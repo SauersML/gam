@@ -6,6 +6,7 @@ use super::family::*;
 use super::gradient_paths::*;
 use super::hessian_paths::{new_cell_moment_cache_stats, new_cell_moment_lru_cache};
 use super::install_flex::validate_spec;
+use super::pilot_total_jacobian::BmsCalibratedPilot;
 use super::*;
 use crate::fit_orchestration::FitFailure;
 use crate::inference::model::SavedLatentZNormalization;
@@ -2744,48 +2745,17 @@ fn fit_bernoulli_marginal_slope_terms_under(
         }
     }
 
-    // Score-warp basis construction is β-independent (identifiability is
-    // provided by the smoothness-null-space drop on the basis transform,
-    // not by a data-distribution moment anchor at the rigid-pilot η₀), so
-    // the standard-normal and empirical latent-measure branches build the
-    // same block. There is no row-weight pilot to thread into the basis;
-    // the latent-measure split is enforced upstream via the empirical
-    // intercept solve in `build_row_exact_context_with_stats`, not in the
-    // deviation basis.
-    // Score-warp basis is built first, then immediately reparameterised
-    // against the parametric span (marginal + slope columns at the n
-    // training rows) so its column span is orthogonal to span(X_marginal,
-    // X_slope) by construction. This is the first half of the joint-
-    // design identifiability invariant; the second half (link-deviation
-    // orthogonalised against parametric + the now-reparameterised score-
-    // warp) runs inside the link-deviation closure below. Together they
-    // ensure `[X_marginal | X_slope | Φ_score_warp · T_sw |
-    // Φ_link_dev · T_lw]` has full numerical column rank, structurally
-    // bounding `σ_min(joint H + S) ≥ λ_min(S) > 0` regardless of how β
-    // drifts the linear predictor distribution during PIRLS.
-    // Cross-block W-metric pilot. The joint penalised Hessian during PIRLS
-    // uses the probit-style data Hessian row metric
+    // Rigid-pilot W-metric. The joint penalised Hessian during PIRLS uses the
+    // probit data Hessian row metric
     //
-    //   W_pirls[i] = spec.weights[i] · φ(η_i)² / (μ_i·(1−μ_i))
+    //   W_pirls[i] = spec.weights[i] · φ(η_i)² / (μ_i·(1−μ_i)),
     //
-    // which is the canonical IRLS row weight. The cross-block
-    // orthogonalisation below must use this metric (not uniform
-    // spec.weights) so that `Aᵀ W C̃ = 0` holds in the same inner product
-    // the joint Hessian sees — otherwise A and C̃ are merely Euclidean-
-    // orthogonal, `Aᵀ W_pirls C̃ ≠ 0`, the joint Hessian carries a near-
-    // null direction along the W-metric alias, and REML can drive the
-    // flex block's λ small enough that the alias direction's joint
-    // Hessian eigenvalue collapses. β then runs away along the alias
-    // (manifest as `rho≈2.0`, constant `step_inf`, growing `beta_inf`
-    // during PIRLS, and the inner solve hitting `inner_max_cycles`
-    // without satisfying the KKT residual).
-    //
-    // Use the rigid pooled-probit pilot η for score-warp (its basis is
-    // β-independent in z, so the rigid pilot suffices) and the one-GN-
-    // stepped pilot η for link-deviation (its basis is evaluated at the
-    // same eta_pilot used here, so the orthogonalisation metric matches
-    // the basis evaluation point exactly). Both are β-independent so the
-    // orthogonalisation remains a one-shot construction-time step.
+    // so the construction-time residualisations below (the Stage-1 influence
+    // absorber and the reduced slope basis) are taken in that inner product at
+    // the rigid pooled-probit pilot η; a Euclidean orthogonality would leave a
+    // W-metric alias the joint Hessian sees as a near-null direction. The flex
+    // blocks are audited separately, on their total η-Jacobian at a calibrated
+    // pilot (see `flex_pilot` below).
     let rigid_pilot_eta = rigid_pooled_probit_pilot_eta(
         &spec.base_link,
         z_train,
@@ -2796,7 +2766,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
         probit_scale,
     )
     .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
-    let cross_block_pilot_w_score_warp =
+    let rigid_pilot_row_metric =
         pilot_irls_hessian_row_metric_at_eta(&rigid_pilot_eta, &spec.weights);
 
     // Absorbed Stage-1 influence columns (#461, design §3). When the workflow
@@ -2858,80 +2828,26 @@ fn fit_bernoulli_marginal_slope_terms_under(
             &rigid_slope_at_rows,
             probit_scale,
             protected_dense.view(),
-            &cross_block_pilot_w_score_warp,
+            &rigid_pilot_row_metric,
         )
         .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
         Some(residualized)
     } else {
         None
     };
-    let mut cross_block_warnings: Vec<CrossBlockIdentifiabilityWarning> = Vec::new();
-    let score_warp_prepared = if let Some(cfg) = spec.score_warp.as_ref() {
-        use super::deviation_runtime::ParametricAnchorBlock;
-        let mut prepared = build_score_warp_deviation_block_from_seed(z_train, cfg)
-            .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
-        // `install_compiled_flex_block_into_runtime` now delegates
-        // its math body to `identifiability::families::compiler::compile` (commit
-        // 4e20b8dc8); the prior Phase-4a shadow compile here was a
-        // duplicate of that internal call and has been removed.
-        let outcome = install_compiled_flex_block_into_runtime(
-            &mut prepared,
-            z_train,
-            cfg,
-            &[
-                (&marginal_design.design, ParametricAnchorBlock::Marginal),
-                (&slope_design.design, ParametricAnchorBlock::Slope),
-            ],
-            &[],
-            &cross_block_pilot_w_score_warp,
-        )
-        .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
-        match outcome {
-            FlexCompileOutcome::Reparameterised => Some(prepared),
-            FlexCompileOutcome::FullyAliased { reason } => {
-                // Record via the structured channel. Keep the original
-                // (non-compiled) design so the unified audit sees score_warp_dev
-                // and attributes the drop via dropped_columns (gauge_priority=80
-                // is below marginal=150 / slope=120, so RRQR correctly
-                // demotes score_warp_dev when it aliases those blocks).
-                cross_block_warnings.push(CrossBlockIdentifiabilityWarning {
-                    candidate_label: "score_warp",
-                    anchor_summary: "marginal+slope".to_string(),
-                    reason,
-                });
-                Some(prepared)
-            }
-        }
-    } else {
-        None
-    };
-    // Build the link-deviation block. The basis lives in η-space, and at
-    // PIRLS time `runtime.design(η_current)` is re-evaluated at the
-    // current β-dependent η, so the basis is genuinely β-dependent during
-    // optimisation. The construction-time seed is used only for (a) knot
-    // placement in η-space and (b) the cross-block identifiability check
-    // that computes the basis-space transform `T` orthogonalising the
-    // candidate against the parametric and score-warp anchors at training
-    // rows.
-    //
-    // Using the rigid pooled probit pilot directly (`q0 = a₀·√(…) + s_f·
-    // b₀·z`) is structurally degenerate: with zero per-row offsets it is
-    // affine in z, so a degree-3 I-spline of `q0` spans the same column
-    // space at training rows as a degree-3 I-spline of z, and the cross-
-    // block check finds the candidate fully aliased by the score-warp
-    // anchor even though at any non-rigid β the link-deviation carries
-    // PC/age structure the score-warp cannot represent.
-    //
-    // Instead, seed both knot placement and the orthogonalisation pivot at
-    // a non-rigid pilot η computed via one probit Gauss-Newton step from
-    // the rigid pilot onto the full marginal design (see
-    // `pilot_eta_for_link_dev_orthogonalisation`). The pilot is row-varying
-    // in PCs/age and the resulting `T` drops only directions aliased
-    // across all β. The score-warp basis at training rows is also threaded
-    // in as a flex anchor when active so the kept directions are jointly
-    // orthogonal to parametric ⊕ score-warp.
-    let link_dev_prepared = if let Some(cfg) = spec.link_dev.as_ref() {
-        let eta_pilot = pilot_eta_for_link_dev_orthogonalisation(
+    // Flex-block identifiability (gam#3320). A score-warp or link-deviation
+    // coefficient moves the row predictor twice: directly at the row's own
+    // argument, and through the calibrated intercept, which averages the same
+    // basis over the latent measure. The likelihood's Fisher information is
+    // `JᵀWJ` with `J` that total η-Jacobian, so each flex block is audited on
+    // `J` at a calibrated pilot — the rigid baseline moved by one Fisher step
+    // on the marginal block — in that pilot's Fisher row metric `W`, against
+    // the total Jacobian columns of every block installed before it. Judging
+    // the raw basis at the training rows instead drops ramps that are flat
+    // over the training arguments but live over the latent measure.
+    let flex_pilot = if spec.score_warp.is_some() || spec.link_dev.is_some() {
+        let pilot = BmsCalibratedPilot::build(
+            &latent_measure,
             &spec.base_link,
             &spec.y,
             z_train,
@@ -2944,94 +2860,112 @@ fn fit_bernoulli_marginal_slope_terms_under(
             probit_scale,
         )
         .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
-        let link_dev_seed = padded_deviation_seed(&eta_pilot, 1.0, 0.5);
-        let mut prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
-            &link_dev_seed,
-            &eta_pilot,
-            cfg,
-        )
-        .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
-        // Cross-block identifiability for the link-deviation basis. The
-        // anchor union covers BOTH possible aliasing channels:
-        //
-        //  - Parametric: location and slope designs evaluated at the n
-        //    training rows. Columns of `Φ_link_dev(q0)` that reproduce
-        //    parametric features become null-direction targets in the
-        //    joint penalised Hessian since `S_link_dev` has no mass on
-        //    them.
-        //
-        //  - Score-warp (when active): the now-reparameterised score-warp
-        //    basis, also evaluated at training rows. Both flex bases are
-        //    cubic I-spline cubic combinations of an η-pilot scalar, and
-        //    even with each block's own smoothness-null-space drop their
-        //    column spans can still overlap inside the orthogonal
-        //    complement of `{1, η_pilot}`.
-        //
-        // After the orthogonalisation, `[X_marginal | X_slope |
-        // Φ_score_warp · T_sw | Φ_link_dev · T_lw]` has full numerical
-        // column rank at training rows, so `σ_min(joint H+S) ≥ λ_min(S)
-        // > 0` for every β. This is the standard GAM `gam.side`
-        // convention generalised to multi-anchor unions (mgcv applies it
-        // sequentially across smooths sharing a covariate).
-        // When `install_compiled_flex_block_into_runtime`
-        // reparameterised the score-warp runtime against the parametric
-        // anchor union (marginal + slope), it installed an
-        // `anchor_residual` and cached the training-row parametric
-        // anchor matrix on the runtime. `runtime.design()` on a
-        // residualised runtime returns the *raw* basis evaluation,
-        // which `assert`s the caller hasn't conflated with the
-        // reparameterised basis — we want the reparameterised one
-        // here, so go through `design_at_training_with_residual` so
-        // the cached anchor rows are folded in. For score-warp
-        // configurations where reparameterisation was a no-op (no
-        // residual installed) the same call falls back to the raw
-        // `design()` path, so the residual-vs-no-residual branches
-        // converge on the right matrix.
-        let score_warp_anchor_design = score_warp_prepared
-            .as_ref()
-            .map(|sw| sw.runtime.design_at_training_with_residual(z_train))
-            .transpose()
-            .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
-        use super::deviation_runtime::ParametricAnchorBlock;
-        let parametric_anchors: [(&DesignMatrix, ParametricAnchorBlock); 2] = [
-            (&marginal_design.design, ParametricAnchorBlock::Marginal),
-            (&slope_design.design, ParametricAnchorBlock::Slope),
+        let fisher_row_metric = pilot.fisher_row_metric(&spec.weights);
+        let parametric_jacobians = vec![
+            pilot
+                .marginal_jacobian(&marginal_design.design)
+                .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?,
+            pilot
+                .slope_jacobian(&slope_design.design)
+                .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?,
         ];
-        let flex_anchor_slot: Option<&Array2<f64>> = score_warp_anchor_design.as_ref();
-        let flex_anchors: Vec<&Array2<f64>> = flex_anchor_slot.into_iter().collect();
-        // W-metric for link-deviation orthogonalisation: same IRLS-style
-        // probit Hessian row weight as the score-warp path, but evaluated at
-        // `eta_pilot` (the one-GN-stepped pilot at which the link-dev basis
-        // itself is anchored).
-        let cross_block_pilot_w_link_dev =
-            pilot_irls_hessian_row_metric_at_eta(&eta_pilot, &spec.weights);
-        let outcome = install_compiled_flex_block_into_runtime(
-            &mut prepared,
-            &eta_pilot,
-            cfg,
-            &parametric_anchors,
-            &flex_anchors,
-            &cross_block_pilot_w_link_dev,
-        )
-        .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
-        match outcome {
-            FlexCompileOutcome::Reparameterised => Some(prepared),
-            FlexCompileOutcome::FullyAliased { reason } => {
-                // Record via the structured channel. Keep the original
-                // (non-compiled) design so the unified audit sees link_dev
-                // and attributes the drop via dropped_columns (gauge_priority=60
-                // is below all parametric blocks so RRQR correctly demotes
-                // link_dev when it aliases marginal / slope / score_warp).
-                cross_block_warnings.push(CrossBlockIdentifiabilityWarning {
-                    candidate_label: "link_deviation",
-                    anchor_summary: "marginal+slope+score_warp".to_string(),
-                    reason,
-                });
-                Some(prepared)
-            }
-        }
+        Some((pilot, fisher_row_metric, parametric_jacobians))
     } else {
         None
+    };
+    let mut cross_block_warnings: Vec<CrossBlockIdentifiabilityWarning> = Vec::new();
+    // The score warp is audited against marginal + slope.
+    let score_warp_prepared = match (spec.score_warp.as_ref(), flex_pilot.as_ref()) {
+        (Some(cfg), Some((pilot, fisher_row_metric, parametric_jacobians))) => {
+            let mut prepared = build_score_warp_deviation_block_from_seed(z_train, cfg)
+                .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
+            let jacobian = pilot
+                .score_warp_jacobian(&prepared.runtime)
+                .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+            let outcome = install_bms_flex_block_on_total_jacobian(
+                &mut prepared,
+                cfg,
+                &jacobian,
+                parametric_jacobians,
+                fisher_row_metric,
+                z_train,
+            )
+            .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+            match outcome {
+                FlexCompileOutcome::Reparameterised => Some(prepared),
+                FlexCompileOutcome::FullyAliased { reason } => {
+                    // Record via the structured channel. Keep the original
+                    // (non-compiled) design so the unified audit sees score_warp_dev
+                    // and attributes the drop via dropped_columns (gauge_priority=80
+                    // is below marginal=150 / slope=120, so RRQR correctly
+                    // demotes score_warp_dev when it aliases those blocks).
+                    cross_block_warnings.push(CrossBlockIdentifiabilityWarning {
+                        candidate_label: "score_warp",
+                        anchor_summary: "marginal+slope".to_string(),
+                        reason,
+                    });
+                    Some(prepared)
+                }
+            }
+        }
+        _ => None,
+    };
+    // The link deviation lives at the pre-scale link argument `t = η/s`; at
+    // PIRLS time it is re-evaluated at the current β-dependent argument, so
+    // the construction-time argument only places the knots and evaluates the
+    // training design. The calibrated pilot's argument is row-varying in the
+    // marginal covariates: the rigid pilot's argument is affine in z, which
+    // would make the link-deviation basis a cubic spline of z like the score
+    // warp. It is audited against marginal + slope + the score warp as
+    // installed above.
+    let link_dev_prepared = match (spec.link_dev.as_ref(), flex_pilot.as_ref()) {
+        (Some(cfg), Some((pilot, fisher_row_metric, parametric_jacobians))) => {
+            let link_argument = pilot.link_argument();
+            let link_dev_seed = padded_deviation_seed(link_argument, 1.0, 0.5);
+            let mut prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+                &link_dev_seed,
+                link_argument,
+                cfg,
+            )
+            .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
+            let mut anchor_jacobians = parametric_jacobians.clone();
+            if let Some(score_warp) = score_warp_prepared.as_ref() {
+                anchor_jacobians.push(
+                    pilot
+                        .score_warp_jacobian(&score_warp.runtime)
+                        .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?,
+                );
+            }
+            let jacobian = pilot
+                .link_deviation_jacobian(&prepared.runtime)
+                .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+            let outcome = install_bms_flex_block_on_total_jacobian(
+                &mut prepared,
+                cfg,
+                &jacobian,
+                &anchor_jacobians,
+                fisher_row_metric,
+                link_argument,
+            )
+            .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+            match outcome {
+                FlexCompileOutcome::Reparameterised => Some(prepared),
+                FlexCompileOutcome::FullyAliased { reason } => {
+                    // Record via the structured channel. Keep the original
+                    // (non-compiled) design so the unified audit sees link_dev
+                    // and attributes the drop via dropped_columns (gauge_priority=60
+                    // is below all parametric blocks so RRQR correctly demotes
+                    // link_dev when it aliases marginal / slope / score_warp).
+                    cross_block_warnings.push(CrossBlockIdentifiabilityWarning {
+                        candidate_label: "link_deviation",
+                        anchor_summary: "marginal+slope+score_warp".to_string(),
+                        reason,
+                    });
+                    Some(prepared)
+                }
+            }
+        }
+        _ => None,
     };
     let extra_rho0 = {
         let mut out = Vec::new();
@@ -3064,7 +2998,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
         &marginal_design,
         &slope_design,
         z.as_ref(),
-        &cross_block_pilot_w_score_warp,
+        &rigid_pilot_row_metric,
         &spec.marginal_offset,
         &spec.slope_offset,
         baseline.0,
