@@ -159,6 +159,10 @@ fn a_seed_whose_every_probe_is_refused_stops_within_the_derived_bound_3219() {
         !published.converged,
         "a non-stationary seed is never claimed converged: {published:?}"
     );
+    // Probes k* and k* + 1 are both refused within the seed's resolution, so the
+    // stop carries two proofs that the domain ends within an unresolvable step of
+    // the seed. The escape granted between them does not clear the first (#3400).
+    assert_eq!(published.wall_refusals, 2, "{published:?}");
 }
 
 /// A seed whose probes recover before the derived bound is not aborted: the
@@ -185,4 +189,7 @@ fn a_seed_whose_probes_recover_before_the_derived_bound_is_not_aborted_3219() {
     assert_eq!(recovered, V0_3219 - probe_3219(recover_at));
     let published = published.expect("the seed is published up front");
     assert_eq!(published.rho, array![0.0], "a refusal displaced the seed: {published:?}");
+    // Every refusal before the recovery was a step whose model promised more than
+    // the seed's resolution, so none is evidence of a domain wall (#3400).
+    assert_eq!(published.wall_refusals, 0, "{published:?}");
 }

@@ -382,6 +382,9 @@ pub(crate) struct CostStallExit {
     /// Set when the window that halted the search held only trials refused for leaving
     /// its kept rank (#2939). See [`CostStallGuard::observe_off_stratum`].
     pub(crate) rank_boundary: Option<RankBoundaryStall>,
+    /// Refused trials proposed from this incumbent whose model promised at most its
+    /// resolution (#3400). See [`CostStallGuard::wall_refusals`].
+    pub(crate) wall_refusals: usize,
 }
 
 /// Tracks the monotone best accepted-iterate REML objective and a
@@ -437,6 +440,23 @@ pub(crate) struct CostStallGuard {
     /// keeping a different kept rank than the run's start (#2765), rather than failing to
     /// evaluate. When it equals the streak, the whole run left the run's rank (#2939).
     off_stratum_streak: usize,
+    /// Refused trials (non-finite cost, a typed refusal, or off the kept rank)
+    /// proposed since the incumbent was adopted whose step's model promised at most
+    /// the incumbent's resolution ([`Self::refusal_stalls`], #3400).
+    ///
+    /// Each one proves that the criterion's domain ends, along that trial's
+    /// direction, within a step whose predicted decrease no evaluation could
+    /// resolve: the criterion is undefined or on another rank there, and a
+    /// shorter step buys nothing resolvable. So the incumbent is pinned at a
+    /// domain wall and no plan can continue its descent from it. That refutes the
+    /// premise of the plan ladder's resume (#3306), which starts the next plan at
+    /// the incumbent because the next plan continues the same descent there, so a
+    /// stop that carries this evidence is kept as a comparator and not resumed.
+    ///
+    /// Unlike [`Self::infeasible_streak`], a finite trial and an escape grant do
+    /// not clear it. The evidence belongs to the incumbent, so only a new
+    /// incumbent does.
+    wall_refusals: usize,
     accepted_iters: usize,
     /// Number of consecutive fruitless [`CostStallVerdict::StuckKeepDescending`]
     /// escapes granted on this seed (#1426), reset by any genuine super-floor
@@ -520,6 +540,7 @@ impl CostStallGuard {
             strict_saddle_refusal: false,
             infeasible_streak: 0,
             off_stratum_streak: 0,
+            wall_refusals: 0,
             accepted_iters: 0,
             stuck_escapes: 0,
             incumbent_at_last_escape: None,
@@ -685,6 +706,7 @@ impl CostStallGuard {
             converged: false,
             probe_scale: None,
             rank_boundary: None,
+            wall_refusals: self.wall_refusals,
         })
     }
 
@@ -814,6 +836,24 @@ impl CostStallGuard {
         self.infeasible_streak
     }
 
+    /// Refused trials at a domain wall since the incumbent was adopted (#3400).
+    pub(crate) fn wall_refusals(&self) -> usize {
+        self.wall_refusals
+    }
+
+    /// Fold one refused trial whose model promised at most the incumbent's
+    /// resolution into [`Self::wall_refusals`], and stamp the count onto the
+    /// published incumbent, which every exit that does not publish a stall
+    /// (a budget or reject-floor stop) recovers its checkpoint from.
+    fn record_wall_refusal(&mut self) {
+        self.wall_refusals = self.wall_refusals.saturating_add(1);
+        if let Ok(mut slot) = self.exit.lock()
+            && let Some(exit) = slot.as_mut()
+        {
+            exit.wall_refusals = self.wall_refusals;
+        }
+    }
+
     pub(crate) fn off_stratum_streak(&self) -> usize {
         self.off_stratum_streak
     }
@@ -884,6 +924,7 @@ impl CostStallGuard {
         self.best_hessian_psd = hessian_psd;
         self.best_curvature = staged_curvature;
         self.infeasible_streak = 0;
+        self.wall_refusals = 0;
         self.window_trials.clear();
         self.accepted_iters = self.accepted_iters.saturating_add(1);
         self.restart_recent(rho, value);
@@ -979,6 +1020,7 @@ impl CostStallGuard {
             self.best_grad_norm = grad_norm;
             self.best_hessian_psd = hessian_psd;
             self.best_curvature = staged_curvature;
+            self.wall_refusals = 0;
             // Keep the shared exit cell tracking the best feasible iterate so the
             // ARC budget-exhaustion path can recover it instead of the optimizer's
             // last (possibly degenerate-corner) iterate (#1371).
@@ -1110,6 +1152,7 @@ impl CostStallGuard {
         if !self.refusal_stalls(predicted_decrease) {
             return CostStallVerdict::Continue;
         }
+        self.record_wall_refusal();
         if self.best_hessian_psd == Some(false) {
             // A strict saddle has a certified local escape direction. A refused
             // trial only says ARC's current cubic step crossed the profiled
@@ -1191,6 +1234,7 @@ impl CostStallGuard {
             if !self.refusal_stalls(predicted_decrease) {
                 return CostStallVerdict::Continue;
             }
+            self.record_wall_refusal();
             if self.off_stratum_streak < self.infeasible_streak {
                 return self.publish_stall(rho, self.best_value, self.best_grad_norm);
             }
@@ -1215,6 +1259,7 @@ impl CostStallGuard {
                     refused_trials: self.off_stratum_streak,
                     band,
                 }),
+                wall_refusals: self.wall_refusals,
             });
         }
         CostStallVerdict::FlatValleyStall {
@@ -1278,6 +1323,7 @@ impl CostStallGuard {
             ..
         } = sample;
         self.infeasible_streak = 0;
+        self.wall_refusals = 0;
         self.accepted_iters = self.accepted_iters.saturating_add(1);
         self.best_value = value;
         self.best_resolution = resolution;
@@ -1313,6 +1359,7 @@ impl CostStallGuard {
                     converged,
                     probe_scale,
                     rank_boundary: None,
+                    wall_refusals: self.wall_refusals,
                 });
             }
             return CostStallVerdict::Converged;
@@ -1385,6 +1432,7 @@ impl CostStallGuard {
                 converged,
                 probe_scale,
                 rank_boundary: None,
+                wall_refusals: self.wall_refusals,
             });
         }
         CostStallVerdict::FlatValleyStall {
@@ -1440,6 +1488,7 @@ impl CostStallGuard {
                 // running best-so-far snapshot.
                 probe_scale: None,
                 rank_boundary: None,
+                wall_refusals: self.wall_refusals,
             });
         }
     }
@@ -3180,6 +3229,7 @@ impl OuterSecondOrderBridge<'_> {
                 // rung that stopped this run is the decrement.
                 probe_scale: None,
                 rank_boundary: None,
+                wall_refusals: guard.wall_refusals(),
             });
         }
         Some(ObjectiveEvalError::fatal(
@@ -3322,6 +3372,7 @@ impl OuterSecondOrderBridge<'_> {
                 // stopped this run is the certificate's band.
                 probe_scale: None,
                 rank_boundary: None,
+                wall_refusals: guard.wall_refusals(),
             });
         }
         Some(ObjectiveEvalError::fatal(
