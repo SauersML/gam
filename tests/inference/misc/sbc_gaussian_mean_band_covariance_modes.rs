@@ -146,8 +146,6 @@ fn confidence_band(fit: &FitResult, level: f64, config: &BandConfig) -> (Array1<
         covariance_mode: config.covariance_mode,
         mean_interval_method: MeanIntervalMethod::TransformEta,
         includeobservation_interval: false,
-        edgeworth_one_sided: false,
-        boundary_correction: false,
         ..PredictUncertaintyOptions::default()
     };
     let result =

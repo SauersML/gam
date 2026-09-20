@@ -108,9 +108,6 @@ fn fit_tweedie_eta_se(x: &[f64], y: &[f64], eval: &[f64]) -> Option<(Vec<f64>, f
             covariance_mode: InferenceCovarianceMode::Conditional,
             mean_interval_method: MeanIntervalMethod::Delta,
             includeobservation_interval: false,
-            edgeworth_one_sided: false,
-            boundary_correction: false,
-            ood_inflation: false,
             ..PredictUncertaintyOptions::default()
         },
     )

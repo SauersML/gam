@@ -1581,23 +1581,6 @@ pub(crate) fn enrich_posterior_mean_bounds(
 /// existing `gam_predict::InferenceCovarianceMode` path is unchanged.
 pub use gam_solve::model_types::InferenceCovarianceMode;
 
-/// Per-axis training support range used by boundary and OOD corrections.
-/// For each predictor axis we record the empirical [min, max] from training.
-/// Boundary correction inflates variance for x_i within a small fraction of
-/// the range from either edge; OOD inflation inflates variance for x_i
-/// outside [min, max] proportional to (excess / range).
-#[derive(Clone, Debug)]
-pub struct TrainingSupport {
-    /// Axis-wise minimum across the training rows; length = number of input
-    /// columns the design treats as continuous predictors. The order must
-    /// match `predictor_x` rows passed in `PredictUncertaintyOptions::
-    /// predictor_x_for_corrections` (see helper below); a length of zero
-    /// disables both boundary and OOD corrections.
-    pub axis_min: Array1<f64>,
-    /// Axis-wise maximum, paired with `axis_min`.
-    pub axis_max: Array1<f64>,
-}
-
 #[derive(Clone)]
 pub struct PredictUncertaintyOptions {
     /// Central interval level in (0, 1), e.g. 0.95.
@@ -1609,59 +1592,13 @@ pub struct PredictUncertaintyOptions {
     /// Return observation intervals for supported response families using
     /// Var(y_new | x) = Var(mu_hat) + Var(Y | mu).
     pub includeobservation_interval: bool,
-    /// Edgeworth expansion correction for one-sided tail coverage. When ON
-    /// (default), the per-row z-multiplier is replaced by the Cornish–Fisher
-    /// expansion z + (z² − 1)·κ₃ / 6 + … using a per-row skewness estimate
-    /// derived from `eta` and `eta_standard_error`. The result is an
-    /// asymmetric (lower, upper) multiplier pair that preserves the central
-    /// confidence level while adjusting tail rates separately. Requires
-    /// `eta_skewness_for_corrections` if a non-zero skew estimate is to be
-    /// used; otherwise this reduces to the standard symmetric interval.
-    pub edgeworth_one_sided: bool,
-    /// Inflate variance near the support boundary. When ON (default),
-    /// requires both `predictor_x_for_corrections` and `training_support`;
-    /// otherwise behaves as a no-op. The inflation factor is
-    /// `1 + α · max(0, 1 − d_edge / (β · range))²` per axis, with
-    /// α = `boundary_alpha` and β = `boundary_band_fraction`. d_edge is the
-    /// minimum of (x − min, max − x) per axis.
-    pub boundary_correction: bool,
-    /// Inflate variance for predictions outside the per-axis training
-    /// range. When ON (default OFF), requires both
-    /// `predictor_x_for_corrections` and `training_support`. Factor is
-    /// `1 + γ · Σ_k (excess_k / range_k)²`, with γ = `ood_gamma`.
-    pub ood_inflation: bool,
-    /// Predictor rows aligned with the prediction batch, used by boundary
-    /// and OOD corrections. Number of columns must match
-    /// `training_support.axis_min.len()`. When None, both corrections
-    /// silently no-op even if their flags are set.
-    pub predictor_x_for_corrections: Option<Array2<f64>>,
-    /// Per-axis training support, paired with `predictor_x_for_corrections`.
-    pub training_support: Option<TrainingSupport>,
     /// V∞ §5 distance-honest seam: per-row extrapolation variance on the
-    /// η scale (already φ̂-scaled), ADDED to Var(η_i) after the
-    /// multiplicative inflations: Var_total = Var_Vp·inflation + Var_extrap.
+    /// η scale (already φ̂-scaled), ADDED to Var(η_i): Var_total = Var_Vp +
+    /// Var_extrap.
     /// Populated by the predict pipeline for fits carrying measure-jet
     /// terms (frozen nodes/masses/band + fitted per-scale amplitudes) via
     /// `FittedModel::measure_jet_extrapolation_variance`; None elsewhere.
-    /// Interaction with `ood_inflation`: when this is `Some`, the additive
-    /// term already prices off-support departure from the fitted spectrum,
-    /// so the heuristic multiplicative OOD inflation is skipped (with a
-    /// warning) to avoid double-counting the same distance signal.
     pub extrapolation_variance: Option<Array1<f64>>,
-    /// Per-row Edgeworth skewness κ₃ estimate (length = batch size). When
-    /// None, Edgeworth correction reduces to the standard symmetric
-    /// quantile (no-op).
-    pub eta_skewness_for_corrections: Option<Array1<f64>>,
-    /// Boundary correction strength α (multiplier on the squared shortfall).
-    /// Default 0.25. Larger ⇒ more inflation near the edge.
-    pub boundary_alpha: f64,
-    /// Boundary correction band β (fraction of range that counts as "near"
-    /// the edge). Default 0.05. Inside this band the inflation factor
-    /// grows quadratically as x → edge.
-    pub boundary_band_fraction: f64,
-    /// OOD inflation strength γ (multiplier on the squared per-axis
-    /// overshoot fraction). Default 1.0.
-    pub ood_gamma: f64,
     /// Opt-in distribution-free conformal calibration of the response-scale
     /// interval. When `Some(level)` with `level ∈ (0, 1)`, the model-based
     /// `mean_lower` / `mean_upper` bounds are REPLACED by a split-conformal /
@@ -1695,131 +1632,11 @@ impl Default for PredictUncertaintyOptions {
             covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
             mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: true,
-            edgeworth_one_sided: true,
-            boundary_correction: true,
-            ood_inflation: false,
-            predictor_x_for_corrections: None,
-            training_support: None,
             extrapolation_variance: None,
-            eta_skewness_for_corrections: None,
-            boundary_alpha: 0.25,
-            boundary_band_fraction: 0.05,
-            ood_gamma: 1.0,
             conformal_level: None,
             observation_prior_weights: None,
         }
     }
-}
-
-/// Asymmetric (lower, upper) z-multiplier produced by the Edgeworth
-/// one-sided correction. With κ₃ = 0 both entries equal the standard
-/// symmetric `z_{(1+level)/2}` quantile.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct EdgeworthZ {
-    pub z_lower: f64,
-    pub z_upper: f64,
-}
-
-/// One-sided Edgeworth expansion (Cornish–Fisher to first non-Gaussian
-/// order) for a coverage level on each tail. Given a per-row skewness
-/// estimate κ₃, returns (z_lower, z_upper) such that
-///
-///   eta_lower = eta − z_lower · se,   eta_upper = eta + z_upper · se,
-///
-/// with the lower-tail probability Φ(−z_lower) ≈ α/2 and the upper-tail
-/// probability 1 − Φ(z_upper) ≈ α/2 to O(κ₃). The expansion is
-///   z_p ≈ z + (z² − 1) · κ₃ / 6
-/// applied with sign-symmetric z at the two tails. With κ₃ = 0 this
-/// reduces to the symmetric interval z_lower = z_upper = z.
-pub(crate) fn edgeworth_one_sided_quantile(z: f64, skew_kappa3: f64) -> EdgeworthZ {
-    // Cornish–Fisher: q_α = z_α + (z_α² − 1) κ₃ / 6.
-    // For the upper tail use +z, for the lower tail use −z (in the
-    // standardized scale), then negate. Net effect:
-    //   z_upper_eta = z + (z² − 1) κ₃ / 6
-    //   z_lower_eta = z − (z² − 1) κ₃ / 6
-    let bump = (z * z - 1.0) * skew_kappa3 / 6.0;
-    EdgeworthZ {
-        z_lower: (z - bump).max(0.0),
-        z_upper: (z + bump).max(0.0),
-    }
-}
-
-/// Per-row variance-inflation factor for the boundary correction. Returns
-/// 1 if no axis is inside the boundary band, otherwise
-/// `1 + α · Σ_k max(0, 1 − d_k / (β · range_k))²` summed over axes.
-/// When `range_k = 0` (degenerate axis) the contribution is skipped.
-pub(crate) fn boundary_variance_inflation_factor(
-    x_row: ArrayView1<'_, f64>,
-    axis_min: ArrayView1<'_, f64>,
-    axis_max: ArrayView1<'_, f64>,
-    alpha: f64,
-    band_fraction: f64,
-) -> f64 {
-    let d = x_row.len();
-    if d == 0 || axis_min.len() != d || axis_max.len() != d || band_fraction <= 0.0 {
-        return 1.0;
-    }
-    let mut excess = 0.0_f64;
-    for k in 0..d {
-        let lo = axis_min[k];
-        let hi = axis_max[k];
-        let range = hi - lo;
-        if !(range > 0.0) {
-            continue;
-        }
-        let x = x_row[k];
-        // Closest-edge distance, clamped to interior.
-        let d_edge = (x - lo).min(hi - x);
-        if !d_edge.is_finite() || d_edge >= band_fraction * range {
-            continue;
-        }
-        // Inside the band (or beyond on the wrong side; we only inflate
-        // for interior-near-edge here, OOD case is the other helper).
-        if d_edge <= 0.0 {
-            // Exactly on or just past the boundary: full band shortfall.
-            excess += 1.0;
-        } else {
-            let shortfall = 1.0 - d_edge / (band_fraction * range);
-            excess += shortfall * shortfall;
-        }
-    }
-    (1.0 + alpha * excess).max(1.0)
-}
-
-/// Per-row variance-inflation factor for an out-of-distribution prediction.
-/// Returns `1 + γ · Σ_k (excess_k / range_k)²` where excess_k = max(0,
-/// max(lo − x, x − hi)) per axis, range_k = hi − lo. Always ≥ 1; equal to
-/// 1 when x is inside the bounding box on every axis.
-pub(crate) fn ood_variance_inflation_factor(
-    x_row: ArrayView1<'_, f64>,
-    axis_min: ArrayView1<'_, f64>,
-    axis_max: ArrayView1<'_, f64>,
-    gamma: f64,
-) -> f64 {
-    let d = x_row.len();
-    if d == 0 || axis_min.len() != d || axis_max.len() != d {
-        return 1.0;
-    }
-    let mut sq_excess = 0.0_f64;
-    for k in 0..d {
-        let lo = axis_min[k];
-        let hi = axis_max[k];
-        let range = hi - lo;
-        if !(range > 0.0) {
-            continue;
-        }
-        let x = x_row[k];
-        let excess = if x < lo {
-            lo - x
-        } else if x > hi {
-            x - hi
-        } else {
-            0.0
-        };
-        let frac = excess / range;
-        sq_excess += frac * frac;
-    }
-    (1.0 + gamma * sq_excess).max(1.0)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2805,20 +2622,10 @@ where
                     .to_string(),
             ));
         }
-        let support_inflation_requested = (options.boundary_correction || options.ood_inflation)
-            && options.predictor_x_for_corrections.is_some()
-            && options.training_support.is_some();
-        if support_inflation_requested || options.extrapolation_variance.is_some() {
+        if options.extrapolation_variance.is_some() {
             return Err(EstimationError::InvalidInput(
                 "inequality-truncated credible intervals cannot combine the persisted posterior \
-                 with boundary, OOD, or extrapolation variance inflation"
-                    .to_string(),
-            ));
-        }
-        if options.eta_skewness_for_corrections.is_some() {
-            return Err(EstimationError::InvalidInput(
-                "inequality-truncated credible intervals already integrate the exact Laplace \
-                 skew law and cannot also apply an Edgeworth skewness correction"
+                 with extrapolation variance"
                     .to_string(),
             ));
         }
@@ -2857,75 +2664,10 @@ where
     let strategy = strategy_for_spec(&likelihood);
     let mean = apply_family_inverse_link(&eta, &likelihood)?;
 
-    let etavar_raw = linear_predictorvariance_from_backend(&x, &backend)?;
-    let n_rows = etavar_raw.len();
-
-    // ── Coverage corrections ────────────────────────────────────────────
-    // Variance inflation (boundary + OOD). Both are per-row multipliers
-    // ≥ 1 applied to Var(η_i); they propagate through to eta_se and
-    // observation intervals consistently.
-    //
-    // Double-count guard (V∞ §5): when the caller supplies the additive
-    // measure-jet `extrapolation_variance`, that term already prices the
-    // off-support departure from the fitted spectrum. Stacking the heuristic
-    // multiplicative OOD inflation on top would charge the same distance
-    // signal twice, so the principled additive term wins and the multiplier
-    // is skipped. Boundary correction is unaffected: it prices a different,
-    // within-support edge effect.
-    let ood_inflation_active = options.ood_inflation && options.extrapolation_variance.is_none();
-    if options.ood_inflation && !ood_inflation_active {
-        log::debug!(
-            "predict_gamwith_uncertainty: ood_inflation is enabled but an additive \
-            extrapolation_variance is supplied; skipping the multiplicative OOD \
-            inflation to avoid double-counting off-support uncertainty"
-        );
-    }
-    let mut variance_inflation = Array1::<f64>::ones(n_rows);
-    if (options.boundary_correction || ood_inflation_active)
-        && let (Some(predictor_x), Some(support)) = (
-            options.predictor_x_for_corrections.as_ref(),
-            options.training_support.as_ref(),
-        )
-        && predictor_x.nrows() == n_rows
-        && predictor_x.ncols() == support.axis_min.len()
-        && support.axis_min.len() == support.axis_max.len()
-    {
-        for i in 0..n_rows {
-            let row = predictor_x.row(i);
-            let mut factor = 1.0_f64;
-            if options.boundary_correction {
-                factor *= boundary_variance_inflation_factor(
-                    row,
-                    support.axis_min.view(),
-                    support.axis_max.view(),
-                    options.boundary_alpha,
-                    options.boundary_band_fraction,
-                );
-            }
-            if ood_inflation_active {
-                factor *= ood_variance_inflation_factor(
-                    row,
-                    support.axis_min.view(),
-                    support.axis_max.view(),
-                    options.ood_gamma,
-                );
-            }
-            variance_inflation[i] = factor;
-        }
-    }
-    let mut etavar = if variance_inflation.iter().all(|&f| f == 1.0) {
-        etavar_raw.clone()
-    } else {
-        Array1::from_iter(
-            etavar_raw
-                .iter()
-                .zip(variance_inflation.iter())
-                .map(|(&v, &f)| v * f),
-        )
-    };
+    let mut etavar = linear_predictorvariance_from_backend(&x, &backend)?;
+    let n_rows = etavar.len();
     // V∞ §5 distance-honest seam: the per-row extrapolation variance is
-    // ADDED after the multiplicative inflations —
-    // Var_total = Var_Vp·inflation + Var_extrap — so far-off-support rows
+    // ADDED — Var_total = Var_Vp + Var_extrap — so far-off-support rows
     // widen by the spectrum's priced ignorance instead of reverting
     // confidently to the parametric backbone. Flows from here into
     // `eta_standard_error` AND the per-row `etavar[i]` consumed by the
@@ -2944,23 +2686,12 @@ where
     let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
 
     // Per-row multipliers: the central quantile of the fit's interval reference
-    // (Student-t on `n − edf` for an estimated scale, normal otherwise), which
-    // Edgeworth then optionally splits into lower/upper tails.
+    // (Student-t on `n − edf` for an estimated scale, normal otherwise).
     let level = options.confidence_level;
     let reference = source.interval_reference()?;
     let z_central = reference.central_multiplier(level)?;
-    let mut z_lower_per_row = Array1::<f64>::from_elem(n_rows, z_central);
-    let mut z_upper_per_row = Array1::<f64>::from_elem(n_rows, z_central);
-    if options.edgeworth_one_sided
-        && let Some(skew) = options.eta_skewness_for_corrections.as_ref()
-        && skew.len() == n_rows
-    {
-        for i in 0..n_rows {
-            let adj = edgeworth_one_sided_quantile(z_central, skew[i]);
-            z_lower_per_row[i] = adj.z_lower;
-            z_upper_per_row[i] = adj.z_upper;
-        }
-    }
+    let z_lower_per_row = Array1::<f64>::from_elem(n_rows, z_central);
+    let z_upper_per_row = Array1::<f64>::from_elem(n_rows, z_central);
     let (eta_lower, eta_upper) = if let Some(fit) = constrained_fit {
         constrained_linear_predictor_intervals(fit, &x, offset, level, requested_mode)?
     } else {
@@ -3408,9 +3139,6 @@ mod tests {
             covariance_mode: InferenceCovarianceMode::Conditional,
             mean_interval_method: MeanIntervalMethod::Delta,
             includeobservation_interval: true,
-            edgeworth_one_sided: false,
-            boundary_correction: false,
-            ood_inflation: false,
             ..PredictUncertaintyOptions::default()
         };
 
@@ -3746,9 +3474,6 @@ mod tests {
             covariance_mode: published,
             mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
-            edgeworth_one_sided: false,
-            boundary_correction: false,
-            ood_inflation: false,
             ..PredictUncertaintyOptions::default()
         };
         let result = predict_gamwith_uncertainty(
@@ -3783,9 +3508,6 @@ mod tests {
             covariance_mode: InferenceCovarianceMode::Conditional,
             mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
-            edgeworth_one_sided: false,
-            boundary_correction: false,
-            ood_inflation: false,
             ..PredictUncertaintyOptions::default()
         };
         let result = predict_gamwith_uncertainty(
@@ -4076,9 +3798,6 @@ mod tests {
             includeobservation_interval: false,
             // Coverage corrections off so the test asserts the legacy
             // unadjusted interval semantics.
-            edgeworth_one_sided: false,
-            boundary_correction: false,
-            ood_inflation: false,
             ..PredictUncertaintyOptions::default()
         };
 
@@ -4120,9 +3839,6 @@ mod tests {
             covariance_mode: InferenceCovarianceMode::Conditional,
             mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
-            edgeworth_one_sided: false,
-            boundary_correction: false,
-            ood_inflation: false,
             ..PredictUncertaintyOptions::default()
         };
         let options_fused = PredictUncertaintyOptions {
@@ -4306,9 +4022,6 @@ mod tests {
         let options = PredictUncertaintyOptions {
             covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
             includeobservation_interval: false,
-            edgeworth_one_sided: false,
-            boundary_correction: false,
-            ood_inflation: false,
             ..PredictUncertaintyOptions::default()
         };
         let corrected_fit = gaussian_location_scale_fit_with_covariance_and_corrected(
@@ -4571,7 +4284,7 @@ mod tests {
     /// Build a minimal Gaussian-identity fit (intercept-only design) with a
     /// non-zero variance on β so prediction returns a non-degenerate
     /// interval. Used to feed corrections without coupling to a fitter.
-    fn coverage_correction_fixture() -> (UnifiedFitResult, Array2<f64>, Array1<f64>, Array1<f64>) {
+    fn profiled_gaussian_fixture() -> (UnifiedFitResult, Array2<f64>, Array1<f64>, Array1<f64>) {
         let beta = array![1.0];
         let cov = array![[0.25_f64]];
         let fit = posterior_band_fixture(beta.clone(), cov.clone());
@@ -4581,27 +4294,22 @@ mod tests {
         (fit, x, beta, offset)
     }
 
-    fn corrections_baseline_options() -> PredictUncertaintyOptions {
+    fn conditional_eta_options() -> PredictUncertaintyOptions {
         PredictUncertaintyOptions {
             confidence_level: 0.95,
             covariance_mode: InferenceCovarianceMode::Conditional,
             mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
-            // All four corrections OFF for the regression baseline.
-            edgeworth_one_sided: false,
-            boundary_correction: false,
-            ood_inflation: false,
             ..PredictUncertaintyOptions::default()
         }
     }
 
     #[test]
-    fn coverage_corrections_all_off_matches_legacy() {
-        // Regression baseline: with every correction OFF the output must
-        // match the un-corrected interval exactly. Locks the legacy
-        // semantics so we can detect accidental drift in the hot path.
-        let (fit, x, beta, offset) = coverage_correction_fixture();
-        let opts = corrections_baseline_options();
+    fn eta_interval_is_reference_quantile_times_standard_error() {
+        // The η interval is exactly `η̂ ± q·SE`; no heuristic inflation or
+        // skew split enters the hot path (#3517).
+        let (fit, x, beta, offset) = profiled_gaussian_fixture();
+        let opts = conditional_eta_options();
         let pred = predict_gamwith_uncertainty(
             x.view(),
             beta.view(),
@@ -4641,7 +4349,7 @@ mod tests {
         // The fixture profiles the Gaussian scale σ̂² from n = 16 rows with
         // edf = 1, so the interval pivot is Student-t on ν = n − edf = 15, not
         // standard normal. A known scale on the same fit keeps Φ.
-        let (fit, x, beta, offset) = coverage_correction_fixture();
+        let (fit, x, beta, offset) = profiled_gaussian_fixture();
         assert_eq!(fit.wald_residual_degrees_of_freedom(), Some(15.0));
         let reference = IntervalReference::of_fit(&fit).expect("estimated-scale reference");
         assert_eq!(
@@ -4664,7 +4372,7 @@ mod tests {
             offset.view(),
             gam_spec::LikelihoodSpec::gaussian_identity(),
             &fit,
-            &corrections_baseline_options(),
+            &conditional_eta_options(),
         )
         .expect("estimated-scale prediction");
         for (tag, half_width) in [
@@ -4691,7 +4399,7 @@ mod tests {
             offset.view(),
             gam_spec::LikelihoodSpec::gaussian_identity(),
             &known,
-            &corrections_baseline_options(),
+            &conditional_eta_options(),
         )
         .expect("known-scale prediction");
         assert!((pred.eta_upper[0] - 1.0 - z * se).abs() <= 1e-12);
@@ -4725,178 +4433,6 @@ mod tests {
             IntervalReference::of_fit(&fit).expect("location-scale reference"),
             IntervalReference::Normal
         );
-    }
-
-    #[test]
-    fn edgeworth_one_sided_makes_interval_asymmetric_with_positive_skew() {
-        let (fit, x, beta, offset) = coverage_correction_fixture();
-        let mut opts = corrections_baseline_options();
-        opts.edgeworth_one_sided = true;
-        opts.eta_skewness_for_corrections = Some(array![0.6_f64]);
-
-        let pred = predict_gamwith_uncertainty(
-            x.view(),
-            beta.view(),
-            offset.view(),
-            gam_spec::LikelihoodSpec::gaussian_identity(),
-            &fit,
-            &opts,
-        )
-        .expect("edgeworth prediction");
-
-        // Cornish–Fisher with κ₃ = 0.6, z ≈ 1.96: bump = (z²−1)·0.6/6 > 0
-        // ⇒ z_upper > z_central > z_lower ⇒ upper tail moves further right
-        // and the lower tail moves *closer* to η̂. Equivalently, the
-        // (η_upper − η̂) > (η̂ − η_lower).
-        let dist_upper = pred.eta_upper[0] - 1.0;
-        let dist_lower = 1.0 - pred.eta_lower[0];
-        assert!(
-            dist_upper > dist_lower + 1e-9,
-            "positive skew should push upper tail further than lower: \
-             upper-dist={dist_upper}, lower-dist={dist_lower}"
-        );
-        // Skew = 0 must reduce to the symmetric interval (parity check).
-        opts.eta_skewness_for_corrections = Some(array![0.0_f64]);
-        let pred_sym = predict_gamwith_uncertainty(
-            x.view(),
-            beta.view(),
-            offset.view(),
-            gam_spec::LikelihoodSpec::gaussian_identity(),
-            &fit,
-            &opts,
-        )
-        .expect("edgeworth zero-skew prediction");
-        let sym_upper = pred_sym.eta_upper[0] - 1.0;
-        let sym_lower = 1.0 - pred_sym.eta_lower[0];
-        assert!((sym_upper - sym_lower).abs() <= 1e-12);
-    }
-
-    #[test]
-    fn boundary_correction_widens_interval_near_edge() {
-        // Two query rows on a single axis with training support [0, 10].
-        // Row 0 lies in the interior (x=5 ⇒ d_edge=5, well outside the
-        // boundary band β·range=0.05·10=0.5). Row 1 is near the edge
-        // (x=9.9 ⇒ d_edge=0.1, inside the band) and must receive a
-        // strictly wider interval than the baseline.
-        let beta = array![1.0_f64];
-        let cov = array![[0.25_f64]];
-        let fit = posterior_band_fixture(beta.clone(), cov);
-        let x = array![[1.0_f64], [1.0_f64]];
-        let offset = array![0.0_f64, 0.0_f64];
-
-        let mut opts = corrections_baseline_options();
-        opts.boundary_correction = true;
-        opts.predictor_x_for_corrections = Some(array![[5.0_f64], [9.9_f64]]);
-        opts.training_support = Some(TrainingSupport {
-            axis_min: array![0.0_f64],
-            axis_max: array![10.0_f64],
-        });
-
-        let pred = predict_gamwith_uncertainty(
-            x.view(),
-            beta.view(),
-            offset.view(),
-            gam_spec::LikelihoodSpec::gaussian_identity(),
-            &fit,
-            &opts,
-        )
-        .expect("boundary-corrected prediction");
-
-        let baseline_se = (0.25_f64).sqrt();
-        // Interior row (x=5) is outside the boundary band ⇒ no inflation.
-        assert!(
-            (pred.eta_standard_error[0] - baseline_se).abs() <= 1e-12,
-            "interior row must not be inflated: {} vs {}",
-            pred.eta_standard_error[0],
-            baseline_se
-        );
-        // Near-edge row must have strictly higher SE.
-        assert!(
-            pred.eta_standard_error[1] > baseline_se + 1e-9,
-            "near-edge row must be inflated: got {}, baseline {}",
-            pred.eta_standard_error[1],
-            baseline_se
-        );
-        // Direction: interval must be wider, not narrower.
-        let width0 = pred.eta_upper[0] - pred.eta_lower[0];
-        let width1 = pred.eta_upper[1] - pred.eta_lower[1];
-        assert!(
-            width1 > width0 + 1e-9,
-            "near-edge interval not wider: width0={width0}, width1={width1}"
-        );
-    }
-
-    #[test]
-    fn ood_inflation_widens_interval_outside_support() {
-        let beta = array![1.0_f64];
-        let cov = array![[0.25_f64]];
-        let fit = posterior_band_fixture(beta.clone(), cov);
-        let x = array![[1.0_f64], [1.0_f64]];
-        let offset = array![0.0_f64, 0.0_f64];
-
-        // Row 0: in-support (x=5). Row 1: well past the upper bound (x=15
-        // outside [0, 10]).
-        let mut opts = corrections_baseline_options();
-        opts.ood_inflation = true;
-        opts.predictor_x_for_corrections = Some(array![[5.0_f64], [15.0_f64]]);
-        opts.training_support = Some(TrainingSupport {
-            axis_min: array![0.0_f64],
-            axis_max: array![10.0_f64],
-        });
-
-        let pred = predict_gamwith_uncertainty(
-            x.view(),
-            beta.view(),
-            offset.view(),
-            gam_spec::LikelihoodSpec::gaussian_identity(),
-            &fit,
-            &opts,
-        )
-        .expect("ood-inflated prediction");
-
-        let baseline_se = (0.25_f64).sqrt();
-        assert!((pred.eta_standard_error[0] - baseline_se).abs() <= 1e-12);
-        // Excess fraction = (15-10)/10 = 0.5 ⇒ factor = 1 + γ·0.25 with
-        // default γ = 1 ⇒ 1.25 ⇒ se = sqrt(0.25·1.25) = sqrt(0.3125).
-        let expected = (0.25_f64 * 1.25).sqrt();
-        assert!(
-            (pred.eta_standard_error[1] - expected).abs() <= 1e-12,
-            "ood inflation factor wrong: got {}, expected {}",
-            pred.eta_standard_error[1],
-            expected
-        );
-        assert!(pred.eta_standard_error[1] > baseline_se);
-    }
-
-    #[test]
-    fn edgeworth_helper_zero_skew_returns_central_z() {
-        let z = 1.96_f64;
-        let adj = edgeworth_one_sided_quantile(z, 0.0);
-        assert!((adj.z_lower - z).abs() <= 1e-12);
-        assert!((adj.z_upper - z).abs() <= 1e-12);
-    }
-
-    #[test]
-    fn boundary_helper_returns_one_in_interior() {
-        let f = boundary_variance_inflation_factor(
-            array![5.0_f64].view(),
-            array![0.0_f64].view(),
-            array![10.0_f64].view(),
-            0.25,
-            0.05,
-        );
-        assert!((f - 1.0).abs() <= 1e-12);
-    }
-
-    #[test]
-    fn ood_helper_returns_one_inside_box() {
-        let f = ood_variance_inflation_factor(
-            array![5.0_f64].view(),
-            array![0.0_f64].view(),
-            array![10.0_f64].view(),
-            1.0,
-        );
-        assert!((f - 1.0).abs() <= 1e-12);
     }
 
     #[test]

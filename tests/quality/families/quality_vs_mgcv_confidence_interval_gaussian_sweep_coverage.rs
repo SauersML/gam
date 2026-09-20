@@ -187,9 +187,6 @@ fn gam_confidence_interval_domain_averaged_coverage_hits_nominal() {
                     covariance_mode: InferenceCovarianceMode::Conditional,
                     mean_interval_method: MeanIntervalMethod::TransformEta,
                     includeobservation_interval: false,
-                    edgeworth_one_sided: false,
-                    boundary_correction: false,
-                    ood_inflation: false,
                     ..PredictUncertaintyOptions::default()
                 },
             )

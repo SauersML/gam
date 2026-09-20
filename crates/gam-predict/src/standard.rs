@@ -391,7 +391,7 @@ impl PredictableModel for StandardPredictor {
         options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
         // Wiggle-free standard fits use the richer dedicated engine (bias
-        // correction, boundary/OOD inflation, smoothing-corrected backend);
+        // correction, extrapolation variance, smoothing-corrected backend);
         // the link-wiggle path shares the generic interval driver.
         if self.link_wiggle.is_none() {
             return predict_gamwith_uncertainty(

@@ -168,9 +168,6 @@ fn response_scale_ci_is_calibrated_and_matches_or_beats_mgcv() {
                 covariance_mode: InferenceCovarianceMode::Conditional,
                 mean_interval_method: MeanIntervalMethod::Delta,
                 includeobservation_interval: false,
-                edgeworth_one_sided: false,
-                boundary_correction: false,
-                ood_inflation: false,
                 ..PredictUncertaintyOptions::default()
             },
         )
@@ -202,9 +199,6 @@ fn response_scale_ci_is_calibrated_and_matches_or_beats_mgcv() {
                 covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
                 mean_interval_method: MeanIntervalMethod::Delta,
                 includeobservation_interval: false,
-                edgeworth_one_sided: false,
-                boundary_correction: false,
-                ood_inflation: false,
                 ..PredictUncertaintyOptions::default()
             },
         )

@@ -168,8 +168,6 @@ fn held_out_calibration_fold_of_different_size_is_accepted_and_covers() {
     let mut options = PredictUncertaintyOptions {
         confidence_level: nominal,
         includeobservation_interval: false,
-        edgeworth_one_sided: false,
-        boundary_correction: false,
         ..Default::default()
     };
     options.conformal_level = Some(nominal);
