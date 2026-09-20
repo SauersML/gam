@@ -3658,7 +3658,7 @@ where
         // bit-for-bit.
         //
         // The returned fit does not need it: the covariance above is complete
-        // without it, and the diagnostic costs 100 to 2155 inner solves plus a
+        // without it, and the diagnostic costs 2155 inner solves plus a
         // fresh ρ-Hessian. So it runs only when the caller requests ρ-posterior
         // inference (`skip_rho_posterior_inference = false`), together with the
         // escalation tier it grades for (quadrature or NUTS over ρ, whichever

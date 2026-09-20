@@ -44,8 +44,8 @@
 //! `√n(1+k)/(n+10)` (with `n = ⌈√M⌉`; [`gam_solve::psis::shape_standard_error`],
 //! and per fit [`k_hat_standard_error`]) around the shrunk shape
 //! `(n·k + 10·0.5)/(n + 10)`, NOT around `k`:
-//! at the initial `M = 100` the tail sample is `10` and the standard error at the
-//! `0.7` boundary is `≈ 0.27`; at the largest `M = 2155` it is `47` and `≈ 0.20`.
+//! at `M = 100` the tail sample is `10` and the standard error at the `0.7`
+//! boundary is `≈ 0.27`; at the diagnostic's `M = 2155` it is `47` and `≈ 0.20`.
 //! Reaching a
 //! standard error of `0.05` takes a tail of `≈ 10³`, i.e. `M ≈ 10⁶`. A single
 //! `k̂` near a cutoff is therefore not evidence about which side of the cutoff
@@ -512,11 +512,10 @@ where
 ///   diagnostic is refused at the first draw it cannot value, never formed
 ///   from the rest.
 ///
-/// The proposal draw count `M` is not an option: it is the draw count at which
-/// PSIS is reliable for the tail shape the draws show,
-/// [`gam_solve::psis::reliable_sample_size`]`(k̂)`, starting from the `100`
-/// draws a shape at [`PLUG_IN_ADEQUATE_K_HAT`] needs and growing to at most the
-/// `2155` a shape at [`ESCALATE_K_HAT`] needs (#3187).
+/// The proposal draw count `M` is not an option: it is the `2155` draws at which
+/// PSIS is reliable for a shape at [`ESCALATE_K_HAT`],
+/// [`gam_solve::psis::reliable_sample_size`]`(ESCALATE_K_HAT)`, so every shape
+/// the grade calls usable is reliably estimated (#3187).
 ///
 /// Returns `Ok(None)` when `K = 0`: there is nothing to grade. Returns the typed
 /// [`RhoPosteriorRefusal`] naming the site when the diagnostic cannot be formed —
@@ -550,57 +549,45 @@ where
     }
     let l_inv = whitening_factor_from_outer_hessian(outer_hessian)?;
 
-    // The draw count is the one at which PSIS is reliable for the shape the
-    // draws show (`reliable_sample_size`): it starts where a shape at the
-    // plug-in cutoff is, and grows to `S(k̂)` while `k̂` asks for more. A shape
-    // past the escalation cutoff is reliable at no draw count, so it ends the
-    // loop with its grade. `S(k̂)` never exceeds `S(ESCALATE_K_HAT)` otherwise,
-    // and `M` strictly grows, so the loop ends.
-    let mut m = reliable_sample_size(PLUG_IN_ADEQUATE_K_HAT)
-        .expect("the plug-in cutoff is a shape below 1");
+    // The draw count is the smallest at which PSIS is reliable for every shape
+    // the grade calls usable: `reliable_sample_size` is `S(k) = 10^{1/(1-k)}`,
+    // and `S(ESCALATE_K_HAT) = 2155` is where the sample-size threshold
+    // `1 - 1/log10(M)` reaches the escalation cutoff, so the grade's cutoffs
+    // are the operative ones at this `M`. Growing `M` from a smaller start
+    // while `k̂` asks for more stops on the draws' noise instead: from `100`
+    // draws (a tail of `10`) an infinite-variance Cauchy-over-Gaussian target
+    // reads `k̂ < 0.5` in 43.5% of 200 seeds, against 13.5% at `2155` (#3187).
+    let m =
+        reliable_sample_size(ESCALATE_K_HAT).expect("the escalation cutoff is a shape below 1");
     let mut rng = DetNormal::new(ADEQUACY_SEED);
     let mut raw_weights: Vec<f64> = Vec::with_capacity(m);
-    loop {
-        while raw_weights.len() < m {
-            let draw = raw_weights.len();
-            let z: Array1<f64> = Array1::from_iter((0..k).map(|_| rng.normal()));
-            // ρ_m = ρ̂ + L_inv z.
-            let mut rho_m = rho_hat.clone();
-            for i in 0..k {
-                let mut acc = 0.0;
-                for j in 0..k {
-                    acc += l_inv[[i, j]] * z[j];
-                }
-                rho_m[i] += acc;
+    for draw in 0..m {
+        let z: Array1<f64> = Array1::from_iter((0..k).map(|_| rng.normal()));
+        // ρ_m = ρ̂ + L_inv z.
+        let mut rho_m = rho_hat.clone();
+        for i in 0..k {
+            let mut acc = 0.0;
+            for j in 0..k {
+                acc += l_inv[[i, j]] * z[j];
             }
-            let half_norm_sq = 0.5 * z.iter().map(|&v| v * v).sum::<f64>();
-            // log w_m = −criterion(ρ_m) + criterion(ρ̂) + ½‖z_m‖².
-            let cost = criterion(&rho_m).map_err(|detail| {
-                RhoPosteriorRefusal::CriterionUnavailableAtDraw { draw, detail }
-            })?;
-            if !cost.is_finite() {
-                return Err(RhoPosteriorRefusal::CriterionNotFiniteAtDraw { draw });
-            }
-            raw_weights.push(-cost + cost_hat + half_norm_sq);
+            rho_m[i] += acc;
         }
-        let (k_hat, effective_sample_size) = smoothed_importance_diagnostic(&raw_weights)?;
-        let needed = if k_hat > ESCALATE_K_HAT {
-            None
-        } else {
-            reliable_sample_size(k_hat)
-        };
-        match needed {
-            Some(needed) if needed > m => m = needed,
-            _ => {
-                return Ok(Some(RhoPosteriorAdequacy {
-                    k_hat,
-                    adequacy: RhoProposalAdequacy::from_k_hat(k_hat),
-                    n_samples: m,
-                    effective_sample_size,
-                }));
-            }
+        let half_norm_sq = 0.5 * z.iter().map(|&v| v * v).sum::<f64>();
+        // log w_m = −criterion(ρ_m) + criterion(ρ̂) + ½‖z_m‖².
+        let cost = criterion(&rho_m)
+            .map_err(|detail| RhoPosteriorRefusal::CriterionUnavailableAtDraw { draw, detail })?;
+        if !cost.is_finite() {
+            return Err(RhoPosteriorRefusal::CriterionNotFiniteAtDraw { draw });
         }
+        raw_weights.push(-cost + cost_hat + half_norm_sq);
     }
+    let (k_hat, effective_sample_size) = smoothed_importance_diagnostic(&raw_weights)?;
+    Ok(Some(RhoPosteriorAdequacy {
+        k_hat,
+        adequacy: RhoProposalAdequacy::from_k_hat(k_hat),
+        n_samples: m,
+        effective_sample_size,
+    }))
 }
 
 /// Pareto-smooth the log importance weights and return the tail shape `k̂` with
@@ -678,9 +665,7 @@ mod tests {
         let graded = rho_posterior_adequacy(&rho_hat, &h, crit)
             .expect("diagnostic formed")
             .expect("diagnostic present");
-        // A shape this small is reliable at the initial draw count, so the
-        // diagnostic draws no more.
-        assert_eq!(graded.n_samples, 100);
+        assert_eq!(graded.n_samples, 2155);
         // All weights equal ⇒ ESS == M and k̂ small ⇒ plug-in adequate.
         assert!(
             (graded.effective_sample_size - graded.n_samples as f64).abs() < 1e-6,
@@ -718,18 +703,9 @@ mod tests {
             "heavy-tailed target must raise k̂ above 0.5, got {}",
             graded.k_hat
         );
-        // #3187: the draw count grew past the initial 100 to the one at which
-        // PSIS is reliable for the shape it reports, unless that shape is
-        // reliable at no draw count.
-        assert!(graded.n_samples > 100, "M = {}", graded.n_samples);
-        assert!(
-            graded.k_hat > ESCALATE_K_HAT
-                || reliable_sample_size(graded.k_hat)
-                    .is_some_and(|needed| needed <= graded.n_samples),
-            "k̂ = {} graded from only M = {} draws",
-            graded.k_hat,
-            graded.n_samples
-        );
+        // #3187: the draw count is the one at which PSIS is reliable for a shape
+        // at the escalation cutoff.
+        assert_eq!(graded.n_samples, 2155);
         // This used to be `assert_ne!(.., PlugInAdequate)`, which is ENTAILED
         // by the `k̂ > 0.5` assertion five lines up: `PlugInAdequate` is
         // DEFINED as `k̂ < 0.5`. It could not distinguish `ImportanceCorrect`
@@ -787,9 +763,9 @@ mod tests {
     }
 
     /// #2946 T2: a fit's `k̂` resolution is the Pareto shape error at the tail
-    /// the fit used, `tail_count(M)`, at its own `k̂`. At the initial `M = 100` a
-    /// `k̂` at the `0.7` cutoff is resolved only to `≈ 0.27`, the value the
-    /// module docs state.
+    /// the fit used, `tail_count(M)`, at its own `k̂`. At `M = 100` a `k̂` at
+    /// the `0.7` cutoff is resolved only to `≈ 0.27`, the value the module docs
+    /// state.
     #[test]
     fn k_hat_standard_error_reads_the_fits_own_tail_2946() {
         let at_cutoff = RhoPosteriorAdequacy {
