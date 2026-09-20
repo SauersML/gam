@@ -1739,6 +1739,12 @@ pub struct CustomFamilyOwnedMode {
     pub(crate) rho: Array1<f64>,
     pub(crate) hyper_values: Array1<f64>,
     pub(crate) inner: BlockwiseInnerResult,
+    /// The `p × ψ` fixed-β inner-gradient scores `g_j = ∂_{ψ_j} ∇_β F` of the
+    /// evaluation that owns this mode, in the stacked coefficient frame of
+    /// `inner`, so `∂β̂/∂ψ_j = −H⁻¹ g_j` (#2677). Read only when the mode has
+    /// ψ coordinates; `None` when the owning evaluation assembled no ψ
+    /// coordinate bundle (a value-only or ρ-only evaluation).
+    pub(crate) psi_scores: Option<Array2<f64>>,
 }
 
 /// Analytic joint-hyper result together with its exact owned coefficient mode.
@@ -1771,6 +1777,8 @@ pub(crate) struct OuterObjectiveEvalResult {
     pub(crate) inner_converged: bool,
     pub(crate) hyper_values: Array1<f64>,
     pub(crate) ext_mode_response_cols: Option<Array2<f64>>,
+    /// See [`CustomFamilyOwnedMode::psi_scores`].
+    pub(crate) psi_scores: Option<Array2<f64>>,
     /// Kept rank of the pseudo-log-determinant this evaluation priced; `None` when the
     /// criterion is not projected. Two evaluations whose kept ranks differ price two
     /// different criteria (#2765).
@@ -1825,6 +1833,7 @@ pub(crate) fn outer_eval_result_into_joint_hyper_owned_result(
         inner_converged,
         hyper_values,
         inner,
+        psi_scores,
         ..
     } = result;
     let rho = warm_start.rho.clone();
@@ -1842,6 +1851,7 @@ pub(crate) fn outer_eval_result_into_joint_hyper_owned_result(
             rho,
             hyper_values,
             inner,
+            psi_scores,
         },
     }
 }

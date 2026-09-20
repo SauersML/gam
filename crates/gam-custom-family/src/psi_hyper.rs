@@ -3119,6 +3119,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                     inner_converged: inner.converged,
                     hyper_values: hyper_layout.values().clone(),
                     ext_mode_response_cols: None,
+                    psi_scores: None,
                     criterion_rank: value_only.criterion_rank,
                     inner: inner.clone(),
                 });
@@ -3611,6 +3612,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         inner_converged: inner.converged,
                         hyper_values: hyper_layout.values().clone(),
                         ext_mode_response_cols: None,
+                        psi_scores: None,
                         criterion_rank: value_only.criterion_rank,
                         inner: inner.clone(),
                     });
@@ -4412,6 +4414,8 @@ pub fn upgrade_custom_family_joint_hyper_mode_shared<
         rho: owned_rho,
         hyper_values: owned_hyper_values,
         inner: selected_inner,
+        // The derivative evaluation below re-assembles the ψ scores at this mode.
+        psi_scores: _,
     } = mode;
 
     let same_rho = owned_rho.len() == rho_current.len()
@@ -4629,6 +4633,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         ConstrainedWarmStart,
         bool,
         BlockwiseInnerResult,
+        Option<Array2<f64>>,
     ),
     CustomFamilyError,
 > {
@@ -4692,7 +4697,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
             "custom-family joint-hyper EFS non-converged inner solve",
         )
         .map_err(CustomFamilyError::from)?;
-        return Ok((eval, warm, converged, inner));
+        return Ok((eval, warm, converged, inner, None));
     }
 
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
@@ -4818,6 +4823,18 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         hessian_beta_independent,
         psi_workspace.clone(),
     )?;
+    if let Some(coord) = psi_coords.iter().find(|coord| coord.g.len() != total) {
+        crate::bail_dim_custom!(
+            "joint-hyper EFS psi score length {}, expected {total}",
+            coord.g.len()
+        );
+    }
+    // The natural-frame ψ scores `g_j = ∂_{ψ_j} ∇_β F` the owned mode carries
+    // to fit assembly (#2677); see `CustomFamilyOwnedMode::psi_scores`.
+    let mut psi_scores = Array2::<f64>::zeros((total, psi_coords.len()));
+    for (column, coord) in psi_coords.iter().enumerate() {
+        psi_scores.column_mut(column).assign(&coord.g);
+    }
     let ext_bundle = ExtCoordBundle {
         completion_psi: None,
         completion_psi_partial: None,
@@ -4946,7 +4963,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         cached_inner: Some(cached_inner_mode_from_result(&inner)),
     };
 
-    Ok((efs_eval, warm, inner.converged, inner))
+    Ok((efs_eval, warm, inner.converged, inner, Some(psi_scores)))
 }
 
 /// Evaluate the joint custom-family hyper-surface in fixed-point form for the
@@ -5013,8 +5030,8 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_owned_shared<
         );
     }
     let hyper_values = hyper_layout.values().clone();
-    let (efs_eval, warm_start, inner_converged, inner) = if hyper_layout.is_empty() {
-        outerobjectiveefs(
+    let (efs_eval, warm_start, inner_converged, inner, psi_scores) = if hyper_layout.is_empty() {
+        let (efs_eval, warm_start, inner_converged, inner) = outerobjectiveefs(
             family,
             specs,
             options,
@@ -5023,7 +5040,8 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_owned_shared<
             warm_start.map(|w| &w.inner),
             gam_problem::RhoPrior::Flat,
         )
-        .map_err(CustomFamilyError::from)?
+        .map_err(CustomFamilyError::from)?;
+        (efs_eval, warm_start, inner_converged, inner, None)
     } else {
         evaluate_custom_family_joint_hyper_efs_internal_shared(
             family,
@@ -5040,6 +5058,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_owned_shared<
         rho: warm_start.rho.clone(),
         hyper_values: hyper_values.clone(),
         inner,
+        psi_scores,
     };
     Ok(CustomFamilyJointHyperEfsOwnedResult {
         result: outer_efs_result_to_joint_hyper_efs_result(

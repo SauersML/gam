@@ -1585,6 +1585,28 @@ pub(crate) fn joint_outer_evaluate(
     } else {
         None
     };
+    // The ψ coordinates' fixed-β inner-gradient scores `g_j = ∂_{ψ_j} ∇_β F`,
+    // read BEFORE the bundle is rescaled by `rho_curvature_scale`: the
+    // unified evaluator sees `c·g_j` against `c·H`, while the reported
+    // conditional covariance and the ρ scores `λ_k S_k β̂` live in the natural
+    // frame, where `∂β̂/∂ψ_j = −H⁻¹ g_j` (#2677).
+    if let Some(bundle) = ext_bundle.as_ref()
+        && let Some(coord) = bundle.coords.iter().find(|coord| coord.g.len() != total)
+    {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "joint outer evaluation received a psi score of length {}, expected {total}",
+                coord.g.len()
+            ),
+        });
+    }
+    let psi_scores = ext_bundle.as_ref().map(|bundle| {
+        let mut scores = Array2::<f64>::zeros((total, bundle.coords.len()));
+        for (column, coord) in bundle.coords.iter().enumerate() {
+            scores.column_mut(column).assign(&coord.g);
+        }
+        scores
+    });
     let (objective, grad, outer_hessian, criterion_components, ext_mode_response_cols) =
         unified_joint_cost_gradient(
             inner,
@@ -1699,6 +1721,7 @@ pub(crate) fn joint_outer_evaluate(
         inner_converged: inner.converged,
         hyper_values: Array1::zeros(0),
         ext_mode_response_cols,
+        psi_scores,
         criterion_rank,
         inner: inner.clone(),
     })

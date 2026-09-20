@@ -3025,6 +3025,10 @@ pub enum SmoothingCorrectionAbsence {
     /// A fit whose inference stayed factorized (the dense covariance bundle was not reserved)
     /// could not reserve the workspace the first-order correction is assembled in (#3283).
     CorrectionWorkspaceRefused { detail: String },
+    /// The certified outer optimum moved family hyperparameters `ψ`, but the terminal evaluation
+    /// that owns the coefficient mode assembled no ψ scores `∂_ψ∇_β F`, so the mode response
+    /// `∂β̂/∂ψ` that carries their uncertainty into the coefficients is unknown (#2677).
+    FamilyHyperScoresUnrecorded { psi_dimension: usize },
 }
 
 /// Why a custom-family outer search declares no analytic ρ-Hessian.
@@ -3081,6 +3085,11 @@ impl std::fmt::Display for SmoothingCorrectionAbsence {
             Self::CorrectionWorkspaceRefused { detail } => write!(
                 f,
                 "the factorized fit could not reserve the smoothing correction's workspace: {detail}"
+            ),
+            Self::FamilyHyperScoresUnrecorded { psi_dimension } => write!(
+                f,
+                "the evaluation that owns the coefficient mode recorded no scores for its \
+                 {psi_dimension} family hyperparameter(s), so their mode response is unknown"
             ),
         }
     }
