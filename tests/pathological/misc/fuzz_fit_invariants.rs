@@ -11,9 +11,17 @@
 //!   I3  finite objective    — REML score and log-likelihood are finite.
 //!   I4  determinism         — refitting identical data with the identical
 //!                             config reproduces β bit-for-bit-close.
-//!   I5  EDF bounds           — total EDF ∈ [null_space_dim − tol, p + tol].
+//!   I5  EDF bounds           — total EDF ∈ [0, p] up to rounding. (The unpenalized
+//!                             dimension is NOT a universal lower bound: the
+//!                             default tensor double penalty also shrinks the
+//!                             marginal null spaces.)
 //!   I6  SE ordering          — standard errors are finite and non-negative,
 //!                             so any symmetric interval lower ≤ mean ≤ upper.
+//!
+//! A typed refusal is accepted only on degenerate or under-determined cells;
+//! the non-degenerate cells at the largest `n` must fit, the identical refit
+//! must succeed for I4, and every shape must reach the invariant checks at
+//! least once, so the sweep cannot pass by refusing everything.
 //!
 //! This file is a DISCOVERY net. Any case that trips an invariant is a bug: it
 //! gets minimized into its own dedicated regression test and a root-cause fix.
@@ -268,9 +276,38 @@ fn build_data(
     encode_recordswith_inferred_schema(headers, rows).expect("encode fuzz data")
 }
 
-/// Outcome of fitting + checking one case. `Ok(())` is invariant-clean;
+/// How an invariant-clean case was disposed of. Only `Checked` means the
+/// I1–I6 invariants were actually evaluated on a fit; the driver counts these
+/// so the sweep cannot pass having checked nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaseOutcome {
+    /// A standard fit was produced and every invariant was evaluated.
+    Checked,
+    /// The engine refused the problem with a typed error (legitimate only for
+    /// degenerate or under-determined cells; see [`must_fit`]).
+    Refused,
+    /// A non-standard fast path answered; its own suites own its invariants.
+    NonStandard,
+}
+
+/// Cells the engine must NOT refuse: the non-degenerate design at the largest
+/// grid `n`. There every shape's default basis has fewer columns than the 40
+/// rows, the predictors are continuous uniform draws with no ties or constant
+/// columns, and the response is a smooth signal plus noise with no separation
+/// (the binomial success probability stays inside [0.35, 0.73]), so the model
+/// is an ordinary well-posed GAM. A refusal there is a bug, not a loud refusal.
+fn must_fit(n: usize, degen: Degeneracy) -> bool {
+    matches!(degen, Degeneracy::None) && n == GRID_NS.iter().copied().max().unwrap_or(0)
+}
+
+/// Outcome of fitting + checking one case. `Ok(outcome)` is invariant-clean;
 /// `Err(msg)` is an invariant VIOLATION (a bug) with a self-contained repro.
-fn check_case(shape: &Shape, n: usize, degen: Degeneracy, seed: u64) -> Result<(), String> {
+fn check_case(
+    shape: &Shape,
+    n: usize,
+    degen: Degeneracy,
+    seed: u64,
+) -> Result<CaseOutcome, String> {
     let repro = format!(
         "[{}/{} family={} n={} degen={} seed={}] formula=`{}`",
         shape.label,
@@ -288,12 +325,18 @@ fn check_case(shape: &Shape, n: usize, degen: Degeneracy, seed: u64) -> Result<(
         ..FitConfig::default()
     };
 
-    // ── fit (must not panic; a clean Err is acceptable — the engine is
-    //    allowed to REFUSE a degenerate problem, it just may not crash or
-    //    silently return garbage) ─────────────────────────────────────────
+    // ── fit (must not panic; a clean Err is acceptable on a degenerate or
+    //    under-determined cell — the engine is allowed to REFUSE such a
+    //    problem, it just may not crash or silently return garbage — but a
+    //    well-posed cell (`must_fit`) must produce a fit) ────────────────────
     let result = match fit_from_formula(shape.formula, &data, &cfg) {
         Ok(r) => r,
-        Err(_) => return Ok(()), // a loud, typed refusal is fine.
+        Err(e) if must_fit(n, degen) => {
+            return Err(format!(
+                "{repro}\n  FIT REFUSED on a well-posed (non-degenerate, n > p) case: {e}"
+            ));
+        }
+        Err(_) => return Ok(CaseOutcome::Refused), // a loud, typed refusal is fine.
     };
 
     // Refit for the determinism invariant (I4).
@@ -302,7 +345,7 @@ fn check_case(shape: &Shape, n: usize, degen: Degeneracy, seed: u64) -> Result<(
     let FitResult::Standard(fit) = result else {
         // Non-standard fast paths (scan/cascade) carry their own invariant
         // tests; this sweep targets the dense standard stack.
-        return Ok(());
+        return Ok(CaseOutcome::NonStandard);
     };
 
     // I1 finite β.
@@ -365,29 +408,45 @@ fn check_case(shape: &Shape, n: usize, degen: Degeneracy, seed: u64) -> Result<(
         }
     }
 
-    // I4 determinism: refit β must match to tight tolerance.
-    if let Ok(FitResult::Standard(fit2)) = result2 {
-        if fit2.fit.beta.len() == fit.fit.beta.len() {
-            let max_diff = fit
-                .fit
-                .beta
-                .iter()
-                .zip(fit2.fit.beta.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max);
-            // Allow only floating-point reduction noise, not a different optimum.
-            if max_diff > 1e-6 {
-                return Err(format!(
-                    "{repro}\n  I4 VIOLATED: refit β diverged by {max_diff:.3e} (non-determinism)"
-                ));
-            }
-        } else {
+    // I4 determinism: the identical refit must succeed on the same standard
+    // route and reproduce β to tight tolerance. A refit that errors or lands
+    // on a different `FitResult` variant after the first fit succeeded is the
+    // strongest form of non-determinism, not a case to skip.
+    let fit2 = match result2 {
+        Ok(FitResult::Standard(fit2)) => fit2,
+        Ok(_) => {
             return Err(format!(
-                "{repro}\n  I4 VIOLATED: refit β length {} != {}",
-                fit2.fit.beta.len(),
-                fit.fit.beta.len()
+                "{repro}\n  I4 VIOLATED: first fit was Standard but the identical refit \
+                 returned a different FitResult variant (non-determinism)"
             ));
         }
+        Err(e) => {
+            return Err(format!(
+                "{repro}\n  I4 VIOLATED: first fit succeeded but the identical refit \
+                 failed (non-determinism): {e}"
+            ));
+        }
+    };
+    if fit2.fit.beta.len() == fit.fit.beta.len() {
+        let max_diff = fit
+            .fit
+            .beta
+            .iter()
+            .zip(fit2.fit.beta.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        // Allow only floating-point reduction noise, not a different optimum.
+        if max_diff > 1e-6 {
+            return Err(format!(
+                "{repro}\n  I4 VIOLATED: refit β diverged by {max_diff:.3e} (non-determinism)"
+            ));
+        }
+    } else {
+        return Err(format!(
+            "{repro}\n  I4 VIOLATED: refit β length {} != {}",
+            fit2.fit.beta.len(),
+            fit.fit.beta.len()
+        ));
     }
 
     // I5 EDF bounds + I6 SE ordering (only when inference is populated).
@@ -412,7 +471,7 @@ fn check_case(shape: &Shape, n: usize, degen: Degeneracy, seed: u64) -> Result<(
         }
     }
 
-    Ok(())
+    Ok(CaseOutcome::Checked)
 }
 
 /// Rebuild the training predictor matrix (x0..x{ncols-1} plus a trailing column
@@ -463,10 +522,14 @@ fn training_predictor_matrix(ncols: usize, n: usize, degen: Degeneracy, seed: u6
     m
 }
 
+/// Sample sizes swept by the grid. The largest is the well-posed size at which
+/// a non-degenerate case must fit ([`must_fit`]).
+const GRID_NS: &[usize] = &[8, 12, 20, 40];
+
 /// The fixed deterministic case grid: every (shape × degeneracy × n × seed).
 /// Kept small enough to run in CI but wide enough to surface edge-case bugs.
 fn case_grid() -> Vec<(&'static Shape, usize, Degeneracy, u64)> {
-    let ns: &[usize] = &[8, 12, 20, 40];
+    let ns: &[usize] = GRID_NS;
     let seeds: &[u64] = &[1, 7, 19, 101];
     let mut out = Vec::new();
     for shape in SHAPES {
@@ -491,12 +554,22 @@ fn fuzz_fit_universal_invariants() {
     let grid = case_grid();
     let mut violations: Vec<String> = Vec::new();
     let mut ran = 0usize;
+    let mut checked = 0usize;
+    let mut checked_per_shape = vec![0usize; SHAPES.len()];
     for (shape, n, degen, seed) in grid {
         ran += 1;
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             check_case(shape, n, degen, seed)
         })) {
-            Ok(Ok(())) => {}
+            Ok(Ok(CaseOutcome::Checked)) => {
+                checked += 1;
+                let idx = SHAPES
+                    .iter()
+                    .position(|s| std::ptr::eq(s, shape))
+                    .expect("grid shape comes from SHAPES");
+                checked_per_shape[idx] += 1;
+            }
+            Ok(Ok(CaseOutcome::Refused | CaseOutcome::NonStandard)) => {}
             Ok(Err(v)) => violations.push(v),
             Err(_) => violations.push(format!(
                 "[{} family={} n={} degen={} seed={}] PANIC during fit/predict",
@@ -508,8 +581,19 @@ fn fuzz_fit_universal_invariants() {
             )),
         }
     }
+    // Vacuity guard: a sweep in which some shape never reached the invariant
+    // checks has certified nothing about that shape, whatever `violations` says.
+    for (shape, &count) in SHAPES.iter().zip(checked_per_shape.iter()) {
+        if count == 0 {
+            violations.push(format!(
+                "[{}/{} family={}] no case of this shape reached the I1–I6 checks \
+                 (every cell was refused or took a non-standard route)",
+                shape.label, shape.formula, shape.family
+            ));
+        }
+    }
     eprintln!(
-        "[fuzz] ran {ran} cases, {} invariant violations",
+        "[fuzz] ran {ran} cases, checked {checked}, {} invariant violations",
         violations.len()
     );
     assert!(
