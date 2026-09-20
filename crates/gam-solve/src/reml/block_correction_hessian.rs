@@ -360,6 +360,84 @@ struct PieceSecondOrder {
     hessian: Array2<f64>,
 }
 
+/// One end of a truncated axis in the whitened coordinate, `e = √λ·t_cut`, and
+/// its ρ-motion.
+///
+/// The end is where row `r`'s predictor reaches its domain boundary `b`:
+/// `η̂_r + Y_r e = b` with `Y = X u/√λ`, so differentiating at fixed `b`
+///
+/// ```text
+///   ė_j  = −(E_{j,r} + e Ẏ_{j,r}) / Y_r,
+///   ë_jl = −(η̈_{jl,r} + ė_j Ẏ_{l,r} + ė_l Ẏ_{j,r} + e Ÿ_{jl,r}) / Y_r.
+/// ```
+///
+/// The active row is the tightest cut, which is locally constant in ρ.
+struct AxisEnd {
+    value: f64,
+    /// `∂ ln Z/∂e`.
+    log_mass_gradient: f64,
+    /// Which of the transport's sensitivities `(∂τ/∂lower, ∂τ/∂upper)` is this end's.
+    side: usize,
+    dot: Vec<f64>,
+    ddot: Vec<f64>,
+}
+
+impl AxisEnd {
+    fn new(
+        value: f64,
+        log_mass_gradient: f64,
+        side: usize,
+        row: usize,
+        axis: &AxisMotion,
+        mode: &ModeMotion,
+        pairs: &[(usize, usize)],
+    ) -> Result<Self, EstimationError> {
+        let y_r = axis.y[row];
+        if !(y_r != 0.0) || !value.is_finite() {
+            crate::bail_invalid_estim!(
+                "#784 ρ-Hessian: a feasible-interval end at row {row} has whitened slope {y_r} \
+                 and position {value}"
+            );
+        }
+        let dot: Vec<f64> = (0..axis.y_dot.len())
+            .map(|j| -(mode.eta_dot[j][row] + value * axis.y_dot[j][row]) / y_r)
+            .collect();
+        let ddot = pairs
+            .iter()
+            .enumerate()
+            .map(|(k, &(j, l))| {
+                -(mode.eta_ddot[k][row]
+                    + dot[j] * axis.y_dot[l][row]
+                    + dot[l] * axis.y_dot[j][row]
+                    + value * axis.y_ddot[k][row])
+                    / y_r
+            })
+            .collect();
+        Ok(Self {
+            value,
+            log_mass_gradient,
+            side,
+            dot,
+            ddot,
+        })
+    }
+}
+
+/// A piece is integrated on the corrector's own rule: the standard-normal
+/// Gauss–Hermite nodes `u_q`, transported onto the block's feasible interval
+/// when the likelihood ends inside the Laplace Gaussian
+/// ([`gam_math::quadrature::TruncatedNormalTransport`]), with
+///
+/// ```text
+///   V = ln Σ_q w_q e^{−F(Y τ_q)} − ln Σ_q w_q + ln Z,   τ_q = τ(u_q; ends).
+/// ```
+///
+/// On a whole-line axis `τ_q = u_q` and `Z = 1`. On a truncated one the ends
+/// move with ρ, and with them every node and the mass. From
+/// `Φ(τ) = Φ(α)(1 − Φ(u)) + Φ(β)Φ(u)` and `φ' = −xφ`, the node's end
+/// sensitivities `τ_a` satisfy `τ_ab = τ τ_a τ_b − δ_ab e_a τ_a`, and from
+/// `Z = Φ(β) − Φ(α)` with `G_a = ∂ ln Z/∂e_a`,
+/// `∂² ln Z/∂e_a∂e_b = −G_a G_b − δ_ab e_a G_a`.
 fn piece_second_order(
     piece_target: &Gam784BlockTarget<'_>,
     curvature: RowCurvature,
@@ -369,51 +447,103 @@ fn piece_second_order(
     geometry: &Geometry<'_, '_>,
 ) -> Result<PieceSecondOrder, EstimationError> {
     let n_rho = axis.y_dot.len();
+    let pairs = &geometry.pairs;
     let lambda = piece_target.block_lambdas[0];
+    let sqrt_lambda = lambda.sqrt();
     let rule = gam_math::quadrature::standard_normal_gauss_hermite_rule(order).map_err(|error| {
         EstimationError::InvalidInput(format!(
             "#784 ρ-Hessian: Gauss–Hermite rule of order {order}: {error}"
         ))
     })?;
-    let inv_sqrt = lambda.sqrt().recip();
-    let draws = Array2::from_shape_fn((1, rule.len()), |(_, q)| rule[q].0 * inv_sqrt);
+
+    let truncation = piece_target.axis_truncation();
+    let cuts = truncation
+        .as_deref()
+        .map_or([None, None], |truncation| [truncation.lower(), truncation.upper()]);
+    let transport = if cuts.iter().any(Option::is_some) {
+        let end = |cut: Option<gam_problem::laplace_sampler_contract::BlockAxisCut>, open: f64| {
+            cut.map_or(open, |cut| sqrt_lambda * cut.t)
+        };
+        Some(
+            gam_math::quadrature::TruncatedNormalTransport::new(
+                end(cuts[0], f64::NEG_INFINITY),
+                end(cuts[1], f64::INFINITY),
+            )
+            .map_err(|error| {
+                EstimationError::InvalidInput(format!(
+                    "#784 ρ-Hessian: the mode is not inside the block's feasible interval: {error}"
+                ))
+            })?,
+        )
+    } else {
+        None
+    };
+    let mut ends: Vec<AxisEnd> = Vec::with_capacity(2);
+    let mut log_mass_of_interval = 0.0;
+    if let Some(transport) = &transport {
+        let (lower_gradient, upper_gradient) = transport.log_mass_endpoint_gradient();
+        let sides = [
+            (transport.lower(), lower_gradient),
+            (transport.upper(), upper_gradient),
+        ];
+        for (side, (cut, (value, gradient))) in cuts.iter().zip(sides).enumerate() {
+            if let Some(cut) = cut {
+                ends.push(AxisEnd::new(value, gradient, side, cut.row, axis, mode, pairs)?);
+            }
+        }
+        log_mass_of_interval = transport.log_mass();
+    }
+
+    // Each node's image `τ` and its end sensitivities `(∂τ/∂lower, ∂τ/∂upper)`.
+    let mut nodes: Vec<(f64, [f64; 2], f64)> = Vec::with_capacity(rule.len());
+    for &(u, w) in &rule {
+        let node = match &transport {
+            Some(transport) => {
+                let tau = transport.transport(u).map_err(|error| {
+                    EstimationError::InvalidInput(format!(
+                        "#784 ρ-Hessian: transporting a node onto the feasible interval: {error}"
+                    ))
+                })?;
+                let (lower, upper) = transport.endpoint_sensitivities(u, tau);
+                (tau, [lower, upper], w)
+            }
+            None => (u, [0.0, 0.0], w),
+        };
+        nodes.push(node);
+    }
+    let draws = Array2::from_shape_fn((1, nodes.len()), |(_, q)| nodes[q].0 / sqrt_lambda);
     let batched = piece_target.excess_with_displaced_neg_score_batch(&draws);
-    if batched.len() != rule.len() {
+    if batched.len() != nodes.len() {
         crate::bail_invalid_estim!(
             "#784 ρ-Hessian: the excess batch returned {} nodes for {}",
             batched.len(),
-            rule.len()
+            nodes.len()
         );
     }
     let ngs_base = piece_target
         .base_neg_score()
         .map_err(EstimationError::InvalidInput)?;
     let w_mode = &piece_target.weights_obs;
-    let log_norm = log_sum_exp(rule.iter().map(|&(_, w)| w.ln()));
-    let feasible: Vec<(f64, f64, Array1<f64>)> = batched
+    let log_norm = log_sum_exp(nodes.iter().map(|&(_, _, w)| w.ln()));
+    let feasible: Vec<(f64, [f64; 2], f64, Array1<f64>)> = batched
         .into_iter()
-        .zip(rule.iter())
-        .filter_map(|((excess, ngs), &(z, w))| match ngs {
-            Some(ngs) if excess.is_finite() => Some((z, w.ln() - excess, ngs)),
+        .zip(nodes.iter())
+        .filter_map(|((excess, ngs), &(tau, sensitivity, w))| match ngs {
+            Some(ngs) if excess.is_finite() => Some((tau, sensitivity, w.ln() - excess, ngs)),
             _ => None,
         })
         .collect();
     if feasible.is_empty() {
         crate::bail_invalid_estim!("#784 ρ-Hessian: every Gauss–Hermite node was infeasible");
     }
-    let log_mass = log_sum_exp(feasible.iter().map(|(_, lw, _)| *lw));
-    let value = log_mass - log_norm;
+    let log_mass = log_sum_exp(feasible.iter().map(|(_, _, lw, _)| *lw));
+    let value = log_mass - log_norm + log_mass_of_interval;
 
-    let n = w_mode.len();
-    let mut m_ee = Array1::<f64>::zeros(n);
-    let mut m_es = Array1::<f64>::zeros(n);
-    let mut m_ss = Array1::<f64>::zeros(n);
-    let mut m_e = Array1::<f64>::zeros(n);
-    let mut m_s = Array1::<f64>::zeros(n);
+    let mut expected_second = Array1::<f64>::zeros(pairs.len());
     let mut node_gradients: Vec<(f64, Array1<f64>)> = Vec::with_capacity(feasible.len());
-    for (z, lw, ngs) in feasible {
+    for (tau, sensitivity, lw, ngs) in feasible {
         let prob = (lw - log_mass).exp();
-        let s = &axis.y * z;
+        let s = &axis.y * tau;
         let psi2 = displaced_row_curvature(piece_target, curvature, &(&piece_target.eta_hat + &s))?;
         // Row derivatives of F_i = ψ(η̂+s) − ψ(η̂) − ψ'(η̂)s − ½W s², W = ψ''(η̂).
         let f_s = &ngs - &ngs_base - &(w_mode * &s);
@@ -422,33 +552,67 @@ fn piece_second_order(
         let f_e = &f_s - &(geometry.c * &s2 * 0.5);
         let f_es = &f_ss - &(geometry.c * &s);
         let f_ee = &f_es - &(geometry.d * &s2 * 0.5);
-        m_ee.scaled_add(prob, &f_ee);
-        m_es.scaled_add(prob * z, &f_es);
-        m_ss.scaled_add(prob * z * z, &f_ss);
-        m_e.scaled_add(prob, &f_e);
-        m_s.scaled_add(prob * z, &f_s);
-        let node_gradient = Array1::from_shape_fn(n_rho, |j| {
-            f_e.dot(&mode.eta_dot[j]) + z * f_s.dot(&axis.y_dot[j])
-        });
+        // The node `s = Y τ` moves with the axis and, on a truncated axis, with
+        // the ends: ṡ_j = Ẏ_j τ + Y τ̇_j.
+        let tau_dot: Vec<f64> = (0..n_rho)
+            .map(|j| ends.iter().map(|end| sensitivity[end.side] * end.dot[j]).sum())
+            .collect();
+        let s_dot: Vec<Array1<f64>> = (0..n_rho)
+            .map(|j| &axis.y_dot[j] * tau + &(&axis.y * tau_dot[j]))
+            .collect();
+        let f_s_y = f_s.dot(&axis.y);
+        let f_s_y_dot: Vec<f64> = axis.y_dot.iter().map(|y_j| f_s.dot(y_j)).collect();
+        let node_gradient =
+            Array1::from_shape_fn(n_rho, |j| f_e.dot(&mode.eta_dot[j]) + f_s.dot(&s_dot[j]));
+        for (k, &(j, l)) in pairs.iter().enumerate() {
+            let (e_j, e_l) = (&mode.eta_dot[j], &mode.eta_dot[l]);
+            // τ̈_jl = Σ_ab τ_ab ė_a,j ė_b,l + Σ_a τ_a ë_a,jl.
+            let mut tau_ddot = 0.0;
+            for a in &ends {
+                let tau_a = sensitivity[a.side];
+                tau_ddot += tau_a * a.ddot[k] - a.value * tau_a * a.dot[j] * a.dot[l];
+                for b in &ends {
+                    tau_ddot += tau * tau_a * sensitivity[b.side] * a.dot[j] * b.dot[l];
+                }
+            }
+            // f_s·s̈_jl with s̈_jl = Ÿ_jl τ + Ẏ_j τ̇_l + Ẏ_l τ̇_j + Y τ̈_jl.
+            let f_s_s_ddot = tau * f_s.dot(&axis.y_ddot[k])
+                + tau_dot[l] * f_s_y_dot[j]
+                + tau_dot[j] * f_s_y_dot[l]
+                + tau_ddot * f_s_y;
+            expected_second[k] += prob
+                * ((&f_ee * e_j).dot(e_l)
+                    + (&f_es * e_j).dot(&s_dot[l])
+                    + (&f_es * e_l).dot(&s_dot[j])
+                    + (&f_ss * &s_dot[j]).dot(&s_dot[l])
+                    + f_e.dot(&mode.eta_ddot[k])
+                    + f_s_s_ddot);
+        }
         node_gradients.push((prob, node_gradient));
     }
-    let mut gradient = Array1::<f64>::zeros(n_rho);
+    let mut node_gradient_mean = Array1::<f64>::zeros(n_rho);
     for (prob, g) in &node_gradients {
-        gradient.scaled_add(*prob, g);
+        node_gradient_mean.scaled_add(*prob, g);
     }
-    // E_p[∂²F] − Var_p(∂F).
+    // The cost is −V: E_p[∂²F] − Var_p(∂F) − ∂² ln Z, with gradient
+    // E_p[∂F] − ∂ ln Z.
+    let mut gradient = node_gradient_mean.clone();
+    for end in &ends {
+        for j in 0..n_rho {
+            gradient[j] -= end.log_mass_gradient * end.dot[j];
+        }
+    }
     let mut hessian = Array2::<f64>::zeros((n_rho, n_rho));
-    for (k, &(j, l)) in geometry.pairs.iter().enumerate() {
-        let (e_j, e_l) = (&mode.eta_dot[j], &mode.eta_dot[l]);
-        let (y_j, y_l) = (&axis.y_dot[j], &axis.y_dot[l]);
-        let mut h = (&m_ee * e_j).dot(e_l)
-            + (&m_es * e_j).dot(y_l)
-            + (&m_es * e_l).dot(y_j)
-            + (&m_ss * y_j).dot(y_l)
-            + m_e.dot(&mode.eta_ddot[k])
-            + m_s.dot(&axis.y_ddot[k]);
+    for (k, &(j, l)) in pairs.iter().enumerate() {
+        let mut h = expected_second[k];
         for (prob, g) in &node_gradients {
-            h -= prob * (g[j] - gradient[j]) * (g[l] - gradient[l]);
+            h -= prob * (g[j] - node_gradient_mean[j]) * (g[l] - node_gradient_mean[l]);
+        }
+        for a in &ends {
+            h -= a.log_mass_gradient * a.ddot[k] - a.value * a.log_mass_gradient * a.dot[j] * a.dot[l];
+            for b in &ends {
+                h += a.log_mass_gradient * b.log_mass_gradient * a.dot[j] * b.dot[l];
+            }
         }
         hessian[(j, l)] = h;
         hessian[(l, j)] = h;

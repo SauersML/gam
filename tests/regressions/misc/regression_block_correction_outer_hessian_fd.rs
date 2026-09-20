@@ -14,7 +14,10 @@
 //!   at its certified optimum, whose fit must also ship the corrected
 //!   covariance;
 //! * a Poisson tensor fit whose block is split axis by axis (`m ≥ 2`), where
-//!   the mixed-axis Laplace term `Φ` carries second-order ρ-motion of its own.
+//!   the mixed-axis Laplace term `Φ` carries second-order ρ-motion of its own;
+//! * an inverse-Gaussian fit on its canonical `1/μ²` link, whose one-axis block
+//!   is truncated to the feasible interval `η > 0`: its ends, and with them the
+//!   transported nodes and the interval's mass `ln Z`, move with ρ.
 //!
 //! Each stencil evaluation builds a fresh criterion, which latches its own
 //! block. Every point must engage the correction on the same block columns
@@ -250,7 +253,6 @@ fn fitted_formula_criterion(
     label: &str,
     formula: &str,
     family_name: &str,
-    family: LikelihoodSpec,
     data: &gam::data::EncodedDataset,
 ) -> (Criterion, Array1<f64>) {
     let config = FitConfig {
@@ -263,7 +265,7 @@ fn fitted_formula_criterion(
     };
     let design = build_term_collection_design(request.data.view(), &request.spec)
         .expect("build the design");
-    let mut opts = standard_options(family);
+    let mut opts = standard_options(request.family.clone());
     opts.nullspace_dims = design.nullspace_dims.clone();
     opts.linear_constraints = design.linear_constraints.clone();
     let offset = &*request.offset + &design.affine_offset;
@@ -361,7 +363,6 @@ fn rare_event_binomial_block_hessian_matches_differences_at_its_optimum() {
         "rare-event binomial",
         "y ~ factor(student) + s(balance) + s(income)",
         "binomial-logit",
-        logit(),
         &data,
     );
     criterion.assert_gradient_matches_cost_differences("rare-event binomial", &optimum);
@@ -400,10 +401,6 @@ fn poisson_tensor_axis_split_block_hessian_matches_differences_at_its_optimum() 
         "poisson te",
         "y ~ te(x0, x1)",
         "poisson",
-        LikelihoodSpec::new(
-            ResponseFamily::Poisson,
-            InverseLink::Standard(StandardLink::Log),
-        ),
         &data,
     );
     enable_rho_outer_audit();
@@ -415,4 +412,40 @@ fn poisson_tensor_axis_split_block_hessian_matches_differences_at_its_optimum() 
     );
     criterion.assert_gradient_matches_cost_differences("poisson te", &optimum);
     criterion.assert_hessian_matches_gradient_differences("poisson te", &optimum);
+}
+
+/// The sweep's n = 100 `p1` inverse-Gaussian cell (see
+/// `crates/gam-models/tests/inverse_gaussian_canonical_block_quadrature.rs`).
+const INVERSE_GAUSSIAN_P1_N100: &str = include_str!(
+    "../../../crates/gam-models/tests/fixtures/inverse_gaussian_canonical_p1_n100.csv"
+);
+
+#[test]
+fn inverse_gaussian_truncated_block_hessian_matches_differences_at_its_optimum() {
+    init_parallelism();
+    let mut reader = csv::Reader::from_reader(INVERSE_GAUSSIAN_P1_N100.as_bytes());
+    let headers: Vec<String> = reader
+        .headers()
+        .expect("fixture header")
+        .iter()
+        .map(str::to_string)
+        .collect();
+    let rows: Vec<StringRecord> = reader
+        .records()
+        .map(|record| record.expect("fixture row"))
+        .collect();
+    let data = encode_recordswith_inferred_schema(headers, rows).expect("encode the fixture");
+    let (criterion, optimum) = fitted_formula_criterion(
+        "inverse gaussian",
+        "y ~ s(x0)",
+        "inverse-gaussian",
+        &data,
+    );
+    assert_eq!(
+        criterion.opts.family.link,
+        InverseLink::Standard(StandardLink::InverseSquared),
+        "the fixture must fit the canonical link, whose block is truncated"
+    );
+    criterion.assert_gradient_matches_cost_differences("inverse gaussian", &optimum);
+    criterion.assert_hessian_matches_gradient_differences("inverse gaussian", &optimum);
 }
