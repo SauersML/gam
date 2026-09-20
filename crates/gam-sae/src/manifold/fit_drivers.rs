@@ -2973,7 +2973,10 @@ impl SaeManifoldTerm {
     ///   curvature it is `material_floor / slope`.
     ///
     /// 1. Armijo backtracking from the far end finds the LONGEST step with
-    ///    sufficient decrease. A direction with tiny curvature and a live gradient
+    ///    sufficient decrease, judged against the rounding bands of `base` and of
+    ///    each trial (#3243, [`BandedPenalizedObjective::armijo_accepts`]): the
+    ///    trial must be resolvably below `base` and pass Armijo relaxed by the two
+    ///    bands. A direction with tiny curvature and a live gradient
     ///    needs a long step (#2762), and this is the globalization that starts
     ///    long. Its trial count is the number of contractions between the two
     ///    endpoints.
@@ -3002,12 +3005,13 @@ impl SaeManifoldTerm {
         registry: Option<&AnalyticPenaltyRegistry>,
         direction: ArrayView1<'_, f64>,
         dense_len: usize,
-        base_objective: f64,
+        base: BandedPenalizedObjective,
         slope: f64,
         negative_curvature: f64,
         material_floor: f64,
         snapshot: &SaeManifoldMutableState,
     ) -> Result<ObjectiveLineMinimum, String> {
+        let base_objective = base.value;
         let mut line = ObjectiveLineMinimum {
             alpha: 0.0,
             value: base_objective,
@@ -3039,48 +3043,51 @@ impl SaeManifoldTerm {
         {
             return Ok(line);
         }
-        let trial_at =
-            |term: &mut Self, alpha: f64, line: &mut ObjectiveLineMinimum| -> Result<f64, String> {
-                let value = match term.apply_newton_step(
-                    direction.slice(s![..dense_len]),
-                    direction.slice(s![dense_len..]),
-                    alpha,
-                ) {
-                    Ok(()) => {
-                        line.objective_evaluations += 1;
-                        match term.penalized_objective_total(target, rho, registry, 1.0) {
-                            Ok(value) if value.is_finite() => Some(value),
-                            Ok(value) => {
-                                line.record_failure(format!(
-                                    "non-finite objective {value} at α={alpha:.3e}"
-                                ));
-                                None
-                            }
-                            Err(err) => {
-                                line.record_failure(format!("objective at α={alpha:.3e}: {err}"));
-                                None
-                            }
+        let trial_at = |term: &mut Self,
+                        alpha: f64,
+                        line: &mut ObjectiveLineMinimum|
+         -> Result<BandedPenalizedObjective, String> {
+            let value = match term.apply_newton_step(
+                direction.slice(s![..dense_len]),
+                direction.slice(s![dense_len..]),
+                alpha,
+            ) {
+                Ok(()) => {
+                    line.objective_evaluations += 1;
+                    match term.penalized_objective_banded(target, rho, registry, 1.0) {
+                        Ok(value) if value.value.is_finite() => Some(value),
+                        Ok(value) => {
+                            line.record_failure(format!(
+                                "non-finite objective {} at α={alpha:.3e}",
+                                value.value
+                            ));
+                            None
+                        }
+                        Err(err) => {
+                            line.record_failure(format!("objective at α={alpha:.3e}: {err}"));
+                            None
                         }
                     }
-                    Err(err) => {
-                        line.record_failure(format!("step at α={alpha:.3e}: {err}"));
-                        None
-                    }
-                };
-                term.restore_mutable_state(snapshot).map_err(|err| {
-                    format!(
-                        "SaeManifoldTerm::minimize_objective_along: restoring the pre-trial \
-                         state after the trial at α={alpha:.6e} failed: {err}"
-                    )
-                })?;
-                Ok(match value {
-                    Some(value) => {
-                        line.finite_trials += 1;
-                        value
-                    }
-                    None => f64::INFINITY,
-                })
+                }
+                Err(err) => {
+                    line.record_failure(format!("step at α={alpha:.3e}: {err}"));
+                    None
+                }
             };
+            term.restore_mutable_state(snapshot).map_err(|err| {
+                format!(
+                    "SaeManifoldTerm::minimize_objective_along: restoring the pre-trial \
+                     state after the trial at α={alpha:.6e} failed: {err}"
+                )
+            })?;
+            Ok(match value {
+                Some(value) => {
+                    line.finite_trials += 1;
+                    value
+                }
+                None => BandedPenalizedObjective::UNUSABLE,
+            })
+        };
 
         // (1) Longest sufficient-decrease step from the trust radius.
         let contraction = BacktrackConfig::default().contraction;
@@ -3090,7 +3097,11 @@ impl SaeManifoldTerm {
             shortest *= contraction;
             max_steps += 1;
         }
-        let cushion = opt::armijo_roundoff_cushion(base_objective);
+        // Each trial is judged against the rounding bands of the two evaluations
+        // it compares (#3243, `BandedPenalizedObjective::armijo_accepts`). The
+        // trial's band rides beside its value, since the search hands `accept`
+        // the value alone.
+        let trial_band = std::cell::Cell::new(0.0_f64);
         let accepted = backtracking_line_search::<_, String>(
             BacktrackConfig {
                 initial_step: far_alpha,
@@ -3098,13 +3109,21 @@ impl SaeManifoldTerm {
                 ..BacktrackConfig::default()
             },
             |alpha| {
-                trial_at(self, alpha, &mut line)
-                    .map(|value| value.is_finite().then_some((value, ())))
+                trial_at(self, alpha, &mut line).map(|trial| {
+                    trial_band.set(trial.band);
+                    trial.value.is_finite().then_some((trial.value, ()))
+                })
             },
             |alpha, value| {
                 let sufficient = SAE_MANIFOLD_ARMIJO_C1 * alpha * slope
                     + SAE_MANIFOLD_ARMIJO_C1 * 0.5 * negative_curvature * alpha * alpha;
-                value <= base_objective - sufficient + cushion
+                base.armijo_accepts(
+                    &BandedPenalizedObjective {
+                        value,
+                        band: trial_band.get(),
+                    },
+                    sufficient,
+                )
             },
         )?;
         let Some(accepted) = accepted else {
@@ -3125,7 +3144,7 @@ impl SaeManifoldTerm {
                 if !(alpha_q.is_finite() && alpha_q >= near_alpha && alpha_q < best_alpha) {
                     break;
                 }
-                let value = trial_at(self, alpha_q, &mut line)?;
+                let value = trial_at(self, alpha_q, &mut line)?.value;
                 if !(best_value - value > material_floor) {
                     break;
                 }
@@ -5972,8 +5991,9 @@ impl SaeManifoldTerm {
             // The baseline is read after assembly, from the exact represented
             // state whose gradient and Hessian produced `sys`.
             let pre_step_loss = self.loss(target, rho)?;
-            let pre_step_total =
-                self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
+            let pre_step =
+                self.penalized_objective_banded(target, rho, analytic_penalties, 1.0)?;
+            let pre_step_total = pre_step.value;
             if !pre_step_total.is_finite() {
                 return Err(format!(
                     "SaeManifoldTerm::run_fixed_decoder_arrow_schur: non-finite objective \
@@ -5993,17 +6013,9 @@ impl SaeManifoldTerm {
                      decrement {directional_decrease} at iteration {iteration}"
                 ));
             }
-            // The penalized objective is the loss components plus the extra
-            // penalty terms. Its longest accumulation is the data fit over the
-            // `n·p` residual cells, then the five summands are added, so its
-            // computed value cannot resolve a change below `γ_k·Σ|summands|`.
-            let summand_scale = pre_step_loss.data_fit.abs()
-                + pre_step_loss.assignment_sparsity.abs()
-                + pre_step_loss.smoothness.abs()
-                + pre_step_loss.ard.abs()
-                + (pre_step_total - pre_step_loss.total()).abs();
-            let objective_resolution =
-                gam_linalg::roundoff::accumulation_band(target.len() + 4, summand_scale);
+            // The computed penalized objective cannot resolve a change below its
+            // own rounding band (`BandedPenalizedObjective`).
+            let objective_resolution = pre_step.band;
             if directional_decrease <= decrease.rounding_band.max(objective_resolution) {
                 return Ok(pre_step_loss);
             }
