@@ -477,6 +477,58 @@ pub(crate) fn joint_penalty_subspace_trace_matches_projected_logdet_derivative()
 }
 
 #[test]
+pub(crate) fn joint_penalty_subspace_refuses_an_indefinite_laplace_precision_3303() {
+    // #3303: at the survival location-scale link-wiggle modes `M = H + S_λ` had
+    // exactly `rank(S_λ)` positive eigenvalues beside `−4.577` and `−2.217`, and
+    // the penalty floor kept the positive ones and dropped the negative ones
+    // without a word, pricing `log|M₊|` in place of `log|M|`. Here `S_λ` has rank
+    // 3 and `M = diag(4, 3, −4.577, 0)`: two resolved positive eigenvalues, one
+    // material negative one, one structural zero. No Laplace approximation exists
+    // at this saddle, so the criterion refuses the trial point by name.
+    let ranges = vec![(0, 4)];
+    let penalties = vec![array![
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0]
+    ]];
+    let h = array![
+        [3.0, 0.0, 0.0, 0.0],
+        [0.0, 2.0, 0.0, 0.0],
+        [0.0, 0.0, -5.577, 0.0],
+        [0.0, 0.0, 0.0, 0.0]
+    ];
+    let err = joint_penalty_subspace_trace_parts(
+        &JointHessianSource::Dense(h),
+        &ranges,
+        &penalties,
+        4,
+        0.0,
+        None,
+        None,
+        None,
+    )
+    .expect_err("an indefinite Laplace precision has no Laplace criterion");
+    assert!(
+        err.is_trial_point_infeasible(),
+        "a saddle at one trial point is rho-local, got {err}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("indefinite") && message.contains("-4.577"),
+        "the refusal must name the material negative eigenvalue, got {message}"
+    );
+
+    // A negative eigenvalue inside the rounding band `p·ε·‖M‖₂` is not resolved
+    // from zero, so its sign is no measurement and the kept set stands.
+    let band = 4.0 * f64::EPSILON * 4.0;
+    let kept = laplace_precision_kept_eigenpairs(&[4.0, 3.0, 2.0, -0.5 * band], 3)
+        .expect("a within-band negative eigenvalue is roundoff, not a saddle");
+    assert_eq!(kept, vec![0, 1, 2]);
+    assert!(laplace_precision_kept_eigenpairs(&[4.0, 3.0, 2.0, -2.0 * band], 3).is_err());
+}
+
+#[test]
 pub(crate) fn joint_penalty_subspace_logdet_keeps_the_identified_rank_2901() {
     // #2901 V22: the criterion keeps standard REML's identified rank. The stiff
     // curvature `1e17` puts the rounding band `p·ε·‖M‖₂` at `88.8`, so `1e3` is
@@ -505,7 +557,12 @@ pub(crate) fn joint_penalty_subspace_logdet_keeps_the_identified_rank_2901() {
         penalty_rank_at_rounding_band(&penalties[0]).expect("penalty rank"),
         3
     );
-    assert_eq!(laplace_precision_kept_eigenpairs(eigenvalues, 3).len(), 3);
+    assert_eq!(
+        laplace_precision_kept_eigenpairs(eigenvalues, 3)
+            .expect("a positive semidefinite precision has a Laplace kept set")
+            .len(),
+        3
+    );
     let (logdet, kernel) = joint_penalty_subspace_trace_parts(
         &JointHessianSource::Dense(h.clone()),
         &ranges,
@@ -563,9 +620,9 @@ pub(crate) fn identity_face_tangent_reproduces_the_full_space_kernel_bit_for_bit
 /// gam#2894: on an active face the criterion prices `log|Zᵀ M Z|` and the kernel
 /// differentiates it. `M` is indefinite (one eigenvalue near `−1.02`) and positive definite
 /// on the face tangent. The face normal `e₃` is not an eigenvector of `M`, so the
-/// full-space pseudo-determinant, which keeps `M`'s two positive eigenvalues, prices
-/// `log(15.25 / 1.0209…) ≈ 2.70` where the face prices `log 4.75 ≈ 1.56`. That gap is the
-/// control that this fixture discriminates the two geometries.
+/// full-space geometry meets the negative eigenvalue and refuses the point (gam#3303)
+/// where the face prices `log 4.75 ≈ 1.56`. That refusal is the control that this
+/// fixture discriminates the two geometries.
 #[test]
 pub(crate) fn face_tangent_kernel_prices_and_differentiates_the_face_determinant_2894() {
     let ranges = vec![(0, 3)];
@@ -577,7 +634,7 @@ pub(crate) fn face_tangent_kernel_prices_and_differentiates_the_face_determinant
     else {
         panic!("one active row cannot pin a three-coefficient face");
     };
-    let parts = |h: &Array2<f64>, tangent: Option<&Array2<f64>>| {
+    let try_parts = |h: &Array2<f64>, tangent: Option<&Array2<f64>>| {
         joint_penalty_subspace_trace_parts(
             &JointHessianSource::Dense(h.clone()),
             &ranges,
@@ -588,7 +645,9 @@ pub(crate) fn face_tangent_kernel_prices_and_differentiates_the_face_determinant
             None,
             tangent,
         )
-        .expect("projection parts build")
+    };
+    let parts = |h: &Array2<f64>, tangent: Option<&Array2<f64>>| {
+        try_parts(h, tangent).expect("projection parts build")
     };
     let (logdet, kernel) = parts(&h, Some(&z));
     let kernel = kernel.expect("a positive-definite face precision has a kernel");
@@ -596,10 +655,13 @@ pub(crate) fn face_tangent_kernel_prices_and_differentiates_the_face_determinant
     // `M = H + S = [[5, 0.5, 0], [0.5, 1, 2], [0, 2, 1]]`; the face is `span(e₁, e₂)`, so
     // `Zᵀ M Z ≅ [[5, 0.5], [0.5, 1]]` with determinant `5 − 0.25`.
     assert_relative_eq!(logdet, 4.75_f64.ln(), epsilon = 1e-12);
-    let (full_logdet, _) = parts(&h, None);
+    // The full space sees `M`'s eigenvalue near `−1.02`: there the mode is a saddle and has no
+    // Laplace approximation, so the full-space geometry refuses the point (gam#3303) where the
+    // face prices it.
+    let full = try_parts(&h, None).expect_err("the full-space precision is indefinite");
     assert!(
-        (full_logdet - logdet).abs() > 1e-2,
-        "the full-space pseudo-determinant must differ on this fixture: full={full_logdet} face={logdet}"
+        full.is_trial_point_infeasible() && full.to_string().contains("indefinite"),
+        "the full-space geometry must refuse the indefinite precision: {full}"
     );
     let drift = array![[0.7, -0.4, 0.2], [-0.4, 1.3, 0.5], [0.2, 0.5, 2.0]];
     let analytic = kernel.trace_projected_logdet(&drift);
