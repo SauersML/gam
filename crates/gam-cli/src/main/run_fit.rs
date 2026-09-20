@@ -487,8 +487,18 @@ fn refuse_survival_only_settings_without_surv(fit_config: &FitConfig) -> Result<
     if survival_only {
         return Err("survival-only options require a Surv(entry, exit, event) response".to_string());
     }
-    if fit_config.noise_offset_column.is_some() && fit_config.noise_formula.is_none() {
-        return Err("--noise-offset-column requires --predict-noise".to_string());
+    // Under the marginal-slope families the noise offset is the slope predictor's
+    // offset (the library materializer reads it there), so only a fit with neither
+    // a noise formula nor a marginal-slope predictor would drop it.
+    let marginal_slope = fit_config.slope_formula.is_some() || fit_config.z_column.is_some();
+    if fit_config.noise_offset_column.is_some()
+        && fit_config.noise_formula.is_none()
+        && !marginal_slope
+    {
+        return Err(
+            "--noise-offset-column requires --predict-noise or a marginal-slope fit (--slope-formula/--z-column)"
+                .to_string(),
+        );
     }
     Ok(())
 }
