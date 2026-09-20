@@ -4660,9 +4660,9 @@ fn gaussian_reml_fit<'py>(
             x_values.nrows(),
         )
         .map_err(py_value_error)?;
-        // The closed form whitens by XᵀWX, so a design whose XᵀWX is singular
-        // (p > n, or rank-deficient) is refused with the engine's typed error
-        // rather than reported as a zero fit (gam#3310).
+        // A singular XᵀWX (p > n, or rank-deficient) is fit through the penalty
+        // pencil when the penalty identifies null(W½X) (gam#3366) and refused
+        // with the engine's typed error otherwise (gam#3310).
         gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
@@ -6023,7 +6023,8 @@ fn gaussian_reml_fit_positions<'py>(
             x.nrows(),
         )
         .map_err(py_value_error)?;
-        // A singular XᵀWX is refused with the engine's typed error (gam#3310).
+        // A singular XᵀWX is fit through the penalty pencil when the penalty
+        // identifies null(W½X) (gam#3366) and refused otherwise (gam#3310).
         let fit = gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
