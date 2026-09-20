@@ -134,6 +134,7 @@ mod spec;
 mod time_block;
 mod truncated_moments;
 mod wiggle_geometry;
+mod wiggle_row_schedule;
 
 #[cfg(test)]
 mod smoothing_corrected_tests;
@@ -161,3 +162,4 @@ pub use spec::*;
 pub use time_block::*;
 pub(crate) use truncated_moments::*;
 pub use wiggle_geometry::*;
+pub(crate) use wiggle_row_schedule::*;
