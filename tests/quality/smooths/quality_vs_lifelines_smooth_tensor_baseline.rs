@@ -262,7 +262,7 @@ fn gam_tensor_baseline_stratified_heldout_concordance() {
         ..FitConfig::default()
     };
     let result = fit_from_formula(
-        "Surv(time, event) ~ te(age, ejection_fraction, bs=c('tp','tp'), k=c(5,5)) \
+        "Surv(time, event) ~ te(age, ejection_fraction, bs=c('tps','tps'), k=c(5,5)) \
          + group(sex) + survmodel(spec='net')",
         &ds,
         &cfg,

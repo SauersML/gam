@@ -26,7 +26,7 @@
 //!   η = q(t)·c(g) + (probit_scale · g) · z_std,
 //! where `z` is the modeled covariate (here EJECTION_FRACTION), `g` is the per-row
 //! slope (`baseline_slope + slope_design·β_slope`, with
-//! `slope = s(age, bs='tp', k=4)` — an age-modulated EF effect; the z column
+//! `slope = s(age, bs='tps', k=4)` — an age-modulated EF effect; the z column
 //! itself is structurally reserved as the latent score and cannot appear in the
 //! slope surface), and SEX + AGE enter the marginal block. The cumulative
 //! hazard is `Λ = −log Φ(−η)`, strictly increasing in η. We evaluate the
@@ -90,7 +90,7 @@ fn gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph() {
     let config = FitConfig {
         survival_likelihood: Some("marginal-slope".into()),
         z_column: Some("ejection_fraction".into()),
-        slope_formula: Some("s(age, bs='tp', k=4)".into()),
+        slope_formula: Some("s(age, bs='tps', k=4)".into()),
         baseline_target: "linear".into(),
         ..FitConfig::default()
     };

@@ -14,7 +14,7 @@ Each case is one the audit measured gamfit losing at the formula defaults:
   values but the default margin used 6 of them (held-out MSE ~0.17): each
   margin was capped at its 1-D internal-knot count (#3181). Margins are now
   capped by their distinct values, and the row-count budget gives both 13.
-* ``s(x, bs='tp')`` with one x = 1e6 among 300 rows on [0, 1). The isotropic
+* ``s(x, bs='tps')`` with one x = 1e6 among 300 rows on [0, 1). The isotropic
   standardization put the whole bulk inside ~2e-5 of standardized space, where
   the r^3 kernel differences are ~1e-15 of the outlier's: every bulk bending
   direction fell under the numerical-rank floor and the fit came back as a flat
@@ -92,7 +92,7 @@ def test_thin_plate_smooth_refuses_a_bulk_flattened_by_an_outlier() -> None:
     y = np.sin(2 * np.pi * x) + rng.normal(0.0, 0.2, n)
     x[0] = 1.0e6
     with pytest.raises(InvalidConfigurationError) as caught:
-        gamfit.fit({"x": x, "y": y}, "y ~ s(x, bs=tp)")
+        gamfit.fit({"x": x, "y": y}, "y ~ s(x, bs=tps)")
     message = str(caught.value)
     assert "cannot resolve the bulk of its data" in message
     assert "1.000000e6" in message
@@ -105,7 +105,7 @@ def test_thin_plate_smooth_on_the_same_bulk_without_the_outlier_still_bends() ->
     n = 300
     x = rng.uniform(0.0, 1.0, n)
     y = np.sin(2 * np.pi * x) + rng.normal(0.0, 0.2, n)
-    model = gamfit.fit({"x": x, "y": y}, "y ~ s(x, bs=tp)")
+    model = gamfit.fit({"x": x, "y": y}, "y ~ s(x, bs=tps)")
     grid = np.linspace(0.05, 0.95, 19)
     pred = np.asarray(model.predict({"x": grid}), float).ravel()
     assert float(np.mean((pred - np.sin(2 * np.pi * grid)) ** 2)) < 0.01

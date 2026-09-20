@@ -36,7 +36,6 @@ def _draws() -> PosteriorSamples:
             n_samples=3,
             n_warmup=2,
             n_chains=1,
-            target_accept=0.8,
             seed=7,
         ),
     )

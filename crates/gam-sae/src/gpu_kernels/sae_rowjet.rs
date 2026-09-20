@@ -581,19 +581,28 @@ pub(crate) fn execute_softmax_row_jet_tile_contracted(
             beta: Vec::new(),
         });
     }
+    let device = || {
+        #[cfg(target_os = "linux")]
+        {
+            device::device_contracted_tile(rows, inv_tau, contraction)
+                .map_err(|error| error.to_string())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err("contracted SAE row-jet device tile requested on a non-Linux host".to_string())
+        }
+    };
     match path {
         SaeRowJetPath::Cpu => cpu_contracted_tile(rows, inv_tau, q, p, n_beta, contraction),
-        SaeRowJetPath::Device => {
-            #[cfg(target_os = "linux")]
-            {
-                device::device_contracted_tile(rows, inv_tau, contraction)
-                    .map_err(|error| error.to_string())
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                Err("contracted SAE row-jet device tile requested on a non-Linux host".to_string())
-            }
-        }
+        SaeRowJetPath::Device => device(),
+        SaeRowJetPath::Race(shape) => gam_gpu::run_measured_row_kernel(
+            gam_gpu::RowKernelShape {
+                rows: rows.len(),
+                ..shape
+            },
+            || cpu_contracted_tile(rows, inv_tau, q, p, n_beta, contraction),
+            device,
+        ),
     }
 }
 
@@ -980,6 +989,19 @@ impl SaeRowJetMemoryLedger {
 pub enum SaeRowJetPath {
     Device,
     Cpu,
+    /// `auto` with a device whose two executors have not been timed on this
+    /// shape: each tile runs [`gam_gpu::run_measured_row_kernel`] with its own
+    /// row count, which races it or reads the record an earlier tile left.
+    Race(gam_gpu::RowKernelShape),
+}
+
+/// What a contracted tile contracts, which sets its race's kernel: the linear
+/// contraction is a one-shot pass, while the bilinear one backs a prepared
+/// state that every CG apply reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaeRowJetContractionKind {
+    Linear,
+    Bilinear,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1005,7 +1027,17 @@ pub(crate) fn plan_softmax_row_jets(
         ));
     }
     let ledger = SaeRowJetMemoryLedger::for_shape(k, q, p, n_beta)?;
-    plan_dispatch(total_rows, k, q, p, n_beta, mode, ledger, host_budget)
+    plan_dispatch(
+        total_rows,
+        k,
+        q,
+        p,
+        n_beta,
+        mode,
+        gam_gpu::GpuKernel::SaeRowJetChannels,
+        ledger,
+        host_budget,
+    )
 }
 
 /// Decide the backend and bounded tile width for a REDUCED (contracted) tile.
@@ -1021,6 +1053,7 @@ pub(crate) fn plan_softmax_row_jets_contracted(
     q: usize,
     p: usize,
     n_beta: usize,
+    kind: SaeRowJetContractionKind,
     mode: gam_gpu::GpuPolicy,
     host_budget: usize,
 ) -> Result<SaeRowJetExecutionPlan, String> {
@@ -1030,10 +1063,36 @@ pub(crate) fn plan_softmax_row_jets_contracted(
         ));
     }
     let ledger = SaeRowJetMemoryLedger::for_contracted_shape(k, q, p, n_beta)?;
-    plan_dispatch(total_rows, k, q, p, n_beta, mode, ledger, host_budget)
+    let kernel = match kind {
+        SaeRowJetContractionKind::Linear => gam_gpu::GpuKernel::SaeRowJetLinear,
+        SaeRowJetContractionKind::Bilinear => gam_gpu::GpuKernel::SaeRowJetBilinear,
+    };
+    plan_dispatch(
+        total_rows,
+        k,
+        q,
+        p,
+        n_beta,
+        mode,
+        kernel,
+        ledger,
+        host_budget,
+    )
 }
 
 /// Shared backend/tile-width dispatch for an already-computed shape ledger.
+///
+/// With a device resolved, the tile is the widest the device and host
+/// budgets admit, and `auto` weighs `kernel`'s two executors on that tile
+/// through the one row-kernel decision (gam#3024): its own timings of this
+/// shape, or a race of a shape this process has not timed. There is no row
+/// floor: the SAE planner used to keep every fit under the xtwx Gram's
+/// calibration floor, and then under that Gram's measured crossover, off the
+/// device, neither of which is a measurement of this kernel. A CPU choice
+/// keeps the device-sized tile, so every later plan of this shape asks about
+/// the same row count its race recorded; the CPU executor's per-row host
+/// residency is at most the device tile's, so the tile fits the host budget
+/// on either executor. `off` and a host with no device run one row per tile.
 fn plan_dispatch(
     total_rows: usize,
     k: usize,
@@ -1041,6 +1100,7 @@ fn plan_dispatch(
     p: usize,
     n_beta: usize,
     mode: gam_gpu::GpuPolicy,
+    kernel: gam_gpu::GpuKernel,
     ledger: SaeRowJetMemoryLedger,
     host_budget: usize,
 ) -> Result<SaeRowJetExecutionPlan, String> {
@@ -1071,25 +1131,13 @@ fn plan_dispatch(
         });
     }
 
-    // This lower bound is derived from the smallest runtime calibration point.
-    // It lets ordinary CPU-sized fits avoid creating a CUDA context at all.
-    if mode == gam_gpu::GpuPolicy::Auto
-        && total_rows < gam_gpu::policy::GpuDispatchPolicy::MIN_CALIBRATABLE_ROW_KERNEL_N
-    {
-        return Ok(SaeRowJetExecutionPlan {
-            path: SaeRowJetPath::Cpu,
-            tile_rows: 1,
-            ledger,
-        });
-    }
-
     #[cfg(not(target_os = "linux"))]
     {
         if mode == gam_gpu::GpuPolicy::Required {
-            return Err(
-                "complete SAE row jet requires CUDA, which is unavailable on this platform"
-                    .to_string(),
-            );
+            return Err(format!(
+                "complete SAE row jet kernel '{}' requires CUDA, which is unavailable on this platform",
+                kernel.as_str()
+            ));
         }
         Ok(SaeRowJetExecutionPlan {
             path: SaeRowJetPath::Cpu,
@@ -1115,13 +1163,6 @@ fn plan_dispatch(
             };
             runtime
         };
-        if mode == gam_gpu::GpuPolicy::Auto && total_rows < runtime.policy.row_kernel_min_n {
-            return Ok(SaeRowJetExecutionPlan {
-                path: SaeRowJetPath::Cpu,
-                tile_rows: 1,
-                ledger,
-            });
-        }
         let tile_rows = ledger.maximum_rows(runtime.memory_budget_bytes, host_budget);
         if tile_rows == 0 {
             if mode == gam_gpu::GpuPolicy::Required {
@@ -1140,9 +1181,35 @@ fn plan_dispatch(
                 ledger,
             });
         }
+        let tile_rows = tile_rows.min(total_rows);
+        let decision = gam_gpu::decide_row_kernel(
+            mode,
+            gam_gpu::RowKernelAdmission {
+                missing_capability: None,
+                compiled: true,
+                shape: gam_gpu::RowKernelShape {
+                    kernel,
+                    rows: tile_rows,
+                    widths: [k, q, p, n_beta],
+                    // The CPU tile evaluates its rows sequentially.
+                    threads: 1,
+                },
+            },
+            &mut gam_gpu::RuntimeDeviceProbe,
+        )
+        .map_err(|error| format!("complete SAE row-jet CUDA admission failed: {error}"))?;
+        decision.clone().log();
+        decision.require_supported()?;
+        let path = if let Some(shape) = decision.race {
+            SaeRowJetPath::Race(shape)
+        } else if decision.use_gpu {
+            SaeRowJetPath::Device
+        } else {
+            SaeRowJetPath::Cpu
+        };
         Ok(SaeRowJetExecutionPlan {
-            path: SaeRowJetPath::Device,
-            tile_rows: tile_rows.min(total_rows),
+            path,
+            tile_rows,
             ledger,
         })
     }
@@ -1196,19 +1263,27 @@ pub fn execute_softmax_row_jet_tile(
     if rows.is_empty() {
         return SaeRowJetChannels::zeros(0, 0, 0, 0, 0);
     }
+    let device = || {
+        #[cfg(target_os = "linux")]
+        {
+            device::device_tile(rows, inv_tau, k, q, p, n_beta).map_err(|error| error.to_string())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err("complete SAE row-jet device tile requested on a non-Linux host".to_string())
+        }
+    };
     match path {
         SaeRowJetPath::Cpu => cpu_tile(rows, inv_tau, k, q, p, n_beta),
-        SaeRowJetPath::Device => {
-            #[cfg(target_os = "linux")]
-            {
-                device::device_tile(rows, inv_tau, k, q, p, n_beta)
-                    .map_err(|error| error.to_string())
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                Err("complete SAE row-jet device tile requested on a non-Linux host".to_string())
-            }
-        }
+        SaeRowJetPath::Device => device(),
+        SaeRowJetPath::Race(shape) => gam_gpu::run_measured_row_kernel(
+            gam_gpu::RowKernelShape {
+                rows: rows.len(),
+                ..shape
+            },
+            || cpu_tile(rows, inv_tau, k, q, p, n_beta),
+            device,
+        ),
     }
 }
 
@@ -2379,6 +2454,71 @@ mod tests {
                 "no admitted CUDA device on this host, yet the Device row-jet path returned Ok \
                  -- the seam fell back to the host silently (#1551 class)"
             );
+        }
+    }
+
+    /// gam#3024: a racing tile returns the CPU executor's tile exactly, the one
+    /// `gpu="off"` computes, and a device that faults during the race is
+    /// returned, never answered by the CPU value it already holds.
+    #[test]
+    fn a_racing_tile_returns_the_cpu_tile_or_the_device_fault_3024() {
+        let rows = complete_fixture(64);
+        let cpu = execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Cpu)
+            .expect("the CPU row-jet path must succeed on every host");
+        let shape = gam_gpu::RowKernelShape {
+            kernel: gam_gpu::GpuKernel::SaeRowJetChannels,
+            rows: 64,
+            widths: [cpu.n_atoms, cpu.q, cpu.p, cpu.n_beta],
+            threads: 1,
+        };
+        #[cfg(target_os = "linux")]
+        let admitted = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
+            .expect("GPU probe fault in the row-jet race test")
+            .is_some();
+        #[cfg(not(target_os = "linux"))]
+        let admitted = false;
+        let raced = execute_softmax_row_jet_tile(&rows, 1.0, SaeRowJetPath::Race(shape));
+        if admitted {
+            assert_eq!(
+                raced.expect("an admitted device races the tile"),
+                cpu,
+                "the race returns the CPU executor's tile"
+            );
+        } else {
+            assert!(
+                raced.is_err(),
+                "no admitted CUDA device on this host, yet the racing tile returned Ok"
+            );
+        }
+    }
+
+    /// gam#3024: no row floor keeps a small SAE fit off the device. `off` and a
+    /// host with no device run one row per tile; with a device, even a
+    /// ten-row fit is planned as one device-sized tile whose executor its own
+    /// race decides.
+    #[test]
+    fn the_planner_has_no_row_floor_3024() {
+        let host_budget = 1 << 30;
+        let off = plan_softmax_row_jets(10, 3, 5, 2, 0, gam_gpu::GpuPolicy::Off, host_budget)
+            .expect("an off plan");
+        assert_eq!((off.path, off.tile_rows), (SaeRowJetPath::Cpu, 1));
+        #[cfg(target_os = "linux")]
+        let admitted = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::GpuPolicy::Auto)
+            .expect("GPU probe fault in the row-jet planner test")
+            .is_some();
+        #[cfg(not(target_os = "linux"))]
+        let admitted = false;
+        let auto = plan_softmax_row_jets(10, 3, 5, 2, 0, gam_gpu::GpuPolicy::Auto, host_budget)
+            .expect("an auto plan");
+        if admitted {
+            assert_eq!(auto.tile_rows, 10, "ten rows fit one device tile");
+            assert!(
+                matches!(auto.path, SaeRowJetPath::Race(shape) if shape.rows == 10),
+                "this process has not timed the shape, so it races; got {:?}",
+                auto.path
+            );
+        } else {
+            assert_eq!((auto.path, auto.tile_rows), (SaeRowJetPath::Cpu, 1));
         }
     }
 

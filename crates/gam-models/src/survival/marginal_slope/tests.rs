@@ -146,8 +146,6 @@ fn base_time_block() -> TimeBlockInput {
             1,
             DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
         ),
-        time_monotonicity:
-            crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByRowConstraint,
         penalties: Vec::new(),
         nullspace_dims: Vec::new(),
         initial_log_lambdas: None,
@@ -981,8 +979,6 @@ fn validate_spec_rejects_coordinate_cone_without_guard_offset() {
             offset_entry: Array1::zeros(2),
             offset_exit: Array1::zeros(2),
             derivative_offset_exit: Array1::zeros(2),
-            time_monotonicity:
-                crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
             ..base_time_block()
         },
         timewiggle_block: None,
@@ -2921,6 +2917,88 @@ fn link_flex_family_supports_second_order_exact_outer_path() {
 mod time_wiggle_and_psi_derivatives;
 mod anchor_history_2983;
 mod resolve_start_2926;
+
+/// gam#2938: the survival likelihood reads a Gaussian-shift frailty only through the
+/// observed slope `s(σ)·g`, `s(σ) = 1/√(1+σ²)`. Rescaling the slope by
+/// `c = s(σ₀)/s(σ₁)` undoes a move `σ₀ ↦ σ₁` to rounding, while the same slope at the
+/// new σ does not, so wherever the slope can rescale the likelihood does not identify σ.
+#[test]
+fn the_survival_likelihood_reads_a_frailty_only_through_the_observed_slope_2938() {
+    let n = 6;
+    let marginal_design =
+        Array2::from_shape_fn((n, 2), |(i, j)| if j == 0 { 1.0 } else { -0.5 + 0.2 * i as f64 });
+    let marginal_beta = array![0.35, -0.1];
+    let slope = Array1::from_shape_fn(n, |i| 0.4 - 0.15 * i as f64);
+    let family = |sigma: f64| SurvivalMarginalSlopeFamily {
+        jeffreys_armed: false,
+        latent_law: None,
+        n,
+        entry_at_origin: Arc::new(Array1::from_elem(n, false)),
+        event: Arc::new(Array1::from_shape_fn(n, |i| (i % 2) as f64)),
+        weights: Arc::new(Array1::ones(n)),
+        z: Arc::new(Array1::from_shape_fn(n, |i| -1.0 + 0.4 * i as f64).insert_axis(Axis(1))),
+        score_covariance: unit_score_covariance(),
+        gaussian_frailty_sd: Some(sigma),
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
+        derivative_guard: 1e-6,
+        design_entry: DesignMatrix::from(Array2::zeros((n, 1))),
+        design_exit: DesignMatrix::from(Array2::zeros((n, 1))),
+        design_derivative_exit: DesignMatrix::from(Array2::ones((n, 1))),
+        offset_entry: Arc::new(Array1::from_shape_fn(n, |i| -0.6 + 0.1 * i as f64)),
+        offset_exit: Arc::new(Array1::from_shape_fn(n, |i| 0.1 + 0.1 * i as f64)),
+        derivative_offset_exit: Arc::new(Array1::from_elem(n, 0.9)),
+        marginal_design: DesignMatrix::from(marginal_design.clone()),
+        slope_layout: (DesignMatrix::from(Array2::ones((n, 1)))).into(),
+        score_warp: None,
+        link_dev: None,
+        influence_absorber: None,
+        time_linear_constraints: None,
+        time_wiggle_knots: None,
+        time_wiggle_degree: None,
+        time_wiggle_ncols: 0,
+        intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
+    };
+    let states = |slope: &Array1<f64>| {
+        vec![
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: marginal_beta.clone(),
+                eta: marginal_design.dot(&marginal_beta),
+            },
+            ParameterBlockState {
+                beta: array![0.0],
+                eta: slope.clone(),
+            },
+        ]
+    };
+    let scale = |sigma: f64| 1.0 / (1.0 + sigma * sigma).sqrt();
+    let log_likelihood = |sigma: f64, slope: &Array1<f64>| {
+        family(sigma)
+            .evaluate(&states(slope))
+            .expect("the survival row program evaluates")
+            .log_likelihood
+    };
+    let base = log_likelihood(0.5, &slope);
+    for sigma in [0.0, 1.5, 4.0] {
+        let c = scale(0.5) / scale(sigma);
+        let rescaled = log_likelihood(sigma, &slope.mapv(|g| c * g));
+        assert!(
+            (rescaled - base).abs() <= 1e-12 * base.abs(),
+            "σ = {sigma}: the rescaled slope must reproduce the likelihood at σ = 0.5, \
+             {rescaled:.17e} against {base:.17e}"
+        );
+        let unscaled = log_likelihood(sigma, &slope);
+        assert!(
+            (unscaled - base).abs() > 1e-6,
+            "fixture invariant: σ = {sigma} must move the likelihood of an unscaled slope, \
+             {unscaled:.17e} against {base:.17e}"
+        );
+    }
+}
 
 #[test]
 fn sigma_exact_joint_psi_terms_returns_analytic_terms() {

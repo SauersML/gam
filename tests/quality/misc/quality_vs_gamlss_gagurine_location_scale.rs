@@ -162,11 +162,11 @@ fn gam_location_scale_predicts_gagurine_better_than_baseline() {
     // ---- fit gam on TRAIN: mu ~ s(Age), log-sigma ~ 1 + s(Age) ------------
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
-        noise_formula: Some("1 + s(Age, bs='tp')".to_string()),
+        noise_formula: Some("1 + s(Age, bs='tps')".to_string()),
         ..FitConfig::default()
     };
     let result =
-        fit_from_formula("GAG ~ s(Age, bs='tp')", &train_ds, &cfg).expect("gam location-scale fit");
+        fit_from_formula("GAG ~ s(Age, bs='tps')", &train_ds, &cfg).expect("gam location-scale fit");
     let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
         fit,
         response_scale,

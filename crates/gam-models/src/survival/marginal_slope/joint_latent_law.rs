@@ -3241,6 +3241,44 @@ mod joint_latent_law_tests {
         Array1::from_shape_fn(len, |c| 0.075 * ((c * 7 + 3) % 5) as f64 - 0.15)
     }
 
+    /// gam#2938: a per-score likelihood reads a Gaussian-shift frailty only through the
+    /// observed slopes `s(σ)·g_k`, in closed form and on a joint law alike, so rescaling
+    /// every slope coefficient by `c = s(σ₀)/s(σ₁)` undoes a move `σ₀ ↦ σ₁` to rounding,
+    /// while the same coefficients at the new σ do not.
+    #[test]
+    fn a_per_score_likelihood_reads_a_frailty_only_through_the_observed_slopes_2938() {
+        use crate::custom_family::CustomFamily;
+        let scale = |sigma: f64| 1.0 / (1.0 + sigma * sigma).sqrt();
+        for anchored in [false, true] {
+            let (mut family, beta, marginal) = per_score_family(2, 40, anchored);
+            let mut log_likelihood = |sigma: f64, beta: &Array1<f64>| {
+                family.gaussian_frailty_sd = Some(sigma);
+                family
+                    .evaluate(&per_score_states(&marginal, beta))
+                    .expect("the per-score row program evaluates")
+                    .log_likelihood
+            };
+            let base = log_likelihood(0.5, &beta);
+            for sigma in [0.0, 1.5, 4.0] {
+                let c = scale(0.5) / scale(sigma);
+                let mut rescaled_beta = beta.clone();
+                rescaled_beta.slice_mut(s![3..]).mapv_inplace(|value| c * value);
+                let rescaled = log_likelihood(sigma, &rescaled_beta);
+                assert!(
+                    (rescaled - base).abs() <= 1e-12 * base.abs(),
+                    "anchored={anchored}, σ = {sigma}: the rescaled slopes must reproduce the \
+                     likelihood at σ = 0.5, {rescaled:.17e} against {base:.17e}"
+                );
+                let unscaled = log_likelihood(sigma, &beta);
+                assert!(
+                    (unscaled - base).abs() > 1e-6,
+                    "fixture invariant, anchored={anchored}: σ = {sigma} must move the likelihood \
+                     of unscaled slopes, {unscaled:.17e} against {base:.17e}"
+                );
+            }
+        }
+    }
+
     /// The width-free `D_β H[u]` of the per-score joint Hessian is the
     /// fixed-width `OneSeed` lowering of the same row program at every width the
     /// jets are compiled for, on the closed form and on a joint law.

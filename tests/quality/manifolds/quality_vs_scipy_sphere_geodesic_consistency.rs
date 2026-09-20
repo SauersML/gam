@@ -14,7 +14,7 @@
 //!
 //! The intrinsic correctness property: fit gam's spline-on-sphere — the SAME
 //! Laplace-Beltrami spherical-harmonic construction as mgcv `bs="sos"`, i.e.
-//! `y ~ sphere(lat, lon, kernel=harmonic, degree=4)` — on noisy samples of a
+//! `y ~ sphere(lat, lon, method=harmonic, degree=4)` — on noisy samples of a
 //! radially-symmetric truth `f(p) = exp(-d_geod(p, pole)/bandwidth)`,
 //! evaluate the fitted surface at a probe grid, and test two things that a
 //! metric-respecting S² smooth must satisfy and a coordinate/chordal-confused
@@ -169,7 +169,7 @@ fn gam_sphere_smooth_recovers_geodesic_truth_at_least_as_well_as_mgcv_sos() {
     };
     let data = make_dataset(&lats, &lons, &ys);
     let result = fit_from_formula(
-        "y ~ sphere(lat, lon, kernel=harmonic, degree=4)",
+        "y ~ sphere(lat, lon, method=harmonic, degree=4)",
         &data,
         &cfg,
     )
