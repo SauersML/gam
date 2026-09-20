@@ -2223,5 +2223,33 @@
     ],
     "reason": "DispersionGlmLocationScaleFamily's override of CustomFamily::outer_hyper_hessian_dense_available returned `specs.len() < 2`. It declined the dense outer Hessian on every two-block fit because the family had no joint second directional derivative D2_beta H_L[u, v], and the trait default for that hook is block-diagonal, which drops the mean/precision cross curvature. The family now implements exact_newton_joint_hessian_second_directional_derivative_with_specs from its contracted fourth row surfaces, so the override is deleted and the trait default (dense outer Hessian available) applies. The trait method and every other family's implementation are unchanged.",
     "evidence": "Direct gate dy7 run w2tha-g1-predict (direct-dy7-w2tha-g1-predict.log) at 96a81f3bca on this change gave RC_CHECK 0, SCANNER_ERRORS 0 and RC_PYFFI 0. The gam-predict gamma, negbin and tweedie dispersion_location_scale_assembles_covariance_and_is_predictable tests passed 3 of 3; gamma had been red at 64f2129d00 (dy3 w2o-3140-basectl) and at 96a81f3bca (dy6 w2tha-pr1b). The guard's only hit is this override. The name's other occurrences are the trait declaration, its callers and other families' own overrides, none of which change."
+  },
+  {
+    "base": "e8568910a946906a0cd9dc56ee1d988b8e45002f",
+    "items": [
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:enum:MixedPrecisionAttempt",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:arrow_factor_slab_to_f32",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:arrow_rhs",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:cholesky_solve_lower_f32",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:mixed_precision_kappa_gate_failure",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:solve_arrow_system_f32",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:try_mixed_precision_arrow_solve",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:DEFAULT_MIXED_PRECISION_CERTIFICATE_TOLERANCE",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:DEFAULT_MIXED_PRECISION_KAPPA_MARGIN",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:DEFAULT_MIXED_PRECISION_MAX_REFINEMENTS",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:F32_UNIT_ROUNDOFF",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:MIXED_PRECISION_CERTIFICATE_EPSILON_MULTIPLIER",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:MIXED_PRECISION_KAPPA_MARGIN_CEILING",
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:fn:matrix_inf_norm",
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:fn:mixed_precision_reduced_beta",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:enum:ArrowSolvePrecisionPolicy",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:enum:MixedPrecisionStatus",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:certified_mixed",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:default",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:is_enabled",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:with_streaming_solve_precision_default"
+    ],
+    "reason": "#2946 census T10: the arrow-Schur CertifiedMixed solve factored in f64 (factor_dense_reduced_schur and the per-row H_tt factors), copied those factors to f32, and ran f32 triangular solves with f64-residual refinement until a normwise backward-error certificate closed. Because the f64 factor that answers the system in one triangular solve already existed, the f32 path was strictly more work, gated by chosen constants (6 refinements, 1e-11 certificate, kappa*u_f32 margin 0.5 / ceiling 1.0, 64*eps floor). SPEC: 'Unnecessary choices and options should be deleted, not included.' and 'Hard-coded knobs and magic constants, especially if arbitrary, should be avoided when possible in production code.' Deleted: the policy enum and its Default impl, the status enum, both mixed solves, the kappa gate, the f32 helpers (slab copy, f32 arrow solve, f32 Cholesky solve), arrow_rhs and matrix_inf_norm (used only by the mixed path), the streaming default upgrade and the six constants.",
+    "evidence": "At base e8568910a9 source_removal_guard.py reports exactly these 21 identities. The removed `default` is the one `impl Default for ArrowSolvePrecisionPolicy`; the other Default impls in solve_options.rs are untouched. At head git grep finds no occurrence of ArrowSolvePrecisionPolicy, MixedPrecisionStatus, solve_precision, mixed_precision_status, try_mixed_precision_arrow_solve, mixed_precision_reduced_beta or F32_UNIT_ROUNDOFF outside CHANGELOG.md and the ledgers. Every former caller already fell back to the f64 cholesky_solve_vector / solve_dense_reduced_system on the same factor, which is now the only route. No test constructed CertifiedMixed or read mixed_precision_status. cargo check --workspace --tests rc 0."
   }
 ]
