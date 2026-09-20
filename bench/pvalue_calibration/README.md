@@ -107,9 +107,9 @@ These are the surfaces a rep reads:
 
 | surface | source |
 |---------|--------|
-| `gamfit.wald` | `summary().smooth_terms[...]["p_value"]` |
+| `gamfit.wald` | `summary().smooth_terms[...]["p_value"]`: the variance-component score test for a smooth or a random effect (the key predates the score tests and names the `summary()` table) |
 | `gamfit.lr` | `smooth_significance(data)[...]["p_value_corrected"]` |
-| `gamfit.coef` | `summary().coefficients`. The row is located through `model.term_blocks`, and the p-value is the two-sided normal tail of `estimate / std_error` (gamfit reports no coefficient p-value). |
+| `gamfit.coef` | `summary().parametric_terms[...]["p_value"]`: the Wald test of the linear coefficient, `t` or `z` as `summary().parametric_statistic` reports |
 | `pygam.wald` | pyGAM's `statistics_["p_values"]` at its default fixed lambda |
 | `pygam_gs.wald` | the same, after `gridsearch` |
 

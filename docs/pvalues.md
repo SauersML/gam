@@ -1,6 +1,6 @@
 # p-values and their calibration
 
-gamfit reports p-values in three places. Each one tests a different null
+gamfit reports p-values in four places. Each one tests a different null
 hypothesis against a different reference distribution. This page says what
 each one is, and shows how well each holds its nominal size in a seeded
 simulation grid (`bench/pvalue_calibration`).
@@ -16,41 +16,56 @@ miscalibrated.
 
 | where | tests | statistic | reference distribution |
 |---|---|---|---|
-| `model.summary().smooth_terms[i]["p_value"]` | the smooth is identically zero | Wood (2013) rank-truncated Wald statistic `chi_sq` | `χ²_{ref_df}` when the scale is known (binomial, Poisson, negative binomial); `F_{ref_df, n − edf}` on `chi_sq / ref_df` when the fit estimates it (Gaussian, Gamma) |
+| `model.summary().smooth_terms[i]["p_value"]`, penalized smooth | the smooth is identically zero | variance-component score statistic `chi_sq` (Lin 1997; Zhang & Lin 2003) | its exact null law `Σ w_i χ²₁` when the scale is known (binomial, Poisson, negative binomial); `P(Σ w_i χ²₁ − (q/ρ)·χ²_ρ > 0)` when the fit estimates it (Gaussian, Gamma) |
+| `model.summary().smooth_terms[i]["p_value"]`, random effect `group(g)` | the variance component is zero | variance-component score statistic `‖X̃_Rᵀv‖²` (Lin 1997) | its exact spectral law `Σ μ_j χ²₁` (Wood 2013), against the residual `χ²_ν` when the scale is estimated |
+| `model.summary().parametric_terms[i]["p_value"]` | the coefficient is zero | Wald `estimate / std_error` | Student-t on the residual degrees of freedom when the scale is estimated, N(0, 1) when it is known; `summary().parametric_statistic` says which |
 | `model.smooth_significance(data)[i]["p_value_corrected"]` | the smooth is identically zero | likelihood ratio `statistic_lr` from a constrained refit without the smooth | the statistic's exact null law `Σ w_j χ²₁`, Bartlett-corrected |
 | `model.summary().basis_checks[i]["p_value"]` | the basis of the smooth is rich enough | penalized score (Rao) lack-of-fit statistic | `χ²_{enrichment_rank}` |
 
-Some terms have no p-value on any surface:
+A factor (`g`) has no single-degree-of-freedom row and no `smooth_terms` or
+`smooth_significance` row, so it has no p-value on any surface.
 
-- Parametric coefficients carry an estimate and a standard error
-  (`summary().coefficients`), not a p-value. `model.term_blocks` gives the
-  coefficient columns of each term.
-- A random effect (`group(g)`) or a factor (`g`) has a `smooth_terms` row with
-  `edf` only, and no row in `smooth_significance`.
-
-### The Wald test in `summary()`
+### The score tests in `summary()`
 
 `summary()` needs only the saved model, so its p-value is the one available
-everywhere. The statistic follows Wood (2013):
+everywhere. A penalized smooth `f_j = X_j β_j` is the random effect
+`β_j ~ N(0, τ·S_j⁻)`, and "no effect" is the boundary null `τ = 0`. The score
+for `τ` there is a quadratic form in the term's score vector:
 
-1. The coefficient block of the term, and its posterior covariance, are
-   mapped into fitted-value space by the design whitening `R` (`RᵀR = XᵀWX`).
-2. The whitened covariance is inverted with a spectral pseudo-inverse
-   truncated at rank `round(edf)`.
+```text
+s = b_j − G_jo H_oo⁻¹ b_o,        b = Hβ̂,        Q = sᵀ K s / φ̂,
+```
 
-The whitening matters. Truncating the raw covariance would keep the
-heavily-penalized, signal-free directions and discard the fitted function.
+with `G = XᵀWX`, `H = G + S(λ)`, `o` every other coefficient and
+`K = Σ_l K_l / t_l` the term's structural penalties, each on its own null
+scale. Under the null `Q` has exactly the law `Σ w_i χ²₁` with
+`w = eig(K^½ C K^½)`, `C` the covariance of `s`. When the scale is
+estimated, the tail is the signed weighted chi-square
+`P(Σ w_i χ²₁ − (q/ρ)·χ²_ρ > 0)`. The reported `chi_sq` is scaled so that its
+null mean is `ref_df = (Σw)² / Σw²`.
 
-`ref_df` is the influence-trace degrees of freedom
-`tr(F_jj)² / tr(F_jj²)`, never below the rank actually used. The covariance
-already includes the scale, so the F statistic is `chi_sq / ref_df` with no
-further division by the dispersion.
+A Wald statistic on `β̂_j` is a function of the term's own fitted smoothing
+parameter, which under the null runs to its boundary in a large share of
+replicates and leaves an atom of p-values at 1. The score test never reads
+`λ_j`: `s` fits the other terms only, and `K` is fixed by the basis. Its
+reference law is therefore exact at the fitted `λ_o`.
 
-This is a first-order reference. Under a penalty the Wald statistic is itself
-a weighted sum of `χ²₁`, not a central `χ²` or `F`. For a term that REML shrinks
-to the boundary, the statistic is near zero and the reported p-value near 1,
-so under the null this p-value piles up near 1 and is not uniform. The table
-below measures how far.
+A random effect `group(g)` carries the score test of its variance component
+`σ²_b = 0` (Lin 1997): `T = ‖u‖²`, `u = X̃_Rᵀ v`, with `v` the working
+residual of the model without the random effect and `X̃_R` the random-effect
+design with every other column projected out. Its null law is the exact
+spectral sum `Σ μ_j χ²₁` (Wood 2013). When the scale is estimated, `T` is
+referred to the unpenalized residual, `P(Σ μ_j χ²₁ − t·χ²_ν > 0)`.
+
+A row that cannot be scored has no `p_value` and carries a
+`p_value_unavailable` reason instead.
+
+### The Wald test in `parametric_terms`
+
+The intercept and each linear coefficient carry `estimate`, `std_error`,
+`statistic = estimate / std_error` and `p_value`. The reference is Student-t
+on the residual degrees of freedom when the scale is estimated and N(0, 1)
+when it is known.
 
 ### The likelihood-ratio test in `smooth_significance(data)`
 
@@ -74,7 +89,7 @@ spectrum's quadratic form and of the residual sum of squares. The p-value
 inverts that map exactly, as `P(Q − c(W)·V > 0)`, rather than scoring `W`
 against the known-scale law. `reference_residual_df` and
 `reference_deterministic_offset` carry the two constants of the map. The
-F reference in `summary()` exists for the same reason.
+estimated-scale score tests in `summary()` use the same signed form.
 
 The raw statistic is then Bartlett-corrected, `W* = W / c`, with the exact
 Lawley factor `c`. The headline value is `p_value_corrected`.
@@ -130,10 +145,12 @@ sample sizes. The pyGAM columns fit pyGAM 0.12 to the same data wherever pyGAM
 has a counterpart. pyGAM has no `ti`, random effect or negative binomial, and
 no LR test.
 
-For the linear null, gamfit has no coefficient p-value, so the table's
-"coefficient" row is the two-sided normal tail of `estimate / std_error`.
-That row tests the reported standard error, which is what such a p-value
-would be built from.
+The committed baseline was measured at the git revision in the table's
+header, before `summary()` carried the score tests and `parametric_terms`.
+At that revision the "Wald (`summary`)" rows measure Wood's (2013)
+rank-truncated Wald test, the "coefficient" rows measure the two-sided normal
+tail of `estimate / std_error`, and a random effect had no p-value. The rows
+describe the current `summary()` only once the baseline is regenerated (gam#3722).
 
 How to read the table:
 
