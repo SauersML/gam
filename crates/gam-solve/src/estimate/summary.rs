@@ -3,11 +3,75 @@ pub struct ParametricTermSummary {
     pub name: String,
     pub estimate: f64,
     pub std_error: Option<f64>,
-    /// `estimate / std_error`, referred to Student-t on the fit's Wald residual
-    /// degrees of freedom when the fit's scale is estimated and to N(0, 1) when
-    /// it is known (`LikelihoodScaleMetadata::wald_scale_is_estimated`).
+    /// For an unpenalized coefficient, `estimate / std_error`, referred to
+    /// Student-t on the fit's Wald residual degrees of freedom when the fit's
+    /// scale is estimated and to N(0, 1) when it is known
+    /// (`LikelihoodScaleMetadata::wald_scale_is_estimated`).
+    ///
+    /// For a linear term under its null-recovery ridge, the signed root of the
+    /// variance-component score statistic the fit recorded
+    /// (`FitArtifacts::linear_term_tests`, #3573): the ridge shrinks `estimate`
+    /// and `std_error` together toward zero, so their ratio is no test of the
+    /// effect, while the score is evaluated at the null and carries the same
+    /// N(0, 1) / Student-t law.
     pub statistic: Option<f64>,
     pub pvalue: Option<f64>,
+    /// Which test `statistic` and `pvalue` come from.
+    pub test: ParametricTest,
+    /// Why `pvalue` is absent for a ridged linear term. `None` whenever
+    /// `pvalue` is present, and for every Wald-tested row.
+    pub pvalue_unavailable: Option<ParametricPValueUnavailable>,
+}
+
+/// The test behind a parametric row's statistic and p-value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParametricTest {
+    /// `estimate / std_error` of an unpenalized coefficient.
+    Wald,
+    /// The variance-component score test of a ridged linear term at `β = 0`
+    /// (#3573); its statistic is not `estimate / std_error`.
+    VarianceComponentScore,
+}
+
+impl ParametricTest {
+    /// Serialized label carried into the model payload and the Python surface.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Wald => "wald",
+            Self::VarianceComponentScore => "variance_component_score",
+        }
+    }
+}
+
+/// Why a ridged linear term reports no p-value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParametricPValueUnavailable {
+    /// The variance-component score test could not be computed, with the
+    /// test's own reason.
+    VarianceComponent(gam_terms::inference::random_effect_test::RandomEffectTestUnavailable),
+    /// The fit carries no score-test record for this ridged term: a model
+    /// saved before the test existed, or a fit route that does not compute it.
+    VarianceComponentTestNotRecorded,
+}
+
+impl ParametricPValueUnavailable {
+    /// Serialized label carried into the model payload and the Python surface.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::VarianceComponent(reason) => reason.label(),
+            Self::VarianceComponentTestNotRecorded => "linear_term_test_not_recorded",
+        }
+    }
+
+    /// One-line explanation printed beside the summary table.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::VarianceComponent(reason) => reason.explanation(),
+            Self::VarianceComponentTestNotRecorded => {
+                "the fit carries no variance-component score test for this ridged linear term"
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

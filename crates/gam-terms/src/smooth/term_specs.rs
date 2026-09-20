@@ -2490,6 +2490,29 @@ impl TermCollectionDesign {
             .count()
     }
 
+    /// The linear terms this build penalized with their null-recovery ridge
+    /// (`LinearTermRidge`), as `(name, coefficient range)` from
+    /// `linear_ranges`. Read off the emitted `penaltyinfo`, so a term whose
+    /// ridge was not built is absent. Such a coefficient is a one-column
+    /// variance component; its summary test is the variance-component score
+    /// test, not the Wald test of the shrunk estimate (#3573).
+    pub fn ridged_linear_ranges(&self) -> Vec<(String, Range<usize>)> {
+        self.linear_ranges
+            .iter()
+            .filter(|(name, _)| {
+                self.penaltyinfo.iter().any(|info| {
+                    info.termname.as_deref() == Some(name.as_str())
+                        && matches!(
+                            &info.penalty.source,
+                            crate::basis::PenaltySource::Other(source)
+                                if source == "LinearTermRidge"
+                        )
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Global flat-penalty range owned by one realized smooth term.
     ///
     /// This is the only supported translation from a smooth-local penalty

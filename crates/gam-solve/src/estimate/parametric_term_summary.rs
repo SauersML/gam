@@ -5,11 +5,16 @@
 //! built once, here, beside [`super::smooth_term_summary_rows`]. The Wald
 //! reference distribution is read off the fit — `N(0, 1)` when the scale is
 //! known, Student-t on `wald_residual_degrees_of_freedom` when it is estimated
-//! — so no caller chooses it.
+//! — so no caller chooses it. A linear term under its null-recovery ridge is
+//! the exception: its row reports the variance-component score test the fit
+//! recorded (`FitArtifacts::linear_term_tests`, #3573).
 
 use crate::estimate::smooth_term_summary::SummaryBlockOffset;
-use crate::estimate::summary::ParametricTermSummary;
+use crate::estimate::summary::{
+    ParametricPValueUnavailable, ParametricTermSummary, ParametricTest,
+};
 use crate::model_types::result_types::UnifiedFitResult;
+use gam_terms::inference::random_effect_test::RandomEffectTestOutcome;
 use gam_math::probability::{normal_two_sided_probability, student_t_two_sided_probability};
 use gam_terms::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, TermCollectionDesign,
@@ -35,7 +40,7 @@ pub fn parametric_term_summary_rows(
     let se = uncertainty.as_ref().map(|view| &view.standard_errors);
     let scale_is_estimated = fit.likelihood_scale.wald_scale_is_estimated();
     let residual_df = fit.wald_residual_degrees_of_freedom();
-    let row = |name: String, local: usize| {
+    let wald_row = |name: String, local: usize| {
         let idx = offset.coefficients + local;
         let estimate = fit.beta.get(idx).copied().unwrap_or(f64::NAN);
         let std_error = se.and_then(|s| s.get(idx).copied());
@@ -60,12 +65,50 @@ pub fn parametric_term_summary_rows(
             std_error,
             statistic,
             pvalue,
+            test: ParametricTest::Wald,
+            pvalue_unavailable: None,
         }
+    };
+    // A ridged linear coefficient is a one-column variance component whose
+    // null sits on REML's λ → ∞ rail, where the Wald ratio of the shrunk
+    // estimate collapses to p ≈ 1 (#3573). Its row reports the score test the
+    // fit recorded for this exact term, matched by name AND global coefficient
+    // range so a replayed design whose layout drifted finds no record rather
+    // than a neighbour's.
+    let ridged = design.ridged_linear_ranges();
+    let score_row = |name: String, term: &str, range: &std::ops::Range<usize>, local: usize| {
+        let mut row = wald_row(name, local);
+        row.test = ParametricTest::VarianceComponentScore;
+        let global = (offset.coefficients + range.start)..(offset.coefficients + range.end);
+        let recorded = fit
+            .artifacts
+            .linear_term_tests
+            .iter()
+            .find(|record| record.term == term && record.coefficient_range == global)
+            .map(|record| &record.outcome);
+        match recorded {
+            Some(RandomEffectTestOutcome::Tested(test)) => {
+                row.statistic = test.signed_root;
+                row.pvalue = Some(test.p_value);
+            }
+            Some(RandomEffectTestOutcome::Unavailable { reason }) => {
+                row.statistic = None;
+                row.pvalue = None;
+                row.pvalue_unavailable = Some(ParametricPValueUnavailable::VarianceComponent(*reason));
+            }
+            None => {
+                row.statistic = None;
+                row.pvalue = None;
+                row.pvalue_unavailable =
+                    Some(ParametricPValueUnavailable::VarianceComponentTestNotRecorded);
+            }
+        }
+        row
     };
 
     let mut rows = Vec::new();
     for idx in design.intercept_range.clone() {
-        rows.push(row("Intercept".to_string(), idx));
+        rows.push(wald_row("Intercept".to_string(), idx));
     }
     for (name, range) in &design.linear_ranges {
         let label = linear_term_label(
@@ -73,12 +116,19 @@ pub fn parametric_term_summary_rows(
             spec.linear_terms.iter().find(|term| term.name == *name),
         );
         for idx in range.clone() {
-            let name = if range.len() > 1 {
+            let row_name = if range.len() > 1 {
                 format!("{label}[{}]", idx - range.start)
             } else {
                 label.clone()
             };
-            rows.push(row(name, idx));
+            let is_ridged = ridged
+                .iter()
+                .any(|(ridged_name, ridged_range)| ridged_name == name && ridged_range == range);
+            rows.push(if is_ridged {
+                score_row(row_name, name, range, idx)
+            } else {
+                wald_row(row_name, idx)
+            });
         }
     }
     rows

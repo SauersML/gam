@@ -10,6 +10,7 @@
 
 use crate::inference::saved_summary::{SummaryConvergence, SummaryPayload};
 use gam_report::{criterion_row, format_significant};
+use gam_solve::estimate::ParametricTest;
 use std::fmt::Write as _;
 
 /// The legend for the significance stars beside each p-value.
@@ -170,6 +171,22 @@ fn parametric_table(summary: &SummaryPayload, out: &mut String) {
         .collect::<Vec<_>>();
     out.push_str("Parametric coefficients:\n");
     write_table(out, &header, &rows);
+    // A ridged linear term's statistic is the score test at β = 0, not the
+    // ratio of the two columns beside it (#3573).
+    for row in &summary.parametric_terms {
+        if let Some(reason) = row.p_value_unavailable {
+            writeln!(out, "  {}: {}", row_label(row.predictor, &row.name), reason.explanation())
+                .expect("writing to a String cannot fail");
+        } else if row.test == ParametricTest::VarianceComponentScore.label() {
+            writeln!(
+                out,
+                "  {}: ridged term; {statistic} value and p-value are the variance-component \
+                 score test at coefficient 0, not Estimate / Std. Error",
+                row_label(row.predictor, &row.name)
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
     out.push('\n');
 }
 
@@ -407,6 +424,8 @@ mod tests {
                     std_error: Some(0.05),
                     statistic: Some(30.0),
                     p_value: Some(1e-50),
+                    test: "wald",
+                    p_value_unavailable: None,
                 },
                 SummaryParametricTermRow {
                     name: "x1".to_string(),
@@ -415,6 +434,8 @@ mod tests {
                     std_error: Some(0.125),
                     statistic: Some(-2.0),
                     p_value: Some(0.0484),
+                    test: "wald",
+                    p_value_unavailable: None,
                 },
             ],
             parametric_terms_unavailable: None,
@@ -533,6 +554,8 @@ Convergence: certified; inner P-IRLS: Converged after 5 iterations; 7 outer iter
             std_error: Some(0.1),
             statistic: Some(6.0),
             p_value: Some(1e-8),
+            test: "wald",
+            p_value_unavailable: None,
         });
         let mut marginal = smooth_row("s(x)", 3.2, None);
         marginal.predictor = Some("marginal");

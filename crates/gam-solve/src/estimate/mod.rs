@@ -130,7 +130,8 @@ pub use smooth_term_summary::{
 };
 pub use summary::{
     ContinuousSmoothnessOrder, ContinuousSmoothnessOrderStatus,
-    ParametricTermSummary, SmoothPValueUnavailable, SmoothTermSummary,
+    ParametricPValueUnavailable, ParametricTermSummary, ParametricTest,
+    SmoothPValueUnavailable, SmoothTermSummary,
 };
 
 #[cfg(test)]

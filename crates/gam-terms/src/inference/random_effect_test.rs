@@ -32,6 +32,15 @@
 //! is testing. The group penalties this crate builds are identity ridges, so
 //! `Σ_b = I` and `T = ‖u‖²`.
 //!
+//! A linear term carrying the default null-recovery ridge (`LinearTermRidge`)
+//! is the one-column case of the same model: `β ~ N(0, σ²_β/m)` with `m` its
+//! function mass, and REML's rail `λ → ∞` is `σ²_β = 0`. Its coefficient Wald
+//! test divides a `β̂` the ridge shrank to zero by a standard error the same
+//! ridge shrank, so it collapses to `p ≈ 1` on exactly the samples where REML
+//! recovers the null (#3573). One column makes `Σ` a scalar that cancels from
+//! the reference law, so the test below is the exact Rao score test of `β = 0`
+//! — the partial `F` test of the unpenalized model for a Gaussian fit.
+//!
 //! `v` is read off the full fit rather than a refit: with `s = W_F ⊙ (z − η̂)`
 //! the fit's working score,
 //!
@@ -171,6 +180,13 @@ pub struct RandomEffectTest {
     pub p_value: f64,
     /// Bound on `|p_value − P|/P` from the tail evaluation; `0` for a closed form.
     pub p_value_relative_error: f64,
+    /// For a one-column term, `u/√(φ̂·μ)`: the signed square root of
+    /// `statistic`, `N(0, 1)` under `H₀` for a known scale and Student-t on
+    /// `residual_df` for an estimated one (where `statistic` is the 1-df `F`).
+    /// `p_value` is its two-sided tail. `None` for a multi-column term, whose
+    /// score has no sign.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_root: Option<f64>,
 }
 
 /// Outcome for one term: a test, or a typed reason there is none.
@@ -498,7 +514,14 @@ impl<'a> RandomEffectTestBasis<'a> {
             }
         };
         let (p_value, p_value_relative_error) = resolved_tail(tail.probability, tail.relative_error)?;
+        // One column and one kept direction: `weight_sum = μ` and
+        // `effective_df = 1`, so `statistic/φ̂·effective_df/weight_sum` is
+        // `u²/(φ̂μ)` and its signed root carries the score's direction.
+        let signed_root = (term.score.len() == 1)
+            .then(|| term.score[0] / (dispersion * weight_sum).sqrt())
+            .filter(|root| root.is_finite());
         Ok(RandomEffectTest {
+            signed_root,
             statistic: statistic / dispersion * effective_df / weight_sum,
             reference_df: effective_df,
             rank,

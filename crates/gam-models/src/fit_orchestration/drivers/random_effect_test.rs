@@ -1,5 +1,6 @@
-// The per-term random-effect test — the driver that turns a fitted standard GAM
-// into "does each `group()` block carry a between-group effect?".
+// The per-term variance-component test — the driver that turns a fitted
+// standard GAM into "does each `group()` block carry a between-group effect?"
+// and "does each ridged linear term carry any effect?" (#3573).
 //
 // `include!`d into `drivers/mod.rs` like the other self-contained inference
 // subsystems, so it shares the driver's flat namespace and import surface.
@@ -10,28 +11,39 @@
 // over; every term gets a record, and a term the test cannot score carries the
 // typed reason instead of a p-value.
 
-/// The variance-component test of every random-effect block of a fitted
-/// standard GAM.
+/// The variance-component score tests of a fitted standard GAM: one record
+/// per random-effect block and one per linear term carrying the null-recovery
+/// ridge (`TermCollectionDesign::ridged_linear_ranges`, #3573).
+pub struct VarianceComponentTestRecords {
+    pub random_effect: Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord>,
+    pub linear_term: Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord>,
+}
+
+/// The variance-component test of every random-effect block and every ridged
+/// linear term of a fitted standard GAM, scored against one shared basis.
 ///
 /// Never fails: a fit without the row state the score needs yields one
-/// `NoIrlsRowState` record per block, so the summary always has an answer for
-/// each random-effect row.
-pub fn random_effect_test_records(
+/// `NoIrlsRowState` record per term, so the summary always has an answer for
+/// each such row.
+pub fn variance_component_test_records(
     design: &gam_terms::smooth::TermCollectionDesign,
     fit: &UnifiedFitResult,
-) -> Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord> {
+) -> VarianceComponentTestRecords {
     use gam_terms::inference::random_effect_test::{
         RandomEffectTermRequest, RandomEffectTestBasis, RandomEffectTestInput,
         RandomEffectTestOutcome, RandomEffectTestRecord, RandomEffectTestScale,
         RandomEffectTestUnavailable,
     };
 
-    let ranges = &design.random_effect_ranges;
-    if ranges.is_empty() {
-        return Vec::new();
-    }
-    let records = |outcomes: Vec<RandomEffectTestOutcome>| -> Vec<RandomEffectTestRecord> {
-        ranges
+    let random_effect_count = design.random_effect_ranges.len();
+    let ranges: Vec<(String, std::ops::Range<usize>)> = design
+        .random_effect_ranges
+        .iter()
+        .cloned()
+        .chain(design.ridged_linear_ranges())
+        .collect();
+    let split = |outcomes: Vec<RandomEffectTestOutcome>| {
+        let mut records: Vec<RandomEffectTestRecord> = ranges
             .iter()
             .zip(outcomes)
             .map(|((name, range), outcome)| RandomEffectTestRecord {
@@ -39,10 +51,18 @@ pub fn random_effect_test_records(
                 coefficient_range: range.clone(),
                 outcome,
             })
-            .collect()
+            .collect();
+        let linear_term = records.split_off(random_effect_count);
+        VarianceComponentTestRecords {
+            random_effect: records,
+            linear_term,
+        }
     };
+    if ranges.is_empty() {
+        return split(Vec::new());
+    }
     let unavailable = |reason: RandomEffectTestUnavailable| {
-        records(
+        split(
             ranges
                 .iter()
                 .map(|_| RandomEffectTestOutcome::Unavailable { reason })
@@ -88,7 +108,7 @@ pub fn random_effect_test_records(
             range: range.clone(),
         })
         .collect();
-    records(
+    split(
         basis
             .test_terms(&requests)
             .into_iter()

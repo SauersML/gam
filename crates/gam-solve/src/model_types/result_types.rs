@@ -2747,6 +2747,15 @@ pub struct FitArtifacts {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub random_effect_tests:
         Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord>,
+    /// The same variance-component score test for every linear term carrying
+    /// the null-recovery ridge (`TermCollectionDesign::ridged_linear_ranges`),
+    /// computed on the same row state (#3573). The summary's ridged linear
+    /// rows read their statistic and p-value from here instead of from the
+    /// Wald ratio of the shrunk coefficient. Empty when no linear term is
+    /// ridged; a summary treats a ridged term missing from it as not recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linear_term_tests:
+        Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord>,
 }
 
 /// A certified outer point (gam#3002): `theta`, the outer coordinates in the order
@@ -2906,6 +2915,7 @@ impl std::fmt::Debug for FitArtifacts {
                     .map(|seed| (seed.theta.len(), seed.beta.len())),
             )
             .field("random_effect_tests", &self.random_effect_tests)
+            .field("linear_term_tests", &self.linear_term_tests)
             .finish()
     }
 }

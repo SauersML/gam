@@ -286,8 +286,14 @@ class Summary:
         when it is known.
     parametric_terms : list of dict
         The intercept and linear-term coefficients, one record per coefficient
-        with ``name``, ``estimate``, ``std_error``, ``statistic`` and
-        ``p_value``.
+        with ``name``, ``estimate``, ``std_error``, ``statistic``, ``p_value``
+        and ``test``. ``test`` is ``"wald"`` when ``statistic`` is
+        ``estimate / std_error``, or ``"variance_component_score"`` for a
+        linear term under its null-recovery ridge, whose ``statistic`` is the
+        signed root of the score test at coefficient 0 (same ``"t"``/``"z"``
+        law) because the ridge shrinks estimate and standard error together.
+        Such a row whose test could not be computed carries
+        ``p_value_unavailable``, the reason's label.
     parametric_terms_unavailable : str or None
         Why :attr:`parametric_terms` could not be built; the same causes as
         :attr:`smooth_terms_unavailable`.
