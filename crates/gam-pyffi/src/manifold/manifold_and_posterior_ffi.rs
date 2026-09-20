@@ -474,7 +474,9 @@ fn difference_smooth_json_impl(model: &FittedModel, request_json: &str) -> Resul
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
     // The band prices its SEs off the covariance the fit publishes, as
     // `summary()` and `partial_dependence` do (#2779); a fit whose correction
-    // is typed unavailable reports the conditional band under that label.
+    // is typed unavailable reports the conditional band under that label. The
+    // band's critical value reads the same fit-owned reference law as
+    // `predict()` intervals: Student-t on n - edf for an estimated dispersion.
     let selected_covariance = gam::inference::effects::select_published_covariance(&fit)
         .map_err(|error| error.to_string())?;
     let payload = model.payload();
@@ -497,6 +499,8 @@ fn difference_smooth_json_impl(model: &FittedModel, request_json: &str) -> Resul
             beta: fit.beta.view(),
             covariance: selected_covariance.matrix,
             covariance_source: selected_covariance.source,
+            reference: gam::inference::interval_reference::IntervalReference::of_fit(&fit)
+                .map_err(|error| error.to_string())?,
         },
         request,
         |headers, rows| {

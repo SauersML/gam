@@ -27,7 +27,7 @@ pub use posterior_predict::*;
 use crate::binomial_location_scale::BinomialLocationScalePredictor;
 pub(crate) use crate::dispersion_location_scale::DispersionLocationScalePredictor;
 use crate::gaussian_location_scale::GaussianLocationScalePredictor;
-pub use crate::interval_policy::IntervalReference;
+pub use gam_inference::interval_reference::IntervalReference;
 use crate::interval_policy::{
     EtaInterval, LinearState, MeanBoundMethod, PredictPass, PredictionTransform, ResponseBounds,
     ResponseInterval, assemble_posterior_mean_bounds, predict_full_uncertainty_generic,
@@ -3650,6 +3650,7 @@ mod tests {
             coefficient_influence: None,
             weighted_gram: None,
             identified_subspace: None,
+            working_residual: None,
         });
         fit
     }
@@ -4599,6 +4600,7 @@ mod tests {
             coefficient_influence: None,
             weighted_gram: None,
             identified_subspace: None,
+            working_residual: None,
         };
         UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
             blocks: vec![FittedBlock {
