@@ -1,5 +1,16 @@
 ## Unreleased
 
+- **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
+  `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
+  `μ̂ ≤ c₀·a²·(1−1/SNR)·(1−C_κκ)/K`, with the chosen constants `c₀ = 1` and
+  `C_κ = 0.125` and no derivation behind the inequality, and it published that as
+  `Verdict::Certified`. The verdict, both constants and its phase-diagram test are
+  deleted. The measurements stay, renamed `CertificateInputs` →
+  `DictionaryIncoherenceReport`: `μ̂`, per-atom `κ̂`, the activity floor and the SNR
+  proxy. The Python `incoherence_report` dict loses the `global_optimality`,
+  `global_optimality_certified` and `global_optimality_margin` keys, and the report
+  is no longer recorded in the certificate ledger.
+
 - **A learned Gaussian-shift frailty in survival marginal-slope is refused as not identified.**
   The likelihood reads σ only through the observed slope `s(σ)·g`, `s = 1/√(1+σ²)`, so with
   the default slope (an intercept in every slope surface and a constant or no offset) any σ
@@ -275,9 +286,10 @@
   (#2926). Both families test the score's conditional law on the
   marginal-index span. Where that law does not move and the score passes the
   standard-normal adequacy screen, the fit uses the closed form, kept at the
-  converged fit only when the rows' anchoring residuals under the estimated
-  law say it is expected to be at least as accurate as that law's own anchor
-  (`D̂ = Σ w (r² − 2·se²)/(π(1−π)) ≤ 0`), and records it as
+  converged fit unless the rows' anchoring residuals under the estimated law
+  are beyond what that law's own sampling error gives an exactly Gaussian
+  score (the upper 5% of their exact weighted-chi-square null law; `D̂ =
+  Σ w (r² − 2·se²)/(π(1−π))` is recorded beside it), and records it as
   `estimated-gaussian-adequate`; otherwise the fit is re-solved on the
   estimated law (`estimated-global-by-residual`). Otherwise it anchors the index on
   one estimated finite law, or on local laws by context where the law moves,
@@ -325,8 +337,8 @@
   from the standard normal. Where a score's law moves, every score keeps the
   closed form as `gaussian-uncertified`, naming that score (#2949). A closed
   form the screen chose for several scores is certified by `D̂` on their joint
-  law, and where `D̂ > 0` re-solved on it, or recorded `gaussian-uncertified`
-  with `D̂` where nothing can re-solve on it.
+  law, and where the certificate fires re-solved on it, or recorded
+  `gaussian-uncertified` with the certificate where nothing can re-solve on it.
 - **`AtomCore.evidence` is removed** (#2946). It copied the fit's `penalized_loss_score`
   into every atom under a label that claimed a per-atom marginal likelihood. It was
   neither a marginal likelihood nor per atom. **Migration:** read the model's top-level
