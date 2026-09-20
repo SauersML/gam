@@ -78,7 +78,7 @@ fn parenthesized_default_link_equals_bare_family() {
         ("gaussian(identity)", "gaussian"),
         ("binomial(logit)", "binomial"),
         ("beta(logit)", "beta"),
-        ("negative_binomial(log)", "negative_binomial"),
+        ("negative-binomial(log)", "negative-binomial"),
     ] {
         let p = resolve(paren).unwrap_or_else(|e| panic!("{paren} must resolve: {e}"));
         let b = resolve(bare).unwrap_or_else(|e| panic!("{bare} must resolve: {e}"));

@@ -1680,7 +1680,7 @@ where
                             // genuine non-improver at the current iterate. Without
                             // this guard the loop would bump λ and `continue` forever:
                             // at a flat optimum (e.g. the larger null space of a
-                            // cyclic `bs='cc'` penalty, where the gradient is at
+                            // cyclic `bs='cyclic'` penalty, where the gradient is at
                             // machine zero and every trial step lies in a direction
                             // the objective is flat along) `rho` never crosses 0, λ
                             // grows until it overflows to `inf`, the damped solve then

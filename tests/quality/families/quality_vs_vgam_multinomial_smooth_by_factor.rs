@@ -194,7 +194,7 @@ fn gam_multinomial_smooth_by_factor_recovers_truth() {
     // outer path; convergence, not elapsed wall time, is the correctness gate.
     let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
         data: &ds,
-        formula: "y ~ s(x, bs='tp', k=5) + s(x, by=group, bs='tp', k=5)",
+        formula: "y ~ s(x, bs='tps', k=5) + s(x, by=group, bs='tps', k=5)",
         config: &cfg,
         init_lambda: 1.0,
         max_iter: 60,

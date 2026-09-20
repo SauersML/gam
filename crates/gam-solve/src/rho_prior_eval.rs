@@ -64,21 +64,31 @@ pub(crate) fn pc_prior_terms(theta: f64, r: f64) -> (f64, f64, f64) {
 /// weak PC prior derived by the distribution policy. Keeping this boundary
 /// explicit prevents a future fitting path from mistaking the sampler's derived
 /// prior for part of REML/LAML.
-pub(crate) fn rho_distribution_default_terms(theta: f64, r: f64) -> (f64, f64) {
-    let (cost, gradient, _) = pc_prior_terms(theta, r);
-    (cost, gradient)
+pub(crate) fn rho_distribution_default_terms(theta: f64, r: f64) -> (f64, f64, f64) {
+    pc_prior_terms(theta, r)
+}
+
+/// The amount [`distribution_correction`] adds to the fitting criterion, with
+/// its derivatives in `ρ`. Every term is per-coordinate, so the curvature is
+/// the diagonal `hessian_diagonal`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DistributionCorrection {
+    pub(crate) cost: f64,
+    pub(crate) gradient: Array1<f64>,
+    pub(crate) hessian_diagonal: Array1<f64>,
 }
 
 /// Convert the fitting objective's prior contribution to a density with respect
 /// to `dρ`. Numerical integration and sampling must use this same correction.
 /// Unset coordinates receive the existing proper PC distribution prior; an
-/// explicit Gamma prior on precision additionally needs `dλ/dρ = exp(ρ)`.
-/// Normal and PC priors are already expressed with respect to `dρ`.
+/// explicit Gamma prior on precision additionally needs `dλ/dρ = exp(ρ)`, whose
+/// log is linear in `ρ` and so adds no curvature. Normal and PC priors are
+/// already expressed with respect to `dρ`.
 pub(crate) fn distribution_correction(
     prior: &RhoPrior,
     rho: &Array1<f64>,
     default_pc_rate: f64,
-) -> Result<(f64, Array1<f64>), RhoPriorError> {
+) -> Result<DistributionCorrection, RhoPriorError> {
     if !default_pc_rate.is_finite() || default_pc_rate <= 0.0 {
         return Err(RhoPriorError::constraint_violation(
             "rho distribution requires a finite positive default PC rate".into(),
@@ -99,11 +109,12 @@ pub(crate) fn distribution_correction(
     };
     let mut cost = 0.0;
     let mut gradient = Array1::zeros(rho.len());
+    let mut hessian_diagonal = Array1::zeros(rho.len());
     for (index, &r) in rho.iter().enumerate() {
         let scalar = independent.map_or(prior, |priors| &priors[index]);
         // Share the fitting engine's shape, parameter and scalar-prior checks.
         scalar_terms(scalar, r, "rho distribution prior")?;
-        let (value, derivative) = match scalar {
+        let (value, derivative, curvature) = match scalar {
             RhoPrior::Flat => rho_distribution_default_terms(default_pc_rate, r),
             RhoPrior::GammaPrecision { shape, rate } if *shape == 1.0 && *rate == 0.0 => {
                 rho_distribution_default_terms(default_pc_rate, r)
@@ -114,8 +125,8 @@ pub(crate) fn distribution_correction(
                         .into(),
                 ));
             }
-            RhoPrior::GammaPrecision { .. } => (-r, -1.0),
-            RhoPrior::Normal { .. } | RhoPrior::PenalizedComplexity { .. } => (0.0, 0.0),
+            RhoPrior::GammaPrecision { .. } => (-r, -1.0, 0.0),
+            RhoPrior::Normal { .. } | RhoPrior::PenalizedComplexity { .. } => (0.0, 0.0, 0.0),
             RhoPrior::Independent(_) => {
                 return Err(RhoPriorError::constraint_violation(
                     "rho distribution prior must not contain nested Independent priors".into(),
@@ -124,8 +135,13 @@ pub(crate) fn distribution_correction(
         };
         cost += value;
         gradient[index] = derivative;
+        hessian_diagonal[index] = curvature;
     }
-    Ok((cost, gradient))
+    Ok(DistributionCorrection {
+        cost,
+        gradient,
+        hessian_diagonal,
+    })
 }
 
 /// What a caller wants done when the configured prior is malformed (e.g. a
@@ -332,11 +348,21 @@ mod tests {
         for r in [-4.0_f64, 0.0, 2.0] {
             let rho = Array1::from_vec(vec![r]);
             let criterion = evaluate_strict(&prior, &rho).expect("valid Gamma prior");
-            let (cost, gradient) =
+            let correction =
                 distribution_correction(&prior, &rho, 0.5).expect("proper Gamma density");
             // p(λ) ∝ λ² exp(-2λ), hence p(ρ) ∝ exp(3ρ - 2 exp(ρ)).
-            approx(criterion.cost + cost, 2.0 * r.exp() - 3.0 * r);
-            approx(criterion.gradient[0] + gradient[0], 2.0 * r.exp() - 3.0);
+            approx(criterion.cost + correction.cost, 2.0 * r.exp() - 3.0 * r);
+            approx(
+                criterion.gradient[0] + correction.gradient[0],
+                2.0 * r.exp() - 3.0,
+            );
+            // The Jacobian is linear in ρ: the density's curvature is the
+            // criterion's own `rate · λ`.
+            let criterion_curvature = criterion.hessian.map_or(0.0, |h| h[[0, 0]]);
+            approx(
+                criterion_curvature + correction.hessian_diagonal[0],
+                2.0 * r.exp(),
+            );
         }
     }
 
@@ -358,17 +384,21 @@ mod tests {
             RhoPrior::Normal { mean: 2.0, sd: 3.0 },
             flat_gamma,
         ];
-        let (cost, gradient) =
+        let joint =
             distribution_correction(&RhoPrior::Independent(priors.to_vec()), &rho, theta).unwrap();
         let mut expected = 0.0;
         for (index, prior) in priors.iter().enumerate() {
-            let (c, g) =
+            let single =
                 distribution_correction(prior, &Array1::from_vec(vec![rho[index]]), theta).unwrap();
-            expected += c;
-            approx(gradient[index], g[0]);
+            expected += single.cost;
+            approx(joint.gradient[index], single.gradient[0]);
+            approx(joint.hessian_diagonal[index], single.hessian_diagonal[0]);
         }
-        approx(cost, expected);
-        approx(gradient[1], 0.0);
+        approx(joint.cost, expected);
+        approx(joint.gradient[1], 0.0);
+        approx(joint.hessian_diagonal[1], 0.0);
+        // An unset coordinate carries the PC prior's curvature `(θ/4)e^{-ρ/2}`.
+        approx(joint.hessian_diagonal[0], 0.25 * theta * (0.5f64).exp());
     }
 
     #[test]

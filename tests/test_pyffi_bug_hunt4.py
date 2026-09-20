@@ -110,8 +110,8 @@ def test_bug_latent_glm_family_synonyms_route_to_distinct_likelihood_specs() -> 
             "y": rng.binomial(1, probability),
         }
     )
-    m1 = gamfit.fit(train, "y ~ x", family="binomial_logit")
-    m2 = gamfit.fit(train, "y ~ x", family="binomial_probit")
+    m1 = gamfit.fit(train, "y ~ x", family="binomial-logit")
+    m2 = gamfit.fit(train, "y ~ x", family="binomial-probit")
     # `Model.predict` returns the response-scale mean directly for a standard
     # GAM; there is no `.mu` attribute on the result and there never has been
     # (`grep -rn "def mu" gamfit/` is empty). Reading `.mu` raised

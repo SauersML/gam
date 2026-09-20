@@ -29,7 +29,7 @@
 //!
 //! Capability under test: survival AFT predictive *calibration* (not just point
 //! coefficients) for the lognormal location-scale family, requested via
-//!   `Surv(t, event) ~ x + s(z, bs="tp", k=5)`
+//!   `Surv(t, event) ~ x + s(z, bs="tps", k=5)`
 //! fit through gam's location-scale survival likelihood
 //! (`FitConfig{ survival_likelihood: "location-scale", survival_distribution:
 //! "gaussian" }`). A Gaussian residual on gam's monotone time-warp channel IS
@@ -42,7 +42,7 @@
 //! by maximum likelihood under right-censoring — the SAME location-scale
 //! likelihood, but log-LINEAR in the covariates (lifelines cannot fit the smooth
 //! `s(z)` directly, so it receives a flexible basis expansion of `z` instead;
-//! see the body). gam carries the smooth via `s(z, bs="tp", k=5)`.
+//! see the body). gam carries the smooth via `s(z, bs="tps", k=5)`.
 //!
 //! Why CRPS via Monte Carlo. For a sample {y_j} ~ LogNormal(mu_i, sigma_i) and
 //! observed time t_i,
@@ -158,7 +158,7 @@ fn gam_lognormal_aft_crps_calibration_matches_lifelines() {
     let z_idx = col["z"];
     let ncols = ds.headers.len();
 
-    // ---- fit with gam: lognormal location-scale AFT with s(z, bs="tp", k=5) -
+    // ---- fit with gam: lognormal location-scale AFT with s(z, bs="tps", k=5) -
     // Gaussian-residual survival location-scale == lognormal AFT (module doc).
     // No noise_formula => a single constant log-scale (sigma) channel, matching
     // lifelines' constant `sigma_`.
@@ -167,7 +167,7 @@ fn gam_lognormal_aft_crps_calibration_matches_lifelines() {
         survival_distribution: "gaussian".to_string(),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tp", k=5)"#, &ds, &cfg)
+    let result = fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tps", k=5)"#, &ds, &cfg)
         .expect("gam lognormal location-scale AFT fit");
     let FitResult::SurvivalLocationScale(fit) = result else {
         panic!("expected a survival location-scale fit result");
@@ -550,7 +550,7 @@ fn gam_lognormal_aft_crps_calibration_matches_lifelines_on_real_data() {
         ..FitConfig::default()
     };
     let result = fit_from_formula(
-        r#"Surv(time, status) ~ karno + s(age, bs="tp", k=5)"#,
+        r#"Surv(time, status) ~ karno + s(age, bs="tps", k=5)"#,
         &train_ds,
         &cfg,
     )
