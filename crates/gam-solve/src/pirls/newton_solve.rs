@@ -655,41 +655,38 @@ pub(super) fn solve_newton_direction_dense(
         .map_err(EstimationError::LinearSystemSolveFailed)?;
     solve_direction_with_dense_factor(&factor, gradient, direction_out);
 
-    // Validate: bare Cholesky on a near-singular H produces huge spurious
-    // step magnitudes in the null direction. If `‖H·δ + g‖∞ / (1+‖g‖∞)` is
-    // not small, the purported direction does not solve the requested
-    // unperturbed system. Surface that failure to the LM controller rather
-    // than silently changing the system or replacing it with a pseudoinverse.
-    let validation_residual = {
-        let h_delta = curvature.dot(direction_out);
-        h_delta
-            .iter()
-            .zip(gradient.iter())
-            .map(|(h, g)| (h + g).abs())
-            .fold(0.0_f64, f64::max)
-    };
-    let g_inf = gradient.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-    let rel = validation_residual / (1.0 + g_inf);
-    if !rel.is_finite() || rel > 1.0e-3 {
-        return Err(EstimationError::InvalidInput(format!(
-            "PIRLS Newton direction failed its unperturbed linear-system certificate: relative residual {rel:.3e} exceeds 1e-3"
-        )));
-    }
-    if array_is_finite(direction_out) {
-        log::debug!(
-            "[STAGE] PIRLS dense newton solve backend=CPU p={} flops~{} elapsed={:.3}s route=\"{}\"",
-            p,
-            (p as u64).saturating_mul((p as u64).saturating_mul(p as u64)) / 3,
-            dense_solve_start.elapsed().as_secs_f64(),
-            cpu_route,
-        );
-        return Ok(());
-    }
-    Err(EstimationError::LinearSystemSolveFailed(
-        FaerLinalgError::FactorizationFailed {
-            context: "PIRLS dense newton solve exhausted",
-        },
-    ))
+    // Certify that `δ` solves the unperturbed system `C·δ = −g` by its
+    // normwise backward error `‖C·δ + g‖∞ / (p‖C‖max‖δ‖∞ + ‖g‖∞)` against the
+    // factorization's own roundoff allowance: the shared boundary every exact
+    // factorized solve is certified at. A failure is surfaced to the LM
+    // controller rather than silently changing the system. The test is
+    // invariant under `C ↦ cC` and `g ↦ ag`, so the verdict does not depend on
+    // the response or coefficient units. The length of a certified step on a
+    // nearly singular `C` is not a defect of the solve; the damping and the
+    // gain ratio judge it on the true objective.
+    let residual = curvature.dot(direction_out) + gradient;
+    let curvature_max_abs = curvature.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    gam_linalg::utils::certify_linear_system_residual(
+        p,
+        curvature_max_abs,
+        &gradient.mapv(|g| -g).insert_axis(ndarray::Axis(1)),
+        &direction_out.clone().insert_axis(ndarray::Axis(1)),
+        &residual.insert_axis(ndarray::Axis(1)),
+        "PIRLS dense Newton direction",
+    )
+    .map_err(|error| {
+        EstimationError::InvalidInput(format!(
+            "PIRLS Newton direction failed its unperturbed linear-system certificate: {error}"
+        ))
+    })?;
+    log::debug!(
+        "[STAGE] PIRLS dense newton solve backend=CPU p={} flops~{} elapsed={:.3}s route=\"{}\"",
+        p,
+        (p as u64).saturating_mul((p as u64).saturating_mul(p as u64)) / 3,
+        dense_solve_start.elapsed().as_secs_f64(),
+        cpu_route,
+    );
+    Ok(())
 }
 
 /// Solve `min_direction ||A direction + residual||` without assembling either

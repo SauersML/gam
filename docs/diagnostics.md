@@ -345,16 +345,15 @@ train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
 model = gamfit.fit(train_df, "y ~ s(x)")
 
 fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-model.plot(train_df, x="x", kind="prediction",            ax=axes[0])
-model.plot(train_df, x="x", kind="residuals",             ax=axes[1])
-model.plot(train_df, x="x", kind="observed_vs_predicted", ax=axes[2])
+model.plot(train_df, kind="prediction",            ax=axes[0])
+model.plot(train_df, kind="residuals",             ax=axes[1])
+model.plot(train_df, kind="observed_vs_predicted", ax=axes[2])
 plt.tight_layout()
 ```
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
 | `data` | required | Held-out data, with the response column present (same requirements as `diagnose`). |
-| `x` | inferred | Feature column to put on the x-axis for `"prediction"`. Inferred when there is exactly one non-response column. |
 | `y` | `None` | Response column override. |
 | `interval` | `0.95` | Wald-band coverage for `"prediction"`. Ignored for the other kinds. |
 | `kind` | `"prediction"` | One of `"prediction"`, `"residuals"`, `"observed_vs_predicted"`. |
@@ -362,12 +361,15 @@ plt.tight_layout()
 
 | `kind` | Contents |
 | --- | --- |
-| `"prediction"` | Sorted mean curve over `x`, shaded Wald band when `interval` is set, observed scatter overlay. |
+| `"prediction"` | For a model with one feature column: the mean curve over it, shaded Wald band when `interval` is set, observed scatter overlay. |
 | `"residuals"` | Residuals vs predicted mean with a horizontal zero line. |
 | `"observed_vs_predicted"` | Observed vs predicted with a `y = x` reference line. |
 
 Returns the `matplotlib.axes.Axes` drawn on. Raises `ValueError` for
-unknown `kind`, ambiguous `x`, or a missing `x` column. Requires
+unknown `kind`, or for `"prediction"` on data with more than one feature
+column: the full model's prediction sorted by one column zigzags through the
+others' values. Per-term curves are partial effects; draw them with
+`model.plot_terms()` (see [partial-effects.md](partial-effects.md)). Requires
 matplotlib (install `gamfit[plot]`).
 
 ## report()

@@ -72,6 +72,23 @@ as a status and counted against the library, never skipped.
 | poisson n=1000 p20 | — | 0.885 s | 5.12 s | **LOSS(status)** | **LOSS(status)** |
 | poisson n=1000 te | 3.89 s | 0.0976 s | 0.617 s | 39.85x **LOSS** | 6.31x **LOSS** |
 
+## import CPU (median over ok reps)
+
+| cell | gamfit | pygam | pygam_gs | vs pygam | vs pygam_gs |
+|---|---|---|---|---|---|
+| gaussian n=1000 p1 | 0.102 s | 0.0161 s | 0.0148 s | 6.35x **LOSS** | 6.92x **LOSS** |
+| gaussian n=1000 p5 | 0.104 s | 0.0164 s | 0.0166 s | 6.33x **LOSS** | 6.23x **LOSS** |
+| gaussian n=1000 p20 | 0.099 s | 0.0205 s | 0.0204 s | 4.84x **LOSS** | 4.86x **LOSS** |
+| gaussian n=1000 te | 0.108 s | 0.0159 s | 0.0164 s | 6.75x **LOSS** | 6.56x **LOSS** |
+| binomial n=1000 p1 | 0.103 s | 0.0154 s | 0.0154 s | 6.69x **LOSS** | 6.70x **LOSS** |
+| binomial n=1000 p5 | 0.107 s | 0.0173 s | 0.0163 s | 6.21x **LOSS** | 6.60x **LOSS** |
+| binomial n=1000 p20 | — | 0.0229 s | 0.0219 s | **LOSS(status)** | **LOSS(status)** |
+| binomial n=1000 te | 0.104 s | 0.016 s | 0.0157 s | 6.52x **LOSS** | 6.64x **LOSS** |
+| poisson n=1000 p1 | 0.104 s | 0.016 s | 0.0146 s | 6.52x **LOSS** | 7.11x **LOSS** |
+| poisson n=1000 p5 | 0.0964 s | 0.0149 s | 0.0147 s | 6.45x **LOSS** | 6.55x **LOSS** |
+| poisson n=1000 p20 | — | 0.0198 s | 0.0214 s | **LOSS(status)** | **LOSS(status)** |
+| poisson n=1000 te | 0.0982 s | 0.0142 s | 0.0142 s | 6.93x **LOSS** | 6.92x **LOSS** |
+
 ## predict CPU (median over ok reps)
 
 | cell | gamfit | pygam | pygam_gs | vs pygam | vs pygam_gs |
@@ -191,24 +208,24 @@ as a status and counted against the library, never skipped.
 | poisson n=1000 p20 | — | 1.76 | 1.64 | **LOSS(status)** | **LOSS(status)** |
 | poisson n=1000 te | 1.61 | 1.61 | 1.61 | WIN Δ=-0.0013±0.00046 | better n.s. Δ=-0.000572±0.0021 |
 
-## 95% CI coverage of true mean (verdict on |cov-0.95|) (mean over ok reps; verdict paired by seed)
+## 95% CI coverage of true mean (verdict on |mean cov-0.95|) (mean over ok reps; verdict paired by seed)
 
 | cell | gamfit | pygam | pygam_gs | vs pygam | vs pygam_gs |
 |---|---|---|---|---|---|
-| gaussian n=1000 p1 | 0.931 | 0.895 | 0.864 | better n.s. Δ=-0.003±0.015 | better n.s. Δ=-0.0517±0.055 |
+| gaussian n=1000 p1 | 0.931 | 0.895 | 0.864 | better n.s. Δ=-0.0363±0.021 | better n.s. Δ=-0.0677±0.045 |
 | gaussian n=1000 p5 | 0.991 | 0.971 | 0.973 | **LOSS** Δ=+0.0197±0.0087 | **LOSS** Δ=+0.018±0.0021 |
-| gaussian n=1000 p20 | 0.956 | 0.94 | 0.893 | **LOSS** Δ=+0.011±0.0032 | better n.s. Δ=-0.035±0.02 |
-| gaussian n=1000 te | 0.939 | 0.866 | 0.911 | WIN Δ=-0.068±0.01 | WIN Δ=-0.023±0.0091 |
-| binomial n=1000 p1 | 0.944 | 0.905 | 0.817 | better n.s. Δ=-0.006±0.016 | better n.s. Δ=-0.094±0.11 |
-| binomial n=1000 p5 | 0.966 | 0.927 | 0.934 | better n.s. Δ=-0.0167±0.027 | better n.s. Δ=-0.00967±0.018 |
+| gaussian n=1000 p20 | 0.956 | 0.94 | 0.893 | better n.s. Δ=-0.00433±0.02 | better n.s. Δ=-0.0517±0.036 |
+| gaussian n=1000 te | 0.939 | 0.866 | 0.911 | WIN Δ=-0.0733±0.0047 | WIN Δ=-0.0283±0.011 |
+| binomial n=1000 p1 | 0.944 | 0.905 | 0.817 | better n.s. Δ=-0.0393±0.049 | better n.s. Δ=-0.127±0.095 |
+| binomial n=1000 p5 | 0.966 | 0.927 | 0.934 | better n.s. Δ=-0.00667±0.042 | better n.s. Δ=-0.000333±0.034 |
 | binomial n=1000 p20 | — | 0.935 | 0.933 | **LOSS(status)** | **LOSS(status)** |
-| binomial n=1000 te | 0.934 | 0.819 | 0.84 | WIN Δ=-0.0773±0.026 | better n.s. Δ=-0.0673±0.064 |
-| poisson n=1000 p1 | 0.963 | 0.975 | 0.941 | worse n.s. Δ=+0.00133±0.0041 | better n.s. Δ=-0.016±0.018 |
-| poisson n=1000 p5 | 0.968 | 0.943 | 0.94 | worse n.s. Δ=+0.00867±0.014 | better n.s. Δ=-0.0133±0.022 |
+| binomial n=1000 te | 0.934 | 0.819 | 0.84 | WIN Δ=-0.115±0.021 | better n.s. Δ=-0.0933±0.051 |
+| poisson n=1000 p1 | 0.963 | 0.975 | 0.941 | better n.s. Δ=-0.0113±0.009 | worse n.s. Δ=+0.00467±0.055 |
+| poisson n=1000 p5 | 0.968 | 0.943 | 0.94 | worse n.s. Δ=+0.0113±0.02 | worse n.s. Δ=+0.008±0.042 |
 | poisson n=1000 p20 | — | 0.953 | 0.935 | **LOSS(status)** | **LOSS(status)** |
-| poisson n=1000 te | 0.961 | 0.953 | 0.841 | worse n.s. Δ=+0.007±0.008 | WIN Δ=-0.087±0.042 |
+| poisson n=1000 te | 0.961 | 0.953 | 0.841 | worse n.s. Δ=+0.00833±0.015 | better n.s. Δ=-0.0983±0.053 |
 
-## Losses (135)
+## Losses (154)
 
 - binomial n=1000 p20: status vs pygam (0/3 ok, 2 not_run_after_timeout, 1 timeout)
 - binomial n=1000 p20: status vs pygam_gs (0/3 ok, 2 not_run_after_timeout, 1 timeout)
@@ -254,6 +271,26 @@ as a status and counted against the library, never skipped.
 - poisson n=1000 p5: fit wall vs pygam_gs 45.51x **LOSS**
 - poisson n=1000 te: fit wall vs pygam 39.85x **LOSS**
 - poisson n=1000 te: fit wall vs pygam_gs 6.31x **LOSS**
+- gaussian n=1000 p1: import CPU vs pygam 6.35x **LOSS**
+- gaussian n=1000 p1: import CPU vs pygam_gs 6.92x **LOSS**
+- gaussian n=1000 p5: import CPU vs pygam 6.33x **LOSS**
+- gaussian n=1000 p5: import CPU vs pygam_gs 6.23x **LOSS**
+- gaussian n=1000 p20: import CPU vs pygam 4.84x **LOSS**
+- gaussian n=1000 p20: import CPU vs pygam_gs 4.86x **LOSS**
+- gaussian n=1000 te: import CPU vs pygam 6.75x **LOSS**
+- gaussian n=1000 te: import CPU vs pygam_gs 6.56x **LOSS**
+- binomial n=1000 p1: import CPU vs pygam 6.69x **LOSS**
+- binomial n=1000 p1: import CPU vs pygam_gs 6.70x **LOSS**
+- binomial n=1000 p5: import CPU vs pygam 6.21x **LOSS**
+- binomial n=1000 p5: import CPU vs pygam_gs 6.60x **LOSS**
+- binomial n=1000 te: import CPU vs pygam 6.52x **LOSS**
+- binomial n=1000 te: import CPU vs pygam_gs 6.64x **LOSS**
+- poisson n=1000 p1: import CPU vs pygam 6.52x **LOSS**
+- poisson n=1000 p1: import CPU vs pygam_gs 7.11x **LOSS**
+- poisson n=1000 p5: import CPU vs pygam 6.45x **LOSS**
+- poisson n=1000 p5: import CPU vs pygam_gs 6.55x **LOSS**
+- poisson n=1000 te: import CPU vs pygam 6.93x **LOSS**
+- poisson n=1000 te: import CPU vs pygam_gs 6.92x **LOSS**
 - gaussian n=1000 p1: predict CPU vs pygam 2.96x **LOSS**
 - gaussian n=1000 p1: predict CPU vs pygam_gs 3.36x **LOSS**
 - gaussian n=1000 p5: predict CPU vs pygam 2.68x **LOSS**
@@ -342,8 +379,7 @@ as a status and counted against the library, never skipped.
 - gaussian n=1000 p5: held-out log score (NLL) vs pygam_gs **LOSS** Δ=+0.00134±0.00041
 - gaussian n=1000 te: held-out log score (NLL) vs pygam **LOSS** Δ=+0.00318±0.00079
 - gaussian n=1000 te: held-out log score (NLL) vs pygam_gs **LOSS** Δ=+0.00427±0.00067
-- gaussian n=1000 p5: 95% CI coverage of true mean (verdict on |cov-0.95|) vs pygam **LOSS** Δ=+0.0197±0.0087
-- gaussian n=1000 p5: 95% CI coverage of true mean (verdict on |cov-0.95|) vs pygam_gs **LOSS** Δ=+0.018±0.0021
-- gaussian n=1000 p20: 95% CI coverage of true mean (verdict on |cov-0.95|) vs pygam **LOSS** Δ=+0.011±0.0032
+- gaussian n=1000 p5: 95% CI coverage of true mean (verdict on |mean cov-0.95|) vs pygam **LOSS** Δ=+0.0197±0.0087
+- gaussian n=1000 p5: 95% CI coverage of true mean (verdict on |mean cov-0.95|) vs pygam_gs **LOSS** Δ=+0.018±0.0021
 
-Comparisons gamfit wins (ratio < 1.00 or significant accuracy WIN): 30.
+Comparisons gamfit wins (ratio < 1.00 or significant accuracy WIN): 29.
