@@ -5,14 +5,6 @@
 
 use super::*;
 
-/// Maximum joint dimension for which the gam#1395 logdet collapse guard rebuilds
-/// the ground-truth penalized Hessian and runs an O(p³) reference
-/// eigendecomposition to cross-check the assembled operator's `log|H|`. Above
-/// this the dense reference would dominate the per-outer-eval cost, so the guard
-/// is skipped (the matrix-free regime is the one whose logdet already routes
-/// through the same exact dense materialization when the byte budget allows).
-const JOINT_LOGDET_GUARD_MAX_DIM: usize = 64;
-
 /// Build the canonical unified REML/LAML assembly for a custom-family outer
 /// evaluation.
 pub(crate) fn build_custom_family_inner_assembly<'dp>(
@@ -1282,111 +1274,6 @@ pub(crate) fn joint_outer_evaluate(
         (Some(hphi), Some(completion)) => Some(assemble_operator(Some(&(hphi + completion)))?),
         _ => None,
     };
-
-    // Structural guard against the gam#1395 `0.5·log|H|` collapse.
-    //
-    // The LAML/pseudo-Laplace objective adds `0.5·hessian_op.logdet()` (the
-    // `0.5·log|H|` Laplace term). `hessian_op` is either the
-    // `BlockCoupledOperator` dense factorization or a fingerprint cache hit.
-    // Each is *asserted* (see the assembly comments above) to realize the
-    // exact penalized joint Hessian `H_unpen + S_λ + scale·H_Φ`, but nothing
-    // *checks* it. gam#1395 is precisely the failure where the operator's
-    // effective spectrum diverges from that matrix (the reported symptom: an
-    // effective eigenvalue ~1.0 instead of 2.0, so `0.5·log|H|` collapses from
-    // `0.5·ln2 = 0.3466` to ~0.0044). A halved curvature, a dropped penalty/
-    // Jeffreys term, or a stale cache entry would all enter the objective
-    // SILENTLY through `logdet()`.
-    //
-    // So when the logdet term is actually consumed (`include_logdet_h`), and the
-    // dimension is small enough to afford a dense ground-truth factorization,
-    // rebuild the SAME matrix directly from `h_joint_unpen` + penalty + Jeffreys,
-    // price it with the SAME logdet kernel the operator route uses for this
-    // `pseudo_logdet_mode`, and compare its logdet to the assembled operator's. An
-    // apples-to-apples match proves no collapse entered the assembly; a divergence
-    // is a true defect. We `log::debug!` and then `assert!`, so the regression is
-    // never silent. This makes the gam#1395 collapse structurally observable at
-    // its source rather than only at the far-downstream objective value.
-    //
-    // The reference kernel must be the operator's kernel (#2627). Every system
-    // is assembled on the dense `BlockCoupledOperator` route (#2900), and since
-    // #2612 that route prices `PositiveDefinite` with an exact LLT.
-    // An eigendecomposition of the same matrix returns a different `Σ ln σ` by
-    // factorization roundoff, of order `2γₙ‖H‖_F‖H⁻¹‖_F` (#2834) and so growing
-    // with κ(H), which the tolerance below does not. Measured on the two
-    // multinomial census fixtures (sw10 job 387070, Jeffreys term not armed): a
-    // fresh LLT of this guard's own matrix reproduced the assembled logdet to every
-    // printed digit (1.789403922e2 at total=24, −5.056270055e1 at total=46), eigh
-    // gave 1.786674192e2 and −5.056239835e1, gaps of 2.7e-1 and 3.0e-4 against
-    // tolerances of 4.3e-4 and 2.4e-4, and a 1e-10 ridge moved the eigh value by
-    // 1e-6 and 3e-3. A guard that compares two kernels cannot tell that roundoff
-    // from a collapse. A halved curvature, a dropped term and a stale cache entry
-    // all change the matrix, so a same-kernel rebuild still sees each of them. For
-    // `Smooth` and `HardPseudo`, `BlockCoupledOperator::from_joint_hessian_with_mode`
-    // is `DenseSpectralOperator::from_symmetric_with_mode`, so those modes are
-    // unchanged bit for bit.
-    if include_logdet_h && total > 0 && total <= JOINT_LOGDET_GUARD_MAX_DIM {
-        if let Ok(mut ground_truth) =
-            materialize_joint_hessian_source(&h_joint_unpen, total, "gam#1395 logdet guard")
-        {
-            add_joint_penalty_to_matrix(
-                &mut ground_truth,
-                ranges,
-                &scaled_s_lambdas,
-                0.0,
-                None,
-            );
-            // gam#1587: the assembled operator includes the full-width joint
-            // penalty, so the ground-truth reference must too — otherwise this
-            // guard false-positives a logdet divergence.
-            if let Some(joint) = scaled_joint_penalty.as_ref() {
-                ground_truth += joint;
-            }
-            // Mirror the operator's `else`-branch Jeffreys term EXACTLY
-            // (`robust_jeffreys_hphi_for_operator` scaled by `rho_curvature_scale`,
-            // including any completion span) rather than the pre-scaled
-            // `scaled_robust_jeffreys_hphi` used by the projected-logdet path, so
-            // the comparison stays apples-to-apples and never false-positives.
-            if let Some(hphi) = robust_jeffreys_hphi_for_operator.as_ref() {
-                ground_truth.scaled_add(rho_curvature_scale, hphi);
-            }
-            symmetrize_dense_in_place(&mut ground_truth);
-            match BlockCoupledOperator::from_joint_hessian_with_mode(&ground_truth, pseudo_logdet_mode)
-            {
-                Ok(reference) => {
-                    let reference_logdet = reference.logdet();
-                    let assembled_logdet = hessian_op.logdet();
-                    if reference_logdet.is_finite() && assembled_logdet.is_finite() {
-                        // Relative tolerance scaled by the dimension (each of the
-                        // `total` eigenvalues contributes one `ln σ`), with a small
-                        // absolute floor for the all-near-unit-spectrum case.
-                        let tol = 1e-7 * (total as f64) * (1.0 + reference_logdet.abs());
-                        let gap = (assembled_logdet - reference_logdet).abs();
-                        if gap > tol {
-                            log::debug!(
-                                "[gam#1395] assembled joint-Hessian logdet diverges from the \
-                                 ground-truth penalized Hessian: assembled={assembled_logdet:.9e} \
-                                 reference={reference_logdet:.9e} gap={gap:.3e} tol={tol:.3e} \
-                                 total={total}. The 0.5*log|H| Laplace term is being computed from \
-                                 an operator that does not realize H_unpen + S_lambda + \
-                                 scale*H_Phi (collapse / dropped-term / stale-cache class)."
-                            );
-                            assert!(
-                                gap <= tol,
-                                "gam#1395 logdet collapse guard: assembled joint-Hessian \
-                                 logdet={assembled_logdet:.9e} != ground-truth {reference_logdet:.9e} \
-                                 (gap={gap:.3e} > tol={tol:.3e}, total={total})"
-                            );
-                        }
-                    }
-                }
-                Err(error) => {
-                    log::trace!(
-                        "[gam#1395] logdet guard skipped: ground-truth factorization failed: {error}"
-                    );
-                }
-            }
-        }
-    }
 
     // The pseudo-log-determinant this route installs and the kernel that
     // differentiates it are ONE object (#2765): the correction rides on the

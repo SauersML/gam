@@ -92,12 +92,12 @@ def test_oracle_agrees_with_partial_dependence_without_a_factor() -> None:
     model = gamfit.fit({"x": data["x"], "y": data["y"]}, "y ~ s(x)", family="gaussian")
 
     result = model.partial_dependence("s(x)", n_points=9)
-    grid = np.asarray(result["grid"], dtype=float)
+    grid = result.x
     expected_fit, expected_se = _oracle(model, grid, {"x": grid})
 
-    np.testing.assert_allclose(np.asarray(result["predicted"], dtype=float), expected_fit, atol=1e-12)
+    np.testing.assert_allclose(result.fit, expected_fit, atol=1e-12)
     np.testing.assert_allclose(
-        np.asarray(result["standard_error"], dtype=float), expected_se, atol=1e-12
+        result.se, expected_se, atol=1e-12
     )
 
 
@@ -108,18 +108,18 @@ def test_partial_dependence_with_a_string_factor(formula: str) -> None:
 
     result = model.partial_dependence("s(x)", n_points=9)
 
-    grid = np.asarray(result["grid"], dtype=float)
+    grid = result.x
     frame = {"x": grid, "b": np.array(["b0"] * grid.size)}
     expected_fit, expected_se = _oracle(model, grid, frame)
 
     np.testing.assert_allclose(
-        np.asarray(result["predicted"], dtype=float),
+        result.fit,
         expected_fit,
         atol=1e-10,
         err_msg="partial_dependence disagrees with X_t @ beta_t for the s(x) block",
     )
     np.testing.assert_allclose(
-        np.asarray(result["standard_error"], dtype=float),
+        result.se,
         expected_se,
         atol=1e-10,
         err_msg="partial_dependence SE disagrees with sqrt(diag(X_t V_t X_t^T))",
