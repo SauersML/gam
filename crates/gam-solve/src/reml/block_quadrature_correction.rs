@@ -1080,6 +1080,7 @@ impl<'a> RemlState<'a> {
                             pirls_result,
                             &target.inverse_link,
                             &target.prior_weights,
+                            c_obs,
                             e_obs,
                         )?,
                     )

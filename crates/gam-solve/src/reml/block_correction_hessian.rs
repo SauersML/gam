@@ -85,16 +85,12 @@ pub(super) fn block_correction_row_curvature(
             RowCurvature::Observed
         }
     };
-    if axis_split
-        && !matches!(curvature, RowCurvature::CanonicalLogit | RowCurvature::PoissonLog)
-        && !matches!(
-            (&response, inverse_link),
-            (ResponseFamily::Gamma, InverseLink::Standard(StandardLink::Log))
-        )
-    {
+    if axis_split && fourth_derivative_rule(&response, inverse_link).is_none() {
         return Err(format!(
-            "the mixed-axis term Φ of a split {block_dim}-axis block needs ∂⁴W/∂η⁴, which \
-             {response:?} carries in no closed form"
+            "the mixed-axis term Φ of a split {block_dim}-axis block needs ∂⁴W/∂η⁴, and the \
+             observed curvature of {response:?} under {inverse_link:?} is not a combination of \
+             at most two powers or exponentials of η, the forms whose ∂⁴W/∂η⁴ follows from \
+             ∂W/∂η and ∂³W/∂η³"
         ));
     }
     if !axis_split && block_dim >= 2 {
@@ -106,29 +102,124 @@ pub(super) fn block_correction_row_curvature(
     Ok(curvature)
 }
 
-/// `∂⁴W/∂η⁴` per row for a split block's `Φ`, from `e = ∂³W/∂η³`.
+/// The shape of a row's observed curvature `W(η)` that fixes `∂⁴W/∂η⁴`.
 ///
-/// Logit carries it from the inverse-link 5-jet; `W = w e^{±η}` families
-/// (Poisson-log, and Gamma-log's `W = w y e^{−η}/φ`) repeat or alternate it.
+/// Up to a constant, `W = a·g(η) + b·h(η)` with row coefficients `a, b`
+/// (prior weight, dispersion, `y`) that do not depend on `η`. The pair
+/// `c = ∂W/∂η`, `e = ∂³W/∂η³` then fixes `(a, b)`, and so `f = ∂⁴W/∂η⁴`; a
+/// constant term drops out of all three.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CurvatureShape {
+    /// Binomial-logit: `W = w μ'(η)`, differentiated by the inverse-link jet.
+    LogitJet,
+    /// `W` constant in `η`.
+    Constant,
+    /// `g = η^p`, `h = η^q`: `f = α c/η³ + β e/η`.
+    Powers(f64, Option<f64>),
+    /// `g = e^{rη}`, `h = e^{sη}`: `f = α c + β e`.
+    Rates(f64, Option<f64>),
+}
+
+/// `ψ(η)` below is each family's negative log-likelihood up to `w/φ`, and
+/// `W = ψ''`: e.g. inverse-Gaussian `1/μ²` has `ψ = yη/2 − √η`, so
+/// `W ∝ η^{−3/2}`, and Gaussian-inverse has `ψ = (y − 1/η)²/2`, so
+/// `W = 3η^{−4} − 2yη^{−3}`.
+fn fourth_derivative_rule(
+    response: &ResponseFamily,
+    inverse_link: &InverseLink,
+) -> Option<CurvatureShape> {
+    use CurvatureShape::{Constant, LogitJet, Powers, Rates};
+    let InverseLink::Standard(link) = inverse_link else {
+        return None;
+    };
+    Some(match (response, link) {
+        (ResponseFamily::Binomial, StandardLink::Logit) => LogitJet,
+        // ψ = μ − y ln μ.
+        (ResponseFamily::Poisson, StandardLink::Log) => Rates(1.0, None),
+        (ResponseFamily::Poisson, StandardLink::Identity | StandardLink::Sqrt) => {
+            Powers(-2.0, None)
+        }
+        (ResponseFamily::Poisson, StandardLink::Inverse) => Powers(-3.0, Some(-2.0)),
+        // ψ = y/μ + ln μ.
+        (ResponseFamily::Gamma, StandardLink::Log) => Rates(-1.0, None),
+        (ResponseFamily::Gamma, StandardLink::Inverse) => Powers(-2.0, None),
+        (ResponseFamily::Gamma, StandardLink::Identity) => Powers(-3.0, Some(-2.0)),
+        (ResponseFamily::Gamma, StandardLink::Sqrt) => Powers(-4.0, Some(-2.0)),
+        (ResponseFamily::Gamma, StandardLink::InverseSquared) => Powers(-1.5, Some(-2.0)),
+        // ψ = y/(2μ²) − 1/μ.
+        (ResponseFamily::InverseGaussian, StandardLink::InverseSquared) => Powers(-1.5, None),
+        (ResponseFamily::InverseGaussian, StandardLink::Inverse) => Constant,
+        (ResponseFamily::InverseGaussian, StandardLink::Log) => Rates(-2.0, Some(-1.0)),
+        (ResponseFamily::InverseGaussian, StandardLink::Identity) => Powers(-4.0, Some(-3.0)),
+        (ResponseFamily::InverseGaussian, StandardLink::Sqrt) => Powers(-6.0, Some(-4.0)),
+        // ψ = (y − μ)²/2.
+        (ResponseFamily::Gaussian, StandardLink::Inverse) => Powers(-4.0, Some(-3.0)),
+        (ResponseFamily::Gaussian, StandardLink::InverseSquared) => Powers(-2.5, Some(-3.0)),
+        (ResponseFamily::Gaussian, StandardLink::Log) => Rates(2.0, Some(1.0)),
+        (ResponseFamily::Gaussian, StandardLink::Sqrt) => Powers(2.0, None),
+        _ => return None,
+    })
+}
+
+/// `(α, β)` with `g⁗ = α g′ + β g‴` on each basis function, from its
+/// `(g‴/g′, g⁗/g′)` in reduced units: `((p−1)(p−2), (p−1)(p−2)(p−3))` on
+/// `η^p` (whose powers of `η` the `c/η³`, `e/η` scaling absorbs), and
+/// `(r², r³)` on `e^{rη}`. One basis function takes `α = 0`; two solve the
+/// pair `α + β t_k = q_k`.
+fn fourth_derivative_coefficients(first: (f64, f64), second: Option<(f64, f64)>) -> (f64, f64) {
+    let (t1, q1) = first;
+    match second {
+        None if t1 == 0.0 => (0.0, 0.0),
+        None => (0.0, q1 / t1),
+        Some((t2, q2)) => {
+            let beta = (q1 - q2) / (t1 - t2);
+            (q1 - beta * t1, beta)
+        }
+    }
+}
+
+/// `∂⁴W/∂η⁴` per row for a split block's `Φ`, from `c = ∂W/∂η` and
+/// `e = ∂³W/∂η³` through the curvature's shape.
 pub(super) fn curvature_fourth_derivative(
     pirls_result: &PirlsResult,
     inverse_link: &InverseLink,
     prior_weights: &Array1<f64>,
+    c: &Array1<f64>,
     e: &Array1<f64>,
 ) -> Result<Array1<f64>, EstimationError> {
     let response = reml_spec(&pirls_result.likelihood).response;
-    match (&response, inverse_link) {
-        (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
-            let eta = &pirls_result.final_eta;
-            Ok(Array1::from_shape_fn(eta.len(), |i| {
-                prior_weights[i] * crate::mixture_link::logit_inverse_link_jet5(eta[i]).d5
-            }))
+    let Some(shape) = fourth_derivative_rule(&response, inverse_link) else {
+        crate::bail_invalid_estim!(
+            "#784 mixed-axis ρ-Hessian: the curvature of {response:?} under {inverse_link:?} \
+             has no ∂⁴W/∂η⁴ from its η-derivatives"
+        );
+    };
+    Ok(fourth_from_shape(shape, pirls_result.final_eta.view(), prior_weights, c, e))
+}
+
+fn fourth_from_shape(
+    shape: CurvatureShape,
+    eta: ArrayView1<'_, f64>,
+    prior_weights: &Array1<f64>,
+    c: &Array1<f64>,
+    e: &Array1<f64>,
+) -> Array1<f64> {
+    let power = |p: f64| ((p - 1.0) * (p - 2.0), (p - 1.0) * (p - 2.0) * (p - 3.0));
+    let rate = |r: f64| (r * r, r * r * r);
+    let n = eta.len();
+    match shape {
+        CurvatureShape::LogitJet => Array1::from_shape_fn(n, |i| {
+            prior_weights[i] * crate::mixture_link::logit_inverse_link_jet5(eta[i]).d5
+        }),
+        CurvatureShape::Constant => Array1::zeros(n),
+        CurvatureShape::Powers(p, q) => {
+            let (alpha, beta) = fourth_derivative_coefficients(power(p), q.map(power));
+            Array1::from_shape_fn(n, |i| alpha * c[i] / eta[i].powi(3) + beta * e[i] / eta[i])
         }
-        (ResponseFamily::Poisson, InverseLink::Standard(StandardLink::Log)) => Ok(e.clone()),
-        (ResponseFamily::Gamma, InverseLink::Standard(StandardLink::Log)) => Ok(-e),
-        _ => crate::bail_invalid_estim!(
-            "#784 mixed-axis ρ-Hessian: {response:?} carries no closed-form ∂⁴W/∂η⁴"
-        ),
+        CurvatureShape::Rates(r, s) => {
+            let (alpha, beta) = fourth_derivative_coefficients(rate(r), s.map(rate));
+            Array1::from_shape_fn(n, |i| alpha * c[i] + beta * e[i])
+        }
     }
 }
 
@@ -387,16 +478,20 @@ impl AxisEnd {
         value: f64,
         log_mass_gradient: f64,
         side: usize,
-        row: usize,
+        cut: gam_problem::laplace_sampler_contract::BlockAxisCut,
         axis: &AxisMotion,
         mode: &ModeMotion,
         pairs: &[(usize, usize)],
     ) -> Result<Self, EstimationError> {
+        let row = cut.row;
         let y_r = axis.y[row];
-        if !(y_r != 0.0) || !value.is_finite() {
+        // The cut's slope `∂s_row/∂t` is `√λ·Y_r`; a sign disagreement means the
+        // truncation and this Hessian describe different block directions.
+        if !(y_r * cut.row_slope > 0.0) || !value.is_finite() {
             crate::bail_invalid_estim!(
-                "#784 ρ-Hessian: a feasible-interval end at row {row} has whitened slope {y_r} \
-                 and position {value}"
+                "#784 ρ-Hessian: a feasible-interval end at row {row} has whitened slope {y_r}, \
+                 cut slope {} and position {value}",
+                cut.row_slope
             );
         }
         let dot: Vec<f64> = (0..axis.y_dot.len())
@@ -488,7 +583,7 @@ fn piece_second_order(
         ];
         for (side, (cut, (value, gradient))) in cuts.iter().zip(sides).enumerate() {
             if let Some(cut) = cut {
-                ends.push(AxisEnd::new(value, gradient, side, cut.row, axis, mode, pairs)?);
+                ends.push(AxisEnd::new(value, gradient, side, *cut, axis, mode, pairs)?);
             }
         }
         log_mass_of_interval = transport.log_mass();
@@ -1102,5 +1197,97 @@ mod block_correction_hessian_tests {
         );
         assert!(derivatives.gradient.iter().all(|g| g.abs() <= 1e-14));
         assert!(derivatives.hessian.iter().all(|h| h.abs() <= 1e-14));
+    }
+
+    /// Every listed curvature shape reproduces the family's own observed
+    /// curvature: `f` from `(c, e)` matches the second difference of
+    /// `∂²W/∂η²` as `compute_observed_hessian_curvature_arrays` evaluates it.
+    #[test]
+    fn curvature_shapes_give_the_observed_fourth_derivative() {
+        let families = [
+            ResponseFamily::Poisson,
+            ResponseFamily::Gamma,
+            ResponseFamily::InverseGaussian,
+            ResponseFamily::Gaussian,
+        ];
+        let links = [
+            StandardLink::Identity,
+            StandardLink::Log,
+            StandardLink::Sqrt,
+            StandardLink::Inverse,
+            StandardLink::InverseSquared,
+        ];
+        let prior = Array1::from_elem(1, 1.7);
+        let h = 2e-3;
+        let mut checked = 0;
+        for response in &families {
+            for &link in &links {
+                let inverse_link = InverseLink::Standard(link);
+                let Some(shape) = fourth_derivative_rule(response, &inverse_link) else {
+                    continue;
+                };
+                let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                    response.clone(),
+                    inverse_link.clone(),
+                ));
+                if !crate::pirls::supports_observed_hessian_curvature_for_likelihood(
+                    &likelihood,
+                    &inverse_link,
+                ) {
+                    // Poisson-log reads `W = w e^η` directly (`RowCurvature::PoissonLog`).
+                    assert!(
+                        matches!((response, link), (ResponseFamily::Poisson, StandardLink::Log)),
+                        "{response:?}/{link:?} has a curvature shape but no observed curvature",
+                    );
+                    let e = Array1::from_elem(1, 1.7 * 0.8_f64.exp());
+                    let f = fourth_from_shape(shape, Array1::from_elem(1, 0.8).view(), &prior, &e, &e);
+                    assert!((f[0] - e[0]).abs() <= 1e-15 * e[0]);
+                    checked += 1;
+                    continue;
+                }
+                // A count for Poisson, a positive real otherwise.
+                let y = if matches!(response, ResponseFamily::Poisson) { 2.0 } else { 1.3 };
+                let curvature_at = |eta: f64| {
+                    crate::pirls::compute_observed_hessian_curvature_arrays(
+                        &likelihood,
+                        &inverse_link,
+                        &Array1::from_elem(1, eta),
+                        Array1::from_elem(1, y).view(),
+                        &Array1::zeros(1),
+                        prior.view(),
+                    )
+                    .expect("observed curvature")
+                };
+                // Richardson-extrapolated central differences of `∂²W/∂η²`:
+                // O(h⁴) truncation with a step whose rounding stays far below it.
+                let differences = |eta0: f64, step: f64| {
+                    let (_, _, d0) = curvature_at(eta0);
+                    let (_, _, d_plus) = curvature_at(eta0 + step);
+                    let (_, _, d_minus) = curvature_at(eta0 - step);
+                    (
+                        (d_plus[0] - d_minus[0]) / (2.0 * step),
+                        (d_plus[0] - 2.0 * d0[0] + d_minus[0]) / (step * step),
+                    )
+                };
+                for eta0 in [0.45, 0.8, 1.6] {
+                    let (w0, c, _) = curvature_at(eta0);
+                    let (e_h, f_h) = differences(eta0, h);
+                    let (e_half, f_half) = differences(eta0, 0.5 * h);
+                    let e = Array1::from_elem(1, (4.0 * e_half - e_h) / 3.0);
+                    let f_fd = (4.0 * f_half - f_h) / 3.0;
+                    let f = fourth_from_shape(shape, Array1::from_elem(1, eta0).view(), &prior, &c, &e)[0];
+                    // The evaluated `∂²W/∂η²` carries rounding on the scale of
+                    // `W/η²`, which the second difference divides by `(h/2)²`.
+                    let rounding =
+                        4096.0 * f64::EPSILON * (w0[0] / (eta0 * eta0)).abs() / (0.25 * h * h);
+                    assert!(
+                        (f - f_fd).abs() <= 1e-7 * f_fd.abs().max(1.0) + rounding,
+                        "{response:?}/{link:?} at η={eta0}: shape f={f}, differenced f={f_fd}",
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 18, "every tabulated non-logit shape is checked");
     }
 }
