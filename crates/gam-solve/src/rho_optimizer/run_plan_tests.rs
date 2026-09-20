@@ -2229,7 +2229,7 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(outer_criterion_resolution(&config)),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2309,7 +2309,7 @@ fn hybrid_efs_backtracking_propagates_fatal_cost_failure() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(outer_criterion_resolution(&config)),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2400,7 +2400,7 @@ fn hybrid_efs_backtracking_halves_past_a_refused_trial_2735() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(outer_criterion_resolution(&config)),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2478,7 +2478,7 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(outer_criterion_resolution(&config)),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 

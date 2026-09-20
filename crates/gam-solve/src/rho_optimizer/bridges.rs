@@ -246,12 +246,6 @@ pub(crate) enum CostStallVerdict {
     },
 }
 
-/// The window of the per-atom fixed-point walk's progress certificate
-/// ([`FixedPointProgress`]) and of `opt`'s own BFGS cost stall on the GPU walk.
-/// A fixed-point map has no model decrease, so the accepted-step stall rule
-/// (#3018) does not apply to it as it stands (#3176).
-pub(crate) const COST_STALL_WINDOW: usize = 6;
-
 /// One sample the cost-stall guard judges (#3018).
 ///
 /// `resolution` bounds the evaluation error of `value`, `|V̂ − V| ≤ resolution`:
@@ -4719,75 +4713,58 @@ pub(crate) fn build_bridge_hessian_for_source(
 /// iteration count (#2817).
 ///
 /// A fixed-point walk is not a descent method: neither its cost nor its step is
-/// monotone along it, and a limit cycle of the map buys nothing forever. What
-/// the walk can buy is a better incumbent, a value lower by more than the
-/// criterion's resolution `τ` ([`super::run::outer_criterion_resolution`]), or
-/// near the fixed point a smaller
-/// proposed step at the incumbent. `window` evaluations without a resolved
-/// improvement fill a window, and a filled window continues only when, since
-/// the previous licensed window, the incumbent improved by a resolution or its
-/// step contracted: the rule [`CostStallGuard::license_continuation`] applies on
-/// the gradient routes, with the proposed step standing in for the gradient.
+/// monotone along it, and a limit cycle of the map buys nothing forever. Each
+/// evaluation is judged on its own, by the two things a walk can buy (#3176):
+///
+/// - a resolved improvement of the incumbent: a value [`resolvably_below`] the
+///   best one so far. An EFS evaluation publishes no certificate evidence, so
+///   each value's resolution is the criterion's `τ`
+///   ([`super::run::outer_criterion_resolution`]), the resolution
+///   [`sample_resolution`] charges such an evaluation on the gradient routes.
+/// - contraction of the map: a proposed step shorter than the previous one.
+///   A fixed-point iteration converges only where its map contracts, so a
+///   step that shrinks is the walk's evidence it is closing on a fixed point.
+///
+/// An evaluation that buys neither stops the walk: the map is not contracting
+/// there and the criterion saw no resolvable progress, so no evidence says
+/// another step would. The stop is no convergence claim; the runner judges the
+/// best iterate and continues on the analytic gradient where one is declared.
 ///
 /// Termination needs no count. The criterion is bounded below on the declared
-/// domain, so resolved improvements are finite, and every other licence strictly
-/// lowers a floating-point step norm bounded below by zero.
+/// domain, so resolved improvements are finite, and between two of them every
+/// continuing evaluation strictly lowers a floating-point step norm bounded
+/// below by zero.
 pub(crate) struct FixedPointProgress {
     /// The criterion's absolute resolution `τ`.
     resolution: f64,
-    window: usize,
     best_value: f64,
-    best_step_norm: f64,
-    streak: usize,
-    licensed_incumbent: Option<(f64, f64)>,
+    previous_step_norm: f64,
     evaluations: usize,
 }
 
 impl FixedPointProgress {
-    pub(crate) fn new(resolution: f64, window: usize) -> Self {
+    pub(crate) fn new(resolution: f64) -> Self {
         Self {
             resolution,
-            window,
             best_value: f64::INFINITY,
-            best_step_norm: f64::INFINITY,
-            streak: 0,
-            licensed_incumbent: None,
+            previous_step_norm: f64::INFINITY,
             evaluations: 0,
         }
     }
 
-    /// Fold one evaluated point in. `true` when a filled window has bought
-    /// nothing since the previous licensed one, so the walk should stop.
+    /// Fold one evaluated point in. `true` when it bought neither a resolved
+    /// improvement of the incumbent nor a contraction of the step, so the walk
+    /// should stop.
     pub(crate) fn observe(&mut self, value: f64, step_norm: f64) -> bool {
         self.evaluations = self.evaluations.saturating_add(1);
         if !value.is_finite() || !step_norm.is_finite() {
             return false;
         }
-        if value < self.best_value {
-            let resolved = self.best_value - value > self.resolution;
-            self.best_value = value;
-            self.best_step_norm = step_norm;
-            if resolved {
-                self.streak = 0;
-                return false;
-            }
-        }
-        self.streak = self.streak.saturating_add(1);
-        if self.streak < self.window {
-            return false;
-        }
-        self.streak = 0;
-        let licensed = match self.licensed_incumbent {
-            None => true,
-            Some((previous_value, previous_step_norm)) => {
-                previous_value - self.best_value > self.resolution
-                    || self.best_step_norm < previous_step_norm
-            }
-        };
-        if licensed {
-            self.licensed_incumbent = Some((self.best_value, self.best_step_norm));
-        }
-        !licensed
+        let improved = resolvably_below(self.best_value, self.resolution, value, self.resolution);
+        let contracted = step_norm < self.previous_step_norm;
+        self.best_value = self.best_value.min(value);
+        self.previous_step_norm = step_norm;
+        !(improved || contracted)
     }
 
     /// Evaluations folded in so far.
@@ -5138,9 +5115,9 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                 status: FixedPointStatus::Stop,
             });
         }
-        // #2817 — a walk that has bought neither a resolved improvement nor a
-        // smaller step since its previous window stops at the incumbent, rather
-        // than walking until an iteration count runs out.
+        // #2817/#3176 — an evaluation that bought neither a resolved
+        // improvement nor a smaller step stops the walk, rather than walking
+        // until an iteration count runs out.
         if self
             .progress
             .observe(current_cost, raw_step.dot(&raw_step).sqrt())
@@ -5151,9 +5128,9 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             }
             log::debug!(
                 "[OUTER] fixed-point walk stopping at an unprogressing stall after \
-                 {evaluations} evaluation(s): a window bought no resolved improvement of the \
-                 incumbent and no contraction of its step since the previous one; the terminal \
-                 certificate judges the incumbent (#2817). cost={current_cost:.6e}"
+                 {evaluations} evaluation(s): the evaluation bought no resolved improvement of \
+                 the incumbent and no contraction of the step; the terminal certificate judges \
+                 the best iterate (#2817, #3176). cost={current_cost:.6e}"
             );
             return Ok(FixedPointSample {
                 value: current_cost,

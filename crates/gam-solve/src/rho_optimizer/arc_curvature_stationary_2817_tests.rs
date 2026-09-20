@@ -1538,64 +1538,58 @@ fn a_crawl_the_evaluations_band_resolves_is_never_stalled_3018() {
 
 // ─── an unprogressing fixed-point walk stops ─────────────────────────────────
 
-/// A fixed-point walk caught in a limit cycle stops when its second window
-/// fills (#2817).
+/// A fixed-point walk caught in a limit cycle stops at its first evaluation
+/// that buys nothing (#2817, #3176).
 ///
-/// The map alternates between two points and never improves on the first
-/// value, so nothing after the first evaluation buys anything. The first filled
-/// window is licensed. The second bought no resolved improvement and did not
-/// contract the step at the incumbent, so the walk stops there. Before, a
-/// cycling walk ran until its iteration count ran out.
+/// The map alternates between two points, so its step norm is the constant
+/// distance between them and it never improves on the first value. The first
+/// evaluation sets the incumbent; the second neither improves on it by a
+/// resolution nor contracts the step, so the walk stops there. Before, a
+/// cycling walk ran two 6-evaluation windows first, and before that until its
+/// iteration count ran out.
 #[test]
-fn a_limit_cycling_fixed_point_walk_stops_at_its_second_window_2817() {
-    let mut progress = FixedPointProgress::new(RESOLUTION_2817, COST_STALL_WINDOW);
-    let stop = 2 * COST_STALL_WINDOW;
-    for index in 0..=stop {
-        let value = if index % 2 == 0 {
-            COST_2817
-        } else {
-            COST_2817 + 1.0
-        };
-        let stopped = progress.observe(value, 0.5);
-        assert_eq!(
-            stopped,
-            index == stop,
-            "evaluation {index}: the walk must stop exactly when its second window fills"
-        );
-    }
+fn a_limit_cycling_fixed_point_walk_stops_at_its_first_unprogressing_evaluation_2817() {
+    let mut progress = FixedPointProgress::new(RESOLUTION_2817);
+    assert!(
+        !progress.observe(COST_2817, 0.5),
+        "the first evaluation sets the incumbent"
+    );
+    assert!(
+        progress.observe(COST_2817 + 1.0, 0.5),
+        "the cycle's second point bought neither improvement nor contraction"
+    );
 }
 
-/// NEGATIVE CONTROL: no resolved improvement between the windows, but the step
-/// at the incumbent halved. The walk is converging, so it keeps walking.
+/// NEGATIVE CONTROL: no evaluation improves by a resolution, but every step is
+/// shorter than the one before it. The map is contracting, so the walk keeps
+/// walking.
 ///
-/// Each evaluation improves by `1e-6`, below the resolution `1e-4`, so every
-/// one counts toward the window while the incumbent still moves and carries the
-/// step of the point that set it.
+/// Each evaluation improves by `1e-6`, below the resolution `1e-4`, so only the
+/// contraction carries the walk.
 #[test]
 fn a_fixed_point_walk_whose_step_contracted_keeps_walking_2817() {
-    let mut progress = FixedPointProgress::new(RESOLUTION_2817, COST_STALL_WINDOW);
-    for index in 0..=(2 * COST_STALL_WINDOW + 1) {
-        let step_norm = if index <= COST_STALL_WINDOW { 0.5 } else { 0.25 };
-        let stopped = progress.observe(COST_2817 - 1.0e-6 * index as f64, step_norm);
+    let mut progress = FixedPointProgress::new(RESOLUTION_2817);
+    for index in 0..40 {
+        let step_norm = 0.5 * 0.5_f64.powi(index);
+        let stopped = progress.observe(COST_2817 - 1.0e-6 * f64::from(index), step_norm);
         assert!(
             !stopped,
-            "evaluation {index}: a walk whose incumbent step halved must keep walking"
+            "evaluation {index}: a walk whose step contracts must keep walking"
         );
     }
+    assert!(
+        progress.observe(COST_2817 - 1.0e-6 * 40.0, 0.5),
+        "once the step stops contracting with no resolved improvement, the walk stops"
+    );
 }
 
-/// NEGATIVE CONTROL: the incumbent improved by 10000 resolutions between the two
-/// windows, which licenses the second.
+/// NEGATIVE CONTROL: every evaluation improves the incumbent by 10000
+/// resolutions at a constant step, so the walk keeps walking.
 #[test]
 fn a_fixed_point_walk_that_bought_resolved_improvement_keeps_walking_2817() {
-    let mut progress = FixedPointProgress::new(RESOLUTION_2817, COST_STALL_WINDOW);
-    for index in 0..=(2 * COST_STALL_WINDOW + 1) {
-        let value = if index <= COST_STALL_WINDOW {
-            COST_2817
-        } else {
-            COST_2817 - 1.0
-        };
-        let stopped = progress.observe(value, 0.5);
+    let mut progress = FixedPointProgress::new(RESOLUTION_2817);
+    for index in 0..40 {
+        let stopped = progress.observe(COST_2817 - f64::from(index), 0.5);
         assert!(
             !stopped,
             "evaluation {index}: a walk that bought a resolved improvement must keep walking"

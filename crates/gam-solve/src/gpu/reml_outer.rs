@@ -20,6 +20,12 @@ use opt::{
 use crate::estimate::EstimationError;
 use gam_gpu::policy::RemlOuterAdmission;
 
+/// The accepted-step count `opt`'s BFGS cost stall requires. `CostStallConfig`
+/// has no window-free form yet; the host routes judge each step on its own
+/// resolution instead (#3018, #3176), and this count goes when opt's stall
+/// rule does the same (#3018).
+const OPT_COST_STALL_WINDOW: usize = 6;
+
 /// Input bundle handed to `run_reml_outer_on_device` by the host
 /// outer-strategy dispatch site. Everything needed to seed the device-resident
 /// BFGS driver and reconstruct the outer `OuterResult` after convergence.
@@ -218,7 +224,7 @@ where
         // termination, below.
         .with_cost_stall(CostStallConfig::new(
             cost_stall_rel_tol,
-            crate::rho_optimizer::COST_STALL_WINDOW,
+            OPT_COST_STALL_WINDOW,
             input.cost_stall_projected_grad_tol,
         ));
     if let Some(caps) = input.axis_step_caps {
