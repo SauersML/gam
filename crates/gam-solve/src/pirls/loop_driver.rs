@@ -920,10 +920,10 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         let tb = build_transformed_lower_bound_constraints(
             &reparam.qs,
             penalty.coefficient_lower_bounds,
-        );
+        )?;
         let tl =
-            build_transformed_linear_constraints(&reparam.qs, penalty.linear_constraints_original);
-        merge_linear_constraints(tb, tl)
+            build_transformed_linear_constraints(&reparam.qs, penalty.linear_constraints_original)?;
+        merge_linear_constraints(tb, tl)?
     } else {
         // Sparse-native without dense reparam: constraints stay in original
         // coordinates (identity Qs).  Use an identity matrix of appropriate size.
@@ -932,10 +932,10 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         let tb = build_transformed_lower_bound_constraints(
             &qs_identity,
             penalty.coefficient_lower_bounds,
-        );
+        )?;
         let tl =
-            build_transformed_linear_constraints(&qs_identity, penalty.linear_constraints_original);
-        merge_linear_constraints(tb, tl)
+            build_transformed_linear_constraints(&qs_identity, penalty.linear_constraints_original)?;
+        merge_linear_constraints(tb, tl)?
     };
 
     let coordinate_frame = if use_sparse_native {
@@ -2255,17 +2255,26 @@ pub(crate) fn make_reparam_operator(
 
 // solve_penalized_least_squares_implicit lives in pls_solver (imported above).
 
+// A constraint whose shape does not match the coefficient vector is a caller
+// error. It is refused, never dropped: dropping it would silently turn a
+// constrained fit into an unconstrained one.
 pub(super) fn build_transformed_lower_bound_constraints(
     qs: &Array2<f64>,
     coefficient_lower_bounds: Option<&Array1<f64>>,
-) -> Option<LinearInequalityConstraints> {
-    let lb = coefficient_lower_bounds?;
+) -> Result<Option<LinearInequalityConstraints>, EstimationError> {
+    let Some(lb) = coefficient_lower_bounds else {
+        return Ok(None);
+    };
     if lb.len() != qs.nrows() {
-        return None;
+        crate::bail_invalid_estim!(
+            "coefficient lower bounds have length {} but the model has {} coefficients",
+            lb.len(),
+            qs.nrows()
+        );
     }
     let activerows: Vec<usize> = (0..lb.len()).filter(|&i| lb[i].is_finite()).collect();
     if activerows.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut a = Array2::<f64>::zeros((activerows.len(), qs.ncols()));
     let mut b = Array1::<f64>::zeros(activerows.len());
@@ -2273,36 +2282,44 @@ pub(super) fn build_transformed_lower_bound_constraints(
         a.row_mut(r).assign(&qs.row(idx));
         b[r] = lb[idx];
     }
-    Some(
-        LinearInequalityConstraints::new(a, b)
-            .expect("transformed lower-bound constraint shape invariant"),
-    )
+    LinearInequalityConstraints::new(a, b)
+        .map(Some)
+        .map_err(EstimationError::InvalidInput)
 }
 
 pub(super) fn build_transformed_linear_constraints(
     qs: &Array2<f64>,
     linear_constraints: Option<&LinearInequalityConstraints>,
-) -> Option<LinearInequalityConstraints> {
-    let lc = linear_constraints?;
+) -> Result<Option<LinearInequalityConstraints>, EstimationError> {
+    let Some(lc) = linear_constraints else {
+        return Ok(None);
+    };
     if lc.a.ncols() != qs.nrows() {
-        return None;
+        crate::bail_invalid_estim!(
+            "linear constraint matrix has {} columns but the model has {} coefficients",
+            lc.a.ncols(),
+            qs.nrows()
+        );
     }
-    Some(
-        LinearInequalityConstraints::new(lc.a.dot(qs), lc.b.clone())
-            .expect("transformed linear constraint shape invariant"),
-    )
+    LinearInequalityConstraints::new(lc.a.dot(qs), lc.b.clone())
+        .map(Some)
+        .map_err(EstimationError::InvalidInput)
 }
 
 pub(super) fn merge_linear_constraints(
     first: Option<LinearInequalityConstraints>,
     second: Option<LinearInequalityConstraints>,
-) -> Option<LinearInequalityConstraints> {
-    match (first, second) {
+) -> Result<Option<LinearInequalityConstraints>, EstimationError> {
+    Ok(match (first, second) {
         (None, None) => None,
         (Some(c), None) | (None, Some(c)) => Some(c),
         (Some(c1), Some(c2)) => {
             if c1.a.ncols() != c2.a.ncols() {
-                return None;
+                crate::bail_invalid_estim!(
+                    "cannot merge constraint blocks with {} and {} columns",
+                    c1.a.ncols(),
+                    c2.a.ncols()
+                );
             }
             let rows = c1.a.nrows() + c2.a.nrows();
             let cols = c1.a.ncols();
@@ -2314,7 +2331,7 @@ pub(super) fn merge_linear_constraints(
             b.slice_mut(s![c1.b.len()..rows]).assign(&c2.b);
             Some(LinearInequalityConstraints { a, b })
         }
-    }
+    })
 }
 
 pub(super) fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> {
