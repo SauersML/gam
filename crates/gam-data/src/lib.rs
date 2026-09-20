@@ -1070,6 +1070,154 @@ pub fn load_datasetwith_schema_projected(
     .map_err(|error| error.with_source_path(path))
 }
 
+/// Read one column as text, one string per data row, with no kind inference.
+///
+/// This is for columns that are carried through rather than modelled, such as
+/// a row identifier echoed into prediction output. It must return the text the
+/// user wrote, not a re-rendering of a number. A numeric encoder would print
+/// the ID `00123` as `123`, collapse int64 IDs above 2^53 onto their neighbours,
+/// and refuse `NA`.
+///
+/// * CSV/TSV: each cell is returned trimmed, which is the text every loader
+///   here sees. Headers, duplicate or missing column names, and row widths are
+///   checked exactly as the inferred loader checks them.
+/// * Parquet: integers are exact; floats use the shortest text that
+///   round-trips the stored value; strings, dictionaries and every other Arrow
+///   type use Arrow's display formatting. A null is the empty string, which is
+///   how CSV writes an absent field.
+pub fn load_column_text(path: &Path, column: &str) -> Result<Vec<String>, DataError> {
+    (match detect_format(path)? {
+        DataFormat::Csv => load_delimited_column_text(path, b',', column),
+        DataFormat::Tsv => load_delimited_column_text(path, b'\t', column),
+        DataFormat::Parquet => load_parquet_column_text(path, column),
+    })
+    .map_err(|error| error.with_source_path(path))
+}
+
+fn load_delimited_column_text(
+    path: &Path,
+    delimiter: u8,
+    column: &str,
+) -> Result<Vec<String>, DataError> {
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .delimiter(delimiter)
+        .from_path(path)
+        .map_err(|e| DataError::ParseError {
+            reason: format!("failed to open '{}': {e}", path.display()),
+        })?;
+    let all_headers: Vec<String> = rdr
+        .headers()
+        .map_err(|e| DataError::ParseError {
+            reason: format!("failed to read headers: {e}"),
+        })?
+        .iter()
+        .map(|s| s.trim().to_string())
+        .collect();
+    let selected = resolve_requested_columns(&all_headers, &[column.to_string()])?;
+    let col_idx = selected[0];
+    let mut out = Vec::new();
+    let mut record = StringRecord::new();
+    while rdr
+        .read_record(&mut record)
+        .map_err(|e| DataError::ParseError {
+            reason: format!("failed reading row: {e}"),
+        })?
+    {
+        if record.len() != all_headers.len() {
+            return Err(DataError::SchemaMismatch {
+                reason: format!(
+                    "row width mismatch at row {}: got {} fields, expected {}",
+                    out.len() + 1,
+                    record.len(),
+                    all_headers.len()
+                ),
+            });
+        }
+        out.push(
+            record
+                .get(col_idx)
+                .expect("record width was checked against the header row above")
+                .trim()
+                .to_string(),
+        );
+    }
+    Ok(out)
+}
+
+fn load_parquet_column_text(path: &Path, column: &str) -> Result<Vec<String>, DataError> {
+    use arrow::array::{Float32Array, Float64Array};
+    use arrow::datatypes::DataType;
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+    use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
+
+    let file = std::fs::File::open(path).map_err(|e| DataError::ParseError {
+        reason: format!("failed to open parquet '{}': {e}", path.display()),
+    })?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| DataError::ParseError {
+            reason: format!("failed to read parquet metadata '{}': {e}", path.display()),
+        })?;
+    let all_headers: Vec<String> = builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let selected = resolve_requested_columns(&all_headers, &[column.to_string()])?;
+    let projection = ProjectionMask::roots(builder.parquet_schema(), selected.iter().copied());
+    let reader = builder
+        .with_projection(projection)
+        .build()
+        .map_err(|e| DataError::ParseError {
+            reason: format!("failed to build parquet reader: {e}"),
+        })?;
+    let options = FormatOptions::default();
+    let mut out = Vec::new();
+    for batch_result in reader {
+        let batch = batch_result.map_err(|e| DataError::ParseError {
+            reason: format!("failed to read parquet record batch: {e}"),
+        })?;
+        let col = batch.column(0).as_ref();
+        // Arrow's display writes a float with a trailing `.0`; the shortest
+        // round-trip text keeps an integral float ID such as `17` unchanged.
+        macro_rules! push_floats {
+            ($array_type:ty) => {{
+                let array = col
+                    .as_any()
+                    .downcast_ref::<$array_type>()
+                    .expect("array type is the one this `col.data_type()` arm matched");
+                out.extend(
+                    array
+                        .iter()
+                        .map(|value| value.map_or_else(String::new, |value| value.to_string())),
+                );
+            }};
+        }
+        match col.data_type() {
+            DataType::Float64 => push_floats!(Float64Array),
+            DataType::Float32 => push_floats!(Float32Array),
+            _ => {
+                let formatter =
+                    ArrayFormatter::try_new(col, &options).map_err(|e| DataError::InvalidValue {
+                        reason: format!("cannot render parquet column '{column}' as text: {e}"),
+                    })?;
+                for i in 0..col.len() {
+                    let row = out.len() + 1;
+                    out.push(formatter.value(i).try_to_string().map_err(|e| {
+                        DataError::InvalidValue {
+                            reason: format!(
+                                "cannot render parquet column '{column}' row {row} as text: {e}"
+                            ),
+                        }
+                    })?);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // CSV convenience loader — infers the schema from the file header.
 // ---------------------------------------------------------------------------
@@ -4854,6 +5002,74 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "column 'x' has non-finite value NaN at row 2"
+        );
+    }
+
+    #[test]
+    fn load_column_text_returns_the_written_id_not_a_numeric_rerendering() {
+        // A pass-through ID column must come back as the text the user wrote:
+        // the numeric loader turns `00123` into 123, rounds an int64 key above
+        // 2^53 onto its neighbour, and has no value for `NA`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let csv_path = dir.path().join("ids.csv");
+        std::fs::write(
+            &csv_path,
+            "id,x\n00123,1\n 9007199254740993 ,2\nNA,3\n1.10,4\n",
+        )
+        .expect("write csv");
+        assert_eq!(
+            load_column_text(&csv_path, "id").expect("csv id column"),
+            vec!["00123", "9007199254740993", "NA", "1.10"]
+        );
+        assert!(load_column_text(&csv_path, "absent").is_err());
+
+        let tsv_path = dir.path().join("ids.tsv");
+        std::fs::write(&tsv_path, "x\tid\n1\t007\n2\tb\n").expect("write tsv");
+        assert_eq!(
+            load_column_text(&tsv_path, "id").expect("tsv id column"),
+            vec!["007", "b"]
+        );
+
+        use arrow::array::{Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::DataType;
+        use parquet::arrow::ArrowWriter;
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, true),
+            Field::new("score", DataType::Float64, true),
+            Field::new("label", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(9_007_199_254_740_993),
+                    Some(-7),
+                    None,
+                ])),
+                Arc::new(Float64Array::from(vec![Some(17.0), Some(0.1), None])),
+                Arc::new(StringArray::from(vec![Some("007"), None, Some("b")])),
+            ],
+        )
+        .expect("record batch of id columns");
+        let parquet_path = dir.path().join("ids.parquet");
+        {
+            let file = std::fs::File::create(&parquet_path).expect("create parquet");
+            let mut writer =
+                ArrowWriter::try_new(file, arrow_schema, None).expect("arrow parquet writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+        }
+        assert_eq!(
+            load_column_text(&parquet_path, "key").expect("int64 id column"),
+            vec!["9007199254740993", "-7", ""]
+        );
+        assert_eq!(
+            load_column_text(&parquet_path, "score").expect("float64 id column"),
+            vec!["17", "0.1", ""]
+        );
+        assert_eq!(
+            load_column_text(&parquet_path, "label").expect("utf8 id column"),
+            vec!["007", "", "b"]
         );
     }
 }
