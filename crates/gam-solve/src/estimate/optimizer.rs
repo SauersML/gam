@@ -3163,14 +3163,10 @@ where
     //
     // The identity check is BITWISE on ρ, not a re-judged gradient norm: the
     // retained certificate is the analytic stationarity authority minted at
-    // `outer_result.rho` by the full certification machinery (noise-floor
-    // widenings, flatness probes, asymptote rails). In the deep-smoothing
-    // regime the analytic gradient is a noise instrument (|Pg| redraws across
-    // evaluations of the SAME point — the reproducibility floor exists because
-    // of it), so re-drawing it once here and comparing against the certified
-    // band refuses honest noise-band certificates with coin-flip probability
-    // while adding nothing to point-identity (which bit equality decides
-    // exactly). The evaluation itself is kept: it installs the inner state at
+    // `outer_result.rho` by the full certification machinery (derived bands,
+    // flatness probes, asymptote rails). Re-judging a second gradient here
+    // would add nothing to point-identity, which bit equality decides exactly.
+    // The evaluation itself is kept: it installs the inner state at
     // the shipped point and supplies the shipped value/gradient fields.
     let (final_value, finalgrad, finalgrad_norm) = if final_rho.is_empty() {
         (outer_result.final_value, Array1::zeros(0), 0.0)
@@ -3829,36 +3825,14 @@ where
             );
             match smoothing_outcome {
                 super::reml::eval::SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
-                    // The only typed absence is an outer Hessian with no
-                    // analytic form for this fit at all (a non-canonical Firth
-                    // link, routed to BFGS): nothing about the optimum is
-                    // suspect, the correction simply cannot be formed, and the
-                    // fit was accepted with that link on purpose (#2158).
+                    // Every Firth link carries its analytic outer ρ-Hessian
+                    // (#3203), so an unavailable correction is a real defect.
                     // Railed coordinates are not a reason: the correction
                     // excludes them exactly as the certificate did, so a
                     // refusal on a railed fit is a real defect like any other.
-                    if !matches!(
-                        reason,
-                        crate::estimate::smoothing_correction::SmoothingCorrectionUnavailable::OuterHessianNotAnalytic { .. }
-                    ) {
-                        return Err(EstimationError::InvalidInput(format!(
-                            "exact smoothing-corrected covariance unavailable: {reason:?}"
-                        )));
-                    }
-                    log::debug!(
-                        "[SMOOTHING-CORRECTION] typed-unavailable on a non-analytic-outer-Hessian \
-                         fit ({reason:?}); shipping the plug-in covariance without a smoothing correction"
-                    );
-                    smoothing_correction_absence = Some(
-                        crate::model_types::SmoothingCorrectionAbsence::OuterHessianNotAnalytic {
-                            detail: format!("{reason:?}"),
-                        },
-                    );
-                    rho_covariance = None;
-                    smoothing_correction = None;
-                    smoothing_correction_method = None;
-                    smoothing_correction_first_order = None;
-                    smoothing_correction_method_first_order = None;
+                    return Err(EstimationError::InvalidInput(format!(
+                        "exact smoothing-corrected covariance unavailable: {reason:?}"
+                    )));
                 }
                 outcome => {
                     rho_covariance = outcome.rho_covariance().cloned();
