@@ -173,6 +173,134 @@ impl std::fmt::Display for JointPenaltyError {
 
 impl std::error::Error for JointPenaltyError {}
 
+/// The thin root `R` of a symmetric penalty `S = RᵀR` on its structural range
+/// (#2954): `R = Σ_+^{1/2}U_+ᵀ` over the eigenpairs `S`'s rank keeps. Every
+/// penalty value, gradient and curvature is formed from it, so a penalty and
+/// its derivatives are one function, and the rows of `R` exclude the null
+/// directions by construction.
+///
+/// That exclusion is the point. A penalty stored in f64 is not exactly singular
+/// on its null space: each formed entry carries rounding, and the stored
+/// matrix's null eigenvalues sit at `O(u·‖S‖)`, not at zero (measured on
+/// `declared_latent_law_2923`: `σ_null = 9.92e-17 = 0.89·u·‖S‖₂`). A dense
+/// `½λβᵀSβ` then carries `½λσ_null(uᵀβ)²`, which grows with `λ` (1.8e-3 at
+/// `ρ = 29.78`, log-log slope 1 in `λ`) while the structural value vanishes.
+/// Truncating the null eigenpairs removes that term. The root's own eigenvector
+/// error leaves `λ(u‖R‖|β|)²`, second order.
+///
+/// Two things are known about each direction, and each can only remove it from
+/// the root:
+/// * the spectrum, through the one rank rule
+///   [`gam_linalg::roundoff::resolved_eigenvalue_count`]: an eigenvalue at or
+///   below the eigensolver's Weyl band `p·ε·‖S‖₂` plus `formation_band` (the
+///   caller's bound, in eigenvalue units, on the error its construction left in
+///   the stored matrix) is not resolved from zero, so no root carries it
+///   faithfully;
+/// * a declared nullity, a structural fact about the exact penalty: its null
+///   directions are dropped even where the stored matrix resolves them, because
+///   a formed matrix carries its construction's rounding there. The link
+///   wiggle's order-3 I-spline roughness `CᵀS_BC` stores its second structural
+///   zero at `1.687e-11` against a Weyl band of `1.370e-11` (gam#2921's 48-row
+///   request): the band omits the congruence's own formation error.
+///
+/// So the rank is the resolved count, capped by the declared range. A
+/// disagreement is not refused: judging a declaration against the spectrum needs
+/// the construction's formation band, and every producer passes 0 until it
+/// carries one (the one-rank-rule follow-up of #2954, which derives it from the
+/// assembly's error-magnitude diagonal, and declared null bases, gam#3023).
+/// Undeclared, the resolved count is the rank.
+pub fn structural_penalty_root(
+    matrix: &Array2<f64>,
+    declared_nullity: Option<usize>,
+    formation_band: f64,
+) -> Result<Array2<f64>, PenaltyRootError> {
+    let p = matrix.nrows();
+    if matrix.ncols() != p {
+        return Err(PenaltyRootError::NotSquare {
+            nrows: p,
+            ncols: matrix.ncols(),
+        });
+    }
+    if let Some(declared) = declared_nullity
+        && declared > p
+    {
+        return Err(PenaltyRootError::NullityExceedsDimension { dim: p, declared });
+    }
+    if p == 0 {
+        return Ok(Array2::zeros((0, 0)));
+    }
+    use gam_linalg::faer_ndarray::FaerEigh;
+    let (eigenvalues, eigenvectors) = FaerEigh::eigh(matrix, faer::Side::Lower).map_err(|e| {
+        PenaltyRootError::EigendecompositionFailed {
+            reason: e.to_string(),
+        }
+    })?;
+    Ok(root_on_structural_range(
+        &eigenvalues.to_vec(),
+        &eigenvectors,
+        declared_nullity,
+        formation_band,
+    ))
+}
+
+/// [`structural_penalty_root`] from the spectrum `(eigenvalues, eigenvectors)`
+/// the caller already computed.
+pub(crate) fn root_on_structural_range(
+    eigenvalues: &[f64],
+    eigenvectors: &Array2<f64>,
+    declared_nullity: Option<usize>,
+    formation_band: f64,
+) -> Array2<f64> {
+    let p = eigenvalues.len();
+    let resolved = gam_linalg::roundoff::resolved_eigenvalue_count(eigenvalues, formation_band);
+    // The declared range caps the resolved count; a nullity above `p` is
+    // refused by the caller before the spectrum is formed.
+    let rank = declared_nullity.map_or(resolved, |declared| resolved.min(p - declared));
+    let nullity = p - rank;
+    // Ascending by value: the structural zeros, and any negative rounding among
+    // them, come first, so the kept eigenvalues are the last `rank`.
+    let mut order: Vec<usize> = (0..p).collect();
+    order.sort_by(|&a, &b| eigenvalues[a].total_cmp(&eigenvalues[b]));
+    let kept = &order[nullity..];
+    let mut root = Array2::<f64>::zeros((kept.len(), p));
+    for (row, &index) in kept.iter().enumerate() {
+        let scale = eigenvalues[index].sqrt();
+        for column in 0..p {
+            root[[row, column]] = scale * eigenvectors[[column, index]];
+        }
+    }
+    root
+}
+
+/// Why [`structural_penalty_root`] could not root a penalty.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PenaltyRootError {
+    NotSquare { nrows: usize, ncols: usize },
+    NullityExceedsDimension { dim: usize, declared: usize },
+    EigendecompositionFailed { reason: String },
+}
+
+impl std::fmt::Display for PenaltyRootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotSquare { nrows, ncols } => {
+                write!(f, "penalty matrix is not square: {nrows}x{ncols}")
+            }
+            Self::NullityExceedsDimension { dim, declared } => {
+                write!(
+                    f,
+                    "penalty declares nullity {declared} above its dimension {dim}"
+                )
+            }
+            Self::EigendecompositionFailed { reason } => {
+                write!(f, "penalty eigendecomposition failed: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PenaltyRootError {}
+
 impl JointPenaltySpec {
     /// Total compiled parameter count this penalty acts on.
     #[inline]
@@ -205,29 +333,6 @@ impl JointPenaltySpec {
             self.dim()
         );
         beta.dot(&self.matrix.dot(&beta))
-    }
-
-    /// [`Self::quadratic_form`] beside the magnitude its summation accumulates,
-    /// `Σ_ij |β_i S_ij β_j|`, from one explicit pass over the entries. The value is
-    /// the same `βᵀSβ` summed in a different order, so the two agree within
-    /// `accumulation_growth(dim²)` of the magnitude on each side, and the magnitude
-    /// is what bounds the rounding of the value (gam#2959).
-    pub fn quadratic_form_with_accumulation(&self, beta: ArrayView1<'_, f64>) -> (f64, f64) {
-        assert_eq!(
-            beta.len(),
-            self.dim(),
-            "joint penalty quadratic form: beta length {} != dim {}",
-            beta.len(),
-            self.dim()
-        );
-        let mut value = 0.0_f64;
-        let mut magnitude = 0.0_f64;
-        for ((row, column), &entry) in self.matrix.indexed_iter() {
-            let term = beta[row] * entry * beta[column];
-            value += term;
-            magnitude += term.abs();
-        }
-        (value, magnitude)
     }
 
     /// Validate shape, finiteness, symmetry, PSD, and nullspace bookkeeping,
@@ -477,56 +582,47 @@ impl JointPenaltyBundle {
         self.lambdas.as_slice()
     }
 
-    /// Total joint-penalty contribution to the objective:
-    ///   `½ Σ_j exp(ρ_j) · βᵀ S_j β`.
+    /// Total joint-penalty contribution to the objective,
+    /// `½ Σ_j exp(ρ_j)·‖R_j β‖²` on each component's structural root
+    /// ([`JointPenaltySpec::validated_root`], `S_j = R_jᵀR_j`). The root form
+    /// carries no `λ`-amplified null-space rounding (#2954,
+    /// [`structural_penalty_root`]).
     pub fn quadratic(&self, beta: ArrayView1<'_, f64>) -> f64 {
         let mut total = 0.0;
-        for (spec, &lam) in self.specs.iter().zip(self.lambdas.iter()) {
-            total += 0.5 * lam * spec.quadratic_form(beta);
+        for (root, &lam) in self.roots.iter().zip(self.lambdas.iter()) {
+            let root_beta = root.dot(&beta);
+            total += 0.5 * lam * root_beta.dot(&root_beta);
         }
         total
     }
 
-    /// [`Self::quadratic`] beside the magnitude its summations accumulate,
-    /// `½ Σ_j exp(ρ_j)·Σ_ik |β_i S_j,ik β_k|`, through
-    /// [`JointPenaltySpec::quadratic_form_with_accumulation`] (gam#2959).
-    pub fn quadratic_with_accumulation(&self, beta: ArrayView1<'_, f64>) -> (f64, f64) {
-        let mut total = 0.0_f64;
-        let mut magnitude = 0.0_f64;
-        for (spec, &lam) in self.specs.iter().zip(self.lambdas.iter()) {
-            let (value, accumulated) = spec.quadratic_form_with_accumulation(beta);
-            total += 0.5 * lam * value;
-            magnitude += 0.5 * lam.abs() * accumulated;
-        }
-        (total, magnitude)
-    }
-
-    /// Accumulate `Σ_j exp(ρ_j) · S_j · v` into `out` (additive).
+    /// Accumulate `Σ_j exp(ρ_j)·R_jᵀ(R_j v)` into `out` (additive): the
+    /// gradient and Hessian action of [`Self::quadratic`].
     pub fn add_apply_into(&self, vector: ArrayView1<'_, f64>, out: &mut ndarray::Array1<f64>) {
         assert_eq!(out.len(), vector.len());
-        for (spec, &lam) in self.specs.iter().zip(self.lambdas.iter()) {
-            let sv = spec.matrix.dot(&vector);
-            out.scaled_add(lam, &sv);
+        for (root, &lam) in self.roots.iter().zip(self.lambdas.iter()) {
+            let root_vector = root.dot(&vector);
+            out.scaled_add(lam, &root.t().dot(&root_vector));
         }
     }
 
-    /// Accumulate `Σ_j exp(ρ_j) · diag(S_j)` into `diag` (additive).
+    /// Accumulate `Σ_j exp(ρ_j)·diag(R_jᵀR_j)` into `diag` (additive).
     pub fn add_diag(&self, diag: &mut ndarray::Array1<f64>) {
-        for (spec, &lam) in self.specs.iter().zip(self.lambdas.iter()) {
-            for (i, value) in spec.matrix.diag().iter().enumerate() {
-                diag[i] += lam * *value;
+        for (root, &lam) in self.roots.iter().zip(self.lambdas.iter()) {
+            for (i, column) in root.columns().into_iter().enumerate() {
+                diag[i] += lam * column.dot(&column);
             }
         }
     }
 
-    /// Accumulate `Σ_j exp(ρ_j) · S_j` into the full `matrix` (additive).
+    /// Accumulate `Σ_j exp(ρ_j)·R_jᵀR_j` into the full `matrix` (additive): the
+    /// Hessian of [`Self::quadratic`].
     pub fn add_to_matrix(&self, matrix: &mut Array2<f64>) {
         assert_eq!(matrix.nrows(), matrix.ncols());
-        for (spec, &lam) in self.specs.iter().zip(self.lambdas.iter()) {
-            matrix.scaled_add(lam, &spec.matrix);
+        for (root, &lam) in self.roots.iter().zip(self.lambdas.iter()) {
+            matrix.scaled_add(lam, &root.t().dot(root));
         }
     }
-
 }
 
 #[cfg(test)]
@@ -590,25 +686,94 @@ mod tests {
         assert!((q - 1.25).abs() < 1e-12, "got {q}");
     }
 
-    /// gam#2959. The explicit entry pass returns the mat-vec value within the
-    /// rounding both evaluations can carry, `γ_{dim²}` of the accumulated magnitude
-    /// for each, and a magnitude that bounds the value.
+    /// #2954: the bundle's quadratic is formed on each component's structural
+    /// root, so it matches the structural value `½λ(0.25 + 1.0)` of
+    /// [`cross_block_spec`] within the root form's own forward error, and its
+    /// null directions contribute nothing at any `λ`.
     #[test]
-    fn quadratic_form_with_accumulation_matches_the_mat_vec_value_2959() {
-        let spec = cross_block_spec();
+    fn the_bundle_quadratic_is_the_root_form_at_any_strength_2954() {
+        let specs = std::sync::Arc::new(vec![cross_block_spec()]);
         let beta: Array1<f64> = array![0.5, -0.25, 1.0, 0.75];
-        let (value, magnitude) = spec.quadratic_form_with_accumulation(beta.view());
-        let mat_vec = spec.quadratic_form(beta.view());
-        let dim = spec.dim();
-        let band = 2.0 * gam_linalg::roundoff::accumulation_growth(dim * dim) * magnitude;
-        let gap = (value - mat_vec).abs();
-        assert!(
-            gap <= band,
-            "explicit value {value:e} against mat-vec {mat_vec:e}: gap {gap:.3e} exceeds {band:.3e}"
+        // (1, 0, 1, 0) and (0, 1, 0, 1) span ker(S).
+        let null: Array1<f64> = array![1.0, 0.0, 1.0, 0.0];
+        for log_lambda in [0.0, 30.0] {
+            let bundle = JointPenaltyBundle::new(specs.clone(), vec![log_lambda], 4)
+                .expect("a valid bundle");
+            let lambda = bundle.lambdas()[0];
+            let value = bundle.quadratic(beta.view());
+            let expected = 0.5 * lambda * 1.25;
+            let band = gam_linalg::roundoff::accumulation_growth(16) * 2.0 * expected;
+            assert!(
+                (value - expected).abs() <= band,
+                "λ={lambda:e}: {value:e} against {expected:e}, band {band:.3e}"
+            );
+            let null_value = bundle.quadratic(null.view());
+            let root_band = lambda
+                * (4.0 * f64::EPSILON * 2.0 * null.iter().map(|v| v.abs()).sum::<f64>()).powi(2);
+            assert!(
+                null_value.abs() <= root_band,
+                "λ={lambda:e}: a null direction carries {null_value:e}, above {root_band:.3e}"
+            );
+        }
+    }
+
+    /// #2954: the declared nullity and the spectrum each remove directions from a
+    /// penalty's root, and neither refuses the other. A formed penalty stores its
+    /// structural zeros with its construction's rounding, which can sit above the
+    /// eigensolver's Weyl band (the link wiggle's order-3 I-spline roughness,
+    /// gam#2921: `1.687e-11` against `1.370e-11`), so only the declaration removes
+    /// them. A declared range direction the spectrum cannot resolve is removed by
+    /// the spectrum. A declaration that removes a resolved direction is a
+    /// structural statement the root cannot audit without the construction's
+    /// formation band.
+    #[test]
+    fn a_declared_nullity_and_the_spectrum_each_remove_directions_2954() {
+        let exact = cross_block_spec().matrix;
+        let rows = |matrix: &Array2<f64>, declared: Option<usize>| {
+            structural_penalty_root(matrix, declared, 0.0)
+                .expect("a square penalty with a nullity at most its dimension roots")
+                .nrows()
+        };
+        assert_eq!(rows(&exact, Some(2)), 2);
+        assert_eq!(rows(&exact, None), 2);
+        assert_eq!(
+            rows(&exact, Some(1)),
+            2,
+            "the spectrum removes an unresolved zero"
         );
+        assert_eq!(
+            rows(&exact, Some(3)),
+            1,
+            "the declaration removes a resolved direction"
+        );
+        // The same penalty with a formation error of eight Weyl bands left along
+        // its structural null direction `(1, 0, 1, 0)/√2`.
+        let weyl = 4.0 * f64::EPSILON * 2.0;
+        let null = array![1.0, 0.0, 1.0, 0.0].mapv(|value: f64| value / 2.0_f64.sqrt());
+        let mut formed = exact.clone();
+        for i in 0..4 {
+            for j in 0..4 {
+                formed[[i, j]] += 8.0 * weyl * null[i] * null[j];
+            }
+        }
+        assert_eq!(
+            rows(&formed, None),
+            3,
+            "the spectrum resolves the formation error"
+        );
+        let root = structural_penalty_root(&formed, Some(2), 0.0).expect("declared nullity 2");
+        assert_eq!(root.nrows(), 2);
+        let along_null = root.dot(&null).mapv(|value| value * value).sum();
         assert!(
-            magnitude >= value.abs(),
-            "the accumulated magnitude {magnitude:e} must bound the value {value:e}"
+            along_null <= weyl,
+            "the declared root carries {along_null:e} along the structural null direction"
+        );
+        // A stored null eigenvalue of `0.89·u·‖S‖` (the 2923 penalty's) is a
+        // structural zero, inside the Weyl band, and is not counted.
+        let stored_null = 0.89 * 0.5 * f64::EPSILON * 2.0;
+        assert_eq!(
+            gam_linalg::roundoff::resolved_eigenvalue_count(&[stored_null, 2.0, 2.0, 2.0], 0.0),
+            3
         );
     }
 

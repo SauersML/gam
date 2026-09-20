@@ -1580,14 +1580,10 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
         let spec = &specs[b];
         let (start, end) = ranges[b];
         let p = end - start;
-        let lambdas = exact_lambdas_from_log_strengths(
-            &block_log_lambdas[b],
-            &format!("joint logdet block {b} log strength"),
-        )?;
-        let mut s_lambda = Array2::<f64>::zeros((p, p));
-        for (k, s) in spec.penalties.iter().enumerate() {
-            s.add_scaled_to(lambdas[k], &mut s_lambda);
-        }
+        // The block curvature and components every other consumer reads, on the
+        // roots (#2954).
+        let (s_lambda, block_terms) =
+            crate::blockwise_solve::block_penalty_roots(b, spec, &block_log_lambdas[b])?;
         let block_logdet = if include_logdet_s {
             // Pseudo-logdet of S_λ on the positive eigenspace.
             //
@@ -1606,10 +1602,13 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
             // magnitude rule). To guarantee value↔gradient agree by
             // construction, compute the value from the SAME canonical
             // `PenaltyPseudologdet` the gradient differentiates, with the same
-            // dense penalty components and the same λ.
-            let penalties_dense: Vec<Array2<f64>> =
-                spec.penalties.iter().map(|pen| pen.to_dense()).collect();
-            let lambdas_vec: Vec<f64> = lambdas.to_vec();
+            // penalty components (each `RᵀR` on its structural root, #2954) and the
+            // same λ.
+            let penalties_dense: Vec<Array2<f64>> = block_terms
+                .iter()
+                .map(|term| term.embedded_penalty(p))
+                .collect();
+            let lambdas_vec: Vec<f64> = block_terms.iter().map(|term| term.lambda).collect();
             match gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet::from_components(
                 &penalties_dense,
                 &lambdas_vec,
@@ -2457,10 +2456,11 @@ pub(crate) fn joint_objective_roundoff_slack(
 /// to show.
 ///
 /// The accumulation is NOT `|F|`, which is the whole content of gam#2612: the
-/// penalty `½βᵀS_λβ` is evaluated as `β·(S_λβ)` with signed `S_ij`, so it sums
-/// `½Σ|β_i S_ij β_j|` while returning `O(10)`. That term is carried explicitly
-/// here, as each endpoint's own sum from one pass over the entries (gam#2959),
-/// which is what keeps the ceiling far above the resolutions gam#2612 was
+/// penalty's rounding is its own accumulation, carried explicitly here as each
+/// endpoint's. It was the dense `β·(S_λβ)` pass over signed `S_ij`, summing
+/// `½Σ|β_i S_ij β_j|` while returning `O(10)` (gam#2959); it is now the root
+/// form's (#2954, [`crate::blockwise_solve::BlockPenaltyRoots::value`]), whose
+/// terms `λ‖R_kβ‖²` do not cancel. That charge is what kept the ceiling far above the resolutions gam#2612 was
 /// opened to measure (its banded witness measures `6.1e-11` against a ceiling
 /// of `1.2e-6`) while refusing this one by nine orders. The cruder
 /// `max|S_λ|·‖β‖₁²` it replaced sat four decades higher on the survival
@@ -2515,10 +2515,10 @@ impl ObjectiveAccumulation {
     /// What comparing one evaluation of `F = −ℓ + ½βᵀS_λβ − Φ` at each of two
     /// coefficient vectors accumulates (gam#2748, gam#2959).
     ///
-    /// The summands are the likelihood's rows and every penalty entry. The
-    /// magnitude is both objective values plus what each endpoint's `½βᵀS_λβ`
-    /// summed, `½Σ|β_i S_ij β_j|` from one explicit pass
-    /// ([`crate::blockwise_solve::total_quadratic_penalty_with_accumulation`]).
+    /// The summands are the likelihood's rows and the penalty's accumulation
+    /// depth. The magnitude is both objective values plus each endpoint's penalty
+    /// accumulation, `(depth, magnitude)` of the root form
+    /// ([`crate::blockwise_solve::BlockPenaltyRoots::value`], #2954).
     /// The log-determinant rounding is both endpoints' certified bound.
     pub(crate) fn between_endpoints(
         likelihood_rows: usize,

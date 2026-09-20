@@ -9083,3 +9083,175 @@ fn closed_form_certificate_anchors_exclude_the_influence_offset_2926() {
         );
     }
 }
+
+/// gam#2971: a survival event row's likelihood keeps its value and its slope as
+/// the row's link-deviation argument `u = a₁ + g·z` crosses the support's right
+/// end. The event density carries `ln χ₁`, `χ₁ = 1 + w′(u)`, and outside the
+/// support the deviation is flat, so a link basis whose `w′` survives at the end
+/// made the row likelihood jump by `ln(1 + w′(end))` there. The inner Newton
+/// crept toward that cliff and never certified. The likelihood's gradient reads
+/// `w″` through `∂χ₁/∂a`, so its slope jumps as well unless `w″` also vanishes.
+///
+/// The exit index `q₁*` putting `u` on the end is bisected, and the row
+/// likelihood is read at `q₁* ± h, ± 2h, ± 3h`. Each side's three points give a
+/// quadratic extrapolation of the value and the slope at `q₁*`. Its gap to the
+/// linear extrapolation from the two nearer points is that side's truncation
+/// estimate. The two sides must agree within the sum of their estimates.
+#[test]
+fn link_deviation_row_likelihood_is_c1_across_its_support_end_2971() {
+    let score_runtime = test_deviation_runtime();
+    let link_seed = array![-2.0, -1.0, 0.0, 1.0, 2.0];
+    let link_runtime = build_link_deviation_block_from_knots_design_seed_and_weights(
+        &link_seed,
+        &link_seed,
+        &DeviationBlockConfig {
+            degree: 3,
+            num_internal_knots: 3,
+            penalty_order: 2,
+            penalty_orders: vec![1, 2, 3],
+            double_penalty: false,
+            monotonicity_eps: 1e-4,
+        },
+    )
+    .expect("build the production survival link deviation")
+    .runtime;
+    let h_dim = score_runtime.basis_dim();
+    let w_dim = link_runtime.basis_dim();
+    let q0v = -0.25_f64;
+    let qd1v = 0.9_f64;
+    let gv = 0.4_f64;
+    let family = SurvivalMarginalSlopeFamily {
+        jeffreys_armed: true,
+        latent_law: None,
+        n: 1,
+        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
+        event: Arc::new(array![1.0]),
+        weights: Arc::new(array![1.0]),
+        z: Arc::new(array![0.3].insert_axis(Axis(1))),
+        score_covariance: unit_score_covariance(),
+        gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
+        derivative_guard: 1e-6,
+        design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        offset_entry: Arc::new(array![q0v]),
+        offset_exit: Arc::new(array![0.0]),
+        derivative_offset_exit: Arc::new(array![qd1v]),
+        marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+        slope_layout: (DesignMatrix::from(Array2::zeros((1, 0)))).into(),
+        score_warp: Some(score_runtime.clone()),
+        link_dev: Some(link_runtime.clone()),
+        influence_absorber: None,
+        time_linear_constraints: None,
+        time_wiggle_knots: None,
+        time_wiggle_degree: None,
+        time_wiggle_ncols: 0,
+        intercept_warm_starts: None,
+    };
+    let beta_h = Array1::from_iter((0..h_dim).map(|k| 0.04 * (k as f64 + 1.3).sin()));
+    let beta_w = Array1::from_iter((0..w_dim).map(|k| 0.035 * (k as f64 + 0.7).cos()));
+    let z_obs = family.observed_score_projection(0);
+    let breakpoints = link_runtime.breakpoints();
+    let right_end = breakpoints[breakpoints.len() - 1];
+    let last_interior = breakpoints[breakpoints.len() - 2];
+    let argument = |q1: f64| -> f64 {
+        let (a1, _) = family
+            .solve_row_survival_intercept_with_slot(q1, gv, Some(&beta_h), Some(&beta_w), None)
+            .expect("exit intercept solve");
+        a1 + gv * z_obs
+    };
+    let neglog = |q1: f64| -> f64 {
+        family
+            .row_neglog_flex_value_from_parts(
+                0,
+                q0v,
+                q1,
+                qd1v,
+                gv,
+                Some(&beta_h),
+                Some(&beta_w),
+                0.0,
+            )
+            .expect("row neglog")
+    };
+
+    // The argument rises with q₁; bisect until the bracket stops shrinking.
+    let (mut lo, mut hi) = (-4.0_f64, 4.0_f64);
+    assert!(
+        argument(lo) < right_end && argument(hi) > right_end,
+        "the bracket must straddle the support end {right_end}: u(lo)={:.6} u(hi)={:.6}",
+        argument(lo),
+        argument(hi)
+    );
+    loop {
+        let mid = 0.5 * (lo + hi);
+        if !(mid > lo && mid < hi) {
+            break;
+        }
+        if argument(mid) <= right_end {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let q_star = 0.5 * (lo + hi);
+    let h = 1e-3;
+    let values: Vec<(f64, f64, f64)> = [-3.0, -2.0, -1.0, 1.0, 2.0, 3.0]
+        .iter()
+        .map(|&k: &f64| {
+            let q = q_star + k * h;
+            (q, argument(q), neglog(q))
+        })
+        .collect();
+    for (q, u, value) in &values {
+        eprintln!(
+            "support end 2971: q1={q:.12e} u={u:.12e} (end {right_end:.6}) neglog={value:.15e}"
+        );
+    }
+    // Every left point lies in the last span and every right point in the flat
+    // tail, so each side's stencil reads one polynomial piece.
+    assert!(
+        values[..3]
+            .iter()
+            .all(|&(_, u, _)| u > last_interior && u <= right_end)
+            && values[3..].iter().all(|&(_, u, _)| u > right_end),
+        "the stencil must sit in the last span on the left and in the tail on the right"
+    );
+    let side = |near: f64, mid: f64, far: f64, sign: f64| -> (f64, f64, f64, f64) {
+        let value = 3.0 * near - 3.0 * mid + far;
+        let value_linear = 2.0 * near - mid;
+        let slope = sign * (2.5 * near - 4.0 * mid + 1.5 * far) / h;
+        let slope_linear = sign * (near - mid) / h;
+        (
+            value,
+            (value - value_linear).abs(),
+            slope,
+            (slope - slope_linear).abs(),
+        )
+    };
+    let (left_value, left_value_est, left_slope, left_slope_est) =
+        side(values[2].2, values[1].2, values[0].2, 1.0);
+    let (right_value, right_value_est, right_slope, right_slope_est) =
+        side(values[3].2, values[4].2, values[5].2, -1.0);
+    let value_gap = (left_value - right_value).abs();
+    let slope_gap = (left_slope - right_slope).abs();
+    eprintln!(
+        "support end 2971: q1*={q_star:.12e} value left={left_value:.15e} right={right_value:.15e} \
+         gap={value_gap:.3e} bound={:.3e} | slope left={left_slope:.12e} right={right_slope:.12e} \
+         gap={slope_gap:.3e} bound={:.3e}",
+        left_value_est + right_value_est,
+        left_slope_est + right_slope_est
+    );
+    assert!(
+        value_gap <= left_value_est + right_value_est,
+        "the row likelihood jumps at the link support end: gap={value_gap:.3e} > bound={:.3e}",
+        left_value_est + right_value_est
+    );
+    assert!(
+        slope_gap <= left_slope_est + right_slope_est,
+        "the row likelihood's slope jumps at the link support end: gap={slope_gap:.3e} > \
+         bound={:.3e}",
+        left_slope_est + right_slope_est
+    );
+}

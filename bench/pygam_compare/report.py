@@ -49,9 +49,11 @@ COVERAGE_TARGET = 0.95
 SE_MULTIPLIER = 2.0
 
 Record = dict[str, Any]
-# (family, n, design, threads, concurrency); records written before the
-# thread fields existed are single-thread, single-process cells.
-CellKey = tuple[str, int, str, int | None, int]
+# (family, n, design, threads, concurrency, n_predict); records written before
+# the thread fields existed are single-thread, single-process cells, and
+# n_predict is None for a cell that predicts on n held-out rows (every plan
+# without an explicit n_predict).
+CellKey = tuple[str, int, str, int | None, int, int | None]
 
 
 @dataclass(frozen=True)
@@ -67,12 +69,14 @@ class Verdict:
 
 
 def _cell_key(r: Record) -> CellKey:
+    n_predict = r.get("n_predict")
     return (
         str(r["family"]),
         int(r["n"]),
         str(r["design"]),
         r.get("threads", 1),
         int(r.get("concurrency", 1)),
+        None if n_predict is None else int(n_predict),
     )
 
 
@@ -84,8 +88,11 @@ def _cells(records: Iterable[Record]) -> list[CellKey]:
 
 
 def _cell_name(cell: CellKey) -> str:
-    family, n, design, threads, concurrency = cell
-    return f"{family} n={n:g} {design}{variant_suffix(threads, concurrency)}"
+    family, n, design, threads, concurrency, n_predict = cell
+    name = f"{family} n={n:g} {design}"
+    if n_predict is not None:
+        name += f" n_predict={n_predict:g}"
+    return name + variant_suffix(threads, concurrency)
 
 
 def _group(records: Iterable[Record]) -> dict[tuple[CellKey, str], list[Record]]:
@@ -202,6 +209,13 @@ SPEED_METRICS: tuple[tuple[str, str], ...] = (
     ("import_cpu_s", "import CPU"),
     ("pred_cpu_s", "predict CPU"),
     ("interval_cpu_s", "interval CPU"),
+    # Post-fit operations, measured only by plans with ``postfit`` set.
+    ("pd_cpu_s", "partial dependence CPU"),
+    ("summary_cpu_s", "summary CPU"),
+    ("save_cpu_s", "save CPU"),
+    ("load_cpu_s", "load CPU"),
+    ("sample_cpu_s", "posterior sample CPU"),
+    ("sig_cpu_s", "smooth significance CPU"),
     ("proc_wall_s", "process wall (import+fit+predict)"),
     ("peak_rss_mb", "peak RSS"),
 )
@@ -228,7 +242,7 @@ def scaling_lines(records: list[Record]) -> list[str]:
     shapes = list(dict.fromkeys(c[:3] for c in cells))
 
     def alone(shape: tuple[str, int, str], threads: int | None) -> float | None:
-        return _median(groups.get(((*shape, threads, 1), GAMFIT), []), "fit_s")
+        return _median(groups.get(((*shape, threads, 1, None), GAMFIT), []), "fit_s")
 
     settings = sorted({c[3] for c in cells if c[4] == 1}, key=_thread_order)
     if len(settings) > 1:
@@ -239,7 +253,7 @@ def scaling_lines(records: list[Record]) -> list[str]:
         rows = []
         for shape in shapes:
             base = alone(shape, 1)
-            row = [_cell_name((*shape, 1, 1))]
+            row = [_cell_name((*shape, 1, 1, None))]
             for t in settings:
                 v = alone(shape, t)
                 speedup = f" ({base / v:.2f}x)" if base and v else ""
@@ -266,7 +280,7 @@ def scaling_lines(records: list[Record]) -> list[str]:
         for cell in fanouts:
             recs = groups[(cell, GAMFIT)]
             k = cell[4]
-            solo = groups.get(((*cell[:3], cell[3], 1), GAMFIT), [])
+            solo = groups.get(((*cell[:3], cell[3], 1, cell[5]), GAMFIT), [])
             solo_wall = _median(solo, "proc_wall_s")
             batch = _median(recs, "batch_wall_s")
             ratio = k * solo_wall / batch if batch and solo_wall else None
@@ -377,6 +391,11 @@ def render(records: list[Record], metas: list[dict[str, Any]] | None = None) -> 
     lines += _table(["cell", *libs], rows) + [""]
 
     for metric, label in SPEED_METRICS:
+        if not any(r.get(metric) is not None for r in records):
+            # A metric no rep measured (a post-fit phase outside a postfit
+            # plan) has no table; a metric only some libraries report still
+            # gets one, so a missing gamfit value shows as a loss.
+            continue
         unit = " MiB" if metric.endswith("_mb") else " s"
         lines += [f"## {label} (median over ok reps)", ""]
         rows = []
