@@ -14,11 +14,12 @@
 //! Two instruments are combined, both already implemented in `gam-sae`:
 //!   * per-edge Fourier-rigidity classification
 //!     ([`transport_class::classify_circle_transport_fit`]) — the `O(2)` element
-//!     `(winding, phase)` and its departure `defect`;
+//!     `(winding, phase)`, its circular-variance departure `defect` and its
+//!     sup-norm angular gap `max_angle_gap`;
 //!   * per-triangle loop holonomy ([`contracts::loop_holonomy`] via
 //!     [`contracts::invert_o2_edge`]) whose trivial/nontrivial tolerance is
-//!     DERIVED from the loop's own composed defect (sum of the three edge
-//!     defects), never a magic constant; plus the analytic delta-method
+//!     DERIVED from the loop's own composed defect (sum of the three edges'
+//!     `max_angle_gap`, in radians), never a magic constant; plus the analytic delta-method
 //!     composition-law test ([`layer_transport::composition_defect`]) as an
 //!     independent calibrated cross-check.
 //!
@@ -297,6 +298,7 @@ fn run(args: &Args) -> Result<PathBuf, String> {
                 "phase_rad": jf(class.phase),
                 "phase_deg": jf(class.phase_degrees()),
                 "o2_defect": jf(class.defect),
+                "o2_max_angle_gap": jf(class.max_angle_gap),
                 "resultant_shift": jf(class.resultant_shift),
                 "resultant_reflect": jf(class.resultant_reflect),
                 "degree": fit.degree,
@@ -333,8 +335,9 @@ fn run(args: &Args) -> Result<PathBuf, String> {
                     (e_bc.winding, e_bc.phase),
                     invert_o2_edge((e_ac.winding, e_ac.phase)),
                 ];
-                let defects = [e_ab.defect, e_bc.defect, e_ac.defect];
-                let holo: HolonomyReport = loop_holonomy(&edges, &defects);
+                let defects = [e_ab.max_angle_gap, e_bc.max_angle_gap, e_ac.max_angle_gap];
+                let holo: HolonomyReport = loop_holonomy(&edges, &defects)
+                    .map_err(|e| format!("triangle {a}-{b}-{c} holonomy: {e}"))?;
                 let net_abs = holo.net_angle.abs();
                 let excess = (net_abs - holo.angle_tolerance).max(0.0);
                 let significance = if holo.angle_tolerance > 0.0 {
@@ -459,8 +462,8 @@ fn run(args: &Args) -> Result<PathBuf, String> {
         "attribution_rule": "per-interval computation_score = summed EXCESS holonomy \
             max(0, |net_angle| - angle_tolerance) of every triangle whose direct edge spans the \
             interval, split uniformly across the adjacent intervals that edge covers; \
-            angle_tolerance is the loop's own composed defect (sum of the three edge O(2) defects), \
-            so the score is null-calibrated in radians.",
+            angle_tolerance is the loop's own composed defect (sum of the three edges' max angle \
+            gaps), so the score is in radians.",
         "summary": summary,
         "edges": edges_json,
         "triangles": triangles_json,

@@ -92,6 +92,16 @@ pub struct CircleTransportReport {
     /// influence on the winning resultant, `√Σ(cos(ψ_k − φ) − R)²/n`; for a fitted
     /// map, by the delta method through the fit's coefficient covariance.
     pub defect_se: f64,
+    /// `max_k |θ_out,k − (winding·θ_in,k + φ)|`, wrapped to `[0, π]`: the largest
+    /// angular gap in radians between the sampled transport and its `O(2)`
+    /// element. This is the sup-norm defect that a
+    /// [`Contract`](crate::inference::contracts::Contract) chain and
+    /// [`loop_holonomy`](crate::inference::contracts::loop_holonomy) add up.
+    /// [`Self::defect`] is a circular variance and is not an angle. With
+    /// residuals `δ_k`, `1 − R = mean(1 − cos δ_k)` is about `δ²/2`, far below
+    /// the gap it would stand in for. The gap is taken over the samples, so it
+    /// bounds the map only where it was sampled.
+    pub max_angle_gap: f64,
     /// Resultants for both hypotheses (diagnostics).
     pub resultant_shift: f64,
     pub resultant_reflect: f64,
@@ -311,6 +321,14 @@ pub(crate) fn classify_circle_transport(
         })
         .sum();
     let defect_se = influence_sq.sqrt() / nf;
+    let max_angle_gap = theta_in
+        .iter()
+        .zip(theta_out.iter())
+        .map(|(&a, &b)| {
+            let residual = b - winning_sign * a - phase;
+            residual.sin().atan2(residual.cos()).abs()
+        })
+        .fold(0.0_f64, f64::max);
     let class_probabilities = posterior_class_probabilities(n, r_shift, r_reflect)?;
     Ok(CircleTransportReport {
         layer_from,
@@ -320,6 +338,7 @@ pub(crate) fn classify_circle_transport(
         phase,
         defect,
         defect_se,
+        max_angle_gap,
         resultant_shift: r_shift,
         resultant_reflect: r_reflect,
         class_probabilities,
@@ -432,6 +451,26 @@ mod tests {
         assert!(r.defect < 1e-3);
         assert!(r.class_probabilities.shift > r.class_probabilities.mixing);
         assert!(r.class_probabilities.shift > r.class_probabilities.reflect);
+    }
+
+    /// The sup-norm gap is the largest residual angle, not the circular variance
+    /// `1 − R`, which for residuals `±δ` is `1 − cos δ ≈ δ²/2`.
+    #[test]
+    fn max_angle_gap_is_the_largest_residual_angle() {
+        let phi = 0.4_f64;
+        let delta = 0.1_f64;
+        let a = [0.0, 1.0, 2.0, 3.0];
+        let b: Vec<f64> = a
+            .iter()
+            .enumerate()
+            .map(|(k, &th)| th + phi + if k % 2 == 0 { delta } else { -delta })
+            .collect();
+        let r = classify_circle_transport(&a, &b, 0, 1).unwrap();
+        assert_eq!(r.winding, 1);
+        assert!((r.phase - phi).abs() < 1e-12, "phase {}", r.phase);
+        assert!((r.max_angle_gap - delta).abs() < 1e-12, "gap {}", r.max_angle_gap);
+        assert!((r.defect - (1.0 - delta.cos())).abs() < 1e-12, "defect {}", r.defect);
+        assert!(r.defect < r.max_angle_gap / 10.0);
     }
 
     #[test]
