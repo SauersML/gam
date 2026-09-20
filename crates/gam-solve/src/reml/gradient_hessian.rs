@@ -3143,7 +3143,12 @@ impl<'a> RemlState<'a> {
     /// saturation handling).
     ///
     /// For non-canonical Bernoulli links (Probit, CLogLog, SAS,
-    /// BetaLogistic, Mixture) we use the analytic
+    /// BetaLogistic, Mixture) eᵢ is the third η-derivative of the row's
+    /// observed information from `pirls::bernoulli_observed_information_jet`,
+    /// linear in the derivatives of log μ and log(1−μ), so no division by
+    /// V = μ(1−μ) occurs where μ' and 1−μ underflow together (#3317).
+    ///
+    /// Every other exact-curvature family uses the analytic
     /// `pirls::e_obs_from_jets` formula. It expresses
     ///   ∂³W_obs/∂η³ = W_F''' + h₃ T₁ + 3 h₂ T₂ + 3 h₁ T₃ − (y−μ) T₄
     /// where T = h₁/(φV), T_k = ∂^k T/∂η^k, and W_F = h₁ T. Everything
@@ -3239,53 +3244,65 @@ impl<'a> RemlState<'a> {
             .into_par_iter()
             .map(|i| -> Result<f64, EstimationError> {
                 let eta_raw = final_eta[i];
-                let h1 = dmu_deta[i];
-                let h2 = d2mu_deta2[i];
-                let h3 = d3mu_deta3[i];
-                let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
-                    inverse_link_ref,
-                    eta_raw,
-                )?;
-                let h5 = crate::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
-                    inverse_link_ref,
-                    eta_raw,
-                )?;
-                if !h1.is_finite()
-                    || !h2.is_finite()
-                    || !h3.is_finite()
-                    || !h4.is_finite()
-                    || !h5.is_finite()
-                {
-                    return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                        row: i,
-                        quantity: "observed Hessian inverse-link five-jet",
-                        eta: eta_raw,
-                        value: h5,
-                    });
-                }
-                let mu_i = mu[i];
-                // #2273 — the complement comes from the LINK, not from `1.0 -
-                // mu`: a saturated cloglog/probit row has `mu == 1.0` exactly,
-                // and `V = mu*(1-mu)` would be a hard zero the whole
-                // observed-information jet then divides by.
-                let one_minus_mu = crate::mixture_link::inverse_link_complement_for_inverse_link(
-                    inverse_link_ref,
-                    eta_raw,
-                    mu_i,
-                );
-                let vj = pirls::variance_jet_for_weight_family(weight_family, mu_i, one_minus_mu);
-                if !(vj.v.is_finite() && vj.v > 0.0) {
-                    return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                        row: i,
-                        quantity: "observed Hessian variance",
-                        eta: eta_raw,
-                        value: vj.v,
-                    });
-                }
-                let pw = weights[i];
-                let y_i = y_view[i];
-                let resid_i = pirls::bernoulli_pair_residual(weight_family, y_i, mu_i, one_minus_mu);
-                let e_i = pirls::e_obs_from_jets(resid_i, h1, h2, h3, h4, h5, vj, phi, pw);
+                let e_i = if matches!(weight_family, pirls::WeightFamily::Binomial) {
+                    // #3317 — a Bernoulli row's jet is linear in the two sides'
+                    // log-probability jets, which never divide by μ(1−μ).
+                    pirls::bernoulli_observed_information_jet(
+                        inverse_link_ref,
+                        eta_raw,
+                        y_view[i],
+                        phi,
+                        weights[i],
+                    )?[3]
+                } else {
+                    let h1 = dmu_deta[i];
+                    let h2 = d2mu_deta2[i];
+                    let h3 = d3mu_deta3[i];
+                    let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
+                        inverse_link_ref,
+                        eta_raw,
+                    )?;
+                    let h5 = crate::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
+                        inverse_link_ref,
+                        eta_raw,
+                    )?;
+                    if !h1.is_finite()
+                        || !h2.is_finite()
+                        || !h3.is_finite()
+                        || !h4.is_finite()
+                        || !h5.is_finite()
+                    {
+                        return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                            row: i,
+                            quantity: "observed Hessian inverse-link five-jet",
+                            eta: eta_raw,
+                            value: h5,
+                        });
+                    }
+                    let mu_i = mu[i];
+                    // #2273 — the complement comes from the LINK, not from `1.0 -
+                    // mu`: a saturated cloglog/probit row has `mu == 1.0` exactly,
+                    // and `V = mu*(1-mu)` would be a hard zero the whole
+                    // observed-information jet then divides by.
+                    let one_minus_mu = crate::mixture_link::inverse_link_complement_for_inverse_link(
+                        inverse_link_ref,
+                        eta_raw,
+                        mu_i,
+                    );
+                    let vj = pirls::variance_jet_for_weight_family(weight_family, mu_i, one_minus_mu);
+                    if !(vj.v.is_finite() && vj.v > 0.0) {
+                        return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                            row: i,
+                            quantity: "observed Hessian variance",
+                            eta: eta_raw,
+                            value: vj.v,
+                        });
+                    }
+                    let pw = weights[i];
+                    let y_i = y_view[i];
+                    let resid_i = pirls::bernoulli_pair_residual(weight_family, y_i, mu_i, one_minus_mu);
+                    pirls::e_obs_from_jets(resid_i, h1, h2, h3, h4, h5, vj, phi, pw)
+                };
                 if e_i.is_finite() {
                     Ok(e_i)
                 } else {
@@ -6594,14 +6611,24 @@ impl<'a> RemlState<'a> {
             .load(Ordering::Relaxed);
         // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
         let key_opt = self.rhokey_sanitized(rho);
+        // A request under an outer iteration cap is also answered by the mode
+        // certified uncapped at the same rho. The outer search probes a trial
+        // rho by value with no cap and then asks for the gradient there under
+        // its schedule's cap; without the stand-in that gradient re-ran P-IRLS
+        // to the mode already in the cache.
         if use_cache
             && let Some(key) = &key_opt
-            && let Some(cached) = self
-                .cache_manager
-                .pirls_cache
-                .write()
-                .expect("PIRLS result cache lock poisoned")
-                .get(key)
+            && let Some(cached) = {
+                let mut cache = self
+                    .cache_manager
+                    .pirls_cache
+                    .write()
+                    .expect("PIRLS result cache lock poisoned");
+                cache.get(key).or_else(|| {
+                    super::rho_key::uncapped_stand_in_key(key)
+                        .and_then(|uncapped| cache.get(&uncapped))
+                })
+            }
         {
             // Do not overwrite the current warm start from cache hits.
             // Line search / multi-eval outer loops revisit older rho keys and
@@ -9240,5 +9267,72 @@ mod firth_hessian_direction_reuse_tests {
                 "batched direct[{idx}] not bit-identical to per-direction at n={n}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod capped_request_cache_tests {
+    use super::super::super::RemlConfig;
+    use super::super::super::tests::{binomial_logit_glm_spec, build_logit_state};
+    use ndarray::{Array1, array};
+
+    #[test]
+    fn capped_gradient_request_reuses_uncapped_mode_at_same_rho() {
+        // The outer search probes a trial rho by value with no inner cap, then
+        // asks for the gradient at that rho under its schedule's cap. The
+        // uncapped mode is already certified and cached, so the capped request
+        // must be answered from it rather than re-running P-IRLS: at n=1e4 the
+        // repeat solve was a third of every value+gradient pair.
+        use std::sync::atomic::Ordering;
+        let y = array![0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.5, -0.4],
+            [1.0, 0.0, 0.7],
+            [1.0, 0.4, -0.3],
+            [1.0, 0.9, 0.1],
+            [1.0, 1.3, -0.6],
+        ];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.1, 0.15], [0.0, 0.15, 0.8],];
+        let rho = array![0.0];
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-10, false);
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+
+        state.outer_inner_cap.store(0, Ordering::Relaxed);
+        state
+            .compute_outer_eval_with_order(&rho, crate::rho_optimizer::OuterEvalOrder::Value)
+            .expect("uncapped value probe should succeed");
+        let uncapped = state
+            .execute_pirls_if_needed(&rho)
+            .expect("uncapped mode is cached");
+
+        // A fresh solve records its iteration count; a cache answer does not.
+        let untouched = usize::MAX;
+        state.last_inner_iters.store(untouched, Ordering::Relaxed);
+        state.outer_inner_cap.store(5, Ordering::Relaxed);
+        let capped = state
+            .execute_pirls_if_needed(&rho)
+            .expect("capped request should succeed");
+
+        assert_eq!(
+            state.last_inner_iters.load(Ordering::Relaxed),
+            untouched,
+            "the capped request re-ran P-IRLS instead of reusing the uncapped mode"
+        );
+        assert_eq!(capped.beta_transformed.as_ref(), uncapped.beta_transformed.as_ref());
+
+        // The converse stays closed (#2309): a mode cached under a cap never
+        // answers an uncapped request.
+        let rho_capped_only = array![0.5];
+        state
+            .execute_pirls_if_needed(&rho_capped_only)
+            .expect("capped solve should succeed");
+        state.outer_inner_cap.store(0, Ordering::Relaxed);
+        state.last_inner_iters.store(untouched, Ordering::Relaxed);
+        state
+            .execute_pirls_if_needed(&rho_capped_only)
+            .expect("uncapped solve should succeed");
+        assert_ne!(state.last_inner_iters.load(Ordering::Relaxed), untouched);
     }
 }

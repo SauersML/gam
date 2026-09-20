@@ -90,23 +90,6 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     /// cycling). `None` ⇒ unconstrained, no projection (raw norm). Cheap to hold
     /// (the outer dimension is the smoothing-param count).
     pub(crate) cost_stall_bounds: Option<(Array1<f64>, Array1<f64>)>,
-    /// Count of consecutive `eval_cost` calls that returned `Recoverable`
-    /// without a single success in between. When every trial step in every
-    /// search direction is infeasible (the inner solve refuses to converge at
-    /// any neighboring ρ), BFGS would otherwise spend its full
-    /// `max_iterations × line_search_budget` budget doing inner solves that
-    /// all fail — the non-termination reported in issue #NaN-outer-loop.
-    ///
-    /// Once this counter exceeds [`PROBE_REFUSAL_FATAL_THRESHOLD`] and no
-    /// gradient evaluation has ever been accepted on this seed (`first_order_evals ==
-    /// 0`), the bridge escalates to `Fatal` so BFGS exits immediately via
-    /// `ObjectiveFailed`. The seed loop treats that outcome as a rejected seed
-    /// and moves on, keeping the cascade bounded.
-    ///
-    /// Reset to 0 on any successful cost evaluation so normal line-search
-    /// noise (a few recoverable probes followed by an accepted step) never
-    /// trips this guard.
-    pub(crate) consecutive_probe_refusals: usize,
     /// Accepted-outer-step signal published by [`OuterAcceptObserver`] (#2613).
     ///
     /// The cost-stall guard above counts *accepted outer steps*. Before #2613
@@ -139,7 +122,9 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     /// The last iterate known to be accepted — the seed, then each accepted
     /// step. The reference point for reconciling [`AcceptedOuterStep`] against
     /// [`Self::pending_first_order`], and the point a refused trial's linear
-    /// model is taken at (#3018).
+    /// model is taken at (#3018). The seed is installed here from the runner's
+    /// initial sample, so a run whose every probe is refused is judged against
+    /// the seed's own gradient and resolution from its first probe (#3219).
     pub(crate) incumbent: Option<OuterIncumbent>,
     /// Kept rank of the criterion at this run's start (#2765), read from
     /// [`OuterObjective::criterion_rank`]. A trial whose criterion keeps a different
@@ -154,40 +139,6 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
 pub(crate) const VALUE_PROBE_CACHE_CAPACITY: usize = 256;
 
 pub(crate) const VALUE_PROBE_REJECT_COST_FLOOR: f64 = 1.0e11;
-
-/// Number of consecutive recoverable `eval_cost` failures (every line-search
-/// probe infeasible) before the bridge escalates to `Fatal` and forces an
-/// immediate BFGS exit. This guard fires only before the first accepted
-/// gradient step (`first_order_evals == 0`): once BFGS has accepted at least one
-/// outer iteration the current ρ is feasible and isolated probe refusals are
-/// normal line-search noise, not a stuck loop.
-///
-/// The threshold covers one full StrongWolfe attempt (up to 20 probes)
-/// plus one backtracking fallback (up to 50 probes) with a small margin,
-/// so a SINGLE failed direction does not fire the guard. Two consecutive
-/// direction failures (120 probes) always does — once both Wolfe and
-/// backtracking exhausted two complete directions with no success, the
-/// neighborhood is globally infeasible and further BFGS iterations are
-/// pure waste.
-pub(crate) const PROBE_REFUSAL_FATAL_THRESHOLD: usize = 150;
-
-/// Tighter probe-refusal threshold used when the bridge has never seen a
-/// `eval_grad` call of its own — i.e. the seed (cost, gradient) was supplied
-/// via `with_initial_sample` so `last_value_grad_rho` is `None` and every
-/// `trial_rho_distance` prints as NaN.  In this case the seed gradient is
-/// already confirmed feasible externally; if even the first line-search
-/// direction exhausts its Wolfe probes without success (≈ 20 probes), the
-/// neighborhood IS globally infeasible and further iterations just repeat
-/// the same expensive inner solve 150 more times.  One generous Wolfe
-/// budget (25 probes) is enough to confirm the failure; 13 seeds ×
-/// 150 probes × ~3 s each would otherwise cause an observed ~97 min hang.
-pub(crate) const PROBE_REFUSAL_FATAL_THRESHOLD_NAN_SEED: usize = 25;
-
-/// Sentinel prefix embedded in the fatal [`ObjectiveEvalError`] message the
-/// bridge returns when [`PROBE_REFUSAL_FATAL_THRESHOLD`] fires. The seed-loop
-/// runner matches this prefix and routes the failed seed to
-/// typed [`SeedRejection`] accounting rather than propagating a fatal error.
-pub(crate) const PROBE_REFUSAL_FATAL_SENTINEL: &str = "OUTER_PROBE_REFUSAL_FATAL";
 
 /// Sentinel embedded in the fatal [`ObjectiveEvalError`] message the bridge
 /// returns when [`CostStallGuard`] halts BFGS on a cost stall. `opt::Bfgs`
@@ -1853,11 +1804,6 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
         remember_value_probe(&mut self.value_probe_cache, x, cached_outcome);
         match &result {
             Ok(cost) => {
-                // A successful probe resets the consecutive-refusal counter: the
-                // current ρ neighbourhood has at least one feasible point, so
-                // isolated refusals on other directions are normal line-search
-                // noise, not a globally-infeasible neighbourhood.
-                self.consecutive_probe_refusals = 0;
                 log::debug!(
                     "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e} (first-order bridge, eval={}) theta={}",
                     stage_start.elapsed().as_secs_f64(),
@@ -1886,6 +1832,18 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                     // A refused probe has no value, so the linear model at the
                     // incumbent, the one the line search takes its sufficient
                     // decrease against, decides whether it stalls (#3018).
+                    //
+                    // This is also what ends a run whose every probe is refused
+                    // (#3219). A line search shrinks `α` by a factor `β < 1` along
+                    // `d`, so the model decrease is `p(α) = α·|g_bᵀd|`, and the
+                    // first probe with `p ≤ R_b` stalls: the direction reaches a
+                    // verdict within `⌈log_{1/β}(α₀·|g_bᵀd| / R_b)⌉ + 1` refused
+                    // probes, a number the incumbent's own gradient and resolution
+                    // fix. A stall at a stationary incumbent converges. One at a
+                    // non-stationary incumbent is granted its first escape, and
+                    // the next stall stops the run through the progress licence,
+                    // since refused probes buy no descent (#2817). A route
+                    // without the guard ends on the line search's own failure.
                     let predicted_decrease = self
                         .incumbent
                         .as_ref()
@@ -1975,47 +1933,6 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                             return Err(ObjectiveEvalError::fatal(COST_STALL_CONVERGED_SENTINEL.to_string()));
                         }
                     }
-                }
-                // Non-termination guard (#NaN-outer-loop): when every
-                // line-search probe is infeasible and BFGS has never
-                // accepted a gradient step (`first_order_evals == 0`), the
-                // neighbourhood around the seed is globally degenerate.
-                // BFGS would otherwise spend its entire max_iterations ×
-                // line_search_budget doing inner solves that all fail.
-                // Escalate to Fatal so BFGS exits immediately; the seed
-                // loop routes it as a rejected seed.
-                self.consecutive_probe_refusals = self.consecutive_probe_refusals.saturating_add(1);
-                // When the bridge seed (cost, gradient) was supplied via
-                // `with_initial_sample` the bridge's own `eval_grad` is
-                // never called, so `last_value_grad_rho` stays `None` and
-                // every `trial_rho_distance` prints as NaN.  The seed IS
-                // feasible (it was evaluated externally), but if every
-                // line-search probe is Recoverable from the very first
-                // direction, the neighbourhood is globally infeasible.
-                // Use the tighter NaN-seed threshold so the guard fires
-                // after one generous Wolfe budget instead of 150 probes
-                // (which, at ~3 s each × 13 seeds, would produce an
-                // observed ~97 min hang on real D=5120 LLM activations).
-                let threshold = if self.last_value_grad_rho.is_none() {
-                    PROBE_REFUSAL_FATAL_THRESHOLD_NAN_SEED
-                } else {
-                    PROBE_REFUSAL_FATAL_THRESHOLD
-                };
-                if self.first_order_evals == 0 && self.consecutive_probe_refusals >= threshold {
-                    log::debug!(
-                        "[OUTER] probe-refusal non-termination guard fired after {} consecutive \
-                         infeasible cost probes with no accepted gradient step \
-                         (nan_seed={}); escalating to Fatal to abort this seed \
-                         (first-order bridge, eval={})",
-                        self.consecutive_probe_refusals,
-                        self.last_value_grad_rho.is_none(),
-                        self.first_order_evals,
-                    );
-                    return Err(ObjectiveEvalError::fatal(format!(
-                            "{PROBE_REFUSAL_FATAL_SENTINEL}: {consecutive} consecutive \
-                             infeasible probes with no accepted outer step",
-                            consecutive = self.consecutive_probe_refusals,
-                        )));
                 }
             }
             Err(_err) => {
@@ -2138,10 +2055,6 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             self.last_g_norm = Some(g_norm);
         }
         self.last_value_grad_rho = Some(x.clone());
-        // A successful gradient evaluation means the current ρ is feasible;
-        // reset the consecutive-probe-refusal counter so the guard only fires
-        // when ALL probes in EVERY subsequent direction fail.
-        self.consecutive_probe_refusals = 0;
         self.value_probe_cache
             .retain(|entry| value_probe_reject_outcome(&entry.outcome));
         log::debug!(

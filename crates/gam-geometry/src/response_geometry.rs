@@ -22,8 +22,8 @@
 //! is a single resolver arm.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use opt::{BacktrackConfig, armijo_roundoff_cushion, backtracking_line_search, constants};
-use std::{convert::Infallible, fmt};
+use opt::{BacktrackConfig, backtracking_line_search, constants};
+use std::{cell::Cell, convert::Infallible, fmt};
 
 use crate::manifold::RiemannianManifold;
 use crate::manifolds::constant_curvature::{ConstantCurvature, cs_stacks3, distance_kappa_jet};
@@ -410,6 +410,79 @@ impl ResponseManifold {
                 Ok(v.dot(&gv).max(0.0))
             }
         }
+    }
+
+    /// First-order rounding band of `sq_norm`, the computed
+    /// [`Self::sq_metric_norm`] of `v` at `base`, against the exact `vᵀG(base)v`
+    /// of that same `v` (#3243). Each arm follows the arithmetic of its metric;
+    /// `γ_k` is [`accumulation_growth`](gam_linalg::roundoff::accumulation_growth).
+    fn sq_metric_norm_rounding_band(
+        &self,
+        base: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+        sq_norm: f64,
+        at: &KarcherBase,
+    ) -> GeometryResult<f64> {
+        use gam_linalg::roundoff::accumulation_growth;
+        // A conformal metric `λ²I` with `λ = 2/g` and the chart gauge `g = 1 +
+        // κ‖p‖²`: `‖p‖²` is a `d`-term inner product and `κ·‖p‖²` and the sum
+        // round twice more, so `g` errs by `γ_{d+2}(1 + |κ|‖p‖²)` and `λ`
+        // relatively by that over `g`, plus its quotient. `λ²·Σv²` (a sum of
+        // squares) and its two products carry `γ_{d+2}` relative.
+        let conformal = |kappa: f64| {
+            let base_sq = base.dot(&base);
+            let gauge = 1.0 + kappa * base_sq;
+            let lambda_relative =
+                accumulation_growth(base.len() + 2) * (1.0 + kappa.abs() * base_sq) / gauge;
+            (2.0 * lambda_relative + accumulation_growth(base.len() + 4)) * sq_norm
+        };
+        let band = match self {
+            Self::Poincare { curvature, .. } => conformal(*curvature),
+            Self::ConstantCurvature { kappa, .. } => conformal(*kappa),
+            // The embedded metric returns `v` itself, so only `v·v`, a sum of
+            // `nk` squares, rounds.
+            Self::Grassmann { .. } | Self::Stiefel { k: 1, .. } => {
+                accumulation_growth(v.len()) * sq_norm
+            }
+            Self::Stiefel { k, n } => {
+                // `GΔ = Δ − ½·Y(YᵀΔ)` takes `n` products for `YᵀΔ`, `k` for
+                // `Y·(YᵀΔ)`, and one subtraction: it errs by
+                // `γ_{n+k+1}(|Δ| + ½|Y|(|Y|ᵀ|Δ|))` entrywise, and `Δ·GΔ` by
+                // `γ_{nk}·|Δ|·|GΔ|` more.
+                let y = crate::manifold::from_flat(base, *n, *k)?;
+                let delta = crate::manifold::from_flat(v, *n, *k)?;
+                let abs_y = y.mapv(f64::abs);
+                let abs_delta = delta.mapv(f64::abs);
+                let magnitude = &abs_delta + &(abs_y.dot(&abs_y.t().dot(&abs_delta)) * 0.5);
+                let metric = &delta - &(y.dot(&y.t().dot(&delta)) * 0.5);
+                accumulation_growth(n + k + 1) * (&abs_delta * &magnitude).sum()
+                    + accumulation_growth(n * k) * (&abs_delta * &metric.mapv(f64::abs)).sum()
+            }
+            Self::Spd { n } => {
+                // `GU = W U W` with the Gauss–Jordan `W = P⁻¹`. That inverse is
+                // backward stable to `nε·max|p_ij|` per entry, so `‖ΔP‖₂ ≤
+                // γ_{n²}·λ_max`, and `W` moves `tr(UWUW)` by at most `2‖P^{-1/2}ΔP
+                // P^{-1/2}‖₂` of itself, `2γ_{n²}·κ(P)` relative. The two `n`-term
+                // products err by `γ_{2n}|W||U||W|` entrywise, and `U·GU` by
+                // `γ_{n²}·|U|·|GU|` more.
+                let p = crate::manifold::from_flat(base, *n, *n)?;
+                let w = crate::manifold::inverse(&p)?;
+                let u = crate::manifold::from_flat(v, *n, *n)?;
+                let abs_w = w.mapv(f64::abs);
+                let abs_u = u.mapv(f64::abs);
+                let magnitude = abs_w.dot(&abs_u).dot(&abs_w);
+                let metric = w.dot(&u).dot(&w);
+                2.0 * accumulation_growth(n * n) * at.distortion * sq_norm
+                    + accumulation_growth(2 * n) * (&abs_u * &magnitude).sum()
+                    + accumulation_growth(n * n) * (&abs_u * &metric.mapv(f64::abs)).sum()
+            }
+        };
+        if !band.is_finite() {
+            return Err(GeometryError::Singular(
+                "response geometry metric norm has no finite rounding band",
+            ));
+        }
+        Ok(band)
     }
 
     /// The base-point quantities that scale the rounding of every logarithm
@@ -824,9 +897,10 @@ const FRECHET_MEAN_CONTEXT: &str = "response geometry Fréchet mean";
 /// step. It runs in two phases, and each ends on its own progress rather than
 /// on a budget:
 ///
-/// 1. While `V` resolves progress, a step must pass the Armijo test and lower
-///    `V` by more than its round-off cushion. `V ≥ 0` falls by at least that
-///    cushion per step, so the phase is finite.
+/// 1. While `V` resolves progress, a step must lower `V` by more than the
+///    rounding bands of the two dispersions it compares and pass the Armijo
+///    test relaxed by them. The computed `V ≥ 0` strictly falls per step, so
+///    the phase is finite.
 /// 2. Once no backtracked step resolves a decrease of `V`, the residual
 ///    `‖ξ‖_P` carries the progress: a step is accepted when it strictly lowers
 ///    the residual, and a strictly decreasing sequence of doubles is finite.
@@ -953,31 +1027,76 @@ pub(crate) fn response_frechet_mean(
     Ok(p)
 }
 
-/// Weighted dispersion `V(p) = Σ wᵢ ‖log_p(xᵢ)‖²_p` over the positive-mass rows.
+/// A computed weighted dispersion and the rounding band of its evaluation.
+struct Dispersion {
+    value: f64,
+    band: f64,
+}
+
+/// Weighted dispersion `V(p) = Σ wᵢ ‖log_p(xᵢ)‖²_p` over the positive-mass rows,
+/// with the first-order rounding band of its evaluation (#3243).
+///
+/// Each row's computed logarithm `ℓ̂` lies within `δ` of the exact one in the
+/// metric at `p` ([`ResponseManifold::log_rounding_band`]), so its squared norm
+/// moves by `|‖ℓ̂‖² − ‖ℓ‖²| ≤ δ(2‖ℓ̂‖ + δ)`. The computed squared norm of `ℓ̂`
+/// errs by its own band ([`ResponseManifold::sq_metric_norm_rounding_band`]), and
+/// the weighted sum over `m` rows takes each term through at most `m + 1`
+/// roundings.
 fn karcher_dispersion(
     manifold: ResponseManifold,
     values: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
     p: ArrayView1<'_, f64>,
-) -> GeometryResult<f64> {
-    let mut acc = 0.0_f64;
+) -> GeometryResult<Dispersion> {
+    let at = manifold.karcher_base(p)?;
+    let mut value = 0.0_f64;
+    let mut band = 0.0_f64;
+    let mut rows = 0usize;
     for (x, &weight) in values.outer_iter().zip(weights.iter()) {
         if weight == 0.0 {
             continue;
         }
         let lg = manifold.log_point(p, x)?;
-        acc += weight * manifold.sq_metric_norm(p, lg.view())?;
+        let sq_norm = manifold.sq_metric_norm(p, lg.view())?;
+        let distance = sq_norm.sqrt();
+        let log_band = manifold.log_rounding_band(p, x, lg.view(), distance, &at)?;
+        let norm_band = manifold.sq_metric_norm_rounding_band(p, lg.view(), sq_norm, &at)?;
+        value += weight * sq_norm;
+        band += weight * (log_band * (2.0 * distance + log_band) + norm_band);
+        rows += 1;
     }
-    Ok(acc)
+    band += gam_linalg::roundoff::accumulation_growth(rows + 1) * value;
+    Ok(Dispersion { value, band })
+}
+
+/// Whether phase 1 of [`karcher_descent`] accepts the trial dispersion `trial` at
+/// step `t` from `current`, along a Karcher direction of squared norm `pred`
+/// (#3243).
+///
+/// The trial must be resolvably below the current value, `V̂ − V̂' > B + B'`, and
+/// pass the Armijo test `V̂' ≤ V̂ − 2c₁·t·pred`, the decrease `−c₁·t·gᵀd` for
+/// `g = −2ξ`, relaxed by the same `B + B'`: the error two evaluations can carry
+/// (Berahas, Byrd & Nocedal 2019). A step whose only shortfall is rounding is
+/// never refused for it.
+fn phase_one_accepts(current: &Dispersion, trial: &Dispersion, t: f64, pred: f64) -> bool {
+    let bands = current.band + trial.band;
+    current.value - trial.value > bands
+        && trial.value <= current.value - 2.0 * constants::ARMIJO_C1 * t * pred + bands
 }
 
 /// The two-phase Karcher descent of [`response_frechet_mean`] from `start`,
 /// certified by the band `stationarity` reports with each residual. Returns the
 /// certified point with its state, or the typed stall.
 ///
-/// It stops without a budget. Each accepted phase-1 step lowers the computed
-/// `V ≥ 0` by more than its cushion `8ε(1 + V) ≥ 8ε`, so phase 1 takes at most
-/// `V(start)/(8ε)` steps. Each accepted phase-2 step strictly lowers the
+/// Phase 1 judges each trial against the rounding bands `B` of the two
+/// dispersions it compares ([`karcher_dispersion`], #3243). A trial is progress
+/// only when its value is resolvably below the current one, `V̂ − V̂' > B + B'`,
+/// and it must pass the Armijo test relaxed by the same `B + B'`, the error two
+/// evaluations can carry (Berahas, Byrd & Nocedal 2019): a step whose only
+/// shortfall is rounding is never refused for it.
+///
+/// It stops without a budget. Each accepted phase-1 step strictly lowers the
+/// computed `V ≥ 0`, a double, so phase 1 is finite. Each accepted phase-2 step strictly lowers the
 /// computed residual, a non-negative double, and only finitely many doubles lie
 /// below the residual phase 2 starts from. Each backtracking search tries a
 /// bounded number of step lengths.
@@ -991,7 +1110,7 @@ fn karcher_descent(
     let dispersion = |p: ArrayView1<'_, f64>| karcher_dispersion(manifold, values, weights, p);
     let mut p = start;
     let mut state = stationarity(p.view())?;
-    let mut f_cur = dispersion(p.view())?;
+    let mut current = dispersion(p.view())?;
     let mut iterations = 0usize;
 
     // Phase 1: Armijo-backtracked unit Karcher steps exp_p(t·ξ) that lower V by
@@ -1001,7 +1120,9 @@ fn karcher_descent(
     // consulting the acceptance test.
     while !(state.residual <= state.band) {
         let pred = state.residual * state.residual;
-        let f_tol = armijo_roundoff_cushion(f_cur);
+        // `trial` hands the band of the dispersion it just evaluated to `accept`,
+        // which judges that same trial next.
+        let trial_band = Cell::new(f64::NAN);
         let accepted = match backtracking_line_search::<_, Infallible>(
             BacktrackConfig::default(),
             |t| {
@@ -1009,14 +1130,18 @@ fn karcher_descent(
                 let Ok(cand) = manifold.exp_point(p.view(), step.view()) else {
                     return Ok(None);
                 };
-                let Ok(f_cand) = dispersion(cand.view()) else {
+                let Ok(cand_dispersion) = dispersion(cand.view()) else {
                     return Ok(None);
                 };
-                Ok(Some((f_cand, cand)))
+                trial_band.set(cand_dispersion.band);
+                Ok(Some((cand_dispersion.value, (cand, cand_dispersion))))
             },
             |t, f_cand| {
-                f_cand < f_cur - f_tol
-                    && f_cand <= f_cur - 2.0 * constants::ARMIJO_C1 * t * pred + f_tol
+                let trial = Dispersion {
+                    value: f_cand,
+                    band: trial_band.get(),
+                };
+                phase_one_accepts(&current, &trial, t, pred)
             },
         ) {
             Ok(result) => result,
@@ -1025,8 +1150,7 @@ fn karcher_descent(
         let Some(accepted_step) = accepted else {
             break;
         };
-        p = accepted_step.payload;
-        f_cur = accepted_step.value;
+        (p, current) = accepted_step.payload;
         state = stationarity(p.view())?;
         iterations += 1;
     }
@@ -2173,7 +2297,7 @@ mod tests {
     }
 
     /// A Poincaré cloud about a base at radius 0.9 has dispersion `V ≈ 9.4`,
-    /// whose evaluation rounds by more than the Armijo cushion `8ε(1 + V)`. Once
+    /// whose evaluation rounds by more than the former Armijo cushion `8ε(1 + V)`. Once
     /// `‖ξ‖²` fell into that noise, a dispersion-only descent accepted only steps
     /// of `t ≤ 1.9e-9` that left `ξ` unchanged, and it stalled at `‖ξ‖ = 2.9e-7`
     /// until its iteration budget ran out. The residual phase carries the descent
@@ -2194,6 +2318,130 @@ mod tests {
         assert!(
             residual <= 3.0 * band,
             "Poincaré mean residual {residual:.3e} exceeds 3 x its rounding band {band:.3e}"
+        );
+    }
+
+    /// The dispersion's rounding band bounds how far two evaluations of one
+    /// dispersion can differ (#3243). Summing the rows in the opposite order
+    /// rounds differently, and each computed value lies within its own band of
+    /// the exact one, so the two differ by at most the sum of their bands. Every
+    /// metric arm is exercised at a sample of its cloud.
+    ///
+    /// On the Poincaré cloud whose rounding defeated the former Armijo cushion
+    /// `8ε(1 + V)` (see the residual-phase test below), the derived band is
+    /// larger than that cushion: a decrease the cushion called resolved could be
+    /// this evaluation's own rounding.
+    #[test]
+    fn the_dispersion_band_bounds_a_second_evaluation_of_the_same_dispersion_3243() {
+        let poincare = ResponseManifold::Poincare {
+            dim: 5,
+            curvature: -1.0,
+        };
+        let mut poincare_base = Array1::<f64>::zeros(5);
+        poincare_base[0] = 0.9;
+        let poincare_cloud = exp_cloud(poincare, poincare_base.view(), 100, 0.3, 1006);
+        let (c1, s1) = (0.2_f64.cos(), 0.2_f64.sin());
+        let (c2, s2) = (0.3_f64.cos(), 0.3_f64.sin());
+        let unit_cloud = array![[1.0, 0.0, 0.0], [c1, s1, 0.0], [c2, 0.0, s2]];
+        let (c3, s3) = (0.1_f64.cos(), 0.1_f64.sin());
+        let (c4, s4) = (0.12_f64.cos(), 0.12_f64.sin());
+        let frames = array![
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            [c3, 0.0, 0.0, 1.0, s3, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, c4, 0.0, 0.0, 0.0, s4],
+        ];
+        let spd = array![
+            [2.0, 0.0, 0.0, 1.0],
+            [1.0, 0.3, 0.3, 2.0],
+            [3.0, -0.5, -0.5, 1.5],
+        ];
+        let chart = array![[0.1, 0.2], [-0.3, 0.1], [0.2, -0.25]];
+        let cases = [
+            (poincare, poincare_cloud, Some(poincare_base)),
+            (ResponseManifold::Grassmann { k: 1, n: 3 }, unit_cloud.clone(), None),
+            (ResponseManifold::Stiefel { k: 1, n: 3 }, unit_cloud, None),
+            (ResponseManifold::Stiefel { k: 2, n: 4 }, frames, None),
+            (ResponseManifold::Spd { n: 2 }, spd, None),
+            (ResponseManifold::ConstantCurvature { dim: 2, kappa: 0.5 }, chart, None),
+        ];
+        for (manifold, values, base) in cases {
+            let rows = values.nrows();
+            let weights = Array1::from_elem(rows, 1.0 / rows as f64);
+            let base = base.unwrap_or_else(|| values.row(1).to_owned());
+            let reversed = values.slice(ndarray::s![..;-1, ..]).to_owned();
+            let forward = karcher_dispersion(manifold, values.view(), weights.view(), base.view())
+                .expect("the dispersion evaluates");
+            let backward =
+                karcher_dispersion(manifold, reversed.view(), weights.view(), base.view())
+                    .expect("the reversed dispersion evaluates");
+            assert!(
+                forward.band.is_finite() && forward.band > 0.0,
+                "{manifold:?}: the dispersion band {:e} is a positive number",
+                forward.band
+            );
+            let difference = (forward.value - backward.value).abs();
+            assert!(
+                difference <= forward.band + backward.band,
+                "{manifold:?}: two evaluations of V = {:.17e} differ by {difference:.3e}, past \
+                 their bands {:.3e} + {:.3e}",
+                forward.value,
+                forward.band,
+                backward.band,
+            );
+            if manifold == poincare {
+                let former_cushion = 8.0 * f64::EPSILON * (1.0 + forward.value);
+                assert!(
+                    forward.band > former_cushion,
+                    "the Poincaré cloud's band {:.3e} must exceed the former cushion \
+                     {former_cushion:.3e} (V = {:.3e}, reversed-order difference {difference:.3e})",
+                    forward.band,
+                    forward.value,
+                );
+            }
+        }
+    }
+
+    /// Phase 1's acceptance, at its edges (#3243), with bands `B = B' = 1e-12`
+    /// around `V̂ = 1` and unit steps:
+    /// - a trial `1.5e-12` lower is inside `B + B'` and resolves nothing;
+    /// - a trial `3e-12` lower is resolved, but along a direction of squared
+    ///   norm `1e-6` the Armijo test promises `2c₁·1e-6`, far past it plus the
+    ///   bands, so it is refused;
+    /// - the same trial along a direction of squared norm `1e-12` meets the
+    ///   Armijo test and is accepted;
+    /// - a trial `2.1e-12` lower, whose Armijo promise is `2.5e-12`, falls short
+    ///   by less than `B + B'`: the exact test refuses it, the relaxed one
+    ///   accepts it.
+    #[test]
+    fn phase_one_accepts_only_resolved_decrease_and_relaxes_armijo_by_the_bands_3243() {
+        let band = 1.0e-12;
+        let current = Dispersion { value: 1.0, band };
+        let trial = |decrease: f64| Dispersion {
+            value: 1.0 - decrease,
+            band,
+        };
+        assert!(
+            !phase_one_accepts(&current, &trial(1.5 * band), 1.0, 1.0e-12),
+            "a decrease inside the two bands resolves nothing"
+        );
+        assert!(
+            !phase_one_accepts(&current, &trial(3.0 * band), 1.0, 1.0e-6),
+            "a resolved decrease far below the Armijo promise is refused"
+        );
+        assert!(
+            phase_one_accepts(&current, &trial(3.0 * band), 1.0, 1.0e-12),
+            "a resolved decrease meeting the Armijo test is accepted"
+        );
+        // The relaxation: the promise exceeds the realized decrease by less than
+        // the two bands, which the exact test would refuse.
+        let promise = 2.5 * band / (2.0 * constants::ARMIJO_C1);
+        assert!(
+            2.0 * constants::ARMIJO_C1 * promise > 2.1 * band,
+            "the fixture's Armijo promise must exceed a 2.1e-12 decrease"
+        );
+        assert!(
+            phase_one_accepts(&current, &trial(2.1 * band), 1.0, promise),
+            "a step whose Armijo shortfall is within the two bands is not refused for it"
         );
     }
 

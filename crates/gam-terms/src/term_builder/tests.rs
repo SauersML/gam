@@ -5726,3 +5726,113 @@ fn a_tensor_sharing_a_margin_with_a_smooth_rebuilds_from_its_frozen_spec() {
         );
     }
 }
+
+/// Two-level factor frame whose group `a` covariate takes `rows_a` evenly
+/// spaced values over `unique_a` distinct points, and group `b` likewise.
+fn two_group_factor_dataset(
+    (rows_a, unique_a): (usize, usize),
+    (rows_b, unique_b): (usize, usize),
+) -> Dataset {
+    let group_rows = |rows: usize, unique: usize, g: f64| {
+        (0..rows)
+            .map(move |i| {
+                let x = (i % unique) as f64 / (unique - 1) as f64;
+                vec![x + g, x, g]
+            })
+            .collect::<Vec<_>>()
+    };
+    let rows: Vec<Vec<f64>> = group_rows(rows_a, unique_a, 0.0)
+        .into_iter()
+        .chain(group_rows(rows_b, unique_b, 1.0))
+        .collect();
+    Dataset {
+        headers: vec!["y".into(), "x".into(), "g".into()],
+        values: Array2::from_shape_vec(
+            (rows.len(), 3),
+            rows.into_iter().flat_map(|row| row.into_iter()).collect(),
+        )
+        .expect("rectangular two-group factor test data"),
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "x".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "g".into(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["a".into(), "b".into()],
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Categorical,
+        ],
+    }
+}
+
+fn factor_smooth_marginal_dim(spec: &FactorSmoothSpec) -> usize {
+    match spec.marginal.knotspec {
+        BSplineKnotSpec::Generate {
+            num_internal_knots, ..
+        }
+        | BSplineKnotSpec::Automatic {
+            num_internal_knots, ..
+        } => num_internal_knots + spec.marginal.degree + 1,
+        ref other => panic!("unexpected factor-smooth knotspec: {other:?}"),
+    }
+}
+
+/// #3264: the default `fs`/`sz` marginal is the univariate `s()` default on
+/// the least-informed group — the resolution-rate pilot of the smallest
+/// group's row count, held to the least per-group distinct-value support by
+/// the rank bound (a group with `u` distinct values identifies at most `u`
+/// marginal directions). The old rule subtracted two hand-set "residual
+/// points" from that support with a `degree + 2` floor, which both shrank a
+/// well-supported marginal below its pilot and, on a 4-value group, handed
+/// the marginal five functions the data could see only four of.
+#[test]
+fn factor_smooth_default_marginal_is_the_rank_bounded_group_pilot_3264() {
+    let degree = DEFAULT_BSPLINE_DEGREE;
+    let order = DEFAULT_PENALTY_ORDER.min(degree);
+    for formula in ["y ~ s(x, g, bs=fs)", "y ~ s(x, g, bs=sz)"] {
+        // Every group resolves its pilot: the marginal is the pilot of the
+        // smallest group's rows, whatever the pooled column would get.
+        let ds = two_group_factor_dataset((40, 40), (400, 400));
+        let spec = factor_smooth_spec_for(formula, &ds);
+        assert_eq!(
+            factor_smooth_marginal_dim(&spec),
+            pilot_internal_knots(40, degree, order) + degree + 1,
+            "{formula}: well-supported marginal is the smallest group's pilot"
+        );
+
+        // A group with exactly as many distinct values as the pilot keeps the
+        // full pilot (the old `u − 2` rule cut it to five functions).
+        let pilot_dim = pilot_internal_knots(1_000, degree, order) + degree + 1;
+        let ds = two_group_factor_dataset((1_000, pilot_dim), (1_000, 1_000));
+        let spec = factor_smooth_spec_for(formula, &ds);
+        assert_eq!(
+            factor_smooth_marginal_dim(&spec),
+            pilot_dim,
+            "{formula}: marginal at the support bound keeps the pilot"
+        );
+
+        // A group with four distinct values bounds the marginal at four.
+        let ds = two_group_factor_dataset((400, 4), (400, 400));
+        let spec = factor_smooth_spec_for(formula, &ds);
+        assert_eq!(
+            factor_smooth_marginal_dim(&spec),
+            4,
+            "{formula}: marginal is bounded by the least group support"
+        );
+        assert_eq!(spec.marginal.degree, degree);
+    }
+}

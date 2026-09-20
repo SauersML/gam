@@ -213,8 +213,9 @@ class Summary:
         Estimated dispersion :math:`\\hat\\varphi` of the fitted family:
         Gaussian :math:`\\hat\\sigma^2 = \\mathrm{RSS}_w / (n - \\mathrm{edf})`
         (mgcv's ``gam.scale``), Gamma ``1 / shape``, ``1`` for fixed-scale
-        families (Poisson, binomial). ``None`` only for a custom family that
-        declares no dispersion.
+        families (Poisson, binomial). ``None`` exactly when the family's scale
+        contract has no scalar dispersion: a custom family that declares none,
+        or Royston-Parmar survival.
     edf_total : float or None
         Total effective degrees of freedom across all blocks.
     edf_rank_bound : list of mapping
