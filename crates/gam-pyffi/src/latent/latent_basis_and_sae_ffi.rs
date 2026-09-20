@@ -1011,75 +1011,23 @@ fn canonicalize_assignment_kind(kind: &str) -> Result<String, String> {
 // `term.seed_oos_softmax_logits_from_projection_residuals(..)` /
 // `term.seed_oos_ordered_beta_bernoulli_logits_from_projected_decoder_lsq(..)` directly.
 
+/// Parse the Python `gumbel_schedule` dict through the single Rust schedule
+/// descriptor parser shared with the analytic penalty registry's
+/// `temperature_schedule`, so the SAE surface, `gumbel_schedule_tau` and the
+/// penalty descriptors accept and refuse exactly the same schedules.
 fn gumbel_temperature_schedule_from_pydict(
     schedule: Option<&Bound<'_, PyDict>>,
 ) -> Result<Option<GumbelTemperatureSchedule>, String> {
-    fn get<'py>(state: &'py Bound<'py, PyDict>, key: &str) -> Result<Bound<'py, PyAny>, String> {
-        state
-            .get_item(key)
-            .map_err(|err| err.to_string())?
-            .ok_or_else(|| format!("gumbel_schedule is missing key {key:?}"))
-    }
-
     let Some(schedule) = schedule else {
         return Ok(None);
     };
-    let decay_name = get(schedule, "decay")?
-        .extract::<String>()
-        .map_err(|err| err.to_string())?
-        .to_ascii_lowercase()
-        .replace('-', "_");
-    let tau_start = get(schedule, "tau_start")?
-        .extract::<f64>()
-        .map_err(|err| err.to_string())?;
-    let tau_min = match schedule
-        .get_item("tau_min")
-        .map_err(|err| err.to_string())?
-    {
-        Some(value) => value.extract::<f64>().map_err(|err| err.to_string())?,
-        None => return Err("gumbel_schedule is missing key \"tau_min\"".to_string()),
-    };
-    let decay = match decay_name.as_str() {
-        "geometric" => {
-            // Prefer the (tau_start, tau_min, steps) endpoints spec and derive
-            // the rate here; fall back to an explicit `rate` (default 0.9).
-            let steps = match schedule.get_item("steps").map_err(|err| err.to_string())? {
-                Some(value) => Some(value.extract::<usize>().map_err(|err| err.to_string())?),
-                None => None,
-            };
-            let rate = match steps {
-                Some(steps) => ScheduleKind::geometric_rate_from_steps(tau_start, tau_min, steps),
-                None => match schedule.get_item("rate").map_err(|err| err.to_string())? {
-                    Some(value) => value.extract::<f64>().map_err(|err| err.to_string())?,
-                    None => 0.9,
-                },
-            };
-            ScheduleKind::Geometric { rate }
-        }
-        "linear" => {
-            let steps = get(schedule, "steps")?
-                .extract::<usize>()
-                .map_err(|err| err.to_string())?;
-            ScheduleKind::Linear { steps }
-        }
-        "reciprocal_iter" => ScheduleKind::ReciprocalIter,
-        other => {
-            return Err(format!(
-                "gumbel_schedule decay must be 'geometric', 'linear', or 'reciprocal_iter'; got {other:?}"
-            ));
-        }
-    };
-    let mut schedule_out = GumbelTemperatureSchedule::new(tau_start, tau_min, decay)?;
-    if let Some(iter_count) = schedule
-        .get_item("iter_count")
-        .map_err(|err| err.to_string())?
-    {
-        schedule_out.iter_count = iter_count
-            .extract::<usize>()
-            .map_err(|err| err.to_string())?;
-        schedule_out.validate()?;
-    }
-    Ok(Some(schedule_out))
+    let raw = crate::manifold::manifold_sae_coercion::py_any_to_json_value(schedule.as_any())
+        .map_err(|err| format!("gumbel_schedule: {err}"))?;
+    gam::families::fit_orchestration::descriptors::gumbel_temperature_schedule_from_json(
+        &raw,
+        "gumbel_schedule",
+    )
+    .map(Some)
 }
 
 fn structured_residual_pass_diagnostics_dict<'py>(

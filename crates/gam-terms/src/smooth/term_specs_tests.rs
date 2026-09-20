@@ -974,15 +974,15 @@ mod factor_smooth_null_component_tests {
         Array1::from(vec![0.0, 0.0, 0.0, 0.0, 0.2, 0.45, 0.6, 1.0, 1.0, 1.0, 1.0])
     }
 
-    /// `double_penalty` as the DSL defaults it: on for `fs` (it gates the
-    /// per-component null penalties), off for `sz` (whose pooled null-function
-    /// penalties are emitted unconditionally).
-    fn marginal(double_penalty: bool) -> BSplineBasisSpec {
+    /// `double_penalty` as the DSL defaults it for every factor-smooth
+    /// flavour: on. It is the single switch for the null-space penalties of
+    /// both `fs` (per-component) and `sz` (pooled zero-sum ridges, #3969).
+    fn marginal() -> BSplineBasisSpec {
         BSplineBasisSpec {
             degree: DEGREE,
             penalty_order: 2,
             knotspec: BSplineKnotSpec::Provided(knots()),
-            double_penalty,
+            double_penalty: true,
             identifiability: BSplineIdentifiability::None,
             boundary: crate::basis::OneDimensionalBoundary::Open,
             boundary_conditions: crate::basis::BSplineBoundaryConditions::default(),
@@ -1004,7 +1004,7 @@ mod factor_smooth_null_component_tests {
         let spec = FactorSmoothSpec {
             continuous_cols: vec![0],
             group_col: 1,
-            marginal: marginal(matches!(flavour, FactorSmoothFlavour::Fs { .. })),
+            marginal: marginal(),
             flavour,
             group_frozen_levels: None,
             frozen_global_orthogonality: None,

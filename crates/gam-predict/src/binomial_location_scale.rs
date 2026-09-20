@@ -94,10 +94,11 @@ impl BinomialLocationScalePredictor {
 
 impl BinomialLocationScalePredictor {
 
-    /// Plug-in probability point + (covariance-derived) response-scale SE via
-    /// the threshold/scale/wiggle chain rule. The η SE is reported equal to the
-    /// response SE because the threshold-scale η interval is not meaningful on
-    /// the probability scale and is collapsed onto the point predictor.
+    /// Plug-in probability point + (covariance-derived) η and response-scale
+    /// SEs via the threshold/scale/wiggle chain rule. The η SE is the SE of the
+    /// reported η itself (the wiggle-warped standardized threshold), not the
+    /// probability SE: the η interval is collapsed onto the point predictor,
+    /// but `eta_se` is still published as the link-scale SE(η) column.
     fn plugin_state_from_covariance(
         &self,
         input: &PredictInput,
@@ -106,19 +107,18 @@ impl BinomialLocationScalePredictor {
         Ok(LinearState {
             eta: with_se.eta,
             mean: with_se.mean,
-            eta_se: with_se.mean_se.clone(),
+            eta_se: with_se.eta_se,
             mean_se: with_se.mean_se,
             covariance_source: InferenceCovarianceMode::Conditional,
         })
     }
-    fn response_se_from_backend(
+    fn eta_se_from_backend(
         &self,
         input: &PredictInput,
         backend: &PredictionCovarianceBackend<'_>,
         q0_base: &Array1<f64>,
         sigma: &Array1<f64>,
         eta_t: &Array1<f64>,
-        dmu_deta: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         let n = eta_t.len();
         let p_t = self.beta_threshold.len();
@@ -143,7 +143,6 @@ impl BinomialLocationScalePredictor {
             let q0_chunk = q0_base.slice(ndarray::s![rows.clone()]).to_owned();
             let sigma_chunk = sigma.slice(ndarray::s![rows.clone()]);
             let eta_t_chunk = eta_t.slice(ndarray::s![rows.clone()]);
-            let dmu_chunk = dmu_deta.slice(ndarray::s![rows.clone()]);
             let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
                 Some(runtime.design(&q0_chunk)?)
             } else {
@@ -157,7 +156,6 @@ impl BinomialLocationScalePredictor {
             let rows_in_chunk = q0_chunk.len();
             let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
             for i in 0..rows_in_chunk {
-                let dphi = dmu_chunk[i];
                 let scale = dq_dq0[i];
                 // The predicted value is built from the CLAMPED standardized
                 // argument (see `compute_q0_and_sigma`), so the differentiated
@@ -173,17 +171,17 @@ impl BinomialLocationScalePredictor {
                 } else {
                     0.0
                 };
-                let dprob_deta_t = dphi * scale * dclamp * (-1.0 / sigma_chunk[i]);
-                let dprob_deta_s = dphi * scale * dclamp * (eta_t_chunk[i] / sigma_chunk[i]);
+                let dq_deta_t = scale * dclamp * (-1.0 / sigma_chunk[i]);
+                let dq_deta_s = scale * dclamp * (eta_t_chunk[i] / sigma_chunk[i]);
                 for j in 0..p_t {
-                    grad[[i, j]] = dprob_deta_t * x_t[[i, j]];
+                    grad[[i, j]] = dq_deta_t * x_t[[i, j]];
                 }
                 for j in 0..p_s {
-                    grad[[i, p_t + j]] = dprob_deta_s * x_s[[i, j]];
+                    grad[[i, p_t + j]] = dq_deta_s * x_s[[i, j]];
                 }
                 if let Some(wd) = wiggle_design.as_ref() {
                     for j in 0..p_w {
-                        grad[[i, p_t + p_s + j]] = dphi * wd[[i, j]];
+                        grad[[i, p_t + p_s + j]] = wd[[i, j]];
                     }
                 }
             }
@@ -191,18 +189,20 @@ impl BinomialLocationScalePredictor {
         })
     }
 
-    /// Delta-method response-scale SE for the binomial-LS probability from an
+    /// Delta-method `(SE(η), SE(μ))` for the binomial-LS prediction from an
     /// arbitrary covariance `backend`, via the threshold/scale/wiggle chain
     /// rule. Shared by the conditional point path and the mode-selecting
     /// full-uncertainty path.
-    fn mean_se_from_backend(
+    fn eta_and_mean_se_from_backend(
         &self,
         input: &PredictInput,
         backend: &PredictionCovarianceBackend<'_>,
-    ) -> Result<Array1<f64>, EstimationError> {
+    ) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
         let (q0_base, sigma, eta_t) = self.compute_q0_and_sigma(input)?;
         let (_, _, dmu_deta) = self.apply_link_with_d1(&q0_base)?;
-        self.response_se_from_backend(input, backend, &q0_base, &sigma, &eta_t, &dmu_deta)
+        let eta_se = self.eta_se_from_backend(input, backend, &q0_base, &sigma, &eta_t)?;
+        let mean_se = &eta_se * &dmu_deta.mapv(f64::abs);
+        Ok((eta_se, mean_se))
     }
 
     fn predict_with_uncertainty_inner(
@@ -212,17 +212,18 @@ impl BinomialLocationScalePredictor {
         let (q0_base, _, _) = self.compute_q0_and_sigma(input)?;
         let (eta, prob, _) = self.apply_link_with_d1(&q0_base)?;
 
-        let mean_se = if let Some(ref cov) = self.covariance {
+        let (eta_se, mean_se) = if let Some(ref cov) = self.covariance {
             let backend = PredictionCovarianceBackend::from_dense(cov.view());
-            Some(self.mean_se_from_backend(input, &backend)?)
+            let (eta_se, mean_se) = self.eta_and_mean_se_from_backend(input, &backend)?;
+            (Some(eta_se), Some(mean_se))
         } else {
-            None
+            (None, None)
         };
 
         Ok(PredictionWithSE {
             eta,
             mean: prob,
-            eta_se: None,
+            eta_se,
             mean_se,
         })
     }
@@ -263,8 +264,8 @@ impl BinomialLocationScalePredictor {
             "binomial location-scale posterior mean",
         )?;
 
-        let eta_se =
-            self.response_se_from_backend(input, &backend, &q0_base, &sigma, &eta_t, &dmu_deta)?;
+        let eta_se = self.eta_se_from_backend(input, &backend, &q0_base, &sigma, &eta_t)?;
+        let mean_se = &eta_se * &dmu_deta.mapv(f64::abs);
 
         let mean = if self.link_wiggle.is_none() {
             let (var_t, var_s, cov_ts) = project_two_block_linear_predictor_covariance(
@@ -446,17 +447,15 @@ impl BinomialLocationScalePredictor {
             }
             out
         };
-        // Binomial location-scale eta_se is response-scale (dprob/dθ chain
-        // rule), so bounds are mean ± z·se clamped to [0, 1]. The threshold-scale
-        // η interval is not meaningful, so it is collapsed onto the point
-        // predictor and uncertainty flows through the delta-method response SE.
-        // The response-scale `eta_se` is reported as both the η and mean SE so
-        // the collapsed-delta policy carries it through unchanged.
+        // The response bounds are mean ± z·SE(μ) clamped to [0, 1], with SE(μ)
+        // the delta-method dprob/dθ chain rule. The threshold-scale η interval
+        // is collapsed onto the point predictor, but `eta_se` stays the SE of
+        // the reported η (dq/dθ), since it is published as SE(η).
         Ok(LinearState {
             eta,
             mean,
-            eta_se: Some(eta_se.clone()),
-            mean_se: Some(eta_se),
+            eta_se: Some(eta_se),
+            mean_se: Some(mean_se),
             covariance_source: InferenceCovarianceMode::Conditional,
         })
     }
@@ -477,7 +476,7 @@ impl PredictionTransform for BinomialLocationScalePredictor {
     ) -> Result<LinearState, EstimationError> {
         match pass {
             PredictPass::FullUncertainty => {
-                // Build the response-scale SE from the requested covariance mode
+                // Build the η and response-scale SEs from the requested covariance mode
                 // and report which covariance was used. The full-uncertainty
                 // path always has a fit (with at least a conditional backend);
                 // when no covariance can be formed at all this surfaces a clean
@@ -492,12 +491,12 @@ impl PredictionTransform for BinomialLocationScalePredictor {
                 )?;
                 let (q0_base, _, _) = self.compute_q0_and_sigma(input)?;
                 let (eta, prob) = self.apply_link(&q0_base)?;
-                let response_se = self.mean_se_from_backend(input, &backend)?;
+                let (eta_se, mean_se) = self.eta_and_mean_se_from_backend(input, &backend)?;
                 Ok(LinearState {
                     eta,
                     mean: prob,
-                    eta_se: Some(response_se.clone()),
-                    mean_se: Some(response_se),
+                    eta_se: Some(eta_se),
+                    mean_se: Some(mean_se),
                     covariance_source,
                 })
             }
@@ -572,15 +571,150 @@ impl PredictableModel for BinomialLocationScalePredictor {
         predict_posterior_mean_generic(self, input, fit, options)
     }
 
-    fn n_blocks(&self) -> usize {
-        if self.link_wiggle.is_some() { 3 } else { 2 }
-    }
+}
 
-    fn block_roles(&self) -> Vec<BlockRole> {
-        if self.link_wiggle.is_some() {
-            vec![BlockRole::Location, BlockRole::Scale, BlockRole::LinkWiggle]
-        } else {
-            vec![BlockRole::Location, BlockRole::Scale]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gam_spec::StandardLink;
+    use ndarray::array;
+
+    /// The reported η is the standardized threshold `q0 = -η_t/σ`, so its SE
+    /// is the link-scale `√(g Σ gᵀ)` with `g = (-1/σ, η_t/σ)`, not the
+    /// probability SE `φ(q0)·SE(q0)` that is reported as the mean SE.
+    #[test]
+    fn eta_standard_error_is_link_scale_not_probability_scale() {
+        let predictor = BinomialLocationScalePredictor {
+            beta_threshold: array![-0.5],
+            beta_noise: array![0.0],
+            covariance: Some(array![[0.04, 0.0], [0.0, 0.09]]),
+            inverse_link: InverseLink::Standard(StandardLink::Probit),
+            link_wiggle: None,
+        };
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0]]),
+            offset: array![0.0],
+            design_noise: Some(DesignMatrix::from(array![[1.0]])),
+            offset_noise: Some(array![0.0]),
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        };
+        // σ = 1, η_t = -0.5, q0 = 0.5: Var(q0) = 1·0.04 + 0.25·0.09.
+        let expected_eta_se = (0.04_f64 + 0.25 * 0.09).sqrt();
+        let density = (-0.5_f64 * 0.5 * 0.5).exp() / (2.0 * std::f64::consts::PI).sqrt();
+        let expected_mean_se = density * expected_eta_se;
+
+        let out = predictor
+            .predict_with_uncertainty(&input)
+            .expect("binomial location-scale uncertainty");
+        assert!((out.eta[0] - 0.5).abs() <= 1e-12);
+        let eta_se = out.eta_se.expect("eta_se should be present");
+        let mean_se = out.mean_se.expect("mean_se should be present");
+        assert!(
+            (eta_se[0] - expected_eta_se).abs() <= 1e-12,
+            "eta_se {}",
+            eta_se[0]
+        );
+        assert!(
+            (mean_se[0] - expected_mean_se).abs() <= 1e-12,
+            "mean_se {}",
+            mean_se[0]
+        );
+
+        let state = predictor.point_state(&input).expect("point state");
+        let state_eta_se = state.eta_se.expect("point-state eta_se");
+        assert!((state_eta_se[0] - expected_eta_se).abs() <= 1e-12);
+        assert!((state.mean_se.expect("point-state mean_se")[0] - expected_mean_se).abs() <= 1e-12);
+    }
+    #[test]
+    fn eta_chain_rule_keeps_cross_covariance_in_every_pass() {
+        for cross in [-0.02, 0.02] {
+            let covariance = array![[0.04, cross], [cross, 0.09]];
+            let predictor = BinomialLocationScalePredictor {
+                beta_threshold: array![-0.5],
+                beta_noise: array![2.0_f64.ln()],
+                covariance: Some(covariance.clone()),
+                inverse_link: InverseLink::Standard(StandardLink::Probit),
+                link_wiggle: None,
+            };
+            let input = PredictInput {
+                design: DesignMatrix::from(array![[1.0]]), offset: array![0.0],
+                design_noise: Some(DesignMatrix::from(array![[1.0]])),
+                offset_noise: Some(array![0.0]), auxiliary_scalar: None, auxiliary_matrix: None,
+            };
+            let gradient = array![-0.5, -0.25];
+            let expected_eta_se = gradient.dot(&covariance.dot(&gradient)).sqrt();
+            let density = (-0.5_f64 * 0.25 * 0.25).exp() / (2.0 * std::f64::consts::PI).sqrt();
+            let fit = crate::tests::test_fit_with_covariance(array![-0.5, 2.0_f64.ln()], covariance);
+            for state in [
+                predictor.point_state(&input).unwrap(),
+                predictor.linear_state(&input, &fit, PredictPass::FullUncertainty, InferenceCovarianceMode::Conditional).unwrap(),
+                predictor.linear_state(&input, &fit, PredictPass::PosteriorMean, InferenceCovarianceMode::Conditional).unwrap(),
+            ] {
+                assert!((state.eta_se.unwrap()[0] - expected_eta_se).abs() < 1e-12);
+                assert!((state.mean_se.unwrap()[0] - density * expected_eta_se).abs() < 1e-12);
+            }
         }
     }
+
+    #[test]
+    fn eta_chain_rule_matches_curved_wiggle_finite_difference() {
+        let knots = array![-2.0, -2.0, -2.0, -2.0, -0.7, 0.3, 1.1, 2.0, 2.0, 2.0, 2.0];
+        let width = gam_models::wiggle::monotone_wiggle_basis_with_derivative_order(array![0.0].view(), &knots, 3, 0).unwrap().ncols();
+        let mut coefficients = Array1::zeros(2 + width);
+        coefficients[0] = -0.4;
+        coefficients[1] = 0.1;
+        for j in 0..width { coefficients[2 + j] = 0.35 + 0.11 * j as f64; }
+        let covariance = Array2::eye(coefficients.len()) * 0.002 + Array2::from_elem((coefficients.len(), coefficients.len()), 0.0003);
+        let make = |beta: &Array1<f64>| BinomialLocationScalePredictor {
+            beta_threshold: array![beta[0]], beta_noise: array![beta[1]],
+            covariance: Some(covariance.clone()),
+            inverse_link: InverseLink::Standard(StandardLink::Probit),
+            link_wiggle: Some(SavedLinkWiggleRuntime {
+                knots: knots.to_vec(), degree: 3, penalty_metadata: None,
+                beta: beta.iter().skip(2).copied().collect(), index_shift: None,
+            }),
+        };
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0]]), offset: array![0.05],
+            design_noise: Some(DesignMatrix::from(array![[1.0]])),
+            offset_noise: Some(array![0.0]), auxiliary_scalar: None, auxiliary_matrix: None,
+        };
+        let mut gradient = Array1::zeros(coefficients.len());
+        let step = 1e-5;
+        for j in 0..coefficients.len() {
+            let mut plus = coefficients.clone(); plus[j] += step;
+            let mut minus = coefficients.clone(); minus[j] -= step;
+            let evaluate = |beta: &Array1<f64>| {
+                let predictor = make(beta);
+                let (q0, _, _) = predictor.compute_q0_and_sigma(&input).unwrap();
+                predictor.apply_link(&q0).unwrap().0[0]
+            };
+            gradient[j] = (evaluate(&plus) - evaluate(&minus)) / (2.0 * step);
+        }
+        let expected = gradient.dot(&covariance.dot(&gradient)).sqrt();
+        let out = make(&coefficients).predict_with_uncertainty(&input).unwrap();
+        assert!((out.eta_se.unwrap()[0] - expected).abs() < 1e-7);
+        let density = (-0.5 * out.eta[0].powi(2)).exp() / (2.0 * std::f64::consts::PI).sqrt();
+        assert!((out.mean_se.unwrap()[0] - density * expected).abs() < 1e-7);
+    }
+
+    #[test]
+    fn clamped_eta_has_zero_threshold_and_scale_uncertainty() {
+        let predictor = BinomialLocationScalePredictor {
+            beta_threshold: array![-2.0 * SURVIVAL_STANDARDIZED_ARG_CLAMP],
+            beta_noise: array![0.0], covariance: Some(Array2::eye(2)),
+            inverse_link: InverseLink::Standard(StandardLink::Probit), link_wiggle: None,
+        };
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0]]), offset: array![0.0],
+            design_noise: Some(DesignMatrix::from(array![[1.0]])),
+            offset_noise: Some(array![0.0]), auxiliary_scalar: None, auxiliary_matrix: None,
+        };
+        let out = predictor.predict_with_uncertainty(&input).unwrap();
+        assert_eq!(out.eta[0], SURVIVAL_STANDARDIZED_ARG_CLAMP);
+        assert_eq!(out.eta_se.unwrap()[0], 0.0);
+        assert_eq!(out.mean_se.unwrap()[0], 0.0);
+    }
+
 }

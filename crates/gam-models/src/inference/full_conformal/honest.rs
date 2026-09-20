@@ -95,6 +95,7 @@ use faer::Side;
 use ndarray::{Array1, Array2};
 
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
+use gam_math::special::softplus;
 
 use super::{
     ConformalInterval, ExactGaussianFullConformal, FullConformalSet, required_dominating_count,
@@ -334,15 +335,6 @@ fn logistic_pair(x: f64) -> (f64, f64) {
     let small = e / (1.0 + e);
     let large = 1.0 / (1.0 + e);
     if x >= 0.0 { (large, small) } else { (small, large) }
-}
-
-/// `ln(1 + eˣ)` without overflow or cancellation.
-fn softplus(x: f64) -> f64 {
-    if x > 0.0 {
-        x + (-x).exp().ln_1p()
-    } else {
-        x.exp().ln_1p()
-    }
 }
 
 impl Affine {

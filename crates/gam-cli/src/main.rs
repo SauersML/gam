@@ -20,7 +20,6 @@ pub(crate) use gam::sample::NutsConfig;
 
 pub(crate) use gam::data::{
     EncodedDataset as Dataset, UnseenCategoryPolicy,
-    load_dataset_projected as load_dataset_auto_projected,
     load_dataset_projected_with_categorical_roles as load_dataset_auto_projected_with_categorical_roles,
     load_datasetwith_schema_projected as load_dataset_auto_with_schema_projected,
 };
@@ -35,7 +34,6 @@ pub(crate) use gam::inference::model::{
     FittedFamily, FittedModel as SavedModel, FittedModelPayload, PredictModelClass,
     load_survival_time_basis_config_from_model,
 };
-pub(crate) use gam_data::ColumnKindTag;
 
 pub(crate) use gam::inference::model_payload_builders::{
     StandardPayloadInputs,

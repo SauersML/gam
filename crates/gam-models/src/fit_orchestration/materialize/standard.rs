@@ -252,59 +252,68 @@ pub(crate) fn materialize_standard<'a>(
     options.resource_policy = policy.clone();
     let kappa_options = config.spatial_optimization.clone();
 
-    let wiggle = effective_linkwiggle.as_ref().and_then(|cfg| {
-        if !family.is_binomial() {
-            return None;
-        }
-        let link_kind = match link_choice.as_ref() {
-            Some(c) => match StandardLink::try_from(c.link) {
-                Ok(std_link) => InverseLink::Standard(std_link),
-                // linkwiggle is gated by `linkname_supports_joint_wiggle` which
-                // rejects Sas / BetaLogistic upstream, so reaching this arm
-                // means the gate was bypassed.
-                Err(_) => return None,
-            },
-            None => {
-                if let Some(state) = latent_cloglog {
-                    InverseLink::LatentCLogLog(state)
-                } else {
-                    InverseLink::Standard(StandardLink::Logit)
+    let wiggle = match effective_linkwiggle.as_ref() {
+        Some(cfg) if family.is_binomial() => {
+            let link_kind = match link_choice.as_ref() {
+                Some(c) => match StandardLink::try_from(c.link) {
+                    Ok(std_link) => InverseLink::Standard(std_link),
+                    // The parse gate `linkname_supports_joint_wiggle` covers only a
+                    // flexible link. An explicit `linkwiggle(...)` term beside a
+                    // strict sas / beta-logistic link has no joint solve, so it is
+                    // refused rather than dropped from the fit.
+                    Err(_) => {
+                        return Err(WorkflowError::InvalidConfig {
+                            reason: format!(
+                                "linkwiggle(...) is not supported with link '{}'; the link \
+                                 wiggle is jointly fit only on a standard link",
+                                c.link.name()
+                            ),
+                        });
+                    }
+                },
+                None => {
+                    if let Some(state) = latent_cloglog {
+                        InverseLink::LatentCLogLog(state)
+                    } else {
+                        InverseLink::Standard(StandardLink::Logit)
+                    }
                 }
-            }
-        };
-        Some(StandardBinomialWiggleConfig {
-            link_kind,
-            wiggle: LinkWiggleConfig {
-                degree: cfg.degree,
-                num_internal_knots: cfg.num_internal_knots,
-                penalty_orders: cfg.penalty_orders.clone(),
-                double_penalty: cfg.double_penalty,
-            },
-            // The second-stage refit options live inside the wiggle config so
-            // the pilot can't be configured without them (see
-            // `StandardBinomialWiggleConfig` doc + #320). Magic-by-default:
-            // no caller-supplied options are required for the Python /
-            // formula-DSL path.
-            refit_options: BlockwiseFitOptions {
-                // The link-wiggle refit is a custom-family solve, and
-                // `BlockwiseFitOptions::default()` leaves `compute_covariance`
-                // OFF -- which makes `compute_joint_covariance_required` return
-                // `Ok(None)` and strands the saved model with no joint
-                // covariance at all. Every other custom-family consumer whose
-                // saved model has to serve inference (marginal-slope,
-                // multinomial, location-scale) turns it on explicitly. A fitted
-                // link-wiggle model owes external callers its
-                // `[Mean, LinkWiggle]` variance and mean--wiggle cross terms, so
-                // it must too (#2299). The posterior mean is the default
-                // estimand for this curved link, so covariance factorization is
-                // part of fit assembly: an improper or unfactorizable posterior
-                // refuses the fit instead of minting a mode-only artifact.
-                compute_covariance: true,
-                persistent_warm_start_store: config.persistent_warm_start_store.clone(),
-                ..BlockwiseFitOptions::default()
-            },
-        })
-    });
+            };
+            Some(StandardBinomialWiggleConfig {
+                link_kind,
+                wiggle: LinkWiggleConfig {
+                    degree: cfg.degree,
+                    num_internal_knots: cfg.num_internal_knots,
+                    penalty_orders: cfg.penalty_orders.clone(),
+                    double_penalty: cfg.double_penalty,
+                },
+                // The second-stage refit options live inside the wiggle config so
+                // the pilot can't be configured without them (see
+                // `StandardBinomialWiggleConfig` doc + #320). Magic-by-default:
+                // no caller-supplied options are required for the Python /
+                // formula-DSL path.
+                refit_options: BlockwiseFitOptions {
+                    // The link-wiggle refit is a custom-family solve, and
+                    // `BlockwiseFitOptions::default()` leaves `compute_covariance`
+                    // OFF -- which makes `compute_joint_covariance_required` return
+                    // `Ok(None)` and strands the saved model with no joint
+                    // covariance at all. Every other custom-family consumer whose
+                    // saved model has to serve inference (marginal-slope,
+                    // multinomial, location-scale) turns it on explicitly. A fitted
+                    // link-wiggle model owes external callers its
+                    // `[Mean, LinkWiggle]` variance and mean--wiggle cross terms, so
+                    // it must too (#2299). The posterior mean is the default
+                    // estimand for this curved link, so covariance factorization is
+                    // part of fit assembly: an improper or unfactorizable posterior
+                    // refuses the fit instead of minting a mode-only artifact.
+                    compute_covariance: true,
+                    persistent_warm_start_store: config.persistent_warm_start_store.clone(),
+                    ..BlockwiseFitOptions::default()
+                },
+            })
+        }
+        _ => None,
+    };
 
     // Borrow the caller's projected matrix for the ordinary path. Latent
     // coordinates create an augmented matrix locally, so move that one owned
@@ -324,7 +333,6 @@ pub(crate) fn materialize_standard<'a>(
             offset: Arc::new(offset),
             spec,
             family,
-            estimate_tweedie_p: false,
             options,
             kappa_options,
             wiggle,
@@ -335,4 +343,71 @@ pub(crate) fn materialize_standard<'a>(
         inference_notes,
         unidentified_scalar_terms: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod linkwiggle_link_tests {
+    //! An explicit `linkwiggle(...)` term is fitted or refused, never dropped.
+    use super::*;
+    use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
+    use ndarray::Array2;
+
+    fn binary_dataset() -> Dataset {
+        let b = [0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+        let x = [-1.0, -0.7, -0.4, -0.2, 0.0, 0.1, 0.3, 0.5, 0.8, 1.0];
+        let kinds = [ColumnKindTag::Binary, ColumnKindTag::Continuous];
+        Dataset {
+            headers: vec!["b".to_string(), "x".to_string()],
+            values: Array2::from_shape_fn((b.len(), 2), |(i, j)| [b[i], x[i]][j]),
+            schema: DataSchema {
+                columns: ["b", "x"]
+                    .iter()
+                    .zip(kinds)
+                    .map(|(name, kind)| SchemaColumn {
+                        name: name.to_string(),
+                        kind,
+                        levels: vec![],
+                    })
+                    .collect(),
+            },
+            column_kinds: kinds.to_vec(),
+        }
+    }
+
+    fn binomial() -> FitConfig {
+        FitConfig {
+            family: Some("binomial".to_string()),
+            ..FitConfig::default()
+        }
+    }
+
+    #[test]
+    fn an_explicit_linkwiggle_beside_a_strict_sas_or_beta_logistic_link_is_refused() {
+        let data = binary_dataset();
+        for link in ["sas", "beta-logistic"] {
+            let formula = format!("b ~ x + linkwiggle(internal_knots=4) + link(type={link})");
+            let message = match materialize(&formula, &data, &binomial()) {
+                Ok(_) => panic!("`{formula}` must refuse the link wiggle, not drop it"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                message.contains("linkwiggle(...) is not supported with link"),
+                "`{formula}`: unexpected refusal: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_linkwiggle_on_a_standard_link_reaches_the_request() {
+        let data = binary_dataset();
+        let model = materialize("b ~ x + linkwiggle(internal_knots=4)", &data, &binomial())
+            .expect("binomial linkwiggle materialization");
+        let FitRequest::Standard(request) = model.request else {
+            panic!("a binomial linkwiggle fit must be a standard request");
+        };
+        assert!(
+            request.wiggle.is_some(),
+            "the explicit linkwiggle(...) term must reach the fit"
+        );
+    }
 }

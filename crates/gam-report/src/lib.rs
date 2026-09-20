@@ -1344,9 +1344,17 @@ pub fn format_significant(value: f64) -> String {
         return "0".to_string();
     }
 
-    let exponent = value.abs().log10().floor() as i32;
+    // %g chooses notation AFTER rounding to the requested significant
+    // digits. In particular, 999999.6 rounds into the scientific range and
+    // 9.999996e-5 rounds into the fixed range.
+    let raw = format!("{:.5e}", value);
+    let exponent: i32 = raw
+        .split_once('e')
+        .expect("Rust scientific formatting includes an exponent")
+        .1
+        .parse()
+        .expect("Rust scientific formatting emits an integer exponent");
     let mut out = if !(-4..6).contains(&exponent) {
-        let raw = format!("{:.5e}", value);
         normalize_exponent(&raw)
     } else {
         let places = (6 - exponent - 1).max(0) as usize;
@@ -1811,4 +1819,31 @@ mod tests {
             "non-converged fit must show conv-warn class"
         );
     }
+    #[test]
+    fn significant_notation_uses_the_rounded_decimal_exponent() {
+        for (value, expected) in [
+            (999999.4, "999999"), (999999.6, "1e+06"),
+            (-999999.6, "-1e+06"), (0.00009999994, "9.99999e-05"),
+            (0.00009999996, "0.0001"), (-0.00009999996, "-0.0001"),
+            (f64::from_bits(1), "4.94066e-324"),
+            (f64::MIN_POSITIVE, "2.22507e-308"),
+            (f64::MAX, "1.79769e+308"),
+        ] {
+            assert_eq!(format_significant(value), expected, "value={value}");
+        }
+    }
+
+    #[test]
+    fn basis_evidence_has_no_report_invented_significance_level() {
+        let mut input = minimal_input("y ~ s(x)");
+        input.basis_checks = vec![BasisCheckRow {
+            name: "s(x)".to_string(), basis_dim: 10, nullspace_dim: 1,
+            edf: Some(4.0), enrichment_rank: Some(3), statistic: Some(12.0),
+            p_value: Some(1e-5), provenance: "test ran".to_string(),
+        }];
+        let html = render_html(&input).unwrap();
+        assert!(html.contains("1.000e-5"));
+        assert!(!html.contains("<strong>1.000e-5</strong>"));
+    }
+
 }

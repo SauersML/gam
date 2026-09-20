@@ -528,7 +528,7 @@ pub(crate) fn vec_norm(v: &Array1<f64>) -> f64 {
     v.dot(v).sqrt()
 }
 
-use gam_linalg::utils::stable_softplus as softplus;
+use gam_math::special::softplus;
 
 /// Canonical-link GLM families supported by the certified z-homotopy
 /// ([`GlmHomotopyFullConformal`]). Canonical links make the candidate

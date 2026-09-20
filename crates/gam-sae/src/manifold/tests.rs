@@ -178,7 +178,7 @@ pub(crate) fn k1_gate_modes_do_not_pin_assignment_to_one() {
     .unwrap();
     assert_abs_diff_eq!(
         jr.try_assignments_row(0).unwrap()[0],
-        gam_linalg::utils::stable_logistic(-1.0),
+        gam_math::special::logistic(-1.0),
         epsilon = 1e-12
     );
 
@@ -217,7 +217,7 @@ pub(crate) fn smooth_threshold_gate_is_centered_at_threshold() {
     // Below threshold the same smooth scalar remains positive and exact.
     assert_abs_diff_eq!(
         gates[1],
-        gam_linalg::utils::stable_logistic(-1.0),
+        gam_math::special::logistic(-1.0),
         epsilon = 1e-12
     );
 }

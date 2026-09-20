@@ -822,6 +822,28 @@ pub(crate) fn validate_tweedie_responses(
 pub(crate) use gam_math::special::trigamma;
 pub(crate) use gam_math::special::{pentagamma as polygamma3, tetragamma as polygamma2};
 
+/// Fisher `dW/dη` and `d²W/dη²` of a Beta(μφ, (1−μ)φ) row under the logit link,
+/// where `W = ω φ² q² (ψ₁(a) + ψ₁(b))`, `a = μφ`, `b = (1−μ)φ` and `q = μ(1−μ)`.
+///
+/// Each unshifted polygamma carries a pole `k!/x^{k+1}`, and the logit
+/// identities make `φ²q²(1/a² + 1/b²) = μ² + (1−μ)²` exactly O(1). So in either
+/// tail the unshifted terms of `c` and `d` are each O(1) and cancel down to an
+/// O(q) answer: the condition number of the sum is 6e3 at |η| = 8 and 2e13 at
+/// |η| = 30. Shifting every polygamma by one argument through
+/// `ψ_k(x) = ψ_k(x+1) + (−1)^{k+1} k!/x^{k+1}` carries the poles analytically:
+///
+/// ```text
+///   W = ω[φ²q²T₁ + μ² + (1−μ)²]
+///   c = ω[φ²(2qq′T₁ + φq³P₂) − 2q′]
+///   d = ω[φ²(2(q′² + qq″)T₁ + 5φq²q′P₂ + φ²q⁴P₃) − 2q″]
+/// ```
+///
+/// with `T₁ = ψ₁(a+1) + ψ₁(b+1)`, `P₂ = ψ₂(a+1) − ψ₂(b+1)`,
+/// `P₃ = ψ₃(a+1) + ψ₃(b+1)`, and `q′`, `q″` the η-derivatives of the logistic
+/// density. The pole parts `μ² + (1−μ)²`, `−2q′` and `−2q″` are successive
+/// η-derivatives of one another, and the shifted polygammas are bounded on
+/// `(0, ∞)`, so every sum stays well conditioned in both tails. The shapes `a`
+/// and `b` must come from the exact logit pair, not from `1 − μ`.
 #[inline]
 pub(crate) fn beta_logit_working_curvature_eta_derivatives(
     prior_weight: f64,
@@ -831,18 +853,22 @@ pub(crate) fn beta_logit_working_curvature_eta_derivatives(
     q_double_prime: f64,
     a: f64,
     b: f64,
-    trigamma_sum: f64,
 ) -> (f64, f64) {
-    let psi2_diff = polygamma2(a) - polygamma2(b);
-    let psi3_sum = polygamma3(a) + polygamma3(b);
+    let shifted_trigamma_sum = trigamma(a + 1.0) + trigamma(b + 1.0);
+    let shifted_psi2_diff = polygamma2(a + 1.0) - polygamma2(b + 1.0);
+    let shifted_psi3_sum = polygamma3(a + 1.0) + polygamma3(b + 1.0);
     let phi_sq = phi * phi;
     let q_sq = q * q;
-    let c = prior_weight * phi_sq * (2.0 * q * q_prime * trigamma_sum + q_sq * phi * q * psi2_diff);
+    let c = prior_weight
+        * (phi_sq
+            * (2.0 * q * q_prime * shifted_trigamma_sum + phi * q_sq * q * shifted_psi2_diff)
+            - 2.0 * q_prime);
     let d = prior_weight
-        * phi_sq
-        * (2.0 * (q_prime * q_prime + q * q_double_prime) * trigamma_sum
-            + 4.0 * q * q_prime * phi * q * psi2_diff
-            + q_sq * (phi * q_prime * psi2_diff + phi_sq * q_sq * psi3_sum));
+        * (phi_sq
+            * (2.0 * (q_prime * q_prime + q * q_double_prime) * shifted_trigamma_sum
+                + 5.0 * phi * q_sq * q_prime * shifted_psi2_diff
+                + phi_sq * q_sq * q_sq * shifted_psi3_sum)
+            - 2.0 * q_double_prime);
     (c, d)
 }
 
@@ -883,9 +909,11 @@ pub(crate) fn exact_beta_logit_row(
         });
     }
     let jet = logit_inverse_link_jet5(eta);
+    // `jet.mu` rounds to exactly 1.0 from η ≈ 36.7 on, long before the exact
+    // complement is gone. The shape checks below decide representability from
+    // the exact pair, symmetrically in both tails.
     if !(jet.mu.is_finite()
-        && jet.mu > 0.0
-        && jet.mu < 1.0
+        && (0.0..=1.0).contains(&jet.mu)
         && jet.d1.is_finite()
         && jet.d1 > 0.0
         && jet.d2.is_finite()
@@ -911,10 +939,13 @@ pub(crate) fn exact_beta_logit_row(
         });
     }
 
-    let mu = jet.mu;
+    // The exact logit pair, as the Beta deviance forms it. `1.0 - jet.mu` would
+    // carry relative error ε·e^η in the upper tail (6e-4 at η = 30) and vanish
+    // once μ rounds to 1, while the mirrored lower-tail row stays exact.
+    let (mu, one_minus_mu) = logit_probability_pair(eta);
     let q = jet.d1;
     let a = mu * phi;
-    let b = (1.0 - mu) * phi;
+    let b = one_minus_mu * phi;
     if !(a.is_finite() && a > 0.0) {
         return Err(EstimationError::pirls_row_geometry_unrepresentable(row, "beta shape a", eta, a));
     }
@@ -941,7 +972,7 @@ pub(crate) fn exact_beta_logit_row(
         ));
     }
     let z = if let Some(y) = y {
-        let score_mu = phi * (digamma(b) - digamma(a) + y.ln() - (1.0 - y).ln());
+        let score_mu = phi * (digamma(b) - digamma(a) + y.ln() - (-y).ln_1p());
         let score_eta_denominator = q * info_mu;
         let z = eta + score_mu / score_eta_denominator;
         if !z.is_finite() {
@@ -964,7 +995,6 @@ pub(crate) fn exact_beta_logit_row(
         jet.d3,
         a,
         b,
-        trigamma_sum,
     );
     if !c.is_finite() {
         return Err(EstimationError::pirls_row_geometry_unrepresentable(row, "beta dW/deta", eta, c));

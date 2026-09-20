@@ -2751,13 +2751,14 @@ pub struct FitArtifacts {
     /// [`CoefficientModeSelection::NotRecorded`], which claims nothing.
     #[serde(default)]
     pub coefficient_mode_selection: CoefficientModeSelection,
-    /// The variance-component score test of every random-effect term, computed
-    /// once on the training fit's own IRLS row state
-    /// (`gam_terms::inference::random_effect_test`). The summary's random-effect
-    /// rows read their p-value (or its typed absence) from here, so the CLI,
-    /// Rust and persisted-model surfaces report the same number. Empty on a
-    /// model with no random-effect term and on a payload written before the
-    /// test existed; a summary treats a term missing from it as not recorded.
+    /// The variance-component score test of every random-effect term and every
+    /// `LinearTermRidge`-penalized linear term, computed once on the training
+    /// fit's own IRLS row state (`gam_terms::inference::random_effect_test`).
+    /// The summary's random-effect rows and ridged parametric rows read their
+    /// p-value (or its typed absence) from here, so the CLI, Rust and
+    /// persisted-model surfaces report the same number. Empty on a model with
+    /// no such term and on a payload written before the test existed; a
+    /// summary treats a term missing from it as not recorded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub random_effect_tests:
         Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord>,
@@ -6683,18 +6684,6 @@ impl UnifiedFitResult {
                     .as_ref()
                     .map(|geom| geom.penalized_hessian.as_array())
             })
-    }
-
-    /// Get owned row-wise diagonal working evidence if available.
-    pub(crate) fn working_geometry(&self) -> Option<&WorkingGeometry> {
-        self.geometry
-            .as_ref()
-            .and_then(|geometry| geometry.working.as_ref())
-    }
-
-    /// Get working response if single diagonal row evidence is available.
-    pub fn working_response(&self) -> Option<&Array1<f64>> {
-        self.working_geometry().map(|working| &working.response)
     }
 
     /// Smoothing-parameter uncertainty covariance contribution `J·Var(ρ)·Jᵀ`

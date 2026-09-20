@@ -12,7 +12,7 @@ use crate::wiggle::{
     WigglePenaltyMetadata, canonical_wiggle_function_penalties,
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
-use gam_linalg::faer_ndarray::{FaerCholesky, array2_to_nested_vec};
+use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_linalg::matrix::DesignMatrix;
 use gam_problem::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, MixtureLinkState, ResponseFamily, SasLinkSpec,
@@ -164,111 +164,22 @@ use std::path::Path;
 // recorded `(p+1)²`. A v34 payload still loads and predicts; its generated-regressor
 // correction refuses the narrower covariance by name, so no interval is published
 // without the stage.
-pub const MODEL_PAYLOAD_VERSION: u32 = 35;
+// v36 freezes a gauged smooth's term-local chart and its joint-null rotation `Q` apart, and
+// records the collection chart `T` on the term's parametric residualization chart
+// (`ParametricResidualizationChart::coefficient_transform`, #3001), so the replay forms
+// `((B·z_local)·Q)·T − C·R` in the fit's own order instead of `B·(z_local·Q·T) − C·R`, which
+// moved μ by up to 2 ulp. An older payload froze the composed chart and no `T`, so it cannot
+// be replayed in that order: every older version is refused by name, and a v35 binary refuses
+// a v36 payload by version.
+pub const MODEL_PAYLOAD_VERSION: u32 = 36;
 
-/// The schema before the constant variance stage in the first-stage covariance
-/// (gam#3030), whose only difference is that covariance's width.
-const CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION: u32 = 34;
-
-/// The schema before the closed-form certificate's null law (gam#2926), whose only
-/// difference from [`CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION`] is those fields'
-/// absence.
-const CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION: u32 = 33;
-
-/// The schema before the full-conformal penalty count (gam#3296), whose only difference
-/// from [`CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION`] is that field's absence.
-const CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION: u32 = 32;
-
-/// The schema before the moving-law arms' adequacy screens (gam#2926), whose only
-/// difference from [`CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION`] is that field's absence.
-const MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION: u32 = 31;
-
-/// The schema before the Gaussian location-scale σ floor record, whose only difference
-/// from [`MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION`] is that field's absence.
-const SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 30;
-
-/// The schema whose Newton-polish record may carry its step budget (#2954), or already
-/// its settling flag (#3012, from 996d0af2c1 on; gam#3166). Its only difference from
-/// [`SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION`] is that record's `step_budget`, which
-/// this binary reads past.
-const POLISH_STEP_BUDGET_PAYLOAD_VERSION: u32 = 29;
-
-/// The schema before the saved model stopped persisting training rows (speed F6), whose
-/// only difference is the conformal field's `x` and `y` and the serialized working
-/// geometry, both of which this binary reads past.
-const TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION: u32 = 28;
-
-/// The schema before the certified point's value and input fingerprint (gam#3002), whose only
-/// difference from [`TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION`] is those fields' absence.
-const WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION: u32 = 27;
-
-/// The schema before the coefficient-mode record (gam#2661), whose only difference from
-/// [`WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION`] is that field's absence.
-const MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 26;
-
-/// The first payload version whose survival location-scale kernel divides the whole
-/// residual by σ (#2695).
-pub const WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION: u32 = 26;
-
-/// The schema before [`WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION`]. Its only difference is
-/// the survival location-scale kernel, whose old payloads the family validator judges.
-const LOCATION_ONLY_SCALE_PAYLOAD_VERSION: u32 = 25;
-
-/// The schema before the certified outer point (`warm_start_from`), whose only difference
-/// from [`LOCATION_ONLY_SCALE_PAYLOAD_VERSION`] is that record's absence.
-pub(crate) const OUTER_WARM_START_ABSENT_PAYLOAD_VERSION: u32 = 24;
-
-/// The schema before the residual repair block's covariance declination (gam#2985),
-/// whose only difference from [`OUTER_WARM_START_ABSENT_PAYLOAD_VERSION`] is that
-/// variant's absence.
-const RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION: u32 = 23;
-
-/// The schema before the latent-law record (gam#2926), whose only difference from
-/// [`RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION`] is that field's absence.
-const LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 22;
-
-/// The schema before the certificate's Newton polish and face kinds (#2954), whose only
-/// difference from [`LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION`] is those fields' absence.
-const NEWTON_POLISH_ABSENT_PAYLOAD_VERSION: u32 = 21;
-
-/// The schema before the rho-posterior adequacy tokens (#2946 T2), whose only
-/// difference is the old tokens, which this binary reads as aliases.
-const RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION: u32 = 20;
-
-/// The schema before the EDF rank-bound status (#2901), whose only difference from
-/// [`RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION`] is that field's absence.
-const EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION: u32 = 19;
-
-/// The schema whose only difference from [`EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION`]
-/// is the inference block's redundant covariance copies (#2955).
-const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
-
-/// Every payload version this binary reads: its own, and each older schema
-/// whose only differences it reads through. A payload written at any other
-/// version is refused by name (`payload_version_mismatch`). Callers that need a
-/// refused or an accepted version read it from here rather than offsetting
-/// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
+/// Every payload version this binary reads. Each older schema froze a gauged smooth's
+/// composed chart without the collection chart `T` its replay now applies (#3001), so a
+/// payload written at any other version is refused by name (`payload_version_mismatch`).
+/// Callers that need a refused or an accepted version read it from here rather than
+/// offsetting [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 18] = [
-    MODEL_PAYLOAD_VERSION,
-    CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION,
-    CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
-    CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
-    MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
-    SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
-    POLISH_STEP_BUDGET_PAYLOAD_VERSION,
-    TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
-    WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
-    MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
-    LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
-    OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
-    RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
-    LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION,
-    NEWTON_POLISH_ABSENT_PAYLOAD_VERSION,
-    RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION,
-    EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION,
-    COVARIANCE_COPIES_PAYLOAD_VERSION,
-];
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 1] = [MODEL_PAYLOAD_VERSION];
 
 /// Whether this binary reads a payload written at `version`.
 fn payload_version_is_readable(version: u32) -> bool {
@@ -703,15 +614,9 @@ pub struct FittedModelPayload {
     pub data_schema: Option<DataSchema>,
     pub link: Option<InverseLink>,
     #[serde(default)]
-    pub mixture_link_param_covariance: Option<Vec<Vec<f64>>>,
-    #[serde(default)]
-    pub sas_param_covariance: Option<Vec<Vec<f64>>>,
-    #[serde(default)]
     pub formula_noise: Option<String>,
     #[serde(default)]
     pub slope_formula: Option<String>,
-    #[serde(default)]
-    pub slope_formulas: Option<Vec<String>>,
     #[serde(default)]
     pub offset_column: Option<String>,
     #[serde(default)]
@@ -722,8 +627,6 @@ pub struct FittedModelPayload {
     /// `sigma_i = sigma_hat / sqrt(w_i)` (#2025). `None` for an unweighted fit.
     #[serde(default)]
     pub weight_column: Option<String>,
-    #[serde(default)]
-    pub beta_noise: Option<Vec<f64>>,
     #[serde(default)]
     pub noise_projection: Option<Vec<Vec<f64>>>,
     #[serde(default)]
@@ -784,8 +687,6 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub latent_z_normalization: Option<SavedLatentZNormalization>,
     #[serde(default)]
-    pub latent_score_contract: Option<SavedLatentScoreContract>,
-    #[serde(default)]
     pub latent_measure: Option<LatentMeasureKind>,
     /// The declared atoms of a survival marginal-slope fit anchored on the
     /// certified compression of its declared law (gam#2928). `latent_measure`
@@ -833,8 +734,6 @@ pub struct FittedModelPayload {
     pub marginal_baseline: Option<f64>,
     #[serde(default)]
     pub baseline_slope: Option<f64>,
-    #[serde(default)]
-    pub baseline_slopes: Option<Vec<f64>>,
     /// Resolved follow-up time margin of the survival marginal-slope slope
     /// block (gam#2765, gam#2767). `None` is the time-constant slope every model
     /// saved before this existed carries.
@@ -1137,16 +1036,6 @@ pub fn append_deployment_extension_columns(
     Ok(out)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SavedLatentScoreContract {
-    pub semantics: String,
-    pub source_transform_id: Option<String>,
-    pub normalization_mean: f64,
-    pub normalization_sd: f64,
-    pub clip_eps: Option<f64>,
-    pub conditioning_columns: Vec<String>,
-}
-
 impl FittedModelPayload {
     pub fn new(
         version: u32,
@@ -1173,15 +1062,11 @@ impl FittedModelPayload {
             residual_cascade: None,
             data_schema: None,
             link: None,
-            mixture_link_param_covariance: None,
-            sas_param_covariance: None,
             formula_noise: None,
             slope_formula: None,
-            slope_formulas: None,
             offset_column: None,
             noise_offset_column: None,
             weight_column: None,
-            beta_noise: None,
             noise_projection: None,
             noise_center: None,
             noise_scale: None,
@@ -1203,7 +1088,6 @@ impl FittedModelPayload {
             z_column: None,
             z_columns: None,
             latent_z_normalization: None,
-            latent_score_contract: None,
             latent_measure: None,
             declared_latent_law: None,
             declared_latent_law_compression: None,
@@ -1213,7 +1097,6 @@ impl FittedModelPayload {
             latent_law_consumed: None,
             marginal_baseline: None,
             baseline_slope: None,
-            baseline_slopes: None,
             slope_time_basis: None,
             score_warp_runtime: None,
             link_deviation_runtime: None,
@@ -1915,35 +1798,6 @@ fn validate_survival_location_scale_saved_fit(
         payload.survival_beta_log_sigma.as_ref(),
         "log-sigma",
     )?;
-    // #2695: before WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION the kernel divided only the
-    // location by σ, `u = h(t) − η_t·e^{−η_σ}`, where it now divides the whole residual,
-    // `u = (h(t) − η_t)·e^{−η_σ}`. The two differ by `h·(1 − e^{−η_σ})`, so an old payload
-    // is refused only when its log-σ predictor can move (a nonzero coefficient, or a
-    // declared noise offset) and its time-warp coefficients can too. The reduced
-    // parametric-AFT lift and the σ-scaled log-t baseline (#892) save an all-zero warp
-    // and fit `h ≡ 0`, so the two kernels agree on their rows. Any other such payload was
-    // fit as a different model, and reading it as the current one would silently move
-    // every prediction.
-    let block_can_move = |role: BlockRole| {
-        fit.block_by_role(role)
-            .is_some_and(|block| block.beta.iter().any(|value| *value != 0.0))
-    };
-    let scale_can_move = block_can_move(BlockRole::Scale) || payload.noise_offset_column.is_some();
-    if payload.version < WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION
-        && scale_can_move
-        && block_can_move(BlockRole::Time)
-    {
-        return Err(FittedModelError::SchemaMismatch {
-            reason: format!(
-                "location-scale survival model written at payload version {} was fit under \
-                 the pre-#2695 location-only kernel u = h(t) − η_t/σ, and neither its log-σ \
-                 predictor nor its time warp is identically zero, so it means something else \
-                 under the current kernel u = (h(t) − η_t)/σ; refit required: σ was \
-                 unidentified under the pre-#2695 likelihood",
-                payload.version
-            ),
-        });
-    }
     if let Some(basis) = structure.threshold_time_basis.as_ref() {
         let width =
             validate_survival_covariate_time_basis(basis, "location-scale survival threshold time basis")?;
@@ -3171,6 +3025,60 @@ fn re_factor_smooth_group_col(basis: &gam_terms::smooth::SmoothBasisSpec) -> Opt
     }
 }
 
+/// Collect the factor columns a smooth basis estimates a per-level CURVE for:
+/// a factor `by=` level smooth (`s(x, by=g)`, stored as one `ByVariable`
+/// `Level` term per level, or as a `BySmooth` `Factor`), a sum-to-zero factor
+/// smooth, and the `fs`/`sz` factor smooths. None of them has a population
+/// curve that an unseen level could fall back to. The `by=` level gate reads
+/// an out-of-vocabulary code as "no level matches", so the row's curve would be
+/// silently zero; the `fs`/`sz` operators refuse such a row. Either way the
+/// held-out-group policy does not apply to the column, even when a
+/// `group(g)` on the same column is itself a genuine random effect
+/// (see [`FittedModel::random_effect_group_columns`]).
+fn collect_per_level_curve_group_cols(
+    basis: &gam_terms::smooth::SmoothBasisSpec,
+    out: &mut HashSet<usize>,
+) {
+    use gam_terms::smooth::{ByVarKind, ByVariableSpec, FactorSmoothFlavour, SmoothBasisSpec};
+    match basis {
+        SmoothBasisSpec::ByVariable {
+            inner, by_col, by, ..
+        } => {
+            if matches!(by, ByVariableSpec::Level { .. }) {
+                out.insert(*by_col);
+            }
+            collect_per_level_curve_group_cols(inner, out);
+        }
+        SmoothBasisSpec::FactorSumToZero { inner, by_col, .. } => {
+            out.insert(*by_col);
+            collect_per_level_curve_group_cols(inner, out);
+        }
+        SmoothBasisSpec::BySmooth { smooth, by_kind } => {
+            if let ByVarKind::Factor { feature_col, .. } = by_kind {
+                out.insert(*feature_col);
+            }
+            collect_per_level_curve_group_cols(smooth, out);
+        }
+        SmoothBasisSpec::FactorSmooth { spec } => {
+            if !matches!(spec.flavour, FactorSmoothFlavour::Re) {
+                out.insert(spec.group_col);
+            }
+        }
+        // Leaf bases read no grouping column. Enumerated rather than
+        // wildcarded so a newly added per-level basis breaks this match
+        // instead of silently inheriting the lenient held-out-group policy.
+        SmoothBasisSpec::BSpline1D { .. }
+        | SmoothBasisSpec::ThinPlate { .. }
+        | SmoothBasisSpec::Sphere { .. }
+        | SmoothBasisSpec::ConstantCurvature { .. }
+        | SmoothBasisSpec::Matern { .. }
+        | SmoothBasisSpec::MeasureJet { .. }
+        | SmoothBasisSpec::Duchon { .. }
+        | SmoothBasisSpec::Pca { .. }
+        | SmoothBasisSpec::TensorBSpline { .. } => {}
+    }
+}
+
 /// Recursively collect the feature columns of a smooth basis whose out-of-hull
 /// evaluation is bounded, so they can be exempted from the predict-time axis
 /// clip (see [`FittedModel::training_smooth_extrapolation_axes`]). Wrapper bases
@@ -3299,6 +3207,116 @@ fn collect_by_variable_numeric_axes(
         | SmoothBasisSpec::Duchon { .. }
         | SmoothBasisSpec::Pca { .. }
         | SmoothBasisSpec::TensorBSpline { .. } => {}
+    }
+}
+
+/// Recursively collect the periodic feature columns of a smooth basis — sphere
+/// longitude, a periodic 1D B-spline axis, periodic tensor-B-spline margins —
+/// so they can be exempted from the predict-time axis clip (see
+/// [`FittedModel::training_periodic_axes`]). Wrapper bases (`by=`,
+/// sum-to-zero) delegate to the inner smooth they modulate / replicate: the
+/// wrapper changes how the inner design is gated or scaled, never the
+/// coordinate the inner basis is evaluated at, so a periodic axis stays
+/// periodic when wrapped. Returned indices reference the training headers.
+fn collect_periodic_axes(
+    basis: &gam_terms::smooth::SmoothBasisSpec,
+    n_training_headers: usize,
+    out: &mut std::collections::HashSet<usize>,
+) {
+    use gam_terms::basis::BSplineKnotSpec;
+    use gam_terms::smooth::SmoothBasisSpec;
+    match basis {
+        // Sphere terms: longitude (second feature col) is always periodic and
+        // exempt from clipping. Latitude is not periodic but is a
+        // closed-manifold coordinate, so it is clipped to the manifold's
+        // intrinsic bounds rather than the sampled range — see
+        // `collect_sphere_latitude_bounds`.
+        SmoothBasisSpec::Sphere { feature_cols, .. } => {
+            if let Some(&lon_col) = feature_cols.get(1)
+                && lon_col < n_training_headers
+            {
+                out.insert(lon_col);
+            }
+        }
+        // 1D periodic B-spline: the single feature column is periodic.
+        SmoothBasisSpec::BSpline1D { feature_col, spec } => {
+            if matches!(spec.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
+                && *feature_col < n_training_headers
+            {
+                out.insert(*feature_col);
+            }
+        }
+        // Tensor B-spline: each axis whose marginal knotspec is
+        // PeriodicUniform is periodic; mark those columns.
+        SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
+            for (i, marginal) in spec.marginalspecs.iter().enumerate() {
+                if matches!(marginal.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
+                    && let Some(&col) = feature_cols.get(i)
+                    && col < n_training_headers
+                {
+                    out.insert(col);
+                }
+            }
+        }
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            collect_periodic_axes(inner, n_training_headers, out)
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => {
+            collect_periodic_axes(smooth, n_training_headers, out)
+        }
+        // Leaf bases with no wrap-around coordinate. Enumerated rather than
+        // wildcarded so a newly added periodic basis breaks this match instead
+        // of silently having its axis clipped.
+        SmoothBasisSpec::FactorSmooth { .. }
+        | SmoothBasisSpec::ThinPlate { .. }
+        | SmoothBasisSpec::ConstantCurvature { .. }
+        | SmoothBasisSpec::Matern { .. }
+        | SmoothBasisSpec::MeasureJet { .. }
+        | SmoothBasisSpec::Duchon { .. }
+        | SmoothBasisSpec::Pca { .. } => {}
+    }
+}
+
+/// Recursively collect the manifold-intrinsic clip bounds of every sphere
+/// latitude column in a smooth basis (see
+/// [`FittedModel::training_sphere_latitude_bounds`]), descending through
+/// `by=` / sum-to-zero wrappers exactly as [`collect_periodic_axes`] does.
+fn collect_sphere_latitude_bounds(
+    basis: &gam_terms::smooth::SmoothBasisSpec,
+    n_training_headers: usize,
+    out: &mut std::collections::HashMap<usize, (f64, f64)>,
+) {
+    use gam_terms::smooth::SmoothBasisSpec;
+    match basis {
+        SmoothBasisSpec::Sphere { feature_cols, spec } => {
+            if let Some(&lat_col) = feature_cols.first()
+                && lat_col < n_training_headers
+            {
+                let bound = if spec.radians {
+                    std::f64::consts::FRAC_PI_2
+                } else {
+                    90.0
+                };
+                out.insert(lat_col, (-bound, bound));
+            }
+        }
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            collect_sphere_latitude_bounds(inner, n_training_headers, out)
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => {
+            collect_sphere_latitude_bounds(smooth, n_training_headers, out)
+        }
+        SmoothBasisSpec::BSpline1D { .. }
+        | SmoothBasisSpec::TensorBSpline { .. }
+        | SmoothBasisSpec::FactorSmooth { .. }
+        | SmoothBasisSpec::ThinPlate { .. }
+        | SmoothBasisSpec::ConstantCurvature { .. }
+        | SmoothBasisSpec::Matern { .. }
+        | SmoothBasisSpec::MeasureJet { .. }
+        | SmoothBasisSpec::Duchon { .. }
+        | SmoothBasisSpec::Pca { .. } => {}
     }
 }
 
@@ -3440,71 +3458,20 @@ impl FittedModel {
     /// Collect the set of training-column indices that are periodic axes —
     /// i.e. features for which a periodic basis (sphere longitude, periodic
     /// B-spline 1D, periodic tensor margin) must be allowed to take any
-    /// real value at predict time and not be clamped to the training range.
-    /// Returned indices reference `self.training_headers` (training-time
-    /// layout), matching the iteration in `axis_clip_to_training_ranges`.
+    /// real value at predict time and not be clamped to the training range —
+    /// on *any* modelled surface (mean, noise/scale, slope), including a
+    /// periodic basis nested inside a `by=` / sum-to-zero wrapper (see
+    /// [`collect_periodic_axes`]). Returned indices reference
+    /// `self.training_headers` (training-time layout), matching the iteration
+    /// in `axis_clip_to_training_ranges`.
     fn training_periodic_axes(
         &self,
         training_headers: &[String],
     ) -> std::collections::HashSet<usize> {
-        use gam_terms::basis::BSplineKnotSpec;
-        use gam_terms::smooth::SmoothBasisSpec;
         let mut out: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let Some(spec) = self.resolved_termspec.as_ref() else {
-            return out;
-        };
-        for term in &spec.smooth_terms {
-            match &term.basis {
-                // Sphere terms: longitude (second feature col) is always
-                // periodic and exempt from clipping. Latitude is not periodic
-                // but is a closed-manifold coordinate, so it is clipped to the
-                // manifold's intrinsic bounds rather than the sampled range —
-                // see `training_sphere_latitude_bounds`.
-                SmoothBasisSpec::Sphere { feature_cols, .. } => {
-                    if let Some(&lon_col) = feature_cols.get(1)
-                        && lon_col < training_headers.len()
-                    {
-                        out.insert(lon_col);
-                    }
-                }
-                // 1D periodic B-spline: the single feature column is periodic.
-                SmoothBasisSpec::BSpline1D { feature_col, spec } => {
-                    if matches!(spec.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
-                        && *feature_col < training_headers.len()
-                    {
-                        out.insert(*feature_col);
-                    }
-                }
-                // Tensor B-spline: each axis whose marginal knotspec is
-                // PeriodicUniform is periodic; mark those columns.
-                SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
-                    for (i, marginal) in spec.marginalspecs.iter().enumerate() {
-                        if matches!(marginal.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
-                            && let Some(&col) = feature_cols.get(i)
-                            && col < training_headers.len()
-                        {
-                            out.insert(col);
-                        }
-                    }
-                }
-                // No periodic axis is exempted for these. The leaf bases have
-                // no wrap-around coordinate at all; the three wrappers
-                // (`ByVariable`, `BySmooth`, `FactorSumToZero`) are matched at
-                // top level only and are deliberately not descended into here,
-                // so a periodic marginal nested inside one stays subject to the
-                // training-range clip. Enumerated rather than wildcarded so a
-                // newly added periodic basis breaks this match instead of
-                // silently having its axis clipped.
-                SmoothBasisSpec::ByVariable { .. }
-                | SmoothBasisSpec::BySmooth { .. }
-                | SmoothBasisSpec::FactorSumToZero { .. }
-                | SmoothBasisSpec::FactorSmooth { .. }
-                | SmoothBasisSpec::ThinPlate { .. }
-                | SmoothBasisSpec::ConstantCurvature { .. }
-                | SmoothBasisSpec::Matern { .. }
-                | SmoothBasisSpec::MeasureJet { .. }
-                | SmoothBasisSpec::Duchon { .. }
-                | SmoothBasisSpec::Pca { .. } => {}
+        for spec in self.saved_term_specs() {
+            for term in &spec.smooth_terms {
+                collect_periodic_axes(&term.basis, training_headers.len(), &mut out);
             }
         }
         out
@@ -3635,30 +3602,20 @@ impl FittedModel {
     /// (single-valued in longitude) while still mapping any out-of-domain
     /// latitude onto the manifold boundary. Longitude needs no entry here: it
     /// is periodic and already exempted from clipping entirely
-    /// (`training_periodic_axes`). Returned indices reference
-    /// `self.training_headers`, matching the iteration in
-    /// `axis_clip_to_training_ranges`.
+    /// (`training_periodic_axes`). Like the periodic set, this covers a sphere
+    /// on *any* modelled surface (mean, noise/scale, slope) and a sphere nested
+    /// inside a `by=` / sum-to-zero wrapper (see [`collect_sphere_latitude_bounds`]).
+    /// Returned indices reference `self.training_headers`, matching the
+    /// iteration in `axis_clip_to_training_ranges`.
     fn training_sphere_latitude_bounds(
         &self,
         training_headers: &[String],
     ) -> std::collections::HashMap<usize, (f64, f64)> {
-        use gam_terms::smooth::SmoothBasisSpec;
         let mut out: std::collections::HashMap<usize, (f64, f64)> =
             std::collections::HashMap::new();
-        let Some(spec) = self.resolved_termspec.as_ref() else {
-            return out;
-        };
-        for term in &spec.smooth_terms {
-            if let SmoothBasisSpec::Sphere { feature_cols, spec } = &term.basis
-                && let Some(&lat_col) = feature_cols.first()
-                && lat_col < training_headers.len()
-            {
-                let bound = if spec.radians {
-                    std::f64::consts::FRAC_PI_2
-                } else {
-                    90.0
-                };
-                out.insert(lat_col, (-bound, bound));
+        for spec in self.saved_term_specs() {
+            for term in &spec.smooth_terms {
+                collect_sphere_latitude_bounds(&term.basis, training_headers.len(), &mut out);
             }
         }
         out
@@ -3798,10 +3755,11 @@ impl FittedModel {
                     );
                 }
             }
-            FittedLinkState::Sas { state, covariance } => {
+            // The link-parameter covariance stays on `fit_result.fitted_link`,
+            // its single serialized home; only the point state has a family slot.
+            FittedLinkState::Sas { state, .. } => {
                 if likelihood.is_binomial_sas() {
                     *sas_state = Some(*state);
-                    payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
                 } else {
                     log::debug!(
                         "fitted SAS link state discarded: likelihood {likelihood:?} is not \
@@ -3809,10 +3767,9 @@ impl FittedModel {
                     );
                 }
             }
-            FittedLinkState::BetaLogistic { state, covariance } => {
+            FittedLinkState::BetaLogistic { state, .. } => {
                 if likelihood.is_binomial_beta_logistic() {
                     *sas_state = Some(*state);
-                    payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
                 } else {
                     log::debug!(
                         "fitted beta-logistic link state discarded: likelihood {likelihood:?} is \
@@ -3820,11 +3777,9 @@ impl FittedModel {
                     );
                 }
             }
-            FittedLinkState::Mixture { state, covariance } => {
+            FittedLinkState::Mixture { state, .. } => {
                 if likelihood.is_binomial_mixture() {
                     *mixture_state = Some(state.clone());
-                    payload.mixture_link_param_covariance =
-                        covariance.as_ref().map(array2_to_nested_vec);
                 } else {
                     log::debug!(
                         "fitted mixture link state discarded: likelihood {likelihood:?} is not a \
@@ -4732,8 +4687,7 @@ impl FittedModel {
         col_map: &HashMap<String, usize>,
     ) -> Result<Option<Array1<f64>>, FittedModelError> {
         use gam_terms::basis::{
-            CenterStrategy, MeasureJetExtrapolationSpectrum, MeasureJetIdentifiability,
-            PenaltySource,
+            CenterStrategy, MeasureJetExtrapolationSpectrum, PenaltySource,
         };
         use gam_terms::smooth::SmoothBasisSpec;
         use gam_terms::smooth::build_term_collection_design;
@@ -5011,16 +4965,6 @@ impl FittedModel {
             // `mj.length_scale`, and σ_coord are all standardized consistently.
             if let Some(sigma_coord) = frozen.sigma_coord {
                 'input_var: {
-                    let MeasureJetIdentifiability::FrozenTransform { transform } =
-                        &mj.identifiability
-                    else {
-                        log::debug!(
-                            "measure-jet term '{}': identifiability is not a frozen transform; \
-                             skipping its input-measurement-error variance",
-                            term.name
-                        );
-                        break 'input_var;
-                    };
                     let full_cols = design.design.ncols();
                     if fit.beta.len() != full_cols {
                         log::debug!(
@@ -5043,6 +4987,23 @@ impl FittedModel {
                         );
                         break 'input_var;
                     }
+                    // The replayed term's composed chart `z_local·Q·T` maps its
+                    // reduced coefficients to the raw representer+head ones. The
+                    // frozen spec carries only the term-local `z_local`; `Q` and
+                    // the collection chart `T` are applied on top of it (#3001),
+                    // so the composition is read off the replayed metadata.
+                    let gam_terms::basis::BasisMetadata::MeasureJet {
+                        constraint_transform: Some(transform),
+                        ..
+                    } = &design.smooth.terms[smooth_idx].metadata
+                    else {
+                        log::debug!(
+                            "measure-jet term '{}': replayed metadata carries no coefficient \
+                             chart; skipping its input-measurement-error variance",
+                            term.name
+                        );
+                        break 'input_var;
+                    };
                     let m = centers.nrows();
                     let m_aug = transform.nrows();
                     let reduced = transform.ncols();
@@ -5324,10 +5285,29 @@ impl FittedModel {
     /// averaged to the factor's centering point (#2102/#2137). Such terms carry
     /// `lenient_unseen == false` and are excluded here so they hit the strict
     /// `UnseenCategoryPolicy::Error` arm.
+    ///
+    /// A column is lenient only if EVERY term that reads it tolerates an unseen
+    /// level. `y ~ s(x, by=g) + group(g)` pairs a genuine random intercept with
+    /// per-level curves `f_g(x)`. The random intercept has a population
+    /// fallback, but the curves do not: the `by=` level gate would read the
+    /// out-of-vocabulary code as "no level matches" and silently drop
+    /// `f_g(x)` from the prediction, its standard error and its band. Such a
+    /// column is therefore removed from the whitelist, so an unseen level hits
+    /// the strict schema encode (see [`collect_per_level_curve_group_cols`]).
     pub fn random_effect_group_columns(&self) -> HashSet<String> {
         let Some(training_headers) = self.training_headers.as_ref() else {
             return HashSet::new();
         };
+        let mut per_level_curve_cols = HashSet::<usize>::new();
+        for spec in self.saved_term_specs() {
+            for term in &spec.smooth_terms {
+                collect_per_level_curve_group_cols(&term.basis, &mut per_level_curve_cols);
+            }
+        }
+        let per_level_curve_names: HashSet<&String> = per_level_curve_cols
+            .iter()
+            .filter_map(|&col| training_headers.get(col))
+            .collect();
         let mut out = HashSet::<String>::new();
         for spec in self.saved_term_specs() {
             for term in &spec.random_effect_terms {
@@ -5352,6 +5332,7 @@ impl FittedModel {
                 }
             }
         }
+        out.retain(|name| !per_level_curve_names.contains(name));
         out
     }
 
@@ -6371,9 +6352,6 @@ impl FittedModel {
             }
         }
 
-        if let Some(v) = self.beta_noise.as_ref() {
-            validate_all_finite("beta_noise", v.iter().copied()).map_err(corrupt)?;
-        }
         if let Some(v) = self.noise_projection.as_ref() {
             validate_all_finite("noise_projection", v.iter().flatten().copied())
                 .map_err(corrupt)?;
@@ -6435,14 +6413,6 @@ impl FittedModel {
         }
         if let Some(v) = self.survival_beta_log_sigma.as_ref() {
             validate_all_finite("survival_beta_log_sigma", v.iter().copied()).map_err(corrupt)?;
-        }
-        if let Some(v) = self.mixture_link_param_covariance.as_ref() {
-            validate_all_finite("mixture_link_param_covariance", v.iter().flatten().copied())
-                .map_err(corrupt)?;
-        }
-        if let Some(v) = self.sas_param_covariance.as_ref() {
-            validate_all_finite("sas_param_covariance", v.iter().flatten().copied())
-                .map_err(corrupt)?;
         }
         Ok(())
     }
@@ -7444,7 +7414,6 @@ mod tests {
         payload.resolved_termspec = Some(empty_termspec());
         payload.resolved_termspec_noise = Some(empty_termspec());
         payload.formula_noise = Some("x".to_string());
-        payload.beta_noise = Some(vec![0.0]);
         payload.link = Some(InverseLink::Standard(StandardLink::Log));
         payload
     }
@@ -7550,6 +7519,88 @@ mod tests {
             None,
             "numeric group labels must reach RandomEffectOperator as unseen levels, not be clipped to boundary seen levels"
         );
+    }
+
+    /// A `sphere(lat, lon)` smooth must get the same predict-time axis
+    /// treatment wherever it sits: on the mean surface, on the noise/scale
+    /// surface, or wrapped in a numeric `by=`. Longitude is periodic and is
+    /// never clipped; latitude is clipped to the manifold bounds `[-90, 90]`,
+    /// not to the sampled latitude range. The periodic and latitude collectors
+    /// used to read only the bare mean-surface smooths, so a noise-surface or
+    /// `by=`-wrapped sphere had both axes clamped to the training box.
+    #[test]
+    fn axis_clip_treats_noise_and_by_wrapped_sphere_like_a_mean_sphere() {
+        use gam_terms::basis::SphericalSplineBasisSpec;
+        use gam_terms::smooth::{ByVarKind, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
+        let sphere = SmoothBasisSpec::Sphere {
+            feature_cols: vec![0, 1],
+            spec: SphericalSplineBasisSpec::default(),
+        };
+        let single_smooth = |basis: SmoothBasisSpec| TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                frozen_parametric_residualization: None,
+                name: "sphere(lat, lon)".to_string(),
+                basis,
+                shape: ShapeConstraint::None.into(),
+                joint_null_rotation: None,
+            }],
+            level: Default::default(),
+        };
+        let headers = ["lat", "lon", "z"];
+        let data = array![[85.0, 170.0, 0.5], [-95.0, -175.0, -0.5], [20.0, 10.0, 0.0]];
+        let col_map: HashMap<String, usize> = headers
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.to_string(), i))
+            .collect();
+        let mut base = standard_gaussian_payload();
+        base.data_schema = Some(DataSchema {
+            columns: headers
+                .iter()
+                .map(|name| SchemaColumn {
+                    name: name.to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                })
+                .collect(),
+        });
+        base.set_training_feature_metadata(
+            headers.iter().map(|name| name.to_string()).collect(),
+            vec![(-10.0, 40.0), (-20.0, 60.0), (-1.0, 1.0)],
+        );
+        base.resolved_termspec = Some(empty_termspec());
+
+        let mut mean_surface = base.clone();
+        mean_surface.resolved_termspec = Some(single_smooth(sphere.clone()));
+        let mut noise_surface = base.clone();
+        noise_surface.resolved_termspec_noise = Some(single_smooth(sphere.clone()));
+        let mut by_wrapped = base;
+        by_wrapped.resolved_termspec = Some(single_smooth(SmoothBasisSpec::BySmooth {
+            smooth: Box::new(sphere),
+            by_kind: ByVarKind::Numeric { feature_col: 2 },
+        }));
+
+        for (label, payload) in [
+            ("mean-surface sphere", mean_surface),
+            ("noise-surface sphere", noise_surface),
+            ("by=-wrapped sphere", by_wrapped),
+        ] {
+            let clipped = FittedModel::from_payload(payload)
+                .axis_clip_to_training_ranges(data.view(), &col_map)
+                .unwrap_or_else(|| panic!("{label}: the -95 latitude must clip to the pole"));
+            assert_eq!(
+                clipped.column(0).to_vec(),
+                vec![85.0, -90.0, 20.0],
+                "{label}: latitude must clip to [-90, 90], not the sampled [-10, 40]"
+            );
+            assert_eq!(
+                clipped.column(1).to_vec(),
+                vec![170.0, -175.0, 10.0],
+                "{label}: periodic longitude must never be clipped"
+            );
+        }
     }
 
     /// #2102/#2137: a FIXED categorical factor — a bare `y ~ g` or an explicit
@@ -7686,6 +7737,133 @@ mod tests {
                 panic!("`{formula}` must tolerate an unseen level, got: {err}")
             });
         }
+    }
+
+    /// `y ~ s(x, by=g) + group(g)`: the random intercept alone would tolerate
+    /// an unseen `g`, but the per-level curves `f_g(x)` have no population
+    /// fallback. The `by=` level gate reads an out-of-vocabulary code as "no
+    /// level matches", so the lenient encode silently dropped `f_g(x)` from the
+    /// prediction. Such a column must reach the strict schema encode. A
+    /// `group(g)` whose column carries no per-level curve stays lenient.
+    #[test]
+    fn group_column_with_per_level_curves_is_not_lenient_on_unseen_levels() {
+        use csv::StringRecord;
+        use gam_data::{UnseenCategoryPolicy, encode_recordswith_schema};
+        use gam_terms::basis::SphericalSplineBasisSpec;
+        use gam_terms::smooth::{
+            BySmoothKind, ByVarKind, ByVariableSpec, RandomEffectTermSpec, ShapeConstraint,
+            SmoothBasisSpec, SmoothTermSpec,
+        };
+        let headers = ["x", "g", "h"];
+        let levels = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let schema = DataSchema {
+            columns: headers
+                .iter()
+                .map(|name| SchemaColumn {
+                    name: name.to_string(),
+                    kind: if *name == "x" {
+                        ColumnKindTag::Continuous
+                    } else {
+                        ColumnKindTag::Categorical
+                    },
+                    levels: if *name == "x" { vec![] } else { levels.clone() },
+                })
+                .collect(),
+        };
+        // The inner basis is irrelevant to the whitelist; only the wrapper's
+        // grouping column is read.
+        let inner = SmoothBasisSpec::Sphere {
+            feature_cols: vec![0, 0],
+            spec: SphericalSplineBasisSpec::default(),
+        };
+        let level_curve = |by_col: usize| SmoothBasisSpec::ByVariable {
+            inner: Box::new(inner.clone()),
+            by_col,
+            kind: BySmoothKind::Level {
+                level_bits: 0.0_f64.to_bits(),
+            },
+            by: ByVariableSpec::Level {
+                value_bits: 0.0_f64.to_bits(),
+                label: "a".to_string(),
+            },
+        };
+        let model_with = |curve: SmoothBasisSpec| -> FittedModel {
+            let mut payload = standard_gaussian_payload();
+            payload.data_schema = Some(schema.clone());
+            payload.set_training_feature_metadata(
+                headers.iter().map(|name| name.to_string()).collect(),
+                vec![(0.0, 1.0), (0.0, 2.0), (0.0, 2.0)],
+            );
+            payload.resolved_termspec = Some(TermCollectionSpec {
+                linear_terms: vec![],
+                random_effect_terms: vec![RandomEffectTermSpec {
+                    name: "g".to_string(),
+                    feature_col: 1,
+                    frozen_levels: None,
+                    lenient_unseen: true,
+                }],
+                smooth_terms: vec![SmoothTermSpec {
+                    frozen_parametric_residualization: None,
+                    name: "s(x):by".to_string(),
+                    basis: curve,
+                    shape: ShapeConstraint::None.into(),
+                    joint_null_rotation: None,
+                }],
+                level: Default::default(),
+            });
+            FittedModel::from_payload(payload)
+        };
+        let g_schema = DataSchema {
+            columns: vec![SchemaColumn {
+                name: "g".to_string(),
+                kind: ColumnKindTag::Categorical,
+                levels: levels.clone(),
+            }],
+        };
+        let encode_unseen_g = |model: &FittedModel| {
+            encode_recordswith_schema(
+                vec!["g".to_string()],
+                vec![StringRecord::from(vec!["NEW"])],
+                &g_schema,
+                UnseenCategoryPolicy::encode_unknown_for_columns(
+                    model.random_effect_group_columns(),
+                ),
+            )
+        };
+
+        for (label, curve) in [
+            ("by=g level smooth", level_curve(1)),
+            (
+                "BySmooth factor by=g",
+                SmoothBasisSpec::BySmooth {
+                    smooth: Box::new(inner.clone()),
+                    by_kind: ByVarKind::Factor {
+                        feature_col: 1,
+                        frozen_levels: None,
+                        ordered: false,
+                    },
+                },
+            ),
+        ] {
+            let model = model_with(curve);
+            assert!(
+                !model.random_effect_group_columns().contains("g"),
+                "{label}: g carries per-level curves, so it must not be lenient"
+            );
+            let err = encode_unseen_g(&model)
+                .expect_err("an unseen g must be refused when g carries per-level curves");
+            assert!(
+                err.contains("unseen level"),
+                "{label}: expected an unseen-level schema mismatch, got: {err}"
+            );
+        }
+
+        let model = model_with(level_curve(2));
+        assert!(
+            model.random_effect_group_columns().contains("g"),
+            "a group(g) whose column carries no per-level curve keeps the held-out-group policy"
+        );
+        encode_unseen_g(&model).expect("group(g) alone tolerates an unseen level");
     }
 
     #[test]
@@ -7905,12 +8083,11 @@ mod tests {
         assert!(err.to_string().contains("payload schema mismatch"));
     }
 
-    /// #2955: the schema one version before the one-store covariance is still
-    /// read, because its only difference is the inference block's covariance
-    /// copies, which were checked against the top-level stores at save and which
-    /// the reader drops. The version before that one is refused.
+    /// #3001: an older payload froze a gauged smooth's composed chart and no collection
+    /// chart, so this binary cannot replay it in the fit's order. Every version but its own,
+    /// older or later, is refused by the named version error before a field is read.
     #[test]
-    fn the_covariance_copies_payload_version_is_readable_and_its_predecessor_is_not_2955() {
+    fn every_payload_version_but_this_binarys_is_refused_by_name_3001() {
         let blocks = || {
             vec![FittedBlock {
                 beta: array![0.1],
@@ -7919,122 +8096,24 @@ mod tests {
                 lambdas: Array1::zeros(0),
             }]
         };
-        FittedModel::from_payload(marginal_slope_payload(
-            COVARIANCE_COPIES_PAYLOAD_VERSION,
-            saved_fit(blocks()),
-        ))
-        .payload()
-        .validate_payload_version()
-        .expect("a payload written with the covariance copies is readable");
-        let err = FittedModel::from_payload(marginal_slope_payload(
-            COVARIANCE_COPIES_PAYLOAD_VERSION - 1,
-            saved_fit(blocks()),
-        ))
-        .payload()
-        .validate_payload_version()
-        .expect_err("the version before the covariance-copies schema is refused");
-        assert!(err.to_string().contains("payload schema mismatch"));
-    }
-
-    /// #2901: a payload written before the EDF rank-bound status, at v19 or at the
-    /// covariance-copies v18, passes the version gate. The field it lacks,
-    /// `FitInference::edf_rank_bound`, carries `#[serde(default)]`, so it reads as empty.
-    /// The v20 schema before the rho-posterior adequacy tokens (#2946 T2) passes too;
-    /// its old tokens read as aliases.
-    /// The v22 schema before the latent-law record (gam#2926) passes too; the field it lacks
-    /// carries `#[serde(default)]`.
-    #[test]
-    fn the_payload_before_the_edf_rank_bound_status_is_readable_2901() {
-        let blocks = || {
-            vec![FittedBlock {
-                beta: array![0.1],
-                role: BlockRole::Mean,
-                edf: 1.0,
-                lambdas: Array1::zeros(0),
-            }]
-        };
-        for version in [
-            MODEL_PAYLOAD_VERSION,
-            CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION,
-            CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
-            CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
-            MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
-            SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
-            POLISH_STEP_BUDGET_PAYLOAD_VERSION,
-            TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
-            WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
-            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
-            LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
-            OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
-            RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
-            LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION,
-            NEWTON_POLISH_ABSENT_PAYLOAD_VERSION,
-            RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION,
-            EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION,
-            COVARIANCE_COPIES_PAYLOAD_VERSION,
-        ] {
-            FittedModel::from_payload(marginal_slope_payload(version, saved_fit(blocks())))
+        FittedModel::from_payload(marginal_slope_payload(MODEL_PAYLOAD_VERSION, saved_fit(blocks())))
+            .payload()
+            .validate_payload_version()
+            .expect("a payload at this binary's version is readable");
+        assert_eq!(READABLE_PAYLOAD_VERSIONS, [MODEL_PAYLOAD_VERSION]);
+        for version in (0..MODEL_PAYLOAD_VERSION).chain([MODEL_PAYLOAD_VERSION + 1]) {
+            let err = FittedModel::from_payload(marginal_slope_payload(version, saved_fit(blocks())))
                 .payload()
                 .validate_payload_version()
-                .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
+                .expect_err("a payload at another version is refused");
+            let message = err.to_string();
+            assert!(
+                message.contains("payload schema mismatch")
+                    && message.contains(&format!("file has version={version}"))
+                    && message.contains(&format!("MODEL_PAYLOAD_VERSION={MODEL_PAYLOAD_VERSION}")),
+                "payload version {version} must be refused by its version: {message}"
+            );
         }
-        assert_eq!(CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
-        assert_eq!(
-            CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
-            CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
-            CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
-            CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
-            MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            POLISH_STEP_BUDGET_PAYLOAD_VERSION,
-            SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
-            POLISH_STEP_BUDGET_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
-            TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
-            WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION,
-            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION
-        );
-        assert_eq!(
-            LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
-            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
-            LOCATION_ONLY_SCALE_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
-            OUTER_WARM_START_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION,
-            RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(NEWTON_POLISH_ABSENT_PAYLOAD_VERSION, LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION - 1);
-        assert_eq!(RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION, NEWTON_POLISH_ABSENT_PAYLOAD_VERSION - 1);
-        assert_eq!(EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION, RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION - 1);
-        assert_eq!(COVARIANCE_COPIES_PAYLOAD_VERSION, EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION - 1);
     }
 
     /// gam#3002: a certified point saved before v28 reads with its `rho` as `theta` and with
@@ -8058,267 +8137,6 @@ mod tests {
         let text = serde_json::to_string(&current).expect("a v28 point writes");
         let read: OuterWarmStartRecord = serde_json::from_str(&text).expect("a v28 point reads");
         assert_eq!(read, current);
-    }
-
-    /// #2954: a payload written before the certificate recorded its Newton polish and each
-    /// railed coordinate's face kind loads, with no polish and the face `Unrecorded`, never as a
-    /// kind the record did not hold; and a payload claiming a later version than this binary
-    /// writes is refused by the named version error.
-    #[test]
-    fn a_payload_before_the_newton_polish_loads_with_unrecorded_faces_2954() {
-        let blocks = || {
-            vec![FittedBlock {
-                beta: array![0.1],
-                role: BlockRole::Mean,
-                edf: 1.0,
-                lambdas: Array1::zeros(0),
-            }]
-        };
-        let mut fit = saved_fit(blocks());
-        fit.artifacts.criterion_certificate =
-            Some(gam_solve::rho_optimizer::OuterCriterionCertificate {
-                stationarity: gam_solve::rho_optimizer::OuterStationarityCertificate::AnalyticGradient {
-                    grad_norm: 2e-7,
-                    projected_grad_norm: 2e-7,
-                    bound: 1e-5,
-                    rung: gam_solve::rho_optimizer::CertifiedRung {
-                        label: "solver-band".to_string(),
-                        derived_standard: false,
-                    },
-                },
-                curvature: gam_solve::rho_optimizer::CurvatureEvidence::Measured { psd: true },
-                lambdas_railed: vec![0],
-                railed_facts: vec![gam_solve::rho_optimizer::RailedCoordinateFact {
-                    index: 0,
-                    theta: 20.0,
-                    lower: -20.0,
-                    upper: 20.0,
-                    margin: 0.5,
-                    face: gam_solve::model_types::RailFaceKind::LimitModel,
-                }],
-                newton_polish: None,
-                curvature_floor: None,
-            });
-        let payload = marginal_slope_payload(NEWTON_POLISH_ABSENT_PAYLOAD_VERSION, fit);
-        let mut older = serde_json::to_value(&payload).expect("serialize the payload");
-        for materialization in ["fit_result", "unified"] {
-            if let Some(certificate) = older
-                .get_mut(materialization)
-                .and_then(|fit| fit.get_mut("artifacts"))
-                .and_then(|artifacts| artifacts.get_mut("criterion_certificate"))
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                certificate.remove("newton_polish");
-                certificate["railed_facts"][0]
-                    .as_object_mut()
-                    .expect("a railed fact serializes as an object")
-                    .remove("face")
-                    .expect("the face kind was written");
-            }
-        }
-        let loaded: FittedModelPayload =
-            serde_json::from_value(older).expect("a payload before the Newton polish parses");
-        FittedModel::from_payload(loaded.clone())
-            .payload()
-            .validate_payload_version()
-            .expect("a payload before the Newton polish is readable");
-        let certificate = loaded
-            .fit_result
-            .as_ref()
-            .and_then(|fit| fit.artifacts.criterion_certificate.as_ref())
-            .expect("the loaded fit keeps its certificate");
-        assert!(certificate.newton_polish.is_none());
-        assert_eq!(
-            certificate.railed_facts[0].face,
-            gam_solve::model_types::RailFaceKind::Unrecorded
-        );
-
-        let err = FittedModel::from_payload(marginal_slope_payload(
-            MODEL_PAYLOAD_VERSION + 1,
-            saved_fit(blocks()),
-        ))
-        .payload()
-        .validate_payload_version()
-        .expect_err("a payload from a later schema is refused");
-        assert!(
-            err.to_string().contains(&format!(
-                "file has version={}, this binary expects MODEL_PAYLOAD_VERSION={MODEL_PAYLOAD_VERSION}",
-                MODEL_PAYLOAD_VERSION + 1
-            )),
-            "{err}"
-        );
-    }
-
-    /// gam#3166: 996d0af2c1 replaced the Newton-polish record's `step_budget` with
-    /// `settled` without a version bump, so v29 has two shapes.
-    /// - A v29 payload written before that commit carries `step_budget` and no `settled`.
-    ///   It loads with `settled` false.
-    /// - A v29 payload written after it carries `settled` and no `step_budget`. It loads
-    ///   as written.
-    /// - A payload claiming the version after this binary's is refused by the named
-    ///   version error, as a v29 binary refuses a v30 payload.
-    #[test]
-    fn both_v29_polish_record_shapes_load_and_a_later_version_is_refused_by_name_3166() {
-        use gam_solve::model_types::NewtonPolishRecord;
-        let blocks = || {
-            vec![FittedBlock {
-                beta: array![0.1],
-                role: BlockRole::Mean,
-                edf: 1.0,
-                lambdas: Array1::zeros(0),
-            }]
-        };
-        let polish = NewtonPolishRecord {
-            lambda_sq_before: 1.5e-6,
-            lambda_sq_after: 2.0e-9,
-            decreases: vec![7.0e-7, -3.0e-8],
-            settled: true,
-            rails: Vec::new(),
-            entry: vec![0.3],
-        };
-        let mut fit = saved_fit(blocks());
-        fit.artifacts.criterion_certificate =
-            Some(gam_solve::rho_optimizer::OuterCriterionCertificate {
-                stationarity:
-                    gam_solve::rho_optimizer::OuterStationarityCertificate::AnalyticGradient {
-                        grad_norm: 2e-7,
-                        projected_grad_norm: 2e-7,
-                        bound: 1e-5,
-                        rung: gam_solve::rho_optimizer::CertifiedRung {
-                            label: "newton-decrement".to_string(),
-                            derived_standard: true,
-                        },
-                    },
-                curvature: gam_solve::rho_optimizer::CurvatureEvidence::Measured { psd: true },
-                lambdas_railed: Vec::new(),
-                railed_facts: Vec::new(),
-                newton_polish: Some(polish.clone()),
-                curvature_floor: None,
-            });
-        let written = serde_json::to_value(marginal_slope_payload(
-            POLISH_STEP_BUDGET_PAYLOAD_VERSION,
-            fit,
-        ))
-        .expect("serialize a v29 payload");
-        // The record as each v29 writer left it: before 996d0af2c1 it held the step
-        // budget and no settling flag.
-        let as_written = |before_996d: bool| {
-            let mut value = written.clone();
-            let mut records = 0;
-            for materialization in ["fit_result", "unified"] {
-                if let Some(record) = value
-                    .get_mut(materialization)
-                    .and_then(|fit| fit.get_mut("artifacts"))
-                    .and_then(|artifacts| artifacts.get_mut("criterion_certificate"))
-                    .and_then(|certificate| certificate.get_mut("newton_polish"))
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    records += 1;
-                    if before_996d {
-                        record
-                            .remove("settled")
-                            .expect("the settling flag was written");
-                        record.insert("step_budget".to_string(), serde_json::json!(2));
-                    }
-                }
-            }
-            assert!(records > 0, "the payload carries the polish record");
-            value
-        };
-        for (before_996d, settled) in [(true, false), (false, true)] {
-            let loaded: FittedModelPayload = serde_json::from_value(as_written(before_996d))
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "a v29 payload (written before 996d0af2c1: {before_996d}) parses: {error}"
-                    )
-                });
-            FittedModel::from_payload(loaded.clone())
-                .payload()
-                .validate_payload_version()
-                .expect("a v29 payload is readable");
-            let record = loaded
-                .fit_result
-                .as_ref()
-                .and_then(|fit| fit.artifacts.criterion_certificate.as_ref())
-                .and_then(|certificate| certificate.newton_polish.as_ref())
-                .expect("the loaded certificate keeps its polish");
-            assert_eq!(
-                record,
-                &NewtonPolishRecord {
-                    settled,
-                    ..polish.clone()
-                },
-                "written before 996d0af2c1: {before_996d}"
-            );
-        }
-
-        let newer = MODEL_PAYLOAD_VERSION + 1;
-        let err = FittedModel::from_payload(marginal_slope_payload(newer, saved_fit(blocks())))
-            .payload()
-            .validate_payload_version()
-            .expect_err("a payload from a later schema is refused");
-        let message = err.to_string();
-        assert!(
-            message.contains("payload schema mismatch")
-                && message.contains(&format!("file has version={newer}"))
-                && message.contains(&format!("MODEL_PAYLOAD_VERSION={MODEL_PAYLOAD_VERSION}")),
-            "a later payload must be refused by its version: {message}"
-        );
-    }
-
-    /// gam#2926: a v22 payload, written before `latent_law_consumed` existed, is read
-    /// by this binary and records no latent law; a current payload with no record
-    /// round-trips; and a payload claiming a schema above this binary's is refused by
-    /// its version, not by a field it cannot parse.
-    #[test]
-    fn a_payload_before_the_latent_law_record_is_read_and_a_newer_one_is_refused_2926() {
-        let blocks = || {
-            vec![FittedBlock {
-                beta: array![0.1],
-                role: BlockRole::Mean,
-                edf: 1.0,
-                lambdas: Array1::zeros(0),
-            }]
-        };
-        let payload =
-            marginal_slope_payload(LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION, saved_fit(blocks()));
-        let mut value = serde_json::to_value(&payload).expect("serialize a v22 payload");
-        value
-            .as_object_mut()
-            .expect("a payload is a JSON object")
-            .remove("latent_law_consumed")
-            .expect("the record is written, as null when there is none");
-        let older: FittedModelPayload =
-            serde_json::from_value(value).expect("a v22 payload without the record deserializes");
-        assert!(older.latent_law_consumed.is_none());
-        FittedModel::from_payload(older)
-            .payload()
-            .validate_payload_version()
-            .expect("a v22 payload is readable");
-
-        let current = marginal_slope_payload(MODEL_PAYLOAD_VERSION, saved_fit(blocks()));
-        assert!(current.latent_law_consumed.is_none());
-        let text = serde_json::to_string(&current).expect("serialize a current payload");
-        let reloaded: FittedModelPayload =
-            serde_json::from_str(&text).expect("a current payload round-trips");
-        assert!(reloaded.latent_law_consumed.is_none());
-        FittedModel::from_payload(reloaded)
-            .payload()
-            .validate_payload_version()
-            .expect("a current payload is readable");
-
-        let newer = MODEL_PAYLOAD_VERSION + 1;
-        let err = FittedModel::from_payload(marginal_slope_payload(newer, saved_fit(blocks())))
-            .payload()
-            .validate_payload_version()
-            .expect_err("a payload from a newer schema is refused");
-        let message = err.to_string();
-        assert!(
-            message.contains("payload schema mismatch")
-                && message.contains(&format!("file has version={newer}"))
-                && message.contains(&format!("MODEL_PAYLOAD_VERSION={MODEL_PAYLOAD_VERSION}")),
-            "a newer payload must be refused by its version: {message}"
-        );
     }
 
     /// #2902 row 34: at payload version 17 a binomial beta-logistic link's

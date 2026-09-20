@@ -4006,7 +4006,6 @@ dependencies = [
  "approx",
  "cudarc",
  "dyn-stack",
- "env_logger",
  "faer",
  "gam-geometry",
  "gam-gpu",

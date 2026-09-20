@@ -153,7 +153,6 @@ __all__ = [
     "curvature_inference_json",
     "cyclic_bspline_roughness_penalty",
     "debiased_functional",
-    "default_survival_time_grid",
     "derive_ivae_aux_scale",
     "diagnostics_anchor_consistency_report",
     "diagnostics_aux_richness",
@@ -179,6 +178,7 @@ __all__ = [
     "equivariant_rho_so2_jvp",
     "equivariant_rho_so3",
     "equivariant_rho_so3_jvp",
+    "evidence_ratio",
     "expected_resolution_budget",
     "extend_model_with_group",
     "extract_reml_score_raw",
@@ -246,7 +246,6 @@ __all__ = [
     "linear_dictionary_transform_ffi",
     "load_joint_event_model",
     "log_e_from_p_value",
-    "log_evidence_ratio",
     "log_loss_from_predictions",
     "loop_holonomy",
     "manifold_ambient_dimension",
@@ -399,6 +398,7 @@ __all__ = [
     "sphere_basis_hessian",
     "sphere_basis_jet",
     "sphere_basis_jet_with_centers",
+    "sphere_basis_size",
     "sphere_basis_with_centers",
     "sphere_frechet_mean",
     "sphere_input_location_first_derivative",
@@ -1697,8 +1697,6 @@ def cyclic_bspline_roughness_penalty(num_basis: int, degree: int = ..., period: 
 
 def debiased_functional(beta: NDArray[np.float64], penalized_hessian: NDArray[np.float64], row_scores: NDArray[np.float64], penalty_beta: NDArray[np.float64], target: str, design_row: NDArray[np.float64] | None = ..., design_row_b: NDArray[np.float64] | None = ..., design_matrix: NDArray[np.float64] | None = ..., weights: NDArray[np.float64] | None = ..., leverage: NDArray[np.float64] | None = ...) -> dict[Any, Any]: ...
 
-def default_survival_time_grid(model_class: str, formula: str, headers: Sequence[str], rows: _EncodedTable, model_bytes: Sequence[int] | None = ...) -> list[float] | None: ...
-
 def derive_ivae_aux_scale(aux: NDArray[np.float64]) -> NDArray[np.float64]: ...
 
 def diagnostics_anchor_consistency_report(assignments: NDArray[np.float64], anchor_dominance: float | None = ...) -> dict[Any, Any]: ...
@@ -1748,6 +1746,8 @@ def equivariant_rho_so2_jvp(theta: NDArray[np.float64]) -> NDArray[np.float64]: 
 def equivariant_rho_so3(omega: NDArray[np.float64]) -> NDArray[np.float64]: ...
 
 def equivariant_rho_so3_jvp(omega: NDArray[np.float64], domega: NDArray[np.float64]) -> NDArray[np.float64]: ...
+
+def evidence_ratio(model_a: _FittedModel, model_b: _FittedModel) -> float: ...
 
 def expected_resolution_budget(alpha: float, growth_nats_per_obs: float) -> float | None: ...
 
@@ -1882,8 +1882,6 @@ def linear_dictionary_transform_ffi(x: NDArray[np.float64], atoms: NDArray[np.fl
 def load_joint_event_model(path: str) -> _JointEventModel: ...
 
 def log_e_from_p_value(p_value: float) -> float: ...
-
-def log_evidence_ratio(model_a: _FittedModel, model_b: _FittedModel) -> float: ...
 
 def log_loss_from_predictions(observed: Sequence[float], predicted_mean: Sequence[float]) -> float: ...
 
@@ -2188,6 +2186,8 @@ def sphere_basis_hessian(points: NDArray[np.float64], n_centers: int, centers: N
 def sphere_basis_jet(points: NDArray[np.float64], n_centers: int, penalty_order: int = ..., kernel: str = ..., radians: bool = ...) -> NDArray[np.float64]: ...
 
 def sphere_basis_jet_with_centers(points: NDArray[np.float64], centers: NDArray[np.float64], penalty_order: int = ..., kernel: str = ..., radians: bool = ...) -> NDArray[np.float64]: ...
+
+def sphere_basis_size(n_centers: int, kernel: str = ...) -> int: ...
 
 def sphere_basis_with_centers(points: NDArray[np.float64], centers: NDArray[np.float64], penalty_order: int = ..., kernel: str = ..., radians: bool = ...) -> tuple[NDArray[np.float64], NDArray[np.float64]]: ...
 

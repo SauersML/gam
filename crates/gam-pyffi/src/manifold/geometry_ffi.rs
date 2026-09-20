@@ -4706,13 +4706,12 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(flat_to_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(extract_row_ids, module)?)?;
-    module.add_function(wrap_pyfunction!(default_survival_time_grid, module)?)?;
     module.add_function(wrap_pyfunction!(torch_from_fitted, module)?)?;
     module.add_function(wrap_pyfunction!(fit_table, module)?)?;
     module.add_function(wrap_pyfunction!(fit_array, module)?)?;
     module.add_class::<PyFittedModel>()?;
     module.add_function(wrap_pyfunction!(compile_model, module)?)?;
-    module.add_function(wrap_pyfunction!(log_evidence_ratio, module)?)?;
+    module.add_function(wrap_pyfunction!(evidence_ratio, module)?)?;
     module.add_function(wrap_pyfunction!(student_t_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_kind, module)?)?;
     module.add_function(wrap_pyfunction!(write_saved_model_file, module)?)?;
@@ -4796,6 +4795,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(duchon_function_norm_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_operator_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_basis, module)?)?;
+    module.add_function(wrap_pyfunction!(sphere_basis_size, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_basis_with_centers, module)?)?;
     module.add_function(wrap_pyfunction!(
         sphere_select_farthest_point_centers,
@@ -7304,7 +7304,7 @@ fn predict_columns(
     )?;
     let predictor = model
         .predictor()
-        .ok_or_else(|| "saved model could not construct a predictor".to_string())?;
+        .map_err(|reason| format!("saved model could not construct a predictor: {reason}"))?;
     let fit = fit_result_from_saved_model_for_prediction(model)?;
 
     let mut columns = BTreeMap::<String, Vec<f64>>::new();
