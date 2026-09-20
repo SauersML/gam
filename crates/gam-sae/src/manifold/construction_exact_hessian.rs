@@ -7329,9 +7329,8 @@ impl SaeManifoldTerm {
 #[cfg(test)]
 mod test_support {
     use super::Side;
-    use super::{
-        ArrowFactorCache, DeflatedArrowSolver, SaeArrowVector, SaeManifoldRho,
-    };
+    use super::{ArrowFactorCache, SaeArrowVector, SaeManifoldRho};
+    use crate::manifold::tests_dense_solver_oracles::DeflatedArrowSolver;
     use gam_linalg::faer_ndarray::FaerEigh;
     use ndarray::{Array1, Array2};
 

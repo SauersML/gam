@@ -6,20 +6,6 @@ pub(crate) const SAE_MANIFOLD_ARMIJO_C1: f64 = opt::constants::ARMIJO_C1;
 
 pub(crate) const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
 
-/// Relative Cholesky-pivot floor for the analytic SAE outer-rho gradient.
-///
-/// The evidence value can still be honest below this threshold because it only
-/// sums `log(diag(L))`. The analytic gradient is different: selected-inverse
-/// traces and `ArrowFactorCache::full_inverse_apply` divide by those pivots.
-/// Once `min_pivot / max_pivot` is below this floor, the gradient lane must
-/// either identify a closed-form gauge orbit and stiffen only that quotient
-/// direction, or reject the trial rho as numerically singular.
-#[cfg(test)]
-pub(crate) const SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR: f64 = 1.0e-12;
-
-#[cfg(test)]
-pub(crate) const SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR: f64 = 1.0e-8;
-
 /// Relative spectral cutoff below which a penalised decoder β-curvature
 /// eigenvalue (`G_k + λ_smooth·S_k`) is treated as a genuine flat direction of
 /// the joint inner Hessian — the rank-deficient-decoder null quotiented out of

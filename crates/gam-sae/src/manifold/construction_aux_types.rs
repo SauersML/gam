@@ -17,11 +17,8 @@ use super::*;
 /// authorizing a degraded fallback direction.
 #[derive(Clone, Debug)]
 pub(crate) enum OuterGradientError {
-    /// Near-singular B-cache pivots on the test-only dense deflated-solver
-    /// oracle lane (`outer_gradient_arrow_solver`).
-    #[cfg(test)]
-    IllConditioned { reason: String },
-    /// A non-identifiable / gauge-degenerate direction at this ρ.
+    /// A non-identifiable, gauge-degenerate or numerically singular joint
+    /// Hessian direction at this ρ.
     NonIdentifiable { reason: String },
     /// Unexpected: shape/dimension mismatch, non-finite intermediate, or a
     /// violated internal invariant.
@@ -79,8 +76,6 @@ impl OuterGradientError {
 impl std::fmt::Display for OuterGradientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            #[cfg(test)]
-            Self::IllConditioned { reason } => write!(f, "ill-conditioned: {reason}"),
             Self::NonIdentifiable { reason } => write!(f, "non-identifiable: {reason}"),
             Self::InternalInvariant { reason } => write!(f, "internal invariant: {reason}"),
         }
@@ -100,10 +95,6 @@ impl From<OuterGradientError> for EstimationError {
     fn from(error: OuterGradientError) -> Self {
         let reason = error.to_string();
         match error {
-            #[cfg(test)]
-            OuterGradientError::IllConditioned { .. } => {
-                EstimationError::TrialPointRefused { reason }
-            }
             OuterGradientError::NonIdentifiable { .. } => {
                 EstimationError::TrialPointRefused { reason }
             }
