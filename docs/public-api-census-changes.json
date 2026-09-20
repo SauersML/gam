@@ -4964,5 +4964,13 @@
     },
     "reason": "#3452: compute the covariance from joint per-observation first-stage and empirical-grid sampling influences, preserving their cross covariance. The former standalone sandwich production function is replaced by the live row-influence Gram. Tests independently assemble score meat and block inverse bread rather than retain the removed implementation.",
     "evidence": "MSI: seven numerical checks pass, including builder weight finite differences, independently assembled sandwich covariance, exact opposing-influence cancellation and 4000 grid-only Monte Carlo samples. Two complete BMS fits (Gaussian and heavy-tailed, n=2000) return finite corrected covariance. Complete model unit-source metadata compiles with warnings denied. No 800-fit CI sweep or timeout extension is introduced."
+  },
+  {
+    "base": "3438024c79eff8ae54c42ed4b6885b96b66a6288",
+    "removed": {
+      "crates/gam-runtime/src/cgroup_memory.rs::from_consistent_counters": 1
+    },
+    "reason": "#4380: cgroup charge and inactive-file statistics are separately sampled. The shared constructor retains the raw counters while assigning no reclaim credit when inactive_file exceeds the charge, preserving limit-current headroom. Both v1/v2 probes and simulated observations use it; the obsolete inconsistent-counters refusal and constructor are removed.",
+    "evidence": "MSI complete runtime unit binary compiles with warnings denied in3.38sec. Nine span tests, eight cgroup tests and26 downstream resource-policy tests pass, including adjacent-float interval membership and216 wide-integer counter combinations. All27 production crates compile coherently on main6f9de4f plus revised4378/4382; complete model unit-source metadata is checked separately. Source census finds no remaining calls to the retired constructor, refusal variant or span wrapper."
   }
 ]

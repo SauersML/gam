@@ -2994,5 +2994,14 @@
     ],
     "reason": "#2469: HTML summary numbers now use the canonical six-significant-digit formatter; its notation selection also honors rounding across decimal boundaries. The duplicate formatter and its obsolete tests are replaced by tests of the active implementation.",
     "evidence": "All42 complete gam-report unit tests pass on MSI, including rounding boundaries, subnormal/maxfinite values, existing HTML checks, and no report-invented significance threshold. No fmt_num definition or call remains."
+  },
+  {
+    "base": "3438024c79eff8ae54c42ed4b6885b96b66a6288",
+    "items": [
+      "crates/gam-runtime/src/cgroup_memory.rs:fn:from_consistent_counters",
+      "crates/gam-runtime/src/cgroup_memory.rs:fn:inconsistent_cache_counter_fails_closed"
+    ],
+    "reason": "#4380: cgroup charge and inactive-file statistics are separately sampled. The shared constructor retains the raw counters while assigning no reclaim credit when inactive_file exceeds the charge, preserving limit-current headroom. Both v1/v2 probes and simulated observations use it; the obsolete inconsistent-counters refusal and constructor are removed.",
+    "evidence": "MSI complete runtime unit binary compiles with warnings denied in3.38sec. Nine span tests, eight cgroup tests and26 downstream resource-policy tests pass, including adjacent-float interval membership and216 wide-integer counter combinations. All27 production crates compile coherently on main6f9de4f plus revised4378/4382; complete model unit-source metadata is checked separately. Source census finds no remaining calls to the retired constructor, refusal variant or span wrapper."
   }
 ]
