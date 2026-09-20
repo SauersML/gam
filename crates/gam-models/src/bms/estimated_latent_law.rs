@@ -323,20 +323,23 @@ pub(crate) fn build_empirical_law_on_own_axis(
 /// The Gaussian closed form's anchoring residual at one survival anchor under a
 /// finite law (gam#2926): `r = Σ_k w_k Φ(−(α_cf + b·u_k)) − Φ(−q)` at
 /// `α_cf = q·√(1+b²)`, the standard deviation of `Φ(−(α_cf + b·U))` under the
-/// law, and `π(1−π)` with `π = Φ(−q)`. The sums run on the smaller tail, so a
-/// survival probability near one keeps its precision.
+/// law, `π(1−π)` with `π = Φ(−q)`, and the smaller-tail probabilities at the law's
+/// nodes. The sums run on the smaller tail, so a survival probability near one keeps
+/// its precision.
 pub(crate) fn closed_form_survival_anchoring_residual(
     q: f64,
     observed_slope: f64,
     law: &EmpiricalZGrid,
-) -> (f64, f64, f64) {
+) -> (f64, f64, f64, Vec<f64>) {
     let alpha = q * (1.0 + observed_slope * observed_slope).sqrt();
     let probabilities: Vec<f64> = law
         .nodes
         .iter()
         .map(|&u| survival_tail_probability(q, alpha + observed_slope * u))
         .collect();
-    anchoring_residual_from_tail_probabilities(q, &law.weights, &probabilities)
+    let (residual, law_sd, scale) =
+        anchoring_residual_from_tail_probabilities(q, &law.weights, &probabilities);
+    (residual, law_sd, scale, probabilities)
 }
 
 /// The moving-law certificate's `(ln S, ln(1 − S))` of one rigid survival anchor
