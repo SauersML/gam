@@ -4680,5 +4680,21 @@
     },
     "reason": "#2902: the test pinned SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS, a +-4 tau hand box on each accepted Newton step of the assignment logits (SPEC 18-22). The cap is deleted (the Armijo line search on the realised objective globalises the step), so the test that asserted the clamp retires with it.",
     "evidence": "Replaced by manifold::tests::assignment_logit_newton_step_is_realised_unboxed, which asserts the realised within-row logit move equals step_size * delta for a 1e3 tau raw delta; it fails on main f4db2a2b (the cap realises 4 tau instead of 500 tau) and passes on this branch."
+  },
+  {
+    "base": "f9f0a6e6ecd0b6c3306926064d7d48ecc86219fa",
+    "removed": {
+      "crates/gam-solve/src/reml/per_atom_efs.rs::sanitize_step": 1
+    },
+    "reason": "#2902: the per-atom EFS primary boxed each coordinate's log-lambda step to +-5 (PER_ATOM_MAX_STEP), stopped halving after a fixed 8 (PER_ATOM_MAX_BACKTRACK), accepted cost increases up to 1e-12 relative (PER_ATOM_COST_DESCENT_TOL), and zeroed non-finite step components (sanitize_step) so the infinity-norm test could certify an unresolved coordinate (SPEC 18-22). The step is now taken as eval_efs produced it; halving runs while 2^-k*|step|_inf >= tolerance; acceptance uses the two costs' rounding bands gamma_1*(|f|+|f'|); finite_step refuses a non-finite component.",
+    "evidence": "git grep finds no remaining use of the three constants or sanitize_step. New tests in crates/gam-solve/src/reml/per_atom_efs.rs: decoupled_step_is_realised_without_a_per_coordinate_box (2 iterations; main 5), backtracking_halves_until_the_step_is_unresolvable (alpha 2^-9; main stalls), backtracking_refuses_a_resolvable_cost_increase (main accepts +5e-13), non_finite_decoupled_step_is_refused_not_zeroed (main reports converged) -- all four fail on main and pass on the branch. cargo test -p gam-solve --lib -- rho_optimizer reml: 968 passed, 0 failed."
+  },
+  {
+    "base": "da88d1a69574d571d8439ccc1c978bf483b0b225",
+    "removed": {
+      "crates/gam-solve/src/inference/residual_factor.rs::bic_penalized_log_likelihood": 1
+    },
+    "reason": "#2901/#2902 (lane bic-removal, SPEC R11/R18/R23): the structured residual model's BIC rank ladder is replaced by the Laplace marginal likelihood of every identifiable rank (residual_factor/evidence.rs). The ladder's alternating fixed-rank fit (fit_fixed_rank with its ALTERNATION_MAX_SWEEPS cap and the DIAGONAL_REL_FLOOR / SCALE_REL_FLOOR clamps), its BIC scorer (gaussian_bic_log_likelihood[_with_band], bic_penalized_log_likelihood) and its moment helpers (column_variances, scaled_second_moment[_chunk], factor_coordinates, moving_average_3, is_finite) have no remaining caller. The tests of the removed internals (hoisted_gram_matches_naive_per_row_rebuild with its naive_* oracles, occupancy_scale_improves_second_moment_reconstruction) go with them; evidence_ladder_prefers_planted_rank_one is superseded by evidence_prefers_planted_rank_one on the same planted DGP.",
+    "evidence": "Replacement: evidence::fit_rank and StructuredResidualModel::log_evidence in crates/gam-solve/src/inference/residual_factor*. The only external reader of bic_penalized_log_likelihood (gam-sae fit_entry.rs StructuredResidualPassDiagnostic and its pyffi dict key) now reads log_evidence. cargo test -p gam-solve --lib residual_factor: 9/9 pass, including the null (rank 0 on three seeds, p = 6) and the planted rank-1 and rank-2 recoveries."
   }
 ]

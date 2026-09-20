@@ -1562,6 +1562,12 @@ pub struct OuterResult {
     /// Final value and gradient when the solver is gradient-based, with the ρ
     /// they were measured at.
     pub final_measurement: Option<OuterFirstOrderMeasurement>,
+    /// The measurement a certificate pass displaced from `final_measurement`
+    /// when it re-measured this ρ. A later pass at the same ρ re-measures from
+    /// the same reset state and replays the earlier pass bit for bit, so without
+    /// this record it would hold two copies of one measurement and never the
+    /// independent one the solver took.
+    pub displaced_measurement: Option<OuterFirstOrderMeasurement>,
     /// Final Hessian when the solver tracks one.
     pub final_hessian: Option<Array2<f64>>,
     /// Single authoritative termination lifecycle. Private so downstream
@@ -1745,6 +1751,7 @@ impl OuterResult {
             iterations,
             final_grad_norm: None,
             final_measurement: None,
+            displaced_measurement: None,
             final_hessian: None,
             termination: OuterTermination::from_solver_claim(solver_claimed_convergence),
             plan_used,
@@ -3654,6 +3661,7 @@ fn certify_fixed_point_optimality(
     result.final_value = evaluation.cost;
     result.final_grad_norm = None;
     result.final_measurement = None;
+    result.displaced_measurement = None;
     result.final_hessian = None;
 
     let certificate = OuterCriterionCertificate {
@@ -4188,6 +4196,14 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // objective at one point — the raw material for the gradient-reproducibility
     // floor further down, at zero additional objective evaluations.
     let run_recorded = result.final_measurement.take();
+    // A previous certificate pass at this ρ (screening, before this mint)
+    // replaced the solver's measurement with its own reset re-measurement, which
+    // this pass's evaluation replays bit for bit. The measurement it displaced is
+    // the independent one.
+    let displaced = result
+        .displaced_measurement
+        .take()
+        .filter(|measurement| measurement.is_at(&result.rho));
 
     // Install measured first-order evidence before any fallible curvature
     // processing. If curvature is malformed, the retained resume checkpoint
@@ -4195,6 +4211,11 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     result.final_value = evaluation.cost;
     result.final_grad_norm = Some(projected_grad_norm);
     result.record_measurement_at_rho(evaluation.cost, evaluation.gradient);
+    result.displaced_measurement = displaced.clone().or_else(|| {
+        run_recorded
+            .clone()
+            .filter(|measurement| measurement.is_at(&result.rho))
+    });
 
     // #2596 — a pass that spends LESS evidence must not produce a STRONGER
     // refusal than the pass that mints.
@@ -4560,16 +4581,24 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             result.rho.to_vec(),
         );
     }
-    if decrement_decided.is_none()
-        && projected_grad_norm > stationarity_bound
-        && let Some(prior) = run_recorded.as_ref()
-        && prior.is_at(&result.rho)
-        && layout
-            .validate_gradient_len(prior.gradient(), "outer run-recorded gradient")
-            .is_ok()
-        && prior.gradient().iter().all(|value| value.is_finite())
-        && prior.value().is_finite()
-    {
+    //
+    // A mint that follows a screening pass at this ρ holds the screening's reset
+    // re-measurement as `run_recorded`, a bit-for-bit replay of its own
+    // evaluation, so the solver's measurement that screening displaced is
+    // weighed too. Otherwise the mint refuses on a spread of exactly zero a
+    // point the screening certified on the solver's evidence at the same ρ.
+    for prior in run_recorded.iter().chain(displaced.iter()) {
+        if decrement_decided.is_some()
+            || projected_grad_norm <= stationarity_bound
+            || !prior.is_at(&result.rho)
+            || layout
+                .validate_gradient_len(prior.gradient(), "outer run-recorded gradient")
+                .is_err()
+            || !prior.gradient().iter().all(|value| value.is_finite())
+            || !prior.value().is_finite()
+        {
+            continue;
+        }
         const GRADIENT_REPRODUCIBILITY_WIDENING: f64 = 2.0;
         let objective_tol = outer_criterion_resolution(config);
         let cost_drift = (prior.value() - evaluation.cost).abs();
