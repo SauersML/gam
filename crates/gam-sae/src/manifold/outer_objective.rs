@@ -1490,6 +1490,16 @@ impl SaeManifoldOuterObjective {
         Ok(samples)
     }
 
+    /// Test access to the probe count of the installed rational log|S| plan; `None`
+    /// before the streaming lane has built one.
+    #[cfg(test)]
+    pub(crate) fn surrogate_probe_count(&self) -> Option<usize> {
+        self.surrogate_lane
+            .as_ref()
+            .and_then(SurrogateLaneState::plan)
+            .map(|plan| plan.probes.len())
+    }
+
     /// Test access to the streaming gradient's dependence on its derivative bundle:
     /// the gradient on the whole bundle, and the gradient on each single bundle vector
     /// taken as a one-vector bundle. `None` off the streaming lane.

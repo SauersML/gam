@@ -469,6 +469,60 @@ fn streaming_gradient_is_affine_in_the_derivative_bundle_second_moment_2933() {
     }
 }
 
+/// #2933 F29 — a fit the streaming lane certifies on its rational log|S| surrogate is
+/// stamped only after the certificate survives probes the search never saw: the
+/// installed plan after [`SaeManifoldOuterObjective::run_to_certificate`] holds at
+/// least twice the search's probes, and the stamped terminal criterion is the one
+/// re-scored on that plan.
+#[test]
+fn surrogate_certificate_is_rescored_on_unseen_probes_before_stamping_2933() {
+    gam_runtime::test_support::install_diagnostic_logger();
+    let (mut term, target) = planted_arc_seed_term(256, 4, 0.02);
+    term.gpu_policy = gam_gpu::GpuPolicy::Off;
+    let default_plan = term
+        .streaming_plan()
+        .expect("streaming plan at the default host reading");
+    term.host_available_bytes = super::streaming_plan::SAE_HOST_MEMORY_RESERVE_FLOOR_BYTES
+        .saturating_add(default_plan.estimated_exact_stationarity_bytes)
+        .saturating_sub(1);
+    let p_beta = term.beta_dim();
+    let seed_rho = SaeManifoldRho::new(0.0, 0.05_f64.ln(), vec![Array1::<f64>::zeros(1)]);
+    let seed = seed_rho
+        .to_flat(&term.assignment)
+        .expect("flat seed coordinates");
+    let mut objective =
+        SaeManifoldOuterObjective::new(term, target, None, seed_rho, 40, 1.0, 1.0e-6, 1.0e-6);
+    let problem = gam_solve::rho_optimizer::OuterProblem::new(seed.len())
+        .with_problem_size(256 * 4, p_beta)
+        .with_initial_rho(seed)
+        .with_max_iter(60);
+    let search_probes = sae_surrogate_lane_config().num_probes;
+    let result = match objective
+        .run_to_certificate(&problem, "#2933 F29 planted arc")
+        .expect("outer search runs")
+    {
+        SaeOuterRun::Certified(result) => result,
+        other => panic!("the planted arc must certify on the streaming lane; got {other:?}"),
+    };
+    let installed = objective
+        .surrogate_probe_count()
+        .expect("premise: the starved host reading prices log|S| on the rational surrogate");
+    assert!(
+        installed >= 2 * search_probes,
+        "the certificate was stamped on {installed} probes, not re-scored on at least \
+         {} unseen ones",
+        search_probes
+    );
+    let terminal = objective
+        .terminal_penalized_quasi_laplace_criterion
+        .expect("a certified fit stamps its terminal criterion");
+    assert!(
+        terminal.is_finite(),
+        "terminal criterion {terminal} at rho {:?}",
+        result.rho
+    );
+}
+
 /// #2515 blocker 3 — WHICH assembly the stale-pair guard is comparing.
 ///
 /// `production_objective_forced_streaming_value_gradient_matches_dense` dies on
