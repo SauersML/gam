@@ -38,7 +38,9 @@ use crate::survival::location_scale::{
 };
 use crate::survival::latent::fixed_latent_hazard_frailty;
 use crate::survival::lognormal_kernel::FrailtySpec;
-use crate::survival::{CompetingRisksCifResult, assemble_competing_risks_cif_from_endpoints};
+use crate::survival::{
+    CompetingRisksCifResult, assemble_competing_risks_cif_from_endpoints_with_rounding,
+};
 use crate::wiggle::monotone_wiggle_basis_with_derivative_order;
 use gam_linalg::matrix::DesignMatrix;
 use gam_math::probability::normal_pdf;
@@ -2374,8 +2376,9 @@ pub struct HazardPathScores {
 /// differently-repaired matrix would make the two metrics disagree about which
 /// prediction they scored.
 ///
-/// `grid` must be strictly increasing with at least two points, `observed[i]`
-/// is `δ_i`, and every `event_times[i]` must be finite and positive — callers
+/// `grid` must start at the time origin `0` (the only time where `S = 1`, which
+/// the pinned first column asserts) and be strictly increasing with at least two
+/// points, `observed[i]` is `δ_i`, and every `event_times[i]` must be finite and positive — callers
 /// validate that, since what to do about a malformed input is theirs to decide.
 pub fn monotone_survival_and_hazard_scores(
     raw: ArrayView2<f64>,
@@ -2586,9 +2589,12 @@ pub struct SurvivalPredictionScores {
 /// scored on the same fold gets the same IPCW weights, and integration stops at
 /// the largest observed time, before the tail where those weights blow up.
 ///
-/// Every field is `None` when the shapes disagree, the grid is not strictly
-/// increasing with at least two points, or an event time is not finite and
-/// positive. What a malformed input means is decided here, once, for every front
+/// Every field is `None` when the shapes disagree, the grid does not start at
+/// the time origin `0` or is not strictly increasing with at least two points,
+/// or an event time is not finite and positive. The hazard-path scores integrate
+/// from `t = 0`, where `S = 1`: a grid starting later has no column for the
+/// hazard accumulated before its first point, and no interval containing an
+/// event before it. What a malformed input means is decided here, once, for every front
 /// door.
 pub fn survival_prediction_scores(
     event_times: &[f64],
@@ -2604,6 +2610,7 @@ pub fn survival_prediction_scores(
         || survival.nrows() != event_times.len()
         || survival.ncols() != grid.len()
         || grid.len() < 2
+        || grid[0] != 0.0
         || grid.windows(2).any(|pair| pair[1] <= pair[0])
         || event_times.iter().any(|time| !time.is_finite() || *time <= 0.0)
     {
@@ -2714,31 +2721,19 @@ impl KaplanMeier {
         Self::fit(time, &flipped)
     }
 
-    /// [`Self::at`] evaluated across a whole grid. `steps` is sorted by
-    /// construction, so each lookup is a binary search rather than the linear
-    /// scan `at` does — the difference matters when a caller evaluates a dense
-    /// grid against a step function with one step per event time.
+    /// [`Self::at`] evaluated across a whole grid.
     pub fn on_grid(&self, grid: &[f64]) -> Vec<f64> {
-        grid.iter()
-            .map(|&t| {
-                let idx = self.steps.partition_point(|&(time, _)| time <= t);
-                if idx == 0 { 1.0 } else { self.steps[idx - 1].1 }
-            })
-            .collect()
+        grid.iter().map(|&t| self.at(t)).collect()
     }
 
     /// Right-continuous step lookup: `Ŝ(t)` = survival at the last event time
-    /// `≤ t` (and `1.0` before the first event).
+    /// `≤ t` (and `1.0` before the first event). `steps` is sorted by
+    /// construction, so the lookup is a binary search: IPCW scoring evaluates
+    /// the censoring curve once per subject per grid point against one step per
+    /// distinct censoring time. A NaN `t` precedes no step and reads `1.0`.
     pub fn at(&self, t: f64) -> f64 {
-        let mut s = 1.0_f64;
-        for &(time, surv) in &self.steps {
-            if time <= t {
-                s = surv;
-            } else {
-                break;
-            }
-        }
-        s
+        let idx = self.steps.partition_point(|&(time, _)| time <= t);
+        if idx == 0 { 1.0 } else { self.steps[idx - 1].1 }
     }
 }
 
@@ -3653,6 +3648,11 @@ pub fn predict_competing_risks_survival(
     let mut cumulative_hazard_refined = (0..cause_count)
         .map(|_| Array2::<f64>::zeros((n, refined_cols)))
         .collect::<Vec<_>>();
+    // Rounding band of each refined cumulative hazard, so the AJ assembly
+    // clamps only decreases that are rounding of these evaluations (#3529).
+    let mut cumulative_hazard_refined_band = (0..cause_count)
+        .map(|_| Array2::<f64>::zeros((n, refined_cols)))
+        .collect::<Vec<_>>();
     let mut linear_predictor = (0..cause_count)
         .map(|_| Array1::<f64>::zeros(n))
         .collect::<Vec<_>>();
@@ -3666,6 +3666,8 @@ pub fn predict_competing_risks_survival(
         /// Cumulative hazard on the refined AJ grid (gam#1385); empty on the
         /// per-row-eval path.
         cumulative_refined: Vec<f64>,
+        /// Rounding band of each `cumulative_refined` entry (#3529).
+        cumulative_refined_band: Vec<f64>,
         eta_exit: f64,
     }
 
@@ -3676,7 +3678,7 @@ pub fn predict_competing_risks_survival(
             let i = flat % n;
             let block = &fit.blocks[cause];
             let timewiggle = saved_timewiggle_by_cause[cause].as_ref();
-            let evaluate_at = |t_query: f64| -> Result<(f64, f64, f64), SurvivalPredictError> {
+            let evaluate_at = |t_query: f64| -> Result<RpRowEvaluation, SurvivalPredictError> {
                 let t_entry = age_entry[i].min(t_query);
                 let single_entry = Array1::from_elem(1, t_entry);
                 let single_exit = Array1::from_elem(1, t_query);
@@ -3719,10 +3721,11 @@ pub fn predict_competing_risks_survival(
                 survival: vec![0.0; t_cols],
                 cumulative: vec![0.0; t_cols],
                 cumulative_refined: vec![0.0; refined_cols],
+                cumulative_refined_band: vec![0.0; refined_cols],
                 eta_exit: 0.0,
             };
             if per_row_eval {
-                let (eta_t, cum_t, haz_t) = evaluate_at(age_exit[i])?;
+                let (eta_t, cum_t, haz_t, cum_band_t) = evaluate_at(age_exit[i])?;
                 out.eta_exit = eta_t;
                 out.hazard[0] = haz_t;
                 out.cumulative[0] = cum_t;
@@ -3736,16 +3739,19 @@ pub fn predict_competing_risks_survival(
                 for s in 1..=CIF_REFINE_SUBINTERVALS {
                     let frac = (s as f64) / (CIF_REFINE_SUBINTERVALS as f64);
                     let t_query = age_exit[i] * frac;
-                    out.cumulative_refined[s - 1] = if t_query <= 0.0 {
-                        0.0
+                    let (cum, cum_band) = if t_query <= 0.0 {
+                        (0.0, 0.0)
                     } else if s == CIF_REFINE_SUBINTERVALS {
                         // frac == 1 exactly: reuse the exit evaluation so the
                         // assembled CIF and the reported cumulative hazard
                         // agree to the bit.
-                        cum_t
+                        (cum_t, cum_band_t)
                     } else {
-                        evaluate_at(t_query)?.1
+                        let (_, cum, _, cum_band) = evaluate_at(t_query)?;
+                        (cum, cum_band)
                     };
+                    out.cumulative_refined[s - 1] = cum;
+                    out.cumulative_refined_band[s - 1] = cum_band;
                 }
             } else {
                 for (j, &t_query) in eval_times.iter().enumerate() {
@@ -3760,7 +3766,7 @@ pub fn predict_competing_risks_survival(
                         out.cumulative[j] = 0.0;
                         out.survival[j] = 1.0;
                     } else {
-                        let (_eta_t, cum_t, haz_t) = evaluate_at(t_query)?;
+                        let (_eta_t, cum_t, haz_t, _) = evaluate_at(t_query)?;
                         out.hazard[j] = haz_t;
                         out.cumulative[j] = cum_t;
                         out.survival[j] = (-cum_t).exp().clamp(0.0, 1.0);
@@ -3772,13 +3778,16 @@ pub fn predict_competing_risks_survival(
                 // per-cause cumulative_hazard and the assembly agree at the user
                 // times to the bit.
                 for (jr, &t_query) in refined_times.iter().enumerate() {
-                    out.cumulative_refined[jr] = if t_query <= 0.0 {
-                        0.0
+                    let (cum, cum_band) = if t_query <= 0.0 {
+                        (0.0, 0.0)
                     } else {
-                        evaluate_at(t_query)?.1
+                        let (_, cum, _, cum_band) = evaluate_at(t_query)?;
+                        (cum, cum_band)
                     };
+                    out.cumulative_refined[jr] = cum;
+                    out.cumulative_refined_band[jr] = cum_band;
                 }
-                let (eta_t, _, _) = evaluate_at(age_exit[i])?;
+                let (eta_t, _, _, _) = evaluate_at(age_exit[i])?;
                 out.eta_exit = eta_t;
             }
             Ok(out)
@@ -3794,6 +3803,8 @@ pub fn predict_competing_risks_survival(
         }
         for jr in 0..refined_cols {
             cumulative_hazard_refined[row.cause][[row.row, jr]] = row.cumulative_refined[jr];
+            cumulative_hazard_refined_band[row.cause][[row.row, jr]] =
+                row.cumulative_refined_band[jr];
         }
     }
 
@@ -3810,9 +3821,10 @@ pub fn predict_competing_risks_survival(
         let assembly_times = Array1::from_shape_fn(CIF_REFINE_SUBINTERVALS, |s| {
             ((s + 1) as f64) / (CIF_REFINE_SUBINTERVALS as f64)
         });
-        let refined_assembled = assemble_competing_risks_cif_from_endpoints(
+        let refined_assembled = assemble_competing_risks_cif_from_endpoints_with_rounding(
             assembly_times.view(),
             &cumulative_hazard_refined,
+            &cumulative_hazard_refined_band,
         )
         .map_err(|err| err.to_string())?;
         let last = CIF_REFINE_SUBINTERVALS - 1;
@@ -3834,9 +3846,10 @@ pub fn predict_competing_risks_survival(
         }
     } else {
         let assembly_times = Array1::from_vec(refined_times.clone());
-        let refined_assembled = assemble_competing_risks_cif_from_endpoints(
+        let refined_assembled = assemble_competing_risks_cif_from_endpoints_with_rounding(
             assembly_times.view(),
             &cumulative_hazard_refined,
+            &cumulative_hazard_refined_band,
         )
         .map_err(|err| err.to_string())?;
         // Project refined CIF / overall-survival columns onto the user grid.
@@ -4710,8 +4723,23 @@ fn evaluate_rp_row(
         derivative_time_offset_row,
         primary_offset_row,
     )
+    .map(|(eta, cumulative_hazard, hazard, _)| (eta, cumulative_hazard, hazard))
 }
 
+/// `(eta, H, h, band_H)` of one Royston-Parmar row; see [`evaluate_rp_row_with_beta`].
+type RpRowEvaluation = (f64, f64, f64, f64);
+
+/// Evaluate one Royston-Parmar row: `(eta, H, h, band_H)`.
+///
+/// `band_H` bounds the rounding of `H = exp(eta)` as evaluated here, for the
+/// design row as built. `eta = Σ_j x_j β_j + (eta_time_offset + primary_offset)`
+/// is a sum of `p + 2` terms, so its forward error is at most
+/// `δ = γ_{p+2} · (Σ_j |x_j β_j| + |eta_time_offset| + |primary_offset|)`
+/// (Higham, Lemma 3.1 / inner-product bound). `exp` is faithfully rounded, a
+/// relative error below `ε`, so
+/// `|Ĥ − H| ≤ Ĥ · (expm1(δ) + ε) / (1 − ε)`.
+/// The competing-risks Aalen-Johansen assembly uses it to tell a rounding-level
+/// decrease of `H` between two evaluations from a real one (#3529).
 fn evaluate_rp_row_with_beta(
     beta: &Array1<f64>,
     saved_timewiggle: Option<&SavedBaselineTimeWiggleRuntime>,
@@ -4720,7 +4748,7 @@ fn evaluate_rp_row_with_beta(
     eta_time_offset_row: f64,
     derivative_time_offset_row: f64,
     primary_offset_row: f64,
-) -> Result<(f64, f64, f64), SurvivalPredictError> {
+) -> Result<RpRowEvaluation, SurvivalPredictError> {
     let p_time = row_time.x_exit_time.ncols();
     let p_timewiggle = saved_timewiggle.map_or(0, |runtime| runtime.beta.len());
     let p_cov = cov_row.len();
@@ -4817,7 +4845,17 @@ fn evaluate_rp_row_with_beta(
     let eta =
         predict_royston_parmar_eta(x_exit.view(), beta.view(), offset_view.view(), &likelihood)?[0];
     let (cum, haz) = royston_parmar_survival_hazard_components(eta, eta_derivative)?;
-    Ok((eta, cum, haz))
+    let eta_magnitude = x_exit
+        .row(0)
+        .iter()
+        .zip(beta.iter())
+        .map(|(x, b)| (x * b).abs())
+        .sum::<f64>()
+        + eta_time_offset_row.abs()
+        + primary_offset_row.abs();
+    let eta_band = gam_linalg::roundoff::accumulation_growth(p + 2) * eta_magnitude;
+    let cum_band = cum * (eta_band.exp_m1() + f64::EPSILON) / (1.0 - f64::EPSILON);
+    Ok((eta, cum, haz, cum_band))
 }
 
 fn predict_royston_parmar_eta<X>(
@@ -7593,6 +7631,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_scoring_grid_that_does_not_start_at_the_origin_is_refused_3609() {
+        // S = 1 holds only at t = 0. On a grid starting at 1.0 the repair would
+        // pin the model's S(1.0) < 1 to 1, dropping −ln S(1.0) from every H(T_i),
+        // and the event at T = 0.5 would sit before the first interval and read a
+        // negative cumulative hazard.
+        let time = [0.5, 2.0, 8.0, 3.0];
+        let event = [1.0, 1.0, 0.0, 1.0];
+        let origin = [0.0, 1.0, 2.0, 3.0, 5.0];
+        let model = Array2::from_shape_fn((4, 5), |(row, col)| {
+            1.0 - col as f64 * (0.05 + 0.02 * row as f64)
+        });
+        let scored = survival_prediction_scores(&time, &event, &origin, model.view(), None);
+        assert!(scored.brier.is_some() && scored.logloss.is_some());
+        for late in [[1.0, 2.0, 3.0, 5.0, 7.0], [-1.0, 1.0, 2.0, 3.0, 5.0]] {
+            assert_eq!(
+                survival_prediction_scores(&time, &event, &late, model.view(), None),
+                SurvivalPredictionScores::default(),
+                "grid {late:?}"
+            );
+        }
+    }
+
     // ---- IPCW Brier score (Graf et al. 1999) -------------------------------
 
     #[test]
@@ -7612,6 +7673,12 @@ mod tests {
         assert!((g.at(6.0) - 2.0 / 3.0).abs() <= 1e-12);
         // At t=8 the last (sole) at-risk subject is censored: G collapses to 0.
         assert!(g.at(8.0).abs() <= 1e-15);
+        // `on_grid` is `at` mapped over the grid, NaN included (it precedes no step).
+        let probe = [f64::NAN, -1.0, 0.0, 3.999, 4.0, 7.5, 8.0, 9.0, f64::INFINITY];
+        let mapped: Vec<f64> = probe.iter().map(|&t| g.at(t)).collect();
+        assert_eq!(g.on_grid(&probe), mapped);
+        assert_eq!(g.at(f64::NAN), 1.0);
+        assert_eq!(g.at(f64::INFINITY), 0.0);
     }
 
     /// The pair-loop definition of Harrell's C, written independently of the

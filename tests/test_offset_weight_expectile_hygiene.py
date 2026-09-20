@@ -173,5 +173,5 @@ def test_zero_weight_rows_drop_factor_levels_they_alone_carry() -> None:
 def test_all_zero_weights_are_refused() -> None:
     data, _ = _zero_weight_problem("gaussian")
     data["w"] = np.zeros_like(data["w"])
-    with pytest.raises(gamfit.errors.InvalidConfigurationError, match="zero on every row"):
+    with pytest.raises(gamfit.errors.DataError, match="no positive weight"):
         gamfit.fit(data, "y ~ s(x)", weights="w")

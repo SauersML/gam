@@ -446,8 +446,6 @@ pub enum FaerLinalgError {
     GeneralEigenCertificateRefused { arm: &'static str, slot: usize, measured: f64, band: f64 },
     #[error("Cholesky factorization failed: {0:?}")]
     Cholesky(solvers::LltError),
-    #[error("LDLT factorization failed: {0:?}")]
-    Ldlt(solvers::LdltError),
 }
 
 /// The lower triangle of the symmetric matrix `a` whose stored triangle `side`
@@ -530,96 +528,6 @@ impl FaerLlt<f64> {
         );
         faer::linalg::cholesky::llt::solve::solve_in_place_with_conj(
             self.l.as_ref(),
-            Conj::No,
-            rhs,
-            par,
-            MemStack::new(&mut mem),
-        );
-    }
-
-    /// `A⁻¹ rhs`.
-    pub fn solve(&self, rhs: MatRef<'_, f64>) -> Mat<f64> {
-        let mut out = rhs.to_owned();
-        self.solve_in_place(out.as_mut());
-        out
-    }
-}
-
-/// `A = L D Lᵀ` of a symmetric matrix at [`decomposition_parallelism`].
-#[derive(Clone)]
-pub struct FaerLdlt {
-    l: Mat<f64>,
-    d: Diag<f64>,
-}
-
-impl FaerLdlt {
-    /// Factor the symmetric matrix `a` from the triangle `side` names.
-    pub fn new(a: MatRef<'_, f64>, side: Side) -> Result<Self, solvers::LdltError> {
-        let mut l = lower_triangle(a, side);
-        let par = decomposition_parallelism();
-        let n = l.nrows();
-        let mut mem = MemBuffer::new(
-            faer::linalg::cholesky::ldlt::factor::cholesky_in_place_scratch::<f64>(
-                n,
-                par,
-                Default::default(),
-            ),
-        );
-        faer::linalg::cholesky::ldlt::factor::cholesky_in_place(
-            l.as_mut(),
-            Default::default(),
-            par,
-            MemStack::new(&mut mem),
-            Default::default(),
-        )?;
-        let mut d = Diag::<f64>::zeros(n);
-        d.copy_from(l.diagonal());
-        l.diagonal_mut().fill(1.0);
-        zero_strict_upper(l.as_mut());
-        Ok(Self { l, d })
-    }
-
-    /// The diagonal factor `D`.
-    pub fn diagonal(&self) -> DiagRef<'_, f64> {
-        self.d.as_ref()
-    }
-
-    /// The dimension of the factored matrix.
-    pub fn nrows(&self) -> usize {
-        self.l.nrows()
-    }
-
-    /// `max_i Σ_k |d_k|·l_ik²`, an upper bound on `‖ |L||D||Lᵀ| ‖_max`: entry
-    /// `(i, j)` is `Σ_k |d_k||l_ik||l_jk|`, at most the geometric mean of the
-    /// row sums by Cauchy–Schwarz with the weights `|d_k|` (#4038).
-    pub fn factor_product_bound(&self) -> f64 {
-        let n = self.l.nrows();
-        let d = self.d.as_ref();
-        let mut bound = 0.0_f64;
-        for i in 0..n {
-            let mut row = 0.0_f64;
-            for k in 0..=i {
-                let l = self.l[(i, k)];
-                row += d[k].abs() * l * l;
-            }
-            bound = bound.max(row);
-        }
-        bound
-    }
-
-    /// Overwrite `rhs` with `A⁻¹ rhs`.
-    pub fn solve_in_place(&self, rhs: MatMut<'_, f64>) {
-        let par = decomposition_parallelism();
-        let mut mem = MemBuffer::new(
-            faer::linalg::cholesky::ldlt::solve::solve_in_place_scratch::<f64>(
-                self.l.nrows(),
-                rhs.ncols(),
-                par,
-            ),
-        );
-        faer::linalg::cholesky::ldlt::solve::solve_in_place_with_conj(
-            self.l.as_ref(),
-            self.d.as_ref(),
             Conj::No,
             rhs,
             par,
@@ -857,6 +765,38 @@ impl FaerLblt {
     /// The dimension of the factored matrix.
     pub fn nrows(&self) -> usize {
         self.l.nrows()
+    }
+
+    /// `ln det A` of a positive semidefinite `A`, read off `B`: `det A = det B`
+    /// because `L` is unit lower triangular and `det P = ±1` enters squared, and
+    /// `det B` is the product of its 1×1 pivots and 2×2 block determinants
+    /// `a d − c²`. By Sylvester's law of inertia `A` is positive semidefinite
+    /// exactly when every block is, so any block with a negative eigenvalue gives
+    /// NaN (as the log of a negative pivot does) even when an even count of them
+    /// would make `det A` positive; a zero eigenvalue gives `−∞`.
+    pub fn logdet(&self) -> f64 {
+        let n = self.l.nrows();
+        let mut total = 0.0_f64;
+        let mut k = 0;
+        while k < n {
+            let a = self.b_diag[k];
+            if k + 1 < n && self.b_subdiag[k] != 0.0 {
+                let c = self.b_subdiag[k];
+                let d = self.b_diag[k + 1];
+                let det = a * d - c * c;
+                // A symmetric 2×2 block has both eigenvalues negative exactly
+                // when its determinant is nonnegative and its trace negative.
+                if det >= 0.0 && a + d < 0.0 {
+                    return f64::NAN;
+                }
+                total += det.ln();
+                k += 2;
+            } else {
+                total += a.ln();
+                k += 1;
+            }
+        }
+        total
     }
 
     /// Overwrite `rhs` with `A⁻¹ rhs`.
@@ -1144,7 +1084,6 @@ pub fn col_piv_qr_solve_lstsq(a: MatRef<'_, f64>, rhs: MatRef<'_, f64>) -> Mat<f
 
 pub enum FaerSymmetricFactor {
     Llt(FaerLlt<f64>),
-    Ldlt(FaerLdlt),
     Lblt(FaerLblt),
 }
 
@@ -1168,7 +1107,6 @@ impl FaerSymmetricFactor {
     pub fn n(&self) -> usize {
         match self {
             FaerSymmetricFactor::Llt(f) => f.nrows(),
-            FaerSymmetricFactor::Ldlt(f) => f.nrows(),
             FaerSymmetricFactor::Lblt(f) => f.nrows(),
         }
     }
@@ -1177,7 +1115,6 @@ impl FaerSymmetricFactor {
     pub fn solve(&self, rhs: MatRef<'_, f64>) -> Mat<f64> {
         match self {
             FaerSymmetricFactor::Llt(f) => f.solve(rhs),
-            FaerSymmetricFactor::Ldlt(f) => f.solve(rhs),
             FaerSymmetricFactor::Lblt(f) => f.solve(rhs),
         }
     }
@@ -1186,7 +1123,6 @@ impl FaerSymmetricFactor {
     pub fn solve_in_place(&self, rhs: MatMut<'_, f64>) {
         match self {
             FaerSymmetricFactor::Llt(f) => f.solve_in_place(rhs),
-            FaerSymmetricFactor::Ldlt(f) => f.solve_in_place(rhs),
             FaerSymmetricFactor::Lblt(f) => f.solve_in_place(rhs),
         }
     }
@@ -1200,12 +1136,6 @@ impl FaerSymmetricFactor {
             FaerSymmetricFactor::Llt(f) => {
                 crate::roundoff::cholesky_solve_backward_band(f.nrows())
             }
-            FaerSymmetricFactor::Ldlt(f) => crate::roundoff::symmetric_factor_solve_backward_band(
-                f.nrows(),
-                2.0,
-                f.factor_product_bound(),
-                matrix_max_abs,
-            ),
             FaerSymmetricFactor::Lblt(f) => crate::roundoff::symmetric_factor_solve_backward_band(
                 f.nrows(),
                 f.pivot_block_roundings(),
@@ -1245,18 +1175,21 @@ impl crate::matrix::FactorizedSystem for FaerSymmetricFactor {
     fn logdet(&self) -> f64 {
         match self {
             FaerSymmetricFactor::Llt(f) => cholesky_factor_logdet(f.lower()),
-            FaerSymmetricFactor::Ldlt(f) => diagonal_log_sum(f.diagonal()),
-            FaerSymmetricFactor::Lblt(..) => {
-                // lblt doesn't easily expose diagonal determinant. Fallback to sparse or other representations if needed, but typically Lblt is indefinite!
-                // Actually faer doesn't easily expose lblt logdet since it has 2x2 blocks.
-                // For our ML systems, if we dropped to LBLT, the matrix was indefinite and logdet is ill-defined (or complex).
-                f64::NAN
-            }
+            FaerSymmetricFactor::Lblt(f) => f.logdet(),
         }
     }
 }
 
-/// Factorize a symmetric system with LLT -> LDLT -> LBLT fallback.
+/// Factorize a symmetric system: Cholesky when the matrix is positive definite
+/// to working precision, Bunch–Kaufman `P A Pᵀ = L B Lᵀ` otherwise.
+///
+/// There is no unpivoted `L D Lᵀ` rung between the two (#3519). Once Cholesky
+/// has refused, the matrix is indefinite or not positive definite to working
+/// precision, and unpivoted `L D Lᵀ` has unbounded element growth there: it
+/// accepts any nonzero leading pivot, however tiny, and returns a solve that is
+/// not backward stable (on `[[1e-17, 1], [1, 1]]`, `cond₂ ≈ 2.6`, it returns
+/// `x₁ = 0` for the exact `x₁ ≈ 1`). Bunch–Kaufman's pivoting bounds the growth,
+/// so it is the backward-stable factorization for exactly this class of input.
 #[inline]
 pub fn factorize_symmetricwith_fallback(
     matrix: MatRef<'_, f64>,
@@ -1265,12 +1198,11 @@ pub fn factorize_symmetricwith_fallback(
     if let Ok(llt) = FaerLlt::new(matrix, side) {
         return Ok(FaerSymmetricFactor::Llt(llt));
     }
-    let ldlt_err = match FaerLdlt::new(matrix, side) {
-        Ok(ldlt) => return Ok(FaerSymmetricFactor::Ldlt(ldlt)),
-        Err(err) => err,
-    };
-    let lblt = catch_unwind(AssertUnwindSafe(|| FaerLblt::new(matrix, side)))
-        .map_err(|_| FaerLinalgError::Ldlt(ldlt_err))?;
+    let lblt = catch_unwind(AssertUnwindSafe(|| FaerLblt::new(matrix, side))).map_err(|_| {
+        FaerLinalgError::FactorizationFailed {
+            context: "Bunch-Kaufman LBLT of a symmetric matrix Cholesky refused",
+        }
+    })?;
     Ok(FaerSymmetricFactor::Lblt(lblt))
 }
 
