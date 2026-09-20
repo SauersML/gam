@@ -1260,11 +1260,13 @@ fn option_numeric_expr(
     }
 }
 
-/// An explicit `length_scale=` on a kernel smooth whose spec stores the auto
-/// request as the numeric marker `0.0` (thin-plate, curvature, measure-jet).
-/// A typed value must be a finite positive range: accepting `0` would make the
-/// explicit request indistinguishable from the auto marker and silently swap
-/// it for the data-derived seed (#3764). `None` is the auto request.
+/// An explicit `length_scale=` on a kernel smooth. A typed value must be a
+/// finite positive range, refused here at the formula rather than at basis
+/// construction. For the kernels whose spec stores the auto request as the
+/// numeric marker `0.0` (thin-plate, curvature, measure-jet), accepting `0`
+/// would also make the explicit request indistinguishable from the auto
+/// marker and silently swap it for the data-derived seed (#3764). `None` is
+/// the auto request.
 fn explicit_positive_length_scale(
     options: &BTreeMap<String, String>,
     smooth: &str,
@@ -3692,7 +3694,7 @@ pub(crate) fn build_smooth_basis(
                     // thin-plate/tensor on identical data, and insensitive to `k`).
                     // Typed Auto starts REML in the resolving regime it can escape
                     // from and cannot be confused with explicit zero.
-                    length_scale: option_f64(options, "length_scale")?
+                    length_scale: explicit_positive_length_scale(options, "matern")?
                         .map(MaternLengthScale::fixed)
                         .unwrap_or_else(MaternLengthScale::auto),
                     nu,
