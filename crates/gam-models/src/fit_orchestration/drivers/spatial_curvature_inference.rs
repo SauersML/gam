@@ -69,20 +69,27 @@ where
 
     let (bound_value, bound_score) = profile(bound)?;
     let outward_score = direction * bound_score;
-    if outward_score < -score_tolerance {
-        return Err(format!(
-            "curvature profile is not outward-monotone at chart bound {bound}: \
-             outward score {outward_score:.6e} is below tolerance {score_tolerance:.6e}"
-        ));
-    }
+    let bound_residual = bound_value - value_hat - half_threshold;
+    // Both refusals name the profile values they were refused against: which
+    // one fires, and how far the bound sits above or below the Wilks level, is
+    // what separates a truncated likelihood set from a κ̂ that is not the
+    // profile's minimum.
     let value_tolerance = score_tolerance * span;
     if bound_value < value_hat - value_tolerance {
         return Err(format!(
             "fitted curvature is not the minimum of its inference profile: \
-             V(bound={bound})={bound_value:.6e} < V(kappa_hat)={value_hat:.6e}"
+             V(bound={bound})={bound_value:.9e} < V(kappa_hat={kappa_hat})={value_hat:.9e} \
+             (outward score at the bound {outward_score:.6e})"
         ));
     }
-    let bound_residual = bound_value - value_hat - half_threshold;
+    if outward_score < -score_tolerance {
+        return Err(format!(
+            "curvature profile is not outward-monotone at chart bound {bound}: \
+             outward score {outward_score:.6e} is below tolerance {score_tolerance:.6e} \
+             (kappa_hat={kappa_hat}, V(kappa_hat)={value_hat:.9e}, V(bound)={bound_value:.9e}, \
+             V(bound) - V(kappa_hat) - half_threshold = {bound_residual:.6e})"
+        ));
+    }
     if bound_residual < 0.0 {
         return Ok((bound, true));
     }

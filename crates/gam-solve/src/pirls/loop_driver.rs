@@ -49,8 +49,9 @@ use super::{
     should_use_sparse_native_pirls,
     solve_penalized_least_squares_implicit,
     standard_inverse_link_jet,
+    update_glmvectors,
 };
-use super::{GamModelFinalState, project_coefficients_to_lower_bounds};
+use super::{GamModelFinalState, WorkingLikelihood, project_coefficients_to_lower_bounds};
 use crate::active_set;
 use crate::estimate::EstimationError;
 use crate::gpu::pirls_host_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
@@ -370,6 +371,61 @@ pub(super) fn default_beta_guess_external(
         }
     }
     beta
+}
+
+/// The Fisher working weights `w·(dμ/dη)²/V(μ)` at the cold P-IRLS start: the
+/// coefficient guess [`default_beta_guess_external`] that an inner solve with
+/// no warm start begins from, pushed through the same working update that
+/// solve's first iterate makes. It plays the part of the working weight at
+/// `mustart` in mgcv's `initial.sp`: it needs no solve, so it exists wherever
+/// an inner solve could refuse, and it follows the response's units exactly as
+/// the fitted working weight does, because the start mean is the weighted mean
+/// of `y`. The start is the unconstrained guess; shape constraints and coefficient
+/// bounds only move it inside their cone during the solve.
+pub(crate) fn start_working_weights(
+    x: &DesignMatrix,
+    y: ArrayView1<'_, f64>,
+    priorweights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    config: &PirlsConfig,
+) -> Result<Array1<f64>, EstimationError> {
+    let beta = default_beta_guess_external(
+        x.ncols(),
+        &config.likelihood.spec.response,
+        config.link_function(),
+        y,
+        priorweights,
+        config.link_kind.mixture_state(),
+        config.link_kind.sas_state(),
+    );
+    let eta = x.matrixvectormultiply(&beta) + &offset;
+    let n = eta.len();
+    let mut mu = Array1::<f64>::zeros(n);
+    let mut weights = Array1::<f64>::zeros(n);
+    let mut z = Array1::<f64>::zeros(n);
+    match &config.link_kind {
+        InverseLink::Standard(_) => config.likelihood.irls_update(
+            y,
+            &eta,
+            priorweights,
+            &mut mu,
+            &mut weights,
+            &mut z,
+            None,
+            None,
+        )?,
+        link => update_glmvectors(
+            y,
+            &eta,
+            link,
+            priorweights,
+            &mut mu,
+            &mut weights,
+            &mut z,
+            None,
+        )?,
+    }
+    Ok(weights)
 }
 
 pub(super) fn solve_intercept_for_prevalence(
@@ -2086,16 +2142,11 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // Use the workspace-backed variant for the dense path to reuse the
     // `final_aug_matrix` allocation; the sparse path still allocates
     // internally because no pre-computed factor is available at this site.
-    let mut edf = if let Some(dense_h) = penalized_hessian_transformed.as_dense() {
+    let edf = if let Some(dense_h) = penalized_hessian_transformed.as_dense() {
         calculate_edfwithworkspace_with_penalty(dense_h, &penalty_active, &mut saved_workspace)?
     } else {
         calculate_edf_with_penalty(&penalized_hessian_transformed, &penalty_active)?
     };
-    if !edf.is_finite() || edf.is_nan() {
-        let p = penalized_hessian_transformed.ncols() as f64;
-        let r = penalty_active.rank() as f64;
-        edf = (p - r).max(0.0);
-    }
 
     // An exhausted iteration budget stays an exhausted budget. The loop's own
     // post-loop soft acceptance (`pirls_soft_acceptance`) has already decided
