@@ -6402,6 +6402,8 @@ impl SaeManifoldTerm {
             total_basis,
             k_atoms,
             d_max,
+            self.assignment.row_block_dim_bound(),
+            p,
             self.beta_dim(),
             self.gpu_policy,
             self.host_available_bytes,

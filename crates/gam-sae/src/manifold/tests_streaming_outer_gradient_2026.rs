@@ -94,15 +94,20 @@ fn build_softmax_term(n: usize, p: usize, k: usize) -> SaeManifoldTerm {
 /// At K=32, p=128 the width-2 euclidean border is `border_dim = Σ_k M_k·p =
 /// 64·128 = 8192`, so the dense direct evidence peak (`N·q·border_dim`,
 /// q=K(1+d)=64) is ≈2.6 GB and exceeds a representative 2 GiB in-core budget,
-/// while the matrix-free plan's peak (chunk window + sparse row-cross + border
-/// vector workspace) stays in the tens of MB. The planner must therefore REFUSE
-/// the dense direct plan (routing the criterion to streaming) while ADMITTING the
-/// matrix-free plan — the exact regime the streaming route was built for.
+/// while the matrix-free plan's peak (chunk window + per-row `q_row × p`
+/// Kronecker Jacobian + per-row `H_tt` and factor blocks + border vector
+/// workspace, q_row = K−1+K·d = 63) stays in the tens of MB (#4262). The
+/// planner must therefore REFUSE the dense direct plan (routing the criterion
+/// to streaming) while ADMITTING the matrix-free plan — the exact regime the
+/// streaming route was built for.
 #[test]
 fn wide_border_routes_to_streaming_with_complete_analytic_gradient_certificate() {
     let (n, p, k, d_max) = (500usize, 128usize, 32usize, 1usize);
     let total_basis = 2 * k; // width-2 euclidean basis per atom.
     let border_dim = total_basis * p;
+    // Softmax rows: `K − 1` gate logits plus `K · d` chart coordinates;
+    // the unframed matrix-free cross block is `q_row × p` per row (#4262).
+    let row_dim = (k - 1) + k * d_max;
     let budget = 2 * 1024 * 1024 * 1024usize; // 2 GiB representative in-core budget.
     let host_available = 8 * 1024 * 1024 * 1024usize;
     let chunk_window = SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE;
@@ -111,6 +116,8 @@ fn wide_border_routes_to_streaming_with_complete_analytic_gradient_certificate()
         total_basis,
         k,
         d_max,
+        row_dim,
+        p,
         border_dim,
         budget,
         chunk_window,
@@ -141,6 +148,8 @@ fn wide_border_routes_to_streaming_with_complete_analytic_gradient_certificate()
         total_basis,
         k,
         d_max,
+        row_dim,
+        p,
         border_dim,
         usize::MAX,
         chunk_window,

@@ -39,6 +39,7 @@ N_ATOMS = 4_096
 N_OBS = 24_000
 N_FEATURES = 32
 D_ATOM = 2
+TOP_K = 8
 MAX_ITER = 3
 
 
@@ -62,8 +63,10 @@ def main() -> None:
     # size chunks, so we pass the conservative monomial-patch estimate.
     per_atom_basis = 1 + D_ATOM + (D_ATOM * (D_ATOM + 1)) // 2  # degree-2 patch
     total_basis = N_ATOMS * per_atom_basis
+    # A TopK row allocates only its `TOP_K` active charts, so the widest row
+    # block the matrix-free route keeps resident is `TOP_K * D_ATOM` wide.
     plan = dict(rust_module().sae_streaming_plan(
-        N_OBS, total_basis, N_ATOMS, D_ATOM, total_basis * N_FEATURES
+        N_OBS, total_basis, N_ATOMS, D_ATOM, TOP_K * D_ATOM, total_basis * N_FEATURES
     ))
     use_streaming, chunk_size = bool(plan["streaming"]), int(plan["chunk_size"])
 
@@ -73,7 +76,7 @@ def main() -> None:
         atom_topology="euclidean",
         d_atom=D_ATOM,
         assignment="topk",
-        top_k=8,
+        top_k=TOP_K,
         n_iter=MAX_ITER,
         random_state=0,
     )

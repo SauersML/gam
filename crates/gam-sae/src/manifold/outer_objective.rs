@@ -900,6 +900,8 @@ fn basin_bundle_member_capacity(term: &SaeManifoldTerm) -> usize {
         total_basis,
         term.k_atoms(),
         d_max,
+        term.assignment.row_block_dim_bound(),
+        term.matrix_free_row_cross_width(),
         border_dim,
         host_budget,
         super::SAE_CPU_L2_CACHE_BYTES * super::SAE_CHUNK_CACHE_MULTIPLE,

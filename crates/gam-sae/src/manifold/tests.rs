@@ -4775,11 +4775,17 @@ pub(crate) fn giant_host_working_set_plan_flips_to_matrix_free_before_dense_allo
     let p_out = 2048usize;
     let border_dim = total_basis * p_out;
     let budget = 60usize * 1024 * 1024 * 1024;
+    // Dense softmax rows: `K − 1` gate logits plus `K · d` chart coordinates;
+    // unframed, the matrix-free cross block is the Kronecker Jacobian at the
+    // output width `p` (#4262).
+    let row_dim = (k_atoms - 1) + k_atoms * d_max;
     let plan = sae_streaming_plan_from_budget(
         n_obs,
         total_basis,
         k_atoms,
         d_max,
+        row_dim,
+        p_out,
         border_dim,
         budget,
         // The production callers all pass `SAE_CPU_L2_CACHE_BYTES *
@@ -4817,11 +4823,14 @@ pub(crate) fn matrix_free_plan_refuses_genuinely_exhausted_process_budget() {
     let k_atoms = 1usize;
     let d_max = 1usize;
     let border_dim = 32usize;
+    let row_dim = (k_atoms - 1) + k_atoms * d_max;
     let plan = sae_streaming_plan_from_budget(
         n_obs,
         total_basis,
         k_atoms,
         d_max,
+        row_dim,
+        border_dim,
         border_dim,
         0, // in-core budget collapsed to zero
         SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE,

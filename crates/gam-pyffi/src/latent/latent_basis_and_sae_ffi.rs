@@ -2383,22 +2383,43 @@ fn sae_incoherence_report_dict<'py>(
 /// clamped to `[1, n_obs]` and to at least a small floor so the per-chunk
 /// reduced-Schur amortizes its `O(M² p + K³_reduced)` overhead.
 ///
+/// The matrix-free route is admitted on what it keeps resident for every row
+/// (#4262): the per-row cross block `row_dim × row_cross_width` plus the
+/// per-row `H_tt`, gradient and factor blocks. `row_dim` is the widest row
+/// the assignment allocates (`K − 1 + Σ d_k` for softmax, `K + Σ d_k` for the
+/// ordered Beta–Bernoulli and threshold gates, the `k` widest charts under
+/// TopK). `row_cross_width` is the per-row cross width; it defaults to the
+/// unframed Kronecker Jacobian width `p = border_dim / total_basis`, which is
+/// exact for the unframed border `border_dim = total_basis · p`.
+///
 /// Exposed to Python as a read-only diagnostic so callers (and the LLM-scale
 /// streaming demo) can inspect the exact dispatch decision and chunk size the
-/// fit will follow for a given `(n_obs, total_basis, k_atoms, d_max)` without
-/// running it. The only execution-policy input is `gpu`; all memory thresholds
-/// and chunk sizes remain derived from the problem shape and selected runtime.
-#[pyfunction(signature = (n_obs, total_basis, k_atoms, d_max, border_dim = None, gpu = "auto"))]
+/// fit will follow for a given shape without running it. The only
+/// execution-policy input is `gpu`; all memory thresholds and chunk sizes
+/// remain derived from the problem shape and selected runtime.
+#[pyfunction(signature = (
+    n_obs,
+    total_basis,
+    k_atoms,
+    d_max,
+    row_dim,
+    border_dim = None,
+    row_cross_width = None,
+    gpu = "auto"
+))]
 fn sae_streaming_plan(
     py: Python<'_>,
     n_obs: usize,
     total_basis: usize,
     k_atoms: usize,
     d_max: usize,
+    row_dim: usize,
     border_dim: Option<usize>,
+    row_cross_width: Option<usize>,
     gpu: &str,
 ) -> PyResult<Py<PyDict>> {
     let border_dim = border_dim.unwrap_or(total_basis);
+    let row_cross_width = row_cross_width.unwrap_or(border_dim / total_basis.max(1));
     let gpu_policy = gam::gpu::GpuPolicy::parse(gpu).ok_or_else(|| {
         py_value_error(format!(
             "sae_streaming_plan gpu must be 'auto', 'off', or 'required'; got {gpu:?}"
@@ -2409,6 +2430,8 @@ fn sae_streaming_plan(
         total_basis,
         k_atoms,
         d_max,
+        row_dim,
+        row_cross_width,
         border_dim,
         gpu_policy,
     )
