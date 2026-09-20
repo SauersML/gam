@@ -5,9 +5,10 @@
 //! regression function must contain the true `eta` at ~90% of (replicate,
 //! evaluation-point) pairs (the frequentist coverage property of Bayesian/
 //! penalized smooth intervals; Nychka 1988, Marra & Wood 2012). The pass/fail
-//! criterion is gam's own coverage landing inside the nominal window
-//! [0.85, 0.95] (0.90 +/- 0.05) — an absolute, self-contained calibration claim
-//! that does not reference mgcv at all.
+//! criterion is gam's own mean per-replicate coverage `mean_r(c_r)` matching
+//! 0.90 up to its Monte-Carlo error, two-sided:
+//! `|mean_r(c_r) − 0.90| ≤ Φ⁻¹(1 − α/2)·sd_r(c_r)/√R` — an absolute,
+//! self-contained calibration claim that does not reference mgcv at all.
 //!
 //! gam's coverage is built entirely from gam's own smoothing-parameter-corrected
 //! coefficient covariance `Vp` (`beta_covariance_corrected`), which propagates
@@ -21,7 +22,9 @@
 //! mgcv" target. mgcv is fit on the IDENTICAL data and its own coverage measured
 //! the same way. We additionally require gam's *calibration error*
 //! |coverage - 0.90| to be no worse than mgcv's by more than a small margin, so
-//! the mature field-standard interval is a floor on quality — but gam passing or
+//! the mature field-standard interval is a floor on quality (the allowance is
+//! the Monte-Carlo error of the paired per-replicate coverage difference, not a
+//! hand-picked margin) — but gam passing or
 //! failing is decided by gam's own distance to nominal, not by reproducing
 //! mgcv's (itself noisy) fitted SEs. Matching mgcv's intervals would prove
 //! nothing; achieving nominal coverage of the true function proves the SEs are
@@ -54,17 +57,18 @@
 //!     inflation — both of which are switched off here (we read the covariance
 //!     directly and build the band ourselves, so no correction is applied).
 //!
-//! Why the window is principled: the 50 eval points within one replicate share
-//! the same fitted curve and noise draw, so they are strongly correlated; the
-//! effective sample size for the coverage rate is on the order of the 50
-//! replicates, not the 2500 pairs. The between-replicate s.e. of the coverage
-//! estimate is ~0.007-0.014, so the +/-0.05 window is several s.e. wide — loose
-//! enough never to fail on Monte-Carlo noise, tight enough to reject a systematic
-//! SE bias of half a nominal-level point (too-low coverage => SE underestimates,
-//! e.g. ignores smoothing-penalty variance; too-high => SE overestimates).
+//! Why the gate is derived, not chosen: the 50 eval points within one replicate
+//! share the same fitted curve and noise draw, so they are strongly correlated;
+//! the sampling unit for the coverage rate is the replicate, not the 2500
+//! pairs. The gate's scale is therefore the between-replicate Monte-Carlo SE
+//! `sd_r(c_r)/√50`, estimated from the replicates themselves, at the shared
+//! calibration false-positive rate α. Too-low coverage => SE underestimates
+//! (e.g. ignores smoothing-penalty variance); too-high => SE overestimates. Both
+//! fail.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
+use gam::test_support::calibration::{audit_replicate_coverage, replicate_mean_and_standard_error};
 use gam::test_support::reference::{Column, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
@@ -73,14 +77,9 @@ use ndarray::{Array2, ArrayView2};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 const N: usize = 500;
-// 50 replicates: the asserted quantity is the pooled across-replicate coverage vs
-// a fixed ±0.05 window. The between-replicate s.e. of the coverage estimate is
-// ~0.007–0.014 at 50 reps (per-replicate coverage std ~0.05–0.10 / sqrt(50)), so
-// the window is still 3.5–7× wider than the noise — a systematically mis-scaled
-// band (coverage ~0.70, i.e. ~14 s.e. off) still fails decisively. 50 matches the
-// mgcv R side's `nrep`, so both engines fit the SAME replicates. NOT a weakened
-// test: the ±0.05 window and the truth-coverage claim are unchanged; halving the
-// fit count from 100 only removes Monte-Carlo budget the assertion never used.
+// 50 replicates: the asserted quantity is the mean per-replicate coverage, gated
+// two-sided at its own Monte-Carlo SE `sd_r(c_r)/√50`. 50 matches the mgcv R
+// side's `nrep`, so both engines fit the SAME replicates.
 const N_REPLICATES: usize = 50;
 const N_EVAL: usize = 50;
 const SIGMA: f64 = 0.1;
@@ -167,7 +166,7 @@ fn pointwise_se(design: ArrayView2<'_, f64>, cov: &Array2<f64>) -> Vec<f64> {
 fn ci_coverage_near_nominal_on_gaussian_truth_90pct() {
     init_parallelism();
 
-    // ---- fixed design + 100 replicate responses (seed 42) -----------------
+    // ---- fixed design + 50 replicate responses (seed 42) -----------------
     let mut rng = SplitMix64::new(42);
     let x: Vec<f64> = (0..N).map(|_| rng.next_open01()).collect();
     let eta: Vec<f64> = x.iter().map(|&xi| true_eta(xi)).collect();
@@ -196,12 +195,12 @@ fn ci_coverage_near_nominal_on_gaussian_truth_90pct() {
     let total_trials = N_REPLICATES * N_EVAL;
 
     // Each replicate is an independent fit on a fixed design (only `y` changes);
-    // the per-replicate hit count is deterministic regardless of how the outer
-    // loop is scheduled, and coverage is accumulated by exact integer addition,
-    // so parallelizing the fit loop is bit-identical to the serial version and
-    // changes no asserted quantity. The 50 independent fits dominate wall-clock,
-    // so fanning them across the rayon pool is the harness-side speedup here.
-    let (gam_hits_vp, gam_hits_vb): (usize, usize) = replicates
+    // the per-replicate hit counts are deterministic regardless of how the outer
+    // loop is scheduled and are collected in replicate order, so parallelizing
+    // the fit loop is bit-identical to the serial version and changes no
+    // asserted quantity. The 50 independent fits dominate wall-clock, so fanning
+    // them across the rayon pool is the harness-side speedup here.
+    let hits_by_rep: Vec<(usize, usize)> = replicates
         .par_iter()
         .map(|rep| {
             let records: Vec<csv::StringRecord> = (0..N)
@@ -264,13 +263,22 @@ fn ci_coverage_near_nominal_on_gaussian_truth_90pct() {
             }
             (hits_vp, hits_vb)
         })
-        .reduce(|| (0usize, 0usize), |a, b| (a.0 + b.0, a.1 + b.1));
+        .collect();
 
-    let gam_coverage_vp = gam_hits_vp as f64 / total_trials as f64;
+    // Per-replicate coverage fractions c_r = hits_r / N_EVAL. Every replicate
+    // checks the same N_EVAL points, so mean_r(c_r) is the pooled hit fraction.
+    let gam_cov_vp_by_rep: Vec<f64> = hits_by_rep
+        .iter()
+        .map(|&(vp, _)| vp as f64 / N_EVAL as f64)
+        .collect();
+    let gam_hits_vb: usize = hits_by_rep.iter().map(|&(_, vb)| vb).sum();
+    const NOMINAL: f64 = 0.90;
+    let gam_verdict = audit_replicate_coverage(&gam_cov_vp_by_rep, NOMINAL);
+    let gam_coverage_vp = gam_verdict.mean;
     let gam_coverage_vb = gam_hits_vb as f64 / total_trials as f64;
 
     // ---- mgcv: same data, same grid, predict(se.fit = TRUE), same z -------
-    // Pass x plus all 100 replicate y columns. R regenerates the identical
+    // Pass x plus all 50 replicate y columns. R regenerates the identical
     // interior grid and the identical truth, fits each replicate, and counts
     // coverage of the 90% CI built from its default (Vp) standard errors.
     let mut columns: Vec<Column<'_>> = Vec::with_capacity(N_REPLICATES + 1);
@@ -290,7 +298,7 @@ fn ci_coverage_near_nominal_on_gaussian_truth_90pct() {
         grid <- seq(0.05, 0.95, length.out = neval)
         truth <- sin(6 * pi * grid)
         newd <- data.frame(x = grid)
-        hits <- 0L
+        cov_by_rep <- numeric(nrep)
         for (r in 0:(nrep - 1L)) {
             yname <- paste0("y", r)
             dat <- data.frame(x = df$x, y = df[[yname]])
@@ -298,37 +306,55 @@ fn ci_coverage_near_nominal_on_gaussian_truth_90pct() {
             pr <- predict(m, newdata = newd, se.fit = TRUE)
             lo <- pr$fit - z90 * pr$se.fit
             hi <- pr$fit + z90 * pr$se.fit
-            hits <- hits + sum(truth >= lo & truth <= hi)
+            cov_by_rep[r + 1L] <- mean(truth >= lo & truth <= hi)
         }
-        emit("coverage", hits / (nrep * neval))
+        emit("cov_by_rep", cov_by_rep)
         "#,
     );
-    let mgcv_coverage = r.scalar("coverage");
+    let mgcv_cov_by_rep = r.vector("cov_by_rep");
+    assert_eq!(
+        mgcv_cov_by_rep.len(),
+        N_REPLICATES,
+        "mgcv must report one coverage fraction per replicate"
+    );
+    let mgcv_coverage = mgcv_cov_by_rep.iter().sum::<f64>() / N_REPLICATES as f64;
+    // Paired per-replicate difference d_r = c_r(gam Vp) − c_r(mgcv): both engines
+    // fit the identical y, so the pairing cancels the shared replicate noise.
+    let diff_by_rep: Vec<f64> = gam_cov_vp_by_rep
+        .iter()
+        .zip(mgcv_cov_by_rep.iter())
+        .map(|(g, m)| g - m)
+        .collect();
+    let (_, diff_se_mc) = replicate_mean_and_standard_error(&diff_by_rep);
 
     // Calibration error = absolute distance of empirical coverage from nominal.
     // This is the objective quality scalar for an uncertainty band: 0 is perfect.
-    const NOMINAL: f64 = 0.90;
     let gam_calib_err = (gam_coverage_vp - NOMINAL).abs();
     let mgcv_calib_err = (mgcv_coverage - NOMINAL).abs();
 
     eprintln!(
         "Gaussian CI coverage (90% nominal, {N_REPLICATES} reps x {N_EVAL} eval pts = {total_trials} trials):\n  \
-         gam Vp coverage = {gam_coverage_vp:.4}  (calib err |cov-0.90| = {gam_calib_err:.4}; smoothing-corrected)\n  \
+         gam Vp coverage = {gam_coverage_vp:.4}  (calib err |cov-0.90| = {gam_calib_err:.4}; se_MC = {:.4}; z_eff = {:.4} vs nominal {Z_90:.4}; z_crit = {:.4}; smoothing-corrected)\n  \
          gam Vb coverage = {gam_coverage_vb:.4}  (conditional; diagnostic)\n  \
-         mgcv coverage   = {mgcv_coverage:.4}  (calib err |cov-0.90| = {mgcv_calib_err:.4}; baseline)"
+         mgcv coverage   = {mgcv_coverage:.4}  (calib err |cov-0.90| = {mgcv_calib_err:.4}; paired-diff se_MC = {diff_se_mc:.4}; baseline)",
+        gam_verdict.se_mc, gam_verdict.z_eff, gam_verdict.z_crit,
     );
 
     // PRIMARY (absolute, self-contained) ASSERTION: gam's own 90% penalized-
-    // covariance band must achieve close to nominal coverage of the TRUE mean
-    // function. [0.85, 0.95] is the principled +/-0.05 window around 0.90; it
-    // rejects a systematic SE bias of half a nominal point while tolerating the
-    // between-replicate Monte-Carlo noise (~0.006 s.e. over the 50
-    // effectively-independent replicates). This claim does not reference mgcv.
+    // covariance band must achieve nominal coverage of the TRUE mean function up
+    // to Monte-Carlo error: |mean_r(c_r) − 0.90| ≤ Φ⁻¹(1 − α/2)·sd_r(c_r)/√R.
+    // Two-sided: over-coverage (SE too large) fails exactly like under-coverage.
+    // This claim does not reference mgcv.
     assert!(
-        gam_coverage_vp >= 0.85 && gam_coverage_vp <= 0.95,
-        "gam 90% CI empirical coverage {gam_coverage_vp:.4} is outside the nominal window \
-         [0.85, 0.95]; gam's standard errors are {} the truth.",
-        if gam_coverage_vp < 0.85 {
+        gam_verdict.passed,
+        "gam 90% CI mean replicate coverage {gam_coverage_vp:.4} differs from 0.90 by more \
+         than {:.3}·se_MC = {:.4} (se_MC = {:.4}; implied z_eff = {:.4} vs nominal {Z_90:.4}); \
+         gam's standard errors are {}.",
+        gam_verdict.z_crit,
+        gam_verdict.z_crit * gam_verdict.se_mc,
+        gam_verdict.se_mc,
+        gam_verdict.z_eff,
+        if gam_coverage_vp < NOMINAL {
             "under-covering (SE too small)"
         } else {
             "over-covering (SE too large)"
@@ -336,17 +362,18 @@ fn ci_coverage_near_nominal_on_gaussian_truth_90pct() {
     );
 
     // SECONDARY (match-or-beat baseline): gam's calibration error must be no
-    // worse than the mature field-standard interval's by more than a small
-    // Monte-Carlo margin. mgcv is the floor on quality, not a "gam == mgcv"
-    // target — gam is allowed to be *better* calibrated, only not meaningfully
-    // worse. The 0.03 margin (~3-6 between-replicate s.e.) absorbs the noise in
-    // both engines' coverage estimates without licensing a real calibration gap.
-    const MATCH_OR_BEAT_MARGIN: f64 = 0.03;
+    // worse than the mature field-standard interval's beyond Monte-Carlo error.
+    // mgcv is the floor on quality, not a "gam == mgcv" target — gam is allowed
+    // to be *better* calibrated. By the triangle inequality
+    // gam_err − mgcv_err ≤ |mean_r(d_r)|, and under equal expected coverage
+    // |mean_r(d_r)| ≤ Φ⁻¹(1 − α/2)·sd_r(d_r)/√R with probability 1 − α, so that
+    // paired Monte-Carlo error is the whole allowance.
+    let match_or_beat_margin = gam_verdict.z_crit * diff_se_mc;
     assert!(
-        gam_calib_err <= mgcv_calib_err + MATCH_OR_BEAT_MARGIN,
+        gam_calib_err <= mgcv_calib_err + match_or_beat_margin,
         "gam CI calibration error {gam_calib_err:.4} (coverage {gam_coverage_vp:.4}) is worse \
          than the mgcv baseline {mgcv_calib_err:.4} (coverage {mgcv_coverage:.4}) by more than \
-         the {MATCH_OR_BEAT_MARGIN:.2} margin; gam's intervals are less honest than the \
-         field-standard reference on identical data."
+         the paired Monte-Carlo margin {match_or_beat_margin:.4}; gam's intervals are less \
+         honest than the field-standard reference on identical data."
     );
 }
