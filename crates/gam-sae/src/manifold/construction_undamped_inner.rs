@@ -91,11 +91,13 @@ impl SaeManifoldTerm {
         // same discipline the streaming fit already trusts
         // (`streaming_gates_frozen`, chunk-size-invariance pinned) and is
         // exactly what value/gradient consistency (#1026/#1625) wants at the
-        // evaluation scope rather than per assembly. A NEW evaluation (new ρ,
-        // or an evidence re-entry) still re-freezes from its own entry state,
-        // so a settled state re-prices identically — the #2253 idempotence
-        // certificate is preserved, and V(ρ) still tracks routing changes
-        // across ρ moves.
+        // evaluation scope rather than per assembly. Freezing at the entry state
+        // is not idempotent: re-freezing at a settled root prices a different
+        // objective from the one that root was converged under (#2933 F05,
+        // ½log|A| moved 8.1e-5 on `recompute_reproduces_joint_shape_band`), so
+        // the pricing criterion leaves its gates declared on success and this
+        // converge-only scope, with no priced value to declare them for, hands
+        // back the gate state it was given.
         let gates_were_frozen = self.freeze_collapse_prevention_gates();
         let out = self.converge_inner_for_undamped_logdet_gate_frozen(
             target,

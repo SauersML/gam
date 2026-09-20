@@ -352,24 +352,137 @@ where
     I: IntoIterator<Item = &'a Array2<f64>>,
 {
     let unit_weights = Array1::<f64>::ones(design.nrows());
-    let likelihood_scale = mean_abs(design.diag_gram(&unit_weights)?.iter().copied());
+    let likelihood_scale = seed_likelihood_scale(design.diag_gram(&unit_weights)?.iter().copied())?;
+    penalty_locals
+        .into_iter()
+        .map(|s| seed_against_likelihood_scale(likelihood_scale, s.diag().iter().copied()))
+        .collect()
+}
+
+/// The mean Gram diagonal a block's seeds are read against, refused when it is
+/// zero or non-finite.
+fn seed_likelihood_scale(gram_diagonal: impl IntoIterator<Item = f64>) -> Result<f64, String> {
+    let likelihood_scale = mean_abs(gram_diagonal);
     if !(likelihood_scale > 0.0 && likelihood_scale.is_finite()) {
         return Err(format!(
             "survival log-lambda seed:the design's mean Gram diagonal is \
              {likelihood_scale:e}, so the block has no likelihood scale to seed against"
         ));
     }
-    penalty_locals
-        .into_iter()
-        .map(|s| {
-            let penalty_scale = mean_abs(s.diag().iter().copied());
-            if !(penalty_scale > 0.0 && penalty_scale.is_finite()) {
+    Ok(likelihood_scale)
+}
+
+/// One penalty's seed, `ln(likelihood scale / mean penalty diagonal)`, refused
+/// when the penalty's diagonal carries no curvature scale.
+fn seed_against_likelihood_scale(
+    likelihood_scale: f64,
+    penalty_diagonal: impl IntoIterator<Item = f64>,
+) -> Result<f64, String> {
+    let penalty_scale = mean_abs(penalty_diagonal);
+    if !(penalty_scale > 0.0 && penalty_scale.is_finite()) {
+        return Err(format!(
+            "survival log-lambda seed:a penalty's mean diagonal is \
+             {penalty_scale:e}, so it has no curvature scale to seed against"
+        ));
+    }
+    Ok((likelihood_scale / penalty_scale).ln())
+}
+
+/// The time block's exit design on the columns its penalties act on.
+///
+/// A time-wiggle tail in the time designs is a zero placeholder: the family
+/// evaluates the warp dynamically, so the wiggle coefficients enter the exit
+/// predictor through the warp's Jacobian at the baseline predictor,
+/// `B(h₀(t_exit))`. This is the base columns beside that Jacobian, the one
+/// design every time penalty's seed and resolvability domain is read against
+/// (gam#3061: the placeholder design has an all-zero wiggle Gram, so a seed read
+/// against it refused every timewiggle fit). Without a wiggle it is the exit
+/// design itself.
+pub(crate) fn time_block_acting_exit_design(
+    design_exit: &DesignMatrix,
+    offset_exit: ArrayView1<'_, f64>,
+    timewiggle: Option<&TimeWiggleBlockInput>,
+) -> Result<DesignMatrix, String> {
+    let Some(wiggle) = timewiggle else {
+        return Ok(design_exit.clone());
+    };
+    let (n, p) = (design_exit.nrows(), design_exit.ncols());
+    if wiggle.ncols > p {
+        return Err(format!(
+            "survival time block declares {} time-wiggle columns but its exit design has only {p}",
+            wiggle.ncols
+        ));
+    }
+    let p_base = p - wiggle.ncols;
+    let jacobian =
+        crate::wiggle::monotone_wiggle_basis_from_knots(offset_exit, &wiggle.knots, wiggle.degree)?;
+    if jacobian.dim() != (n, wiggle.ncols) {
+        return Err(format!(
+            "survival time-wiggle Jacobian is {}x{}, but the time block's wiggle tail is {n}x{}",
+            jacobian.nrows(),
+            jacobian.ncols(),
+            wiggle.ncols
+        ));
+    }
+    let mut acting = Array2::<f64>::zeros((n, p));
+    acting
+        .slice_mut(s![.., ..p_base])
+        .assign(&design_exit.to_dense().slice(s![.., ..p_base]));
+    acting.slice_mut(s![.., p_base..]).assign(&jacobian);
+    Ok(DesignMatrix::from(acting))
+}
+
+/// Each time penalty's `log λ` seed, read against the part of the acting exit
+/// design ([`time_block_acting_exit_design`]) it acts on: the base columns for a
+/// base penalty, the warp Jacobian for a wiggle penalty. The two parts are
+/// seeded separately because they are different functions of time with their
+/// own scales. A penalty that couples them has no single part to be read
+/// against, and is refused.
+pub(crate) fn time_block_log_lambda_seeds(
+    acting_exit: &DesignMatrix,
+    penalties: &[Array2<f64>],
+    timewiggle_cols: usize,
+) -> Result<Vec<f64>, String> {
+    let p = acting_exit.ncols();
+    if timewiggle_cols > p {
+        return Err(format!(
+            "survival time block declares {timewiggle_cols} time-wiggle columns but its exit design has only {p}"
+        ));
+    }
+    let p_base = p - timewiggle_cols;
+    let gram_diagonal = acting_exit.diag_gram(&Array1::<f64>::ones(acting_exit.nrows()))?;
+    penalties
+        .iter()
+        .enumerate()
+        .map(|(idx, penalty)| {
+            if penalty.dim() != (p, p) {
                 return Err(format!(
-                    "survival log-lambda seed:a penalty's mean diagonal is \
-                     {penalty_scale:e}, so it has no curvature scale to seed against"
+                    "survival log-lambda seed:time penalty {idx} is {}x{}, but the time block has {p} columns",
+                    penalty.nrows(),
+                    penalty.ncols()
                 ));
             }
-            Ok((likelihood_scale / penalty_scale).ln())
+            let mut acts_on_base = false;
+            let mut acts_on_wiggle = false;
+            for ((row, col), &value) in penalty.indexed_iter() {
+                if value != 0.0 {
+                    acts_on_base |= row < p_base || col < p_base;
+                    acts_on_wiggle |= row >= p_base || col >= p_base;
+                }
+            }
+            if acts_on_base && acts_on_wiggle {
+                return Err(format!(
+                    "survival log-lambda seed:time penalty {idx} couples the base columns with \
+                     the time-wiggle columns, so it has no single design part to seed against"
+                ));
+            }
+            let part = if acts_on_wiggle { p_base..p } else { 0..p_base };
+            let likelihood_scale =
+                seed_likelihood_scale(gram_diagonal.slice(s![part.clone()]).iter().copied())?;
+            seed_against_likelihood_scale(
+                likelihood_scale,
+                penalty.diag().slice(s![part]).iter().copied(),
+            )
         })
         .collect()
 }

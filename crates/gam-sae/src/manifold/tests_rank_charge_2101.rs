@@ -42,6 +42,29 @@ fn lcg_normal(s: &mut u64) -> f64 {
 /// states neither of which is a converged root.
 const SUBSET_FIT_ITERATIONS: usize = 60;
 
+/// The K=3 fixture's generating noise standard deviation. The criterion's data
+/// term is `½‖y − f‖²` at unit dispersion, so the fixture prices its target in
+/// noise units `x/σ` (the `y' = √λ·y` change of variables of
+/// `SaeManifoldOuterObjective::with_global_dispersion` at the true `λ = 1/σ²`):
+/// on the raw target the criterion would assert a noise variance of 1 against a
+/// unit-amplitude circle, where dropping it is the right call (#2822).
+const K3_NOISE_SD: f64 = 0.05;
+
+/// `M_null = Σ_k r_k·(M_k − rank S_k)`: the flat-prior decoder directions the
+/// noise-unit change of variables does not normalize. Two subsets priced on the
+/// same `x/σ` differ in the raw-unit criterion by `½·ΔM_null·log(1/σ²)`.
+fn flat_prior_decoder_dims(term: &SaeManifoldTerm) -> f64 {
+    term.atoms
+        .iter()
+        .map(|atom| {
+            let rank_s = SaeManifoldTerm::symmetric_rank(atom.smooth_penalty())
+                .expect("the fixture's smoothing penalty has a symmetric rank");
+            let m_k = atom.smooth_penalty().nrows();
+            (atom.border_frame_rank() * m_k.saturating_sub(rank_s)) as f64
+        })
+        .sum()
+}
+
 /// Build + fit a term with circles on the given output-dim indices (each circle
 /// c on dims (2c, 2c+1)), against the shared target `x`. Used for leave-one-out
 /// decision margins.
@@ -49,6 +72,7 @@ fn fit_circle_subset(
     x: &Array2<f64>,
     theta: &[Vec<f64>],
     circles: &[usize],
+    amplitude: f64,
 ) -> (SaeManifoldTerm, SaeManifoldRho) {
     let n = x.nrows();
     let p = x.ncols();
@@ -66,8 +90,8 @@ fn fit_circle_subset(
             .evaluate(coords.view())
             .expect("the fixture's coordinate block is a valid input for this evaluator");
         let mut decoder = Array2::<f64>::zeros((3, p));
-        decoder[[1, 2 * c]] = 1.0;
-        decoder[[2, 2 * c + 1]] = 1.0;
+        decoder[[1, 2 * c]] = amplitude;
+        decoder[[2, 2 * c + 1]] = amplitude;
         let atom = SaeManifoldAtom::new_with_provided_function_gram(
             format!("circle{c}"),
             SaeAtomBasisKind::Periodic,
@@ -131,15 +155,19 @@ fn rank_charge_k3_accepts_clean_atoms() {
             x[[i, 2 * c + 1]] += theta[i][c].sin();
         }
         for j in 0..p {
-            x[[i, j]] += 0.05 * lcg_normal(&mut s);
+            x[[i, j]] += K3_NOISE_SD * lcg_normal(&mut s);
         }
     }
+    // Price in noise units (see `K3_NOISE_SD`); the seed decoder rides `β' = β/σ`.
+    let x = x.mapv(|v| v / K3_NOISE_SD);
+    let amplitude = 1.0 / K3_NOISE_SD;
+    let log_precision = -2.0 * K3_NOISE_SD.ln();
     // Compute each circle's leave-one-out margin:
     // margin_k = reml(all 3) − reml(drop k). <0 ⇒ keeping k is favored.
     // Both sides are priced at the criterion's converged evidence root (see
     // `SUBSET_FIT_ITERATIONS`).
     let margins = || -> Vec<f64> {
-        let (mut t3, r3) = fit_circle_subset(&x, &theta, &[0, 1, 2]);
+        let (mut t3, r3) = fit_circle_subset(&x, &theta, &[0, 1, 2], amplitude);
         let (v3, _, _) = t3
             .penalized_quasi_laplace_criterion_with_cache(
                 x.view(),
@@ -154,7 +182,7 @@ fn rank_charge_k3_accepts_clean_atoms() {
         (0..ncirc)
             .map(|drop| {
                 let keep: Vec<usize> = (0..ncirc).filter(|&c| c != drop).collect();
-                let (mut t2, r2) = fit_circle_subset(&x, &theta, &keep);
+                let (mut t2, r2) = fit_circle_subset(&x, &theta, &keep, amplitude);
                 let (v2, _, _) = t2
                     .penalized_quasi_laplace_criterion_with_cache(
                         x.view(),
@@ -166,7 +194,12 @@ fn rank_charge_k3_accepts_clean_atoms() {
                         1e-6,
                     )
                     .unwrap();
-                v3 - v2 // margin_drop: <0 ⇒ the dropped circle is worth KEEPING
+                // Back to raw units: V_φ(x) = V₁(x/σ) − ((n·p − M_null)/2)·log(1/σ²);
+                // the n·p part cancels in the difference.
+                let jacobian =
+                    0.5 * (flat_prior_decoder_dims(&t3) - flat_prior_decoder_dims(&t2))
+                        * log_precision;
+                v3 - v2 + jacobian // margin_drop: <0 ⇒ the dropped circle is worth KEEPING
             })
             .collect()
     };

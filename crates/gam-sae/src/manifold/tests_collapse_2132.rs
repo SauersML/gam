@@ -183,7 +183,7 @@ pub(crate) fn oos_heldout_ev(
     }
     term.assignment.logits.assign(&logits);
     let mut rho_oos = rho.clone();
-    term.run_fixed_decoder_arrow_schur(x, &mut rho_oos, None, 24, 1.0, 1.0e-6)
+    term.run_fixed_decoder_arrow_schur(x, &mut rho_oos, None, 1.0e-6)
         .expect("fixed-decoder OOS solve");
     let fitted = term.try_fitted().expect("OOS fitted");
     global_ev(x, fitted.view())

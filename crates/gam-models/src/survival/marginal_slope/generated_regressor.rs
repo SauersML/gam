@@ -211,6 +211,7 @@ fn withhold_covariance(fit: &mut UnifiedFitResult, reason: &str) {
     fit.covariance_corrected = None;
     if let Some(inference) = fit.inference.as_mut() {
         inference.factorized_standard_errors = None;
+        inference.smoothing_correction_factorized = None;
     }
     let declined = gam_solve::estimate::CovarianceDeclined::
         SurvivalMarginalSlopeGeneratedRegressorSensitivityUnavailable {

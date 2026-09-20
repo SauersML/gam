@@ -568,7 +568,6 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                 let smooth_rows = smooth_term_summary_rows(
                     &design,
                     &fit,
-                    fit.weighted_gram(),
                     SummaryBlockOffset::default(),
                 );
                 for st in &smooth_rows {

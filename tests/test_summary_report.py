@@ -115,7 +115,12 @@ def test_poisson_null_deviance_is_the_intercept_only_deviance():
     assert summary.deviance_explained == pytest.approx(
         1.0 - summary.deviance / null_deviance, rel=1e-12
     )
-    # Poisson has no estimated scale: z statistics and a chi-squared smooth test.
+    # Poisson has no estimated scale: z statistics, and the smooth row carries
+    # its variance-component score statistic, referred to its own law.
     assert summary.adjusted_r_squared is None
     assert summary.parametric_statistic == "z"
-    assert summary.smooth_statistic == "Chi.sq"
+    (smooth,) = summary.smooth_terms
+    assert "statistic" not in smooth
+    assert smooth["chi_sq"] > 0.0
+    assert 0.0 <= smooth["p_value"] < 1e-6
+    assert "Score" in str(summary)

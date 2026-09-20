@@ -92,10 +92,6 @@ pub struct SmoothTestResult {
     pub statistic: f64,
     pub ref_df: f64,
     pub p_value: f64,
-    /// The statistic `p_value` is the tail of: `T` itself against `χ²_{ref_df}`
-    /// for a known scale, `F = T/ref_df` against `F_{ref_df, residual_df}` for
-    /// an estimated one.
-    pub reference_statistic: f64,
 }
 
 /// Wood (2013) rank-truncated Wald smooth-component test.
@@ -207,8 +203,8 @@ pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> 
     if !statistic.is_finite() || statistic < 0.0 || !ref_df.is_finite() || ref_df <= 0.0 {
         return None;
     }
-    let (reference_statistic, p_value) = match input.scale {
-        SmoothTestScale::Known => (statistic, chi_square_sf(statistic, ref_df)),
+    let p_value = match input.scale {
+        SmoothTestScale::Known => chi_square_sf(statistic, ref_df),
         SmoothTestScale::Estimated => {
             let residual_df = input
                 .residual_df
@@ -218,7 +214,7 @@ pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> 
             // χ² divided by its reference d.f. only — mgcv's `Tr/rank`. Dividing
             // by `φ̂` again would re-introduce a response-unit dependence (#675).
             let f_stat = statistic / ref_df;
-            (f_stat, fisher_snedecor_sf(f_stat, ref_df, residual_df))
+            fisher_snedecor_sf(f_stat, ref_df, residual_df)
         }
     };
     if !p_value.is_finite() {
@@ -228,7 +224,6 @@ pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> 
         statistic,
         ref_df,
         p_value,
-        reference_statistic,
     })
 }
 
@@ -320,17 +315,10 @@ fn fractional_rank_test(
         whole
     };
     let p_value = fractional_rank_sf(statistic, rank, residual_df).probability;
-    // With an estimated scale the law is `rank·F` at an integer rank, so the
-    // F-scale statistic `p_value` is the tail of is `T/rank`.
-    let reference_statistic = match residual_df {
-        Some(_) => statistic / rank,
-        None => statistic,
-    };
     (statistic.is_finite() && p_value.is_finite()).then_some(SmoothTestResult {
         statistic,
         ref_df: rank,
         p_value,
-        reference_statistic,
     })
 }
 
