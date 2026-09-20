@@ -40,23 +40,6 @@ const P: usize = 160;
 const NOISE_SD: f64 = 0.02;
 const Z95: f64 = 1.959964;
 
-fn erf_approx(x: f64) -> f64 {
-    // Abramowitz & Stegun 7.1.26, |err| < 1.5e-7 — ample for a PIT KS guard.
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let x = x.abs();
-    let t = 1.0 / (1.0 + 0.3275911 * x);
-    let y = 1.0
-        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
-            + 0.254829592)
-            * t
-            * (-x * x).exp();
-    sign * y
-}
-
-fn normal_cdf(z: f64) -> f64 {
-    0.5 * (1.0 + erf_approx(z / std::f64::consts::SQRT_2))
-}
-
 /// One-sample Kolmogorov–Smirnov statistic against Uniform(0,1).
 fn ks_vs_uniform(mut u: Vec<f64>) -> f64 {
     u.sort_by(|a, b| {
@@ -220,7 +203,7 @@ fn gaussian_observation_interval_calibrated_high_edf_1765() {
         if dev <= Z95 * sd_mle {
             hits_mle += 1;
         }
-        pit_full.push(normal_cdf((y_new - mu) / sd_full));
+        pit_full.push(gam_math::probability::normal_cdf((y_new - mu) / sd_full));
     }
     mean_etavar /= nf;
     let cov_full = hits_full as f64 / nf;

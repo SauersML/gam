@@ -165,7 +165,7 @@ fn gaussian_smooth_observation_interval_covers_nominal_1765() {
         if (y_obs - mu[i]).abs() <= z95 * sigma {
             hits += 1;
         }
-        let u = 0.5 * (1.0 + libm_erf((y_obs - mu[i]) / (sigma * std::f64::consts::SQRT_2)));
+        let u = gam_math::probability::normal_cdf((y_obs - mu[i]) / sigma);
         pit.push(u);
     }
     let coverage = hits as f64 / n_test as f64;
@@ -293,7 +293,7 @@ fn additive_fit_to_interaction_truth_scale_diagnostic_1765() {
         if (y_obs - mu[i]).abs() <= z95 * sigma {
             hits += 1;
         }
-        let u = 0.5 * (1.0 + libm_erf((y_obs - mu[i]) / (sigma * std::f64::consts::SQRT_2)));
+        let u = gam_math::probability::normal_cdf((y_obs - mu[i]) / sigma);
         pit.push(u);
     }
     let coverage = hits as f64 / n_test as f64;
@@ -325,18 +325,4 @@ fn additive_fit_to_interaction_truth_scale_diagnostic_1765() {
          even under misspecification (#1765 scale identity)",
         sigma * sigma
     );
-}
-
-/// Error function via a rational approximation (Abramowitz & Stegun 7.1.26),
-/// accurate to ~1e-7 — enough for the PIT KS guard. Avoids a libm dependency.
-fn libm_erf(x: f64) -> f64 {
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let x = x.abs();
-    let t = 1.0 / (1.0 + 0.3275911 * x);
-    let y = 1.0
-        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
-            + 0.254829592)
-            * t
-            * (-x * x).exp();
-    sign * y
 }

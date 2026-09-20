@@ -22,6 +22,7 @@
 
 use csv::StringRecord;
 use gam_data::encode_recordswith_inferred_schema;
+use gam_math::special::logistic;
 use gam_models::fit_orchestration::FitConfig;
 use gam_models::multinomial::{
     MultinomialFitRequest, MultinomialSavedModel, fit_penalized_multinomial_formula,
@@ -45,15 +46,6 @@ impl Lcg {
     }
 }
 
-fn sigmoid(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
-    }
-}
-
 /// A strongly non-constant two-class log-odds: `p` sweeps `[0.21, 0.82]` across
 /// the covariate range, which no intercept-only model can follow.
 fn two_class_truth(x: f64) -> f64 {
@@ -74,7 +66,7 @@ fn two_class_rows(seed: u64) -> Vec<StringRecord> {
     (0..N)
         .map(|i| {
             let x = i as f64 / (N - 1) as f64;
-            let label = if rng.next_u01() < sigmoid(two_class_truth(x)) {
+            let label = if rng.next_u01() < logistic(two_class_truth(x)) {
                 "hi"
             } else {
                 "lo"

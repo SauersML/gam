@@ -3803,6 +3803,7 @@ pub(crate) fn cloglog_point_d6(t: f64) -> f64 {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+    use gam_math::special::logistic;
     use gam_spec::LikelihoodSpec;
 
     fn even_moment_exp_neg_x2(power: usize) -> f64 {
@@ -3976,10 +3977,6 @@ mod tests {
         m1 *= h / 3.0;
         m2 *= h / 3.0;
         m2 - m1 * m1
-    }
-
-    fn logistic(x: f64) -> f64 {
-        (-gam_math::special::softplus(-x)).exp()
     }
 
     /// The response-scale posterior variance must be the variance of the same

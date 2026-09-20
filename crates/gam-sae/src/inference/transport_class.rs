@@ -26,7 +26,7 @@
 //! priori, the report publishes each class's posterior probability, and the
 //! class it names is the most probable one. No separation threshold enters.
 
-use gam_math::special::bessel_i0_centered_terms;
+use gam_math::special::{bessel_i0_centered_terms, logaddexp};
 use ndarray::ArrayView1;
 
 use crate::inference::layer_transport::{ChartTopology, FittedTransport};
@@ -113,22 +113,6 @@ impl CircleTransportReport {
     }
 }
 
-/// `ln(a + b)` from `ln a` and `ln b`, without forming either exponential.
-fn log_add_exp(log_a: f64, log_b: f64) -> f64 {
-    if log_a == f64::NEG_INFINITY {
-        return log_b;
-    }
-    if log_b == f64::NEG_INFINITY {
-        return log_a;
-    }
-    let (high, low) = if log_a >= log_b {
-        (log_a, log_b)
-    } else {
-        (log_b, log_a)
-    };
-    high + (low - high).exp().ln_1p()
-}
-
 /// `ln` of one rigid class's marginal likelihood relative to `Mixing`, for `n`
 /// pairs whose resultant length under that class is `r`:
 /// `ln ∫₀¹ I₀(nκR)/I₀(κ)ⁿ dρ` with `ρ = A(κ) = I₁(κ)/I₀(κ)`.
@@ -205,7 +189,7 @@ fn log_rigid_bayes_factor(n: usize, r: f64) -> Result<f64, String> {
                     ));
                 }
                 nodes += 1;
-                log_sum = log_add_exp(log_sum, value);
+                log_sum = logaddexp(log_sum, value);
                 let falling = value < previous;
                 let negligible = value < log_sum + ln_epsilon;
                 let peak_ahead = direction > 0.0 && r < 1.0 && below_maximizer;

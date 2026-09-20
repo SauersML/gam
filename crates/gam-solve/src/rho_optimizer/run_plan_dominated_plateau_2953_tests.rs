@@ -23,6 +23,7 @@
 //!   declines it on the state it started from instead of publishing it.
 
 use super::*;
+use gam_math::special::{logistic, softplus};
 use gam_problem::DominanceRefusalKind;
 use ndarray::array;
 use std::sync::Arc;
@@ -117,23 +118,6 @@ const KNEE_WIDTH: f64 = 0.05;
 const SLOPE: f64 = 1.0;
 const SLOPE_CURVATURE: f64 = 0.01;
 const SLOPE_START: f64 = -2.0;
-
-fn softplus(z: f64) -> f64 {
-    if z > 0.0 {
-        z + (-z).exp().ln_1p()
-    } else {
-        z.exp().ln_1p()
-    }
-}
-
-fn logistic(z: f64) -> f64 {
-    if z >= 0.0 {
-        1.0 / (1.0 + (-z).exp())
-    } else {
-        let e = z.exp();
-        e / (1.0 + e)
-    }
-}
 
 fn knee_depth(x: f64) -> f64 {
     KNEE_WIDTH * softplus(-(x - KNEE) / KNEE_WIDTH)

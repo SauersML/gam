@@ -36,6 +36,7 @@
 //! `exact_survival_neglog_derivatives_fourth_rescaled`'s CLogLog arm).
 
 use super::*;
+use gam_math::special::logistic;
 
 /// Entry index above which the probit far-tail series takes over from the naive
 /// stack sum.  Below it the naive branch is accurate (and bitwise-identical to
@@ -99,19 +100,6 @@ fn pdf_derivs(link: &InverseLink, u: f64) -> Option<[f64; 4]> {
     let (_, d1, d2, d3, d4) =
         SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(link, u, 0.0).ok()?;
     Some([d1, d2, d3, d4])
-}
-
-/// Stable `σ(−u) = 1 / (1 + e^{u})`, formed without the `1 − σ(u)` subtraction
-/// that annihilates the tail for large positive `u`.
-fn sigmoid_of_neg(u: f64) -> f64 {
-    if u >= 0.0 {
-        // e^{−u} ≤ 1: no overflow, and the numerator carries the tail directly.
-        let z = (-u).exp();
-        z / (1.0 + z)
-    } else {
-        // e^{u} < 1: the reciprocal form is exact and overflow-free.
-        1.0 / (1.0 + u.exp())
-    }
 }
 
 /// The Gaussian Mills residual `ρ(u) = r(u) − u` (hazard minus index) and its
@@ -217,8 +205,8 @@ fn logit_paired(link: &InverseLink, u0: f64, u1: f64) -> Option<PairedNeglogStac
     let a0 = surv_derivs(link, u0)?;
     let a1 = surv_derivs(link, u1)?;
     let b1 = pdf_derivs(link, u1)?;
-    let s1_event = 2.0 * sigmoid_of_neg(u1) - sigmoid_of_neg(u0);
-    let s1_censored = sigmoid_of_neg(u1) - sigmoid_of_neg(u0);
+    let s1_event = 2.0 * logistic(-u1) - logistic(-u0);
+    let s1_censored = logistic(-u1) - logistic(-u0);
     Some(PairedNeglogStacks {
         event: [s1_event, a0[1] + b1[1], a0[2] + b1[2], a0[3] + b1[3]],
         censored: [s1_censored, a0[1] - a1[1], a0[2] - a1[2], a0[3] - a1[3]],
@@ -521,12 +509,12 @@ mod paired_stack_tests {
         // Moderate agreement with the closed regrouped reference.
         for &(u0, u1) in &[(-2.0, 1.0), (0.0, 0.0), (1.5, 3.0)] {
             let p = paired_neglog_stacks(&logit(), u0, u1, u1 - u0).unwrap();
-            let want = 2.0 * sigmoid_of_neg(u1) - sigmoid_of_neg(u0);
+            let want = 2.0 * logistic(-u1) - logistic(-u0);
             assert_eq!(p.event[0].to_bits(), want.to_bits(), "logit s1 exact form");
         }
 
         let p = paired_neglog_stacks(&logit(), 40.0, 40.0, 0.0).unwrap();
-        let sig = sigmoid_of_neg(40.0);
+        let sig = logistic(-40.0);
         assert!(sig > 0.0, "sigma(-40) must be positive: {sig:e}");
         assert_eq!(p.event[0].to_bits(), sig.to_bits());
 
