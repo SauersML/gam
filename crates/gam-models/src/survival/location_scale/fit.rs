@@ -810,7 +810,6 @@ pub(crate) fn fit_survival_location_scale_terms(
                 offset_entry: spec.time_block.offset_entry.clone(),
                 offset_exit: spec.time_block.offset_exit.clone(),
                 derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
-                time_monotonicity: spec.time_block.time_monotonicity,
                 penalties: spec.time_block.penalties.clone(),
                 nullspace_dims: spec.time_block.nullspace_dims.clone(),
                 // `initial_log_lambdas` is the per-penalty seed for THIS block's

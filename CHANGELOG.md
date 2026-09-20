@@ -1,5 +1,18 @@
 ## Unreleased
 
+- **The arrow-Schur "certified mixed precision" solve is removed** (#2946 census T10).
+  The streaming/residency path turned it on by default. It factored the reduced
+  Schur complement and the per-row blocks in f64, copied those factors to f32,
+  solved in f32, and refined with f64 residuals until a backward-error certificate
+  closed. The gates were chosen constants: at most 6 refinements, a 1e-11
+  certificate, a κ·u_f32 margin of 0.5 with a ceiling of 1.0, and a 64·ε floor.
+  Because the f64 factors already existed, the f32 solves and refinement matvecs
+  were extra work on top of an f64 triangular solve that the same factor answers
+  directly. Every dense reduced solve now runs that one f64 solve.
+  `ArrowSolvePrecisionPolicy`, `ArrowSolveOptions::solve_precision`,
+  `MixedPrecisionStatus` and `ArrowPcgDiagnostics::mixed_precision_status` are
+  deleted. The GPU PIRLS mixed-precision policy (`GpuMixedPrecisionPolicy`) is a
+  separate path and is unchanged.
 - **One exception hierarchy, chosen by the engine's error category.** Every engine
   error now reports one Rust `ErrorCategory` (formula, data, convergence, not fitted,
   internal). Python raises a class under that category's base, and the CLI exits
