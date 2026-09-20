@@ -181,9 +181,9 @@ fn radius_law(alpha: ArrayView1<f64>, beta: ArrayView1<f64>) -> Result<RadiusLaw
     })
 }
 
-/// Circular resultants `R₁ = |E[e^{iθ}]|`, `R₂ = |E[e^{2iθ}]|` of the parse
-/// angles `θ_i = atan2(β_i, α_i)`.
-fn circular_resultants(alpha: ArrayView1<f64>, beta: ArrayView1<f64>) -> (f64, f64) {
+/// Sample circular moments `(E[cos θ], E[sin θ], E[cos 2θ], E[sin 2θ])` of the
+/// parse angles `θ_i = atan2(β_i, α_i)`.
+fn circular_moments(alpha: ArrayView1<f64>, beta: ArrayView1<f64>) -> [f64; 4] {
     let n = alpha.len();
     let inv = 1.0 / n as f64;
     let (mut c1, mut s1, mut c2, mut s2) = (0.0, 0.0, 0.0, 0.0);
@@ -194,9 +194,7 @@ fn circular_resultants(alpha: ArrayView1<f64>, beta: ArrayView1<f64>) -> (f64, f
         c2 += (2.0 * th).cos();
         s2 += (2.0 * th).sin();
     }
-    let r1 = ((c1 * inv).powi(2) + (s1 * inv).powi(2)).sqrt();
-    let r2 = ((c2 * inv).powi(2) + (s2 * inv).powi(2)).sqrt();
-    (r1, r2)
+    [c1 * inv, s1 * inv, c2 * inv, s2 * inv]
 }
 
 /// The witnesses a centered circle leaves in its joint amplitude law, read with no
@@ -216,22 +214,26 @@ pub struct RingRecognition {
     pub resultant2: f64,
     /// `√E[r²]`, the RMS in-plane radius, measured with no noise model.
     pub rms_radius: f64,
-    /// The plane has collapsed to a diameter: `R₂` is past the screen that
-    /// `covered` refuses. It is the one diameter screen both directions of the
+    /// The plane has collapsed to a diameter: `R₂` sits nearer the line template
+    /// `R₂ = 1` than the isotropic template `R₂ = 0`. A diameter is never
+    /// covered, and it is the one diameter screen both directions of the
     /// curl/flatten pair read, so a plane cannot be neither curlable nor
     /// flattenable (#3506).
     pub diameter: bool,
-    /// Neither resultant resolves a departure from the uniform-angle null: the
-    /// angle is covered (`n·R₁²` below the Rayleigh cut) and the plane is not a
-    /// diameter (`n·R₂²` below it), the pair calibrated to refuse a uniform ring
-    /// with probability `Φ(−CURL_Z)`, the κ gate's level.
+    /// The plane is not a diameter and the first harmonic resolves no departure
+    /// from the centrally symmetric null `E[e^{iθ}] = 0`: the studentized
+    /// Rayleigh statistic (asymptotically `Exp(1)`, see `recognize`) is below
+    /// `−ln Φ(−CURL_Z)`, so a full circle or ellipse is refused with probability
+    /// `Φ(−CURL_Z)`, the κ gate's level, at every n.
     pub covered: bool,
     /// κ resolvably below the Gaussian-fill value 2 (2σ) and `covered`.
     pub recognized: bool,
 }
 
 fn recognize(law: &RadiusLaw, alpha: ArrayView1<f64>, beta: ArrayView1<f64>) -> RingRecognition {
-    let (resultant1, resultant2) = circular_resultants(alpha, beta);
+    let [c1, s1, c2, s2] = circular_moments(alpha, beta);
+    let resultant1 = c1.hypot(s1);
+    let resultant2 = c2.hypot(s2);
     let z_below_gaussian = if law.kappa_se > 0.0 {
         (2.0 - law.kappa) / law.kappa_se
     } else if law.kappa < 2.0 {
@@ -239,28 +241,35 @@ fn recognize(law: &RadiusLaw, alpha: ArrayView1<f64>, beta: ArrayView1<f64>) -> 
     } else {
         0.0
     };
-    // Coverage / degeneracy screens against the uniform-angle null (#3827). A full
-    // ring with uniform phase has E[e^{ikθ}] = 0 for k = 1, 2; an arc of width
-    // w < 2π has R₁ → sin(w/2)/(w/2) > 0, and a diameter (a line through the
-    // origin) has R₂ → 1. Under the null the four Fourier components cos kθ, sin kθ
-    // (k = 1, 2) are mutually uncorrelated with variance ½ each, so by the CLT
-    // n·R₁² and n·R₂² are asymptotically independent Exp(1) (the Rayleigh law).
-    // The pair of screens accepts iff both n·R_k² < t, whose null acceptance
-    // probability is (1 − e^{−t})². Setting that to 1 − α with α = Φ(−CURL_Z), the
-    // κ gate's level, gives
-    //     t = −ln(1 − √(1 − α)) = ln((1 + √(1 − α)) / α),
-    // evaluated in the second form so a small α loses no digits. A uniform ring is
-    // then refused by the geometry screens with probability α at every n, while any
-    // fixed arc or diameter is refused with probability → 1 as n grows. There is no
-    // absolute floor: the uniform-phase law is also the law the circle phase code
-    // prices (a uniform codebook over the turn), so a phase departure this test
-    // resolves is one the ring's code does not describe.
-    let n = law.n as f64;
-    let level = normal_cdf(-CURL_Z);
-    let rayleigh_t = ((1.0 + (1.0 - level).sqrt()) / level).ln();
-    let coverage_ok = n * resultant1 * resultant1 < rayleigh_t;
-    let diameter = !(n * resultant2 * resultant2 < rayleigh_t);
-    let covered = coverage_ok && !diameter;
+    // Diameter degeneracy. A line through the origin has R₂ = 1 and an isotropic
+    // plane has R₂ = 0. R₂ is NOT screened against the isotropic null: the
+    // periodic atom a curl seeds carries independent sin/cos decoder rows, so an
+    // ellipse of aspect b is a ring of that family, and at uniform phase it reads
+    // R₂ = (1 − b)/(1 + b) > 0, which a Rayleigh screen on R₂ refuses at every b < 1
+    // once n is large (#3827). What R₂ decides is which template the plane sits
+    // nearer, the line (R₂ = 1) or the isotropic plane (R₂ = 0); the equidistant
+    // boundary is R₂ = ½. A diameter is never covered, and this is the one
+    // diameter screen both directions of the curl/flatten pair read (#3506).
+    let diameter = resultant2 >= 0.5;
+    // Coverage against the centrally symmetric null E[e^{iθ}] = 0 (#3827). Every
+    // full closed curve of the periodic family symmetric about its center (a
+    // circle or an ellipse) satisfies it; an arc of width w < 2π has
+    // R₁ → sin(w/2)/(w/2) > 0. Under the null, by the CLT, the mean
+    // m = (E[cos θ], E[sin θ]) is asymptotically N(0, V/n) with
+    //     V = ½·[[1 + c₂, s₂], [s₂, 1 − c₂]],   det V = ¼(1 − R₂²),
+    // read off the sample second harmonic (the null-restricted score form), so
+    //     Q = ½·n·mᵀV⁻¹m = n·[(1 − c₂)c₁² − 2s₂c₁s₁ + (1 + c₂)s₁²] / (1 − R₂²)
+    // is asymptotically χ²₂/2 = Exp(1). On an isotropic plane Q = n·R₁², the
+    // Rayleigh statistic. Refusing iff Q ≥ t with t = −ln α, α = Φ(−CURL_Z) (the κ
+    // gate's level), refuses a full ring with probability α at every n and any
+    // fixed arc with probability → 1. There is no absolute floor. The diameter
+    // screen runs first, so 1 − R₂² ≥ ¾ wherever Q is read.
+    let covered = !diameter && {
+        let n = law.n as f64;
+        let q = n * ((1.0 - c2) * c1 * c1 - 2.0 * s2 * c1 * s1 + (1.0 + c2) * s1 * s1)
+            / (1.0 - resultant2 * resultant2);
+        q < -normal_cdf(-CURL_Z).ln()
+    };
     RingRecognition {
         kappa: law.kappa,
         kappa_se: law.kappa_se,
@@ -275,8 +284,8 @@ fn recognize(law: &RadiusLaw, alpha: ArrayView1<f64>, beta: ArrayView1<f64>) -> 
 }
 
 /// Recognize a candidate plane `(α, β)` as a ring: κ resolvably below the
-/// Gaussian-fill value 2 (2σ), and neither circular resultant resolvable from the
-/// uniform-angle null (full coverage `R₁`, no diameter degeneracy `R₂`; see
+/// Gaussian-fill value 2 (2σ), the angle covered (`R₁` not resolvable from the
+/// centrally symmetric null) and no diameter degeneracy (`R₂`; see
 /// [`RingRecognition::covered`]). No noise scale enters and nothing is priced; a
 /// caller that prices the replacement in bits decides acceptance on this and its
 /// own ledger, not on the small-cell screen of [`curl_verdict`] (#2933 F23).
@@ -1073,8 +1082,8 @@ mod tests {
 
     /// #3827: a 330° arc is not a ring. Its radius law is a perfect shell (κ = 1),
     /// so only the coverage screen can refuse it, and at n = 4000 its first
-    /// resultant `R₁ = sin(w/2)/(w/2) ≈ 0.090` puts `n·R₁² ≈ 32` far past the
-    /// Rayleigh cut `≈ 4.47`. The former `R₁ < 2/√n + 0.15` gate read `0.090 <
+    /// resultant `R₁ = sin(w/2)/(w/2) ≈ 0.090` puts the studentized Rayleigh
+    /// statistic `Q ≈ n·R₁² ≈ 32` far past the cut `−ln Φ(−2) ≈ 3.78`. The former `R₁ < 2/√n + 0.15` gate read `0.090 <
     /// 0.182` and certified this arc as a full ring at every n.
     #[test]
     fn a_330_degree_arc_is_not_covered_3827() {
@@ -1107,8 +1116,42 @@ mod tests {
         );
     }
 
-    /// #3827: the geometry screens are a calibrated test of the uniform-angle
-    /// null. Over `B` independent uniform rings the refusal rate of `covered` is
+    /// #3827: an ellipse is a ring of the periodic family (independent sin/cos
+    /// decoder rows), not a diameter. At aspect 0.8 and uniform phase it reads
+    /// `R₂ = (1 − b)/(1 + b) ≈ 0.11`, so `n·R₂² ≈ 40` at n = 4000: a Rayleigh screen
+    /// on `R₂` refuses it, and reading that screen as the diameter flag demotes
+    /// it to a rank-1 line. It must stay covered and recognized, and flatten must
+    /// leave it standing.
+    #[test]
+    fn an_ellipse_is_a_covered_ring_not_a_diameter_3827() {
+        let n = 4000usize;
+        let mut s = 0xE11_u64;
+        let mut alpha = Array1::<f64>::zeros(n);
+        let mut beta = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let th = TAU * lcg(&mut s);
+            alpha[i] = 3.0 * th.cos();
+            beta[i] = 2.4 * th.sin();
+        }
+        let rec = ring_recognition(alpha.view(), beta.view()).unwrap();
+        assert!(
+            n as f64 * rec.resultant2 * rec.resultant2 > 20.0,
+            "premise: the ellipse's R₂ is resolved (R₂ = {})",
+            rec.resultant2
+        );
+        assert!(!rec.diameter, "an ellipse is not a diameter (R₂ = {})", rec.resultant2);
+        assert!(
+            rec.covered && rec.recognized,
+            "a full ellipse is a covered ring (R₁ = {}, R₂ = {}, κ = {})",
+            rec.resultant1,
+            rec.resultant2,
+            rec.kappa
+        );
+        let v = flatten_verdict(alpha.view(), beta.view(), alpha.view(), beta.view()).unwrap();
+        assert!(!v.recommend_flatten, "a full ellipse must not be flattened");
+    }
+
+    /// #3827: the geometry screens are a calibrated test of full coverage. Over `B` independent uniform rings the refusal rate of `covered` is
     /// Binomial(B, α)/B with `α = Φ(−CURL_Z)`, so it must land within four
     /// binomial standard errors `4·√(α(1−α)/B)` of α. The former gate, with its
     /// absolute `+0.15` floor and fixed `R₂ < 0.5` cut, refused essentially no
@@ -1136,6 +1179,36 @@ mod tests {
         assert!(
             (rate - level).abs() < band,
             "uniform-ring refusal rate {rate} must match α = {level} within {band}"
+        );
+    }
+
+    /// #3827: the coverage screen is studentized by the second harmonic, so it
+    /// keeps its level on an ellipse, whose angle law is not uniform. Over `B`
+    /// independent aspect-½ ellipses at uniform phase (`R₂ = ⅓`) the refusal rate
+    /// of `covered` must land within four binomial standard errors of α.
+    #[test]
+    fn ellipse_refusal_rate_is_the_kappa_gate_level_3827() {
+        let (b, n) = (4000usize, 200usize);
+        let mut s = 0xE111_u64;
+        let mut refused = 0usize;
+        let mut alpha = Array1::<f64>::zeros(n);
+        let mut beta = Array1::<f64>::zeros(n);
+        for _ in 0..b {
+            for i in 0..n {
+                let th = TAU * lcg(&mut s);
+                alpha[i] = th.cos();
+                beta[i] = 0.5 * th.sin();
+            }
+            if !ring_recognition(alpha.view(), beta.view()).unwrap().covered {
+                refused += 1;
+            }
+        }
+        let level = normal_cdf(-CURL_Z);
+        let rate = refused as f64 / b as f64;
+        let band = 4.0 * (level * (1.0 - level) / b as f64).sqrt();
+        assert!(
+            (rate - level).abs() < band,
+            "ellipse refusal rate {rate} must match α = {level} within {band}"
         );
     }
 
