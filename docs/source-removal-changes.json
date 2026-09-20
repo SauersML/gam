@@ -2615,7 +2615,7 @@
     "evidence": "New test exact_joint_outer_step_budget_tests::a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget: separable quadratic with psi optimum 8 e-folds from the seed converges in 3 outer iterations uncapped; with the removed caps it took 11 and the test fails."
   },
   {
-    "base": "91214e476fb84da76915e0a938f773c57d320bb2",
+    "base": "d027be231ca8fdf6f8104690ae68869486db51ab",
     "items": [
       "crates/gam-cli/src/main.rs:const:CLI_WORKER_STACK_SIZE",
       "crates/gam-linalg/src/parallel.rs:fn:run_on_single_worker_pool",
