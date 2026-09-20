@@ -42,7 +42,8 @@ use super::scoring::TileScorer;
 use super::residual_reservoir::{ResidualReservoir, residual_rounding_energy};
 use super::update::{
     DecoderNormalEq, DecoderRecycleSpace, DecoderSolveStats, decoder_fixed_point_residual,
-    fixed_point_tolerance, polish_unit_rows_against_normal_eq, route_and_code_all, seed_decoder,
+    fitted_code_count, fixed_point_tolerance, polish_unit_rows_against_normal_eq,
+    route_and_code_all, routability_noise_scale, seed_decoder,
     solve_decoder_with_routability_gate_recycled, unit_norm_rows,
 };
 use super::{ScoreRouteStats, SparseDictConfig};
@@ -110,6 +111,9 @@ pub struct SparseDictStreamState {
     col_sumsq: Vec<f64>,
     rss: f64,
     row_count: usize,
+    /// Live codes routed this epoch: the per-row parameters the coding step fit,
+    /// which the routability noise scale profiles out.
+    fitted_codes: usize,
     reservoir: ResidualReservoir,
 
     // ---- cross-epoch state ----
@@ -164,6 +168,7 @@ impl SparseDictStreamState {
             col_sumsq: vec![0.0; p],
             rss: 0.0,
             row_count: 0,
+            fitted_codes: 0,
             reservoir: ResidualReservoir::new(k),
             prev_ev: f64::NEG_INFINITY,
             last_ev: f64::NEG_INFINITY,
@@ -272,6 +277,7 @@ impl SparseDictStreamState {
 
         self.rss += shard_rss;
         self.row_count += codes.len();
+        self.fitted_codes += fitted_code_count(&codes);
         Ok(ShardStats {
             rows: codes.len(),
             rss: shard_rss,
@@ -325,7 +331,8 @@ impl SparseDictStreamState {
 
         // (c) routability-gated decoder refresh from accumulated normal equations,
         // then (d) unit-norm. Deferred atoms keep their evidence streaming.
-        let sigma = (self.rss / (self.row_count * self.p) as f64).sqrt();
+        let sigma =
+            routability_noise_scale(self.rss, self.row_count * self.p, self.fitted_codes);
         let (decoder_solve_stats, gate) = solve_decoder_with_routability_gate_recycled(
             &mut self.decoder,
             &self.eq,
@@ -440,6 +447,7 @@ impl SparseDictStreamState {
         }
         self.rss = 0.0;
         self.row_count = 0;
+        self.fitted_codes = 0;
         self.reservoir.clear();
     }
 

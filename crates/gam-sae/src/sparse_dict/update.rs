@@ -916,7 +916,7 @@ fn run_from_decoder(
         let sigma = residual_scale(x, &codes, decoder.view());
         let sigma_secs = epoch_start.elapsed().as_secs_f64() - accumulate_secs;
         let stats = if s == 1 {
-            let gate = routability_gate_decisions(&normal_eq, sigma);
+            let gate = routability_gate_decisions(&normal_eq, decoder.view(), sigma);
             let mut members = vec![Vec::new(); k];
             for (row, code) in certified_codes.iter().enumerate() {
                 members[code.indices[0] as usize].push(row);
@@ -2317,8 +2317,6 @@ pub(super) struct DecoderNormalEq {
     pub(super) off: HashMap<(u32, u32), f64>,
     /// Non-zero code firings per atom over the accumulated refresh window.
     pub(super) firings: Vec<usize>,
-    /// Sum of absolute code amplitudes per atom over the accumulated window.
-    pub(super) amplitude_sum: Vec<f64>,
 }
 
 impl DecoderNormalEq {
@@ -2331,7 +2329,6 @@ impl DecoderNormalEq {
             b: Array2::<f64>::zeros((k, p)),
             off: HashMap::new(),
             firings: vec![0; k],
-            amplitude_sum: vec![0.0; k],
         }
     }
 
@@ -2353,7 +2350,6 @@ impl DecoderNormalEq {
                 }
                 let ka = code.indices[a];
                 self.firings[ka as usize] += 1;
-                self.amplitude_sum[ka as usize] += ca.abs();
                 self.diag[ka as usize] += ca * ca;
                 for bsel in (a + 1)..code.indices.len() {
                     let cb = code.codes[bsel] as f64;
@@ -2436,7 +2432,6 @@ impl DecoderNormalEq {
             let atom = decision.atom;
             self.diag[atom] = 0.0;
             self.firings[atom] = 0;
-            self.amplitude_sum[atom] = 0.0;
             self.b.row_mut(atom).fill(0.0);
         }
         self.off
@@ -2958,86 +2953,125 @@ impl DecoderSolveStats {
     }
 }
 
+/// One atom's routability decision: refresh its decoder row from this window's
+/// normal equations, or keep the previous row and let the evidence accumulate.
+///
+/// The question the gate answers is whether the window's data move the atom's
+/// *direction* off its current unit row `d_k` by more than noise would. With
+/// the codes `C` as the (fixed) design and every other atom held at its current
+/// row, the atom's partial model is `x_i − Σ_{l≠k} c_{il} d_l = c_{ik} u + ε_i`,
+/// `ε_i ~ N(0, σ² I_p)`, `u` on the unit sphere. The Rao score test of
+/// `H0: u = d_k` differentiates the log-likelihood along the sphere's tangent
+/// space at `d_k`:
+///
+/// ```text
+///   r_k = B_k − Σ_{l≠k} A_kl d_l = Σ_i c_{ik} (x_i − Σ_{l≠k} c_{il} d_l),
+///   g_k = (I − d_k d_kᵀ) r_k      = Σ_i c_{ik} (I − d_k d_kᵀ) e_i,
+///   I(u) = (A_kk / σ²) (I − d_k d_kᵀ),
+///   T_k = ‖g_k‖² / (σ² A_kk),
+/// ```
+///
+/// with `e_i` the current residual (the radial component `A_kk d_k` of `r_k`
+/// is the fitted part and drops out under the projection). Given the codes,
+/// `g_k ~ N(0, σ² A_kk (I − d_k d_kᵀ))` under `H0`, so `T_k ~ χ²_{p−1}` exactly
+/// for single-atom routing: the codes and the routing depend on each row only
+/// through its in-span coordinates, which isotropic Gaussian noise leaves
+/// independent of the tangent residual. The statistic is calibrated whatever
+/// the codes' magnitude. The previous gates tested the code magnitude itself
+/// (`mean |c|`, then the least-squares amplitude along `d_k`), which least-
+/// squares coding makes grow like `√n` on pure noise (#3926).
+///
+/// The charge is BIC's, applied once: refreshing frees the row's `p − 1`
+/// direction coordinates on the unit sphere, whose log-likelihood gain is
+/// `T_k / 2` to leading order, against the charge `½ (p − 1) ln n_k`, with `n_k`
+/// the atom's firings in the window (the direction's information `A_kk / σ²`
+/// grows in proportion to them). Refresh iff `T_k ≥ (p − 1) ln n_k`. A
+/// deferred atom keeps its row and its firings keep accumulating, so a real
+/// direction change `Δ` (`T_k ≈ n_k ‖Δ‖² c̄² / σ²`) always crosses the
+/// logarithmic threshold eventually while a stationary row does not.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct RoutabilityGateDecision {
     pub(super) atom: usize,
     pub(super) refresh: bool,
     pub(super) firings: usize,
-    pub(super) mean_amplitude: f64,
-    pub(super) z_alpha: f64,
-    pub(super) margin: f64,
-    pub(super) threshold: f64,
-    pub(super) standard_error: f64,
+    /// Score statistic `T_k = ‖(I − d_k d_kᵀ) r_k‖² / (σ² A_kk)`,
+    /// `χ²_{p−1}` under `H0: u = d_k` given the codes.
+    pub(super) statistic: f64,
+    /// Degrees of freedom `p − 1` of the direction on the unit sphere.
+    pub(super) degrees_of_freedom: usize,
+    /// BIC critical value `(p − 1) ln n_k`.
+    pub(super) critical: f64,
 }
 
-fn routability_z_alpha(firings: usize) -> f64 {
-    // BIC's one-parameter charge is `0.5 ln n`; equating it to a Gaussian
-    // tail exponent `z^2/2` gives the confidence radius without a tuned knob.
-    (firings.max(2) as f64).ln().sqrt()
+/// BIC's charge `½ (p − 1) ln n` for the `p − 1` free direction coordinates,
+/// equated to the score test's log-likelihood gain `T / 2`: the critical `T`
+/// is `(p − 1) ln n`.
+fn routability_critical(degrees_of_freedom: usize, firings: usize) -> f64 {
+    degrees_of_freedom as f64 * (firings as f64).ln().max(0.0)
 }
 
+/// Routability decisions for every atom against the current `decoder` (the rows
+/// the window's codes were routed with). See [`RoutabilityGateDecision`].
 pub(super) fn routability_gate_decisions(
     eq: &DecoderNormalEq,
+    decoder: ArrayView2<'_, f32>,
     residual_scale: f64,
 ) -> Vec<RoutabilityGateDecision> {
-    (0..eq.diag.len())
+    let k = eq.diag.len();
+    let p = eq.b.ncols();
+    assert_eq!(decoder.nrows(), k, "decoder rows must match the normal equations");
+    assert_eq!(decoder.ncols(), p, "decoder width must match the normal equations");
+    let degrees_of_freedom = p.saturating_sub(1);
+    // `r_k = B_k − Σ_{l≠k} A_kl d_l`, one pass over the sparse couplings.
+    let mut partial = eq.b.clone();
+    for (&(a, b), &a_ab) in eq.off.iter() {
+        let (a, b) = (a as usize, b as usize);
+        for j in 0..p {
+            partial[[a, j]] -= a_ab * decoder[[b, j]] as f64;
+            partial[[b, j]] -= a_ab * decoder[[a, j]] as f64;
+        }
+    }
+    (0..k)
         .map(|atom| {
             let firings = eq.firings[atom];
-            if firings == 0 || eq.diag[atom] == 0.0 {
+            let critical = routability_critical(degrees_of_freedom, firings);
+            let row = decoder.row(atom);
+            let row_norm_sq: f64 = row.iter().map(|&v| v as f64 * v as f64).sum();
+            let a_kk = eq.diag[atom];
+            if firings == 0 || a_kk <= 0.0 || row_norm_sq <= 0.0 {
+                // No firing energy or no row to carry it: nothing is estimable.
                 return RoutabilityGateDecision {
                     atom,
                     refresh: false,
                     firings,
-                    mean_amplitude: 0.0,
-                    z_alpha: routability_z_alpha(firings),
-                    margin: 0.0,
-                    threshold: f64::INFINITY,
-                    standard_error: f64::INFINITY,
+                    statistic: 0.0,
+                    degrees_of_freedom,
+                    critical,
                 };
             }
-            let n = firings as f64;
-            let mean_amplitude = eq.amplitude_sum[atom] / n;
-            let z_alpha = routability_z_alpha(firings);
-            let charge_floor = if residual_scale > 0.0 {
-                residual_scale * z_alpha / n.sqrt()
-            } else {
-                0.0
-            };
-            // The routability margin is the fraction of the mean amplitude that
-            // survives the charge floor. A starved atom (mean_amplitude below the
-            // floor) has NO surviving margin: clamp at zero so the quantity is
-            // `>= 0` by construction and can never enter a downstream expression as
-            // a negative shrink. Semantically identical to the previous negative /
-            // NEG_INFINITY value — a non-positive margin already forces
-            // `threshold = +INF` below, deferring the atom — but it removes the
-            // sign hazard entirely: the gate can defer or refresh, never negate.
-            let margin = if mean_amplitude > 0.0 {
-                (1.0 - charge_floor / mean_amplitude).max(0.0)
-            } else {
-                0.0
-            };
-            let standard_error = if residual_scale > 0.0 && mean_amplitude > 0.0 {
-                residual_scale / (mean_amplitude * n.sqrt())
-            } else if mean_amplitude > 0.0 {
-                0.0
-            } else {
+            let r = partial.row(atom);
+            let radial: f64 = row.iter().zip(r.iter()).map(|(&d, &v)| d as f64 * v).sum();
+            // ‖(I − d dᵀ/‖d‖²) r‖² = ‖r‖² − (dᵀr)²/‖d‖², clamped at the
+            // rounding floor of the subtraction.
+            let tangent_sq = (r.iter().map(|&v| v * v).sum::<f64>()
+                - radial * radial / row_norm_sq)
+                .max(0.0);
+            // `σ = 0` is an exact reconstruction: any tangent pull is certain
+            // (`T = +∞`), none leaves the row where it is.
+            let statistic = if residual_scale > 0.0 {
+                tangent_sq / (residual_scale * residual_scale * a_kk)
+            } else if tangent_sq > 0.0 {
                 f64::INFINITY
-            };
-            let threshold = if margin > 0.0 && mean_amplitude > 0.0 {
-                let denom = mean_amplitude * margin;
-                (z_alpha * residual_scale / denom).powi(2)
             } else {
-                f64::INFINITY
+                0.0
             };
             RoutabilityGateDecision {
                 atom,
-                refresh: n >= threshold,
+                refresh: statistic >= critical,
                 firings,
-                mean_amplitude,
-                z_alpha,
-                margin,
-                threshold,
-                standard_error,
+                statistic,
+                degrees_of_freedom,
+                critical,
             }
         })
         .collect()
@@ -3051,27 +3085,22 @@ pub(super) fn solve_decoder_with_routability_gate_recycled(
     gpu: gam_gpu::GpuPolicy,
     recycle: &mut DecoderRecycleSpace,
 ) -> Result<(DecoderSolveStats, Vec<RoutabilityGateDecision>), String> {
-    let gate = routability_gate_decisions(eq, residual_scale);
+    let gate = routability_gate_decisions(eq, decoder.view(), residual_scale);
     let mut candidate = decoder.clone();
     let stats = solve_decoder_recycled(&mut candidate, eq, ridge, gpu, recycle)?;
     for decision in gate.iter() {
         if !decision.refresh {
             // A deferred atom keeps its previous decoder row and accumulates
-            // firing evidence across epochs. Surface the routability evidence
-            // trail so a persistently-held-back atom is diagnosable without a
-            // debugger: `n < threshold` because the mean amplitude cannot yet
-            // clear the `z_alpha * residual_scale` charge floor by the required
-            // `margin` (see `routability_gate_decisions`).
+            // firing evidence across epochs. Surface the evidence trail so a
+            // persistently-held-back atom is diagnosable without a debugger.
             log::trace!(
-                "[SAE routability] atom {} deferred: firings={} mean_amplitude={:.4} \
-                 z_alpha={:.4} margin={:.4} standard_error={:.4} threshold={:.4}",
+                "[SAE routability] atom {} deferred: firings={} score={:.4} \
+                 df={} critical={:.4}",
                 decision.atom,
                 decision.firings,
-                decision.mean_amplitude,
-                decision.z_alpha,
-                decision.margin,
-                decision.standard_error,
-                decision.threshold,
+                decision.statistic,
+                decision.degrees_of_freedom,
+                decision.critical,
             );
             continue;
         }
@@ -4321,10 +4350,30 @@ fn residual_scale(
     codes: &[SparseCode],
     decoder: ArrayView2<'_, f32>,
 ) -> f64 {
-    let n = x.nrows();
-    let p = x.ncols();
     let (rss, _) = reconstruction_rss_tss_chunks(x, codes, decoder, None);
-    (rss / (n * p) as f64).sqrt()
+    routability_noise_scale(rss, x.nrows() * x.ncols(), fitted_code_count(codes))
+}
+
+/// Number of live (nonzero) codes: the per-row parameters the coding step fit.
+pub(super) fn fitted_code_count(codes: &[SparseCode]) -> usize {
+    codes
+        .iter()
+        .map(|code| code.codes.iter().filter(|&&c| c != 0.0).count())
+        .sum()
+}
+
+/// Noise scale `σ̂` for the routability score test, with the codes (the
+/// nuisance parameters under `H0`) profiled out:
+/// `σ̂² = RSS / (n p − Σ_i |S_i|)`. Each live code is one least-squares fit to
+/// its row, so the residual keeps `n p − Σ_i |S_i|` degrees of freedom; the raw
+/// `RSS / (n p)` is biased low by the factor `1 − s / p` and inflates the score
+/// statistic by its inverse. With no residual degrees of freedom the codes
+/// interpolate every entry: the reconstruction is exact and `σ̂ = 0`.
+pub(super) fn routability_noise_scale(rss: f64, entries: usize, fitted_codes: usize) -> f64 {
+    match entries.checked_sub(fitted_codes) {
+        Some(dof) if dof > 0 => (rss / dof as f64).sqrt(),
+        _ => 0.0,
+    }
 }
 
 fn pack_codes(codes: &[SparseCode], n: usize, s: usize) -> (Array2<u32>, Array2<f32>) {
@@ -4473,7 +4522,6 @@ mod exact_solve_tests {
         let mut b = Array2::<f64>::zeros((k, p));
         let mut off: HashMap<(u32, u32), f64> = HashMap::new();
         let mut firings = vec![0usize; k];
-        let mut amplitude_sum = vec![0.0f64; k];
 
         for (row_idx, code) in codes.iter().enumerate() {
             let xi = x.row(row_idx);
@@ -4485,7 +4533,6 @@ mod exact_solve_tests {
                 }
                 let ka = code.indices[a];
                 firings[ka as usize] += 1;
-                amplitude_sum[ka as usize] += ca.abs();
                 diag[ka as usize] += ca * ca;
                 let brow = ka as usize;
                 let mut brow_view = b.row_mut(brow);
@@ -4523,7 +4570,6 @@ mod exact_solve_tests {
             b,
             off,
             firings,
-            amplitude_sum,
         }
     }
 
@@ -4625,10 +4671,11 @@ mod exact_solve_tests {
     fn routability_gate_refreshes_well_fired_and_defers_starved_atom() {
         let mut eq = DecoderNormalEq::zeros(2, 2);
         accumulate_constant_rows(&mut eq, 0, 64, 1.0, [2.0, 0.0]);
-        accumulate_constant_rows(&mut eq, 1, 1, 1.0, [0.0, 3.0]);
+        accumulate_constant_rows(&mut eq, 1, 2, 1.0, [3.0, 0.3]);
 
         let mut decoder = Array2::<f32>::zeros((2, 2));
-        decoder[[0, 1]] = 1.0;
+        decoder[[0, 0]] = 0.8;
+        decoder[[0, 1]] = 0.6;
         decoder[[1, 0]] = 1.0;
         let (_stats, gate) = solve_decoder_with_routability_gate(
             &mut decoder,
@@ -4639,16 +4686,16 @@ mod exact_solve_tests {
         )
         .expect("decoder refresh");
 
+        // Atom 0: r = (128, 0), tangent part ‖r‖² − (d·r)² = 128² − 102.4² =
+        // 5898.24, so T = 5898.24 / 64 = 92.16 against (p − 1) ln 64 ≈ 4.16
+        // (to the f32 rounding of the row (0.8, 0.6), relative ~1e-7).
+        assert!((gate[0].statistic - 92.16).abs() < 1.0e-4);
+        assert_eq!(gate[0].degrees_of_freedom, 1);
+        assert!((gate[0].critical - 64.0f64.ln()).abs() < 1.0e-12);
         assert!(gate[0].refresh, "well-fired atom must refresh");
-        assert!(
-            gate[0].standard_error <= gate[0].margin,
-            "well-fired atom should clear the SE-to-margin gate"
-        );
+        // Atom 1: r = (6, 0.6) along d = (1, 0): T = 0.36 / 2 = 0.18 < ln 2.
+        assert!((gate[1].statistic - 0.18).abs() < 1.0e-6);
         assert!(!gate[1].refresh, "starved atom must defer");
-        assert!(
-            gate[1].standard_error > gate[1].margin,
-            "starved atom's refresh SE should exceed its charge-floor margin"
-        );
         assert!(
             decoder[[0, 0]] > 1.9 && decoder[[0, 1]].abs() < 1.0e-6,
             "admitted atom should take its MOD row"
@@ -4665,7 +4712,8 @@ mod exact_solve_tests {
         let mut decoder = Array2::<f32>::zeros((1, 2));
         decoder[[0, 1]] = 1.0;
 
-        accumulate_constant_rows(&mut eq, 0, 1, 1.0, [3.0, 0.0]);
+        // Two firings with tangent pull 0.4 each: T = 0.8² / 2 = 0.32 < ln 2.
+        accumulate_constant_rows(&mut eq, 0, 2, 1.0, [0.4, 3.0]);
         let (_stats_first, first_gate) = solve_decoder_with_routability_gate(
             &mut decoder,
             &eq,
@@ -4676,17 +4724,19 @@ mod exact_solve_tests {
         .expect("decoder refresh");
         eq.clear_refreshed_atoms(&first_gate);
 
-        assert!(!first_gate[0].refresh, "single firing should defer");
+        assert!(!first_gate[0].refresh, "two weak firings should defer");
         assert_eq!(
-            eq.firings[0], 1,
+            eq.firings[0], 2,
             "deferred atom's firing evidence must remain accumulated"
         );
         assert!(
-            decoder[[0, 1]] > 0.9,
+            decoder[[0, 1]] > 0.9 && decoder[[0, 0]].abs() < 1.0e-6,
             "deferred atom must keep its old decoder direction"
         );
 
-        accumulate_constant_rows(&mut eq, 0, 63, 1.0, [3.0, 0.0]);
+        // Sixty-four firings: T = 25.6² / 64 = 10.24 ≥ ln 64 ≈ 4.16. The score
+        // grows linearly in the firings, the charge only logarithmically.
+        accumulate_constant_rows(&mut eq, 0, 62, 1.0, [0.4, 3.0]);
         let (_stats_second, second_gate) = solve_decoder_with_routability_gate(
             &mut decoder,
             &eq,
@@ -4697,6 +4747,7 @@ mod exact_solve_tests {
         .expect("decoder refresh");
         eq.clear_refreshed_atoms(&second_gate);
 
+        assert!((second_gate[0].statistic - 10.24).abs() < 1.0e-6);
         assert!(
             second_gate[0].refresh,
             "accumulated firings should cross the routability threshold"
@@ -4706,8 +4757,135 @@ mod exact_solve_tests {
             "refreshed atom's consumed evidence should be cleared"
         );
         assert!(
-            decoder[[0, 0]] > 2.9 && decoder[[0, 1]].abs() < 1.0e-6,
+            (decoder[[0, 0]] - 0.4).abs() < 1.0e-5 && (decoder[[0, 1]] - 3.0).abs() < 1.0e-5,
             "eventually admitted atom should install its MOD row"
+        );
+    }
+
+    /// The gate tests the row's direction, not the codes' size (#3926): heavy,
+    /// well-fired traffic exactly along the current row is no evidence that the
+    /// row should move, and a coupled atom's share of `B_k` is not either.
+    #[test]
+    fn routability_gate_ignores_radial_mass_and_coupled_atoms() {
+        let mut eq = DecoderNormalEq::zeros(1, 3);
+        let mut x = Array2::<f32>::zeros((64, 3));
+        x.column_mut(0).fill(5.0);
+        let codes: Vec<SparseCode> = (0..64)
+            .map(|_| SparseCode {
+                indices: vec![0],
+                codes: vec![5.0],
+            })
+            .collect();
+        eq.accumulate(x.view(), &codes);
+        let mut decoder = Array2::<f32>::zeros((1, 3));
+        decoder[[0, 0]] = 1.0;
+        let radial = super::routability_gate_decisions(&eq, decoder.view(), 1.0)[0];
+        assert_eq!(radial.degrees_of_freedom, 2);
+        assert!((radial.critical - 2.0 * 64.0f64.ln()).abs() < 1.0e-12);
+        assert!(radial.statistic.abs() < 1.0e-9, "radial T {}", radial.statistic);
+        assert!(!radial.refresh, "code mass along the row must not refresh it");
+
+        // Two non-orthogonal atoms firing together on rows they reconstruct
+        // exactly: each `B_k` carries the other atom's direction, which the
+        // coupling term removes, so neither row is pulled.
+        let rows = 40usize;
+        let d = [[1.0f32, 0.0], [0.6, 0.8]];
+        let mut x = Array2::<f32>::zeros((rows, 2));
+        let codes: Vec<SparseCode> = (0..rows)
+            .map(|i| {
+                let c0 = 1.0 + (i % 5) as f32 * 0.25;
+                let c1 = 0.5 + (i % 3) as f32 * 0.5;
+                for j in 0..2 {
+                    x[[i, j]] = c0 * d[0][j] + c1 * d[1][j];
+                }
+                SparseCode {
+                    indices: vec![0, 1],
+                    codes: vec![c0, c1],
+                }
+            })
+            .collect();
+        let mut eq = DecoderNormalEq::zeros(2, 2);
+        eq.accumulate(x.view(), &codes);
+        let decoder = Array2::from_shape_vec((2, 2), vec![1.0f32, 0.0, 0.6, 0.8]).unwrap();
+        let gate = super::routability_gate_decisions(&eq, decoder.view(), 1.0);
+        for decision in &gate {
+            assert!(
+                decision.statistic < 1.0e-6,
+                "atom {} pulled by its partner: T {}",
+                decision.atom,
+                decision.statistic
+            );
+            assert!(!decision.refresh);
+        }
+    }
+
+    /// Under `H0` the score statistic is `χ²_{p−1}` given the codes, with the
+    /// codes the least-squares ones the router produces (`c_i = dᵀx_i` for a
+    /// unit row) on pure-noise rows. For `p = 3` the refresh rate is the tail
+    /// `P(χ²₂ ≥ 2 ln n) = 1 / n`. The amplitude statistic this replaces has
+    /// `â ≡ 1` under least-squares codes and `t = ‖c‖ / σ ≈ √n` here, so it
+    /// refreshed on every trial. The profiled noise scale is unbiased; the raw
+    /// `RSS / (n p)` it replaces averages `(p − 1) / p = 2/3` here.
+    #[test]
+    fn routability_score_is_chi_square_under_the_null_with_least_squares_codes() {
+        use rand::RngExt;
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3926);
+        let mut normal = || {
+            let u1: f64 = 1.0 - rng.random_range(0.0..1.0);
+            let u2: f64 = rng.random_range(0.0..1.0);
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+        };
+        let (trials, n, p) = (4000usize, 50usize, 3usize);
+        let mut decoder = Array2::<f32>::zeros((1, p));
+        decoder[[0, 0]] = 0.6;
+        decoder[[0, 2]] = 0.8;
+        let (mut sum, mut sum_sq, mut refreshed, mut sigma_sq_sum) =
+            (0.0f64, 0.0f64, 0usize, 0.0f64);
+        for _ in 0..trials {
+            let mut x = Array2::<f32>::zeros((n, p));
+            x.iter_mut().for_each(|v| *v = normal() as f32);
+            let codes: Vec<SparseCode> = (0..n)
+                .map(|i| SparseCode {
+                    indices: vec![0],
+                    codes: vec![x.row(i).dot(&decoder.row(0))],
+                })
+                .collect();
+            let mut eq = DecoderNormalEq::zeros(1, p);
+            eq.accumulate(x.view(), &codes);
+            let decision = super::routability_gate_decisions(&eq, decoder.view(), 1.0)[0];
+            assert_eq!(decision.degrees_of_freedom, p - 1);
+            sum += decision.statistic;
+            sum_sq += decision.statistic * decision.statistic;
+            refreshed += usize::from(decision.refresh);
+            let sigma = super::residual_scale(x.view(), &codes, decoder.view());
+            sigma_sq_sum += sigma * sigma;
+        }
+        let trials_f = trials as f64;
+        let df = (p - 1) as f64;
+        let mean = sum / trials_f;
+        let var = sum_sq / trials_f - mean * mean;
+        // χ²₂ is exponential with mean 2: variance 4, fourth central moment 9·16.
+        assert!((mean - df).abs() < 4.0 * (2.0 * df / trials_f).sqrt(), "null mean {mean}");
+        assert!(
+            (var - 2.0 * df).abs() < 4.0 * ((9.0 - 1.0) * 16.0 / trials_f).sqrt(),
+            "null var {var}"
+        );
+        let tail = (-df * (n as f64).ln() / 2.0).exp();
+        assert!((tail - 1.0 / n as f64).abs() < 1.0e-12);
+        let rate = refreshed as f64 / trials_f;
+        let se_rate = (tail * (1.0 - tail) / trials_f).sqrt();
+        assert!(
+            (rate - tail).abs() < 4.0 * se_rate,
+            "null refresh rate {rate} vs tail {tail}"
+        );
+        // RSS ~ σ² χ²_{n(p−1)}: the profiled σ̂² has mean 1 and per-trial
+        // variance 2 / (n (p − 1)).
+        let sigma_sq_mean = sigma_sq_sum / trials_f;
+        let se_sigma_sq = (2.0 / (n as f64 * df) / trials_f).sqrt();
+        assert!(
+            (sigma_sq_mean - 1.0).abs() < 4.0 * se_sigma_sq,
+            "profiled noise scale {sigma_sq_mean}"
         );
     }
 
@@ -4731,7 +4909,6 @@ mod exact_solve_tests {
             b,
             off,
             firings: vec![4; k],
-            amplitude_sum: vec![4.0; k],
         }
     }
 
@@ -4950,7 +5127,6 @@ mod exact_solve_tests {
                     b,
                     off,
                     firings: vec![k; k],
-                    amplitude_sum: vec![k as f64; k],
                 },
                 dense,
                 truth,
@@ -5328,7 +5504,6 @@ mod exact_solve_tests {
             b,
             off,
             firings: vec![4; k],
-            amplitude_sum: vec![4.0; k],
         };
         let mut decoder = Array2::<f32>::zeros((k, p));
         let ridge = 1.0e-9f64;
@@ -5396,7 +5571,6 @@ mod exact_solve_tests {
             b: ndarray::array![[2.0_f64, 1.0], [2.0, 1.0]],
             off,
             firings: vec![1; k],
-            amplitude_sum: vec![1.0; k],
         };
         // With no CG history the route's prediction is min(Chebyshev cap, m)
         // = m here (the singular block's κ bound is ~1e16).
