@@ -2653,3 +2653,382 @@ fn row_precision_prior_reads_the_symmetric_part_of_its_precision_2469() {
     let refused = RowPrecisionPriorPenalty::new(target, singular_part, 1.3, 2, true);
     assert!(refused.unwrap_err().contains("must be positive definite"));
 }
+
+// ---------------------------------------------------------------------------
+// Central-difference consistency for analytic derivatives that had no FD pin:
+// smoothed total variation (path and graph operators), soft monotonicity, the
+// iVAE ridge conditional-mean gauge, and the normalized cross-Gram composition
+// behind the decoder-incoherence and subspace-overlap priors.
+//
+// Tolerance derivation. A central difference with step h along a probe v has
+// truncation error h²/6 · |∂³_v f| and roundoff ≈ u·|f|/h (u = 2.2e-16). The
+// fixtures keep every coordinate and probe entry O(1) and every smoothing scale
+// ≥ 0.2, so the largest third directional derivative that enters any check
+// (the TV kernel's fourth derivative 3/ε³ ≈ 375 times |D v|³ ≤ 13) is below
+// 5e3: at h = 1e-5 truncation is ≤ 1e-7 and roundoff ≤ 1e-10. The asserted
+// 1e-6·(1 + |analytic|) bound therefore has an order of magnitude of margin,
+// while any dropped, mis-signed or mis-scaled analytic term (an O(1) relative
+// error) exceeds it by several orders.
+// ---------------------------------------------------------------------------
+
+const DERIV_FD_STEP: f64 = 1.0e-5;
+const DERIV_FD_TOL: f64 = 1.0e-6;
+
+fn assert_fd_close(label: &str, analytic: f64, fd: f64) {
+    let bound = DERIV_FD_TOL * (1.0 + analytic.abs());
+    let err = (analytic - fd).abs();
+    assert!(
+        err <= bound,
+        "{label}: analytic {analytic:.12e} vs central difference {fd:.12e} (|Δ| = {err:.3e} > {bound:.3e})"
+    );
+}
+
+/// Pins value→`grad_target`, `grad_target`→`hvp` along every probe, the convex
+/// identity `psd_majorizer_hvp == hvp`, and value→`grad_rho`.
+fn assert_penalty_derivatives_match_fd(
+    label: &str,
+    pen: &dyn AnalyticPenalty,
+    target: ArrayView1<'_, f64>,
+    rho: ArrayView1<'_, f64>,
+    probes: &[Array1<f64>],
+) {
+    let h = DERIV_FD_STEP;
+    let grad = pen.grad_target(target, rho);
+    let mut tp = target.to_owned();
+    let mut tm = target.to_owned();
+    for i in 0..target.len() {
+        tp[i] = target[i] + h;
+        tm[i] = target[i] - h;
+        let fd = (pen.value(tp.view(), rho) - pen.value(tm.view(), rho)) / (2.0 * h);
+        tp[i] = target[i];
+        tm[i] = target[i];
+        assert_fd_close(&format!("{label} grad[{i}]"), grad[i], fd);
+    }
+    for (k, v) in probes.iter().enumerate() {
+        let hv = pen.hvp(target, rho, v.view());
+        let majorized = pen.psd_majorizer_hvp(target, rho, v.view());
+        let step = v.mapv(|x| x * h);
+        let gp = pen.grad_target((&target + &step).view(), rho);
+        let gm = pen.grad_target((&target - &step).view(), rho);
+        for i in 0..target.len() {
+            let fd = (gp[i] - gm[i]) / (2.0 * h);
+            assert_fd_close(&format!("{label} hvp[{k}][{i}]"), hv[i], fd);
+            // Every penalty checked here is convex, so its PSD majorizer is the
+            // exact Hessian and the two operators must agree to roundoff.
+            assert_abs_diff_eq!(majorized[i], hv[i], epsilon = 1e-12 * (1.0 + hv[i].abs()));
+        }
+    }
+    let grad_rho = pen.grad_rho(target, rho);
+    assert_eq!(grad_rho.len(), pen.rho_count(), "{label} grad_rho length");
+    for k in 0..rho.len() {
+        let mut rp = rho.to_owned();
+        let mut rm = rho.to_owned();
+        rp[k] += h;
+        rm[k] -= h;
+        let fd = (pen.value(target, rp.view()) - pen.value(target, rm.view())) / (2.0 * h);
+        assert_fd_close(&format!("{label} grad_rho[{k}]"), grad_rho[k], fd);
+    }
+}
+
+/// The materialized Hessian must act exactly like the matrix-free `hvp`.
+fn assert_dense_matches_hvp(
+    label: &str,
+    dense: &Array2<f64>,
+    pen: &dyn AnalyticPenalty,
+    target: ArrayView1<'_, f64>,
+    rho: ArrayView1<'_, f64>,
+    probes: &[Array1<f64>],
+) {
+    for (k, v) in probes.iter().enumerate() {
+        let hv = pen.hvp(target, rho, v.view());
+        let dv = dense.dot(v);
+        for i in 0..v.len() {
+            assert!(
+                (dv[i] - hv[i]).abs() <= 1e-12 * (1.0 + hv[i].abs()),
+                "{label} dense·v[{k}][{i}] = {:.12e} but hvp = {:.12e}",
+                dv[i],
+                hv[i]
+            );
+        }
+    }
+}
+
+/// `ln det A` of a symmetric positive-definite matrix by an unpivoted Cholesky
+/// factorization, as an independent dense reference.
+fn cholesky_log_det(a: &Array2<f64>) -> f64 {
+    let n = a.nrows();
+    let mut l = Array2::<f64>::zeros((n, n));
+    let mut log_det = 0.0;
+    for j in 0..n {
+        let mut pivot = a[[j, j]];
+        for k in 0..j {
+            pivot -= l[[j, k]] * l[[j, k]];
+        }
+        assert!(pivot > 0.0, "reference matrix is not positive definite");
+        let ljj = pivot.sqrt();
+        l[[j, j]] = ljj;
+        log_det += 2.0 * ljj.ln();
+        for i in j + 1..n {
+            let mut s = a[[i, j]];
+            for k in 0..j {
+                s -= l[[i, k]] * l[[j, k]];
+            }
+            l[[i, j]] = s / ljj;
+        }
+    }
+    log_det
+}
+
+/// Row-major `(5, 2)` latent block whose edge differences mix the quadratic
+/// regime (|Δ| = 0.05 ≪ ε) with the L¹ regime (|Δ| up to 2.25 ≫ ε), plus two
+/// dense probes.
+fn five_by_two_fixture() -> (Array1<f64>, Vec<Array1<f64>>) {
+    let t = array![
+        0.10_f64, -0.40, 0.15, 0.90, -0.60, 0.95, -0.55, -1.30, 0.40, -1.20
+    ];
+    let probes = vec![
+        array![1.0_f64, -0.5, 0.3, 0.8, -1.1, 0.2, 0.6, -0.4, 0.9, -0.7],
+        array![-0.2_f64, 0.7, 1.0, -0.3, 0.5, 0.4, -0.8, 1.2, -0.6, 0.1],
+    ];
+    (t, probes)
+}
+
+#[test]
+fn total_variation_forward_1d_derivatives_match_fd() {
+    let (t, probes) = five_by_two_fixture();
+    let rho = array![0.3_f64];
+    let pen = TotalVariationPenalty::new(0.7, 5, DifferenceOpKind::ForwardDiff1D, 0.2, true)
+        .expect("valid forward-difference TV");
+    assert_penalty_derivatives_match_fd("TV forward", &pen, t.view(), rho.view(), &probes);
+
+    let dense = pen.as_dense(t.view(), rho.view());
+    assert_dense_matches_hvp("TV forward", &dense, &pen, t.view(), rho.view(), &probes);
+    let diag = pen.diag_target(t.view(), rho.view());
+    for i in 0..t.len() {
+        assert_abs_diff_eq!(
+            diag[i],
+            dense[[i, i]],
+            epsilon = 1e-12 * (1.0 + dense[[i, i]])
+        );
+    }
+    // The tridiagonal pivot recurrence behind the frozen operator's log-det must
+    // equal the dense log-det of the same Hessian, including a λ small enough
+    // that the path Laplacian's constant null direction dominates.
+    for &lambda in &[1.0e-3_f64, 0.5, 4.0] {
+        let tridiagonal = pen
+            .log_det_plus_lambda_i_forward_1d(t.view(), rho.view(), lambda)
+            .expect("positive pivots");
+        let mut shifted = dense.clone();
+        for i in 0..t.len() {
+            shifted[[i, i]] += lambda;
+        }
+        let reference = cholesky_log_det(&shifted);
+        assert_abs_diff_eq!(
+            tridiagonal,
+            reference,
+            epsilon = 1e-10 * (1.0 + reference.abs())
+        );
+    }
+}
+
+#[test]
+fn total_variation_graph_edges_derivatives_match_fd() {
+    let (t, probes) = five_by_two_fixture();
+    let rho = array![-0.4_f64];
+    let edges = vec![(0, 2), (2, 1), (3, 1), (0, 4), (4, 3)];
+    let pen = TotalVariationPenalty::new(1.3, 5, DifferenceOpKind::GraphEdges(edges), 0.25, true)
+        .expect("valid graph TV");
+    assert_penalty_derivatives_match_fd("TV graph", &pen, t.view(), rho.view(), &probes);
+
+    let dense = pen.as_dense(t.view(), rho.view());
+    assert_dense_matches_hvp("TV graph", &dense, &pen, t.view(), rho.view(), &probes);
+    let diag = pen.diag_target(t.view(), rho.view());
+    for i in 0..t.len() {
+        assert_abs_diff_eq!(
+            diag[i],
+            dense[[i, i]],
+            epsilon = 1e-12 * (1.0 + dense[[i, i]])
+        );
+    }
+}
+
+#[test]
+fn shape_monotonicity_derivatives_match_fd() {
+    let (t, probes) = five_by_two_fixture();
+    let rho = array![0.2_f64];
+    for direction in [1.0_f64, -1.0] {
+        let pen = ShapeMonotonicityPenalty::new(0.6, 5, direction, 0.25, true)
+            .expect("valid monotonicity penalty");
+        assert_penalty_derivatives_match_fd(
+            &format!("monotonicity dir {direction}"),
+            &pen,
+            t.view(),
+            rho.view(),
+            &probes,
+        );
+    }
+}
+
+#[test]
+fn ivae_ridge_mean_gauge_derivatives_match_fd() {
+    let (t, probes) = five_by_two_fixture();
+    let rho = array![0.25_f64];
+    let aux = array![
+        [1.0_f64, 0.2],
+        [0.4, -0.7],
+        [-0.3, 0.5],
+        [0.8, 1.1],
+        [-1.2, 0.1]
+    ];
+    let pen = IvaeRidgeMeanGauge::new(PsiSlice::full(10, Some(2)), aux, 0.1, 0.8, 5, true)
+        .expect("valid iVAE gauge");
+    // grad_rho includes the Gaussian normalizer −½·len·ln μ, so the ρ check
+    // pins the normalizer's derivative as well as the quadratic's.
+    assert_penalty_derivatives_match_fd("iVAE gauge", &pen, t.view(), rho.view(), &probes);
+
+    let dense = pen.as_dense(t.view(), rho.view());
+    assert_dense_matches_hvp("iVAE gauge", &dense, &pen, t.view(), rho.view(), &probes);
+    let diag = pen.diag_target(t.view(), rho.view());
+    for i in 0..t.len() {
+        assert_abs_diff_eq!(
+            diag[i],
+            dense[[i, i]],
+            epsilon = 1e-12 * (1.0 + dense[[i, i]].abs())
+        );
+    }
+}
+
+fn ncg_split(
+    theta: ArrayView1<'_, f64>,
+    left_rows: usize,
+    right_rows: usize,
+    cols: usize,
+) -> (Array2<f64>, Array2<f64>) {
+    let split = left_rows * cols;
+    let left = Array2::from_shape_vec((left_rows, cols), theta.slice(s![..split]).to_vec())
+        .expect("left block shape");
+    let right = Array2::from_shape_vec((right_rows, cols), theta.slice(s![split..]).to_vec())
+        .expect("right block shape");
+    (left, right)
+}
+
+/// `u^p v^p = ∂φ/∂E`, recomputed from the `GramNormalization` definitions.
+fn ncg_normalizer(
+    left: &Array2<f64>,
+    right: &Array2<f64>,
+    normalization: normalized_gram::GramNormalization,
+) -> f64 {
+    let sum_sq = |m: &Array2<f64>| m.iter().map(|x| x * x).sum::<f64>();
+    match normalization {
+        normalized_gram::GramNormalization::DecoderNorm => 1.0 / (sum_sq(left) * sum_sq(right)),
+        normalized_gram::GramNormalization::SelfGramNorm => {
+            let left_gram = left.dot(&left.t());
+            let right_gram = right.dot(&right.t());
+            1.0 / (sum_sq(&left_gram).sqrt() * sum_sq(&right_gram).sqrt())
+        }
+    }
+}
+
+fn assert_normalized_cross_gram_derivatives_match_fd(
+    normalization: normalized_gram::GramNormalization,
+) {
+    let (left_rows, right_rows, cols) = (2, 3, 3);
+    let theta = array![
+        0.9_f64, -0.3, 0.5, 0.2, 1.1, -0.6, 0.4, 0.8, -0.2, -0.7, 0.3, 0.9, 0.6, -0.5, 1.0
+    ];
+    let l_dir = array![
+        0.3_f64, 1.0, -0.4, 0.7, -0.2, 0.5, -0.9, 0.1, 0.6, 0.4, -0.8, 0.2, -0.3, 0.9, 0.5
+    ];
+    let r_dir = array![
+        -0.6_f64, 0.2, 0.8, -0.1, 0.4, 1.1, 0.3, -0.7, 0.5, 0.9, 0.2, -0.4, 0.7, 0.1, -0.5
+    ];
+    let dim = theta.len();
+    let h = DERIV_FD_STEP;
+    let label = format!("{normalization:?}");
+    let at = |t: &Array1<f64>| {
+        let (left, right) = ncg_split(t.view(), left_rows, right_rows, cols);
+        normalized_gram::NormalizedCrossGram::new(left.view(), right.view(), normalization)
+            .expect("positive normalizers")
+    };
+    let value = |t: &Array1<f64>| {
+        let (left, right) = ncg_split(t.view(), left_rows, right_rows, cols);
+        let cross = left.dot(&right.t());
+        cross.iter().map(|x| x * x).sum::<f64>() * ncg_normalizer(&left, &right, normalization)
+    };
+    // Frozen-direction Gauss–Newton form 2·u^p v^p·⟨C_l, C_r⟩ with
+    // C_l = l_X Yᵀ + X l_Yᵀ; its θ-gradient is what the GN bilinear returns.
+    let gn_form = |t: &Array1<f64>| {
+        let (x, y) = ncg_split(t.view(), left_rows, right_rows, cols);
+        let (lx, ly) = ncg_split(l_dir.view(), left_rows, right_rows, cols);
+        let (rx, ry) = ncg_split(r_dir.view(), left_rows, right_rows, cols);
+        let cl = lx.dot(&y.t()) + x.dot(&ly.t());
+        let cr = rx.dot(&y.t()) + x.dot(&ry.t());
+        2.0 * ncg_normalizer(&x, &y, normalization) * (&cl * &cr).sum()
+    };
+    let bilinear_hessian = |t: &Array1<f64>| l_dir.dot(&at(t).hessian_action(r_dir.view()));
+    let coordinate_fd = |f: &dyn Fn(&Array1<f64>) -> f64, i: usize| {
+        let mut tp = theta.clone();
+        let mut tm = theta.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        (f(&tp) - f(&tm)) / (2.0 * h)
+    };
+
+    let base = at(&theta);
+    let grad = base.gradient();
+    let third = base.third_bilinear(l_dir.view(), r_dir.view());
+    let gn = base.gauss_newton_bilinear_gradient(l_dir.view(), r_dir.view());
+    let diag = base.diagonal();
+    for i in 0..dim {
+        assert_fd_close(
+            &format!("{label} gradient[{i}]"),
+            grad[i],
+            coordinate_fd(&value, i),
+        );
+        assert_fd_close(
+            &format!("{label} third_bilinear[{i}]"),
+            third[i],
+            coordinate_fd(&bilinear_hessian, i),
+        );
+        assert_fd_close(
+            &format!("{label} gauss_newton_bilinear_gradient[{i}]"),
+            gn[i],
+            coordinate_fd(&gn_form, i),
+        );
+        let mut e = Array1::<f64>::zeros(dim);
+        e[i] = 1.0;
+        let column = base.hessian_action(e.view());
+        assert_abs_diff_eq!(
+            diag[i],
+            column[i],
+            epsilon = 1e-12 * (1.0 + column[i].abs())
+        );
+    }
+    for (k, v) in [l_dir.view(), r_dir.view()].into_iter().enumerate() {
+        let hv = base.hessian_action(v);
+        let step = v.mapv(|x| x * h);
+        let gp = at(&(&theta + &step)).gradient();
+        let gm = at(&(&theta - &step)).gradient();
+        for i in 0..dim {
+            assert_fd_close(
+                &format!("{label} hessian_action[{k}][{i}]"),
+                hv[i],
+                (gp[i] - gm[i]) / (2.0 * h),
+            );
+        }
+    }
+}
+
+#[test]
+fn normalized_cross_gram_decoder_norm_derivatives_match_fd() {
+    assert_normalized_cross_gram_derivatives_match_fd(
+        normalized_gram::GramNormalization::DecoderNorm,
+    );
+}
+
+#[test]
+fn normalized_cross_gram_self_gram_norm_derivatives_match_fd() {
+    assert_normalized_cross_gram_derivatives_match_fd(
+        normalized_gram::GramNormalization::SelfGramNorm,
+    );
+}
