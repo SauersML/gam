@@ -475,23 +475,112 @@ pub(crate) fn use_duchon_small_chi_riesz_series(kappa: f64, r: f64) -> bool {
         && (kappa * r).abs() <= DUCHON_SMALL_CHI_SERIES_MAX
 }
 
-/// Small-χ Riesz-series chart for
-/// `F^{-1}{ρ^{-2a}(κ²+ρ²)^{-b}}`.
+/// Coefficient `E_K(κ)` of `r^{2K}` in the entire function
+/// `H = PF − S` that separates the partial-fraction kernel
+/// `PF = F^{-1}{ρ^{-2a}(κ²+ρ²)^{-b}}` from its high-frequency Riesz series
+/// `S = Σ_n (-1)^n C(b+n-1,n) κ^{2n} R_{a+b+n}^d`, returned as the triplet
+/// `(E_K, ∂_ψ E_K, ∂_ψ² E_K)` in `ψ = ln κ`.
 ///
-/// Expanding at high frequency gives
+/// `S` only reproduces the `ρ → ∞` expansion of the spectrum, so it misses
+/// every analytic (`r^{2K}`, no `ln r`) Taylor term that the Matérn blocks
+/// `M_ℓ = F^{-1}{(κ²+ρ²)^{-ℓ}}` carry. With
+/// `PF = Σ_{j≤a} α_j R_j + Σ_{ℓ≤b} β_ℓ M_ℓ`,
+/// `α_j = (-1)^{a-j} C(a+b-j-1, a-j) κ^{-2(a+b-j)}` and
+/// `β_ℓ = (-1)^a C(a+b-ℓ-1, b-ℓ) κ^{-2(a+b-ℓ)}`, the non-log `r^{2K}`
+/// coefficient of `PF − S` is
 ///
 /// ```text
-/// Σ_n (-1)^n C(b+n-1,n) κ^{2n} R_{a+b+n}^d(R).
+/// E_K = [even d, 1 ≤ d/2+K ≤ a]   α_{d/2+K} c_K A_K
+///     + Σ_ℓ β_ℓ · [r^{2K}] M_ℓ
+///     − [even d, n = K+d/2-a-b ≥ 0]   (-1)^n C(b+n-1, n) κ^{2n} c_K A_K,
 /// ```
 ///
-/// When `d > 2(a+b)`, the low-frequency mass is uniformly integrable and
-/// this is the true pointwise positive-κ kernel for small χ. In singular
-/// regimes this same chart is the constrained Duchon finite-part
-/// representative after quotienting the polynomial nullspace. Either way,
-/// this avoids the catastrophic Riesz/Matérn partial-fraction cancellation
-/// that appears as κR→0.
+/// where `c_K r^{2K}(ln r + A_K)` is the log-Riesz block
+/// ([`log_riesz_coefficient`], [`log_riesz_finite_part_shift`]) and
+/// `[r^{2K}] M_ℓ` is the DLMF 10.31.1 (even `d`: `ln(κ/2)` and digamma) or
+/// elementary half-integer Bessel (odd `d`) coefficient from
+/// `duchon_matern_block_taylor_r2j_triplet`. The `r^{2K} ln r`
+/// coefficients of `PF` and `S` agree identically, so `H` is entire, and
+/// every contribution scales as `κ^{d+2K-2(a+b)}` (times `ln κ` for even
+/// `d`): there is no cross-scale cancellation between the three pieces.
+pub(crate) fn duchon_entire_correction_r2k_psi_triplet(
+    d: usize,
+    a: usize,
+    b: usize,
+    kappa: f64,
+    k: usize,
+) -> (f64, f64, f64) {
+    assert!(
+        a >= 1 && b >= 1,
+        "entire correction needs both Riesz and Matérn factors: a={a}, b={b}"
+    );
+    let mut acc = (0.0_f64, 0.0_f64, 0.0_f64);
+    if d.is_multiple_of(2) {
+        let j = d / 2 + k;
+        let riesz_nonlog = log_riesz_coefficient(d, k) * log_riesz_finite_part_shift(d, k);
+        if (1..=a).contains(&j) {
+            let sign = if (a - j).is_multiple_of(2) { 1.0 } else { -1.0 };
+            let exponent = -2.0 * (a + b - j) as f64;
+            let value = sign * binomial_f64(a + b - j - 1, a - j) * kappa.powf(exponent) * riesz_nonlog;
+            super::add_triplet(&mut acc, super::psi_power_triplet(value, exponent));
+        }
+        if j >= a + b {
+            let n = j - a - b;
+            let sign = if n.is_multiple_of(2) { 1.0 } else { -1.0 };
+            let exponent = 2.0 * n as f64;
+            let value = -sign * binomial_f64(b + n - 1, n) * kappa.powf(exponent) * riesz_nonlog;
+            super::add_triplet(&mut acc, super::psi_power_triplet(value, exponent));
+        }
+    }
+    let sign_a = if a.is_multiple_of(2) { 1.0 } else { -1.0 };
+    for ell in 1..=b {
+        let exponent = -2.0 * (a + b - ell) as f64;
+        let beta = sign_a * binomial_f64(a + b - ell - 1, b - ell) * kappa.powf(exponent);
+        let (pure, _log) = super::duchon_matern_block_taylor_r2j_triplet(kappa, ell, d, k);
+        super::add_triplet(
+            &mut acc,
+            (
+                beta * pure.0,
+                beta * (exponent * pure.0 + pure.1),
+                beta * (exponent * exponent * pure.0 + 2.0 * exponent * pure.1 + pure.2),
+            ),
+        );
+    }
+    acc
+}
+
+/// `κ`-derivative of order `order ∈ {0, 1, 2}` of a quantity given as its
+/// `ψ = ln κ` triplet `(v, ∂_ψ v, ∂_ψ² v)`.
+#[inline]
+fn kappa_derivative_from_psi_triplet(triplet: (f64, f64, f64), kappa: f64, order: usize) -> f64 {
+    match order {
+        0 => triplet.0,
+        1 => triplet.1 / kappa,
+        2 => (triplet.2 - triplet.1) / (kappa * kappa),
+        _ => panic!("kappa derivative order {order} is not supported (need <= 2)"),
+    }
+}
+
+/// Small-κR chart for `PF = F^{-1}{ρ^{-2a}(κ²+ρ²)^{-b}}`: the
+/// high-frequency Riesz series plus its entire correction,
 ///
-/// This helper returns radial R-derivatives of that same series and,
+/// ```text
+/// PF(R) = Σ_n (-1)^n C(b+n-1,n) κ^{2n} R_{a+b+n}^d(R)  +  Σ_K E_K(κ) R^{2K}.
+/// ```
+///
+/// The Riesz series alone is NOT the kernel: it is the `ρ → ∞` expansion
+/// of the spectrum and drops the analytic Taylor terms of the Matérn
+/// blocks. Its difference from `PF` is the entire, non-polynomial
+/// function `H = Σ_K E_K R^{2K}` (see
+/// [`duchon_entire_correction_r2k_psi_triplet`]), so the series alone
+/// is neither the pointwise kernel nor a nullspace-equivalent
+/// representative of it. Adding `H` makes this chart equal to `PF` (and to
+/// the Schwinger chart, where that one applies), so the kernel is
+/// continuous across `κR = DUCHON_SMALL_CHI_SERIES_MAX`. Evaluating both
+/// sums at small `κR` avoids the catastrophic Riesz/Matérn
+/// partial-fraction cancellation that appears as `κR → 0`.
+///
+/// This helper returns radial R-derivatives of that chart and,
 /// with `kappa_derivative_order` set to 1 or 2, the corresponding
 /// analytic κ partials. It is the shared value/η/κ source for the
 /// cancellation basin; production never differentiates it numerically.
@@ -634,6 +723,45 @@ pub(crate) fn duchon_small_chi_riesz_series_radial_derivatives(
     // non-finite, which every Gram and penalty assembly downstream refuses
     // (#2469 — this used to return the partial sum silently).
     if !reached_band {
+        return vec![f64::NAN; total.len()];
+    }
+
+    // Entire correction `H = Σ_K E_K R^{2K}`; its `o`-th radial derivative is
+    // `Σ_{2K ≥ o} E_K (2K)!/(2K-o)! R^{2K-o}`. Consecutive terms shrink by
+    // `O((κR)²/K²)` inside this chart, and the same committed-roundoff band
+    // as above ends the sum. The test starts once every requested order has
+    // received a term (`2K ≥ max_order`) and one more to compare it against.
+    let first_tested = max_order.div_ceil(2) + 1;
+    let mut reached_correction_band = false;
+    for k in 0..DUCHON_SMALL_CHI_SERIES_MAX_TERMS {
+        let coeff = kappa_derivative_from_psi_triplet(
+            duchon_entire_correction_r2k_psi_triplet(d, a, b, kappa, k),
+            kappa,
+            kappa_derivative_order,
+        );
+        let two_k = 2 * k;
+        let mut term_norm = 0.0_f64;
+        let mut falling = 1.0_f64;
+        for order in 0..=max_order.min(two_k) {
+            let summand = coeff * falling * r.powi((two_k - order) as i32);
+            total[order].add(summand);
+            absolute[order] += summand.abs();
+            term_norm = term_norm.max(summand.abs());
+            falling *= (two_k - order) as f64;
+        }
+        // Each summand costs two roundings (`coeff · falling`, `· R^{2K-o}`;
+        // the falling factorial is an exact small integer).
+        let accumulated_band = absolute
+            .iter()
+            .copied()
+            .map(|absolute_sum| gam_linalg::roundoff::compensated_band(2, absolute_sum))
+            .fold(0.0_f64, f64::max);
+        if k >= first_tested && term_norm <= accumulated_band {
+            reached_correction_band = true;
+            break;
+        }
+    }
+    if !reached_correction_band {
         return vec![f64::NAN; total.len()];
     }
 
@@ -899,7 +1027,70 @@ pub(crate) fn hybrid_self_pair_bundle_odd_d(
     let d = eta.len();
     let (f, f_kappa, f_kappa2) =
         hybrid_self_pair_radial_derivative_with_kappa_derivs_odd_d(q, m, s, d, kappa)?;
+    self_pair_bundle_from_radial_diagonal(q, f, f_kappa, f_kappa2, eta)
+}
 
+/// Zero-lag self-pair for the hybrid kernel through the finite part of the
+/// partial-fraction chart, valid in every dimension whenever the UV clause
+/// `λ = 2(m+s) - d/2 - q > 0` holds (the IR clause `μ = d/2 + q - 2m > 0`
+/// of [`schoenberg_self_pair_bundle`] is not needed).
+///
+/// With `a = 2m`, `b = 2s`, the kernel is `f = S + H`: the Riesz series
+/// `S = Σ_n (-1)^n C(b+n-1,n) κ^{2n} R_{a+b+n}^d` plus the entire
+/// correction `H = Σ_K E_K r^{2K}`. After `(-Δ_B)^q`, every block of `S`
+/// is `O(r^{2(λ+n)})` or `O(r^{2(λ+n)} ln r)` with `λ + n > 0`, so it
+/// vanishes at `r = 0`; only the `r^{2q}` term of `H` survives. Hence
+///
+/// ```text
+/// f^{(2q)}(0) = (2q)! E_q(κ),
+/// ```
+///
+/// which for even `d` carries the `ln(κ/2)` / digamma constants of the
+/// `K_0`-type Matérn blocks and the log-Riesz shifts `A_K`: it is exactly
+/// the Hadamard finite part of the `(-Δ)^q`-differentiated self-pair,
+/// computed in closed form rather than by evaluating the kernel at a
+/// small offset. The `κ` derivatives come from the exact `ψ = ln κ`
+/// triplet of `E_q`, and the `η` derivatives from the same anisotropic
+/// trace assembly as the other analytic branches.
+pub(crate) fn finite_part_self_pair_bundle(
+    q: usize,
+    m: usize,
+    s: usize,
+    kappa: f64,
+    eta: &[f64],
+) -> Option<PairBlockBundle> {
+    let d = eta.len();
+    if q > 2 || m == 0 || s == 0 || !(kappa > 0.0) || !kappa.is_finite() {
+        return None;
+    }
+    let (a, b) = (2 * m, 2 * s);
+    if 2 * (a + b) <= d + 2 * q {
+        return None;
+    }
+    let triplet = duchon_entire_correction_r2k_psi_triplet(d, a, b, kappa, q);
+    let scale = factorial_f64(2 * q);
+    let f = scale * kappa_derivative_from_psi_triplet(triplet, kappa, 0);
+    let f_kappa = scale * kappa_derivative_from_psi_triplet(triplet, kappa, 1);
+    let f_kappa2 = scale * kappa_derivative_from_psi_triplet(triplet, kappa, 2);
+    if !(f.is_finite() && f_kappa.is_finite() && f_kappa2.is_finite()) {
+        return None;
+    }
+    self_pair_bundle_from_radial_diagonal(q, f, f_kappa, f_kappa2, eta)
+}
+
+/// Anisotropic zero-lag assembly `J · (-Δ_B)^q f |_{z=0}` from the radial
+/// diagonal `f = f^{(2q)}(0)` and its `κ` derivatives. At the origin
+/// `(-Δ_B)^q r^{2q}` reduces to traces of `B = diag(exp(-2η))`, and the
+/// bundle carries the external `J = exp(Ση)` with its product-rule
+/// derivatives.
+fn self_pair_bundle_from_radial_diagonal(
+    q: usize,
+    f: f64,
+    f_kappa: f64,
+    f_kappa2: f64,
+    eta: &[f64],
+) -> Option<PairBlockBundle> {
+    let d = eta.len();
     let mut s1 = 0.0_f64;
     let mut s2 = 0.0_f64;
     let mut b = vec![0.0_f64; d];
@@ -994,8 +1185,10 @@ pub(crate) fn hybrid_self_pair_bundle_odd_d(
 /// Exact zero-lag bundle for every analytic self-pair regime currently
 /// supported by the closed-form Duchon path. This is the single
 /// production entry point for diagonal values and diagonal η/κ
-/// derivatives: callers should not hand-code the Schoenberg or odd-d
-/// collision branches separately.
+/// derivatives: callers should not hand-code the Schoenberg, odd-d
+/// collision, or finite-part branches separately. It returns `None` only
+/// when the UV clause `4(m+s) > d + 2q` fails (the self-pair diverges) or
+/// the arguments are outside the supported `q ≤ 2`, `κ > 0` domain.
 pub(crate) fn analytic_self_pair_bundle(
     q: usize,
     m: usize,
@@ -1005,6 +1198,7 @@ pub(crate) fn analytic_self_pair_bundle(
 ) -> Option<PairBlockBundle> {
     schoenberg_self_pair_bundle(q, m, s, kappa, eta)
         .or_else(|| hybrid_self_pair_bundle_odd_d(q, m, s, kappa, eta))
+        .or_else(|| finite_part_self_pair_bundle(q, m, s, kappa, eta))
 }
 
 // ============================================================
@@ -1195,6 +1389,21 @@ pub(crate) fn compress_terms(mut terms: Vec<(f64, f64, i32)>) -> Vec<(f64, f64, 
     out
 }
 
+/// Leading constant `c_n` of the log-Riesz block
+/// `R_{d/2+n}^d(r) = c_n r^{2n}(ln r + A_n)`:
+///
+/// ```text
+/// c_n = (-1)^{n+1} / (2^{d+2n-1} π^{d/2} Γ(d/2+n) n!).
+/// ```
+pub(crate) fn log_riesz_coefficient(d: usize, n: usize) -> f64 {
+    let sign = if n.is_multiple_of(2) { -1.0 } else { 1.0 };
+    let denom = 2.0_f64.powi((d + 2 * n) as i32 - 1)
+        * std::f64::consts::PI.powf(d as f64 / 2.0)
+        * gamma_fn(0.5 * d as f64 + n as f64)
+        * factorial_f64(n);
+    sign / denom
+}
+
 /// Radial derivatives `[R^{(0)}, …, R^{(max_order)}]` of a single
 /// Riesz block `R_j^d(r) = c · r^{2j-d}` (non-log) or
 /// `c · r^{2n} · ln r` (log case `2j = d + 2n`).
@@ -1229,13 +1438,7 @@ pub(crate) fn riesz_block_radial_derivatives(
         // R_j^d(r) = c · r^{2n} · (ln r + A_n).
         let n_f = (offset / 2.0).round();
         let n = n_f as usize;
-        let two_j_i = two_j.round() as i32;
-        let sign = if n.is_multiple_of(2) { -1.0 } else { 1.0 };
-        let denom = 2.0_f64.powi(two_j_i - 1)
-            * std::f64::consts::PI.powf(d as f64 / 2.0)
-            * gamma_fn(j)
-            * factorial_f64(n);
-        let c = sign / denom;
+        let c = log_riesz_coefficient(d, n);
         let two_n = 2 * n;
         let shift = log_riesz_finite_part_shift(d, n);
         for k in 0..=max_order {
@@ -1339,9 +1542,11 @@ pub(crate) fn radial_derivatives_of_isotropic_duchon(
     // Hybrid case (s ≥ 1, κ > 0). Three charts in priority order:
     //
     // 1. Small-χ Riesz series (`κr ≤ DUCHON_SMALL_CHI_SERIES_MAX`).
-    //    Exact analytic finite-part representative at small κ. Converges
-    //    spectrally in `κ²r²` so the tails decay geometrically; carries
-    //    full f64 precision when applicable. Several test fixtures
+    //    The Riesz series S plus its entire correction H = Σ_K E_K r^{2K}
+    //    equals the partial-fraction kernel PF identically, so this chart
+    //    is the same function as charts 2–3, only evaluated without their
+    //    cancellation. Converges spectrally in `κ²r²` so the tails decay
+    //    geometrically; carries full f64 precision when applicable. Several test fixtures
     //    (`test_small_kappa_finite_part_chart_is_shared_by_value_radial_and_kappa_partials`)
     //    pin the production code to this chart at the boundary
     //    κ=0.01, r=1.3 because the value, radial-derivative, and
@@ -3330,5 +3535,438 @@ mod origin_reduced_pair_tests {
             "reduced block differs from full − self-pair: {}",
             failures.join("; ")
         );
+    }
+}
+
+#[cfg(test)]
+mod finite_part_self_pair_tests {
+    use super::*;
+
+    fn components(bundle: &PairBlockBundle) -> Vec<f64> {
+        let mut out = vec![bundle.value, bundle.d_kappa, bundle.d2_kappa];
+        out.extend(&bundle.d_eta);
+        out.extend(&bundle.d2_eta_kappa);
+        for row in &bundle.d2_eta {
+            out.extend(row);
+        }
+        out
+    }
+
+    fn assert_components_close(label: &str, actual: &[f64], expected: &[f64], rel_tol: f64) {
+        let scale = expected
+            .iter()
+            .chain(actual)
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        for (index, (&a, &e)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (a - e).abs() <= rel_tol * scale,
+                "{label}: component {index} actual={a:e} expected={e:e} (scale {scale:e})"
+            );
+        }
+    }
+
+    /// Where the IR clause `μ = d/2 + q - 2m > 0` holds, the finite part is an
+    /// ordinary limit and must reproduce the Schoenberg closed form; in odd `d`
+    /// it must reproduce the odd-dimensional collision constants. Both
+    /// comparisons cover every bundle slot (value, η, κ, mixed) on an
+    /// anisotropic metric, so the shared trace assembly and the `ψ = ln κ`
+    /// triplet are both checked against independent closed forms.
+    #[test]
+    fn finite_part_self_pair_matches_the_schoenberg_and_odd_d_closed_forms_3545() {
+        for &(d, m, s, q) in &[
+            (4usize, 1usize, 1usize, 1usize),
+            (6, 1, 1, 0),
+            (6, 1, 2, 2),
+            (4, 1, 2, 1),
+            (5, 2, 1, 2),
+            (3, 1, 1, 1),
+        ] {
+            let eta: Vec<f64> = (0..d).map(|axis| 0.2 * (0.9 * axis as f64 + 0.4).sin()).collect();
+            for kappa in [0.35_f64, 1.7] {
+                let reference = schoenberg_self_pair_bundle(q, m, s, kappa, &eta)
+                    .expect("μ > 0 and λ > 0: the Schoenberg integral converges");
+                let finite_part = finite_part_self_pair_bundle(q, m, s, kappa, &eta)
+                    .expect("λ > 0: the finite part exists");
+                assert_components_close(
+                    &format!("schoenberg d={d} m={m} s={s} q={q} κ={kappa}"),
+                    &components(&finite_part),
+                    &components(&reference),
+                    1e-12,
+                );
+            }
+        }
+        for &(d, m, s, q) in &[
+            (3usize, 1usize, 1usize, 0usize),
+            (3, 2, 2, 0),
+            (3, 2, 2, 1),
+            (3, 2, 2, 2),
+            (5, 2, 1, 1),
+        ] {
+            let eta: Vec<f64> = (0..d).map(|axis| 0.15 * (1.3 * axis as f64).cos()).collect();
+            for kappa in [0.6_f64, 1.9] {
+                let reference = hybrid_self_pair_bundle_odd_d(q, m, s, kappa, &eta)
+                    .expect("odd d: the collision closed form exists");
+                let finite_part = finite_part_self_pair_bundle(q, m, s, kappa, &eta)
+                    .expect("λ > 0: the finite part exists");
+                assert_components_close(
+                    &format!("odd-d d={d} m={m} s={s} q={q} κ={kappa}"),
+                    &components(&finite_part),
+                    &components(&reference),
+                    1e-12,
+                );
+            }
+        }
+    }
+
+    /// Even `d` with `μ ≤ 0` (the regime that used to fall back to a kernel
+    /// evaluation at `R = 1e-6 · median lag`): the finite part equals the
+    /// `r → 0` limit of `(-Δ)^q PF`, with `PF` evaluated from its Bessel/Riesz
+    /// closed forms at 60 significant digits (isotropic metric, `κ = 1.3`).
+    /// `(d, m, s, q) = (2, 2, 1, 2)` and `(2, 1, 1, 0)` share their value because
+    /// `Δ²` maps the `ρ^{-8}(κ²+ρ²)^{-2}` kernel onto the `ρ^{-4}(κ²+ρ²)^{-2}` one
+    /// with the same log-Riesz convention.
+    #[test]
+    fn finite_part_self_pair_matches_the_high_precision_limit_for_even_d_ir_divergent_orders_3545() {
+        let kappa = 1.3_f64;
+        for &(d, m, s, q, expected) in &[
+            (2usize, 2usize, 1usize, 1usize, -0.001_184_334_963_333_02_f64),
+            (2, 2, 1, 0, -0.000_989_747_637_961_422),
+            (2, 2, 1, 2, 0.006_829_870_404_847_23),
+            (4, 2, 1, 1, 0.003_167_421_183_354_07),
+            (4, 1, 1, 0, -0.003_785_075_986_879),
+            (2, 1, 1, 0, 0.006_829_870_404_847_23),
+            (2, 1, 2, 1, -0.015_027_818_887_805_7),
+        ] {
+            let eta = vec![0.0_f64; d];
+            assert!(schoenberg_self_pair_bundle(q, m, s, kappa, &eta).is_none());
+            let bundle = analytic_self_pair_bundle(q, m, s, kappa, &eta)
+                .expect("UV-convergent even-d order must have an analytic self-pair");
+            let rel = (bundle.value - expected).abs() / expected.abs();
+            assert!(
+                rel <= 1e-12,
+                "d={d} m={m} s={s} q={q}: finite part {:.17e} vs limit {expected:.17e} (rel {rel:.3e})",
+                bundle.value
+            );
+        }
+    }
+
+    /// The κ and η slots of the finite-part bundle are the exact derivatives of
+    /// its value: central differences in κ and in each η_k.
+    #[test]
+    fn finite_part_self_pair_derivatives_match_finite_differences_3545() {
+        for &(d, m, s, q) in &[
+            (2usize, 2usize, 1usize, 1usize),
+            (2, 1, 2, 0),
+            (2, 2, 2, 2),
+            (4, 2, 1, 1),
+        ] {
+            let eta: Vec<f64> = (0..d).map(|axis| 0.25 * (0.7 * axis as f64 + 0.3).sin()).collect();
+            let kappa = 0.9_f64;
+            let base = finite_part_self_pair_bundle(q, m, s, kappa, &eta).expect("finite part");
+            let at = |kappa: f64, eta: &[f64]| {
+                finite_part_self_pair_bundle(q, m, s, kappa, eta).expect("finite part")
+            };
+            let h = 1e-4;
+            let hk = h * kappa;
+            let plus = at(kappa + hk, &eta);
+            let minus = at(kappa - hk, &eta);
+            let check = |label: &str, analytic: f64, fd: f64, scale: f64| {
+                assert!(
+                    (analytic - fd).abs() <= 1e-6 * scale,
+                    "d={d} m={m} s={s} q={q} {label}: analytic {analytic:e} vs fd {fd:e}"
+                );
+            };
+            let kappa_scale = base.d_kappa.abs().max(base.value.abs() / kappa);
+            check("d_kappa", base.d_kappa, (plus.value - minus.value) / (2.0 * hk), kappa_scale);
+            check(
+                "d2_kappa",
+                base.d2_kappa,
+                (plus.d_kappa - minus.d_kappa) / (2.0 * hk),
+                base.d2_kappa.abs().max(kappa_scale / kappa),
+            );
+            let eta_scale = base.d_eta.iter().fold(base.value.abs(), |acc, v| acc.max(v.abs()));
+            for k in 0..d {
+                let mut up = eta.clone();
+                let mut down = eta.clone();
+                up[k] += h;
+                down[k] -= h;
+                let (up, down) = (at(kappa, &up), at(kappa, &down));
+                check("d_eta", base.d_eta[k], (up.value - down.value) / (2.0 * h), eta_scale);
+                check(
+                    "d2_eta_kappa",
+                    base.d2_eta_kappa[k],
+                    (up.d_kappa - down.d_kappa) / (2.0 * h),
+                    kappa_scale.max(eta_scale / kappa),
+                );
+                for l in 0..d {
+                    check(
+                        "d2_eta",
+                        base.d2_eta[k][l],
+                        (up.d_eta[l] - down.d_eta[l]) / (2.0 * h),
+                        eta_scale,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The small-κR chart (Riesz series plus its entire correction `H`) is the
+    /// partial-fraction kernel itself, not a representative modulo
+    /// polynomials: value, radial derivatives and both κ partials agree with
+    /// the partial-fraction / Schwinger evaluation at lags on both sides of the
+    /// dispatch threshold `κR = 1/8`. Without `H` the two differ by an entire
+    /// non-polynomial function and the kernel jumps at the threshold.
+    #[test]
+    fn small_chi_chart_equals_the_partial_fraction_kernel_across_the_dispatch_threshold_3545() {
+        let max_order = 4usize;
+        for &(d, m, s) in &[
+            (1usize, 1usize, 1usize),
+            (2, 1, 1),
+            (2, 2, 1),
+            (3, 1, 2),
+            (4, 1, 1),
+            (4, 2, 1),
+            (6, 1, 1),
+        ] {
+            let (a, b) = (2 * m, 2 * s);
+            for kappa in [0.4_f64, 1.3] {
+                for chi in [0.3_f64, 0.6] {
+                    let r = chi / kappa;
+                    assert!(!use_duchon_small_chi_riesz_series(kappa, r));
+                    let charts = [
+                        (
+                            duchon_small_chi_riesz_series_radial_derivatives(d, a, b, kappa, r, max_order, 0),
+                            radial_derivatives_of_isotropic_duchon(d, m, s as f64, kappa, r, max_order),
+                        ),
+                        (
+                            duchon_small_chi_riesz_series_radial_derivatives(d, a, b, kappa, r, max_order, 1),
+                            radial_derivatives_of_isotropic_duchon_kappa_partial(d, m, s, kappa, r, max_order),
+                        ),
+                        (
+                            duchon_small_chi_riesz_series_radial_derivatives(d, a, b, kappa, r, max_order, 2),
+                            radial_derivatives_of_isotropic_duchon_kappa_partial2(d, m, s, kappa, r, max_order),
+                        ),
+                    ];
+                    for (kappa_order, (series, reference)) in charts.iter().enumerate() {
+                        assert_components_close(
+                            &format!("d={d} m={m} s={s} κ={kappa} κR={chi} ∂κ^{kappa_order}"),
+                            series,
+                            reference,
+                            1e-9,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `Z = Π_k (T_{h_k} − I)` applied at a base point `c`: the `2^n` corner
+    /// points `c + Σ_{k∈S} h_k` with weights `(−1)^{n−|S|}`. Its Fourier
+    /// transform `Σ_i z_i e^{iξ·x_i} = e^{iξ·(c + Σ h_k/2)} Π_k 2i sin(ξ·h_k/2)`
+    /// is evaluated without cancellation, and it annihilates every polynomial
+    /// of degree `< n`.
+    struct DifferenceStencil {
+        base: [f64; 2],
+        steps: Vec<[f64; 2]>,
+    }
+
+    impl DifferenceStencil {
+        fn points_and_weights(&self) -> Vec<([f64; 2], f64)> {
+            let n = self.steps.len();
+            (0..1usize << n)
+                .map(|mask| {
+                    let mut point = self.base;
+                    for (k, step) in self.steps.iter().enumerate() {
+                        if mask & (1 << k) != 0 {
+                            point[0] += step[0];
+                            point[1] += step[1];
+                        }
+                    }
+                    let weight = if (n - mask.count_ones() as usize).is_multiple_of(2) { 1.0 } else { -1.0 };
+                    (point, weight)
+                })
+                .collect()
+        }
+
+        /// `(phase, amplitude)` with `Σ_i z_i e^{iξ·x_i} = i^n · amplitude · e^{i·phase}`.
+        fn transform(&self, xi: [f64; 2]) -> (f64, f64) {
+            let dot = |v: [f64; 2]| xi[0] * v[0] + xi[1] * v[1];
+            let mut phase = dot(self.base);
+            let mut amplitude = 1.0_f64;
+            for &step in &self.steps {
+                let t = dot(step);
+                phase += 0.5 * t;
+                amplitude *= 2.0 * (0.5 * t).sin();
+            }
+            (phase, amplitude)
+        }
+    }
+
+    /// Direct quadrature and conditional positive definiteness of the Gram with
+    /// the finite-part diagonal, in the even-`d`, `μ ≤ 0` regime. For stencils
+    /// `Z_α` annihilating polynomials of degree `≤ −2μ` (the degree of the
+    /// null-space ambiguity of the kernel after `(−Δ)^q`),
+    ///
+    /// ```text
+    /// Z_αᵀ G Z_β = (2π)^{-d} ∫ |ξ|^{2q} |ξ|^{-4m} (κ²+|ξ|²)^{-2s} Re(Â_α conj(Â_β)) dξ,
+    /// ```
+    ///
+    /// an absolutely convergent integral that involves no diagonal convention.
+    /// The Gram side uses the production pair block (diagonal = finite part,
+    /// off-diagonals on both kernel charts: at `κ = 0.45` the shortest lags sit in
+    /// the small-κR chart, at `κ = 1.3` every lag is outside it). The projected Gram
+    /// must match the quadrature entry by entry and be positive definite.
+    #[test]
+    fn finite_part_gram_matches_spectral_quadrature_on_the_polynomial_null_space_3545() {
+        let n = 6usize;
+        let stencils: Vec<DifferenceStencil> = [(0.0_f64, 0.55_f64, 0.3_f64), (0.7, 0.45, 1.1), (-0.4, 0.6, 2.0)]
+            .iter()
+            .map(|&(shift, length, angle)| DifferenceStencil {
+                base: [shift, 0.5 * shift],
+                steps: (0..n)
+                    .map(|k| {
+                        let theta = angle + std::f64::consts::PI * k as f64 / n as f64;
+                        let len = length * (1.0 + 0.1 * k as f64);
+                        [len * theta.cos(), len * theta.sin()]
+                    })
+                    .collect(),
+            })
+            .collect();
+        let mut points = Vec::new();
+        let mut weights = vec![Vec::new(); stencils.len()];
+        for (alpha, stencil) in stencils.iter().enumerate() {
+            for (point, weight) in stencil.points_and_weights() {
+                for (beta, column) in weights.iter_mut().enumerate() {
+                    column.push(if beta == alpha { weight } else { 0.0 });
+                }
+                points.push(point);
+            }
+        }
+        let centers = ndarray::Array2::from_shape_fn((points.len(), 2), |(i, axis)| points[i][axis]);
+
+        // Quadrature grid: Gauss–Legendre panels in ρ (fine near the κ² scale),
+        // trapezoid in θ ∈ [0, π) (the integrand is even under ξ → −ξ).
+        let (gl_nodes, gl_weights) = gauss_legendre_64();
+        let mut edges: Vec<f64> = (0..=40).map(|i| 0.05 * i as f64).collect();
+        edges.extend((1..=39).map(|i| 2.0 + 2.0 * i as f64));
+
+        for &(q, m, s) in &[(0usize, 1usize, 1usize), (1, 1, 1), (2, 2, 1), (1, 1, 2)] {
+            let mu = 1 + q as i64 - 2 * m as i64;
+            assert!(mu <= 0 && -2 * mu < n as i64, "stencil must annihilate the ambiguity");
+            for kappa in [0.45_f64, 1.3] {
+                let gram = crate::basis::closed_form_anisotropic_pair_block(centers.view(), q, m, s, kappa, None);
+                let k = stencils.len();
+                let mut projected = vec![vec![0.0_f64; k]; k];
+                for alpha in 0..k {
+                    let gz = gram.dot(&ndarray::Array1::from(weights[alpha].clone()));
+                    for beta in 0..k {
+                        projected[beta][alpha] = weights[beta].iter().zip(gz.iter()).map(|(w, g)| w * g).sum();
+                    }
+                }
+
+                let mut spectral = vec![vec![0.0_f64; k]; k];
+                for panel in edges.windows(2) {
+                    let (lo, hi) = (panel[0], panel[1]);
+                    let half = 0.5 * (hi - lo);
+                    for (&node, &weight) in gl_nodes.iter().zip(gl_weights.iter()) {
+                        let rho = lo + half * (node + 1.0);
+                        let rho_sq = rho * rho;
+                        let symbol = rho.powi(2 * q as i32 + 1 - 4 * m as i32)
+                            * (kappa * kappa + rho_sq).powi(-2 * s as i32);
+                        let radial_weight = half * weight * symbol;
+                        // Trapezoid on [0, π) is exact past the angular bandwidth ρ·max|x_i − x_j| < 8ρ.
+                        let theta_nodes = 64 + (8.0 * rho) as usize;
+                        let dtheta = std::f64::consts::PI / theta_nodes as f64;
+                        for t in 0..theta_nodes {
+                            let theta = dtheta * t as f64;
+                            let radial = radial_weight * dtheta;
+                            let xi = [rho * theta.cos(), rho * theta.sin()];
+                            let transforms: Vec<(f64, f64)> = stencils.iter().map(|st| st.transform(xi)).collect();
+                            for alpha in 0..k {
+                                for beta in 0..=alpha {
+                                    let (pa, aa) = transforms[alpha];
+                                    let (pb, ab) = transforms[beta];
+                                    spectral[alpha][beta] += radial * aa * ab * (pa - pb).cos();
+                                }
+                            }
+                        }
+                    }
+                }
+                // [0, π) doubled to the full circle, and (2π)^{-2}.
+                let norm = 2.0 / (4.0 * std::f64::consts::PI * std::f64::consts::PI);
+                for alpha in 0..k {
+                    for beta in 0..=alpha {
+                        spectral[alpha][beta] *= norm;
+                        spectral[beta][alpha] = spectral[alpha][beta];
+                    }
+                }
+                let scale = (0..k).fold(0.0_f64, |acc, i| acc.max(spectral[i][i].abs()));
+                for alpha in 0..k {
+                    for beta in 0..k {
+                        let gap = (projected[alpha][beta] - spectral[alpha][beta]).abs();
+                        assert!(
+                            gap <= 1e-8 * scale,
+                            "q={q} m={m} s={s} κ={kappa} [{alpha},{beta}]: Gram {:e} vs quadrature {:e} (gap {gap:e}, scale {scale:e})",
+                            projected[alpha][beta],
+                            spectral[alpha][beta]
+                        );
+                    }
+                }
+                // Positive definite on the null space: all leading minors positive.
+                let m11 = projected[0][0];
+                let m22 = m11 * projected[1][1] - projected[0][1] * projected[1][0];
+                let m33 = projected[0][0] * (projected[1][1] * projected[2][2] - projected[1][2] * projected[2][1])
+                    - projected[0][1] * (projected[1][0] * projected[2][2] - projected[1][2] * projected[2][0])
+                    + projected[0][2] * (projected[1][0] * projected[2][1] - projected[1][1] * projected[2][0]);
+                assert!(
+                    m11 > 0.0 && m22 > 0.0 && m33 > 0.0,
+                    "q={q} m={m} s={s} κ={kappa}: projected Gram not positive definite ({m11:e}, {m22:e}, {m33:e})"
+                );
+            }
+        }
+    }
+
+    /// As `κ → 0` the hybrid Gram converges to the pure-Duchon Gram on the
+    /// polynomial null space of the pure kernel, at the `O(κ²)` rate of
+    /// `(κ²+ρ²)^{-2s} = ρ^{-4s}(1 − 2sκ²/ρ² + …)`. The hybrid diagonal grows like
+    /// `κ^{-2λ}` while the pure self-pair is exactly zero, so the limit holds
+    /// only if the finite-part diagonal is the one the off-diagonal kernel
+    /// implies. `(d, q, m, s) = (2, 1, 1, 1)` has `μ = 0` (finite-part branch)
+    /// and pure-kernel ambiguity of degree `≤ 4`, annihilated by a six-fold
+    /// difference stencil.
+    #[test]
+    fn finite_part_gram_converges_to_the_pure_duchon_gram_as_kappa_vanishes_3545() {
+        let n = 6usize;
+        let stencil = DifferenceStencil {
+            base: [0.1, -0.2],
+            steps: (0..n)
+                .map(|k| {
+                    let theta = 0.4 + std::f64::consts::PI * k as f64 / n as f64;
+                    let len = 0.5 * (1.0 + 0.1 * k as f64);
+                    [len * theta.cos(), len * theta.sin()]
+                })
+                .collect(),
+        };
+        let pairs = stencil.points_and_weights();
+        let centers = ndarray::Array2::from_shape_fn((pairs.len(), 2), |(i, axis)| pairs[i].0[axis]);
+        let z = ndarray::Array1::from_iter(pairs.iter().map(|(_, w)| *w));
+        let (q, m, s) = (1usize, 1usize, 1usize);
+        assert!(schoenberg_self_pair_bundle(q, m, s, 0.1, &[0.0, 0.0]).is_none());
+        let pure = crate::basis::closed_form_anisotropic_pair_block_pure(centers.view(), q, m, s as f64, None);
+        let pure_form = z.dot(&pure.dot(&z));
+        let gaps: Vec<f64> = [0.2_f64, 0.1, 0.05]
+            .iter()
+            .map(|&kappa| {
+                let hybrid = crate::basis::closed_form_anisotropic_pair_block(centers.view(), q, m, s, kappa, None);
+                (z.dot(&hybrid.dot(&z)) - pure_form).abs() / pure_form.abs()
+            })
+            .collect();
+        for pair in gaps.windows(2) {
+            let ratio = pair[0] / pair[1];
+            assert!(
+                (3.5..=4.5).contains(&ratio),
+                "hybrid→pure gap must shrink like κ²: gaps {gaps:?} (ratio {ratio})"
+            );
+        }
     }
 }

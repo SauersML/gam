@@ -1238,14 +1238,12 @@ fn duchon_small_chi_riesz_series_value(
 /// Hybrid isotropic Duchon penalty
 /// g_q^iso(R; m, s, κ) = F^{-1}{1/(ρ^{2(2m-q)} (κ² + ρ²)^{2s})}(R).
 ///
-/// This returns the canonical constrained Duchon representative: polynomial
-/// nullspace components are quotiented out, and the small-κR chart evaluates
-/// the matching finite-part Riesz series directly. The ordinary
-/// partial-fraction Green's function and this representative differ by
-/// nullspace terms in low-dimensional singular regimes, but the constrained
-/// fit only sees this representative. Value, radial derivatives, and κ
-/// partials all use the same chart switch, so production never mixes a
-/// stable value formula with cancelled derivative formulas.
+/// The small-κR chart evaluates the finite-part Riesz series plus its entire
+/// correction Σ_K E_K r^{2K}, which is the partial-fraction Green's function
+/// identically (not merely modulo the polynomial nullspace), so both charts
+/// below are the same function. Value, radial derivatives, and κ partials
+/// all use the same chart switch, so production never mixes a stable value
+/// formula with cancelled derivative formulas.
 ///
 /// Edge cases:
 /// - s = 0: g_q^iso(R) = R_{2m-q}^d(R) (no Matérn factor).

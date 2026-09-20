@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 
 use crate::basis::{
     closed_form_anisotropic_pair_block_with_origin, closed_form_anisotropic_pair_value_with_powers,
-    closed_form_pair_origin, closed_form_penalty, pure_duchon_diagonal_epsilon,
+    closed_form_pair_origin, closed_form_penalty,
 };
 use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
 
@@ -48,10 +48,6 @@ pub struct ClosedFormPenaltyOperator {
     polynomial_block_cols: usize,
     /// Optional outer spatial identifiability transform T (total_pre × total).
     outer_identifiability: Option<Array2<f64>>,
-    /// Diagonal epsilon convention for regimes without an exact analytic
-    /// self-pair. In the convergent closed-form regimes this is zero and is
-    /// never read by pair evaluation.
-    diagonal_epsilon: f64,
     /// Lazily-populated dense form. Populated only by `dense_form`; the
     /// matvec/diag/trace/log-det paths stay matrix-free.
     ///
@@ -79,7 +75,6 @@ impl Clone for ClosedFormPenaltyOperator {
             kernel_nullspace: self.kernel_nullspace.clone(),
             polynomial_block_cols: self.polynomial_block_cols,
             outer_identifiability: self.outer_identifiability.clone(),
-            diagonal_epsilon: self.diagonal_epsilon,
             cached_dense: gam_runtime::resource::RayonSafeOnce::new(),
         }
     }
@@ -110,12 +105,6 @@ impl ClosedFormPenaltyOperator {
         } else {
             vec![0.0_f64; d]
         };
-        let diagonal_epsilon =
-            if closed_form_penalty::analytic_self_pair_bundle(q, m, s, kappa, &eta_raw).is_some() {
-                0.0
-            } else {
-                pure_duchon_diagonal_epsilon(centers, &eta_raw)
-            };
         Self {
             q,
             m,
@@ -127,7 +116,6 @@ impl ClosedFormPenaltyOperator {
             kernel_nullspace: kernel_nullspace.cloned(),
             polynomial_block_cols,
             outer_identifiability: outer_identifiability.cloned(),
-            diagonal_epsilon,
             cached_dense: gam_runtime::resource::RayonSafeOnce::new(),
         }
     }
@@ -170,7 +158,6 @@ impl ClosedFormPenaltyOperator {
             &self.eta_raw,
             &self.eta_metric_powers,
             r0.as_slice(),
-            self.diagonal_epsilon,
             closed_form_pair_origin(self.kernel_nullspace.as_ref()),
         )
     }
@@ -365,7 +352,6 @@ impl ClosedFormPenaltyOperator {
                         &self.eta_raw,
                         &self.eta_metric_powers,
                         r.as_slice(),
-                        self.diagonal_epsilon,
                         origin,
                     );
                     let y = gij * v[j] - correction;

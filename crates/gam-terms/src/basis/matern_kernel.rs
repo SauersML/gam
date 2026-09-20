@@ -2435,7 +2435,6 @@ pub(crate) fn closed_form_anisotropic_pair_value_with_powers(
     eta_raw: &[f64],
     powers: &closed_form_penalty::AnisoMetricPowers,
     r: &[f64],
-    diagonal_epsilon: f64,
     origin: closed_form_penalty::PairOrigin,
 ) -> f64 {
     assert_eq!(
@@ -2443,33 +2442,41 @@ pub(crate) fn closed_form_anisotropic_pair_value_with_powers(
         r.len(),
         "closed_form_anisotropic_pair_value_with_powers: eta/r dimension mismatch"
     );
-    let j_prefactor = eta_raw.iter().sum::<f64>().exp();
     if r.iter().all(|&value| value == 0.0) {
-        // Exact distributional diagonal first. In the convergent spectral
-        // strip the radial pointwise chain is singular at R=0, but the
-        // self-pair integral is finite and has a Gamma/Beta closed form.
-        // Outside that strip, odd-d hybrid Taylor covers the smooth pointwise
-        // diagonal; epsilon regularization is only the final non-convergent
-        // diagonal convention.
-        if let Some(bundle) =
-            closed_form_penalty::self_pair_bundle(q, m, s, kappa, eta_raw, origin)
-        {
-            return bundle.value;
-        }
-        let mut r_eps_buf = vec![0.0_f64; r.len()];
-        if !r_eps_buf.is_empty() {
-            r_eps_buf[0] = diagonal_epsilon * eta_raw[0].exp();
-        }
-        return j_prefactor
-            * closed_form_penalty::duchon_pair_kernel_with_powers(
-                q, m, s as f64, kappa, eta_raw, powers, &r_eps_buf, origin,
-            );
+        // Zero lag: the exact self-pair bundle. The radial chain is singular
+        // at R = 0, but whenever the UV clause holds the self-pair is finite
+        // and closed-form (Schoenberg Gamma/Beta, odd-d Taylor, or the
+        // partial-fraction finite part).
+        return closed_form_self_pair_bundle(q, m, s, kappa, eta_raw, origin).value;
     }
 
+    let j_prefactor = eta_raw.iter().sum::<f64>().exp();
     j_prefactor
         * closed_form_penalty::duchon_pair_kernel_with_powers(
             q, m, s as f64, kappa, eta_raw, powers, r, origin,
         )
+}
+
+/// The zero-lag bundle of a hybrid closed-form pair block. It exists exactly
+/// when the UV clause `4(m+s) > d + 2q` holds; outside it the self-pair
+/// diverges and no closed-form block exists, so reaching this without the
+/// convergence gate is a contract violation and panics.
+pub(crate) fn closed_form_self_pair_bundle(
+    q: usize,
+    m: usize,
+    s: usize,
+    kappa: f64,
+    eta_raw: &[f64],
+    origin: closed_form_penalty::PairOrigin,
+) -> closed_form_penalty::PairBlockBundle {
+    closed_form_penalty::self_pair_bundle(q, m, s, kappa, eta_raw, origin).unwrap_or_else(|| {
+        panic!(
+            "closed-form hybrid pair block: q={q} d={} m={m} s={s} kappa={kappa} violates the UV \
+             clause 4(m+s) > d + 2q (or q > 2), so the self-pair diverges; callers must gate on \
+             duchon_closed_form_operator_penalty_converges",
+            eta_raw.len()
+        )
+    })
 }
 
 pub fn closed_form_anisotropic_pair_block(
@@ -2520,12 +2527,6 @@ pub(crate) fn closed_form_anisotropic_pair_block_with_origin(
             &zeros
         }
     };
-    let r_eps = if closed_form_penalty::analytic_self_pair_bundle(q, m, s, kappa, eta_raw).is_some()
-    {
-        0.0
-    } else {
-        pure_duchon_diagonal_epsilon(centers, eta_raw)
-    };
     let powers = closed_form_penalty::AnisoMetricPowers::new(eta_raw);
 
     // Parallelize by independent lower-triangular rows. This keeps one lag
@@ -2543,7 +2544,7 @@ pub(crate) fn closed_form_anisotropic_pair_block_with_origin(
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
             let value = closed_form_anisotropic_pair_value_with_powers(
-                q, m, s, kappa, eta_raw, &powers, &r_buf, r_eps, origin,
+                q, m, s, kappa, eta_raw, &powers, &r_buf, origin,
             );
             // SAFETY: values has k(k+1)/2 slots; for i in 0..k and j ∈ 0..=i,
             // lower_triangular_offset(i)+j is in bounds. Each rayon iteration
@@ -2635,42 +2636,6 @@ pub fn closed_form_anisotropic_pair_block_pure(
     });
 
     symmetric_matrix_from_lower_values(k, &values)
-}
-
-/// Median off-diagonal anisotropic lag scaled by 1e-6, used for
-/// regularizing self-pair R=0 evaluations in pure-Duchon (κ=0) closed-form
-/// penalties. Matches the magnitude used by hybrid κ>0 collocation builders
-/// where the ε-regularization is implicit in the Matérn kernel finiteness.
-pub(crate) fn pure_duchon_diagonal_epsilon(
-    centers: ArrayView2<'_, f64>,
-    eta_log_scales: &[f64],
-) -> f64 {
-    let k = centers.nrows();
-    let d = centers.ncols();
-    if k <= 1 || d == 0 {
-        return 1e-12;
-    }
-    let mut lags = Vec::with_capacity(k * (k - 1) / 2);
-    for i in 0..k {
-        for j in 0..i {
-            let mut acc = 0.0_f64;
-            for axis in 0..d {
-                let delta = centers[[i, axis]] - centers[[j, axis]];
-                let b = (-2.0 * eta_log_scales[axis]).exp();
-                acc += b * delta * delta;
-            }
-            let r = acc.sqrt();
-            if r > 0.0 {
-                lags.push(r);
-            }
-        }
-    }
-    if lags.is_empty() {
-        return 1e-12;
-    }
-    lags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = lags[lags.len() / 2];
-    (median * 1e-6).max(1e-12)
 }
 
 /// The pair-kernel representative a Gram restricted by `kernel_nullspace` may use.
@@ -2769,16 +2734,9 @@ pub(crate) fn closed_form_psi_derivatives_in_total_basis(
             &zeros
         }
     };
-    let r_eps =
-        if closed_form_penalty::analytic_self_pair_bundle(q, p_order, s_order, kappa, eta_raw)
-            .is_some()
-        {
-            0.0
-        } else {
-            pure_duchon_diagonal_epsilon(centers, eta_raw)
-        };
     let powers = closed_form_penalty::AnisoMetricPowers::new(eta_raw);
     let origin = closed_form_pair_origin(kernel_nullspace);
+    let self_pair = closed_form_self_pair_bundle(q, p_order, s_order, kappa, eta_raw, origin);
 
     let n_pairs = lower_triangular_len(k);
     let mut g_values = vec![0.0_f64; n_pairs];
@@ -2794,26 +2752,19 @@ pub(crate) fn closed_form_psi_derivatives_in_total_basis(
         let g_psi_psi_row = g_psi_psi_ptr.add(row_offset);
         let mut r_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
         r_buf.resize(d, 0.0);
-        let mut r_eps_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
-        r_eps_buf.resize(d, 0.0);
-        if d > 0 {
-            r_eps_buf[0] = r_eps * eta_raw[0].exp();
-        }
         for j in 0..=i {
             for axis in 0..d {
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
-            let bundle = if i == j {
-                closed_form_penalty::self_pair_bundle(q, p_order, s_order, kappa, eta_raw, origin)
-                    .unwrap_or_else(|| {
-                        closed_form_penalty::pair_block_radial_with_j_second_derivatives_with_powers(
-                            q, p_order, s_order, kappa, eta_raw, &powers, &r_eps_buf, origin,
-                        )
-                    })
+            let computed;
+            let bundle = if r_buf.iter().all(|&value| value == 0.0) {
+                &self_pair
             } else {
-                closed_form_penalty::pair_block_radial_with_j_second_derivatives_with_powers(
-                    q, p_order, s_order, kappa, eta_raw, &powers, &r_buf, origin,
-                )
+                computed =
+                    closed_form_penalty::pair_block_radial_with_j_second_derivatives_with_powers(
+                        q, p_order, s_order, kappa, eta_raw, &powers, &r_buf, origin,
+                    );
+                &computed
             };
             // SAFETY: each output has k(k+1)/2 slots; for i in 0..k and j ∈ 0..=i,
             // lower_triangular_offset(i)+j is in bounds. Each rayon iteration
