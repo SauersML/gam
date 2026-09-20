@@ -1830,7 +1830,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod consolidation_regressions {
+mod consolidation_tests {
     use super::*;
     use ndarray::array;
 
