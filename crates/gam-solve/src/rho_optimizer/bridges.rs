@@ -3067,6 +3067,22 @@ impl OuterSecondOrderBridge<'_> {
         let rail_bounds = self.cost_stall_bounds.as_ref().map(rail_relaxed_bounds);
         let projected = project_gradient_vector(x, gradient, rail_bounds.as_ref());
         let projected_norm = projected.iter().map(|v| v * v).sum::<f64>().sqrt();
+        // #2568: the certificate caps every rung at the caller's |Pg|
+        // requirement, so the loop keeps going past a point that requirement
+        // refuses. Stopping here would hand the certificate a point it must
+        // refuse, or, before the cap reached the ladder's top, one it minted
+        // short of what the caller asked for (#3311).
+        if let Some(required) = self
+            .decrement_verdict_config
+            .and_then(|config| config.required_projected_gradient_norm)
+            && !(projected_norm <= required)
+        {
+            log::debug!(
+                "[OUTER] ARC online stop declined: |Pg|={projected_norm:.3e} exceeds the \
+                 caller's requirement {required:.3e} (#2568)"
+            );
+            return None;
+        }
         // #2954: the certificate's verdict, where it is taken, is the rung.
         let verdict_decided = self
             .decrement_verdict_config
