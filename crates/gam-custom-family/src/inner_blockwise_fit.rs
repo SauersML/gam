@@ -2365,17 +2365,15 @@ fn exact_joint_jeffreys_completion_at<F: CustomFamily + Clone + Send + Sync + 's
             h_information.dim(),
         )));
     }
+    // An inactive plan has a vanishing completion.
     let completion = custom_family_joint_jeffreys_second_order_completion(
         family,
         states,
         specs,
         &h_information,
         z_joint,
-        JeffreysCompletionAssembly::Exact,
     )?
-    .ok_or_else(|| {
-        format!("{context}: active Jeffreys term did not supply its exact second-order completion")
-    })?;
+    .unwrap_or_else(|| Array2::zeros((total_p, total_p)));
     if completion.dim() != (total_p, total_p) || completion.iter().any(|value| !value.is_finite()) {
         return Err(CustomFamilyError::trial_point(format!(
             "{context}: Jeffreys completion is non-finite or has shape {:?}, expected ({total_p}, {total_p})",
@@ -3810,9 +3808,20 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
     // latter still take the joint path (their objective is NOT separable, so
     // block-coordinate descent would drop the cross-block ∂²L/∂β_a∂β_b
     // curvature).
+    //
+    // An armed joint Jeffreys term Φ = ½ log|I(β)| is a joint objective term
+    // that only the joint path carries: its score ∇Φ enters the joint Newton
+    // stationarity `∇L − Sβ + ∇Φ = 0`, while the block-coordinate cycle
+    // below iterates the bare `∇L − Sβ`. The outer value prices −Φ at the
+    // returned β, so a blockwise mode would be the unarmed stationary point
+    // and the envelope ρ-gradient would not be the derivative of the value
+    // (gam#3371). Whenever the family arms Φ and a joint Hessian exists, the
+    // joint path owns the solve, single-block and separable alike.
     let blocks_separable = specs.len() >= 2 && family.likelihood_blocks_uncoupled();
-    let use_joint_newton =
-        has_joint_exacthessian && (specs.len() >= 2 || has_workspace_source) && !blocks_separable;
+    let jeffreys_armed = family.joint_jeffreys_term_required();
+    let use_joint_newton = has_joint_exacthessian
+        && (jeffreys_armed
+            || ((specs.len() >= 2 || has_workspace_source) && !blocks_separable));
     let joint_workspace_requested = use_joint_newton && has_workspace_source;
     // Row-measure consistency for the outer-score subsample (gam#1135 HT path).
     //
@@ -4607,7 +4616,41 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 block_accumulation.roundoff_ceiling(),
                 false,
             );
-            block_max_step[b] = trust_update.radius;
+            // A KEPT STEP NEITHER SIDE OF THE RATIO CAN RESOLVE IS NEUTRAL, NOT
+            // REJECTED (gam#3289). On this path the line search above decides
+            // whether the step is kept; the controller only sizes the next
+            // region. It reads a prediction inside the `|f|·1e-14` floor as
+            // `rho = -inf`, and it calls a realized change neutral only while
+            // that change sits inside the same floor. A realized decrease above
+            // the floor but inside the evaluation's own rounding ceiling
+            // satisfies neither the neutral test nor the gam#2637 override, so
+            // the controller shrinks the region to half the kept step. Neither
+            // reading of that change supports the shrink. If it is rounding,
+            // the step is neutral and the region holds. If it is a genuine
+            // decrease, the override accepts it and the region again holds.
+            // Only a model that predicts ascent is evidence against the region,
+            // and this one predicted a non-negative decrease.
+            //
+            // Measured on a railed `bounded()` slope, whose latent logit walks
+            // toward the injective clamp at one unit per cycle while the
+            // objective contracts by `e^-1` per cycle. At cycle 30 the realized
+            // change was `5.400e-13` against a floor of `5.366e-13`. The radius
+            // went from `40` to `5e-6`, the next step hit it, and the
+            // frozen-likelihood divergence exit refused the fit three cycles
+            // before the clamp would have produced the exactly-zero accepted
+            // step that certifies it.
+            let kept_step_is_numerically_neutral = accepted
+                && !trust_update.accepted
+                && trust_update.rho == f64::NEG_INFINITY
+                && predicted_reduction.is_finite()
+                && predicted_reduction >= 0.0
+                && actual_reduction >= 0.0
+                && actual_reduction <= block_accumulation.roundoff_ceiling();
+            block_max_step[b] = if kept_step_is_numerically_neutral {
+                block_max_step[b]
+            } else {
+                trust_update.radius
+            };
             if !accepted {
                 states[b].beta.assign(&beta_old);
                 eta_checkpoint.restore_eta(&mut states[b]);

@@ -104,7 +104,7 @@
 
 use ndarray::ArrayView2;
 
-use super::atom::SaeAtomBasisKind;
+use super::atom::{SaeAtomBasisKind, SaeManifoldAtom};
 use super::term::SaeManifoldTerm;
 
 /// Nodes on the centered-coordinate axis `c ∈ [0, 1)`.
@@ -308,9 +308,9 @@ pub fn certify_periodic_decoder_embeddedness(
     })
 }
 
-/// Build the embeddedness certificate for one fitted atom, or `None` when the
-/// atom is not a `d = 1` periodic (trig-polynomial) decoder — the only family
-/// whose separation function this module's algebra covers.
+/// Build the embeddedness certificate for one fitted atom of `term`, or `None`
+/// when the atom is not a `d = 1` periodic (trig-polynomial) decoder — the only
+/// family whose separation function this module's algebra covers.
 pub(crate) fn atom_decoder_embeddedness(
     term: &SaeManifoldTerm,
     atom_idx: usize,
@@ -320,13 +320,32 @@ pub(crate) fn atom_decoder_embeddedness(
             "atom_decoder_embeddedness: atom {atom_idx} is not in the term"
         ));
     };
+    periodic_atom_embeddedness(atom)
+}
+
+/// Embeddedness certificate of one atom's decoded image.
+///
+/// The algebra reads the decoder in the
+/// [`crate::basis::PeriodicHarmonicEvaluator`] row layout, and the only decoder
+/// the atom holds in that layout is [`SaeManifoldAtom::full_width_decoder`].
+/// After a #1117 rank reduction the stored
+/// [`SaeManifoldAtom::decoder_coefficients`] is `B̃ = QᵀB` (`r × p`) in the
+/// frozen eigenvector frame `Q`, whose rows are mixtures of harmonics, not
+/// harmonics: reading it directly certifies a different curve when `r` is odd
+/// and silently drops the certificate when `r` is even (#3514). The full-width
+/// `Q·B̃` decodes identically on the standard `[1, sin, cos, …]` inner basis, so
+/// it is exactly the curve the atom draws.
+pub(crate) fn periodic_atom_embeddedness(
+    atom: &SaeManifoldAtom,
+) -> Result<Option<AtomEmbeddednessCertificate>, String> {
     if atom.latent_dim() != 1 || !matches!(atom.basis_kind(), SaeAtomBasisKind::Periodic) {
         return Ok(None);
     }
-    let decoder = atom.decoder_coefficients();
+    let decoder = atom.full_width_decoder();
     if decoder.nrows() % 2 == 0 {
-        // A periodic-tagged atom whose decoder is not `2H+1` rows cannot be read
-        // in the harmonic layout; report "no certificate" rather than guessing.
+        // A periodic-tagged atom whose INNER basis is not `2H+1` columns cannot
+        // be read in the harmonic layout; report "no certificate" rather than
+        // guessing.
         return Ok(None);
     }
     certify_periodic_decoder_embeddedness(decoder.view()).map(Some)

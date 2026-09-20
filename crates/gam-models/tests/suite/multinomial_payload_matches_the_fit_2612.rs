@@ -195,9 +195,9 @@ fn plugin_probability_spread(model: &MultinomialSavedModel) -> f64 {
 #[test]
 fn a_saved_multinomial_payload_implies_the_deviance_the_fit_reported_2612() {
     for (label, rows, formula) in [
-        ("K=2 smooth", two_class_rows(7), "y ~ s(x, bs='tp', k=8)"),
+        ("K=2 smooth", two_class_rows(7), "y ~ s(x, bs='tps', k=8)"),
         ("K=2 parametric", two_class_rows(7), "y ~ x"),
-        ("K=3 smooth", three_class_rows(7), "y ~ s(x, bs='tp', k=8)"),
+        ("K=3 smooth", three_class_rows(7), "y ~ s(x, bs='tps', k=8)"),
         ("K=3 parametric", three_class_rows(7), "y ~ x"),
     ] {
         let model = fit(rows, formula);
@@ -220,7 +220,7 @@ fn a_saved_multinomial_payload_implies_the_deviance_the_fit_reported_2612() {
 /// at the origin is perfectly self-consistent.
 #[test]
 fn a_two_class_smooth_multinomial_recovers_a_non_constant_surface_2612() {
-    let model = fit(two_class_rows(7), "y ~ s(x, bs='tp', k=8)");
+    let model = fit(two_class_rows(7), "y ~ s(x, bs='tps', k=8)");
 
     let beta_sup = model
         .coefficients_active()
@@ -258,7 +258,7 @@ fn a_two_class_smooth_multinomial_recovers_a_non_constant_surface_2612() {
 /// `K = 2` by special-casing it cannot pass while breaking the general path.
 #[test]
 fn a_three_class_smooth_multinomial_recovers_a_non_constant_surface_2612() {
-    let model = fit(three_class_rows(7), "y ~ s(x, bs='tp', k=8)");
+    let model = fit(three_class_rows(7), "y ~ s(x, bs='tps', k=8)");
     let spread = plugin_probability_spread(&model);
     assert!(
         spread > 0.20,

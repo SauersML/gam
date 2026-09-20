@@ -1,5 +1,5 @@
 //! Bug (#791): a box-constrained **parametric linear** coefficient —
-//! `linear(x, min=.., max=..)` or its sugar `constrain(x, min=.., max=..)` — is
+//! `linear(x, min=.., max=..)` — is
 //! not actually held inside `[min, max]` on the reported / saved / prediction
 //! scale when the predictor is not already standardized.
 //!
@@ -19,7 +19,7 @@
 //!
 //! ```text
 //!   y ~ linear(x, min=0, max=1)    -> reported/predicted slope ≈ 2.93   (asked ≤ 1)
-//!   y ~ constrain(x, min=0, max=1) -> reported/predicted slope ≈ 2.93   (asked ≤ 1)
+//!   y ~ linear(x, min=0, max=1)    -> reported/predicted slope ≈ 2.93   (asked ≤ 1)
 //!   constrained MAP                -> slope = 1.00
 //! ```
 //!
@@ -147,12 +147,9 @@ fn linear_box_constraint_holds_on_reported_scale() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let dir = tmp.path();
 
-    // Both active-set spellings must bind at the MAP, while the distinct
-    // reported/default-prediction estimand remains inside the requested box.
-    for (label, formula) in [
-        ("linear", "y ~ linear(x, min=0, max=1)"),
-        ("constrain", "y ~ constrain(x, min=0, max=1)"),
-    ] {
+    // The box must bind at the MAP, while the distinct reported/default-
+    // prediction estimand remains inside the requested box.
+    for (label, formula) in [("linear", "y ~ linear(x, min=0, max=1)")] {
         let (mode, reported, predicted) = coefficient_estimands(dir, label, formula);
         assert!(
             (mode - BOX_MAX).abs() < 1e-8,

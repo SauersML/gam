@@ -7,13 +7,14 @@ line on some cross-validation folds. ``family="student-t"`` estimates the scale
 the outliers are downweighted and the curvature survives. The pyGAM
 match-or-beat comparison on identical folds lives in the Rust quality suite
 (``quality_vs_pygam_student_t_outliers``); these tests pin the Python surface:
-the three family spellings, the reported (σ̂, ν̂), and the held-out gain over
+the one family spelling, the reported (σ̂, ν̂), and the held-out gain over
 the Gaussian fit.
 """
 
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from sklearn.model_selection import KFold
 
 import gamfit
@@ -31,19 +32,13 @@ def _outlier_n300() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return x, y, mu
 
 
-def test_family_spellings_fit_the_same_model() -> None:
+def test_only_the_hyphenated_family_spelling_is_accepted() -> None:
     x, y, _ = _outlier_n300()
-    fits = [
-        gamfit.fit({"x": x, "y": y}, "y ~ s(x)", family=name)
-        for name in ("student-t", "student_t", "t")
-    ]
-    reference = np.asarray(fits[0].predict({"x": x}), float).ravel()
-    for model in fits[1:]:
-        np.testing.assert_array_equal(
-            np.asarray(model.predict({"x": x}), float).ravel(), reference
-        )
-        assert model.student_t_sigma == fits[0].student_t_sigma
-        assert model.student_t_nu == fits[0].student_t_nu
+    for name in ("student_t", "t"):
+        with pytest.raises(Exception, match=f"unknown family `{name}`; use `student-t`"):
+            gamfit.fit({"x": x, "y": y}, "y ~ s(x)", family=name)
+    model = gamfit.fit({"x": x, "y": y}, "y ~ s(x)", family="student-t")
+    assert model.student_t_sigma is not None
 
 
 def test_fitted_scale_and_degrees_of_freedom_are_reported() -> None:

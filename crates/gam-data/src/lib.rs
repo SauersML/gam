@@ -984,7 +984,7 @@ pub fn load_dataset_projected(
 ///
 /// `categorical_roles` is keyed on the *formula role*, not on a value
 /// heuristic: a column is forced categorical only when the formula uses it in a
-/// role that is a factor by construction (`group(g)` / `factor(g)` / `re(g)`
+/// role that is a factor by construction (`group(g)` / `factor(g)`
 /// random-effect terms, or a categorical/multinomial response). A bare `+ x`
 /// linear term and a smooth argument `s(x)` are deliberately NOT included — they
 /// stay value-inferred, so a genuinely continuous integer covariate like

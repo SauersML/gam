@@ -89,8 +89,8 @@
 //!   jet bookkeeping the curvature assembly threads through it.
 //! * `row_layout` — the per-row active-set layout for sparse assignment.
 //! * `shape_uncertainty` — the posterior shape-band payload types.
-//! * `certificate` — the curved-dictionary global-optimality certificate and
-//!   the post-fit diagnostics it feeds.
+//! * `certificate` — the curved-dictionary incoherence/curvature measurements
+//!   and the post-fit diagnostics that carry them.
 //! * `term` — the `SaeManifoldTerm` aggregate, its shared numeric constants,
 //!   and the mutable-state snapshot the inner line search restores.
 //! * `construction` — term construction, accessors, frame/border bookkeeping,
