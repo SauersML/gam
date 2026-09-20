@@ -107,9 +107,10 @@ pub fn smooth_term_summary_rows(
     };
     // The score test's inputs are fit-level and shared by every smooth: `H =
     // X'WX + S(λ)` and `X'WX` from the one inference block, so both are in the
-    // saved coefficient layout and belong to the same fit. The geometry-frame
-    // Hessian is not a substitute (it may live in a reduced gauge), and neither
-    // is a Gram rebuilt without the fitted weights.
+    // saved coefficient layout and belong to the same fit whenever the
+    // geometry gauge is the identity; behind any other gauge the Hessian is in
+    // the active frame and the test is refused. A Gram rebuilt without the
+    // fitted weights is no substitute.
     let score_fit = ScoreTestFit::of(fit, residual_df, scale);
 
     let shift = |range: &std::ops::Range<usize>| {
@@ -281,6 +282,16 @@ impl<'a> ScoreTestFit<'a> {
             .inference
             .as_ref()
             .ok_or(SmoothPValueUnavailable::FitCurvatureUnavailable)?;
+        // The inference Hessian shares the geometry's active frame, which is
+        // the saved layout of `β` and `X'WX` only under the identity gauge; a
+        // Hessian behind any other gauge describes other coordinates.
+        if fit
+            .geometry
+            .as_ref()
+            .is_some_and(|geometry| !geometry.coefficient_gauge.is_identity())
+        {
+            return Err(SmoothPValueUnavailable::FitCurvatureUnavailable);
+        }
         let weighted_gram = inference
             .weighted_gram
             .as_ref()

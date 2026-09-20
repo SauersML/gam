@@ -4626,6 +4626,40 @@ mod assembly_inner_status_gate_tests {
         assert_eq!(fit.beta, before);
         assert_eq!(fit.blocks[1].beta.len(), 1);
     }
+
+    /// gam#2668: through a square triangular lift (the binomial mean-wiggle
+    /// residualisation `[[I, −A], [0, I]]`) the weighted Gram moves with the
+    /// coefficients it pairs with, as the raw form that pulls back to it, while
+    /// the Hessian stays in its active frame behind the composed gauge.
+    #[test]
+    fn lift_to_saved_frame_pushes_the_weighted_gram_through_a_triangular_lift_2668() {
+        let (mut fit, _, _) = reduced_frame_fit();
+        let gram = ndarray::array![[3.0, 0.5, 0.2], [0.5, 2.0, -0.4], [0.2, -0.4, 1.5]];
+        if let Some(inference) = fit.inference.as_mut() {
+            inference.weighted_gram = Some(gram.clone());
+        }
+        let frame = gam_problem::Gauge::from_t(
+            ndarray::array![[1.0, 0.0, -0.3], [0.0, 1.0, 0.7], [0.0, 0.0, 1.0]],
+            &[2, 1],
+            &[2, 1],
+        );
+        let active_hessian = fit.geometry.as_ref().unwrap().penalized_hessian.as_array().clone();
+        fit.lift_to_saved_frame(&frame).expect("a triangular lift carries the Gram");
+        let lifted = fit.weighted_gram().expect("the Gram survives the lift");
+        assert_eq!(lifted, &frame.lift_precision(&gram).unwrap());
+        let pulled_back = frame.restrict_penalty(lifted);
+        let bound = 16.0 * f64::EPSILON * gram.iter().map(|v| v.abs()).fold(0.0, f64::max);
+        assert!(
+            pulled_back.iter().zip(gram.iter()).all(|(a, b)| (a - b).abs() <= bound),
+            "the lifted Gram must pull back to the fitted one: {pulled_back:?} vs {gram:?}"
+        );
+        assert_eq!(
+            fit.geometry.as_ref().unwrap().penalized_hessian.as_array(),
+            &active_hessian
+        );
+        fit.validate_numeric_finiteness()
+            .expect("the lifted fit satisfies the decode invariants");
+    }
 }
 
 /// Exact coefficient-covariance definition (#2296).
@@ -6176,14 +6210,20 @@ impl UnifiedFitResult {
     /// * the covariances (conditional, corrected, frequentist) and both
     ///   smoothing-parameter corrections push forward as `JΣJᵀ`;
     /// * the penalized Hessian and its identified subspace are covariant and
-    ///   stay in their active frame, whose coefficient gauge becomes `J∘gauge`.
+    ///   stay in their active frame, whose coefficient gauge becomes `J∘gauge`;
+    /// * the weighted Gram `XᵀWX` is published in the original basis beside the
+    ///   coefficients and covariances it pairs with, so it moves with them as
+    ///   the unique raw form pulling back to it, `J⁻ᵀ·G·J⁻¹`
+    ///   ([`gam_problem::gauge::Gauge::lift_precision`]). That exists only for
+    ///   a structurally invertible `J`; through any other `J` the Gram is a
+    ///   pullback with no pushforward and the lift is refused.
     ///
-    /// A quantity with no unique lift through a non-square `J` is refused, not
-    /// dropped: standard errors published without their covariance, the
-    /// influence matrix `H⁻¹XᵀWX`, the weighted Gram `XᵀWX` (a pullback, which
-    /// cannot be pushed forward), and a stored reparameterization basis. The fit
-    /// is rebuilt through the constructor's invariants before it replaces
-    /// `self`, so a refused lift leaves the fit as it was.
+    /// A quantity with no unique lift is refused, not dropped: standard errors
+    /// published without their covariance, the influence matrix `H⁻¹XᵀWX`, a
+    /// weighted Gram through a `J` with no structural inverse, and a stored
+    /// reparameterization basis. The fit is rebuilt through the constructor's
+    /// invariants before it replaces `self`, so a refused lift leaves the fit as
+    /// it was.
     pub fn lift_to_saved_frame(
         &mut self,
         frame: &gam_problem::gauge::Gauge,
@@ -6266,7 +6306,6 @@ impl UnifiedFitResult {
                     inference.coefficient_influence.is_some(),
                     "coefficient influence matrix",
                 ),
-                (inference.weighted_gram.is_some(), "weighted Gram"),
                 (inference.reparam_qs.is_some(), "reparameterization basis"),
             ] {
                 if present {
@@ -6274,6 +6313,13 @@ impl UnifiedFitResult {
                         "saved-frame lift: the fit carries a {label}, which has no unique lift to the saved frame"
                     );
                 }
+            }
+            if let Some(gram) = inference.weighted_gram.take() {
+                inference.weighted_gram = Some(frame.lift_precision(&gram).map_err(|reason| {
+                    EstimationError::InvalidInput(format!(
+                        "saved-frame lift: the fit carries a weighted Gram, which has no unique lift to the saved frame: {reason}"
+                    ))
+                })?);
             }
             for (slot, label) in [
                 (

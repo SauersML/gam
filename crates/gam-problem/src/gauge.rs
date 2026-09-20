@@ -728,6 +728,76 @@ impl Gauge {
         }
         raw
     }
+
+    /// Push a reduced-coordinate quadratic form that is itself a pullback
+    /// (a weighted Gram `XᵀWX`, a likelihood curvature) forward to raw
+    /// coordinates: the unique raw form whose pullback
+    /// [`Gauge::restrict_penalty`] returns it, `G_raw = T⁻ᵀ · G_θ · T⁻¹`.
+    ///
+    /// Only a square lift has that inverse. It is proven invertible from its
+    /// structure alone: `T` must be upper triangular with a nonzero diagonal
+    /// (every block-upper-triangular section whose diagonal slabs are
+    /// triangular, the identity and the cross-block residualisation
+    /// `[[I, −R], [0, I]]` among them), so no rank tolerance decides it. The
+    /// two triangular solves `Tᵀ·M = G_θ` and `Tᵀ·G_rawᵀ = Mᵀ` are forward
+    /// substitutions, and the result is symmetrised as in
+    /// [`Gauge::lift_covariance`]. Any other lift is refused with the reason.
+    pub fn lift_precision(&self, precision_reduced: &Array2<f64>) -> Result<Array2<f64>, String> {
+        let total_reduced = self.reduced_total();
+        if precision_reduced.dim() != (total_reduced, total_reduced) {
+            return Err(format!(
+                "quadratic form has shape {:?}, expected ({total_reduced}, {total_reduced})",
+                precision_reduced.dim(),
+            ));
+        }
+        let n = self.raw_total();
+        if n != total_reduced {
+            return Err(format!(
+                "a {n}x{total_reduced} lift is not square, so a pullback has no unique pushforward"
+            ));
+        }
+        if let Some(index) = (0..n).find(|&i| self.t_full[[i, i]] == 0.0) {
+            return Err(format!("lift diagonal entry {index} is zero"));
+        }
+        if let Some(((i, j), _)) = self
+            .t_full
+            .indexed_iter()
+            .find(|&((i, j), &value)| i > j && value != 0.0)
+        {
+            return Err(format!(
+                "lift entry ({i}, {j}) lies below the diagonal, so its inverse is not structural"
+            ));
+        }
+        if self.t_full_is_identity() {
+            return Ok(precision_reduced.clone());
+        }
+        // Solve `Tᵀ·X = B` in place: `Tᵀ` is lower triangular with
+        // `Tᵀ[i, k] = T[k, i]`, so row `i` of `X` needs rows `k < i` only.
+        let forward_solve_transpose = |mut rhs: Array2<f64>| -> Array2<f64> {
+            for i in 0..n {
+                for k in 0..i {
+                    let coefficient = self.t_full[[k, i]];
+                    if coefficient != 0.0 {
+                        let (solved, mut rest) = rhs.view_mut().split_at(ndarray::Axis(0), i);
+                        rest.row_mut(0).scaled_add(-coefficient, &solved.row(k));
+                    }
+                }
+                let pivot = self.t_full[[i, i]];
+                rhs.row_mut(i).mapv_inplace(|value| value / pivot);
+            }
+            rhs
+        };
+        let half = forward_solve_transpose(precision_reduced.clone());
+        let mut raw = forward_solve_transpose(half.reversed_axes().as_standard_layout().into_owned());
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let avg = 0.5 * (raw[[i, j]] + raw[[j, i]]);
+                raw[[i, j]] = avg;
+                raw[[j, i]] = avg;
+            }
+        }
+        Ok(raw)
+    }
 }
 
 #[cfg(test)]
@@ -1088,5 +1158,38 @@ mod tests {
             .left_compose(&outer)
             .expect_err("block boundaries are part of the coordinate frame");
         assert!(error.contains("composition frame partition mismatch"));
+    }
+
+    /// A pullback pushed forward through a square triangular section is the
+    /// one raw form the section pulls back to it: `Tᵀ·(T⁻ᵀ G T⁻¹)·T = G`.
+    #[test]
+    fn lift_precision_inverts_restrict_penalty_on_a_triangular_section() {
+        let t = ndarray::array![[1.0, 0.0, -0.3], [0.0, 1.0, 0.7], [0.0, 0.0, 2.0]];
+        let gauge = Gauge::from_t(t, &[2, 1], &[2, 1]);
+        let reduced = ndarray::array![[4.0, 1.0, 0.5], [1.0, 3.0, -0.2], [0.5, -0.2, 2.0]];
+        let raw = gauge.lift_precision(&reduced).expect("a triangular section is invertible");
+        let round_trip = gauge.restrict_penalty(&raw);
+        // Two substitutions and two products over entries of order one, each
+        // exact to a few roundings per accumulated term.
+        let bound = 16.0 * f64::EPSILON * reduced.iter().map(|v| v.abs()).fold(0.0, f64::max);
+        for ((i, j), &value) in round_trip.indexed_iter() {
+            assert!(
+                (value - reduced[[i, j]]).abs() <= bound,
+                "Tᵀ·G_raw·T must return G at ({i},{j}): got {value}, expected {}",
+                reduced[[i, j]]
+            );
+            assert_eq!(raw[[i, j]], raw[[j, i]], "the pushed form is symmetric");
+        }
+    }
+
+    #[test]
+    fn lift_precision_refuses_a_lift_without_a_structural_inverse() {
+        let reduced = Array2::<f64>::eye(2);
+        let rectangular = Gauge::from_t(ndarray::array![[0.6], [0.8]], &[2], &[1]);
+        assert!(rectangular.lift_precision(&Array2::eye(1)).is_err());
+        let lower = Gauge::from_t(ndarray::array![[1.0, 0.0], [0.5, 1.0]], &[2], &[2]);
+        assert!(lower.lift_precision(&reduced).unwrap_err().contains("below the diagonal"));
+        let singular = Gauge::from_t(ndarray::array![[1.0, 0.5], [0.0, 0.0]], &[2], &[2]);
+        assert!(singular.lift_precision(&reduced).unwrap_err().contains("diagonal entry 1"));
     }
 }
