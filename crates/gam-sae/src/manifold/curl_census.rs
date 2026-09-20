@@ -334,6 +334,12 @@ pub fn census_shattered_circles(
         ids.iter().enumerate().map(|(i, a)| (*a, i)).collect();
     let signed_active: Vec<Vec<bool>> = signed.iter().map(|s| s.active.clone()).collect();
     let candidate_pairs = cooccurrence_pairs_sparse(&signed_active, cfg.min_cooccurrence);
+    // An explicit budget of one draw cannot form a permutation null at all.
+    if cfg.null_replicates == 1 {
+        return Err(
+            "curl census: null_replicates must be 0 (derived) or at least 2, got 1".to_string(),
+        );
+    }
     // The derived budget: B + 1 = m/α, the smallest at which every e-BH rank is
     // reachable and the largest that buys anything. See `null_replicates`.
     let replicates = if cfg.null_replicates > 0 {
@@ -346,7 +352,7 @@ pub fn census_shattered_circles(
 
     let out: Vec<CensusPair> = candidate_pairs
         .par_iter()
-        .filter_map(|&(si, sj, _count)| {
+        .filter_map(|&(si, sj, _count)| -> Option<Result<CensusPair, String>> {
             let di = &signed[si];
             let dj = &signed[sj];
             let mut co_fire: Vec<usize> = (0..n_rows)
@@ -417,8 +423,13 @@ pub fn census_shattered_circles(
                 let seed = (di.members[0] as u64)
                     .wrapping_mul(0x9E37_79B9_7F4A_7C15)
                     ^ (dj.members[0] as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-                ring_permutation_evidence(alpha.view(), beta.view(), replicates, seed | 1)
-                    .unwrap_or((1.0, 0.0, f64::NAN, f64::NAN, f64::NAN))
+                // A plane the screens accepted is a well-formed test input, so a
+                // failure here is a contract breach, not a refusal: surface it
+                // rather than recording it as the `e = 0` of a rejected plane.
+                match ring_permutation_evidence(alpha.view(), beta.view(), replicates, seed | 1) {
+                    Ok(evidence) => evidence,
+                    Err(err) => return Some(Err(format!("curl census: {err}"))),
+                }
             } else {
                 (1.0, 0.0, f64::NAN, f64::NAN, f64::NAN)
             };
@@ -434,7 +445,7 @@ pub fn census_shattered_circles(
             } else {
                 None
             };
-            Some(CensusPair {
+            Some(Ok(CensusPair {
                 members_a: di.members.clone(),
                 members_b: dj.members.clone(),
                 n_co_fire: n_eff as usize,
@@ -446,9 +457,9 @@ pub fn census_shattered_circles(
                 null_rho_sd,
                 fdr_discovery: false,
                 accepted_geometry,
-            })
+            }))
         })
-        .collect();
+        .collect::<Result<Vec<CensusPair>, String>>()?;
 
     // One e-BH ledger over the whole screened family. e-BH is valid under
     // ARBITRARY dependence between the pairs' e-values, which is the property this
@@ -738,6 +749,11 @@ mod tests {
                 "fdr_alpha = {alpha} must be refused"
             );
         }
+        let one_draw = CurlCensusConfig {
+            null_replicates: 1,
+            ..cfg()
+        };
+        assert!(census_shattered_circles(&frames, 200, 8, 0.05, &one_draw).is_err());
     }
 
     /// Without coalescing, the SAME shattered dictionary yields no accepted plane:
