@@ -7171,11 +7171,16 @@ impl<'a> RemlState<'a> {
                     )));
                 }
             };
+            // The frozen λ-search scale is the plug-in (edf-free) estimate:
+            // charging the edf of the first solve's λ would tie the frozen
+            // scale to one trial ρ. The reported fit re-estimates it on the
+            // residual degrees of freedom n₊ − edf at the converged λ (#4075).
             let phi = pirls::estimate_tweedie_phi_from_eta(
                 self.y,
                 &pirls_result.final_eta.to_owned(),
                 self.weights,
                 p,
+                0.0,
             )?;
             self.frozen_tweedie_phi
                 .store(phi.to_bits(), Ordering::Relaxed);
@@ -7227,11 +7232,13 @@ impl<'a> RemlState<'a> {
             // `F(ρ) = REML(ρ, ν_frozen)` stays stationary in ρ exactly as #1074
             // requires. It only makes the captured ν the ML shape at a
             // converged mean instead of at a half-converged one.
+            // Plug-in (edf-free) frozen value, as for the Tweedie φ above.
             let shape = pirls::estimate_gamma_shape_from_eta(
                 &pirls_result.likelihood.spec.link,
                 self.y,
                 &pirls_result.final_eta.to_owned(),
                 self.weights,
+                0.0,
             )?;
             self.frozen_gamma_shape
                 .store(shape.to_bits(), Ordering::Relaxed);
@@ -7304,12 +7311,14 @@ impl<'a> RemlState<'a> {
             )
         {
             let spec = reml_spec(&self.config.likelihood);
+            // Plug-in (edf-free) frozen value, as for the Tweedie φ above.
             let phi = pirls::estimate_dispersion_phi_from_eta(
                 &spec.response,
                 &spec.link,
                 self.y,
                 &pirls_result.final_eta.to_owned(),
                 self.weights,
+                0.0,
             )?;
             self.frozen_dispersion_phi
                 .store(phi.to_bits(), Ordering::Relaxed);
