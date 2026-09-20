@@ -77,7 +77,7 @@ pub use analytic_penalties::{
     NestedPrefixPenalty, NuclearNormPenalty, OrderedBetaBernoulliHessianDiagThirdChannels,
     OrderedBetaBernoulliPenalty, OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty,
     PenaltyConcavity, PenaltyTier, PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty,
-    ScalarWeightSchedule, ShapeMonotonicityPenalty, SheafConsistencyPenalty,
-    SmoothThresholdPenalty, SoftmaxAssignmentSparsityPenalty, SparsityKind, SparsityPenalty,
-    TopKActivationPenalty, TotalVariationPenalty, WeightField,
+    ShapeMonotonicityPenalty, SheafConsistencyPenalty, SmoothThresholdPenalty,
+    SoftmaxAssignmentSparsityPenalty, SparsityKind, SparsityPenalty, TopKActivationPenalty,
+    TotalVariationPenalty, WeightField,
 };

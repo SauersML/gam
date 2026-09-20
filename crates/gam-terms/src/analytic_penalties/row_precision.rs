@@ -23,7 +23,6 @@ pub struct RowPrecisionPriorPenalty {
     pub learnable_weight: bool,
     pub rho_index: usize,
     pub target: PsiSlice,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl RowPrecisionPriorPenalty {
@@ -114,11 +113,8 @@ impl RowPrecisionPriorPenalty {
             learnable_weight,
             rho_index: 0,
             target,
-            weight_schedule: None,
         })
     }
-
-    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -353,8 +349,6 @@ impl AnalyticPenalty for RowPrecisionPriorPenalty {
     fn name(&self) -> &str {
         "row_precision_prior"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -381,7 +375,6 @@ pub struct IvaeRidgeMeanGauge {
     pub learnable_weight: bool,
     pub rho_index: usize,
     pub target: PsiSlice,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl IvaeRidgeMeanGauge {
@@ -471,11 +464,8 @@ impl IvaeRidgeMeanGauge {
             learnable_weight,
             rho_index: 0,
             target,
-            weight_schedule: None,
         })
     }
-
-    impl_with_weight_schedule!(weight);
 
     fn invert_spd_gram(gram: Array2<f64>) -> Result<Array2<f64>, String> {
         let q = gram.nrows();
@@ -710,8 +700,6 @@ impl AnalyticPenalty for IvaeRidgeMeanGauge {
     fn name(&self) -> &str {
         "ivae_ridge_mean_gauge"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -738,7 +726,6 @@ pub struct ParametricRowPrecisionPriorPenalty {
     pub n_eff: usize,
     pub learnable_weight: bool,
     pub target: PsiSlice,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl ParametricRowPrecisionPriorPenalty {
@@ -872,11 +859,8 @@ impl ParametricRowPrecisionPriorPenalty {
             n_eff,
             learnable_weight,
             target,
-            weight_schedule: None,
         })
     }
-
-    impl_with_weight_schedule!(weight);
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
         if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
@@ -1166,6 +1150,4 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
     fn name(&self) -> &str {
         "parametric_row_precision_prior"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }

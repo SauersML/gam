@@ -637,7 +637,6 @@ impl SaeManifoldTerm {
         .ok()
         .map(|mut per_fit| {
             per_fit.rho_index = base.rho_index;
-            per_fit.weight_schedule = base.weight_schedule.clone();
             per_fit
         })
     }

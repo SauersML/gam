@@ -84,7 +84,6 @@ pub struct SparsityPenalty {
     pub target_tier: PenaltyTier,
     pub kind: SparsityKind,
     pub weight: f64,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
     /// Whether local rho coordinate 1 learns `log ε` (or `log δ`). Coordinate
     /// 0 is always the log-strength. Keeping this as a boolean makes invalid
     /// local index layouts unrepresentable.
@@ -117,7 +116,6 @@ pub struct SoftmaxAssignmentSparsityPenalty {
     pub k_atoms: usize,
     pub temperature: f64,
     pub weight: f64,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
     /// #991 design-honesty per-row weights `w_i` (mean-1). When present, row `i`'s
     /// prior contribution is scaled by `w_i` in EVERY aggregate channel — value,
     /// `grad_target`, `hessian_diag`, `hvp`, `psd_majorizer_diag`, `grad_rho`.
@@ -139,7 +137,6 @@ impl SoftmaxAssignmentSparsityPenalty {
             k_atoms,
             temperature,
             weight: 1.0,
-            weight_schedule: None,
             row_weights: None,
         }
     }
@@ -160,8 +157,6 @@ impl SoftmaxAssignmentSparsityPenalty {
     pub fn row_weight(&self, row: usize) -> f64 {
         self.row_weights.as_ref().map_or(1.0, |w| w[row])
     }
-
-    impl_with_weight_schedule!(weight);
 
     fn softmax_row(&self, row: &[f64]) -> Vec<f64> {
         let inv_tau = 1.0 / self.temperature;
@@ -584,8 +579,6 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     fn name(&self) -> &str {
         "softmax_assignment_sparsity"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }
 
 impl SparsityPenalty {
@@ -602,7 +595,6 @@ impl SparsityPenalty {
             target_tier,
             kind: SparsityKind::SmoothedL1 { eps },
             weight: 1.0,
-            weight_schedule: None,
             learnable_smoothing: false,
         })
     }
@@ -620,7 +612,6 @@ impl SparsityPenalty {
             target_tier,
             kind: SparsityKind::Log { delta },
             weight: 1.0,
-            weight_schedule: None,
             learnable_smoothing: false,
         })
     }
@@ -633,12 +624,9 @@ impl SparsityPenalty {
             target_tier,
             kind: SparsityKind::Hoyer,
             weight: 1.0,
-            weight_schedule: None,
             learnable_smoothing: false,
         }
     }
-
-    impl_with_weight_schedule!(weight);
 
     #[must_use = "invalid learnable-smoothing requests must be handled"]
     pub fn with_learnable_smoothing(mut self) -> Result<Self, String> {
@@ -982,8 +970,6 @@ impl AnalyticPenalty for SparsityPenalty {
     fn name(&self) -> &str {
         "sparsity"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -996,7 +982,6 @@ pub struct TopKActivationPenalty {
     pub k: usize,
     pub latent_dim: usize,
     pub weight: f64,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl TopKActivationPenalty {
@@ -1023,11 +1008,8 @@ impl TopKActivationPenalty {
             k,
             latent_dim,
             weight,
-            weight_schedule: None,
         })
     }
-
-    impl_with_weight_schedule!(weight);
 
     fn topk_mask_row(&self, target: ArrayView1<'_, f64>, row: usize, mask: &mut [bool]) {
         mask.fill(false);
@@ -1127,8 +1109,6 @@ impl AnalyticPenalty for TopKActivationPenalty {
     fn name(&self) -> &str {
         "topk_activation"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,7 +1122,6 @@ pub struct SmoothThresholdPenalty {
     pub thresholds: Array1<f64>,
     pub weight: f64,
     pub smoothing_eps: f64,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl SmoothThresholdPenalty {
@@ -1188,11 +1167,8 @@ impl SmoothThresholdPenalty {
             thresholds,
             weight,
             smoothing_eps,
-            weight_schedule: None,
         })
     }
-
-    impl_with_weight_schedule!(weight);
 
     fn threshold(&self, axis: usize, rho: ArrayView1<'_, f64>) -> f64 {
         // Resolve the exact multiplicative threshold after the owning seam has
@@ -1404,8 +1380,6 @@ impl AnalyticPenalty for SmoothThresholdPenalty {
     fn name(&self) -> &str {
         "smooth_threshold"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }
 
 #[cfg(test)]

@@ -176,7 +176,6 @@ pub struct IsometryPenalty {
     /// `O(p²)` per row.
     pub weight: WeightField,
     pub scalar_weight: f64,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 pub(crate) struct IsometryHvpState<'a> {
@@ -339,7 +338,6 @@ impl IsometryPenalty {
             p_out,
             weight: WeightField::Identity,
             scalar_weight: 1.0,
-            weight_schedule: None,
         }
     }
 
@@ -479,7 +477,6 @@ impl Clone for IsometryPenalty {
             p_out: self.p_out,
             weight: self.weight.clone(),
             scalar_weight: self.scalar_weight,
-            weight_schedule: self.weight_schedule.clone(),
         }
     }
 }
@@ -497,8 +494,6 @@ impl IsometryPenalty {
         self.set_jacobian_second_cache(Some(h));
         self
     }
-
-    impl_with_weight_schedule!(scalar_weight);
 
     /// Check that the decoder jets an evaluation of `order` reads are installed
     /// and shaped for a target of `target_len` latent coordinates.
@@ -1388,6 +1383,4 @@ impl AnalyticPenalty for IsometryPenalty {
     fn name(&self) -> &str {
         "isometry"
     }
-
-    impl_scalar_apply_schedule!(scalar_weight);
 }

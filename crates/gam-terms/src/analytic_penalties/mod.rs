@@ -128,7 +128,7 @@ pub(crate) use crate::basis::{
     BasisError, DuchonNullspaceOrder, radial_basis_cartesian_derivative,
 };
 pub(crate) use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
-pub(crate) use gam_problem::{GumbelTemperatureSchedule, ScheduleKind};
+pub(crate) use gam_problem::GumbelTemperatureSchedule;
 
 #[macro_use]
 mod penalty_trait;

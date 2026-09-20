@@ -38,7 +38,6 @@ pub struct OrderedBetaBernoulliPenalty {
     pub temperature_schedule: Option<GumbelTemperatureSchedule>,
     pub learnable_alpha: bool,
     pub weight: f64,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
     /// Optional design weights.  They define both `M_k = sum_i w_i z_ik` and
     /// `N_eff = sum_i w_i`, so value and every derivative remain one operator.
     pub row_weights: Option<std::sync::Arc<[f64]>>,
@@ -67,7 +66,6 @@ impl OrderedBetaBernoulliPenalty {
             temperature_schedule: None,
             learnable_alpha,
             weight: 1.0,
-            weight_schedule: None,
             row_weights: None,
         }
     }
@@ -154,8 +152,6 @@ impl OrderedBetaBernoulliPenalty {
         self.temperature_schedule = Some(schedule);
         self
     }
-
-    impl_with_weight_schedule!(weight);
 
     fn resolved_alpha(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_alpha {
@@ -417,20 +413,18 @@ impl OrderedBetaBernoulliPenalty {
     /// `N = Σ_i w_i` is the effective row count the integrated scalar already scores its
     /// weighted active mass against. The partition depends on neither the logits nor the
     /// gates, so the logit gradient, Hessian and third channels are unchanged by it. Only
-    /// the untempered energy has this normalizer, so a penalty whose `weight` is not one, or
-    /// that carries a weight schedule, is refused.
+    /// the untempered energy has this normalizer, so a penalty whose `weight` is not one is
+    /// refused.
     pub fn log_partition(
         &self,
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Result<(f64, Array1<f64>), String> {
-        if self.weight != 1.0 || self.weight_schedule.is_some() {
+        if self.weight != 1.0 {
             return Err(format!(
-                "ordered Beta--Bernoulli log partition: the tempered energy weight·L (weight {}, \
-                 schedule {}) has no computed partition function; only the untempered prior is \
-                 normalized",
-                self.weight,
-                self.weight_schedule.is_some()
+                "ordered Beta--Bernoulli log partition: the tempered energy weight·L (weight {}) \
+                 has no computed partition function; only the untempered prior is normalized",
+                self.weight
             ));
         }
         assert_eq!(

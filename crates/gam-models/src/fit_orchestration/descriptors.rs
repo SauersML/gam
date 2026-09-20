@@ -24,9 +24,9 @@ use gam_terms::{
     IsometryPenalty, IvaeRidgeMeanGauge, MechanismSparsityPenalty, NestedPrefixPenalty,
     NuclearNormPenalty, OrderedBetaBernoulliPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
-    RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule, ShapeMonotonicityPenalty,
-    SmoothThresholdPenalty, SoftmaxAssignmentSparsityPenalty, SparsityPenalty,
-    TopKActivationPenalty, TotalVariationPenalty,
+    RowPrecisionPriorPenalty, ScadMcpPenalty, ShapeMonotonicityPenalty, SmoothThresholdPenalty,
+    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty,
+    TotalVariationPenalty,
 };
 
 /// A latent block a penalty descriptor can target, identified either by name or
@@ -184,73 +184,6 @@ fn descriptor_weight_scalar(
         return Err(format!("{context}.weight must be finite and > 0"));
     }
     Ok(weight)
-}
-
-fn descriptor_weight_schedule(
-    descriptor: &serde_json::Map<String, JsonValue>,
-    context: &str,
-) -> Result<Option<ScalarWeightSchedule>, String> {
-    let Some(raw_schedule) = descriptor.get("weight_schedule") else {
-        return Ok(None);
-    };
-    if raw_schedule.is_null() {
-        return Ok(None);
-    }
-    let schedule = raw_schedule
-        .as_object()
-        .ok_or_else(|| format!("{context}.weight_schedule must be an object"))?;
-    let w_start = schedule
-        .get("w_start")
-        .and_then(JsonValue::as_f64)
-        .ok_or_else(|| format!("{context}.weight_schedule.w_start must be a finite number"))?;
-    let w_end = schedule
-        .get("w_end")
-        .and_then(JsonValue::as_f64)
-        .ok_or_else(|| format!("{context}.weight_schedule.w_end must be a finite number"))?;
-    let kind_name = schedule
-        .get("kind")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| format!("{context}.weight_schedule.kind is required"))?
-        .to_ascii_lowercase()
-        .replace('-', "_");
-    let kind = match kind_name.as_str() {
-        "geometric" => {
-            let rate = schedule
-                .get("rate")
-                .and_then(JsonValue::as_f64)
-                .ok_or_else(|| {
-                    format!("{context}.weight_schedule.rate is required for geometric")
-                })?;
-            ScheduleKind::Geometric { rate }
-        }
-        "linear" => {
-            let steps = schedule
-                .get("steps")
-                .and_then(JsonValue::as_u64)
-                .ok_or_else(|| format!("{context}.weight_schedule.steps is required for linear"))?;
-            ScheduleKind::Linear {
-                steps: json_u64_to_usize(steps, &format!("{context}.weight_schedule.steps"))?,
-            }
-        }
-        "reciprocal_iter" => ScheduleKind::ReciprocalIter,
-        other => {
-            return Err(format!(
-                "{context}.weight_schedule.kind must be geometric, linear, or reciprocal_iter; got {other:?}"
-            ));
-        }
-    };
-    let mut parsed = ScalarWeightSchedule::new(w_start, w_end, kind)
-        .map_err(|err| format!("{context}.weight_schedule: {err}"))?;
-    if let Some(iter_count) = schedule.get("iter_count") {
-        let raw_iter_count = iter_count.as_u64().ok_or_else(|| {
-            format!("{context}.weight_schedule.iter_count must be a non-negative integer")
-        })?;
-        parsed.iter_count = json_u64_to_usize(
-            raw_iter_count,
-            &format!("{context}.weight_schedule.iter_count"),
-        )?;
-    }
-    Ok(Some(parsed))
 }
 
 fn descriptor_temperature_schedule(
@@ -537,90 +470,55 @@ pub fn build_analytic_penalty_registry_from_descriptors(
             .ok_or_else(|| format!("{context}.kind is required"))?
             .to_ascii_lowercase()
             .replace('-', "_");
-        let weight_schedule = descriptor_weight_schedule(descriptor, &context)?;
         match kind.as_str() {
             "isometry" => {
                 descriptor_no_unknown_keys(
                     descriptor,
                     &context,
-                    &["kind", "target", "weight", "p_out", "weight_schedule"],
+                    &["kind", "target", "weight", "p_out"],
                 )?;
                 let weight = descriptor_weight_scalar(descriptor, &context)?;
                 let p_out = descriptor_usize(descriptor, "p_out", target.d)?;
                 let mut penalty = IsometryPenalty::new_euclidean(slice, p_out);
                 penalty.scalar_weight = weight;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::Isometry(Arc::new(penalty)));
             }
             "ard" => {
-                descriptor_no_unknown_keys(
-                    descriptor,
-                    &context,
-                    &["kind", "target", "weight", "weight_schedule"],
-                )?;
+                descriptor_no_unknown_keys(descriptor, &context, &["kind", "target", "weight"])?;
                 let mut penalty = ARDPenalty::new(slice, target.d);
                 penalty.weight = descriptor_f64(descriptor, "weight", 1.0)?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::Ard(Arc::new(penalty)));
             }
             "topk" | "topk_activation" => {
                 descriptor_no_unknown_keys(
                     descriptor,
                     &context,
-                    &["kind", "target", "k", "weight", "weight_schedule"],
+                    &["kind", "target", "k", "weight"],
                 )?;
                 let k = descriptor_usize(descriptor, "k", 1)?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let penalty = TopKActivationPenalty::new(slice, k, weight)
                     .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::TopKActivation(Arc::new(penalty)));
             }
             "smooth_threshold" => {
                 descriptor_no_unknown_keys(
                     descriptor,
                     &context,
-                    &[
-                        "kind",
-                        "target",
-                        "thresholds",
-                        "weight",
-                        "smoothing_eps",
-                        "weight_schedule",
-                    ],
+                    &["kind", "target", "thresholds", "weight", "smoothing_eps"],
                 )?;
                 let thresholds = descriptor_array1_flat(descriptor, "thresholds", &context)?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-3)?;
                 let penalty = SmoothThresholdPenalty::new(slice, thresholds, weight, smoothing_eps)
                     .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::SmoothThreshold(Arc::new(penalty)));
             }
             "orthogonality" => {
                 descriptor_no_unknown_keys(
                     descriptor,
                     &context,
-                    &[
-                        "kind",
-                        "target",
-                        "weight",
-                        "n_eff",
-                        "learnable",
-                        "weight_schedule",
-                    ],
+                    &["kind", "target", "weight", "n_eff", "learnable"],
                 )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
@@ -630,10 +528,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     .unwrap_or(false);
                 let penalty = OrthogonalityPenalty::new(slice, target.d, weight, n_eff, learnable)
                     .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::Orthogonality(Arc::new(penalty)));
             }
             "sparsity" => {
@@ -647,7 +541,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "weight",
                         "eps",
                         "eps_weight",
-                        "weight_schedule",
                     ],
                 )?;
                 let weight = descriptor_weight_scalar(descriptor, &context)?;
@@ -689,10 +582,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         ));
                     }
                 };
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::Sparsity(Arc::new(penalty)));
             }
             "scad_mcp" => {
@@ -708,7 +597,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "variant",
                         "smoothing_eps",
                         "learnable",
-                        "weight_schedule",
                     ],
                 )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
@@ -744,10 +632,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     learnable,
                 )
                 .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::ScadMcp(Arc::new(penalty)));
             }
             "block_orthogonality" => {
@@ -766,10 +650,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 let penalty =
                     BlockOrthogonalityPenalty::new(slice, groups, weight, n_eff, learnable)
                         .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::BlockOrthogonality(Arc::new(penalty)));
             }
             "decoder_incoherence" => {
@@ -783,7 +663,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "p_out",
                         "weight",
                         "learnable",
-                        "weight_schedule",
                         "coactivation",
                         "coactivation_shape",
                     ],
@@ -848,10 +727,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     learnable,
                 )
                 .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::DecoderIncoherence(Arc::new(penalty)));
             }
             "ordered_beta_bernoulli" => {
@@ -867,7 +742,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "learnable",
                         "learnable_alpha",
                         "temperature_schedule",
-                        "weight_schedule",
                     ],
                 )?;
                 let k_max = descriptor_usize(descriptor, "k_max", target.d)?;
@@ -884,31 +758,17 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     Some(schedule) => penalty.with_temperature_schedule(schedule),
                     None => penalty,
                 };
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::OrderedBetaBernoulli(Arc::new(penalty)));
             }
             "softmax_assignment_sparsity" => {
                 descriptor_no_unknown_keys(
                     descriptor,
                     &context,
-                    &[
-                        "kind",
-                        "target",
-                        "k_atoms",
-                        "temperature",
-                        "weight_schedule",
-                    ],
+                    &["kind", "target", "k_atoms", "temperature"],
                 )?;
                 let k_atoms = descriptor_usize(descriptor, "k_atoms", target.d)?;
                 let temperature = descriptor_f64(descriptor, "temperature", 1.0)?;
                 let penalty = SoftmaxAssignmentSparsityPenalty::new(k_atoms, temperature);
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::SoftmaxAssignmentSparsity(Arc::new(
                     penalty,
                 )));
@@ -926,7 +786,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "edges",
                         "smoothing_eps",
                         "learnable",
-                        "weight_schedule",
                     ],
                 )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
@@ -945,10 +804,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     learnable,
                 )
                 .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::TotalVariation(Arc::new(penalty)));
             }
             "harmonic_roughness" => {
@@ -962,7 +817,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "n_eff",
                         "row_weights",
                         "learnable",
-                        "weight_schedule",
                     ],
                 )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
@@ -974,10 +828,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     .unwrap_or(false);
                 let penalty = HarmonicRoughnessPenalty::new(weight, n_eff, row_weights, learnable)
                     .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::HarmonicRoughness(Arc::new(penalty)));
             }
             "monotonicity" => {
@@ -992,7 +842,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "direction",
                         "smoothing_eps",
                         "learnable",
-                        "weight_schedule",
                     ],
                 )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
@@ -1016,10 +865,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     learnable,
                 )
                 .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::Monotonicity(Arc::new(penalty)));
             }
             "nuclear_norm" => {
@@ -1034,7 +879,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "smoothing_eps",
                         "max_rank",
                         "learnable",
-                        "weight_schedule",
                     ],
                 )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
@@ -1065,10 +909,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     learnable,
                 )
                 .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::NuclearNorm(Arc::new(penalty)));
             }
             "block_sparsity" => {
@@ -1083,7 +923,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "n_eff",
                         "smoothing_eps",
                         "learnable",
-                        "weight_schedule",
                     ],
                 )?;
                 let groups = descriptor_axis_groups(descriptor, "groups", &context)?;
@@ -1103,10 +942,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     learnable,
                 )
                 .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::BlockSparsity(Arc::new(penalty)));
             }
             "mechanism_sparsity" => {
@@ -1121,7 +956,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "smoothing_eps",
                         "n_eff",
                         "learnable",
-                        "weight_schedule",
                     ],
                 )?;
                 let raw_groups = descriptor
@@ -1174,10 +1008,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     learnable,
                 )
                 .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::MechanismSparsity(Arc::new(penalty)));
             }
             "row_precision_prior" | "aux_conditional_prior" => {
@@ -1192,7 +1022,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "weight",
                         "n_eff",
                         "learnable",
-                        "weight_schedule",
                     ],
                 )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
@@ -1210,10 +1039,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 let penalty =
                     RowPrecisionPriorPenalty::new(slice, lambda_per_row, weight, n_eff, learnable)
                         .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::RowPrecisionPrior(Arc::new(penalty)));
             }
             "ivae_ridge_mean_gauge" => {
@@ -1229,7 +1054,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "weight",
                         "n_eff",
                         "learnable",
-                        "weight_schedule",
                     ],
                 )?;
                 let aux = descriptor_array2_flat(descriptor, "aux", "aux_shape", &context)?;
@@ -1243,10 +1067,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 let penalty =
                     IvaeRidgeMeanGauge::new(slice, aux, ridge_eps, weight, n_eff, learnable)
                         .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::IvaeRidgeMeanGauge(Arc::new(penalty)));
             }
             "parametric_row_precision_prior" | "parametric_aux_conditional_prior" => {
@@ -1265,7 +1085,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "weight",
                         "n_eff",
                         "learnable",
-                        "weight_schedule",
                     ],
                 )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
@@ -1282,10 +1101,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     slice, aux, log_alpha, raw_beta, mu, weight, n_eff, learnable,
                 )
                 .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::ParametricRowPrecisionPrior(Arc::new(
                     penalty,
                 )));
@@ -1301,7 +1116,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "shell_weights",
                         "eps",
                         "tier",
-                        "weight_schedule",
                     ],
                 )?;
                 let prefix_values = descriptor
@@ -1353,10 +1167,6 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 let penalty =
                     NestedPrefixPenalty::new(slice, tier, prefix_sizes, shell_weights, eps)
                         .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::NestedPrefix(Arc::new(penalty)));
             }
             other => {
@@ -1556,6 +1366,26 @@ mod tests {
     fn rejects_missing_target() {
         let penalties = json!([{ "kind": "ard" }]);
         assert_eq!(reject(&penalties), "penalties[0].target is required");
+    }
+
+    #[test]
+    fn rejects_weight_schedule_as_an_unrecognized_field() {
+        // #3689: the strength of an analytic penalty is its REML-selected
+        // log-weight. No outer loop ever advanced a schedule, so the field was
+        // an inert knob, and it has been removed from every kind.
+        let schedule = json!({ "w_start": 10.0, "w_end": 1.0, "kind": "geometric", "rate": 0.5 });
+        for kind in ["isometry", "ard", "topk"] {
+            let mut descriptor =
+                json!({ "kind": kind, "target": "z", "weight_schedule": schedule });
+            if kind == "topk" {
+                descriptor["k"] = json!(2);
+            }
+            assert_eq!(
+                reject(&json!([descriptor])),
+                "penalties[0].weight_schedule is not a recognized field for this analytic penalty",
+                "{kind}"
+            );
+        }
     }
 
     #[test]

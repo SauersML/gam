@@ -584,11 +584,6 @@ Everything else lives in a public submodule, imported on first access
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.penalties.ScalarWeightSchedule
-    options:
-      show_root_heading: true
-      heading_level: 3
-
 ::: gamfit.penalties.PENALTY_MANIFEST
     options:
       show_root_heading: true

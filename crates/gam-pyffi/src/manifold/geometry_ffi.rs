@@ -1578,14 +1578,12 @@ struct SparsityPenalty {
     eps: f64,
     #[pyo3(get, set)]
     eps_weight: String,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 #[pymethods]
 impl SparsityPenalty {
     #[new]
-    #[pyo3(signature = (kind = "smooth_l1".to_string(), weight = None, eps = 1.0e-3, eps_weight = "fixed".to_string(), *, target = None, weight_schedule = None))]
+    #[pyo3(signature = (kind = "smooth_l1".to_string(), weight = None, eps = 1.0e-3, eps_weight = "fixed".to_string(), *, target = None))]
     fn new(
         py: Python<'_>,
         kind: String,
@@ -1593,7 +1591,6 @@ impl SparsityPenalty {
         eps: f64,
         eps_weight: String,
         target: Option<&Bound<'_, PyAny>>,
-        weight_schedule: Option<PyObject>,
     ) -> PyResult<Self> {
         let weight = py_object_or_string_default(py, weight, "auto");
         let target = py_object_or_string_default(py, target, "t");
@@ -1624,7 +1621,6 @@ impl SparsityPenalty {
             weight,
             eps,
             eps_weight,
-            weight_schedule,
         })
     }
 
@@ -1639,32 +1635,17 @@ impl SparsityPenalty {
         payload.set_item("weight", self.weight.bind(py))?;
         payload.set_item("eps", self.eps)?;
         payload.set_item("eps_weight", &self.eps_weight)?;
-        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
-            payload.set_item("weight_schedule", schedule)?;
-        }
         Ok(payload.into())
-    }
-
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "SparsityPenalty(kind={}, weight={}, eps={}, eps_weight={}, target={}, weight_schedule={})",
+            "SparsityPenalty(kind={}, weight={}, eps={}, eps_weight={}, target={})",
             self.kind.as_str(),
             py_repr(self.weight.bind(py))?,
             self.eps,
             self.eps_weight.as_str(),
             py_repr(self.target.bind(py))?,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(schedule.bind(py))?,
-                None => "None".to_string(),
-            }
         ))
     }
 }
@@ -1756,25 +1737,17 @@ struct ARDPenalty {
     target: PyObject,
     #[pyo3(get, set)]
     weight: f64,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 #[pymethods]
 impl ARDPenalty {
     #[new]
-    #[pyo3(signature = (weight = 1.0, *, target = None, weight_schedule = None))]
-    fn new(
-        py: Python<'_>,
-        weight: f64,
-        target: Option<&Bound<'_, PyAny>>,
-        weight_schedule: Option<PyObject>,
-    ) -> PyResult<Self> {
+    #[pyo3(signature = (weight = 1.0, *, target = None))]
+    fn new(py: Python<'_>, weight: f64, target: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
         validate_target_eager(py, "ARDPenalty", target)?;
         Ok(Self {
             target: py_object_or_string_default(py, target, "t"),
             weight,
-            weight_schedule,
         })
     }
 
@@ -1786,29 +1759,14 @@ impl ARDPenalty {
         payload.set_item("kind", Self::KIND_TAG)?;
         payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
         payload.set_item("weight", self.weight)?;
-        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
-            payload.set_item("weight_schedule", schedule)?;
-        }
         Ok(payload.into())
-    }
-
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "ARDPenalty(weight={}, target={}, weight_schedule={})",
+            "ARDPenalty(weight={}, target={})",
             self.weight,
             py_repr(self.target.bind(py))?,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(schedule.bind(py))?,
-                None => "None".to_string(),
-            }
         ))
     }
 }
@@ -1821,20 +1779,17 @@ struct PyTopKActivationPenalty {
     k: i64,
     #[pyo3(get, set)]
     weight: f64,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 #[pymethods]
 impl PyTopKActivationPenalty {
     #[new]
-    #[pyo3(signature = (k, weight = 1.0, *, target = None, weight_schedule = None))]
+    #[pyo3(signature = (k, weight = 1.0, *, target = None))]
     fn new(
         py: Python<'_>,
         k: &Bound<'_, PyAny>,
         weight: f64,
         target: Option<&Bound<'_, PyAny>>,
-        weight_schedule: Option<PyObject>,
     ) -> PyResult<Self> {
         let k = k.call_method0("__index__")?.extract::<i64>()?;
         if k <= 0 {
@@ -1851,7 +1806,6 @@ impl PyTopKActivationPenalty {
             target: py_object_or_string_default(py, target, "t"),
             k,
             weight,
-            weight_schedule,
         })
     }
 
@@ -1864,30 +1818,15 @@ impl PyTopKActivationPenalty {
         payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
         payload.set_item("k", self.k)?;
         payload.set_item("weight", self.weight)?;
-        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
-            payload.set_item("weight_schedule", schedule)?;
-        }
         Ok(payload.into())
-    }
-
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "TopKActivationPenalty(k={}, weight={}, target={}, weight_schedule={})",
+            "TopKActivationPenalty(k={}, weight={}, target={})",
             self.k,
             self.weight,
             py_repr(self.target.bind(py))?,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(schedule.bind(py))?,
-                None => "None".to_string(),
-            }
         ))
     }
 }
@@ -1902,21 +1841,18 @@ struct SmoothThresholdPenalty {
     weight: f64,
     #[pyo3(get, set)]
     smoothing_eps: f64,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 #[pymethods]
 impl SmoothThresholdPenalty {
     #[new]
-    #[pyo3(signature = (thresholds, weight = 1.0, smoothing_eps = 1.0e-3, *, target = None, weight_schedule = None))]
+    #[pyo3(signature = (thresholds, weight = 1.0, smoothing_eps = 1.0e-3, *, target = None))]
     fn new(
         py: Python<'_>,
         thresholds: &Bound<'_, PyAny>,
         weight: f64,
         smoothing_eps: f64,
         target: Option<&Bound<'_, PyAny>>,
-        weight_schedule: Option<PyObject>,
     ) -> PyResult<Self> {
         let numpy = py.import("numpy")?;
         let kwargs = PyDict::new(py);
@@ -1955,7 +1891,6 @@ impl SmoothThresholdPenalty {
             thresholds,
             weight,
             smoothing_eps,
-            weight_schedule,
         })
     }
 
@@ -1969,54 +1904,18 @@ impl SmoothThresholdPenalty {
         payload.set_item("thresholds", self.thresholds.clone())?;
         payload.set_item("weight", self.weight)?;
         payload.set_item("smoothing_eps", self.smoothing_eps)?;
-        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
-            payload.set_item("weight_schedule", schedule)?;
-        }
         Ok(payload.into())
-    }
-
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "SmoothThresholdPenalty(thresholds={:?}, weight={}, smoothing_eps={}, target={}, weight_schedule={})",
+            "SmoothThresholdPenalty(thresholds={:?}, weight={}, smoothing_eps={}, target={})",
             self.thresholds,
             self.weight,
             self.smoothing_eps,
             py_repr(self.target.bind(py))?,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(schedule.bind(py))?,
-                None => "None".to_string(),
-            }
         ))
     }
-}
-
-fn topk_weight_schedule_descriptor(
-    py: Python<'_>,
-    schedule: &Option<PyObject>,
-) -> PyResult<Option<PyObject>> {
-    let Some(schedule) = schedule else {
-        return Ok(None);
-    };
-    let bound = schedule.bind(py);
-    if bound.hasattr("to_rust_descriptor")? {
-        return Ok(Some(
-            bound.call_method0("to_rust_descriptor")?.unbind().into(),
-        ));
-    }
-    if let Ok(mapping) = bound.cast::<PyDict>() {
-        return Ok(Some(mapping.copy()?.unbind().into()));
-    }
-    Err(PyTypeError::new_err(
-        "weight_schedule must be ScalarWeightSchedule, a mapping, or None",
-    ))
 }
 
 fn aux_conditional_prior_float_array<'py>(
@@ -2090,8 +1989,6 @@ struct BlockSparsityPenalty {
     smoothing_eps: f64,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 #[pymethods]
@@ -2130,7 +2027,6 @@ impl BlockSparsityPenalty {
             n_eff,
             smoothing_eps,
             learnable,
-            weight_schedule: None,
         })
     }
 
@@ -2146,33 +2042,18 @@ impl BlockSparsityPenalty {
         payload.set_item("n_eff", self.n_eff)?;
         payload.set_item("smoothing_eps", self.smoothing_eps)?;
         payload.set_item("learnable", self.learnable)?;
-        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
-            payload.set_item("weight_schedule", schedule)?;
-        }
         Ok(payload.into())
-    }
-
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "BlockSparsityPenalty(groups={:?}, weight={}, n_eff={}, smoothing_eps={}, learnable={}, target={}, weight_schedule={})",
+            "BlockSparsityPenalty(groups={:?}, weight={}, n_eff={}, smoothing_eps={}, learnable={}, target={})",
             self.groups,
             self.weight,
             self.n_eff,
             self.smoothing_eps,
             self.learnable,
             py_repr(self.target.bind(py))?,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(schedule.bind(py))?,
-                None => "None".to_string(),
-            }
         ))
     }
 }
@@ -2252,20 +2133,17 @@ struct SoftmaxAssignmentSparsityPenalty {
     k_atoms: i64,
     #[pyo3(get, set)]
     temperature: f64,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 #[pymethods]
 impl SoftmaxAssignmentSparsityPenalty {
     #[new]
-    #[pyo3(signature = (k_atoms, temperature = 1.0, *, target = None, weight_schedule = None))]
+    #[pyo3(signature = (k_atoms, temperature = 1.0, *, target = None))]
     fn new(
         py: Python<'_>,
         k_atoms: &Bound<'_, PyAny>,
         temperature: f64,
         target: Option<&Bound<'_, PyAny>>,
-        weight_schedule: Option<PyObject>,
     ) -> PyResult<Self> {
         let builtins = PyModule::import(py, "builtins")?;
         let k_atoms = builtins
@@ -2286,7 +2164,6 @@ impl SoftmaxAssignmentSparsityPenalty {
             target: py_object_or_string_default(py, target, "t"),
             k_atoms,
             temperature,
-            weight_schedule,
         })
     }
 
@@ -2299,9 +2176,6 @@ impl SoftmaxAssignmentSparsityPenalty {
         payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
         payload.set_item("k_atoms", self.k_atoms)?;
         payload.set_item("temperature", self.temperature)?;
-        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
-            payload.set_item("weight_schedule", schedule)?;
-        }
         Ok(payload.into())
     }
 
@@ -2309,24 +2183,12 @@ impl SoftmaxAssignmentSparsityPenalty {
         self.to_rust_descriptor(py)
     }
 
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
-    }
-
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "SoftmaxAssignmentSparsityPenalty(target={}, k_atoms={}, temperature={}, weight_schedule={})",
+            "SoftmaxAssignmentSparsityPenalty(target={}, k_atoms={}, temperature={})",
             py_repr(self.target.bind(py))?,
             self.k_atoms,
             self.temperature,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(schedule.bind(py))?,
-                None => "None".to_string(),
-            }
         ))
     }
 }
@@ -2337,28 +2199,21 @@ struct IsometryPenalty {
     target: PyObject,
     #[pyo3(get, set)]
     weight: PyObject,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 #[pymethods]
 impl IsometryPenalty {
     #[new]
-    #[pyo3(signature = (weight = None, *, target = None, weight_schedule = None))]
+    #[pyo3(signature = (weight = None, *, target = None))]
     fn new(
         py: Python<'_>,
         weight: Option<&Bound<'_, PyAny>>,
         target: Option<&Bound<'_, PyAny>>,
-        weight_schedule: Option<PyObject>,
     ) -> PyResult<Self> {
         let weight = py_object_or_string_default(py, weight, "auto");
         let target = py_object_or_string_default(py, target, "t");
         validate_sparsity_weight(weight.bind(py), "IsometryPenalty")?;
-        Ok(Self {
-            target,
-            weight,
-            weight_schedule,
-        })
+        Ok(Self { target, weight })
     }
 
     #[classattr]
@@ -2369,29 +2224,14 @@ impl IsometryPenalty {
         payload.set_item("kind", Self::KIND_TAG)?;
         payload.set_item("target", target_descriptor(py, self.target.bind(py))?)?;
         payload.set_item("weight", self.weight.bind(py))?;
-        if let Some(schedule) = &self.weight_schedule {
-            payload.set_item("weight_schedule", schedule.bind(py))?;
-        }
         Ok(payload.into())
-    }
-
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "IsometryPenalty(weight={}, target={}, weight_schedule={})",
+            "IsometryPenalty(weight={}, target={})",
             py_repr(self.weight.bind(py))?,
             py_repr(self.target.bind(py))?,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(schedule.bind(py))?,
-                None => "None".to_string(),
-            }
         ))
     }
 }
@@ -2410,14 +2250,12 @@ struct PyOrderedBetaBernoulliPenalty {
     learnable: bool,
     #[pyo3(get, set)]
     temperature_schedule: Option<PyObject>,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 #[pymethods]
 impl PyOrderedBetaBernoulliPenalty {
     #[new]
-    #[pyo3(signature = (k_max, alpha = 1.0, tau = 1.0, learnable = false, *, target = None, temperature_schedule = None, weight_schedule = None))]
+    #[pyo3(signature = (k_max, alpha = 1.0, tau = 1.0, learnable = false, *, target = None, temperature_schedule = None))]
     fn new(
         py: Python<'_>,
         k_max: &Bound<'_, PyAny>,
@@ -2426,7 +2264,6 @@ impl PyOrderedBetaBernoulliPenalty {
         learnable: bool,
         target: Option<&Bound<'_, PyAny>>,
         temperature_schedule: Option<PyObject>,
-        weight_schedule: Option<PyObject>,
     ) -> PyResult<Self> {
         let builtins = PyModule::import(py, "builtins")?;
         let k_max = builtins.getattr("int")?.call1((k_max,))?.extract::<i64>()?;
@@ -2452,7 +2289,6 @@ impl PyOrderedBetaBernoulliPenalty {
             tau,
             learnable,
             temperature_schedule,
-            weight_schedule,
         })
     }
 
@@ -2470,9 +2306,6 @@ impl PyOrderedBetaBernoulliPenalty {
         if let Some(schedule) = &self.temperature_schedule {
             payload.set_item("temperature_schedule", schedule.bind(py))?;
         }
-        if let Some(schedule) = &self.weight_schedule {
-            payload.set_item("weight_schedule", schedule.bind(py))?;
-        }
         Ok(payload.into())
     }
 
@@ -2480,17 +2313,9 @@ impl PyOrderedBetaBernoulliPenalty {
         self.to_rust_descriptor(py)
     }
 
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
-    }
-
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "OrderedBetaBernoulliPenalty(target={}, k_max={}, alpha={}, tau={}, learnable={}, temperature_schedule={}, weight_schedule={})",
+            "OrderedBetaBernoulliPenalty(target={}, k_max={}, alpha={}, tau={}, learnable={}, temperature_schedule={})",
             py_repr(self.target.bind(py))?,
             self.k_max,
             self.alpha,
@@ -2500,10 +2325,6 @@ impl PyOrderedBetaBernoulliPenalty {
                 Some(schedule) => py_repr(schedule.bind(py))?,
                 None => "None".to_string(),
             },
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(schedule.bind(py))?,
-                None => "None".to_string(),
-            }
         ))
     }
 }
@@ -2562,8 +2383,6 @@ struct TotalVariationPenalty {
     learnable: bool,
     #[pyo3(get, set)]
     _edges: Option<Vec<(i64, i64)>>,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 #[pymethods]
@@ -2635,7 +2454,6 @@ impl TotalVariationPenalty {
             smoothing_eps,
             learnable,
             _edges: edges,
-            weight_schedule: None,
         })
     }
 
@@ -2656,33 +2474,18 @@ impl TotalVariationPenalty {
         } else {
             payload.set_item("difference_op", "forward_1d")?;
         }
-        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
-            payload.set_item("weight_schedule", schedule)?;
-        }
         Ok(payload.into())
-    }
-
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "TotalVariationPenalty(weight={}, n_eff={}, difference_op={}, smoothing_eps={}, learnable={}, target={}, weight_schedule={})",
+            "TotalVariationPenalty(weight={}, n_eff={}, difference_op={}, smoothing_eps={}, learnable={}, target={})",
             self.weight,
             self.n_eff,
             py_repr(self.difference_op.bind(py))?,
             self.smoothing_eps,
             self.learnable,
             py_repr(self.target.bind(py))?,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(schedule.bind(py))?,
-                None => "None".to_string(),
-            }
         ))
     }
 }
@@ -2835,8 +2638,6 @@ struct ParametricAuxConditionalPriorPenalty {
     n_eff: i64,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 #[pymethods]
@@ -2875,7 +2676,6 @@ impl ParametricAuxConditionalPriorPenalty {
             weight,
             n_eff,
             learnable,
-            weight_schedule: None,
         })
     }
 
@@ -2937,23 +2737,12 @@ impl ParametricAuxConditionalPriorPenalty {
         payload.set_item("weight", self.weight)?;
         payload.set_item("n_eff", self.n_eff)?;
         payload.set_item("learnable", self.learnable)?;
-        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
-            payload.set_item("weight_schedule", schedule)?;
-        }
         Ok(payload.into())
-    }
-
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "ParametricAuxConditionalPriorPenalty(aux={}, alpha_init={}, beta_init={}, mu_init={}, weight={}, n_eff={}, learnable={}, target={}, weight_schedule={})",
+            "ParametricAuxConditionalPriorPenalty(aux={}, alpha_init={}, beta_init={}, mu_init={}, weight={}, n_eff={}, learnable={}, target={})",
             py_repr(self.aux.bind(py))?,
             py_repr(self.alpha_init.bind(py))?,
             py_repr(self.beta_init.bind(py))?,
@@ -2962,10 +2751,6 @@ impl ParametricAuxConditionalPriorPenalty {
             self.n_eff,
             self.learnable,
             py_repr(self.target.bind(py))?,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(schedule.bind(py))?,
-                None => "None".to_string(),
-            }
         ))
     }
 
@@ -3050,8 +2835,6 @@ struct OrthogonalityPenalty {
     n_eff: i64,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 #[pymethods]
@@ -3080,7 +2863,6 @@ impl OrthogonalityPenalty {
             weight,
             n_eff,
             learnable,
-            weight_schedule: None,
         })
     }
 
@@ -3094,31 +2876,16 @@ impl OrthogonalityPenalty {
         payload.set_item("weight", self.weight)?;
         payload.set_item("n_eff", self.n_eff)?;
         payload.set_item("learnable", self.learnable)?;
-        if let Some(schedule) = &self.weight_schedule {
-            payload.set_item("weight_schedule", schedule.bind(py))?;
-        }
         Ok(payload.into())
-    }
-
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "OrthogonalityPenalty(weight={:?}, n_eff={}, learnable={}, target={}, weight_schedule={})",
+            "OrthogonalityPenalty(weight={:?}, n_eff={}, learnable={}, target={})",
             self.weight,
             self.n_eff,
             if self.learnable { "True" } else { "False" },
             py_repr(self.target.bind(py))?,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(schedule.bind(py))?,
-                None => "None".to_string(),
-            }
         ))
     }
 }
@@ -3139,8 +2906,6 @@ struct ScadMcpPenalty {
     smoothing_eps: f64,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 #[pymethods]
@@ -3177,7 +2942,6 @@ impl ScadMcpPenalty {
             variant,
             smoothing_eps,
             learnable,
-            weight_schedule: None,
         };
         penalty.validate()?;
         Ok(penalty)
@@ -3196,9 +2960,6 @@ impl ScadMcpPenalty {
         payload.set_item("variant", &self.variant)?;
         payload.set_item("smoothing_eps", self.smoothing_eps)?;
         payload.set_item("learnable", self.learnable)?;
-        if let Some(schedule) = &self.weight_schedule {
-            payload.set_item("weight_schedule", schedule.bind(py))?;
-        }
         Ok(payload.into())
     }
 
@@ -3206,17 +2967,9 @@ impl ScadMcpPenalty {
         self.to_rust_descriptor(py)
     }
 
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
-    }
-
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "ScadMcpPenalty(weight={}, n_eff={}, gamma={}, variant={}, smoothing_eps={}, learnable={}, target={}, weight_schedule={})",
+            "ScadMcpPenalty(weight={}, n_eff={}, gamma={}, variant={}, smoothing_eps={}, learnable={}, target={})",
             self.weight,
             self.n_eff,
             self.gamma,
@@ -3224,10 +2977,6 @@ impl ScadMcpPenalty {
             self.smoothing_eps,
             self.learnable,
             py_repr(self.target.bind(py))?,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(schedule.bind(py))?,
-                None => "None".to_string(),
-            }
         ))
     }
 }
@@ -3282,8 +3031,6 @@ struct IvaeRidgeMeanGauge {
     n_eff: i64,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 #[pymethods]
@@ -3314,7 +3061,6 @@ impl IvaeRidgeMeanGauge {
             weight,
             n_eff,
             learnable,
-            weight_schedule: None,
         })
     }
 
@@ -3338,33 +3084,18 @@ impl IvaeRidgeMeanGauge {
         payload.set_item("weight", self.weight)?;
         payload.set_item("n_eff", self.n_eff)?;
         payload.set_item("learnable", self.learnable)?;
-        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
-            payload.set_item("weight_schedule", schedule)?;
-        }
         Ok(payload.into())
-    }
-
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "IvaeRidgeMeanGauge(aux={}, weight={}, n_eff={}, ridge_eps={}, learnable={}, target={}, weight_schedule={})",
+            "IvaeRidgeMeanGauge(aux={}, weight={}, n_eff={}, ridge_eps={}, learnable={}, target={})",
             py_repr(self.aux.bind(py))?,
             self.weight,
             self.n_eff,
             self.ridge_eps,
             self.learnable,
             py_repr(self.target.bind(py))?,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(schedule.bind(py))?,
-                None => "None".to_string(),
-            }
         ))
     }
 
@@ -3485,8 +3216,6 @@ struct MechanismSparsityPenalty {
     n_eff: f64,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 #[pymethods]
@@ -3535,7 +3264,6 @@ impl MechanismSparsityPenalty {
             smoothing_eps,
             n_eff,
             learnable,
-            weight_schedule: None,
         })
     }
 
@@ -3551,30 +3279,14 @@ impl MechanismSparsityPenalty {
         payload.set_item("smoothing_eps", self.smoothing_eps)?;
         payload.set_item("n_eff", self.n_eff)?;
         payload.set_item("learnable", self.learnable)?;
-        if let Some(schedule) = &self.weight_schedule {
-            let schedule = mechanism_weight_schedule_descriptor(py, schedule)?;
-            payload.set_item("weight_schedule", schedule)?;
-        }
         Ok(payload.unbind().into_any())
-    }
-
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         let target_repr = self.target.bind(py).repr()?.extract::<String>()?;
-        let schedule_repr = match &self.weight_schedule {
-            Some(schedule) => schedule.bind(py).repr()?.extract::<String>()?,
-            None => "None".to_string(),
-        };
         let learnable = if self.learnable { "True" } else { "False" };
         Ok(format!(
-            "MechanismSparsityPenalty(target={target_repr}, feature_groups={:?}, weight={}, smoothing_eps={}, n_eff={}, learnable={learnable}, weight_schedule={schedule_repr})",
+            "MechanismSparsityPenalty(target={target_repr}, feature_groups={:?}, weight={}, smoothing_eps={}, n_eff={}, learnable={learnable})",
             self.feature_groups, self.weight, self.smoothing_eps, self.n_eff
         ))
     }
@@ -3716,19 +3428,6 @@ fn set_mechanism_target_descriptor(
     ))
 }
 
-fn mechanism_weight_schedule_descriptor(py: Python<'_>, schedule: &PyObject) -> PyResult<PyObject> {
-    let schedule = schedule.bind(py);
-    if schedule.hasattr("to_rust_descriptor")? {
-        return Ok(schedule.call_method0("to_rust_descriptor")?.unbind());
-    }
-    if schedule.cast::<PyDict>().is_ok() {
-        return Ok(schedule.clone().unbind());
-    }
-    Err(PyTypeError::new_err(
-        "weight_schedule must be ScalarWeightSchedule, a mapping, or None",
-    ))
-}
-
 #[pyclass(module = "gamfit._rust", name = "BlockOrthogonalityPenalty")]
 struct BlockOrthogonalityPenalty {
     #[pyo3(get, set)]
@@ -3741,8 +3440,6 @@ struct BlockOrthogonalityPenalty {
     n_eff: i64,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 fn block_orthogonality_groups(groups: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<i64>>> {
@@ -3852,7 +3549,6 @@ impl BlockOrthogonalityPenalty {
             weight,
             n_eff,
             learnable,
-            weight_schedule: None,
         })
     }
 
@@ -3870,32 +3566,17 @@ impl BlockOrthogonalityPenalty {
         payload.set_item("weight", self.weight)?;
         payload.set_item("n_eff", self.n_eff)?;
         payload.set_item("learnable", self.learnable)?;
-        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
-            payload.set_item("weight_schedule", schedule)?;
-        }
         Ok(payload.into())
-    }
-
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "BlockOrthogonalityPenalty(target={}, groups={:?}, weight={}, n_eff={}, learnable={}, weight_schedule={})",
+            "BlockOrthogonalityPenalty(target={}, groups={:?}, weight={}, n_eff={}, learnable={})",
             py_repr(self.target.bind(py))?,
             self.groups,
             self.weight,
             self.n_eff,
             self.learnable,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(schedule.bind(py))?,
-                None => "None".to_string(),
-            }
         ))
     }
 }
@@ -4183,8 +3864,6 @@ struct AuxConditionalPriorPenalty {
     n_eff: i64,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 #[pymethods]
@@ -4213,7 +3892,6 @@ impl AuxConditionalPriorPenalty {
             weight,
             n_eff,
             learnable,
-            weight_schedule: None,
         })
     }
 
@@ -4236,32 +3914,17 @@ impl AuxConditionalPriorPenalty {
         payload.set_item("weight", self.weight)?;
         payload.set_item("n_eff", self.n_eff)?;
         payload.set_item("learnable", self.learnable)?;
-        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
-            payload.set_item("weight_schedule", schedule)?;
-        }
         Ok(payload.into())
-    }
-
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "AuxConditionalPriorPenalty(lambda_per_row={}, weight={}, n_eff={}, learnable={}, target={}, weight_schedule={})",
+            "AuxConditionalPriorPenalty(lambda_per_row={}, weight={}, n_eff={}, learnable={}, target={})",
             py_repr(self.lambda_per_row.bind(py))?,
             self.weight,
             self.n_eff,
             self.learnable,
             py_repr(self.target.bind(py))?,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(schedule.bind(py))?,
-                None => "None".to_string(),
-            }
         ))
     }
 
@@ -4332,8 +3995,6 @@ struct NuclearNormPenalty {
     max_rank: Option<i64>,
     #[pyo3(get, set)]
     learnable: bool,
-    #[pyo3(get)]
-    weight_schedule: Option<PyObject>,
 }
 
 #[pymethods]
@@ -4383,7 +4044,6 @@ impl NuclearNormPenalty {
             smoothing_eps,
             max_rank,
             learnable,
-            weight_schedule: None,
         })
     }
 
@@ -4399,23 +4059,12 @@ impl NuclearNormPenalty {
         payload.set_item("smoothing_eps", self.smoothing_eps)?;
         payload.set_item("max_rank", self.max_rank)?;
         payload.set_item("learnable", self.learnable)?;
-        if let Some(schedule) = topk_weight_schedule_descriptor(py, &self.weight_schedule)? {
-            payload.set_item("weight_schedule", schedule)?;
-        }
         Ok(payload.into())
-    }
-
-    fn set_weight_schedule<'py>(
-        mut slf: PyRefMut<'py, Self>,
-        schedule: PyObject,
-    ) -> PyRefMut<'py, Self> {
-        slf.weight_schedule = Some(schedule);
-        slf
     }
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "NuclearNormPenalty(weight={}, n_eff={}, smoothing_eps={}, max_rank={}, learnable={}, target={}, weight_schedule={})",
+            "NuclearNormPenalty(weight={}, n_eff={}, smoothing_eps={}, max_rank={}, learnable={}, target={})",
             self.weight,
             self.n_eff,
             self.smoothing_eps,
@@ -4425,10 +4074,6 @@ impl NuclearNormPenalty {
             },
             self.learnable,
             py_repr(self.target.bind(py))?,
-            match &self.weight_schedule {
-                Some(schedule) => py_repr(schedule.bind(py))?,
-                None => "None".to_string(),
-            }
         ))
     }
 }

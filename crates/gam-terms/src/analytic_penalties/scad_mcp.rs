@@ -67,7 +67,6 @@ pub struct ScadMcpPenalty {
     pub variant: PenaltyConcavity,
     pub learnable_weight: bool,
     pub rho_index: usize,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl ScadMcpPenalty {
@@ -139,11 +138,8 @@ impl ScadMcpPenalty {
             variant,
             learnable_weight,
             rho_index: 0,
-            weight_schedule: None,
         })
     }
-
-    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -406,6 +402,4 @@ impl AnalyticPenalty for ScadMcpPenalty {
     fn name(&self) -> &str {
         "scad_mcp"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }

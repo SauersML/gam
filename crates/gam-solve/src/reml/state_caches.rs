@@ -336,41 +336,6 @@ pub(crate) fn hash_psi_slice(
     }
 }
 
-pub(crate) fn hash_scalar_weight_schedule(
-    hasher: &mut Fingerprinter,
-    schedule: &gam_terms::analytic_penalties::ScalarWeightSchedule,
-) {
-    use gam_problem::schedule::ScheduleKind;
-
-    hasher.write_f64(schedule.w_start);
-    hasher.write_f64(schedule.w_end);
-    match &schedule.kind {
-        ScheduleKind::Geometric { rate } => {
-            hasher.write_str("geometric");
-            hasher.write_f64(*rate);
-        }
-        ScheduleKind::Linear { steps } => {
-            hasher.write_str("linear");
-            hasher.write_usize(*steps);
-        }
-        ScheduleKind::ReciprocalIter => hasher.write_str("reciprocal-iter"),
-    }
-    hasher.write_usize(schedule.iter_count);
-}
-
-pub(crate) fn hash_weight_schedule_option(
-    hasher: &mut Fingerprinter,
-    schedule: &Option<gam_terms::analytic_penalties::ScalarWeightSchedule>,
-) {
-    match schedule {
-        Some(schedule) => {
-            hasher.write_bool(true);
-            hash_scalar_weight_schedule(hasher, schedule);
-        }
-        None => hasher.write_bool(false),
-    }
-}
-
 pub(crate) fn hash_gumbel_temperature_schedule(
     hasher: &mut Fingerprinter,
     schedule: &gam_problem::schedule::GumbelTemperatureSchedule,
@@ -504,7 +469,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             hasher.write_usize(p.p_out);
             hash_weight_field(hasher, &p.weight);
             hasher.write_f64(p.scalar_weight);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
             // The `jacobian_cache` / `jacobian_second_cache` /
             // `third_decoder_derivative` slots are interior-mutable
             // (`RwLock<Option<Arc<…>>>`), lazily populated, and θ-DEPENDENT:
@@ -545,7 +509,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             hasher.write_str(&format!("{:?}", p.target_tier));
             hash_sparsity_kind(hasher, p.kind);
             hasher.write_f64(p.weight);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
             hasher.write_bool(p.learns_smoothing());
         }
         AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => {
@@ -553,7 +516,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             hasher.write_usize(p.k_atoms);
             hasher.write_f64(p.temperature);
             hasher.write_f64(p.weight);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
         AnalyticPenaltyKind::OrderedBetaBernoulli(p) => {
             hasher.write_str("ibp-assignment");
@@ -563,14 +525,12 @@ pub(crate) fn hash_analytic_penalty_kind(
             hash_gumbel_schedule_option(hasher, &p.temperature_schedule);
             hasher.write_bool(p.learnable_alpha);
             hasher.write_f64(p.weight);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
         AnalyticPenaltyKind::Ard(p) => {
             hasher.write_str("ard");
             hash_psi_slice(hasher, &p.target);
             hasher.write_usize(p.latent_dim);
             hasher.write_f64(p.weight);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
             hasher.write_usize(p.rho_indices.len());
             for &idx in &p.rho_indices {
                 hasher.write_usize(idx);
@@ -583,7 +543,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             hasher.write_usize(p.k);
             hasher.write_usize(p.latent_dim);
             hasher.write_f64(p.weight);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
         AnalyticPenaltyKind::SmoothThreshold(p) => {
             hasher.write_str("smooth_threshold");
@@ -592,7 +551,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             hash_array_view(hasher, p.thresholds.view());
             hasher.write_f64(p.weight);
             hasher.write_f64(p.smoothing_eps);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
         AnalyticPenaltyKind::TotalVariation(p) => {
             hasher.write_str("total-variation");
@@ -602,7 +560,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             hasher.write_f64(p.smoothing_eps);
             hasher.write_bool(p.learnable_weight);
             hasher.write_usize(p.rho_index);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
         AnalyticPenaltyKind::NuclearNorm(p) => {
             hasher.write_str("nuclear-norm");
@@ -619,7 +576,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             }
             hasher.write_bool(p.learnable_weight);
             hasher.write_usize(p.rho_index);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
         AnalyticPenaltyKind::BlockSparsity(p) => {
             hasher.write_str("block-sparsity");
@@ -630,7 +586,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             hasher.write_f64(p.smoothing_eps);
             hasher.write_bool(p.learnable_weight);
             hasher.write_usize(p.rho_index);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
         AnalyticPenaltyKind::MechanismSparsity(p) => {
             hasher.write_str("mechanism-sparsity");
@@ -641,13 +596,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             hasher.write_f64(p.n_eff);
             hasher.write_bool(p.learnable_weight);
             hasher.write_usize(p.rho_index);
-            match &p.weight_schedule {
-                Some(schedule) => {
-                    hasher.write_bool(true);
-                    hash_scalar_weight_schedule(hasher, schedule.as_ref());
-                }
-                None => hasher.write_bool(false),
-            }
         }
         AnalyticPenaltyKind::RowPrecisionPrior(p) => {
             hasher.write_str("row-precision-prior");
@@ -657,7 +605,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             hasher.write_bool(p.learnable_weight);
             hasher.write_usize(p.rho_index);
             hash_psi_slice(hasher, &p.target);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
         AnalyticPenaltyKind::IvaeRidgeMeanGauge(p) => {
             hasher.write_str("ivae-ridge-mean-gauge");
@@ -669,7 +616,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             hasher.write_bool(p.learnable_weight);
             hasher.write_usize(p.rho_index);
             hash_psi_slice(hasher, &p.target);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
         AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => {
             hasher.write_str("parametric-row-precision-prior");
@@ -681,7 +627,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             hasher.write_usize(p.n_eff);
             hasher.write_bool(p.learnable_weight);
             hash_psi_slice(hasher, &p.target);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
         AnalyticPenaltyKind::ScadMcp(p) => {
             hasher.write_str("scad-mcp");
@@ -696,7 +641,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             }
             hasher.write_bool(p.learnable_weight);
             hasher.write_usize(p.rho_index);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
         AnalyticPenaltyKind::BlockOrthogonality(p) => {
             hasher.write_str("block-orthogonality");
@@ -706,7 +650,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             hasher.write_usize(p.n_eff);
             hasher.write_bool(p.learnable_weight);
             hasher.write_usize(p.rho_index);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
         AnalyticPenaltyKind::DecoderIncoherence(p) => {
             hasher.write_str("decoder-incoherence");
@@ -726,7 +669,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             hasher.write_f64(p.weight);
             hasher.write_bool(p.learnable_weight);
             hasher.write_usize(p.rho_index);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
         AnalyticPenaltyKind::Orthogonality(p) => {
             hasher.write_str("orthogonality");
@@ -736,7 +678,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             hasher.write_usize(p.n_eff);
             hasher.write_bool(p.learnable_weight);
             hasher.write_usize(p.rho_index);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
         AnalyticPenaltyKind::NestedPrefix(p) => {
             hasher.write_str("nested-prefix");
@@ -755,7 +696,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             for &idx in &p.rho_indices {
                 hasher.write_usize(idx);
             }
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
         AnalyticPenaltyKind::Monotonicity(p) => {
             hasher.write_str("monotonicity");
@@ -765,7 +705,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             hasher.write_f64(p.smoothing_eps);
             hasher.write_bool(p.learnable_weight);
             hasher.write_usize(p.rho_index);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
         AnalyticPenaltyKind::SheafConsistency(p) => {
             hasher.write_str("sheaf-consistency");
@@ -790,7 +729,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             }
             hasher.write_bool(p.learnable_weight);
             hasher.write_usize(p.rho_index);
-            hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
     }
 }

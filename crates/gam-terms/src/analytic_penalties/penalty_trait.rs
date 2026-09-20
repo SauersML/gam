@@ -121,93 +121,6 @@ pub(crate) fn validated_exp_log_strength(log_strength: f64) -> f64 {
         .expect("analytic-penalty rho must be validated before precision evaluation")
 }
 
-/// Scalar annealing schedule for analytic penalty weights.
-///
-/// This is the penalty-weight analogue of `crate::terms::sae::manifold::GumbelTemperatureSchedule`:
-/// it starts with a weak analytic regularizer and ramps toward the target
-/// weight during REML outer iterations. This follows the standard annealed
-/// regularization pattern in deep learning, where optimization first finds
-/// good fits before stronger structure constrains the solution. It also
-/// addresses the general observation that hand-picked analytic weights
-/// materially affect outcomes — fixed tight auxiliary scales can outperform
-/// learned weights on one dataset and underperform on another. A schedule
-/// side-steps that brittle initial choice by ramping the constraint.
-#[derive(Debug, Clone)]
-pub struct ScalarWeightSchedule {
-    pub w_start: f64,
-    pub w_end: f64,
-    pub kind: ScheduleKind,
-    pub iter_count: usize,
-}
-
-impl ScalarWeightSchedule {
-    #[must_use = "build error must be handled"]
-    pub fn new(w_start: f64, w_end: f64, kind: ScheduleKind) -> Result<Self, String> {
-        let schedule = Self {
-            w_start,
-            w_end,
-            kind,
-            iter_count: 0,
-        };
-        schedule.validate()?;
-        Ok(schedule)
-    }
-
-    pub fn validate(&self) -> Result<(), String> {
-        if !(self.w_start.is_finite() && self.w_start >= 0.0) {
-            return Err(format!(
-                "ScalarWeightSchedule: w_start must be finite and non-negative; got {}",
-                self.w_start
-            ));
-        }
-        if !(self.w_end.is_finite() && self.w_end >= 0.0) {
-            return Err(format!(
-                "ScalarWeightSchedule: w_end must be finite and non-negative; got {}",
-                self.w_end
-            ));
-        }
-        match &self.kind {
-            ScheduleKind::Geometric { rate } => {
-                if !(rate.is_finite() && *rate > 0.0 && *rate < 1.0) {
-                    return Err(format!(
-                        "ScalarWeightSchedule::Geometric: rate must be in (0, 1); got {rate}"
-                    ));
-                }
-            }
-            ScheduleKind::Linear { steps } => {
-                if *steps == 0 {
-                    return Err("ScalarWeightSchedule::Linear: steps must be positive".into());
-                }
-            }
-            ScheduleKind::ReciprocalIter => {}
-        }
-        Ok(())
-    }
-
-    pub fn current_weight(&self, iter: usize) -> f64 {
-        let delta = self.w_end - self.w_start;
-        let raw = match &self.kind {
-            ScheduleKind::Geometric { rate } => self.w_end - delta * rate.powf(iter as f64),
-            ScheduleKind::Linear { steps } => {
-                if iter >= *steps {
-                    self.w_end
-                } else {
-                    let frac = iter as f64 / *steps as f64;
-                    self.w_start + frac * delta
-                }
-            }
-            ScheduleKind::ReciprocalIter => self.w_end - delta / (1.0 + iter as f64),
-        };
-        raw.clamp(self.w_start.min(self.w_end), self.w_start.max(self.w_end))
-    }
-
-    pub fn step(&mut self) -> f64 {
-        let weight = self.current_weight(self.iter_count);
-        self.iter_count += 1;
-        weight
-    }
-}
-
 /// Uniform interface implemented by every analytic penalty in this module.
 ///
 /// `target` is the relevant slice of the β or extension-coordinate vector, viewed as
@@ -369,44 +282,6 @@ pub trait AnalyticPenalty: Send + Sync {
 
     /// Human-readable identifier for diagnostics / logging.
     fn name(&self) -> &str;
-
-    /// Update any attached scalar weight schedule at the given REML outer
-    /// iteration. Penalties without schedules keep their stored weight.
-    fn apply_schedule(&mut self, iter: usize) {
-        // REML outer loops are bounded well below 1,000,000; a value beyond
-        // that cap signals counter corruption rather than a legitimate
-        // iteration count, so refuse to silently accept it.
-        assert!(
-            iter < 1_000_000,
-            "apply_schedule received implausible outer iteration {iter}",
-        );
-    }
-}
-
-/// Emit the standard scalar-weight-schedule builder for a penalty struct whose
-/// scalar weight lives in `$field` and whose schedule lives in
-/// `weight_schedule: Option<ScalarWeightSchedule>`. The builder seeds the
-/// current weight from the schedule and stores the schedule. Invoke inside the
-/// struct's inherent `impl … {}` block.
-macro_rules! impl_with_weight_schedule {
-    ($field:ident) => {
-        /// Attach a scalar weight schedule, seeding the current weight from
-        /// the schedule's stored iteration counter.
-        #[must_use]
-        pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-            self.$field = schedule.current_weight(schedule.iter_count);
-            self.weight_schedule = Some(schedule);
-            self
-        }
-    };
-}
-
-/// Emit the standard [`AnalyticPenalty::apply_schedule`] override for a penalty
-/// whose scalar weight lives in `$field`. Invoke inside the `impl
-/// AnalyticPenalty for …` block.
-macro_rules! impl_scalar_apply_schedule {
-    ($field:ident) => {
-    };
 }
 
 /// Emit the standard learnable-scalar-weight [`AnalyticPenalty::grad_rho`] for a
