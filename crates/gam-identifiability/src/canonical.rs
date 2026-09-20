@@ -1441,19 +1441,22 @@ fn canonicalize_for_identifiability_inner(
                         }
                     }
                 }
-                Err(_) => {
-                    // Fall back: embed the flat design at its native rows.
-                    if let Ok(flat) = spec
-                        .design
-                        .try_to_dense_arc("canonicalize_rank_check")
-                        .map(|a| a.as_ref().clone())
-                    {
-                        for i in 0..n_rows.min(flat.nrows()).min(r_map) {
-                            for j in 0..p_b.min(flat.ncols()) {
-                                j_pre[[i, col_off + j]] = flat[[i, j]];
-                            }
-                        }
-                    }
+                // A refusal here is fatal for the same reason as the stacked
+                // refusal above (gam#2465). A block's callback exists because
+                // its flat `design` is not its geometry (a bounded term's
+                // design column is a zeroed placeholder), and a block without
+                // a callback would only retry the densify that just failed.
+                // Either substitute puts a false null direction into `JᵀWJ`,
+                // so the check would run on a geometry the solver never fits.
+                Err(reason) => {
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "canonicalize_for_identifiability_with_operating_scalars: the MAP-uniqueness \
+                             check could not evaluate the effective Jacobian of block '{}', so its \
+                             column span cannot be seen: {reason}",
+                            spec.name,
+                        ),
+                    });
                 }
             }
             col_off += p_b;

@@ -777,3 +777,76 @@ fn penalty_covered_competing_risks_redundancy_canonicalises_cleanly_1590() {
         "#1590 multi-channel canonicalization: raw_width=8 raw_rank=6 retained_width={reduced_width} retained_rank=6"
     );
 }
+
+/// A two-channel callback that evaluates only at a supplied operating point, as a
+/// family whose effective Jacobian needs its current family scalars does.
+struct OperatingPointOnlyTwoChannelJacobian {
+    full: Array2<f64>,
+    n: usize,
+}
+
+impl BlockEffectiveJacobian for OperatingPointOnlyTwoChannelJacobian {
+    fn effective_jacobian_rows(
+        &self,
+        state: &FamilyLinearizationState<'_>,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, String> {
+        if state.family_scalars.is_none() {
+            return Err("fixture Jacobian requires the operating point".into());
+        }
+        let end = rows.end.min(self.n);
+        if rows.start > end {
+            return Err("fixture row range is reversed or out of bounds".into());
+        }
+        let width = end - rows.start;
+        let mut output = Array2::zeros((2 * width, self.full.ncols()));
+        for channel in 0..2 {
+            output
+                .slice_mut(s![channel * width..(channel + 1) * width, ..])
+                .assign(&self.full.slice(s![
+                    channel * self.n + rows.start..channel * self.n + end,
+                    ..
+                ]));
+        }
+        Ok(output)
+    }
+
+    fn n_outputs(&self) -> usize {
+        2
+    }
+}
+
+/// The MAP-uniqueness check must see each block's effective Jacobian, so a callback it
+/// cannot evaluate is refused with the callback's reason. It must not be replaced by the
+/// block's flat design, which is not the block's geometry.
+#[test]
+fn map_uniqueness_check_refuses_an_unevaluable_effective_jacobian() {
+    let n = 64;
+    let basis = legendre_columns(n, 4);
+    let specs: Vec<_> = (0..2)
+        .map(|block| {
+            let full = Array2::from_shape_fn((2 * n, 2), |(row, column)| {
+                basis[[row % n, 2 * block + column]]
+            });
+            let mut spec = spec_from_dense(
+                &format!("surface_{}", block + 1),
+                full.slice(s![..n, ..]).to_owned(),
+            );
+            spec.jacobian_callback =
+                Some(Arc::new(OperatingPointOnlyTwoChannelJacobian { full, n }));
+            spec
+        })
+        .collect();
+    let err = canonicalize_for_identifiability_with_operating_scalars(
+        &specs,
+        &[CoefficientCoordinate::Spanning; 2],
+        Some(operating_point(vec![vec![1.0; 2], vec![1.0; 2]], false)),
+    )
+    .expect_err("a block Jacobian the MAP-uniqueness check cannot evaluate must be refused");
+    let text = format!("{err:?}");
+    assert!(
+        text.contains("could not evaluate the effective Jacobian of block 'surface_1'")
+            && text.contains("fixture Jacobian requires the operating point"),
+        "the refusal must name the block and carry the callback's reason: {text}"
+    );
+}
