@@ -469,23 +469,27 @@ mod cuda {
     // -----------------------------------------------------------------------
 
     /// Solve `A x = b` using an fp32 Cholesky factorization with up to
-    /// `max_steps` fp64-residual iterative refinement corrections.
+    /// [`super::refinement_step_budget`] fp64-residual iterative refinement
+    /// corrections.
     ///
     /// # Algorithm
     ///
     /// 1. Cast `A` (f64) to f32 on device. Factor in fp32 (POTRF).
     /// 2. Cast `b` (f64) to f32. Solve `A x = b` in fp32 (POTRS). Lift `x`
     ///    to f64.
-    /// 3. `r = b − A·x` accumulated in fp64 (cuBLAS Dgemv). Stop with `x` once
+    /// 3. `r = b − A·x` accumulated in fp64 (cuBLAS Dgemv), then
+    ///    `refine_to_certificate`: corrections (cast `r` to f32, solve
+    ///    `A e = r` in fp32, `x += e` in f64, recompute the fp64 residual),
+    ///    each judged by [`super::refinement_verdict`], until
     ///    `‖r‖ ≤ γ_{p+1}·(‖A‖_F‖x‖ + ‖b‖)`, the residual's own rounding band.
-    /// 4. Otherwise cast `r` to f32, solve `A e = r` in fp32, `x += e` (f64),
-    ///    and judge the new residual by [`super::refinement_verdict`].
+    /// 4. Return `x` only when that certificate holds.
     ///
-    /// `Ok` is returned only for an `x` whose residual met the band. Returns
-    /// `Err` when the fp32 POTRF fails (not SPD at f32), when the residual
-    /// does not decrease (κ(A)·u_f32 ≥ 1 regime), or when the band cannot be
-    /// reached within [`super::refinement_step_budget`]. Callers fall back to
-    /// the fp64 factorization on `Err`.
+    /// Returns `Err` when the fp32 POTRF fails (not SPD at f32), when the
+    /// residual does not decrease (κ(A)·u_f32 ≥ 1 regime), or when the band
+    /// cannot be reached within [`super::refinement_step_budget`] corrections,
+    /// the most that cost no more than the fp64 factorization. `Ok` therefore
+    /// always carries a solution whose fp64 residual is inside its own
+    /// rounding. Callers use fp64 POTRF on `Err`.
     pub(super) fn iterative_refinement_solve_impl(
         hessian: ArrayView2<'_, f64>,
         rhs: &[f64],
@@ -523,6 +527,7 @@ mod cuda {
             .map_err(|e| format!("download f32 x: {e}"))?;
         let mut x: Vec<f64> = x_f32.iter().map(|&v| v as f64).collect();
 
+        let max_steps = super::refinement_step_budget(p);
         let norm_b = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
         // Refinement has converged once the fp64 residual `b − A·x` is inside its own
         // rounding: each component is a `p`-term inner product and a subtraction, so it
@@ -534,63 +539,178 @@ mod cuda {
             growth * (hessian_frobenius * x.iter().map(|v| v * v).sum::<f64>().sqrt() + norm_b)
         };
 
-        let mut x_dev_f64 = pinned_htod(&stream, &x).map_err(|e| format!("upload f64 x: {e}"))?;
+        let x_dev_f64 = pinned_htod(&stream, &x).map_err(|e| format!("upload f64 x: {e}"))?;
         let (r0, norm_r0) = residual_norm_and_vec(&blas, &stream, p, &a_dev_f64, &x_dev_f64, rhs)?;
 
-        // Early exit: already converged after initial solve.
-        if norm_r0 <= attainable(&x) {
-            return Ok(ndarray::Array1::from_vec(x));
-        }
+        refine_to_certificate(
+            &mut x,
+            r0,
+            norm_r0,
+            max_steps,
+            attainable,
+            |r| {
+                // Cast residual to f32, solve A e = r with the fp32 factor, lift e to f64.
+                let r_f32: Vec<f32> = r.iter().map(|&v| v as f32).collect();
+                let mut e_dev_f32 = pinned_htod(&stream, &r_f32)
+                    .map_err(|e| format!("upload f32 residual: {e}"))?;
+                spotrs_in_place(&solver, &stream, p, 1, &a_dev_f32, &mut e_dev_f32)?;
+                let e_f32 = stream
+                    .clone_dtoh(&e_dev_f32)
+                    .map_err(|e| format!("download f32 e: {e}"))?;
+                Ok(e_f32.iter().map(|&v| v as f64).collect())
+            },
+            |x| {
+                let x_dev =
+                    pinned_htod(&stream, x).map_err(|e| format!("upload refined x: {e}"))?;
+                residual_norm_and_vec(&blas, &stream, p, &a_dev_f64, &x_dev, rhs)
+            },
+        )?;
 
-        let budget = super::refinement_step_budget(p);
-        if budget == 0 {
+        Ok(ndarray::Array1::from_vec(x))
+    }
+
+    /// Drive fp32-factor iterative refinement of `x` until its fp64 residual is
+    /// certified, or report why it cannot be.
+    ///
+    /// `r`/`norm_r` are the fp64 residual `b − A·x` of the incoming `x` and its
+    /// 2-norm. `attainable(x)` is the residual's own rounding band
+    /// `γ_{p+1}·(‖A‖_F‖x‖ + ‖b‖)`; `correct(r)` solves `A e = r` with the fp32
+    /// factor; `residual(x)` recomputes `b − A·x` in fp64.
+    ///
+    /// With a fixed fp32 factor the refinement contracts the error LINEARLY, by
+    /// about `κ(A)·u_f32` per correction, so reaching the band may need more
+    /// corrections than `max_steps` allows. Each correction is judged by
+    /// [`super::refinement_verdict`], which refuses as soon as the measured
+    /// contraction predicts the band past `max_steps`, so a budget that cannot
+    /// certify is an `Err`, never an uncertified `Ok`: `Ok(())` means the final
+    /// residual is inside its rounding band. A correction that does not reduce
+    /// the residual (the `κ(A)·u_f32 ≥ 1` regime, where the fp32 factor cannot
+    /// contract) is also an `Err`.
+    fn refine_to_certificate(
+        x: &mut [f64],
+        mut r: Vec<f64>,
+        mut norm_r: f64,
+        max_steps: usize,
+        attainable: impl Fn(&[f64]) -> f64,
+        mut correct: impl FnMut(&[f64]) -> Result<Vec<f64>, String>,
+        mut residual: impl FnMut(&[f64]) -> Result<(Vec<f64>, f64), String>,
+    ) -> Result<(), String> {
+        let mut band = attainable(&*x);
+        if norm_r <= band {
+            return Ok(());
+        }
+        if max_steps == 0 {
             return Err(format!(
-                "iterative refinement: fp32 solve residual {norm_r0:.3e} is above its rounding \
-                 band {:.3e} and no correction at p = {p} costs less than the fp64 factorization",
-                attainable(&x)
+                "iterative refinement: fp32 solve residual {norm_r:.3e} is above its rounding \
+                 band {band:.3e} and no correction costs less than the fp64 factorization"
             ));
         }
-        let mut r = r0;
-        let mut prev_norm_r = norm_r0;
         let mut steps = 0usize;
-
         loop {
-            // Cast residual to f32, solve A e = r in fp32.
-            let r_f32: Vec<f32> = r.iter().map(|&v| v as f32).collect();
-            let mut e_dev_f32 =
-                pinned_htod(&stream, &r_f32).map_err(|e| format!("upload f32 residual: {e}"))?;
-            spotrs_in_place(&solver, &stream, p, 1, &a_dev_f32, &mut e_dev_f32)?;
-
-            // x += e in f64.
-            let e_f32 = stream
-                .clone_dtoh(&e_dev_f32)
-                .map_err(|e| format!("download f32 e: {e}"))?;
-            for (xi, ei) in x.iter_mut().zip(e_f32.iter()) {
-                *xi += *ei as f64;
+            let e = correct(r.as_slice())?;
+            for (xi, ei) in x.iter_mut().zip(e.iter()) {
+                *xi += *ei;
             }
-
-            // Reupload x_dev_f64 and compute new residual.
-            x_dev_f64 = pinned_htod(&stream, &x).map_err(|e| format!("upload refined x: {e}"))?;
-            let (r_new, norm_r_new) =
-                residual_norm_and_vec(&blas, &stream, p, &a_dev_f64, &x_dev_f64, rhs)?;
-
+            let (r_new, norm_r_new) = residual(&*x)?;
             steps += 1;
-            match super::refinement_verdict(
-                prev_norm_r,
-                norm_r_new,
-                attainable(&x),
-                steps,
-                budget,
-            ) {
-                super::RefinementVerdict::Converged => return Ok(ndarray::Array1::from_vec(x)),
+            band = attainable(&*x);
+            match super::refinement_verdict(norm_r, norm_r_new, band, steps, max_steps) {
+                super::RefinementVerdict::Converged => return Ok(()),
                 super::RefinementVerdict::Continue => {
-                    prev_norm_r = norm_r_new;
                     r = r_new;
+                    norm_r = norm_r_new;
                 }
                 super::RefinementVerdict::Refuse(reason) => {
-                    return Err(format!("iterative refinement at p = {p}: {reason}"));
+                    return Err(format!("iterative refinement: {reason}"));
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod refine_to_certificate_tests {
+        use super::refine_to_certificate;
+
+        // A = diag(1, 2, 3, 4), b = 1. The residual is evaluated exactly as
+        // b − A∘x, and the "fp32 factor" is modelled as a solve whose error
+        // contracts by a fixed ratio ρ per correction: e = (1 − ρ)·r / a.
+        const A: [f64; 4] = [1.0, 2.0, 3.0, 4.0];
+        const B: [f64; 4] = [1.0, 1.0, 1.0, 1.0];
+
+        fn residual(x: &[f64]) -> Result<(Vec<f64>, f64), String> {
+            let r: Vec<f64> = B
+                .iter()
+                .zip(A.iter())
+                .zip(x)
+                .map(|((b, a), x)| b - a * x)
+                .collect();
+            let n = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+            Ok((r, n))
+        }
+
+        fn attainable(x: &[f64]) -> f64 {
+            let p = A.len();
+            let a_frob = A.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let norm_x = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let norm_b = B.iter().map(|v| v * v).sum::<f64>().sqrt();
+            gam_linalg::roundoff::accumulation_growth(p + 1) * (a_frob * norm_x + norm_b)
+        }
+
+        fn run(rho: f64, max_steps: usize) -> (Vec<f64>, Result<(), String>) {
+            let mut x = vec![0.0; A.len()];
+            let (r0, n0) = residual(&x).unwrap();
+            let out = refine_to_certificate(
+                &mut x,
+                r0,
+                n0,
+                max_steps,
+                attainable,
+                |r| {
+                    Ok(r.iter()
+                        .zip(A.iter())
+                        .map(|(ri, ai)| (1.0 - rho) * ri / ai)
+                        .collect())
+                },
+                residual,
+            );
+            (x, out)
+        }
+
+        /// Regression for #3547: a slowly contracting factor (ρ = 0.5, i.e. the
+        /// large-κ regime) leaves the residual far above its rounding band after
+        /// the step budget. That must be an `Err`, not an uncertified `Ok`.
+        #[test]
+        fn refine_exhausted_budget_is_an_error_not_an_uncertified_solution() {
+            let (x, out) = run(0.5, 3);
+            let (_, norm_r) = residual(&x).unwrap();
+            assert!(
+                norm_r > attainable(&x),
+                "precondition: band not reached ({norm_r:e})"
+            );
+            let err = out.expect_err("uncertified refinement must not return Ok");
+            assert!(err.contains("rounding band"), "unexpected error: {err}");
+        }
+
+        /// A fast-contracting factor certifies within the budget and the
+        /// returned `x` then solves the system to rounding.
+        #[test]
+        fn refine_certifies_when_contraction_is_fast() {
+            let (x, out) = run(1e-8, 3);
+            out.expect("fast contraction must certify");
+            let (_, norm_r) = residual(&x).unwrap();
+            assert!(norm_r <= attainable(&x));
+            for (xi, (b, a)) in x.iter().zip(B.iter().zip(A.iter())) {
+                assert!((xi - b / a).abs() <= 1e-14, "x = {xi}, want {}", b / a);
+            }
+        }
+
+        /// A correction that over-shoots (ρ = −2, so ‖r‖ doubles) is the
+        /// κ(A)·u_f32 ≥ 1 regime and must be reported, not iterated.
+        #[test]
+        fn refine_non_decreasing_residual_is_an_error() {
+            let (_, out) = run(-2.0, 3);
+            let err = out.expect_err("non-contracting refinement must not return Ok");
+            assert!(err.contains("not decreasing"), "unexpected error: {err}");
         }
     }
 

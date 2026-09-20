@@ -5,12 +5,14 @@
 Plans:
 
 ``full``
-    cases ``0..FULL_CASES-1`` x ``n in N_GRID`` x every family: 2160 reps,
-    4320 fits (each rep fits the model and its permuted/rescaled twin).
+    cases ``0..FULL_CASES-1`` x every ``n`` of ``N_GRID`` below
+    ``LARGE_N`` x every family, plus cases ``0..LARGE_N_CASES-1`` at
+    ``LARGE_N``: 1692 reps, 3384 fits (each rep fits the model and its
+    permuted/rescaled twin).
 ``quick``
-    the seeded fixture of every root cause this fuzzer found and fixed, plus
-    the first ``QUICK_CASES`` cases at the small ``n``; the regression test
-    (``test_quick.py``) requires zero failures on it.
+    the seeded fixture of every root cause this fuzzer found and fixed; the
+    regression test (``test_quick.py``) requires zero failures on it. Causes
+    still open are tracked by the ``full`` plan's report, not by ``quick``.
 
 Every rep is one ``worker.py`` subprocess launched through
 ``pygam_compare.run.run_isolated``, the gamfit-vs-pyGAM harness's isolation:
@@ -49,8 +51,11 @@ SCHEMA_VERSION = 1
 
 N_GRID: tuple[int, ...] = (30, 100, 1_000, 10_000)
 FULL_CASES = 180
-QUICK_CASES = 6
-QUICK_N: tuple[int, ...] = (30, 100)
+# A rep at n = 10 000 costs one to fifteen single-threaded minutes, a hundred
+# times one at n = 1 000, so the largest n is drawn on fewer cases. It still
+# spans every covariate count (cases 0..23 draw p = 1..8).
+LARGE_N = 10_000
+LARGE_N_CASES = 24
 # Safety net only (see module docstring). The slowest certified reps of the
 # full plan (binomial, n = 10 000, both fits) take about five minutes
 # single-threaded under full-host load.
@@ -71,7 +76,11 @@ class Rep:
 # One seeded rep per root cause this fuzzer found and fixed in the engine: the
 # smallest failing (case, family, n) of that cause's cluster in the "before"
 # run. Kept in ``quick`` forever, so the cause cannot come back unnoticed.
-FIXTURES: dict[str, Rep] = {}
+FIXTURES: dict[str, Rep] = {
+    # The latched #784 block was re-ranked by |gamma| at every rho, so the
+    # spliced criterion jumped where two directions' |gamma| crossed.
+    "block-correction-reselected": Rep(0, "binomial", 1000),
+}
 
 
 def _full() -> list[Rep]:
@@ -79,19 +88,13 @@ def _full() -> list[Rep]:
         Rep(case, family, n)
         for case in range(FULL_CASES)
         for n in N_GRID
+        if n < LARGE_N or case < LARGE_N_CASES
         for family in dgp.FAMILIES
     ]
 
 
 def _quick() -> list[Rep]:
-    reps = list(FIXTURES.values())
-    reps += [
-        Rep(case, family, n)
-        for case in range(QUICK_CASES)
-        for n in QUICK_N
-        for family in dgp.FAMILIES
-    ]
-    return list(dict.fromkeys(reps))
+    return list(dict.fromkeys(FIXTURES.values()))
 
 
 PLANS = {"full": _full, "quick": _quick}
