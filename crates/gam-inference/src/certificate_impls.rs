@@ -8,7 +8,7 @@
 //! (`OuterCriterionCertificate`, `CoresetCertificate`, `CollapseEvent`) carry
 //! their impls in
 //! [`gam_solve::inference::certificate_impls`]; the gam-sae-owned certificates
-//! (`ResidualGaugeReport`, `CertificateInputs`) carry theirs in
+//! (`ResidualGaugeReport` and the chart certificates) carry theirs in
 //! `gam_sae::certificate_impls`. The bodies moved byte-identically, so there
 //! remains exactly one source of truth for each verdict.
 
