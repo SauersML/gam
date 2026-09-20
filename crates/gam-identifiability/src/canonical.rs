@@ -51,7 +51,8 @@ use crate::audit::{
     priority_tiered_rank_from_gram, rank_of_gram,
 };
 use crate::families::compiler::{
-    IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks, symmetric_sqrt_into,
+    CompilerError, IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks,
+    symmetric_sqrt_into,
 };
 use gam_linalg::faer_ndarray::{
     default_rrqr_rank_alpha, fast_ata, fast_atb, rrqr_with_permutation,
@@ -253,7 +254,7 @@ impl RowJacobianOperator for BlockJacobianAsRowOp {
         }
         out
     }
-    fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Array2<f64> {
+    fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Result<Array2<f64>, CompilerError> {
         let n = self.nrows();
         let p = self.ncols();
         let k = self.k();
@@ -273,7 +274,12 @@ impl RowJacobianOperator for BlockJacobianAsRowOp {
                         h_i[[a, b]] = h_full[[row, a, b]];
                     }
                 }
-                symmetric_sqrt_into(&h_i, &mut sqrt_h);
+                symmetric_sqrt_into(&h_i, &mut sqrt_h).map_err(|reason| {
+                    CompilerError::LinalgFailure(format!(
+                        "BlockJacobianAsRowOp block '{}' row {row}: {reason}",
+                        self.block_name
+                    ))
+                })?;
                 for ch in 0..k {
                     let dst = row * k + ch;
                     for col in 0..p {
@@ -286,7 +292,7 @@ impl RowJacobianOperator for BlockJacobianAsRowOp {
                 }
             }
         }
-        out
+        Ok(out)
     }
     fn channel_flattened_column(&self, col: usize, out: &mut [f64]) {
         let n = self.nrows();

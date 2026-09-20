@@ -14,7 +14,9 @@
 
 use ndarray::{Array1, Array2, Array3};
 
-use crate::families::compiler::{RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with};
+use crate::families::compiler::{
+    CompilerError, RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
+};
 use gam_problem::FamilyChannelHessian;
 
 /// Row Hessian for Bernoulli's K=1 row primary state. The "Hessian" is the
@@ -142,7 +144,7 @@ impl RowJacobianOperator for BernoulliDenseDesignOperator {
         }
         out
     }
-    fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Array2<f64> {
+    fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Result<Array2<f64>, CompilerError> {
         // K=1: the only channel is `δη = design.row(i)·δβ`. Scale straight from
         // the stored `(n, p)` design rather than reshaping it into a `(n, p, 1)`
         // tensor first. (#738: a capability is not a representation.)
