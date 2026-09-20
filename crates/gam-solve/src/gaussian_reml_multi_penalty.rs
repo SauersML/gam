@@ -69,10 +69,12 @@ use gam_linalg::faer_ndarray::{
 };
 use gam_linalg::matrix::array2_bits_fingerprint;
 use gam_linalg::roundoff::{
-    FactorRankPartition, UNIT_ROUNDOFF, accumulation_growth, compensated_band, factor_rank_partition,
-    factor_singular_band, resolved_eigenvalue_count, symmetric_spectrum_rounding_band,
+    FactorRankPartition, UNIT_ROUNDOFF, accumulation_growth, compensated_band,
+    factor_rank_partition, factor_singular_band, resolved_eigenvalue_count,
+    symmetric_spectrum_rounding_band,
 };
-use gam_linalg::utils::{KahanSum, validate_finite_symmetric_matrix};
+use gam_linalg::utils::validate_finite_symmetric_matrix;
+use gam_math::sparse_grid::CompensatedSum;
 use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -282,15 +284,17 @@ struct StackedProjection {
 }
 
 fn frobenius(matrix: ArrayView2<'_, f64>) -> f64 {
-    let mut sum = KahanSum::default();
+    let mut sum = CompensatedSum::default();
     for &value in matrix {
         sum.add(value * value);
     }
-    sum.sum().sqrt()
+    sum.value().sqrt()
 }
 
 fn faer_to_array(matrix: faer::MatRef<'_, f64>) -> Array2<f64> {
-    Array2::from_shape_fn((matrix.nrows(), matrix.ncols()), |(row, col)| matrix[(row, col)])
+    Array2::from_shape_fn((matrix.nrows(), matrix.ncols()), |(row, col)| {
+        matrix[(row, col)]
+    })
 }
 
 impl GaussianRemlMultiPenaltyProblem {
@@ -326,7 +330,9 @@ impl GaussianRemlMultiPenaltyProblem {
     /// caller that knows its null space declares it instead.
     pub fn structural_nullity(penalties: &[Array2<f64>]) -> Result<usize, EstimationError> {
         let Some(first) = penalties.first() else {
-            crate::bail_invalid_estim!("multi-penalty Gaussian REML structural nullity needs at least one penalty");
+            crate::bail_invalid_estim!(
+                "multi-penalty Gaussian REML structural nullity needs at least one penalty"
+            );
         };
         let p = first.nrows();
         Ok(p - Self::penalty_structure(penalties, p)?.partition.rank)
@@ -335,7 +341,10 @@ impl GaussianRemlMultiPenaltyProblem {
     /// Read each penalty's root off its own spectrum above [`symmetric_spectrum_rounding_band`], and partition the
     /// stacked unit-norm roots by [`factor_rank_partition`]: the one rank predicate construction and
     /// [`Self::structural_nullity`] share.
-    fn penalty_structure(penalties: &[Array2<f64>], p: usize) -> Result<PenaltyStructure, EstimationError> {
+    fn penalty_structure(
+        penalties: &[Array2<f64>],
+        p: usize,
+    ) -> Result<PenaltyStructure, EstimationError> {
         let mut roots = Vec::with_capacity(penalties.len());
         let mut penalty_rounding = Vec::with_capacity(penalties.len());
         let mut pseudo_penalty_rounding = Vec::with_capacity(penalties.len());
@@ -367,7 +376,9 @@ impl GaussianRemlMultiPenaltyProblem {
                     "multi-penalty Gaussian REML penalty {k} has no eigenvalue above its rounding band"
                 );
             }
-            let norm = spectrum.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+            let norm = spectrum
+                .iter()
+                .fold(0.0_f64, |acc, value| acc.max(value.abs()));
             let mut root = Array2::<f64>::zeros((rank, p));
             for (row, index) in (0..p).filter(|&index| spectrum[index] > band).enumerate() {
                 let scale = spectrum[index].sqrt();
@@ -432,7 +443,9 @@ impl GaussianRemlMultiPenaltyProblem {
             );
         }
         if x.iter().chain(y.iter()).any(|value| !value.is_finite()) {
-            crate::bail_invalid_estim!("multi-penalty Gaussian REML design and responses must be finite");
+            crate::bail_invalid_estim!(
+                "multi-penalty Gaussian REML design and responses must be finite"
+            );
         }
         let (support, observation_measure, observation_measure_roundoff) = match weights {
             None => (None, 0.0, 0.0),
@@ -443,11 +456,16 @@ impl GaussianRemlMultiPenaltyProblem {
                         weights.len()
                     );
                 }
-                if weights.iter().any(|weight| !(weight.is_finite() && *weight >= 0.0)) {
-                    crate::bail_invalid_estim!("multi-penalty Gaussian REML weights must be finite and non-negative");
+                if weights
+                    .iter()
+                    .any(|weight| !(weight.is_finite() && *weight >= 0.0))
+                {
+                    crate::bail_invalid_estim!(
+                        "multi-penalty Gaussian REML weights must be finite and non-negative"
+                    );
                 }
                 let kept: Vec<usize> = (0..rows).filter(|&row| weights[row] > 0.0).collect();
-                let mut log_det = KahanSum::default();
+                let mut log_det = CompensatedSum::default();
                 let mut magnitude = 0.0;
                 for &row in &kept {
                     let term = weights[row].ln();
@@ -460,7 +478,11 @@ impl GaussianRemlMultiPenaltyProblem {
                     root_weights: kept.iter().map(|&row| weights[row].sqrt()).collect(),
                     rows: kept,
                 };
-                (Some(support), -scale * log_det.sum(), scale * compensated_band(3, magnitude))
+                (
+                    Some(support),
+                    -scale * log_det.value(),
+                    scale * compensated_band(3, magnitude),
+                )
             }
         };
         let design_fingerprint = array2_bits_fingerprint(&x);
@@ -476,7 +498,9 @@ impl GaussianRemlMultiPenaltyProblem {
         };
         let n = x.nrows();
         if n == 0 {
-            crate::bail_invalid_estim!("weighted multi-penalty Gaussian REML needs at least one positive-weight row");
+            crate::bail_invalid_estim!(
+                "weighted multi-penalty Gaussian REML needs at least one positive-weight row"
+            );
         }
 
         let PenaltyStructure {
@@ -523,9 +547,8 @@ impl GaussianRemlMultiPenaltyProblem {
         }
         let mut rotated = faer::Mat::<f64>::from_fn(n, m, |row, col| y[[row, col]]);
         design_qr.apply_transpose_on_the_left(rotated.as_mut());
-        let rotated_head =
-            Array2::from_shape_fn((head_rows, m), |(row, col)| rotated[(row, col)]);
-        let mut tail = KahanSum::default();
+        let rotated_head = Array2::from_shape_fn((head_rows, m), |(row, col)| rotated[(row, col)]);
+        let mut tail = CompensatedSum::default();
         for col in 0..m {
             for row in head_rows..n {
                 tail.add(rotated[(row, col)] * rotated[(row, col)]);
@@ -562,7 +585,7 @@ impl GaussianRemlMultiPenaltyProblem {
             design_upper,
             rotated_head,
             compressed_head,
-            unpenalized_residual: tail.sum(),
+            unpenalized_residual: tail.value(),
             penalties: penalties.to_vec(),
             roots,
             penalty_rounding,
@@ -593,11 +616,15 @@ impl GaussianRemlMultiPenaltyProblem {
         // whole domain; an interpolated response has no finite profiled dispersion and is refused.
         // This is the evaluator's own predicate (`q > δq`). The refusal names the pooled residual over every column
         // (`output` 0) at the lower corner, whose smallest coordinate the scalar `rho` field carries.
-        let (residual, residual_roundoff) = problem.residual_quadratic_at(problem.rho_lower.view())?;
+        let (residual, residual_roundoff) =
+            problem.residual_quadratic_at(problem.rho_lower.view())?;
         if !(residual > residual_roundoff) {
             return Err(EstimationError::ProfiledResidualUnresolved {
                 output: 0,
-                rho: problem.rho_lower.iter().fold(f64::INFINITY, |acc, value| acc.min(*value)),
+                rho: problem
+                    .rho_lower
+                    .iter()
+                    .fold(f64::INFINITY, |acc, value| acc.min(*value)),
                 residual,
                 resolution: residual_roundoff,
                 ywy: problem.response_frobenius * problem.response_frobenius,
@@ -608,7 +635,10 @@ impl GaussianRemlMultiPenaltyProblem {
         Ok(problem)
     }
 
-    fn stacked_root_factor(&self, rho: ArrayView1<'_, f64>) -> Result<StackedRootFactor, EstimationError> {
+    fn stacked_root_factor(
+        &self,
+        rho: ArrayView1<'_, f64>,
+    ) -> Result<StackedRootFactor, EstimationError> {
         if rho.len() != self.penalties.len() {
             crate::bail_invalid_estim!(
                 "multi-penalty Gaussian REML expects {} log-strengths, got {}",
@@ -627,7 +657,8 @@ impl GaussianRemlMultiPenaltyProblem {
             .zip(lambdas.iter())
             .map(|(root, &lambda)| root.mapv(|value| lambda.sqrt() * value))
             .collect();
-        let rows = self.design_upper.nrows() + scaled_roots.iter().map(Array2::nrows).sum::<usize>();
+        let rows =
+            self.design_upper.nrows() + scaled_roots.iter().map(Array2::nrows).sum::<usize>();
         let mut stacked = faer::Mat::<f64>::zeros(rows, p);
         let mut offset = 0;
         for block in std::iter::once(&self.design_upper).chain(scaled_roots.iter()) {
@@ -638,7 +669,7 @@ impl GaussianRemlMultiPenaltyProblem {
             }
             offset += block.nrows();
         }
-        let mut energy = KahanSum::default();
+        let mut energy = CompensatedSum::default();
         for col in 0..p {
             for row in 0..rows {
                 energy.add(stacked[(row, col)] * stacked[(row, col)]);
@@ -646,9 +677,11 @@ impl GaussianRemlMultiPenaltyProblem {
         }
         let qr = HouseholderQr::new(stacked.as_ref());
         let upper = qr.r().to_owned();
-        if (0..p).any(|index| !(upper[(index, index)].is_finite() && upper[(index, index)] != 0.0)) {
+        if (0..p).any(|index| !(upper[(index, index)].is_finite() && upper[(index, index)] != 0.0))
+        {
             return Err(EstimationError::TrialPointRefused {
-                reason: "multi-penalty Gaussian REML penalized normal matrix is singular at this ρ".to_string(),
+                reason: "multi-penalty Gaussian REML penalized normal matrix is singular at this ρ"
+                    .to_string(),
             });
         }
         let penalty_rounding = self
@@ -663,7 +696,7 @@ impl GaussianRemlMultiPenaltyProblem {
             qr,
             upper,
             rows,
-            frobenius: energy.sum().sqrt(),
+            frobenius: energy.value().sqrt(),
             penalty_rounding,
             rotation_growth: accumulation_growth(rows.saturating_mul(p)),
         })
@@ -679,7 +712,7 @@ impl GaussianRemlMultiPenaltyProblem {
             }
         }
         factor.qr.apply_transpose_on_the_left(target.as_mut());
-        let mut tail = KahanSum::default();
+        let mut tail = CompensatedSum::default();
         for col in 0..columns {
             for row in p..factor.rows {
                 tail.add(target[(row, col)] * target[(row, col)]);
@@ -687,7 +720,7 @@ impl GaussianRemlMultiPenaltyProblem {
         }
         StackedProjection {
             head: faer::Mat::<f64>::from_fn(p, columns, |row, col| target[(row, col)]),
-            tail_energy: tail.sum(),
+            tail_energy: tail.value(),
         }
     }
 
@@ -701,14 +734,22 @@ impl GaussianRemlMultiPenaltyProblem {
     }
 
     /// `(q, bound on |δq|)` at `ρ`; the bound is the residual term of [`Self::evaluate`].
-    fn residual_quadratic_at(&self, rho: ArrayView1<'_, f64>) -> Result<(f64, f64), EstimationError> {
+    fn residual_quadratic_at(
+        &self,
+        rho: ArrayView1<'_, f64>,
+    ) -> Result<(f64, f64), EstimationError> {
         let factor = self.stacked_root_factor(rho)?;
         let projection = self.project(&factor, self.compressed_head.view());
         let fitted = Self::solve_upper(&factor, projection.head);
         let residual = self.unpenalized_residual + projection.tail_energy;
         Ok((
             residual,
-            self.residual_roundoff(&factor, residual, projection.tail_energy, frobenius(fitted.view())),
+            self.residual_roundoff(
+                &factor,
+                residual,
+                projection.tail_energy,
+                frobenius(fitted.view()),
+            ),
         ))
     }
 
@@ -722,7 +763,8 @@ impl GaussianRemlMultiPenaltyProblem {
         coefficient_frobenius: f64,
     ) -> f64 {
         let rotation = self.design_rotation_growth + factor.rotation_growth;
-        let perturbation = rotation * (self.response_frobenius + factor.frobenius * coefficient_frobenius)
+        let perturbation = rotation
+            * (self.response_frobenius + factor.frobenius * coefficient_frobenius)
             + self.compression_growth * self.response_frobenius;
         2.0 * residual.sqrt() * perturbation
             + perturbation * perturbation
@@ -762,22 +804,28 @@ impl GaussianRemlMultiPenaltyProblem {
         let inverse_trace = frobenius(inverse.view()).powi(2);
         let rotation = self.design_rotation_growth + factor.rotation_growth;
 
-        let mut log_det = KahanSum::default();
+        let mut log_det = CompensatedSum::default();
         let mut log_det_magnitude = 0.0;
         for index in 0..p {
             let term = 2.0 * factor.upper[(index, index)].abs().ln();
             log_det.add(term);
             log_det_magnitude += term.abs();
         }
-        let log_det_normal = log_det.sum();
+        let log_det_normal = log_det.value();
         let log_det_normal_roundoff = 2.0 * inverse_trace.sqrt() * rotation * factor.frobenius
             + inverse_trace * factor.penalty_rounding
             + accumulation_growth(p) * log_det_magnitude;
 
-        let shrink: Vec<Array2<f64>> =
-            factor.scaled_roots.iter().map(|root| fast_ab(root, &inverse)).collect();
-        let moved: Vec<Array2<f64>> =
-            factor.scaled_roots.iter().map(|root| fast_ab(root, &fitted)).collect();
+        let shrink: Vec<Array2<f64>> = factor
+            .scaled_roots
+            .iter()
+            .map(|root| fast_ab(root, &inverse))
+            .collect();
+        let moved: Vec<Array2<f64>> = factor
+            .scaled_roots
+            .iter()
+            .map(|root| fast_ab(root, &fitted))
+            .collect();
         let adjoint: Vec<Array2<f64>> = shrink
             .iter()
             .zip(moved.iter())
@@ -881,7 +929,8 @@ impl GaussianRemlMultiPenaltyProblem {
             && reml_hessian.iter().all(|value| value.is_finite()))
         {
             return Err(EstimationError::TrialPointRefused {
-                reason: "multi-penalty Gaussian REML evaluation produced a non-finite value".to_string(),
+                reason: "multi-penalty Gaussian REML evaluation produced a non-finite value"
+                    .to_string(),
             });
         }
         Ok(GaussianRemlMultiPenaltyEvaluation {
@@ -907,7 +956,10 @@ impl GaussianRemlMultiPenaltyProblem {
 
     /// Per-column coefficients `B̂` (`p × m`) at `ρ`, with a first-order bound on `‖δB̂‖_F` from the least-squares
     /// perturbation `δB = A⁺(ΔY − ΔA·B̂) + K⁻¹ΔAᵀr − K⁻¹ΔS_λB̂`.
-    pub fn coefficients(&self, rho: ArrayView1<'_, f64>) -> Result<(Array2<f64>, f64), EstimationError> {
+    pub fn coefficients(
+        &self,
+        rho: ArrayView1<'_, f64>,
+    ) -> Result<(Array2<f64>, f64), EstimationError> {
         let factor = self.stacked_root_factor(rho)?;
         let projection = self.project(&factor, self.rotated_head.view());
         let penalized_residual = projection.tail_energy;
@@ -949,9 +1001,11 @@ impl GaussianRemlMultiPenaltyProblem {
             .iter()
             .any(|placement| *placement != GaussianRemlMultiPenaltyRhoPlacement::Interior)
         {
-            return Ok(GaussianRemlMultiPenaltyDataGradientOutcome::RhoAtDomainBound {
-                placement: fit.rho_placement.clone(),
-            });
+            return Ok(
+                GaussianRemlMultiPenaltyDataGradientOutcome::RhoAtDomainBound {
+                    placement: fit.rho_placement.clone(),
+                },
+            );
         }
         let (n, p, m) = (self.rows, self.coefficients, self.responses);
         if x.dim() != (n, p) || y.dim() != (n, m) || fit.coefficients.dim() != (p, m) {
@@ -1005,9 +1059,18 @@ impl GaussianRemlMultiPenaltyProblem {
             Some(support) => {
                 let mut observed_x = Array2::<f64>::zeros((self.rows, p));
                 let mut observed_y = Array2::<f64>::zeros((self.rows, m));
-                for (index, (&row, &root)) in support.rows.iter().zip(support.root_weights.iter()).enumerate() {
-                    observed_x.row_mut(row).assign(&grad_x.row(index).mapv(|value| root * value));
-                    observed_y.row_mut(row).assign(&grad_y.row(index).mapv(|value| root * value));
+                for (index, (&row, &root)) in support
+                    .rows
+                    .iter()
+                    .zip(support.root_weights.iter())
+                    .enumerate()
+                {
+                    observed_x
+                        .row_mut(row)
+                        .assign(&grad_x.row(index).mapv(|value| root * value));
+                    observed_y
+                        .row_mut(row)
+                        .assign(&grad_y.row(index).mapv(|value| root * value));
                 }
                 (observed_x, observed_y)
             }
@@ -1032,9 +1095,11 @@ impl GaussianRemlMultiPenaltyProblem {
             .iter()
             .any(|placement| *placement != GaussianRemlMultiPenaltyRhoPlacement::Interior)
         {
-            return Ok(GaussianRemlMultiPenaltyPenaltyGradientOutcome::RhoAtDomainBound {
-                placement: fit.rho_placement.clone(),
-            });
+            return Ok(
+                GaussianRemlMultiPenaltyPenaltyGradientOutcome::RhoAtDomainBound {
+                    placement: fit.rho_placement.clone(),
+                },
+            );
         }
         let p = self.coefficients;
         let m = self.responses as f64;
@@ -1154,8 +1219,13 @@ impl GaussianRemlMultiPenaltyProblem {
         let rho_placement = match optimum.criterion_certificate.as_ref() {
             None => vec![GaussianRemlMultiPenaltyRhoPlacement::Unaudited; penalty_count],
             Some(certificate) => {
-                let mut placement = vec![GaussianRemlMultiPenaltyRhoPlacement::Interior; penalty_count];
-                for &index in certificate.lambdas_railed.iter().filter(|&&index| index < penalty_count) {
+                let mut placement =
+                    vec![GaussianRemlMultiPenaltyRhoPlacement::Interior; penalty_count];
+                for &index in certificate
+                    .lambdas_railed
+                    .iter()
+                    .filter(|&&index| index < penalty_count)
+                {
                     let rho = optimum.rho[index];
                     placement[index] = if rho - lower[index] <= upper[index] - rho {
                         GaussianRemlMultiPenaltyRhoPlacement::LowerBound
@@ -1222,7 +1292,11 @@ mod tests {
     /// `diag(j⁴)` for `j ≥ unpenalized`, zero on the first `unpenalized` modes.
     fn curvature_penalty(p: usize, unpenalized: usize) -> Array2<f64> {
         Array2::from_shape_fn((p, p), |(row, col)| {
-            if row == col && row >= unpenalized { (row as f64).powi(4) } else { 0.0 }
+            if row == col && row >= unpenalized {
+                (row as f64).powi(4)
+            } else {
+                0.0
+            }
         })
     }
 
@@ -1256,7 +1330,11 @@ mod tests {
             .eigh(Side::Lower)
             .expect("the fitted Hessian's spectrum")
             .0;
-        assert!(curvatures[0] > 0.0, "the fitted criterion must curve upward; λ_min={}", curvatures[0]);
+        assert!(
+            curvatures[0] > 0.0,
+            "the fitted criterion must curve upward; λ_min={}",
+            curvatures[0]
+        );
         resolution_radius(
             frobenius(fit.evaluation.reml_gradient.view().insert_axis(Axis(1))),
             curvatures[0],
@@ -1296,7 +1374,10 @@ mod tests {
         );
         // Positive control: a ρ shift whose quadratic score change is nine bands is resolved by that same band.
         let curvature = at_old.reml_hessian[[0, 0]];
-        assert!(curvature > 0.0, "the criterion must curve upward at its optimum; h={curvature:.3e}");
+        assert!(
+            curvature > 0.0,
+            "the criterion must curve upward at its optimum; h={curvature:.3e}"
+        );
         let shift = 3.0 * (2.0 * score_band / curvature).sqrt();
         let shifted = problem
             .evaluate(array![old.rho + shift].view())
@@ -1318,7 +1399,11 @@ mod tests {
         let inverse_trace = inverse.inverse().diag().sum();
         let design_energy = frobenius(x.view()).powi(2);
         let gram_norm = gram.iter().fold(0.0_f64, |acc, value| acc.max(value.abs())) * p as f64;
-        let delta_max = old.cache.penalty_eigenvalues.iter().fold(0.0_f64, |acc, value| acc.max(*value));
+        let delta_max = old
+            .cache
+            .penalty_eigenvalues
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(*value));
         let penalty_norm = (p as f64 - 1.0).powi(4);
         let old_edf_band = inverse_trace
             * (2.0 * accumulation_growth(n * p) * design_energy
@@ -1357,9 +1442,14 @@ mod tests {
         );
 
         // λ̂: both optima lie within their resolution radii of the one minimizer.
-        let fit = problem.fit(None).expect("the multi-penalty fit converges on the one-column fixture");
+        let fit = problem
+            .fit(None)
+            .expect("the multi-penalty fit converges on the one-column fixture");
         let new_curvature = fit.evaluation.reml_hessian[[0, 0]];
-        assert!(new_curvature > 0.0, "the fitted criterion must curve upward; h={new_curvature:.3e}");
+        assert!(
+            new_curvature > 0.0,
+            "the fitted criterion must curve upward; h={new_curvature:.3e}"
+        );
         let new_radius = resolution_radius(
             fit.evaluation.reml_gradient[0].abs(),
             new_curvature,
@@ -1402,24 +1492,36 @@ mod tests {
             .expect("the joint fit converges")
             .evaluation
             .rho;
-        let shared = joint.evaluate(rho.view()).expect("the joint evaluation at ρ̂");
-        let (shared_coefficients, shared_coefficients_roundoff) =
-            joint.coefficients(rho.view()).expect("joint coefficients at ρ̂");
+        let shared = joint
+            .evaluate(rho.view())
+            .expect("the joint evaluation at ρ̂");
+        let (shared_coefficients, shared_coefficients_roundoff) = joint
+            .coefficients(rho.view())
+            .expect("joint coefficients at ρ̂");
         let columns: Vec<(GaussianRemlMultiPenaltyEvaluation, Array2<f64>, f64)> = (0..m)
             .map(|col| {
                 let column = y.column(col).insert_axis(Axis(1));
                 let problem = GaussianRemlMultiPenaltyProblem::new(x.view(), column, &penalties, 0)
                     .expect("a one-column problem");
-                let evaluation = problem.evaluate(rho.view()).expect("one-column evaluation at ρ̂");
-                let (coefficients, roundoff) =
-                    problem.coefficients(rho.view()).expect("one-column coefficients at ρ̂");
+                let evaluation = problem
+                    .evaluate(rho.view())
+                    .expect("one-column evaluation at ρ̂");
+                let (coefficients, roundoff) = problem
+                    .coefficients(rho.view())
+                    .expect("one-column coefficients at ρ̂");
                 (evaluation, coefficients, roundoff)
             })
             .collect();
 
-        let residual_sum: f64 = columns.iter().map(|column| column.0.residual_quadratic).sum();
+        let residual_sum: f64 = columns
+            .iter()
+            .map(|column| column.0.residual_quadratic)
+            .sum();
         let residual_band = shared.residual_quadratic_roundoff
-            + columns.iter().map(|column| column.0.residual_quadratic_roundoff).sum::<f64>()
+            + columns
+                .iter()
+                .map(|column| column.0.residual_quadratic_roundoff)
+                .sum::<f64>()
             + accumulation_growth(m) * residual_sum;
         assert!(
             (shared.residual_quadratic - residual_sum).abs() <= residual_band,
@@ -1427,12 +1529,16 @@ mod tests {
             shared.residual_quadratic
         );
         let dof_sum: f64 = columns.iter().map(|column| column.0.dispersion_dof).sum();
-        assert_eq!(shared.dispersion_dof, dof_sum, "ν adds over columns exactly");
+        assert_eq!(
+            shared.dispersion_dof, dof_sum,
+            "ν adds over columns exactly"
+        );
         for (col, (evaluation, coefficients, roundoff)) in columns.iter().enumerate() {
-            let normal_band =
-                shared.log_det_penalized_normal_roundoff + evaluation.log_det_penalized_normal_roundoff;
+            let normal_band = shared.log_det_penalized_normal_roundoff
+                + evaluation.log_det_penalized_normal_roundoff;
             assert!(
-                (shared.log_det_penalized_normal - evaluation.log_det_penalized_normal).abs() <= normal_band,
+                (shared.log_det_penalized_normal - evaluation.log_det_penalized_normal).abs()
+                    <= normal_band,
                 "column {col}: log|K| {} vs {}, band {normal_band:.3e}",
                 evaluation.log_det_penalized_normal,
                 shared.log_det_penalized_normal
@@ -1440,7 +1546,8 @@ mod tests {
             let pseudo_band =
                 shared.log_pseudo_det_penalty_roundoff + evaluation.log_pseudo_det_penalty_roundoff;
             assert!(
-                (shared.log_pseudo_det_penalty - evaluation.log_pseudo_det_penalty).abs() <= pseudo_band,
+                (shared.log_pseudo_det_penalty - evaluation.log_pseudo_det_penalty).abs()
+                    <= pseudo_band,
                 "column {col}: log|S|₊ {} vs {}, band {pseudo_band:.3e}",
                 evaluation.log_pseudo_det_penalty,
                 shared.log_pseudo_det_penalty
@@ -1458,7 +1565,7 @@ mod tests {
         // The restricted log-likelihood at a FIXED σ² adds over independent columns, so the pooled profiled score is
         // the columns' sum at the shared σ̂². `∂/∂σ² Σ_c W_c = 0` at σ̂², so the shared σ̂²'s own error is second order.
         let sigma2 = shared.sigma2;
-        let mut restricted_sum = KahanSum::default();
+        let mut restricted_sum = CompensatedSum::default();
         let mut magnitude = 0.0;
         let mut column_band = 0.0;
         for (evaluation, ..) in &columns {
@@ -1479,13 +1586,13 @@ mod tests {
         }
         let identity_band =
             shared.reml_score_roundoff + column_band + accumulation_growth(4 * m + 6) * magnitude;
-        let identity_gap = (shared.reml_score - restricted_sum.sum()).abs();
+        let identity_gap = (shared.reml_score - restricted_sum.value()).abs();
         assert!(
             identity_gap <= identity_band,
             "pooled score {} vs the columns' restricted likelihoods at σ̂² {}, gap {identity_gap:.3e}, band \
              {identity_band:.3e}",
             shared.reml_score,
-            restricted_sum.sum()
+            restricted_sum.value()
         );
         // Positive control: letting each column profile its own dispersion is a different criterion, and the band
         // resolves the difference.
@@ -1519,7 +1626,10 @@ mod tests {
             .expect("the rotated problem");
 
         let fits = [
-            original.clone().fit(None).expect("the original fit converges"),
+            original
+                .clone()
+                .fit(None)
+                .expect("the original fit converges"),
             turned.clone().fit(None).expect("the rotated fit converges"),
         ];
         let radii: Vec<f64> = fits.iter().map(fitted_radius).collect();
@@ -1538,14 +1648,16 @@ mod tests {
         let rho = fits[0].evaluation.rho.clone();
         let a = original.evaluate(rho.view()).expect("original evaluation");
         let b = turned.evaluate(rho.view()).expect("rotated evaluation");
-        let score_band = a.reml_score_roundoff + b.reml_score_roundoff + 0.5 * a.dispersion_dof * defect;
+        let score_band =
+            a.reml_score_roundoff + b.reml_score_roundoff + 0.5 * a.dispersion_dof * defect;
         assert!(
             (a.reml_score - b.reml_score).abs() <= score_band,
             "score {} vs rotated {}, band {score_band:.3e}",
             a.reml_score,
             b.reml_score
         );
-        let sigma_band = (a.residual_quadratic_roundoff + b.residual_quadratic_roundoff) / a.dispersion_dof
+        let sigma_band = (a.residual_quadratic_roundoff + b.residual_quadratic_roundoff)
+            / a.dispersion_dof
             + defect * a.sigma2;
         assert!(
             (a.sigma2 - b.sigma2).abs() <= sigma_band,
@@ -1559,8 +1671,12 @@ mod tests {
             a.edf,
             b.edf
         );
-        let (a_coefficients, a_roundoff) = original.coefficients(rho.view()).expect("original coefficients");
-        let (b_coefficients, b_roundoff) = turned.coefficients(rho.view()).expect("rotated coefficients");
+        let (a_coefficients, a_roundoff) = original
+            .coefficients(rho.view())
+            .expect("original coefficients");
+        let (b_coefficients, b_roundoff) = turned
+            .coefficients(rho.view())
+            .expect("rotated coefficients");
         let turned_back = fast_ab(&a_coefficients, &rotation);
         let coefficient_band = b_roundoff
             + a_roundoff * (1.0 + defect)
@@ -1593,8 +1709,10 @@ mod tests {
         let penalties = [curvature_penalty(p, 2), Array2::<f64>::eye(p)];
         // Two coordinates and their ratio, Bonferroni at a declared family-wise false-alarm rate.
         let family_wise_false_alarm = 1.0e-3;
-        let z = gam_math::probability::standard_normal_quantile(1.0 - family_wise_false_alarm / (2.0 * 3.0))
-            .expect("the normal quantile of the Bonferroni level");
+        let z = gam_math::probability::standard_normal_quantile(
+            1.0 - family_wise_false_alarm / (2.0 * 3.0),
+        )
+        .expect("the normal quantile of the Bonferroni level");
         // `β_c ~ N(0, σ²S_λ⁻¹)` with `σ² = 1`; both penalties are diagonal, so `S_λ` is too.
         let planted = |rho: [f64; 2], seed: u64| -> Array2<f64> {
             let mut rng = StdRng::seed_from_u64(seed);
@@ -1613,9 +1731,10 @@ mod tests {
                 .expect("the planted problem")
                 .fit(None)
                 .expect("the planted fit converges");
-            let covariance = certified_spd_inverse(&fit.evaluation.reml_hessian, "planted ρ̂ information")
-                .expect("the planted fit's information is SPD")
-                .into_inverse();
+            let covariance =
+                certified_spd_inverse(&fit.evaluation.reml_hessian, "planted ρ̂ information")
+                    .expect("the planted fit's information is SPD")
+                    .into_inverse();
             (fit.evaluation.rho, covariance)
         };
         let ratio_sd = |covariance: &Array2<f64>| {
@@ -1671,7 +1790,9 @@ mod tests {
         let penalties = [curvature_penalty(p, 2), Array2::<f64>::eye(p)];
         let problem = GaussianRemlMultiPenaltyProblem::new(x.view(), y.view(), &penalties, 0)
             .expect("the gradient fixture");
-        let fit = problem.fit(None).expect("the gradient fixture fit converges");
+        let fit = problem
+            .fit(None)
+            .expect("the gradient fixture fit converges");
         assert!(
             fit.rho_placement
                 .iter()
@@ -1690,10 +1811,11 @@ mod tests {
 
         // `V` at fixed ρ̂ along a unit direction; the analytic cotangents are the fixed-ρ partials.
         let score = |design: &Array2<f64>, response: &Array2<f64>| -> (f64, f64) {
-            let evaluation = GaussianRemlMultiPenaltyProblem::new(design.view(), response.view(), &penalties, 0)
-                .expect("a perturbed problem")
-                .evaluate(rho.view())
-                .expect("a perturbed evaluation");
+            let evaluation =
+                GaussianRemlMultiPenaltyProblem::new(design.view(), response.view(), &penalties, 0)
+                    .expect("a perturbed problem")
+                    .evaluate(rho.view())
+                    .expect("a perturbed evaluation");
             (evaluation.reml_score, evaluation.reml_score_roundoff)
         };
         let unit = |matrix: Array2<f64>| {
@@ -1710,14 +1832,20 @@ mod tests {
             let (design_minus, response_minus) = perturb(-h);
             let (plus, plus_roundoff) = score(&design_plus, &response_plus);
             let (minus, minus_roundoff) = score(&design_minus, &response_minus);
-            ((plus - minus) / (2.0 * h), (plus_roundoff + minus_roundoff) / (2.0 * h))
+            (
+                (plus - minus) / (2.0 * h),
+                (plus_roundoff + minus_roundoff) / (2.0 * h),
+            )
         };
-        let design_perturb =
-            |h: f64| (&x + &design_direction.mapv(|value| h * value), y.clone());
+        let design_perturb = |h: f64| (&x + &design_direction.mapv(|value| h * value), y.clone());
         let response_perturb =
             |h: f64| (x.clone(), &y + &response_direction.mapv(|value| h * value));
         let directional = |analytic: &Array2<f64>, direction: &Array2<f64>| {
-            analytic.iter().zip(direction.iter()).map(|(a, b)| a * b).sum::<f64>()
+            analytic
+                .iter()
+                .zip(direction.iter())
+                .map(|(a, b)| a * b)
+                .sum::<f64>()
         };
 
         type Perturbation<'a> = &'a dyn Fn(f64) -> (Array2<f64>, Array2<f64>);
@@ -1768,7 +1896,11 @@ mod tests {
         let x = cosine_design(n, p);
         let y = Array2::from_shape_fn((n, 2), |(row, col)| {
             let position = (row as f64 + 0.5) / n as f64;
-            if col == 0 { position.powf(2.5) } else { (1.5 * position).exp() }
+            if col == 0 {
+                position.powf(2.5)
+            } else {
+                (1.5 * position).exp()
+            }
         });
         let scale = 1.0e3;
         let scaled = y.mapv(|value| scale * value);
@@ -1779,10 +1911,15 @@ mod tests {
             .expect("the scaled noise-free problem is resolved");
         let fits = [
             original.fit(None).expect("the noise-free fit converges"),
-            enlarged.fit(None).expect("the scaled noise-free fit converges"),
+            enlarged
+                .fit(None)
+                .expect("the scaled noise-free fit converges"),
         ];
         for fit in &fits {
-            assert!(fit.certificate.is_some(), "a returned fit carries the optimizer's analytic certificate");
+            assert!(
+                fit.certificate.is_some(),
+                "a returned fit carries the optimizer's analytic certificate"
+            );
             assert!(
                 fit.evaluation.residual_quadratic > fit.evaluation.residual_quadratic_roundoff,
                 "the approximate representation leaves a resolved residual {} against {}",
@@ -1806,7 +1943,8 @@ mod tests {
         let a = original.evaluate(rho.view()).expect("original evaluation");
         let b = enlarged.evaluate(rho.view()).expect("scaled evaluation");
         let shift = a.dispersion_dof * scale.ln();
-        let shift_band = a.reml_score_roundoff + b.reml_score_roundoff + accumulation_growth(4) * shift.abs();
+        let shift_band =
+            a.reml_score_roundoff + b.reml_score_roundoff + accumulation_growth(4) * shift.abs();
         assert!(
             (b.reml_score - a.reml_score - shift).abs() <= shift_band,
             "V(cY) − V(Y) = {:.9e} against ν·ln c = {shift:.9e}, band {shift_band:.3e}",
@@ -1825,7 +1963,8 @@ mod tests {
             .expect("the one-column-scaled problem")
             .evaluate(rho.view())
             .expect("one-column-scaled evaluation");
-        let control_band = a.reml_score_roundoff + c.reml_score_roundoff + accumulation_growth(4) * shift.abs();
+        let control_band =
+            a.reml_score_roundoff + c.reml_score_roundoff + accumulation_growth(4) * shift.abs();
         assert!(
             (c.reml_score - a.reml_score - shift).abs() > control_band,
             "positive control: scaling one column shifted the score by {:.9e}, inside the band {control_band:.3e} of \
@@ -1848,7 +1987,11 @@ mod tests {
             .into_inverse();
         let orthogonal = &draws - &fast_ab(&x, &fast_ab(&gram_inverse, &fast_atb(&x, &draws)));
         let null_coefficients = Array2::from_shape_fn((p, m), |(row, col)| {
-            if row < 2 { 1.0 + row as f64 + col as f64 } else { 0.0 }
+            if row < 2 {
+                1.0 + row as f64 + col as f64
+            } else {
+                0.0
+            }
         });
         let y = fast_ab(&x, &null_coefficients) + &orthogonal;
         let problem = GaussianRemlMultiPenaltyProblem::new(x.view(), y.view(), &[penalty], 2)
@@ -1868,7 +2011,10 @@ mod tests {
             .certificate
             .as_ref()
             .expect("a returned fit carries the optimizer's certificate");
-        assert!(certificate.is_stationary(), "the cold start is certified stationary: {certificate:?}");
+        assert!(
+            certificate.is_stationary(),
+            "the cold start is certified stationary: {certificate:?}"
+        );
         assert!(
             fit.evaluation.reml_gradient[0] < 0.0,
             "the criterion still descends at the certified point; g={:.3e}",
@@ -1893,7 +2039,9 @@ mod tests {
             .expect("the data gradient answers at the certified point")
         {
             GaussianRemlMultiPenaltyDataGradientOutcome::Interior(..) => {}
-            refusal => panic!("an interior placement must return the envelope forms; got {refusal:?}"),
+            refusal => {
+                panic!("an interior placement must return the envelope forms; got {refusal:?}")
+            }
         }
     }
 
@@ -1924,7 +2072,10 @@ mod tests {
             .expect("the data gradient answers at the edge")
         {
             GaussianRemlMultiPenaltyDataGradientOutcome::RhoAtDomainBound { placement } => {
-                assert_eq!(placement, fit.rho_placement, "the refusal names the railed coordinate");
+                assert_eq!(
+                    placement, fit.rho_placement,
+                    "the refusal names the railed coordinate"
+                );
             }
             GaussianRemlMultiPenaltyDataGradientOutcome::Interior(..) => {
                 panic!("a railed ρ̂ must not return the envelope forms as a total derivative")
@@ -1943,10 +2094,15 @@ mod tests {
         let penalties = [curvature_penalty(p, 2), Array2::<f64>::eye(p)];
         let problem = GaussianRemlMultiPenaltyProblem::new(x.view(), y.view(), &penalties, 0)
             .expect("the fingerprint fixture");
-        let fit = problem.fit(None).expect("the fingerprint fixture converges");
+        let fit = problem
+            .fit(None)
+            .expect("the fingerprint fixture converges");
         let accepted = problem.data_gradient(x.view(), y.view(), &fit);
         assert!(
-            matches!(accepted, Ok(GaussianRemlMultiPenaltyDataGradientOutcome::Interior(..))),
+            matches!(
+                accepted,
+                Ok(GaussianRemlMultiPenaltyDataGradientOutcome::Interior(..))
+            ),
             "the arrays the problem was built from are accepted; got {accepted:?} with placement {:?}",
             fit.rho_placement
         );
@@ -1978,7 +2134,11 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(29_460_009);
         let m = columns as f64;
         let slope = Array2::from_shape_fn((p, p), |(row, col)| {
-            if row == col && row >= 2 { (row as f64).powi(2) } else { 0.0 }
+            if row == col && row >= 2 {
+                (row as f64).powi(2)
+            } else {
+                0.0
+            }
         });
         let penalties = [curvature_penalty(p, 2), slope];
         // Both strengths are planted material: at ρ = (−3, 0) the slope penalty dominates the low range modes and the
@@ -1989,12 +2149,18 @@ mod tests {
             .collect();
         let beta = Array2::from_shape_fn((p, columns), |index: (usize, usize)| {
             let draw: f64 = StandardNormal.sample(&mut rng);
-            if index.0 < 2 { draw } else { draw / planted_precision[index.0].sqrt() }
+            if index.0 < 2 {
+                draw
+            } else {
+                draw / planted_precision[index.0].sqrt()
+            }
         });
         let y = fast_ab(&x, &beta) + normal_matrix(n, columns, &mut rng);
         let problem = GaussianRemlMultiPenaltyProblem::new(x.view(), y.view(), &penalties, 2)
             .expect("the penalty-gradient fixture");
-        let fit = problem.fit(None).expect("the penalty-gradient fixture converges");
+        let fit = problem
+            .fit(None)
+            .expect("the penalty-gradient fixture converges");
         let (gradients, rank, smallest_resolved, rank_band) = match problem
             .penalty_gradient(&fit)
             .expect("the penalty gradient at the fit")
@@ -2007,7 +2173,11 @@ mod tests {
             } => (gradients, rank, smallest_resolved_singular_value, rank_band),
             refusal => panic!("an interior fit must return the penalty gradient; got {refusal:?}"),
         };
-        assert_eq!(rank, p - 2, "rank(S_λ) is the complement of the two shared null modes");
+        assert_eq!(
+            rank,
+            p - 2,
+            "rank(S_λ) is the complement of the two shared null modes"
+        );
         assert!(
             smallest_resolved > rank_band,
             "the reported rank margin {smallest_resolved:.3e} clears its band {rank_band:.3e}"
@@ -2025,7 +2195,8 @@ mod tests {
         // construction for the mutant.
         let pseudo_inverse = Array2::from_shape_fn((p, p), |(row, col)| {
             if row == col && row >= 2 {
-                1.0 / (lambdas[0] * penalties[0][[row, row]] + lambdas[1] * penalties[1][[row, row]])
+                1.0 / (lambdas[0] * penalties[0][[row, row]]
+                    + lambdas[1] * penalties[1][[row, row]])
             } else {
                 0.0
             }
@@ -2053,12 +2224,19 @@ mod tests {
                 minus[k] = &minus[k] - &direction.mapv(|value| h * value);
                 let (above, above_roundoff) = score(&plus);
                 let (below, below_roundoff) = score(&minus);
-                ((above - below) / (2.0 * h), (above_roundoff + below_roundoff) / (2.0 * h))
+                (
+                    (above - below) / (2.0 * h),
+                    (above_roundoff + below_roundoff) / (2.0 * h),
+                )
             };
             let (at_h, rounding_h) = central(step);
             let (at_2h, rounding_2h) = central(2.0 * step);
             let band = (at_2h - at_h).abs() / 3.0 + (4.0 * rounding_h + rounding_2h) / 3.0;
-            let expected: f64 = gradients[k].iter().zip(direction.iter()).map(|(g, d)| g * d).sum();
+            let expected: f64 = gradients[k]
+                .iter()
+                .zip(direction.iter())
+                .map(|(g, d)| g * d)
+                .sum();
             assert!(
                 expected.abs() > band,
                 "∂V/∂S_{k}: the directional derivative {expected:.3e} must exceed the band {band:.3e}, or agreement is \
@@ -2069,7 +2247,11 @@ mod tests {
                 "∂V/∂S_{k}: central difference {at_h:.9e} vs analytic {expected:.9e}, band {band:.3e}"
             );
             let mutant = &gradients[k] + &pseudo_inverse.mapv(|value| 0.5 * lambdas[k] * m * value);
-            let wrong: f64 = mutant.iter().zip(direction.iter()).map(|(g, d)| g * d).sum();
+            let wrong: f64 = mutant
+                .iter()
+                .zip(direction.iter())
+                .map(|(g, d)| g * d)
+                .sum();
             assert!(
                 (at_h - wrong).abs() > band,
                 "mutant: the gradient without −m·S_λ⁺ gives {wrong:.9e}, inside the band {band:.3e} of {at_h:.9e}"
@@ -2080,20 +2262,27 @@ mod tests {
     /// Weights in `[0.5, 1.5]`, with every seventh row omitted.
     fn observation_weights(n: usize) -> Array1<f64> {
         Array1::from_shape_fn(n, |row| {
-            if row % 7 == 3 { 0.0 } else { 1.0 + 0.5 * (2.3 * row as f64).cos() }
+            if row % 7 == 3 {
+                0.0
+            } else {
+                1.0 + 0.5 * (2.3 * row as f64).cos()
+            }
         })
     }
 
     /// `√w_i·M` over the positive-weight rows, whitened the way a caller would.
     fn whiten_positive_rows(matrix: &Array2<f64>, weights: &Array1<f64>) -> Array2<f64> {
-        let kept: Vec<usize> = (0..weights.len()).filter(|&row| weights[row] > 0.0).collect();
+        let kept: Vec<usize> = (0..weights.len())
+            .filter(|&row| weights[row] > 0.0)
+            .collect();
         Array2::from_shape_fn((kept.len(), matrix.ncols()), |(row, col)| {
             matrix[[kept[row], col]] * weights[kept[row]].sqrt()
         })
     }
 
     #[test]
-    fn gaussian_reml_multi_penalty_weighted_one_penalty_reproduces_the_shared_dispersion_closed_form() {
+    fn gaussian_reml_multi_penalty_weighted_one_penalty_reproduces_the_shared_dispersion_closed_form()
+     {
         let (n, p) = (120, 8);
         let x = cosine_design(n, p);
         let mut rng = StdRng::seed_from_u64(29_460_014);
@@ -2136,7 +2325,10 @@ mod tests {
         );
         // Positive control: a ρ shift whose quadratic score change is nine bands is resolved by that same band.
         let curvature = at_old.reml_hessian[[0, 0]];
-        assert!(curvature > 0.0, "the criterion must curve upward at its optimum; h={curvature:.3e}");
+        assert!(
+            curvature > 0.0,
+            "the criterion must curve upward at its optimum; h={curvature:.3e}"
+        );
         let shift = 3.0 * (2.0 * score_band / curvature).sqrt();
         let shifted = problem
             .evaluate(array![old.rho + shift].view())
@@ -2147,12 +2339,14 @@ mod tests {
             (shifted.reml_score - old.reml_score).abs()
         );
         // The weights are read: the same data unweighted is resolved apart at the same ρ.
-        let unweighted = GaussianRemlMultiPenaltyProblem::new(x.view(), y.view(), &[penalty.clone()], 2)
-            .expect("the unweighted problem accepts the fixture")
-            .evaluate(array![old.rho].view())
-            .expect("the unweighted evaluator evaluates at the closed-form optimum");
+        let unweighted =
+            GaussianRemlMultiPenaltyProblem::new(x.view(), y.view(), &[penalty.clone()], 2)
+                .expect("the unweighted problem accepts the fixture")
+                .evaluate(array![old.rho].view())
+                .expect("the unweighted evaluator evaluates at the closed-form optimum");
         assert!(
-            (unweighted.reml_score - old.reml_score).abs() > score_band + unweighted.reml_score_roundoff,
+            (unweighted.reml_score - old.reml_score).abs()
+                > score_band + unweighted.reml_score_roundoff,
             "control: the unweighted score {} is inside the band of the weighted closed form {}",
             unweighted.reml_score,
             old.reml_score
@@ -2171,12 +2365,17 @@ mod tests {
         let inverse_trace = inverse.inverse().diag().sum();
         let design_energy = frobenius(white_x.view()).powi(2);
         let gram_norm = gram.iter().fold(0.0_f64, |acc, value| acc.max(value.abs())) * p as f64;
-        let delta_max = old.cache.penalty_eigenvalues.iter().fold(0.0_f64, |acc, value| acc.max(*value));
+        let delta_max = old
+            .cache
+            .penalty_eigenvalues
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(*value));
         let penalty_norm = (p as f64 - 1.0).powi(4);
         let old_penalty_rounding = p as f64 * f64::EPSILON * penalty_norm
             + 2.0 * p as f64 * f64::EPSILON * delta_max * gram_norm;
         let whitening = accumulation_growth(n * p);
-        let old_edf_band = inverse_trace * (2.0 * whitening * design_energy + lambda * old_penalty_rounding)
+        let old_edf_band = inverse_trace
+            * (2.0 * whitening * design_energy + lambda * old_penalty_rounding)
             + accumulation_growth(2 * p) * p as f64;
         let edf_band = at_old.edf_roundoff + old_edf_band;
         assert!(
@@ -2203,9 +2402,14 @@ mod tests {
         );
 
         // λ̂: both optima lie within their resolution radii of the one minimizer.
-        let fit = problem.fit(None).expect("the weighted multi-penalty fit converges");
+        let fit = problem
+            .fit(None)
+            .expect("the weighted multi-penalty fit converges");
         let new_curvature = fit.evaluation.reml_hessian[[0, 0]];
-        assert!(new_curvature > 0.0, "the fitted criterion must curve upward; h={new_curvature:.3e}");
+        assert!(
+            new_curvature > 0.0,
+            "the fitted criterion must curve upward; h={new_curvature:.3e}"
+        );
         let new_radius = resolution_radius(
             fit.evaluation.reml_gradient[0].abs(),
             new_curvature,
@@ -2249,28 +2453,34 @@ mod tests {
             2,
         )
         .expect("the whitened problem accepts the positive-weight rows");
-        let unweighted = GaussianRemlMultiPenaltyProblem::new(x.view(), y.view(), &[penalty.clone()], 2)
-            .expect("the unweighted problem accepts the fixture");
+        let unweighted =
+            GaussianRemlMultiPenaltyProblem::new(x.view(), y.view(), &[penalty.clone()], 2)
+                .expect("the unweighted problem accepts the fixture");
         // `−(m/2)·Σ log w_i` over the positive-weight rows, with the evaluator's own bound on its formation.
-        let mut log_weights = KahanSum::default();
+        let mut log_weights = CompensatedSum::default();
         let mut magnitude = 0.0;
         for &weight in weights.iter().filter(|&&weight| weight > 0.0) {
             log_weights.add(weight.ln());
             magnitude += weight.ln().abs();
         }
-        let jacobian = -0.5 * m as f64 * log_weights.sum();
+        let jacobian = -0.5 * m as f64 * log_weights.value();
         let jacobian_roundoff = 0.5 * m as f64 * compensated_band(3, magnitude);
 
         for rho in [-2.0, 1.5, 4.0] {
             let at = array![rho];
-            let observed = weighted.evaluate(at.view()).expect("the weighted evaluator evaluates");
-            let whitened = white.evaluate(at.view()).expect("the whitened evaluator evaluates");
+            let observed = weighted
+                .evaluate(at.view())
+                .expect("the weighted evaluator evaluates");
+            let whitened = white
+                .evaluate(at.view())
+                .expect("the whitened evaluator evaluates");
             assert_eq!(
                 observed.dispersion_dof,
                 (m * (kept - 2)) as f64,
                 "ν counts the positive-weight rows only"
             );
-            let band = observed.reml_score_roundoff + whitened.reml_score_roundoff + jacobian_roundoff;
+            let band =
+                observed.reml_score_roundoff + whitened.reml_score_roundoff + jacobian_roundoff;
             let gap = (observed.reml_score - (whitened.reml_score + jacobian)).abs();
             assert!(
                 gap <= band,
@@ -2279,7 +2489,9 @@ mod tests {
                 whitened.reml_score
             );
             // Control: the same rows read without their weights are resolved apart by that band.
-            let plain = unweighted.evaluate(at.view()).expect("the unweighted evaluator evaluates");
+            let plain = unweighted
+                .evaluate(at.view())
+                .expect("the unweighted evaluator evaluates");
             assert!(
                 (plain.reml_score - observed.reml_score).abs() > band + plain.reml_score_roundoff,
                 "control at ρ={rho}: the unweighted score {} is inside the band of the weighted {}",
@@ -2309,7 +2521,10 @@ mod tests {
         let y = responses(n, &[0.2, 0.4], &mut rng);
         let penalty = curvature_penalty(p, 2);
         let weights = observation_weights(n);
-        let (white_x, white_y) = (whiten_positive_rows(&x, &weights), whiten_positive_rows(&y, &weights));
+        let (white_x, white_y) = (
+            whiten_positive_rows(&x, &weights),
+            whiten_positive_rows(&y, &weights),
+        );
 
         let weighted = GaussianRemlMultiPenaltyProblem::new_weighted(
             x.view(),
@@ -2319,17 +2534,29 @@ mod tests {
             2,
         )
         .expect("the weighted problem accepts the fixture");
-        let white = GaussianRemlMultiPenaltyProblem::new(white_x.view(), white_y.view(), &[penalty.clone()], 2)
-            .expect("the whitened problem accepts the positive-weight rows");
+        let white = GaussianRemlMultiPenaltyProblem::new(
+            white_x.view(),
+            white_y.view(),
+            &[penalty.clone()],
+            2,
+        )
+        .expect("the whitened problem accepts the positive-weight rows");
         let fit = weighted.fit(None).expect("the weighted fit converges");
         assert!(
-            fit.rho_placement.iter().all(|placement| *placement == GaussianRemlMultiPenaltyRhoPlacement::Interior),
+            fit.rho_placement
+                .iter()
+                .all(|placement| *placement == GaussianRemlMultiPenaltyRhoPlacement::Interior),
             "the fixture's λ̂ must be interior; placement {:?}",
             fit.rho_placement
         );
-        let observed = match weighted.data_gradient(x.view(), y.view(), &fit).expect("weighted data gradient") {
+        let observed = match weighted
+            .data_gradient(x.view(), y.view(), &fit)
+            .expect("weighted data gradient")
+        {
             GaussianRemlMultiPenaltyDataGradientOutcome::Interior(gradient) => gradient,
-            other => panic!("an interior weighted fit must return the envelope forms, got {other:?}"),
+            other => {
+                panic!("an interior weighted fit must return the envelope forms, got {other:?}")
+            }
         };
         // The whitened criterion is the weighted one less a constant, so the weighted fit is its fit as well.
         let whitened = match white
@@ -2337,7 +2564,9 @@ mod tests {
             .expect("whitened data gradient")
         {
             GaussianRemlMultiPenaltyDataGradientOutcome::Interior(gradient) => gradient,
-            other => panic!("an interior whitened fit must return the envelope forms, got {other:?}"),
+            other => {
+                panic!("an interior whitened fit must return the envelope forms, got {other:?}")
+            }
         };
         assert_eq!(observed.grad_x.dim(), (n, p));
         assert_eq!(observed.grad_y.dim(), (n, y.ncols()));
@@ -2353,7 +2582,13 @@ mod tests {
                 .row(row)
                 .iter()
                 .zip(whitened.grad_x.row(index).iter())
-                .chain(observed.grad_y.row(row).iter().zip(whitened.grad_y.row(index).iter()))
+                .chain(
+                    observed
+                        .grad_y
+                        .row(row)
+                        .iter()
+                        .zip(whitened.grad_y.row(index).iter()),
+                )
                 .map(|(&left, &right)| (left, right))
                 .collect::<Vec<_>>();
             for (scaled, unscaled) in pairs {
@@ -2376,7 +2611,12 @@ mod tests {
         );
         for row in (0..n).filter(|&row| weights[row] == 0.0) {
             assert!(
-                observed.grad_x.row(row).iter().chain(observed.grad_y.row(row).iter()).all(|value| *value == 0.0),
+                observed
+                    .grad_x
+                    .row(row)
+                    .iter()
+                    .chain(observed.grad_y.row(row).iter())
+                    .all(|value| *value == 0.0),
                 "row {row} carries zero weight, so it has no cotangent"
             );
         }
@@ -2395,13 +2635,22 @@ mod tests {
         ] {
             let nullity = GaussianRemlMultiPenaltyProblem::structural_nullity(&penalties)
                 .expect("the structural nullity of well-formed penalties");
-            assert_eq!(nullity, expected, "dim ∩ ker S_k of {} penalties", penalties.len());
+            assert_eq!(
+                nullity,
+                expected,
+                "dim ∩ ker S_k of {} penalties",
+                penalties.len()
+            );
             GaussianRemlMultiPenaltyProblem::new(x.view(), y.view(), &penalties, nullity)
                 .expect("construction accepts the structural nullity");
-            for wrong in [nullity + 1, nullity.wrapping_sub(1)].into_iter().filter(|&wrong| wrong <= p) {
-                let refusal = GaussianRemlMultiPenaltyProblem::new(x.view(), y.view(), &penalties, wrong)
-                    .expect_err("construction refuses a declaration its predicate contradicts")
-                    .to_string();
+            for wrong in [nullity + 1, nullity.wrapping_sub(1)]
+                .into_iter()
+                .filter(|&wrong| wrong <= p)
+            {
+                let refusal =
+                    GaussianRemlMultiPenaltyProblem::new(x.view(), y.view(), &penalties, wrong)
+                        .expect_err("construction refuses a declaration its predicate contradicts")
+                        .to_string();
                 assert!(
                     refusal.contains(&format!("declared null space of dimension {wrong}")),
                     "the refusal must name the contradicted declaration {wrong}: {refusal}"
@@ -2422,14 +2671,36 @@ mod tests {
         let y = responses(n, &[0.3], &mut rng);
         let penalties = [curvature_penalty(p, 2)];
         let build = |weights: &Array1<f64>| {
-            GaussianRemlMultiPenaltyProblem::new_weighted(x.view(), y.view(), weights.view(), &penalties, 2)
+            GaussianRemlMultiPenaltyProblem::new_weighted(
+                x.view(),
+                y.view(),
+                weights.view(),
+                &penalties,
+                2,
+            )
         };
         build(&observation_weights(n)).expect("control: well-formed weights are accepted");
         let cases: [(&str, Array1<f64>, &str); 5] = [
-            ("a negative weight", Array1::from_shape_fn(n, |row| if row == 4 { -0.5 } else { 1.0 }), "non-negative"),
-            ("a NaN weight", Array1::from_shape_fn(n, |row| if row == 4 { f64::NAN } else { 1.0 }), "finite"),
-            ("one weight short", Array1::ones(n - 1), "weights length mismatch"),
-            ("every weight zero", Array1::zeros(n), "at least one positive-weight row"),
+            (
+                "a negative weight",
+                Array1::from_shape_fn(n, |row| if row == 4 { -0.5 } else { 1.0 }),
+                "non-negative",
+            ),
+            (
+                "a NaN weight",
+                Array1::from_shape_fn(n, |row| if row == 4 { f64::NAN } else { 1.0 }),
+                "finite",
+            ),
+            (
+                "one weight short",
+                Array1::ones(n - 1),
+                "weights length mismatch",
+            ),
+            (
+                "every weight zero",
+                Array1::zeros(n),
+                "at least one positive-weight row",
+            ),
             (
                 "fewer positive-weight rows than the null space needs",
                 Array1::from_shape_fn(n, |row| if row < 2 { 1.0 } else { 0.0 }),
@@ -2438,7 +2709,10 @@ mod tests {
         ];
         for (case, weights, expected) in cases {
             let refusal = build(&weights).expect_err(case).to_string();
-            assert!(refusal.contains(expected), "{case}: the refusal must name it ({expected}); got: {refusal}");
+            assert!(
+                refusal.contains(expected),
+                "{case}: the refusal must name it ({expected}); got: {refusal}"
+            );
         }
     }
 }

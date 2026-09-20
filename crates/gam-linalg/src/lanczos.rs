@@ -295,9 +295,11 @@ pub struct SymmetricExtremeLanczosOptions {
     pub max_steps: usize,
     /// Recompute the tiny tridiagonal eigensystem at this cadence.
     pub check_every: usize,
-    /// Required `||A v - λ v||₂ / max(||Λ_selected||∞, 1)` for every returned
-    /// pair. Scaling every Ritz residual by the retained operator norm gives
-    /// one invariant certificate for the requested eigenspace, including
+    /// Required `||A v - λ v||₂ / ||Λ_selected||∞` for every returned pair.
+    /// Scaling every Ritz residual by the retained operator norm gives one
+    /// invariant certificate for the requested eigenspace (#3784: no unit floor
+    /// on that norm, which would make the test absolute for `||A|| < 1` and tie
+    /// the certified accuracy to the operator's units), including
     /// clustered eigenvalues.
     pub relative_residual_tol: f64,
     /// Norm below which the Krylov recurrence has exactly exhausted its space.
@@ -442,18 +444,24 @@ pub fn symmetric_extreme_lanczos_eigenpairs(
             let selected_indices =
                 mgcv_largest_magnitude_indices(&values, options.target_rank);
             let residual_scale = if exhausted { 0.0 } else { beta };
+            // #3784 — the retained operator norm is the certificate's whole scale.
+            // A zero retained spectrum certifies only an exactly zero residual (an
+            // exhausted Krylov space), never by dividing into a unit floor.
             let selected_operator_scale = selected_indices
                 .iter()
                 .map(|&index| values[index].abs())
-                .fold(0.0_f64, f64::max)
-                .max(1.0);
+                .fold(0.0_f64, f64::max);
             let mut residual_bounds = Array1::<f64>::zeros(options.target_rank);
             last_worst_relative_residual = 0.0;
             for (out, &j) in selected_indices.iter().enumerate() {
                 let residual = residual_scale * vectors[[k - 1, j]].abs();
                 residual_bounds[out] = residual;
-                last_worst_relative_residual =
-                    last_worst_relative_residual.max(residual / selected_operator_scale);
+                let relative = if residual == 0.0 {
+                    0.0
+                } else {
+                    residual / selected_operator_scale
+                };
+                last_worst_relative_residual = last_worst_relative_residual.max(relative);
             }
             if last_worst_relative_residual <= options.relative_residual_tol {
                 let mut selected_vectors = Array2::<f64>::zeros((dim, options.target_rank));
@@ -694,6 +702,48 @@ mod tests {
             }
             assert!(residual_squared.sqrt() < 1e-10);
             assert!(pairs.residual_bounds[j] < 1e-10);
+        }
+    }
+
+    /// #3784 — the certificate is relative to the retained operator norm, so an
+    /// operator carried in small units certifies to the same RELATIVE accuracy.
+    /// With a unit floor on the scale, `2⁻⁴⁰·diag(1..=50)` has `‖A‖ < tol` and
+    /// "certified" at the first checkpoint with a Ritz value far below `λ_max`.
+    #[test]
+    fn adaptive_extreme_lanczos_certificate_is_invariant_to_operator_units() {
+        let dim = 50;
+        let start = vec![1.0_f64; dim];
+        let tol = 1e-8;
+        for scale in [1.0_f64, 2.0_f64.powi(-40)] {
+            let pairs = symmetric_extreme_lanczos_eigenpairs(
+                dim,
+                &start,
+                SymmetricExtremeLanczosOptions {
+                    target_rank: 1,
+                    max_steps: dim,
+                    check_every: 1,
+                    relative_residual_tol: tol,
+                    breakdown_tol: 0.0,
+                },
+                |q, out| {
+                    for i in 0..dim {
+                        out[i] = scale * (1.0 + i as f64) * q[i];
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let theta = pairs.eigenvalues[0];
+            let lambda_max = scale * dim as f64;
+            assert!(
+                pairs.residual_bounds[0] <= tol * theta.abs(),
+                "scale {scale:e}: residual {:e} is not relative to theta {theta:e}",
+                pairs.residual_bounds[0]
+            );
+            assert!(
+                (theta - lambda_max).abs() <= 1e-6 * lambda_max,
+                "scale {scale:e}: certified theta {theta:e} but lambda_max = {lambda_max:e}"
+            );
         }
     }
 }

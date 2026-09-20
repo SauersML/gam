@@ -528,7 +528,7 @@ pub(crate) fn vec_norm(v: &Array1<f64>) -> f64 {
     v.dot(v).sqrt()
 }
 
-use gam_linalg::utils::stable_softplus as softplus;
+use gam_math::special::softplus;
 
 /// Canonical-link GLM families supported by the certified z-homotopy
 /// ([`GlmHomotopyFullConformal`]). Canonical links make the candidate
@@ -886,29 +886,29 @@ impl<'a> GlmHomotopyFullConformal<'a> {
         g
     }
 
-    /// Natural magnitude of the augmented penalized gradient, mirroring the
-    /// main P-IRLS convergence certificate's `gradient_natural_scale`
-    /// (`src/solver/pirls/state.rs`): `‖Xᵀ(μ − y)‖₂ + ‖Sβ‖₂` plus the test
-    /// row's score contribution `‖x_*‖·|μ̂_* − z|`. The penalized score is a
-    /// difference of these O(√(n+1)) sums, so at the optimum the raw gradient
-    /// floor scales with this quantity, NOT with `(1 + ‖β‖)`. Dividing by
-    /// `1 + this` yields a stationarity residual that is invariant under
-    /// uniform rescaling of the objective and per-observation in meaning.
+    /// Natural magnitude of the augmented penalized gradient
+    /// `Xᵀμ − Xᵀy + Sβ + x_*(μ_* − z)`: the norms of the terms it is a
+    /// difference of, `‖Xᵀμ‖₂ + ‖Xᵀy‖₂ + ‖Sβ‖₂ + ‖x_*‖·(|μ̂_*| + |z|)`. At
+    /// the optimum those terms keep the data's magnitude while the gradient
+    /// cancels to rounding, so its floor scales with this quantity. The
+    /// cancelled score `‖Xᵀ(μ − y)‖₂` is not a scale: at an interior optimum
+    /// of an unpenalised coefficient it is itself rounding-level (gam#3451,
+    /// the P-IRLS form is gam#3339). The resulting stationarity residual is
+    /// invariant under uniform rescaling of the objective.
     fn gradient_natural_scale(&self, beta: &Array1<f64>, z: f64) -> f64 {
         let eta = fast_av(self.x, beta);
-        let mut resid = Array1::<f64>::zeros(self.n);
-        for i in 0..self.n {
-            resid[i] = self.family.mean(eta[i]) - self.y[i];
-        }
-        let score = self.x.t().dot(&resid);
-        let r_star = self.family.mean(self.x_star.dot(beta)) - z;
-        vec_norm(&score) + vec_norm(&self.s_lambda.dot(beta)) + self.star_norm * r_star.abs()
+        let mu = eta.mapv(|eta_i| self.family.mean(eta_i));
+        let mu_star = self.family.mean(self.x_star.dot(beta));
+        vec_norm(&self.x.t().dot(&mu))
+            + vec_norm(&self.x.t().dot(self.y))
+            + vec_norm(&self.s_lambda.dot(beta))
+            + self.star_norm * (mu_star.abs() + z.abs())
     }
 
     /// Scale-invariant KKT acceptance on the RAW penalized gradient, exactly
     /// the `WorkingState::certifies_kkt` certificate the engine's main solver
-    /// uses: the dimensionless residual `‖g‖ / (‖score‖ + ‖S·β‖)` is below
-    /// `tol`. The earlier predicate compared the PRECONDITIONED Newton step
+    /// uses: the dimensionless residual `‖g‖ / gradient_natural_scale` is
+    /// below `tol`. The earlier predicate compared the PRECONDITIONED Newton step
     /// `‖H⁻¹g‖` against `tol·(1 + ‖β‖)`, whose floating-point floor is
     /// `~ε·(n+1)/λ_min(H)` — n-dependent and not compensated by `(1 + ‖β‖)`,
     /// so genuinely-converged fits (e.g. raw gradient floor `3.6e-8` at
@@ -2408,5 +2408,81 @@ mod tests {
             ConformalCertificate::Refused(ConformalRefusal::UnknownPenaltyStructure)
         );
         assert!(penalty.with_labeled_rows(x.slice(ndarray::s![.., ..2]).to_owned(), y).is_err());
+    }
+
+    /// gam#3451: an unpenalised Poisson fit whose test row sits at its own fitted
+    /// mean, `z = μ̂_*`, is the augmented optimum with the training optimum's β̂:
+    /// the test row's residual is zero and the training score cancels to rounding.
+    /// A stationarity scale built from that score and residual is itself rounding,
+    /// so the certificate refused the exact solution. The scale is the operands'
+    /// norms; `‖Xᵀy‖` alone is at least `Σy` through the intercept column.
+    #[test]
+    fn unpenalised_optimum_at_its_own_fitted_test_mean_certifies_3451() {
+        use std::f64::consts::PI;
+        let n = 16usize;
+        let p = 2usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = (PI * t).cos();
+            y[i] = (1.0 + (2.0 * PI * t).sin()).exp().round();
+        }
+        let s = Array2::<f64>::zeros((p, p));
+        let weights = Array1::<f64>::ones(n);
+        let no_test_row = Array1::<f64>::zeros(p);
+        let training = GlmHomotopyFullConformal::new(
+            CanonicalGlmFamily::PoissonLog,
+            &x,
+            &y,
+            &weights,
+            &s,
+            &no_test_row,
+        )
+        .expect("training engine");
+        // Newton on the convex training likelihood; a zero test row adds nothing.
+        let mut beta = Array1::<f64>::zeros(p);
+        for _ in 0..50 {
+            let g = training.penalized_score(&beta, 0.0);
+            let step = training
+                .penalized_hessian(&beta)
+                .cholesky(Side::Lower)
+                .expect("training Hessian SPD")
+                .solvevec(&g);
+            beta -= &step;
+        }
+
+        let x_star = cosine_row(p, 0.37);
+        let eng = GlmHomotopyFullConformal::new(
+            CanonicalGlmFamily::PoissonLog,
+            &x,
+            &y,
+            &weights,
+            &s,
+            &x_star,
+        )
+        .expect("augmented engine");
+        let z = CanonicalGlmFamily::PoissonLog.mean(x_star.dot(&beta));
+        let y_total: f64 = y.sum();
+        let scale = eng.gradient_natural_scale(&beta, z);
+        assert!(
+            scale >= y_total,
+            "the stationarity scale {scale:.3e} fell below Σy = {y_total}: it is built from \
+             the cancelled score, not from its operands"
+        );
+        assert!(
+            eng.kkt_converged(&beta, z, GLM_CONVERGENCE_RTOL),
+            "the exact augmented optimum must certify: |g|={:.3e}, scale={scale:.3e}",
+            vec_norm(&eng.penalized_score(&beta, z))
+        );
+        let (refit, _) = eng
+            .cold_fit(z, Array1::<f64>::zeros(p))
+            .expect("the cold refit at z = μ̂_* must certify");
+        let gap = vec_norm(&(&refit - &beta));
+        assert!(
+            gap <= 1e-9 * (1.0 + vec_norm(&beta)),
+            "the cold refit at z = μ̂_* must return the training optimum (gap {gap:.3e})"
+        );
     }
 }

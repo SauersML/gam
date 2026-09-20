@@ -7,6 +7,7 @@ use ndarray::{Array2, array};
 fn survival_fit_from_parts_rejects_mismatched_lambda_lengths() {
     let parts = SurvivalLocationScaleFitResultParts {
         training_sample_size: 32,
+        log_lambdas: array![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0].mapv(f64::ln),
         beta_time: array![0.1, -0.2],
         beta_threshold: array![0.3, 0.4],
         beta_log_sigma: array![0.5],

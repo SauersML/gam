@@ -424,4 +424,28 @@ mod tests {
         assert!(lower.iter().all(|&v| v == f64::NEG_INFINITY));
         assert!(upper.iter().all(|&v| v == f64::INFINITY));
     }
+
+    #[test]
+    fn decimal_conformal_ranks_match_integer_arithmetic_with_ties_and_permutations() {
+        for n in [1usize, 2, 9, 19, 24, 49, 74, 99, 127] {
+            let ordered: Array1<f64> = (0..n).map(|i| (i / 3) as f64).collect();
+            let reversed: Array1<f64> = ordered.iter().rev().copied().collect();
+            for percent in 1..100usize {
+                let exact_rank = ((n + 1) * percent).div_ceil(100);
+                let expected = if exact_rank > n { f64::INFINITY } else { ordered[exact_rank - 1] };
+                let alpha = 1.0 - percent as f64 / 100.0;
+                for scores in [&ordered, &reversed] {
+                    assert_eq!(conformal_multiplier(scores.view(), alpha).unwrap(), expected,
+                        "n={n}, nominal level={percent}/100");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conformal_rank_resolves_both_sides_outside_the_rounding_band() {
+        let scores: Array1<f64> = (1..=99).map(|i| i as f64).collect();
+        assert_eq!(conformal_multiplier(scores.view(), 0.1 - 1e-12).unwrap(), 91.0);
+        assert_eq!(conformal_multiplier(scores.view(), 0.1 + 1e-12).unwrap(), 90.0);
+    }
 }

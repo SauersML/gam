@@ -148,7 +148,6 @@ pub(crate) fn prune_unidentified_linear_terms_for_marginal_slope(
     basis.push(intercept.mapv(|v| v / intercept_norm));
 
     let rank_alpha = gam_linalg::faer_ndarray::default_rrqr_rank_alpha();
-    let mut scale = intercept_norm.max(1.0);
     let mut kept = Vec::<LinearTermSpec>::with_capacity(spec.linear_terms.len());
     let mut dropped = Vec::<UnidentifiedScalarTerm>::new();
 
@@ -160,10 +159,14 @@ pub(crate) fn prune_unidentified_linear_terms_for_marginal_slope(
                 reason: format!("{label}: linear term '{}' has non-finite norm", term.name),
             });
         }
-        scale = scale.max(norm.max(1.0));
         let residual = residualize_against_orthonormal_basis(&column, &basis);
         let residual_norm = l2_norm(&residual);
-        let tol = rank_alpha * f64::EPSILON * ((n + basis.len() + 1).max(1) as f64) * scale;
+        // A scalar coefficient absorbs any rescaling of its column, so whether
+        // the column adds a direction is a question about its angle to the span
+        // so far: the residual is measured against the column's own norm. A
+        // scale shared across columns would make the answer depend on the
+        // units of other terms and on their order in the formula.
+        let tol = rank_alpha * f64::EPSILON * ((n + basis.len() + 1).max(1) as f64) * norm;
         let is_data_redundant = residual_norm <= tol;
         let has_constraints = term.coefficient_min.is_some() || term.coefficient_max.is_some();
         if is_data_redundant {
@@ -211,5 +214,78 @@ pub(crate) fn prune_unidentified_linear_terms_for_marginal_slope(
         spec.linear_terms = kept;
     }
     Ok(dropped)
+}
+
+#[cfg(test)]
+mod scalar_rank_scale_invariance_tests {
+    use super::*;
+    use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
+    use ndarray::Array2;
+
+    fn linear(name: &str, column: usize) -> LinearTermSpec {
+        LinearTermSpec {
+            name: name.to_string(),
+            feature_col: column,
+            feature_cols: vec![column],
+            categorical_levels: vec![],
+            double_penalty: true,
+            coefficient_geometry: gam_terms::smooth::LinearCoefficientGeometry::Unconstrained,
+            coefficient_min: None,
+            coefficient_max: None,
+            frozen_function_mass: None,
+        }
+    }
+
+    fn kept_after_prune(order: &[(&str, usize)], data: &Dataset) -> Vec<String> {
+        let mut spec = TermCollectionSpec {
+            linear_terms: order.iter().map(|&(name, column)| linear(name, column)).collect(),
+            random_effect_terms: vec![],
+            smooth_terms: vec![],
+            level: Default::default(),
+        };
+        let mut notes = FitNotes::default();
+        prune_unidentified_linear_terms_for_marginal_slope(&mut spec, data, "test", &mut notes)
+            .expect("rank check runs");
+        let mut kept: Vec<String> = spec.linear_terms.iter().map(|t| t.name.clone()).collect();
+        kept.sort();
+        kept
+    }
+
+    /// A timestamp-scale column must not make a later small-unit covariate look
+    /// redundant: both orders keep both identified columns, and an exact
+    /// multiple of the timestamp is still pruned.
+    #[test]
+    fn identified_scalar_terms_survive_other_terms_units_and_order() {
+        let n = 2000;
+        let headers: Vec<String> =
+            ["t", "x", "t2"].iter().map(|name| name.to_string()).collect();
+        let values = Array2::from_shape_fn((n, 3), |(row, column)| {
+            let t = 1.7e9 + row as f64 * 1.0e4;
+            match column {
+                0 => t,
+                1 => 0.01 * (row as f64 * 0.7).sin(),
+                _ => 2.0 * t,
+            }
+        });
+        let data = Dataset {
+            headers: headers.clone(),
+            values,
+            schema: DataSchema {
+                columns: headers
+                    .iter()
+                    .map(|name| SchemaColumn {
+                        name: name.clone(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    })
+                    .collect(),
+            },
+            column_kinds: vec![ColumnKindTag::Continuous; 3],
+        };
+        let both = vec!["t".to_string(), "x".to_string()];
+        assert_eq!(kept_after_prune(&[("t", 0), ("x", 1)], &data), both);
+        assert_eq!(kept_after_prune(&[("x", 1), ("t", 0)], &data), both);
+        assert_eq!(kept_after_prune(&[("t", 0), ("x", 1), ("t2", 2)], &data), both);
+    }
 }
 

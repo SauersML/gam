@@ -492,6 +492,58 @@ pub(crate) fn weighted_normal_equations(
     Ok((xtwx, xtwy))
 }
 
+/// Directional derivative of a diagonal working-set block's data Hessian
+/// `H = Xᵀ W X`:
+///
+/// `D_β H[d] = Xᵀ diag(dw) X + (dXᵀ W X + Xᵀ W dX)`,
+///
+/// where the bracket appears only when the block geometry moves the design,
+/// i.e. `geometry = Some((dX, w))`. `X` is used as an operator throughout. The
+/// signed Gram streams through `xt_diag_x_signed_op`, and `M = Xᵀ W dX` is
+/// accumulated over bounded row chunks of `X`, with the bracket equal to
+/// `M + Mᵀ`. No n×p copy of the design is ever formed.
+pub(crate) fn diagonal_block_hessian_drift(
+    x: &DesignMatrix,
+    dw: &Array1<f64>,
+    geometry: Option<(&Array2<f64>, &Array1<f64>)>,
+) -> Result<Array2<f64>, CustomFamilyError> {
+    let (mut drift, _) = weighted_normal_equations(x, dw, None)?;
+    let Some((dx, w)) = geometry else {
+        return Ok(drift);
+    };
+    let (n, p) = (x.nrows(), x.ncols());
+    if dx.nrows() != n || dx.ncols() != p || w.len() != n {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "diagonal dH geometry shape mismatch: dX is {}x{}, weights {}, design {n}x{p}",
+                dx.nrows(),
+                dx.ncols(),
+                w.len()
+            ),
+        });
+    }
+    let chunk = gam_linalg::utils::row_chunk_for_byte_budget(n, p);
+    let mut x_rows = Array2::<f64>::zeros((chunk, p));
+    let mut wdx_rows = Array2::<f64>::zeros((chunk, p));
+    let mut xt_w_dx = Array2::<f64>::zeros((p, p));
+    for start in (0..n).step_by(chunk) {
+        let end = (start + chunk).min(n);
+        let len = end - start;
+        let mut x_view = x_rows.slice_mut(s![..len, ..]);
+        gam_linalg::matrix::DenseDesignOperator::row_chunk_into(x, start..end, x_view.view_mut())
+            .map_err(|error| error.to_string())?;
+        let mut wdx_view = wdx_rows.slice_mut(s![..len, ..]);
+        wdx_view.assign(&dx.slice(s![start..end, ..]));
+        for (mut row, &wi) in wdx_view.rows_mut().into_iter().zip(w.slice(s![start..end])) {
+            row *= wi;
+        }
+        xt_w_dx += &fast_atb(&x_view, &wdx_view);
+    }
+    drift += &xt_w_dx;
+    drift += &xt_w_dx.t();
+    Ok(drift)
+}
+
 /// Smallest diagonal shift that makes the penalized joint Hessian
 /// Cholesky-factorable (i.e. positive definite at the solver floor), or `None`
 /// when no shift is needed (the matrix is already PD) or none can help (a
@@ -581,12 +633,12 @@ fn stabilizing_shift_core(
     // Recover a near-minimal shift without an `O(p³)`-per-eigenpair eigh: use the
     // Gershgorin shift only as a guaranteed-PD upper bracket and bisect the PD
     // frontier with Cholesky. `cholesky(H + δI)` succeeds iff `δ > −λ_min(H)`, a
-    // monotone step in `δ`, so a handful of bisections between the known-indefinite
-    // `δ = 0` (the fast-path Cholesky above already failed) and the known-PD
-    // Gershgorin bracket squeeze `δ` to within `2⁻ⁿ` of the minimal PD shift. Each
-    // step is one `O(p³/3)` Cholesky; the iteration count is capped and only runs
-    // on the indefinite cycles the fast path did not already clear, so the cost is
-    // bounded and self-vanishing. The final `+ floor` restores the `≥ floor`
+    // monotone step in `δ`, so bisection between the known-indefinite `δ = 0`
+    // (the fast-path Cholesky above already failed) and the known-PD Gershgorin
+    // bracket squeezes `δ` onto the minimal PD shift, to the Cholesky
+    // certificate's own resolution (see the stop rule below). Each step is one
+    // `O(p³/3)` Cholesky and only runs on the indefinite cycles the fast path
+    // did not already clear. The final `+ floor` restores the `≥ floor`
     // positive-definiteness margin the downstream solve relies on.
     let p = gershgorin_src.nrows();
     let mut gershgorin_min = f64::INFINITY;
@@ -633,17 +685,44 @@ fn stabilizing_shift_core(
         }
         shifted.cholesky(Side::Lower).is_ok()
     };
-    // Bisect the minimal PD shift `δ*` (where Cholesky just succeeds) in
-    // `(0, bracket]`. `δ = 0` is known-indefinite (fast path failed above); the
-    // bracket is known-PD. Cap iterations (relative squeeze to ~2⁻¹² of the
-    // bracket) so the extra Choleskys stay bounded even when the shift fires on
-    // every cycle of a coupled K-block fit.
-    const MAX_BISECT: usize = 12;
+    // A matrix with an all-zero diagonal and no caller floor carries no pivot
+    // resolution to bisect against; the guaranteed Gershgorin shift is the only
+    // certified answer.
+    if !(floor > 0.0) {
+        return Some(bracket);
+    }
+    // Locate the minimal PD shift `δ* = −λ_min(cholesky_test)` in
+    // `(0, bracket]`. `δ = 0` is known-indefinite (the fast path failed above)
+    // and the bracket is known-PD.
+    //
+    // Stop rule (gam#3660). A Cholesky pass/fail decides the PD frontier only to
+    // within `floor`, the pivot rounding bound computed above, so `δ*` is
+    // resolved once the bracket's width is `floor`. Everything below `floor` is
+    // one resolution cell, so the lower end reads `a = max(lo, floor)` and the
+    // search stops at `hi − a ≤ floor`. On exit `hi ≤ δ* + 2·floor`, so the
+    // returned `hi + floor` overshifts `δ*` by at most `3·floor`, whatever the
+    // Gershgorin bracket's looseness. A fixed number of halvings of the bracket
+    // instead leaves an error of `bracket·2⁻ⁿ`, which is relative to the
+    // bracket and not to `δ*`: on a barely-indefinite Hessian (`δ*` far below
+    // the O(1) Gershgorin bracket) it returned hundreds of times the minimal
+    // shift and flattened every direction of curvature below it.
+    //
+    // Midpoints are geometric, `√(a·hi)`. Each probe halves `ln(hi/a)`, which
+    // starts at `ln(bracket/floor)` (at most ~37 for a double) and must reach
+    // `ln(1 + floor/a)`. That costs about `log₂ ln(bracket/floor) +
+    // log₂(max(δ*, floor)/floor)` Choleskys. The near-singular gauge cycles of a
+    // coupled K-block fit (gam#729/#826), where `δ*` sits at the rounding
+    // level, resolve in about six.
     let mut lo = 0.0_f64; // indefinite
     let mut hi = bracket; // PD
-    for _ in 0..MAX_BISECT {
-        let mid = 0.5 * (lo + hi);
-        if mid <= lo || mid >= hi {
+    loop {
+        let a = lo.max(floor);
+        if hi - a <= floor {
+            break;
+        }
+        let mid = (a * hi).sqrt();
+        if !(mid > lo && mid < hi) {
+            // The bracket is at the spacing of adjacent doubles.
             break;
         }
         if cholesky_pd_at(mid) {
@@ -652,9 +731,8 @@ fn stabilizing_shift_core(
             lo = mid;
         }
     }
-    // `hi` is the tightest bracket known PD (λ_min(cholesky_test + hi·I) ≈ 0⁺).
-    // Add `floor` to restore the strict `≥ floor` margin, clamped to the original
-    // guaranteed-PD Gershgorin shift so we never exceed the conservative bound.
+    // `hi` is the tightest shift known PD. Add `floor` to restore the strict
+    // `≥ floor` margin, clamped to the guaranteed-PD Gershgorin shift.
     Some((hi + floor).min(bracket))
 }
 

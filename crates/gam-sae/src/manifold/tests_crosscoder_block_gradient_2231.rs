@@ -61,17 +61,12 @@ fn crosscoder_block_gradient_factors_are_derivatives_of_the_criterion_2231() {
         )
         .expect("the criterion prices the converged state");
     let geometry = geometry.expect("the dense criterion hands out the block it priced");
-    let lambda_smooth = at.lambda_smooth_vec().expect("smoothing strengths");
-    let solver = priced
-        .outer_gradient_arrow_solver(&cache, &lambda_smooth)
-        .expect("dense outer gradient solver");
     let components = priced
         .analytic_outer_rho_gradient_components_with_bundle(
             target.view(),
             &at,
             &loss,
             &cache,
-            &solver,
             None,
             None,
             Some(&geometry),
