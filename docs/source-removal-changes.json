@@ -2674,5 +2674,20 @@
     ],
     "reason": "#3819: gaussian_reml's private matrix_fingerprint folded each f64's bits into one word with fnv1a_mix, a word-level fold under which X and X with a negated column (whose Grams X'X differ only by a sign conjugation) could collide, so the eigen cache accepted a design it was not built for. Every fingerprint in the file now goes through gam_linalg::matrix::array2_bits_fingerprint, the canonical byte-wise FNV-1a over (nrows, ncols, each value's bits), and the block canonical key hashes the (design, penalty) fingerprint pair with DefaultHasher (it only orders rho blocks in-process). Neither helper has a caller left.",
     "evidence": "scripts/source_removal_guard.py --base 74c2b1d788902aa74c5a7306ae4014e37749e4e3 lists exactly these two private removals. Read-proof: before the change git grep -w -c on 74c2b1d788902aa74c5a7306ae4014e37749e4e3 finds matrix_fingerprint/fnv1a_mix only in crates/gam-solve/src/gaussian_reml.rs (20 occurrences, all the two definitions and their in-file callers); at the head git grep -w finds 0 occurrences in crates/ tests/ examples/. New test eigen_cache_refuses_the_design_with_a_negated_column pins the refusal."
+  },
+  {
+    "base": "8e7d3054e6bad8c2aec5baf8ada71c729ae99be9",
+    "items": [
+      "crates/gam-sae/src/manifold/fit_seed.rs:const:SAE_SHARED_ARD_K_THRESHOLD",
+      "crates/gam-sae/src/manifold/rho.rs:enum:ArdSharing",
+      "crates/gam-sae/src/manifold/rho.rs:fn:ard_sharing",
+      "crates/gam-sae/src/manifold/rho.rs:fn:max_ard_axes",
+      "crates/gam-sae/src/manifold/rho.rs:fn:new_shared_ard",
+      "crates/gam-sae/src/manifold/tests.rs:fn:shared_ard_flat_index_aliases_in_bounds_1026",
+      "tests/sae/sae/owed_1026.rs:fn:shared_ard_collapses_outer_param_count_at_large_k",
+      "tests/sae/sae/owed_1026.rs:fn:shared_ard_is_a_convergent_outer_coordinate_1026"
+    ],
+    "reason": "#3824: the SAE coordinate prior switched from per-atom ARD to one ARD precision per axis index broadcast to every atom once K >= SAE_SHARED_ARD_K_THRESHOLD = 256, so the prior family and the REML/LAML criterion changed at an arbitrary atom count. Per-atom ARD costs 1+K+sum_k d_k outer coordinates against 1+K+max_d, both Theta(K), and the per-(k,j) energies were already assembled, so no derived crossover exists. The threshold, ArdSharing, the ard_sharing accessor, SaeManifoldRho::new_shared_ard and max_ard_axes go, with the tests that pinned the shared mode (shared_ard_flat_index_aliases_in_bounds_1026, shared_ard_collapses_outer_param_count_at_large_k, shared_ard_is_a_convergent_outer_coordinate_1026).",
+    "evidence": "manifold::tests::ard_flat_index_is_unique_per_atom_axis_3824 and sae owed_1026::ard_outer_coordinates_are_per_atom_at_every_k_3824: for K in {2,255,256,1000} the flat length is 1+K+K and every (k,j) index is distinct; a heterogeneous d=[2,1,2] from_flat round trip is exact."
   }
 ]
