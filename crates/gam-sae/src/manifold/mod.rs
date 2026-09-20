@@ -89,8 +89,8 @@
 //!   jet bookkeeping the curvature assembly threads through it.
 //! * `row_layout` — the per-row active-set layout for sparse assignment.
 //! * `shape_uncertainty` — the posterior shape-band payload types.
-//! * `certificate` — the curved-dictionary global-optimality certificate and
-//!   the post-fit diagnostics it feeds.
+//! * `certificate` — the curved-dictionary incoherence/curvature measurements
+//!   and the post-fit diagnostics that carry them.
 //! * `term` — the `SaeManifoldTerm` aggregate, its shared numeric constants,
 //!   and the mutable-state snapshot the inner line search restores.
 //! * `construction` — term construction, accessors, frame/border bookkeeping,
@@ -129,7 +129,7 @@ pub(crate) use gam_linalg::faer_ndarray::{FaerCholesky, FaerCholeskyFactor, Faer
 
 pub(crate) use gam_linalg::triangular::cholesky_solve_vector;
 
-pub(crate) use gam_solve::arrow_schur::{ArrowFactorCache, ArrowRowGaugeDeflation, RowDeflationSpectrum, RowSpectralConditioning, arrow_factor_max_pivot, arrow_factor_min_pivot, probe_undamped_evidence_row_factors, solve_arrow_newton_step_with_options};
+pub(crate) use gam_solve::arrow_schur::{ArrowFactorCache, ArrowRowGaugeDeflation, RowDeflationSpectrum, RowSpectralConditioning, probe_undamped_evidence_row_factors, solve_arrow_newton_step_with_options};
 
 // #988 memory-matrix-free criterion log-det: the reduced-Schur SLQ entry point
 // and its shared tuning constants, used when the dense k×k Schur exceeds budget.
@@ -238,6 +238,9 @@ mod wbic_audit;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_dense_solver_oracles;
 
 #[cfg(test)]
 mod tests_basin_bundle_envelope;
