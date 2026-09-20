@@ -23,7 +23,7 @@ use super::law::{JointHistory, invalid, numerical};
 use super::model::JointForecast;
 use crate::{EventHistoryError, MarkKind};
 use gam_math::sparse_grid::CompensatedSum;
-use gam_math::special::{gauss_legendre, logistic, softplus};
+use gam_math::special::{gauss_legendre, logaddexp, logistic, softplus};
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 
@@ -42,12 +42,7 @@ pub(super) struct ConstantRatePosterior {
     rates: Option<Vec<GammaRate>>,
 }
 
-fn log_add(a: f64, b: f64) -> f64 {
-    if a == f64::NEG_INFINITY {
-        return b;
-    }
-    a.max(b) + softplus(-(a - b).abs())
-}
+
 
 /// The negative log evidence as a function of `z = log c - x0`.
 struct Evidence {
@@ -210,7 +205,7 @@ impl ConstantRatePosterior {
                     .zip(&exposure)
                     .map(|(&n, &e)| GammaRate {
                         shape: n as f64 + 1.0,
-                        log_rate: log_add(e.ln(), log_c),
+                        log_rate: logaddexp(e.ln(), log_c),
                     })
                     .collect(),
             ),
@@ -240,7 +235,7 @@ impl ConstantRatePosterior {
                     .zip(counts.iter().zip(&exposure))
                     .map(|(rate, (&n, &e))| GammaRate {
                         shape: rate.shape + n as f64,
-                        log_rate: log_add(e.ln(), rate.log_rate),
+                        log_rate: logaddexp(e.ln(), rate.log_rate),
                     })
                     .collect(),
             ),
@@ -378,7 +373,7 @@ fn incidence(
         width *= 2.0;
     }
     breaks.push(u);
-    let hazard = |j: usize, t: f64| rates[j].shape * (-log_add(rates[j].log_rate, t.ln())).exp();
+    let hazard = |j: usize, t: f64| rates[j].shape * (-logaddexp(rates[j].log_rate, t.ln())).exp();
     let mut order = 1;
     let mut previous = f64::INFINITY;
     loop {

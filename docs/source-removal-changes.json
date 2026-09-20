@@ -3012,5 +3012,15 @@
     ],
     "reason": "#4376: the canonical breakpoint search owns the left-span convention already required by both cubic deviation runtimes. Remove the unused right-span wrapper and duplicated post-adjustments. The retired right-span-only test is replaced by left-span and independent interval-membership tests.",
     "evidence": "MSI complete runtime unit binary compiles with warnings denied in3.38sec. Nine span tests, eight cgroup tests and26 downstream resource-policy tests pass, including adjacent-float interval membership and216 wide-integer counter combinations. All27 production crates compile coherently on main6f9de4f plus revised4378/4382; complete model unit-source metadata is checked separately. Source census finds no remaining calls to the retired constructor, refusal variant or span wrapper."
+  },
+  {
+    "base": "68a544bc55748f007628aab021e9040981763ddf",
+    "items": [
+      "crates/gam-event-history/src/joint/constant_rate_inference.rs:fn:log_add",
+      "crates/gam-math/src/probability/weighted_chi_square.rs:fn:log_add",
+      "crates/gam-terms/src/structure/anova_atom.rs:fn:log_add"
+    ],
+    "reason": "#4518: three private log-add implementations now use gam_math::special::logaddexp. Finite-input algebra is preserved while the central owner consistently handles infinities and NaNs.",
+    "evidence": "Exact current production source and focused MSI consumer regressions validate weighted chi-square tails, hypoexponential/Wilks closed forms and constant-rate event forecasts. Reference audit finds no private log_add definitions or calls in the three changed modules."
   }
 ]
