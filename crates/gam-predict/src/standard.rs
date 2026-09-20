@@ -466,6 +466,9 @@ impl PredictableModel for StandardPredictor {
                     // V∞ §5: the measure-jet extrapolation variance widens the
                     // band adopted below, never the posterior-mean point above.
                     extrapolation_variance: options.extrapolation_variance.clone(),
+                    // #2077: the weighted-Gaussian band is `σ̂²/w_i` on a curved
+                    // link exactly as on the identity link.
+                    observation_prior_weights: options.observation_prior_weights.clone(),
                     ..PredictUncertaintyOptions::default()
                 };
                 let unc = predict_gamwith_uncertainty(

@@ -7,7 +7,6 @@ pub mod generative;
 pub mod input;
 pub mod interval_policy;
 pub mod linalg;
-pub mod partial_effect;
 pub mod posterior_bands;
 pub mod posterior_predict;
 pub mod term_diagnostics;
@@ -1499,12 +1498,19 @@ impl PointCovarianceProvenance {
 ///   * `extrapolation_variance` — per-row η-scale variance added to the band's
 ///     `Var(η)`, exactly as [`PredictUncertaintyOptions::extrapolation_variance`].
 ///     The posterior-mean point is unaffected.
+///   * `observation_prior_weights` — per-row analytic prior weights for the
+///     heteroscedastic Gaussian observation band `Var(y_i) = σ̂²/w_i` (#2077),
+///     exactly as [`PredictUncertaintyOptions::observation_prior_weights`]. A
+///     curved-link Gaussian fit (`gaussian-log`, …) reaches this path, so its
+///     band must see the same weights the identity-link path does. `None` keeps
+///     the unweighted pooled `σ̂²`.
 #[derive(Clone, Debug)]
 pub struct PosteriorMeanOptions {
     pub confidence_level: Option<f64>,
     pub covariance_mode: InferenceCovarianceMode,
     pub include_observation_interval: bool,
     pub extrapolation_variance: Option<Array1<f64>>,
+    pub observation_prior_weights: Option<Array1<f64>>,
 }
 
 impl PosteriorMeanOptions {
@@ -1515,6 +1521,7 @@ impl PosteriorMeanOptions {
             covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
             include_observation_interval: false,
             extrapolation_variance: None,
+            observation_prior_weights: None,
         }
     }
 }
@@ -5007,6 +5014,67 @@ mod tests {
                 "the refusal carries the fit's reason ({mode:?}): {message}"
             );
         }
+    }
+
+    /// #2077 on a curved link: a weighted Gaussian-log fit takes the
+    /// posterior-mean branch (`prediction_uses_posterior_mean`), and its
+    /// observation band must be `Var(y_i) = σ̂²/w_i + Var(μ_i)` exactly as the
+    /// identity-link band is. Two identical design rows with weights 1 and 9
+    /// share `Var(μ)`, so the weight-9 band is ~1/3 as wide; dropping the
+    /// weights on this branch reported equal widths.
+    #[test]
+    fn gaussian_log_posterior_mean_observation_band_honours_prior_weights_2077() {
+        let beta = array![0.4, -0.3];
+        let gaussian_log = LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(StandardLink::Log),
+        );
+        let mut fit = posterior_band_fixture(beta.clone(), Array2::eye(2) * 1e-6);
+        fit.likelihood_family = Some(gaussian_log.clone());
+        let predictor = StandardPredictor {
+            beta,
+            family: gaussian_log,
+            link_kind: None,
+            covariance: None,
+            link_wiggle: None,
+        };
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0, 0.5], [1.0, 0.5]]),
+            offset: array![0.0, 0.0],
+            design_noise: None,
+            offset_noise: None,
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        };
+        let band_widths = |weights: Option<Array1<f64>>| {
+            let options = PosteriorMeanOptions {
+                confidence_level: Some(0.9),
+                include_observation_interval: true,
+                observation_prior_weights: weights,
+                ..PosteriorMeanOptions::point_only()
+            };
+            let prediction = predictor
+                .predict_posterior_mean(&input, &fit, &options)
+                .expect("gaussian-log posterior-mean band");
+            let lower = prediction.observation_lower.expect("observation lower");
+            let upper = prediction.observation_upper.expect("observation upper");
+            &upper - &lower
+        };
+        let unweighted = band_widths(None);
+        let weighted = band_widths(Some(array![1.0, 9.0]));
+        assert!(
+            ((unweighted[0] - unweighted[1]) / unweighted[0]).abs() <= 1e-12,
+            "identical unweighted rows share one band: {unweighted:?}"
+        );
+        assert!(
+            ((weighted[0] - unweighted[0]) / unweighted[0]).abs() <= 1e-12,
+            "a unit-weight row keeps the pooled band: {weighted:?} vs {unweighted:?}"
+        );
+        let ratio = weighted[1] / weighted[0];
+        assert!(
+            (ratio - 1.0 / 3.0).abs() <= 1e-4,
+            "a weight-9 row's band is 1/sqrt(9) as wide on a log link (#2077); got {ratio}"
+        );
     }
 
     /// gam#2985: a withheld fit's posterior-mean point is still the posterior

@@ -1178,6 +1178,7 @@ pub fn resolve_prediction_request(
                 covariance_mode: request.covariance_mode,
                 include_observation_interval: request.observation_interval,
                 extrapolation_variance: request.extrapolation_variance.clone(),
+                observation_prior_weights: request.observation_prior_weights.clone(),
             };
             let prediction = predictor.predict_posterior_mean(input, fit, &options)?;
             let mean_standard_error = prediction.mean_standard_error.ok_or_else(|| {
