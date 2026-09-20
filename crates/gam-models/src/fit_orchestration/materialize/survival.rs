@@ -160,6 +160,19 @@ pub(crate) fn materialize_survival<'a>(
             ),
         });
     }
+    // Only the transformation/Weibull request carries penalty-block priors;
+    // no survival request carries coefficient groups.
+    reject_unrealized_precision_priors(
+        config,
+        &format!(
+            "survival_likelihood='{}'",
+            crate::survival::construction::survival_likelihood_modename(survival_mode)
+        ),
+        matches!(
+            survival_mode,
+            SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
+        ),
+    )?;
     // Fail fast on zero effective event mass (all-censored, OR every event-coded
     // row carries zero weight) for every survival likelihood (#789B /
     // construction-time fittability split; #2276). With no row contributing a
