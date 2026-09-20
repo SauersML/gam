@@ -418,6 +418,17 @@ pub(crate) fn stack_crosscoder_targets(
     Ok((stacked, dims, labels))
 }
 
+/// Explained variance of one fitted layer against its raw target, by the SAE
+/// stack's shared band-aware definition ([`crate::k_selection::explained_variance`]).
+///
+/// A layer whose total sum of squares sits inside the rounding residue of its
+/// own column means carries no variance to explain: a reconstruction inside the
+/// same band reproduces it (`1`), any other explains nothing (`0`). Deciding
+/// that on `tss > 0.0` instead is wrong in exactly this case, because a
+/// constant column's centred squares are rounding residue, not zero — a
+/// constant `0.1` layer over three rows has `tss ≈ 6e-34` — so a fit `1e-9`
+/// off in relative terms read `R² ≈ −5e13`. The result is always finite for
+/// finite inputs, so the serialized wire report never carries a `null`.
 fn reconstruction_r2(target: &Array2<f64>, fitted: &Array2<f64>) -> Result<f64, String> {
     if target.dim() != fitted.dim() {
         return Err(format!(
@@ -426,47 +437,10 @@ fn reconstruction_r2(target: &Array2<f64>, fitted: &Array2<f64>) -> Result<f64, 
             fitted.dim()
         ));
     }
-    let (n, p) = target.dim();
-    let mut means = vec![0.0; p];
-    for row in target.rows() {
-        for j in 0..p {
-            means[j] += row[j];
-        }
-    }
-    for mean in &mut means {
-        *mean /= n as f64;
-    }
-    let mut rss = 0.0;
-    let mut tss = 0.0;
-    for i in 0..n {
-        for j in 0..p {
-            let residual = target[[i, j]] - fitted[[i, j]];
-            let centered = target[[i, j]] - means[j];
-            rss += residual * residual;
-            tss += centered * centered;
-        }
-    }
-    // Degenerate constant-column layer (TSS = 0): a zero-residual fit is a
-    // PERFECT reconstruction (R² = 1), not undefined — and a NaN here would
-    // poison the serde-serialized wire report (serde_json writes non-finite
-    // floats as null). A non-zero residual against a constant target has no
-    // variance to explain and stays NaN by design.
-    //
-    // The perfect-fit threshold is RELATIVE to the target's own magnitude, not
-    // an absolute `EPSILON·n·p`: a machine-perfect fit of a large constant
-    // layer (target ≈ 1e3 everywhere) leaves `rss ≈ 1e-6` in absolute terms —
-    // still numerically perfect, but far above any fixed absolute floor. Scale
-    // the tolerance by the target's total energy so the verdict is
-    // magnitude-invariant.
-    let target_energy: f64 = target.iter().map(|&v| v * v).sum();
-    let perfect_tol = f64::EPSILON * (n * p) as f64 * target_energy.max(1.0);
-    Ok(if tss > 0.0 {
-        1.0 - rss / tss
-    } else if rss <= perfect_tol {
-        1.0
-    } else {
-        f64::NAN
-    })
+    Ok(crate::k_selection::explained_variance(
+        target.view(),
+        fitted.view(),
+    ))
 }
 
 /// Build the production circle seed and run the typed crosscoder schedule. This
@@ -991,6 +965,22 @@ mod tests {
         );
         assert_eq!(dims, vec![1, 2]);
         assert_eq!(labels, vec!["middle", "late"]);
+    }
+
+    /// A constant layer has only rounding residue for a total sum of squares.
+    /// Its R² must follow the shared band-aware definition — `1` for a
+    /// reproduction, `0` for anything else — instead of dividing by the residue
+    /// (`R² ≈ −5e13` for a fit `1e-9` off) or reading as undefined.
+    #[test]
+    fn constant_layer_r2_is_decided_by_the_rounding_band_not_the_residue() {
+        let target = Array2::<f64>::from_elem((3, 1), 0.1);
+        assert_eq!(reconstruction_r2(&target, &target).unwrap(), 1.0);
+        let off = target.mapv(|value| value * (1.0 + 1e-9));
+        assert_eq!(reconstruction_r2(&off, &target).unwrap(), 0.0);
+        assert_eq!(reconstruction_r2(&target, &off).unwrap(), 0.0);
+        let spread = ndarray::array![[0.0], [1.0], [2.0]];
+        let fitted = ndarray::array![[0.0], [1.0], [1.0]];
+        assert_eq!(reconstruction_r2(&spread, &fitted).unwrap(), 0.5);
     }
 
     #[test]
