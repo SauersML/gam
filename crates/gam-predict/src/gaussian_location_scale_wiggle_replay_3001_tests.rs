@@ -31,7 +31,8 @@ use gam_models::inference::model_payload_builders::payload_for_gaussian_location
 use gam_models::inference::predict_input::build_predict_input_for_model;
 use gam_models::inference::predict_io::PredictInput;
 use gam_problem::BlockRole;
-use ndarray::Array1;
+use gam_terms::smooth::{build_term_collection_design, freeze_term_collection_from_design};
+use ndarray::{Array1, Array2};
 use std::collections::HashMap;
 
 const ROWS: usize = 48;
@@ -85,6 +86,91 @@ fn agreement(label: &str, predicted: &Array1<f64>, fitted: &Array1<f64>) -> usiz
         largest.2
     );
     differing
+}
+
+/// The entries of `rebuilt` whose bits differ from `fitted`'s.
+fn entries_differing(label: &str, rebuilt: &Array2<f64>, fitted: &Array2<f64>) -> usize {
+    assert_eq!(rebuilt.dim(), fitted.dim(), "{label}: design shapes differ");
+    let differing = rebuilt
+        .iter()
+        .zip(fitted.iter())
+        .filter(|(r, f)| r.to_bits() != f.to_bits())
+        .count();
+    println!(
+        "[3001] {label}: {differing}/{} design entries differ",
+        fitted.len()
+    );
+    differing
+}
+
+/// The design half of #3001 without the fit: each channel's term collection is built on
+/// the 48 rows, frozen, and rebuilt from the frozen spec on the same rows, and the rebuild
+/// must be the built design bit for bit. The control rebuilds from the chart the freeze
+/// used to write, `Q·T` composed into one product, and must NOT be, or this test could not
+/// tell the two replays apart.
+#[test]
+fn the_frozen_term_collection_rebuilds_its_design_bit_for_bit_3001() {
+    init_parallelism();
+    let data = gnomon_gaussian_table();
+    let config = FitConfig {
+        family: Some("gaussian".to_string()),
+        noise_formula: Some(TERMS.to_string()),
+        ..FitConfig::default()
+    };
+    let materialized =
+        materialize(&format!("y ~ {TERMS}"), &data, &config).expect("materialize the request");
+    let FitRequest::GaussianLocationScale(request) = materialized.request else {
+        panic!("expected a Gaussian location-scale request");
+    };
+    let mut composed_differing = 0usize;
+    for (channel, spec) in [
+        ("location", &request.spec.meanspec),
+        ("log-σ", &request.spec.log_sigmaspec),
+    ] {
+        let built = build_term_collection_design(request.data, spec).expect("build the design");
+        assert!(
+            built.smooth.terms.iter().any(|term| term
+                .collection_gauge
+                .as_ref()
+                .is_some_and(|gauge| gauge.joint_null_rotation.is_some())),
+            "premise: a {channel} smooth takes a collection gauge on a joint-null rotation"
+        );
+        let frozen = freeze_term_collection_from_design(spec, &built).expect("freeze the spec");
+        let rebuilt =
+            build_term_collection_design(request.data, &frozen).expect("rebuild the design");
+        let fitted_dense = built.design.to_dense();
+        let differing = entries_differing(
+            &format!("{channel} (rebuilt design)"),
+            &rebuilt.design.to_dense(),
+            &fitted_dense,
+        );
+        assert_eq!(
+            differing, 0,
+            "the {channel} design the frozen spec rebuilds must be the built design, bit for bit"
+        );
+
+        let mut composed = frozen.clone();
+        for term in &mut composed.smooth_terms {
+            if let (Some(rotation), Some(chart)) = (
+                term.joint_null_rotation.take(),
+                term.frozen_parametric_residualization.as_mut(),
+            ) {
+                chart.coefficient_transform = rotation.rotation.dot(&chart.coefficient_transform);
+            }
+        }
+        let composed_rebuilt =
+            build_term_collection_design(request.data, &composed).expect("rebuild composed");
+        composed_differing += entries_differing(
+            &format!("{channel} (composed Q·T control)"),
+            &composed_rebuilt.design.to_dense(),
+            &fitted_dense,
+        );
+    }
+    assert!(
+        composed_differing > 0,
+        "the control replay `B·(Q·T)` must differ from the fit's `(B·Q)·T` somewhere, or \
+         this test cannot tell the two apart"
+    );
 }
 
 #[test]
