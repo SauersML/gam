@@ -100,9 +100,8 @@ mod tests {
     use gam_linalg::matrix::DesignMatrix;
     use gam_math::probability::standard_normal_quantile;
     use gam_problem::{
-        Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec,
-        LinkComponent, LinkFunction, LogSmoothingParamsView, MixtureLinkSpec, ResponseFamily,
-        StandardLink,
+        GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkComponent,
+        LinkFunction, LogSmoothingParamsView, MixtureLinkSpec, ResponseFamily, StandardLink,
     };
 
     // Test-only zero-log-measure-scale wrapper over the production single-row
