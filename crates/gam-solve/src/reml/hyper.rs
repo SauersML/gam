@@ -2990,10 +2990,6 @@ impl<'a> RemlState<'a> {
     /// This is exact for REML/LAML evaluation with learnable link
     /// parameters. The IFT-mediated `c ⊙ X dβ/dθ` part is handled
     /// separately by the unified evaluator's third-derivative correction.
-    ///
-    /// SAS epsilon reparameterization (tanh bounding) is NOT applied here;
-    /// the caller should apply the chain rule `grad[ε_raw] *= d_eps/d_raw`
-    /// after the unified evaluator returns.
     pub(crate) fn build_sas_link_ext_coords(
         &self,
         bundle: &EvalShared,

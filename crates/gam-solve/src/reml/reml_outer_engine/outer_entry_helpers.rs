@@ -608,7 +608,7 @@ pub(crate) fn efs_q_eff_with_gamma_rate(
 /// `1 − 2·g_base/q_eff = (d − t)/q_eff` (the classical pseudoinverse-and-
 /// trace form); when out-of-band terms — Tierney–Kadane corrections,
 /// smoothing-parameter priors, Firth bias-reduction, monotonicity
-/// barriers, the SAS log-δ ridge — enter `g_full = g_base + g_extra`,
+/// barriers — enter `g_full = g_base + g_extra`,
 /// the multiplicative target shifts by exactly the right amount,
 /// `1 − 2·g_full/q_eff = (d − t − 2·g_extra)/q_eff`. No per-augmentation
 /// post-correction is needed in `compute_efs_update` /

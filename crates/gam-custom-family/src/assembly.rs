@@ -624,7 +624,7 @@ pub(crate) fn unified_joint_efs_eval(
     // Always evaluate gradient: the universal-form EFS step
     // `Δρ = log(1 − 2·g_full / q_eff)` reads it directly from the cost
     // gradient slot, so out-of-band cost terms (TK, prior, Firth,
-    // barrier, SAS log-δ ridge) shift the multiplicative target through
+    // barrier) shift the multiplicative target through
     // their gradient contribution without needing per-augmentation
     // post-corrections.
     let eval_mode = EvalMode::ValueAndGradient;

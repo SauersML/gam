@@ -2240,9 +2240,8 @@ impl<'a> RemlState<'a> {
         // Always evaluate cost + gradient: the EFS update uses the
         // universal-form `Δρ = log(1 − 2·g_full / q_eff)` for ρ and τ
         // coordinates, which folds Tierney–Kadane corrections, smoothing-
-        // parameter priors, Firth bias-reduction, monotonicity barriers,
-        // and SAS log-δ ridge contributions into the multiplicative
-        // target through their gradient channel. Without the gradient
+        // parameter priors, Firth bias-reduction and monotonicity barriers
+        // into the multiplicative target through their gradient channel. Without the gradient
         // the EFS step targets the wrong stationarity equation whenever
         // any of those terms are active.
         let eval_mode = super::reml_outer_engine::EvalMode::ValueAndGradient;
@@ -2933,11 +2932,8 @@ impl<'a> RemlState<'a> {
     /// # Returns
     ///
     /// `RemlLamlResult` whose gradient (when requested) has length `k + aux_dim`,
-    /// with the link parameters appended after the ρ coordinates. The caller is
-    /// responsible for:
-    /// - Applying SAS epsilon reparameterization chain rule (`grad[k] *= d_eps/d_raw`)
-    /// - Adding SAS ridge/barrier gradient contributions to `grad[k+1]`
-    /// - Adding SAS ridge/barrier cost contributions to `result.cost`
+    /// with the link parameters appended after the ρ coordinates, in the
+    /// coordinates the outer optimizer searches.
     /// Build link ext_coords from the current runtime link state.
     pub(crate) fn build_link_ext_coords(
         &self,

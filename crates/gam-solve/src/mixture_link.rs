@@ -25,8 +25,8 @@ pub(crate) const LOG_LINK_SOLVER_ETA_MIN: f64 = -700.0;
 pub(crate) const LOG_LINK_SOLVER_ETA_MAX: f64 = 700.0;
 /// Bound B used by the bounded sinh-arcsinh log-delta parameterisation:
 /// `delta = exp(g(raw_log_delta))` with `g = smooth_bound_jet(·, B)`. Exposed
-/// for the outer-strategy edge-barrier helpers in `solver/estimate.rs` that
-/// previously had to hard-code the same `12.0` with a "must match" comment.
+/// so the outer optimizer can search raw log δ over the support of this map
+/// (`smooth_bound_support`).
 pub(crate) const SAS_LOG_DELTA_BOUND: f64 = 12.0;
 
 /// The raw interval on which `smooth_bound_jet(·, bound)` still depends on its

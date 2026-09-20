@@ -115,9 +115,9 @@ fn efs_penalty_like_steps(
 /// covers both the base REML/LAML stationarity (`g_extra = 0`,
 /// recovering the canonical `log((d − t)/q_eff)`) and any out-of-band
 /// augmentations — Tierney–Kadane corrections, smoothing-parameter
-/// priors, Firth bias-reduction, monotonicity barriers, SAS log-δ ridge
-/// — the step automatically targets the right *augmented* stationarity
-/// without any per-augmentation post-correction.
+/// priors, Firth bias-reduction, monotonicity barriers — the step
+/// automatically targets the right *augmented* stationarity without any
+/// per-augmentation post-correction.
 ///
 /// At any stationary point of `V_total`, `g_full = 0`, so `Δρ = 0`.
 /// In the over-correction regime (`2·g_full ≥ q_eff`) the multiplicative
