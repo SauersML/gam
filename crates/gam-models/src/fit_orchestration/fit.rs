@@ -2651,6 +2651,7 @@ fn survival_unified_fit_result(
         coefficient_influence: None,
         weighted_gram: None,
         identified_subspace: None,
+        working_residual: None,
     };
 
     // The published coefficients are the posterior mean (gam#3575), and the
