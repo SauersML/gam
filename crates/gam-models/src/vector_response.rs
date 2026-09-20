@@ -1,21 +1,15 @@
 //! Vector-valued response support.
 //!
-//! Many smooths sharing one latent: the shape function in the latent-variable
-//! engine maps to a reduced activation vector (tens-to-hundreds of dimensions,
-//! after a random-matrix noise cut). This module defines the response-side
-//! types, the Gaussian vector likelihood, and the connector trait the inner
-//! solver consumes.
+//! This module defines the connector trait the shared
+//! [`crate::penalized_vector_glm`] engine consumes, the shared input
+//! validation every implementation runs, and the multinomial-logit likelihood.
 //!
 //! Conventions:
 //! - `Y` is shape `(N, M)`: `N` rows, `M` output dimensions.
 //! - `eta` is shape `(N, M)`: the linear predictor with one column per output.
-//! - For Gaussian identity-link, mean(η) = η, so the likelihood depends only
-//!   on `eta` and `Y`.
 //!
-//! The Hessian is block-structured: per-row (N independent blocks for the
-//! Gaussian case), each of size `(M, M)`. For a Gaussian likelihood with
-//! Diagonal/Isotropic noise this per-row block is itself diagonal — exactly
-//! what the arrow Schur elimination in `solver/arrow_schur.rs` consumes.
+//! The Hessian is block-structured: `N` independent per-row blocks, each of
+//! size `(M, M)`.
 
 use crate::model_types::EstimationError;
 use crate::multinomial_reml::{MultinomialLogitRowProgram, multinomial_logit_probabilities_into};
@@ -87,12 +81,12 @@ fn validate_row_weights(weights: &Array1<f64>, n: usize) -> Result<(), Estimatio
     Ok(())
 }
 
-/// Connector trait the inner solver (Piece 1) plugs into.
+/// Connector trait the shared [`crate::penalized_vector_glm`] engine plugs
+/// into.
 ///
 /// `eta` is the `(N, M)` linear predictor; `y` is the `(N, M)` target. The
 /// implementation is responsible for any link inversion. The `hess_diag`
-/// return is the per-element diagonal of the per-row Hessian block; for a
-/// Diagonal-noise Gaussian this is exactly `(N, M)` of per-output precisions.
+/// return is the per-element diagonal of the per-row Hessian block.
 pub trait VectorLikelihood {
     /// log p(Y | η).
     fn log_lik(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Result<f64, EstimationError>;
@@ -105,7 +99,6 @@ pub trait VectorLikelihood {
     ) -> Result<Array2<f64>, EstimationError>;
 
     /// Diagonal of the per-row Hessian −∂² log p / ∂ η ∂ η, shape (N, M).
-    /// This is the per-row block consumed by `solver/arrow_schur.rs`.
     fn hess_diag(
         &self,
         eta: ArrayView2<f64>,
@@ -116,11 +109,9 @@ pub trait VectorLikelihood {
     ///
     /// Default implementation lifts [`Self::hess_diag`] onto the per-row
     /// diagonal, valid only when the per-row Hessian is genuinely diagonal
-    /// across outputs (e.g. Gaussian with Isotropic/Diagonal noise).
-    /// Likelihoods with off-diagonal output coupling must override this:
-    /// [`GaussianVectorLikelihood`] with a low-rank precision factor `F`
-    /// (block `w·(diag(precision) + F·Fᵀ)`, off-diagonals `w·Σ_k F[a,k]·F[b,k]`)
-    /// and multinomial-logit (per-row Fisher block `p_a (δ_ab − p_b)`).
+    /// across outputs (e.g. independent binomial columns). Likelihoods with
+    /// off-diagonal output coupling must override this, as multinomial-logit
+    /// does (per-row Fisher block `p_a (δ_ab − p_b)`).
     ///
     /// The returned array is consumed by
     /// [`gam_solve::pirls::dense_block_xtwx`] /
@@ -174,229 +165,6 @@ pub(crate) fn validate_vector_likelihood_inputs(
     }
     Ok(())
 }
-
-/// Gaussian vector likelihood with identity link.
-///
-/// `log p(Y|η) = −½ Σ_n w_n · rᵀ W r` where `r = Y_n − η_n` and `W` is the
-/// per-output **precision** matrix. For Isotropic / Diagonal `W = diag(prec)`;
-/// for `LowRank` it is `W = diag(prec) + F · Fᵀ`, with `F` carried alongside
-/// the diagonal here.
-///
-/// (Up to the constant log-determinant of the noise covariance, dropped here
-/// because it does not depend on β or the latent t; the determinant is
-/// accounted for in the REML score, not the inner likelihood.)
-#[derive(Clone, Debug)]
-pub struct GaussianVectorLikelihood {
-    /// Per-output diagonal precision (length M). For Isotropic / Diagonal /
-    /// LowRank this is the diagonal piece of the precision matrix
-    /// (`1/σ_m²` for Diagonal/Isotropic; `diag` for LowRank).
-    pub precision: Array1<f64>,
-    /// Optional dense rank-r factor `F` of size `(M, r)` such that the full
-    /// per-row precision is `diag(precision) + F · Fᵀ`. `None` for the
-    /// Isotropic / Diagonal cases.
-    pub factor: Option<Array2<f64>>,
-    /// Optional row weights (length N), or None for uniform.
-    pub row_weights: Option<Array1<f64>>,
-}
-
-impl GaussianVectorLikelihood {
-    #[inline]
-    fn row_weight(&self, n: usize) -> f64 {
-        self.row_weights.as_ref().map_or(1.0, |w| w[n])
-    }
-}
-
-impl VectorLikelihood for GaussianVectorLikelihood {
-    fn log_lik(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Result<f64, EstimationError> {
-        validate_vector_likelihood_inputs(
-            "GaussianVectorLikelihood::log_lik",
-            eta,
-            y,
-            Some(self.precision.len()),
-        )?;
-        let m = eta.ncols();
-        let rank = self.factor.as_ref().map_or(0, |f| f.ncols());
-        let mut acc = 0.0;
-        // Scratch buffer for Fᵀ r (length rank), reused across rows.
-        let mut ftr = vec![0.0f64; rank];
-        for n in 0..eta.nrows() {
-            let w = self.row_weight(n);
-            // Diagonal part: Σ_m d_m r_m²
-            let mut row_acc = 0.0;
-            for j in 0..m {
-                let r = y[[n, j]] - eta[[n, j]];
-                row_acc += self.precision[j] * r * r;
-            }
-            // Low-rank part: ||Fᵀ r||²
-            if let Some(f) = self.factor.as_ref() {
-                for k in 0..rank {
-                    ftr[k] = 0.0;
-                }
-                for j in 0..m {
-                    let r = y[[n, j]] - eta[[n, j]];
-                    for k in 0..rank {
-                        ftr[k] += f[[j, k]] * r;
-                    }
-                }
-                for k in 0..rank {
-                    row_acc += ftr[k] * ftr[k];
-                }
-            }
-            acc += w * row_acc;
-        }
-        Ok(-0.5 * acc)
-    }
-
-    fn grad_eta(
-        &self,
-        eta: ArrayView2<f64>,
-        y: ArrayView2<f64>,
-    ) -> Result<Array2<f64>, EstimationError> {
-        validate_vector_likelihood_inputs(
-            "GaussianVectorLikelihood::grad_eta",
-            eta,
-            y,
-            Some(self.precision.len()),
-        )?;
-        let (n_rows, n_cols) = eta.dim();
-        let rank = self.factor.as_ref().map_or(0, |f| f.ncols());
-        let mut out = Array2::<f64>::zeros((n_rows, n_cols));
-        let mut ftr = vec![0.0f64; rank];
-        for n in 0..n_rows {
-            let w = self.row_weight(n);
-            // Diagonal part: w · d_m · (y − η)_m
-            for j in 0..n_cols {
-                out[[n, j]] = w * self.precision[j] * (y[[n, j]] - eta[[n, j]]);
-            }
-            // Low-rank part: + w · F (Fᵀ r) for r = y − η
-            if let Some(f) = self.factor.as_ref() {
-                for k in 0..rank {
-                    ftr[k] = 0.0;
-                }
-                for j in 0..n_cols {
-                    let r = y[[n, j]] - eta[[n, j]];
-                    for k in 0..rank {
-                        ftr[k] += f[[j, k]] * r;
-                    }
-                }
-                for j in 0..n_cols {
-                    let mut s = 0.0;
-                    for k in 0..rank {
-                        s += f[[j, k]] * ftr[k];
-                    }
-                    out[[n, j]] += w * s;
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    fn hess_diag(
-        &self,
-        eta: ArrayView2<f64>,
-        y: ArrayView2<f64>,
-    ) -> Result<Array2<f64>, EstimationError> {
-        validate_vector_likelihood_inputs(
-            "GaussianVectorLikelihood::hess_diag",
-            eta,
-            y,
-            Some(self.precision.len()),
-        )?;
-        // Diagonal of −∂² log p / ∂η² = w · diag(diag(d) + F·Fᵀ); the diagonal
-        // of (F·Fᵀ) at output m is Σ_k F[m, k]². This is the diagonal
-        // *preconditioner* only — the off-diagonal cross terms F[a, k]·F[b, k]
-        // are carried by the full per-row block in [`Self::hess_block`] (which
-        // this type overrides whenever `factor` is present). Callers that need
-        // the true Hessian must use `hess_block`, not this diagonal.
-        let (n_rows, n_cols) = eta.dim();
-        let mut out = Array2::<f64>::zeros((n_rows, n_cols));
-        // Pre-compute Σ_k F[m, k]² per output m (independent of n).
-        let f_row_sqsum: Option<Array1<f64>> = self.factor.as_ref().map(|f| {
-            let m = f.nrows();
-            let r = f.ncols();
-            let mut s = Array1::<f64>::zeros(m);
-            for j in 0..m {
-                let mut acc = 0.0;
-                for k in 0..r {
-                    let v = f[[j, k]];
-                    acc += v * v;
-                }
-                s[j] = acc;
-            }
-            s
-        });
-        for n in 0..n_rows {
-            let w = self.row_weight(n);
-            for j in 0..n_cols {
-                let mut d = self.precision[j];
-                if let Some(s) = f_row_sqsum.as_ref() {
-                    d += s[j];
-                }
-                out[[n, j]] = w * d;
-            }
-        }
-        Ok(out)
-    }
-
-    fn hess_block(
-        &self,
-        eta: ArrayView2<f64>,
-        y: ArrayView2<f64>,
-    ) -> Result<Array3<f64>, EstimationError> {
-        // Per-row dense block −∂² log p / ∂η_a ∂η_b. With log-likelihood
-        //     ℓ = −½ Σ_n w_n · rₙᵀ W rₙ,   r = y − η,   W = diag(precision) + F·Fᵀ,
-        // the gradient is wₙ · W rₙ and the negative Hessian block is exactly
-        //     H_{n,a,b} = w_n · ( precision_a · δ_ab + Σ_k F[a,k] · F[b,k] ).
-        // This is the true second derivative of `log_lik` (it differentiates
-        // `grad_eta` exactly); the diagonal-only trait default would drop the
-        // F·Fᵀ cross terms F[a,k]·F[b,k] for a ≠ b, so it must be overridden
-        // whenever a low-rank factor is present.
-        validate_vector_likelihood_inputs(
-            "GaussianVectorLikelihood::hess_block",
-            eta,
-            y,
-            Some(self.precision.len()),
-        )?;
-        let (n_rows, m) = eta.dim();
-        let rank = self.factor.as_ref().map_or(0, |f| f.ncols());
-
-        // Per-output Gram of the low-rank factor, G_{a,b} = Σ_k F[a,k]·F[b,k].
-        // Independent of the row n, so assemble once and scale by w_n.
-        let gram: Option<Array2<f64>> = self.factor.as_ref().map(|f| {
-            let mut g = Array2::<f64>::zeros((m, m));
-            for a in 0..m {
-                for b in a..m {
-                    let mut acc = 0.0;
-                    for k in 0..rank {
-                        acc += f[[a, k]] * f[[b, k]];
-                    }
-                    g[[a, b]] = acc;
-                    g[[b, a]] = acc;
-                }
-            }
-            g
-        });
-
-        let mut out = Array3::<f64>::zeros((n_rows, m, m));
-        for n in 0..n_rows {
-            let w = self.row_weight(n);
-            for a in 0..m {
-                for b in 0..m {
-                    let mut val = if a == b { self.precision[a] } else { 0.0 };
-                    if let Some(g) = gram.as_ref() {
-                        val += g[[a, b]];
-                    }
-                    out[[n, a, b]] = w * val;
-                }
-            }
-        }
-        Ok(out)
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Piece 5 / Piece 1 row-block support
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Multinomial-logit (softmax) likelihood with explicit reference class.
 ///
@@ -792,21 +560,12 @@ mod tests {
     /// as DATA, not as a bug in the caller: the row loop must refuse it with the
     /// offending index named, rather than panicking or returning a NaN
     /// objective that the line search would then read as an improvement.
-    ///
-    /// The historical fixture built the likelihood through a `from_target`
-    /// convenience constructor that no longer exists. The contract does not
-    /// live there — it lives in the shared input validation every
-    /// `VectorLikelihood` row entry point runs — so the likelihood is built
-    /// from its public fields directly, which is also the shape the optimizer
-    /// hands it.
     #[test]
     fn vector_likelihood_rejects_nonfinite_optimizer_state_without_panicking_932() {
-        let likelihood = GaussianVectorLikelihood {
-            precision: Array1::from(vec![1.0, 1.0]),
-            factor: None,
-            row_weights: None,
-        };
-        let response = Array2::from_shape_vec((1, 2), vec![0.0, 0.0]).expect("response shape");
+        let likelihood = MultinomialLogitLikelihood::with_classes(3)
+            .expect("three-class reference-coded likelihood");
+        let response =
+            Array2::from_shape_vec((1, 3), vec![0.0, 1.0, 0.0]).expect("simplex response shape");
         // Positive control: the same fixture with a finite state is evaluated,
         // so the refusal below is about the NaN and not about this fixture
         // failing to reach the validation at all.
@@ -821,6 +580,14 @@ mod tests {
         let eta = Array2::from_shape_vec((1, 2), vec![0.0, f64::NAN]).expect("eta shape");
         expect_invalid_input!(
             likelihood.log_lik(eta.view(), response.view()),
+            "eta[0,1] must be finite",
+        );
+        expect_invalid_input!(
+            likelihood.grad_eta(eta.view(), response.view()),
+            "eta[0,1] must be finite",
+        );
+        expect_invalid_input!(
+            likelihood.hess_block(eta.view(), response.view()),
             "eta[0,1] must be finite",
         );
     }

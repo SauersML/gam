@@ -311,3 +311,142 @@ impl NormalizedCrossGram {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_abs_diff_eq;
+    use ndarray::array;
+
+    const LEFT: (usize, usize) = (2, 3);
+    const RIGHT: (usize, usize) = (3, 3);
+
+    fn split(theta: &Array1<f64>) -> (Array2<f64>, Array2<f64>) {
+        let cut = LEFT.0 * LEFT.1;
+        let left = theta
+            .slice(s![..cut])
+            .to_owned()
+            .into_shape_with_order(LEFT)
+            .expect("left decoder shape");
+        let right = theta
+            .slice(s![cut..])
+            .to_owned()
+            .into_shape_with_order(RIGHT)
+            .expect("right decoder shape");
+        (left, right)
+    }
+
+    /// `u^p v^p`, the normalizer factor of `φ = E u^p v^p`, computed directly
+    /// from the decoders.
+    fn normalizer(
+        left: &Array2<f64>,
+        right: &Array2<f64>,
+        normalization: GramNormalization,
+    ) -> f64 {
+        let squared = |m: &Array2<f64>| m.iter().map(|x| x * x).sum::<f64>();
+        match normalization {
+            GramNormalization::DecoderNorm => 1.0 / (squared(left) * squared(right)),
+            GramNormalization::SelfGramNorm => {
+                1.0 / (squared(&left.dot(&left.t())) * squared(&right.dot(&right.t()))).sqrt()
+            }
+        }
+    }
+
+    fn value(theta: &Array1<f64>, normalization: GramNormalization) -> f64 {
+        let (left, right) = split(theta);
+        let energy = left.dot(&right.t()).iter().map(|x| x * x).sum::<f64>();
+        energy * normalizer(&left, &right, normalization)
+    }
+
+    /// `lᵀ B r = 2 u^p v^p ⟨J l, J r⟩`, where `J` is the Jacobian of the
+    /// cross-Gram `X Yᵀ` and the directions stay fixed.
+    fn gauss_newton_form(
+        theta: &Array1<f64>,
+        l: &Array1<f64>,
+        r: &Array1<f64>,
+        normalization: GramNormalization,
+    ) -> f64 {
+        let (left, right) = split(theta);
+        let (lx, ly) = split(l);
+        let (rx, ry) = split(r);
+        let jl = lx.dot(&right.t()) + left.dot(&ly.t());
+        let jr = rx.dot(&right.t()) + left.dot(&ry.t());
+        2.0 * normalizer(&left, &right, normalization) * (&jl * &jr).sum()
+    }
+
+    /// Nothing tied the closed-form derivatives of the normalized cross-Gram to
+    /// its value. This pins them against central differences with `h = 1e-5`,
+    /// for both normalizations:
+    /// - `gradient` against the value
+    /// - `diagonal` against the gradient
+    /// - `hessian_action` against the directional derivative of the gradient
+    /// - `third_bilinear(l, r)` against the gradient of `lᵀ H r`
+    /// - `gauss_newton_bilinear_gradient(l, r)` against the gradient of the
+    ///   frozen-direction form `lᵀ B r`
+    ///
+    /// Tolerance. The stencil error is `h²/6 |f'''| + ε_mach |f| / h`. Every
+    /// differenced quantity is smooth on this fixture, and its third derivative
+    /// along each coordinate (and along `l`) is at most about `17`. That bound
+    /// was estimated with a five-point stencil of step `2e-3`, and `lᵀ H r`
+    /// under `SelfGramNorm` is the largest. The truncation error is therefore
+    /// at most about `3e-10`. Every value is `O(1)`, so the roundoff is about
+    /// `5e-11`. A `1e-8` tolerance leaves at least 25× margin.
+    #[test]
+    fn normalized_cross_gram_derivatives_match_central_differences() {
+        let theta = array![
+            0.7_f64, -0.3, 0.5, 0.2, 0.9, -0.4, 0.6, 0.1, -0.8, -0.5, 0.4, 0.3, 0.3, -0.7, 0.2
+        ];
+        let n = theta.len();
+        let l = Array1::from_shape_fn(n, |i| 0.6 * (0.9 * i as f64 + 0.4).cos());
+        let r = Array1::from_shape_fn(n, |i| 0.5 * (1.3 * i as f64 + 0.2).sin());
+        let h = 1e-5;
+        let tol = 1e-8;
+        for normalization in [
+            GramNormalization::DecoderNorm,
+            GramNormalization::SelfGramNorm,
+        ] {
+            let at = |point: &Array1<f64>| {
+                let (left, right) = split(point);
+                NormalizedCrossGram::new(left.view(), right.view(), normalization)
+                    .expect("both normalizers are positive")
+            };
+            let geometry = at(&theta);
+            let gradient = geometry.gradient();
+            let diagonal = geometry.diagonal();
+            let third = geometry.third_bilinear(l.view(), r.view());
+            let gauss_newton = geometry.gauss_newton_bilinear_gradient(l.view(), r.view());
+            for i in 0..n {
+                let mut plus = theta.clone();
+                let mut minus = theta.clone();
+                plus[i] += h;
+                minus[i] -= h;
+                let (upper, lower) = (at(&plus), at(&minus));
+                let fd_value =
+                    (value(&plus, normalization) - value(&minus, normalization)) / (2.0 * h);
+                assert_abs_diff_eq!(gradient[i], fd_value, epsilon = tol);
+                let fd_diagonal = (upper.gradient()[i] - lower.gradient()[i]) / (2.0 * h);
+                assert_abs_diff_eq!(diagonal[i], fd_diagonal, epsilon = tol);
+                let fd_third = (l.dot(&upper.hessian_action(r.view()))
+                    - l.dot(&lower.hessian_action(r.view())))
+                    / (2.0 * h);
+                assert_abs_diff_eq!(third[i], fd_third, epsilon = tol);
+                let fd_gauss_newton = (gauss_newton_form(&plus, &l, &r, normalization)
+                    - gauss_newton_form(&minus, &l, &r, normalization))
+                    / (2.0 * h);
+                assert_abs_diff_eq!(gauss_newton[i], fd_gauss_newton, epsilon = tol);
+            }
+            let action = geometry.hessian_action(l.view());
+            let fd_action = (at(&(&theta + &(h * &l))).gradient()
+                - at(&(&theta - &(h * &l))).gradient())
+                / (2.0 * h);
+            for i in 0..n {
+                assert_abs_diff_eq!(action[i], fd_action[i], epsilon = tol);
+            }
+            assert_abs_diff_eq!(
+                l.dot(&geometry.hessian_action(r.view())),
+                r.dot(&action),
+                epsilon = 1e-12
+            );
+        }
+    }
+}
