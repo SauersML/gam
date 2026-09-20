@@ -1749,11 +1749,11 @@ fn sae_fit_report_into_dict<'py>(
             sae_incoherence_report_dict(py, report)?,
         )?;
     }
-    // #1097 / #1103 — per-atom Riesz-debiased smooth-functional inference
+    // #1097 — per-atom Riesz-debiased smooth-functional inference
     // (peak-vs-mode contrast, on-fit decoder-variation norm, data-averaged value;
     // each a plug-in + one-step-debiased POINT estimate with the removed penalty
-    // bias — #1115 dropped the coverage-claiming SE/CI) and an any-n-valid
-    // split-LRT e-value for smooth significance. One entry per fitted atom.
+    // bias — #1115 dropped the coverage-claiming SE/CI). One entry per fitted
+    // atom.
     out.set_item(
         "atom_inference",
         sae_atom_inference_list(py, &fit_diagnostics.atom_inference)?,
@@ -2067,8 +2067,7 @@ fn sae_hybrid_split_dict<'py>(
 /// under #1115): the plug-in value, the one-step penalty-debiased value, and the
 /// removed penalty bias. Deliberately carries NO standard error and NO
 /// confidence interval — the conditional-on-generated-regressors variance
-/// channel is unmodelled, so any SE would under-cover. Use the atom's
-/// `smooth_significance` (any-n-valid e-value) for an honest structure test.
+/// channel is unmodelled, so any SE would under-cover.
 fn sae_atom_functional_estimate_dict<'py>(
     py: Python<'py>,
     estimate: &gam::terms::sae::identifiability::AtomFunctionalEstimate,
@@ -2081,10 +2080,9 @@ fn sae_atom_functional_estimate_dict<'py>(
 }
 
 /// Build the result-dict list of per-atom post-PIRLS inference reports (#1097
-/// penalty-debiased functional point summaries + #1103 split-LRT smooth
-/// significance). One entry per fitted atom; `functionals` /
-/// `smooth_significance` are `None` (Python `None`) for atoms whose
-/// inner-decoder smooth was not harvestable.
+/// penalty-debiased functional point summaries). One entry per fitted atom;
+/// `functionals` is `None` (Python `None`) for atoms whose inner-decoder smooth
+/// was not harvestable.
 fn sae_atom_inference_list<'py>(
     py: Python<'py>,
     reports: &[gam::terms::sae::identifiability::AtomInferenceReport],
@@ -2119,19 +2117,6 @@ fn sae_atom_inference_list<'py>(
                 a.set_item("functionals", fd)?;
             }
             None => a.set_item("functionals", py.None())?,
-        }
-        match &report.smooth_significance {
-            Some(s) => {
-                let sd = PyDict::new(py);
-                // #1103: any-n-valid split-LRT e-value for "atom smooth is
-                // non-constant" (null = constant). log E, with E_{H0}[E] ≤ 1.
-                match s.log_e_nonconstant {
-                    Some(log_e) => sd.set_item("log_e_nonconstant", log_e)?,
-                    None => sd.set_item("log_e_nonconstant", py.None())?,
-                }
-                a.set_item("smooth_significance", sd)?;
-            }
-            None => a.set_item("smooth_significance", py.None())?,
         }
         list.append(a)?;
     }

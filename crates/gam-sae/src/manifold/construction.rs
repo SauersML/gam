@@ -987,7 +987,7 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    /// Harvest the per-atom inner-decoder-smooth byproducts (#1097 / #1103) the
+    /// Harvest the per-atom inner-decoder-smooth byproducts (#1097) the
     /// residual-gauge certificate's post-PIRLS atom inference reports consume.
     ///
     /// This is the post-fit harness seam: it needs the reconstruction target `Z`
@@ -999,7 +999,7 @@ impl SaeManifoldTerm {
     /// `e_{i} = z_i − fitted_i + a_{ik} g_k(t_i)` on channel `j`, holding all
     /// other atoms and the assignment fixed at the fitted optimum — exactly the
     /// fixed snapshot ([`crate::identifiability::AtomInnerFit`]) the Riesz
-    /// debiasing and split-LRT smooth-structure e-value read.
+    /// debiasing reads.
     ///
     /// A pure read of the fitted state: it mutates only the diagnostic
     /// `atom_inner_fits` field, never a loss / criterion / penalty / optimizer
@@ -1215,7 +1215,6 @@ impl SaeManifoldTerm {
             penalized_hessian,
             row_scores,
             weights,
-            dispersion,
             peak_design_row,
             mode_design_row,
         }))
@@ -1958,9 +1957,8 @@ impl SaeManifoldTerm {
             }
         };
 
-        // #1097 / #1103: per-atom Riesz-debiased functionals and the any-n-valid
-        // split-LRT smooth-structure e-value (non-constant vs constant inner
-        // decoder), read straight off the certificate model — which carries
+        // #1097: per-atom Riesz-debiased functional point summaries, read
+        // straight off the certificate model — which carries
         // each atom's `inner_fit` snapshot when the caller harvested it via
         // [`Self::set_atom_inner_fits`] before this report. Atoms without a
         // harvested inner fit degrade their inference fields to `None` inside
@@ -2384,7 +2382,7 @@ impl SaeManifoldTerm {
                                     | SaeAtomBasisKind::EuclideanPatch
                                     | SaeAtomBasisKind::Sphere
                             ))),
-                // #1097 / #1103: the per-atom inner-decoder-smooth snapshot,
+                // #1097: the per-atom inner-decoder-smooth snapshot,
                 // attached when the post-fit harness has run
                 // [`Self::set_atom_inner_fits`] (it needs the reconstruction
                 // target Z, dropped from the objective at fit end). `None` on a

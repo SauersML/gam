@@ -1144,7 +1144,7 @@ mod vanished_stage_tests {
 ///   internal split device, not a property of the returned fit, and is
 ///   cleared after the search on both paths now;
 /// - the fit copy harvested `set_atom_inner_fits` at the PRE-rebuild
-///   dispersion when the search changed the model, where #1097/#1103 want the
+///   dispersion when the search changed the model, where #1097 wants the
 ///   settled state; the snapshots are now harvested once, after the
 ///   conditional joint-shape rebuild, at the final dispersion;
 /// - `loss` reporting stays caller-owned: the fit entry reports the last
@@ -1340,9 +1340,9 @@ fn finalize_sae_fit_report(
     // output quantities, so they read the raw output noise variance.
     term.set_certificate_dispersion(shape_uncertainty.dispersion.raw_output_noise_variance)?;
 
-    // #1097 / #1103 — harvest each atom's fixed inner-decoder-smooth snapshot at
-    // the settled state, so the diagnostics report can produce per-atom
-    // Riesz-debiased functionals and the split-LRT smooth-structure e-value.
+    // #1097 — harvest each atom's fixed inner-decoder-smooth snapshot at the
+    // settled state, so the diagnostics report can produce per-atom
+    // Riesz-debiased functionals.
     term.set_atom_inner_fits(
         z.view(),
         shape_uncertainty.dispersion.raw_output_noise_variance,
