@@ -1676,7 +1676,7 @@ pub(crate) fn reml_laml_evaluate(
     if let Some((input, normalizer)) = cone_normalizer.as_ref() {
         let drifts = build_trace_drifts();
         let y = normalizer.solved_gradient();
-        let basis = normalizer.covariance_basis();
+        let r = normalizer.normal_solves();
         let rho_vs = rho_v_ks
             .as_ref()
             .expect("the constrained normalizer requests every rho mode response");
@@ -1684,7 +1684,7 @@ pub(crate) fn reml_laml_evaluate(
         // kept–dropped rotation, read off the drift on the dropped basis (gam#2952). The kernel
         // prices operator units, so the rotation takes the curvature scale like `cone_solve`.
         let pseudo_inverse_kernel = solution.penalty_subspace_trace.as_deref();
-        let generator = normalizer.covariance_generator();
+        let normals = normalizer.retained_normals();
         for coordinate in 0..(k + ext_dim) {
             let (response, fixed_beta_rate) = if coordinate < k {
                 (&rho_vs[coordinate], &rho_curvature_a_k_betas[coordinate])
@@ -1701,13 +1701,13 @@ pub(crate) fn reml_laml_evaluate(
             };
             let drift = &drifts[coordinate];
             let precision_rate_on_y = drift.apply(y) / cone_scale;
-            let mut precision_rate_on_basis = Array2::<f64>::zeros(basis.raw_dim());
-            for column in 0..basis.ncols() {
-                precision_rate_on_basis
+            let mut precision_rate_on_r = Array2::<f64>::zeros(r.raw_dim());
+            for column in 0..r.ncols() {
+                precision_rate_on_r
                     .column_mut(column)
-                    .assign(&(drift.apply(&basis.column(column).to_owned()) / cone_scale));
+                    .assign(&(drift.apply(&r.column(column).to_owned()) / cone_scale));
             }
-            let (inverse_rotation_on_gradient, inverse_rotation_on_generator) =
+            let (inverse_rotation_on_gradient, inverse_rotation_on_normals) =
                 match pseudo_inverse_kernel {
                     Some(kernel) => {
                         let mut rate_on_dropped = Array2::<f64>::zeros(kernel.dropped_basis.raw_dim());
@@ -1719,18 +1719,18 @@ pub(crate) fn reml_laml_evaluate(
                         let rotation = kernel.pseudo_inverse_rotation(&rate_on_dropped)?;
                         (
                             rotation.apply(&input.gradient) * cone_scale,
-                            rotation.apply_columns(generator) * cone_scale,
+                            rotation.apply_columns(&normals) * cone_scale,
                         )
                     }
-                    None => (Array1::zeros(y.len()), Array2::zeros(generator.raw_dim())),
+                    None => (Array1::zeros(y.len()), Array2::zeros(normals.raw_dim())),
                 };
             let motion = crate::constrained_posterior::ConeCoordinateMotion {
                 mode_response,
                 gradient_rate,
                 precision_rate_on_y,
-                precision_rate_on_basis,
+                precision_rate_on_r,
                 inverse_rotation_on_gradient,
-                inverse_rotation_on_generator,
+                inverse_rotation_on_normals,
             };
             let first = normalizer.first_order(&motion, &cone_solve);
             grad[coordinate] += first.derivative;
@@ -2203,7 +2203,7 @@ fn cone_normalizer_outer_hessian(
     let k = curvature_lambdas.len();
     let total = mode_responses.len();
     let y = normalizer.solved_gradient();
-    let basis = normalizer.covariance_basis();
+    let r = normalizer.normal_solves();
     let mode_rhs_correction = effective_deriv.mode_response_rhs_correction();
     // The family's fixed-β pair objects, fetched across the pool as the dense Hessian fetches its
     // own; the solution memoizes them, so the log-determinant's Hessian reads these same objects.
@@ -2345,10 +2345,10 @@ fn cone_normalizer_outer_hessian(
     // dropped basis in operator units and scaled like the solves (gam#2952).
     let pseudo_inverse_kernel = solution.penalty_subspace_trace.as_deref();
     let probes = pseudo_inverse_kernel.map(|_| {
-        let generator = normalizer.covariance_generator();
-        let mut probes = Array2::<f64>::zeros((y.len(), 1 + generator.ncols()));
+        let normals = normalizer.retained_normals();
+        let mut probes = Array2::<f64>::zeros((y.len(), 1 + normals.ncols()));
         probes.column_mut(0).assign(&input.gradient);
-        probes.slice_mut(ndarray::s![.., 1..]).assign(generator);
+        probes.slice_mut(ndarray::s![.., 1..]).assign(&normals);
         probes
     });
     let dropped_rates: Vec<Array2<f64>> = match pseudo_inverse_kernel {
@@ -2407,13 +2407,13 @@ fn cone_normalizer_outer_hessian(
             }
             ConeGradientMotion::Pinned => -&state.rhs / scale,
         };
-        let mut precision_rate_on_basis = Array2::<f64>::zeros(basis.raw_dim());
-        for column in 0..basis.ncols() {
-            precision_rate_on_basis
+        let mut precision_rate_on_r = Array2::<f64>::zeros(r.raw_dim());
+        for column in 0..r.ncols() {
+            precision_rate_on_r
                 .column_mut(column)
-                .assign(&second_drift(&basis.column(column).to_owned()));
+                .assign(&second_drift(&r.column(column).to_owned()));
         }
-        let (inverse_rotation_on_gradient, inverse_rotation_on_generator) =
+        let (inverse_rotation_on_gradient, inverse_rotation_on_normals) =
             match (pseudo_inverse_kernel, probes.as_ref()) {
                 (Some(kernel), Some(probes)) => {
                     let mut second_on_dropped = Array2::<f64>::zeros(kernel.dropped_basis.raw_dim());
@@ -2435,18 +2435,15 @@ fn cone_normalizer_outer_hessian(
                         turned.slice(ndarray::s![.., 1..]).to_owned(),
                     )
                 }
-                _ => (
-                    Array1::zeros(y.len()),
-                    Array2::zeros(normalizer.covariance_generator().raw_dim()),
-                ),
+                _ => (Array1::zeros(y.len()), Array2::zeros(r.raw_dim())),
             };
         let pair_motion = crate::constrained_posterior::ConePairMotion {
             mode_response: state.second_response.clone(),
             gradient_rate,
             precision_rate_on_y: second_drift(y),
-            precision_rate_on_basis,
+            precision_rate_on_r,
             inverse_rotation_on_gradient,
-            inverse_rotation_on_generator,
+            inverse_rotation_on_normals,
         };
         let value = normalizer
             .second_order(

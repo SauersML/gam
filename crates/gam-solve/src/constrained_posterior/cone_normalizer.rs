@@ -42,21 +42,14 @@
 //! for every tied data row: the transformation-normal cone `ψ_iᵀA_k ≥ 0` repeats each response
 //! row once per data row of an intercept-only fit.
 //!
-//! # The orthant in its smaller coordinates
-//!
-//! `u = m₀ + Az` with `z ~ N(0, M⁻¹)`, and only the columns `A` touches enter. So the orthant
-//! is carried as `u = m₀ + Bz`, `z ~ N(0, K)`, in whichever coordinates are fewer: the rows
-//! themselves (`B = I_q`, `K = W`) when there are no more rows than supported columns, and the
-//! `r` supported columns (`B = A` on them, `K = M⁻¹` on them) otherwise. A monotonicity guard
-//! with one row per observation has thousands of rows on a few spline columns (gam#3037,
-//! gam#3038); every operation below is `O(q r²)` or `O(r³)` and never `O(q³)`. The choice is by
-//! dimension alone; both carry the same law, so `ln P` and its derivatives do not depend on it.
-//!
 //! # `ln P` by expectation propagation
 //!
 //! `P(u ≥ 0)` has no closed form beyond two rows. It is estimated by EP on the orthant's
 //! half-line indicators (Cunningham, Hennig and Lacoste-Julien, 2011): deterministic, smooth in
-//! `(m₀, K)`, and exact for one row and for rows whose normals are `M⁻¹`-orthogonal. A sweep
+//! `(m₀, W)`, and exact for one row and for rows whose normals are `M⁻¹`-orthogonal. Each sweep
+//! visits the sites in order, carrying the posterior from one site to the next by the rank-one
+//! update the site's move makes to its precision, `O(q²)` a site, and forms the posterior
+//! exactly again at the sweep's end. A sweep
 //! that moves `ln Z_EP` by no more than its own rounding band ends the iteration. The change need
 //! not fall monotonically on the way: on strongly correlated rows it can grow for one sweep and
 //! then contract geometrically. A sweep that fails to contract halves the step every later site
@@ -68,19 +61,16 @@
 //!
 //! At the EP fixed point `ln Z_EP` is stationary in the site parameters (each site's tilted and
 //! approximating cavity moments agree), so its gradient is the fixed-site derivative of the
-//! Gaussian part. With `T = diag(τ̃)`, `G = BᵀTB`, the posterior `Σ_z = (K⁻¹ + G)⁻¹ = F⁻¹K`
-//! (`F = I + KG`, so `K⁻¹` is never formed), `μ_u = m₀ + BΣ_zBᵀ(ν̃ − Tm₀)` and `ḡ = Bᵀγ`,
+//! Gaussian part. With `T = diag(τ̃)` and `E = (I + WT)⁻¹`,
 //!
 //! ```text
-//! γ := ∂lnP/∂m₀ = ν̃ − T μ_u,    Γ := ∂lnP/∂K = ½ (ḡḡᵀ − G + GΣ_zG).
+//! γ := ∂lnP/∂m₀ = Eᵀ(ν̃ − T m₀),    Γ := ∂lnP/∂W = ½ (γγᵀ − EᵀT).
 //! ```
 //!
 //! The Hessian is not stationary in the sites: along a direction they move by the linearized
-//! fixed point `(I − ∂F/∂s) ds = ∂F/∂θ dθ`, a `2q × 2q` system whose coupling has rank at most
-//! `r(r+1)/2 + r` (a site moves the posterior only through `(Σ_z, μ_z)`), and `(γ, Γ)` are
-//! differentiated through it. The criterion's derivatives chain through `y = M⁻¹g` and the
-//! basis `N` whose Gram under `M` is `K` (`R = M⁻¹Aᵀ` in row coordinates, `M⁻¹` on the
-//! supported columns otherwise), so the precision's motion is read only on `span{y, N}`.
+//! fixed point `(I − ∂F/∂s) ds = ∂F/∂θ dθ`, a `2q × 2q` system, and `(γ, Γ)` are differentiated
+//! through it. The criterion's derivatives chain through `y = M⁻¹g` and `R = M⁻¹Aᵀ`, so the
+//! precision's motion is read only on `span{y, R}`.
 
 use gam_math::probability::{normal_logcdf_derivatives, standard_normal_quantile};
 use gam_math::roundoff::accumulation_growth;
@@ -171,49 +161,47 @@ fn invert(mut a: Array2<f64>, what: &str) -> Result<Array2<f64>, ConeNormalizerR
     Ok(inverse)
 }
 
-/// `ln|det A|` and the summed magnitude of its pivot logarithms, by LU with partial pivoting.
-/// Refused unless `det A > 0`: `F = I + KG` is similar to `I + K^½GK^½` for positive
-/// semidefinite `K` and `G`, so its determinant is at least one.
-fn positive_log_det(mut a: Array2<f64>, what: &str) -> Result<(f64, f64), ConeNormalizerRefusal> {
-    let n = a.nrows();
-    let (mut log_det, mut magnitude, mut sign) = (0.0, 0.0, 1.0_f64);
-    for col in 0..n {
-        let mut pivot_row = col;
-        for row in (col + 1)..n {
-            if a[[row, col]].abs() > a[[pivot_row, col]].abs() {
-                pivot_row = row;
-            }
-        }
-        let pivot = a[[pivot_row, col]];
-        if !(pivot != 0.0 && pivot.is_finite()) {
-            return Err(ConeNormalizerRefusal::Singular {
-                reason: format!("{what} has no pivot in column {col} of {n}"),
-            });
-        }
-        if pivot_row != col {
-            for k in 0..n {
-                a.swap([col, k], [pivot_row, k]);
-            }
-            sign = -sign;
-        }
-        sign *= pivot.signum();
-        let log_pivot = pivot.abs().ln();
-        log_det += log_pivot;
-        magnitude += log_pivot.abs();
-        for row in (col + 1)..n {
-            let factor = a[[row, col]] / pivot;
-            if factor == 0.0 {
-                continue;
-            }
-            for k in (col + 1)..n {
-                a[[row, k]] -= factor * a[[col, k]];
-            }
+/// `E = (I + W T)⁻¹`. `I + WT` is similar to the positive definite `I + T^½ W T^½` for every
+/// `τ̃ ≥ 0`, so it is nonsingular whenever the sites are admissible.
+fn inverse_i_plus_wt(w: &Array2<f64>, tau: &Array1<f64>) -> Result<Array2<f64>, ConeNormalizerRefusal> {
+    let q = tau.len();
+    let mut a = Array2::<f64>::eye(q);
+    for i in 0..q {
+        for j in 0..q {
+            a[[i, j]] += w[[i, j]] * tau[j];
         }
     }
-    if !(sign > 0.0) {
-        return Err(ConeNormalizerRefusal::Singular {
-            reason: format!("{what} has a negative determinant"),
-        });
+    invert(a, "I + WT")
+}
+
+/// `ln det(I + W T)`, through the Cholesky factor of `I + T^½ W T^½`, with the magnitude of its
+/// pivot logarithms for the rounding band.
+fn log_det_i_plus_wt(w: &Array2<f64>, tau: &Array1<f64>) -> Result<(f64, f64), ConeNormalizerRefusal> {
+    let q = tau.len();
+    let root = tau.mapv(f64::sqrt);
+    let mut factor = Array2::<f64>::zeros((q, q));
+    let (mut log_det, mut magnitude) = (0.0, 0.0);
+    for j in 0..q {
+        let mut diag = 1.0 + root[j] * w[[j, j]] * root[j];
+        for k in 0..j {
+            diag -= factor[[j, k]] * factor[[j, k]];
+        }
+        if !(diag > 0.0) {
+            return Err(ConeNormalizerRefusal::Singular {
+                reason: format!("I + T^½WT^½ lost positive definiteness at pivot {j} ({diag:e})"),
+            });
+        }
+        let pivot = diag.sqrt();
+        factor[[j, j]] = pivot;
+        log_det += 2.0 * pivot.ln();
+        magnitude += (2.0 * pivot.ln()).abs();
+        for i in (j + 1)..q {
+            let mut value = root[i] * w[[i, j]] * root[j];
+            for k in 0..j {
+                value -= factor[[i, k]] * factor[[j, k]];
+            }
+            factor[[i, j]] = value / pivot;
+        }
     }
     Ok((log_det, magnitude))
 }
@@ -250,170 +238,75 @@ fn site_update(tau_c: f64, nu_c: f64) -> SiteUpdate {
     }
 }
 
-/// EP's Gaussian approximation in the orthant's coordinates `z`, formed from the sites.
-#[derive(Clone, Debug)]
-struct Posterior {
-    /// `G = BᵀTB`.
-    g: Array2<f64>,
-    /// `F = I + KG`.
-    f: Array2<f64>,
-    /// `F⁻¹`.
-    f_inv: Array2<f64>,
-    /// `Σ_z = F⁻¹K`.
-    sigma: Array2<f64>,
-    /// `μ_z = Σ_z Bᵀ(ν̃ − T m₀)`.
-    mu: Array1<f64>,
-    /// `ḡ = Bᵀγ = F⁻ᵀBᵀ(ν̃ − T m₀)`, read without forming `γ = ν̃ − Tμ_u`: that difference
-    /// cancels once a site's precision dwarfs its row's prior variance, `ḡ` does not.
-    gbar: Array1<f64>,
-}
-
-/// The per-row marginals of the posterior: the rows `w_j = Σ_z b_j`, the variances
-/// `s_j = b_jᵀΣ_z b_j` and the means `μ_j = m₀_j + b_jᵀμ_z`.
-struct Marginals {
-    loaded: Array2<f64>,
-    variance: Array1<f64>,
-    mean: Array1<f64>,
-}
-
-/// The linearized EP fixed point `(I − ∂F/∂s) ds = rhs`. With the site Jacobians `D`, the
-/// cavity map `C` from a row's marginal `(s_j, μ_j)` and the sites' effect `Ψ` on the marginals,
-/// `I − ∂F/∂s = (I + D) − DCΨ`. `I + D` is block diagonal, one `2 × 2` block per site: the
-/// Jacobian of the cavity's map to the moment-matched tilted law, a diffeomorphism for the
-/// log-concave half-line site. `Ψ = Rd·V` factors through the posterior's own coordinates
-/// `(Σ_z, μ_z)`, of dimension `m = r(r+1)/2 + r`, so the system is solved in whichever of `2q`
-/// and `m` is smaller.
-#[derive(Clone, Debug)]
-enum SiteSystem {
-    /// `(I − ∂F/∂s)⁻¹`, `2q × 2q`.
-    Direct(Array2<f64>),
-    /// Woodbury through the posterior coordinates.
-    Capacitance {
-        /// `(I + D_j)⁻¹`, row-major `2 × 2`.
-        site_inverse: Vec<[f64; 4]>,
-        /// `P_j = (I + D_j)⁻¹ D_j C_j`, row-major `2 × 2`.
-        coupling: Vec<[f64; 4]>,
-        /// `(I_m − V (I + D)⁻¹ DC Rd)⁻¹`.
-        capacitance_inverse: Array2<f64>,
-        marginals: Marginals,
-    },
-}
-
-impl Clone for Marginals {
-    fn clone(&self) -> Self {
-        Self { loaded: self.loaded.clone(), variance: self.variance.clone(), mean: self.mean.clone() }
-    }
-}
-
-impl std::fmt::Debug for Marginals {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Marginals").field("rows", &self.variance.len()).finish()
-    }
-}
-
-/// The index pairs `a ≤ b` of an `r × r` symmetric matrix's upper triangle.
-fn upper_pairs(r: usize) -> Vec<(usize, usize)> {
-    (0..r).flat_map(|a| (a..r).map(move |b| (a, b))).collect()
-}
-
-/// `ln P(u ≥ 0)` for `u = m₀ + Bz`, `z ~ N(0, K)`, at a converged EP fixed point, with its first
-/// two derivatives in `(m₀, K)`.
+/// `ln P(u ≥ 0)` for `u ~ N(m₀, W)` at a converged EP fixed point, with its first two
+/// derivatives in `(m₀, W)`.
 #[derive(Clone, Debug)]
 pub struct OrthantLogMass {
     m0: Array1<f64>,
-    /// `B`, `q × r`.
-    loadings: Array2<f64>,
-    /// `K`, `r × r`.
-    k: Array2<f64>,
+    w: Array2<f64>,
     tau: Array1<f64>,
     nu: Array1<f64>,
-    post: Posterior,
-    /// `B = I`: the orthant is carried in its rows' own coordinates, where `γ = ḡ`.
-    row_coordinates: bool,
+    /// `E = (I + W T)⁻¹` at the sites.
+    e: Array2<f64>,
     log_mass: f64,
     sweeps: usize,
     /// The share of its full update each site took on the last sweep: 1 unless a sweep failed to
     /// contract.
     fraction: f64,
-    /// The linearized fixed point, formed on the first derivative request.
-    site_system: std::sync::OnceLock<SiteSystem>,
+    /// The linearized fixed point at these sites, formed on the first derivative that reads it.
+    site_motion_system: std::sync::OnceLock<Result<SiteMotionSystem, ConeNormalizerRefusal>>,
+}
+
+/// What the sites' motion reads at a fixed point that does not depend on the direction of the
+/// motion: the posterior `(Σ, μ)`, each site's update partials in its cavity, and the inverse of
+/// `I − ∂F/∂s`. Every direction of every coordinate pair solves with the same inverse.
+#[derive(Clone, Debug)]
+struct SiteMotionSystem {
+    sigma: Array2<f64>,
+    mu: Array1<f64>,
+    jacobians: Vec<[f64; 4]>,
+    inverse: Array2<f64>,
 }
 
 impl OrthantLogMass {
-    /// Converge EP on `P(u ≥ 0)`, `u ~ N(m₀, W)`, in the rows' own coordinates.
+    /// Converge EP on `P(u ≥ 0)`, `u ~ N(m₀, W)`.
     pub fn converge(m0: &Array1<f64>, w: &Array2<f64>) -> Result<Self, ConeNormalizerRefusal> {
-        Self::converge_in(m0, &Array2::eye(m0.len()), w, true)
-    }
-
-    /// Converge EP on `P(u ≥ 0)`, `u = m₀ + Bz`, `z ~ N(0, K)`: the orthant of `N(m₀, BKBᵀ)`
-    /// carried in the `r` coordinates of `z`.
-    pub fn converge_loaded(
-        m0: &Array1<f64>,
-        loadings: &Array2<f64>,
-        k: &Array2<f64>,
-    ) -> Result<Self, ConeNormalizerRefusal> {
-        Self::converge_in(m0, loadings, k, false)
-    }
-
-    fn converge_in(
-        m0: &Array1<f64>,
-        loadings: &Array2<f64>,
-        k: &Array2<f64>,
-        row_coordinates: bool,
-    ) -> Result<Self, ConeNormalizerRefusal> {
-        let (q, r) = loadings.dim();
-        assert_eq!(m0.len(), q, "one orthant mean per loading row");
-        assert_eq!(k.dim(), (r, r), "a covariance on the loadings' coordinates");
-        if m0.iter().chain(loadings.iter()).chain(k.iter()).any(|value| !value.is_finite()) {
+        let q = m0.len();
+        if m0.iter().chain(w.iter()).any(|value| !value.is_finite()) {
             return Err(ConeNormalizerRefusal::NonFinite { what: "orthant mean or covariance" });
         }
         let mut state = Self {
             m0: m0.clone(),
-            loadings: loadings.clone(),
-            k: k.clone(),
+            w: w.clone(),
             tau: Array1::zeros(q),
             nu: Array1::zeros(q),
-            post: Posterior {
-                g: Array2::zeros((r, r)),
-                f: Array2::eye(r),
-                f_inv: Array2::eye(r),
-                sigma: k.clone(),
-                mu: Array1::zeros(r),
-                gbar: Array1::zeros(r),
-            },
-            row_coordinates,
+            e: Array2::eye(q),
             log_mass: 0.0,
             sweeps: 0,
             fraction: 1.0,
-            site_system: std::sync::OnceLock::new(),
+            site_motion_system: std::sync::OnceLock::new(),
         };
         if q == 0 {
             return Ok(state);
         }
-        state.post = state.form_posterior()?;
         let (mut previous, _) = state.evaluate_log_mass()?;
         let mut previous_change = f64::INFINITY;
         let mut fraction = 1.0_f64;
         loop {
             state.sweeps += 1;
             let (mut at_fixed_point, mut moved) = (true, false);
-            // Sequential EP: each site reads the posterior its predecessors in the sweep left.
-            // Moving site `j` by `(Δτ, Δν)` adds `Δτ b_jb_jᵀ` to the precision of `z`, so the
-            // posterior follows by Sherman–Morrison in O(r²),
-            //   `Σ ← Σ − c w wᵀ`, `μ ← μ + (Δν(1 − c s_j) − c μ_j) w`,
-            //   `w = Σ b_j`, `s_j = b_jᵀw`, `c = Δτ/(1 + Δτ s_j)`,
-            // where `1 + Δτ s_j = s_j(τ_c + τ̃_j^new) > 0` for an admissible cavity. The posterior
-            // is re-formed from the sites once per sweep, which also resets the rank-one updates'
-            // accumulated rounding before `ln Z_EP` is read.
-            let mut sigma = state.post.sigma.clone();
-            let mut mu = state.post.mu.clone();
+            // The sweep starts from the posterior of its sites, formed exactly, and carries it
+            // from site to site by the rank-one update a site's move makes to the precision
+            // `W⁻¹ + T`: with `c = Δτ̃/(1 + Δτ̃ Σ_jj)`, `Σ ← Σ − c Σ_{:j}Σ_{j:}` and
+            // `μ ← μ + Σ_{:j}(Δν̃ − Δτ̃ μ_j)/(1 + Δτ̃ Σ_jj)`. Site `j` reads the same cavity it
+            // would from `(E W, E(m₀ + W ν̃))` at the sites before it, in `O(q²)` instead of the
+            // `O(q³)` of forming and inverting `I + WT` again. `1 + Δτ̃ Σ_jj = Σ_jj (τ_c + τ̃_j)` is
+            // positive for an admissible cavity, since the new `τ̃_j` is not negative.
+            let (mut sigma, mut mu) = state.posterior();
             for j in 0..q {
-                let b = state.loadings.row(j);
-                let w = sigma.dot(&b);
-                let s_jj = b.dot(&w);
-                let mu_j = state.m0[j] + b.dot(&mu);
+                let s_jj = sigma[[j, j]];
                 let tau_c = 1.0 / s_jj - state.tau[j];
-                let nu_c = mu_j / s_jj - state.nu[j];
+                let nu_c = mu[j] / s_jj - state.nu[j];
                 if !(tau_c > 0.0 && tau_c.is_finite()) {
                     return Err(ConeNormalizerRefusal::CavityPrecision {
                         row: j,
@@ -426,30 +319,28 @@ impl OrthantLogMass {
                 let tau = (1.0 - fraction) * state.tau[j] + fraction * update.tau;
                 let nu = (1.0 - fraction) * state.nu[j] + fraction * update.nu;
                 moved |= tau != state.tau[j] || nu != state.nu[j];
-                let (delta_tau, delta_nu) = (tau - state.tau[j], nu - state.nu[j]);
+                let (d_tau, d_nu) = (tau - state.tau[j], nu - state.nu[j]);
                 state.tau[j] = tau;
                 state.nu[j] = nu;
-                if delta_tau == 0.0 && delta_nu == 0.0 {
-                    continue;
-                }
-                let c = delta_tau / (1.0 + delta_tau * s_jj);
-                let mean_step = delta_nu * (1.0 - c * s_jj) - c * mu_j;
-                mu.scaled_add(mean_step, &w);
-                for a in 0..r {
-                    let scaled = c * w[a];
-                    for b in 0..r {
-                        sigma[[a, b]] -= scaled * w[b];
+                let denominator = 1.0 + d_tau * s_jj;
+                let column = sigma.column(j).to_owned();
+                let mean_step = (d_nu - d_tau * mu[j]) / denominator;
+                mu.scaled_add(mean_step, &column);
+                let shrink = d_tau / denominator;
+                for a in 0..q {
+                    let scaled = shrink * column[a];
+                    for b in 0..q {
+                        sigma[[a, b]] -= scaled * column[b];
                     }
                 }
             }
-            state.post = state.form_posterior()?;
+            state.e = inverse_i_plus_wt(&state.w, &state.tau)?;
             let (log_mass, magnitude) = state.evaluate_log_mass()?;
             let change = (log_mass - previous).abs();
-            // Each row's cavity is read through O(r²) rounded operations and the determinant and
-            // quadratic through O(r²) per entry, summed over the q sites. A damped sweep moves
+            // Every term of ln Z_EP is formed in O(q²) rounded operations. A damped sweep moves
             // ln Z_EP by about `fraction` times what the full update would, so the band scales with
             // it: a short step is not mistaken for a settled one.
-            let band = accumulation_growth(4 * r * r + 8 * q) * magnitude;
+            let band = accumulation_growth(4 * q * q + 8 * q) * magnitude;
             if at_fixed_point || change <= fraction * band {
                 state.log_mass = log_mass;
                 state.fraction = fraction;
@@ -471,46 +362,27 @@ impl OrthantLogMass {
         }
     }
 
-    /// The posterior of `z` at the current sites: `Σ_z = (I + KG)⁻¹K`, `μ_z = Σ_z Bᵀ(ν̃ − Tm₀)`.
-    fn form_posterior(&self) -> Result<Posterior, ConeNormalizerRefusal> {
-        let (q, r) = self.loadings.dim();
-        let weighted = Array2::from_shape_fn((q, r), |(j, a)| self.tau[j] * self.loadings[[j, a]]);
-        let g = symmetrized(&self.loadings.t().dot(&weighted));
-        let f = Array2::<f64>::eye(r) + &self.k.dot(&g);
-        let f_inv = invert(f.clone(), "I + KG")?;
-        let sigma = symmetrized(&f_inv.dot(&self.k));
-        let h = self.loadings.t().dot(&(&self.nu - &(&self.tau * &self.m0)));
-        let mu = sigma.dot(&h);
-        let gbar = f_inv.t().dot(&h);
-        Ok(Posterior { g, f, f_inv, sigma, mu, gbar })
-    }
-
-    /// Every row's posterior marginal.
-    fn marginals(&self) -> Marginals {
-        let loaded = self.loadings.dot(&self.post.sigma);
-        let variance = Array1::from_shape_fn(self.m0.len(), |j| {
-            loaded.row(j).dot(&self.loadings.row(j))
-        });
-        let mean = &self.m0 + &self.loadings.dot(&self.post.mu);
-        Marginals { loaded, variance, mean }
+    /// The posterior approximation `(Σ, μ) = (E W, E (m₀ + W ν̃))`.
+    fn posterior(&self) -> (Array2<f64>, Array1<f64>) {
+        let sigma = self.e.dot(&self.w);
+        let mu = self.e.dot(&(&self.m0 + &self.w.dot(&self.nu)));
+        (sigma, mu)
     }
 
     /// `ln Z_EP` and the summed magnitude of its terms,
     ///
     /// `Σ_j [ln Φ(z_j) + ½ln(1 + τ̃_j v_j) + ½(τ̃_j m_j − ν̃_j)²/(τ̃_j(1 + τ̃_j v_j))]
-    ///  − ½ ln|I + KG| − ½ Q`,
+    ///  − ½ ln|I + WT| − ½ xᵀ(T + TWT)⁺x`,   `x = T m₀ − ν̃`,
     ///
-    /// with `(m_j, v_j)` the cavity of site `j` and `Q = xᵀ(T + TWT)⁺x`, `x = Tm₀ − ν̃`, read as
-    /// `Σ_{τ̃_j > 0} γ_j²/τ̃_j + μ_zᵀḡ`: `μ_zᵀḡ = μ_zᵀK⁻¹μ_z ≥ 0`, so neither part cancels the
-    /// other. Neither `K⁻¹`, `W⁻¹` nor `τ̃^{−½}` is formed.
+    /// with `(m_j, v_j)` the cavity of site `j`. Neither `W⁻¹` nor `τ̃^{−½}` is formed.
     fn evaluate_log_mass(&self) -> Result<(f64, f64), ConeNormalizerRefusal> {
         let q = self.m0.len();
-        let marginals = self.marginals();
+        let (sigma, mu) = self.posterior();
         let (mut total, mut magnitude) = (0.0, 0.0);
         for j in 0..q {
-            let s_jj = marginals.variance[j];
+            let s_jj = sigma[[j, j]];
             let tau_c = 1.0 / s_jj - self.tau[j];
-            let nu_c = marginals.mean[j] / s_jj - self.nu[j];
+            let nu_c = mu[j] / s_jj - self.nu[j];
             if !(tau_c > 0.0) {
                 return Err(ConeNormalizerRefusal::CavityPrecision {
                     row: j,
@@ -530,18 +402,33 @@ impl OrthantLogMass {
             total += log_cdf + site;
             magnitude += log_cdf.abs() + site.abs();
         }
-        let (log_det, log_det_magnitude) = positive_log_det(self.post.f.clone(), "I + KG")?;
-        let gamma = self.mean_gradient();
-        // A site with τ̃ = 0 has never moved, so ν̃ = 0 and γ_j = 0 there.
-        let spread: f64 =
-            (0..q).filter(|&j| self.tau[j] > 0.0).map(|j| gamma[j] * gamma[j] / self.tau[j]).sum();
-        let coupling = self.post.mu.dot(&self.post.gbar);
-        total += -0.5 * log_det - 0.5 * (spread + coupling);
-        magnitude += 0.5 * log_det_magnitude + 0.5 * (spread + coupling.abs());
+        let (log_det, log_det_magnitude) = log_det_i_plus_wt(&self.w, &self.tau)?;
+        let quadratic = self.quadratic_part()?;
+        total += -0.5 * log_det - 0.5 * quadratic;
+        magnitude += 0.5 * log_det_magnitude + 0.5 * quadratic.abs();
         if !total.is_finite() {
             return Err(ConeNormalizerRefusal::NonFinite { what: "EP log mass" });
         }
         Ok((total, magnitude))
+    }
+
+    /// `xᵀ (T + TWT)⁺ x` with `x = T m₀ − ν̃`, restricted to the sites with `τ̃ > 0` (a site with
+    /// `τ̃ = 0` has `ν̃ = 0` and contributes nothing), through `(T + TWT)⁻¹ = (I + WT)⁻¹ T⁻¹`.
+    fn quadratic_part(&self) -> Result<f64, ConeNormalizerRefusal> {
+        let support: Vec<usize> = (0..self.m0.len()).filter(|&j| self.tau[j] > 0.0).collect();
+        let n = support.len();
+        if n == 0 {
+            return Ok(0.0);
+        }
+        let w_s = Array2::from_shape_fn((n, n), |(a, b)| self.w[[support[a], support[b]]]);
+        let tau_s = Array1::from_shape_fn(n, |a| self.tau[support[a]]);
+        let x = Array1::from_shape_fn(n, |a| {
+            let j = support[a];
+            self.tau[j] * self.m0[j] - self.nu[j]
+        });
+        let e_s = inverse_i_plus_wt(&w_s, &tau_s)?;
+        let scaled = Array1::from_shape_fn(n, |a| x[a] / tau_s[a]);
+        Ok(x.dot(&e_s.dot(&scaled)))
     }
 
     /// `ln P(u ≥ 0)`.
@@ -559,259 +446,117 @@ impl OrthantLogMass {
         self.fraction
     }
 
-    /// `r`, the dimension EP's posterior is carried in.
-    pub fn dimension(&self) -> usize {
-        self.k.nrows()
-    }
-
-    /// `γ = ∂lnP/∂m₀ = ν̃ − T μ_u`, which is `ḡ` itself in row coordinates.
+    /// `γ = ∂lnP/∂m₀ = Eᵀ(ν̃ − T m₀)`.
     pub fn mean_gradient(&self) -> Array1<f64> {
-        if self.row_coordinates {
-            return self.post.gbar.clone();
-        }
-        let mean = &self.m0 + &self.loadings.dot(&self.post.mu);
-        &self.nu - &(&self.tau * &mean)
+        let x = &self.nu - &(&self.tau * &self.m0);
+        self.e.t().dot(&x)
     }
 
-    /// `Γ = ∂lnP/∂K = ½(ḡḡᵀ − G + GΣ_zG)`, `ḡ = Bᵀγ`, so `d ln P = γᵀdm₀ + tr(Γ dK)`.
+    /// `Γ = ∂lnP/∂W = ½(γγᵀ − EᵀT)`, so `d ln P = γᵀdm₀ + tr(Γ dW)`.
     pub fn covariance_gradient(&self) -> Array2<f64> {
-        let gbar = &self.post.gbar;
-        let g = &self.post.g;
-        let gsg = g.dot(&self.post.sigma).dot(g);
-        symmetrized(&Array2::from_shape_fn(g.raw_dim(), |(a, b)| {
-            0.5 * (gbar[a] * gbar[b] - g[[a, b]] + gsg[[a, b]])
-        }))
+        let gamma = self.mean_gradient();
+        let q = gamma.len();
+        Array2::from_shape_fn((q, q), |(i, j)| {
+            0.5 * (gamma[i] * gamma[j] - self.e[[j, i]] * self.tau[j])
+        })
     }
 
-    /// `(dγ, dΓ)` along `(dm₀, dK)`, the sites moving with their linearized fixed point.
+    /// `(dγ, dΓ)` along `(dm₀, dW)`, the sites moving with their linearized fixed point.
     pub fn gradient_motion(
         &self,
         dm0: &Array1<f64>,
-        dk: &Array2<f64>,
+        dw: &Array2<f64>,
     ) -> Result<(Array1<f64>, Array2<f64>), ConeNormalizerRefusal> {
-        let (q, r) = self.loadings.dim();
+        let q = self.m0.len();
         if q == 0 {
-            return Ok((Array1::zeros(0), Array2::zeros((r, r))));
+            return Ok((Array1::zeros(0), Array2::zeros((0, 0))));
         }
-        let (dtau, dnu) = self.site_motion(dm0, dk)?;
-        let b = &self.loadings;
-        let post = &self.post;
-        let mean = &self.m0 + &b.dot(&post.mu);
-        let gbar = &post.gbar;
-        // dG = Bᵀ dT B; dΣ_z = F⁻¹dK F⁻ᵀ − Σ_z dG Σ_z; dμ_z = F⁻¹dK ḡ + Σ_zBᵀ(dν̃ − dT μ_u − T dm₀).
-        let weighted = Array2::from_shape_fn((q, r), |(j, a)| dtau[j] * b[[j, a]]);
-        let d_g = symmetrized(&b.t().dot(&weighted));
-        let d_sigma = post.f_inv.dot(dk).dot(&post.f_inv.t()) - post.sigma.dot(&d_g).dot(&post.sigma);
-        let shift = &dnu - &(&dtau * &mean) - &(&self.tau * dm0);
-        let d_mu_z = post.f_inv.dot(&dk.dot(gbar)) + post.sigma.dot(&b.t().dot(&shift));
-        let d_mean = dm0 + &b.dot(&d_mu_z);
-        let d_gamma = &dnu - &(&dtau * &mean) - &(&self.tau * &d_mean);
-        let d_gbar = b.t().dot(&d_gamma);
-        let g = &post.g;
-        let curvature = d_g.dot(&post.sigma).dot(g) + g.dot(&d_sigma).dot(g) + g.dot(&post.sigma).dot(&d_g);
-        let d_big_gamma = symmetrized(&Array2::from_shape_fn((r, r), |(a, c)| {
-            0.5 * (d_gbar[a] * gbar[c] + gbar[a] * d_gbar[c] - d_g[[a, c]] + curvature[[a, c]])
-        }));
-        Ok((d_gamma, d_big_gamma))
+        let (dtau, dnu) = self.site_motion(dm0, dw)?;
+        // dE = −E (dW T + W dT) E.
+        let inner = Array2::from_shape_fn((q, q), |(i, j)| {
+            dw[[i, j]] * self.tau[j] + self.w[[i, j]] * dtau[j]
+        });
+        let de = -self.e.dot(&inner).dot(&self.e);
+        let x = &self.nu - &(&self.tau * &self.m0);
+        let dx = &dnu - &(&dtau * &self.m0) - &(&self.tau * dm0);
+        let dgamma = de.t().dot(&x) + self.e.t().dot(&dx);
+        let gamma = self.mean_gradient();
+        let dgamma_matrix = Array2::from_shape_fn((q, q), |(i, j)| {
+            0.5 * (dgamma[i] * gamma[j] + gamma[i] * dgamma[j]
+                - de[[j, i]] * self.tau[j]
+                - self.e[[j, i]] * dtau[j])
+        });
+        Ok((dgamma, dgamma_matrix))
     }
 
-    /// The sites' motion `(dτ̃, dν̃)` along `(dm₀, dK)`, from `(I − ∂F/∂s) ds = ∂F/∂θ dθ`.
+    /// The sites' motion `(dτ̃, dν̃)` along `(dm₀, dW)`, from `(I − ∂F/∂s) ds = ∂F/∂θ dθ`.
     ///
-    /// At fixed sites a row's marginal moves by `ds_j = b_jᵀF⁻¹dKF⁻ᵀb_j` and
-    /// `dμ_j = dm₀_j + b_jᵀ(F⁻¹dK ḡ − Σ_zBᵀT dm₀)`; site `j` reads the cavity
-    /// `(1/s_j − τ̃_j, μ_j/s_j − ν̃_j)`.
+    /// Per unit site change the posterior moves by `dΣ/dτ̃_k = −Σ_{:k}Σ_{k:}`,
+    /// `dμ/dτ̃_k = −Σ_{:k} μ_k`, `dμ/dν̃_k = Σ_{:k}`; along `(dm₀, dW)` by `dΣ = E dW Eᵀ` and
+    /// `dμ = E dm₀ + E dW (ν̃ − Tμ)`. Site `j` reads the cavity
+    /// `(1/Σ_jj − τ̃_j, μ_j/Σ_jj − ν̃_j)`. Only the right-hand side depends on the direction; the
+    /// system is the fixed point's own ([`Self::linearized_fixed_point`]).
     fn site_motion(
         &self,
         dm0: &Array1<f64>,
-        dk: &Array2<f64>,
+        dw: &Array2<f64>,
     ) -> Result<(Array1<f64>, Array1<f64>), ConeNormalizerRefusal> {
         let q = self.m0.len();
-        let b = &self.loadings;
-        let post = &self.post;
-        let marginals = self.marginals();
-        let gbar = &post.gbar;
-        let spread_rows = b.dot(&post.f_inv.dot(dk).dot(&post.f_inv.t()));
-        let d_mu_z = post.f_inv.dot(&dk.dot(gbar)) - post.sigma.dot(&b.t().dot(&(&self.tau * dm0)));
-        let d_mean = dm0 + &b.dot(&d_mu_z);
+        let system = self.linearized_fixed_point()?;
+        let (sigma, mu) = (&system.sigma, &system.mu);
+        let d_sigma = self.e.dot(dw).dot(&self.e.t());
+        let shift = &self.nu - &(&self.tau * mu);
+        let d_mu = self.e.dot(dm0) + self.e.dot(&dw.dot(&shift));
         let mut rhs = Array1::<f64>::zeros(2 * q);
         for j in 0..q {
-            let s_jj = marginals.variance[j];
-            let mu_j = marginals.mean[j];
-            let tau_c = 1.0 / s_jj - self.tau[j];
-            let nu_c = mu_j / s_jj - self.nu[j];
-            let [dt_dtc, dt_dnc, dn_dtc, dn_dnc] = site_update(tau_c, nu_c).jacobian;
+            let s_jj = sigma[[j, j]];
+            let [dt_dtc, dt_dnc, dn_dtc, dn_dnc] = system.jacobians[j];
             let s2 = s_jj * s_jj;
-            let d_sjj = spread_rows.row(j).dot(&b.row(j));
-            let (dtc, dnc) = (-d_sjj / s2, d_mean[j] / s_jj - mu_j * d_sjj / s2);
+            let (dtc, dnc) = (-d_sigma[[j, j]] / s2, d_mu[j] / s_jj - mu[j] * d_sigma[[j, j]] / s2);
             rhs[j] = dt_dtc * dtc + dt_dnc * dnc;
             rhs[q + j] = dn_dtc * dtc + dn_dnc * dnc;
         }
-        let ds = self.solve_site_system(&rhs)?;
+        let ds = system.inverse.dot(&rhs);
         Ok((ds.slice(s![0..q]).to_owned(), ds.slice(s![q..2 * q]).to_owned()))
     }
 
-    /// Solve the linearized fixed point `(I − ∂F/∂s) ds = rhs`, `rhs = [τ̃ block; ν̃ block]`.
-    fn solve_site_system(&self, rhs: &Array1<f64>) -> Result<Array1<f64>, ConeNormalizerRefusal> {
-        let q = self.m0.len();
-        match self.site_system()? {
-            SiteSystem::Direct(inverse) => Ok(inverse.dot(rhs)),
-            SiteSystem::Capacitance { site_inverse, coupling, capacitance_inverse, marginals } => {
-                let b = &self.loadings;
-                let r = b.ncols();
-                let quad = r * (r + 1) / 2;
-                // x₀ = (I + D)⁻¹ rhs.
-                let mut x_tau = Array1::<f64>::zeros(q);
-                let mut x_nu = Array1::<f64>::zeros(q);
+    /// The posterior, the site partials and the inverse of the linearized fixed point's
+    /// `2q × 2q` system `I − ∂F/∂s`, formed once for these sites.
+    fn linearized_fixed_point(&self) -> Result<&SiteMotionSystem, ConeNormalizerRefusal> {
+        self.site_motion_system
+            .get_or_init(|| {
+                let q = self.m0.len();
+                let (sigma, mu) = self.posterior();
+                let mut system = Array2::<f64>::eye(2 * q);
+                let mut jacobians = Vec::with_capacity(q);
                 for j in 0..q {
-                    let a = site_inverse[j];
-                    x_tau[j] = a[0] * rhs[j] + a[1] * rhs[q + j];
-                    x_nu[j] = a[2] * rhs[j] + a[3] * rhs[q + j];
-                }
-                // V x₀ = [upper(Bᵀ diag(x_τ) B); Bᵀ(x_ν − μ∘x_τ)].
-                let weighted = Array2::from_shape_fn((q, r), |(j, a)| x_tau[j] * b[[j, a]]);
-                let gram = b.t().dot(&weighted);
-                let mut moved = Array1::<f64>::zeros(quad + r);
-                for (index, &(a, c)) in upper_pairs(r).iter().enumerate() {
-                    moved[index] = gram[[a, c]];
-                }
-                let linear = b.t().dot(&(&x_nu - &(&marginals.mean * &x_tau)));
-                moved.slice_mut(s![quad..]).assign(&linear);
-                let solved = capacitance_inverse.dot(&moved);
-                // ds = x₀ + P·Rd·solved, with Rd reading (−wᵀZw, wᵀz) off each row w_j.
-                let mut z_matrix = Array2::<f64>::zeros((r, r));
-                for (index, &(a, c)) in upper_pairs(r).iter().enumerate() {
-                    z_matrix[[a, c]] = solved[index];
-                    z_matrix[[c, a]] = solved[index];
-                }
-                let z_linear = solved.slice(s![quad..]).to_owned();
-                let quadratic_rows = marginals.loaded.dot(&z_matrix);
-                let mut ds = Array1::<f64>::zeros(2 * q);
-                for j in 0..q {
-                    let w = marginals.loaded.row(j);
-                    let read_s = -quadratic_rows.row(j).dot(&w);
-                    let read_mu = w.dot(&z_linear);
-                    let p = coupling[j];
-                    ds[j] = x_tau[j] + p[0] * read_s + p[1] * read_mu;
-                    ds[q + j] = x_nu[j] + p[2] * read_s + p[3] * read_mu;
-                }
-                Ok(ds)
-            }
-        }
-    }
-
-    /// The linearized fixed point at the converged sites. It depends on the fixed point alone, not
-    /// on the direction `(dm₀, dK)`, so it is formed once and shared by every coordinate and pair.
-    fn site_system(&self) -> Result<&SiteSystem, ConeNormalizerRefusal> {
-        if let Some(system) = self.site_system.get() {
-            return Ok(system);
-        }
-        let (q, r) = self.loadings.dim();
-        let b = &self.loadings;
-        let marginals = self.marginals();
-        let quad = r * (r + 1) / 2;
-        let m = quad + r;
-        let mut jacobians = Vec::with_capacity(q);
-        for j in 0..q {
-            let s_jj = marginals.variance[j];
-            let tau_c = 1.0 / s_jj - self.tau[j];
-            let nu_c = marginals.mean[j] / s_jj - self.nu[j];
-            jacobians.push(site_update(tau_c, nu_c).jacobian);
-        }
-        let system = if m < 2 * q {
-            let mut site_inverse = Vec::with_capacity(q);
-            let mut coupling = Vec::with_capacity(q);
-            for j in 0..q {
-                let [d00, d01, d10, d11] = jacobians[j];
-                let (a00, a01, a10, a11) = (1.0 + d00, d01, d10, 1.0 + d11);
-                let det = a00 * a11 - a01 * a10;
-                if !(det != 0.0 && det.is_finite()) {
-                    return Err(ConeNormalizerRefusal::Singular {
-                        reason: format!("the EP site map at row {j} has determinant {det:e}"),
-                    });
-                }
-                let inverse = [a11 / det, -a01 / det, -a10 / det, a00 / det];
-                // C_j = [[−1/s², 0], [−μ/s², 1/s]] maps (ds_j, dμ_j) to the cavity's motion.
-                let s_jj = marginals.variance[j];
-                let s2 = s_jj * s_jj;
-                let (c00, c01, c10, c11) = (-1.0 / s2, 0.0, -marginals.mean[j] / s2, 1.0 / s_jj);
-                let dc = [
-                    d00 * c00 + d01 * c10,
-                    d00 * c01 + d01 * c11,
-                    d10 * c00 + d11 * c10,
-                    d10 * c01 + d11 * c11,
-                ];
-                coupling.push([
-                    inverse[0] * dc[0] + inverse[1] * dc[2],
-                    inverse[0] * dc[1] + inverse[1] * dc[3],
-                    inverse[2] * dc[0] + inverse[3] * dc[2],
-                    inverse[2] * dc[1] + inverse[3] * dc[3],
-                ]);
-                site_inverse.push(inverse);
-            }
-            // Capacitance I_m − Σ_j V_j P_j Rd_j, where site j's columns of V are
-            // τ̃_j → [upper(b_jb_jᵀ); −μ_j b_j] and ν̃_j → [0; b_j], and its rows of Rd are
-            // s_j → [−(2 − δ_ac) w_a w_c; 0] and μ_j → [0; w_j]. It is accumulated over blocks
-            // of m sites, so no intermediate is larger than m × 2m.
-            let pairs = upper_pairs(r);
-            let mut capacitance = Array2::<f64>::eye(m);
-            let block = m.max(1);
-            let mut start = 0;
-            while start < q {
-                let end = (start + block).min(q);
-                let n = end - start;
-                let mut v = Array2::<f64>::zeros((m, 2 * n));
-                let mut read = Array2::<f64>::zeros((2 * n, m));
-                for (i, j) in (start..end).enumerate() {
-                    let row = b.row(j);
-                    let w = marginals.loaded.row(j);
-                    let p = coupling[j];
-                    for (index, &(a, c)) in pairs.iter().enumerate() {
-                        v[[index, 2 * i]] = row[a] * row[c];
-                        let weight = if a == c { 1.0 } else { 2.0 };
-                        let spread = weight * w[a] * w[c];
-                        read[[2 * i, index]] = -p[0] * spread;
-                        read[[2 * i + 1, index]] = -p[2] * spread;
-                    }
-                    for a in 0..r {
-                        v[[quad + a, 2 * i]] = -marginals.mean[j] * row[a];
-                        v[[quad + a, 2 * i + 1]] = row[a];
-                        read[[2 * i, quad + a]] = p[1] * w[a];
-                        read[[2 * i + 1, quad + a]] = p[3] * w[a];
+                    let s_jj = sigma[[j, j]];
+                    let tau_c = 1.0 / s_jj - self.tau[j];
+                    let nu_c = mu[j] / s_jj - self.nu[j];
+                    let jacobian = site_update(tau_c, nu_c).jacobian;
+                    let [dt_dtc, dt_dnc, dn_dtc, dn_dnc] = jacobian;
+                    jacobians.push(jacobian);
+                    let s2 = s_jj * s_jj;
+                    let cavity_rate = |d_sjj: f64, d_muj: f64| -> (f64, f64) {
+                        (-d_sjj / s2, d_muj / s_jj - mu[j] * d_sjj / s2)
+                    };
+                    for k in 0..q {
+                        let (dtc, dnc) =
+                            cavity_rate(-sigma[[j, k]] * sigma[[j, k]], -sigma[[j, k]] * mu[k]);
+                        let dtc = if k == j { dtc - 1.0 } else { dtc };
+                        system[[j, k]] -= dt_dtc * dtc + dt_dnc * dnc;
+                        system[[q + j, k]] -= dn_dtc * dtc + dn_dnc * dnc;
+                        let (dtc, dnc) = cavity_rate(0.0, sigma[[j, k]]);
+                        let dnc = if k == j { dnc - 1.0 } else { dnc };
+                        system[[j, q + k]] -= dt_dtc * dtc + dt_dnc * dnc;
+                        system[[q + j, q + k]] -= dn_dtc * dtc + dn_dnc * dnc;
                     }
                 }
-                capacitance -= &v.dot(&read);
-                start = end;
-            }
-            let capacitance_inverse = invert(capacitance, "the EP site system's capacitance")?;
-            SiteSystem::Capacitance { site_inverse, coupling, capacitance_inverse, marginals }
-        } else {
-            // Per unit site change a row's marginal moves by `ds_j/dτ̃_k = −Σ_jk²`,
-            // `dμ_j/dτ̃_k = −Σ_jk μ_k` and `dμ_j/dν̃_k = Σ_jk`, `Σ_u = BΣ_zBᵀ`.
-            let sigma_u = marginals.loaded.dot(&b.t());
-            let mu = &marginals.mean;
-            let mut system = Array2::<f64>::eye(2 * q);
-            for j in 0..q {
-                let [dt_dtc, dt_dnc, dn_dtc, dn_dnc] = jacobians[j];
-                let s_jj = marginals.variance[j];
-                let s2 = s_jj * s_jj;
-                let cavity_rate = |d_sjj: f64, d_muj: f64| -> (f64, f64) {
-                    (-d_sjj / s2, d_muj / s_jj - mu[j] * d_sjj / s2)
-                };
-                for k in 0..q {
-                    let (dtc, dnc) =
-                        cavity_rate(-sigma_u[[j, k]] * sigma_u[[j, k]], -sigma_u[[j, k]] * mu[k]);
-                    let dtc = if k == j { dtc - 1.0 } else { dtc };
-                    system[[j, k]] -= dt_dtc * dtc + dt_dnc * dnc;
-                    system[[q + j, k]] -= dn_dtc * dtc + dn_dnc * dnc;
-                    let (dtc, dnc) = cavity_rate(0.0, sigma_u[[j, k]]);
-                    let dnc = if k == j { dnc - 1.0 } else { dnc };
-                    system[[j, q + k]] -= dt_dtc * dtc + dt_dnc * dnc;
-                    system[[q + j, q + k]] -= dn_dtc * dtc + dn_dnc * dnc;
-                }
-            }
-            SiteSystem::Direct(invert(system, "the linearized EP fixed point")?)
-        };
-        Ok(self.site_system.get_or_init(|| system))
+                let inverse = invert(system, "the linearized EP fixed point")?;
+                Ok(SiteMotionSystem { sigma, mu, jacobians, inverse })
+            })
+            .as_ref()
+            .map_err(|refusal| refusal.clone())
     }
 }
 
@@ -824,38 +569,38 @@ fn slack_horizon() -> Result<f64, ConeNormalizerRefusal> {
 
 /// One outer coordinate's first-order motion of the state the normalizer reads: the mode response
 /// `v = dβ̂/dθ`, the KKT gradient's total derivative `ġ`, and the precision's motion `Ṁ` applied to
-/// `y = M⁻¹g` ([`ConeNormalizer::solved_gradient`]) and to each column of the covariance basis `N`
-/// ([`ConeNormalizer::covariance_basis`]).
+/// `y = M⁻¹g` ([`ConeNormalizer::solved_gradient`]) and to each column of `R = M⁻¹Aᵀ`
+/// ([`ConeNormalizer::normal_solves`]).
 ///
 /// Where `M⁻¹` is the criterion's kept-spectrum pseudo-inverse `M⁺`, its derivative is not
 /// `−M⁺ṀM⁺` alone: the kept eigenvectors rotate into the dropped ones. That part of `D(M⁺)[Ṁ]`
-/// is applied to `g` and to each column of the basis generator `C` with `N = M⁺C`
-/// ([`ConeNormalizer::covariance_generator`]) in `inverse_rotation_on_gradient` and
-/// `inverse_rotation_on_generator`, zero where `M⁻¹` is an inverse (gam#2952).
+/// is applied to `g` and to each retained constraint normal ([`ConeNormalizer::retained_normals`])
+/// in `inverse_rotation_on_gradient` and `inverse_rotation_on_normals`, zero where `M⁻¹` is an
+/// inverse (gam#2952).
 #[derive(Clone, Debug)]
 pub struct ConeCoordinateMotion {
     pub mode_response: Array1<f64>,
     pub gradient_rate: Array1<f64>,
     pub precision_rate_on_y: Array1<f64>,
-    pub precision_rate_on_basis: Array2<f64>,
+    pub precision_rate_on_r: Array2<f64>,
     pub inverse_rotation_on_gradient: Array1<f64>,
-    pub inverse_rotation_on_generator: Array2<f64>,
+    pub inverse_rotation_on_normals: Array2<f64>,
 }
 
 /// One coordinate pair's second-order motion: `v_kl`, `g̈_kl`, and `M̈_kl` applied to `y` and to
-/// each column of `N`.
+/// each column of `R`.
 #[derive(Clone, Debug)]
 pub struct ConePairMotion {
     pub mode_response: Array1<f64>,
     pub gradient_rate: Array1<f64>,
     pub precision_rate_on_y: Array1<f64>,
-    pub precision_rate_on_basis: Array2<f64>,
+    pub precision_rate_on_r: Array2<f64>,
     /// What the inverse identities in [`ConeNormalizer::second_order`] omit where `M⁻¹` is the
     /// criterion's kept-spectrum pseudo-inverse: `(D²M⁺[Ṁ_k, Ṁ_l] − M⁺Ṁ_kM⁺Ṁ_lM⁺ − M⁺Ṁ_lM⁺Ṁ_kM⁺)`
-    /// plus the rotation of the pair drift `D M⁺[M̈] + M⁺M̈M⁺`, applied to `g` and to each column
-    /// of the generator `C`. Zero where `M⁻¹` is an inverse (gam#2952).
+    /// plus the rotation of the pair drift `D M⁺[M̈] + M⁺M̈M⁺`, applied to `g` and to each retained
+    /// normal. Zero where `M⁻¹` is an inverse (gam#2952).
     pub inverse_rotation_on_gradient: Array1<f64>,
-    pub inverse_rotation_on_generator: Array2<f64>,
+    pub inverse_rotation_on_normals: Array2<f64>,
 }
 
 /// A coordinate's first derivative of `C`, with the rates its pairs reuse.
@@ -864,9 +609,9 @@ pub struct ConeFirstOrder {
     pub derivative: f64,
     y_rate: Array1<f64>,
     m0_rate: Array1<f64>,
-    k_rate: Array2<f64>,
-    /// `M⁻¹ Ṁ N`.
-    solved_rate_on_basis: Array2<f64>,
+    w_rate: Array2<f64>,
+    /// `M⁻¹ Ṁ R`.
+    solved_rate_on_r: Array2<f64>,
 }
 
 /// The constrained Laplace normalizer's criterion share `C` at one inner mode, with the state its
@@ -877,23 +622,9 @@ pub struct ConeNormalizer {
     /// Unit-scaled rows inside the mass horizon, `q × p`.
     rows: Array2<f64>,
     y: Array1<f64>,
-    /// `N`, `p × r`, with `K = NᵀMN` the orthant's covariance and `A M⁻¹ = B Nᵀ`.
-    basis: Array2<f64>,
-    /// `C`, `p × r`, with `N = M⁻¹C`.
-    generator: Array2<f64>,
+    r: Array2<f64>,
     gradient: Array1<f64>,
     orthant: OrthantLogMass,
-}
-
-/// The columns any of `rows` touches.
-fn supported_columns<'a>(rows: impl Iterator<Item = &'a Array1<f64>>, p: usize) -> Vec<usize> {
-    let mut touched = vec![false; p];
-    for row in rows {
-        for (column, &value) in row.iter().enumerate() {
-            touched[column] |= value != 0.0;
-        }
-    }
-    (0..p).filter(|&column| touched[column]).collect()
 }
 
 impl ConeNormalizer {
@@ -920,7 +651,7 @@ impl ConeNormalizer {
         }
         let center = beta - &y;
         let p = beta.len();
-        let mut units: Vec<(Array1<f64>, f64)> = Vec::new();
+        let mut kept: Vec<(Array1<f64>, Array1<f64>, f64)> = Vec::new();
         let mut half_spaces = std::collections::HashSet::<Vec<u64>>::new();
         for row in 0..rows.nrows() {
             let norm = rows.row(row).dot(&rows.row(row)).sqrt();
@@ -934,31 +665,10 @@ impl ConeNormalizer {
             // gives each copy its own site, so a repeat enters once.
             let half_space: Vec<u64> =
                 unit.iter().chain(std::iter::once(&bound)).map(|value| (value + 0.0).to_bits()).collect();
-            if half_spaces.insert(half_space) {
-                units.push((unit, bound));
+            if !half_spaces.insert(half_space) {
+                continue;
             }
-        }
-        // `M⁻¹a` for every row, from whichever is fewer: one solve per row, or one per supported
-        // column (`M⁻¹a = Σ_c a_c M⁻¹e_c`, exact since `a` vanishes off its support).
-        let support = supported_columns(units.iter().map(|(unit, _)| unit), p);
-        let unit_solve = |column: usize| {
-            let mut unit = Array1::<f64>::zeros(p);
-            unit[column] = 1.0;
-            solve(&unit)
-        };
-        let column_solves: Option<Array2<f64>> = (units.len() > support.len()).then(|| {
-            let mut solves = Array2::<f64>::zeros((p, support.len()));
-            for (index, &column) in support.iter().enumerate() {
-                solves.column_mut(index).assign(&unit_solve(column));
-            }
-            solves
-        });
-        let mut kept: Vec<(Array1<f64>, Array1<f64>, f64)> = Vec::new();
-        for (unit, scaled_bound) in units {
-            let solved = match column_solves.as_ref() {
-                Some(solves) => solves.dot(&Array1::from_shape_fn(support.len(), |i| unit[support[i]])),
-                None => solve(&unit),
-            };
+            let solved = solve(&unit);
             let variance = unit.dot(&solved);
             if !variance.is_finite() {
                 return Err(ConeNormalizerRefusal::NonFinite { what: "constraint-normal variance" });
@@ -966,63 +676,27 @@ impl ConeNormalizer {
             if !(variance > 0.0) {
                 continue;
             }
-            let mean = unit.dot(&center) - scaled_bound;
+            let mean = unit.dot(&center) - bound;
             if mean / variance.sqrt() < horizon {
                 kept.push((unit, solved, mean));
             }
         }
         let q = kept.len();
-        let kept_support = supported_columns(kept.iter().map(|(unit, _, _)| unit), p);
         let mut a = Array2::<f64>::zeros((q, p));
+        let mut r = Array2::<f64>::zeros((p, q));
         let mut m0 = Array1::<f64>::zeros(q);
-        for (i, (unit, _, mean)) in kept.iter().enumerate() {
-            a.row_mut(i).assign(unit);
-            m0[i] = *mean;
+        for (i, (unit, solved, mean)) in kept.into_iter().enumerate() {
+            a.row_mut(i).assign(&unit);
+            r.column_mut(i).assign(&solved);
+            m0[i] = mean;
         }
-        let row_coordinates = q <= kept_support.len();
-        let (loadings, basis, generator, k) = if row_coordinates {
-            // Row coordinates: B = I, N = R = M⁻¹Aᵀ, K = W = AR.
-            let mut r = Array2::<f64>::zeros((p, q));
-            for (i, (_, solved, _)) in kept.iter().enumerate() {
-                r.column_mut(i).assign(solved);
-            }
-            let w = symmetrized(&a.dot(&r));
-            (Array2::<f64>::eye(q), r, a.t().to_owned(), w)
-        } else {
-            // Supported-column coordinates: B = A on them, N = M⁻¹ on them, K = N on them.
-            let mut basis = Array2::<f64>::zeros((p, kept_support.len()));
-            for (index, &column) in kept_support.iter().enumerate() {
-                let solved = match column_solves.as_ref() {
-                    Some(solves) => solves.column(support.binary_search(&column).expect(
-                        "a kept row's support lies in the support of all rows",
-                    ))
-                    .to_owned(),
-                    None => unit_solve(column),
-                };
-                basis.column_mut(index).assign(&solved);
-            }
-            let r = kept_support.len();
-            let k = symmetrized(&Array2::from_shape_fn((r, r), |(i, j)| basis[[kept_support[i], j]]));
-            let loadings = Array2::from_shape_fn((q, r), |(i, j)| a[[i, kept_support[j]]]);
-            let mut generator = Array2::<f64>::zeros((p, r));
-            for (index, &column) in kept_support.iter().enumerate() {
-                generator[[column, index]] = 1.0;
-            }
-            (loadings, basis, generator, k)
-        };
-        if basis.iter().any(|value| !value.is_finite()) {
-            return Err(ConeNormalizerRefusal::NonFinite { what: "covariance basis" });
-        }
-        let orthant = if row_coordinates {
-            OrthantLogMass::converge(&m0, &k)?
-        } else {
-            OrthantLogMass::converge_loaded(&m0, &loadings, &k)?
-        };
+        let w = symmetrized(&a.dot(&r));
+        let orthant = OrthantLogMass::converge(&m0, &w)?;
         let value = -0.5 * gradient.dot(&y) - orthant.log_mass();
         if !value.is_finite() {
             return Err(ConeNormalizerRefusal::NonFinite { what: "normalizer value" });
         }
-        Ok(Self { value, rows: a, y, basis, generator, gradient: gradient.clone(), orthant })
+        Ok(Self { value, rows: a, y, r, gradient: gradient.clone(), orthant })
     }
 
     /// `C = −½gᵀM⁻¹g − ln P(u ≥ 0)`.
@@ -1035,16 +709,9 @@ impl ConeNormalizer {
         self.rows.nrows()
     }
 
-    /// The dimension EP carries the orthant in: the retained rows or their supported columns,
-    /// whichever are fewer.
-    pub fn orthant_dimension(&self) -> usize {
-        self.orthant.dimension()
-    }
-
-    /// The generator `C`, `p × r`, of the covariance basis `N = M⁻¹C` and `K = CᵀM⁻¹C`: the unit
-    /// normals `Aᵀ` in row coordinates, the unit vectors of the supported columns otherwise.
-    pub fn covariance_generator(&self) -> &Array2<f64> {
-        &self.generator
+    /// The unit normals of the rows inside the mass horizon, `Aᵀ`, `p × q`.
+    pub fn retained_normals(&self) -> Array2<f64> {
+        self.rows.t().to_owned()
     }
 
     /// EP sweeps at this mode.
@@ -1067,10 +734,9 @@ impl ConeNormalizer {
         &self.y
     }
 
-    /// The covariance basis `N`, `p × r`: `M⁻¹Aᵀ` in row coordinates, the columns of `M⁻¹` on
-    /// the supported columns otherwise.
-    pub fn covariance_basis(&self) -> &Array2<f64> {
-        &self.basis
+    /// `R = M⁻¹Aᵀ`, `p × q`.
+    pub fn normal_solves(&self) -> &Array2<f64> {
+        &self.r
     }
 
     /// First derivative along one coordinate, with the rates its pairs reuse. `solve` applies the
@@ -1083,28 +749,27 @@ impl ConeNormalizer {
         let y_rate = solve(&(&motion.gradient_rate - &motion.precision_rate_on_y))
             + &motion.inverse_rotation_on_gradient;
         let m0_rate = self.rows.dot(&motion.mode_response) - self.rows.dot(&y_rate);
-        let k_rate = symmetrized(
-            &(self.generator.t().dot(&motion.inverse_rotation_on_generator)
-                - self.basis.t().dot(&motion.precision_rate_on_basis)),
+        let w_rate = symmetrized(
+            &(self.rows.dot(&motion.inverse_rotation_on_normals)
+                - self.r.t().dot(&motion.precision_rate_on_r)),
         );
         let derivative = -0.5 * (motion.gradient_rate.dot(&self.y) + self.gradient.dot(&y_rate))
             - self.orthant.mean_gradient().dot(&m0_rate)
-            - frobenius(&self.orthant.covariance_gradient(), &k_rate);
-        let (p, r) = self.basis.dim();
-        let mut solved_rate_on_basis = Array2::<f64>::zeros((p, r));
-        for column in 0..r {
-            solved_rate_on_basis
+            - frobenius(&self.orthant.covariance_gradient(), &w_rate);
+        let (p, q) = self.r.dim();
+        let mut solved_rate_on_r = Array2::<f64>::zeros((p, q));
+        for column in 0..q {
+            solved_rate_on_r
                 .column_mut(column)
-                .assign(&solve(&motion.precision_rate_on_basis.column(column).to_owned()));
+                .assign(&solve(&motion.precision_rate_on_r.column(column).to_owned()));
         }
-        ConeFirstOrder { derivative, y_rate, m0_rate, k_rate, solved_rate_on_basis }
+        ConeFirstOrder { derivative, y_rate, m0_rate, w_rate, solved_rate_on_r }
     }
 
     /// Second derivative for the coordinate pair `(k, l)`.
     ///
-    /// `M ÿ = g̈ − Ṁ_l ẏ_k − Ṁ_k ẏ_l − M̈ y`, read only through `yᵀ(·)` and `A M⁻¹(·) = BNᵀ(·)`,
-    /// so `Ṁ_l ẏ_k` enters as `(Ṁ_l y)ᵀẏ_k` and `(Ṁ_l N)ᵀẏ_k`;
-    /// `K̈ = Nᵀ(Ṁ_k M⁻¹ Ṁ_l + Ṁ_l M⁻¹ Ṁ_k − M̈)N`.
+    /// `M ÿ = g̈ − Ṁ_l ẏ_k − Ṁ_k ẏ_l − M̈ y`, read only through `yᵀ(·)` and `Rᵀ(·)`, so `Ṁ_l ẏ_k`
+    /// enters as `(Ṁ_l y)ᵀẏ_k` and `(Ṁ_l R)ᵀẏ_k`; `Ẅ = Rᵀ(Ṁ_k M⁻¹ Ṁ_l + Ṁ_l M⁻¹ Ṁ_k − M̈)R`.
     pub fn second_order(
         &self,
         motion_k: &ConeCoordinateMotion,
@@ -1132,30 +797,27 @@ impl ConeNormalizer {
             + motion_l.gradient_rate.dot(&first_k.y_rate)
             + y_moved
             + y_turned;
-        // `A = B Cᵀ` and `A M⁻¹ = B Nᵀ` in either coordinate system, so the rows read `ÿ` through
-        // the basis, the rotations on `C`, and `A` itself.
-        let basis_turned = motion_k.inverse_rotation_on_generator.t().dot(&motion_l.gradient_rate)
-            + motion_l.inverse_rotation_on_generator.t().dot(&motion_k.gradient_rate)
-            + motion_l.precision_rate_on_basis.t().dot(turn_k)
-            + motion_k.precision_rate_on_basis.t().dot(turn_l);
-        let basis_moved = self.basis.t().dot(&pair.gradient_rate)
-            - motion_l.precision_rate_on_basis.t().dot(&first_k.y_rate)
-            - motion_k.precision_rate_on_basis.t().dot(&first_l.y_rate)
-            - self.basis.t().dot(&pair.precision_rate_on_y)
-            + basis_turned;
-        let normal_moved = self.orthant.loadings.dot(&basis_moved)
-            + self.rows.dot(&pair.inverse_rotation_on_gradient);
+        let normal_turned = motion_k.inverse_rotation_on_normals.t().dot(&motion_l.gradient_rate)
+            + motion_l.inverse_rotation_on_normals.t().dot(&motion_k.gradient_rate)
+            + self.rows.dot(&pair.inverse_rotation_on_gradient)
+            + motion_l.precision_rate_on_r.t().dot(turn_k)
+            + motion_k.precision_rate_on_r.t().dot(turn_l);
+        let normal_moved = self.r.t().dot(&pair.gradient_rate)
+            - motion_l.precision_rate_on_r.t().dot(&first_k.y_rate)
+            - motion_k.precision_rate_on_r.t().dot(&first_l.y_rate)
+            - self.r.t().dot(&pair.precision_rate_on_y)
+            + normal_turned;
         let m0_second = self.rows.dot(&pair.mode_response) - normal_moved;
-        let cross = motion_k.precision_rate_on_basis.t().dot(&first_l.solved_rate_on_basis);
-        let k_second = symmetrized(
-            &(&cross + &cross.t() - self.basis.t().dot(&pair.precision_rate_on_basis)
-                + self.generator.t().dot(&pair.inverse_rotation_on_generator)),
+        let cross = motion_k.precision_rate_on_r.t().dot(&first_l.solved_rate_on_r);
+        let w_second = symmetrized(
+            &(&cross + &cross.t() - self.r.t().dot(&pair.precision_rate_on_r)
+                + self.rows.dot(&pair.inverse_rotation_on_normals)),
         );
-        let (d_gamma, d_big_gamma) = self.orthant.gradient_motion(&first_l.m0_rate, &first_l.k_rate)?;
+        let (d_gamma, d_big_gamma) = self.orthant.gradient_motion(&first_l.m0_rate, &first_l.w_rate)?;
         let second_log_mass = d_gamma.dot(&first_k.m0_rate)
-            + frobenius(&d_big_gamma, &first_k.k_rate)
+            + frobenius(&d_big_gamma, &first_k.w_rate)
             + self.orthant.mean_gradient().dot(&m0_second)
-            + frobenius(&self.orthant.covariance_gradient(), &k_second);
+            + frobenius(&self.orthant.covariance_gradient(), &w_second);
         Ok(-0.5 * second_gy - second_log_mass)
     }
 }
@@ -1174,14 +836,6 @@ mod tests {
     use super::*;
     use gam_math::probability::normal_logcdf;
     use ndarray::array;
-
-    /// Site `j`'s cavity read from a freshly formed posterior: the re-inverted reference the
-    /// fixed-point tests sweep with.
-    fn cavity(mass: &OrthantLogMass, j: usize) -> (f64, f64) {
-        let marginals = mass.marginals();
-        let s_jj = marginals.variance[j];
-        (1.0 / s_jj - mass.tau[j], marginals.mean[j] / s_jj - mass.nu[j])
-    }
 
     /// A rounding band for a quantity assembled from terms of total magnitude `magnitude` in
     /// `operations` rounded steps.
@@ -1227,17 +881,18 @@ mod tests {
         move |rhs: &Array1<f64>| inverse.dot(rhs)
     }
 
-    /// One undamped EP sweep read straight off the definitions: each site's cavity from the
-    /// posterior re-formed from the sites (`Σ_z = (I + KG)⁻¹K`) after every site.
+    /// One undamped EP sweep read straight off the definitions: each site's cavity from
+    /// `Σ = EW` and `μ = E(m₀ + Wν̃)` re-formed from `E = (I + WT)⁻¹` after every site.
     fn sequential_site_sweep(state: &mut OrthantLogMass) {
         for j in 0..state.m0.len() {
-            let (tau_c, nu_c) = cavity(state, j);
-            let update = site_update(tau_c, nu_c);
+            let (sigma, mu) = state.posterior();
+            let s_jj = sigma[[j, j]];
+            let update = site_update(1.0 / s_jj - state.tau[j], mu[j] / s_jj - state.nu[j]);
             state.tau[j] = update.tau;
             state.nu[j] = update.nu;
-            state.post = state.form_posterior().expect("admissible sites");
+            state.e = inverse_i_plus_wt(&state.w, &state.tau).expect("admissible sites");
         }
-        state.site_system = std::sync::OnceLock::new();
+        state.site_motion_system = std::sync::OnceLock::new();
     }
 
     /// The change of `ln Z_EP` need not fall monotonically. This orthant is where EP was refused on
@@ -1363,42 +1018,6 @@ mod tests {
                 gamma[i]
             );
         }
-    }
-
-    /// gam#3037: EP re-formed `E = (I + WT)⁻¹` by a fresh `q × q` inversion after every site, an
-    /// `O(q⁴)` sweep that held the 3828-row delayed-entry location-scale fit inside one normalizer
-    /// evaluation for over ten minutes. Each site move is a rank-one change of `I + WT`, so the
-    /// sweep follows it by Sherman–Morrison. The fixed point is unchanged: a sweep taken the old
-    /// way, re-inverting after every site, from where the rank-one sweeps stop moves `ln P` by no
-    /// more than its rounding band, and the posterior the sweeps carried agrees with the one
-    /// re-formed from the sites.
-    #[test]
-    fn rank_one_ep_sweeps_reach_the_re_inverted_fixed_point_3037() {
-        let q = 24;
-        // A smooth monotone-guard-like covariance: neighbouring rows strongly correlated.
-        let w = Array2::from_shape_fn((q, q), |(i, j)| {
-            let d = (i as f64 - j as f64) / 4.0;
-            (-0.5 * d * d).exp() + if i == j { 0.05 } else { 0.0 }
-        });
-        let m0 = Array1::from_shape_fn(q, |i| 0.6 * ((i as f64) * 0.7).sin() - 0.2);
-        let mass = OrthantLogMass::converge(&m0, &w)
-            .unwrap_or_else(|refusal| panic!("EP settles on the correlated orthant: {refusal}"));
-        let mut checked = mass.clone();
-        sequential_site_sweep(&mut checked);
-        let (after, magnitude) = checked.evaluate_log_mass().expect("a finite EP log mass");
-        let step_band = accumulation_growth(4 * q * q + 8 * q) * magnitude;
-        eprintln!(
-            "[3037-EP] ln P {:.15e} after {} sweeps; a re-inverted sweep moves it {:e} (band {step_band:e})",
-            mass.log_mass(),
-            mass.sweeps(),
-            (after - mass.log_mass()).abs()
-        );
-        assert!(
-            (after - mass.log_mass()).abs() <= step_band,
-            "a re-inverted sweep from the rank-one stop moves ln P by {:e}, above the band {step_band:e}",
-            (after - mass.log_mass()).abs()
-        );
-        assert!(mass.log_mass() < 0.0 && mass.log_mass().is_finite());
     }
 
     #[test]
@@ -1581,17 +1200,17 @@ mod tests {
         let turn = kernel
             .pseudo_inverse_rotation(&rotation_on_dropped)
             .expect("spectral kernel");
-        let motion_with = |turn_on_gradient: Array1<f64>, turn_on_generator: Array2<f64>| {
+        let motion_with = |turn_on_gradient: Array1<f64>, turn_on_normals: Array2<f64>| {
             ConeCoordinateMotion {
                 mode_response: b1.clone(),
                 gradient_rate: g1.clone(),
                 precision_rate_on_y: precision_rate.dot(normalizer.solved_gradient()),
-                precision_rate_on_basis: precision_rate.dot(normalizer.covariance_basis()),
+                precision_rate_on_r: precision_rate.dot(normalizer.normal_solves()),
                 inverse_rotation_on_gradient: turn_on_gradient,
-                inverse_rotation_on_generator: turn_on_generator,
+                inverse_rotation_on_normals: turn_on_normals,
             }
         };
-        let exact = motion_with(turn.apply(&g0), turn.apply_columns(normalizer.covariance_generator()));
+        let exact = motion_with(turn.apply(&g0), turn.apply_columns(&normalizer.retained_normals()));
         let derivative = normalizer.first_order(&exact, &solve).derivative;
         let (fd, bar) = richardson(&|t: f64| normalizer_at(t).value(), 1.0e-3);
         assert!(
@@ -1615,7 +1234,7 @@ mod tests {
         // Positive control: without the rotation the derivative is the inverse's, and it misses.
         let inverse_only = motion_with(
             Array1::zeros(3),
-            Array2::zeros(normalizer.covariance_generator().raw_dim()),
+            Array2::zeros(normalizer.normal_solves().raw_dim()),
         );
         let missed = normalizer.first_order(&inverse_only, &solve).derivative;
         assert!(
@@ -1646,9 +1265,9 @@ mod tests {
                 mode_response: b1.clone(),
                 gradient_rate: g1.clone(),
                 precision_rate_on_y: rate.dot(normalizer.solved_gradient()),
-                precision_rate_on_basis: rate.dot(normalizer.covariance_basis()),
+                precision_rate_on_r: rate.dot(normalizer.normal_solves()),
                 inverse_rotation_on_gradient: turn.apply(&(&g0 + &(&g1 * t))),
-                inverse_rotation_on_generator: turn.apply_columns(normalizer.covariance_generator()),
+                inverse_rotation_on_normals: turn.apply_columns(&normalizer.retained_normals()),
             }
         };
         // The second order is graded on one row, where EP is exact (P = Φ), so the check measures
@@ -1670,10 +1289,10 @@ mod tests {
         };
         let normalizer_one = normalizer_one_at(0.0);
         assert_eq!(normalizer_one.retained_rows(), 1, "the one row is inside the mass horizon");
-        let generator_one = normalizer_one.covariance_generator().to_owned();
-        let mut probes = Array2::<f64>::zeros((3, 1 + generator_one.ncols()));
+        let normals = normalizer_one.retained_normals();
+        let mut probes = Array2::<f64>::zeros((3, 1 + normals.ncols()));
         probes.column_mut(0).assign(&g0);
-        probes.slice_mut(s![.., 1..]).assign(&generator_one);
+        probes.slice_mut(s![.., 1..]).assign(&normals);
         let apply_rate = |v: &Array1<f64>| precision_rate.dot(v);
         let second_rotation = |vectors: &Array2<f64>| {
             kernel
@@ -1708,13 +1327,13 @@ mod tests {
             "d²(M⁺v) against a second difference: gap {second_solve_gap:e}"
         );
         let second_turn = second_rotation(&probes);
-        let pair_with = |turn_on_gradient: Array1<f64>, turn_on_generator: Array2<f64>| ConePairMotion {
+        let pair_with = |turn_on_gradient: Array1<f64>, turn_on_normals: Array2<f64>| ConePairMotion {
             mode_response: Array1::zeros(3),
             gradient_rate: Array1::zeros(3),
             precision_rate_on_y: second_precision.dot(normalizer_one.solved_gradient()),
-            precision_rate_on_basis: second_precision.dot(normalizer_one.covariance_basis()),
+            precision_rate_on_r: second_precision.dot(normalizer_one.normal_solves()),
             inverse_rotation_on_gradient: turn_on_gradient,
-            inverse_rotation_on_generator: turn_on_generator,
+            inverse_rotation_on_normals: turn_on_normals,
         };
         let exact_one = exact_motion_at(0.0, &normalizer_one, &kernel);
         let first = normalizer_one.first_order(&exact_one, &solve);
@@ -1728,10 +1347,10 @@ mod tests {
             "d²C {second} against central difference of dC {fd2} (bar {bar2})"
         );
         // Positive control: the inverse identities alone miss the second derivative.
-        let bare_pair = pair_with(Array1::zeros(3), Array2::zeros(generator_one.raw_dim()));
+        let bare_pair = pair_with(Array1::zeros(3), Array2::zeros(normals.raw_dim()));
         let bare_first_motion = ConeCoordinateMotion {
             inverse_rotation_on_gradient: Array1::zeros(3),
-            inverse_rotation_on_generator: Array2::zeros(generator_one.raw_dim()),
+            inverse_rotation_on_normals: Array2::zeros(normals.raw_dim()),
             ..exact_one.clone()
         };
         let bare_first = normalizer_one.first_order(&bare_first_motion, &solve);
@@ -1744,61 +1363,52 @@ mod tests {
         );
     }
 
-    /// The quadratic path `β(t), g(t), M(t)` of the derivative checks, `(x₀, x₁, x₂)` its
-    /// coefficients.
-    struct NormalizerPath {
-        beta: [Array1<f64>; 3],
-        gradient: [Array1<f64>; 3],
-        precision: [Array2<f64>; 3],
-    }
-
-    /// `dC` and `d²C` along `path` against central differences of `C` and `dC`; returns the
-    /// normalizer at `t = 0`.
-    fn assert_normalizer_derivatives_match_central_differences(
-        rows: &Array2<f64>,
-        bounds: &Array1<f64>,
-        path: &NormalizerPath,
-    ) -> ConeNormalizer {
-        let [b0, b1, b2] = &path.beta;
-        let [g0, g1, g2] = &path.gradient;
-        let [m0, m1, m2] = &path.precision;
+    #[test]
+    fn the_normalizer_derivatives_match_central_differences_2765() {
+        let rows = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.6, 0.8]];
+        let bounds = array![0.0, 0.0, -0.05];
+        let m0 = array![[2.0, 0.8, 0.3], [0.8, 1.5, -0.4], [0.3, -0.4, 1.2]];
+        let m1 = array![[0.3, -0.1, 0.0], [-0.1, 0.2, 0.05], [0.0, 0.05, -0.1]];
+        let m2 = array![[0.05, 0.0, 0.02], [0.0, -0.04, 0.0], [0.02, 0.0, 0.03]];
+        let (b0, b1, b2) = (array![0.01, 0.02, 0.3], array![-0.2, 0.1, 0.05], array![0.05, -0.1, 0.02]);
+        let (g0, g1, g2) = (array![0.4, 0.3, 0.0], array![0.1, -0.2, 0.05], array![-0.03, 0.02, 0.01]);
         let state = |t: f64| {
             (
-                b0 + &(b1 * t) + &(b2 * (t * t)),
-                g0 + &(g1 * t) + &(g2 * (t * t)),
-                m0 + &(m1 * t) + &(m2 * (t * t)),
+                &b0 + &(&b1 * t) + &(&b2 * (t * t)),
+                &g0 + &(&g1 * t) + &(&g2 * (t * t)),
+                &m0 + &(&m1 * t) + &(&m2 * (t * t)),
             )
         };
         let value_at = |t: f64| {
             let (beta, gradient, m) = state(t);
             let solve = dense_solve(&m);
-            ConeNormalizer::evaluate(rows, bounds, &beta, &gradient, &solve)
+            ConeNormalizer::evaluate(&rows, &bounds, &beta, &gradient, &solve)
                 .expect("normalizer")
                 .value()
         };
         let motion_at = |t: f64, normalizer: &ConeNormalizer| {
-            let m_rate = m1 + &(m2 * (2.0 * t));
+            let m_rate = &m1 + &(&m2 * (2.0 * t));
             ConeCoordinateMotion {
-                mode_response: b1 + &(b2 * (2.0 * t)),
-                gradient_rate: g1 + &(g2 * (2.0 * t)),
+                mode_response: &b1 + &(&b2 * (2.0 * t)),
+                gradient_rate: &g1 + &(&g2 * (2.0 * t)),
                 precision_rate_on_y: m_rate.dot(normalizer.solved_gradient()),
-                precision_rate_on_basis: m_rate.dot(normalizer.covariance_basis()),
+                precision_rate_on_r: m_rate.dot(normalizer.normal_solves()),
                 // `dense_solve` is an inverse: nothing rotates.
                 inverse_rotation_on_gradient: Array1::zeros(b1.len()),
-                inverse_rotation_on_generator: Array2::zeros(normalizer.covariance_generator().raw_dim()),
+                inverse_rotation_on_normals: Array2::zeros(normalizer.normal_solves().raw_dim()),
             }
         };
         let derivative_at = |t: f64| {
             let (beta, gradient, m) = state(t);
             let solve = dense_solve(&m);
             let normalizer =
-                ConeNormalizer::evaluate(rows, bounds, &beta, &gradient, &solve).expect("normalizer");
+                ConeNormalizer::evaluate(&rows, &bounds, &beta, &gradient, &solve).expect("normalizer");
             normalizer.first_order(&motion_at(t, &normalizer), &solve).derivative
         };
         let (beta, gradient, m) = state(0.0);
         let solve = dense_solve(&m);
         let normalizer =
-            ConeNormalizer::evaluate(rows, bounds, &beta, &gradient, &solve).expect("normalizer");
+            ConeNormalizer::evaluate(&rows, &bounds, &beta, &gradient, &solve).expect("normalizer");
         assert!(normalizer.retained_rows() >= 2, "at least two correlated rows are near their bounds");
         let motion = motion_at(0.0, &normalizer);
         let first = normalizer.first_order(&motion, &solve);
@@ -1809,12 +1419,12 @@ mod tests {
             first.derivative
         );
         let pair = ConePairMotion {
-            mode_response: b2 * 2.0,
-            gradient_rate: g2 * 2.0,
-            precision_rate_on_y: (m2 * 2.0).dot(normalizer.solved_gradient()),
-            precision_rate_on_basis: (m2 * 2.0).dot(normalizer.covariance_basis()),
+            mode_response: &b2 * 2.0,
+            gradient_rate: &g2 * 2.0,
+            precision_rate_on_y: (&m2 * 2.0).dot(normalizer.solved_gradient()),
+            precision_rate_on_r: (&m2 * 2.0).dot(normalizer.normal_solves()),
             inverse_rotation_on_gradient: Array1::zeros(b2.len()),
-            inverse_rotation_on_generator: Array2::zeros(normalizer.covariance_generator().raw_dim()),
+            inverse_rotation_on_normals: Array2::zeros(normalizer.normal_solves().raw_dim()),
         };
         let second = normalizer
             .second_order(&motion, &first, &motion, &first, &pair)
@@ -1824,196 +1434,6 @@ mod tests {
             (second - fd2).abs() <= bar2,
             "d²C {second} against central difference of dC {fd2} (bar {bar2})"
         );
-        normalizer
-    }
-
-    #[test]
-    fn the_normalizer_derivatives_match_central_differences_2765() {
-        let rows = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.6, 0.8]];
-        let bounds = array![0.0, 0.0, -0.05];
-        let path = NormalizerPath {
-            beta: [array![0.01, 0.02, 0.3], array![-0.2, 0.1, 0.05], array![0.05, -0.1, 0.02]],
-            gradient: [array![0.4, 0.3, 0.0], array![0.1, -0.2, 0.05], array![-0.03, 0.02, 0.01]],
-            precision: [
-                array![[2.0, 0.8, 0.3], [0.8, 1.5, -0.4], [0.3, -0.4, 1.2]],
-                array![[0.3, -0.1, 0.0], [-0.1, 0.2, 0.05], [0.0, 0.05, -0.1]],
-                array![[0.05, 0.0, 0.02], [0.0, -0.04, 0.0], [0.02, 0.0, 0.03]],
-            ],
-        };
-        let normalizer = assert_normalizer_derivatives_match_central_differences(&rows, &bounds, &path);
-        assert_eq!(normalizer.orthant_dimension(), normalizer.retained_rows(), "rows are the fewer");
-    }
-
-    /// `u = m₀ + Bz`, `z ~ N(0, K)`, is the orthant of `N(m₀, BKBᵀ)`. Carried in the `r`
-    /// coordinates of `z` EP runs the same site updates it runs in the `q` rows' own, so the two
-    /// converge to the same `ln P`, to the rounding of the sweeps both took. At the same sites the
-    /// two coordinates give the same `ln Z_EP`, `γ`, `Γ_K = BᵀΓ_W B` (as `dW = B dK Bᵀ`) and
-    /// motion of both. With `q = 6` rows on `r = 2` coordinates the loaded fixed point is solved
-    /// through the `m = 5` capacitance and the rows' own through the `2q = 12` direct system, so
-    /// this also checks the one against the other.
-    #[test]
-    fn loaded_coordinates_agree_with_the_rows_own_3037() {
-        let b = array![[1.0, 0.0], [0.8, 0.3], [0.5, 0.7], [0.1, 1.0], [1.0, -0.4], [0.6, 0.6]];
-        let k = array![[0.9, 0.35], [0.35, 0.6]];
-        let m0 = array![-0.3, 0.1, 0.4, -0.2, 0.25, 0.05];
-        let w = b.dot(&k).dot(&b.t());
-        let loaded = OrthantLogMass::converge_loaded(&m0, &b, &k).expect("loaded EP converges");
-        let converged_rows = OrthantLogMass::converge(&m0, &w).expect("row EP converges");
-        let (q, r) = b.dim();
-        let operations = (loaded.sweeps() + converged_rows.sweeps()) * (4 * q * q + 8 * q);
-        let log_scale = converged_rows.log_mass().abs().max(1.0);
-        eprintln!(
-            "[3037-LOADED] ln P {:.15e} (r = {r}, {} sweeps) against {:.15e} (q = {q}, {} sweeps)",
-            loaded.log_mass(),
-            loaded.sweeps(),
-            converged_rows.log_mass(),
-            converged_rows.sweeps()
-        );
-        assert_eq!(loaded.dimension(), r);
-        assert!(
-            (loaded.log_mass() - converged_rows.log_mass()).abs() <= band(operations, log_scale),
-            "ln P {} in z against {} in the rows",
-            loaded.log_mass(),
-            converged_rows.log_mass()
-        );
-        // The rows' own coordinates at the loaded fixed point's sites.
-        let mut rows = converged_rows.clone();
-        rows.tau = loaded.tau.clone();
-        rows.nu = loaded.nu.clone();
-        rows.post = rows.form_posterior().expect("admissible sites");
-        rows.site_system = std::sync::OnceLock::new();
-        let (rows_log_mass, _) = rows.evaluate_log_mass().expect("a finite EP log mass");
-        let (loaded_log_mass, _) = loaded.evaluate_log_mass().expect("a finite EP log mass");
-        let operations = 4 * q * q * q;
-        assert!(
-            (loaded_log_mass - rows_log_mass).abs() <= band(operations, log_scale),
-            "ln Z_EP {loaded_log_mass} in z against {rows_log_mass} in the rows at the same sites"
-        );
-        let close = |got: &Array1<f64>, want: &Array1<f64>, what: &str| {
-            let scale = want.iter().fold(1.0_f64, |acc, value| acc.max(value.abs()));
-            for i in 0..want.len() {
-                assert!(
-                    (got[i] - want[i]).abs() <= band(operations, scale),
-                    "{what}[{i}] {} against {}",
-                    got[i],
-                    want[i]
-                );
-            }
-        };
-        let close2 = |got: &Array2<f64>, want: &Array2<f64>, what: &str| {
-            let flat = |m: &Array2<f64>| Array1::from_iter(m.iter().copied());
-            close(&flat(got), &flat(want), what);
-        };
-        close(&loaded.mean_gradient(), &rows.mean_gradient(), "γ");
-        let pulled = |gamma_w: &Array2<f64>| b.t().dot(gamma_w).dot(&b);
-        close2(&loaded.covariance_gradient(), &pulled(&rows.covariance_gradient()), "Γ_K");
-        let dm0 = array![0.2, -0.1, 0.3, 0.05, -0.25, 0.1];
-        let dk = array![[0.1, -0.05], [-0.05, 0.2]];
-        let (dg_loaded, dbg_loaded) = loaded.gradient_motion(&dm0, &dk).expect("loaded motion");
-        let (dg_rows, dbg_rows) = rows.gradient_motion(&dm0, &b.dot(&dk).dot(&b.t())).expect("row motion");
-        assert!(matches!(loaded.site_system().expect("formed"), SiteSystem::Capacitance { .. }));
-        assert!(matches!(rows.site_system().expect("formed"), SiteSystem::Direct(_)));
-        close(&dg_loaded, &dg_rows, "dγ");
-        close2(&dbg_loaded, &pulled(&dbg_rows), "dΓ_K");
-    }
-
-    /// Five rows on three of four columns: the normalizer carries EP in the three supported
-    /// columns, and its outer derivatives are still those of `C`.
-    #[test]
-    fn supported_column_normalizer_derivatives_match_central_differences_3037() {
-        let rows = array![
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.6, 0.8, 0.0],
-            [0.7, -0.7, 0.0, 0.0],
-            [0.3, 0.4, 0.5, 0.0]
-        ];
-        let bounds = array![0.0, 0.0, -0.05, -0.02, 0.1];
-        let path = NormalizerPath {
-            beta: [
-                array![0.01, 0.02, 0.3, -0.4],
-                array![-0.2, 0.1, 0.05, 0.3],
-                array![0.05, -0.1, 0.02, 0.0],
-            ],
-            gradient: [
-                array![0.4, 0.3, 0.0, 0.1],
-                array![0.1, -0.2, 0.05, 0.0],
-                array![-0.03, 0.02, 0.01, 0.02],
-            ],
-            precision: [
-                array![[2.0, 0.8, 0.3, 0.2], [0.8, 1.5, -0.4, 0.1], [0.3, -0.4, 1.2, -0.3], [0.2, 0.1, -0.3, 1.0]],
-                array![[0.3, -0.1, 0.0, 0.05], [-0.1, 0.2, 0.05, 0.0], [0.0, 0.05, -0.1, 0.02], [0.05, 0.0, 0.02, 0.1]],
-                array![[0.05, 0.0, 0.02, 0.0], [0.0, -0.04, 0.0, 0.01], [0.02, 0.0, 0.03, 0.0], [0.0, 0.01, 0.0, 0.02]],
-            ],
-        };
-        let normalizer = assert_normalizer_derivatives_match_central_differences(&rows, &bounds, &path);
-        assert_eq!(normalizer.retained_rows(), 5);
-        assert_eq!(normalizer.orthant_dimension(), 3, "EP runs in the three supported columns");
-    }
-
-    /// gam#3037/#3038: the location-scale time-derivative guard emits one row per observation on
-    /// the few time-basis columns, thousands of rows EP carried as a `q × q` covariance. Two
-    /// thousand such rows on three of five columns, most of them near their bound, are carried in
-    /// the three columns, and the outer derivatives of `C` still match central differences.
-    #[test]
-    fn thousands_of_guard_rows_are_carried_in_their_columns_3037() {
-        let q = 2000;
-        let rows = Array2::from_shape_fn((q, 5), |(i, c)| {
-            let t = i as f64 / (q - 1) as f64;
-            match c {
-                0 => 1.0,
-                1 => t,
-                2 => t * t,
-                _ => 0.0,
-            }
-        });
-        let bounds = Array1::zeros(q);
-        // The guard's slope β₀ + β₁t + β₂t² stays positive and comes within 0.009 of its bound.
-        let path = NormalizerPath {
-            beta: [
-                array![0.02, -0.03, 0.02, 0.4, -0.2],
-                array![0.01, -0.005, 0.004, 0.1, 0.0],
-                array![0.002, 0.001, -0.001, 0.0, 0.05],
-            ],
-            gradient: [
-                array![0.05, 0.02, 0.01, 0.0, 0.0],
-                array![0.01, -0.01, 0.005, 0.0, 0.0],
-                array![-0.002, 0.001, 0.0, 0.0, 0.0],
-            ],
-            precision: [
-                array![
-                    [400.0, 150.0, 90.0, 5.0, 0.0],
-                    [150.0, 120.0, 80.0, 0.0, 2.0],
-                    [90.0, 80.0, 70.0, 1.0, 0.0],
-                    [5.0, 0.0, 1.0, 3.0, 0.5],
-                    [0.0, 2.0, 0.0, 0.5, 2.0]
-                ],
-                array![
-                    [20.0, 5.0, 2.0, 0.0, 0.0],
-                    [5.0, 6.0, 3.0, 0.0, 0.0],
-                    [2.0, 3.0, 4.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0, 0.1, 0.0],
-                    [0.0, 0.0, 0.0, 0.0, 0.1]
-                ],
-                array![
-                    [4.0, 1.0, 0.0, 0.0, 0.0],
-                    [1.0, 2.0, 0.5, 0.0, 0.0],
-                    [0.0, 0.5, 1.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0, 0.0, 0.0]
-                ],
-            ],
-        };
-        let normalizer = assert_normalizer_derivatives_match_central_differences(&rows, &bounds, &path);
-        eprintln!(
-            "[3037-GUARD] {} retained rows carried in {} coordinates; {} EP sweeps; C = {:.12e}",
-            normalizer.retained_rows(),
-            normalizer.orthant_dimension(),
-            normalizer.sweeps(),
-            normalizer.value()
-        );
-        assert!(normalizer.retained_rows() > 1000, "most guard rows are inside the mass horizon");
-        assert_eq!(normalizer.orthant_dimension(), 3);
     }
 
     /// gam#3135 (the property gam-2959 proposed for #2959 M7): the rank-one sweep stops at a fixed
