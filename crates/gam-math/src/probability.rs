@@ -1,6 +1,6 @@
 use libm::{erf, erfc};
 use crate::double_double::SMALLEST_SUBNORMAL;
-use crate::roundoff::{UNIT_ROUNDOFF, inflated};
+use crate::roundoff::{UNIT_ROUNDOFF, accumulation_growth, inflated};
 
 mod normal_table;
 mod weighted_chi_square;
@@ -22,7 +22,9 @@ const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
 /// `I_x(a, b) = p`, where `I` is the regularized incomplete beta.
 ///
 /// `p <= 0` maps to the support floor and `p >= 1` to the support ceiling. A
-/// non-finite or non-positive shape, or a NaN probability, yields `NaN`.
+/// non-finite or non-positive shape, or a NaN probability, yields `NaN`. So
+/// does a lower-tail quantile whose log-space Newton ends at a point the
+/// residual certificate of [`lower_tail_beta_quantile`] does not accept.
 pub fn beta_quantile(p: f64, a: f64, b: f64) -> f64 {
     if p.is_nan() || !(a.is_finite() && a > 0.0 && b.is_finite() && b > 0.0) {
         return f64::NAN;
@@ -73,6 +75,17 @@ pub fn beta_quantile(p: f64, a: f64, b: f64) -> f64 {
 /// spurious positive floor a
 /// caller cannot distinguish from a resolved bound.
 ///
+/// The step test `|Δy| ≤ ε·max(|y|, 1)` only decides when to stop iterating;
+/// it is not what makes the answer an answer. For small `a` the rounding noise
+/// of `G` divided by `G′ ≈ a` sits above that threshold, and the iterate
+/// oscillates at noise level until [`BETA_NEWTON_MAX_STEPS`] runs out. The
+/// returned root is therefore certified at the point it is returned: `G` is
+/// re-evaluated there and must lie within its own rounding band
+/// ([`lower_tail_residual`]). A point outside the band is reported as
+/// `Some(NaN)`, whichever way the loop ended. It is not returned as a quantile,
+/// and `None` is not used for it either, since `None` would hand the case to
+/// `inv_beta_reg`, whose floor on this branch is the defect above.
+///
 /// The branch condition is `x·max(1, b) ≤ ½`, which is derived rather than
 /// tuned. The term ratio is `|x·(k+1−b)/(k+1)|·(a+k)/(a+k+1)`, and
 /// `|k+1−b| ≤ (k+1)·max(1, b)` for every `k ≥ 0`, so the condition bounds every
@@ -100,48 +113,102 @@ fn lower_tail_beta_quantile(p: f64, a: f64, b: f64) -> Option<f64> {
     }
     let ln_p = p.ln();
     for _ in 0..BETA_NEWTON_MAX_STEPS {
-        let x = y.exp();
-        if x * b.max(1.0) > 0.5 {
-            return None;
-        }
-        let (sum, derivative_sum) = beta_ascending_series(x, a, b)?;
-        if !(sum.is_finite() && sum > 0.0 && derivative_sum.is_finite()) {
-            return None;
-        }
-        // `G(y) = a·y − ln B(a,b) + ln S(e^y) − ln p`.
-        let g = a * y - ln_b + sum.ln() - ln_p;
-        let g_prime = a + x * derivative_sum / sum;
-        if !(g.is_finite() && g_prime.is_finite() && g_prime > 0.0) {
-            return None;
-        }
-        let step = g / g_prime;
+        let residual = lower_tail_residual(y, a, b, ln_b, ln_p)?;
+        let step = residual.g / residual.g_prime;
         if !step.is_finite() {
             return None;
         }
         y -= step;
-        // Absolute in `y` is relative in `x`, which is the whole point.
+        // Absolute in `y` is relative in `x`. This only stops the iteration;
+        // the certificate below judges the point it stops at.
         if step.abs() <= f64::EPSILON * y.abs().max(1.0) {
             break;
         }
     }
     let x = y.exp();
-    if x.is_finite() && (0.0..=1.0).contains(&x) {
+    if !(x.is_finite() && (0.0..=1.0).contains(&x)) {
+        return None;
+    }
+    // An underflowed quantile (`exp(y) = 0`, the correctly rounded answer) is
+    // certified the same way: `G` is formed from `y`, which stays finite, and
+    // the series at `x = 0` is the exact `S = 1/a`.
+    let certificate = lower_tail_residual(y, a, b, ln_b, ln_p)?;
+    if certificate.g.abs() <= certificate.band {
         Some(x)
     } else {
-        None
+        Some(f64::NAN)
     }
 }
 
-/// `(S(x), S′(x))` for `S(x) = Σ_{k≥0} (1−b)_k · x^k / (k!·(a+k))`.
+/// `G(y) = a·y − ln B(a,b) + ln S(e^y) − ln p`, its derivative and the rounding
+/// band inside which a computed `G` does not resolve from zero. Returns `None`
+/// off the series branch or when a piece does not form.
+///
+/// The band, with `γ_n` from [`accumulation_growth`]:
+/// - The four summands `a·y`, `ln B`, `ln S` and `ln p` meet in three
+///   additions. Each also passes at most one rounding of its own (the product
+///   `a·y` or the logarithm), so the assembly errs by at most
+///   `γ₄·(|a·y| + |ln B| + |ln S| + |ln p|)`.
+/// - `ln S` inherits the relative error of `S`, which is
+///   [`AscendingSeries::relative_error_bound`].
+fn lower_tail_residual(y: f64, a: f64, b: f64, ln_b: f64, ln_p: f64) -> Option<LowerTailResidual> {
+    let x = y.exp();
+    if x * b.max(1.0) > 0.5 {
+        return None;
+    }
+    let series = beta_ascending_series(x, a, b)?;
+    if !(series.sum.is_finite() && series.sum > 0.0 && series.derivative_sum.is_finite()) {
+        return None;
+    }
+    let ln_s = series.sum.ln();
+    let a_y = a * y;
+    let g = a_y - ln_b + ln_s - ln_p;
+    let g_prime = a + x * series.derivative_sum / series.sum;
+    let band = accumulation_growth(4) * (a_y.abs() + ln_b.abs() + ln_s.abs() + ln_p.abs())
+        + series.relative_error_bound();
+    if !(g.is_finite() && g_prime.is_finite() && g_prime > 0.0 && band.is_finite()) {
+        return None;
+    }
+    Some(LowerTailResidual { g, g_prime, band })
+}
+
+struct LowerTailResidual {
+    g: f64,
+    g_prime: f64,
+    band: f64,
+}
+
+/// The ascending series `S(x)`, its derivative, and what its rounding needs:
+/// the sum of the magnitudes of its terms and the number of terms taken.
+struct AscendingSeries {
+    sum: f64,
+    derivative_sum: f64,
+    magnitude: f64,
+    terms: usize,
+}
+
+impl AscendingSeries {
+    /// Bound on `|Ŝ − S|/Ŝ`. Term `k` carries at most `4k + 3` roundings: `3k`
+    /// in its Pochhammer-over-factorial product, two forming the coefficient,
+    /// `k` in the power `x^k` and one in the product. The running sum adds at
+    /// most `terms` more. So the sum errs by at most
+    /// `γ_{5·terms+3}·Σ|t_k|`.
+    fn relative_error_bound(&self) -> f64 {
+        accumulation_growth(self.terms.saturating_mul(5).saturating_add(3)) * self.magnitude / self.sum
+    }
+}
+
+/// `S(x)`, `S′(x)`, `Σ|t_k|` and the term count for `S(x) = Σ_{k≥0} (1−b)_k · x^k / (k!·(a+k))`.
 ///
 /// Accumulated by the ratio `t_{k+1} = t_k·(k+1−b)/(k+1)` on the Pochhammer
 /// factor, so no factorial or gamma is formed. `None` if the guard term count
 /// is exhausted, which the caller's branch condition makes unreachable.
-fn beta_ascending_series(x: f64, a: f64, b: f64) -> Option<(f64, f64)> {
+fn beta_ascending_series(x: f64, a: f64, b: f64) -> Option<AscendingSeries> {
     let mut pochhammer_over_factorial = 1.0_f64;
     let mut power = 1.0_f64;
     let mut sum = 1.0 / a;
     let mut derivative_sum = 0.0_f64;
+    let mut magnitude = sum;
     for k in 1..=BETA_SERIES_MAX_TERMS {
         let kf = k as f64;
         pochhammer_over_factorial *= (kf - b) / kf;
@@ -151,8 +218,14 @@ fn beta_ascending_series(x: f64, a: f64, b: f64) -> Option<(f64, f64)> {
         power *= x;
         let term = coefficient * power;
         sum += term;
+        magnitude += term.abs();
         if term.abs() <= f64::EPSILON * sum.abs() {
-            return Some((sum, derivative_sum));
+            return Some(AscendingSeries {
+                sum,
+                derivative_sum,
+                magnitude,
+                terms: k,
+            });
         }
     }
     None
@@ -238,7 +311,7 @@ fn ln_regularized_beta_series(log_x: f64, a: f64, b: f64) -> Option<f64> {
         return None;
     }
     let x = log_x.exp();
-    let Some((sum, _)) = beta_ascending_series(x, a, b) else {
+    let Some(AscendingSeries { sum, .. }) = beta_ascending_series(x, a, b) else {
         return Some(f64::NAN);
     };
     let log_beta = ln_beta(a, b);
@@ -265,9 +338,12 @@ fn log_reciprocal_one_plus_exp(log_ratio: f64) -> f64 {
 /// guard, not the expected count.
 const BETA_SERIES_MAX_TERMS: usize = 128;
 
-/// Guard step count for the log-space Newton. From a seed whose relative error
-/// is `O(x)` the iteration is quadratic, so it converges in two or three steps
-/// over the whole branch; this is the non-convergence guard.
+/// Step count for the log-space Newton. From a seed whose relative error is
+/// `O(x)` the iteration is quadratic, so it reaches `G`'s rounding band in two
+/// to four steps over the whole branch. The step test that ends the loop can
+/// fail to fire once the iterate sits in that band, so this count can end the
+/// loop too. It is not a certificate. [`lower_tail_beta_quantile`] certifies
+/// the point it returns, whichever way the loop ended.
 const BETA_NEWTON_MAX_STEPS: usize = 32;
 
 /// The part of `x·x` that `f64` cannot hold: `x² = x*x + square_residual(x)`,
@@ -2358,6 +2434,43 @@ mod tests {
             ((upper - UPPER) / UPPER).abs() <= 1.0e-11,
             "upper tail moved: {upper:e}, want {UPPER:e}"
         );
+    }
+
+    #[test]
+    /// The lower-tail quantile is judged by the residual of `G` at the point it
+    /// returns, not by how its Newton loop ended. For small `a` the step test
+    /// `|Δy| ≤ ε·max(|y|, 1)` sits below `G`'s own rounding noise over `a`,
+    /// and the loop can end on its step count with the iterate oscillating in
+    /// the band. Over this grid, which includes such shapes, every returned
+    /// quantile is inside the band. A point moved off it by a resolvable
+    /// amount is not, so the band is not vacuous.
+    fn beta_lower_tail_quantile_is_certified_by_its_residual_band() {
+        let mut certified = 0_usize;
+        for a in [1.0e-3, 0.01, 0.02, 0.04, 0.08, 0.1, 0.2, 0.5, 1.0, 2.0] {
+            for b in [0.3, 0.9, 1.5, 3.96, 10.0, 100.0, 1000.0] {
+                for p in [1.0e-10, 1.0e-4, 1.0e-3, 0.025, 0.1, 0.5, 0.9, 0.975] {
+                    let Some(x) = lower_tail_beta_quantile(p, a, b) else {
+                        continue;
+                    };
+                    assert!(
+                        x.is_finite(),
+                        "Beta({a}, {b}) at p={p}: the lower-tail Newton ended outside its residual band"
+                    );
+                    if x > 0.0 {
+                        let ln_b = ln_beta(a, b);
+                        let off_root = x.ln() + 1.0e-6;
+                        if let Some(residual) = lower_tail_residual(off_root, a, b, ln_b, p.ln()) {
+                            assert!(
+                                residual.g.abs() > residual.band,
+                                "Beta({a}, {b}) at p={p}: a 1e-6 displacement in ln x is not resolved"
+                            );
+                        }
+                    }
+                    certified += 1;
+                }
+            }
+        }
+        assert!(certified > 100, "the grid barely reaches the series branch: {certified}");
     }
 
     #[test]
