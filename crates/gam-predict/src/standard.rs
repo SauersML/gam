@@ -459,9 +459,10 @@ impl PredictableModel for StandardPredictor {
                     confidence_level: level,
                     covariance_mode: options.covariance_mode,
                     mean_interval_method: MeanIntervalMethod::TransformEta,
-                    // The observation band is recomputed below, centred on the
-                    // posterior-mean point rather than the plug-in point.
-                    includeobservation_interval: false,
+                    // The engine builds the observation band from the posterior
+                    // moments of μ under the requested covariance's η law (#3140),
+                    // so it is adopted as it comes.
+                    includeobservation_interval: options.include_observation_interval,
                     // V∞ §5: the measure-jet extrapolation variance widens the
                     // band adopted below, never the posterior-mean point above.
                     extrapolation_variance: options.extrapolation_variance.clone(),
@@ -500,27 +501,8 @@ impl PredictableModel for StandardPredictor {
                     self.link_kind.as_ref(),
                     unc.mean_standard_error.clone(),
                 )?;
-                if options.include_observation_interval {
-                    let z = reference.central_multiplier(level)?;
-                    let z_row = Array1::from_elem(result.eta.len(), z);
-                    let (obs_lower, obs_upper) = family_observation_band(
-                        &self.family.response,
-                        &result.mean,
-                        &unc.mean_standard_error,
-                        &z_row,
-                        &z_row,
-                        reference,
-                        fit,
-                        // Posterior-mean band: the analytic prior-weights path
-                        // (#2077) is threaded through `predict_gamwith_uncertainty`
-                        // for the effectively-linear Gaussian identity fits it
-                        // targets; the curved posterior-mean families reaching here
-                        // are unweighted-scalar for now (None ⇒ unchanged).
-                        None,
-                    );
-                    result.observation_lower = obs_lower;
-                    result.observation_upper = obs_upper;
-                }
+                result.observation_lower = unc.observation_lower;
+                result.observation_upper = unc.observation_upper;
             }
             return Ok(result);
         }

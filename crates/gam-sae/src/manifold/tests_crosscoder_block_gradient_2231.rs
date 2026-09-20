@@ -170,3 +170,73 @@ fn crosscoder_block_gradient_factors_are_derivatives_of_the_criterion_2231() {
         (implicit - implicit_fd).abs()
     );
 }
+
+/// #3270 — the streaming exact-A route prices an output-scale coordinate's
+/// `½tr(A⁺ ∂A/∂log λ)` from its probe bundle, row by row, and so returns the dense route's
+/// entry at one state. Before, it refused the coordinate for want of that trace.
+fn assert_streaming_output_scale_entry_matches_dense(label: &str, global_dispersion: bool) {
+    let (term, target, rho) = curvature_fixture();
+    let (state, anchor, _) = converged_anchor(term, &target, rho);
+    let block_width = target.ncols() - ANCHOR_WIDTH;
+    let mut at = anchor.clone();
+    at.log_lambda_block = vec![0.0];
+    // A zero inner budget prices both routes at the converged state.
+    let objective =
+        SaeManifoldOuterObjective::new(state, target.clone(), None, at, 0, 0.4, 1.0e-6, 1.0e-6);
+    let mut objective = if global_dispersion {
+        objective
+            .with_global_dispersion(0)
+            .expect("one output-scale coordinate over every column")
+    } else {
+        objective
+            .with_crosscoder_blocks(ANCHOR_WIDTH, vec![block_width])
+            .expect("one anchor column and one output block")
+    };
+    let at = objective.baseline_rho.clone();
+    let coord = at.block_flat_range().start;
+    let dense_evaluation = objective
+        .evaluate_outer_criterion_route(&at, true, false)
+        .expect("the dense route prices the state");
+    let dense = objective
+        .analytic_gradient_for_outer_evaluation(&at, &dense_evaluation)
+        .expect("the dense route differentiates the state")[coord];
+    let streaming_evaluation = objective
+        .evaluate_outer_criterion_route(&at, false, false)
+        .expect("the streaming route prices the state");
+    let streaming = objective
+        .analytic_gradient_for_outer_evaluation(&at, &streaming_evaluation)
+        .expect("the streaming route differentiates the output-scale coordinate")[coord];
+    println!(
+        "[#3270 {label}] dense cost={:.12e} streaming cost={:.12e} dense dV/dlog λ={dense:.12e} \
+         streaming dV/dlog λ={streaming:.12e}",
+        dense_evaluation.cost, streaming_evaluation.cost
+    );
+    assert!(
+        (dense_evaluation.cost - streaming_evaluation.cost).abs()
+            <= 1.0e-8 * dense_evaluation.cost.abs().max(1.0),
+        "{label}: both routes must price one state ({} vs {})",
+        dense_evaluation.cost,
+        streaming_evaluation.cost
+    );
+    assert!(
+        dense.abs() > 1.0e-3,
+        "{label}: the entry must be material for route parity to mean anything ({dense})"
+    );
+    let tolerance = 1.0e-6 * dense.abs().max(1.0);
+    assert!(
+        (streaming - dense).abs() <= tolerance,
+        "{label}: the streaming entry {streaming} is not the dense entry {dense} at one state \
+         (|Δ| = {}, tolerance {tolerance})",
+        (streaming - dense).abs()
+    );
+}
+
+#[test]
+fn streaming_route_crosscoder_block_gradient_matches_the_dense_route_3270() {
+    assert_streaming_output_scale_entry_matches_dense("crosscoder block", false);
+}
+
+#[test]
+fn streaming_route_global_dispersion_gradient_matches_the_dense_route_3270() {
+    assert_streaming_output_scale_entry_matches_dense("global dispersion", true);
+}

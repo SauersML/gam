@@ -211,11 +211,12 @@ impl GaussianLocationScaleWiggleFamily {
             &self.policy.material_policy(),
         )
     }
-    pub(crate) fn dense_block_designs_fromspecs<'a>(
-        &self,
-        specs: &'a [ParameterBlockSpec],
-    ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
-        dense_locscale_block_designs_fromspecs(
+    pub(crate) fn exact_joint_dense_block_designs<'a>(
+        &'a self,
+        specs: Option<&'a [ParameterBlockSpec]>,
+    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
+        exact_joint_locscale_block_designs(
+            (self.mu_design.as_ref(), self.log_sigma_design.as_ref()),
             specs,
             3,
             "GaussianLocationScaleWiggleFamily",
@@ -225,19 +226,6 @@ impl GaussianLocationScaleWiggleFamily {
             "mu",
             &self.policy.material_policy(),
         )
-    }
-
-    pub(crate) fn exact_joint_dense_block_designs<'a>(
-        &'a self,
-        specs: Option<&'a [ParameterBlockSpec]>,
-    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
-        if self.exact_joint_supported() {
-            return self.dense_block_designs().map(Some);
-        }
-        if let Some(specs) = specs {
-            return self.dense_block_designs_fromspecs(specs).map(Some);
-        }
-        Ok(None)
     }
 }
 

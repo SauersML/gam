@@ -147,10 +147,30 @@ use std::path::Path;
 // scored but not a candidate. It carries a serde default, so an older payload loads with no
 // screen, which reads as the rule it was chosen by, where every arm was a candidate; a v31
 // binary refuses a v32 payload by version.
-pub const MODEL_PAYLOAD_VERSION: u32 = 32;
+// v33 records, beside the exact full-conformal frozen penalty, the fit's smoothing-parameter
+// count (`ExactFullConformalPenalty::penalty_count`, gam#3296), which decides whether the REML
+// re-selecting map is computable. It carries a serde default, so an older payload loads with no
+// count and its conformal rows are refused by name (`UnknownPenaltyStructure`); a v32 binary
+// refuses a v33 payload by version instead of publishing its frozen-λ set for a fit whose
+// selection it cannot see.
+// v34 carries the constant variance stage in the latent-Z calibration's first-stage
+// covariance (`theta1_cov`, gam#3030): a fit whose variance stage does not fire now
+// records the `(p+2)²` joint covariance, with the variance row and column, where v33
+// recorded `(p+1)²`. A v33 payload still loads and predicts; its generated-regressor
+// correction refuses the narrower covariance by name, so no interval is published
+// without the stage.
+pub const MODEL_PAYLOAD_VERSION: u32 = 34;
+
+/// The schema before the constant variance stage in the first-stage covariance
+/// (gam#3030), whose only difference is that covariance's width.
+const CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION: u32 = 33;
+
+/// The schema before the full-conformal penalty count (gam#3296), whose only difference
+/// from [`CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION`] is that field's absence.
+const CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION: u32 = 32;
 
 /// The schema before the moving-law arms' adequacy screens (gam#2926), whose only
-/// difference is that field's absence.
+/// difference from [`CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION`] is that field's absence.
 const MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION: u32 = 31;
 
 /// The schema before the Gaussian location-scale σ floor record, whose only difference
@@ -218,8 +238,10 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 15] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 17] = [
     MODEL_PAYLOAD_VERSION,
+    CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION,
+    CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
     MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
     SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
     POLISH_STEP_BUDGET_PAYLOAD_VERSION,
@@ -424,6 +446,36 @@ impl_reason_error_boilerplate! {
         MissingField,
         IncompatibleConfig,
         InvalidInput,
+    }
+}
+
+impl FittedModelError {
+    /// Who has to act on a saved model this binary refuses: the one category
+    /// every front end classifies it by. Each variant refuses the saved
+    /// payload's own contents (its schema, bytes, fields, options or values),
+    /// so each is a data refusal, remedied by refitting or re-saving the model
+    /// (gam#3008). Exhaustive with no wildcard arm.
+    #[must_use]
+    pub fn error_category(&self) -> gam_problem::ErrorCategory {
+        match self {
+            Self::SchemaMismatch { .. }
+            | Self::PayloadCorrupt { .. }
+            | Self::MissingField { .. }
+            | Self::IncompatibleConfig { .. }
+            | Self::InvalidInput { .. } => gam_problem::ErrorCategory::Data,
+        }
+    }
+
+    /// The `Enum::Variant` name a front end reports beside the category.
+    #[must_use]
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::SchemaMismatch { .. } => "FittedModelError::SchemaMismatch",
+            Self::PayloadCorrupt { .. } => "FittedModelError::PayloadCorrupt",
+            Self::MissingField { .. } => "FittedModelError::MissingField",
+            Self::IncompatibleConfig { .. } => "FittedModelError::IncompatibleConfig",
+            Self::InvalidInput { .. } => "FittedModelError::InvalidInput",
+        }
     }
 }
 
@@ -668,9 +720,9 @@ pub struct FittedModelPayload {
     pub noise_scale: Option<Vec<f64>>,
     #[serde(default)]
     pub noise_non_intercept_start: Option<usize>,
-    /// Tikhonov ridge alpha used by `solve_scale_projection` when fitting
-    /// `noise_projection`.  Persisted so prediction-time replay is identical
-    /// to fit-time projection.
+    /// The squared SVD cutoff a saved `noise_projection` was fitted with, by the
+    /// transform-fitting route #3015 retired. Persisted so a saved model's replay
+    /// reads exactly what it wrote.
     #[serde(default)]
     pub noise_projection_ridge_alpha: Option<f64>,
     #[serde(default)]
@@ -2448,10 +2500,19 @@ impl SavedLinkWiggleRuntime {
                 ),
             });
         }
+        Ok(base + &self.contribution(warp_index)?)
+    }
+
+    /// The wiggle's share `B(warp_index)·β` of the link, certified monotone at
+    /// `warp_index`. This is the one evaluation of that share:
+    /// [`Self::apply_with_index`] adds it to the base predictor, and a Gaussian
+    /// location-scale fit publishes it as its wiggle block's state, so the saved
+    /// model reproduces the fit's own mean bit for bit (#3001).
+    pub fn contribution(&self, warp_index: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
         self.validate_monotone_derivative(warp_index)?;
         let xwiggle = self.constrained_basis(warp_index, BasisOptions::value())?;
         let beta_link_wiggle = Array1::from_vec(self.beta.clone());
-        Ok(base + &xwiggle.dot(&beta_link_wiggle))
+        Ok(xwiggle.dot(&beta_link_wiggle))
     }
 
     pub fn derivative_q0(&self, q0: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
@@ -7881,6 +7942,8 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION,
+            CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
             MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
             SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
             POLISH_STEP_BUDGET_PAYLOAD_VERSION,
@@ -7901,7 +7964,15 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
-        assert_eq!(MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(
+            CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
+            CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION - 1
+        );
+        assert_eq!(
+            MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
+            CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION - 1
+        );
         assert_eq!(
             SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
             MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION - 1

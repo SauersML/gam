@@ -14,7 +14,9 @@
 
 use csv::StringRecord;
 use gam::estimate::FitOptions;
-use gam::inference::rho_posterior::{RhoPosteriorNotComputed, RhoPosteriorOutcome};
+use gam::inference::rho_posterior::{
+    RhoPosteriorNotComputed, RhoPosteriorOutcome, WeightTailShape,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -180,11 +182,12 @@ fn real_gaussian_fit_carries_a_sound_tier0_adequacy_diagnostic() {
     init_parallelism();
     let (_reml_score, adequacy) = fit_and_take_adequacy(938_001);
 
-    assert!(
-        adequacy.k_hat.is_finite(),
-        "the Pareto tail shape k̂ must be finite, got {}",
-        adequacy.k_hat
-    );
+    // A real criterion is not the proposal quadratic, so its weights have a
+    // tail to fit.
+    let WeightTailShape::Pareto(k_hat) = adequacy.tail_shape else {
+        panic!("a real fit's weights carry a tail, got {:?}", adequacy.tail_shape);
+    };
+    assert!(k_hat.is_finite(), "the Pareto tail shape k̂ must be finite, got {k_hat}");
     assert!(adequacy.n_samples >= 2, "the diagnostic must draw proposals");
 
     // Kish's (Σw)²/Σw² over the M self-normalized weights lies in [1, M]: Σw = 1
@@ -213,9 +216,13 @@ fn tier0_adequacy_is_deterministic_across_identical_fits() {
         score_b.to_bits(),
         "identical fits must reach the same REML score"
     );
+    let shape_bits = |shape: WeightTailShape| match shape {
+        WeightTailShape::Pareto(k_hat) => Some(k_hat.to_bits()),
+        WeightTailShape::Flat => None,
+    };
     assert_eq!(
-        a.k_hat.to_bits(),
-        b.k_hat.to_bits(),
+        shape_bits(a.tail_shape),
+        shape_bits(b.tail_shape),
         "the fixed-seed diagnostic must give bit-identical k̂ across identical fits"
     );
     assert_eq!(a.n_samples, b.n_samples);

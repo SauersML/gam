@@ -92,9 +92,12 @@ struct PyFittedModel {
 
 impl PyFittedModel {
     fn compile(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<Self> {
-        let (model, source) = detach_py_result(py, "compile_model", move || {
-            load_model_impl(&model_bytes).map(|model| (model, model_bytes))
-        })?;
+        let (model, source) = detach_typed_py_result(
+            py,
+            "compile_model",
+            move || load_model_impl(&model_bytes).map(|model| (model, model_bytes)),
+            saved_model_error_to_pyerr,
+        )?;
         Ok(Self {
             model: Arc::new(model),
             source: source.into(),
@@ -4381,11 +4384,18 @@ fn compare_models(
             )))
         })
         .collect::<PyResult<Vec<_>>>()?;
+    let models = detach_typed_py_result(
+        py,
+        "compare_models",
+        move || {
+            model_bytes
+                .iter()
+                .map(|bytes| load_model_impl(bytes))
+                .collect::<Result<Vec<_>, _>>()
+        },
+        saved_model_error_to_pyerr,
+    )?;
     let comparison = detach_py_result(py, "compare_models", move || {
-        let models = model_bytes
-            .iter()
-            .map(|bytes| load_model_impl(bytes))
-            .collect::<Result<Vec<_>, String>>()?;
         let named = labels
             .into_iter()
             .zip(models.iter())
@@ -4448,7 +4458,8 @@ fn json_lookup_str(payload: &serde_json::Value, keys: &[&str]) -> Option<String>
 
 fn reml_fit_view<'py>(fit: &Bound<'py, PyAny>) -> PyResult<RemlFitView<'py>> {
     if let Ok(model_bytes) = fit.extract::<Vec<u8>>() {
-        let model = load_model_impl(&model_bytes).map_err(PyValueError::new_err)?;
+        let model =
+            load_model_impl(&model_bytes).map_err(|err| saved_model_error_to_pyerr(fit.py(), err))?;
         let summary = summary_payload_value(&model).map_err(PyValueError::new_err)?;
         return Ok(RemlFitView::SavedSummary(summary));
     }
@@ -4626,45 +4637,37 @@ fn gaussian_reml_fit<'py>(
     let x_values = x.as_array().to_owned();
     let y_values = y.as_array().to_owned();
     let penalty_values = penalty.as_array().to_owned();
-    let n_rows = x_values.nrows();
-    let n_outputs = y_values.ncols();
-    let n_coefficients = penalty_values.nrows();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
-    let result = detach_py_result(py, "gaussian_reml_fit", move || {
+    let fit = detach_pyresult(py, "gaussian_reml_fit", move || {
         let gated_x = gate_design_for_forward(
             x_values.view(),
             by_values.as_ref().map(|b| b.view()),
             by_start_col,
-        )?;
+        )
+        .map_err(py_value_error)?;
         let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
         let gated_weights = gate_weights_for_forward(
             weight_values.as_ref().map(|w| w.view()),
             by_values.as_ref().map(|b| b.view()),
             x_values.nrows(),
-        )?;
-        match gaussian_reml_multi_closed_form_with_cache(
+        )
+        .map_err(py_value_error)?;
+        // The closed form whitens by XᵀWX, so a design whose XᵀWX is singular
+        // (p > n, or rank-deficient) is refused with the engine's typed error
+        // rather than reported as a zero fit (gam#3310).
+        gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
             penalty_values.view(),
             gated_weights.as_ref().map(|w| w.view()),
             init_lambda,
             None,
-        ) {
-            Ok(fit) => Ok(Some(fit)),
-            Err(EstimationError::ModelIsIllConditioned { .. }) => Ok(None),
-            Err(err) => Err(err.to_string()),
-        }
+        )
+        .map_err(estimation_error_to_pyerr)
     })?;
     let out = PyDict::new(py);
-    match result {
-        Some(fit) => {
-            set_ok_gaussian_reml_items(py, &out, fit)?;
-        }
-        None => {
-            set_degenerate_gaussian_reml_items(py, &out, n_rows, n_outputs, n_coefficients)?;
-        }
-    }
+    set_ok_gaussian_reml_items(py, &out, fit)?;
     Ok(out.unbind())
 }
 
@@ -5979,9 +5982,7 @@ fn gaussian_reml_fit_positions<'py>(
     let y_values = y.as_array().to_owned();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
-    let n_rows = t_values.len();
-    let n_outputs = y_values.ncols();
-    let (result, basis) = detach_py_result(py, "gaussian_reml_fit_positions", move || {
+    let (fit, basis) = detach_pyresult(py, "gaussian_reml_fit_positions", move || {
         let basis = resolve_position_basis(
             t_values.view(),
             basis_kind.as_deref(),
@@ -5990,7 +5991,8 @@ fn gaussian_reml_fit_positions<'py>(
             basis_order,
             periodic,
             period,
-        )?;
+        )
+        .map_err(py_value_error)?;
         let x = position_basis_design(
             t_values.view(),
             basis.locations.view(),
@@ -5998,36 +6000,32 @@ fn gaussian_reml_fit_positions<'py>(
             basis.order,
             periodic,
             basis.period,
-        )?;
+        )
+        .map_err(py_value_error)?;
         let gated_x =
-            gate_design_for_forward(x.view(), by_values.as_ref().map(|b| b.view()), by_start_col)?;
+            gate_design_for_forward(x.view(), by_values.as_ref().map(|b| b.view()), by_start_col)
+                .map_err(py_value_error)?;
         let fit_x = gated_x.as_ref().map_or(x.view(), |g| g.view());
         let gated_weights = gate_weights_for_forward(
             weight_values.as_ref().map(|w| w.view()),
             by_values.as_ref().map(|b| b.view()),
             x.nrows(),
-        )?;
-        let fit = match gaussian_reml_multi_closed_form_with_cache(
+        )
+        .map_err(py_value_error)?;
+        // A singular XᵀWX is refused with the engine's typed error (gam#3310).
+        let fit = gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
             basis.penalty.view(),
             gated_weights.as_ref().map(|w| w.view()),
             init_lambda,
             None,
-        ) {
-            Ok(fit) => Some(fit),
-            Err(EstimationError::ModelIsIllConditioned { .. }) => None,
-            Err(err) => return Err(err.to_string()),
-        };
+        )
+        .map_err(estimation_error_to_pyerr)?;
         Ok((fit, basis))
     })?;
     let out = PyDict::new(py);
-    match result {
-        Some(fit) => set_ok_gaussian_reml_items(py, &out, fit)?,
-        None => {
-            set_degenerate_gaussian_reml_items(py, &out, n_rows, n_outputs, basis.penalty.nrows())?;
-        }
-    }
+    set_ok_gaussian_reml_items(py, &out, fit)?;
     set_position_basis_items(py, &out, basis, periodic)?;
     Ok(out.unbind())
 }

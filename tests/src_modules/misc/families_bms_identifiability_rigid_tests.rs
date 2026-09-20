@@ -2589,15 +2589,11 @@ fn zero_deviation_intercept_fast_path_matches_denested_calibration() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "marginal map", e));
     let scale = family.probit_frailty_scale();
     let rigid_a = rigid_prescale_intercept_from_marginal(marginal.q, slope, scale);
-    let (f_rigid, f_a_rigid, _) = family
-        .evaluate_denested_calibration_newton(
-            rigid_a,
-            marginal_eta,
-            slope,
-            Some(&beta_h),
-            Some(&beta_w),
-        )
+    let calibration = family
+        .evaluate_denested_calibration_tail(rigid_a, slope, Some(&beta_h), Some(&beta_w), false)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "denested zero-deviation calibration", e));
+    let f_rigid = calibration.tail - marginal.mu;
+    let f_a_rigid = calibration.density;
     assert!(
         f_rigid.abs() <= 5e-13,
         "closed-form rigid intercept residual should be at machine epsilon, got {f_rigid}"

@@ -52,8 +52,7 @@ fn a_streamed_reader_gram_reproduces_the_cached_pass_bit_for_bit_across_tiles() 
     let streamed_total = streamed
         .units
         .pair_pass(streamed.units.readers.view(), CoordinateFormation::Copied, None)
-        .expect("the streamed V(I) pass")
-        .energy;
+        .expect("the streamed V(I) pass");
     let resident = cached
         .units
         .reader_gram
@@ -197,7 +196,7 @@ fn the_halved_pair_pass_is_the_full_double_sum_across_tiles() {
     let pass = units
         .pair_pass(units.readers.view(), CoordinateFormation::Copied, Some(&mut weighted))
         .expect("the halved V(I) pass");
-    let halved = pass.energy.value;
+    let halved = pass.value;
     let reference = full_square_reference(&block);
     let worst_ratio = (&weighted - &reference.weighted)
         .mapv(f64::abs)
@@ -221,7 +220,7 @@ fn the_halved_pair_pass_is_the_full_double_sum_across_tiles() {
         (halved - reference.upper_only_variance).abs(),
         weighted.len(),
     );
-    assert_eq!(pass.energy, block.total_variance(), "the V(I) pass must reproduce the cached V(I)");
+    assert_eq!(pass, block.total_variance(), "the V(I) pass must reproduce the cached V(I)");
     assert!(
         (halved - reference.variance).abs() <= reference.variance_band,
         "halved V(I) {halved} vs the full double sum {} beyond the band {}",

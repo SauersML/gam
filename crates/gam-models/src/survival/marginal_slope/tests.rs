@@ -146,8 +146,6 @@ fn base_time_block() -> TimeBlockInput {
             1,
             DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
         ),
-        time_monotonicity:
-            crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByRowConstraint,
         penalties: Vec::new(),
         nullspace_dims: Vec::new(),
         initial_log_lambdas: None,
@@ -347,6 +345,7 @@ fn make_closed_form_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -946,6 +945,7 @@ fn test_family(
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -979,8 +979,6 @@ fn validate_spec_rejects_coordinate_cone_without_guard_offset() {
             offset_entry: Array1::zeros(2),
             offset_exit: Array1::zeros(2),
             derivative_offset_exit: Array1::zeros(2),
-            time_monotonicity:
-                crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
             ..base_time_block()
         },
         timewiggle_block: None,
@@ -1416,6 +1414,7 @@ fn exact_flex_row_matches_rigid_closed_form_without_deviations() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -1770,6 +1769,7 @@ fn oracle_rigid_family(
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -2105,6 +2105,7 @@ fn exact_flex_row_value_matches_rigid_with_zero_score_and_link_coefficients() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -2254,6 +2255,7 @@ fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip()
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            flex_jet_arenas: new_flex_jet_arena_pool(),
         };
         // ZERO deviation coefficients: the flex calculus runs in full, but the
         // primary NLL reduces to the rigid closed form so the rigid Tower4 is the
@@ -2453,6 +2455,7 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let primary = flex_primary_slices(&family);
     let p = primary.total;
@@ -2897,6 +2900,7 @@ fn link_flex_family_supports_second_order_exact_outer_path() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let specs = vec![
         dummy_blockspec(1),
@@ -2912,6 +2916,7 @@ fn link_flex_family_supports_second_order_exact_outer_path() {
 
 mod time_wiggle_and_psi_derivatives;
 mod anchor_history_2983;
+mod resolve_start_2926;
 
 #[test]
 fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
@@ -2947,6 +2952,7 @@ fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -3022,6 +3028,7 @@ fn censored_rows_still_reject_invalid_time_derivative() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -3095,6 +3102,7 @@ fn exact_newton_evaluation_propagates_invalid_rows() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -3169,6 +3177,7 @@ fn time_constraints_use_exact_derivative_guard_rows() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
@@ -3257,6 +3266,7 @@ fn time_block_constraints_synthesize_qd1_rows_when_stored_constraints_missing() 
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
@@ -3332,6 +3342,7 @@ fn time_block_max_feasible_step_uses_synthesized_qd1_rows() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let states = vec![ParameterBlockState {
         beta: array![0.4, 7.0],
@@ -3398,6 +3409,7 @@ fn coupled_qd1_guard_limits_time_step_before_post_update_projection() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let states = vec![ParameterBlockState {
         beta: array![0.6, 0.6],
@@ -3477,6 +3489,7 @@ fn timewiggle_tail_step_is_clipped_before_it_can_flip_derivative() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 1,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let states = vec![ParameterBlockState {
         beta: array![0.0, 0.5],
@@ -3545,6 +3558,7 @@ fn time_block_post_update_rejects_infeasible_beta_instead_of_projecting() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 1,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
@@ -3626,6 +3640,7 @@ fn time_block_post_update_rejects_qd1_when_no_linear_constraints() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
@@ -3711,6 +3726,7 @@ fn time_block_post_update_errors_when_current_violates_qd1() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
@@ -3791,6 +3807,7 @@ fn time_block_feasible_step_stays_inside_derivative_guard() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let states = vec![
         ParameterBlockState {
@@ -3874,6 +3891,7 @@ fn mixed_blockwise_exact_newton_preserves_sparse_block_hessians() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -4213,6 +4231,7 @@ fn make_block_psi_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -4355,6 +4374,7 @@ fn make_flex_baseline_psi_test_fixture() -> (
         time_wiggle_degree: Some(degree),
         time_wiggle_ncols: wiggle_width,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
 
     let mut beta_time = Array1::zeros(time_width);
@@ -5321,6 +5341,7 @@ fn make_flex_no_wiggle_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -6042,6 +6063,7 @@ fn flex_contraction_fixture_family(
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let h_dim = score_runtime.basis_dim();
     let w_dim = link_runtime.basis_dim();
@@ -6267,6 +6289,7 @@ fn make_time_guard_family(deriv_coeff: f64, deriv_offset: f64) -> SurvivalMargin
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -6491,6 +6514,7 @@ fn zz_diag_failure1_flex_vs_rigid_vs_fdhess() {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            flex_jet_arenas: new_flex_jet_arena_pool(),
         };
         let sd = score_runtime.basis_dim();
         let ld = link_runtime.basis_dim();
@@ -8184,6 +8208,7 @@ fn make_timewiggle_test_family(
         time_wiggle_degree: Some(TIMEWIGGLE_TEST_DEGREE),
         time_wiggle_ncols: TIMEWIGGLE_TEST_NCOLS,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -8918,6 +8943,7 @@ fn survival_intercept_root_does_not_follow_its_warm_seed_2971() {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: cache,
+            flex_jet_arenas: new_flex_jet_arena_pool(),
         }
     };
     let beta_h = Array1::from_iter((0..h_dim).map(|k| 0.04 * (k as f64 + 1.3).sin()));
@@ -8971,33 +8997,26 @@ fn survival_intercept_root_does_not_follow_its_warm_seed_2971() {
     );
 }
 
-/// #2900 row 6.11: the rigid survival row jet reaches the device through the
-/// dispatch policy's fused-kernel crossover, and the device returns the per-row
-/// CPU program. On a CUDA host the fixture is sized at the probed runtime's
-/// `fused_kernel_min_n`, so the production cache build selects the device, and
-/// every channel of every row is compared with `row_kernel(row)` at the
-/// `RowKernel::batched_value_grad_hess_all` contract (≤ 1e-9). Two rows in
-/// seven are shifted 5 units into either probability tail. On a host without a
-/// device, nothing is admitted: the check reduces to admission, and the report
-/// says `device_selected=false`.
+/// #2900 row 6.11 and gam#3024: the rigid survival row jet is weighed by its
+/// own two executors, and the device returns the per-row CPU program. On a
+/// host without a device nothing is admitted or raced, and the cache is the
+/// per-row loop. On a CUDA host the first `auto` build of an untimed shape
+/// races the per-row loop against the device pass and returns the per-row
+/// result bit for bit; the shape is then decided from its timing without
+/// another race, and the device pass is compared with `row_kernel(row)` on
+/// every channel of every row at the `RowKernel::batched_value_grad_hess_all`
+/// contract (≤ 1e-9). Two rows in seven are shifted 5 units into either
+/// probability tail.
 #[test]
 fn rigid_row_jet_device_admission_and_parity_2900() {
     use crate::row_kernel::{RowKernel, RowSet, build_row_kernel_cache};
-    use gam_gpu::policy::GpuDispatchPolicy;
-    let admitted = |n: usize| {
+    let n = 2_048;
+    let decide = || {
         rigid_row_jet_decision::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>(n)
             .expect("survival row-jet admission must not fault")
-            .use_gpu
     };
-
-    let floor = GpuDispatchPolicy::MIN_CALIBRATABLE_FUSED_KERNEL_N;
-    assert!(
-        !admitted(floor - 1),
-        "no reachable policy admits a fused batch below {floor} rows"
-    );
     let runtime = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
         .expect("CUDA runtime resolution must not fault");
-    let n = runtime.map_or(64, |runtime| runtime.policy().fused_kernel_min_n.max(floor));
 
     let mut family = make_closed_form_test_family(n);
     let into_tails = |values: &Array1<f64>| {
@@ -9014,45 +9033,87 @@ fn rigid_row_jet_device_admission_and_parity_2900() {
         family,
         block_states,
     );
-
-    let selected = admitted(n);
-    assert_eq!(
-        selected,
-        runtime.is_some(),
-        "a {n}-row batch at the probed runtime's fused-kernel crossover must reach the device \
-         exactly when a device resolves"
-    );
-    let cache = build_row_kernel_cache(&kernel, &RowSet::All).expect("rigid row-kernel cache");
-    let mut worst_gap = 0.0_f64;
-    let mut worst_row = 0;
-    for row in 0..n {
-        let (value, grad, hess) = RowKernel::row_kernel(&kernel, row).expect("per-row CPU program");
-        let channels = std::iter::once((cache.nll[row], value))
-            .chain(cache.gradients[row].iter().copied().zip(grad))
-            .chain(
-                cache.hessians[row]
-                    .iter()
-                    .flatten()
-                    .copied()
-                    .zip(hess.iter().flatten().copied()),
-            );
-        for (batched, per_row) in channels {
-            let gap = (batched - per_row).abs() / 1.0_f64.max(batched.abs()).max(per_row.abs());
-            if !(gap <= worst_gap) {
-                worst_gap = gap;
-                worst_row = row;
+    let per_row: Vec<_> = (0..n)
+        .map(|row| RowKernel::row_kernel(&kernel, row).expect("per-row CPU program"))
+        .collect();
+    let worst_gap =
+        |nll: &[f64],
+         gradients: &[[f64; STATIC_SLOPE_PRIMARIES]],
+         hessians: &[[[f64; STATIC_SLOPE_PRIMARIES]; STATIC_SLOPE_PRIMARIES]]| {
+            let mut worst = (0.0_f64, 0);
+            for (row, (value, grad, hess)) in per_row.iter().enumerate() {
+                let channels = std::iter::once((nll[row], *value))
+                    .chain(gradients[row].iter().copied().zip(grad.iter().copied()))
+                    .chain(
+                        hessians[row]
+                            .iter()
+                            .flatten()
+                            .copied()
+                            .zip(hess.iter().flatten().copied()),
+                    );
+                for (batched, cpu) in channels {
+                    let gap = (batched - cpu).abs() / 1.0_f64.max(batched.abs()).max(cpu.abs());
+                    if !(gap <= worst.0) {
+                        worst = (gap, row);
+                    }
+                }
             }
+            worst
+        };
+
+    let first = decide();
+    if runtime.is_none() {
+        assert_eq!(
+            (first.use_gpu, first.race),
+            (false, None),
+            "a host without a device admits and races nothing: {}",
+            first.reason
+        );
+    } else {
+        assert!(
+            first.race.is_some() || first.reason == "cpu-device-measured-slower" || first.use_gpu,
+            "an untimed shape on a CUDA host is raced: {}",
+            first.reason
+        );
+    }
+    let raced = first.race.is_some();
+    let cache = build_row_kernel_cache(&kernel, &RowSet::All).expect("rigid row-kernel cache");
+    let (cache_gap, cache_row) = worst_gap(&cache.nll, &cache.gradients, &cache.hessians);
+    if raced || !first.use_gpu {
+        assert_eq!(
+            cache_gap, 0.0,
+            "a raced or CPU-decided build returns the per-row loop bit for bit; row {cache_row}"
+        );
+        if raced {
+            assert!(decide().race.is_none(), "a raced shape is decided from its timing");
         }
     }
+    #[cfg(target_os = "linux")]
+    let device_gap = runtime.map(|_| {
+        let (nll, gradients, hessians) = kernel
+            .rigid_row_jet_on_device()
+            .expect("the device row jet runs on a CUDA host");
+        worst_gap(&nll, &gradients, &hessians)
+    });
+    #[cfg(not(target_os = "linux"))]
+    let device_gap: Option<(f64, usize)> = None;
     eprintln!(
-        "#2900 survival row jet: n={n} device_selected={selected} \
-         worst_relative_gap={worst_gap:.3e} at row {worst_row}"
+        "#2900/#3024 survival row jet: n={n} raced={raced} decision={} cache_gap={cache_gap:.3e} \
+         device_gap={device_gap:?}",
+        first.reason
     );
     assert!(
-        worst_gap <= 1e-9,
-        "survival row jet: batched channel differs from the per-row program by {worst_gap:e} \
-         (relative) at row {worst_row}, device_selected={selected}"
+        cache_gap <= 1e-9,
+        "survival row jet: the cache differs from the per-row program by {cache_gap:e} \
+         (relative) at row {cache_row}"
     );
+    if let Some((gap, row)) = device_gap {
+        assert!(
+            gap <= 1e-9,
+            "survival row jet: the device pass differs from the per-row program by {gap:e} \
+             (relative) at row {row}"
+        );
+    }
 }
 
 /// gam#3000 slice 2: the device row jet declares the four-primary Gaussian
@@ -9251,6 +9312,7 @@ fn link_deviation_row_likelihood_is_c1_across_its_support_end_2971() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let beta_h = Array1::from_iter((0..h_dim).map(|k| 0.04 * (k as f64 + 1.3).sin()));
     let beta_w = Array1::from_iter((0..w_dim).map(|k| 0.035 * (k as f64 + 0.7).cos()));
