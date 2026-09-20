@@ -4871,6 +4871,23 @@ mod selection_replay_tests {
     /// retired one-pass `Σd²/N − d̄²` is evaluated alongside to show this is
     /// the regime where it loses the variance (it resolves only `ulp(c²)`),
     /// and a constant sample must report an error of exactly zero.
+    ///
+    /// The fixture is chosen so that every floating-point step of the two-pass
+    /// reading is exact, which is why the assertions are equalities rather than
+    /// an ε band:
+    /// - `c ± s` with `c = 3·2⁻²` and `s = 2⁻ᵏ`, `k ≤ 31`, spans bits `2⁻¹…2⁻³¹`,
+    ///   well inside a 53-bit significand, so both values are exact.
+    /// - The pivoted differences are `0` or `−2s`, exact by Sterbenz because
+    ///   `c − s` and `c + s` are within a factor of two of each other.
+    /// - Every partial sum is a multiple of `2s` no larger than `2⁹·s`, so it is
+    ///   exact. Dividing by `N = 2⁸` is exact, and so is `(c + s) − s = c`.
+    /// - The centred values `±s` and their squares `2⁻²ᵏ` (normal for `k ≤ 31`)
+    ///   are exact, and so is the sum `N·s²`.
+    /// - `M₂/N/N = 2⁻²ᵏ⁻⁸` and its square root `2⁻ᵏ⁻⁴` are exact, and that root
+    ///   is exactly the reference `√(s²/N)`.
+    ///
+    /// A constant sample has every pivoted difference exactly `0`, so its mean is
+    /// the pivot and its `M₂` is `0`, both exactly.
     #[test]
     fn paired_standard_error_is_centred_and_exact_under_a_large_mean_4086() {
         let c = 0.75_f64;
@@ -4883,9 +4900,9 @@ mod selection_replay_tests {
             let exact_error = (s * s / n).sqrt();
             let (shift, error) = paired_mean_with_error(sample.iter().copied());
             assert_eq!(shift, c, "the construction gives the mean exactly");
-            assert!(
-                (error - exact_error).abs() <= 4.0 * f64::EPSILON * exact_error,
-                "s = 2^-{k}: centred error {error:.17e} vs exact {exact_error:.17e}"
+            assert_eq!(
+                error, exact_error,
+                "s = 2^-{k}: every step of the centred reading is exact on this fixture"
             );
             let sum: f64 = sample.iter().sum();
             let sum_squares: f64 = sample.iter().map(|d| d * d).sum();
@@ -4902,7 +4919,7 @@ mod selection_replay_tests {
         for value in [0.1_f64, 1.0 / 3.0, -0.7, 1.0] {
             let (shift, error) = paired_mean_with_error(std::iter::repeat_n(value, 10));
             assert_eq!(error, 0.0, "a constant sample of {value} has no spread");
-            assert!((shift - value).abs() <= 2.0 * f64::EPSILON * value.abs());
+            assert_eq!(shift, value, "a constant sample of {value} is its own mean");
         }
     }
 
