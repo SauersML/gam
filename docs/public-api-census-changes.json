@@ -4888,7 +4888,7 @@
     "evidence": "public_api_census.py with base 9e4544cb8f0785925cdca5cc448efcb22afd9fb8 and head the candidate refuses exactly this identity (13820 -> 13819 public function declarations). In the head tree, git grep -w learned_frailty_scale_is_identified finds 0 occurrences."
   },
   {
-    "base": "900d061dfc69e80e09eb163b488f12aabfc496a3",
+    "base": "f978f1d043baca9753bc81e60ef5a8ac0de02060",
     "removed": {
       "crates/gam-predict/src/posterior_bands.rs::eta_bands_from_matrix_link": 1
     },

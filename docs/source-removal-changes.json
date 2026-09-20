@@ -2708,6 +2708,21 @@
   {
     "base": "900d061dfc69e80e09eb163b488f12aabfc496a3",
     "items": [
+      "crates/gam-inference/src/hmc_io.rs:const:HIGH_DIM_THRESHOLD",
+      "crates/gam-inference/src/hmc_io.rs:const:MASS_REGULARIZE_HIGH_DIM",
+      "crates/gam-inference/src/hmc_io.rs:const:MASS_REGULARIZE_LOW_DIM",
+      "crates/gam-inference/src/hmc_io.rs:const:SURVIVAL_MASS_REGULARIZE_HIGH_DIM",
+      "crates/gam-inference/src/hmc_io.rs:const:SURVIVAL_MASS_REGULARIZE_LOW_DIM",
+      "crates/gam-inference/src/hmc_io.rs:fn:mass_matrix_configs_floor_by_regularization_not_jitter_3090",
+      "crates/gam-inference/src/hmc_io.rs:fn:robust_mass_matrix_config",
+      "crates/gam-inference/src/hmc_io.rs:fn:robust_survival_mass_matrix_config"
+    ],
+    "reason": "#3263, the metric half (the target-acceptance half landed with #3370): the NUTS mass-matrix shrinkage toward the identity was a fixed weight, MASS_REGULARIZE_{HIGH,LOW}_DIM = 0.14/0.10 for the mean families and SURVIVAL_MASS_REGULARIZE_{HIGH,LOW}_DIM = 0.18/0.12 for survival, switched at HIGH_DIM_THRESHOLD = 50 and chosen by robust_mass_matrix_config and robust_survival_mass_matrix_config. The pinned general-mcmc c6e415d shrinks each warmup window's log variances toward the identity by that window's own James-Stein intensity, priced by the Monte Carlo error of the squared deviations, and its open warmup no longer reads the fixed weight regularize, so the four weights, the switch and both configs are dead. One nuts_mass_matrix_config with every fixed field zero replaces both configs at their two call sites. The #3090 test mass_matrix_configs_floor_by_regularization_not_jitter_3090 asserted the removed regularize floor; mass_matrix_config_leaves_shrinkage_to_each_warmup_window_3263 replaces it.",
+    "evidence": "At this base, source_removal_guard.py with the landing commit as head reports exactly these identities. git grep -w finds none of the eight names under crates, src or tests in the head tree. Gate direct-dy4-w2evhb-3263-g1f.log (acn112): cargo check --workspace --all-targets and gam-pyffi, plus the gam-inference hmc_io, rho_posterior and sample tests, among them mass_matrix_config_leaves_shrinkage_to_each_warmup_window_3263."
+  },
+  {
+    "base": "f978f1d043baca9753bc81e60ef5a8ac0de02060",
+    "items": [
       "crates/gam-predict/src/posterior_bands.rs:enum:LinkSelector",
       "crates/gam-predict/src/posterior_bands.rs:fn:apply",
       "crates/gam-predict/src/posterior_bands.rs:fn:eta_bands_from_matrix_link",
