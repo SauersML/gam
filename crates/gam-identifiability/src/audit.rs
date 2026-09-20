@@ -93,7 +93,8 @@ use gam_linalg::faer_ndarray::{
     FaerEigh, default_rrqr_rank_alpha, fast_atb, rrqr_with_permutation, with_nested_parallel,
 };
 use gam_problem::{
-    EstimationError, FamilyLinearizationState, JointRankCertificate, ParameterBlockSpec,
+    CustomFamilyError, EstimationError, FamilyLinearizationState, JointRankCertificate,
+    ParameterBlockSpec,
 };
 use gam_runtime::loop_progress::LoopProgress;
 
@@ -3388,15 +3389,18 @@ pub use gam_problem::MapUniquenessError;
 /// `Ok(())` when the condition holds for every null direction (i.e. every
 /// null direction of `J^T W J` carries `n^T S n > null_tol`).
 ///
-/// `Err(MapUniquenessError)` for the first null direction (sorted by
-/// ascending `n^T S n`) that violates the condition.
+/// `Err(CustomFamilyError::MapUniquenessFailure)` for the first null direction
+/// (sorted by ascending `n^T S n`) that violates the condition, and
+/// `Err(CustomFamilyError::NumericalFailure)` when `J^T W J` cannot be
+/// eigendecomposed: a failed factorisation certifies nothing about the null
+/// space, so it is never reported as a pass.
 pub fn check_map_uniqueness(
     j_joint: &Array2<f64>,
     w_diag: &[f64],
     s_joint: &Array2<f64>,
     specs: &[ParameterBlockSpec],
     col_offsets: &[usize],
-) -> Result<(), MapUniquenessError> {
+) -> Result<(), CustomFamilyError> {
     let n = j_joint.nrows();
     let p = j_joint.ncols();
 
@@ -3470,18 +3474,14 @@ pub fn check_map_uniqueness(
     }
 
     // Eigendecompose the equilibrated G = V diag(λ) V^T (symmetric).
-    let (evals, evecs) = match g.eigh(Side::Lower) {
-        Ok(pair) => pair,
-        Err(e) => {
-            // Eigendecomposition failure: skip the check rather than
-            // producing a spurious failure — log and return Ok.
-            log::debug!(
-                "[MAP-UNIQUE] check_map_uniqueness: eigendecomposition of J^T W J failed \
-                 ({e:?}); skipping MAP uniqueness check",
-            );
-            return Ok(());
-        }
-    };
+    let (evals, evecs) = g
+        .eigh(Side::Lower)
+        .map_err(|e| CustomFamilyError::NumericalFailure {
+            reason: format!(
+                "MAP uniqueness check: eigendecomposition of the equilibrated J^T W J \
+                 ({p}x{p}) failed ({e:?}); ker(J^T W J) ∩ ker(S) cannot be certified",
+            ),
+        })?;
 
     // Determine the null-space tolerance.
     // Use the same RRQR_RANK_ALPHA · ε · p · λ_max convention as the
@@ -3536,11 +3536,13 @@ pub fn check_map_uniqueness(
                  direction, or remove the unpenalised null direction from the model.",
                 dir_idx, dominant_block, dominant_block,
             );
-            return Err(MapUniquenessError {
-                message,
-                dominant_block,
-                null_direction_index: dir_idx,
-                penalty_quadratic_form: ntsn,
+            return Err(CustomFamilyError::MapUniquenessFailure {
+                error: MapUniquenessError {
+                    message,
+                    dominant_block,
+                    null_direction_index: dir_idx,
+                    penalty_quadratic_form: ntsn,
+                },
             });
         }
     }
@@ -3636,7 +3638,7 @@ mod tests {
                 verdict.is_ok(),
                 "scale {scale:e}: a direction with resolvable curvature is not a null \
                  direction: {}",
-                verdict.err().map(|error| error.message).unwrap_or_default()
+                verdict.err().map(|e| e.to_string()).unwrap_or_default()
             );
 
             let mut aliased = design.clone();
@@ -3646,9 +3648,19 @@ mod tests {
                 .rank;
             assert_eq!(aliased_rank, 2, "scale {scale:e}: aliased design must lose one rank");
             let aliased_specs = [spec_from_dense("time_transform", aliased.clone())];
-            let error =
-                check_map_uniqueness(&aliased, &[], &unpenalized, &aliased_specs, &col_offsets)
-                    .expect_err("an exactly aliased, unpenalized pair must refuse at every scale");
+            let error = match check_map_uniqueness(
+                &aliased,
+                &[],
+                &unpenalized,
+                &aliased_specs,
+                &col_offsets,
+            ) {
+                Err(CustomFamilyError::MapUniquenessFailure { error }) => error,
+                other => panic!(
+                    "scale {scale:e}: an exactly aliased, unpenalized pair must refuse as a \
+                     MAP-uniqueness failure at every scale, got {other:?}"
+                ),
+            };
             assert!(
                 error.penalty_quadratic_form.abs() < 1e-8,
                 "scale {scale:e}: the refused direction must carry no penalty, got {:.3e}",
