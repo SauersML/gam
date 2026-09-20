@@ -543,6 +543,87 @@ impl FaerLlt<f64> {
     }
 }
 
+/// `P A = L U` of a square matrix by partial pivoting at [`decomposition_parallelism`],
+/// through faer's low-level entry points for the reason [`FaerLlt`] gives.
+#[derive(Clone, Debug)]
+pub struct FaerLu {
+    lu: Mat<f64>,
+    perm: Perm<usize>,
+}
+
+impl FaerLu {
+    /// Factor the square matrix `a`, or name the first column whose pivot is zero or not
+    /// finite: faer divides by every pivot it chooses, so a singular `a` is refused here
+    /// rather than read back as infinite or NaN solves.
+    pub fn new(a: MatRef<'_, f64>) -> Result<Self, usize> {
+        assert_eq!(a.nrows(), a.ncols(), "LU of a non-square matrix");
+        let mut lu = a.to_owned();
+        let par = decomposition_parallelism();
+        let n = lu.nrows();
+        let mut forward = vec![0usize; n];
+        let mut inverse = vec![0usize; n];
+        let mut mem = MemBuffer::new(
+            faer::linalg::lu::partial_pivoting::factor::lu_in_place_scratch::<usize, f64>(
+                n,
+                n,
+                par,
+                Default::default(),
+            ),
+        );
+        faer::linalg::lu::partial_pivoting::factor::lu_in_place(
+            lu.as_mut(),
+            &mut forward,
+            &mut inverse,
+            par,
+            MemStack::new(&mut mem),
+            Default::default(),
+        );
+        if let Some(column) = (0..n).find(|&i| {
+            let pivot = lu[(i, i)];
+            !(pivot != 0.0 && pivot.is_finite())
+        }) {
+            return Err(column);
+        }
+        let perm = Perm::new_checked(forward.into_boxed_slice(), inverse.into_boxed_slice(), n);
+        Ok(Self { lu, perm })
+    }
+
+    /// The dimension of the factored matrix.
+    pub fn nrows(&self) -> usize {
+        self.lu.nrows()
+    }
+
+    /// Overwrite `rhs` with `A⁻¹ rhs`.
+    pub fn solve_in_place(&self, rhs: MatMut<'_, f64>) {
+        let par = decomposition_parallelism();
+        let n = self.lu.nrows();
+        let mut mem = MemBuffer::new(
+            faer::linalg::lu::partial_pivoting::solve::solve_in_place_scratch::<usize, f64>(
+                n,
+                rhs.ncols(),
+                par,
+            ),
+        );
+        // L is the strict lower triangle with a unit diagonal; U the upper triangle.
+        faer::linalg::lu::partial_pivoting::solve::solve_in_place_with_conj(
+            self.lu.as_ref(),
+            self.lu.as_ref(),
+            self.perm.as_ref(),
+            Conj::No,
+            rhs,
+            par,
+            MemStack::new(&mut mem),
+        );
+    }
+
+    /// `A⁻¹ rhs`.
+    pub fn solve(&self, rhs: MatRef<'_, f64>) -> Mat<f64> {
+        let mut out = rhs.to_owned();
+        self.solve_in_place(out.as_mut());
+        out
+    }
+}
+
 /// The inertia of a symmetric matrix read off its Bunch–Kaufman factor (#2901).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SymmetricInertia {
@@ -4236,6 +4317,31 @@ mod tests {
     /// threshold, used only by the regression tests below to assert the verdict
     /// margin lands on the correct side of the cliff. Kept in sync by value (1e3).
     const JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST: f64 = 1.0e3;
+
+    /// A zero leading entry forces a row exchange, and the solve meets LU's backward-error
+    /// bound: `(A + ΔA)x̂ = b` with `|ΔA| ≤ γ_{3n}|L||U|`, where partial pivoting keeps
+    /// `|l| ≤ 1` and `|u| ≤ 2^{n−1} max|a|`, so `|L||U| ≤ n·2^{n−1}·max|a|` entrywise.
+    #[test]
+    fn partial_pivot_lu_solves_within_its_backward_error_and_refuses_a_singular_matrix() {
+        let a = Mat::from_fn(3, 3, |i, j| [[0.0, 2.0, 1.0], [1.0, 1.0, 0.0], [3.0, 0.0, 1.0]][i][j]);
+        let b = Mat::from_fn(3, 1, |i, _| [-1.0, -1.0, 6.0][i]);
+        let lu = FaerLu::new(a.as_ref()).expect("a nonsingular matrix factors");
+        let x = lu.solve(b.as_ref());
+        let n = 3;
+        let gamma = (3 * n) as f64 * f64::EPSILON / (1.0 - (3 * n) as f64 * f64::EPSILON);
+        let x_sum: f64 = (0..n).map(|k| x[(k, 0)].abs()).sum();
+        let bound = gamma * (n as f64) * 2f64.powi(n as i32 - 1) * 3.0 * x_sum;
+        for i in 0..n {
+            let residual: f64 = (0..n).map(|k| a[(i, k)] * x[(k, 0)]).sum::<f64>() - b[(i, 0)];
+            assert!(residual.abs() <= bound, "row {i}: residual {residual:e} against {bound:e}");
+        }
+        for (k, want) in [1.0, -2.0, 3.0].into_iter().enumerate() {
+            assert!((x[(k, 0)] - want).abs() <= 1.0e-12, "x[{k}] = {}", x[(k, 0)]);
+        }
+
+        let singular = Mat::from_fn(2, 2, |i, j| [[1.0, 2.0], [2.0, 4.0]][i][j]);
+        assert_eq!(FaerLu::new(singular.as_ref()).err(), Some(1));
+    }
 
     #[test]
     fn rrqr_nullspace_basis_is_orthonormal_and_annihilates_transpose() {

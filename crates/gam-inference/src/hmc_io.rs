@@ -1125,38 +1125,19 @@ mod tests {
         }
     }
 
-    /// #3090: the mass-matrix configs carry no jitter and no dense-metric cap.
-    /// Their diagonal metric is `(1 - regularize)·var + regularize` with
-    /// `var ≥ 0`, so its positive floor is the regularization itself, for every
-    /// dimension on both sides of the high-dimension threshold.
+    /// #3090, #3263: one mass-matrix config for every family and dimension,
+    /// with no fixed shrinkage weight, jitter or dense-metric cap. The open
+    /// warmup estimates each window's shrinkage toward the identity itself.
     #[test]
-    fn mass_matrix_configs_floor_by_regularization_not_jitter_3090() {
-        for dim in [
-            1usize,
-            super::HIGH_DIM_THRESHOLD,
-            super::HIGH_DIM_THRESHOLD + 1,
-            200,
-        ] {
-            for cfg in [
-                super::robust_mass_matrix_config(dim),
-                super::robust_survival_mass_matrix_config(dim),
-            ] {
-                assert_eq!(cfg.jitter, 0.0, "dim={dim}: mass-matrix jitter must be absent");
-                assert!(
-                    cfg.regularize > 0.0 && cfg.regularize < 1.0,
-                    "dim={dim}: regularize={} must bound the diagonal metric away from zero",
-                    cfg.regularize
-                );
-                assert!(matches!(
-                    cfg.adaptation,
-                    super::MassMatrixAdaptation::Diagonal
-                ));
-                assert_eq!(
-                    cfg.dense_max_dim, 0,
-                    "dim={dim}: no dense-metric cap under diagonal adaptation"
-                );
-            }
-        }
+    fn mass_matrix_config_leaves_shrinkage_to_each_warmup_window_3263() {
+        let cfg = super::nuts_mass_matrix_config();
+        assert!(matches!(
+            cfg.adaptation,
+            super::MassMatrixAdaptation::Diagonal
+        ));
+        assert_eq!(cfg.regularize, 0.0, "no fixed shrinkage weight");
+        assert_eq!(cfg.jitter, 0.0, "no mass-matrix jitter");
+        assert_eq!(cfg.dense_max_dim, 0, "no dense-metric cap under diagonal adaptation");
     }
 
     use super::{FamilyNutsInputs, GlmFlatInputs, NUTS_CHAINS, NutsConfig, NutsPosterior, NutsResult, SharedData, exact_glm_logp_and_grad_into, firth_jeffreys_logp_and_grad, laplace_directional_cubic_diagnostic_on_eigenpairs, laplace_skewness_threshold, laplace_trustworthiness_from_skewness, run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family};
@@ -1334,6 +1315,7 @@ mod tests {
                 coefficient_influence: None,
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             }),
             None,
         );
@@ -1447,21 +1429,6 @@ mod tests {
             err.contains("missing an explicit penalized Hessian"),
             "unexpected error: {err}"
         );
-    }
-
-    #[test]
-    fn log1pexp_is_finite_for_extreme_eta() {
-        assert!(gam_linalg::utils::stable_softplus(1000.0).is_finite());
-        assert!(gam_linalg::utils::stable_softplus(-1000.0).is_finite());
-        assert!((gam_linalg::utils::stable_softplus(-1000.0) - 0.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn sigmoid_stable_behaves_at_extremes() {
-        let hi = gam_linalg::utils::stable_logistic(1000.0);
-        let lo = gam_linalg::utils::stable_logistic(-1000.0);
-        assert!((1.0 - 1e-12..=1.0).contains(&hi));
-        assert!((0.0..=1e-12).contains(&lo));
     }
 
     #[test]
@@ -2029,7 +1996,7 @@ mod tests {
         let posterior_nll: f64 = eta
             .iter()
             .zip(y.iter())
-            .map(|(&eta_i, &y_i)| gam_linalg::utils::stable_softplus(eta_i) - y_i * eta_i)
+            .map(|(&eta_i, &y_i)| gam_math::special::softplus(eta_i) - y_i * eta_i)
             .sum();
         let zero_nll = x.nrows() as f64 * std::f64::consts::LN_2;
         assert!(
@@ -2087,7 +2054,7 @@ mod tests {
                 let (mut loglik, mut i00, mut i01, mut i11) = (0.0, 0.0, 0.0, 0.0);
                 for (xi, yi) in xs.iter().zip(y.iter()) {
                     let eta = b0 + b1 * xi;
-                    loglik += yi * eta - gam_linalg::utils::stable_softplus(eta);
+                    loglik += yi * eta - gam_math::special::softplus(eta);
                     let mu = 1.0 / (1.0 + (-eta).exp());
                     let wi = mu * (1.0 - mu);
                     i00 += wi;
@@ -4640,25 +4607,10 @@ fn draw_logit_pg1_omega(
 /// user option (#3263): the sampler runs in the Laplace-whitened space, where
 /// the leapfrog cost-optimal average acceptance lies in [0.6, 0.9] and its
 /// upper end is the choice robust to departures from Gaussianity (Betancourt,
-/// Byrne & Girolami 2014). Measured on general-mcmc's open warmup (#3263), the
-/// warmup ends fastest here (124 transitions on a 4-D Gaussian against 16380 at
-/// 0.6), while targets at or above 0.98 never end it, because the dual-averaging
-/// bias plateaus the acceptance statistic below the target.
+/// Byrne & Girolami 2014). At the pinned general-mcmc every target from 0.6 to
+/// 0.99 ends the open warmup on a 4-D unit Gaussian, in 124 to 508 transitions
+/// per chain, so the choice is not forced by the warmup (#3263).
 const NUTS_TARGET_ACCEPT: f64 = 0.9;
-
-/// Parameter dimension above which the posterior is treated as "high-dimensional"
-/// for the mass-matrix regularization below.
-const HIGH_DIM_THRESHOLD: usize = 50;
-
-/// Mass-matrix ridge (added to the diagonal of the estimated metric) for the
-/// general (mean-family) sampler. The high-dimensional value is larger because
-/// the warmup metric estimate is noisier relative to its scale as `p` grows.
-const MASS_REGULARIZE_HIGH_DIM: f64 = 0.14;
-const MASS_REGULARIZE_LOW_DIM: f64 = 0.10;
-/// Mass-matrix ridge for survival posteriors, which are frequently skewed by
-/// censoring / rare events and so warrant a heavier ridge than the mean family.
-const SURVIVAL_MASS_REGULARIZE_HIGH_DIM: f64 = 0.18;
-const SURVIVAL_MASS_REGULARIZE_LOW_DIM: f64 = 0.12;
 
 fn jittered_initial_positions(
     seed: u64,
@@ -4674,46 +4626,21 @@ fn jittered_initial_positions(
         .collect()
 }
 
-/// Diagonal metric adaptation for the mean families. The open warmup chooses its
-/// own windows, so the fixed-schedule buffers stay zero.
-fn robust_mass_matrix_config(dim: usize) -> NUTSMassMatrixConfig {
+/// Diagonal metric adaptation, for every family. The open warmup chooses its
+/// own windows and shrinks each window's variances toward the identity (the
+/// metric of the Laplace-whitened target) by that window's own James-Stein
+/// intensity, so every fixed-schedule field stays zero, the fixed shrinkage
+/// weight `regularize` among them (#3263). No jitter either: a metric entry is a
+/// window's shrunk variance, positive wherever a chain moved, and general-mcmc
+/// keeps its inverse representable (#3090). `dense_max_dim` is read only under
+/// dense adaptation.
+fn nuts_mass_matrix_config() -> NUTSMassMatrixConfig {
     NUTSMassMatrixConfig {
         adaptation: MassMatrixAdaptation::Diagonal,
         start_buffer: 0,
         end_buffer: 0,
         initial_window: 0,
-        regularize: if dim > HIGH_DIM_THRESHOLD {
-            MASS_REGULARIZE_HIGH_DIM
-        } else {
-            MASS_REGULARIZE_LOW_DIM
-        },
-        // No jitter: the diagonal metric is `(1 - regularize)·var + regularize`,
-        // so its entries are bounded below by `regularize > 0` and a floor could
-        // never bind (#3090). `dense_max_dim` is read only under dense
-        // adaptation, and both configs are diagonal.
-        jitter: 0.0,
-        dense_max_dim: 0,
-    }
-}
-
-/// Diagonal metric adaptation for survival posteriors, which censoring and rare
-/// events often skew. The open warmup chooses its own windows, so the
-/// fixed-schedule buffers stay zero.
-fn robust_survival_mass_matrix_config(dim: usize) -> NUTSMassMatrixConfig {
-    NUTSMassMatrixConfig {
-        adaptation: MassMatrixAdaptation::Diagonal,
-        start_buffer: 0,
-        end_buffer: 0,
-        initial_window: 0,
-        regularize: if dim > HIGH_DIM_THRESHOLD {
-            SURVIVAL_MASS_REGULARIZE_HIGH_DIM
-        } else {
-            SURVIVAL_MASS_REGULARIZE_LOW_DIM
-        },
-        // No jitter: the diagonal metric is `(1 - regularize)·var + regularize`,
-        // so its entries are bounded below by `regularize > 0` and a floor could
-        // never bind (#3090). `dense_max_dim` is read only under dense
-        // adaptation, and both configs are diagonal.
+        regularize: 0.0,
         jitter: 0.0,
         dense_max_dim: 0,
     }
@@ -5431,7 +5358,7 @@ pub(crate) fn run_nuts_sampling(
 
     let initial_positions =
         jittered_initial_positions(config.seed, dim, 0.1, 0x0F65_83B2_BC71_4D9E);
-    let mass_cfg = robust_mass_matrix_config(dim);
+    let mass_cfg = nuts_mass_matrix_config();
     let (result, run_stats) = run_whitened_nuts_result(
         target,
         &mode_arr,
@@ -7614,7 +7541,7 @@ mod survival_hmc {
         let initial_positions =
             jittered_initial_positions(config.seed, dim, 0.1, 0xEC2D_7A9B_4051_F638);
 
-        let mass_cfg = robust_survival_mass_matrix_config(dim);
+        let mass_cfg = nuts_mass_matrix_config();
         let (result, run_stats) = run_whitened_nuts_result(
             target,
             &mode_arr,

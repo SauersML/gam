@@ -512,9 +512,8 @@ pub(crate) fn hash_analytic_penalty_kind(
             // cached J / H / K reflect the Jacobian at the *current* outer θ.
             // They are NOT part of this penalty's identity — they are a pure
             // (recomputable) function of the basis + θ, and the basis identity
-            // is already captured exactly by `duchon_radial_source` (below) for
-            // the Duchon path and by the hashed design matrix / latent
-            // fingerprint for the SAE path. Hashing the live cache snapshot made
+            // is already captured exactly by the hashed design matrix / latent
+            // fingerprint. Hashing the live cache snapshot made
             // the persistent warm-start key non-reproducible across otherwise
             // identical fits: a cold fit opens its session with the slots empty
             // (`None`), while a repeat fit sees them populated from the prior
@@ -523,22 +522,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             // the converged (ρ, β) — equivalence to recomputing is unaffected by
             // dropping these derived snapshots from the key, so we deliberately
             // do NOT hash them.
-            match p.duchon_radial_source.as_ref() {
-                Some(source) => {
-                    hasher.write_bool(true);
-                    hash_array2(hasher, source.centers.as_ref());
-                    hash_array2(hasher, source.radial_coefficients.as_ref());
-                    match source.length_scale {
-                        Some(length_scale) => {
-                            hasher.write_bool(true);
-                            hasher.write_f64(length_scale);
-                        }
-                        None => hasher.write_bool(false),
-                    }
-                    hasher.write_str(&format!("{:?}", source.nullspace_order));
-                }
-                None => hasher.write_bool(false),
-            }
         }
         AnalyticPenaltyKind::Sparsity(p) => {
             hasher.write_str("sparsity");
@@ -910,7 +893,8 @@ pub(crate) struct TkSharedIntermediates {
 /// roundoff; they differ only in work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TkRowPairRoute {
-    /// The blocked row-pair gram: `O(active²·p)`.
+    /// The blocked row-pair gram: `O(active²·p)` (for the ρ-Hessian block,
+    /// `O(n²·((2 + k)·p + k²))`).
     RowPairs,
     /// Contraction through `T = Σ_j c_j x_j⊗x_j⊗x_j`: `O((active + n)·p³)` time
     /// and `p³` working memory.
@@ -935,14 +919,18 @@ impl TkRowPairRoute {
 
     /// The route with less leading work for the ρ-Hessian block of
     /// `¹⁄₁₂ Σ_ij c_i c_j K_ij³` over `n` rows, `p` columns and `k` smoothing
-    /// coordinates. The row-pair jets form `n²·(1 + k + k²)·p` products. The
-    /// tensor route forms `n·(1 + k)·p³` to build its tensors and
-    /// `n·((1 + 2k)·p³ + k²·p²)` to contract them.
+    /// coordinates. The row blocks form `n²·((2 + k)·p + k²)` products: `K_ij`,
+    /// every `(K_a)_ij` and `r_i` against the design, then the `k×k` Gram of the
+    /// `(K_a)_ij`. The tensor route forms `n·(1 + k)·p³` to build its tensors
+    /// and `n·((1 + 2k)·p³ + k²·p²)` to contract them.
     pub(crate) fn predicted_rho_hessian(n: usize, p: usize, k: usize) -> Self {
         let p_squared = p.saturating_mul(p);
         let p_cubed = p_squared.saturating_mul(p);
-        let jet_width = k.saturating_mul(k).saturating_add(k).saturating_add(1);
-        let row_pairs = n.saturating_mul(n).saturating_mul(jet_width).saturating_mul(p);
+        let per_pair = k
+            .saturating_add(2)
+            .saturating_mul(p)
+            .saturating_add(k.saturating_mul(k));
+        let row_pairs = n.saturating_mul(n).saturating_mul(per_pair);
         let per_row = k
             .saturating_mul(3)
             .saturating_add(2)

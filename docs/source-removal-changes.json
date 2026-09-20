@@ -2642,5 +2642,277 @@
     ],
     "reason": "Replace the IFT/tangent warm-start step caps (#2902) with a derived trust radius: the tiered |dρ| budget (2.0 default, 0.5..4.0 by residual tier), the tangent α tiers, and the grow/shrink step controller with its hand quality bands and flat override are hand bounds and magic constants forbidden by SPEC. The radius R = s·F/E is measured from each accepted prediction's miss E against the flat seed's miss F at step s.",
     "evidence": "ift_predictor_rejects_large_drho: an unmeasured predictor now takes the |dρ| = 3 step the 2.0 default cap rejected; a measured radius of 2 rejects it and 4 accepts it. warm_start_trust_radius_is_the_step_where_the_predictor_ties_the_flat_seed pins R = s·F/E, R = ∞ for an exact prediction, no update for E = F = 0 or non-finite input, and reset on clear. The same-slot test now checks the radius and staged step do not leak across RemlStates."
+  },
+  {
+    "base": "88af7f36c95adcede13b6507ad702acc78ab4bd0",
+    "items": [
+      "crates/gam-gpu/src/policy.rs:enum:GpuMixedPrecisionPolicy",
+      "crates/gam-gpu/src/policy.rs:fn:never_policy_never_attempts_refinement",
+      "crates/gam-gpu/src/policy.rs:fn:off_policy_never_attempts_refinement",
+      "crates/gam-gpu/src/solver.rs:fn:cholesky_logdet",
+      "crates/gam-gpu/src/solver.rs:fn:cholesky_logdet_from_col_major",
+      "crates/gam-gpu/src/solver.rs:fn:cholesky_solve_gpu",
+      "crates/gam-gpu/src/solver.rs:fn:iterative_refinement_cholesky_solve"
+    ],
+    "reason": "#3547/#3548: fp32 + fp64-residual refinement now returns a solution only once its residual reaches the attainable band, and GpuDispatchPolicy keeps only fields a dispatch reads. cholesky_solve_gpu returned (solution, logdet) through iterative_refinement_cholesky_solve's need_logdet branch, whose extra fp64 POTRF was cuda::cholesky_logdet; no production code called it (its only callers were three arrow_gpu tests, now on cholesky_solve_only_gpu), so cholesky_solve_only_gpu is the single entry point and folds iterative_refinement_cholesky_solve in. The fp64 device solve no longer downloads its factor for a logdet nobody reads, so cholesky_logdet_from_col_major has no caller. GpuMixedPrecisionPolicy's Off and Never variants were unreachable (no code built a policy with them) and Refinement was the only live value, so the enum and the mixed_precision field go, with the two unit tests that pinned the unreachable variants (off_policy_never_attempts_refinement, never_policy_never_attempts_refinement); iterative_refinement_should_attempt is now an associated fn of p.",
+    "evidence": "scripts/source_removal_guard.py and scripts/public_api_census.py with --base 88af7f36c95adcede13b6507ad702acc78ab4bd0 (main after the #3547 certificate landed) and head the change's commit list exactly these removals. Read-proof at the head: git grep -w -c finds 0 occurrences of GpuMixedPrecisionPolicy, cholesky_solve_gpu, iterative_refinement_cholesky_solve and the two test names anywhere in crates/ tests/ examples/; cholesky_logdet survives only as gam-terms grid_spline_2d::cholesky_logdet (a different function) and its users; cholesky_logdet_from_col_major only in a historical doc sentence in gam-solve pirls_gpu.rs. Before the change git grep -n cholesky_solve_gpu on main found callers only in tests/arrow_gpu (gpu_solver_dimension_mismatch_returns_error.rs, gpu_solver_matches_cpu_on_small_spd_system.rs, misc/owed_1412.rs)."
+  },
+  {
+    "base": "e695ec5d3137372f183f8c7e625f9dd992bb1ebc",
+    "items": [
+      "crates/gam-solve/src/reml/reml_outer_engine/efs.rs:const:EFS_MAX_STEP",
+      "crates/gam-solve/src/reml/reml_outer_engine/efs.rs:const:PSI_INITIAL_ALPHA"
+    ],
+    "reason": "#2902: EFS_MAX_STEP boxed every EFS log-lambda step to +-5, a hand bound SPEC forbids; the step is now the multiplicative model's root (or its Newton step in the over-correction regime), clipped only to the outer domain and sized by the bridge's cost line search. PSI_INITIAL_ALPHA was a 1.0 multiplier with no effect.",
+    "evidence": "rho_optimizer::efs_step_domain_2902_tests::efs_takes_the_whole_multiplicative_step_toward_a_far_root_2902: on the orthogonal Gaussian REML fixture the boxed walk evaluated EFS at 0,-5,-10,-15 before the root (7 evaluations); the whole step evaluates 0,-14.88 then the root (5)."
+  },
+  {
+    "base": "74c2b1d788902aa74c5a7306ae4014e37749e4e3",
+    "items": [
+      "crates/gam-solve/src/gaussian_reml.rs:fn:fnv1a_mix",
+      "crates/gam-solve/src/gaussian_reml.rs:fn:matrix_fingerprint"
+    ],
+    "reason": "#3819: gaussian_reml's private matrix_fingerprint folded each f64's bits into one word with fnv1a_mix, a word-level fold under which X and X with a negated column (whose Grams X'X differ only by a sign conjugation) could collide, so the eigen cache accepted a design it was not built for. Every fingerprint in the file now goes through gam_linalg::matrix::array2_bits_fingerprint, the canonical byte-wise FNV-1a over (nrows, ncols, each value's bits), and the block canonical key hashes the (design, penalty) fingerprint pair with DefaultHasher (it only orders rho blocks in-process). Neither helper has a caller left.",
+    "evidence": "scripts/source_removal_guard.py --base 74c2b1d788902aa74c5a7306ae4014e37749e4e3 lists exactly these two private removals. Read-proof: before the change git grep -w -c on 74c2b1d788902aa74c5a7306ae4014e37749e4e3 finds matrix_fingerprint/fnv1a_mix only in crates/gam-solve/src/gaussian_reml.rs (20 occurrences, all the two definitions and their in-file callers); at the head git grep -w finds 0 occurrences in crates/ tests/ examples/. New test eigen_cache_refuses_the_design_with_a_negated_column pins the refusal."
+  },
+  {
+    "base": "95504620470839de04fc1647d8b79f456a45b5ce",
+    "items": [
+      "crates/gam-custom-family/src/assembly.rs:fn:assembled_operator_fingerprint",
+      "crates/gam-custom-family/src/assembly.rs:fn:hash_f64"
+    ],
+    "reason": "#3641: the assembled-operator cache keyed an Operator-source joint Hessian on a 64-bit hash of its diagonal plus (rho, beta-hat, penalties, knobs) and folded the pseudo-logdet mode to mode == Smooth, so fits sharing the process-global cache could be handed another matrix's operator. The key is now the assembled symmetrized J itself plus the PseudoLogdetMode, compared by exact element equality; the fingerprint and its f64 hashing helper have no remaining caller.",
+    "evidence": "assembly::assembled_operator_cache_tests::same_diagonal_different_curvature_never_shares_an_operator_3641: [[2,0],[0,2]] and [[2,1],[1,2]] (same diagonal) are priced ln 4 and ln 3 under Smooth, HardPseudo and PositiveDefinite; the_cache_key_is_the_exact_matrix_and_mode_3641: a different mode or a one-ulp entry change misses, -0.0 hits +0.0."
+  },
+  {
+    "base": "9e4544cb8f0785925cdca5cc448efcb22afd9fb8",
+    "items": [
+      "crates/gam-models/src/bms/block_specs.rs:fn:learned_frailty_scale_is_identified"
+    ],
+    "reason": "gam#2938 commit 2 (gam#3059): the Bernoulli marginal-slope fit now asks the one identification rule both marginal-slope families share, crate::survival::lognormal_kernel::frailty_identification (landed in dc80110867), instead of its own copy. learned_frailty_scale_is_identified was that copy: the same span test (is the slope's fixed part o = baseline + slope_offset in the slope design's span?), decided against a band max(n, p + 1)·ε with no rank decision. The shared rule reads the rank from factor_singular_band, compares the distance with the projector error bar at the rank gap plus the rounding of forming it, and reports an unseparated rank boundary as Undecided instead of guessing. The one caller in fit_bernoulli_marginal_slope_terms_under moves onto it: NotIdentified keeps the #3059 refusal text word for word, IdentifiedByOffset continues, and Undecided is a new named refusal. The three #3059 pins keep their names and call frailty_identification through a local identified() helper.",
+    "evidence": "With base 9e4544cb8f0785925cdca5cc448efcb22afd9fb8 and head the candidate, source_removal_guard.py and public_api_census.py refuse exactly this identity: public true, production_occurrences 0, 13820 -> 13819 public function declarations. In the head tree, git grep -w learned_frailty_scale_is_identified finds 0 occurrences. The three pins intercept_slope_with_constant_fixed_part_is_unidentified_3059, covariate_only_slope_with_constant_fixed_part_is_identified_3059 and slope_offset_inside_the_span_is_unidentified_3059 run on the replacement. test_census.py: 12708 -> 12708 tests."
+  },
+  {
+    "base": "b4b0ef17614582d86b30c8ad89e094bc3bca6a7c",
+    "items": [
+      "crates/gam-models/src/vector_response.rs:fn:grad_eta",
+      "crates/gam-models/src/vector_response.rs:fn:hess_block",
+      "crates/gam-models/src/vector_response.rs:fn:hess_diag",
+      "crates/gam-models/src/vector_response.rs:fn:log_lik",
+      "crates/gam-models/src/vector_response.rs:fn:row_weight",
+      "crates/gam-models/src/vector_response.rs:struct:GaussianVectorLikelihood"
+    ],
+    "reason": "#4070: GaussianVectorLikelihood (identity-link Gaussian vector likelihood with diagonal plus low-rank precision) was re-exported from gam-models but never constructed outside one validation test. Its struct, its private row_weight helper and its VectorLikelihood impl (log_lik, grad_eta, hess_diag, hess_block) are deleted with the re-export. The trait's other implementation, MultinomialLogitLikelihood, keeps its own log_lik/grad_eta/hess_diag/hess_block, and the #932 non-finite-state contract stays under test on it.",
+    "evidence": "At the base, git grep -w GaussianVectorLikelihood finds only its declaration and impls in crates/gam-models/src/vector_response.rs, the pub use in crates/gam-models/src/mod.rs, and the vector_response test that constructed it; no crate, binding or Python module names it. The guard's remaining declarations of log_lik, grad_eta, hess_diag and hess_block are the VectorLikelihood trait's and MultinomialLogitLikelihood's; the other row_weight is unrelated."
+  },
+  {
+    "base": "900d061dfc69e80e09eb163b488f12aabfc496a3",
+    "items": [
+      "crates/gam-inference/src/hmc_io.rs:const:HIGH_DIM_THRESHOLD",
+      "crates/gam-inference/src/hmc_io.rs:const:MASS_REGULARIZE_HIGH_DIM",
+      "crates/gam-inference/src/hmc_io.rs:const:MASS_REGULARIZE_LOW_DIM",
+      "crates/gam-inference/src/hmc_io.rs:const:SURVIVAL_MASS_REGULARIZE_HIGH_DIM",
+      "crates/gam-inference/src/hmc_io.rs:const:SURVIVAL_MASS_REGULARIZE_LOW_DIM",
+      "crates/gam-inference/src/hmc_io.rs:fn:mass_matrix_configs_floor_by_regularization_not_jitter_3090",
+      "crates/gam-inference/src/hmc_io.rs:fn:robust_mass_matrix_config",
+      "crates/gam-inference/src/hmc_io.rs:fn:robust_survival_mass_matrix_config"
+    ],
+    "reason": "#3263, the metric half (the target-acceptance half landed with #3370): the NUTS mass-matrix shrinkage toward the identity was a fixed weight, MASS_REGULARIZE_{HIGH,LOW}_DIM = 0.14/0.10 for the mean families and SURVIVAL_MASS_REGULARIZE_{HIGH,LOW}_DIM = 0.18/0.12 for survival, switched at HIGH_DIM_THRESHOLD = 50 and chosen by robust_mass_matrix_config and robust_survival_mass_matrix_config. The pinned general-mcmc c6e415d shrinks each warmup window's log variances toward the identity by that window's own James-Stein intensity, priced by the Monte Carlo error of the squared deviations, and its open warmup no longer reads the fixed weight regularize, so the four weights, the switch and both configs are dead. One nuts_mass_matrix_config with every fixed field zero replaces both configs at their two call sites. The #3090 test mass_matrix_configs_floor_by_regularization_not_jitter_3090 asserted the removed regularize floor; mass_matrix_config_leaves_shrinkage_to_each_warmup_window_3263 replaces it.",
+    "evidence": "At this base, source_removal_guard.py with the landing commit as head reports exactly these identities. git grep -w finds none of the eight names under crates, src or tests in the head tree. Gate direct-dy4-w2evhb-3263-g1f.log (acn112): cargo check --workspace --all-targets and gam-pyffi, plus the gam-inference hmc_io, rho_posterior and sample tests, among them mass_matrix_config_leaves_shrinkage_to_each_warmup_window_3263."
+  },
+  {
+    "base": "f978f1d043baca9753bc81e60ef5a8ac0de02060",
+    "items": [
+      "crates/gam-predict/src/posterior_bands.rs:enum:LinkSelector",
+      "crates/gam-predict/src/posterior_bands.rs:fn:apply",
+      "crates/gam-predict/src/posterior_bands.rs:fn:eta_bands_from_matrix_link",
+      "crates/gam-predict/src/posterior_bands.rs:fn:posterior_quantile_from_sorted",
+      "crates/gam-pyffi/src/latent/reml_latent_fit_ffi.rs:fn:posterior_eta_bands",
+      "crates/gam-pyffi/src/manifold/manifold_and_posterior_ffi.rs:fn:posterior_eta_bands_impl"
+    ],
+    "reason": "#3604: posterior_eta_bands had no Python caller (retired in docs/public-api-2829-disposition.tsv); its hand-copied band reducer never validated draws. draw_bands_from_matrices is the single reducer; matrix_bands calls quantile_from_sorted directly.",
+    "evidence": "git grep finds no caller of posterior_eta_bands, posterior_eta_bands_impl, eta_bands_from_matrix_link, LinkSelector or posterior_quantile_from_sorted after the deletion."
+  },
+  {
+    "base": "db8172c18d77f3cf412550268a6ce520be42b002",
+    "items": [
+      "crates/gam-inference/src/rho_posterior.rs:fn:normal",
+      "crates/gam-models/src/bms/mod.rs:fn:signed_weighted_gram",
+      "crates/gam-models/src/bms/mod.rs:fn:weighted_ridge_sandwich_cov",
+      "tests/src_modules/misc/families_bms_identifiability_rigid_tests.rs:fn:weighted_ridge_sandwich_cov_is_finite_on_rank_deficient_normal_matrix"
+    ],
+    "reason": "#3047/#3030/#3010 (PR #3222, pr-land comment 5748106176). The stacked first-stage variance now inverts the block-triangular bread J = [[M,0],[M_vm,N]] as J^-1 = [[M+,0],[K,N+]] with K = N+ M_vm M+ in stacked_first_stage_inverse_bread, and carries the constant variance stage in theta1 (dzeta/dv = -zeta/(2v)). That replaces weighted_ridge_sandwich_cov (the mean-only sandwich that omitted the variance stage, #3030) and signed_weighted_gram (whose -2 M_vm cross block gave the wrong sign, #3047); the rank-deficient finiteness test exercised only the deleted sandwich. In rho_posterior.rs the Tier-0 proposal is now the exact GHK truncated Laplace proposal on CriterionContinuation::posterior_support() (#3010), drawn by inverse-CDF truncated_standard_normal from the uniform stream, so the Box-Muller normal() draw has no caller.",
+    "evidence": "At base b3832b92 each name has exactly one definition (rho_posterior.rs:136 SplitMix64::normal, bms/mod.rs:1938 signed_weighted_gram, bms/mod.rs:2039 weighted_ridge_sandwich_cov, families_bms_identifiability_rigid_tests.rs:7072 the test); at the head git grep -w 'fn <name>' finds none of them in those files, and the other fn normal hits are unrelated local RNGs in other files. cargo check --workspace --tests is clean; first_stage_variance_stage (4), murphy_topel (1), gam-inference lib, rho_domain and perf rho_posterior_tier0 pass on the head."
+  },
+  {
+    "base": "bf410bb4622f23c2597aeeebfd5d9fa32d0c3193",
+    "items": [
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_io_bytes",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_io_bytes_valid_line",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_io_bytes_wrong_key_returns_none",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_count",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_count_valid_line",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_kb",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_kb_valid_line",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_kb_wrong_key_returns_none",
+      "crates/gam-runtime/src/warm_start/store.rs:fn:touch_lookup_hit"
+    ],
+    "reason": "#3882/#3885: the warm-start lookup fast path now re-reads and touches the cached meta itself and re-records the post-touch meta and key-directory stamps through remember_lookup, the one helper the slow path also uses, so the private wrapper touch_lookup_hit (read_meta + touch_lookup_meta, discarding the touched meta the row now needs) has no caller. #4073: process_monitor's three private /proc/self field parsers parse_status_kb, parse_status_count and parse_io_bytes were one rule (the integer after the key) written three times; they collapse into parse_proc_value, and the five unit tests that pinned the copies separately (parse_status_kb_valid_line, parse_status_kb_wrong_key_returns_none, parse_status_count_valid_line, parse_io_bytes_valid_line, parse_io_bytes_wrong_key_returns_none) are replaced by parse_proc_value_reads_the_number_before_a_unit, parse_proc_value_reads_a_bare_counter and parse_proc_value_wrong_key_returns_none, which cover the same lines plus an unanchored-key case.",
+    "evidence": "scripts/source_removal_guard.py with --base bf410bb4622f23c2597aeeebfd5d9fa32d0c3193 and head the change's commit lists exactly these removals. Read-proof at the head: git grep -w touch_lookup_hit finds no occurrence in the repository (it was a private method of WarmStartStore in crates/gam-runtime/src/warm_start/store.rs whose only call site was the lookup_with fast path rewritten here); git grep -w for parse_status_count and parse_io_bytes finds no occurrence, and parse_status_kb survives only as crates/gam-sae/examples/scale_k.rs's own unrelated local helper. All removed process_monitor functions were private and cfg(target_os = \"linux\"), called only from read_linux in the same file."
+  },
+  {
+    "base": "b6be6bb6ec166b7e98ee17e8aa77af19faa754d3",
+    "items": [
+      "crates/gam-sae/src/manifold/fit_seed.rs:const:SAE_SHARED_ARD_K_THRESHOLD",
+      "crates/gam-sae/src/manifold/rho.rs:enum:ArdSharing",
+      "crates/gam-sae/src/manifold/rho.rs:fn:ard_sharing",
+      "crates/gam-sae/src/manifold/rho.rs:fn:max_ard_axes",
+      "crates/gam-sae/src/manifold/rho.rs:fn:new_shared_ard",
+      "crates/gam-sae/src/manifold/tests.rs:fn:shared_ard_flat_index_aliases_in_bounds_1026",
+      "tests/sae/sae/owed_1026.rs:fn:shared_ard_collapses_outer_param_count_at_large_k",
+      "tests/sae/sae/owed_1026.rs:fn:shared_ard_is_a_convergent_outer_coordinate_1026"
+    ],
+    "reason": "#3824: the SAE coordinate prior switched from per-atom ARD to one ARD precision per axis index broadcast to every atom once K >= SAE_SHARED_ARD_K_THRESHOLD = 256, so the prior family and the REML/LAML criterion changed at an arbitrary atom count. Per-atom ARD costs 1+K+sum_k d_k outer coordinates against 1+K+max_d, both Theta(K), and the per-(k,j) energies were already assembled, so no derived crossover exists. The threshold, ArdSharing, the ard_sharing accessor, SaeManifoldRho::new_shared_ard and max_ard_axes go, with the tests that pinned the shared mode (shared_ard_flat_index_aliases_in_bounds_1026, shared_ard_collapses_outer_param_count_at_large_k, shared_ard_is_a_convergent_outer_coordinate_1026).",
+    "evidence": "manifold::tests::ard_flat_index_is_unique_per_atom_axis_3824 and sae owed_1026::ard_outer_coordinates_are_per_atom_at_every_k_3824: for K in {2,255,256,1000} the flat length is 1+K+K and every (k,j) index is distinct; a heterogeneous d=[2,1,2] from_flat round trip is exact."
+  },
+  {
+    "base": "dcae5aa879ffe746b86288b27cda3b89de428ead",
+    "items": [
+      "crates/gam-terms/tests/suite/probe_2761_penalty_topology.rs:fn:probe_frozen_chart_local_topology_versus_range",
+      "crates/gam-terms/tests/suite/probe_2761_penalty_topology.rs:fn:probe_term_collection_topology_versus_range"
+    ],
+    "reason": "#3884: the print-only probes are replaced by asserting tests (term_collection_penalty_topology_is_invariant_to_the_representer_range, frozen_chart_local_penalty_topology_matches_the_cached_one_at_every_range) that pin the same topology invariants.",
+    "evidence": "The two probe fns only printed penalty counts/ranks and asserted nothing; the replacement tests in the same file assert the invariants each probe printed."
+  },
+  {
+    "base": "e5e926b4bfc6f5f3b77b314c8f0b66f5c4e2769b",
+    "items": [
+      "crates/gam-sae/src/parameter_decomposition/lift.rs:fn:forward",
+      "crates/gam-sae/src/parameter_decomposition/lift.rs:fn:vjp",
+      "crates/gam-sae/src/parameter_decomposition/lift.rs:trait:ParameterExecutor",
+      "crates/gam-solve/src/constrained_posterior/cone_laplace.rs:fn:retained_normals"
+    ],
+    "reason": "#4485: ParameterExecutor had no implementor, bound or caller anywhere (its doc claimed a native Rust implementation and a Python wrapper that do not exist); executed rows are built directly as ExecutedExperiment. ConeLaplace::retained_normals (A^T) had no caller; its cone_normalizer twin was already deleted as dead.",
+    "evidence": "At this base, source_removal_guard.py with the landing commit as head reports exactly these identities. git grep -w finds no ParameterExecutor or retained_normals under crates, src, tests or python in the head tree."
+  },
+  {
+    "base": "0b9dc2c6b850eff58b11003192136420ef7233e7",
+    "items": [
+      "crates/gam-models/src/test_support.rs:const:PI_QUARTER_INV"
+    ],
+    "reason": "#4522: gauss_hermite_probabilists was a line-for-line Numerical Recipes gauher transcription (asymptotic seeds, orthonormal recurrence, 200-step Newton); it is now a split of gam_math::quadrature::standard_normal_gauss_hermite_rule, the workspace's one standard-normal Gauss-Hermite rule. PI_QUARTER_INV (pi^-1/4, the recurrence seed) was a local constant of the deleted transcription.",
+    "evidence": "At this base, source_removal_guard.py with the landing commit as head reports exactly this identity. git grep -w PI_QUARTER_INV finds none under crates, src or tests in the head tree."
+  },
+  {
+    "base": "c78ebbfb47498180e00fa0b6721359b1ff02948c",
+    "items": [
+      "crates/gam-math/src/paired_timing.rs:fn:quantile_sorted"
+    ],
+    "reason": "#3877: paired_timing quantiles route through the shared gam_math::quantile::quantile_from_sorted; the private duplicate is deleted.",
+    "evidence": "PR #3887; quantile_from_sorted returns NaN on empty input exactly like the removed helper."
+  },
+  {
+    "base": "e3fbe9373038ccaee479c0aa87d85febd623cc56",
+    "items": [
+      "crates/gam-models/src/fit_orchestration/drivers/spatial_hyper_dirs.rs:fn:add_analytic_penalty_hessian_to_eval"
+    ],
+    "reason": "#4161: add_analytic_penalty_hessian_to_eval assembled a wrong latent joint REML Hessian. It used hessian_diag (the exact diagonal, even for dense-Hessian penalties such as BlockOrthogonality, SoftmaxAssignmentSparsity and sheaf) as the whole t-t block and had no t-rho or rho-rho terms for learnable penalty rho, at O((n d)^2) HVP cost per outer evaluation. Its output was always discarded. add_analytic_penalty_objective_to_eval now declares its gradient-only contribution by downgrading an analytic Hessian to Unavailable itself.",
+    "evidence": "git grep -w add_analytic_penalty_hessian_to_eval at the base finds only its definition (spatial_hyper_dirs.rs:974) and its one call (:1069) in add_analytic_penalty_objective_to_eval. That function's only caller, spatial_optimization.rs:6260, is always followed at :6268 by add_latent_id_objective_to_eval, which sets eval.2 = HessianValue::Unavailable whenever it is analytic (spatial_hyper_dirs.rs:907-909). So no Hessian value this helper wrote ever reached store_eval."
+  },
+  {
+    "base": "e3fbe9373038ccaee479c0aa87d85febd623cc56",
+    "items": [
+      "crates/gam-solve/src/reml/jeffreys_subspace.rs:fn:ramp_down",
+      "crates/gam-solve/src/reml/jeffreys_subspace.rs:fn:ramp_down_value_and_deriv",
+      "crates/gam-solve/src/reml/jeffreys_subspace.rs:fn:ramp_down_value_d1_d2"
+    ],
+    "reason": "The conditioning-gate value, gradient and Hessian each defined a private inner copy of the cubic smoothstep ramp (ramp_down, ramp_down_value_and_deriv, ramp_down_value_d1_d2) duplicating conditioning_ramp_down_derivatives, which the third and fourth partials already read. All orders now read both sub-weights through conditioning_sub_weight_derivatives over that one ramp, so the value and every partial select the active max-branch from the same numbers.",
+    "evidence": "Each removed inner fn was local to one function body (spectral_gate_weight, spectral_gate_weight_grad, spectral_gate_weight_hess) and called only there; the ramp arithmetic 1 - t^2(3 - 2t), -6t(1-t)/span, -6(1-2t)/span^2 is identical in conditioning_ramp_down_derivatives, so every gate value and partial is bit-identical. The other ramp_down occurrences the guard counts are the call sites inside these bodies and the explicit mixed trace weights stratum closure, which now also reads conditioning_sub_weight_derivatives."
+  },
+  {
+    "base": "08628afb310729629275eb487e7714732662d59e",
+    "items": [
+      "crates/gam-math/src/categorical.rs:fn:positive_log_sum_exp",
+      "crates/gam-models/src/latent_law_compression.rs:fn:log_sum_exp",
+      "crates/gam-sae/src/sparse_dict/split_lr_fdr.rs:fn:logsumexp",
+      "crates/gam-solve/src/evidence.rs:fn:log_sum_exp",
+      "crates/gam-solve/src/reml/block_correction_hessian.rs:fn:log_sum_exp"
+    ],
+    "reason": "Single source of truth for log-sum-exp: five private copies (categorical positive_log_sum_exp, latent_law_compression log_sum_exp, split_lr_fdr logsumexp, evidence log_sum_exp, block_correction_hessian log_sum_exp) plus three inline copies duplicated gam_math::probability::signed_log_sum_exp with all signs +1. They are replaced by one pub gam_math::probability::positive_log_sum_exp that shares signed_log_sum_exp's body. The evidence.rs copy returned -inf for a +inf term; the canonical routine silently dropped NaN terms, which consolidation would have turned into a NaN-swallowing regression, so it now propagates an undefined term as NaN.",
+    "evidence": "gam-math probability tests slse_undefined_term_makes_the_sum_undefined and positive_log_sum_exp_edge_cases pin NaN propagation, +inf, -inf, empty input and the 1000+ln2 overflow case; at the head git grep -w finds no definition of the five removed names in the edited files, and every former caller now calls positive_log_sum_exp."
+  },
+  {
+    "base": "b9758d35a07556d8233277172814d07401129bb5",
+    "items": [
+      "crates/gam-pyffi/src/latent/latent_basis_and_sae_ffi.rs:fn:get"
+    ],
+    "reason": "#3521: gumbel_temperature_schedule_from_pydict no longer hand-parses the Python dict with its nested `get` helper (which defaulted a geometric rate to 0.9 and silently accepted wrong-typed optional fields); it routes through the single strict Rust schedule descriptor parser shared with the penalty registry's temperature_schedule.",
+    "evidence": "The removed item is a function-local helper nested in gumbel_temperature_schedule_from_pydict with no other callers (the 2318 production occurrences are the unrelated common name `get`); covered by gam-pyffi gumbel_temperature_schedule and gam-models descriptors::tests."
+  },
+  {
+    "base": "c78ebbfb47498180e00fa0b6721359b1ff02948c",
+    "items": [
+      "crates/gam-models/src/inference/saved_summary.rs:fn:saved_models_log_evidence_ratio",
+      "crates/gam-pyffi/src/model/model_ffi.rs:fn:log_evidence_ratio"
+    ],
+    "reason": "#3878: the evidence ratio is exponentiated in Rust; the log-ratio entry points are replaced by saved_models_evidence_ratio and the pyffi evidence_ratio.",
+    "evidence": "PR #3895; Model.evidence_ratio_vs no longer overflows in Python."
+  },
+  {
+    "base": "e3fbe9373038ccaee479c0aa87d85febd623cc56",
+    "items": [
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:duchon_radial_jacobian_second",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:duchon_radial_jacobian_third",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:jacobian_second",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:jacobian_third",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:target_matrix",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:struct:IsometryDuchonRadialSource"
+    ],
+    "reason": "IsometryDuchonRadialSource had no constructor anywhere in the workspace: IsometryPenalty::duchon_radial_source was set to None in new_euclidean and only ever cloned, so its Duchon Jacobian adapters (duchon_radial_jacobian_second/third), the target_matrix helper they read, and the jacobian_second/jacobian_third wrappers that fell back to them were dead, and every duchon_radial_source.is_none() guard was always true. The gradient, GN majorizer and exact HVP now read the installed H/K caches after the evaluation precondition, which already refuses a missing jet by name.",
+    "evidence": "git grep on the base tree finds no struct literal or constructor of IsometryDuchonRadialSource and no assignment to duchon_radial_source other than `duchon_radial_source: None` in IsometryPenalty::new_euclidean and the field-wise clone; the same-named target_matrix/jacobian_second/jacobian_third occurrences the guard counts belong to other penalties (block_sparsity, nuclear_norm, orthogonality, row_precision) and to the deleted wrappers' own call sites in isometry.rs."
+  },
+  {
+    "base": "03f9a1216aae0cc61e83bf828877243b2bf6a425",
+    "items": [
+      "crates/gam-inference/src/hmc_io.rs:fn:log1pexp_is_finite_for_extreme_eta",
+      "crates/gam-inference/src/hmc_io.rs:fn:sigmoid_stable_behaves_at_extremes",
+      "crates/gam-linalg/src/utils.rs:fn:logistic_at_zero_is_half",
+      "crates/gam-linalg/src/utils.rs:fn:logistic_large_negative_approaches_zero",
+      "crates/gam-linalg/src/utils.rs:fn:logistic_large_positive_approaches_one",
+      "crates/gam-linalg/src/utils.rs:fn:logistic_symmetry_around_zero",
+      "crates/gam-linalg/src/utils.rs:fn:softplus_at_zero",
+      "crates/gam-linalg/src/utils.rs:fn:softplus_matches_naive_formula_at_moderate_x",
+      "crates/gam-linalg/src/utils.rs:fn:softplus_negative_large_approximates_zero",
+      "crates/gam-linalg/src/utils.rs:fn:softplus_positive_large_approximates_x",
+      "crates/gam-linalg/src/utils.rs:fn:stable_logistic",
+      "crates/gam-linalg/src/utils.rs:fn:stable_softplus",
+      "crates/gam-models/src/inference/full_conformal/honest.rs:fn:softplus"
+    ],
+    "reason": "#3735: the stable softplus/logistic kernels were implemented more than once in the Rust core. gam_math::special::{softplus, logistic} is canonical; gam_linalg::utils::{stable_softplus, stable_logistic} and the private honest.rs softplus re-derived the identical expressions (max(x,0)+ln1p(exp(-|x|)) and the sign-split logistic). SPEC: 'It's required that the CLI, Python library, and Rust library are unified, have a single source of truth'. The 10 removed tests re-tested the same kernel through the aliases; their tail and symmetry assertions move into gam-math's softplus_and_logistic_agree_with_their_definitions_away_from_the_tails. The gam-pyffi copy and its numerics_* pyfunctions stay for now, because open PR #3076 edits geometry_ffi.rs and the stubs.",
+    "evidence": "At head git grep -w finds no stable_softplus or stable_logistic anywhere; every former caller imports gam_math::special::{softplus, logistic}. The remaining softplus/sigmoid_stable name occurrences are other, untouched items."
+  },
+  {
+    "base": "00b33efd500f54529a61bab8ba3dcc5da54a8745",
+    "items": [
+      "crates/gam-models/src/inference/model.rs:struct:SavedLatentScoreContract",
+      "crates/gam-solve/src/model_types/result_types.rs:fn:working_geometry",
+      "crates/gam-solve/src/model_types/result_types.rs:fn:working_response"
+    ],
+    "reason": "#4466: the saved-model payload carried write-only mirrors (sas_param_covariance, mixture_link_param_covariance, beta_noise, slope_formulas, baseline_slopes, latent_score_contract). Predict reads the link covariance from fit_result.fitted_link, the noise coefficients from the fit's Scale block and the marginal-slope contract from slope_formula/baseline_slope/z_columns, so the mirrors could be edited or drift with no effect on any reloaded prediction. They are deleted with SavedLatentScoreContract, the struct only latent_score_contract held, and the FitResult::working_response/working_geometry accessors, which had no caller outside each other.",
+    "evidence": "At 00b33efd50, git grep finds no reader of the six payload keys (beta_noise only behind a dead fallback after the fit's Scale block) outside their writers in model_payload_builders.rs, the new()/validate_numeric_finiteness boilerplate in model.rs and tests; SavedLatentScoreContract is named only in model.rs; '.working_response()' has no call site and '.working_geometry()' is called only by working_response, both in result_types.rs. stateful_saved_model_sync now asserts the SAS covariance round-trips through fit_result.fitted_link and pins 96 payload keys (the pin had also missed gaussian_sigma_floor and informational_notes)."
+  },
+  {
+    "base": "b4ab590eb5ca9c4e08dacc18e1a287eb8fecd78c",
+    "items": [
+      "crates/gam-event-history/src/joint/constant_rate_inference.rs:fn:add",
+      "crates/gam-event-history/src/joint/constant_rate_inference.rs:fn:value",
+      "crates/gam-event-history/src/joint/constant_rate_inference.rs:struct:CompensatedSum",
+      "crates/gam-math/src/sparse_grid.rs:fn:default",
+      "crates/gam-terms/src/smooth/input_standardization.rs:fn:add",
+      "crates/gam-terms/src/smooth/input_standardization.rs:fn:total",
+      "crates/gam-terms/src/smooth/input_standardization.rs:struct:CompensatedSum"
+    ],
+    "reason": "#4306: one canonical Neumaier accumulator in gam-math replaces private duplicate scalar sums and the quadrature duplicate. All former callers import the canonical live type.",
+    "evidence": "Four exact cancellation/copy/reset/quadrature regressions execute against rebuilt gam-math; complete changed consumer crates and their transitive dependency metadata compile with warnings denied on MSI. Source census enumerates all direct consumers and removed declarations."
   }
 ]
