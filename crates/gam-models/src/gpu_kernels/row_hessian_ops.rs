@@ -30,8 +30,6 @@ use gam_gpu::gpu_error::checked_shape_len;
 // `Arc` only wraps the CUDA stream and module, which exist on Linux alone.
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
-use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
@@ -265,34 +263,25 @@ struct RowOpsBackend {
 #[cfg(target_os = "linux")]
 impl RowOpsBackend {
     fn probe() -> Result<&'static Self, GpuError> {
-        static BACKEND: OnceLock<Result<RowOpsBackend, GpuError>> = OnceLock::new();
-        BACKEND
-            .get_or_init(|| {
-                let runtime = gam_gpu::device_runtime::GpuRuntime::require()?;
-                let ctx = gam_gpu::device_runtime::cuda_context_for(
-                    runtime.selected_device().ordinal,
-                )
-                .ok_or_else(|| {
-                    gpu_err!(
-                        "row_hessian_ops backend: failed to create CUDA context for device {}",
-                        runtime.selected_device().ordinal
-                    )
-                })?;
-                let stream = ctx.default_stream();
-                // Shared arch+fmad options (NOT bare `compile_ptx`): #1686's
-                // `--fmad=false` keeps the matvec / diag reductions
-                // bit-comparable to the separately-rounded CPU oracle, and the
-                // #1551 arch pin keys the kernel to the device's real compute
-                // capability instead of NVRTC's pre-sm_60 default.
-                let ptx = gam_gpu::device_cache::compile_ptx_arch(ROW_KERNEL_SOURCE)
-                    .map_err(|err| gpu_err!("row_hessian_ops NVRTC compile failed: {err}"))?;
-                let module = ctx
-                    .load_module(ptx)
-                    .gpu_ctx("row_hessian_ops module load failed")?;
-                Ok(RowOpsBackend { stream, module })
+        static BACKEND: gam_gpu::backend_probe::CachedBackend<RowOpsBackend> =
+            gam_gpu::backend_probe::CachedBackend::new();
+        BACKEND.get_or_probe("row_hessian_ops", |parts| {
+            // Shared arch+fmad options (NOT bare `compile_ptx`): #1686's
+            // `--fmad=false` keeps the matvec / diag reductions
+            // bit-comparable to the separately-rounded CPU oracle, and the
+            // #1551 arch pin keys the kernel to the device's real compute
+            // capability instead of NVRTC's pre-sm_60 default.
+            let ptx = gam_gpu::device_cache::compile_ptx_arch(ROW_KERNEL_SOURCE)
+                .map_err(|err| gpu_err!("row_hessian_ops NVRTC compile failed: {err}"))?;
+            let module = parts
+                .ctx
+                .load_module(ptx)
+                .gpu_ctx("row_hessian_ops module load failed")?;
+            Ok(RowOpsBackend {
+                stream: parts.stream,
+                module,
             })
-            .as_ref()
-            .map_err(GpuError::clone)
+        })
     }
 }
 

@@ -19,7 +19,7 @@ use gam_gpu::gpu_error::GpuError;
 use gam_gpu::gpu_error::GpuResultExt;
 
 #[cfg(target_os = "linux")]
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, CudaModule, CudaStream};
@@ -53,8 +53,9 @@ struct CubicCellGpuContextLinux {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     /// NVRTC-compiled module per `max_degree` specialization. Keyed by
-    /// `MOMENT_STRIDE = max_degree + 1` so a single integer suffices.
-    modules: Mutex<std::collections::HashMap<usize, Arc<CudaModule>>>,
+    /// `max_degree` (`MOMENT_STRIDE = max_degree + 1`) so a single integer
+    /// suffices.
+    modules: gam_gpu::device_cache::KeyedPtxModuleCache<usize>,
 }
 
 #[cfg(target_os = "linux")]
@@ -63,63 +64,35 @@ impl CubicCellGpuBackend {
     /// of the kernel module is deferred to dispatch (each `max_degree`
     /// specialization compiles on first use, cached forever).
     pub(crate) fn probe() -> Result<&'static Self, GpuError> {
-        static BACKEND: OnceLock<Result<CubicCellGpuBackend, GpuError>> = OnceLock::new();
-        BACKEND
-            .get_or_init(Self::probe_linux)
-            .as_ref()
-            .map_err(GpuError::clone)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn probe_linux() -> Result<Self, GpuError> {
-        let parts = gam_gpu::backend_probe::probe_cuda_backend("cubic_cell")?;
-        Ok(CubicCellGpuBackend {
-            inner: CubicCellGpuContextLinux {
-                ctx: parts.ctx,
-                stream: parts.stream,
-                modules: Mutex::new(std::collections::HashMap::new()),
-            },
+        static BACKEND: gam_gpu::backend_probe::CachedBackend<CubicCellGpuBackend> =
+            gam_gpu::backend_probe::CachedBackend::new();
+        BACKEND.get_or_probe("cubic_cell", |parts| {
+            Ok(CubicCellGpuBackend {
+                inner: CubicCellGpuContextLinux {
+                    ctx: parts.ctx,
+                    stream: parts.stream,
+                    modules: gam_gpu::device_cache::KeyedPtxModuleCache::new(),
+                },
+            })
         })
     }
 
     /// NVRTC-compile and load (or fetch from cache) the kernel module for
     /// `max_degree`.
-    #[cfg(target_os = "linux")]
     fn module_for_degree(&self, max_degree: usize) -> Result<Arc<CudaModule>, GpuError> {
-        let key = max_degree;
-        {
-            let guard = self
-                .inner
-                .modules
-                .lock()
-                .gpu_ctx("cubic_cell module cache mutex poisoned")?;
-            if let Some(module) = guard.get(&key) {
-                return Ok(Arc::clone(module));
-            }
-        }
-        let source =
-            crate::gpu_kernels::cubic_cell::kernel_src::build_cubic_deriv_moments_kernel_source(
-                max_degree,
-            );
-        // Route through the shared arch-aware NVRTC compile (#1551), NOT the bare
-        // `cudarc::nvrtc::compile_ptx`. That sets the device-keyed `--gpu-architecture`
-        // pin AND the NVRTC include search paths (`/usr/local/cuda/include`, …).
-        // The bare path supplies no `-I`, so this kernel's `#include <stdint.h>`
-        // failed with "catastrophic error: could not open source file stdint.h"
-        // and the device path silently fell back to the CPU on every GPU box.
-        let ptx = gam_gpu::device_cache::compile_ptx_arch(&source).gpu_ctx_with(|err| {
-            format!("cubic_cell NVRTC compile (degree={max_degree}) failed: {err}")
-        })?;
-        let module = self.inner.ctx.load_module(ptx).gpu_ctx_with(|err| {
-            format!("cubic_cell module load (degree={max_degree}) failed: {err}")
-        })?;
-        let mut guard = self
-            .inner
-            .modules
-            .lock()
-            .gpu_ctx("cubic_cell module cache mutex poisoned")?;
-        let entry = guard.entry(key).or_insert(module);
-        Ok(Arc::clone(entry))
+        // The keyed cache compiles through the shared arch-aware NVRTC options
+        // (#1551), NOT the bare `cudarc::nvrtc::compile_ptx`. Those set the
+        // device-keyed `--gpu-architecture` pin AND the NVRTC include search
+        // paths (`/usr/local/cuda/include`, …). The bare path supplies no `-I`,
+        // so this kernel's `#include <stdint.h>` failed with "catastrophic
+        // error: could not open source file stdint.h" and the device path
+        // silently fell back to the CPU on every GPU box.
+        self.inner.modules.get_or_compile(
+            &self.inner.ctx,
+            max_degree,
+            "cubic_cell",
+            crate::gpu_kernels::cubic_cell::kernel_src::build_cubic_deriv_moments_kernel_source,
+        )
     }
 
     /// Device-resident dispatcher: leaves the moments + status buffers on

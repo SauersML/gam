@@ -1,7 +1,5 @@
 //! Bernoulli marginal-slope FLEX GPU policy and backend probe.
 
-use std::sync::OnceLock;
-
 use gam_gpu::gpu_error::GpuError;
 use gam_gpu::{
     GpuDecision, RowKernelAdmission, RowKernelShape, RuntimeDeviceProbe, decide_row_kernel,
@@ -153,34 +151,26 @@ impl BmsFlexGpuBackend {
     /// selected device, opens a stream, and NVRTC-compiles the probe
     /// kernel. Subsequent calls return the cached handle.
     pub fn probe() -> Result<&'static Self, GpuError> {
-        static BACKEND: OnceLock<Result<BmsFlexGpuBackend, GpuError>> = OnceLock::new();
-        BACKEND
-            .get_or_init(|| {
-                #[cfg(target_os = "linux")]
-                {
-                    Self::probe_linux()
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    Err(GpuError::DriverLibraryUnavailable {
-                        reason: "bms_flex GPU backend is Linux-only".to_string(),
-                    })
-                }
+        #[cfg(target_os = "linux")]
+        {
+            static BACKEND: gam_gpu::backend_probe::CachedBackend<BmsFlexGpuBackend> =
+                gam_gpu::backend_probe::CachedBackend::new();
+            BACKEND.get_or_probe("bms_flex", |parts| {
+                let backend = BmsFlexGpuBackend {
+                    inner: gam_gpu::backend_probe::CudaBackendContext::from_parts(parts),
+                };
+                // Eagerly compile the probe kernel so any NVRTC failure surfaces
+                // here, not at first dispatch.
+                backend.compile_probe_module()?;
+                Ok(backend)
             })
-            .as_ref()
-            .map_err(GpuError::clone)
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn probe_linux() -> Result<Self, GpuError> {
-        let parts = gam_gpu::backend_probe::probe_cuda_backend("bms_flex")?;
-        let backend = BmsFlexGpuBackend {
-            inner: gam_gpu::backend_probe::CudaBackendContext::from_parts(parts),
-        };
-        // Eagerly compile the probe kernel so any NVRTC failure surfaces
-        // here, not at first dispatch.
-        backend.compile_probe_module()?;
-        Ok(backend)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(GpuError::DriverLibraryUnavailable {
+                reason: "bms_flex GPU backend is Linux-only".to_string(),
+            })
+        }
     }
 
     /// NVRTC-compile (or fetch from cache) the probe module.

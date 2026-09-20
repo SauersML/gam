@@ -39,17 +39,15 @@
 //! source compiled to a dedicated module and cached. The kernel never branches
 //! on a runtime `family` enum — that pattern collapses ILP and forces the
 //! compiler to keep dead paths warm. The module cache is keyed by
-//! `(family_id, curvature_mode, precision)` so a single process compiles each
+//! `(family, curvature_mode, kernel_mode)` so a single process compiles each
 //! kernel exactly once across all fits.
-
-use std::sync::OnceLock;
 
 use gam_gpu::gpu_error::GpuError;
 #[cfg(target_os = "linux")]
 use gam_gpu::gpu_error::GpuResultExt;
 
 #[cfg(target_os = "linux")]
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, CudaModule};
@@ -283,7 +281,7 @@ pub struct PirlsRowBackend {
 #[cfg(target_os = "linux")]
 struct PirlsRowBackendLinux {
     ctx: Arc<CudaContext>,
-    modules: Mutex<std::collections::HashMap<ModuleKey, Arc<CudaModule>>>,
+    modules: gam_gpu::device_cache::KeyedPtxModuleCache<ModuleKey>,
 }
 
 /// Distinguishes the three kernel modes in the per-process module cache.
@@ -300,6 +298,17 @@ enum KernelMode {
 }
 
 #[cfg(target_os = "linux")]
+impl KernelMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FinalRow => "final",
+            Self::SolveRow => "solve",
+            Self::AlphaLadder => "ladder",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ModuleKey {
     family: PirlsRowFamily,
@@ -307,94 +316,70 @@ struct ModuleKey {
     mode: KernelMode,
 }
 
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for ModuleKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}/{}",
+            self.mode.as_str(),
+            self.family.as_str(),
+            self.curvature.as_str()
+        )
+    }
+}
+
 impl PirlsRowBackend {
-    pub const fn compiled() -> bool {
-        cfg!(target_os = "linux")
-    }
-
     pub fn probe() -> Result<&'static Self, GpuError> {
-        static BACKEND: OnceLock<Result<PirlsRowBackend, GpuError>> = OnceLock::new();
-        BACKEND
-            .get_or_init(|| {
-                #[cfg(target_os = "linux")]
-                {
-                    Self::probe_linux()
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    Err(GpuError::DriverLibraryUnavailable {
-                        reason: "pirls_row GPU backend is Linux-only".to_string(),
-                    })
-                }
+        #[cfg(target_os = "linux")]
+        {
+            static BACKEND: gam_gpu::backend_probe::CachedBackend<PirlsRowBackend> =
+                gam_gpu::backend_probe::CachedBackend::new();
+            BACKEND.get_or_probe("pirls_row", |parts| {
+                Ok(Self {
+                    inner: PirlsRowBackendLinux {
+                        ctx: parts.ctx,
+                        modules: gam_gpu::device_cache::KeyedPtxModuleCache::new(),
+                    },
+                })
             })
-            .as_ref()
-            .map_err(GpuError::clone)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn probe_linux() -> Result<Self, GpuError> {
-        let parts = gam_gpu::backend_probe::probe_cuda_backend("pirls_row")?;
-        Ok(Self {
-            inner: PirlsRowBackendLinux {
-                ctx: parts.ctx,
-                modules: Mutex::new(std::collections::HashMap::new()),
-            },
-        })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(GpuError::DriverLibraryUnavailable {
+                reason: "pirls_row GPU backend is Linux-only".to_string(),
+            })
+        }
     }
 
     /// Compile (or fetch from cache) the kernel module for `(family, curvature)`
     /// in the given [`KernelMode`]. This is the single source of truth behind
     /// [`module_for`], `module_for_solve`, and `module_for_ladder`; the only
     /// per-mode variation is which CUDA source generator is used (selected by
-    /// `mode`) and the error label `label` woven into compile/load diagnostics.
+    /// `mode`), and the mode is part of the cache key and its diagnostics.
     #[cfg(target_os = "linux")]
     fn module_for_kind(
         &self,
         family: PirlsRowFamily,
         curvature: CurvatureMode,
         mode: KernelMode,
-        label: &str,
     ) -> Result<Arc<CudaModule>, GpuError> {
         let key = ModuleKey {
             family,
             curvature,
             mode,
         };
-        if let Some(existing) = self
-            .inner
-            .modules
-            .lock()
-            .gpu_ctx_with(|err| format!("pirls_row {label}module cache mutex poisoned: {err}"))?
-            .get(&key)
-        {
-            return Ok(existing.clone());
-        }
-        let source = match mode {
-            KernelMode::FinalRow => cuda_source_for(family, curvature),
-            KernelMode::SolveRow => solve_row_source_for(family, curvature),
-            KernelMode::AlphaLadder => ladder_source_for(family, curvature),
-        };
-        // #1551: route through the device-arch-pinned compile — this kernel uses
-        // `atomicAdd(double*, double)` (objective_out), which NVRTC rejects under
-        // its default sub-sm_60 arch, silently disabling the device PIRLS path.
-        let ptx = gam_gpu::device_cache::compile_ptx_arch(&source).gpu_ctx_with(|err| {
-            format!(
-                "pirls_row {label}NVRTC compile failed for {family}/{curv}: {err}",
-                family = family.as_str(),
-                curv = curvature.as_str(),
-            )
-        })?;
-        let module = self
-            .inner
-            .ctx
-            .load_module(ptx)
-            .gpu_ctx_with(|err| format!("pirls_row {label}module load failed: {err}"))?;
+        // #1551: the keyed cache compiles through the device-arch-pinned
+        // options — this kernel uses `atomicAdd(double*, double)`
+        // (objective_out), which NVRTC rejects under its default sub-sm_60
+        // arch, silently disabling the device PIRLS path.
         self.inner
             .modules
-            .lock()
-            .gpu_ctx_with(|err| format!("pirls_row {label}module cache mutex poisoned: {err}"))?
-            .insert(key, module.clone());
-        Ok(module)
+            .get_or_compile(&self.inner.ctx, key, "pirls_row", |key| match key.mode {
+                KernelMode::FinalRow => cuda_source_for(key.family, key.curvature),
+                KernelMode::SolveRow => solve_row_source_for(key.family, key.curvature),
+                KernelMode::AlphaLadder => ladder_source_for(key.family, key.curvature),
+            })
     }
 
     /// Compile (or fetch from cache) the **final-row** kernel module for
@@ -405,7 +390,7 @@ impl PirlsRowBackend {
         family: PirlsRowFamily,
         curvature: CurvatureMode,
     ) -> Result<Arc<CudaModule>, GpuError> {
-        self.module_for_kind(family, curvature, KernelMode::FinalRow, "")
+        self.module_for_kind(family, curvature, KernelMode::FinalRow)
     }
 
     /// Compile (or fetch from cache) the **solve-row** kernel module for
@@ -417,7 +402,7 @@ impl PirlsRowBackend {
         family: PirlsRowFamily,
         curvature: CurvatureMode,
     ) -> Result<Arc<CudaModule>, GpuError> {
-        self.module_for_kind(family, curvature, KernelMode::SolveRow, "solve ")
+        self.module_for_kind(family, curvature, KernelMode::SolveRow)
     }
 
     /// Compile (or fetch from cache) the **alpha-ladder** kernel module for
@@ -429,9 +414,8 @@ impl PirlsRowBackend {
         family: PirlsRowFamily,
         curvature: CurvatureMode,
     ) -> Result<Arc<CudaModule>, GpuError> {
-        self.module_for_kind(family, curvature, KernelMode::AlphaLadder, "ladder ")
+        self.module_for_kind(family, curvature, KernelMode::AlphaLadder)
     }
-
 }
 
 /// Device-resident per-row output buffers for the GPU row-reweight kernel.

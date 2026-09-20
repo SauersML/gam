@@ -1,5 +1,17 @@
 ## Unreleased
 
+- **One process-wide GPU backend cache** (#4155). The BMS flex and row/HVP, cubic-cell,
+  row-Hessian, PIRLS row and sphere backends are now `static CachedBackend`s read through
+  `get_or_probe`, like the SAE and survival backends, instead of seven hand-rolled
+  `OnceLock<Result<_, GpuError>>` caches. `row_hessian_ops` gains the shared probe prologue,
+  so a host without a GPU now reports the labelled `DriverLibraryUnavailable` every other
+  backend reports. The per-degree, per-kernel and per-`LMAX` module caches of cubic-cell,
+  PIRLS row and sphere move onto `KeyedPtxModuleCache`; the sphere cache no longer skips
+  caching (and recompiles on every call) after a poisoned lock, and no longer keys on the
+  fixed device's compute capability. `probe_backend_with_compile`, the public
+  `probe_cuda_backend` entry, `CudaBackendParts::capability` and the unused
+  `PirlsRowBackend::compiled` are removed.
+
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
   `μ̂ ≤ c₀·a²·(1−1/SNR)·(1−C_κκ)/K`, with the chosen constants `c₀ = 1` and
