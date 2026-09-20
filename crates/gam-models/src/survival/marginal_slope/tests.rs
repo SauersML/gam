@@ -4744,11 +4744,12 @@ fn flex_timewiggle_baseline_public_workspace_owns_family_and_design_pairs_withou
         .expect("FLEX baseline-pair callback")
         .expect("FLEX baseline-pair terms are present");
     assert_eq!(baseline_pair.score_psi_psi.len(), dimension);
-    let baseline_pair_hessian = baseline_pair
-        .hessian_psi_psi_operator
-        .as_ref()
-        .expect("FLEX baseline-pair Hessian operator")
-        .to_dense();
+    // gam#3304: the ζ composition serves chart pairs with a dense θθ Hessian too.
+    assert!(
+        baseline_pair.hessian_psi_psi_operator.is_none(),
+        "the ζ composition publishes a dense baseline-pair Hessian"
+    );
+    let baseline_pair_hessian = baseline_pair.hessian_psi_psi.clone();
     assert_eq!(baseline_pair_hessian.dim(), (dimension, dimension));
     assert!(
         baseline_pair
@@ -4785,11 +4786,11 @@ fn flex_timewiggle_baseline_public_workspace_owns_family_and_design_pairs_withou
         mixed.score_psi_psi.iter().any(|value| value.abs() > 1e-12),
         "active FLEX/timewiggle baseline-by-design score must not collapse to zero"
     );
-    let mixed_hessian = mixed
-        .hessian_psi_psi_operator
-        .as_ref()
-        .expect("FLEX baseline-by-design Hessian operator")
-        .to_dense();
+    assert!(
+        mixed.hessian_psi_psi_operator.is_none(),
+        "the ζ composition publishes a dense baseline-by-design Hessian"
+    );
+    let mixed_hessian = mixed.hessian_psi_psi.clone();
     assert_eq!(mixed_hessian.dim(), (dimension, dimension));
     assert!(mixed_hessian.iter().all(|value| value.is_finite()));
     assert!(mixed_hessian.iter().any(|value| *value != 0.0));
