@@ -323,7 +323,12 @@ pub(crate) fn hash_cf_array2(hasher: &mut Fingerprinter, values: &Array2<f64>) {
     }
 }
 
-pub(crate) fn hash_cf_design_matrix(
+/// Absorb a design matrix as `(nrows, ncols)` then every entry, read one row
+/// chunk at a time so the key never densifies a lazy design. Public so a
+/// family's `CustomFamily::persistent_warm_start_fingerprint` hashes the
+/// designs its likelihood reads with the same byte stream the block specs are
+/// keyed with, not a second copy of this rule (gam#3002).
+pub fn hash_cf_design_matrix(
     hasher: &mut Fingerprinter,
     design: &DesignMatrix,
 ) -> Result<(), String> {
