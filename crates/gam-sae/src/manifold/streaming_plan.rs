@@ -183,6 +183,8 @@ pub(crate) fn sae_streaming_plan_from_budget(
     total_basis: usize,
     k_atoms: usize,
     d_max: usize,
+    row_dim: usize,
+    row_cross_width: usize,
     border_dim: usize,
     in_core_budget_bytes: usize,
     chunk_window_bytes: usize,
@@ -204,15 +206,6 @@ pub(crate) fn sae_streaming_plan_from_budget(
         .saturating_mul(row_block_dim)
         .saturating_mul(border_dim)
         .saturating_mul(SAE_BYTES_PER_F64);
-    // #1405/#1406: the MATRIX-FREE path does NOT materialize that dense
-    // `(q × border_dim)` slab — the Kronecker operator stores only the per-row
-    // `kron_jac` (the `q × p` local Jacobian) plus the sparse `kron_a_phi`
-    // support, an `O(N · q · p)` footprint, NOT `O(N · q · K·M·p)`. Predicting
-    // the dense `row_cross_bytes` here is the spurious ~6 TiB working-set the
-    // high-K throughput plan aborted on (#1405). Use the true matrix-free cross
-    // footprint `N · q · p` (p = border_dim / total_basis, since
-    // border_dim = Σ_k M_k · p and total_basis = Σ_k M_k).
-    let p_out = border_dim / total_basis.max(1);
     let direct_peak_bytes = full_batch_bytes
         .saturating_add(row_cross_bytes)
         .saturating_add(dense_schur_bytes);
@@ -221,35 +214,41 @@ pub(crate) fn sae_streaming_plan_from_budget(
     let border_vector_bytes = border_dim
         .saturating_mul(SAE_BYTES_PER_F64)
         .saturating_mul(SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER);
-    // The matrix-free operator stores per-row Jacobians only over each row's
-    // ACTIVE atoms (exact sparse assignment: TopK support) — an
-    // `O(N · active · (1+d) · p)` footprint, NOT the dense `O(N · K · (1+d) · p)`
-    // that the full `k_atoms · (1+d)` row block implies. Estimating the dense
-    // block was the spurious ~7.9 GiB working set that refused a K=256 fit at
-    // n=40000 against a 1.75 GiB budget even though the sparse operator
-    // materialises well under 100 MiB. The chunked/sparse plan is *designed* to
-    // stay admittable; size its cross footprint at the per-row active count the
-    // fit can afford in the budget left after the border-vector + chunk
-    // workspaces, capped by k_atoms. The fit's row layout already bounds the
-    // active set to the in-core budget (row_layout.rs), so this matches what it
-    // actually materialises rather than a worst-case all-K-active row.
-    let mf_cross_bytes_per_active_atom = (1usize.saturating_add(d_max))
-        .saturating_mul(p_out)
-        .saturating_mul(SAE_BYTES_PER_F64)
-        .max(1);
-    let mf_cross_budget = matrix_free_budget
-        .saturating_sub(border_vector_bytes)
-        .saturating_sub(chunk_resident_bytes);
-    let mf_affordable_active =
-        (mf_cross_budget / n_obs.max(1) / mf_cross_bytes_per_active_atom).max(1);
-    let mf_active_atoms = k_atoms.min(mf_affordable_active);
+    // #4262 — what the matrix-free route keeps resident for ALL `n_obs` rows,
+    // priced at the assembly's own per-row widths. Nothing here depends on the
+    // budget it is compared against: an admission whose cost is sized from its
+    // own budget always passes and decides nothing.
+    //   * `row_dim = q_row`, the per-row inner block
+    //     (`SaeAssignment::row_block_dim_bound`: the full gate-plus-chart block
+    //     for dense support, the `k` widest charts under TopK);
+    //   * `row_cross_width`, the per-row cross-block width the route
+    //     materializes. Unframed (#1405/#1406) that is the Kronecker operator's
+    //     local Jacobian `kron_jac`, `q_row × p`; with frames engaged it is the
+    //     dense `H_tβ` slab at the factored border width
+    //     (`construction_arrow_schur_assembly`, `row_htbeta_dim`);
+    //   * the assembled per-row block `H_tt` (`q_row × q_row`) and its gradient
+    //     `g_t` (`q_row`) in `ArrowRowBlock`;
+    //   * the Newton step's per-row factor slab (`ArrowFactorSlab`), one dense
+    //     `q_row × q_row` factor per row.
+    // The sparse `kron_a_phi` support is additional and left unpriced (its
+    // length is the row's nonzero basis count, which the shape does not fix),
+    // so the ledger is a lower bound on the true resident set: it can admit a
+    // plan that is marginal, but it can no longer admit one whose priced
+    // buffers alone exceed the budget.
     let matrix_free_cross_bytes = n_obs
-        .saturating_mul(mf_active_atoms)
-        .saturating_mul(1usize.saturating_add(d_max))
-        .saturating_mul(p_out)
+        .saturating_mul(row_dim)
+        .saturating_mul(row_cross_width)
+        .saturating_mul(SAE_BYTES_PER_F64);
+    let matrix_free_row_block_words = row_dim
+        .saturating_mul(row_dim)
+        .saturating_mul(2)
+        .saturating_add(row_dim);
+    let matrix_free_row_block_bytes = n_obs
+        .saturating_mul(matrix_free_row_block_words)
         .saturating_mul(SAE_BYTES_PER_F64);
     let matrix_free_peak_bytes = chunk_resident_bytes
         .saturating_add(matrix_free_cross_bytes)
+        .saturating_add(matrix_free_row_block_bytes)
         .saturating_add(border_vector_bytes);
     // Admit the direct plan when it fits the headroom-reserved budget, OR when its
     // footprint is small in absolute terms (≤ 16 MiB) and fits the reported
@@ -280,8 +279,8 @@ pub(crate) fn sae_streaming_plan_from_budget(
     // dimension (#2283); here at the shape-derived bound.
     let exact_stationarity_admitted =
         sae_exact_stationarity_admitted(exact_stationarity_dim, process_available_bytes);
-    // Matrix-free streaming bounds its peak to the chunk, row-cross and border
-    // workspaces, but it is still a real allocation. Admit it against the same
+    // Matrix-free streaming bounds its peak to the chunk, per-row Jacobian,
+    // per-row block and border workspaces, but it is still a real allocation. Admit it against the same
     // authoritative process budget: a genuine zero means exhausted memory,
     // not permission to manufacture a positive allowance.
     let matrix_free_admitted = matrix_free_peak_bytes <= matrix_free_budget;
@@ -323,6 +322,8 @@ pub fn sae_streaming_plan_for_shape(
     total_basis: usize,
     k_atoms: usize,
     d_max: usize,
+    row_dim: usize,
+    row_cross_width: usize,
     border_dim: usize,
     gpu_policy: gam_gpu::GpuPolicy,
 ) -> Result<SaeStreamingPlan, String> {
@@ -331,6 +332,8 @@ pub fn sae_streaming_plan_for_shape(
         total_basis,
         k_atoms,
         d_max,
+        row_dim,
+        row_cross_width,
         border_dim,
         gpu_policy,
         sae_process_memory_capacity_bytes(),
@@ -340,7 +343,8 @@ pub fn sae_streaming_plan_for_shape(
 /// The same plan, resolved against a host-memory reading the CALLER supplies.
 ///
 /// The plan has exactly two inputs: the model SHAPE (`n_obs`, `total_basis`,
-/// `k_atoms`, `d_max`, `border_dim`) and the ENVIRONMENT (available bytes —
+/// `k_atoms`, `d_max`, the per-row block and cross widths `row_dim` and
+/// `row_cross_width`, `border_dim`) and the ENVIRONMENT (available bytes —
 /// every budget below is derived from that one number by
 /// `sae_host_in_core_budget_from_available`). The shape legitimately moves
 /// during a fit as atoms are rank-reduced and frames activate; the environment
@@ -351,6 +355,8 @@ pub fn sae_streaming_plan_for_shape_with_available(
     total_basis: usize,
     k_atoms: usize,
     d_max: usize,
+    row_dim: usize,
+    row_cross_width: usize,
     border_dim: usize,
     gpu_policy: gam_gpu::GpuPolicy,
     host_available_bytes: usize,
@@ -378,6 +384,8 @@ pub fn sae_streaming_plan_for_shape_with_available(
         total_basis,
         k_atoms,
         d_max,
+        row_dim,
+        row_cross_width,
         border_dim,
         host_budget.min(SAE_MIN_DEVICE_POOL_IN_CORE_BUDGET_BYTES),
         host_window,
@@ -405,6 +413,8 @@ pub fn sae_streaming_plan_for_shape_with_available(
             total_basis,
             k_atoms,
             d_max,
+            row_dim,
+            row_cross_width,
             border_dim,
             host_budget,
             host_window,
@@ -454,6 +464,8 @@ pub fn sae_streaming_plan_for_shape_with_available(
         total_basis,
         k_atoms,
         d_max,
+        row_dim,
+        row_cross_width,
         border_dim,
         budget,
         chunk_window,
@@ -784,6 +796,9 @@ mod cpu_sized_plan_laziness_tests {
             60,
             6,
             2,
+            // softmax row block: 5 free logits + 6 two-dimensional charts.
+            5 + 6 * 2,
+            144 / 60,
             144,
             gam_gpu::GpuPolicy::Auto,
             available,
@@ -889,6 +904,8 @@ mod host_in_core_budget_tests {
             4_096,
             8,
             8,
+            7 + 8 * 8,
+            64 / 4_096,
             64,
             budget,
             SAE_CPU_L2_CACHE_BYTES,
@@ -914,8 +931,18 @@ mod host_in_core_budget_tests {
 
         // Tiny plan: the #1026 toy shape n=120, p=2, K=1 (one M=3 atom) — a few
         // KiB working set, far below the 16 MiB always-admit size.
-        let tiny =
-            sae_streaming_plan_from_budget(120, 3, 1, 1, 6, budget, SAE_CPU_L2_CACHE_BYTES, avail);
+        let tiny = sae_streaming_plan_from_budget(
+            120,
+            3,
+            1,
+            1,
+            1,
+            2,
+            6,
+            budget,
+            SAE_CPU_L2_CACHE_BYTES,
+            avail,
+        );
         assert!(
             tiny.estimated_direct_peak_bytes <= SAE_DIRECT_ALWAYS_ADMIT_BYTES,
             "toy plan should be far below the always-admit size, got {} bytes",
@@ -939,6 +966,8 @@ mod host_in_core_budget_tests {
             4_096,
             8,
             8,
+            7 + 8 * 8,
+            64 / 4_096,
             64,
             budget,
             SAE_CPU_L2_CACHE_BYTES,
@@ -1001,11 +1030,18 @@ mod exact_stationarity_admission_tests {
 
     fn plan_at(available: usize) -> SaeStreamingPlan {
         let (n_obs, total_basis, k_atoms, d_max, border_dim) = WITNESS;
+        // The measured row block: 7 free softmax logits + 8 circle coordinates.
+        let row_dim = (k_atoms - 1) + k_atoms * d_max;
+        // `border = 72` is the factored (framed) border, whose per-row slab is
+        // that width.
+        let row_cross_width = border_dim;
         sae_streaming_plan_from_budget(
             n_obs,
             total_basis,
             k_atoms,
             d_max,
+            row_dim,
+            row_cross_width,
             border_dim,
             sae_host_in_core_budget_from_available(available),
             SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE,
@@ -1119,8 +1155,18 @@ mod exact_stationarity_admission_tests {
     #[test]
     fn a_toy_shape_survives_a_collapsed_budget() {
         let available = 200 * 1024 * 1024usize; // below the 256 MiB reserve floor.
-        let plan =
-            sae_streaming_plan_from_budget(120, 3, 1, 1, 6, 0, SAE_CPU_L2_CACHE_BYTES, available);
+        let plan = sae_streaming_plan_from_budget(
+            120,
+            3,
+            1,
+            1,
+            1,
+            2,
+            6,
+            0,
+            SAE_CPU_L2_CACHE_BYTES,
+            available,
+        );
         assert!(
             plan.estimated_exact_stationarity_bytes <= SAE_DIRECT_ALWAYS_ADMIT_BYTES,
             "the toy shape's exact route ({} B) should be far below the always-admit size",
@@ -1251,6 +1297,8 @@ mod frozen_host_sample_tests {
             total_basis,
             k_atoms,
             d_max,
+            (k_atoms - 1) + k_atoms * d_max,
+            border_dim / total_basis,
             border_dim,
             gam_gpu::GpuPolicy::Off,
             available,
@@ -1319,5 +1367,102 @@ mod frozen_host_sample_tests {
             roomy.process_available_bytes,
             roomy_again.process_available_bytes
         );
+    }
+}
+
+#[cfg(test)]
+mod matrix_free_admission_4262_tests {
+    //! #4262 — the matrix-free admission must price what the route keeps
+    //! resident, independently of the budget it is compared against.
+    //!
+    //! The old ledger sized its cross term from `budget / (n · (1+d) · p · 8)`
+    //! active atoms, so `peak ≤ budget` held by construction for every shape
+    //! whose fixed workspaces fit, and the gate decided nothing.
+    use super::*;
+
+    const GIB: usize = 1 << 30;
+
+    /// The issue's worked shape: Softmax, n = 200 000, K = 64, d = 2,
+    /// P = 512, M = 9 per atom, on a 64 GiB host.
+    const N: usize = 200_000;
+    const K: usize = 64;
+    const D: usize = 2;
+    const P: usize = 512;
+    const TOTAL_BASIS: usize = K * 9;
+    const BORDER: usize = TOTAL_BASIS * P;
+
+    fn plan(row_dim: usize, available: usize) -> SaeStreamingPlan {
+        sae_streaming_plan_from_budget(
+            N,
+            TOTAL_BASIS,
+            K,
+            D,
+            row_dim,
+            P,
+            BORDER,
+            sae_host_in_core_budget_from_available(available),
+            SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE,
+            available,
+        )
+    }
+
+    #[test]
+    fn dense_support_matrix_free_admission_prices_kron_jac_4262() {
+        // Softmax row block: K − 1 free logits plus K two-dimensional charts.
+        let q_row = (K - 1) + K * D;
+        assert_eq!(q_row, 191);
+        let plan = plan(q_row, 64 * GIB);
+        // The per-row local Jacobian alone is n · q_row · P f64.
+        let kron_jac_bytes = N * q_row * P * SAE_BYTES_PER_F64;
+        assert!(
+            plan.estimated_matrix_free_peak_bytes >= kron_jac_bytes,
+            "matrix-free peak {} must cover the resident kron_jac {kron_jac_bytes}",
+            plan.estimated_matrix_free_peak_bytes
+        );
+        assert!(
+            kron_jac_bytes > plan.in_core_budget_bytes,
+            "premise: the shape's kron_jac ({kron_jac_bytes} B) exceeds the budget ({} B)",
+            plan.in_core_budget_bytes
+        );
+        assert!(!plan.direct_admitted, "the dense row-cross slab cannot fit");
+        assert!(
+            !plan.matrix_free_admitted,
+            "a route whose resident Jacobians exceed the budget must be refused; got {plan:?}"
+        );
+        assert!(plan.admitted_or_error(N, P, K).is_err());
+    }
+
+    #[test]
+    fn matrix_free_peak_does_not_depend_on_the_budget_4262() {
+        let q_row = (K - 1) + K * D;
+        let small = plan(q_row, 16 * GIB);
+        let large = plan(q_row, 4096 * GIB);
+        assert!(small.in_core_budget_bytes < large.in_core_budget_bytes);
+        assert_eq!(
+            small.estimated_matrix_free_peak_bytes, large.estimated_matrix_free_peak_bytes,
+            "the priced working set is a property of the shape, not of the budget"
+        );
+        assert!(!small.matrix_free_admitted);
+        assert!(
+            large.matrix_free_admitted,
+            "a budget that covers the resident set must still admit it, or the gate refuses \
+             everything and proves nothing"
+        );
+    }
+
+    #[test]
+    fn topk_rows_price_only_their_active_charts_4262() {
+        // TopK with k = 4: no gate coordinates, the 4 selected two-dimensional
+        // charts per row. Same shape and host as the refused Softmax fit.
+        let q_row = 4 * D;
+        let plan = plan(q_row, 64 * GIB);
+        let kron_jac_bytes = N * q_row * P * SAE_BYTES_PER_F64;
+        let row_block_bytes = N * (2 * q_row * q_row + q_row) * SAE_BYTES_PER_F64;
+        assert!(plan.estimated_matrix_free_peak_bytes >= kron_jac_bytes + row_block_bytes);
+        assert!(
+            plan.matrix_free_admitted,
+            "a sparse-support fit whose resident set fits must be admitted; got {plan:?}"
+        );
+        assert!(plan.admitted_or_error(N, P, K).is_ok());
     }
 }

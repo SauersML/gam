@@ -468,6 +468,30 @@ impl SaeAssignment {
         self.assignment_coord_dim() + self.total_coord_dim()
     }
 
+    /// The widest per-row inner block the Arrow-Schur assembly allocates
+    /// (#4262), the `q_row` every per-row resident buffer is sized by.
+    ///
+    /// Dense-support families (Softmax, ordered Beta–Bernoulli, threshold
+    /// gates) have nonzero derivatives on every atom, so each row carries the
+    /// full `row_block_dim()`. Hard TopK rows carry only their selected atoms'
+    /// chart coordinates, `Σ_{k ∈ support_i} d_k` (`SaeRowLayout`), and no gate
+    /// coordinates; the widest such row takes the `k` largest atom dimensions.
+    /// The bound is exact for dense support and attained under TopK whenever a
+    /// row selects the `k` widest charts, so a memory ledger priced on it never
+    /// under-counts a row.
+    pub(crate) fn row_block_dim_bound(&self) -> usize {
+        match self.mode {
+            AssignmentMode::TopK { k } => {
+                let mut dims: Vec<usize> = self.coords.iter().map(|c| c.latent_dim()).collect();
+                dims.sort_unstable_by(|a, b| b.cmp(a));
+                dims.iter().take(k).sum()
+            }
+            AssignmentMode::Softmax { .. }
+            | AssignmentMode::OrderedBetaBernoulli { .. }
+            | AssignmentMode::ThresholdGate { .. } => self.row_block_dim(),
+        }
+    }
+
     pub(crate) fn coord_offsets(&self) -> Vec<usize> {
         let mut out = Vec::with_capacity(self.k_atoms());
         let mut cursor = self.assignment_coord_dim();
@@ -997,6 +1021,57 @@ mod topk_support_gate_tests {
         assert!(
             AssignmentMode::top_k_support(0).validate().is_err(),
             "k = 0 must be rejected"
+        );
+    }
+
+    /// #4262 — the per-row block the memory ledger prices. Dense support
+    /// carries the full `row_block_dim()` (gate coordinates plus every chart);
+    /// TopK carries only the `k` widest charts and no gate coordinate.
+    #[test]
+    fn row_block_dim_bound_is_the_widest_allocated_row_4262() {
+        let n = 3usize;
+        let dims = [1usize, 3, 2, 2];
+        let k_atoms = dims.len();
+        let build = |mode: AssignmentMode| {
+            let logits =
+                Array2::from_shape_fn((n, k_atoms), |(i, kk)| 0.2 * (i as f64) - 0.3 * (kk as f64));
+            let coords: Vec<Array2<f64>> = dims
+                .iter()
+                .map(|&d| Array2::from_shape_fn((n, d), |(i, c)| 0.1 * (i + c) as f64))
+                .collect();
+            SaeAssignment::from_blocks_with_mode_and_manifolds(
+                logits,
+                coords,
+                vec![LatentManifold::Euclidean; k_atoms],
+                mode,
+            )
+            .expect("assignment builds")
+        };
+        let total: usize = dims.iter().sum();
+        let softmax = build(AssignmentMode::softmax(1.0));
+        assert_eq!(softmax.row_block_dim_bound(), (k_atoms - 1) + total);
+        assert_eq!(softmax.row_block_dim_bound(), softmax.row_block_dim());
+        let obb = build(AssignmentMode::ordered_beta_bernoulli(0.5, 1.0, false));
+        assert_eq!(obb.row_block_dim_bound(), k_atoms + total);
+        let gate = build(AssignmentMode::threshold_gate(0.5, 0.0));
+        assert_eq!(gate.row_block_dim_bound(), k_atoms + total);
+        // TopK: the widest row picks the k largest charts {3, 2, ...}.
+        assert_eq!(
+            build(AssignmentMode::top_k_support(1)).row_block_dim_bound(),
+            3
+        );
+        assert_eq!(
+            build(AssignmentMode::top_k_support(2)).row_block_dim_bound(),
+            5
+        );
+        assert_eq!(
+            build(AssignmentMode::top_k_support(3)).row_block_dim_bound(),
+            7
+        );
+        assert_eq!(
+            build(AssignmentMode::top_k_support(9)).row_block_dim_bound(),
+            total,
+            "k >= K is all-active: every chart, still no gate coordinate"
         );
     }
 }

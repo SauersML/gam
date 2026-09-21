@@ -2785,10 +2785,28 @@ impl SaeManifoldTerm {
             total_basis,
             self.k_atoms(),
             d_max,
+            self.assignment.row_block_dim_bound(),
+            self.matrix_free_row_cross_width(),
             border_dim,
             self.gpu_policy,
             self.host_available_bytes,
         )
+    }
+
+    /// #4262 — the per-row cross-block width the Arrow-Schur assembly keeps
+    /// resident for every row on the matrix-free route, the `row_cross_width`
+    /// the streaming plan prices. It mirrors the assembly's own branches:
+    /// fixed-decoder passes build no β tier; engaged frames hold the dense
+    /// `H_tβ` slab at the factored border width; otherwise the Kronecker
+    /// operator holds the `q_row × p` local Jacobian `kron_jac`.
+    pub(crate) fn matrix_free_row_cross_width(&self) -> usize {
+        if self.fixed_decoder_assembly {
+            0
+        } else if self.any_frame_active() {
+            self.factored_border_dim()
+        } else {
+            self.output_dim()
+        }
     }
 
     /// Construction-time validation: every Psi-tier analytic penalty in the
