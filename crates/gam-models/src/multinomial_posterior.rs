@@ -231,8 +231,13 @@ pub fn integrate_multinomial_design_moments(
         for a in 0..m {
             active_mean[a] = x.dot(&coefficients.column(a));
         }
+        // `V = (I_M ⊗ x)ᵀ Σ (I_M ⊗ x)` is a congruence of `Σ`, and a congruence
+        // of a symmetric matrix is symmetric. Form it from the symmetric part
+        // `½(Σ + Σᵀ)` and write each off-diagonal pair once, so `V` is symmetric
+        // BY CONSTRUCTION, bit for bit, and reads both triangles of `Σ` equally
+        // rather than whichever one a loop order happened to reach (gam#3245).
         for a in 0..m {
-            for b in 0..m {
+            for b in a..m {
                 let mut value = 0.0_f64;
                 let a_base = a * p;
                 let b_base = b * p;
@@ -243,11 +248,15 @@ pub fn integrate_multinomial_design_moments(
                     }
                     let mut row_product = 0.0_f64;
                     for j in 0..p {
-                        row_product += coefficient_covariance[[a_base + i, b_base + j]] * x[j];
+                        let sigma = 0.5
+                            * (coefficient_covariance[[a_base + i, b_base + j]]
+                                + coefficient_covariance[[b_base + j, a_base + i]]);
+                        row_product += sigma * x[j];
                     }
                     value += xi * row_product;
                 }
                 active_covariance[[a, b]] = value;
+                active_covariance[[b, a]] = value;
             }
         }
         let moments = integrate_logistic_normal_softmax_moments_with_rule_ladder(
@@ -485,11 +494,12 @@ fn validate_inputs(
     Ok(())
 }
 
-/// Nearest symmetric matrix to `covariance` in the Frobenius norm.
+/// Symmetric part `½(C + Cᵀ)` of `covariance`: the unique symmetric matrix
+/// with the same quadratic form, and the nearest one in the Frobenius norm.
 ///
-/// The inputs to this module are symmetric by construction; this removes the
-/// roundoff-level asymmetry their assembly chain leaves behind, so the
-/// integration cannot depend on which triangle a downstream routine reads.
+/// The integration then cannot depend on which triangle a downstream
+/// eigenroutine reads. On the design-moment path `C` is already symmetric by
+/// construction and this is the identity, bit for bit.
 fn symmetrized_covariance(covariance: ArrayView2<'_, f64>) -> Array2<f64> {
     let m = covariance.nrows();
     let mut out = covariance.to_owned();
