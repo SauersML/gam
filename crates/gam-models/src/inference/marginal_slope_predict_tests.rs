@@ -382,9 +382,8 @@ fn conditional_latent_calibration_conditions_on_the_named_design_block() {
     // `m(C) = 0.25 + 0.5·x`, `v(C) ≡ 0.64` (mean-only correction, so `√v = 0.8`).
     let calibration = LatentZConditionalCalibration {
         mean_coeffs: vec![0.25, 0.5],
-        var_coeffs: Vec::new(),
+        log_var_coeffs: Vec::new(),
         basis_ncols: 1,
-        var_floor: 1e-8,
         homoskedastic_var: 0.64,
         post_mean: 0.0,
         post_sd: 1.0,

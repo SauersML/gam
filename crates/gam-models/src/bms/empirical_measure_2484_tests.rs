@@ -639,9 +639,8 @@ fn the_assembled_correction_is_psd_and_strictly_widens_the_naive_interval_2484()
     }
     let calibration = super::LatentZConditionalCalibration {
         mean_coeffs: vec![0.05, 0.31],
-        var_coeffs: vec![0.9, 0.12],
+        log_var_coeffs: vec![-0.1, 0.13],
         basis_ncols,
-        var_floor: 1.0e-6,
         homoskedastic_var: 0.9,
         post_mean: 0.0,
         post_sd: 1.0,

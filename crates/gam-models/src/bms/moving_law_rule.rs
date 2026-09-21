@@ -1017,7 +1017,7 @@ impl MovingLawCandidates {
                         z,
                         &fold_weights,
                         conditioning,
-                        !full.var_coeffs.is_empty(),
+                        !full.log_var_coeffs.is_empty(),
                     )
                     .map_err(|reason| refusal(held_out, arm, reason))?;
                     for &row in rows {

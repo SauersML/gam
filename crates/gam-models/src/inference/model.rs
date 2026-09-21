@@ -71,7 +71,12 @@ pub const SAVED_MODEL_KIND: &str = "gam";
 // v37 moves the version out of the payload and into the shared `{kind, version, model}`
 // envelope, stores the fit once (the `unified` copy of `fit_result` is gone) and reads the
 // file in one streaming pass (#3350).
-pub const MODEL_PAYLOAD_VERSION: u32 = 37;
+// v38 fits the latent-Z calibration's conditional variance log-linearly,
+// `log v(C) = γ·[1 | a(C)]` (gam#4019), stored as `log_var_coeffs`, and deletes the
+// linear fit's `var_coeffs` and `var_floor`; the variance stage of `theta1_cov` is in
+// log units. A v37 document carries the linear pair and no `log_var_coeffs`, so it is a
+// different wire shape at the same field names and must not be read as this one.
+pub const MODEL_PAYLOAD_VERSION: u32 = 38;
 
 /// Coefficient parameterization of a saved transformation-normal (CTN) fit.
 ///

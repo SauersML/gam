@@ -3,7 +3,7 @@
 //!
 //! When the automatic conditional location-scale gate fires, the fit consumes a
 //! score `ζ = (z − m̂(C))/√v̂(C)` whose first stage `θ₁ = (mean_coeffs,
-//! var_coeffs)` was *estimated from the same data*. The joint solve treats ζ as
+//! log_var_coeffs)` was *estimated from the same data*. The joint solve treats ζ as
 //! KNOWN, so `covariance_conditional` is the naive second-stage covariance
 //! `H_β⁻¹`. The honest two-stage covariance is
 //!

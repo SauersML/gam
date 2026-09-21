@@ -4,11 +4,13 @@
 //!
 //! Two arms:
 //!
-//!   - an exact pin of the inverse bread: perturb the score `z → z + tδ`, refit,
-//!     and compare the central difference of the refit `θ̂₁` with `J⁻¹·∂ψ/∂t`.
-//!     The mean stage is linear in `z` and the variance stage quadratic, so a
-//!     central difference is EXACT up to roundoff; a reversed cross-stage block
-//!     (the gam#3047 sign) misses by the whole of `2K·g_m`.
+//!   - a pin of the inverse bread: perturb the score `z → z + tδ`, refit, and
+//!     compare the Richardson-extrapolated central difference of the refit `θ̂₁`
+//!     with `J⁻¹·∂ψ/∂t`. The mean stage is linear in `z`; the log-linear
+//!     variance stage (gam#4019) is the root of a smooth score, polished here to
+//!     that root, so the difference carries an `O(h⁴)` truncation and roundoff
+//!     only; a reversed cross-stage block (the gam#3047 sign) misses by the
+//!     whole of `2K·g_m`.
 //!   - a Monte Carlo coverage audit of the second-stage slope interval the
 //!     Murphy–Topel correction produces, on both variance stages, which fails on
 //!     over-coverage exactly as on under-coverage: the reversed sign made the
@@ -21,18 +23,18 @@ use super::{
     stacked_first_stage_inverse_bread,
 };
 use gam_math::probability::normal_cdf;
+use gam_math::special::gauss_legendre;
 use gam_test_support::calibration::{
     COVERAGE_FALSE_POSITIVE_RATE, COVERAGE_NOMINAL_LEVELS, COVERAGE_REPLICATIONS,
     CalibrationRng, CoverageClass, audit_coverage, standard_normal_quantile,
 };
 use ndarray::{Array1, Array2, s};
 
-/// Moments of `a ~ U(−1, 1)`: `E a² = 1/3`, `E a⁴ = 1/5`, odd moments zero.
+/// `E a² = 1/3` of `a ~ U(−1, 1)`.
 const A_SECOND_MOMENT: f64 = 1.0 / 3.0;
-const A_FOURTH_MOMENT: f64 = 1.0 / 5.0;
 /// `z = QUAD·a² + LIN·a + e`: the quadratic term makes the linear conditional
 /// mean MISSPECIFIED, so the mean residual is correlated with `a²` and the
-/// cross-stage bread `M_vm = −2 Σ w û B Aᵀ` is O(n) rather than ≈ 0.
+/// cross-stage bread `M_vm = −2 Σ w (û/v) B Aᵀ` is O(n) rather than ≈ 0.
 const QUAD: f64 = 0.8;
 const LIN: f64 = 0.3;
 /// `e = ξ·(SCALE0 + SCALE1·a)` with `ξ = (U² − E U²)/sd(U²)`, `U ~ U(0, 1)`:
@@ -73,29 +75,132 @@ fn draw_design(rng: &mut CalibrationRng, n: usize) -> (Array2<f64>, Array1<f64>)
 ///
 /// The linear projection of `z` on `[1, a]` is `(QUAD·E a², LIN)`. The mean
 /// residual is `u = QUAD(a² − E a²) + e`, so
-/// `E[u² | a] = QUAD²(a² − E a²)² + (SCALE0 + SCALE1·a)²`, whose projection on
-/// `[1, a]` has intercept `E u² = QUAD²·Var(a²) + SCALE0² + SCALE1²·E a²` and
-/// slope `2·SCALE0·SCALE1` (the only odd part). The constant stage is the
-/// intercept alone.
-fn pseudo_truth() -> ([f64; 2], [f64; 2]) {
-    let var_a2 = A_FOURTH_MOMENT - A_SECOND_MOMENT * A_SECOND_MOMENT;
+/// `s(a) = E[u² | a] = QUAD²(a² − E a²)² + (SCALE0 + SCALE1·a)²`. The constant
+/// stage's pseudo-truth is `log E u²`. The fired stage's is the root `γ*` of the
+/// population log-linear score `E[B (s(a)·exp(−Bᵀγ) − 1)] = 0`, `B = [1, a]`:
+/// `s` is not log-linear, so `γ*` is the Kullback-Leibler projection rather than
+/// a closed form. Its integrand is a quartic times an exponential, which a
+/// 64-point Gauss-Legendre rule integrates to roundoff, and the population
+/// information is positive definite, so Newton converges from `(log E u², 0)`.
+/// Returns `(mean, fired log-variance γ*, constant log-variance)`.
+fn pseudo_truth() -> ([f64; 2], [f64; 2], f64) {
     let mean = [QUAD * A_SECOND_MOMENT, LIN];
-    let var = [
-        QUAD * QUAD * var_a2 + SCALE0 * SCALE0 + SCALE1 * SCALE1 * A_SECOND_MOMENT,
-        2.0 * SCALE0 * SCALE1,
-    ];
-    (mean, var)
+    let (nodes, rule_weights) = gauss_legendre(64);
+    // `a ~ U(−1, 1)` has density 1/2 on the rule's interval.
+    let conditional_second_moment = |a: f64| {
+        let centred = a * a - A_SECOND_MOMENT;
+        QUAD * QUAD * centred * centred + (SCALE0 + SCALE1 * a).powi(2)
+    };
+    let second_moment = nodes
+        .iter()
+        .zip(rule_weights.iter())
+        .map(|(&a, &w)| 0.5 * w * conditional_second_moment(a))
+        .sum::<f64>();
+    let rows: Vec<(f64, f64, f64)> = nodes
+        .iter()
+        .zip(rule_weights.iter())
+        .map(|(&a, &w)| (a, 0.5 * w, conditional_second_moment(a)))
+        .collect();
+    let gamma = newton_log_linear_root([second_moment.ln(), 0.0], |gamma| {
+        let mut score = [0.0; 2];
+        let mut information = [[0.0; 2]; 2];
+        for &(a, w, s) in &rows {
+            let ratio = s * (-(gamma[0] + gamma[1] * a)).exp();
+            let basis = [1.0, a];
+            for j in 0..2 {
+                score[j] += w * basis[j] * (ratio - 1.0);
+                for k in 0..2 {
+                    information[j][k] += w * ratio * basis[j] * basis[k];
+                }
+            }
+        }
+        (score, information)
+    });
+    (mean, gamma, second_moment.ln())
+}
+
+/// Newton's method on a two-parameter log-linear variance score from a start
+/// inside its quadratic basin, run until a step stops contracting -- the point at
+/// which roundoff, not the iteration, sets the error. `system(γ)` returns the
+/// score and the (positive-definite) information `−∂score/∂γ`.
+fn newton_log_linear_root(
+    start: [f64; 2],
+    system: impl Fn([f64; 2]) -> ([f64; 2], [[f64; 2]; 2]),
+) -> [f64; 2] {
+    let mut gamma = start;
+    let mut previous = f64::INFINITY;
+    loop {
+        let (score, info) = system(gamma);
+        let det = info[0][0] * info[1][1] - info[0][1] * info[1][0];
+        let step = [
+            (info[1][1] * score[0] - info[0][1] * score[1]) / det,
+            (info[0][0] * score[1] - info[1][0] * score[0]) / det,
+        ];
+        let size = step[0].hypot(step[1]);
+        if !(size < previous) {
+            return gamma;
+        }
+        gamma = [gamma[0] + step[0], gamma[1] + step[1]];
+        previous = size;
+    }
 }
 
 /// The refit's `θ₁ = (mean_coeffs, variance stage)`, in the coordinates of
-/// `theta1_cov`.
+/// `theta1_cov`: the constant stage is `log homoskedastic_var`.
 fn theta1(cal: &LatentZConditionalCalibration) -> Vec<f64> {
     let mut theta = cal.mean_coeffs.clone();
-    if cal.var_coeffs.is_empty() {
-        theta.push(cal.homoskedastic_var);
+    if cal.log_var_coeffs.is_empty() {
+        theta.push(cal.homoskedastic_var.ln());
     } else {
-        theta.extend_from_slice(&cal.var_coeffs);
+        theta.extend_from_slice(&cal.log_var_coeffs);
     }
+    theta
+}
+
+/// [`theta1`] with the fired stage's `γ̂` polished to the exact root of its
+/// score `Σ w B (û²/v − 1)` at the refit's own mean residuals `û`. The
+/// production fit stops on its likelihood's rounding band, which leaves `γ̂`
+/// within `O(√ε)` of the root -- statistically nothing, but a difference
+/// quotient divides that by the step. Newton from there converges quadratically,
+/// so the pin compares `J⁻¹` with the derivative of the root itself, which is
+/// what `J⁻¹` claims to be.
+fn theta1_at_root(
+    cal: &LatentZConditionalCalibration,
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    a_block: &Array2<f64>,
+) -> Vec<f64> {
+    let mut theta = theta1(cal);
+    if cal.log_var_coeffs.is_empty() {
+        return theta;
+    }
+    let rows: Vec<(f64, f64, f64)> = (0..z.len())
+        .map(|i| {
+            let a = a_block[[i, 0]];
+            let u = z[i] - LatentZConditionalCalibration::affine(&cal.mean_coeffs, a_block.row(i));
+            (a, weights[i], u * u)
+        })
+        .collect();
+    let gamma = newton_log_linear_root(
+        [cal.log_var_coeffs[0], cal.log_var_coeffs[1]],
+        |gamma| {
+            let mut score = [0.0; 2];
+            let mut information = [[0.0; 2]; 2];
+            for &(a, w, u2) in &rows {
+                let ratio = u2 * (-(gamma[0] + gamma[1] * a)).exp();
+                let basis = [1.0, a];
+                for j in 0..2 {
+                    score[j] += w * basis[j] * (ratio - 1.0);
+                    for k in 0..2 {
+                        information[j][k] += w * ratio * basis[j] * basis[k];
+                    }
+                }
+            }
+            (score, information)
+        },
+    );
+    let p = cal.mean_coeffs.len();
+    theta[p..].copy_from_slice(&gamma);
     theta
 }
 
@@ -110,7 +215,7 @@ fn inverse_bread_pin(fit_variance: bool) -> (f64, f64) {
 
     let cal = fit_conditional_latent_calibration(&z, &weights, a_block.view(), fit_variance)
         .expect("base fit");
-    assert_eq!(cal.var_coeffs.is_empty(), !fit_variance);
+    assert_eq!(cal.log_var_coeffs.is_empty(), !fit_variance);
     assert_eq!(cal.theta1_dim(), theta1(&cal).len());
     assert_eq!(cal.theta1_cov.dim(), (cal.theta1_dim(), cal.theta1_dim()));
 
@@ -132,13 +237,16 @@ fn inverse_bread_pin(fit_variance: bool) -> (f64, f64) {
     let mean_residuals: Vec<f64> = (0..n)
         .map(|i| z[i] - LatentZConditionalCalibration::affine(&cal.mean_coeffs, a_block.row(i)))
         .collect();
-    let (var_basis, var_normal) = if fit_variance {
-        (basis.clone(), mean_normal.clone())
+    // The system at the base root: the polished `γ̂` and its fitted `v_i`.
+    let base_theta = theta1_at_root(&cal, &z, &weights, &a_block);
+    let (var_basis, var_fitted): (Array2<f64>, Vec<f64>) = if fit_variance {
+        let gamma = &base_theta[p..];
+        let fitted = (0..n)
+            .map(|i| (gamma[0] + gamma[1] * a_block[[i, 0]]).exp())
+            .collect();
+        (basis.clone(), fitted)
     } else {
-        (
-            Array2::<f64>::ones((n, 1)),
-            Array2::from_elem((1, 1), weights.sum()),
-        )
+        (Array2::<f64>::ones((n, 1)), vec![cal.homoskedastic_var; n])
     };
     let q = var_basis.ncols();
     let j_inv = stacked_first_stage_inverse_bread(
@@ -146,45 +254,54 @@ fn inverse_bread_pin(fit_variance: bool) -> (f64, f64) {
         var_basis.view(),
         weights.view(),
         &mean_residuals,
+        &var_fitted,
         &mean_normal,
-        &var_normal,
     )
     .expect("inverse bread");
 
-    // ∂ψ/∂t at t = 0: ψ^m = Σ w A û, ψ^v = Σ w B (û² − Bᵀβ_v), û = z + tδ − Aᵀβ_m.
+    // ∂ψ/∂t at t = 0: ψ^m = Σ w A û, ψ^v = Σ w B (û²/v − 1), û = z + tδ − Aᵀβ_m.
     let mut g = Array1::<f64>::zeros(p + q);
     for i in 0..n {
         for j in 0..p {
             g[j] += weights[i] * basis[[i, j]] * delta[i];
         }
         for j in 0..q {
-            g[p + j] += 2.0 * weights[i] * mean_residuals[i] * var_basis[[i, j]] * delta[i];
+            g[p + j] += 2.0 * weights[i] * mean_residuals[i] / var_fitted[i]
+                * var_basis[[i, j]]
+                * delta[i];
         }
     }
     let predicted = j_inv.dot(&g);
 
-    // The gam#3047 mutant: the pre-fix `K = −M⁻¹·M_vm·M⁻¹`, which on the fired
-    // stage (`N = M`) is exactly the reversed sign of `N⁻¹·M_vm·M⁻¹`.
+    // The gam#3047 mutant: the reversed sign of the cross-stage block `K`.
     let mut mutant = j_inv.clone();
     mutant.slice_mut(s![p.., ..p]).mapv_inplace(|entry| -entry);
     let mutant_predicted = mutant.dot(&g);
 
-    // The mean stage is linear in z and the variance stage quadratic, so the
-    // central difference is exact; the step only sets the roundoff scale.
+    // The refit root is smooth in t, so the central difference `D(h)` carries
+    // an even series `D(h) = θ' + c₂h² + c₄h⁴ + …`, and the Richardson
+    // combination `(4·D(h/2) − D(h))/3` cancels the `h²` term.
     let step = 1.0e-3;
     let refit = |t: f64| {
         let zt = &z + &(&delta * t);
-        theta1(
-            &fit_conditional_latent_calibration(&zt, &weights, a_block.view(), fit_variance)
-                .expect("perturbed fit"),
-        )
+        let cal_t = fit_conditional_latent_calibration(&zt, &weights, a_block.view(), fit_variance)
+            .expect("perturbed fit");
+        theta1_at_root(&cal_t, &zt, &weights, &a_block)
     };
-    let plus = refit(step);
-    let minus = refit(-step);
-    let observed: Vec<f64> = plus
+    let central = |h: f64| -> Vec<f64> {
+        let plus = refit(h);
+        let minus = refit(-h);
+        plus.iter()
+            .zip(minus.iter())
+            .map(|(a, b)| (a - b) / (2.0 * h))
+            .collect()
+    };
+    let coarse = central(step);
+    let fine = central(0.5 * step);
+    let observed: Vec<f64> = fine
         .iter()
-        .zip(minus.iter())
-        .map(|(a, b)| (a - b) / (2.0 * step))
+        .zip(coarse.iter())
+        .map(|(f, c)| (4.0 * f - c) / 3.0)
         .collect();
     let scale = observed.iter().map(|v| v * v).sum::<f64>().sqrt();
     let rel_err = |pred: &Array1<f64>| {
@@ -199,10 +316,12 @@ fn inverse_bread_pin(fit_variance: bool) -> (f64, f64) {
     (rel_err(&predicted), rel_err(&mutant_predicted))
 }
 
-/// The roundoff budget of the exact pin. A central difference of an O(1)
-/// quadratic at step `h = 1e-3` carries `ε/h ≈ 2e-13` of cancellation error
-/// per coordinate, amplified by the conditioning of the O(n) normal systems;
-/// `√ε` bounds that with room, and a reversed `K` misses by O(1).
+/// The error budget of the pin. The Richardson-extrapolated central difference
+/// at `h = 1e-3` leaves an `O(h⁴) ≈ 1e-12` truncation of an O(1) smooth root and
+/// `ε/h ≈ 2e-13` of cancellation error per coordinate, amplified by the
+/// conditioning of the O(n) normal systems; `√ε` bounds that with room (a numpy
+/// replica of this pin measured 3.8e-12 fired and 2.2e-12 constant), and a
+/// reversed `K` misses by O(1).
 fn pin_tolerance() -> f64 {
     f64::EPSILON.sqrt()
 }
@@ -227,8 +346,8 @@ fn inverse_bread_matches_the_refit_on_the_constant_variance_stage_3030() {
     let (err, _) = inverse_bread_pin(false);
     assert!(
         err <= pin_tolerance(),
-        "gam#3030: the constant variance stage v̂ = Σwû²/Σw must be propagated by the same \
-         inverse bread; relative error {err:.3e}"
+        "gam#3030: the constant variance stage log v̂ = log(Σwû²/Σw) must be propagated by the \
+         same inverse bread; relative error {err:.3e}"
     );
 }
 
@@ -247,7 +366,7 @@ const COVERAGE_SAMPLE_SIZE: usize = 2000;
 /// [`COVERAGE_NOMINAL_LEVELS`] and the two-sided Wald p-values.
 fn slope_coverage(fit_variance: bool, seed: u64) -> ([usize; 3], Vec<f64>) {
     let n = COVERAGE_SAMPLE_SIZE;
-    let (mean_star, var_star) = pseudo_truth();
+    let (mean_star, log_var_star, constant_log_var_star) = pseudo_truth();
     let z_crit: Vec<f64> = COVERAGE_NOMINAL_LEVELS
         .iter()
         .map(|&c| standard_normal_quantile(0.5 + 0.5 * c))
@@ -262,9 +381,9 @@ fn slope_coverage(fit_variance: bool, seed: u64) -> ([usize; 3], Vec<f64>) {
             .map(|i| {
                 let a = a_block[[i, 0]];
                 let v = if fit_variance {
-                    var_star[0] + var_star[1] * a
+                    (log_var_star[0] + log_var_star[1] * a).exp()
                 } else {
-                    var_star[0]
+                    constant_log_var_star.exp()
                 };
                 let zeta_star = (z[i] - mean_star[0] - mean_star[1] * a) / v.sqrt();
                 BETA * zeta_star + SIGMA * rng.standard_normal()
@@ -352,3 +471,88 @@ fn slope_interval_is_calibrated_on_the_constant_variance_stage_3030() {
     assert_slope_interval_calibrated(false, 0x3030_c0de, "gam#3030");
 }
 
+/// gam#4019: under multiplicative heteroskedasticity `Var(z | a) = e^a` -- convex
+/// in `a`, where the retired linear variance stage went negative on the lower
+/// sixth of the span and was floored at `1e-3·Var(z)`, leaving `sd(ζ)` at 7-11
+/// there -- the log-linear stage must recover the variance law and standardise
+/// `ζ` on every stretch of the span.
+///
+/// Design `a ~ N(0, 1)`, `z = 0.3·a + e^{a/2}·ε`, `ε ~ N(0, 1)`: the mean is
+/// linear and the variance log-linear with `γ* = (0, 1)` exactly. Every bound
+/// is a Wald bound at a Bonferroni split of [`COVERAGE_FALSE_POSITIVE_RATE`]
+/// over the two coefficients and the bins:
+///
+///   - `|γ̂_k − γ*_k| ≤ c·se_k` with `se` from the calibration's own stacked
+///     sandwich, so the covariance the Murphy–Topel correction consumes is
+///     audited on the same fit;
+///   - per bin, the root mean square of `ζ̂` (which is 1 for the true `ζ`)
+///     within `c·(1/√(2 n_b) + ½·max se(η̂(a)))`: the first term is the
+///     sampling SD of a Gaussian sample's RMS, the second the first-order
+///     effect `½·Δη` of the fitted log-variance's error on the scale, bounded
+///     at the bin's extreme rows. A numpy replica of this construction exceeded
+///     the combined bound on 1 of 200 seeds (familywise level 0.01), at 1.0015×.
+#[test]
+fn log_linear_variance_stage_standardises_zeta_under_multiplicative_heteroskedasticity_4019() {
+    let n = 20_000;
+    let mut rng = CalibrationRng::new(0x4019_0001);
+    let mut a_block = Array2::<f64>::zeros((n, 1));
+    let mut z = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let a = rng.standard_normal();
+        a_block[[i, 0]] = a;
+        z[i] = 0.3 * a + (0.5 * a).exp() * rng.standard_normal();
+    }
+    let weights = Array1::<f64>::ones(n);
+    let cal = fit_conditional_latent_calibration(&z, &weights, a_block.view(), true)
+        .expect("fired log-linear variance stage");
+    assert_eq!(cal.log_var_coeffs.len(), 2);
+    let p = cal.mean_coeffs.len();
+    let v_gamma = cal.theta1_cov.slice(s![p.., p..]).to_owned();
+
+    let edges = [f64::NEG_INFINITY, -2.0, -1.2, -0.8, 0.0, 1.0, f64::INFINITY];
+    let bins = edges.len() - 1;
+    let crit =
+        standard_normal_quantile(1.0 - COVERAGE_FALSE_POSITIVE_RATE / (2.0 * (bins + 2) as f64));
+
+    let gamma_star = [0.0, 1.0];
+    for k in 0..2 {
+        let se = v_gamma[[k, k]].sqrt();
+        let wald = (cal.log_var_coeffs[k] - gamma_star[k]).abs() / se;
+        assert!(
+            wald <= crit,
+            "gam#4019: log-variance coefficient {k} = {:.4} must recover the log-linear law's \
+             {} within {crit:.3} sandwich SEs ({se:.4}); Wald {wald:.3}",
+            cal.log_var_coeffs[k],
+            gamma_star[k]
+        );
+    }
+
+    let zeta = cal.apply(z.view(), a_block.view()).expect("ζ̂");
+    let se_eta = |a: f64| {
+        let c = [1.0, a];
+        let mut q = 0.0_f64;
+        for j in 0..2 {
+            for k in 0..2 {
+                q += c[j] * v_gamma[[j, k]] * c[k];
+            }
+        }
+        q.sqrt()
+    };
+    for window in edges.windows(2) {
+        let (lo, hi) = (window[0], window[1]);
+        let rows: Vec<usize> = (0..n)
+            .filter(|&i| a_block[[i, 0]] >= lo && a_block[[i, 0]] < hi)
+            .collect();
+        let n_b = rows.len() as f64;
+        let rms = (rows.iter().map(|&i| zeta[i] * zeta[i]).sum::<f64>() / n_b).sqrt();
+        let (a_min, a_max) = rows.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &i| {
+            (l.min(a_block[[i, 0]]), h.max(a_block[[i, 0]]))
+        });
+        let tolerance = crit * (1.0 / (2.0 * n_b).sqrt() + 0.5 * se_eta(a_min).max(se_eta(a_max)));
+        assert!(
+            (rms - 1.0).abs() <= tolerance,
+            "gam#4019: ζ̂ must be unit-scaled on a ∈ [{lo}, {hi}) ({n_b} rows); RMS {rms:.4}, \
+             tolerance {tolerance:.4}"
+        );
+    }
+}

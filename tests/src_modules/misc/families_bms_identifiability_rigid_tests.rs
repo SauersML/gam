@@ -7121,11 +7121,11 @@ fn first_stage_sandwich_is_finite_on_rank_deficient_normal_matrix() {
     normal_matrix[[0, 0]] *= 1.0 + AUTO_Z_CONDITIONAL_RIDGE_REL;
     normal_matrix[[1, 1]] *= 1.0 + AUTO_Z_CONDITIONAL_RIDGE_REL;
 
-    // The constant variance stage (`B = 1`, `N = Σw`) rides along; the mean
-    // block of the stacked sandwich is the standalone HC0 sandwich.
+    // The constant log-variance stage (`B = 1`, `v ≡ v̂ = 0.25 = mean û²`, so
+    // `N = Σ w û²/v = n`) rides along; the mean block of the stacked sandwich
+    // is the standalone HC0 sandwich.
     let var_basis = Array2::<f64>::ones((n, 1));
-    let var_normal = Array2::<f64>::from_elem((1, 1), n as f64);
-    let var_residuals: Vec<f64> = residuals.iter().map(|&e| e * e - 0.25).collect();
+    let var_fitted = vec![0.25; n];
     // The production covariance is the Gram of the stacked row influence
     // (gam#3452), so the test drives that path.
     let joint = stacked_first_stage_row_influence(
@@ -7133,9 +7133,8 @@ fn first_stage_sandwich_is_finite_on_rank_deficient_normal_matrix() {
         var_basis.view(),
         weights.view(),
         &residuals,
-        &var_residuals,
+        &var_fitted,
         &normal_matrix,
-        &var_normal,
     )
     .and_then(|psi| first_stage_covariance_from_row_influence(&psi))
     .unwrap_or_else(|e| {

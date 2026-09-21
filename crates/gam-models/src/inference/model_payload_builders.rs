@@ -2977,9 +2977,8 @@ mod joint_latent_law_save_tests {
         );
         let conditional = crate::bms::LatentZConditionalCalibration {
             mean_coeffs: vec![0.1, 0.4],
-            var_coeffs: Vec::new(),
+            log_var_coeffs: Vec::new(),
             basis_ncols: 1,
-            var_floor: 1e-6,
             homoskedastic_var: 1.0,
             post_mean: 0.0,
             post_sd: 1.0,
