@@ -2917,10 +2917,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     row,
                     partner,
                     block_states,
-                    &crate::bms::EmpiricalZGrid {
+                    &crate::bms::moving_law_rule::MovingLawRowLaw::Finite(crate::bms::EmpiricalZGrid {
                         nodes: vec![candidates.own_score(row)],
                         weights: vec![1.0],
-                    },
+                    }),
                 )?;
                 let arms = candidates
                     .row_laws(row)?

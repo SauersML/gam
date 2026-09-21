@@ -3040,24 +3040,36 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     /// The moving-law certificate's `(ln P, ln(1 − P))` of the row's anchor at
-    /// intercept `a` under the finite law `grid` (gam#2926): `P = Σ_k w_k Φ(η(u_k))`
-    /// for `η` the de-nested index, through
-    /// [`super::moving_law_rule::log_grid_anchor_probabilities`].
-    pub(super) fn empirical_grid_anchor_log_probabilities(
+    /// intercept `a` under one arm's law of the score (gam#2926, gam#4028):
+    /// `P = E[Φ(η(U))]` for `η` the de-nested index, `Σ_k w_k Φ(η(u_k))` on a
+    /// finite law and the exact integral over the index's cubic cells on a
+    /// Gaussian law, through
+    /// [`super::moving_law_rule::MovingLawRowLaw::denested_anchor_log_probabilities`].
+    pub(super) fn moving_law_anchor_log_probabilities(
         &self,
         a: f64,
         slope: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
-        grid: &EmpiricalZGrid,
+        law: &super::moving_law_rule::MovingLawRowLaw,
     ) -> Result<(f64, f64), super::moving_law_rule::MovingLawError> {
         use super::moving_law_rule::MovingLawError;
-        super::moving_law_rule::log_grid_anchor_probabilities(grid, |node| {
-            let obs = self
-                .observed_denested_cell_partials_at_z(node, a, slope, beta_h, beta_w)
-                .map_err(|reason| MovingLawError::AnchorProgram { reason })?;
-            Ok(eval_coeff4_at(&obs.coeff, node))
-        })
+        law.denested_anchor_log_probabilities(
+            |node| {
+                let obs = self
+                    .observed_denested_cell_partials_at_z(node, a, slope, beta_h, beta_w)
+                    .map_err(|reason| MovingLawError::AnchorProgram { reason })?;
+                Ok(eval_coeff4_at(&obs.coeff, node))
+            },
+            || {
+                Ok(self
+                    .denested_partition_cells(a, slope, beta_h, beta_w)
+                    .map_err(|reason| MovingLawError::AnchorProgram { reason })?
+                    .into_iter()
+                    .map(|partition| partition.cell)
+                    .collect())
+            },
+        )
     }
 
     /// The anchoring residual `Σ_k w_k Φ(η_k) − μ` at intercept `a` under the
