@@ -1,28 +1,35 @@
-//! Adversarial fit-quality stress probes across the geometric smooth families.
+//! Adversarial fit-quality stress probes across the geometric smooth
+//! families: high-frequency truths, sharp bumps, a near-flat signal,
+//! heteroscedastic noise, outliers, a sparse/dense design imbalance, a step,
+//! multicollinear tensor inputs, data spanning two declared periods, and
+//! sphere data on the polar caps only.
 //!
-//! These tests do NOT enforce tight numerical tolerances: their job is to
-//! generate honest, structured quality data by stressing each smooth with
-//! known-hard signals (high frequency, sharp bumps, discontinuities,
-//! heteroscedastic noise, outliers, etc.), fit it via `gam::fit_from_formula`,
-//! and categorize the result as PASS / DEGRADED / COLLAPSED based on the
-//! prediction RMSE relative to the noise scale and the recovered span
-//! relative to the truth span.
-//!
-//! Each probe `eprintln!`s a single `[fit-quality]` line so the user can grep
-//! the output. The only hard assertion is non-finiteness — a smooth that
-//! produces NaN/Inf is an actual bug and fails the test.
+//! Every probe is a well-posed request, so every probe must fit: a refusal
+//! fails it. Each fit is then scored against its known truth by
+//! `smooth_truth_scoring::fit_and_score`: the fit's smoothing-corrected
+//! posterior band must cover, across the function, the basis's best
+//! approximation `f_B` of the truth (the unpenalized least-squares
+//! projection of the noise-free training truth onto the fit's own design),
+//! with `Q` at most its Satterthwaite `χ²` bound at the family-wise rate
+//! `FAMILY_WISE_ALPHA` (one scored case per test). Where the basis expresses
+//! the truth, `f_B = f`; where it cannot (the step, a truth that violates the
+//! anchored end pins), `f_B` is the approximation floor no estimator in this
+//! basis can beat, printed as `floor` next to `rmse(f̂−f)`. A fit that keeps
+//! only part of the signal inflates `f̂ − f_B` while its band narrows, which
+//! drives `Q ≫ 1`: there is no partial-recovery pass (#4411).
 //!
 //! Deterministic LCG seeding is used throughout (no rand crate dependency on
 //! the noise streams) so reruns and CI are bit-identical.
 
+#[path = "../../common/misc/smooth_truth_scoring.rs"]
+mod smooth_truth_scoring;
+
 use csv::StringRecord;
-use gam::matrix::LinearOperator;
-use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::rmse;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use ndarray::Array2;
+use smooth_truth_scoring::{FAMILY_WISE_ALPHA, fit_and_score, probe_matrix};
 
 const TAU: f64 = std::f64::consts::TAU;
 const PI: f64 = std::f64::consts::PI;
@@ -64,128 +71,42 @@ impl Lcg {
     }
 }
 
-// ---------- categorization ----------
+// ---------- scoring ----------
 
-#[derive(Debug, Clone, Copy)]
-enum Category {
-    Pass,
-    Degraded,
-    Collapsed,
-}
-
-impl Category {
-    fn label(&self) -> &'static str {
-        match self {
-            Category::Pass => "PASS",
-            Category::Degraded => "DEGRADED",
-            Category::Collapsed => "COLLAPSED",
-        }
-    }
-}
-
-/// Classify based on rmse vs noise sd and recovered-span vs truth-span ratio.
-///
-/// Categories (in order of precedence):
-///   COLLAPSED if span_ratio < 0.30
-///   PASS      if rmse < 2 σ AND span_ratio >= 0.70
-///   DEGRADED  if rmse < 5 σ
-///   COLLAPSED otherwise
-fn categorize(rmse: f64, sigma: f64, span_ratio: f64) -> Category {
-    let sigma_eff = sigma.max(1e-9);
-    if span_ratio < 0.30 {
-        Category::Collapsed
-    } else if rmse < 2.0 * sigma_eff && span_ratio >= 0.70 {
-        Category::Pass
-    } else if rmse < 5.0 * sigma_eff {
-        Category::Degraded
-    } else {
-        Category::Collapsed
-    }
-}
-
-fn span(v: &[f64]) -> f64 {
-    let max = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let min = v.iter().cloned().fold(f64::INFINITY, f64::min);
-    max - min
-}
-
-fn truth_residual(yhat: &[f64], truth: &[f64]) -> f64 {
-    // L1 mean residual at truth — a complementary metric to rmse.
-    let n = yhat.len() as f64;
-    let s: f64 = yhat
-        .iter()
-        .zip(truth.iter())
-        .map(|(a, b)| (a - b).abs())
-        .sum();
-    s / n
-}
-
-fn check_finite(name: &str, formula: &str, yhat: &[f64], beta: &[f64]) {
-    let bad_pred = yhat.iter().filter(|v| !v.is_finite()).count();
-    let bad_beta = beta.iter().filter(|v| !v.is_finite()).count();
-    assert!(
-        bad_pred == 0 && bad_beta == 0,
-        "[fit-quality] {name} produced non-finite output: {bad_pred} bad preds, \
-         {bad_beta} bad betas — formula `{formula}`",
-    );
-}
-
-/// Emit a structured error category when fit-or-predict fails. The task
-/// asked us to hard-assert only on non-finite outputs — a fit that errors
-/// before producing any prediction is reported (not panicked) so the
-/// downstream probes still run and the suite produces an honest table.
-fn report_fit_error(probe: &str, formula: &str, err: &str) {
-    let cat = if err.contains("frozen identifiability transform mismatch") {
-        // Specific known ticket: see tests/bc_clamped_predict_shape_bug.rs.
-        "PREDICT_DESIGN_BUG"
-    } else if err.contains("rebuild design failed") {
-        "PREDICT_FAILED"
-    } else {
-        "FIT_FAILED"
-    };
-    eprintln!("[fit-quality] probe={probe} category={cat} formula=`{formula}` err=`{err}`",);
-    panic!("[fit-quality] probe={probe} category={cat} formula=`{formula}` err=`{err}`");
-}
-
-fn report(
+/// Fit `formula` and score it against the truth: `truth` at `probes`,
+/// `train_truth` (the noise-free signal) at the training rows.
+fn score(
     probe: &str,
     formula: &str,
-    rmse_val: f64,
-    sigma: f64,
-    span_fit: f64,
-    span_truth: f64,
-    extra: &str,
-) -> Category {
-    let ratio = if span_truth.abs() < 1e-12 {
-        1.0
-    } else {
-        span_fit / span_truth
-    };
-    let cat = categorize(rmse_val, sigma, ratio);
-    eprintln!(
-        "[fit-quality] probe={probe} category={cat} rmse={rmse_val:.4} \
-         sigma_noise={sigma:.4} span_fit={span_fit:.3} span_truth={span_truth:.3} \
-         span_ratio={ratio:.3}{ws}{extra} formula=`{formula}`",
-        cat = cat.label(),
-        ws = if extra.is_empty() { "" } else { " " },
-    );
-    assert!(
-        !matches!(cat, Category::Collapsed),
-        "probe {probe} collapsed"
-    );
-    cat
+    data: &gam::data::EncodedDataset,
+    probes: &Array2<f64>,
+    truth: &[f64],
+    train_truth: &[f64],
+) -> Result<(), String> {
+    fit_and_score(formula, data, probes, truth, train_truth, FAMILY_WISE_ALPHA)
+        .map(|_| ())
+        .map_err(|e| format!("probe {probe} `{formula}`: {e}"))
 }
 
-// ---------- dataset & predict helpers ----------
+/// Probe rows for a one-covariate table `[x, y]`.
+fn rows_1d(x: &[f64]) -> Array2<f64> {
+    probe_matrix(&x.iter().map(|&v| vec![v, 0.0]).collect::<Vec<_>>())
+}
+
+/// Probe rows for a two-covariate table `[a, b, y]`.
+fn rows_2d(a: &[f64], b: &[f64]) -> Array2<f64> {
+    probe_matrix(
+        &a.iter()
+            .zip(b)
+            .map(|(&u, &v)| vec![u, v, 0.0])
+            .collect::<Vec<_>>(),
+    )
+}
+
+// ---------- dataset helpers ----------
 
 fn make_dataset_1d(x: &[f64], y: &[f64]) -> gam::data::EncodedDataset {
-    let headers = ["x", "y"].into_iter().map(String::from).collect::<Vec<_>>();
-    let rows: Vec<StringRecord> = x
-        .iter()
-        .zip(y.iter())
-        .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
-        .collect();
-    encode_recordswith_inferred_schema(headers, rows).expect("encode 1d")
+    make_dataset_named_1d("x", x, y)
 }
 
 fn make_dataset_named_1d(x_name: &str, x: &[f64], y: &[f64]) -> gam::data::EncodedDataset {
@@ -221,58 +142,6 @@ fn make_dataset_2d_named(
     encode_recordswith_inferred_schema(headers, rows).expect("encode 2d")
 }
 
-fn fit_predict_1d(
-    formula: &str,
-    data: &gam::data::EncodedDataset,
-    x_grid: &[f64],
-) -> Result<(Vec<f64>, Vec<f64>), String> {
-    let cfg = FitConfig {
-        family: Some("gaussian".to_string()),
-        ..FitConfig::default()
-    };
-    let result = fit_from_formula(formula, data, &cfg)?;
-    let FitResult::Standard(fit) = result else {
-        return Err("expected standard fit".to_string());
-    };
-    let n = x_grid.len();
-    let mut m = Array2::<f64>::zeros((n, 2));
-    for i in 0..n {
-        m[[i, 0]] = x_grid[i];
-        m[[i, 1]] = 0.0;
-    }
-    let test_design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .map_err(|e| format!("rebuild design failed: {e:?}"))?;
-    let pred = test_design.design.apply(&fit.fit.beta).to_vec();
-    Ok((pred, fit.fit.beta.to_vec()))
-}
-
-fn fit_predict_2d(
-    formula: &str,
-    data: &gam::data::EncodedDataset,
-    a_grid: &[f64],
-    b_grid: &[f64],
-) -> Result<(Vec<f64>, Vec<f64>), String> {
-    let cfg = FitConfig {
-        family: Some("gaussian".to_string()),
-        ..FitConfig::default()
-    };
-    let result = fit_from_formula(formula, data, &cfg)?;
-    let FitResult::Standard(fit) = result else {
-        return Err("expected standard fit".to_string());
-    };
-    let n = a_grid.len();
-    let mut m = Array2::<f64>::zeros((n, 3));
-    for i in 0..n {
-        m[[i, 0]] = a_grid[i];
-        m[[i, 1]] = b_grid[i];
-        m[[i, 2]] = 0.0;
-    }
-    let test_design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .map_err(|e| format!("rebuild design failed: {e:?}"))?;
-    let pred = test_design.design.apply(&fit.fit.beta).to_vec();
-    Ok((pred, fit.fit.beta.to_vec()))
-}
-
 // =====================================================================
 // Probe 1: high-frequency truths sin(2π k x), k in {4, 6, 8, 10}
 // =====================================================================
@@ -295,26 +164,14 @@ fn hifreq_cyclic_probe(k: usize) -> Result<(), String> {
         .map(|i| TAU * (i as f64 + 0.5) / mgrid as f64)
         .collect();
     let truth: Vec<f64> = theta_grid.iter().map(|t| (k as f64 * t).sin()).collect();
-
-    let probe = format!("hifreq_cyclic_k{k}");
-    let (yhat, beta) = match fit_predict_1d(&formula, &data, &theta_grid) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error(&probe, &formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite(&probe, &formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    let l1 = truth_residual(&yhat, &truth);
-    let extra = format!("k={k} l1_at_truth={l1:.4}");
-    let cat = report(&probe, &formula, r, sigma, sf, st, &extra);
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+    score(
+        &format!("hifreq_cyclic_k{k}"),
+        &formula,
+        &data,
+        &rows_1d(&theta_grid),
+        &truth,
+        &y_truth,
+    )
 }
 
 #[test]
@@ -334,6 +191,9 @@ fn hifreq_cyclic_k10() -> Result<(), String> {
     hifreq_cyclic_probe(10)
 }
 
+/// `sin(2πkx)` has nonzero slope at both ends, which the anchored end pins
+/// (f = f′ = 0 at each end) cannot express; that end mismatch is the
+/// basis's approximation floor, carried by `f_B`.
 fn hifreq_bc_probe(k: usize) -> Result<(), String> {
     init_parallelism();
     let n: usize = 400;
@@ -351,26 +211,14 @@ fn hifreq_bc_probe(k: usize) -> Result<(), String> {
         .map(|i| 0.005 + 0.99 * i as f64 / (mgrid as f64 - 1.0))
         .collect();
     let truth: Vec<f64> = x_grid.iter().map(|t| (TAU * k as f64 * t).sin()).collect();
-
-    let probe = format!("hifreq_bc_k{k}");
-    let (yhat, beta) = match fit_predict_1d(&formula, &data, &x_grid) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error(&probe, &formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite(&probe, &formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    let l1 = truth_residual(&yhat, &truth);
-    let extra = format!("k={k} l1_at_truth={l1:.4}");
-    let cat = report(&probe, &formula, r, sigma, sf, st, &extra);
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+    score(
+        &format!("hifreq_bc_k{k}"),
+        &formula,
+        &data,
+        &rows_1d(&x_grid),
+        &truth,
+        &y_truth,
+    )
 }
 
 #[test]
@@ -392,8 +240,8 @@ fn hifreq_bc_k10() -> Result<(), String> {
 
 /// Spherical-harmonic ground-truth signal of degree l (l in {4, 6, 8}).
 /// We use the zonal harmonic P_l(sin(lat)) which has the cleanest closed
-/// form and provides a high-frequency latitude oscillation; the
-/// spherical smooth, if it works at this max_degree, should capture it.
+/// form and provides a high-frequency latitude oscillation; a harmonic
+/// basis of max_degree ≥ l expresses it exactly.
 fn legendre_p(l: usize, x: f64) -> f64 {
     if l == 0 {
         return 1.0;
@@ -439,33 +287,21 @@ fn hifreq_sphere_probe(l: usize) -> Result<(), String> {
     let max_deg = l + 2;
     let formula = format!("y ~ sphere(lat, lon, method=harmonic, max_degree={max_deg})");
 
-    // Test grid: zonal stripes
+    // Test grid: a zonal meridian.
     let lat_test: Vec<f64> = (0..180).map(|i| -89.0 + 178.0 * i as f64 / 179.0).collect();
     let lon_test: Vec<f64> = vec![0.0; lat_test.len()];
     let truth: Vec<f64> = lat_test
         .iter()
         .map(|d| legendre_p(l, (d.to_radians()).sin()))
         .collect();
-
-    let probe = format!("hifreq_sphere_l{l}");
-    let (yhat, beta) = match fit_predict_2d(&formula, &data, &lat_test, &lon_test) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error(&probe, &formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite(&probe, &formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    let l1 = truth_residual(&yhat, &truth);
-    let extra = format!("l={l} l1_at_truth={l1:.4}");
-    let cat = report(&probe, &formula, r, sigma, sf, st, &extra);
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+    score(
+        &format!("hifreq_sphere_l{l}"),
+        &formula,
+        &data,
+        &rows_2d(&lat_test, &lon_test),
+        &truth,
+        &y_truth,
+    )
 }
 
 #[test]
@@ -481,17 +317,22 @@ fn hifreq_sphere_l8() -> Result<(), String> {
     hifreq_sphere_probe(8)
 }
 
-/// Deterministic 2-D high-frequency tensor fixture shared by the k-arms and the
-/// zz_measure λ-readout sibling: y = sin(k·θ)·cos(π·h) on a 24×24 grid, σ=0.10,
-/// fit with te(theta[periodic], h[natural]), kb=(2k+4).max(10) per margin.
-/// Returns (data, formula, n_train, sigma).
 /// Tensor-margin basis size for the `hifreq_tensor` family. Hoisted so the grid
 /// can size itself against the basis (#2607) instead of the two drifting apart.
 fn kb_for(k: usize) -> usize {
     (2 * k + 4).max(10)
 }
 
-fn hifreq_tensor_dataset(k: usize) -> (gam::data::EncodedDataset, String, usize, f64) {
+fn hifreq_tensor_truth(k: usize, theta: f64, h: f64) -> f64 {
+    (k as f64 * theta).sin() * (PI * h).cos()
+}
+
+/// Deterministic 2-D high-frequency tensor fixture shared by the k-arms and the
+/// zz_measure sibling readouts: y = sin(k·θ)·cos(π·h) on a side×side grid,
+/// σ=0.10, fit with te(theta[periodic], h[natural]), kb=(2k+4).max(10) per
+/// margin. Returns (data, noise-free truth at the training rows, formula,
+/// n_train, sigma).
+fn hifreq_tensor_dataset(k: usize) -> (gam::data::EncodedDataset, Vec<f64>, String, usize, f64) {
     // #2607: the grid must stay ahead of the basis, or the design SATURATES and
     // the arm stops measuring what its siblings measure.
     //
@@ -526,14 +367,16 @@ fn hifreq_tensor_dataset(k: usize) -> (gam::data::EncodedDataset, String, usize,
     let mut rng = Lcg::new(0xD7 * (k as u64) + 41);
     let mut theta = Vec::with_capacity(n_theta * n_h);
     let mut h = Vec::with_capacity(n_theta * n_h);
+    let mut y_truth = Vec::with_capacity(n_theta * n_h);
     let mut y_noisy = Vec::with_capacity(n_theta * n_h);
     for i in 0..n_theta {
         let t = TAU * (i as f64) / (n_theta as f64);
         for j in 0..n_h {
             let hv = -0.95 + 1.9 * (j as f64) / ((n_h - 1) as f64);
-            let yt = (k as f64 * t).sin() * (PI * hv).cos();
+            let yt = hifreq_tensor_truth(k, t, hv);
             theta.push(t);
             h.push(hv);
+            y_truth.push(yt);
             y_noisy.push(yt + sigma * rng.normal());
         }
     }
@@ -541,12 +384,12 @@ fn hifreq_tensor_dataset(k: usize) -> (gam::data::EncodedDataset, String, usize,
     let kb = kb_for(k);
     let formula =
         format!("y ~ te(theta, h, bc=['periodic', 'natural'], period=[2*pi, None], k={kb})");
-    (data, formula, n_theta * n_h, sigma)
+    (data, y_truth, formula, n_theta * n_h, sigma)
 }
 
 fn hifreq_tensor_probe(k: usize) -> Result<(), String> {
     init_parallelism();
-    let (data, formula, n_train, sigma) = hifreq_tensor_dataset(k);
+    let (data, y_truth, formula, _, _) = hifreq_tensor_dataset(k);
 
     // Test grid
     let g: Vec<f64> = (0..25).map(|i| 0.02 + 0.96 * i as f64 / 24.0).collect();
@@ -559,29 +402,17 @@ fn hifreq_tensor_probe(k: usize) -> Result<(), String> {
             let hv = -0.95 + 1.9 * gy;
             t_test.push(t);
             h_test.push(hv);
-            truth.push((k as f64 * t).sin() * (PI * hv).cos());
+            truth.push(hifreq_tensor_truth(k, t, hv));
         }
     }
-
-    let probe = format!("hifreq_tensor_k{k}");
-    let (yhat, beta) = match fit_predict_2d(&formula, &data, &t_test, &h_test) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error(&probe, &formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite(&probe, &formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    let l1 = truth_residual(&yhat, &truth);
-    let extra = format!("k={k} l1_at_truth={l1:.4} n_train={n_train}");
-    let cat = report(&probe, &formula, r, sigma, sf, st, &extra);
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+    score(
+        &format!("hifreq_tensor_k{k}"),
+        &formula,
+        &data,
+        &rows_2d(&t_test, &h_test),
+        &truth,
+        &y_truth,
+    )
 }
 
 #[test]
@@ -700,7 +531,7 @@ fn hifreq_tensor_k10() -> Result<(), String> {
 #[test]
 fn zz_measure_hifreq_tensor_k8_lambda_readout() {
     init_parallelism();
-    let (data, formula, n_train, sigma) = hifreq_tensor_dataset(8);
+    let (data, _, formula, n_train, sigma) = hifreq_tensor_dataset(8);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
@@ -834,7 +665,7 @@ fn zz_measure_hifreq_tensor_k10_seed_costs() {
     }
     log::set_max_level(log::LevelFilter::Debug);
 
-    let (data, formula, n_train, sigma) = hifreq_tensor_dataset(10);
+    let (data, _, formula, n_train, sigma) = hifreq_tensor_dataset(10);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
@@ -890,31 +721,14 @@ fn bimodal_sharp_bumps_bc() -> Result<(), String> {
         .map(|i| 0.001 + 0.998 * i as f64 / (mgrid as f64 - 1.0))
         .collect();
     let truth: Vec<f64> = x_grid.iter().map(|&t| bump_pair(t)).collect();
-    let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error("bimodal_sharp_bumps", formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite("bimodal_sharp_bumps", formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    let l1 = truth_residual(&yhat, &truth);
-    let cat = report(
+    score(
         "bimodal_sharp_bumps",
         formula,
-        r,
-        sigma,
-        sf,
-        st,
-        &format!("l1_at_truth={l1:.4}"),
-    );
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+        &data,
+        &rows_1d(&x_grid),
+        &truth,
+        &y_truth,
+    )
 }
 
 // =====================================================================
@@ -928,24 +742,17 @@ fn near_flat_signal() -> Result<(), String> {
     let sigma = 0.02;
     let mut rng = Lcg::new(202);
     let x: Vec<f64> = (0..n).map(|_| rng.uniform_01()).collect();
-    // #1967/#2069: the probe formerly planted signal_amp == sigma (SNR ≈ 1), so a
-    // fit that chased noise was indistinguishable from one that recovered the true
-    // near-flat sinusoid — the over-fit/collapse verdict was muddy. Plant a signal
-    // clearly above the noise floor (SNR = 0.06/0.02 ≈ 3) yet near-null in span
-    // (peak-to-peak 0.12), so span_fit/span_truth cleanly separates genuine
-    // recovery from a collapsed-to-flat or noise-chasing (over-fit) fit.
+    // #1967/#2069: plant a signal clearly above the noise floor (SNR =
+    // 0.06/0.02 ≈ 3) yet near-null in span (peak-to-peak 0.12), so a fit that
+    // collapses to flat and one that chases the noise both miss the band.
     //
-    // The truth MUST vanish at the anchored endpoint. `bc=anchored` pins the fitted
-    // function to f(0)=0 AND suppresses the global intercept — an anchored endpoint
-    // is the model's level-setting gauge, so term-design construction drops the
-    // intercept and applies no sum-to-zero chart (gam-terms term_builder.rs, the
-    // `BSplineIdentifiability::None` branch for `has_anchor()`), and the anchored
-    // I-spline additionally loses its constant direction (basis/derivative_penalty.rs).
-    // A truth with a NONZERO value at x=0 is therefore structurally unrepresentable:
-    // the fit is forced to ramp from the pinned 0 up to the baseline, a boundary
-    // artifact unrelated to over/under-smoothing (it formerly made this probe report
-    // a spurious 36× "overfit" — span_fit ≈ the forced 0→baseline ramp). So plant a
-    // pure sinusoid 0.06·sin(2πx), which is 0 at x=0 and compatible with the anchor.
+    // `bc=anchored` pins the fitted function at the endpoints and suppresses
+    // the global intercept — an anchored endpoint is the model's level-setting
+    // gauge (gam-terms term_builder.rs, the `BSplineIdentifiability::None`
+    // branch for `has_anchor()`). A truth with a nonzero value at x=0 is
+    // therefore outside the basis; 0.06·sin(2πx) vanishes at both ends, and
+    // what remains of the pin mismatch (its end slope) is the approximation
+    // floor carried by `f_B`.
     let signal_amp = 0.06_f64;
     let y_truth: Vec<f64> = x
         .iter()
@@ -963,31 +770,24 @@ fn near_flat_signal() -> Result<(), String> {
         .iter()
         .map(|&t| signal_amp * (2.0 * PI * t).sin())
         .collect();
-    let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error("near_flat_signal", formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite("near_flat_signal", formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    let extra = format!("max_abs_fit={:.4}", {
-        yhat.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
-    });
-    let cat = report("near_flat_signal", formula, r, sigma, sf, st, &extra);
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+    score(
+        "near_flat_signal",
+        formula,
+        &data,
+        &rows_1d(&x_grid),
+        &truth,
+        &y_truth,
+    )
 }
 
 // =====================================================================
 // Probe 4: Heteroscedastic noise
 // =====================================================================
 
+/// The Gaussian fit's band carries one pooled scale. The probes are spread
+/// like the data, so the pooled variance is the probe-average of the true
+/// local variance and the across-the-function statistic keeps `E[Q] ≈ 1`;
+/// what this probes is the mean recovery under a 6x variance ramp.
 #[test]
 fn heteroscedastic_noise_mean_recovery() -> Result<(), String> {
     init_parallelism();
@@ -998,16 +798,15 @@ fn heteroscedastic_noise_mean_recovery() -> Result<(), String> {
         .iter()
         .map(|&t| (PI * t).sin() + 0.5 * (2.0 * PI * t).cos())
         .collect();
-    // Variance grows linearly with x (5x at right edge vs left).
+    // SD grows linearly with x, from 0.05 at the left edge to 0.30 at the right.
     let y_noisy: Vec<f64> = x
         .iter()
         .zip(y_truth.iter())
         .map(|(&xi, &yt)| {
-            let sigma_x = 0.05 + 0.25 * xi; // [0.05, 0.30]
+            let sigma_x = 0.05 + 0.25 * xi;
             yt + sigma_x * rng.normal()
         })
         .collect();
-    let avg_sigma = 0.175_f64;
     let data = make_dataset_1d(&x, &y_noisy);
     let formula = "y ~ s(x, bc=anchored, k=15)";
 
@@ -1019,37 +818,23 @@ fn heteroscedastic_noise_mean_recovery() -> Result<(), String> {
         .iter()
         .map(|&t| (PI * t).sin() + 0.5 * (2.0 * PI * t).cos())
         .collect();
-    let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error("heteroscedastic", formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite("heteroscedastic", formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    let l1 = truth_residual(&yhat, &truth);
-    let cat = report(
+    score(
         "heteroscedastic",
         formula,
-        r,
-        avg_sigma,
-        sf,
-        st,
-        &format!("l1_at_truth={l1:.4} sigma_range=[0.05,0.30]"),
-    );
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+        &data,
+        &rows_1d(&x_grid),
+        &truth,
+        &y_truth,
+    )
 }
 
 // =====================================================================
 // Probe 5: Outliers (1% at y ± 10 σ)
 // =====================================================================
 
+/// Alternating ±10σ contamination is zero-mean noise with a heavy tail; the
+/// Gaussian fit's pooled scale absorbs its variance, so the mean must still
+/// be recovered inside the fit's own band.
 #[test]
 fn outlier_contamination() -> Result<(), String> {
     init_parallelism();
@@ -1080,37 +865,23 @@ fn outlier_contamination() -> Result<(), String> {
         .iter()
         .map(|&t| (PI * t).sin() + 0.5 * (3.0 * PI * t).cos())
         .collect();
-    let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error("outlier_contamination", formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite("outlier_contamination", formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    let l1 = truth_residual(&yhat, &truth);
-    let cat = report(
+    score(
         "outlier_contamination",
         formula,
-        r,
-        sigma,
-        sf,
-        st,
-        &format!("l1_at_truth={l1:.4} n_outliers={n_out}"),
-    );
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+        &data,
+        &rows_1d(&x_grid),
+        &truth,
+        &y_truth,
+    )
 }
 
 // =====================================================================
 // Probe 6: Sparse-dense imbalance
 // =====================================================================
 
+/// 20 points on [0, 0.5) against 2000 on [0.5, 1): the band must widen on
+/// the sparse half to cover the truth there, and stay tight on the dense
+/// half. Half the probes sit on each side.
 #[test]
 fn sparse_dense_imbalance() -> Result<(), String> {
     init_parallelism();
@@ -1131,55 +902,27 @@ fn sparse_dense_imbalance() -> Result<(), String> {
     let data = make_dataset_1d(&x, &y_noisy);
     let formula = "y ~ s(x, bc=anchored, k=20)";
 
-    // Test on sparse side only
-    let xg_sparse: Vec<f64> = (0..100).map(|i| 0.005 + 0.49 * i as f64 / 99.0).collect();
-    let truth_sparse: Vec<f64> = xg_sparse.iter().map(|&t| f(t)).collect();
-    // Test on dense side only
-    let xg_dense: Vec<f64> = (0..100).map(|i| 0.505 + 0.49 * i as f64 / 99.0).collect();
-    let truth_dense: Vec<f64> = xg_dense.iter().map(|&t| f(t)).collect();
-
-    let all_x: Vec<f64> = xg_sparse.iter().chain(xg_dense.iter()).copied().collect();
-    let (yhat_all, beta) = match fit_predict_1d(formula, &data, &all_x) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error("sparse_dense_imbalance", formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite("sparse_dense_imbalance", formula, &yhat_all, &beta);
-    let (yhat_sparse, yhat_dense) = yhat_all.split_at(100);
-    let r_sparse = rmse(yhat_sparse, &truth_sparse);
-    let r_dense = rmse(yhat_dense, &truth_dense);
-    let r_worst = r_sparse.max(r_dense);
-    let sf = span(&yhat_all);
-    let truth_all: Vec<f64> = truth_sparse
-        .iter()
-        .chain(truth_dense.iter())
-        .copied()
+    let x_grid: Vec<f64> = (0..100)
+        .map(|i| 0.005 + 0.49 * i as f64 / 99.0)
+        .chain((0..100).map(|i| 0.505 + 0.49 * i as f64 / 99.0))
         .collect();
-    let st = span(&truth_all);
-    let extra = format!(
-        "rmse_sparse={r_sparse:.4} rmse_dense={r_dense:.4} rmse_worst={r_worst:.4} n_sparse={n_sparse} n_dense={n_dense}"
-    );
-    let cat = report(
+    let truth: Vec<f64> = x_grid.iter().map(|&t| f(t)).collect();
+    score(
         "sparse_dense_imbalance",
         formula,
-        r_worst,
-        sigma,
-        sf,
-        st,
-        &extra,
-    );
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+        &data,
+        &rows_1d(&x_grid),
+        &truth,
+        &y_truth,
+    )
 }
 
 // =====================================================================
 // Probe 7: Boundary discontinuity (Gibbs)
 // =====================================================================
 
+/// A unit step is outside every spline basis; its projection `f_B` carries
+/// the Gibbs ringing, the floor no estimator in the basis can beat.
 #[test]
 fn boundary_discontinuity_step() -> Result<(), String> {
     init_parallelism();
@@ -1198,41 +941,23 @@ fn boundary_discontinuity_step() -> Result<(), String> {
         .map(|i| 0.002 + 0.996 * i as f64 / (mgrid as f64 - 1.0))
         .collect();
     let truth: Vec<f64> = x_grid.iter().map(|&t| f(t)).collect();
-    let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error("step_discontinuity", formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite("step_discontinuity", formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    // Estimate Gibbs overshoot: max prediction above 1 or below 0.
-    let over = yhat
-        .iter()
-        .map(|&v| (v - 1.0).max(0.0).max((-v).max(0.0)))
-        .fold(0.0_f64, f64::max);
-    let cat = report(
+    score(
         "step_discontinuity",
         formula,
-        r,
-        sigma,
-        sf,
-        st,
-        &format!("gibbs_overshoot={over:.3}"),
-    );
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+        &data,
+        &rows_1d(&x_grid),
+        &truth,
+        &y_truth,
+    )
 }
 
 // =====================================================================
 // Probe 8: Multicollinear input in a tensor smooth
 // =====================================================================
 
+/// `b ≈ 0.95·a` leaves most of the tensor surface unobserved; the penalty
+/// identifies it, so the request is well-posed and must fit. It is scored
+/// on the support strip, where the data determine the surface.
 #[test]
 fn tensor_multicollinear_inputs() -> Result<(), String> {
     init_parallelism();
@@ -1253,67 +978,40 @@ fn tensor_multicollinear_inputs() -> Result<(), String> {
     let data = make_dataset_2d_named("a", &a, "b", &b, &y_noisy);
     let formula = "y ~ te(a, b, k=6)";
 
-    // Test on the support manifold (b ≈ 0.95 a) — extrapolating off it
-    // is unfair.
-    let g: Vec<f64> = (0..60).map(|i| 0.02 + 0.96 * i as f64 / 59.0).collect();
-    let a_test: Vec<f64> = g.clone();
-    let b_test: Vec<f64> = g.iter().map(|&u| 0.95 * u + 0.025).collect();
+    let a_test: Vec<f64> = (0..60).map(|i| 0.02 + 0.96 * i as f64 / 59.0).collect();
+    let b_test: Vec<f64> = a_test.iter().map(|&u| 0.95 * u + 0.025).collect();
     let truth: Vec<f64> = a_test
         .iter()
         .zip(b_test.iter())
         .map(|(&x, &y)| f(x, y))
         .collect();
-
-    let res = fit_predict_2d(formula, &data, &a_test, &b_test);
-    match res {
-        Ok((yhat, beta)) => {
-            check_finite("multicollinear_tensor", formula, &yhat, &beta);
-            let r = rmse(&yhat, &truth);
-            let sf = span(&yhat);
-            let st = span(&truth);
-            let l1 = truth_residual(&yhat, &truth);
-            let cat = report(
-                "multicollinear_tensor",
-                formula,
-                r,
-                sigma,
-                sf,
-                st,
-                &format!("l1_at_truth={l1:.4} corr_ab~0.95"),
-            );
-            if let Category::Collapsed = cat {
-                return Err(format!("probe collapsed"));
-            }
-            Ok(())
-        }
-        Err(e) => {
-            // Some smooths refuse to build on near-singular tensor inputs.
-            // That's an honest "fail-fast" outcome; record it.
-            eprintln!(
-                "[fit-quality] probe=multicollinear_tensor category=BUILD_REFUSED \
-                 formula=`{formula}` err=`{e}`",
-            );
-            Ok(())
-        }
-    }
+    score(
+        "multicollinear_tensor",
+        formula,
+        &data,
+        &rows_2d(&a_test, &b_test),
+        &truth,
+        &y_truth,
+    )
 }
 
 // =====================================================================
-// Probe 9: Wrong period for cyclic
+// Probe 9: Data spanning two declared periods
 // =====================================================================
 
+/// The data span [0, 2π) while the cyclic smooth declares period π. The
+/// truth sin(2θ) has period π, so the declaration is correct and the data
+/// wrap twice onto one period: the fit must pool both laps.
 #[test]
-fn cyclic_wrong_period() -> Result<(), String> {
+fn cyclic_two_laps_of_declared_period() -> Result<(), String> {
     init_parallelism();
     let n = 300;
     let sigma = 0.05;
     let mut rng = Lcg::new(808);
-    // True data is on [0, 2π]
     let theta: Vec<f64> = (0..n).map(|_| TAU * rng.uniform_01()).collect();
     let y_truth: Vec<f64> = theta.iter().map(|t| (2.0 * t).sin()).collect();
     let y_noisy: Vec<f64> = y_truth.iter().map(|&v| v + sigma * rng.normal()).collect();
     let data = make_dataset_named_1d("theta", &theta, &y_noisy);
-    // Misconfiguration: declare period = π even though data spans [0, 2π].
     let formula = "y ~ cyclic(theta, k=10, period_start=0, period_end=3.141592653589793)";
 
     let mgrid = 400;
@@ -1321,63 +1019,23 @@ fn cyclic_wrong_period() -> Result<(), String> {
         .map(|i| 0.005 + (TAU - 0.01) * i as f64 / (mgrid as f64 - 1.0))
         .collect();
     let truth: Vec<f64> = theta_grid.iter().map(|t| (2.0 * t).sin()).collect();
-
-    // The fit is allowed to either error out (preferred) or to succeed
-    // with a degraded recovery (which we then record).
-    let cfg = FitConfig {
-        family: Some("gaussian".to_string()),
-        ..FitConfig::default()
-    };
-    let res = fit_from_formula(formula, &data, &cfg);
-    match res {
-        Err(e) => {
-            eprintln!(
-                "[fit-quality] probe=cyclic_wrong_period category=ERROR_RAISED \
-                 formula=`{formula}` err=`{e}`",
-            );
-            Ok(())
-        }
-        Ok(result) => {
-            let FitResult::Standard(fit) = result else {
-                panic!("expected standard fit for cyclic wrong-period probe");
-            };
-            let mut m = Array2::<f64>::zeros((theta_grid.len(), 2));
-            for i in 0..theta_grid.len() {
-                m[[i, 0]] = theta_grid[i];
-                m[[i, 1]] = 0.0;
-            }
-            let test_design = build_term_collection_design(m.view(), &fit.resolvedspec)
-                .expect("rebuild design (wrong period)");
-            let yhat = test_design.design.apply(&fit.fit.beta).to_vec();
-            let beta = fit.fit.beta.to_vec();
-            check_finite("cyclic_wrong_period", formula, &yhat, &beta);
-            let r = rmse(&yhat, &truth);
-            let sf = span(&yhat);
-            let st = span(&truth);
-            // Headline category here is what the fit did despite the
-            // wrong period — usually a forced wraparound that ruins
-            // the recovery.
-            let cat = report(
-                "cyclic_wrong_period",
-                formula,
-                r,
-                sigma,
-                sf,
-                st,
-                "note=fit_accepted_wrong_period",
-            );
-            if let Category::Collapsed = cat {
-                return Err(format!("probe collapsed"));
-            }
-            Ok(())
-        }
-    }
+    score(
+        "cyclic_two_laps",
+        formula,
+        &data,
+        &rows_1d(&theta_grid),
+        &truth,
+        &y_truth,
+    )
 }
 
 // =====================================================================
 // Probe 10: Antipodal sphere data (poles only)
 // =====================================================================
 
+/// Data on the two polar caps only. The truth is defined only there (±1 on
+/// each cap), so the fit is scored on the caps; between them the surface is
+/// the penalty's, not the data's.
 #[test]
 fn sphere_antipodal_only() -> Result<(), String> {
     init_parallelism();
@@ -1403,64 +1061,25 @@ fn sphere_antipodal_only() -> Result<(), String> {
     let data = make_dataset_2d_named("lat", &lat, "lon", &lon, &y_noisy);
     let formula = "y ~ sphere(lat, lon, method=harmonic, max_degree=4)";
 
-    // Predict on the same caps to assess recovery; also predict at the
-    // equator to check that the smoother gives a sensible interpolation
-    // (no NaNs, no wild blow-up).
     let mut lat_test = Vec::new();
     let mut lon_test = Vec::new();
-    let mut truth_test = Vec::new();
-    for i in 0..60 {
-        let lt = 78.0 + 10.0 * i as f64 / 59.0;
-        for j in 0..6 {
-            let ln = -180.0 + 60.0 * j as f64;
-            lat_test.push(lt);
-            lon_test.push(ln);
-            truth_test.push(1.0);
+    let mut truth = Vec::new();
+    for (lat_lo, value) in [(78.0, 1.0), (-88.0, -1.0)] {
+        for i in 0..60 {
+            let lt = lat_lo + 10.0 * i as f64 / 59.0;
+            for j in 0..6 {
+                lat_test.push(lt);
+                lon_test.push(-180.0 + 60.0 * j as f64);
+                truth.push(value);
+            }
         }
     }
-    for i in 0..60 {
-        let lt = -88.0 + 10.0 * i as f64 / 59.0;
-        for j in 0..6 {
-            let ln = -180.0 + 60.0 * j as f64;
-            lat_test.push(lt);
-            lon_test.push(ln);
-            truth_test.push(-1.0);
-        }
-    }
-    // Equator probes — truth unknown; we just verify finiteness and report
-    // the magnitude as `extra`.
-    let n_polar = lat_test.len();
-    for j in 0..36 {
-        lat_test.push(0.0);
-        lon_test.push(-180.0 + 10.0 * j as f64);
-        truth_test.push(0.0); // sentinel — unused for rmse calc
-    }
-
-    let (yhat, beta) = match fit_predict_2d(formula, &data, &lat_test, &lon_test) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error("antipodal_sphere", formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite("antipodal_sphere", formula, &yhat, &beta);
-    let (yhat_polar, yhat_equator) = yhat.split_at(n_polar);
-    let truth_polar = &truth_test[..n_polar];
-    let r = rmse(yhat_polar, truth_polar);
-    let sf = span(yhat_polar);
-    let st = span(truth_polar);
-    let eq_max = yhat_equator.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
-    let cat = report(
+    score(
         "antipodal_sphere",
         formula,
-        r,
-        sigma,
-        sf,
-        st,
-        &format!("equator_max_abs={eq_max:.4} n_polar={n_polar}"),
-    );
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+        &data,
+        &rows_2d(&lat_test, &lon_test),
+        &truth,
+        &y_truth,
+    )
 }
