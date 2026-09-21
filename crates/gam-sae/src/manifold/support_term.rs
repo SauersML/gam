@@ -5906,25 +5906,26 @@ impl SaeSupportSparseTerm {
                     .map(|(left, right)| left * right)
                     .sum::<f64>();
         }
-        value += (0..self.n_obs())
-            .into_par_iter()
-            .map(|row| {
-                let mut row_value = 0.0_f64;
-                for (slot, &atom) in self.assignment.support_indices(row).iter().enumerate() {
-                    let atom = atom as usize;
-                    let periods = self.atom_ard_axis_periods(atom);
-                    for axis in 0..self.assignment.atom_coord_dim(atom) {
-                        row_value += ArdAxisPrior::eval(
-                            ard_precisions[atom][axis],
-                            self.assignment.coords_for_slot(row, slot)[axis],
-                            periods[axis],
-                        )
-                        .value;
-                    }
+        // The ARD prior is summed over rows on the length-only pairwise tree
+        // (#2228): the acceptance gates compare this objective against its own
+        // arithmetic resolution, so its bits must not move with the pool width
+        // or with rayon's work stealing, which `ParallelIterator::sum` lets them.
+        value += gam_linalg::pairwise_reduce::par_pairwise_sum(self.n_obs(), |row| {
+            let mut row_value = 0.0_f64;
+            for (slot, &atom) in self.assignment.support_indices(row).iter().enumerate() {
+                let atom = atom as usize;
+                let periods = self.atom_ard_axis_periods(atom);
+                for axis in 0..self.assignment.atom_coord_dim(atom) {
+                    row_value += ArdAxisPrior::eval(
+                        ard_precisions[atom][axis],
+                        self.assignment.coords_for_slot(row, slot)[axis],
+                        periods[axis],
+                    )
+                    .value;
                 }
-                row_value
-            })
-            .sum::<f64>();
+            }
+            row_value
+        });
         // #2502: the acceptance gate certifies the same priced objective the
         // router ranks by -- each atom in use charges its parameter bits at
         // the armed noise floor (objective scale: sigma2*ln2 per bit).
