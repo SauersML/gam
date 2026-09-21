@@ -7794,9 +7794,13 @@ fn certified_top_dir(
     if !(best_norm > 0.0) {
         return Ok(None);
     }
-    // Normalize the operator by the seed's Rayleigh quotient `ρ₀ ≤ λ₁`, so the
-    // solver's `max(|λ|, 1)` residual scale is `λ₁/ρ₀ ≥ 1`: the certificate is
-    // relative to `λ₁` whatever the image's units.
+    // Normalize the operator by the seed's Rayleigh quotient `ρ₀ ≤ λ₁`. The
+    // solver's Ritz certificate is `‖A v − λ v‖₂ / ‖Λ‖∞`, a ratio that does not
+    // move when `A` is scaled (gam#3784 removed the unit floor on that norm
+    // precisely so it would not), so this scaling does not change the residual
+    // test. What it buys is `breakdown_tol`, which is an ABSOLUTE norm on the
+    // Krylov recurrence: on `C/ρ₀` that norm is in units of `λ₁/ρ₀ ≥ 1` rather
+    // than in the image's own units, so one band serves both tests.
     let mut c_seed = vec![0.0_f64; p];
     apply_c(&seed, &mut c_seed);
     let rho0 = seed.iter().zip(&c_seed).map(|(s, c)| s * c).sum::<f64>() / best_norm;
@@ -7810,9 +7814,17 @@ fn certified_top_dir(
     }
     // One scaled matvec commits `p + 2` roundings per row projection (centering,
     // product, sum), `m + 2` per output accumulation, and one in `/ρ₀`, against
-    // the magnitude `‖Σ |g−c||g−c|ᵀ‖/ρ₀ ≤ tr C/ρ₀`. That is the resolution of
-    // `C v / ρ₀` at working precision: a Krylov residual inside it is an
-    // exhausted space, and a Ritz residual inside it is certified.
+    // the magnitude `‖Σ |g−c||g−c|ᵀ‖/ρ₀ ≤ tr C/ρ₀`. That is the ABSOLUTE
+    // resolution of `C v / ρ₀` at working precision, which is what
+    // `breakdown_tol` wants: a Krylov residual inside it is an exhausted space.
+    //
+    // The residual test wants the same quantity divided by `‖Λ‖∞ = λ₁/ρ₀`, and
+    // `λ₁` is not known before the solve. The only lower bound in hand is
+    // `λ₁ ≥ ρ₀`, i.e. `‖Λ‖∞ ≥ 1`, so the same number is the conservative
+    // relative bar: it can only ask for more accuracy than the matvec's own
+    // rounding, never less. The looseness is at most `λ₁/ρ₀`, itself at most
+    // `tr C/‖seed‖² ≤ m`, since `ρ₀ ≥ ‖seed‖²` and `‖seed‖²` is the largest
+    // centered row norm.
     let matvec_band = gam_linalg::roundoff::accumulation_growth(p + m + 5) * trace / rho0;
     let pairs = gam_linalg::lanczos::symmetric_extreme_lanczos_eigenpairs(
         p,
