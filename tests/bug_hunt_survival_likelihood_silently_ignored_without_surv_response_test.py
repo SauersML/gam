@@ -93,9 +93,11 @@ def _survival_frame(seed: int = 20260630, n: int = 500) -> dict[str, list[float]
     return {"time": list(time), "event": list(event), "x": list(x)}
 
 
-# Non-default survival formulations (the default is "transformation", which a
-# non-Surv() response cannot be distinguished from "unset", so it is excluded).
-NON_DEFAULT_LIKELIHOODS = ["weibull", "location-scale", "latent"]
+# Explicit survival formulations. The knob defaults to None ("unset") at every
+# entrance (#2301), so ANY explicit mode, "transformation" included, is a
+# survival request that a non-Surv() response must refuse
+# (reject_survival_only_config_for_nonsurvival).
+NON_DEFAULT_LIKELIHOODS = ["transformation", "weibull", "location-scale", "latent"]
 
 
 def test_survival_likelihood_not_silently_ignored_without_surv_response() -> None:
@@ -105,9 +107,18 @@ def test_survival_likelihood_not_silently_ignored_without_surv_response() -> Non
     for mode in NON_DEFAULT_LIKELIHOODS:
         try:
             model = gamfit.fit(data, "time ~ s(x)", survival_likelihood=mode)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - judged by its message below
             # A clean configuration error is an acceptable outcome: the survival
-            # request was *not* silently dropped.
+            # request was *not* silently dropped. It has to BE that error,
+            # naming the knob and the Surv(...) wrapper (the #1767 contract
+            # pinned in materialize/tests.rs); any other exception (a panic,
+            # an integration failure) used to pass here too.
+            msg = str(exc)
+            if "survival_likelihood" not in msg or "Surv(" not in msg:
+                offenders.append(
+                    f"survival_likelihood={mode!r} raised {type(exc).__name__} that is "
+                    f"not the non-Surv() configuration refusal: {msg}"
+                )
             continue
         # The fit "succeeded" — it must then be an actual survival model, not a
         # plain Gaussian GAM that ignored the survival likelihood.
