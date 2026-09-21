@@ -294,3 +294,84 @@ fn transport_ladder_wires_adjacent_two_hop_and_composition_fields() {
     assert!(hop.composition_max_studentized.is_some());
     assert!(hop.composition_gauge_reflected.is_some());
 }
+
+/// #3512 — the composition test must gain power as the sample grows. What it
+/// contrasts is a pair of FITTED CURVES, whose standard error at a grid point
+/// falls like `σ√(edf/n)`. Studentizing it against each map's per-observation
+/// residual RMS instead scored a fixed violation `δ` at `z ≈ δ/(3σ)` whatever
+/// the sample size, so with 1000 rows and `edf ≈ 10` a real violation had to be
+/// about 30× the curve's own standard error before it registered at all.
+///
+/// The planted violation is the same `δ·sin(2t)` warp at every size, carried
+/// only by the direct A→C map: `h_bc` is fitted on the consistent pair, so it
+/// cannot absorb the warp, and the composed route stays on the clean C chart.
+/// The truth is a fixed smooth, so its REML `edf` grows far slower than the
+/// rows do and the studentized defect grows like `√(n/edf)`: 16× the rows
+/// predict about 3×, while the residual-RMS floor predicts exactly 1×, being
+/// n-free. The 2× bar sits a clear factor from each, so the test brackets the
+/// two rules rather than tuning against either.
+#[test]
+fn composition_power_grows_with_the_sample_3512() {
+    const DELTA: f64 = 0.05;
+    let circle = ChartTopology::Circle;
+    let f = |v: f64| v + 0.25 * v.sin();
+    let g = |u: f64| u + 0.6 + 0.2 * u.sin();
+    let studentized: Vec<f64> = [200usize, 800, 3200]
+        .into_iter()
+        .map(|n| {
+            let t = uniform_angles(n);
+            let mut rng = DetNoise(0x3512_0001);
+            let coords_b = t.mapv(|v| (f(v) + rng.jitter(NOISE)).rem_euclid(TAU));
+            let coords_c = Array1::from_iter(
+                t.iter()
+                    .map(|&v| (g(f(v)) + rng.jitter(NOISE)).rem_euclid(TAU)),
+            );
+            let coords_c_warped =
+                Array1::from_iter(t.iter().map(|&v| {
+                    (g(f(v)) + DELTA * (2.0 * v).sin() + rng.jitter(NOISE)).rem_euclid(TAU)
+                }));
+            let h_ab = fit_transport_map(
+                t.view(),
+                coords_b.view(),
+                circle,
+                circle,
+                PairLaw::Stochastic,
+            )
+            .expect("h_ab");
+            let h_bc = fit_transport_map(
+                coords_b.view(),
+                coords_c.view(),
+                circle,
+                circle,
+                PairLaw::Stochastic,
+            )
+            .expect("h_bc");
+            let h_ac = fit_transport_map(
+                t.view(),
+                coords_c_warped.view(),
+                circle,
+                circle,
+                PairLaw::Stochastic,
+            )
+            .expect("warped h_ac");
+            let report = composition_defect(&h_ab, &h_bc, &h_ac).expect("composition test");
+            assert!(
+                report.max_studentized_defect.is_finite() && report.max_studentized_defect > 0.0,
+                "n = {n}: a stochastic triple must carry a finite sampling law, got z = {}",
+                report.max_studentized_defect
+            );
+            report.max_studentized_defect
+        })
+        .collect();
+    for pair in studentized.windows(2) {
+        assert!(
+            pair[1] > pair[0],
+            "one fixed violation must score higher on more rows: z = {studentized:?}"
+        );
+    }
+    assert!(
+        studentized[2] >= 2.0 * studentized[0],
+        "16× the rows must at least double the studentized defect of a fixed violation; \
+         an observation-noise floor holds it n-free: z = {studentized:?}"
+    );
+}

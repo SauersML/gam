@@ -3672,5 +3672,13 @@
     ],
     "reason": "#4454: private SplitMix64 copies duplicated gam_linalg::utils::{splitmix64, splitmix64_hash}. Eleven named copies of the full algorithm (same golden increment, multipliers 0xBF58_476D_1CE4_E5B9 / 0x94D0_49BB_1331_11EB, shifts 30/27/31) and seven thin wrappers that forwarded to the canonical function under a local name are deleted; block.rs splitmix64_block is renamed at its callers to splitmix64_hash. SPEC: 'It's required that the CLI, Python library, and Rust library are unified, have a single source of truth'.",
     "evidence": "https://github.com/SauersML/gam/issues/4454: each deleted body was checked token-for-token against the canonical stream or hash form before replacement, every former call site now calls gam_linalg::utils::splitmix64 or splitmix64_hash, and git grep -w finds no remaining call to a removed name in the edited files."
+  },
+  {
+    "base": "1c501108b9ee65e35132f724fa2e3fc7e568ba24",
+    "items": [
+      "crates/gam-sae/src/inference/layer_transport.rs:fn:approximation_resolution"
+    ],
+    "reason": "#3512: composition_defect no longer floors the defect's variance at an observation-noise scale, so the helper that produced that floor has no remaining caller and is deleted with it. approximation_resolution returned a stochastic fit's in-sample observation residual RMS (and 0 for a deterministic interpolant); composition_defect combined the three maps' values by Minkowski's inequality and took max(sandwich_variance, approximation_sd^2). The defect contrasts fitted curves, whose sampling SD is about sigma*sqrt(edf/n), so that floor exceeded the true variance by about 9n/edf and held the test's power flat in n. The joint influence sandwich is now the whole studentizer. Nothing else read the helper; the PairLaw distinction it encoded survives where it belongs, in fit_transport_map, which still chooses an interpolant for Deterministic and a REML smooth for Stochastic, and a deterministic pair still emits no p-value because its influence collapses to zero.",
+    "evidence": "At the base, git grep -n approximation_resolution finds it only in crates/gam-sae/src/inference/layer_transport.rs: the declaration and the three calls in composition_defect's floor loop. This commit deletes the declaration and the loop. No other crate, bench, example, test or Python file names it. FittedTransport::residual_rms and FittedTransport::pair_law are untouched and still read elsewhere in the same file."
   }
 ]

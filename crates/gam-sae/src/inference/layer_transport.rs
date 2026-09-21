@@ -1479,7 +1479,9 @@ pub struct CompositionDefectReport {
     pub mean_abs_defect: f64,
     pub rms_defect: f64,
     pub max_abs_defect: f64,
-    /// `max_t |d(t)| / band(t)` against the composed pointwise bands.
+    /// `max_t |d(t)| / se(t)`, with `se(t)` the joint influence-sandwich
+    /// standard error of the defect at `t` — the sampling scale of the fitted
+    /// curves themselves, not of a single observation (#3512).
     pub max_studentized_defect: f64,
     /// Bonferroni p-value bound for the max studentized defect over all tested
     /// grid points.
@@ -1595,26 +1597,16 @@ fn piece_grid(basis: &DomainBasis) -> Array1<f64> {
     Array1::from_vec(grid)
 }
 
-/// Observed approximation resolution of a fit, the floor its composition
-/// contrasts are studentized against: the residual RMS of a stochastic smooth,
-/// and zero for a deterministic interpolant, which reproduces its pairs and
-/// carries no observation law — its residual is rounding, not resolution.
-fn approximation_resolution(fit: &FittedTransport) -> f64 {
-    match fit.pair_law {
-        PairLaw::Deterministic => 0.0,
-        PairLaw::Stochastic => fit.residual_rms,
-    }
-}
-
 /// Test the composition law `h_ac ≟ h_bc ∘ h_ab` on a grid derived from the fits.
 ///
 /// The defect `d(t) = h_ac(t) ⊖ (h_bc ∘ h_ab)(t)` (circular difference on
 /// circle targets) is computed directly in the common target chart: no gauge is
 /// selected after seeing the defect. Pointwise uncertainty is assembled from
 /// the combined observation-level influence of all three maps, retaining their
-/// shared-row covariance. Its resolution is bounded below by the three maps'
-/// observed residual scales, propagated through the composition by Minkowski's
-/// inequality, and the grid is tested by a Bonferroni max statistic.
+/// shared-row covariance, and is the whole studentizer: the defect contrasts
+/// fitted curves, whose standard error is `O(σ√(edf/n))`, so no observation-
+/// noise scale floors it (#3512). The grid is tested by a Bonferroni max
+/// statistic.
 ///
 /// The grid samples every polynomial piece of the finer of the two
 /// source-domain splines (`h_ab`, `h_ac`) at `degree + 1` cell midpoints, the
@@ -1685,31 +1677,30 @@ pub fn composition_defect(
         }
     }));
 
-    // --- pointwise studentization at the maps' identifiable resolution -------
-    // The influence sandwich is sampling variance and collapses on noiseless
-    // fits. The finite spline family is not closed under composition, however,
-    // so a direct fit and a composed pair retain approximation error even when
-    // the underlying chart maps obey the law exactly (#2143). Studentizing that
-    // representation defect against sampling variance alone therefore reverses
-    // the intended test: cleaner data can look more significantly inconsistent.
+    // --- pointwise studentization by the fitted curves' own sampling law -----
+    // The quantity tested is a contrast of FITTED CURVES, so the law it is read
+    // against is the sampling law of those curves — exactly what the joint
+    // influence sandwich above estimates, shared rows and all. At a grid point
+    // that scale is O(σ√(edf/n)), not O(σ).
     //
-    // Do not hide the problem behind a fixed coordinate-scale tolerance. Each
-    // stochastic map already measures its own approximation resolution as
-    // residual RMS; a deterministic interpolant has none to measure. For e_ac - e_bc - h_bc' e_ab, Minkowski's inequality gives the
-    // data-derived envelope
+    // #3512 — an earlier rule floored this variance at the three maps' observed
+    // residual RMS, combined by Minkowski's inequality. `residual_rms` is the
+    // in-sample OBSERVATION residual RMS, which estimates the per-observation
+    // noise σ: on any noisy fit the floor exceeded the true variance by about
+    // 9n/edf, deflated every z by about 3√(n/edf), and pinned the test at a
+    // power that does not grow with n — a fixed violation δ scored z ≈ δ/(3σ)
+    // at every sample size. It was not a bound on the representation error it
+    // was named for either: an RMS over the data rows bounds nothing about the
+    // approximation error at a grid point, so defect/residual_rms is a standard
+    // normal deviate under no law. A conservative calibration is a calibration
+    // defect exactly as an anti-conservative one is, so there is no floor.
     //
-    //   ||e_ac||₂ + ||e_bc||₂ + |h_bc'| ||e_ab||₂.
-    //
-    // This retains power above what the fitted representations can resolve,
-    // adapts to topology/scale/basis complexity, and has no calibration knob.
-    let mut calibrated_variance = variance;
-    for i in 0..n_grid {
-        let approximation_sd = approximation_resolution(h_ac)
-            + approximation_resolution(h_bc)
-            + mid_slope[i].abs() * approximation_resolution(h_ab);
-        calibrated_variance[i] = calibrated_variance[i].max(approximation_sd * approximation_sd);
-    }
-    let max_var = calibrated_variance.iter().copied().fold(0.0_f64, f64::max);
+    // The representation defect of the finite spline family under composition
+    // (#2143) is a bias, not a variance, and is not priced as one here; it is
+    // the deterministic-map estimator of #3364. A deterministic pair carries no
+    // observation law at all: every residual is rounding, its influence
+    // collapses to zero, `max_var` is zero, and no p-value is emitted.
+    let max_var = variance.iter().copied().fold(0.0_f64, f64::max);
     let mut max_abs = 0.0_f64;
     let mut sum_abs = 0.0_f64;
     let mut sum_sq = 0.0_f64;
@@ -1723,9 +1714,9 @@ pub fn composition_defect(
         if max_var > 0.0 {
             // Studentize by this point's own variance. With none, a nonzero
             // defect is infinitely many standard errors out and a zero one is none.
-            let variance = calibrated_variance[i];
-            let z = if variance > 0.0 {
-                a / variance.sqrt()
+            let pointwise_variance = variance[i];
+            let z = if pointwise_variance > 0.0 {
+                a / pointwise_variance.sqrt()
             } else if a > 0.0 {
                 f64::INFINITY
             } else {
@@ -1738,8 +1729,9 @@ pub fn composition_defect(
     let rms_defect = (sum_sq / n_grid as f64).sqrt();
 
     // Bonferroni bound for the max studentized defect over the actual grid:
-    // valid for arbitrary dependence among pointwise contrasts. With neither
-    // empirical score variation nor observed approximation error there is no
+    // valid for arbitrary dependence among pointwise contrasts, and at most a
+    // factor `n_grid` conservative, which scales the p-value but not the way it
+    // moves with the sample. With no empirical score variation there is no
     // uncertainty law, so no p-value is emitted from deterministic fitted-grid
     // values.
     let max_studentized_p_value = if max_var > 0.0 {

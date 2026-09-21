@@ -1,5 +1,21 @@
 ## Unreleased
 
+- **The composition-law test studentizes by the fitted curves' own sampling law** (#3512).
+  `composition_defect` floored the defect's pointwise variance at the three maps'
+  in-sample observation residual RMS, combined by Minkowski's inequality. That RMS
+  estimates the per-observation noise `σ`, while the quantity tested is a contrast
+  of fitted curves whose standard error is about `σ√(edf/n)`, so the floor exceeded
+  the true variance by about `9n/edf`, deflated every `z` by about `3√(n/edf)`, and
+  pinned a fixed violation `δ` at `z ≈ δ/(3σ)` at every sample size: with 1000 rows
+  and `edf ≈ 10` a real violation had to be about 30× the curve's standard error
+  before it registered. It was also not a bound on the representation error it was
+  named for, since an RMS over data rows bounds nothing at a grid point. The joint
+  influence sandwich, which already keeps the three maps' shared-row covariance, is
+  now the whole studentizer, and `approximation_resolution` is deleted with the
+  floor. Deterministic pairs are unchanged: their influence collapses to zero and no
+  p-value is emitted.
+  **Behavior change:** composition p-values on stochastic pairs are smaller, and the
+  test's power now grows with the sample.
 - **One owner for the uniform cyclic domain grid, and it closes on its end** (#3179 item 6).
   `basis_with_jet(kind="bspline", periodic=True, n_basis=k)` built its knot grid with
   `Array1::linspace(0.0, 1.0, k + 1)`, a second copy of
