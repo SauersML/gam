@@ -62,6 +62,26 @@
   gains `softplus_inverse`, which carries that face back through `softplus` on both
   branches, including where `e^s` itself is not representable.
 
+- **The Duchon bending penalty read a kernel value whose binary64 granularity was larger
+  than the penalty itself** (gam#4558). The constrained Gram `Ω_c = α² Zᵀ K_CC Z` was
+  assembled from the hybrid kernel's VALUE. With `b = p + s − d/2` that value is
+  `φ(r) = pref · κ^{−2b} · G(κ r)` for a profile `G` that is `O(1)` at the origin, so a long
+  length scale makes it a huge constant carrying a relatively tiny shape, and `Z` — which
+  annihilates the polynomials of degree `< p` — keeps only the shape. At `d = 1, p = 2,
+  s = 2, length_scale = 100` the fixture's centers span `κ r ≤ 0.02`: `φ ≈ 1.25e14` while
+  the leading term `Z` keeps is `≈ 1.0e4 r⁴`, and one binary64 holds `φ(r)` only to
+  `ulp(1.25e14) = 1.6e−2`. The projection therefore inherited an absolute error of that
+  size and `d1_hybrid_penalty_is_psd_1604` refused a `−1.2e−7 · λ_max` mode. No evaluator
+  repairs this — the digits are not in the rounded value — which is why the withdrawn
+  `φ(r) − φ(0)` attempt reproduced the same mode to two digits. The penalty now reads the
+  NULL-SPACE-REDUCED kernel: `Σ_{j<p} c_{2j} r^{2j}`, the pure even Taylor coefficients
+  below `r^{2p}`, is removed in closed form, which changes nothing in exact arithmetic
+  because `Zᵀ (r^{2j}) Z = 0` identically for `j ≤ p−1`. The reduced value is assembled
+  either as a Taylor series over the orders the head does not cover — skipping the orders
+  that vanish structurally rather than summing them to rounding — or as the
+  partial-fraction sum minus the head, whichever of the two reports the smaller bound on
+  its own assembly. The kernel's value, which a Nyström chart of the kernel operator and
+  the forward design still read, is unchanged.
 - **A chart gauge normalized axes whose spread was its own rounding, and the stretches
   compounded into the smoothness Gram** (gam#2822).
   `canonicalize_atom_affine_gauge` divides each latent axis by its weighted rms, and it

@@ -756,12 +756,8 @@ pub(crate) fn duchon_matern_block_taylor_r2j(
     k_dim: usize,
     j: usize,
 ) -> (f64, f64) {
-    let n = n_order as f64;
-    let k_half = 0.5 * k_dim as f64;
-    let nu = n - k_half;
-    // Normalization constant for the Matérn block.
-    let c = kappa.powf(k_half - n)
-        / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
+    let c = duchon_matern_block_normalization(kappa, n_order, k_dim);
+    let nu = n_order as f64 - 0.5 * k_dim as f64;
 
     if k_dim.is_multiple_of(2) {
         // Integer ν.
@@ -771,6 +767,45 @@ pub(crate) fn duchon_matern_block_taylor_r2j(
         // Half-integer ν.
         duchon_matern_block_taylor_r2j_half_integer_nu(kappa, c, nu, j)
     }
+}
+
+/// The normalization constant `c` of one Matérn partial-fraction block
+/// `g_n(r) = c · r^ν K_{|ν|}(κ r)`, `ν = n − d/2`.
+#[inline(always)]
+fn duchon_matern_block_normalization(kappa: f64, n_order: usize, k_dim: usize) -> f64 {
+    let n = n_order as f64;
+    let k_half = 0.5 * k_dim as f64;
+    kappa.powf(k_half - n)
+        / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n))
+}
+
+/// The `r^k` Taylor coefficient (pure and `ln r` parts) of one Matérn
+/// partial-fraction block, for ANY integer power `k` — not only the even ones
+/// [`duchon_matern_block_taylor_r2j`] exposes.
+///
+/// A collision derivative reads only even powers, because the odd powers of an
+/// isotropic kernel carry no even-order radial derivative at the origin. The
+/// null-space-reduced kernel (gam#4558) reads both: in odd `d` the hybrid
+/// kernel's NON-analytic sector is exactly its odd powers, and that sector is
+/// what survives the constraint projection once the polynomial head is gone.
+///
+/// In even `d` (integer ν) the expansion is a series in `r²`, so an odd `k` is
+/// absent rather than small.
+pub(crate) fn duchon_matern_block_taylor_rk(
+    kappa: f64,
+    n_order: usize,
+    k_dim: usize,
+    k: usize,
+) -> (f64, f64) {
+    if k.is_multiple_of(2) {
+        return duchon_matern_block_taylor_r2j(kappa, n_order, k_dim, k / 2);
+    }
+    if k_dim.is_multiple_of(2) {
+        return (0.0, 0.0);
+    }
+    let c = duchon_matern_block_normalization(kappa, n_order, k_dim);
+    let nu = n_order as f64 - 0.5 * k_dim as f64;
+    duchon_matern_block_taylor_rk_half_integer_nu(kappa, c, nu, k)
 }
 
 #[inline(always)]
@@ -1011,6 +1046,19 @@ pub(crate) fn duchon_matern_block_taylor_r2j_half_integer_nu(
     nu: f64,
     j: usize,
 ) -> (f64, f64) {
+    duchon_matern_block_taylor_rk_half_integer_nu(kappa, c, nu, 2 * j)
+}
+
+/// [`duchon_matern_block_taylor_r2j_half_integer_nu`] at an arbitrary integer
+/// power `k`. For half-integer ν every power of `r` in the expansion is an
+/// integer, odd as well as even, so the even-only entry point above is this
+/// one at `k = 2j`.
+pub(crate) fn duchon_matern_block_taylor_rk_half_integer_nu(
+    kappa: f64,
+    c: f64,
+    nu: f64,
+    k: usize,
+) -> (f64, f64) {
     let nu_abs = nu.abs();
     // |ν| = l + ½ ⇒ l = |ν| − ½. (The earlier `2|ν| − 1` form computed `2l`,
     // not `l` — see the matching note in `duchon_matern_block_taylor_r2j_triplet`;
@@ -1029,9 +1077,9 @@ pub(crate) fn duchon_matern_block_taylor_r2j_half_integer_nu(
     // each monomial with e^{−κr} = Σ_q (−κ)^q r^q / q! and extract the
     // r^{2j} coefficient.
     //
-    // For monomial r^p (p = ν−½−i) times e^{−κr}: the r^{2j} coefficient is
-    //   (−κ)^{2j−p} / (2j−p)!   when 2j−p is a non-negative integer.
-    let target = 2 * j;
+    // For monomial r^p (p = ν−½−i) times e^{−κr}: the r^k coefficient is
+    //   (−κ)^{k−p} / (k−p)!   when k−p is a non-negative integer.
+    let target = k;
     let mut pure = 0.0;
 
     for i in 0..=l {
@@ -1066,10 +1114,21 @@ pub(crate) fn duchon_matern_block_taylor_r2j_half_integer_nu(
 /// Log case (d even, m ≥ d/2): Φ_m = c · r^α · ln(r).
 ///   Only contributes when α = 2j: pure_coeff = 0, log_coeff = c.
 pub(crate) fn duchon_polyharmonic_block_taylor_r2j(m: usize, k_dim: usize, j: usize) -> (f64, f64) {
+    duchon_polyharmonic_block_taylor_rk(m, k_dim, 2 * j)
+}
+
+/// [`duchon_polyharmonic_block_taylor_r2j`] at an arbitrary integer power `k`.
+///
+/// A polyharmonic block is the single monomial `c · r^{2m−d}` (times `ln r` in
+/// the log case), so it contributes to exactly one power. In odd `d` that
+/// power is odd, which is why the even-only entry point above always reports
+/// zero there and the null-space-reduced kernel (gam#4558) must ask for the
+/// odd powers by name.
+pub(crate) fn duchon_polyharmonic_block_taylor_rk(m: usize, k_dim: usize, k: usize) -> (f64, f64) {
     let k_half = 0.5 * k_dim as f64;
     let alpha = 2 * m as i64 - k_dim as i64;
 
-    if alpha != 2 * j as i64 {
+    if alpha != k as i64 {
         return (0.0, 0.0);
     }
 

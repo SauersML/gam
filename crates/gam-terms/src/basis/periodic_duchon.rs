@@ -1694,14 +1694,30 @@ pub(crate) fn duchon_constrained_bending_penalty(
     aniso_log_scales: Option<&[f64]>,
     kernel_transform: &Array2<f64>,
 ) -> Result<Array2<f64>, BasisError> {
-    let (center_kernel, kernel_amp) = duchon_center_kernel_value_matrix(
+    let (center_kernel, kernel_amp) = duchon_center_kernel_matrix(
         centers,
         length_scale,
         power,
         nullspace_order,
         aniso_log_scales,
+        DuchonCenterKernelForm::NullspaceReduced,
     )?;
     duchon_constrained_bending_penalty_from_kernel(&center_kernel, kernel_amp, kernel_transform)
+}
+
+/// Which form of the center-pair kernel a consumer needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DuchonCenterKernelForm {
+    /// The kernel's value, `K_CC[i][j] = φ(r_ij)`: what a Nyström chart of the
+    /// kernel OPERATOR reads, and what the forward design multiplies by `α`.
+    Value,
+    /// The value with the polynomial head the Duchon constraint null space
+    /// annihilates removed in closed form: what `Ω_c = α² Zᵀ K_CC Z` reads.
+    /// The two forms are identical under `Zᵀ · Z` in exact arithmetic, and the
+    /// reduced one is the only one that survives the projection in binary64 at
+    /// a long length scale — see
+    /// [`duchon_hybrid_kernel_nullspace_reduced`] (gam#4558).
+    NullspaceReduced,
 }
 
 /// Exact center-pair kernel values and the chart amplification applied by the
@@ -1713,6 +1729,28 @@ pub(crate) fn duchon_center_kernel_value_matrix(
     power: f64,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: Option<&[f64]>,
+) -> Result<(Array2<f64>, f64), BasisError> {
+    duchon_center_kernel_matrix(
+        centers,
+        length_scale,
+        power,
+        nullspace_order,
+        aniso_log_scales,
+        DuchonCenterKernelForm::Value,
+    )
+}
+
+/// [`duchon_center_kernel_value_matrix`] in the caller's choice of form. The
+/// chart amplification `α` is the same object in both: it is the forward
+/// design's amplitude, read from the kernel's VALUE at the frozen reference
+/// pair, and the penalty lives in the coefficient frame that amplitude defines.
+pub(crate) fn duchon_center_kernel_matrix(
+    centers: ArrayView2<'_, f64>,
+    length_scale: Option<f64>,
+    power: f64,
+    nullspace_order: DuchonNullspaceOrder,
+    aniso_log_scales: Option<&[f64]>,
+    form: DuchonCenterKernelForm,
 ) -> Result<(Array2<f64>, f64), BasisError> {
     let dim = centers.ncols();
     if dim == 0 {
@@ -1752,6 +1790,13 @@ pub(crate) fn duchon_center_kernel_value_matrix(
         pure_poly_coeff.as_ref(),
     );
     let axis_scales = aniso_log_scales.map(aniso_axis_scales);
+    // The reduction is defined on the partial-fraction blocks. The
+    // `duchon_hybrid_stable_integral_applies` orders evaluate the kernel
+    // through the radial profile instead, and keep the value — see the closing
+    // note on [`duchon_hybrid_kernel_nullspace_reduced`].
+    let reduce_hybrid_head = form == DuchonCenterKernelForm::NullspaceReduced
+        && !pure
+        && !duchon_hybrid_stable_integral_applies(p_order, s_int, dim);
 
     // K_CC: kernel value at every center pair (anisotropic distance when set).
     let mut center_kernel = Array2::<f64>::zeros((k, k));
@@ -1762,7 +1807,26 @@ pub(crate) fn duchon_center_kernel_value_matrix(
             euclidean_distance_rows(centers, i, centers, j)
         };
         if let Some(ppc) = pure_poly_coeff.as_ref() {
+            // The pure polyharmonic kernel is a single monomial `c·r^{2m−d}`
+            // (times `ln r` in the log case). It carries no origin constant to
+            // lose, so the projection reads it at full relative precision and
+            // there is nothing for the reduction to remove.
             Ok(ppc.eval(r))
+        } else if reduce_hybrid_head {
+            let length_scale = length_scale.ok_or_else(|| {
+                BasisError::InvalidInput(
+                    "Duchon null-space-reduced center kernel requires a hybrid length scale"
+                        .to_string(),
+                )
+            })?;
+            let coeffs = coeffs.as_ref().ok_or_else(|| {
+                BasisError::InvalidInput(
+                    "Duchon null-space-reduced center kernel requires partial-fraction \
+                     coefficients"
+                        .to_string(),
+                )
+            })?;
+            duchon_hybrid_kernel_nullspace_reduced(r, length_scale, p_order, s_int, dim, coeffs)
         } else {
             duchon_matern_kernel_general_from_distance(
                 r,
@@ -1950,12 +2014,16 @@ pub(crate) fn duchon_native_penalty_candidates_with_curvature(
     // ω = α² · Zᵀ K_CC Z, embedded in the kernel block of the
     // (n_kernel + poly) pre-identifiability frame (polynomial columns carry no
     // native roughness), then mapped through the outer identifiability `T`.
-    let (center_kernel, kernel_amp) = duchon_center_kernel_value_matrix(
+    // `Z` annihilates the kernel's polynomial head exactly, so the penalty is
+    // assembled from the reduced form, which is the same object and the only
+    // one that keeps its digits through the projection (gam#4558).
+    let (center_kernel, kernel_amp) = duchon_center_kernel_matrix(
         centers,
         length_scale,
         power,
         nullspace_order,
         aniso_log_scales,
+        DuchonCenterKernelForm::NullspaceReduced,
     )?;
     let omega = match reduced_curvature {
         Some(curvature) => {

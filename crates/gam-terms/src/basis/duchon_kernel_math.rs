@@ -2130,6 +2130,278 @@ pub(crate) fn duchon_hybrid_kernel_near_collision_value(
     Ok(value)
 }
 
+/// One `r^k` Taylor coefficient of the hybrid Duchon–Matérn kernel, assembled
+/// from its partial-fraction blocks.
+struct DuchonHybridTaylorTerm {
+    /// The coefficient of `r^k`.
+    pure: f64,
+    /// The coefficient of `r^k · ln r`.
+    log: f64,
+    /// The sum of the absolute block contributions to `pure` — the roundoff
+    /// scale of THAT assembly, so a caller bounds its own error from the
+    /// numbers actually added instead of assuming one. An order whose
+    /// coefficient vanishes structurally has a scale that does not, which is
+    /// the whole reason such orders are skipped rather than summed.
+    pure_scale: f64,
+    /// The same, for `log`.
+    log_scale: f64,
+}
+
+/// Assemble [`DuchonHybridTaylorTerm`] at order `k` from the partial-fraction
+/// blocks. This is the general-order form of the sum
+/// [`duchon_hybrid_kernel_collision_value`] takes at `k = 0`.
+fn duchon_hybrid_taylor_rk(
+    kappa: f64,
+    k_dim: usize,
+    coeffs: &DuchonPartialFractionCoeffs,
+    k: usize,
+) -> DuchonHybridTaylorTerm {
+    let mut pure = CompensatedSum::default();
+    let mut log = CompensatedSum::default();
+    let mut pure_scale = 0.0_f64;
+    let mut log_scale = 0.0_f64;
+    for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
+        if a_m == 0.0 {
+            continue;
+        }
+        let (block_pure, block_log) = duchon_polyharmonic_block_taylor_rk(m, k_dim, k);
+        let term_pure = a_m * block_pure;
+        let term_log = a_m * block_log;
+        pure.add(term_pure);
+        log.add(term_log);
+        pure_scale += term_pure.abs();
+        log_scale += term_log.abs();
+    }
+    for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
+        if b_n == 0.0 {
+            continue;
+        }
+        let (block_pure, block_log) = duchon_matern_block_taylor_rk(kappa, n, k_dim, k);
+        let term_pure = b_n * block_pure;
+        let term_log = b_n * block_log;
+        pure.add(term_pure);
+        log.add(term_log);
+        pure_scale += term_pure.abs();
+        log_scale += term_log.abs();
+    }
+    DuchonHybridTaylorTerm {
+        pure: pure.value(),
+        log: log.value(),
+        pure_scale,
+        log_scale,
+    }
+}
+
+/// `q!` overflows binary64 past `q = 170`. Every block's `r^k` coefficient
+/// carries a `1/(k − q₀)!` with `q₀ ≤ s`, so no order above `s + 170` has a
+/// representable coefficient at all: this is the Taylor form's own ceiling,
+/// not a budget chosen for it.
+const DUCHON_TAYLOR_ORDER_CEILING: usize = 170;
+
+/// The hybrid Duchon–Matérn kernel with the polynomial head that the Duchon
+/// constraint null space annihilates removed in closed form (gam#4558).
+///
+/// ## What is removed, and why the penalty is unchanged by removing it
+///
+/// `Z` spans the orthogonal complement, at the centers, of the polynomials of
+/// degree `< p`. Expanding `r_ij^{2j} = (|c_i|² − 2 c_i·c_j + |c_j|²)^j` gives
+/// monomials `(|c_i|²)^a (c_i·c_j)^e (|c_j|²)^f` with `a + e + f = j`, whose
+/// degrees `2a + e` in `c_i` and `2f + e` in `c_j` sum to `2j`; for `j ≤ p−1`
+/// at least one of the two is `≤ p−1`, so `Zᵀ (r^{2j}) Z = 0` IDENTICALLY.
+/// Subtracting `Σ_{j<p} c_{2j} r^{2j}` — the PURE (non-`ln r`) even Taylor
+/// coefficients of `φ` below `r^{2p}` — therefore leaves
+/// `Ω_c = α² Zᵀ K_CC Z` unchanged in exact arithmetic. `r^{2j} ln r` is not a
+/// polynomial, so the `ln r` coefficients are NOT part of the head and stay in
+/// the value.
+///
+/// ## Why the penalty cannot read `φ(r)` itself at a long length scale
+///
+/// With `b = p + s − d/2` the kernel is `φ(r) = pref · κ^{−2b} · G(κ r)` for a
+/// profile `G` that is `O(1)` at the origin, so a long length scale makes the
+/// VALUE a huge constant while the penalty's content stays a relatively tiny
+/// shape. At `d = 1, p = 2, s = 2, length_scale = 100` the fixture's centers
+/// span `κ r ≤ 0.02`: `φ ≈ 1.25e14` while the leading term `Z` keeps is
+/// `g₂ κ^{−3} r⁴ ≈ 1.0e4 r⁴`. One binary64 holds `φ(r)` to
+/// `ulp(1.25e14) = 1.6e−2`, so `Zᵀ K_CC Z` inherits an absolute error of that
+/// size against a signal of `1.0e4 r⁴` — `1.2e−7` of `λ_max` at the fixture's
+/// radii, which is the mode `d1_hybrid_penalty_is_psd_1604` refused. No
+/// evaluator repairs that: the digits are not in the rounded value.
+/// Subtracting a separately computed `φ(0)` from it reproduces the same mode
+/// to two digits, because the difference inherits the granularity it was meant
+/// to remove — which is what the withdrawn `φ(r) − φ(0)` attempt measured.
+///
+/// ## The two forms, and which one answers
+///
+/// * **Series.** `Σ_k C_k r^k` over the orders the head does not cover, each
+///   `C_k` assembled by [`duchon_hybrid_taylor_rk`]. The orders that vanish
+///   identically are SKIPPED, not summed: the analytic sector is even and the
+///   reduction starts it at `r^{2p}` (below that it IS the head), and the
+///   non-analytic sector starts at `r^{2(p+s)−d}` — in odd `d` that sector is
+///   the odd powers, whose coefficients below it cancel exactly across the
+///   blocks and would otherwise contribute `ε · κ^{−2(p+s−1)}` of pure
+///   rounding (`2.2e−4` at the fixture above, against a `1.0e4` answer).
+/// * **Difference.** The partial-fraction sum minus the head. This is the
+///   accurate form once `κ r` is large enough that the head no longer
+///   dominates, and the only one defined when `2(p+s) ≤ d`, where the kernel is
+///   singular at the origin and has no analytic head.
+///
+/// Neither is a fallback for the other. Each reports the absolute error its own
+/// assembly can guarantee — rounding over the terms actually added, plus, for
+/// the series, the geometric bound on the tail past its last term — and the
+/// smaller bound answers.
+///
+/// ## Not taken here
+///
+/// [`duchon_hybrid_stable_integral_applies`] orders (`2p < d`) evaluate `φ`
+/// through the profile, not through these blocks, and keep the unreduced value:
+/// the same head domination exists there and its head is a different closed
+/// form, `c_{2j} = pref · κ^{2j−2b} · Γ(b) · B(s−b+j, p) / (4^j · j! · (1−b)_j)`
+/// (finite for every `j ≤ p−1` on that branch, since `b > p` there). No
+/// measurement calls for it yet, so it is recorded rather than written.
+pub(crate) fn duchon_hybrid_kernel_nullspace_reduced(
+    r: f64,
+    length_scale: f64,
+    p_order: usize,
+    s_order: usize,
+    k_dim: usize,
+    coeffs: &DuchonPartialFractionCoeffs,
+) -> Result<f64, BasisError> {
+    if !r.is_finite() || r < 0.0 {
+        crate::bail_invalid_basis!(
+            "Duchon null-space-reduced kernel distance must be finite and non-negative"
+        );
+    }
+    let kappa = duchon_inverse_length_scale(length_scale, "Duchon null-space-reduced kernel")?;
+    // The kernel's spectrum decays as ρ^{-2(p+s)}, so its origin expansion
+    // carries r^{2(p+s)-d} beside the analytic even series. That power is the
+    // first order of the non-analytic sector, and `2(p+s) > d` — the kernel's
+    // own existence condition — is what makes the analytic head exist at all.
+    let non_analytic = 2 * (p_order + s_order) as i64 - k_dim as i64;
+    let analytic_start = 2 * p_order;
+
+    if r == 0.0 {
+        if non_analytic <= 0 {
+            crate::bail_invalid_basis!(
+                "Duchon null-space-reduced kernel at r=0 requires 2(p+s) > d; \
+                 got p={p_order}, s={s_order}, d={k_dim}"
+            );
+        }
+        // Every order the reduction keeps is `r^k` with `k ≥ 1`, and the head is
+        // exactly `φ(0)` at `k = 0`: the reduced diagonal is zero, not rounded.
+        return Ok(0.0);
+    }
+
+    // The head, at this radius.
+    let mut head = CompensatedSum::default();
+    let mut head_scale = 0.0_f64;
+    let mut even_power = 1.0_f64;
+    for j in 0..p_order {
+        let term = duchon_hybrid_taylor_rk(kappa, k_dim, coeffs, 2 * j);
+        head.add(term.pure * even_power);
+        head_scale += term.pure_scale * even_power;
+        even_power *= r * r;
+    }
+    let head = head.value();
+
+    // Difference form: the partial-fraction sum, with the head taken off inside
+    // the same compensated accumulation rather than after it.
+    let mut difference = CompensatedSum::default();
+    let mut difference_scale = head_scale;
+    difference.add(-head);
+    for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
+        if a_m == 0.0 {
+            continue;
+        }
+        let value = a_m * polyharmonic_kernel(r, m as f64, k_dim);
+        difference.add(value);
+        difference_scale += value.abs();
+    }
+    for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
+        if b_n == 0.0 {
+            continue;
+        }
+        let value = b_n * duchon_matern_block(r, kappa, n, k_dim)?;
+        difference.add(value);
+        difference_scale += value.abs();
+    }
+    let mut best_value = difference.value();
+    let difference_error = f64::EPSILON * difference_scale;
+
+    // Series form.
+    if non_analytic >= 1 {
+        let z = kappa * r;
+        let ln_r = r.ln();
+        let start = analytic_start.min(non_analytic as usize);
+        let mut series = CompensatedSum::default();
+        let mut series_scale = 0.0_f64;
+        let mut power = r.powi(start as i32);
+        let mut k = start;
+        let mut certified: Option<f64> = None;
+        while k <= s_order + DUCHON_TAYLOR_ORDER_CEILING {
+            let term = duchon_hybrid_taylor_rk(kappa, k_dim, coeffs, k);
+            let even = k.is_multiple_of(2);
+            // Below `2p` the even sector is the head; below `2(p+s)−d` the
+            // non-analytic sector's coefficients vanish identically.
+            let keeps_pure = (even && k >= analytic_start) || (!even && (k as i64) >= non_analytic);
+            let keeps_log = (k as i64) >= non_analytic;
+            let mut coefficient = 0.0_f64;
+            let mut kept_scale = 0.0_f64;
+            if keeps_pure {
+                coefficient += term.pure;
+                kept_scale += term.pure_scale;
+            }
+            if keeps_log {
+                coefficient += term.log * ln_r;
+                kept_scale += term.log_scale * ln_r.abs();
+            }
+            series.add(coefficient * power);
+            // What was summed sets the rounding; what the order COULD carry —
+            // including a channel this order skips — sets the bound on what
+            // follows it, so a structurally vanishing order cannot certify a
+            // tail it says nothing about.
+            series_scale += kept_scale * power;
+            let order_bound = (term.pure_scale + term.log_scale * ln_r.abs()) * power;
+            if !(series_scale.is_finite() && order_bound.is_finite()) {
+                break;
+            }
+            // Every block's order-`k` coefficient carries `(−κ)^{k−q₀}/(k−q₀)!`
+            // for a block-fixed `q₀ ≤ s`, so past `k = s` the per-order ratio is
+            // at most `z / (k − s)`, and past `k = 2p` — beyond every
+            // polyharmonic block, which contributes to a single order — that
+            // ratio is the whole of it. Where the ratio is below one half the
+            // untaken tail is a geometric series on this order's own scale.
+            if k > analytic_start && (k as f64) > s_order as f64 + 2.0 * z {
+                let ratio = z / (k as f64 - s_order as f64);
+                let tail = order_bound * ratio / (1.0 - ratio);
+                if tail <= f64::EPSILON * series_scale {
+                    certified = Some(f64::EPSILON * series_scale + tail);
+                    break;
+                }
+            }
+            if f64::EPSILON * series_scale >= difference_error {
+                // The series' rounding alone has passed the form already in
+                // hand; paying for more orders cannot change the answer.
+                break;
+            }
+            k += 1;
+            power *= r;
+        }
+        if let Some(error) = certified {
+            if error < difference_error {
+                best_value = series.value();
+            }
+        }
+    }
+
+    if !best_value.is_finite() {
+        crate::bail_invalid_basis!(
+            "non-finite Duchon null-space-reduced kernel at r={r}, p={p_order}, \
+             s={s_order}, d={k_dim}"
+        );
+    }
+    Ok(best_value)
+}
+
 #[inline(always)]
 pub(crate) fn stable_euclidean_norm<I>(components: I) -> f64
 where
@@ -3354,6 +3626,179 @@ mod duchon_hybrid_psd_tests {
                 );
             }
         }
+    }
+
+    /// The `d = 1, p = 2, s = 2` hybrid kernel with its polynomial head
+    /// removed, in closed form and independent of the production assembly.
+    ///
+    /// The partial-fraction data of that shape are `a₁ = −2κ^{-6}`,
+    /// `a₂ = κ^{-4}`, `b₁ = 2κ^{-6}`, `b₂ = κ^{-4}` over blocks `Φ₁ = −r/2`,
+    /// `Φ₂ = r³/12`, `M₁ = e^{-κr}/(2κ)` and
+    /// `M₂ = e^{-κr}(r/(4κ²) + 1/(4κ³))`, so
+    /// `φ(r) = κ^{-7}[ z + z³/12 + e^{-z}(5/4 + z/4) ]` with `z = κ r`.
+    /// Expanding the exponential, the `z` and `z³` coefficients cancel the two
+    /// polyharmonic blocks EXACTLY, leaving
+    /// `φ(r) = κ^{-7} Σ_k (−1)^k (5/4 − k/4) z^k / k!`
+    /// for every `k ∉ {1, 3}`. The head the constraint null space annihilates
+    /// is `k = 0` and `k = 2`, so the reduced kernel is that series from
+    /// `k = 4`, whose first orders are `z⁴/96`, `0·z⁵`, `−z⁶/2880` and
+    /// `z⁷/10080`.
+    fn d1_p2_s2_reduced_closed_form(r: f64, length_scale: f64) -> f64 {
+        let kappa = 1.0 / length_scale;
+        let z = kappa * r;
+        let mut sum = 0.0_f64;
+        let mut factorial = 24.0_f64; // 4!
+        let mut z_power = z * z * z * z;
+        // `z ≤ 4` on every fixture below and the terms fall off as `z/k`, so by
+        // `k = 60` the omitted tail is under 1e-40 of the leading order.
+        for k in 4..60usize {
+            let sign = if k.is_multiple_of(2) { 1.0 } else { -1.0 };
+            sum += sign * (1.25 - 0.25 * k as f64) / factorial * z_power;
+            factorial *= (k + 1) as f64;
+            z_power *= z;
+        }
+        sum * kappa.powi(-7)
+    }
+
+    /// gam#4558 — the null-space-reduced hybrid kernel against that closed
+    /// form, at four length scales and across the fixture's whole radius range.
+    ///
+    /// The point of the reduction is the long length scale: at
+    /// `length_scale = 100` the kernel's own value is `≈ 1.25e14` while the
+    /// reduced value at `r = 1` is `≈ 1.0e4`, so a form that computes the
+    /// value and subtracts cannot carry more than about seven digits. The bar
+    /// here is relative and the same at every scale, so a route that degraded
+    /// with `κ` would fail at the long end while passing at the short one.
+    #[test]
+    fn nullspace_reduced_hybrid_kernel_matches_its_closed_form_4558() {
+        let (d, p_order, s_order) = (1usize, 2usize, 2usize);
+        for &length_scale in &[0.5f64, 1.0, 10.0, 100.0] {
+            let kappa = 1.0 / length_scale;
+            let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+            for &r in &[1.0e-8_f64, 1.0e-4, 0.01, 0.1, 0.25, 0.5, 1.0, 1.5, 2.0] {
+                let got = duchon_hybrid_kernel_nullspace_reduced(
+                    r,
+                    length_scale,
+                    p_order,
+                    s_order,
+                    d,
+                    &coeffs,
+                )
+                .expect("the reduced hybrid kernel is defined for d=1, p=2, s=2");
+                let want = d1_p2_s2_reduced_closed_form(r, length_scale);
+                let relative = (got - want).abs() / want.abs().max(f64::MIN_POSITIVE);
+                assert!(
+                    relative <= 1.0e-12,
+                    "reduced hybrid kernel at ls={length_scale}, r={r}: got {got:.17e}, \
+                     closed form {want:.17e} (relative {relative:.3e})"
+                );
+            }
+            // The head is the whole value at the origin, so the reduced
+            // diagonal is exactly zero rather than a rounded difference.
+            let diagonal = duchon_hybrid_kernel_nullspace_reduced(
+                0.0,
+                length_scale,
+                p_order,
+                s_order,
+                d,
+                &coeffs,
+            )
+            .expect("the reduced diagonal is defined");
+            assert_eq!(
+                diagonal, 0.0,
+                "reduced hybrid diagonal at ls={length_scale} is {diagonal:.3e}, not exactly zero"
+            );
+        }
+    }
+
+    /// gam#4558 — the identity the reduction rests on: the Duchon constraint
+    /// null space annihilates every even power `r^{2j}` with `j < p`, which is
+    /// exactly the head the reduced kernel drops. `r^{2p}` is NOT annihilated,
+    /// so the test also shows the head stops where it is claimed to.
+    #[test]
+    fn constraint_nullspace_annihilates_the_head_the_reduction_drops_4558() {
+        let d = 1usize;
+        let nullspace_order = DuchonNullspaceOrder::Linear; // p = 2
+        let centers = fixture_centers(d, 12);
+        let mut cache = BasisCacheContext::default();
+        let z = kernel_constraint_nullspace(centers.view(), nullspace_order, &mut cache)
+            .expect("constraint null space");
+        let k = centers.nrows();
+        for power in [0usize, 2, 4] {
+            let mut matrix = Array2::<f64>::zeros((k, k));
+            for i in 0..k {
+                for j in 0..k {
+                    let r = euclidean_distance_rows(centers.view(), i, centers.view(), j);
+                    matrix[[i, j]] = r.powi(power as i32);
+                }
+            }
+            let scale = matrix.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+            let projected = fast_ab(&fast_atb(&z, &matrix), &z);
+            let projected_scale = projected.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+            if power < 2 * duchon_p_from_nullspace_order(nullspace_order) {
+                assert!(
+                    projected_scale <= 1.0e-13 * scale.max(1.0),
+                    "Zᵀ r^{power} Z must vanish identically: max|·| = {projected_scale:.3e} \
+                     against a max|r^{power}| of {scale:.3e}"
+                );
+            } else {
+                assert!(
+                    projected_scale >= 1.0e-3 * scale,
+                    "Zᵀ r^{power} Z must NOT vanish — the head stops below r^{{2p}}: \
+                     max|·| = {projected_scale:.3e} against a max|r^{power}| of {scale:.3e}"
+                );
+            }
+        }
+    }
+
+    /// gam#4558 — where BOTH forms carry their digits (a short length scale,
+    /// `κ r ≈ 1`, no head domination), the reduced and unreduced kernels must
+    /// give the same constrained penalty. This pins that the reduction changed
+    /// the ARITHMETIC and not the penalty.
+    #[test]
+    fn reduced_and_unreduced_penalties_agree_where_both_are_conditioned_4558() {
+        let d = 1usize;
+        let nullspace_order = DuchonNullspaceOrder::Linear;
+        let power = 2.0_f64;
+        let length_scale = 0.5_f64;
+        let centers = fixture_centers(d, 12);
+        let mut cache = BasisCacheContext::default();
+        let z = kernel_constraint_nullspace(centers.view(), nullspace_order, &mut cache)
+            .expect("constraint null space");
+
+        let reduced = duchon_constrained_bending_penalty(
+            centers.view(),
+            Some(length_scale),
+            power,
+            nullspace_order,
+            None,
+            &z,
+        )
+        .expect("reduced constrained bending penalty");
+
+        let (value_kernel, amplification) = duchon_center_kernel_matrix(
+            centers.view(),
+            Some(length_scale),
+            power,
+            nullspace_order,
+            None,
+            DuchonCenterKernelForm::Value,
+        )
+        .expect("unreduced center kernel");
+        let amp2 = amplification * amplification;
+        let unreduced = fast_ab(&fast_atb(&z, &value_kernel), &z).mapv(|value| value * amp2);
+
+        let scale = reduced.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        let mut worst = 0.0_f64;
+        for (a, b) in reduced.iter().zip(unreduced.iter()) {
+            worst = worst.max((a - b).abs());
+        }
+        assert!(
+            worst <= 1.0e-11 * scale,
+            "reduced and unreduced constrained penalties disagree by {worst:.3e} \
+             against a penalty scale of {scale:.3e} at a length scale where both \
+             forms are conditioned"
+        );
     }
 
     /// No-regression guard: a well-conditioned low-dimensional fixture must keep
