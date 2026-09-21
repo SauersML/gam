@@ -13,7 +13,7 @@
 //!   integrals, each resolved on a grid placed from its own prefix, with the
 //!   prior's absolute mass intact.
 
-use crate::chain::{Grid, log_sum_exp, normal_density};
+use crate::chain::{Grid, SplitDensity, log_standard_prior, log_sum_exp};
 use crate::cohort::EventHistoryError;
 use crate::marginal::{ForwardPass, NodeLikelihood, Spell, SubjectInputs, centred_baseline, condition, node_likelihood};
 use crate::scalar::{add_real, div, exp, ln, sqrt};
@@ -37,7 +37,7 @@ pub(crate) fn is_static<S: JetField>(rates: &[S]) -> bool {
     !rates.is_empty() && rates.iter().all(|r| r.value() == 0.0)
 }
 
-pub(crate) fn filter<S: JetField>(inputs: &SubjectInputs<'_, S>, initial: Option<(&Grid<S>, &[S])>,
+pub(crate) fn filter<S: JetField>(inputs: &SubjectInputs<'_, S>, initial: Option<(&Grid<S>, &[S], &SplitDensity<S>)>,
     compensated: &[bool]) -> Result<ForwardPass<S>, EventHistoryError> {
     Ok(conditioned(inputs, initial, compensated, false)?.0)
 }
@@ -45,34 +45,38 @@ pub(crate) fn filter<S: JetField>(inputs: &SubjectInputs<'_, S>, initial: Option
 /// [`filter`] together with the likelihood each node was conditioned on, every
 /// one on the pass's single grid; `derivatives` keeps their scores and
 /// curvatures too, for a caller that differentiates the pass.
-pub(crate) fn conditioned<S: JetField>(inputs: &SubjectInputs<'_, S>, initial: Option<(&Grid<S>, &[S])>,
-    compensated: &[bool], derivatives: bool) -> Result<(ForwardPass<S>, Vec<NodeLikelihood<S>>), EventHistoryError> {
+pub(crate) fn conditioned<S: JetField>(inputs: &SubjectInputs<'_, S>,
+    initial: Option<(&Grid<S>, &[S], &SplitDensity<S>)>, compensated: &[bool], derivatives: bool)
+    -> Result<(ForwardPass<S>, Vec<NodeLikelihood<S>>), EventHistoryError> {
     let like = &inputs.eta0[0];
     let marks = inputs.nodes.counts.ncols();
     let atoms = inputs.rates.len();
-    let (grid, mut density) = match initial {
-        Some((grid, density)) => (grid.clone(), density.to_vec()),
+    let (grid, mut log_density) = match initial {
+        Some((grid, log_density, _)) => (grid.clone(), log_density.to_vec()),
         None => {
             let grid = posterior_grid(inputs, compensated)?;
-            let density = prior(&grid, like);
-            (grid, density)
+            let log_density = log_standard_prior(&grid, like);
+            (grid, log_density)
         }
     };
     let grid = Arc::new(grid);
-    let mut pass = ForwardPass { grids: Vec::new(), alpha: Vec::new(), predicted: Vec::new(), log_normalisers: Vec::new() };
+    let mut pass = ForwardPass { grids: Vec::new(), log_alpha: Vec::new(), log_predicted: Vec::new(),
+        log_normalisers: Vec::new(), densities: Vec::new() };
     let mut likelihoods = Vec::with_capacity(inputs.nodes.len());
     for n in 0..inputs.nodes.len() {
         let likelihood = node_likelihood(&grid, &inputs.eta0[n * marks..(n + 1) * marks],
             inputs.loadings, &inputs.nodes.counts.row(n).to_vec(), &inputs.nodes.exposure_row(n),
             Some(compensated), inputs.log_normaliser.map(|m| &m[n * marks..(n + 1) * marks]), marks, atoms,
             derivatives);
-        let (updated, mass) = condition(&grid, &density, &likelihood.ell, likelihood.shift, "static frailty")?;
-        pass.predicted.push(density);
+        let updated = condition(&grid, &log_density, &likelihood.ell, likelihood.shift, "static frailty")?;
+        pass.log_predicted.push(log_density);
         pass.grids.push(Arc::clone(&grid));
-        pass.log_normalisers.push(add_real(&ln(&mass), likelihood.shift));
-        pass.alpha.push(updated.clone());
+        pass.log_normalisers.push(add_real(&updated.log_normaliser, likelihood.shift));
+        pass.log_alpha.push(updated.log_alpha.clone());
+        // No gap moves a static frailty, so no kernel ever reads a split.
+        pass.densities.push(SplitDensity::whole(&updated.log_alpha));
         likelihoods.push(likelihood);
-        density = updated;
+        log_density = updated.log_alpha;
     }
     Ok((pass, likelihoods))
 }
@@ -149,13 +153,6 @@ fn solve<S: JetField>(matrix: &[S], rhs: &[S]) -> Result<Vec<S>, EventHistoryErr
         out[i] = div(&out[i], &lower[i * n + i]);
     }
     Ok(out)
-}
-
-pub(crate) fn prior<S: JetField>(grid: &Grid<S>, like: &S) -> Vec<S> {
-    let zero = like.constant_like(0.0);
-    let unit = like.constant_like(1.0);
-    (0..grid.size()).map(|i| (0..grid.dimension()).fold(unit.clone(), |p, k|
-        p.mul(&normal_density(grid.coordinate(i, k), &zero, &unit)))).collect()
 }
 
 /// What a static factor's likelihood over a run of nodes depends on the state
@@ -913,14 +910,18 @@ mod tests {
 
     /// `Bound`'s first-order bound at least doubles through every node the
     /// static filter conditions (#2965), which is why the Louis agreement
-    /// fixtures keep to few nodes. `condition` forms `raw_i = p_i e_i`, the sum
-    /// `c = Σ_j w_j raw_j` and `α_i = raw_i / c`. `Bound` charges a product or a
-    /// quotient at least the sum of its operands' relative bounds, and a sum of
-    /// positive terms at least the smallest of theirs, so the smallest relative
-    /// bound over a node's grid points satisfies `m_n ≥ m_{n−1} + m_{n−1}`. The
-    /// quotient's actual error grows about linearly instead, because the
-    /// numerator and the sum share it. At nineteen nodes: nine Legendre points
-    /// in each of two cells, and the event.
+    /// fixtures keep to few nodes. `condition` forms, in the log domain,
+    /// `raw_i = ln p_i + ell_i − shift`, `t_i = raw_i + ln w_i`,
+    /// `ln c = shift' + ln Σ_j exp(t_j − shift')` and `ln α_i = raw_i − ln c`.
+    /// `Bound` charges a sum or difference at least the sum of its operands'
+    /// absolute bounds, `exp` its argument's absolute bound relative to the
+    /// result, a sum of positive terms at least the smallest relative bound of
+    /// theirs, and `ln` its argument's relative bound. So
+    /// `μ(ln c) ≥ min_j μ(t_j) ≥ min_j μ(ln α_{n−1, j})`, and the smallest
+    /// absolute bound of `ln α` over the one grid satisfies
+    /// `m_n ≥ m_{n−1} + m_{n−1}`. The actual error grows about linearly
+    /// instead, because `raw_i` and `ln c` share it. At nineteen nodes: nine
+    /// Legendre points in each of two cells, and the event.
     #[test]
     fn the_running_bound_doubles_through_the_static_filter_2965() {
         use crate::test_support::Bound;
@@ -943,18 +944,18 @@ mod tests {
             continuation_gap: 0.0, designs: None, log_normaliser: None,
         };
         let pass = filter(&inputs, None, &[true]).unwrap();
-        let smallest: Vec<f64> = pass.alpha.iter().map(|alpha| alpha.iter()
-            .filter(|a| a.value > 0.0)
-            .map(|a| a.rounding() / a.value)
+        let smallest: Vec<f64> = pass.log_alpha.iter().map(|log_alpha| log_alpha.iter()
+            .map(Bound::rounding)
             .fold(f64::INFINITY, f64::min)).collect();
         eprintln!("{} nodes", smallest.len());
         for (n, m) in smallest.iter().enumerate() {
-            eprintln!("node {n}: smallest relative bound {m:e}, ratio {:e}", if n == 0 { f64::NAN } else { m / smallest[n - 1] });
+            eprintln!("node {n}: smallest log-density bound {m:e}, ratio {:e}", if n == 0 { f64::NAN } else { m / smallest[n - 1] });
         }
-        assert!(smallest.len() >= 2 && smallest.iter().all(|m| m.is_finite()), "the filter conditions every node");
+        assert!(smallest.len() >= 2 && smallest.iter().all(|m| m.is_finite() && *m > 0.0),
+            "the filter conditions every node");
         for n in 1..smallest.len() {
             assert!(smallest[n] >= 2.0 * smallest[n - 1],
-                "node {n}: the smallest relative bound {:e} is below twice the previous node's {:e}", smallest[n], smallest[n - 1]);
+                "node {n}: the smallest log-density bound {:e} is below twice the previous node's {:e}", smallest[n], smallest[n - 1]);
         }
     }
 }

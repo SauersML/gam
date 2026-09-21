@@ -681,7 +681,7 @@ mod tests {
         let (base, _) = recurrent_family(0.1, rates.clone(), 9);
         let nodes = base.nodes.max_subject_nodes();
         let mut top = 9;
-        while let Some(next) = positivity_raise(top, nodes, tolerance) {
+        while let Some(next) = next_certifiable_order(top, nodes, tolerance) {
             top = next;
         }
         assert!(top > 9, "a certifiable rung must remain above order 9 over {nodes} nodes");
@@ -709,7 +709,7 @@ mod tests {
         let tolerance = EventHistorySpec::new(Vec::new()).quadrature_tolerance;
         assert!(certifiable(11, 449, tolerance));
         assert!(!certifiable(21, 449, tolerance));
-        assert_eq!(positivity_raise(11, 449, tolerance), None);
+        assert_eq!(next_certifiable_order(11, 449, tolerance), None);
     }
 
     /// The start shift is the one-unit bar's numerator: each term against its

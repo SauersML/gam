@@ -15,8 +15,8 @@ use super::covariance::{
     empirical_bayes_ridge,
 };
 use super::marginal::{
-    Evaluation, LOST_POSITIVITY, SubjectInputs, expected_intensities, forward_filter,
-    pairwise_sum, subject_marginal,
+    Evaluation, SubjectInputs, expected_intensities, forward_filter, pairwise_sum,
+    subject_marginal,
 };
 use super::preserve::{ReferenceGrid, ReferenceStrata, stratum_normalisers};
 use super::scalar::{Tangent, add_real, recip};
@@ -441,10 +441,6 @@ impl EventHistoryFamily {
         self.gh.order
     }
 
-    pub(crate) fn quadrature_tolerance(&self) -> f64 {
-        self.quadrature_tolerance
-    }
-
     pub fn nodes(&self) -> &Arc<CohortNodes> {
         &self.nodes
     }
@@ -634,11 +630,7 @@ impl EventHistoryFamily {
         let subjects = &self.nodes.subjects;
         let gh = &self.gh;
         let time_scale = self.time_scale;
-        let evaluation = if derivatives {
-            Evaluation::Derivatives { tolerance: self.quadrature_tolerance }
-        } else {
-            Evaluation::Value
-        };
+        let evaluation = if derivatives { Evaluation::Derivatives } else { Evaluation::Value };
         let row_direction = |dir: Option<&Array1<f64>>, d: usize, row: usize| -> f64 {
             dir.map_or(0.0, |dir| {
                 let design = &designs[d];
@@ -891,7 +883,7 @@ impl EventHistoryFamily {
                 for node in 0..n {
                     let intensities = expected_intensities(
                         &pass.grids[node],
-                        &pass.predicted[node],
+                        &pass.log_predicted[node],
                         &eta0[node * marks..(node + 1) * marks],
                         &loadings,
                         normaliser.as_ref().map(|m| &m[node * marks..(node + 1) * marks]),
@@ -1673,8 +1665,9 @@ impl Built {
 
 /// Bytes the family's evaluation may hold at once: the streamed backward
 /// kernel row for one gap, the carried `P × S` conditional expectations,
-/// the per-node densities and operators of every node, per parallel
-/// subject, in the widest scalar the outer solve uses (sixteen channels
+/// the per-node densities of every node and the one forward kernel built at
+/// a time (`G³` Lagrange bases and `2G²` inner coordinates per axis, and the
+/// log ratio and inner weights over the grid), per parallel subject, in the widest scalar the outer solve uses (sixteen channels
 /// for mixed reference sensitivities nested over two outer directions).
 fn transient_footprint_bytes(
     order: usize,
@@ -1689,7 +1682,8 @@ fn transient_footprint_bytes(
     let per_subject = 4.0 * s
         + total_width as f64 * s
         + n * s * (4.0 + marks as f64)
-        + n * atoms as f64 * 3.0 * g * g;
+        + atoms as f64 * (g * g * g + 2.0 * g * g)
+        + 2.0 * s;
     let channels = 16.0;
     let bytes = 8.0 * channels * per_subject * rayon::current_num_threads() as f64;
     Ok(bytes)
@@ -1893,8 +1887,6 @@ pub enum DecisionIntegral {
     AddedFactorCurvature,
     /// The likelihood profile along a proposed loading direction.
     DirectionalProfile,
-    /// The grown candidate's posterior at the incumbent's setting.
-    CandidatePosterior,
 }
 
 impl DecisionIntegral {
@@ -1902,7 +1894,6 @@ impl DecisionIntegral {
         match self {
             Self::AddedFactorCurvature => "added_factor_curvature",
             Self::DirectionalProfile => "directional_profile",
-            Self::CandidatePosterior => "candidate_posterior",
         }
     }
 }
@@ -2241,7 +2232,7 @@ fn certifiable(order: usize, max_subject_nodes: usize, tolerance: f64) -> bool {
 /// The Gauss-Hermite order a decision the grid cannot resolve is raised to,
 /// `2·order − 1`, when that rung is itself [`certifiable`]; `None` at the
 /// ladder's top certifiable rung.
-fn positivity_raise(order: usize, max_subject_nodes: usize, tolerance: f64) -> Option<usize> {
+fn next_certifiable_order(order: usize, max_subject_nodes: usize, tolerance: f64) -> Option<usize> {
     let next_order = 2 * order - 1;
     certifiable(next_order, max_subject_nodes, tolerance).then_some(next_order)
 }
@@ -2451,49 +2442,12 @@ pub(crate) fn fit_at_rank(
                 // reference step the reference grid cannot take is read back
                 // typed from the family, for `fit_event_history` to answer by
                 // refining that grid.
-                let message = error.to_string();
-                let failure = typed_failure(
+                return Err(typed_failure(
                     &built.family,
                     format!(
-                        "event-history LAML fit at Gauss-Hermite order {order}, mesh refinement {refinement}: {message}"
+                        "event-history LAML fit at Gauss-Hermite order {order}, mesh refinement {refinement}: {error}"
                     ),
-                );
-                if matches!(failure, EventHistoryError::ReferenceStep { .. }) {
-                    return Err(failure);
-                }
-                // A posterior the grid cannot represent (its interpolant goes
-                // negative where the mass is) is answered by resolving the
-                // grid, which is the ladder this driver already owns — not by
-                // handing the caller a number the representation could not
-                // carry. The grid is raised a rung at a time up to where the
-                // raised rule's interpolant would amplify roundoff past the
-                // certificate's tolerance. A pinned candidate is not raised:
-                // it must stay at the incumbent's setting, so the loss is the
-                // caller's, typed, to answer by raising the incumbent.
-                // Anything else is the caller's to see.
-                if message.contains(LOST_POSITIVITY) {
-                    if pinned.is_some() {
-                        return Err(EventHistoryError::LostPositivity {
-                            reason: format!(
-                                "the candidate at rank {atoms}, pinned at Gauss-Hermite order {order}, mesh refinement {refinement}: {message}"
-                            ),
-                        });
-                    }
-                    let raised = if atoms > 0 {
-                        positivity_raise(order, built.nodes.max_subject_nodes(), spec.quadrature_tolerance)
-                    } else {
-                        None
-                    };
-                    if let Some(next_order) = raised {
-                        log::debug!(
-                            "[event-history] Gauss-Hermite order {order} cannot represent a posterior on this cohort; raising it to {next_order}"
-                        );
-                        order = next_order;
-                        built = build(order, refinement)?;
-                        continue;
-                    }
-                }
-                return Err(failure);
+                ));
             }
         };
         let (covariance, sd) = posterior_scale(&fit, built.family.total_width())?;
@@ -2951,7 +2905,7 @@ fn loading_curvature(probe: &EventHistoryFamily, states: &[ParameterBlockState])
 /// (`2·order − 1`, the step the fit's certificate takes), and the proposal
 /// prices the difference by what it moves ([`proposal_start_shift`]). `None`
 /// where that rung would amplify interpolation roundoff past `tolerance`
-/// ([`positivity_raise`]): the curvature at this order can no longer be
+/// ([`next_certifiable_order`]): the curvature at this order can no longer be
 /// checked. A factor held static has no interpolant and is always checkable.
 fn added_factor_curvature_pair(
     probe: &EventHistoryFamily,
@@ -3038,9 +2992,9 @@ enum Proposal {
 /// direction from the added-factor curvature, its prior from the directional
 /// profiles, and its start loading. Unresolved when a rung's worth of
 /// curvature error moves that start by more than `tolerance` posterior sd
-/// ([`proposal_start_shift`]), when no rung remains to check the curvature
-/// against, or when the curvature or a profile evaluates a posterior the grid
-/// cannot represent (`LostPositivity`).
+/// ([`proposal_start_shift`]), when the profiles one Gauss-Hermite rung up
+/// decide the atom otherwise or move its start by more than `tolerance`
+/// posterior sd, or when no rung remains to check the curvature against.
 fn propose_atom(
     fit: &EventHistoryFit,
     cohort: &EventHistoryCohort,
@@ -3060,13 +3014,6 @@ fn propose_atom(
                 DecisionIntegral::AddedFactorCurvature,
                 Rung::GaussHermite,
                 format!("no Gauss-Hermite rung above order {order} checks the added-factor curvature"),
-            ));
-        }
-        Err(EventHistoryError::LostPositivity { reason }) => {
-            return Ok(Proposal::Unresolved(
-                DecisionIntegral::AddedFactorCurvature,
-                Rung::GaussHermite,
-                reason,
             ));
         }
         Err(error) => return Err(error),
@@ -3108,54 +3055,69 @@ fn propose_atom(
     // tail at the selected `λ̂` is shallower than `resolved_profile_depth` is
     // sampled again under `λ̂`. Final acceptance uses the jointly fitted
     // criterion.
+    //
+    // A profile is a likelihood integral along the whole direction, and far
+    // from zero loading it reads posteriors the curvature at zero never saw,
+    // so every direction is sampled at the probe's order and at the ladder's
+    // next rung, and the proposal both profiles make is compared below.
     let mut priors: Vec<f64> = alongs
         .iter()
         .map(|along| 1.0 / (along.ridge.mode_scale * along.ridge.mode_scale))
         .collect();
-    let (refined, directions) = loop {
+    let (refined, directions, rung_ridge) = loop {
         let mut directions = Vec::with_capacity(marks);
+        let mut rung_directions = Vec::with_capacity(marks);
         for (along, prior) in alongs.iter().zip(priors.iter()) {
-            match direction_profile(fit, along, time_scale, *prior) {
-                Ok(profile) => directions.push(DirectionEvidence::Sampled(profile)),
-                Err(EventHistoryError::LostPositivity { reason }) => {
-                    return Ok(Proposal::Unresolved(
-                        DecisionIntegral::DirectionalProfile,
-                        Rung::GaussHermite,
-                        reason,
-                    ));
-                }
-                Err(error) => return Err(error),
-            }
+            let (profile, rung_profile) =
+                direction_profile(fit, along, time_scale, *prior, curvature.next_order)?;
+            directions.push(DirectionEvidence::Sampled(profile));
+            rung_directions.push(DirectionEvidence::Sampled(rung_profile));
         }
         let refined = empirical_bayes_ridge(&directions)?;
-        let lambda = refined.log_lambda.exp();
-        let unresolved: Vec<usize> = directions
-            .iter()
-            .enumerate()
-            .filter_map(|(d, evidence)| match evidence {
-                DirectionEvidence::Sampled(profile) if lambda.is_finite() => {
-                    let n = profile.points.len();
-                    let penalised = |i: usize| {
-                        profile.values[i] - 0.5 * lambda * profile.points[i] * profile.points[i]
-                    };
-                    let peak = (0..n).map(penalised).fold(f64::NEG_INFINITY, f64::max);
-                    (peak - penalised(n - 1) < resolved_profile_depth()).then_some(d)
-                }
-                _ => None,
-            })
+        let rung_ridge = empirical_bayes_ridge(&rung_directions)?;
+        let shallow = |directions: &[DirectionEvidence], lambda: f64, d: usize| match &directions[d] {
+            DirectionEvidence::Sampled(profile) if lambda.is_finite() => {
+                let n = profile.points.len();
+                let penalised = |i: usize| {
+                    profile.values[i] - 0.5 * lambda * profile.points[i] * profile.points[i]
+                };
+                let peak = (0..n).map(penalised).fold(f64::NEG_INFINITY, f64::max);
+                peak - penalised(n - 1) < resolved_profile_depth()
+            }
+            _ => false,
+        };
+        let lambdas = [refined.log_lambda.exp(), rung_ridge.log_lambda.exp()];
+        let unresolved: Vec<usize> = (0..marks)
+            .filter(|&d| shallow(&directions, lambdas[0], d) || shallow(&rung_directions, lambdas[1], d))
             .collect();
         if unresolved.is_empty() {
-            break (refined, directions);
+            break (refined, directions, rung_ridge);
         }
+        // The smaller selected precision is the wider prior, whose tail
+        // reaches furthest.
+        let lambda = lambdas.iter().copied().filter(|l| l.is_finite()).fold(f64::INFINITY, f64::min);
         log::debug!(
-            "[event-history] rank {rank} → {}: directions {unresolved:?} are not resolved under the selected prior precision {lambda:.4e}; sampling them again under it",
-            rank + 1
+            "[event-history] rank {rank} → {}: directions {unresolved:?} are not resolved under the selected prior precisions {:.4e} and {:.4e} at Gauss-Hermite orders {order}/{}; sampling them again under {lambda:.4e}",
+            rank + 1,
+            lambdas[0],
+            lambdas[1],
+            curvature.next_order
         );
         for d in unresolved {
             priors[d] = lambda;
         }
     };
     let lambda = refined.log_lambda.exp();
+    if refined.accepted != rung_ridge.accepted {
+        return Ok(Proposal::Unresolved(
+            DecisionIntegral::DirectionalProfile,
+            Rung::GaussHermite,
+            format!(
+                "the directional profiles at Gauss-Hermite orders {order} and {} disagree on the atom: evidence {:.3e} against {:.3e} nats, accepted {} against {}",
+                curvature.next_order, refined.gain, rung_ridge.gain, refined.accepted, rung_ridge.accepted
+            ),
+        ));
+    }
     if refined.accepted && lambda.is_finite() {
         let spreads: Vec<f64> = directions
             .iter()
@@ -3185,6 +3147,33 @@ fn propose_atom(
                 ),
             ));
         }
+        // The start is `s·v₀` with `s` the profiles' empirical-Bayes mode
+        // along `v₀`, so the rung's profiles move it by `|s′ − s| / σ₀`
+        // posterior sd; a spread that cannot price it leaves it unbounded.
+        let profile_shift = if spreads[0].is_finite() && spreads[0] > 0.0 {
+            (rung_ridge.mode_scale - refined.mode_scale).abs() / spreads[0]
+        } else {
+            f64::INFINITY
+        };
+        log::debug!(
+            "[event-history] rank {rank} → {}: the directional profiles at Gauss-Hermite order {} move the proposed start by {profile_shift:.3e} posterior sd (mode scale {:.4e} → {:.4e}, evidence {:.3e} → {:.3e} nats)",
+            rank + 1,
+            curvature.next_order,
+            refined.mode_scale,
+            rung_ridge.mode_scale,
+            refined.gain,
+            rung_ridge.gain
+        );
+        if !(profile_shift <= tolerance) {
+            return Ok(Proposal::Unresolved(
+                DecisionIntegral::DirectionalProfile,
+                Rung::GaussHermite,
+                format!(
+                    "the directional profiles between Gauss-Hermite orders {order} and {} move the proposed start by {profile_shift:.3e} posterior sd, above the tolerance {tolerance}",
+                    curvature.next_order
+                ),
+            ));
+        }
         // The node quadrature of the latent path is part of the same integral,
         // so the curvature is also read one mesh rung up, at the same
         // coefficients and order, and priced the same way (#2627). Where no
@@ -3206,17 +3195,7 @@ fn propose_atom(
             atom.log_rate,
             reference_refinement,
         )?;
-        let mesh_curvature = match loading_curvature(&probe, &states) {
-            Ok(mesh_curvature) => mesh_curvature,
-            Err(EventHistoryError::LostPositivity { reason }) => {
-                return Ok(Proposal::Unresolved(
-                    DecisionIntegral::AddedFactorCurvature,
-                    Rung::GaussHermite,
-                    reason,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
+        let mesh_curvature = loading_curvature(&probe, &states)?;
         if mesh_curvature.iter().any(|x| !x.is_finite()) {
             return Err(EventHistoryError::NumericalFailure {
                 reason: format!(
@@ -3272,14 +3251,17 @@ fn resolved_profile_depth() -> f64 {
     -0.5 * f64::EPSILON.ln()
 }
 
-/// The log-likelihood sampled along `atom`'s direction until, under the prior
-/// precision `prior`, its tail is [`resolved_profile_depth`] under the peak.
+/// The log-likelihood sampled along `atom`'s direction at the incumbent's
+/// Gauss-Hermite order and at `rung_order`, on the same points, until under
+/// the prior precision `prior` both tails are [`resolved_profile_depth`]
+/// under their peaks.
 fn direction_profile(
     fit: &EventHistoryFit,
     atom: &NewAtom,
     time_scale: f64,
     prior: f64,
-) -> Result<DirectionProfile, EventHistoryError> {
+    rung_order: usize,
+) -> Result<(DirectionProfile, DirectionProfile), EventHistoryError> {
     let marks = fit.marks();
     let carried = fit.rank();
     let atoms = carried + 1;
@@ -3302,6 +3284,7 @@ fn direction_profile(
         ).map(|family| family.with_reference(fit.family.reference.clone()))
     };
     let probe = build(fit.family.gh.order)?;
+    let rung = build(rung_order)?;
     let width = probe.latent_width();
     let total = probe.total_width();
     let latent_offset = probe.block_offsets()[marks];
@@ -3336,50 +3319,57 @@ fn direction_profile(
         direction[latent_offset + d * atoms + carried] = atom.direction[d];
     }
     // Finite sampled profiles propose a prior. Every sample must be
-    // evaluated successfully at the same quadrature setting; a failed tail
-    // is an unresolved proposal, never an invented continuation, and a sample
-    // the grid cannot represent is refused as `LostPositivity`, at a setting
-    // the incumbent was certified at.
+    // evaluated successfully at both rungs; a failed tail is an unresolved
+    // proposal, never an invented continuation.
     let resolved_depth = resolved_profile_depth();
-    let (base, _) = probe.directional_log_likelihood(&states_at(0.0), &direction)?;
+    let families = [&probe, &rung];
+    let mut bases = [0.0; 2];
+    for (base, family) in bases.iter_mut().zip(families) {
+        *base = family.directional_log_likelihood(&states_at(0.0), &direction)?.0;
+    }
     let mut step = atom.ridge.mode_scale / 8.0;
-    let mut points = vec![0.0];
-    let mut values = vec![0.0];
-    let mut slopes = vec![0.0];
-    let mut peak = 0.0_f64;
+    let start = DirectionProfile {
+        points: vec![0.0],
+        values: vec![0.0],
+        slopes: vec![0.0],
+    };
+    let mut profiles = [start.clone(), start];
+    let mut peaks = [0.0_f64; 2];
     let mut t = 0.0;
     loop {
         t += step;
-        let (value, slope) = probe.directional_log_likelihood(&states_at(t), &direction)?;
-        let value = value - base;
-        peak = peak.max(value - 0.5 * prior * t * t);
-        points.push(t);
-        values.push(value);
-        slopes.push(slope);
-        if !(value.is_finite() && slope.is_finite()) {
-            return Err(EventHistoryError::NumericalFailure {
-                reason: format!(
-                    "the log-likelihood along the proposed direction is not finite at t = {t:.3e}: value {value}, slope {slope}"
-                ),
-            });
+        let mut resolved = true;
+        for (k, family) in families.iter().enumerate() {
+            let (value, slope) = family.directional_log_likelihood(&states_at(t), &direction)?;
+            let value = value - bases[k];
+            if !(value.is_finite() && slope.is_finite()) {
+                return Err(EventHistoryError::NumericalFailure {
+                    reason: format!(
+                        "the log-likelihood along the proposed direction is not finite at t = {t:.3e}, Gauss-Hermite order {}: value {value}, slope {slope}",
+                        family.gh.order
+                    ),
+                });
+            }
+            peaks[k] = peaks[k].max(value - 0.5 * prior * t * t);
+            profiles[k].points.push(t);
+            profiles[k].values.push(value);
+            profiles[k].slopes.push(slope);
+            // The evidence search integrates `exp(g(t) − ½·prior·t²)`, so the
+            // tail is resolved once that integrand is falling and has dropped
+            // `resolved_depth` under its peak — whether or not the likelihood
+            // itself has turned down: a likelihood rising toward a finite
+            // limit still has a negligible penalised tail.
+            resolved &= slope - prior * t < 0.0 && value - 0.5 * prior * t * t < peaks[k] - resolved_depth;
         }
-        // The evidence search integrates `exp(g(t) − ½·prior·t²)`, so the tail
-        // is resolved once that integrand is falling and has dropped
-        // `resolved_depth` under its peak — whether or not the likelihood
-        // itself has turned down: a likelihood rising toward a finite limit
-        // still has a negligible penalised tail.
-        if slope - prior * t < 0.0 && value - 0.5 * prior * t * t < peak - resolved_depth {
+        if resolved {
             break;
         }
-        if points.len() % 128 == 0 {
+        if profiles[0].points.len() % 128 == 0 {
             step *= 2.0;
         }
     }
-    Ok(DirectionProfile {
-        points,
-        values,
-        slopes,
-    })
+    let [profile, rung_profile] = profiles;
+    Ok((profile, rung_profile))
 }
 
 /// Grow candidate ranks under one reference law and numerical setting.
@@ -3404,7 +3394,7 @@ fn fit_event_history_on_grid(
     // candidate all run at that certified setting, so the two criteria the
     // rank decision compares are one functional at a resolved setting. That
     // setting must also resolve every integral the decision reads — the
-    // proposal's added-factor curvature, its profiles and their positivity —
+    // proposal's added-factor curvature and its profiles —
     // so while any is unresolved the incumbent is refitted one ladder rung up
     // and the proposal is formed again there. Where no certifiable rung
     // remains, the path stops at the certified incumbent and records the
@@ -3579,32 +3569,6 @@ fn fit_event_history_on_grid(
                     reference_refinement,
                 )?;
             }
-            // The candidate is fitted at the incumbent's setting, so a
-            // posterior that setting cannot represent is the incumbent's
-            // setting failing to resolve the decision.
-            Err(EventHistoryError::LostPositivity { reason }) => {
-                match raise_incumbent(
-                    cohort,
-                    &mut rank_spec,
-                    &fit,
-                    Rung::GaussHermite,
-                    &reason,
-                    reference_refinement,
-                )? {
-                    Some(raised) => fit = raised,
-                    None => {
-                        step.accepted = false;
-                        step.converged = false;
-                        step.growth_unresolved = Some(UnresolvedGrowth {
-                            gauss_hermite_order: fit.quadrature.gauss_hermite_order,
-                            integral: DecisionIntegral::CandidatePosterior,
-                            reason,
-                        });
-                        rank_path.push(step);
-                        break;
-                    }
-                }
-            }
             // A reference step the reference grid cannot take is answered by
             // refining that grid for the whole selection, not by stopping the
             // path at this rank.
@@ -3671,7 +3635,7 @@ enum Rung {
 /// (`2·order − 1`) or the time mesh (one refinement), warm-started from its
 /// own converged values, because an integral the rank decision reads is
 /// unresolved at its certified setting. `None` at that ladder's top rung, the
-/// top certifiable order ([`positivity_raise`]) or the mesh ceiling
+/// top certifiable order ([`next_certifiable_order`]) or the mesh ceiling
 /// ([`EventHistoryCohort::mesh_refinement_ceiling`]): the incumbent stays the
 /// certified model and the decision is recorded as unresolved.
 fn raise_incumbent(
@@ -3688,7 +3652,7 @@ fn raise_incumbent(
     let from_refinement = match rung {
         Rung::GaussHermite => {
             let Some(next_order) =
-                positivity_raise(order, fit.nodes.max_subject_nodes(), rank_spec.quadrature_tolerance)
+                next_certifiable_order(order, fit.nodes.max_subject_nodes(), rank_spec.quadrature_tolerance)
             else {
                 log::debug!(
                     "[event-history] rank {rank} → {}: the decision is unresolved at Gauss-Hermite order {order} ({reason}), the ladder's top certifiable rung: the path stops at the certified rank-{rank} model with growth unresolved",

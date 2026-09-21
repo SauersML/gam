@@ -99,9 +99,7 @@ pub(crate) trait KilledProcess {
 
     fn runs(&self) -> &[KilledRun];
 
-    /// Every run's cell sums over `[left, right]` from `from`. An
-    /// `EventHistoryError::LostPositivity` refusal says the cell is too coarse
-    /// for the engine's representation. A finer cell resolves that.
+    /// Every run's cell sums over `[left, right]` from `from`.
     fn cell(
         &self,
         left: f64,
@@ -302,16 +300,6 @@ fn summed(one: &[RunGaps], two: &[RunGaps]) -> Vec<RunGaps> {
         .collect()
 }
 
-/// A cell an engine's representation could not hold has not been resolved.
-/// A finer cell can resolve it. Any other failure is the forecast's own.
-fn resolved<T>(result: Result<T, EventHistoryError>) -> Result<Option<T>, EventHistoryError> {
-    match result {
-        Ok(value) => Ok(Some(value)),
-        Err(EventHistoryError::LostPositivity { .. }) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
 /// The states every run of `integrals` ends at.
 fn ends<S: Clone>(integrals: &[CellIntegral<S>]) -> Vec<S> {
     integrals.iter().map(|integral| integral.state.clone()).collect()
@@ -466,105 +454,80 @@ fn integrate_interval<P: KilledProcess>(
         }
         let at: Vec<P::State> = position.iter().map(|p| p.state.clone()).collect();
         let coarse = match cell.coarse {
-            Some(integral) => Some(integral),
-            None => resolved(process.cell(a, b, &at))?.map(&couple),
+            Some(integral) => integral,
+            None => couple(process.cell(a, b, &at)?),
         };
-        let first = resolved(process.cell(a, middle, &at))?.map(&couple);
-        // The companion's integrals of the cell and of its first half, each
-        // from the companion's own state.
-        let (companion_coarse, companion_first) = match (companion, &beside) {
-            (Some(other), Some(states)) => (
-                match cell.companion_coarse {
-                    Some(integral) => Some(integral),
-                    None => resolved(other.cell(a, b, states))?.map(&couple),
-                },
-                resolved(other.cell(a, middle, states))?.map(&couple),
-            ),
-            _ => (None, None),
+        let first = couple(process.cell(a, middle, &at)?);
+        let two = couple(process.cell(middle, b, &ends(&first))?);
+        // The companion's integrals of the cell and of its halves, each from
+        // the companion's own state; `None` when there is no other axis to
+        // measure.
+        let (companion_first, other, companion_fine) = match (companion, &beside) {
+            (Some(beside_process), Some(states)) => {
+                let whole = match cell.companion_coarse {
+                    Some(integral) => integral,
+                    None => couple(beside_process.cell(a, b, states)?),
+                };
+                let half = couple(beside_process.cell(a, middle, states)?);
+                let second = couple(beside_process.cell(middle, b, &ends(&half))?);
+                let halves = chained(
+                    &first,
+                    &two,
+                    &integral_gaps(&first, &half, marks),
+                    &integral_gaps(&two, &second, marks),
+                );
+                let bound = summed(&integral_gaps(&coarse, &whole, marks), &halves);
+                (Some(half), Some((bound, halves)), Some(ends(&second)))
+            }
+            _ => (None, None, None),
         };
-        let mut measured = None;
-        let mut fine = None;
-        let mut companion_fine = None;
-        if let (Some(c), Some(one)) = (&coarse, &first) {
-            if let Some(two) = resolved(process.cell(middle, b, &ends(one)))?.map(&couple) {
-                // `None` when the companion could not represent the cell or a
-                // half, which a finer cell resolves; `Some(None)` when there
-                // is no other axis to measure.
-                let other = match (companion, &companion_coarse, &companion_first) {
-                    (None, ..) => Some(None),
-                    (Some(beside_process), Some(whole), Some(half)) => {
-                        match resolved(beside_process.cell(middle, b, &ends(half)))?.map(&couple) {
-                            Some(second) => {
-                                let halves = chained(
-                                    one,
-                                    &two,
-                                    &integral_gaps(one, half, marks),
-                                    &integral_gaps(&two, &second, marks),
-                                );
-                                let bound = summed(&integral_gaps(c, whole, marks), &halves);
-                                companion_fine = Some(ends(&second));
-                                Some(Some((bound, halves)))
-                            }
-                            None => None,
-                        }
-                    }
-                    _ => None,
-                };
-                if let Some(other) = other {
-                    let halves: Vec<CellIntegral<P::State>> =
-                        one.iter().zip(two).map(|(x, y)| joined(x, y)).collect();
-                    measured = Some(time_excess(
-                        &position,
-                        c,
-                        &halves,
-                        other.as_ref().map(|o| o.0.as_slice()),
-                        other.as_ref().map(|o| o.1.as_slice()),
-                        process.roundoff(),
-                        marks,
-                    )?);
-                    fine = Some(halves);
+        let fine: Vec<CellIntegral<P::State>> =
+            first.iter().zip(two).map(|(x, y)| joined(x, y)).collect();
+        let (excess, gaps) = time_excess(
+            &position,
+            &coarse,
+            &fine,
+            other.as_ref().map(|o| o.0.as_slice()),
+            other.as_ref().map(|o| o.1.as_slice()),
+            process.roundoff(),
+            marks,
+        )?;
+        if excess <= 1.0 {
+            let entering = Stand {
+                position,
+                companion: beside,
+            };
+            position = entering
+                .position
+                .iter()
+                .zip(&fine)
+                .zip(&gaps)
+                .map(|((p, integral), g)| p.advanced(integral, g, process.roundoff()))
+                .collect();
+            beside = companion_fine;
+            while next_horizon < horizons.len() && horizons[next_horizon] <= b {
+                let h = horizons[next_horizon];
+                if h == b {
+                    reached.push(position.clone());
+                } else {
+                    let (at_h, _) = integrate_interval(process, companion, entering.clone(), a, h, &[], marks)?;
+                    reached.push(at_h.position);
                 }
+                next_horizon += 1;
             }
-        }
-        match (measured, fine) {
-            (Some((excess, gaps)), Some(fine)) if excess <= 1.0 => {
-                let entering = Stand {
-                    position,
-                    companion: beside,
-                };
-                position = entering
-                    .position
-                    .iter()
-                    .zip(&fine)
-                    .zip(&gaps)
-                    .map(|((p, integral), g)| p.advanced(integral, g, process.roundoff()))
-                    .collect();
-                beside = companion_fine;
-                while next_horizon < horizons.len() && horizons[next_horizon] <= b {
-                    let h = horizons[next_horizon];
-                    if h == b {
-                        reached.push(position.clone());
-                    } else {
-                        let (at_h, _) = integrate_interval(process, companion, entering.clone(), a, h, &[], marks)?;
-                        reached.push(at_h.position);
-                    }
-                    next_horizon += 1;
-                }
-            }
-            _ => {
-                pending.push(Pending {
-                    left: middle,
-                    right: b,
-                    coarse: None,
-                    companion_coarse: None,
-                });
-                pending.push(Pending {
-                    left: a,
-                    right: middle,
-                    coarse: first,
-                    companion_coarse: companion_first,
-                });
-            }
+        } else {
+            pending.push(Pending {
+                left: middle,
+                right: b,
+                coarse: None,
+                companion_coarse: None,
+            });
+            pending.push(Pending {
+                left: a,
+                right: middle,
+                coarse: Some(first),
+                companion_coarse: companion_first,
+            });
         }
     }
     Ok((

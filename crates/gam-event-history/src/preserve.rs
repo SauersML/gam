@@ -6,11 +6,12 @@
 //! killing step. Finite steps approximate that identity; the fitting driver
 //! must resolve both normalisers and risk masses by time refinement.
 //!
-use super::chain::{GaussHermite, Grid, normal_density};
+use super::chain::{GaussHermite, Grid, SplitDensity, log_standard_prior, log_sum_exp};
 use super::cohort::{EventHistoryError, MarkKind};
-use super::marginal::{condition, node_likelihood, predict, transitions_across, weighted_sum};
-use super::scalar::{exp, ln};
+use super::marginal::{condition, conditioned_density, node_likelihood, predict, transitions_across};
+use super::scalar::ln;
 use gam_math::nested_dual::JetField;
+use gam_math::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 
 /// The reference population of every stratum: which covariate row its profile
 /// is, and which stratum every subject belongs to.
@@ -150,75 +151,130 @@ pub(crate) struct Normalisers<S> {
     pub masks: usize,
 }
 
-/// Log survivor-law activity moments, with a numerical log-sum-exp shift.
+/// Log survivor-law activity moments of risk sets held as log densities,
+/// `ln ∫ e^{a_d·z} α(z) dz − ln ∫ α(z) dz`, each a difference of two
+/// log-sum-exps over the grid, with the absolute rounding error of the
+/// largest moment beyond the error of the log densities it reads.
+///
+/// Each log-sum-exp over `n` terms rounds `t_i − s` (an error `u|t_i − s|`
+/// in a term of share at most `e^{t_i − s}`, so at most `u·n/e` in all),
+/// every `exp` and the fold of the sum (relative `u + γ_{n−1}`), the `ln`
+/// (`u ln n`) and the restoring shift (`u` of the result's magnitude): at
+/// most `2γ_{n+1} + u|lse|`. Two of them and their difference give
+/// `4γ_{n+1} + u(|lse_num| + |lse_den| + |moment|)`. At each point the term
+/// `ln w_i + ln α_i`, the exponent `Σ_k a_dk z_ik` (a fold of `2·atoms`
+/// operations) and their sum round with at most
+/// `u(|ln w_i| + |a_i| + |a_i + e_i|) + γ_{2·atoms} Σ_k |a_dk z_ik|`; an
+/// error `δ_i` in the point terms moves the moment by
+/// `Σ_i (π_i − ρ_i) δ_i` for the numerator and denominator shares `π`, `ρ`,
+/// at most twice the largest `δ_i`.
 fn moments<S: JetField>(
     populations: &[(Grid<S>, Vec<S>)], of_mark: &[usize], loadings: &[S],
     atoms: usize, like: &S,
-) -> Result<Vec<S>, EventHistoryError> {
+) -> Result<(Vec<S>, f64), EventHistoryError> {
+    let u = UNIT_ROUNDOFF;
     let mut out = Vec::with_capacity(of_mark.len());
+    let mut error = 0.0_f64;
     for (d, &mask) in of_mark.iter().enumerate() {
-        let (grid, density) = &populations[mask];
-        let exponents: Vec<S> = (0..grid.size()).map(|i| {
-            let mut value = like.constant_like(0.0);
+        let (grid, log_density) = &populations[mask];
+        let size = grid.size();
+        let mut point_error = 0.0_f64;
+        let mut denominator_terms = Vec::with_capacity(size);
+        let mut numerator_terms = Vec::with_capacity(size);
+        for i in 0..size {
+            let log_weight = ln(&grid.weights[i]);
+            let mut exponent = like.constant_like(0.0);
+            let mut spread = 0.0;
             for k in 0..atoms {
-                value = value.add(&loadings[d * atoms + k].mul(grid.coordinate(i, k)));
+                let term = loadings[d * atoms + k].mul(grid.coordinate(i, k));
+                spread += term.value().abs();
+                exponent = exponent.add(&term);
             }
-            value
-        }).collect();
-        let shift = exponents.iter().map(JetField::value).fold(f64::NEG_INFINITY, f64::max);
-        let weighted: Vec<S> = exponents.iter().zip(density.iter()).map(|(value, p)|
-            p.mul(&exp(&value.sub(&like.constant_like(shift))))).collect();
-        let numerator = weighted_sum(&grid.weights, &weighted);
-        let denominator = weighted_sum(&grid.weights, density);
-        if !(numerator.value().is_finite() && numerator.value() > 0.0
-            && denominator.value().is_finite() && denominator.value() > 0.0) {
+            let base = log_weight.add(&log_density[i]);
+            let tilted = base.add(&exponent);
+            point_error = point_error.max(
+                u * (log_weight.value().abs() + base.value().abs() + tilted.value().abs())
+                    + accumulation_growth(2 * atoms) * spread,
+            );
+            denominator_terms.push(base);
+            numerator_terms.push(tilted);
+        }
+        let numerator = log_sum_exp(&numerator_terms);
+        let denominator = log_sum_exp(&denominator_terms);
+        if !(numerator.value().is_finite() && denominator.value().is_finite()) {
             return Err(EventHistoryError::NumericalFailure {
                 reason: format!("reference population: invalid activity moment for mark {d}"),
             });
         }
-        out.push(ln(&numerator).sub(&ln(&denominator)).add(&like.constant_like(shift)));
+        let moment = numerator.sub(&denominator);
+        error = error.max(
+            4.0 * accumulation_growth(size + 1)
+                + u * (numerator.value().abs() + denominator.value().abs() + moment.value().abs())
+                + 2.0 * point_error,
+        );
+        out.push(moment);
     }
-    Ok(out)
+    Ok((out, error))
 }
 
 /// Advance all risk sets with a common set of per-mark normalisers. A terminal
 /// hazard uses the living-law normaliser even in a once-only disease's risk set.
+///
+/// Also returns the largest absolute rounding error of a conditioned log
+/// density point, beyond the error its log normaliser shares with every
+/// point (which cancels from each moment). A killed mark's log intensity
+/// `η⁰_d − shift_d + Σ_k a_dk z_ik + ln exposure` is formed in `2·atoms + 3`
+/// operations on quantities no larger than
+/// `Λ_i = |η⁰_d| + |shift_d| + Σ_k |a_dk z_ik| + |ln exposure|`; its `exp`
+/// and the sum of the `marks` compensators give `ell_i` a relative error of
+/// at most `γ_{2·atoms+4+marks}(1 + Λ_i)`. Adding the log density, removing
+/// the likelihood shift and the log normaliser round once each relative to
+/// their results.
+///
+/// Each population is a predicted density, smooth on its grid; the killed
+/// population's split ([`SplitDensity`]) keeps it as the smooth part and the
+/// killing compensator as the explicit factor, for the kernel out of it.
 fn kill<S: JetField>(
     populations: &[(Grid<S>, Vec<S>)], masks: &[Vec<bool>], eta0: &[S],
     loadings: &[S], shift: &[S], exposure: f64, atoms: usize,
-) -> Result<(Vec<(Grid<S>, Vec<S>)>, Vec<S>), EventHistoryError> {
+) -> Result<(Vec<(Grid<S>, Vec<S>)>, Vec<S>, f64, Vec<SplitDensity<S>>), EventHistoryError> {
+    let u = UNIT_ROUNDOFF;
     let marks = eta0.len();
     let no_counts = vec![0.0; marks];
+    let intensity_growth = accumulation_growth(2 * atoms + 4 + marks);
     let mut out = Vec::with_capacity(masks.len());
     let mut masses = Vec::with_capacity(masks.len());
-    for ((grid, density), mask) in populations.iter().zip(masks) {
+    let mut densities = Vec::with_capacity(masks.len());
+    let mut error = 0.0_f64;
+    for ((grid, log_density), mask) in populations.iter().zip(masks) {
         let exposures: Vec<f64> = mask.iter().map(|&killed|
             if killed { exposure } else { 0.0 }).collect();
         let likelihood = node_likelihood(grid, eta0, loadings, &no_counts,
             &exposures, None, Some(shift), marks, atoms, false);
-        let (alpha, mass) = condition(grid, density, &likelihood.ell,
+        let state = condition(grid, log_density, &likelihood.ell,
             likelihood.shift, "reference population")?;
-        masses.push(ln(&mass).add(&eta0[0].constant_like(likelihood.shift)));
-        out.push((grid.clone(), alpha));
+        let log_normaliser = state.log_normaliser.value();
+        for i in 0..grid.size() {
+            let magnitude = (0..marks).filter(|&d| mask[d]).map(|d| {
+                eta0[d].value().abs() + shift[d].value().abs() + exposure.ln().abs()
+                    + (0..atoms).map(|k|
+                        (loadings[d * atoms + k].value() * grid.coordinate(i, k).value()).abs())
+                        .sum::<f64>()
+            }).fold(0.0_f64, f64::max);
+            let ell = likelihood.ell[i].value();
+            let joined = log_density[i].value() + ell;
+            let raw = joined - likelihood.shift;
+            error = error.max(
+                intensity_growth * ell.abs() * (1.0 + magnitude)
+                    + u * (joined.abs() + raw.abs() + (raw - log_normaliser).abs()),
+            );
+        }
+        masses.push(state.log_normaliser.add(&eta0[0].constant_like(likelihood.shift)));
+        densities.push(conditioned_density(log_density.clone(), None, &likelihood,
+            &state.log_normaliser));
+        out.push((grid.clone(), state.log_alpha));
     }
-    Ok((out, masses))
-}
-
-/// The pairwise rounding resolution of two evaluations of the midpoint map at
-/// one state (#2627).
-///
-/// One evaluation first conditions each risk set over `grid_points` nodes
-/// (`condition`: a left fold of that many products, then the normaliser's
-/// reciprocal). It then forms each moment as the log of a left fold of the same
-/// length over the conditioned density, once for the numerator and once for the
-/// denominator. A term of a fold passes through at most `grid_points + 1`
-/// rounded operations, so each fold carries a relative error of at most
-/// `γ_{grid_points+1}`. The moment is the log-ratio of two folds of a
-/// conditioned density, so its absolute error collects four such relative
-/// errors. Adding the shift rounds once more, relative to its magnitude.
-fn midpoint_map_rounding_band(grid_points: usize, magnitude: f64) -> f64 {
-    4.0 * gam_linalg::roundoff::accumulation_growth(grid_points + 1)
-        + gam_linalg::roundoff::UNIT_ROUNDOFF * (1.0 + magnitude)
+    Ok((out, masses, error, densities))
 }
 
 /// Evolve from the reference entry to each endpoint, reporting the law AT
@@ -244,31 +300,31 @@ pub(crate) fn stratum_normalisers<S: JetField>(
     let zero: Vec<S> = (0..atoms).map(|_| like.constant_like(0.0)).collect();
     let unit: Vec<S> = (0..atoms).map(|_| like.constant_like(1.0)).collect();
     let initial = Grid::new(gh, &zero, &unit, like);
-    let density: Vec<S> = (0..initial.size()).map(|i| {
-        let mut p = like.constant_like(1.0);
-        for k in 0..atoms {
-            p = p.mul(&normal_density(initial.coordinate(i, k), &zero[k], &unit[k]));
-        }
-        p
-    }).collect();
-    let mut populations = vec![(initial, density); masks.len()];
+    let log_density = log_standard_prior(&initial, like);
+    let mut populations = vec![(initial, log_density); masks.len()];
     let mut carried = vec![like.constant_like(0.0); masks.len()];
     let mut log_normaliser = Vec::with_capacity(nodes * marks);
     let mut log_risk_mass = Vec::with_capacity(nodes * masks.len());
     for n in 0..nodes {
-        log_normaliser.extend(moments(&populations, &of_mark, loadings, atoms, like)?);
+        log_normaliser.extend(moments(&populations, &of_mark, loadings, atoms, like)?.0);
         log_risk_mass.extend(carried.iter().cloned());
         if n + 1 == nodes { break; }
         let dt = grid.gaps[n];
         let transitions = transitions_across(rates, 0.5 * dt, time_scale)?;
-        let diffuse = |populations: &[(Grid<S>, Vec<S>)]| -> Result<Vec<(Grid<S>, Vec<S>)>, EventHistoryError> {
-            populations.iter().map(|(grid, density)|
-                predict(gh, like, grid, density, &transitions, "reference population")).collect()
+        let diffuse = |populations: &[(Grid<S>, Vec<S>)], densities: &[SplitDensity<S>]|
+            -> Result<Vec<(Grid<S>, Vec<S>)>, EventHistoryError> {
+            populations.iter().zip(densities).map(|((grid, log_density), density)|
+                predict(gh, like, grid, log_density, density, &transitions,
+                    "reference population")).collect()
         };
-        let middle = diffuse(&populations)?;
+        // Every population entering a step is a predicted density (or the
+        // prior), smooth on its grid.
+        let whole: Vec<SplitDensity<S>> = populations.iter()
+            .map(|(_, log_density)| SplitDensity::whole(log_density)).collect();
+        let middle = diffuse(&populations, &whole)?;
         let eta_mid: Vec<S> = (0..marks).map(|d|
             eta0[n * marks + d].add(&eta0[(n + 1) * marks + d]).scale(0.5)).collect();
-        let mut shift = moments(&middle, &of_mark, loadings, atoms, like)?;
+        let (mut shift, _) = moments(&middle, &of_mark, loadings, atoms, like)?;
         // The midpoint shift is the fixed point of `shift ↦ moments(kill(middle, shift))`,
         // iterated until the value is resolved. Derivative channels follow every
         // iteration, so at a contraction they converge with the value. Two evaluations
@@ -277,21 +333,22 @@ pub(crate) fn stratum_normalisers<S: JetField>(
         // Above it, a ratio ≥ 1 is a map that does not contract at this step length,
         // the one refusal, which a finer reference grid answers. A ratio below 1
         // stops once the geometric remainder `change·q/(1 − q)` is within the band.
-        let grid_points = middle.iter().map(|(grid, _)| grid.size()).max().unwrap_or(1);
         let mut previous: Option<f64> = None;
         loop {
-            let (selected, _) = kill(&middle, &masks, &eta_mid, loadings, &shift, 0.5 * dt, atoms)?;
-            let next = moments(&selected, &of_mark, loadings, atoms, like)?;
+            let (selected, _, conditioning, _) =
+                kill(&middle, &masks, &eta_mid, loadings, &shift, 0.5 * dt, atoms)?;
+            let (next, moment_error) = moments(&selected, &of_mark, loadings, atoms, like)?;
             let change = shift.iter().zip(&next).map(|(a, b)|
                 (a.value() - b.value()).abs()).fold(0.0, f64::max);
-            let magnitude = next.iter().map(|value| value.value().abs()).fold(0.0_f64, f64::max);
             shift = next;
             if !change.is_finite() {
                 return Err(EventHistoryError::NumericalFailure {
                     reason: format!("reference midpoint on interval {n}: non-finite change {change}"),
                 });
             }
-            let band = midpoint_map_rounding_band(grid_points, magnitude);
+            // One evaluation's rounding: its own moment error and twice the
+            // conditioned point error each moment propagates (`moments`, `kill`).
+            let band = moment_error + 2.0 * conditioning;
             if change <= 2.0 * band { break; }
             if let Some(prior) = previous
                 && prior > 2.0 * band
@@ -306,9 +363,10 @@ pub(crate) fn stratum_normalisers<S: JetField>(
             }
             previous = Some(change);
         }
-        let (selected, masses) = kill(&middle, &masks, &eta_mid, loadings, &shift, dt, atoms)?;
+        let (selected, masses, _, killed) =
+            kill(&middle, &masks, &eta_mid, loadings, &shift, dt, atoms)?;
         for (mass, increment) in carried.iter_mut().zip(masses) { *mass = mass.add(&increment); }
-        populations = diffuse(&selected)?;
+        populations = diffuse(&selected, &killed)?;
     }
     Ok(Normalisers { log_normaliser, log_risk_mass, masks: masks.len() })
 }
