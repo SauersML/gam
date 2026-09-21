@@ -24,6 +24,27 @@
   `loglik_covariance`, `row_scores_hat`, `row_scores_null`, `row_loglik_diff` and
   `lr_statistic`. Existing calls will not type-check; the `_rust.pyi` and
   `_rust_module.pyi` stubs are regenerated.
+- **The returned-mode settlement charges the Jeffreys score's own rounding band** (gam#3345).
+  An armed multinomial Jeffreys refit stalled at a KKT residual of 1.584e-11 against a
+  tolerance of 1.013e-11. The settlement charged the data term and the penalty product in
+  their per-coordinate rounding bands, but not the rounding of the Jeffreys score
+  `grad Phi` that the stationarity system `grad l - S beta + grad Phi` adds, so the
+  certificate could not settle a state that is stationary to the resolution of its own
+  score. The band is derived rather than chosen. With `K` the floored inverse of
+  `H_id = Z_J' H Z_J` and `D_k = Z_J' Hdot[e_k] Z_J`, the Frechet derivative of `K` along
+  `E` is `V (Psi . V'EV) V'` with `Psi` the divided differences of the spectrum, and the
+  computed spectrum is exact for some `H_id + E` with `norm(E) <= b`, giving
+  `|delta grad Phi_k| <= 0.5 |G| b sum_ij |Psi_ij| |(V' D_k V)_ij|` and
+  `b = symmetric_spectrum_rounding_band(evals) + gamma_{2p+1} M sum_i norm1(z_i)^2`,
+  whose second term is the formation of `Z_J'(H Z_J)` (Higham ASNA 3.5). Under
+  `strength * Phi` the band scales by `|strength|`. The gate and floor motion terms and
+  the formation of `D_k` are not charged, and the change says so. `JointJeffreysPlan`
+  carries `information_rounding_band`, which is the same resolution band `prepare`
+  already refused against, and the batched term constructors return
+  `JointJeffreysTerm { value, gradient, curvature, score_rounding_band }`.
+  **Behavior change:** an armed Jeffreys refit that stalled just above its KKT tolerance,
+  because the tolerance omitted the score's own rounding, now settles. No tolerance was
+  loosened: the band charged is the one the score actually carries.
 - **Multinomial smooth significance is a softmax score test, and the saved model format
   moves to version 3** (#3569, #1101). `MultinomialSavedModel::smooth_significance` ran a
   per-class Wood rank-truncated Wald test. It now runs the shared variance-component score
