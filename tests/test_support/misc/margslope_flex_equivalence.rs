@@ -24,6 +24,7 @@ use gam::terms::smooth::{
 };
 use gam::types::{InverseLink, StandardLink};
 use gam::{BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, fit_model};
+use gam_math::probability::normal_cdf;
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -52,19 +53,6 @@ fn normal_pair(rng: &mut StdRng) -> (f64, f64) {
     let r = (-2.0 * u1.ln()).sqrt();
     let theta = std::f64::consts::TAU * u2;
     (r * theta.cos(), r * theta.sin())
-}
-
-fn erf_approx(x: f64) -> f64 {
-    let a1 = 0.254829592;
-    let a2 = -0.284496736;
-    let a3 = 1.421413741;
-    let a4 = -1.453152027;
-    let a5 = 1.061405429;
-    let p = 0.3275911;
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let ax = x.abs();
-    let t = 1.0 / (1.0 + p * ax);
-    sign * (1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-ax * ax).exp())
 }
 
 fn age_smooth(feature_col: usize, name: &str) -> SmoothTermSpec {
@@ -145,7 +133,7 @@ pub fn build_large_scale_shape_problem(n: usize) -> LargeScaleShapeProblem {
             .map(|j| data[[i, j]] * (0.08 / ((j + 1) as f64).sqrt()))
             .sum::<f64>();
         let eta = -0.15 + 0.35 * age - 0.12 * age * age + pc_signal + 0.30 * z[i];
-        let p = 0.5 * (1.0 + erf_approx(eta / std::f64::consts::SQRT_2));
+        let p = normal_cdf(eta);
         y[i] = if rng.random::<f64>() < p { 1.0 } else { 0.0 };
     }
 

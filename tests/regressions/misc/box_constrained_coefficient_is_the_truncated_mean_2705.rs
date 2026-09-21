@@ -44,7 +44,7 @@
 
 use gam::data::EncodedDataset;
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
-use gam_math::probability::{normal_cdf, normal_logsf};
+use gam_math::probability::{normal_cdf, normal_logsf, normal_pdf};
 use std::io::Write;
 
 const INTERCEPT: f64 = 2.0;
@@ -66,10 +66,6 @@ fn fixture() -> (Vec<f64>, Vec<f64>) {
         .collect();
     let y: Vec<f64> = x.iter().map(|&xi| INTERCEPT + SLOPE * xi).collect();
     (x, y)
-}
-
-fn standard_normal_pdf(z: f64) -> f64 {
-    (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt()
 }
 
 /// `E[X | X ∈ [lower, upper]]` for `X ~ N(mean, sd²)`.
@@ -95,7 +91,7 @@ fn truncated_normal_mean(mean: f64, sd: f64, lower: f64, upper: f64) -> f64 {
         mass > 0.0,
         "the truncation interval must carry positive Gaussian mass: a={a}, b={b}"
     );
-    mean + sd * (standard_normal_pdf(a) - standard_normal_pdf(b)) / mass
+    mean + sd * (normal_pdf(a) - normal_pdf(b)) / mass
 }
 
 fn dataset(x: &[f64], y: &[f64]) -> EncodedDataset {

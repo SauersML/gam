@@ -27,6 +27,7 @@
 
 use csv::StringRecord;
 use gam_data::{EncodedDataset, encode_recordswith_inferred_schema};
+use gam_math::special::logistic;
 use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
@@ -68,15 +69,6 @@ impl SmoothEta {
 
 fn training_grid(n: usize) -> Vec<f64> {
     (0..n).map(|i| i as f64 / (n - 1) as f64).collect()
-}
-
-fn sigmoid(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
-    }
 }
 
 // --- Response-family samplers built on the harness's uniform/normal stream ---
@@ -164,7 +156,7 @@ impl FamilyCase {
         if self.log_link {
             eta.exp()
         } else {
-            sigmoid(eta)
+            logistic(eta)
         }
     }
 }

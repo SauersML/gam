@@ -47,6 +47,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
 };
+use gam_math::probability::normal_cdf;
 use ndarray::{Array1, Array2};
 use std::path::Path;
 
@@ -180,24 +181,6 @@ fn reconstruct_transform(
     }
 }
 
-/// Standard-normal CDF via erf (libm not in deps; use the rational `erf`-free
-/// Hart-style approximation that scipy/R agree with to ~1e-7 — far below the test
-/// bound). Used only to map gam's latent transform to a probability mass.
-fn norm_cdf(x: f64) -> f64 {
-    // Abramowitz & Stegun 7.1.26 erf approximation, accurate to ~1.5e-7.
-    let t = 1.0 / (1.0 + 0.327_591_1 * (x / std::f64::consts::SQRT_2).abs());
-    let y = 1.0
-        - (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736) * t
-            + 0.254_829_592)
-            * t
-            * (-(x * x) / 2.0).exp();
-    if x >= 0.0 {
-        0.5 * (1.0 + y)
-    } else {
-        0.5 * (1.0 - y)
-    }
-}
-
 #[test]
 fn gam_smooth_transformation_matches_r_tram_on_heart_failure() {
     init_parallelism();
@@ -319,7 +302,7 @@ fn gam_smooth_transformation_matches_r_tram_on_heart_failure() {
             rep_rows.row_mut(k).assign(&cov_rows.row(gi));
         }
         let rec = reconstruct_transform(&tn, &rep_rows, &y_quad);
-        let denom = norm_cdf(rec.upper[0]) - norm_cdf(rec.lower[0]);
+        let denom = normal_cdf(rec.upper[0]) - normal_cdf(rec.lower[0]);
         // density f(y) = φ(h)·h' / denom; trapezoidal ∫ y f dy and ∫ f dy.
         let mut num = 0.0;
         let mut mass = 0.0;

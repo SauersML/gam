@@ -31,6 +31,7 @@ use gam::utils::splitmix64;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
+use gam_math::probability::normal_cdf;
 
 fn next_unit(state: &mut u64) -> f64 {
     (splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64
@@ -40,10 +41,6 @@ fn next_gauss(state: &mut u64) -> f64 {
     let u1 = next_unit(state).max(f64::MIN_POSITIVE);
     let u2 = next_unit(state);
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
-}
-
-fn normal_cdf(x: f64) -> f64 {
-    gam::probability::normal_cdf(x)
 }
 
 /// Root of a strictly increasing function by bisection on `[-40, 40]`.

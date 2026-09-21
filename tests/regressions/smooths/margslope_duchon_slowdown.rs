@@ -47,6 +47,7 @@ use gam::smooth::{
 };
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, fit_model};
+use gam_math::probability::normal_cdf;
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -83,20 +84,6 @@ fn duchon2_smooth(name: &str, centers: usize) -> SmoothTermSpec {
     }
 }
 
-fn erf_approx(x: f64) -> f64 {
-    let a1 = 0.254829592;
-    let a2 = -0.284496736;
-    let a3 = 1.421413741;
-    let a4 = -1.453152027;
-    let a5 = 1.061405429;
-    let p = 0.3275911;
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let ax = x.abs();
-    let t = 1.0 / (1.0 + p * ax);
-    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-ax * ax).exp();
-    sign * y
-}
-
 /// Shared simulator: two spatial coordinates in columns 0,1, a latent score `z`,
 /// a smooth spatial field plus a spatially-varying slope. Returns the data
 /// matrix, the latent score, and the binary response.
@@ -129,7 +116,7 @@ fn simulate(n: usize) -> (Array2<f64>, Array1<f64>, Array1<f64>) {
         f + slope * z[i]
     }));
     let y = Array1::from_iter(true_eta.iter().map(|&eta| {
-        let p = 0.5 * (1.0 + erf_approx(eta / std::f64::consts::SQRT_2));
+        let p = normal_cdf(eta);
         if rng.random::<f64>() < p { 1.0 } else { 0.0 }
     }));
     (data, z, y)

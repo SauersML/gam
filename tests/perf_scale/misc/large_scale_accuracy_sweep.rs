@@ -23,6 +23,7 @@ use gam::smooth::build_term_collection_design;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
+use gam_math::special::logistic;
 use ndarray::{Array1, Array2};
 use std::f64::consts::{PI, TAU};
 
@@ -162,10 +163,6 @@ fn mean_squared_error(predicted: &Array1<f64>, truth: &Array1<f64>) -> f64 {
         acc += d * d;
     }
     acc / n
-}
-
-fn logistic(x: f64) -> f64 {
-    1.0 / (1.0 + (-x).exp())
 }
 
 // =============================================================================

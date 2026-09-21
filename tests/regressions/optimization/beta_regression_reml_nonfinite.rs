@@ -42,11 +42,7 @@
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-
-#[inline]
-fn logistic(eta: f64) -> f64 {
-    1.0 / (1.0 + (-eta).exp())
-}
+use gam_math::special::logistic;
 
 /// Deterministic, RNG-free data: `mu = logistic(0.3 + 1.6 x)` plus a small
 /// bounded sinusoidal perturbation that keeps every response strictly inside

@@ -26,6 +26,7 @@ use gam::terms::smooth::{SmoothBasisSpec, TermCollectionSpec};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
+use gam_math::probability::normal_cdf;
 use std::time::Instant;
 
 const N: usize = 2_500;
@@ -40,21 +41,6 @@ fn next_gauss(state: &mut u64) -> f64 {
     let u1 = next_unit(state).max(1e-12);
     let u2 = next_unit(state);
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
-}
-
-fn erf_approx(x: f64) -> f64 {
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let x = x.abs();
-    let t = 1.0 / (1.0 + 0.3275911 * x);
-    let polynomial = (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736)
-        * t
-        + 0.254829592)
-        * t;
-    sign * (1.0 - polynomial * (-x * x).exp())
-}
-
-fn normal_cdf(x: f64) -> f64 {
-    0.5 * (1.0 + erf_approx(x / std::f64::consts::SQRT_2))
 }
 
 fn build_dataset() -> gam::inference::data::EncodedDataset {

@@ -31,6 +31,7 @@ use gam::families::bms::BernoulliMarginalSlopeFitResult;
 use gam::terms::smooth::{SmoothBasisSpec, TermCollectionSpec, build_term_collection_design};
 use gam::test_support::reference::pearson;
 use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
+use gam_math::probability::normal_cdf;
 use ndarray::Array2;
 
 /// Both surfaces share one declaration so the marginal and slope blocks
@@ -71,10 +72,6 @@ impl SplitMix64 {
         let u2 = self.next_unit();
         (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
     }
-}
-
-fn normal_cdf(x: f64) -> f64 {
-    0.5 * (1.0 + statrs::function::erf::erf(x / std::f64::consts::SQRT_2))
 }
 
 /// Planted slope truth: monotone in x1, flat in x2 — the template Sim B's

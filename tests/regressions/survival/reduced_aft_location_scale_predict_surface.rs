@@ -24,6 +24,7 @@
 //! `−log t` mirror the surface is flat in `t` and fails every check.
 
 use gam::test_support::cli_harness::run_or_panic;
+use gam_math::probability::normal_cdf;
 use std::path::Path;
 use std::process::Command;
 
@@ -41,12 +42,6 @@ const N: usize = 400;
 const A: f64 = 1.0; // intercept of mu(x)
 const B: f64 = 0.6; // slope on x
 const SIGMA_TRUE: f64 = 0.5;
-
-/// Standard normal CDF via erf, matching the lognormal survival the location-
-/// scale gaussian residual family implements.
-fn normal_cdf(z: f64) -> f64 {
-    gam_math::probability::normal_cdf(z)
-}
 
 /// True lognormal survival `S(t|x) = 1 - Phi((log t - mu(x)) / sigma)`.
 fn lognormal_survival(t: f64, mu: f64, sigma: f64) -> f64 {

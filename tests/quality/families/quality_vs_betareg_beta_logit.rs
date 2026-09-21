@@ -28,6 +28,7 @@ use gam::test_support::reference::{Column, QualityPair, pearson, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
+use gam_math::special::logistic;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -36,11 +37,6 @@ use rand_distr::{Beta, Distribution, Uniform};
 const N: usize = 150;
 const SEED: u64 = 234;
 const PHI: f64 = 20.0;
-
-#[inline]
-fn logit_inv(eta: f64) -> f64 {
-    1.0 / (1.0 + (-eta).exp())
-}
 
 #[inline]
 fn mu_eta_truth(x1: f64, x2: f64) -> f64 {
@@ -63,7 +59,7 @@ fn gam_beta_logit_recovers_smooth_truth() {
     for _ in 0..N {
         let a = ux.sample(&mut rng);
         let b = ux.sample(&mut rng);
-        let mu = logit_inv(mu_eta_truth(a, b));
+        let mu = logistic(mu_eta_truth(a, b));
         // Beta shape parameters from mean/precision parameterisation.
         let beta = Beta::new(mu * PHI, (1.0 - mu) * PHI).expect("beta shapes > 0");
         // Keep draws strictly inside (0,1) so the beta likelihood is finite for
@@ -122,7 +118,7 @@ fn gam_beta_logit_recovers_smooth_truth() {
         .design
         .apply(&fit.fit.beta)
         .iter()
-        .map(|&e| logit_inv(e))
+        .map(|&e| logistic(e))
         .collect();
 
     // ---- fit the SAME additive model with betareg (the mature reference) ---

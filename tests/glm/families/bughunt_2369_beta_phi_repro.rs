@@ -6,6 +6,7 @@ use gam::{
 };
 
 use gam::utils::splitmix64;
+use gam_math::special::logistic;
 struct SplitMix64 {
     state: u64,
 }
@@ -48,11 +49,6 @@ impl SplitMix64 {
         let gb = self.gamma_ge1(b);
         ga / (ga + gb)
     }
-}
-
-#[inline]
-fn logistic(eta: f64) -> f64 {
-    1.0 / (1.0 + (-eta).exp())
 }
 
 fn make_dataset(n: usize, phi: f64, seed: u64) -> (Vec<f64>, Vec<f64>) {

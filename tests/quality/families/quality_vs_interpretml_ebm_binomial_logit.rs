@@ -44,15 +44,11 @@ use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, QualityPair, relative_l2, run_python};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
+use gam_math::special::logistic;
 use ndarray::Array2;
 use std::path::Path;
 
 const PROSTATE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/prostate.csv");
-
-/// Logistic (inverse-logit) link: eta -> probability.
-fn inv_logit(eta: f64) -> f64 {
-    1.0 / (1.0 + (-eta).exp())
-}
 
 /// Clamp a probability away from {0,1} so log-loss / deviance stays finite.
 /// 1e-12 is far below any meaningful predictive resolution and is the standard
@@ -205,7 +201,7 @@ fn gam_binomial_logit_heldout_accuracy_beats_ebm() {
     let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
         .expect("rebuild design at held-out points");
     let gam_eta: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
-    let gam_prob_te: Vec<f64> = gam_eta.iter().map(|&e| inv_logit(e)).collect();
+    let gam_prob_te: Vec<f64> = gam_eta.iter().map(|&e| logistic(e)).collect();
     assert_eq!(
         gam_prob_te.len(),
         nte,
@@ -267,7 +263,7 @@ emit("prob_tr", ebm.predict_proba(Xtr)[:, 1])
     let design_tr = build_term_collection_design(grid_tr.view(), &fit.resolvedspec)
         .expect("rebuild train design");
     let gam_eta_tr: Vec<f64> = design_tr.design.apply(&fit.fit.beta).to_vec();
-    let gam_prob_tr: Vec<f64> = gam_eta_tr.iter().map(|&e| inv_logit(e)).collect();
+    let gam_prob_tr: Vec<f64> = gam_eta_tr.iter().map(|&e| logistic(e)).collect();
     let ebm_prob_tr = py.vector("prob_tr");
     let insample_dev_rel = relative_l2(
         &deviance_terms(&gam_prob_tr, &y_tr),

@@ -29,6 +29,7 @@ use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
+use gam_math::special::logistic;
 use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
@@ -40,10 +41,6 @@ use rand_distr::{Beta, Distribution, Uniform};
 
 const Z95: f64 = 1.959_963_984_540_054; // qnorm(0.975)
 const TRUE_PHI: f64 = 30.0;
-
-fn logistic(z: f64) -> f64 {
-    1.0 / (1.0 + (-z).exp())
-}
 
 #[test]
 fn beta_observation_interval_uses_estimated_phi_not_seed() {

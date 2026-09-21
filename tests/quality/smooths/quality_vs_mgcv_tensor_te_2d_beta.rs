@@ -32,6 +32,7 @@ use gam::test_support::reference::{Column, QualityPair, pearson, relative_l2, rm
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
+use gam_math::special::logistic;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -40,11 +41,6 @@ use std::f64::consts::PI;
 
 const N: usize = 300;
 const PHI: f64 = 20.0;
-
-#[inline]
-fn logit_inv(eta: f64) -> f64 {
-    1.0 / (1.0 + (-eta).exp())
-}
 
 #[test]
 fn gam_tensor_te_2d_beta_matches_mgcv() {
@@ -66,7 +62,7 @@ fn gam_tensor_te_2d_beta_matches_mgcv() {
         let xi = u.sample(&mut rng);
         let zi = u.sample(&mut rng);
         let eta = (PI * xi).sin() * (PI * zi).cos();
-        let mu = logit_inv(eta);
+        let mu = logistic(eta);
         let beta = Beta::new(mu * PHI, (1.0 - mu) * PHI).expect("beta shapes > 0");
         // Keep draws strictly inside (0,1) so the Beta likelihood is finite for
         // both engines (gam and mgcv betar both require open-interval responses).
@@ -117,7 +113,7 @@ fn gam_tensor_te_2d_beta_matches_mgcv() {
     let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
         .expect("rebuild te design at training points");
     let gam_eta: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
-    let gam_mu: Vec<f64> = gam_eta.iter().map(|&e| logit_inv(e)).collect();
+    let gam_mu: Vec<f64> = gam_eta.iter().map(|&e| logistic(e)).collect();
 
     // ---- fit the SAME model with mgcv betar (the mature reference) ---------
     let r = run_r(
