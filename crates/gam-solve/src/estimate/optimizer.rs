@@ -18,6 +18,22 @@ use gam_terms::inference::smooth_score_test::WorkingResidual;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
+/// The η band of a strict SPD solve of `hessian` (#4038): the unpivoted
+/// Cholesky band of [`gam_linalg::roundoff::cholesky_solve_backward_band`],
+/// plus, for a dense `hessian`, the asymmetry the factor never read (the dense
+/// factorization reads one triangle while the residual is formed with the
+/// stored matrix).
+fn strict_cholesky_solve_band(hessian: &gam_linalg::matrix::SymmetricMatrix) -> f64 {
+    let cholesky = gam_linalg::roundoff::cholesky_solve_backward_band(hessian.nrows());
+    match hessian {
+        gam_linalg::matrix::SymmetricMatrix::Dense(dense) => {
+            cholesky
+                + gam_linalg::utils::symmetric_part_defect_band(dense, hessian.max_abs_entry())
+        }
+        gam_linalg::matrix::SymmetricMatrix::Sparse(_) => cholesky,
+    }
+}
+
 fn certify_factorized_inference_solve(
     hessian: &gam_linalg::matrix::SymmetricMatrix,
     rhs: &Array2<f64>,
@@ -31,6 +47,7 @@ fn certify_factorized_inference_solve(
         rhs,
         solution,
         &residual,
+        strict_cholesky_solve_band(hessian),
         label,
     )
     .map_err(|error| {
@@ -80,16 +97,22 @@ impl InferenceHessianFactor {
                 certify_factorized_inference_solve(hessian, rhs, &solution, label)?;
                 Ok(solution)
             }
-            Self::Identified(inverse) => {
-                let solution = inverse.apply(rhs);
-                certify_factorized_inference_solve(
-                    hessian,
-                    &inverse.project(rhs),
-                    &solution,
-                    label,
-                )?;
-                Ok(solution)
-            }
+            // The identified inverse exists only for a dense Hessian.
+            Self::Identified(inverse) => match hessian {
+                gam_linalg::matrix::SymmetricMatrix::Dense(dense) => inverse
+                    .certified_solve(dense, rhs, label)
+                    .map_err(|error| {
+                        EstimationError::RemlOptimizationFailed(format!(
+                            "exact factorized inference solve did not certify: {error}"
+                        ))
+                    }),
+                gam_linalg::matrix::SymmetricMatrix::Sparse(_) => {
+                    Err(EstimationError::RemlOptimizationFailed(format!(
+                        "{label}: an identified-subspace inverse is certified only against the \
+                         dense Hessian it was taken on"
+                    )))
+                }
+            },
         }
     }
 

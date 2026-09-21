@@ -92,20 +92,71 @@ impl IdentifiedHessianInverse {
 
     /// `H⁺·B`.
     pub(crate) fn apply(&self, rhs: &Array2<f64>) -> Array2<f64> {
-        let mut coordinates = self.basis.t().dot(rhs);
-        for (mut row, &inverse) in coordinates
+        self.apply_and_project(rhs).0
+    }
+
+    /// `U·Uᵀ·B`, the part of `B` that lies in the identified subspace.
+    pub(crate) fn project(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        self.basis.dot(&self.basis.t().dot(rhs))
+    }
+
+    /// `(H⁺·B, U·Uᵀ·B)` from one set of coordinates `C = Uᵀ·B`: the solve is
+    /// `U·(S·C)` and the right-hand side it is certified against is `U·C`.
+    fn apply_and_project(&self, rhs: &Array2<f64>) -> (Array2<f64>, Array2<f64>) {
+        let coordinates = self.basis.t().dot(rhs);
+        let projected = self.basis.dot(&coordinates);
+        let mut scaled = coordinates;
+        for (mut row, &inverse) in scaled
             .rows_mut()
             .into_iter()
             .zip(self.reduced_inverse.diag().iter())
         {
             row *= inverse;
         }
-        self.basis.dot(&coordinates)
+        (self.basis.dot(&scaled), projected)
     }
 
-    /// `U·Uᵀ·B`, the part of `B` that lies in the identified subspace.
-    pub(crate) fn project(&self, rhs: &Array2<f64>) -> Array2<f64> {
-        self.basis.dot(&self.basis.t().dot(rhs))
+    /// The η band of [`Self::apply`] against `hessian` (#4038): the spectral
+    /// solve band at this basis's own measured orthonormality defect
+    /// `‖UᵀU − I‖₂` and eigen-residual `‖H·U − U·Σ̃‖₂`, `Σ̃ = diag(1/s_a)` for
+    /// the stored reciprocals `s_a`. Both are measured against the `hessian`
+    /// the residual is formed with, so a rotated basis and an asymmetric
+    /// assembly are charged exactly what they cost.
+    fn solve_band(&self, hessian: &Array2<f64>, matrix_max_abs: f64) -> f64 {
+        let dimension = hessian.nrows();
+        let rank = self.rank();
+        let mut gram_defect = self.basis.t().dot(&self.basis);
+        for index in 0..rank {
+            gram_defect[[index, index]] -= 1.0;
+        }
+        let orthonormality_defect = gam_linalg::roundoff::orthonormality_defect_bound(
+            frobenius_norm(&gram_defect),
+            dimension,
+            rank,
+        );
+        let mut eigen_residual = hessian.dot(&self.basis);
+        let mut max_abs_eigenvalue = 0.0_f64;
+        for (index, &reciprocal) in self.reduced_inverse.diag().iter().enumerate() {
+            max_abs_eigenvalue = max_abs_eigenvalue.max((1.0 / reciprocal).abs());
+            for row in 0..dimension {
+                eigen_residual[[row, index]] -= self.basis[[row, index]] / reciprocal;
+            }
+        }
+        let eigen_residual_two_norm = gam_linalg::roundoff::eigen_residual_two_norm_bound(
+            frobenius_norm(&eigen_residual),
+            dimension,
+            rank,
+            orthonormality_defect,
+            matrix_max_abs,
+            gam_math::roundoff::inflated(max_abs_eigenvalue, 1),
+        );
+        gam_linalg::roundoff::spectral_solve_backward_band(
+            dimension,
+            rank,
+            matrix_max_abs,
+            eigen_residual_two_norm,
+            orthonormality_defect,
+        )
     }
 
     /// Solve `H·X = U·Uᵀ·B` min-norm and certify the residual against `U·Uᵀ·B`,
@@ -116,41 +167,52 @@ impl IdentifiedHessianInverse {
         rhs: &Array2<f64>,
         label: &str,
     ) -> Result<Array2<f64>, CertifiedSymmetricSolveError> {
-        let solution = self.apply(rhs);
-        let projected = self.project(rhs);
+        let (solution, projected) = self.apply_and_project(rhs);
+        let matrix_max_abs = max_abs_entry(hessian);
         let residual = hessian.dot(&solution) - &projected;
         certify_linear_system_residual(
             hessian.nrows(),
-            max_abs_entry(hessian),
+            matrix_max_abs,
             &projected,
             &solution,
             &residual,
+            self.solve_band(hessian, matrix_max_abs),
             label,
         )?;
         Ok(solution)
     }
 
     /// `H⁺` itself, certified by `H·H⁺ = U·Uᵀ`.
+    ///
+    /// The certificate is taken on the solved identity columns, then they are
+    /// projected onto the symmetric matrices. `H⁺` is symmetric, so the
+    /// projected error `(E + Eᵀ)/2` is no larger than `E` in the max norm: the
+    /// returned inverse is at least as accurate as the certified columns.
     pub(crate) fn certified_inverse(
         &self,
         hessian: &Array2<f64>,
         label: &str,
     ) -> Result<Array2<f64>, CertifiedSymmetricSolveError> {
         let identity = Array2::<f64>::eye(hessian.nrows());
-        let mut inverse = self.apply(&identity);
-        gam_linalg::matrix::symmetrize_in_place(&mut inverse);
-        let projector = self.project(&identity);
+        let (mut inverse, projector) = self.apply_and_project(&identity);
+        let matrix_max_abs = max_abs_entry(hessian);
         let residual = hessian.dot(&inverse) - &projector;
         certify_linear_system_residual(
             hessian.nrows(),
-            max_abs_entry(hessian),
+            matrix_max_abs,
             &projector,
             &inverse,
             &residual,
+            self.solve_band(hessian, matrix_max_abs),
             label,
         )?;
+        gam_linalg::matrix::symmetrize_in_place(&mut inverse);
         Ok(inverse)
     }
+}
+
+fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
+    matrix.iter().map(|value| value * value).sum::<f64>().sqrt()
 }
 
 fn max_abs_entry(matrix: &Array2<f64>) -> f64 {

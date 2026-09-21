@@ -333,9 +333,314 @@ pub fn solved_penalty_trace(
     Ok((lambda * trace, band))
 }
 
+// Backward-error bands of a solve `A·X̂ ≈ B`, read by the max-norm certificate
+//
+//     η = ‖A·X̂ − B‖_max / (n·‖A‖_max·‖X̂‖_max + ‖B‖_max)
+//
+// (`crate::utils::certify_linear_system_residual`). Each band is an upper
+// bound on the η the named algorithm can produce in binary64 (#4038), so a
+// residual above it is not rounding. Every band has two parts:
+//
+// * the SOLVE's backward error. A solve with `(A + ΔA)·x̂_j = b_j` for every
+//   column leaves the exact residual `−ΔA·x̂_j`, whose entries are at most
+//   `n·‖ΔA‖_max·‖X̂‖_max`, so it contributes `‖ΔA‖_max / ‖A‖_max` to η;
+// * the residual's FORMATION. Each computed residual entry is an `n`-term
+//   inner product and one subtraction, within `γ_{n+1}·(|A||x̂_j| + |b_j|)` of
+//   the exact one in any summation order (Higham, *ASNA* 2nd ed., §3.1), which
+//   contributes `γ_{n+1}` to η.
+
+/// The residual-formation share of every solve band: `γ_{n+1}`.
+fn residual_formation_band(dimension: usize) -> f64 {
+    accumulation_growth(dimension + 1)
+}
+
+/// η band of a solve by an unpivoted Cholesky factor `A = R̂ᵀR̂` of an SPD `A`.
+///
+/// Higham (*ASNA* 2nd ed., Thm 10.4): the solve satisfies `(A + ΔA)x̂ = b` with
+/// `|ΔA| ≤ γ_{3n+1}·|R̂ᵀ||R̂|`. Entry `(i, j)` of `|R̂ᵀ||R̂|` is at most
+/// `‖r_i‖₂‖r_j‖₂` for the columns `r_i` of `R̂`, and the factor's own diagonal
+/// (Thm 10.3, `R̂ᵀR̂ = A + ΔA₁`, `|ΔA₁| ≤ γ_{n+1}|R̂ᵀ||R̂|`) gives
+/// `‖r_i‖₂² ≤ a_ii / (1 − γ_{n+1})`. So `‖ΔA‖_max ≤ γ_{3n+1}·‖A‖_max / (1 − γ_{n+1})`
+/// with no growth factor at all, which is why the band depends on `n` alone.
+/// Blocked and recursive variants reorder the same inner products, and a
+/// symmetric permutation (a sparse fill-reducing ordering) is exact, so the band
+/// covers them.
+pub fn cholesky_solve_backward_band(dimension: usize) -> f64 {
+    let solve = accumulation_growth(3 * dimension + 1);
+    let factor = accumulation_growth(dimension + 1);
+    if !(factor < 1.0) {
+        return f64::INFINITY;
+    }
+    solve / (1.0 - factor) + residual_formation_band(dimension)
+}
+
+/// η band of a solve by a symmetric indefinite factor `P A Pᵀ = L̂ B̂ L̂ᵀ`
+/// (unit lower `L̂`, block-diagonal `B̂` with 1×1 and 2×2 pivots).
+///
+/// Higham (*ASNA* 2nd ed., Thm 11.3–11.4): the factorization and the solve
+/// together satisfy `(A + ΔA)x̂ = b` with `|ΔA| ≤ γ_k·(|A| + P ᵀ|L̂||B̂||L̂ᵀ|P)`,
+/// where `k` counts the roundings on one entry's path: the `n`-term inner
+/// products of the factorization and of the two triangular solves, plus the
+/// pivot-block arithmetic twice (once to form the multipliers, once to solve the
+/// block). `pivot_block_roundings` is that block constant `c_B` — `2` for a 1×1
+/// pivot applied as a reciprocal and a product, and the measured constant of the
+/// 2×2 block formula otherwise — so `k = 3n + 2·c_B + 3`.
+///
+/// `factor_product_bound` is an upper bound `G` on `‖ |L̂||B̂||L̂ᵀ| ‖_max`,
+/// measured on the factor. Unlike Cholesky this term is NOT bounded by `‖A‖_max`:
+/// it is the element growth of the pivoting, and it is the only honest source of
+/// the band's size.
+pub fn symmetric_factor_solve_backward_band(
+    dimension: usize,
+    pivot_block_roundings: f64,
+    factor_product_bound: f64,
+    matrix_max_abs: f64,
+) -> f64 {
+    if !(matrix_max_abs > 0.0) || !factor_product_bound.is_finite() || factor_product_bound < 0.0
+    {
+        return f64::INFINITY;
+    }
+    if !(pivot_block_roundings.is_finite() && pivot_block_roundings >= 0.0) {
+        return f64::INFINITY;
+    }
+    let operations = 3.0 * dimension as f64 + 2.0 * pivot_block_roundings.ceil() + 3.0;
+    if !(operations * UNIT_ROUNDOFF < 1.0) {
+        return f64::INFINITY;
+    }
+    let growth = accumulation_growth(operations as usize);
+    growth * (matrix_max_abs + factor_product_bound) / matrix_max_abs
+        + residual_formation_band(dimension)
+}
+
+/// A certified upper bound `ω ≥ ‖UᵀU − I‖₂` for a computed `n × rank` basis
+/// `U` meant to be orthonormal, from `computed_gram_defect_frobenius =
+/// ‖fl(fl(UᵀU) − I)‖_F`.
+///
+/// Every entry of `fl(UᵀU)` is an `n`-term inner product within
+/// `γ_n·‖u_a‖₂‖u_b‖₂ ≤ γ_n·(1 + ω)` of the exact one, so the `rank × rank`
+/// formation error has Frobenius norm at most `γ_n·rank·(1 + ω)`. With the
+/// computed norm inflated for its diagonal subtraction and its `rank²`-term
+/// accumulation (`ω̂`), `ω ≤ ω̂ + γ_n·rank·(1 + ω)`, i.e.
+/// `ω ≤ (ω̂ + γ_n·rank)/(1 − γ_n·rank)`. Infinite when that is no bound.
+pub fn orthonormality_defect_bound(
+    computed_gram_defect_frobenius: f64,
+    dimension: usize,
+    rank: usize,
+) -> f64 {
+    let formation = accumulation_growth(dimension) * rank as f64;
+    if !(formation < 1.0) || !computed_gram_defect_frobenius.is_finite() {
+        return f64::INFINITY;
+    }
+    let computed = gam_math::roundoff::inflated(
+        computed_gram_defect_frobenius,
+        rank.saturating_mul(rank).saturating_add(1),
+    );
+    (computed + formation) / (1.0 - formation)
+}
+
+/// A certified upper bound on `‖H·U − U·Σ̃‖₂` from its computed value
+/// `computed_residual_frobenius = ‖fl(H·U − fl(U·Σ̃))‖_F`, for `U` with `rank`
+/// columns and orthonormality defect `ω ≥ ‖UᵀU − I‖₂`
+/// ([`orthonormality_defect_bound`]) and `Σ̃` diagonal with largest entry
+/// `max_abs_eigenvalue`.
+///
+/// Each computed entry is an `n`-term inner product, one product (or quotient)
+/// and one subtraction, within `γ_{n+1}·(|H||U| + |U||Σ̃|)` of the exact one. A
+/// column has `‖u‖₁ ≤ √n·‖u‖₂ ≤ √n·√(1 + ω)`, so `(|H||U|)_{ia} ≤
+/// √n·√(1 + ω)·‖H‖_max`, and the Frobenius norm of the majorant over the
+/// `n × rank` entries is at most `√rank·√(1 + ω)·(n·‖H‖_max + max|σ̃|)`.
+/// `‖·‖₂ ≤ ‖·‖_F` and the triangle inequality give the bound; the computed
+/// Frobenius norm is inflated for its own `n·rank`-term accumulation.
+pub fn eigen_residual_two_norm_bound(
+    computed_residual_frobenius: f64,
+    dimension: usize,
+    rank: usize,
+    orthonormality_defect: f64,
+    matrix_max_abs: f64,
+    max_abs_eigenvalue: f64,
+) -> f64 {
+    if !(orthonormality_defect.is_finite() && orthonormality_defect >= 0.0) {
+        return f64::INFINITY;
+    }
+    let computed = gam_math::roundoff::inflated(
+        computed_residual_frobenius,
+        dimension.saturating_mul(rank),
+    );
+    computed
+        + accumulation_growth(dimension + 1)
+            * (rank as f64 * (1.0 + orthonormality_defect)).sqrt()
+            * (dimension as f64 * matrix_max_abs + max_abs_eigenvalue)
+}
+
+/// η band of the spectral solve `X̂ = fl(U·Z)`, `Z = fl(S·C)`, `C = fl(Uᵀ·B)`,
+/// certified against `B̃ = fl(U·C)`, for `U` with `rank` columns and
+/// orthonormality defect `ω ≥ ‖UᵀU − I‖₂`, `S = diag(s_a)` the stored inverse
+/// eigenvalues, `Σ̃ = S⁻¹` exactly, and `eigen_residual_two_norm ≥
+/// ‖H·U − U·Σ̃‖₂` ([`eigen_residual_two_norm_bound`]).
+///
+/// With `R_e = HU − UΣ̃`, `Z = SC + E_Z`, `X̂ = UZ + E_X` and `B̃ = UC + E_B`,
+/// exactly `Σ̃Z = C + Σ̃E_Z` and
+///
+/// ```text
+///   H·X̂ − B̃ = U·Σ̃·E_Z + R_e·Z + H·E_X − E_B,
+/// ```
+///
+/// with `|Σ̃E_Z| ≤ u|C|` (one product), `|E_X| ≤ γ_rank|U||Z|` and
+/// `|E_B| ≤ γ_rank|U||C|`. The rows of `U` have norm at most `ν = √(1 + ω)`, so
+/// column `j` of the four terms is at most `ν·u‖c_j‖₂`, `‖R_e‖₂‖z_j‖₂`,
+/// `n‖H‖_max·γ_rank·ν‖z_j‖₂` and `γ_rank·ν‖c_j‖₂` in the max norm. Since
+/// `‖Uz‖₂ ≥ √(1 − ω)‖z‖₂` and `‖|U||z|‖₂ ≤ ‖U‖_F‖z‖₂ ≤ √(rank)·ν‖z‖₂`,
+/// `√n‖X̂‖_max ≥ ‖x̂_j‖₂ ≥ θ‖z_j‖₂` with `θ = √(1 − ω) − γ_rank·√rank·ν`, and
+/// likewise `√n‖B̃‖_max ≥ θ‖c_j‖₂`. Against the certificate's denominator
+/// `n‖H‖_max‖X̂‖_max + ‖B̃‖_max` the terms are at most `(ν/θ)·√n·u`,
+/// `‖R_e‖₂/(θ√n‖H‖_max)`, `(ν/θ)·√n·γ_rank` and `(ν/θ)·√n·γ_rank`. The
+/// residual's formation adds `γ_{n+1}`. Infinite when `θ ≤ 0`.
+pub fn spectral_solve_backward_band(
+    dimension: usize,
+    rank: usize,
+    matrix_max_abs: f64,
+    eigen_residual_two_norm: f64,
+    orthonormality_defect: f64,
+) -> f64 {
+    if !(matrix_max_abs > 0.0)
+        || !eigen_residual_two_norm.is_finite()
+        || !(orthonormality_defect >= 0.0 && orthonormality_defect < 1.0)
+    {
+        return f64::INFINITY;
+    }
+    let nu = (1.0 + orthonormality_defect).sqrt();
+    let theta = (1.0 - orthonormality_defect).sqrt()
+        - accumulation_growth(rank) * (rank as f64).sqrt() * nu;
+    if !(theta > 0.0) {
+        return f64::INFINITY;
+    }
+    let root_n = (dimension as f64).sqrt();
+    residual_formation_band(dimension)
+        + eigen_residual_two_norm / (theta * root_n * matrix_max_abs)
+        + nu / theta * root_n * (UNIT_ROUNDOFF + 2.0 * accumulation_growth(rank))
+}
+
+/// η band of a positive semidefinite pseudo-inverse accumulated from `rank`
+/// eigenpairs, `X̂ = fl(Σ_a fl(fl(s_a·v_a)·v_aᵀ))` with every `s_a = fl(1/σ_a) > 0`,
+/// certified against the projector `P̂ = fl(Σ_a v_a·v_aᵀ)`, for eigenvectors
+/// with orthonormality defect `ω ≥ ‖VᵀV − I‖₂` and `eigen_residual_two_norm ≥
+/// ‖H·V − V·Σ̃‖₂`, `Σ̃ = diag(1/s_a)` exactly.
+///
+/// Exactly `H·V·S·Vᵀ − V·Vᵀ = (H·V − V·Σ̃)·S·Vᵀ`: column `c` of it is
+/// `R_e·y_c`, `y_c = S·Vᵀe_c`, and the exact `X = V·S·Vᵀ` has column
+/// `V·y_c`, so `‖y_c‖₂ ≤ ‖X e_c‖₂/√(1 − ω) ≤ √n‖X‖_max/√(1 − ω)`. The
+/// accumulation errors, by weighted Cauchy–Schwarz on the positive `s_a`, are
+/// `|F_X| ≤ γ_{rank+3}·√(X_rr X_cc) ≤ γ_{rank+3}·‖X‖_max` (so also
+/// `‖X‖_max ≤ ‖X̂‖_max/(1 − γ_{rank+3})`) and `|F_P| ≤ γ_rank·√(P_rr P_cc) ≤
+/// γ_rank·(1 + ω)`, and `‖P̂‖_max ≥ trace(P)/n − γ_rank(1 + ω) ≥
+/// rank·(1 − ω)/n − γ_rank(1 + ω)`. Against the certificate's denominator the
+/// three parts are at most `‖R_e‖₂/(√(1 − ω)·(1 − γ_{rank+3})·√n‖H‖_max)`,
+/// `γ_{rank+3}/(1 − γ_{rank+3})` and `γ_rank(1 + ω)/‖P̂‖_max`'s lower bound.
+/// The residual's formation adds `γ_{n+1}`.
+pub fn psd_pseudo_inverse_backward_band(
+    dimension: usize,
+    rank: usize,
+    matrix_max_abs: f64,
+    eigen_residual_two_norm: f64,
+    orthonormality_defect: f64,
+) -> f64 {
+    if rank == 0 {
+        // Nothing accumulated: `X̂ = P̂ = 0` exactly.
+        return residual_formation_band(dimension);
+    }
+    if !(matrix_max_abs > 0.0)
+        || !eigen_residual_two_norm.is_finite()
+        || !(orthonormality_defect >= 0.0 && orthonormality_defect < 1.0)
+    {
+        return f64::INFINITY;
+    }
+    let n = dimension as f64;
+    let accumulation = accumulation_growth(rank + 3);
+    let projector_error = accumulation_growth(rank) * (1.0 + orthonormality_defect);
+    let projector_floor = rank as f64 * (1.0 - orthonormality_defect) / n - projector_error;
+    if !(accumulation < 1.0) || !(projector_floor > 0.0) {
+        return f64::INFINITY;
+    }
+    residual_formation_band(dimension)
+        + eigen_residual_two_norm
+            / ((1.0 - orthonormality_defect).sqrt() * (1.0 - accumulation) * n.sqrt() * matrix_max_abs)
+        + accumulation / (1.0 - accumulation)
+        + projector_error / projector_floor
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// To first order in `u` the Cholesky band is `(3n+1)u + (n+1)u =
+    /// (4n+2)u = (2n+1)ε`: the derivation's own count, which is what replaced
+    /// the unexplained `256·n·ε` (#4038), and it is below that at every `n`.
+    #[test]
+    fn cholesky_solve_band_is_its_rounding_count_4038() {
+        for dimension in [1_usize, 2, 10, 100, 10_000] {
+            let band = cholesky_solve_backward_band(dimension);
+            let first_order = (4 * dimension + 2) as f64 * UNIT_ROUNDOFF;
+            assert!(band.is_finite() && band > 0.0);
+            assert!(
+                (band / first_order - 1.0).abs() < 1.0e-9,
+                "n={dimension}: band {band:e} against first-order {first_order:e}"
+            );
+            assert!(band < 256.0 * dimension as f64 * f64::EPSILON);
+        }
+    }
+
+    /// The indefinite band carries the factor's growth `G` and nothing else: at
+    /// `G = ‖A‖_max` it is twice the entry band, it grows linearly in `G`, and a
+    /// growth that is not finite leaves no bound.
+    #[test]
+    fn symmetric_factor_band_is_priced_by_measured_growth_4038() {
+        let dimension = 20;
+        let entry = accumulation_growth(3 * dimension + 2 * 2 + 3);
+        let formation = accumulation_growth(dimension + 1);
+        let unit_growth = symmetric_factor_solve_backward_band(dimension, 2.0, 3.0, 3.0);
+        assert!((unit_growth - (2.0 * entry + formation)).abs() <= 1.0e-12 * unit_growth);
+        let large_growth = symmetric_factor_solve_backward_band(dimension, 2.0, 3.0e6, 3.0);
+        assert!((large_growth - ((1.0 + 1.0e6) * entry + formation)).abs() <= 1.0e-9 * large_growth);
+        assert!(symmetric_factor_solve_backward_band(dimension, 2.0, f64::INFINITY, 3.0).is_infinite());
+        assert!(symmetric_factor_solve_backward_band(dimension, f64::NAN, 3.0, 3.0).is_infinite());
+        assert!(symmetric_factor_solve_backward_band(dimension, 2.0, 3.0, 0.0).is_infinite());
+    }
+
+    /// An exactly orthonormal basis still gets the Gram's formation error, and a
+    /// defect that is no bound (formation `≥ 1`, non-finite) is infinite.
+    #[test]
+    fn orthonormality_defect_bound_covers_gram_formation_4038() {
+        let omega = orthonormality_defect_bound(0.0, 50, 10);
+        let formation = accumulation_growth(50) * 10.0;
+        assert!(omega >= formation && omega < 2.0 * formation);
+        assert!(orthonormality_defect_bound(f64::NAN, 50, 10).is_infinite());
+        let measured = orthonormality_defect_bound(1.0e-12, 50, 10);
+        assert!(measured >= 1.0e-12 + formation);
+    }
+
+    /// The spectral and pseudo-inverse bands reduce to their rounding terms at a
+    /// zero eigen-residual, grow with a measured one, and refuse a basis that is
+    /// not near-orthonormal.
+    #[test]
+    fn spectral_and_pseudo_inverse_bands_charge_the_measured_residual_4038() {
+        let (dimension, rank) = (30, 12);
+        let omega = orthonormality_defect_bound(0.0, dimension, rank);
+        let spectral = spectral_solve_backward_band(dimension, rank, 2.0, 0.0, omega);
+        assert!(spectral.is_finite() && spectral < 1.0e-12);
+        let spectral_residual = spectral_solve_backward_band(dimension, rank, 2.0, 1.0e-6, omega);
+        assert!(spectral_residual > spectral + 1.0e-6 / (2.0 * (dimension as f64).sqrt() * 2.0));
+        assert!(spectral_solve_backward_band(dimension, rank, 2.0, 0.0, 1.0).is_infinite());
+        assert!(spectral_solve_backward_band(dimension, rank, 0.0, 0.0, omega).is_infinite());
+
+        let pseudo = psd_pseudo_inverse_backward_band(dimension, rank, 2.0, 0.0, omega);
+        assert!(pseudo.is_finite() && pseudo < 1.0e-12);
+        assert!(psd_pseudo_inverse_backward_band(dimension, rank, 2.0, 1.0e-6, omega) > pseudo);
+        assert!(psd_pseudo_inverse_backward_band(dimension, rank, 2.0, 0.0, 1.0).is_infinite());
+        assert_eq!(
+            psd_pseudo_inverse_backward_band(dimension, 0, 2.0, f64::NAN, f64::NAN),
+            accumulation_growth(dimension + 1)
+        );
+    }
 
     /// The composed trace is `λ·Σ r·x̂`, and its band covers the error of a
     /// displaced solution through the residual it forms against the operator.

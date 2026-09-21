@@ -749,6 +749,100 @@ impl FaerLblt {
         inertia
     }
 
+    /// The pivot blocks of `B`: `(start, size)` in factor order.
+    fn pivot_blocks(&self) -> Vec<(usize, usize)> {
+        let n = self.l.nrows();
+        let b_subdiag = self.b_subdiag.as_ref();
+        let mut blocks = Vec::with_capacity(n);
+        let mut k = 0;
+        while k < n {
+            if k + 1 < n && b_subdiag[k] != 0.0 {
+                blocks.push((k, 2));
+                k += 2;
+            } else {
+                blocks.push((k, 1));
+                k += 1;
+            }
+        }
+        blocks
+    }
+
+    /// `max_i Σ_b ‖|B_b|‖₂·‖l_{i,b}‖₂²` over the pivot blocks `B_b` and the
+    /// matching pieces `l_{i,b}` of row `i` of `L`, an upper bound on
+    /// `‖ |L||B||Lᵀ| ‖_max` by Cauchy–Schwarz block by block (#4038). For a 2×2
+    /// block `[[a, c], [c, d]]` the norm of its entrywise absolute value is its
+    /// Perron root `(|a| + |d|)/2 + hypot((|a| − |d|)/2, |c|)`.
+    pub fn factor_product_bound(&self) -> f64 {
+        let n = self.l.nrows();
+        let b_diag = self.b_diag.as_ref();
+        let b_subdiag = self.b_subdiag.as_ref();
+        let blocks = self.pivot_blocks();
+        let mut bound = 0.0_f64;
+        for i in 0..n {
+            let mut row = 0.0_f64;
+            for &(start, size) in &blocks {
+                if start > i {
+                    break;
+                }
+                if size == 1 {
+                    let l = self.l[(i, start)];
+                    row += b_diag[start].abs() * l * l;
+                } else {
+                    let a = b_diag[start].abs();
+                    let d = b_diag[start + 1].abs();
+                    let c = b_subdiag[start].abs();
+                    let perron = 0.5 * (a + d) + (0.5 * (a - d)).hypot(c);
+                    let l0 = self.l[(i, start)];
+                    let l1 = if start + 1 <= i {
+                        self.l[(i, start + 1)]
+                    } else {
+                        0.0
+                    };
+                    row += perron * (l0 * l0 + l1 * l1);
+                }
+            }
+            bound = bound.max(row);
+        }
+        bound
+    }
+
+    /// The largest per-block rounding constant `c_B` of the pivot-block solves:
+    /// the componentwise backward error `(B_b + ΔB_b)ŷ = x`, `|ΔB_b| ≤ c_B·u·|B_b|`,
+    /// of the block formula faer applies (#4038).
+    ///
+    /// A 1×1 pivot is applied as a reciprocal and a product, `c_B = 2`. A 2×2 pivot
+    /// `[[a, c], [c, d]]` is solved as `c⁻¹ → (a·c⁻¹, d·c⁻¹) → (a d/c² − 1)⁻¹ → y`,
+    /// the scaled formula of LAPACK's `dsytrs` (Higham, *ASNA* 2nd ed., §11.1.1).
+    /// Tracking its eleven roundings through the adjugate form
+    /// `y = adj(B_b)·x / det(B_b)` — the determinant enters only through the
+    /// rounded `a d/c² − 1`, whose relative error is amplified by
+    /// `|ad|/|ad − c²|` — and back to the block by Oettli–Prager gives
+    /// `c_B = 9 + (23|ad| + 12c²)/|ad − c²|`: bounded (≈ 46) under Bunch–Kaufman's
+    /// `|ad| ≤ α²c²`, `α = (1 + √17)/8`, and honestly unbounded as the block
+    /// approaches singularity. Checked in exact rational arithmetic against faer's
+    /// formula over random Bunch–Kaufman blocks, including near-singular ones:
+    /// the measured backward error stays below `0.2·c_B·u`.
+    pub fn pivot_block_roundings(&self) -> f64 {
+        let b_diag = self.b_diag.as_ref();
+        let b_subdiag = self.b_subdiag.as_ref();
+        let mut worst = 2.0_f64;
+        for (start, size) in self.pivot_blocks() {
+            if size == 2 {
+                let a = b_diag[start];
+                let d = b_diag[start + 1];
+                let c = b_subdiag[start];
+                let determinant = (a * d - c * c).abs();
+                let constant = 9.0 + (23.0 * (a * d).abs() + 12.0 * c * c) / determinant;
+                worst = worst.max(if constant.is_nan() {
+                    f64::INFINITY
+                } else {
+                    constant
+                });
+            }
+        }
+        worst
+    }
+
     /// The dimension of the factored matrix.
     pub fn nrows(&self) -> usize {
         self.l.nrows()
@@ -1111,6 +1205,24 @@ impl FaerSymmetricFactor {
         match self {
             FaerSymmetricFactor::Llt(f) => f.solve_in_place(rhs),
             FaerSymmetricFactor::Lblt(f) => f.solve_in_place(rhs),
+        }
+    }
+
+    /// The max-norm backward-error band of a solve by this factor of a matrix
+    /// with max entry `matrix_max_abs` (#4038): the Cholesky band, which needs no
+    /// growth factor, or the indefinite band at this factor's own measured
+    /// `‖ |L||B||Lᵀ| ‖_max` and pivot-block constant.
+    pub fn solve_backward_band(&self, matrix_max_abs: f64) -> f64 {
+        match self {
+            FaerSymmetricFactor::Llt(f) => {
+                crate::roundoff::cholesky_solve_backward_band(f.nrows())
+            }
+            FaerSymmetricFactor::Lblt(f) => crate::roundoff::symmetric_factor_solve_backward_band(
+                f.nrows(),
+                f.pivot_block_roundings(),
+                f.factor_product_bound(),
+                matrix_max_abs,
+            ),
         }
     }
 }
