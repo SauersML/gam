@@ -715,14 +715,67 @@ pub(crate) fn combine_slope_surface_designs(
     Ok((combined, concatenate_term_specs(specs), topology))
 }
 
+/// One evaluation of the pooled pilot objective at a slope: the summed row
+/// value, score and curvature in the slope, each with the rounding band of its
+/// own `n`-term sum.
+#[derive(Clone, Copy, Debug)]
+struct PooledPilotState {
+    slope: f64,
+    score: f64,
+    score_band: f64,
+    curvature: f64,
+    curvature_band: f64,
+}
+
+impl PooledPilotState {
+    /// The pooled score is zero to the rounding of its own sum: a computed
+    /// `Σ gᵢ` whose exact value is zero can land anywhere in
+    /// `±γ_n·Σ|gᵢ|` (the `n − 1` additions plus the rounding that formed each
+    /// row's score), and a score outside that band has a trustworthy sign.
+    fn score_resolved(&self) -> bool {
+        self.score.abs() <= self.score_band
+    }
+
+    /// The pooled curvature is positive beyond the rounding of its own sum.
+    fn curvature_resolved_positive(&self) -> bool {
+        self.curvature > self.curvature_band
+    }
+}
+
 /// Compute a baseline slope from the actual survival marginal-slope likelihood,
 /// using the baseline offsets alone as a time-only pilot q(t).
 ///
-/// This is a safeguarded 1D Newton solve on the true row objective. It does not
-/// use a coarse fixed grid scan. A row entering at the time origin carries no
-/// entry factor here, as in the fitted likelihood (gnomon#2336), and each row's
-/// score reads its conditional variance `z_variance[i] = Var(z | a_i)`, the
-/// covariance the fitted likelihood reads (gam#2766, gam#2952).
+/// A row entering at the time origin carries no entry factor here, as in the
+/// fitted likelihood (gnomon#2336), and each row's score reads its conditional
+/// variance `z_variance[i] = Var(z | a_i)`, the covariance the fitted
+/// likelihood reads (gam#2766, gam#2952).
+///
+/// The returned slope is a certified minimizer of the pooled objective
+/// (gam#4250). It is one of:
+/// - a slope whose pooled score is zero to the rounding band of its own sum
+///   (see [`PooledPilotState::score_resolved`]), reached inside a bracket where
+///   the score changes sign from negative to positive, or outside one with a
+///   curvature resolved positive;
+/// - the endpoint, with the smaller score, of a bracket whose two ends are
+///   adjacent floats while the score still changes sign across them, so the
+///   root is resolved to the slope's own precision.
+///
+/// Anything else is an error, not a value: a row that does not evaluate, a
+/// non-finite pooled objective, and a pooled objective with no finite
+/// minimizer. The last is a score that keeps its sign out to the end of the
+/// f64 range, or flattens to rounding with no curvature left, as a separable
+/// or degenerate pilot does. The slope becomes part of the model (the slope
+/// block's fixed offset, the frailty identification gate, the absorber
+/// columns and the saved `baseline_slope`), so a best-so-far probe or a
+/// silent `0.0` would change the fitted model with nothing recording it.
+///
+/// The solve has no iteration cap and no absolute tolerance. The bracket
+/// expansion doubles until the score changes sign or the slope leaves the
+/// f64 range. The refinement is Newton inside the bracket, falling back to
+/// bisection whenever Newton leaves the bracket, lacks a resolved positive
+/// curvature, or the previous step failed to halve the bracket, so the bracket
+/// halves at least every second evaluation and reaches adjacent floats in
+/// finitely many steps.
 pub(crate) fn pooled_survival_baseline(
     event: &Array1<f64>,
     weights: &Array1<f64>,
@@ -733,17 +786,17 @@ pub(crate) fn pooled_survival_baseline(
     q1: &Array1<f64>,
     qd1: &Array1<f64>,
     probit_scale: f64,
-) -> f64 {
+) -> Result<f64, SurvivalMarginalSlopeError> {
     let n = event.len();
     if n == 0 {
-        return 0.0;
+        return Ok(0.0);
     }
-    let objective_grad_hess = |slope: f64| -> Option<(f64, f64, f64)> {
+    let evaluate = |slope: f64| -> Result<PooledPilotState, SurvivalMarginalSlopeError> {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let triples: Option<Vec<(f64, f64, f64)>> = (0..n)
+        let rows: Vec<Result<(f64, f64, f64), String>> = (0..n)
             .into_par_iter()
             .map(|i| {
-                let (row_obj, row_grad, row_hess) = row_primary_closed_form(
+                row_primary_closed_form(
                     q0[i],
                     q1[i],
                     qd1[i],
@@ -756,127 +809,149 @@ pub(crate) fn pooled_survival_baseline(
                     0.0,
                     probit_scale,
                 )
-                .ok()?;
-                Some((row_obj, row_grad[3], row_hess[3][3]))
+                .map(|(row_value, row_grad, row_hess)| (row_value, row_grad[3], row_hess[3][3]))
             })
             .collect();
-        let triples = triples?;
-        Some(
-            triples
-                .into_iter()
-                .fold((0.0_f64, 0.0_f64, 0.0_f64), |(o, g, h), (oi, gi, hi)| {
-                    (o + oi, g + gi, h + hi)
-                }),
-        )
-    };
-
-    let Some(state0) = objective_grad_hess(0.0) else {
-        return 0.0;
-    };
-    if !state0.0.is_finite() {
-        return 0.0;
-    }
-    if state0.1.abs() < 1e-8 {
-        return 0.0;
-    }
-
-    let mut best_slope = 0.0;
-    let mut best = state0;
-
-    let mut bracket_lo = if state0.1 <= 0.0 {
-        Some((0.0, state0))
-    } else {
-        None
-    };
-    let mut bracket_hi = if state0.1 >= 0.0 {
-        Some((0.0, state0))
-    } else {
-        None
-    };
-    let mut step = 0.5f64;
-    for _ in 0..48 {
-        for &candidate in &[-step, step] {
-            if let Some(state) = objective_grad_hess(candidate) {
-                if state.0 < best.0 {
-                    best_slope = candidate;
-                    best = state;
-                }
-                if state.1 <= 0.0 {
-                    bracket_lo = Some((candidate, state));
-                }
-                if state.1 >= 0.0 {
-                    bracket_hi = Some((candidate, state));
-                }
-                if let (Some((lo, lo_state)), Some((hi, hi_state))) = (bracket_lo, bracket_hi)
-                    && lo < hi
-                    && lo_state.1 <= 0.0
-                    && hi_state.1 >= 0.0
-                {
-                    let mut slope = best_slope.clamp(lo, hi);
-                    let mut state = if (slope - lo).abs() < f64::EPSILON {
-                        lo_state
-                    } else if (slope - hi).abs() < f64::EPSILON {
-                        hi_state
-                    } else {
-                        match objective_grad_hess(slope) {
-                            Some(s) => s,
-                            None => {
-                                slope = 0.5 * (lo + hi);
-                                objective_grad_hess(slope).unwrap_or(best)
-                            }
-                        }
-                    };
-
-                    let mut bracket_lo = (lo, lo_state);
-                    let mut bracket_hi = (hi, hi_state);
-                    for _ in 0..60 {
-                        if state.1.abs() < 1e-8 || (bracket_hi.0 - bracket_lo.0).abs() < 1e-8 {
-                            break;
-                        }
-                        let mut candidate = 0.5 * (bracket_lo.0 + bracket_hi.0);
-                        if state.2.is_finite() && state.2 > 0.0 {
-                            let newton = slope - state.1 / state.2;
-                            if newton > bracket_lo.0 && newton < bracket_hi.0 {
-                                candidate = newton;
-                            }
-                        }
-                        let Some(candidate_state) = objective_grad_hess(candidate) else {
-                            candidate = 0.5 * (bracket_lo.0 + bracket_hi.0);
-                            let Some(mid_state) = objective_grad_hess(candidate) else {
-                                break;
-                            };
-                            if mid_state.0 < best.0 {
-                                best_slope = candidate;
-                                best = mid_state;
-                            }
-                            if mid_state.1 <= 0.0 {
-                                bracket_lo = (candidate, mid_state);
-                            } else {
-                                bracket_hi = (candidate, mid_state);
-                            }
-                            slope = candidate;
-                            state = mid_state;
-                            continue;
-                        };
-                        if candidate_state.0 < best.0 {
-                            best_slope = candidate;
-                            best = candidate_state;
-                        }
-                        if candidate_state.1 <= 0.0 {
-                            bracket_lo = (candidate, candidate_state);
-                        } else {
-                            bracket_hi = (candidate, candidate_state);
-                        }
-                        slope = candidate;
-                        state = candidate_state;
-                    }
-                    return if best.0.is_finite() { best_slope } else { 0.0 };
-                }
-            }
+        // Summed in row order, so the pilot is the same on every thread count.
+        let (mut value, mut score, mut score_abs, mut curvature, mut curvature_abs) =
+            (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+        for (row, evaluated) in rows.into_iter().enumerate() {
+            let (row_value, row_score, row_curvature) =
+                evaluated.map_err(|reason| SurvivalMarginalSlopeError::NumericalFailure {
+                    reason: format!(
+                        "survival marginal-slope pooled baseline pilot: row {row} does not \
+                         evaluate at slope {slope:e}: {reason}"
+                    ),
+                })?;
+            value += row_value;
+            score += row_score;
+            score_abs += row_score.abs();
+            curvature += row_curvature;
+            curvature_abs += row_curvature.abs();
         }
-        step *= 2.0;
+        if !(value.is_finite() && score.is_finite() && curvature.is_finite()) {
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival marginal-slope pooled baseline pilot: the pooled objective is not \
+                     finite at slope {slope:e} (value {value:e}, score {score:e}, curvature \
+                     {curvature:e})"
+                ),
+            });
+        }
+        Ok(PooledPilotState {
+            slope,
+            score,
+            score_band: gam_linalg::roundoff::accumulation_band(n, score_abs),
+            curvature,
+            curvature_band: gam_linalg::roundoff::accumulation_band(n, curvature_abs),
+        })
+    };
+    // A score zero to rounding without a curvature resolved positive is a
+    // flat stretch, not a certified minimizer.
+    let flat_without_minimizer =
+        |state: &PooledPilotState| SurvivalMarginalSlopeError::RootSolveFailed {
+            reason: format!(
+                "survival marginal-slope pooled baseline pilot: the pooled score {:e} is zero to \
+                 its rounding band {:e} at slope {:e}, but its curvature {:e} is not resolved \
+                 positive (band {:e}); the pilot objective flattens there without a certified \
+                 finite minimizer, as a separable or degenerate pilot does",
+                state.score, state.score_band, state.slope, state.curvature, state.curvature_band,
+            ),
+        };
+
+    let origin = evaluate(0.0)?;
+    if origin.score_resolved() {
+        return if origin.curvature_resolved_positive() {
+            Ok(0.0)
+        } else {
+            Err(flat_without_minimizer(&origin))
+        };
     }
-    if best.0.is_finite() { best_slope } else { 0.0 }
+
+    // Expand along the descent direction until the score changes sign. The
+    // first probe is the Newton step from the origin when its curvature is
+    // resolved positive (the step then points along the descent direction),
+    // else a unit slope; the start only sets how many doublings the bracket
+    // takes. The expansion ends at the f64 range, not at a count.
+    let direction = -origin.score.signum();
+    let newton_reach = (origin.score / origin.curvature).abs();
+    let mut reach =
+        if origin.curvature_resolved_positive() && newton_reach > 0.0 && newton_reach.is_finite() {
+            newton_reach
+        } else {
+            1.0
+        };
+    let mut inner = origin;
+    let outer = loop {
+        let slope = direction * reach;
+        if !slope.is_finite() {
+            return Err(SurvivalMarginalSlopeError::RootSolveFailed {
+                reason: format!(
+                    "survival marginal-slope pooled baseline pilot: the pooled score keeps the \
+                     sign of its value {:e} at slope 0 out to slope {:e}, the last finite \
+                     doubling, so the pooled objective has no finite minimizer (a separable or \
+                     degenerate pilot)",
+                    origin.score, inner.slope,
+                ),
+            });
+        }
+        let probe = evaluate(slope)?;
+        if probe.score_resolved() {
+            return if probe.curvature_resolved_positive() {
+                Ok(slope)
+            } else {
+                Err(flat_without_minimizer(&probe))
+            };
+        }
+        if probe.score.signum() != origin.score.signum() {
+            break probe;
+        }
+        inner = probe;
+        reach *= 2.0;
+    };
+
+    // Both ends lie outside their score bands, so the signs are trustworthy:
+    // `lower.score < 0 < upper.score`, a crossing from descent to ascent.
+    let (mut lower, mut upper) = if direction > 0.0 {
+        (inner, outer)
+    } else {
+        (outer, inner)
+    };
+    let mut width_before_last_step = f64::INFINITY;
+    loop {
+        let current = if lower.score.abs() <= upper.score.abs() {
+            lower
+        } else {
+            upper
+        };
+        let width = upper.slope - lower.slope;
+        let midpoint = lower.slope + 0.5 * width;
+        if !(midpoint > lower.slope && midpoint < upper.slope) {
+            // Adjacent floats: the score changes sign across one ulp, so the
+            // root is resolved to the slope's own precision.
+            return Ok(current.slope);
+        }
+        let newton = current.slope - current.score / current.curvature;
+        let candidate = if current.curvature_resolved_positive()
+            && newton > lower.slope
+            && newton < upper.slope
+            && width <= 0.5 * width_before_last_step
+        {
+            newton
+        } else {
+            midpoint
+        };
+        let probe = evaluate(candidate)?;
+        if probe.score_resolved() {
+            return Ok(candidate);
+        }
+        width_before_last_step = width;
+        if probe.score < 0.0 {
+            lower = probe;
+        } else {
+            upper = probe;
+        }
+    }
 }
 
 // ── Public fitting function ───────────────────────────────────────────

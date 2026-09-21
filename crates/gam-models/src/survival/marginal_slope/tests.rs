@@ -180,11 +180,13 @@ fn pooled_survival_baseline_ignores_origin_entry_offsets_2336() {
             &qd1,
             1.0,
         )
+        .expect("the pilot certifies a minimizer of the pooled objective")
     };
     let origin = Array1::from_elem(n, true);
     let delayed = Array1::from_elem(n, false);
 
-    // The pilot returns exactly 0 when it declines to solve.
+    // A zero slope would mean the score already vanished at the origin, which
+    // leaves the entry-offset comparison below without a solve to compare.
     let origin_slope = pilot(&origin, &entry_low);
     assert!(
         origin_slope.is_finite() && origin_slope != 0.0,
@@ -231,10 +233,11 @@ fn pooled_survival_baseline_solves_at_the_conditional_score_variance_2952() {
             &qd1,
             1.0,
         )
+        .expect("the pilot certifies a minimizer of the pooled objective")
     };
     let conditional_slope = pilot(variance);
     let unit_slope = pilot(1.0);
-    // The pilot returns exactly 0 when it declines to solve.
+    // A zero slope would mean the score already vanished at the origin.
     assert!(
         conditional_slope.is_finite() && conditional_slope != 0.0,
         "the pilot must solve for a slope at Var(z | a) = {variance}; got {conditional_slope:e}"
@@ -274,6 +277,137 @@ fn pooled_survival_baseline_solves_at_the_conditional_score_variance_2952() {
          {conditional_slope:.12e} scores {at_conditional:.15e}, not below the unit-variance slope \
          {unit_slope:.12e}'s {at_unit:.15e} by more than the rounding {rounding:.3e}"
     );
+}
+
+/// The twelve delayed-entry rows of the gnomon#2336 and gam#2952 gates, whose
+/// pooled pilot objective has an interior minimizer.
+struct PooledPilotFixture {
+    event: Array1<f64>,
+    weights: Array1<f64>,
+    entry_at_origin: Array1<bool>,
+    z: Array1<f64>,
+    z_variance: Array1<f64>,
+    q0: Array1<f64>,
+    q1: Array1<f64>,
+    qd1: Array1<f64>,
+}
+
+impl PooledPilotFixture {
+    fn new() -> Self {
+        let n = 12;
+        Self {
+            event: Array1::from_shape_fn(n, |i| if (i * 7) % 12 < 7 { 1.0 } else { 0.0 }),
+            weights: Array1::from_elem(n, 1.0),
+            entry_at_origin: Array1::from_elem(n, false),
+            z: Array1::from_shape_fn(n, |i| (i as f64 - 5.5) / 4.0),
+            z_variance: Array1::from_elem(n, 1.0),
+            q0: Array1::from_elem(n, -2.5),
+            q1: Array1::from_shape_fn(n, |i| -0.8 + 0.1 * i as f64),
+            qd1: Array1::from_elem(n, 1.0),
+        }
+    }
+
+    fn pilot(&self) -> Result<f64, SurvivalMarginalSlopeError> {
+        pooled_survival_baseline(
+            &self.event,
+            &self.weights,
+            &self.entry_at_origin,
+            &self.z,
+            &self.z_variance,
+            &self.q0,
+            &self.q1,
+            &self.qd1,
+            1.0,
+        )
+    }
+
+    /// The pooled score and curvature in the slope, summed in row order
+    /// through the row program the pilot solves, each with the rounding band
+    /// `γ_n·Σ|termᵢ|` of its sum: `(score, score_band, curvature, curvature_band)`.
+    fn pooled_score(&self, slope: f64) -> (f64, f64, f64, f64) {
+        let n = self.event.len();
+        let mut sums = [0.0_f64; 4];
+        for i in 0..n {
+            let (_, grad, hess) = row_primary_closed_form(
+                self.q0[i],
+                self.q1[i],
+                self.qd1[i],
+                slope,
+                self.z[i],
+                self.z_variance[i],
+                self.weights[i],
+                if self.entry_at_origin[i] {
+                    0.0
+                } else {
+                    self.weights[i]
+                },
+                self.event[i],
+                0.0,
+                1.0,
+            )
+            .expect("an admissible row");
+            sums[0] += grad[3];
+            sums[1] += grad[3].abs();
+            sums[2] += hess[3][3];
+            sums[3] += hess[3][3].abs();
+        }
+        (
+            sums[0],
+            gam_linalg::roundoff::accumulation_band(n, sums[1]),
+            sums[2],
+            gam_linalg::roundoff::accumulation_band(n, sums[3]),
+        )
+    }
+}
+
+/// gam#4250: the pilot slope becomes part of the model (the slope block's
+/// offset, the frailty gate, the absorber columns and the saved baseline), so
+/// it must be a certified root of the pooled score, not the lowest probe of a
+/// capped search. At the returned slope the pooled score is zero to the
+/// rounding of its own sum, or it changes sign across the adjacent floats, so
+/// no representable slope sits closer to the root.
+#[test]
+fn pooled_survival_baseline_returns_a_certified_score_root_4250() {
+    let fixture = PooledPilotFixture::new();
+    let slope = fixture
+        .pilot()
+        .expect("the pilot certifies a minimizer of the pooled objective");
+    assert!(
+        slope.is_finite() && slope != 0.0,
+        "the fixture's pooled score does not vanish at the origin, so its root is not 0; got \
+         {slope:e}"
+    );
+    let (score, band, curvature, curvature_band) = fixture.pooled_score(slope);
+    let (below, ..) = fixture.pooled_score(slope.next_down());
+    let (above, ..) = fixture.pooled_score(slope.next_up());
+    assert!(
+        score.abs() <= band || (below <= 0.0 && above >= 0.0),
+        "the pilot slope {slope:.17e} is not a certified root: pooled score {score:e} outside \
+         its rounding band {band:e}, and no sign change across the adjacent floats (score \
+         {below:e} below, {above:e} above)"
+    );
+    // The root is a minimizer, not a stationary point of another kind.
+    assert!(
+        curvature > curvature_band,
+        "the pilot slope {slope:e} is not a minimizer of the pooled objective: curvature \
+         {curvature:e} is not resolved positive (band {curvature_band:e})"
+    );
+}
+
+/// gam#4250: a row that does not evaluate is an error naming that row, not a
+/// silent `0.0` that the fit would read as "the pooled slope is zero".
+#[test]
+fn pooled_survival_baseline_refuses_a_row_that_does_not_evaluate_4250() {
+    let mut fixture = PooledPilotFixture::new();
+    // A decreasing baseline breaks the monotonicity every row is admitted under.
+    fixture.qd1[3] = -1.0;
+    match fixture.pilot() {
+        Err(SurvivalMarginalSlopeError::NumericalFailure { reason }) => assert!(
+            reason.contains("row 3"),
+            "the refusal must name the row that failed to evaluate: {reason}"
+        ),
+        other => panic!("a row that does not evaluate must refuse the pilot; got {other:?}"),
+    }
 }
 
 fn sparse_design(dense: &Array2<f64>) -> DesignMatrix {

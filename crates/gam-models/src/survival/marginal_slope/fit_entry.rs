@@ -741,7 +741,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         &spec.time_block.offset_exit,
         &spec.time_block.derivative_offset_exit,
         probit_scale,
-    );
+    )?;
     log::debug!(
         "[survival-marginal-slope] baseline seed slope={:.6e} elapsed={:.3}s",
         baseline_slope,
