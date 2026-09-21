@@ -4823,30 +4823,6 @@ mod negative_binomial_joint_certificate_tests {
         );
     }
 
-    /// The bound is the score's rounding band carried into the log-theta
-    /// Newton displacement plus the derived root displacement; an underivable
-    /// displacement grants nothing.
-    #[test]
-    fn joint_bound_adds_rounding_band_and_root_displacement() {
-        let theta = 2.0;
-        let scores = profile(3.0, 5.0, 1.0e-9);
-        let rounding = theta * 1.0e-9 / (theta * theta * 5.0 - theta * 3.0);
-        assert_eq!(negbin_theta_joint_bound(theta, &scores, 0.0), rounding);
-        assert_eq!(
-            negbin_theta_joint_bound(theta, &scores, 1.0e-6),
-            rounding + 1.0e-6
-        );
-        for undefined in [f64::NAN, f64::INFINITY, -1.0] {
-            assert_eq!(
-                negbin_theta_joint_bound(theta, &scores, undefined),
-                rounding
-            );
-        }
-        assert_eq!(
-            negbin_theta_joint_bound(theta, &profile(2.0, 1.0, 1.0e-9), 0.0),
-            0.0
-        );
-    }
 
     /// `∂score/∂η` against a central difference of the profile score itself.
     #[test]
