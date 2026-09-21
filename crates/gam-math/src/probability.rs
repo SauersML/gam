@@ -2,6 +2,12 @@ use libm::{erf, erfc};
 use crate::double_double::{BoundedDoubleDouble, SMALLEST_SUBNORMAL};
 use crate::roundoff::{UNIT_ROUNDOFF, inflated};
 use std::sync::LazyLock;
+
+mod normal_table;
+pub use normal_table::{
+    NORMAL_CDF_RELATIVE_ERROR, NORMAL_CDF_UNDERFLOW_FLOOR, NORMAL_SCALED_TAIL_RELATIVE_ERROR, normal_cdf_and_pdf,
+    normal_scaled_tail,
+};
 use statrs::function::{
     beta::{beta_reg, inv_beta_reg, ln_beta},
     gamma::gamma_ur,
@@ -279,31 +285,58 @@ fn square_residual(x: f64, rounded_square: f64) -> f64 {
     x.mul_add(x, -rounded_square)
 }
 
+/// `φ(x)`'s pieces before its fused correction: `fl(x²)`, the exponential `libm::exp(−½·fl(x²))` and the head
+/// `fl(e/√(2π))`. [`normal_pdf`] finishes them and [`normal_pdf_bounded`] bounds the same computation, so its bound
+/// covers `normal_pdf`'s value bit for bit. [`normal_cdf_and_pdf`] reuses the same exponential for `Φ`, so `φ` is
+/// computed once there and agrees with `normal_pdf` bit for bit.
+#[derive(Clone, Copy)]
+struct NormalDensityParts {
+    rounded_square: f64,
+    exponential: f64,
+    head: f64,
+}
+
+/// The libm crate's `exp` is called explicitly, not the platform's `f64::exp`, so that [`normal_pdf_bounded`]'s cited
+/// contract covers the value [`normal_pdf`] publishes.
+#[inline]
+fn normal_density_parts(x: f64) -> NormalDensityParts {
+    const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
+    let rounded_square = x * x;
+    let exponential = libm::exp(-0.5 * rounded_square);
+    NormalDensityParts {
+        rounded_square,
+        exponential,
+        head: INV_SQRT_2PI * exponential,
+    }
+}
+
+/// `head·(1 − ½e)` with the exact square residual `e`, fused. Where the density underflowed or `x` was `±∞` (head
+/// `0`), or `x` was NaN, no relative correction applies, and `±∞` would feed the residual `∞ − ∞`, so the head stands.
+#[inline]
+fn finish_normal_density(x: f64, parts: NormalDensityParts) -> f64 {
+    if parts.head == 0.0 || parts.head.is_nan() {
+        return parts.head;
+    }
+    let residual = square_residual(x, parts.rounded_square);
+    parts.head.mul_add(-0.5 * residual, parts.head)
+}
+
 /// Standard normal PDF phi(x).
 ///
 /// The squared argument is carried exactly (see `square_residual`); without
 /// that, `exp(-½·fl(x*x))` degrades like `x²·ε/2` and reaches `5.7e-14`
 /// relative before `φ` underflows, against the `3.3e-16` it holds with.
+/// The exponential is `libm::exp`, so [`normal_pdf_bounded`]'s cited bound
+/// covers this value bit for bit.
 #[inline]
 pub fn normal_pdf(x: f64) -> f64 {
-    const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
-    let rounded_square = x * x;
-    let head = INV_SQRT_2PI * (-0.5 * rounded_square).exp();
-    if head == 0.0 || head.is_nan() {
-        // The pdf underflowed or `x` was `±∞` (head `0`), or `x` was `NaN`.
-        // Neither admits a relative correction, and `±∞` would feed the
-        // residual an `∞ − ∞`; return the limit the plain form gives.
-        return head;
-    }
-    let residual = square_residual(x, rounded_square);
-    head.mul_add(-0.5 * residual, head)
+    finish_normal_density(x, normal_density_parts(x))
 }
 
-/// `φ(x)` computed with the libm crate's `exp`, NOT the platform's `f64::exp`, and a rigorous bound on its absolute
-/// error. [`normal_pdf`] keeps the platform exponential and carries no bound.
+/// [`normal_pdf`]`(x)` and a rigorous bound on its absolute error.
 ///
-/// The computation is [`normal_pdf`]'s: `fl(x²)` with its exact fused remainder `e` (`|e| ≤ u·x²`), the exact
-/// `−½·fl(x²)`, the exponential, the product with `1/√(2π)`, and the fused correction `head·(1 − ½e)`.
+/// The computation is `fl(x²)` with its exact fused remainder `e` (`|e| ≤ u·x²`), the exact `−½·fl(x²)`, the
+/// exponential `libm::exp`, the product with `1/√(2π)`, and the fused correction `head·(1 − ½e)`.
 /// - **The exponential** errs by less than one ulp, so by less than `2u` relative. This is a CITED contract, and it
 ///   covers `libm::exp` only: libm 0.2.16, `src/math/exp.rs:58-60`, "according to an error analysis, the error is always
 ///   less than 1 ulp", resting on the Remez bound `2**-59` at `:30`. `libm_version_matches_the_cited_error_analysis` fails
@@ -316,19 +349,17 @@ pub fn normal_pdf(x: f64) -> f64 {
 /// within that. So `φ` errs by at most `(5u + u²x⁴/8)·φ + 2η`. The charged `u·φ̂` in place of `u·φ`, and the bound's own
 /// evaluation, are absorbed by `1 + γ_{m+3}`, with `m = 11`: ten rounded operations and one charged magnitude.
 pub fn normal_pdf_bounded(x: f64) -> (f64, f64) {
-    const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
-    let rounded_square = x * x;
-    let head = INV_SQRT_2PI * libm::exp(-0.5 * rounded_square);
-    if head.is_nan() {
-        return (head, head);
+    let parts = normal_density_parts(x);
+    let density = finish_normal_density(x, parts);
+    if density.is_nan() {
+        return (density, density);
     }
-    if head == 0.0 {
+    if parts.head == 0.0 {
         // The density underflowed, or the argument is infinite: the exact φ lies below η.
-        return (head, 2.0 * f64::from_bits(1));
+        return (density, 2.0 * f64::from_bits(1));
     }
-    let density = head.mul_add(-0.5 * square_residual(x, rounded_square), head);
-    let relative =
-        5.0 * UNIT_ROUNDOFF + UNIT_ROUNDOFF * UNIT_ROUNDOFF * rounded_square * rounded_square / 8.0;
+    let square = parts.rounded_square;
+    let relative = 5.0 * UNIT_ROUNDOFF + UNIT_ROUNDOFF * UNIT_ROUNDOFF * square * square / 8.0;
     (density, inflated(relative * density + 2.0 * f64::from_bits(1), 11))
 }
 

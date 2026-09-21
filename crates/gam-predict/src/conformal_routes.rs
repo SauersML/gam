@@ -32,8 +32,10 @@ pub struct ConformalRows<'a> {
 /// Reads the `ExactFullConformalSubstrate` precomputed at fit time (only
 /// available for Gaussian-identity, unit-weight, offset-free models without a
 /// link wiggle), rebuilds the test design from the saved `resolved_termspec`,
-/// and calls `substrate.interval(x_*, alpha)` per test row — one Cholesky each,
-/// zero refits. The set is exact *given the frozen penalty*; because the fitted
+/// forms the per-batch training statistics once (`substrate.training`, which
+/// rebuilds the training design from the saved training columns), and scores
+/// each test row with `training.interval(x_*, alpha)` — one Cholesky each, zero
+/// refits. The set is exact *given the frozen penalty*; because the fitted
 /// λ̂ was selected from all training responses, the frozen-λ score construction
 /// is not permutation symmetric in the n+1 augmented points, so the
 /// distribution-free finite-sample coverage theorem applies only where the
@@ -111,13 +113,30 @@ pub fn full_conformal_prediction_columns(
             x_test.ncols()
         ));
     }
+    // #2901 V17: the substrate carries the training columns, and the design they
+    // build through the saved frozen specification is formed once for every test
+    // row, under the memory governor, with the statistics that do not move with the
+    // row.
+    let training = substrate.training(|frame| {
+        let headers = model.training_headers.as_ref().ok_or_else(|| {
+            "full conformal: the model is missing training_headers, which index its saved \
+             term specification"
+                .to_string()
+        })?;
+        let saved = model.resolved_termspec.as_ref().ok_or_else(|| {
+            "full conformal: the model is missing resolved_termspec".to_string()
+        })?;
+        saved.validate_frozen("resolved_termspec")?;
+        let frame_spec = frame.frame_spec(saved, headers)?;
+        frame.design(&frame_spec, substrate.p())
+    })?;
     let mut mean_vec = Vec::with_capacity(n_test);
     let mut lower_vec = Vec::with_capacity(n_test);
     let mut upper_vec = Vec::with_capacity(n_test);
     let mut certified_vec = Vec::with_capacity(n_test);
     for i in 0..n_test {
         let x_star = x_test.row(i).to_owned();
-        let iv = substrate
+        let iv = training
             .interval(&x_star, alpha)
             .map_err(|e| format!("full conformal at row {i}: {e}"))?;
         // The conformal set changes only the interval. The point is the fitted

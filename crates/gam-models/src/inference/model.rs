@@ -788,9 +788,10 @@ pub struct FittedModelPayload {
     /// (#942 Layer 1 + the frozen-ρ self-diagnostic).
     ///
     /// Populated only for a standard Gaussian-identity fit with unit prior
-    /// weights, no offset and no link wiggle. It
-    /// persists the training design + response + frozen penalty `Sλ` so the
-    /// prediction set that is exact GIVEN `Sλ` (a union of intervals, valid for
+    /// weights, no offset and no link wiggle. It persists the training columns the
+    /// frozen term specification reads (payloads through version 20 persisted the
+    /// dense design they build, and still read), the response and the frozen penalty
+    /// `Sλ`, so the prediction set that is exact GIVEN `Sλ` (a union of intervals, valid for
     /// any penalized smooth) can be replayed per test point — one Cholesky each,
     /// zero refits. Because λ̂ was selected from all training responses, the
     /// frozen-λ construction is not permutation symmetric in the augmented

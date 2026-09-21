@@ -28,6 +28,7 @@ mod joint_unpenalized_dim_tests {
                 normalization_scale: 1.0,
                 kronecker_factors: None,
                 structural_null_frame: None,
+                energy_factor: None,
             },
         }
     }
@@ -1158,5 +1159,173 @@ mod frozen_factor_level_collection_tests {
                 "numeric feature column {numeric_col} was misclassified as categorical"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod energy_factor_partition_tests {
+    use super::{PenaltyStructureHint, matern_operator_penalty_triplet_at_length_scale};
+    use crate::basis::{MaternNu, PenaltySource};
+    use ndarray::Array2;
+    use qd::Quad;
+
+    /// Double-double `log det(AᵀA)`: the Gram is formed and Cholesky-factored in
+    /// double-double arithmetic from the f64 factor, so eigenvalues far below
+    /// f64's rounding band of `AᵀA` still enter with their own digits.
+    fn double_double_gram_logdet(factor: &Array2<f64>) -> f64 {
+        let (rows, cols) = factor.dim();
+        let mut lower = vec![Quad::ZERO; cols * cols];
+        for i in 0..cols {
+            for j in 0..=i {
+                let mut acc = Quad::ZERO;
+                for r in 0..rows {
+                    acc += Quad::from_f64(factor[[r, i]]) * Quad::from_f64(factor[[r, j]]);
+                }
+                lower[i * cols + j] = acc;
+            }
+        }
+        let mut logdet = Quad::ZERO;
+        for k in 0..cols {
+            let mut pivot = lower[k * cols + k];
+            for s in 0..k {
+                let l = lower[k * cols + s];
+                pivot -= l * l;
+            }
+            assert!(
+                pivot.0 > 0.0,
+                "double-double Gram pivot {k} is not positive: {:e}",
+                pivot.0
+            );
+            let root = pivot.sqrt();
+            lower[k * cols + k] = root;
+            logdet += Quad::from_f64(2.0) * root.ln();
+            for i in (k + 1)..cols {
+                let mut value = lower[i * cols + k];
+                for s in 0..k {
+                    value -= lower[i * cols + s] * lower[k * cols + s];
+                }
+                lower[i * cols + k] = value / root;
+            }
+        }
+        logdet.0
+    }
+
+    /// #2469 / #2817: the Matérn operator triplet reads the mass penalty's rank
+    /// off its collocation factor at every length scale. The sweep runs from a
+    /// short ℓ, where the dense Gram also resolves every mode and its log-det
+    /// agrees with the factor route, to a long ℓ, where the dense Gram loses
+    /// genuine modes (its rank drops, and a dense log-det over them is NaN). At
+    /// every ℓ the factor keeps all modes, and the canonical `log|S|₊` rooted
+    /// from `SVD(A)` matches a double-double reference within the SVD's
+    /// first-order backward-error envelope.
+    #[test]
+    fn matern_mass_penalty_rank_and_logdet_come_from_its_energy_factor_2469() {
+        let side = 7;
+        let dim = side * side;
+        let mut centers = Array2::<f64>::zeros((dim, 2));
+        for i in 0..side {
+            for j in 0..side {
+                centers[[i * side + j, 0]] = i as f64 / (side - 1) as f64;
+                centers[[i * side + j, 1]] = j as f64 / (side - 1) as f64;
+            }
+        }
+        let mut dense_lost_modes = false;
+        let mut dense_resolved_every_mode = false;
+        for length_scale in [0.25, 1.0, 5.0] {
+            let filtered = matern_operator_penalty_triplet_at_length_scale(
+                centers.view(),
+                None,
+                None,
+                MaternNu::FiveHalves,
+                false,
+                None,
+                length_scale,
+            )
+            .expect("Matérn operator triplet");
+            let mass = filtered
+                .active
+                .iter()
+                .find(|penalty| matches!(penalty.info.source, PenaltySource::OperatorMass))
+                .expect("mass block");
+            let factor = mass
+                .info
+                .energy_factor
+                .as_ref()
+                .expect("the triplet carries its energy factor");
+            assert_eq!(
+                mass.info.effective_rank, dim,
+                "ℓ={length_scale}: the collocation factor resolves every mass mode"
+            );
+            assert_eq!(mass.nullity, 0);
+            let spec = crate::PenaltySpec::Block {
+                local: mass.matrix.clone(),
+                col_range: 0..dim,
+                prior_mean: gam_problem::CoefficientPriorMean::Zero,
+                structure_hint: Some(PenaltyStructureHint::EnergyFactor(factor.clone())),
+                op: None,
+            };
+            let canonical =
+                crate::construction::canonicalize_penalty_spec(&spec, dim, 0, "energy factor")
+                    .expect("canonicalization")
+                    .expect("a resolved mass penalty");
+            assert_eq!(canonical.root.nrows(), dim);
+            assert_eq!(canonical.nullity, 0);
+            let logdet: f64 = canonical
+                .positive_eigenvalues
+                .iter()
+                .map(|value| value.ln())
+                .sum();
+            let reference = double_double_gram_logdet(factor);
+            let sigma: Vec<f64> = canonical
+                .positive_eigenvalues
+                .iter()
+                .map(|value| value.sqrt())
+                .collect();
+            let sigma_max = sigma.iter().copied().fold(0.0_f64, f64::max);
+            let (rows, cols) = factor.dim();
+            let backward = rows.max(cols) as f64 * f64::EPSILON * sigma_max;
+            // `|δ ln σᵢ²| ≤ 2‖δA‖₂/σᵢ` to first order for every resolved mode.
+            let envelope: f64 = sigma.iter().map(|value| 2.0 * backward / value).sum();
+            assert!(
+                (logdet - reference).abs() <= envelope,
+                "ℓ={length_scale}: factor log|S|+ {logdet:.12e} vs double-double {reference:.12e}: \
+                 gap {:.3e} exceeds the backward-error envelope {envelope:.3e}",
+                (logdet - reference).abs()
+            );
+            let dense = crate::basis::analyze_penalty_block(&mass.matrix).expect("dense spectrum");
+            if dense.rank < dim {
+                dense_lost_modes = true;
+            } else {
+                dense_resolved_every_mode = true;
+                let dense_logdet: f64 = dense.eigenvalues.iter().map(|value| value.ln()).sum();
+                let lambda_max = dense
+                    .eigenvalues
+                    .iter()
+                    .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+                // `|δλᵢ| ≤ ‖δS‖₂` for the symmetric eigensolver.
+                let dense_backward = dim as f64 * f64::EPSILON * lambda_max;
+                let dense_envelope: f64 = dense
+                    .eigenvalues
+                    .iter()
+                    .map(|value| dense_backward / value)
+                    .sum::<f64>()
+                    + envelope;
+                assert!(
+                    (dense_logdet - logdet).abs() <= dense_envelope,
+                    "ℓ={length_scale}: where the dense Gram resolves every mode its log-det \
+                     {dense_logdet:.12e} must agree with the factor route {logdet:.12e} \
+                     (gap {:.3e}, envelope {dense_envelope:.3e})",
+                    (dense_logdet - logdet).abs()
+                );
+            }
+        }
+        assert!(
+            dense_lost_modes,
+            "the sweep must reach a length scale where the dense Gram loses modes"
+        );
+        assert!(
+            dense_resolved_every_mode,
+            "the sweep must include a length scale where the dense Gram resolves every mode"
+        );
     }
 }

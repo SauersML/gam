@@ -34,10 +34,12 @@
 
 mod code_space;
 mod fit;
+mod promotion;
 pub use code_space::{
     CensusPairVerdict, CodeSpacePromotionReport, PairChartFit, fit_pair_chart,
     harvest_code_space_pair_promotions, harvest_code_space_promotions, linear_distortion_floor,
 };
+pub use promotion::{InstalledChart, PromotionInstall, PromotionRefusal, PromotionRefusalReason};
 pub use fit::{
     LinearPeel, LinearPeelConfig, TieredFitConfig, TieredFitReport, fit_tiered, linear_bulk_census,
 };

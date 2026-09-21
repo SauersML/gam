@@ -3535,10 +3535,12 @@ pub(crate) fn design_chart_jets(
     per_axis: bool,
     share_c: f64,
 ) -> Result<Option<DesignChartJets>, BasisError> {
-    if chart.scale == 1.0 {
-        return Ok(None);
-    }
+    // A chart with a reference pair carries `ln α` jets whatever its value; `α`
+    // can equal 1 at one ψ and still move with ψ (gam#2735).
     let Some((i, j)) = chart.reference_pair else {
+        if chart.scale == 1.0 {
+            return Ok(None);
+        }
         return Err(BasisError::InvalidInput(format!(
             "design kernel chart is amplified (scale={}) but names no reference center pair",
             chart.scale

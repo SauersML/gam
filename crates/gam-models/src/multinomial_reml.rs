@@ -64,8 +64,8 @@ use crate::block_layout::block_count::validate_block_count;
 use crate::custom_family::{
     AdditiveBlockJacobian, BlockEffectiveJacobian, BlockWorkingSet, CustomFamily,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace, FamilyEvaluation,
-    FamilyLinearizationState, JointHessianSourcePreference, ParameterBlockSpec,
-    ParameterBlockState, PenaltyMatrix,
+    FamilyLinearizationState, GradientAccumulation, JointHessianSourcePreference,
+    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
 };
 use crate::vector_response::{
     MultinomialLogitLikelihood, VectorLikelihood, validate_multinomial_simplex,
@@ -1724,11 +1724,16 @@ impl MultinomialFamily {
     /// [`Self::assemble_joint_hessian`]. Reused by the frozen-β workspace so the
     /// inner joint-Newton gradient load and line-search log-likelihood reads
     /// share the same cached probabilities as the matrix-free `H·v` contraction.
+    ///
+    /// The same loop measures the gradient's accumulation (#2976): each
+    /// coordinate is one sequential sum of `N` formed products `X_{row,i} ·
+    /// w_row (y − p)_{row,a}`, so its depth is `N`, and the absolute value of
+    /// every product is summed beside it.
     fn joint_loglik_and_gradient_from_probs(
         &self,
         eta: ArrayView2<'_, f64>,
         probs_full: ArrayView2<'_, f64>,
-    ) -> Result<(f64, Array1<f64>), String> {
+    ) -> Result<MultinomialGradientPass, String> {
         let n = self.weights.len();
         let p = self.design.ncols();
         let m = self.active_classes();
@@ -1766,21 +1771,36 @@ impl MultinomialFamily {
             log_lik -= program.negative_log_likelihood();
         }
         let mut grad = Array1::<f64>::zeros(m * p);
+        let mut absolute_sums = Array1::<f64>::zeros(m * p);
         let grad_values = grad
             .as_slice_mut()
             .expect("fresh joint gradient is contiguous");
+        let absolute_values = absolute_sums
+            .as_slice_mut()
+            .expect("fresh absolute sums are contiguous");
         for a in 0..m {
             for i in 0..p {
                 let mut acc = 0.0_f64;
+                let mut absolute = 0.0_f64;
                 for row in 0..n {
                     let resid = self.weights[row]
                         * (response_values[row * k + a] - probability_values[row * k + a]);
-                    acc += design_values[row * p + i] * resid;
+                    let product = design_values[row * p + i] * resid;
+                    acc += product;
+                    absolute += product.abs();
                 }
                 grad_values[a * p + i] = acc;
+                absolute_values[a * p + i] = absolute;
             }
         }
-        Ok((log_lik, grad))
+        Ok(MultinomialGradientPass {
+            log_likelihood: log_lik,
+            gradient: grad,
+            accumulation: GradientAccumulation {
+                accumulation_depth: n,
+                absolute_sums,
+            },
+        })
     }
 
     /// Apply a coefficient-space direction `d_β` to the design to obtain
@@ -3230,6 +3250,7 @@ impl CustomFamily for MultinomialFamily {
             eta,
             probs,
             projection_cache: Arc::new(gam_runtime::resource::RayonSafeOnce::new()),
+            gradient_pass: gam_runtime::resource::RayonSafeOnce::new(),
         })))
     }
 
@@ -3423,6 +3444,30 @@ struct MultinomialHessianWorkspace {
     /// trace kernels query all directional operators with the same factor, so
     /// `X·F_a` is workspace geometry, not direction-specific work.
     projection_cache: Arc<gam_runtime::resource::RayonSafeOnce<MultinomialClassProjection>>,
+    /// The value, gradient and gradient accumulation at the frozen state, from
+    /// one pass of [`MultinomialFamily::joint_loglik_and_gradient_from_probs`],
+    /// so the accumulation always describes the gradient the solve read.
+    gradient_pass: gam_runtime::resource::RayonSafeOnce<Result<MultinomialGradientPass, String>>,
+}
+
+/// The joint log-likelihood, its gradient and that gradient's accumulation
+/// (#2976), formed in one row pass.
+struct MultinomialGradientPass {
+    log_likelihood: f64,
+    gradient: Array1<f64>,
+    accumulation: GradientAccumulation,
+}
+
+impl MultinomialHessianWorkspace {
+    fn gradient_pass(&self) -> Result<&MultinomialGradientPass, String> {
+        self.gradient_pass
+            .get_or_compute(|| {
+                self.family
+                    .joint_loglik_and_gradient_from_probs(self.eta.view(), self.probs.view())
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
 }
 
 impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
@@ -3452,21 +3497,24 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
     }
 
     fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
-        let (log_lik, _) = self
-            .family
-            .joint_loglik_and_gradient_from_probs(self.eta.view(), self.probs.view())?;
-        Ok(Some(log_lik))
+        Ok(Some(self.gradient_pass()?.log_likelihood))
     }
 
     fn joint_gradient_evaluation(
         &self,
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        let (log_likelihood, gradient) = self
-            .family
-            .joint_loglik_and_gradient_from_probs(self.eta.view(), self.probs.view())?;
+        let pass = self.gradient_pass()?;
         Ok(Some(ExactNewtonJointGradientEvaluation {
-            log_likelihood,
-            gradient,
+            log_likelihood: pass.log_likelihood,
+            gradient: pass.gradient.clone(),
+        }))
+    }
+
+    fn joint_gradient_accumulation(&self) -> Result<Option<GradientAccumulation>, String> {
+        let accumulation = &self.gradient_pass()?.accumulation;
+        Ok(Some(GradientAccumulation {
+            accumulation_depth: accumulation.accumulation_depth,
+            absolute_sums: accumulation.absolute_sums.clone(),
         }))
     }
 
@@ -4054,9 +4102,10 @@ mod tests {
                 // ∇NLL = −∇log_lik).
                 let probs = active_probs(&family, &eta);
                 let eta_matrix = Array2::from_shape_vec((1, M), eta.to_vec()).expect("eta matrix");
-                let (log_lik, grad_ll) = family
+                let pass = family
                     .joint_loglik_and_gradient_from_probs(eta_matrix.view(), probs.view())
                     .expect("valid frozen multinomial row");
+                let (log_lik, grad_ll) = (pass.log_likelihood, pass.gradient);
                 close(
                     jet_v,
                     -log_lik,

@@ -832,11 +832,14 @@ pub(crate) fn subject_marginal<S: JetField>(
     };
 
     // ---- backward pass: smoother residual and innovation moments ----------
+    // Static atoms put every node on the one whole-history grid of
+    // `static_state::filter`, with no gap between nodes to score.
+    let is_static = crate::static_state::is_static(inputs.rates);
     let n_gaps = n_nodes.saturating_sub(1);
     let Smoothed {
         marginals: smoothed_all,
         innovation_moments,
-    } = backward_smoother(inputs, &filtered, &counts_rows, &exposure_rows, true)?;
+    } = backward_smoother(inputs, &filtered, &counts_rows, &exposure_rows, !is_static)?;
 
     // ---- forward sweep: Fisher mean and Louis second moment ---------------
     // `carried[q * size + i]` is `C_m(z_i)[q]`, the conditional expectation
@@ -1005,9 +1008,12 @@ pub(crate) fn subject_marginal<S: JetField>(
                 }
             }
             for &(c1, x1) in &rows[d] {
+                // Design entries scale one at a time: each is exact data, and
+                // their product would be a rounded factor.
+                let ec1 = ec.scale(x1);
                 for &(c2, x2) in &rows[d] {
                     curvature[c1 * p_total + c2] =
-                        curvature[c1 * p_total + c2].sub(&ec.scale(x1 * x2));
+                        curvature[c1 * p_total + c2].sub(&ec1.scale(x2));
                 }
                 for k in 0..atoms {
                     let c2 = layout.a(d, k);
@@ -1046,9 +1052,10 @@ pub(crate) fn subject_marginal<S: JetField>(
                     }
                 }
                 for &(c1, x1) in &rows[d] {
+                    let m001 = m00.scale(x1);
                     for &(c2, x2) in &rows[d2] {
                         second[c1 * p_total + c2] =
-                            second[c1 * p_total + c2].add(&m00.scale(x1 * x2));
+                            second[c1 * p_total + c2].add(&m001.scale(x2));
                     }
                     for k in 0..atoms {
                         let c2 = layout.a(d2, k);
@@ -1092,8 +1099,10 @@ pub(crate) fn subject_marginal<S: JetField>(
         // The gap carries the latent moments across it and scores its own
         // rate. Without atoms there is neither: nothing is carried, no rate
         // is a coefficient, and the whole section is a step over a state that
-        // does not exist.
-        if !latent_variance {
+        // does not exist. A static atom has no rate to score, and its grid does
+        // not move: with `p̂_{m+1} = α_m` on the one whole-history grid, the
+        // propagated vector `α_m C_m / p̂_{m+1}` is `C_m` itself.
+        if !latent_variance || is_static {
             continue;
         }
         // ---- gap m: (m, m+1) ------------------------------------------------
@@ -1306,13 +1315,16 @@ pub(crate) fn subject_marginal<S: JetField>(
     //   ∂ℓ/∂ν = ∂ℓ/∂ρ / ν,
     //   ∂²ℓ/∂ν² = (∂²ℓ/∂ρ² − ∂ℓ/∂ρ) / ν²,   ∂²ℓ/∂ν∂x = ∂²ℓ/∂ρ∂x / ν.
     // The factors are jets, so every derivative channel of the conversion
-    // is carried along with the value.
-    let inverse_rates: Vec<S> = inputs.rates.iter().map(recip).collect();
-    let rate_gradients: Vec<S> = (0..atoms).map(|k| mean[layout.rho(k)].clone()).collect();
-    for k in 0..atoms {
+    // is carried along with the value. A static atom's rate is held at zero
+    // with no gap score, so its slots stay zero and `evaluate_generic` drops
+    // them; converting them would form `0 · ∞`.
+    let converted = if is_static { 0 } else { atoms };
+    let inverse_rates: Vec<S> = inputs.rates[..converted].iter().map(recip).collect();
+    let rate_gradients: Vec<S> = (0..converted).map(|k| mean[layout.rho(k)].clone()).collect();
+    for k in 0..converted {
         let rho_k = layout.rho(k);
         let inv_k = &inverse_rates[k];
-        for j in 0..atoms {
+        for j in 0..converted {
             let rho_j = layout.rho(j);
             let inv_j = &inverse_rates[j];
             let raw = hessian[rho_k * p_total + rho_j].clone();
@@ -1354,12 +1366,13 @@ fn filter_nodes<S: JetField>(
     let gh = inputs.gh;
     let like = &inputs.eta0[0];
     if crate::static_state::is_static(inputs.rates) {
-        if derivatives { return Err(numerical("static frailties use derivatives of the integrated objective")); }
+        // Every node shares the one whole-history grid of `static_state::filter`,
+        // so a node's scores live on the grid the carried vector already lives on.
         let pass = crate::static_state::filter(inputs, None, &vec![true; marks])?;
         return Ok((0..n_nodes).map(|n| {
             let likelihood = node_likelihood(&pass.grids[n], &inputs.eta0[n * marks..(n + 1) * marks],
                 inputs.loadings, &counts_rows[n], &exposure_rows[n], None,
-                inputs.log_normaliser.map(|m| &m[n * marks..(n + 1) * marks]), marks, atoms, false);
+                inputs.log_normaliser.map(|m| &m[n * marks..(n + 1) * marks]), marks, atoms, derivatives);
             FilteredNode { grid: pass.grids[n].clone(), transitions: Vec::new(),
                 forward: OperatorFamily { per_axis: Vec::new(), order: gh.order },
                 predicted: pass.predicted[n].clone(), alpha: pass.alpha[n].clone(),
@@ -1928,5 +1941,81 @@ mod tests {
             "score derivative {} vs fd {fd2}",
             evaluate(&dt.c)
         );
+    }
+
+    /// The Louis sweep and the computed path's block sweep read one grid at
+    /// every node (#2965). `subject_marginal` places a subject's grids through
+    /// `filter_nodes`: the Louis sweep with derivatives at the scalar, the block
+    /// sweep without them at its nested jet. The tests comparing the two routes
+    /// take the grids' positions and weights as the rule both evaluate, so a
+    /// route that placed its own grid would owe their rounding. For static and
+    /// dynamic atoms at two orders, every node's positions and weights must be
+    /// the same doubles.
+    #[test]
+    fn louis_and_block_sweeps_read_bit_identical_grids_2965() {
+        use crate::scalar::{Rows, TANGENT_WIDTH};
+        use ndarray::Array2;
+        type Block = Rows<Rows<f64, TANGENT_WIDTH>, TANGENT_WIDTH>;
+        fn grid_bits<S: JetField>(grid: &Grid<S>) -> Vec<u64> {
+            let mut bits: Vec<u64> = grid.weights.iter().map(|w| w.value().to_bits()).collect();
+            for axis in &grid.axes {
+                bits.extend([axis.mu.value().to_bits(), axis.sigma.value().to_bits()]);
+                bits.extend(axis.points.iter().chain(&axis.weights).map(|x| x.value().to_bits()));
+            }
+            bits
+        }
+        let times = [0.0, 0.3, 0.7, 1.0];
+        let events = [0.0, 1.0, 0.0, 1.0];
+        let n_nodes = times.len();
+        let nodes = SubjectNodes {
+            first_row: 0,
+            times: times.to_vec(),
+            gaps: times.windows(2).map(|w| w[1] - w[0]).collect(),
+            weights: vec![0.25; n_nodes],
+            exposures: Array2::from_elem((n_nodes, 1), 0.25),
+            counts: Array2::from_shape_fn((n_nodes, 1), |(n, _)| events[n]),
+            covariate_rows: vec![0; n_nodes],
+        };
+        let design = Array2::from_shape_fn((n_nodes, 2), |(n, j)| if j == 0 { 1.0 } else { times[n] });
+        let views = [design.view()];
+        let beta = [-0.4, 0.3];
+        let loadings = [0.8, 0.5];
+        let counts_rows: Vec<Vec<f64>> = (0..n_nodes).map(|n| nodes.counts.row(n).to_vec()).collect();
+        let exposure_rows: Vec<Vec<f64>> = (0..n_nodes).map(|n| nodes.exposure_row(n)).collect();
+        // Coordinate `q` of `[β | a]` seeded on both levels of the block jet;
+        // a `q` past the width seeds a constant.
+        let seed = |value: f64, q: usize| -> Block {
+            let tangent: [f64; TANGENT_WIDTH] = std::array::from_fn(|k| f64::from(k == q));
+            Rows::seed(Rows::seed(value, tangent), tangent)
+        };
+        let eta0: Vec<f64> = times.iter().map(|t| beta[0] + beta[1] * t).collect();
+        let block_eta0: Vec<Block> = times.iter().zip(&eta0)
+            .map(|(t, eta)| seed(beta[0], 0).add(&seed(beta[1], 1).scale(*t)).with_value(*eta))
+            .collect();
+        let block_loadings = [seed(loadings[0], 2), seed(loadings[1], 3)];
+        let mut compared = 0;
+        for rates in [[0.0, 0.0], [0.6, 1.1]] {
+            let block_rates = [seed(rates[0], TANGENT_WIDTH), seed(rates[1], TANGENT_WIDTH)];
+            for order in [9, 17] {
+                let gh = GaussHermite::new(order).unwrap();
+                let louis_inputs = SubjectInputs {
+                    nodes: &nodes, eta0: &eta0, loadings: &loadings, rates: &rates, time_scale: 1.0,
+                    gh: &gh, continuation_gap: 0.0, designs: Some(&views[..]), log_normaliser: None,
+                };
+                let block_inputs = SubjectInputs {
+                    nodes: &nodes, eta0: &block_eta0, loadings: &block_loadings, rates: &block_rates,
+                    time_scale: 1.0, gh: &gh, continuation_gap: 0.0, designs: None, log_normaliser: None,
+                };
+                let louis = filter_nodes(&louis_inputs, true, &counts_rows, &exposure_rows).unwrap();
+                let block = filter_nodes(&block_inputs, false, &counts_rows, &exposure_rows).unwrap();
+                for (n, (l, b)) in louis.iter().zip(&block).enumerate() {
+                    let (l, b) = (grid_bits(&l.grid), grid_bits(&b.grid));
+                    compared += l.len();
+                    assert_eq!(l, b, "rates {rates:?}, order {order}, node {n}: the Louis and block sweeps read different grids");
+                }
+            }
+        }
+        eprintln!("compared {compared} grid positions and weights");
+        assert!(compared > 0, "no grid was compared");
     }
 }

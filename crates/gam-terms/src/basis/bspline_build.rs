@@ -2088,6 +2088,60 @@ pub fn filter_penalty_candidates(
             op,
         } = candidate;
         let structural_null_frame = matrix.structural_null_frame().cloned();
+        if matrix.rank_from_factor() {
+            // The builder's energy factor decides the partition. The dense Gram
+            // is still shipped for consumers that need a matrix, but its rank is
+            // never measured: `AᵀA` squares the factor's conditioning.
+            let partition = gam_linalg::roundoff::factor_rank_partition(matrix.factor())
+                .map_err(BasisError::LinalgError)?;
+            let sym_penalty = symmetrize_penalty(matrix.dense());
+            if partition.rank == 0 {
+                let reason = if partition.singular_values.iter().all(|&sigma| sigma == 0.0) {
+                    PenaltyDropReason::ZeroMatrix
+                } else {
+                    PenaltyDropReason::NumericalRankZero
+                };
+                log::debug!(
+                    "Dropped inactive penalty block source={:?} original_index={} reason={:?}",
+                    source,
+                    original_index,
+                    reason
+                );
+                dropped.push(DroppedPenaltyInfo {
+                    source,
+                    original_index,
+                    reason,
+                    normalization_scale,
+                });
+                continue;
+            }
+            let dim = sym_penalty.nrows();
+            let nullity = dim - partition.rank;
+            let null_basis = (nullity > 0).then(|| {
+                partition
+                    .right_vectors
+                    .slice(s![partition.rank.., ..])
+                    .t()
+                    .to_owned()
+            });
+            let kronecker_factors = validated_kronecker_factors(kronecker_factors, &sym_penalty);
+            active.push(ActivePenalty {
+                matrix: sym_penalty,
+                nullity,
+                null_eigenvectors: null_basis,
+                op,
+                info: ActivePenaltyInfo {
+                    source,
+                    original_index,
+                    effective_rank: partition.rank,
+                    normalization_scale,
+                    kronecker_factors,
+                    structural_null_frame,
+                    energy_factor: Some(matrix.factor().to_owned()),
+                },
+            });
+            continue;
+        }
         let analysis = analyze_penalty_block_with_op(&matrix, op)?;
         let dropped_reason = if analysis.rank == 0 {
             Some(if analysis.iszero {
@@ -2136,6 +2190,7 @@ pub fn filter_penalty_candidates(
                     normalization_scale,
                     kronecker_factors,
                     structural_null_frame,
+                    energy_factor: None,
                 },
             });
         }

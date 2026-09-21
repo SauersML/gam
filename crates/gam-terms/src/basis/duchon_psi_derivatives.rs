@@ -1683,23 +1683,20 @@ pub fn build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace(
     })
 }
 
-/// Multiplicative amplification factor that lifts an underflowing Duchon
-/// kernel back into a representable range. Probes max|K_CC| (the kernel at
-/// every center pair) and returns `1/max` when the kernel collapses to the
-/// double-precision noise floor; otherwise returns `1.0`.
+/// The amplitude `α` the forward Duchon basis multiplies into every kernel
+/// value: [`duchon_kernel_chart`]'s `1/|φ̃(r*)|` at the frozen reference pair.
 ///
-/// **Why**: in high d with a small length scale the spectral normalization
-/// `c = κ^{d/2-n} / ((2π)^{d/2}·2^{n-1}·Γ(n))` of the Matérn block is `~1e-14`,
-/// driving every `K(r) = c · r^ν · K_ν(κr)` to `~1e-16`. Downstream
-/// `B^T B` is then at `~1e-32` — below `eps²` — and the spectral whitener
-/// truncates everything as noise, even though the basis is mathematically
-/// well-defined.
+/// **Why**: the kernel's own scale is not representable across the length
+/// scales a fit visits. In high `d` at a large spectral power the prefactor is
+/// `~1e-14`, so `BᵀB` sits near `1e-32` and the spectral whitener truncates the
+/// basis as noise. At long length scales the surviving kernel grows like
+/// `ℓ^{2(b−p)}`, so the kernel block dwarfs the polynomial columns.
 ///
-/// Rescaling the basis by α = 1/max|K_CC| produces the same predictions
-/// (β rescales by α, REML's λ adapts). Since the probe is computed from
-/// `centers + kernel parameters` which are stored verbatim in
-/// `BasisMetadata::Duchon`, prediction recomputes an identical α — so
-/// fit-time and predict-time bases share a single coefficient frame.
+/// Rescaling the basis by a positive `α` produces the same predictions (β
+/// rescales by `α`, REML's λ adapts). `α` is a pure function of the centers and
+/// the kernel parameters stored verbatim in `BasisMetadata::Duchon`, so
+/// prediction recomputes an identical `α`, and fit-time and predict-time bases
+/// share one coefficient frame.
 pub(crate) fn duchon_kernel_amplification(
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
@@ -1723,24 +1720,24 @@ pub(crate) fn duchon_kernel_amplification(
     .amplification
 }
 
-/// The numerical chart of one realized Duchon kernel block (gam#979).
+/// The numerical chart of one realized Duchon kernel block (gam#979, gam#2735).
 ///
 /// [`duchon_kernel_amplification`] is the amplitude `α` the forward basis
-/// multiplies into every kernel value; `α` is `1/|K(r*)|` at the center pair
-/// `(i*, j*)` carrying the largest kernel magnitude whenever that magnitude
-/// has underflowed, and `1` otherwise. Because `K` moves with the length
-/// scale and the anisotropy, so does `α` — the design the criterion is built
-/// on is `α(ψ)·K(ψ)`, and a ψ-derivative of the design that differentiates
-/// `K` alone is a derivative of something the fit never evaluates. The
-/// derivative builders read the reference pair from here and form the exact
-/// ψ-jets of `ln α` from the SAME radial jets they use for every other pair,
-/// so the charted derivative is the derivative of the charted kernel.
+/// multiplies into every kernel value: `α = 1/|φ̃(r*(η); κ)|`, where `(i*, j*)`
+/// is the frozen reference pair [`duchon_kernel_chart`] selects and `r*(η)` is
+/// its distance in the current metric. The reference pair depends on the
+/// centers alone, so `α` has no branch and no argmax: it is smooth in ψ. The
+/// design the criterion is built on is `α(ψ)·K(ψ)`, and a ψ-derivative of the
+/// design that differentiates `K` alone is a derivative of something the fit
+/// never evaluates. The derivative builders read the reference pair from here
+/// and form the exact ψ-jets of `ln α` from the SAME radial jets they use for
+/// every other pair, so the charted derivative is the derivative of the charted
+/// kernel.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DuchonKernelChart {
-    /// `α`: `1/|K(r*)|` when amplified, `1.0` otherwise.
+    /// `α = 1/|φ̃(r*)|`, or `1.0` for a block with fewer than two distinct centers.
     pub(crate) amplification: f64,
-    /// The `(i*, j*)` center pair whose kernel magnitude defines `α`; `None`
-    /// when the chart is not amplified (`amplification == 1.0`).
+    /// The frozen `(i*, j*)` reference pair; `None` only for the identity chart.
     pub(crate) reference_pair: Option<(usize, usize)>,
 }
 
@@ -1758,6 +1755,26 @@ impl DuchonKernelChart {
     }
 }
 
+/// Select the frozen reference pair and form `α = 1/|φ̃(r*(η); κ)|`.
+///
+/// The reference pair is the farthest pair of the frozen standardized centers in
+/// the isotropic metric, the lowest `(i, j)` on ties. It is recomputed at every
+/// build from the centers alone and never persisted, so it has one source of
+/// truth and no dependence on ψ. The previous chart amplified only below a
+/// literal `max|K| = 1e-10`, over an argmax the origin constant pinned to the
+/// diagonal. That branch switched the realized columns at a length-scale
+/// threshold (#979 CTN, gam#2735); this chart has no threshold to cross.
+///
+/// **Magnitude bound.** For the stable hybrid orders (`2p < d`, `b > 0`) the
+/// profile `G(ρ)` decreases, because `d/dz [z^b K_b(z)] = −z^b K_{b−1}(z) < 0`
+/// on every slice of the reference integral. So `|φ̃(r)| = pref·κ^{−2b}·(G(0) −
+/// G(κr))` increases with `r`, and every center pair satisfies
+/// `|α·K_CC| ≤ |φ̃(r_max(η))| / |φ̃(r*(η))|`, where `r_max(η)` is the farthest
+/// center distance in the current metric. That ratio is exactly 1 in the
+/// isotropic metric. A data row `x` outside the centers' hull can exceed it by
+/// `|φ̃(r_x)| / |φ̃(r*)|`. No such proof is claimed for pure log-case kernels,
+/// partial-fraction orders or null-space-reduced kernels; their bound is
+/// measured on the ψ ladder instead.
 pub(crate) fn duchon_kernel_chart(
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
@@ -1769,60 +1786,49 @@ pub(crate) fn duchon_kernel_chart(
     pure_poly_coeff: Option<&PolyharmonicBlockCoeff>,
 ) -> DuchonKernelChart {
     let k = centers.nrows();
-    if k == 0 {
-        return DuchonKernelChart::IDENTITY;
-    }
-    let axis_scales = aniso_log_scales.map(aniso_axis_scales);
-    // One bound evaluator for the whole k² sweep (the chart is rebuilt for
-    // every κ trial).
-    let hybrid = duchon_hybrid_evaluator(length_scale, p_order, s_order, d)
-        .ok()
-        .flatten();
-    let mut max_abs = 0.0_f64;
     let mut reference_pair = None;
+    let mut farthest = 0.0_f64;
     for i in 0..k {
-        for j in i..k {
-            let r = if let Some(scales) = axis_scales.as_deref() {
-                aniso_distance_rows_with_scales(centers, i, centers, j, scales)
-            } else {
-                euclidean_distance_rows(centers, i, centers, j)
-            };
-            let val = if let Some(ppc) = pure_poly_coeff {
-                ppc.eval(r)
-            } else if let Some(hybrid) = hybrid.as_ref() {
-                match hybrid.value(r) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                }
-            } else {
-                match duchon_matern_kernel_general_from_distance(
-                    r,
-                    length_scale,
-                    p_order,
-                    s_order,
-                    d,
-                    coeffs,
-                ) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                }
-            };
-            if val.abs() > max_abs {
-                max_abs = val.abs();
+        for j in (i + 1)..k {
+            let r = euclidean_distance_rows(centers, i, centers, j);
+            if r > farthest {
+                farthest = r;
                 reference_pair = Some((i, j));
             }
         }
     }
-    // Only amplify when the kernel has underflowed. The 1e-10 threshold is
-    // well above any meaningful smoothing-relevant kernel scale yet far from
-    // 1.0, so well-conditioned kernels pass through unchanged (α = 1).
-    if max_abs > 0.0 && max_abs < 1e-10 {
-        DuchonKernelChart {
-            amplification: 1.0 / max_abs,
-            reference_pair,
-        }
+    let Some((i, j)) = reference_pair else {
+        return DuchonKernelChart::IDENTITY;
+    };
+    let axis_scales = aniso_log_scales.map(aniso_axis_scales);
+    let r = match axis_scales.as_deref() {
+        Some(scales) => aniso_distance_rows_with_scales(centers, i, centers, j, scales),
+        None => farthest,
+    };
+    let value = if let Some(ppc) = pure_poly_coeff {
+        Ok(ppc.eval(r))
     } else {
-        DuchonKernelChart::IDENTITY
+        match duchon_hybrid_evaluator(length_scale, p_order, s_order, d) {
+            Ok(Some(hybrid)) => hybrid.value(r),
+            Ok(None) => duchon_matern_kernel_general_from_distance(
+                r,
+                length_scale,
+                p_order,
+                s_order,
+                d,
+                coeffs,
+            ),
+            Err(error) => Err(error),
+        }
+    };
+    match value {
+        Ok(magnitude) if magnitude.is_finite() && magnitude != 0.0 => DuchonKernelChart {
+            amplification: 1.0 / magnitude.abs(),
+            reference_pair: Some((i, j)),
+        },
+        // A kernel that cannot be evaluated at the reference pair has no chart; the
+        // forward build evaluates the same kernel and owns that refusal.
+        _ => DuchonKernelChart::IDENTITY,
     }
 }
 

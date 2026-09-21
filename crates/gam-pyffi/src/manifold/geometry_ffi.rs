@@ -585,15 +585,20 @@ fn sae_eq4_description_length<'py>(
     Ok(out.into())
 }
 
+/// `unit_roundoff` is that of the precision the caller stores the result in
+/// (`torch.finfo(dtype).eps / 2`); it defaults to f64's.
 #[pyfunction]
+#[pyo3(signature = (point, curvature, unit_roundoff = None))]
 fn poincare_project_into_ball<'py>(
     py: Python<'py>,
     point: PyReadonlyArray1<'py, f64>,
     curvature: f64,
+    unit_roundoff: Option<f64>,
 ) -> PyResult<Py<PyArray1<f64>>> {
     let owned = point.as_array().to_owned();
+    let unit_roundoff = unit_roundoff.unwrap_or(gam_math::roundoff::UNIT_ROUNDOFF);
     let out = detach_geometry_result(py, "poincare_project_into_ball", move || {
-        poincare_project_into_ball_impl(owned.view(), curvature)
+        poincare_project_into_ball_at_impl(owned.view(), curvature, unit_roundoff)
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -795,12 +800,16 @@ fn poincare_lorentz_exp_origin<'py>(
 /// recomputing. `proj_scale` (shape `(F,)`) is the per-atom radial
 /// ball-projection factor needed by the backward to chain gradients through
 /// the projection back to the raw atom storage.
+/// `unit_roundoff` is that of the precision the caller stores atoms and outputs
+/// in, and defaults to f64's; pass the same value to the backward.
 #[pyfunction]
+#[pyo3(signature = (atoms, gates, curvature, unit_roundoff = None))]
 fn poincare_tangent_decode_forward<'py>(
     py: Python<'py>,
     atoms: PyReadonlyArray2<'py, f64>,
     gates: PyReadonlyArray2<'py, f64>,
     curvature: f64,
+    unit_roundoff: Option<f64>,
 ) -> PyResult<(
     Py<PyArray2<f64>>,
     Py<PyArray2<f64>>,
@@ -810,9 +819,15 @@ fn poincare_tangent_decode_forward<'py>(
 )> {
     let atoms_owned = atoms.as_array().to_owned();
     let gates_owned = gates.as_array().to_owned();
+    let unit_roundoff = unit_roundoff.unwrap_or(gam_math::roundoff::UNIT_ROUNDOFF);
     let (x_hat, cache) =
         detach_geometry_result(py, "poincare_tangent_decode_forward", move || {
-            poincare_tangent_decode_forward_impl(atoms_owned.view(), gates_owned.view(), curvature)
+            poincare_tangent_decode_forward_at_impl(
+                atoms_owned.view(),
+                gates_owned.view(),
+                curvature,
+                unit_roundoff,
+            )
         })?;
     Ok((
         x_hat.into_pyarray(py).unbind(),
@@ -826,7 +841,11 @@ fn poincare_tangent_decode_forward<'py>(
 /// Backward pass that consumes the cached state returned by the forward.
 ///
 /// Returns `(grad_gates, grad_atoms)`.
+/// `unit_roundoff` must be the value the forward was given.
 #[pyfunction]
+#[pyo3(signature = (
+    atoms_projected, gates, v, tangents, proj_scale, grad_x_hat, curvature, unit_roundoff = None,
+))]
 fn poincare_tangent_decode_backward<'py>(
     py: Python<'py>,
     atoms_projected: PyReadonlyArray2<'py, f64>,
@@ -836,6 +855,7 @@ fn poincare_tangent_decode_backward<'py>(
     proj_scale: PyReadonlyArray1<'py, f64>,
     grad_x_hat: PyReadonlyArray2<'py, f64>,
     curvature: f64,
+    unit_roundoff: Option<f64>,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
     let atoms_p = atoms_projected.as_array().to_owned();
     let gates_owned = gates.as_array().to_owned();
@@ -843,6 +863,7 @@ fn poincare_tangent_decode_backward<'py>(
     let tangents_owned = tangents.as_array().to_owned();
     let proj_scale_owned = proj_scale.as_array().to_owned();
     let grad_owned = grad_x_hat.as_array().to_owned();
+    let unit_roundoff = unit_roundoff.unwrap_or(gam_math::roundoff::UNIT_ROUNDOFF);
     let (gg, ga) = detach_geometry_result(py, "poincare_tangent_decode_backward", move || {
         let cache = gam::geometry::poincare::TangentDecodeCache {
             atoms_projected: atoms_p,
@@ -851,23 +872,34 @@ fn poincare_tangent_decode_backward<'py>(
             tangents: tangents_owned,
             proj_scale: proj_scale_owned,
             curvature,
+            unit_roundoff,
         };
         poincare_tangent_decode_backward_impl(&cache, grad_owned.view())
     })?;
     Ok((gg.into_pyarray(py).unbind(), ga.into_pyarray(py).unbind()))
 }
 
+/// `unit_roundoff` is that of the precision the caller stores atoms and outputs
+/// in, and defaults to f64's.
 #[pyfunction]
+#[pyo3(signature = (atoms, gates, curvature, unit_roundoff = None))]
 fn poincare_lorentz_decode_forward<'py>(
     py: Python<'py>,
     atoms: PyReadonlyArray2<'py, f64>,
     gates: PyReadonlyArray2<'py, f64>,
     curvature: f64,
+    unit_roundoff: Option<f64>,
 ) -> PyResult<Py<PyArray2<f64>>> {
     let atoms_owned = atoms.as_array().to_owned();
     let gates_owned = gates.as_array().to_owned();
+    let unit_roundoff = unit_roundoff.unwrap_or(gam_math::roundoff::UNIT_ROUNDOFF);
     let out = detach_geometry_result(py, "poincare_lorentz_decode_forward", move || {
-        poincare_lorentz_decode_forward_impl(atoms_owned.view(), gates_owned.view(), curvature)
+        poincare_lorentz_decode_forward_at_impl(
+            atoms_owned.view(),
+            gates_owned.view(),
+            curvature,
+            unit_roundoff,
+        )
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -877,7 +909,11 @@ fn poincare_lorentz_decode_forward<'py>(
 /// decoders are algebraically the same function of the inputs, so the
 /// Poincaré cache is the right state to differentiate from). Returns
 /// `(grad_gates, grad_atoms)`.
+/// `unit_roundoff` must be the value the forward was given.
 #[pyfunction]
+#[pyo3(signature = (
+    atoms_projected, gates, v, tangents, proj_scale, grad_x_hat, curvature, unit_roundoff = None,
+))]
 fn poincare_lorentz_decode_backward<'py>(
     py: Python<'py>,
     atoms_projected: PyReadonlyArray2<'py, f64>,
@@ -887,6 +923,7 @@ fn poincare_lorentz_decode_backward<'py>(
     proj_scale: PyReadonlyArray1<'py, f64>,
     grad_x_hat: PyReadonlyArray2<'py, f64>,
     curvature: f64,
+    unit_roundoff: Option<f64>,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
     let atoms_p = atoms_projected.as_array().to_owned();
     let gates_owned = gates.as_array().to_owned();
@@ -894,6 +931,7 @@ fn poincare_lorentz_decode_backward<'py>(
     let tangents_owned = tangents.as_array().to_owned();
     let proj_scale_owned = proj_scale.as_array().to_owned();
     let grad_owned = grad_x_hat.as_array().to_owned();
+    let unit_roundoff = unit_roundoff.unwrap_or(gam_math::roundoff::UNIT_ROUNDOFF);
     let (gg, ga) = detach_geometry_result(py, "poincare_lorentz_decode_backward", move || {
         let cache = gam::geometry::poincare::TangentDecodeCache {
             atoms_projected: atoms_p,
@@ -902,6 +940,7 @@ fn poincare_lorentz_decode_backward<'py>(
             tangents: tangents_owned,
             proj_scale: proj_scale_owned,
             curvature,
+            unit_roundoff,
         };
         poincare_lorentz_decode_backward_impl(&cache, grad_owned.view())
     })?;

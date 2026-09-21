@@ -33,7 +33,7 @@ fn planted_circle() -> Array2<f64> {
     z
 }
 
-fn periodic_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+pub(super) fn periodic_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     planted_fixture("periodic")
 }
 
@@ -88,19 +88,19 @@ fn planted_fixture(basis: &str) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho
     (seed.base_term, z, seed.initial_rho)
 }
 
-fn arrow_norm(vector: &SaeArrowVector) -> f64 {
+pub(super) fn arrow_norm(vector: &SaeArrowVector) -> f64 {
     (vector.t.dot(&vector.t) + vector.beta.dot(&vector.beta)).sqrt()
 }
 
-fn arrow_dot(x: &SaeArrowVector, y: &SaeArrowVector) -> f64 {
+pub(super) fn arrow_dot(x: &SaeArrowVector, y: &SaeArrowVector) -> f64 {
     x.t.dot(&y.t) + x.beta.dot(&y.beta)
 }
 
-fn richardson(coarse: f64, fine: f64) -> (f64, f64) {
+pub(super) fn richardson(coarse: f64, fine: f64) -> (f64, f64) {
     ((4.0 * fine - coarse) / 3.0, (fine - coarse).abs())
 }
 
-fn inner_gradient(term: &SaeManifoldTerm, target: ArrayView2<'_, f64>, rho: &SaeManifoldRho) -> SaeArrowVector {
+pub(super) fn inner_gradient(term: &SaeManifoldTerm, target: ArrayView2<'_, f64>, rho: &SaeManifoldRho) -> SaeArrowVector {
     let mut state = term.clone();
     state
         .refresh_basis_from_current_coords()
@@ -116,7 +116,7 @@ fn inner_gradient(term: &SaeManifoldTerm, target: ArrayView2<'_, f64>, rho: &Sae
 
 /// The term moved by `scale·step`: row-major coordinates on the atom's own manifold and the
 /// basis-major decoder (no decoder frame at this output width).
-fn displaced(term: &SaeManifoldTerm, step: &SaeArrowVector, scale: f64) -> SaeManifoldTerm {
+pub(super) fn displaced(term: &SaeManifoldTerm, step: &SaeArrowVector, scale: f64) -> SaeManifoldTerm {
     let mut moved = term.clone();
     let coords = moved.assignment.coords[0].as_matrix().to_owned();
     let manifold = moved.assignment.coords[0].manifold().clone();
@@ -279,11 +279,12 @@ fn orbit_priced_dense_gradient_factors_are_derivatives_of_the_criterion_2234() {
     );
 }
 
-/// The split between the routes is explicit: the dense route prices the orbit state finitely, and the
-/// same state routed to the arrow evaluation by its admission input refuses by name, because that route
-/// cannot price the orbit-eliminated criterion. An atom with no compact orbit is not refused there.
+/// Both routes price the orbit state: the dense route through its stiffened block, and the same state
+/// routed to the arrow evaluation by its admission input through the arrow orbit lane (#2234 step 1a),
+/// to the resolution of the two inner solves each objective converges. An atom with no compact orbit
+/// takes the arrow route's ordinary evidence.
 #[test]
-fn streaming_route_refuses_the_orbit_criterion_by_name_2234() {
+fn streaming_route_prices_the_orbit_criterion_as_the_dense_route_does_2234() {
     let (term, target, rho) = periodic_fixture();
     let mut objective =
         SaeManifoldOuterObjective::new(term, target.clone(), None, rho, 40, 0.05, 1.0e-6, 1.0e-6);
@@ -307,13 +308,14 @@ fn streaming_route_refuses_the_orbit_criterion_by_name_2234() {
         dense.cost,
         streaming.as_ref().map(|evaluation| evaluation.cost)
     );
+    let streaming = streaming.expect("the arrow orbit lane prices the orbit state");
+    let resolution = SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * dense.cost.abs().max(1.0);
     assert!(
-        matches!(
-            streaming,
-            Err(SaeCriterionError::OrbitCriterionUnavailableOnArrowRoute { atom: 0 })
-        ),
-        "the arrow route must refuse the orbit state by name, got {:?}",
-        streaming.map(|evaluation| evaluation.cost)
+        (streaming.cost - dense.cost).abs() <= resolution,
+        "the arrow orbit lane's cost {} misses the dense route's {} (|Δ| {:e}, resolution {resolution:e})",
+        streaming.cost,
+        dense.cost,
+        (streaming.cost - dense.cost).abs()
     );
 
     let (term, target, rho) = planted_fixture("linear");
@@ -358,7 +360,7 @@ fn planted_two_circles() -> Array2<f64> {
 
 /// Two periodic atoms with native ARD under hard TopK(1): each row holds one atom's coordinate,
 /// so the cache's layout is compact.
-fn topk_two_circle_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+pub(super) fn topk_two_circle_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let z = planted_two_circles();
     let minimal = build_sae_minimal_seed(SaeMinimalSeedRequest {
         target: z.view(),
@@ -410,7 +412,7 @@ fn topk_two_circle_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
 
 /// The term moved by `scale·step` in the compact hard-TopK layout: each row's selected coordinates
 /// at their compact slots, and every atom's basis-major decoder block of the border.
-fn displaced_compact(
+pub(super) fn displaced_compact(
     term: &SaeManifoldTerm,
     row_offsets: &[usize],
     step: &SaeArrowVector,

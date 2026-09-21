@@ -3392,11 +3392,14 @@ mod spatial_trial_recovery_tests {
 
     #[test]
     fn spatial_value_probe_classifier_matches_derivative_lane() {
-        // The contract is an AGREEMENT: the value-probe lane must retreat to
-        // `+∞` on exactly the errors the derivative lane calls recoverable, and
-        // propagate every other error unchanged. Asserting the agreement over a
-        // table — rather than pinning one hand-picked error per outcome — is
-        // what keeps this gate honest when the producer's verdict moves.
+        // The contract is an AGREEMENT: the value-probe lane must answer with a
+        // typed refusal — a variant `is_trial_point_infeasible` recognizes, still
+        // carrying its reason — on exactly the errors the derivative lane calls
+        // recoverable, and propagate every other error unchanged. No +∞ cost: a
+        // sentinel names no reason, so three walls read "non-finite cost" and
+        // nothing else (#2735). Asserting the agreement over a table — rather
+        // than pinning one hand-picked error per outcome — is what keeps this
+        // gate honest when the producer's verdict moves.
         //
         // #2593 moved that verdict from the message text to the error VARIANT
         // (`TrialPointRefused`), which is what the sibling
@@ -3425,31 +3428,27 @@ mod spatial_trial_recovery_tests {
         for error in cases {
             let message = error.to_string();
             let derivative_lane_recovers = is_recoverable_trial_point_error(&error);
-            match classify_spatial_value_probe_failure(error) {
-                Ok(value) => {
-                    assert!(
-                        derivative_lane_recovers,
-                        "the value probe retreated on {message:?} while the derivative lane \
-                         calls it fatal — the two lanes must classify one error the same way"
-                    );
-                    assert!(
-                        value.is_infinite() && value.is_sign_positive(),
-                        "a domain refusal must retreat to +INFINITY so the line search steps \
-                         away from it; got {value} for {message:?}"
-                    );
-                }
-                Err(propagated) => {
-                    assert!(
-                        !derivative_lane_recovers,
-                        "the value probe propagated {message:?} while the derivative lane \
-                         calls it a recoverable trial point"
-                    );
-                    assert_eq!(
-                        propagated.to_string(),
-                        message,
-                        "a fatal failure must be propagated unchanged, not reworded"
-                    );
-                }
+            let typed = classify_spatial_value_probe_failure(error);
+            if derivative_lane_recovers {
+                assert!(
+                    typed.is_trial_point_infeasible(),
+                    "the value probe must carry {message:?} as a typed refusal the outer \
+                     consumers retreat from; got {typed}"
+                );
+                assert!(
+                    typed.to_string().contains(&message),
+                    "the refusal must keep its reason: {message:?} became {typed}"
+                );
+            } else {
+                assert!(
+                    !typed.is_trial_point_infeasible(),
+                    "the value probe turned the fatal {message:?} into a refusal"
+                );
+                assert_eq!(
+                    typed.to_string(),
+                    message,
+                    "a fatal failure must be propagated unchanged, not reworded"
+                );
             }
         }
     }

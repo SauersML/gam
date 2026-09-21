@@ -1,5 +1,6 @@
 use super::*;
 use super::rail_face::RailFaceLimitOutcome;
+use gam_problem::domain_face::DomainFaces;
 
 // Re-exported here while the shared EFS contract lives in `gam-problem`.
 pub use gam_problem::{EfsEval, FixedPointCertificateEval, FixedPointCoordinateCertificate};
@@ -71,10 +72,14 @@ pub enum SeedOutcome {
 ///   points even when `capability().hessian == Analytic`; `opt` degrades that
 ///   step to first-order behavior instead of requiring the objective to fake a
 ///   stale or non-finite Hessian.
-/// - Use `eval_cost()` / `OuterEval::infeasible()` for infeasible trial points.
-///   Return `Err(...)` only when the evaluation artifact itself cannot be
-///   constructed. Such errors are fatal across screening, multistart, and
-///   solver plans; they are never reinterpreted as another numerical trial.
+/// - An infeasible trial point returns `Err` carrying a refusal whose
+///   `EstimationError::is_trial_point_infeasible` answers true (for example
+///   `EstimationError::TrialPointRefused`), so the refusal's reason reaches the
+///   outer log and every consumer classifies the point by variant (#2735). Every
+///   other `Err` means the evaluation artifact itself cannot be constructed; it
+///   is fatal across screening, multistart, and solver plans and is never
+///   reinterpreted as another numerical trial. A +∞ cost
+///   (`OuterEval::infeasible()`) still reads as infeasible but names no reason.
 /// - `eval_cost()` is used only for cost-based optimization paths.
 /// - `eval()` is the main evaluation path (cost + gradient + optional Hessian).
 /// - `eval_efs()` is used only by the EFS solver. It runs the inner solve,
@@ -350,9 +355,14 @@ pub trait OuterObjective {
     /// continuation. Consequently the exact same upper endpoint is both the
     /// solver's legal box face and the continuation path's literal rho entry.
     /// `None` means the objective has no domain narrower than the configured
-    /// generic box. An advertised vector must have `capability().n_params`
+    /// generic box. An advertised side must have `capability().n_params`
     /// finite entries; malformed contracts are typed runner errors.
-    fn outer_domain_upper_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
+    ///
+    /// Each face carries the [`gam_problem::domain_face::DomainFaceKind`] its
+    /// producer derived it as, and there is no default: the certificate judges a
+    /// projection-only stationarity at a face by that kind (#2627), so an
+    /// objective that declares a face says what it is.
+    fn outer_domain_upper_bound(&self) -> Result<Option<DomainFaces>, EstimationError> {
         Ok(None)
     }
 
@@ -362,7 +372,7 @@ pub trait OuterObjective {
     /// runner seam as [`Self::outer_domain_upper_bound`], before any seed,
     /// continuation waypoint, solver evaluation, or stationarity certificate can
     /// observe an out-of-domain coordinate.
-    fn outer_domain_lower_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
+    fn outer_domain_lower_bound(&self) -> Result<Option<DomainFaces>, EstimationError> {
         Ok(None)
     }
 
@@ -1762,6 +1772,20 @@ pub(crate) fn outer_error_to_native(error: EstimationError, perm: &[usize]) -> E
             band,
             continuation,
             terminal_refusal: Box::new(outer_error_to_native(*terminal_refusal, perm)),
+        },
+        // Its faces name native coordinates already; only the point is permuted.
+        EstimationError::OuterDomainFaceRefused {
+            context,
+            faces,
+            bound,
+            constraint_projected_grad_norm,
+            rho_checkpoint,
+        } => EstimationError::OuterDomainFaceRefused {
+            context,
+            faces,
+            bound,
+            constraint_projected_grad_norm,
+            rho_checkpoint: to_native(rho_checkpoint),
         },
         other => other,
     }

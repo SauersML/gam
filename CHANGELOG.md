@@ -1,5 +1,20 @@
 ## Unreleased
 
+- **The Poincaré ball's edge is the radius its storage precision resolves** (#2469). Every
+  Poincaré projection, exponential and decoder kept points at `√k‖y‖ ≤ 1 − 1e-5` and
+  clamped the logarithm there, so a point past that margin got a shortened logarithm.
+  Points now sit at `√k‖y‖ ≤ R = sqrt((1 − 2γ)/(1 + 2γ))`, `γ = (d+2)u/(1 − (d+2)u)`,
+  the largest radius whose chart factor `1 − k‖y‖²` is still resolved at unit roundoff
+  `u` (about `1 − 1.8e-15` in f64 at `d = 6`). The logarithm is an exact `atanh`, and a
+  point whose chart factor is inside its rounding band is refused rather than clamped.
+  `gamfit.PoincareAtoms` passes its tensor dtype's `u`, so a float32 dictionary stays
+  strictly inside the ball once stored (about `1 − 1e-6`). The `poincare_project_into_ball`
+  and `poincare_*_decode_*` bindings take an optional `unit_roundoff` (default f64's). Rust
+  gains `project_into_ball_at`, `tangent_decode_forward_at` and
+  `lorentz_decode_forward_at`, and `TangentDecodeCache` a `unit_roundoff` field.
+  **Migration:** saturated decodes and clamped atoms now reach much larger hyperbolic
+  radii, with `atanh(R)` about 17 in f64 against 6.1 before. A caller that builds
+  `TangentDecodeCache` by hand sets `unit_roundoff` to the value its forward used.
 - **Sphere points must be unit-norm to f64 precision** (#2469). Unit-sphere points were
   accepted within `1e-6` of `‖p‖² = 1` by `SphereManifold` (and so by `stiefel(k=1)` and
   `grassmann(k=1)`), and the `"sphere"` response geometry and `sphere_frechet_mean`
@@ -91,6 +106,11 @@
   `inference::rho_posterior::k_hat_standard_error` give the grade's resolution.
   **Saved models:** new payloads write only the new tokens. A payload written earlier still
   reads, because the old tokens are accepted as read-only aliases.
+- **`AtomCore.evidence` is removed** (#2946). It copied the fit's `penalized_loss_score`
+  into every atom under a label that claimed a per-atom marginal likelihood. It was
+  neither a marginal likelihood nor per atom. **Migration:** read the model's top-level
+  `penalized_loss_score`. The `ManifoldSAE` artifact schema is now `v10`, without the
+  per-atom `evidence`. A `v9` artifact still loads and drops that copy on read.
 
 ## gamfit 0.1.268 (2026-09-11)
 

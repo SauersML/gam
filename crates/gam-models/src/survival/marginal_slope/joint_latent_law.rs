@@ -60,12 +60,6 @@ use serde::{Deserialize, Serialize};
 /// radius, so it carries about twice that.
 pub(crate) const DEFAULT_JOINT_LATENT_NODES: usize = 128;
 
-/// Lloyd iterations the compression may spend before it keeps the partition it
-/// has. Assignments almost always settle far earlier; the cap only bounds a
-/// cycling partition, and the moment correction that follows makes the declared
-/// law's first two moments exact whatever the partition.
-const JOINT_LAW_LLOYD_ITERATIONS: usize = 60;
-
 /// The persisted joint law of a `K ≥ 2` score vector (gam#2929): the pooled
 /// whitened residual law and the affine map that transports it to a context.
 ///
@@ -124,9 +118,15 @@ impl SurvivalJointLatentLaw {
             }
             total += weight;
         }
-        if (total - 1.0).abs() > 1e-8 {
+        // Weights normalized in f64 by their own sum sum to one within the
+        // rounding of that sum, of each quotient and of this re-summation: at most
+        // `γ_{2m}`. The compression normalizes exactly so, and a persisted law
+        // round-trips its bits.
+        let band = gam_linalg::roundoff::accumulation_growth(2 * m);
+        if !((total - 1.0).abs() <= band) {
             return Err(format!(
-                "{context}: joint latent weights must sum to one, got {total}"
+                "{context}: joint latent weights must sum to one to f64 precision: they sum to \
+                 {total}, off by more than {band:.3e}; normalize them in f64 by their sum"
             ));
         }
         if self.score_mean.len() != k || self.score_mean.iter().any(|value| !value.is_finite()) {
@@ -413,6 +413,109 @@ fn squared_distance(left: &[f64], right: &[f64]) -> f64 {
         .sum()
 }
 
+/// A weighted sample's Lloyd (k-means) partition over a fixed set of centers.
+struct LloydPartition {
+    centers: Vec<f64>,
+    assignment: Vec<usize>,
+    nearest: Vec<f64>,
+    masses: Vec<f64>,
+    sums: Vec<f64>,
+}
+
+impl LloydPartition {
+    /// A partition over `centers` (`clusters × K`, row-major) with no point
+    /// assigned yet. `nearest` holds one entry per sample point; every step
+    /// overwrites it before reading it.
+    fn new(centers: Vec<f64>, nearest: Vec<f64>, k: usize) -> Self {
+        let clusters = centers.len() / k;
+        Self {
+            assignment: vec![usize::MAX; nearest.len()],
+            masses: vec![0.0; clusters],
+            sums: vec![0.0; clusters * k],
+            centers,
+            nearest,
+        }
+    }
+
+    /// One Lloyd step: assign every point to its nearest center, then move every
+    /// center to its cluster's weighted mean. An emptied cluster takes the
+    /// worst-served point. Returns whether an assignment or a center moved, and
+    /// the weighted squared error `Σ w·d²` of the assignment.
+    fn step(&mut self, sample: &[f64], sample_weights: &[f64], k: usize) -> (bool, f64) {
+        let count = sample_weights.len();
+        let clusters = self.masses.len();
+        let mut changed = false;
+        for index in 0..count {
+            let point = &sample[index * k..(index + 1) * k];
+            let mut best = 0usize;
+            let mut best_distance = f64::INFINITY;
+            for cluster in 0..clusters {
+                let distance =
+                    squared_distance(point, &self.centers[cluster * k..(cluster + 1) * k]);
+                if distance < best_distance {
+                    best_distance = distance;
+                    best = cluster;
+                }
+            }
+            self.nearest[index] = best_distance;
+            if self.assignment[index] != best {
+                self.assignment[index] = best;
+                changed = true;
+            }
+        }
+        let error: f64 = (0..count)
+            .map(|index| sample_weights[index] * self.nearest[index])
+            .sum();
+        self.masses.fill(0.0);
+        self.sums.fill(0.0);
+        for index in 0..count {
+            let cluster = self.assignment[index];
+            self.masses[cluster] += sample_weights[index];
+            for j in 0..k {
+                self.sums[cluster * k + j] += sample_weights[index] * sample[index * k + j];
+            }
+        }
+        for cluster in 0..clusters {
+            if self.masses[cluster] > 0.0 {
+                for j in 0..k {
+                    self.centers[cluster * k + j] =
+                        self.sums[cluster * k + j] / self.masses[cluster];
+                }
+            } else {
+                let worst = (0..count)
+                    .max_by(|&left, &right| {
+                        (sample_weights[left] * self.nearest[left])
+                            .total_cmp(&(sample_weights[right] * self.nearest[right]))
+                    })
+                    .unwrap_or(0);
+                self.centers[cluster * k..(cluster + 1) * k]
+                    .copy_from_slice(&sample[worst * k..(worst + 1) * k]);
+                self.nearest[worst] = 0.0;
+                changed = true;
+            }
+        }
+        (changed, error)
+    }
+
+    /// Lloyd steps with no budget. The assignment moves every point to its
+    /// nearest center and the update moves every center to its cluster's mean,
+    /// and neither raises `Σ w·d²`. Reseeding an emptied cluster moves a center
+    /// nothing is assigned to. So the error measured after each assignment is
+    /// non-increasing. The refinement ends once the assignment stops changing or
+    /// that error stops strictly decreasing. A strictly decreasing run of doubles
+    /// is finite, and a cycling partition cannot keep lowering it.
+    fn refine(&mut self, sample: &[f64], sample_weights: &[f64], k: usize) {
+        let mut previous_error = f64::INFINITY;
+        loop {
+            let (changed, error) = self.step(sample, sample_weights, k);
+            if !changed || !(error < previous_error) {
+                return;
+            }
+            previous_error = error;
+        }
+    }
+}
+
 /// Compress a weighted sample in `ℝ^K` to at most `node_count` joint nodes whose
 /// weighted mean and covariance are the sample's exactly. Deterministic: the
 /// k-means++ seeding draws from a fixed-seed generator over the sample in its
@@ -492,61 +595,11 @@ fn compress_joint_sample(
     }
     let clusters = centers.len() / k;
 
-    // Lloyd iterations.
-    let mut assignment = vec![usize::MAX; count];
-    let mut masses = vec![0.0; clusters];
-    let mut sums = vec![0.0; clusters * k];
-    for _ in 0..JOINT_LAW_LLOYD_ITERATIONS {
-        let mut changed = false;
-        for index in 0..count {
-            let point = &sample[index * k..(index + 1) * k];
-            let mut best = 0usize;
-            let mut best_distance = f64::INFINITY;
-            for cluster in 0..clusters {
-                let distance = squared_distance(point, &centers[cluster * k..(cluster + 1) * k]);
-                if distance < best_distance {
-                    best_distance = distance;
-                    best = cluster;
-                }
-            }
-            nearest[index] = best_distance;
-            if assignment[index] != best {
-                assignment[index] = best;
-                changed = true;
-            }
-        }
-        masses.fill(0.0);
-        sums.fill(0.0);
-        for index in 0..count {
-            let cluster = assignment[index];
-            masses[cluster] += sample_weights[index];
-            for j in 0..k {
-                sums[cluster * k + j] += sample_weights[index] * sample[index * k + j];
-            }
-        }
-        for cluster in 0..clusters {
-            if masses[cluster] > 0.0 {
-                for j in 0..k {
-                    centers[cluster * k + j] = sums[cluster * k + j] / masses[cluster];
-                }
-            } else {
-                // An emptied cluster takes the worst-served point.
-                let worst = (0..count)
-                    .max_by(|&left, &right| {
-                        (sample_weights[left] * nearest[left])
-                            .total_cmp(&(sample_weights[right] * nearest[right]))
-                    })
-                    .unwrap_or(0);
-                centers[cluster * k..(cluster + 1) * k]
-                    .copy_from_slice(&sample[worst * k..(worst + 1) * k]);
-                nearest[worst] = 0.0;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    // The moment correction below makes the declared law's first two moments
+    // exact whatever partition the refinement ends on.
+    let mut partition = LloydPartition::new(centers, nearest, k);
+    partition.refine(&sample, &sample_weights, k);
+    let LloydPartition { centers, masses, .. } = partition;
     let mut nodes = Vec::with_capacity(clusters * k);
     let mut node_weights = Vec::with_capacity(clusters);
     for cluster in 0..clusters {
@@ -3350,5 +3403,73 @@ mod joint_latent_law_tests {
                 "K={k}: unexpected refusal {reason}"
             );
         }
+    }
+
+    /// The compression's Lloyd refinement ends at a fixed point of its own step
+    /// (#2469). From these centers the partition is still moving after 60 steps,
+    /// the budget the refinement used to stop at, so a budget hands back a
+    /// partition its next step still changes.
+    #[test]
+    fn lloyd_refinement_ends_at_a_fixed_point_past_the_old_budget_2469() {
+        let k = 2;
+        let count = 20_000;
+        let mut state = 0x2469_u64;
+        let mut sample = Vec::with_capacity(count * k);
+        for _ in 0..count {
+            let radius = (-2.0 * splitmix_unit(&mut state).ln()).sqrt();
+            let angle = 2.0 * std::f64::consts::PI * splitmix_unit(&mut state);
+            sample.push(radius * angle.cos());
+            sample.push(radius * angle.sin());
+        }
+        let weights = vec![1.0; count];
+        let seed_centers = sample[..DEFAULT_JOINT_LATENT_NODES * k].to_vec();
+        let fresh = || LloydPartition::new(seed_centers.clone(), vec![f64::INFINITY; count], k);
+
+        let mut budgeted = fresh();
+        let mut moving = false;
+        for _ in 0..60 {
+            moving = budgeted.step(&sample, &weights, k).0;
+        }
+        assert!(
+            moving,
+            "the fixture must still be moving after 60 Lloyd steps, or it cannot tell a budget \
+             from a fixed point"
+        );
+
+        let mut refined = fresh();
+        refined.refine(&sample, &weights, k);
+        let assignment = refined.assignment.clone();
+        let centers = refined.centers.clone();
+        let (changed, _) = refined.step(&sample, &weights, k);
+        assert!(
+            !changed && refined.assignment == assignment && refined.centers == centers,
+            "the refined partition must be a fixed point of the Lloyd step"
+        );
+    }
+
+    /// A joint law's weights are checked against the rounding of an f64
+    /// normalization, `γ_{2m}` for `m` weights, not a fixed `1e-8` (#2469). Weights
+    /// normalized by their own sum pass; the same weights off by `1e-9` in total
+    /// are refused, which the fixed tolerance accepted.
+    #[test]
+    fn joint_latent_weights_are_checked_against_their_normalization_band_2469() {
+        let (nodes, weights) = skewed_joint_law();
+        let m = weights.len();
+        let covariance = [[1.0, 0.4], [0.4, 1.3]];
+        persisted_law(&nodes, &weights, [0.1, -0.2], covariance)
+            .runtime(None, 1)
+            .expect("weights normalized by their sum pass");
+        let band = gam_linalg::roundoff::accumulation_growth(2 * m);
+        assert!(band < 1e-9, "γ_2m={band:.3e} for m={m}");
+        let mut off = weights.clone();
+        off[0] += 1e-9;
+        let error = persisted_law(&nodes, &off, [0.1, -0.2], covariance)
+            .runtime(None, 1)
+            .err()
+            .expect("weights off by 1e-9 in total are refused");
+        assert!(
+            error.contains("must sum to one to f64 precision"),
+            "unexpected refusal {error}"
+        );
     }
 }

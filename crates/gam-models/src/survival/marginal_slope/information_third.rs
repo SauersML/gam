@@ -5,7 +5,9 @@
 //! finite Bell polynomial in g. This computes the eleven potentially nonzero
 //! mixed fifth derivatives once per row, before any coefficient pullback. The
 //! sixth is the same construction one order higher; the fourth information
-//! derivative consumes it (gam#2894).
+//! derivative consumes it (gam#2894). On a declared latent law the unary
+//! compositions in `q` become bivariate ones in `(q, g)` through the anchor's
+//! Taylor tables, which give the anchored frame its fifth (gam#2945).
 
 use super::*;
 use crate::row_kernel::RowKernel;
@@ -654,45 +656,261 @@ impl SurvivalMarginalSlopeRowKernel<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>
 /// the fourth derivatives contract with.
 pub(crate) type PrimaryThirdDirections<const P: usize> = ([f64; P], [f64; P], Option<[f64; P]>);
 
-/// The anchored frame has no closed-form fifth derivative: the anchor is an
-/// implicit function of a declared law and its higher derivatives exist only
-/// through the jet lift, which stops at order four. Every third-information
-/// entry is therefore refused by name here, and the family's
-/// `rigid_third_information_available` routes the armed-Jeffreys machinery
-/// away from it before any of these is reached (gam#2923).
-impl SurvivalMarginalSlopeRowKernel<STATIC_SLOPE_PRIMARIES, AnchoredStaticSlopeGeometry> {
-    fn no_fifth(&self, context: &str, request: String) -> String {
-        format!(
-            "survival marginal-slope {context} ({request}, n={}) needs the closed-form fifth \
-             likelihood derivatives of the Gaussian lowering, which a declared latent law does \
-             not have",
-            self.family.n,
-        )
-    }
+// ── The anchored time-constant slope frame (gam#2945) ──────────────────
+//
+// On a declared latent law the location channels are the anchor `α(q, b)`, the
+// root of `Σ_k w_k Φ(−(α + b u_k)) = Φ(−q)` with `b = s·g`, so the row is
+//
+//     wi_entry·log Φ(−η₀) − wi(1 − d)·log Φ(−η₁) + w·d·(η₁²/2 − log α_q(q₁, b) − log q̇₁),
+//
+// with `η_j = α(q_j, b) + b·z`. It still separates into functions of `(q₀, g)`,
+// `(q₁, g)` and `q̇₁`, but `α` is nonlinear in both of its arguments, so each
+// channel is a bivariate composition: the anchor's Taylor table in `(δq, δb)`,
+// composed with the leaf's derivative stack. `α` through order five is the
+// table the root slot publishes; the event row's `log α_q` through order five
+// is `α` through order six, solved on demand (`anchor_taylor_through_sixth`).
 
+/// A Taylor polynomial in `(δq, δg)`, one location primary and the slope
+/// primary, through total degree five: `[i][k]` multiplies `δq^i·δg^k`, and every
+/// entry with `i + k > 5` stays zero.
+type ChannelTaylor = [[f64; 6]; 6];
+
+/// The product of two [`ChannelTaylor`]s, truncated at total degree five.
+fn channel_product(a: &ChannelTaylor, b: &ChannelTaylor) -> ChannelTaylor {
+    let mut out = [[0.0; 6]; 6];
+    for i1 in 0..6 {
+        for k1 in 0..6 - i1 {
+            for i2 in 0..6 - i1 - k1 {
+                for k2 in 0..6 - i1 - k1 - i2 {
+                    out[i1 + i2][k1 + k2] += a[i1][k1] * b[i2][k2];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `F(x + δ)` through total degree five by Horner's rule on `Σ_n F⁽ⁿ⁾(x)·δⁿ/n!`:
+/// `leaf` is `F`'s derivative stack at `x`, and `delta` has no constant term.
+fn channel_compose(leaf: &[f64; 6], delta: &ChannelTaylor) -> ChannelTaylor {
+    let mut out = [[0.0; 6]; 6];
+    out[0][0] = leaf[5] / FACTORIAL[5];
+    for n in (0..5).rev() {
+        out = channel_product(&out, delta);
+        out[0][0] += leaf[n] / FACTORIAL[n];
+    }
+    out
+}
+
+/// The motion of `∂_q^SHIFT α` as a [`ChannelTaylor`]: `∂_q^SHIFT α(q + δq, b + s·δg)`
+/// minus its value, read from the anchor's Taylor table in `(δq, δb)`. The
+/// coefficient of `δq^i·δb^k` in `∂_q^SHIFT α` is `(i + SHIFT)!/i!·c[i + SHIFT][k]`,
+/// and `δb = s·δg` scales it by `s^k`.
+fn anchor_channel<const SLOTS: usize, const SHIFT: usize>(
+    table: &[[f64; SLOTS]; SLOTS],
+    probit_scale: f64,
+) -> ChannelTaylor {
+    const { assert!(SLOTS >= 6 + SHIFT) };
+    let mut out = [[0.0; 6]; 6];
+    let mut slope_power = 1.0;
+    for k in 0..6 {
+        for i in 0..6 - k {
+            out[i][k] = FACTORIAL[i + SHIFT] / FACTORIAL[i] * table[i + SHIFT][k] * slope_power;
+        }
+        slope_power *= probit_scale;
+    }
+    out[0][0] = 0.0;
+    out
+}
+
+/// `∂_q^i ∂_g^(5−i)` of a [`ChannelTaylor`], for `i = 0, …, 5`.
+fn channel_fifth(taylor: &ChannelTaylor) -> [f64; 6] {
+    std::array::from_fn(|i| taylor[i][5 - i] * FACTORIAL[i] * FACTORIAL[5 - i])
+}
+
+/// `d^n/dη^n` of `scale·log Φ(−η)` at `η = −neg_eta`: `(−1)^n·scale` times the
+/// `log Φ` stack at `neg_eta`.
+fn survival_leaf(neg_eta: f64, scale: f64) -> [f64; 6] {
+    let stack = gam_math::probability::normal_logcdf_derivatives_through_fifth(neg_eta);
+    std::array::from_fn(|n| if n % 2 == 0 { scale * stack[n] } else { -scale * stack[n] })
+}
+
+/// One admitted anchored row's signed margins and anchor tables (gam#2945).
+pub(super) struct AnchoredRowTables {
+    /// `[−η₀, −η₁]`, as the row program's admission witnesses give them.
+    pub(super) neg_etas: [f64; 2],
+    /// The entry anchor's order-five table; `None` on a row with no entry factor.
+    pub(super) entry: Option<AnchorTaylor>,
+    /// The exit anchor's order-five table.
+    pub(super) exit: AnchorTaylor,
+    /// The exit anchor's order-six table the event row's rate channel reads;
+    /// `None` on a censored row.
+    pub(super) exit_sixth: Option<[[f64; ANCHOR_SIXTH_SLOTS]; ANCHOR_SIXTH_SLOTS]>,
+}
+
+/// The tables [`anchored_row_fifth_from_tables`] reads, through the anchors the
+/// row's value path solved: both order-five tables from their root slots and,
+/// on an event row, the exit anchor's order-six table at the slot's root. The
+/// row is admitted exactly as the row program admits it.
+pub(super) fn anchored_row_tables(
+    primaries: &[f64; STATIC_SLOPE_PRIMARIES],
+    inputs: &RigidRowInputs,
+) -> Result<AnchoredRowTables, String> {
+    let [neg_eta0, neg_eta1, derivative] =
+        rigid_row_admission_witnesses::<4, AnchoredStaticSlopeGeometry>(primaries, inputs);
+    validate_rigid_row_admission::<4, AnchoredStaticSlopeGeometry>(
+        primaries[PRIMARY_QD1],
+        inputs,
+        neg_eta0,
+        neg_eta1,
+        derivative,
+    )?;
+    let context = inputs.anchor.ok_or_else(|| {
+        format!(
+            "survival marginal-slope anchored fifth likelihood derivative at row {} has no \
+             declared latent law",
+            inputs.row
+        )
+    })?;
+    let observed_slope = inputs.probit_scale * primaries[PRIMARY_SLOPE];
+    let table = |q: f64, kind: SurvivalInterceptSlotKind| {
+        anchor_taylor_in_slot(q, observed_slope, context, inputs.row, survival_anchor_slot(kind))
+    };
+    let entry = if inputs.wi_entry != 0.0 {
+        Some(table(primaries[PRIMARY_Q0], SurvivalInterceptSlotKind::Entry)?)
+    } else {
+        None
+    };
+    let exit = table(primaries[PRIMARY_Q1], SurvivalInterceptSlotKind::Exit)?;
+    let exit_sixth = if inputs.di != 0.0 {
+        Some(anchor_taylor_through_sixth(
+            exit.coefficients()[0][0],
+            primaries[PRIMARY_Q1],
+            observed_slope,
+            context.grid,
+        )?)
+    } else {
+        None
+    };
+    Ok(AnchoredRowTables {
+        neg_etas: [neg_eta0, neg_eta1],
+        entry,
+        exit,
+        exit_sixth,
+    })
+}
+
+/// The anchored row's fifth likelihood derivatives from its tables (gam#2945).
+pub(super) fn anchored_row_fifth_from_tables(
+    primaries: &[f64; STATIC_SLOPE_PRIMARIES],
+    inputs: &RigidRowInputs,
+    tables: &AnchoredRowTables,
+) -> [[[[[f64; 4]; 4]; 4]; 4]; 4] {
+    let [neg_eta0, neg_eta1] = tables.neg_etas;
+    let s = inputs.probit_scale;
+    // η_j = α(q_j, b) + b·z moves with g through b = s·g on both terms.
+    let linear = s * inputs.z_sum;
+    let entry_fifth = tables.entry.as_ref().map_or([0.0; 6], |table| {
+        let mut delta = anchor_channel::<6, 0>(table.coefficients(), s);
+        delta[0][1] += linear;
+        channel_fifth(&channel_compose(&survival_leaf(neg_eta0, inputs.wi_entry), &delta))
+    });
+    let event_weight = inputs.wi * inputs.di;
+    let eta1 = -neg_eta1;
+    let density = [
+        0.5 * event_weight * eta1 * eta1,
+        event_weight * eta1,
+        event_weight,
+        0.0,
+        0.0,
+        0.0,
+    ];
+    let survival = survival_leaf(neg_eta1, -inputs.wi * (1.0 - inputs.di));
+    let exit_leaf: [f64; 6] = std::array::from_fn(|n| survival[n] + density[n]);
+    let mut delta = anchor_channel::<6, 0>(tables.exit.coefficients(), s);
+    delta[0][1] += linear;
+    let mut exit_fifth = channel_fifth(&channel_compose(&exit_leaf, &delta));
+    if let Some(table) = tables.exit_sixth.as_ref() {
+        // −w·d·log α_q: d^n log a / da^n = (−1)^(n−1)·(n−1)!/a^n for n ≥ 1.
+        let rate = table[1][0];
+        let mut rate_leaf = [-event_weight * rate.ln(), 0.0, 0.0, 0.0, 0.0, 0.0];
+        for n in 1..6 {
+            let sign = if n % 2 == 1 { 1.0 } else { -1.0 };
+            rate_leaf[n] = -event_weight * sign * FACTORIAL[n - 1] / rate.powi(n as i32);
+        }
+        let rate_fifth =
+            channel_fifth(&channel_compose(&rate_leaf, &anchor_channel::<7, 1>(table, s)));
+        for i in 0..6 {
+            exit_fifth[i] += rate_fifth[i];
+        }
+    }
+    let slope_fifth = entry_fifth[0] + exit_fifth[0];
+    let derivative_fifth = -event_weight * 24.0 / primaries[PRIMARY_QD1].powi(5);
+    std::array::from_fn(|i| {
+        std::array::from_fn(|j| {
+            std::array::from_fn(|k| {
+                std::array::from_fn(|l| {
+                    std::array::from_fn(|m| {
+                        let axes = [i, j, k, l, m];
+                        let count = |axis| axes.iter().filter(|&&value| value == axis).count();
+                        let n0 = count(PRIMARY_Q0);
+                        let n1 = count(PRIMARY_Q1);
+                        let nd = count(PRIMARY_QD1);
+                        if n0 + n1 + nd == 0 {
+                            slope_fifth
+                        } else if n0 > 0 && n1 + nd == 0 {
+                            entry_fifth[n0]
+                        } else if n1 > 0 && n0 + nd == 0 {
+                            exit_fifth[n1]
+                        } else if nd == 5 {
+                            derivative_fifth
+                        } else {
+                            0.0
+                        }
+                    })
+                })
+            })
+        })
+    })
+}
+
+/// The anchored row's fifth likelihood derivatives (gam#2945) at the anchors
+/// its value path solved ([`anchored_row_tables`]).
+fn anchored_row_fifth(
+    primaries: &[f64; STATIC_SLOPE_PRIMARIES],
+    inputs: &RigidRowInputs,
+) -> Result<[[[[[f64; 4]; 4]; 4]; 4]; 4], String> {
+    if inputs.wi == 0.0 {
+        return Ok([[[[[0.0; 4]; 4]; 4]; 4]; 4]);
+    }
+    let tables = anchored_row_tables(primaries, inputs)?;
+    Ok(anchored_row_fifth_from_tables(primaries, inputs, &tables))
+}
+
+/// The anchored frame's third information derivatives: the frame-generic
+/// contractions over [`anchored_row_fifth`] (gam#2945). The frame prices no
+/// Jeffreys completion, whose outer derivatives would read sixth derivatives
+/// through the anchor root, so it has none of the static frame's
+/// contracted-trace kernels.
+impl SurvivalMarginalSlopeRowKernel<STATIC_SLOPE_PRIMARIES, AnchoredStaticSlopeGeometry> {
     pub(crate) fn third_information_all_axes(
         &self,
         u: &[f64],
         v: &[f64],
     ) -> Result<Vec<Array2<f64>>, String> {
-        Err(self.no_fifth(
-            "third information derivative",
-            format!("|u|={}, |v|={}", u.len(), v.len()),
-        ))
+        self.third_information_all_axes_from(u, v, anchored_row_fifth)
     }
 
+    /// [`Self::primary_third_information_all_axes_from`] on the anchored frame.
     pub(crate) fn primary_third_information_all_axes(
         &self,
         row_weights: &[f64],
         directions: impl Fn(usize) -> Result<PrimaryThirdDirections<STATIC_SLOPE_PRIMARIES>, String>,
     ) -> Result<Vec<Array2<f64>>, String> {
-        let first_row = directions(0).map(|(x, _, _)| x[PRIMARY_Q0]).unwrap_or(f64::NAN);
-        Err(self.no_fifth(
-            "baseline third information derivative",
-            format!("{} row weights, first direction q₀ = {first_row:e}", row_weights.len()),
-        ))
+        self.primary_third_information_all_axes_from(row_weights, directions, anchored_row_fifth)
     }
 
+    /// [`Self::design_psi_third_information_all_axes_from`] on the anchored frame.
     pub(crate) fn design_psi_third_information_all_axes(
         &self,
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -700,17 +918,16 @@ impl SurvivalMarginalSlopeRowKernel<STATIC_SLOPE_PRIMARIES, AnchoredStaticSlopeG
         d_beta: &[f64],
         row_weights: &[f64],
     ) -> Result<Option<Vec<Array2<f64>>>, String> {
-        Err(self.no_fifth(
-            "design ψ third information derivative",
-            format!(
-                "ψ axis {psi_index} of {} blocks, |d_beta|={}, {} row weights",
-                derivative_blocks.len(),
-                d_beta.len(),
-                row_weights.len()
-            ),
-        ))
+        self.design_psi_third_information_all_axes_from(
+            derivative_blocks,
+            psi_index,
+            d_beta,
+            row_weights,
+            anchored_row_fifth,
+        )
     }
 
+    /// [`Self::design_psi_pair_third_information_all_axes_from`] on the anchored frame.
     pub(crate) fn design_psi_pair_third_information_all_axes(
         &self,
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -718,14 +935,13 @@ impl SurvivalMarginalSlopeRowKernel<STATIC_SLOPE_PRIMARIES, AnchoredStaticSlopeG
         psi_j: usize,
         row_weights: &[f64],
     ) -> Result<Option<Vec<Array2<f64>>>, String> {
-        Err(self.no_fifth(
-            "design ψ-pair third information derivative",
-            format!(
-                "ψ axes ({psi_i}, {psi_j}) of {} blocks, {} row weights",
-                derivative_blocks.len(),
-                row_weights.len()
-            ),
-        ))
+        self.design_psi_pair_third_information_all_axes_from(
+            derivative_blocks,
+            psi_i,
+            psi_j,
+            row_weights,
+            anchored_row_fifth,
+        )
     }
 }
 

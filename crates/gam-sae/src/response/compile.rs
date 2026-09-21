@@ -475,7 +475,7 @@ pub fn compile_retained_response(
 ) -> Result<CompiledResponse, CompileError> {
     // The gradient pass validates the frame against the block before anything is drawn, and yields `E(P)` with it.
     let gradient = block.explained_variance_gradient(frame)?;
-    let discarded_error = gradient.discarded_error;
+    let discarded_error = gradient.discarded_error.value;
     let input_dim = block.input_dim();
     let output_dim = block.output_dim();
     let retained_dim = frame.ncols();
@@ -697,11 +697,11 @@ fn next_frame_step(
     let mut extended = Array2::<f64>::zeros((input_dim, retained_dim + 1));
     extended.slice_mut(s![.., ..retained_dim]).assign(&frame);
     extended.column_mut(retained_dim).assign(&direction);
-    let discarded_error_after = block.discarded_error(extended.view())?;
+    let discarded_error_after = block.discarded_error(extended.view())?.value;
     Ok(Some(FrameStepGain {
         direction,
         discarded_error_after,
-        gain: gradient.discarded_error - discarded_error_after,
+        gain: gradient.discarded_error.value - discarded_error_after,
     }))
 }
 

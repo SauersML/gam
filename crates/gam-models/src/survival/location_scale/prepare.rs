@@ -475,20 +475,26 @@ pub(crate) fn prepare_survival_location_scale_model(
     let non_intercept_start =
         infer_non_intercept_start_design(&log_sigma_prep.design_exit, &spec.weights)?;
     let log_sigma_full_ncols = log_sigma_prep.design_exit.ncols();
-    // The row program forms the standardized residual `u = h(t) − η_t·e^{−η_σ}`
-    // and the event Jacobian `g = ḣ + e^{−η_σ}·(η_t·η̇_σ − η̇_t)`
-    // (`sls_row_program`): the scale divides only the location predictor, and
-    // outside the σ-scaled log-t baseline no `−log σ` term enters. Every row is
-    // then a function of `η_t·e^{−η_σ}` alone, so `(η_t, η_σ) → (c·η_t, η_σ + log c)`
-    // leaves the likelihood exactly unchanged for any `c > 0` while the threshold
-    // smoothing penalty falls as `c²`: the penalized inner problem has no finite
-    // minimizer along that ray (#2106 reports a joint-Newton residual growing
-    // 1.13× per cycle, every step accepted, no block penalty opposing the step).
-    // The constant column of the log-σ design is the ray's only coordinate, so it
-    // is fixed at zero and the threshold owns the scale. It stays free in two
-    // cases: the σ-scaled log-t baseline (`location_log_time_offset`, #892), whose
-    // Jacobian carries `−η_σ` and so identifies σ, and a threshold with a nonzero
-    // offset, which no `c ≠ 1` can rescale.
+    // The row program forms the standardized residual `u = (h(t) − η_t)·e^{−η_σ}`
+    // and its time derivative `g = e^{−η_σ}·(ḣ − η̇_t − (h − η_t)·η̇_σ)`
+    // (`sls_row_program`): the scale divides the whole residual, so `log g`
+    // carries `−η_σ` and σ(x) is identified against the time transform (#2695).
+    // What remains is the joint scale gauge `(h, η_t, σ) → c·(h, η_t, σ)`: it
+    // leaves every row exactly unchanged for any `c > 0` while the time and
+    // threshold smoothing penalties fall as `c²`, so the penalized inner problem
+    // has no finite minimizer along that ray (#2106 reports a joint-Newton
+    // residual growing 1.13× per cycle, every step accepted, no block penalty
+    // opposing the step). The constant column of the log-σ design is the ray's
+    // only coordinate, so it is fixed at zero and the time transform owns the
+    // scale. It stays free wherever the clock's scale is fixed rather than free,
+    // since then no `c ≠ 1` is a symmetry: the σ-scaled log-t baseline
+    // (`location_log_time_offset`, #892) and the pinned unit-log-t warp
+    // (`pinned_free_row_constant`), whose `log t` rides a fixed offset the free
+    // columns cannot rescale, and a threshold with a nonzero offset. A flexible
+    // warp's own offsets do not fix the clock: a baseline in its affine span is
+    // rescaled by its own columns, and a derivative guard sits orders of magnitude
+    // below the rate it guards, so the gauge stands (exactly, or to the guard's
+    // size) and the pin is required.
     //
     // The scale design is otherwise kept RAW, an identity reparameterization
     // matching `identified_gaussian_log_sigma_design`. Residualizing it against
@@ -497,7 +503,10 @@ pub(crate) fn prepare_survival_location_scale_model(
     // full-width `x_log_sigma`, and `exact_newton_joint_gradient_evaluation`
     // refused the shape ("joint gradient length mismatch for block 2").
     let threshold_scale_is_free = threshold_prep.offset.iter().all(|&value| value == 0.0);
-    let log_sigma_fixed_cols = if time_prepared.location_log_time_offset || !threshold_scale_is_free {
+    let log_sigma_fixed_cols = if time_prepared.location_log_time_offset
+        || time_prepared.pinned_free_row_constant
+        || !threshold_scale_is_free
+    {
         0
     } else {
         non_intercept_start.min(log_sigma_full_ncols)
@@ -760,6 +769,11 @@ pub(crate) fn prepare_survival_location_scale_model(
         x_link_wiggle: wigglespec.as_ref().map(|s| s.design.clone()),
         wiggle_knots: spec.linkwiggle_block.as_ref().map(|w| w.knots.clone()),
         wiggle_degree: spec.linkwiggle_block.as_ref().map(|w| w.degree),
+        entry_active: spec
+            .age_entry
+            .iter()
+            .map(|&entry| entry > crate::survival::base::ENTRY_AT_ORIGIN_THRESHOLD)
+            .collect(),
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         jeffreys_armed: true,
     };

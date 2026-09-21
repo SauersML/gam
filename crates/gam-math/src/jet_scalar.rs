@@ -5932,6 +5932,106 @@ impl<const K: usize> JetScalar<K> for TwoSeed<K> {
             eps_del: Order2::constant(0.0),
         }
     }
+
+    #[inline(always)]
+    fn weighted_compose_sum(
+        lefts: &[Self],
+        right: &Self,
+        derivative_stacks: &[[f64; 5]],
+        addend: &Self,
+    ) -> Self {
+        // With `R = B + εE + δD + εδX`,
+        // `f_i(R) = f_i(B) + ε f_i′(B)·E + δ f_i′(B)·D + εδ (f_i″(B)·E·D + f_i′(B)·X)`.
+        // So each part of `addend + Σ_i L_i·f_i(R)` is a few order-two weighted sums
+        // at the one composition point `B`, joined by products:
+        //   base = Σ L_i.base·f_i(B)
+        //   ε    = (Σ L_i.base·f_i′(B))·E + Σ L_i.eps·f_i(B)
+        //   δ    = (Σ L_i.base·f_i′(B))·D + Σ L_i.del·f_i(B)
+        //   εδ   = (Σ L_i.base·f_i″(B))·E·D + (Σ L_i.base·f_i′(B))·X
+        //        + (Σ L_i.eps·f_i′(B))·D + (Σ L_i.del·f_i′(B))·E + Σ L_i.eps_del·f_i(B)
+        // (plus the addend's part in each). The default loop forms a two-seed
+        // composition, a two-seed product and a two-seed sum, twenty-seven
+        // order-two blocks, per term; the flexible marginal-slope link-deviation
+        // fourth runs that loop over every deviation coefficient (#932).
+        let terms = lefts.len();
+        let point = &right.base.0;
+        let zero = crate::jet_tower::Tower2::<K>::zero();
+        let base = tower2_weighted_compose_sum(
+            terms,
+            |term| &lefts[term].base.0,
+            point,
+            derivative_stacks,
+            0,
+            &addend.base.0,
+        );
+        let carried_eps = tower2_weighted_compose_sum(
+            terms,
+            |term| &lefts[term].eps.0,
+            point,
+            derivative_stacks,
+            0,
+            &addend.eps.0,
+        );
+        let carried_del = tower2_weighted_compose_sum(
+            terms,
+            |term| &lefts[term].del.0,
+            point,
+            derivative_stacks,
+            0,
+            &addend.del.0,
+        );
+        let carried_eps_del = tower2_weighted_compose_sum(
+            terms,
+            |term| &lefts[term].eps_del.0,
+            point,
+            derivative_stacks,
+            0,
+            &addend.eps_del.0,
+        );
+        let first = Order2(tower2_weighted_compose_sum(
+            terms,
+            |term| &lefts[term].base.0,
+            point,
+            derivative_stacks,
+            1,
+            &zero,
+        ));
+        let first_eps = Order2(tower2_weighted_compose_sum(
+            terms,
+            |term| &lefts[term].eps.0,
+            point,
+            derivative_stacks,
+            1,
+            &zero,
+        ));
+        let first_del = Order2(tower2_weighted_compose_sum(
+            terms,
+            |term| &lefts[term].del.0,
+            point,
+            derivative_stacks,
+            1,
+            &zero,
+        ));
+        let second = Order2(tower2_weighted_compose_sum(
+            terms,
+            |term| &lefts[term].base.0,
+            point,
+            derivative_stacks,
+            2,
+            &zero,
+        ));
+        let eps_del = first.multiply_add(&right.eps_del, &Order2(carried_eps_del));
+        let eps_del = first_eps.multiply_add(&right.del, &eps_del);
+        let eps_del = first_del.multiply_add(&right.eps, &eps_del);
+        let eps_del = crate::nested_dual::JetField::mul(&second, &right.eps)
+            .multiply_add(&right.del, &eps_del);
+        TwoSeed {
+            base: Order2(base),
+            eps: first.multiply_add(&right.eps, &Order2(carried_eps)),
+            del: first.multiply_add(&right.del, &Order2(carried_del)),
+            eps_del,
+        }
+    }
 }
 
 impl<const K: usize> crate::nested_dual::JetField for TwoSeed<K> {
@@ -8545,6 +8645,139 @@ mod one_seed_fused_932_tests {
             &order2_channels(&fused),
             &order2_channels(&reference),
             1 + K,
+        );
+    }
+}
+
+#[cfg(test)]
+mod two_seed_fused_932_tests {
+    //! The fused `TwoSeed` weighted compose sum against the field program it
+    //! replaces (#932).
+    //!
+    //! The reference is written with the unfused field operations (`mul`,
+    //! `add`, `compose_unary`), so it shares no lowering with the override
+    //! under test. The two sum the same terms in a different order and agree
+    //! to rounding. Every operand is a composition of dense mixtures of
+    //! primaries seeded along two directions, so all four parts carry live
+    //! Hessian channels, and an override that drops one of the εδ part's five
+    //! terms fails here instead of passing on a zero channel.
+    use super::{JetScalar, Order2, TwoSeed};
+    use crate::nested_dual::JetField;
+
+    const K: usize = 5;
+    const TERMS: usize = 4;
+
+    fn stacks() -> [[f64; 5]; TERMS] {
+        [
+            [0.31, 0.62, -0.24, 0.11, -0.05],
+            [-0.17, 0.45, 0.33, -0.28, 0.09],
+            [0.52, -0.38, 0.19, 0.07, -0.13],
+            [0.28, 0.71, -0.46, 0.22, 0.04],
+        ]
+    }
+
+    /// A mixture of every seeded primary, so every part's gradient is dense.
+    fn mixture(vars: &[TwoSeed<K>; K], salt: usize) -> TwoSeed<K> {
+        vars.iter()
+            .enumerate()
+            .fold(TwoSeed::constant(0.1 * salt as f64), |sum, (axis, var)| {
+                let weight = 0.3 + 0.17 * ((axis + salt) % K) as f64 - 0.05 * salt as f64;
+                sum.add(&var.scale(weight))
+            })
+    }
+
+    fn operands() -> (Vec<TwoSeed<K>>, TwoSeed<K>, TwoSeed<K>) {
+        let vars: [TwoSeed<K>; K] = std::array::from_fn(|axis| {
+            TwoSeed::seed(
+                0.35 - 0.11 * axis as f64,
+                axis,
+                0.6 - 0.17 * axis as f64,
+                -0.4 + 0.13 * axis as f64,
+            )
+        });
+        let right = mixture(&vars, 0)
+            .compose_unary([0.9, -0.5, 0.27, -0.14, 0.06])
+            .mul(&mixture(&vars, 1))
+            .add(&mixture(&vars, 2).compose_unary([0.4, 0.3, -0.21, 0.12, -0.04]));
+        let lefts = (0..TERMS)
+            .map(|term| {
+                mixture(&vars, term)
+                    .compose_unary([0.2, 0.8, -0.3, 0.15, -0.07])
+                    .mul(&mixture(&vars, term + 1))
+                    .scale(0.4 + 0.23 * term as f64)
+            })
+            .collect();
+        let addend = mixture(&vars, 3)
+            .mul(&mixture(&vars, 4))
+            .compose_unary([-0.6, 0.35, 0.44, -0.18, 0.05]);
+        (lefts, right, addend)
+    }
+
+    fn order2_channels(x: &Order2<K>) -> Vec<f64> {
+        let mut out = vec![x.0.v];
+        out.extend_from_slice(&x.0.g);
+        for row in &x.0.h {
+            out.extend_from_slice(row);
+        }
+        out
+    }
+
+    /// Part-by-part, channel-by-channel agreement to rounding, and every
+    /// Hessian channel of every part live.
+    fn assert_two_seed_agrees(label: &str, fused: &TwoSeed<K>, reference: &TwoSeed<K>) {
+        let parts = |x: &TwoSeed<K>| [x.base, x.eps, x.del, x.eps_del];
+        for (part, (got, want)) in ["base", "eps", "del", "eps_del"]
+            .iter()
+            .zip(parts(fused).iter().zip(parts(reference).iter()))
+        {
+            let (got, want) = (order2_channels(got), order2_channels(want));
+            for (index, (&got, &want)) in got.iter().zip(&want).enumerate() {
+                let tolerance = 1.0e-13 * got.abs().max(want.abs()).max(1.0);
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "{label} {part}: channel {index} fused {got:+.17e} vs field program {want:+.17e}"
+                );
+            }
+            let live = got[1 + K..]
+                .iter()
+                .filter(|channel| channel.abs() > 1.0e-9)
+                .count();
+            assert_eq!(
+                live,
+                K * K,
+                "{label} {part}: every Hessian channel under test must be live: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_two_seed_weighted_compose_sum_matches_the_product_loop_932() {
+        let (lefts, right, addend) = operands();
+        let derivative_stacks = stacks();
+        let looped = |terms: usize| {
+            lefts[..terms]
+                .iter()
+                .zip(derivative_stacks)
+                .fold(addend, |sum, (left, stack)| {
+                    left.mul(&right.compose_unary(stack)).add(&sum)
+                })
+        };
+        assert_two_seed_agrees(
+            "weighted_compose_sum",
+            &TwoSeed::weighted_compose_sum(&lefts, &right, &derivative_stacks, &addend),
+            &looped(TERMS),
+        );
+        // One term, and no terms: the edges an accumulator started from the
+        // wrong value would get wrong.
+        assert_two_seed_agrees(
+            "weighted_compose_sum single",
+            &TwoSeed::weighted_compose_sum(&lefts[..1], &right, &derivative_stacks[..1], &addend),
+            &looped(1),
+        );
+        assert_two_seed_agrees(
+            "weighted_compose_sum empty",
+            &TwoSeed::weighted_compose_sum(&[], &right, &[], &addend),
+            &addend,
         );
     }
 }

@@ -2212,19 +2212,207 @@ pub(crate) fn duchon_operator_penalty_candidates(
         )?
     };
     if split_tension {
-        // `D1` rows are indexed `collocation_i · dim + axis`, so axis `a` owns
-        // the strided row set `a, a+dim, a+2·dim, …`. `fast_ata` of that slice
-        // is the density-blind support quadrature of `∫(∂f/∂x_a)²` in the final
-        // β-basis.
         for axis in 0..dim {
-            let d1_axis = ops.d1.slice(s![axis..; dim, ..]).to_owned();
-            candidates.push(normalize_penalty_candidate(
-                symmetrize(&fast_ata(&d1_axis)),
-                PenaltySource::OperatorRelevance { axis },
-            )?);
+            candidates.push(duchon_axis_relevance_candidate(&ops.d1, dim, axis)?);
         }
     }
     Ok(candidates)
+}
+
+/// Axis `a`'s relevance penalty `Σ(∂f/∂x_a)²`, emitted from its collocation
+/// factor.
+///
+/// `D1` rows are indexed `collocation_i · dim + axis`, so axis `a` owns the
+/// strided row set `a, a+dim, a+2·dim, …`. That slice `D_a` is the
+/// density-blind support quadrature factor of `∫(∂f/∂x_a)²` in the final
+/// β-basis, so the block is `D_aᵀD_a` by construction and its rank is the
+/// factor's.
+///
+/// Forming the Gram first and passing it through
+/// `ConstructiveQuadratic::try_from_dense_psd` dropped every mode below that
+/// bridge's `dim·1e-10·λ_max` cutoff, which is a topology decision relative to
+/// the spectrum. On the #2735 stress term (MSI 1244869) each axis's factor
+/// resolved 494 modes, and so did its Gram, but the bridge kept 488 or 483
+/// (axis 1: 484). The kept count then flipped 484 ↔ 483 as ℓ moved by 0.4%,
+/// because λ₄₈₃/λ_max went 5.057e-8 → 4.958e-8 across the 5.000e-8 cutoff, and
+/// every trial on the short side was refused at the frozen rank.
+fn duchon_axis_relevance_candidate(
+    d1: &Array2<f64>,
+    dim: usize,
+    axis: usize,
+) -> Result<PenaltyCandidate, BasisError> {
+    let d1_axis = d1.slice(s![axis..; dim, ..]).to_owned();
+    normalize_constructive_penalty_candidate(
+        ConstructiveQuadratic::from_energy_factor(
+            d1_axis,
+            "Duchon operator per-axis relevance penalty",
+        )?,
+        PenaltySource::OperatorRelevance { axis },
+    )
+}
+
+#[cfg(test)]
+mod axis_relevance_factor_rank_2735_tests {
+    use super::*;
+    use ndarray::Array2;
+
+    /// The shipped relevance block keeps every mode its collocation factor
+    /// resolves, including one below the dense bridge's relative cutoff.
+    #[test]
+    fn axis_relevance_block_keeps_every_mode_its_factor_resolves_2735() {
+        // Axis 1 of a 2-axis D1 is `[diag(σ) Vᵀ; 0]`, with V a Householder
+        // reflection so the Gram is not diagonal. One mode sits at σ²/σ²_max =
+        // 1e-9: far above the Gram's rounding band (n·ε ≈ 2.7e-15) and below
+        // the bridge's cutoff n·1e-10 = 1.2e-9.
+        let n = 12usize;
+        let rows_per_axis = 20usize;
+        let sigma_sq: [f64; 12] = [1.0, 0.5, 0.1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-9, 0.0, 0.0, 0.0];
+        let v: Vec<f64> = (0..n).map(|i| 1.0 + 0.37 * i as f64).collect();
+        let v_norm_sq: f64 = v.iter().map(|x| x * x).sum();
+        let mut factor = Array2::<f64>::zeros((rows_per_axis, n));
+        for (row, &s2) in sigma_sq.iter().enumerate() {
+            let sigma = s2.sqrt();
+            for col in 0..n {
+                let identity = if row == col { 1.0 } else { 0.0 };
+                let reflection = identity - 2.0 * v[row] * v[col] / v_norm_sq;
+                factor[[row, col]] = sigma * reflection;
+            }
+        }
+        let mut d1 = Array2::<f64>::zeros((2 * rows_per_axis, n));
+        for row in 0..rows_per_axis {
+            d1[[2 * row, row % n]] = 1.0;
+            d1.row_mut(2 * row + 1).assign(&factor.row(row));
+        }
+
+        let factor_rank = gam_linalg::roundoff::factor_rank_partition(&factor)
+            .expect("factor SVD")
+            .rank;
+        assert_eq!(factor_rank, 9, "the fixture's factor must resolve its 1e-9 mode");
+        // Negative control: the dense bridge drops that mode.
+        let bridged = ConstructiveQuadratic::try_from_dense_psd(
+            symmetrize(&fast_ata(&factor)),
+            "dense bridge control",
+        )
+        .expect("dense bridge");
+        assert_eq!(
+            bridged.factor().nrows(),
+            8,
+            "the dense bridge must truncate the 1e-9 mode, or this fixture cannot tell the routes apart"
+        );
+
+        let candidate = duchon_axis_relevance_candidate(&d1, 2, 1).expect("relevance candidate");
+        assert_eq!(candidate.source, PenaltySource::OperatorRelevance { axis: 1 });
+        let shipped = analyze_penalty_block(candidate.matrix.dense())
+            .expect("shipped block spectrum")
+            .eigenvalues
+            .to_vec();
+        assert_eq!(
+            gam_linalg::roundoff::resolved_eigenvalue_count(&shipped, 0.0),
+            factor_rank,
+            "the shipped relevance block must keep every mode its factor resolves"
+        );
+        let gram_frobenius = stable_euclidean_norm(fast_ata(&factor).iter().copied());
+        assert!(
+            (candidate.normalization_scale - gram_frobenius).abs() <= 1e-12 * gram_frobenius,
+            "the block is normalized by its own Gram's Frobenius norm: {} vs {gram_frobenius}",
+            candidate.normalization_scale
+        );
+    }
+
+    /// The rank flip #2735's seed 0 hit (MSI 1244869), rebuilt on a factor whose
+    /// spectrum is set instead of searched for. On the stress term's 500-column
+    /// relevance Gram of axis 1, `λ₄₈₃/λ_max` was 5.057e-8, 5.013e-8 and
+    /// 4.958e-8 at ℓ = 1.0004, 0.9970 and 0.9929 (builds 1, 6 and 7), across
+    /// the dense bridge's cutoff `500·1e-10 = 5.000e-8`. The bridge kept 484,
+    /// 484 and then 483 modes, and every trial on the short side was refused at
+    /// the frozen rank.
+    ///
+    /// Here `D = U·Σ·Vᵀ` has 500 columns and eight modes, and the eighth mode's
+    /// `σ²/σ²_max` takes the three measured ratios. The factor resolves all
+    /// eight modes at every ℓ, so the shipped rank must be eight at all three.
+    /// The dense bridge must keep 8, 8, 7, or the fixture cannot tell the
+    /// routes apart.
+    #[test]
+    fn axis_relevance_rank_is_continuous_across_the_seed0_length_scales_2735() {
+        let rows_per_axis = 12usize;
+        let columns = 500usize;
+        let steady_ratios: [f64; 7] = [1.0, 0.25, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6];
+        let crossing: [(f64, f64); 3] =
+            [(1.0004, 5.057e-8), (0.9970, 5.013e-8), (0.9929, 4.958e-8)];
+        // Householder reflections, so neither the factor nor its Gram is
+        // diagonal: U acts on the rows and V on the columns.
+        let householder = |n: usize, slope: f64| {
+            let v: Vec<f64> = (0..n).map(|i| 1.0 + slope * i as f64).collect();
+            let v_norm_sq: f64 = v.iter().map(|x| x * x).sum();
+            Array2::from_shape_fn((n, n), |(i, j)| {
+                let identity = if i == j { 1.0 } else { 0.0 };
+                identity - 2.0 * v[i] * v[j] / v_norm_sq
+            })
+        };
+        let u = householder(rows_per_axis, 0.37);
+        let v = householder(columns, 0.011);
+
+        let mut shipped_ranks = Vec::new();
+        let mut bridged_ranks = Vec::new();
+        for (length_scale, ratio) in crossing {
+            let mut sigma_sq = steady_ratios.to_vec();
+            sigma_sq.push(ratio);
+            let mut factor = Array2::<f64>::zeros((rows_per_axis, columns));
+            for (mode, &s2) in sigma_sq.iter().enumerate() {
+                let sigma = s2.sqrt();
+                for row in 0..rows_per_axis {
+                    for col in 0..columns {
+                        factor[[row, col]] += u[[row, mode]] * sigma * v[[col, mode]];
+                    }
+                }
+            }
+            // Axis 1 of a 2-axis D1 owns the odd rows.
+            let mut d1 = Array2::<f64>::zeros((2 * rows_per_axis, columns));
+            for row in 0..rows_per_axis {
+                d1[[2 * row, row]] = 1.0;
+                d1.row_mut(2 * row + 1).assign(&factor.row(row));
+            }
+
+            let factor_rank = gam_linalg::roundoff::factor_rank_partition(&factor)
+                .expect("factor SVD")
+                .rank;
+            assert_eq!(
+                factor_rank,
+                sigma_sq.len(),
+                "ℓ = {length_scale}: the fixture's factor must resolve every mode"
+            );
+            let candidate =
+                duchon_axis_relevance_candidate(&d1, 2, 1).expect("relevance candidate");
+            let shipped = analyze_penalty_block(candidate.matrix.dense())
+                .expect("shipped block spectrum")
+                .eigenvalues
+                .to_vec();
+            let shipped_rank = gam_linalg::roundoff::resolved_eigenvalue_count(&shipped, 0.0);
+            assert_eq!(
+                shipped_rank, factor_rank,
+                "ℓ = {length_scale}, axis 1: the shipped relevance block resolves \
+                 {shipped_rank} modes but its collocation factor resolves {factor_rank}"
+            );
+            let bridged = ConstructiveQuadratic::try_from_dense_psd(
+                symmetrize(&fast_ata(&factor)),
+                "dense bridge control",
+            )
+            .expect("dense bridge");
+            shipped_ranks.push(shipped_rank);
+            bridged_ranks.push(bridged.factor().nrows());
+        }
+        assert_eq!(
+            bridged_ranks,
+            vec![8, 8, 7],
+            "negative control: the dense bridge must keep the crossing mode at ℓ = 1.0004 and \
+             0.9970 and drop it at 0.9929, or this fixture cannot tell the routes apart"
+        );
+        assert!(
+            shipped_ranks.windows(2).all(|pair| pair[0] == pair[1]),
+            "the axis-1 relevance rank must be the same at ℓ = 1.0004, 0.9970 and 0.9929: \
+             {shipped_ranks:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2737,6 +2925,102 @@ mod hybrid_high_dim_psd_tests {
         assert!(
             evals.iter().all(|&v| v >= -3.0 * f64::EPSILON),
             "clamped spectrum {evals:?}"
+        );
+    }
+
+    /// gam#2735: at the stress fixture's order (`d = 6`, `Linear` so `p = 2`,
+    /// `s = 2`) the constrained bending penalty stays PSD at long length scales
+    /// because the hybrid kernel is formed without its origin constant
+    /// `φ(0) = pref · κ^{-2b} · G(0)`, which grows like `ℓ²` and which `Z`
+    /// annihilates. On 500 deterministic centres along the fixture's ψ̄ ladder:
+    /// 1. `Zᵀ K Z` is PSD to the penalty pipeline's own spectral cutoff at every rung;
+    /// 2. `max|K_CC|` stays within `1 + |ψ̄|` of the pure κ → 0 kernel's, because the
+    ///    only divergent term left is the `r² ln κ` null-space piece;
+    /// 3. restoring the constant (today's representative) moves `Zᵀ K Z` only by
+    ///    the roundoff of annihilating it, where today's build is well conditioned;
+    /// 4. the restored constant reproduces materially negative modes at the trial.
+    #[test]
+    fn the_long_length_scale_constrained_penalty_is_psd_without_the_origin_constant_2735() {
+        let d = 6;
+        let s_order = 2usize;
+        let centers = deterministic_centers(d, 500);
+        let effective =
+            duchon_effective_nullspace_order(centers.view(), DuchonNullspaceOrder::Linear);
+        let p_order = duchon_p_from_nullspace_order(effective);
+        assert_eq!(p_order, 2, "the ladder is the fixture's Linear order");
+        let poly_block = polynomial_block_from_order(centers.view(), effective);
+        let z = kernel_constraint_nullspace_from_matrix(poly_block.view())
+            .expect("kernel null-space basis must build");
+        let column_l1 = (0..z.ncols())
+            .map(|col| z.column(col).iter().map(|v| v.abs()).sum::<f64>())
+            .fold(0.0_f64, f64::max);
+        let profile = duchon_radial_profile(p_order, s_order, d).expect("profile builds");
+        let g0 = profile.origin_value().expect("b > 0 has an origin value");
+        let max_abs = |m: &Array2<f64>| m.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        let project = |m: &Array2<f64>| fast_ab(&fast_atb(&z, m), &z);
+        let min_eigenvalue_and_cutoff = |m: &Array2<f64>| {
+            let (evals, _) = FaerEigh::eigh(&symmetrize(m), Side::Lower).expect("eigh");
+            let min = evals.iter().copied().fold(f64::INFINITY, f64::min);
+            (min, spectral_tolerance(&evals))
+        };
+        let (pure_kernel, pure_amp) = duchon_center_kernel_value_matrix(
+            centers.view(),
+            None,
+            s_order as f64,
+            effective,
+            None,
+        )
+        .expect("pure centre kernel must build");
+        let pure_magnitude = pure_amp * max_abs(&pure_kernel);
+        let incumbent_psi_bar = -11.5135_f64;
+        let trial_psi_bar = -16.8665_f64;
+        let mut restored_at_trial = None;
+        for psi_bar in [0.0_f64, -4.0, -8.0, incumbent_psi_bar, -14.19, -15.52825, trial_psi_bar] {
+            let length_scale = (-psi_bar).exp();
+            let (raw_kernel, amp) = duchon_center_kernel_value_matrix(
+                centers.view(),
+                Some(length_scale),
+                s_order as f64,
+                effective,
+                None,
+            )
+            .expect("hybrid centre kernel must build");
+            let kernel = raw_kernel.mapv(|v| v * amp);
+            let omega = project(&kernel);
+            let (min_ev, cutoff) = min_eigenvalue_and_cutoff(&omega);
+            assert!(
+                min_ev >= -cutoff,
+                "(1) ψ̄={psi_bar}: λ_min(ZᵀKZ) = {min_ev:.3e} is below the cutoff −{cutoff:.3e}"
+            );
+            let magnitude = max_abs(&kernel);
+            assert!(
+                magnitude <= (1.0 + psi_bar.abs()) * pure_magnitude,
+                "(2) ψ̄={psi_bar}: max|K_CC| = {magnitude:.3e} exceeds (1 + |ψ̄|) × the pure limit's \
+                 {pure_magnitude:.3e}"
+            );
+            let origin = amp * profile.kappa_scale(1.0 / length_scale) * g0;
+            let restored = kernel.mapv(|v| v + origin);
+            let restored_omega = project(&restored);
+            if psi_bar >= incumbent_psi_bar {
+                let gap = max_abs(&(&restored_omega - &omega));
+                let annihilation_roundoff =
+                    2.0 * z.nrows() as f64 * f64::EPSILON * origin.abs() * column_l1 * column_l1;
+                assert!(
+                    gap <= annihilation_roundoff,
+                    "(3) ψ̄={psi_bar}: restoring φ(0) = {origin:.3e} moves ZᵀKZ by {gap:.3e}, more \
+                     than the roundoff of annihilating it ({annihilation_roundoff:.3e})"
+                );
+            }
+            if psi_bar == trial_psi_bar {
+                restored_at_trial = Some(restored_omega);
+            }
+        }
+        let restored_omega = restored_at_trial.expect("the ladder ends at the trial");
+        let (restored_min, restored_cutoff) = min_eigenvalue_and_cutoff(&restored_omega);
+        assert!(
+            restored_min < -restored_cutoff,
+            "(4) restoring φ(0) at the trial ψ̄ must reproduce the refused spectrum: λ_min = \
+             {restored_min:.3e} against the cutoff −{restored_cutoff:.3e}"
         );
     }
 }

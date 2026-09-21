@@ -289,6 +289,7 @@ fn standard_conformal_substrates(
     family: &LikelihoodSpec,
     fit: &UnifiedFitResult,
     design: &TermCollectionDesign,
+    resolved_termspec: &TermCollectionSpec,
 ) -> Option<crate::inference::full_conformal::ExactFullConformalSubstrate> {
     // #2633: the substrate grows with the training rows. A caller that keeps
     // its training data, or never asks for a conformal interval, can decline it;
@@ -311,24 +312,49 @@ fn standard_conformal_substrates(
         return None;
     }
     let y = response_for_standard_payload(formula, dataset)?;
-    let x = design.design.try_to_dense_arc("standard conformal design").ok()?;
     let normal_matrix = fit.penalized_hessian()?;
-    if x.nrows() != y.len()
-        || normal_matrix.nrows() != x.ncols()
-        || normal_matrix.ncols() != x.ncols()
+    let p = design.design.ncols();
+    if design.design.nrows() != y.len() || normal_matrix.nrows() != p || normal_matrix.ncols() != p
     {
         return None;
     }
     let weights = Array1::<f64>::ones(y.len());
+    // #2901 V17: the substrate persists the training columns the frozen
+    // specification reads, not the dense design they build, and `XᵀX` is taken
+    // over the design those columns rebuild, in row chunks. The rebuilt rows are
+    // checked against the fitted design's first chunk, the positive control that
+    // prediction's rebuild is the design this fit was solved on.
+    let built = crate::inference::full_conformal::ConformalTrainingFrame::from_table(
+        resolved_termspec,
+        &dataset.headers,
+        dataset.values.view(),
+    )
+    .and_then(|frame| {
+        let frame_spec = frame.frame_spec(resolved_termspec, &dataset.headers)?;
+        let check_rows = gam_runtime::resource::rows_for_target_bytes(
+            gam_runtime::resource::LIBRARY_ROW_CHUNK_TARGET_BYTES,
+            p,
+        )
+        .min(y.len());
+        crate::inference::full_conformal::check_rebuilt_design_rows(
+            &frame,
+            &frame_spec,
+            &design.design,
+            0..check_rows,
+        )?;
+        let gram = frame.gram(&frame_spec, p)?;
+        crate::inference::full_conformal::ExactFullConformalSubstrate::from_training_frame_unit_weight_normal_matrix(
+            frame,
+            &gram,
+            &y,
+            &weights,
+            normal_matrix,
+        )
+    });
     // The substrate may legitimately decline this design (rank, shape, or a
     // non-invertible normal matrix). `None` is the contract, but the reason is
     // what explains a fit that silently ships without conformal intervals.
-    match crate::inference::full_conformal::ExactFullConformalSubstrate::from_design_unit_weight_normal_matrix(
-        x.as_ref(),
-        &y,
-        &weights,
-        normal_matrix,
-    ) {
+    match built {
         Ok(substrate) => Some(substrate),
         Err(reason) => {
             log::debug!("exact full-conformal substrate unavailable: {reason}");
@@ -394,7 +420,15 @@ pub fn assemble_standard_payload(
         FittedEstimator::Expectile { tau } => format!("expectile({tau})"),
     };
     let full_conformal =
-        standard_conformal_substrates(&formula, dataset, fit_config, &family, &fit, &design);
+        standard_conformal_substrates(
+            &formula,
+            dataset,
+            fit_config,
+            &family,
+            &fit,
+            &design,
+            &resolved_termspec,
+        );
     let latent_cloglog_state = if family.is_latent_cloglog() {
         Some(saved_latent_cloglog_state_from_fit(&fit).ok_or_else(|| {
             "latent-cloglog-binomial fit did not produce a fitted latent-cloglog state".to_string()

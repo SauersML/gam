@@ -642,6 +642,7 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         // the same across these lanes.
         EstimationError::RemlDidNotConverge { .. } => RemlConvergenceError::new_err(message),
         EstimationError::DominatedCertifiedPlateau { .. } => RemlConvergenceError::new_err(message),
+        EstimationError::OuterDomainFaceRefused { .. } => RemlConvergenceError::new_err(message),
         EstimationError::BlockOrthogonalRemlDidNotConverge { .. } => {
             RemlConvergenceError::new_err(message)
         }

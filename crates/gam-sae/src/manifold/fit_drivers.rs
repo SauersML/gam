@@ -546,30 +546,25 @@ impl SaeManifoldTerm {
         let atoms = self
             .atoms
             .iter()
-            .map(|atom| {
-                let (smooth_penalty_kappa_derivative, geometry_plan) = atom.curvature_state();
-                SaeManifoldAtomSnapshot {
-                    decoder_coefficients: atom.decoder_coefficients().clone(),
-                    decoder_frame: atom.decoder_frame.clone(),
-                    smooth_penalty: atom.smooth_penalty().clone(),
-                    // Pointer-cheap handle clones; `basis_values`/`basis_jacobian`
-                    // are rebuilt from these + coords on restore, avoiding the
-                    // dominant `O(N·M·(1+d))` snapshot copy (see
-                    // `SaeManifoldMutableState`).
-                    basis_evaluator: atom.basis_evaluator.clone(),
-                    basis_second_jet: atom.basis_second_jet.clone(),
-                    homotopy_eta: atom.homotopy_eta,
-                    chart_canonicalized: atom.chart_canonicalized,
-                    reduced_column_map: atom.reduced_column_map.clone(),
-                    smooth_penalty_kappa_derivative,
-                    geometry_plan,
-                    caller_managed_basis: atom.basis_evaluator.is_none().then(|| {
-                        (
-                            atom.basis_values.clone(),
-                            atom.basis_jacobian.clone(),
-                        )
-                    }),
-                }
+            .map(|atom| SaeManifoldAtomSnapshot {
+                decoder_coefficients: atom.decoder_coefficients().clone(),
+                decoder_frame: atom.decoder_frame.clone(),
+                smooth_penalty: atom.smooth_penalty().clone(),
+                // Pointer-cheap handle clones; `basis_values`/`basis_jacobian`
+                // are rebuilt from these + coords on restore, avoiding the
+                // dominant `O(N·M·(1+d))` snapshot copy (see
+                // `SaeManifoldMutableState`).
+                basis_evaluator: atom.basis_evaluator.clone(),
+                basis_second_jet: atom.basis_second_jet.clone(),
+                homotopy_eta: atom.homotopy_eta,
+                chart_canonicalized: atom.chart_canonicalized,
+                reduced_column_map: atom.reduced_column_map.clone(),
+                caller_managed_basis: atom.basis_evaluator.is_none().then(|| {
+                    (
+                        atom.basis_values.clone(),
+                        atom.basis_jacobian.clone(),
+                    )
+                }),
             })
             .collect();
         SaeManifoldMutableState {
@@ -626,10 +621,6 @@ impl SaeManifoldTerm {
                         }
                         && decoder_frame_matches
                         && atom.smooth_penalty() == &saved.smooth_penalty
-                        && atom.curvature_state_matches(
-                            saved.smooth_penalty_kappa_derivative.as_ref(),
-                            saved.geometry_plan.as_ref(),
-                        )
                         && atom.homotopy_eta.to_bits() == saved.homotopy_eta.to_bits()
                         && evaluator_matches
                         && second_jet_matches
@@ -1103,6 +1094,7 @@ impl SaeManifoldTerm {
         }
         let transport = solve_basis_transport(new_phi.view(), old_phi.view())?;
         let old_decoder = self.atoms[atom_idx].decoder_coefficients().clone();
+        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty().clone();
         let new_decoder = fast_ab(&transport, &old_decoder);
         let (image_scale, max_abs) = image_invariance_extremes(
             old_phi.view(),
@@ -1121,9 +1113,14 @@ impl SaeManifoldTerm {
         let base: Arc<dyn SaeBasisEvaluator> = new_evaluator.clone();
         atom.basis_evaluator = Some(base);
         atom.basis_second_jet = Some(new_evaluator);
-        // S, ∂S/∂κ and the geometry plan all move by the transport's congruence, so
-        // a trial κ after this gauge rebuilds S(κ) in the new chart (#2935, #2947).
-        atom.install_chart_transport(new_phi, new_jet, new_decoder, transport.view())?;
+        let transported_penalty =
+            transport_smooth_penalty_for_decoder(transport.view(), old_smooth_penalty.view())?;
+        atom.install_reparameterized_basis(
+            new_phi,
+            new_jet,
+            new_decoder,
+            transported_penalty,
+        )?;
         Ok(())
     }
 
@@ -1588,12 +1585,6 @@ impl SaeManifoldTerm {
         chart: PreparedUnitSpeedChart,
     ) -> Result<(), String> {
         let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty().clone();
-        let transported_kappa_derivative = self.atoms[atom_idx]
-            .smooth_penalty_kappa_derivative()?
-            .map(|derivative| {
-                transport_smooth_penalty_for_decoder(chart.decoder_transport.view(), derivative.view())
-            })
-            .transpose()?;
         let flat = Array1::from_iter(chart.new_coords.iter().copied());
         self.assignment.coords[atom_idx].set_flat(flat.view());
         let atom = &mut self.atoms[atom_idx];
@@ -1606,7 +1597,6 @@ impl SaeManifoldTerm {
             chart.new_jet,
             chart.new_decoder,
             transported_penalty,
-            transported_kappa_derivative,
         )?;
         atom.chart_canonicalized = true;
         Ok(())
@@ -1856,12 +1846,6 @@ impl SaeManifoldTerm {
         // transported smoothness Gram (`B̃ᵀ S̃ B̃ = Bᵀ S B`, same as the affine
         // gauge pass and the d = 1 path).
         let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty().clone();
-        let transported_kappa_derivative = self.atoms[atom_idx]
-            .smooth_penalty_kappa_derivative()?
-            .map(|derivative| {
-                transport_smooth_penalty_for_decoder(repar.decoder_transport.view(), derivative.view())
-            })
-            .transpose()?;
         let flat = Array1::from_iter(new_coords.iter().copied());
         self.assignment.coords[atom_idx].set_flat(flat.view());
         let atom = &mut self.atoms[atom_idx];
@@ -1874,7 +1858,6 @@ impl SaeManifoldTerm {
             new_jet,
             repar.new_decoder,
             transported_penalty,
-            transported_kappa_derivative,
         )?;
         atom.chart_canonicalized = true;
         Ok(true)
@@ -1947,12 +1930,6 @@ impl SaeManifoldTerm {
         // transported smoothness Gram (`B̃ᵀ S̃ B̃ = Bᵀ S B`, same as every other
         // canonicalization path).
         let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty().clone();
-        let transported_kappa_derivative = self.atoms[atom_idx]
-            .smooth_penalty_kappa_derivative()?
-            .map(|derivative| {
-                transport_smooth_penalty_for_decoder(repar.decoder_transport.view(), derivative.view())
-            })
-            .transpose()?;
         let flat = Array1::from_iter(new_coords.iter().copied());
         self.assignment.coords[atom_idx].set_flat(flat.view());
         let atom = &mut self.atoms[atom_idx];
@@ -1965,7 +1942,6 @@ impl SaeManifoldTerm {
             new_jet,
             repar.new_decoder,
             transported_penalty,
-            transported_kappa_derivative,
         )?;
         atom.chart_canonicalized = true;
         Ok(true)
@@ -2038,12 +2014,6 @@ impl SaeManifoldTerm {
         // transported smoothness Gram (`B̃ᵀ S̃ B̃ = Bᵀ S B`, same as every other
         // canonicalization path).
         let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty().clone();
-        let transported_kappa_derivative = self.atoms[atom_idx]
-            .smooth_penalty_kappa_derivative()?
-            .map(|derivative| {
-                transport_smooth_penalty_for_decoder(repar.decoder_transport.view(), derivative.view())
-            })
-            .transpose()?;
         let flat = Array1::from_iter(new_coords.iter().copied());
         self.assignment.coords[atom_idx].set_flat(flat.view());
         let atom = &mut self.atoms[atom_idx];
@@ -2056,7 +2026,6 @@ impl SaeManifoldTerm {
             new_jet,
             repar.new_decoder,
             transported_penalty,
-            transported_kappa_derivative,
         )?;
         atom.chart_canonicalized = true;
         Ok(true)

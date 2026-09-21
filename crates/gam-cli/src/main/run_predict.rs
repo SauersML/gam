@@ -833,8 +833,14 @@ fn build_saved_location_scale_survival_alo_input(
             )?
         }
     };
+    // The fitted likelihood drops `S(entry)` for a row entering at the origin (#2695).
+    let entry_active = age_entry
+        .iter()
+        .map(|&entry| entry > gam::families::survival::ENTRY_AT_ORIGIN_THRESHOLD)
+        .collect::<Vec<_>>();
     let input = gam_predict::SavedLocationScaleSurvivalAloInput::new(
         event,
+        entry_active,
         derivative_guard,
         time_base,
         threshold,

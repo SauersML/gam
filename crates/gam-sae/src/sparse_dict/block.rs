@@ -47,6 +47,7 @@
 //! block-tiled exactly as the atom lane tiles columns.
 
 use super::scoring::TopSSelector;
+use gam_math::roundoff::gram_schmidt_residual_band;
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis};
 use rayon::prelude::*;
 use std::fmt;
@@ -414,11 +415,19 @@ pub fn route_row_blocks(gates: &[f32], k: usize) -> Vec<(u32, f32)> {
 /// Modified Gram–Schmidt orthonormalisation of the rows in place, substituting a
 /// canonical axis `e_j` for any row that collapses (so a rank-deficient seed
 /// still yields `b` orthonormal rows). f64 accumulation, f32 storage.
+///
+/// A row collapses when its residual after the one projection pass is not
+/// resolved from zero, at or below [`gram_schmidt_residual_band`] for that pass
+/// against the rows already kept and the row's own input norm (#2469). A
+/// canonical axis is admitted by the same band at unit norm. Both tests scale
+/// with the row, so the orthonormalisation is invariant under a power-of-two
+/// rescaling of the block.
 pub(super) fn gram_schmidt_rows(block: &mut Array2<f32>) {
     let (b, p) = block.dim();
     let mut basis: Vec<Vec<f64>> = Vec::with_capacity(b);
     for r in 0..b {
         let mut v: Vec<f64> = (0..p).map(|c| block[[r, c]] as f64).collect();
+        let input_norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
         for u in basis.iter() {
             let dot: f64 = v.iter().zip(u).map(|(a, b)| a * b).sum();
             for (vc, uc) in v.iter_mut().zip(u) {
@@ -426,7 +435,7 @@ pub(super) fn gram_schmidt_rows(block: &mut Array2<f32>) {
             }
         }
         let mut norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if norm <= 1.0e-9 {
+        if !(norm > gram_schmidt_residual_band(1, basis.len(), p, input_norm)) {
             // Collapsed: pick the first canonical axis orthogonal to the basis.
             let mut installed = false;
             for axis in 0..p {
@@ -439,7 +448,7 @@ pub(super) fn gram_schmidt_rows(block: &mut Array2<f32>) {
                     }
                 }
                 let en = e.iter().map(|x| x * x).sum::<f64>().sqrt();
-                if en > 1.0e-9 {
+                if en > gram_schmidt_residual_band(1, basis.len(), p, 1.0) {
                     for ec in e.iter_mut() {
                         *ec /= en;
                     }

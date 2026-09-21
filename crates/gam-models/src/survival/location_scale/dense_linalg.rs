@@ -1,76 +1,5 @@
 use super::*;
 
-pub(crate) fn safe_fast_xt_diag_x(x: &Array2<f64>, weights: &Array1<f64>) -> Array2<f64> {
-    let sanitized = sanitize_survival_weight_vector(weights);
-    fast_xt_diag_x(x, &sanitized)
-}
-
-/// Horvitz-Thompson outer-subsample row mask. When `mask` is `None` this
-/// returns `weighted_crossprod_dense(left, weights, right)` verbatim, which is
-/// the byte-identical pre-refactor expression. When `mask` is `Some(m)`, the
-/// per-row weight `weights[i]` is replaced by `weights[i] * m[i]` before the
-/// cross product. The math invariant is that each survival-LS assembly site
-/// is row-additive — `Σ_i x_i y_iᵀ · w_i` — so per-row HT-masking is unbiased.
-#[inline]
-pub(crate) fn mxtwx(
-    left: &Array2<f64>,
-    weights: &Array1<f64>,
-    right: &Array2<f64>,
-    mask: Option<&Array1<f64>>,
-) -> Result<Array2<f64>, String> {
-    match mask {
-        Some(m) => weighted_crossprod_dense(left, &(weights * m), right),
-        None => weighted_crossprod_dense(left, weights, right),
-    }
-}
-
-#[inline]
-pub(crate) fn mxtwxd(
-    x: &Array2<f64>,
-    weights: &Array1<f64>,
-    mask: Option<&Array1<f64>>,
-) -> Array2<f64> {
-    match mask {
-        Some(m) => safe_fast_xt_diag_x(x, &(weights * m)),
-        None => safe_fast_xt_diag_x(x, weights),
-    }
-}
-
-/// Multiply a per-row weight by the HT mask. The `None` branch returns the
-/// caller's array unmodified (zero-copy borrow), so any downstream
-/// `X.t().dot(&out)` / `out.sum()` / `out.dot(&other)` aggregate is
-/// byte-identical to the pre-refactor path. The `Some` branch produces an
-/// owned masked copy.
-#[inline]
-pub(crate) fn mask_row_vec<'a>(
-    weights: &'a Array1<f64>,
-    mask: Option<&Array1<f64>>,
-) -> std::borrow::Cow<'a, Array1<f64>> {
-    match mask {
-        Some(m) => std::borrow::Cow::Owned(weights * m),
-        None => std::borrow::Cow::Borrowed(weights),
-    }
-}
-
-/// HT-mask-aware variant of [`weighted_crossprod_psi_maps`]. `None` is
-/// byte-identical to the pre-refactor call. `Some(m)` multiplies the
-/// per-row weight view by `m` before the cross product.
-#[inline]
-pub(crate) fn mxtwx_psi(
-    left: crate::custom_family::CustomFamilyPsiLinearMapRef<'_>,
-    weights: ArrayView1<'_, f64>,
-    right: crate::custom_family::CustomFamilyPsiLinearMapRef<'_>,
-    mask: Option<&Array1<f64>>,
-) -> Result<Array2<f64>, gam_problem::CustomFamilyError> {
-    match mask {
-        Some(m) => {
-            let masked = &weights * m;
-            weighted_crossprod_psi_maps(left, masked.view(), right)
-        }
-        None => weighted_crossprod_psi_maps(left, weights, right),
-    }
-}
-
 #[inline]
 pub(crate) fn should_use_survival_rayon(work_items: u64) -> bool {
     rayon::current_num_threads() > 1
@@ -226,19 +155,6 @@ pub(crate) fn weighted_crossprod_dense_stable(
         .into());
     }
     Ok(out)
-}
-
-pub(crate) fn weighted_crossprod_dense(
-    left: &Array2<f64>,
-    weights: &Array1<f64>,
-    right: &Array2<f64>,
-) -> Result<Array2<f64>, String> {
-    weighted_crossprod_dense_with_parallelism(
-        left,
-        weights,
-        right,
-        gam_linalg::faer_ndarray::pool_parallelism(),
-    )
 }
 
 pub(crate) fn weighted_crossprod_dense_with_parallelism(
@@ -415,29 +331,4 @@ pub(crate) fn embed_tail_columns(
     let mut out = Array2::<f64>::zeros((local.nrows(), total_cols));
     out.slice_mut(s![.., tail_range]).assign(local);
     Ok(out)
-}
-
-pub(crate) fn assign_block(
-    target: &mut Array2<f64>,
-    row_start: usize,
-    col_start: usize,
-    block: &Array2<f64>,
-) {
-    let row_end = row_start + block.nrows();
-    let col_end = col_start + block.ncols();
-    target
-        .slice_mut(s![row_start..row_end, col_start..col_end])
-        .assign(block);
-}
-
-pub(crate) fn assign_symmetric_block(
-    target: &mut Array2<f64>,
-    row_start: usize,
-    col_start: usize,
-    block: &Array2<f64>,
-) {
-    assign_block(target, row_start, col_start, block);
-    if row_start != col_start || block.nrows() != block.ncols() {
-        assign_block(target, col_start, row_start, &block.t().to_owned());
-    }
 }

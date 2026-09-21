@@ -248,11 +248,11 @@ impl ContextBlocks {
             let evaluation = block
                 .explained_variance_gradient(frame)
                 .map_err(|error| ContextResponseError::Response { context, error })?;
-            error += weights[context] * evaluation.discarded_error;
+            error += weights[context] * evaluation.discarded_error.value;
             horizontal_gradient.scaled_add(-weights[context], &evaluation.horizontal_gradient);
             rows.push(ContextRow {
-                error: evaluation.discarded_error,
-                total_variance: block.total_variance(),
+                error: evaluation.discarded_error.value,
+                total_variance: block.total_variance().value,
             });
         }
         let standard_error = sampled.then(|| {

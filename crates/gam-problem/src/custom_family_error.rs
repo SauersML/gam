@@ -804,8 +804,10 @@ pub enum CustomFamilyError {
     /// boundary (`FitFailure::ending_the_fit`) can name the inner solve that
     /// decided the fit (gam#2943). Nothing else reads it. Jeffreys arming reads
     /// `last_refusal`, because the search stepped away from every earlier refusal.
-    #[error("custom-family optimization error in fit_custom_family outer smoothing: {reason}")]
+    #[error("custom-family optimization error in {route}: {reason}")]
     OuterSmoothingFailed {
+        /// The outer search that refused, which the rendered message names (gam#2938).
+        route: OuterSearchRoute,
         reason: String,
         last_refusal: Option<Box<CustomFamilyError>>,
         search_inner_refusal: Option<Box<CustomFamilyError>>,
@@ -815,6 +817,25 @@ pub enum CustomFamilyError {
         /// same sentence here (#2937).
         outer_error: std::sync::Arc<crate::EstimationError>,
     },
+}
+
+/// The outer search a whole-search refusal came from, so the refusal names the search that
+/// refused (gam#2938).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OuterSearchRoute {
+    /// `fit_custom_family`'s outer smoothing search.
+    CustomFamily,
+    /// The n-block exact-joint spatial driver's outer search.
+    SpatialExactJoint,
+}
+
+impl std::fmt::Display for OuterSearchRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::CustomFamily => "fit_custom_family outer smoothing",
+            Self::SpatialExactJoint => "the n-block exact-joint spatial outer search",
+        })
+    }
 }
 
 impl CustomFamilyError {

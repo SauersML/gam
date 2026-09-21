@@ -183,10 +183,9 @@ fn time_nullspace_shrinkage_adds_precision_for_uncontrolled_time_direction() {
         initial_beta: Some(Array1::zeros(2)),
         ..base_time_block()
     };
-    let no_origin_entries = Array1::from_elem(block.design_entry.nrows(), false);
 
     assert!(
-        install_time_nullspace_shrinkage_penalty(&mut block, 0, &no_origin_entries)
+        install_time_nullspace_shrinkage_penalty(&mut block, 0)
             .expect("time nullspace shrinkage should build"),
         "expected a shrinkage penalty to be appended",
     );
@@ -203,99 +202,6 @@ fn time_nullspace_shrinkage_adds_precision_for_uncontrolled_time_direction() {
             );
         }
     }
-}
-
-/// gnomon#2336: a row entering at the time origin has no entry factor, so its
-/// entry evaluation carries no function-metric mass. The ridge must not read an
-/// origin row's entry design, and a fully landmarked block gets the exit metric.
-#[test]
-fn time_nullspace_shrinkage_metric_ignores_origin_entry_rows_2336() {
-    let (design_entry, design_exit) = full_span_time_endpoint_designs();
-    let block_with = |entry: DesignMatrix| TimeBlockInput {
-        design_entry: entry,
-        design_exit: design_exit.clone(),
-        design_derivative_exit: DesignMatrix::from(Array2::ones((3, 2))),
-        offset_entry: Array1::zeros(3),
-        offset_exit: Array1::zeros(3),
-        derivative_offset_exit: Array1::from_elem(
-            3,
-            DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
-        ),
-        penalties: vec![array![[1.0, 0.0], [0.0, 0.0]]],
-        nullspace_dims: vec![1],
-        initial_beta: Some(Array1::zeros(2)),
-        ..base_time_block()
-    };
-    let ridge = |mut block: TimeBlockInput, entry_at_origin: &Array1<bool>| {
-        assert!(
-            install_time_nullspace_shrinkage_penalty(&mut block, 0, entry_at_origin)
-                .expect("time nullspace shrinkage should build"),
-            "expected a shrinkage penalty to be appended",
-        );
-        block.penalties.last().expect("appended ridge").clone()
-    };
-
-    let one_origin_row = array![false, false, true];
-    let reference = ridge(block_with(design_entry.clone()), &one_origin_row);
-    let moved_origin_row = ridge(
-        block_with(DesignMatrix::from(array![[1.0, 0.0], [0.0, 1.0], [7.5, -3.0]])),
-        &one_origin_row,
-    );
-    assert_eq!(
-        reference, moved_origin_row,
-        "the ridge read the entry design of a row that enters at the origin"
-    );
-
-    let landmarked = ridge(block_with(design_entry), &Array1::from_elem(3, true));
-    let exit_metric = ridge(block_with(design_exit.clone()), &Array1::from_elem(3, false));
-    for i in 0..2 {
-        for j in 0..2 {
-            assert_close(
-                landmarked[[i, j]],
-                exit_metric[[i, j]],
-                1e-12,
-                &format!("landmarked block metric ({i},{j})"),
-            );
-        }
-    }
-}
-
-/// gnomon#2336: the pilot baseline slope solves the fitted row objective, so a
-/// row entering at the time origin contributes no entry factor there either.
-/// Moving the entry offsets of landmarked rows must leave the pilot slope
-/// unchanged, while the same move on delayed-entry rows must reach it.
-#[test]
-fn pooled_survival_baseline_ignores_origin_entry_offsets_2336() {
-    let n = 12;
-    let z = Array1::from_shape_fn(n, |i| (i as f64 - 5.5) / 4.0);
-    let event = Array1::from_shape_fn(n, |i| if (i * 7) % 12 < 7 { 1.0 } else { 0.0 });
-    let weights = Array1::from_elem(n, 1.0);
-    let q1 = Array1::from_shape_fn(n, |i| -0.8 + 0.1 * i as f64);
-    let qd1 = Array1::from_elem(n, 1.0);
-    let entry_low = Array1::from_elem(n, -2.5);
-    let entry_high = Array1::from_elem(n, -1.2);
-    let pilot = |entry_at_origin: &Array1<bool>, q0: &Array1<f64>| {
-        pooled_survival_baseline(&event, &weights, entry_at_origin, &z, q0, &q1, &qd1, 1.0)
-    };
-    let origin = Array1::from_elem(n, true);
-    let delayed = Array1::from_elem(n, false);
-
-    // The pilot returns exactly 0 when it declines to solve.
-    let origin_slope = pilot(&origin, &entry_low);
-    assert!(
-        origin_slope.is_finite() && origin_slope != 0.0,
-        "the landmarked pilot must solve for a slope; got {origin_slope:e}"
-    );
-    assert_eq!(
-        origin_slope,
-        pilot(&origin, &entry_high),
-        "the pilot read the entry offsets of rows that enter at the origin"
-    );
-    assert_ne!(
-        pilot(&delayed, &entry_low),
-        pilot(&delayed, &entry_high),
-        "the entry offsets must reach a delayed-entry pilot, or this gate is vacuous"
-    );
 }
 
 #[test]
@@ -316,10 +222,9 @@ fn time_nullspace_shrinkage_is_noop_for_full_rank_time_penalty() {
         initial_beta: Some(Array1::zeros(2)),
         ..base_time_block()
     };
-    let no_origin_entries = Array1::from_elem(block.design_entry.nrows(), false);
 
     assert!(
-        !install_time_nullspace_shrinkage_penalty(&mut block, 0, &no_origin_entries)
+        !install_time_nullspace_shrinkage_penalty(&mut block, 0)
             .expect("full-rank time penalty should be accepted"),
         "full-rank time penalties should not get another penalty",
     );
@@ -370,7 +275,6 @@ fn make_closed_form_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         jeffreys_armed: true,
         latent_law: None,
         n,
-        entry_at_origin: Arc::new(Array1::from_elem(n, false)),
         event: Arc::new(event),
         weights: Arc::new(weights),
         z: Arc::new(z.insert_axis(Axis(1))),
@@ -971,7 +875,6 @@ fn test_family(
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![0.0]),
         weights: Arc::new(array![1.0]),
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
@@ -1441,7 +1344,6 @@ fn exact_flex_row_matches_rigid_closed_form_without_deviations() {
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![1.0]),
         weights: Arc::new(array![1.7]),
         z: Arc::new(array![0.25].insert_axis(Axis(1))),
@@ -1494,7 +1396,6 @@ fn exact_flex_row_matches_rigid_closed_form_without_deviations() {
         block_states[2].eta[0],
         family.z[[0, 0]],
         family.weights[0],
-        family.entry_weight(0),
         family.event[0],
         family.derivative_guard,
         family.probit_frailty_scale(),
@@ -1514,7 +1415,7 @@ fn exact_flex_row_matches_rigid_closed_form_without_deviations() {
 
 #[test]
 fn row_primary_closed_form_rejects_negative_infinite_signed_margin() {
-    let err = row_primary_closed_form(f64::INFINITY, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1e-6, 1.0)
+    let err = row_primary_closed_form(f64::INFINITY, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1e-6, 1.0)
         .expect_err("exact closed-form row should reject -inf signed margins");
     assert!(err.contains("non-finite signed margin"));
 }
@@ -1560,7 +1461,7 @@ fn marginal_block_hessian_cancels_in_saturated_regime() {
     // cancellation must be ULP-exact for every η.
     for &eta in &[0.5_f64, 1.0, 2.0, 5.0, 10.0, 40.0, 100.0, 500.0, 988.0] {
         let (_nll, _grad, hess) =
-            row_primary_closed_form(eta, eta, qd1, g, z, w, w, 0.0, derivative_guard, probit_scale)
+            row_primary_closed_form(eta, eta, qd1, g, z, w, 0.0, derivative_guard, probit_scale)
                 .expect("rigid censored row");
         let sum = hess[0][0] + hess[1][1];
         assert!(
@@ -1576,7 +1477,7 @@ fn marginal_block_hessian_cancels_in_saturated_regime() {
     // 1/η² by Mills asymptotic M(−η) = η + 1/η + O(1/η³).
     for &eta in &[40.0_f64, 100.0, 500.0, 988.0] {
         let (_nll, _grad, hess) =
-            row_primary_closed_form(eta, eta, qd1, g, z, w, w, 1.0, derivative_guard, probit_scale)
+            row_primary_closed_form(eta, eta, qd1, g, z, w, 1.0, derivative_guard, probit_scale)
                 .expect("rigid event row");
         let sum = hess[0][0] + hess[1][1];
         let bound = 2.0 / (eta * eta);
@@ -1591,9 +1492,9 @@ fn marginal_block_hessian_cancels_in_saturated_regime() {
     // Cross-check at η = 988 (the user's large-scale saturation):
     // both kinds of rows hit the predicted floor exactly.
     let (_, _, ev) =
-        row_primary_closed_form(988.0, 988.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1e-6, 1.0).unwrap();
+        row_primary_closed_form(988.0, 988.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1e-6, 1.0).unwrap();
     let (_, _, ce) =
-        row_primary_closed_form(988.0, 988.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1e-6, 1.0).unwrap();
+        row_primary_closed_form(988.0, 988.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1e-6, 1.0).unwrap();
     let ev_sum = ev[0][0] + ev[1][1];
     let ce_sum = ce[0][0] + ce[1][1];
     assert!(
@@ -1608,7 +1509,7 @@ fn marginal_block_hessian_cancels_in_saturated_regime() {
 
 #[test]
 fn row_primary_closed_form_rejects_nan_signed_margin() {
-    let err = row_primary_closed_form(f64::NAN, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1e-6, 1.0)
+    let err = row_primary_closed_form(f64::NAN, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1e-6, 1.0)
         .expect_err("exact closed-form row should reject NaN signed margins");
     assert!(err.contains("non-finite signed margin"));
 }
@@ -1794,7 +1695,6 @@ fn oracle_rigid_family(
         jeffreys_armed: true,
         latent_law: None,
         n,
-        entry_at_origin: Arc::new(Array1::from_elem(n, false)),
         event: Arc::new(Array1::from(event.to_vec())),
         weights: Arc::new(Array1::from(weights.to_vec())),
         z: Arc::new(z_col),
@@ -2051,19 +1951,15 @@ fn rigid_feature_program_scalar_pullback_matches_generic_and_witnesses_932() {
     let mut max_rel = 0.0_f64;
     for _ in 0..4000 {
         let p = [nx() * 1.5, nx() * 1.5, 0.5 + nx().abs() * 2.0, nx() * 1.2];
-        let inputs = {
-            let wi = 0.5 + nx().abs();
-            RigidRowInputs {
-                row: 0,
-                wi,
-                wi_entry: wi,
-                di: if nx() > 0.0 { 1.0 } else { 0.0 },
-                z_sum: nx() * 1.2,
-                covariance_ones: 0.7 + nx().abs(),
-                probit_scale: 0.6 + nx().abs(),
-                qd1_lower: -1.0,
-                anchor: None,
-            }
+        let inputs = RigidRowInputs {
+            row: 0,
+            wi: 0.5 + nx().abs(),
+            di: if nx() > 0.0 { 1.0 } else { 0.0 },
+            z_sum: nx() * 1.2,
+            covariance_ones: 0.7 + nx().abs(),
+            probit_scale: 0.6 + nx().abs(),
+            qd1_lower: -1.0,
+            anchor: None,
         };
 
         let dense_vars: [Order2<4>; 4] = std::array::from_fn(|a| Order2::variable(p[a], a));
@@ -2084,7 +1980,6 @@ fn rigid_feature_program_scalar_pullback_matches_generic_and_witnesses_932() {
                 0.0,
             ),
             inputs.wi,
-            inputs.wi_entry,
             inputs.di,
             inputs.probit_scale,
             follow_up_varying_flag::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>(),
@@ -2129,7 +2024,6 @@ fn exact_flex_row_value_matches_rigid_with_zero_score_and_link_coefficients() {
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![0.0]),
         weights: Arc::new(array![0.9]),
         z: Arc::new(array![-0.35].insert_axis(Axis(1))),
@@ -2190,7 +2084,6 @@ fn exact_flex_row_value_matches_rigid_with_zero_score_and_link_coefficients() {
         block_states[2].eta[0],
         family.z[[0, 0]],
         family.weights[0],
-        family.entry_weight(0),
         family.event[0],
         family.derivative_guard,
         family.probit_frailty_scale(),
@@ -2277,7 +2170,6 @@ fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip()
             jeffreys_armed: true,
             latent_law: None,
             n: 1,
-            entry_at_origin: Arc::new(Array1::from_elem(1, false)),
             event: Arc::new(array![fix.event]),
             weights: Arc::new(array![fix.weight]),
             z: Arc::new(array![fix.z].insert_axis(Axis(1))),
@@ -2476,7 +2368,6 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![event]),
         weights: Arc::new(array![weight]),
         z: Arc::new(array![z_row].insert_axis(Axis(1))),
@@ -2920,7 +2811,6 @@ fn link_flex_family_supports_second_order_exact_outer_path() {
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![0.0]),
         weights: Arc::new(array![1.0]),
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
@@ -2969,7 +2859,6 @@ fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![1.0]),
         weights: Arc::new(array![1.0]),
         z: Arc::new(array![0.15].insert_axis(Axis(1))),
@@ -3033,7 +2922,6 @@ fn censored_rows_still_reject_invalid_time_derivative() {
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![0.0]),
         weights: Arc::new(array![1.0]),
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
@@ -3106,7 +2994,6 @@ fn exact_newton_evaluation_propagates_invalid_rows() {
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![1.0]),
         weights: Arc::new(array![1.0]),
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
@@ -3172,7 +3059,6 @@ fn time_constraints_use_exact_derivative_guard_rows() {
         jeffreys_armed: true,
         latent_law: None,
         n: 2,
-        entry_at_origin: Arc::new(Array1::from_elem(2, false)),
         event: Arc::new(array![0.0, 1.0]),
         weights: Arc::new(array![1.0, 1.0]),
         z: Arc::new(array![0.0, 0.0].insert_axis(Axis(1))),
@@ -3268,7 +3154,6 @@ fn time_block_constraints_synthesize_qd1_rows_when_stored_constraints_missing() 
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![1.0]),
         weights: Arc::new(array![1.0]),
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
@@ -3343,7 +3228,6 @@ fn time_block_max_feasible_step_uses_synthesized_qd1_rows() {
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![1.0]),
         weights: Arc::new(array![1.0]),
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
@@ -3409,7 +3293,6 @@ fn coupled_qd1_guard_limits_time_step_before_post_update_projection() {
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![0.0]),
         weights: Arc::new(array![1.0]),
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
@@ -3488,7 +3371,6 @@ fn timewiggle_tail_step_is_clipped_before_it_can_flip_derivative() {
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![0.0]),
         weights: Arc::new(array![1.0]),
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
@@ -3544,7 +3426,6 @@ fn time_block_post_update_rejects_infeasible_beta_instead_of_projecting() {
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![0.0]),
         weights: Arc::new(array![1.0]),
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
@@ -3635,7 +3516,6 @@ fn time_block_post_update_rejects_qd1_when_no_linear_constraints() {
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![1.0]),
         weights: Arc::new(array![1.0]),
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
@@ -3722,7 +3602,6 @@ fn time_block_post_update_errors_when_current_violates_qd1() {
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![1.0]),
         weights: Arc::new(array![1.0]),
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
@@ -3795,7 +3674,6 @@ fn time_block_feasible_step_stays_inside_derivative_guard() {
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![0.0]),
         weights: Arc::new(array![1.0]),
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
@@ -3896,7 +3774,6 @@ fn mixed_blockwise_exact_newton_preserves_sparse_block_hessians() {
         jeffreys_armed: true,
         latent_law: None,
         n: 2,
-        entry_at_origin: Arc::new(Array1::from_elem(2, false)),
         event: Arc::new(array![1.0, 0.0]),
         weights: Arc::new(array![1.0, 0.8]),
         z: Arc::new(array![0.1, -0.2].insert_axis(Axis(1))),
@@ -4235,7 +4112,6 @@ fn make_block_psi_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         jeffreys_armed: true,
         latent_law: None,
         n,
-        entry_at_origin: Arc::new(Array1::from_elem(n, false)),
         event: Arc::new(event),
         weights: Arc::new(weights),
         z: Arc::new(z.insert_axis(Axis(1))),
@@ -4377,7 +4253,6 @@ fn make_flex_baseline_psi_test_fixture() -> (
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![1.0]),
         weights: Arc::new(array![0.9]),
         z: Arc::new(array![0.2].insert_axis(Axis(1))),
@@ -4587,61 +4462,6 @@ fn rigid_baseline_dispatch_matches_direct_and_owned_workspace_without_fd() {
         rel_diff_array2_survival(&direct_drift, &owned_drift) < 1e-13,
         "baseline Hessian drift direct/workspace mismatch",
     );
-}
-
-/// gam#2930: the one-pass contraction `⟨W, ∂_θ H²[e_a, e_b]⟩` along a baseline-chart coordinate
-/// is the contraction with `W` of the workspace's column-by-column `{∂_θ H²[e_b, e_a]}`, to
-/// roundoff, on every chart axis.
-#[test]
-fn rigid_baseline_contracted_trace_hessian_psi_matches_column_contraction_2930() {
-    let (family, hyper_layout) = make_rigid_baseline_psi_test_family(12);
-    let states = block_psi_test_block_states(&family, 0.15, 0.25);
-    let specs = vec![dummy_blockspec(0), dummy_blockspec(1), dummy_blockspec(1)];
-    let workspace = family
-        .exact_newton_joint_psi_workspace_with_options(
-            &states,
-            &specs,
-            &hyper_layout,
-            &BlockwiseFitOptions::default(),
-        )
-        .expect("construct rigid baseline workspace")
-        .expect("rigid baseline workspace is available");
-    let total = 2;
-    let weight = array![[0.7, -0.2], [-0.2, 0.4]];
-    assert!(!hyper_layout.is_empty(), "the chart fixture must carry baseline coordinates");
-    for axis in 0..hyper_layout.len() {
-        assert!(
-            workspace
-                .contracted_trace_hessian_psi_axes()
-                .expect("availability query")
-                .contains(&axis),
-            "chart axis {axis} must serve the one-pass contraction"
-        );
-        let contracted = workspace
-            .contracted_trace_hessian_psi(axis, &weight)
-            .expect("one-pass contraction")
-            .expect("chart axis contraction is served");
-        let mut reference = Array2::<f64>::zeros((total, total));
-        for b in 0..total {
-            let mut unit = Array1::<f64>::zeros(total);
-            unit[b] = 1.0;
-            let columns = workspace
-                .hessian_second_directional_derivative_all_beta_axes(axis, &unit)
-                .expect("column-by-column third information derivative")
-                .expect("chart axis third information derivative is served");
-            for a in 0..total {
-                reference[[a, b]] = (&weight * &columns[a]).sum();
-            }
-        }
-        assert!(
-            reference.iter().any(|value| value.abs() > 1e-8),
-            "chart axis {axis}: the reference contraction is identically zero, so it grades nothing"
-        );
-        assert!(
-            rel_diff_array2_survival(&contracted, &reference) < 1e-12,
-            "chart axis {axis}: one-pass {contracted:?} against column contraction {reference:?}"
-        );
-    }
 }
 
 #[test]
@@ -5340,7 +5160,6 @@ fn make_flex_no_wiggle_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         jeffreys_armed: true,
         latent_law: None,
         n,
-        entry_at_origin: Arc::new(Array1::from_elem(n, false)),
         event: Arc::new(event),
         weights: Arc::new(weights),
         z: Arc::new(z.insert_axis(Axis(1))),
@@ -6061,7 +5880,6 @@ fn flex_contraction_fixture_family(
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![fixture.event]),
         weights: Arc::new(array![fixture.weight]),
         z: Arc::new(array![fixture.z].insert_axis(Axis(1))),
@@ -6286,7 +6104,6 @@ fn make_time_guard_family(deriv_coeff: f64, deriv_offset: f64) -> SurvivalMargin
         jeffreys_armed: true,
         latent_law: None,
         n: 1,
-        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
         event: Arc::new(array![1.0]),
         weights: Arc::new(array![1.0]),
         z: Arc::new(array![0.0].insert_axis(Axis(1))),
@@ -6510,7 +6327,6 @@ fn zz_diag_failure1_flex_vs_rigid_vs_fdhess() {
             jeffreys_armed: true,
             latent_law: None,
             n: 1,
-            entry_at_origin: Arc::new(Array1::from_elem(1, false)),
             event: Arc::new(array![event]),
             weights: Arc::new(array![weight]),
             z: Arc::new(array![zr].insert_axis(Axis(1))),
@@ -6920,219 +6736,6 @@ fn rigid_survival_all_axes_build_once_equals_per_axis_sweep_979() {
             let scale = expected.iter().fold(1.0_f64, |s, x| s.max(x.abs()));
             assert!(assembled[axis].iter().zip(&expected)
                 .all(|(actual, expected)| (actual - expected).abs() < 2e-12 * scale));
-        }
-    }
-}
-
-/// gnomon#2337: the tiled symmetric all-axes tensor pullback reassociates its row,
-/// primary and group sums, so it is held to accuracy rather than bits. Against a
-/// double-double reference of `D_{ajk} = Σ_i Σ_{αβγ} T_i[α][β][γ] J_i[α,a] J_i[β,j] J_i[γ,k]`,
-/// its largest error scaled by the entry's term mass `Σ_i Σ_{αβγ} |T J J J|` must not
-/// exceed that of the ten-Gram assembly it replaced, rebuilt here, and must sit inside
-/// the `γ_m` bound of its longest sum. Its fixed group order makes it independent of
-/// the pool width, pinned bitwise at 1, 4 and 12 workers. `n = 5000` rows span 79
-/// tiles, so groups fold more than one tile.
-#[test]
-fn rigid_survival_all_axes_tensor_pullback_is_accurate_and_width_invariant_2337() {
-    use crate::row_kernel::RowKernel;
-
-    let n = 5_000usize;
-    let z: Vec<f64> = (0..n).map(|r| ((r as f64) * 0.37).sin() * 1.1).collect();
-    let weights: Vec<f64> = (0..n).map(|r| 0.7 + 0.5 * ((r % 5) as f64) / 5.0).collect();
-    let event: Vec<f64> = (0..n).map(|r| ((r % 3 == 0) as u8) as f64).collect();
-    let marginal_design = Array2::from_shape_fn((n, 6), |(r, j)| {
-        0.2 + 0.05 * ((r * (j + 1)) as f64 * 0.011).cos() + 0.11 * (j as f64)
-            - 0.013 * (r as f64) / (n as f64)
-    });
-    let slope_design = Array2::from_shape_fn((n, 4), |(r, j)| {
-        0.1 + 0.07 * ((r + 3 * j) as f64 * 0.017).sin() - 0.09 * (j as f64)
-    });
-    let beta_marginal = Array1::from_shape_fn(6, |j| 0.03 * (j as f64) - 0.08);
-    let beta_slope = Array1::from_shape_fn(4, |j| 0.05 - 0.04 * (j as f64));
-    let mut family = oracle_rigid_family(n, &z, &weights, &event, None);
-    family.marginal_design = DesignMatrix::from(marginal_design.clone());
-    family
-        .slope_layout
-        .replace_coefficient_design(DesignMatrix::from(slope_design.clone()));
-    let block_states = vec![
-        ParameterBlockState {
-            beta: array![0.65],
-            eta: Array1::zeros(n),
-        },
-        ParameterBlockState {
-            beta: beta_marginal.clone(),
-            eta: marginal_design.dot(&beta_marginal),
-        },
-        ParameterBlockState {
-            beta: beta_slope.clone(),
-            eta: slope_design.dot(&beta_slope),
-        },
-    ];
-    let kernel = SurvivalMarginalSlopeRowKernel::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>::new(
-        family,
-        block_states,
-    );
-    let p = RowKernel::n_coefficients(&kernel);
-    assert_eq!(p, 11);
-    // Signed, row-varying and symmetric in (a, b, c): built from a + b + c and the
-    // elementary symmetric products.
-    let tensors: Vec<[[[f64; 4]; 4]; 4]> = (0..n)
-        .map(|row| {
-            std::array::from_fn(|a| {
-                std::array::from_fn(|b| {
-                    std::array::from_fn(|c| {
-                        let sum = (a + b + c) as f64;
-                        let products = (a * b + b * c + a * c + a * b * c) as f64;
-                        ((row as f64) * 0.013 + 0.7 * sum).sin() * (1.0 + 0.1 * products)
-                    })
-                })
-            })
-        })
-        .collect();
-
-    // jacobian[row][axis][primary]
-    let jacobian: Vec<Vec<[f64; 4]>> = (0..n)
-        .map(|row| {
-            (0..p)
-                .map(|axis| {
-                    let mut direction = vec![0.0_f64; p];
-                    direction[axis] = 1.0;
-                    kernel.jacobian_action(row, &direction)
-                })
-                .collect()
-        })
-        .collect();
-    let two_sum = |a: f64, b: f64| {
-        let sum = a + b;
-        let b_part = sum - a;
-        (sum, (a - (sum - b_part)) + (b - b_part))
-    };
-    let two_product = |a: f64, b: f64| {
-        let product = a * b;
-        (product, a.mul_add(b, -product))
-    };
-    // Double-double reference and absolute term mass at sorted indices a ≤ j ≤ k.
-    let mut reference = std::collections::HashMap::new();
-    for a in 0..p {
-        for j in a..p {
-            for k in j..p {
-                let (mut high, mut low, mut mass) = (0.0_f64, 0.0_f64, 0.0_f64);
-                for row in 0..n {
-                    let (ja, jj, jk) = (&jacobian[row][a], &jacobian[row][j], &jacobian[row][k]);
-                    for alpha in 0..4 {
-                        for beta in 0..4 {
-                            for gamma in 0..4 {
-                                let t = tensors[row][alpha][beta][gamma];
-                                let (p1, e1) = two_product(t, ja[alpha]);
-                                let (p2, e2) = two_product(p1, jj[beta]);
-                                let e2 = e2 + e1 * jj[beta];
-                                let (p3, e3) = two_product(p2, jk[gamma]);
-                                let e3 = e3 + e2 * jk[gamma];
-                                let (sum, error) = two_sum(high, p3);
-                                let (renormalized, rest) = two_sum(sum, low + error + e3);
-                                high = renormalized;
-                                low = rest;
-                                mass += (t * ja[alpha] * jj[beta] * jk[gamma]).abs();
-                            }
-                        }
-                    }
-                }
-                reference.insert((a, j, k), (high + low, mass));
-            }
-        }
-    }
-    let worst_scaled_error = |axes: &[Array2<f64>]| {
-        let mut worst = 0.0_f64;
-        for a in 0..p {
-            for j in 0..p {
-                for k in 0..p {
-                    let mut index = [a, j, k];
-                    index.sort_unstable();
-                    let (exact, mass) = reference[&(index[0], index[1], index[2])];
-                    if mass > 0.0 {
-                        worst = worst.max((axes[a][[j, k]] - exact).abs() / mass);
-                    }
-                }
-            }
-        }
-        worst
-    };
-
-    // The ten-Gram assembly this pullback replaced, per axis a:
-    // Σ_{α≤β} sym_{αβ}(J_αᵀ diag(Σ_γ T[α][β][γ] J_γ[:,a]) J_β).
-    let identity = Array2::<f64>::eye(p);
-    let packed = kernel
-        .jacobian_action_matrix(identity.view())
-        .expect("dense J·I projection");
-    let blocks: [Array2<f64>; 4] =
-        std::array::from_fn(|primary| packed.slice(s![.., primary * p..(primary + 1) * p]).to_owned());
-    let former: Vec<Array2<f64>> = (0..p)
-        .map(|axis| {
-            let mut total = Array2::<f64>::zeros((p, p));
-            for left in 0..4 {
-                for right in left..4 {
-                    let row_weights = Array1::from_shape_fn(n, |row| {
-                        (0..4)
-                            .map(|direction| tensors[row][left][right][direction] * blocks[direction][[row, axis]])
-                            .sum::<f64>()
-                    });
-                    let gram = gam_linalg::faer_ndarray::fast_xt_diag_y(
-                        &blocks[left],
-                        &row_weights,
-                        &blocks[right],
-                    );
-                    total.scaled_add(1.0, &gram);
-                    if left != right {
-                        total.scaled_add(1.0, &gram.t());
-                    }
-                }
-            }
-            total
-        })
-        .collect();
-
-    let pullback = |workers: usize| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .build()
-            .expect("test worker pool")
-            .install(|| kernel.all_axes_primary_tensor_pullback(&tensors))
-            .expect("all-axes tensor pullback")
-    };
-    let one_worker = pullback(1);
-    let tiled_error = worst_scaled_error(&one_worker);
-    let former_error = worst_scaled_error(&former);
-    // Longest sum: three products, three primary sums of four and the n rows.
-    let terms = (3 + 3 * 4 + n) as f64;
-    let gamma_bound = terms * f64::EPSILON / 2.0 / (1.0 - terms * f64::EPSILON / 2.0);
-    eprintln!(
-        "[2337 pullback] worst scaled error: tiled {tiled_error:e}, former ten-Gram {former_error:e}, gamma_m bound {gamma_bound:e}"
-    );
-    assert!(
-        tiled_error <= former_error,
-        "tiled pullback worst scaled error {tiled_error:e} exceeds the former assembly's {former_error:e}"
-    );
-    assert!(
-        tiled_error <= gamma_bound,
-        "tiled pullback worst scaled error {tiled_error:e} exceeds the gamma_m bound {gamma_bound:e}"
-    );
-    for axis in &one_worker {
-        for j in 0..p {
-            for k in 0..p {
-                assert_eq!(axis[[j, k]].to_bits(), axis[[k, j]].to_bits(), "axis matrix not symmetric");
-            }
-        }
-    }
-    for workers in [4, 12] {
-        let wide = pullback(workers);
-        for (axis, (narrow, wide)) in one_worker.iter().zip(&wide).enumerate() {
-            for (index, (x, y)) in narrow.iter().zip(wide.iter()).enumerate() {
-                assert_eq!(
-                    x.to_bits(),
-                    y.to_bits(),
-                    "axis {axis} entry {index}: 1 worker {x:e} vs {workers} workers {y:e}"
-                );
-            }
         }
     }
 }
@@ -8152,7 +7755,6 @@ fn make_timewiggle_test_family(
         jeffreys_armed: true,
         latent_law: None,
         n,
-        entry_at_origin: Arc::new(Array1::from_elem(n, false)),
         event: Arc::new(event),
         weights: Arc::new(weights),
         z: Arc::new(z),
@@ -8453,7 +8055,6 @@ fn rigid_row_primary_mixed_in_z_matches_finite_difference() {
                         let inputs_at = |z_value: f64| RigidRowInputs {
                             row: 0,
                             wi: w,
-                            wi_entry: w,
                             di: d,
                             z_sum: z_value,
                             covariance_ones,
@@ -8534,14 +8135,13 @@ fn time_shrinkage_metric_excludes_timewiggle_placeholder_columns() {
     // The same block through the all-columns metric is exactly the production
     // refusal: the placeholder columns have no value support.
     let mut all_columns = block.clone();
-    let no_origin_entries = Array1::from_elem(block.design_entry.nrows(), false);
-    let refused = install_time_nullspace_shrinkage_penalty(&mut all_columns, 0, &no_origin_entries);
+    let refused = install_time_nullspace_shrinkage_penalty(&mut all_columns, 0);
     assert!(
         refused.is_err(),
         "the control must refuse: an all-columns metric over zero placeholders is singular"
     );
     assert!(
-        install_time_nullspace_shrinkage_penalty(&mut block, 2, &no_origin_entries)
+        install_time_nullspace_shrinkage_penalty(&mut block, 2)
             .expect("value-block metric with placeholders excluded"),
         "expected a shrinkage penalty on the value block"
     );
@@ -8635,7 +8235,6 @@ fn release_measure_rigid_contracted_towers_vs_generic_tower_932() {
         let inputs = RigidRowInputs {
             row: 0,
             wi: w,
-            wi_entry: w,
             di: d,
             z_sum: z,
             covariance_ones: 1.0,
@@ -8805,108 +8404,84 @@ fn joint_hessian_and_jeffreys_information_exist_above_512_columns() {
     assert_eq!(information, hessian);
 }
 
-/// gam#2971: a survival intercept is the root of its calibration identity, not
-/// of its seed. A deep-tail exit index (`q₁ = −7.7`, the planted index at the
-/// fixture's `t = 1e-3` floor, where the marginal failure probability is about
-/// 7e-15) is solved cold, then from a warm slot seeded half a unit away. Each
-/// root is certified independently: its log-tail residual lies within the
-/// resolution the solve publishes, so each sits within that resolution over the
-/// log slope of the true root, and two such roots differ by at most twice it.
-/// The absolute probability residual this replaces met its `1e-12` at the seed
-/// and returned the seed as the root.
+/// #2900 row 6.11: the rigid survival row jet reaches the device through the
+/// dispatch policy's fused-kernel crossover, and the device returns the per-row
+/// CPU program. On a CUDA host the fixture is sized at the probed runtime's
+/// `fused_kernel_min_n`, so the production cache build selects the device, and
+/// every channel of every row is compared with `row_kernel(row)` at the
+/// `RowKernel::batched_value_grad_hess_all` contract (≤ 1e-9). Two rows in
+/// seven are shifted 5 units into either probability tail. On a host without a
+/// device, nothing is admitted: the check reduces to admission, and the report
+/// says `device_selected=false`.
 #[test]
-fn survival_intercept_root_does_not_follow_its_warm_seed_2971() {
-    use super::family::{
-        SurvivalInterceptSlotKind, SurvivalInterceptWarmStartCache, hash_intercept_warm_start_key,
-        new_intercept_warm_start_cache,
+fn rigid_row_jet_device_admission_and_parity_2900() {
+    use crate::gpu_kernels::survival_rowjet::survival_rigid_row_vgh_device_selected;
+    use crate::row_kernel::{RowKernel, RowSet, build_row_kernel_cache};
+    use gam_gpu::policy::GpuDispatchPolicy;
+
+    let floor = GpuDispatchPolicy::MIN_CALIBRATABLE_FUSED_KERNEL_N;
+    assert!(
+        !survival_rigid_row_vgh_device_selected(floor - 1).expect("admission below the floor"),
+        "no reachable policy admits a fused batch below {floor} rows"
+    );
+    let runtime = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
+        .expect("CUDA runtime resolution must not fault");
+    let n = runtime.map_or(64, |runtime| runtime.policy().fused_kernel_min_n.max(floor));
+
+    let mut family = make_closed_form_test_family(n);
+    let into_tails = |values: &Array1<f64>| {
+        Array1::from_iter(values.iter().enumerate().map(|(row, &value)| match row % 7 {
+            3 => value + 5.0,
+            5 => value - 5.0,
+            _ => value,
+        }))
     };
-    let score_runtime = test_deviation_runtime();
-    let link_runtime = test_deviation_runtime();
-    let h_dim = score_runtime.basis_dim();
-    let w_dim = link_runtime.basis_dim();
-    let q0v = -8.5_f64;
-    let q1v = -7.7_f64;
-    let qd1v = 0.9_f64;
-    let gv = 0.4_f64;
-    let make_family = |cache: Option<Arc<SurvivalInterceptWarmStartCache>>| {
-        SurvivalMarginalSlopeFamily {
-            jeffreys_armed: true,
-            latent_law: None,
-            n: 1,
-            entry_at_origin: Arc::new(Array1::from_elem(1, false)),
-            event: Arc::new(array![1.0]),
-            weights: Arc::new(array![1.0]),
-            z: Arc::new(array![0.3].insert_axis(Axis(1))),
-            score_covariance: unit_score_covariance(),
-            gaussian_frailty_sd: None,
-            family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
-            derivative_guard: 1e-6,
-            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
-            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
-            design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
-            offset_entry: Arc::new(array![q0v]),
-            offset_exit: Arc::new(array![q1v]),
-            derivative_offset_exit: Arc::new(array![qd1v]),
-            marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
-            slope_layout: (DesignMatrix::from(Array2::zeros((1, 0)))).into(),
-            score_warp: Some(score_runtime.clone()),
-            link_dev: Some(link_runtime.clone()),
-            influence_absorber: None,
-            time_linear_constraints: None,
-            time_wiggle_knots: None,
-            time_wiggle_degree: None,
-            time_wiggle_ncols: 0,
-            intercept_warm_starts: cache,
+    family.offset_entry = Arc::new(into_tails(&family.offset_entry));
+    family.offset_exit = Arc::new(into_tails(&family.offset_exit));
+    let block_states = closed_form_block_states(&family, 0.4);
+    let kernel = SurvivalMarginalSlopeRowKernel::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>::new(
+        family,
+        block_states,
+    );
+
+    let selected =
+        survival_rigid_row_vgh_device_selected(n).expect("survival row-jet admission must not fault");
+    assert_eq!(
+        selected,
+        runtime.is_some(),
+        "a {n}-row batch at the probed runtime's fused-kernel crossover must reach the device \
+         exactly when a device resolves"
+    );
+    let cache = build_row_kernel_cache(&kernel, &RowSet::All).expect("rigid row-kernel cache");
+    let mut worst_gap = 0.0_f64;
+    let mut worst_row = 0;
+    for row in 0..n {
+        let (value, grad, hess) = RowKernel::row_kernel(&kernel, row).expect("per-row CPU program");
+        let channels = std::iter::once((cache.nll[row], value))
+            .chain(cache.gradients[row].iter().copied().zip(grad))
+            .chain(
+                cache.hessians[row]
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .zip(hess.iter().flatten().copied()),
+            );
+        for (batched, per_row) in channels {
+            let gap = (batched - per_row).abs() / 1.0_f64.max(batched.abs()).max(per_row.abs());
+            if !(gap <= worst_gap) {
+                worst_gap = gap;
+                worst_row = row;
+            }
         }
-    };
-    let beta_h = Array1::from_iter((0..h_dim).map(|k| 0.04 * (k as f64 + 1.3).sin()));
-    let beta_w = Array1::from_iter((0..w_dim).map(|k| 0.035 * (k as f64 + 0.7).cos()));
-
-    let cold = make_family(None);
-    let (a_cold, density_cold) = cold
-        .solve_row_survival_intercept_with_slot(q1v, gv, Some(&beta_h), Some(&beta_w), None)
-        .expect("cold survival intercept solve");
-
-    let cache = new_intercept_warm_start_cache(1);
-    cache.store(
-        0,
-        SurvivalInterceptSlotKind::Exit,
-        a_cold + 0.5,
-        hash_intercept_warm_start_key(Some(&beta_h), Some(&beta_w)),
-    );
-    let warm = make_family(Some(Arc::clone(&cache)));
-    let (a_warm, density_warm) = warm
-        .solve_row_survival_intercept_with_slot(
-            q1v,
-            gv,
-            Some(&beta_h),
-            Some(&beta_w),
-            Some((0, SurvivalInterceptSlotKind::Exit)),
-        )
-        .expect("warm-seeded survival intercept solve");
-
-    // The log slope at the root is `|T′|/T`, from the returned density and the
-    // target tail `Φ(q₁)`; the resolution is the production certificate's.
-    let log_target = crate::probability::normal_logcdf(q1v);
-    let log_slope = density_cold / log_target.exp();
-    let terms = score_runtime.breakpoints().len() + link_runtime.breakpoints().len() + 1;
-    let rounding = crate::latent_anchor::anchor_residual_rounding(log_target, terms);
-    let resolution = crate::latent_anchor::anchor_residual_resolution(a_cold, log_slope, rounding);
-    let bound = 2.0 * resolution / log_slope;
-    let gap = (a_warm - a_cold).abs();
+    }
     eprintln!(
-        "survival intercept 2971: a_cold={a_cold:.15e} a_warm={a_warm:.15e} gap={gap:.3e} \
-         bound={bound:.3e} density_cold={density_cold:.6e} density_warm={density_warm:.6e} \
-         log_slope={log_slope:.6e}"
+        "#2900 survival row jet: n={n} device_selected={selected} \
+         worst_relative_gap={worst_gap:.3e} at row {worst_row}"
     );
     assert!(
-        log_slope.is_finite() && log_slope > 0.0,
-        "the cold root must carry a finite positive log slope: {log_slope:.3e}"
-    );
-    assert!(
-        gap <= bound,
-        "a warm seed half a unit from the root moved the certified intercept: a_cold={a_cold:.15e} \
-         a_warm={a_warm:.15e} gap={gap:.3e} > bound={bound:.3e}"
+        worst_gap <= 1e-9,
+        "survival row jet: batched channel differs from the per-row program by {worst_gap:e} \
+         (relative) at row {worst_row}, device_selected={selected}"
     );
 }
 

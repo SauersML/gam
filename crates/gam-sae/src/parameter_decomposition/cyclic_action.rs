@@ -43,6 +43,25 @@
 //! from a column-pivoted QR solve, after `σ_min(B_S)` is resolved above its backward-error band
 //! (`gam_linalg::roundoff::factor_singular_band`).
 //!
+//! # The frequency edit
+//!
+//! A proper subset's joint operator turns `X_U e_a`, the least-squares coordinates of the row on
+//! `B_S`. Those are the characters `D(ω_k a)` only when the rest of the row,
+//! `Σ_{k∉S} U_k D(ω_k a)`, is orthogonal to `B_S`. Otherwise the operator also turns whatever of the
+//! other planes projects onto `B_S`. [`frequency_edit`] turns each cycled row's own components instead,
+//! with the characters of its cycle position as coordinates:
+//!
+//! ```text
+//! e_a  ↦  e_a + Σ_{k∈S} U_k (D(ω_k (a + s)) − D(ω_k a)).
+//! ```
+//!
+//! It is exact for the planes it names, and leaves every other plane and every row outside the cycle
+//! fixed. On the full set both edits are the shift. On the
+//! trained modular-addition table (`p = 113`, pos0, every test pair at every shift `2..112`), the six
+//! most powerful planes miss the shifted reference's argmax in 10 of 992,118 rows under the frequency
+//! edit and in 40,687 under the joint operator, whose miss is not monotone in the plane count
+//! (mpd-lead's torch measurement `freq_edit_diag`, acn112, 09-19).
+//!
 //! # What reproducing the shift does not show
 //!
 //! `B` has `p` columns, so for `p ≤ d` it is generically of full column rank, and a linear edit
@@ -64,8 +83,9 @@
 //!
 //! A plane program sends its frequency subset in the enumerative subset code and the `2d|S|`
 //! basis reals as one [`LatticeCode`] at a declared precision. The decoder rebuilds the left
-//! inverse from the basis and every angle from `p`, `k` and `s`, so no angle and no inverse is
-//! transmitted. Distortion belongs to the decoded artifact, measured where it executes.
+//! inverse from the basis (the frequency edit needs none: its coordinates are characters) and every
+//! angle from `p`, `k` and `s`, so no angle and no inverse is transmitted. Distortion belongs to the
+//! decoded artifact, measured where it executes.
 
 use super::codec::{BitString, subset_code_len_bits};
 use super::precision::{DeclaredPrecision, LatticeCode};
@@ -448,6 +468,94 @@ pub fn rotation_edit(
     })
 }
 
+/// The frequency edit of one plane subset at one shift. Each cycled row's own components in the planes of
+/// `frequencies` turn by `ω_k s`, and nothing else in the table moves. Row `r_a` becomes
+/// `e_a + Σ_{k∈S} U_k (D(ω_k (a + s)) − D(ω_k a))`, so the edited table is `E + left · rightᵀ` with
+/// `right = U_S` and row `r_a` of `left` holding `D(ω_k (a + s)) − D(ω_k a)` for each `k ∈ S`. A row
+/// outside the cycle has a zero `left` row, so it stays exactly fixed, as the native reference keeps it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CyclicFrequencyEdit {
+    pub frequencies: Vec<usize>,
+    pub shift: usize,
+    pub left: Array2<f64>,
+    pub right: Array2<f64>,
+}
+
+/// The frequency edit of `frequencies` at `shift` under `cycle`, from a plane basis `U_S` (`d × 2|S|`),
+/// the closed form or a decoded artifact. Every coordinate is a character of the row's cycle position,
+/// so no inverse is solved and no basis condition is needed.
+pub fn frequency_edit(
+    cycle: &RowCycle,
+    basis: ArrayView2<'_, f64>,
+    frequencies: &[usize],
+    shift: usize,
+) -> Result<CyclicFrequencyEdit, CyclicActionError> {
+    check_frequencies(frequencies, cycle.plane_count())?;
+    let plane_columns = 2 * frequencies.len();
+    if basis.ncols() != plane_columns {
+        return Err(CyclicActionError::ShapeMismatch {
+            what: "basis columns against 2|S|",
+            expected: plane_columns,
+            found: basis.ncols(),
+        });
+    }
+    if let Some(((row, col), _)) = basis.indexed_iter().find(|(_, value)| !value.is_finite()) {
+        return Err(CyclicActionError::NonFinite { row, col });
+    }
+    let length = cycle.length();
+    let mut left = Array2::<f64>::zeros((cycle.table_rows(), plane_columns));
+    for (position, &row) in cycle.rows().iter().enumerate() {
+        let target = (position + shift % length) % length;
+        for (plane, &frequency) in frequencies.iter().enumerate() {
+            let (sin_at, cos_at) = plane_angle(frequency, position, length).sin_cos();
+            let (sin_to, cos_to) = plane_angle(frequency, target, length).sin_cos();
+            left[[row, 2 * plane]] = cos_to - cos_at;
+            left[[row, 2 * plane + 1]] = sin_to - sin_at;
+        }
+    }
+    Ok(CyclicFrequencyEdit {
+        frequencies: frequencies.to_vec(),
+        shift,
+        left,
+        right: basis.to_owned(),
+    })
+}
+
+/// A factored edit `E + left · rightᵀ` of a table at one shift.
+pub trait FactoredShiftEdit {
+    fn shift(&self) -> usize;
+    fn left(&self) -> ArrayView2<'_, f64>;
+    fn right(&self) -> ArrayView2<'_, f64>;
+}
+
+impl FactoredShiftEdit for CyclicRotationEdit {
+    fn shift(&self) -> usize {
+        self.shift
+    }
+
+    fn left(&self) -> ArrayView2<'_, f64> {
+        self.left.view()
+    }
+
+    fn right(&self) -> ArrayView2<'_, f64> {
+        self.right.view()
+    }
+}
+
+impl FactoredShiftEdit for CyclicFrequencyEdit {
+    fn shift(&self) -> usize {
+        self.shift
+    }
+
+    fn left(&self) -> ArrayView2<'_, f64> {
+        self.left.view()
+    }
+
+    fn right(&self) -> ArrayView2<'_, f64> {
+        self.right.view()
+    }
+}
+
 /// The finite family a [`ShiftResidual`] covers: every cycled row and every column at one shift.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShiftRegion {
@@ -489,7 +597,7 @@ impl ShiftResidual {
     }
 }
 
-/// Compare the edited table of `edit` with the row permutation of `edit.shift` under `cycle`.
+/// Compare the edited table of `edit` with the row permutation of its shift under `cycle`.
 ///
 /// A residual entry `e_{r_a j} + Σ_t l_{r_a t} r_{jt} − e_{r_{a+s} j}` has `2|S|` product terms,
 /// each rounding once and passing at most `2|S| − 1` additions among the products, one where
@@ -498,15 +606,16 @@ impl ShiftResidual {
 pub fn shift_residual(
     table: ArrayView2<'_, f64>,
     cycle: &RowCycle,
-    edit: &CyclicRotationEdit,
+    edit: &impl FactoredShiftEdit,
 ) -> Result<ShiftResidual, CyclicActionError> {
     check_table(table, cycle)?;
     let (rows, width) = table.dim();
-    let components = edit.left.ncols();
+    let (left, right, shift) = (edit.left(), edit.right(), edit.shift());
+    let components = left.ncols();
     for (what, expected, found) in [
-        ("edit left rows against table rows", rows, edit.left.nrows()),
-        ("edit right rows against table width", width, edit.right.nrows()),
-        ("edit right components against left components", components, edit.right.ncols()),
+        ("edit left rows against table rows", rows, left.nrows()),
+        ("edit right rows against table width", width, right.nrows()),
+        ("edit right components against left components", components, right.ncols()),
     ] {
         if expected != found {
             return Err(CyclicActionError::ShapeMismatch { what, expected, found });
@@ -515,10 +624,10 @@ pub fn shift_residual(
     let length = cycle.length();
     let mut target = vec![None; rows];
     for (position, &row) in cycle.rows().iter().enumerate() {
-        target[row] = Some(cycle.rows()[(position + edit.shift % length) % length]);
+        target[row] = Some(cycle.rows()[(position + shift % length) % length]);
     }
     let mut out = ShiftResidual {
-        region: ShiftRegion { shift: edit.shift, cycled_rows: length, columns: width },
+        region: ShiftRegion { shift, cycled_rows: length, columns: width },
         max_abs_residual: 0.0,
         max_residual_band: 0.0,
         max_abs_fixed_row_change: 0.0,
@@ -529,7 +638,7 @@ pub fn shift_residual(
             let mut change = 0.0;
             let mut absolute_sum = 0.0;
             for component in 0..components {
-                let term = edit.left[[row, component]] * edit.right[[column, component]];
+                let term = left[[row, component]] * right[[column, component]];
                 change += term;
                 absolute_sum = up(absolute_sum + up(term.abs()));
             }
@@ -1215,6 +1324,106 @@ mod tests {
         let certified = up(orthogonal.slack + orthogonal.coupling_bound);
         assert!(orthogonal.miss <= certified, "orthogonal per-plane miss {:e} above {certified:e}", orthogonal.miss);
         assert!(certified < orthogonal.spacing, "bound {certified:e} does not resolve spacing {:e}", orthogonal.spacing);
+    }
+
+    /// The largest `evaluation_band(1, |entry|)` over a matrix: one rounding per entry.
+    fn one_rounding(matrix: ArrayView2<'_, f64>) -> f64 {
+        matrix.iter().fold(0.0_f64, |acc, value| acc.max(evaluation_band(1, value.abs())))
+    }
+
+    #[test]
+    fn the_frequency_edit_of_every_plane_reproduces_every_shift_within_a_derived_bound() {
+        let table = plant(&ALL, false, false, 2951).0;
+        let cycle = declared_cycle();
+        let planes = cyclic_planes(table.view(), &cycle).expect("closed-form planes");
+        let basis = planes.basis(&ALL).expect("every plane");
+        let full = full_basis(planes.mean.view(), basis.view());
+        let unused_block = Array2::<f64>::zeros((basis.ncols(), basis.ncols()));
+        let spacing = minimum_row_spacing(&table);
+        for shift in 1..LENGTH {
+            let edit = frequency_edit(&cycle, basis.view(), &ALL, shift).expect("a declared cycle");
+            let residual = shift_residual(table.view(), &cycle, &edit).expect("matching shapes");
+            // `e_a = B φ_a + δ_a`, and each computed coordinate is `φ_{a+s} − φ_a` from the same characters
+            // with one rounding `η`. So the exact residual of the computed factors is
+            // `δ_a − δ_{a+s} + U η`: at most `2 r_E + ‖U‖ max|η|`.
+            let reconstruction = defects(&table, full.view(), &ALL, unused_block.view(), shift).reconstruction;
+            let bound = up(up(2.0 * reconstruction) + up(inf_norm_upper(basis.view()) * one_rounding(edit.left.view())));
+            assert!(
+                residual.max_abs_residual <= up(bound + residual.max_residual_band),
+                "shift {shift}: residual {:e} exceeds its derived bound {bound:e}",
+                residual.max_abs_residual
+            );
+            // Magnitude floor, as for the joint operator: the bound resolves the row spacing.
+            assert!(
+                up(bound + residual.max_residual_band) < spacing,
+                "shift {shift}: derived bound {bound:e} does not resolve the row spacing {spacing:e}"
+            );
+            // The row outside the cycle is not touched at all.
+            assert!(edit.left.row(FIXED_ROW).iter().all(|&value| value == 0.0));
+            assert_eq!(residual.max_abs_fixed_row_change, 0.0);
+        }
+    }
+
+    #[test]
+    fn a_frequency_edit_turns_only_its_planes_where_the_joint_operator_turns_the_others_too() {
+        // Three mutually skewed planes; the subset is the middle one.
+        let table = plant(&ALL, false, false, 2951).0;
+        let cycle = declared_cycle();
+        let planes = cyclic_planes(table.view(), &cycle).expect("closed-form planes");
+        let every = planes.basis(&ALL).expect("every plane");
+        let full = full_basis(planes.mean.view(), every.view());
+        let unused_block = Array2::<f64>::zeros((every.ncols(), every.ncols()));
+        let subset = [2];
+        let basis = planes.basis(&subset).expect("plane 2");
+        let norm_basis = inf_norm_upper(basis.view());
+        for shift in 1..LENGTH {
+            let reconstruction = defects(&table, full.view(), &ALL, unused_block.view(), shift).reconstruction;
+            let edit = frequency_edit(&cycle, basis.view(), &subset, shift).expect("a declared cycle");
+            let joint = rotation_edit(table.view(), planes.mean.view(), basis.view(), &subset, LENGTH, shift)
+                .expect("a resolved basis");
+            // The target turns plane 2 of every cycled row and keeps planes 1 and 3: `B φ'_a`, with φ'_a
+            // the characters at `a` except plane 2's at `a + s`. The frequency edit's exact row is
+            // `B φ'_a + δ_a + U_2 η`.
+            let slack = up(reconstruction + up(norm_basis * one_rounding(edit.left.view())));
+            let (mut worst, mut joint_miss) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for (position, &row) in CYCLE.iter().enumerate() {
+                let mut turned = characters(&ALL, position);
+                let ahead = characters(&ALL, (position + shift) % LENGTH);
+                turned[3] = ahead[3];
+                turned[4] = ahead[4];
+                for j in 0..WIDTH {
+                    let (mut target, mut target_sum) = (0.0, 0.0);
+                    for t in 0..full.ncols() {
+                        let term = full[[j, t]] * turned[t];
+                        target += term;
+                        target_sum = up(target_sum + up(term.abs()));
+                    }
+                    let target_band = evaluation_band(full.ncols(), target_sum);
+                    for (factors, miss) in [(&edit.left, &mut worst), (&joint.left, &mut joint_miss)] {
+                        let (mut edited, mut edited_sum) = (table[[row, j]], table[[row, j]].abs());
+                        for t in 0..basis.ncols() {
+                            let term = factors[[row, t]] * basis[[j, t]];
+                            edited += term;
+                            edited_sum = up(edited_sum + up(term.abs()));
+                        }
+                        let band = up(up(evaluation_band(basis.ncols() + 1, edited_sum) + target_band)
+                            + evaluation_band(1, up(edited.abs() + target.abs())));
+                        *miss = miss.max((edited - target).abs() - band);
+                    }
+                }
+            }
+            assert!(worst <= slack, "shift {shift}: the frequency edit misses its target by {worst:e}, beyond {slack:e}");
+            // Positive control: the joint operator turns the other planes' content that projects onto
+            // plane 2's span too, and misses the same target by more than the same slack.
+            assert!(
+                joint_miss.next_down() > slack,
+                "shift {shift}: the joint operator's miss {joint_miss:e} is inside the slack {slack:e}"
+            );
+            // And it moves the row outside the cycle, which the frequency edit leaves exactly fixed.
+            assert!(edit.left.row(FIXED_ROW).iter().all(|&value| value == 0.0));
+            let fixed_change = joint.left.row(FIXED_ROW).dot(&basis.t()).iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+            assert!(fixed_change > 0.0, "shift {shift}: the joint operator left the fixed row unchanged");
+        }
     }
 
     #[test]

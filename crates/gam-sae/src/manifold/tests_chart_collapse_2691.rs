@@ -831,16 +831,16 @@ fn ard_face_for(n: usize, p: usize, radius: f64, sigma: f64) -> (f64, f64, f64) 
         1.0e-3_f64.ln(),
         vec![array![1.0e-3_f64.ln()]; 1],
     )
-    .for_assignment(&term.assignment);
+    .for_assignment(term.assignment.mode);
     let ard_index = rho.ard_flat_index(0, 0);
-    let seed = rho.flat_coordinates()[ard_index];
+    let seed = rho.to_flat()[ard_index];
     let objective =
         SaeManifoldOuterObjective::new(term, z.clone(), None, rho, 40, 1.0, 1.0e-6, 1.0e-6);
     let upper = objective
         .outer_domain_upper_bound()
         .expect("the SAE outer domain face must be constructible")
         .expect("the SAE outer objective declares a typed upper face");
-    (upper[ard_index], seed, period)
+    (upper.values()[ard_index], seed, period)
 }
 
 /// #2691 MECHANISM — the ARD chart coordinate's domain face must be denominated
@@ -1078,9 +1078,9 @@ fn zz_2691_bounded_sigma_witness_returns_an_answer_at_every_sigma() {
             1.0e-3_f64.ln(),
             vec![array![1.0e-3_f64.ln()]; 1],
         )
-        .for_assignment(&term.assignment);
+        .for_assignment(term.assignment.mode);
         let ard_index = rho.ard_flat_index(0, 0);
-        let rho_flat = rho.to_flat(&term.assignment).expect("the seed rho is bound to the term's assignment");
+        let rho_flat = rho.to_flat();
         let n_params = rho_flat.len();
         let mut objective =
             SaeManifoldOuterObjective::new(term, z.clone(), None, rho, 40, 1.0, 1.0e-6, 1.0e-6);

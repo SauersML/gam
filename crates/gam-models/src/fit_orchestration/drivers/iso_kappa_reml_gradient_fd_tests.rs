@@ -3231,6 +3231,124 @@ fn duchon_hybrid_psi_components_match_fd_order0_power9_16d() {
     assert_duchon_psi_components("duchon_gaussian_order0_power9_16d_centers24", 1700);
 }
 
+/// gam#2959 D2: where the criterion prices `½log|H|` from the Hessian's root, its
+/// analytic ρ-gradient agrees with central differences of its own value.
+///
+/// The fixture is `single_block_no_spatial_fast_path_returns_fully_frozen_spec`'s
+/// (p = 13, an aliased constant), at ρ₁ = 17.2 on the line through its stall
+/// checkpoint: the root prices every mode there, with penalty 1 railed at
+/// λ ≈ 2.95e7 beside a mode at σ ≈ 6.1e-8. The penalty trace formed from the
+/// operator's eigenvectors put the analytic ∂V/∂ρ₁ at +2.595e-3 against
+/// differences of −1.352e-5 (lane probe job 1275539, the M4 hunk without D2); read
+/// off the root's left singular vectors it is −1.351328e-5. Past the rounding-band
+/// crossing (ρ₁ ≥ 17.23) the inner mode's softest curvature is inside its band and
+/// the evaluation refuses the trial (gam#2765), so that side has no value to
+/// difference.
+///
+/// The bar is four times the differences' own disagreement between h and 2h, the
+/// same bar as the #2895 production route gate below.
+#[test]
+fn a_root_priced_rho_gradient_matches_its_value_2959() {
+    let n = 48usize;
+    let mut data = Array2::<f64>::zeros((n, 2));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let t = i as f64 / (n as f64 - 1.0);
+        data[[i, 0]] = t;
+        data[[i, 1]] = (i % 4) as f64;
+        y[i] = 0.5 + 1.5 * t + 0.1 * ((i as f64 * 0.754_877_666_246_692_7).fract() - 0.5);
+    }
+    let spec = TermCollectionSpec {
+        linear_terms: vec![],
+        random_effect_terms: vec![RandomEffectTermSpec {
+            name: "grp".to_string(),
+            feature_col: 1,
+            drop_first_level: false,
+            penalized: true,
+            frozen_levels: None,
+            lenient_unseen: true,
+        }],
+        smooth_terms: vec![SmoothTermSpec {
+            frozen_parametric_residualization: None,
+            name: "ps".to_string(),
+            basis: SmoothBasisSpec::BSpline1D {
+                feature_col: 0,
+                spec: gam_terms::basis::BSplineBasisSpec {
+                    degree: 3,
+                    penalty_order: 2,
+                    knotspec: gam_terms::basis::BSplineKnotSpec::Generate {
+                        data_range: (0.0, 1.0),
+                        num_internal_knots: 4,
+                    },
+                    double_penalty: true,
+                    identifiability: gam_terms::basis::BSplineIdentifiability::None,
+                    boundary: OneDimensionalBoundary::Open,
+                    boundary_conditions: gam_terms::basis::BSplineBoundaryConditions::default(),
+                },
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }],
+    };
+    let weights = Array1::<f64>::ones(n);
+    let offset = Array1::<f64>::zeros(n);
+    let family = LikelihoodSpec::gaussian_identity();
+    let fit_opts = FitOptions {
+        max_iter: 40,
+        ..FitOptions::default()
+    };
+    let design = build_term_collection_design(data.view(), &spec)
+        .unwrap_or_else(|e| panic!("design failed: {e:?}"));
+    let frozen = freeze_term_collection_from_design(&spec, &design)
+        .unwrap_or_else(|e| panic!("freeze failed: {e:?}"));
+    let frozen_design = build_term_collection_design(data.view(), &frozen)
+        .unwrap_or_else(|e| panic!("frozen design failed: {e:?}"));
+    let rho_dim = frozen_design.penalties.len();
+    let external_opts = external_opts_for_design(&family, &frozen_design, &fit_opts);
+    let mut evaluator = gam_solve::estimate::ExternalJointHyperEvaluator::new(
+        y.view(),
+        weights.view(),
+        &frozen_design.design,
+        offset.view(),
+        &frozen_design.penalties,
+        &external_opts,
+        "gam#2959 root-priced gradient",
+    )
+    .unwrap_or_else(|e| panic!("evaluator failed: {e:?}"));
+    let checkpoint = [-12.477798750586413, 17.258195793239388, -16.32224909783324];
+    assert_eq!(rho_dim, checkpoint.len(), "the stall checkpoint names every smoothing parameter");
+    let mut evaluate = |value: f64| {
+        let mut theta = Array1::from_vec(checkpoint.to_vec());
+        theta[1] = value;
+        evaluator
+            .evaluate_with_order(
+                &frozen_design.design,
+                &frozen_design.penalties,
+                &frozen_design.nullspace_dims,
+                frozen_design.linear_constraints.clone(),
+                &theta,
+                rho_dim,
+                Vec::new(),
+                None,
+                "gam#2959 root-priced gradient",
+                gam_solve::rho_optimizer::OuterEvalOrder::ValueAndGradient,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("evaluation at rho1={value} failed: {e:?}"))
+    };
+    let center = 17.2_f64;
+    let gradient = evaluate(center).1;
+    let at_h = (evaluate(center + 1.0e-3).0 - evaluate(center - 1.0e-3).0) / 2.0e-3;
+    let at_2h = (evaluate(center + 2.0e-3).0 - evaluate(center - 2.0e-3).0) / 4.0e-3;
+    let bar = 4.0 * (at_h - at_2h).abs();
+    assert!(
+        (gradient[1] - at_h).abs() <= bar,
+        "rho1={center}: analytic {:.12e} against central differences {at_h:.12e} (h) and \
+         {at_2h:.12e} (2h), bar {bar:.3e}",
+        gradient[1]
+    );
+}
+
 /// gam#2895 acceptance: on the PRODUCTION spatial κ route at the Matérn monotone
 /// fixture's θ0, the analytic ∂V/∂ψ agrees with central differences of the route's
 /// own value, and its negation does not.

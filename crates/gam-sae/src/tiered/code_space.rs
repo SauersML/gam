@@ -58,6 +58,10 @@ pub struct CodeSpacePromotionReport {
     /// with ≥ 2 firings and a ≥ 2-dimensional code plane). `accept` on each entry
     /// is the atomic DL verdict; nothing here mutates the fit.
     pub proposals: Vec<CurvePromotionProposal>,
+    /// The routed `(row, slot)` of every firing in each proposal's code cloud, in
+    /// the order the cloud was built, index-aligned with `proposals`. An installer
+    /// decodes exactly the firings the atomic ledger priced.
+    pub proposal_firings: Vec<Vec<(usize, usize)>>,
     /// Cross-block shell census: one proposal per CO-FIRING block pair whose
     /// joint code cloud reached the adjudicator, keyed by the pair. A ring the
     /// dictionary shattered across two blocks (one straight atom per half — the
@@ -148,6 +152,7 @@ pub fn harvest_code_space_promotions(
     // f×b), the co-firing block-pair joint code lists (flattened f×2b), and the
     // measured mean active scalar coordinates per token (L0).
     let mut firings: Vec<Vec<f64>> = vec![Vec::new(); n_blocks];
+    let mut block_firings: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n_blocks];
     let mut pair_firings: std::collections::BTreeMap<(usize, usize), Vec<f64>> =
         std::collections::BTreeMap::new();
     let mut active_scalars = 0usize;
@@ -171,6 +176,7 @@ pub fn harvest_code_space_promotions(
                 }
                 firings[g].push(code);
             }
+            block_firings[g].push((i, j));
             row_live.push((g, j));
         }
         // Joint clouds for every co-firing pair on this row (ordered by block id
@@ -206,6 +212,7 @@ pub fn harvest_code_space_promotions(
     };
 
     let mut proposals = Vec::new();
+    let mut proposal_firings = Vec::new();
     let mut n_communities = 0usize;
     let mut n_accepted = 0usize;
     let mut dl_saved_bits = 0.0f64;
@@ -238,6 +245,7 @@ pub fn harvest_code_space_promotions(
             dl_saved_bits += proposal.dl_old - proposal.dl_new;
         }
         proposals.push(proposal);
+        proposal_firings.push(std::mem::take(&mut block_firings[g]));
     }
     // Cross-block shells: adjudicate every co-firing pair's JOINT cloud. A ring
     // shattered across two blocks presents per block as a line (refused above)
@@ -312,6 +320,7 @@ pub fn harvest_code_space_promotions(
 
     Ok(CodeSpacePromotionReport {
         proposals,
+        proposal_firings,
         pair_proposals,
         n_blocks_scanned: n_blocks,
         n_communities,
@@ -754,6 +763,7 @@ pub fn harvest_code_space_pair_promotions(
 
     Ok(CodeSpacePromotionReport {
         proposals: Vec::new(),
+        proposal_firings: Vec::new(),
         pair_proposals,
         n_blocks_scanned: k_atoms,
         n_communities,
@@ -780,6 +790,9 @@ pub struct PairChartFit {
     pub criterion: crate::front_door::SaeCriterionScore,
     /// Chart explained variance of the centered cloud (`1 − RSS/TSS`).
     pub explained_variance: f64,
+    /// The chart's squared reconstruction error per firing, `RSS/f` over both
+    /// coordinates, in the cloud's units: the distortion the fitted chart delivers.
+    pub distortion: f64,
     /// Outer (smoothing-selection) iterations to the certified optimum.
     pub outer_iterations: usize,
     /// Whether the outer stationarity certificate certifies.
@@ -853,6 +866,7 @@ fn fit_pair_chart_at_seed(
         lambda_smooth: fit.outer.lambda_smooth,
         criterion: fit.outer.criterion,
         explained_variance: crate::tiered::explained_variance_from_sums(rss, tss),
+        distortion: rss / f as f64,
         outer_iterations: fit.outer.outer_iterations,
         certified: fit.outer.outer_certificate.certifies(),
         recurred: fit.outer.fixed_point.recurred,

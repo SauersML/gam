@@ -1273,18 +1273,10 @@ pub(crate) struct CustomOuterState {
     /// seeds β from it. One mode per walk, not per iterate: inside a walk the
     /// incumbent's own θ is served by `warm_cache`.
     pub(crate) walk_endpoints: Vec<(Vec<u64>, ConstrainedWarmStart)>,
-    /// The converged mode of the latest value probe, filed under the bits of its θ and
-    /// the identity of the seed it was solved from (#979).
-    ///
-    /// A line search prices a trial θ by value, then asks for the gradient at the same θ,
-    /// and both lanes start from the same seed. The second lane's inner solve therefore
-    /// re-derives this mode: on the n=2000 BMS flex fit, 12 value/gradient pairs at 12 θ,
-    /// every pair with matching cycle counts (job 1244570). The mode is served only at
-    /// bitwise that θ, and only while [`Self::seed_for`] still returns a seed of the same
-    /// identity. So it seeds no other θ (#2668), and a seed that moved never inherits it.
-    /// Like a walk endpoint it is a start, not a value: the inner solve reuses it only
-    /// when its own same-ρ check accepts it.
-    pub(crate) value_probe: Option<ValueProbeMode>,
+    /// The outer Hessian of the latest successful `ValueGradientHessian`
+    /// evaluation and the exact state it was assembled at (#2627). See
+    /// [`evaluate_with_outer_hessian_memo`].
+    pub(crate) outer_hessian_memo: Option<OuterHessianMemo>,
     /// Kept rank of the criterion the most recent successful evaluation priced (#2765),
     /// published to the outer search through `OuterObjective::criterion_rank`.
     pub(crate) last_criterion_rank: Option<usize>,
@@ -1292,38 +1284,6 @@ pub(crate) struct CustomOuterState {
 
 fn theta_bits(theta: &Array1<f64>) -> Vec<u64> {
     theta.iter().map(|value| value.to_bits()).collect()
-}
-
-/// What an inner solve's result depends on in its seed: the bits of the seed's θ, block
-/// coefficients and active sets, and whose objective a carried cached mode was solved
-/// for. Two solves at one θ from seeds of one identity are one deterministic computation.
-#[derive(PartialEq)]
-pub(crate) struct SeedIdentity {
-    theta: Vec<u64>,
-    block_beta: Vec<Vec<u64>>,
-    active_sets: Vec<Option<Vec<usize>>>,
-    cached_objective: Option<crate::assembly::InnerObjectiveState>,
-}
-
-impl SeedIdentity {
-    pub(crate) fn of(seed: Option<&ConstrainedWarmStart>) -> Option<Self> {
-        seed.map(|seed| Self {
-            theta: theta_bits(&seed.rho),
-            block_beta: seed.block_beta.iter().map(theta_bits).collect(),
-            active_sets: seed.active_sets.clone(),
-            cached_objective: seed
-                .cached_inner
-                .as_ref()
-                .map(|cached| cached.objective_state.clone()),
-        })
-    }
-}
-
-/// A converged value probe's mode with the θ it priced and the seed it was solved from.
-pub(crate) struct ValueProbeMode {
-    theta: Vec<u64>,
-    seed: Option<SeedIdentity>,
-    mode: ConstrainedWarmStart,
 }
 
 impl CustomOuterState {
@@ -1348,15 +1308,23 @@ impl CustomOuterState {
             pending_first_order_mode: None,
             walk_iterate: None,
             walk_endpoints: Vec::new(),
-            value_probe: None,
+            outer_hessian_memo: None,
             last_criterion_rank: None,
         }
+    }
+
+    /// The measure the family's evaluations currently price: its sampled-pilot
+    /// epoch, or `None` for a family that never samples (#2627).
+    pub(crate) fn measure_epoch(&self) -> Option<usize> {
+        self.outer_derivative_pilot
+            .as_ref()
+            .map(OuterDerivativePilotSchedule::measure_epoch)
     }
 
     /// The seed of one outer evaluation at `theta`: the certified mode a walk
     /// accepted at `theta` when there is one, otherwise the incumbent's (#2627,
     /// #2668).
-    pub(crate) fn seed_for(&self, theta: &Array1<f64>) -> Option<&ConstrainedWarmStart> {
+    pub(crate) fn warm_start_for(&self, theta: &Array1<f64>) -> Option<&ConstrainedWarmStart> {
         let key = theta_bits(theta);
         let endpoint = self
             .walk_endpoints
@@ -1364,34 +1332,6 @@ impl CustomOuterState {
             .find(|(bits, _)| *bits == key)
             .map(|(_, mode)| mode);
         screened_outer_warm_start(endpoint.or(self.warm_cache.as_ref()), theta)
-    }
-
-    /// The start of one outer evaluation at `theta`: the latest value probe's mode when
-    /// it priced bitwise this θ from a seed of the identity [`Self::seed_for`] returns now,
-    /// otherwise that seed (#979).
-    pub(crate) fn warm_start_for(&self, theta: &Array1<f64>) -> Option<&ConstrainedWarmStart> {
-        let seed = self.seed_for(theta);
-        match &self.value_probe {
-            Some(probe) if probe.theta == theta_bits(theta) && probe.seed == SeedIdentity::of(seed) => {
-                Some(&probe.mode)
-            }
-            _ => seed,
-        }
-    }
-
-    /// File a converged value probe's mode at `theta`, solved from a seed of identity
-    /// `seed` (#979). It replaces the previous probe's.
-    pub(crate) fn record_value_probe(
-        &mut self,
-        theta: &Array1<f64>,
-        seed: Option<SeedIdentity>,
-        mode: ConstrainedWarmStart,
-    ) {
-        self.value_probe = Some(ValueProbeMode {
-            theta: theta_bits(theta),
-            seed,
-            mode,
-        });
     }
 
     /// Observe the shared cold-reeval pulse (consuming it) and the sticky
@@ -1614,6 +1554,11 @@ pub struct CustomFamilyOwnedMode {
     pub(crate) rho: Array1<f64>,
     pub(crate) hyper_values: Array1<f64>,
     pub(crate) inner: BlockwiseInnerResult,
+    /// The mode responses `H⁻¹ g_i` the evaluation solved for its non-ρ outer
+    /// coordinates, one column per coordinate of `hyper_values`, when it solved
+    /// them. A certified fit reads them for the smoothing correction over those
+    /// coordinates (#2677).
+    pub(crate) ext_mode_response_cols: Option<Array2<f64>>,
 }
 
 /// Analytic joint-hyper result together with its exact owned coefficient mode.
@@ -1688,6 +1633,139 @@ pub(crate) fn publish_outer_selected_evaluation(result: &OuterObjectiveEvalResul
     );
 }
 
+/// Everything a same-θ outer Hessian is a function of, bit for bit, once one
+/// objective's family, data and options are fixed (#2627): the outer point, the
+/// measure the family priced, and the content of the inner mode the evaluation
+/// installed. It never records where that mode lives (#2515). The evaluation's
+/// value and gradient are part of it, so a stored Hessian answers only an
+/// evaluation that priced exactly what the stored one did.
+struct InstalledOuterState {
+    theta_bits: Vec<u64>,
+    measure_epoch: Option<usize>,
+    beta_bits: Vec<Vec<u64>>,
+    active_sets: Vec<Option<Vec<usize>>>,
+    objective_state: crate::assembly::InnerObjectiveState,
+    likelihood_bits: [u64; 2],
+    logdet_bits: [Option<u64>; 2],
+    objective_bits: u64,
+    gradient_bits: Vec<u64>,
+}
+
+// Written out rather than derived: a derived `PartialEq` does not count as a
+// read of the fields it compares, and every field here is read only by it.
+impl PartialEq for InstalledOuterState {
+    fn eq(&self, other: &Self) -> bool {
+        self.theta_bits == other.theta_bits
+            && self.measure_epoch == other.measure_epoch
+            && self.beta_bits == other.beta_bits
+            && self.active_sets == other.active_sets
+            && self.objective_state == other.objective_state
+            && self.likelihood_bits == other.likelihood_bits
+            && self.logdet_bits == other.logdet_bits
+            && self.objective_bits == other.objective_bits
+            && self.gradient_bits == other.gradient_bits
+    }
+}
+
+impl InstalledOuterState {
+    fn of(
+        theta: &Array1<f64>,
+        measure_epoch: Option<usize>,
+        evaluation: &OuterObjectiveEvalResult,
+    ) -> Self {
+        let inner = &evaluation.inner;
+        Self {
+            theta_bits: theta_bits(theta),
+            measure_epoch,
+            beta_bits: inner
+                .block_states
+                .iter()
+                .map(|state| state.beta.iter().map(|value| value.to_bits()).collect())
+                .collect(),
+            active_sets: inner.active_sets.clone(),
+            objective_state: inner.objective_state.clone(),
+            likelihood_bits: [inner.log_likelihood.to_bits(), inner.penalty_value.to_bits()],
+            logdet_bits: [
+                inner.block_logdet_h.map(f64::to_bits),
+                inner.block_logdet_s.map(f64::to_bits),
+            ],
+            objective_bits: evaluation.objective.to_bits(),
+            gradient_bits: evaluation.gradient.iter().map(|value| value.to_bits()).collect(),
+        }
+    }
+}
+
+/// An outer Hessian and the exact state it was assembled at (#2627).
+pub(crate) struct OuterHessianMemo {
+    state: InstalledOuterState,
+    hessian: gam_problem::HessianValue,
+}
+
+/// One outer evaluation at `theta` that owes the outer Hessian (#2627).
+///
+/// When the stored Hessian was assembled at the same θ bits under the same
+/// measure, this first evaluates `ValueAndGradient`, which installs the inner
+/// mode and prices the value and gradient without assembling the Hessian. If
+/// the installed state is bit-identical to the stored one, the stored Hessian
+/// is that state's Hessian and is served. Otherwise, and whenever nothing is
+/// stored at θ, the evaluation runs at `ValueGradientHessian` and its Hessian
+/// replaces the stored one.
+///
+/// Why: after a latched saddle escape, the Mint certificate re-assembled the
+/// dense outer Hessian at the ARC walk's last iterate, at bit-identical ρ, from
+/// the mode that walk had certified there: 14.8 s per latched fit (job 1230177,
+/// log lines 4369 and 4630). The state is compared, not the ρ alone, because
+/// one ρ can hold two certified inner modes whose Hessians differ.
+///
+/// `measure_epoch` is read after each evaluation, since a sampling family moves
+/// its measure while evaluating.
+pub(crate) fn evaluate_with_outer_hessian_memo<E, M>(
+    memo: &mut Option<OuterHessianMemo>,
+    theta: &Array1<f64>,
+    measure_epoch: M,
+    mut evaluate: E,
+) -> Result<OuterObjectiveEvalResult, CustomFamilyError>
+where
+    E: FnMut(EvalMode) -> Result<OuterObjectiveEvalResult, CustomFamilyError>,
+    M: Fn() -> Option<usize>,
+{
+    let key = theta_bits(theta);
+    let stored_here = memo.as_ref().is_some_and(|stored| {
+        stored.state.theta_bits == key && stored.state.measure_epoch == measure_epoch()
+    });
+    if stored_here {
+        let mut evaluation = evaluate(EvalMode::ValueAndGradient)?;
+        if let Some(stored) = memo.as_ref()
+            && evaluation.inner_converged
+            && stored.state == InstalledOuterState::of(theta, measure_epoch(), &evaluation)
+        {
+            log::info!(
+                "[OUTER hessian-route] served the outer Hessian stored for this exact state \
+                 (#2627)"
+            );
+            evaluation.outer_hessian = stored.hessian.clone();
+            return Ok(evaluation);
+        }
+    }
+    let evaluation = evaluate(EvalMode::ValueGradientHessian)?;
+    let hessian_assembled = match &evaluation.outer_hessian {
+        gam_problem::HessianValue::Dense(hessian) => hessian.iter().all(|value| value.is_finite()),
+        gam_problem::HessianValue::Operator(operator) => operator.dim() == theta.len(),
+        gam_problem::HessianValue::Unavailable => false,
+    };
+    if evaluation.inner_converged
+        && evaluation.objective.is_finite()
+        && evaluation.gradient.iter().all(|value| value.is_finite())
+        && hessian_assembled
+    {
+        *memo = Some(OuterHessianMemo {
+            state: InstalledOuterState::of(theta, measure_epoch(), &evaluation),
+            hessian: evaluation.outer_hessian.clone(),
+        });
+    }
+    Ok(evaluation)
+}
+
 pub(crate) fn outer_eval_result_into_joint_hyper_owned_result(
     result: OuterObjectiveEvalResult,
 ) -> CustomFamilyJointHyperOwnedResult {
@@ -1699,6 +1777,7 @@ pub(crate) fn outer_eval_result_into_joint_hyper_owned_result(
         warm_start,
         inner_converged,
         hyper_values,
+        ext_mode_response_cols,
         inner,
         ..
     } = result;
@@ -1717,6 +1796,7 @@ pub(crate) fn outer_eval_result_into_joint_hyper_owned_result(
             rho,
             hyper_values,
             inner,
+            ext_mode_response_cols,
         },
     }
 }

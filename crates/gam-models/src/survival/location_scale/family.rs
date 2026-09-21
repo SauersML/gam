@@ -37,6 +37,13 @@ pub(crate) struct SurvivalLocationScaleFamily {
     /// time-derivative `−1/t`, so `u = inv_sigma·(log t − η_t) = (log t − μ)/σ`
     /// and the event Jacobian gains `−log σ − log t`. `None` everywhere else.
     pub(crate) location_log_time: Option<LocationLogTimeOffset>,
+    /// Whether each row enters after the origin (`age_entry >
+    /// ENTRY_AT_ORIGIN_THRESHOLD`, the predicate `survival/base.rs` applies). A
+    /// row entering at the origin is not left-truncated, so its likelihood has
+    /// no `S(entry)` factor and its entry stack is exactly zero. Conditioning it
+    /// on its entry anyway puts the factor `S((h(t_left) − η_t)·e^{−η_σ})` into
+    /// the row, which is not close to one wherever σ is large (#2695).
+    pub(crate) entry_active: Arc<[bool]>,
     pub(crate) policy: gam_runtime::resource::ResourcePolicy,
     /// Whether this member's Jeffreys/Firth prior is armed. A fit arms it only
     /// on the unarmed fit's own evidence, through
@@ -55,14 +62,20 @@ pub(crate) struct LocationLogTimeOffset {
     /// `−log t_entry`: shifts the entry-time effective location by `−log t`.
     pub(crate) value_entry: Array1<f64>,
     /// `−1/t_exit`: the exit-time derivative of the `−log t` location shift,
-    /// feeding the `q`-channel `qdot` so `g` carries `inv_sigma/t`.
+    /// feeding the `q`-channel `qdot` so `du1/dt` carries `inv_sigma/t`.
     pub(crate) deriv_exit: Array1<f64>,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct SurvivalPredictorState {
+    /// The time transform's share of the entry and exit standardized residuals,
+    /// `h·e^{−eta_ls}` (#2695): `u0 = h0 + q0`, `u1 = h1 + q1`.
     pub(crate) h0: f64,
     pub(crate) h1: f64,
+    /// The event Jacobian with the scale factored out, `ĝ = e^{eta_ls}·du1/dt`
+    /// (#2695). The scale enters `log(du1/dt) = log ĝ + log_rate_scale`
+    /// additively, so the rate stack is taken at `ĝ`, never at `du1/dt`, whose
+    /// derivative stack `(k−1)!/g^k` overflows once `e^{−eta_ls}` is extreme.
     pub(crate) g: f64,
     /// q evaluated at entry time. When the threshold/sigma blocks are
     /// time-invariant, q0 == q1.
@@ -75,6 +88,12 @@ pub(crate) struct SurvivalPredictorState {
     /// max(|d_raw|, |qdot|): kept only for diagnostics so monotonicity errors
     /// can report the scale of the operands that produced `g`.
     pub(crate) g_operand_scale: f64,
+    /// `−eta_ls` at exit, the log of the factor `e^{−eta_ls}` that scales
+    /// `du1/dt = e^{−eta_ls}·ĝ`. It enters the event log-density linearly.
+    pub(crate) log_rate_scale: f64,
+    /// Whether the row conditions on surviving to its entry
+    /// ([`SurvivalLocationScaleFamily::entry_active`]).
+    pub(crate) entry_active: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -82,16 +101,8 @@ pub(crate) struct SurvivalRowDerivatives {
     pub(crate) ll: f64,
     /// Entry-only derivative: d ell / dq0 = w * r(u0).
     pub(crate) d1_q0: f64,
-    /// Entry-only second derivative: d² ell / dq0² = w * r'(u0).
-    pub(crate) d2_q0: f64,
-    /// Entry-only third derivative: d³ ell / dq0³ = w * r''(u0).
-    pub(crate) d3_q0: f64,
     /// Exit-only derivative: d ell / dq1.
     pub(crate) d1_q1: f64,
-    /// Exit-only second derivative: d² ell / dq1².
-    pub(crate) d2_q1: f64,
-    /// Exit-only third derivative: d³ ell / dq1³.
-    pub(crate) d3_q1: f64,
     /// Exit-only derivatives with respect to qdot1 = dq/dt at the event time.
     pub(crate) d1_qdot1: f64,
     pub(crate) grad_time_eta_h0: f64,

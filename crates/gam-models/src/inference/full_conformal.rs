@@ -271,8 +271,31 @@ impl ExactGaussianFullConformal {
             );
         }
 
+        Self::from_gram(x, y, s_lambda, &x.t().dot(x), &x.t().dot(y), x_star)
+    }
+
+    /// [`Self::new`] with the training Gram `XᵀX` and `Xᵀy` supplied. They do not
+    /// move with the test row, so a caller scoring many rows forms them once
+    /// (#2901 V17) instead of the `O(n·p²)` product per row. Unit prior weights are
+    /// the caller's contract here, as they are [`Self::new`]'s check.
+    pub fn from_gram(
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        s_lambda: &Array2<f64>,
+        xtx: &Array2<f64>,
+        xty: &Array1<f64>,
+        x_star: &Array1<f64>,
+    ) -> Result<Self, String> {
+        let n = x.nrows();
+        let p = x.ncols();
+        if y.len() != n || xty.len() != p || xtx.dim() != (p, p) {
+            return Err("full conformal: training Gram shape mismatch".to_string());
+        }
+        if s_lambda.nrows() != p || s_lambda.ncols() != p || x_star.len() != p {
+            return Err("full conformal: column-count mismatch".to_string());
+        }
         // M = XᵀX + x_*x_*ᵀ + Sλ — the augmented penalized normal matrix.
-        let mut m = x.t().dot(x) + s_lambda;
+        let mut m = xtx + s_lambda;
         for i in 0..p {
             for j in 0..p {
                 m[[i, j]] += x_star[i] * x_star[j];
@@ -281,8 +304,7 @@ impl ExactGaussianFullConformal {
         let chol = m
             .cholesky(Side::Lower)
             .map_err(|e| format!("full conformal: augmented normal matrix not SPD: {e:?}"))?;
-        let xty = x.t().dot(y);
-        let a = chol.solvevec(&xty);
+        let a = chol.solvevec(xty);
         let b = chol.solvevec(&x_star.to_owned());
 
         // Affine residuals r_i(z) = u_i + w_i z; test residual last.
@@ -862,10 +884,72 @@ pub struct GaussianRemlRhoResponse<'a> {
     n: usize,
     p: usize,
     rank_s: usize,
+    xtx: std::borrow::Cow<'a, Array2<f64>>,
+    xty: std::borrow::Cow<'a, Array1<f64>>,
+    rho_domain: (f64, f64),
+    augmented_rho_domain: (f64, f64),
+    /// The training-only optimum `ρ̂₀`, shared by every test row a
+    /// [`GaussianRemlTrainingStatistics`] serves. `None` selects it per response.
+    training_rho: Option<&'a std::sync::OnceLock<Result<f64, String>>>,
+}
+
+/// The half of [`GaussianRemlRhoResponse`] that does not move with the test row:
+/// `rank(S)`, `XᵀX`, `Xᵀy`, the training ρ domain and the training-only optimum
+/// `ρ̂₀`. A caller scoring many rows forms it once (#2901 V17), where every row used
+/// to repeat the `O(n·p²)` Gram, the penalty eigendecomposition and the `ρ̂₀` search.
+pub struct GaussianRemlTrainingStatistics {
+    rank_s: usize,
     xtx: Array2<f64>,
     xty: Array1<f64>,
     rho_domain: (f64, f64),
-    augmented_rho_domain: (f64, f64),
+    training_rho: std::sync::OnceLock<Result<f64, String>>,
+}
+
+impl GaussianRemlTrainingStatistics {
+    /// Form the statistics of the training design `x`, response `y` and penalty `s`.
+    /// `rank(S)` counts the eigenvalues above the REML engine's
+    /// `positive_eigenvalue_threshold`, the positive-eigenspace decision the fit's
+    /// own penalty pseudo-logdet makes.
+    pub fn new(x: &Array2<f64>, y: &Array1<f64>, s: &Array2<f64>) -> Result<Self, String> {
+        let n = x.nrows();
+        let p = x.ncols();
+        if y.len() != n {
+            return Err("gaussian reml response: row-count mismatch".to_string());
+        }
+        if s.nrows() != p || s.ncols() != p {
+            return Err("gaussian reml response: column-count mismatch".to_string());
+        }
+        let (evals, _) = s.eigh(Side::Lower).map_err(|e| {
+            format!("gaussian reml response: penalty eigendecomposition failed: {e:?}")
+        })?;
+        let threshold = gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(
+            evals.as_slice().ok_or_else(|| {
+                "gaussian reml response: penalty eigenvalues are not contiguous".to_string()
+            })?,
+        );
+        let rank_s = evals.iter().filter(|&&e| e > threshold).count();
+        let xtx = x.t().dot(x);
+        let xty = x.t().dot(y);
+        let rho_domain = reml_rho_domain(&xtx, s);
+        Ok(Self {
+            rank_s,
+            xtx,
+            xty,
+            rho_domain,
+            training_rho: std::sync::OnceLock::new(),
+        })
+    }
+}
+
+/// #2902 row 8: ρ is searched in the #2812 resolvability domain of the Gram
+/// against `S`.
+fn reml_rho_domain(gram: &Array2<f64>, s: &Array2<f64>) -> (f64, f64) {
+    gam_solve::estimate::rho_domain::coordinate_domain(
+        gam_solve::estimate::rho_domain::penalty_range_gammas_from_gram(gram, s)
+            .as_deref()
+            .and_then(gam_solve::estimate::rho_domain::resolvability_interval),
+        None,
+    )
 }
 
 /// One closed-form evaluation of the (possibly augmented) Gaussian REML
@@ -914,54 +998,78 @@ pub struct CertifiedFullConformal {
 }
 
 impl<'a> GaussianRemlRhoResponse<'a> {
-    /// Build the response object. Computes `rank(S)` once by symmetric
-    /// eigendecomposition, counting the eigenvalues above the REML engine's
-    /// `positive_eigenvalue_threshold`: the positive-eigenspace decision the
-    /// fit's own penalty pseudo-logdet makes.
+    /// Build the response object, forming its [`GaussianRemlTrainingStatistics`]
+    /// for this one test row.
     pub fn new(
         x: &'a Array2<f64>,
         y: &'a Array1<f64>,
         s: &'a Array2<f64>,
         x_star: &'a Array1<f64>,
     ) -> Result<Self, String> {
+        let statistics = GaussianRemlTrainingStatistics::new(x, y, s)?;
+        Self::assemble(
+            x,
+            y,
+            s,
+            x_star,
+            statistics.rank_s,
+            std::borrow::Cow::Owned(statistics.xtx),
+            std::borrow::Cow::Owned(statistics.xty),
+            statistics.rho_domain,
+            None,
+        )
+    }
+
+    /// Build the response object on statistics formed once for the training data
+    /// (`x`, `y`, `s` must be the ones `statistics` was formed from).
+    pub fn with_statistics(
+        x: &'a Array2<f64>,
+        y: &'a Array1<f64>,
+        s: &'a Array2<f64>,
+        x_star: &'a Array1<f64>,
+        statistics: &'a GaussianRemlTrainingStatistics,
+    ) -> Result<Self, String> {
+        Self::assemble(
+            x,
+            y,
+            s,
+            x_star,
+            statistics.rank_s,
+            std::borrow::Cow::Borrowed(&statistics.xtx),
+            std::borrow::Cow::Borrowed(&statistics.xty),
+            statistics.rho_domain,
+            Some(&statistics.training_rho),
+        )
+    }
+
+    fn assemble(
+        x: &'a Array2<f64>,
+        y: &'a Array1<f64>,
+        s: &'a Array2<f64>,
+        x_star: &'a Array1<f64>,
+        rank_s: usize,
+        xtx: std::borrow::Cow<'a, Array2<f64>>,
+        xty: std::borrow::Cow<'a, Array1<f64>>,
+        rho_domain: (f64, f64),
+        training_rho: Option<&'a std::sync::OnceLock<Result<f64, String>>>,
+    ) -> Result<Self, String> {
         let n = x.nrows();
         let p = x.ncols();
-        if y.len() != n {
+        if y.len() != n || xty.len() != p || xtx.dim() != (p, p) {
             return Err("gaussian reml response: row-count mismatch".to_string());
         }
         if s.nrows() != p || s.ncols() != p || x_star.len() != p {
             return Err("gaussian reml response: column-count mismatch".to_string());
         }
-        let (evals, _) = s.eigh(Side::Lower).map_err(|e| {
-            format!("gaussian reml response: penalty eigendecomposition failed: {e:?}")
-        })?;
-        let threshold = gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(
-            evals.as_slice().ok_or_else(|| {
-                "gaussian reml response: penalty eigenvalues are not contiguous".to_string()
-            })?,
-        );
-        let rank_s = evals.iter().filter(|&&e| e > threshold).count();
-        let xtx = x.t().dot(x);
-        let xty = x.t().dot(y);
-        // #2902 row 8: ρ is searched in the #2812 resolvability domain of the Gram
-        // against S. The test row adds `x_* x_*ᵀ` to the Gram whatever z is, so
-        // every ρ̂(z) shares one augmented domain.
-        let domain_of = |gram: &Array2<f64>| {
-            gam_solve::estimate::rho_domain::coordinate_domain(
-                gam_solve::estimate::rho_domain::penalty_range_gammas_from_gram(gram, s)
-                    .as_deref()
-                    .and_then(gam_solve::estimate::rho_domain::resolvability_interval),
-                None,
-            )
-        };
-        let rho_domain = domain_of(&xtx);
-        let mut augmented_xtx = xtx.clone();
+        // The test row adds `x_* x_*ᵀ` to the Gram whatever z is, so every ρ̂(z)
+        // shares one augmented domain.
+        let mut augmented_xtx = (*xtx).clone();
         for i in 0..p {
             for j in 0..p {
                 augmented_xtx[[i, j]] += x_star[i] * x_star[j];
             }
         }
-        let augmented_rho_domain = domain_of(&augmented_xtx);
+        let augmented_rho_domain = reml_rho_domain(&augmented_xtx, s);
         Ok(Self {
             x,
             y,
@@ -974,6 +1082,7 @@ impl<'a> GaussianRemlRhoResponse<'a> {
             xty,
             rho_domain,
             augmented_rho_domain,
+            training_rho,
         })
     }
 
@@ -995,7 +1104,7 @@ impl<'a> GaussianRemlRhoResponse<'a> {
             .map_err(|error| format!("gaussian REML conformal response: {error}"))?;
 
         // A(λ) = XᵀX + λ S [+ x_* x_*ᵀ].
-        let mut a = self.xtx.clone();
+        let mut a = (*self.xtx).clone();
         for i in 0..p {
             for j in 0..p {
                 a[[i, j]] += lambda * self.s[[i, j]];
@@ -1013,7 +1122,7 @@ impl<'a> GaussianRemlRhoResponse<'a> {
             .map_err(|e| format!("gaussian reml response: A(λ) not SPD: {e:?}"))?;
 
         // c(z) = Xᵀy [+ x_* z].
-        let mut c = self.xty.clone();
+        let mut c = (*self.xty).clone();
         if let Some(zv) = z {
             for j in 0..p {
                 c[j] += self.x_star[j] * zv;
@@ -1115,7 +1224,7 @@ impl<'a> GaussianRemlRhoResponse<'a> {
         let coef = (n_eff - m0) as f64;
         let lambda = gam_problem::checked_exp_log_strength(rho)
             .map_err(|error| format!("gaussian REML conformal response: {error}"))?;
-        let mut a_mat = self.xtx.clone();
+        let mut a_mat = (*self.xtx).clone();
         for i in 0..p {
             for j in 0..p {
                 a_mat[[i, j]] += lambda * self.s[[i, j]] + self.x_star[i] * self.x_star[j];
@@ -1234,7 +1343,7 @@ impl<'a> GaussianRemlRhoResponse<'a> {
     /// `|∂μ̂/∂ρ|` at 65 probes was neither a supremum nor a bound.
     fn score_rho_lipschitz_sup(&self, z_lo: f64, z_hi: f64) -> Result<f64, String> {
         let p = self.p;
-        let mut m = self.xtx.clone();
+        let mut m = (*self.xtx).clone();
         for i in 0..p {
             for j in 0..p {
                 m[[i, j]] += self.x_star[i] * self.x_star[j];
@@ -1258,17 +1367,25 @@ impl<'a> GaussianRemlRhoResponse<'a> {
             format!("gaussian reml response: generalized penalty eigenproblem failed: {e:?}")
         })?;
         let v = solve_lower_triangular_transposed(&lower, &u);
-        let xv = self.x.dot(&v);
         let xsv = v.t().dot(self.x_star);
-        let t0 = v.t().dot(&self.xty);
+        let t0 = v.t().dot(&*self.xty);
         let t1 = &xsv;
         let envelope: Vec<f64> = (0..p)
             .map(|k| (t0[k] + t1[k] * z_lo).abs().max((t0[k] + t1[k] * z_hi).abs()))
             .collect();
+        // `XV` is `n × p`; its rows are read in chunks so the bound never holds a
+        // second copy of the design (#2901 V17).
+        let chunk_rows = gam_runtime::resource::rows_for_target_bytes(
+            gam_runtime::resource::LIBRARY_ROW_CHUNK_TARGET_BYTES,
+            p,
+        );
         let mut worst_row = 0.0_f64;
-        for i in 0..self.n {
-            let row: f64 = (0..p).map(|k| xv[[i, k]].abs() * envelope[k]).sum();
-            worst_row = worst_row.max(row);
+        for chunk in self.x.axis_chunks_iter(ndarray::Axis(0), chunk_rows) {
+            let xv = chunk.dot(&v);
+            for row in xv.rows() {
+                let value: f64 = (0..p).map(|k| row[k].abs() * envelope[k]).sum();
+                worst_row = worst_row.max(value);
+            }
         }
         let test_row: f64 = (0..p).map(|k| xsv[k].abs() * envelope[k]).sum();
         Ok(0.25 * (worst_row + test_row))
@@ -1397,7 +1514,12 @@ impl<'a> GaussianRemlRhoResponse<'a> {
     /// proof: the returned diagnostics expose the probe count and observed
     /// derivative maximum.
     pub fn certified_full_conformal(&self, alpha: f64) -> Result<CertifiedFullConformal, String> {
-        let rho0 = self.select_rho(None)?;
+        // `ρ̂₀` is the training-only optimum; statistics shared across test rows
+        // select it once.
+        let rho0 = match self.training_rho {
+            Some(cell) => cell.get_or_init(|| self.select_rho(None)).clone()?,
+            None => self.select_rho(None)?,
+        };
         let lambda0 = gam_problem::checked_exp_log_strength(rho0)
             .map_err(|error| format!("full conformal selected an invalid log strength: {error}"))?;
         let mut s_lambda = Array2::<f64>::zeros((self.p, self.p));
@@ -1406,9 +1528,14 @@ impl<'a> GaussianRemlRhoResponse<'a> {
                 s_lambda[[i, j]] = lambda0 * self.s[[i, j]];
             }
         }
-        let weights = Array1::<f64>::ones(self.n);
-        let engine =
-            ExactGaussianFullConformal::new(self.x, self.y, &weights, &s_lambda, self.x_star)?;
+        let engine = ExactGaussianFullConformal::from_gram(
+            self.x,
+            self.y,
+            &s_lambda,
+            &self.xtx,
+            &self.xty,
+            self.x_star,
+        )?;
         let frozen_set = engine.prediction_set(alpha);
 
         // Collect the finite deciding endpoints. If there are none (set is ℝ
@@ -2420,8 +2547,11 @@ impl<'a> GlmHomotopyFullConformal<'a> {
 ///
 /// The exact full-conformal set has no test-point-independent
 /// factorization: every test covariate `x_*` enters the augmented normal matrix
-/// `M = XᵀX + x_*x_*ᵀ + Sλ`, so the substrate persists the training design `X`,
-/// response `y`, and the (frozen) penalty `Sλ` and rebuilds
+/// `M = XᵀX + x_*x_*ᵀ + Sλ`, and every training residual is read against the
+/// training design. So the substrate persists what rebuilds the design (the
+/// training columns of a [`ConformalTrainingFrame`], or the design itself), the
+/// response `y` and the (frozen) penalty `Sλ`. [`Self::training`] forms the
+/// per-batch statistics once and [`ExactFullConformalTraining::interval`] builds
 /// [`ExactGaussianFullConformal`] per test row — one Cholesky per test point,
 /// zero refits. Valid for any penalized smooth with an arbitrary `Sλ` and basis.
 ///
@@ -2444,12 +2574,213 @@ impl<'a> GlmHomotopyFullConformal<'a> {
 /// training row is not exchangeable with the test row.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ExactFullConformalSubstrate {
-    /// Training design `X` (n × p).
-    x: Array2<f64>,
+    /// Training design `X` (n × p) of a payload saved before the training frame
+    /// (#2901 V17): read, never written. Exactly one of this and `training_frame`
+    /// is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    x: Option<Array2<f64>>,
+    /// The training columns the design is rebuilt from (#2901 V17), `n × d` where
+    /// the dense design is `n × p`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    training_frame: Option<ConformalTrainingFrame>,
     /// Training response `y` (n).
     y: Array1<f64>,
     /// Frozen penalty `Sλ = M₀ − XᵀX` at the fitted smoothing parameters (p × p).
     s_lambda: Array2<f64>,
+}
+
+/// The training columns an exact full-conformal substrate rebuilds its design
+/// from: every column the fit reads, in the order of `headers`, with the values
+/// the design builder read at fit time (#2901 V17).
+///
+/// Exact full conformal reads `x_iᵀv` over every training row for each test row,
+/// so it needs the training design. The design is a deterministic function of
+/// these columns through the model's frozen term specification, the same builder
+/// prediction runs on the test rows, so the substrate stores the `n × d` columns
+/// instead of the `n × p` design: at `d = 2`, `p = 2000`, `n = 1e6` that is 24 MB in
+/// place of 16 GB.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ConformalTrainingFrame {
+    pub headers: Vec<String>,
+    pub values: Array2<f64>,
+}
+
+impl ConformalTrainingFrame {
+    /// The columns a frozen term specification reads from a training table whose
+    /// columns `headers` names, in table order.
+    pub fn from_table(
+        spec: &gam_terms::smooth::TermCollectionSpec,
+        headers: &[String],
+        values: ndarray::ArrayView2<'_, f64>,
+    ) -> Result<Self, String> {
+        if values.ncols() != headers.len() {
+            return Err(format!(
+                "full conformal training frame: {} headers for a {}-column table",
+                headers.len(),
+                values.ncols()
+            ));
+        }
+        let mut read = std::collections::BTreeSet::new();
+        spec.remap_feature_columns(|index| -> Result<usize, String> {
+            if index >= headers.len() {
+                return Err(format!(
+                    "full conformal training frame: the specification reads column {index} of a \
+                     {}-column table",
+                    headers.len()
+                ));
+            }
+            read.insert(index);
+            Ok(index)
+        })?;
+        let columns: Vec<usize> = read.into_iter().collect();
+        let mut frame = Array2::<f64>::zeros((values.nrows(), columns.len()));
+        for (slot, &column) in columns.iter().enumerate() {
+            frame.column_mut(slot).assign(&values.column(column));
+        }
+        Ok(Self {
+            headers: columns.iter().map(|&column| headers[column].clone()).collect(),
+            values: frame,
+        })
+    }
+
+    /// `spec`, which indexes the model's training table (`training_headers`),
+    /// re-indexed onto this frame's columns.
+    pub fn frame_spec(
+        &self,
+        spec: &gam_terms::smooth::TermCollectionSpec,
+        training_headers: &[String],
+    ) -> Result<gam_terms::smooth::TermCollectionSpec, String> {
+        spec.remap_feature_columns(|index| -> Result<usize, String> {
+            let name = training_headers.get(index).ok_or_else(|| {
+                format!("full conformal training frame: saved column index {index} is out of bounds")
+            })?;
+            self.headers
+                .iter()
+                .position(|header| header == name)
+                .ok_or_else(|| {
+                    format!("full conformal training frame carries no column {name:?}")
+                })
+        })
+    }
+
+    /// Rows `range` of the design `frame_spec` builds from this frame.
+    fn design_rows(
+        &self,
+        frame_spec: &gam_terms::smooth::TermCollectionSpec,
+        range: std::ops::Range<usize>,
+    ) -> Result<Array2<f64>, String> {
+        gam_terms::smooth::build_term_collection_design(
+            self.values.slice(ndarray::s![range, ..]),
+            frame_spec,
+        )
+        .map_err(|error| format!("full conformal: rebuilding the training design: {error}"))?
+        .design
+        .try_to_dense_by_chunks("full conformal training design rows")
+    }
+
+    /// Row chunks of the rebuilt design, each within the library row-chunk target.
+    fn row_chunks(&self, p: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+        let n = self.values.nrows();
+        let rows = gam_runtime::resource::rows_for_target_bytes(
+            gam_runtime::resource::LIBRARY_ROW_CHUNK_TARGET_BYTES,
+            p,
+        );
+        (0..n).step_by(rows.max(1)).map(move |start| start..(start + rows).min(n))
+    }
+
+    /// `XᵀX` of the design `frame_spec` builds from this frame, accumulated over row
+    /// chunks, so no `n × p` design is formed. `p` is the design's width.
+    pub fn gram(
+        &self,
+        frame_spec: &gam_terms::smooth::TermCollectionSpec,
+        p: usize,
+    ) -> Result<Array2<f64>, String> {
+        let mut gram = Array2::<f64>::zeros((p, p));
+        for range in self.row_chunks(p) {
+            let rows = self.design_rows(frame_spec, range)?;
+            if rows.ncols() != p {
+                return Err(format!(
+                    "full conformal: the rebuilt training design has {} columns, expected {p}",
+                    rows.ncols()
+                ));
+            }
+            gram += &rows.t().dot(&rows);
+        }
+        Ok(gram)
+    }
+
+    /// The `n × p` design `frame_spec` builds from this frame. Its storage is
+    /// reserved on the memory governor before it is formed and stays charged for as
+    /// long as the returned design lives; a refused reservation is returned as the
+    /// error, naming the bytes and the budget.
+    pub fn design(
+        &self,
+        frame_spec: &gam_terms::smooth::TermCollectionSpec,
+        p: usize,
+    ) -> Result<gam_runtime::resource::Governed<Array2<f64>>, String> {
+        let n = self.values.nrows();
+        let reservation = gam_runtime::resource::MemoryGovernor::global()
+            .try_reserve_dense_f64(n, p, "full conformal training design")
+            .map_err(|error| {
+                format!("full conformal: refusing to form the {n}x{p} training design: {error}")
+            })?;
+        let mut design = Array2::<f64>::zeros((n, p));
+        for range in self.row_chunks(p) {
+            let rows = self.design_rows(frame_spec, range.clone())?;
+            if rows.ncols() != p {
+                return Err(format!(
+                    "full conformal: the rebuilt training design has {} columns, expected {p}",
+                    rows.ncols()
+                ));
+            }
+            design.slice_mut(ndarray::s![range, ..]).assign(&rows);
+        }
+        Ok(reservation.bind(design))
+    }
+}
+
+/// Refuse a training frame whose rebuilt design rows `range` are not the fitted
+/// design's rows (#2901 V17). Prediction scores every training residual against
+/// the rebuilt design, so a frame that rebuilds a different design would publish
+/// a set for a model nobody fitted. The frozen specification re-evaluates the
+/// fitted basis on the same values, which reproduces each entry to rounding: lane
+/// diagnostic 1286891 measured 1.11e-16 against a largest entry of 1 on an
+/// `s(x1) + s(x2)` fit. A difference within Wilkinson's accumulation factor for
+/// the row width, times the largest entry compared, is that rounding. A frame that
+/// maps a column wrongly moves entries by their own size.
+pub(crate) fn check_rebuilt_design_rows(
+    frame: &ConformalTrainingFrame,
+    frame_spec: &gam_terms::smooth::TermCollectionSpec,
+    fitted: &gam_linalg::matrix::DesignMatrix,
+    range: std::ops::Range<usize>,
+) -> Result<(), String> {
+    let rebuilt = frame.design_rows(frame_spec, range.clone())?;
+    let original = fitted
+        .try_row_chunk(range.clone())
+        .map_err(|error| format!("full conformal: reading the fitted design rows: {error}"))?;
+    if rebuilt.dim() != original.dim() {
+        return Err(format!(
+            "full conformal: the training frame rebuilds a {:?} block where the fitted design \
+             rows {range:?} are {:?}",
+            rebuilt.dim(),
+            original.dim()
+        ));
+    }
+    let mut worst = 0.0_f64;
+    let mut scale = 0.0_f64;
+    for (&a, &b) in rebuilt.iter().zip(original.iter()) {
+        worst = worst.max((a - b).abs());
+        scale = scale.max(b.abs());
+    }
+    let band = gam_math::roundoff::accumulation_growth(original.ncols()) * scale;
+    if !(worst <= band) {
+        return Err(format!(
+            "full conformal: the training frame rebuilds design rows {range:?} that differ from \
+             the fitted design by {worst:e}, beyond the rounding band {band:e} of entries up to \
+             {scale:e}, so the substrate would not describe the fitted model"
+        ));
+    }
+    Ok(())
 }
 
 /// One test row's exact full-conformal verdict: the outer `[lower, upper]`
@@ -2472,22 +2803,49 @@ pub struct ExactFullConformalInterval {
 }
 
 impl ExactFullConformalSubstrate {
-    /// Build the substrate from the training design, response, prior weights,
-    /// and the converged penalized normal matrix `M₀ = XᵀX + Sλ`. Recovers the
-    /// frozen penalty `Sλ = M₀ − XᵀX` once. Rejects non-unit prior weights and
-    /// shape mismatches, identically to the rest of this module.
-    pub fn from_design_unit_weight_normal_matrix(
-        x: &Array2<f64>,
+    /// Build the substrate from the training columns the design is rebuilt from,
+    /// the training Gram `XᵀX` of the design they build, the response, prior
+    /// weights and `M₀ = XᵀX + Sλ` (#2901 V17). The persisted substrate is `n × d`
+    /// rather than `n × p`, and no dense design is formed to build it.
+    pub fn from_training_frame_unit_weight_normal_matrix(
+        frame: ConformalTrainingFrame,
+        gram: &Array2<f64>,
         y: &Array1<f64>,
         prior_weights: &Array1<f64>,
         m: &Array2<f64>,
     ) -> Result<Self, String> {
-        let n = x.nrows();
-        let p = x.ncols();
+        if frame.values.nrows() != y.len() || frame.values.ncols() != frame.headers.len() {
+            return Err(format!(
+                "exact full conformal substrate: a {}x{} training frame with {} headers \
+                 against {} responses",
+                frame.values.nrows(),
+                frame.values.ncols(),
+                frame.headers.len(),
+                y.len()
+            ));
+        }
+        let s_lambda = Self::frozen_penalty(gram, y, frame.values.nrows(), prior_weights, m)?;
+        Ok(Self {
+            x: None,
+            training_frame: Some(frame),
+            y: y.clone(),
+            s_lambda,
+        })
+    }
+
+    /// `Sλ = M₀ − XᵀX`, after the shape and unit-weight checks.
+    fn frozen_penalty(
+        gram: &Array2<f64>,
+        y: &Array1<f64>,
+        n: usize,
+        prior_weights: &Array1<f64>,
+        m: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let p = gram.nrows();
         if y.len() != n || prior_weights.len() != n {
             return Err("exact full conformal substrate: row-count mismatch".to_string());
         }
-        if m.nrows() != p || m.ncols() != p {
+        if gram.ncols() != p || m.nrows() != p || m.ncols() != p {
             return Err("exact full conformal substrate: normal-matrix shape mismatch".to_string());
         }
         if prior_weights.iter().any(|&w| w != 1.0) {
@@ -2498,46 +2856,128 @@ impl ExactFullConformalSubstrate {
                     .to_string(),
             );
         }
-        // Sλ = M₀ − XᵀX (frozen at the fitted smoothing parameters).
-        let s_lambda = m - &x.t().dot(x);
-        Ok(Self {
-            x: x.clone(),
-            y: y.clone(),
-            s_lambda,
-        })
+        Ok(m - gram)
     }
 
     /// Coefficient dimension `p`.
     pub fn p(&self) -> usize {
-        self.x.ncols()
+        self.s_lambda.ncols()
     }
 
     /// Training-row count `n`.
     pub fn n(&self) -> usize {
-        self.x.nrows()
+        self.y.len()
     }
 
+    /// The training columns the design is rebuilt from, when the substrate
+    /// carries them instead of the design.
+    pub fn training_frame(&self) -> Option<&ConformalTrainingFrame> {
+        self.training_frame.as_ref()
+    }
+
+    /// Everything the exact set reads that does not move with the test row,
+    /// formed once for a batch of test rows (#2901 V17). The substrate hands its
+    /// training columns to `rebuild_design`, which returns the `n × p` design the
+    /// model's term specification builds from them. A substrate read from a payload
+    /// saved before the training frame carries that design itself, and
+    /// `rebuild_design` is not called.
+    pub fn training(
+        &self,
+        rebuild_design: impl FnOnce(
+            &ConformalTrainingFrame,
+        ) -> Result<gam_runtime::resource::Governed<Array2<f64>>, String>,
+    ) -> Result<ExactFullConformalTraining<'_>, String> {
+        let x = match (&self.x, &self.training_frame) {
+            (Some(x), None) => TrainingDesign::Stored(x),
+            (None, Some(frame)) => TrainingDesign::Rebuilt(rebuild_design(frame)?),
+            (Some(_), Some(_)) => {
+                return Err(
+                    "exact full conformal substrate carries both a design and a training frame"
+                        .to_string(),
+                );
+            }
+            (None, None) => {
+                return Err(
+                    "exact full conformal substrate carries neither a design nor a training frame"
+                        .to_string(),
+                );
+            }
+        };
+        if x.design().dim() != (self.n(), self.p()) {
+            return Err(format!(
+                "exact full conformal: the training design is {}x{}, the substrate needs {}x{}",
+                x.design().nrows(),
+                x.design().ncols(),
+                self.n(),
+                self.p()
+            ));
+        }
+        let statistics =
+            GaussianRemlTrainingStatistics::new(x.design(), &self.y, &self.s_lambda)?;
+        Ok(ExactFullConformalTraining {
+            x,
+            y: &self.y,
+            s_lambda: &self.s_lambda,
+            statistics,
+        })
+    }
+
+}
+
+/// The training design an [`ExactFullConformalTraining`] scores against: the one
+/// rebuilt from the training frame, which keeps its memory-governor charge for as
+/// long as it lives, or the one a payload saved before the training frame carries,
+/// read and never written.
+enum TrainingDesign<'s> {
+    Stored(&'s Array2<f64>),
+    Rebuilt(gam_runtime::resource::Governed<Array2<f64>>),
+}
+
+impl TrainingDesign<'_> {
+    fn design(&self) -> &Array2<f64> {
+        match self {
+            Self::Stored(design) => design,
+            Self::Rebuilt(design) => design,
+        }
+    }
+}
+
+/// The per-batch half of the exact full-conformal set: the training design and
+/// every statistic that does not move with the test row (#2901 V17).
+pub struct ExactFullConformalTraining<'s> {
+    x: TrainingDesign<'s>,
+    y: &'s Array1<f64>,
+    s_lambda: &'s Array2<f64>,
+    statistics: GaussianRemlTrainingStatistics,
+}
+
+impl ExactFullConformalTraining<'_> {
     /// The exact full-conformal verdict at one test row `x_*` and miscoverage
     /// `alpha`: the exact set, its outer envelope, and the frozen-ρ
-    /// self-diagnostics flag. One Cholesky per call, zero refits.
+    /// self-diagnostics flag. One Cholesky per row, zero refits.
     pub fn interval(
         &self,
         x_star: &Array1<f64>,
         alpha: f64,
     ) -> Result<ExactFullConformalInterval, String> {
-        if x_star.len() != self.p() {
+        let p = self.s_lambda.ncols();
+        if x_star.len() != p {
             return Err(format!(
-                "exact full conformal: x_* has {} entries but the fit has {} coefficients",
-                x_star.len(),
-                self.p()
+                "exact full conformal: x_* has {} entries but the fit has {p} coefficients",
+                x_star.len()
             ));
         }
         // The AUTHORITATIVE exact set is built at the user's fitted penalty `Sλ`
         // (ρ frozen exactly at the fit), so the reported set reflects the model
         // the user trained — not a re-optimized global scale.
-        let weights = Array1::<f64>::ones(self.n());
-        let engine =
-            ExactGaussianFullConformal::new(&self.x, &self.y, &weights, &self.s_lambda, x_star)?;
+        let engine = ExactGaussianFullConformal::from_gram(
+            self.x.design(),
+            self.y,
+            self.s_lambda,
+            &self.statistics.xtx,
+            &self.statistics.xty,
+            x_star,
+        )?;
         let set = engine.prediction_set(alpha);
 
         // Frozen-ρ self-diagnostic: treat the whole frozen penalty as carrying a
@@ -2550,26 +2990,31 @@ impl ExactFullConformalSubstrate {
         // research-core Layer 3 and is not asserted here. A degenerate certificate
         // computation must NOT void the exact set, so its failure maps to "not
         // certified" rather than an error.
-        let frozen_rho_certified =
-            GaussianRemlRhoResponse::new(&self.x, &self.y, &self.s_lambda, x_star)
-                .and_then(|response| response.certified_full_conformal(alpha))
-                .map(|certified| {
-                    matches!(
-                        certified.certificate,
-                        FrozenRhoCertificate::Certified { .. }
-                    )
-                })
-                .unwrap_or(false);
+        let frozen_rho_certified = GaussianRemlRhoResponse::with_statistics(
+            self.x.design(),
+            self.y,
+            self.s_lambda,
+            x_star,
+            &self.statistics,
+        )
+        .and_then(|response| response.certified_full_conformal(alpha))
+        .map(|certified| {
+            matches!(
+                certified.certificate,
+                FrozenRhoCertificate::Certified { .. }
+            )
+        })
+        .unwrap_or(false);
 
         let (lo, hi) = if set.intervals.is_empty() {
             // No candidate qualifies (pathological tiny α·(n+1)); collapse to the
             // frozen plug-in mean μ̂_* = x_*ᵀβ̂, β̂ = (XᵀX+Sλ)⁻¹Xᵀy — the only
             // honest scalar answer.
-            let m = &self.x.t().dot(&self.x) + &self.s_lambda;
+            let m = &self.statistics.xtx + self.s_lambda;
             let chol = m.cholesky(Side::Lower).map_err(|e| {
                 format!("exact full conformal: frozen normal matrix not SPD: {e:?}")
             })?;
-            let beta = chol.solvevec(&self.x.t().dot(&self.y));
+            let beta = chol.solvevec(&self.statistics.xty);
             let mu_point = x_star.dot(&beta);
             (mu_point, mu_point)
         } else {
@@ -2916,7 +3361,7 @@ mod tests {
                 2.0 * (2.0 * gamma * scale * svd_rss.sqrt() + (gamma * condition * scale).powi(2));
 
             // The closed form this replaced, on the same arithmetic.
-            let mut a_matrix = resp.xtx.clone();
+            let mut a_matrix = (*resp.xtx).clone();
             for i in 0..p {
                 for j in 0..p {
                     a_matrix[[i, j]] += lambda * s[[i, j]] + x_star[i] * x_star[j];
@@ -2976,14 +3421,14 @@ mod tests {
     ) -> (Array1<f64>, f64) {
         let lambda = rho.exp();
         let p = resp.p;
-        let mut a = resp.xtx.clone();
+        let mut a = (*resp.xtx).clone();
         for i in 0..p {
             for j in 0..p {
                 a[[i, j]] += lambda * resp.s[[i, j]] + resp.x_star[i] * resp.x_star[j];
             }
         }
         let chol = a.cholesky(Side::Lower).expect("augmented A(λ) must be SPD");
-        let mut c = resp.xty.clone();
+        let mut c = (*resp.xty).clone();
         for j in 0..p {
             c[j] += resp.x_star[j] * z;
         }
@@ -3493,4 +3938,202 @@ mod tests {
         }
     }
 
+    /// The JSON a payload saved before the training frame carries for `substrate`:
+    /// the dense design `design` in place of the training columns.
+    fn design_carrying_json(
+        substrate: &ExactFullConformalSubstrate,
+        design: &Array2<f64>,
+    ) -> serde_json::Value {
+        let mut json = serde_json::to_value(substrate).expect("serialize the substrate");
+        let object = json.as_object_mut().expect("the substrate serializes as an object");
+        object
+            .remove("training_frame")
+            .expect("a frame substrate serializes its training columns");
+        object.insert(
+            "x".to_string(),
+            serde_json::to_value(design).expect("serialize the design"),
+        );
+        json
+    }
+
+    /// #2901 V17: the substrate stores its training columns and rebuilds the design
+    /// through the caller's builder; a substrate saved before the training frame,
+    /// which carries the dense design instead, still reads and scores the same exact
+    /// sets without calling the builder; and nothing but that read carries a design.
+    #[test]
+    fn a_design_carrying_substrate_reads_and_scores_as_its_training_frame_2901() {
+        let n = 30usize;
+        let p = 4usize;
+        let frame_values = Array2::from_shape_fn((n, 1), |(i, _)| i as f64 / (n - 1) as f64);
+        let build = |values: &Array2<f64>| {
+            Array2::from_shape_fn((values.nrows(), p), |(i, j)| values[[i, 0]].powi(j as i32))
+        };
+        let x = build(&frame_values);
+        let y = Array1::from_shape_fn(n, |i| {
+            (3.0 * frame_values[[i, 0]]).sin() + 0.1 * ((7 * i) as f64).cos()
+        });
+        let mut s = Array2::<f64>::eye(p) * 0.5;
+        s[[0, 0]] = 0.0;
+        let m0 = x.t().dot(&x) + &s;
+        let weights = Array1::<f64>::ones(n);
+        let framed = ExactFullConformalSubstrate::from_training_frame_unit_weight_normal_matrix(
+            ConformalTrainingFrame {
+                headers: vec!["t".to_string()],
+                values: frame_values.clone(),
+            },
+            &x.t().dot(&x),
+            &y,
+            &weights,
+            &m0,
+        )
+        .expect("frame substrate");
+        let framed_json = serde_json::to_value(&framed).expect("serialize frame");
+        assert!(framed_json.get("x").is_none(), "{framed_json}");
+        assert!(framed_json.get("training_frame").is_some(), "{framed_json}");
+        let framed_training = framed
+            .training(|frame| {
+                gam_runtime::resource::MemoryGovernor::global()
+                    .try_reserve_dense_f64(n, p, "test training design")
+                    .map(|reservation| reservation.bind(build(&frame.values)))
+                    .map_err(|error| error.to_string())
+            })
+            .expect("frame training");
+        let legacy: ExactFullConformalSubstrate =
+            serde_json::from_value(design_carrying_json(&framed, &x))
+                .expect("a design-carrying substrate reads");
+        assert!(legacy.training_frame().is_none());
+        let legacy_training = legacy
+            .training(|_| Err("a design-carrying substrate never rebuilds".to_string()))
+            .expect("design-carrying training");
+        for &t in &[0.13_f64, 0.5, 0.91] {
+            let x_star = Array1::from_shape_fn(p, |j| t.powi(j as i32));
+            let framed_interval = framed_training.interval(&x_star, 0.2).expect("frame interval");
+            let legacy_interval = legacy_training.interval(&x_star, 0.2).expect("design interval");
+            assert_eq!(
+                (framed_interval.lo, framed_interval.hi, framed_interval.frozen_rho_certified),
+                (legacy_interval.lo, legacy_interval.hi, legacy_interval.frozen_rho_certified),
+                "t={t}"
+            );
+            assert!(framed_interval.lo < framed_interval.hi, "t={t}: {framed_interval:?}");
+        }
+    }
+
+    /// #2901 V17: an eligible standard fit saves the training columns its frozen
+    /// specification reads (not the response, not an unread column, and not the
+    /// `n × p` design), and the design those columns rebuild is the design the saved
+    /// specification builds on the table, scoring the same exact sets.
+    #[test]
+    fn a_saved_substrate_is_the_training_frame_and_rebuilds_the_fitted_design_2901() {
+        use crate::fit_orchestration::FitConfig;
+        use crate::inference::model_payload_builders::fit_formula_to_payload;
+        let n = 80usize;
+        let records: Vec<csv::StringRecord> = (0..n)
+            .map(|i| {
+                let t = i as f64 / n as f64;
+                let x1 = t * 10.0;
+                let x2 = ((i * 7) % 40) as f64 / 4.0;
+                let y = (x1 * 0.7).sin() * 2.0 + (x2 * 0.4).cos() + 0.3 * (i as f64 * 1.7).sin();
+                let unread = (i as f64 * 0.37).sin();
+                csv::StringRecord::from(vec![
+                    format!("{y:.6}"),
+                    format!("{x1:.6}"),
+                    format!("{x2:.6}"),
+                    format!("{unread:.6}"),
+                ])
+            })
+            .collect();
+        let headers: Vec<String> = ["y", "x1", "x2", "unread"].iter().map(|h| h.to_string()).collect();
+        let dataset =
+            gam_data::encode_recordswith_inferred_schema(headers, records).expect("encode table");
+        let payload = fit_formula_to_payload(
+            "y ~ s(x1, k=6) + s(x2, k=6)".to_string(),
+            &dataset,
+            &FitConfig::default(),
+        )
+        .expect("eligible gaussian fit");
+        let substrate = payload.full_conformal.as_ref().expect("an eligible fit carries the substrate");
+        let frame = substrate.training_frame().expect("the substrate carries its training columns");
+        assert_eq!(frame.headers, vec!["x1".to_string(), "x2".to_string()]);
+        assert_eq!(frame.values.dim(), (n, 2));
+        let json = serde_json::to_value(substrate).expect("serialize substrate");
+        assert!(json.get("x").is_none(), "the dense design is not persisted");
+
+        let spec = payload.resolved_termspec.as_ref().expect("saved specification");
+        let training_headers = payload.training_headers.as_ref().expect("training headers");
+        let frame_spec = frame.frame_spec(spec, training_headers).expect("frame specification");
+        let rebuilt = frame.design(&frame_spec, substrate.p()).expect("rebuilt design");
+        let table = gam_terms::smooth::build_term_collection_design(dataset.values.view(), spec)
+            .expect("table design");
+        let table_design = table
+            .design
+            .try_to_dense_by_chunks("table design")
+            .expect("dense table design");
+        // The fit-time check passes the saved frame's rows against the table's
+        // design, and refuses a frame whose two columns are swapped under the same
+        // names (its negative control).
+        check_rebuilt_design_rows(frame, &frame_spec, &table.design, 0..n)
+            .expect("the saved frame rebuilds the fitted rows");
+        let mut swapped = frame.clone();
+        for i in 0..n {
+            let first = swapped.values[[i, 0]];
+            swapped.values[[i, 0]] = swapped.values[[i, 1]];
+            swapped.values[[i, 1]] = first;
+        }
+        let refusal = check_rebuilt_design_rows(&swapped, &frame_spec, &table.design, 0..n)
+            .expect_err("a frame with swapped columns rebuilds another design");
+        assert!(refusal.contains("differ from the fitted design"), "{refusal}");
+        assert_eq!(*rebuilt, table_design, "the frame rebuilds the design the table builds");
+        // The rebuilt design stays charged on the memory governor for as long as it
+        // lives, so a prediction holding it is on the ledger.
+        assert_eq!(
+            Some(rebuilt.reserved_bytes()),
+            gam_runtime::resource::dense_f64_bytes(n, substrate.p())
+        );
+
+        // A payload saved before the training frame carries the dense design in its
+        // substrate. It loads at every readable version older than this binary's and
+        // scores the same exact sets without calling a builder: the read path of the
+        // payloads that persisted the design, which nothing writes any more.
+        let framed_training = substrate
+            .training(|frame| frame.design(&frame_spec, substrate.p()))
+            .expect("frame training");
+        let older_versions: Vec<u32> = crate::inference::model::READABLE_PAYLOAD_VERSIONS
+            .iter()
+            .copied()
+            .filter(|&version| version < crate::inference::model::MODEL_PAYLOAD_VERSION)
+            .collect();
+        assert!(!older_versions.is_empty(), "this binary reads the payloads before its own");
+        for version in older_versions {
+            let mut old = serde_json::to_value(&payload).expect("serialize the payload");
+            old["full_conformal"] = design_carrying_json(substrate, &table_design);
+            old["version"] = serde_json::json!(version);
+            let loaded: crate::inference::model::FittedModelPayload =
+                serde_json::from_value(old).expect("a design-carrying payload parses");
+            crate::inference::model::FittedModel::from_payload(loaded.clone())
+                .validate_for_persistence()
+                .unwrap_or_else(|error| panic!("payload version {version} loads: {error}"));
+            let old_substrate = loaded
+                .full_conformal
+                .as_ref()
+                .expect("the old payload carries its substrate");
+            assert!(old_substrate.training_frame().is_none());
+            let old_training = old_substrate
+                .training(|_| Err("a design-carrying substrate never rebuilds".to_string()))
+                .expect("design-carrying training");
+            for row in [0usize, 17, 63] {
+                let x_star = table_design.row(row).to_owned();
+                let expected = framed_training.interval(&x_star, 0.1).expect("frame interval");
+                let old_interval = old_training.interval(&x_star, 0.1).expect("design interval");
+                assert_eq!(
+                    (expected.lo, expected.hi, expected.frozen_rho_certified),
+                    (old_interval.lo, old_interval.hi, old_interval.frozen_rho_certified),
+                    "version {version} row {row}"
+                );
+                assert!(
+                    expected.lo.is_finite() && expected.hi.is_finite(),
+                    "row {row}: {expected:?}"
+                );
+            }
+        }
+    }
 }

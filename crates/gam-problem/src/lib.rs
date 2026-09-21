@@ -26,6 +26,7 @@ pub mod custom_family_error;
 pub mod diagnostics;
 pub mod dispersion;
 pub mod dispersion_cov;
+pub mod domain_face;
 pub mod estimation_error;
 pub mod execution_path;
 pub mod failure_category;
@@ -112,7 +113,7 @@ pub use custom_family_error::{
     CustomFamilyError,
     DescendingRayExit,
     InnerConvergenceTerminalState,
-    ConstrainedFixedPointCondition, JointNewtonTerminalReason, RayRestoration,
+    ConstrainedFixedPointCondition, JointNewtonTerminalReason, OuterSearchRoute, RayRestoration,
     TerminalInnerModeEvidence,
     relative_stationarity,
 };

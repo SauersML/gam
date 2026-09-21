@@ -6354,7 +6354,6 @@ fn per_row_evidence_classification_prices_a_clamp_basin_before_a_saddle_2515() {
     let basin_geometry = ExactAClassificationRow {
         delta_tt: array![[0.0_f64, 0.0], [0.0, -4.007_997_610]],
         delta_tbeta: Array2::<f64>::zeros((d, 0)),
-        border_columns: Arc::from([] as [usize; 0]),
         clamp_diag: array![0.0_f64, 2.0e-2],
     };
     let basin = factor_spectral_deflated_criterion_row_with_geometry(
@@ -6379,7 +6378,6 @@ fn per_row_evidence_classification_prices_a_clamp_basin_before_a_saddle_2515() {
     let saddle_geometry = ExactAClassificationRow {
         delta_tt: basin_geometry.delta_tt.clone(),
         delta_tbeta: Array2::<f64>::zeros((d, 0)),
-        border_columns: Arc::from([] as [usize; 0]),
         clamp_diag: Array1::<f64>::zeros(d),
     };
     let refusal = factor_spectral_deflated_criterion_row_with_geometry(
@@ -6404,7 +6402,6 @@ fn per_row_evidence_classification_prices_a_clamp_basin_before_a_saddle_2515() {
         let null_geometry = ExactAClassificationRow {
             delta_tt: array![[0.0_f64, 0.0], [0.0, band_direction - 4.0]],
             delta_tbeta: Array2::<f64>::zeros((d, 0)),
-            border_columns: Arc::from([] as [usize; 0]),
             clamp_diag: Array1::<f64>::zeros(d),
         };
         let conditioned = factor_spectral_deflated_criterion_row_with_geometry(
@@ -6493,10 +6490,10 @@ fn matrix_free_exact_a_prices_a_clamp_basin_before_refusing_a_saddle_2515() {
             rows: vec![ExactAClassificationRow {
                 delta_tt: array![[-2.0_f64]],
                 delta_tbeta: Array2::<f64>::zeros((1, 0)),
-                border_columns: Arc::from([] as [usize; 0]),
                 clamp_diag: array![clamp_value],
             }]
             .into(),
+            border_indices: Arc::from([] as [usize; 0]),
             border_remainder: None,
         });
         system

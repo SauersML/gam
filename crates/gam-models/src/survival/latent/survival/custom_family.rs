@@ -465,6 +465,77 @@ impl CustomFamily for LatentSurvivalFamily {
             .map(Some)
     }
 
+    /// `{D_βa D_βv D_θ H}` of a baseline-chart hyper axis (#2677).
+    fn exact_newton_joint_psihessian_second_directional_derivative_all_beta_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "exact_newton_joint_psihessian_second_directional_derivative_all_beta_axes: {} parameter-block specs for {} block states",
+                specs.len(),
+                block_states.len()
+            ));
+        }
+        let (rows, axis) = self.baseline_theta_family_axis(hyper_layout, psi_index)?;
+        self.baseline_theta_hessian_second_directional_derivative_all_axes_dense(
+            block_states,
+            &rows,
+            axis,
+            d_beta_flat,
+        )
+        .map(Some)
+    }
+
+    /// `{D_βa D_θi D_θj H}` of a pair of baseline-chart hyper axes (#2677).
+    fn exact_newton_joint_psisecond_order_hessian_directional_derivative_all_beta_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "exact_newton_joint_psisecond_order_hessian_directional_derivative_all_beta_axes: {} parameter-block specs for {} block states",
+                specs.len(),
+                block_states.len()
+            ));
+        }
+        let (rows, axis_i) = self.baseline_theta_family_axis(hyper_layout, psi_i)?;
+        let (_, axis_j) = self.baseline_theta_family_axis(hyper_layout, psi_j)?;
+        self.baseline_theta_psisecond_order_hessian_directional_derivative_all_axes_dense(
+            block_states,
+            &rows,
+            axis_i,
+            axis_j,
+        )
+        .map(Some)
+    }
+
+    /// The baseline-chart axes are family-owned hyper axes, whose coefficient drift
+    /// the evaluator reads through one owned exact-ψ workspace (#2677).
+    fn exact_newton_joint_psi_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+    ) -> Result<Option<Arc<dyn gam_problem::ExactNewtonJointPsiWorkspace>>, String> {
+        Ok(Some(Arc::new(
+            super::baseline_chart_pairs::LatentBaselineChartPsiWorkspace::new(
+                self.clone(),
+                block_states,
+                specs,
+                hyper_layout,
+            ),
+        )))
+    }
+
     fn requires_joint_outer_hyper_path(&self) -> bool {
         true
     }
@@ -916,6 +987,77 @@ impl CustomFamily for LatentBinaryFamily {
         let (_, axis_j) = self.baseline_theta_family_axis(hyper_layout, psi_index_j)?;
         self.baseline_theta_psisecond_order_terms_dense(block_states, &rows, axis_i, axis_j)
             .map(Some)
+    }
+
+    /// `{D_βa D_βv D_θ H}` of a baseline-chart hyper axis (#2677).
+    fn exact_newton_joint_psihessian_second_directional_derivative_all_beta_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "exact_newton_joint_psihessian_second_directional_derivative_all_beta_axes: {} parameter-block specs for {} block states",
+                specs.len(),
+                block_states.len()
+            ));
+        }
+        let (rows, axis) = self.baseline_theta_family_axis(hyper_layout, psi_index)?;
+        self.baseline_theta_hessian_second_directional_derivative_all_axes_dense(
+            block_states,
+            &rows,
+            axis,
+            d_beta_flat,
+        )
+        .map(Some)
+    }
+
+    /// `{D_βa D_θi D_θj H}` of a pair of baseline-chart hyper axes (#2677).
+    fn exact_newton_joint_psisecond_order_hessian_directional_derivative_all_beta_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "exact_newton_joint_psisecond_order_hessian_directional_derivative_all_beta_axes: {} parameter-block specs for {} block states",
+                specs.len(),
+                block_states.len()
+            ));
+        }
+        let (rows, axis_i) = self.baseline_theta_family_axis(hyper_layout, psi_i)?;
+        let (_, axis_j) = self.baseline_theta_family_axis(hyper_layout, psi_j)?;
+        self.baseline_theta_psisecond_order_hessian_directional_derivative_all_axes_dense(
+            block_states,
+            &rows,
+            axis_i,
+            axis_j,
+        )
+        .map(Some)
+    }
+
+    /// The baseline-chart axes are family-owned hyper axes, whose coefficient drift
+    /// the evaluator reads through one owned exact-ψ workspace (#2677).
+    fn exact_newton_joint_psi_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+    ) -> Result<Option<Arc<dyn gam_problem::ExactNewtonJointPsiWorkspace>>, String> {
+        Ok(Some(Arc::new(
+            super::baseline_chart_pairs::LatentBaselineChartPsiWorkspace::new(
+                self.clone(),
+                block_states,
+                specs,
+                hyper_layout,
+            ),
+        )))
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {

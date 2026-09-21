@@ -58,6 +58,17 @@ def _from_np(values: np.ndarray, ref: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _unit_roundoff(dtype: torch.dtype) -> float:
+    """Unit roundoff of ``dtype``, the precision a ball point is stored in.
+
+    The Rust kernels compute in f64 and place points at the ball radius
+    resolvable at this precision, so a point cast back to ``dtype`` is still
+    strictly inside the ball there.
+    """
+
+    return float(torch.finfo(dtype).eps) / 2.0
+
+
 class _PoincareTangentDecode(torch.autograd.Function):
     """Autograd shim around the Rust tangent-space-at-origin decoder.
 
@@ -77,14 +88,18 @@ class _PoincareTangentDecode(torch.autograd.Function):
         rust = rust_module()
         atoms_np = _np_f64(atoms)
         gates_np = _np_f64(gates)
+        unit_roundoff = _unit_roundoff(atoms.dtype)
         (
             x_hat_np,
             atoms_proj_np,
             v_np,
             tangents_np,
             proj_scale_np,
-        ) = rust.poincare_tangent_decode_forward(atoms_np, gates_np, float(curvature))
+        ) = rust.poincare_tangent_decode_forward(
+            atoms_np, gates_np, float(curvature), unit_roundoff
+        )
         ctx.curvature = float(curvature)
+        ctx.unit_roundoff = unit_roundoff
         ctx.save_for_backward(
             torch.from_numpy(np.ascontiguousarray(atoms_proj_np)),
             torch.from_numpy(np.ascontiguousarray(gates_np)),
@@ -111,6 +126,7 @@ class _PoincareTangentDecode(torch.autograd.Function):
             np.ascontiguousarray(proj_scale.numpy()),
             grad_np,
             ctx.curvature,
+            ctx.unit_roundoff,
         )
         grad_atoms = torch.from_numpy(np.ascontiguousarray(grad_atoms_np)).to(
             dtype=ctx.atoms_dtype, device=ctx.atoms_device
@@ -146,7 +162,10 @@ class _PoincareLorentzDecode(torch.autograd.Function):
         rust = rust_module()
         atoms_np = _np_f64(atoms)
         gates_np = _np_f64(gates)
-        x_hat_np = rust.poincare_lorentz_decode_forward(atoms_np, gates_np, float(curvature))
+        unit_roundoff = _unit_roundoff(atoms.dtype)
+        x_hat_np = rust.poincare_lorentz_decode_forward(
+            atoms_np, gates_np, float(curvature), unit_roundoff
+        )
         # Cache Poincaré forward state for the analytic backward.
         (
             _,
@@ -154,8 +173,11 @@ class _PoincareLorentzDecode(torch.autograd.Function):
             v_np,
             tangents_np,
             proj_scale_np,
-        ) = rust.poincare_tangent_decode_forward(atoms_np, gates_np, float(curvature))
+        ) = rust.poincare_tangent_decode_forward(
+            atoms_np, gates_np, float(curvature), unit_roundoff
+        )
         ctx.curvature = float(curvature)
+        ctx.unit_roundoff = unit_roundoff
         ctx.save_for_backward(
             torch.from_numpy(np.ascontiguousarray(atoms_proj_np)),
             torch.from_numpy(np.ascontiguousarray(gates_np)),
@@ -182,6 +204,7 @@ class _PoincareLorentzDecode(torch.autograd.Function):
             np.ascontiguousarray(proj_scale.numpy()),
             grad_np,
             ctx.curvature,
+            ctx.unit_roundoff,
         )
         grad_atoms = torch.from_numpy(np.ascontiguousarray(grad_atoms_np)).to(
             dtype=ctx.atoms_dtype, device=ctx.atoms_device
@@ -263,7 +286,9 @@ class PoincareAtoms(nn.Module):
         atoms_init = torch.randn(F, ball_dim, device=device, dtype=dtype) * init_scale
         rust = rust_module()
         projected_rows = [
-            rust.poincare_project_into_ball(np.ascontiguousarray(row), curvature)
+            rust.poincare_project_into_ball(
+                np.ascontiguousarray(row), curvature, _unit_roundoff(dtype)
+            )
             for row in atoms_init.detach().cpu().to(torch.float64).numpy()
         ]
         atoms_init = torch.from_numpy(
@@ -278,11 +303,16 @@ class PoincareAtoms(nn.Module):
 
         rust = rust_module()
         if x.dim() == 1:
-            out = rust.poincare_project_into_ball(_np_f64(x), self.curvature)
+            out = rust.poincare_project_into_ball(
+                _np_f64(x), self.curvature, _unit_roundoff(x.dtype)
+            )
             return _from_np(out, x)
         flat = x.reshape(-1, x.shape[-1]).detach().cpu().to(torch.float64).numpy()
+        unit_roundoff = _unit_roundoff(x.dtype)
         rows = [
-            rust.poincare_project_into_ball(np.ascontiguousarray(r), self.curvature)
+            rust.poincare_project_into_ball(
+                np.ascontiguousarray(r), self.curvature, unit_roundoff
+            )
             for r in flat
         ]
         stacked = np.stack(rows, axis=0).reshape(x.shape)

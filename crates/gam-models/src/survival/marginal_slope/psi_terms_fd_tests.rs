@@ -1926,6 +1926,8 @@ fn design_contracted_trace_hessian_psi_directional_matches_finite_difference_293
             &format!("static/{axis:?} contracted trace Hessian by beta"),
             &analytic,
             &beta,
+            // A one-pass contraction `⟨W, ·⟩` over the rows and the `p²` entries of `W`.
+            N_ROWS * total * total,
             |displaced| {
                 family
                     .design_contracted_trace_hessian_psi_with_options(
@@ -2049,13 +2051,13 @@ fn assert_within_derived_band(label: &str, analytic: f64, oracle: DerivedDiffere
 }
 
 /// gam#2945: [`grade_all_beta_axes`] on the band of [`derived_difference`]. Every object of the family
-/// is resolved against the family's largest analytic magnitude. The object differenced is a one-pass
-/// contraction `⟨W, ·⟩` over `N_ROWS` rows and the `p²` entries of `W`, so it carries `N_ROWS·p²`
-/// summands.
+/// is resolved against the family's largest analytic magnitude. `summands` counts the floating terms
+/// one differenced entry sums.
 fn grade_all_beta_axes_on_derived_band(
     label: &str,
     analytic: &[Array2<f64>],
     beta: &Array1<f64>,
+    summands: usize,
     lower_order_at: impl Fn(&Array1<f64>) -> Array2<f64>,
 ) {
     let dim = beta.len();
@@ -2082,7 +2084,7 @@ fn grade_all_beta_axes_on_derived_band(
                     derived_difference(
                         std::array::from_fn(|k| stencil[k][[row, column]]),
                         DERIVED_DIFFERENCE_STEP,
-                        N_ROWS * dim * dim,
+                        summands,
                     ),
                     scale,
                 );
@@ -2154,6 +2156,8 @@ fn baseline_contracted_trace_hessian_psi_directional_matches_finite_difference_2
             &format!("static/chart axis {axis} contracted trace Hessian by beta"),
             &analytic,
             &beta,
+            // A one-pass contraction `⟨W, ·⟩` over the rows and the `p²` entries of `W`.
+            N_ROWS * total * total,
             |displaced| {
                 family
                     .baseline_contracted_trace_hessian_psi_with_options(
@@ -2318,5 +2322,371 @@ fn baseline_psi_pair_third_information_matches_finite_difference_2765() {
                 },
             );
         }
+    }
+}
+
+// ── The anchored frame's third information derivatives (gam#2945) ────────────
+//
+// On a declared latent law every location channel is the anchor `α(q, b)`, so the frame's fifth
+// likelihood derivatives run through the anchor's Taylor tables, and an event row's rate
+// `log α_q(q₁, b)` through the order-six table solved on demand. Each object an armed Jeffreys
+// objective's exact outer Hessian reads is differenced along every coefficient axis against the
+// lower-order hook it differentiates, on the derived band.
+
+/// The floating terms one differenced entry of an anchored-frame hook sums: over the rows, the `P⁴`
+/// products of a row's fourth-order primary tensor with two primary directions and the Jacobian
+/// columns of the entry's two coefficient axes.
+const ANCHORED_HOOK_SUMMANDS: usize =
+    N_ROWS * super::slope_geometry::STATIC_SLOPE_PRIMARIES.pow(4);
+
+/// The floating terms one differenced entry of an anchored-frame `∂_ψ H` sums: over the rows, the
+/// `P³` products of a row's third-order primary tensor with one primary direction and the Jacobian
+/// columns of the entry's two coefficient axes.
+const ANCHORED_DRIFT_SUMMANDS: usize =
+    N_ROWS * super::slope_geometry::STATIC_SLOPE_PRIMARIES.pow(3);
+
+/// Two coefficient directions that move every block of the drift fixture.
+fn anchored_directions() -> (Array1<f64>, Array1<f64>) {
+    (
+        ndarray::array![0.23, 0.17, 0.41, -0.27, 0.33, 0.19],
+        ndarray::array![-0.11, 0.31, 0.19, 0.24, -0.28, 0.14],
+    )
+}
+
+/// `D²_β H[u, v]` at `β`.
+fn second_directional_at(
+    family: &SurvivalMarginalSlopeFamily,
+    beta: &Array1<f64>,
+    u: &Array1<f64>,
+    v: &Array1<f64>,
+) -> Array2<f64> {
+    family
+        .exact_newton_joint_hessiansecond_directional_derivative(&states_at_beta(family, beta), u, v)
+        .expect("joint Hessian second directional derivative")
+        .expect("survival marginal-slope publishes an exact D2_beta H")
+}
+
+/// gam#2945: on a declared latent law the rigid frame serves its third information derivative
+/// `D³H[u, v, e_a]`, the coefficient derivative of `D²H[u, v]` along every axis. The frame prices
+/// no Jeffreys completion, so it declines the completion's contractions, which would otherwise
+/// build the Gaussian frame's kernel on an anchored family.
+#[test]
+fn anchored_third_information_matches_differenced_second_directional_2945() {
+    let (family, beta) = drift_family_and_states(SlopeFrame::Anchored);
+    let states = states_at_beta(&family, &beta);
+    assert!(family.anchored_law_active(), "the fixture runs the anchored frame");
+    assert!(
+        family.jeffreys_completion_outer_derivatives().is_none(),
+        "the anchored frame prices no completion"
+    );
+    assert!(
+        !family
+            .baseline_contracted_trace_hessian_psi_available(&states)
+            .expect("contraction availability"),
+        "the anchored frame must decline the Gaussian frame's contracted-trace kernels"
+    );
+    let (u, v) = anchored_directions();
+    let analytic = family
+        .jeffreys_third_information_derivative()
+        .expect("the anchored rigid frame exposes its third information derivative")
+        .third_directional_all_axes(&states, &drift_specs(&family), &u, &v)
+        .expect("anchored third information derivative")
+        .expect("the anchored rigid frame publishes its third information derivative");
+    grade_all_beta_axes_on_derived_band(
+        "anchored-slope D3H[u, v, e_a]",
+        &analytic,
+        &beta,
+        ANCHORED_HOOK_SUMMANDS,
+        |displaced| second_directional_at(&family, displaced, &u, &v),
+    );
+}
+
+/// gam#2945: the same gate rejects the Gaussian lowering's closed-form fifth derivatives on the
+/// anchored rows, and the anchored kernel with its order-six terms dropped, so it grades the
+/// anchoring and the order the on-demand table adds.
+#[test]
+fn anchored_third_information_gate_rejects_the_closed_form_and_a_dropped_sixth_order_2945() {
+    use super::information_third::{
+        anchored_row_fifth_from_tables, anchored_row_tables, static_row_fifth,
+    };
+    use super::row_kernel::SurvivalMarginalSlopeRowKernel;
+    use super::slope_geometry::{AnchoredStaticSlopeGeometry, STATIC_SLOPE_PRIMARIES};
+
+    let (family, beta) = drift_family_and_states(SlopeFrame::Anchored);
+    let (u, v) = anchored_directions();
+    let (u_slice, v_slice) = (
+        u.as_slice().expect("contiguous u"),
+        v.as_slice().expect("contiguous v"),
+    );
+    let kernel =
+        SurvivalMarginalSlopeRowKernel::<STATIC_SLOPE_PRIMARIES, AnchoredStaticSlopeGeometry>::new(
+            family.clone(),
+            states_at_beta(&family, &beta),
+        );
+    let exact = kernel
+        .third_information_all_axes(u_slice, v_slice)
+        .expect("anchored third information derivative");
+    let closed_form = kernel
+        .third_information_all_axes_from(u_slice, v_slice, static_row_fifth)
+        .expect("the closed form on the anchored rows");
+    let sixth_dropped = kernel
+        .third_information_all_axes_from(u_slice, v_slice, |primaries, inputs| {
+            let mut tables = anchored_row_tables(primaries, inputs)?;
+            if let Some(sixth) = tables.exit_sixth.as_mut() {
+                let top = sixth.len() - 1;
+                for i in 0..=top {
+                    sixth[i][top - i] = 0.0;
+                }
+            }
+            Ok(anchored_row_fifth_from_tables(primaries, inputs, &tables))
+        })
+        .expect("the anchored kernel without its sixth order");
+    let scale = exact
+        .iter()
+        .fold(0.0_f64, |acc, matrix| acc.max(max_abs(matrix.iter())));
+    let stencils: Vec<[Array2<f64>; 4]> = (0..beta.len())
+        .map(|axis| {
+            derived_difference_stencil(|t| {
+                let mut displaced = beta.clone();
+                displaced[axis] += t;
+                second_directional_at(&family, &displaced, &u, &v)
+            })
+        })
+        .collect();
+    // The statistic the gate bounds by one, over every entry the difference resolves.
+    let worst_gap_over_band = |candidate: &[Array2<f64>]| {
+        let mut worst = 0.0_f64;
+        for (axis, stencil) in stencils.iter().enumerate() {
+            for ((row, column), value) in candidate[axis].indexed_iter() {
+                let oracle = derived_difference(
+                    std::array::from_fn(|k| stencil[k][[row, column]]),
+                    DERIVED_DIFFERENCE_STEP,
+                    ANCHORED_HOOK_SUMMANDS,
+                );
+                if oracle.band <= scale {
+                    worst = worst.max((value - oracle.value).abs() / oracle.band);
+                }
+            }
+        }
+        worst
+    };
+    let exact_worst = worst_gap_over_band(&exact);
+    let closed_form_worst = worst_gap_over_band(&closed_form);
+    let sixth_dropped_worst = worst_gap_over_band(&sixth_dropped);
+    eprintln!(
+        "[2945-CONTROL] worst gap over band: anchored {exact_worst:.3e}, closed form \
+         {closed_form_worst:.3e}, sixth order dropped {sixth_dropped_worst:.3e}"
+    );
+    assert!(
+        exact_worst <= 1.0,
+        "the anchored kernel itself must pass the gate (worst gap over band {exact_worst:.3e})"
+    );
+    assert!(
+        closed_form_worst > 1.0,
+        "the gate accepted the closed form's fifth derivatives on a skewed law (worst gap over \
+         band {closed_form_worst:.3e}), so it grades nothing about the anchoring"
+    );
+    assert!(
+        sixth_dropped_worst > 1.0,
+        "the gate accepted the anchored kernel without its order-six terms (worst gap over band \
+         {sixth_dropped_worst:.3e}), so it grades nothing about the on-demand table"
+    );
+}
+
+/// gam#2945: `D_β(D_β ∂_θ H[v])` and `D_β ∂²_θθ' H` for every baseline-chart coordinate on the
+/// anchored frame, each the coefficient derivative of the hook below it.
+#[test]
+fn anchored_baseline_psi_third_information_matches_finite_difference_2945() {
+    let options = BlockwiseFitOptions::default();
+    let (family, beta) = drift_family_and_states(SlopeFrame::Anchored);
+    let total = beta.len();
+    let (direction, _) = anchored_directions();
+    for axis in 0..3 {
+        let analytic = family
+            .baseline_exact_joint_psihessian_second_directional_derivative_all_beta_axes_with_options(
+                &states_at_beta(&family, &beta),
+                axis,
+                &direction,
+                &options,
+            )
+            .expect("anchored baseline-by-coefficient third information derivative");
+        grade_all_beta_axes_on_derived_band(
+            &format!("anchored-slope/baseline {axis} by beta"),
+            &analytic,
+            &beta,
+            ANCHORED_HOOK_SUMMANDS,
+            |displaced| {
+                family
+                    .baseline_exact_joint_psihessian_directional_derivative_with_options(
+                        &states_at_beta(&family, displaced),
+                        axis,
+                        &direction,
+                        &options,
+                    )
+                    .expect("anchored baseline ψ Hessian drift")
+                    .expect("the anchored chart publishes its ψ Hessian drift")
+            },
+        );
+    }
+    for (axis, other_axis) in [(0, 0), (1, 1), (0, 2), (1, 2)] {
+        let analytic = family
+            .baseline_exact_joint_psisecond_order_hessian_directional_derivative_all_beta_axes_with_options(
+                &states_at_beta(&family, &beta),
+                axis,
+                other_axis,
+                &options,
+            )
+            .expect("anchored baseline-pair third information derivative");
+        grade_all_beta_axes_on_derived_band(
+            &format!("anchored-slope/baseline pair ({axis},{other_axis})"),
+            &analytic,
+            &beta,
+            ANCHORED_HOOK_SUMMANDS,
+            |displaced| {
+                let terms = family
+                    .baseline_exact_joint_psisecond_order_terms_with_options(
+                        &states_at_beta(&family, displaced),
+                        axis,
+                        other_axis,
+                        &options,
+                    )
+                    .expect("anchored baseline pair terms")
+                    .expect("the anchored chart publishes its pair terms");
+                match terms.hessian_psi_psi_operator.as_ref() {
+                    Some(operator) => operator.mul_mat(&Array2::<f64>::eye(total)),
+                    None => terms.hessian_psi_psi.clone(),
+                }
+            },
+        );
+    }
+}
+
+/// gam#2945: on the anchored frame the design ψ Hessian drift `D_β ∂_ψ H[v]` is the derivative of
+/// `∂_ψ H` along `v`. Its fourth-order row contraction chose between the two Gaussian frames alone,
+/// so on a declared law it read the closed-form lowering's fourth derivatives.
+#[test]
+fn anchored_design_psi_hessian_drift_matches_finite_difference_2945() {
+    let options = BlockwiseFitOptions::default();
+    let (family, beta) = drift_family_and_states(SlopeFrame::Anchored);
+    let total = beta.len();
+    let (direction, _) = anchored_directions();
+    for axis in [PsiAxis::MarginalDesign, PsiAxis::SlopeDesign] {
+        let layout = hyper_layout(axis);
+        let analytic = family
+            .psi_hessian_directional_derivative_with_options(
+                &states_at_beta(&family, &beta),
+                layout.design_derivative_blocks(),
+                0,
+                &direction,
+                &options,
+            )
+            .expect("anchored design ψ Hessian drift")
+            .expect("a design ψ axis on the anchored frame publishes its Hessian drift");
+        let stencil = derived_difference_stencil(|t| {
+            let displaced = &beta + &(&direction * t);
+            let terms = family
+                .psi_terms(
+                    &states_at_beta(&family, &displaced),
+                    layout.design_derivative_blocks(),
+                    0,
+                )
+                .expect("anchored design ψ terms")
+                .expect("a design ψ axis on the anchored frame publishes terms");
+            match terms.hessian_psi_operator.as_ref() {
+                Some(operator) => operator.mul_mat(&Array2::<f64>::eye(total)),
+                None => terms.hessian_psi.clone(),
+            }
+        });
+        let scale = max_abs(analytic.iter());
+        assert!(scale > 1e-8, "{axis:?}: the drift is identically zero, so it grades nothing");
+        for ((row, column), value) in analytic.indexed_iter() {
+            assert_within_derived_band(
+                &format!("anchored-slope/{axis:?} D_beta hessian_psi [{row},{column}]"),
+                *value,
+                derived_difference(
+                    std::array::from_fn(|k| stencil[k][[row, column]]),
+                    DERIVED_DIFFERENCE_STEP,
+                    ANCHORED_DRIFT_SUMMANDS,
+                ),
+                scale,
+            );
+        }
+    }
+}
+
+/// gam#2945: `D_β(D_β ∂_ψ H[v])` for a marginal and a slope design axis, and `D_β ∂²_ψψ' H` for
+/// their diagonal and cross pairs, on the anchored frame.
+#[test]
+fn anchored_design_psi_third_information_matches_finite_difference_2945() {
+    let options = BlockwiseFitOptions::default();
+    let (family, beta) = drift_family_and_states(SlopeFrame::Anchored);
+    let total = beta.len();
+    let (direction, _) = anchored_directions();
+    for axis in [PsiAxis::MarginalDesign, PsiAxis::SlopeDesign] {
+        let layout = hyper_layout(axis);
+        let analytic = family
+            .design_psi_hessian_second_directional_derivative_all_beta_axes_with_options(
+                &states_at_beta(&family, &beta),
+                layout.design_derivative_blocks(),
+                0,
+                &direction,
+                &options,
+            )
+            .expect("anchored design-by-coefficient third information derivative")
+            .expect("a design ψ axis on the anchored frame publishes its third information derivative");
+        grade_all_beta_axes_on_derived_band(
+            &format!("anchored-slope/{axis:?} by beta"),
+            &analytic,
+            &beta,
+            ANCHORED_HOOK_SUMMANDS,
+            |displaced| {
+                family
+                    .psi_hessian_directional_derivative_with_options(
+                        &states_at_beta(&family, displaced),
+                        layout.design_derivative_blocks(),
+                        0,
+                        &direction,
+                        &options,
+                    )
+                    .expect("anchored design ψ Hessian drift")
+                    .expect("a design ψ axis on the anchored frame publishes its Hessian drift")
+            },
+        );
+    }
+    let blocks = two_design_axis_blocks();
+    for (psi_i, psi_j) in [(0, 0), (0, 1), (1, 1)] {
+        let analytic = family
+            .design_psi_pair_hessian_directional_derivative_all_beta_axes_with_options(
+                &states_at_beta(&family, &beta),
+                &blocks,
+                psi_i,
+                psi_j,
+                &options,
+            )
+            .expect("anchored design-pair third information derivative")
+            .expect("a design pair on the anchored frame publishes its third information derivative");
+        grade_all_beta_axes_on_derived_band(
+            &format!("anchored-slope/design pair ({psi_i},{psi_j})"),
+            &analytic,
+            &beta,
+            ANCHORED_HOOK_SUMMANDS,
+            |displaced| {
+                let terms = family
+                    .psi_second_order_terms_inner_with_options(
+                        &states_at_beta(&family, displaced),
+                        &blocks,
+                        psi_i,
+                        psi_j,
+                        None,
+                        &options,
+                    )
+                    .expect("anchored design pair terms")
+                    .expect("a design pair on the anchored frame publishes its terms");
+                match terms.hessian_psi_psi_operator.as_ref() {
+                    Some(operator) => operator.mul_mat(&Array2::<f64>::eye(total)),
+                    None => terms.hessian_psi_psi.clone(),
+                }
+            },
+        );
     }
 }

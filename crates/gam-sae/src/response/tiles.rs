@@ -24,7 +24,8 @@
 //!
 //! The coefficients, their error bounds and the tail bounds are one block's per-unit columns, produced by the
 //! coefficient owner (the normalized coefficients of `gam_math::gaussian_activation`, wrapped per block by
-//! `response::hermite`). Nothing here produces them. [`PairChaosTable::from_columns`] takes `a_{j,n}` for `n = 0..=N`
+//! `response::hermite`). Nothing here produces them. [`PairChaosTable::for_columns`] reads them from a block's
+//! `HermiteColumns`; [`PairChaosTable::from_columns`] takes `a_{j,n}` for `n = 0..=N`
 //! with `a_{j,0} = m_j`, a bound on each entry's absolute error, and banded upper bounds on the tails
 //! `t_j(n)² ≥ Σ_{m>n} a_{j,m}²` and `d_j(n)² ≥ Σ_{m>n} m a_{j,m}²`. By Parseval `t_j(0) ≥ √Var σ(X_j)` and
 //! `d_j(0) ≥ √(v_j E σ'(X_j)²)` bound the largest magnitudes a pair's value and slope can take, and they are the scales
@@ -60,9 +61,10 @@
 //! [`PairRowSum::band`] bounds a row value's error, given exact metric rows and covariances. Per chaos pair, the
 //! truncation is at most `γ t_j(0) t_k(0)`, and Horner's rounding is at most `γ Σ_n |a_{j,n} a_{k,n}| |ρ|ⁿ` (Higham,
 //! *Accuracy and Stability of Numerical Algorithms*, §5.1), which Cauchy–Schwarz bounds by the same `γ t_j(0) t_k(0)`;
-//! the columns' errors `e_j` add at most `‖e_j‖ t_k(0) + t_j(0) ‖e_k‖ + ‖e_j‖ ‖e_k‖`. Per closed-form pair, the closed
-//! form adds `γ` of its operations times its magnitudes, and the means' errors add
-//! `|m_j| e_{k,0} + e_{j,0} |m_k| + e_{j,0} e_{k,0}`. The fold adds `γ_width` times its absolute sum.
+//! the columns' errors `e_j` add at most `‖e_j‖ t_k(0) + t_j(0) ‖e_k‖ + ‖e_j‖ ‖e_k‖`. Per closed-form pair, the kernel
+//! states its own evaluation rounding (`PairKernel::value_rounding`), forming `K − m_j m_k` adds
+//! `γ_2 (|K| + |m_j m_k|)`, and the means' errors add `|m_j| e_{k,0} + e_{j,0} |m_k| + e_{j,0} e_{k,0}`. The fold adds
+//! `γ` of its terms times its absolute sum.
 //!
 //! # Layout
 //!
@@ -71,14 +73,11 @@
 //! copy the running CPU selects writes the same words as the portable body. The row sum is one fold in unit order,
 //! with the operations of the closed-form loop. Scratch is per worker: nothing is allocated per pair.
 
+use super::hermite::HermiteColumns;
 use gam_linalg::roundoff::accumulation_growth;
 use gam_math::gaussian_activation::{GaussianActivation, GaussianActivationError, PreactivationPair, pair_kernel};
 use ndarray::ArrayView2;
 use std::fmt;
-
-/// A bound on the floating-point operations one closed form of `gam_math::gaussian_activation` chains, each adding at
-/// most one ulp of relative error to first order. Its own tests state the same bound.
-const CLOSED_FORM_OPERATIONS: usize = 64;
 
 /// The operations one chaos pair chains through order `order`, to first order in the unit roundoff: two products for
 /// the correlation, per order the coefficient product and Horner's product and sum, and the closing product by the
@@ -108,6 +107,8 @@ pub enum PairRouteError {
         other: usize,
         error: GaussianActivationError,
     },
+    /// The column owner refused the block's columns (`response::hermite`).
+    Columns { reason: String },
 }
 
 impl fmt::Display for PairRouteError {
@@ -124,6 +125,7 @@ impl fmt::Display for PairRouteError {
             Self::Pair { unit, other, error } => {
                 write!(f, "closed-form pair ({unit}, {other}) of the chaos pair route: {error}")
             }
+            Self::Columns { reason } => write!(f, "the chaos table's Hermite columns were refused: {reason}"),
         }
     }
 }
@@ -183,26 +185,27 @@ pub struct PairRowScratch {
 }
 
 impl PairChaosTable {
-    /// The table for units `σ(b_j + w_jᵀ Z)` with biases `biases` and reader variances `variances = ‖w_j‖²`, from the
-    /// coefficient owner's columns (`width × (N + 1)` each): `coefficients` holds `a_{j,n}` with `a_{j,0} = m_j`,
-    /// `coefficient_band` a bound on each entry's absolute error, and `value_tails` and `slope_tails` the banded upper
-    /// bounds `t_j(n)` and `d_j(n)` (module docs).
+    /// The table for units `σ(b_j + w_jᵀ Z)` with biases `biases` and reader norms `scales = ‖w_j‖`, the norms the
+    /// columns were scaled by (a closed-form pair reads the variance `s_j²`), from the coefficient owner's columns
+    /// (`width × (N + 1)` each): `coefficients` holds `a_{j,n}` with `a_{j,0} = m_j`, `coefficient_band` a bound on
+    /// each entry's absolute error, and `value_tails` and `slope_tails` the banded upper bounds `t_j(n)` and `d_j(n)`
+    /// (module docs).
     pub fn from_columns(
         activation: GaussianActivation,
         biases: &[f64],
-        variances: &[f64],
+        scales: &[f64],
         coefficients: ArrayView2<'_, f64>,
         coefficient_band: ArrayView2<'_, f64>,
         value_tails: ArrayView2<'_, f64>,
         slope_tails: ArrayView2<'_, f64>,
     ) -> Result<Self, PairRouteError> {
         let width = biases.len();
-        require_length("chaos table variances", width, variances.len())?;
+        require_length("chaos table scales", width, scales.len())?;
         require_finite("chaos table biases", biases.iter())?;
-        require_finite("chaos table variances", variances.iter())?;
-        if variances.iter().any(|variance| *variance < 0.0) {
+        require_finite("chaos table scales", scales.iter())?;
+        if scales.iter().any(|scale| *scale < 0.0) {
             return Err(PairRouteError::NegativeBound {
-                context: "chaos table variances",
+                context: "chaos table scales",
             });
         }
         let columns = coefficients.ncols();
@@ -240,8 +243,8 @@ impl PairChaosTable {
         for unit in 0..width {
             means[unit] = coefficients[[unit, 0]];
             mean_bands[unit] = coefficient_band[[unit, 0]];
-            if variances[unit] > 0.0 {
-                inverse_scales[unit] = variances[unit].sqrt().recip();
+            if scales[unit] > 0.0 {
+                inverse_scales[unit] = scales[unit].recip();
             }
             let mut error_square = 0.0;
             for degree in 1..=order {
@@ -265,7 +268,7 @@ impl PairChaosTable {
             width,
             order,
             biases: biases.to_vec(),
-            variances: variances.to_vec(),
+            variances: scales.iter().map(|scale| scale * scale).collect(),
             means,
             mean_bands,
             inverse_scales,
@@ -285,6 +288,122 @@ impl PairChaosTable {
         Ok(table)
     }
 
+    /// The table for a block's closed-form Hermite columns: the units' activation and biases, the reader norms the
+    /// columns were scaled by, the coefficients with their band, and both banded tails, all read from the column owner.
+    /// Moment columns carry no tails and are refused.
+    ///
+    /// The table's order is `min(N_sat, N)`, with `N` the order the caller built the columns to and `N_sat` the
+    /// [`saturation order`](Self::saturation_order). Past `N_sat` no pair's route or value moves, since every row
+    /// already stops at or below it, so the columns' further orders are only storage. Where the columns never reach
+    /// it, as ReLU's slowly decaying tails do not, the caller's `N` is the table's. A higher order would only move more
+    /// high-correlation pairs from the closed form to the chaos route: a cost choice, which the SpeedGate measures.
+    pub fn for_columns(columns: &HermiteColumns) -> Result<Self, PairRouteError> {
+        let refused = |error: super::hermite::HermiteError| PairRouteError::Columns {
+            reason: format!("{error:?}"),
+        };
+        let (activation, biases) = columns.closed_form_units().map_err(refused)?;
+        let biases = biases.to_vec();
+        let scales = columns.scales().to_vec();
+        let value_tails = columns.value_tails().map_err(refused)?;
+        let slope_tails = columns.slope_tails().map_err(refused)?;
+        let full = Self::from_columns(
+            activation,
+            &biases,
+            &scales,
+            columns.coefficients(),
+            columns.coefficient_band(),
+            value_tails,
+            slope_tails,
+        )?;
+        let order = full.saturation_order();
+        if order == full.order {
+            return Ok(full);
+        }
+        let kept = ndarray::s![.., ..=order];
+        Self::from_columns(
+            activation,
+            &biases,
+            &scales,
+            columns.coefficients().slice(kept),
+            columns.coefficient_band().slice(kept),
+            value_tails.slice(kept),
+            slope_tails.slice(kept),
+        )
+    }
+
+    /// The order to build a block's columns to so that [`Self::saturation_order`] finds a saturation order whenever the
+    /// column owner's a-priori envelopes admit one: the smallest `N` at which every unit's value and slope tail
+    /// envelopes (`response::hermite::unit_tail_envelope`, `unit_slope_tail_envelope`), taken relative to the unit's
+    /// own scales `t_j(0)` and `d_j(0)`, meet both chaos bounds at correlation one. The actual tails are at most the
+    /// envelopes, so a table built to `N` saturates at or below it. The scales are read from `columns` at any order.
+    ///
+    /// `None` when some unit's envelopes never do, as ReLU's slope envelope is `+∞`: such a block has no saturation
+    /// order an a-priori bound can find. Both envelopes shrink with `N` and the bound grows with it, so the condition
+    /// holds from its first order on and is found by doubling and bisection.
+    pub fn covering_column_order(columns: &HermiteColumns) -> Result<Option<usize>, PairRouteError> {
+        let refused = |error: super::hermite::HermiteError| PairRouteError::Columns {
+            reason: format!("{error:?}"),
+        };
+        let (activation, biases) = columns.closed_form_units().map_err(refused)?;
+        let scales = columns.scales();
+        let value_scales = columns.value_tails().map_err(refused)?.column(0).to_owned();
+        let slope_scales = columns.slope_tails().map_err(refused)?.column(0).to_owned();
+        let covered = |order: usize| -> Result<bool, PairRouteError> {
+            let band = accumulation_growth(chaos_operations(order)).sqrt();
+            for unit in 0..scales.len() {
+                let (bias, scale) = (biases[unit], scales[unit]);
+                let value = super::hermite::unit_tail_envelope(activation, bias, scale, order).map_err(refused)?;
+                let slope =
+                    super::hermite::unit_slope_tail_envelope(activation, bias, scale, order).map_err(refused)?;
+                if !(value.sqrt() <= band * value_scales[unit] && slope.sqrt() <= band * slope_scales[unit]) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        let mut upper = 1usize;
+        while !covered(upper)? {
+            // An envelope that is not finite at this order is not finite at any: the envelope forms have no order
+            // at which `+∞` turns finite, and a doubling that overflows has no order left to try.
+            if (0..scales.len()).any(|unit| {
+                super::hermite::unit_slope_tail_envelope(activation, biases[unit], scales[unit], upper)
+                    .is_ok_and(|slope| !slope.is_finite())
+                    || super::hermite::unit_tail_envelope(activation, biases[unit], scales[unit], upper)
+                        .is_ok_and(|value| !value.is_finite())
+            }) {
+                return Ok(None);
+            }
+            let Some(doubled) = upper.checked_mul(2) else {
+                return Ok(None);
+            };
+            upper = doubled;
+        }
+        let mut lower = upper / 2;
+        while lower + 1 < upper {
+            let middle = lower + (upper - lower) / 2;
+            if covered(middle)? {
+                upper = middle;
+            } else {
+                lower = middle;
+            }
+        }
+        Ok(Some(upper))
+    }
+
+    /// The highest order the table carries.
+    pub fn order(&self) -> usize {
+        self.order
+    }
+
+    /// The smallest order at which every unit meets both chaos bounds at correlation one, so every off-diagonal
+    /// pair's route radius is one and no row needs a higher order; the table's own order when no order it carries
+    /// does.
+    pub fn saturation_order(&self) -> usize {
+        (1..=self.order)
+            .find(|&order| (0..self.width).all(|unit| self.meets_bounds(unit, order, 1.0, true)))
+            .unwrap_or(self.order)
+    }
+
     /// Scratch for one worker's rows of this table.
     pub fn row_scratch(&self) -> PairRowScratch {
         PairRowScratch {
@@ -297,15 +416,19 @@ impl PairChaosTable {
         }
     }
 
-    /// One unit's row of the pair sum, `Σ_k D_jk [K_σ − m_j m_k]`, with its error band. `covariances` is the row
-    /// `r_jk = w_jᵀ P w_k`, and `weights` enters as the row `D_jk`; with `gradient` it leaves as
-    /// `B_jk = D_jk ∂_r K_σ`.
+    /// One unit's row of the pair sum over the columns `k ≥ first_column`, `Σ_{k ≥ first_column} D_jk [K_σ − m_j m_k]`,
+    /// with its error band. `covariances` holds `r_jk = w_jᵀ P w_k` and `weights` enters as `D_jk`, both for
+    /// `k = first_column..width` in order; with `gradient` `weights` leaves as `B_jk = D_jk ∂_r K_σ`. A caller that
+    /// assembles a symmetric sum from `k ≥ j` passes `first_column = j`, reading one packed upper row, and every pair
+    /// it evaluates is the same function of its own correlation as in the full row.
     ///
-    /// `covariance_rounding(k)` is the `covariance_rounding` the caller's formation of `r_jk` states for the pair
-    /// `(unit, k)` (`response::subspace::covariance_rounding_band`). Only closed-form pairs read it.
+    /// `covariance_rounding(k)`, for the column index `k` itself, is the `covariance_rounding` the caller's formation
+    /// of `r_jk` states for the pair `(unit, k)` (`response::subspace::covariance_rounding_band`). Only closed-form
+    /// pairs read it.
     pub fn pair_row(
         &self,
         unit: usize,
+        first_column: usize,
         covariances: &[f64],
         covariance_rounding: impl Fn(usize) -> f64,
         weights: &mut [f64],
@@ -313,9 +436,17 @@ impl PairChaosTable {
         scratch: &mut PairRowScratch,
     ) -> Result<PairRowSum, PairRouteError> {
         let width = self.width;
-        require_length("pair row covariances", width, covariances.len())?;
-        require_length("pair row weights", width, weights.len())?;
         require_length("pair row scratch", width, scratch.values.len())?;
+        if first_column > width {
+            return Err(PairRouteError::DimensionMismatch {
+                context: "pair row first column",
+                expected: width,
+                got: first_column,
+            });
+        }
+        let count = width - first_column;
+        require_length("pair row covariances", count, covariances.len())?;
+        require_length("pair row weights", count, weights.len())?;
         let PairRowScratch {
             correlations,
             values,
@@ -324,18 +455,23 @@ impl PairChaosTable {
             unit_coefficients,
             direct,
         } = scratch;
+        let (correlations, values, slopes, bands) = (
+            &mut correlations[..count],
+            &mut values[..count],
+            &mut slopes[..count],
+            &mut bands[..count],
+        );
+        let inverse_scales = &self.inverse_scales[first_column..];
         let inverse_unit = self.inverse_scales[unit];
-        for ((correlation, &covariance), &inverse_scale) in correlations
-            .iter_mut()
-            .zip(covariances)
-            .zip(&self.inverse_scales)
+        for ((correlation, &covariance), &inverse_scale) in
+            correlations.iter_mut().zip(covariances).zip(inverse_scales)
         {
             *correlation = covariance * inverse_unit * inverse_scale;
         }
         let radius = self.routes[unit];
         direct.clear();
         let mut largest = 0.0f64;
-        for (other, &correlation) in correlations.iter().enumerate() {
+        for (other, &correlation) in (first_column..width).zip(correlations.iter()) {
             let magnitude = correlation.abs();
             if other == unit || !(magnitude <= radius.min(self.routes[other])) {
                 direct.push(other);
@@ -351,13 +487,15 @@ impl PairChaosTable {
         chaos_orders(
             unit_coefficients.as_slice(),
             &self.coefficients,
-            correlations.as_slice(),
-            values.as_mut_slice(),
-            slopes.as_mut_slice(),
+            width,
+            first_column,
+            correlations,
+            values,
+            slopes,
             gradient,
         );
         if gradient {
-            for (slope, &inverse_scale) in slopes.iter_mut().zip(&self.inverse_scales) {
+            for (slope, &inverse_scale) in slopes.iter_mut().zip(inverse_scales) {
                 *slope *= inverse_unit * inverse_scale;
             }
         }
@@ -366,15 +504,17 @@ impl PairChaosTable {
         let series_band = 2.0 * accumulation_growth(chaos_operations(order)) * unit_scale;
         for ((band, &scale), &error) in bands
             .iter_mut()
-            .zip(&self.value_scales)
-            .zip(&self.coefficient_errors)
+            .zip(&self.value_scales[first_column..])
+            .zip(&self.coefficient_errors[first_column..])
         {
             *band = scale * (series_band + unit_error) + error * (unit_scale + unit_error);
         }
-        let closed_band = accumulation_growth(CLOSED_FORM_OPERATIONS);
+        // Forming `K − m_j m_k`: the mean product and the difference, one rounding each.
+        let difference_band = accumulation_growth(2);
         let unit_mean = self.means[unit];
         let unit_mean_band = self.mean_bands[unit];
         for &other in direct.iter() {
+            let local = other - first_column;
             let rounding = covariance_rounding(other);
             if !rounding.is_finite() {
                 return Err(PairRouteError::NonFinite {
@@ -393,7 +533,7 @@ impl PairChaosTable {
                     mean_y: self.biases[other],
                     variance_x: self.variances[unit],
                     variance_y: self.variances[other],
-                    covariance: covariances[other],
+                    covariance: covariances[local],
                     covariance_rounding: rounding,
                 },
             )
@@ -401,9 +541,10 @@ impl PairChaosTable {
             let other_mean = self.means[other];
             let other_mean_band = self.mean_bands[other];
             let mean_product = unit_mean * other_mean;
-            values[other] = kernel.value - mean_product;
-            slopes[other] = kernel.covariance_derivative;
-            bands[other] = closed_band * (kernel.value.abs() + mean_product.abs())
+            values[local] = kernel.value - mean_product;
+            slopes[local] = kernel.covariance_derivative;
+            bands[local] = kernel.value_rounding
+                + difference_band * (kernel.value.abs() + mean_product.abs())
                 + unit_mean.abs() * other_mean_band
                 + unit_mean_band * (other_mean.abs() + other_mean_band);
         }
@@ -436,7 +577,7 @@ impl PairChaosTable {
         }
         Ok(PairRowSum {
             value,
-            band: band + accumulation_growth(width) * absolute,
+            band: band + accumulation_growth(count) * absolute,
         })
     }
 
@@ -505,13 +646,15 @@ fn radius(band: f64, product: f64, exponent: usize) -> f64 {
     }
 }
 
-/// Every order of one row by Horner: `values[k] = Σ_{n≤N} ρ_kⁿ a_{j,n} a_{k,n}` and, with `gradient`,
-/// `slopes[k] = Σ_{n≤N} n ρ_kⁿ⁻¹ a_{j,n} a_{k,n}`, where `N = unit_coefficients.len()`, on the CPU-feature variant the
-/// running machine supports.
+/// Every order of one row by Horner: `values[i] = Σ_{n≤N} ρ_iⁿ a_{j,n} a_{k,n}` and, with `gradient`,
+/// `slopes[i] = Σ_{n≤N} n ρ_iⁿ⁻¹ a_{j,n} a_{k,n}` for `k = first + i`, where `N = unit_coefficients.len()` and `columns`
+/// holds each order's coefficients over all units at `stride`, on the CPU-feature variant the running machine supports.
 #[inline]
 fn chaos_orders(
     unit_coefficients: &[f64],
     columns: &[f64],
+    stride: usize,
+    first: usize,
     correlations: &[f64],
     values: &mut [f64],
     slopes: &mut [f64],
@@ -520,10 +663,12 @@ fn chaos_orders(
     #[cfg(target_arch = "x86_64")]
     if avx2_available() {
         // SAFETY: `avx2_available` is the cached CPU probe for exactly the `avx2` feature this variant enables.
-        unsafe { chaos_orders_avx2(unit_coefficients, columns, correlations, values, slopes, gradient) };
+        unsafe {
+            chaos_orders_avx2(unit_coefficients, columns, stride, first, correlations, values, slopes, gradient)
+        };
         return;
     }
-    chaos_orders_body(unit_coefficients, columns, correlations, values, slopes, gradient);
+    chaos_orders_body(unit_coefficients, columns, stride, first, correlations, values, slopes, gradient);
 }
 
 /// Whether the running x86_64 CPU executes the `avx2` variant. `is_x86_feature_detected!` caches its probe in a
@@ -541,12 +686,14 @@ fn avx2_available() -> bool {
 fn chaos_orders_avx2(
     unit_coefficients: &[f64],
     columns: &[f64],
+    stride: usize,
+    first: usize,
     correlations: &[f64],
     values: &mut [f64],
     slopes: &mut [f64],
     gradient: bool,
 ) {
-    chaos_orders_body(unit_coefficients, columns, correlations, values, slopes, gradient);
+    chaos_orders_body(unit_coefficients, columns, stride, first, correlations, values, slopes, gradient);
 }
 
 /// Horner from the highest order down. While it runs, `values` carries `Q = Σ_{n≤N} a_{j,n} a_{k,n} ρⁿ⁻¹` and `slopes`
@@ -555,6 +702,8 @@ fn chaos_orders_avx2(
 fn chaos_orders_body(
     unit_coefficients: &[f64],
     columns: &[f64],
+    stride: usize,
+    first: usize,
     correlations: &[f64],
     values: &mut [f64],
     slopes: &mut [f64],
@@ -569,9 +718,10 @@ fn chaos_orders_body(
     let order = unit_coefficients.len();
     for (&unit_coefficient, column) in unit_coefficients
         .iter()
-        .zip(columns[..order * width].chunks_exact(width))
+        .zip(columns[..order * stride].chunks_exact(stride))
         .rev()
     {
+        let column = &column[first..first + width];
         if gradient {
             for (((value, slope), &coefficient), &correlation) in values
                 .iter_mut()

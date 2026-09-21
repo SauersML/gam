@@ -1475,7 +1475,9 @@ pub(crate) const RESPONSE_GEOMETRY_SCHEMA: &str = "gamfit.ResponseGeometryModel/
 /// The kind of a saved gamfit model payload, read from its JSON header. A
 /// `gamfit.ManifoldSAE` schema of any version is `"manifold_sae"`, so a stale
 /// version reaches its own refusal; the response-geometry container is
-/// `"response_geometry"`; the multinomial envelope is `"multinomial"`. Every
+/// `"response_geometry"`; the multinomial envelope is `"multinomial"`; a saved
+/// event-history predictor's envelope is its registered kind
+/// (`EVENT_HISTORY_MODEL_KIND`), whose loader refuses another version. Every
 /// other payload, including bytes that are not JSON, is `"scalar"`, whose
 /// loader reports what is wrong with it.
 #[pyfunction]
@@ -1486,10 +1488,15 @@ fn saved_model_kind(model_bytes: Vec<u8>) -> &'static str {
         schema: Option<String>,
         #[serde(default)]
         model_class: Option<String>,
+        #[serde(default)]
+        kind: Option<String>,
     }
     let Ok(header) = serde_json::from_slice::<SavedModelHeader>(&model_bytes) else {
         return "scalar";
     };
+    if header.kind.as_deref() == Some(gam::event_history::EVENT_HISTORY_MODEL_KIND) {
+        return gam::event_history::EVENT_HISTORY_MODEL_KIND;
+    }
     let schema_family = header
         .schema
         .as_deref()

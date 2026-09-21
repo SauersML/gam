@@ -174,14 +174,13 @@ pub(crate) fn build_marginal_blockspec(
     }
 }
 
-/// The inner coefficient fit. The solver's error is returned whole, so the fit
-/// that stops on it raises its category (#2937).
 pub(crate) fn inner_fit(
     family: &SurvivalMarginalSlopeFamily,
     blocks: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
-) -> Result<UnifiedFitResult, crate::custom_family::CustomFamilyError> {
+) -> Result<UnifiedFitResult, String> {
     crate::custom_family::fit_custom_family_arming_on_evidence(family, blocks, options)
+        .map_err(|e| e.to_string())
 }
 
 pub(crate) fn inner_fit_from_certified_outer(
@@ -191,11 +190,12 @@ pub(crate) fn inner_fit_from_certified_outer(
     mode: CustomFamilyJointHyperModeSelection,
     theta: &Array1<f64>,
     outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
-) -> Result<UnifiedFitResult, crate::custom_family::CustomFamilyError> {
+) -> Result<UnifiedFitResult, String> {
     let options = crate::outer_subsample::exact_outer_options(options);
     fit_custom_family_fixed_log_lambdas_from_mode_selection(
         family, blocks, &options, mode, theta, outer,
     )
+    .map_err(|error| error.to_string())
 }
 
 /// Marginal-slope guard policy: the guard is required to be strictly positive
@@ -507,10 +507,6 @@ pub(crate) fn install_time_nullspace_shrinkage_penalty(
     // Gram over all `p` columns was singular there — `NonPositivePivot` — and
     // the whole survival fit refused before its first evaluation).
     timewiggle_cols: usize,
-    // Rows entering at the time origin. Their likelihood has no entry factor
-    // (`S(0) = 1`), so their entry evaluation is not a value channel and carries
-    // no metric mass (gnomon#2336).
-    entry_at_origin: &Array1<bool>,
 ) -> Result<bool, String> {
     let p = time_block.design_exit.ncols();
     if p == 0 || time_block.penalties.is_empty() {
@@ -572,20 +568,7 @@ pub(crate) fn install_time_nullspace_shrinkage_penalty(
     // treating both endpoints symmetrically. Under any coefficient chart
     // change M, `G -> M' G M`, so the resulting null ridge transforms by the
     // same congruence instead of changing the represented penalty.
-    //
-    // Only delayed entries are an entry channel. A landmarked cohort enters every
-    // row at the origin, where the entry design row is one shared finite
-    // stand-in; counting it put half of the metric's mass on a single point
-    // whose location moved with the time anchor.
-    if entry_at_origin.len() != time_block.design_entry.nrows() {
-        return Err(format!(
-            "survival-marginal-slope time_block origin-entry mask has {} rows, but the entry design has {}",
-            entry_at_origin.len(),
-            time_block.design_entry.nrows(),
-        ));
-    }
-    let entry_weights = entry_at_origin.mapv(|origin| if origin { 0.0 } else { 1.0 });
-    let entry_mass = entry_at_origin.iter().filter(|&&origin| !origin).count();
+    let entry_mass = time_block.design_entry.nrows();
     let exit_mass = time_block.design_exit.nrows();
     let total_mass = entry_mass.saturating_add(exit_mass);
     if total_mass == 0 {
@@ -596,7 +579,7 @@ pub(crate) fn install_time_nullspace_shrinkage_penalty(
     }
     let entry_gram = time_block
         .design_entry
-        .diag_xtw_x(&entry_weights)
+        .diag_xtw_x(&Array1::ones(entry_mass))
         .map_err(|err| format!("survival-marginal-slope time_block entry function Gram: {err}"))?;
     let exit_gram = time_block
         .design_exit
@@ -817,12 +800,10 @@ pub(crate) fn combine_slope_surface_designs(
 /// using the baseline offsets alone as a time-only pilot q(t).
 ///
 /// This is a safeguarded 1D Newton solve on the true row objective. It does not
-/// use a coarse fixed grid scan. A row entering at the time origin carries no
-/// entry factor here, as in the fitted likelihood (gnomon#2336).
+/// use a coarse fixed grid scan.
 pub(crate) fn pooled_survival_baseline(
     event: &Array1<f64>,
     weights: &Array1<f64>,
-    entry_at_origin: &Array1<bool>,
     z: &Array1<f64>,
     q0: &Array1<f64>,
     q1: &Array1<f64>,
@@ -845,7 +826,6 @@ pub(crate) fn pooled_survival_baseline(
                     slope,
                     z[i],
                     weights[i],
-                    if entry_at_origin[i] { 0.0 } else { weights[i] },
                     event[i],
                     0.0,
                     probit_scale,

@@ -1,5 +1,6 @@
 use super::*;
 pub(crate) use gam_problem::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN};
+use gam_problem::domain_face::{DomainFaceKind, DomainFaces};
 use gam_problem::{checked_exp_log_strength, checked_exp_log_strengths, validate_log_strength};
 
 /// Closed numerical domain of every active flat log-strength coordinate.
@@ -770,23 +771,31 @@ impl SaeManifoldRho {
 
     /// Generic objective-domain lower face in flat-rho layout. Log strengths
     /// share this exact endpoint; the owning SAE objective replaces raw `kappa`
-    /// placeholders with scale-derived geometry rails.
-    pub(crate) fn flat_domain_lower_bound(&self) -> Option<Array1<f64>> {
+    /// placeholders with scale-derived geometry rails. It is the edge of what
+    /// `exp(rho)` represents, so every face is declared
+    /// [`DomainFaceKind::Representability`] (#2627).
+    pub(crate) fn flat_domain_lower_bound(&self) -> Option<DomainFaces> {
         let len = self.flat_coordinates().len();
         if len == 0 {
             return None;
         }
-        Some(Array1::from_elem(len, LOG_STRENGTH_MIN))
+        Some(DomainFaces::uniform(
+            Array1::from_elem(len, LOG_STRENGTH_MIN),
+            DomainFaceKind::Representability,
+        ))
     }
 
     /// Objective-domain upper face in flat-rho layout; see
     /// [`Self::flat_domain_lower_bound`].
-    pub(crate) fn flat_domain_upper_bound(&self) -> Option<Array1<f64>> {
+    pub(crate) fn flat_domain_upper_bound(&self) -> Option<DomainFaces> {
         let len = self.flat_coordinates().len();
         if len == 0 {
             return None;
         }
-        Some(Array1::from_elem(len, LOG_STRENGTH_MAX))
+        Some(DomainFaces::uniform(
+            Array1::from_elem(len, LOG_STRENGTH_MAX),
+            DomainFaceKind::Representability,
+        ))
     }
 
     /// Flatten ρ into the contiguous outer-coordinate vector the generic

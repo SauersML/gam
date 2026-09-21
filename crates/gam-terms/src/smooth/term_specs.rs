@@ -2224,6 +2224,11 @@ where
 pub enum PenaltyStructureHint {
     Ridge(f64),
     Kronecker(Vec<Array2<f64>>),
+    /// The block's authoritative energy factor `A` with `local = AᵀA`.
+    /// Canonicalization roots it from `SVD(A)` at the resolved singular-value
+    /// rank ([`gam_linalg::roundoff::factor_rank_partition`]), so the root and
+    /// `log|S|₊` never go through the squared conditioning of `AᵀA` (#2469).
+    EnergyFactor(Array2<f64>),
 }
 
 /// A penalty matrix stored at its natural block size together with the
@@ -2316,6 +2321,25 @@ impl BlockwisePenalty {
             local,
             prior_mean: gam_problem::CoefficientPriorMean::Zero,
             structure_hint: Some(PenaltyStructureHint::Kronecker(factors)),
+            op: None,
+        }
+    }
+
+    /// A block whose `local` is `AᵀA` for the builder's authoritative energy
+    /// factor `A`. Canonicalization roots it from `SVD(A)`.
+    pub(crate) fn energy_factor(
+        col_range: Range<usize>,
+        local: Array2<f64>,
+        factor: Array2<f64>,
+    ) -> Self {
+        assert_eq!(col_range.len(), local.nrows());
+        assert_eq!(col_range.len(), local.ncols());
+        assert_eq!(col_range.len(), factor.ncols());
+        Self {
+            col_range,
+            local,
+            prior_mean: gam_problem::CoefficientPriorMean::Zero,
+            structure_hint: Some(PenaltyStructureHint::EnergyFactor(factor)),
             op: None,
         }
     }
@@ -5296,28 +5320,32 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
     let d = penalty_centers.ncols();
     let m = nu.half_integer_value() + 0.5 * d as f64;
     let mut candidates = Vec::with_capacity(4);
-    for (raw, source, min_order) in [
-        (ops.d0.t().dot(&ops.d0), PenaltySource::OperatorMass, 0.0),
-        (ops.d1.t().dot(&ops.d1), PenaltySource::OperatorTension, 1.0),
-        (
-            ops.d2.t().dot(&ops.d2),
-            PenaltySource::OperatorStiffness,
-            2.0,
-        ),
+    for (operator, source, min_order) in [
+        (&ops.d0, PenaltySource::OperatorMass, 0.0),
+        (&ops.d1, PenaltySource::OperatorTension, 1.0),
+        (&ops.d2, PenaltySource::OperatorStiffness, 2.0),
     ] {
         let nondifferentiable_ou = matches!(nu, crate::basis::MaternNu::Half);
         if min_order > 0.0 && (nondifferentiable_ou || m < min_order) {
             continue;
         }
-        let sym = (&raw + &raw.t()) * 0.5;
-        let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym);
-        candidates.push(PenaltyCandidate {
-            matrix: ConstructiveQuadratic::try_from_dense_psd(matrix, "Matérn operator penalty")?,
-            source,
-            normalization_scale,
-            kronecker_factors: None,
-            op: None,
-        });
+        // The collocated operator `D` is the penalty's energy factor, and its
+        // singular values decide the rank. `DᵀD` squares `D`'s conditioning: on
+        // a 119-center 2-D cloud the mass factor resolves all 118 modes at every
+        // length scale, while the dense Gram's rank falls to 113, 45 and 5 as ℓ
+        // grows and its tail comes back as roundoff of either sign (MSI job
+        // 1123515, #2817). The Householder `R` of `D` (`RᵀR = DᵀD`, backward
+        // stable) carries the same singular values at `p × p` storage.
+        let (_, energy_factor) = gam_linalg::faer_ndarray::FaerQr::qr(operator)
+            .map_err(BasisError::LinalgError)?;
+        let quadratic = ConstructiveQuadratic::from_energy_factor(
+            energy_factor,
+            "Matérn operator penalty energy factor",
+        )?
+        .with_factor_rank_partition();
+        candidates.push(crate::basis::normalize_constructive_penalty_candidate(
+            quadratic, source,
+        )?);
     }
     if let Some(gram) = ops.third_order_gram.as_ref() {
         let sym = (gram + &gram.t()) * 0.5;
@@ -8724,6 +8752,13 @@ pub fn build_single_local_smooth_term(
             penalty.matrix = fast_ab(&tt_s, &t);
             penalty.op = None;
             penalty.info.kronecker_factors = None;
+            // `Tᵀ AᵀA T = (AT)ᵀ(AT)`: an energy factor transports exactly through
+            // this chart, orthogonal or not.
+            penalty.info.energy_factor = penalty
+                .info
+                .energy_factor
+                .as_ref()
+                .map(|factor| fast_ab(factor, &t));
             // A declared structural null frame does NOT survive this chart.
             // `null(Tᵀ S T) = T⁻¹ null(S)`, and `T` is a cumulative-sum /
             // derivative-control transform — invertible but not orthogonal, so
@@ -8785,10 +8820,20 @@ pub fn build_single_local_smooth_term(
             // A positive Frobenius rescale does not move a null space, so the
             // frame transports verbatim through this chart.
             let structural_null_frame = info.structural_null_frame;
-            let matrix = ConstructiveQuadratic::try_from_dense_psd(
-                matrix,
-                "shape-constrained transformed penalty",
-            )?;
+            let matrix = match info.energy_factor {
+                // `S/c = (A/√c)ᵀ(A/√c)`: keep the transported factor rather than
+                // rebuild one from the dense Gram.
+                Some(factor) => ConstructiveQuadratic::from_energy_factor(
+                    factor,
+                    "shape-constrained transformed penalty energy factor",
+                )?
+                .with_factor_rank_partition()
+                .scaled(1.0 / c_new, "normalized shape-constrained penalty energy factor")?,
+                None => ConstructiveQuadratic::try_from_dense_psd(
+                    matrix,
+                    "shape-constrained transformed penalty",
+                )?,
+            };
             let matrix = match structural_null_frame {
                 Some(frame) => matrix.with_structural_null_frame(
                     frame,
@@ -8960,6 +9005,13 @@ pub(crate) fn build_smooth_design_from_planned_terms(
                         .structural_null_frame
                         .as_ref()
                         .map(|frame| gam_linalg::faer_ndarray::fast_atb(q, frame));
+                    // `QᵀAᵀAQ = (AQ)ᵀ(AQ)`: the energy factor moves by right
+                    // multiplication.
+                    penalty.info.energy_factor = penalty
+                        .info
+                        .energy_factor
+                        .as_ref()
+                        .map(|factor| gam_linalg::faer_ndarray::fast_ab(factor, q));
                     penalty.op = None;
                     penalty.info.kronecker_factors = None;
                 }
@@ -8971,10 +9023,15 @@ pub(crate) fn build_smooth_design_from_planned_terms(
 
         for active_penalty in &built.active_penalties {
             let global_index = penalties_global.len();
-            penalties_global.push(
-                BlockwisePenalty::new(col_start..col_end, active_penalty.matrix.clone())
-                    .with_op(active_penalty.op.clone()),
-            );
+            let block = match active_penalty.info.energy_factor.as_ref() {
+                Some(factor) => BlockwisePenalty::energy_factor(
+                    col_start..col_end,
+                    active_penalty.matrix.clone(),
+                    factor.clone(),
+                ),
+                None => BlockwisePenalty::new(col_start..col_end, active_penalty.matrix.clone()),
+            };
+            penalties_global.push(block.with_op(active_penalty.op.clone()));
             nullspace_dims_global.push(active_penalty.nullity);
             penaltyinfo_global.push(PenaltyBlockInfo {
                 global_index,

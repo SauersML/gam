@@ -338,7 +338,9 @@ fn reactive_entry_reseeds_nonzero_k2_seed_to_strict_separated_root_2080() {
         .expect("dense K=2 objective must own a reactive scalar contract");
     let entry_rho = OuterObjective::outer_domain_upper_bound(&objective)
         .expect("reactive rho entry query")
-        .expect("dense K=2 objective must own a reactive rho entry");
+        .expect("dense K=2 objective must own a reactive rho entry")
+        .values()
+        .clone();
 
     OuterObjective::begin_reactive_domain_waypoint(&mut objective)
         .expect("entry transaction must begin");
@@ -610,11 +612,15 @@ impl OuterObjective for LivelockRecorder<'_> {
         self.inner.seed_inner_state(beta)
     }
 
-    fn outer_domain_upper_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
+    fn outer_domain_upper_bound(
+        &self,
+    ) -> Result<Option<gam_problem::domain_face::DomainFaces>, EstimationError> {
         self.inner.outer_domain_upper_bound()
     }
 
-    fn outer_domain_lower_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
+    fn outer_domain_lower_bound(
+        &self,
+    ) -> Result<Option<gam_problem::domain_face::DomainFaces>, EstimationError> {
         self.inner.outer_domain_lower_bound()
     }
 

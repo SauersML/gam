@@ -196,6 +196,17 @@ impl OuterDerivativePilotSchedule {
         }
     }
 
+    /// The measure the family's evaluations currently price.
+    ///
+    /// Each sampled derivative point advances the counter through
+    /// `0..=budget`, and the exact full-data phase is the one value
+    /// `budget + 1`. Two evaluations that read different epochs may price
+    /// different measures at one outer point, so a result stored under one
+    /// epoch never answers for another (#2627).
+    pub fn measure_epoch(&self) -> usize {
+        self.phase_counter.load(Ordering::SeqCst)
+    }
+
     /// Enter the exact full-data phase iff at least one sampled derivative
     /// evaluation actually ran and the family has not already transitioned.
     ///

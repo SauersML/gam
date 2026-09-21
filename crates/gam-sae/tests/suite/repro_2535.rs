@@ -36,8 +36,9 @@ fn noise_stream(seed: u64) -> impl FnMut() -> f64 {
 fn build_k2(
     evaluator: &Arc<PeriodicHarmonicEvaluator>,
     coords: &Array2<f64>,
-    output_dim: usize,
+    target: &Array2<f64>,
 ) -> (SaeManifoldTerm, SaeManifoldRho) {
+    let output_dim = target.ncols();
     let (basis_values, basis_jacobian) = evaluator.evaluate(coords.view()).unwrap();
     let basis_width = basis_values.ncols();
     let atoms: Vec<SaeManifoldAtom> = (0..2)
@@ -70,8 +71,11 @@ fn build_k2(
         AssignmentMode::softmax(1.0),
     )
     .unwrap();
-    let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+    let mut term = SaeManifoldTerm::new(atoms, assignment).unwrap();
     let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1), Array1::<f64>::zeros(1)]);
+    // #2822 — the data least-squares decoders at the fixture's charts; an entry refuses a zero decoder.
+    term.refit_decoder_least_squares_at_current_state(target.view(), Some(&rho))
+        .expect("the planted circle spans nonzero least-squares decoders");
     (term, rho)
 }
 
@@ -112,11 +116,10 @@ fn fresh_arrow_schur_joint_fits_are_bit_reproducible_at_k2_2535() {
     let behavior = BehaviorBlock::fit(probabilities.view(), p_x, 0.0).unwrap();
     // The augmented target `[Z | √λ_y·Y]` at log λ_y = 0, where √λ_y = exp(0) = 1.
     let target = concatenate(Axis(1), &[activations.view(), behavior.target.view()]).unwrap();
-    let output_dim = target.ncols();
 
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(basis_width).unwrap());
     let mut fits: Vec<(SaeManifoldTerm, SaeManifoldRho)> = (0..4)
-        .map(|_| build_k2(&evaluator, &coords, output_dim))
+        .map(|_| build_k2(&evaluator, &coords, &target))
         .collect();
     for (term, rho) in &mut fits {
         term.run_joint_fit_arrow_schur(target.view(), rho, None, 1, 1.0, 1.0e-6, 1.0e-6)

@@ -3119,20 +3119,21 @@ pub(crate) fn run_outer_with_plan(
     // anyway.
     //
     // The incumbent is the lowest checkpoint the attempt kept. Its stored value is
-    // where a search stopped, so it is re-evaluated at its own ρ before it can
-    // outrank anything. The gap is judged at the criterion's own rounding
-    // envelope, [`outer_value_agreement_bound`], because two values of one
-    // criterion closer than that cannot be ranked. Beyond it the winner loses.
-    // The search continues once from the incumbent, with the same one-shot reseed
-    // the tail-snap and saddle-escape retries use. If that does not certify, the
-    // attempt returns the typed [`PlanRunOutcome::DominatedPlateau`], and the
-    // incumbent is the resume checkpoint. When the objective refuses to
-    // re-evaluate the incumbent, its stored value, the criterion's own evaluation
-    // at that ρ, decides the gap, and no search continues from a point the
-    // objective refuses (#2953).
+    // where a search stopped, possibly under the search-time inner cap, so before it
+    // can outrank anything it is priced at its own ρ by the protocol that priced
+    // the winner, at full inner fidelity ([`price_checkpoint`]). The gap is judged
+    // at the criterion's own rounding envelope, [`outer_value_agreement_bound`],
+    // because two values of one criterion closer than that cannot be ranked. Beyond
+    // it the winner loses. The search continues once from the incumbent, with the
+    // same one-shot reseed the tail-snap and saddle-escape retries use. If that does
+    // not certify, the attempt returns the typed [`PlanRunOutcome::DominatedPlateau`],
+    // and the incumbent is the resume checkpoint. A checkpoint that cannot be priced
+    // at full fidelity (refused, unconverged or non-finite) does not defeat the
+    // winner, which publishes carrying it as an [`UnpriceableCheckpoint`]: an
+    // unpriceable state cannot defeat a certified one (the lead's 09-18 ruling on
+    // #2953).
     let mut dominance: Option<(f64, f64)> = None;
-    // Why the incumbent could not be re-evaluated at its own ρ, when it could not.
-    let mut reevaluation_refusal: Option<EstimationError> = None;
+    let mut unpriceable: Option<UnpriceableCheckpoint> = None;
     if let (Some(certified), Some(incumbent)) = (best.as_ref(), best_checkpoint.as_ref()) {
         let winner_value = certified.result().final_value;
         let cached_band =
@@ -3141,37 +3142,35 @@ pub(crate) fn run_outer_with_plan(
             && incumbent.final_value.is_finite()
             && winner_value - incumbent.final_value > cached_band
         {
-            let incumbent_rho = incumbent.rho.clone();
-            obj.reset();
-            install_matching_initial_inner_seed(obj, config, &incumbent_rho, context)?;
-            let incumbent_value = match obj.eval_cost(&incumbent_rho) {
-                Ok(value) => value,
-                // The stored checkpoint cannot be re-evaluated at its own ρ. Its stored
-                // value is the criterion's evaluation there and beats the winner beyond
-                // the envelope, so the winner is declined on it (#2953).
-                Err(error) if error.is_trial_point_infeasible() => {
+            match price_checkpoint(obj, config, &incumbent.rho, context)? {
+                CheckpointPrice::Priced(incumbent_value) => {
+                    let band = crate::rho_optimizer::outer_value_agreement_bound(
+                        winner_value,
+                        incumbent_value,
+                    );
+                    if winner_value - incumbent_value > band {
+                        dominance = Some((incumbent_value, band));
+                    }
+                }
+                CheckpointPrice::Unpriceable(refusal) => {
                     log::warn!(
                         "[OUTER] {context}: certified winner rho={:?} cost={:.6e} sits above a stored \
                          checkpoint rho={:?} cost={:.6e} by more than the criterion's rounding envelope \
-                         {:.3e}, and re-evaluating that checkpoint was refused ({error}); the winner is \
-                         declined on the stored value, and no search continues from the checkpoint \
-                         (#2953)",
+                         {:.3e}, but the checkpoint cannot be priced at full inner fidelity \
+                         ({refusal}); an unpriceable state cannot defeat a certified one, so the \
+                         winner publishes (#2953)",
                         certified.result().rho.to_vec(),
                         winner_value,
-                        incumbent_rho.to_vec(),
+                        incumbent.rho.to_vec(),
                         incumbent.final_value,
                         cached_band,
                     );
-                    reevaluation_refusal = Some(error);
-                    incumbent.final_value
+                    unpriceable = Some(UnpriceableCheckpoint {
+                        rho: incumbent.rho.clone(),
+                        stored_value: incumbent.final_value,
+                        refusal,
+                    });
                 }
-                Err(error) => return Err(error),
-            };
-            obj.reset();
-            let band =
-                crate::rho_optimizer::outer_value_agreement_bound(winner_value, incumbent_value);
-            if incumbent_value.is_finite() && winner_value - incumbent_value > band {
-                dominance = Some((incumbent_value, band));
             }
         }
     }
@@ -3182,32 +3181,20 @@ pub(crate) fn run_outer_with_plan(
         let plateau = certified.into_result();
         incumbent.final_value = incumbent_value;
         let gap = plateau.final_value - incumbent.final_value;
-        let reevaluated = reevaluation_refusal.is_none();
-        let mut continuation = match reevaluation_refusal {
-            // No search can start from a point the objective refuses.
-            Some(refusal) => DominanceContinuationStop::Failed {
-                error: format!(
-                    "re-evaluating the checkpoint at its own rho was refused: {refusal}"
-                ),
-            },
-            None => {
-                log::warn!(
-                    "[OUTER] {context}: certified winner rho={:?} cost={:.6e} is dominated by an \
-                     evaluated state rho={:?} cost={:.6e} (gap {:.3e} > the criterion's rounding \
-                     envelope {:.3e}); it is not published, and the search continues from that \
-                     state (#2596, #2627)",
-                    plateau.rho.to_vec(),
-                    plateau.final_value,
-                    incumbent.rho.to_vec(),
-                    incumbent.final_value,
-                    gap,
-                    band,
-                );
-                DominanceContinuationStop::NotRun
-            }
-        };
-        if allow_tail_snap_reseed && reevaluated {
-            let mut retry_config = config.clone();
+        log::warn!(
+            "[OUTER] {context}: certified winner rho={:?} cost={:.6e} is dominated by an \
+             evaluated state rho={:?} cost={:.6e} (gap {:.3e} > the criterion's rounding \
+             envelope {:.3e}); it is not published, and the search continues from that state \
+             (#2596, #2627)",
+            plateau.rho.to_vec(),
+            plateau.final_value,
+            incumbent.rho.to_vec(),
+            incumbent.final_value,
+            gap,
+            band,
+        );
+        let mut continuation = DominanceContinuationStop::NotRun;
+        if allow_tail_snap_reseed {            let mut retry_config = config.clone();
             // The continuation judges what it certifies against the state it starts from, so it
             // cannot publish the optimum that state just beat (#2953).
             retry_config.carried_checkpoint = Some(carried_checkpoint_of(&incumbent));
@@ -3299,6 +3286,7 @@ pub(crate) fn run_outer_with_plan(
         result.iterations = spent_seed_iterations;
         result.refused_seed_points =
             certificate_refused_seed_points(&seed_rejections, &seeds, &budget_exhausted_seed_points);
+        result.unpriceable_checkpoint = unpriceable;
         // NO mint audit here (#2359). Every candidate above was screened at
         // order three, and the winner's order-four audit is paid EXACTLY ONCE —
         // but it is paid by `run_outer`, not here.
@@ -3469,7 +3457,7 @@ pub(crate) fn run_outer_with_plan(
             String::new()
         };
         if started_seeds == 0 {
-            EstimationError::StartupSeedsRefused(format_no_seeds_passed(
+            EstimationError::RemlOptimizationFailed(format_no_seeds_passed(
                 context,
                 &stats,
                 &seed_rejections,

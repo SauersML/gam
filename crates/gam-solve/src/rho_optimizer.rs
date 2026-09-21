@@ -49,6 +49,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 pub mod asymptote_certificate;
 mod bridges;
 mod capability;
+mod checkpoint_price;
 #[cfg(test)]
 #[path = "rho_optimizer/efs_fallback_routing_tests.rs"]
 mod efs_fallback_routing_tests;
@@ -70,6 +71,7 @@ pub use crate::model_types::{
 };
 pub(crate) use bridges::*;
 pub use capability::*;
+pub(crate) use checkpoint_price::*;
 pub use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval};
 pub(crate) use hessian_operator::*;
 pub use objective::*;

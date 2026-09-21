@@ -160,6 +160,7 @@ pub use cone_normalizer::{
     ConeCoordinateMotion, ConeFirstOrder, ConeNormalizer, ConeNormalizerRefusal, ConePairMotion,
     OrthantLogMass,
 };
+pub mod exact_flow;
 
 /// Relative accuracy demanded of the orthant-moment cubature, measured against
 /// the PRE-TRUNCATION scale `sd_i = sqrt(W_ii)` so the criterion is invariant

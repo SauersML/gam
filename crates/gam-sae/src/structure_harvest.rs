@@ -8133,7 +8133,8 @@ pub struct ProductionRefitParams {
 /// and the per-round ledgers (#997).
 ///
 /// The shard refit folds a held-out block into a candidate via the SAME inner
-/// joint-fit driver the outer fit used ([`SaeManifoldTerm::run_joint_fit_arrow_schur`]),
+/// joint-fit driver the outer fit used, as a converged solve
+/// (`SaeManifoldTerm::run_joint_fit_arrow_schur_to_convergence`),
 /// PENALTY-FREE: the gate's evidence is a held-out reconstruction
 /// likelihood-ratio, and the isometry/ARD penalties are gauge/regularization
 /// terms that do not belong in the evaluation likelihood. Every candidate and
@@ -8172,7 +8173,7 @@ pub fn run_production_structure_search(
             weights[r] = 1.0;
         }
         cand_term.set_row_loss_weights(weights)?;
-        cand_term.run_joint_fit_arrow_schur(
+        cand_term.run_joint_fit_arrow_schur_to_convergence(
             full_target,
             &mut cand_rho,
             None,

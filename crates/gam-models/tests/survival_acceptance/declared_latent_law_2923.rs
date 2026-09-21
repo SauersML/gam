@@ -728,3 +728,75 @@ fn many_atom_declared_law_is_compressed_persisted_and_replayed_bitwise_2928() {
         "the loaded model's survival must match the in-memory model's bit for bit"
     );
 }
+
+/// gnomon#2370's 32-row calibrate request, row by row as its comment on gam#2945 states it.
+fn calibrate_rows_2945() -> gam_data::EncodedDataset {
+    let headers = ["age_entry", "age_exit", "event_target", "score", "sex"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    let rows = (0..32usize)
+        .map(|i| {
+            StringRecord::from(vec![
+                (20 + i % 5).to_string(),
+                (40 + i % 13).to_string(),
+                u8::from(i % 3 != 0).to_string(),
+                format!("{:.17e}", ((7 * i) % 32) as f64 / 8.0 - 2.0),
+                (i % 2).to_string(),
+            ])
+        })
+        .collect::<Vec<_>>();
+    encode_recordswith_inferred_schema(headers, rows).expect("encode the calibrate request")
+}
+
+/// gam#2945: gnomon#2370's 32-row calibrate request on the declared global empirical law. The fit
+/// arms the Jeffreys term, so its exact outer Hessian reads the anchored frame's fifth likelihood
+/// derivatives. Without them the frame declared no outer Hessian, and the certificate at the
+/// search's best checkpoint read `hessian_psd=n/a curvature_source=unavailable`. That checkpoint
+/// lies on the smoothing box's rail and beats the interior optima the search certified. Its
+/// curvature is now measured (`curvature_source=terminal-analytic`) and is indefinite, and its
+/// projected gradient is not stationary. So the fit is refused by name, on evidence. The request's
+/// artificial modular events leave the criterion falling toward that rail. The refusal belongs to
+/// the fixture, not to a missing derivative.
+#[test]
+fn calibrate_request_on_a_declared_law_is_refused_on_measured_curvature_2945() {
+    super::initialize_cpu_fitting();
+    gam_runtime::test_support::install_diagnostic_logger();
+    #[cfg(target_os = "macos")]
+    gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::Off);
+
+    let config = FitConfig {
+        survival_likelihood: Some("marginal-slope".to_string()),
+        slope_formula: Some("1".to_string()),
+        z_column: Some("score".to_string()),
+        latent_measure: Some("global-empirical".to_string()),
+        time_basis: "ispline".to_string(),
+        time_degree: 3,
+        time_num_internal_knots: 4,
+        baseline_target: "weibull".to_string(),
+        baseline_scale: Some(45.34375),
+        baseline_shape: Some(1.0),
+        ..FitConfig::default()
+    };
+    let message = match fit_from_formula(
+        "Surv(age_entry, age_exit, event_target) ~ sex",
+        &calibrate_rows_2945(),
+        &config,
+    ) {
+        Ok(_) => panic!(
+            "the calibrate request's criterion falls toward its smoothing box's rail, where no \
+             point is stationary, so it must be refused"
+        ),
+        Err(error) => error.to_string(),
+    };
+    eprintln!("[2945-CALIBRATE] {message}");
+    assert!(
+        message.contains("declined a certified optimum that an evaluated state beats"),
+        "the refusal must name the certified optimum it declined: {message}"
+    );
+    assert!(
+        message.contains("curvature_source=terminal-analytic")
+            && !message.contains("curvature_source=unavailable"),
+        "the refusal must rest on measured analytic curvature, not an unevaluated one: {message}"
+    );
+}

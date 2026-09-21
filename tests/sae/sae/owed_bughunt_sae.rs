@@ -22,29 +22,29 @@ fn boundary_radius(curvature: f64) -> f64 {
 }
 
 /// Bug-hunt finding: the Poincaré tangent decoder's forward radial coefficient
-/// `exp_coeff(s) = min(tanh(s), 1 - BOUNDARY_EPS)/s` CLAMPS once the tangent
-/// magnitude `s = sqrt(k)|v|` saturates (`tanh(s) >= 1 - BOUNDARY_EPS`, i.e. `s`
-/// beyond `EXP_SATURATION_CAP ≈ 6.103`), pinning the decoded point to the open-
-/// ball boundary. The analytic backward MUST differentiate that SAME clamped,
+/// `exp_coeff(s) = min(tanh(s), R)/s`, with `R` the largest radius whose chart
+/// factor is resolved, CLAMPS once the tangent magnitude `s = sqrt(k)|v|`
+/// saturates (`tanh(s) >= R`, i.e. `s` beyond `atanh(R)`, about 17.7 in two
+/// dimensions), pinning the decoded point to the open-ball boundary. The analytic backward MUST differentiate that SAME clamped,
 /// radially-pinned map — not the unclamped `tanh(s)/s` — or the gradient
 /// desyncs from the forward in the saturated regime.
 ///
-/// This drives the decode deep into saturation (gates of ≈3 onto the two
-/// near-boundary atoms give `s ≈ 8 > 6.103`) and finite-differences the forward
-/// loss. The OLD unclamped backward disagreed with the FD here (the disagreement
-/// is bounded by `~BOUNDARY_EPS` but is a genuine forward/backward inconsistency
-/// the small-input FD test never exercised); the fixed backward matches.
+/// This drives the decode deep into saturation (gates of ≈8 onto the two
+/// near-boundary atoms give `s ≈ 24`, past `atanh(R)`) and finite-differences the
+/// forward loss. The OLD unclamped backward disagreed with the FD in saturation (a
+/// genuine forward/backward inconsistency the small-input FD test never
+/// exercised); the fixed backward matches.
 #[test]
 fn poincare_tangent_backward_matches_fd_in_saturated_regime() {
     // Curvature -1 (sqrt(k) = 1). Two near-boundary atoms in DIFFERENT
-    // directions; their gated tangent sum has |v| ≈ 8 > 6.103, so exp_coeff
+    // directions; their gated tangent sum has |v| ≈ 24 > atanh(R), so exp_coeff
     // CLAMPS and the forward output is pinned to the ball boundary. Because the
     // two atoms are not collinear, moving a gate ROTATES the boundary-pinned
     // output (a genuine tangential sensitivity), so the FD is nonzero and the
     // radially-pinned Jacobian's tangential part is exercised — not just the
     // radial cancellation.
     let atoms = array![[0.95, 0.1], [0.1, 0.95]];
-    let gates = array![[3.0, 2.5]];
+    let gates = array![[9.0, 7.5]];
     let curvature = -1.0;
 
     let (x_hat, cache) =
@@ -52,8 +52,7 @@ fn poincare_tangent_backward_matches_fd_in_saturated_regime() {
 
     // Confirm we are genuinely in the clamped boundary regime: the decoded norm
     // must equal the boundary radius `project_into_ball` clamps to, not the
-    // unclamped tanh image (which would be strictly smaller for this s only by
-    // ~BOUNDARY_EPS, so we assert it is AT the boundary).
+    // unclamped tanh image.
     let boundary = boundary_radius(curvature);
     let out_norm: f64 = (0..x_hat.ncols())
         .map(|j| x_hat[[0, j]] * x_hat[[0, j]])
@@ -88,8 +87,8 @@ fn poincare_tangent_backward_matches_fd_in_saturated_regime() {
     let fd_gate = (lp - lm) / (2.0 * eps);
 
     // In the saturated regime the forward norm is pinned, so moving the gate
-    // changes the loss only at O(BOUNDARY_EPS) — the analytic gradient must track
-    // that small, radially-pinned sensitivity, NOT the unclamped tanh slope.
+    // barely changes the loss: the analytic gradient must track that small,
+    // radially-pinned sensitivity, NOT the unclamped tanh slope.
     assert!(
         (fd_gate - grad_gates[[0, 0]]).abs() < 1.0e-6,
         "saturated gate grad desync: analytic {} vs FD {}",

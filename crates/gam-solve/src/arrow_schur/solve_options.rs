@@ -272,9 +272,16 @@ pub enum ArrowSolverMode {
 /// Reason the Steihaug-CG loop stopped.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum PcgStopReason {
-    /// Residual fell below the relative tolerance threshold.
+    /// The recursive residual plus the residual-gap bound fell to
+    /// `relative_tolerance·‖rhs‖`, so the true residual meets the relative
+    /// tolerance (see `residual_gap`).
     #[default]
-    Converged,
+    RelativeToleranceMet,
+    /// The recursive residual fell to the residual-gap bound before the relative
+    /// tolerance was certified. It no longer resolves the true residual, which is
+    /// at most twice the bound, and no later recursive residual can certify an
+    /// improvement in this arithmetic.
+    AttainableFloorReached,
     /// The loop spent its resolved product budget without meeting its forcing
     /// tolerance ([`ArrowPcgBudget::stop_at`], #2900 row 6.15).
     BudgetExhausted,
@@ -305,8 +312,14 @@ pub struct ArrowPcgDiagnostics {
     pub precond_apply_calls: usize,
     /// Number of times the LM ridge was escalated before a successful factor.
     pub ridge_escalations: usize,
-    /// Relative residual at termination; 0.0 when the RHS was zero.
+    /// Recursive relative residual `‖r̂‖/‖rhs‖` at termination; 0.0 when the RHS
+    /// was zero. The true relative residual lies within
+    /// [`Self::relative_residual_gap_bound`] of it.
     pub final_relative_residual: f64,
+    /// The residual-gap bound `D_k/‖rhs‖` at termination: the recursive and true
+    /// relative residuals differ by at most this. 0.0 before any CG iteration and
+    /// for solves that run no CG.
+    pub relative_residual_gap_bound: f64,
     /// Why the loop stopped.
     pub stopping_reason: PcgStopReason,
     /// Mixed-precision certificate outcome for this solve.

@@ -58,32 +58,67 @@ use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2};
 
 use crate::manifold::{GeometryError, GeometryResult};
 
-/// Numerical floor for denominators that vanish only when a point sits on
-/// the ball boundary. Anything inside the ball satisfies
-/// `1 - k |y|^2 >= BOUNDARY_EPS` after [`project_into_ball`].
-pub(crate) const BOUNDARY_EPS: f64 = 1.0e-5;
+/// Largest ball radius `√k·|y|` at which this module places a point of
+/// dimension `dim`: the chart factor `1 − k|y|²` there is resolved from zero
+/// with one rounding band to spare.
+///
+/// The factor is formed from a `dim`-term `|y|²`, a product and a sum, so it
+/// rounds by `β = γ_{dim+2}·(1 + k|y|²)`, the band inside which
+/// [`poincare_distance`] and [`log_origin`] read a point as on the boundary to
+/// precision. A point placed where the factor is `2β` keeps it above `β` when
+/// any map recomputes it, so every map that refuses an unresolved factor
+/// accepts every point this module produces. Solving `1 − s² = 2γ(1 + s²)`
+/// gives `s² = (1 − 2γ)/(1 + 2γ)`.
+///
+/// `unit_roundoff` is that of the precision the caller stores the point in. A
+/// point computed in f64 and stored narrower (an f32 tensor) is rounded again
+/// there, by about `2u·s²` in its factor, and is then measured at that `u`; the
+/// `2β` margin taken at that `u` covers both. f64 callers pass
+/// [`UNIT_ROUNDOFF`](gam_math::roundoff::UNIT_ROUNDOFF).
+fn resolvable_radius(dim: usize, unit_roundoff: f64) -> f64 {
+    let band = gam_math::roundoff::accumulation_growth_at(dim + 2, unit_roundoff);
+    ((1.0 - 2.0 * band) / (1.0 + 2.0 * band)).sqrt()
+}
 
-/// Largest radial exp-map argument `s = sqrt(k)|v|` worth evaluating
-/// hyperbolic functions at. Above this, `tanh(s)` is already
-/// `1 - BOUNDARY_EPS` in f64 (and `cosh`/`sinh` would eventually overflow to
-/// `inf` near `s ≈ 710`), so the Lorentz lift caps `s` here to stay finite
-/// while landing on the same clamped boundary as the Poincaré path. Derived
-/// from [`BOUNDARY_EPS`] — no magic literal: `atanh(1 - BOUNDARY_EPS) ≈ 6.1`.
-const EXP_SATURATION_CAP: f64 = {
-    // `atanh` is not const-evaluable; the cap is fixed by BOUNDARY_EPS as
-    // `atanh(1 - BOUNDARY_EPS)` and is pinned by
-    // `exp_saturation_cap_matches_boundary_eps`.
-    6.1030338227611125
-};
+/// Refuses a storage unit roundoff that is not a precision at least as coarse
+/// as f64's, or so coarse that a `dim`-dimensional ball has no resolvable
+/// radius (`2γ_{dim+2} ≥ 1`).
+fn require_storage_unit_roundoff(unit_roundoff: f64, dim: usize) -> GeometryResult<()> {
+    let band = gam_math::roundoff::accumulation_growth_at(dim + 2, unit_roundoff);
+    if !(unit_roundoff >= gam_math::roundoff::UNIT_ROUNDOFF && 2.0 * band < 1.0) {
+        return Err(GeometryError::InvalidPoint(
+            "Poincaré storage unit roundoff must be finite, at least f64's, and fine enough for the \
+             ball to have a resolvable radius",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a ball radius `s = √k·|y|` of a `dim`-dimensional point has a chart
+/// factor `1 − s²` inside its own rounding band `γ_{dim+2}·(1 + s²)`: on the
+/// boundary to precision.
+fn chart_factor_unresolved(s: f64, dim: usize) -> bool {
+    let band = gam_linalg::roundoff::accumulation_growth(dim + 2);
+    !(1.0 - s * s > band * (1.0 + s * s))
+}
+
+/// Largest radial exp-map argument `s = √k·|v|` worth evaluating hyperbolic
+/// functions at: `atanh` of [`resolvable_radius`], where `tanh(s)` reaches it.
+/// Past it the exponential saturates at that radius (and `cosh`/`sinh` would
+/// eventually overflow to `inf` near `s ≈ 710`), so the Lorentz lift caps `s`
+/// here to stay finite while landing on the same boundary as the Poincaré path.
+fn exp_saturation_cap(dim: usize, unit_roundoff: f64) -> f64 {
+    resolvable_radius(dim, unit_roundoff).atanh()
+}
 
 /// Poincaré exp radial coefficient `tanh(s)/s` with the open-ball boundary
-/// clamp baked in. Because `sqrt(k)|exp_0(v)| = tanh(s)`, clamping `tanh(s)`
-/// to `1 - BOUNDARY_EPS` makes the output norm exactly `max_norm`, i.e.
-/// strictly interior and consistent with [`project_into_ball`]. Callers must
-/// guard `s > 0` before calling (a zero tangent short-circuits to the
-/// identity), so no divide-by-zero is introduced.
-fn exp_coeff(s: f64) -> f64 {
-    (s.tanh().min(1.0 - BOUNDARY_EPS)) / s
+/// clamp baked in. Because `√k·|exp_0(v)| = tanh(s)`, clamping `tanh(s)` to
+/// [`resolvable_radius`] makes the output norm exactly `max_norm`, i.e. strictly
+/// interior and consistent with [`project_into_ball`]. Callers must guard
+/// `s > 0` before calling (a zero tangent short-circuits to the identity), so no
+/// divide-by-zero is introduced.
+fn exp_coeff(s: f64, dim: usize, unit_roundoff: f64) -> f64 {
+    (s.tanh().min(resolvable_radius(dim, unit_roundoff))) / s
 }
 
 fn require_negative_curvature(curvature: f64) -> GeometryResult<f64> {
@@ -147,7 +182,7 @@ fn require_in_ball(point: ArrayView1<'_, f64>, sqrt_negc: f64) -> GeometryResult
     Ok(())
 }
 
-/// Project a point into the open ball so `sqrt(k) |y| <= 1 - BOUNDARY_EPS`.
+/// Project a point into the open ball so `sqrt(k) |y| <= resolvable_radius(d)`.
 ///
 /// Returns `y` unchanged when it is already strictly inside; otherwise it is
 /// rescaled along the radial direction. The output is always finite and never
@@ -158,7 +193,19 @@ pub fn project_into_ball(
     point: ArrayView1<'_, f64>,
     curvature: f64,
 ) -> GeometryResult<Array1<f64>> {
+    project_into_ball_at(point, curvature, gam_math::roundoff::UNIT_ROUNDOFF)
+}
+
+/// [`project_into_ball`] for a point the caller stores in a precision with unit
+/// roundoff `unit_roundoff`: the radius is resolvable at that precision, so the
+/// stored point is still strictly inside the ball there.
+pub fn project_into_ball_at(
+    point: ArrayView1<'_, f64>,
+    curvature: f64,
+    unit_roundoff: f64,
+) -> GeometryResult<Array1<f64>> {
     let sqrt_negc = require_negative_curvature(curvature)?;
+    require_storage_unit_roundoff(unit_roundoff, point.len())?;
     if !point.iter().all(|v| v.is_finite()) {
         return Err(GeometryError::InvalidPoint(
             "Poincaré projection input contains NaN or infinity",
@@ -166,7 +213,7 @@ pub fn project_into_ball(
     }
     let mut out = point.to_owned();
     let norm = out.iter().map(|v| v * v).sum::<f64>().sqrt();
-    let max_norm = (1.0 - BOUNDARY_EPS) / sqrt_negc;
+    let max_norm = resolvable_radius(out.len(), unit_roundoff) / sqrt_negc;
     if norm > max_norm {
         let scale = max_norm / norm;
         for v in out.iter_mut() {
@@ -288,10 +335,16 @@ pub fn log_origin(y: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Arra
         // positive `√k|y|` takes `artanh(t)/t`, which is 1 to rounding at small t.
         return Ok(out);
     }
-    // y is validated in-ball, so sqrt(k)·|y| < 1; the clamp only guards the
-    // last-ulp approach to the boundary, never an out-of-domain artanh.
-    let arg = (sqrt_negc * norm).min(1.0 - BOUNDARY_EPS);
-    let coeff = arg.atanh() / (sqrt_negc * norm);
+    // y is validated in-ball, so sqrt(k)·|y| < 1. A chart factor `1 − k|y|²`
+    // inside its own rounding band is the boundary to precision, where `artanh`
+    // has no resolved value: refuse it rather than shorten the logarithm.
+    let s = sqrt_negc * norm;
+    if chart_factor_unresolved(s, y.len()) {
+        return Err(GeometryError::InvalidPoint(
+            "Poincaré point on the ball boundary to precision",
+        ));
+    }
+    let coeff = s.atanh() / s;
     for v in out.iter_mut() {
         *v *= coeff;
     }
@@ -307,7 +360,7 @@ pub fn exp_origin(v: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Arra
     if s == 0.0 {
         return Ok(out);
     }
-    let coeff = exp_coeff(s);
+    let coeff = exp_coeff(s, v.len(), gam_math::roundoff::UNIT_ROUNDOFF);
     for x in out.iter_mut() {
         *x *= coeff;
     }
@@ -514,6 +567,10 @@ pub struct TangentDecodeCache {
     pub gates: Array2<f64>,
     /// Curvature used.
     pub curvature: f64,
+    /// Unit roundoff of the precision the decoded points are stored in, which
+    /// set the ball radius the forward clamped atoms and outputs to; the
+    /// backward differentiates that same clamp.
+    pub unit_roundoff: f64,
 }
 
 fn check_atoms_shape(atoms: ArrayView2<'_, f64>, gates: ArrayView2<'_, f64>) -> GeometryResult<()> {
@@ -545,10 +602,11 @@ fn check_atoms_shape(atoms: ArrayView2<'_, f64>, gates: ArrayView2<'_, f64>) -> 
 fn project_and_log(
     atoms: ArrayView2<'_, f64>,
     curvature: f64,
+    unit_roundoff: f64,
 ) -> GeometryResult<(Array2<f64>, Array2<f64>, Array1<f64>)> {
     let sqrt_negc = require_negative_curvature(curvature)?;
-    let max_norm = (1.0 - BOUNDARY_EPS) / sqrt_negc;
     let (f_atoms, d) = atoms.dim();
+    let max_norm = resolvable_radius(d, unit_roundoff) / sqrt_negc;
     let mut projected = Array2::<f64>::zeros((f_atoms, d));
     let mut tangents = Array2::<f64>::zeros((f_atoms, d));
     let mut proj_scale = Array1::<f64>::ones(f_atoms);
@@ -572,8 +630,16 @@ fn project_and_log(
             // log_0(0) = 0; row stays zero.
             continue;
         }
-        let arg = (sqrt_negc * nrm_proj).min(1.0 - BOUNDARY_EPS);
-        let coeff = arg.atanh() / (sqrt_negc * nrm_proj);
+        // The projection placed the atom at or inside `resolvable_radius`, where
+        // `artanh` is finite and resolved. A clamped atom takes the radius the
+        // projection targeted: its recomputed norm differs from it in the last
+        // ulps, which `artanh`'s slope `1/(1 − R²)` would amplify into the value.
+        let arg = if scale < 1.0 {
+            resolvable_radius(d, unit_roundoff)
+        } else {
+            sqrt_negc * nrm_proj
+        };
+        let coeff = arg.atanh() / arg;
         for i in 0..d {
             tangents[[f, i]] = coeff * projected[[f, i]];
         }
@@ -590,9 +656,22 @@ pub fn tangent_decode_forward(
     gates: ArrayView2<'_, f64>,
     curvature: f64,
 ) -> GeometryResult<(Array2<f64>, TangentDecodeCache)> {
+    tangent_decode_forward_at(atoms, gates, curvature, gam_math::roundoff::UNIT_ROUNDOFF)
+}
+
+/// [`tangent_decode_forward`] for atoms and outputs the caller stores in a
+/// precision with unit roundoff `unit_roundoff`: atoms are clamped, and outputs
+/// saturate, at the ball radius resolvable at that precision.
+pub fn tangent_decode_forward_at(
+    atoms: ArrayView2<'_, f64>,
+    gates: ArrayView2<'_, f64>,
+    curvature: f64,
+    unit_roundoff: f64,
+) -> GeometryResult<(Array2<f64>, TangentDecodeCache)> {
     check_atoms_shape(atoms, gates)?;
     let sqrt_negc = require_negative_curvature(curvature)?;
-    let (projected, tangents, proj_scale) = project_and_log(atoms, curvature)?;
+    require_storage_unit_roundoff(unit_roundoff, atoms.ncols())?;
+    let (projected, tangents, proj_scale) = project_and_log(atoms, curvature, unit_roundoff)?;
     // V = gates · tangents (batch×F · F×d): the dominant decode GEMM over the
     // whole observation batch. Row-tile gates across ALL GPUs (each device runs
     // one cuBLAS call over its batch-row tile with tangents broadcast); single
@@ -607,7 +686,7 @@ pub fn tangent_decode_forward(
             // exp_0(0) = 0.
             continue;
         }
-        let coeff = exp_coeff(s);
+        let coeff = exp_coeff(s, d, unit_roundoff);
         for i in 0..d {
             x_hat[[b, i]] = coeff * v[[b, i]];
         }
@@ -619,6 +698,7 @@ pub fn tangent_decode_forward(
         proj_scale,
         gates: gates.to_owned(),
         curvature,
+        unit_roundoff,
     };
     Ok((x_hat, cache))
 }
@@ -660,6 +740,7 @@ pub fn tangent_decode_backward(
 ) -> GeometryResult<(Array2<f64>, Array2<f64>)> {
     let sqrt_negc = require_negative_curvature(cache.curvature)?;
     let (batch, d) = cache.v.dim();
+    require_storage_unit_roundoff(cache.unit_roundoff, d)?;
     let n_atoms = cache.tangents.dim().0;
     if grad_x_hat.dim() != (batch, d) {
         return Err(GeometryError::DimensionMismatch {
@@ -687,18 +768,19 @@ pub fn tangent_decode_backward(
             continue;
         }
         let tanh_s = s.tanh();
-        // The forward `exp_coeff` CLAMPS the radial coefficient to
-        // `(1 - BOUNDARY_EPS)/s` once `tanh(s) >= 1 - BOUNDARY_EPS` (s beyond
-        // EXP_SATURATION_CAP), pinning the output norm to the open-ball boundary
-        // `(1 - BOUNDARY_EPS)/sqrt(k)`. The backward MUST differentiate that same
+        // The forward `exp_coeff` CLAMPS the radial coefficient to `R/s` once
+        // `tanh(s) >= R`, with `R = resolvable_radius(d)` (s beyond
+        // `exp_saturation_cap`), pinning the output norm to the open-ball boundary
+        // `R/sqrt(k)`. The backward MUST differentiate that same
         // clamped map, not the unclamped `tanh(s)/s`, or the analytic gradient
         // desyncs from the forward in the saturated regime.
-        let (phi, dphi_dv_coeff) = if tanh_s >= 1.0 - BOUNDARY_EPS {
-            // Saturated: x_hat = C * v / |v| with C = (1 - BOUNDARY_EPS)/sqrt(k)
-            // constant ⇒ coeff = C/|v| = (1 - BOUNDARY_EPS)/s, and
+        let saturation_radius = resolvable_radius(d, cache.unit_roundoff);
+        let (phi, dphi_dv_coeff) = if tanh_s >= saturation_radius {
+            // Saturated: x_hat = C * v / |v| with C = R/sqrt(k)
+            // constant ⇒ coeff = C/|v| = R/s, and
             // ∂x_hat_i/∂v_j = coeff (δ_ij - v̂_i v̂_j): the output is radially
             // pinned, so the radial sensitivity is exactly cancelled.
-            let coeff = (1.0 - BOUNDARY_EPS) / s;
+            let coeff = saturation_radius / s;
             (coeff, -coeff / (nrm * nrm))
         } else {
             // Interior: x_hat = phi(s) * v, phi(s) = tanh(s)/s.
@@ -740,9 +822,23 @@ pub fn tangent_decode_backward(
     for f in 0..n_atoms {
         let a_row = cache.atoms_projected.row(f);
         let g_l_row = grad_tangents.row(f);
+        if cache.proj_scale[f] < 1.0 {
+            // A clamped atom's log took `t = resolvable_radius(d)` in the forward.
+            // Its radial term `ψ′(t)·t ≈ 1/(1 − t²)` is annihilated exactly by the
+            // step-4 projection `I − â âᵀ`; forming it and projecting it out would
+            // leave its rounding, about `ε/(1 − t²)` times `|g_L|`, behind.
+            let t = resolvable_radius(d, cache.unit_roundoff);
+            let psi = t.atanh() / t;
+            for j in 0..d {
+                grad_atoms_proj[[f, j]] = psi * g_l_row[j];
+            }
+            continue;
+        }
         let r_sq: f64 = (0..d).map(|i| a_row[i] * a_row[i]).sum();
         let r = r_sq.sqrt();
-        let t = (sqrt_negc * r).min(1.0 - BOUNDARY_EPS);
+        // The forward projected every atom to at most `resolvable_radius(d)`, where
+        // `artanh` and its derivative are finite.
+        let t = sqrt_negc * r;
         // psi(t) = 1 + t²/3 + O(t⁴) and psi'(t)·t = 2t²/3 + O(t⁴): once `t² ≤ ε` the
         // Jacobian is the identity to rounding (the same switch as step 1).
         if t * t <= f64::EPSILON {
@@ -813,7 +909,8 @@ pub fn tangent_decode_backward(
 /// curvature `c = -k`. The output is `(x_0, x_s)` packed as `(d+1)`-vector.
 ///
 /// The input is first run through [`project_into_ball`] so the boundary-
-/// vanishing denominator `1 - |ŷ|^2` is bounded below by `~2·BOUNDARY_EPS`.
+/// vanishing denominator `1 - |ŷ|^2` is resolved from zero by at least its own
+/// rounding band (see `resolvable_radius`).
 /// A point on (or outside) the ideal boundary would otherwise drive the
 /// denominator to zero and the output to infinity; projecting first keeps the
 /// map well-conditioned and makes the
@@ -826,10 +923,9 @@ pub fn to_lorentz(y: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Arra
     }
     let y_proj = project_into_ball(y, curvature)?;
     let yhat_sq: f64 = y_proj.iter().map(|v| (sqrt_negc * v).powi(2)).sum();
-    // After `project_into_ball`, `sqrt(k)|y| <= 1 - BOUNDARY_EPS`, so
-    // `1 - yhat_sq >= 2·BOUNDARY_EPS - BOUNDARY_EPS^2 > 0`; the floor is a
-    // defensive no-op held at `BOUNDARY_EPS`.
-    let denom = (1.0 - yhat_sq).max(BOUNDARY_EPS);
+    // After `project_into_ball`, `1 - yhat_sq` is at least twice its rounding
+    // band (see `resolvable_radius`), so it is positive and resolved.
+    let denom = 1.0 - yhat_sq;
     let z0 = (1.0 + yhat_sq) / denom;
     let mut out = Array1::<f64>::zeros(d + 1);
     out[0] = z0 / sqrt_negc;
@@ -841,6 +937,16 @@ pub fn to_lorentz(y: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Arra
 
 /// Inverse stereographic projection Lorentz -> Poincaré ball.
 pub fn from_lorentz(x: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Array1<f64>> {
+    from_lorentz_at(x, curvature, gam_math::roundoff::UNIT_ROUNDOFF)
+}
+
+/// [`from_lorentz`] projecting its output into the ball resolvable at the storage
+/// precision `unit_roundoff`.
+fn from_lorentz_at(
+    x: ArrayView1<'_, f64>,
+    curvature: f64,
+    unit_roundoff: f64,
+) -> GeometryResult<Array1<f64>> {
     let sqrt_negc = require_negative_curvature(curvature)?;
     if x.len() < 2 {
         return Err(GeometryError::InvalidPoint(
@@ -863,11 +969,11 @@ pub fn from_lorentz(x: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Ar
         out[i] = (xs_scaled / denom) / sqrt_negc;
     }
     // Symmetric with `to_lorentz`, which projects its input into the ball:
-    // enforce the open-ball invariant `sqrt(k)|out| <= 1 - BOUNDARY_EPS` here
+    // enforce the open-ball invariant `sqrt(k)|out| <= resolvable_radius(d)` here
     // too. `tanh(s/2)` saturates to exactly 1.0 for large hyperboloid points,
     // which would land `out` ON the ideal boundary; the projection nudges it
     // strictly interior so every `from_lorentz` consumer is boundary-safe.
-    project_into_ball(out.view(), curvature)
+    project_into_ball_at(out.view(), curvature, unit_roundoff)
 }
 
 /// Lorentz log at the origin `o = (1/sqrt(k), 0, ..., 0)`.
@@ -909,6 +1015,16 @@ pub fn lorentz_exp_origin(
     v_spatial: ArrayView1<'_, f64>,
     curvature: f64,
 ) -> GeometryResult<Array1<f64>> {
+    lorentz_exp_origin_at(v_spatial, curvature, gam_math::roundoff::UNIT_ROUNDOFF)
+}
+
+/// [`lorentz_exp_origin`] capped so that its ball image saturates at the radius
+/// resolvable at the storage precision `unit_roundoff`.
+fn lorentz_exp_origin_at(
+    v_spatial: ArrayView1<'_, f64>,
+    curvature: f64,
+    unit_roundoff: f64,
+) -> GeometryResult<Array1<f64>> {
     let sqrt_negc = require_negative_curvature(curvature)?;
     let d = v_spatial.len();
     let norm_sq: f64 = v_spatial.iter().map(|x| x * x).sum();
@@ -922,15 +1038,16 @@ pub fn lorentz_exp_origin(
     // maps this hyperboloid point to ball radius
     // `sinh(s_eval)/(cosh(s_eval)+1) = tanh(s_eval / 2)` — the EFFECTIVE
     // Poincaré argument is HALF of `s_eval`. To land the decoded radius on the
-    // same open-ball boundary `1 - BOUNDARY_EPS` that the Poincaré path
+    // same open-ball boundary `resolvable_radius(d)` that the Poincaré path
     // (`exp_coeff`, which clamps `tanh(s)`) produces, we need
-    // `tanh(s_eval / 2) = 1 - BOUNDARY_EPS`, i.e. `s_eval / 2 =
-    // EXP_SATURATION_CAP`, hence the cap is `2 * EXP_SATURATION_CAP`
-    // (≈ 12.206 — still far below the ~710 cosh/sinh overflow threshold).
-    // Capping at `EXP_SATURATION_CAP` instead would saturate at
-    // `tanh(EXP_SATURATION_CAP / 2) ≈ 0.9955`, a factor of ~2 too early.
+    // `tanh(s_eval / 2) = resolvable_radius(d)`, i.e. `s_eval / 2 =
+    // exp_saturation_cap(d)`, hence the cap is `2 * exp_saturation_cap(d)`
+    // (about 35 in f64 for small d, still far below the ~710 cosh/sinh overflow
+    // threshold).
+    // Capping at `exp_saturation_cap(d)` instead would saturate at
+    // `tanh(exp_saturation_cap(d) / 2)`, well inside the boundary.
     // `from_lorentz` then projects strictly interior, so the decode never NaNs.
-    let s_eval = s.min(2.0 * EXP_SATURATION_CAP);
+    let s_eval = s.min(2.0 * exp_saturation_cap(d, unit_roundoff));
     let mut out = Array1::<f64>::zeros(d + 1);
     out[0] = s_eval.cosh() / sqrt_negc;
     // Radial scaling stays in the original (uncapped) tangent direction: the
@@ -958,14 +1075,27 @@ pub fn lorentz_decode_forward(
     gates: ArrayView2<'_, f64>,
     curvature: f64,
 ) -> GeometryResult<Array2<f64>> {
+    lorentz_decode_forward_at(atoms, gates, curvature, gam_math::roundoff::UNIT_ROUNDOFF)
+}
+
+/// [`lorentz_decode_forward`] for atoms and outputs the caller stores in a
+/// precision with unit roundoff `unit_roundoff`, clamped and saturating at the
+/// same radius as [`tangent_decode_forward_at`].
+pub fn lorentz_decode_forward_at(
+    atoms: ArrayView2<'_, f64>,
+    gates: ArrayView2<'_, f64>,
+    curvature: f64,
+    unit_roundoff: f64,
+) -> GeometryResult<Array2<f64>> {
     check_atoms_shape(atoms, gates)?;
     let sqrt_negc = require_negative_curvature(curvature)?;
     let (f_atoms, d) = atoms.dim();
+    require_storage_unit_roundoff(unit_roundoff, d)?;
     let batch = gates.dim().0;
 
     // Project each atom into the ball, lift to hyperboloid, take log_o.
     let mut tangents = Array2::<f64>::zeros((f_atoms, d));
-    let max_norm = (1.0 - BOUNDARY_EPS) / sqrt_negc;
+    let max_norm = resolvable_radius(d, unit_roundoff) / sqrt_negc;
     for f in 0..f_atoms {
         let row = atoms.row(f);
         let nrm = row.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -991,8 +1121,8 @@ pub fn lorentz_decode_forward(
     let mut out = Array2::<f64>::zeros((batch, d));
     for b in 0..batch {
         let v_row: Array1<f64> = v.row(b).to_owned();
-        let x_h = lorentz_exp_origin(v_row.view(), curvature)?;
-        let y = from_lorentz(x_h.view(), curvature)?;
+        let x_h = lorentz_exp_origin_at(v_row.view(), curvature, unit_roundoff)?;
+        let y = from_lorentz_at(x_h.view(), curvature, unit_roundoff)?;
         for i in 0..d {
             out[[b, i]] = y[i];
         }
@@ -1109,12 +1239,17 @@ mod tests {
     }
 
     #[test]
-    fn project_into_ball_clamps_near_boundary() {
-        let raw = array![0.999, 0.0];
-        let proj = project_into_ball(raw.view(), -1.0).expect("project");
+    fn project_into_ball_clamps_to_the_resolvable_radius() {
+        // A point outside the ball lands where its chart factor is still resolved;
+        // a point inside, however near the boundary, is left alone.
+        let outside = array![1.5, 0.0];
+        let proj = project_into_ball(outside.view(), -1.0).expect("project");
         let norm = (proj[0] * proj[0] + proj[1] * proj[1]).sqrt();
         assert!(norm < 1.0, "norm {} should be inside ball", norm);
-        assert!(norm <= 1.0 - BOUNDARY_EPS + 1e-12);
+        assert!(!chart_factor_unresolved(norm, 2), "projected norm {norm} is unresolved");
+        let inside = array![0.999, 0.0];
+        let kept = project_into_ball(inside.view(), -1.0).expect("project");
+        assert_eq!(kept, inside);
     }
 
     #[test]
@@ -1406,14 +1541,69 @@ mod tests {
     }
 
     #[test]
-    fn exp_saturation_cap_matches_boundary_eps() {
-        // The named cap must equal `atanh(1 - BOUNDARY_EPS)` so the Lorentz
-        // lift caps exactly where `tanh` first reads `1 - BOUNDARY_EPS` in f64.
-        let expected = (1.0 - BOUNDARY_EPS).atanh();
-        assert!(
-            (EXP_SATURATION_CAP - expected).abs() < 1.0e-12,
-            "cap {EXP_SATURATION_CAP} vs atanh(1-eps) {expected}"
-        );
+    fn resolvable_radius_is_resolved_and_the_last_float_below_one_is_not() {
+        // The radius this module places points at keeps its chart factor
+        // resolved, the largest double below one does not, and `tanh` reaches the
+        // radius at a finite saturation cap far below the cosh/sinh overflow.
+        let last_below_one = 1.0 - f64::EPSILON / 2.0;
+        for dim in 1..=8 {
+            let radius = resolvable_radius(dim, gam_math::roundoff::UNIT_ROUNDOFF);
+            assert!(radius < 1.0);
+            assert!(!chart_factor_unresolved(radius, dim), "dim {dim}: radius {radius}");
+            assert!(chart_factor_unresolved(last_below_one, dim), "dim {dim}");
+            let cap = exp_saturation_cap(dim, gam_math::roundoff::UNIT_ROUNDOFF);
+            assert!(cap.is_finite() && 2.0 * cap < 710.0, "dim {dim}: cap {cap}");
+            assert!(
+                (cap.tanh() - radius).abs() <= f64::EPSILON,
+                "dim {dim}: tanh(cap) {} vs radius {radius}",
+                cap.tanh()
+            );
+        }
+    }
+
+    #[test]
+    fn decoders_at_f32_storage_stay_inside_the_ball_once_stored() {
+        // The f64 radius `1 − 2γ_8` (about `1 − 1.8e-15` at d = 6) rounds to 1 in
+        // f32, so an f64-saturated decode stored as f32 sits on the boundary.
+        // Decoding at f32's unit roundoff keeps every stored output strictly
+        // inside, with a positive chart factor measured in f32, on both paths.
+        let unit_roundoff_f32 = f64::from(f32::EPSILON) / 2.0;
+        let d = 6;
+        assert_eq!(resolvable_radius(d, gam_math::roundoff::UNIT_ROUNDOFF) as f32, 1.0_f32);
+        assert!((resolvable_radius(d, unit_roundoff_f32) as f32) < 1.0_f32);
+
+        let atoms = Array2::from_shape_fn((4, d), |(f, i)| 0.1 * (((f * d + i) as f64) + 1.0).sin());
+        let gates = Array2::from_elem((3, 4), 1.0e3);
+        let (x_f64, _) = tangent_decode_forward(atoms.view(), gates.view(), -1.0).expect("f64 decode");
+        for row in x_f64.outer_iter() {
+            let norm = row.iter().map(|v| v * v).sum::<f64>().sqrt();
+            assert_eq!(norm as f32, 1.0_f32, "the f64 decode saturates at the f64 radius");
+        }
+        let (x_poincare, cache) =
+            tangent_decode_forward_at(atoms.view(), gates.view(), -1.0, unit_roundoff_f32)
+                .expect("f32-storage decode");
+        assert_eq!(cache.unit_roundoff, unit_roundoff_f32);
+        let x_lorentz =
+            lorentz_decode_forward_at(atoms.view(), gates.view(), -1.0, unit_roundoff_f32)
+                .expect("f32-storage Lorentz decode");
+        for decoded in [&x_poincare, &x_lorentz] {
+            for row in decoded.outer_iter() {
+                let stored: Vec<f32> = row.iter().map(|&v| v as f32).collect();
+                let norm_sq: f32 = stored.iter().map(|v| v * v).sum();
+                assert!(
+                    norm_sq.sqrt() < 1.0 && 1.0 - norm_sq > 0.0,
+                    "stored f32 point has norm² {norm_sq}"
+                );
+            }
+        }
+
+        let grad = Array2::<f64>::ones(x_poincare.dim());
+        assert!(tangent_decode_backward(&cache, grad.view()).is_ok());
+        let unresolvable = TangentDecodeCache { unit_roundoff: 0.0, ..cache };
+        assert!(matches!(
+            tangent_decode_backward(&unresolvable, grad.view()),
+            Err(GeometryError::InvalidPoint(_))
+        ));
     }
 
     #[test]
@@ -1423,13 +1613,13 @@ mod tests {
         // unclamped map would land |x| == 1; the clamp keeps it interior.
         for curvature in [-1.0_f64, -0.25, -4.0] {
             let sqrt_negc = (-curvature).sqrt();
-            let max_norm = (1.0 - BOUNDARY_EPS) / sqrt_negc;
+            let max_norm = resolvable_radius(4, gam_math::roundoff::UNIT_ROUNDOFF) / sqrt_negc;
             let v = array![1.0e3, -5.0e2, 2.0e2, 7.0e1];
             let x = exp_origin(v.view(), curvature).expect("exp");
             assert!(x.iter().all(|q| q.is_finite()), "exp must be finite: {x:?}");
             let norm = x.iter().map(|q| q * q).sum::<f64>().sqrt();
             assert!(
-                sqrt_negc * norm <= 1.0 - BOUNDARY_EPS + 1.0e-12,
+                !chart_factor_unresolved(sqrt_negc * norm, 4),
                 "exp must stay strictly interior (curvature {curvature}): \
                  sqrt(k)|x| = {}",
                 sqrt_negc * norm
@@ -1467,7 +1657,7 @@ mod tests {
             );
             let norm = y.iter().map(|q| q * q).sum::<f64>().sqrt();
             assert!(
-                sqrt_negc * norm <= 1.0 - BOUNDARY_EPS + 1.0e-12,
+                !chart_factor_unresolved(sqrt_negc * norm, 3),
                 "lorentz decode must stay strictly interior (curvature \
                  {curvature}): sqrt(k)|y| = {}",
                 sqrt_negc * norm
@@ -1478,24 +1668,22 @@ mod tests {
     #[test]
     fn lorentz_exp_saturates_at_same_boundary_as_poincare() {
         // Regression for #1349. The Lorentz decode path used to cap its exp
-        // argument at `EXP_SATURATION_CAP`, but `from_lorentz` maps the
+        // argument at the saturation cap itself, but `from_lorentz` maps the
         // hyperboloid point to ball radius `tanh(s_eval / 2)` (the module's
-        // identity `y^{Lorentz}(v) = exp_0^{Poincare}(v / 2)`). So capping at
-        // `EXP_SATURATION_CAP` saturated the radius at `tanh(cap / 2) ≈ 0.9955`
-        // — a factor of ~2 too early — instead of `1 - BOUNDARY_EPS`. The cap is
-        // now `2 * EXP_SATURATION_CAP` so both decoders land on the same
-        // boundary.
+        // identity `y^{Lorentz}(v) = exp_0^{Poincare}(v / 2)`), so it saturated
+        // far inside the boundary. The cap is `2 * exp_saturation_cap(d)` so both
+        // decoders land on the same boundary, `resolvable_radius(d)`.
         let curvature = -1.0_f64;
         let sqrt_negc = (-curvature).sqrt();
         // A fixed unit direction in R^4, scaled to several large norms. With
-        // curvature -1 the radial exp argument is `s = norm`; the saturation
-        // cap is `2 * EXP_SATURATION_CAP ≈ 12.206`, so every norm here sits
-        // deep in the saturated (capped) regime where the radius must pin to
-        // `1 - BOUNDARY_EPS`. The OLD cap of `EXP_SATURATION_CAP ≈ 6.103` would
-        // instead saturate at `tanh(6.103 / 2) ≈ 0.9955`, failing this test.
+        // curvature -1 the radial exp argument is `s = norm`, and every norm here
+        // is past `2 * exp_saturation_cap(4)`, deep in the saturated regime where
+        // the radius must pin to `resolvable_radius(4)`.
+        let saturation_radius = resolvable_radius(4, gam_math::roundoff::UNIT_ROUNDOFF);
+        assert!(50.0 > 2.0 * exp_saturation_cap(4, gam_math::roundoff::UNIT_ROUNDOFF));
         let raw = array![0.3_f64, -0.5, 0.7, 0.2];
         let raw_norm = raw.iter().map(|x| x * x).sum::<f64>().sqrt();
-        for &target_norm in &[20.0_f64, 50.0, 100.0] {
+        for &target_norm in &[50.0_f64, 100.0, 1000.0] {
             let v: Array1<f64> = raw.mapv(|x| x * target_norm / raw_norm);
 
             // (a) The Lorentz decode is the SAME function as the Poincaré exp at
@@ -1515,12 +1703,11 @@ mod tests {
                  {r_lorentz} vs {r_poincare}"
             );
 
-            // (b) The saturated radius reaches `1 - BOUNDARY_EPS`, NOT ~0.9955.
+            // (b) The saturated radius reaches the resolvable radius.
             assert!(
-                (r_lorentz - (1.0 - BOUNDARY_EPS)).abs() < 1.0e-9,
-                "saturated lorentz radius must reach 1 - BOUNDARY_EPS \
-                 ({}), got {r_lorentz} at norm {target_norm}",
-                1.0 - BOUNDARY_EPS
+                (r_lorentz - saturation_radius).abs() < 1.0e-9,
+                "saturated lorentz radius must reach {saturation_radius}, got {r_lorentz} \
+                 at norm {target_norm}"
             );
             assert!(
                 r_lorentz > 0.999,
@@ -1554,7 +1741,7 @@ mod tests {
                     .sum::<f64>()
                     .sqrt();
                 assert!(
-                    norm.is_finite() && norm <= 1.0 - BOUNDARY_EPS + 1.0e-12,
+                    norm.is_finite() && !chart_factor_unresolved(norm, 6),
                     "decode row {b} must be strictly interior, got norm {norm}"
                 );
             }

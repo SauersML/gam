@@ -1015,7 +1015,7 @@ row_program! {
         q0, q1, qd1, linear0, linear1, dlinear1, variance0, variance1, dvariance1;
         wi, wi_entry, di, probit_scale, follow_up_varying
     )
-    emit [generic, runtime, order2, third, fourth, witnesses, cuda];
+    emit [generic, runtime, order2, third, fourth, witnesses, witness_jets, cuda];
     leaves {
         sqrt => unary_derivatives_sqrt => d_sqrt,
         inverse_sqrt => unary_derivatives_inverse_sqrt => d_inverse_sqrt,
@@ -1238,6 +1238,31 @@ pub(crate) fn rigid_feature_frame_witnesses(
         features[6],
         features[7],
         features[8],
+        probit_scale,
+        follow_up_varying,
+    )
+}
+
+/// The same three witnesses as jets over whatever the feature frame was seeded
+/// on. The follow-up step limiter reads `η′₁`'s derivative along a coefficient
+/// direction from here (gam#2765), so the rate it damps with is the one
+/// declaration's, not a restated expression.
+#[inline(always)]
+pub(crate) fn rigid_feature_frame_witness_jets<const K: usize, S: JetScalar<K>>(
+    features: &[S; RIGID_FEATURE_DIMENSION],
+    probit_scale: f64,
+    follow_up_varying: f64,
+) -> [S; 3] {
+    rigid_feature_program_witness_jets::<K, S>(
+        &features[0],
+        &features[1],
+        &features[2],
+        &features[3],
+        &features[4],
+        &features[5],
+        &features[6],
+        &features[7],
+        &features[8],
         probit_scale,
         follow_up_varying,
     )

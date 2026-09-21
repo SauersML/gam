@@ -177,6 +177,8 @@ mod run_predict;
 mod run_sample_generate_report;
 #[path = "main/run_fit_events.rs"]
 mod run_fit_events;
+#[path = "main/run_forecast_events.rs"]
+mod run_forecast_events;
 #[path = "main/smooth_warnings.rs"]
 mod smooth_warnings;
 
@@ -196,6 +198,7 @@ pub(crate) use run_joint_events::*;
 pub(crate) use run_predict::*;
 pub(crate) use run_sample_generate_report::*;
 pub(crate) use run_fit_events::*;
+pub(crate) use run_forecast_events::*;
 pub(crate) use smooth_warnings::*;
 
 /// Bypass-drop process exit, routed through a fn-pointer indirection so
@@ -308,6 +311,8 @@ fn run() -> CliResult<()> {
         Command::Generate(args) => run_generate(args).map_err(CliError::from),
         Command::JointEvents(args) => run_joint_events(args).map_err(CliError::from),
         Command::FitEvents(args) => run_fit_events(args).map_err(CliError::from),
+        Command::ForecastEvents(args) => run_forecast_events(args).map_err(CliError::from),
+        Command::ForecastPopulation(args) => run_forecast_population(args).map_err(CliError::from),
     }
 }
 

@@ -66,6 +66,7 @@ use crate::tiered::Tier0Mean;
 use crate::tiered::code_space::{
     CodeSpacePromotionReport, harvest_code_space_promotions, linear_distortion_floor,
 };
+use crate::tiered::promotion::{PromotionInstall, install_block_promotions};
 
 /// Tier-2 curved refinement configuration: the overcomplete hard-TopK
 /// support-sparse dictionary fit on the Tier-1 residual (#2023). The residual
@@ -317,6 +318,10 @@ pub struct TieredFitReport {
     /// reconstructs it exactly (the residual substrate is blind to that move by
     /// construction; see `crate::tiered::code_space`).
     pub code_space: CodeSpacePromotionReport,
+    /// The census's accepted single-block promotions installed as certified curved charts,
+    /// and the ones whose chart fit refused. Empty on the census-only report
+    /// [`linear_bulk_census`] returns, which installs nothing.
+    pub curved: PromotionInstall,
     /// Unified migration ledger of the adjudicated births / deaths / refusals.
     pub ledger: SaeMigrationLedger,
     /// Final composed explained variance (`1 − RSS/TSS` vs the Tier-0 mean).
@@ -324,12 +329,14 @@ pub struct TieredFitReport {
 }
 
 /// Run the seed policy + curved refinement on activations `z` (`N×P`, f64):
-/// Tier-0 mean + Tier-1 block-sparse linear warm start (the seed) → Tier-2 curved
-/// support-sparse refinement on the Tier-1 residual.
+/// Tier-0 mean + Tier-1 block-sparse linear warm start (the seed) → the code-space
+/// census, whose accepted single-block promotions install as certified curved charts
+/// → Tier-2 curved support-sparse refinement on the Tier-1 residual.
 ///
-/// Production reaches it with Tier-2 off, through [`linear_bulk_census`]. The public
-/// tiered FFI/Python surface was deleted in unification Increment 4, so the full
-/// cadence is called only by its tests and the `tiered_*` examples.
+/// Production does not reach it: [`linear_bulk_census`] runs the shared census stage
+/// and installs nothing. The public tiered FFI/Python surface was deleted in
+/// unification Increment 4, so the full cadence is called only by its tests and the
+/// `tiered_*` examples.
 ///
 /// The curved tier is fit on the Tier-1 residual through the canonical
 /// support-sparse engine (`fit_tier2_support` → [`fit_sae_support_sparse`]),
@@ -341,6 +348,61 @@ pub fn fit_tiered(
     z: ArrayView2<'_, f64>,
     config: &TieredFitConfig,
 ) -> Result<TieredFitReport, String> {
+    let (peel, mut ledger, code_space) = census_stage(z, config)?;
+    // Each accepted single-block verdict installs as a certified curved chart, or is
+    // refused with the chart fitter's own reason.
+    let curved = install_block_promotions(&code_space, &peel.tier1)?;
+    record_census_moves(&mut ledger, &code_space, &curved);
+
+    // Tier 2: curved support-sparse refinement on the Tier-1 residual, or the
+    // linear-bulk baseline.
+    let (tier2, explained_variance) = if config.tier2_enabled {
+        let fit = fit_tier2_support(&peel, &config.tier2)?;
+        record_support_moves(&mut ledger, &fit);
+        let ev = fit.explained_variance;
+        (Some(fit), ev)
+    } else {
+        (None, peel.tier1.explained_variance)
+    };
+
+    Ok(TieredFitReport {
+        tier0: peel.tier0,
+        tier1: peel.tier1,
+        tier2,
+        code_space,
+        curved,
+        ledger,
+        explained_variance,
+    })
+}
+
+/// The linear bulk and its code-space census with nothing installed: every accepted
+/// verdict stays an admitted move, and no Tier-2 refinement runs. This is the audit
+/// [`linear_bulk_census`] reports beside the public support-sparse fit.
+pub(crate) fn census_tiered(
+    z: ArrayView2<'_, f64>,
+    config: &TieredFitConfig,
+) -> Result<TieredFitReport, String> {
+    let (peel, mut ledger, code_space) = census_stage(z, config)?;
+    let curved = PromotionInstall::default();
+    record_census_moves(&mut ledger, &code_space, &curved);
+    Ok(TieredFitReport {
+        explained_variance: peel.tier1.explained_variance,
+        tier0: peel.tier0,
+        tier1: peel.tier1,
+        tier2: None,
+        code_space,
+        curved,
+        ledger,
+    })
+}
+
+/// The shared first stage of [`fit_tiered`] and [`census_tiered`]: the linear peel, the
+/// Tier-1 account in the ledger, and the code-space census of its blocks.
+fn census_stage(
+    z: ArrayView2<'_, f64>,
+    config: &TieredFitConfig,
+) -> Result<(LinearPeel, SaeMigrationLedger, CodeSpacePromotionReport), String> {
     // Tier 0 + Tier 1: the shared linear peel.
     let peel = fit_linear_peel(
         z,
@@ -413,15 +475,81 @@ pub fn fit_tiered(
     // power against it; the distortion floor and L0 are measured off the fit.
     let tolerance = linear_distortion_floor(peel.residual.view(), peel.baseline_energy)?;
     let code_space = harvest_code_space_promotions(&peel.tier1, z.nrows(), tolerance)?;
-    let census_proposals = code_space.proposals.iter().chain(
-        code_space
-            .pair_proposals
+    Ok((peel, ledger, code_space))
+}
+
+/// The census verdicts in the ledger's currency. A verdict the bits did not buy is a
+/// refusal. An accepted single-block verdict is one curved birth from the linear atom
+/// plus one linear death of the block it replaced when its chart installed, a refusal
+/// carrying the chart fit's reason when that fit refused, and an admitted move when no
+/// chart fit ran. Accepted pair verdicts are admitted moves: no pair chart installs.
+fn record_census_moves(
+    ledger: &mut SaeMigrationLedger,
+    census: &CodeSpacePromotionReport,
+    installed: &PromotionInstall,
+) {
+    for proposal in &census.proposals {
+        let evidence = MoveEvidence::from_dl_bits(proposal.dl_old - proposal.dl_new);
+        if !proposal.accept {
+            ledger.refuse(
+                MoveStage::Curved,
+                MoveReason::EvidenceInsufficient,
+                1,
+                None,
+                evidence,
+                proposal.dl_new,
+            );
+            continue;
+        }
+        let chart_installed = installed
+            .charts
             .iter()
-            .map(|verdict| &verdict.proposal),
-    );
-    // An accepted proposal is admitted, not born: the census adjudicates the
-    // replacement and mutates nothing, so no curved atom joins the model here.
-    for proposal in census_proposals {
+            .any(|chart| chart.block == proposal.block);
+        let refusal = installed
+            .refusals
+            .iter()
+            .find(|refusal| refusal.block == proposal.block);
+        if chart_installed {
+            // The move is priced once, in the census's bits, on its birth; the linear
+            // half is the structural death of the block the chart replaced.
+            ledger.birth(
+                MoveStage::Curved,
+                BirthSeed::LinearAtom,
+                1,
+                None,
+                evidence,
+                proposal.dl_new,
+            );
+            ledger.death(
+                MoveStage::Linear,
+                MoveReason::Promoted,
+                1,
+                None,
+                MoveEvidence::none(),
+                f64::NAN,
+            );
+        } else if let Some(refusal) = refusal {
+            ledger.refuse(
+                MoveStage::Curved,
+                MoveReason::Custom(refusal.reason.to_string()),
+                1,
+                None,
+                evidence,
+                proposal.dl_new,
+            );
+        } else {
+            ledger.admit(
+                MoveStage::Curved,
+                BirthSeed::LinearAtom,
+                1,
+                None,
+                evidence,
+                proposal.dl_new,
+            );
+        }
+    }
+    for verdict in &census.pair_proposals {
+        let proposal = &verdict.proposal;
         let evidence = MoveEvidence::from_dl_bits(proposal.dl_old - proposal.dl_new);
         if proposal.accept {
             ledger.admit(
@@ -443,26 +571,6 @@ pub fn fit_tiered(
             );
         }
     }
-
-    // Tier 2: curved support-sparse refinement on the Tier-1 residual, or the
-    // linear-bulk baseline.
-    let (tier2, explained_variance) = if config.tier2_enabled {
-        let fit = fit_tier2_support(&peel, &config.tier2)?;
-        record_support_moves(&mut ledger, &fit);
-        let ev = fit.explained_variance;
-        (Some(fit), ev)
-    } else {
-        (None, peel.tier1.explained_variance)
-    };
-
-    Ok(TieredFitReport {
-        tier0: peel.tier0,
-        tier1: peel.tier1,
-        tier2,
-        code_space,
-        ledger,
-        explained_variance,
-    })
 }
 
 /// The linear bulk the public support-sparse fit audits with (#2023 lead ruling):
@@ -504,7 +612,7 @@ pub fn linear_bulk_census(
     support_k: usize,
 ) -> Result<TieredFitReport, String> {
     let config = derived_linear_bulk_config(z.ncols(), block_size, support_k)?;
-    fit_tiered(z, &config)
+    census_tiered(z, &config)
 }
 
 impl TieredFitReport {
@@ -628,8 +736,9 @@ mod fit_tests {
     }
 
     /// #2023 criterion 3 on Tier-1: the linear rung records the `G` seed blocks and
-    /// every committed revival as births, and every revival and the blocks dead at
-    /// the end as deaths, so births minus deaths is the number of live blocks.
+    /// every committed revival as births, and every revival, the blocks dead at the
+    /// end and the blocks an installed chart replaced as deaths, so births minus
+    /// deaths is the number of live blocks still decoding linearly.
     fn assert_linear_blocks_accounted(report: &TieredFitReport) {
         let (births, deaths) = stage_tally(&report.ledger, MoveStage::Linear);
         let tier1 = &report.tier1;
@@ -641,8 +750,8 @@ mod fit_tests {
         );
         assert_eq!(
             births - deaths,
-            live,
-            "linear births minus linear deaths must be the live block count"
+            live - report.curved.charts.len(),
+            "linear births minus linear deaths must be the live blocks no chart replaced"
         );
     }
 
@@ -907,8 +1016,8 @@ mod fit_tests {
         );
         assert_eq!(
             stage_tally(&report.ledger, MoveStage::Curved).0,
-            tier2.retained_atoms,
-            "every retained curved atom is a promotion off the linear residual"
+            tier2.retained_atoms + report.curved.charts.len(),
+            "every retained curved atom and every installed chart is one curved birth"
         );
         assert_linear_blocks_accounted(&report);
         // A curved refinement (which also peels the residual's own mean) can never
@@ -929,7 +1038,8 @@ mod fit_tests {
     /// spectra-only birth priority is negative — but it is a heuristic and may not
     /// veto (#2933 F22). The decision is the atomic ledger's, and the migration
     /// ledger records exactly that decision. This is the #2502 in-span curvature
-    /// move wired end to end from `fit_tiered`.
+    /// move wired end to end through the census stage `fit_tiered` shares, read on
+    /// the census-only report the public fit's audit returns.
     #[test]
     fn code_space_census_adjudicates_a_zero_residual_planted_ring_by_its_ledger() {
         use std::f64::consts::TAU;
@@ -946,7 +1056,7 @@ mod fit_tests {
         let mut config = TieredFitConfig::linear_bulk(1, 2);
         config.tier1.block_topk = 1;
         config.tier1.max_epochs = 200;
-        let report = fit_tiered(z.view(), &config).expect("single-block tiered fit runs");
+        let report = census_tiered(z.view(), &config).expect("single-block census runs");
 
         let census = &report.code_space;
         assert_eq!(census.n_blocks_scanned, 1);
@@ -1020,6 +1130,146 @@ mod fit_tests {
             );
         }
         assert_eq!(report.ledger.pc_reseed_events, 0);
+    }
+
+    /// #2023 installer: the cadence makes an accepted census verdict a model move. A
+    /// ring one `b=2` block spans is recognized and bought by the atomic ledger, and
+    /// `fit_tiered` fits exactly the firings the ledger priced with the census's
+    /// certified chart fitter, so the installed chart carries its REML certificate and
+    /// the ledger records one curved birth from the linear atom plus one `Promoted`
+    /// linear death. The census-only report on the same corpus admits the same verdict
+    /// and installs nothing. A solid disk in the same plane, over the same off-plane
+    /// residual, is the negative control: its radial spread is far above the distortion
+    /// the flat code spends, so no curved phase code meets it, the ledger refuses the
+    /// verdict, and no chart fit runs.
+    ///
+    /// TRACKED RED (#2023): the ring's chart certifies but does not deliver the priced
+    /// code, so the installer refuses it (`PromotionRefusalReason::FidelityBelowPriced`)
+    /// and the install assertion fails. The chart explains only EV 0.912 of this
+    /// 1%-wobble ring (all smoothing at `e^8` after one outer iteration), and the start
+    /// decides which certified optimum it reports: from `l0 = 0.01 / 100` the same
+    /// 96-point ring, read in its plane, certifies `λ = e^11.4 / e^5.6` at criterion
+    /// `−159.15 / −160.05` and EV `0.876 / 0.920`, against this fit's `e^8`, `−162.11`
+    /// and `0.912`, each after one outer iteration (probe 1288366). The defect is in
+    /// `fit_pair_chart`, not in the installer.
+    #[test]
+    fn census_promotions_install_certified_charts_and_an_isotropic_control_installs_none_2023() {
+        use std::f64::consts::{PI, TAU};
+        let n = 96usize;
+        let jitter = |row: usize, col: usize, amplitude: f64| {
+            let x = (row as f64 + 1.0) * 12.9898 + (col as f64 + 1.0) * 78.233;
+            amplitude * (x.sin() * 43758.5453).sin()
+        };
+        // #2822: an exact ring is an interpolation REML abstains on by design, so the ring
+        // carries an in-plane perturbation the chart can score. The census codes each
+        // firing at the Tier-1 residual's RMS, so the off-plane residual in cols 2,3 sets
+        // that scale above the ring's radial spread, and the curved phase code can meet
+        // the distortion the flat code spends.
+        let off_plane = |corpus: &mut Array2<f64>| {
+            for i in 0..n {
+                corpus[[i, 2]] = jitter(i, 2, 0.04);
+                corpus[[i, 3]] = jitter(i, 3, 0.04);
+            }
+        };
+        let mut ring = Array2::<f64>::zeros((n, 4));
+        for i in 0..n {
+            let theta = TAU * (i as f64) / (n as f64);
+            ring[[i, 0]] = theta.cos() + jitter(i, 0, 0.01);
+            ring[[i, 1]] = theta.sin() + jitter(i, 1, 0.01);
+        }
+        off_plane(&mut ring);
+        let mut config = TieredFitConfig::linear_bulk(1, 2);
+        config.tier1.block_topk = 1;
+        config.tier1.max_epochs = 200;
+
+        let report = fit_tiered(ring.view(), &config).expect("single-block tiered fit runs");
+        let census = &report.code_space;
+        assert_eq!(
+            census.n_accepted, 1,
+            "the census must buy the planted ring: {:?}",
+            census.proposals
+        );
+        let proposal = &census.proposals[0];
+        assert!(
+            report.curved.refusals.is_empty(),
+            "the accepted ring's chart must install: {:?}",
+            report.curved.refusals
+        );
+        assert_eq!(report.curved.charts.len(), 1);
+        let chart = &report.curved.charts[0];
+        assert_eq!(chart.block, proposal.block);
+        assert!(
+            chart.fit.certified && chart.fit.recurred,
+            "an installed chart carries its certificate: {:?}",
+            chart.fit
+        );
+        let tier1 = &report.tier1;
+        let routed: Vec<(usize, usize)> = (0..tier1.gates.nrows())
+            .flat_map(|row| (0..tier1.block_topk).map(move |slot| (row, slot)))
+            .filter(|&(row, slot)| {
+                tier1.gates[[row, slot]] != 0.0
+                    && tier1.blocks[[row, slot]] as usize == proposal.block
+            })
+            .collect();
+        assert!(!routed.is_empty());
+        assert_eq!(
+            chart.firings, routed,
+            "the chart decodes exactly the routed firings the ledger priced"
+        );
+        assert_eq!(chart.dl_saved_bits, proposal.dl_old - proposal.dl_new);
+        assert_eq!(stage_tally(&report.ledger, MoveStage::Curved).0, 1);
+        let promoted: usize = report
+            .ledger
+            .moves
+            .iter()
+            .filter(|mv| {
+                matches!(
+                    mv.kind,
+                    SaeMove::Death {
+                        stage: MoveStage::Linear,
+                        reason: MoveReason::Promoted,
+                    }
+                )
+            })
+            .map(|mv| mv.count)
+            .sum();
+        assert_eq!(promoted, 1, "the replaced block is one Promoted linear death");
+        assert_eq!(report.ledger.n_admitted, 0, "an installed verdict is not admitted");
+        assert_linear_blocks_accounted(&report);
+        assert_eq!(report.ledger.pc_reseed_events, 0);
+
+        let audit = census_tiered(ring.view(), &config).expect("single-block census runs");
+        assert_eq!(audit.code_space.n_accepted, 1);
+        assert!(
+            audit.curved.charts.is_empty() && audit.curved.refusals.is_empty(),
+            "the census-only report installs nothing"
+        );
+        assert_eq!(audit.ledger.n_admitted, 1);
+        assert_eq!(stage_tally(&audit.ledger, MoveStage::Curved).0, 0);
+        assert_linear_blocks_accounted(&audit);
+
+        // A sunflower lattice: uniform over the unit disk in the same plane.
+        let golden_angle = PI * (3.0 - 5.0_f64.sqrt());
+        let mut disk = Array2::<f64>::zeros((n, 4));
+        for i in 0..n {
+            let radius = ((i as f64 + 0.5) / n as f64).sqrt();
+            let angle = golden_angle * i as f64;
+            disk[[i, 0]] = radius * angle.cos();
+            disk[[i, 1]] = radius * angle.sin();
+        }
+        off_plane(&mut disk);
+        let control = fit_tiered(disk.view(), &config).expect("single-block tiered fit runs");
+        assert_eq!(
+            control.code_space.n_accepted, 0,
+            "the ledger must refuse a solid disk: {:?}",
+            control.code_space.proposals
+        );
+        assert!(
+            control.curved.charts.is_empty() && control.curved.refusals.is_empty(),
+            "a refused verdict runs no chart fit"
+        );
+        assert_eq!(stage_tally(&control.ledger, MoveStage::Curved).0, 0);
+        assert_linear_blocks_accounted(&control);
     }
 
     /// Focused #2023 gate: on a tiny two-circle fixture the Tier-2 branch drives
@@ -1096,8 +1346,8 @@ mod fit_tests {
         // residual, never PC reseeds, and every Tier-1 block is accounted for.
         assert_eq!(
             stage_tally(&report.ledger, MoveStage::Curved).0,
-            tier2.retained_atoms,
-            "every retained curved atom is one curved birth"
+            tier2.retained_atoms + report.curved.charts.len(),
+            "every retained curved atom and every installed chart is one curved birth"
         );
         assert_linear_blocks_accounted(&report);
         assert_eq!(
@@ -1139,7 +1389,7 @@ mod fit_tests {
         config.tier1.block_topk = 1;
         config.tier1.aux_k = 2;
         config.tier1.max_epochs = 200;
-        let report = fit_tiered(z.view(), &config).expect("linear-bulk fit runs");
+        let report = census_tiered(z.view(), &config).expect("linear-bulk census runs");
         assert_linear_blocks_accounted(&report);
         let record = report.census_json();
         assert_eq!(record["linear_bulk"]["n_blocks"].as_u64(), Some(2));

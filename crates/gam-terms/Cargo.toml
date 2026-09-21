@@ -40,4 +40,5 @@ cudarc.workspace = true
 approx = "0.5.1"
 gam-linalg-test-support = { path = "../gam-linalg-test-support" }
 num-dual = "0.14.1"
+qd = "0.8.0"
 rand = "0.10.1"

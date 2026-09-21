@@ -470,7 +470,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         Ok(Some(rows.assemble_dense(
             x_t.as_ref(),
             x_ls.as_ref(),
-            &program.basis_derivatives,
+            program.basis_derivatives(),
         )?))
     }
 
@@ -504,7 +504,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         Ok(Some(rows.assemble_dense(
             x_t.as_ref(),
             x_ls.as_ref(),
-            &program.basis_derivatives,
+            program.basis_derivatives(),
         )?))
     }
     fn exact_newton_joint_hessian_with_specs(

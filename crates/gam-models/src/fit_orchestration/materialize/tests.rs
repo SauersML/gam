@@ -2398,14 +2398,10 @@ fn survival_location_scale_wiggle_rejects_unsupported_inverse_link() {
         .expect("valid SAS state"),
     );
 
-    // Through the fit boundary: the refusal keeps its category (#2937).
-    let err = match fit_model(FitRequest::SurvivalLocationScale(request)) {
+    let err = match fit_survival_location_scale_model(request) {
         Ok(_) => panic!("survival link wiggle should reject unsupported inverse links"),
         Err(e) => e,
     };
-    assert_eq!(err.failure_category(), gam_problem::FailureCategory::Input, "{err}");
-    assert_eq!(err.variant_name(), "FitFailure::Input", "{err}");
-    let err = err.to_string();
 
     assert!(err.contains("survival link wiggle"));
     assert!(err.contains("does not support"));
@@ -4127,86 +4123,5 @@ fn materialized_requests_carry_the_callers_covariance_request_2677() {
                  compute_covariance={expected} to the fit"
             );
         }
-    }
-}
-
-/// #2937: a survival marginal-slope, latent or latent-binary fit refused by its
-/// own input validation raises that category through `fit_model`. All three
-/// routes handed back text, which `fit_model` recorded as
-/// `FitFailure::Unclassified`, so Python raised the bare `FitError`.
-#[test]
-fn survival_marginal_slope_and_latent_refusals_raise_their_category_2937() {
-    use crate::fit_orchestration::request::FitRequest;
-    use crate::survival::lognormal_kernel::{FrailtyScale, FrailtySpec, HazardLoading};
-
-    let td = tempdir().expect("tempdir");
-    let data_path = td.path().join("survival_refusal_category_2937.csv");
-    fs::write(
-        &data_path,
-        "entry,exit,event,x,z\n\
-         0.0,0.4,1,-0.9,0.3\n\
-         0.0,0.7,0,-0.6,-1.1\n\
-         0.0,0.9,1,-0.3,0.8\n\
-         0.0,1.2,1,-0.1,-0.4\n\
-         0.0,1.5,0,0.2,1.3\n\
-         0.0,1.8,1,0.4,-0.7\n\
-         0.0,2.2,0,0.6,0.1\n\
-         0.0,2.6,1,0.8,-1.5\n\
-         0.0,3.1,1,0.9,0.6\n\
-         0.0,3.7,0,-0.4,-0.2\n\
-         0.0,4.2,1,0.1,1.0\n\
-         0.0,4.8,0,-0.7,-0.9\n",
-    )
-    .expect("write survival refusal category csv");
-    let data = load_dataset_projected(
-        &data_path,
-        &[
-            "entry".to_string(),
-            "exit".to_string(),
-            "event".to_string(),
-            "x".to_string(),
-            "z".to_string(),
-        ],
-    )
-    .expect("load survival refusal category dataset");
-
-    for mode in ["marginal-slope", "latent", "latent-binary"] {
-        let config = if mode == "marginal-slope" {
-            FitConfig {
-                survival_likelihood: Some(mode.to_string()),
-                z_column: Some("z".to_string()),
-                ..FitConfig::default()
-            }
-        } else {
-            FitConfig {
-                survival_likelihood: Some(mode.to_string()),
-                baseline_target: "weibull".to_string(),
-                frailty: FrailtySpec::HazardMultiplier {
-                    scale: FrailtyScale::Fixed { sigma: 0.5 },
-                    loading: HazardLoading::Full,
-                },
-                ..FitConfig::default()
-            }
-        };
-        let mut request = materialize("Surv(entry, exit, event) ~ x", &data, &config)
-            .unwrap_or_else(|error| panic!("{mode} should materialize: {error}"))
-            .request;
-        // A negative prior weight, which each route's own validator refuses.
-        match &mut request {
-            FitRequest::SurvivalMarginalSlope(request) => request.spec.weights[0] = -1.0,
-            FitRequest::LatentSurvival(request) => request.spec.weights[0] = -1.0,
-            FitRequest::LatentBinary(request) => request.spec.weights[0] = -1.0,
-            _ => panic!("{mode} must materialize its own request"),
-        }
-        let err = match fit_model(request) {
-            Ok(_) => panic!("#2937: {mode} must refuse a negative prior weight"),
-            Err(err) => err,
-        };
-        assert_eq!(
-            err.failure_category(),
-            gam_problem::FailureCategory::Input,
-            "{mode}: {err}"
-        );
-        assert_eq!(err.variant_name(), "FitFailure::Input", "{mode}: {err}");
     }
 }

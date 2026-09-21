@@ -173,46 +173,33 @@ fn flex_blocks_cannot_move_the_anchor_on_a_declared_law_2948() {
     let law = skewed_grid();
     let anchored = anchored_on(&gaussian, &law);
     let scale = gaussian.probit_frailty_scale();
-    // The identity on the smaller tail, in log units (gam#2971): `T = Σ w Φ(−η)`
-    // where `q ≥ 0` and `T = Σ w Φ(η)` otherwise, against `Φ(∓q)`. Returns the
-    // residual `log T − log Φ(∓q)` and the certificate bound the production solve
-    // enforces at that intercept.
     let identity_residual = |a: f64, q: f64, g: f64, beta_h: &Array1<f64>, beta_w: &Array1<f64>| {
-        let survival_side = q >= 0.0;
-        let mut tail = 0.0;
-        let mut density = 0.0;
-        for (&u, &w) in law.nodes.iter().zip(&law.weights) {
-            let partials = shared_observed_denested_cell_partials(
-                u,
-                a,
-                g,
-                gaussian.score_warp.as_ref(),
-                Some(beta_h),
-                gaussian.link_dev.as_ref(),
-                Some(beta_w),
-                scale,
-            )
-            .expect("node partials");
-            let eta = eval_coeff4_at(&partials.coeff, u);
-            let chi = eval_coeff4_at(&partials.dc_da, u);
-            tail += w * crate::probability::normal_cdf(if survival_side { -eta } else { eta });
-            density += w * crate::probability::normal_pdf(eta) * chi;
-        }
-        let log_target = if survival_side {
-            crate::probability::normal_logcdf(-q)
-        } else {
-            crate::probability::normal_logcdf(q)
-        };
-        let log_slope = (density / tail).abs();
-        let rounding = crate::latent_anchor::anchor_residual_rounding(log_target, law.nodes.len());
-        let bound = crate::latent_anchor::anchor_residual_resolution(a, log_slope, rounding);
-        (tail.ln() - log_target, bound)
+        let marginal: f64 = law
+            .nodes
+            .iter()
+            .zip(&law.weights)
+            .map(|(&u, &w)| {
+                let partials = shared_observed_denested_cell_partials(
+                    u,
+                    a,
+                    g,
+                    gaussian.score_warp.as_ref(),
+                    Some(beta_h),
+                    gaussian.link_dev.as_ref(),
+                    Some(beta_w),
+                    scale,
+                )
+                .expect("node partials");
+                w * crate::probability::normal_cdf(-eval_coeff4_at(&partials.coeff, u))
+            })
+            .sum();
+        marginal - crate::probability::normal_cdf(-q)
     };
     let slope = 0.35;
     let (flat_h, flat_w) = warp_and_deviation(&gaussian, 0.0);
     let (warp_h, warp_w) = warp_and_deviation(&gaussian, 2.0);
-    let mut unresolved: Vec<String> = Vec::new();
-    let mut unmoved: Vec<String> = Vec::new();
+    let mut anchored_worst = 0.0_f64;
+    let mut gaussian_smallest_move = f64::INFINITY;
     for q in [-1.2, -0.3, 0.4, 1.1] {
         let solve = |family: &SurvivalMarginalSlopeFamily, beta_h: &Array1<f64>, beta_w: &Array1<f64>| {
             family
@@ -220,47 +207,29 @@ fn flex_blocks_cannot_move_the_anchor_on_a_declared_law_2948() {
                 .expect("intercept solve")
                 .0
         };
-        let (gaussian_flat, gaussian_flat_bound) =
-            identity_residual(solve(&gaussian, &flat_h, &flat_w), q, slope, &flat_h, &flat_w);
-        let (gaussian_warped, gaussian_warped_bound) =
-            identity_residual(solve(&gaussian, &warp_h, &warp_w), q, slope, &warp_h, &warp_w);
-        let (anchored_flat, anchored_flat_bound) =
-            identity_residual(solve(&anchored, &flat_h, &flat_w), q, slope, &flat_h, &flat_w);
-        let (anchored_warped, anchored_warped_bound) =
-            identity_residual(solve(&anchored, &warp_h, &warp_w), q, slope, &warp_h, &warp_w);
-        let gaussian_move = (gaussian_warped - gaussian_flat).abs();
-        let resolvable = anchored_flat_bound + anchored_warped_bound;
+        let gaussian_flat = identity_residual(solve(&gaussian, &flat_h, &flat_w), q, slope, &flat_h, &flat_w);
+        let gaussian_warped = identity_residual(solve(&gaussian, &warp_h, &warp_w), q, slope, &warp_h, &warp_w);
+        let anchored_flat = identity_residual(solve(&anchored, &flat_h, &flat_w), q, slope, &flat_h, &flat_w);
+        let anchored_warped = identity_residual(solve(&anchored, &warp_h, &warp_w), q, slope, &warp_h, &warp_w);
         eprintln!(
-            "[2948 anchor] q={q:+.2} gaussian log miss flat={gaussian_flat:+.3e} (bound {gaussian_flat_bound:.3e}) \
-             warped={gaussian_warped:+.3e} (bound {gaussian_warped_bound:.3e}) move={gaussian_move:.3e} | \
-             anchored log miss flat={anchored_flat:+.3e} (bound {anchored_flat_bound:.3e}) \
-             warped={anchored_warped:+.3e} (bound {anchored_warped_bound:.3e})"
+            "[2948 anchor] q={q:+.2} gaussian miss flat={gaussian_flat:+.3e} warped={gaussian_warped:+.3e} | \
+             anchored miss flat={anchored_flat:+.3e} warped={anchored_warped:+.3e}"
         );
-        if anchored_flat.abs() > anchored_flat_bound {
-            unresolved.push(format!("q={q:+.2} flat {anchored_flat:+.3e} > {anchored_flat_bound:.3e}"));
-        }
-        if anchored_warped.abs() > anchored_warped_bound {
-            unresolved.push(format!(
-                "q={q:+.2} warped {anchored_warped:+.3e} > {anchored_warped_bound:.3e}"
-            ));
-        }
-        if !(gaussian_move > resolvable) {
-            unmoved.push(format!("q={q:+.2} move {gaussian_move:.3e} <= {resolvable:.3e}"));
-        }
+        anchored_worst = anchored_worst.max(anchored_flat.abs()).max(anchored_warped.abs());
+        gaussian_smallest_move = gaussian_smallest_move.min((gaussian_warped - gaussian_flat).abs());
     }
-    // The anchored solve certifies its log-tail residual at the resolution the
-    // solve itself enforces, read here through the independent node kernel.
+    // The solve accepts an absolute probability residual of
+    // `SURVIVAL_INTERCEPT_ABS_RESIDUAL_TOL`; the independent kernel reads the same
+    // index to rounding.
     assert!(
-        unresolved.is_empty(),
-        "the anchored flex intercept must meet the declared law's marginal identity to its \
-         certificate for every warp and deviation: {unresolved:?}"
+        anchored_worst <= 10.0 * SURVIVAL_INTERCEPT_ABS_RESIDUAL_TOL,
+        "the anchored flex intercept must meet the declared law's marginal identity for every \
+         warp and deviation; worst miss {anchored_worst:.3e}"
     );
-    // The Gaussian program's anchor must move with the warp and the deviation by
-    // more than the anchored certificate could hide, or the pin bounds nothing.
     assert!(
-        unmoved.is_empty(),
-        "the fixture must show the Gaussian program's log miss moving with the warp and the \
-         deviation by more than the anchored certificate resolves: {unmoved:?}"
+        gaussian_smallest_move > 1e6 * anchored_worst.max(SURVIVAL_INTERCEPT_ABS_RESIDUAL_TOL),
+        "the fixture must show the Gaussian program's anchor moving with the warp and the \
+         deviation, or it pins nothing; smallest move {gaussian_smallest_move:.3e}"
     );
 }
 

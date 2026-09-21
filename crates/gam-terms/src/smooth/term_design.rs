@@ -317,6 +317,7 @@ fn build_term_collection_design_inner_with_policy_and_plan(
                 normalization_scale: 1.0,
                 kronecker_factors: None,
                 structural_null_frame: None,
+                energy_factor: None,
             },
         });
     }
@@ -339,6 +340,7 @@ fn build_term_collection_design_inner_with_policy_and_plan(
                 normalization_scale: 1.0,
                 kronecker_factors: None,
                 structural_null_frame: None,
+                energy_factor: None,
             },
         });
     }
@@ -363,6 +365,9 @@ fn build_term_collection_design_inner_with_policy_and_plan(
             (bp_smooth.col_range.start + smooth_start)..(bp_smooth.col_range.end + smooth_start);
         let bp = if let Some(factors) = localinfo.penalty.kronecker_factors.as_ref() {
             BlockwisePenalty::kronecker(offset_range, bp_smooth.local.clone(), factors.clone())
+                .with_op(bp_smooth.op.clone())
+        } else if let Some(factor) = localinfo.penalty.energy_factor.as_ref() {
+            BlockwisePenalty::energy_factor(offset_range, bp_smooth.local.clone(), factor.clone())
                 .with_op(bp_smooth.op.clone())
         } else if matches!(
             localinfo.penalty.source,
@@ -2318,10 +2323,21 @@ fn penalty_candidates_under_collection_gauge(
     let penalty_candidates = active_penalties
         .par_iter()
         .map(|penalty| -> Result<PenaltyCandidate, BasisError> {
-            let raw = ConstructiveQuadratic::try_from_dense_psd(
-                penalty.matrix.clone(),
-                "global smooth source penalty",
-            )?;
+            // A penalty that carries its builder's energy factor keeps it
+            // through the global gauge (`restricted` maps `A ↦ AT`). Rebuilding
+            // it from the dense Gram would re-square the factor's conditioning
+            // and re-measure its rank there.
+            let raw = match penalty.info.energy_factor.as_ref() {
+                Some(factor) => ConstructiveQuadratic::from_energy_factor(
+                    factor.clone(),
+                    "global smooth source penalty energy factor",
+                )?
+                .with_factor_rank_partition(),
+                None => ConstructiveQuadratic::try_from_dense_psd(
+                    penalty.matrix.clone(),
+                    "global smooth source penalty",
+                )?,
+            };
             // Re-attach the structural null frame the basis factory
             // declared (#2445): `try_from_dense_psd` sees only the dense
             // matrix, and the declaration must survive this chokepoint so

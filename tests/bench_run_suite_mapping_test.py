@@ -520,25 +520,10 @@ class RunSuiteMappingTests(unittest.TestCase):
             _RUN_SUITE._default_rust_formula_link_for_family("binomial"), "probit"
         )
 
-    def test_survival_benchmark_fit_options_require_structural_ispline_basis(self) -> None:
-        expected = {
-            "icu_survival_death": 10,
-            "icu_survival_los": 10,
-            "heart_failure_survival": 8,
-            "cirrhosis_survival": 8,
-        }
-        for scenario_name, expected_knots in expected.items():
-            with self.subTest(scenario_name=scenario_name):
-                cfg = _RUN_SUITE._rust_survival_fit_options_for_scenario(scenario_name)
-                self.assertEqual(cfg["time_basis"], "ispline")
-                self.assertEqual(cfg["time_degree"], 3)
-                self.assertEqual(cfg["time_num_internal_knots"], expected_knots)
-
-    def test_survival_benchmark_cli_args_emit_ispline(self) -> None:
-        args = _RUN_SUITE._rust_survival_fit_cli_args("icu_survival_death")
-        self.assertIn("--time-basis", args)
-        idx = args.index("--time-basis")
-        self.assertEqual(args[idx + 1], "ispline")
+    def test_survival_benchmark_cli_args_are_only_the_structural_ispline_basis(self) -> None:
+        # gam fit has no time-basis degree or knot flags (9419ed8fa4), so the
+        # survival contenders pass the basis alone; any other flag fails the fit.
+        self.assertEqual(_RUN_SUITE._rust_survival_fit_cli_args(), ["--time-basis", "ispline"])
 
     def test_run_rust_scenario_cv_rejects_survival_misuse(self) -> None:
         scenario = {"name": "heart_failure_survival"}

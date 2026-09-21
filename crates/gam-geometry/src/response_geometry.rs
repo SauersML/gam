@@ -578,14 +578,6 @@ impl ResponseManifold {
                 }
                 let y_norm = y_sq.sqrt();
                 let s = k.sqrt() * y_norm;
-                // `log_0` clamps `s` at `1 − BOUNDARY_EPS`: past it the returned
-                // logarithm is shortened, not rounded, and no band covers it.
-                if s >= 1.0 - crate::manifolds::poincare::BOUNDARY_EPS {
-                    return Err(GeometryError::Singular(
-                        "Poincaré logarithm clamped at the ball boundary: the target lies beyond \
-                         the distance the base can resolve",
-                    ));
-                }
                 let magnitudes = (1.0 + 2.0 * k * uv.abs() + k * vv) * uu.sqrt()
                     + (1.0 + k * uu) * vv.sqrt()
                     + y_norm * (1.0 + 2.0 * k * uv.abs() + k * k * uu * vv);
@@ -2197,14 +2189,14 @@ mod tests {
         );
     }
 
-    /// Past `√k·|(−p) ⊕ x| = 1 − BOUNDARY_EPS` the Poincaré logarithm is
-    /// clamped: it returns a shortened tangent, not a rounded one, so a Karcher
-    /// field built from it has zeros that are not the mean. A cloud with rows
-    /// beyond that horizon of the seed must be refused, never certified. A
-    /// dispersion-only descent stalled on this cloud at `‖ξ‖ = 3.7e-2` until its
-    /// iteration budget ran out.
+    /// The Poincaré logarithm is exact up to the ball's resolvable radius, so a
+    /// cloud whose rows lie farther from its mean than the removed
+    /// `BOUNDARY_EPS = 1e-5` log clamp reached (`2·artanh(1 − 1e-5)`) has a
+    /// Karcher field whose zero is the mean, and its descent certifies. Under
+    /// that clamp this cloud was refused: its clamped logarithms were shortened,
+    /// not rounded.
     #[test]
-    fn poincare_cloud_beyond_the_log_clamp_is_refused_not_certified() {
+    fn poincare_cloud_past_the_removed_log_clamp_certifies() {
         let manifold = ResponseManifold::Poincare {
             dim: 2,
             curvature: -1.0,
@@ -2212,12 +2204,29 @@ mod tests {
         let mut base = Array1::<f64>::zeros(2);
         base[0] = 0.3;
         let values = exp_cloud(manifold, base.view(), 2000, 3.0, 1008);
-        match response_frechet_mean(manifold, values.view(), None) {
-            Err(GeometryError::Singular(message)) => {
-                assert!(message.contains("clamped at the ball boundary"), "{message}");
-            }
-            other => panic!("expected the clamped cloud to be refused, got {other:?}"),
-        }
+        let mean = response_frechet_mean(manifold, values.view(), None)
+            .expect("an exact logarithm certifies the cloud past the removed clamp");
+        let uniform = Array1::from_elem(values.nrows(), 1.0 / values.nrows() as f64);
+        let state = karcher_state(manifold, values.view(), uniform.view(), mean.view())
+            .expect("Karcher state at the mean");
+        assert!(
+            state.residual <= state.band,
+            "residual {:.3e} exceeds its rounding band {:.3e}",
+            state.residual,
+            state.band
+        );
+        let removed_clamp_reach = 2.0 * (1.0 - 1.0e-5_f64).atanh();
+        let past_the_clamp = (0..values.nrows())
+            .filter(|&row| {
+                crate::manifolds::poincare::poincare_distance(mean.view(), values.row(row), -1.0)
+                    .expect("distance")
+                    > removed_clamp_reach
+            })
+            .count();
+        assert!(
+            past_the_clamp > 0,
+            "no row lies past the removed clamp's reach {removed_clamp_reach:.3}"
+        );
     }
 
     /// The phase-2 stall refusal, forced. The same SPD cloud and seed are

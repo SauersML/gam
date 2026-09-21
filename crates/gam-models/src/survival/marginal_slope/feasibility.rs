@@ -3,6 +3,8 @@
 //! that a candidate beta keeps the time derivative / monotonicity feasible.
 
 use super::*;
+use gam_math::jet_scalar::{JetScalar, Order2};
+use gam_math::nested_dual::JetField;
 
 /// Render a shared barrier-step refusal into the marginal-slope error
 /// vocabulary. A width disagreement is a dimension fault; everything else is a
@@ -308,36 +310,68 @@ impl SurvivalMarginalSlopeFamily {
         Ok(Some(margin))
     }
 
-    /// The largest `α ∈ [0, 1]` for which `β + α·δ` is strictly inside the
-    /// follow-up-varying likelihood domain, or `None` when the rule does not
-    /// apply (time-constant slope, or the whole step is already inside).
+    /// The joint step fraction `α ∈ [0, 1)` the row barrier's damping takes, or
+    /// `None` when the rule does not apply (time-constant slope) or the whole
+    /// step is taken.
     ///
-    /// # Why there is no safety fraction
+    /// # The damping
     ///
-    /// The usual interior-point retreat exists because the limiter and the
-    /// objective compute the boundary differently, so a step taken to the
-    /// limiter's boundary can land outside the objective's. Here they are the
-    /// same function evaluated by the same code at the same primaries, so the
-    /// endpoint this returns is admitted by the row program bit for bit. What
-    /// remains — a step that lands legally but very close, where `−log η′₁` is
-    /// large — is not a hazard the limiter should price: the objective there is
-    /// finite and worse, and the trust region rejects it on its own terms. That
-    /// is the mechanism that is supposed to decide step length, and inventing a
-    /// second one would shorten steps the criterion is happy with.
+    /// Each event row carries `−log η′₁,i`. Along the step its first-order rate
+    /// of approach to the edge, in units of its own distance from it, is
     ///
-    /// This mirrors [`apply_feasible_step_boundary_backoff`]'s finding on the
-    /// linear guard (gam#2695): a multiplicative retreat is a proportionality
-    /// the geometry does not have, and it can walk a coefficient toward a face
-    /// it never reaches.
+    ///     r_i = max(0, −Dη′₁,i[δ]) / η′₁,i,
     ///
-    /// # Search
+    /// the row barrier's local norm of `δ`, counted on the rows the step lowers.
+    /// A damped step is `α = 1/(1 + max_i r_i)`: the self-concordant (Dikin)
+    /// damping of the logarithmic barrier. A row affine along `δ` then keeps
+    /// `η′₁,i(α) = η′₁,i·(1 − α·r_i) ≥ η′₁,i/(1 + r_i) > 0`, strictly inside its
+    /// own crossing at `1/r_i`. So a step moves each row a bounded fraction of its
+    /// own distance to the edge, and the barrier's gradient `1/η′₁` and curvature
+    /// `1/η′₁²` grow by at most `1 + r_i` and `(1 + r_i)²` in one step. It is
+    /// derived from the barrier, not a fraction to the boundary. The rate is
+    /// `η′₁`'s own derivative, read as a jet from the one row-program declaration
+    /// (`rigid_feature_frame_witness_jets`) and pushed along `δ` through the
+    /// primaries' Jacobian.
     ///
-    /// `η′₁(α)` is smooth but not monotone in `α`, so the answer is found by
-    /// bisecting the bracket `[feasible, infeasible]` and returning the
-    /// FEASIBLE end — a point the rule has actually evaluated, never an
-    /// interpolated one. The bracket stops once it is finer than the step's own
-    /// representability, `α·‖δ‖∞ ≲ ε·‖β‖∞`, below which `β + α·δ` is not a
-    /// different point in f64 and no smaller `α` can change the answer.
+    /// # When the whole step is taken
+    ///
+    /// When `max_i r_i ≤ (3 − √5)/2`. A full Newton step on a self-concordant
+    /// barrier with decrement `λ` leaves `λ⁺ ≤ (λ/(1 − λ))²`, which is at most
+    /// `λ` exactly when `λ ≤ (3 − √5)/2`: inside that bound the full step
+    /// provably contracts the barrier's own decrement, and damping it would cut
+    /// a healthy Newton step and give up quadratic convergence for nothing.
+    /// Above it, a step is damped even when it is feasible. A feasible full step
+    /// with `r_i → 1` leaves `η′₁,i·(1 − r_i) ≈ 0` and recreates the jam at the
+    /// edge on the next iterate.
+    ///
+    /// Why it is needed (#2627, docs/marginal-slope.md:205, #2765): stepping to
+    /// the domain's feasible end puts every accepted iterate within roundoff of
+    /// the edge whenever the rest of the objective pushes toward it. Measured
+    /// there, 578 of 930 limited bases fell below `1e-10` (minimum `8.9e-16`),
+    /// and the steps that put them there were accepted as model-consistent
+    /// descents (the first at `ρ = 1.000009`). At such a base, `−log η′₁` sets
+    /// gradient and curvature scales (`1.7e10`, `2.9e20`) no reduced-face KKT
+    /// closure can meet.
+    ///
+    /// # The backstop
+    ///
+    /// A row that is not affine along `δ` has no such guarantee, so the damped
+    /// point must also be admitted by the exact witness. When it is not, the
+    /// binding row falls faster than its tangent, and a bisection of `[0, α]`
+    /// finds its exact crossing `α_c`. `η′₁(α)` is smooth but not monotone in
+    /// `α`, so the crossing is the feasible end of the bracket, a point the rule
+    /// has actually evaluated, and the bracket stops once it is finer than the
+    /// step's own representability, `α·‖δ‖∞ ≲ ε·‖β‖∞`. Returning `α_c` itself
+    /// would land within roundoff of the edge (measured on md:205: the tangent
+    /// put the crossing at `9.72e-3`, the exact one was `9.60e-3`, and the next
+    /// base was `1.3e-15`). So the step is damped by the chord to that crossing
+    /// instead, rate `r = 1/α_c`, giving `α = α_c/(1 + α_c)`. A row concave along
+    /// `δ` on `[0, α_c]` stays above the chord from `(0, η′₁)` to `(α_c, 0)`, so
+    /// it keeps `η′₁(α) ≥ η′₁/(1 + 1/α_c) > 0`: the affine rule's guarantee, with
+    /// the rate the row actually shows. If the exact witness refuses even the
+    /// chord point, a row turned back inside `[0, α_c]`, and the backstop repeats
+    /// below it ([`Self::chord_damped_domain_fraction`]). It never answers with a
+    /// bisection end.
     pub(crate) fn max_feasible_follow_up_joint_step(
         &self,
         block_states: &[ParameterBlockState],
@@ -356,9 +390,6 @@ impl SurvivalMarginalSlopeFamily {
                 .expect("the follow-up frame is what this rule is gated on"))
         };
 
-        if margin_at(1.0)? > 0.0 {
-            return Ok(None);
-        }
         if !(base_margin > 0.0) {
             // The rule has no bracket: the CURRENT iterate is already outside
             // the domain, which is a statement about how it got there and not
@@ -385,24 +416,173 @@ impl SurvivalMarginalSlopeFamily {
             return Ok(None);
         };
 
-        let mut feasible = 0.0_f64;
-        let mut infeasible = 1.0_f64;
-        while infeasible - feasible > resolution {
-            let midpoint = 0.5 * (feasible + infeasible);
-            if midpoint <= feasible || midpoint >= infeasible {
-                break;
-            }
-            if margin_at(midpoint)? > 0.0 {
-                feasible = midpoint;
-            } else {
-                infeasible = midpoint;
-            }
+        // The decrement below which a full Newton step on a self-concordant
+        // barrier contracts its own decrement: `(λ/(1 − λ))² ≤ λ` exactly when
+        // `λ ≤ (3 − √5)/2` (see the doc above).
+        let full_step_decrement = 0.5 * (3.0 - 5.0_f64.sqrt());
+        // A rate that is not finite has no damping to offer, so the step falls
+        // back to the exact domain alone: the bisection of `[0, 1]`.
+        let max_rate = self.follow_up_domain_max_rate(block_states, delta)?;
+        let damped = if max_rate.is_finite() && max_rate > full_step_decrement {
+            1.0 / (1.0 + max_rate)
+        } else {
+            1.0
+        };
+        if damped >= 1.0 && margin_at(1.0)? > 0.0 {
+            return Ok(None);
         }
+        if damped < 1.0 && margin_at(damped)? > 0.0 {
+            log::debug!(
+                "[survival-marginal-slope/follow-up-domain] joint step limited to α={damped:.6e} \
+                 by the row barrier's damping (max row rate {max_rate:.6e}; base min η′₁ = \
+                 {base_margin:.6e}, |δ|∞ = {step_scale:.6e})"
+            );
+            return Ok(Some(damped));
+        }
+
+        let (chord, rounds) = Self::chord_damped_domain_fraction(&margin_at, damped, resolution)?;
         log::debug!(
-            "[survival-marginal-slope/follow-up-domain] joint step limited to α={feasible:.6e} \
-             (base min η′₁ = {base_margin:.6e}, |δ|∞ = {step_scale:.6e})"
+            "[survival-marginal-slope/follow-up-domain] joint step limited to α={chord:.6e} \
+             by the chord to the exact crossing after {rounds} round(s), inside the damped \
+             α={damped:.6e} (max row rate {max_rate:.6e}; base min η′₁ = {base_margin:.6e}, \
+             |δ|∞ = {step_scale:.6e})"
         );
-        Ok(Some(feasible))
+        Ok(Some(chord))
+    }
+
+    /// The backstop's step when the point `refused` is not admitted: the chord-damped
+    /// fraction of the exact crossing below it, and how many rounds that took.
+    ///
+    /// Each round bisects `[0, upper]`, whose right end the domain refuses, for a
+    /// sign change `α_c` of the margin. It is the feasible end of the bracket, a point
+    /// the rule has evaluated, and the bracket stops at `resolution`, the step's own
+    /// representability. The round then damps by the chord to that crossing,
+    /// `α = α_c/(1 + α_c)`: a row concave along the step on `[0, α_c]` stays above
+    /// the chord from `(0, η′₁)` to `(α_c, 0)`, so it keeps `η′₁ ≥ η′₁/(1 + 1/α_c)`.
+    ///
+    /// If the chord point is refused too, a row turned back inside `[0, α_c]`, and
+    /// the bisection found a later sign change than the first. The next round bisects
+    /// `[0, α]`. The loop needs no cap: every round's crossing is a sign change at or
+    /// above the first one, and the next bracket excludes it and everything above it.
+    /// So the rounds are at most the sign changes below `refused`, plus one. A
+    /// chord below the first sign change is admitted. No round returns a bisection end,
+    /// which would put the iterate within roundoff of the edge.
+    pub(crate) fn chord_damped_domain_fraction(
+        margin_at: &dyn Fn(f64) -> Result<f64, String>,
+        refused: f64,
+        resolution: f64,
+    ) -> Result<(f64, usize), String> {
+        let mut upper = refused;
+        let mut rounds = 0usize;
+        loop {
+            rounds += 1;
+            let mut feasible = 0.0_f64;
+            let mut infeasible = upper;
+            while infeasible - feasible > resolution {
+                let midpoint = 0.5 * (feasible + infeasible);
+                if midpoint <= feasible || midpoint >= infeasible {
+                    break;
+                }
+                if margin_at(midpoint)? > 0.0 {
+                    feasible = midpoint;
+                } else {
+                    infeasible = midpoint;
+                }
+            }
+            let chord = feasible / (1.0 + feasible);
+            if !(chord > 0.0) || margin_at(chord)? > 0.0 {
+                return Ok((chord, rounds));
+            }
+            upper = chord;
+        }
+    }
+
+    /// `max_i r_i` over the event rows, with `r_i = max(0, −Dη′₁,i[δ]) / η′₁,i`
+    /// the row's first-order rate of approach to the follow-up domain's edge
+    /// along the joint step `δ`, in units of its own margin. Zero when no row's
+    /// `η′₁` falls along `δ`.
+    ///
+    /// `Dη′₁,i[δ] = ∇ₚη′₁,i · Dp_i[δ]`: the witness gradient over the row's
+    /// primaries is the `Order2` jet of the row program's `adjusted_derivative`
+    /// witness, and the primaries' derivative along `δ` is their exact Jacobian:
+    /// `row_dynamic_q_gradient` for the three `q` channels and the slope layout's
+    /// primary channel designs for the slope channels. The caller has checked
+    /// that every event row is strictly inside the domain.
+    fn follow_up_domain_max_rate(
+        &self,
+        block_states: &[ParameterBlockState],
+        delta: &Array1<f64>,
+    ) -> Result<f64, String> {
+        let widths: Vec<usize> = block_states.iter().map(|state| state.beta.len()).collect();
+        if widths.len() != 3 || delta.len() != widths.iter().sum::<usize>() {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope follow-up rate needs the [time, marginal, slope] \
+                     blocks and a matching step; got block widths {widths:?} and a step of {}",
+                    delta.len(),
+                ),
+            }
+            .into());
+        }
+        let delta_time = delta.slice(s![..widths[0]]);
+        let delta_marginal = delta.slice(s![widths[0]..widths[0] + widths[1]]);
+        let delta_slope = delta.slice(s![widths[0] + widths[1]..]).to_owned();
+        let follow_up_varying = follow_up_varying_flag::<
+            DYNAMIC_SLOPE_PRIMARIES,
+            DynamicSlopeGeometry,
+        >();
+        (0..self.n)
+            .into_par_iter()
+            .map(|row| -> Result<f64, String> {
+                // A censored row's density has no `log η′₁` factor, so it
+                // imposes no domain condition and has no rate.
+                if self.event[row] == 0.0 {
+                    return Ok(0.0);
+                }
+                let inputs = rigid_row_inputs(
+                    self,
+                    block_states,
+                    row,
+                    "survival marginal-slope follow-up domain rate",
+                )?;
+                let primaries = rigid_row_kernel_primaries::<
+                    DYNAMIC_SLOPE_PRIMARIES,
+                    DynamicSlopeGeometry,
+                >(self, block_states, row)?;
+                let seeded: [Order2<DYNAMIC_SLOPE_PRIMARIES>; DYNAMIC_SLOPE_PRIMARIES] =
+                    std::array::from_fn(|axis| Order2::variable(primaries[axis], axis));
+                let features = <DynamicSlopeGeometry as SlopeRowGeometry<
+                    DYNAMIC_SLOPE_PRIMARIES,
+                >>::feature_frame(&seeded, &inputs);
+                let [_, _, witness] = rigid_feature_frame_witness_jets::<
+                    DYNAMIC_SLOPE_PRIMARIES,
+                    Order2<DYNAMIC_SLOPE_PRIMARIES>,
+                >(&features, inputs.probit_scale, follow_up_varying);
+
+                let q = self.row_dynamic_q_gradient(row, block_states)?;
+                let mut direction = [0.0_f64; DYNAMIC_SLOPE_PRIMARIES];
+                direction[PRIMARY_Q0] =
+                    q.dq0_time.dot(&delta_time) + q.dq0_marginal.dot(&delta_marginal);
+                direction[PRIMARY_Q1] =
+                    q.dq1_time.dot(&delta_time) + q.dq1_marginal.dot(&delta_marginal);
+                direction[PRIMARY_QD1] =
+                    q.dqd1_time.dot(&delta_time) + q.dqd1_marginal.dot(&delta_marginal);
+                for &(primary, design) in self.slope_layout.primary_channels().as_slice() {
+                    direction[primary] += design.dot_row(row, &delta_slope);
+                }
+                let rate: f64 = witness
+                    .g()
+                    .iter()
+                    .zip(direction.iter())
+                    .map(|(gradient, step)| gradient * step)
+                    .sum();
+                Ok(if rate.is_finite() {
+                    (-rate).max(0.0) / witness.value()
+                } else {
+                    f64::INFINITY
+                })
+            })
+            .try_reduce(|| 0.0, |a, b| Ok(if b > a || b.is_nan() { b } else { a }))
     }
 
     /// `(β + α·δ, η + α·Xδ)` for every block: the displaced coefficients AND the

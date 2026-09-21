@@ -681,7 +681,6 @@ pub(crate) fn joint_outer_gradient_uses_projected_trace_for_rank_deficient_penal
         true,
         true,
         true,
-        false,
         EvalMode::ValueAndGradient,
         &options,
         gam_problem::RhoPrior::Flat,
@@ -715,7 +714,6 @@ pub(crate) fn joint_outer_gradient_uses_projected_trace_for_rank_deficient_penal
         0.0,
         true,
         true,
-        false,
         false,
         EvalMode::ValueAndGradient,
         &options,
@@ -859,7 +857,6 @@ pub(crate) fn joint_outer_gradient_projected_trace_drops_joint_null() {
         true,
         true,
         true,
-        false,
         EvalMode::ValueAndGradient,
         &options,
         gam_problem::RhoPrior::Flat,
@@ -1001,7 +998,6 @@ pub(crate) fn large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant(
             true,
             true,
             true,
-            false,
             EvalMode::ValueAndGradient,
             &options,
             gam_problem::RhoPrior::Flat,
@@ -1036,7 +1032,6 @@ pub(crate) fn large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant(
             0.0,
             true,
             true,
-            false,
             false,
             EvalMode::ValueAndGradient,
             &options,
@@ -1377,7 +1372,6 @@ pub(crate) fn large_scale_multiblock_outer_gradient_with_realistic_drift_is_boun
         true,
         true,
         true,
-        false,
         EvalMode::ValueAndGradient,
         &options,
         gam_problem::RhoPrior::Flat,
@@ -7170,6 +7164,7 @@ pub(crate) fn labeled_terminal_mode_keeps_one_outer_rho_for_two_physical_penalti
         rho: theta.clone(),
         hyper_values: Array1::zeros(0),
         inner: eval.inner,
+        ext_mode_response_cols: None,
     };
     let mut state = CustomOuterState::new(None);
     state.install_terminal_mode(&theta, objective, &gradient, mode);
@@ -7179,6 +7174,117 @@ pub(crate) fn labeled_terminal_mode_keeps_one_outer_rho_for_two_physical_penalti
         .expect("the non-Clone mode must move exactly once into terminal ownership");
     assert_eq!(terminal.mode.rho, theta);
     assert_eq!(terminal.theta.len(), 1);
+}
+
+/// #2677: a fit assembled from a certified owned coefficient mode carries the
+/// smoothing correction its certified outer optimum makes available. The route
+/// every baseline-chart and spatial-kappa driver certifies through used to publish
+/// no corrected covariance and no reason at all.
+#[test]
+pub(crate) fn certified_owned_mode_fit_publishes_the_smoothing_correction_2677() {
+    let family = OneBlockGaussianFamily {
+        y: array![0.3, -1.1, 0.8, 2.0, -0.4, 1.5],
+    };
+    let theta = array![0.5];
+    let specs = vec![ParameterBlockSpec {
+        name: "certified_owned_mode".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
+            [1.0, -1.0],
+            [1.0, -0.6],
+            [1.0, -0.2],
+            [1.0, 0.2],
+            [1.0, 0.6],
+            [1.0, 1.0],
+        ])),
+        offset: Array1::zeros(6),
+        penalties: vec![PenaltyMatrix::Dense(Array2::<f64>::eye(2))],
+        nullspace_dims: vec![0],
+        initial_log_lambdas: theta.clone(),
+        initial_beta: Some(Array1::zeros(2)),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }];
+    // The conditional covariance is opt-in; without it there is nothing to correct.
+    let options = BlockwiseFitOptions {
+        compute_covariance: true,
+        ..BlockwiseFitOptions::default()
+    };
+    let penalty_counts = validate_blockspecs(&specs).expect("valid certified-mode spec");
+    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
+        .expect("valid certified-mode layout");
+    let eval = outerobjectivegradienthessian_labeled(
+        &family,
+        &specs,
+        &options,
+        &layout,
+        &theta,
+        None,
+        &gam_problem::RhoPrior::Flat,
+        EvalMode::ValueAndGradient,
+    )
+    .expect("certified-mode outer evaluation");
+    let objective = eval.objective;
+    let mode = CustomFamilyOwnedMode {
+        objective,
+        rho: theta.clone(),
+        hyper_values: Array1::zeros(0),
+        inner: eval.inner,
+        ext_mode_response_cols: None,
+    };
+    let certified_outer = certified_test_outer(theta.clone(), objective);
+    assert!(
+        certified_outer.final_hessian().is_some(),
+        "the fixture's certificate must carry the analytic outer Hessian it declares"
+    );
+    let fit = fit_custom_family_fixed_log_lambdas_from_owned_mode(
+        &family,
+        &specs,
+        &options,
+        mode,
+        &theta,
+        &certified_outer,
+    )
+    .expect("the certified owned mode assembles a fit");
+    let conditional = fit
+        .covariance_conditional
+        .as_ref()
+        .expect("the certified fit publishes its conditional covariance");
+    let corrected = fit.covariance_corrected.as_ref().unwrap_or_else(|| {
+        panic!(
+            "#2677: a certified owned-mode fit must publish the smoothing-corrected covariance; \
+             absence={:?}",
+            fit.inference
+                .as_ref()
+                .map(|inference| &inference.smoothing_correction_absence)
+        )
+    });
+    assert_eq!(corrected.dim(), conditional.dim());
+    let mut widest_gain = 0.0_f64;
+    for j in 0..conditional.nrows() {
+        let gain = corrected[[j, j]] - conditional[[j, j]];
+        assert!(
+            gain >= -1e-12 * conditional[[j, j]].abs(),
+            "corrected variance {} is below the conditional {} at coefficient {j}",
+            corrected[[j, j]],
+            conditional[[j, j]]
+        );
+        widest_gain = widest_gain.max(gain);
+    }
+    assert!(widest_gain > 0.0, "the correction widens no marginal variance");
+    assert!(
+        matches!(
+            fit.inference
+                .as_ref()
+                .and_then(|inference| inference.smoothing_correction_method.as_ref()),
+            Some(gam_solve::model_types::SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
+                rho_dimension: 1,
+                ..
+            })
+        ),
+        "the published correction must carry its first-order provenance over the one outer coordinate"
+    );
 }
 
 /// #2668 row 30: only an accepted outer iterate seeds the search. A trial the
@@ -7620,6 +7726,7 @@ pub(crate) fn owned_mode_finalizer_preserves_prior_and_active_jeffreys_without_r
             rho: rho.clone(),
             hyper_values: Array1::zeros(0),
             inner: profiled.inner,
+            ext_mode_response_cols: None,
         },
     };
     let certified_outer = certified_test_outer(rho, objective);
@@ -7680,6 +7787,7 @@ pub(crate) fn failed_terminal_probe_clears_stale_owned_mode() {
         rho: theta.clone(),
         hyper_values: Array1::zeros(0),
         inner: evaluated.mode.inner,
+        ext_mode_response_cols: None,
     };
     let mut state = CustomOuterState::new(None);
     state.install_terminal_mode(&theta, objective, &array![0.0], mode);
@@ -7876,7 +7984,10 @@ mod anchored_continuation_2366;
 mod joint_hessian_drift_fd_979;
 
 mod residual_summand_floor_2976;
+
 mod walk_endpoint_mode_2627;
+
+mod outer_hessian_memo_2627;
 
 /// gam#2360. `audit_converged_identifiability` handed the drift audit a bare
 /// `vec![0.0; n]` as the pilot β. The pilot the PRE-FIT audit linearized at is

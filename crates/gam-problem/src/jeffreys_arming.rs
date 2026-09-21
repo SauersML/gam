@@ -280,6 +280,7 @@ mod tests {
         let search = |last_refusal: Option<CustomFamilyError>,
                       search_inner_refusal: Option<CustomFamilyError>| {
             CustomFamilyError::OuterSmoothingFailed {
+                route: crate::OuterSearchRoute::CustomFamily,
                 reason: "outer smoothing optimization failed".to_string(),
                 last_refusal: last_refusal.map(Box::new),
                 search_inner_refusal: search_inner_refusal.map(Box::new),
@@ -404,6 +405,7 @@ mod tests {
         // A whole-search refusal is read through its last objective refusal.
         let search = |last_refusal: Option<CustomFamilyError>| {
             CustomFamilyError::OuterSmoothingFailed {
+                route: crate::OuterSearchRoute::CustomFamily,
                 reason: "outer smoothing optimization failed".to_string(),
                 last_refusal: last_refusal.map(Box::new),
                 search_inner_refusal: None,

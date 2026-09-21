@@ -1246,7 +1246,7 @@ pub(crate) fn prepare_identified_time_block(
         ) }.into());
     }
     // Materialize to dense at the location-scale boundary — the hot path
-    // uses dense matrix operations (scale_dense_rows, weighted_crossprod_dense).
+    // uses dense matrix operations (scale_dense_rows, weighted_crossprod_dense_with_parallelism).
     let design_entry = input.design_entry.to_dense();
     let design_exit = input.design_exit.to_dense();
     let design_derivative_exit = input.design_derivative_exit.to_dense();
@@ -1288,12 +1288,9 @@ pub(crate) fn prepare_identified_time_block(
         // to exactly `log t` (built straight from the event times, NOT the
         // I-spline's curved image of it) but keep its SCALE `θ` a single FREE
         // coefficient: `h(t) = θ · log t`. The standardized residual is
-        // `u = h − η_loc/σ` with the warp UN-scaled by σ, so a lognormal/loglogistic
-        // AFT `(log t − μ)/σ` needs the warp to carry slope `1/σ` versus log t;
-        // the MLE drives `θ → 1/σ` and σ recovers to truth (folding `θ ≡ 1` instead
-        // would lock the residual log-t slope at 1 and over-determine σ). `θ` is
-        // identified — no flat ridge — by the event Jacobian's `log|h′| = log θ −
-        // log t` term, so the collapse to one log-t column is well posed. The
+        // `u = (h − η_loc)/σ`, so a free `θ` would co-scale with `(η_loc, σ)`
+        // along the gauge `c·(h, η_loc, σ)`; the branch below instead fixes the
+        // slope at the canonical `log t`, which breaks that gauge and identifies σ. The
         // single free column is the (non-constant) log-t warp, so the threshold
         // keeps its intercept and `pinned_free_row_constant` stays false.
         if r == 1
@@ -1310,11 +1307,9 @@ pub(crate) fn prepare_identified_time_block(
             // Jacobian gains `log_g = −η_ls − log t = −log σ − log t` — the `−log σ`
             // term that IDENTIFIES σ.
             //
-            // Why not a free warp scale θ (the prior attempt): with the warp
-            // un-scaled by σ the pair `(η_t, σ)` co-scaled freely (only `η_t/σ`
-            // identified, no `−log σ` term), so every parameter shrank by a common
-            // factor. Routing `log t` through the σ-scaled `q` channel supplies the
-            // missing `−log σ` Jacobian and pins σ. The warp is gone, so the time
+            // Why not a free warp scale θ: `(θ, η_t, σ)` would co-scale freely along
+            // the gauge `c·(θ, η_t, σ)`. The fixed `log t` offset breaks it and pins σ
+            // against the canonical AFT clock. The warp is gone, so the time
             // block is empty (no free columns, no penalties, no constraints); all
             // the σ-coupling rides the existing `q`-derivative/Hessian stack, with
             // no new time×log_sigma cross-terms.

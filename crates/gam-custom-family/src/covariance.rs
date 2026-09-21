@@ -2241,70 +2241,11 @@ pub(crate) fn joint_smoothing_correction(
     Result<(Array2<f64>, usize), gam_solve::model_types::SmoothingCorrectionAbsence>,
     CustomFamilyError,
 > {
-    let p_total: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
-    let k_outer = rho_outer.len();
-    if block_states.len() != specs.len() {
-        return Err(CustomFamilyError::trial_point(format!(
-            "joint smoothing correction: {} block states vs {} specs",
-            block_states.len(),
-            specs.len()
-        )));
-    }
-
-    // β̂ stacked in block order — the reduced coefficient frame V_cond lives in.
-    let mut beta_flat = Array1::<f64>::zeros(p_total);
-    let mut offsets = Vec::with_capacity(specs.len() + 1);
-    let mut at = 0usize;
-    for (spec, state) in specs.iter().zip(block_states) {
-        let width = spec.design.ncols();
-        if state.beta.len() != width {
-            return Err(CustomFamilyError::trial_point(format!(
-                "joint smoothing correction: block '{}' beta length {} ≠ design width {width}",
-                spec.name,
-                state.beta.len()
-            )));
-        }
-        offsets.push(at);
-        beta_flat
-            .slice_mut(ndarray::s![at..at + width])
-            .assign(&state.beta);
-        at += width;
-    }
-    offsets.push(at);
-
-    // U[:, o] = Σ_{slots tied to outer o} λ_slot · S_slot · β̂. Per-block
-    // penalties act on their block slice; joint specs act on the full stacked
-    // space. Fixed (untied) physical slots carry no ρ coordinate — no
-    // ρ-uncertainty flows through them.
-    let mut u_mat = Array2::<f64>::zeros((p_total, k_outer));
-    let mut physical = 0usize;
-    for (block_idx, spec) in specs.iter().enumerate() {
-        let base = offsets[block_idx];
-        let width = spec.design.ncols();
-        for penalty in &spec.penalties {
-            let outer = layout.physical_to_outer.get(physical).copied().flatten();
-            physical += 1;
-            let Some(outer) = outer else {
-                continue;
-            };
-            let lambda = rho_outer[outer].exp();
-            if lambda == 0.0 {
-                continue;
-            }
-            let s_dense = penalty.to_dense();
-            if s_dense.dim() != (width, width) {
-                return Err(CustomFamilyError::trial_point(format!(
-                    "joint smoothing correction: block '{}' penalty shape {:?} ≠ ({width}, {width})",
-                    spec.name,
-                    s_dense.dim()
-                )));
-            }
-            let s_beta = s_dense.dot(&beta_flat.slice(ndarray::s![base..base + width]));
-            for i in 0..width {
-                u_mat[[base + i, outer]] += lambda * s_beta[i];
-            }
-        }
-    }
+    let (mut u_mat, beta_flat) = penalty_drift_columns(specs, block_states, rho_outer, |slot| {
+        layout.physical_to_outer.get(slot).copied().flatten()
+    })?;
+    let p_total = beta_flat.len();
+    // Joint specs act on the full stacked space.
     for (joint_idx, spec) in layout.joint_specs.iter().enumerate() {
         let outer = layout.joint_to_outer[joint_idx];
         let lambda = rho_outer[outer].exp();
@@ -2326,6 +2267,146 @@ pub(crate) fn joint_smoothing_correction(
 
     first_order_smoothing_correction(v_cond, &u_mat, outer_hessian, outer_gradient, excluded_outer)
         .map_err(CustomFamilyError::trial_point)
+}
+
+/// `U[:, o] = Σ_{physical slots tied to outer o} λ_o · S_slot · β̂` over the per-block
+/// penalties, in the stacked coefficient frame V_cond lives in, with the stacked
+/// `β̂` it was formed at. `outer_of(slot)` is the outer coordinate physical slot
+/// `slot` is tied to. A fixed slot carries no ρ coordinate, so no ρ-uncertainty
+/// flows through it.
+fn penalty_drift_columns(
+    specs: &[ParameterBlockSpec],
+    block_states: &[ParameterBlockState],
+    rho_outer: &Array1<f64>,
+    outer_of: impl Fn(usize) -> Option<usize>,
+) -> Result<(Array2<f64>, Array1<f64>), CustomFamilyError> {
+    let p_total: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+    let k_outer = rho_outer.len();
+    if block_states.len() != specs.len() {
+        return Err(CustomFamilyError::trial_point(format!(
+            "smoothing correction: {} block states vs {} specs",
+            block_states.len(),
+            specs.len()
+        )));
+    }
+
+    // β̂ stacked in block order — the reduced coefficient frame V_cond lives in.
+    let mut beta_flat = Array1::<f64>::zeros(p_total);
+    let mut offsets = Vec::with_capacity(specs.len() + 1);
+    let mut at = 0usize;
+    for (spec, state) in specs.iter().zip(block_states) {
+        let width = spec.design.ncols();
+        if state.beta.len() != width {
+            return Err(CustomFamilyError::trial_point(format!(
+                "smoothing correction: block '{}' beta length {} ≠ design width {width}",
+                spec.name,
+                state.beta.len()
+            )));
+        }
+        offsets.push(at);
+        beta_flat
+            .slice_mut(ndarray::s![at..at + width])
+            .assign(&state.beta);
+        at += width;
+    }
+    offsets.push(at);
+
+    let mut u_mat = Array2::<f64>::zeros((p_total, k_outer));
+    let mut physical = 0usize;
+    for (block_idx, spec) in specs.iter().enumerate() {
+        let base = offsets[block_idx];
+        let width = spec.design.ncols();
+        for penalty in &spec.penalties {
+            let outer = outer_of(physical);
+            physical += 1;
+            let Some(outer) = outer else {
+                continue;
+            };
+            if outer >= k_outer {
+                return Err(CustomFamilyError::trial_point(format!(
+                    "smoothing correction: physical penalty {} is tied to outer coordinate {outer} of {k_outer}",
+                    physical - 1
+                )));
+            }
+            let lambda = rho_outer[outer].exp();
+            if lambda == 0.0 {
+                continue;
+            }
+            let s_dense = penalty.to_dense();
+            if s_dense.dim() != (width, width) {
+                return Err(CustomFamilyError::trial_point(format!(
+                    "smoothing correction: block '{}' penalty shape {:?} ≠ ({width}, {width})",
+                    spec.name,
+                    s_dense.dim()
+                )));
+            }
+            let s_beta = s_dense.dot(&beta_flat.slice(ndarray::s![base..base + width]));
+            for i in 0..width {
+                u_mat[[base + i, outer]] += lambda * s_beta[i];
+            }
+        }
+    }
+    Ok((u_mat, beta_flat))
+}
+
+/// The first-order smoothing correction at a certified owned coefficient mode
+/// (#2677), over every outer coordinate the certified optimum selected: the owned
+/// mode's physical smoothing strengths `rho`, one per penalty in block order, and
+/// `manifest_dimension` manifest coordinates such as a latent family's baseline
+/// chart axes. A smoothing coordinate's mode response is `V_cond·λ S β̂`; a manifest
+/// coordinate's is the column its evaluator solved.
+pub(crate) fn owned_mode_smoothing_correction(
+    v_cond: &Array2<f64>,
+    specs: &[ParameterBlockSpec],
+    rho: &Array1<f64>,
+    block_states: &[ParameterBlockState],
+    manifest_mode_responses: Option<&Array2<f64>>,
+    manifest_dimension: usize,
+    outer_hessian: &Array2<f64>,
+    outer_gradient: &Array1<f64>,
+    excluded_outer: &[usize],
+) -> Result<
+    Result<(Array2<f64>, usize), gam_solve::model_types::SmoothingCorrectionAbsence>,
+    CustomFamilyError,
+> {
+    let (u_rho, beta_flat) = penalty_drift_columns(specs, block_states, rho, Some)?;
+    let p_total = beta_flat.len();
+    if v_cond.dim() != (p_total, p_total) {
+        return Err(CustomFamilyError::trial_point(format!(
+            "owned-mode smoothing correction: V_cond shape {:?} ≠ ({p_total}, {p_total})",
+            v_cond.dim()
+        )));
+    }
+    let k_rho = rho.len();
+    let mut mode_responses = Array2::<f64>::zeros((p_total, k_rho + manifest_dimension));
+    mode_responses
+        .slice_mut(ndarray::s![.., ..k_rho])
+        .assign(&v_cond.dot(&u_rho));
+    if manifest_dimension > 0 {
+        let columns = manifest_mode_responses.ok_or_else(|| CustomFamilyError::Optimization {
+            context: "owned-mode smoothing correction",
+            reason: format!(
+                "the certified terminal mode selected {manifest_dimension} manifest coordinate(s) \
+                 but carries no mode responses for them"
+            ),
+        })?;
+        if columns.dim() != (p_total, manifest_dimension) {
+            return Err(CustomFamilyError::trial_point(format!(
+                "owned-mode smoothing correction: manifest mode responses have shape {:?}, expected ({p_total}, {manifest_dimension})",
+                columns.dim()
+            )));
+        }
+        mode_responses
+            .slice_mut(ndarray::s![.., k_rho..])
+            .assign(columns);
+    }
+    first_order_smoothing_correction_from_mode_responses(
+        &mode_responses,
+        outer_hessian,
+        outer_gradient,
+        excluded_outer,
+    )
+    .map_err(CustomFamilyError::trial_point)
 }
 
 /// First-order ρ-uncertainty inflation `C = A·V_ρ·Aᵀ` of a conditional
@@ -2355,17 +2436,39 @@ pub fn first_order_smoothing_correction(
     excluded_outer: &[usize],
 ) -> Result<Result<(Array2<f64>, usize), gam_solve::model_types::SmoothingCorrectionAbsence>, String>
 {
-    let (p_total, k_outer) = u_mat.dim();
-    if !outer_gradient.is_empty() && outer_gradient.len() != k_outer {
-        return Err(format!(
-            "smoothing correction: outer gradient has {} coordinate(s) for {k_outer}",
-            outer_gradient.len()
-        ));
-    }
+    let p_total = u_mat.nrows();
     if v_cond.dim() != (p_total, p_total) {
         return Err(format!(
             "smoothing correction: V_cond shape {:?} ≠ ({p_total}, {p_total})",
             v_cond.dim()
+        ));
+    }
+    first_order_smoothing_correction_from_mode_responses(
+        &v_cond.dot(u_mat),
+        outer_hessian,
+        outer_gradient,
+        excluded_outer,
+    )
+}
+
+/// [`first_order_smoothing_correction`] from the mode responses themselves: column
+/// `o` of `mode_responses` is `A[:, o]`, so `−A[:, o]` is `∂β̂/∂θ_o` in the
+/// conditional covariance's coefficient frame. A smoothing coordinate's column is
+/// `V_cond·∂(S_λ β̂)/∂ρ_o`; an outer coordinate no penalty carries, such as a
+/// family's baseline chart axis, supplies the mode response its evaluator solved
+/// (#2677).
+pub(crate) fn first_order_smoothing_correction_from_mode_responses(
+    mode_responses: &Array2<f64>,
+    outer_hessian: &Array2<f64>,
+    outer_gradient: &Array1<f64>,
+    excluded_outer: &[usize],
+) -> Result<Result<(Array2<f64>, usize), gam_solve::model_types::SmoothingCorrectionAbsence>, String>
+{
+    let (p_total, k_outer) = mode_responses.dim();
+    if !outer_gradient.is_empty() && outer_gradient.len() != k_outer {
+        return Err(format!(
+            "smoothing correction: outer gradient has {} coordinate(s) for {k_outer}",
+            outer_gradient.len()
         ));
     }
     if outer_hessian.dim() != (k_outer, k_outer) {
@@ -2422,13 +2525,12 @@ pub fn first_order_smoothing_correction(
             }
         };
 
-    // C = (V·U_inc) · V_ρ · (V·U_inc)ᵀ — symmetric PSD by construction.
-    let mut u_inc = Array2::<f64>::zeros((p_total, ki));
+    // C = A_inc · V_θ · A_incᵀ — symmetric PSD by construction.
+    let mut a_inc = Array2::<f64>::zeros((p_total, ki));
     for (col, &o) in included.iter().enumerate() {
-        u_inc.column_mut(col).assign(&u_mat.column(o));
+        a_inc.column_mut(col).assign(&mode_responses.column(o));
     }
-    let a_mat = v_cond.dot(&u_inc);
-    let mut correction = a_mat.dot(&inverted.inverse).dot(&a_mat.t());
+    let mut correction = a_inc.dot(&inverted.inverse).dot(&a_inc.t());
     symmetrize_dense_in_place(&mut correction);
     Ok(Ok((correction, inverted.active_rank)))
 }
@@ -2472,6 +2574,122 @@ mod required_covariance_tests {
                 Err(gam_solve::model_types::SmoothingCorrectionAbsence::InteriorRhoHessianRefused { .. })
             ),
             "a curvature below the certificate's bar is the typed interior refusal: {absence:?}"
+        );
+    }
+
+    /// One 2-coefficient block with penalty `S = diag(1, 2)` at `λ = 3` and mode
+    /// `β̂ = (0.5, −1)`, so `λ S β̂ = (1.5, −6)`.
+    fn owned_mode_correction_fixture() -> (Vec<ParameterBlockSpec>, Vec<ParameterBlockState>, Array1<f64>) {
+        let beta = array![0.5, -1.0];
+        let spec = ParameterBlockSpec {
+            name: "owned_mode".to_string(),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 2)),
+            )),
+            offset: Array1::zeros(1),
+            penalties: vec![PenaltyMatrix::Dense(array![[1.0, 0.0], [0.0, 2.0]])],
+            nullspace_dims: vec![0],
+            initial_log_lambdas: array![3.0_f64.ln()],
+            initial_beta: Some(beta.clone()),
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        };
+        let state = ParameterBlockState {
+            beta,
+            eta: Array1::zeros(1),
+        };
+        (vec![spec], vec![state], array![3.0_f64.ln()])
+    }
+
+    /// #2677: at a certified owned mode the correction spans the smoothing strength
+    /// and the manifest coordinates the optimum selected. A smoothing column is
+    /// `V_cond·λ S β̂`, a manifest column is the evaluator's mode response, and
+    /// `C = A·H_θ⁻¹·Aᵀ` over both.
+    #[test]
+    fn owned_mode_smoothing_correction_spans_smoothing_and_manifest_coordinates_2677() {
+        let (specs, states, rho) = owned_mode_correction_fixture();
+        let v_cond = array![[0.4, 0.1], [0.1, 0.3]];
+        let manifest = array![[0.2], [0.7]];
+        let outer_hessian = array![[4.0, 1.0], [1.0, 2.0]];
+        let no_gradient = Array1::<f64>::zeros(0);
+        let (correction, active_rank) = owned_mode_smoothing_correction(
+            &v_cond,
+            &specs,
+            &rho,
+            &states,
+            Some(&manifest),
+            1,
+            &outer_hessian,
+            &no_gradient,
+            &[],
+        )
+        .expect("well-formed owned-mode inputs")
+        .expect("a positive definite outer Hessian identifies both coordinates");
+        assert_eq!(active_rank, 2);
+        // A = [V_cond·(1.5, −6) | (0.2, 0.7)] = [[0, 0.2], [−1.65, 0.7]], and
+        // H_θ⁻¹ = [[2, −1], [−1, 4]] / 7.
+        let a = array![[0.0, 0.2], [-1.65, 0.7]];
+        let inverse = array![[2.0, -1.0], [-1.0, 4.0]] / 7.0;
+        let expected = a.dot(&inverse).dot(&a.t());
+        for ((row, column), &value) in expected.indexed_iter() {
+            assert!(
+                (correction[[row, column]] - value).abs() <= 1e-12,
+                "correction[{row},{column}] = {} vs A·H⁻¹·Aᵀ = {value}",
+                correction[[row, column]]
+            );
+        }
+
+        // A railed manifest coordinate has no finite variance, so only the
+        // smoothing column survives, against its own curvature 4.
+        let (railed, railed_rank) = owned_mode_smoothing_correction(
+            &v_cond,
+            &specs,
+            &rho,
+            &states,
+            Some(&manifest),
+            1,
+            &outer_hessian,
+            &no_gradient,
+            &[1],
+        )
+        .expect("well-formed owned-mode inputs")
+        .expect("the interior smoothing coordinate is identified");
+        assert_eq!(railed_rank, 1);
+        let a_rho = array![[0.0], [-1.65]];
+        let expected_railed = a_rho.dot(&a_rho.t()) / 4.0;
+        for ((row, column), &value) in expected_railed.indexed_iter() {
+            assert!(
+                (railed[[row, column]] - value).abs() <= 1e-12,
+                "railed correction[{row},{column}] = {} vs {value}",
+                railed[[row, column]]
+            );
+        }
+    }
+
+    /// #2677: a certified mode that selected manifest coordinates but carries no
+    /// mode responses for them cannot price their uncertainty, and says so.
+    #[test]
+    fn owned_mode_smoothing_correction_refuses_manifest_coordinates_without_responses_2677() {
+        let (specs, states, rho) = owned_mode_correction_fixture();
+        let v_cond = array![[0.4, 0.1], [0.1, 0.3]];
+        let outer_hessian = array![[4.0, 1.0], [1.0, 2.0]];
+        let refusal = owned_mode_smoothing_correction(
+            &v_cond,
+            &specs,
+            &rho,
+            &states,
+            None,
+            1,
+            &outer_hessian,
+            &Array1::<f64>::zeros(0),
+            &[],
+        )
+        .expect_err("manifest coordinates without mode responses must refuse");
+        assert!(
+            refusal.to_string().contains("carries no mode responses"),
+            "{refusal}"
         );
     }
 

@@ -1962,3 +1962,44 @@ fn a_stored_frames_conditioning_enters_its_rounding_band_2502() {
     let dead = stored_spans(Array2::<f32>::zeros((b, p)).view(), b).expect("a dead block");
     assert!(dead.inverse_grams.iter().all(|&value| value == 0.0));
 }
+
+/// #2469: a row collapses when its Gram–Schmidt residual is inside the pass's
+/// rounding band, not below an absolute `1e-9`. An independent row whose norm
+/// is far below `1e-9` keeps its own direction; under the literal it was
+/// replaced by the first free canonical axis, `e₁`. A row exactly in the span
+/// of the kept rows still collapses to the canonical fallback (positive
+/// control), and a power-of-two rescaling of the block leaves every output bit
+/// unchanged.
+#[test]
+fn gram_schmidt_rows_collapse_on_the_rounding_band_not_an_absolute_floor_2469() {
+    let tiny = 2.0_f32.powi(-40);
+    let mut block = Array2::<f32>::zeros((3, 3));
+    block[[0, 0]] = 1.0;
+    block[[1, 1]] = tiny;
+    block[[1, 2]] = tiny;
+    block[[2, 0]] = 3.0;
+    let mut orthonormal = block.clone();
+    gram_schmidt_rows(&mut orthonormal);
+    let half = std::f32::consts::FRAC_1_SQRT_2;
+    let near = |value: f32, expected: f32| (value - expected).abs() <= f32::EPSILON;
+
+    assert_eq!(orthonormal.row(0).to_vec(), vec![1.0, 0.0, 0.0], "the first row is e₀");
+    assert!(
+        orthonormal[[1, 0]] == 0.0 && near(orthonormal[[1, 1]], half) && near(orthonormal[[1, 2]], half),
+        "an independent row of norm 2⁻⁴⁰·√2 must keep its direction (e₁ + e₂)/√2, got {:?}",
+        orthonormal.row(1)
+    );
+    assert!(
+        orthonormal[[2, 0]] == 0.0 && near(orthonormal[[2, 1]], half) && near(orthonormal[[2, 2]], -half),
+        "a row in the span of e₀ must collapse to the canonical fallback (e₁ − e₂)/√2, got {:?}",
+        orthonormal.row(2)
+    );
+
+    let scale = 2.0_f32.powi(-20);
+    let mut rescaled = block.mapv(|value| value * scale);
+    gram_schmidt_rows(&mut rescaled);
+    assert!(
+        rescaled.iter().zip(orthonormal.iter()).all(|(a, b)| a.to_bits() == b.to_bits()),
+        "a power-of-two rescaling must leave the orthonormalisation bit-identical"
+    );
+}

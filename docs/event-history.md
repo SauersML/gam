@@ -135,6 +135,27 @@ biobank scalability.
 
 ## Forecasting
 
+Forecasts are posterior-predictive. The fit's global parameters (baselines,
+loadings, and rates) are uncertain, and every forecast averages its **final**
+probabilities over the fit's Laplace posterior of all coefficients. That
+posterior uses the smoothing-corrected covariance when smoothing strengths were
+estimated. Each parameter state filters the history and integrates the window
+under its own coefficients, and under the reference law evaluated at those
+coefficients. Averaging the parameters first and evaluating once would give a
+different, plug-in number: under an exponential rate posterior of mean one, the
+one-unit event probability is `1/2`, while the mean rate gives `1 - e^-1`.
+
+The average uses a dimension-adaptive sparse Gauss-Hermite rule over the
+posterior's eigen-directions. Every parameter state's window measures its own
+integration error, and the rule carries those errors through its weights. The
+rule refines until, for every returned probability, the frontier contributions,
+its estimate of what one more refinement could still move, no longer exceed that
+carried error, or the rounding band of the combination where that is larger. No
+tolerance is chosen.
+`survival_error` and `expected_count_errors` report the total of the three.
+`latent_state`, `pit` and `baseline_rates` remain conditional on the posterior
+mode's parameters.
+
 `forecast` filters a training history; `forecast_history` takes an independent
 history and covariate table. A cutoff discards later records and never invents
 follow-up beyond a recorded exit. Appending records after a cutoff cannot
@@ -155,6 +176,26 @@ Future terminal survival and mark counts integrate the killed latent process.
 Terminal counts are cumulative incidences, once-only counts are first-event
 probabilities before termination, and recurrent counts are expected numbers of
 events before termination.
+
+## Saving and reloading
+
+A fitted model saves its predictor. That is everything a forecast reads: the
+mark vocabulary and kinds, the covariate names and levels, the frozen bases, the
+numerical settings, the reference grid and profiles, and the posterior that
+forecasts average over. No training record is saved. The document is
+`{"kind": "event-history", "version": ..., "model": ...}`. A reader refuses
+another kind or version with a typed error and never migrates an older document.
+JSON carries every float exactly, so reloading on the same build reproduces
+every forecast bit for bit.
+
+In Python, `model.save(path)` writes the document and `gamfit.load(path)`
+returns an `EventHistoryPredictor`, which forecasts new histories and covariate
+paths. `gam fit-events --save-model PATH` writes the same document.
+`gam forecast-events --model PATH ...` forecasts new histories from it, and
+`gam forecast-population --model PATH ...` forecasts a covariate path alone,
+as `population_forecast` does. A save that cannot be made, because the
+predictor refuses or the file cannot be written, fails `gam fit-events` before
+it writes its summary.
 
 ## Python example
 

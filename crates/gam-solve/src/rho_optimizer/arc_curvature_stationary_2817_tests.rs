@@ -1197,6 +1197,8 @@ fn step_2817(iter: usize, step_norm: f64, radius: f64, actual: f64) -> StepInfo 
         predicted_decrease: actual,
         actual_decrease: actual,
         trust_radius: Some(radius),
+        regularization: None,
+        line_search_step: None,
     }
 }
 

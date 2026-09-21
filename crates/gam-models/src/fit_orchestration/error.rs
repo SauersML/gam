@@ -363,37 +363,6 @@ impl FitFailure {
         }
     }
 
-    /// The caller's configuration, data or problem size was refused.
-    #[must_use]
-    pub fn input(reason: impl Into<String>) -> Self {
-        Self::raised(FailureCategory::Input, reason)
-    }
-
-    /// State the engine built from validated input disagreed with itself.
-    #[must_use]
-    pub fn invariant(reason: impl Into<String>) -> Self {
-        Self::raised(FailureCategory::Invariant, reason)
-    }
-
-    /// A numerical step failed on the fit's own iterates.
-    #[must_use]
-    pub fn numerical(reason: impl Into<String>) -> Self {
-        Self::raised(FailureCategory::Numerical, reason)
-    }
-
-    /// A quadrature or compression did not reach its tolerance.
-    #[must_use]
-    pub fn integration(reason: impl Into<String>) -> Self {
-        Self::raised(FailureCategory::Integration, reason)
-    }
-
-    /// Text from a helper whose failures span categories. Each call site is
-    /// named, so what is left untyped stays countable (#2937).
-    #[must_use]
-    pub fn unclassified(reason: impl Into<String>) -> Self {
-        Self::raised(FailureCategory::Unclassified, reason)
-    }
-
     /// Put `context` in front of this failure without changing what it is.
     #[must_use]
     pub fn context(self, context: impl Into<String>) -> Self {
@@ -674,31 +643,6 @@ impl From<SurvivalMarginalSlopeError> for FitFailure {
     }
 }
 
-/// A term-design construction refusal, under the category the engine gives it
-/// as [`EstimationError::BasisError`], with the basis error's own text.
-impl From<gam_problem::BasisError> for FitFailure {
-    fn from(err: gam_problem::BasisError) -> Self {
-        let reason = err.to_string();
-        Self::raised(EstimationError::from(err).failure_category(), reason)
-    }
-}
-
-/// A survival location-scale refusal, under its variant's category, with its
-/// own text.
-impl From<crate::survival::location_scale::SurvivalLocationScaleError> for FitFailure {
-    fn from(err: crate::survival::location_scale::SurvivalLocationScaleError) -> Self {
-        Self::raised(err.failure_category(), err.to_string())
-    }
-}
-
-/// A latent survival or binary refusal, under its variant's category, with its
-/// own text.
-impl From<crate::survival::latent::LatentSurvivalError> for FitFailure {
-    fn from(err: crate::survival::latent::LatentSurvivalError) -> Self {
-        Self::raised(err.failure_category(), err.to_string())
-    }
-}
-
 impl From<WorkflowError> for FitFailure {
     fn from(err: WorkflowError) -> Self {
         match err {
@@ -795,6 +739,7 @@ mod fit_failure_tests {
     #[test]
     fn a_custom_family_search_failure_is_categorized_by_its_outer_verdict_2937() {
         let failure = FitFailure::from(CustomFamilyError::OuterSmoothingFailed {
+            route: gam_problem::OuterSearchRoute::CustomFamily,
             reason: format!(
                 "outer smoothing optimization failed certified-fit validation after exhausting \
                  strategy fallbacks: {}",
@@ -834,6 +779,7 @@ mod fit_failure_tests {
             )),
         };
         let failure = FitFailure::from(CustomFamilyError::OuterSmoothingFailed {
+            route: gam_problem::OuterSearchRoute::CustomFamily,
             reason: format!(
                 "outer smoothing optimization failed certified-fit validation after exhausting \
                  strategy fallbacks: {refusal}"
@@ -943,6 +889,7 @@ mod fit_failure_tests {
         search_inner_refusal: Option<CustomFamilyError>,
     ) -> CustomFamilyError {
         CustomFamilyError::OuterSmoothingFailed {
+            route: gam_problem::OuterSearchRoute::CustomFamily,
             reason: "outer smoothing optimization failed certified-fit validation".to_string(),
             last_refusal: last_refusal.map(Box::new),
             search_inner_refusal: search_inner_refusal.map(Box::new),

@@ -3893,12 +3893,58 @@
         }
     }
 
+    /// #2677: the β-drift `{D_βa X}` of one chart-axis information term `X(β)`
+    /// against its central `β_a`-difference, along every coefficient axis `a`. The
+    /// bar is [`assert_psi_pair_matches_central_difference`]'s, and the drift must
+    /// carry a channel above its absolute floor for agreement to say anything.
+    fn assert_beta_drift_matches_central_difference(
+        label: &str,
+        exact: &[Array2<f64>],
+        term_at: impl Fn(&Array1<f64>) -> Array2<f64>,
+        beta: &Array1<f64>,
+        h: f64,
+    ) {
+        let absolute_floor = 1e-6;
+        let close = |analytic: f64, central: f64| {
+            (analytic - central).abs() <= absolute_floor * analytic.abs().max(central.abs()).max(1.0)
+        };
+        assert_eq!(
+            exact.len(),
+            beta.len(),
+            "{label}: one drift per coefficient axis"
+        );
+        let magnitude = exact
+            .iter()
+            .flat_map(|drift| drift.iter())
+            .fold(0.0_f64, |worst, value| worst.max(value.abs()));
+        assert!(
+            magnitude > absolute_floor,
+            "{label}: every drift channel is at most {magnitude:e}, below the bar's absolute floor {absolute_floor:e}"
+        );
+        for (a, drift) in exact.iter().enumerate() {
+            let mut plus = beta.clone();
+            plus[a] += h;
+            let mut minus = beta.clone();
+            minus[a] -= h;
+            let central = (&term_at(&plus) - &term_at(&minus)) / (2.0 * h);
+            for ((r, c), &analytic) in drift.indexed_iter() {
+                assert!(
+                    close(analytic, central[[r, c]]),
+                    "{label}: D_β{a}[{r},{c}] {analytic} against central difference {}",
+                    central[[r, c]]
+                );
+            }
+        }
+    }
+
     /// #2677: the baseline-chart hyper axes serve the exact fixed-β second-order
     /// terms of every axis pair, the θ-derivatives of the first-order terms. The
     /// family is realized at `θ ± h` through the chart, on a fully loaded Weibull
     /// chart and on a loaded/unloaded Gompertz-Makeham split whose `ln m` axis moves
     /// no offset, so the loaded pairs, the `(ln m, loaded)` pairs and `(ln m, ln m)`
-    /// are each checked.
+    /// are each checked. At the chart point, every axis's `{D_βa D_βv D_θ H}` and every
+    /// pair's `{D_βa D_θi D_θj H}` are checked against the central `β_a`-difference of
+    /// the production `D_βv D_θ H` and `H_ij`.
     #[test]
     fn baseline_chart_psi_pair_terms_match_central_differences_2677() {
         let h = 1e-5_f64;
@@ -4001,6 +4047,63 @@
                         &pair,
                         &first_plus,
                         &first_minus,
+                        h,
+                    );
+                }
+            }
+            let states_at = |beta_point: &Array1<f64>| {
+                let mut states = latent_survival_states_from_joint_beta(&at_theta, beta_point);
+                let eta = &mut states[LatentSurvivalFamily::BLOCK_TIME].eta;
+                eta.slice_mut(s![0..n]).scaled_add(1.0, &rows.offset_entry);
+                eta.slice_mut(s![n..2 * n]).scaled_add(1.0, &rows.offset_exit);
+                eta.slice_mut(s![2 * n..3 * n])
+                    .scaled_add(1.0, &rows.derivative_offset_exit);
+                states
+            };
+            let direction = array![0.30, -0.20, 0.15, 0.25, -0.10_f64];
+            for i in 0..theta.len() {
+                let drift = at_theta
+                    .baseline_theta_hessian_second_directional_derivative_all_axes_dense(
+                        &states, &rows, i, &direction,
+                    )
+                    .expect("baseline psi mixed fifth");
+                assert_beta_drift_matches_central_difference(
+                    &format!("{label} axis {i} D_βa D_βv D_θ H"),
+                    &drift,
+                    |beta_point| {
+                        at_theta
+                            .baseline_theta_hessian_directional_derivative_dense(
+                                &states_at(beta_point),
+                                &rows,
+                                i,
+                                &direction,
+                            )
+                            .expect("baseline psi fourth at β ± h")
+                    },
+                    &beta,
+                    h,
+                );
+                for j in 0..theta.len() {
+                    let drift = at_theta
+                        .baseline_theta_psisecond_order_hessian_directional_derivative_all_axes_dense(
+                            &states, &rows, i, j,
+                        )
+                        .expect("baseline psi pair mixed fifth");
+                    assert_beta_drift_matches_central_difference(
+                        &format!("{label} pair ({i}, {j}) D_βa H_ij"),
+                        &drift,
+                        |beta_point| {
+                            at_theta
+                                .baseline_theta_psisecond_order_terms_dense(
+                                    &states_at(beta_point),
+                                    &rows,
+                                    i,
+                                    j,
+                                )
+                                .expect("baseline psi pair terms at β ± h")
+                                .hessian_psi_psi
+                        },
+                        &beta,
                         h,
                     );
                 }
@@ -4150,7 +4253,10 @@
     /// #2677: the binary deployment's second-order baseline-chart terms on a
     /// loaded/unloaded Gompertz-Makeham split. Its event and survivor rows run the
     /// loaded pairs, the `(ln m, loaded)` pairs and `(ln m, ln m)`, each against the
-    /// central `θ_j`-difference of the first-order hook realized at `θ ± h`.
+    /// central `θ_j`-difference of the first-order hook realized at `θ ± h`. At the
+    /// chart point, every axis's `{D_βa D_βv D_θ H}` and every pair's
+    /// `{D_βa D_θi D_θj H}` are checked against the central `β_a`-difference of the
+    /// production `D_βv D_θ H` and `H_ij`.
     #[test]
     fn binary_baseline_chart_psi_pair_terms_match_central_differences_2677() {
         let n = 4;
@@ -4232,6 +4338,61 @@
                     &pair,
                     &first_plus,
                     &first_minus,
+                    h,
+                );
+            }
+        }
+        let states_at = |beta_point: &Array1<f64>| {
+            let mut states = latent_binary_states_from_joint_beta(&at_theta, beta_point);
+            let eta = &mut states[LatentBinaryFamily::BLOCK_TIME].eta;
+            eta.slice_mut(s![0..n]).scaled_add(1.0, &rows.offset_entry);
+            eta.slice_mut(s![n..2 * n]).scaled_add(1.0, &rows.offset_exit);
+            states
+        };
+        let direction = array![0.30, -0.20, 0.15, 0.25_f64];
+        for i in 0..theta.len() {
+            let drift = at_theta
+                .baseline_theta_hessian_second_directional_derivative_all_axes_dense(
+                    &states, &rows, i, &direction,
+                )
+                .expect("binary baseline psi mixed fifth");
+            assert_beta_drift_matches_central_difference(
+                &format!("binary Gompertz-Makeham split axis {i} D_βa D_βv D_θ H"),
+                &drift,
+                |beta_point| {
+                    at_theta
+                        .baseline_theta_hessian_directional_derivative_dense(
+                            &states_at(beta_point),
+                            &rows,
+                            i,
+                            &direction,
+                        )
+                        .expect("binary baseline psi fourth at β ± h")
+                },
+                &beta,
+                h,
+            );
+            for j in 0..theta.len() {
+                let drift = at_theta
+                    .baseline_theta_psisecond_order_hessian_directional_derivative_all_axes_dense(
+                        &states, &rows, i, j,
+                    )
+                    .expect("binary baseline psi pair mixed fifth");
+                assert_beta_drift_matches_central_difference(
+                    &format!("binary Gompertz-Makeham split pair ({i}, {j}) D_βa H_ij"),
+                    &drift,
+                    |beta_point| {
+                        at_theta
+                            .baseline_theta_psisecond_order_terms_dense(
+                                &states_at(beta_point),
+                                &rows,
+                                i,
+                                j,
+                            )
+                            .expect("binary baseline psi pair terms at β ± h")
+                            .hessian_psi_psi
+                    },
+                    &beta,
                     h,
                 );
             }

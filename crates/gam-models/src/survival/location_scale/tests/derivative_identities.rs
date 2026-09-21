@@ -249,6 +249,7 @@ fn survival_ls_all_axes_second_directional_override_is_the_per_axis_fold_across_
             residual_distribution_inverse_link(distribution),
         );
         family.n = n;
+        family.entry_active = Arc::from(vec![true; n]);
         family.y = Array1::from_iter((0..n).map(|r| if r % 3 == 0 { 0.0 } else { 1.0 }));
         family.w = Array1::from_iter((0..n).map(|r| 0.6 + 0.1 * ((r % 7) as f64)));
         family.x_time_entry = Arc::new(x_time_entry.clone());
@@ -357,6 +358,7 @@ fn survival_ls_second_directional_axis_contractions_are_the_dense_axes_contracte
             residual_distribution_inverse_link(distribution),
         );
         family.n = n;
+        family.entry_active = Arc::from(vec![true; n]);
         family.y = Array1::from_iter((0..n).map(|r| if r % 3 == 0 { 0.0 } else { 1.0 }));
         family.w = Array1::from_iter((0..n).map(|r| 0.6 + 0.1 * ((r % 7) as f64)));
         family.x_time_entry = Arc::new(x_time_entry.clone());
@@ -467,6 +469,7 @@ fn survival_ls_rotated_first_directional_rows_are_the_dense_axes_rotated_2668() 
             residual_distribution_inverse_link(distribution),
         );
         family.n = n;
+        family.entry_active = Arc::from(vec![true; n]);
         family.y = Array1::from_iter((0..n).map(|r| if r % 3 == 0 { 0.0 } else { 1.0 }));
         family.w = Array1::from_iter((0..n).map(|r| 0.6 + 0.1 * ((r % 7) as f64)));
         family.x_time_entry = Arc::new(x_time_entry.clone());

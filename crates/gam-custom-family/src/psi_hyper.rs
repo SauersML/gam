@@ -8,9 +8,6 @@ use super::*;
 /// and the same immutable information/row measure as the psi workspace.
 pub struct ExplicitJeffreysCurvatureDrifts {
     completion_psi: CompletionPsiAction,
-    completion_psi_partial: CompletionPsiPartial,
-    completion_psi_pair: Option<CompletionPsiPair>,
-    completion_beta_psi: Option<CompletionBetaPsi>,
     psi_pair: Arc<
         dyn Fn(usize, &[f64], &Array2<f64>) -> Result<(Array2<f64>, Array1<f64>), CustomFamilyError> + Send + Sync,
     >,
@@ -217,277 +214,6 @@ fn prepare_explicit_jeffreys_curvature_drifts<F: CustomFamily + Clone + Send + S
             Ok(base.completion_drift_action_from_rotated(v, h, &base.rotate_axes(&axes)?, axes_psi.as_ref(), &base.rotate_axes(&moving)?)? * strength)
         })
     };
-    // gam#2930: `∂C/∂ψ|_β` as a matrix. Where the workspace contracts the ψ-moved trace Hessian in
-    // one pass, the completion's first-drift algebra forms it directly from `∂_ψ H_info`; elsewhere
-    // every column is the exact action above along one coefficient axis.
-    let completion_psi_partial: CompletionPsiPartial = {
-        let (base, first, first_axes, family, states, specs, workspace, completion_psi) = (
-            base.clone(),
-            first.clone(),
-            first_axes.clone(),
-            family.clone(),
-            states.clone(),
-            specs.clone(),
-            workspace.clone(),
-            Arc::clone(&completion_psi),
-        );
-        Arc::new(move |psi| {
-            let h = first
-                .get(psi)
-                .ok_or_else(|| CustomFamilyError::trial_point("Jeffreys completion psi index out of range"))?;
-            let total = h.nrows();
-            // gam#2922: the workspace contracts the observed Hessian's ψ motion.
-            let served = information_is_observed
-                && match workspace.as_ref() {
-                    Some(ws) => ws.contracted_trace_hessian_psi_axes()?.contains(&psi),
-                    None => false,
-                };
-            match (served, workspace.as_ref()) {
-                (true, Some(ws)) => {
-                    let second = if base.hessian_motion_active() {
-                        let psi_axes = first_axes.get(psi).ok_or_else(|| {
-                            CustomFamilyError::trial_point("Jeffreys completion psi axis derivatives out of range")
-                        })?;
-                        Some(base.rotate_axes(psi_axes)?)
-                    } else {
-                        None
-                    };
-                    let contracted = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
-                        family
-                            .joint_jeffreys_information_contracted_trace_hessian_with_specs(&states, &specs, weight)?
-                            .ok_or_else(|| {
-                                "priced Jeffreys completion requires the contracted trace Hessian".to_string()
-                            })
-                    };
-                    let along = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
-                        ws.contracted_trace_hessian_psi(psi, weight)?.ok_or_else(|| {
-                            format!(
-                                "psi axis {psi} declared its contracted trace Hessian derivative available and served none"
-                            )
-                        })
-                    };
-                    Ok(base.completion_drift_matrix(h, second.as_ref(), &contracted, &along)? * strength)
-                }
-                _ => {
-                    let mut columns = Array2::<f64>::zeros((total, total));
-                    let mut unit = Array1::<f64>::zeros(total);
-                    for axis in 0..total {
-                        unit[axis] = 1.0;
-                        columns.column_mut(axis).assign(&completion_psi(psi, &unit)?);
-                        unit[axis] = 0.0;
-                    }
-                    Ok(columns)
-                }
-            }
-        })
-    };
-    // gam#2930: the completion's second explicit ψ partial `∂²C/∂ψ_i∂ψ_j|_β` and its mixed drift
-    // `∂_ψ D_β C[v]`, from the completion's second-drift algebra with ψ directions in place of
-    // coefficient directions. Served only where the workspace contracts every ψ-moved trace Hessian
-    // in one pass; elsewhere a criterion that prices the completion declares no outer Hessian.
-    // Those passes move the observed Hessian, so another information is never served (gam#2922).
-    let every_axis_served = information_is_observed
-        && match workspace.as_ref() {
-            Some(ws) => {
-                let served = ws.contracted_trace_hessian_psi_axes()?;
-                (0..layout.len()).all(|psi| served.contains(&psi))
-            }
-            None => false,
-        };
-    let (completion_psi_pair, completion_beta_psi): (
-        Option<CompletionPsiPair>,
-        Option<CompletionBetaPsi>,
-    ) = match workspace.as_ref().filter(|_| every_axis_served) {
-        Some(ws) => {
-            let pair: CompletionPsiPair = {
-                let (base, first, first_axes, family, states, specs, ws) = (
-                    base.clone(),
-                    first.clone(),
-                    first_axes.clone(),
-                    family.clone(),
-                    states.clone(),
-                    specs.clone(),
-                    Arc::clone(ws),
-                );
-                Arc::new(move |psi_i, psi_j| {
-                    let out_of_range = || {
-                        CustomFamilyError::trial_point("Jeffreys completion psi pair index out of range")
-                    };
-                    let h_i = first.get(psi_i).ok_or_else(out_of_range)?;
-                    let h_j = first.get(psi_j).ok_or_else(out_of_range)?;
-                    let total = h_i.nrows();
-                    let terms = ws.second_order_terms(psi_i, psi_j)?.ok_or_else(|| {
-                        CustomFamilyError::trial_point(format!(
-                            "psi pair ({psi_i}, {psi_j}) has no exact second-order information terms"
-                        ))
-                    })?;
-                    let h_ij = if terms.hessian_psi_psi.dim() == (total, total) {
-                        terms.hessian_psi_psi.clone()
-                    } else {
-                        terms
-                            .hessian_psi_psi_operator
-                            .as_ref()
-                            .map(|operator| operator.mul_mat(&Array2::<f64>::eye(total)))
-                            .ok_or_else(|| {
-                                CustomFamilyError::trial_point(format!(
-                                    "psi pair ({psi_i}, {psi_j}) has no second information derivative"
-                                ))
-                            })?
-                    };
-                    let (second_i, second_j, third_ij) = if base.hessian_motion_active() {
-                        let axes_i = first_axes.get(psi_i).ok_or_else(out_of_range)?;
-                        let axes_j = first_axes.get(psi_j).ok_or_else(out_of_range)?;
-                        let third = ws
-                            .second_order_hessian_directional_derivative_all_beta_axes(psi_i, psi_j)?
-                            .ok_or_else(|| {
-                                CustomFamilyError::trial_point(format!(
-                                    "psi pair ({psi_i}, {psi_j}) has no exact third information derivative"
-                                ))
-                            })?;
-                        (
-                            Some(base.rotate_axes(axes_i)?),
-                            Some(base.rotate_axes(axes_j)?),
-                            Some(base.rotate_axes(&third)?),
-                        )
-                    } else {
-                        (None, None, None)
-                    };
-                    let contracted = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
-                        family
-                            .joint_jeffreys_information_contracted_trace_hessian_with_specs(&states, &specs, weight)?
-                            .ok_or_else(|| {
-                                "priced Jeffreys completion requires the contracted trace Hessian".to_string()
-                            })
-                    };
-                    let along_i = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
-                        ws.contracted_trace_hessian_psi(psi_i, weight)?.ok_or_else(|| {
-                            format!("psi axis {psi_i} served no contracted trace Hessian derivative")
-                        })
-                    };
-                    let along_j = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
-                        ws.contracted_trace_hessian_psi(psi_j, weight)?.ok_or_else(|| {
-                            format!("psi axis {psi_j} served no contracted trace Hessian derivative")
-                        })
-                    };
-                    let along_ij = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
-                        ws.contracted_trace_hessian_psi_pair(psi_i, psi_j, weight)?.ok_or_else(|| {
-                            format!(
-                                "psi pair ({psi_i}, {psi_j}) served no contracted trace Hessian second derivative"
-                            )
-                        })
-                    };
-                    Ok(base.completion_second_drift_matrix(
-                        h_i,
-                        h_j,
-                        &h_ij,
-                        second_i.as_ref(),
-                        second_j.as_ref(),
-                        third_ij.as_ref(),
-                        &contracted,
-                        &along_i,
-                        &along_j,
-                        &along_ij,
-                    )? * strength)
-                })
-            };
-            let beta: CompletionBetaPsi = {
-                let (base, first, first_axes, family, states, specs, ws) = (
-                    base.clone(),
-                    first.clone(),
-                    first_axes.clone(),
-                    family.clone(),
-                    states.clone(),
-                    specs.clone(),
-                    Arc::clone(ws),
-                );
-                Arc::new(move |psi, direction: &Array1<f64>| {
-                    let missing = |what: &str| {
-                        CustomFamilyError::trial_point(format!(
-                            "a criterion priced on the complete Jeffreys curvature requires exact {what} (gam#2930)"
-                        ))
-                    };
-                    let h_psi = first
-                        .get(psi)
-                        .ok_or_else(|| CustomFamilyError::trial_point("Jeffreys completion psi index out of range"))?;
-                    let total = h_psi.nrows();
-                    let h_v = family
-                        .joint_jeffreys_information_directional_derivative_with_specs(&states, &specs, direction)?
-                        .ok_or_else(|| missing("first information derivatives"))?;
-                    let h_psi_v = match ws
-                        .hessian_directional_derivative(psi, direction)?
-                        .ok_or_else(|| missing("psi-coefficient information derivatives"))?
-                    {
-                        DriftDerivResult::Dense(matrix) => matrix,
-                        DriftDerivResult::Operator(operator) => operator.mul_mat(&Array2::<f64>::eye(total)),
-                    };
-                    let (second_psi, second_v, third) = if base.hessian_motion_active() {
-                        let axes_psi = first_axes.get(psi).ok_or_else(|| {
-                            CustomFamilyError::trial_point("Jeffreys completion psi axis derivatives out of range")
-                        })?;
-                        let axes_v = family
-                            .joint_jeffreys_information_second_directional_all_axes_with_specs(&states, &specs, direction)?
-                            .ok_or_else(|| missing("second information derivatives"))?;
-                        let moving = ws
-                            .hessian_second_directional_derivative_all_beta_axes(psi, direction)?
-                            .ok_or_else(|| missing("mixed third information derivatives"))?;
-                        (
-                            Some(base.rotate_axes(axes_psi)?),
-                            Some(base.rotate_axes(&axes_v)?),
-                            Some(base.rotate_axes(&moving)?),
-                        )
-                    } else {
-                        (None, None, None)
-                    };
-                    let contracted = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
-                        family
-                            .joint_jeffreys_information_contracted_trace_hessian_with_specs(&states, &specs, weight)?
-                            .ok_or_else(|| {
-                                "priced Jeffreys completion requires the contracted trace Hessian".to_string()
-                            })
-                    };
-                    let along_psi = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
-                        ws.contracted_trace_hessian_psi(psi, weight)?.ok_or_else(|| {
-                            format!("psi axis {psi} served no contracted trace Hessian derivative")
-                        })
-                    };
-                    let along_v = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
-                        family
-                            .jeffreys_completion_outer_derivatives()
-                            .ok_or_else(|| {
-                                "priced Jeffreys completion requires the completion outer derivatives".to_string()
-                            })?
-                            .contracted_trace_hessian_directional(&states, &specs, weight, direction)?
-                            .ok_or_else(|| {
-                                "priced Jeffreys completion requires the directional contracted trace Hessian"
-                                    .to_string()
-                            })
-                    };
-                    let along_psi_v = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
-                        ws.contracted_trace_hessian_psi_directional(psi, weight, direction)?
-                            .ok_or_else(|| {
-                                format!(
-                                    "psi axis {psi} served no directional contracted trace Hessian derivative"
-                                )
-                            })
-                    };
-                    Ok(base.completion_second_drift_matrix(
-                        h_psi,
-                        &h_v,
-                        &h_psi_v,
-                        second_psi.as_ref(),
-                        second_v.as_ref(),
-                        third.as_ref(),
-                        &contracted,
-                        &along_psi,
-                        &along_v,
-                        &along_psi_v,
-                    )? * strength)
-                })
-            };
-            (Some(pair), Some(beta))
-        }
-        None => (None, None),
-    };
     let beta_psi = Arc::new(
         move |psi: usize, direction: &Array1<f64>| -> Result<Array2<f64>, CustomFamilyError> {
             if psi >= first.len() || direction.len() != total {
@@ -546,9 +272,6 @@ fn prepare_explicit_jeffreys_curvature_drifts<F: CustomFamily + Clone + Send + S
     );
     Ok(Some(Arc::new(ExplicitJeffreysCurvatureDrifts {
         completion_psi,
-        completion_psi_partial,
-        completion_psi_pair,
-        completion_beta_psi,
         psi_pair,
         beta_psi,
     })))
@@ -2918,12 +2641,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
 
         let robust_jeffreys_hphi =
             custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?;
-        // gam#2930: a ψ coordinate moves the Jeffreys completion exactly when the
-        // Jeffreys information depends on ψ. An active completion already implies the
-        // active reduced information the ψ completion action is built from, so nothing
-        // else is needed. Decided once, before the requested derivative order is looked
-        // at, so value screening and derivative assembly price one criterion.
-        let completion_moves_with_psi = family.joint_jeffreys_information_depends_on_psi();
         let has_configured_rho_prior = !matches!(rho_prior, gam_problem::RhoPrior::Flat);
         let batched_gradient_contract_allows_override =
             batched_outer_gradient_contract_allows_override(
@@ -3025,7 +2742,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         // same scalar value convention; the projected-subspace
                         // value belongs only to the generic projected-gradient path.
                         false,
-                        completion_moves_with_psi,
                         EvalMode::ValueOnly,
                         options,
                         gam_problem::RhoPrior::Flat,
@@ -3095,7 +2811,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 psi_workspace.clone(),
             )?;
 
-            let (ext_ext_fn, rho_ext_fn, drift_fn, contracted_psi_fn, explicit_completion) =
+            let (ext_ext_fn, rho_ext_fn, drift_fn, contracted_psi_fn, completion_psi) =
                 if eval_mode == EvalMode::ValueGradientHessian {
                     // EXPLICIT Firth/Jeffreys ψψ VALUE second-derivative context
                     // (gam#1607). Built ONCE and shared by BOTH the per-pair
@@ -3171,7 +2887,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         jeffreys_ctx,
                         explicit_curvature.clone(),
                     )?;
-                    let explicit_completion = explicit_curvature.clone();
+                    let completion_psi = explicit_curvature.as_ref().map(|c| Arc::clone(&c.completion_psi));
                     let drift_fn = build_psi_drift_deriv_callback(
                         family,
                         synced_joint_states.as_ref(),
@@ -3186,49 +2902,14 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         Some(rho_ext_fn),
                         drift_fn,
                         contracted_psi_fn,
-                        explicit_completion,
+                        completion_psi,
                     )
-                } else if completion_moves_with_psi
-                    && robust_jeffreys_hphi
-                        .as_ref()
-                        .is_some_and(|(_phi, _hphi, completion)| completion.is_some())
-                {
-                    // gam#2930: a gradient of a criterion that prices a ψ-moving completion
-                    // reads the completion's explicit ψ derivative, from the same explicit
-                    // Jeffreys curvature a Hessian evaluation builds.
-                    let jeffreys_ctx = build_jeffreys_hphi_ctx(
-                        family,
-                        synced_joint_states.as_ref(),
-                        specs,
-                        hyper_layout.as_ref(),
-                        beta_flat.len(),
-                    )?;
-                    let explicit_curvature = prepare_explicit_jeffreys_curvature_drifts(
-                        family,
-                        synced_joint_states.as_ref(),
-                        specs,
-                        Arc::clone(&hyper_layout),
-                        psi_workspace.clone(),
-                        jeffreys_ctx.as_ref(),
-                    )?;
-                    (None, None, None, None, explicit_curvature)
                 } else {
                     (None, None, None, None, None)
                 };
 
             Some(ExtCoordBundle {
-                completion_psi: explicit_completion
-                    .as_ref()
-                    .map(|completion| Arc::clone(&completion.completion_psi)),
-                completion_psi_partial: explicit_completion
-                    .as_ref()
-                    .map(|completion| Arc::clone(&completion.completion_psi_partial)),
-                completion_psi_pair: explicit_completion
-                    .as_ref()
-                    .and_then(|completion| completion.completion_psi_pair.clone()),
-                completion_beta_psi: explicit_completion
-                    .as_ref()
-                    .and_then(|completion| completion.completion_beta_psi.clone()),
+                completion_psi,
                 coords: psi_coords,
                 ext_ext_fn,
                 rho_ext_fn,
@@ -3335,7 +3016,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             } else {
                 family.use_projected_penalty_logdet()
             },
-            completion_moves_with_psi,
             eval_mode,
             options,
             rho_prior.clone(),
@@ -3510,7 +3190,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         // route, gam#808/#787), where joint_outer_evaluate produces
                         // a matched projected value AND gradient in one call.
                         false,
-                        false,
                         EvalMode::ValueOnly,
                         options,
                         gam_problem::RhoPrior::Flat,
@@ -3605,7 +3284,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             } else {
                 family.use_projected_penalty_logdet()
             },
-            false,
             eval_mode,
             options,
             rho_prior.clone(),
@@ -3935,7 +3613,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         include_logdet_h,
         include_logdet_s,
         family.use_projected_penalty_logdet(),
-        false,
         eval_mode,
         options,
         rho_prior,
@@ -4323,6 +4000,7 @@ pub fn upgrade_custom_family_joint_hyper_mode_shared<
         rho: owned_rho,
         hyper_values: owned_hyper_values,
         inner: selected_inner,
+        ..
     } = mode;
 
     let same_rho = owned_rho.len() == rho_current.len()
@@ -4736,9 +4414,6 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     )?;
     let ext_bundle = ExtCoordBundle {
         completion_psi: None,
-        completion_psi_partial: None,
-        completion_psi_pair: None,
-        completion_beta_psi: None,
         coords: psi_coords,
         ext_ext_fn: None,
         rho_ext_fn: None,
@@ -4956,6 +4631,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_owned_shared<
         rho: warm_start.rho.clone(),
         hyper_values: hyper_values.clone(),
         inner,
+        ext_mode_response_cols: None,
     };
     Ok(CustomFamilyJointHyperEfsOwnedResult {
         result: outer_efs_result_to_joint_hyper_efs_result(

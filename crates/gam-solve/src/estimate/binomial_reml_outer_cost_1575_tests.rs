@@ -1189,6 +1189,12 @@ fn a_fits_identified_rank_refuses_over_a_step_that_reaches_its_band_2901() {
         let design = gam_linalg::matrix::DesignMatrix::from(x);
         let coordinates = fit.lambdas.len();
         let outer_hessian = Array2::<f64>::eye(coordinates);
+        let rho = fit.lambdas.mapv(f64::ln);
+        // A domain that confines nothing, so the step below is the whole Newton step.
+        let unbounded = (
+            Array1::<f64>::from_elem(coordinates, f64::NEG_INFINITY),
+            Array1::<f64>::from_elem(coordinates, f64::INFINITY),
+        );
         let (at_zero_step, zero_radius) = super::identified_hessian::certify_fitted_identified_rank(
             pirls,
             &spectrum,
@@ -1197,6 +1203,8 @@ fn a_fits_identified_rank_refuses_over_a_step_that_reaches_its_band_2901() {
             &outer_hessian,
             &Array1::<f64>::zeros(coordinates),
             &[],
+            rho.view(),
+            (unbounded.0.view(), unbounded.1.view()),
         )
         .expect("a zero step certifies the fitted rank");
         assert_eq!(zero_radius, 0.0);
@@ -1233,14 +1241,18 @@ fn a_fits_identified_rank_refuses_over_a_step_that_reaches_its_band_2901() {
              {penalty_norm:.3e}",
             at_zero_step.smallest_identified,
         );
+        let reaching_hessian = outer_hessian.mapv(|entry| entry / reaching_step);
+        let reaching_gradient = Array1::<f64>::ones(coordinates);
         let refusal = super::identified_hessian::certify_fitted_identified_rank(
             pirls,
             &spectrum,
             &fit.lambdas,
             &design,
-            &outer_hessian.mapv(|entry| entry / reaching_step),
-            &Array1::<f64>::ones(coordinates),
+            &reaching_hessian,
+            &reaching_gradient,
             &[],
+            rho.view(),
+            (unbounded.0.view(), unbounded.1.view()),
         )
         .expect_err("a step reaching the band refuses the fitted rank");
         assert!(
@@ -1250,5 +1262,23 @@ fn a_fits_identified_rank_refuses_over_a_step_that_reaches_its_band_2901() {
             ),
             "{refusal}"
         );
+        // The same Newton step, where the search domain ends at ρ̂ on both sides: the
+        // stationary point the certificate vouches for cannot leave ρ̂, so nothing the
+        // step reaches outside the domain is charged, and the rank certifies as at a
+        // zero step.
+        let (confined, confined_radius) = super::identified_hessian::certify_fitted_identified_rank(
+            pirls,
+            &spectrum,
+            &fit.lambdas,
+            &design,
+            &reaching_hessian,
+            &reaching_gradient,
+            &[],
+            rho.view(),
+            (rho.view(), rho.view()),
+        )
+        .expect("a step the search domain confines to ρ̂ certifies the fitted rank");
+        assert_eq!(confined_radius, 0.0);
+        assert_eq!(confined.rank, at_zero_step.rank);
     }
 }

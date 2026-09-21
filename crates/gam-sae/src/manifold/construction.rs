@@ -277,14 +277,16 @@ pub enum SaeCriterionError {
     IndefiniteObservedInformation {
         block: &'static str,
     },
-    /// #2234 — atom `atom` carries a closure-certified circle orbit, whose evidence the dense
-    /// exact-`A` route integrates exactly: `log|A_s| − log det N − 2·log I + log 2π`. The arrow
-    /// (streaming) route factors `A` on its per-row blocks and reduced Schur, and has no signed
-    /// factorization carrying the rank-2 orbit correction, so it cannot price that criterion. It
-    /// refuses by this name rather than through the indefinite-`A` verdict, which would claim the
-    /// state has no Laplace normalizer while the dense route prices the same state finitely.
+    /// #2234 — atom `atom` carries a closure-certified circle orbit, whose evidence both routes
+    /// integrate exactly: `log|A_s| − log det N − 2·log I + log 2π`. The arrow route prices it on
+    /// its exact reduced-Schur orbit lane where the stiffened pencil is certified free of band and
+    /// negative directions (step 1a). `refusal` names the arrow lane that could not price this
+    /// state and why. It refuses by this name rather than through the indefinite-`A` verdict,
+    /// which would claim the state has no Laplace normalizer while the dense route prices the
+    /// same state finitely.
     OrbitCriterionUnavailableOnArrowRoute {
         atom: usize,
+        refusal: ArrowOrbitRefusal,
     },
 }
 
@@ -349,11 +351,11 @@ impl std::fmt::Display for SaeCriterionError {
                 "exact observed-information Hessian is indefinite at the converged mode \
                  ({block} block): ½log|A| is undefined (the inner point is not a maximum)"
             ),
-            Self::OrbitCriterionUnavailableOnArrowRoute { atom } => write!(
+            Self::OrbitCriterionUnavailableOnArrowRoute { atom, refusal } => write!(
                 f,
-                "atom {atom} carries a closure-certified circle orbit: its orbit-eliminated criterion \
-                 (#2234) is priced only on the dense exact-A route, and the arrow (streaming) route \
-                 has no signed factorization carrying the rank-2 orbit correction"
+                "atom {atom} carries a closure-certified circle orbit, and the arrow route's {} \
+                 cannot price its orbit-eliminated criterion (#2234): {refusal}",
+                refusal.lane()
             ),
         }
     }
@@ -790,16 +792,16 @@ include!("softmax_entropy_majorizer.rs");
 // gate.
 include!("construction_exact_hessian.rs");
 
-// [#2933 F36] The joint fitted-response divergence reads the exact stationarity
-// eigensystem above, so it shares this module scope.
-include!("construction_fitted_response.rs");
-
 // [#2253] Exact hard-rank-charge direct and implicit-response derivatives.
 include!("construction_rank_charge_derivative.rs");
 
 // [#2234] The declared compact chart orbit, integrated exactly: the stiffened operator the dense
 // exact-A block prices and the orbit-eliminated exact-A pseudo-inverse beside it.
 include!("construction_orbit_elimination.rs");
+
+// [#2234] The same orbit-eliminated evidence on the arrow route, off one elimination of the
+// bordered operator, and the arrow-held seams the exact-A channels read their operands through.
+include!("construction_orbit_arrow.rs");
 
 // [#780] The outer-gradient error taxonomy (`OuterGradientError`), the
 // `ForcedRowLayout` override alias, the `COTRAIN_*` co-training weight
@@ -4432,6 +4434,7 @@ impl SaeManifoldTerm {
             manifold_for,
             delta_ev_for,
             total_centered_variance,
+            n,
             dispersion_r,
         )
     }
@@ -5109,11 +5112,8 @@ impl SaeManifoldTerm {
             }
             pairwise_sum(&vals)
         };
-        // #2080 — the gate prior is an energy on `z`, and this objective is integrated over
-        // the logit, so the prior carries its change-of-variables term. Only the ThresholdGate
-        // and learnable-concentration ordered Beta--Bernoulli energies carry their partition
-        // functions; softmax entropy and fixed-concentration ordered Beta--Bernoulli stay
-        // unnormalized energies (#2933 F45).
+        // #2080 — the gate prior is a density on `z`, and this objective is integrated over
+        // the logit, so the prior carries its change-of-variables term.
         let assignment_sparsity = crate::assignment::assignment_prior_value_weighted(
             &self.assignment,
             rho,
@@ -5393,26 +5393,14 @@ impl SaeManifoldTerm {
         // Design-honesty weights change the relative contribution of rows while
         // preserving total sample mass: `set_row_loss_weights` normalizes them to
         // mean one. The ARD energy therefore uses the per-row weights, while its
-        // log-partition normalizer counts the priced coordinate slots exactly.
+        // log-partition normalizer remains the observed row count exactly.
         let row_w = self.row_loss_weights.as_deref();
-        // A hard-TopK coordinate exists only on the rows that select its atom, where
-        // `½·log|A|` integrates it (#2933 F27, see `Self::coordinate_prior_rows`).
-        let prior_rows = self.coordinate_prior_rows()?;
+        let n_eff = n as f64;
         let mut acc = 0.0;
         for (atom_idx, coord) in self.assignment.coords.iter().enumerate() {
             if rho.log_ard[atom_idx].is_empty() {
                 continue;
             }
-            let atom_rows = prior_rows.as_ref().map(|rows| rows[atom_idx].as_slice());
-            let slots = atom_rows.map_or(n, <[usize]>::len);
-            let slot_count = slots as f64;
-            // A reflection-only deck group leaves the prior family and partition
-            // unchanged, so the quotient normalizer divides out its sheet count per
-            // slot (#2933 F25; see `SaeAtomBasisKind::ard_quotient_log_sheets`).
-            acc -= slot_count
-                * self.atoms[atom_idx]
-                    .basis_kind()
-                    .ard_quotient_log_sheets(coord.latent_dim());
             // Per-axis prior period selects the smooth von-Mises energy on
             // wrapped (Circle) axes and the quadratic energy on every other axis.
             // A quotient atom's half-turned axis carries its deck-invariant half
@@ -5436,14 +5424,13 @@ impl SaeManifoldTerm {
                 for factor_axis in axis..axis + support.ambient_axes() {
                     let alpha = ard_precisions[atom_idx][factor_axis];
                     let period = periods[factor_axis];
-                    for slot in 0..slots {
-                        let row = atom_rows.map_or(slot, |rows| rows[slot]);
+                    for row in 0..n {
                         let w_row = row_w.map_or(1.0, |w| w[row]);
                         let v = coord.row(row)[factor_axis];
                         energy += w_row * ArdAxisPrior::eval(alpha, v, period).value;
                     }
                 }
-                acc += energy + slot_count * log_partition;
+                acc += energy + n_eff * log_partition;
                 axis += support.ambient_axes();
             }
         }
@@ -5679,19 +5666,4 @@ mod construction_tests {
     use super::*;
 
     include!("construction_tests.rs");
-}
-
-/// Solve-invariant operands of `selected_inverse_row_blocks_or_solve` (#932
-/// FRONT C): everything fixed across the per-row sweep of one
-/// trace/adjoint pass — the deflated solver, the factor cache, the dense
-/// `(H⁻¹)_ββ`, the Takahashi-vs-solve route flag, the shared zero β-RHS, and
-/// the error-context prefix — bundled so each per-row call carries only the
-/// row coordinates and the reusable scratch buffer.
-pub(crate) struct SelectedInverseRowSolve<'a> {
-    pub(crate) solver: &'a DeflatedArrowSolver<'a>,
-    pub(crate) cache: &'a ArrowFactorCache,
-    pub(crate) beta_inv: &'a Array2<f64>,
-    pub(crate) fast_selected: bool,
-    pub(crate) rhs_beta_zero: ArrayView1<'a, f64>,
-    pub(crate) context: &'a str,
 }

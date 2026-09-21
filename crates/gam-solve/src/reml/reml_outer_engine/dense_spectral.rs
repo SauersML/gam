@@ -48,6 +48,12 @@ pub struct DenseSpectralOperator {
     pub(crate) raw_eigenvalues: Vec<f64>,
     /// The spectral regularization scale ε used to build every kernel.
     pub(crate) epsilon: f64,
+    /// For an operator priced from the root `B = [√W·X; √λ_k R_k]`: per penalty
+    /// coordinate `k`, the rows `U_k` of `B`'s left singular vectors that belong to
+    /// `√λ_k·R_k` (one column per mode, in eigenpair order), beside the `λ_k` they
+    /// were taken at. `None` for a penalty the root carries no rows for; empty for
+    /// an operator from an eigendecomposition (#2959 D2).
+    pub(crate) root_penalty_leverage: Vec<Option<(Array2<f64>, f64)>>,
 }
 
 impl DenseSpectralOperator {
@@ -372,6 +378,66 @@ impl DenseSpectralOperator {
             n_dim: n,
             raw_eigenvalues: eigenvalues.to_vec(),
             epsilon,
+            root_penalty_leverage: Vec::new(),
+        })
+    }
+
+    /// This operator with each penalty's left-singular rows attached; see
+    /// [`Self::root_penalty_mode_terms`] (#2959 D2).
+    pub(crate) fn with_root_penalty_leverage(
+        mut self,
+        leverage: Vec<Option<(Array2<f64>, f64)>>,
+    ) -> Self {
+        self.root_penalty_leverage = leverage;
+        self
+    }
+
+    /// Penalty `penalty`'s per-mode terms of `tr(H⁻¹·λ S)` at `λ = scale`, read off
+    /// the root's left singular vectors: `λ·v_jᵀ S v_j / σ_j = ‖U_k[:, j]‖²`. `None`
+    /// unless this operator was priced from the root at exactly that `λ`.
+    ///
+    /// The same terms formed from the eigenvectors, `λ·g_jᵀ S g_j`, carry `v_j`'s
+    /// error through `√λ·R` and divide it by `σ_j`. On #2959 M4's fixture that put
+    /// the analytic `½log|H|` gradient 2.595e-3 from its central difference at
+    /// ρ₁ = 17.2 (lane probe job 1220428), with a penalty railed at λ = 2.95e7
+    /// beside a mode at σ ≈ 3e-7.
+    pub(crate) fn root_penalty_mode_terms(&self, penalty: usize, scale: f64) -> Option<Array1<f64>> {
+        let (rows, lambda) = self.root_penalty_leverage.get(penalty)?.as_ref()?;
+        if *lambda != scale || rows.ncols() != self.n_dim {
+            return None;
+        }
+        Some(Array1::from_shape_fn(self.n_dim, |mode| {
+            if self.active_mask[mode] {
+                rows.column(mode).iter().map(|value| value * value).sum()
+            } else {
+                0.0
+            }
+        }))
+    }
+
+    /// Per-mode terms `λ·g_jᵀ S g_j` of `tr(G_ε·λ S)` for a block-local penalty,
+    /// from the root's left singular vectors when this operator was priced from
+    /// the root at this `λ`, else from the eigenvectors.
+    fn penalty_mode_terms(
+        &self,
+        penalty: usize,
+        s_block: &Array2<f64>,
+        start: usize,
+        end: usize,
+        scale: f64,
+    ) -> Array1<f64> {
+        if let Some(terms) = self.root_penalty_mode_terms(penalty, scale) {
+            return terms;
+        }
+        let g_block = self.g_factor.slice(ndarray::s![start..end, ..]);
+        let sg = s_block.dot(&g_block);
+        Array1::from_shape_fn(self.n_dim, |mode| {
+            scale
+                * sg.column(mode)
+                    .iter()
+                    .zip(g_block.column(mode).iter())
+                    .map(|(&a, &b)| a * b)
+                    .sum::<f64>()
         })
     }
 
@@ -427,25 +493,18 @@ impl DenseSpectralOperator {
     /// is the integer rank.
     pub(crate) fn fused_logdet_gradient_minus_rank_full_block(
         &self,
+        penalty: usize,
         s_block: &Array2<f64>,
         start: usize,
         end: usize,
         scale: f64,
     ) -> f64 {
-        let g_block = self.g_factor.slice(ndarray::s![start..end, ..]);
         let u_block = self.eigenvectors.slice(ndarray::s![start..end, ..]);
-        // S_k · g_block once: (width × n), column j is S_k g_j[block].
-        let sg = s_block.dot(&g_block);
+        let trace_terms = self.penalty_mode_terms(penalty, s_block, start, end, scale);
         let mut fused = 0.0;
         for j in 0..self.n_dim {
-            let s_term: f64 = sg
-                .column(j)
-                .iter()
-                .zip(g_block.column(j).iter())
-                .map(|(&a, &b)| a * b)
-                .sum();
             let p_term: f64 = u_block.column(j).iter().map(|&u| u * u).sum();
-            fused += scale * s_term - p_term;
+            fused += trace_terms[j] - p_term;
         }
         fused
     }
@@ -491,6 +550,7 @@ impl DenseSpectralOperator {
     /// (proportional singleton, so `−rank` is the exact det pairing).
     pub(crate) fn fused_logdet_gradient_minus_rank_from_root_chart(
         &self,
+        penalty: usize,
         s_block: &Array2<f64>,
         range_root: &Array2<f64>,
         start: usize,
@@ -516,10 +576,8 @@ impl DenseSpectralOperator {
             "canonical penalty root rows must be structurally independent"
         );
 
-        let g_block = self.g_factor.slice(ndarray::s![start..end, ..]);
         let u_block = self.eigenvectors.slice(ndarray::s![start..end, ..]);
-        // S_k · g_block once: (width × n), column j is S_k g_j[block].
-        let sg = s_block.dot(&g_block);
+        let trace_terms = self.penalty_mode_terms(penalty, s_block, start, end, scale);
         // Range coordinates of every eigenvector's block restriction:
         // `qt_u[:, j] = Qᵀ u_j^{blk}` (r × n), so `‖qt_u[:, j]‖²` is the mass of
         // `u_j^{blk}` inside `range(S_k)` — the per-eigenpair `−rank` share.
@@ -536,14 +594,8 @@ impl DenseSpectralOperator {
 
         let mut fused = 0.0;
         for j in 0..self.n_dim {
-            let s_term: f64 = sg
-                .column(j)
-                .iter()
-                .zip(g_block.column(j).iter())
-                .map(|(&a, &b)| a * b)
-                .sum();
             let p_term: f64 = qt_u.column(j).iter().map(|&v| v * v).sum();
-            fused += scale * s_term - p_term;
+            fused += trace_terms[j] - p_term;
         }
         fused
     }
@@ -589,16 +641,16 @@ impl DenseSpectralOperator {
     /// cancellation-free.
     pub(crate) fn fused_logdet_gradient_weighted_block(
         &self,
+        penalty: usize,
         s_block: &Array2<f64>,
         start: usize,
         end: usize,
         scale: f64,
         penalty_whitening: &Array2<f64>,
     ) -> (f64, f64) {
-        let g_block = self.g_factor.slice(ndarray::s![start..end, ..]);
         let u_block = self.eigenvectors.slice(ndarray::s![start..end, ..]);
-        // Trace-term factor: sg[:,j] = S_k g_j[block]; s_k_u[:,j] = S_k u_j[block].
-        let sg = s_block.dot(&g_block);
+        let trace_terms = self.penalty_mode_terms(penalty, s_block, start, end, scale);
+        // s_k_u[:,j] = S_k u_j[block].
         let s_k_u_block = s_block.dot(&u_block);
         // W_Sᵀ u_j for every H-eigenvector (r × n), and W_Sᵀ (S_k u_j) using only
         // the block rows of S_k u_j (nonzero only there).
@@ -609,12 +661,7 @@ impl DenseSpectralOperator {
         let mut fused = 0.0;
         let mut weight_sum = 0.0;
         for j in 0..self.n_dim {
-            let trace_term: f64 = scale
-                * sg.column(j)
-                    .iter()
-                    .zip(g_block.column(j).iter())
-                    .map(|(&a, &b)| a * b)
-                    .sum::<f64>();
+            let trace_term = trace_terms[j];
             let w_jk: f64 = scale
                 * wt_u
                     .column(j)

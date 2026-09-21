@@ -210,6 +210,9 @@ pub enum MoveReason {
     /// A linear block / atom ended dead — no row selected it — and fell back to
     /// the residual-factor pool.
     DeadRouting,
+    /// A linear block a curved chart replaced: the census bought its promotion and the
+    /// chart fit installed it, so the block's firings decode through the chart.
+    Promoted,
     /// A curved candidate's evidence did not beat the linear/flat alternative;
     /// the simpler atom is kept (the co-fit's `Θ→0` verdict).
     EvidenceInsufficient,

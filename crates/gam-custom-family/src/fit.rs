@@ -2887,25 +2887,38 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // consumed by certified fit assembly. A failed analytic probe must not
         // leave an older mode available for accidental substitution.
         outer.begin_terminal_evaluation();
+        // A Hessian stored at this θ answers only for the state it was assembled
+        // at, which `evaluate_with_outer_hessian_memo` checks bit for bit (#2627).
+        let mut outer_hessian_memo = outer.outer_hessian_memo.take();
         let warm_ref = if force_cold {
             canonical_seed.as_ref()
         } else {
             outer.warm_start_for(rho)
         };
-        let eval_result = match outerobjectivegradienthessian_labeled(
-            family,
-            specs,
-            &outer_options,
-            &label_layout,
-            rho,
-            warm_ref,
-            &rho_prior,
-            if request_hessian {
-                EvalMode::ValueGradientHessian
-            } else {
-                EvalMode::ValueAndGradient
-            },
-        ) {
+        let evaluate = |mode: EvalMode| {
+            outerobjectivegradienthessian_labeled(
+                family,
+                specs,
+                &outer_options,
+                &label_layout,
+                rho,
+                warm_ref,
+                &rho_prior,
+                mode,
+            )
+        };
+        let evaluated = if request_hessian {
+            crate::warm_start::evaluate_with_outer_hessian_memo(
+                &mut outer_hessian_memo,
+                rho,
+                || outer.measure_epoch(),
+                evaluate,
+            )
+        } else {
+            evaluate(EvalMode::ValueAndGradient)
+        };
+        outer.outer_hessian_memo = outer_hessian_memo;
+        let eval_result = match evaluated {
             Ok(eval) if !eval.inner_converged => {
                 let failure = inner_solve_not_converged_error(&eval.inner, &outer_options, rho.len(), 0);
                 // An unconverged solve never seeds the next evaluation (#2902).
@@ -2994,6 +3007,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             rho: rho.clone(),
             hyper_values: Array1::zeros(0),
             inner: eval_result.inner,
+            ext_mode_response_cols: eval_result.ext_mode_response_cols,
         };
         log::debug!(
             "[OUTER-EVAL] order={order:?} request_hessian={request_hessian} cost={objective:.6e} \
@@ -3267,6 +3281,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 );
             }
             return Err(CustomFamilyError::OuterSmoothingFailed {
+                route: gam_problem::OuterSearchRoute::CustomFamily,
                 reason: format!(
                     "outer smoothing optimization failed certified-fit validation after exhausting strategy fallbacks: \
                      {e}; last_evaluated_rho={last_evaluated_rho:?}; no fit was assembled.\
@@ -3312,6 +3327,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         rho: mode_rho,
         hyper_values: mode_hyper_values,
         mut inner,
+        ..
     } = mode;
     if !mode_hyper_values.is_empty() {
         return Err(CustomFamilyError::Optimization {
@@ -3847,9 +3863,9 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
     provenance: OwnedModeProvenance<'_>,
     curvature_requirement: OwnedModeCurvatureRequirement,
 ) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
-    let (outer_iterations, outer_gradient_norm, criterion_certificate, certified_theta) =
+    let (outer_iterations, outer_gradient_norm, criterion_certificate, certified_theta, certified_outer) =
         match provenance {
-            OwnedModeProvenance::UserFixed => (0, None, None, None),
+            OwnedModeProvenance::UserFixed => (0, None, None, None, None),
             OwnedModeProvenance::CertifiedOuter {
                 selected_theta,
                 outer,
@@ -3899,6 +3915,7 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
                     outer.final_grad_norm(),
                     Some(outer.criterion_certificate().clone()),
                     Some((outer.rho(), outer.final_value())),
+                    Some(outer),
                 )
             }
         };
@@ -3908,6 +3925,7 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
         rho,
         hyper_values,
         mut inner,
+        ext_mode_response_cols,
     } = mode;
     if !inner.converged {
         return Err(CustomFamilyError::Optimization {
@@ -4026,6 +4044,67 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
         mut geometry,
         reported_beta,
     } = posterior;
+    // #2677: a certified owned mode carries the smoothing correction over every
+    // outer coordinate its optimum selected, its smoothing strengths and its
+    // manifest coordinates, from the analytic outer Hessian the certificate judged.
+    // The mode responses read `β̂` at the mode, before the reported posterior mean
+    // is installed. A certified outer without that Hessian records why it has none.
+    let (smoothing_corrected, smoothing_correction_absence) =
+        match (certified_outer, covariance_conditional.as_ref()) {
+            (Some(outer), Some(v_cond)) => match outer.final_hessian() {
+                Some(outer_hessian) => {
+                    let certificate = outer.criterion_certificate();
+                    let mut excluded: Vec<usize> = certificate.lambdas_railed.clone();
+                    for rail in certificate.stationarity.rails() {
+                        if !excluded.contains(&rail.index) {
+                            excluded.push(rail.index);
+                        }
+                    }
+                    let no_gradient = Array1::<f64>::zeros(0);
+                    match crate::covariance::owned_mode_smoothing_correction(
+                        v_cond,
+                        specs,
+                        &rho,
+                        &inner.block_states,
+                        ext_mode_response_cols.as_ref(),
+                        hyper_values.len(),
+                        outer_hessian,
+                        outer.final_gradient().unwrap_or(&no_gradient),
+                        &excluded,
+                    )? {
+                        Ok((correction, active_rank)) => (
+                            Some((
+                                correction,
+                                gam_solve::model_types::SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
+                                    active_rank,
+                                    rho_dimension: rho.len() + hyper_values.len(),
+                                },
+                            )),
+                            None,
+                        ),
+                        Err(absence) => (None, Some(absence)),
+                    }
+                }
+                None => {
+                    let reason =
+                        crate::joint_newton::custom_family_outer_hessian_absence(family, specs, options)
+                            .unwrap_or(gam_solve::model_types::OuterHessianAbsence::NotPublished);
+                    log::info!(
+                        "[smoothing-correction] branch=unavailable reason={reason} rho_dimension={}",
+                        rho.len() + hyper_values.len(),
+                    );
+                    (
+                        None,
+                        Some(
+                            gam_solve::model_types::SmoothingCorrectionAbsence::OuterHessianUndeclared {
+                                reason,
+                            },
+                        ),
+                    )
+                }
+            },
+            _ => (None, None),
+        };
     install_reported_posterior_mean(
         family,
         specs,
@@ -4060,8 +4139,8 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
             criterion_certificate,
             outer_converged: true,
             joint_log_lambdas: None,
-            smoothing_corrected: None,
-            smoothing_correction_absence: None,
+            smoothing_corrected,
+            smoothing_correction_absence,
         },
     )
 }

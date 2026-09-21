@@ -22,6 +22,9 @@ pub use model::{ConditionedJointModel, JointEventModel, JointForecast, fit_joint
 // law.rs (jls-law after slice 0): specification, history, complete-path density
 mod law;
 
+// jumps.rs (jls-jumps): learned disease-associated state jumps
+// [unlanded: jumps.rs]
+
 // constant_rate_inference.rs (jls-serve): exact rank-zero rate posterior and its forecasts
 mod constant_rate_inference;
 

@@ -320,14 +320,6 @@ fn summary_smooth_terms(
     let data = representative_data_from_ranges(ranges, &factor_levels);
     let design = gam_terms::smooth::build_term_collection_design(data.view(), spec)
         .map_err(|err| format!("frozen-basis design replay failed: {err}"))?;
-    // The walk below reads the fit's per-penalty record by the rebuilt layout's
-    // global index, so a rebuild with another block count would misread it.
-    crate::inference::model::saved_lambdas_index_rebuilt_layout(
-        spec,
-        design.penalties.len(),
-        fit,
-        "per-smooth summary",
-    )?;
 
     // Wood (2013) design-whitening metric for the Wald smooth test (#2142).
     // Prefer the fit's exact weighted Gram `X'WX` when the inference block

@@ -398,14 +398,14 @@ fn follow_up_value_program_preserves_the_newton_value_without_derivative_work_27
         1024 * N_ROWS, newton_elapsed.as_secs_f64() / scalar_elapsed.as_secs_f64());
 }
 
-/// The limiter returns a point the ROW PROGRAM admits, and it goes to the
-/// boundary rather than stopping short of it.
-///
-/// Both halves matter. Returning an admitted point is the whole purpose — a
-/// limiter whose endpoint the likelihood then refuses has moved the problem
-/// rather than solved it. Going to the boundary is what keeps it a
-/// globalization and not a step-crusher: an `α` far inside would shorten every
-/// step in the fit for nothing.
+/// The limiter returns a point the ROW PROGRAM admits, at the row barrier's
+/// damped fraction and strictly inside the crossing an independent scan finds.
+/// Returning an admitted point is the whole purpose: a limiter whose endpoint the
+/// likelihood then refuses has moved the problem rather than solved it. The
+/// damped fraction is checked against rates measured independently of the
+/// limiter's jet, by a test-only central difference of each row's `η′₁` along
+/// this non-affine step. The exact margin it keeps is pinned on an affine
+/// fixture below.
 #[test]
 fn the_joint_step_limit_lands_on_a_point_the_row_program_admits_2765() {
     let family = family(true);
@@ -429,10 +429,33 @@ fn the_joint_step_limit_lands_on_a_point_the_row_program_admits_2765() {
         panic!("the row program refused the limiter's own endpoint α={alpha:.9e}: {error}")
     });
 
-    // Tightness, measured against an independent scan rather than asserted from
-    // the limiter's internals: the first grid point at which the margin turns
-    // non-positive brackets the true crossing, and the returned α must be
-    // inside that bracket.
+    let step = 1e-5;
+    let along = |alpha: f64| {
+        row_margins(
+            &family,
+            &family
+                .displaced_block_states(&base, &direction, alpha)
+                .expect("width agreement"),
+        )
+    };
+    let (start, ahead, behind) = (along(0.0), along(step), along(-step));
+    let max_rate = (0..family.n)
+        .map(|row| (-(ahead[row] - behind[row]) / (2.0 * step)).max(0.0) / start[row])
+        .fold(0.0_f64, f64::max);
+    let damped = 1.0 / (1.0 + max_rate);
+    assert!(
+        margin_along(&family, &base, &direction, damped) > 0.0,
+        "the fixture's damped point must be inside the domain"
+    );
+    assert!(
+        (alpha - damped).abs() <= 1e-6 * damped,
+        "the limited step must be the damped 1/(1 + max r) = {damped:.12e} from the \
+         measured rates; got {alpha:.12e}"
+    );
+
+    // Measured against an independent scan rather than asserted from the
+    // limiter's internals: the first grid point at which the margin turns
+    // non-positive bounds the true crossing from above.
     const GRID: usize = 4096;
     let mut crossing = 1.0_f64;
     for step in 1..=GRID {
@@ -442,17 +465,286 @@ fn the_joint_step_limit_lands_on_a_point_the_row_program_admits_2765() {
             break;
         }
     }
-    let grid_step = 1.0 / GRID as f64;
-    assert!(
-        alpha >= crossing - 2.0 * grid_step,
-        "the limiter stopped {:.6e} short of the boundary the scan puts at {crossing:.6e} \
-         (grid step {grid_step:.3e})",
-        crossing - alpha,
-    );
     assert!(
         alpha < crossing,
         "the limiter must stay strictly inside the scanned crossing: α={alpha:.9e}, \
          crossing={crossing:.9e}"
+    );
+}
+
+/// Every event row's `η′₁` from the row program's own admission witness.
+fn row_margins(family: &SurvivalMarginalSlopeFamily, states: &[ParameterBlockState]) -> Vec<f64> {
+    (0..family.n)
+        .map(|row| {
+            let inputs = rigid_row_inputs(family, states, row, "follow-up row margins")
+                .expect("row inputs");
+            let primaries = rigid_row_kernel_primaries::<
+                DYNAMIC_SLOPE_PRIMARIES,
+                DynamicSlopeGeometry,
+            >(family, states, row)
+            .expect("dynamic primaries");
+            let [_, _, adjusted_derivative] =
+                rigid_row_admission_witnesses::<DYNAMIC_SLOPE_PRIMARIES, DynamicSlopeGeometry>(
+                    &primaries, &inputs,
+                );
+            adjusted_derivative
+        })
+        .collect()
+}
+
+/// The row barrier's damping on rows that are affine along the step (#2765,
+/// #2627 docs/marginal-slope.md:205). A marginal-only step moves `q₁` and
+/// nothing `c₁` reads, so every row's `η′₁` is affine along it and its rate
+/// `r_i = max(0, η′₁,i(0) − η′₁,i(1)) / η′₁,i(0)` is exact from two
+/// evaluations, independently of the limiter's jet. The limited step must be
+/// `1/(1 + max_i r_i)` and keep every row at `η′₁,i ≥ η′₁,i(0)/(1 + r_i)`. The
+/// same holds for a feasible step scaled to `max r = 0.9`, above the
+/// self-concordant full-step bound, which must be damped to `1/1.9`, not taken.
+///
+/// Negative control: the undamped rule, the feasible end of a bisection of
+/// `[0, 1]` to the step's representability, which the limiter used before.
+/// Its endpoint sits within roundoff of the edge and breaks the bound.
+#[test]
+fn the_joint_step_limit_keeps_every_affine_row_a_damped_share_of_its_margin_2765() {
+    let family = family(true);
+    let base = states(&family, interior_slope_beta());
+    let direction = ndarray::array![400.0, 0.0, 0.0];
+    let moved = |alpha: f64| {
+        family
+            .displaced_block_states(&base, &direction, alpha)
+            .expect("width agreement")
+    };
+    let start = row_margins(&family, &base);
+    let whole = row_margins(&family, &moved(1.0));
+    let half = row_margins(&family, &moved(0.5));
+    for row in 0..family.n {
+        let chord = 0.5 * (start[row] + whole[row]);
+        assert!(
+            (half[row] - chord).abs() <= 1e-12 * start[row].abs().max(whole[row].abs()),
+            "the fixture's rows must be affine along the step: row {row} has η′₁ {:.15e} \
+             at the midpoint against the chord's {chord:.15e}",
+            half[row]
+        );
+    }
+    assert!(
+        start.iter().all(|&margin| margin > 0.0),
+        "the base must be interior at every row"
+    );
+    assert!(
+        whole.iter().any(|&margin| margin < 0.0),
+        "the whole step must leave the domain at some row"
+    );
+    let rates: Vec<f64> = start
+        .iter()
+        .zip(whole.iter())
+        .map(|(&from, &to)| (from - to).max(0.0) / from)
+        .collect();
+    let max_rate = rates.iter().copied().fold(0.0_f64, f64::max);
+
+    let alpha = family
+        .max_feasible_follow_up_joint_step(&base, &direction)
+        .expect("the follow-up frame answers")
+        .expect("a step that leaves the domain must be limited");
+    let damped = 1.0 / (1.0 + max_rate);
+    assert!(
+        (alpha - damped).abs() <= 1e-12 * damped,
+        "the limited step must be the damped 1/(1 + max r) = {damped:.15e}; got {alpha:.15e}"
+    );
+    let landed = row_margins(&family, &moved(alpha));
+    for row in 0..family.n {
+        let floor = start[row] / (1.0 + rates[row]);
+        assert!(
+            landed[row] >= floor * (1.0 - 1e-12),
+            "row {row} must keep η′₁ ≥ η′₁(0)/(1 + r) = {floor:.6e}; got {:.6e}",
+            landed[row]
+        );
+    }
+
+    let step_scale = direction.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let beta_scale = base
+        .iter()
+        .flat_map(|state| state.beta.iter())
+        .fold(0.0_f64, |acc, v| acc.max(v.abs()))
+        .max(1.0);
+    let resolution = beta_scale * f64::EPSILON / step_scale;
+    let (mut feasible, mut infeasible) = (0.0_f64, 1.0_f64);
+    while infeasible - feasible > resolution {
+        let midpoint = 0.5 * (feasible + infeasible);
+        if midpoint <= feasible || midpoint >= infeasible {
+            break;
+        }
+        if margin_along(&family, &base, &direction, midpoint) > 0.0 {
+            feasible = midpoint;
+        } else {
+            infeasible = midpoint;
+        }
+    }
+    // A FEASIBLE whole step is damped too once it consumes more of a row's margin
+    // than the self-concordant full-step bound `(3 − √5)/2`: at `max r = 0.9`
+    // taking it would leave that row at a tenth of its margin, and the next
+    // iterate would start at the edge.
+    let scale = 0.9 / max_rate;
+    let consuming = &direction * scale;
+    let consumed = family
+        .displaced_block_states(&base, &consuming, 1.0)
+        .expect("width agreement");
+    assert!(
+        row_margins(&family, &consumed).iter().all(|&margin| margin > 0.0),
+        "the scaled step must stay inside the domain"
+    );
+    let consuming_alpha = family
+        .max_feasible_follow_up_joint_step(&base, &consuming)
+        .expect("the follow-up frame answers")
+        .expect("a feasible step that consumes 0.9 of a row's margin must be damped");
+    assert!(
+        (consuming_alpha - 1.0 / 1.9).abs() <= 1e-12,
+        "the damped fraction of a max-rate-0.9 step is 1/1.9; got {consuming_alpha:.15e}"
+    );
+    let consumed_landed = row_margins(
+        &family,
+        &family
+            .displaced_block_states(&base, &consuming, consuming_alpha)
+            .expect("width agreement"),
+    );
+    for row in 0..family.n {
+        let floor = start[row] / (1.0 + scale * rates[row]);
+        assert!(
+            consumed_landed[row] >= floor * (1.0 - 1e-12),
+            "row {row} must keep η′₁ ≥ η′₁(0)/(1 + r) = {floor:.6e} on the feasible step; \
+             got {:.6e}",
+            consumed_landed[row]
+        );
+    }
+
+    let edge = row_margins(&family, &moved(feasible));
+    let broken = (0..family.n).any(|row| edge[row] < start[row] / (1.0 + rates[row]));
+    let edge_margin = edge.iter().copied().fold(f64::INFINITY, f64::min);
+    assert!(
+        broken && edge_margin < 1e-9 * start.iter().copied().fold(f64::INFINITY, f64::min),
+        "negative control: the undamped feasible end must sit at the edge and break the \
+         damped bound; min η′₁ there = {edge_margin:.6e}"
+    );
+}
+
+/// The backstop damps by the chord to the exact crossing when a row falls faster
+/// than its tangent (#2765, #2627 docs/marginal-slope.md:205). A marginal step with
+/// a slope-level step makes `q₁·b₁` quadratic along it, so the rows are concave and
+/// cross before the tangent's damped point, which the exact witness then refuses.
+/// The step must be `α_c/(1 + α_c)`, with `α_c` the exact crossing, and every row
+/// concave on `[0, α_c]` keeps `η′₁ ≥ η′₁(0)·α_c/(1 + α_c)`. Negative control: the
+/// crossing itself, the old backstop's answer, sits at the edge.
+#[test]
+fn the_joint_step_limit_damps_a_concave_row_by_its_chord_to_the_crossing_2765() {
+    let family = family(true);
+    let base = states(&family, interior_slope_beta());
+    let direction = ndarray::array![400.0, 2.0, 0.0];
+    let along = |alpha: f64| {
+        row_margins(
+            &family,
+            &family
+                .displaced_block_states(&base, &direction, alpha)
+                .expect("width agreement"),
+        )
+    };
+    let step = 1e-5;
+    let (start, ahead, behind) = (along(0.0), along(step), along(-step));
+    let max_rate = (0..family.n)
+        .map(|row| (-(ahead[row] - behind[row]) / (2.0 * step)).max(0.0) / start[row])
+        .fold(0.0_f64, f64::max);
+    let tangent_damped = 1.0 / (1.0 + max_rate);
+    assert!(
+        margin_along(&family, &base, &direction, tangent_damped) <= 0.0,
+        "the fixture's rows must cross before the tangent's damped point α={tangent_damped:.6e}"
+    );
+
+    let step_scale = direction.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let beta_scale = base
+        .iter()
+        .flat_map(|state| state.beta.iter())
+        .fold(0.0_f64, |acc, v| acc.max(v.abs()))
+        .max(1.0);
+    let resolution = beta_scale * f64::EPSILON / step_scale;
+    let (mut crossing, mut outside) = (0.0_f64, tangent_damped);
+    while outside - crossing > resolution {
+        let midpoint = 0.5 * (crossing + outside);
+        if midpoint <= crossing || midpoint >= outside {
+            break;
+        }
+        if margin_along(&family, &base, &direction, midpoint) > 0.0 {
+            crossing = midpoint;
+        } else {
+            outside = midpoint;
+        }
+    }
+    let at_crossing = along(crossing);
+    let half = along(0.5 * crossing);
+    for row in 0..family.n {
+        assert!(
+            half[row] >= 0.5 * (start[row] + at_crossing[row]),
+            "the fixture's row {row} must be concave on [0, α_c]"
+        );
+    }
+
+    let alpha = family
+        .max_feasible_follow_up_joint_step(&base, &direction)
+        .expect("the follow-up frame answers")
+        .expect("a step that leaves the domain must be limited");
+    let chord = crossing / (1.0 + crossing);
+    assert!(
+        (alpha - chord).abs() <= 1e-9 * chord,
+        "the backstop must damp by the chord to the crossing, α_c/(1 + α_c) = {chord:.12e}; \
+         got {alpha:.12e}"
+    );
+    let landed = along(alpha);
+    for row in 0..family.n {
+        let floor = start[row] * crossing / (1.0 + crossing);
+        assert!(
+            landed[row] >= floor * (1.0 - 1e-9),
+            "row {row} must keep η′₁ ≥ η′₁(0)·α_c/(1 + α_c) = {floor:.6e}; got {:.6e}",
+            landed[row]
+        );
+    }
+    let edge = at_crossing.iter().copied().fold(f64::INFINITY, f64::min);
+    assert!(
+        edge < 1e-9 * start.iter().copied().fold(f64::INFINITY, f64::min),
+        "negative control: the crossing itself sits at the edge; min η′₁ there = {edge:.6e}"
+    );
+}
+
+/// The backstop repeats instead of returning a bisection end (#2765). The margin
+/// dips below zero on `(0.1, 0.45)` and comes back until `0.8`. The first bisection
+/// of `[0, 1]` finds the LATER sign change at `0.8`, and its chord point `0.8/1.8`
+/// lies in the dip and is refused. The second round finds the first crossing at
+/// `0.1` and damps by its chord, `0.1/1.1`, which is admitted with a strictly
+/// positive margin.
+#[test]
+fn the_backstop_repeats_below_a_refused_chord_point_2765() {
+    let (a, b, c) = (0.1_f64, 0.45_f64, 0.8_f64);
+    let margin = |alpha: f64| -> Result<f64, String> {
+        Ok(-(alpha - a) * (alpha - b) * (alpha - c) / (a * b * c))
+    };
+    assert!(margin(1.0).expect("margin") <= 0.0, "the right end must be refused");
+    assert!(
+        margin(0.5).expect("margin") > 0.0,
+        "the margin must come back above zero past the dip"
+    );
+    assert!(
+        margin(c / (1.0 + c)).expect("margin") < 0.0,
+        "the later crossing's chord point must lie in the dip"
+    );
+    let (alpha, rounds) =
+        SurvivalMarginalSlopeFamily::chord_damped_domain_fraction(&margin, 1.0, f64::EPSILON)
+            .expect("the backstop answers");
+    assert_eq!(rounds, 2, "the first chord point is refused, so a second round must run");
+    assert!(
+        (alpha - a / (1.0 + a)).abs() <= 1e-12,
+        "the second round must damp by the chord to the first crossing, {:.12e}; got \
+         {alpha:.12e}",
+        a / (1.0 + a)
+    );
+    assert!(
+        margin(alpha).expect("margin") > 0.0,
+        "the answer must be admitted with a strictly positive margin"
     );
 }
 
@@ -482,18 +774,39 @@ fn a_time_constant_slope_declines_the_joint_step_limit_2765() {
     }
 }
 
-/// A step that stays inside is not limited at all. A limiter that answered
-/// `Some(1.0)` here would be indistinguishable from one that answered `None` in
-/// its effect, but it would route every cycle through the `Scaled` arm and the
-/// log line that goes with it; `None` is the honest answer and the gate says so.
+/// A step that stays inside, and consumes no row's margin beyond the
+/// self-concordant full-step bound `(3 − √5)/2`, is not limited at all. A limiter
+/// that answered `Some(1.0)` here would be indistinguishable from one that
+/// answered `None` in its effect, but it would route every cycle through the
+/// `Scaled` arm and the log line that goes with it; `None` is the honest answer
+/// and the gate says so. The rates are measured by a test-only central
+/// difference of each row's `η′₁` along the step.
 #[test]
 fn an_interior_step_is_not_limited_2765() {
     let family = family(true);
     let base = states(&family, interior_slope_beta());
-    let inward = &exiting_direction() * -0.05;
+    let inward = &exiting_direction() * -0.02;
     assert!(
         margin_along(&family, &base, &inward, 1.0) > 0.0,
         "the fixture's inward step must stay interior"
+    );
+    let step = 1e-5;
+    let along = |alpha: f64| {
+        row_margins(
+            &family,
+            &family
+                .displaced_block_states(&base, &inward, alpha)
+                .expect("width agreement"),
+        )
+    };
+    let (start, ahead, behind) = (along(0.0), along(step), along(-step));
+    let max_rate = (0..family.n)
+        .map(|row| (-(ahead[row] - behind[row]) / (2.0 * step)).max(0.0) / start[row])
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_rate > 0.0 && max_rate < 0.5 * (3.0 - 5.0_f64.sqrt()),
+        "the fixture's inward step must lower some row, by less than the full-step bound; \
+         max row rate {max_rate:.6e}"
     );
     assert!(
         family

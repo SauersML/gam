@@ -1024,11 +1024,16 @@ pub enum ParameterEditScope {
     /// parameter's storage on the plan's declared forward path, seen only by query
     /// `positions` (every position when `None`).
     ///
-    /// `read_module` and `read_op` name that read for validation only, because a
-    /// (module, call) pair cannot name a functional read outside a module call, such
-    /// as a tied `lm_head` weight read through `F.linear`. The runner applies the edit
-    /// to the patched copy alone. The clean copy therefore stays in the same batch,
-    /// and under the causal mask every position before the first query position reads
+    /// `read_module` and `read_op` name that read as the executing framework's
+    /// discovery reports it: the innermost executing module (`""` for the root
+    /// module's own forward, as torch names the root) and the op. The ordinal
+    /// addresses the read, and the names validate it, because a (module, call) pair
+    /// cannot address a functional read outside a module call, such as a tied
+    /// `lm_head` weight read through `F.linear`. An executed experiment is accepted
+    /// only when its forward made the ordinal's read by these names
+    /// ([`InterventionChange::check_executed_reads`]). The runner applies the edit to
+    /// the patched copy alone. The clean copy therefore stays in the same batch, and
+    /// under the causal mask every position before the first query position reads
     /// back exactly clean.
     UseSite {
         ordinal: usize,
@@ -1037,6 +1042,193 @@ pub enum ParameterEditScope {
         positions: Option<Vec<usize>>,
     },
 }
+
+impl InterventionChange {
+    /// Check a use-site parameter edit against the reads of the forward that executed
+    /// it ([`ParameterEditScope::check_executed_reads`]). Every other change names no
+    /// read and passes.
+    pub fn check_executed_reads(
+        &self,
+        executed: &ExecutedParameterReads,
+    ) -> Result<(), ParameterReadRefusal> {
+        match self {
+            InterventionChange::ParameterEdit { parameter, scope, .. } => {
+                scope.check_executed_reads(parameter, executed)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl ParameterEditScope {
+    /// Check this scope of an edit of `parameter` against the reads of the forward that
+    /// executed it. A use-site scope passes only when that forward read the parameter's
+    /// storage at its ordinal, by the module and op it names; a read by any other names
+    /// means the ordinal addressed another read. A global scope names no read and
+    /// passes.
+    pub fn check_executed_reads(
+        &self,
+        parameter: &str,
+        executed: &ExecutedParameterReads,
+    ) -> Result<(), ParameterReadRefusal> {
+        let ParameterEditScope::UseSite {
+            ordinal,
+            read_module,
+            read_op,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        let reads = executed
+            .reads
+            .iter()
+            .filter(|read| read.parameter == parameter)
+            .count();
+        let read = executed
+            .reads
+            .iter()
+            .find(|read| read.parameter == parameter && read.ordinal == *ordinal)
+            .ok_or_else(|| ParameterReadRefusal::Unread {
+                parameter: parameter.to_string(),
+                ordinal: *ordinal,
+                reads,
+            })?;
+        if read.read_module != *read_module || read.read_op != *read_op {
+            return Err(ParameterReadRefusal::LabelMismatch {
+                parameter: parameter.to_string(),
+                ordinal: *ordinal,
+                declared_module: read_module.clone(),
+                declared_op: read_op.clone(),
+                executed_module: read.read_module.clone(),
+                executed_op: read.read_op.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One read of a stored parameter in an executed forward, as the executing framework
+/// reports it: the storage read (whichever alias the code used), the read's ordinal
+/// among that storage's reads in execution order, and the module and op that made it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutedParameterRead {
+    pub parameter: String,
+    pub ordinal: usize,
+    pub read_module: String,
+    pub read_op: String,
+}
+
+/// Every parameter read of one executed forward, in execution order. The field is
+/// private, so every value has passed [`ExecutedParameterReads::new`], and each
+/// storage's reads are numbered `0, 1, 2, …` in the order they executed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutedParameterReads {
+    reads: Vec<ExecutedParameterRead>,
+}
+
+impl ExecutedParameterReads {
+    /// Refuse a read that names no parameter or no op. Also refuse reads of one storage
+    /// that are not numbered in execution order, because under another numbering an
+    /// ordinal addresses another read.
+    pub fn new(reads: Vec<ExecutedParameterRead>) -> Result<Self, ParameterReadRefusal> {
+        let mut next: BTreeMap<&str, usize> = BTreeMap::new();
+        for (index, read) in reads.iter().enumerate() {
+            if read.parameter.is_empty() || read.read_op.is_empty() {
+                return Err(ParameterReadRefusal::Unnamed { index });
+            }
+            let expected = next.entry(read.parameter.as_str()).or_insert(0);
+            if read.ordinal != *expected {
+                return Err(ParameterReadRefusal::OutOfOrder {
+                    index,
+                    parameter: read.parameter.clone(),
+                    ordinal: read.ordinal,
+                    expected: *expected,
+                });
+            }
+            *expected += 1;
+        }
+        Ok(Self { reads })
+    }
+
+    pub fn reads(&self) -> &[ExecutedParameterRead] {
+        &self.reads
+    }
+}
+
+/// Typed refusals of executed parameter reads, and of a use-site edit checked against
+/// them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParameterReadRefusal {
+    /// Read `index` names no parameter or no op.
+    Unnamed { index: usize },
+    /// Read `index` is not the next read of its storage, so the forward numbered its
+    /// reads in another order.
+    OutOfOrder {
+        index: usize,
+        parameter: String,
+        ordinal: usize,
+        expected: usize,
+    },
+    /// The executed forward read `parameter` only `reads` times, so it made no read at
+    /// the edit's ordinal.
+    Unread {
+        parameter: String,
+        ordinal: usize,
+        reads: usize,
+    },
+    /// The executed read at the edit's ordinal was made by another module or op, so
+    /// the ordinal addressed another read.
+    LabelMismatch {
+        parameter: String,
+        ordinal: usize,
+        declared_module: String,
+        declared_op: String,
+        executed_module: String,
+        executed_op: String,
+    },
+}
+
+impl fmt::Display for ParameterReadRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unnamed { index } => write!(
+                f,
+                "parameter reads: read {index} names no parameter or no op"
+            ),
+            Self::OutOfOrder {
+                index,
+                parameter,
+                ordinal,
+                expected,
+            } => write!(
+                f,
+                "parameter reads: read {index} is {parameter}#{ordinal}, but the next read of {parameter} in execution order is #{expected}"
+            ),
+            Self::Unread {
+                parameter,
+                ordinal,
+                reads,
+            } => write!(
+                f,
+                "parameter reads: the executed forward read {parameter} {reads} times, so it made no read #{ordinal}"
+            ),
+            Self::LabelMismatch {
+                parameter,
+                ordinal,
+                declared_module,
+                declared_op,
+                executed_module,
+                executed_op,
+            } => write!(
+                f,
+                "parameter reads: the edit names {parameter}#{ordinal} as ({declared_module:?}, {declared_op:?}), but the executed forward made that read as ({executed_module:?}, {executed_op:?}), so the ordinal addressed another read"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ParameterReadRefusal {}
 
 /// The positions a KL readout reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1647,16 +1839,12 @@ fn validate_experiment(
                 }
                 check_values("left factor entries", left, rows * rank).map_err(invalid)?;
                 check_values("right factor entries", right, cols * rank).map_err(invalid)?;
-                if let ParameterEditScope::UseSite {
-                    read_module,
-                    read_op,
-                    positions,
-                    ..
-                } = scope
-                {
-                    if read_module.is_empty() || read_op.is_empty() {
+                if let ParameterEditScope::UseSite { read_op, positions, .. } = scope {
+                    // The module may be `""`: torch names the root module so, and a tied
+                    // head read through `F.linear` in the root's own forward is made there.
+                    if read_op.is_empty() {
                         return Err(invalid(
-                            "a use-site parameter edit names its read module and op".to_string(),
+                            "a use-site parameter edit names the op of its read".to_string(),
                         ));
                     }
                     if let Some(query_positions) = positions {
@@ -1734,6 +1922,10 @@ pub struct ExperimentMeasurement {
     /// For a same-batch experiment whose earliest edit is after position 0: the
     /// largest KL over the positions before that edit. `None` otherwise.
     pub pre_edit_kl_max: Option<f64>,
+    /// Every parameter read the patched forward executed, when the runner recorded
+    /// them. An experiment with a use-site parameter edit must carry them, so that each
+    /// edit is accepted only where the read it names executed.
+    pub parameter_reads: Option<ExecutedParameterReads>,
 }
 
 /// A validated plan together with what its execution measured.
@@ -1794,6 +1986,17 @@ pub enum ExecutedInterventionError {
         experiment: usize,
         site: usize,
     },
+    /// An experiment with a use-site parameter edit reported no executed parameter
+    /// reads, so nothing shows that its edits reached the reads they name.
+    MissingParameterReads {
+        experiment: usize,
+    },
+    /// A use-site parameter edit disagrees with the reads its forward executed.
+    ParameterRead {
+        experiment: usize,
+        change: usize,
+        refusal: ParameterReadRefusal,
+    },
 }
 
 impl fmt::Display for ExecutedInterventionError {
@@ -1826,6 +2029,18 @@ impl fmt::Display for ExecutedInterventionError {
                 f,
                 "executed interventions: experiment {experiment} has no activation readout at site {site} over its replaced positions"
             ),
+            Self::MissingParameterReads { experiment } => write!(
+                f,
+                "executed interventions: experiment {experiment} edits a parameter at a use site but reported no executed parameter reads"
+            ),
+            Self::ParameterRead {
+                experiment,
+                change,
+                refusal,
+            } => write!(
+                f,
+                "executed interventions: experiment {experiment} change {change}: {refusal}"
+            ),
         }
     }
 }
@@ -1833,7 +2048,8 @@ impl fmt::Display for ExecutedInterventionError {
 impl std::error::Error for ExecutedInterventionError {}
 
 impl ExecutedInterventionExperiments {
-    /// Validate one measurement per experiment against its declared readouts.
+    /// Validate one measurement per experiment against its declared readouts, and each
+    /// use-site parameter edit against the parameter reads its forward executed.
     pub fn new(
         plan: InterventionExperimentPlan,
         measurements: Vec<ExperimentMeasurement>,
@@ -1891,6 +2107,34 @@ impl ExecutedInterventionExperiments {
                         return Err(invalid(
                             "a readout was measured as a different kind".to_string(),
                         ));
+                    }
+                }
+            }
+            match &measurement.parameter_reads {
+                Some(executed) => {
+                    for (change_index, change) in experiment.changes.iter().enumerate() {
+                        change.check_executed_reads(executed).map_err(|refusal| {
+                            ExecutedInterventionError::ParameterRead {
+                                experiment: index,
+                                change: change_index,
+                                refusal,
+                            }
+                        })?;
+                    }
+                }
+                None => {
+                    if experiment.changes.iter().any(|change| {
+                        matches!(
+                            change,
+                            InterventionChange::ParameterEdit {
+                                scope: ParameterEditScope::UseSite { .. },
+                                ..
+                            }
+                        )
+                    }) {
+                        return Err(ExecutedInterventionError::MissingParameterReads {
+                            experiment: index,
+                        });
                     }
                 }
             }
@@ -2550,6 +2794,7 @@ mod tests {
                 rows: rows.to_vec(),
             }],
             pre_edit_kl_max: None,
+            parameter_reads: None,
         }
     }
 
@@ -2881,6 +3126,7 @@ mod tests {
                     ReadoutMeasurement::Kl(vec![0.02, 0.01]),
                 ],
                 pre_edit_kl_max,
+                parameter_reads: None,
             }]
         };
         assert!(ExecutedInterventionExperiments::new(plan(), measured(Some(0.0))).is_ok());
@@ -2974,10 +3220,26 @@ mod tests {
         assert_eq!(plan.forward_path(), Some("full-forward:len6"));
 
         // Positions before the first query position must read back exactly clean.
+        let executed = ExecutedParameterReads::new(vec![
+            ExecutedParameterRead {
+                parameter: "gpt_neox.embed_out.weight".to_string(),
+                ordinal: 0,
+                read_module: "gpt_neox.embed_in".to_string(),
+                read_op: "F.embedding".to_string(),
+            },
+            ExecutedParameterRead {
+                parameter: "gpt_neox.embed_out.weight".to_string(),
+                ordinal: 1,
+                read_module: "embed_out".to_string(),
+                read_op: "F.linear".to_string(),
+            },
+        ])
+        .unwrap();
         let measured = |pre_edit_kl_max: Option<f64>| {
             vec![ExperimentMeasurement {
                 readouts: vec![ReadoutMeasurement::Kl(vec![0.02, 0.01])],
                 pre_edit_kl_max,
+                parameter_reads: Some(executed.clone()),
             }]
         };
         assert!(ExecutedInterventionExperiments::new(plan.clone(), measured(Some(0.0))).is_ok());
@@ -3034,6 +3296,175 @@ mod tests {
         assert_eq!(
             global.experiments()[0].clean_pass(),
             CleanPass::SeparateForward
+        );
+    }
+
+    #[test]
+    fn a_use_site_edit_is_accepted_only_where_its_forward_made_the_named_read() {
+        // A tied embedding: read #0 by the embedding module, read #1 as the head through
+        // F.linear in the root module's own forward, which torch names "".
+        let tied = "embed.weight";
+        let read = |parameter: &str, ordinal: usize, module: &str, op: &str| {
+            ExecutedParameterRead {
+                parameter: parameter.to_string(),
+                ordinal,
+                read_module: module.to_string(),
+                read_op: op.to_string(),
+            }
+        };
+        let linear = "torch.nn.functional.linear";
+        let forward = || {
+            vec![
+                read(tied, 0, "embed", "torch.nn.functional.embedding"),
+                read("block.mlp.weight", 0, "block.mlp", linear),
+                read(tied, 1, "", linear),
+            ]
+        };
+        let plan = |scope: ParameterEditScope, readout: Readout| {
+            InterventionExperimentPlan::new(
+                experiment_sites(),
+                Vec::new(),
+                vec![InterventionExperiment {
+                    unit: unit_in(4),
+                    changes: vec![InterventionChange::ParameterEdit {
+                        parameter: tied.to_string(),
+                        rows: 2,
+                        cols: 2,
+                        rank: 1,
+                        left: vec![1.0, 0.0],
+                        right: vec![0.0, 1.0],
+                        scope,
+                    }],
+                    readouts: vec![readout],
+                }],
+                0,
+                Some("full-forward:len6".to_string()),
+            )
+        };
+        let head = |ordinal: usize, module: &str, op: &str| ParameterEditScope::UseSite {
+            ordinal,
+            read_module: module.to_string(),
+            read_op: op.to_string(),
+            positions: None,
+        };
+        // Every position is edited, so the KL readout has one value per position.
+        let execute = |scope: ParameterEditScope, reads: Option<Vec<ExecutedParameterRead>>| {
+            ExecutedInterventionExperiments::new(
+                plan(scope, Readout::Kl(KlPositions::Edited)).unwrap(),
+                vec![ExperimentMeasurement {
+                    readouts: vec![ReadoutMeasurement::Kl(vec![0.1; 6])],
+                    pre_edit_kl_max: None,
+                    parameter_reads: reads
+                        .map(|reads| ExecutedParameterReads::new(reads).unwrap()),
+                }],
+            )
+        };
+        let mismatch = |ordinal: usize, declared: (&str, &str), executed: (&str, &str)| {
+            ExecutedInterventionError::ParameterRead {
+                experiment: 0,
+                change: 0,
+                refusal: ParameterReadRefusal::LabelMismatch {
+                    parameter: tied.to_string(),
+                    ordinal,
+                    declared_module: declared.0.to_string(),
+                    declared_op: declared.1.to_string(),
+                    executed_module: executed.0.to_string(),
+                    executed_op: executed.1.to_string(),
+                },
+            }
+        };
+
+        // The head read, named as the forward made it, root module "" included.
+        assert!(execute(head(1, "", linear), Some(forward())).is_ok());
+        // Another op, or another module, at that ordinal is another read.
+        assert_eq!(
+            execute(head(1, "", "torch.matmul"), Some(forward())).unwrap_err(),
+            mismatch(1, ("", "torch.matmul"), ("", linear))
+        );
+        assert_eq!(
+            execute(head(1, "lm_head", linear), Some(forward())).unwrap_err(),
+            mismatch(1, ("lm_head", linear), ("", linear))
+        );
+        // An ordinal off by one addresses the embedding read, which the names catch.
+        assert_eq!(
+            execute(head(0, "", linear), Some(forward())).unwrap_err(),
+            mismatch(0, ("", linear), ("embed", "torch.nn.functional.embedding"))
+        );
+        // The forward read the tied tensor twice, so it made no read #2.
+        assert_eq!(
+            execute(head(2, "", linear), Some(forward())).unwrap_err(),
+            ExecutedInterventionError::ParameterRead {
+                experiment: 0,
+                change: 0,
+                refusal: ParameterReadRefusal::Unread {
+                    parameter: tied.to_string(),
+                    ordinal: 2,
+                    reads: 2,
+                },
+            }
+        );
+        // Without the executed reads, nothing shows the edit reached its read.
+        assert_eq!(
+            execute(head(1, "", linear), None).unwrap_err(),
+            ExecutedInterventionError::MissingParameterReads { experiment: 0 }
+        );
+        // Negative control: a global edit names no read, so it needs no reads.
+        assert!(ExecutedInterventionExperiments::new(
+            plan(
+                ParameterEditScope::Global,
+                Readout::Kl(KlPositions::Declared(vec![5]))
+            )
+            .unwrap(),
+            vec![ExperimentMeasurement {
+                readouts: vec![ReadoutMeasurement::Kl(vec![0.1])],
+                pre_edit_kl_max: None,
+                parameter_reads: None,
+            }],
+        )
+        .is_ok());
+        // The op is required even where the module is the root's "".
+        assert!(matches!(
+            plan(head(1, "", ""), Readout::Kl(KlPositions::Edited)),
+            Err(InterventionPlanError::InvalidChange {
+                experiment: 0,
+                change: 0,
+                ..
+            })
+        ));
+
+        // Each storage is numbered in execution order on its own, so the interleaved
+        // forward is accepted. A read out of order, a repeated ordinal and a read with
+        // no op are refused.
+        assert!(ExecutedParameterReads::new(forward()).is_ok());
+        assert_eq!(
+            ExecutedParameterReads::new(vec![
+                read(tied, 1, "", linear),
+                read(tied, 0, "embed", linear),
+            ])
+            .unwrap_err(),
+            ParameterReadRefusal::OutOfOrder {
+                index: 0,
+                parameter: tied.to_string(),
+                ordinal: 1,
+                expected: 0,
+            }
+        );
+        assert_eq!(
+            ExecutedParameterReads::new(vec![
+                read(tied, 0, "embed", linear),
+                read(tied, 0, "", linear),
+            ])
+            .unwrap_err(),
+            ParameterReadRefusal::OutOfOrder {
+                index: 1,
+                parameter: tied.to_string(),
+                ordinal: 0,
+                expected: 1,
+            }
+        );
+        assert_eq!(
+            ExecutedParameterReads::new(vec![read(tied, 0, "embed", "")]).unwrap_err(),
+            ParameterReadRefusal::Unnamed { index: 0 }
         );
     }
 }

@@ -13,6 +13,9 @@ pub(crate) struct BinomialLocationScaleWiggleHessianWorkspace {
     pub(crate) x_t: Arc<Array2<f64>>,
     pub(crate) x_ls: Arc<Array2<f64>>,
     pub(crate) pieces: BinomialWiggleOrder2Rows,
+    /// The geometry every directional operator of this workspace shares, built on the first
+    /// request so value-only evaluations never build it (#2940).
+    pub(crate) operator_geometry: std::sync::OnceLock<BlsWiggleOperatorGeometry>,
 }
 
 impl BinomialLocationScaleWiggleHessianWorkspace {
@@ -29,7 +32,25 @@ impl BinomialLocationScaleWiggleHessianWorkspace {
             x_t: Arc::new(x_t),
             x_ls: Arc::new(x_ls),
             pieces,
+            operator_geometry: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The shared operator geometry at this workspace's frozen states, built on first use at
+    /// fourth order, the highest any directional operator reads. Two concurrent first requests
+    /// may both build one; `get_or_init` keeps the first, so every operator reads one set of
+    /// design identities.
+    pub(crate) fn shared_operator_geometry(&self) -> Result<&BlsWiggleOperatorGeometry, String> {
+        if let Some(geometry) = self.operator_geometry.get() {
+            return Ok(geometry);
+        }
+        let built = self.family.bls_wiggle_operator_geometry(
+            &self.block_states,
+            self.x_t.clone(),
+            self.x_ls.clone(),
+            4,
+        )?;
+        Ok(self.operator_geometry.get_or_init(|| built))
     }
 
     /// Apply a Horvitz–Thompson outer-row subsample mask to the precomputed
@@ -206,12 +227,12 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
-        self.family.bls_wiggle_directional_operator(
+        let operator = self.family.bls_wiggle_directional_operator(
+            self.shared_operator_geometry()?,
             &self.block_states,
-            self.x_t.clone(),
-            self.x_ls.clone(),
             d_beta_flat,
-        )
+        )?;
+        Ok(Some(Arc::new(operator)))
     }
 
     fn second_directional_derivative(
@@ -232,13 +253,13 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
         d_beta_u: &Array1<f64>,
         d_beta_v: &Array1<f64>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
-        self.family.bls_wiggle_second_directional_operator(
+        let operator = self.family.bls_wiggle_second_directional_operator(
+            self.shared_operator_geometry()?,
             &self.block_states,
-            self.x_t.clone(),
-            self.x_ls.clone(),
             d_beta_u,
             d_beta_v,
-        )
+        )?;
+        Ok(Some(Arc::new(operator)))
     }
 }
 

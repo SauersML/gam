@@ -20,11 +20,14 @@
 //!
 //!   for `m` contexts. The noise terms cancel, and the second bracket is the Occam factor of `m` independent coefficient
 //!   volumes against one.
-//! - [`compare_reuse_reml`], **prior scale not declared**: a penalty `S` with ONE smoothing strength per hypothesis, fitted
-//!   by Gaussian REML with the dispersion profiled (#2822 M1). Both hypotheses carry the same two hyperparameters
-//!   `(λ, σ²)`, so their profiled evidences are comparable. A penalty with a null space is refused: its improper flat
-//!   directions have dimension `k` under sharing and `m·k` under specialization, so their arbitrary constants cannot
-//!   cancel.
+//! - [`compare_reuse_reml`], **prior scale not declared**: a penalty set `S_1..S_K` with one REML-fitted strength vector
+//!   per hypothesis, fitted by exact multi-penalty Gaussian REML ([`gam_solve::gaussian_reml_multi_penalty`]) with the
+//!   dispersion profiled (#2822 M1). Both hypotheses carry the same hyperparameters `(λ_1, …, λ_K, σ²)`, so their
+//!   profiled evidences are comparable. The penalties' declared null space `N` (an unpenalized intercept, say) enters
+//!   BOTH hypotheses as per-context fixed effects: each context keeps its own null-space coefficients under a flat prior,
+//!   and only the penalized part is shared. The hypotheses then integrate the same improper space, `m·dim N` flat
+//!   coordinates in one parametrization, so its arbitrary constant cancels from the Bayes factor exactly. Sharing the
+//!   null space too would integrate `dim N` flat directions against `m·dim N`, whose constants cannot cancel.
 //!
 //! **Adapters are charged.** An alignment of the contexts' coordinates belongs to the shared hypothesis, and the shared
 //! evidence is the prior-mass mixture over the DECLARED alignments. Picking the best of them after seeing the data is
@@ -33,12 +36,18 @@
 //! in its own coordinates with the same prior; an adapter that is not a prior isometry (`A_cᵀQA_c ≠ Q`) also changes
 //! that context's marginal function prior under sharing, and the Bayes factor prices that change too.
 
-use gam_linalg::faer_ndarray::fast_ab;
+use faer::Side;
+use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, HouseholderQr, fast_ab};
+use gam_linalg::roundoff::{accumulation_growth, symmetric_spectrum_rounding_band};
+use gam_linalg::utils::KahanSum;
 use gam_math::special::{logaddexp, logistic};
 use gam_solve::gaussian_marginal::{
     GaussianEvidenceParts, GaussianMarginalError, GaussianMarginalModel,
 };
-use gam_solve::gaussian_reml::gaussian_reml_multi_closed_form;
+use gam_solve::gaussian_reml_multi_penalty::{
+    GaussianRemlMultiPenaltyFit, GaussianRemlMultiPenaltyProblem,
+    GaussianRemlMultiPenaltyRhoPlacement,
+};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, concatenate, s};
 
 /// One context's observations of the retained function.
@@ -89,19 +98,25 @@ pub struct ReuseComparison {
     pub posterior_share_probability: f64,
 }
 
-/// The REML arm's comparison with its fitted smoothing strengths and its resolution.
+/// The REML arm's comparison with its fitted smoothing strengths, where they sit, and its resolution.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemlReuseComparison {
-    /// The comparison, with each log evidence the negative minimized REML cost.
+    /// The comparison. Each log evidence is `log p(y | λ̂, σ̂²)`: the negative minimized REML cost of the whitened
+    /// problem less `½Σ ln r_i` for the declared noise shape.
     pub comparison: ReuseComparison,
-    /// `λ̂` of the shared hypothesis under each declared alignment.
-    pub alignment_lambdas: Vec<f64>,
-    /// `λ̂` of the specialized hypothesis, one strength for every context's block.
-    pub specialized_lambda: f64,
-    /// Bound on how far `comparison.log_bayes_factor` can sit from the exact profiled value: each fit's accumulated
-    /// forward-error bound plus its optimality gap `g²/(2h)` in `ρ = ln λ` (the mixture over alignments is 1-Lipschitz
-    /// in each alignment's evidence, so the shared side contributes its largest bound). `None` when a fit carries no
-    /// forward-error bound or no positive curvature at `ρ̂`: the verdict then has no established resolution.
+    /// `λ̂` of the shared hypothesis under each declared alignment, one strength per penalty.
+    pub alignment_lambdas: Vec<Array1<f64>>,
+    /// Per shared fit, per penalty: where `ρ̂ = ln λ̂` sits in the REML owner's derived domain.
+    pub alignment_rho_placement: Vec<Vec<GaussianRemlMultiPenaltyRhoPlacement>>,
+    /// `λ̂` of the specialized hypothesis, one strength per penalty for every context's block.
+    pub specialized_lambdas: Array1<f64>,
+    /// Per penalty: where the specialized fit's `ρ̂` sits.
+    pub specialized_rho_placement: Vec<GaussianRemlMultiPenaltyRhoPlacement>,
+    /// Bound on how far `comparison.log_bayes_factor` can sit from the exact profiled value: each fit's forward-error
+    /// bound (widened for the noise whitening) plus its optimality gap `½g_Fᵀ H_FF⁻¹ g_F` over the interior coordinates
+    /// `F` of `ρ̂`. The mixture over alignments is 1-Lipschitz in each alignment's evidence, so the shared side
+    /// contributes its largest bound. `None` when a fit's placement is unaudited or its interior Hessian block is not
+    /// positive definite: the verdict then has no established resolution.
     pub log_bayes_factor_resolution: Option<f64>,
 }
 
@@ -112,13 +127,14 @@ pub enum ReuseError {
     InvalidInput(String),
     /// The declared-prior evidence refused its input (an improper prior among them).
     Evidence(GaussianMarginalError),
-    /// A Gaussian REML fit failed.
+    /// A Gaussian REML problem or fit was refused; an undeclared null space of the penalty set among them.
     Reml(String),
-    /// The penalty leaves `nullity` unpenalized directions in `hypothesis`'s fit, so the two hypotheses integrate improper
-    /// spaces of different dimension.
-    ImproperPenalty {
-        hypothesis: &'static str,
-        nullity: usize,
+    /// Penalty `penalty` does not annihilate the declared null space: `‖S_k N̂‖_F` exceeds the band inside which its own
+    /// spectrum cannot resolve a direction from zero.
+    NullSpaceNotAnnihilated {
+        penalty: usize,
+        residual: f64,
+        band: f64,
     },
 }
 
@@ -127,14 +143,14 @@ impl std::fmt::Display for ReuseError {
         match self {
             Self::InvalidInput(message) | Self::Reml(message) => f.write_str(message),
             Self::Evidence(error) => write!(f, "reuse comparison: {error}"),
-            Self::ImproperPenalty {
-                hypothesis,
-                nullity,
+            Self::NullSpaceNotAnnihilated {
+                penalty,
+                residual,
+                band,
             } => write!(
                 f,
-                "reuse comparison refuses a penalty with a null space: the {hypothesis} fit has {nullity} unpenalized \
-                 directions, and an improper space whose dimension differs between the hypotheses cannot enter a \
-                 Bayes factor"
+                "reuse comparison: penalty {penalty} does not annihilate the declared null space: ‖S N̂‖_F = \
+                 {residual:e} exceeds its rounding band {band:e}"
             ),
         }
     }
@@ -236,7 +252,8 @@ fn shared_design(
         .zip(adapters)
         .map(|(context, adapter)| fast_ab(&context.basis, adapter))
         .collect();
-    let design_views: Vec<ArrayView2<'_, f64>> = designs.iter().map(|design| design.view()).collect();
+    let design_views: Vec<ArrayView2<'_, f64>> =
+        designs.iter().map(|design| design.view()).collect();
     let response_views: Vec<ArrayView1<'_, f64>> =
         contexts.iter().map(|context| context.response).collect();
     let noise_views: Vec<ArrayView1<'_, f64>> = contexts
@@ -327,17 +344,251 @@ pub fn compare_reuse(
     ))
 }
 
+/// The penalty set with its declared null space `N` split off: an orthonormal `N̂` spanning `N`, an orthonormal
+/// complement `U`, and every penalty restricted to the complement, `UᵀS_kU`.
+struct PenaltySplit {
+    null_basis: Array2<f64>,
+    complement: Array2<f64>,
+    restricted: Vec<Array2<f64>>,
+}
+
+fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
+    let mut sum = KahanSum::default();
+    for value in matrix {
+        sum.add(value * value);
+    }
+    sum.sum().sqrt()
+}
+
+/// How far a declared null space escapes one penalty: `‖S N̂‖_F` for the orthonormal basis `N̂` of the declaration,
+/// against the band inside which the penalty's own spectrum cannot resolve a direction from zero.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NullSpaceAnnihilation {
+    /// `‖S N̂‖_F`.
+    pub residual: f64,
+    /// `√k·(p·ε·‖S‖₂ + γ_p‖S‖_F)`. A direction the eigensolver cannot resolve from zero has `‖Sv‖ ≤ p·ε·‖S‖₂`
+    /// ([`symmetric_spectrum_rounding_band`]), and the product that measures it rounds by at most `γ_p‖S‖_F` per unit
+    /// column. Zero for an empty declaration.
+    pub band: f64,
+}
+
+impl NullSpaceAnnihilation {
+    /// The penalty annihilates the declaration to its own rounding.
+    pub fn holds(&self) -> bool {
+        self.residual <= self.band
+    }
+}
+
+fn validate_penalties(penalties: &[Array2<f64>], coefficients: usize) -> Result<(), ReuseError> {
+    if penalties.is_empty() {
+        return Err(ReuseError::InvalidInput(
+            "the REML arm needs at least one penalty".to_string(),
+        ));
+    }
+    if let Some((index, penalty)) = penalties.iter().enumerate().find(|(_, penalty)| {
+        penalty.dim() != (coefficients, coefficients)
+            || penalty.iter().any(|value| !value.is_finite())
+    }) {
+        return Err(ReuseError::InvalidInput(format!(
+            "penalty {index} must be a finite {coefficients} x {coefficients} matrix; got {}x{}",
+            penalty.nrows(),
+            penalty.ncols()
+        )));
+    }
+    Ok(())
+}
+
+/// An orthonormal basis `N̂` of the declared null space and its orthonormal complement `U`.
+fn orthonormal_null_split(
+    null_space: ArrayView2<'_, f64>,
+    coefficients: usize,
+) -> Result<(Array2<f64>, Array2<f64>), ReuseError> {
+    let nullity = null_space.ncols();
+    if null_space.nrows() != coefficients
+        || nullity >= coefficients
+        || null_space.iter().any(|value| !value.is_finite())
+    {
+        return Err(ReuseError::InvalidInput(format!(
+            "the declared null space must be a finite {coefficients} x k matrix with k < {coefficients}; got {}x{nullity}",
+            null_space.nrows()
+        )));
+    }
+    if nullity == 0 {
+        return Ok((Array2::zeros((coefficients, 0)), Array2::eye(coefficients)));
+    }
+    // Householder QR `N = QR`: the leading `k` columns of `Q` span `N` and the rest are its orthonormal complement. An
+    // exactly rank-deficient `N` has a zero on `R`'s diagonal, which the QR's backward error raises to at most
+    // `γ_{pk}‖N‖_F`.
+    let declared = null_space.to_owned();
+    let qr = HouseholderQr::new(FaerArrayView::new(&declared).as_ref());
+    let rank_band = accumulation_growth(coefficients * nullity) * frobenius_norm(&declared);
+    if let Some(column) = (0..nullity).find(|&column| qr.r()[(column, column)].abs() <= rank_band) {
+        return Err(ReuseError::InvalidInput(format!(
+            "the declared null space is not of full column rank: column {column} is not resolved above its QR \
+             rounding band {rank_band:e}"
+        )));
+    }
+    let mut transposed_q = faer::Mat::<f64>::identity(coefficients, coefficients);
+    qr.apply_transpose_on_the_left(transposed_q.as_mut());
+    let null_basis = Array2::from_shape_fn((coefficients, nullity), |(row, col)| {
+        transposed_q[(col, row)]
+    });
+    let complement = Array2::from_shape_fn((coefficients, coefficients - nullity), |(row, col)| {
+        transposed_q[(nullity + col, row)]
+    });
+    Ok((null_basis, complement))
+}
+
+fn annihilation(
+    penalty: &Array2<f64>,
+    null_basis: &Array2<f64>,
+    index: usize,
+) -> Result<NullSpaceAnnihilation, ReuseError> {
+    let nullity = null_basis.ncols();
+    if nullity == 0 {
+        return Ok(NullSpaceAnnihilation {
+            residual: 0.0,
+            band: 0.0,
+        });
+    }
+    let (eigenvalues, _) = penalty.eigh(Side::Lower).map_err(|error| {
+        ReuseError::InvalidInput(format!("penalty {index} spectrum: {error}"))
+    })?;
+    Ok(NullSpaceAnnihilation {
+        residual: frobenius_norm(&fast_ab(penalty, null_basis)),
+        band: (nullity as f64).sqrt()
+            * (symmetric_spectrum_rounding_band(&eigenvalues.to_vec())
+                + accumulation_growth(penalty.nrows()) * frobenius_norm(penalty)),
+    })
+}
+
+/// Measure, per penalty, how far the declared null space (`p × k`, any full-column-rank basis) escapes it. This is the
+/// one predicate [`compare_reuse_reml`] refuses a declaration by ([`ReuseError::NullSpaceNotAnnihilated`]), so a
+/// declaration whose every entry [`NullSpaceAnnihilation::holds`] is accepted there.
+pub fn null_space_annihilation(
+    penalties: &[Array2<f64>],
+    null_space: ArrayView2<'_, f64>,
+) -> Result<Vec<NullSpaceAnnihilation>, ReuseError> {
+    let coefficients = null_space.nrows();
+    validate_penalties(penalties, coefficients)?;
+    let (null_basis, _) = orthonormal_null_split(null_space, coefficients)?;
+    penalties
+        .iter()
+        .enumerate()
+        .map(|(index, penalty)| annihilation(penalty, &null_basis, index))
+        .collect()
+}
+
+fn split_penalties(
+    penalties: &[Array2<f64>],
+    null_space: ArrayView2<'_, f64>,
+    coefficients: usize,
+) -> Result<PenaltySplit, ReuseError> {
+    validate_penalties(penalties, coefficients)?;
+    let (null_basis, complement) = orthonormal_null_split(null_space, coefficients)?;
+    if null_basis.ncols() == 0 {
+        return Ok(PenaltySplit {
+            null_basis,
+            complement,
+            restricted: penalties.to_vec(),
+        });
+    }
+    let mut restricted = Vec::with_capacity(penalties.len());
+    for (index, penalty) in penalties.iter().enumerate() {
+        let measured = annihilation(penalty, &null_basis, index)?;
+        if !measured.holds() {
+            return Err(ReuseError::NullSpaceNotAnnihilated {
+                penalty: index,
+                residual: measured.residual,
+                band: measured.band,
+            });
+        }
+        let projected = fast_ab(&complement.t(), &fast_ab(penalty, &complement));
+        restricted.push((&projected + &projected.t()) * 0.5);
+    }
+    Ok(PenaltySplit {
+        null_basis,
+        complement,
+        restricted,
+    })
+}
+
+/// `[A | B]` for two blocks with the same rows.
+fn side_by_side(left: &Array2<f64>, right: &Array2<f64>) -> Array2<f64> {
+    let rows = left.nrows();
+    let mut joined = Array2::zeros((rows, left.ncols() + right.ncols()));
+    joined.slice_mut(s![.., ..left.ncols()]).assign(left);
+    joined.slice_mut(s![.., left.ncols()..]).assign(right);
+    joined
+}
+
+/// Each restricted penalty `S̃_k` placed `copies` times on the diagonal after `offset` unpenalized coordinates.
+fn embedded_penalties(
+    restricted: &[Array2<f64>],
+    offset: usize,
+    copies: usize,
+) -> Vec<Array2<f64>> {
+    restricted
+        .iter()
+        .map(|penalty| {
+            let width = penalty.nrows();
+            let size = offset + copies * width;
+            let mut embedded = Array2::zeros((size, size));
+            for copy in 0..copies {
+                let block = offset + copy * width..offset + (copy + 1) * width;
+                embedded.slice_mut(s![block.clone(), block]).assign(penalty);
+            }
+            embedded
+        })
+        .collect()
+}
+
 struct RemlFit {
-    cost: f64,
-    lambda: f64,
+    log_evidence: f64,
+    lambdas: Array1<f64>,
+    placement: Vec<GaussianRemlMultiPenaltyRhoPlacement>,
     resolution: Option<f64>,
 }
 
+/// `½g_Fᵀ H_FF⁻¹ g_F` over the interior coordinates `F` of `ρ̂`: to second order, how far the criterion at `ρ̂` sits above
+/// its minimum over the owner's domain. A railed coordinate sits at the domain's edge, where that minimum is defined, and
+/// contributes no gap. `None` when a placement is unaudited or `H_FF` is not positive definite.
+fn optimality_gap(fit: &GaussianRemlMultiPenaltyFit) -> Option<f64> {
+    if fit
+        .rho_placement
+        .contains(&GaussianRemlMultiPenaltyRhoPlacement::Unaudited)
+    {
+        return None;
+    }
+    let interior: Vec<usize> = fit
+        .rho_placement
+        .iter()
+        .enumerate()
+        .filter(|(_, placement)| **placement == GaussianRemlMultiPenaltyRhoPlacement::Interior)
+        .map(|(index, _)| index)
+        .collect();
+    if interior.is_empty() {
+        return Some(0.0);
+    }
+    let evaluation = &fit.evaluation;
+    let gradient = Array1::from_iter(
+        interior
+            .iter()
+            .map(|&index| evaluation.reml_gradient[index]),
+    );
+    let hessian = Array2::from_shape_fn((interior.len(), interior.len()), |(row, col)| {
+        evaluation.reml_hessian[[interior[row], interior[col]]]
+    });
+    let step = hessian.cholesky(Side::Lower).ok()?.solvevec(&gradient);
+    Some(0.5 * gradient.dot(&step).max(0.0))
+}
+
 fn reml_fit(
-    design: ArrayView2<'_, f64>,
-    response: ArrayView1<'_, f64>,
-    noise_variance: ArrayView1<'_, f64>,
-    penalty: ArrayView2<'_, f64>,
+    design: &Array2<f64>,
+    response: &Array1<f64>,
+    noise_variance: &Array1<f64>,
+    penalties: &[Array2<f64>],
+    nullity: usize,
     hypothesis: &'static str,
 ) -> Result<RemlFit, ReuseError> {
     if let Some((row, variance)) = noise_variance
@@ -349,98 +600,114 @@ fn reml_fit(
             "the noise variance at stacked row {row} must be finite and positive; got {variance}"
         )));
     }
-    let weights = noise_variance.mapv(f64::recip);
-    let fit = gaussian_reml_multi_closed_form(
-        design,
-        response.insert_axis(Axis(1)),
-        penalty,
-        Some(weights.view()),
-        None,
+    let scales = noise_variance.mapv(|variance| variance.sqrt().recip());
+    let whitened_design = design * &scales.view().insert_axis(Axis(1));
+    let whitened_response = (response * &scales).insert_axis(Axis(1));
+    let fit = GaussianRemlMultiPenaltyProblem::new(
+        whitened_design.view(),
+        whitened_response.view(),
+        penalties,
+        nullity,
     )
-    .map_err(|error| {
-        ReuseError::Reml(format!("{hypothesis} hypothesis REML fit failed: {error}"))
-    })?;
-    if fit.cache.nullity > 0 {
-        return Err(ReuseError::ImproperPenalty {
-            hypothesis,
-            nullity: fit.cache.nullity,
-        });
+    .and_then(|problem| problem.fit(None))
+    .map_err(|error| ReuseError::Reml(format!("{hypothesis} hypothesis REML refused: {error}")))?;
+    // `log p(y) = log p(R^{-1/2}y) − ½Σ ln r_i`. Both hypotheses stack the same rows in the same order, so this sum is
+    // bitwise the same on both sides and cancels from the Bayes factor.
+    let mut log_noise = KahanSum::default();
+    for variance in noise_variance {
+        log_noise.add(variance.ln());
     }
-    let optimality_gap = (fit.reml_hess_rho > 0.0)
-        .then(|| fit.reml_grad_rho * fit.reml_grad_rho / (2.0 * fit.reml_hess_rho));
+    let evaluation = &fit.evaluation;
+    // Whitening multiplies every entry by `fl(1/√r_i)`, a relative perturbation of at most `γ_3`. The owner's bound is
+    // first order in the columnwise backward error `γ_{n·p}` of its design QR and its application to `y`, so the
+    // perturbation widens that bound by at most the factor `1 + γ_3/γ_{n·p}`.
+    let (rows, columns) = design.dim();
+    let whitening = 1.0 + accumulation_growth(3) / accumulation_growth(rows * columns);
     Ok(RemlFit {
-        cost: fit.reml_score,
-        lambda: fit.lambda,
-        resolution: fit
-            .reml_score_roundoff
-            .zip(optimality_gap)
-            .map(|(roundoff, gap)| roundoff + gap),
+        log_evidence: -evaluation.reml_score - 0.5 * log_noise.sum(),
+        lambdas: evaluation.lambdas.clone(),
+        placement: fit.rho_placement.clone(),
+        resolution: optimality_gap(&fit)
+            .map(|gap| whitening * evaluation.reml_score_roundoff + gap),
     })
 }
 
-/// Compare reuse against specialization when the prior scale is not declared: penalty `S` with one REML-fitted
-/// smoothing strength per hypothesis and the dispersion profiled (#2822 M1).
+/// Compare reuse against specialization when the prior scale is not declared: penalties `S_1..S_K` with one
+/// REML-fitted strength vector per hypothesis and the dispersion profiled (#2822 M1).
 ///
-/// The shared fit uses the stacked design `[Φ_1A_1; …; Φ_mA_m]` with `S`; the specialized fit uses the block-diagonal
-/// design `diag(Φ_1, …, Φ_m)` with `diag(S, …, S)` and ONE `λ`. A penalty that leaves any direction unpenalized in either
-/// fit is refused with [`ReuseError::ImproperPenalty`].
+/// `null_space` (`p × k`, `k` may be 0) declares `∩_k ker S_k`, the directions no penalty reaches. With `N̂` its
+/// orthonormal basis and `U` the orthonormal complement, context `c` reads `Φ_c(N̂γ_c + ·)`: its own null-space
+/// coefficients `γ_c` under a flat prior in BOTH hypotheses. The shared fit then uses `[diag(Φ_1N̂, …, Φ_mN̂) |
+/// Φ_1A_1U; …; Φ_mA_mU]` with penalties `diag(0, UᵀS_kU)`; the specialized fit uses `[diag(Φ_cN̂) | diag(Φ_cU)]` with
+/// `diag(0, UᵀS_kU, …, UᵀS_kU)` and the same `λ_k` for every context. Both integrate the same `m·k` flat coordinates,
+/// so the flat prior's arbitrary constant cancels from the Bayes factor. A penalty that does not annihilate the
+/// declared null space is refused with [`ReuseError::NullSpaceNotAnnihilated`], and an undeclared null direction by the
+/// REML owner's structural rank check.
 pub fn compare_reuse_reml(
     contexts: &[ContextObservations<'_>],
-    penalty: ArrayView2<'_, f64>,
+    penalties: &[Array2<f64>],
+    null_space: ArrayView2<'_, f64>,
     alignments: &[SharedAlignment],
     prior_share_probability: f64,
 ) -> Result<RemlReuseComparison, ReuseError> {
     let total_weight = validate_structure(contexts, alignments, prior_share_probability)?;
     let coefficients = contexts[0].basis.ncols();
-    if penalty.dim() != (coefficients, coefficients) {
-        return Err(ReuseError::InvalidInput(format!(
-            "the penalty is {}x{}; the retained function has {coefficients} coefficients",
-            penalty.nrows(),
-            penalty.ncols()
-        )));
+    let split = split_penalties(penalties, null_space, coefficients)?;
+    let context_count = contexts.len();
+    let nullity = split.null_basis.ncols();
+    let fixed_count = context_count * nullity;
+    let rows: usize = contexts.iter().map(|context| context.basis.nrows()).sum();
+
+    // `diag(Φ_1N̂, …, Φ_mN̂)` and `diag(Φ_1U, …, Φ_mU)`, row blocks in context order.
+    let penalized_width = coefficients - nullity;
+    let mut fixed_effects = Array2::<f64>::zeros((rows, fixed_count));
+    let mut specialized_penalized = Array2::<f64>::zeros((rows, context_count * penalized_width));
+    let mut start = 0;
+    for (index, context) in contexts.iter().enumerate() {
+        let end = start + context.basis.nrows();
+        if nullity > 0 {
+            fixed_effects
+                .slice_mut(s![start..end, index * nullity..(index + 1) * nullity])
+                .assign(&fast_ab(&context.basis, &split.null_basis));
+        }
+        specialized_penalized
+            .slice_mut(s![
+                start..end,
+                index * penalized_width..(index + 1) * penalized_width
+            ])
+            .assign(&fast_ab(&context.basis, &split.complement));
+        start = end;
     }
 
+    let shared_penalties = embedded_penalties(&split.restricted, fixed_count, 1);
     let mut alignment_log_evidence = Vec::with_capacity(alignments.len());
     let mut alignment_lambdas = Vec::with_capacity(alignments.len());
+    let mut alignment_rho_placement = Vec::with_capacity(alignments.len());
     let mut log_evidence_shared = f64::NEG_INFINITY;
     let mut shared_resolution = Some(0.0_f64);
     for alignment in alignments {
-        let (design, response, noise_variance) = shared_design(contexts, &alignment.adapters)?;
+        let (stacked, response, noise_variance) = shared_design(contexts, &alignment.adapters)?;
+        let design = side_by_side(&fixed_effects, &fast_ab(&stacked, &split.complement));
         let fit = reml_fit(
-            design.view(),
-            response.view(),
-            noise_variance.view(),
-            penalty,
+            &design,
+            &response,
+            &noise_variance,
+            &shared_penalties,
+            fixed_count,
             "shared",
         )?;
         log_evidence_shared = logaddexp(
             log_evidence_shared,
-            (alignment.prior_weight / total_weight).ln() - fit.cost,
+            (alignment.prior_weight / total_weight).ln() + fit.log_evidence,
         );
-        alignment_log_evidence.push(-fit.cost);
-        alignment_lambdas.push(fit.lambda);
+        alignment_log_evidence.push(fit.log_evidence);
+        alignment_lambdas.push(fit.lambdas);
+        alignment_rho_placement.push(fit.placement);
         shared_resolution = shared_resolution
             .zip(fit.resolution)
             .map(|(bound, resolution)| bound.max(resolution));
     }
 
-    let context_count = contexts.len();
-    let rows: usize = contexts.iter().map(|context| context.basis.nrows()).sum();
-    let mut design = Array2::<f64>::zeros((rows, context_count * coefficients));
-    let mut block_penalty =
-        Array2::<f64>::zeros((context_count * coefficients, context_count * coefficients));
-    let mut start = 0;
-    for (index, context) in contexts.iter().enumerate() {
-        let end = start + context.basis.nrows();
-        let columns = index * coefficients..(index + 1) * coefficients;
-        design
-            .slice_mut(s![start..end, columns.clone()])
-            .assign(&context.basis);
-        block_penalty
-            .slice_mut(s![columns.clone(), columns])
-            .assign(&penalty);
-        start = end;
-    }
     let response_views: Vec<ArrayView1<'_, f64>> =
         contexts.iter().map(|context| context.response).collect();
     let noise_views: Vec<ArrayView1<'_, f64>> = contexts
@@ -451,10 +718,11 @@ pub fn compare_reuse_reml(
     let response = concatenate(Axis(0), &response_views).map_err(shape)?;
     let noise_variance = concatenate(Axis(0), &noise_views).map_err(shape)?;
     let specialized = reml_fit(
-        design.view(),
-        response.view(),
-        noise_variance.view(),
-        block_penalty.view(),
+        &side_by_side(&fixed_effects, &specialized_penalized),
+        &response,
+        &noise_variance,
+        &embedded_penalties(&split.restricted, fixed_count, context_count),
+        fixed_count,
         "specialized",
     )?;
 
@@ -462,11 +730,13 @@ pub fn compare_reuse_reml(
         comparison: assemble(
             log_evidence_shared,
             alignment_log_evidence,
-            -specialized.cost,
+            specialized.log_evidence,
             prior_share_probability,
         ),
         alignment_lambdas,
-        specialized_lambda: specialized.lambda,
+        alignment_rho_placement,
+        specialized_lambdas: specialized.lambdas,
+        specialized_rho_placement: specialized.placement,
         log_bayes_factor_resolution: shared_resolution
             .zip(specialized.resolution)
             .map(|(shared, specialized)| shared + specialized),
@@ -476,9 +746,6 @@ pub fn compare_reuse_reml(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faer::Side;
-    use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
-    use gam_linalg::roundoff::accumulation_growth;
     use ndarray::array;
     use std::f64::consts::PI;
 
@@ -954,7 +1221,8 @@ mod tests {
             Array1::<f64>::ones(3 * repeats),
             Array1::<f64>::ones(3 * repeats),
         ];
-        let penalty = Array2::<f64>::eye(3);
+        let penalties = [Array2::<f64>::eye(3)];
+        let no_null_space = Array2::<f64>::zeros((3, 0));
         let alignments = [SharedAlignment::identity(2, 3)];
         // A deterministic perturbation keeps the profiled deviance away from a perfect fit.
         let first = quadratic_response(repeats, 1.0, 0.125);
@@ -963,11 +1231,17 @@ mod tests {
         {
             let responses = [first.clone(), first.mapv(|value| sign * value)];
             let contexts = contexts_of(&bases, &responses, &noise_shapes);
-            let reml = compare_reuse_reml(&contexts, penalty.view(), &alignments, 0.5)
-                .expect("REML comparison");
+            let reml = compare_reuse_reml(
+                &contexts,
+                &penalties,
+                no_null_space.view(),
+                &alignments,
+                0.5,
+            )
+            .expect("REML comparison");
             let resolution = reml
                 .log_bayes_factor_resolution
-                .expect("the closed-form REML evaluator accumulates a forward-error bound");
+                .expect("every fit is audited with positive interior curvature");
             let log_bayes_factor = reml.comparison.log_bayes_factor;
             if favours_sharing {
                 assert!(
@@ -980,36 +1254,206 @@ mod tests {
                     "{label}: REML log Bayes factor {log_bayes_factor:e} must favour specialization beyond {resolution:e}"
                 );
             }
-            assert!(reml.specialized_lambda > 0.0 && reml.alignment_lambdas[0] > 0.0);
+            assert!(reml.specialized_lambdas[0] > 0.0 && reml.alignment_lambdas[0][0] > 0.0);
         }
     }
 
-    #[test]
-    fn reml_arm_refuses_a_penalty_with_a_null_space() {
+    /// Two contexts on [`orthogonal_quadratic_basis`] with unit noise shape: `y₁ = x² + x/2 + ε` and
+    /// `y₂ = sign·y₁ + offset`. Both penalized coordinates carry signal well above the noise, so no REML strength rails.
+    fn offset_contexts_fixture(
+        sign: f64,
+        offset: f64,
+    ) -> ([Array2<f64>; 2], [Array1<f64>; 2], [Array1<f64>; 2]) {
         let repeats = 10;
-        let bases = [
-            orthogonal_quadratic_basis(repeats),
-            orthogonal_quadratic_basis(repeats),
-        ];
-        let noise_shapes = [
-            Array1::<f64>::ones(3 * repeats),
-            Array1::<f64>::ones(3 * repeats),
-        ];
-        let responses = [
-            quadratic_response(repeats, 1.0, 0.125),
-            quadratic_response(repeats, 1.0, 0.125),
-        ];
-        let contexts = contexts_of(&bases, &responses, &noise_shapes);
+        let slope = Array1::from_shape_fn(3 * repeats, |row| ((row % 3) as f64 - 1.0) / 2.0);
+        let first = quadratic_response(repeats, 1.0, 0.125) + &slope;
+        let second = first.mapv(|value| sign * value + offset);
+        (
+            [
+                orthogonal_quadratic_basis(repeats),
+                orthogonal_quadratic_basis(repeats),
+            ],
+            [first, second],
+            [
+                Array1::<f64>::ones(3 * repeats),
+                Array1::<f64>::ones(3 * repeats),
+            ],
+        )
+    }
+
+    /// The penalty set `{diag(0, 1, 0), diag(0, 0, 1)}`, which leaves the intercept `e₁` unpenalized.
+    fn intercept_free_penalties() -> ([Array2<f64>; 2], Array2<f64>) {
+        (
+            [
+                array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
+                array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            ],
+            array![[1.0], [0.0], [0.0]],
+        )
+    }
+
+    #[test]
+    fn reml_arm_keeps_each_contexts_null_space_coefficients_in_both_hypotheses() {
+        let (penalties, intercept) = intercept_free_penalties();
         let alignments = [SharedAlignment::identity(2, 3)];
 
-        // Positive control: a full-rank penalty computes.
+        // One shape read at two offsets: the per-context intercepts absorb the offset, so sharing wins.
+        let (bases, responses, noise) = offset_contexts_fixture(1.0, 5.0);
+        let contexts = contexts_of(&bases, &responses, &noise);
+        let offset_shape =
+            compare_reuse_reml(&contexts, &penalties, intercept.view(), &alignments, 0.5)
+                .expect("REML comparison with a declared intercept");
+        let resolution = offset_shape
+            .log_bayes_factor_resolution
+            .expect("every fit is audited with positive interior curvature");
         assert!(
-            compare_reuse_reml(&contexts, Array2::<f64>::eye(3).view(), &alignments, 0.5).is_ok()
+            offset_shape.comparison.log_bayes_factor > resolution,
+            "one shape at two offsets: REML log Bayes factor {:e} must favour sharing beyond {resolution:e}",
+            offset_shape.comparison.log_bayes_factor
         );
-        let unpenalized_intercept = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        assert_eq!(offset_shape.specialized_lambdas.len(), 2);
+        assert_eq!(offset_shape.alignment_rho_placement[0].len(), 2);
+
+        // Control: sharing the intercept too (a full-rank penalty, no null space) cannot fit both offsets.
+        let full_rank = [Array2::<f64>::eye(3)];
+        let shared_intercept = compare_reuse_reml(
+            &contexts,
+            &full_rank,
+            Array2::<f64>::zeros((3, 0)).view(),
+            &alignments,
+            0.5,
+        )
+        .expect("REML comparison with a full-rank penalty");
+        let control_resolution = shared_intercept
+            .log_bayes_factor_resolution
+            .expect("every fit is audited with positive interior curvature");
+        assert!(
+            shared_intercept.comparison.log_bayes_factor < -control_resolution,
+            "a shared intercept across a 5-unit offset: REML log Bayes factor {:e} must favour specialization \
+             beyond {control_resolution:e}",
+            shared_intercept.comparison.log_bayes_factor
+        );
+
+        // Control: opposite shapes still favour specialization with the intercepts free.
+        let (bases, responses, noise) = offset_contexts_fixture(-1.0, 5.0);
+        let contexts = contexts_of(&bases, &responses, &noise);
+        let opposite =
+            compare_reuse_reml(&contexts, &penalties, intercept.view(), &alignments, 0.5)
+                .expect("REML comparison with a declared intercept");
+        let opposite_resolution = opposite
+            .log_bayes_factor_resolution
+            .expect("every fit is audited with positive interior curvature");
+        assert!(
+            opposite.comparison.log_bayes_factor < -opposite_resolution,
+            "opposite shapes: REML log Bayes factor {:e} must favour specialization beyond {opposite_resolution:e}",
+            opposite.comparison.log_bayes_factor
+        );
+    }
+
+    #[test]
+    fn reml_bayes_factor_is_invariant_when_a_basis_change_rescales_the_null_space() {
+        let (penalties, intercept) = intercept_free_penalties();
+        let (bases, responses, noise) = offset_contexts_fixture(1.0, 5.0);
+        let alignments = [SharedAlignment::identity(2, 3)];
+        let contexts = contexts_of(&bases, &responses, &noise);
+        let original =
+            compare_reuse_reml(&contexts, &penalties, intercept.view(), &alignments, 0.5)
+                .expect("REML comparison");
+
+        // `T` is upper triangular with `Te₁ = e₁/4`, so the transformed null space `T⁻¹e₁` is `e₁` again while each
+        // context's fixed-effect column `Φ_cTe₁ = Φ_ce₁/4` shrinks by `s = 1/4`. The flat prior on `m·k = 2` fixed-effect
+        // coordinates then moves both log evidences by `−m·k·ln s = 2 ln 4` and leaves the Bayes factor alone. `T` also
+        // shears the complement off `e₁⊥`, which the flat coordinates absorb.
+        let transform = array![[0.25, 0.5, 0.0], [0.0, 1.0, 0.25], [0.0, 0.0, 1.0]];
+        let transformed_bases = [bases[0].dot(&transform), bases[1].dot(&transform)];
+        let transformed_penalties = [
+            transform.t().dot(&penalties[0]).dot(&transform),
+            transform.t().dot(&penalties[1]).dot(&transform),
+        ];
+        let transformed_contexts = contexts_of(&transformed_bases, &responses, &noise);
+        let transformed = compare_reuse_reml(
+            &transformed_contexts,
+            &transformed_penalties,
+            intercept.view(),
+            &alignments,
+            0.5,
+        )
+        .expect("REML comparison in transformed coordinates");
+
+        let band = original
+            .log_bayes_factor_resolution
+            .expect("every fit is audited with positive interior curvature")
+            + transformed
+                .log_bayes_factor_resolution
+                .expect("every fit is audited with positive interior curvature");
+        let predicted_shift = 2.0 * 4.0_f64.ln();
+        assert!(
+            predicted_shift > band,
+            "positive control: the predicted evidence shift {predicted_shift:e} must exceed the band {band:e}"
+        );
+        for (label, before, after) in [
+            (
+                "shared",
+                original.comparison.log_evidence_shared,
+                transformed.comparison.log_evidence_shared,
+            ),
+            (
+                "specialized",
+                original.comparison.log_evidence_specialized,
+                transformed.comparison.log_evidence_specialized,
+            ),
+        ] {
+            assert!(
+                (after - before - predicted_shift).abs() <= band,
+                "{label} log evidence moved by {:e}, predicted {predicted_shift:e} within {band:e}",
+                after - before
+            );
+        }
+        assert!(
+            (transformed.comparison.log_bayes_factor - original.comparison.log_bayes_factor).abs()
+                <= band,
+            "log Bayes factor {:e} vs {:e} must agree within {band:e}",
+            transformed.comparison.log_bayes_factor,
+            original.comparison.log_bayes_factor
+        );
+    }
+
+    #[test]
+    fn reml_arm_refuses_an_undeclared_or_unannihilated_null_space() {
+        let (penalties, intercept) = intercept_free_penalties();
+        let (bases, responses, noise) = offset_contexts_fixture(1.0, 0.0);
+        let contexts = contexts_of(&bases, &responses, &noise);
+        let alignments = [SharedAlignment::identity(2, 3)];
+
+        // Positive control: the declared intercept computes.
+        assert!(
+            compare_reuse_reml(&contexts, &penalties, intercept.view(), &alignments, 0.5).is_ok()
+        );
+        // The same penalties with no declared null space leave the intercept unpenalized in both fits.
         assert!(matches!(
-            compare_reuse_reml(&contexts, unpenalized_intercept.view(), &alignments, 0.5),
-            Err(ReuseError::ImproperPenalty { .. })
+            compare_reuse_reml(
+                &contexts,
+                &penalties,
+                Array2::<f64>::zeros((3, 0)).view(),
+                &alignments,
+                0.5
+            ),
+            Err(ReuseError::Reml(_))
+        ));
+        // The published predicate agrees: the intercept holds for both penalties, the slope fails only the first.
+        let intercept_measured =
+            null_space_annihilation(&penalties, intercept.view()).expect("intercept measure");
+        assert!(intercept_measured.iter().all(NullSpaceAnnihilation::holds));
+        let slope = array![[0.0], [1.0], [0.0]];
+        let slope_measured = null_space_annihilation(&penalties, slope.view()).expect("slope measure");
+        assert!(
+            !slope_measured[0].holds() && slope_measured[1].holds(),
+            "the slope escapes diag(0, 1, 0) only: {slope_measured:?}"
+        );
+        // A declared direction the penalties reach.
+        assert!(matches!(
+            compare_reuse_reml(&contexts, &penalties, slope.view(), &alignments, 0.5),
+            Err(ReuseError::NullSpaceNotAnnihilated { penalty: 0, .. })
         ));
     }
 

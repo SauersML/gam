@@ -681,7 +681,11 @@ pub(crate) fn fit_transformation_normal(
          specs: &[TermCollectionSpec],
          designs: &[TermCollectionDesign],
          eval_mode,
-         owned_value_mode| {
+         owned_value_mode|
+         -> Result<
+            ExactJointEvaluation<crate::custom_family::CustomFamilyJointHyperModeSelection>,
+            String,
+        > {
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let hyper_values = theta.slice(s![joint_setup.rho_dim()..]).to_owned();
             ensure_exact_geometry(&specs[0], &designs[0], &rho, &hyper_values)?;

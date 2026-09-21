@@ -41,6 +41,12 @@
 //! are never refitted here. A dense basis matrix is the case `R_j = I_{d_in}`: the design row
 //! is `β(m_r) ⊗ h_r` and the penalty is `S ⊗ I_{d_in}`.
 //!
+//! The block's criterion `V` is differentiated by that owner too: its envelope
+//! cotangents in the design, the responses and each assembled penalty
+//! (`data_gradient`, `penalty_gradient`) are pulled back here, through the design's
+//! exact adjoint and the penalties' chain to the right factors, by
+//! [`gaussian_block_cotangents`].
+//!
 //! # Rows that are refused
 //!
 //! A row whose declared mask has `m_c = m_Δ` for every component executes `m_Δ Θ_*`
@@ -71,11 +77,13 @@ use std::num::NonZeroU64;
 use super::codec::code_saving_at_proven_fidelity;
 use super::precision::{DecodedFidelity, DeclaredPrecision};
 use super::supports::{EvidenceStatus, Extremum};
-use gam_linalg::matrix::dense_rowwise_kronecker;
+use gam_linalg::matrix::{array2_bits_fingerprint, dense_rowwise_kronecker};
 use gam_linalg::roundoff::accumulation_growth;
 use gam_solve::estimate::EstimationError;
 use gam_solve::gaussian_reml_multi_penalty::{
-    GaussianRemlMultiPenaltyFit, GaussianRemlMultiPenaltyProblem,
+    GaussianRemlMultiPenaltyDataGradientOutcome, GaussianRemlMultiPenaltyFit,
+    GaussianRemlMultiPenaltyPenaltyGradientOutcome, GaussianRemlMultiPenaltyProblem,
+    GaussianRemlMultiPenaltyRhoPlacement,
 };
 use ndarray::{Array2, ArrayView1, ArrayView2, s};
 
@@ -106,6 +114,13 @@ pub struct GaussianBlockFit {
     /// The certified multi-penalty REML fit of the block. Its coefficients are in
     /// design order (row `offset_j + a`, one column per output coordinate).
     pub reml: GaussianRemlMultiPenaltyFit,
+    /// The `K × K` field penalties the block's penalties were assembled from, in the
+    /// REML problem's penalty order: the coefficients of their chain to the right factors.
+    /// Private, since nothing re-checks them against the assembled penalties.
+    field_penalties: Vec<Array2<f64>>,
+    /// Value fingerprints of the right factors the block was built from
+    /// ([`array2_bits_fingerprint`]): the penalty chain is exact only at those.
+    right_factor_fingerprints: Vec<u64>,
 }
 
 /// Why a conditionally Gaussian coefficient block was not fitted.
@@ -173,6 +188,12 @@ pub enum GaussianBlockError {
     DesignCotangentWidth {
         columns: usize,
         expected: usize,
+    },
+    /// Right factor `basis` differs in value from the one the fit was built from (or
+    /// the count differs, with `basis` the fit's count), so the fit's envelope
+    /// derivatives are not taken at it.
+    RightFactorsChanged {
+        basis: usize,
     },
     Reml(EstimationError),
 }
@@ -279,6 +300,11 @@ impl fmt::Display for GaussianBlockError {
                 f,
                 "conditionally Gaussian block refused: the design cotangent has {columns} columns \
                  but the design has {expected}"
+            ),
+            Self::RightFactorsChanged { basis } => write!(
+                f,
+                "conditionally Gaussian block refused: right factor {basis} is not the one the fit \
+                 was built from, so the fit is not converged at it"
             ),
             Self::Reml(error) => write!(f, "conditionally Gaussian block REML failed: {error}"),
         }
@@ -433,6 +459,8 @@ pub fn fit_gaussian_coefficient_block(
         left_factors,
         problem,
         reml,
+        field_penalties: field_penalties.iter().map(|penalty| penalty.to_owned()).collect(),
+        right_factor_fingerprints: right_factors.iter().map(array2_bits_fingerprint).collect(),
     })
 }
 
@@ -551,7 +579,8 @@ fn left_factors_from_design_order(
 /// For a scalar criterion `V(X)` with `G = ∂V/∂X` (`n × p`, design order), these
 /// are `∂V/∂β` (`n × K`), `∂V/∂h` (`n × d_in`) and `∂V/∂R_j` (`d_in × r_j`) through
 /// the design alone. A criterion whose penalties also depend on the right factors
-/// (`S_jk R_jᵀ R_k`) adds that penalty chain, which this struct does not carry.
+/// (`S_jk R_jᵀ R_k`) adds that penalty chain; [`gaussian_block_cotangents`] adds it
+/// for the block's REML criterion.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlockDesignCotangents {
     /// `∂V/∂β[r, j] = Σ_a G[r, offset_j + a] (R_jᵀ h_r)_a`.
@@ -650,6 +679,139 @@ pub fn block_design_adjoint(
         inputs: input_cotangents,
         right_factors: right_cotangents,
     })
+}
+
+/// Cotangents of the block's REML criterion `V` at its certified fit, with respect to
+/// everything that built the block.
+///
+/// `V` reads the moments `β` and the inputs `h` through the design only, and the
+/// responses `Y` directly. It reads each right factor `R_j` twice: through the design
+/// (`β_j R_jᵀ h_r`) and through every assembled penalty `P_k`, whose block `(j, l)` is
+/// `S^k_jl R_jᵀ R_l`. With `G_k = ∂V/∂P_k` symmetric, `dV = Σ_k tr(G_k dP_k)` gives the
+/// penalty leg `∂V/∂R_j = Σ_k Σ_l (S^k_jl + S^k_lj) R_l G_k[l, j]`, where `G_k[l, j]` is
+/// the `(l, j)` block of `G_k` in design order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GaussianBlockCotangents {
+    /// `∂V/∂β`, `n × K`.
+    pub moments: Array2<f64>,
+    /// `∂V/∂h`, `n × d_in`.
+    pub inputs: Array2<f64>,
+    /// `∂V/∂R_j`, `d_in × r_j`: the design leg plus the penalty leg.
+    pub right_factors: Vec<Array2<f64>>,
+    /// `∂V/∂Y`, `n × d_out`.
+    pub responses: Array2<f64>,
+}
+
+/// The block's cotangents where the REML owner's envelope forms are the total
+/// derivative, or the typed reason they are not.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GaussianBlockCotangentOutcome {
+    /// Every smoothing strength is interior.
+    Interior(GaussianBlockCotangents),
+    /// Some smoothing strength is railed or unaudited. The owner's domain edge moves
+    /// with the design and the penalties, so its envelope forms miss that edge's motion
+    /// and none is returned.
+    RhoAtDomainBound {
+        placement: Vec<GaussianRemlMultiPenaltyRhoPlacement>,
+    },
+}
+
+/// `∂V/∂(β, h, R, Y)` at the block's certified fit, for the rows and right factors it
+/// was built from.
+///
+/// The REML owner differentiates `V`: `data_gradient` gives `∂V/∂X` and `∂V/∂Y`, and
+/// `penalty_gradient` gives each `∂V/∂P_k`. This function only pulls them back:
+/// `∂V/∂X` through [`block_design_adjoint`], and each `∂V/∂P_k` through the penalty
+/// chain of [`GaussianBlockCotangents`].
+///
+/// Refuses, typed:
+/// * right factors whose values differ from the fit's (`RightFactorsChanged`);
+/// * moments, inputs or responses whose design or response differs from the fit's
+///   (the owner's refusal, as `Reml`).
+///
+/// A railed or unaudited smoothing strength returns
+/// [`GaussianBlockCotangentOutcome::RhoAtDomainBound`], never a partial gradient.
+pub fn gaussian_block_cotangents(
+    fit: &GaussianBlockFit,
+    rows: GaussianBlockRows<'_>,
+    right_factors: &[ArrayView2<'_, f64>],
+) -> Result<GaussianBlockCotangentOutcome, GaussianBlockError> {
+    if right_factors.len() != fit.right_factor_fingerprints.len() {
+        return Err(GaussianBlockError::RightFactorsChanged {
+            basis: fit.right_factor_fingerprints.len(),
+        });
+    }
+    if let Some(basis) = right_factors
+        .iter()
+        .zip(fit.right_factor_fingerprints.iter())
+        .position(|(factor, &fingerprint)| array2_bits_fingerprint(factor) != fingerprint)
+    {
+        return Err(GaussianBlockError::RightFactorsChanged { basis });
+    }
+    // The shapes the design is rebuilt at; the owner then refuses any value that differs from the fit's.
+    let (n, basis) = rows.moments.dim();
+    if basis != right_factors.len() {
+        return Err(GaussianBlockError::RightFactorCount {
+            basis,
+            right_factors: right_factors.len(),
+        });
+    }
+    if rows.inputs.nrows() != n {
+        return Err(GaussianBlockError::RowCountMismatch {
+            what: "inputs",
+            rows: rows.inputs.nrows(),
+            expected: n,
+        });
+    }
+    if let Some(index) = right_factors
+        .iter()
+        .position(|factor| factor.nrows() != rows.inputs.ncols())
+    {
+        return Err(GaussianBlockError::RightFactorShape {
+            basis: index,
+            rows: right_factors[index].nrows(),
+            rank: right_factors[index].ncols(),
+            input_dim: rows.inputs.ncols(),
+        });
+    }
+    let design = block_design(rows.moments, rows.inputs, right_factors);
+    let data = match fit
+        .problem
+        .data_gradient(design.view(), rows.responses, &fit.reml)
+        .map_err(GaussianBlockError::Reml)?
+    {
+        GaussianRemlMultiPenaltyDataGradientOutcome::Interior(gradient) => gradient,
+        GaussianRemlMultiPenaltyDataGradientOutcome::RhoAtDomainBound { placement } => {
+            return Ok(GaussianBlockCotangentOutcome::RhoAtDomainBound { placement });
+        }
+    };
+    let penalty_gradients = match fit
+        .problem
+        .penalty_gradient(&fit.reml)
+        .map_err(GaussianBlockError::Reml)?
+    {
+        GaussianRemlMultiPenaltyPenaltyGradientOutcome::Interior { gradients, .. } => gradients,
+        GaussianRemlMultiPenaltyPenaltyGradientOutcome::RhoAtDomainBound { placement } => {
+            return Ok(GaussianBlockCotangentOutcome::RhoAtDomainBound { placement });
+        }
+    };
+    let design_leg = block_design_adjoint(data.grad_x.view(), rows.moments, rows.inputs, right_factors)?;
+    let offsets = design_offsets(right_factors);
+    let mut right = design_leg.right_factors;
+    for (field_penalty, gradient) in fit.field_penalties.iter().zip(penalty_gradients.iter()) {
+        for (j, total) in right.iter_mut().enumerate() {
+            for (l, factor) in right_factors.iter().enumerate() {
+                let block = gradient.slice(s![offsets[l]..offsets[l + 1], offsets[j]..offsets[j + 1]]);
+                total.scaled_add(field_penalty[[j, l]] + field_penalty[[l, j]], &factor.dot(&block));
+            }
+        }
+    }
+    Ok(GaussianBlockCotangentOutcome::Interior(GaussianBlockCotangents {
+        moments: design_leg.moments,
+        inputs: design_leg.inputs,
+        right_factors: right,
+        responses: data.grad_y,
+    }))
 }
 
 /// A lower bound on the block's peak dense state in bytes, or `None` on overflow.
@@ -999,6 +1161,7 @@ mod experiment_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gam_linalg::faer_ndarray::FaerEigh;
     use ndarray::{Array1, array};
 
     const COMPONENTS: usize = 3;
@@ -1666,6 +1829,299 @@ mod tests {
         let admitted =
             block_design_adjoint(wide.view(), data.moments.view(), data.inputs.view(), &right);
         assert!(admitted.is_ok(), "the design's own width must be admitted, got {admitted:?}");
+    }
+
+    /// A block whose design-order coefficients are drawn from its own prior at unit
+    /// strengths, `B ~ N(0, (P_0 + P_1)⁻¹)` per output, with unit noise: both field
+    /// penalties are material, so the REML optimum is interior. 3 masks × 20 inputs, 8
+    /// outputs.
+    fn prior_fixture() -> Fixture {
+        const INPUTS: usize = 20;
+        const OUTPUTS: usize = 8;
+        let base = fixture(&SUFFICIENCY_MASKS, generic_right_factors());
+        let right = base.right_views();
+        let n = SUFFICIENCY_MASKS.len() * INPUTS;
+        let mut state = 0x2946_2951_u64;
+        let mut draw = || {
+            gam_math::probability::standard_normal_from_uniform_bits(gam_linalg::utils::splitmix64(&mut state))
+                .expect("a standard normal draw")
+        };
+        let component_masks =
+            Array2::from_shape_fn((n, COMPONENTS), |(row, c)| SUFFICIENCY_MASKS[row / INPUTS].0[c]);
+        let residual_masks = Array1::from_shape_fn(n, |row| SUFFICIENCY_MASKS[row / INPUTS].1);
+        let moments = Array2::from_shape_fn((n, BASIS), |(row, j)| moment(SUFFICIENCY_MASKS[row / INPUTS])[j]);
+        let inputs = Array2::from_shape_fn((n, INPUT_DIM), |(row, i)| {
+            (0.7 * (row % INPUTS) as f64 + 1.1 * i as f64 + 0.3).sin()
+        });
+        let precision = &block_penalty(0, base.penalty.view(), &right).expect("the energy block penalty")
+            + &block_penalty(1, base.null_penalty.view(), &right).expect("the null-space block penalty");
+        let (values, vectors) = precision
+            .eigh(faer::Side::Lower)
+            .expect("the prior precision's spectrum");
+        assert!(values.iter().all(|&value| value > 0.0), "the summed prior must be proper: {values:?}");
+        let standard = Array2::from_shape_simple_fn((precision.nrows(), OUTPUTS), &mut draw);
+        let coefficients = vectors.dot(&Array2::from_shape_fn(standard.dim(), |(row, col)| {
+            standard[[row, col]] / values[row].sqrt()
+        }));
+        let design = block_design(moments.view(), inputs.view(), &right);
+        let noise = Array2::from_shape_simple_fn((n, OUTPUTS), &mut draw);
+        let responses = design.dot(&coefficients) + noise;
+        Fixture {
+            component_masks,
+            residual_masks,
+            moments,
+            inputs,
+            responses,
+            right: base.right.clone(),
+            penalty: base.penalty.clone(),
+            null_penalty: base.null_penalty.clone(),
+        }
+    }
+
+    /// `V(ρ)` and its rounding bound for the block rebuilt from these arrays, at a fixed `ρ`.
+    fn block_criterion_at(
+        rho: ArrayView1<'_, f64>,
+        moments: &Array2<f64>,
+        inputs: &Array2<f64>,
+        right: &[Array2<f64>],
+        responses: &Array2<f64>,
+        penalties: &[ArrayView2<'_, f64>],
+    ) -> (f64, f64) {
+        let right_views: Vec<ArrayView2<'_, f64>> = right.iter().map(|factor| factor.view()).collect();
+        let design = block_design(moments.view(), inputs.view(), &right_views);
+        let assembled = penalties
+            .iter()
+            .enumerate()
+            .map(|(k, penalty)| block_penalty(k, *penalty, &right_views).expect("a perturbed block penalty"))
+            .collect::<Vec<_>>();
+        let evaluation = GaussianRemlMultiPenaltyProblem::new(design.view(), responses.view(), &assembled, 0)
+            .expect("a perturbed block problem")
+            .evaluate(rho)
+            .expect("a perturbed block evaluation");
+        (evaluation.reml_score, evaluation.reml_score_roundoff)
+    }
+
+    /// Central differences of `score` at `h` and `2h`: `D_h` and its band, the Richardson
+    /// remainder `|D_2h − D_h|/3` plus both differences' rounding over their steps.
+    fn richardson(score: impl Fn(f64) -> (f64, f64), step: f64) -> (f64, f64) {
+        let central = |h: f64| {
+            let (above, above_rounding) = score(h);
+            let (below, below_rounding) = score(-h);
+            ((above - below) / (2.0 * h), (above_rounding + below_rounding) / (2.0 * h))
+        };
+        let (at_h, rounding_h) = central(step);
+        let (at_2h, rounding_2h) = central(2.0 * step);
+        (at_h, (at_2h - at_h).abs() / 3.0 + (4.0 * rounding_h + rounding_2h) / 3.0)
+    }
+
+    fn inner(left: &Array2<f64>, right: &Array2<f64>) -> f64 {
+        left.iter().zip(right.iter()).map(|(a, b)| a * b).sum()
+    }
+
+    fn root_mean_square(matrix: &Array2<f64>) -> f64 {
+        (matrix.iter().map(|value| value * value).sum::<f64>() / matrix.len() as f64).sqrt()
+    }
+
+    #[test]
+    fn block_cotangents_match_central_differences_of_the_criterion_along_every_leg() {
+        let data = prior_fixture();
+        let right = data.right_views();
+        let penalties = data.penalty_views();
+        let fit = fit_gaussian_coefficient_block(data.rows(), &right, &penalties)
+            .expect("the prior fixture is admitted and fitted");
+        assert!(
+            fit.reml
+                .rho_placement
+                .iter()
+                .all(|placement| *placement == GaussianRemlMultiPenaltyRhoPlacement::Interior),
+            "precondition: the prior fixture's strengths must be interior; placement {:?}",
+            fit.reml.rho_placement
+        );
+        let cotangents = match gaussian_block_cotangents(&fit, data.rows(), &right)
+            .expect("the block cotangents at an interior fit")
+        {
+            GaussianBlockCotangentOutcome::Interior(cotangents) => cotangents,
+            other => panic!("an interior fit must return the block cotangents, got {other:?}"),
+        };
+        let rho = fit.reml.evaluation.rho.clone();
+
+        // One direction per leg, scaled to the leg's own magnitude so the difference resolves it.
+        let mut state = 0x2951_0001_u64;
+        let mut draw = || {
+            gam_math::probability::standard_normal_from_uniform_bits(gam_linalg::utils::splitmix64(&mut state))
+                .expect("a standard normal draw")
+        };
+        let mut direction = |like: &Array2<f64>| {
+            Array2::from_shape_simple_fn(like.dim(), &mut draw) * root_mean_square(like)
+        };
+        let d_moments = direction(&data.moments);
+        let d_inputs = direction(&data.inputs);
+        let d_responses = direction(&data.responses);
+        let d_right: Vec<Array2<f64>> = data.right.iter().map(|factor| direction(factor)).collect();
+        let step = f64::EPSILON.cbrt();
+        let criterion = |moments: &Array2<f64>, inputs: &Array2<f64>, right: &[Array2<f64>], responses: &Array2<f64>| {
+            block_criterion_at(rho.view(), moments, inputs, right, responses, &penalties)
+        };
+        let check = |leg: &str, analytic: f64, (difference, band): (f64, f64)| {
+            assert!(
+                analytic.abs() > band,
+                "{leg}: the directional derivative {analytic:.3e} must exceed the band {band:.3e}, or agreement \
+                 is vacuous"
+            );
+            assert!(
+                (difference - analytic).abs() <= band,
+                "{leg}: central difference {difference:.9e} vs cotangent {analytic:.9e}, band {band:.3e}"
+            );
+        };
+        check(
+            "∂V/∂β",
+            inner(&cotangents.moments, &d_moments),
+            richardson(
+                |h| criterion(&(&data.moments + &(&d_moments * h)), &data.inputs, &data.right, &data.responses),
+                step,
+            ),
+        );
+        check(
+            "∂V/∂h",
+            inner(&cotangents.inputs, &d_inputs),
+            richardson(
+                |h| criterion(&data.moments, &(&data.inputs + &(&d_inputs * h)), &data.right, &data.responses),
+                step,
+            ),
+        );
+        check(
+            "∂V/∂Y",
+            inner(&cotangents.responses, &d_responses),
+            richardson(
+                |h| criterion(&data.moments, &data.inputs, &data.right, &(&data.responses + &(&d_responses * h))),
+                step,
+            ),
+        );
+        let perturbed_right = |h: f64| -> Vec<Array2<f64>> {
+            data.right
+                .iter()
+                .zip(d_right.iter())
+                .map(|(factor, change)| factor + &(change * h))
+                .collect()
+        };
+        let right_difference = richardson(
+            |h| criterion(&data.moments, &data.inputs, &perturbed_right(h), &data.responses),
+            step,
+        );
+        let right_analytic: f64 = cotangents
+            .right_factors
+            .iter()
+            .zip(d_right.iter())
+            .map(|(cotangent, change)| inner(cotangent, change))
+            .sum();
+        check("∂V/∂R", right_analytic, right_difference);
+
+        // Mutant: the right factors' cotangent without the penalty chain, i.e. what the design
+        // adjoint alone gives from the owner's data gradient, is resolved apart.
+        let design = block_design(data.moments.view(), data.inputs.view(), &right);
+        let data_gradient = match fit
+            .problem
+            .data_gradient(design.view(), data.responses.view(), &fit.reml)
+            .expect("the owner's data gradient")
+        {
+            GaussianRemlMultiPenaltyDataGradientOutcome::Interior(gradient) => gradient,
+            other => panic!("an interior fit must return the data gradient, got {other:?}"),
+        };
+        let design_only = block_design_adjoint(
+            data_gradient.grad_x.view(),
+            data.moments.view(),
+            data.inputs.view(),
+            &right,
+        )
+        .expect("the design adjoint of the owner's data gradient");
+        let mutant: f64 = design_only
+            .right_factors
+            .iter()
+            .zip(d_right.iter())
+            .map(|(cotangent, change)| inner(cotangent, change))
+            .sum();
+        let (difference, band) = right_difference;
+        assert!(
+            (difference - mutant).abs() > band,
+            "mutant: the design leg alone gives {mutant:.9e}, inside the band {band:.3e} of {difference:.9e}, so \
+             the penalty chain is not resolved"
+        );
+    }
+
+    #[test]
+    fn block_cotangents_refuse_arrays_the_fit_was_not_built_from() {
+        let data = prior_fixture();
+        let right = data.right_views();
+        let fit = fit_gaussian_coefficient_block(data.rows(), &right, &data.penalty_views())
+            .expect("the prior fixture is admitted and fitted");
+        assert!(
+            matches!(
+                gaussian_block_cotangents(&fit, data.rows(), &right),
+                Ok(GaussianBlockCotangentOutcome::Interior(..))
+            ),
+            "control: the fit's own rows and right factors are served"
+        );
+        let one_ulp = |matrix: &Array2<f64>| {
+            let mut changed = matrix.clone();
+            changed[[0, 0]] = f64::from_bits(changed[[0, 0]].to_bits() + 1);
+            changed
+        };
+
+        let responses = one_ulp(&data.responses);
+        let mut rows = data.rows();
+        rows.responses = responses.view();
+        match gaussian_block_cotangents(&fit, rows, &right) {
+            Err(GaussianBlockError::Reml(error)) => assert!(
+                error.to_string().contains("refuses `y`"),
+                "a response one ulp away must be refused by the owner, naming y: {error}"
+            ),
+            other => panic!("a response one ulp away must be refused typed, got {other:?}"),
+        }
+
+        let moments = one_ulp(&data.moments);
+        let mut rows = data.rows();
+        rows.moments = moments.view();
+        match gaussian_block_cotangents(&fit, rows, &right) {
+            Err(GaussianBlockError::Reml(error)) => assert!(
+                error.to_string().contains("refuses `x`"),
+                "a moment one ulp away changes the design, so the owner must refuse it naming x: {error}"
+            ),
+            other => panic!("a moment one ulp away must be refused typed, got {other:?}"),
+        }
+
+        let changed_factor = one_ulp(&data.right[1]);
+        let mut changed_right = right.clone();
+        changed_right[1] = changed_factor.view();
+        assert!(
+            matches!(
+                gaussian_block_cotangents(&fit, data.rows(), &changed_right),
+                Err(GaussianBlockError::RightFactorsChanged { basis: 1 })
+            ),
+            "a right factor one ulp away must be refused, naming basis 1"
+        );
+        assert!(
+            matches!(
+                gaussian_block_cotangents(&fit, data.rows(), &right[..BASIS - 1]),
+                Err(GaussianBlockError::RightFactorsChanged { basis }) if basis == BASIS
+            ),
+            "a missing right factor must be refused"
+        );
+    }
+
+    #[test]
+    fn block_cotangents_return_a_railed_strength_typed() {
+        let data = prior_fixture();
+        let right = data.right_views();
+        let mut fit = fit_gaussian_coefficient_block(data.rows(), &right, &data.penalty_views())
+            .expect("the prior fixture is admitted and fitted");
+        let mut railed = fit.reml.rho_placement.clone();
+        railed[1] = GaussianRemlMultiPenaltyRhoPlacement::UpperBound;
+        fit.reml.rho_placement = railed.clone();
+        assert_eq!(
+            gaussian_block_cotangents(&fit, data.rows(), &right).expect("a railed fit is not an error"),
+            GaussianBlockCotangentOutcome::RhoAtDomainBound { placement: railed },
+            "a railed strength must return the typed outcome, never a partial gradient"
+        );
     }
 }
 

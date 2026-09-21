@@ -1252,19 +1252,20 @@ fn degree_energies_converge_to_the_blocks_explained_variance_within_the_envelope
         for frame in &frames {
             let variance = block
                 .explained_variance(frame.view())
-                .expect("admissible frame");
+                .expect("admissible frame")
+                .value;
             let coordinates = block.readers().dot(frame);
             let total = BandedEnergy {
                 value: variance,
                 band: zero_mean_variance_band(&block, &coordinates),
             };
             if frame.ncols() == block.input_dim() {
-                let gap = (variance - block.total_variance()).abs();
+                let gap = (variance - block.total_variance().value).abs();
                 assert!(
                     gap <= 2.0 * total.band,
                     "{activation:?} V(I) through the identity frame {variance} against the block's \
                      total {}: gap {gap:e}, band {:e}",
-                    block.total_variance(),
+                    block.total_variance().value,
                     2.0 * total.band
                 );
             }
@@ -1553,7 +1554,8 @@ fn coordinate_variance(block: &KnownBlock, kept: &[usize]) -> BandedEnergy {
     let frame = coordinate_frame(block.input_dim(), kept);
     let value = block
         .explained_variance(frame.view())
-        .expect("admissible coordinate frame");
+        .expect("admissible coordinate frame")
+        .value;
     let coordinates = block.readers().dot(&frame);
     BandedEnergy {
         value,

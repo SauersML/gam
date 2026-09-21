@@ -265,6 +265,20 @@ pub fn trace_penalty_covariance_in_orthogonal_basis(
     trace_reduced_penalty_covariance(&reduced, covariance_basis)
 }
 
+/// The tolerance at or below which [`classify_eigenvalues_strict`] snaps a
+/// `dim`-dimensional symmetric spectrum of magnitude `scale` to exact zero: the
+/// larger of the eigensolver's machine floor `64·ε·dim·scale` and the relative
+/// numerically-PSD floor `REL_PSD_FLOOR·scale` (#1619). A split whose null modes
+/// were classified through this snap carries it as its cut, so the leakage guard
+/// reads the same number the classifier used.
+fn strict_psd_snap_tolerance(dim: usize, scale: f64) -> f64 {
+    const C_EPS_P_FACTOR: f64 = 64.0;
+    let machine_floor = C_EPS_P_FACTOR * f64::EPSILON * (dim.max(1) as f64) * scale;
+    machine_floor
+        .max(REL_PSD_FLOOR * scale)
+        .max(f64::MIN_POSITIVE)
+}
+
 /// Strict spectral classifier used as a final guard on penalty eigendecompositions.
 ///
 /// Penalty matrices fed to the GAM solver are required to be PSD by construction.
@@ -288,11 +302,6 @@ fn classify_eigenvalues_strict(
     eigenvalues: &mut [f64],
     context: &str,
 ) -> Result<(), EstimationError> {
-    const C_EPS_P_FACTOR: f64 = 64.0;
-    // `REL_PSD_FLOOR` (module-level): the relative threshold below which a
-    // (possibly slightly negative) eigenvalue is roundoff and is snapped to zero
-    // rather than rejected. Shared with the subspace-leakage guard so the null
-    // definition and the leakage tolerance stay mutually consistent.
     let p = eigenvalues.len();
 
     let mut scale = 0.0_f64;
@@ -307,16 +316,7 @@ fn classify_eigenvalues_strict(
         scale = scale.max(val.abs());
     }
 
-    // p * eps captures the rounding floor of a symmetric eigendecomposition of a
-    // p-dimensional matrix; multiplying by `scale` lifts the floor to the actual
-    // magnitude of the spectrum. For large high-rank penalties assembled at
-    // extreme λ this machine floor (~12×ε relative) is tighter than the roundoff
-    // actually produced, so we take the larger of it and a relative numerically-PSD
-    // floor `REL_PSD_FLOOR * scale` (#1619).
-    let machine_floor = C_EPS_P_FACTOR * f64::EPSILON * (p.max(1) as f64) * scale;
-    let tolerance = machine_floor
-        .max(REL_PSD_FLOOR * scale)
-        .max(f64::MIN_POSITIVE);
+    let tolerance = strict_psd_snap_tolerance(p, scale);
 
     for (idx, val) in eigenvalues.iter_mut().enumerate() {
         if val.abs() <= tolerance {
@@ -487,33 +487,30 @@ fn assess_subspace_leakage(
 /// The split has two independent invariants:
 ///
 /// 1. **Orthogonality** — `Qs = [Q_p | Q_n]` must be orthonormal, so the range
-///    and null blocks share no direction (`max |Qp'Qn| ≤ orth_tol`). This is the
-///    structural correctness guarantee and is checked at machine precision.
+///    and null blocks share no direction. A backward-stable symmetric eigensolver
+///    returns eigenvectors orthonormal to `p·ε`, and each entry of `Qp'Qn` is an
+///    inner product of `p` terms whose absolute sum is at most 1 (Cauchy–Schwarz
+///    on unit vectors), so its rounding is at most `γ_p`
+///    ([`gam_linalg::roundoff::accumulation_growth`]). An entry above
+///    `γ_p + p·ε` is a split that is not orthonormal.
 ///
-/// 2. **Bounded root leakage** — the transformed penalty root must have
-///    negligible energy on the null columns. The admissible relative-energy
-///    leakage is DERIVED from `REL_PSD_FLOOR`, the same numerically-PSD floor
-///    that `classify_eigenvalues_strict` uses to decide which modes are null:
-///    a mode the classifier is entitled to call null can, by the symmetric
-///    eigensolver's own eigenvector accuracy on a small-gap spectrum, retain up
-///    to `REL_PSD_FLOOR` of the penalty root's relative energy in that direction.
-///    Summed over the at-most-`p` near-threshold null modes the relative leakage
-///    cannot exceed `p · REL_PSD_FLOOR` without signalling a genuine
-///    (non-numerical) inconsistency, so that is the derived tolerance — matching
-///    the `p`-scaling `classify_eigenvalues_strict` already applies to its
-///    machine floor. Demanding a leakage tighter than the very floor that
-///    defined the null space is self-contradictory: it rejects well-posed smooth
-///    manifold / Duchon / sphere penalties whose Laplace-Beltrami spectrum decays
-///    through the classification threshold with no clean rank gap (#1802), even
-///    though the downstream penalty (`E'E`) is rebuilt with an EXACTLY clean null
-///    block regardless. The absolute floor keeps a vanishing-scale penalty from
-///    tripping the relative test on pure roundoff.
-fn subspace_split_is_consistent(leakage: &SubspaceLeakageMetrics, p: usize) -> bool {
-    let leakage_rel_tol = (p.max(1) as f64) * REL_PSD_FLOOR;
-    let leakage_abs_tol = 1e-12;
-    let orth_tol = 1e-10;
-    let root_leaks = leakage.max_rel_sq > leakage_rel_tol && leakage.max_abs_sq > leakage_abs_tol;
-    let split_nonorthogonal = leakage.max_cross_gram_abs > orth_tol;
+/// 2. **Bounded root leakage** — a penalty root's relative energy on the null
+///    columns must not exceed `null_leakage_bound`, the bound the split carries
+///    from the cut that classified its null modes (see `ReparamInvariant`). A
+///    manifold / Duchon / sphere penalty whose spectrum decays through that cut
+///    with no clean gap (#1802) leaves null energy inside the bound by
+///    construction. The test is relative, so a penalty gets the same verdict at
+///    every scale. An absolute energy floor beside it would admit any leakage
+///    from a small enough penalty.
+fn subspace_split_is_consistent(
+    leakage: &SubspaceLeakageMetrics,
+    null_leakage_bound: f64,
+    p: usize,
+) -> bool {
+    let orth_band =
+        gam_linalg::roundoff::accumulation_growth(p) + (p.max(1) as f64) * f64::EPSILON;
+    let root_leaks = leakage.max_rel_sq > null_leakage_bound;
+    let split_nonorthogonal = leakage.max_cross_gram_abs > orth_band;
     !(root_leaks || split_nonorthogonal)
 }
 
@@ -1447,6 +1444,41 @@ pub fn canonicalize_penalty_spec(
         }));
     }
 
+    // ── Energy-factor path: root from SVD(A), never from AᵀA's eigensystem ──
+    if let Some(PenaltyStructureHint::EnergyFactor(factor)) = hint {
+        if factor.ncols() != block_dim {
+            crate::bail_invalid_estim!(
+                "{context}: penalty {idx} energy factor has {} columns but the block has {block_dim}",
+                factor.ncols()
+            );
+        }
+        let partition = gam_linalg::roundoff::factor_rank_partition(factor).map_err(|err| {
+            EstimationError::InvalidInput(format!(
+                "{context}: energy-factor canonicalization failed at index {idx}: {err}"
+            ))
+        })?;
+        if partition.rank == 0 {
+            return Ok(None);
+        }
+        let root = partition.root_rows(partition.rank);
+        let positive_eigenvalues = partition.singular_values[..partition.rank]
+            .iter()
+            .map(|sigma| sigma * sigma)
+            .collect();
+        let mut local_sym = local_matrix.to_owned();
+        symmetrize_in_place(&mut local_sym);
+        return Ok(Some(CanonicalPenalty {
+            root,
+            col_range,
+            total_dim: p,
+            nullity: block_dim - partition.rank,
+            local: local_sym,
+            prior_mean,
+            positive_eigenvalues,
+            op,
+        }));
+    }
+
     // ── Generic block-local path: eigendecompose at O(block_dim³) ──
     let local_owned = local_matrix.to_owned();
     let analysis = analyze_penalty_block(&local_owned).map_err(|err| {
@@ -1976,6 +2008,21 @@ pub fn balanced_penalty_rank_tolerance(max_balanced_eigenvalue: f64) -> f64 {
     }
 }
 
+/// One block's `ReparamInvariant::null_leakage_bound`: the null count times the
+/// cut that classified the null modes of the balanced spectrum `eigenvalues`
+/// (largest magnitude `max_balanced_eigenvalue`), plus the eigensolver's rounding
+/// band on that spectrum.
+fn split_null_leakage_bound(
+    eigenvalues: &[f64],
+    null_count: usize,
+    max_balanced_eigenvalue: f64,
+) -> f64 {
+    let cut = strict_psd_snap_tolerance(eigenvalues.len(), max_balanced_eigenvalue)
+        .max(balanced_penalty_rank_tolerance(max_balanced_eigenvalue));
+    null_count as f64
+        * (cut + gam_linalg::roundoff::symmetric_spectrum_rounding_band(eigenvalues))
+}
+
 /// Structural rank of a set of penalty components: the number of eigenvalues of
 /// [`balanced_penalty_sum`] above [`balanced_penalty_rank_tolerance`]. This is
 /// the rank the reparameterization's penalized subspace has, and the rank the
@@ -2081,6 +2128,19 @@ pub struct ReparamInvariant {
     /// Largest eigenvalue of the balanced (unit-Frobenius) penalty matrix.
     /// Used as the scale reference for the shrinkage floor.
     max_balanced_eigenvalue: f64,
+    /// The largest relative energy a penalty root can leave on the split's null
+    /// columns while the split is consistent.
+    ///
+    /// For a PSD component `S_k` of the balanced sum `B = Σ_j S_j/‖S_j‖_F`,
+    /// `S_k ⪯ ‖S_k‖_F·B` and `tr S_k ≥ ‖S_k‖_F`, so the root's relative energy on
+    /// the null columns is at most `Σ_null μ_j(B)`. Each null mode lies at or below
+    /// the cut that classified it (the larger of [`strict_psd_snap_tolerance`] and
+    /// [`balanced_penalty_rank_tolerance`]), and its computed eigenvector adds the
+    /// eigensolver's rounding band on `B`. A block's bound is its null count times
+    /// that cut plus band. Roots are block-local, so the split's bound is the
+    /// largest block's. Every term is read off the unit-Frobenius balanced
+    /// spectrum, so the bound does not move when a penalty is rescaled.
+    null_leakage_bound: f64,
 }
 
 /// Precompute the lambda-invariant reparameterization structure from canonical penalties.
@@ -2103,6 +2163,7 @@ pub fn precompute_reparam_invariant_from_canonical(
             qs_base: Array2::eye(p_total),
             has_nonzero: false,
             max_balanced_eigenvalue: 0.0,
+            null_leakage_bound: 0.0,
         });
     }
 
@@ -2134,6 +2195,7 @@ pub fn precompute_reparam_invariant_from_canonical(
             qs_base: Array2::eye(p_total),
             has_nonzero: false,
             max_balanced_eigenvalue: 0.0,
+            null_leakage_bound: 0.0,
         });
     }
 
@@ -2198,12 +2260,15 @@ pub fn precompute_reparam_invariant_from_canonical(
             .take_while(|&&idx| bal_eigenvalues[idx] > rank_tol)
             .count();
         let split = SubspaceSplit::from_ordered_qs(&qs, penalized_rank, p_total)?;
+        let null_leakage_bound =
+            split_null_leakage_bound(&bal_eigenvalues, p_total - penalized_rank, max_bal);
 
         return Ok(ReparamInvariant {
             split,
             qs_base: mat_to_array(&qs),
             has_nonzero,
             max_balanced_eigenvalue: max_bal,
+            null_leakage_bound,
         });
     }
 
@@ -2228,6 +2293,8 @@ pub fn precompute_reparam_invariant_from_canonical(
         q_null_local: Array2<f64>, // block_dim × null_rank
         /// Largest balanced eigenvalue contributed by this block.
         max_balanced_eigenvalue: f64,
+        /// This block's `null_leakage_bound` (see [`ReparamInvariant`]).
+        null_leakage_bound: f64,
         /// Column offset of this block's penalized directions within global Q_pen.
         pen_col_offset: usize,
         /// Column offset of this block's null directions within global Q_null.
@@ -2264,6 +2331,7 @@ pub fn precompute_reparam_invariant_from_canonical(
                         q_pen_local: Array2::zeros((block_dim, 0)),
                         q_null_local: Array2::eye(block_dim),
                         max_balanced_eigenvalue: 0.0,
+                        null_leakage_bound: 0.0,
                         pen_col_offset: 0,  // set later
                         null_col_offset: 0, // set later
                     });
@@ -2291,6 +2359,8 @@ pub fn precompute_reparam_invariant_from_canonical(
                     .take_while(|&&idx| bal_eigenvalues[idx] > rank_tol)
                     .count();
                 let null_count = block_dim - penalized_rank;
+                let null_leakage_bound =
+                    split_null_leakage_bound(&bal_eigenvalues.to_vec(), null_count, max_bal);
 
                 let mut q_pen_local = Array2::zeros((block_dim, penalized_rank));
                 let mut q_null_local = Array2::zeros((block_dim, null_count));
@@ -2312,6 +2382,7 @@ pub fn precompute_reparam_invariant_from_canonical(
                     q_pen_local,
                     q_null_local,
                     max_balanced_eigenvalue: max_bal,
+                    null_leakage_bound,
                     pen_col_offset: 0,  // set later
                     null_col_offset: 0, // set later
                 })
@@ -2321,6 +2392,10 @@ pub fn precompute_reparam_invariant_from_canonical(
     let global_max_bal = block_results
         .iter()
         .map(|br| br.max_balanced_eigenvalue)
+        .fold(0.0_f64, f64::max);
+    let null_leakage_bound = block_results
+        .iter()
+        .map(|br| br.null_leakage_bound)
         .fold(0.0_f64, f64::max);
 
     // Compute column offsets for each block in the global Q_pen / Q_null layout.
@@ -2387,6 +2462,7 @@ pub fn precompute_reparam_invariant_from_canonical(
         qs_base: qs_global,
         has_nonzero,
         max_balanced_eigenvalue: global_max_bal,
+        null_leakage_bound,
     })
 }
 
@@ -2740,11 +2816,12 @@ pub fn stable_reparameterizationwith_invariant(
     // Guard against any accidental penalized/null mixing. The transformed penalty
     // roots must have negligible support on null columns by construction.
     let leakage = assess_subspace_leakage(&qs, &rs_transformed, structural_rank, p);
-    if !subspace_split_is_consistent(&leakage, p) {
+    if !subspace_split_is_consistent(&leakage, invariant.null_leakage_bound, p) {
         return Err(EstimationError::LayoutError(format!(
-            "Reparameterization subspace split is inconsistent: max null leakage {:.3e} (rel {:.3e}, worst penalty {}), max |Qp'Qn| {:.3e}",
+            "Reparameterization subspace split is inconsistent: max null leakage {:.3e} (rel {:.3e} against the split's bound {:.3e}, worst penalty {}), max |Qp'Qn| {:.3e}",
             leakage.max_abs_sq.sqrt(),
             leakage.max_rel_sq.sqrt(),
+            invariant.null_leakage_bound.sqrt(),
             leakage.worst_penalty,
             leakage.max_cross_gram_abs,
         )));

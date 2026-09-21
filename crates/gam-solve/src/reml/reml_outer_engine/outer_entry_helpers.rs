@@ -176,6 +176,9 @@ pub enum RemlLamlError {
     /// The inner mode is at a fold: its Laplace normalizer approximates no integral, so the trial
     /// point is refused, with no value or derivative standing in for one.
     InnerModeFold(InnerModeFold),
+    /// The constrained Laplace normalizer could not be formed at this trial point (gam#2765), so it
+    /// is refused with no value or derivative standing in for one.
+    ConeNormalizer(crate::constrained_posterior::ConeNormalizerRefusal),
     /// Any other failure, with its diagnostic.
     Failed(String),
 }
@@ -184,6 +187,7 @@ impl std::fmt::Display for RemlLamlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InnerModeFold(fold) => write!(f, "{fold}"),
+            Self::ConeNormalizer(refusal) => write!(f, "{refusal}"),
             Self::Failed(reason) => f.write_str(reason),
         }
     }
@@ -1573,11 +1577,16 @@ pub(crate) fn try_tangent_projected_evaluate(
         )));
     }
 
-    let constrained_mode_response: Arc<dyn HessianFactorization> =
-        match active_constraint_tangent_geometry(&block.a)? {
-            ActiveConstraintTangentGeometry::FullyPinned => {
-                Arc::new(FullyPinnedModeResponse { dimension: p })
-            }
+    // The KKT gradient's motion the constrained Laplace normalizer reads (gam#2765): on a face
+    // `ġ = M_true β̂̇ + ∂_θ∇F` with the same stationarity curvature the mode response solves.
+    let (constrained_mode_response, gradient_motion): (
+        Arc<dyn HessianFactorization>,
+        ConeGradientMotion,
+    ) = match active_constraint_tangent_geometry(&block.a)? {
+            ActiveConstraintTangentGeometry::FullyPinned => (
+                Arc::new(FullyPinnedModeResponse { dimension: p }),
+                ConeGradientMotion::Pinned,
+            ),
             ActiveConstraintTangentGeometry::Tangent(z) => {
                 // Differentiate the stationarity system the inner solve
                 // actually used, not the operator that owns the Laplace
@@ -1660,10 +1669,13 @@ pub(crate) fn try_tangent_projected_evaluate(
                             "constrained mode-response eigendecomposition failed: {error}"
                         )
                     })?;
-                Arc::new(TangentProjectedHessianOperator {
-                    z,
-                    h_t_op: response_tangent_op,
-                })
+                (
+                    Arc::new(TangentProjectedHessianOperator {
+                        z,
+                        h_t_op: response_tangent_op,
+                    }),
+                    ConeGradientMotion::OnFace(Arc::new(response_full)),
+                )
             }
         };
 
@@ -1699,6 +1711,12 @@ pub(crate) fn try_tangent_projected_evaluate(
         // Prevent recursive constrained-response installation. The operator
         // above already carries the active geometry.
         active_constraints: None,
+        cone_normalizer: solution.cone_normalizer.as_ref().map(|input| {
+            Arc::new(ConeNormalizerInput {
+                gradient_motion,
+                ..ConeNormalizerInput::clone(input)
+            })
+        }),
     };
     reml_laml_evaluate(&constrained, rho, mode, prior_cost_gradient).map(Some)
 }

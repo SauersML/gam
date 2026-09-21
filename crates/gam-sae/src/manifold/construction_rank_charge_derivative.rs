@@ -19,7 +19,7 @@ impl SaeManifoldTerm {
         atom: usize,
         assignments: &[f64],
     ) -> f64 {
-        if self.assignment.logits_are_fixed() {
+        if self.assignment.logit_is_fixed(wrt_atom) {
             return 0.0;
         }
         match self.assignment.mode {
@@ -165,7 +165,7 @@ impl SaeManifoldTerm {
             // `S(κ)`: `∂tr((G+λS)⁻¹G)/∂κ = −λ·tr((G+λS)⁻¹G(G+λS)⁻¹ ∂S/∂κ)`.
             let kappa_penalty_derivative = rho
                 .kappa_flat_index(atom_idx)
-                .zip(atom.smooth_penalty_kappa_derivative()?);
+                .zip(atom.smooth_penalty_kappa_derivative());
             if edf_is_interior {
                 // d tr((G+λS)⁻¹G) / dG = A⁻¹ − A⁻¹GA⁻¹.
                 // Writing this identity directly keeps the derivative paired to
@@ -345,12 +345,10 @@ impl SaeManifoldTerm {
                 gram,
                 occupancy,
                 p,
-                OutputNoiseSpectrum::isotropic(dispersion, p),
+                dispersion,
                 lambda[atom_idx],
                 Some(atom.smooth_penalty()),
             )?;
-            let mp_false_rank_probability_bound =
-                noise_null.false_rank_probability_bound(stratum.mp_reconstruction_rank_edge())?;
             let log_occupancy = occupancy.ln();
             if !(log_occupancy.is_finite() && log_occupancy > 0.0) {
                 return Err(format!(
@@ -397,7 +395,6 @@ impl SaeManifoldTerm {
                 nearest_mp_boundary: stratum.nearest_mp_boundary(),
                 stratum,
                 noise_null,
-                mp_false_rank_probability_bound,
                 tempered_posterior,
             });
         }

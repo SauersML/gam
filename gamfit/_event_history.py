@@ -297,6 +297,9 @@ class EventHistoryModel:
             "horizons": np.asarray(out["horizons"]),
             "survival": np.asarray(out["survival"]),
             "expected_counts": np.asarray(out["expected_counts"]),
+            "survival_error": np.asarray(out["survival_error"]),
+            "expected_count_errors": np.asarray(out["expected_count_errors"]),
+            "posterior_evaluations": int(out["posterior_evaluations"]),
         }
 
     def forecast(
@@ -311,7 +314,13 @@ class EventHistoryModel:
         mark — its cumulative incidence when terminal, its first-occurrence
         probability when once-only. ``future`` is the covariate path over the
         window: absent, the row in force at exit holds; a record holds
-        constant; ``[(start, record), ...]`` changes at the given times."""
+        constant; ``[(start, record), ...]`` changes at the given times.
+
+        Every forecast averages its final probabilities over the posterior of
+        the fit's parameters. ``survival_error`` and ``expected_count_errors``
+        are the checked errors of what is returned, the posterior integration's
+        included; ``posterior_evaluations`` is how many parameter states that
+        integration evaluated."""
         index = self._subject(subject)
         exit_ = float(self._native.subject_exits()[index])
         path = self._future(future, exit_)

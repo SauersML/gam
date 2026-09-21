@@ -22,6 +22,11 @@ pub struct SmoothTermSummary {
     /// user's requested `(degree, num_internal_knots)`. `None` means no
     /// shrink occurred (or the term is not a B-spline 1D smooth).
     pub basis_note: Option<String>,
+    /// #2901: the label a term's `edf` carries when a penalty block it spends is not
+    /// rank-bound certified ([`crate::estimate::EdfRankBound`]). That block's trace is
+    /// published raw, so `edf` may lie outside `[0, dim]` and is not clamped. `None`
+    /// when every block of the term is certified, or the fit recorded no bounds.
+    pub edf_rank_bound: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -470,6 +475,17 @@ impl fmt::Display for ModelSummary {
                 namew = smoothnamew
             )?;
         }
+        // #2901: a term spending an uncertified penalty block publishes its EDF
+        // unclamped, and says so here rather than in a number that looks clamped.
+        for term in &self.smooth_terms {
+            if let Some(label) = term.edf_rank_bound.as_deref() {
+                writeln!(
+                    f,
+                    "  {}: {label}; its effective degrees of freedom are published unclamped",
+                    term.name
+                )?;
+            }
+        }
         writeln!(f)?;
         let order_terms = self
             .smooth_terms
@@ -534,5 +550,47 @@ impl fmt::Display for ModelSummary {
             "Signif. codes: 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1"
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod edf_rank_bound_label_tests {
+    use super::*;
+
+    /// #2901: a smooth term whose EDF spends an uncertified penalty block names the
+    /// label beside the table, and a certified term adds no line.
+    #[test]
+    fn the_summary_names_an_uncertified_terms_edf_label_2901() {
+        let row = |name: &str, edf: f64, label: Option<&str>| SmoothTermSummary {
+            name: name.to_string(),
+            edf,
+            ref_df: edf.max(0.0),
+            chi_sq: None,
+            pvalue: None,
+            continuous_order: None,
+            basis_note: None,
+            edf_rank_bound: label.map(str::to_string),
+        };
+        let summary = ModelSummary {
+            family: "gaussian".to_string(),
+            deviance_explained: None,
+            reml_score: None,
+            raw_reml_score: None,
+            parametric_terms: Vec::new(),
+            smooth_terms: vec![
+                row("s(x1)", 3.2, None),
+                row("s(x2)", 5.0003, Some("rank bound not certified")),
+            ],
+            coefficient_se_source: None,
+        };
+        let text = summary.to_string();
+        assert!(
+            text.contains(
+                "s(x2): rank bound not certified; its effective degrees of freedom are published \
+                 unclamped"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("s(x1): rank bound"), "{text}");
     }
 }

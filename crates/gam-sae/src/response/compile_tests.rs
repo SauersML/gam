@@ -171,7 +171,7 @@ fn a_planted_smooth_function_of_a_planted_subspace_is_recovered() {
     ];
     let activation = GaussianActivation::ExactGelu;
     let block = known_block(readers.clone(), activation);
-    let total_variance = block.total_variance();
+    let total_variance = block.total_variance().value;
     assert!(total_variance > 0.0, "the planted block has output variance {total_variance}");
     let design = CompileDesign::pilot(TRAINING_DRAWS, HOLDOUT_DRAWS, 2);
     let compiled = compile_retained_response(&block, retained_frame().view(), design, 2_946_051)
@@ -284,7 +284,7 @@ fn mean_squared_row_gap(left: &Array2<f64>, right: &Array2<f64>) -> f64 {
 /// training design (`n·p` products). A REML fit that rails a penalty at the lower edge of its resolvability domain
 /// shrinks each direction it penalizes by at most `√ε` of itself, a squared error of `ε` per penalty, under this bar.
 fn rounding_bar(block: &KnownBlock, compiled: &CompiledResponse) -> f64 {
-    block.total_variance() * accumulation_growth(TRAINING_DRAWS * compiled.price().function_coefficients)
+    block.total_variance().value * accumulation_growth(TRAINING_DRAWS * compiled.price().function_coefficients)
 }
 
 #[test]

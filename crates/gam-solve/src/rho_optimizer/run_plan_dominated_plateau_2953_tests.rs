@@ -11,9 +11,10 @@
 //! - The well plus a concave ridge along a second coordinate: the continuation certifies a
 //!   strict saddle whose escape cannot run, and the fit refuses with
 //!   `IncumbentUnescapableSaddle`, or propagates the escape search's fatal failure.
-//! - The well again, where the objective refuses to re-evaluate the checkpoint that beats the
-//!   flat top: the flat top is still declined on the checkpoint's stored value. The fit refuses
-//!   with `DominanceUnresolved`, unless a later plan attempt certifies below the checkpoint.
+//! - The well again, where the objective refuses to price the checkpoint that beats the flat
+//!   top at full inner fidelity: an unpriceable state cannot defeat a certified one, so the flat
+//!   top publishes carrying the checkpoint as an `UnpriceableCheckpoint`, and no later plan
+//!   attempt runs.
 //! - The well where a search cannot restart from a stored state: a continuation that certifies
 //!   the flat top it was started to replace, or a later plan attempt that certifies it again,
 //!   declines it on the state it started from instead of publishing it.
@@ -490,13 +491,12 @@ fn a_fatal_failure_of_the_saddle_escape_search_propagates_as_it_is_2953() {
     );
 }
 
-// The re-entry fixture: the checkpoint that beats the declined optimum cannot be re-evaluated
-// at its own ρ. The objective refuses, as an infeasible trial, a point it evaluated before its
-// latest reset, as an objective does whose inner state at a stored checkpoint a cold solve
-// cannot re-enter. The plan runner re-evaluates the checkpoint from a reset before it may
-// outrank the certified winner, so that re-evaluation is the first refusal. The well is
-// searched from inside its convex core, where a Newton-like step on the declared curvature
-// lands near the centre.
+// The re-entry fixture: the checkpoint that beats the certified flat top cannot be priced at its
+// own ρ. The objective refuses, as an infeasible trial, a point it evaluated before its latest
+// reset, as an objective does whose inner state at a stored checkpoint a cold solve cannot
+// re-enter. The plan runner prices the checkpoint from a reset before it may outrank the
+// certified winner, so that pricing is the first refusal. The well is searched from inside its
+// convex core, where a Newton-like step on the declared curvature lands near the centre.
 
 const REENTRY_START: f64 = -3.7;
 const REENTRY_MARKER: &str =
@@ -602,8 +602,52 @@ fn reentry_calibration(prefer_gradient_only: bool) -> Result<usize, EstimationEr
     Ok(problem.run(&mut objective, &label)?.iterations)
 }
 
+/// Assert that `published` is the neutral seed's flat top, certified and published over a
+/// checkpoint inside the well that the objective refused to price, which rides on it.
+fn assert_flat_top_published_over_the_unpriceable_checkpoint(published: &OuterResult) {
+    assert_eq!(published.rho.to_vec(), vec![0.0]);
+    assert_eq!(published.final_value.to_bits(), well_value(0.0).to_bits());
+    assert!(
+        published.dominated_plateau.is_none(),
+        "nothing was declined, so no declined optimum may ride on the result: {:?}",
+        published.dominated_plateau
+    );
+    let checkpoint = published
+        .unpriceable_checkpoint
+        .as_ref()
+        .expect("the checkpoint the winner was not judged against must ride on the result");
+    // The checkpoint is where the capped search stopped, inside the well, at its stored value.
+    assert!(
+        (checkpoint.rho[0] - CENTER).abs() < WIDTH,
+        "the unpriceable checkpoint must be the capped search inside the well; rho={:?}",
+        checkpoint.rho
+    );
+    assert_eq!(checkpoint.stored_value.to_bits(), well_value(checkpoint.rho[0]).to_bits());
+    assert!(
+        well_value(0.0) - checkpoint.stored_value > DEPTH / 2.0,
+        "the stored value must beat the flat top by far more than the envelope: {} against {}",
+        checkpoint.stored_value,
+        well_value(0.0)
+    );
+    assert!(
+        matches!(
+            &checkpoint.refusal,
+            CheckpointPriceRefusal::Refused(error) if error.contains(REENTRY_MARKER)
+        ),
+        "the checkpoint must be unpriceable because the objective refused it: {}",
+        checkpoint.refusal
+    );
+}
+
+/// The lead's 09-18 ruling: an unpriceable state can't defeat a certified one. This pin used to
+/// assert the opposite (d0407a670c): the objective refuses to price the checkpoint that beats
+/// the flat top, and the flat top was declined on the checkpoint's stored value, so the fit
+/// refused with `DominanceUnresolved`. A stored value is only where a search stopped, possibly
+/// under the search-time inner cap, and it is no evidence about the profiled criterion that
+/// certified the flat top. So the flat top publishes, carrying the checkpoint as an
+/// `UnpriceableCheckpoint`. The objective refuses one re-entry: the full-fidelity pricing.
 #[test]
-fn a_checkpoint_that_cannot_be_re_evaluated_still_declines_the_optimum_it_beats_2953() {
+fn a_checkpoint_refused_at_full_fidelity_cannot_defeat_the_certified_optimum_2953() {
     let bfgs_iterations = reentry_calibration(true)
         .expect("an unbounded BFGS search of the well from inside its core certifies its centre");
     assert!(
@@ -618,70 +662,37 @@ fn a_checkpoint_that_cannot_be_re_evaluated_still_declines_the_optimum_it_beats_
         FallbackPolicy::Disabled,
         "re-entry refusal #2953",
     );
-    let mut objective = reentry_objective!(problem, usize::MAX, Arc::clone(&refusals));
-    let error = problem
+    let mut objective = reentry_objective!(problem, 1, Arc::clone(&refusals));
+    let published = problem
         .run(&mut objective, "re-entry refusal #2953")
-        .expect_err(
-            "a certified optimum that a stored checkpoint beats must not publish because the \
-             checkpoint cannot be re-evaluated",
-        );
-    let EstimationError::DominatedCertifiedPlateau {
-        kind,
-        plateau_rho,
-        plateau_value,
-        incumbent_rho,
-        incumbent_value,
-        gap,
-        band,
-        continuation,
-        terminal_refusal,
-        ..
-    } = error
-    else {
-        panic!("expected the typed dominated-plateau refusal, got {error}");
-    };
-    assert_eq!(kind, DominanceRefusalKind::DominanceUnresolved);
-    assert_eq!(plateau_rho, vec![0.0]);
-    assert_eq!(plateau_value.to_bits(), well_value(0.0).to_bits());
-    // The checkpoint is where the capped search stopped, inside the well, at its stored value:
-    // no re-evaluation replaced it.
-    assert!(
-        (incumbent_rho[0] - CENTER).abs() < WIDTH,
-        "the refused checkpoint must be the capped search inside the well; rho={incumbent_rho:?}"
-    );
-    assert_eq!(incumbent_value.to_bits(), well_value(incumbent_rho[0]).to_bits());
-    assert_eq!(gap.to_bits(), (plateau_value - incumbent_value).to_bits());
-    assert!(
-        band > 0.0 && gap > DEPTH / 2.0 && gap > band,
-        "gap {gap:e} against band {band:e}"
-    );
-    assert!(
-        continuation.contains("re-evaluating the checkpoint at its own rho was refused")
-            && continuation.contains(REENTRY_MARKER),
-        "the continuation must say that no search could start from the refused checkpoint: \
-         {continuation}"
-    );
-    assert!(
-        terminal_refusal.is_trial_point_infeasible(),
-        "the terminal certificate's installation at the checkpoint is refused the same way: \
-         {terminal_refusal}"
-    );
-    assert!(
-        refusals.load(Ordering::Relaxed) >= 2,
-        "both the dominance re-evaluation and the terminal installation must have been refused; \
-         refused {}",
-        refusals.load(Ordering::Relaxed)
+        .unwrap_or_else(|error| {
+            panic!(
+                "a certified optimum that only an unpriceable checkpoint beats must publish: \
+                 {error}"
+            )
+        });
+    assert_flat_top_published_over_the_unpriceable_checkpoint(&published);
+    assert_eq!(
+        refusals.load(Ordering::Relaxed),
+        1,
+        "the full-fidelity pricing of the checkpoint must have been the one refusal"
     );
 }
 
+/// The lead's 09-18 ruling: an unpriceable state can't defeat a certified one. This pin used to
+/// assert the opposite (d0407a670c): the BFGS attempt declined its flat top on a checkpoint the
+/// objective refused to re-evaluate, and the ARC attempt that followed (#2898) certified the
+/// well's centre and published. Now the BFGS attempt's flat top is certified and nothing priced
+/// beats it, so it publishes and the plan runs no later attempt, although ARC would have
+/// certified lower.
 #[test]
-fn a_later_attempt_that_certifies_below_the_refused_checkpoint_publishes_2953() {
+fn an_unpriceable_checkpoint_does_not_start_a_later_plan_attempt_2953() {
     let bfgs_iterations = reentry_calibration(true)
         .expect("an unbounded BFGS search of the well from inside its core certifies its centre");
     let arc_iterations = reentry_calibration(false)
         .expect("an unbounded ARC search of the well from inside its core certifies its centre");
-    // Under a budget of ARC's own iteration count the BFGS attempt stops short of
-    // certifying, and the ARC attempt that follows it certifies.
+    // Under a budget of ARC's own iteration count the BFGS attempt stops short of certifying
+    // the centre, and an ARC attempt would certify it.
     assert!(
         arc_iterations < bfgs_iterations,
         "ARC on the declared curvature must certify in fewer iterations than BFGS for one \
@@ -699,32 +710,21 @@ fn a_later_attempt_that_certifies_below_the_refused_checkpoint_publishes_2953() 
         .run(&mut objective, "re-entry continuation #2953")
         .unwrap_or_else(|error| {
             panic!(
-                "the ARC attempt certifies the well's centre, below the refused checkpoint, and \
-                 must publish: {error}"
+                "the BFGS attempt's certified flat top, beaten only by an unpriceable \
+                 checkpoint, must publish: {error}"
             )
         });
-    assert!(
-        (published.rho[0] - CENTER).abs() < 1.0e-3,
-        "the published optimum must be the well's centre; rho={:?}",
-        published.rho
+    assert_flat_top_published_over_the_unpriceable_checkpoint(&published);
+    assert_eq!(
+        published.plan_used.solver,
+        Solver::Bfgs,
+        "the flat top must be the BFGS attempt's; no ARC attempt may have run"
     );
     assert_eq!(
         refusals.load(Ordering::Relaxed),
         1,
-        "the BFGS attempt's dominance re-evaluation must have been the one refusal"
-    );
-    let Some(record) = published.dominated_plateau.as_ref() else {
-        panic!("the BFGS attempt's declined optimum must ride on the published result");
-    };
-    assert_eq!(record.plateau_rho.to_vec(), vec![0.0]);
-    assert!(
-        matches!(
-            &record.continuation,
-            DominanceContinuationStop::Failed { error }
-                if error.contains("re-evaluating the checkpoint at its own rho was refused")
-        ),
-        "the BFGS attempt must have declined on the checkpoint it could not re-evaluate: {}",
-        record.continuation
+        "the BFGS attempt's full-fidelity pricing of the checkpoint must have been the one \
+         refusal"
     );
 }
 

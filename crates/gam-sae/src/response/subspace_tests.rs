@@ -10,7 +10,7 @@
 //! truncation, with the same kind of positive control. Every pin prints its numbers whether it passes or fails, so a
 //! green run is a receipt.
 
-use super::{KnownBlock, KnownGatedBlock, ResponseError};
+use super::{BandedEnergy, KnownBlock, KnownGatedBlock, ResponseError, signed_sum};
 use gam_math::gaussian_activation::{
     GaussianActivation, PreactivationPair, gaussian_smoothing_derivatives, pair_kernel,
 };
@@ -169,37 +169,45 @@ fn diagonal_only_relu_variance(readers: &Array2<f64>, frame: ArrayView2<'_, f64>
 fn discarded_error_vanishes_on_the_full_frame_and_shrinks_strictly_as_the_frame_grows() {
     let block = relu_block(overlapping_readers());
     let reflector = half_reflector();
-    let errors: Vec<f64> = (1..=4)
+    let errors: Vec<BandedEnergy> = (1..=4)
         .map(|rank| {
             block
                 .discarded_error(reflector.slice(s![.., ..rank]))
                 .expect("an orthonormal frame inside the input")
         })
         .collect();
+    let total = block.total_variance();
     eprintln!(
-        "#2946 A2 V(I) = {}; E at frame rank 1..4 = {}, {}, {}, {}",
-        block.total_variance(),
-        errors[0],
-        errors[1],
-        errors[2],
-        errors[3],
+        "#2946 A2 V(I) = {} ± {:e}; E at frame rank 1..4 = {} ± {:e}, {} ± {:e}, {} ± {:e}, {} ± {:e}",
+        total.value,
+        total.band,
+        errors[0].value,
+        errors[0].band,
+        errors[1].value,
+        errors[1].band,
+        errors[2].value,
+        errors[2].band,
+        errors[3].value,
+        errors[3].band,
     );
     // `W H` has half-integer entries and `(W H)(W H)ᵀ = W Wᵀ` holds exactly, so the full frame feeds the kernel the
     // same covariances as `V(I)` and the discarded error is exactly zero.
-    assert_eq!(errors[3], 0.0, "E(I) must be exactly 0, got {}", errors[3]);
+    assert_eq!(errors[3].value, 0.0, "E(I) must be exactly 0, got {:?}", errors[3]);
     assert_eq!(
         block
             .explained_variance(reflector.view())
-            .expect("the full frame"),
-        block.total_variance(),
+            .expect("the full frame")
+            .value,
+        total.value,
     );
-    assert!(block.total_variance() > 0.0);
-    // Conditioning on a larger subspace can only reduce the discarded error, and these readers overlap every
-    // column of `H`, so each added column removes a positive share.
+    assert!(total.resolved_positive(), "V(I) must clear its band: {total:?}");
+    // Conditioning on a larger subspace can only reduce the discarded error, and these readers overlap every column of
+    // `H`, so each added column removes a positive share. The band resolves every step, so it is not vacuous.
     for rank in 0..3 {
+        let step = signed_sum(&[errors[rank]], &[errors[rank + 1]]);
         assert!(
-            errors[rank] > errors[rank + 1],
-            "E must shrink as the frame grows: E(rank {}) = {} vs E(rank {}) = {}",
+            step.resolved_positive(),
+            "E must shrink resolvably as the frame grows: E(rank {}) = {:?} vs E(rank {}) = {:?}",
             rank + 1,
             errors[rank],
             rank + 2,
@@ -255,11 +263,16 @@ fn a_coordinate_frame_reads_the_selected_reader_columns() {
     let unit_frame = identity(4);
     for retained in [vec![], vec![0], vec![1, 3], vec![0, 2, 3], vec![0, 1, 2, 3]] {
         let frame = unit_frame.select(Axis(1), &retained);
+        // The values agree bit for bit; the frame route states a frame's formation errors, so its band differs.
         assert_eq!(
             block
                 .explained_variance_of_coordinates(&retained)
-                .expect("strictly increasing coordinates"),
-            block.explained_variance(frame.view()).expect("a coordinate frame"),
+                .expect("strictly increasing coordinates")
+                .value,
+            block
+                .explained_variance(frame.view())
+                .expect("a coordinate frame")
+                .value,
             "coordinates {retained:?}",
         );
     }
@@ -296,10 +309,13 @@ fn a_planted_exact_subspace_discards_nothing_and_its_complement_discards_everyth
     let empty = block
         .discarded_error(reflector.slice(s![.., ..0]))
         .expect("the empty frame");
-    eprintln!("#2946 A3 planted: E(planted) = {retained}, E(complement) = {complement}, E(empty) = {empty}");
-    assert_eq!(retained, 0.0, "E on the planted subspace must be exactly 0, got {retained}");
-    assert_eq!(complement, empty);
-    assert!(complement > 0.0, "the complement must discard a positive error, got {complement}");
+    eprintln!("#2946 A3 planted: E(planted) = {retained:?}, E(complement) = {complement:?}, E(empty) = {empty:?}");
+    assert_eq!(retained.value, 0.0, "E on the planted subspace must be exactly 0, got {retained:?}");
+    assert_eq!(complement.value, empty.value);
+    assert!(
+        complement.resolved_positive(),
+        "the complement must discard a resolved positive error, got {complement:?}",
+    );
 }
 
 #[test]
@@ -353,10 +369,10 @@ fn monte_carlo_of_the_executed_block_reproduces_explained_variance_and_discarded
     let (coupled_error_estimate, coupled_error_se) = mean_and_standard_error(&coupled_error_terms);
     let (residual_error_estimate, residual_error_se) = mean_and_standard_error(&residual_error_terms);
 
-    let explained = block.explained_variance(frame.view()).expect("frame");
-    let discarded = block.discarded_error(frame.view()).expect("frame");
+    let explained = block.explained_variance(frame.view()).expect("frame").value;
+    let discarded = block.discarded_error(frame.view()).expect("frame").value;
     let arms = [
-        ("V(I)", block.total_variance(), total_estimate * unbias, total_se),
+        ("V(I)", block.total_variance().value, total_estimate * unbias, total_se),
         ("V(P)", explained, explained_estimate * unbias, explained_se),
         ("E(P) coupled", discarded, coupled_error_estimate, coupled_error_se),
         ("E(P) residual of F-bar", discarded, residual_error_estimate, residual_error_se),
@@ -581,7 +597,6 @@ fn a_rounding_scale_frame_defect_is_projected_and_a_stretched_frame_is_refused()
 
 #[test]
 fn a_signed_sum_carries_its_operand_bands_and_the_rounding_of_its_additions() {
-    use super::{BandedEnergy, signed_sum};
     use gam_linalg::roundoff::accumulation_growth;
     // Dyadic operands, so the value is exact and the expected band is rebuilt in the implementation's own order.
     let added = [
@@ -654,10 +669,12 @@ fn geodesic_central_difference(
 ) -> f64 {
     let ahead = block
         .explained_variance(geodesic_frame(frame, x, y, step).view())
-        .expect("a geodesic frame is orthonormal");
+        .expect("a geodesic frame is orthonormal")
+        .value;
     let behind = block
         .explained_variance(geodesic_frame(frame, x, y, -step).view())
-        .expect("a geodesic frame is orthonormal");
+        .expect("a geodesic frame is orthonormal")
+        .value;
     (ahead - behind) / (2.0 * step)
 }
 
@@ -726,13 +743,13 @@ fn the_frame_gradient_is_the_derivative_of_explained_variance_along_a_grassmann_
         let truncation = (coarse - fine).abs();
         let diagonal_only = diagonal_only_directional_derivative(&block, frame.view(), x.view(), y.view());
         eprintln!(
-            "#2946 A4 {activation:?}: V(P) = {}; <grad V, x y^T> = {analytic}; central differences D({step}) = {coarse}, D({}) = {fine}; Richardson {extrapolated}; |analytic - Richardson| = {:e} against the ladder truncation {truncation:e}; control without cross terms {diagonal_only}, off by {:e}",
+            "#2946 A4 {activation:?}: V(P) = {:?}; <grad V, x y^T> = {analytic}; central differences D({step}) = {coarse}, D({}) = {fine}; Richardson {extrapolated}; |analytic - Richardson| = {:e} against the ladder truncation {truncation:e}; control without cross terms {diagonal_only}, off by {:e}",
             gradient.explained_variance,
             step / 2.0,
             (analytic - extrapolated).abs(),
             (diagonal_only - extrapolated).abs(),
         );
-        // One pass returns the value pass's V and E bit for bit.
+        // One pass returns the value pass's V and E, bands included, bit for bit.
         assert_eq!(
             gradient.explained_variance,
             block
@@ -741,7 +758,7 @@ fn the_frame_gradient_is_the_derivative_of_explained_variance_along_a_grassmann_
         );
         assert_eq!(
             gradient.discarded_error,
-            block.total_variance() - gradient.explained_variance,
+            signed_sum(&[block.total_variance()], &[gradient.explained_variance]),
         );
         assert!(
             (analytic - extrapolated).abs() <= truncation,
@@ -834,10 +851,12 @@ fn the_saturated_coordinate_carries_the_discarded_error_and_the_averaged_gradien
     let coordinates = identity(2);
     let discard_second = block
         .discarded_error(coordinates.slice(s![.., ..1]))
-        .expect("retain z1");
+        .expect("retain z1")
+        .value;
     let discard_first = block
         .discarded_error(coordinates.slice(s![.., 1..]))
-        .expect("retain z2");
+        .expect("retain z2")
+        .value;
     let active = active_subspace_matrix(&block);
 
     let draws = 1 << 18;
@@ -1024,4 +1043,106 @@ fn the_gated_retained_response_is_the_executed_block_averaged_over_the_discarded
             }
         }
     }
+}
+
+/// `Q S` for the Givens rotation `S` of the frame's two columns by `angle`: the same span through a non-dyadic basis.
+fn rotated_basis(frame: ArrayView2<'_, f64>, angle: f64) -> Array2<f64> {
+    let (sine, cosine) = angle.sin_cos();
+    frame.dot(&array![[cosine, -sine], [sine, cosine]])
+}
+
+#[test]
+fn every_discarded_error_is_nonnegative_the_empty_frame_discards_the_total_and_two_bases_agree_within_their_bands() {
+    // A2 with the operator's band. At P = 0 every pair law is independent, so V(0) = 0 and E(0) = V(I) exactly; the
+    // computed V(0) sums K(r = 0) − m_j m_k, zero only up to rounding, so its band must cover it. Every E(P) ≥ 0 within
+    // its band. A basis Q S of the same span has the same projector, since its nearest orthonormal frame spans it, so
+    // V(Q S) and V(Q) estimate one exact V and must agree within their two bands. Positive control: a frame turned
+    // off the span by 2⁻²⁰ changes V by far more than those bands, so the bar resolves a real move.
+    let reflector = half_reflector();
+    let frame = retained_frame();
+    let x = reflector.column(2).to_owned();
+    let y = array![0.6, 0.8];
+    for activation in [GaussianActivation::Relu, GaussianActivation::ExactGelu] {
+        let block = biased_block(activation);
+        let total = block.total_variance();
+        let empty = reflector.slice(s![.., ..0]);
+        let nothing = block.explained_variance(empty).expect("the empty frame");
+        let everything_discarded = block.discarded_error(empty).expect("the empty frame");
+        let explained = block.explained_variance(frame.view()).expect("an orthonormal frame");
+        let rebased = block
+            .explained_variance(rotated_basis(frame.view(), 0.7).view())
+            .expect("a rotated basis of the frame");
+        let turned = block
+            .explained_variance(geodesic_frame(frame.view(), x.view(), y.view(), 2.0_f64.powi(-20)).view())
+            .expect("a turned frame");
+        let errors: Vec<BandedEnergy> = (0..=4)
+            .map(|rank| {
+                block
+                    .discarded_error(reflector.slice(s![.., ..rank]))
+                    .expect("a frame of H")
+            })
+            .collect();
+        eprintln!(
+            "#2946 A2 band {activation:?}: V(I) = {total:?}; V(0) = {nothing:?}; E(0) = {everything_discarded:?}; V(Q) = {explained:?}; V(Q S) = {rebased:?} (gap {:e}); V(turned 2^-20) = {turned:?} (gap {:e}); E at rank 0..4 = {errors:?}",
+            (rebased.value - explained.value).abs(),
+            (turned.value - explained.value).abs(),
+        );
+        assert!(
+            nothing.value.abs() <= nothing.band,
+            "{activation:?}: V(0) = {nothing:?} must be zero within its band",
+        );
+        assert!(
+            (everything_discarded.value - total.value).abs() <= everything_discarded.band + total.band,
+            "{activation:?}: E(0) = {everything_discarded:?} must equal V(I) = {total:?} within their bands",
+        );
+        for (rank, error) in errors.iter().enumerate() {
+            assert!(
+                error.value >= -error.band,
+                "{activation:?}: E at rank {rank} = {error:?} must be nonnegative within its band",
+            );
+        }
+        assert!(
+            (rebased.value - explained.value).abs() <= rebased.band + explained.band,
+            "{activation:?}: two bases of one span give V = {explained:?} and {rebased:?}, beyond their bands",
+        );
+        assert!(
+            (turned.value - explained.value).abs() > turned.band + explained.band,
+            "{activation:?}: a frame turned by 2^-20 must move V beyond the bands: {explained:?} vs {turned:?}",
+        );
+    }
+}
+
+#[test]
+fn a_pass_counts_the_pair_kernels_that_fell_back_to_the_certified_orthant_route() {
+    // Two ReLU units deep in their lower tails (b = c = −8) with anticorrelated readers (r = −½): the plain bivariate
+    // normal route certifies no digit there, so the kernel re-evaluates through the certified entry and flags it. The
+    // same readers at zero bias take the zero-mean closed form, which never falls back: the negative control.
+    let readers = array![[1.0, 0.0], [-0.5, 0.75_f64.sqrt()]];
+    let frame = identity(2);
+    let mut counts = Vec::new();
+    for bias in [-8.0, 0.0] {
+        let block = KnownBlock::new(
+            readers.clone(),
+            array![bias, bias],
+            array![[1.0, 1.0]],
+            Array1::zeros(1),
+            identity(1).view(),
+            GaussianActivation::Relu,
+        )
+        .expect("a finite two-unit block");
+        let gradient = block
+            .explained_variance_gradient(frame.view())
+            .expect("the full frame");
+        eprintln!(
+            "#2946 orthant fallbacks at bias {bias}: {} of 3 pair kernels; V(I) = {:?}",
+            gradient.orthant_fallbacks,
+            gradient.explained_variance,
+        );
+        counts.push(gradient.orthant_fallbacks);
+    }
+    assert!(
+        counts[0] >= 1 && counts[0] <= 3,
+        "the lower-tail block must report its fallback pairs among its 3: {counts:?}",
+    );
+    assert_eq!(counts[1], 0, "the zero-mean block never falls back: {counts:?}");
 }

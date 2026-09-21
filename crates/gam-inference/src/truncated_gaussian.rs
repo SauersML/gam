@@ -42,6 +42,7 @@
 //! `N(0, I)` and travelling for a quarter period `T = π/2` between draws gives
 //! independent draws when no wall intervenes (`z(π/2) = v₀`). Reflections can
 //! induce serial dependence; constrained draws still require chain diagnostics.
+//! The flow is `gam_solve::constrained_posterior::exact_flow`, its one owner.
 //!
 //! # Whitening
 //!
@@ -66,20 +67,9 @@ use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 
 use gam_linalg::faer_ndarray::FaerCholesky;
-use gam_linalg::triangular::{
-    back_substitution_lower_transpose_guarded_into, forward_substitution_lower_matrix,
-};
+use gam_linalg::triangular::back_substitution_lower_transpose_guarded_into;
+use gam_solve::constrained_posterior::exact_flow::{TRAVEL_TIME, WhitenedPolytope};
 use gam_solve::pirls::LinearInequalityConstraints;
-
-/// Quarter-period travel time between velocity refreshes. With no active wall,
-/// `z(π/2) = v₀`, so consecutive draws decorrelate completely.
-const TRAVEL_TIME: f64 = std::f64::consts::FRAC_PI_2;
-
-/// A reflection budget per trajectory. A pointed feasible cone resolves a
-/// vertex start in `O(#active rows)` bounces; this cap is a backstop against a
-/// pathological grazing cycle. Exhaustion is an error: stopping at a wall
-/// instead of completing the fixed travel time does not preserve the target.
-const MAX_BOUNCES_BASE: usize = 256;
 
 /// Draw `n_samples · n_chains` posterior samples of `β ~ N(center, φ·H⁻¹)`
 /// truncated to `{β : A β ≥ b}`, returned as a `(n_total, p)` matrix in the
@@ -162,36 +152,10 @@ pub(crate) fn sample_truncated_gaussian_posterior(
 
     // Whitened constraint rows Fᵢ = √φ · L⁻¹ aᵢ and slacks gᵢ = aᵢᵀ center − bᵢ
     // (possibly negative — the CENTER may be infeasible; only the start point
-    // must satisfy the polytope). `F` is `m × p`;
-    // `forward_substitution_lower_matrix` solves `L M = Aᵀ` column-by-column
-    // giving `M = L⁻¹ Aᵀ` (`p × m`), so `F = √φ · Mᵀ`.
-    let (f_rows, g, f_sq_norm) = if m == 0 {
-        (
-            Array2::<f64>::zeros((0, p)),
-            Array1::<f64>::zeros(0),
-            Vec::new(),
-        )
-    } else {
-        let at = a.t().to_owned();
-        let mut f = forward_substitution_lower_matrix(&l, &at).reversed_axes(); // m × p
-        f.mapv_inplace(|v| v * sqrt_phi);
-        let mut g = a.dot(center) - b;
-        // Equivalent positive row scalings must give the same reflections.
-        // Normalize in two stages before squaring: raw row norms can overflow
-        // or underflow even when every coefficient and the unit normal is finite.
-        for i in 0..m {
-            let row_scale = f.row(i).iter().fold(0.0_f64, |s, &v| s.max(v.abs()));
-            if row_scale > 0.0 {
-                f.row_mut(i).mapv_inplace(|v| v / row_scale);
-                g[i] /= row_scale;
-                let row_norm = f.row(i).dot(&f.row(i)).sqrt();
-                f.row_mut(i).mapv_inplace(|v| v / row_norm);
-                g[i] /= row_norm;
-            }
-        }
-        let f_sq_norm: Vec<f64> = (0..m).map(|i| f.row(i).dot(&f.row(i))).collect();
-        (f, g, f_sq_norm)
-    };
+    // must satisfy the polytope), each normalized so that equivalent positive
+    // row scalings give the same reflections.
+    let polytope = WhitenedPolytope::new(&l, sqrt_phi, center, constraints)
+        .map_err(|error| format!("truncated-Gaussian posterior: {error}"))?;
 
     // Whitened start `z₀ = (1/√φ)·Lᵀ·(start − center)`, validated feasible up
     // to reflective slack: the constrained KKT mode sits ON its active walls,
@@ -237,7 +201,6 @@ pub(crate) fn sample_truncated_gaussian_posterior(
 
     let n_total = n_samples.saturating_mul(n_chains);
     let mut samples = Array2::<f64>::zeros((n_total, p));
-    let max_bounces = MAX_BOUNCES_BASE + 8 * m;
 
     // Scratch buffers reused across draws.
     let mut z = Array1::<f64>::zeros(p);
@@ -257,7 +220,9 @@ pub(crate) fn sample_truncated_gaussian_posterior(
             for vi in v.iter_mut() {
                 *vi = standard_normal(&mut rng);
             }
-            simulate_constrained_trajectory(&mut z, &mut v, &f_rows, &g, &f_sq_norm, max_bounces)?;
+            polytope
+                .flow(&mut z, &mut v, TRAVEL_TIME)
+                .map_err(|error| format!("truncated-Gaussian posterior: {error}"))?;
             // Back-transform: β = center + √φ · L⁻ᵀ z.
             back_substitution_lower_transpose_guarded_into(&l, &z, &mut beta);
             let row = chain * n_samples + draw;
@@ -268,136 +233,6 @@ pub(crate) fn sample_truncated_gaussian_posterior(
     }
 
     Ok(samples)
-}
-
-/// Advance `(z, v)` along the harmonic trajectory `z(t) = z cos t + v sin t`
-/// for a total time [`TRAVEL_TIME`], reflecting specularly off every wall
-/// `fᵢᵀ z + gᵢ = 0` it reaches. On return `z` is the new (feasible) position.
-fn simulate_constrained_trajectory(
-    z: &mut Array1<f64>,
-    v: &mut Array1<f64>,
-    f_rows: &Array2<f64>,
-    g: &Array1<f64>,
-    f_sq_norm: &[f64],
-    max_bounces: usize,
-) -> Result<(), String> {
-    let m = f_rows.nrows();
-    let mut t_left = TRAVEL_TIME;
-    let mut bounces = 0usize;
-
-    loop {
-        if t_left <= 0.0 {
-            return Ok(());
-        }
-        // Find the first wall hit within (0, t_left].
-        let mut hit_time = t_left;
-        let mut hit_wall: Option<usize> = None;
-        for i in 0..m {
-            let fi = f_rows.row(i);
-            let u = fi.dot(z); // fᵢᵀ z   (so cᵢ(0) = u + gᵢ)
-            let w = fi.dot(v); // fᵢᵀ v
-            if let Some(t) = first_wall_hit(u, w, g[i], hit_time) {
-                if t < hit_time {
-                    hit_time = t;
-                    hit_wall = Some(i);
-                } else if hit_wall.is_none() && t <= hit_time {
-                    // Immediate (t == 0) outward bounce on an active face.
-                    hit_time = t;
-                    hit_wall = Some(i);
-                }
-            }
-        }
-
-        match hit_wall {
-            None => {
-                // No wall within the remaining arc: advance the full time.
-                advance(z, v, t_left);
-                return Ok(());
-            }
-            Some(j) => {
-                advance(z, v, hit_time);
-                t_left -= hit_time;
-                // Specular reflection of the velocity about the wall normal fⱼ:
-                //   v ← v − 2 (fⱼᵀ v / ‖fⱼ‖²) fⱼ,
-                // which flips the outward normal velocity component to inward.
-                let fj = f_rows.row(j);
-                let denom = f_sq_norm[j];
-                if denom > 0.0 {
-                    let coeff = 2.0 * fj.dot(v) / denom;
-                    for k in 0..v.len() {
-                        v[k] -= coeff * fj[k];
-                    }
-                }
-                bounces += 1;
-                if bounces >= max_bounces && t_left > 0.0 {
-                    return Err(format!(
-                        "truncated-Gaussian posterior: trajectory exhausted its {max_bounces} \
-                         reflection budget before completing the fixed travel time"
-                    ));
-                }
-            }
-        }
-    }
-}
-
-/// First time `t ∈ (0, t_max]` at which the constraint value
-/// `c(t) = u cos t + w sin t + g` crosses zero *downward* (feasible → wall),
-/// or `None` if the arc never reaches the wall within `t_max`.
-///
-/// `c(0) = u + g ≥ 0` at a feasible position. The Gaussian center may be
-/// infeasible (`g < 0`), and the particle may start exactly on a wall.
-#[inline]
-fn first_wall_hit(u: f64, w: f64, g: f64, t_max: f64) -> Option<f64> {
-    // Positive rescaling of a constraint must not change its impact time.
-    // Normalize before products so finite large row scales cannot overflow.
-    let scale = u.abs().max(w.abs()).max(g.abs());
-    if scale == 0.0 {
-        return None;
-    }
-    let u = u / scale;
-    let w = w / scale;
-    let g = g / scale;
-    let c0 = u + g;
-    if c0 <= 0.0 && w < 0.0 {
-        return Some(0.0);
-    }
-
-    // On our quarter-period arc, s = tan(t/2) is finite and nonnegative.
-    // Multiplying c(t) by 1+s² gives
-    //     (g-u)s² + 2ws + (u+g) = 0.
-    // Select the root with negative derivative. Rationalizing it when w<0
-    // avoids cancellation near t=0; adding atan2 and acos instead can erase
-    // such a hit, while wrapping a small positive time skips a real impact.
-    let a = g - u;
-    let discriminant = w.mul_add(w, -a * c0);
-    if discriminant < 0.0 {
-        return None;
-    }
-    let root = discriminant.sqrt();
-    let s = if w < 0.0 {
-        c0 / (-w + root)
-    } else if a < 0.0 {
-        (-w - root) / a
-    } else {
-        return None;
-    };
-    let t = 2.0 * s.max(0.0).atan();
-    if t <= t_max { Some(t) } else { None }
-}
-
-/// In-place harmonic advance: `z ← z cos t + v sin t`, `v ← −z sin t + v cos t`.
-#[inline]
-fn advance(z: &mut Array1<f64>, v: &mut Array1<f64>, t: f64) {
-    if t == 0.0 {
-        return;
-    }
-    let (st, ct) = t.sin_cos();
-    for k in 0..z.len() {
-        let zk = z[k];
-        let vk = v[k];
-        z[k] = zk * ct + vk * st;
-        v[k] = -zk * st + vk * ct;
-    }
 }
 
 /// Box–Muller standard-normal draw, matching the engine's other sampler RNG
@@ -418,46 +253,6 @@ mod tests {
 
     fn constraints(a: Array2<f64>, b: Array1<f64>) -> LinearInequalityConstraints {
         LinearInequalityConstraints::new(a, b).expect("valid constraints")
-    }
-
-    #[test]
-    fn wall_hit_keeps_positive_times_below_the_old_slack_threshold() {
-        let expected = (1e-6_f64 / 1e8).atan();
-        let actual = first_wall_hit(1e-6, -1e8, 0.0, TRAVEL_TIME).expect("early hit");
-        assert!((actual / expected - 1.0).abs() < 1e-14);
-    }
-
-    #[test]
-    fn wall_hit_is_invariant_to_positive_constraint_rescaling() {
-        // cos(t) - sin(t) = 0 first crosses downward at pi/4.
-        for scale in [1e-200, 1.0, 1e200] {
-            let t = first_wall_hit(scale, -scale, 0.0, TRAVEL_TIME).expect("hit");
-            assert!((t - std::f64::consts::FRAC_PI_4).abs() < 1e-14);
-        }
-    }
-
-    #[test]
-    fn wall_hit_handles_an_infeasible_center_and_an_inward_launch() {
-        // Starting at z=1 with wall z>=1, the next return solves
-        // cos(t) + v sin(t) = 1, hence t=2 atan(v).
-        for velocity in [1e-14, 0.25, 0.5] {
-            let t = first_wall_hit(1.0, velocity, -1.0, TRAVEL_TIME).expect("return hit");
-            assert!((t / (2.0 * velocity.atan()) - 1.0).abs() < 1e-14);
-        }
-    }
-
-    #[test]
-    fn reflection_budget_exhaustion_refuses_a_partial_trajectory() {
-        let error = simulate_constrained_trajectory(
-            &mut array![0.5],
-            &mut array![2.0],
-            &array![[1.0], [-1.0]],
-            &array![0.0, 1.0],
-            &[1.0, 1.0],
-            1,
-        )
-        .expect_err("a partial arc would place spurious probability mass on its last wall");
-        assert!(error.contains("reflection budget"));
     }
 
     #[test]

@@ -42,6 +42,8 @@ import numpy as np
 import torch
 from torch.overrides import TorchFunctionMode, resolve_name
 
+from .._binding import rust_module
+
 __all__ = [
     "EditedCotangents",
     "EditedExecution",
@@ -219,12 +221,21 @@ class GlobalParameterEdit:
 @dataclass(frozen=True)
 class UseSiteParameterEdit:
     """Use ``{tensor_id}#{ordinal}`` reads ``W + delta`` (at every position, or
-    only at declared ``positions``); every other use reads ``W``."""
+    only at declared ``positions``); every other use reads ``W``.
+
+    ``read_module`` and ``read_op`` name that read as discovery reported it:
+    the :attr:`ParameterUseSite.module` (``""`` for the root module) and
+    :attr:`ParameterUseSite.op` of ``{tensor_id}#{ordinal}``. Rust checks them
+    against the read the executed forward made at that ordinal, so an ordinal
+    that addresses another read refuses instead of editing it.
+    """
 
     tensor_id: str
     ordinal: int
     delta: Any
     positions: Any
+    read_module: str
+    read_op: str
 
     def __post_init__(self) -> None:
         _require_ordinal(self.ordinal)
@@ -818,6 +829,7 @@ def _executed_output(output: Any, tf32_matmul: bool) -> ExecutedOutput:
 def _finished_execution(
     output: Any,
     mode: _ParameterUseMode,
+    edits: tuple[Any, ...],
     global_values: dict[str, _Planned],
     site_values: dict[tuple[str, int], _Planned],
 ) -> EditedExecution:
@@ -828,6 +840,18 @@ def _finished_execution(
     unread = sorted(set(global_values) - {site.tensor_id for site in mode.substituted})
     if unread:
         raise ValueError(f"global edits of {unread} were never read in this forward")
+    labelled = [
+        (edit.tensor_id, int(edit.ordinal), edit.read_module, edit.read_op)
+        for edit in edits
+        if isinstance(edit, UseSiteParameterEdit)
+    ]
+    if labelled:
+        # Rust checks each use-site edit against the read this forward made at its
+        # ordinal, and refuses when another module or op made it.
+        rust_module().check_parameter_use_site_reads(
+            labelled,
+            [(site.tensor_id, site.ordinal, site.module, site.op) for site in mode.use_sites],
+        )
     return EditedExecution(
         output=_executed_output(output, mode.tf32_matmul),
         use_sites=tuple(mode.use_sites),
@@ -862,9 +886,12 @@ def execute_parameter_edits(
     A global edit makes every use read ``W + ΔW``, and refuses when this forward
     reads the tensor nowhere. A use-site edit does so only at
     ``{tensor_id}#{ordinal}``, which this forward must reach. A tensor cannot
-    carry both kinds, since a global edit already reaches every use. ``W + ΔW``
-    is formed in float64 and refuses unless the tensor's own format represents
-    it exactly, so an edit never runs rounded.
+    carry both kinds, since a global edit already reaches every use. A use-site
+    edit's ``read_module`` and ``read_op`` must name the read this forward made
+    at its ordinal, which Rust checks after the forward, so the forward itself
+    runs exactly as without the check. ``W + ΔW`` is formed in float64 and
+    refuses unless the tensor's own format represents it exactly, so an edit
+    never runs rounded.
 
     An edit with declared positions needs ``leading_shape``, the unit's
     ``(batch, seq)``. At each of its uses the op runs twice on the same current
@@ -886,7 +913,7 @@ def execute_parameter_edits(
     output, mode = _run_under_mode(
         model, inputs, global_values, site_values, leading, frozenset(), frozenset()
     )
-    return _finished_execution(output, mode, global_values, site_values)
+    return _finished_execution(output, mode, edits, global_values, site_values)
 
 
 def execute_parameter_cotangents(
@@ -941,11 +968,12 @@ def execute_parameter_cotangents(
                 "readouts must be OutputReadout, UseSiteInputReadout or UseSiteOutputReadout; "
                 f"got {type(readout).__name__}"
             )
-    global_values, site_values, leading = _plan_edits(table, tuple(edits), leading_shape)
+    edits = tuple(edits)
+    global_values, site_values, leading = _plan_edits(table, edits, leading_shape)
     output, mode = _run_under_mode(
         model, inputs, global_values, site_values, leading, frozenset(keys), frozenset(read_out)
     )
-    execution = _finished_execution(output, mode, global_values, site_values)
+    execution = _finished_execution(output, mode, edits, global_values, site_values)
     unreached = sorted(
         f"{tensor_id}#{ordinal}"
         for tensor_id, ordinal in keys

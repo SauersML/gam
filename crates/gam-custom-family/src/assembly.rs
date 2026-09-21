@@ -525,8 +525,9 @@ pub(crate) fn unified_joint_cost_gradient(
     ))
 }
 
-/// A unified-evaluator failure as the custom family reports it (gam#2765): an inner mode at a fold
-/// refuses the trial point by its typed verdict, and any other failure keeps its diagnostic.
+/// A unified-evaluator failure as the custom family reports it (gam#2765): an inner mode at a fold,
+/// or a constrained Laplace normalizer that cannot be formed, refuses the trial point by its typed
+/// verdict, and any other failure keeps its diagnostic.
 fn unified_evaluation_error(
     error: gam_solve::estimate::reml::reml_outer_engine::RemlLamlError,
     eval_mode: EvalMode,
@@ -536,6 +537,11 @@ fn unified_evaluation_error(
         gam_solve::estimate::reml::reml_outer_engine::RemlLamlError::InnerModeFold(fold) => {
             CustomFamilyError::TrialPointRefused {
                 reason: format!("the {eval_mode:?} {route} refused this trial point: {fold}"),
+            }
+        }
+        gam_solve::estimate::reml::reml_outer_engine::RemlLamlError::ConeNormalizer(refusal) => {
+            CustomFamilyError::TrialPointRefused {
+                reason: format!("the {eval_mode:?} {route} refused this trial point: {refusal}"),
             }
         }
         gam_solve::estimate::reml::reml_outer_engine::RemlLamlError::Failed(reason) => {

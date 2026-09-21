@@ -484,12 +484,12 @@ mod standard_convergence_gate_tests {
 
 pub(crate) fn fit_standard_model(
     mut request: StandardFitRequest<'_>,
-) -> Result<StandardFitResult, FitFailure> {
+) -> Result<StandardFitResult, String> {
     if request.estimate_tweedie_p {
-        return Err(FitFailure::raised(
-            gam_problem::FailureCategory::Input,
-            "automatic Tweedie power profiling is derivative-free hyperparameter search and is forbidden by SPEC.md; supply an explicit p strictly between 1 and 2",
-        ));
+        return Err(
+            "automatic Tweedie power profiling is derivative-free hyperparameter search and is forbidden by SPEC.md; supply an explicit p strictly between 1 and 2"
+                .to_string(),
+        );
     }
     // #2750: resolve every AUTO measure-jet representer range against the
     // response, once, before anything reads the spec.
@@ -612,15 +612,15 @@ pub(crate) fn fit_standard_model(
                     // message. The typed original is still what was raised; what
                     // changes is that the refusal stops recommending a remedy it
                     // has already tried without saying so.
-                    return Err(FitFailure::from(original_error).annotated(format!(
-                        "the automatic Firth/Jeffreys rescue WAS attempted \
+                    return Err(format!(
+                        "{original_error}; the automatic Firth/Jeffreys rescue WAS attempted \
                          and also failed to certify, so enabling Firth explicitly will not \
                          change this outcome: {retry_report}"
-                    )));
+                    ));
                 }
             }
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(error.to_string()),
     };
 
     let adaptive_spatial_terms = adaptive_spatial_term_mask(&request.spec);
@@ -726,20 +726,20 @@ pub(crate) fn fit_standard_model(
             // adaptive-link paths now report startup-validation failures
             // (#1571/#1572). The fit is NOT silently downgraded.
             log::warn!("[linkwiggle] binomial mean link-wiggle joint solve did not converge ({e})");
-            return Err(FitFailure::raised(gam_problem::FailureCategory::Convergence, format!(
+            return Err(format!(
                 "flexible/learnable link requested via link(type=flexible(...)) / \
                  linkwiggle(...), but the binomial mean link-wiggle joint solve did not \
                  converge ({e}). The fit was NOT silently downgraded to the fixed base \
                  link. Refit with a fixed link (e.g. logit/probit/cloglog) or adjust the \
                  wiggle spec (linkwiggle(internal_knots=...)). See gam#1596."
-            )));
+            ));
         }
     };
     if solved.fit.beta_covariance().is_none() {
-        return Err(FitFailure::raised(
-            gam_problem::FailureCategory::Invariant,
-            "link-wiggle fit reached assembly without its joint [Mean, LinkWiggle] posterior covariance; no model was minted",
-        ));
+        return Err(
+            "link-wiggle fit reached assembly without its joint [Mean, LinkWiggle] posterior covariance; no model was minted"
+                .to_string(),
+        );
     }
     // The joint link-wiggle solver is a custom block family and therefore does
     // not infer the observation-law metadata stored by the generic likelihood
@@ -812,7 +812,7 @@ trait LocationScaleWorkflowAdapter {
         spec: &Self::Spec,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermFitResult, FitFailure>;
+    ) -> Result<BlockwiseTermFitResult, String>;
 
     /// Select the link-wiggle basis from the pilot, then refit the full model
     /// with that selected wiggle block. Consumes `spec`.
@@ -823,7 +823,7 @@ trait LocationScaleWorkflowAdapter {
         wiggle_cfg: &LinkWiggleConfig,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermWiggleFitResult, FitFailure>;
+    ) -> Result<BlockwiseTermWiggleFitResult, String>;
 
     /// Plain non-wiggle fit, used when no wiggle config is present. Consumes
     /// `spec`.
@@ -832,7 +832,7 @@ trait LocationScaleWorkflowAdapter {
         spec: Self::Spec,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermFitResult, FitFailure>;
+    ) -> Result<BlockwiseTermFitResult, String>;
 
     /// Assemble the family result from a non-wiggle fit (knots/degree/wiggle
     /// coefficients all absent).
@@ -855,7 +855,7 @@ trait LocationScaleWorkflowAdapter {
 fn require_location_scale_covariance_or_decline(
     fit: &UnifiedFitResult,
     context: &str,
-) -> Result<(), FitFailure> {
+) -> Result<(), String> {
     if fit.beta_covariance().is_some() {
         return Ok(());
     }
@@ -866,13 +866,8 @@ fn require_location_scale_covariance_or_decline(
         );
         return Ok(());
     }
-    // The fit was asked for its covariance, so returning neither it nor a typed
-    // decline breaks the engine's own contract (#2937).
-    Err(FitFailure::raised(
-        gam_problem::FailureCategory::Invariant,
-        format!(
-            "{context} reached assembly without its joint posterior covariance or a typed constrained-posterior moment decline; no model was minted"
-        ),
+    Err(format!(
+        "{context} reached assembly without its joint posterior covariance or a typed constrained-posterior moment decline; no model was minted"
     ))
 }
 
@@ -881,7 +876,7 @@ fn require_location_scale_covariance_or_decline(
 /// their [`LocationScaleWorkflowAdapter`].
 fn fit_location_scale_with_optional_wiggle<A: LocationScaleWorkflowAdapter>(
     request: A::Request<'_>,
-) -> Result<A::Result, FitFailure> {
+) -> Result<A::Result, String> {
     let LocationScaleWorkflowParts {
         data,
         spec,
@@ -938,8 +933,7 @@ fn fit_location_scale_with_optional_wiggle<A: LocationScaleWorkflowAdapter>(
         noisespec_resolved: solved.fit.noisespec_resolved,
         mean_design: solved.fit.mean_design,
         noise_design: solved.fit.noise_design,
-    })
-    .map_err(crate::gamlss::assembly_failure)?;
+    })?;
     Ok(A::assemble_with_wiggle(
         assembled_fit,
         solved.wiggle_knots,
@@ -971,7 +965,7 @@ impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
         spec: &Self::Spec,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermFitResult, FitFailure> {
+    ) -> Result<BlockwiseTermFitResult, String> {
         // Gaussian location-scale uses an identity mean link; the joint wiggle
         // refit is always admissible, so the pilot fits with no extra guard.
         fit_gaussian_location_scale_terms(
@@ -996,7 +990,7 @@ impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
         wiggle_cfg: &LinkWiggleConfig,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermWiggleFitResult, FitFailure> {
+    ) -> Result<BlockwiseTermWiggleFitResult, String> {
         let selected_wiggle_basis = select_gaussian_location_scale_link_wiggle_basis_from_pilot(
             pilot,
             &WiggleBlockConfig {
@@ -1021,7 +1015,7 @@ impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
         spec: Self::Spec,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermFitResult, FitFailure> {
+    ) -> Result<BlockwiseTermFitResult, String> {
         fit_gaussian_location_scale_terms(data, spec, options, kappa_options)
     }
 
@@ -1080,15 +1074,14 @@ impl LocationScaleWorkflowAdapter for BinomialLocationScaleWorkflow {
         spec: &Self::Spec,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermFitResult, FitFailure> {
+    ) -> Result<BlockwiseTermFitResult, String> {
         // Binomial location-scale requires an inverse link that supports the
         // joint link-wiggle refit; gate it before any fitting work (the pilot
         // runs only on the wiggle path).
         require_inverse_link_supports_joint_wiggle(
             &spec.link_kind,
             "binomial location-scale link wiggle",
-        )
-        .map_err(|reason| FitFailure::raised(gam_problem::FailureCategory::Input, reason))?;
+        )?;
         fit_binomial_location_scale_terms(
             data,
             BinomialLocationScaleTermSpec {
@@ -1112,7 +1105,7 @@ impl LocationScaleWorkflowAdapter for BinomialLocationScaleWorkflow {
         wiggle_cfg: &LinkWiggleConfig,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermWiggleFitResult, FitFailure> {
+    ) -> Result<BlockwiseTermWiggleFitResult, String> {
         let selected_wiggle_basis = select_binomial_location_scale_link_wiggle_basis_from_pilot(
             pilot,
             &WiggleBlockConfig {
@@ -1137,7 +1130,7 @@ impl LocationScaleWorkflowAdapter for BinomialLocationScaleWorkflow {
         spec: Self::Spec,
         options: &BlockwiseFitOptions,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<BlockwiseTermFitResult, FitFailure> {
+    ) -> Result<BlockwiseTermFitResult, String> {
         fit_binomial_location_scale_terms(data, spec, options, kappa_options)
     }
 
@@ -1470,16 +1463,6 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw_with_units(
     {
         let ln_s = s.ln();
         result.fit.fit.log_likelihood -= n_obs * ln_s;
-        if let Some(mode_log_likelihood) = result
-            .fit
-            .fit
-            .geometry
-            .as_mut()
-            .and_then(|geometry| geometry.constrained_posterior.as_mut())
-            .and_then(|constrained| constrained.mode_log_likelihood.as_mut())
-        {
-            *mode_log_likelihood -= n_obs * ln_s;
-        }
         result.fit.fit.shift_criterion(n_obs * ln_s);
     }
 
@@ -1489,7 +1472,7 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw_with_units(
 
 pub(crate) fn fit_gaussian_location_scale_model(
     mut request: GaussianLocationScaleFitRequest<'_>,
-) -> Result<GaussianLocationScaleFitResult, FitFailure> {
+) -> Result<GaussianLocationScaleFitResult, String> {
     // Standardize the response so the fixed log-σ soft floor
     // `LOGB_SIGMA_FLOOR = 0.01` is scale-relative (≈ 1 % of the response
     // spread) rather than absolute. Without this the link σ = 0.01 + exp(η)
@@ -1502,12 +1485,9 @@ pub(crate) fn fit_gaussian_location_scale_model(
     // location-scale model either: refuse it rather than fit `y / 1e-6`
     // (#2469).
     if !(response_scale > 0.0) || !response_scale.is_finite() {
-        return Err(FitFailure::raised(
-            gam_problem::FailureCategory::Input,
-            format!(
-                "gaussian location-scale fit: the response has no finite positive spread \
-                 (sample std = {response_scale:.3e}); a location-scale model needs one"
-            ),
+        return Err(format!(
+            "gaussian location-scale fit: the response has no finite positive spread \
+             (sample std = {response_scale:.3e}); a location-scale model needs one"
         ));
     }
     if response_scale != 1.0 {
@@ -1524,16 +1504,13 @@ pub(crate) fn fit_gaussian_location_scale_model(
     let mut result =
         fit_location_scale_with_optional_wiggle::<GaussianLocationScaleWorkflow>(request)?;
 
-    // The raw-unit remap rewrites a fitted result the engine assembled, so its
-    // refusals are shape disagreements inside that result (#2937).
-    rescale_gaussian_location_scale_to_raw(&mut result, response_scale)
-        .map_err(crate::gamlss::assembly_failure)?;
+    rescale_gaussian_location_scale_to_raw(&mut result, response_scale)?;
     Ok(result)
 }
 
 pub(crate) fn fit_dispersion_location_scale_model(
     request: DispersionLocationScaleFitRequest<'_>,
-) -> Result<DispersionLocationScaleFitResult, FitFailure> {
+) -> Result<DispersionLocationScaleFitResult, String> {
     let kind = request.spec.kind;
     // The joint (mean + log-precision) posterior covariance / EDF is requested
     // unconditionally inside `fit_dispersion_glm_location_scale_terms`, which is
@@ -1550,7 +1527,7 @@ pub(crate) fn fit_dispersion_location_scale_model(
 
 pub(crate) fn fit_binomial_location_scale_model(
     request: BinomialLocationScaleFitRequest<'_>,
-) -> Result<BinomialLocationScaleFitResult, FitFailure> {
+) -> Result<BinomialLocationScaleFitResult, String> {
     fit_location_scale_with_optional_wiggle::<BinomialLocationScaleWorkflow>(request)
 }
 
@@ -3780,7 +3757,7 @@ pub(crate) fn fit_survival_transformation_model(
 
 pub(crate) fn fit_survival_location_scale_model(
     request: SurvivalLocationScaleFitRequest<'_>,
-) -> Result<SurvivalLocationScaleFitResult, FitFailure> {
+) -> Result<SurvivalLocationScaleFitResult, String> {
     // Fit one coherent survival subproblem: select/apply the link-wiggle basis,
     // then solve the full penalized location-scale fit, whose outer selects the
     // inverse-link shape together with ρ (#2904).
@@ -3789,15 +3766,12 @@ pub(crate) fn fit_survival_location_scale_model(
         spec: SurvivalLocationScaleTermSpec,
         wiggle: Option<LinkWiggleConfig>,
         kappa_options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Result<SurvivalLocationScaleProfile, FitFailure> {
+    ) -> Result<SurvivalLocationScaleProfile, String> {
         let mut wiggle_knots = None;
         let mut wiggle_degree = None;
 
         let fit = if let Some(wiggle) = wiggle {
-            require_inverse_link_supports_joint_wiggle(&spec.inverse_link, "survival link wiggle")
-                .map_err(|reason| {
-                    FitFailure::raised(gam_problem::FailureCategory::Input, reason)
-                })?;
+            require_inverse_link_supports_joint_wiggle(&spec.inverse_link, "survival link wiggle")?;
             let mut pilot_spec = spec.clone();
             pilot_spec.linkwiggle_block = None;
             let pilot = fit_survival_location_scale_terms(data, pilot_spec, kappa_options)?;
@@ -3843,7 +3817,7 @@ pub(crate) fn fit_survival_location_scale_model(
 
 pub(crate) fn fit_bernoulli_marginal_slope_model(
     request: BernoulliMarginalSlopeFitRequest<'_>,
-) -> Result<BernoulliMarginalSlopeFitResult, FitFailure> {
+) -> Result<BernoulliMarginalSlopeFitResult, String> {
     fit_bernoulli_marginal_slope_terms(
         request.data,
         request.spec,
@@ -3851,12 +3825,11 @@ pub(crate) fn fit_bernoulli_marginal_slope_model(
         &request.kappa_options,
         &request.policy,
     )
-    .map_err(FitFailure::from)
 }
 
 pub(crate) fn fit_survival_marginal_slope_model(
     request: SurvivalMarginalSlopeFitRequest<'_>,
-) -> Result<SurvivalMarginalSlopeFitResult, FitFailure> {
+) -> Result<SurvivalMarginalSlopeFitResult, String> {
     fit_survival_marginal_slope_terms(
         request.data,
         request.spec,
@@ -3867,7 +3840,7 @@ pub(crate) fn fit_survival_marginal_slope_model(
 
 pub(crate) fn fit_latent_survival_model(
     request: LatentSurvivalFitRequest<'_>,
-) -> Result<LatentSurvivalTermFitResult, FitFailure> {
+) -> Result<LatentSurvivalTermFitResult, String> {
     fit_latent_survival_terms(
         request.data,
         request.spec,
@@ -3878,7 +3851,7 @@ pub(crate) fn fit_latent_survival_model(
 
 pub(crate) fn fit_latent_binary_model(
     request: LatentBinaryFitRequest<'_>,
-) -> Result<LatentBinaryTermFitResult, FitFailure> {
+) -> Result<LatentBinaryTermFitResult, String> {
     fit_latent_binary_terms(
         request.data,
         request.spec,
@@ -3889,7 +3862,7 @@ pub(crate) fn fit_latent_binary_model(
 
 pub(crate) fn fit_transformation_normal_model(
     request: TransformationNormalFitRequest<'_>,
-) -> Result<TransformationNormalFitResult, FitFailure> {
+) -> Result<TransformationNormalFitResult, String> {
     fit_transformation_normal(
         &request.response,
         &request.weights,
@@ -3900,7 +3873,6 @@ pub(crate) fn fit_transformation_normal_model(
         &request.options,
         &request.kappa_options,
     )
-    .map_err(FitFailure::from)
 }
 
 

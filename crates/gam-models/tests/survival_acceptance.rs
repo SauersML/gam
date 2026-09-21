@@ -2,8 +2,8 @@
 //! The mathematical inference registrations match the public facade's startup;
 //! the CPU lane does not require a GPU dispatch registration.
 
-#[path = "survival_acceptance/covariate_constant_slope_2930.rs"]
-mod covariate_constant_slope_2930;
+#[path = "survival_acceptance/anchored_flex_2948.rs"]
+mod anchored_flex_2948;
 #[path = "survival_acceptance/declared_latent_law_2923.rs"]
 mod declared_latent_law_2923;
 #[path = "survival_acceptance/joint_latent_law_2929.rs"]
@@ -12,8 +12,6 @@ mod joint_latent_law_2929;
 mod follow_up_mode_response_fd_2765;
 #[path = "survival_acceptance/follow_up_varying_slope_2765.rs"]
 mod follow_up_varying_slope_2765;
-#[path = "survival_acceptance/landmark_short_horizon_calibration_2336.rs"]
-mod landmark_short_horizon_calibration_2336;
 #[path = "survival_acceptance/latent_frailty_inner_solve_2714.rs"]
 mod latent_frailty_inner_solve_2714;
 #[path = "survival_acceptance/latent_loaded_vs_unloaded_chart_2714.rs"]

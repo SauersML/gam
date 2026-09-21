@@ -5010,7 +5010,19 @@ fn predict_survival_location_scale_batch(
         }
         qdot *= &(derivative_basis.dot(&beta_wiggle) + 1.0);
     }
-    let eta_derivative_full = hdot + qdot;
+    // The scale divides the time transform too (#2695):
+    // `g = e^{−η_σ}·(ḣ − h·η_σ') + qdot`, with `h` the same exit-time channel
+    // the predicted residual reads.
+    let h_exit = location_scale_time_warp_components(
+        &pred_input.x_time_exit,
+        &pred_input.eta_time_offset_exit,
+        time_wiggle_knots.as_ref(),
+        time_wiggle_degree,
+        time_wiggle_ncols,
+        &saved_fit,
+    )?
+    .h;
+    let eta_derivative_full = &inv_sigma * &(&hdot - &(&h_exit * &eta_log_sigma_derivative)) + qdot;
     if eta_derivative_full
         .iter()
         .any(|value| !(value.is_finite() && *value > 0.0))

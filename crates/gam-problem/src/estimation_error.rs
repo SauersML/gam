@@ -894,6 +894,36 @@ pub enum EstimationError {
         terminal_refusal: Box<EstimationError>,
     },
 
+    /// A point that is stationary only because box-KKT projection removed an
+    /// outward pull at a face that is not a constraint of the model (#2627).
+    ///
+    /// Projection is stationarity at a face that belongs to the model's parameter
+    /// space. At a resolution limit or at the edge of what the computation
+    /// represents, an outward pull beyond the certificate's own stationarity band
+    /// means the criterion wants the coordinate past the face, so the point is
+    /// not an optimum of the model and no fit is minted or published from it.
+    #[error(
+        "Outer smoothing-parameter optimization reached no stationary optimum inside the \
+         model's domain ({context}): the certificate's projected gradient norm cleared its \
+         bound {bound:.3e} only by projecting away outward pull at face(s) that are not \
+         constraints of the model; with projection at constraint faces alone the norm is \
+         {constraint_projected_grad_norm:.3e}. The criterion wants each coordinate past its \
+         face: {}. Resume by seeding the outer search at rho_checkpoint = {rho_checkpoint:?}.",
+        .faces.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "),
+    )]
+    OuterDomainFaceRefused {
+        /// Fit context label (the same string the outer runner logs under).
+        context: String,
+        /// Every coordinate whose outward pull only a non-constraint face absorbed.
+        faces: Vec<crate::domain_face::RefusedDomainFace>,
+        /// The certificate's stationarity bound, the band each pull exceeds.
+        bound: f64,
+        /// The residual with the outward half removed only at constraint faces.
+        constraint_projected_grad_norm: f64,
+        /// The judged point, carried as the resume checkpoint. It is not a fit.
+        rho_checkpoint: Vec<f64>,
+    },
+
     #[error(
         "Fit assembly rejected a non-converged optimization state: inner status \
          {inner_status}, outer status {outer_status}, after {outer_iterations} outer \
@@ -1190,6 +1220,7 @@ impl EstimationError {
             | Self::OuterObjectiveEvaluationFailed { .. }
             | Self::RemlDidNotConverge { .. }
             | Self::DominatedCertifiedPlateau { .. }
+            | Self::OuterDomainFaceRefused { .. }
             | Self::FitDidNotConverge { .. }
             | Self::GradientUnavailable { .. }
             | Self::LayoutError { .. }
@@ -1351,6 +1382,7 @@ impl EstimationError {
             | Self::TrialPointRefused { .. }
             | Self::RemlDidNotConverge { .. }
             | Self::DominatedCertifiedPlateau { .. }
+            | Self::OuterDomainFaceRefused { .. }
             | Self::FitDidNotConverge { .. }
             // The exact Tweedie series refusing its term budget is a
             // convergence-class refusal of the likelihood evaluation.
@@ -1463,6 +1495,7 @@ impl EstimationError {
             Self::DominatedCertifiedPlateau { .. } => {
                 "EstimationError::DominatedCertifiedPlateau"
             }
+            Self::OuterDomainFaceRefused { .. } => "EstimationError::OuterDomainFaceRefused",
             Self::FitDidNotConverge { .. } => "EstimationError::FitDidNotConverge",
             Self::GradientUnavailable { .. } => "EstimationError::GradientUnavailable",
             Self::LayoutError(_) => "EstimationError::LayoutError",

@@ -366,9 +366,9 @@ fn all_assignment_topology_combinations_pass_startup_validation_1782() {
 /// Run the real outer `OuterProblem::run` ("SAE manifold") cascade — the exact
 /// FFI entry — for one topology/assignment pair on the tiny planted-circle
 /// fixture, with the single-PCA-seed budget the production `sae_manifold_fit`
-/// FFI uses, and return the reconstruction EV. A non-converged best-so-far
-/// iterate is still returned as `Ok`, so a returned EV means the fit RAN to a
-/// real reconstruction rather than aborting at startup / in the outer solver.
+/// FFI uses, and return the reconstruction EV. The outer search runs uncapped and
+/// the result must pass the shared outer certificate, so a returned EV is the
+/// reconstruction of a certified fit, not of a best-so-far iterate.
 fn run_full_fit(
     z: ArrayView2<'_, f64>,
     k: usize,
@@ -380,7 +380,6 @@ fn run_full_fit(
     let n_params = seed.len();
     let result = gam_solve::rho_optimizer::OuterProblem::new(n_params)
         .with_initial_rho(seed)
-        .with_max_iter(4)
         .with_seed_config(gam_problem::SeedConfig {
             max_seeds: 1,
             seed_budget: 1,
@@ -412,10 +411,8 @@ fn run_full_fit(
 /// The assignment axis (the issue's headline: threshold-gate/softmax) must not just
 /// pass validation but actually FIT: run the real outer `OuterProblem::run`
 /// ("SAE manifold") cascade — the exact FFI entry — on circle atoms for each
-/// assignment kind and require a finite reconstruction EV. Circle atoms are
-/// well-conditioned, so a low outer-iteration cap keeps this fast; a
-/// non-converged best-so-far iterate is still returned as `Ok`, so this asserts
-/// the fit RUNS to a real reconstruction rather than aborting at startup.
+/// assignment kind and require a certified fit with a finite reconstruction EV,
+/// not merely a fit that avoided aborting at startup.
 ///
 /// `softmax` is the SECOND #1782 failure surface: its seed and its whole
 /// neighbourhood land in the recoverable infeasible-ρ refusal class, so the
@@ -447,9 +444,9 @@ fn assignment_kinds_fit_on_circle_1782() {
 /// The topology axis of #1782: on identical clean planted-circle data the
 /// `euclidean` and `linear` atom topologies (whose rank-deficient PCA seed lands
 /// in the recoverable infeasible-ρ refusal class) must also FIT through the real
-/// outer cascade, not abort with an emptied / globally-refused seed cascade. Same
-/// single-PCA-seed budget and low outer-iteration cap as the assignment-axis
-/// test, so it stays fast. RED before the fix (`euclidean`/`linear` aborted at
+/// outer cascade and certify, not abort with an emptied / globally-refused seed
+/// cascade. Same single-PCA-seed budget as the assignment-axis test, uncapped and
+/// certified the same way. RED before the fix (`euclidean`/`linear` aborted at
 /// "no candidate seeds passed outer startup validation"); GREEN after.
 #[test]
 fn topologies_fit_on_circle_data_1782() {
@@ -843,8 +840,8 @@ fn seed_infeasibility_channel_is_named_2609() {
             Err(SaeCriterionError::IndefiniteObservedInformation { block }) => {
                 format!("INDEFINITE-OBSERVED-INFORMATION block={block}")
             }
-            Err(SaeCriterionError::OrbitCriterionUnavailableOnArrowRoute { atom }) => {
-                format!("ORBIT-CRITERION-UNAVAILABLE-ON-ARROW-ROUTE atom={atom}")
+            Err(SaeCriterionError::OrbitCriterionUnavailableOnArrowRoute { atom, refusal }) => {
+                format!("ORBIT-CRITERION-UNAVAILABLE-ON-ARROW-ROUTE atom={atom} lane={}: {refusal}", refusal.lane())
             }
             Err(SaeCriterionError::Numerical(message)) => {
                 format!("NUMERICAL(fatal, never mapped to +inf) {message}")

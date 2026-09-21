@@ -138,6 +138,10 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
     // no outer search is left to step away from it (#2943).
     let wrap_solver_err =
         |failure: FitFailure| -> WorkflowError { WorkflowError::from(failure.ending_the_fit()) };
+    // The survival location-scale helper still hands back text; it is recorded
+    // as unclassified rather than given a category it does not carry.
+    let wrap_untyped_solver_err =
+        |reason: String| -> WorkflowError { WorkflowError::from(FitFailure::from(reason)) };
     match request {
         FitRequest::Standard(request) => {
             if let Some(fitted) = try_deterministic_gaussian_standard_fit(&request)? {
@@ -161,7 +165,7 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
         }
         FitRequest::SurvivalLocationScale(request) => fit_survival_location_scale_model(request)
             .map(FitResult::SurvivalLocationScale)
-            .map_err(wrap_solver_err),
+            .map_err(wrap_untyped_solver_err),
         FitRequest::SurvivalTransformation(request) => fit_survival_transformation_model(request)
             .map(FitResult::SurvivalTransformation)
             .map_err(wrap_solver_err),
@@ -2794,13 +2798,6 @@ fn materialize_impl<'a>(
         if effective_config.transformation_normal {
             return Err(WorkflowError::TransformationNormalConflict {
                 conflict: TransformationNormalConflict::SurvResponse,
-            });
-        }
-        if !effective_config.residual_columns.is_empty() {
-            return Err(WorkflowError::InvalidConfig {
-                reason: "residual_columns is a Bernoulli marginal-slope block (gam#2924); the \
-                         survival marginal-slope family takes it once gam#2923 lands"
-                    .to_string(),
             });
         }
         // `materialize_*` now return `WorkflowError` directly so the typed

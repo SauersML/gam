@@ -17,7 +17,13 @@ use crate::chain::{Grid, log_sum_exp, normal_density};
 use crate::cohort::EventHistoryError;
 use crate::marginal::{ForwardPass, Spell, SubjectInputs, centred_baseline, condition, node_likelihood};
 use crate::scalar::{add_real, div, exp, ln, sqrt};
-use gam_math::nested_dual::JetField;
+use gam_math::nested_dual::{JET_ORDER_CAP, JetField};
+
+/// Newton steps that carry every derivative order a jet holds from a converged
+/// value: a step squares the error's order, so `k` steps from an exact value
+/// are exact through order `2^k − 1`, and no jet is exact past
+/// [`JET_ORDER_CAP`]. `⌈log₂(JET_ORDER_CAP + 1)⌉`.
+const IMPLICIT_STEPS: usize = (JET_ORDER_CAP + 1).next_power_of_two().trailing_zeros() as usize;
 
 fn failure(reason: &str) -> EventHistoryError {
     EventHistoryError::NumericalFailure { reason: reason.to_string() }
@@ -205,47 +211,48 @@ impl<S: JetField> Statistics<S> {
         out
     }
 
-    /// The product grid at the mode of `φ L`, scaled by its curvature.
-    fn place(&self, inputs: &SubjectInputs<'_, S>) -> Result<Grid<S>, EventHistoryError> {
-        let atoms = inputs.rates.len();
-        let like = &inputs.eta0[0];
-        let zero = like.constant_like(0.0);
-        let evaluate = |z: &[S]| {
-            let mut value = zero.clone();
-            let mut gradient = self.linear.to_vec();
-            let mut precision = vec![zero.clone(); atoms * atoms];
-            for k in 0..atoms {
-                value = value.add(&self.linear[k].mul(&z[k])).sub(&z[k].mul(&z[k]).scale(0.5));
-                gradient[k] = gradient[k].sub(&z[k]);
-                precision[k * atoms + k] = like.constant_like(1.0);
-            }
-            for (d, log_hazard) in self.log_hazards.iter().enumerate() {
-                if let Some(log_hazard) = log_hazard {
-                    let a = &inputs.loadings[d * atoms..(d + 1) * atoms];
-                    let log_rate = a.iter().zip(z).fold(log_hazard.clone(), |acc, (a, z)| acc.add(&a.mul(z)));
-                    let rate = exp(&log_rate);
-                    value = value.sub(&rate);
-                    for k in 0..atoms {
-                        gradient[k] = gradient[k].sub(&rate.mul(&a[k]));
-                        for j in 0..atoms {
-                            precision[k * atoms + j] = precision[k * atoms + j].add(&rate.mul(&a[k]).mul(&a[j]));
-                        }
+    /// `ln φ L` at `z` up to a constant, with its gradient and its negative
+    /// Hessian in `z`, for the loadings `loadings`.
+    fn objective(&self, loadings: &[S], z: &[S]) -> (S, Vec<S>, Vec<S>) {
+        let atoms = z.len();
+        let zero = z[0].constant_like(0.0);
+        let mut value = zero.clone();
+        let mut gradient = self.linear.to_vec();
+        let mut precision = vec![zero; atoms * atoms];
+        for k in 0..atoms {
+            value = value.add(&self.linear[k].mul(&z[k])).sub(&z[k].mul(&z[k]).scale(0.5));
+            gradient[k] = gradient[k].sub(&z[k]);
+            precision[k * atoms + k] = z[0].constant_like(1.0);
+        }
+        for (d, log_hazard) in self.log_hazards.iter().enumerate() {
+            if let Some(log_hazard) = log_hazard {
+                let a = &loadings[d * atoms..(d + 1) * atoms];
+                let log_rate = a.iter().zip(z).fold(log_hazard.clone(), |acc, (a, z)| acc.add(&a.mul(z)));
+                let rate = exp(&log_rate);
+                value = value.sub(&rate);
+                for k in 0..atoms {
+                    gradient[k] = gradient[k].sub(&rate.mul(&a[k]));
+                    for j in 0..atoms {
+                        precision[k * atoms + j] = precision[k * atoms + j].add(&rate.mul(&a[k]).mul(&a[j]));
                     }
                 }
             }
-            (value, gradient, precision)
-        };
-        let mut means = vec![zero.clone(); atoms];
-        // Fixed iteration depth carries parameter sensitivities through the
-        // converged mode, including when its primal value has stopped moving.
-        for _ in 0..24 {
-            let (value, gradient, precision) = evaluate(&means);
+        }
+        (value, gradient, precision)
+    }
+
+    /// `steps` Newton ascent steps on `ln φ L` from `start`, each halved until
+    /// the objective does not fall below where it was.
+    fn ascend(&self, loadings: &[S], start: Vec<S>, steps: usize) -> Result<Vec<S>, EventHistoryError> {
+        let mut means = start;
+        for _ in 0..steps {
+            let (value, gradient, precision) = self.objective(loadings, &means);
             let step = solve(&precision, &gradient)?;
             let mut scale = 1.0;
             let mut next: Vec<S> = means.iter().zip(&step).map(|(z, d)| z.add(d)).collect();
             let mut accepted = false;
             for _ in 0..40 {
-                let proposed = evaluate(&next).0.value();
+                let proposed = self.objective(loadings, &next).0.value();
                 if proposed.is_finite() && proposed >= value.value() - 16.0 * f64::EPSILON * (1.0 + value.value().abs()) {
                     accepted = true;
                     break;
@@ -256,10 +263,52 @@ impl<S: JetField> Statistics<S> {
             if !accepted { return Err(failure("static posterior grid placement did not converge")); }
             means = next;
         }
-        let (value, gradient, precision) = evaluate(&means);
+        Ok(means)
+    }
+
+    /// The product grid at the mode of `φ L`, scaled by its curvature.
+    ///
+    /// The mode is searched on the values alone. The coefficient channels then
+    /// follow it by the implicit function theorem: from the converged value,
+    /// [`IMPLICIT_STEPS`] Newton steps over `S`, each with the Hessian at the
+    /// current jet, carry every channel. Searching in `S` itself cost a
+    /// jet-valued solve per step, and a running error bound grows at each of
+    /// them because it cannot see the map contract (#2965).
+    fn place(&self, inputs: &SubjectInputs<'_, S>) -> Result<Grid<S>, EventHistoryError> {
+        let like = &inputs.eta0[0];
+        let values = Statistics {
+            linear: self.linear.iter().map(JetField::value).collect(),
+            log_hazards: self.log_hazards.iter().map(|h| h.as_ref().map(JetField::value)).collect(),
+        };
+        let loadings: Vec<f64> = inputs.loadings.iter().map(JetField::value).collect();
+        let mode = values.ascend(&loadings, vec![0.0; inputs.rates.len()], 24)?;
+        let start = mode.iter().map(|z| like.constant_like(*z)).collect();
+        self.grid_at(inputs, self.implicit_steps(inputs.loadings, start, IMPLICIT_STEPS)?)
+    }
+
+    /// `steps` full Newton steps from the converged value `start`, each solving
+    /// with the gradient and Hessian at the current jet, so every step squares
+    /// the error's order in the channels.
+    fn implicit_steps(&self, loadings: &[S], start: Vec<S>, steps: usize) -> Result<Vec<S>, EventHistoryError> {
+        let mut means = start;
+        for _ in 0..steps {
+            let (_, gradient, precision) = self.objective(loadings, &means);
+            let step = solve(&precision, &gradient)?;
+            means = means.iter().zip(&step).map(|(z, d)| z.add(d)).collect();
+        }
+        Ok(means)
+    }
+
+    /// The grid centred at `means`, which must be the mode, with the scales
+    /// its curvature gives.
+    fn grid_at(&self, inputs: &SubjectInputs<'_, S>, means: Vec<S>) -> Result<Grid<S>, EventHistoryError> {
+        let atoms = inputs.rates.len();
+        let like = &inputs.eta0[0];
+        let (value, gradient, precision) = self.objective(inputs.loadings, &means);
         if !value.value().is_finite() || gradient.iter().any(|g| !g.value().is_finite() || g.value().abs() > 1e-8) {
             return Err(failure("static posterior grid placement has an unresolved score"));
         }
+        let zero = like.constant_like(0.0);
         let mut scales = Vec::with_capacity(atoms);
         for k in 0..atoms {
             let mut unit = vec![zero.clone(); atoms];
@@ -604,5 +653,156 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "#2962 static spells:\n{}", failures.join("\n"));
+    }
+
+    /// The placement carries every derivative order a jet holds by the implicit
+    /// function theorem (#2965). The mode is searched on the values alone, then
+    /// [`IMPLICIT_STEPS`] Newton steps over the jet carry the channels.
+    /// - The gradient of `ln φ L` vanishes at the mode in every channel: that
+    ///   is the identity defining the mode as a function of the coefficients.
+    ///   At an order-4 jet over `Bound`, every channel of the gradient at the
+    ///   placed mean is within its own rounding bound `ε μ`. The searched value
+    ///   enters as a rounded constant; the pin in `marginal` makes it rule data
+    ///   both routes share, so only the Newton steps from it are charged. A step
+    ///   fewer leaves the order-4 channel unconverged.
+    /// - The placed values are today's, the whole search in the jet from the
+    ///   prior mean: each is within its own Newton step of the mode plus the
+    ///   rounding of its last addition, `|Δz| ≤ |d| + |d_today| + u(|z| +
+    ///   |z_today|)`.
+    /// - Today's channels against the placed ones are printed, not asserted:
+    ///   the running bound through the whole search in the jet is not finite in
+    ///   any useful sense, which is why the channels no longer take it.
+    #[test]
+    fn placement_carries_every_jet_order_by_the_implicit_function_2965() {
+        use crate::cohort::SubjectNodes;
+        use crate::scalar::Rows;
+        use crate::test_support::Bound;
+        type Jet = Rows<Rows<Rows<Rows<Bound, 1>, 1>, 1>, 1>;
+        fn channels(x: &Jet) -> Vec<Bound> {
+            let mut out = Vec::with_capacity(16);
+            for a in [&x.base, &x.rows[0]] {
+                for b in [&a.base, &a.rows[0]] {
+                    for c in [&b.base, &b.rows[0]] {
+                        out.extend([c.base, c.rows[0]]);
+                    }
+                }
+            }
+            out
+        }
+        // Coefficient `q` seeded at every level whose direction is `q`: the
+        // order-4 channel is `∂⁴/∂a₀² ∂a₁ ∂η⁰`.
+        let directions = [0usize, 1, 2, 0];
+        let seed = |value: f64, q: usize| -> Jet {
+            let t = |level: usize| [f64::from(directions[level] == q)];
+            Rows::seed(Rows::seed(Rows::seed(Rows::seed(Bound::exact(value), t(3)), t(2)), t(1)), t(0))
+        };
+        let times = [0.0, 0.25, 0.5, 0.75, 1.0];
+        let events = [0.0, 1.0, 0.0, 1.0, 1.0];
+        let n_nodes = times.len();
+        let nodes = SubjectNodes {
+            first_row: 0,
+            times: times.to_vec(),
+            gaps: times.windows(2).map(|w| w[1] - w[0]).collect(),
+            weights: vec![0.2; n_nodes],
+            exposures: Array2::from_elem((n_nodes, 1), 0.2),
+            counts: Array2::from_shape_fn((n_nodes, 1), |(n, _)| events[n]),
+            covariate_rows: vec![0; n_nodes],
+        };
+        let gh = GaussHermite::new(9).unwrap();
+        let eta0: Vec<Jet> = times.iter().map(|t| seed(-0.3 + 0.2 * t, 2)).collect();
+        let loadings = [seed(0.8, 0), seed(0.5, 1)];
+        let rates = [seed(0.0, 3), seed(0.0, 3)];
+        let inputs = SubjectInputs {
+            nodes: &nodes, eta0: &eta0, loadings: &loadings, rates: &rates, time_scale: 1.0, gh: &gh,
+            continuation_gap: 0.0, designs: None, log_normaliser: None,
+        };
+        let statistics = Statistics::whole(&inputs, &[true]);
+        let grid = statistics.place(&inputs).unwrap();
+        let means: Vec<Jet> = grid.axes.iter().map(|axis| axis.mu.clone()).collect();
+        let (_, gradient, _) = statistics.objective(inputs.loadings, &means);
+        for (k, g) in gradient.iter().enumerate() {
+            for (c, channel) in channels(g).iter().enumerate() {
+                eprintln!("atom {k} channel {c:04b}: gradient {:e} rounding {:e}", channel.value, channel.rounding());
+            }
+        }
+        for (k, g) in gradient.iter().enumerate() {
+            for (c, channel) in channels(g).iter().enumerate() {
+                assert!(channel.value.abs() <= channel.rounding(),
+                    "atom {k} channel {c:04b}: the gradient at the placed mode is {:e}, beyond its rounding bound {:e}",
+                    channel.value, channel.rounding());
+            }
+        }
+        let zero = eta0[0].constant_like(0.0);
+        let today = statistics.ascend(inputs.loadings, vec![zero; 2], 24).unwrap();
+        let values = Statistics {
+            linear: statistics.linear.iter().map(JetField::value).collect(),
+            log_hazards: statistics.log_hazards.iter().map(|h| h.as_ref().map(JetField::value)).collect(),
+        };
+        let loading_values: Vec<f64> = loadings.iter().map(JetField::value).collect();
+        let newton_step = |z: &[f64]| -> Vec<f64> {
+            let (_, gradient, precision) = values.objective(&loading_values, z);
+            solve(&precision, &gradient).unwrap()
+        };
+        let placed: Vec<f64> = means.iter().map(JetField::value).collect();
+        let earlier: Vec<f64> = today.iter().map(JetField::value).collect();
+        let (step, earlier_step) = (newton_step(&placed), newton_step(&earlier));
+        for k in 0..2 {
+            let band = step[k].abs() + earlier_step[k].abs()
+                + 0.5 * f64::EPSILON * (placed[k].abs() + earlier[k].abs());
+            eprintln!("atom {k}: placed {:e} today {:e} difference {:e} band {band:e}", placed[k], earlier[k], placed[k] - earlier[k]);
+            for (c, (ours, theirs)) in channels(&means[k]).iter().zip(channels(&today[k])).enumerate() {
+                eprintln!("atom {k} channel {c:04b}: placed {:e} today {:e}", ours.value, theirs.value);
+            }
+            assert!((placed[k] - earlier[k]).abs() <= band,
+                "atom {k}: the placed mode {:e} is {:e} from today's {:e}, beyond the band {band:e}",
+                placed[k], placed[k] - earlier[k], earlier[k]);
+        }
+    }
+
+    /// `Bound`'s first-order bound at least doubles through every node the
+    /// static filter conditions (#2965), which is why the Louis agreement
+    /// fixtures keep to few nodes. `condition` forms `raw_i = p_i e_i`, the sum
+    /// `c = Σ_j w_j raw_j` and `α_i = raw_i / c`. `Bound` charges a product or a
+    /// quotient at least the sum of its operands' relative bounds, and a sum of
+    /// positive terms at least the smallest of theirs, so the smallest relative
+    /// bound over a node's grid points satisfies `m_n ≥ m_{n−1} + m_{n−1}`. The
+    /// quotient's actual error grows about linearly instead, because the
+    /// numerator and the sum share it. At nineteen nodes: nine Legendre points
+    /// in each of two cells, and the event.
+    #[test]
+    fn the_running_bound_doubles_through_the_static_filter_2965() {
+        use crate::test_support::Bound;
+        let mut cohort = EventHistoryCohort {
+            mark_names: vec!["event".to_string()], mark_kinds: vec![MarkKind::Recurrent],
+            covariate_names: Vec::new(), covariate_levels: Vec::new(), covariates: Array2::zeros((1, 0)),
+            subjects: vec![SubjectHistory { id: "one".to_string(), entry: 0.0, exit: 1.0,
+                events: vec![Event { time: 0.5, mark: 0 }],
+                segments: vec![CovariateSegment { start: 0.0, row: 0 }] }],
+        };
+        cohort.validate().unwrap();
+        let nodes = expand_nodes(&cohort, 9, 0).unwrap();
+        let subject = &nodes.subjects[0];
+        let gh = GaussHermite::new(9).unwrap();
+        let eta0 = vec![Bound::exact(0.0); subject.len()];
+        let loadings = [Bound::exact(1.2), Bound::exact(0.6)];
+        let rates = [Bound::exact(0.0), Bound::exact(0.0)];
+        let inputs = SubjectInputs {
+            nodes: subject, eta0: &eta0, loadings: &loadings, rates: &rates, time_scale: 1.0, gh: &gh,
+            continuation_gap: 0.0, designs: None, log_normaliser: None,
+        };
+        let pass = filter(&inputs, None, &[true]).unwrap();
+        let smallest: Vec<f64> = pass.alpha.iter().map(|alpha| alpha.iter()
+            .filter(|a| a.value > 0.0)
+            .map(|a| a.rounding() / a.value)
+            .fold(f64::INFINITY, f64::min)).collect();
+        eprintln!("{} nodes", smallest.len());
+        for (n, m) in smallest.iter().enumerate() {
+            eprintln!("node {n}: smallest relative bound {m:e}, ratio {:e}", if n == 0 { f64::NAN } else { m / smallest[n - 1] });
+        }
+        assert!(smallest.len() >= 2 && smallest.iter().all(|m| m.is_finite()), "the filter conditions every node");
+        for n in 1..smallest.len() {
+            assert!(smallest[n] >= 2.0 * smallest[n - 1],
+                "node {n}: the smallest relative bound {:e} is below twice the previous node's {:e}", smallest[n], smallest[n - 1]);
+        }
     }
 }

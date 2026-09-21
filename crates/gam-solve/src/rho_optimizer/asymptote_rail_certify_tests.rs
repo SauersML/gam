@@ -1,6 +1,93 @@
 use super::*;
 use ndarray::array;
 
+/// #2735: the face law's pulled-back falsification point is a trial point, and a
+/// trial the criterion refuses is a statement about that point. The falsification
+/// must DECLINE with the refusal's reason — never end the fit through `?` — and it
+/// must still restore the certified point before judging.
+#[test]
+fn face_law_falsification_declines_at_a_refused_pulled_back_point_2735() {
+    const PLANTED: &str = "planted refusal at the pulled-back face point";
+    let rho_hat = 30.0_f64;
+    let limit = RailFaceLimit {
+        face: vec![0],
+        face_rho: vec![rho_hat],
+        first_order_form: Array2::from_diag(&array![4.0, 6.0]),
+        released_penalties: vec![Array2::from_diag(&array![2.0, 3.0])],
+        released_score: array![1.0, 2.0],
+        form_conditioning: 1.0,
+        limit_beta: Array1::zeros(0),
+        limit_dispersion: 1.0,
+        released_curvature_drift: None,
+    };
+    let proof = match certify_rail_face(&limit) {
+        RailFaceVerdict::Certified(proof) => proof,
+        other => panic!("the diagonal positive-definite face must certify, got {other:?}"),
+    };
+    let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
+    let mut obj = problem.build_objective(
+        Vec::<f64>::new(),
+        move |seen: &mut Vec<f64>, rho: &Array1<f64>| {
+            seen.push(rho[0]);
+            if rho[0] < rho_hat - 0.5 {
+                Err(EstimationError::TrialPointRefused {
+                    reason: PLANTED.to_string(),
+                })
+            } else {
+                Ok(1.0)
+            }
+        },
+        |_: &mut Vec<f64>, rho: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: 1.0,
+                gradient: Array1::zeros(rho.len()),
+                hessian: HessianValue::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut Vec<f64>)>,
+        None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let rho = array![rho_hat];
+    let gradient = array![0.0];
+    let hessian = array![[1.0]];
+    let bounds = (array![0.0], array![40.0]);
+    let inputs = AsymptoteRailInputs {
+        rho: &rho,
+        projected_gradient: &gradient,
+        railed: &[0],
+        layout: OuterThetaLayout::new(1, 0),
+        hessian: &hessian,
+        bounds: &bounds,
+        terminal_beta: None,
+        stationarity_bound: StationarityBound::from_ladder(1.0e-3, StationarityBoundSource::SolverBand),
+        objective_tol: 1.0e-10,
+        context: "face law falsification at a refused point",
+        native_coordinate_order: None,
+    };
+
+    let verdict = falsify_face_law(&mut obj, &inputs, &limit, &proof)
+        .expect("a refused pulled-back point must decline, not end the fit");
+    match verdict {
+        Err(reason) => assert!(
+            reason.contains(PLANTED),
+            "the decline must carry the refusal's reason, got {reason:?}"
+        ),
+        Ok(()) => panic!("a refused falsification point cannot falsify the face law"),
+    }
+    assert!(
+        obj.state.iter().any(|&r| r < rho_hat - 0.5),
+        "the pulled-back point must have been evaluated: {:?}",
+        obj.state
+    );
+    assert_eq!(
+        obj.state.last().copied(),
+        Some(rho_hat),
+        "the certified point must be restored before the decline: {:?}",
+        obj.state
+    );
+}
+
 /// Build a one-coordinate UPPER-rail tail-law objective: at ρ its gradient is
 /// `−c·e^{−ρ}` (so `ĉ = −e^{ρ}·grad = c` is constant) and its published inner
 /// β is `a·e^{−ρ}` (so consecutive-probe `‖Δβ‖` contracts geometrically).

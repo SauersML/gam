@@ -2929,9 +2929,7 @@ fn every_registered_d2_topology_fits_at_least_once_2604() {
                     .with_geometry_plan(fit.geometry.clone())
                     .expect("attach fitted curvature geometry");
                     assert!(
-                        atom.smooth_penalty_kappa_derivative()
-                            .expect("dS/dkappa sits at the atom's basis width")
-                            .is_some(),
+                        atom.smooth_penalty_kappa_derivative().is_some(),
                         "geometry attachment must install dS/dkappa with S(kappa)"
                     );
                     let assignment = SaeAssignment::with_mode(

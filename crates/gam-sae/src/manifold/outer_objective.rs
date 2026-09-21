@@ -1,4 +1,5 @@
 use super::*;
+use gam_problem::domain_face::{DomainFaceKind, DomainFaces};
 use gam_solve::rho_optimizer::{
     FixedPointCertificateEval, FixedPointCoordinateCertificate, OuterResult,
 };
@@ -529,10 +530,15 @@ pub struct OuterProbeTelemetry {
     pub root_solve_failures: usize,
     /// Dense root steps not taken because the pencil resolved a negative curvature.
     pub root_negative_curvature_no_steps: usize,
-    /// Arrow root steps not taken because the exact-A system does not factor at ridge 0.
-    pub root_unfactorable_no_steps: usize,
+    /// Arrow root steps not taken because the exact-A solve escalated its ridge.
+    pub root_ridge_escalation_no_steps: usize,
     /// Refined roots that did not certify, so the accepted state was priced instead.
     pub root_uncertified_refinements: usize,
+    /// #2822 — root phases that ended with the gate inside its formation band.
+    pub root_rounding_floor_stops: usize,
+    /// #2822 — root steps the strict contraction would have committed, refused because the
+    /// two gates' formation bands overlap.
+    pub root_band_refused_commits: usize,
 }
 
 impl OuterProbeTelemetry {
@@ -722,6 +728,9 @@ enum OuterEvaluationArtifacts {
     /// it, so one dense evaluation decomposes its state once.
     Dense(DenseExactAGeometry),
     MatrixFree(MatrixFreeOuterArtifacts),
+    /// #2234 step 1a — the arrow orbit lane's bordered elimination the streaming criterion
+    /// priced a closure-certified circle orbit off.
+    ArrowOrbit(ArrowOrbitGeometry),
 }
 
 pub(crate) struct OuterCriterionEvaluation {
@@ -967,7 +976,7 @@ impl SaeManifoldOuterObjective {
                 .geometry_plan()
                 .and_then(SaeAtomGeometryPlan::constant_curvature)
                 .is_some_and(|current| current.to_bits() == kappa.to_bits())
-                && atom.smooth_penalty_kappa_derivative()?.is_some();
+                && atom.smooth_penalty_kappa_derivative().is_some();
             if !already_installed {
                 prepared.push((atom_index, atom.prepare_constant_curvature(kappa)?));
             }
@@ -1242,16 +1251,24 @@ impl SaeManifoldOuterObjective {
         if evaluated.cost.is_finite() {
             self.adopt_collapse_prevention_gates_from_root();
         }
+        let artifacts = match evaluated.evidence {
+            StreamingOuterEvidence::Bundle(bundle) => {
+                OuterEvaluationArtifacts::MatrixFree(MatrixFreeOuterArtifacts {
+                    system: bundle.system,
+                    exact_a_cache: bundle.exact_a_cache,
+                    logdet_derivative_bundle: bundle.logdet_derivative_bundle,
+                    efs_inverse_probe_bundle: bundle.efs_inverse_probe_bundle,
+                })
+            }
+            StreamingOuterEvidence::ArrowOrbit(geometry) => {
+                OuterEvaluationArtifacts::ArrowOrbit(geometry)
+            }
+        };
         Ok(OuterCriterionEvaluation {
             cost: evaluated.cost,
             loss: evaluated.loss,
             cache: evaluated.cache,
-            artifacts: OuterEvaluationArtifacts::MatrixFree(MatrixFreeOuterArtifacts {
-                system: evaluated.system,
-                exact_a_cache: evaluated.exact_a_cache,
-                logdet_derivative_bundle: evaluated.logdet_derivative_bundle,
-                efs_inverse_probe_bundle: evaluated.efs_inverse_probe_bundle,
-            }),
+            artifacts,
         })
     }
 
@@ -1295,6 +1312,19 @@ impl SaeManifoldOuterObjective {
                         Some(&matrix_free.system),
                         None,
                     )?
+            }
+            OuterEvaluationArtifacts::ArrowOrbit(geometry) => {
+                // #2234 — `cache` is the `B` geometry the implicit right-hand sides ride; every
+                // log-determinant channel and the adjoint read the orbit lane's elimination.
+                let solver = DeflatedArrowSolver::plain(&evaluation.cache);
+                self.term.analytic_outer_rho_gradient_components_arrow_orbit(
+                    self.target.view(),
+                    rho,
+                    &evaluation.loss,
+                    &evaluation.cache,
+                    &solver,
+                    geometry,
+                )?
             }
             OuterEvaluationArtifacts::Dense(geometry) => {
                 let lambda_smooth = rho
@@ -1644,8 +1674,10 @@ impl SaeManifoldOuterObjective {
             root_band_skips: root.band_skips,
             root_solve_failures: root.solve_failures,
             root_negative_curvature_no_steps: root.negative_curvature_no_steps,
-            root_unfactorable_no_steps: root.unfactorable_no_steps,
+            root_ridge_escalation_no_steps: root.ridge_escalation_no_steps,
             root_uncertified_refinements: root.uncertified_refinements,
+            root_rounding_floor_stops: root.rounding_floor_stops,
+            root_band_refused_commits: root.band_refused_commits,
             ..self.probe_telemetry
         }
     }
@@ -2802,7 +2834,7 @@ impl SaeManifoldOuterObjective {
             OuterEvaluationArtifacts::MatrixFree(artifacts) => {
                 artifacts.efs_inverse_probe_bundle.as_ref()
             }
-            OuterEvaluationArtifacts::Dense(_) => None,
+            OuterEvaluationArtifacts::Dense(_) | OuterEvaluationArtifacts::ArrowOrbit(_) => None,
         };
         let traces = if let Some((probes, sinv)) = inverse_probe_bundle.as_ref() {
             self.term
@@ -3990,7 +4022,13 @@ impl OuterObjective for SaeManifoldOuterObjective {
         Ok(SeedOutcome::Installed)
     }
 
-    fn outer_domain_upper_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
+    /// The objective's upper faces, each declared by what it is (#2627): the
+    /// log-strength domain and the learnable-α shift of it are
+    /// [`DomainFaceKind::Representability`], a #2812 resolvability face is
+    /// [`DomainFaceKind::Resolution`], and the geometry-owned faces (the reactive
+    /// structural face, the #2691 periodic ARD face and a curvature rail) are
+    /// [`DomainFaceKind::Constraint`].
+    fn outer_domain_upper_bound(&self) -> Result<Option<DomainFaces>, EstimationError> {
         self.baseline_term
             .assignment
             .validate_rho_domain(&self.baseline_rho)
@@ -4006,7 +4044,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 self.baseline_rho.sparse_flat_index(),
             )
         {
-            bounds[index] = bounds[index].min(alpha_upper);
+            // The log-strength domain shifted by -ln(alpha)
+            // (`learnable_weight_coordinate_domain`): still its representable edge.
+            bounds.tighten_upper(index, alpha_upper, DomainFaceKind::Representability);
         }
         let curvature_bounds = self.curvature_domain_bounds()?;
         // #2691 — the periodic ARD face, applied on BOTH exits of this function.
@@ -4043,13 +4083,17 @@ impl OuterObjective for SaeManifoldOuterObjective {
         let Some(contract) = self.reactive_domain_scalar_contract()? else {
             if let Some(bounds) = log_strength_upper.as_mut() {
                 for &(index, _, upper) in &resolvability_faces {
-                    bounds[index] = bounds[index].min(upper.max(target[index]));
+                    bounds.tighten_upper(
+                        index,
+                        upper.max(target[index]),
+                        DomainFaceKind::Resolution,
+                    );
                 }
                 for &(index, face) in &chart_faces {
-                    bounds[index] = bounds[index].min(face.max(target[index]));
+                    bounds.tighten_upper(index, face.max(target[index]), DomainFaceKind::Constraint);
                 }
                 for &(index, _, upper) in &curvature_bounds {
-                    bounds[index] = upper;
+                    bounds.replace(index, upper, DomainFaceKind::Constraint);
                 }
             }
             return Ok(log_strength_upper);
@@ -4074,36 +4118,47 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     "reactive rho domain could not construct its separated entry geometry: {error}"
                 ))
             })?;
-        let mut reactive_upper = reactive_rho_domain_upper(
-            &entry_term,
-            &self.baseline_rho,
-            contract.entry().assignment_temperature,
-        )
-        .map_err(EstimationError::RemlOptimizationFailed)?;
+        // The reactive face is the objective's own structural domain, derived from
+        // the placed entry geometry (`reactive_rho_domain_upper`): a constraint.
+        let mut reactive_upper = DomainFaces::uniform(
+            reactive_rho_domain_upper(
+                &entry_term,
+                &self.baseline_rho,
+                contract.entry().assignment_temperature,
+            )
+            .map_err(EstimationError::RemlOptimizationFailed)?,
+            DomainFaceKind::Constraint,
+        );
         if let Some(log_strength_upper) = log_strength_upper {
             for index in 0..reactive_upper.len() {
-                reactive_upper[index] = reactive_upper[index].min(log_strength_upper[index]);
+                reactive_upper.tighten_upper(
+                    index,
+                    log_strength_upper.values()[index],
+                    log_strength_upper.kinds()[index],
+                );
             }
         }
         // #2691 — the same chart-resolution face on the reactive exit. The
         // reactive construction leaves a periodic ARD coordinate at its literal
         // target, which is not a claim about the domain.
         for &(index, face) in &chart_faces {
-            reactive_upper[index] = reactive_upper[index].min(face.max(target[index]));
+            reactive_upper.tighten_upper(index, face.max(target[index]), DomainFaceKind::Constraint);
         }
         for &(index, _, upper) in &resolvability_faces {
-            reactive_upper[index] = reactive_upper[index].min(upper.max(target[index]));
+            reactive_upper.tighten_upper(index, upper.max(target[index]), DomainFaceKind::Resolution);
         }
         // Reactive-domain construction knows only log-strength coordinates.
         // Curvature is a raw, scale-dependent coordinate, so its typed geometry
         // rail replaces (rather than intersects) that generic placeholder.
         for &(index, _, upper) in &curvature_bounds {
-            reactive_upper[index] = upper;
+            reactive_upper.replace(index, upper, DomainFaceKind::Constraint);
         }
         Ok(Some(reactive_upper))
     }
 
-    fn outer_domain_lower_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
+    /// The objective's lower faces, declared as in
+    /// [`Self::outer_domain_upper_bound`].
+    fn outer_domain_lower_bound(&self) -> Result<Option<DomainFaces>, EstimationError> {
         self.baseline_term
             .assignment
             .validate_rho_domain(&self.baseline_rho)
@@ -4117,7 +4172,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             && let (Some(bounds), Some(index)) =
                 (lower.as_mut(), self.baseline_rho.sparse_flat_index())
         {
-            bounds[index] = bounds[index].max(alpha_lower);
+            bounds.tighten_lower(index, alpha_lower, DomainFaceKind::Representability);
         }
         if let Some(bounds) = lower.as_mut() {
             let assignments = self
@@ -4130,10 +4185,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 resolvability_domain_faces(&self.baseline_term, &self.baseline_rho, &assignments)
                     .map_err(EstimationError::RemlOptimizationFailed)?
             {
-                bounds[index] = bounds[index].max(face.min(target[index]));
+                bounds.tighten_lower(index, face.min(target[index]), DomainFaceKind::Resolution);
             }
             for (index, curvature_lower, _) in self.curvature_domain_bounds()? {
-                bounds[index] = curvature_lower;
+                bounds.replace(index, curvature_lower, DomainFaceKind::Constraint);
             }
         }
         Ok(lower)

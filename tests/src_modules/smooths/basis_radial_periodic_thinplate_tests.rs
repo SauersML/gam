@@ -4962,6 +4962,10 @@ fn test_pure_polyharmonic_origin_jets_preserve_derivative_singularities() {
 
 #[test]
 fn test_duchon_hybrid_collision_uses_combined_partial_fraction_limit() {
+    // `p = 1, s = 1, d = 3` routes through the stable single integral, which forms the
+    // kernel without its origin constant (gam#2735). The diagonal is therefore 0 by
+    // construction, and the constant it removes is the combined partial-fraction
+    // collision limit `φ(0) = 1/(4π)`.
     let p_order = 1usize;
     let s_order = 1usize;
     let dim = 3usize;
@@ -4976,8 +4980,19 @@ fn test_duchon_hybrid_collision_uses_combined_partial_fraction_limit() {
         Some(&coeffs),
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "finite hybrid diagonal", e));
+    assert_abs_diff_eq!(got, 0.0, epsilon = 1e-12);
     let expected = 1.0 / (4.0 * std::f64::consts::PI);
-    assert_abs_diff_eq!(got, expected, epsilon = 1e-12);
+    let combined_limit =
+        duchon_hybrid_kernel_collision_value(length_scale, p_order, s_order, dim, &coeffs)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "combined partial-fraction limit", e));
+    assert_abs_diff_eq!(combined_limit, expected, epsilon = 1e-12);
+    let profile = duchon_radial_profile(p_order, s_order, dim)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "radial profile", e));
+    let removed_constant = profile.kappa_scale(1.0 / length_scale)
+        * profile
+            .origin_value()
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "origin value", e));
+    assert_abs_diff_eq!(removed_constant, expected, epsilon = 1e-12);
 }
 
 #[test]
@@ -5015,6 +5030,18 @@ fn test_duchon_aniso_collocation_uses_metric_weights() {
     let s_order = 2usize;
     let dim = 2usize;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0);
+    // The collocation operators carry the forward chart amplitude `α`
+    // (`duchon_kernel_chart`, gam#979, gam#2735), so the hand-assembled rows do too.
+    let amplification = duchon_kernel_amplification(
+        centers.view(),
+        Some(1.0),
+        p_order,
+        s_order,
+        dim,
+        Some(&eta),
+        Some(&coeffs),
+        None,
+    );
     let weights = [4.0, 0.25];
     let sum_weights = weights.iter().sum::<f64>();
 
@@ -5043,13 +5070,14 @@ fn test_duchon_aniso_collocation_uses_metric_weights() {
                     let t = (phi_rr - q) / (r * r);
                     let sum_wb_sb = weights[0] * s_vec[0] + weights[1] * s_vec[1];
                     for axis in 0..dim {
-                        expected_d1[axis] += q * weights[axis] * h[axis] * z[[j, col]];
+                        expected_d1[axis] +=
+                            amplification * q * weights[axis] * h[axis] * z[[j, col]];
                     }
                     q * sum_weights + t * sum_wb_sb
                 } else {
                     sum_weights * phi_rr
                 };
-                expected_d2 += lap * z[[j, col]];
+                expected_d2 += amplification * lap * z[[j, col]];
             }
 
             for axis in 0..dim {
@@ -5475,25 +5503,44 @@ fn test_duchon_operator_psi_derivatives_fd_dim1() {
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "z kernel", e));
     let p = centers.nrows();
     let kernel_cols = z_kernel.ncols();
+    let value_and_psi = |r: f64| {
+        let core =
+            duchon_radial_core_value_jet(r, length_scale, p_order, s_order, d, &coeffs).unwrap();
+        let (phi_psi, _) = duchon_direction_derivatives(
+            DuchonPsiDirection::Global,
+            core.value,
+            core.first,
+            core.second,
+            core.exponent,
+            r,
+            d,
+            &[],
+        );
+        (core.value, phi_psi)
+    };
+    // The forward operators ship `α·Φ·Z`, with `α = 1/|φ(r*)|` at the chart's
+    // frozen farthest center pair (`duchon_kernel_chart`, gam#2735), here (0, 3).
+    // So `∂(α·Φ·Z)/∂ψ = α·(Φ_ψ + (ln α)_ψ·Φ)·Z` with `(ln α)_ψ = −φ_ψ(r*)/φ(r*)`.
+    let amplification = duchon_kernel_amplification(
+        centers.view(),
+        Some(length_scale),
+        p_order,
+        s_order,
+        d,
+        None,
+        Some(&coeffs),
+        None,
+    );
+    let (reference_value, reference_psi) =
+        value_and_psi((centers[[0, 0]] - centers[[p - 1, 0]]).abs());
+    let log_amplification_psi = -reference_psi / reference_value;
     let mut d0_psi_analytic = ndarray::Array2::<f64>::zeros((p, kernel_cols));
     for k in 0..p {
         for j in 0..p {
-            let r = (centers[[k, 0]] - centers[[j, 0]]).abs();
-            let core =
-                duchon_radial_core_value_jet(r, length_scale, p_order, s_order, d, &coeffs)
-                    .unwrap();
-            let (phi_psi, _) = duchon_direction_derivatives(
-                DuchonPsiDirection::Global,
-                core.value,
-                core.first,
-                core.second,
-                core.exponent,
-                r,
-                d,
-                &[],
-            );
+            let (phi, phi_psi) = value_and_psi((centers[[k, 0]] - centers[[j, 0]]).abs());
+            let charted = amplification * (phi_psi + log_amplification_psi * phi);
             for col in 0..kernel_cols {
-                d0_psi_analytic[[k, col]] += phi_psi * z_kernel[[j, col]];
+                d0_psi_analytic[[k, col]] += charted * z_kernel[[j, col]];
             }
         }
     }
@@ -5526,7 +5573,7 @@ fn test_duchon_operator_psi_derivatives_fd_dim1() {
     // orders above it.
     //
     // Scaling: RELATIVE to max(1, ||analytic||, ||fd||). The kernel columns of
-    // D0 are Phi(r;kappa)*Z with entries of order 1, so max(1.0) neither
+    // D0 are alpha*Phi(r;kappa)*Z with entries of order 1, so max(1.0) neither
     // inflates nor deflates the gate here; it is present so a legitimately
     // near-zero derivative cannot divide the roundoff by itself and read as
     // rel = 1 (the failure mode documented at the frozen sibling below).

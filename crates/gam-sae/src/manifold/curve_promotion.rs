@@ -153,6 +153,12 @@ pub struct CurvePromotionProposal {
     /// The least circle phase codebook meeting the flat arm's in-plane distortion,
     /// or `None` when the ring's radial spread alone exceeds that distortion.
     pub curved_phase_code: Option<CirclePhaseCode>,
+    /// The in-plane distortion `D = Σₖ min(varₖ, δ²)` the flat arm spends per firing:
+    /// the fidelity both arms of the ledger are priced at.
+    pub flat_distortion: f64,
+    /// The cloud's mean radius `E[r]` in the ring plane, the source the curved phase
+    /// code quantizes.
+    pub mean_radius: f64,
     /// `true` iff the ring is recognized AND the atomic ledger strictly prefers the
     /// curved chart (`dl_new < dl_old`). Never depends on residual explained
     /// variance, on the birth proposal priority, or on the small-cell circle screen.
@@ -381,6 +387,8 @@ pub fn propose_curve_promotion(
         dl_new,
         crossover_prescreen,
         curved_phase_code,
+        flat_distortion,
+        mean_radius,
         accept,
     }))
 }

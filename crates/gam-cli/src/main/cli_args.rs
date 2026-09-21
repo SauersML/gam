@@ -107,6 +107,12 @@ pub(crate) enum Command {
     /// Fit an event-history model (marked counting process with a latent
     /// per-subject state) from subjects, events and covariate-segment tables.
     FitEvents(FitEventsArgs),
+    /// Forecast new histories from a saved event-history predictor (written by
+    /// `fit-events --save-model`), averaged over its posterior.
+    ForecastEvents(ForecastEventsArgs),
+    /// Forecast a subject with no history from a covariate path alone, with a
+    /// saved event-history predictor, averaged over its posterior.
+    ForecastPopulation(ForecastPopulationArgs),
 }
 
 #[derive(Args, Debug)]
@@ -176,6 +182,107 @@ pub(crate) struct FitEventsArgs {
         long,
         value_name = "JSON",
         help = "Write the summary here instead of stdout"
+    )]
+    pub(crate) out: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "JSON",
+        help = "Write the fitted predictor here: the frozen schema and bases, the reference law and the posterior that forecasts average over, and no training record. `gam forecast-events --model` and `gam forecast-population --model` read it. A save that cannot be made fails the command before the summary is written"
+    )]
+    pub(crate) save_model: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ForecastEventsArgs {
+    #[arg(
+        long,
+        value_name = "JSON",
+        help = "A saved event-history predictor, as written by `gam fit-events --save-model`"
+    )]
+    pub(crate) model: PathBuf,
+    #[arg(
+        long,
+        value_name = "CSV",
+        help = "Subjects table: columns id, entry, exit"
+    )]
+    pub(crate) subjects: PathBuf,
+    #[arg(
+        long,
+        value_name = "CSV",
+        help = "Events table: columns id, time, mark, with marks from the saved vocabulary"
+    )]
+    pub(crate) events: PathBuf,
+    #[arg(
+        long,
+        value_name = "CSV",
+        help = "Covariate segments: columns id, start, then the saved covariate columns; a categorical value is coded against the saved levels, and an unknown one is refused"
+    )]
+    pub(crate) covariates: PathBuf,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        required = true,
+        help = "Forecast horizons as offsets after each subject's exit (or after --forecast-cutoff), comma separated"
+    )]
+    pub(crate) horizons_after_exit: Vec<f64>,
+    #[arg(
+        long,
+        value_name = "TIME",
+        help = "Forecast every subject from what was known at this time: its history cut at the cutoff, the horizons counted from it; subjects not under follow-up at the cutoff are skipped"
+    )]
+    pub(crate) forecast_cutoff: Option<f64>,
+    #[arg(
+        long,
+        value_name = "COLUMN",
+        help = "Column of the subjects table giving each subject's reference stratum as an integer index, for a model centred on reference strata"
+    )]
+    pub(crate) reference_stratum: Option<String>,
+    #[arg(
+        long,
+        value_name = "JSON",
+        help = "Write the forecasts here instead of stdout"
+    )]
+    pub(crate) out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ForecastPopulationArgs {
+    #[arg(
+        long,
+        value_name = "JSON",
+        help = "A saved event-history predictor, as written by `gam fit-events --save-model`"
+    )]
+    pub(crate) model: PathBuf,
+    #[arg(
+        long,
+        value_name = "CSV",
+        help = "The covariate path: columns start, then the saved covariate columns, one row per segment; the first segment starts at or before --start"
+    )]
+    pub(crate) covariates: PathBuf,
+    #[arg(
+        long,
+        value_name = "TIME",
+        help = "When the subject enters the forecast: alive and free of once-only diagnoses under a reference-centred model"
+    )]
+    pub(crate) start: f64,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        required = true,
+        help = "Forecast horizons as times, comma separated"
+    )]
+    pub(crate) horizons: Vec<f64>,
+    #[arg(
+        long,
+        value_name = "INDEX",
+        default_value_t = 0,
+        help = "The reference stratum's integer index, for a model centred on reference strata"
+    )]
+    pub(crate) reference_stratum: usize,
+    #[arg(
+        long,
+        value_name = "JSON",
+        help = "Write the forecast here instead of stdout"
     )]
     pub(crate) out: Option<PathBuf>,
 }

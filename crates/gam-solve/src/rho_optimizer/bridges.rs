@@ -3089,18 +3089,30 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
             "[STAGE] outer eval start order=ValueGradientHessian dim={}",
             x.len()
         );
-        let eval = self
+        // Infeasible trials are the near-separable multinomial failure mode:
+        // ARC probes the unbounded λ→0 separating region where the inner softmax
+        // solve does not converge. These never reach `observe_cost_stall` below
+        // (validation rejects them), so feed them to the guard's dedicated
+        // infeasible-streak path FIRST — a run of consecutive infeasible trials
+        // after a feasible best halts the outer loop at that best iterate instead
+        // of grinding to `max_iter` (#1082/#1237). A typed refusal is an
+        // infeasible trial exactly like a non-finite cost, so it feeds the same
+        // streak (#2735).
+        let eval = match self
             .obj
             .eval_with_order(x, OuterEvalOrder::ValueGradientHessian)
-            .map_err(|err| into_line_search_value_probe_error("outer eval failed", err))?;
-        // Infeasible (non-finite cost) trials are the near-separable
-        // multinomial failure mode: ARC probes the unbounded λ→0 separating
-        // region where the inner softmax solve does not converge. These never
-        // reach `observe_cost_stall` below (validation rejects them), so feed
-        // them to the guard's dedicated infeasible-streak path FIRST — a run of
-        // consecutive infeasible trials after a feasible best halts the outer
-        // loop at that best iterate instead of grinding to `max_iter`
-        // (#1082/#1237).
+        {
+            Ok(eval) => eval,
+            Err(err) => {
+                let err = into_line_search_value_probe_error("outer eval failed", err);
+                if err.is_recoverable()
+                    && let Some(halt) = self.observe_cost_stall_infeasible(x)
+                {
+                    return Err(halt);
+                }
+                return Err(err);
+            }
+        };
         if !eval.cost.is_finite() {
             if let Some(err) = self.observe_cost_stall_infeasible(x) {
                 return Err(err);
@@ -4733,9 +4745,10 @@ impl OuterFixedPointBridge<'_> {
         // and forces unnecessary halvings.
         let cost_floor = current_cost + EFS_COST_DESCENT_TOL * current_cost.abs().max(1.0);
         // `bt` counts trials so the accepted step can report its halving count
-        // (trial `bt` runs at α = 2^-bt). Recoverable domain refusals arrive as
-        // `Ok(+∞)` and keep halving; `Err` is reserved for a broken evaluation
-        // artifact and leaves the search immediately.
+        // (trial `bt` runs at α = 2^-bt). A refusal arrives as a typed error
+        // (`is_trial_point_infeasible`) and is contracted as `Ok(None)` without an
+        // accept test, so the search keeps halving; any other error is a broken
+        // evaluation artifact and leaves the search immediately (#2735).
         let mut bt = 0usize;
         let accepted = backtracking_line_search::<_, ObjectiveEvalError>(
             BacktrackConfig {
@@ -4746,12 +4759,22 @@ impl OuterFixedPointBridge<'_> {
                 bt += 1;
                 let trial_step = raw_step * alpha;
                 let trial = x + &trial_step;
-                let cost = self
-                    .obj
-                    .eval_cost(&trial)
-                    .map_err(|error| {
-                        into_objective_error("EFS backtracking cost evaluation failed", error)
-                    })?;
+                let cost = match self.obj.eval_cost(&trial) {
+                    Ok(cost) => cost,
+                    Err(error) if error.is_trial_point_infeasible() => {
+                        log::info!(
+                            "[EFS] backtrack α=2^-{bt}={alpha:.4e}: trial refused ({error}), halving",
+                            bt = bt - 1,
+                        );
+                        return Ok(None);
+                    }
+                    Err(error) => {
+                        return Err(into_objective_error(
+                            "EFS backtracking cost evaluation failed",
+                            error,
+                        ));
+                    }
+                };
                 if !(cost.is_finite() && cost <= cost_floor) {
                     log::trace!(
                         "[EFS] backtrack α=2^-{bt}={alpha:.4e}: trial cost {cost:.6e} not below current {current_cost:.6e}, halving",

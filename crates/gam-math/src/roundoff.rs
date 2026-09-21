@@ -22,7 +22,14 @@ pub const UNIT_ROUNDOFF: f64 = f64::EPSILON / 2.0;
 /// an accumulation that long has no useful error bound, and reporting an
 /// infinite band is the honest answer rather than a negative or wrapped one.
 pub const fn accumulation_growth(operations: usize) -> f64 {
-    let scaled = operations as f64 * UNIT_ROUNDOFF;
+    accumulation_growth_at(operations, UNIT_ROUNDOFF)
+}
+
+/// [`accumulation_growth`] in a precision with unit roundoff `unit_roundoff`: `γ_n = n·u / (1 − n·u)`. A result that
+/// is stored in a narrower format than it was computed in (an `f32` tensor filled from an `f64` kernel) rounds at
+/// that format's `u`, so a band on the stored value is taken at that `u`.
+pub const fn accumulation_growth_at(operations: usize, unit_roundoff: f64) -> f64 {
+    let scaled = operations as f64 * unit_roundoff;
     if !(scaled < 1.0) {
         return f64::INFINITY;
     }

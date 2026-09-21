@@ -1744,8 +1744,10 @@ pub(crate) fn duchon_partial_fraction_coeffs(
 /// [`duchon_radial_profile`] represents once per process, certified against
 /// its own adaptive reference integral (a fixed 64-node Gauss–Legendre rule
 /// on `w` was measured 1 % off for half-integer `b` at every distance and
-/// 100 % off for `κ r ≳ 10³`; see that module). The `r = 0` diagonal is the
-/// closed form `φ(0) = (4π)^{-d/2} Γ(b)/(Γ(p)Γ(s)) κ^{-2b} B(s−b, p)`.
+/// 100 % off for `κ r ≳ 10³`; see that module). The value returned is `φ(r) − φ(0)`
+/// with `φ(0) = (4π)^{-d/2} Γ(b)/(Γ(p)Γ(s)) κ^{-2b} B(s−b, p)`: the origin constant,
+/// which the Duchon constraint annihilates, is removed by construction
+/// ([`DuchonHybridEvaluator::value`], gam#2735).
 ///
 /// Requires `b = p + s − d/2 > 0` (kernel existence, `2(p+s) > d`) and
 /// `s − b = d/2 − p > 0` (integrable `w → 0` endpoint), i.e. `2p < d`. Callers
@@ -1781,9 +1783,6 @@ pub(crate) struct DuchonHybridEvaluator {
     kappa: f64,
     /// `pref · κ^{-2b}`.
     scale: f64,
-    /// `pref · κ^{-2b} · G(0)`, the closed-form `r = 0` diagonal, or `None`
-    /// for a kernel singular at the origin (`2(p+s) ≤ d`).
-    origin: Option<f64>,
 }
 
 impl DuchonHybridEvaluator {
@@ -1803,7 +1802,6 @@ impl DuchonHybridEvaluator {
         );
         let profile = duchon_radial_profile(p_order, s_order, k_dim)?;
         let scale = profile.kappa_scale(kappa);
-        let origin = profile.origin_value().ok().map(|g0| scale * g0);
         Ok(Self {
             profile,
             p_order,
@@ -1811,23 +1809,35 @@ impl DuchonHybridEvaluator {
             k_dim,
             kappa,
             scale,
-            origin,
         })
     }
 
-    /// `φ(r)`, including the closed-form `r = 0` diagonal.
+    /// `φ(r) − φ(0)`: the kernel with its origin value removed.
+    ///
+    /// `φ(0) = pref · κ^{-2b} · G(0)` is a constant, a degree-zero polynomial
+    /// that every Duchon constraint `Z` annihilates, on both sides of `Zᵀ K Z`
+    /// and on the centre side of `K(x, c) Z`. At long length scales its
+    /// `κ^{-2b}` growth is the whole magnitude of the kernel, so forming `K`
+    /// with it and projecting afterwards cancels about `2b · log₁₀ ℓ` digits. At
+    /// `d = 6`, `p = s = 2`, `ℓ ≈ 2e7`, `max|K_CC|` was 1e11 against
+    /// `max|Zᵀ K Z|` ≈ 1e-2, and the constrained penalty went indefinite
+    /// (gam#2735, MSI job 1152423). The represented function differs from `φ`
+    /// by that constant alone, so every projected quantity is unchanged in
+    /// exact arithmetic. The scaling-law ψ derivative `δ φ + r φ_r` also stays
+    /// exact for it, because `∂/∂ln κ` of `c₀ κ^δ` is `δ c₀ κ^δ`. A kernel
+    /// singular at the origin has no constant to remove and owns its `r = 0`
+    /// refusal.
     pub(crate) fn value(&self, r: f64) -> Result<f64, BasisError> {
         if !r.is_finite() || r < 0.0 {
             crate::bail_invalid_basis!("Duchon kernel distance must be finite and non-negative");
         }
         let value = if r == 0.0 {
-            match self.origin {
-                Some(origin) => origin,
-                // The profile owns the refusal for a kernel singular at `r = 0`.
-                None => self.scale * self.profile.origin_value()?,
+            if let Err(error) = self.profile.origin_value() {
+                return Err(error);
             }
+            0.0
         } else {
-            self.scale * self.profile.value(self.kappa * r)
+            self.scale * self.profile.origin_reduced_value(self.kappa * r)
         };
         if !value.is_finite() {
             crate::bail_invalid_basis!(
@@ -1948,6 +1958,51 @@ pub(crate) fn duchon_hybrid_stable_integral_applies(
     k_dim: usize,
 ) -> bool {
     p_order >= 1 && s_order >= 1 && 2 * p_order < k_dim
+}
+
+/// The frozen centre matrix a Duchon spec builds from, when its strategy has one.
+fn frozen_duchon_centers(strategy: &CenterStrategy) -> Option<&Array2<f64>> {
+    match strategy {
+        CenterStrategy::UserProvided(centers) => Some(centers),
+        CenterStrategy::Auto(inner) => frozen_duchon_centers(inner),
+        CenterStrategy::DuchonSpectral { knots, .. } => frozen_duchon_centers(knots),
+        CenterStrategy::EqualMass { .. }
+        | CenterStrategy::EqualMassCovarRepresentative { .. }
+        | CenterStrategy::FarthestPoint { .. }
+        | CenterStrategy::KMeans { .. }
+        | CenterStrategy::UniformGrid { .. } => None,
+    }
+}
+
+impl DuchonBasisSpec {
+    /// Whether a term built from this spec on `dim` covariates evaluates its
+    /// kernel through [`DuchonHybridEvaluator`], whose values are `φ(r) − φ(0)`
+    /// (gam#2735).
+    ///
+    /// It asks the builder's question with the builder's inputs. A periodic spec
+    /// never reaches the evaluator: the circle takes the Bernoulli kernel and a
+    /// mixed-periodicity term is pure polyharmonic. Otherwise `p` is read from the
+    /// effective null-space order at the spec's frozen centres, as the builder
+    /// reads it. A spec whose centres are not frozen could degrade to any order
+    /// down to `Zero`, so it answers for the smallest `p`, the most inclusive
+    /// answer.
+    pub fn evaluates_origin_reduced_hybrid_kernel(&self, dim: usize) -> bool {
+        if self.length_scale.is_none()
+            || self.periodic.is_some()
+            || self.boundary.period().is_some()
+        {
+            return false;
+        }
+        let order = match frozen_duchon_centers(&self.center_strategy) {
+            Some(centers) => duchon_effective_nullspace_order(centers.view(), self.nullspace_order),
+            None => DuchonNullspaceOrder::Zero,
+        };
+        duchon_hybrid_stable_integral_applies(
+            duchon_p_from_nullspace_order(order),
+            self.power_as_usize(),
+            dim,
+        )
+    }
 }
 
 pub(crate) fn duchon_matern_kernel_general_from_distance(
@@ -3495,5 +3550,96 @@ mod inverse_length_scale_tests {
             text.contains("Duchon N-D radial jets") && text.contains("got 0"),
             "refusal names its context and the value: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod origin_reduced_hybrid_kernel_predicate_tests {
+    use super::*;
+
+    /// Deterministic centres in general position: `k` rows of a golden-ratio
+    /// lattice in `[0, 1)^d`.
+    fn lattice_centers(k: usize, d: usize) -> Array2<f64> {
+        Array2::from_shape_fn((k, d), |(i, j)| {
+            ((i + 1) as f64 * ((j + 2) as f64).sqrt() * 0.618_033_988_749_895).fract()
+        })
+    }
+
+    fn hybrid_spec(center_strategy: CenterStrategy, power: f64) -> DuchonBasisSpec {
+        DuchonBasisSpec {
+            center_strategy,
+            periodic: None,
+            length_scale: Some(0.7),
+            power,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::default(),
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+            boundary: OneDimensionalBoundary::Open,
+            radial_reparam: None,
+        }
+    }
+
+    /// The predicate answers what the builder does (gam#2735). For frozen
+    /// centres the oracle is the builder's own centre-pair kernel at the
+    /// effective order: its diagonal is exactly `0` on the origin-reduced hybrid
+    /// path and `φ(0) ≠ 0` on the partial-fraction path, so a predicate that
+    /// disagrees with the builder fails here, in either direction. `d = 4`, `m = 2`,
+    /// `s = 2` is on the partial-fraction path (`2p = 4 = d`) with 12 centres and
+    /// on the hybrid path with 5, where the linear block consumes every centre and
+    /// the order degrades to `Zero` (`p = 1`).
+    #[test]
+    fn the_origin_reduced_predicate_answers_what_the_builder_evaluates_2735() {
+        for (k, d, power, expected) in [
+            (12, 6, 2.0, true),
+            (12, 4, 2.0, false),
+            (5, 4, 2.0, true),
+        ] {
+            let centers = lattice_centers(k, d);
+            let spec = hybrid_spec(CenterStrategy::UserProvided(centers.clone()), power);
+            assert_eq!(
+                spec.evaluates_origin_reduced_hybrid_kernel(d),
+                expected,
+                "k={k} d={d} s={power}"
+            );
+            let order = duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
+            let (center_kernel, _) = duchon_center_kernel_value_matrix(
+                centers.view(),
+                spec.length_scale,
+                spec.power,
+                order,
+                None,
+            )
+            .expect("centre-pair kernel");
+            for i in 0..k {
+                let diagonal = center_kernel[[i, i]];
+                assert!(diagonal.is_finite(), "k={k} d={d}: diagonal {diagonal}");
+                assert_eq!(
+                    diagonal == 0.0,
+                    expected,
+                    "k={k} d={d} s={power}: diagonal {diagonal:e} against predicate {expected}"
+                );
+            }
+        }
+
+        let frozen = hybrid_spec(CenterStrategy::UserProvided(lattice_centers(12, 6)), 2.0);
+        let scale_free = DuchonBasisSpec {
+            length_scale: None,
+            ..frozen.clone()
+        };
+        assert!(!scale_free.evaluates_origin_reduced_hybrid_kernel(6));
+        let polyharmonic = DuchonBasisSpec {
+            power: 0.0,
+            ..frozen.clone()
+        };
+        assert!(!polyharmonic.evaluates_origin_reduced_hybrid_kernel(6));
+        let periodic = DuchonBasisSpec {
+            periodic: Some(vec![None; 6]),
+            ..frozen.clone()
+        };
+        assert!(!periodic.evaluates_origin_reduced_hybrid_kernel(6));
+        let unfrozen = hybrid_spec(CenterStrategy::FarthestPoint { num_centers: 12 }, 2.0);
+        assert!(unfrozen.evaluates_origin_reduced_hybrid_kernel(4));
+        assert!(!unfrozen.evaluates_origin_reduced_hybrid_kernel(2));
     }
 }

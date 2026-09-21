@@ -1685,6 +1685,15 @@ pub struct ActivePenaltyInfo {
     /// from the basis factory, which is the single source.
     #[serde(skip)]
     pub structural_null_frame: Option<Array2<f64>>,
+    /// The penalty's authoritative energy factor `A` (`matrix = AᵀA`), carried
+    /// when the builder declares that the rank is read off `A`
+    /// ([`ConstructiveQuadratic::rank_from_factor`]). Every chart transform of
+    /// `matrix` transports it (`A ↦ AT`, `A ↦ A/√c`), and canonicalization roots
+    /// the block from `SVD(A)` through `PenaltyStructureHint::EnergyFactor`, so
+    /// the partition never re-squares the factor's conditioning (#2469, #2817).
+    /// Runtime-only, like `kronecker_factors`.
+    #[serde(skip)]
+    pub energy_factor: Option<Array2<f64>>,
 }
 
 /// Diagnostic for one penalty candidate excluded from the optimizer layout.
@@ -1799,6 +1808,15 @@ pub struct ConstructiveQuadratic {
     /// consumer that needs the null space must measure it". `Some` with zero
     /// columns is a declaration that the seminorm is structurally full rank.
     structural_null_frame: Option<Array2<f64>>,
+    /// `true` when `factor` is the builder's authoritative energy factor, so
+    /// the penalty's rank is the factor's resolved singular-value count
+    /// ([`gam_linalg::roundoff::factor_rank_partition`]), not a rank test on the dense
+    /// Gram. Forming `AᵀA` squares `A`'s conditioning, so a mode that `A`
+    /// resolves can come back from the Gram as roundoff of either sign, and a
+    /// Gram-side rank moves with any outer coordinate that conditions `A`
+    /// (#2469, #2817). Only the builders that hold a collocation or design
+    /// factor declare it. `try_from_dense_psd`'s rebuilt factor never does.
+    rank_from_factor: bool,
 }
 
 impl ConstructiveQuadratic {
@@ -1817,7 +1835,22 @@ impl ConstructiveQuadratic {
             factor,
             matrix,
             structural_null_frame: None,
+            rank_from_factor: false,
         })
+    }
+
+    /// Declare `factor` authoritative for this quadratic's rank (see the
+    /// `rank_from_factor` field). The chart transports `restricted` and `scaled`
+    /// keep the declaration, because `A ↦ AT` and `A ↦ √s·A` are energy factors
+    /// of the transported quadratic.
+    pub(crate) fn with_factor_rank_partition(mut self) -> Self {
+        self.rank_from_factor = true;
+        self
+    }
+
+    /// Whether this quadratic's rank is read off its energy factor.
+    pub fn rank_from_factor(&self) -> bool {
+        self.rank_from_factor
     }
 
     /// Declare the structural null frame of the represented seminorm (see the
@@ -1937,19 +1970,23 @@ impl ConstructiveQuadratic {
         Self::from_energy_factor(factor, context)
     }
 
-    /// The rounding band of an assembled symmetric Gram,
-    /// `dim·ε·(max|Sᵢⱼ| + assembly_magnitude)`.
+    /// The rounding band of an assembled symmetric Gram's computed spectrum:
+    /// the eigensolver's backward error plus the rounding the assembly left in
+    /// the entries.
     ///
-    /// `max|Sᵢⱼ|` bounds the eigensolver's backward error in the Gram's own
-    /// entries. `assembly_magnitude` is the largest entry of the absolute-summand
-    /// Gram the caller accumulated (`|D|ᵀ|D|` for `DᵀD`, `Σ|term|` for a Gram
-    /// summed in closed form), which bounds the rounding the assembly left in
-    /// those entries when its terms cancel. Both are absolute scales, never
-    /// relative to the Gram's spectrum: a near-underflow Gram carries rounding
-    /// that is large against its own eigenvalues.
-    pub fn gram_rounding_band(sym: &Array2<f64>, assembly_magnitude: f64) -> f64 {
-        let entrywise = sym.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
-        sym.nrows() as f64 * f64::EPSILON * (entrywise + assembly_magnitude.abs())
+    /// The first term is `gam_linalg::roundoff::symmetric_spectrum_rounding_band`
+    /// (`p·ε·‖S‖₂`, the band a backward-stable symmetric eigensolver resolves an
+    /// eigenvalue from zero to). The second is `p · entry_assembly_band`. The
+    /// caller bounds each entry's assembly error with
+    /// `gam_linalg::roundoff::accumulation_band(k, Σ|terms|)`: `k = D.nrows()`
+    /// and `max(|D|ᵀ|D|)` for a Gram formed as `DᵀD`, or the accumulated term
+    /// count and `Σ|term|` for a Gram summed in closed form. An entrywise error
+    /// `E` moves the spectrum by at most `‖E‖₂ ≤ p·max|Eᵢⱼ|` (Weyl). The assembly
+    /// term is what covers a near-underflow Gram, whose terms cancel at scales
+    /// far above its own eigenvalues.
+    pub fn gram_rounding_band(eigenvalues: &[f64], entry_assembly_band: f64) -> f64 {
+        gam_linalg::roundoff::symmetric_spectrum_rounding_band(eigenvalues)
+            + eigenvalues.len() as f64 * entry_assembly_band.abs()
     }
 
     /// A Gram as a unit-Frobenius constructive quadratic that is a continuous
@@ -1969,7 +2006,7 @@ impl ConstructiveQuadratic {
     /// periodic Matérn bug-hunt fixture, ψ = 5.577).
     pub fn unit_frobenius_from_gram_within_rounding_band(
         gram: &Array2<f64>,
-        assembly_magnitude: f64,
+        entry_assembly_band: f64,
         context: &str,
     ) -> Result<(Self, f64), BasisError> {
         if gram.nrows() != gram.ncols() {
@@ -1979,25 +2016,26 @@ impl ConstructiveQuadratic {
                 gram.ncols()
             );
         }
-        if gram.iter().any(|value| !value.is_finite()) || !assembly_magnitude.is_finite() {
-            crate::bail_invalid_basis!("{context}: Gram or its assembly magnitude is not finite");
+        if gram.iter().any(|value| !value.is_finite()) || !entry_assembly_band.is_finite() {
+            crate::bail_invalid_basis!("{context}: Gram or its entry assembly band is not finite");
         }
         let dim = gram.nrows();
         if dim == 0 {
             return Ok((Self::from_energy_factor(Array2::zeros((0, 0)), context)?, 1.0));
         }
         let sym = symmetrize_penalty(gram);
-        let rounding_band = Self::gram_rounding_band(&sym, assembly_magnitude);
         let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
-        if let Some(&negative) = evals.iter().find(|&&value| value < -rounding_band) {
+        let eigenvalues = evals.to_vec();
+        let rounding_band = Self::gram_rounding_band(&eigenvalues, entry_assembly_band);
+        if let Some(&negative) = eigenvalues.iter().find(|&&value| value < -rounding_band) {
             return Err(BasisError::IndefinitePenalty {
                 context: context.to_string(),
                 min_eigenvalue: negative,
                 tolerance: rounding_band,
                 guidance: format!(
-                    "the eigenvalue lies beyond the Gram's rounding band dim·ε·(max|S|={:e} + \
-                     assembly={assembly_magnitude:e})",
-                    sym.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()))
+                    "the eigenvalue lies beyond the Gram's rounding band: spectrum band {:e} + \
+                     {dim}·entry assembly band {entry_assembly_band:e}",
+                    gam_linalg::roundoff::symmetric_spectrum_rounding_band(&eigenvalues)
                 ),
             });
         }
@@ -2048,6 +2086,7 @@ impl ConstructiveQuadratic {
     ) -> Result<Self, BasisError> {
         let mut out =
             Self::from_energy_factor(gauge.restrict_quadratic_factor(&self.factor), context)?;
+        out.rank_from_factor = self.rank_from_factor;
         if let Some(frame) = self.structural_null_frame.as_ref() {
             if gauge.n_blocks() == 1 {
                 let transform = gauge.block_transform(0);
@@ -2069,6 +2108,7 @@ impl ConstructiveQuadratic {
         }
         let root = scale.sqrt();
         let mut out = Self::from_energy_factor(self.factor.mapv(|value| value * root), context)?;
+        out.rank_from_factor = self.rank_from_factor;
         // A positive rescale does not move the null space; scaling to exactly
         // zero collapses the seminorm and voids the declaration.
         if scale > 0.0 {
@@ -2105,6 +2145,7 @@ impl ConstructiveQuadratic {
             factor: Array2::zeros((0, dimension)),
             matrix: Array2::zeros((dimension, dimension)),
             structural_null_frame: None,
+            rank_from_factor: false,
         }
     }
 }
@@ -3623,12 +3664,17 @@ mod rounding_band_tests {
     #[test]
     fn a_negative_residual_inside_the_assembly_band_is_clamped_not_refused() {
         let gram = mixed_gram(&[1.8e-12, 4.0e-13, -5.6e-16]);
-        let assembly_magnitude = 1.0;
-        let band = ConstructiveQuadratic::gram_rounding_band(&gram, assembly_magnitude);
+        // Each entry is the cancelled remainder of an 8-row inner product whose
+        // summands add to 1 in absolute value.
+        let entry_assembly_band = gam_linalg::roundoff::accumulation_band(8, 1.0);
+        let band = ConstructiveQuadratic::gram_rounding_band(
+            &[1.8e-12, 4.0e-13, -5.6e-16],
+            entry_assembly_band,
+        );
         assert!(band > 5.6e-16, "assembly band {band:e} must cover the residual");
         let (quadratic, scale) = ConstructiveQuadratic::unit_frobenius_from_gram_within_rounding_band(
             &gram,
-            assembly_magnitude,
+            entry_assembly_band,
             "clamp pin",
         )
         .expect("a residual inside the assembly band is clamped, not refused");
@@ -3654,7 +3700,7 @@ mod rounding_band_tests {
         );
         assert!(
             matches!(refused, Err(BasisError::IndefinitePenalty { .. })),
-            "without an assembly magnitude the residual lies beyond the entrywise band"
+            "without an assembly bound the residual lies beyond the spectrum band"
         );
     }
 

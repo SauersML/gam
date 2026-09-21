@@ -859,17 +859,22 @@ fn nfree_skip_gate_status_from_parts(
     }
 }
 
-/// Apply the same trial-point classification to the value and derivative lanes.
-/// `Ok(+∞)` means the point is outside the evaluable numerical domain; `Err`
-/// means the evaluation artifact itself could not be constructed and must abort
-/// every outer solver route.
-fn classify_spatial_value_probe_failure(
-    error: EstimationError,
-) -> Result<f64, EstimationError> {
-    if is_recoverable_trial_point_error(&error) {
-        Ok(f64::INFINITY)
+/// Give the value and derivative lanes one typed answer for a failed trial.
+///
+/// A refusal at this trial travels as an error whose variant answers
+/// `is_trial_point_infeasible()`, so every outer consumer classifies it by
+/// variant and the refusal's reason reaches the outer log (#2735). A bare
+/// `BasisError` — the design cannot be built at this hyperparameter — is a
+/// refusal here but graded fatal by `is_trial_point_infeasible`, so it is carried
+/// as `TrialPointRefused` with its own message. Every other error is returned
+/// unchanged and stays fatal.
+fn classify_spatial_value_probe_failure(error: EstimationError) -> EstimationError {
+    if error.is_trial_point_infeasible() || !is_recoverable_trial_point_error(&error) {
+        error
     } else {
-        Err(error)
+        EstimationError::TrialPointRefused {
+            reason: format!("the design cannot be realized at this trial point: {error}"),
+        }
     }
 }
 
@@ -1423,8 +1428,12 @@ impl<'d> SpatialJointContext<'d> {
             && self.evaluator.has_psi_gram_tensor()
             && !self.evaluator.psi_gram_tensor_covers(theta[self.rho_dim])
         {
-            self.cache.store_cost_at(theta, f64::INFINITY);
-            return Ok(f64::INFINITY);
+            return Err(EstimationError::TrialPointRefused {
+                reason: format!(
+                    "psi={:.6e} lies outside the certified psi-Gram tensor window",
+                    theta[self.rho_dim]
+                ),
+            });
         }
         // #2481: preserve the derivative-lane contract. A basis or inner-solve
         // refusal at this trial is a recoverable domain wall; layout, topology,
@@ -1432,18 +1441,13 @@ impl<'d> SpatialJointContext<'d> {
         if !skip_value_realization && let Err(error) = self.cache.ensure_theta(theta) {
             self.value_realization_failures += 1;
             let (theta_norm, log_kappa_norm) = kphase_log_norms(theta, self.rho_dim);
-            if is_recoverable_trial_point_error(&error) {
-                log::debug!(
-                    "[STAGE] {} value-probe: design realization makes this trial infeasible at theta_norm={:.4e} log_kappa_norm={:.4e} ({error}); retreating",
-                    self.kind.label(), theta_norm, log_kappa_norm,
-                );
-            } else {
+            if !is_recoverable_trial_point_error(&error) {
                 log::warn!(
                     "[STAGE] {} value-probe: design realization FAILED fatally at theta_norm={:.4e} log_kappa_norm={:.4e} ({error}); propagating",
                     self.kind.label(), theta_norm, log_kappa_norm,
                 );
             }
-            return classify_spatial_value_probe_failure(error);
+            return Err(classify_spatial_value_probe_failure(error));
         }
         // #1033 penalty lane: stage the EXACT n-free `S(ψ)` for this probe's ψ so
         // the cost-only fast path re-keys the kept surface without `reset_surface`
@@ -1524,16 +1528,12 @@ impl<'d> SpatialJointContext<'d> {
             Err(error) => {
                 self.value_evaluation_failures += 1;
                 let (theta_norm, log_kappa_norm) = kphase_log_norms(theta, self.rho_dim);
-                if is_recoverable_trial_point_error(&error) {
-                    log::debug!(
-                        "[STAGE] {cost_label} value-probe: cost evaluator makes this trial infeasible at theta_norm={theta_norm:.4e} log_kappa_norm={log_kappa_norm:.4e} ({error}); retreating",
-                    );
-                } else {
+                if !is_recoverable_trial_point_error(&error) {
                     log::warn!(
                         "[STAGE] {cost_label} value-probe: cost evaluation FAILED fatally at theta_norm={theta_norm:.4e} log_kappa_norm={log_kappa_norm:.4e} ({error}); propagating",
                     );
                 }
-                classify_spatial_value_probe_failure(error)
+                Err(classify_spatial_value_probe_failure(error))
             }
         }
     }
@@ -1957,23 +1957,21 @@ fn run_exact_joint_spatial_optimization(
                 hessian: hess,
                 inner_beta_hint: None,
             }),
-            // A trial hyperparameter at which the spatial kernel design /
-            // ψ-derivatives are non-constructible is an infeasible point, not
-            // a fatal error: the gradient/Hessian path must retreat exactly as
-            // the cost-only path (which already returns +∞) does. Returning
-            // `OuterEval::infeasible` keeps the two paths symmetric so a single
-            // bad probe — e.g. an anisotropy that overflows the Duchon radial
-            // kernel — no longer aborts the whole REML optimization.
-            Err(err) if is_recoverable_trial_point_error(&err) => {
-                // Each refusal costs the line search a halving and this call's
-                // work; a run that crawls on refusals must say why (#2735).
-                log::info!(
-                    "[{label}] trial point infeasible (kernel design \
-                     not constructible at theta={theta:?}): {err}; retreating",
-                );
-                Ok(OuterEval::infeasible(theta_dim))
+            // A trial hyperparameter at which the spatial kernel design, its
+            // ψ-derivatives or the criterion refuse is an infeasible point, not
+            // a fatal error. The refusal travels typed, through the same
+            // classifier as the value lane, so a single bad probe — e.g. an
+            // anisotropy that overflows the Duchon radial kernel — makes the
+            // search retreat and its reason reaches the outer log (#2735).
+            Err(err) => {
+                let err = classify_spatial_value_probe_failure(err);
+                if err.is_trial_point_infeasible() {
+                    // Each refusal costs the line search a halving and this call's
+                    // work; a run that crawls on refusals must say why (#2735).
+                    log::info!("[{label}] trial point refused at theta={theta:?}: {err}; retreating");
+                }
+                Err(err)
             }
-            Err(err) => Err(err),
         }
     };
 
@@ -2811,6 +2809,13 @@ fn wrap_local_build_as_realization(
                     .structural_null_frame
                     .as_ref()
                     .map(|frame| gam_linalg::faer_ndarray::fast_atb(q, frame));
+                // `QᵀAᵀAQ = (AQ)ᵀ(AQ)`: the energy factor moves by right
+                // multiplication.
+                penalty.info.energy_factor = penalty
+                    .info
+                    .energy_factor
+                    .as_ref()
+                    .map(|factor| gam_linalg::faer_ndarray::fast_ab(factor, q));
                 penalty.op = None;
                 penalty.info.kronecker_factors = None;
             }
@@ -3607,6 +3612,10 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         // The per-term penalties live contiguously in the collection penalty
         // list at the term's `coeff_range` (single-spatial-term collection).
         let p_total = self.design.design.ncols();
+        // The trial realization's energy factors, block by block, for the bases
+        // whose builder carries one. A template's factor belongs to the build ψ,
+        // so it is never reused with a trial `local`.
+        let mut rekey_energy_factors: Vec<Option<Array2<f64>>> = Vec::new();
         let (locals, nullspace_dims): (Vec<Array2<f64>>, Vec<usize>) = match &term.metadata {
             BasisMetadata::Duchon {
                 centers,
@@ -3691,6 +3700,11 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     effective_ls,
                 )
                 .map_err(|e| e.to_string())?;
+                rekey_energy_factors = filtered
+                    .active
+                    .iter()
+                    .map(|penalty| penalty.info.energy_factor.clone())
+                    .collect();
                 let locals = filtered
                     .active
                     .iter()
@@ -3749,11 +3763,20 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         let specs: Vec<gam_solve::estimate::PenaltySpec> = templates
             .iter()
             .zip(locals.into_iter())
-            .map(|(tmpl, local)| gam_solve::estimate::PenaltySpec::Block {
+            .enumerate()
+            .map(|(block, (tmpl, local))| gam_solve::estimate::PenaltySpec::Block {
                 local,
                 col_range: tmpl.col_range.clone(),
                 prior_mean: tmpl.prior_mean.clone(),
-                structure_hint: tmpl.structure_hint.clone(),
+                structure_hint: match rekey_energy_factors.get(block).cloned().flatten() {
+                    Some(factor) => {
+                        Some(gam_terms::smooth::PenaltyStructureHint::EnergyFactor(factor))
+                    }
+                    None => match &tmpl.structure_hint {
+                        Some(gam_terms::smooth::PenaltyStructureHint::EnergyFactor(_)) => None,
+                        other => other.clone(),
+                    },
+                },
                 op: tmpl.op.clone(),
             })
             .collect();
@@ -5557,6 +5580,93 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     Ok(problem)
 }
 
+/// [`optimize_spatial_length_scale_exact_joint_typed`] for callers whose final
+/// coefficient fit still reports text. Their fit failures cross as prose, which
+/// the typed driver records as unclassified; its own failures are rendered to
+/// the text these callers used to receive (#2937).
+pub fn optimize_spatial_length_scale_exact_joint<FitOut, Mode, FitFn, ExactFn, ExactEfsFn, SeedFn>(
+    data: ArrayView2<'_, f64>,
+    block_specs: &[TermCollectionSpec],
+    block_term_indices: &[Vec<usize>],
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+    joint_setup: &ExactJointHyperSetup,
+    seed_risk_profile: gam_problem::SeedRiskProfile,
+    analytic_joint_gradient_available: bool,
+    analytic_joint_hessian_available: bool,
+    disable_fixed_point: bool,
+    screening_cap: Option<Arc<AtomicUsize>>,
+    walk_signals: Option<crate::exact_mode_branch::OuterWalkSignals>,
+    outer_derivative_policy: gam_model_api::families::custom_family::OuterDerivativePolicy,
+    mut fit_fn: FitFn,
+    exact_fn: ExactFn,
+    exact_efs_fn: ExactEfsFn,
+    seed_inner_beta_fn: SeedFn,
+) -> Result<SpatialLengthScaleOptimizationResult<FitOut>, String>
+where
+    FitFn: FnMut(
+        &Array1<f64>,
+        &[TermCollectionSpec],
+        &[TermCollectionDesign],
+        SpatialFitProvenance<'_, Mode>,
+    ) -> Result<FitOut, String>,
+    ExactFn: FnMut(
+        &Array1<f64>,
+        &[TermCollectionSpec],
+        &[TermCollectionDesign],
+        gam_solve::estimate::reml::reml_outer_engine::EvalMode,
+        Option<Mode>,
+    ) -> Result<ExactJointEvaluation<Mode>, String>,
+    ExactEfsFn: FnMut(
+        &Array1<f64>,
+        &[TermCollectionSpec],
+        &[TermCollectionDesign],
+    ) -> Result<ExactJointEfsEvaluation<Mode>, String>,
+    SeedFn: FnMut(&Array1<f64>) -> Result<gam_solve::rho_optimizer::SeedOutcome, EstimationError>,
+{
+    optimize_spatial_length_scale_exact_joint_typed(
+        data,
+        block_specs,
+        block_term_indices,
+        kappa_options,
+        joint_setup,
+        seed_risk_profile,
+        analytic_joint_gradient_available,
+        analytic_joint_hessian_available,
+        disable_fixed_point,
+        screening_cap,
+        walk_signals,
+        outer_derivative_policy,
+        |theta: &Array1<f64>,
+         specs: &[TermCollectionSpec],
+         designs: &[TermCollectionDesign],
+         provenance: SpatialFitProvenance<'_, Mode>| {
+            fit_fn(theta, specs, designs, provenance).map_err(FitFailure::from)
+        },
+        exact_fn,
+        exact_efs_fn,
+        seed_inner_beta_fn,
+    )
+    .map_err(|failure| failure.to_string())
+}
+
+/// The custom-family refusal a typed fit failure carries, through the context and notes layers
+/// placed in front of it (gam#2938).
+pub(crate) fn custom_family_refusal_in(failure: &FitFailure) -> Option<&gam_problem::CustomFamilyError> {
+    match failure {
+        FitFailure::CustomFamily(refusal) => Some(refusal),
+        FitFailure::Estimation(error) => match error.as_ref() {
+            EstimationError::CustomFamily(refusal) => Some(refusal),
+            _ => None,
+        },
+        FitFailure::Context { source, .. } | FitFailure::Annotated { source, .. } => {
+            custom_family_refusal_in(source)
+        }
+        FitFailure::SurvivalMarginalSlope(_) | FitFailure::Workflow(_) | FitFailure::Raised { .. } => {
+            None
+        }
+    }
+}
+
 /// The n-block exact-joint spatial driver. Its final coefficient fit and the
 /// outer search's own verdict both reach the caller as a typed [`FitFailure`]
 /// (#2937).
@@ -5565,6 +5675,7 @@ pub fn optimize_spatial_length_scale_exact_joint_typed<
     Mode,
     FitFn,
     ExactFn,
+    ExactErr,
     ExactEfsFn,
     SeedFn,
 >(
@@ -5598,7 +5709,8 @@ where
         &[TermCollectionDesign],
         gam_solve::estimate::reml::reml_outer_engine::EvalMode,
         Option<Mode>,
-    ) -> Result<ExactJointEvaluation<Mode>, String>,
+    ) -> Result<ExactJointEvaluation<Mode>, ExactErr>,
+    ExactErr: Into<FitFailure>,
     ExactEfsFn: FnMut(
         &Array1<f64>,
         &[TermCollectionSpec],
@@ -5641,9 +5753,7 @@ where
             data, block_specs,
         )
         .map_err(|e| {
-            FitFailure::from(e).context(
-                "failed to build and freeze joint block designs during exact joint kappa optimization",
-            )
+            format!("failed to build and freeze joint block designs during exact joint kappa optimization: {e}")
         })?;
         let theta0 = joint_setup.theta0();
 
@@ -5693,8 +5803,8 @@ where
         block_specs,
     )
     .map_err(|e| {
-        FitFailure::from(e).context(
-            "failed to build and freeze joint block designs during exact joint kappa bootstrap",
+        format!(
+            "failed to build and freeze joint block designs during exact joint kappa bootstrap: {e}"
         )
     })?;
     // The ρ half of the θ box is the domain the setup's builder derived over
@@ -5787,15 +5897,16 @@ where
     }
 
     let mut state = NBlockExactJointState {
-        // The realizers replay the designs frozen above (#2937).
-        cache: ExactJointDesignCache::new(data, cache_blocks, rho_dim, all_dims.clone())
-            .map_err(FitFailure::invariant)?,
+        cache: ExactJointDesignCache::new(data, cache_blocks, rho_dim, all_dims.clone())?,
         terminal_mode: None,
     };
 
     let n_total = data.nrows();
 
     let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
+    // The typed custom-family refusal of the last exact evaluation that refused. The outer
+    // search sees each refusal as text; its verdict carries this one typed (gam#2938).
+    let last_custom_family_refusal = std::cell::RefCell::new(None::<gam_problem::CustomFamilyError>);
     let exact_efs_fn_cell = std::cell::RefCell::new(&mut exact_efs_fn);
 
     // ── κ-optimization scaling instrumentation ──
@@ -5985,6 +6096,7 @@ where
                     hessian: hess,
                     mode,
                 }) => {
+                    last_custom_family_refusal.replace(None);
                     ctx.install_terminal_mode(theta, cost, mode);
                     if value_only {
                         ctx.cache.store_cost_only(theta, cost);
@@ -6023,9 +6135,13 @@ where
                 // `RemlOptimizationFailed`, `is_trial_point_infeasible`
                 // answered false and `into_objective_error` graded it Fatal,
                 // aborting the fit instead of the trial (#2627).
-                Err(err) => Err(EstimationError::TrialPointRefused {
-                    reason: format!("n-block exact-joint spatial evaluation failed: {err}"),
-                }),
+                Err(err) => {
+                    let failure: FitFailure = err.into();
+                    last_custom_family_refusal.replace(custom_family_refusal_in(&failure).cloned());
+                    Err(EstimationError::TrialPointRefused {
+                        reason: format!("n-block exact-joint spatial evaluation failed: {failure}"),
+                    })
+                }
             }
         };
 
@@ -6073,6 +6189,7 @@ where
                         mode,
                         ..
                     }) => {
+                        last_custom_family_refusal.replace(None);
                         ctx.install_terminal_mode(theta, cost, mode);
                         // Don't `store_eval`: that path is only valid when the
                         // closure produced a real gradient. The next outer-eval
@@ -6082,11 +6199,15 @@ where
                         ctx.cache.store_cost_only(theta, cost);
                         Ok(cost)
                     }
-                    Err(err) => Err(EstimationError::TrialPointRefused {
-                        reason: format!(
-                            "n-block exact-joint spatial cost evaluation failed: {err}"
-                        ),
-                    }),
+                    Err(err) => {
+                        let failure: FitFailure = err.into();
+                        last_custom_family_refusal.replace(custom_family_refusal_in(&failure).cloned());
+                        Err(EstimationError::TrialPointRefused {
+                            reason: format!(
+                                "n-block exact-joint spatial cost evaluation failed: {failure}"
+                            ),
+                        })
+                    }
                 }
             },
             |ctx: &mut &mut NBlockExactJointState<'_, Mode>, theta: &Array1<f64>| {
@@ -6185,7 +6306,20 @@ where
 
         // The outer search's verdict stays typed: a search whose every seed was
         // refused is not the same failure as one that started and stalled.
-        problem.run_certified(&mut obj, "n-block exact-joint spatial")?
+        problem
+            .run_certified(&mut obj, "n-block exact-joint spatial")
+            .map_err(|outer_error| match last_custom_family_refusal.take() {
+                Some(refusal) => FitFailure::from(gam_problem::CustomFamilyError::OuterSmoothingFailed {
+                    route: gam_problem::OuterSearchRoute::SpatialExactJoint,
+                    reason: outer_error.to_string(),
+                    last_refusal: Some(Box::new(refusal)),
+                    // This driver keeps no record of an uncertified inner solve apart from
+                    // its last refusal, so the fit boundary falls back to that (#2943).
+                    search_inner_refusal: None,
+                    outer_error: Arc::new(outer_error),
+                }),
+                None => FitFailure::from(outer_error),
+            })?
     }; // obj dropped here, releasing mutable borrow on state
 
     // ── κ-optimization scaling summary ──

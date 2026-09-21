@@ -2,16 +2,20 @@
 //! Composition across known blocks (#2946). The tests cover:
 //! - the ReLU² negative control;
 //! - affine exactness;
-//! - the Gaussian closure's error, measured against the executed composition.
+//! - the Gaussian closure's error, measured against the executed composition;
+//! - the residual stack on its enlarged state: agreement with the one-block route when nothing is read, and with the
+//!   executed stack when it is.
 //!
 //! The closed-form witnesses read the zero-mean kernels. The retained-point tests read the biased kernels, because a
 //! retained point shifts `μ = b + W P z` off zero even when `b = 0`.
 
 use super::{
-    compose_affine_stage, gaussian_closure_response, quadratic_readout, relu_two_moment_bound, residual_block_energies,
+    ResidualStackError, compose_affine_stage, enlarged_frame, gaussian_closure_response, quadratic_readout,
+    relu_two_moment_bound, residual_block_energies, residual_stack_response,
 };
 use crate::response::subspace::{KnownBlock, smoothing};
 use gam_math::gaussian_activation::GaussianActivation;
+use gam_linalg::roundoff::accumulation_growth;
 use gam_linalg::utils::splitmix64;
 use gam_math::probability::{normal_cdf, normal_pdf, standard_normal_from_uniform_bits, standard_normal_quantile};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, array, s};
@@ -829,5 +833,451 @@ fn gaussian_closure_error_is_measured_at_retained_points_of_a_biased_stack() {
     assert!(
         mean_composition_rejections > 0,
         "positive control: the gate never rejects the mean composition F₂(F̄₁)"
+    );
+}
+
+fn gaussian_vector(rng: &mut u64, len: usize, scale: f64) -> Array1<f64> {
+    gaussian_matrix(rng, len, 1, scale).column(0).to_owned()
+}
+
+/// A symmetric positive definite metric `(A Aᵀ + I)` with its two triangles bitwise equal.
+fn spd_metric(rng: &mut u64, dim: usize) -> Array2<f64> {
+    let factor = gaussian_matrix(rng, dim, dim, 0.4);
+    let product = factor.dot(&factor.t()) + Array2::<f64>::eye(dim);
+    (&product + &product.t()) * 0.5
+}
+
+/// The executed ReLU layer `U ReLU(b + W y) + c` of a known block.
+fn executed_relu_layer(block: &KnownBlock, input: ArrayView1<'_, f64>) -> Array1<f64> {
+    block
+        .writers()
+        .dot(&(block.readers().dot(&input) + &block.biases()).mapv(|preactivation| preactivation.max(0.0)))
+        + &block.output_bias()
+}
+
+/// The executed ReLU residual stack `z + G₁(z) + G₂(z + G₁(z))`.
+fn executed_relu_residual_stack(first: &KnownBlock, second: &KnownBlock, input: ArrayView1<'_, f64>) -> Array1<f64> {
+    let stream = &input + &executed_relu_layer(first, input);
+    &stream + &executed_relu_layer(second, stream.view())
+}
+
+/// The sample mean of a sample and its standard error.
+fn sample_mean_and_error(sample: ArrayView1<'_, f64>) -> (f64, f64) {
+    let count = sample.len() as f64;
+    let mean = sample.sum() / count;
+    let variance = sample.iter().map(|value| (value - mean) * (value - mean)).sum::<f64>() / (count - 1.0);
+    (mean, (variance / count).sqrt())
+}
+
+/// Executed moments of `executed(Z)` over `draws` samples of `Z = P z + (I − P) ξ`, `ξ ~ N(0, I_d)`.
+struct ExecutedMoments {
+    /// The sample mean and its standard errors, per coordinate.
+    mean: Array1<f64>,
+    mean_errors: Array1<f64>,
+    /// The sample mean of `‖executed(Z) − center‖²_M` and its standard error.
+    squared_deviation: f64,
+    squared_deviation_error: f64,
+}
+
+fn executed_conditional_moments(
+    rng: &mut u64,
+    frame: ArrayView2<'_, f64>,
+    point: ArrayView1<'_, f64>,
+    center: ArrayView1<'_, f64>,
+    metric: ArrayView2<'_, f64>,
+    draws: usize,
+    executed: impl Fn(ArrayView1<'_, f64>) -> Array1<f64>,
+) -> ExecutedMoments {
+    let retained = frame.dot(&frame.t().dot(&point));
+    let noise = gaussian_matrix(rng, draws, point.len(), 1.0);
+    let mut outputs = Array2::<f64>::zeros((draws, center.len()));
+    let mut squared_deviations = Array1::<f64>::zeros(draws);
+    for (draw, row) in noise.rows().into_iter().enumerate() {
+        let input = &retained + &row - &frame.dot(&frame.t().dot(&row));
+        let output = executed(input.view());
+        let deviation = &output - &center;
+        squared_deviations[draw] = deviation.dot(&metric.dot(&deviation));
+        outputs.row_mut(draw).assign(&output);
+    }
+    let (mean, mean_errors): (Vec<f64>, Vec<f64>) =
+        outputs.columns().into_iter().map(|column| sample_mean_and_error(column)).unzip();
+    let (squared_deviation, squared_deviation_error) = sample_mean_and_error(squared_deviations.view());
+    ExecutedMoments {
+        mean: Array1::from(mean),
+        mean_errors: Array1::from(mean_errors),
+        squared_deviation,
+        squared_deviation_error,
+    }
+}
+
+#[test]
+fn a_residual_stack_whose_second_block_reads_no_first_block_write_is_one_residual_block() {
+    // `G₁` writes only coordinates `0..3` and `G₂` reads only `3..6`, so `W₂ U₁ = 0` and `N = ∅`. The stack is then the
+    // one residual block `B = G₁ ⊕ G₂` with biases `[b₁; b₂ + W₂ c₁]` and output bias `c₁ + c₂`. The stack route must
+    // agree with `B`'s retained response at points, and its conditional variance averaged over `PZ` must agree with
+    // `B`'s `E(P)`. The same gate must reject `E(P)` without its Stein cross term. So that the cross term is resolvable,
+    // `G₂` also holds an opposed ReLU pair on `e₅` that writes `−(ReLU(s y₅) − ReLU(−s y₅))/s = −y₅` into `e₅`,
+    // cancelling the skip there, with a cross term of about `−2 M₅₅ (1 − ‖P e₅‖²)`.
+    let (input_dim, split, first_width, random_width, rank, point_count, outer_draws) = (6, 3, 4, 3, 2, 3, 1 << 14);
+    let (second_width, pair_scale) = (random_width + 2, 1.5);
+    let mut rng: u64 = 0x2946_c101;
+    let metric = spd_metric(&mut rng, input_dim);
+    let first_readers = gaussian_matrix(&mut rng, first_width, input_dim, 1.0);
+    let first_biases = gaussian_vector(&mut rng, first_width, 0.5);
+    let mut first_writers = Array2::<f64>::zeros((input_dim, first_width));
+    first_writers
+        .slice_mut(s![..split, ..])
+        .assign(&gaussian_matrix(&mut rng, split, first_width, 0.8));
+    let first_output_bias = gaussian_vector(&mut rng, input_dim, 0.5);
+    let mut second_readers = Array2::<f64>::zeros((second_width, input_dim));
+    second_readers
+        .slice_mut(s![..random_width, split..])
+        .assign(&gaussian_matrix(&mut rng, random_width, input_dim - split, 1.0));
+    second_readers[[random_width, input_dim - 1]] = pair_scale;
+    second_readers[[random_width + 1, input_dim - 1]] = -pair_scale;
+    let mut second_biases = Array1::<f64>::zeros(second_width);
+    second_biases
+        .slice_mut(s![..random_width])
+        .assign(&gaussian_vector(&mut rng, random_width, 0.5));
+    let mut second_writers = Array2::<f64>::zeros((input_dim, second_width));
+    second_writers
+        .slice_mut(s![.., ..random_width])
+        .assign(&gaussian_matrix(&mut rng, input_dim, random_width, 0.8));
+    second_writers[[input_dim - 1, random_width]] = -1.0 / pair_scale;
+    second_writers[[input_dim - 1, random_width + 1]] = 1.0 / pair_scale;
+    let second_output_bias = gaussian_vector(&mut rng, input_dim, 0.5);
+    let first = KnownBlock::new(
+        first_readers.clone(),
+        first_biases.clone(),
+        first_writers.clone(),
+        first_output_bias.clone(),
+        metric.view(),
+        GaussianActivation::Relu,
+    )
+    .expect("the first residual block is valid");
+    let second = KnownBlock::new(
+        second_readers.clone(),
+        second_biases.clone(),
+        second_writers.clone(),
+        second_output_bias.clone(),
+        metric.view(),
+        GaussianActivation::Relu,
+    )
+    .expect("the second residual block is valid");
+    let width = first_width + second_width;
+    let mut joint_readers = Array2::<f64>::zeros((width, input_dim));
+    joint_readers.slice_mut(s![..first_width, ..]).assign(&first_readers);
+    joint_readers.slice_mut(s![first_width.., ..]).assign(&second_readers);
+    let mut joint_biases = Array1::<f64>::zeros(width);
+    joint_biases.slice_mut(s![..first_width]).assign(&first_biases);
+    joint_biases
+        .slice_mut(s![first_width..])
+        .assign(&(&second_biases + &second_readers.dot(&first_output_bias)));
+    let mut joint_writers = Array2::<f64>::zeros((input_dim, width));
+    joint_writers.slice_mut(s![.., ..first_width]).assign(&first_writers);
+    joint_writers.slice_mut(s![.., first_width..]).assign(&second_writers);
+    let joint_output_bias = &first_output_bias + &second_output_bias;
+    let joint = KnownBlock::new(
+        joint_readers.clone(),
+        joint_biases.clone(),
+        joint_writers.clone(),
+        joint_output_bias.clone(),
+        metric.view(),
+        GaussianActivation::Relu,
+    )
+    .expect("the one residual block G₁ ⊕ G₂ is valid");
+
+    let caller_frame = orthonormal_frame(&mut rng, input_dim, rank);
+    let enlarged = enlarged_frame(&first, &second, caller_frame.view()).expect("the enlarged frame of the stack");
+    assert!(
+        enlarged.read_units.is_empty(),
+        "the second block reads no first-block write, yet N = {:?}",
+        enlarged.read_units
+    );
+    assert_eq!(
+        enlarged.frame.ncols(),
+        rank,
+        "an empty N must keep the frame at rank {rank}"
+    );
+    let frame = enlarged.frame.view();
+
+    let points = gaussian_matrix(&mut rng, point_count, input_dim, 1.0);
+    let stack = residual_stack_response(&first, &second, frame, points.view()).expect("the stack route at the points");
+    assert!(
+        stack.state_leak == 0.0,
+        "with N = ∅ nothing leaks, yet Λ = {}",
+        stack.state_leak
+    );
+    let one_block = joint
+        .retained_response(frame, points.view())
+        .expect("the one-block retained response")
+        + &points.dot(&frame).dot(&frame.t());
+    // Both routes form each term of a coordinate with at most `d + h + k + 4` rounded operations on a chain, and the
+    // smoothing closed forms add their own `CLOSED_FORM_FLOOR`. ReLU's smoothing is 1-Lipschitz in its location,
+    // `|τ_u| ≤ |μ_u| + √v_u ≤ β_u + ‖w_u‖ (‖z‖ + 1)` with `β_u` the absolute sum of the bias terms the routes add, and
+    // two evaluations of one exact value differ by at most twice one's bound.
+    let agreement_growth = 2.0 * (accumulation_growth(input_dim + width + rank + 4) + CLOSED_FORM_FLOOR);
+    let mut bias_scales = joint_biases.mapv(f64::abs);
+    bias_scales
+        .slice_mut(s![first_width..])
+        .assign(&(second_biases.mapv(f64::abs) + second_readers.mapv(f64::abs).dot(&first_output_bias.mapv(f64::abs))));
+    for point in 0..point_count {
+        let z = points.row(point);
+        let z_norm = z.dot(&z).sqrt();
+        let coordinates = frame.t().dot(&z).mapv(f64::abs);
+        let mut resolved = false;
+        for coordinate in 0..input_dim {
+            let unit_scale: f64 = (0..width)
+                .map(|unit| {
+                    let reader = joint_readers.row(unit);
+                    2.0 * joint_writers[[coordinate, unit]].abs()
+                        * (bias_scales[unit] + reader.dot(&reader).sqrt() * (z_norm + 1.0))
+                })
+                .sum();
+            let scale = joint_output_bias[coordinate].abs()
+                + frame.row(coordinate).mapv(f64::abs).dot(&coordinates)
+                + unit_scale;
+            let floor = agreement_growth * scale;
+            let (routed, expected) = (stack.conditional_mean[[point, coordinate]], one_block[[point, coordinate]]);
+            assert!(
+                (routed - expected).abs() <= floor,
+                "point {point} coordinate {coordinate}: the stack route's mean {routed} disagrees with the one-block response {expected} beyond {floor}"
+            );
+            resolved |= expected.abs() > floor;
+        }
+        assert!(
+            resolved,
+            "magnitude floor: every coordinate of the one-block response at point {point} is within its rounding floor of zero"
+        );
+    }
+
+    let energies = residual_block_energies(&joint, frame).expect("the one-block residual energies");
+    let outer_points = gaussian_matrix(&mut rng, outer_draws, input_dim, 1.0);
+    let outer = residual_stack_response(&first, &second, frame, outer_points.view()).expect("the stack route over PZ");
+    let (average, standard_error) = sample_mean_and_error(outer.conditional_variance.view());
+    let gate = comparison_multiple(2) * standard_error;
+    eprintln!(
+        "#2946 compose residual stack, N = ∅: average conditional variance {average} ± {standard_error} against E(P) {} (cross term {}) gate {gate}",
+        energies.discarded_error, energies.discarded_cross_term
+    );
+    assert!(
+        energies.discarded_error > gate,
+        "magnitude floor: E(P) = {} is not resolved from zero at the gate {gate}",
+        energies.discarded_error
+    );
+    assert!(
+        (average - energies.discarded_error).abs() <= gate,
+        "the stack route's average conditional variance {average} disagrees with the one-block E(P) = {} beyond {gate}",
+        energies.discarded_error
+    );
+    assert!(
+        (average - (energies.discarded_error - energies.discarded_cross_term)).abs() > gate,
+        "positive control: the gate {gate} cannot reject E(P) without its Stein cross term {}",
+        energies.discarded_cross_term
+    );
+}
+
+#[test]
+fn the_enlarged_frame_makes_a_reading_residual_stack_agree_with_its_executed_output() {
+    // `G₂` reads coordinates `0, 1`, where only `G₁`'s units `0, 1` write, so `N = {0, 1}`. On `Q̃ = orth[Q, w₁₀, w₁₁]`
+    // those units are functions of `P̃Z`, and the executed `E[out | P̃Z]` and `E[‖out − E[out | P̃Z]‖²_M | P̃Z]` must agree
+    // with the stack route at retained points. On the caller's rank-1 frame the route is only the model `out'`: the same
+    // gate must reject it, and its measured mean error must stay within its state leak `Λ`.
+    let (input_dim, first_width, second_width, rank, point_count, draws) = (5, 4, 3, 1, 3, 1 << 16);
+    let mut rng: u64 = 0x2946_c102;
+    let metric = Array2::from_diag(&array![1.0, 2.0, 0.5, 1.5, 1.0]);
+    let mut first_writers = gaussian_matrix(&mut rng, input_dim, first_width, 1.0);
+    first_writers.slice_mut(s![..2, 2..]).fill(0.0);
+    let mut second_readers = Array2::<f64>::zeros((second_width, input_dim));
+    second_readers
+        .slice_mut(s![.., ..2])
+        .assign(&gaussian_matrix(&mut rng, second_width, 2, 1.5));
+    let first = KnownBlock::new(
+        gaussian_matrix(&mut rng, first_width, input_dim, 1.0),
+        gaussian_vector(&mut rng, first_width, 0.5),
+        first_writers,
+        gaussian_vector(&mut rng, input_dim, 0.5),
+        metric.view(),
+        GaussianActivation::Relu,
+    )
+    .expect("the first residual block is valid");
+    let second = KnownBlock::new(
+        second_readers,
+        gaussian_vector(&mut rng, second_width, 0.5),
+        gaussian_matrix(&mut rng, input_dim, second_width, 1.0),
+        gaussian_vector(&mut rng, input_dim, 0.5),
+        metric.view(),
+        GaussianActivation::Relu,
+    )
+    .expect("the second residual block is valid");
+    let caller_frame = orthonormal_frame(&mut rng, input_dim, rank);
+    let enlarged = enlarged_frame(&first, &second, caller_frame.view()).expect("the enlarged frame of the stack");
+    assert_eq!(enlarged.read_units, vec![0, 1], "the second block reads exactly the first block's units 0 and 1");
+    assert_eq!(
+        enlarged.frame.ncols(),
+        rank + 2,
+        "the enlarged frame retains the caller's direction and both read readers"
+    );
+    let points = gaussian_matrix(&mut rng, point_count, input_dim, 1.0);
+    let exact = residual_stack_response(&first, &second, enlarged.frame.view(), points.view())
+        .expect("the stack route on the enlarged frame");
+    let model = residual_stack_response(&first, &second, caller_frame.view(), points.view())
+        .expect("the stack route on the caller's frame");
+    let executed = |input: ArrayView1<'_, f64>| executed_relu_residual_stack(&first, &second, input);
+    let multiple = comparison_multiple(point_count * (input_dim + 1));
+    // Laurent–Massart: a Gaussian quadratic form with total weight `V/n` exceeds `(1 + 2√x + 2x) V/n` with probability at
+    // most `e^{−x}`, so this bounds `‖m̂ − m‖_M` of the sample mean at every point at the family-wise false alarm.
+    let tail = (point_count as f64 / FAMILY_WISE_FALSE_ALARM).ln();
+    let tail_factor = 1.0 + 2.0 * tail.sqrt() + 2.0 * tail;
+    let mut model_rejections = 0;
+    for point in 0..point_count {
+        let z = points.row(point);
+        let on_enlarged = executed_conditional_moments(
+            &mut rng,
+            enlarged.frame.view(),
+            z,
+            exact.conditional_mean.row(point),
+            metric.view(),
+            draws,
+            executed,
+        );
+        let smallest_error = on_enlarged.mean_errors.iter().fold(on_enlarged.squared_deviation_error, |least, &error| least.min(error));
+        assert!(
+            exact.state_leak < smallest_error,
+            "the state leak Λ = {} on the enlarged frame is resolvable at the Monte Carlo's resolution {smallest_error}",
+            exact.state_leak
+        );
+        for coordinate in 0..input_dim {
+            let gate = multiple * on_enlarged.mean_errors[coordinate];
+            let (routed, measured) = (exact.conditional_mean[[point, coordinate]], on_enlarged.mean[coordinate]);
+            assert!(
+                (routed - measured).abs() <= gate,
+                "point {point} coordinate {coordinate}: the stack route's mean {routed} disagrees with the executed {measured} beyond {gate}"
+            );
+        }
+        let variance_gate = multiple * on_enlarged.squared_deviation_error;
+        let routed_variance = exact.conditional_variance[point];
+        eprintln!(
+            "#2946 compose residual stack on the enlarged frame, point {point}: conditional variance {routed_variance} executed {} ± {} state leak {}",
+            on_enlarged.squared_deviation, on_enlarged.squared_deviation_error, exact.state_leak
+        );
+        assert!(
+            routed_variance > variance_gate,
+            "magnitude floor: the conditional variance {routed_variance} at point {point} is not resolved from zero at {variance_gate}"
+        );
+        assert!(
+            (routed_variance - on_enlarged.squared_deviation).abs() <= variance_gate,
+            "point {point}: the stack route's conditional variance {routed_variance} disagrees with the executed {} beyond {variance_gate}",
+            on_enlarged.squared_deviation
+        );
+
+        let on_caller = executed_conditional_moments(
+            &mut rng,
+            caller_frame.view(),
+            z,
+            model.conditional_mean.row(point),
+            metric.view(),
+            draws,
+            executed,
+        );
+        let rejected_mean = (0..input_dim).any(|coordinate| {
+            (model.conditional_mean[[point, coordinate]] - on_caller.mean[coordinate]).abs()
+                > multiple * on_caller.mean_errors[coordinate]
+        });
+        let rejected_variance = (model.conditional_variance[point] - on_caller.squared_deviation).abs()
+            > multiple * on_caller.squared_deviation_error;
+        if rejected_mean || rejected_variance {
+            model_rejections += 1;
+        }
+        let mean_error = &on_caller.mean - &model.conditional_mean.row(point);
+        let mean_error_norm = mean_error.dot(&metric.dot(&mean_error)).sqrt();
+        let spread = (on_caller.squared_deviation - mean_error_norm * mean_error_norm).max(0.0);
+        let allowance = (tail_factor * spread / draws as f64).sqrt();
+        eprintln!(
+            "#2946 compose residual stack on the caller's frame, point {point}: mean error {mean_error_norm} state leak {} allowance {allowance} rejected {}",
+            model.state_leak,
+            rejected_mean || rejected_variance
+        );
+        assert!(
+            mean_error_norm <= model.state_leak + allowance,
+            "point {point}: the model's mean error {mean_error_norm} exceeds its state leak {} plus the sampling allowance {allowance}",
+            model.state_leak
+        );
+    }
+    assert!(
+        model_rejections > 0,
+        "positive control: the gate never rejects the route on the caller's frame, which discards the read readers"
+    );
+}
+
+#[test]
+fn a_dense_second_block_enlarges_the_state_to_the_whole_stream() {
+    // Every `G₂` reader reads every coordinate, so `N` is every unit of `G₁`, and its `h₁ = 4 ≥ d − k = 2` readers fill
+    // `ℝ³`: the enlarged state is the whole stream, and nothing is compressed.
+    let (input_dim, first_width, second_width, rank) = (3, 4, 2, 1);
+    let mut rng: u64 = 0x2946_c103;
+    let metric = Array2::<f64>::eye(input_dim);
+    let first = KnownBlock::new(
+        gaussian_matrix(&mut rng, first_width, input_dim, 1.0),
+        gaussian_vector(&mut rng, first_width, 0.5),
+        gaussian_matrix(&mut rng, input_dim, first_width, 1.0),
+        Array1::<f64>::zeros(input_dim),
+        metric.view(),
+        GaussianActivation::ExactGelu,
+    )
+    .expect("the first residual block is valid");
+    let second = KnownBlock::new(
+        gaussian_matrix(&mut rng, second_width, input_dim, 1.0),
+        gaussian_vector(&mut rng, second_width, 0.5),
+        gaussian_matrix(&mut rng, input_dim, second_width, 1.0),
+        Array1::<f64>::zeros(input_dim),
+        metric.view(),
+        GaussianActivation::ExactGelu,
+    )
+    .expect("the second residual block is valid");
+    let caller_frame = orthonormal_frame(&mut rng, input_dim, rank);
+    let enlarged = enlarged_frame(&first, &second, caller_frame.view()).expect("the enlarged frame of the stack");
+    assert_eq!(
+        enlarged.read_units,
+        (0..first_width).collect::<Vec<_>>(),
+        "a dense second block reads every unit"
+    );
+    assert_eq!(
+        enlarged.frame.ncols(),
+        input_dim,
+        "k + |N| = {} readers in ℝ^{input_dim} must enlarge the state to the whole stream",
+        rank + first_width
+    );
+}
+
+#[test]
+fn a_residual_stack_of_two_activations_is_refused() {
+    let identity = Array2::<f64>::eye(2);
+    let block = |activation| {
+        KnownBlock::new(
+            identity.clone(),
+            Array1::<f64>::zeros(2),
+            identity.clone(),
+            Array1::<f64>::zeros(2),
+            identity.view(),
+            activation,
+        )
+        .expect("an identity block is valid")
+    };
+    let (first, second) = (block(GaussianActivation::Relu), block(GaussianActivation::ExactGelu));
+    let refusal = residual_stack_response(
+        &first,
+        &second,
+        Array2::<f64>::zeros((2, 0)).view(),
+        Array2::<f64>::zeros((1, 2)).view(),
+    )
+    .expect_err("a ReLU block followed by a GELU block has no mixed pair kernel");
+    assert_eq!(
+        refusal,
+        ResidualStackError::MixedActivations {
+            first: GaussianActivation::Relu,
+            second: GaussianActivation::ExactGelu,
+        },
+        "the refusal must name both activations"
     );
 }

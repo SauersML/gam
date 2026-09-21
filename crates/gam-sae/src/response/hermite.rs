@@ -1421,17 +1421,16 @@ pub fn propose(
 /// The smallest order whose truncation error, band included, is within
 /// `budget.unexplained_fraction · V(P)`, with `V(P)` from the block's kernels.
 ///
-/// `V(P)` enters with the band its owner publishes. The first landing of the retained-response
-/// operator publishes none, so the band is zero here until it does.
+/// `V(P)` enters with the band its owner publishes ([`KnownBlock::explained_variance`]).
 pub fn select_order<'a>(
     block: &'a KnownBlock,
     frame: ArrayView2<'_, f64>,
     budget: FidelityBudget,
 ) -> Result<(HermiteResponse<'a>, OrderSelection), HermiteError> {
-    let value = block
+    let total = block
         .explained_variance(frame)
         .map_err(HermiteError::Response)?;
-    select_order_with_total_energy(block, frame, BandedEnergy { value, band: 0.0 }, budget)
+    select_order_with_total_energy(block, frame, total, budget)
 }
 
 /// [`select_order`] for a caller holding `V(P)` with its band.

@@ -4,10 +4,12 @@
 //! gradient, and Hessian with respect to `rho` agree only while that
 //! exponentiation is evaluated exactly: clamping `rho` or flooring/ceilinging
 //! `lambda` creates a constant tail with a fictitious nonzero derivative.
-//! The inclusive `[-700, 700]` interval deliberately stays inside binary64's
-//! finite, normal exponential range: its lower face avoids subnormal-strength
-//! arithmetic and its upper face leaves overflow guard margin.  It is a solver
-//! policy domain, not a claim about the widest representable binary64 input.
+//! The computation forms both `lambda = exp(rho)` and `1/lambda = exp(-rho)`
+//! (a penalty and the prior covariance it implies), so the domain is where both
+//! are finite, normal binary64 numbers: `|rho| <= -ln(f64::MIN_POSITIVE)
+//! = 1022 ln 2`. Its faces are the edge of what the computation represents, not
+//! a constraint of any model, so every face they bound is declared
+//! [`crate::domain_face::DomainFaceKind::Representability`] (#2627).
 //! This module owns the single domain used by all penalty implementations.
 
 /// `ln √ε`: the log of the relative resolution of a criterion gradient carried
@@ -28,11 +30,15 @@ pub fn precision_box() -> (f64, f64) {
     (log_gradient_resolution(), -log_gradient_resolution())
 }
 
-/// Smallest supported logarithmic strength (inclusive).
-pub const LOG_STRENGTH_MIN: f64 = -700.0;
+/// Smallest supported logarithmic strength (inclusive): `ln(f64::MIN_POSITIVE)`,
+/// the log of the smallest normal binary64 number. See [`LOG_STRENGTH_MAX`].
+pub const LOG_STRENGTH_MIN: f64 = -LOG_STRENGTH_MAX;
 
-/// Largest supported logarithmic strength (inclusive).
-pub const LOG_STRENGTH_MAX: f64 = 700.0;
+/// Largest supported logarithmic strength (inclusive):
+/// `-ln(f64::MIN_POSITIVE) = (1 - f64::MIN_EXP) ln 2 = 1022 ln 2`. At either face
+/// `exp(rho)` and `exp(-rho)` are finite and normal: the reciprocal of the
+/// smallest normal number is finite, so this face binds before `ln(f64::MAX)`.
+pub const LOG_STRENGTH_MAX: f64 = (1 - f64::MIN_EXP) as f64 * std::f64::consts::LN_2;
 
 /// A logarithmic strength is outside the exact supported solver contract.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -171,6 +177,27 @@ mod tests {
             let strength = checked_exp_log_strength(endpoint).expect("closed endpoint");
             assert_eq!(strength.to_bits(), endpoint.exp().to_bits());
             assert!(strength.is_finite() && strength > 0.0);
+        }
+    }
+
+    #[test]
+    fn domain_faces_are_where_a_strength_and_its_reciprocal_stay_normal() {
+        // The face is -ln(f64::MIN_POSITIVE), up to the one rounding of its
+        // closed form 1022 ln 2.
+        let from_log = -f64::MIN_POSITIVE.ln();
+        assert!(
+            (LOG_STRENGTH_MAX - from_log).abs() <= f64::EPSILON * from_log,
+            "LOG_STRENGTH_MAX {LOG_STRENGTH_MAX:e} is not -ln(f64::MIN_POSITIVE) {from_log:e}"
+        );
+        assert_eq!(LOG_STRENGTH_MIN, -LOG_STRENGTH_MAX);
+        for face in [LOG_STRENGTH_MIN, LOG_STRENGTH_MAX] {
+            let strength = face.exp();
+            let reciprocal = (-face).exp();
+            assert!(
+                strength.is_normal() && reciprocal.is_normal(),
+                "at rho = {face:e}: exp(rho) = {strength:e} and exp(-rho) = {reciprocal:e} must \
+                 both be finite normal binary64 numbers"
+            );
         }
     }
 

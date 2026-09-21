@@ -15,7 +15,7 @@
 
 use faer::Side;
 use gam::faer_ndarray::FaerCholesky;
-use gam::inference::full_conformal::ExactFullConformalSubstrate;
+use gam::inference::full_conformal::{ConformalTrainingFrame, ExactFullConformalSubstrate};
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -127,13 +127,29 @@ fn gaussian_exact_full_conformal_covers_under_misspecification_and_is_efficient(
     }
     let m0 = train_design.t().dot(&train_design) + &s_lambda;
     let prior_weights = Array1::<f64>::ones(train_design.nrows());
-    let substrate = ExactFullConformalSubstrate::from_design_unit_weight_normal_matrix(
-        &train_design,
+    // The substrate stores the training column and rebuilds the design through the
+    // builder the route hands it, as a saved model rebuilds its design through its
+    // frozen term specification (#2901 V17).
+    let substrate = ExactFullConformalSubstrate::from_training_frame_unit_weight_normal_matrix(
+        ConformalTrainingFrame {
+            headers: vec!["x".to_string()],
+            values: x_train.clone().insert_axis(ndarray::Axis(1)),
+        },
+        &train_design.t().dot(&train_design),
         &y_train,
         &prior_weights,
         &m0,
     )
     .expect("exact full-conformal substrate from unit-weight normal matrix");
+    let training = substrate
+        .training(|frame| {
+            let design = poly_design(&frame.values.column(0).to_owned());
+            gam_runtime::resource::MemoryGovernor::global()
+                .try_reserve_dense_f64(design.nrows(), design.ncols(), "route test design")
+                .map(|reservation| reservation.bind(design))
+                .map_err(|error| error.to_string())
+        })
+        .expect("exact full-conformal training statistics");
 
     // Parametric mean + predictive SD for the delta-method Wald baseline: μ̂ =
     // x_*ᵀβ̂, β̂ = M₀⁻¹Xᵀy, Var(μ̂) = σ̂²·x_*ᵀM₀⁻¹XᵀX M₀⁻¹x_* (sandwich), and the
@@ -162,7 +178,7 @@ fn gaussian_exact_full_conformal_covers_under_misspecification_and_is_efficient(
         let x_star = test_design.row(i).to_owned();
 
         // EXACT full-conformal envelope (the #1098 engine).
-        let interval = substrate
+        let interval = training
             .interval(&x_star, alpha)
             .expect("exact full-conformal interval");
         if y_test[i] >= interval.lo && y_test[i] <= interval.hi {

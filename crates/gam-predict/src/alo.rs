@@ -195,6 +195,9 @@ impl SavedSurvivalAffineBlockAloInput {
 /// retained in observed row curvature.
 pub struct SavedLocationScaleSurvivalAloInput {
     event: Array1<f64>,
+    /// Whether each row entered after the origin; a row entering at the origin
+    /// carries no `S(entry)` factor in the fitted likelihood (#2695).
+    entry_active: Vec<bool>,
     derivative_guard: f64,
     time_base: SavedSurvivalAffineBlockAloInput,
     threshold: SavedSurvivalAffineBlockAloInput,
@@ -348,6 +351,7 @@ impl SavedLatentBinaryAloInput {
 impl SavedLocationScaleSurvivalAloInput {
     pub fn new(
         event: Array1<f64>,
+        entry_active: Vec<bool>,
         derivative_guard: f64,
         time_base: SavedSurvivalAffineBlockAloInput,
         threshold: SavedSurvivalAffineBlockAloInput,
@@ -364,6 +368,12 @@ impl SavedLocationScaleSurvivalAloInput {
                 time_base.design_exit.nrows(),
                 threshold.design_exit.nrows(),
                 log_sigma.design_exit.nrows(),
+            ));
+        }
+        if entry_active.len() != n {
+            return Err(format!(
+                "saved survival location-scale ALO entry activity has {} rows; expected {n}",
+                entry_active.len()
             ));
         }
         if !derivative_guard.is_finite() || derivative_guard <= 0.0 {
@@ -383,6 +393,7 @@ impl SavedLocationScaleSurvivalAloInput {
         }
         Ok(Self {
             event,
+            entry_active,
             derivative_guard,
             time_base,
             threshold,
@@ -2615,6 +2626,7 @@ fn compute_saved_location_scale_survival_alo(
                 eta_log_sigma_exit: eta_log_sigma_exit[row],
                 eta_log_sigma_entry: eta_log_sigma_entry[row],
                 eta_log_sigma_derivative_exit: eta_log_sigma_derivative_exit[row],
+                entry_active: input.entry_active[row],
                 time_wiggle: time_wiggle_row,
                 link_wiggle: link_wiggle_row,
             })

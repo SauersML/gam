@@ -186,7 +186,9 @@ fn reactive_rho_upper_face_comes_from_live_penalty_geometry() {
     let (objective, _z, seed) = two_circle_objective(96, 48, 2, 2, 8);
     let upper = OuterObjective::outer_domain_upper_bound(&objective)
         .expect("reactive rho domain construction must succeed")
-        .expect("dense K=2 objective must advertise a legal upper face");
+        .expect("dense K=2 objective must advertise a legal upper face")
+        .values()
+        .clone();
     eprintln!("[#2080] geometry-derived reactive rho upper={upper:?}, target={seed:?}");
     assert_eq!(upper.len(), seed.len());
     assert!(upper.iter().all(|value| value.is_finite()));
@@ -294,7 +296,9 @@ fn freeze_contract_bypasses_the_bundle() {
     let (mut objective, _z, _seed) = two_circle_objective(n, p, k, 2, 8);
     let legal_rho = OuterObjective::outer_domain_upper_bound(&objective)
         .expect("objective legal rho construction must succeed")
-        .expect("dense K=2 objective must advertise a legal rho entry");
+        .expect("dense K=2 objective must advertise a legal rho entry")
+        .values()
+        .clone();
     let scalar_contract = OuterObjective::reactive_domain_scalar_contract(&objective)
         .expect("reactive scalar contract construction must succeed")
         .expect("dense K=2 objective must advertise a reactive scalar entry");
@@ -373,7 +377,9 @@ fn fixed_legal_rho_envelope_value_is_stable_across_re_evaluation() {
     let (mut objective, _z, _seed) = two_circle_objective(n, p, k, 2, 8);
     let legal_rho = OuterObjective::outer_domain_upper_bound(&objective)
         .expect("objective legal rho construction must succeed")
-        .expect("dense K=2 objective must advertise a legal rho entry");
+        .expect("dense K=2 objective must advertise a legal rho entry")
+        .values()
+        .clone();
     let scalar_contract = OuterObjective::reactive_domain_scalar_contract(&objective)
         .expect("reactive scalar contract construction must succeed")
         .expect("dense K=2 objective must advertise a reactive scalar entry");

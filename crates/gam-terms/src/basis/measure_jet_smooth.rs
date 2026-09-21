@@ -884,14 +884,49 @@ fn condition_representer_section(
     k_cc: &Array2<f64>,
     z_rbf: &Array2<f64>,
 ) -> Result<Array2<f64>, BasisError> {
-    if z_rbf.ncols() == 0 {
-        return Ok(z_rbf.clone());
+    Ok(match representer_section_chart(k_cc, z_rbf)?.transform {
+        Some(transform) => z_rbf.dot(&transform),
+        None => z_rbf.clone(),
+    })
+}
+
+/// The chart [`condition_representer_section`] realizes, with the decomposition
+/// it is read off. [`representer_section_log_length_jets`] differentiates the
+/// same decision, so both read it here.
+struct RepresenterSectionChart {
+    /// `z_rbf` coordinates to realized columns, `q × r`. `None` when the section
+    /// passes through unchanged.
+    transform: Option<Array2<f64>>,
+    /// Every singular value of `E = K_cc·z_rbf`.
+    singular: Array1<f64>,
+    /// The right singular vectors of `E` as COLUMNS, `q × q`.
+    right: Array2<f64>,
+    /// The directions the retention bar keeps, in the transform's column order.
+    kept: Vec<usize>,
+    /// `sign/max(σ, floor)` for each kept column.
+    column_scales: Vec<f64>,
+}
+
+fn representer_section_chart(
+    k_cc: &Array2<f64>,
+    z_rbf: &Array2<f64>,
+) -> Result<RepresenterSectionChart, BasisError> {
+    let width = z_rbf.ncols();
+    let pass_through = |singular: Array1<f64>| RepresenterSectionChart {
+        transform: None,
+        singular,
+        right: Array2::<f64>::eye(width),
+        kept: (0..width).collect(),
+        column_scales: vec![1.0; width],
+    };
+    if width == 0 {
+        return Ok(pass_through(Array1::<f64>::zeros(0)));
     }
     let evaluation = k_cc.dot(z_rbf);
     let (_, singular, right) = evaluation.svd(false, true).map_err(BasisError::LinalgError)?;
     let leading = singular.iter().copied().fold(0.0_f64, f64::max);
     if !(leading.is_finite() && leading > 0.0) {
-        return Ok(z_rbf.clone());
+        return Ok(pass_through(singular));
     }
     // `right` is `Vᵀ`: row `i` is `σ_i`'s right singular vector, in the
     // coefficient coordinates of `z_rbf`.
@@ -984,6 +1019,7 @@ fn condition_representer_section(
         kept
     };
     let mut transform = Array2::<f64>::zeros((z_rbf.ncols(), kept.len()));
+    let mut column_scales = Vec::with_capacity(kept.len());
     for (column, &index) in kept.iter().enumerate() {
         let inverse = singular[index]
             .max(amplification_floor)
@@ -1003,8 +1039,207 @@ fn condition_representer_section(
         for row in 0..z_rbf.ncols() {
             transform[(row, column)] = sign * right[(index, row)] * inverse;
         }
+        column_scales.push(sign * inverse);
     }
-    Ok(z_rbf.dot(&transform))
+    Ok(RepresenterSectionChart {
+        transform: Some(transform),
+        singular,
+        right: right.t().to_owned(),
+        kept,
+        column_scales,
+    })
+}
+
+/// `(W·A, null(AᵀW·K_cc))`: the mass-weighted affine value basis at the centers
+/// and the orthonormal representer coefficient section it leaves, before
+/// conditioning.
+///
+/// `head_cc` IS the affine value basis `A` at the centers, by construction (both
+/// come from `measure_jet_affine_head_lift`), so the gauge constrains the
+/// representers against exactly the span the head carries.
+fn representer_null_section(
+    k_cc: &Array2<f64>,
+    head_cc: &Array2<f64>,
+    masses: ArrayView1<'_, f64>,
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    let mut weighted_affine = head_cc.clone();
+    for (i, mut row) in weighted_affine.outer_iter_mut().enumerate() {
+        row.mapv_inplace(|v| v * masses[i]);
+    }
+    // `rrqr_nullspace_basis(B)` returns null(B^T). Here `B = K_cc^T W A = C^T`,
+    // hence the returned columns span null(C), exactly the required RBF
+    // coefficient section.
+    let constraint_cross = k_cc.t().dot(&weighted_affine);
+    let (section, _) = rrqr_nullspace_basis(&constraint_cross, default_rrqr_rank_alpha())
+        .map_err(BasisError::LinalgError)?;
+    Ok((weighted_affine, section))
+}
+
+/// First and second `u = ln ℓ` derivatives `(∂Z, ∂²Z)` of the representer section
+/// a `CenterSumToZero` build realizes, on its representer rows and columns
+/// (`m × r`).
+///
+/// A frozen transform replays one coefficient chart, so its jets hold `Z` fixed.
+/// A `CenterSumToZero` build realizes the section at every range,
+/// `Z(ℓ) = N(ℓ)·V(ℓ)·D(ℓ)`, and the design and penalty jets have to carry that
+/// motion or they differentiate a function the builder never evaluates. On the
+/// range-screen fixture the frozen-`Z` jet put `V′` 1.5e-3 relative off central
+/// differences of the rebuilt criterion, while freezing the gauge on both sides
+/// agreed to 5e-7 (#2902 row 5). Two factors move:
+///
+/// * `N(ℓ)`, an orthonormal basis of `null(C(ℓ))`, `C = AᵀW K_cc(ℓ)`, of constant
+///   rank. Along `N(u) = P(u)N₀(N₀ᵀP(u)N₀)^{-1/2}` with `P = I − C⁺C` and
+///   `CN₀ = 0`: `N′ = −C⁺C′N₀` and `N″ = −2(C⁺)′C′N₀ − C⁺C″N₀ + N₀N′ᵀN′`, where
+///   `(C⁺)′ = −C⁺C′C⁺ + C⁺C⁺ᵀC′ᵀ(I − CC⁺) + (I − C⁺C)C′ᵀC⁺ᵀC⁺`.
+/// * `V(ℓ)`, the right singular directions of `E = K_cc·N` the retention bar
+///   keeps. Their span is the dominant invariant subspace of `F = EᵀE`. In the
+///   graph chart `V_K(u) = V_K + V_D·X(u)` of that subspace, the invariance
+///   equation gives, in `E`'s singular basis with `λ = σ²`,
+///   `X′_jk·(λ_k − λ_j) = F′_jk` and
+///   `X″_jk·(λ_k − λ_j) = F″_jk + 2(F′_DD·X′ − X′·F′_KK)_jk`.
+///
+/// `D`, the conditioning's damping, and every other chart freedom right-multiply
+/// the section, which the profiled criterion does not see (`X → XT`,
+/// `S → TᵀST`). So on any stretch of ranges where the constraint rank and the
+/// retained count hold, this curve's jets are the realized criterion's jets.
+/// Where either count changes the realized design jumps, and no derivative
+/// describes a jump.
+fn representer_section_log_length_jets(
+    centers: ArrayView2<'_, f64>,
+    masses: ArrayView1<'_, f64>,
+    head_lift: ArrayView2<'_, f64>,
+    kernel: [&Array2<f64>; 3],
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    let [k_cc, dk_cc, d2k_cc] = kernel;
+    let m = centers.nrows();
+    let head_cc = measure_jet_affine_head_block(centers, head_lift);
+    let (weighted_affine, section) = representer_null_section(k_cc, &head_cc, masses)?;
+    let width = section.ncols();
+    let constraint = weighted_affine.t().dot(k_cc);
+    let constraint_first = weighted_affine.t().dot(dk_cc);
+    let constraint_second = weighted_affine.t().dot(d2k_cc);
+    // The pseudo-inverse on the rank the section was cut at.
+    let constraint_rank = m - width;
+    let (left, singular, right) = constraint.svd(true, true).map_err(BasisError::LinalgError)?;
+    let (Some(left), Some(right)) = (left, right) else {
+        crate::bail_invalid_basis!(
+            "measure-jet representer constraint decomposition returned no singular vectors"
+        );
+    };
+    let mut order: Vec<usize> = (0..singular.len()).collect();
+    order.sort_by(|&a, &b| singular[b].total_cmp(&singular[a]));
+    if constraint_rank > order.len() {
+        crate::bail_invalid_basis!(
+            "measure-jet representer section of width {width} implies constraint rank \
+             {constraint_rank}, but the constraint has {} singular values",
+            order.len()
+        );
+    }
+    let retained = &order[..constraint_rank];
+    let range_left = left.select(Axis(1), retained);
+    let range_right = right.select(Axis(0), retained).t().to_owned();
+    let mut inverse_singular = Array1::<f64>::zeros(constraint_rank);
+    for (slot, &index) in retained.iter().enumerate() {
+        let value = singular[index];
+        if !(value.is_finite() && value > 0.0) {
+            crate::bail_invalid_basis!(
+                "measure-jet representer constraint retains a singular value {value:e}"
+            );
+        }
+        inverse_singular[slot] = value.recip();
+    }
+    let pseudo_inverse =
+        (&range_right * &inverse_singular.view().insert_axis(Axis(0))).dot(&range_left.t());
+    let moved = constraint_first.dot(&section);
+    let pulled = pseudo_inverse.dot(&moved);
+    let off_range_left = &moved - &range_left.dot(&range_left.t().dot(&moved));
+    let back = constraint_first.t().dot(&pseudo_inverse.t().dot(&pulled));
+    let off_range_right = &back - &range_right.dot(&range_right.t().dot(&back));
+    let pseudo_inverse_moved = -pseudo_inverse.dot(&constraint_first.dot(&pulled))
+        + pseudo_inverse.dot(&pseudo_inverse.t().dot(&constraint_first.t().dot(&off_range_left)))
+        + off_range_right;
+    let null_first = -pulled;
+    let null_second = pseudo_inverse_moved * -2.0
+        - pseudo_inverse.dot(&constraint_second.dot(&section))
+        + section.dot(&null_first.t().dot(&null_first));
+
+    let chart = representer_section_chart(k_cc, &section)?;
+    let kept = &chart.kept;
+    let dropped: Vec<usize> = (0..width).filter(|index| !kept.contains(index)).collect();
+    let (rotation_first, rotation_second) = if dropped.is_empty() {
+        (
+            Array2::<f64>::zeros((width, kept.len())),
+            Array2::<f64>::zeros((width, kept.len())),
+        )
+    } else {
+        let evaluation = k_cc.dot(&section);
+        let evaluation_first = dk_cc.dot(&section) + k_cc.dot(&null_first);
+        let evaluation_second =
+            d2k_cc.dot(&section) + dk_cc.dot(&null_first) * 2.0 + k_cc.dot(&null_second);
+        let symmetric_product = |left: &Array2<f64>, right: &Array2<f64>| -> Array2<f64> {
+            let half = left.t().dot(right);
+            &half + &half.t()
+        };
+        let basis = &chart.right;
+        let gram_first = basis
+            .t()
+            .dot(&symmetric_product(&evaluation_first, &evaluation))
+            .dot(basis);
+        let gram_second = basis
+            .t()
+            .dot(
+                &(symmetric_product(&evaluation_second, &evaluation)
+                    + evaluation_first.t().dot(&evaluation_first) * 2.0),
+            )
+            .dot(basis);
+        let mut gaps = Array2::<f64>::zeros((dropped.len(), kept.len()));
+        let mut graph_first = Array2::<f64>::zeros((dropped.len(), kept.len()));
+        for (row, &lower) in dropped.iter().enumerate() {
+            for (column, &upper) in kept.iter().enumerate() {
+                let gap = chart.singular[upper].powi(2) - chart.singular[lower].powi(2);
+                if !(gap.is_finite() && gap > 0.0) {
+                    crate::bail_invalid_basis!(
+                        "measure-jet representer section has no spectral gap ({gap:e}) between a \
+                         kept and a dropped direction, so its range jet is undefined there"
+                    );
+                }
+                gaps[(row, column)] = gap;
+                graph_first[(row, column)] = gram_first[(lower, upper)] / gap;
+            }
+        }
+        let coupling = gram_first
+            .select(Axis(0), &dropped)
+            .select(Axis(1), &dropped)
+            .dot(&graph_first)
+            - graph_first.dot(&gram_first.select(Axis(0), kept).select(Axis(1), kept));
+        let mut graph_second = Array2::<f64>::zeros((dropped.len(), kept.len()));
+        for (row, &lower) in dropped.iter().enumerate() {
+            for (column, &upper) in kept.iter().enumerate() {
+                graph_second[(row, column)] = (gram_second[(lower, upper)]
+                    + 2.0 * coupling[(row, column)])
+                    / gaps[(row, column)];
+            }
+        }
+        let dropped_basis = basis.select(Axis(1), &dropped);
+        (
+            dropped_basis.dot(&graph_first),
+            dropped_basis.dot(&graph_second),
+        )
+    };
+    let scales = Array1::from_vec(chart.column_scales.clone());
+    let scale_columns =
+        |block: Array2<f64>| -> Array2<f64> { &block * &scales.view().insert_axis(Axis(0)) };
+    let transform = chart
+        .transform
+        .clone()
+        .unwrap_or_else(|| Array2::<f64>::eye(width));
+    let rotation_first = scale_columns(rotation_first);
+    let rotation_second = scale_columns(rotation_second);
+    let first = null_first.dot(&transform) + section.dot(&rotation_first);
+    let second = null_second.dot(&transform)
+        + null_first.dot(&rotation_first) * 2.0
+        + section.dot(&rotation_second);
+    Ok((first, second))
 }
 
 /// Axis-aligned bounding-box diagonal of a point set — the deterministic
@@ -2192,21 +2427,7 @@ pub(crate) fn realize_measure_jet_geometry(
         }
         MeasureJetIdentifiability::CenterSumToZero => {
             let z_rbf = if head_width > 0 {
-                // `head_cc` IS the affine value basis A at the centers, by
-                // construction (both come from `measure_jet_affine_head_lift`),
-                // so the gauge constrains the representers against exactly the
-                // span the head carries.
-                let mut weighted_affine = head_cc.clone();
-                for (i, mut row) in weighted_affine.outer_iter_mut().enumerate() {
-                    row.mapv_inplace(|v| v * masses[i]);
-                }
-                // `rrqr_nullspace_basis(B)` returns null(B^T). Here
-                // `B = K_cc^T W A = C^T`, hence the returned columns span
-                // null(C), exactly the required RBF coefficient section.
-                let constraint_cross = k_cc.t().dot(&weighted_affine);
-                rrqr_nullspace_basis(&constraint_cross, default_rrqr_rank_alpha())
-                    .map_err(BasisError::LinalgError)?
-                    .0
+                representer_null_section(&k_cc, &head_cc, masses.view())?.1
             } else {
                 let u = householder_sum_to_zero_u(m);
                 householder_sum_to_zero_z(&u)
@@ -2663,10 +2884,11 @@ pub fn build_measure_jet_basis_psi_derivatives(
 
     // The Gaussian representer range moves both the FIT design and the center
     // evaluation map `E = [K_cc | A_head] Z`. The affine head is ℓ-invariant,
-    // so its raw derivative columns are exactly zero before applying the frozen
-    // Gauge section. Keeping `Z` frozen is the replay contract: rank/gauge
-    // realization happens once at fit time, then every ψ trial differentiates
-    // the same coefficient chart.
+    // so its raw derivative columns are exactly zero before applying the Gauge
+    // section. A frozen transform is the replay contract: rank/gauge realization
+    // happens once at fit time, then every ψ trial differentiates the same
+    // coefficient chart. A `CenterSumToZero` build realizes the section at every
+    // ℓ, so its jets carry the section's own motion as well (#2902 row 5).
     let length_scale_jets = if spec.learn_length_scale {
         let (dk_data, d2k_data) =
             measure_jet_design_log_length_jets(data, geom.centers.view(), geom.length_scale)?;
@@ -2691,12 +2913,67 @@ pub fn build_measure_jet_basis_psi_derivatives(
             .slice_mut(ndarray::s![.., ..m])
             .assign(&d2k_centers);
 
-        Some(LengthScaleJets {
+        let mut jets = LengthScaleJets {
             evaluation_first: geom.coefficient_gauge.restrict_design(&dk_centers_aug),
             evaluation_second: geom.coefficient_gauge.restrict_design(&d2k_centers_aug),
             design_first: geom.coefficient_gauge.restrict_design(&dk_data_aug),
             design_second: geom.coefficient_gauge.restrict_design(&d2k_data_aug),
-        })
+        };
+        if matches!(
+            spec.identifiability,
+            MeasureJetIdentifiability::CenterSumToZero
+        ) && geom.head_lift.ncols() > 0
+        {
+            let kernel_centers = measure_jet_design_matrix(
+                geom.centers.view(),
+                geom.centers.view(),
+                geom.length_scale,
+            )?;
+            let (section_first, section_second) = representer_section_log_length_jets(
+                geom.centers.view(),
+                geom.masses.view(),
+                geom.head_lift.view(),
+                [&kernel_centers, &dk_centers, &d2k_centers],
+            )?;
+            let representer_columns = p - geom.head_lift.ncols();
+            if section_first.dim() != (m, representer_columns) {
+                crate::bail_dim_basis!(
+                    "measure-jet representer section motion is {:?}, expected ({m}, {representer_columns})",
+                    section_first.dim()
+                );
+            }
+            let kernel_data =
+                measure_jet_design_matrix(data, geom.centers.view(), geom.length_scale)?;
+            // `∂(KZ) = ∂K·Z + K·∂Z` and `∂²(KZ) = ∂²K·Z + 2∂K·∂Z + K·∂²Z` on the
+            // representer columns. The first term of each is already in place;
+            // the head columns do not move.
+            {
+                let mut block = jets
+                    .design_first
+                    .slice_mut(ndarray::s![.., ..representer_columns]);
+                block += &kernel_data.dot(&section_first);
+            }
+            {
+                let mut block = jets
+                    .design_second
+                    .slice_mut(ndarray::s![.., ..representer_columns]);
+                block += &(dk_data.dot(&section_first) * 2.0 + kernel_data.dot(&section_second));
+            }
+            {
+                let mut block = jets
+                    .evaluation_first
+                    .slice_mut(ndarray::s![.., ..representer_columns]);
+                block += &kernel_centers.dot(&section_first);
+            }
+            {
+                let mut block = jets
+                    .evaluation_second
+                    .slice_mut(ndarray::s![.., ..representer_columns]);
+                block += &(dk_centers.dot(&section_first) * 2.0
+                    + kernel_centers.dot(&section_second));
+            }
+        }
+        Some(jets)
     } else {
         None
     };

@@ -4,10 +4,11 @@
 use crate::cli_args::FitEventsArgs;
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::event_history::{
-    CovariateCells, CovariateSegment, Event, EventHistoryCohort, ForecastRequest, FutureSegment,
-    MarkKind, PopulationForecastRequest, ReferenceStrata, SubjectHistory,
-    fit_event_history_formulas, forecast, latent_state, pit_uniform_distance, population_forecast,
-    predictive_pit, resolve_mark_vocabulary,
+    CovariateCells, CovariateSegment, Event, EventHistoryCohort, FittedEventHistory,
+    ForecastRequest, FutureSegment, MarkKind, PopulationForecastRequest, ReferenceStrata,
+    SubjectHistory,
+    forecast, latent_state, pit_uniform_distance, population_forecast, predictive_pit,
+    resolve_mark_vocabulary,
 };
 use ndarray::Array2;
 use serde_json::{Map, Value, json};
@@ -61,6 +62,9 @@ fn forecast_json(f: &gam::event_history::Forecast) -> Value {
         "horizons": f.horizons,
         "survival": f.survival,
         "expected_counts": f.expected_counts.rows().into_iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        "survival_error": f.survival_error,
+        "expected_count_errors": f.expected_count_errors.rows().into_iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        "posterior_evaluations": f.posterior_evaluations,
     })
 }
 
@@ -152,7 +156,7 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
             row,
         });
     }
-    let mut cohort = EventHistoryCohort {
+    let cohort = EventHistoryCohort {
         mark_names: mark_names.clone(),
         mark_kinds: mark_kinds.clone(),
         covariate_names: covariate_names.clone(),
@@ -251,13 +255,11 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
         })
     };
     let has_reference = reference.is_some();
-    let fit = fit_event_history_formulas(
-        &mut cohort,
-        &formulas,
-        BlockwiseFitOptions::default(),
-        reference,
-    )
-    .map_err(|e| e.to_string())?;
+    // The predictor is built only when a forecast is requested, so a fit whose
+    // posterior cannot be averaged over still fits and reports.
+    let model = FittedEventHistory::fit(cohort, &formulas, BlockwiseFitOptions::default(), reference)
+        .map_err(|e| e.to_string())?;
+    let (fit, cohort) = (&model.fit, &model.cohort);
 
     let mut summary = Map::new();
     summary.insert("marks".to_string(), json!(mark_names));
@@ -414,6 +416,7 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
         json!(pit_uniform_distance(&pits)),
     );
     if !args.horizons_after_exit.is_empty() {
+        let predictor = model.predictor().map_err(|e| e.to_string())?;
         let mut forecasts = Vec::with_capacity(cohort.subjects.len());
         let mut skipped = 0usize;
         for (i, subject) in cohort.subjects.iter().enumerate() {
@@ -438,7 +441,7 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
                 .map(|h| subject.exit + h)
                 .collect();
             let f = forecast(
-                &fit,
+                &predictor,
                 &cohort,
                 &ForecastRequest {
                     history: subject,
@@ -452,8 +455,7 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
             // covariates at exit: what the model says without its history.
             let row = subject.covariate_row_at(subject.exit, false);
             let alone = population_forecast(
-                &fit,
-                &cohort,
+                &predictor,
                 &PopulationForecastRequest {
                     start: subject.exit,
                     horizons: &horizons,
@@ -468,8 +470,11 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
             let mut entry = forecast_json(&f);
             entry["id"] = json!(subject.id);
             entry["without_history"] = json!({
+                "survival_error": alone.survival_error,
                 "survival": alone.survival,
                 "expected_counts": alone.expected_counts.rows().into_iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+                "expected_count_errors": alone.expected_count_errors.rows().into_iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+                "posterior_evaluations": alone.posterior_evaluations,
             });
             forecasts.push(entry);
         }

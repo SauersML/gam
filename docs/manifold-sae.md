@@ -357,7 +357,7 @@ model, so the reported band still reflects the joint covariance of the returned
 (possibly grown) dictionary, seed and born atoms alike.
 
 !!! note "Full fitted-state persistence"
-    `save` / `load` and `to_dict` / `from_dict` use the strict Rust-owned v9
+    `save` / `load` and `to_dict` / `from_dict` use the strict Rust-owned v8
     artifact schema. They retain each atom's decoder coefficients, fitted
     per-token coordinates, resolved topology, shape-band grid/mean/sd/robust sd, and a
     compact per-output-channel covariance factor. Loading reconstructs the

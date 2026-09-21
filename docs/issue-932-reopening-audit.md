@@ -682,6 +682,41 @@ and gam-sae at `aaa0ddcfac` (job 1256028), gam-models at `cd4e4d3662` (jobs 1256
 RIGID-BMS-HAND-932 passes every channel on this host (order2 1.019 through fourth_full 1.325),
 as it did on EPYC 7763 before.
 
+Receipt at `a7a0301949`. All 19 gam-row-macros cells pass (job 1279869), and 21 of the 23
+gam-models gates pass (jobs 1283139 and 1283140). gam-math and gam-sae had no change since
+the receipt above. The five cells that failed there now read:
+
+| gate | `a7a0301949` | status |
+|---|---|---|
+| BINOMIAL-LS-HAND-932 | order2 1.022, third 1.031, fourth 1.027 | pass (`c7b453c3ec`, `a7a0301949`) |
+| RIGID-BERNOULLI-VGH-932 | y = 1 1.012, y = 0 1.016 (wins 0.93, 1.00) | pass |
+| BINOMIAL-Q-PRUNE-932 | 0.9991, resolution 0.0028 | pass |
+| BMS-FLEX-CONTRACTED-932 | link-dev order 4 0.499 | fail |
+| SLS-WIGGLE-HAND-932 | 0.028 to 0.129 | fail |
+
+RIGID-BERNOULLI-VGH's red belonged to one build, not to the kernel code. The receipt binary
+(`gam_models-a647504fed25e61e`, `cd4e4d3662`) and a build of the unchanged kernel at
+`c7b453c3ec` ran interleaved on one host, three runs each (job 1282536). The old binary fails
+at 0.762 to 0.789 and the new one passes at 1.010 to 1.043. The two measured functions
+disassemble to equivalent code in the old binary: 155 and 151 instructions, one `sqrtsd`
+each, one division each, the same call to `normal_logcdf_derivatives`. Raced against itself
+in the same harness (job 1279199), each arm reads 0.996 to 1.002.
+
+BINOMIAL-Q-PRUNE races two copies of one program. Production is the `Tower4` composition with
+`d4 = 0`, and its opponent is the same composition reading `d4`; after inlining the fourth
+channel is dead in both. A `not_slower` cell between them sits at the instrument's floor: an
+identical function raced against itself in the rigid harness read 0.996 with resolution
+0.0028, which alone fails `not_slower`.
+
+BMS-FLEX-CONTRACTED link-dev order 4. The link-deviation row is a weighted compose sum over
+the deviation coefficients (`bms/flex_row_program.rs`). The dynamic two-seed batch it is raced
+against writes that sum as fused order-two blocks (`79ea1f0e7a`). The fixed `TwoSeed<K>`
+specialization ran `JetScalar`'s default loop, one two-seed composition, product and sum per
+coefficient. `TwoSeed<K>` now overrides it with eight order-two weighted sums at the one
+composition point, joined by seven products. In three release runs (job 1286112) link-dev
+order 4 reads 1.578, 1.582 and 1.658 (wins 1.00), score-warp order 4 1.002 to 1.018, and the
+order-3 cells 1.51 to 1.70.
+
 Binomial location-scale mechanism. Every production caller evaluated
 `binomial_ls_row_program` at `δ = 0`. A `name: origin` primary role on `row_program!`, which
 seeds the value with zero so the IEEE `0·x` terms fold, lifts order2 only to 0.766 (third

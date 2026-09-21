@@ -52,14 +52,15 @@ fn a_streamed_reader_gram_reproduces_the_cached_pass_bit_for_bit_across_tiles() 
     let streamed_total = streamed
         .units
         .pair_pass(streamed.units.readers.view(), CoordinateFormation::Copied, None)
-        .expect("the streamed V(I) pass");
+        .expect("the streamed V(I) pass")
+        .energy;
     let resident = cached
         .units
         .reader_gram
         .as_ref()
         .map_or(0, |gram| gram.resident_bytes());
     eprintln!(
-        "#2946 reader Gram routes: width {MULTI_TILE_WIDTH}, tile {tile}; V(I) cached {} streamed {streamed_total}; V(P) cached {} streamed {}; cache resident {resident} bytes",
+        "#2946 reader Gram routes: width {MULTI_TILE_WIDTH}, tile {tile}; V(I) cached {:?} streamed {streamed_total:?}; V(P) cached {:?} streamed {:?}; cache resident {resident} bytes",
         cached.total_variance(),
         cached_gradient.explained_variance,
         streamed_gradient.explained_variance,
@@ -193,9 +194,10 @@ fn the_halved_pair_pass_is_the_full_double_sum_across_tiles() {
     let block = integer_block(MULTI_TILE_WIDTH);
     let units = &block.units;
     let mut weighted = Array2::<f64>::zeros(units.readers.dim());
-    let halved = units
+    let pass = units
         .pair_pass(units.readers.view(), CoordinateFormation::Copied, Some(&mut weighted))
         .expect("the halved V(I) pass");
+    let halved = pass.energy.value;
     let reference = full_square_reference(&block);
     let worst_ratio = (&weighted - &reference.weighted)
         .mapv(f64::abs)
@@ -219,7 +221,7 @@ fn the_halved_pair_pass_is_the_full_double_sum_across_tiles() {
         (halved - reference.upper_only_variance).abs(),
         weighted.len(),
     );
-    assert_eq!(halved, block.total_variance(), "the V(I) pass must reproduce the cached V(I)");
+    assert_eq!(pass.energy, block.total_variance(), "the V(I) pass must reproduce the cached V(I)");
     assert!(
         (halved - reference.variance).abs() <= reference.variance_band,
         "halved V(I) {halved} vs the full double sum {} beyond the band {}",

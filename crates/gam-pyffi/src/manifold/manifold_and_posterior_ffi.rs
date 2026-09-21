@@ -1492,16 +1492,6 @@ fn build_analytic_penalty_registry_json(
     })
 }
 
-/// Convert a JSON-sourced `u64` into a positive `usize`, rejecting zero and
-/// values that exceed `usize::MAX`. Used by the geometry-manifold descriptor
-/// parsers below.
-fn json_positive_u64_to_usize(value: u64, context: &str) -> Result<usize, String> {
-    if value == 0 {
-        return Err(format!("{context} must be > 0"));
-    }
-    usize::try_from(value).map_err(|_| format!("{context} exceeds usize::MAX"))
-}
-
 #[pyfunction(signature = (latents_json, penalties_json))]
 fn register_analytic_penalties(latents_json: &str, penalties_json: &str) -> PyResult<String> {
     let latents: serde_json::Value = serde_json::from_str(latents_json)
@@ -2035,118 +2025,6 @@ mod isometry_decoder_jet_facade_tests {
     }
 }
 
-fn parse_manifold_kind(value: &serde_json::Value) -> Result<gam::geometry::ManifoldSpec, String> {
-    if let Some(name) = value.as_str() {
-        return match name.to_ascii_lowercase().as_str() {
-            "circle" | "s1" => Ok(gam::geometry::ManifoldSpec::Circle),
-            other => Err(format!("unknown manifold string {other:?}")),
-        };
-    }
-    let obj = value
-        .as_object()
-        .ok_or_else(|| "manifold must be a string or object".to_string())?;
-    let kind = obj
-        .get("kind")
-        .or_else(|| obj.get("type"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "manifold.kind is required".to_string())?
-        .to_ascii_lowercase();
-    match kind.as_str() {
-        "euclidean" => {
-            let dim = obj
-                .get("dim")
-                .or_else(|| obj.get("d"))
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| "euclidean manifold requires dim".to_string())?;
-            Ok(gam::geometry::ManifoldSpec::Euclidean(
-                json_positive_u64_to_usize(dim, "euclidean.dim")?,
-            ))
-        }
-        "circle" | "s1" => Ok(gam::geometry::ManifoldSpec::Circle),
-        "sphere" => {
-            let n = obj
-                .get("intrinsic_dim")
-                .or_else(|| obj.get("n"))
-                .or_else(|| obj.get("dim"))
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| "sphere manifold requires intrinsic_dim".to_string())?;
-            Ok(gam::geometry::ManifoldSpec::Sphere {
-                intrinsic_dim: json_positive_u64_to_usize(n, "sphere.intrinsic_dim")?,
-            })
-        }
-        "torus" => {
-            let d = obj
-                .get("d")
-                .or_else(|| obj.get("dim"))
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| "torus manifold requires d".to_string())?;
-            Ok(gam::geometry::ManifoldSpec::Torus {
-                dim: json_positive_u64_to_usize(d, "torus.d")?,
-            })
-        }
-        "grassmann" => {
-            let k = obj
-                .get("k")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| "grassmann manifold requires k".to_string())?;
-            let n = obj
-                .get("n")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| "grassmann manifold requires n".to_string())?;
-            let k = json_positive_u64_to_usize(k, "grassmann.k")?;
-            let n = json_positive_u64_to_usize(n, "grassmann.n")?;
-            if k > n {
-                return Err(format!(
-                    "grassmann manifold requires k <= n (got k={k}, n={n}): \
-                     Gr(k, n) is the set of k-dimensional subspaces of R^n"
-                ));
-            }
-            Ok(gam::geometry::ManifoldSpec::Grassmann { k, n })
-        }
-        "stiefel" => {
-            let k = obj
-                .get("k")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| "stiefel manifold requires k".to_string())?;
-            let n = obj
-                .get("n")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| "stiefel manifold requires n".to_string())?;
-            let k = json_positive_u64_to_usize(k, "stiefel.k")?;
-            let n = json_positive_u64_to_usize(n, "stiefel.n")?;
-            if k > n {
-                return Err(format!(
-                    "stiefel manifold requires k <= n (got k={k}, n={n}): \
-                     St(n, k) is the set of k-frames (orthonormal columns) in R^n"
-                ));
-            }
-            Ok(gam::geometry::ManifoldSpec::Stiefel { k, n })
-        }
-        "spd" => {
-            let n = obj
-                .get("n")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| "spd manifold requires n".to_string())?;
-            Ok(gam::geometry::ManifoldSpec::Spd {
-                n: json_positive_u64_to_usize(n, "spd.n")?,
-            })
-        }
-        "product" => {
-            let parts = obj
-                .get("components")
-                .or_else(|| obj.get("parts"))
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| "product manifold requires components".to_string())?;
-            let mut parsed = Vec::with_capacity(parts.len());
-            for part in parts {
-                parsed.push(parse_manifold_kind(part)?);
-            }
-            Ok(gam::geometry::ManifoldSpec::Product(parsed))
-        }
-        other => Err(format!("unknown manifold kind {other:?}")),
-    }
-}
-
 /// Take one batched metric-correct Riemannian gradient step.
 ///
 /// `euclidean_grad` is an ambient Euclidean differential, not a tangent step.
@@ -2163,7 +2041,7 @@ fn riemannian_gradient_step<'py>(
 ) -> PyResult<Py<PyArray2<f64>>> {
     let value: serde_json::Value = serde_json::from_str(manifold_json)
         .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
-    let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
+    let kind = gam::geometry::ManifoldSpec::from_descriptor(&value).map_err(py_value_error)?;
     let manifold = kind
         .build()
         .map_err(|err| py_value_error(err.to_string()))?;
@@ -2207,7 +2085,7 @@ fn manifold_exp_map<'py>(
 ) -> PyResult<Py<PyArray2<f64>>> {
     let value: serde_json::Value = serde_json::from_str(manifold_json)
         .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
-    let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
+    let kind = gam::geometry::ManifoldSpec::from_descriptor(&value).map_err(py_value_error)?;
     let manifold = kind
         .build()
         .map_err(|err| py_value_error(err.to_string()))?;
@@ -2258,7 +2136,7 @@ fn manifold_exp_map_vjp<'py>(
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
     let value: serde_json::Value = serde_json::from_str(manifold_json)
         .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
-    let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
+    let kind = gam::geometry::ManifoldSpec::from_descriptor(&value).map_err(py_value_error)?;
     let manifold = kind
         .build()
         .map_err(|err| py_value_error(err.to_string()))?;
@@ -2311,7 +2189,7 @@ fn manifold_log_map<'py>(
 ) -> PyResult<Py<PyArray2<f64>>> {
     let value: serde_json::Value = serde_json::from_str(manifold_json)
         .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
-    let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
+    let kind = gam::geometry::ManifoldSpec::from_descriptor(&value).map_err(py_value_error)?;
     let manifold = kind
         .build()
         .map_err(|err| py_value_error(err.to_string()))?;
@@ -2350,7 +2228,7 @@ fn manifold_metric_tensor<'py>(
 ) -> PyResult<Py<PyArray2<f64>>> {
     let value: serde_json::Value = serde_json::from_str(manifold_json)
         .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
-    let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
+    let kind = gam::geometry::ManifoldSpec::from_descriptor(&value).map_err(py_value_error)?;
     let manifold = kind
         .build()
         .map_err(|err| py_value_error(err.to_string()))?;
@@ -2373,7 +2251,7 @@ fn manifold_metric_tensor<'py>(
 fn manifold_dimension(manifold_json: &str) -> PyResult<usize> {
     let value: serde_json::Value = serde_json::from_str(manifold_json)
         .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
-    let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
+    let kind = gam::geometry::ManifoldSpec::from_descriptor(&value).map_err(py_value_error)?;
     let manifold = kind
         .build()
         .map_err(|err| py_value_error(err.to_string()))?;
@@ -2385,7 +2263,7 @@ fn manifold_dimension(manifold_json: &str) -> PyResult<usize> {
 fn manifold_ambient_dimension(manifold_json: &str) -> PyResult<usize> {
     let value: serde_json::Value = serde_json::from_str(manifold_json)
         .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
-    let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
+    let kind = gam::geometry::ManifoldSpec::from_descriptor(&value).map_err(py_value_error)?;
     let manifold = kind
         .build()
         .map_err(|err| py_value_error(err.to_string()))?;

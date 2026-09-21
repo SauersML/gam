@@ -104,6 +104,7 @@ mod penalty_ops;
 mod prelude;
 mod rational_logdet;
 mod reduced_solve;
+mod residual_gap;
 mod slq_logdet;
 mod solve_options;
 mod system;
@@ -134,6 +135,8 @@ mod dense_lane_pricing_2900_tests;
 mod latent_inverse_diagonal_2900_tests;
 #[cfg(test)]
 mod touched_pair_fold_2900_tests;
+#[cfg(test)]
+mod pcg_attainable_floor_2627_tests;
 
 pub(crate) use factorization::*;
 // `SPECTRAL_DEFLATION_REL_FLOOR` is consumed cross-crate (gam-sae streaming plan)
@@ -148,6 +151,7 @@ pub use penalty_ops::*;
 pub use prelude::*;
 pub use rational_logdet::*;
 pub use reduced_solve::*;
+pub(crate) use residual_gap::*;
 pub use slq_logdet::*;
 pub use solve_options::*;
 pub use system::*;

@@ -149,8 +149,8 @@ fn two_planted_contexts_report_their_own_errors_beside_the_average_frame() {
     )
     .expect("context B's absorbed block");
     let context_b_error = by_hand.discarded_error(frame.view()).expect("the frame");
-    assert_eq!(report.rows[1].error, context_b_error);
-    assert_eq!(report.rows[1].total_variance, by_hand.total_variance());
+    assert_eq!(report.rows[1].error, context_b_error.value);
+    assert_eq!(report.rows[1].total_variance, by_hand.total_variance().value);
     // The one absorption owner builds that same block from context B's declared law.
     let absorbed = single_unit_block()
         .absorb(array![0.0, -2.0, 0.0].view(), array![[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]].view())

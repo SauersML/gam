@@ -43,9 +43,47 @@
 //!   - The pass-through coordinates carry `GL(n_pass)`.
 //!
 //!   A per-head norm between the projection and the rotation (Qwen3's
-//!   `q_norm`/`k_norm`) does not execute this program, so this family does not apply
-//!   to it. The family is read from a native block, and `RotaryQueryKey::new`
-//!   refuses such a block.
+//!   `q_norm`/`k_norm`) does not execute this program. `RotaryQueryKey::new` refuses such
+//!   a block, and its family is the next one.
+//! * **Rotary query/key behind a per-head RMS norm** ([`NormedRotaryQueryKey`]).
+//!   - **The block.** Each head reads `q̂ = D_w ν(u) u`, with `u = W_Q x + b_Q` and
+//!     `ν(u) = (‖u‖²/d + ε)^{−1/2}`. Likewise each key head reads `k̂ = D_v ν(u_k) u_k`.
+//!     Every query head shares the gains `w`, and every key head shares `v`.
+//!   - **The candidate change.** For each key/value head `g`: `u ↦ A_g u` on each of its
+//!     query heads and `u_k ↦ B_g u_k` on its key, with new gains `w′`, `v′`.
+//!
+//!   The derivation:
+//!   - **The head maps are orthogonal.** With `ε > 0`, `ν` sees `‖u‖`. When a head's
+//!     weight rows have full row rank, every `u` occurs along its whole ray. So the
+//!     scores survive only if `A_g` and `B_g` are orthogonal. Then `q̂ ↦ T_g q̂` with
+//!     `T_g = D_{w′} A_g D_w⁻¹`, and `k̂ ↦ U_g k̂`.
+//!   - **`T_g` is in the rotary commutant.** As for the family above, `Δ = 0` forces
+//!     `U_g = T_g⁻ᵀ`, and the span of the `R_Δ` forces `T_g` into the rotary commutant.
+//!   - **Each plane.** With distinct frequencies and no pass-through, `T_g = ρ R_θ` on
+//!     each plane. `A_g = D_{w′}⁻¹ T_g D_w` is orthogonal iff
+//!     `R_θ D_w² R_θᵀ = ρ⁻² D_{w′}²`. The left side is diagonal iff `|w_a| = |w_b|` or
+//!     `θ ∈ (π/2)ℤ`, and then `|w′| = ρ|w|`, with the two entries swapped when `θ/(π/2)`
+//!     is odd. The keys satisfy the same condition with `v` and `1/ρ`.
+//!   - **What the heads share.** The gains are shared, so every head has the same `ρ`.
+//!     Unless the plane is coincident, every head also has the same parity of `θ`.
+//!
+//!   So on each plane the group has:
+//!   - a shared positive scale `ρ`, with the query gains multiplied by `ρ` and the key
+//!     gains divided by it;
+//!   - per key/value head, a head map `ρ R^t`, with one parity of `t` for every head;
+//!     the odd parity swaps both gain pairs;
+//!   - the signs of the four gain entries, each carried by its rows in every head;
+//!   - on a coincident plane (`|w_a| = |w_b|` and `|v_a| = |v_b|`, compared exactly), a
+//!     rotation `R_θ` per key/value head, which absorbs the parity.
+//!
+//!   The family is refused, typed, wherever the derivation does not hold:
+//!   - a zero gain;
+//!   - `ε ≤ 0`;
+//!   - a head that does not resolve full row rank;
+//!   - pass-through coordinates;
+//!   - two planes that share a frequency.
+//!
+//!   [`QueryKeyGauge::new`] reads whichever of the two families a native block carries.
 //! * **Residual-stream basis.** `h ↦ Q h` acts on every write (embedding columns,
 //!   block writes and their biases) and `W ↦ W Q⁻¹` on every read.
 //!   - A stream read only linearly admits `GL(d)`.
@@ -110,6 +148,9 @@
 //!   witness is orthogonal and fixes `1`, so it lies in the group.
 //! * The rotary commutant is `RotaryCommutant`, built from the plane groups of equal
 //!   frequency.
+//! * The normed family declares the same `RotaryCommutant`. On each plane its head maps
+//!   commute with exactly `αI + βJ`, which is the rotary commutant's commutant, and the
+//!   owner's one-plane witnesses (scale 2 on a plane, `J` on a plane) are its changes.
 //!
 //! Every operator acts through its factors or matrix-free. Nothing here forms a
 //! `d_out × d_in` product or a `d × d` stream basis change.
@@ -163,11 +204,35 @@ pub enum GaugeRefusal {
     /// A zero or non-finite `attention_scaling` scales every score by zero or by
     /// nothing finite, so it determines no query/key gauge.
     ZeroRotaryScaling,
-    /// A native attention block with a per-head query/key norm between its projections
-    /// and its rotation. That norm commutes only with orthogonal maps that respect its
-    /// gain, so the block's gauge is a proper subgroup of the rotary commutant, and this
-    /// family is not detected for it.
+    /// [`RotaryQueryKey::new`] on a native attention block with a per-head query/key norm
+    /// between its projections and its rotation. That block's gauge is
+    /// [`NormedRotaryQueryKey`]'s, a proper subgroup of the rotary commutant.
     QueryKeyNorm,
+    /// [`NormedRotaryQueryKey::new`] on a block without a query/key norm. Its gauge is
+    /// [`RotaryQueryKey`]'s.
+    NoQueryKeyNorm,
+    /// A query/key norm whose `ε` is not positive and finite. At `ε = 0` the norm forgets
+    /// every scale of its input, so a projection scale is a gauge that the normed
+    /// derivation excludes.
+    QueryKeyNormEpsilon { epsilon: f64 },
+    /// A zero query or key norm gain. Its coordinate is zero after the norm whatever the
+    /// projection reads, so its rows are free, which the normed derivation excludes.
+    QueryKeyNormZeroGain { side: QueryKeySide, coordinate: usize },
+    /// A projection head whose weight rows do not resolve full row rank. The normed
+    /// derivation needs every pre-norm vector to occur along every ray, which is what
+    /// forces an orthogonal head map.
+    QueryKeyNormHeadRank {
+        side: QueryKeySide,
+        head: usize,
+        resolved: usize,
+        order: usize,
+    },
+    /// Head coordinates past the rotary dimension behind a query/key norm. Their group
+    /// permutes and rotates classes of equal `|w_i v_i|`, which is not derived here.
+    QueryKeyNormPassThrough { coordinates: usize },
+    /// Two planes of one frequency behind a query/key norm. Their `GL(m, ℂ)` meets the
+    /// norm through pairwise gain coincidences across planes, which are not derived here.
+    QueryKeyNormSharedFrequency { first: usize, second: usize },
     /// The P1 owner refused a declared gauge.
     Operator(OperatorRefusal),
 }
@@ -200,6 +265,10 @@ pub enum ContinuousGauge {
     /// `copies` independent copies, one per key/value head, of a rotary commutant of
     /// real dimension `per_copy`.
     RotaryCommutant { copies: usize, per_copy: usize },
+    /// Behind a per-head query/key norm: one positive gain scale per rotated plane, shared
+    /// by every head, and `plane_rotations` rotations, one per key/value head and
+    /// coincident plane.
+    NormedRotary { plane_scales: usize, plane_rotations: usize },
     /// No continuous gauge.
     Trivial,
 }
@@ -216,6 +285,10 @@ impl ContinuousGauge {
                 rest * rest.saturating_sub(1) / 2
             }
             Self::RotaryCommutant { copies, per_copy } => copies * per_copy,
+            Self::NormedRotary {
+                plane_scales,
+                plane_rotations,
+            } => plane_scales + plane_rotations,
             Self::Trivial => 0,
         }
     }
@@ -229,6 +302,17 @@ pub enum DiscreteGauge {
     None,
     /// Joint relabellings of `units` hidden units.
     UnitPermutations { units: usize },
+    /// Behind a per-head query/key norm, the components over each plane.
+    /// - Every plane: the signs of its four gain entries, `2⁴`.
+    /// - A plane whose gains are not coincident, in addition: the parity of the shared
+    ///   quarter turn, and one sign per key/value head, `2^{n_kv + 1}`.
+    ///
+    /// The order is `2^{(n_kv + 5)·generic_planes + 4·coincident_planes}`.
+    NormedRotary {
+        generic_planes: usize,
+        coincident_planes: usize,
+        key_value_heads: usize,
+    },
 }
 
 /// Which native structure a detected gauge family acts on.
@@ -239,6 +323,7 @@ pub enum GaugeFamilyKind {
     SwigluUnits,
     NormGain,
     RotaryQueryKey,
+    NormedRotaryQueryKey,
 }
 
 /// A dimension resolved from below at the registered tensors, with the largest
@@ -290,9 +375,11 @@ impl GaugeFamily {
 /// classifier witness (the reflection) is not a positive scale. No detector here produces
 /// that group, so it is left undeclared rather than declared with a witness outside it.
 /// The rotary commutant needs its plane groups and is declared by
-/// [`RotaryQueryKey::declared_gauge`].
+/// [`RotaryQueryKey::declared_gauge`], and the normed family by
+/// [`NormedRotaryQueryKey::declared_gauge`].
 fn declared_gauge(continuous: ContinuousGauge, discrete: DiscreteGauge) -> Result<Option<DeclaredGauge>, GaugeRefusal> {
     Ok(match (continuous, discrete) {
+        (ContinuousGauge::NormedRotary { .. }, _) | (_, DiscreteGauge::NormedRotary { .. }) => None,
         (ContinuousGauge::GeneralLinear { order }, _) | (ContinuousGauge::Orthogonal { order }, _) => {
             Some(DeclaredGauge::Blocks(GaugeBlocks::new(&[order])?))
         }
@@ -1182,14 +1269,379 @@ impl RotaryQueryKey {
     /// `operators::classify_under`. Each group lists the coordinate pairs of the planes
     /// sharing one frequency, and the pass-through range follows the rotary dimension.
     pub fn declared_gauge(&self) -> Result<DeclaredGauge, GaugeRefusal> {
-        let mut plane_groups = Vec::new();
-        for block in rotary_commutant(&self.rotary, self.geometry.head_dim)? {
-            if let RotaryBlock::Planes { planes, .. } = block {
-                plane_groups.push(planes.iter().map(|&plane| self.rotary.plane(plane)).collect());
+        rotary_declaration(&self.rotary, self.geometry.head_dim)
+    }
+}
+
+fn rotary_declaration(rotary: &RotaryEmbedding, head_dim: usize) -> Result<DeclaredGauge, GaugeRefusal> {
+    let mut plane_groups = Vec::new();
+    for block in rotary_commutant(rotary, head_dim)? {
+        if let RotaryBlock::Planes { planes, .. } = block {
+            plane_groups.push(planes.iter().map(|&plane| rotary.plane(plane)).collect());
+        }
+    }
+    let pass_through = rotary.rotary_dim()..head_dim;
+    Ok(DeclaredGauge::RotaryCommutant(RotaryGroups::new(plane_groups, pass_through)?))
+}
+
+/// Which side of a query/key pair a norm gain or a projection head is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryKeySide {
+    Query,
+    Key,
+}
+
+/// A rotary query/key block behind a per-head query/key RMS norm (Qwen3 `q_norm`,
+/// `k_norm`): the projections, the norm's `ε`, and the query and key gains that every
+/// head shares. Its group is derived in the module docs.
+#[derive(Clone, Debug)]
+pub struct NormedRotaryQueryKey {
+    geometry: AttentionGeometry,
+    rotary: RotaryEmbedding,
+    query_weight: Array2<f64>,
+    query_bias: Array1<f64>,
+    key_weight: Array2<f64>,
+    key_bias: Array1<f64>,
+    epsilon: f64,
+    query_gain: Array1<f64>,
+    key_gain: Array1<f64>,
+}
+
+/// An element of [`NormedRotaryQueryKey`]'s group, in the group's own coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NormedRotaryChange {
+    /// `ρ_p > 0` for each rotated plane: its query gains scale by `ρ_p` and its key gains
+    /// by `1/ρ_p`.
+    pub plane_scales: Array1<f64>,
+    /// `n_kv_heads × planes`. Key/value head `g`'s map on plane `p` is `ρ_p R^t`, where
+    /// `R` is the quarter turn `(x_a, x_b) ↦ (−x_b, x_a)` and `t` is in `0..4`.
+    pub quarter_turns: Array2<u8>,
+    /// The query gain coordinates whose sign flips. Each flip is carried by its row in
+    /// every query head.
+    pub query_gain_flips: Vec<bool>,
+    /// The key gain coordinates whose sign flips. Each flip is carried by its row in
+    /// every key head.
+    pub key_gain_flips: Vec<bool>,
+}
+
+impl NormedRotaryQueryKey {
+    /// The normed query/key gauge of a native attention block, read through the attention
+    /// owner's accessors.
+    ///
+    /// It refuses, typed, each block the derivation does not cover: no norm, `ε` not
+    /// positive, a zero gain, pass-through coordinates, two planes of one frequency, and a
+    /// projection head whose weight rows do not resolve full row rank.
+    pub fn new(native: &NativeAttention) -> Result<Self, GaugeRefusal> {
+        let norm = native.query_key_norm().ok_or(GaugeRefusal::NoQueryKeyNorm)?;
+        let epsilon = norm.epsilon();
+        if !(epsilon.is_finite() && epsilon > 0.0) {
+            return Err(GaugeRefusal::QueryKeyNormEpsilon { epsilon });
+        }
+        let geometry = native.geometry();
+        let rotary = native.rotary().clone();
+        for block in rotary_commutant(&rotary, geometry.head_dim)? {
+            match block {
+                RotaryBlock::PassThrough { start, end } => {
+                    return Err(GaugeRefusal::QueryKeyNormPassThrough { coordinates: end - start });
+                }
+                RotaryBlock::Planes { planes, .. } if planes.len() > 1 => {
+                    return Err(GaugeRefusal::QueryKeyNormSharedFrequency {
+                        first: planes[0],
+                        second: planes[1],
+                    });
+                }
+                RotaryBlock::Planes { .. } => {}
             }
         }
-        let pass_through = self.rotary.rotary_dim()..self.geometry.head_dim;
-        Ok(DeclaredGauge::RotaryCommutant(RotaryGroups::new(plane_groups, pass_through)?))
+        let (query_gain, key_gain) = (norm.query_gain().to_owned(), norm.key_gain().to_owned());
+        for (side, gain) in [(QueryKeySide::Query, &query_gain), (QueryKeySide::Key, &key_gain)] {
+            require_finite_vector("query/key norm gain", gain.view())?;
+            if let Some(coordinate) = gain.iter().position(|&entry| entry == 0.0) {
+                return Err(GaugeRefusal::QueryKeyNormZeroGain { side, coordinate });
+            }
+        }
+        let block = Self {
+            geometry,
+            rotary,
+            query_weight: native.query().weight.clone(),
+            query_bias: native.query().bias.clone(),
+            key_weight: native.key().weight.clone(),
+            key_bias: native.key().bias.clone(),
+            epsilon,
+            query_gain,
+            key_gain,
+        };
+        require_finite_matrix("query weight", block.query_weight.view())?;
+        require_finite_vector("query bias", block.query_bias.view())?;
+        require_finite_matrix("key weight", block.key_weight.view())?;
+        require_finite_vector("key bias", block.key_bias.view())?;
+        let hd = geometry.head_dim;
+        for (side, weight, heads) in [
+            (QueryKeySide::Query, &block.query_weight, geometry.n_heads),
+            (QueryKeySide::Key, &block.key_weight, geometry.n_kv_heads),
+        ] {
+            for head in 0..heads {
+                let resolved = resolved_rank("normed projection head", weight.slice(s![head * hd..(head + 1) * hd, ..]))?;
+                if resolved < hd {
+                    return Err(GaugeRefusal::QueryKeyNormHeadRank {
+                        side,
+                        head,
+                        resolved,
+                        order: hd,
+                    });
+                }
+            }
+        }
+        Ok(block)
+    }
+
+    pub fn query_weight(&self) -> ArrayView2<'_, f64> {
+        self.query_weight.view()
+    }
+
+    pub fn query_bias(&self) -> ArrayView1<'_, f64> {
+        self.query_bias.view()
+    }
+
+    pub fn key_weight(&self) -> ArrayView2<'_, f64> {
+        self.key_weight.view()
+    }
+
+    pub fn key_bias(&self) -> ArrayView1<'_, f64> {
+        self.key_bias.view()
+    }
+
+    pub fn epsilon(&self) -> f64 {
+        self.epsilon
+    }
+
+    pub fn query_gain(&self) -> ArrayView1<'_, f64> {
+        self.query_gain.view()
+    }
+
+    pub fn key_gain(&self) -> ArrayView1<'_, f64> {
+        self.key_gain.view()
+    }
+
+    /// Whether plane `plane` carries a rotation per key/value head. That holds when its
+    /// two query gains are equal in magnitude and so are its two key gains, compared
+    /// exactly.
+    pub fn coincident(&self, plane: usize) -> bool {
+        let (a, b) = self.rotary.plane(plane);
+        self.query_gain[a].abs() == self.query_gain[b].abs() && self.key_gain[a].abs() == self.key_gain[b].abs()
+    }
+
+    /// The family through the registered tensors. Its orbit dimension is exact. Every gain
+    /// is nonzero, so the plane scales move the gains freely. Every head resolves full row
+    /// rank, so each rotation moves its head's rows, and different rotations move
+    /// different rows.
+    pub fn family(&self) -> GaugeFamily {
+        let g = self.geometry;
+        let planes = self.rotary.inverse_frequencies.len();
+        let coincident = (0..planes).filter(|&plane| self.coincident(plane)).count();
+        let rotations = g.n_kv_heads * coincident;
+        GaugeFamily {
+            kind: GaugeFamilyKind::NormedRotaryQueryKey,
+            continuous: ContinuousGauge::NormedRotary {
+                plane_scales: planes,
+                plane_rotations: rotations,
+            },
+            discrete: DiscreteGauge::NormedRotary {
+                generic_planes: planes - coincident,
+                coincident_planes: coincident,
+                key_value_heads: g.n_kv_heads,
+            },
+            parameter_coordinates: (g.n_heads + g.n_kv_heads) * g.head_dim * (g.model_dim + 1) + 2 * g.head_dim,
+            orbit_dimension: DimensionInterval {
+                resolved: planes + rotations,
+                at_most: planes + rotations,
+            },
+            null_coordinates: 0,
+        }
+    }
+
+    /// The block under `change`. On plane `p`, key/value head `g` maps the pre-norm rows
+    /// of its key, and of each of its query heads, by the signed permutation
+    /// `A = D_{w′}⁻¹ ρ_p R^t D_w`. The gains become `w′ = ρ_p τ(w)` and `v′ = τ(v)/ρ_p`,
+    /// where `τ` swaps the plane's two gain entries when its gains are not coincident and
+    /// its turns are odd. Gain flips follow. Every carried row is exact, and the gains are
+    /// exact when every `ρ_p` is a power of two.
+    ///
+    /// It refuses a scale that is not positive, a turn outside `0..4`, and turns of both
+    /// parities on a plane whose gains are not coincident, where the heads that do not turn
+    /// cannot follow the shared gain swap. It realises the elements whose head maps are
+    /// quarter turns. On a coincident plane those are the quarter turns among its rotations.
+    pub fn apply(&self, change: &NormedRotaryChange) -> Result<Self, GaugeRefusal> {
+        let g = self.geometry;
+        let hd = g.head_dim;
+        let planes = self.rotary.inverse_frequencies.len();
+        check_len("plane scales", planes, change.plane_scales.len())?;
+        check_len("quarter-turn key/value heads", g.n_kv_heads, change.quarter_turns.nrows())?;
+        check_len("quarter-turn planes", planes, change.quarter_turns.ncols())?;
+        check_len("query gain flips", hd, change.query_gain_flips.len())?;
+        check_len("key gain flips", hd, change.key_gain_flips.len())?;
+        for (plane, &scale) in change.plane_scales.iter().enumerate() {
+            if !(scale.is_finite() && scale > 0.0) {
+                return Err(GaugeRefusal::NotInGroup {
+                    what: "plane gain scale",
+                    index: plane,
+                    value: scale,
+                });
+            }
+        }
+        for ((kv, plane), &turn) in change.quarter_turns.indexed_iter() {
+            if turn > 3 {
+                return Err(GaugeRefusal::NotInGroup {
+                    what: "quarter-turn count",
+                    index: kv * planes + plane,
+                    value: f64::from(turn),
+                });
+            }
+        }
+        let mut carried = self.clone();
+        for plane in 0..planes {
+            let (a, b) = self.rotary.plane(plane);
+            let coincident = self.coincident(plane);
+            let turns = change.quarter_turns.column(plane);
+            let odd = turns.iter().next().is_some_and(|&turn| turn % 2 == 1);
+            if !coincident {
+                if let Some(kv) = turns.iter().position(|&turn| (turn % 2 == 1) != odd) {
+                    return Err(GaugeRefusal::NotInGroup {
+                        what: "quarter turns of both parities on a plane whose gains are not coincident",
+                        index: kv * planes + plane,
+                        value: f64::from(turns[kv]),
+                    });
+                }
+            }
+            let swap = !coincident && odd;
+            let scale = change.plane_scales[plane];
+            for i in [a, b] {
+                let source = if swap { a + b - i } else { i };
+                carried.query_gain[i] = scale * self.query_gain[source];
+                carried.key_gain[i] = self.key_gain[source] / scale;
+            }
+            for (kv, &turn) in turns.iter().enumerate() {
+                let plane_turn = PlaneTurn { a, b, turn, swap };
+                plane_turn.carry(&mut carried.key_weight, &mut carried.key_bias, &self.key_weight, &self.key_bias, kv * hd, &self.key_gain);
+                for head in (0..g.n_heads).filter(|&head| g.key_value_head(head) == kv) {
+                    plane_turn.carry(
+                        &mut carried.query_weight,
+                        &mut carried.query_bias,
+                        &self.query_weight,
+                        &self.query_bias,
+                        head * hd,
+                        &self.query_gain,
+                    );
+                }
+            }
+        }
+        flip_gain_rows(&mut carried.query_gain, &mut carried.query_weight, &mut carried.query_bias, g.n_heads, hd, &change.query_gain_flips);
+        flip_gain_rows(&mut carried.key_gain, &mut carried.key_weight, &mut carried.key_bias, g.n_kv_heads, hd, &change.key_gain_flips);
+        Ok(carried)
+    }
+
+    /// The rotary commutant, declared to `operators::classify_under` as for
+    /// [`RotaryQueryKey`]. On one head's normed coordinates this family's head maps are
+    /// `ρ R^t`, and `ρ R_θ` on a coincident plane. Those commute with exactly `αI + βJ` on
+    /// each plane, and with nothing across planes, because each plane has its own scale.
+    /// That is the rotary commutant's commutant. The owner's witnesses for one-plane
+    /// groups are scale 2 on a plane and `J` on a plane, and both are
+    /// [`NormedRotaryChange`]s.
+    pub fn declared_gauge(&self) -> Result<DeclaredGauge, GaugeRefusal> {
+        rotary_declaration(&self.rotary, self.geometry.head_dim)
+    }
+}
+
+/// One plane's quarter turn `R^turn` on the pre-norm rows `a`, `b` of one projection head.
+struct PlaneTurn {
+    a: usize,
+    b: usize,
+    turn: u8,
+    swap: bool,
+}
+
+impl PlaneTurn {
+    /// Rows `a`, `b` of the head at row `offset`, under `A = D_{g′}⁻¹ ρ R^turn D_g` with
+    /// `g′ = ρ τ(g)`. `R^turn` reads row `σ(i)` into row `i` with a sign, so
+    /// `A_{iσ(i)} = R^turn_{iσ(i)} g_{σ(i)} / g_{τ(i)}`. Where `σ(i) = τ(i)` that is the
+    /// turn's sign. Where they differ the plane is coincident, `|g_a| = |g_b|`, so it is
+    /// the turn's sign times the gains' signs. No entry rounds.
+    fn carry(
+        &self,
+        weight: &mut Array2<f64>,
+        bias: &mut Array1<f64>,
+        source_weight: &Array2<f64>,
+        source_bias: &Array1<f64>,
+        offset: usize,
+        gain: &Array1<f64>,
+    ) {
+        let (a, b) = (self.a, self.b);
+        let (odd, sign_a, sign_b) = match self.turn {
+            0 => (false, 1.0, 1.0),
+            1 => (true, -1.0, 1.0),
+            2 => (false, -1.0, -1.0),
+            _ => (true, 1.0, -1.0),
+        };
+        for (row, turn_sign) in [(a, sign_a), (b, sign_b)] {
+            let read = if odd { a + b - row } else { row };
+            let kept = if self.swap { a + b - row } else { row };
+            let sign = if read == kept {
+                turn_sign
+            } else {
+                turn_sign * gain[read].signum() * gain[kept].signum()
+            };
+            weight
+                .row_mut(offset + row)
+                .assign(&source_weight.row(offset + read).mapv(|entry| sign * entry));
+            bias[offset + row] = sign * source_bias[offset + read];
+        }
+    }
+}
+
+/// Flips each flagged gain coordinate, together with its row, weight and bias, in every head.
+fn flip_gain_rows(gain: &mut Array1<f64>, weight: &mut Array2<f64>, bias: &mut Array1<f64>, heads: usize, head_dim: usize, flips: &[bool]) {
+    for (coordinate, &flip) in flips.iter().enumerate() {
+        if flip {
+            gain[coordinate] = -gain[coordinate];
+            for head in 0..heads {
+                let row = head * head_dim + coordinate;
+                weight.row_mut(row).mapv_inplace(|entry| -entry);
+                bias[row] = -bias[row];
+            }
+        }
+    }
+}
+
+/// The query/key gauge of a native attention block. It is the rotary commutant when the
+/// block has no query/key norm, and the normed family when it has one. Only norm variants
+/// outside the normed derivation are refused.
+#[derive(Clone, Debug)]
+pub enum QueryKeyGauge {
+    Rotary(RotaryQueryKey),
+    NormedRotary(NormedRotaryQueryKey),
+}
+
+impl QueryKeyGauge {
+    pub fn new(native: &NativeAttention) -> Result<Self, GaugeRefusal> {
+        if native.has_query_key_norm() {
+            NormedRotaryQueryKey::new(native).map(Self::NormedRotary)
+        } else {
+            RotaryQueryKey::new(native).map(Self::Rotary)
+        }
+    }
+
+    pub fn family(&self) -> Result<GaugeFamily, GaugeRefusal> {
+        match self {
+            Self::Rotary(block) => block.family(),
+            Self::NormedRotary(block) => Ok(block.family()),
+        }
+    }
+
+    pub fn declared_gauge(&self) -> Result<DeclaredGauge, GaugeRefusal> {
+        match self {
+            Self::Rotary(block) => block.declared_gauge(),
+            Self::NormedRotary(block) => block.declared_gauge(),
+        }
     }
 }
 
@@ -1451,7 +1903,7 @@ fn invert_gauge_change(gauge_change: ArrayView2<'_, f64>) -> Result<Array2<f64>,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parameter_decomposition::attention::{AffineProjection, RotaryPairing};
+    use crate::parameter_decomposition::attention::{AffineProjection, AttentionExecution, RotaryPairing};
     use crate::parameter_decomposition::operators::{MaskGaugeVerdict, classify_under};
     use crate::parameter_decomposition::rewrite::NativeMlp;
     use rand::rngs::StdRng;
@@ -2180,7 +2632,7 @@ mod tests {
         }
     }
 
-    fn half_split_rotary(frequencies: [f64; 2]) -> RotaryEmbedding {
+    fn half_split_rotary(frequencies: &[f64]) -> RotaryEmbedding {
         RotaryEmbedding {
             pairing: RotaryPairing::HalfSplit,
             inverse_frequencies: frequencies.to_vec(),
@@ -2352,7 +2804,7 @@ mod tests {
         let x = uniform_matrix(&mut rng, positions.len(), geometry.model_dim);
         let hd = geometry.head_dim;
         for (frequencies, shared) in [([0.7, 0.7], true), ([1.0, 0.3], false)] {
-            let rotary = half_split_rotary(frequencies);
+            let rotary = half_split_rotary(&frequencies);
             let teacher = rotary_block(
                 geometry,
                 rotary.clone(),
@@ -2435,7 +2887,7 @@ mod tests {
             rotary_block(geometry, rotary, qw.clone(), qb.clone(), kw.clone(), kb.clone())
         };
         for (frequencies, per_copy) in [([0.7, 0.7], 12), ([1.0, 0.3], 8)] {
-            let family = block(half_split_rotary(frequencies), &query_weight, &query_bias, &key_weight, &key_bias)
+            let family = block(half_split_rotary(&frequencies), &query_weight, &query_bias, &key_weight, &key_bias)
                 .expect("shapes")
                 .family()
                 .expect("svd");
@@ -2447,14 +2899,14 @@ mod tests {
         key_bias.slice_mut(s![6..12]).fill(0.0);
         query_weight.slice_mut(s![12..24, ..]).fill(0.0);
         query_bias.slice_mut(s![12..24]).fill(0.0);
-        let family = block(half_split_rotary([0.7, 0.7]), &query_weight, &query_bias, &key_weight, &key_bias)
+        let family = block(half_split_rotary(&[0.7, 0.7]), &query_weight, &query_bias, &key_weight, &key_bias)
             .expect("shapes")
             .family()
             .expect("svd");
         assert_eq!(family.orbit_dimension, DimensionInterval { resolved: 12, at_most: 24 });
         for frequency in [std::f64::consts::PI, 0.0] {
             assert!(matches!(
-                block(half_split_rotary([0.7, frequency]), &query_weight, &query_bias, &key_weight, &key_bias),
+                block(half_split_rotary(&[0.7, frequency]), &query_weight, &query_bias, &key_weight, &key_bias),
                 Err(GaugeRefusal::FrequencyOutsideHalfTurn { plane: 1, .. })
             ));
         }
@@ -2475,7 +2927,7 @@ mod tests {
         };
         let native = native_block(
             geometry,
-            half_split_rotary([0.7, 0.7]),
+            half_split_rotary(&[0.7, 0.7]),
             uniform_matrix(&mut rng, geometry.query_dim(), geometry.model_dim),
             uniform_vector(&mut rng, geometry.query_dim()),
             uniform_matrix(&mut rng, geometry.key_value_dim(), geometry.model_dim),
@@ -2486,6 +2938,369 @@ mod tests {
             .with_query_key_norm(1e-6, Array1::ones(geometry.head_dim), Array1::ones(geometry.head_dim))
             .expect("gains of head width");
         assert_eq!(RotaryQueryKey::new(&normed).err(), Some(GaugeRefusal::QueryKeyNorm));
+    }
+
+    /// A normed block with its value and output projections, inputs and positions.
+    struct NormedFixture {
+        block: NormedRotaryQueryKey,
+        value: AffineProjection,
+        output: AffineProjection,
+        score_scale: f64,
+        inputs: Array2<f64>,
+        positions: Vec<i64>,
+    }
+
+    impl NormedFixture {
+        /// The source block with `block`'s projections and norm.
+        fn execute(&self, block: &NormedRotaryQueryKey) -> AttentionExecution {
+            NativeAttention::new(
+                block.geometry,
+                block.rotary.clone(),
+                self.score_scale,
+                AffineProjection {
+                    weight: block.query_weight.clone(),
+                    bias: block.query_bias.clone(),
+                },
+                AffineProjection {
+                    weight: block.key_weight.clone(),
+                    bias: block.key_bias.clone(),
+                },
+                self.value.clone(),
+                self.output.clone(),
+            )
+            .expect("the fixture's shapes compose")
+            .with_query_key_norm(block.epsilon, block.query_gain.clone(), block.key_gain.clone())
+            .expect("gains of head width")
+            .execute(self.inputs.view(), &self.positions)
+            .expect("execute")
+        }
+    }
+
+    /// Three planes at distinct frequencies filling a 6-coordinate head, random projections
+    /// and random signed gains of magnitude in `[½, 2]`, behind Qwen3's `ε = 10⁻⁶`. On
+    /// plane `coincident`, if given, `w_b = −w_a` and `v_b = v_a`.
+    fn normed_fixture(seed: u64, coincident: Option<usize>) -> NormedFixture {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let geometry = AttentionGeometry {
+            model_dim: 8,
+            n_heads: 4,
+            n_kv_heads: 2,
+            head_dim: 6,
+        };
+        let rotary = half_split_rotary(&[0.9, 0.5, 0.2]);
+        let mut query_gain = random_scales(&mut rng, geometry.head_dim, true);
+        let mut key_gain = random_scales(&mut rng, geometry.head_dim, true);
+        if let Some(plane) = coincident {
+            let (a, b) = rotary.plane(plane);
+            query_gain[b] = -query_gain[a];
+            key_gain[b] = key_gain[a];
+        }
+        let score_scale = 1.0 / (geometry.head_dim as f64).sqrt();
+        let query = AffineProjection {
+            weight: uniform_matrix(&mut rng, geometry.query_dim(), geometry.model_dim),
+            bias: uniform_vector(&mut rng, geometry.query_dim()),
+        };
+        let key = AffineProjection {
+            weight: uniform_matrix(&mut rng, geometry.key_value_dim(), geometry.model_dim),
+            bias: uniform_vector(&mut rng, geometry.key_value_dim()),
+        };
+        let value = AffineProjection {
+            weight: uniform_matrix(&mut rng, geometry.key_value_dim(), geometry.model_dim),
+            bias: uniform_vector(&mut rng, geometry.key_value_dim()),
+        };
+        let output = AffineProjection {
+            weight: uniform_matrix(&mut rng, geometry.model_dim, geometry.query_dim()),
+            bias: uniform_vector(&mut rng, geometry.model_dim),
+        };
+        let native = NativeAttention::new(geometry, rotary, score_scale, query, key, value.clone(), output.clone())
+            .expect("the fixture's shapes compose")
+            .with_query_key_norm(1e-6, query_gain, key_gain)
+            .expect("gains of head width");
+        NormedFixture {
+            block: NormedRotaryQueryKey::new(&native).expect("a covered normed block"),
+            value,
+            output,
+            score_scale,
+            inputs: uniform_matrix(&mut rng, 5, geometry.model_dim),
+            positions: vec![0, 1, 3, 4, 7],
+        }
+    }
+
+    fn same_bits<'a>(left: impl IntoIterator<Item = &'a f64>, right: impl IntoIterator<Item = &'a f64>) -> bool {
+        left.into_iter().zip(right).all(|(p, q)| p.to_bits() == q.to_bits())
+    }
+
+    /// The causal scores of `after` farther from `before`'s than both executions' radii.
+    /// Each radius is attention.rs's forward-error bar against its own block's exact
+    /// scores. So when the two blocks have the same exact scores, no score lies past the
+    /// sum of the two radii.
+    fn scores_past_radii(before: &AttentionExecution, after: &AttentionExecution) -> usize {
+        before
+            .scores
+            .iter()
+            .zip(after.scores.iter())
+            .zip(before.score_radius.iter().zip(after.score_radius.iter()))
+            .filter(|((p, q), (r, s))| p.is_finite() && (**p - **q).abs() > **r + **s)
+            .count()
+    }
+
+    fn no_flips(width: usize) -> (Vec<bool>, Vec<bool>) {
+        (vec![false; width], vec![false; width])
+    }
+
+    /// The positive control: plane scales that are powers of two, per-head sign turns
+    /// (`t = 2`) and gain sign flips are in the normed family, and each carried tensor is
+    /// exact. A power of two scales without rounding, a sign is exact, and `ν` sees only
+    /// `‖u‖²`, which a sign keeps bit for bit. So the carried block executes the same
+    /// scores, weights and output bit for bit. The control on the bitwise comparison is
+    /// the teacher with one query gain moved by one ulp, which changes some score's bits.
+    #[test]
+    fn a_normed_block_reproduces_bit_for_bit_under_power_of_two_scales_and_signs() {
+        let fixture = normed_fixture(295_418, None);
+        let change = NormedRotaryChange {
+            plane_scales: Array1::from(vec![2.0, 0.5, 4.0]),
+            quarter_turns: Array2::from_shape_vec((2, 3), vec![0, 2, 0, 2, 2, 0]).expect("shape"),
+            query_gain_flips: vec![true, false, false, true, false, false],
+            key_gain_flips: vec![false, true, false, false, false, true],
+        };
+        let carried = fixture.block.apply(&change).expect("in the normed family");
+        let before = fixture.execute(&fixture.block);
+        let after = fixture.execute(&carried);
+        assert!(same_bits(&before.scores, &after.scores), "the scores must reproduce bit for bit");
+        assert!(same_bits(&before.weights, &after.weights), "the weights must reproduce bit for bit");
+        assert!(same_bits(&before.output, &after.output), "the output must reproduce bit for bit");
+        let mut nudged = fixture.block.clone();
+        nudged.query_gain[0] = nudged.query_gain[0].next_up();
+        assert!(!same_bits(&before.scores, &fixture.execute(&nudged).scores), "a one-ulp gain change must show in the bits");
+    }
+
+    /// Odd quarter turns on every head of a plane whose gains are not coincident, with the
+    /// gains swapped, and a quarter turn on one key/value head of the coincident plane are
+    /// in the normed family. The carried tensors are exact: signed row permutations and
+    /// power-of-two gain scales. So both blocks have the same exact scores, and every
+    /// computed score agrees within the sum of both radii. The family counts one scale per
+    /// plane and one rotation per key/value head on the coincident plane.
+    #[test]
+    fn quarter_turns_and_a_coincident_plane_turn_keep_every_score_within_both_radii() {
+        let fixture = normed_fixture(295_419, Some(1));
+        let family = fixture.block.family();
+        assert_eq!(
+            family.continuous,
+            ContinuousGauge::NormedRotary {
+                plane_scales: 3,
+                plane_rotations: 2
+            }
+        );
+        assert_eq!(
+            family.discrete,
+            DiscreteGauge::NormedRotary {
+                generic_planes: 2,
+                coincident_planes: 1,
+                key_value_heads: 2
+            }
+        );
+        assert_eq!(family.orbit_dimension, DimensionInterval { resolved: 5, at_most: 5 });
+        assert_eq!(family.parameter_coordinates, 6 * 6 * 9 + 12);
+        assert_eq!(
+            (0..3).map(|plane| fixture.block.coincident(plane)).collect::<Vec<_>>(),
+            vec![false, true, false]
+        );
+        let (query_gain_flips, key_gain_flips) = no_flips(6);
+        let change = NormedRotaryChange {
+            plane_scales: Array1::from(vec![1.0, 2.0, 0.5]),
+            quarter_turns: Array2::from_shape_vec((2, 3), vec![1, 1, 3, 3, 0, 1]).expect("shape"),
+            query_gain_flips,
+            key_gain_flips,
+        };
+        let carried = fixture.block.apply(&change).expect("in the normed family");
+        let (a, b) = fixture.block.rotary.plane(0);
+        assert_eq!(
+            (carried.query_gain[a], carried.query_gain[b]),
+            (fixture.block.query_gain[b], fixture.block.query_gain[a]),
+            "odd turns on a plane that is not coincident swap its query gains"
+        );
+        let past = scores_past_radii(&fixture.execute(&fixture.block), &fixture.execute(&carried));
+        assert_eq!(past, 0, "{past} scores moved past both radii under a change in the family");
+    }
+
+    /// The negative controls: outside the normed family the scores move.
+    /// - A quarter turn on one key/value head of a plane whose gains are not coincident,
+    ///   with the gains kept, is the rotary commutant's own change. `RotaryQueryKey::apply`
+    ///   admits it on the same projections without the norm. The normed `apply` refuses it,
+    ///   and carried by hand (`u ↦ R u` on that head's pre-norm rows) it moves some score
+    ///   past both radii.
+    /// - So does a gain scale that differs between a plane's two coordinates.
+    ///
+    /// Both carries are exact, so the radii are the whole bar. The same one-head quarter
+    /// turn on the coincident plane, in the previous test, is the matching positive control.
+    #[test]
+    fn a_rotary_commutant_turn_outside_the_normed_family_moves_a_score() {
+        let fixture = normed_fixture(295_419, Some(1));
+        let block = &fixture.block;
+        let before = fixture.execute(block);
+        let (query_gain_flips, key_gain_flips) = no_flips(6);
+        let one_head = NormedRotaryChange {
+            plane_scales: Array1::ones(3),
+            quarter_turns: Array2::from_shape_vec((2, 3), vec![1, 0, 0, 0, 0, 0]).expect("shape"),
+            query_gain_flips,
+            key_gain_flips,
+        };
+        assert!(matches!(block.apply(&one_head), Err(GaugeRefusal::NotInGroup { .. })));
+        let (a, b) = block.rotary.plane(0);
+        let mut quarter = Array2::<f64>::eye(6);
+        quarter[[a, a]] = 0.0;
+        quarter[[b, b]] = 0.0;
+        quarter[[a, b]] = -1.0;
+        quarter[[b, a]] = 1.0;
+        let unnormed = RotaryQueryKey {
+            geometry: block.geometry,
+            rotary: block.rotary.clone(),
+            query_weight: block.query_weight.clone(),
+            query_bias: block.query_bias.clone(),
+            key_weight: block.key_weight.clone(),
+            key_bias: block.key_bias.clone(),
+        };
+        assert!(unnormed.apply(&[quarter, Array2::eye(6)]).is_ok(), "the quarter turn lies in the rotary commutant");
+        let turn_rows = |weight: &mut Array2<f64>, bias: &mut Array1<f64>, head: usize| {
+            let (ra, rb) = (head * 6 + a, head * 6 + b);
+            let (row_a, row_b) = (weight.row(ra).to_owned(), weight.row(rb).to_owned());
+            weight.row_mut(ra).assign(&row_b.mapv(|entry| -entry));
+            weight.row_mut(rb).assign(&row_a);
+            let (bias_a, bias_b) = (bias[ra], bias[rb]);
+            bias[ra] = -bias_b;
+            bias[rb] = bias_a;
+        };
+        let mut forced = block.clone();
+        turn_rows(&mut forced.key_weight, &mut forced.key_bias, 0);
+        for head in (0..block.geometry.n_heads).filter(|&head| block.geometry.key_value_head(head) == 0) {
+            turn_rows(&mut forced.query_weight, &mut forced.query_bias, head);
+        }
+        let moved = scores_past_radii(&before, &fixture.execute(&forced));
+        assert!(moved > 0, "the rotary commutant's quarter turn must move a score behind the norm");
+        let (c, _) = block.rotary.plane(2);
+        let mut unequal = block.clone();
+        unequal.query_gain[c] *= 2.0;
+        unequal.key_gain[c] /= 2.0;
+        let moved = scores_past_radii(&before, &fixture.execute(&unequal));
+        assert!(moved > 0, "a gain scale that differs within a plane must move a score");
+    }
+
+    /// Only the norm variants outside the derivation are refused, each by name.
+    /// [`QueryKeyGauge::new`] reads a covered normed block as the normed family, and a
+    /// block without the norm as the rotary commutant.
+    #[test]
+    fn the_normed_family_refuses_by_name_each_norm_variant_its_derivation_does_not_cover() {
+        let mut rng = StdRng::seed_from_u64(295_420);
+        let geometry = AttentionGeometry {
+            model_dim: 8,
+            n_heads: 4,
+            n_kv_heads: 2,
+            head_dim: 6,
+        };
+        let mut native = |geometry: AttentionGeometry, frequencies: &[f64]| {
+            native_block(
+                geometry,
+                half_split_rotary(frequencies),
+                uniform_matrix(&mut rng, geometry.query_dim(), geometry.model_dim),
+                uniform_vector(&mut rng, geometry.query_dim()),
+                uniform_matrix(&mut rng, geometry.key_value_dim(), geometry.model_dim),
+                uniform_vector(&mut rng, geometry.key_value_dim()),
+            )
+        };
+        let gains = Array1::from(vec![1.5, -0.7, 0.9, 1.2, -1.9, 0.6]);
+        let normed = |plain: NativeAttention, epsilon: f64, key_gain: Array1<f64>| {
+            plain.with_query_key_norm(epsilon, gains.clone(), key_gain).expect("gains of head width")
+        };
+        let full = native(geometry, &[0.9, 0.5, 0.2]);
+        assert!(matches!(QueryKeyGauge::new(&full), Ok(QueryKeyGauge::Rotary(_))));
+        assert_eq!(NormedRotaryQueryKey::new(&full).err(), Some(GaugeRefusal::NoQueryKeyNorm));
+        let covered = normed(full.clone(), 1e-6, gains.clone());
+        assert!(matches!(QueryKeyGauge::new(&covered), Ok(QueryKeyGauge::NormedRotary(_))));
+        assert_eq!(RotaryQueryKey::new(&covered).err(), Some(GaugeRefusal::QueryKeyNorm));
+        assert_eq!(
+            NormedRotaryQueryKey::new(&normed(full.clone(), 0.0, gains.clone())).err(),
+            Some(GaugeRefusal::QueryKeyNormEpsilon { epsilon: 0.0 })
+        );
+        let mut zero = gains.clone();
+        zero[4] = 0.0;
+        assert_eq!(
+            NormedRotaryQueryKey::new(&normed(full, 1e-6, zero)).err(),
+            Some(GaugeRefusal::QueryKeyNormZeroGain {
+                side: QueryKeySide::Key,
+                coordinate: 4
+            })
+        );
+        assert_eq!(
+            QueryKeyGauge::new(&normed(native(geometry, &[0.9, 0.4]), 1e-6, gains.clone())).err(),
+            Some(GaugeRefusal::QueryKeyNormPassThrough { coordinates: 2 })
+        );
+        assert_eq!(
+            QueryKeyGauge::new(&normed(native(geometry, &[0.7, 0.7, 0.3]), 1e-6, gains.clone())).err(),
+            Some(GaugeRefusal::QueryKeyNormSharedFrequency { first: 0, second: 1 })
+        );
+        let narrow = AttentionGeometry { model_dim: 4, ..geometry };
+        assert_eq!(
+            QueryKeyGauge::new(&normed(native(narrow, &[0.9, 0.5, 0.2]), 1e-6, gains.clone())).err(),
+            Some(GaugeRefusal::QueryKeyNormHeadRank {
+                side: QueryKeySide::Query,
+                head: 0,
+                resolved: 4,
+                order: 6
+            })
+        );
+    }
+
+    /// The owner's witnesses for one-plane groups are normed changes. Scale 2 on a plane is
+    /// `ρ_p = 2`, and `J` on a plane is one quarter turn on every key/value head. The normed
+    /// family declares the rotary commutant, and `apply` admits both witnesses.
+    #[test]
+    fn every_rotary_witness_is_a_normed_family_change() {
+        let fixture = normed_fixture(295_421, None);
+        let declared = fixture.block.declared_gauge().expect("a valid rotary declaration");
+        assert_eq!(
+            declared,
+            DeclaredGauge::RotaryCommutant(RotaryGroups::new(vec![vec![(0, 3)], vec![(1, 4)], vec![(2, 5)]], 6..6).expect("groups"))
+        );
+        let identity = Array2::<f64>::eye(6);
+        let mut coupling = identity.clone();
+        coupling[[0, 1]] = 0.3;
+        let mut not_complex = identity.clone();
+        not_complex[[3, 0]] = 0.4;
+        not_complex[[0, 3]] = 0.4;
+        for mask in [&coupling, &not_complex] {
+            let witness = basis_dependent_witness(mask, &declared);
+            let change = normed_change_from_head_map(&witness, &fixture.block.rotary, 2);
+            assert!(fixture.block.apply(&change).is_ok(), "the owner's witness must be a normed change");
+        }
+    }
+
+    /// A head map that is a signed scale or a signed quarter turn on each plane, as the
+    /// same change on every key/value head.
+    fn normed_change_from_head_map(map: &Array2<f64>, rotary: &RotaryEmbedding, key_value_heads: usize) -> NormedRotaryChange {
+        let planes = rotary.inverse_frequencies.len();
+        let mut plane_scales = Array1::<f64>::ones(planes);
+        let mut quarter_turns = Array2::<u8>::zeros((key_value_heads, planes));
+        for plane in 0..planes {
+            let (a, b) = rotary.plane(plane);
+            let (alpha, beta) = (map[[a, a]], map[[b, a]]);
+            assert!(
+                alpha == map[[b, b]] && beta == -map[[a, b]] && alpha * beta == 0.0,
+                "plane {plane}: the witness is not a signed scale or quarter turn"
+            );
+            let (scale, turn) = if beta == 0.0 {
+                (alpha.abs(), if alpha > 0.0 { 0 } else { 2 })
+            } else {
+                (beta.abs(), if beta > 0.0 { 1 } else { 3 })
+            };
+            plane_scales[plane] = scale;
+            quarter_turns.column_mut(plane).fill(turn);
+        }
+        NormedRotaryChange {
+            plane_scales,
+            quarter_turns,
+            query_gain_flips: vec![false; map.nrows()],
+            key_gain_flips: vec![false; map.nrows()],
+        }
     }
 
     /// `W₂ M σ(W₁ x + b₁)` for each row: a fixed internal mask `M` on the hidden units.
@@ -2601,7 +3416,7 @@ mod tests {
         for (frequencies, groups) in [([0.7, 0.7], vec![vec![(0, 2), (1, 3)]]), ([1.0, 0.3], vec![vec![(0, 2)], vec![(1, 3)]])] {
             let block = rotary_block(
                 geometry,
-                half_split_rotary(frequencies),
+                half_split_rotary(&frequencies),
                 uniform_matrix(&mut rng, geometry.query_dim(), geometry.model_dim),
                 uniform_vector(&mut rng, geometry.query_dim()),
                 uniform_matrix(&mut rng, geometry.key_value_dim(), geometry.model_dim),
@@ -2716,7 +3531,7 @@ mod tests {
         for frequencies in [[0.7, 0.7], [1.0, 0.3]] {
             let teacher = rotary_block(
                 geometry,
-                half_split_rotary(frequencies),
+                half_split_rotary(&frequencies),
                 uniform_matrix(&mut rng, geometry.query_dim(), geometry.model_dim),
                 uniform_vector(&mut rng, geometry.query_dim()),
                 uniform_matrix(&mut rng, geometry.key_value_dim(), geometry.model_dim),

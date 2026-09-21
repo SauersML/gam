@@ -4322,6 +4322,7 @@ pub(crate) fn gls_wiggle_workspace_fixture() -> (
         wiggle_knots: knots,
         wiggle_degree: 2,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
+        cached_row_scalars: std::sync::RwLock::new(None),
         jeffreys_armed: true,
     };
     // The wiggle block has dynamic geometry (q0-dependent basis): the
@@ -4389,6 +4390,135 @@ pub(crate) fn gls_wiggle_workspace_fixture() -> (
         },
     ];
     (family, states, specs, xmu, xls, xw_at_q0)
+}
+
+/// #2677: binomial location-scale's production third information derivative `{D³I[u, v, e_a]}`
+/// of its expected information equals a five-point β-difference of the second directional
+/// derivative along every axis, across closed-form and generic links, and the capability the outer
+/// planner reads serves the same matrices through the block specs.
+#[test]
+pub(crate) fn binomial_location_scale_expected_information_third_directional_matches_difference_of_second_2677() {
+    let n = 9usize;
+    let pt = 2usize;
+    let pls = 2usize;
+    let total = pt + pls;
+    let xt = Array2::from_shape_fn((n, pt), |(i, j)| {
+        ((i as f64) * 0.31 + (j as f64) * 0.17).sin() + 0.4
+    });
+    let xls = Array2::from_shape_fn((n, pls), |(i, j)| {
+        ((i as f64) * 0.23 + (j as f64) * 0.41).cos() * 0.5
+    });
+    let beta = array![0.35, -0.20, 0.18, -0.27];
+    let u = array![0.6, -0.3, 0.25, 0.4];
+    let v = array![-0.2, 0.5, -0.35, 0.15];
+    let states_at = |coefficients: &Array1<f64>| {
+        let beta_t = coefficients.slice(ndarray::s![0..pt]).to_owned();
+        let beta_ls = coefficients.slice(ndarray::s![pt..total]).to_owned();
+        vec![
+            ParameterBlockState {
+                eta: xt.dot(&beta_t),
+                beta: beta_t,
+            },
+            ParameterBlockState {
+                eta: xls.dot(&beta_ls),
+                beta: beta_ls,
+            },
+        ]
+    };
+    let dense_spec = |name: &str, design: &Array2<f64>| ParameterBlockSpec {
+        name: name.to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(design.clone())),
+        offset: Array1::zeros(n),
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        structural_aliases: gam_problem::StructuralAliasFrame::none(),
+        stacked_offset: None,
+    };
+    let specs = vec![dense_spec("threshold", &xt), dense_spec("log_sigma", &xls)];
+    let step = 1.0e-3;
+    for link in [
+        InverseLink::Standard(StandardLink::Probit),
+        InverseLink::Standard(StandardLink::Logit),
+        InverseLink::Standard(StandardLink::CLogLog),
+        InverseLink::Standard(StandardLink::LogLog),
+    ] {
+        let family = BinomialLocationScaleFamily {
+            y: Array1::from_iter((0..n).map(|i| if i % 3 == 0 { 1.0 } else { 0.0 })),
+            weights: Array1::from_iter((0..n).map(|i| 0.5 + 0.2 * i as f64)),
+            link_kind: link.clone(),
+            threshold_design: None,
+            log_sigma_design: None,
+            policy: gam_runtime::resource::ResourcePolicy::default_library(),
+            jeffreys_armed: true,
+        };
+        let states = states_at(&beta);
+        let axes = family
+            .expected_joint_information_third_directional_all_axes_from_designs(
+                &states, &xt, &xls, &u, &v,
+            )
+            .expect("third information derivative");
+        assert_eq!(axes.len(), total);
+        let served = family
+            .jeffreys_third_information_derivative()
+            .expect("binomial location-scale must declare its third information derivative")
+            .third_directional_all_axes(&states, &specs, &u, &v)
+            .expect("capability evaluation")
+            .expect("the capability must serve the derivative through the block specs");
+        assert_eq!(
+            served, axes,
+            "{link:?}: the capability and the design producer must agree bitwise"
+        );
+        let second_at = |coefficients: &Array1<f64>| {
+            family
+                .expected_joint_information_second_directional_from_designs(
+                    &states_at(coefficients),
+                    &xt,
+                    &xls,
+                    &u,
+                    &v,
+                )
+                .expect("second information derivative")
+                .expect("second information derivative present")
+        };
+        let mut scale = 0.0_f64;
+        let mut worst = 0.0_f64;
+        for axis in 0..total {
+            let shifted = |offset: f64| {
+                let mut moved = beta.clone();
+                moved[axis] += offset;
+                second_at(&moved)
+            };
+            let difference = (shifted(-2.0 * step) - shifted(2.0 * step)
+                + 8.0 * (shifted(step) - shifted(-step)))
+                / (12.0 * step);
+            for (&analytic, &numeric) in axes[axis].iter().zip(difference.iter()) {
+                scale = scale.max(analytic.abs());
+                worst = worst.max((analytic - numeric).abs());
+            }
+            for row in 0..total {
+                for col in 0..total {
+                    assert_eq!(
+                        axes[axis][[row, col]],
+                        axes[axis][[col, row]],
+                        "{link:?} axis {axis}: D3I must be symmetric"
+                    );
+                }
+            }
+        }
+        assert!(
+            scale > 1.0e-6,
+            "{link:?}: the fixture's third derivative is too small to grade: scale={scale:.3e}"
+        );
+        assert!(
+            worst <= 1.0e-6 * scale,
+            "{link:?}: D3I disagrees with the difference of D2I: worst={worst:.3e} scale={scale:.3e}"
+        );
+    }
 }
 
 #[path = "tests_wiggle_ls.rs"]

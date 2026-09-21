@@ -30,8 +30,8 @@
 //!
 //! The scanner is hand-rolled (no `regex` dev-dependency), mirroring the string/
 //! comment-masking style build.rs uses for its own line-level ban scanners. It
-//! masks `"..."`/`'...'` literal interiors and truncates at `//` per line, so a
-//! numeral inside a string or a comment is never counted as code.
+//! masks `"..."`/`'...'` literal interiors (a `"..."` one across lines) and truncates at
+//! `//`, so a numeral inside a string or a comment is never counted as code.
 
 use std::path::PathBuf;
 
@@ -52,19 +52,26 @@ fn workspace_root() -> PathBuf {
 
 /// Strip a single line down to its *code* bytes: `"..."` and `'...'` literal
 /// interiors are replaced by spaces (so digits inside them are not scanned) and
-/// everything from a `//` line comment onward is dropped. State does not carry
-/// across lines (matching the per-line scan); multi-line string interiors are
-/// out of scope, as they are for the analogous build.rs line scanners.
+/// everything from a `//` line comment onward is dropped.
+///
+/// `in_string` carries a `"..."` literal across lines: it says whether this
+/// line starts inside one, and on return whether the next line does. A Rust
+/// string may span lines (a `\` continuation, or a literal newline), and a
+/// numeral on such a continuation line is string text, not code: #2627's census
+/// at 95115c8a1f flagged `2933` in the continuation `(#2933 F27)",` of a
+/// `format!` string in front_door.rs, when the state reset at every line. A
+/// `'...'` that does not close on its line is a lifetime (`<'a>`), not a char
+/// literal, so only a `"` literal carries.
 ///
 /// The returned string has the same byte length as the input up to the point a
 /// `//` comment truncates it, so `stripped.len() < line.len()` is exactly "this
 /// line carries a `//` comment" — used as the inline-justification signal.
-fn strip_code(line: &str) -> String {
+fn strip_code_carrying(line: &str, in_string: &mut bool) -> String {
     let bytes = line.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
-    let mut in_str = false;
-    let mut quote = 0u8;
+    let mut in_str = *in_string;
+    let mut quote = if in_str { b'"' } else { 0u8 };
     while i < bytes.len() {
         let c = bytes[i];
         if in_str {
@@ -96,7 +103,13 @@ fn strip_code(line: &str) -> String {
         out.push(c);
         i += 1;
     }
+    *in_string = in_str && quote == b'"';
     String::from_utf8(out).unwrap_or_default()
+}
+
+/// [`strip_code_carrying`] for a line that starts outside any literal.
+fn strip_code(line: &str) -> String {
+    strip_code_carrying(line, &mut false)
 }
 
 /// The first line index at which the file's test region begins: the first line
@@ -276,9 +289,10 @@ fn scan_file(rel: &str) -> Vec<(usize, String, String)> {
     let lines: Vec<&str> = content.lines().collect();
     let end = test_region_start(&lines);
     let mut offenders = Vec::new();
+    let mut in_string = false;
     for idx in 0..end {
         let raw = lines[idx];
-        let code = strip_code(raw);
+        let code = strip_code_carrying(raw, &mut in_string);
         if line_is_exempt(&code) {
             continue;
         }
@@ -354,6 +368,20 @@ fn scanner_recognizes_flags_and_exemptions() {
 
     // Numerals inside strings/comments are masked out.
     assert!(numeric_literals(&strip_code("    log(\"snr=0.37 dB\"); // note 0.99")).is_empty());
+
+    // A `"..."` literal spanning lines masks its continuation lines, and code
+    // after it closes is scanned again (#2627: `(#2933 F27)` in front_door.rs).
+    let mut carried = false;
+    assert!(numeric_literals(&strip_code_carrying("    let m = format!(\"a {} b \\", &mut carried)).is_empty());
+    assert!(carried, "an unclosed `\"` literal must carry to the next line");
+    assert!(numeric_literals(&strip_code_carrying("         (#2933 F27)\", x);", &mut carried)).is_empty());
+    assert!(!carried, "the literal closes on its continuation line");
+    let after = numeric_literals(&strip_code_carrying("    let t = 0.37;", &mut carried));
+    assert!(after.iter().any(|l| l.core == "0.37"), "code after the literal is scanned");
+    // A lifetime is not a literal and must not swallow the lines after it.
+    let mut carried = false;
+    strip_code_carrying("    fn name(&self) -> &'static str {", &mut carried);
+    assert!(!carried, "a lifetime must not carry as an open literal");
 
     // A suffixed float literal `0.0_f64` tokenizes to the trivial core `0.0`
     // (the `_` separator before the suffix must be stripped, not kept as `0.0_`).

@@ -2453,7 +2453,7 @@ def run_rust_gamlss_survival_cv(
             ]
             if survival_link:
                 fit_cmd.extend(["--link", str(survival_link)])
-            fit_cmd.extend(_rust_survival_fit_cli_args(scenario_name))
+            fit_cmd.extend(_rust_survival_fit_cli_args())
             fit_cmd.extend([str(train_path), fit_formula])
 
             t0 = perf_counter()
@@ -2632,7 +2632,7 @@ def run_rust_gamlss_survival_marginal_slope_cv(
                 "--out",
                 str(model_path),
             ]
-            fit_cmd.extend(_rust_survival_fit_cli_args(scenario_name))
+            fit_cmd.extend(_rust_survival_fit_cli_args())
             fit_cmd.extend([str(train_path), fit_formula])
 
             t0 = perf_counter()

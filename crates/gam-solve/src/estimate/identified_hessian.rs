@@ -256,14 +256,14 @@ impl HessianSpectrumMotion {
 /// Loewner bounds on the penalized Hessian's spectrum over a smoothing-parameter
 /// step (#2901 V22).
 ///
-/// Along `ρ ↦ ρ + δρ` with `|δρ_k| ≤ t_k` the criterion's Hessian is
+/// Along `ρ ↦ ρ + δρ` with `−d_k ≤ δρ_k ≤ u_k` the criterion's Hessian is
 /// `H' = XᵀW'X + Σ_k e^{δρ_k}·λ_k S̃_k`. Every `λ_k S̃_k ⪰ 0` is scaled by a factor
-/// in `[e^{−t_k}, e^{t_k}]`, exactly, for any finite step, and the curvature
+/// in `[e^{−d_k}, e^{u_k}]`, exactly, for any finite step, and the curvature
 /// weights move as [`HessianSpectrumMotion`] bounds them. With `G = XᵀWX`,
 ///
 /// ```text
 ///   H₋ ⪯ H' ⪯ H₊,
-///   H₋ = (1 − m)·G − V + Σ_k e^{−t_k}·λ_k S̃_k,   H₊ = (1 + m)·G + V + Σ_k e^{t_k}·λ_k S̃_k,
+///   H₋ = (1 − m)·G − V + Σ_k e^{−d_k}·λ_k S̃_k,   H₊ = (1 + m)·G + V + Σ_k e^{u_k}·λ_k S̃_k,
 /// ```
 ///
 /// so by Weyl's monotonicity theorem `σ_i(H₋) ≤ σ_i(H') ≤ σ_i(H₊)` for every
@@ -312,25 +312,31 @@ pub(crate) struct HessianSpectrumBounds {
 
 impl HessianSpectrumBounds {
     /// The bounds for the penalized `hessian`, which carries the engine's
-    /// `penalty` `S̃`, over a step of at most `step[k]` in coordinate `k`, for the
-    /// curvature weights' `motion` over that step. `penalties` yields one
-    /// `(range, block)` per coordinate, in coordinate order: `block` is
-    /// `λ_k S̃_k` on `hessian`'s rows and columns `range`, zero elsewhere.
+    /// `penalty` `S̃`, over a step of at most `shrink[k]` down and `growth[k]` up in
+    /// coordinate `k`, for the curvature weights' `motion` over that step.
+    /// `penalties` yields one `(range, block)` per coordinate, in coordinate order:
+    /// `block` is `λ_k S̃_k` on `hessian`'s rows and columns `range`, zero elsewhere.
     pub(crate) fn over_step(
         hessian: &Array2<f64>,
         penalty: &Array2<f64>,
         penalties: impl IntoIterator<Item = (std::ops::Range<usize>, Array2<f64>)>,
-        step: ArrayView1<'_, f64>,
+        shrink: ArrayView1<'_, f64>,
+        growth: ArrayView1<'_, f64>,
         motion: HessianSpectrumMotion,
     ) -> Result<Self, EstimationError> {
         let dimension = hessian.nrows();
         if hessian.ncols() != dimension
             || penalty.dim() != (dimension, dimension)
-            || step.iter().any(|&radius| !(radius.is_finite() && radius >= 0.0))
+            || shrink.len() != growth.len()
+            || shrink
+                .iter()
+                .chain(growth.iter())
+                .any(|&radius| !(radius.is_finite() && radius >= 0.0))
         {
             return Err(EstimationError::InvalidInput(format!(
                 "Hessian spectrum bounds need a square Hessian, a penalty of its shape and \
-                 finite nonnegative steps: {}x{} Hessian, {}x{} penalty, steps {step}",
+                 finite nonnegative steps of one length: {}x{} Hessian, {}x{} penalty, steps \
+                 down {shrink} and up {growth}",
                 hessian.nrows(),
                 hessian.ncols(),
                 penalty.nrows(),
@@ -344,10 +350,11 @@ impl HessianSpectrumBounds {
         let mut upper_unbounded = false;
         let mut coordinates = 0usize;
         for (range, block) in penalties {
-            let Some(&radius) = step.get(coordinates) else {
+            let (Some(&down), Some(&up)) = (shrink.get(coordinates), growth.get(coordinates))
+            else {
                 return Err(EstimationError::InvalidInput(format!(
                     "Hessian spectrum bounds: more penalties than the {} step coordinates",
-                    step.len()
+                    shrink.len()
                 )));
             };
             if range.end > dimension || block.dim() != (range.len(), range.len()) {
@@ -365,21 +372,21 @@ impl HessianSpectrumBounds {
                 .scaled_add(1.0, &block);
             shrunk
                 .slice_mut(s![range.clone(), range.clone()])
-                .scaled_add((-radius).exp(), &block);
-            let growth = radius.exp();
-            if growth.is_finite() {
+                .scaled_add((-down).exp(), &block);
+            let scale_up = up.exp();
+            if scale_up.is_finite() {
                 grown
                     .slice_mut(s![range.clone(), range])
-                    .scaled_add(growth, &block);
+                    .scaled_add(scale_up, &block);
             } else {
                 upper_unbounded = true;
             }
             coordinates += 1;
         }
-        if coordinates != step.len() {
+        if coordinates != shrink.len() {
             return Err(EstimationError::InvalidInput(format!(
                 "Hessian spectrum bounds: {coordinates} penalties for {} step coordinates",
-                step.len()
+                shrink.len()
             )));
         }
         let difference = penalty - &total;
@@ -498,6 +505,50 @@ pub(crate) fn certificate_newton_displacement(
     } else {
         Err(EstimationError::InvalidInput(format!(
             "certificate Newton displacement is not finite: {displacement}"
+        )))
+    }
+}
+
+/// The part of the certificate's Newton displacement that stays inside the search
+/// domain, as `(down, up)` radii per coordinate (#2901 V22).
+///
+/// The outer search is confined to `[lower, upper]`, the #2812 resolvability domain,
+/// so the stationary point its certificate vouches for lies there too: the
+/// neighbourhood the rank certificate must cover is the Newton box `[ρ̂ − t, ρ̂ + t]`
+/// intersected with the domain, never a point the search cannot reach. Measured on
+/// gam-predict's binomial `y ~ s(age)` (haberman draw seed 20260541, job 1264848): at
+/// `ln λ₂ = 20.318`, `g₂ = −4.0e-9` against `H_ρ[2,2] = 2.6e-10` gives a displacement of
+/// 15.6, while the domain ends at 21.254. Over the unclipped step `σ₁(H₊)` reached
+/// 4.0e15 and the band 10.6, above the smallest identified eigenvalue 1.85, and the fit
+/// was refused for a rank change 14.7 log-units outside anything the search could
+/// visit. A coordinate the domain does not cover keeps its whole displacement.
+pub(crate) fn reachable_step_within_domain(
+    displacement: ArrayView1<'_, f64>,
+    rho: ArrayView1<'_, f64>,
+    lower: ArrayView1<'_, f64>,
+    upper: ArrayView1<'_, f64>,
+) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
+    if rho.len() != displacement.len() || lower.len() != upper.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "reachable certificate step: {} displacement coordinates at a {}-coordinate ρ, \
+             against a domain of {} lower and {} upper bounds",
+            displacement.len(),
+            rho.len(),
+            lower.len(),
+            upper.len()
+        )));
+    }
+    let mut down = displacement.to_owned();
+    let mut up = displacement.to_owned();
+    for index in 0..displacement.len().min(lower.len()) {
+        down[index] = down[index].min((rho[index] - lower[index]).max(0.0));
+        up[index] = up[index].min((upper[index] - rho[index]).max(0.0));
+    }
+    if down.iter().chain(up.iter()).all(|radius| radius.is_finite()) {
+        Ok((down, up))
+    } else {
+        Err(EstimationError::InvalidInput(format!(
+            "reachable certificate step is not finite: down {down}, up {up}"
         )))
     }
 }
@@ -674,7 +725,9 @@ impl FittedHessianSpectrum {
 ///
 /// `spectrum` is PIRLS's dense penalized Hessian's, in its transformed basis;
 /// `hessian_rho` and `gradient` are the outer certificate's curvature and
-/// gradient at ρ̂, and `railed` lists the coordinates it certified on a rail. The
+/// gradient at `rho` = ρ̂, and `railed` lists the coordinates it certified on a rail.
+/// The step is the Newton displacement kept inside the search `domain`
+/// ([`reachable_step_within_domain`]). The
 /// curvature weights move through `β̂`: `ΔW_i = c_i·x_iᵀΔβ` with
 /// `Δβ = Σ_k δρ_k·∂β̂/∂ρ_k` and `∂β̂/∂ρ_k = −H⁺λ_kS_kβ̂` over the identified
 /// subspace the criterion priced, so row `i` moves by at most
@@ -691,9 +744,20 @@ pub(crate) fn certify_fitted_identified_rank(
     hessian_rho: &Array2<f64>,
     gradient: &Array1<f64>,
     railed: &[usize],
+    rho: ArrayView1<'_, f64>,
+    domain: (ArrayView1<'_, f64>, ArrayView1<'_, f64>),
 ) -> Result<(IdentifiedRankCertificate, f64), EstimationError> {
     let displacement = certificate_newton_displacement(hessian_rho, gradient, railed)?;
-    let step_radius = displacement.iter().fold(0.0_f64, |acc, value| acc.max(*value));
+    let (shrink, growth) =
+        reachable_step_within_domain(displacement.view(), rho, domain.0, domain.1)?;
+    // The weights move with `|δρ_k|`, which reaches the larger of the two radii.
+    let reach = Array1::from_iter(
+        shrink
+            .iter()
+            .zip(growth.iter())
+            .map(|(&down, &up)| down.max(up)),
+    );
+    let step_radius = reach.iter().fold(0.0_f64, |acc, value| acc.max(*value));
     let penalties = pirls.reparam_result.applied_penalties().map_err(|error| {
         EstimationError::LayoutError(format!(
             "projecting the rank certificate's penalty blocks onto the reparameterization's \
@@ -714,7 +778,7 @@ pub(crate) fn certify_fitted_identified_rank(
         for ((penalty, &lambda), &step) in penalties
             .iter()
             .zip(lambdas.iter())
-            .zip(displacement.iter())
+            .zip(reach.iter())
         {
             if step == 0.0 {
                 continue;
@@ -774,7 +838,8 @@ pub(crate) fn certify_fitted_identified_rank(
                 penalty.root.t().dot(&penalty.root) * lambda,
             )
         }),
-        displacement.view(),
+        shrink.view(),
+        growth.view(),
         motion,
     )?;
     certify_identified_rank_locally_constant(eigenvalues, rank, penalty_rank, &bounds)
@@ -859,6 +924,7 @@ mod tests {
             penalties
                 .iter()
                 .map(|entry| (0..hessian.len(), diagonal(entry.0))),
+            steps.view(),
             steps.view(),
             still_weights(),
         )
@@ -1032,6 +1098,7 @@ mod tests {
                     penalty.root.t().dot(&penalty.root) * 1.0e8,
                 )],
                 array![1.0].view(),
+                array![1.0].view(),
                 still_weights(),
             )
             .unwrap()
@@ -1064,6 +1131,7 @@ mod tests {
                 &diagonal(&spectrum),
                 &diagonal(engine),
                 [(0..2, diagonal(&[0.0, 0.2]))],
+                array![0.0].view(),
                 array![0.0].view(),
                 still_weights(),
             )
@@ -1223,6 +1291,7 @@ mod tests {
             &(&first + &second),
             [(0..3, first.clone()), (0..3, second.clone())],
             steps.view(),
+            steps.view(),
             still_weights(),
         )
         .unwrap();
@@ -1260,6 +1329,60 @@ mod tests {
         assert_eq!(railed[1], 0.0);
         let interior = certificate_newton_displacement(&hessian_rho, &gradient, &[]).unwrap();
         assert!((interior[1] - 50.0).abs() < 1e-10, "{interior}");
+    }
+
+    /// The certificate's step stops at the search domain: gam-predict's binomial
+    /// `s(age)` draw 20260541 (job 1264848) had a displacement of 15.6 at
+    /// `ln λ₂ = 20.318` against a domain ending at 21.254, so only 0.936 of it is
+    /// reachable upward, while the downward side and the first coordinate keep their
+    /// whole displacement. A coordinate past the domain's length is not confined.
+    #[test]
+    fn the_certificate_step_stops_at_the_search_domain() {
+        let displacement = array![6.7e-6, 15.6, 2.0];
+        let rho = array![7.034, 20.318, 0.0];
+        let lower = array![-19.9, -17.58];
+        let upper = array![27.73, 21.254];
+        let (down, up) = reachable_step_within_domain(
+            displacement.view(),
+            rho.view(),
+            lower.view(),
+            upper.view(),
+        )
+        .unwrap();
+        assert_eq!(down, displacement);
+        assert_eq!(up[0], 6.7e-6);
+        assert!((up[1] - (21.254 - 20.318)).abs() < 1e-12, "{up}");
+        assert_eq!(up[2], 2.0);
+        // A ρ̂ on the domain's edge reaches nothing past it, and a ρ̂ past the edge
+        // (a rail-relaxed point) reaches nothing further out.
+        let (at_edge_down, at_edge_up) = reachable_step_within_domain(
+            array![3.0].view(),
+            array![21.254].view(),
+            array![-17.58].view(),
+            array![21.254].view(),
+        )
+        .unwrap();
+        assert_eq!(at_edge_down[0], 3.0);
+        assert_eq!(at_edge_up[0], 0.0);
+        let (past_down, past_up) = reachable_step_within_domain(
+            array![3.0].view(),
+            array![21.5].view(),
+            array![-17.58].view(),
+            array![21.254].view(),
+        )
+        .unwrap();
+        assert_eq!(past_down[0], 3.0);
+        assert_eq!(past_up[0], 0.0);
+        assert!(
+            reachable_step_within_domain(
+                displacement.view(),
+                array![0.0].view(),
+                lower.view(),
+                upper.view(),
+            )
+            .is_err(),
+            "a ρ̂ of the wrong length is refused"
+        );
     }
 
     /// A row whose curvature weight is negative is charged by its own row mass
@@ -1302,6 +1425,7 @@ mod tests {
                 &diagonal(&spectrum),
                 &diagonal(&[0.0, 0.5]),
                 [penalty.clone()],
+                array![0.0].view(),
                 array![0.0].view(),
                 motion,
             )

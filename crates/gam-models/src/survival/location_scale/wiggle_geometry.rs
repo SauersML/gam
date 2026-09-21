@@ -116,14 +116,10 @@ pub(crate) struct SurvivalWiggleGeometry {
 #[derive(Clone, Copy)]
 pub(crate) struct SurvivalBaseQScalars {
     pub(crate) eta_t: f64,
-    pub(crate) inv_sigma: f64,
     pub(crate) q: f64,
     pub(crate) q_t: f64,
     pub(crate) q_ls: f64,
-    pub(crate) q_tl: f64,
     pub(crate) q_ll: f64,
-    pub(crate) q_tl_ls: f64,
-    pub(crate) q_ll_ls: f64,
 }
 
 pub(crate) struct SurvivalDynamicGeometryRowsMut<'a> {
@@ -134,14 +130,8 @@ pub(crate) struct SurvivalDynamicGeometryRowsMut<'a> {
     pub(crate) dq_t_entry: &'a mut [f64],
     pub(crate) dq_ls_exit: &'a mut [f64],
     pub(crate) dq_ls_entry: &'a mut [f64],
-    pub(crate) d2q_tls_exit: &'a mut [f64],
-    pub(crate) d2q_tls_entry: &'a mut [f64],
     pub(crate) d2q_ls_exit: &'a mut [f64],
     pub(crate) d2q_ls_entry: &'a mut [f64],
-    pub(crate) d3q_tls_ls_exit: &'a mut [f64],
-    pub(crate) d3q_tls_ls_entry: &'a mut [f64],
-    pub(crate) d3q_ls_exit: &'a mut [f64],
-    pub(crate) d3q_ls_entry: &'a mut [f64],
     pub(crate) dqdot_t: &'a mut [f64],
     pub(crate) dqdot_ls: &'a mut [f64],
     pub(crate) dqdot_td: &'a mut [f64],
@@ -162,14 +152,8 @@ impl<'a> SurvivalDynamicGeometryRowsMut<'a> {
         let (dq_t_entry_l, dq_t_entry_r) = self.dq_t_entry.split_at_mut(mid);
         let (dq_ls_exit_l, dq_ls_exit_r) = self.dq_ls_exit.split_at_mut(mid);
         let (dq_ls_entry_l, dq_ls_entry_r) = self.dq_ls_entry.split_at_mut(mid);
-        let (d2q_tls_exit_l, d2q_tls_exit_r) = self.d2q_tls_exit.split_at_mut(mid);
-        let (d2q_tls_entry_l, d2q_tls_entry_r) = self.d2q_tls_entry.split_at_mut(mid);
         let (d2q_ls_exit_l, d2q_ls_exit_r) = self.d2q_ls_exit.split_at_mut(mid);
         let (d2q_ls_entry_l, d2q_ls_entry_r) = self.d2q_ls_entry.split_at_mut(mid);
-        let (d3q_tls_ls_exit_l, d3q_tls_ls_exit_r) = self.d3q_tls_ls_exit.split_at_mut(mid);
-        let (d3q_tls_ls_entry_l, d3q_tls_ls_entry_r) = self.d3q_tls_ls_entry.split_at_mut(mid);
-        let (d3q_ls_exit_l, d3q_ls_exit_r) = self.d3q_ls_exit.split_at_mut(mid);
-        let (d3q_ls_entry_l, d3q_ls_entry_r) = self.d3q_ls_entry.split_at_mut(mid);
         let (dqdot_t_l, dqdot_t_r) = self.dqdot_t.split_at_mut(mid);
         let (dqdot_ls_l, dqdot_ls_r) = self.dqdot_ls.split_at_mut(mid);
         let (dqdot_td_l, dqdot_td_r) = self.dqdot_td.split_at_mut(mid);
@@ -184,14 +168,8 @@ impl<'a> SurvivalDynamicGeometryRowsMut<'a> {
                 dq_t_entry: dq_t_entry_l,
                 dq_ls_exit: dq_ls_exit_l,
                 dq_ls_entry: dq_ls_entry_l,
-                d2q_tls_exit: d2q_tls_exit_l,
-                d2q_tls_entry: d2q_tls_entry_l,
                 d2q_ls_exit: d2q_ls_exit_l,
                 d2q_ls_entry: d2q_ls_entry_l,
-                d3q_tls_ls_exit: d3q_tls_ls_exit_l,
-                d3q_tls_ls_entry: d3q_tls_ls_entry_l,
-                d3q_ls_exit: d3q_ls_exit_l,
-                d3q_ls_entry: d3q_ls_entry_l,
                 dqdot_t: dqdot_t_l,
                 dqdot_ls: dqdot_ls_l,
                 dqdot_td: dqdot_td_l,
@@ -205,14 +183,8 @@ impl<'a> SurvivalDynamicGeometryRowsMut<'a> {
                 dq_t_entry: dq_t_entry_r,
                 dq_ls_exit: dq_ls_exit_r,
                 dq_ls_entry: dq_ls_entry_r,
-                d2q_tls_exit: d2q_tls_exit_r,
-                d2q_tls_entry: d2q_tls_entry_r,
                 d2q_ls_exit: d2q_ls_exit_r,
                 d2q_ls_entry: d2q_ls_entry_r,
-                d3q_tls_ls_exit: d3q_tls_ls_exit_r,
-                d3q_tls_ls_entry: d3q_tls_ls_entry_r,
-                d3q_ls_exit: d3q_ls_exit_r,
-                d3q_ls_entry: d3q_ls_entry_r,
                 dqdot_t: dqdot_t_r,
                 dqdot_ls: dqdot_ls_r,
                 dqdot_td: dqdot_td_r,
@@ -271,7 +243,6 @@ pub(crate) fn fill_survival_dynamic_geometry_rows_serial(
                 wig.basis.row(i).dot(&beta_w),
                 wig.dq_dq0[i],
                 wig.d2q_dq02[i],
-                wig.d3q_dq03[i],
             )
         } else {
             compose_survival_dynamic_q(
@@ -280,7 +251,6 @@ pub(crate) fn fill_survival_dynamic_geometry_rows_serial(
                 inputs.eta_ls_deriv_exit[i],
                 0.0,
                 1.0,
-                0.0,
                 0.0,
             )
         };
@@ -292,10 +262,9 @@ pub(crate) fn fill_survival_dynamic_geometry_rows_serial(
                 wig.basis.row(i).dot(&beta_w),
                 wig.dq_dq0[i],
                 wig.d2q_dq02[i],
-                wig.d3q_dq03[i],
             )
         } else {
-            compose_survival_dynamic_q(base_entry, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+            compose_survival_dynamic_q(base_entry, 0.0, 0.0, 0.0, 1.0, 0.0)
         };
         rows.q_exit[offset] = exit_dyn.q;
         rows.q_entry[offset] = entry_dyn.q;
@@ -304,14 +273,8 @@ pub(crate) fn fill_survival_dynamic_geometry_rows_serial(
         rows.dq_t_entry[offset] = entry_dyn.q_t;
         rows.dq_ls_exit[offset] = exit_dyn.q_ls;
         rows.dq_ls_entry[offset] = entry_dyn.q_ls;
-        rows.d2q_tls_exit[offset] = exit_dyn.q_tl;
-        rows.d2q_tls_entry[offset] = entry_dyn.q_tl;
         rows.d2q_ls_exit[offset] = exit_dyn.q_ll;
         rows.d2q_ls_entry[offset] = entry_dyn.q_ll;
-        rows.d3q_tls_ls_exit[offset] = exit_dyn.q_tl_ls;
-        rows.d3q_tls_ls_entry[offset] = entry_dyn.q_tl_ls;
-        rows.d3q_ls_exit[offset] = exit_dyn.q_ll_ls;
-        rows.d3q_ls_entry[offset] = entry_dyn.q_ll_ls;
         rows.dqdot_t[offset] = exit_dyn.qdot_t;
         rows.dqdot_ls[offset] = exit_dyn.qdot_ls;
         rows.dqdot_td[offset] = exit_dyn.qdot_td;
@@ -324,10 +287,7 @@ pub(crate) struct SurvivalDynamicQScalars {
     pub(crate) q: f64,
     pub(crate) q_t: f64,
     pub(crate) q_ls: f64,
-    pub(crate) q_tl: f64,
     pub(crate) q_ll: f64,
-    pub(crate) q_tl_ls: f64,
-    pub(crate) q_ll_ls: f64,
     pub(crate) qdot: f64,
     pub(crate) qdot_t: f64,
     pub(crate) qdot_ls: f64,
@@ -340,6 +300,16 @@ pub(crate) struct SurvivalDynamicGeometry {
     pub(crate) h_exit: Array1<f64>,
     pub(crate) h_entry: Array1<f64>,
     pub(crate) hdot_exit: Array1<f64>,
+    /// The time transform's share of the standardized residual and of its time
+    /// derivative (#2695): `hs = h·e^{-eta_ls}` at entry and exit, and
+    /// `time_rate = hdot − h·eta_ls'` at exit. The scale divides the whole
+    /// residual, so `u = hs + q` and `du1/dt = e^{-eta_ls}·g` with
+    /// `g = time_rate + qdot`: the rate channels carry no scale, whose `−eta_ls`
+    /// enters the event log-density linearly. The raw `h` fields above stay the
+    /// primaries the time design maps coefficients to.
+    pub(crate) hs_exit: Array1<f64>,
+    pub(crate) hs_entry: Array1<f64>,
+    pub(crate) time_rate_exit: Array1<f64>,
     pub(crate) time_base_derivative_exit: Array1<f64>,
     pub(crate) time_jac_entry: Array2<f64>,
     pub(crate) time_jac_exit: Array2<f64>,
@@ -369,14 +339,8 @@ pub(crate) struct SurvivalDynamicGeometry {
     pub(crate) dq_t_entry: Array1<f64>,
     pub(crate) dq_ls_exit: Array1<f64>,
     pub(crate) dq_ls_entry: Array1<f64>,
-    pub(crate) d2q_tls_exit: Array1<f64>,
-    pub(crate) d2q_tls_entry: Array1<f64>,
     pub(crate) d2q_ls_exit: Array1<f64>,
     pub(crate) d2q_ls_entry: Array1<f64>,
-    pub(crate) d3q_tls_ls_exit: Array1<f64>,
-    pub(crate) d3q_tls_ls_entry: Array1<f64>,
-    pub(crate) d3q_ls_exit: Array1<f64>,
-    pub(crate) d3q_ls_entry: Array1<f64>,
     pub(crate) dqdot_t: Array1<f64>,
     pub(crate) dqdot_ls: Array1<f64>,
     pub(crate) dqdot_td: Array1<f64>,
@@ -403,6 +367,9 @@ impl SurvivalDynamicGeometry {
             ) }.into());
         }
         for (channel, len) in [
+            ("hs_exit", self.hs_exit.len()),
+            ("hs_entry", self.hs_entry.len()),
+            ("time_rate_exit", self.time_rate_exit.len()),
             ("q_base_exit", self.q_base_exit.len()),
             ("q_base_entry", self.q_base_entry.len()),
             ("eta_t_deriv_exit", self.eta_t_deriv_exit.len()),
@@ -537,29 +504,28 @@ pub(crate) fn survival_wiggle_fifth_basis(
 }
 
 pub(crate) fn survival_base_q_scalars(eta_t: f64, eta_ls: f64) -> SurvivalBaseQScalars {
-    let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls) = q_chain_derivs_scalar(eta_t, eta_ls);
-    let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls);
+    let derivs = q_chain_derivs_scalar(eta_t, eta_ls);
     SurvivalBaseQScalars {
         eta_t,
-        inv_sigma,
         q: survival_q0_from_eta(eta_t, eta_ls),
-        q_t,
-        q_ls,
-        q_tl,
-        q_ll,
-        q_tl_ls,
-        q_ll_ls,
+        q_t: derivs.0,
+        q_ls: derivs.1,
+        q_ll: derivs.3,
     }
 }
 
+/// The location channel's rate with the scale factored out,
+/// `r = eta_t·eta_ls' − eta_t'`, so that `dq0/dt = e^{−eta_ls}·r`. The scale's
+/// `−eta_ls` enters the event log-density linearly (#2695), so no rate channel
+/// carries it, and the single fused multiply-add keeps the local cancellation
+/// `eta_t·eta_ls' − eta_t'` exact however extreme `eta_t` is.
 #[inline]
 pub(crate) fn survival_q0dot_from_base(
     base: SurvivalBaseQScalars,
     eta_t_deriv: f64,
     eta_ls_deriv: f64,
 ) -> f64 {
-    let local_derivative = base.eta_t.mul_add(eta_ls_deriv, -eta_t_deriv);
-    safe_product(base.inv_sigma, local_derivative)
+    base.eta_t.mul_add(eta_ls_deriv, -eta_t_deriv)
 }
 
 pub(crate) fn compose_survival_dynamic_q(
@@ -569,48 +535,30 @@ pub(crate) fn compose_survival_dynamic_q(
     wiggle_value: f64,
     dq_dq0: f64,
     d2q_dq02: f64,
-    d3q_dq03: f64,
 ) -> SurvivalDynamicQScalars {
     let a = base.q_t;
     let b = base.q_ls;
-    let c = base.q_tl;
     let d = base.q_ll;
-    let e = base.q_tl_ls;
-    let f = base.q_ll_ls;
     let m1 = dq_dq0;
     let m2 = d2q_dq02;
-    let m3 = d3q_dq03;
-    let r = survival_q0dot_from_base(base, eta_t_deriv, eta_ls_deriv);
-    let r_t = safe_product(c, eta_ls_deriv);
-    let r_ls = safe_sum2(safe_product(c, eta_t_deriv), safe_product(d, eta_ls_deriv));
     let q_t = safe_product(m1, a);
     let q_ls = safe_product(m1, b);
-    let q_tl = safe_sum2(safe_product(m2, safe_product(a, b)), safe_product(m1, c));
     let q_ll = safe_sum2(safe_product(m2, safe_product(b, b)), safe_product(m1, d));
-    let q_tl_ls = safe_sum3(
-        safe_product(m3, safe_product(a, safe_product(b, b))),
-        safe_product(m2, safe_sum2(safe_product(a, d), 2.0 * safe_product(b, c))),
-        safe_product(m1, e),
-    );
-    let q_ll_ls = safe_sum3(
-        safe_product(m3, safe_product(b, safe_product(b, b))),
-        safe_product(m2, 3.0 * safe_product(b, d)),
-        safe_product(m1, f),
-    );
+    // The location channel's share `qdot = m1·r` of the unscaled event
+    // Jacobian and its partials in (eta_t, eta_ls, eta_t', eta_ls'). The scale
+    // reaches it only through the warp slope `m1(q0)`, whence the `m2` terms.
+    let r = survival_q0dot_from_base(base, eta_t_deriv, eta_ls_deriv);
 
     SurvivalDynamicQScalars {
         q: base.q + wiggle_value,
         q_t,
         q_ls,
-        q_tl,
         q_ll,
-        q_tl_ls,
-        q_ll_ls,
         qdot: safe_product(m1, r),
-        qdot_t: safe_sum2(safe_product(m2, safe_product(a, r)), safe_product(m1, r_t)),
-        qdot_ls: safe_sum2(safe_product(m2, safe_product(b, r)), safe_product(m1, r_ls)),
-        qdot_td: q_t,
-        qdot_lsd: q_ls,
+        qdot_t: safe_sum2(safe_product(m2, safe_product(a, r)), safe_product(m1, eta_ls_deriv)),
+        qdot_ls: safe_product(m2, safe_product(b, r)),
+        qdot_td: -m1,
+        qdot_lsd: safe_product(m1, base.eta_t),
     }
 }
 
@@ -641,8 +589,9 @@ impl SurvivalLocationScaleFamily {
         // baseline instead shifts the effective location predictor on the σ-scaled
         // `q` channel — `η_t → η_t − log t` (value) with derivative `−1/t` — so the
         // standardized residual is `u = inv_sigma·(log t − η_t) = (log t − μ)/σ`
-        // and the event Jacobian gains `qdot = inv_sigma/t → log_g = −η_ls − log t`,
-        // the `−log σ` term that identifies σ. Shifting the effective location here
+        // and the unscaled event Jacobian gains `qdot = 1/t`, so
+        // `log(du1/dt) = −η_ls − log t` carries the `−log σ` term that identifies σ
+        // (that term is the event log-density's linear one, #2695). Shifting the effective location here
         // (before q0 / the q-row kernel) routes the whole σ coupling through the
         // existing `q`-derivative/Hessian stack — no new time×log_sigma cross-terms.
         let (eta_t_exit, eta_t_entry) = if let Some(loc) = self.location_log_time.as_ref() {
@@ -793,14 +742,8 @@ impl SurvivalLocationScaleFamily {
         let mut dq_t_entry = Array1::<f64>::zeros(n);
         let mut dq_ls_exit = Array1::<f64>::zeros(n);
         let mut dq_ls_entry = Array1::<f64>::zeros(n);
-        let mut d2q_tls_exit = Array1::<f64>::zeros(n);
-        let mut d2q_tls_entry = Array1::<f64>::zeros(n);
         let mut d2q_ls_exit = Array1::<f64>::zeros(n);
         let mut d2q_ls_entry = Array1::<f64>::zeros(n);
-        let mut d3q_tls_ls_exit = Array1::<f64>::zeros(n);
-        let mut d3q_tls_ls_entry = Array1::<f64>::zeros(n);
-        let mut d3q_ls_exit = Array1::<f64>::zeros(n);
-        let mut d3q_ls_entry = Array1::<f64>::zeros(n);
         let mut dqdot_t = Array1::<f64>::zeros(n);
         let mut dqdot_ls = Array1::<f64>::zeros(n);
         let mut dqdot_td = Array1::<f64>::zeros(n);
@@ -835,30 +778,12 @@ impl SurvivalLocationScaleFamily {
             dq_ls_entry: dq_ls_entry
                 .as_slice_mut()
                 .expect("dq_ls_entry must be contiguous"),
-            d2q_tls_exit: d2q_tls_exit
-                .as_slice_mut()
-                .expect("d2q_tls_exit must be contiguous"),
-            d2q_tls_entry: d2q_tls_entry
-                .as_slice_mut()
-                .expect("d2q_tls_entry must be contiguous"),
             d2q_ls_exit: d2q_ls_exit
                 .as_slice_mut()
                 .expect("d2q_ls_exit must be contiguous"),
             d2q_ls_entry: d2q_ls_entry
                 .as_slice_mut()
                 .expect("d2q_ls_entry must be contiguous"),
-            d3q_tls_ls_exit: d3q_tls_ls_exit
-                .as_slice_mut()
-                .expect("d3q_tls_ls_exit must be contiguous"),
-            d3q_tls_ls_entry: d3q_tls_ls_entry
-                .as_slice_mut()
-                .expect("d3q_tls_ls_entry must be contiguous"),
-            d3q_ls_exit: d3q_ls_exit
-                .as_slice_mut()
-                .expect("d3q_ls_exit must be contiguous"),
-            d3q_ls_entry: d3q_ls_entry
-                .as_slice_mut()
-                .expect("d3q_ls_entry must be contiguous"),
             dqdot_t: dqdot_t.as_slice_mut().expect("dqdot_t must be contiguous"),
             dqdot_ls: dqdot_ls
                 .as_slice_mut()
@@ -902,10 +827,16 @@ impl SurvivalLocationScaleFamily {
             out
         });
 
+        let hs_entry = &h_entry * &inv_sigma_entry;
+        let hs_exit = &h_exit * &inv_sigma_exit;
+        let time_rate_exit = &hdot_exit - &(&h_exit * &eta_ls_deriv_exit);
         let dynamic = SurvivalDynamicGeometry {
             h_exit,
             h_entry,
             hdot_exit,
+            hs_exit,
+            hs_entry,
+            time_rate_exit,
             time_base_derivative_exit: d_base,
             time_jac_entry,
             time_jac_exit,
@@ -931,14 +862,8 @@ impl SurvivalLocationScaleFamily {
             dq_t_entry,
             dq_ls_exit,
             dq_ls_entry,
-            d2q_tls_exit,
-            d2q_tls_entry,
             d2q_ls_exit,
             d2q_ls_entry,
-            d3q_tls_ls_exit,
-            d3q_tls_ls_entry,
-            d3q_ls_exit,
-            d3q_ls_entry,
             dqdot_t,
             dqdot_ls,
             dqdot_td,

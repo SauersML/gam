@@ -19,6 +19,7 @@ use super::forecast::{
     predictive_pit,
 };
 use super::marginal::{SubjectInputs, subject_marginal};
+use super::predictor::{EventHistoryPredictor, FittedEventHistory};
 use super::preserve::{ReferenceGrid, ReferenceStrata, killing_masks, stratum_normalisers};
 use gam_model_api::families::custom_family::BlockwiseFitOptions;
 use gam_problem::ParameterBlockState;
@@ -1205,7 +1206,8 @@ fn fit_recovers_the_covariate_effect_and_a_positive_shared_risk_loading() {
         future: &[],
         stratum: 0,
     };
-    let f = forecast(&fit, &cohort, &request).expect("forecast");
+    let predictor = EventHistoryPredictor::from_fit(&fit, &cohort).expect("predictor");
+    let f = forecast(&predictor, &cohort, &request).expect("forecast");
     assert!(
         f.survival.iter().all(|&s| (0.0..=1.0).contains(&s)),
         "survival left [0, 1]: {:?}",
@@ -3234,9 +3236,9 @@ fn forecast_tiers_population_score_and_history_are_one_model_conditioned_on_more
             covariates: vec![score],
         }]
     };
+    let predictor = EventHistoryPredictor::from_fit(&fit, &cohort).expect("predictor");
     let population = population_forecast(
-        &fit,
-        &cohort,
+        &predictor,
         &PopulationForecastRequest {
             start: 6.0,
             horizons: &horizons,
@@ -3269,8 +3271,7 @@ fn forecast_tiers_population_score_and_history_are_one_model_conditioned_on_more
             let subject = &cohort.subjects[i];
             let score = cohort.covariates[[i, 0]];
             let alone = population_forecast(
-                &fit,
-                &cohort,
+                &predictor,
                 &PopulationForecastRequest {
                     start: subject.exit,
                     horizons: &horizons,
@@ -3280,7 +3281,7 @@ fn forecast_tiers_population_score_and_history_are_one_model_conditioned_on_more
             )
             .expect("score-only forecast");
             let with_history = forecast(
-                &fit,
+                &predictor,
                 &cohort,
                 &ForecastRequest {
                     history: subject,
@@ -3408,9 +3409,81 @@ fn terminal_forecasts_match_the_constant_hazard_solution() {
             rates[d]
         );
     }
-    let total_terminal = rates[0] + rates[1];
-    // A censored subject: the forecast is the exponential competing-risks
-    // solution, chronologically integrated.
+    // A censored subject: the forecast is posterior-predictive, the exponential
+    // competing-risks solution averaged over the fit's Laplace posterior of the
+    // three log rates. The reference average is a tensor Gauss-Hermite rule in
+    // the posterior's eigenbasis, which shares nothing with the adaptive sparse
+    // rule the forecast integrates by. At rank zero the only coefficients are
+    // the intercepts. Measurement premise, printed before it is asserted.
+    emit(&format!("[2964 terminal] rank {}", fit.rank()));
+    assert_eq!(fit.rank(), 0, "the fixture's verdict is the null");
+    let predictor = EventHistoryPredictor::from_fit(&fit, &cohort).expect("predictor");
+    let covariance = fit
+        .fit
+        .beta_covariance_corrected()
+        .or_else(|| fit.fit.beta_covariance())
+        .expect("posterior covariance")
+        .clone();
+    let (spread, directions) =
+        super::covariance::eigenmodes(&covariance).expect("posterior eigenmodes");
+    let mode: Vec<f64> = (0..3).map(|d| fit.mark_coefficients(d)[0]).collect();
+    // The average at `h` by the tensor rule of `order` nodes per direction: the
+    // survival, then every mark's expected count (terminal incidences and
+    // recurrent events before termination, `λ_d (1 − S)/Λ`). Each value comes
+    // with its rounding: its serial sum of `order³` terms is resolved beyond
+    // `accumulation_band(order³, Σ|w·F|)`.
+    let average = |h: f64, order: usize| -> ([f64; 4], [f64; 4]) {
+        let rule = gam_math::quadrature::gauss_hermite_rule(order).expect("Gauss-Hermite rule");
+        let nodes: Vec<f64> = rule.nodes.iter().map(|x| std::f64::consts::SQRT_2 * x).collect();
+        let weights: Vec<f64> = rule
+            .weights
+            .iter()
+            .map(|w| w / std::f64::consts::PI.sqrt())
+            .collect();
+        let mut values = [0.0; 4];
+        let mut absolute = [0.0; 4];
+        for a in 0..order {
+            for b in 0..order {
+                for c in 0..order {
+                    let z = [nodes[a], nodes[b], nodes[c]];
+                    let w = weights[a] * weights[b] * weights[c];
+                    let rate: Vec<f64> = (0..3)
+                        .map(|d| {
+                            let shift: f64 = (0..3)
+                                .map(|k| spread[k].max(0.0).sqrt() * directions[[d, k]] * z[k])
+                                .sum();
+                            (mode[d] + shift).exp()
+                        })
+                        .collect();
+                    let terminal = rate[0] + rate[1];
+                    let decrement = -(-terminal * h).exp_m1();
+                    let terms = [
+                        w * (-terminal * h).exp(),
+                        w * rate[0] / terminal * decrement,
+                        w * rate[1] / terminal * decrement,
+                        w * rate[2] / terminal * decrement,
+                    ];
+                    for q in 0..4 {
+                        values[q] += terms[q];
+                        absolute[q] += terms[q].abs();
+                    }
+                }
+            }
+        }
+        let band = |sum: f64| gam_linalg::roundoff::accumulation_band(order * order * order, sum);
+        (values, absolute.map(band))
+    };
+    // The oracle's error: the change from half the nodes, and both rules'
+    // rounding.
+    let oracle = |h: f64| -> ([f64; 4], [f64; 4]) {
+        let (fine, fine_rounding) = average(h, 20);
+        let (coarse, coarse_rounding) = average(h, 10);
+        let mut error = [0.0; 4];
+        for q in 0..4 {
+            error[q] = (fine[q] - coarse[q]).abs() + fine_rounding[q] + coarse_rounding[q];
+        }
+        (fine, error)
+    };
     let censored = cohort
         .subjects
         .iter()
@@ -3419,7 +3492,7 @@ fn terminal_forecasts_match_the_constant_hazard_solution() {
     let offsets = [0.5, 1.0, 2.0, 4.0];
     let horizons: Vec<f64> = offsets.iter().map(|h| censored.exit + h).collect();
     let f = forecast(
-        &fit,
+        &predictor,
         &cohort,
         &ForecastRequest {
             history: censored,
@@ -3429,28 +3502,37 @@ fn terminal_forecasts_match_the_constant_hazard_solution() {
         },
     )
     .expect("forecast");
+    assert!(f.posterior_evaluations > 1);
     for (i, &h) in offsets.iter().enumerate() {
-        let survival = (-total_terminal * h).exp();
-        assert!(
-            (f.survival[i] - survival).abs() < 1e-4,
-            "survival at +{h}: {} vs {survival}",
-            f.survival[i]
-        );
-        for d in 0..2 {
-            let incidence = rates[d] / total_terminal * (1.0 - survival);
+        let (average, oracle_error) = oracle(h);
+        let forecast = [
+            f.survival[i],
+            f.expected_counts[[i, 0]],
+            f.expected_counts[[i, 1]],
+            f.expected_counts[[i, 2]],
+        ];
+        let errors = [
+            f.survival_error[i],
+            f.expected_count_errors[[i, 0]],
+            f.expected_count_errors[[i, 1]],
+            f.expected_count_errors[[i, 2]],
+        ];
+        for q in 0..4 {
+            let bar = errors[q] + oracle_error[q];
+            emit(&format!(
+                "[2964 terminal] quantity {q} at +{h}: forecast {} average {} checked error {} oracle error {}",
+                forecast[q], average[q], errors[q], oracle_error[q]
+            ));
+            assert!(average[q] > bar, "quantity {q} at +{h}: the average {} is not above its bar {bar}", average[q]);
             assert!(
-                (f.expected_counts[[i, d]] - incidence).abs() < 1e-4,
-                "cumulative incidence of mark {d} at +{h}: {} vs {incidence}",
-                f.expected_counts[[i, d]]
+                (forecast[q] - average[q]).abs() <= bar,
+                "quantity {q} at +{h}: forecast {} vs the posterior average {}, checked error {} + oracle error {}",
+                forecast[q],
+                average[q],
+                errors[q],
+                oracle_error[q]
             );
         }
-        // Recurrent events before termination: λ₂ ∫₀ʰ S = λ₂ (1 − S)/Λ.
-        let recurrent = rates[2] / total_terminal * (1.0 - survival);
-        assert!(
-            (f.expected_counts[[i, 2]] - recurrent).abs() < 1e-4,
-            "expected recurrent count at +{h}: {} vs {recurrent}",
-            f.expected_counts[[i, 2]]
-        );
     }
     // A subject who died has no future.
     let dead = cohort
@@ -3459,7 +3541,7 @@ fn terminal_forecasts_match_the_constant_hazard_solution() {
         .find(|s| s.terminal_event(&cohort.mark_kinds).is_some())
         .expect("a subject with a terminal event");
     let gone = forecast(
-        &fit,
+        &predictor,
         &cohort,
         &ForecastRequest {
             history: dead,
@@ -3471,10 +3553,9 @@ fn terminal_forecasts_match_the_constant_hazard_solution() {
     .expect("forecast of an absorbed subject");
     assert_eq!(gone.survival, vec![0.0]);
     assert!(gone.expected_counts.iter().all(|c| *c == 0.0));
-    // The population tier at the same rates is the same solution.
+    // The population tier over the same posterior is the same average.
     let population = population_forecast(
-        &fit,
-        &cohort,
+        &predictor,
         &PopulationForecastRequest {
             start: 1.0,
             horizons: &[2.0, 3.0],
@@ -3486,7 +3567,19 @@ fn terminal_forecasts_match_the_constant_hazard_solution() {
         },
     )
     .expect("population forecast");
-    assert!((population.survival[1] - (-2.0 * total_terminal).exp()).abs() < 1e-4);
+    let (average, oracle_error) = oracle(2.0);
+    let bar = population.survival_error[1] + oracle_error[0];
+    emit(&format!(
+        "[2964 terminal] population survival over 2: {} average {} checked error {} oracle error {}",
+        population.survival[1], average[0], population.survival_error[1], oracle_error[0]
+    ));
+    assert!(average[0] > bar, "the average survival over 2 {} is not above its bar {bar}", average[0]);
+    assert!(
+        (population.survival[1] - average[0]).abs() <= bar,
+        "population survival over 2: {} vs the posterior average {}, bar {bar}",
+        population.survival[1],
+        average[0]
+    );
     // Rosenblatt: with constant hazards the PIT of an event at `t` after the
     // previous event at `s` is `1 − exp(−Λ_all (t − s))` with the total rate.
     let total_rate: f64 = rates.iter().sum();
@@ -3544,15 +3637,17 @@ fn constant_hazard_fit() -> (EventHistoryCohort, EventHistoryFit, Vec<f64>) {
     (cohort, fit, rates)
 }
 
-/// A population forecast of the constant-hazard fixture from time zero.
+/// A population forecast of the constant-hazard fixture from time zero,
+/// conditional on the fitted parameters: the plug-in, whose closed forms are
+/// in the fitted rates.
 fn constant_hazard_population(
     fit: &EventHistoryFit,
     cohort: &EventHistoryCohort,
     horizons: &[f64],
 ) -> super::forecast::Forecast {
+    let at_mode = EventHistoryPredictor::conditional_on_mode(fit, cohort).expect("predictor at the mode");
     population_forecast(
-        fit,
-        cohort,
+        &at_mode,
         &PopulationForecastRequest {
             start: 0.0,
             horizons,
@@ -3685,8 +3780,11 @@ fn constant_hazard_forecasts_are_exact_at_every_horizon() {
     // its bar: the magnitude floor a two-route comparison needs.
     let hazards = [0.5, 2.0, 10.0];
     let horizons: Vec<f64> = hazards.iter().map(|h| censored.exit + h / total_terminal).collect();
+    // Conditional on the fitted parameters: the closed forms are in the fitted
+    // rates.
+    let at_mode = EventHistoryPredictor::conditional_on_mode(&fit, &cohort).expect("predictor at the mode");
     let f = forecast(
-        &fit,
+        &at_mode,
         &cohort,
         &ForecastRequest {
             history: censored,
@@ -3762,14 +3860,16 @@ fn forecast_probabilities_are_coherent_under_a_latent_state() {
         "a shared latent state was simulated but the evidence grew no atom: {:?}",
         fit.rank_path
     );
+    let predictor = EventHistoryPredictor::from_fit(&fit, &cohort).expect("predictor");
     let horizons_after = [0.5, 1.5, 3.0];
     for subject in cohort.subjects.iter().take(12) {
         if subject.terminal_event(&cohort.mark_kinds).is_some() {
             continue;
         }
         let horizons: Vec<f64> = horizons_after.iter().map(|h| subject.exit + h).collect();
+        let forecast_started = std::time::Instant::now();
         let f = forecast(
-            &fit,
+            &predictor,
             &cohort,
             &ForecastRequest {
                 history: subject,
@@ -3779,6 +3879,14 @@ fn forecast_probabilities_are_coherent_under_a_latent_state() {
             },
         )
         .expect("forecast");
+        emit(&format!(
+            "[2964 coherent] subject {}: {} posterior states in {:.2}s, survival {:?} at checked errors {:?}",
+            subject.id,
+            f.posterior_evaluations,
+            forecast_started.elapsed().as_secs_f64(),
+            f.survival,
+            f.survival_error
+        ));
         let had_once = subject.events.iter().any(|e| e.mark == 1);
         let mut previous_survival = 1.0;
         let mut previous_counts = vec![0.0; 3];
@@ -4136,6 +4244,7 @@ fn a_prefix_forecast_sees_only_what_was_known_at_the_cutoff() {
     let mut cohort = competing_risks_cohort(64);
     let spec = EventHistorySpec::new(vec![intercept_only_spec()]);
     let fit = fit_event_history(&mut cohort, &spec).expect("fit");
+    let predictor = EventHistoryPredictor::from_fit(&fit, &cohort).expect("predictor");
     let kinds = cohort.mark_kinds.clone();
     let cutoff = 2.0;
     let subject = cohort
@@ -4153,7 +4262,7 @@ fn a_prefix_forecast_sees_only_what_was_known_at_the_cutoff() {
     assert!(prefix.events.len() < subject.events.len());
     let horizons = [2.5, 3.0];
     let from_prefix = forecast(
-        &fit,
+        &predictor,
         &cohort,
         &ForecastRequest {
             history: &prefix,
@@ -4168,7 +4277,7 @@ fn a_prefix_forecast_sees_only_what_was_known_at_the_cutoff() {
     extended.events.push(Event { time: 2.7, mark: 2 });
     extended.events.sort_by(|a, b| a.time.total_cmp(&b.time));
     let again = forecast(
-        &fit,
+        &predictor,
         &cohort,
         &ForecastRequest {
             history: &extended.prefix(cutoff, &kinds).expect("prefix"),
@@ -4180,6 +4289,37 @@ fn a_prefix_forecast_sees_only_what_was_known_at_the_cutoff() {
     .expect("forecast from the extended prefix");
     assert_eq!(from_prefix.survival, again.survival);
     assert_eq!(from_prefix.expected_counts, again.expected_counts);
+    // A real fit's saved predictor reloads to the same forecast: the frozen
+    // bases, settings and posterior all round-trip (#2966).
+    let reloaded = EventHistoryPredictor::from_json(&predictor.to_json().expect("saved document"))
+        .expect("reloaded predictor");
+    let from_reload = forecast(
+        &reloaded,
+        &cohort,
+        &ForecastRequest {
+            history: &prefix,
+            horizons: &horizons,
+            future: &[],
+            stratum: 0,
+        },
+    )
+    .expect("forecast from the reloaded predictor");
+    let bits = |forecast: &crate::forecast::Forecast| -> Vec<u64> {
+        forecast
+            .survival
+            .iter()
+            .chain(forecast.expected_counts.iter())
+            .chain(forecast.survival_error.iter())
+            .chain(forecast.expected_count_errors.iter())
+            .map(|v| v.to_bits())
+            .chain(std::iter::once(forecast.posterior_evaluations as u64))
+            .collect()
+    };
+    assert_eq!(
+        bits(&from_reload),
+        bits(&from_prefix),
+        "[2966 C1] the reloaded predictor forecast the prefix to different bits"
+    );
     // The prefix as a history of its own, carrying its own covariate row,
     // forecasts the same: the training cohort's rows are not consulted.
     let row = cohort
@@ -4192,8 +4332,7 @@ fn a_prefix_forecast_sees_only_what_was_known_at_the_cutoff() {
         segment.row = 0;
     }
     let standalone = forecast_history(
-        &fit,
-        &cohort,
+        &predictor,
         &HistoryForecastRequest {
             history: &own,
             covariates: row.view(),
@@ -4216,8 +4355,7 @@ fn a_prefix_forecast_sees_only_what_was_known_at_the_cutoff() {
     let wide = Array2::<f64>::zeros((1, 2));
     assert!(
         forecast_history(
-            &fit,
-            &cohort,
+            &predictor,
             &HistoryForecastRequest {
                 history: &own,
                 covariates: wide.view(),
@@ -4261,7 +4399,7 @@ fn a_prefix_forecast_sees_only_what_was_known_at_the_cutoff() {
         *dead
     );
     let zero = forecast(
-        &fit,
+        &predictor,
         &cohort,
         &ForecastRequest {
             history: &whole,
@@ -4272,6 +4410,49 @@ fn a_prefix_forecast_sees_only_what_was_known_at_the_cutoff() {
     )
     .expect("forecast of a subject whose follow-up ended");
     assert_eq!(zero.survival, vec![0.0]);
+}
+
+/// A smoothed fit whose outer search publishes no ρ-Hessian carries a typed
+/// smoothing-correction absence, so its conditional covariance would understate
+/// the posterior a forecast averages over. Fitting it must still succeed. The
+/// predictor is built only when a forecast asks for it, and that request is
+/// what refuses, with the absence's reason (#2964).
+#[test]
+fn a_smoothed_fit_without_a_smoothing_correction_fits_and_refuses_only_its_forecasts_2964() {
+    install_test_logger();
+    let cohort = competing_risks_cohort(64);
+    let options = BlockwiseFitOptions {
+        use_outer_hessian: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let model = FittedEventHistory::fit(cohort, &["s(time)"], options, None)
+        .expect("a smoothed fit carrying a smoothing-correction absence still fits");
+    // Measurement premise, printed before it is asserted: with no outer
+    // ρ-Hessian the fit minted the absence and published no corrected
+    // covariance.
+    let absence = model
+        .fit
+        .fit
+        .smoothing_correction_absence()
+        .map(|absence| format!("{absence:?}"));
+    emit(&format!(
+        "[2964 lazy] smoothing-correction absence {absence:?}; corrected covariance published: {}",
+        model.fit.fit.beta_covariance_corrected().is_some()
+    ));
+    assert!(
+        absence.is_some(),
+        "the fixture cannot measure the refusal without a smoothing-correction absence"
+    );
+    match model.predictor() {
+        Err(super::cohort::EventHistoryError::InvalidInput { reason }) => assert!(
+            reason.contains("smoothing-uncertainty correction"),
+            "the forecast's refusal names the absence: {reason}"
+        ),
+        Err(other) => panic!(
+            "a forecast of a fit without a smoothing correction must refuse with InvalidInput, got {other:?}"
+        ),
+        Ok(_) => panic!("a fit without a smoothing correction must refuse its forecasts"),
+    }
 }
 
 #[test]
@@ -4293,6 +4474,111 @@ fn per_mark_formulas_give_each_mark_its_own_terms() {
             .err()
             .expect("two formulas for three marks must be refused");
     assert!(refused.to_string().contains("one per mark"), "{refused}");
+}
+
+/// A predictor saved from a fit with covariate terms reloads to the same
+/// forecast of a new history, bit for bit. The history is built here, not taken
+/// from the cohort, and carries its own covariate row, so the covariate schema,
+/// the frozen bases and the posterior the forecast averages over are all read
+/// from the document (#2966).
+#[test]
+fn a_reloaded_predictor_forecasts_a_new_history_to_the_same_bits_2966() {
+    install_test_logger();
+    // Competing risks whose every rate moves with x. The first mark reads x
+    // through a smooth, so the frozen basis carries knots and an identifiability
+    // constraint, and the fit estimates a smoothing strength; the last reads it
+    // linearly.
+    let mut cohort = simulate_marked_cohort(
+        120,
+        4.0,
+        &[-1.4, -2.0, -0.6],
+        0.5,
+        &[0.0, 0.0, 0.0],
+        1.0,
+        &[MarkKind::Terminal, MarkKind::Terminal, MarkKind::Recurrent],
+        66,
+    );
+    let fit = fit_event_history_formulas(
+        &mut cohort,
+        &["s(x)", "1", "x"],
+        BlockwiseFitOptions::default(),
+        None,
+    )
+    .expect("fit with a smooth and a linear covariate term");
+    let predictor = EventHistoryPredictor::from_fit(&fit, &cohort).expect("predictor");
+    let reloaded = EventHistoryPredictor::from_json(&predictor.to_json().expect("saved document"))
+        .expect("reloaded predictor");
+    let history = SubjectHistory {
+        id: "new".to_string(),
+        entry: 0.0,
+        exit: 2.5,
+        events: vec![Event { time: 0.8, mark: 2 }, Event { time: 1.9, mark: 2 }],
+        segments: vec![CovariateSegment { start: 0.0, row: 0 }],
+    };
+    let horizons = [3.0, 3.5];
+    let run = |predictor: &EventHistoryPredictor, x: f64| {
+        let row = Array2::from_elem((1, 1), x);
+        forecast_history(
+            predictor,
+            &HistoryForecastRequest {
+                history: &history,
+                covariates: row.view(),
+                horizons: &horizons,
+                future: &[],
+                stratum: 0,
+            },
+        )
+        .expect("forecast of a new history")
+    };
+    let bits = |forecast: &crate::forecast::Forecast| -> Vec<u64> {
+        forecast
+            .survival
+            .iter()
+            .chain(forecast.expected_counts.iter())
+            .chain(forecast.survival_error.iter())
+            .chain(forecast.expected_count_errors.iter())
+            .map(|v| v.to_bits())
+            .chain(std::iter::once(forecast.posterior_evaluations as u64))
+            .collect()
+    };
+    let in_memory = run(&predictor, 0.7);
+    assert!(
+        in_memory.posterior_evaluations > 1,
+        "[2966 B1] the new-history forecast averaged {} posterior states",
+        in_memory.posterior_evaluations
+    );
+    let from_document = run(&reloaded, 0.7);
+    assert_eq!(
+        bits(&from_document),
+        bits(&in_memory),
+        "[2966 B2] the reloaded predictor forecast the new history to different bits"
+    );
+    // The reloaded predictor reads the covariate through its frozen basis: a
+    // different x moves the forecast beyond both checked errors.
+    let shifted = run(&reloaded, -0.7);
+    let beyond = from_document
+        .survival
+        .iter()
+        .zip(&shifted.survival)
+        .zip(from_document.survival_error.iter().zip(&shifted.survival_error))
+        .chain(
+            from_document
+                .expected_counts
+                .iter()
+                .zip(shifted.expected_counts.iter())
+                .zip(
+                    from_document
+                        .expected_count_errors
+                        .iter()
+                        .zip(shifted.expected_count_errors.iter()),
+                ),
+        )
+        .map(|((a, b), (ea, eb))| (a - b).abs() - (ea + eb))
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        beyond > 0.0,
+        "[2966 B3] x = ±0.7 left the reloaded forecast within its checked errors: largest excess {beyond}"
+    );
 }
 
 /// Independent continuous-time solution: invert the lognormal Laplace
@@ -4829,479 +5115,4 @@ fn reference_midpoint_derivative_channels_converge_with_the_value_2627() {
         }
         assert!(moves, "no log normaliser moves along the {name} by more than its bar, so the agreement is vacuous");
     }
-}
-
-/// One latent atom injected into a rank-zero fit: loadings `a_d` per mark and
-/// dimensionless rate `nu` (zero for a static factor). The rank is the number
-/// of rates, so the forecast runs the latent filter. Every parameter it reads
-/// is then known exactly, which is what lets an independent quadrature of the
-/// same model serve as its oracle.
-fn inject_one_atom(fit: &mut EventHistoryFit, loadings: [f64; 3], nu: f64) {
-    fit.loadings = Array2::from_shape_vec((3, 1), loadings.to_vec()).expect("one column of loadings");
-    fit.log_rates = vec![nu.ln()];
-    assert_eq!(fit.rank(), 1);
-}
-
-/// The constant-hazard fixture fitted under Gauss-Hermite order `order`. At
-/// rank zero the rule integrates nothing, so the fitted rates are the same at
-/// every order, and an atom injected afterwards is forecast under that rule.
-fn constant_hazard_fit_at(order: usize) -> (EventHistoryCohort, EventHistoryFit, Vec<f64>) {
-    let mut cohort = competing_risks_cohort(64);
-    let mut spec = EventHistorySpec::new(vec![intercept_only_spec()]);
-    spec.gauss_hermite_order = order;
-    let fit = fit_event_history(&mut cohort, &spec).expect("intercept-only fit");
-    assert_eq!(fit.rank(), 0, "the constant-hazard fixture must be rank zero: {:?}", fit.rank_path);
-    assert_eq!(fit.family.gauss_hermite_order(), order, "the fit left Gauss-Hermite order {order}");
-    let rates = (0..3).map(|d| fit.mark_coefficients(d)[0].exp()).collect();
-    (cohort, fit, rates)
-}
-
-/// `λ_d(z) = exp(η⁰_d − a_d²/2 + a_d z)`: the prior-centred intensity.
-fn one_atom_intensity(rates: &[f64], loadings: &[f64; 3], d: usize, z: f64) -> f64 {
-    rates[d] * (loadings[d] * z - 0.5 * loadings[d] * loadings[d]).exp()
-}
-
-/// The static one-atom model's survival, terminal incidences and recurrent
-/// count `h` after a history, by the trapezoid rule over the factor with
-/// spacing `step`. The history is `events` (the marks of its events) over a
-/// follow-up of `follow_up` with every mark at risk, as for a censored subject
-/// under constant hazards; no events and no follow-up is the stationary prior.
-/// It weighs the prior into the posterior
-/// `φ(z) Π_e λ_{m_e}(z) exp(−Σ_d λ_d(z) T)`, and the forecast integrands are
-/// averaged under that posterior.
-///
-/// Returns the values, their rounding and the mass the rule leaves outside
-/// its range. The rule's own error is MEASURED by the caller's step-halving
-/// gap: the trapezoid rule converges spectrally for an analytic integrand under
-/// a Gaussian.
-/// - Rounding: each value is a quotient of two serial sums. Its first-order
-///   running bound is `ε |v| (μ_N/|N| + μ_D/|D| + 1)`, with `μ` the magnitude of
-///   every partial sum (Higham, *Accuracy and Stability*, ch. 3) and one more
-///   rounding for the division. A term's own rounding is a few operations
-///   relative to itself, dominated by the partial sums' over thousands of
-///   terms.
-/// - Range: `ln` of the posterior weight is at most `−z²/2 + A z + C`, with
-///   `A = Σ_e a_{m_e}` and `C = Σ_e (ln r_{m_e} − a_{m_e}²/2)`, dropping the
-///   compensator. The survival and terminal integrands are at most one, and the
-///   recurrent one at most `λ_2 h`, so each is at most `B e^{b z}`. Beyond
-///   `|z| > R` the weighted integrand's mass is then at most
-///   `2 B e^{C − peak + s²/2 − (R − |s|)²/2} / (R − |s|)` with `s = A + b`
-///   (Mills' ratio), and the range is `R = 12 + |A| + |a_2|`.
-fn static_factor_oracle(
-    rates: &[f64],
-    loadings: &[f64; 3],
-    events: &[usize],
-    follow_up: f64,
-    h: f64,
-    step: f64,
-) -> ([f64; 4], [f64; 4], [f64; 4]) {
-    let tilt: f64 = events.iter().map(|&m| loadings[m]).sum();
-    let offset: f64 = events
-        .iter()
-        .map(|&m| rates[m].ln() - 0.5 * loadings[m] * loadings[m])
-        .sum();
-    let reach = 12.0 + tilt.abs() + loadings[2].abs();
-    let n = (2.0 * reach / step).round() as usize;
-    let log_weight = |z: f64| -> f64 {
-        let mut value = -0.5 * z * z;
-        for &m in events {
-            value += one_atom_intensity(rates, loadings, m, z).ln();
-        }
-        for d in 0..3 {
-            value -= one_atom_intensity(rates, loadings, d, z) * follow_up;
-        }
-        value
-    };
-    let peak = (0..=n)
-        .map(|j| log_weight(-reach + step * j as f64))
-        .fold(f64::NEG_INFINITY, f64::max);
-    let (mut denominator, mut denominator_bound) = (0.0_f64, 0.0_f64);
-    let mut numerators = [0.0_f64; 4];
-    let mut numerator_bounds = [0.0_f64; 4];
-    for j in 0..=n {
-        let z = -reach + step * j as f64;
-        let ends = if j == 0 || j == n { 0.5 } else { 1.0 };
-        let weight = ends * step * (log_weight(z) - peak).exp();
-        let lambda: Vec<f64> = (0..3).map(|d| one_atom_intensity(rates, loadings, d, z)).collect();
-        let killing = lambda[0] + lambda[1];
-        let decrement = -(-killing * h).exp_m1();
-        let ratios = [
-            (-killing * h).exp(),
-            lambda[0] / killing * decrement,
-            lambda[1] / killing * decrement,
-            lambda[2] / killing * decrement,
-        ];
-        denominator += weight;
-        denominator_bound += denominator.abs();
-        for q in 0..4 {
-            numerators[q] += weight * ratios[q];
-            numerator_bounds[q] += numerators[q].abs();
-        }
-    }
-    let outside = |scale: f64, slope: f64| -> f64 {
-        let s = tilt + slope;
-        let margin = reach - s.abs();
-        2.0 * scale * (offset - peak + 0.5 * s * s - 0.5 * margin * margin).exp() / margin
-    };
-    let recurrent_scale = h * rates[2] * (-0.5 * loadings[2] * loadings[2]).exp();
-    let denominator_tail = outside(1.0, 0.0);
-    let mut values = [0.0; 4];
-    let mut rounding = [0.0; 4];
-    let mut tails = [0.0; 4];
-    for q in 0..4 {
-        values[q] = numerators[q] / denominator;
-        rounding[q] = f64::EPSILON
-            * values[q].abs()
-            * (numerator_bounds[q] / numerators[q].abs() + denominator_bound / denominator.abs() + 1.0);
-        let numerator_tail = if q == 3 { outside(recurrent_scale, loadings[2]) } else { outside(1.0, 0.0) };
-        tails[q] = numerator_tail / denominator + values[q].abs() * denominator_tail / denominator;
-    }
-    (values, rounding, tails)
-}
-
-/// The static one-atom oracle's value and error: its value at spacing `step`,
-/// with the step-halving gap from `2 · step` (MEASURED), both values' rounding
-/// and both ranges' outside mass.
-fn static_factor_reference(
-    rates: &[f64],
-    loadings: &[f64; 3],
-    events: &[usize],
-    follow_up: f64,
-    h: f64,
-    step: f64,
-) -> ([f64; 4], [f64; 4]) {
-    let (coarse, coarse_rounding, coarse_tail) = static_factor_oracle(rates, loadings, events, follow_up, h, 2.0 * step);
-    let (value, rounding, tail) = static_factor_oracle(rates, loadings, events, follow_up, h, step);
-    let mut error = [0.0; 4];
-    for q in 0..4 {
-        error[q] = (coarse[q] - value[q]).abs() + coarse_rounding[q] + rounding[q] + coarse_tail[q] + tail[q];
-    }
-    (value, error)
-}
-
-/// The dynamic one-atom model from its stationary prior over `[0, h]`, by a
-/// route independent of the filter. The density relative to the standard
-/// normal is represented on the orthonormal Hermite basis of degree below
-/// `order`, where the Ornstein–Uhlenbeck transition is exactly diagonal
-/// (`e^{−nκ}`). The killing acts at the Gauss–Hermite nodes by Strang
-/// splitting over equal steps, and the sub-densities are summed by the
-/// trapezoid rule on those steps. Both are second order, so one Richardson step
-/// between `steps` and `2·steps` leaves a fourth-order value.
-fn spectral_oracle(
-    rates: &[f64],
-    loadings: &[f64; 3],
-    kappa_per_time: f64,
-    h: f64,
-    order: usize,
-    steps: usize,
-) -> [f64; 4] {
-    let rule = gam_math::quadrature::gauss_hermite_rule(order).expect("Gauss-Hermite rule");
-    let z: Vec<f64> = rule.nodes.iter().map(|x| std::f64::consts::SQRT_2 * x).collect();
-    let v: Vec<f64> = rule.weights.iter().map(|w| w / std::f64::consts::PI.sqrt()).collect();
-    // basis[n][i] = ψ_n(z_i), with ψ_{n+1} = (z ψ_n − √n ψ_{n−1}) / √(n+1).
-    let mut basis = vec![vec![0.0; order]; order];
-    for i in 0..order {
-        basis[0][i] = 1.0;
-        basis[1][i] = z[i];
-        for n in 1..order - 1 {
-            basis[n + 1][i] = (z[i] * basis[n][i] - (n as f64).sqrt() * basis[n - 1][i]) / ((n + 1) as f64).sqrt();
-        }
-    }
-    let lambda: Vec<Vec<f64>> = (0..3)
-        .map(|d| z.iter().map(|&zi| one_atom_intensity(rates, loadings, d, zi)).collect())
-        .collect();
-    let densities = |p: &[f64]| -> [f64; 3] {
-        let mut m = [0.0; 3];
-        for d in 0..3 {
-            m[d] = (0..order).map(|i| v[i] * p[i] * lambda[d][i]).sum();
-        }
-        m
-    };
-    let run = |steps: usize| -> [f64; 4] {
-        let dt = h / steps as f64;
-        let half_kill: Vec<f64> = (0..order).map(|i| (-(lambda[0][i] + lambda[1][i]) * 0.5 * dt).exp()).collect();
-        let decay: Vec<f64> = (0..order).map(|n| (-(n as f64) * kappa_per_time * dt).exp()).collect();
-        let mut p = vec![1.0; order];
-        let mut counts = [0.0; 3];
-        let mut previous = densities(&p);
-        for _ in 0..steps {
-            for i in 0..order {
-                p[i] *= half_kill[i];
-            }
-            let coefficients: Vec<f64> = (0..order)
-                .map(|n| (0..order).map(|i| v[i] * p[i] * basis[n][i]).sum::<f64>() * decay[n])
-                .collect();
-            for i in 0..order {
-                p[i] = (0..order).map(|n| coefficients[n] * basis[n][i]).sum::<f64>() * half_kill[i];
-            }
-            let current = densities(&p);
-            for d in 0..3 {
-                counts[d] += 0.5 * dt * (previous[d] + current[d]);
-            }
-            previous = current;
-        }
-        [(0..order).map(|i| v[i] * p[i]).sum(), counts[0], counts[1], counts[2]]
-    };
-    let coarse = run(steps);
-    let fine = run(2 * steps);
-    let mut value = [0.0; 4];
-    for q in 0..4 {
-        value[q] = (4.0 * fine[q] - coarse[q]) / 3.0;
-    }
-    value
-}
-
-/// The dynamic one-atom oracle's value and error: its value at (56 basis
-/// functions, 800 steps), with the error MEASURED as its change across three
-/// resolutions, both consecutive changes summed. At these resolutions both sit
-/// at the oracle's rounding floor (probe 1230171: 3.8e-14, then 6.3e-14), so
-/// the finer one being the closer is not assumed.
-fn spectral_reference(rates: &[f64], loadings: &[f64; 3], kappa_per_time: f64, h: f64) -> ([f64; 4], [f64; 4]) {
-    let coarse = spectral_oracle(rates, loadings, kappa_per_time, h, 40, 400);
-    let value = spectral_oracle(rates, loadings, kappa_per_time, h, 56, 800);
-    let fine = spectral_oracle(rates, loadings, kappa_per_time, h, 72, 1600);
-    let mut error = [0.0; 4];
-    for q in 0..4 {
-        error[q] = (coarse[q] - value[q]).abs() + (value[q] - fine[q]).abs();
-    }
-    (value, error)
-}
-
-/// A forecast's survival and three expected counts at horizon `i`, and their
-/// checked errors.
-fn forecast_quantities(f: &super::forecast::Forecast, i: usize) -> ([f64; 4], [f64; 4]) {
-    (
-        [f.survival[i], f.expected_counts[[i, 0]], f.expected_counts[[i, 1]], f.expected_counts[[i, 2]]],
-        [
-            f.survival_error[i],
-            f.expected_count_errors[[i, 0]],
-            f.expected_count_errors[[i, 1]],
-            f.expected_count_errors[[i, 2]],
-        ],
-    )
-}
-
-/// The rank-zero model's survival and three expected counts `h` into a window
-/// at the fitted constant rates: `e^{−Λh}` and `(r_d/Λ)(1 − e^{−Λh})`, with `Λ`
-/// the terminal marks' total rate.
-fn rank_zero_quantities(rates: &[f64], h: f64) -> [f64; 4] {
-    let total = rates[0] + rates[1];
-    let decrement = -(-total * h).exp_m1();
-    [
-        (-total * h).exp(),
-        rates[0] / total * decrement,
-        rates[1] / total * decrement,
-        rates[2] / total * decrement,
-    ]
-}
-
-/// The magnitude floor of a one-atom agreement: for every quantity, the latent
-/// factor moves the oracle from the rank-zero model by more than the checked
-/// error and the oracle's error together. Agreement with the oracle within that
-/// error is then not agreement with the rank-zero model, and an error inflated
-/// past the factor's own effect fails here.
-fn assert_the_factor_is_resolved(label: &str, h: f64, rates: &[f64], errors: [f64; 4], oracle: [f64; 4], oracle_error: [f64; 4]) {
-    let rank_zero = rank_zero_quantities(rates, h);
-    emit(&format!("[2963 {label}] h {h:.4}: rank-zero model {rank_zero:?}"));
-    for q in 0..4 {
-        assert!(
-            (oracle[q] - rank_zero[q]).abs() > errors[q] + oracle_error[q],
-            "{label}: quantity {q} at h {h}: the factor moves it from {} to {} only, within the checked error {} + oracle error {}",
-            rank_zero[q],
-            oracle[q],
-            errors[q],
-            oracle_error[q]
-        );
-    }
-}
-
-/// Assert that a one-atom forecast is covered by its checked error against an
-/// oracle, above the magnitude floor of [`assert_the_factor_is_resolved`].
-fn assert_covered(label: &str, f: &super::forecast::Forecast, i: usize, h: f64, rates: &[f64], oracle: [f64; 4], oracle_error: [f64; 4]) {
-    let (forecast, errors) = forecast_quantities(f, i);
-    emit(&format!("[2963 {label}] h {h:.4}: forecast {forecast:?} errors {errors:?} oracle {oracle:?} oracle error {oracle_error:?}"));
-    assert_the_factor_is_resolved(label, h, rates, errors, oracle, oracle_error);
-    for q in 0..4 {
-        assert!(
-            (forecast[q] - oracle[q]).abs() <= errors[q] + oracle_error[q],
-            "{label}: quantity {q} at h {h}: forecast {} vs oracle {}, checked error {} + oracle error {}",
-            forecast[q],
-            oracle[q],
-            errors[q],
-            oracle_error[q]
-        );
-    }
-}
-
-#[test]
-fn a_static_factor_forecast_is_covered_by_its_reported_error() {
-    install_test_logger();
-    let loadings = [0.8, -0.5, 0.6];
-    let (cohort, mut fit, rates) = constant_hazard_fit();
-    inject_one_atom(&mut fit, loadings, 0.0);
-    let total = rates[0] + rates[1];
-    let horizons = [2.0 / total, 10.0 / total];
-    let f = constant_hazard_population(&fit, &cohort, &horizons);
-    for (i, &h) in horizons.iter().enumerate() {
-        let (oracle, oracle_error) = static_factor_reference(&rates, &loadings, &[], 0.0, h, 0.005);
-        assert_covered("static", &f, i, h, &rates, oracle, oracle_error);
-    }
-}
-
-#[test]
-fn a_dynamic_factor_forecast_is_covered_by_its_reported_error() {
-    install_test_logger();
-    let loadings = [0.8, -0.5, 0.6];
-    let (cohort, mut fit, rates) = constant_hazard_fit();
-    let total = rates[0] + rates[1];
-    let horizons = [2.0 / total, 10.0 / total];
-    // The factor decorrelates about three times over the window.
-    let kappa_per_time = 3.0 / horizons[1];
-    let nu = kappa_per_time * fit.time_scale;
-    inject_one_atom(&mut fit, loadings, nu);
-    let f = constant_hazard_population(&fit, &cohort, &horizons);
-    for (i, &h) in horizons.iter().enumerate() {
-        let (oracle, oracle_error) = spectral_reference(&rates, &loadings, kappa_per_time, h);
-        assert_covered("dynamic", &f, i, h, &rates, oracle, oracle_error);
-    }
-}
-
-/// The forecast opens at the state a history implies, not at the prior, so
-/// the error it reports must cover what filtering that history contributed.
-/// A censored subject with events, under a static factor: its posterior is
-/// the oracle's, and the window after its exit is covered as the prior's is.
-#[test]
-fn a_history_conditioned_static_factor_forecast_is_covered_by_its_reported_error() {
-    install_test_logger();
-    let loadings = [0.8, -0.5, 0.6];
-    let (cohort, mut fit, rates) = constant_hazard_fit();
-    inject_one_atom(&mut fit, loadings, 0.0);
-    let total = rates[0] + rates[1];
-    let subject = cohort
-        .subjects
-        .iter()
-        .find(|s| s.terminal_event(&cohort.mark_kinds).is_none() && !s.events.is_empty())
-        .expect("a censored subject with events");
-    let marks: Vec<usize> = subject.events.iter().map(|event| event.mark).collect();
-    let offsets = [2.0 / total, 10.0 / total];
-    let horizons: Vec<f64> = offsets.iter().map(|offset| subject.exit + offset).collect();
-    let f = forecast(
-        &fit,
-        &cohort,
-        &ForecastRequest {
-            history: subject,
-            horizons: &horizons,
-            future: &[],
-            stratum: 0,
-        },
-    )
-    .expect("forecast from a history");
-    emit(&format!(
-        "[2963 history static] subject {} follow-up {} events {marks:?}",
-        subject.id,
-        subject.exit - subject.entry
-    ));
-    for (i, &offset) in offsets.iter().enumerate() {
-        let (oracle, oracle_error) =
-            static_factor_reference(&rates, &loadings, &marks, subject.exit - subject.entry, offset, 0.005);
-        assert_covered("history static", &f, i, offset, &rates, oracle, oracle_error);
-    }
-}
-
-/// A forecast's roundoff and latent error are its own rule's, so a finer
-/// Gauss-Hermite rule gives a forecast at least as good and says so. The same
-/// one-atom window under orders 9 and 17:
-/// - the order-17 forecast lies within the order-9 forecast's checked error
-///   of the oracle, as a forecast under the more accurate rule must (the
-///   premise the latent check rests on), above the order-9 forecast's
-///   magnitude floor; and
-/// - when `resolves`, the order-17 checked error resolves the change from
-///   order 9.
-///
-/// For a static factor the first arm is that premise as a measurement
-/// precondition: no defect-state control moves it, since the order-17 static
-/// forecast was 5.0e-10 from the oracle on the pre-fix code too (probe
-/// 1230171). It prints before it asserts. For a dynamic factor it is the arm
-/// the pre-fix code's stalled mesh fires.
-fn assert_the_finer_rule_is_within_the_coarser_ones_error(label: &str, dynamic: bool, resolves: bool) {
-    let loadings = [0.8, -0.5, 0.6];
-    let mut at_order = Vec::new();
-    for order in [9, 17] {
-        let (cohort, mut fit, rates) = constant_hazard_fit_at(order);
-        let total = rates[0] + rates[1];
-        let horizons = [2.0 / total, 10.0 / total];
-        let kappa_per_time = if dynamic { 3.0 / horizons[1] } else { 0.0 };
-        let nu = kappa_per_time * fit.time_scale;
-        inject_one_atom(&mut fit, loadings, nu);
-        let f = constant_hazard_population(&fit, &cohort, &horizons);
-        at_order.push((f, rates, horizons, kappa_per_time));
-    }
-    let (coarse, rates, horizons, kappa_per_time) = &at_order[0];
-    let fine = &at_order[1].0;
-    for (i, &h) in horizons.iter().enumerate() {
-        let (oracle, oracle_error) = if dynamic {
-            spectral_reference(rates, &loadings, *kappa_per_time, h)
-        } else {
-            static_factor_reference(rates, &loadings, &[], 0.0, h, 0.005)
-        };
-        let (v9, e9) = forecast_quantities(coarse, i);
-        let (v17, e17) = forecast_quantities(fine, i);
-        for q in 0..4 {
-            emit(&format!(
-                "[2963 orders {label}] h {h:.4} quantity {q}: G9 {:.15} checked {:.3e} |G9−oracle| {:.3e} | G17 {:.15} checked {:.3e} |G17−oracle| {:.3e} | |G9−G17| {:.3e} | oracle error {:.3e}",
-                v9[q],
-                e9[q],
-                (v9[q] - oracle[q]).abs(),
-                v17[q],
-                e17[q],
-                (v17[q] - oracle[q]).abs(),
-                (v9[q] - v17[q]).abs(),
-                oracle_error[q]
-            ));
-        }
-        assert_the_factor_is_resolved(&format!("orders {label}"), h, rates, e9, oracle, oracle_error);
-        for q in 0..4 {
-            assert!(
-                (v17[q] - oracle[q]).abs() <= e9[q] + oracle_error[q],
-                "{label}: quantity {q} at h {h}: the order-17 forecast {} is {} from the oracle {}, outside the order-9 checked error {} + oracle error {}",
-                v17[q],
-                (v17[q] - oracle[q]).abs(),
-                oracle[q],
-                e9[q],
-                oracle_error[q]
-            );
-            if resolves {
-                assert!(
-                    e17[q] < (v9[q] - v17[q]).abs(),
-                    "{label}: quantity {q} at h {h}: the order-17 checked error {} does not resolve the change {} from order 9",
-                    e17[q],
-                    (v9[q] - v17[q]).abs()
-                );
-            }
-        }
-    }
-}
-
-/// A static factor's filter interpolates nothing, so its checked error at
-/// order 17 is that rule's own and resolves the change from order 9. Probe
-/// 1230171 measured the defect this pins: the order-17 window charged every
-/// value the roundoff of order 33's interpolant, 4.1e-5 on a survival of 0.17,
-/// above the whole order-9 error (3.7e-6).
-#[test]
-fn a_finer_rule_resolves_a_static_factor_forecasts_change_from_the_coarser_one() {
-    install_test_logger();
-    assert_the_finer_rule_is_within_the_coarser_ones_error("static", false, true);
-}
-
-/// A dynamic factor's order-17 forecast stays within the order-9 checked
-/// error of the oracle. Probe 1230171 measured the defect this pins: charged
-/// order 33's roundoff floor, the order-17 window stopped refining its mesh
-/// while time dominated, 5.1e-6 from the oracle where order 9 was 4.4e-8. Its
-/// own checked error is not asserted to resolve the change: the dynamic
-/// filter's roundoff is charged at order 17's Lebesgue constant, as the fit's
-/// certificate charges it, and that model is the certificate's question.
-#[test]
-fn a_finer_rule_keeps_a_dynamic_factor_forecast_within_the_coarser_ones_error() {
-    install_test_logger();
-    assert_the_finer_rule_is_within_the_coarser_ones_error("dynamic", true, false);
 }

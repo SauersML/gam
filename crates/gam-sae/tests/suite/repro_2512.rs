@@ -36,8 +36,9 @@ fn noise_stream(seed: u64) -> impl FnMut() -> f64 {
 fn build_k1(
     evaluator: &Arc<PeriodicHarmonicEvaluator>,
     coords: &Array2<f64>,
-    output_dim: usize,
+    target: &Array2<f64>,
 ) -> (SaeManifoldTerm, SaeManifoldRho) {
+    let output_dim = target.ncols();
     let (basis_values, basis_jacobian) = evaluator.evaluate(coords.view()).unwrap();
     let basis_width = basis_values.ncols();
     let atom = SaeManifoldAtom::new_with_provided_function_gram(
@@ -58,8 +59,11 @@ fn build_k1(
         AssignmentMode::softmax(1.0),
     )
     .unwrap();
-    let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+    let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
     let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
+    // #2822 — the data least-squares decoder at the fixture's chart; an entry refuses a zero decoder.
+    term.refit_decoder_least_squares_at_current_state(target.view(), Some(&rho))
+        .expect("the planted circle spans a nonzero least-squares decoder");
     (term, rho)
 }
 
@@ -103,7 +107,7 @@ fn fresh_arrow_schur_joint_fits_are_bit_reproducible_above_61_rows_2512() {
     for basis_width in [5usize, 11usize] {
         let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(basis_width).unwrap());
         let mut fits: Vec<(SaeManifoldTerm, SaeManifoldRho)> = (0..4)
-            .map(|_| build_k1(&evaluator, &coords, output_dim))
+            .map(|_| build_k1(&evaluator, &coords, &target))
             .collect();
         for (term, _) in &fits {
             assert_eq!(

@@ -1,11 +1,13 @@
 #![cfg(test)]
-//! #2946 pins for the GPT-NeoX torch-layout reader: its parameters land in the block's fields, an absent bias is zero,
-//! the output bias reaches every context's block, and every foreign name, approximate or gated activation, missing
-//! weight and mis-shaped array is refused with its typed error.
+//! #2946 pins for the GPT-NeoX and Qwen3 torch-layout readers: their parameters land in the blocks' fields, an absent
+//! bias is zero, the output bias reaches every context's block, the absorbed gated block reproduces the layout's own
+//! forward pass, and every foreign name, approximate or out-of-layout activation, missing weight and mis-shaped array
+//! is refused with its typed error.
 
-use super::{TorchLayoutError, UnabsorbedBlock};
+use super::{TorchLayoutError, UnabsorbedBlock, UnabsorbedGatedBlock};
 use crate::response::context::{ContextBlocks, ContextDeclaredLaw};
 use gam_math::gaussian_activation::{GaussianActivation, GaussianActivationError};
+use gam_math::gaussian_gated::silu_derivatives;
 use ndarray::{Array1, Array2, ArrayD, array};
 use std::collections::BTreeMap;
 
@@ -144,6 +146,117 @@ fn approximate_or_gated_activations_foreign_names_and_mis_shaped_arrays_are_refu
             context: "output metric rows",
             expected: 2,
             got: 1,
+        }),
+    );
+}
+
+/// A Qwen3 MLP with `h = 2` units on `D = 2` inputs, writing `p = 2` outputs: integers and halves.
+fn qwen3_parameters() -> BTreeMap<String, ArrayD<f64>> {
+    parameters(vec![
+        ("gate_proj.weight", array![[1.0, -0.5], [0.5, 1.0]].into_dyn()),
+        ("up_proj.weight", array![[0.0, 1.0], [1.0, 1.0]].into_dyn()),
+        ("down_proj.weight", array![[1.0, -2.0], [0.5, 1.0]].into_dyn()),
+    ])
+}
+
+#[test]
+fn a_qwen3_mlp_reads_into_the_gated_block_and_absorbs_the_declared_law() {
+    let raw = UnabsorbedGatedBlock::from_torch_parameters(qwen3_parameters(), "silu", metric())
+        .expect("a Qwen3 MLP with the SiLU gate");
+    assert_eq!(raw.gate_readers, array![[1.0, -0.5], [0.5, 1.0]]);
+    assert_eq!(raw.up_readers, array![[0.0, 1.0], [1.0, 1.0]]);
+    assert_eq!(raw.writers, array![[1.0, -2.0], [0.5, 1.0]]);
+    assert_eq!(raw.gate_biases, Array1::<f64>::zeros(2), "a Qwen3 MLP holds no biases");
+    assert_eq!(raw.up_biases, Array1::<f64>::zeros(2));
+    assert_eq!(raw.output_bias, Array1::<f64>::zeros(2));
+    assert_eq!(raw.metric, metric());
+
+    // Absorbing h = h₀ + L z and retaining every latent coordinate must reproduce the torch layout's own forward pass
+    // at h₀ + L z. The law and the point are dyadic, so both routes form the same pre-activations exactly, and they
+    // differ only in the order the two output terms are added: within 2γ₂ Σ_j |u_oj t_j|.
+    let baseline = array![0.5, -1.0];
+    let loading = array![[1.0, 0.0], [0.5, 1.0]];
+    let block = raw
+        .absorb(baseline.view(), loading.view())
+        .expect("the absorbed gated block");
+    let latent = array![[0.5, -1.5]];
+    let response = block
+        .retained_response(Array2::<f64>::eye(2).view(), latent.view())
+        .expect("a finite point");
+    let ambient = &baseline + &loading.dot(&latent.row(0));
+    let terms: Array1<f64> = (0..2)
+        .map(|unit| {
+            raw.up_readers.row(unit).dot(&ambient) * silu_derivatives(raw.gate_readers.row(unit).dot(&ambient))[0]
+        })
+        .collect();
+    let executed = raw.writers.dot(&terms);
+    let growth = gam_linalg::roundoff::accumulation_growth(2);
+    for output in 0..2 {
+        let magnitude: f64 = (0..2)
+            .map(|unit| (raw.writers[[output, unit]] * terms[unit]).abs())
+            .sum();
+        let band = 2.0 * growth * magnitude;
+        eprintln!(
+            "#2946 R9 absorbed Qwen3 output {output}: operator {} torch layout {} band {band:e} quadrature {}",
+            response.values[[0, output]],
+            executed[output],
+            response.quadrature_band[[0, output]],
+        );
+        assert_eq!(response.quadrature_band[[0, output]], 0.0, "retaining every coordinate smooths nothing");
+        assert!((response.values[[0, output]] - executed[output]).abs() <= band);
+    }
+}
+
+#[test]
+fn a_qwen3_reader_refuses_a_dense_activation_foreign_names_and_mis_shaped_projections() {
+    for tag in ["gelu", "relu"] {
+        let refusal = UnabsorbedGatedBlock::from_torch_parameters(qwen3_parameters(), tag, metric());
+        assert_eq!(
+            refusal.err(),
+            Some(TorchLayoutError::ActivationOutsideLayout {
+                hidden_act: tag.to_string(),
+            }),
+        );
+    }
+    let mut foreign = qwen3_parameters();
+    foreign.insert("dense_h_to_4h.weight".to_string(), array![[1.0, 0.0]].into_dyn());
+    let refusal = UnabsorbedGatedBlock::from_torch_parameters(foreign, "silu", metric());
+    assert_eq!(
+        refusal.err(),
+        Some(TorchLayoutError::UnexpectedParameter {
+            name: "dense_h_to_4h.weight".to_string(),
+        }),
+    );
+    let mut missing = qwen3_parameters();
+    missing.remove("up_proj.weight");
+    let refusal = UnabsorbedGatedBlock::from_torch_parameters(missing, "silu", metric());
+    assert_eq!(
+        refusal.err(),
+        Some(TorchLayoutError::MissingParameter {
+            name: "up_proj.weight",
+        }),
+    );
+    let mut short = qwen3_parameters();
+    short.insert("up_proj.weight".to_string(), array![[0.0, 1.0]].into_dyn());
+    let refusal = UnabsorbedGatedBlock::from_torch_parameters(short, "silu", metric());
+    assert_eq!(
+        refusal.err(),
+        Some(TorchLayoutError::DimensionMismatch {
+            context: "up_proj.weight rows",
+            expected: 2,
+            got: 1,
+        }),
+    );
+    let mut nonfinite = qwen3_parameters();
+    nonfinite.insert(
+        "down_proj.weight".to_string(),
+        array![[f64::INFINITY, 0.0], [0.0, 1.0]].into_dyn(),
+    );
+    let refusal = UnabsorbedGatedBlock::from_torch_parameters(nonfinite, "silu", metric());
+    assert_eq!(
+        refusal.err(),
+        Some(TorchLayoutError::NonFinite {
+            name: "down_proj.weight".to_string(),
         }),
     );
 }

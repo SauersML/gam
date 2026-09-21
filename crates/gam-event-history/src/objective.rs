@@ -225,24 +225,29 @@ impl EventHistoryFamily {
 
     /// Whether the coefficient derivatives come from the computed path: a
     /// reference law differentiated through its evolution, or a static atom
-    /// integrated on a grid placed by the whole history. The Louis sweep of
-    /// `subject_marginal` covers neither.
+    /// beside a dynamic one. The Louis sweep of `subject_marginal` covers
+    /// all-static atoms, whose nodes share one whole-history grid, and neither
+    /// of those.
     pub(super) fn differentiates_the_computed_path(&self) -> bool {
-        self.atoms > 0 && (self.reference.is_some() || self.held_rates.contains(&Some(0.0)))
+        let any_static = self.held_rates.contains(&Some(0.0));
+        let all_static = self.held_rates.iter().all(|rate| *rate == Some(0.0));
+        self.atoms > 0 && (self.reference.is_some() || (any_static && !all_static))
     }
 }
 
 /// The coefficient-Hessian workspace of a family whose derivatives come from
 /// the computed path, at one state (#2965).
 ///
-/// Every intent, the inner solve included, takes the block sweep's dense
-/// Hessian, which the family caches on the state. The workspace keeps the
-/// trait's dense preference because streaming the inner solve through `H v`
-/// took more inner cycles and more time on this route (#2965). A matrix-free
-/// consumer gets `H v` from [`EventHistoryFamily::hessian_vector_product`],
-/// `⌈p / TANGENT_WIDTH⌉` path evaluations a product. Every representation is
-/// the negative log-likelihood Hessian of the same computed value, the
-/// engine's convention.
+/// Every Hessian source query, the inner solve's Newton direction included,
+/// returns the block sweep's dense Hessian, which the family caches on the
+/// state: the trait's dense preference, kept because streaming the Newton
+/// direction through `H v` took more inner cycles and more time where it was
+/// measured, on static atoms at p = 17 before they took the Louis sweep
+/// (#2965). A consumer that does not query the preference still streams `H v`
+/// from [`EventHistoryFamily::hessian_vector_product`], `⌈p / TANGENT_WIDTH⌉`
+/// path evaluations a product. The outer log-determinant's Jeffreys pre-check
+/// is one such consumer. Every representation is the negative log-likelihood
+/// Hessian of the same computed value, the engine's convention.
 pub(super) struct ComputedHessianWorkspace {
     family: EventHistoryFamily,
     states: Vec<ParameterBlockState>,
@@ -459,6 +464,14 @@ mod tests {
     }
 
     fn recurrent_family(event_time: f64, rates: Vec<Option<f64>>, order: usize) -> (EventHistoryFamily, Vec<ParameterBlockState>) {
+        recurrent_family_on(event_time, rates, order, 9)
+    }
+
+    /// One subject on `[0, 1]` with one recurrent event at `event_time`, each
+    /// of its two cells integrated by `legendre` Gauss-Legendre points.
+    fn recurrent_family_on(
+        event_time: f64, rates: Vec<Option<f64>>, order: usize, legendre: usize,
+    ) -> (EventHistoryFamily, Vec<ParameterBlockState>) {
         let mut cohort = EventHistoryCohort {
             mark_names: vec!["event".to_string()], mark_kinds: vec![MarkKind::Recurrent],
             covariate_names: Vec::new(), covariate_levels: Vec::new(), covariates: Array2::zeros((1, 0)),
@@ -467,7 +480,7 @@ mod tests {
                 segments: vec![CovariateSegment { start: 0.0, row: 0 }] }],
         };
         cohort.validate().unwrap();
-        let nodes = Arc::new(expand_nodes(&cohort, 9, 0).unwrap());
+        let nodes = Arc::new(expand_nodes(&cohort, legendre, 0).unwrap());
         let states = vec![
             ParameterBlockState { beta: array![0.0], eta: Array1::zeros(nodes.total_nodes) },
             ParameterBlockState { beta: array![2.0, 0.0], eta: Array1::zeros(nodes.total_nodes) },
@@ -640,6 +653,150 @@ mod tests {
         }
     }
 
+    /// A rounding bound carries a value, never a direction, so it seeds only
+    /// the undirected evaluation.
+    impl Directional for crate::test_support::Bound {
+        fn seeded(value: f64, u: f64, v: f64) -> Self {
+            assert!(u == 0.0 && v == 0.0, "a rounding bound carries no direction");
+            Self::exact(value)
+        }
+        fn eps(&self) -> f64 {
+            0.0
+        }
+        fn eps_del(&self) -> f64 {
+            0.0
+        }
+    }
+
+    /// The Louis Hessian against the block sweep of one fixture at Gauss-Hermite
+    /// orders 9, 17 and 33, entry by entry (#2965). The Louis Hessian
+    /// approximates the exact marginal's curvature, and the block sweep
+    /// differentiates the computed value, grid placement included. Both tend to
+    /// the exact marginal's curvature as the Gauss-Hermite order resolves, so at
+    /// order 17 they differ by at most the two routes' quadrature errors there
+    /// plus their rounding.
+    ///
+    /// Both routes run at `Bound`: a computed value `v_n` at order `n` is within
+    /// `r_n = ε μ_n` of its exact-arithmetic result, with test_support's `exp`
+    /// and `ln` charges cited from the runtime libm. The design entries, the
+    /// held rates and the rule's nodes and weights are the same data in all six
+    /// evaluations, so they enter exactly: both routes place each order's grids
+    /// through the one `marginal::filter_nodes` (static atoms through
+    /// `static_state::filter`, whose `posterior_grid` calls `Grid::new`), so
+    /// both read identical positions such as `σ · fl(√2 x)`, and those positions
+    /// are the rule both evaluate. A static placement's mode is searched on
+    /// values and enters as a rounded constant, so only the Newton steps that
+    /// carry its channels are charged. Per route and entry the exact
+    /// refinement steps satisfy `d1 ≥ |v9 − v17| − r9 − r17` and
+    /// `d2 ≤ |v17 − v33| + r17 + r33`. With `d1` resolved above zero, and under
+    /// geometric convergence past order 33 at a ratio below
+    /// `q = max d2 / min d1 < 1`, the order-17 error is at most
+    /// `max d2 / (1 − q)`. The bar is the two routes' errors plus each route's
+    /// own `r17`. The order-9 comparison is printed with its bar, which adds each
+    /// route's first step, but not asserted: the first steps are the order-9
+    /// gap itself. An unresolved or growing step gives no estimate, and every
+    /// compared entry must be material against its bar. Every order's signed
+    /// values are printed before anything is asserted.
+    fn louis_matches_the_block_sweep_2965(
+        label: &str, fixture: impl Fn(usize) -> (EventHistoryFamily, Vec<ParameterBlockState>),
+    ) {
+        use crate::test_support::Bound;
+        struct Refinement {
+            first: f64,
+            second: f64,
+            resolved: f64,
+            ratio: f64,
+            error: f64,
+        }
+        let refinement = |values: &[Vec<Bound>], k: usize| -> Refinement {
+            let (v9, v17, v33) = (&values[0][k], &values[1][k], &values[2][k]);
+            let first = (v9.value - v17.value).abs();
+            let second = (v17.value - v33.value).abs();
+            let resolved = first - v9.rounding() - v17.rounding();
+            let second_upper = second + v17.rounding() + v33.rounding();
+            let ratio = second_upper / resolved;
+            Refinement { first, second, resolved, ratio, error: second_upper / (1.0 - ratio) }
+        };
+        let orders = [9, 17, 33];
+        let mut louis = Vec::new();
+        let mut computed = Vec::new();
+        for order in orders {
+            let (family, states) = fixture(order);
+            assert!(!family.differentiates_the_computed_path(), "{label}: the fixture takes the Louis sweep");
+            let (_, _, sweep) = family.evaluate_generic::<Bound>(&states, None, None, true).unwrap();
+            let (_, _, block) = family.computed_joint::<Bound>(&states, None, None, true).unwrap();
+            louis.push(sweep);
+            computed.push(block);
+        }
+        let entries: Vec<_> = (0..louis[0].len()).map(|k| {
+            let routes = [("Louis", refinement(&louis, k)), ("block", refinement(&computed, k))];
+            let rounding = louis[1][k].rounding() + computed[1][k].rounding();
+            let bar = routes[0].1.error + routes[1].1.error + rounding;
+            let gap = (louis[1][k].value - computed[1][k].value).abs();
+            (routes, rounding, bar, gap)
+        }).collect();
+        for (k, (routes, rounding, bar, gap)) in entries.iter().enumerate() {
+            for (n, order) in orders.iter().enumerate() {
+                eprintln!(
+                    "{label} entry {k} order {order}: louis {:e} block {:e} louis - block {:e} rounding [{:e}, {:e}]",
+                    louis[n][k].value, computed[n][k].value, louis[n][k].value - computed[n][k].value,
+                    louis[n][k].rounding(), computed[n][k].rounding()
+                );
+            }
+            let coarse_bar = bar + routes.iter().map(|(_, step)| step.first).sum::<f64>()
+                + louis[0][k].rounding() + computed[0][k].rounding();
+            let coarse_gap = (louis[0][k].value - computed[0][k].value).abs();
+            eprintln!("{label} entry {k}: order 17 gap {gap:e} bar {bar:e} rounding {rounding:e}; order 9 gap {coarse_gap:e} bar {coarse_bar:e}");
+            for (route, step) in routes {
+                eprintln!(
+                    "{label} entry {k} {route}: steps [{:e}, {:e}] resolved {:e} ratio {:e} error {:e}",
+                    step.first, step.second, step.resolved, step.ratio, step.error
+                );
+            }
+        }
+        for (k, (routes, _, bar, gap)) in entries.iter().enumerate() {
+            for (route, step) in routes {
+                assert!(step.resolved > 0.0, "{label} entry {k}: the {route} step {:e} from order 9 is not resolved above rounding", step.first);
+                assert!(step.ratio < 1.0, "{label} entry {k}: the {route} refinement step did not shrink ({:e} then {:e})", step.first, step.second);
+            }
+            assert!(computed[1][k].value.abs() > *bar, "{label} entry {k} is not material against its bar {bar:e}");
+            assert!(gap <= bar, "{label} entry {k}: Louis {} against the block sweep {} at order 17 differs by {gap:e}, above its refinement bar {bar:e}",
+                louis[1][k].value, computed[1][k].value);
+        }
+    }
+
+    /// All-static atoms take the Louis sweep (#2965): every node shares one
+    /// whole-history grid, so the carried score is never moved.
+    ///
+    /// The fixture's size is set by `Bound`'s growth, fixed before any run at
+    /// it. Conditioning a node, `α_n = α_{n−1} L_n / Σ α_{n−1} L_n`, charges the
+    /// numerator and the normalising sum apart where the error they share
+    /// cancels, so the first-order bound doubles at every node while the
+    /// quotient's actual error grows about linearly: job 1250857
+    /// measured a node normaliser's bound at 4.5e-13, 1.1e-12, 2.25e-12,
+    /// 4.8e-12 and 9.8e-12 over five nodes. That is the tracker's looseness,
+    /// not either route's error. At the nineteen nodes of nine Legendre points a
+    /// cell, the block route's bound (1.7e-5 at entry 0, job 1250136) exceeded
+    /// its first refinement step (3.4e-6). The subject here has seven nodes,
+    /// three points in each of its two cells and the event, which puts the
+    /// bound about `2^12` lower. The node count is printed. The hazards are
+    /// constant in time, so either rule integrates them exactly and the node
+    /// count moves only the rounding chain, not the compared entries: at order
+    /// 9 the Louis entry 0 is −0.30562673725264494 at seven nodes and
+    /// −0.3056267372526445 at nineteen.
+    #[test]
+    fn all_static_atoms_take_the_louis_sweep_within_the_quadrature_refinement_2965() {
+        let (mixed, _) = recurrent_family(0.5, vec![Some(0.0), Some(0.7)], 9);
+        assert!(mixed.differentiates_the_computed_path(), "a static atom beside a dynamic one keeps the computed path");
+        let fixture = |order| {
+            let (family, mut states) = recurrent_family_on(0.5, vec![Some(0.0), Some(0.0)], order, 3);
+            states[1].beta = array![1.2, 0.6];
+            (family, states)
+        };
+        eprintln!("all static: {} nodes", fixture(9).0.nodes.total_nodes);
+        louis_matches_the_block_sweep_2965("all static", fixture);
+    }
+
     /// Four subjects on one once-only mark, a reference law on 24 equal steps,
     /// `columns` cosine time columns in the mark block, and a near-static held
     /// atom: a reference-centred fixture of any width.
@@ -788,6 +945,7 @@ mod tests {
     /// break an equality.
     #[test]
     fn the_computed_workspace_streams_the_block_sweep_curvature_2965() {
+        use gam_model_api::families::custom_family::{JointHessianSourcePreference, MaterializationIntent};
         let (family, states) = wide_reference_family(16);
         let total = family.total_width();
         assert!(family.differentiates_the_computed_path());
@@ -815,5 +973,12 @@ mod tests {
             assert_eq!(evaluation.gradient[q], joint.gradient[q], "gradient [{q}]");
         }
         assert_eq!(evaluation.log_likelihood, joint.log_likelihood);
+        // The Newton direction takes the dense block sweep, the preference
+        // measured faster at p = 17 in job 1219149 (static atom, fixed λ). An
+        // operator preference is measured again before it replaces this one.
+        assert_eq!(
+            workspace.hessian_source_preference_for_intent(MaterializationIntent::InnerSolve),
+            JointHessianSourcePreference::Dense
+        );
     }
 }
