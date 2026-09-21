@@ -552,13 +552,17 @@ fn zz_2691_ard_precision_ladder_collapses_the_chart() {
         let (mut term, _disp) = build_term(z.view(), 1, Topo::Circle, AssignmentMode::softmax(1.0));
         let mut rho =
             SaeManifoldRho::new(1.0e-3_f64.ln(), 1.0e-3_f64.ln(), vec![array![log_ard]; 1]);
-        let fit =
-            term.run_joint_fit_arrow_schur(z.view(), &mut rho, None, 40, 1.0, 1.0e-6, 1.0e-6);
-        if let Err(error) = fit {
-            let text = format!("{error}").replace('\n', " ");
-            eprintln!("[2691-ard] {log_ard:.3}\t{:.3e}\tREFUSED: {text}", log_ard.exp());
-            continue;
-        }
+        // Every rung is the same perfectly-recoverable fixture with only α
+        // moved, so a refusal at any rung is a solver defect this ladder must
+        // surface, not a row to drop.
+        term.run_joint_fit_arrow_schur(z.view(), &mut rho, None, 40, 1.0, 1.0e-6, 1.0e-6)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "#2691: the inner joint fit must succeed at every rung of the ARD ladder; \
+                     α={:.3e} (log_ard={log_ard:.3}) refused: {error}",
+                    log_ard.exp()
+                )
+            });
         let ev = term
             .try_fitted()
             .map(|fitted| global_ev(z.view(), fitted.view()))
@@ -593,22 +597,29 @@ fn zz_2691_ard_precision_ladder_collapses_the_chart() {
         rungs.push((log_ard.exp(), circular_variance, wrapped.len()));
     }
     // The mechanism, pinned. Nothing but α moved between these two rungs.
-    if let (Some(low), Some(high)) = (
-        rungs.iter().find(|(alpha, _, _)| *alpha <= 1.0e-3),
-        rungs.iter().find(|(alpha, _, _)| *alpha >= 1.0e9),
-    ) {
-        assert!(
-            low.1 > 0.5,
-            "#2691: at α=1e-3 the chart must still be spread over the circle              (circular variance {:.3e})",
-            low.1
-        );
-        assert!(
-            high.1 < 1.0e-6 && high.2 <= 1,
-            "#2691: raising ONLY the von-Mises coordinate precision to α=1e9 must collapse the              chart to one point — this is the mechanism the guard exists for              (circular variance {:.3e}, {} resolved chart points)",
-            high.1,
-            high.2
-        );
-    }
+    // The anchors are addressed by ladder POSITION: `exp(ln 1e-3)` rounds to
+    // 1.0000000000000002e-3 and `exp(ln 1e9)` to 999999999.9999993, so a
+    // threshold search on the round-tripped α (`<= 1e-3`, `>= 1e9`) finds
+    // neither anchor and would leave the mechanism unasserted.
+    assert_eq!(rungs.len(), ladder.len(), "#2691: every ladder rung must be measured");
+    let low = rungs.first().expect("#2691: the ladder has a lowest-α rung");
+    let high = rungs.last().expect("#2691: the ladder has a highest-α rung");
+    assert!(
+        low.1 > 0.5,
+        "#2691: at α={:.3e} the chart must still be spread over the circle \
+         (circular variance {:.3e})",
+        low.0,
+        low.1
+    );
+    assert!(
+        high.1 < 1.0e-6 && high.2 <= 1,
+        "#2691: raising ONLY the von-Mises coordinate precision to α={:.3e} must collapse the \
+         chart to one point — this is the mechanism the guard exists for \
+         (circular variance {:.3e}, {} resolved chart points)",
+        high.0,
+        high.1,
+        high.2
+    );
 }
 
 /// #2691 REGRESSION — the production entry must REFUSE a chart that has
