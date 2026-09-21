@@ -5157,7 +5157,7 @@ fn survival_ls_wiggle_kernel_value_matches_direct_loglik_932() {
         for row in 0..n {
             let arena = DynamicJetArena::new();
             let kernel_nll = kernel
-                .row_order2(row, &arena)
+                .row_jet_order2(row, &arena)
                 .expect("wiggle kernel value")
                 .value();
             // Direct single-warp objective: exactly `log_likelihood_only`'s per-row
