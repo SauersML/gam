@@ -35,6 +35,7 @@ pub mod row_kernel_race;
 pub mod solver;
 
 pub use device::GpuDeviceInfo;
+pub use linalg_dispatch::CholeskyVerdict;
 pub use device_runtime::{GpuAbsence, GpuAvailability, GpuAvailabilityRef, GpuRuntime};
 pub use dictionary_score::{
     DEFAULT_DICTIONARY_SCORE_MIN_ELEMS, DEFAULT_DICTIONARY_SCORE_TILE_ELEMS,
@@ -552,18 +553,20 @@ pub fn try_fast_abt_strided_batched_with_policy(
     linalg_dispatch::try_fast_abt_strided_batched_with_policy(a, b, policy)
 }
 #[inline]
-pub fn try_cholesky_lower_inplace(a: &mut ndarray::Array2<f64>) -> Option<()> {
+pub fn try_cholesky_lower_inplace(a: &mut ndarray::Array2<f64>) -> Option<CholeskyVerdict> {
     linalg_dispatch::try_cholesky_lower_inplace(a)
 }
 #[inline]
-pub fn try_cholesky_batched_lower_inplace(matrices: &mut [ndarray::Array2<f64>]) -> Option<()> {
+pub fn try_cholesky_batched_lower_inplace(
+    matrices: &mut [ndarray::Array2<f64>],
+) -> Option<CholeskyVerdict> {
     linalg_dispatch::try_cholesky_batched_lower_inplace(matrices)
 }
 #[inline]
 pub fn try_cholesky_batched_lower_inplace_with_policy(
     matrices: &mut [ndarray::Array2<f64>],
     policy: GpuPolicy,
-) -> Option<()> {
+) -> Option<CholeskyVerdict> {
     linalg_dispatch::try_cholesky_batched_lower_inplace_with_policy(matrices, policy)
 }
 #[inline]

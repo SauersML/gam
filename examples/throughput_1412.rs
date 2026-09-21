@@ -185,9 +185,15 @@ fn main() {
         let mut blocks: Vec<Array2<f64>> = (0..k_batch).map(|_| spd_block(d, &mut rng)).collect();
         // Warm + dispatch check (operates in place; clone for the warm pass).
         let mut warm_blocks = blocks.clone();
-        let chol_on_device =
+        let chol_on_device = match
             gam::gpu::linalg_dispatch::try_cholesky_batched_lower_inplace(&mut warm_blocks)
-                .is_some();
+        {
+            Some(gam::gpu::CholeskyVerdict::Factored) => true,
+            Some(gam::gpu::CholeskyVerdict::NotPositiveDefinite) => {
+                panic!("generated SPD warmup block was reported not positive definite")
+            }
+            None => false,
+        };
         black_box(&warm_blocks);
 
         let mut chol_total = Duration::ZERO;
@@ -201,8 +207,11 @@ fn main() {
             }
             let start = Instant::now();
             match gam::gpu::linalg_dispatch::try_cholesky_batched_lower_inplace(&mut blocks) {
-                Some(()) => {
+                Some(gam::gpu::CholeskyVerdict::Factored) => {
                     black_box(&blocks);
+                }
+                Some(gam::gpu::CholeskyVerdict::NotPositiveDefinite) => {
+                    panic!("generated SPD benchmark block was reported not positive definite")
                 }
                 None => chol_decl += 1,
             }
