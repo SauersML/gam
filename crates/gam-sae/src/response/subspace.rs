@@ -99,15 +99,18 @@
 //!
 //! The pass adds `γ_{2h+1}` of its absolute terms, and `E = V(I) − V(P)` is their [`signed_sum`].
 
+use super::hermite::{HermiteError, unit_tail_envelope};
 use super::reader_gram::{ReaderGram, ReaderGramError, fill_upper_rows, upper_tile_rows};
+use super::tiles::chaos_operations;
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerCholesky, fast_ab, fast_abt, fast_atb};
 use gam_linalg::roundoff::accumulation_growth;
 use gam_math::gaussian_activation::{
     GaussianActivation, GaussianActivationError, PairKernel, PreactivationPair, gaussian_hermite_coefficients,
-    gaussian_smoothing_derivatives, pair_kernel, pair_kernel_variance_partials,
+    gaussian_smoothing_derivatives, pair_kernel, pair_kernel_variance_partials, project_covariance,
 };
 use gam_math::gaussian_gated::{GatedMean, GaussianGatedError, gated_conditional_mean};
+use gam_math::roundoff::inflated;
 use gam_runtime::resource::byte_balanced_row_chunk;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::*;
@@ -1162,6 +1165,168 @@ pub fn pair_moments(activation: GaussianActivation, pair: PreactivationPair) -> 
     pair_kernel(activation, pair).map_err(|error| ResponseError::Kernel {
         context: "Gaussian pair kernel",
         error,
+    })
+}
+
+/// `Cov(σ(X), σ(Y)) = K − m_x m_y` for one unit pair, with a bound on its error, formed without the difference where
+/// the difference would cancel (#4351).
+///
+/// # Routes
+///
+/// The closed form subtracts the means' product from the pair kernel. It errs by the kernel's `value_rounding`,
+/// `γ_2 (|K| + |m_x m_y|)` for the product and the difference, and `|m_x| δ_y + δ_x (|m_y| + δ_y)` for the means,
+/// where `δ = e_0 + γ_1 sup|σ'| ŝ` covers `m = a_0` evaluated at `ŝ = fl(√v)`. Its band therefore scales with `|K|`,
+/// not with the covariance. At small correlation, or at a large mean over a small variance, every digit of
+/// `K − m_x m_y` can cancel.
+///
+/// The chaos series never forms the means. With `s_x = √v`, `s_y = √w` and `ρ = r/(s_x s_y)`, Mehler's formula gives
+/// `Cov = Σ_{n≥1} ρⁿ a_n b_n`. Here `a_n = E[σ(b + s_x E) h_n(E)]` and `b_n` likewise
+/// ([`gaussian_hermite_coefficients`]), with errors `e_n` and `f_n`. Truncated at order `N` and evaluated by Horner,
+/// the series errs by:
+///
+/// - the tail `|Σ_{n>N} ρⁿ a_n b_n| ≤ |ρ|^{N+1} √(E_x(N) E_y(N))`, by Cauchy–Schwarz on the envelopes
+///   `Σ_{n>N} a_n² ≤ E(N)` of [`unit_tail_envelope`];
+/// - Horner's rounding, `γ_{3N+3} Σ_n |ρ|ⁿ |a_n b_n|` (Higham, *ASNA* §5.1; see `chaos_operations`);
+/// - the coefficients' errors, `Σ_n |ρ|ⁿ (e_n |b_n| + |a_n| f_n + e_n f_n)`;
+/// - the rounding of the law it is evaluated at, `γ_6 |ρ| ŝ_x ŝ_y sup|σ'|²`. Forming `ρ̂ = (r/ŝ_x)/ŝ_y` errs by
+///   `γ_4 |ρ|`, and Price's theorem `∂_ρ Cov = s_x s_y E[σ'(X) σ'(Y)]` turns that into `γ_4 |ρ| s_x s_y sup|σ'|²`.
+///   Each `|ŝ − s| ≤ u s` moves `a_{≥1}` in `ℓ²` by at most `sup|σ'| |ŝ − s|`, because
+///   `∂_s σ(b + sE) = σ'(b + sE) E`, and the other column has `‖b_{≥1}‖ ≤ s_y sup|σ'|` by the Gaussian Poincaré
+///   inequality. With `|ρ|ⁿ ≤ |ρ|`, each scale adds `γ_1 |ρ| s_x s_y sup|σ'|²`.
+///
+/// Every term is proportional to `|ρ|`, so the series keeps its relative accuracy as `ρ → 0` and as `|K| ≫ |Cov|`.
+///
+/// # Order
+///
+/// The order is the first `N ≥ 1` whose tail falls within Horner's floor `γ_{3N+3} |ρ a_1 b_1|`. That floor bounds
+/// the series' own rounding from below, so a higher order cannot shrink the band by more than the tail it removes.
+/// The floor grows with `N` and the tail shrinks. The series is dropped at the first `N` whose floor plus the law's
+/// rounding already reaches the closed form's band, and this also ends the scan. Once `γ_{3N+3}` is infinite the
+/// floor reaches every band. The value carries whichever route's band is smaller.
+///
+/// # Exact zeros
+///
+/// A constant pre-activation (`v = 0` or `w = 0`) or an uncorrelated projected law (`r = 0`) makes `σ(X)` and
+/// `σ(Y)` independent, so the covariance is exactly zero.
+///
+/// The band is at the law [`project_covariance`] returns. Moving the covariance onto the Cauchy–Schwarz boundary
+/// moves the value by at most `sup|σ'|² β`, and that move is the caller's to carry.
+pub fn pair_covariance(activation: GaussianActivation, pair: PreactivationPair) -> Result<BandedEnergy, ResponseError> {
+    let kernel = pair_moments(activation, pair)?;
+    let law = project_covariance(
+        pair.variance_x,
+        pair.variance_y,
+        pair.covariance,
+        pair.covariance_rounding,
+    )
+    .map_err(|error| ResponseError::Kernel {
+        context: "pair covariance law",
+        error,
+    })?;
+    if pair.variance_x == 0.0 || pair.variance_y == 0.0 || law.covariance == 0.0 {
+        return Ok(BandedEnergy::ZERO);
+    }
+    let slope_bound = activation
+        .slope_bound_squared()
+        .map_err(|error| ResponseError::Kernel {
+            context: "pair covariance slope bound",
+            error,
+        })?;
+    let scale_x = pair.variance_x.sqrt();
+    let scale_y = pair.variance_y.sqrt();
+    let (lead_x, lead_errors_x) = chaos_column(activation, pair.mean_x, scale_x, 1)?;
+    let (lead_y, lead_errors_y) = chaos_column(activation, pair.mean_y, scale_y, 1)?;
+    let mean_move = accumulation_growth(1) * slope_bound.sqrt();
+    let mean_band_x = lead_errors_x[0] + mean_move * scale_x;
+    let mean_band_y = lead_errors_y[0] + mean_move * scale_y;
+    let mean_product = lead_x[0] * lead_y[0];
+    let closed = BandedEnergy {
+        value: kernel.value - mean_product,
+        band: inflated(
+            kernel.value_rounding
+                + accumulation_growth(2) * (kernel.value.abs() + mean_product.abs())
+                + lead_x[0].abs() * mean_band_y
+                + mean_band_x * (lead_y[0].abs() + mean_band_y),
+            4,
+        ),
+    };
+    let correlation = (law.covariance / scale_x / scale_y).clamp(-1.0, 1.0);
+    let magnitude = correlation.abs();
+    let law_band = inflated(accumulation_growth(6) * magnitude * slope_bound * scale_x * scale_y, 4);
+    let anchor = magnitude * (lead_x[1] * lead_y[1]).abs();
+    if !(anchor > 0.0 && law_band < closed.band) {
+        return Ok(closed);
+    }
+    let mut order = 1;
+    let mut power = magnitude * magnitude;
+    let tail = loop {
+        let floor = accumulation_growth(chaos_operations(order)) * anchor;
+        if !(floor + law_band < closed.band) {
+            return Ok(closed);
+        }
+        let envelopes = chaos_tail(activation, pair.mean_x, scale_x, order)?
+            * chaos_tail(activation, pair.mean_y, scale_y, order)?;
+        // `power` took `order + 1` products, the square root and the product with it one more each.
+        let tail = inflated(power * envelopes.sqrt(), order + 3);
+        if tail <= floor {
+            break tail;
+        }
+        order += 1;
+        power *= magnitude;
+    };
+    let (column_x, errors_x) = chaos_column(activation, pair.mean_x, scale_x, order)?;
+    let (column_y, errors_y) = chaos_column(activation, pair.mean_y, scale_y, order)?;
+    let mut value = 0.0;
+    let mut absolute = 0.0;
+    let mut coefficient_band = 0.0;
+    for degree in (1..=order).rev() {
+        let product = column_x[degree] * column_y[degree];
+        value = product + correlation * value;
+        absolute = product.abs() + magnitude * absolute;
+        coefficient_band = errors_x[degree] * column_y[degree].abs()
+            + column_x[degree].abs() * errors_y[degree]
+            + errors_x[degree] * errors_y[degree]
+            + magnitude * coefficient_band;
+    }
+    let operations = chaos_operations(order);
+    let series = BandedEnergy {
+        value: correlation * value,
+        band: inflated(
+            tail + accumulation_growth(operations) * magnitude * absolute + magnitude * coefficient_band + law_band,
+            operations,
+        ),
+    };
+    Ok(if series.band < closed.band { series } else { closed })
+}
+
+/// `a_0, …, a_order` of `σ(bias + scale E)` with their rounding bounds.
+fn chaos_column(
+    activation: GaussianActivation,
+    bias: f64,
+    scale: f64,
+    order: usize,
+) -> Result<(Vec<f64>, Vec<f64>), ResponseError> {
+    let mut coefficients = vec![0.0; order + 1];
+    let mut bounds = vec![0.0; order + 1];
+    gaussian_hermite_coefficients(activation, bias, scale, &mut coefficients, &mut bounds).map_err(|error| {
+        ResponseError::Kernel {
+            context: "pair covariance Hermite coefficients",
+            error,
+        }
+    })?;
+    Ok((coefficients, bounds))
+}
+
+/// `E(order) ≥ Σ_{n>order} a_n²` for `σ(bias + scale E)`, with the expansion's refusal carried as a [`ResponseError`].
+fn chaos_tail(activation: GaussianActivation, bias: f64, scale: f64, order: usize) -> Result<f64, ResponseError> {
+    unit_tail_envelope(activation, bias, scale, order).map_err(|error| match error {
+        HermiteError::NoClosedFormActivation { activation } => ResponseError::Kernel {
+            context: "pair covariance tail envelope",
+            error: GaussianActivationError::NoClosedForm { activation },
+        },
+        _ => ResponseError::NonFinite {
+            context: "pair covariance tail envelope",
+        },
     })
 }
 
