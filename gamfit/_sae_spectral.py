@@ -896,8 +896,12 @@ class AtlasNerveDiagram:
     the reduced nerve complex. ``nerve_euler_characteristic`` is the exact
     alternating sum of those admitted simplices; it is deliberately distinct
     from ``certified_euler_characteristic``, which is populated only by a
-    finite-sample Gauss--Bonnet certificate. The standalone sparse-route entry
-    point has no ambient observations and therefore reports ``not_analyzed``.
+    finite-sample Gauss--Bonnet certificate. ``transfer_gates`` holds one
+    calibrated transfer test per co-firing chart pair (existence and
+    scaled-rotation-or-reflection p-values), run at the per-edge level
+    ``transfer_gate_level``; that level is ``None`` when no familywise level was
+    supplied, and then no nerve edge is certified. Without ambient observations
+    the holonomy reports ``not_analyzed``.
     ``audit_sae`` supplies ambient observations, constructs a deterministic
     cross-fit in Rust, and returns ``analyzed_refused`` with structured
     first-order diagnostics until population spectrum/margin and Gaussian-law
@@ -917,6 +921,8 @@ class AtlasNerveDiagram:
     n_tetrahedra: int | None = None
     nerve_euler_characteristic: int | None = None
     certified_euler_characteristic: int | None = None
+    transfer_gate_level: float | None = None
+    transfer_gates: list[dict[str, Any]] | None = None
     holonomy_status: str | None = None
     holonomy_provenance: str | None = None
     holonomy_refusal_codes: list[str] | None = None
@@ -946,17 +952,15 @@ def atlas_nerve_diagram(
     firing; the logical ``N x K`` code matrix is never materialized. A chart
     fires on the rows where its routed block gate is nonzero.
 
-    Supplying ``observations`` (the ambient activation rows the charts were read
-    from, one row per route row) together with ``familywise_alpha`` runs the
-    cross-fitted Gaussian-PCA holonomy producer and threads a real finite-sample
-    certificate through the diagram. Both must be given together, since a
-    certified holonomy claim must state the error probability it spends; omitting
-    both keeps the pure combinatorial nerve.
+    An overlap becomes a nerve edge only through a calibrated transfer test:
+    the co-firing codes must carry a linear transfer that is a scaled rotation
+    or reflection. ``familywise_alpha`` bounds the probability of misclassifying
+    any tested chart pair; without it the gates report their p-values but no
+    edge is admitted. Supplying ``observations`` (the ambient activation rows
+    the charts were read from, one row per route row) as well runs the
+    cross-fitted Gaussian-PCA holonomy producer and threads its finite-sample
+    certificate through the diagram; it requires ``familywise_alpha``.
     """
-    if (observations is None) != (familywise_alpha is None):
-        raise ValueError(
-            "atlas_nerve_diagram requires observations and familywise_alpha together"
-        )
     indices, values = _sparse_route_arrays(route, "route", int(block_size))
     block_list = None if blocks is None else [int(b) for b in blocks]
     ambient = (
@@ -994,6 +998,12 @@ def atlas_nerve_diagram(
             if payload["certified_euler_characteristic"] is None
             else int(payload["certified_euler_characteristic"])
         ),
+        transfer_gate_level=(
+            None
+            if payload["transfer_gate_level"] is None
+            else float(payload["transfer_gate_level"])
+        ),
+        transfer_gates=[dict(gate) for gate in payload["transfer_gates"]],
         holonomy_status=str(payload["holonomy_status"]),
         holonomy_provenance=(
             None
