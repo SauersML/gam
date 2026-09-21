@@ -343,7 +343,7 @@ impl SparseAtomCodes {
     /// and that information increases in both firing counts, so the exact
     /// maximum spanning tree of the COMPLETE graph is found by Borůvka rounds
     /// that scan the explicit edges plus, per atom, one best never-co-firing
-    /// partner (see [`SupportCounts::chow_liu_tree`]). The KT code lengths are
+    /// partner (see `SupportCounts::chow_liu_tree`). The KT code lengths are
     /// closed forms in the counts. The code is the same at every scale: no
     /// memory or dictionary-size threshold switches the code family.
     pub fn support_entropy(&self) -> SupportEntropy {
@@ -807,7 +807,7 @@ pub(crate) fn combinatorial_support_bits(g: usize, cardinality_counts: &[usize])
 /// integers. The direct `p·log(p / (p_u·p_v))` form loses the `p₀₀` cell to
 /// rounding once `n_u·n_v / n²` nears machine epsilon — rare atoms at corpus
 /// scale — and can then invert the order of two never-co-firing pairs, which
-/// [`SupportCounts::chow_liu_tree`] relies on. Exactly zero when `D = 0`, and
+/// `SupportCounts::chow_liu_tree` relies on. Exactly zero when `D = 0`, and
 /// bit-for-bit symmetric in the two atoms.
 fn mutual_information_bits(n: u64, n_u: u64, n_v: u64, n_uv: u64) -> f64 {
     let (n_u, n_v) = (n_u.min(n_v), n_u.max(n_v));

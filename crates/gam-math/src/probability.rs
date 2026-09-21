@@ -23,7 +23,7 @@ const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
 /// `p <= 0` maps to the support floor and `p >= 1` to the support ceiling. A
 /// non-finite or non-positive shape, or a NaN probability, yields `NaN`. So
 /// does a lower-tail quantile whose log-space Newton ends at a point the
-/// residual certificate of [`lower_tail_beta_quantile`] does not accept.
+/// residual certificate of `lower_tail_beta_quantile` does not accept.
 pub fn beta_quantile(p: f64, a: f64, b: f64) -> f64 {
     if p.is_nan() || !(a.is_finite() && a > 0.0 && b.is_finite() && b > 0.0) {
         return f64::NAN;
@@ -321,7 +321,7 @@ fn beta_ascending_series(x: f64, a: f64, b: f64) -> Option<AscendingSeries> {
 /// `(1 − I_x)/I_x`: the conditioning of the subtraction, which is inherent to
 /// the quantity rather than to this evaluation.
 ///
-/// The same term-ratio proof used by [`lower_tail_beta_quantile`] supplies both
+/// The same term-ratio proof used by `lower_tail_beta_quantile` supplies both
 /// branch boundaries. Between them, the ordinary regularized-beta
 /// implementation receives an argument with `x` and `1 − x` both representable
 /// and remains the canonical general evaluator.
@@ -374,7 +374,7 @@ pub fn ln_regularized_beta_lower_from_log_x(log_x: f64, a: f64, b: f64) -> f64 {
 /// `None` off it.
 ///
 /// The branch boundary `x·max(1,b) ≤ ½` is the term-ratio proof used by
-/// [`lower_tail_beta_quantile`]. `Some(NaN)` reports a series or normalizer that
+/// `lower_tail_beta_quantile`. `Some(NaN)` reports a series or normalizer that
 /// did not form.
 fn ln_regularized_beta_series(log_x: f64, a: f64, b: f64) -> Option<f64> {
     let series_limit = (0.5_f64).ln() - b.max(1.0).ln();
@@ -413,7 +413,7 @@ const BETA_SERIES_MAX_TERMS: usize = 128;
 /// `O(x)` the iteration is quadratic, so it reaches `G`'s rounding band in two
 /// to four steps over the whole branch. The step test that ends the loop can
 /// fail to fire once the iterate sits in that band, so this count can end the
-/// loop too. It is not a certificate. [`lower_tail_beta_quantile`] certifies
+/// loop too. It is not a certificate. `lower_tail_beta_quantile` certifies
 /// the point it returns, whichever way the loop ended.
 const BETA_NEWTON_MAX_STEPS: usize = 32;
 
@@ -750,7 +750,7 @@ pub fn chi_square_quantile(p: f64, degrees_of_freedom: f64) -> f64 {
 ///
 /// Three evaluations, each used exactly where it is certified (#4068):
 ///
-/// * Temme's uniform asymptotic expansion ([`temme_incomplete_gamma_pair`]),
+/// * Temme's uniform asymptotic expansion (`temme_incomplete_gamma_pair`),
 ///   whenever its `1/a` correction series certifies convergence to `ε`. Its
 ///   cost does not grow with `a`, and its accuracy is uniform in `x / a`, so it
 ///   carries the transition region `x ≈ a` where the other two need `O(√a)`

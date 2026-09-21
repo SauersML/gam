@@ -492,7 +492,7 @@ mod cuda {
     // -----------------------------------------------------------------------
 
     /// Solve `A x = b` using an fp32 Cholesky factorization with up to
-    /// [`super::refinement_step_budget`] fp64-residual iterative refinement
+    /// `super::refinement_step_budget` fp64-residual iterative refinement
     /// corrections.
     ///
     /// # Algorithm
@@ -503,13 +503,13 @@ mod cuda {
     /// 3. `r = b − A·x` accumulated in fp64 (cuBLAS Dgemv), then
     ///    `refine_to_certificate`: corrections (cast `r` to f32, solve
     ///    `A e = r` in fp32, `x += e` in f64, recompute the fp64 residual),
-    ///    each judged by [`super::refinement_verdict`], until
+    ///    each judged by `super::refinement_verdict`, until
     ///    `‖r‖ ≤ γ_{p+1}·(‖A‖_F‖x‖ + ‖b‖)`, the residual's own rounding band.
     /// 4. Return `x` only when that certificate holds.
     ///
     /// Returns `Err` when the fp32 POTRF fails (not SPD at f32), when the
     /// residual does not decrease (κ(A)·u_f32 ≥ 1 regime), or when the band
-    /// cannot be reached within [`super::refinement_step_budget`] corrections,
+    /// cannot be reached within `super::refinement_step_budget` corrections,
     /// the most that cost no more than the fp64 factorization. `Ok` therefore
     /// always carries a solution whose fp64 residual is inside its own
     /// rounding. Callers use fp64 POTRF on `Err`.
@@ -603,7 +603,7 @@ mod cuda {
     /// With a fixed fp32 factor the refinement contracts the error LINEARLY, by
     /// about `κ(A)·u_f32` per correction, so reaching the band may need more
     /// corrections than `max_steps` allows. Each correction is judged by
-    /// [`super::refinement_verdict`], which refuses as soon as the measured
+    /// `super::refinement_verdict`, which refuses as soon as the measured
     /// contraction predicts the band past `max_steps`, so a budget that cannot
     /// certify is an `Err`, never an uncertified `Ok`: `Ok(())` means the final
     /// residual is inside its rounding band. A correction that does not reduce
@@ -1018,7 +1018,7 @@ pub(crate) enum RefinementVerdict {
 
 /// Judge the residual `new_norm` left by correction number `steps` (1-based),
 /// which followed a residual `prev_norm`, against the rounding band `band`
-/// and the correction budget `budget` of [`refinement_step_budget`].
+/// and the correction budget `budget` of `refinement_step_budget`.
 ///
 /// Refinement with a fixed fp32 factor contracts the error linearly, at a rate
 /// of about `κ(A)·u_f32` per correction, so the measured contraction
@@ -1059,15 +1059,15 @@ pub(crate) fn refinement_verdict(
 /// iterative refinement when that path applies, the fp64 Cholesky solve
 /// otherwise. There is no user-facing knob; the `p` floor is a
 /// `GpuDispatchPolicy` constant and the correction budget is derived from `p`
-/// by [`refinement_step_budget`]. The decision path is:
+/// by `refinement_step_budget`. The decision path is:
 ///
 /// 1. Multi-column RHS, or `GpuDispatchPolicy::iterative_refinement_should_attempt(p)`
 ///    false → fp64 POTRF + POTRS.
 /// 2. Otherwise fp32 POTRF + fp64-residual corrections, each judged by
-///    [`refinement_verdict`]. The refined `x` is returned only when its
+///    `refinement_verdict`. The refined `x` is returned only when its
 ///    residual reaches the attainable band `γ_{p+1}(‖A‖_F‖x‖ + ‖b‖)`; an fp32
 ///    POTRF failure, a non-monotone residual, or a band predicted past
-///    [`refinement_step_budget`] sends the solve to fp64 POTRF + POTRS
+///    `refinement_step_budget` sends the solve to fp64 POTRF + POTRS
 ///    instead.
 ///
 /// Either way the returned solution is fp64-accurate. The expensive O(p³)

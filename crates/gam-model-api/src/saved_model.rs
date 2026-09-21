@@ -8,7 +8,7 @@
 //! streaming pass: the kind and the version are checked as they are read, before
 //! the model, and the model is decoded straight from the bytes, never through an
 //! intermediate `serde_json::Value`. Any other kind or version is refused with a
-//! typed error; an older payload is never migrated. [`saved_model_header`] reads
+//! typed error; an older payload is never migrated. `saved_model_header` reads
 //! only the kind and the version and stops, so dispatching on the kind costs
 //! the header, not the model. JSON has no encoding for a non-finite float, so
 //! saving refuses one instead of writing `null`. With serde_json's exact float

@@ -485,7 +485,7 @@ pub struct PairKernelVariancePartials {
 ///   GELU's smoothing and its first two mean-derivatives at `(m′, s′²)`. By the same tilt,
 ///   `T″ = φ(m′/S)/S·(2 − m′²/S⁴ − s′²/S²)` with `S² = 1 + s′²`.
 /// - **Rounding.** The bounded forms carry their own rounding. `m`'s rounding enters through the sups of the
-///   activation's derivatives, since `|∂_m T^{(k)}| ≤ sup|σ^{(k+1)}|` (see [`exact_gelu_derivative_suprema`]).
+///   activation's derivatives, since `|∂_m T^{(k)}| ≤ sup|σ^{(k+1)}|` (see `exact_gelu_derivative_suprema`).
 pub fn pair_kernel_variance_partials(
     activation: GaussianActivation,
     pair: PreactivationPair,

@@ -154,7 +154,7 @@ pub enum SmoothLrReferenceSource {
 /// ```
 ///
 /// where `w_sel` is the observation under the replay's own selection (see
-/// [`Self::observed`]; `w_sel = w` when no score was supplied).
+/// `Self::observed`; `w_sel = w` when no score was supplied).
 ///
 /// a textbook control variate. The bracket is a difference of two indicators
 /// that agree on most draws, so its variance is a fraction of either term's, and
@@ -224,7 +224,7 @@ pub struct SmoothLrSelectionReplay {
 }
 
 /// `W_q` of the observed whitened score, at `t = 1` and at the replay's
-/// selected `t*` — see [`SmoothLrSelectionReplay::observed`].
+/// selected `t*` — see `SmoothLrSelectionReplay::observed`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ObservedSelection {
     conditional: f64,
@@ -2474,7 +2474,7 @@ impl SmoothLrSelectionReplay {
     }
     /// The factor that carries the observation from the fitted `λ̂` to the
     /// replay's own selection: the quadratic model's ratio `W_q(t*; z)/W_q(1; z)`
-    /// of the observed whitened score (see [`Self::observed`]). One when no
+    /// of the observed whitened score (see `Self::observed`). One when no
     /// observation was scored, or when its `W_q(1; z)` is not a positive number
     /// to divide by — a score of exactly zero, where every `t` gives the same
     /// `W_q = 0` and the selection moves nothing.

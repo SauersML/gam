@@ -4995,7 +4995,7 @@ impl FittedModel {
     /// out-of-vocabulary code as "no level matches" and silently drop
     /// `f_g(x)` from the prediction, its standard error and its band. Such a
     /// column is therefore removed from the whitelist, so an unseen level hits
-    /// the strict schema encode (see [`collect_per_level_curve_group_cols`]).
+    /// the strict schema encode (see `collect_per_level_curve_group_cols`).
     pub fn random_effect_group_columns(&self) -> HashSet<String> {
         let Some(training_headers) = self.training_headers.as_ref() else {
             return HashSet::new();

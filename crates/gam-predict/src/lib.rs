@@ -2871,7 +2871,7 @@ pub(crate) fn family_observation_band_per_row(
 ///
 /// CLogLog note (exact target):
 /// If p = 1 - exp(-exp(η)) and η ~ N(μ,σ²), then
-///   E[p] = 1 - I(1),  E[p²] = 1 - 2I(1) + I(2),  Var(p) = I(2) - I(1)²
+///   `E[p] = 1 - I(1)`,  `E[p²] = 1 - 2I(1) + I(2)`,  `Var(p) = I(2) - I(1)²`
 /// where I(λ) = E[exp(-λ exp(η))] is the lognormal Laplace transform.
 /// This identity is exact, and highlights that the moments are determined by
 /// the lognormal Laplace transform values at λ=1 and λ=2.

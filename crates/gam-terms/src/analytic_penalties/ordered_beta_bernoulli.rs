@@ -839,7 +839,7 @@ struct LogPartitionPanel {
 /// bounded by `2^{−N}e^{w_lo}` and `2^{−N}e^{2w_lo}` on the left and by `2^{−N}e^{−e^{w_hi}}`
 /// and `2^{−N}(1 + e^{w_hi})e^{−e^{w_hi}}` on the right; the interval is widened until each
 /// bound is below `ε` of the computed mass or moment. Exhausting
-/// [`LOG_PARTITION_MAX_PANELS`] is a refusal, not a value.
+/// `LOG_PARTITION_MAX_PANELS` is a refusal, not a value.
 pub fn ordered_beta_bernoulli_log_partition(
     shape: f64,
     rows: f64,

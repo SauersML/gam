@@ -525,7 +525,7 @@ pub(crate) fn symmetrized_square_matrix(
 /// Try exact Newton joint Hessian first, then surrogate. Returns `None` if
 /// neither path provides a joint Hessian. When successful, returns the joint
 /// Hessian source, flat beta, and boxed closures for computing directional
-/// derivatives dH[v] and d²H[u,v].
+/// derivatives `dH[v]` and `d²H[u,v]`.
 ///
 /// This eliminates the previously duplicated exact-Newton and surrogate
 /// code blocks in `outerobjectivegradienthessian_internal`.
@@ -827,7 +827,7 @@ pub(crate) fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + 
     Ok(None)
 }
 
-/// Build a closure computing dH[v] using exact Newton derivatives on synced states.
+/// Build a closure computing `dH[v]` using exact Newton derivatives on synced states.
 /// Non-finite derivative output is treated as a hard error.
 /// Symmetrize-and-scale the dH Dense result, optionally rejecting non-finite
 /// values first.  The borrowed factory (`exact_newton_dh_closure`) guards
@@ -853,7 +853,7 @@ pub(crate) fn finalize_dh_dense(
     Ok(Some(DriftDerivResult::Dense(sym)))
 }
 
-/// Single source of truth for the dH[v] three-way dispatch shared by the
+/// Single source of truth for the `dH[v]` three-way dispatch shared by the
 /// borrowed (`exact_newton_dh_closure`) and owned
 /// (`exact_newton_dh_closure_owned`) closure factories.  The `check_finite`
 /// flag preserves the lone behavioral difference between the two (the borrowed
@@ -963,7 +963,7 @@ pub(crate) fn exact_newton_dh_many_closure<'a>(
     }))
 }
 
-/// Single source of truth for the d²H[u,v] three-way dispatch shared by the
+/// Single source of truth for the `d²H[u,v]` three-way dispatch shared by the
 /// borrowed (`exact_newton_d2h_closure`) and owned
 /// (`exact_newton_d2h_closure_owned`) closure factories.  Takes references for
 /// `family`/`specs` so both ownership flavors can call it; the only difference
@@ -1026,7 +1026,7 @@ pub(crate) fn exact_newton_d2h_apply<F: CustomFamily + Sync>(
     }
 }
 
-/// Build a closure computing d²H[u,v] using exact Newton derivatives on synced states.
+/// Build a closure computing `d²H[u,v]` using exact Newton derivatives on synced states.
 pub(crate) fn exact_newton_d2h_closure<'a, F: CustomFamily + Sync>(
     family: &'a F,
     synced_states: Arc<Vec<ParameterBlockState>>,

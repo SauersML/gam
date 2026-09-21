@@ -32,7 +32,7 @@ pub struct SoftmaxEntropyLogPartition {
 
 /// Declared accuracy of [`softmax_entropy_log_partition`], relative to `1 + |·|` for the value and
 /// for the log-strength derivative. Each group table is certified to
-/// [`PARTITION_LOCAL_TOLERANCE`]; a table error enters the next split's integral at most twice, so
+/// `PARTITION_LOCAL_TOLERANCE`; a table error enters the next split's integral at most twice, so
 /// the `log₂K` levels of balanced splitting keep the result within `2·log₂K` local tolerances.
 pub const SOFTMAX_ENTROPY_PARTITION_RELATIVE_TOLERANCE: f64 = 1.0e-9;
 
@@ -48,7 +48,7 @@ const PARTITION_PIECE_ORDER: usize = 8;
 /// against `1 + |ln Z_j|`, and `λ'·∂_λ ln Z_j` against `1 + |λ'·∂_λ ln Z_j|`. A node error `δ` in
 /// those units reaches the check through the coarse interpolant as at most `(1 + Λ)·δ`, where
 /// `Λ ≤ 1 + (2/π)·ln n` is the Lebesgue constant of the `n`-interval Chebyshev--Lobatto rule, so
-/// holding it below half of [`PARTITION_LOCAL_TOLERANCE`] keeps the integrals' own error from being
+/// holding it below half of `PARTITION_LOCAL_TOLERANCE` keeps the integrals' own error from being
 /// read as interpolation error, which no bisection removes. The integrand's logarithm sums terms as
 /// large as `|ln Z_j|`, so the mass and the moment each carry a rounding error of order
 /// `ε·|ln Z_j|` relative to themselves; `ln Z_j` measured against `1 + |ln Z_j|`, and the slope
@@ -163,7 +163,7 @@ impl GroupTables {
     }
 
     /// Build the table of `size` from the tables of its halves. A piece is accepted when the coarse
-    /// interpolant predicts the fine rule's new nodes to [`PARTITION_LOCAL_TOLERANCE`], in the value
+    /// interpolant predicts the fine rule's new nodes to `PARTITION_LOCAL_TOLERANCE`, in the value
     /// and in `λ'·∂_λ ln Z_j`; otherwise it is bisected in `u`.
     fn build(&mut self, size: usize, evaluations: &mut usize) -> Result<(), String> {
         let first = size / 2;
@@ -490,13 +490,13 @@ fn partition_memo() -> &'static Mutex<Vec<(usize, u64, SoftmaxEntropyLogPartitio
 /// `(K − 1)`-simplex (#2933 F45).
 ///
 /// The simplex integral of a product over coordinates is computed by balanced group splitting
-/// ([`combine_groups`]): a group of `j` gates needs `ln Z_j` and its slope at every strength in
+/// (`combine_groups`): a group of `j` gates needs `ln Z_j` and its slope at every strength in
 /// `[0, λ]`, tabulated on Chebyshev--Lobatto nodes in `u = ln(1 + λ')` and read back by barycentric
 /// interpolation, and the top split is integrated at `λ` itself. Group sizes halve, so a `K`-gate
 /// partition needs at most `2·log₂K` tables and its cost does not grow with `K` beyond that.
 ///
 /// Accuracy. Each table covers `[0, ln(1 + λ)]` by pieces. A piece is accepted when its 8-interval
-/// interpolant predicts the 16-interval rule's new nodes to [`PARTITION_LOCAL_TOLERANCE`], and is
+/// interpolant predicts the 16-interval rule's new nodes to `PARTITION_LOCAL_TOLERANCE`, and is
 /// bisected otherwise, so the pieces concentrate where `ln Z_j` bends: near `λ' ≈ j` a large group
 /// passes from near-uniform routing to near-vertex routing, and a single global rule cannot resolve
 /// that bend. The declared result error is [`SOFTMAX_ENTROPY_PARTITION_RELATIVE_TOLERANCE`]. This is

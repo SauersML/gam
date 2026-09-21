@@ -287,7 +287,7 @@ fn solve_weighted_allocation(
 /// component with a positive variance costs `+∞` bits, because an exact
 /// continuous Gaussian value needs unbounded rate. Nonfinite inputs and
 /// materially negative eigenvalues are rejected (see
-/// [`validated_variance_spectrum`]).
+/// `validated_variance_spectrum`).
 pub fn weighted_reverse_water_filling(
     components: &[(f64, Vec<f64>)],
     total_distortion: f64,
@@ -397,7 +397,7 @@ impl BirthProposalPriority {
 ///              − (m−ŝ)·P·½log₂(N)
 /// ```
 ///
-/// with the Gaussian surrogate rate [`scalar_rate_bits`] `½max(log₂(λ̂/δ),0)` as
+/// with the Gaussian surrogate rate `scalar_rate_bits` `½max(log₂(λ̂/δ),0)` as
 /// the code coefficient.
 ///
 /// # A heuristic, not a theorem (#2933 F22)

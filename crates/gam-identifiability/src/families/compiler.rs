@@ -75,7 +75,7 @@ pub trait RowJacobianOperator: Send + Sync {
     /// the compiler asks for the scaled design it needs, not the dense tensor.)
     ///
     /// Fails when a row's `sqrt(H_i)` cannot be formed (see
-    /// [`symmetric_sqrt_into`]).
+    /// `symmetric_sqrt_into`).
     ///
     /// [`evaluate_full`]: RowJacobianOperator::evaluate_full
     fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Result<Array2<f64>, CompilerError> {

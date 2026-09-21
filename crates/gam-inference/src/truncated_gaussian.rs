@@ -67,7 +67,7 @@
 //! polytope in the posterior's own `H` metric — the constrained quadratic solve
 //! the fit itself uses. A draw already inside the polytope is its own start, an
 //! exact draw from the target. The chains then burn in by the engine's doubling
-//! windows ([`crate::hmc_io::burn_in_until_mixed`]) until their draws meet the
+//! windows (`crate::hmc_io::burn_in_until_mixed`) until their draws meet the
 //! convergence targets, and only the draws after burn-in are returned.
 
 use std::collections::HashSet;

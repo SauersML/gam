@@ -451,7 +451,7 @@ where
 /// that needs fewer criterion evaluations (#3187). Tier 1 (deterministic
 /// quadrature) costs its product grid, `5^K` or `3^K` nodes; Tier 2 (NUTS over
 /// `ρ` with the exact profiled gradient) costs more than
-/// [`RHO_NUTS_MIN_EVALUATIONS`](crate::hmc_io::RHO_NUTS_MIN_EVALUATIONS)
+/// `RHO_NUTS_MIN_EVALUATIONS`
 /// value+gradient evaluations whenever it converges. Quadrature runs while its
 /// grid is no larger than that floor (`K ≤ 4`), NUTS beyond, at any `K`. A tier
 /// that fails reports an honest [`RhoPosteriorEscalation::Unavailable`]. Magic
@@ -691,7 +691,7 @@ impl DomainLaplaceProposal {
 /// * `held` — the coordinates the outer certificate railed or found on a face.
 ///   They, and every coordinate with `ρ̂` on a finite face of `support`, stay
 ///   at `ρ̂`
-///   ([`DomainLaplaceProposal`]).
+///   (`DomainLaplaceProposal`).
 /// * `criterion` — evaluates the outer criterion `−log π(ρ|y)` (the LAML/REML
 ///   objective) at a trial `ρ`, or says why it cannot. This is the
 ///   `OuterObjective::eval_cost` contract, supplied by the caller that retains

@@ -4409,7 +4409,7 @@ fn joint_mode_starts<F: CustomFamily + ?Sized>(
 /// derivatives for every candidate.
 ///
 /// The starts are the caller's, completed with the fit's fixed start
-/// ([`joint_mode_starts`]). Every start is solved once at the requested
+/// (`joint_mode_starts`). Every start is solved once at the requested
 /// derivative quality while assembling only its value. The winner is the
 /// certified candidate with the lowest penalized objective, the published-mode
 /// rule of gam#3173 ([`lowest_penalized_index`]: candidate order keeps ties

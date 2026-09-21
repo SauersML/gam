@@ -145,7 +145,7 @@ pub struct ConstraintKktDiagnostics {
     /// `g = S_λβ − score`, `‖score‖₂ + ‖S_λβ‖₂`), supplied by the caller that
     /// formed `g`. Every gradient-unit channel (stationarity, a negative
     /// multiplier, `|λ·slack|`) is certified relative to this scale and only
-    /// relative to it ([`exceeds_at_gradient_scale`]).
+    /// relative to it (`exceeds_at_gradient_scale`).
     ///
     /// The scale is the OPERANDS', not `‖g‖∞` itself: rescaling the objective
     /// by `c` scales the operands, `g` and `λ` by `c` and leaves the minimizer
@@ -3115,7 +3115,7 @@ fn scan_operator_violations(
 /// history can change how fast this solve runs but never what it returns.
 /// The two dual KKT channels of the metric projection, judged in the same
 /// units as its stationarity channel: relative to `gradient_scale`, the
-/// natural scale of the gradient ([`exceeds_at_gradient_scale`]). The
+/// natural scale of the gradient (`exceeds_at_gradient_scale`). The
 /// multipliers solve `g − A_Aᵀμ = 0` on unit rows, so they carry the
 /// gradient's scale and so does `|μ·slack|`; an absolute bar refused every
 /// high-λ seed of the survival location-scale fits at `|μ·slack| ≈ 1e-6` from

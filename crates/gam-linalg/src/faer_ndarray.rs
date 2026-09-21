@@ -277,7 +277,7 @@ pub fn decomposition_parallelism() -> Par {
 }
 
 /// #2627/#2267 — the degree every self-adjoint eigendecomposition is
-/// partitioned at: the named deployment cap [`EVD_DEPLOYMENT_DEGREE`], passed
+/// partitioned at: the named deployment cap `EVD_DEPLOYMENT_DEGREE`, passed
 /// to faer per call.
 ///
 /// **Invariance.** faer's EVD words follow the degree its arithmetic is
@@ -3718,9 +3718,9 @@ pub struct CertifiedGeneralSpectrum {
     pub backward_errors: Array1<f64>,
     /// Per slot, the band its backward error was certified against.
     /// - A `VectorResidual` slot's band is `η = η_A + 2·γ_{n+1}`
-    ///   ([`general_eigen_pair_band`]).
+    ///   (`general_eigen_pair_band`).
     /// - A `SingularValue` slot's band is `η_A` plus the SVD's and the shift's rounding
-    ///   ([`general_eigenvalue_singular_backward_error`]).
+    ///   (`general_eigenvalue_singular_backward_error`).
     ///
     /// `η_A` counts faer's iteration cap, not the iterations run, so it grows like
     /// `60·n³·u`. A decision that needs tighter evidence reads `backward_errors`.
@@ -3745,10 +3745,10 @@ pub struct CertifiedGeneralSpectrum {
 /// measured value and the band, unless all of these hold:
 /// - (i) every eigenvalue's backward error is within its band. First the
 ///   residual of faer's eigenvector ([`general_eigenpair_backward_errors`]) is
-///   compared with `η` ([`general_eigen_pair_band`]); it bounds the backward error
+///   compared with `η` (`general_eigen_pair_band`); it bounds the backward error
 ///   from above. Where it does not certify, faer's vector is not evidence either
 ///   way, so the exact backward error `σ_min(A − λI)` is measured instead
-///   ([`general_eigenvalue_singular_backward_error`]), one singular-values-only SVD
+///   (`general_eigenvalue_singular_backward_error`), one singular-values-only SVD
 ///   per such eigenvalue.
 /// - (ii) `Σ re` agrees with `tr A` ([`general_spectrum_trace_measure`]), and
 ///   Schur's inequality `Σ|λ|² ≤ ‖A‖_F²` holds
@@ -3775,7 +3775,7 @@ pub struct CertifiedGeneralSpectrum {
 ///
 /// **faer dependency.** This reads faer's info-discarding `evd_imp`, its
 /// iteration cap, and its conjugate-pair eigenvector convention. Like
-/// [`EVD_DEPLOYMENT_DEGREE`], re-read them whenever faer is bumped.
+/// `EVD_DEPLOYMENT_DEGREE`, re-read them whenever faer is bumped.
 pub fn real_general_spectrum<S: Data<Elem = f64>>(
     matrix: &ArrayBase<S, Ix2>,
 ) -> Result<CertifiedGeneralSpectrum, FaerLinalgError> {

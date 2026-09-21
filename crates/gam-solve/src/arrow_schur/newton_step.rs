@@ -814,9 +814,9 @@ pub fn prepare_sae_resident_frame(
 ///
 /// The ladder ends structurally, not after a count (#2627). On the first
 /// recoverable refusal it reads the system's declared bounds once into an
-/// [`ArrowShiftCertificate`]. A refusal at a rung those bounds certify factorable
+/// `ArrowShiftCertificate`. A refusal at a rung those bounds certify factorable
 /// cannot be cured by a larger shift and returns
-/// [`ArrowSchurError::RefusedAtCertifiedShift`] with the refusal as its cause. A
+/// `ArrowSchurError::RefusedAtCertifiedShift` with the refusal as its cause. A
 /// system with no certifiable rung (a non-finite entry or bound, an undeclared
 /// matrix-free cross block, or a next rung past the float range) returns the
 /// refusal itself, since no shift cures it.

@@ -675,7 +675,7 @@ impl FixedPointAdjoint<'_> {
 /// Write `f_k = log u_k` for the row potentials. At the fixed point
 /// `f_k = log p_k − logsumexp_j(log_kernel[:, j] + log a_j − lse0_kj)`, with
 /// `log a = Σ_k w_k lse0_k`. Scaling its Jacobian in `f` by `W = diag(w_k p_k)`
-/// gives the operator `B` of [`FixedPointAdjoint`], which is symmetric positive
+/// gives the operator `B` of `FixedPointAdjoint`, which is symmetric positive
 /// semidefinite by construction (`⟨ν, Bν⟩ ≥ 0` is Jensen's inequality on each
 /// softmax `S_k`). Its null space is the gauge `ν_k = c_k 1` with
 /// `Σ_k w_k c_k = 0`, which leaves the plans unchanged; the right-hand side is

@@ -795,7 +795,7 @@ pub(crate) fn assembled_joint_operator(
 ///
 /// Both paths differ only in:
 /// - how the joint Hessian source is obtained (exact vs surrogate family methods)
-/// - the closure for computing D_β H_L[v] (`compute_dh`)
+/// - the closure for computing `D_β H_L[v]` (`compute_dh`)
 /// - the closure for computing D²_β H_L[u, v] (`compute_d2h`)
 /// - whether a tangent-basis projection is applied to the mode inverse
 ///

@@ -1387,7 +1387,7 @@ pub struct EventHistoryFit {
     /// The returned reference grid's certificate, in posterior standard
     /// deviations: its fixed-coefficient refinement steps to the first finer
     /// grid whose steps contract, plus that grid's geometric-tail estimate
-    /// ([`select_reference_grid`]), within `quadrature_tolerance`; absent for
+    /// (`select_reference_grid`), within `quadrature_tolerance`; absent for
     /// prior centring.
     pub reference_certificate: Option<f64>,
     /// The term builder's notes on the covariate formulas: `advisories` where
@@ -2122,7 +2122,7 @@ pub(crate) fn refinement_shift(
 /// posterior sd, exceeded the tail, 2.12e-4), so the fit log prints every
 /// step it read.
 /// - `None` when the steps do not contract (`q ≥ 1`): the grid has no tail of
-///   its own, and [`select_reference_grid`] charges it its step to the next
+///   its own, and `select_reference_grid` charges it its step to the next
 ///   grid and reads that grid's tail.
 /// - Two exact zeros are a grid the objective does not read, as at rank
 ///   zero: certified at zero.
@@ -3817,7 +3817,7 @@ fn raise_incumbent(
 ///
 /// A grid that fails is not refitted rung by rung. The same fixed-coefficient
 /// steps continue until a finer grid's tail estimate certifies, the fitted
-/// grid charged its steps to that grid ([`select_reference_grid`]); only
+/// grid charged its steps to that grid (`select_reference_grid`); only
 /// when that charge exceeds the tolerance does selection repeat, once, under
 /// the coarsest grid it certifies; a rank selected under one reference grid is never read
 /// as evidence under another. Each repeat refines the grid strictly, so the

@@ -345,7 +345,7 @@ where
 /// non-degenerate face is held to a strict band (`10 · kkt_tolerance`, the same
 /// near-stationary band `near_stationary_kkt` uses). Stationarity is checked
 /// relative to `gradient_scale`, the natural scale of the operands that formed
-/// `gradient` ([`crate::active_set::exceeds_at_gradient_scale`]), exactly as the
+/// `gradient` (`crate::active_set::exceeds_at_gradient_scale`), exactly as the
 /// outer gate and the inner active-set solver do: an O(n) gradient scale (issue
 /// #879) does not leave a converged optimum stranded above a fixed absolute
 /// band (issue #989), and rescaling the objective does not move the verdict.

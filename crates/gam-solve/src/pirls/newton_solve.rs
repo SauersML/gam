@@ -1505,7 +1505,7 @@ pub(super) fn constrained_stationarity_norm(
 ///   to `KKT_TOL_COMP`, the OUTER startup gate's own bound, in the gate's own
 ///   frame: relative to `gradient_scale`, the natural scale of the operands
 ///   that formed `gradient`
-///   ([`crate::active_set::exceeds_at_gradient_scale`]). The multipliers carry
+///   (`crate::active_set::exceeds_at_gradient_scale`). The multipliers carry
 ///   the gradient's scale, so a bare absolute bar made the same fit pass or
 ///   fail under a response rescale `y → c·y`. The requirement here is
 ///   lockstep with `enforce_constraint_kkt` — an inner certificate the outer

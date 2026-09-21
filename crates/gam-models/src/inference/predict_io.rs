@@ -303,7 +303,7 @@ impl AnchoredRowKernel {
     /// `∂η/∂b = s²·b·q/c(b) + s·z` under the standard-normal law, and the
     /// implicit-function derivatives `a_q = μ′(q)/F_a`, `a_b = −F_b/F_a` of the
     /// calibrated intercept (plus `s·z` on `b`) under an empirical law. These
-    /// are the partials [`BernoulliMarginalSlopePredictor::predict_eta_and_time_tangent`]
+    /// are the partials `BernoulliMarginalSlopePredictor::predict_eta_and_time_tangent`
     /// chains a time tangent through.
     pub fn eta_and_partials(&self, q: f64, b: f64) -> Result<(f64, f64, f64), EstimationError> {
         let scale = self.probit_scale;

@@ -2374,7 +2374,7 @@ pub(crate) fn run_predict_saved_latent_binary(
 }
 
 /// Survival marginal-slope prediction publishes exactly what the library's
-/// [`predict_survival`] computes (gam#3316): the posterior-mean survival at each
+/// `predict_survival` computes (gam#3316): the posterior-mean survival at each
 /// row's own exit time from the same integration rule, the plug-in beside it by
 /// name, and the same refusal of a surface whose survival rises (gam#3026). The
 /// CLI formerly rebuilt the predictor here and published the probit-normal

@@ -91,7 +91,7 @@ impl gam_linalg::gpu_hook::GpuGemmDispatch for CudaGemmDispatch {
 /// the input matrix, not an execution fault: callers use this to decide
 /// definiteness exactly as they would with a CPU factorization. Execution
 /// faults (driver errors, illegal arguments `info < 0`) remain post-admission
-/// panics through [`complete_gpu_attempt`].
+/// panics through `complete_gpu_attempt`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CholeskyVerdict {
     /// Every matrix was factored; inputs now hold their lower Cholesky factors.

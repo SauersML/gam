@@ -436,7 +436,7 @@ pub(crate) fn linear_constraint_primal_violation(
 }
 
 /// Stationarity residual with the tangent-face normal-cone component at
-/// `beta` removed; see [`projected_stationarity_inf_norm`] for the face rule.
+/// `beta` removed; see `projected_stationarity_inf_norm` for the face rule.
 pub fn projected_linear_constraint_stationarity_vector(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
