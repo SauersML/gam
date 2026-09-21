@@ -1294,6 +1294,171 @@ fn positive_shift_fractions(x: f64, shift: f64) -> (f64, f64) {
     }
 }
 
+/// Binet's remainder `r(x) = lnΓ(x) − (x − ½) ln x + x − ½ ln 2π` of Stirling's
+/// formula, for `x > 0`; `NaN` otherwise.
+///
+/// `r` is positive and decreasing. Below the asymptotic switch it walks
+/// `r(x) = r(x + 1) + t(x)` with `t(x) = (x + ½) ln(1 + 1/x) − 1`, which is
+/// `atanh(u)/u − 1 = Σ_{k≥1} u^{2k}/(2k + 1)` for `u = 1/(2x + 1)`: a sum of
+/// positive terms, summed until the next one no longer changes it. That series
+/// converges at least as fast as `9^{−k}` for `x ≥ 1`. For `x < 1` the closed
+/// form `(x + ½)(ln(1 + x) − ln x) − 1` is used instead (finite down to the
+/// smallest subnormal `x`), and there `t > t(1) = 0.0397` against a minuend of
+/// `1 + t`, a loss under five bits. From the switch
+/// on it is the Bernoulli series `Σ_j B_{2j}/(2j(2j − 1)) x^{1−2j}` through `B₂₀`.
+/// Every piece is positive, so `r` is correct to a few ulps relative.
+pub(crate) fn ln_gamma_binet_remainder(mut x: f64) -> f64 {
+    if !(x.is_finite() && x > 0.0) {
+        return f64::NAN;
+    }
+    let mut remainder = 0.0;
+    while x < POLYGAMMA_ASYMPTOTIC_MIN_X {
+        remainder += binet_recurrence_step(x);
+        x += 1.0;
+    }
+    let inverse = 1.0 / x;
+    let inverse_squared = inverse * inverse;
+    let mut tail = 0.0;
+    for coefficient in BINET_ASYMPTOTIC_TAIL.iter().rev() {
+        tail = tail * inverse_squared + coefficient;
+    }
+    remainder + inverse * tail
+}
+
+/// `t(x) = r(x) − r(x + 1) = (x + ½) ln(1 + 1/x) − 1`; see
+/// [`ln_gamma_binet_remainder`].
+#[inline]
+fn binet_recurrence_step(x: f64) -> f64 {
+    if x < 1.0 {
+        return (x + 0.5) * (x.ln_1p() - x.ln()) - 1.0;
+    }
+    let u = 1.0 / (2.0 * x + 1.0);
+    let u_squared = u * u;
+    let mut power = u_squared;
+    let mut denominator = 3.0;
+    let mut sum = power / denominator;
+    loop {
+        power *= u_squared;
+        denominator += 2.0;
+        let next = sum + power / denominator;
+        if next == sum {
+            return next;
+        }
+        sum = next;
+    }
+}
+
+/// The Stirling gap `g(x) = x ln x − x − lnΓ(x) = ½ ln x − ½ ln 2π − r(x)`, for
+/// `x > 0`; `NaN` otherwise.
+///
+/// `g` is `O(ln x)`, while `x ln x − x` and `lnΓ(x)` are `O(x ln x)`: forming it
+/// from `lnΓ` keeps only about `log₂(1/(x·ε))` bits at large `x`. Here the three
+/// terms are each correct to a few ulps relative ([`ln_gamma_binet_remainder`]
+/// for `r`), so `g` is correct to a few ulps of `½|ln x| + ½ ln 2π + r(x)`; they
+/// cancel only where `g` crosses zero, near `x = 2π`.
+pub(crate) fn stirling_gap(x: f64) -> f64 {
+    0.5 * x.ln() - HALF_LN_TWO_PI - ln_gamma_binet_remainder(x)
+}
+
+/// `[g′(x), g″(x), …]` through the first `orders` entries (at most five) of the
+/// Stirling gap `g(x) = x ln x − x − lnΓ(x)`, for `x > 0`; those entries are
+/// `NaN` otherwise, and the entries past `orders` are zero. Entry `m` is
+/// `g⁽ᵐ⁺¹⁾(x) = D^m ln x − ψ_m(x)`, laid out as [`polygamma_positive_stack`]
+/// lays out `ψ_m`.
+///
+/// `g⁽ᵐ⁺¹⁾` is `O(x^{−m−1})`, while `D^m ln x` and `ψ_m` are `O(x^{−m})`: their
+/// difference keeps only about `log₂(1/(x·ε))` bits at large `x`. Here it is
+/// differenced in closed form:
+/// - `g′` walks `g′(x) = g′(x + 1) + (1/x − ln(1 + 1/x))`, the bracket from
+///   [`crate::special::log1p_minus_x`], up to the switch, then adds
+///   `ln x − ψ(x) = 1/(2x) − x^{−2}·Σ_j c_{0j} x^{−2j}`;
+/// - `g⁽ᵐ⁺¹⁾`, `m ≥ 1`, walks `g⁽ᵐ⁺¹⁾(x) = g⁽ᵐ⁺¹⁾(x + 1) + (−1)^m (m − 1)!
+///   x^{−m} e_m` with `e_m = (1 + v)^{−m} − 1 + m v`, `v = 1/x`, formed from
+///   `e_m = q (e_{m−1} + m v²)`, `q = x/(x + 1)`, a sum of positive terms, then
+///   adds the asymptotic `D^m ln x − ψ_m(x) = −x^{−m}·((−1)^{m+1} m!/(2x) +
+///   x^{−2}·Σ_j c_{mj} x^{−2j})`, whose leading `(−1)^{m+1}(m − 1)! x^{−m}`
+///   cancelled analytically.
+///
+/// Within one order the recurrence terms and the leading asymptotic term share
+/// the sign `(−1)^m`, and the alternating Bernoulli tail is below `x^{−2} ≤
+/// 1/400` of that leading term, so each entry is correct to a few ulps
+/// relative. The entry of order `m` does not depend on `orders`.
+pub(crate) fn stirling_gap_derivative_stack(
+    x: f64,
+    orders: usize,
+) -> [f64; POLYGAMMA_STACK_ORDERS] {
+    let orders = orders.min(POLYGAMMA_STACK_ORDERS);
+    let mut out = [0.0; POLYGAMMA_STACK_ORDERS];
+    if !(x.is_finite() && x > 0.0) {
+        out[..orders].fill(f64::NAN);
+        return out;
+    }
+    if orders == 0 {
+        return out;
+    }
+    let mut shifted = x;
+    while shifted < POLYGAMMA_ASYMPTOTIC_MIN_X {
+        let v = 1.0 / shifted;
+        out[0] -= crate::special::log1p_minus_x(v);
+        let q = shifted / (shifted + 1.0);
+        let v_squared = v * v;
+        let mut e = 0.0;
+        let mut power = 1.0;
+        for m in 1..orders {
+            e = q * (e + m as f64 * v_squared);
+            power *= v;
+            out[m] += STIRLING_GAP_RECURRENCE[m] * power * e;
+        }
+        shifted += 1.0;
+    }
+    let inverse = 1.0 / shifted;
+    let inverse_squared = inverse * inverse;
+    let mut power = 1.0;
+    for m in 0..orders {
+        let mut tail = 0.0;
+        for coefficient in POLYGAMMA_ASYMPTOTIC_TAIL[m].iter().rev() {
+            tail = tail * inverse_squared + coefficient;
+        }
+        out[m] += if m == 0 {
+            0.5 * inverse - inverse_squared * tail
+        } else {
+            let [_, half_term] = POLYGAMMA_ASYMPTOTIC_LEADING[m];
+            power *= inverse;
+            -power * (half_term * inverse + inverse_squared * tail)
+        };
+    }
+    out
+}
+
+/// `½ ln 2π`, the constant of Stirling's formula.
+const HALF_LN_TWO_PI: f64 = 0.918_938_533_204_672_8;
+
+/// `(−1)^m (m − 1)!`: the coefficient of `x^{−m} e_m` in one recurrence step of
+/// `g⁽ᵐ⁺¹⁾`, `m ≥ 1`; see [`stirling_gap_derivative_stack`]. The `m = 0` entry is
+/// unread.
+const STIRLING_GAP_RECURRENCE: [f64; POLYGAMMA_STACK_ORDERS] = {
+    let mut coefficients = [0.0; POLYGAMMA_STACK_ORDERS];
+    let mut m = 1;
+    while m < POLYGAMMA_STACK_ORDERS {
+        coefficients[m] = -polygamma_sign(m) * factorial(m - 1);
+        m += 1;
+    }
+    coefficients
+};
+
+/// `B_{2j}/(2j(2j − 1))`, `j = 1, …, 10`: Binet's remainder is
+/// `x^{−1} Σ_j b_j x^{−2(j−1)}` from the asymptotic switch on.
+const BINET_ASYMPTOTIC_TAIL: [f64; BERNOULLI_EVEN.len()] = {
+    let mut coefficients = [0.0; BERNOULLI_EVEN.len()];
+    let mut index = 0;
+    while index < BERNOULLI_EVEN.len() {
+        let (power, bernoulli) = BERNOULLI_EVEN[index];
+        coefficients[index] = bernoulli / (power as f64 * (power - 1) as f64);
+        index += 1;
+    }
+    coefficients
+};
+
 const POLYGAMMA_ASYMPTOTIC_MIN_X: f64 = 20.0;
 const BERNOULLI_EVEN: [(usize, f64); 10] = [
     (2, 1.0 / 6.0),
@@ -2649,6 +2814,80 @@ mod derivative_stack_tests {
         assert!(ln_gamma_shift_gap(1.0, -1.0).is_nan());
         assert!(ln_gamma_shift_gap(0.0, 1.0).is_nan());
         assert!(ln_gamma_shift_gap(1.0, f64::INFINITY).is_nan());
+    }
+
+    /// `g(x) = x ln x − x − lnΓ(x)` and `g⁽ᵐ⁺¹⁾ = D^m ln x − ψ_m` against
+    /// 450-digit `mpmath` values, on both sides of the recurrence/asymptotic
+    /// switch and at the large shapes of the Gamma/Beta σ → 0 limit (#4252).
+    /// `g` itself is the sum `½ ln x − ½ ln 2π − r(x)`, which crosses zero near
+    /// `x = 2π`, so its error is bounded against the magnitudes of those three
+    /// terms; every derivative and Binet's remainder `r` are bounded relative.
+    #[test]
+    fn stirling_gap_matches_high_precision_references() {
+        const REFERENCES: [(f64, f64, [f64; 5], f64); 12] = [
+            (0.03, -3.6251677803620114007, [3.0355696523298783357e1, -1.079353402693146266e3, 7.2965182931559237228e4, -7.3333391325171916858e6, 9.802469351093043739e8], 9.5295029849734780211e-1),
+            (0.5, -1.4189385332046727418, [1.27036284546147817, -2.9348022005446793094, 1.2828796644234319996e1, -8.1409091034002437236e1, 6.7547424982666722519e2], 1.5342640972002734529e-1),
+            (1.0, -1.0, [5.7721566490153286061e-1, -6.4493406684822643647e-1, 1.4041138063191885708, -4.4939394022668291491, 1.8886266123440878232e1], 8.106146679532725822e-2),
+            (3.7, -2.872408939597264835e-1, [1.4117928028866736741e-1, -3.9767587399768044864e-2, 2.2349289736589102586e-2, -1.8794883366312302016e-2, 2.1024285764506951045e-2], 2.2468770580143145898e-2),
+            (19.75, 5.6841916349807022895e-1, [2.5530041968267203351e-2, -1.3034693146732710269e-3, 1.3309063195433357712e-4, -2.0382266546174915078e-5, 4.1616249281983902554e-6], 4.219048970822466934e-3),
+            (20.0, 5.7476128388032583248e-1, [2.5208281311841942558e-2, -1.2708229352031198315e-3, 1.2812240231465459343e-4, -1.9374221339638914594e-5, 3.9059777263966684707e-6], 4.1663196919969224575e-3),
+            (20.5, 5.8720919142863302644e-1, [2.4588491436715912341e-2, -1.2091046250829440184e-3, 1.1890378188587807055e-4, -1.753832835543991611e-5, 3.4489639504833312174e-6], 4.0647184388754790051e-3),
+            (137.25, 1.5413563435229264444, [3.6474110114281494126e-3, -2.6607174691048028222e-5, 3.8818805467203232613e-7, -8.4952504216075415771e-9, 2.4788388398388202731e-10], 6.0716346722082022302e-4),
+            (2.5e7, 7.5982546548782313515, [2.0000000133333333333e-8, -8.0000001066666666667e-16, 6.400000128e-23, -7.6800002048e-30, 1.22880004096e-36], 3.3333333333333331556e-9),
+            (1.0e10, 1.0593986931757222345e1, [5.0000000000833333333e-11, -5.0000000001666666667e-21, 1.00000000005e-30, -3.0000000002e-40, 1.2000000001e-49], 8.3333333333333333333e-12),
+            (1.0e12, 1.2896572024759518029e1, [5.0000000000008333333e-13, -5.0000000000016666667e-25, 1.0000000000005e-36, -3.000000000002e-48, 1.200000000001e-59], 8.3333333333333333333e-14),
+            (1.0e100, 1.1421031611649761147e2, [4.9999999999999999205e-101, -4.999999999999999841e-201, 9.9999999999999995229e-301, 0.0, 0.0], 8.3333333333333332008e-102),
+        ];
+        let mut worst = 0.0_f64;
+        for (x, gap, derivatives, binet) in REFERENCES {
+            let remainder = ln_gamma_binet_remainder(x);
+            let relative = ((remainder - binet) / binet).abs();
+            worst = worst.max(relative);
+            assert!(
+                relative <= 8.0 * f64::EPSILON,
+                "x={x:e}: Binet remainder {remainder:+.17e} reference {binet:+.17e}"
+            );
+            let value = stirling_gap(x);
+            let magnitude = 0.5 * x.ln().abs() + HALF_LN_TWO_PI + binet;
+            assert!(
+                (value - gap).abs() <= 8.0 * f64::EPSILON * magnitude,
+                "x={x:e}: g={value:+.17e} reference={gap:+.17e}"
+            );
+            let stack = stirling_gap_derivative_stack(x, POLYGAMMA_STACK_ORDERS);
+            for order in 0..POLYGAMMA_STACK_ORDERS {
+                if derivatives[order] == 0.0 {
+                    // Below the f64 range: the entry underflows with its reference.
+                    assert_eq!(stack[order], 0.0, "x={x:e} order={order}");
+                    continue;
+                }
+                let relative =
+                    (stack[order] - derivatives[order]).abs() / derivatives[order].abs();
+                worst = worst.max(relative);
+                assert!(
+                    relative <= 8.0 * f64::EPSILON,
+                    "x={x:e} order={order}: g={:+.17e} reference={:+.17e} relative error {relative:e}",
+                    stack[order],
+                    derivatives[order]
+                );
+            }
+            for orders in 1..POLYGAMMA_STACK_ORDERS {
+                let partial = stirling_gap_derivative_stack(x, orders);
+                assert_eq!(partial[..orders], stack[..orders], "x={x:e} orders={orders}");
+                assert!(partial[orders..].iter().all(|&entry| entry == 0.0));
+            }
+        }
+        eprintln!("Stirling gap: worst relative error {worst:e}");
+        // The cancelling forms this kernel replaces, at a Gamma shape of 1e10.
+        let x = 1.0e10;
+        let naive_first = x.ln() - digamma_positive(x);
+        assert!(
+            ((naive_first - 5.0000000000833333333e-11) / 5.0000000000833333333e-11).abs() > 1.0e-9,
+            "ln x − ψ(x) was expected to cancel at x={x:e}: {naive_first:e}"
+        );
+        assert!(stirling_gap_derivative_stack(0.0, 2)[..2].iter().all(|g| g.is_nan()));
+        assert!(stirling_gap_derivative_stack(f64::INFINITY, 2)[..2].iter().all(|g| g.is_nan()));
+        assert!(stirling_gap(0.0).is_nan());
+        assert!(ln_gamma_binet_remainder(-1.0).is_nan());
     }
 }
 

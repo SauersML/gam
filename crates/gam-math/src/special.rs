@@ -554,6 +554,37 @@ pub fn ln_gamma_shift_gap(x: f64, shift: f64) -> f64 {
     crate::jet_tower::ln_gamma_shift_gap(x, shift)
 }
 
+/// Binet's remainder `r(x) = lnΓ(x) − (x − ½) ln x + x − ½ ln 2π` of Stirling's
+/// formula, for `x > 0`; `NaN` otherwise. Correct to a few ulps relative at every
+/// `x`, where `lnΓ(x) − (x − ½) ln x + x` cancels `O(x ln x)` magnitudes down to
+/// `r(x) ≈ 1/(12x)`.
+#[inline]
+pub fn ln_gamma_binet_remainder(x: f64) -> f64 {
+    crate::jet_tower::ln_gamma_binet_remainder(x)
+}
+
+/// The Stirling gap `g(x) = x ln x − x − lnΓ(x) = ½ ln x − ½ ln 2π − r(x)` for
+/// `x > 0`, `NaN` otherwise; correct to a few ulps of `½|ln x| + ½ ln 2π + r(x)`,
+/// where forming it from `lnΓ` cancels `O(x ln x)` magnitudes.
+#[inline]
+pub fn stirling_gap(x: f64) -> f64 {
+    crate::jet_tower::stirling_gap(x)
+}
+
+/// `[g′(x), g″(x), …]` of the Stirling gap `g(x) = x ln x − x − lnΓ(x)` through
+/// the first `orders` entries (at most five), zero past them; for `x ≤ 0` or
+/// non-finite `x` those entries are `NaN`. Entry `m` is `D^m ln x − ψ_m(x)`,
+/// laid out as [`polygamma_stack`] lays out `ψ_m`.
+///
+/// Where a likelihood carries `x ln x − x − lnΓ(x)` (the Gamma shape, the Beta
+/// precision), its derivatives formed from [`polygamma_stack`] cancel
+/// `O(x^{−m})` magnitudes down to `O(x^{−m−1})`; here every entry is correct to
+/// a few ulps relative.
+#[inline]
+pub fn stirling_gap_derivative_stack(x: f64, orders: usize) -> [f64; 5] {
+    crate::jet_tower::stirling_gap_derivative_stack(x, orders)
+}
+
 /// Gauss-Legendre nodes and weights on `[-1, 1]` for `n` points, computed via
 /// Newton iteration on the Legendre-polynomial roots (Bonnet's three-term
 /// recurrence, cosine initial guess). Returns `(nodes, weights)` with nodes

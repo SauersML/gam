@@ -323,7 +323,7 @@ fn retired_row_kernel(
         DispersionFamilyKind::Gamma => {
             let mu = em.exp();
             let nu = ed.exp();
-            let loglik = dispersion_gamma_loglik(yi, yi, mu, nu, wi);
+            let loglik = dispersion_gamma_loglik(yi, mu, nu, wi);
             let s_nu = nu.ln() + 1.0 - mu.ln() - gam_math::special::digamma(nu) + yi.ln()
                 - (1.0 / mu) * yi;
             let info_nu = gam_math::special::trigamma(nu) - nu.recip();
@@ -566,38 +566,50 @@ fn corrupted(mut stacks: DispersionRowStacks) -> DispersionRowStacks {
             *theta_share *= bump;
         }
         DispersionRowStacks::Gamma {
+            response_fit,
+            response_excess,
             response_ratio,
-            digamma_shape,
-            trigamma_shape,
-            tetragamma_shape,
+            shape_gap_first,
+            shape_gap_second,
+            shape_gap_third,
             ..
         } => {
+            *response_fit *= bump;
+            *response_excess *= bump;
             *response_ratio *= bump;
-            *digamma_shape *= bump;
-            *trigamma_shape *= bump;
-            *tetragamma_shape *= bump;
+            *shape_gap_first *= bump;
+            *shape_gap_second *= bump;
+            *shape_gap_third *= bump;
         }
         DispersionRowStacks::Beta {
             mean_first,
             mean_second,
             mean_third,
-            digamma_precision,
-            trigamma_precision,
-            tetragamma_precision,
-            digamma_first_shape,
-            trigamma_first_shape,
-            tetragamma_first_shape,
+            divergence,
+            divergence_first,
+            divergence_second,
+            divergence_third,
+            precision_gap_first,
+            precision_gap_second,
+            precision_gap_third,
+            first_shape_gap_first,
+            first_shape_gap_second,
+            first_shape_gap_third,
             ..
         } => {
             *mean_first *= bump;
             *mean_second *= bump;
             *mean_third *= bump;
-            *digamma_precision *= bump;
-            *trigamma_precision *= bump;
-            *tetragamma_precision *= bump;
-            *digamma_first_shape *= bump;
-            *trigamma_first_shape *= bump;
-            *tetragamma_first_shape *= bump;
+            *divergence *= bump;
+            *divergence_first *= bump;
+            *divergence_second *= bump;
+            *divergence_third *= bump;
+            *precision_gap_first *= bump;
+            *precision_gap_second *= bump;
+            *precision_gap_third *= bump;
+            *first_shape_gap_first *= bump;
+            *first_shape_gap_second *= bump;
+            *first_shape_gap_third *= bump;
         }
         DispersionRowStacks::TweediePositive {
             mean_term,
@@ -659,22 +671,28 @@ fn with_values(mut stacks: DispersionRowStacks, row: Row) -> DispersionRowStacks
         }
         DispersionRowStacks::Gamma {
             shape,
-            ln_gamma_shape,
+            log_response,
+            shape_gap,
             ..
         } => {
-            *ln_gamma_shape = ln_gamma(*shape);
+            *log_response = row.y.ln();
+            *shape_gap = stirling_gap(*shape);
         }
         DispersionRowStacks::Beta {
             precision,
             mean,
-            ln_gamma_precision,
-            ln_gamma_first_shape,
-            ln_gamma_second_shape,
+            log_response,
+            log_complement,
+            precision_gap,
+            first_shape_gap,
+            second_shape_gap,
             ..
         } => {
-            *ln_gamma_precision = ln_gamma(*precision);
-            *ln_gamma_first_shape = ln_gamma(*mean * *precision);
-            *ln_gamma_second_shape = ln_gamma((1.0 - *mean) * *precision);
+            *log_response = row.y.ln();
+            *log_complement = (-row.y).ln_1p();
+            *precision_gap = stirling_gap(*precision);
+            *first_shape_gap = stirling_gap(*mean * *precision);
+            *second_shape_gap = stirling_gap((1.0 - *mean) * *precision);
         }
         DispersionRowStacks::TweediePositive {
             series_value,
@@ -821,6 +839,77 @@ fn dispersion_row_programs_match_the_retired_hand_derivatives_932() {
         );
         if !(value <= 1.0) {
             failures.push(format!("{name} value channel: {value:.3e} bands"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// #4252: at the σ→0 boundary (shape or precision `10¹⁰ … 10¹⁴`) the Gamma and
+/// Beta rows keep full precision in every production channel. The references
+/// are 80-digit mpmath evaluations of the lnΓ-form density, its η-space score,
+/// observed curvature and Fisher information at these exact `f64` inputs
+/// (`η_μ = 0`, so `μ = 1` for Gamma and `μ = ½` for Beta are exact, and `y` sits
+/// 0.7 standard deviations above the mean). The retired lnΓ/ψ′ forms, which
+/// difference `O(ν ln ν)` and `O(1/ν)` terms, are printed alongside for scale.
+#[test]
+fn gamma_and_beta_rows_are_accurate_at_large_shape_4252() {
+    struct Reference {
+        kind: DispersionFamilyKind,
+        eta_d: f64,
+        y: f64,
+        loglik: f64,
+        score_mu: f64,
+        score_d: f64,
+        hessian_dd: f64,
+        fisher_d: f64,
+        step_d: f64,
+    }
+    let gamma = DispersionFamilyKind::Gamma;
+    let beta = DispersionFamilyKind::Beta;
+    #[rustfmt::skip]
+    let references = [
+        Reference { kind: gamma, eta_d: 23.025850929940457, y: 1.000007, loglik: 10.348981075102735, score_mu: 70000.0000009027, score_d: 0.2550011433293454, hessian_dd: -0.24499885668732124, fisher_d: 0.5000000000166667, step_d: 0.5100022866416908 },
+        Reference { kind: gamma, eta_d: 27.631021115928547, y: 1.0000007, loglik: 12.651571439117804, score_mu: 699999.9999646172, score_d: 0.25500011435812436, hessian_dd: -0.24499988564204228, fisher_d: 0.5000000000001666, step_d: 0.5100002287160788 },
+        Reference { kind: gamma, eta_d: 32.23619130191664, y: 1.00000007, loglik: 14.954157059056318, score_mu: 7000000.001866633, score_d: 0.2550000113026696, hessian_dd: -0.24499998869733208, fisher_d: 0.5000000000000017, step_d: 0.5100000226053375 },
+        Reference { kind: beta, eta_d: 23.025850929940457, y: 0.5000035, loglik: 11.04213411233718, score_mu: 35000.000001023014, score_d: 0.2550000000126787, hessian_dd: -0.2450000000373213, fisher_d: 0.50000000005, step_d: 0.5099999999743574 },
+        Reference { kind: beta, eta_d: 27.631021115928547, y: 0.50000035, loglik: 13.344719205344495, score_mu: 349999.99998236576, score_d: 0.25500000002495776, hessian_dd: -0.24499999997554225, fisher_d: 0.5000000000005, step_d: 0.5100000000494055 },
+        Reference { kind: beta, eta_d: 32.23619130191664, y: 0.500000035, loglik: 15.647304298182931, score_mu: 3500000.000933322, score_d: 0.2549999998693379, hessian_dd: -0.2450000001306671, fisher_d: 0.500000000000005, step_d: 0.5099999997386707 },
+    ];
+    let mut failures = Vec::new();
+    for reference in &references {
+        let Reference { kind, eta_d, y, .. } = *reference;
+        let name = if matches!(kind, DispersionFamilyKind::Gamma) { "gamma" } else { "beta" };
+        let (_, score, hessian) = DispersionRowStacks::at(kind, y, 0.0, eta_d, 3).order2();
+        let kernel = dispersion_row_kernel(kind, y, 0.0, eta_d, 1.0);
+        let retired = retired_row_kernel(kind, y, 0.0, eta_d, 1.0);
+        let ([_, retired_score_d], _) = retired_eta_loglik_second(kind, y, 0.0, eta_d);
+        let channels = [
+            ("row_loglik", dispersion_row_loglik(kind, y, 0.0, eta_d, 1.0), reference.loglik, retired.loglik),
+            ("kernel_loglik", kernel.loglik, reference.loglik, retired.loglik),
+            ("score_mu", score[0], reference.score_mu, f64::NAN),
+            ("score_d", score[1], reference.score_d, retired_score_d),
+            ("hessian_dd", hessian[1][1], reference.hessian_dd, f64::NAN),
+            ("kernel_disp_weight", kernel.disp_weight, reference.fisher_d, retired.disp_weight),
+            (
+                "kernel_disp_step",
+                kernel.disp_response - eta_d,
+                reference.step_d,
+                retired.disp_response - eta_d,
+            ),
+        ];
+        for (label, production, exact, retired) in channels {
+            let bands = in_bands(production, exact);
+            eprintln!(
+                "LARGE-SHAPE-4252 member={name} eta_d={eta_d} channel={label} \
+                 production_err={:.3e} retired_err={:.3e} bands={bands:.3e}",
+                (production - exact).abs(),
+                (retired - exact).abs(),
+            );
+            if !(bands <= 1.0) {
+                failures.push(format!(
+                    "{name} eta_d={eta_d} {label}: {production:e} vs exact {exact:e} ({bands:.3e} bands)"
+                ));
+            }
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

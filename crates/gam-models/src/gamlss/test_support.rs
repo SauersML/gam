@@ -197,6 +197,35 @@ pub(crate) fn order2_ln_gamma<const K: usize>(
     gam_math::jet_scalar::JetScalar::ln_gamma(x)
 }
 
+/// `[g, g′, g″, g‴, g⁗]` of the Stirling gap `g(x) = x ln x − x − ln Γ(x)` at
+/// `x`, the `compose_unary` stack the Gamma/Beta gap-form oracles lift onto a
+/// jet (#4252).
+#[inline]
+pub(crate) fn stirling_gap_jet_stack(x: f64) -> [f64; 5] {
+    let derivatives = gam_math::special::stirling_gap_derivative_stack(x, 4);
+    [
+        gam_math::special::stirling_gap(x),
+        derivatives[0],
+        derivatives[1],
+        derivatives[2],
+        derivatives[3],
+    ]
+}
+
+/// `[L₁, L₁′, L₁″, L₁‴, L₁⁗]` of `L₁(x) = ln(1 + x) − x` at `x`, with
+/// `L₁′ = −x/(1 + x)` and `L₁⁽ᵏ⁾ = (−1)^{k−1}(k − 1)!/(1 + x)^k` for `k ≥ 2`.
+#[inline]
+pub(crate) fn log1p_minus_x_jet_stack(x: f64) -> [f64; 5] {
+    let r = 1.0 / (1.0 + x);
+    [
+        gam_math::special::log1p_minus_x(x),
+        -x * r,
+        -r * r,
+        2.0 * r * r * r,
+        -6.0 * r * r * r * r,
+    ]
+}
+
 /// Observed η-space row NLL tower, both predictors as jet variables (`η_μ` axis 0,
 /// `η_d` axis 1). Oracle for the row-program production row derivatives in
 /// `dispersion_family` (`eta_space_row_program_derivatives_match_the_towers`).
