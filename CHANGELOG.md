@@ -1,5 +1,21 @@
 ## Unreleased
 
+- **Multinomial smooth significance is a softmax score test, and the saved model format
+  moves to version 3** (#3569, #1101). `MultinomialSavedModel::smooth_significance` ran a
+  per-class Wood rank-truncated Wald test. It now runs the shared variance-component score
+  test on the stacked softmax fit, at the working score `b = Gθ̂ + ∇ℓ(θ̂) = XᵀWz` rather
+  than `Hθ̂`, which is the same object only at a mode of the penalized likelihood and so was
+  wrong for a fit that armed the Jeffreys/Firth prior. With `K ≥ 3` each term also gets a
+  joint row tested against `(I − 11ᵀ/K) ⊗ S_l`, the inverse of the covariance of the
+  reference contrasts of `K` iid class effects, so the joint statistic does not move when the
+  reference class changes. Three things break. `smooth_significance` returns `Result`, and a
+  row the test cannot be formed for now carries a typed reason instead of being dropped
+  silently. `MultinomialSmoothTermSpan` persists the term's structural penalties and no
+  longer stores `nullspace_dim`, so the saved model format is version 3 and the envelope gate
+  refuses a version 2 payload: a multinomial model saved by an earlier build must be refitted.
+  The FFI and Python rows gain `contrast` and `class`, make `edf` optional, and report
+  `ref_df`, `statistic` and `p_value` as absent on a refused row.
+
 - **The joint encode row solve stops on quantities the problem states** (#4498).
   `joint_encode_refine_row` declared a row converged when `‖Jᵀ M r‖ ≤ 1e-10·(1 + ‖x‖)`.
   The gradient carries units of output² per latent unit and the bound carries units
