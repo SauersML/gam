@@ -492,10 +492,36 @@ def _build_design_penalty(
         for b_j in marg_designs[1:]:
             n = design.shape[0]
             design = (design.unsqueeze(2) * b_j.unsqueeze(1)).reshape(n, -1)
-        # Penalty: single-λ Kronecker-sum  S = Σ_a I ⊗ S_a ⊗ I  (mgcv te()-style
-        # isotropic tensor penalty), matching the Rust TensorBSpline penalty
-        # `S = Σ_i I ⊗ … ⊗ S_i ⊗ … ⊗ I` (the MarginalKroneckerSum branch of
-        # `gam_terms::smooth::term_specs::build_tensor_bspline_basis`).
+        # Penalty: single-λ Kronecker-sum  S = Σ_a I ⊗ S_a ⊗ I, an mgcv
+        # te()-style isotropic tensor penalty.
+        #
+        # THIS IS NOT THE PENALTY RUST BUILDS FOR THE SAME SPEC (gam#4492). The
+        # comment here used to claim it matched the `MarginalKroneckerSum`
+        # branch of `gam_terms::smooth::term_specs::build_tensor_bspline_basis`;
+        # it does not, in three ways, and the claim is removed rather than left
+        # standing while the divergence is open:
+        #
+        #   * Rust emits ONE CANDIDATE PER MARGIN, each with its own λ. This
+        #     sums them under a single λ, so anisotropic smoothing cannot be
+        #     expressed at all and `λ̂` is not comparable with `gamfit.fit`'s.
+        #   * Rust measures the other margins by their FUNCTION Grams,
+        #     `S_dim = G_0/m_0 ⊗ … ⊗ S̃_dim ⊗ … ⊗ G_{d-1}/m_{d-1}` with
+        #     `m_j = 1ᵀG_j1`. `I ⊗ S_a ⊗ I` measures them by their
+        #     COEFFICIENTS, which agrees with the integral only where those
+        #     bases are Gram-orthonormal (#1561, SPEC rule 5: penalties are on
+        #     the function, never on the coefficients).
+        #   * Rust puts the marginal roughness through
+        #     `normalize_penalty_in_constrained_space` first, so each λ carries
+        #     no basis-size or length unit (#2315). The raw `S_a` here makes the
+        #     relative weight of the margins depend on their knot counts and
+        #     domain lengths.
+        #
+        # The fix is not a better penalty here: it is to ask the Rust term
+        # builder for the realized candidates and delete this branch. That needs
+        # an FFI entry returning the realized chart and candidate list, and a
+        # torch REML backend that takes several penalty blocks per smooth (one λ
+        # each), in that order -- deleting this first would leave the torch path
+        # unable to fit a TensorBSpline at all.
         total = 1
         for k in sizes:
             total *= k
@@ -526,10 +552,26 @@ def _build_design_penalty(
         # Design: Matérn kernel evaluated points-vs-centers, autograd VJP back to
         # `points` via the analytic Rust input-location jet (matern_evaluate).
         design = matern_evaluate(smooth, points)
-        # Penalty: the Matérn covariance Gram K_cc among centers — the
-        # REML-compatible RKHS penalty by Duchon's kernel-Gram identity (the
-        # RKHS norm of f = Σ αᵢ k(·, cᵢ) is αᵀ K_cc α). centers/length_scale/ν
-        # are structural, so this carries no autograd path.
+        # Penalty: the Matérn covariance Gram K_cc among centers — the RKHS
+        # norm of `f = Σ αᵢ k(·, cᵢ)`, which is `αᵀ K_cc α` by the kernel-Gram
+        # identity. centers/length_scale/ν are structural, so this carries no
+        # autograd path.
+        #
+        # RUST NEVER FITS A MATÉRN TERM THIS WAY (gam#4492), and the divergence
+        # is recorded here rather than left implicit. Rust's default path uses
+        # the ν-gated collocation operator candidates (D0/D1/D2 dials gated by
+        # `DuchonOperatorPenaltySpec::matern_for_smoothness`, #707), and its
+        # double-penalty path uses the chart-restricted `Zᵀ K Z` factor built
+        # from K's own spectrum against its roundoff envelope, plus the centre
+        # function Gram candidate. Both go through the kernel identifiability
+        # chart `Z` and carry more than one λ. This branch has no chart, has one
+        # λ, and checks `K_cc` against no roundoff envelope before it becomes a
+        # penalty -- it only symmetrizes it. So
+        # `gamfit.torch.fit(x, y, Matern(...))` fits a different model, with a
+        # different number of smoothing parameters, than `gamfit.fit` does for
+        # the same term. The fix is the same one the TensorBSpline branch above
+        # describes: the realized Rust candidates through a new FFI entry, then
+        # this branch deleted.
         centers_np = centers_t.detach().cpu().to(torch.float64).numpy()
         gram_np = _matern_basis(
             centers_np,
