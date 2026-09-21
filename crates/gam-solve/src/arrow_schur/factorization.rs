@@ -136,11 +136,17 @@ pub(crate) fn try_factor_blocks_batched(
     Ok(Some(ArrowFactorSlab::from_blocks(blocks)))
 }
 
+/// Curvature scale of a row block, `max_a |H_tt[a,a]|`, in the block's own
+/// units. It is deliberately NOT clamped to `1`: every gate measured against it
+/// (the safe-inversion pivot floor, the gauge-qualification bar, the certified
+/// proximal-shift pivot floor) then scales by `c²` when the latent coordinates
+/// are rescaled by `1/c`, so the accept/ridge verdicts are unit-covariant
+/// (#4483). A clamp made an O(1e-6)-curvature block meet an absolute `√ε`
+/// floor that the same block in O(1) units never sees.
 pub(crate) fn row_block_diag_scale(row: &ArrowRowBlock, d: usize) -> f64 {
     (0..d)
         .map(|a| row.htt[[a, a]].abs())
         .fold(0.0_f64, f64::max)
-        .max(1.0)
 }
 
 /// Diagonal-ratio condition-number proxy for an SPD matrix from its lower
@@ -197,8 +203,95 @@ pub(crate) fn cholesky_factor_min_pivot_estimate(factor: &Array2<f64>) -> f64 {
     min_pivot
 }
 
+/// Relative pivot floor `√ε · diag_scale` for the safe-inversion gate: a
+/// Cholesky pivot below it has lost half the working precision relative to the
+/// block's own curvature scale. Relative, never absolute (#4483).
 pub(crate) fn safe_spd_pivot_min(diag_scale: f64) -> f64 {
-    f64::EPSILON.sqrt() * diag_scale.max(1.0)
+    f64::EPSILON.sqrt() * diag_scale
+}
+
+/// Closed-form per-row ridge (#4483): the smallest `r ≥ ridge_t` for which the
+/// floating-point Cholesky of `H_tt + r·I` is guaranteed to pass the
+/// safe-inversion gate [`cholesky_factor_passes_safe_inversion`], computed from
+/// the block's symmetric spectrum instead of a reactive search.
+///
+/// Exact arithmetic. Every Cholesky pivot `L_ii²` of an SPD `M = L Lᵀ` is the
+/// Schur complement of `M`'s leading `i×i` block, i.e. `1/[(M_{≤i})⁻¹]_{ii}`,
+/// so by Cauchy interlacing it lies in `[λ_min(M), λ_max(M)]`. Hence the
+/// diagonal-ratio proxy `(max L_ii / min L_ii)² ≤ κ₂(M)` and
+/// `min L_ii² ≥ λ_min(M)`, and with `M = H + r·I`, `p = √ε·max_a|H_aa|`,
+/// `κ = safe_spd_kappa_max(d)` the gate passes whenever
+///     r ≥ p − λ_min(H)                              (pivot floor)
+///     r ≥ (λ_max(H) − κ·λ_min(H)) / (κ − 1)         (κ ceiling).
+///
+/// Rounding. The factor actually tested is `L̂ L̂ᵀ = M + E` with
+/// `|E| ≤ γ_{d+1}|L̂||L̂ᵀ|` (Higham, ASNA 2nd ed., Thm 10.3) and
+/// `‖|L̂||L̂ᵀ|‖₂ ≤ d(1 − dγ_{d+1})⁻¹‖M‖₂`, so `‖E‖₂ ≤ c_ch·(s + r)` with
+/// `c_ch = dγ_{d+1}/(1 − dγ_{d+1})` and `s = max|λ(H)|`. The symmetric
+/// eigensolver is backward stable, `λ̂ = λ(H + F)`, and its `‖F‖₂` is charged at
+/// the same order, `c_ch·s`. Weyl then puts every eigenvalue of `L̂L̂ᵀ` within
+/// `δ = c·(s + r)`, `c = 2·c_ch`, of `λ̂ + r`. Requiring the gate on the
+/// δ-shrunk interval `[λ̂_min + r − δ, λ̂_max + r + δ]` gives the two linear
+/// conditions solved below. `δ ≥ 4u·(λ_max + r)` also covers the few-ulp
+/// rounding of the proxy's own `v·v` and `(max/min)²`.
+///
+/// `Err` only for a non-finite block, a failed eigendecomposition, or a
+/// non-finite result: there is then no finite ridge to derive.
+pub(crate) fn closed_form_row_ridge(
+    row: &ArrowRowBlock,
+    d: usize,
+    ridge_t: f64,
+    diag_scale: f64,
+) -> Result<f64, String> {
+    // The Cholesky reads only the lower triangle; the spectrum must be of the
+    // same symmetric matrix it factors.
+    let mut sym = Array2::<f64>::zeros((d, d));
+    for i in 0..d {
+        for j in 0..=i {
+            let v = row.htt[[i, j]];
+            if !v.is_finite() {
+                return Err(format!("H_tt carries a non-finite entry at ({i},{j})"));
+            }
+            sym[[i, j]] = v;
+            sym[[j, i]] = v;
+        }
+    }
+    let (lambda_min, lambda_max) = if d == 1 {
+        (sym[[0, 0]], sym[[0, 0]])
+    } else {
+        let (evals, _) = sym
+            .eigh(Side::Lower)
+            .map_err(|e| format!("symmetric eigendecomposition of H_tt failed: {e:?}"))?;
+        evals.iter().fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(lo, hi), &v| (lo.min(v), hi.max(v)),
+        )
+    };
+    if !(lambda_min.is_finite() && lambda_max.is_finite()) {
+        return Err(format!(
+            "H_tt spectrum [{lambda_min:e}, {lambda_max:e}] is not finite"
+        ));
+    }
+    let spectral_radius = lambda_min.abs().max(lambda_max.abs());
+    let dim = d as f64;
+    let unit_roundoff = 0.5 * f64::EPSILON;
+    let gamma = (dim + 1.0) * unit_roundoff / (1.0 - (dim + 1.0) * unit_roundoff);
+    let cholesky_rel = dim * gamma / (1.0 - dim * gamma);
+    let c = 2.0 * cholesky_rel;
+    let pivot_min = safe_spd_pivot_min(diag_scale);
+    let kappa_max = safe_spd_kappa_max(d);
+    let pivot_ridge = (pivot_min - lambda_min + c * spectral_radius) / (1.0 - c);
+    let kappa_ridge = (lambda_max - kappa_max * lambda_min
+        + c * spectral_radius * (1.0 + kappa_max))
+        / (kappa_max * (1.0 - c) - 1.0 - c);
+    let ridge = ridge_t.max(pivot_ridge).max(kappa_ridge);
+    if ridge.is_finite() {
+        Ok(ridge)
+    } else {
+        Err(format!(
+            "closed-form ridge is not finite (spectrum [{lambda_min:e}, {lambda_max:e}])"
+        ))
+    }
 }
 
 pub(crate) fn cholesky_factor_passes_safe_inversion(
@@ -1001,256 +1094,235 @@ pub(crate) fn factor_one_row_result(
     }
     // Everything below indexes the block, so it must use the block's dimension.
     let d = htt_rows;
-    // Per-row adaptive Tikhonov ridge. A non-convex objective (e.g. softmax
+    // Per-row Tikhonov ridge (#4483). A non-convex objective (e.g. softmax
     // assignment) can leave an individual token's latent Hessian H_tt^(i)
-    // indefinite, so `H_tt + ridge_t·I` has a negative Cholesky pivot. Rather
-    // than fail and force the OUTER LM loop to lift `ridge_t` for EVERY row
-    // (over-damping the well-conditioned tokens), damp only this block by the
-    // minimal amount it needs: escalate this row's ridge geometrically from the
-    // caller's base `ridge_t` until the factor is positive-definite. A
-    // positive-definite block factors at the base ridge with zero escalation,
-    // so the common case is bit-for-bit unchanged. The escalation is capped
-    // relative to the block's diagonal scale, so a genuinely broken block
-    // (non-finite, or unboundedly indefinite) still surfaces as
-    // `PerRowFactorFailed` for the outer loop to handle rather than looping.
-    // Per-row ridge escalation policy. The escalation starts at the caller's
-    // base ridge (or, if that is zero, a tiny seed scaled by the block's
-    // diagonal magnitude), multiplies geometrically each rejection, and is
-    // capped at a large multiple of the base scale so a genuinely broken block
-    // surfaces as an error instead of looping forever.
-    // The three magnitudes are tied to each other and to the block's own
-    // diagonal scale, so the escalation terminates in a bounded number of
-    // attempts with the ridge never exceeding the curvature it is damping:
-    //   * with no caller ridge, `ridge_cap = 1e-12·diag · 1e12 = diag`, so the
-    //     ladder runs `1e-10·diag → 1·diag` in 10 rejections and its last
-    //     admissible rung is exactly the block's own diagonal scale. Past that
-    //     the "factorization" would be of the ridge rather than of `H_tt`, and
-    //     reporting `PerRowFactorFailed` is the honest answer;
-    //   * with a caller ridge `ridge_t > 0`, `ridge_cap = 1e12 · ridge_t`, so
-    //     the same decade-per-rejection ladder terminates after 12 rejections.
-    // Every quantity is a FRACTION of `diag_scale`, so the policy is invariant
-    // to the units of the latent block.
-    const RIDGE_GROWTH_FACTOR: f64 = 10.0;
-    const RIDGE_SEED_DIAG_FRACTION: f64 = 1.0e-10;
-    const RIDGE_CAP_DIAG_FRACTION: f64 = 1.0e-12;
-    const RIDGE_CAP_SCALE: f64 = 1.0e12;
+    // indefinite, and a rank-deficient / over-parameterised decoder atom can
+    // leave it barely PD (pivots ~ε·trace). Either way `H_tt + ridge_t·I` fails
+    // the safe-inversion gate. Rather than fail and force the OUTER LM loop to
+    // lift `ridge_t` for EVERY row (over-damping the well-conditioned tokens),
+    // damp only this block, by the closed-form minimal ridge
+    // [`closed_form_row_ridge`] derived from its own spectrum, and factor ONCE
+    // there (gam#578: the ridge regularises the deficient directions instead of
+    // aborting the fit). A block that passes at the base ridge is factored there
+    // with zero escalation, bit-for-bit as before. Every threshold is relative to
+    // the block's own curvature (`diag_scale` is unclamped), so the verdict and
+    // the applied ridge are exactly unit-covariant: rescaling H_tt by c² rescales
+    // the ridge by c².
     let diag_scale = row_block_diag_scale(row, d);
-    let ridge_cap = ridge_t.max(RIDGE_CAP_DIAG_FRACTION * diag_scale) * RIDGE_CAP_SCALE;
-    let mut ridge_eff = ridge_t;
-    // Escalate the per-row ridge until the block is BOTH positive-definite AND
-    // well-conditioned. Previously the escalation only fired on a *failed*
-    // Cholesky (indefinite block); a barely-PD but ill-conditioned block
-    // (pivots ~ε·trace — e.g. a rank-deficient / over-parameterized decoder
-    // atom) factored successfully and was then rejected outright as
-    // `PerRowFactorIllConditioned`, so the ridge the SAE audit advertises
-    // ("the Arrow-Schur ridge will regularise the deficient directions") never
-    // got the chance to. Folding the κ proxy into the loop lets the ridge lift
-    // just enough to regularise the deficient directions, as advertised,
-    // instead of aborting the whole fit (gam#578). A genuinely PD,
-    // well-conditioned block factors at the base ridge with zero escalation and
-    // is bit-for-bit unchanged; only a block that cannot be conditioned even at
-    // `ridge_cap` (1e12 × base) still surfaces an error for the outer loop.
-    let factor = loop {
-        match factor_row_block_cholesky(row, ridge_eff, d) {
-            Ok(factor) => {
-                // Evidence/log-det-only callers tolerate ill-conditioning: the
-                // factor is genuinely PD, so its diagonal gives an exact log|S|
-                // and an inaccurate Δβ would be discarded anyway.
-                if evidence_factorization {
-                    if ridge_t == 0.0
-                        && !row_gauges.is_empty()
-                        && let Some(deflated) =
-                            factor_gauge_deflated_evidence_row(row, d, row_gauges)
+    let base_rejection = match factor_row_block_cholesky(row, ridge_t, d) {
+        Ok(factor) => {
+            // Evidence/log-det-only callers tolerate ill-conditioning: the
+            // factor is genuinely PD, so its diagonal gives an exact log|S|
+            // and an inaccurate Δβ would be discarded anyway.
+            if evidence_factorization {
+                if ridge_t == 0.0
+                    && !row_gauges.is_empty()
+                    && let Some(deflated) =
+                        factor_gauge_deflated_evidence_row(row, d, row_gauges)
+                {
+                    return Ok(deflated);
+                }
+                // #1377 — route-independent intrinsic-dimension-flat recovery.
+                // At `ridge_t = 0` the undamped per-row Cholesky of a #1273
+                // intrinsic-dimension-flat block sits on a knife-edge: the
+                // marginal pivot of the flat direction rounds to a *tiny
+                // positive* value on one route (Cholesky succeeds → this `Ok`
+                // arm) and to `≤ 0` on the other (Cholesky fails → the `Err`
+                // arm below). The `Err` arm already deflates that flat
+                // direction to UNIT stiffness via
+                // `factor_spectral_deflated_criterion_row_with_geometry` (`log 1 = 0`
+                // contribution), but this `Ok` arm previously returned the RAW
+                // barely-PD factor whose tiny pivot contributes a large
+                // `2·ln(√ε)` instead. The two memory-budget routes (dense
+                // `factor_blocks_for_system` vs the streaming per-row
+                // factor) then disagreed on the
+                // per-row log-det, breaking the streaming-plan identical-logdet
+                // invariant and surfacing as a NON-PD `H_tt` on whichever route
+                // landed on the failing side of the edge.
+                //
+                // Unify the two arms: when this is the SAE evidence path
+                // (`allow_spectral_deflation`) and the just-computed factor is
+                // NOT safely invertible (a near-flat / rank-deficient block, by
+                // the SAME κ / min-pivot proxy used for the Δβ-accuracy gate
+                // below), deflate it through the identical spectral recovery the
+                // `Err` arm uses. A genuinely well-conditioned PD block
+                // (`λ ≫ floor`) passes the safe-inversion proxy and is returned
+                // bit-for-bit unchanged, so #1273's recovery and every healthy
+                // block are untouched — only the marginal flat direction is now
+                // deflated identically regardless of which side of the pivot
+                // knife-edge a route lands on.
+                if ridge_t == 0.0 && allow_spectral_deflation {
+                    let kappa_est = cholesky_factor_kappa_estimate(&factor);
+                    if !cholesky_factor_passes_safe_inversion(&factor, d, diag_scale, kappa_est)
                     {
-                        return Ok(deflated);
-                    }
-                    // #1377 — route-independent intrinsic-dimension-flat recovery.
-                    // At `ridge_t = 0` the undamped per-row Cholesky of a #1273
-                    // intrinsic-dimension-flat block sits on a knife-edge: the
-                    // marginal pivot of the flat direction rounds to a *tiny
-                    // positive* value on one route (Cholesky succeeds → this `Ok`
-                    // arm) and to `≤ 0` on the other (Cholesky fails → the `Err`
-                    // arm below). The `Err` arm already deflates that flat
-                    // direction to UNIT stiffness via
-                    // `factor_spectral_deflated_criterion_row_with_geometry` (`log 1 = 0`
-                    // contribution), but this `Ok` arm previously returned the RAW
-                    // barely-PD factor whose tiny pivot contributes a large
-                    // `2·ln(√ε)` instead. The two memory-budget routes (dense
-                    // `factor_blocks_for_system` vs the streaming per-row
-                    // factor) then disagreed on the
-                    // per-row log-det, breaking the streaming-plan identical-logdet
-                    // invariant and surfacing as a NON-PD `H_tt` on whichever route
-                    // landed on the failing side of the edge.
-                    //
-                    // Unify the two arms: when this is the SAE evidence path
-                    // (`allow_spectral_deflation`) and the just-computed factor is
-                    // NOT safely invertible (a near-flat / rank-deficient block, by
-                    // the SAME κ / min-pivot proxy used for the Δβ-accuracy gate
-                    // below), deflate it through the identical spectral recovery the
-                    // `Err` arm uses. A genuinely well-conditioned PD block
-                    // (`λ ≫ floor`) passes the safe-inversion proxy and is returned
-                    // bit-for-bit unchanged, so #1273's recovery and every healthy
-                    // block are untouched — only the marginal flat direction is now
-                    // deflated identically regardless of which side of the pivot
-                    // knife-edge a route lands on.
-                    if ridge_t == 0.0 && allow_spectral_deflation {
-                        let kappa_est = cholesky_factor_kappa_estimate(&factor);
-                        if !cholesky_factor_passes_safe_inversion(&factor, d, diag_scale, kappa_est)
-                        {
-                            let deflated = factor_spectral_deflated_criterion_row_with_geometry(
-                                row,
-                                d,
-                                refuse_resolved_indefinite,
-                                exact_a,
-                            )
-                            .map_err(|reason| ArrowSchurError::PerRowFactorFailed {
-                                row: row_idx,
-                                reason,
-                            })?;
-                            if let Some(deflated) = deflated {
-                                return Ok(deflated);
-                            }
-                        }
-                    }
-                    break ArrowRowFactorResult {
-                        factor,
-                        gauge_deflated_directions: 0,
-                        deflated_directions: Vec::new(),
-                        deflation_spectrum: None,
-                        clamp_basin_directions: 0,
-                        ridge_escalated: false,
-                    };
-                }
-                // Diagonal-ratio condition-number proxy κ(LLᵀ) ≈
-                // (max L_ii / min L_ii)², vs the dimension-scaled Higham
-                // near-singularity ceiling. A barely-PD inverse plugged into
-                //   S = H_ββ + ridge_β·I − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)
-                // contaminates S by spectral terms scaled by κ_i, so an
-                // over-threshold block is regularised further rather than used.
-                let kappa_est = cholesky_factor_kappa_estimate(&factor);
-                if cholesky_factor_passes_safe_inversion(&factor, d, diag_scale, kappa_est) {
-                    break ArrowRowFactorResult {
-                        factor,
-                        gauge_deflated_directions: 0,
-                        deflated_directions: Vec::new(),
-                        deflation_spectrum: None,
-                        clamp_basin_directions: 0,
-                        ridge_escalated: ridge_eff > ridge_t,
-                    };
-                }
-                let next = if ridge_eff > 0.0 {
-                    ridge_eff * RIDGE_GROWTH_FACTOR
-                } else {
-                    RIDGE_SEED_DIAG_FRACTION * diag_scale
-                };
-                if !next.is_finite() || next > ridge_cap {
-                    return Err(ArrowSchurError::PerRowFactorIllConditioned {
-                        row: row_idx,
-                        kappa_estimate: kappa_est,
-                    });
-                }
-                ridge_eff = next;
-            }
-            Err(e) => {
-                // Evidence/log-det factorization
-                // consume the returned factor's diagonal as the exact
-                // log|H_tt + ridge_t·I|. Silently lifting ridge past the
-                // caller's base would shift that determinant by Σ d·log(1+δ/λ)
-                // while returning Ok, corrupting the reported evidence. A
-                // genuinely non-PD block at the base ridge must surface as
-                // an error here, not be quietly conditioned.
-                if evidence_factorization {
-                    if ridge_t == 0.0 {
-                        if let Some(deflated) =
-                            factor_gauge_deflated_evidence_row(row, d, row_gauges)
-                        {
-                            // Faddeev-Popov row-gauge deflation: only the
-                            // closed-form orbit direction is stiffened, at UNIT
-                            // stiffness kappa = 1.0, so each deflated direction
-                            // contributes log(1) = 0 to log|H| — the quotient
-                            // pseudo-determinant convention (the gauge orbit is a
-                            // criterion null direction, contributing nothing to
-                            // the Laplace normalizer). Zero theta/rho dependence,
-                            // so criterion derivatives stay exact on the quotient.
+                        let deflated = factor_spectral_deflated_criterion_row_with_geometry(
+                            row,
+                            d,
+                            refuse_resolved_indefinite,
+                            exact_a,
+                        )
+                        .map_err(|reason| ArrowSchurError::PerRowFactorFailed {
+                            row: row_idx,
+                            reason,
+                        })?;
+                        if let Some(deflated) = deflated {
                             return Ok(deflated);
                         }
-                        // #1117/#1118/#1273 — the offending direction is NOT a
-                        // supplied gauge vector. Two distinct geometries reach
-                        // here: (a) under K>1 IBP/softmax row-sharing the
-                        // logit×coordinate Gauss-Newton cross term drives an
-                        // eigenvalue of this row's H_tt negative at a direction the
-                        // closed-form gauge orbit does not span; and (b) — the
-                        // #1273 circle/torus case — a single atom whose data is
-                        // intrinsically LOWER-dimensional than its chart (a 1-D ring
-                        // embedded in a 2-D torus harmonic basis) has a genuine FLAT
-                        // tangent direction: H_tt is rank-deficient even though the
-                        // REML cost is finite and valid. In (b) the supplied row
-                        // gauge is only the rotation/phase orbit, which does NOT span
-                        // the intrinsic-dimension flat direction, so that row's gauge
-                        // list can be empty (or non-spanning) yet a valid quotient
-                        // factor exists. In BOTH cases DISCOVER the offending
-                        // direction from the block's own symmetric eigendecomposition
-                        // and deflate it at the SAME unit stiffness (eigenvalue → +1),
-                        // so its evidence contribution is the ρ-independent constant
-                        // log 1 = 0. This replaces the previous ridge-damped evidence
-                        // fallback, whose ½·log|I + ridge·H_tt⁻¹| bias was
-                        // ρ-DEPENDENT and therefore desynced the outer REML value
-                        // (which saw it) from the analytic ρ-gradient (built for
-                        // the undamped Laplace log-det, which did not) — the
-                        // multi-atom outer line-search non-convergence (#1117).
-                        //
-                        // The undamped exact Cholesky still owns every genuinely PD
-                        // block (this arm is reached only on a refused factor), and
-                        // only the SAE evidence path opts into spectral discovery
-                        // (`allow_spectral_deflation`); generic callers keep the
-                        // strict non-PD refusal. The previous `!row_gauges.is_empty()`
-                        // gate spuriously withheld this recovery from a row whose
-                        // flat direction was intrinsic-dimension deficiency rather
-                        // than a supplied gauge — exactly the #1273 abort.
-                        if allow_spectral_deflation {
-                            let deflated = factor_spectral_deflated_criterion_row_with_geometry(
-                                row,
-                                d,
-                                refuse_resolved_indefinite,
-                                exact_a,
-                            )
-                            .map_err(|reason| ArrowSchurError::PerRowFactorFailed {
-                                row: row_idx,
-                                reason,
-                            })?;
-                            if let Some(deflated) = deflated {
-                                return Ok(deflated);
-                            }
+                    }
+                }
+                return Ok(ArrowRowFactorResult {
+                    factor,
+                    gauge_deflated_directions: 0,
+                    deflated_directions: Vec::new(),
+                    deflation_spectrum: None,
+                    clamp_basin_directions: 0,
+                    ridge_escalated: false,
+                });
+            }
+            // Diagonal-ratio condition-number proxy κ(LLᵀ) ≈
+            // (max L_ii / min L_ii)², vs the dimension-scaled Higham
+            // near-singularity ceiling. A barely-PD inverse plugged into
+            //   S = H_ββ + ridge_β·I − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)
+            // contaminates S by spectral terms scaled by κ_i, so an
+            // over-threshold block is regularised rather than used.
+            let kappa_est = cholesky_factor_kappa_estimate(&factor);
+            if cholesky_factor_passes_safe_inversion(&factor, d, diag_scale, kappa_est) {
+                return Ok(ArrowRowFactorResult {
+                    factor,
+                    gauge_deflated_directions: 0,
+                    deflated_directions: Vec::new(),
+                    deflation_spectrum: None,
+                    clamp_basin_directions: 0,
+                    ridge_escalated: false,
+                });
+            }
+            format!(
+                "the factor at base ridge {ridge_t:e} fails the safe-inversion gate \
+                 (κ proxy {kappa_est:e})"
+            )
+        }
+        Err(e) => {
+            // Evidence/log-det factorization
+            // consume the returned factor's diagonal as the exact
+            // log|H_tt + ridge_t·I|. Silently lifting ridge past the
+            // caller's base would shift that determinant by Σ d·log(1+δ/λ)
+            // while returning Ok, corrupting the reported evidence. A
+            // genuinely non-PD block at the base ridge must surface as
+            // an error here, not be quietly conditioned.
+            if evidence_factorization {
+                if ridge_t == 0.0 {
+                    if let Some(deflated) =
+                        factor_gauge_deflated_evidence_row(row, d, row_gauges)
+                    {
+                        // Faddeev-Popov row-gauge deflation: only the
+                        // closed-form orbit direction is stiffened, at UNIT
+                        // stiffness kappa = 1.0, so each deflated direction
+                        // contributes log(1) = 0 to log|H| — the quotient
+                        // pseudo-determinant convention (the gauge orbit is a
+                        // criterion null direction, contributing nothing to
+                        // the Laplace normalizer). Zero theta/rho dependence,
+                        // so criterion derivatives stay exact on the quotient.
+                        return Ok(deflated);
+                    }
+                    // #1117/#1118/#1273 — the offending direction is NOT a
+                    // supplied gauge vector. Two distinct geometries reach
+                    // here: (a) under K>1 IBP/softmax row-sharing the
+                    // logit×coordinate Gauss-Newton cross term drives an
+                    // eigenvalue of this row's H_tt negative at a direction the
+                    // closed-form gauge orbit does not span; and (b) — the
+                    // #1273 circle/torus case — a single atom whose data is
+                    // intrinsically LOWER-dimensional than its chart (a 1-D ring
+                    // embedded in a 2-D torus harmonic basis) has a genuine FLAT
+                    // tangent direction: H_tt is rank-deficient even though the
+                    // REML cost is finite and valid. In (b) the supplied row
+                    // gauge is only the rotation/phase orbit, which does NOT span
+                    // the intrinsic-dimension flat direction, so that row's gauge
+                    // list can be empty (or non-spanning) yet a valid quotient
+                    // factor exists. In BOTH cases DISCOVER the offending
+                    // direction from the block's own symmetric eigendecomposition
+                    // and deflate it at the SAME unit stiffness (eigenvalue → +1),
+                    // so its evidence contribution is the ρ-independent constant
+                    // log 1 = 0. This replaces the previous ridge-damped evidence
+                    // fallback, whose ½·log|I + ridge·H_tt⁻¹| bias was
+                    // ρ-DEPENDENT and therefore desynced the outer REML value
+                    // (which saw it) from the analytic ρ-gradient (built for
+                    // the undamped Laplace log-det, which did not) — the
+                    // multi-atom outer line-search non-convergence (#1117).
+                    //
+                    // The undamped exact Cholesky still owns every genuinely PD
+                    // block (this arm is reached only on a refused factor), and
+                    // only the SAE evidence path opts into spectral discovery
+                    // (`allow_spectral_deflation`); generic callers keep the
+                    // strict non-PD refusal. The previous `!row_gauges.is_empty()`
+                    // gate spuriously withheld this recovery from a row whose
+                    // flat direction was intrinsic-dimension deficiency rather
+                    // than a supplied gauge — exactly the #1273 abort.
+                    if allow_spectral_deflation {
+                        let deflated = factor_spectral_deflated_criterion_row_with_geometry(
+                            row,
+                            d,
+                            refuse_resolved_indefinite,
+                            exact_a,
+                        )
+                        .map_err(|reason| ArrowSchurError::PerRowFactorFailed {
+                            row: row_idx,
+                            reason,
+                        })?;
+                        if let Some(deflated) = deflated {
+                            return Ok(deflated);
                         }
                     }
-                    return Err(ArrowSchurError::PerRowFactorFailed {
-                        row: row_idx,
-                        reason: format!(
-                            "row {row_idx} H_tt is non-PD at base ridge {ridge_t:e}; \
-                             evidence mode preserves the genuine Cholesky of \
-                             H_tt and does not condition non-PD blocks: {e}"
-                        ),
-                    });
                 }
-                let next = if ridge_eff > 0.0 {
-                    ridge_eff * RIDGE_GROWTH_FACTOR
-                } else {
-                    RIDGE_SEED_DIAG_FRACTION * diag_scale
-                };
-                if !next.is_finite() || next > ridge_cap {
-                    return Err(ArrowSchurError::PerRowFactorFailed {
-                        row: row_idx,
-                        reason: format!(
-                            "row {row_idx} H_tt remained non-PD up to ridge {ridge_eff:e} \
-                             (base ridge_t={ridge_t}); last cholesky error: {e}"
-                        ),
-                    });
-                }
-                ridge_eff = next;
+                return Err(ArrowSchurError::PerRowFactorFailed {
+                    row: row_idx,
+                    reason: format!(
+                        "row {row_idx} H_tt is non-PD at base ridge {ridge_t:e}; \
+                         evidence mode preserves the genuine Cholesky of \
+                         H_tt and does not condition non-PD blocks: {e}"
+                    ),
+                });
             }
+            format!("H_tt is non-PD at base ridge {ridge_t:e}: {e}")
         }
     };
-    Ok(factor)
+    let ridge = closed_form_row_ridge(row, d, ridge_t, diag_scale).map_err(|reason| {
+        ArrowSchurError::PerRowFactorFailed {
+            row: row_idx,
+            reason: format!(
+                "row {row_idx}: {base_rejection}; no finite ridge conditions it: {reason}"
+            ),
+        }
+    })?;
+    // One factorisation at the derived ridge. Its gate is re-checked because the
+    // factor is what the solve consumes; a failure here means the block violates
+    // the derivation's own bounds and is reported, never searched past.
+    match factor_row_block_cholesky(row, ridge, d) {
+        Ok(factor) => {
+            let kappa_est = cholesky_factor_kappa_estimate(&factor);
+            if cholesky_factor_passes_safe_inversion(&factor, d, diag_scale, kappa_est) {
+                Ok(ArrowRowFactorResult {
+                    factor,
+                    gauge_deflated_directions: 0,
+                    deflated_directions: Vec::new(),
+                    deflation_spectrum: None,
+                    clamp_basin_directions: 0,
+                    ridge_escalated: ridge > ridge_t,
+                })
+            } else {
+                Err(ArrowSchurError::PerRowFactorIllConditioned {
+                    row: row_idx,
+                    kappa_estimate: kappa_est,
+                })
+            }
+        }
+        Err(e) => Err(ArrowSchurError::PerRowFactorFailed {
+            row: row_idx,
+            reason: format!(
+                "row {row_idx}: {base_rejection}; still non-PD at the closed-form spectral \
+                 ridge {ridge:e}: {e}"
+            ),
+        }),
+    }
 }
 
 pub(crate) fn manifold_mode_fingerprint(latent: &LatentCoordValues) -> u64 {

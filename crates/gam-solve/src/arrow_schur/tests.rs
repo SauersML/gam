@@ -597,14 +597,14 @@ pub(crate) fn proximal_correction_breaks_scalar_newton_cycle() {
 /// Issue #195 / gam#578: a per-row block that is barely-PD (smallest
 /// pivot on the order of ε·trace — a rank-deficient / over-parameterized
 /// decoder atom) factors successfully but is unsafe to use raw in the
-/// Schur reduction. The κ proxy is folded INTO the per-row ridge
-/// escalation loop: rather than reject such a block outright (which made
+/// Schur reduction. Rather than reject such a block outright (which made
 /// the advertised Arrow-Schur ridge never actually run and aborted the
-/// whole SAE fit, gam#578), `factor_one_row` lifts this row's ridge until
-/// the block is BOTH positive-definite and well-conditioned, then returns
-/// a genuinely conditioned factor safe to plug into
+/// whole SAE fit, gam#578), `factor_one_row` lifts this row's ridge to the
+/// closed-form spectral minimum at which the block is BOTH positive-definite
+/// and well-conditioned (#4483), then returns a genuinely conditioned factor
+/// safe to plug into
 /// `S = H_ββ + ridge_β·I − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)`.
-/// Only a block that cannot be conditioned even at `ridge_cap` errors.
+/// Only a block with no finite conditioning ridge (non-finite) errors.
 #[test]
 pub(crate) fn factor_one_row_conditions_barely_pd_block_via_ridge() {
     let d = 2;
@@ -618,8 +618,8 @@ pub(crate) fn factor_one_row_conditions_barely_pd_block_via_ridge() {
     row.htbeta = array![[1.0_f64, 0.0], [0.0, 1.0]];
     row.gt = array![0.0_f64, 0.0];
 
-    // The fix: instead of rejecting, the escalation loop lifts this
-    // row's ridge until the factor is well-conditioned. The returned
+    // The fix: instead of rejecting, the closed-form ridge lifts this
+    // row just enough for the factor to be well-conditioned. The returned
     // factor must satisfy the κ ceiling that a raw barely-PD block fails.
     let factor = factor_one_row(&row, 0.0, d, 0, false).expect(
         "barely-PD H_tt must be CONDITIONED by per-row ridge escalation, not rejected (gam#578)",
@@ -698,8 +698,8 @@ pub(crate) fn factor_one_row_conditions_barely_pd_block_via_ridge() {
 
     // A block that cannot be conditioned at all — a non-finite entry —
     // is genuinely broken: no finite ridge shift repairs it, so the
-    // escalation loop must still surface a typed `PerRowFactorFailed`
-    // for the outer loop rather than loop forever or return garbage.
+    // closed-form ridge has no value and a typed `PerRowFactorFailed`
+    // surfaces for the outer loop rather than garbage.
     let mut row_nan = ArrowRowBlock::new(d, k);
     row_nan.htt = array![[f64::NAN, 0.0], [0.0, 1.0]];
     row_nan.htbeta = array![[1.0_f64, 0.0], [0.0, 1.0]];
@@ -711,8 +711,13 @@ pub(crate) fn factor_one_row_conditions_barely_pd_block_via_ridge() {
     );
 }
 
+/// #4483: a positive scalar block is perfectly conditioned in its OWN units
+/// (κ = 1, pivot = its whole curvature scale), however small the number is in
+/// the caller's units. The previous `max(1.0)` clamp measured `1e-20` against an
+/// absolute `√ε` floor and ridged it to ~`1e-7`, i.e. 10¹³ times the block's own
+/// curvature. It must now factor raw with no escalation, on both paths.
 #[test]
-pub(crate) fn factor_one_row_conditions_scalar_tiny_pivot_via_ridge() {
+pub(crate) fn factor_one_row_accepts_tiny_scalar_block_in_its_own_units_4483() {
     let d = 1;
     let k = 1;
     let mut row = ArrowRowBlock::new(d, k);
@@ -720,16 +725,13 @@ pub(crate) fn factor_one_row_conditions_scalar_tiny_pivot_via_ridge() {
     row.htbeta = array![[1.0_f64]];
     row.gt = array![0.0_f64];
 
-    let factor = factor_one_row(&row, 0.0, d, 0, false)
-        .expect("tiny positive scalar pivot must be ridge-conditioned");
-    let pivot = factor[[0, 0]] * factor[[0, 0]];
+    let strict = factor_one_row_with_escalation(&row, 0.0, d, 0, false)
+        .expect("a positive scalar block is safely invertible at its own scale");
+    assert!(!strict.ridge_escalated, "a positive scalar block needs no ridge");
+    let pivot = strict.factor[[0, 0]] * strict.factor[[0, 0]];
     assert!(
-        pivot >= safe_spd_pivot_min(1.0),
-        "scalar pivot must be lifted above the absolute safe floor; got {pivot:e}"
-    );
-    assert!(
-        pivot > row.htt[[0, 0]],
-        "scalar block must not be accepted at the raw tiny pivot"
+        (pivot - row.htt[[0, 0]]).abs() <= 4.0 * f64::EPSILON * row.htt[[0, 0]],
+        "strict factor must be the raw scalar Cholesky; got pivot {pivot:e}"
     );
 
     let tolerated = factor_one_row(&row, 0.0, d, 0, true)
@@ -739,6 +741,100 @@ pub(crate) fn factor_one_row_conditions_scalar_tiny_pivot_via_ridge() {
         (raw_pivot - row.htt[[0, 0]]).abs() < 1.0e-30,
         "tolerated factor must remain the raw scalar Cholesky"
     );
+}
+
+/// #4483: the per-row ridge is the closed-form spectral minimum, applied once,
+/// and it is exactly unit-covariant.
+///
+/// With `c = 2·dγ_{d+1}/(1 − dγ_{d+1})` the production rounding charge and
+/// `s = max|λ(H)|`:
+/// * Minimal: for `H = [[1,2],[2,1]]` (eigenvalues 3, −1) the smallest ridge
+///   passing the κ ceiling is `(3 + κ)/(κ − 1)` (the pivot floor needs only
+///   `√ε + 1`). The applied ridge is that value times `1 + 4c` from the
+///   margin, moved by at most the charged eigenvalue error `c·s = 3c`, so its
+///   relative excess lies in `[0, 8c]`. The old decade ladder returned `10`.
+/// * Applied once: the returned factor is bit-for-bit the Cholesky of
+///   `H + r*·I`.
+/// * Unit-covariant: rescaling the block by a power of two `c²` (exact in
+///   binary floating point) rescales the applied ridge by `c²`. Two
+///   evaluations differ by at most twice the charged eigenvalue error carried
+///   through `∂r/∂λ_min = κ/(κ − 1)`, i.e. `|Δr| ≤ 4c·s` in the block's own
+///   units. The barely-PD gam#578 block is checked the same way.
+#[test]
+pub(crate) fn factor_one_row_ridge_is_closed_form_minimal_and_unit_covariant_4483() {
+    let d = 2;
+    let k = 2;
+    let blocks = [
+        array![[1.0_f64, 2.0], [2.0, 1.0]],
+        array![[1.0_f64, 1.0], [1.0, 1.0 + 1e-14]],
+    ];
+    let kappa_max = safe_spd_kappa_max(d);
+    let unit_roundoff = 0.5 * f64::EPSILON;
+    let dim = d as f64;
+    let gamma = (dim + 1.0) * unit_roundoff / (1.0 - (dim + 1.0) * unit_roundoff);
+    let rounding_charge = 2.0 * dim * gamma / (1.0 - dim * gamma);
+    let spectral_radii = [3.0_f64, 2.0 + 1e-14];
+    let exact_indefinite_ridge = ((3.0 + kappa_max) / (kappa_max - 1.0))
+        .max(safe_spd_pivot_min(1.0) + 1.0);
+    for (block_index, base) in blocks.iter().enumerate() {
+        let mut reference_ridge = None;
+        for exponent in [-40_i32, 0, 40] {
+            let scale = 2.0_f64.powi(exponent);
+            let mut row = ArrowRowBlock::new(d, k);
+            row.htt = base.mapv(|v| v * scale);
+            row.htbeta = array![[1.0_f64, 0.0], [0.0, 1.0]];
+            row.gt = array![0.0_f64, 0.0];
+
+            let result = factor_one_row_with_escalation(&row, 0.0, d, 0, false)
+                .expect("the closed-form ridge must condition the block");
+            assert!(
+                result.ridge_escalated,
+                "block {block_index} at scale 2^{exponent} fails the gate raw and must be ridged"
+            );
+            let ridge = closed_form_row_ridge(&row, d, 0.0, row_block_diag_scale(&row, d))
+                .expect("finite block has a finite closed-form ridge");
+            let expected = factor_row_block_cholesky(&row, ridge, d)
+                .expect("the closed-form ridge must make the block PD");
+            assert_eq!(
+                result.factor, expected,
+                "the returned factor must be the single Cholesky at the closed-form ridge"
+            );
+            let kappa = cholesky_factor_kappa_estimate(&result.factor);
+            assert!(
+                cholesky_factor_passes_safe_inversion(
+                    &result.factor,
+                    d,
+                    row_block_diag_scale(&row, d),
+                    kappa
+                ),
+                "factor at the closed-form ridge must pass the safe-inversion gate; κ={kappa:e}"
+            );
+
+            let unit_ridge = ridge / scale;
+            if block_index == 0 {
+                let excess = (unit_ridge - exact_indefinite_ridge) / exact_indefinite_ridge;
+                assert!(
+                    (0.0..=8.0 * rounding_charge).contains(&excess),
+                    "indefinite block: ridge {unit_ridge:.17e} must be the spectral minimum \
+                     {exact_indefinite_ridge:.17e} plus only the O(dε) rounding margin \
+                     (relative excess {excess:e})"
+                );
+            }
+            match reference_ridge {
+                None => reference_ridge = Some(unit_ridge),
+                Some(reference) => {
+                    let gap = (unit_ridge - reference).abs();
+                    let bound = 4.0 * rounding_charge * spectral_radii[block_index];
+                    assert!(
+                        gap <= bound,
+                        "block {block_index}: ridge/c² at 2^{exponent} is {unit_ridge:e}, \
+                         at scale 2^-40 {reference:e} (gap {gap:e} > {bound:e}); the ridge \
+                         must scale with the block"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// #1117/#1118: a per-row `H_tt` that is gauge-flat AND genuinely indefinite
