@@ -1826,7 +1826,8 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // is rebuilt with that same ν, so `Vb = H⁻¹·φ̂` stays internally consistent.
     // Warm-started solves (every REML cost eval) already sit near the converged
     // η, so the first refresh check confirms ν and exits without a re-solve; the
-    // added cost there is a single O(n) shape evaluation.
+    // added cost there is a single O(n) shape evaluation plus the one
+    // working-state read that certifies β̂ at the reported ν.
     let gamma_scale = working_model
         .likelihood
         .resolved_scale()
@@ -1840,14 +1841,13 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             }
         )
     {
-        // A few passes suffice: the converged-η shape map is a strong
-        // contraction (β̂ barely moves once the mean is captured), so cold
-        // starts settle in 1–2 re-solves and warm starts in zero.
-        const MAX_SHAPE_REFRESH: usize = 5;
-        // Relative shape tolerance below which a re-solve cannot move any
-        // reported quantity meaningfully (far under statistical resolution).
-        const SHAPE_REFRESH_REL_TOL: f64 = 1e-4;
-        for refresh_iter in 0..MAX_SHAPE_REFRESH {
+        // The alternation runs until the reported pair certifies or its own
+        // progress record ends it: `converged_eta_refresh_band` supplies the
+        // certificate, `ScaleAlternationProgress` the reason a further pass is
+        // justified. Neither is a pass count.
+        let resolution = scale_estimator_resolution(y.len());
+        let mut progress = ScaleAlternationProgress::new(&options);
+        loop {
             // The shape is the stationary point of the Laplace marginal
             // likelihood at fixed λ, whose −½ log|H| term charges the edf of
             // the mean model (#4075); the edf is read off the current Hessian.
@@ -1864,7 +1864,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 .likelihood
                 .resolved_gamma_shape()
                 .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-            let rel_change = (refreshed_shape - prior_shape).abs() / prior_shape;
+            let relative_change = (refreshed_shape - prior_shape).abs() / prior_shape;
             // Install the refreshed shape and hold it fixed for any re-solve so
             // the LM objective stays stationary (the lock is *re-armed*, not
             // released — the seed-from-warm-start branch in `update_with_curvature`
@@ -1878,28 +1878,42 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 .clone()
                 .with_gamma_shape(refreshed_shape);
             working_model.gamma_shape_locked = true;
-            if rel_change <= SHAPE_REFRESH_REL_TOL {
-                // Converged: the working-state buffers (weights, Hessian,
-                // deviance) already reflect a shape within tolerance of
-                // `refreshed_shape`, because the only way to reach here without
-                // a re-solve is that the prior solve's shape already matched the
-                // converged-η estimate. Nothing left to rebuild.
+            // Read the reported coefficients at the shape just installed. The
+            // shape rescales the data term of the penalized objective
+            // `k·D(β) + βᵀS_λβ`, so a shape that moved leaves β̂ off-stationary
+            // by `|k_new/k_old − 1|·‖S_λβ̂‖`; that residual is not predicted
+            // here, it is read off the rebuilt gradient.
+            let band = converged_eta_refresh_band(&working_summary, &options);
+            let reading =
+                certify_converged_eta_scale(&mut working_model, &working_summary, &options)?;
+            if reading.relative_residual <= band {
+                // β̂ is stationary at the reported shape to the band this solve
+                // certified it at, and the state just read — weights, Hessian,
+                // deviance, and through them `Vb = H⁻¹` and the EDF — was built
+                // at that same shape. Report it.
+                install_certified_refresh(
+                    &mut working_summary,
+                    &options,
+                    reading.state,
+                    reading.residual,
+                );
                 break;
             }
-            if refresh_iter + 1 == MAX_SHAPE_REFRESH {
-                // Final allowed pass and the shape is still drifting (a
-                // non-contracting alternation). The working state — β̂, weights,
-                // Hessian, EDF — was solved at the PREVIOUS shape, which differs
-                // from the just-installed one by more than the tolerance; the
-                // shape rescales the penalized objective `k·D + βᵀSβ`, so β̂ is
-                // not stationary at the reported shape. That is not a joint
-                // (β, shape) fixed point and may not be reported as a fit
-                // (#3544), exactly as the Gaussian φ refresh below refuses.
-                crate::bail_invalid_estim!(
-                    "Gamma shape did not reach its converged-η fixed point within \
-                     {MAX_SHAPE_REFRESH} re-solves (relative change {rel_change:e} > \
-                     tolerance {SHAPE_REFRESH_REL_TOL:e})"
-                );
+            if !progress.justifies_another_pass(
+                relative_change,
+                (refreshed_shape - prior_shape).signum(),
+                resolution,
+            ) {
+                // Not a joint (β, shape) fixed point, and the alternation is no
+                // longer moving toward one, so this may not be reported as a fit
+                // (#3544) — exactly as the Gaussian φ refresh below refuses.
+                return Err(progress.refuse(
+                    "Gamma shape",
+                    relative_change,
+                    resolution,
+                    reading.relative_residual,
+                    band,
+                ));
             }
             // The shape moved: re-solve β at the corrected shape, warm-started
             // at the converged β, so the final working state is rebuilt with the
@@ -1945,10 +1959,11 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         )
     {
         if let ResponseFamily::Tweedie { p } = working_model.likelihood.spec.response {
-            // The converged-η Pearson map is a strong contraction (β̂ scale-free
-            // here), so cold starts settle in 1–2 re-solves and warm starts in
-            // zero.
-            for refresh_iter in 0..MAX_PHI_REFRESH {
+            // Same rule as the Gamma shape above: the pass is bought by the
+            // certificate, not by a count.
+            let resolution = scale_estimator_resolution(y.len());
+            let mut progress = ScaleAlternationProgress::new(&options);
+            loop {
                 // Pearson moment on the residual degrees of freedom n₊ − edf
                 // (#4075), with the edf of the current converged mean model.
                 let mean_model_edf =
@@ -1964,7 +1979,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                     .likelihood
                     .resolved_tweedie_phi()
                     .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-                let rel_change = (refreshed_phi - prior_phi).abs() / prior_phi;
+                let relative_change = (refreshed_phi - prior_phi).abs() / prior_phi;
                 // Install the refreshed φ (the scale metadata the working weight
                 // reads via `fixed_phi()`) and re-arm the lock so a following
                 // re-solve does not overwrite this converged-η value. Because the
@@ -1976,22 +1991,34 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                     .clone()
                     .with_tweedie_phi(refreshed_phi);
                 working_model.tweedie_phi_locked = true;
-                if rel_change <= PHI_REFRESH_REL_TOL {
-                    // Converged: the working state already reflects a φ within
-                    // tolerance of `refreshed_phi`. Nothing left to rebuild.
+                // φ rescales the effective penalty, so a φ that moved leaves β̂
+                // off-stationary; read how far at the installed φ.
+                let band = converged_eta_refresh_band(&working_summary, &options);
+                let reading =
+                    certify_converged_eta_scale(&mut working_model, &working_summary, &options)?;
+                if reading.relative_residual <= band {
+                    install_certified_refresh(
+                        &mut working_summary,
+                        &options,
+                        reading.state,
+                        reading.residual,
+                    );
                     break;
                 }
-                if refresh_iter + 1 == MAX_PHI_REFRESH {
-                    // Final allowed pass and φ is still drifting: the working
-                    // state was solved at a φ that differs from the installed one
-                    // by more than the tolerance (φ rescales the effective
-                    // penalty, so β̂ is not stationary at the reported φ). Not a
-                    // joint (β, φ) fixed point, so not a fit (#3544).
-                    crate::bail_invalid_estim!(
-                        "Tweedie dispersion φ did not reach its converged-η fixed point \
-                         within {MAX_PHI_REFRESH} re-solves (relative change {rel_change:e} > \
-                         tolerance {PHI_REFRESH_REL_TOL:e})"
-                    );
+                if !progress.justifies_another_pass(
+                    relative_change,
+                    (refreshed_phi - prior_phi).signum(),
+                    resolution,
+                ) {
+                    // Not a joint (β, φ) fixed point, and no further pass is
+                    // implied by the ones already run, so not a fit (#3544).
+                    return Err(progress.refuse(
+                        "Tweedie dispersion φ",
+                        relative_change,
+                        resolution,
+                        reading.relative_residual,
+                        band,
+                    ));
                 }
                 // φ moved materially: re-solve β at the corrected φ, warm-started
                 // at the converged β, so the final working state is rebuilt with
@@ -2011,9 +2038,10 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // The same converged-η refresh as the Tweedie φ above, with the scale that
     // makes the Laplace marginal likelihood stationary at fixed λ,
     // `φ̂ = Σ wᵢ dᵢ / (n₊ − edf)` (#4075), in place of the Pearson moment. As in
-    // every converged-η refresh, a φ still moving on the last allowed pass is a
-    // failed fit, not a reported one: the reported φ must be the estimate at the
-    // reported η.
+    // every converged-η refresh, a φ whose alternation has stopped contracting
+    // while β̂ is still off-stationary at it is a failed fit, not a reported one:
+    // the reported φ must be the estimate at the reported η, with β̂ stationary
+    // there.
     if refine_dispersion_at_converged_eta
         && matches!(
             working_model
@@ -2026,8 +2054,9 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             }
         )
     {
-        let mut converged = false;
-        for _ in 0..MAX_PHI_REFRESH {
+        let resolution = scale_estimator_resolution(y.len());
+        let mut progress = ScaleAlternationProgress::new(&options);
+        loop {
             let mean_model_edf =
                 calculate_edf_with_penalty(&working_summary.state.hessian, &penalty_active)?;
             let refreshed_phi = super::estimate_dispersion_phi_from_eta(
@@ -2042,15 +2071,36 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 .likelihood
                 .resolved_dispersion_phi()
                 .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-            let rel_change = (refreshed_phi - prior_phi).abs() / prior_phi;
+            let relative_change = (refreshed_phi - prior_phi).abs() / prior_phi;
             working_model.likelihood = working_model
                 .likelihood
                 .clone()
                 .with_dispersion_phi(refreshed_phi);
             working_model.dispersion_phi_locked = true;
-            if rel_change <= PHI_REFRESH_REL_TOL {
-                converged = true;
+            let band = converged_eta_refresh_band(&working_summary, &options);
+            let reading =
+                certify_converged_eta_scale(&mut working_model, &working_summary, &options)?;
+            if reading.relative_residual <= band {
+                install_certified_refresh(
+                    &mut working_summary,
+                    &options,
+                    reading.state,
+                    reading.residual,
+                );
                 break;
+            }
+            if !progress.justifies_another_pass(
+                relative_change,
+                (refreshed_phi - prior_phi).signum(),
+                resolution,
+            ) {
+                return Err(progress.refuse(
+                    "dispersion φ",
+                    relative_change,
+                    resolution,
+                    reading.relative_residual,
+                    band,
+                ));
             }
             working_summary = runworking_model_pirls(
                 &mut working_model,
@@ -2058,12 +2108,6 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 &options,
                 Some(&mut iteration_logger),
             )?;
-        }
-        if !converged {
-            crate::bail_invalid_estim!(
-                "dispersion φ did not reach its converged-η fixed point within {MAX_PHI_REFRESH} \
-                 re-solves (relative tolerance {PHI_REFRESH_REL_TOL:e})"
-            );
         }
     }
 
@@ -2094,7 +2138,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // re-solve β at the corrected φ (warm-started), and repeat. This is the
     // betareg alternating mean-fit ↔ φ-estimate scheme; the moment estimator is
     // a strong contraction once the mean has any structure, so the pair settles
-    // in a handful of passes. Held OFF inside the REML λ search (see the flag
+    // once the climb out of the cold φ is over. Held OFF inside the REML λ search (see the flag
     // doc), φ is refreshed only here at the reported fit, so it cannot couple to
     // the smoothing parameter and reward over-smoothing. As with Gamma, every
     // exit path installs φ evaluated at the *current* η with no following
@@ -2115,13 +2159,14 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         )
     {
         // The mean moves between passes (φ feeds back through the digamma
-        // score), so allow a few more passes than the scale-free Gamma case;
-        // the contraction is fast and warm-started re-solves are cheap.
-        const MAX_PHI_REFRESH: usize = 30;
-        // Relative φ tolerance below which a re-solve cannot move β̂ — and hence
-        // any reported quantity — by a statistically meaningful amount.
-        const PHI_REFRESH_REL_TOL: f64 = 1e-4;
-        for refresh_iter in 0..MAX_PHI_REFRESH {
+        // score), so this alternation climbs before it contracts; the progress
+        // record below allows a monotone climb for exactly that reason and
+        // never counts passes.
+        let resolution = scale_estimator_resolution(y.len());
+        let mut progress = ScaleAlternationProgress::new(&options);
+        let mut refresh_pass = 0_usize;
+        loop {
+            refresh_pass += 1;
             let refreshed_phi = super::estimate_beta_phi_from_eta(
                 y,
                 working_summary.state.eta.as_ref(),
@@ -2131,7 +2176,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 .likelihood
                 .resolved_beta_precision()
                 .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-            let rel_change = (refreshed_phi - prior_phi).abs() / prior_phi;
+            let relative_change = (refreshed_phi - prior_phi).abs() / prior_phi;
             // Install the refreshed φ (updates BOTH the `Beta { phi }` family
             // variant every weight/deviance expression reads and the
             // `EstimatedBetaPhi` scale metadata) and re-arm the lock so a
@@ -2142,24 +2187,44 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 .clone()
                 .with_beta_phi(refreshed_phi);
             working_model.beta_phi_locked = true;
-            if rel_change <= PHI_REFRESH_REL_TOL {
-                // Converged: the just-installed φ matches (to tolerance) the φ
-                // the current working state was solved at, so β̂, the weights,
-                // the Hessian and the deviance are already self-consistent with
-                // the reported φ. Nothing left to rebuild.
+            // φ enters the digamma mean score, so the residual it induces is not
+            // a rescaling of the penalty and cannot be predicted from the
+            // penalty gradient the way the Gamma and Tweedie ones can. It is
+            // READ: one working-state evaluation at the unchanged β̂ under the
+            // installed φ gives the exact β-score there, and the same KKT
+            // certificate decides.
+            let band = converged_eta_refresh_band(&working_summary, &options);
+            let reading =
+                certify_converged_eta_scale(&mut working_model, &working_summary, &options)?;
+            if reading.relative_residual <= band {
+                // β̂ is stationary at the reported φ to the band this solve
+                // certified it at, and the state just read — weights, Hessian,
+                // deviance, and through them `Vb = H⁻¹` and the EDF — was built
+                // at that same φ. Report it.
+                install_certified_refresh(
+                    &mut working_summary,
+                    &options,
+                    reading.state,
+                    reading.residual,
+                );
                 break;
             }
-            if refresh_iter + 1 == MAX_PHI_REFRESH {
-                // Final allowed pass and φ is still drifting: the mean was solved
-                // at a precision that differs from the installed one by more than
-                // the tolerance, and φ feeds back through the digamma mean score,
-                // so β̂ is not stationary at the reported φ. Not a joint (β, φ)
-                // fixed point, so not a fit (#3544).
-                crate::bail_invalid_estim!(
-                    "Beta precision φ did not reach its converged-η fixed point within \
-                     {MAX_PHI_REFRESH} re-solves (relative change {rel_change:e} > \
-                     tolerance {PHI_REFRESH_REL_TOL:e})"
-                );
+            if !progress.justifies_another_pass(
+                relative_change,
+                (refreshed_phi - prior_phi).signum(),
+                resolution,
+            ) {
+                // The mean was solved at a precision the installed one no longer
+                // matches, and φ feeds back through the digamma mean score, so β̂
+                // is not stationary at the reported φ. Not a joint (β, φ) fixed
+                // point, so not a fit (#3544).
+                return Err(progress.refuse(
+                    "Beta precision φ",
+                    relative_change,
+                    resolution,
+                    reading.relative_residual,
+                    band,
+                ));
             }
             // φ moved materially: re-solve β at the corrected φ, warm-started at
             // the converged β, so the mean is refit under the better precision
@@ -2192,7 +2257,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             let deviance_at_prior = working_summary.state.deviance;
             let refused = |inner_status: String| {
                 EstimationError::BetaPrecisionRefinementDidNotConverge {
-                    passes: refresh_iter + 1,
+                    passes: refresh_pass,
                     prior_phi,
                     refreshed_phi,
                     deviance: deviance_at_prior,
@@ -2257,14 +2322,13 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             }
         )
     {
-        // θ feeds back through the working response, so allow a few more passes
-        // than the scale-free Gamma case; the alternation is a strong contraction
-        // and warm-started re-solves are cheap.
-        const MAX_THETA_REFRESH: usize = 30;
-        // Relative θ tolerance below which a re-solve cannot move β̂ — and hence
-        // any reported quantity — by a statistically meaningful amount.
-        const THETA_REFRESH_REL_TOL: f64 = 1e-4;
-        for refresh_iter in 0..MAX_THETA_REFRESH {
+        // θ feeds back through the working response, so — like the Beta
+        // precision and unlike the scale-free Gamma shape — this alternation can
+        // climb out of a cold θ before it contracts. Same progress record, same
+        // certificate, no pass count.
+        let resolution = scale_estimator_resolution(y.len());
+        let mut progress = ScaleAlternationProgress::new(&options);
+        loop {
             let refreshed_theta = super::estimate_negbin_theta_from_eta(
                 y,
                 working_summary.state.eta.as_ref(),
@@ -2274,7 +2338,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 .likelihood
                 .resolved_negbin_theta()
                 .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-            let rel_change = (refreshed_theta - prior_theta).abs() / prior_theta;
+            let relative_change = (refreshed_theta - prior_theta).abs() / prior_theta;
             // Install the refreshed θ (updates BOTH the `NegativeBinomial { theta }`
             // family variant every weight/deviance expression reads and the
             // `EstimatedNegBinTheta` scale metadata) and re-arm the lock so a
@@ -2285,24 +2349,41 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 .clone()
                 .with_negbin_theta(refreshed_theta);
             working_model.negbin_theta_locked = true;
-            if rel_change <= THETA_REFRESH_REL_TOL {
-                // Converged: the just-installed θ matches (to tolerance) the θ the
-                // current working state was solved at, so β̂, the weights, the
-                // Hessian and the deviance are already self-consistent with the
-                // reported θ. Nothing left to rebuild.
+            // θ enters the NB2 working response, so its induced residual is read
+            // off a working-state evaluation at the unchanged β̂, not predicted
+            // from the penalty gradient.
+            let band = converged_eta_refresh_band(&working_summary, &options);
+            let reading =
+                certify_converged_eta_scale(&mut working_model, &working_summary, &options)?;
+            if reading.relative_residual <= band {
+                // β̂ is stationary at the reported θ to the band this solve
+                // certified it at, and the state just read — weights, Hessian,
+                // deviance, and through them `Vb = H⁻¹` and the EDF — was built
+                // at that same θ. Report it.
+                install_certified_refresh(
+                    &mut working_summary,
+                    &options,
+                    reading.state,
+                    reading.residual,
+                );
                 break;
             }
-            if refresh_iter + 1 == MAX_THETA_REFRESH {
-                // Final allowed pass and θ is still drifting: the mean was solved
-                // under a variance function whose θ differs from the installed one
-                // by more than the tolerance, and θ enters the NB2 working
+            if !progress.justifies_another_pass(
+                relative_change,
+                (refreshed_theta - prior_theta).signum(),
+                resolution,
+            ) {
+                // The mean was solved under a variance function whose θ the
+                // installed one no longer matches, and θ enters the NB2 working
                 // response, so β̂ is not stationary at the reported θ. Not a joint
                 // (β, θ) fixed point, so not a fit (#3544).
-                crate::bail_invalid_estim!(
-                    "negative-binomial θ did not reach its converged-η fixed point within \
-                     {MAX_THETA_REFRESH} re-solves (relative change {rel_change:e} > \
-                     tolerance {THETA_REFRESH_REL_TOL:e})"
-                );
+                return Err(progress.refuse(
+                    "negative-binomial θ",
+                    relative_change,
+                    resolution,
+                    reading.relative_residual,
+                    band,
+                ));
             }
             // θ moved materially: re-solve β at the corrected θ, warm-started at
             // the converged β, so the mean is refit under the better variance

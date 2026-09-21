@@ -104,6 +104,35 @@
   on whichever executor measured faster instead of always on the device, so results can
   differ at roundoff between runs near the crossover. Off Linux, `gpu="required"` now
   refuses them instead of silently running the CPU loop.
+- **A converged-η scale refresh is accepted by the P-IRLS KKT certificate, not by a 1e-4
+  relative change** (#4489).
+  The five refreshes that re-estimate a family's scale at the reported fit — the Gamma
+  shape, the Tweedie φ, the Gaussian / inverse-Gaussian φ, the Beta precision and the
+  negative-binomial θ — installed the refreshed value and then accepted the fit without a
+  re-solve once the value had moved by less than `1e-4` relative. β̂, the working weights,
+  the penalized Hessian, `Vb = H⁻¹` and the EDF had all been assembled at the PREVIOUS
+  value, so the reported coefficients were not stationary at the reported scale: for the
+  families where the scale multiplies the data term the residual is
+  `|m_new/m_old − 1|·‖S_λβ̂‖`, orders above the KKT band the same β̂ was certified at, and
+  for Beta and negative binomial the scale enters the mean score itself, so β̂ was biased
+  rather than merely rescaled. Each refresh now reads the working state at the installed
+  scale — one evaluation at the unchanged β̂ — and accepts only when its relative
+  stationarity residual `‖g‖/‖natural scale‖` is inside the band that solve certified β̂ at
+  (`final_kkt_tolerance`, widened to `10·tol` exactly when the solve was accepted as
+  `StalledAtValidMinimum`, floored at the residual β̂ already carries). The state that is
+  reported is the one that certified, so the deviance, the weights, `Vb` and the EDF all
+  come from the scale the fit reports. The pass caps `MAX_PHI_REFRESH = 5`,
+  `MAX_SHAPE_REFRESH = 5`, the local Beta and negative-binomial `30`, and every
+  `*_REL_TOL = 1e-4` are deleted: a pass is justified while the alternation still resolves
+  the scale (above `γ_n`, the estimator's own `n`-term accumulation band) and either
+  contracts or keeps its direction, netted by the caller's own inner fixed-point budget.
+  A monotone non-contracting climb is allowed because the Beta cold start measured at that
+  site climbs `φ: 1.1 → 6.4 → 50 → 1.6e3` before it converges.
+  **Behavior change:** a fit whose scale alternation never reaches a joint fixed point is
+  refused where it was previously reported with a scale β̂ was not stationary at, and the
+  reported dispersion, standard errors and EDF of an accepted fit shift by up to the old
+  `1e-4` relative tolerance.
+
 - **The composition-law test studentizes by the fitted curves' own sampling law** (#3512).
   `composition_defect` floored the defect's pointwise variance at the three maps'
   in-sample observation residual RMS, combined by Minkowski's inequality. That RMS
