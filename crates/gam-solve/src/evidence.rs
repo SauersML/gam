@@ -3605,7 +3605,10 @@ mod tests {
             covariances: vec![array![[1.0]], array![[1.0]]],
             k: 2,
             d: 1,
+            // This fixture reads only the density; it carries no evidence and
+            // no band for one, exactly as its `log_evidence` says.
             log_evidence: 0.0,
+            log_evidence_band: 0.0,
         };
         let previous = mixture(array![0.25, 0.75], array![[0.0], [0.0]])
             .per_point_log_density(data.view())
