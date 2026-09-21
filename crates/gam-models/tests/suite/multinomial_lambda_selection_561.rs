@@ -178,6 +178,59 @@ fn multinomial_outer_reml_selects_per_term_lambda_and_recovers_truth() {
         model_hi.lambdas,
     );
 
+    // The shape of what was measured. These are preconditions for reading the
+    // four bars at all, so they stay immediate.
+    assert_eq!(edf.len(), K - 1, "one EDF entry per active class");
+    assert!(!per_block.is_empty(), "must report per-class λ block sizes");
+    assert!(
+        n0 >= 2,
+        "class 0 must carry ≥2 penalty components, got {n0}"
+    );
+
+    // (#4004) The four bars are COLLECTED and raised together, diagnosing ones
+    // first. Truth recovery is the only one of the four that does not tell a
+    // dead smoothing selection from a live selection that landed in a worse
+    // basin, and it used to be asserted first, so a red run stopped there and
+    // reported "RMSE is 0.0688" while (2), (3) and (4) -- the three that name
+    // WHICH of the two it is -- were never asserted. A fixture that stops at
+    // its least informative bar makes every run cost one more run.
+    let mut failures: Vec<String> = Vec::new();
+
+    // (2) Penalization is active. Per-class EDF must sit well below the
+    // per-class coefficient count; a near-unpenalized fit (EDF ≈ p) is the
+    // dead-selection signature (λ pinned at the seed).
+    for (a, &e) in edf.iter().enumerate() {
+        if !(e.is_finite() && e > 0.0 && e < 0.75 * p_per_class) {
+            failures.push(format!(
+                "(2) class {a} EDF={e:.3} is not in (0, 0.75·p={:.2}): the fit is \
+                 near-unpenalized, so REML never selected a smoothing parameter",
+                0.75 * p_per_class
+            ));
+        }
+    }
+
+    // (3) Per-term λ are genuinely selected and DIFFER. With #561 fixed the
+    // rough cubic term and the smoother sigmoid/null-space terms take very
+    // different λ; a fused or dead selector returns near-equal λ (or all == the
+    // seed 1.0). Check the within-class span.
+    if !(lam_max / lam_min > 5.0) {
+        failures.push(format!(
+            "(3) within-class per-term λ barely differ (max={lam_max:.4} min={lam_min:.4}); \
+             REML is not selecting independent per-term smoothing (fused-λ regression)"
+        ));
+    }
+
+    // (4) Selection is not a passthrough of the seed. The init=50 fit above is
+    // the control: its recovered λ must NOT all be ≈ init (the exact
+    // dead-selection fingerprint: λ ≡ init for every component).
+    if echoes_seed {
+        failures.push(format!(
+            "(4) every selected λ equals the init seed 50.0 — the outer smoothing search \
+             never moved (dead selection): {:?}",
+            model_hi.lambdas
+        ));
+    }
+
     // (1) Truth recovery. The fused-λ driver measured ≥ 0.13 and the pinned-λ
     // (dead-selection) driver ≥ 0.07 on this DGP; a working per-term REML fit
     // recovers to a few percent.
@@ -186,48 +239,20 @@ fn multinomial_outer_reml_selects_per_term_lambda_and_recovers_truth() {
     // between "working" and the failure mode this bar names, so a value inside
     // it does not tell a small quality regression from dead selection. That is
     // an argument for deriving the bar, not for moving it, and it is why (2),
-    // (3) and (4) are the assertions that carry the diagnosis.
-    assert!(
-        rmse < 0.065,
-        "multinomial fit did not recover the true simplex: RMSE={rmse:.5} (>= 0.065 \
-         indicates fused-λ or a stalled outer smoothing selection)"
-    );
-
-    // (2) Penalization is active. Per-class EDF must sit well below the
-    // per-class coefficient count; a near-unpenalized fit (EDF ≈ p) is the
-    // dead-selection signature (λ pinned at the seed).
-    assert_eq!(edf.len(), K - 1, "one EDF entry per active class");
-    for (a, &e) in edf.iter().enumerate() {
-        assert!(
-            e.is_finite() && e > 0.0 && e < 0.75 * p_per_class,
-            "class {a} EDF={e:.3} is not in (0, 0.75·p={:.2}): the fit is \
-             near-unpenalized, so REML never selected a smoothing parameter",
-            0.75 * p_per_class
-        );
+    // (3) and (4) are the assertions that carry the diagnosis. The bar is
+    // unchanged here: the two reference numbers it sits between were measured
+    // on drivers this test cannot construct -- `MultinomialFitRequest` carries
+    // no way to hold λ at its seed -- so denominating it against a control
+    // needs that control to exist first.
+    if !(rmse < 0.065) {
+        failures.push(format!(
+            "(1) multinomial fit did not recover the true simplex: RMSE={rmse:.5} (>= 0.065 \
+             indicates fused-λ or a stalled outer smoothing selection)"
+        ));
     }
 
-    // (3) Per-term λ are genuinely selected and DIFFER. With #561 fixed the
-    // rough cubic term and the smoother sigmoid/null-space terms take very
-    // different λ; a fused or dead selector returns near-equal λ (or all == the
-    // seed 1.0). Check the within-class span.
-    assert!(!per_block.is_empty(), "must report per-class λ block sizes");
     assert!(
-        n0 >= 2,
-        "class 0 must carry ≥2 penalty components, got {n0}"
-    );
-    assert!(
-        lam_max / lam_min > 5.0,
-        "within-class per-term λ barely differ (max={lam_max:.4} min={lam_min:.4}); \
-         REML is not selecting independent per-term smoothing (fused-λ regression)"
-    );
-
-    // (4) Selection is not a passthrough of the seed. The init=50 fit above is
-    // the control: its recovered λ must NOT all be ≈ init (the exact
-    // dead-selection fingerprint: λ ≡ init for every component).
-    assert!(
-        !echoes_seed,
-        "every selected λ equals the init seed 50.0 — the outer smoothing search \
-         never moved (dead selection): {:?}",
-        model_hi.lambdas
+        failures.is_empty(),
+        "multinomial per-term λ selection (#561/#4004), every failing bar:\n{failures:#?}"
     );
 }
