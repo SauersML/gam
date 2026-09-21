@@ -51,9 +51,9 @@ def test_bounded_gaussian_se_matches_unconstrained() -> None:
     y = 1.0 + 0.5 * x + rng.standard_normal(n) * 0.05
     df = pd.DataFrame({"x": x, "y": y})
 
-    # `prior=none`: this pins the unpenalised interval geometry. The default
+    # `prior=uniform`: this pins the unpenalised interval geometry. The default
     # shrinkage prior centres at the midpoint 0.5, which is the true slope here.
-    mb = gamfit.fit(df, "y ~ bounded(x, min=0, max=1, prior=none)")
+    mb = gamfit.fit(df, "y ~ bounded(x, min=0, max=1, prior=uniform)")
     mu = gamfit.fit(df, "y ~ x")
 
     # Same point estimate (interior, well away from either bound).
@@ -104,7 +104,7 @@ def test_bounded_gaussian_se_scales_with_noise() -> None:
         # Reuse one noise vector so only its amplitude changes.
         noise = rng.standard_normal(n)
         df = pd.DataFrame({"x": x, "y": base + noise * sigma})
-        return _se(gamfit.fit(df, "y ~ bounded(x, min=0, max=1, prior=none)"))
+        return _se(gamfit.fit(df, "y ~ bounded(x, min=0, max=1, prior=uniform)"))
 
     se_lo = fit_se(0.02)
     se_hi = fit_se(0.08)

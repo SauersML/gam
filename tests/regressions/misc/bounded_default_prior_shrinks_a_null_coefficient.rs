@@ -10,7 +10,7 @@
 //! null-recovery ridge.
 //!
 //! The fixture pins the noise's least-squares slope at half its standard
-//! error, so the unpenalised fit (`prior=none`) reports a clearly nonzero
+//! error, so the unpenalised fit (`prior=uniform`) reports a clearly nonzero
 //! slope, while REML's single-coefficient variance estimate
 //! `max(0, beta_hat^2 - se^2)` is zero and the default fit must return the
 //! slope to `beta = 0`.
@@ -112,7 +112,7 @@ fn bounded_default_prior_shrinks_a_null_coefficient_to_zero() {
 
     // Non-vacuity: without a prior the box is interior and the slope is the
     // noise's least-squares slope, half a standard error away from zero.
-    let unpenalised = bounded_slope("y ~ bounded(x, min=-1, max=1, prior=none)", &data);
+    let unpenalised = bounded_slope("y ~ bounded(x, min=-1, max=1, prior=uniform)", &data);
     assert!(
         unpenalised.abs() > 0.02,
         "the unpenalised bounded slope must carry the fixture's noise slope, got {unpenalised}"
@@ -184,74 +184,88 @@ fn bounded_shrinkage_is_equivariant_in_the_units_of_the_response() {
     );
 }
 
-/// An unpenalised bounded fit whose constrained optimum sits on a bound is the
-/// rail itself (gam#3289). The least-squares slope here is the noise's, about
-/// 0.035, so `bounded(x, min=1, max=3, prior=none)` has its box-constrained
-/// optimum at exactly `beta = min = 1`. The bounded term fits that coefficient
-/// on a logit chart, where the rail is at infinity, and the inner solve must
-/// certify the rail rather than return the fit unconverged.
+/// An unpenalised bounded fit whose constrained optimum sits on a bound has
+/// its MODE on the rail (gam#3289, gam#3923). The least-squares slope here is
+/// the noise's, about 0.035, so `bounded(x, min=1, max=3, prior=uniform)` has its
+/// box-constrained optimum at exactly `beta = min = 1`: with the intercept
+/// profiled out the Gaussian objective is a convex quadratic in the slope,
+/// minimised at the OLS slope, and the constrained optimum is that slope
+/// clamped to the box.
+///
+/// `prior=none` used to be a flat prior on the logit chart of the interval
+/// transform. That prior is improper: as the latent coordinate runs to either
+/// infinity the likelihood tends to its value at the rail, a positive
+/// constant, so the flat-latent posterior has infinite mass and no mean. The
+/// fit stalled at the chart's injective clamp, read that flat direction as an
+/// improper posterior, armed the Jeffreys term (#979) and published 1.0076, a
+/// summary of neither the constrained MLE nor any stated posterior. And
+/// `prior=uniform` was flat on the box pulled back to the chart (the
+/// log-Jacobian correction): proper, but the fit published the chart's mode,
+/// 1.008280 here against the box posterior's mean 1.008165 (gam#3479).
+///
+/// Both were the same prior, flat on the box, so there is one spelling,
+/// `prior=uniform` (`none` is refused with a pointer to it), and it is the
+/// box-constrained linear term: flat on the box of the coefficient itself, a
+/// proper posterior because the box is bounded. Its mode is the constrained
+/// MLE, and what it publishes is that truncated posterior's mean (SPEC:
+/// "Posterior mean must always be the default (never MAP)"), which sits
+/// strictly inside the box. Inside a box that does not bind it is the
+/// unconstrained unpenalised fit, the same numbers as `linear(x, min, max,
+/// double_penalty=false)` there too.
 #[test]
-fn bounded_unpenalised_fit_certifies_an_optimum_on_the_rail() {
+fn bounded_unpenalised_fit_is_the_box_constrained_linear_posterior() {
     init_parallelism();
     let (x, y) = fixture();
     let data = dataset(&x, &y);
     let ols = ols_slope(&x, &y);
     assert!(ols < 1.0, "non-vacuity: the least-squares slope {ols} must lie below the box");
-    let slope = bounded_slope("y ~ bounded(x, min=1, max=3, prior=none)", &data);
-    assert!(
-        (1.0..=3.0).contains(&slope),
-        "the railed slope must honour the box, got {slope}"
-    );
-    // What the railed fit publishes is not pinned here. On this fixture the
-    // unarmed fit certifies with the latent coordinate at its injective clamp
-    // `|logit| = ln(2/eps)`, where the Fisher information in that coordinate is
-    // about 1e-14. The certificate therefore reads the flat-latent posterior as
-    // improper, arms the Jeffreys term (#979), and the armed refit publishes
-    // 1.0076 rather than the constrained maximum-likelihood rail `min = 1` that
-    // docs/formulas.md promises for `prior=none`. That contract question is
-    // gam#3923.
-}
 
-/// `bounded(x, min, max, prior=uniform)` is flat on the coefficient over the
-/// box, which is the posterior of the unpenalised box-constrained `linear()`
-/// coefficient, so both formulas must publish the same number: that route's
-/// truncated posterior mean (#2705). The bounded term used to fit this prior
-/// on its logit chart and publish the chart's mode pushed back to the
-/// coefficient, which is neither the mode nor the mean in the coefficient
-/// (gam#3479): on this fixture it sat 2.0e-4 below the truncated mean inside
-/// `[-1, 1]` and 1.15e-4 above it on the rail box `[1, 3]`.
-#[test]
-fn bounded_uniform_prior_publishes_the_boxed_linear_truncated_mean() {
-    init_parallelism();
-    let (x, y) = fixture();
-    let data = dataset(&x, &y);
-    let ols = ols_slope(&x, &y);
-    for (min, max) in [(-1.0_f64, 1.0_f64), (1.0, 3.0)] {
-        let uniform = bounded_slope(
-            &format!("y ~ bounded(x, min={min}, max={max}, prior=uniform)"),
-            &data,
-        );
-        let boxed = bounded_slope(
-            &format!("y ~ linear(x, min={min}, max={max}, double_penalty=false)"),
-            &data,
-        );
-        // Both formulas lower to the same term and solve the same problem, so
-        // they differ at most by the reduction-order rounding of about 1e-15
-        // derived in the interior test below. The 1e-12 band sits eight orders
-        // under the 1e-4 gap of the chart mode it replaces.
-        assert!(
-            (uniform - boxed).abs() <= 1e-12,
-            "bounded(prior=uniform) on [{min}, {max}] must publish the boxed linear \
-             truncated mean {boxed}, got {uniform}"
-        );
-        // Non-vacuity: the box is interior on [-1, 1] and binds on [1, 3],
-        // where the truncated mean lies strictly inside the box, off the rail.
-        assert!(
-            min < boxed && boxed < max,
-            "the truncated mean {boxed} must lie strictly inside ({min}, {max})"
-        );
-    }
-    assert!(ols < 1.0, "non-vacuity: the least-squares slope {ols} must lie below the rail box");
+    let standard = |formula: &str| match fit_from_formula(formula, &data, &FitConfig::default()) {
+        Ok(FitResult::Standard(fit)) => fit,
+        Ok(_) => panic!("`{formula}` is a Standard GAM fit"),
+        Err(error) => panic!("`{formula}` must fit: {error}"),
+    };
+    let bounded = standard("y ~ bounded(x, min=1, max=3, prior=uniform)");
+    let linear = standard("y ~ linear(x, min=1, max=3, double_penalty=false)");
+
+    let mode = bounded
+        .fit
+        .geometry
+        .as_ref()
+        .and_then(|geometry| geometry.constrained_posterior.as_ref())
+        .expect("prior=uniform carries the box as inequality constraints")
+        .mode[1];
+    // The active row is held as an equality in the solver's conditioned frame:
+    // the bound is carried there as `min*s` for a column scale `s` and the mode
+    // comes back as `beta/s`, two roundings of relative size at most `eps/2`
+    // each, so the mode is within `2*eps*|min|` of `min`.
+    assert!(
+        (mode - 1.0).abs() <= 2.0 * f64::EPSILON,
+        "the prior=uniform mode is the constrained maximum-likelihood fit, the rail min = 1; \
+         got {mode:.17}"
+    );
+
+    let reported = bounded.fit.beta[1];
+    assert!(
+        reported > 1.0 && reported < 3.0,
+        "the published coefficient is the truncated posterior's mean, strictly inside the \
+         box; got {reported:.17}"
+    );
+    assert!(
+        reported == linear.fit.beta[1],
+        "prior=uniform must be the box-constrained linear fit: bounded {reported:.17} against \
+         linear {:.17}",
+        linear.fit.beta[1]
+    );
+
+    let interior = bounded_slope("y ~ bounded(x, min=-1, max=1, prior=uniform)", &data);
+    let interior_linear =
+        bounded_slope("y ~ linear(x, min=-1, max=1, double_penalty=false)", &data);
+    assert!(
+        interior == interior_linear,
+        "inside a box that does not bind, prior=uniform must be the box-constrained linear \
+         fit: bounded {interior:.17} against linear {interior_linear:.17}"
+    );
 }
 
 /// A box that does not bind leaves the fit unconstrained, so on an unpenalised

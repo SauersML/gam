@@ -922,20 +922,22 @@ mod adaptive_bounded_duchon_tests {
     }
 
     #[test]
-    fn boundednone_prior_has_no_extra_latentobjective_terms() {
+    fn bounded_shrinkage_prior_has_no_extra_latent_objective_terms() {
+        // The shrinkage prior is carried as a REML-weighted latent penalty
+        // block, so it adds nothing to the per-coefficient prior terms.
         let theta = 0.7;
-        let none = bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::None)
-            .expect("flat prior geometry");
-        assert_eq!(none, (0.0, 0.0, 0.0, 0.0, 0.0));
+        let shrinkage = bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Shrinkage)
+            .expect("shrinkage prior geometry");
+        assert_eq!(shrinkage, (0.0, 0.0, 0.0, 0.0, 0.0));
 
-        let beta =
+        let beta11 =
             bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Beta { a: 1.0, b: 1.0 })
                 .expect("Beta(1,1) prior geometry");
-        assert!(beta.0.is_finite());
-        assert!(beta.0 < 0.0);
-        assert!(beta.1.abs() > 1e-6);
-        assert!(beta.2 > 0.0);
-        assert!(beta.3.is_finite());
+        assert!(beta11.0.is_finite());
+        assert!(beta11.0 < 0.0);
+        assert!(beta11.1.abs() > 1e-6);
+        assert!(beta11.2 > 0.0);
+        assert!(beta11.3.is_finite());
     }
 
     #[test]

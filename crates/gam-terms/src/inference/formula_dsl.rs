@@ -988,6 +988,7 @@ mod tests {
             ("bounded(x, min=0, max=1, pull=uniform)", "unknown option `pull` in bounded(); use `prior`"),
             ("bounded(x, min=0, max=1, prior=log-jacobian)", "unknown bounded() prior `log-jacobian`; use `uniform`"),
             ("bounded(x, min=0, max=1, prior=jacobian)", "unknown bounded() prior `jacobian`; use `uniform`"),
+            ("bounded(x, min=0, max=1, prior=none)", "unknown bounded() prior `none`; use `uniform`"),
         ];
         for (term, expected) in cases {
             let err = term_error(term);
@@ -2738,7 +2739,6 @@ fn parse_bounded_priorspec(
     if let Some(priorname) = prior_mode {
         return match priorname.as_str() {
             "shrinkage" => Ok(BoundedPriorChoice::Latent(BoundedCoefficientPriorSpec::Shrinkage)),
-            "none" => Ok(BoundedPriorChoice::Latent(BoundedCoefficientPriorSpec::None)),
             "uniform" => Ok(BoundedPriorChoice::FlatOnBox),
             "center" => Ok(BoundedPriorChoice::Latent(BoundedCoefficientPriorSpec::Beta {
                 a: 2.0,
@@ -2753,7 +2753,7 @@ fn parse_bounded_priorspec(
                         "unknown bounded() prior `{other}`; use `{canonical}`: {raw}"
                     ),
                     None => format!(
-                        "bounded() prior must be one of shrinkage|none|uniform|center, got '{other}': {raw}"
+                        "bounded() prior must be one of shrinkage|uniform|center, got '{other}': {raw}"
                     ),
                 },
             }

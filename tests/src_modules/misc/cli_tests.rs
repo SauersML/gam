@@ -3998,7 +3998,10 @@ fn parse_bounded_linear_term_with_center_prior() {
 }
 
 #[test]
-fn parse_bounded_uniform_prior_as_the_boxed_linear_term() {
+fn parse_bounded_linear_uniform_prior_is_the_box_constrained_linear_term() {
+    // gam#3923 / gam#3479: `prior=uniform` is flat on the box of the
+    // coefficient, which is exactly the unpenalised box-constrained linear
+    // term. There is no flat-chart variant and no log-Jacobian chart variant.
     let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1, prior=\"uniform\") + z")
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     assert_eq!(parsed.terms.len(), 2);
@@ -4012,12 +4015,24 @@ fn parse_bounded_uniform_prior_as_the_boxed_linear_term() {
         } => {
             assert_eq!(name, "mu_hat");
             assert!(*explicit);
+            assert!(!*double_penalty);
             assert_eq!(*coefficient_min, Some(0.0));
             assert_eq!(*coefficient_max, Some(1.0));
-            assert!(!*double_penalty);
         }
         other => panic!("bounded(prior=uniform) must be the boxed linear term, got {other:?}"),
     }
+    assert!(
+        parse_formula("y ~ bounded(mu_hat, min=0, max=1, prior=uniform, double_penalty=true)")
+            .is_err(),
+        "the unpenalised constrained fit cannot take a double penalty"
+    );
+    let removed = parse_formula("y ~ bounded(mu_hat, min=0, max=1, prior=none)")
+        .expect_err("`none` is a removed spelling of `uniform`")
+        .to_string();
+    assert!(
+        removed.contains("use `uniform`"),
+        "the refusal must name the canonical spelling: {removed}"
+    );
 }
 
 #[test]
