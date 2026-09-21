@@ -17,12 +17,17 @@
 //! both of the Gauss–Newton system.
 //!
 //! The data term, both prior normalizers and the integrated coordinate block are the
-//! dense SAE criterion's (#2933 F24–F26, F27 S1–S2). The value still departs from the
-//! dense criterion in four ways:
+//! dense SAE criterion's (#2933 F24–F26, F27 S1–S2). The Euclidean ARD log precisions
+//! are outer coordinates on the dense lane's layout, one per atom axis below
+//! `SAE_SHARED_ARD_K_THRESHOLD` atoms and one per axis index above it, and the criterion
+//! is minimized over them as the dense one is (#3433, F27 S5). The value still departs
+//! from the dense criterion in four ways:
+//! - a periodic axis's precision is held at the caller's value, because its Laplace
+//!   criterion has no minimizer where the axis carries no profiled data curvature
+//!   ([`SaeSupportArdLayout`]);
 //! - the curvature is the majorizer, not the exact observed information `log|A|`;
 //! - no realised-rank charge and no collapse-prevention energy enter;
-//! - smoothing is shared per family;
-//! - the ARD precisions are fixed.
+//! - smoothing is shared per family.
 //!
 //! So a hard-TopK request that crosses `K = P` still changes criteria. The report
 //! carries a [`SaeCriterionScore`] of kind [`SaeCriterionKind::SupportQuasiLaplace`],
@@ -158,10 +163,179 @@ impl SaeSupportSmoothingLayout {
     }
 }
 
+/// Which outer log-precision coordinate prices each atom axis's ARD prior (#3433).
+///
+/// The layout is the dense lane's (`fit_seed`): one coordinate per atom axis below
+/// `SAE_SHARED_ARD_K_THRESHOLD` atoms, and above it one per axis index, shared by
+/// every atom that has that axis. A support route and a dense route of one request
+/// therefore search the same Euclidean precision coordinates.
+///
+/// A periodic (von-Mises) axis is held at the caller's precision and is not an
+/// outer coordinate. On a circle of period `P` with `κ = 2π/P`, the prior's exact
+/// partition is `log Z = log(2π/κ) − α/κ² + log I₀(α/κ²)` per slot, while the
+/// criterion integrates the coordinate block by Laplace, `½·log(α + d)` with `d` the
+/// profiled data curvature of the slot axis. Where `d = 0`, which happens exactly
+/// (for example a single selecting row whose decoder carries an unpenalized
+/// constant column absorbs the row's cell for every `λ`), the slot's
+/// log-precision derivative is `−α/κ² + (α/κ²)·I₁/I₀(α/κ²) + ½ → ½` as `α → 0`: the
+/// criterion decreases without bound toward the prior's flat limit, where the
+/// Laplace step integrates a density that is no longer concentrated, and its
+/// minimizer is the domain face, at which the row block is singular to working
+/// precision. A Gaussian axis has no such limit: its partition's `−½·log α`
+/// cancels the Laplace `½·log α`, so a data-free Euclidean axis is exactly flat.
+/// Selecting a periodic precision needs the circle's own integrated block, not
+/// its Laplace image (#2933 F27 S3.1). Until then the lane holds it, and its
+/// entries still curve the row blocks at that precision.
+#[derive(Clone, Debug)]
+pub struct SaeSupportArdLayout {
+    /// `atom_coordinate[atom][axis]`: the coordinate pricing that axis, `None` for
+    /// a held periodic axis.
+    pub atom_coordinate: Vec<Vec<Option<usize>>>,
+    /// The caller's precisions per atom axis: the search's seed, and the value a
+    /// held axis keeps.
+    pub entry_precisions: Vec<Vec<f64>>,
+    /// Number of ARD log-precision coordinates.
+    pub coordinates: usize,
+    /// Whether the coordinates are shared by axis index.
+    pub shared: bool,
+}
+
+impl SaeSupportArdLayout {
+    /// The layout for `term` at the caller's precisions. A non-positive precision
+    /// has no log coordinate and is refused.
+    pub(crate) fn from_term(
+        term: &SaeSupportSparseTerm,
+        ard_precisions: &[Vec<f64>],
+    ) -> Result<Self, String> {
+        if ard_precisions.len() != term.k_atoms() {
+            return Err(format!(
+                "support ARD layout: {} precision blocks for {} atoms",
+                ard_precisions.len(),
+                term.k_atoms()
+            ));
+        }
+        let mut euclidean = Vec::with_capacity(term.k_atoms());
+        for (atom, precisions) in ard_precisions.iter().enumerate() {
+            let periods = term.atom_ard_axis_periods(atom);
+            if precisions.len() != term.assignment.atom_coord_dim(atom)
+                || periods.len() != precisions.len()
+            {
+                return Err(format!(
+                    "support ARD layout: atom {atom} has {} precisions for {} axes",
+                    precisions.len(),
+                    term.assignment.atom_coord_dim(atom)
+                ));
+            }
+            if let Some(precision) = precisions
+                .iter()
+                .find(|precision| !(precision.is_finite() && **precision > 0.0))
+            {
+                return Err(format!(
+                    "support ARD layout: atom {atom} precision {precision} has no log \
+                     coordinate; the support lane searches log precisions"
+                ));
+            }
+            euclidean.push(periods.iter().map(Option::is_none).collect::<Vec<_>>());
+        }
+        let shared = term.k_atoms() >= super::fit_seed::SAE_SHARED_ARD_K_THRESHOLD;
+        let (atom_coordinate, coordinates) = if shared {
+            // One coordinate per axis index some atom prices as Euclidean.
+            let width = euclidean.iter().map(Vec::len).max().unwrap_or(0);
+            let mut index_of_axis = vec![None; width];
+            let mut next = 0usize;
+            for (axis, slot) in index_of_axis.iter_mut().enumerate() {
+                if euclidean.iter().any(|axes| axes.get(axis).copied().unwrap_or(false)) {
+                    *slot = Some(next);
+                    next += 1;
+                }
+            }
+            let map = euclidean
+                .iter()
+                .map(|axes| {
+                    axes.iter()
+                        .enumerate()
+                        .map(|(axis, &free)| if free { index_of_axis[axis] } else { None })
+                        .collect()
+                })
+                .collect();
+            (map, next)
+        } else {
+            let mut next = 0usize;
+            let map = euclidean
+                .iter()
+                .map(|axes| {
+                    axes.iter()
+                        .map(|&free| {
+                            free.then(|| {
+                                next += 1;
+                                next - 1
+                            })
+                        })
+                        .collect()
+                })
+                .collect();
+            (map, next)
+        };
+        Ok(Self {
+            atom_coordinate,
+            entry_precisions: ard_precisions.to_vec(),
+            coordinates,
+            shared,
+        })
+    }
+
+    /// The per-atom ARD precisions at the log precisions `log_ard`: `exp(u)` on
+    /// every priced axis, the entry precision on every held one.
+    pub fn expand(&self, log_ard: ArrayView1<'_, f64>) -> Result<Vec<Vec<f64>>, String> {
+        if log_ard.len() != self.coordinates {
+            return Err(format!(
+                "SaeSupportArdLayout::expand: {} log precisions for {} coordinates",
+                log_ard.len(),
+                self.coordinates
+            ));
+        }
+        let precisions = gam_problem::checked_exp_log_strengths(log_ard.iter().copied())
+            .map_err(|error| {
+                format!("SaeSupportArdLayout::expand: invalid log precision: {error}")
+            })?;
+        Ok(self
+            .atom_coordinate
+            .iter()
+            .zip(&self.entry_precisions)
+            .map(|(axes, held)| {
+                axes.iter()
+                    .zip(held)
+                    .map(|(index, &held)| index.map_or(held, |index| precisions[index]))
+                    .collect()
+            })
+            .collect())
+    }
+
+    /// The caller's precisions on this layout: each coordinate at the geometric
+    /// mean of the entry precisions it prices.
+    fn seed(&self) -> Array1<f64> {
+        let mut sum = Array1::<f64>::zeros(self.coordinates);
+        let mut count = vec![0usize; self.coordinates];
+        for (axes, precisions) in self.atom_coordinate.iter().zip(&self.entry_precisions) {
+            for (index, &precision) in axes.iter().zip(precisions) {
+                if let Some(index) = *index {
+                    sum[index] += precision.ln();
+                    count[index] += 1;
+                }
+            }
+        }
+        // Every coordinate prices at least one axis by construction.
+        Array1::from_shape_fn(self.coordinates, |index| sum[index] / count[index] as f64)
+    }
+}
+
 pub struct SaeSupportOuterRequest {
     pub term: SaeSupportSparseTerm,
     pub target: Array2<f64>,
     pub initial_smoothness: f64,
+    /// The ARD precisions the search starts from, per atom axis. Each outer
+    /// log-precision coordinate starts at the geometric mean of those it prices,
+    /// and a periodic axis keeps its value ([`SaeSupportArdLayout`]).
     pub ard_precisions: Vec<Vec<f64>>,
     pub max_outer_iter: usize,
     pub trust_radius: f64,
@@ -173,6 +347,11 @@ pub struct SaeSupportOuterReport {
     pub smoothing_layout: SaeSupportSmoothingLayout,
     pub log_lambda_groups: Array1<f64>,
     pub lambda_smooth: Vec<f64>,
+    /// Which log-precision coordinate prices each atom axis.
+    pub ard_layout: SaeSupportArdLayout,
+    /// The selected ARD log precisions, one per `ard_layout` coordinate.
+    pub log_ard: Array1<f64>,
+    /// The selected ARD precisions per atom axis, `exp(log_ard)` on `ard_layout`.
     pub ard_precisions: Vec<Vec<f64>>,
     /// The terminal criterion, typed as the support quasi-Laplace score this lane
     /// minimizes. It does not compare with a dense quasi-Laplace score (#2933 F27).
@@ -260,6 +439,7 @@ struct SupportOuterEvaluation {
     components: SaeSupportCriterionComponents,
     gradient: Array1<f64>,
     lambda_smooth: Vec<f64>,
+    ard_precisions: Vec<Vec<f64>>,
     fixed_point: SaeSupportFixedPointReport,
     /// Hutchinson probes behind `components.reduced_log_det`; zero on the exact route.
     logdet_probes: usize,
@@ -267,7 +447,8 @@ struct SupportOuterEvaluation {
     logdet_nodes: usize,
     /// Hutchinson standard error of `components.reduced_log_det`.
     logdet_std_err: f64,
-    /// Per-probe samples `[probe, group]` of the log-determinant half of `gradient`,
+    /// Per-probe samples `[probe, coordinate]` of the log-determinant half of
+    /// `gradient`, smoothing groups first and ARD log precisions after them,
     /// present where the evaluation was asked to measure them on the rational route.
     probe_gradient_samples: Option<Array2<f64>>,
     /// Each group's gradient split into the channels it is summed from, published
@@ -318,7 +499,7 @@ struct SaeSupportOuterObjective {
     target: Array2<f64>,
     layout: SaeSupportSmoothingLayout,
     spectrum: PenaltySpectrum,
-    ard_precisions: Vec<Vec<f64>>,
+    ard_layout: SaeSupportArdLayout,
     inner_tolerance: f64,
     trust_radius: f64,
     random_state: u64,
@@ -456,6 +637,92 @@ fn unused_atom_null_quotient(
 impl SaeSupportOuterObjective {
     fn beta_layout(&self) -> Result<(Vec<usize>, usize), EstimationError> {
         self.term.beta_layout().map_err(outer_error)
+    }
+
+    /// Outer coordinates: the smoothing groups, then the ARD log precisions.
+    fn n_params(&self) -> usize {
+        self.layout.group_keys.len() + self.ard_layout.coordinates
+    }
+
+    /// `(λ per atom, α per atom axis)` at the outer point `rho`.
+    fn split(&self, rho: &Array1<f64>) -> Result<(Vec<f64>, Vec<Vec<f64>>), EstimationError> {
+        if rho.len() != self.n_params() {
+            return Err(outer_error(format!(
+                "support outer point has {} coordinates; the layout has {} smoothing groups and \
+                 {} ARD log precisions",
+                rho.len(),
+                self.layout.group_keys.len(),
+                self.ard_layout.coordinates
+            )));
+        }
+        let groups = self.layout.group_keys.len();
+        let lambda_smooth = self
+            .layout
+            .expand(&rho.slice(ndarray::s![..groups]).to_owned())
+            .map_err(outer_error)?;
+        let ard = self
+            .ard_layout
+            .expand(rho.slice(ndarray::s![groups..]))
+            .map_err(outer_error)?;
+        Ok((lambda_smooth, ard))
+    }
+
+    /// A name for outer coordinate `index`, for messages.
+    fn coordinate_name(&self, index: usize) -> String {
+        let groups = self.layout.group_keys.len();
+        if index < groups {
+            format!("smoothing group {index} ({})", self.layout.group_keys[index])
+        } else {
+            let coordinate = Some(index - groups);
+            let priced = self
+                .ard_layout
+                .atom_coordinate
+                .iter()
+                .enumerate()
+                .flat_map(|(atom, axes)| {
+                    axes.iter()
+                        .enumerate()
+                        .filter(|(_, priced)| **priced == coordinate)
+                        .map(move |(axis, _)| (atom, axis))
+                })
+                .next();
+            match (self.ard_layout.shared, priced) {
+                (true, Some((_, axis))) => format!("shared ARD log precision of axis {axis}"),
+                (false, Some((atom, axis))) => {
+                    format!("ARD log precision of atom {atom} axis {axis}")
+                }
+                (_, None) => format!("ARD log precision {}", index - groups),
+            }
+        }
+    }
+
+    /// `g_ρ = ∂(∇_θ ℓ_pen)/∂ρ_g = Σ_{k ∈ g} λ_k (S_k ⊗ I_P) β̂`: the group penalty
+    /// applied to the decoder, zero in the coordinate block, in the border layout.
+    fn smoothing_state_direction(
+        &self,
+        group: usize,
+        lambda_smooth: &[f64],
+        beta_offsets: &[usize],
+        beta_dim: usize,
+    ) -> Array1<f64> {
+        let output_dim = self.term.output_dim();
+        let mut beta = Array1::<f64>::zeros(beta_dim);
+        for atom in 0..self.term.k_atoms() {
+            if self.layout.atom_group[atom] != group {
+                continue;
+            }
+            let offset = beta_offsets[atom];
+            let lambda = lambda_smooth[atom];
+            let sb = self.term.atoms[atom]
+                .smooth_penalty()
+                .dot(self.term.atoms[atom].decoder_coefficients());
+            for basis in 0..self.term.atoms[atom].basis_size() {
+                for output in 0..output_dim {
+                    beta[offset + basis * output_dim + output] = lambda * sb[[basis, output]];
+                }
+            }
+        }
+        beta
     }
 
     fn penalty_energy_by_group(&self, lambda_smooth: &[f64]) -> Vec<f64> {
@@ -774,20 +1041,21 @@ impl SaeSupportOuterObjective {
         rho: &Array1<f64>,
         measure: bool,
     ) -> Result<SupportOuterEvaluation, EstimationError> {
-        let lambda_smooth = self.layout.expand(rho).map_err(outer_error)?;
+        let (lambda_smooth, ard) = self.split(rho)?;
+        let groups = self.layout.group_keys.len();
         let fixed_point = self
             .term
             .solve_fixed_point(
                 self.target.view(),
                 &lambda_smooth,
-                &self.ard_precisions,
+                &ard,
                 self.inner_tolerance,
                 self.trust_radius,
             )
             .map_err(outer_error)?;
         let mut system = self
             .term
-            .assemble_arrow_schur(self.target.view(), &lambda_smooth, &self.ard_precisions)
+            .assemble_arrow_schur(self.target.view(), &lambda_smooth, &ard)
             .map_err(outer_error)?;
         // #2576: atoms no row selects leave border directions nothing identifies. The
         // evidence prices the quotient without them (`unused_atom_null_quotient`).
@@ -805,19 +1073,27 @@ impl SaeSupportOuterObjective {
         // functions (#2576).
         let penalized_objective = self
             .term
-            .penalized_objective(self.target.view(), &lambda_smooth, &self.ard_precisions)
+            .penalized_objective(self.target.view(), &lambda_smooth, &ard)
             .map_err(outer_error)?;
         // The ARD prior's normalizer on every active slot: the partition, Laplace
         // constant and quotient sheets the dense criterion's `loss.ard` carries
-        // (#2933 F24–F26). The precisions are fixed here, so it has no smoothing
-        // derivative.
+        // (#2933 F24–F26). It moves with the ARD log precisions only.
         let ard_log_partition = self
             .term
-            .ard_log_partition_total(&self.ard_precisions)
+            .ard_log_partition_total(&ard)
+            .map_err(outer_error)?;
+        // Every active ARD entry and the coordinate that prices it (#3433).
+        let ard_entries = self
+            .term
+            .support_ard_prior_entries(
+                &ard,
+                &self.ard_layout.atom_coordinate,
+                self.ard_layout.coordinates,
+            )
             .map_err(outer_error)?;
         let (beta_offsets, beta_dim) = self.beta_layout()?;
         let mut penalty_logdet = 0.0;
-        for group in 0..self.layout.group_keys.len() {
+        for group in 0..groups {
             penalty_logdet += self.spectrum.log_pdet_base_by_group[group]
                 + self.spectrum.rank_by_group[group] as f64 * rho[group];
         }
@@ -847,7 +1123,7 @@ impl SaeSupportOuterObjective {
             .term
             .support_reduced_logdet_profile_adjoint(
                 self.target.view(),
-                &self.ard_precisions,
+                &ard,
                 &system,
                 &logdet_derivative,
             )
@@ -888,9 +1164,10 @@ impl SaeSupportOuterObjective {
             logdet_move,
             components.value(),
         );
-        let mut gradient = Array1::<f64>::zeros(self.layout.group_keys.len());
-        let mut gradient_parts = Vec::with_capacity(gradient.len());
-        for group in 0..gradient.len() {
+        let n_params = self.n_params();
+        let mut gradient = Array1::<f64>::zeros(n_params);
+        let mut gradient_parts = Vec::with_capacity(n_params);
+        for group in 0..groups {
             let derivative_matvec = |vector: ArrayView1<f64>| -> Array1<f64> {
                 self.schur_derivative_matvec(
                     group,
@@ -904,36 +1181,21 @@ impl SaeSupportOuterObjective {
                 .directional_derivative(&derivative_matvec)
                 .ok_or_else(|| {
                     outer_error(format!(
-                        "support LAML reduced-Schur surrogate produced no derivative for \
-                         smoothing group {group} ({})",
-                        self.layout.group_keys[group]
+                        "support LAML reduced-Schur surrogate produced no derivative for {}",
+                        self.coordinate_name(group)
                     ))
                 })?;
             // `g_rho = d(∇_theta L)/d rho` lives only in the decoder
             // block and equals the group penalty applied to beta. With
             // `a = A^+ Gamma`, the implicit logdet response is
             // `-1/2 <a, g_rho>` (one adjoint, then one cheap contraction per
-            // smoothing group).
-            let mut profile_response = 0.0_f64;
-            for atom in 0..self.term.k_atoms() {
-                if self.layout.atom_group[atom] != group {
-                    continue;
-                }
-                let m = self.term.atoms[atom].basis_size();
-                let offset = beta_offsets[atom];
-                let lambda = lambda_smooth[atom];
-                let sb = self.term.atoms[atom]
-                    .smooth_penalty()
-                    .dot(self.term.atoms[atom].decoder_coefficients());
-                for basis in 0..m {
-                    for output in 0..self.term.output_dim() {
-                        profile_response += profile_adjoint.beta
-                            [offset + basis * self.term.output_dim() + output]
-                            * lambda
-                            * sb[[basis, output]];
-                    }
-                }
-            }
+            // outer coordinate).
+            let profile_response = profile_adjoint.beta.dot(&self.smoothing_state_direction(
+                group,
+                &lambda_smooth,
+                &beta_offsets,
+                beta_dim,
+            ));
             let rank = self.spectrum.rank_by_group[group];
             // The same channels the REML engine publishes, with the same
             // meaning. `log|H|`'s total ρ-derivative is `tr(H⁻¹ dH/dρ_g)` with
@@ -969,6 +1231,66 @@ impl SaeSupportOuterObjective {
                 total: gradient[group],
             });
         }
+        // The ARD log precisions `u_c = log α_c` (#3433). The prior's value, gradient
+        // and majorizer curvature are degree-1 homogeneous in `α`, so each `∂/∂u_c` is
+        // the entry itself restricted to `c`:
+        //   ∂ℓ_pen/∂u_c = E_c = Σ_{a ∈ c} V_a (envelope theorem at the inner optimum),
+        //   ∂(Σ log Z)/∂u_c = P_c,
+        //   ∂log|H|/∂u_c at fixed state = tr(H_tt⁻¹D_c) + tr(S⁻¹ ∂S_c) = R_c + Schur_c,
+        //   ∂(∇_θ ℓ_pen)/∂u_c = g_c, the entries' prior gradients in the coordinate block.
+        // The state response is `dθ̂/du_c = −A⁻¹g_c`, so `½·log|H|` adds
+        // `−½⟨A⁺Γ, g_c⟩`, the same adjoint the smoothing gradient contracts:
+        //   ∂cost/∂u_c = E_c + P_c + ½·(R_c + Schur_c − ⟨a, g_c⟩).
+        // `penalty_log_pdet` is precision-free.
+        let ard_channels = self
+            .term
+            .support_ard_logdet_channels(
+                &system,
+                &ard_entries,
+                &logdet_derivative,
+                measure && logdet_derivative.hutchinson_probe_count() > 0,
+            )
+            .map_err(outer_error)?;
+        let ard_response = ard_entries
+            .contract_gradient(profile_adjoint.t.view())
+            .map_err(outer_error)?;
+        for coordinate in 0..self.ard_layout.coordinates {
+            let index = groups + coordinate;
+            let logdet = ard_channels.row_log_det[coordinate]
+                + ard_channels.reduced_log_det[coordinate];
+            let energy = ard_entries.energy[coordinate];
+            let partition = ard_entries.log_partition_gradient[coordinate];
+            // The channels map as the smoothing ones do: `fixed_beta` is the
+            // envelope prior energy, `logdet_h` is `½·∂log|H|` in both its halves --
+            // the fixed-state `½·(R_c + Schur_c)` and the mode response
+            // `−½·⟨a, g_c⟩`, the log determinant's move through the inner mode --
+            // and `logdet_s` is the prior normalizer's derivative, here the log
+            // partition's rather than a penalty pseudo-determinant's `−½·rank`.
+            // The rank is the active entries the coordinate prices. Nothing is
+            // folded in after the envelope, so `total` is exactly
+            // `fixed_beta + logdet_h + logdet_s` and the certificate's `kkt`
+            // residual is zero, as it is for a smoothing group.
+            let frozen_logdet_h = 0.5 * logdet;
+            let mode_response_logdet_h = -0.5 * ard_response[coordinate];
+            let logdet_h = frozen_logdet_h + mode_response_logdet_h;
+            let fixed_beta = energy;
+            let logdet_s = partition;
+            gradient[index] = fixed_beta + logdet_h + logdet_s;
+            let lambda = rho[index].exp();
+            gradient_parts.push(RhoGradientParts {
+                index,
+                lambda,
+                block_quadratic: 2.0 * energy / lambda,
+                rank: ard_entries.priced[coordinate],
+                dim: profile_adjoint.t.len(),
+                fixed_beta,
+                logdet_h,
+                frozen_logdet_h,
+                mode_response_logdet_h,
+                logdet_s,
+                total: gradient[index],
+            });
+        }
         if !cost.is_finite() || gradient.iter().any(|value| !value.is_finite()) {
             return Err(outer_error(
                 "support LAML produced a non-finite value or gradient",
@@ -979,8 +1301,9 @@ impl SaeSupportOuterObjective {
             Some(self.logdet_gradient_probe_samples(
                 &system,
                 &lambda_smooth,
-                &beta_offsets,
-                beta_dim,
+                &ard,
+                &ard_entries,
+                &ard_channels,
                 &logdet_derivative,
             )?)
         } else {
@@ -991,6 +1314,7 @@ impl SaeSupportOuterObjective {
             components,
             gradient,
             lambda_smooth,
+            ard_precisions: ard,
             fixed_point,
             logdet_probes: logdet_derivative.hutchinson_probe_count(),
             logdet_nodes: logdet_derivative.evaluation_metrics().node_count,
@@ -1002,81 +1326,78 @@ impl SaeSupportOuterObjective {
     }
 
     /// Per-probe samples of the log-determinant half of the criterion gradient
-    /// (#2933 F29). Row `j`, column `g` is probe `j`'s own
-    /// `½(∂log|S|/∂ρ_g − profile response)`. Their mean is the probe share of the
-    /// gradient `evaluate_uncached` reports, and their spread is that share's
-    /// Hutchinson standard error. Every other term of the gradient is deterministic.
+    /// (#2933 F29, #3433). Row `j` is probe `j`'s own share of every outer
+    /// coordinate: `½(∂log|S|/∂ρ_g − ⟨A⁺Γ_j, g_ρ⟩)` for a smoothing group and
+    /// `½(∂log|S|/∂u_c − ⟨A⁺Γ_j, g_c⟩)` for an ARD log precision. Their mean is the
+    /// probe share of the gradient `evaluate_uncached` reports, and their spread is
+    /// that share's Hutchinson standard error. Every other term of the gradient,
+    /// the row blocks' `log|H_tt|` derivative among them, is deterministic.
     fn logdet_gradient_probe_samples(
         &self,
         system: &ArrowSchurSystem,
         lambda_smooth: &[f64],
-        beta_offsets: &[usize],
-        beta_dim: usize,
+        ard: &[Vec<f64>],
+        ard_entries: &SupportArdPriorEntries,
+        ard_channels: &SupportArdLogdetChannels,
         bundle: &RationalLogdetDerivativeBundle,
     ) -> Result<Array2<f64>, EstimationError> {
         let groups = self.layout.group_keys.len();
-        let output_dim = self.term.output_dim();
-        let coordinate_dim = *system.row_offsets.last().unwrap_or(&0);
-        // `g_ρ = d(∇_θ L)/dρ_g`: the group penalty applied to the decoder, zero in the
-        // coordinate block. The profile response `evaluate_uncached` contracts is
-        // `⟨A⁺Γ, g_ρ⟩`.
-        let directions = (0..groups)
-            .map(|group| {
-                let mut beta = Array1::<f64>::zeros(beta_dim);
-                for atom in 0..self.term.k_atoms() {
-                    if self.layout.atom_group[atom] != group {
-                        continue;
-                    }
-                    let offset = beta_offsets[atom];
-                    let lambda = lambda_smooth[atom];
-                    let sb = self.term.atoms[atom]
-                        .smooth_penalty()
-                        .dot(self.term.atoms[atom].decoder_coefficients());
-                    for basis in 0..self.term.atoms[atom].basis_size() {
-                        for output in 0..output_dim {
-                            beta[offset + basis * output_dim + output] =
-                                lambda * sb[[basis, output]];
-                        }
-                    }
-                }
-                SaeArrowVector {
-                    t: Array1::<f64>::zeros(coordinate_dim),
-                    beta,
-                }
-            })
-            .collect::<Vec<_>>();
-        let responses = self
-            .term
-            .support_reduced_logdet_probe_responses(
-                self.target.view(),
-                &self.ard_precisions,
-                system,
-                bundle,
-                &directions,
-            )
-            .map_err(outer_error)?;
+        let coordinates = self.ard_layout.coordinates;
         let probes = bundle.hutchinson_probe_count();
-        let mut samples = Array2::<f64>::zeros((probes, groups));
+        let (beta_offsets, beta_dim) = self.beta_layout()?;
+        // One adjoint per probe serves every outer coordinate.
+        let adjoints = self
+            .term
+            .support_reduced_logdet_probe_adjoints(self.target.view(), ard, system, bundle)
+            .map_err(outer_error)?;
+        let ard_samples = ard_channels
+            .reduced_log_det_probe_samples
+            .as_ref()
+            .filter(|samples| samples.dim() == (probes, coordinates))
+            .ok_or_else(|| {
+                outer_error(format!(
+                    "support LAML ARD log-determinant channels carry no {probes}x{coordinates} \
+                     per-probe samples"
+                ))
+            })?;
+        if adjoints.len() != probes {
+            return Err(outer_error(format!(
+                "support LAML formed {} per-probe adjoints for {probes} probes",
+                adjoints.len()
+            )));
+        }
+        let mut samples = Array2::<f64>::zeros((probes, self.n_params()));
         for group in 0..groups {
+            let direction =
+                self.smoothing_state_direction(group, lambda_smooth, &beta_offsets, beta_dim);
             let explicit = bundle
                 .per_probe_directional_derivatives(&|vector: ArrayView1<f64>| {
                     self.schur_derivative_matvec(
                         group,
                         lambda_smooth,
-                        beta_offsets,
+                        &beta_offsets,
                         beta_dim,
                         vector,
                     )
                 })
+                .filter(|explicit| explicit.len() == probes)
                 .ok_or_else(|| {
                     outer_error(format!(
-                        "support LAML surrogate produced no per-probe derivative for smoothing \
-                         group {group} ({})",
-                        self.layout.group_keys[group]
+                        "support LAML surrogate produced no per-probe derivative for {}",
+                        self.coordinate_name(group)
                     ))
                 })?;
-            for probe in 0..probes {
-                samples[[probe, group]] = 0.5 * (explicit[probe] - responses[[probe, group]]);
+            for (probe, adjoint) in adjoints.iter().enumerate() {
+                samples[[probe, group]] = 0.5 * (explicit[probe] - adjoint.beta.dot(&direction));
+            }
+        }
+        for (probe, adjoint) in adjoints.iter().enumerate() {
+            let response = ard_entries
+                .contract_gradient(adjoint.t.view())
+                .map_err(outer_error)?;
+            for coordinate in 0..coordinates {
+                samples[[probe, groups + coordinate]] =
+                    0.5 * (ard_samples[[probe, coordinate]] - response[coordinate]);
             }
         }
         Ok(samples)
@@ -1088,7 +1409,7 @@ impl OuterObjective for SaeSupportOuterObjective {
         OuterCapability {
             gradient: Derivative::Analytic,
             hessian: DeclaredHessianForm::Unavailable,
-            n_params: self.layout.group_keys.len(),
+            n_params: self.n_params(),
             psi_dim: 0,
             fixed_point_available: false,
             barrier_config: None,
@@ -1188,8 +1509,60 @@ fn support_smoothing_domain(
     Ok((lower, upper))
 }
 
-/// Select topology-grouped smoothing strengths through the shared generic
-/// outer optimizer. Only a terminal point with an analytic stationarity
+/// The ARD log-precision coordinates' domain at the entry state, on the smoothing
+/// domain's rule (#2812, #3433). The prior's curvature on one slot axis is `α` times
+/// a unit coefficient, and the data's is that slot's Gauss–Newton `‖∂f/∂t_a‖²`, so
+/// the data curvatures are the coordinate's generalized eigenvalues `γ`
+/// ([`SaeSupportSparseTerm::support_ard_axis_curvature_ranges`]). A coordinate's
+/// eigenvalues are the extremes over the atom axes it prices, and past
+/// `[ln(√ε·γ_min), ln(γ_max/√ε)]` every slot's share of its gradient is under
+/// round-off. A coordinate whose axes carry no data curvature keeps the precision box.
+fn support_ard_domain(
+    term: &SaeSupportSparseTerm,
+    layout: &SaeSupportArdLayout,
+) -> Result<(Array1<f64>, Array1<f64>), String> {
+    use gam_solve::estimate::rho_domain;
+    let ranges = term.support_ard_axis_curvature_ranges()?;
+    let mut gammas_by_coordinate = vec![Vec::<f64>::new(); layout.coordinates];
+    for (atom_ranges, axes) in ranges.iter().zip(&layout.atom_coordinate) {
+        for (&(smallest, largest), index) in atom_ranges.iter().zip(axes) {
+            if let Some(index) = *index
+                && largest > 0.0
+            {
+                gammas_by_coordinate[index].extend([smallest, largest]);
+            }
+        }
+    }
+    let mut lower = Array1::<f64>::zeros(layout.coordinates);
+    let mut upper = Array1::<f64>::zeros(layout.coordinates);
+    for (index, gammas) in gammas_by_coordinate.iter().enumerate() {
+        let (lo, hi) =
+            rho_domain::coordinate_domain(rho_domain::resolvability_interval(gammas), None);
+        lower[index] = lo;
+        upper[index] = hi;
+    }
+    Ok((lower, upper))
+}
+
+/// The whole outer box: the smoothing groups' domain, then the ARD log precisions'.
+fn support_outer_domain(
+    term: &SaeSupportSparseTerm,
+    layout: &SaeSupportSmoothingLayout,
+    ard_layout: &SaeSupportArdLayout,
+) -> Result<(Array1<f64>, Array1<f64>), String> {
+    let (smoothing_lower, smoothing_upper) = support_smoothing_domain(term, layout)?;
+    let (ard_lower, ard_upper) = support_ard_domain(term, ard_layout)?;
+    let concatenate = |left: &Array1<f64>, right: &Array1<f64>| {
+        left.iter().chain(right.iter()).copied().collect::<Array1<f64>>()
+    };
+    Ok((
+        concatenate(&smoothing_lower, &ard_lower),
+        concatenate(&smoothing_upper, &ard_upper),
+    ))
+}
+
+/// Select topology-grouped smoothing strengths and the ARD log precisions through
+/// the shared generic outer optimizer. Only a terminal point with an analytic stationarity
 /// certificate and a recurring raw inner fixed point is returned.
 pub fn run_sae_support_outer(
     request: SaeSupportOuterRequest,
@@ -1207,8 +1580,11 @@ pub fn run_sae_support_outer(
         ));
     }
     let spectrum = penalty_spectrum(&request.term, &layout).map_err(outer_error)?;
+    let ard_layout = SaeSupportArdLayout::from_term(&request.term, &request.ard_precisions)
+        .map_err(outer_error)?;
     let (rho_lower, rho_upper) =
-        support_smoothing_domain(&request.term, &layout).map_err(outer_error)?;
+        support_outer_domain(&request.term, &layout, &ard_layout).map_err(outer_error)?;
+    let ard_seed = ard_layout.seed();
     // #2954: the criterion's rows and the reduced Schur's border are the
     // formation counts the certificate charges each gradient component's
     // rounding at. Its resolution is each group's own O(rank) scale, which the
@@ -1226,7 +1602,7 @@ pub fn run_sae_support_outer(
         target: request.target,
         layout: layout.clone(),
         spectrum,
-        ard_precisions: request.ard_precisions.clone(),
+        ard_layout: ard_layout.clone(),
         inner_tolerance,
         trust_radius: request.trust_radius,
         random_state: request.random_state,
@@ -1237,10 +1613,16 @@ pub fn run_sae_support_outer(
         logdet_probes: SCHUR_SLQ_LOGDET_PROBES,
         in_core_budget_bytes: crate::manifold::sae_host_in_core_budget_bytes().0,
     };
-    // The caller's smoothness, placed in the domain the search has.
+    // The caller's smoothness and ARD precisions, placed in the domain the search has.
+    let groups = layout.group_keys.len();
     let initial_log_smoothness = request.initial_smoothness.ln();
-    let initial_rho = Array1::from_shape_fn(layout.group_keys.len(), |group| {
-        initial_log_smoothness.max(rho_lower[group]).min(rho_upper[group])
+    let initial_rho = Array1::from_shape_fn(objective.n_params(), |index| {
+        let seed = if index < groups {
+            initial_log_smoothness
+        } else {
+            ard_seed[index - groups]
+        };
+        seed.max(rho_lower[index]).min(rho_upper[index])
     });
     let search = run_support_outer_search(
         &mut objective,
@@ -1259,9 +1641,11 @@ pub fn run_sae_support_outer(
     Ok(SaeSupportOuterReport {
         term: objective.term,
         smoothing_layout: layout,
-        log_lambda_groups: search.rho,
+        log_lambda_groups: search.rho.slice(ndarray::s![..groups]).to_owned(),
         lambda_smooth: terminal.lambda_smooth,
-        ard_precisions: request.ard_precisions,
+        ard_layout,
+        log_ard: search.rho.slice(ndarray::s![groups..]).to_owned(),
+        ard_precisions: terminal.ard_precisions,
         criterion: SaeCriterionScore::new(SaeCriterionKind::SupportQuasiLaplace, terminal.cost),
         criterion_components: terminal.components,
         fixed_point: terminal.fixed_point,
@@ -1320,7 +1704,7 @@ fn run_support_outer_search(
     let mut iterations = 0usize;
     let mut plans = 1usize;
     loop {
-        let problem = OuterProblem::new(objective.layout.group_keys.len())
+        let problem = OuterProblem::new(objective.n_params())
             .with_gradient(Derivative::Analytic)
             .with_hessian(DeclaredHessianForm::Unavailable)
             .with_prefer_gradient_only(true)
@@ -1823,6 +2207,12 @@ mod tests {
     /// later iterate moves further from `p/4`, so the coordinate block stays
     /// strictly positive definite all the way to the recurring fixed point.
     fn build_objective() -> SaeSupportOuterObjective {
+        build_objective_at(&unit_ard_precisions())
+    }
+
+    /// [`build_objective`] entering at the ARD precisions `entry_ard`, which the
+    /// circle's held axis keeps.
+    fn build_objective_at(entry_ard: &[Vec<f64>]) -> SaeSupportOuterObjective {
         let periodic_eval: Arc<dyn SaeBasisSecondJet> =
             Arc::new(PeriodicHarmonicEvaluator::new(3).expect("periodic"));
         let patch_eval: Arc<dyn SaeBasisSecondJet> =
@@ -1867,6 +2257,13 @@ mod tests {
         let layout = SaeSupportSmoothingLayout::from_term(&term);
         assert_eq!(layout.group_keys.len(), 2, "fixture must expose two groups");
         let spectrum = penalty_spectrum(&term, &layout).expect("spectrum");
+        let ard_layout =
+            SaeSupportArdLayout::from_term(&term, entry_ard).expect("ARD layout");
+        assert_eq!(
+            ard_layout.coordinates, 2,
+            "fixture must expose one ARD log precision per Euclidean atom axis and hold the \
+             periodic one"
+        );
         let initial_term = term.clone();
         SaeSupportOuterObjective {
             term,
@@ -1874,7 +2271,7 @@ mod tests {
             target: array![[1.4], [4.3]],
             layout,
             spectrum,
-            ard_precisions: vec![vec![1.0], vec![1.0, 1.0]],
+            ard_layout,
             inner_tolerance: 1.0e-9,
             trust_radius: 1.0,
             random_state: 0xC0FF_EE00_D15E_A5E5,
@@ -1887,6 +2284,20 @@ mod tests {
         }
     }
 
+    /// The fixtures' ARD precisions, `α = 1` on every atom axis: the circle's is
+    /// held there, the plane's two are the outer coordinates' entry.
+    fn unit_ard_precisions() -> Vec<Vec<f64>> {
+        vec![vec![1.0], vec![1.0, 1.0]]
+    }
+
+    /// The fixtures' ARD log precisions at `α = 1` on every Euclidean atom axis.
+    const UNIT_LOG_ARD: [f64; 2] = [0.0; 2];
+
+    /// The outer point `[smoothing log strengths…, ARD log precisions…]`.
+    fn outer_point(smoothing: &[f64], log_ard: &[f64]) -> Array1<f64> {
+        smoothing.iter().chain(log_ard).copied().collect()
+    }
+
     /// #2634 — the first-order bridge asks for a value during line search and
     /// then for value+gradient at the accepted point. This objective computes
     /// both in one evidence pass, so an exact repeated rho must consume that
@@ -1895,7 +2306,7 @@ mod tests {
     #[test]
     fn identical_value_then_gradient_evaluates_support_laml_once_2634() {
         let mut objective = build_objective();
-        let rho = array![0.0, 0.0];
+        let rho = outer_point(&[0.0, 0.0], &UNIT_LOG_ARD);
         let value = objective
             .eval_with_order(&rho, OuterEvalOrder::Value)
             .expect("value evaluation");
@@ -1932,10 +2343,18 @@ mod tests {
     /// row-coordinate determinant priced without its derivative, reported an uphill
     /// direction as descent on the filed Tier-2 route. The row determinant now
     /// enters with its implicit response (#2933 F27 S2), and this oracle checks both.
+    ///
+    /// The Euclidean ARD log precisions are outer coordinates too (#3433, F27 S5), so
+    /// the same refitted central difference covers them, at precisions away from one,
+    /// with the circle's held away from one as well: their
+    /// gradient is the prior energy, the normalizer's derivative and both determinants'
+    /// explicit and implicit responses.
     #[test]
     fn profiled_support_outer_gradient_matches_refitted_value_fd_2634() {
-        let mut objective = build_objective();
-        let base = array![0.4_f64.ln(), 2.2_f64.ln()];
+        // The circle's precision is held at 1.3; the plane's two are outer coordinates.
+        let mut objective = build_objective_at(&[vec![1.3], vec![0.8, 1.6]]);
+        let base = outer_point(&[0.4_f64.ln(), 2.2_f64.ln()], &[0.8_f64.ln(), 1.6_f64.ln()]);
+        assert_eq!(base.len(), objective.n_params());
         let analytic = objective
             .evaluate(&base)
             .expect("profiled centre evaluation")
@@ -1964,14 +2383,14 @@ mod tests {
             let gap = (analytic[group] - finite_difference).abs();
             let scale = 1.0 + analytic[group].abs().max(finite_difference.abs());
             eprintln!(
-                "#2634 profiled FD group {group} ({}): analytic={:.12e}, central_fd={finite_difference:.12e}, gap={gap:.3e}",
-                objective.layout.group_keys[group],
+                "#2634 profiled FD {}: analytic={:.12e}, central_fd={finite_difference:.12e}, gap={gap:.3e}",
+                objective.coordinate_name(group),
                 analytic[group],
             );
             assert!(
                 gap <= 5.0e-4 * scale,
-                "group {group} ({}): profiled analytic gradient {:.9e} != refitted production-value FD {finite_difference:.9e} (gap {gap:.3e}, scale {scale:.3e})",
-                objective.layout.group_keys[group],
+                "{}: profiled analytic gradient {:.9e} != refitted production-value FD {finite_difference:.9e} (gap {gap:.3e}, scale {scale:.3e})",
+                objective.coordinate_name(group),
                 analytic[group],
             );
         }
@@ -1983,13 +2402,13 @@ mod tests {
     /// raw residual sum of squares at that converged inner optimum.
     fn deviance_and_rss(objective: &mut SaeSupportOuterObjective, rho: &Array1<f64>) -> (f64, f64) {
         objective.reset();
-        let lambda = objective.layout.expand(rho).expect("expand");
+        let (lambda, ard) = objective.split(rho).expect("split");
         objective
             .term
             .solve_fixed_point(
                 objective.target.view(),
                 &lambda,
-                &objective.ard_precisions,
+                &ard,
                 objective.inner_tolerance,
                 objective.trust_radius,
             )
@@ -1997,7 +2416,7 @@ mod tests {
         let deviance = 2.0
             * objective
                 .term
-                .penalized_objective(objective.target.view(), &lambda, &objective.ard_precisions)
+                .penalized_objective(objective.target.view(), &lambda, &ard)
                 .expect("penalized objective");
         let residual = objective
             .term
@@ -2023,18 +2442,18 @@ mod tests {
         let mut objective = build_objective();
         // λ deliberately away from 1 in both groups so the raw-RSS derivative and
         // the penalized-deviance derivative are unmistakably different functions.
-        let base = array![0.35_f64.ln(), 2.8_f64.ln()];
+        let base = outer_point(&[0.35_f64.ln(), 2.8_f64.ln()], &UNIT_LOG_ARD);
         let groups = objective.layout.group_keys.len();
 
         // Production `energy[g]` at the base inner optimum.
         objective.reset();
-        let lambda_base = objective.layout.expand(&base).expect("expand");
+        let (lambda_base, ard_base) = objective.split(&base).expect("split");
         objective
             .term
             .solve_fixed_point(
                 objective.target.view(),
                 &lambda_base,
-                &objective.ard_precisions,
+                &ard_base,
                 objective.inner_tolerance,
                 objective.trust_radius,
             )
@@ -2100,7 +2519,7 @@ mod tests {
     #[test]
     fn support_outer_evaluate_mints_a_finite_value_and_gradient() {
         let mut objective = build_objective();
-        let rho = array![0.4_f64.ln(), 2.2_f64.ln()];
+        let rho = outer_point(&[0.4_f64.ln(), 2.2_f64.ln()], &UNIT_LOG_ARD);
         let evaluation = objective
             .evaluate(&rho)
             .expect("the grouped-LAML criterion must evaluate on a CPU-only host");
@@ -2109,10 +2528,10 @@ mod tests {
             "criterion value must be finite, got {}",
             evaluation.cost
         );
-        assert_eq!(evaluation.gradient.len(), objective.layout.group_keys.len());
+        assert_eq!(evaluation.gradient.len(), objective.n_params());
         assert!(
             evaluation.gradient.iter().all(|value| value.is_finite()),
-            "every smoothing gradient component must be finite, got {:?}",
+            "every outer gradient component must be finite, got {:?}",
             evaluation.gradient
         );
         assert!(
@@ -2128,14 +2547,10 @@ mod tests {
         // build. A plan rebuilt per call would make the outer search descend a
         // different function at every point, and the exact directional
         // derivative would be the gradient of something nobody evaluated twice.
-        let lambda = objective.layout.expand(&rho).expect("expand");
+        let (lambda, ard) = objective.split(&rho).expect("split");
         let system = objective
             .term
-            .assemble_arrow_schur(
-                objective.target.view(),
-                &lambda,
-                &objective.ard_precisions,
-            )
+            .assemble_arrow_schur(objective.target.view(), &lambda, &ard)
             .expect("assemble arrow schur");
         let first = objective
             .evidence_log_det(&system)
@@ -2166,7 +2581,8 @@ mod tests {
             let gap = (again.gradient[group] - evaluation.gradient[group]).abs();
             assert!(
                 gap <= 1.0e-10 * evaluation.gradient[group].abs().max(1.0),
-                "group {group} gradient moved between two evaluations at one ρ: {} vs {}",
+                "{} gradient moved between two evaluations at one ρ: {} vs {}",
+                objective.coordinate_name(group),
                 evaluation.gradient[group],
                 again.gradient[group]
             );
@@ -2190,12 +2606,13 @@ mod tests {
     #[test]
     fn support_outer_gradient_parts_carry_the_profile_response_in_logdet_h() {
         let mut objective = build_objective();
-        let rho = array![0.4_f64.ln(), 2.2_f64.ln()];
+        let rho = outer_point(&[0.4_f64.ln(), 2.2_f64.ln()], &UNIT_LOG_ARD);
         let evaluation = objective.evaluate(&rho).expect("support LAML evaluation");
         assert_eq!(
             evaluation.gradient_parts.len(),
             evaluation.gradient.len(),
-            "every smoothing group publishes its parts"
+            "every outer coordinate, smoothing group and ARD log precision alike, \
+             publishes its parts"
         );
         let mut any_mode_response = false;
         for part in &evaluation.gradient_parts {
@@ -2203,7 +2620,7 @@ mod tests {
             assert_eq!(
                 (part.total - envelope).to_bits(),
                 0.0_f64.to_bits(),
-                "group {}: no correction is folded in after the envelope, so the kkt \
+                "coordinate {}: no correction is folded in after the envelope, so the kkt \
                  residual must be exactly zero (total {}, envelope {})",
                 part.index,
                 part.total,
@@ -2212,20 +2629,20 @@ mod tests {
             assert_eq!(
                 part.total.to_bits(),
                 evaluation.gradient[part.index].to_bits(),
-                "group {}: the published total is the gradient the search descends",
+                "coordinate {}: the published total is the gradient the search descends",
                 part.index
             );
             assert_eq!(
                 (part.frozen_logdet_h + part.mode_response_logdet_h).to_bits(),
                 part.logdet_h.to_bits(),
-                "group {}: logdet_h is its frozen and mode-response halves",
+                "coordinate {}: logdet_h is its frozen and mode-response halves",
                 part.index
             );
             any_mode_response |= part.mode_response_logdet_h != 0.0;
         }
         assert!(
             any_mode_response,
-            "the fixture's inner mode moves with ρ, so some group's log determinant \
+            "the fixture's inner mode moves with ρ, so some coordinate's log determinant \
              must carry a mode response: {:?}",
             evaluation.gradient_parts
         );
@@ -2251,34 +2668,30 @@ mod tests {
     #[test]
     fn support_outer_logdet_gradient_matches_fd_of_its_own_surrogate() {
         let mut objective = build_objective();
-        let base = array![0.4_f64.ln(), 2.2_f64.ln()];
+        let base = outer_point(&[0.4_f64.ln(), 2.2_f64.ln()], &UNIT_LOG_ARD);
         let groups = objective.layout.group_keys.len();
 
         // One clean inner solve, then FREEZE: the log-det channel's contract is
         // the partial derivative through λ at a fixed inner state, which is
         // exactly what the LAML gradient's trace term is.
         objective.reset();
-        let lambda_base = objective.layout.expand(&base).expect("expand");
+        let (lambda_base, ard_base) = objective.split(&base).expect("split");
         objective
             .term
             .solve_fixed_point(
                 objective.target.view(),
                 &lambda_base,
-                &objective.ard_precisions,
+                &ard_base,
                 objective.inner_tolerance,
                 objective.trust_radius,
             )
             .expect("base inner fixed point");
 
         let assemble = |objective: &SaeSupportOuterObjective, rho: &Array1<f64>| {
-            let lambda = objective.layout.expand(rho).expect("expand");
+            let (lambda, ard) = objective.split(rho).expect("split");
             let system = objective
                 .term
-                .assemble_arrow_schur(
-                    objective.target.view(),
-                    &lambda,
-                    &objective.ard_precisions,
-                )
+                .assemble_arrow_schur(objective.target.view(), &lambda, &ard)
                 .expect("assemble arrow schur");
             (system, lambda)
         };
@@ -2368,9 +2781,17 @@ mod tests {
     /// exact gradient at the same point. Over independent probe sets the rational
     /// route's realized gradient error must be the size its samples report, and the
     /// samples carry the implicit profile response through their own adjoints.
+    ///
+    /// A coordinate whose reduced-Schur share is identically zero has no probe error
+    /// to report: an ARD axis whose profiled data curvature vanishes (the plane's
+    /// second axis here, whose gradient is `0` to rounding) contributes no
+    /// `D_aa·v_a²` to any probe. Its samples must then report no bar above the
+    /// deterministic floor and its realized error must stay under that floor as
+    /// well, and at least one coordinate must be stochastic so the calibration is
+    /// exercised.
     #[test]
     fn rational_route_gradient_error_is_the_size_its_probe_samples_report_2933() {
-        let rho = array![0.4_f64.ln(), 2.2_f64.ln()];
+        let rho = outer_point(&[0.4_f64.ln(), 2.2_f64.ln()], &UNIT_LOG_ARD);
         let mut dense = build_objective();
         let exact = dense.evaluate_measured(&rho).expect("exact dense route");
         assert_eq!(exact.logdet_probes, 0, "the fixture's border admits the exact dense route");
@@ -2398,6 +2819,7 @@ mod tests {
                 ));
             }
         }
+        let mut stochastic = 0usize;
         for (group, pairs) in pairs.iter().enumerate() {
             let count = pairs.len() as f64;
             let rms_error = (pairs.iter().map(|(error, _)| error * error).sum::<f64>() / count).sqrt();
@@ -2407,12 +2829,22 @@ mod tests {
                 .filter(|(error, bar)| error.abs() <= 3.0 * bar)
                 .count();
             eprintln!(
-                "#2933 F29 gradient group {group} ({}): exact {:.6e}, RMS error {rms_error:.4e}, \
+                "#2933 F29 gradient {}: exact {:.6e}, RMS error {rms_error:.4e}, \
                  RMS reported bar {rms_bar:.4e}, {covered}/{} within 3 bars",
-                objective_group_key(group),
+                build_objective().coordinate_name(group),
                 exact.gradient[group],
                 pairs.len()
             );
+            if rms_bar <= floor {
+                assert!(
+                    rms_error <= floor,
+                    "group {group}: its samples report no probe error (RMS bar \
+                     {rms_bar:.3e} under the deterministic floor {floor:.3e}), yet the \
+                     realized RMS gradient error is {rms_error:.3e}"
+                );
+                continue;
+            }
+            stochastic += 1;
             assert!(
                 rms_error > floor,
                 "group {group}: RMS gradient error {rms_error:.3e} is not above the \
@@ -2430,10 +2862,7 @@ mod tests {
                 pairs.len()
             );
         }
-    }
-
-    fn objective_group_key(group: usize) -> String {
-        build_objective().layout.group_keys[group].clone()
+        assert!(stochastic > 0, "no outer coordinate carries a probe error to calibrate");
     }
 
     /// #2933 F29 — the rational-route search publishes a certified point only after
@@ -2478,8 +2907,9 @@ mod tests {
     fn rational_route_search_checks_its_certified_point_on_unseen_probes_2933() {
         let (lower, upper, border) = {
             let objective = build_objective();
-            let (lower, upper) = support_smoothing_domain(&objective.term, &objective.layout)
-                .expect("smoothing domain");
+            let (lower, upper) =
+                support_outer_domain(&objective.term, &objective.layout, &objective.ard_layout)
+                    .expect("outer domain");
             let (_, border) = objective.beta_layout().expect("beta layout");
             (lower, upper, border)
         };
@@ -2716,6 +3146,8 @@ mod tests {
         let layout = SaeSupportSmoothingLayout::from_term(&term);
         assert_eq!(layout.group_keys.len(), 2, "one smoothing group per atom");
         let spectrum = penalty_spectrum(&term, &layout).expect("spectrum");
+        let ard_layout =
+            SaeSupportArdLayout::from_term(&term, &unit_ard_precisions()).expect("ARD layout");
         let initial_term = term.clone();
         let mut objective = SaeSupportOuterObjective {
             term,
@@ -2723,7 +3155,7 @@ mod tests {
             target: target.clone(),
             layout,
             spectrum,
-            ard_precisions: vec![vec![1.0], vec![1.0, 1.0]],
+            ard_layout,
             inner_tolerance: 1.0e-9,
             trust_radius: 1.0,
             random_state: 0xC0FF_EE00_D15E_A5E5,
@@ -2734,21 +3166,22 @@ mod tests {
             logdet_probes: SCHUR_SLQ_LOGDET_PROBES,
             in_core_budget_bytes: crate::manifold::sae_host_in_core_budget_bytes().0,
         };
-        let rho = array![0.4_f64.ln(), 2.2_f64.ln()];
+        // Unit ARD precisions: the dense rho below carries log α = 0 on every axis.
+        let rho = outer_point(&[0.4_f64.ln(), 2.2_f64.ln()], &UNIT_LOG_ARD);
         let evaluation = objective.evaluate(&rho).expect("support route evaluates");
         assert!(evaluation.fixed_point.recurred, "support inner state must recur");
         let components = evaluation.components;
 
         // Support value at the FROZEN state, rebuilt from production pieces.
         let support_frozen = |objective: &mut SaeSupportOuterObjective, rho: &Array1<f64>| {
-            let lambda = objective.layout.expand(rho).expect("expand");
+            let (lambda, ard) = objective.split(rho).expect("split");
             let system = objective
                 .term
-                .assemble_arrow_schur(objective.target.view(), &lambda, &objective.ard_precisions)
+                .assemble_arrow_schur(objective.target.view(), &lambda, &ard)
                 .expect("assemble");
             let (row_log_det, reduced_log_det, _) =
                 objective.evidence_log_det(&system).expect("evidence");
-            let penalty_log_pdet = (0..rho.len())
+            let penalty_log_pdet = (0..objective.layout.group_keys.len())
                 .map(|group| {
                     objective.spectrum.log_pdet_base_by_group[group]
                         + objective.spectrum.rank_by_group[group] as f64 * rho[group]
@@ -2756,11 +3189,11 @@ mod tests {
                 .sum::<f64>();
             let penalized_objective = objective
                 .term
-                .penalized_objective(objective.target.view(), &lambda, &objective.ard_precisions)
+                .penalized_objective(objective.target.view(), &lambda, &ard)
                 .expect("penalized objective");
             let ard_log_partition = objective
                 .term
-                .ard_log_partition_total(&objective.ard_precisions)
+                .ard_log_partition_total(&ard)
                 .expect("ARD log partition");
             SaeSupportCriterionComponents {
                 penalized_objective,
@@ -2774,7 +3207,7 @@ mod tests {
         let support_rebuilt = support_frozen(&mut objective, &rho);
 
         // Transfer the converged state into the dense engine.
-        let lambda = objective.layout.expand(&rho).expect("expand");
+        let (lambda, _) = objective.split(&rho).expect("split");
         let support_term = &objective.term;
         let mut dense_atoms = Vec::with_capacity(2);
         let mut coord_blocks = Vec::with_capacity(2);
@@ -3011,11 +3444,24 @@ mod tests {
     /// and the two log-determinants, with no profiled dispersion.
     #[test]
     fn support_value_prices_the_ard_partition_on_active_slots_2933_f27() {
-        let mut objective = build_objective();
-        objective.ard_precisions = vec![vec![1.7], vec![3.0, 1.5]];
-        let rho = array![0.4_f64.ln(), 2.2_f64.ln()];
+        // The circle's precision is held at 1.7; the plane's two are outer coordinates.
+        let mut objective = build_objective_at(&[vec![1.7], vec![1.0, 1.0]]);
+        let rho = outer_point(&[0.4_f64.ln(), 2.2_f64.ln()], &[3.0_f64.ln(), 1.5_f64.ln()]);
         let evaluation = objective.evaluate(&rho).expect("support value evaluates");
         let components = evaluation.components;
+        for (got, want) in evaluation
+            .ard_precisions
+            .iter()
+            .flatten()
+            .zip([1.7, 3.0, 1.5])
+        {
+            assert!(
+                (got - want).abs() <= 1.0e-14 * want,
+                "the outer point's ARD precisions {:?} are not the held circle precision and exp \
+                 of the plane's log coordinates",
+                evaluation.ard_precisions
+            );
+        }
 
         let kappa = std::f64::consts::TAU;
         let nodes = 512usize;
@@ -3035,7 +3481,7 @@ mod tests {
             .penalized_objective(
                 objective.target.view(),
                 &evaluation.lambda_smooth,
-                &objective.ard_precisions,
+                &evaluation.ard_precisions,
             )
             .expect("penalized objective");
         eprintln!(
@@ -3090,7 +3536,7 @@ mod tests {
     #[test]
     fn support_value_integrates_the_row_coordinate_block_2933_f27() {
         let mut objective = build_objective();
-        let rho = array![0.4_f64.ln(), 2.2_f64.ln()];
+        let rho = outer_point(&[0.4_f64.ln(), 2.2_f64.ln()], &UNIT_LOG_ARD);
         let evaluation = objective.evaluate(&rho).expect("support value evaluates");
         let components = evaluation.components;
 
@@ -3117,7 +3563,7 @@ mod tests {
             let mut block = jacobian.dot(&jacobian.t());
             for axis in 0..d {
                 block[[axis, axis]] += ArdAxisPrior::eval(
-                    objective.ard_precisions[atom][axis],
+                    evaluation.ard_precisions[atom][axis],
                     coords[axis],
                     periods[axis],
                 )

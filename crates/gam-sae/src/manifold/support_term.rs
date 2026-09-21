@@ -931,6 +931,68 @@ struct SupportOuterDifferentialRow {
     prior_majorizer_derivative: Array1<f64>,
 }
 
+/// One active ARD prior entry `(row, slot, axis)` and the outer log-precision
+/// coordinate that prices it (#3433), `None` on a held axis. Every field is
+/// already its own `∂/∂log α` by degree-1 homogeneity.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SupportArdPriorEntry {
+    pub(crate) coordinate: Option<usize>,
+    /// `∂V/∂t` at the entry's coordinate.
+    pub(crate) grad: f64,
+    /// The Gauss–Newton majorizer curvature the row block carries on its diagonal.
+    pub(crate) majorizer: f64,
+}
+
+/// The support lane's active ARD prior, keyed by outer log-precision
+/// coordinate ([`SaeSupportSparseTerm::support_ard_prior_entries`]).
+pub(crate) struct SupportArdPriorEntries {
+    pub(crate) coordinates: usize,
+    /// `rows[i]` in row `i`'s coordinate-block order.
+    pub(crate) rows: Vec<Vec<SupportArdPriorEntry>>,
+    /// `Σ V` per coordinate: the explicit `∂ℓ_pen/∂u_c`.
+    pub(crate) energy: Array1<f64>,
+    /// `∂(ARD log partition total)/∂u_c`.
+    pub(crate) log_partition_gradient: Array1<f64>,
+    /// Active entries per coordinate: the rank of `c`'s prior quadratic.
+    pub(crate) priced: Vec<usize>,
+}
+
+impl SupportArdPriorEntries {
+    /// `Σ_{a ∈ c} t[a]·∂V_a/∂t_a` per coordinate: the pairing of a coordinate-state
+    /// vector with `∂(∇_t ℓ_pen)/∂u_c`, the right-hand side of the implicit
+    /// state response to `u_c`.
+    pub(crate) fn contract_gradient(
+        &self,
+        t: ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, String> {
+        let total = self.rows.iter().map(Vec::len).sum::<usize>();
+        if t.len() != total {
+            return Err(format!(
+                "support ARD gradient contraction: state has {} coordinates, the prior {total}",
+                t.len()
+            ));
+        }
+        let mut out = Array1::<f64>::zeros(self.coordinates);
+        for (value, entry) in t.iter().zip(self.rows.iter().flatten()) {
+            if let Some(index) = entry.coordinate {
+                out[index] += value * entry.grad;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Fixed-state log-precision derivatives of the row and reduced Schur
+/// log-determinants ([`SaeSupportSparseTerm::support_ard_logdet_channels`]).
+pub(crate) struct SupportArdLogdetChannels {
+    /// `Σ_i ∂log|H_tt^(i)|/∂u_c`.
+    pub(crate) row_log_det: Array1<f64>,
+    /// The bundle's `∂log|S|/∂u_c`.
+    pub(crate) reduced_log_det: Array1<f64>,
+    /// `[probe, coordinate]` Hutchinson samples of `reduced_log_det`, when measured.
+    pub(crate) reduced_log_det_probe_samples: Option<Array2<f64>>,
+}
+
 /// Dense representation of the exact/majorized stationarity pencil on the
 /// small-problem lane.  `generalized_vectors` are B-orthonormal columns:
 /// `A v_j = mu_j B v_j` and `v_j^T B v_j = 1`.
@@ -1588,7 +1650,7 @@ impl SaeSupportSparseTerm {
 
     /// Period of one atom's ARD coordinate prior per axis; see the
     /// `atom_ard_axis_periods` field.
-    fn atom_ard_axis_periods(&self, atom: usize) -> &[Option<f64>] {
+    pub(crate) fn atom_ard_axis_periods(&self, atom: usize) -> &[Option<f64>] {
         &self.atom_ard_axis_periods[atom]
     }
 
@@ -1636,6 +1698,309 @@ impl SaeSupportSparseTerm {
             total += slots as f64 * per_slot;
         }
         Ok(total)
+    }
+
+    /// Every active ARD prior entry, keyed by the outer log-precision coordinate
+    /// it prices, with the criterion's explicit log-precision derivatives (#3433).
+    ///
+    /// `coordinate[atom][axis]` names the outer coordinate `u_c = log α_c` that
+    /// atom `atom`'s axis `axis` reads, `None` for an axis held at its precision.
+    /// Several atom-axes may share one. A held axis's entries stay in the row
+    /// blocks, which they curve, and price no coordinate. The prior's
+    /// value, gradient and majorizer curvature are each degree-1 homogeneous in `α`
+    /// ([`ArdAxisPrior::eval`], [`ArdAxisPrior::psd_majorizer_hess`]), so their
+    /// `∂/∂u` is the entry itself, and the entry list carries everything the
+    /// log-precision gradient contracts:
+    /// - `energy[c] = Σ_{entries of c} V(α, t)`: `∂ℓ_pen/∂u_c` at fixed state, the
+    ///   whole envelope-theorem derivative of the penalized objective;
+    /// - `log_partition_gradient[c] = Σ_{atom-axes of c} slots·∂log Z/∂log α`: the
+    ///   derivative of [`Self::ard_log_partition_total`], whose sheet count is
+    ///   precision-free;
+    /// - each entry's `grad`: `∂(∇_t ℓ_pen)/∂u_c` on its coordinate, the implicit
+    ///   response's right-hand side;
+    /// - each entry's `majorizer`: `∂H_tt/∂u_c` on its diagonal.
+    ///
+    /// `rows[i]` lists row `i`'s entries in the row block's own coordinate order.
+    pub(crate) fn support_ard_prior_entries(
+        &self,
+        ard_precisions: &[Vec<f64>],
+        coordinate: &[Vec<Option<usize>>],
+        coordinates: usize,
+    ) -> Result<SupportArdPriorEntries, String> {
+        if ard_precisions.len() != self.k_atoms() || coordinate.len() != self.k_atoms() {
+            return Err(format!(
+                "SaeSupportSparseTerm::support_ard_prior_entries: {} ARD blocks and {} \
+                 coordinate maps for K={}",
+                ard_precisions.len(),
+                coordinate.len(),
+                self.k_atoms()
+            ));
+        }
+        for atom in 0..self.k_atoms() {
+            let width = self.assignment.atom_coord_dim(atom);
+            if ard_precisions[atom].len() != width
+                || coordinate[atom].len() != width
+                || ard_precisions[atom]
+                    .iter()
+                    .any(|value| !(value.is_finite() && *value > 0.0))
+                || coordinate[atom].iter().flatten().any(|&index| index >= coordinates)
+            {
+                return Err(format!(
+                    "SaeSupportSparseTerm::support_ard_prior_entries: atom {atom} needs {width} \
+                     finite positive precisions and {width} coordinates below {coordinates}; got \
+                     {:?} on {:?}",
+                    ard_precisions[atom], coordinate[atom]
+                ));
+            }
+        }
+        let mut energy = Array1::<f64>::zeros(coordinates);
+        let mut priced = vec![0usize; coordinates];
+        let mut rows = Vec::with_capacity(self.n_obs());
+        for row in 0..self.n_obs() {
+            let mut entries = Vec::with_capacity(self.assignment.coords_row(row).len());
+            for (slot, &atom) in self.assignment.support_indices(row).iter().enumerate() {
+                let atom = atom as usize;
+                let periods = self.atom_ard_axis_periods(atom);
+                for axis in 0..self.assignment.atom_coord_dim(atom) {
+                    let prior = ArdAxisPrior::eval(
+                        ard_precisions[atom][axis],
+                        self.assignment.coords_for_slot(row, slot)[axis],
+                        periods[axis],
+                    );
+                    let index = coordinate[atom][axis];
+                    if let Some(index) = index {
+                        energy[index] += prior.value;
+                        priced[index] += 1;
+                    }
+                    entries.push(SupportArdPriorEntry {
+                        coordinate: index,
+                        grad: prior.grad,
+                        majorizer: prior.psd_majorizer_hess(),
+                    });
+                }
+            }
+            rows.push(entries);
+        }
+        let mut log_partition_gradient = Array1::<f64>::zeros(coordinates);
+        for atom in 0..self.k_atoms() {
+            let slots = self.atom_rows[atom].len();
+            if slots == 0 {
+                continue;
+            }
+            let alpha = Array1::from(ard_precisions[atom].clone());
+            let log_alpha = alpha.mapv(f64::ln);
+            let partition = SaeManifoldTerm::ard_log_partition(
+                &self.assignment.atom_prior_supports(atom),
+                self.atom_ard_axis_periods(atom),
+                log_alpha.view(),
+                alpha.view(),
+            )?;
+            for (axis, index) in coordinate[atom].iter().enumerate() {
+                if let Some(index) = *index {
+                    log_partition_gradient[index] +=
+                        slots as f64 * partition.log_precision_gradient[axis];
+                }
+            }
+        }
+        if energy
+            .iter()
+            .chain(log_partition_gradient.iter())
+            .chain(rows.iter().flatten().flat_map(|entry| [&entry.grad, &entry.majorizer]))
+            .any(|value| !value.is_finite())
+        {
+            return Err(
+                "SaeSupportSparseTerm::support_ard_prior_entries: non-finite ARD prior entry"
+                    .to_string(),
+            );
+        }
+        Ok(SupportArdPriorEntries {
+            coordinates,
+            rows,
+            energy,
+            log_partition_gradient,
+            priced,
+        })
+    }
+
+    /// The fixed-state log-precision derivatives of the two Gauss–Newton
+    /// log-determinants the criterion integrates (#3433).
+    ///
+    /// Only the row blocks carry `α`: `∂H_tt^(i)/∂u_c = D_c^(i)`, the majorizer
+    /// diagonal on `c`'s entries, while `H_tβ` and `H_ββ` are precision-free. So
+    /// - `∂log|H_tt^(i)|/∂u_c = tr(H_tt^(i)⁻¹ D_c^(i)) = Σ_{a ∈ c} (H_tt^(i)⁻¹)_aa·D_aa`;
+    /// - `∂S/∂u_c = Σ_i H_βt^(i) H_tt^(i)⁻¹ D_c^(i) H_tt^(i)⁻¹ H_tβ^(i)`, and the bundle
+    ///   contracts it as `(1/r)·Σ_z zᵀ ∂S z = (1/r)·Σ_z Σ_i Σ_{a ∈ c} D_aa·v_a²` with
+    ///   `v = H_tt^(i)⁻¹ H_tβ^(i) z`, the representation the value's own `log|S|`
+    ///   has, and the one [`RationalLogdetDerivativeBundle::directional_derivative`]
+    ///   applies. One pass over the bundle prices every coordinate at once.
+    ///
+    /// With `measure` on the rational route, `reduced_log_det_probe_samples[j, c]`
+    /// is probe `j`'s own sample `w·Σ_{z ∈ probe j} zᵀ ∂S_c z`, the deflation share
+    /// left out as [`RationalLogdetDerivativeBundle::per_probe_directional_derivatives`]
+    /// leaves it out.
+    pub(crate) fn support_ard_logdet_channels(
+        &self,
+        system: &ArrowSchurSystem,
+        entries: &SupportArdPriorEntries,
+        bundle: &RationalLogdetDerivativeBundle,
+        measure: bool,
+    ) -> Result<SupportArdLogdetChannels, String> {
+        let n_rows = system.row_dims.len();
+        if entries.rows.len() != n_rows || system.rows.len() != n_rows {
+            return Err(format!(
+                "support ARD log-det channels: {} entry rows for a {n_rows}-row system",
+                entries.rows.len()
+            ));
+        }
+        let mut offset = 0usize;
+        for (row, row_entries) in entries.rows.iter().enumerate() {
+            if row_entries.len() != system.row_dims[row] || system.row_offsets[row] != offset {
+                return Err(format!(
+                    "support ARD log-det channels: row {row} has {} prior entries at offset \
+                     {offset}, its block {} coordinates at offset {}",
+                    row_entries.len(),
+                    system.row_dims[row],
+                    system.row_offsets[row]
+                ));
+            }
+            offset += row_entries.len();
+        }
+        let vectors = bundle.vectors.as_slice();
+        if vectors.is_empty()
+            || vectors
+                .iter()
+                .any(|vector| vector.len() != system.k || vector.iter().any(|value| !value.is_finite()))
+        {
+            return Err(format!(
+                "support ARD log-det channels require a non-empty bundle of finite vectors of \
+                 border width {}",
+                system.k
+            ));
+        }
+        let factors = CpuBatchedBlockSolver
+            .factor_blocks(&system.rows, 0.0, system.d, true)
+            .map_err(|error| format!("support ARD log-det channels row factorization: {error}"))?;
+        let coordinates = entries.coordinates;
+        let mut row_log_det = Array1::<f64>::zeros(coordinates);
+        for (row, row_entries) in entries.rows.iter().enumerate() {
+            let q = system.row_dims[row];
+            let inverse = CpuBatchedBlockSolver
+                .solve_block_matrix(factors.factor(row), Array2::<f64>::eye(q).view());
+            for (local, entry) in row_entries.iter().enumerate() {
+                if let Some(index) = entry.coordinate {
+                    row_log_det[index] += inverse[[local, local]] * entry.majorizer;
+                }
+            }
+        }
+        // `Σ_{z ∈ vectors[range]} zᵀ ∂S_c z` for every `c`, folded over the
+        // length-only tree so the sum does not depend on thread count.
+        let schur_quadratic = |range: Range<usize>| -> Result<Array1<f64>, String> {
+            gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                range.len(),
+                |block: Range<usize>| -> Result<Array1<f64>, String> {
+                    let mut out = Array1::<f64>::zeros(coordinates);
+                    for vector in &vectors[range.start + block.start..range.start + block.end] {
+                        for (row, row_entries) in entries.rows.iter().enumerate() {
+                            let cross = support_arrow_cross_forward(system, row, vector.view())?;
+                            let solved = CpuBatchedBlockSolver
+                                .solve_block_vector(factors.factor(row), cross.view());
+                            for (local, entry) in row_entries.iter().enumerate() {
+                                if let Some(index) = entry.coordinate {
+                                    out[index] +=
+                                        entry.majorizer * solved[local] * solved[local];
+                                }
+                            }
+                        }
+                    }
+                    Ok(out)
+                },
+                |mut left: Array1<f64>, right: Array1<f64>| -> Result<Array1<f64>, String> {
+                    left += &right;
+                    Ok(left)
+                },
+            )?
+            .ok_or_else(|| "support ARD log-det channels folded no bundle vector".to_string())
+        };
+        let reduced_log_det =
+            schur_quadratic(0..vectors.len())? * (1.0 / vectors.len() as f64);
+        let probes = bundle.hutchinson_probe_count();
+        let reduced_log_det_probe_samples = if measure && probes > 0 {
+            let weight = bundle.probe_sample_weight();
+            let nodes = bundle.evaluation_metrics().node_count;
+            let mut samples = Array2::<f64>::zeros((probes, coordinates));
+            for probe in 0..probes {
+                if bundle.probe_vectors(probe).is_none_or(<[Array1<f64>]>::is_empty) {
+                    return Err(format!("support ARD log-det channels: probe {probe} has no vectors"));
+                }
+                let sample = schur_quadratic(probe * nodes..(probe + 1) * nodes)? * weight;
+                samples.row_mut(probe).assign(&sample);
+            }
+            Some(samples)
+        } else {
+            None
+        };
+        if row_log_det
+            .iter()
+            .chain(reduced_log_det.iter())
+            .chain(reduced_log_det_probe_samples.iter().flatten())
+            .any(|value| !value.is_finite())
+        {
+            return Err("support ARD log-det channels are non-finite".to_string());
+        }
+        Ok(SupportArdLogdetChannels {
+            row_log_det,
+            reduced_log_det,
+            reduced_log_det_probe_samples,
+        })
+    }
+
+    /// The smallest positive and the largest per-slot Gauss–Newton data curvature
+    /// `‖∂f/∂t_a‖²` of every atom-axis, over the rows that select the atom (#3433).
+    ///
+    /// Native ARD curvature carries unit coefficient before `α`, so at `α` equal to
+    /// one of these values the prior matches the data's curvature on that slot's
+    /// axis; they are the log-precision coordinate's generalized eigenvalues, as the
+    /// dense lane's `observed_ard_curvature_range` reads them. The smallest is `+∞`
+    /// where no selecting row carries curvature on the axis.
+    pub(crate) fn support_ard_axis_curvature_ranges(
+        &self,
+    ) -> Result<Vec<Vec<(f64, f64)>>, String> {
+        let mut scratch = ActiveAtomScratch::default();
+        let mut ranges = Vec::with_capacity(self.k_atoms());
+        for atom in 0..self.k_atoms() {
+            let width = self.assignment.atom_coord_dim(atom);
+            let mut atom_ranges = vec![(f64::INFINITY, 0.0_f64); width];
+            for &(row, slot) in &self.atom_rows[atom] {
+                self.fill_active(row, slot, &mut scratch)?;
+                if scratch.jacobian.nrows() != width {
+                    return Err(format!(
+                        "support ARD curvature: atom {atom} Jacobian spans {} axes but its \
+                         coordinate block has {width}",
+                        scratch.jacobian.nrows()
+                    ));
+                }
+                for (axis, range) in atom_ranges.iter_mut().enumerate() {
+                    let curvature = scratch
+                        .jacobian
+                        .row(axis)
+                        .iter()
+                        .map(|value| value * value)
+                        .sum::<f64>();
+                    if !curvature.is_finite() {
+                        return Err(format!(
+                            "support ARD curvature: atom {atom} axis {axis} row {row} has \
+                             non-finite data curvature {curvature}"
+                        ));
+                    }
+                    if curvature > 0.0 {
+                        range.0 = range.0.min(curvature);
+                    }
+                    range.1 = range.1.max(curvature);
+                }
+            }
+            ranges.push(atom_ranges);
+        }
+        Ok(ranges)
     }
 
     /// Total width of the compact coordinate state `T` — the concatenation of
@@ -4506,35 +4871,34 @@ impl SaeSupportSparseTerm {
         Ok((gamma, adjoint))
     }
 
-    /// Per-probe implicit responses of a surrogate `log|S|` derivative bundle
-    /// (#2933 F29). Entry `[j, d]` is `w·⟨Σ_{z ∈ probe j} Γ(z), A⁺ directions[d]⟩`,
-    /// with `w` the bundle's [`RationalLogdetDerivativeBundle::probe_sample_weight`]
-    /// and `Γ(z)` one vector's inner-state derivative
-    /// ([`Self::support_reduced_logdet_theta_derivative_add`]). `A⁺` is symmetric, so
-    /// the mean over probes is the probe share of `⟨A⁺Γ, directions[d]⟩`, the implicit
-    /// response [`Self::support_reduced_logdet_profile_adjoint`] feeds the gradient,
-    /// and the spread over probes is that response's Hutchinson standard error. The
-    /// cost is one adjoint per direction, not one per probe.
-    pub(crate) fn support_reduced_logdet_probe_responses(
+    /// Per-probe implicit adjoints of a surrogate `log|S|` derivative bundle
+    /// (#2933 F29, #3433). Entry `j` is `A⁺ Γ_j` with
+    /// `Γ_j = w·Σ_{z ∈ probe j} Γ(z)`, `w` the bundle's
+    /// [`RationalLogdetDerivativeBundle::probe_sample_weight`] and `Γ(z)` one
+    /// vector's inner-state derivative
+    /// ([`Self::support_reduced_logdet_theta_derivative_add`]). `A⁺` is linear, so
+    /// the mean over probes is the probe share of the adjoint
+    /// [`Self::support_reduced_logdet_profile_adjoint`] feeds the gradient, and
+    /// `⟨A⁺Γ_j, g⟩` for any outer direction `g` is probe `j`'s sample of that
+    /// direction's implicit response. The cost is one adjoint per probe, however
+    /// many outer coordinates (smoothing groups and ARD precisions) read it.
+    pub(crate) fn support_reduced_logdet_probe_adjoints(
         &self,
         target: ArrayView2<'_, f64>,
         ard_precisions: &[Vec<f64>],
         system: &ArrowSchurSystem,
         bundle: &RationalLogdetDerivativeBundle,
-        directions: &[SaeArrowVector],
-    ) -> Result<Array2<f64>, String> {
+    ) -> Result<Vec<SaeArrowVector>, String> {
         let probes = bundle.hutchinson_probe_count();
-        if probes == 0 || directions.is_empty() {
-            return Err(format!(
-                "support reduced-logdet probe responses need Hutchinson probes and a \
-                 direction; got {probes} probes and {} directions",
-                directions.len()
-            ));
+        if probes == 0 {
+            return Err(
+                "support reduced-logdet probe adjoints need Hutchinson probes".to_string(),
+            );
         }
         let (beta_offsets, beta_dim) = self.beta_layout()?;
         if beta_dim != system.k {
             return Err(format!(
-                "support reduced-logdet probe responses beta layout {beta_dim} != system border {}",
+                "support reduced-logdet probe adjoints beta layout {beta_dim} != system border {}",
                 system.k
             ));
         }
@@ -4542,28 +4906,24 @@ impl SaeSupportSparseTerm {
         let factors = CpuBatchedBlockSolver
             .factor_blocks(&system.rows, 0.0, system.d, true)
             .map_err(|error| {
-                format!("support reduced-logdet probe responses row factorization: {error}")
+                format!("support reduced-logdet probe adjoints row factorization: {error}")
             })?;
         let coordinate_dim = *system.row_offsets.last().unwrap_or(&0);
-        let adjoints =
-            self.support_reduced_logdet_adjoint_solves(system, &rows, directions, bundle)?;
         let weight = bundle.probe_sample_weight();
-        let accumulate = |range: Range<usize>| -> Result<Vec<f64>, String> {
-            let mut responses = Vec::with_capacity(range.len() * adjoints.len());
-            let mut gamma = SaeArrowVector {
-                t: Array1::<f64>::zeros(coordinate_dim),
-                beta: Array1::<f64>::zeros(beta_dim),
-            };
+        let accumulate = |range: Range<usize>| -> Result<Vec<SaeArrowVector>, String> {
+            let mut gammas = Vec::with_capacity(range.len());
             for probe in range {
-                gamma.t.fill(0.0);
-                gamma.beta.fill(0.0);
+                let mut gamma = SaeArrowVector {
+                    t: Array1::<f64>::zeros(coordinate_dim),
+                    beta: Array1::<f64>::zeros(beta_dim),
+                };
                 let vectors = bundle.probe_vectors(probe).ok_or_else(|| {
-                    format!("support reduced-logdet probe responses: probe {probe} has no vectors")
+                    format!("support reduced-logdet probe adjoints: probe {probe} has no vectors")
                 })?;
                 for vector in vectors {
                     if vector.len() != system.k || vector.iter().any(|value| !value.is_finite()) {
                         return Err(format!(
-                            "support reduced-logdet probe responses require finite vectors of \
+                            "support reduced-logdet probe adjoints require finite vectors of \
                              border width {}",
                             system.k
                         ));
@@ -4577,26 +4937,31 @@ impl SaeSupportSparseTerm {
                         &mut gamma,
                     )?;
                 }
-                for adjoint in &adjoints {
-                    responses.push(gamma.t.dot(&adjoint.t) + gamma.beta.dot(&adjoint.beta));
-                }
+                gammas.push(gamma);
             }
-            Ok(responses)
+            Ok(gammas)
         };
-        let responses = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+        let gammas = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
             probes,
             accumulate,
-            |mut left: Vec<f64>, right: Vec<f64>| -> Result<Vec<f64>, String> {
+            |mut left: Vec<SaeArrowVector>,
+             right: Vec<SaeArrowVector>|
+             -> Result<Vec<SaeArrowVector>, String> {
                 left.extend(right);
                 Ok(left)
             },
         )?
-        .ok_or_else(|| "support reduced-logdet probe responses folded no probe".to_string())?;
-        if responses.iter().any(|value| !value.is_finite()) {
-            return Err("support reduced-logdet probe responses are non-finite".to_string());
+        .ok_or_else(|| "support reduced-logdet probe adjoints folded no probe".to_string())?;
+        if gammas
+            .iter()
+            .any(|gamma| gamma.t.iter().chain(gamma.beta.iter()).any(|value| !value.is_finite()))
+        {
+            return Err(
+                "support reduced-logdet probe adjoints assembled a non-finite theta derivative"
+                    .to_string(),
+            );
         }
-        Array2::from_shape_vec((probes, adjoints.len()), responses)
-            .map_err(|error| format!("support reduced-logdet probe responses shape: {error}"))
+        self.support_reduced_logdet_adjoint_solves(system, &rows, &gammas, bundle)
     }
 
     /// `A⁺ b` for every right-hand side `b` in `rhs`, with `A` the exact stationarity
