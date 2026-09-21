@@ -316,6 +316,8 @@ pub(super) struct SeedQuorum {
     floor: std::sync::atomic::AtomicU64,
     /// Every run certified so far, in seed order.
     certified: std::sync::Mutex<Vec<QuorumMember>>,
+    /// Signalled under `certified` when the floor is first set.
+    formed: std::sync::Condvar,
 }
 
 /// A certified run as the quorum judges it.
@@ -332,6 +334,31 @@ impl SeedQuorum {
             tau,
             floor: std::sync::atomic::AtomicU64::new(f64::NAN.to_bits()),
             certified: std::sync::Mutex::new(Vec::new()),
+            formed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Block until a quorum has formed, or `timeout` elapses; the floor if one
+    /// exists by then.
+    fn wait_floor(&self, timeout: std::time::Duration) -> Option<f64> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut members = self
+            .certified
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(floor) = self.floor() {
+                return Some(floor);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            members = self
+                .formed
+                .wait_timeout(members, deadline - now)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
         }
     }
 
@@ -372,6 +399,7 @@ impl SeedQuorum {
         };
         let floor = incumbent.value - tolerance;
         let previous = f64::from_bits(self.floor.swap(floor.to_bits(), Ordering::AcqRel));
+        self.formed.notify_all();
         if previous.is_nan() || previous != floor {
             log::debug!(
                 "[OUTER] {context}: multistart quorum: seeds {} and {confirming} certified one \

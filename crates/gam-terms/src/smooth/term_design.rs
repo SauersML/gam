@@ -1512,8 +1512,10 @@ fn penalty_balanced_collection_chart(
         }
     }
     let realized = apply_smooth_transform_to_design(design_local.clone(), &frame, termname)?;
-    let (realized, _) = crate::basis::FixedRowSpaceProjector::from_constraint_block(block)?
-        .project_design(realized, termname)?;
+    let projector = crate::basis::FixedRowSpaceProjector::from_constraint_block(block)?;
+    let row_space_correction = projector.row_space_correction(&realized, termname)?;
+    let realized =
+        subtract_row_space_correction(realized, block, row_space_correction.view(), termname)?;
     let mut gram = Array2::<f64>::zeros((frame.ncols(), frame.ncols()));
     for start in (0..realized.nrows()).step_by(crate::basis::DESIGN_CROSS_CHUNK_SIZE) {
         let end = (start + crate::basis::DESIGN_CROSS_CHUNK_SIZE).min(realized.nrows());

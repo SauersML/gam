@@ -937,54 +937,6 @@ impl FirthDenseOperator {
         out
     }
 
-    /// General-rhs form of `D(Hφ)[u] V`. Production only ever needs `V = I`,
-    /// which [`Self::hphi_direction`] evaluates without the identity products;
-    /// this form stays as the independent reference those tests check against.
-    #[cfg(test)]
-    pub(crate) fn hphi_direction_apply(
-        &self,
-        dir: &FirthDirection,
-        rhs: &Array2<f64>,
-    ) -> Array2<f64> {
-        let p = self.x_dense.ncols();
-        if rhs.nrows() != p {
-            return Array2::<f64>::zeros((p, rhs.ncols()));
-        }
-        if rhs.ncols() == 0 || p == 0 {
-            return Array2::<f64>::zeros((p, rhs.ncols()));
-        }
-        // Matrix-free apply of D(Hphi)[u] to a block V:
-        //   D(Hphi)[u] V
-        // = 0.5[ Xᵀ(c_u ⊙ (X V))
-        //       - B_uᵀ P (B V) - Bᵀ P (B_u V) - Bᵀ P_u (B V) ].
-        // This avoids dense p×p materialization and is used by sparse exact
-        // trace contractions through tr(H^{-1} ·).
-        let etav = fast_ab(&self.x_dense, rhs);
-        let qv = &etav * &self.w1.view().insert_axis(Axis(1));
-        let m_qv = RemlState::apply_hadamard_gram_to_matrix(
-            &self.x_reduced,
-            &self.k_reduced,
-            &self.k_reduced,
-            &qv,
-        );
-        let buvec = &dir.b_uvec;
-        let m_buv = RemlState::apply_hadamard_gram_to_matrix(
-            &self.x_reduced,
-            &self.k_reduced,
-            &self.k_reduced,
-            &(&etav * &buvec.view().insert_axis(Axis(1))),
-        );
-        let p_u_qv = self.apply_p_u_to_matrix(&dir.a_u_reduced, &qv);
-        let c_u = &(&self.w3 * &dir.deta) * &self.h_diag + &(&self.w2 * &dir.dh);
-        let diag_term = self
-            .x_dense_t
-            .dot(&(&etav * &c_u.view().insert_axis(Axis(1))));
-        let term1 = self.left_scaled_xt(buvec, &m_qv);
-        let term2 = self.left_scaled_xt(&self.w1, &m_buv);
-        let term3 = self.left_scaled_xt(&self.w1, &p_u_qv);
-        0.5 * (diag_term - (term1 + term2 + term3))
-    }
-
     pub(crate) fn hphi_direction(&self, dir: &FirthDirection) -> Array2<f64> {
         let p = self.x_dense.ncols();
         if p == 0 {
@@ -1117,139 +1069,6 @@ impl FirthDenseOperator {
         let hadamard_terms = 2.0 * dir.b_uvec.dot(&kernel.hadamard_w1);
         let p_u_term = -2.0 * (&dir.a_u_reduced * &kernel.reduced).sum();
         0.5 * (diag_term - (hadamard_terms + p_u_term))
-    }
-
-    /// General-rhs form of `D²H_φ[u,v] V`. Production only ever needs `V = I`,
-    /// which [`Self::hphisecond_direction`] evaluates without the identity
-    /// products; this form stays as the independent reference those tests
-    /// check against.
-    #[cfg(test)]
-    pub(crate) fn hphisecond_direction_apply(
-        &self,
-        u: &FirthDirection,
-        v: &FirthDirection,
-        rhs: &Array2<f64>,
-    ) -> Array2<f64> {
-        let p = self.x_dense.ncols();
-        if rhs.nrows() != p {
-            return Array2::<f64>::zeros((p, rhs.ncols()));
-        }
-        if rhs.ncols() == 0 || p == 0 {
-            return Array2::<f64>::zeros((p, rhs.ncols()));
-        }
-        // Exact mixed second directional derivative:
-        //   D² H_φ[u,v] = 0.5 [ Xᵀ diag(c_uv) X - D²J₂[u,v] ], J₂ = Bᵀ P B.
-        // Implemented with matrix identities for N_{u,v}, P_{u,v}, and the
-        // nine-term expansion of D²J₂[u,v].
-        //
-        // Because we parameterize Phi through fixed-rank I_r = X_rᵀ W X_r (SPD for
-        // finite-logit eta), this mixed derivative is evaluated on a smooth
-        // manifold without dynamic active-set switching in the Firth block.
-        //
-        // The nine contraction terms below are the explicit D²J₂[u,v] expansion,
-        // each computed through reduced Hadamard-Gram operators.
-        let deta_uv = &u.deta * &v.deta;
-        // Mixed reduced Gram:
-        //   G_uv = X_rᵀ diag(w'' ⊙ (Xu) ⊙ (Xv)) X_r.
-        let s_uv = &self.w2 * &deta_uv;
-        let g_uv_reduced = RemlState::reducedweighted_gram(&self.x_reduced, &s_uv);
-        let k_g_uv = self.k_reduced.dot(&g_uv_reduced);
-        let k_gv = self.k_reduced.dot(&v.g_u_reduced);
-        let k_g_u = self.k_reduced.dot(&u.g_u_reduced);
-        // Reduced form of:
-        //   T_{u,v} = K I_{u,v} K - K Iv K I_u K - K I_u K Iv K.
-        let a_uv_reduced = k_g_uv.dot(&self.k_reduced)
-            - k_gv.dot(&k_g_u).dot(&self.k_reduced)
-            - k_g_u.dot(&k_gv).dot(&self.k_reduced);
-        let d2h = -RemlState::reduced_diag_gram(&self.x_reduced, &a_uv_reduced);
-        // Implements mixed diagonal coefficient:
-        //   c_uv = w'''' ⊙ (Xu) ⊙ (Xv) ⊙ h
-        //          + w''' ⊙ ((Xu) ⊙ Dh[v] + (Xv) ⊙ Dh[u])
-        //          + w'' ⊙ D²h[u,v].
-        let c_uv = &(&(&self.w4 * &deta_uv) * &self.h_diag)
-            + &(&self.w3 * &(&u.deta * &v.dh))
-            + &(&self.w3 * &(&v.deta * &u.dh))
-            + &(&self.w2 * &d2h);
-
-        let eta_rhs = fast_ab(&self.x_dense, rhs);
-        let diag_term = fast_ab(
-            &self.x_dense_t,
-            &(&eta_rhs * &c_uv.view().insert_axis(Axis(1))),
-        );
-
-        let b_uvvec = &self.w3 * &deta_uv;
-        let b_uv_base = &self.x_dense * &b_uvvec.view().insert_axis(Axis(1));
-        let qv = &eta_rhs * &self.w1.view().insert_axis(Axis(1));
-
-        // Linearity in the rhs argument lets us precompute the expensive
-        // Hadamard-Gram operator on the full base blocks B, B_u, Bv, B_uv once,
-        // then post-multiply by rhs. This preserves the exact operator while
-        // avoiding repeated O(n r^2 c) work for every rhs block.
-        let p_b_rhs = fast_ab(&self.p_b_base, rhs);
-        let p_bu_rhs = RemlState::apply_hadamard_gram_to_matrix(
-            &self.x_reduced,
-            &self.k_reduced,
-            &self.k_reduced,
-            &(&eta_rhs * &u.b_uvec.view().insert_axis(Axis(1))),
-        );
-        let p_bv_rhs = RemlState::apply_hadamard_gram_to_matrix(
-            &self.x_reduced,
-            &self.k_reduced,
-            &self.k_reduced,
-            &(&eta_rhs * &v.b_uvec.view().insert_axis(Axis(1))),
-        );
-        let p_buv_base = RemlState::apply_hadamard_gram_to_matrix(
-            &self.x_reduced,
-            &self.k_reduced,
-            &self.k_reduced,
-            &b_uv_base,
-        );
-        let p_buv_rhs = fast_ab(&p_buv_base, rhs);
-
-        let pv_b_rhs = self.apply_p_u_to_matrix(&v.a_u_reduced, &qv);
-        let pv_bu_rhs = self.apply_p_u_to_matrix(
-            &v.a_u_reduced,
-            &(&eta_rhs * &u.b_uvec.view().insert_axis(Axis(1))),
-        );
-        let p_u_b_rhs = self.apply_p_u_to_matrix(&u.a_u_reduced, &qv);
-        let p_u_bv_rhs = self.apply_p_u_to_matrix(
-            &u.a_u_reduced,
-            &(&eta_rhs * &v.b_uvec.view().insert_axis(Axis(1))),
-        );
-
-        let p_nu_nv_base = RemlState::apply_hadamard_gram_to_matrix(
-            &self.x_reduced,
-            &u.a_u_reduced,
-            &v.a_u_reduced,
-            &self.b_base,
-        );
-        let p_hw_nuv_base = RemlState::apply_hadamard_gram_to_matrix(
-            &self.x_reduced,
-            &self.k_reduced,
-            &a_uv_reduced,
-            &self.b_base,
-        );
-        let p_uv_base = 2.0 * p_nu_nv_base - 2.0 * p_hw_nuv_base;
-        let p_uv_rhs = fast_ab(&p_uv_base, rhs);
-
-        // Nine-term expansion of D²J₂[u,v] with J₂ = Bᵀ P B.
-        let d2_terms = [
-            self.left_scaled_xt(&b_uvvec, &p_b_rhs),
-            self.left_scaled_xt(&self.w1, &p_buv_rhs),
-            self.left_scaled_xt(&u.b_uvec, &p_bv_rhs),
-            self.left_scaled_xt(&v.b_uvec, &p_bu_rhs),
-            self.left_scaled_xt(&u.b_uvec, &pv_b_rhs),
-            self.left_scaled_xt(&self.w1, &pv_bu_rhs),
-            self.left_scaled_xt(&v.b_uvec, &p_u_b_rhs),
-            self.left_scaled_xt(&self.w1, &p_u_bv_rhs),
-            self.left_scaled_xt(&self.w1, &p_uv_rhs),
-        ];
-        let mut d2_j2 = Array2::<f64>::zeros((p, rhs.ncols()));
-        for term in d2_terms {
-            d2_j2 += &term;
-        }
-
-        0.5 * (diag_term - d2_j2)
     }
 
     /// Exact mixed second directional derivative `D²H_φ[u,v]` as a `p×p`
@@ -4743,6 +4562,192 @@ mod tests {
                 "probit Fisher weight jet must be tiny-positive and finite at eta={eta}; got \
                  ({w}, {w1}, {w2}, {w3}, {w4})"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    impl FirthDenseOperator {
+        /// General-rhs form of `D(Hφ)[u] V`. Production only ever needs `V = I`,
+        /// which [`Self::hphi_direction`] evaluates without the identity products;
+        /// this form stays as the independent reference those tests check against.
+        pub(crate) fn hphi_direction_apply(
+            &self,
+            dir: &FirthDirection,
+            rhs: &Array2<f64>,
+        ) -> Array2<f64> {
+            let p = self.x_dense.ncols();
+            if rhs.nrows() != p {
+                return Array2::<f64>::zeros((p, rhs.ncols()));
+            }
+            if rhs.ncols() == 0 || p == 0 {
+                return Array2::<f64>::zeros((p, rhs.ncols()));
+            }
+            // Matrix-free apply of D(Hphi)[u] to a block V:
+            //   D(Hphi)[u] V
+            // = 0.5[ Xᵀ(c_u ⊙ (X V))
+            //       - B_uᵀ P (B V) - Bᵀ P (B_u V) - Bᵀ P_u (B V) ].
+            // This avoids dense p×p materialization and is used by sparse exact
+            // trace contractions through tr(H^{-1} ·).
+            let etav = fast_ab(&self.x_dense, rhs);
+            let qv = &etav * &self.w1.view().insert_axis(Axis(1));
+            let m_qv = RemlState::apply_hadamard_gram_to_matrix(
+                &self.x_reduced,
+                &self.k_reduced,
+                &self.k_reduced,
+                &qv,
+            );
+            let buvec = &dir.b_uvec;
+            let m_buv = RemlState::apply_hadamard_gram_to_matrix(
+                &self.x_reduced,
+                &self.k_reduced,
+                &self.k_reduced,
+                &(&etav * &buvec.view().insert_axis(Axis(1))),
+            );
+            let p_u_qv = self.apply_p_u_to_matrix(&dir.a_u_reduced, &qv);
+            let c_u = &(&self.w3 * &dir.deta) * &self.h_diag + &(&self.w2 * &dir.dh);
+            let diag_term = self
+                .x_dense_t
+                .dot(&(&etav * &c_u.view().insert_axis(Axis(1))));
+            let term1 = self.left_scaled_xt(buvec, &m_qv);
+            let term2 = self.left_scaled_xt(&self.w1, &m_buv);
+            let term3 = self.left_scaled_xt(&self.w1, &p_u_qv);
+            0.5 * (diag_term - (term1 + term2 + term3))
+        }
+
+        /// General-rhs form of `D²H_φ[u,v] V`. Production only ever needs `V = I`,
+        /// which [`Self::hphisecond_direction`] evaluates without the identity
+        /// products; this form stays as the independent reference those tests
+        /// check against.
+        pub(crate) fn hphisecond_direction_apply(
+            &self,
+            u: &FirthDirection,
+            v: &FirthDirection,
+            rhs: &Array2<f64>,
+        ) -> Array2<f64> {
+            let p = self.x_dense.ncols();
+            if rhs.nrows() != p {
+                return Array2::<f64>::zeros((p, rhs.ncols()));
+            }
+            if rhs.ncols() == 0 || p == 0 {
+                return Array2::<f64>::zeros((p, rhs.ncols()));
+            }
+            // Exact mixed second directional derivative:
+            //   D² H_φ[u,v] = 0.5 [ Xᵀ diag(c_uv) X - D²J₂[u,v] ], J₂ = Bᵀ P B.
+            // Implemented with matrix identities for N_{u,v}, P_{u,v}, and the
+            // nine-term expansion of D²J₂[u,v].
+            //
+            // Because we parameterize Phi through fixed-rank I_r = X_rᵀ W X_r (SPD for
+            // finite-logit eta), this mixed derivative is evaluated on a smooth
+            // manifold without dynamic active-set switching in the Firth block.
+            //
+            // The nine contraction terms below are the explicit D²J₂[u,v] expansion,
+            // each computed through reduced Hadamard-Gram operators.
+            let deta_uv = &u.deta * &v.deta;
+            // Mixed reduced Gram:
+            //   G_uv = X_rᵀ diag(w'' ⊙ (Xu) ⊙ (Xv)) X_r.
+            let s_uv = &self.w2 * &deta_uv;
+            let g_uv_reduced = RemlState::reducedweighted_gram(&self.x_reduced, &s_uv);
+            let k_g_uv = self.k_reduced.dot(&g_uv_reduced);
+            let k_gv = self.k_reduced.dot(&v.g_u_reduced);
+            let k_g_u = self.k_reduced.dot(&u.g_u_reduced);
+            // Reduced form of:
+            //   T_{u,v} = K I_{u,v} K - K Iv K I_u K - K I_u K Iv K.
+            let a_uv_reduced = k_g_uv.dot(&self.k_reduced)
+                - k_gv.dot(&k_g_u).dot(&self.k_reduced)
+                - k_g_u.dot(&k_gv).dot(&self.k_reduced);
+            let d2h = -RemlState::reduced_diag_gram(&self.x_reduced, &a_uv_reduced);
+            // Implements mixed diagonal coefficient:
+            //   c_uv = w'''' ⊙ (Xu) ⊙ (Xv) ⊙ h
+            //          + w''' ⊙ ((Xu) ⊙ Dh[v] + (Xv) ⊙ Dh[u])
+            //          + w'' ⊙ D²h[u,v].
+            let c_uv = &(&(&self.w4 * &deta_uv) * &self.h_diag)
+                + &(&self.w3 * &(&u.deta * &v.dh))
+                + &(&self.w3 * &(&v.deta * &u.dh))
+                + &(&self.w2 * &d2h);
+
+            let eta_rhs = fast_ab(&self.x_dense, rhs);
+            let diag_term = fast_ab(
+                &self.x_dense_t,
+                &(&eta_rhs * &c_uv.view().insert_axis(Axis(1))),
+            );
+
+            let b_uvvec = &self.w3 * &deta_uv;
+            let b_uv_base = &self.x_dense * &b_uvvec.view().insert_axis(Axis(1));
+            let qv = &eta_rhs * &self.w1.view().insert_axis(Axis(1));
+
+            // Linearity in the rhs argument lets us precompute the expensive
+            // Hadamard-Gram operator on the full base blocks B, B_u, Bv, B_uv once,
+            // then post-multiply by rhs. This preserves the exact operator while
+            // avoiding repeated O(n r^2 c) work for every rhs block.
+            let p_b_rhs = fast_ab(&self.p_b_base, rhs);
+            let p_bu_rhs = RemlState::apply_hadamard_gram_to_matrix(
+                &self.x_reduced,
+                &self.k_reduced,
+                &self.k_reduced,
+                &(&eta_rhs * &u.b_uvec.view().insert_axis(Axis(1))),
+            );
+            let p_bv_rhs = RemlState::apply_hadamard_gram_to_matrix(
+                &self.x_reduced,
+                &self.k_reduced,
+                &self.k_reduced,
+                &(&eta_rhs * &v.b_uvec.view().insert_axis(Axis(1))),
+            );
+            let p_buv_base = RemlState::apply_hadamard_gram_to_matrix(
+                &self.x_reduced,
+                &self.k_reduced,
+                &self.k_reduced,
+                &b_uv_base,
+            );
+            let p_buv_rhs = fast_ab(&p_buv_base, rhs);
+
+            let pv_b_rhs = self.apply_p_u_to_matrix(&v.a_u_reduced, &qv);
+            let pv_bu_rhs = self.apply_p_u_to_matrix(
+                &v.a_u_reduced,
+                &(&eta_rhs * &u.b_uvec.view().insert_axis(Axis(1))),
+            );
+            let p_u_b_rhs = self.apply_p_u_to_matrix(&u.a_u_reduced, &qv);
+            let p_u_bv_rhs = self.apply_p_u_to_matrix(
+                &u.a_u_reduced,
+                &(&eta_rhs * &v.b_uvec.view().insert_axis(Axis(1))),
+            );
+
+            let p_nu_nv_base = RemlState::apply_hadamard_gram_to_matrix(
+                &self.x_reduced,
+                &u.a_u_reduced,
+                &v.a_u_reduced,
+                &self.b_base,
+            );
+            let p_hw_nuv_base = RemlState::apply_hadamard_gram_to_matrix(
+                &self.x_reduced,
+                &self.k_reduced,
+                &a_uv_reduced,
+                &self.b_base,
+            );
+            let p_uv_base = 2.0 * p_nu_nv_base - 2.0 * p_hw_nuv_base;
+            let p_uv_rhs = fast_ab(&p_uv_base, rhs);
+
+            // Nine-term expansion of D²J₂[u,v] with J₂ = Bᵀ P B.
+            let d2_terms = [
+                self.left_scaled_xt(&b_uvvec, &p_b_rhs),
+                self.left_scaled_xt(&self.w1, &p_buv_rhs),
+                self.left_scaled_xt(&u.b_uvec, &p_bv_rhs),
+                self.left_scaled_xt(&v.b_uvec, &p_bu_rhs),
+                self.left_scaled_xt(&u.b_uvec, &pv_b_rhs),
+                self.left_scaled_xt(&self.w1, &pv_bu_rhs),
+                self.left_scaled_xt(&v.b_uvec, &p_u_b_rhs),
+                self.left_scaled_xt(&self.w1, &p_u_bv_rhs),
+                self.left_scaled_xt(&self.w1, &p_uv_rhs),
+            ];
+            let mut d2_j2 = Array2::<f64>::zeros((p, rhs.ncols()));
+            for term in d2_terms {
+                d2_j2 += &term;
+            }
+
+            0.5 * (diag_term - d2_j2)
         }
     }
 }

@@ -28,7 +28,7 @@ const DEGREE: usize = 3;
 
 fn outlier_covariate(n: usize, seed: u64) -> Vec<f64> {
     let mut rng = StdRng::seed_from_u64(seed);
-    let unif = Uniform::new(0.0_f64, 1.0).unwrap();
+    let unif = Uniform::new(0.0_f64, 1.0).expect("the unit interval is a valid uniform range");
     let mut x: Vec<f64> = (0..n).map(|_| unif.sample(&mut rng)).collect();
     x[0] = 1.0e6;
     x
@@ -50,6 +50,8 @@ fn chain_internal_knots(x: &[f64], root: usize, num_internal_knots: usize) -> Ve
         boundary_conditions: BSplineBoundaryConditions::default(),
     };
     let data = Array1::from_vec(x.to_vec());
+    // SAFETY: test helper; a chain that cannot build, or builds a basis other
+    // than the 1-D B-spline it was asked for, is a fixture defect.
     let built = build_bspline_basis_1d(data.view(), &spec)
         .unwrap_or_else(|e| panic!("chain at K={num_internal_knots} from root {root}: {e:?}"));
     let BasisMetadata::BSpline1D { knots, .. } = built.metadata else {
@@ -132,6 +134,8 @@ fn fit_on_bulk_grid(formula: &str, x: &[f64], y: &[f64], grid: &[f64]) -> (Vec<f
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
+    // SAFETY: test helper; the outlier design is a Gaussian standard fit by
+    // construction, so a refusal or another result kind is a fixture defect.
     let result = fit_from_formula(formula, &ds, &cfg)
         .unwrap_or_else(|e| panic!("{formula} must fit the outlier design: {e:?}"));
     let StandardFitResult {

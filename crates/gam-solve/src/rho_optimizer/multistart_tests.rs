@@ -886,14 +886,10 @@ fn run_convex_well_seed(
             return;
         }
         let quorum = &release.as_ref().expect("a held seed has a release handle").quorum;
-        let started = std::time::Instant::now();
-        while quorum.floor().is_none() {
-            assert!(
-                started.elapsed() < std::time::Duration::from_secs(120),
-                "the two fast seeds never formed a quorum"
-            );
-            std::thread::yield_now();
-        }
+        assert!(
+            quorum.wait_floor(std::time::Duration::from_secs(120)).is_some(),
+            "the two fast seeds never formed a quorum"
+        );
     };
     let wait_value = wait.clone();
     let mut obj = problem.build_objective(

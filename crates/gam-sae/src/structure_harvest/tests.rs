@@ -2057,7 +2057,8 @@ fn gaussian_regression_gate_4327(y: &Array2<f64>, alpha: f64) -> (bool, f64, f64
     let sxy: f64 = est.iter().map(|&r| (x(r) - x_bar) * (y[[r, 0]] - y_bar)).sum();
     let slope = sxy / sxx;
     let alt_fitted = Array2::from_shape_fn((n, 1), |(r, _)| y_bar + slope * (x(r) - x_bar));
-    let (est_sse, est_count) = residual_sse(&alt_fitted, y, est).unwrap();
+    let (est_sse, est_count) = residual_sse(&alt_fitted, y, est)
+        .expect("the estimation rows index the fitted response");
     let sigma2 = est_sse / est_count as f64;
 
     let mut null_stream = NullStreamSup::default();
@@ -2085,7 +2086,7 @@ fn gaussian_regression_gate_4327(y: &Array2<f64>, alpha: f64) -> (bool, f64, f64
         },
         |alt, _| Ok(alt),
     )
-    .unwrap();
+    .expect("the atom birth gate runs over the split's shards");
     let certified = matches!(gate.verdict(), GateVerdict::Certified { .. });
     (certified, alt_total, null_sup)
 }

@@ -654,7 +654,12 @@ fn outer_product(lambda: &Array2<f64>) -> Array2<f64> {
 /// fitted model guarantees `Σ ≻ 0`, so a failure is a genuine defect upstream).
 fn covariance_whitening_factor(sigma: &Array2<f64>, urow: &mut [f64]) -> Result<(), String> {
     let p = sigma.nrows();
-    debug_assert_eq!(urow.len(), p * p);
+    if urow.len() != p * p {
+        return Err(format!(
+            "whitening factor buffer holds {} entries for a {p}x{p} covariance",
+            urow.len()
+        ));
+    }
     let l = sigma
         .cholesky(Side::Lower)
         .map_err(|e| format!("residual covariance is not SPD: {e:?}"))?

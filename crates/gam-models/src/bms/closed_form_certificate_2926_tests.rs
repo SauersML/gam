@@ -427,7 +427,7 @@ fn refusals_on(weights: &[f64], shifts: &[f64], outside: f64, draws: u32, seed: 
     statistics.sort_by(|a, b| b.total_cmp(a));
     let decide = |statistic: f64| {
         declared_gaussian_loss_test(weights, statistic)
-            .unwrap_or_else(|reason| panic!("{reason}"))
+            .expect("the declared Gaussian loss test decides every finite statistic")
             .refused
     };
     let refused = statistics.iter().take_while(|&&t| decide(t)).count();

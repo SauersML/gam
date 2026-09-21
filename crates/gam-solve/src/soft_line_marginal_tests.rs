@@ -448,7 +448,8 @@ fn fold_hessian_is_continuous_at_the_fold() {
 // Refusals.
 // ---------------------------------------------------------------------------------------------------------------------
 
-fn flat_slice(_: f64) -> Result<SoftLineSlice, ()> {
+fn flat_slice(rho: f64) -> Result<SoftLineSlice, ()> {
+    assert!(rho.is_finite(), "a flat slice is only probed at finite rho, not {rho}");
     Ok(SoftLineSlice {
         cost: 0.0,
         cost_band: 0.0,
