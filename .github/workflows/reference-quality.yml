@@ -137,6 +137,12 @@ jobs:
             || echo "gam CLI build reported errors; CLI-shelling quality tests will report TEST_ERROR"
 
       - name: Run quality suite (resilient + streaming; full per-test capture)
+        # gam#1561: the platform's 6-hour JOB cap kills every later step, so a run that
+        # outlived it published nothing and its measured cases were discarded (85 of
+        # them on one run). A STEP bound under that cap stops only this loop; the
+        # always() aggregate, upload and publish steps then record what was measured,
+        # with completeness=INCOMPLETE set by the loop's own bookkeeping.
+        timeout-minutes: 320
         shell: bash
         run: |
           # GitHub's `shell: bash` runs with `-e`, which would abort this step at
