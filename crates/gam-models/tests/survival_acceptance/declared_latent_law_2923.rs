@@ -447,41 +447,30 @@ fn closed_form_is_miscalibrated_on_a_skewed_law_and_the_anchored_fit_is_not_2923
         .map(|(&q, &z)| normal_cdf(-(law.anchor(q, SLOPE) + SLOPE * z)))
         .collect();
 
-    // gam#2926: a Gaussian declaration on a score that fails the adequacy screen
-    // is fitted with a warning, not refused, and records what it costs: on a law
-    // this skewed its excess anchoring loss is positive. The closed form below is
-    // reached through the declared Gauss–Hermite law, which is its anchor to
-    // quadrature tolerance
+    // gam#2968: a Gaussian declaration on a score that fails the adequacy screen
+    // is refused when, at the converged declared fit, the closed form's excess
+    // anchoring loss is beyond its sampling noise (its residual energy past the
+    // least-favourable loss-free law's upper 1e-3 tail); on a law this skewed it
+    // is far past it. The closed form below is reached through
+    // the declared Gauss–Hermite law, which is its anchor to quadrature tolerance
     // (`anchored_fit_on_a_gaussian_law_reproduces_the_closed_form_2923`).
-    let declared = fit_from_formula(
+    let refusal = match fit_from_formula(
         "Surv(time, event) ~ 1",
         &data,
         &FitConfig {
             latent_measure: Some("gaussian".to_string()),
             ..base_config()
         },
-    )
-    .expect("a Gaussian declaration on a skewed score is fitted with a warning");
-    let FitResult::SurvivalMarginalSlope(declared) = declared else {
-        panic!("expected a SurvivalMarginalSlope fit result");
-    };
-    let gam_models::bms::LatentLawConsumed::DeclaredGaussian {
-        adequacy: Some(_),
-        residual: Some(certificate),
-        ..
-    } = &declared.latent_law_consumed
-    else {
-        panic!(
-            "a declaration whose score fails the screen must record the ledger and its excess \
-             anchoring loss; got {:?}",
-            declared.latent_law_consumed
-        )
+    ) {
+        Ok(_) => panic!("a Gaussian declaration on this skewed score must be refused"),
+        Err(error) => error.to_string(),
     };
     assert!(
-        certificate.excess_kl > 0.0,
-        "on a skewed score the declaration's excess anchoring loss must be positive: \
-         {certificate:?}"
+        refusal.contains("excess anchoring loss is beyond its sampling noise")
+            && refusal.contains("Refused"),
+        "the declaration must be refused by its anchoring-loss test: {refusal}"
     );
+    eprintln!("[2923/2968 skewed] declared gaussian refused: {refusal}");
     let closed_form = fit(
         &data,
         &FitConfig {

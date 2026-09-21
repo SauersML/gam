@@ -531,6 +531,242 @@ impl AnchorNoiseGram {
         }
         Ok(eigenvalues.iter().copied().filter(|&l| l > 0.0).collect())
     }
+
+    /// The declared-Gaussian loss test ([`declared_gaussian_loss_test`]) of the
+    /// residual energy `residual_energy` against this Gram's null weights.
+    pub(crate) fn declared_gaussian_loss_test(
+        &self,
+        residual_energy: f64,
+    ) -> Result<DeclaredGaussianLossTest, String> {
+        declared_gaussian_loss_test(&self.null_weights()?, residual_energy)
+    }
+}
+
+/// The test of a declared Gaussian law's excess anchoring loss (gam#2968), at the
+/// conditional-law gate's level [`AUTO_Z_CONDITIONAL_RAO_ALPHA`].
+///
+/// Under the declaration each anchor's residual is `r = b + e`: `b` the Gaussian
+/// anchor's bias against the true law, `e ~ N(0, Σ)` the estimated law's sampling
+/// error ([`ClosedFormAnchorResidual`]). The declaration's excess loss is
+/// `D = bᵀCb − N`, the Gaussian anchor's weighted squared error beyond the estimated
+/// law's own, `N = tr(CΣ) = Σ_k λ_k` the noise energy, and `D̂ = T − 2N` estimates it
+/// without bias. The declaration is refused when `H₀: D ≤ 0` is rejected, which
+/// needs the law of `T = ‖C^{1/2}(b + e)‖²` at its least favourable null bias.
+/// In the eigenbasis of `C^{1/2}ΣC^{1/2}`,
+///
+/// ```text
+/// T = Σ_k λ_k (z_k + μ_k)² + ‖β_⊥‖²,    Σ_k λ_k μ_k² + ‖β_⊥‖² = bᵀCb ≤ N,
+/// ```
+///
+/// `z_k` independent standard normals, `β_⊥` the part of `C^{1/2}b` outside the
+/// noise's range. `T`'s tail grows with the bias energy, so the supremum over the
+/// null is on its boundary `bᵀCb = N`. A budget `B` on one mode gives
+/// `(√λ·z + √B)²`, and `P(|√λ·z + √B| > √t)` grows with `λ` wherever `t > B`, so the
+/// top mode `λ₁` carries the heaviest tail and the bias outside the range
+/// (`λ → 0`, the constant `B`) the lightest. The least-favourable law is
+///
+/// ```text
+/// T_LF = λ₁·χ²₁(N/λ₁) + Σ_{k≥2} λ_k χ²₁,
+/// ```
+///
+/// with mean `2N` and variance `2Σλ² + 4λ₁N`; a bias split over modes is checked
+/// against it by simulation in the tests. The noncentral term is the Poisson mixture
+/// `χ²₁(δ) = Σ_j Pois(j; δ/2)·χ²_{1+2j}`, so the p-value `P(T_LF > T)` is
+/// `Σ_j π_j P_j`, each `P_j` a central weighted chi-square tail
+/// ([`crate::probability::signed_weighted_chi_square_sf`]) with `1 + 2j` degrees of
+/// freedom on `λ₁` ([`least_favourable_declaration_tail`] bounds it). Cantelli's
+/// inequality on the mean and variance above is a second upper bound. The declaration
+/// is refused when the upper bound is below the level and kept when the lower bound
+/// is at least it, and a bound that straddles the level is an error by name.
+///
+/// The test has size exactly `α` at the least-favourable bias and less everywhere
+/// else in the null: on an exactly Gaussian score, `b = 0`, it is far below `α`.
+/// No positive weight means no anchor varies over the law's atoms, every law gives
+/// the same anchors, and there is nothing to refuse.
+pub(crate) fn declared_gaussian_loss_test(
+    weights: &[f64],
+    residual_energy: f64,
+) -> Result<DeclaredGaussianLossTest, String> {
+    let alpha = AUTO_Z_CONDITIONAL_RAO_ALPHA;
+    let top_weight = weights.iter().copied().fold(0.0, f64::max);
+    let (noise_energy, weight_sq_sum) = weights
+        .iter()
+        .fold((0.0, 0.0), |(s, q), &l| (s + l, q + l * l));
+    if weights.is_empty() {
+        return Ok(DeclaredGaussianLossTest {
+            p_value_lower: 1.0,
+            p_value_upper: 1.0,
+            top_weight,
+            noise_energy,
+            refused: false,
+        });
+    }
+    let (p_value_lower, series_upper) = least_favourable_declaration_tail(weights, residual_energy)?;
+    let excess = residual_energy - 2.0 * noise_energy;
+    let variance = 2.0 * weight_sq_sum + 4.0 * top_weight * noise_energy;
+    let cantelli = if excess > 0.0 {
+        variance / (variance + excess * excess)
+    } else {
+        1.0
+    };
+    let p_value_upper = series_upper.min(cantelli);
+    let refused = if p_value_upper < alpha {
+        true
+    } else if p_value_lower >= alpha {
+        false
+    } else {
+        return Err(format!(
+            "declared-Gaussian loss test does not decide against the level {alpha}: the \
+             least-favourable p-value lies in [{p_value_lower:.6e}, {p_value_upper:.6e}] at \
+             residual energy {residual_energy}, top null weight {top_weight} of {} summing to \
+             {noise_energy}",
+            weights.len()
+        ));
+    };
+    Ok(DeclaredGaussianLossTest {
+        p_value_lower,
+        p_value_upper,
+        top_weight,
+        noise_energy,
+        refused,
+    })
+}
+
+/// Bounds `[lower, upper]` on `P(λ₁·χ²₁(N/λ₁) + Σ_{k≥2} λ_k χ²₁ > statistic)`, `λ₁`
+/// the largest of the positive `weights` and `N` their sum (gam#2968,
+/// [`declared_gaussian_loss_test`]).
+///
+/// With Poisson mean `μ = N/(2λ₁)` the tail is `Σ_j π_j P_j`, `π_j = e^{−μ} μ^j/j!`
+/// and `P_j` the central tail with `1 + 2j` degrees of freedom on `λ₁`. Each bound
+/// is derived:
+/// - `π_j` is formed by `π_j = π_{j−1}·μ/j` from `e^{−μ}` (the exponential within one
+///   ulp), so it carries at most `2j + 2` roundings, `γ_{2j+2}` relative;
+/// - a resolved `P_j` (`relative_error ε < 1`) lies in `[p/(1 + ε), p/(1 − ε)]`. An
+///   unresolved one says only `0 ≤ P_j ≤ 1`, but `χ²_{1+2j}` is stochastically
+///   increasing in `j`, so `P_j` lies between the last resolved lower bound before it
+///   and the first resolved upper bound after it;
+/// - once `J + 2 > μ` the Poisson mass beyond `J` is at most
+///   `π_{J+1}/(1 − μ/(J + 2))` (the ratio of consecutive terms is `μ/(j+1)`), charged
+///   at `P_j ≤ 1`.
+///
+/// The series stops when that remainder is no wider than the interval the evaluated
+/// terms already leave, or has underflowed to zero. The two sums round by at most
+/// `γ` of twice their length. `e^{−μ}` underflows only past about 1400 null modes,
+/// far beyond any estimated or joint law here, and is refused by name there.
+fn least_favourable_declaration_tail(weights: &[f64], statistic: f64) -> Result<(f64, f64), String> {
+    use crate::probability::{WeightedChiSquareTerm, signed_weighted_chi_square_sf};
+    use gam_linalg::roundoff::accumulation_growth;
+    if !(statistic > 0.0) {
+        return if statistic.is_nan() {
+            Err("declared-Gaussian loss test read a residual energy that is not a number".to_string())
+        } else {
+            Ok((1.0, 1.0))
+        };
+    }
+    let (top_index, top_weight) = weights
+        .iter()
+        .copied()
+        .enumerate()
+        .fold((0, 0.0), |best, (index, weight)| {
+            if weight > best.1 { (index, weight) } else { best }
+        });
+    let noise_energy: f64 = weights.iter().sum();
+    let mean = 0.5 * noise_energy / top_weight;
+    let mut mass = (-mean).exp();
+    if !(mass > 0.0) {
+        return Err(format!(
+            "declared-Gaussian loss test: the least-favourable law's Poisson mixture of mean \
+             {mean} ({} null weights, top {top_weight} of {noise_energy}) underflows at its \
+             first term",
+            weights.len()
+        ));
+    }
+    let mut terms: Vec<WeightedChiSquareTerm> = weights
+        .iter()
+        .map(|&weight| WeightedChiSquareTerm {
+            weight,
+            degrees_of_freedom: 1.0,
+        })
+        .collect();
+    let (mut lower, mut upper) = (0.0, 0.0);
+    // Upper Poisson mass of the unresolved terms since the last resolved one, and
+    // that resolved term's lower bound.
+    let (mut pending, mut last_lower) = (0.0, 0.0);
+    let mut resolved = false;
+    let mut j = 0usize;
+    loop {
+        terms[top_index].degrees_of_freedom = 1.0 + 2.0 * j as f64;
+        let tail = signed_weighted_chi_square_sf(&terms, statistic);
+        if tail.probability.is_nan() || tail.relative_error.is_nan() {
+            return Err(format!(
+                "declared-Gaussian loss test: the central tail with {} degrees of freedom on the \
+                 top null weight is not a number at residual energy {statistic}",
+                1 + 2 * j
+            ));
+        }
+        let rounding = accumulation_growth(2 * j + 2);
+        let (mass_lower, mass_upper) = (mass / (1.0 + rounding), mass * (1.0 + rounding));
+        if tail.relative_error < 1.0 {
+            let p_lower = tail.probability / (1.0 + tail.relative_error);
+            let p_upper = (tail.probability / (1.0 - tail.relative_error)).min(1.0);
+            lower += mass_lower * p_lower;
+            upper += (mass_upper + pending) * p_upper;
+            pending = 0.0;
+            last_lower = p_lower;
+            resolved = true;
+        } else {
+            lower += mass_lower * last_lower;
+            pending += mass_upper;
+        }
+        let next = mass * mean / (j as f64 + 1.0);
+        let ratio = mean / (j as f64 + 2.0);
+        if ratio < 1.0 {
+            let remainder = next * (1.0 + accumulation_growth(2 * j + 6)) / (1.0 - ratio);
+            if (resolved && remainder <= upper + pending - lower) || remainder == 0.0 {
+                let summed = accumulation_growth(2 * j + 2);
+                return Ok((
+                    (lower / (1.0 + summed)).min(1.0),
+                    ((upper + pending + remainder) * (1.0 + summed)).min(1.0),
+                ));
+            }
+        }
+        mass = next;
+        j += 1;
+    }
+}
+
+/// The outcome of [`declared_gaussian_loss_test`] (gam#2968).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeclaredGaussianLossTest {
+    /// Lower bound on the least-favourable p-value `P(T_LF > T)`.
+    pub p_value_lower: f64,
+    /// Upper bound on it: the Poisson-mixture series' or Cantelli's, the tighter.
+    pub p_value_upper: f64,
+    /// `λ₁`, the null weight the least-favourable bias sits on.
+    pub top_weight: f64,
+    /// `N = Σλ`, the bias energy at the null's boundary.
+    pub noise_energy: f64,
+    /// `H₀: D ≤ 0` is rejected at [`AUTO_Z_CONDITIONAL_RAO_ALPHA`].
+    pub refused: bool,
+}
+
+impl DeclaredGaussianLossTest {
+    pub fn summary(&self) -> String {
+        format!(
+            "P(T beyond the least-favourable loss-free declaration's, λ₁ = {:.4e} carrying all \
+             of N = {:.4e}) in [{:.3e}, {:.3e}] against α = {}: {}",
+            self.top_weight,
+            self.noise_energy,
+            self.p_value_lower,
+            self.p_value_upper,
+            AUTO_Z_CONDITIONAL_RAO_ALPHA,
+            if self.refused {
+                "the excess anchoring loss is beyond its sampling noise"
+            } else {
+                "the excess anchoring loss is within its sampling noise"
+            }
+        )
+    }
 }
 
 impl ClosedFormAnchorResidual {
@@ -774,8 +1010,11 @@ pub enum LatentLawConsumed {
     /// closed-form `N(0, 1)` lowering, admitted because the score's conditional
     /// moments do not move on the span. When the pooled score fails the adequacy
     /// screen, `adequacy` is the failing ledger and `residual` the declaration's
-    /// estimated excess anchoring loss at the converged fit, both warned about;
-    /// neither refuses the declaration.
+    /// estimated excess anchoring loss at the converged fit, both warned about. A
+    /// failed screen alone does not refuse the declaration; a loss beyond its
+    /// sampling noise does ([`declared_gaussian_loss_test`],
+    /// [`LatentLawRefusal::DeclaredGaussianAnchoringLoss`], gam#2968), so a
+    /// persisted declaration's loss is within it.
     DeclaredGaussian {
         evidence: ConditionalLawEvidence,
         adequacy: Option<LatentNormalAdequacy>,
@@ -914,6 +1153,16 @@ pub enum LatentLawRefusal {
         arm: MovingLawArm,
         reason: String,
     },
+    /// A Gaussian law was declared on a score that fails the standard-normal
+    /// adequacy screen, and at the converged declared fit the declaration's excess
+    /// anchoring loss is beyond its sampling noise ([`declared_gaussian_loss_test`],
+    /// gam#2968).
+    DeclaredGaussianAnchoringLoss {
+        context: String,
+        certificate: ClosedFormAnchorResidual,
+        test: DeclaredGaussianLossTest,
+        adequacy: String,
+    },
 }
 
 impl std::fmt::Display for LatentLawRefusal {
@@ -964,6 +1213,24 @@ impl std::fmt::Display for LatentLawRefusal {
                  Declare latent_measure=\"conditional-location-scale\" or \
                  latent_measure=\"global-empirical\"",
                 arm.label()
+            ),
+            Self::DeclaredGaussianAnchoringLoss {
+                context,
+                certificate,
+                test,
+                adequacy,
+            } => write!(
+                f,
+                "{context}: the Gaussian latent law was declared (latent_measure=\"gaussian\", \
+                 frozen_score, or the CTN chain) on a score that fails the standard-normal \
+                 adequacy screen (ledger, x = statistic / bound, x<=1 passed: {adequacy}), and at \
+                 the converged declared fit the closed form's estimated excess anchoring loss \
+                 is beyond its sampling noise: D-hat = {:.4e}, {} ({}). The declared anchor \
+                 misstates the probabilities it anchors. Refused. Drop the declaration to anchor \
+                 on the estimated law (the default), or supply a score that is standard normal",
+                certificate.excess_kl,
+                test.summary(),
+                certificate.summary()
             ),
         }
     }

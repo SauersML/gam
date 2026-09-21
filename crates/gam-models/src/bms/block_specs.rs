@@ -3940,7 +3940,9 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // `Σ_k w_k Φ(η_k) − π` under the estimated law, and its sampling error. When
     // their excess-KL estimate prefers that law, the fit is re-solved on it from
     // these coefficients. A declared Gaussian law whose score failed the screen
-    // is measured the same way and kept, with the measurement warned about.
+    // is measured the same way: refused when its excess anchoring loss is beyond
+    // that measurement's sampling noise at its least-favourable null law
+    // (gam#2968), and kept otherwise, with the measurement warned about.
     let certificate_pending = matches!(
         &latent_law_consumed,
         LatentLawConsumed::EstimatedGaussianAdequate { residual: None, .. }
@@ -4033,13 +4035,29 @@ fn fit_bernoulli_marginal_slope_terms_under(
             ..
         } = &mut latent_law_consumed
         {
+            let test = noise
+                .declared_gaussian_loss_test(certificate.residual_energy)
+                .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+            if test.refused {
+                return Err(FitFailure::raised(
+                    FailureCategory::Input,
+                    super::LatentLawRefusal::DeclaredGaussianAnchoringLoss {
+                        context: gate_context.to_string(),
+                        certificate,
+                        test,
+                        adequacy: adequacy.ledger(),
+                    }
+                    .to_string(),
+                ));
+            }
             log::debug!(
                 "[{gate_context} latent-z] the declared Gaussian law is fitted although the score \
                  fails the standard-normal adequacy screen (adequacy ledger, x = statistic / \
                  bound, x<=1 passed: {}); the declaration's estimated excess anchoring loss at \
-                 the converged fit: {} (gam#2926)",
+                 the converged fit: {}; {} (gam#2926, gam#2968)",
                 adequacy.ledger(),
-                certificate.summary()
+                certificate.summary(),
+                test.summary()
             );
             *residual = Some(certificate);
         } else if let LatentLawConsumed::EstimatedGaussianAdequate {

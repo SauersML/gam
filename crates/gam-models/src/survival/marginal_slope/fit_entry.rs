@@ -2672,7 +2672,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // the residual is the closed form's under it.
     //
     // A declared Gaussian law whose score failed the screen is measured the same
-    // way and kept, with the measurement warned about.
+    // way: refused when its excess anchoring loss is beyond that measurement's
+    // sampling noise at its least-favourable null law (gam#2968), and kept
+    // otherwise.
     let mut latent_law_consumed = latent_calibration.consumed.clone();
     let certificate_pending = matches!(
         &latent_law_consumed,
@@ -2777,13 +2779,28 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             ..
         } = &mut latent_law_consumed
         {
+            let test = noise
+                .declared_gaussian_loss_test(certificate.residual_energy)
+                .map_err(FitFailure::numerical)?;
+            if test.refused {
+                return Err(FitFailure::input(
+                    crate::bms::LatentLawRefusal::DeclaredGaussianAnchoringLoss {
+                        context: "survival marginal-slope".to_string(),
+                        certificate,
+                        test,
+                        adequacy: adequacy.ledger(),
+                    }
+                    .to_string(),
+                ));
+            }
             log::debug!(
                 "[survival-marginal-slope latent-z] the declared Gaussian law is fitted although \
                  the score fails the standard-normal adequacy screen (adequacy ledger, x = \
                  statistic / bound, x<=1 passed: {}); the declaration's estimated excess \
-                 anchoring loss at the converged fit: {} (gam#2926)",
+                 anchoring loss at the converged fit: {}; {} (gam#2926, gam#2968)",
                 adequacy.ledger(),
-                certificate.summary()
+                certificate.summary(),
+                test.summary()
             );
             *residual = Some(certificate);
         } else if let crate::bms::LatentLawConsumed::EstimatedGaussianAdequate {

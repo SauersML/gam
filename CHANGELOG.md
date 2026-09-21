@@ -13,6 +13,22 @@
   `parse_status_kb`, `parse_status_count` and `parse_io_bytes` were three copies of
   "the integer after the key"; they are replaced by `parse_proc_value`, which takes the
   first whitespace-separated token after the key for `status` and `io` lines alike.
+- **A Gaussian latent declaration that misstates its anchor is refused** (gam#2968).
+  `latent_measure="gaussian"`, `frozen_score=True` and the CTN chain on a Bernoulli or
+  survival marginal-slope fit whose score fails the standard-normal adequacy screen
+  used to be fitted with a warning whatever the departure cost. The declaration is now
+  refused when its residual energy `T = Σ w r²/(π(1−π))` against the estimated law's
+  anchor is beyond the upper `α = 10⁻³` tail of the least-favourable loss-free law
+  `λ₁·χ²₁(N/λ₁) + Σ_{k≥2} λ_k·χ²₁`, where `λ_k` are the eigenvalues of the estimated
+  law's anchoring noise and `N = Σ λ_k`: of every bias whose excess anchoring loss
+  `D̂ = T − 2N` has a non-positive mean, the one on the top eigenvector gives `T` its
+  heaviest upper tail. The p-value is that law's tail with certified bounds (a Poisson
+  mixture of central weighted chi-square tails, and Cantelli), so the refusal has size
+  exactly `α` at the least-favourable null and at most `α` at every other loss-free
+  one. The message gives `D̂`, the p-value bounds and the failed ledger.
+  **Behavior change:** such declarations now raise instead of returning a fitted
+  model; drop the declaration to anchor on the estimated law.
+
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
   point. `cholesky_solve_gpu`, which also returned a log-determinant that no caller read, is

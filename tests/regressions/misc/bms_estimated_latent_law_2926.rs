@@ -16,8 +16,10 @@
 //!    on that law. The default fit anchors on the law it estimates from the
 //!    score; the Gaussian form is reached through a declared Gauss–Hermite law,
 //!    which is its anchor to quadrature tolerance (claim 2). A Gaussian
-//!    declaration on this score is fitted with a warning, and records a positive
-//!    excess anchoring loss. The default and the Gaussian form are judged against the
+//!    declaration on this score is refused (gam#2968): its excess anchoring loss
+//!    is beyond its sampling noise, the residual energy far past the
+//!    least-favourable loss-free law's upper 1e-3 tail. The default and the
+//!    Gaussian form are judged against the
 //!    TRUE law, in closed form: `E[Φ(α + b·z)] = Σ_j p_j Φ((α + b·μ_j)/√(1 + b²σ_j²))`
 //!    for a normal mixture.
 //! 2. **On a Gaussian score the declared law and the closed form agree to
@@ -386,20 +388,21 @@ fn default_law_is_calibrated_on_a_skewed_score_and_the_gaussian_form_is_not_2926
     let law = Mixture::skewed();
     let (data, x) = skewed_fixture();
 
-    // A Gaussian declaration on this score is fitted, not refused: the score's
-    // conditional moments do not move, and the failed shape screen is a warning.
-    // What the declaration costs is recorded beside it, and on a law this skewed
-    // its excess anchoring loss is several times its sampling noise.
-    let declared = fit(&data, &x, &config(Some("gaussian"), None));
-    assert_eq!(declared.law, "declared-gaussian");
-    let Some(declared_certificate) = declared.certificate.as_ref() else {
-        panic!("a declaration whose score fails the screen must record its excess anchoring loss")
+    // A Gaussian declaration on this score is refused (gam#2968): the score fails
+    // the standard-normal screen, and at the converged declared fit the closed
+    // form's excess anchoring loss is beyond its sampling noise at the
+    // least-favourable null, so the declared anchor misstates the probabilities
+    // it anchors.
+    let refusal = match fit_from_formula("y ~ x", &data, &config(Some("gaussian"), None)) {
+        Ok(_) => panic!("a Gaussian declaration on this skewed score must be refused"),
+        Err(error) => error.to_string(),
     };
     assert!(
-        declared_certificate.excess_kl > 0.0 && !declared_certificate.closed_form_chosen,
-        "on a skewed score the declaration's excess anchoring loss must be positive: \
-         {declared_certificate:?}"
+        refusal.contains("excess anchoring loss is beyond its sampling noise")
+            && refusal.contains("Refused"),
+        "the declaration must be refused by its anchoring-loss test: {refusal}"
     );
+    eprintln!("[2926/2968 skewed] declared gaussian refused: {refusal}");
 
     let default = fit(&data, &x, &config(None, None));
     let gaussian = fit(
