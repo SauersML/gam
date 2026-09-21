@@ -6,19 +6,28 @@
 //! A seed's start value is an upper bound on the minimum of the basin it drains
 //! into, never a lower bound, so no comparison of start values can prove a seed
 //! dominated. With no valid lower bound on a basin, every declared start is
-//! searched. Each seed is its own complete, certified outer run on a lane: a task
+//! searched to completion unless a certified quorum releases it (see below).
+//! Each seed is its own complete, certified outer run on a lane: a task
 //! of the pool the caller runs on (the process worker pool, or a caller's own
 //! pool), with no more lanes than that pool has workers. A search starts only once
 //! the memory governor grants its predicted working set (SPEC 10); a lane refused
 //! while a search is live retires, and the next search to finish respawns it. Only certified runs compete:
 //! the lowest certified value wins, values within the criterion's rounding
-//! envelope of each other tie, and a tie goes to the lower seed index, so the
-//! winner depends neither on which run finished first nor on how many ran at once.
+//! envelope of each other tie, and a tie goes to the lower seed index, so among a
+//! FIXED set of certified runs the winner depends neither on which run finished
+//! first nor on how many ran at once.
 //!
 //! Once a second certified run confirms the optimum keep-best would publish, a
-//! seed still searching whose evidence cannot reach below it is released at its
-//! next evaluation ([`SeedQuorum`], #3325), so one slow seed no longer gates the
-//! fit after the others agree.
+//! seed still searching whose own local model no longer forecasts a value below
+//! it is released at its next evaluation ([`SeedQuorum`], #3325), so one slow seed
+//! no longer gates the fit after the others agree. A released seed never
+//! certifies, so the SET of certified runs — and with it the published run — is
+//! timing-dependent whenever a route declares an observation count. What the
+//! release test establishes is a property of the seed's own quadratic model over
+//! the feasible box, not of the objective, so a released seed is one the
+//! optimizer's own model says has nothing left to find, not one proved unable to
+//! find it. Determinism of the winner is therefore guaranteed only on a route
+//! with no observation count, where nothing is released.
 //!
 //! A finished run's payload (for a custom family, its terminal inner mode and
 //! every O(n) buffer that carries) is kept only while it can still be the one
@@ -313,9 +322,15 @@ fn publishable_payloads(values: &[Option<Option<f64>>]) -> Vec<bool> {
 /// never joins a quorum.
 ///
 /// A route that declares no observation count has no `τ`, and its multistart
-/// never releases a seed early. Which seeds are released depends on when the
-/// quorum forms, so the published run can differ with timing, but only among
-/// runs whose certified values lie within the tolerance of each other.
+/// never releases a seed early; only there is the published run timing-independent.
+/// Elsewhere, which seeds are released depends on when the quorum forms, and a
+/// released seed never certifies, so the published run is the keep-best of a
+/// timing-dependent SET of certified runs. The release test bounds the seed's own
+/// quadratic model over the feasible box, which is not a bound on the objective
+/// there, so a seed released before it left its current basin could in principle
+/// have certified below the floor. This is a deliberate trade of that possibility
+/// for the wall time of a search the optimizer's own model says has nothing left,
+/// not a proof that the released seed was dominated.
 ///
 /// [`DecrementTolerance`]: crate::rho_optimizer::decrement_bands::DecrementTolerance
 pub(super) struct SeedQuorum {
@@ -503,7 +518,8 @@ impl ReleasableSeed<'_> {
             }
             let note = format!(
                 "multistart seed {} released: a certified quorum confirmed the optimum keep-best \
-                 publishes, and this seed cannot reach below {floor:.9e} (lowest evaluated \
+                 publishes, and neither this seed's evaluations nor its own quadratic model over \
+                 the feasible box reaches below {floor:.9e} (lowest evaluated \
                  value {:.9e}, |g|={:.3e}, local-model minimum {forecast:.9e})",
                 self.handle.seed,
                 self.best_value,
