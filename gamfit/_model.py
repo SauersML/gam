@@ -1906,12 +1906,17 @@ class MultinomialModel:
         return labels
 
     def smooth_significance(self) -> list[dict[str, Any]]:
-        """Wood rank-truncated Wald smooth-term significance table (#1101).
+        """Variance-component score test of every smooth term (#1101, #3569).
 
-        One row per ``(active class, smooth term)`` with keys ``class``,
-        ``term``, ``edf``, ``ref_df``, ``statistic``, ``p_value`` from the Wood
-        rank-truncated Wald kernel. Empty
-        when the model has no smooth terms or no stored covariance.
+        One row per ``(active class, smooth term)`` testing the term's effect
+        on that class's log-odds against the reference class, plus, when there
+        are three or more classes, one ``contrast == "joint"`` row per term
+        testing that the term moves no class probability; that row does not
+        depend on which class is the reference. Keys: ``contrast``
+        (``"class"`` or ``"joint"``), ``class`` (``None`` on a joint row),
+        ``term``, ``edf``, ``ref_df``, ``statistic``, ``p_value`` and
+        ``p_value_unavailable``, the reason a row has no test (its numeric
+        fields are then ``None``). Empty when the model has no smooth terms.
         """
         try:
             return list(
@@ -1927,8 +1932,8 @@ class MultinomialModel:
         Rendered by the Rust ``MultinomialSavedModel::summary_text``: the
         selected per-class REML λ, the per-class hat-matrix trace (effective
         degrees of freedom) when the inference block is available, the
-        separation decision that fixed the published estimand, and the Wood
-        smooth-significance table.
+        separation decision that fixed the published estimand, and the
+        score-test smooth-significance table.
         """
         try:
             return str(rust_module().multinomial_summary_text_pyfunc(self._model_bytes))

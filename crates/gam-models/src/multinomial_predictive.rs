@@ -420,6 +420,19 @@ impl<'a> MultinomialPredictiveModel<'a> {
         gradient
     }
 
+    /// The training likelihood's gradient `∇ℓ(θ) = Xᵀ(y − p(θ))` and its Fisher
+    /// information `XᵀW(θ)X`, both in the stacked class-major order. The softmax
+    /// link is canonical, so the information is also the observed curvature.
+    pub(crate) fn likelihood_gradient_and_information(
+        &self,
+        theta: &[f64],
+    ) -> (Array1<f64>, Array2<f64>) {
+        let d = self.coefficient_dim();
+        let mut information = Array2::<f64>::zeros((d, d));
+        let negative_gradient = self.add_training_rows(theta, &mut information);
+        (-negative_gradient, information)
+    }
+
     /// Gradient of the NEGATIVE of [`Self::log_posterior`] and its Hessian, both
     /// in the stacked class-major order.
     fn gradient_and_precision(

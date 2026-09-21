@@ -50,7 +50,7 @@ use crate::model_types::result_types::UnifiedFitResult;
 use gam_terms::basis::{BasisMetadata, PenaltySource};
 use gam_terms::inference::random_effect_test::RandomEffectTestOutcome;
 use gam_terms::inference::smooth_score_test::{
-    ScoreTestScale, SmoothScoreTestInput, SmoothScoreTestRefusal, smooth_score_test,
+    ScoreTestScale, SmoothScoreTestInput, smooth_score_test,
 };
 use gam_terms::inference::smooth_test::SmoothTestResult;
 use gam_terms::smooth::{
@@ -346,21 +346,7 @@ impl<'a> ScoreTestFit<'a> {
             structural_penalties: &structural_penalties,
             scale: self.scale,
         })
-        .map_err(|refusal| match refusal {
-            SmoothScoreTestRefusal::InconsistentFit => {
-                SmoothPValueUnavailable::FitCurvatureUnavailable
-            }
-            SmoothScoreTestRefusal::UnpenalizedDirection => {
-                SmoothPValueUnavailable::UnpenalizedDirection
-            }
-            SmoothScoreTestRefusal::NotIdentified => SmoothPValueUnavailable::NotIdentified,
-            SmoothScoreTestRefusal::IndefiniteCurvature => {
-                SmoothPValueUnavailable::IndefiniteCurvature
-            }
-            SmoothScoreTestRefusal::ResidualDfUnavailable => {
-                SmoothPValueUnavailable::ResidualDfUnavailable
-            }
-        })
+        .map_err(SmoothPValueUnavailable::from)
     }
 }
 

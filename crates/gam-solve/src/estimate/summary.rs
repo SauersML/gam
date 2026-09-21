@@ -105,6 +105,24 @@ pub enum SmoothPValueUnavailable {
     RandomEffectTestNotRecorded,
 }
 
+impl From<gam_terms::inference::smooth_score_test::SmoothScoreTestRefusal>
+    for SmoothPValueUnavailable
+{
+    /// The score test's own refusal, named on the summary surface. One mapping
+    /// for every caller of the kernel, so the scalar and multinomial tables
+    /// cannot report the same refusal under different names.
+    fn from(refusal: gam_terms::inference::smooth_score_test::SmoothScoreTestRefusal) -> Self {
+        use gam_terms::inference::smooth_score_test::SmoothScoreTestRefusal as Refusal;
+        match refusal {
+            Refusal::InconsistentFit => Self::FitCurvatureUnavailable,
+            Refusal::UnpenalizedDirection => Self::UnpenalizedDirection,
+            Refusal::NotIdentified => Self::NotIdentified,
+            Refusal::IndefiniteCurvature => Self::IndefiniteCurvature,
+            Refusal::ResidualDfUnavailable => Self::ResidualDfUnavailable,
+        }
+    }
+}
+
 impl SmoothPValueUnavailable {
     /// Serialized label carried into the model payload and the Python surface.
     pub fn label(self) -> &'static str {

@@ -72,12 +72,39 @@ def test_smooth_significance_table_is_populated() -> None:
     sig = model.smooth_significance()
     assert isinstance(sig, list)
     assert len(sig) > 0
+    keys = (
+        "contrast",
+        "class",
+        "term",
+        "edf",
+        "ref_df",
+        "statistic",
+        "p_value",
+        "p_value_unavailable",
+    )
     for row in sig:
-        for key in ("class", "term", "edf", "ref_df", "statistic", "p_value"):
+        for key in keys:
             assert key in row
-        assert np.isfinite(row["edf"]) and row["edf"] > 0.0
-        assert np.isfinite(row["statistic"]) and row["statistic"] >= 0.0
-        assert 0.0 <= row["p_value"] <= 1.0
+        assert row["contrast"] in ("class", "joint")
+        if row["contrast"] == "class":
+            assert row["class"] in model.classes_
+        else:
+            assert row["class"] is None
+        if row["edf"] is not None:
+            assert np.isfinite(row["edf"]) and row["edf"] > 0.0
+        if row["p_value_unavailable"] is None:
+            assert np.isfinite(row["statistic"]) and row["statistic"] >= 0.0
+            assert np.isfinite(row["ref_df"]) and row["ref_df"] > 0.0
+            assert 0.0 <= row["p_value"] <= 1.0
+        else:
+            assert isinstance(row["p_value_unavailable"], str)
+            assert row["statistic"] is None and row["p_value"] is None
+    # One row per (active class, term) plus, for K >= 3, one joint row per term.
+    n_terms = 2
+    n_active = len(model.classes_) - 1
+    n_joint = n_terms if n_active >= 2 else 0
+    assert len(sig) == n_active * n_terms + n_joint
+    assert sum(row["p_value_unavailable"] is None for row in sig) > 0
     # The summary embeds the same table.
     text = model.summary()
     assert "smooth terms" in text
