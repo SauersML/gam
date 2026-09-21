@@ -3,6 +3,12 @@
 //! `[exp(-exp(eta + z*se)), exp(-exp(eta - z*se))]`. It used to be the
 //! posterior mean `+/- z*sd(S)` clamped to `[0, 1]`, which is not a central
 //! interval for a skewed `S` (one-tailed at either rail).
+//!
+//! The survival table's columns are the ones #4533 settled: `std_error` is the
+//! posterior SD of `survival_prob`, the response-scale quantity the band
+//! describes, and the link-scale SD of `eta` has its own `eta_std_error`
+//! column. The band bound this test reconstructs is `z` standard errors of
+//! ETA, so it reads `eta_std_error`.
 
 use std::process::Command;
 
@@ -86,6 +92,7 @@ fn cli_royston_parmar_survival_band_is_the_transformed_eta_interval_3560() {
             "survival_prob",
             "failure_prob",
             "risk_score",
+            "eta_std_error",
             "std_error",
             "mean_lower",
             "mean_upper"
@@ -115,10 +122,14 @@ fn cli_royston_parmar_survival_band_is_the_transformed_eta_interval_3560() {
                     .unwrap_or_else(|e| panic!("parse {c}: {e:?}"))
             })
             .collect();
-        let (eta, plugin, se, lo, hi) = (v[0], v[1], v[5], v[6], v[7]);
+        let (eta, plugin, eta_se, response_sd, lo, hi) = (v[0], v[1], v[5], v[6], v[7], v[8]);
         assert!(
-            se > 0.0,
-            "a fitted row must carry a positive eta SE, got {se}"
+            eta_se > 0.0,
+            "a fitted row must carry a positive eta SE, got {eta_se}"
+        );
+        assert!(
+            response_sd > 0.0,
+            "a fitted row must carry a positive survival-scale SD, got {response_sd}"
         );
         assert!(
             0.0 < lo && lo < hi && hi < 1.0,
@@ -129,7 +140,7 @@ fn cli_royston_parmar_survival_band_is_the_transformed_eta_interval_3560() {
             "row {rows}: the band [{lo}, {hi}] must contain the plug-in survival {plugin}"
         );
         if !constrained {
-            let (want_lo, want_hi) = (survival(eta + z * se), survival(eta - z * se));
+            let (want_lo, want_hi) = (survival(eta + z * eta_se), survival(eta - z * eta_se));
             for (got, want, side) in [(lo, want_lo, "lower"), (hi, want_hi, "upper")] {
                 assert!(
                     (got - want).abs() <= print_tol,
