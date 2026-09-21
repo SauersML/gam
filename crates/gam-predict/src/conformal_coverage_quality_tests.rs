@@ -170,8 +170,6 @@ fn predict_with_conformal(
         // Keep the model-based interval comparison clean: no extra coverage
         // inflation that would muddy the "plain interval under-covers" claim.
         includeobservation_interval: false,
-        edgeworth_one_sided: false,
-        boundary_correction: false,
         ..Default::default()
     };
     options.conformal_level = conformal_level;

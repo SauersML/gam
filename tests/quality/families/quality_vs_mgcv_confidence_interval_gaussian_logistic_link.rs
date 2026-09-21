@@ -133,9 +133,6 @@ fn confidence_intervals_cover_truth_under_logistic_link() {
                 covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
                 mean_interval_method: MeanIntervalMethod::Delta,
                 includeobservation_interval: false,
-                edgeworth_one_sided: false,
-                boundary_correction: false,
-                ood_inflation: false,
                 ..PredictUncertaintyOptions::default()
             };
             let offset = Array1::zeros(N);

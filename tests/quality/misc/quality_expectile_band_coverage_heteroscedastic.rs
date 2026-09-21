@@ -173,9 +173,6 @@ fn expectile_bands_cover_true_expectile_under_heteroscedastic_noise() {
         covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
         mean_interval_method: MeanIntervalMethod::Delta,
         includeobservation_interval: false,
-        edgeworth_one_sided: false,
-        boundary_correction: false,
-        ood_inflation: false,
         ..PredictUncertaintyOptions::default()
     };
 

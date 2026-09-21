@@ -122,9 +122,8 @@ fn simulate_dataset(
 
 /// The credible band at every training row under the requested configuration.
 ///
-/// Only the covariance mode is varied; the
-/// Edgeworth / boundary / OOD modifiers are held OFF (and no-op here anyway
-/// without their inputs) so the gate isolates the covariance-mode axis.
+/// Only the covariance mode is varied, so the gate isolates the
+/// covariance-mode axis.
 fn confidence_band(fit: &FitResult, level: f64, config: &BandConfig) -> (Array1<f64>, Array1<f64>) {
     let FitResult::Standard(standard) = fit else {
         panic!(
@@ -146,8 +145,6 @@ fn confidence_band(fit: &FitResult, level: f64, config: &BandConfig) -> (Array1<
         covariance_mode: config.covariance_mode,
         mean_interval_method: MeanIntervalMethod::TransformEta,
         includeobservation_interval: false,
-        edgeworth_one_sided: false,
-        boundary_correction: false,
         ..PredictUncertaintyOptions::default()
     };
     let result =

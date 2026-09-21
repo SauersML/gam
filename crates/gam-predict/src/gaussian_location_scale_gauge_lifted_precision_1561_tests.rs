@@ -121,8 +121,6 @@ fn gauge_lifted_precision_predicts_the_dense_covariance_bands_on_a_dropped_colum
     let options = PredictUncertaintyOptions {
         covariance_mode: InferenceCovarianceMode::Conditional,
         includeobservation_interval: false,
-        edgeworth_one_sided: false,
-        boundary_correction: false,
         ..Default::default()
     };
 
