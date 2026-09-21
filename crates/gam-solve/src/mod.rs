@@ -34,6 +34,7 @@ pub mod penalty_invariance;
 pub mod persistent_warm_start;
 pub mod pirls;
 pub(crate) mod priority_selection;
+pub mod profiled_rank_selection;
 pub mod progress_log;
 pub mod psi_gram_tensor;
 // Pareto-smoothed importance sampling (descended #1521): leaf numerics with no

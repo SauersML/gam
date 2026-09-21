@@ -4145,6 +4145,114 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
     })
 }
 
+/// Select a skip-transcoder style integer rank in `[0, max_rank]` with the
+/// continuous log-hyperparameters profiled at every visited rank (#3920).
+///
+/// `profile(evaluation_id, rank, log_hyperparameters, transition, warm_start)`
+/// is the inner fit: it fits rank `rank` at `log_hyperparameters` to
+/// convergence and returns `(value, gradient, gradient_scale)`, the negative
+/// log evidence, its analytic gradient in the log-hyperparameters and the
+/// positive magnitude of the terms that gradient is summed from.
+/// `transition` is `"seed"`, `"birth"`, `"death"` or `"continuous"`, and
+/// `warm_start` is the `evaluation_id` of an earlier fit to start from (or
+/// `None`). The BFGS profile, the stationarity certificate and the
+/// birth/death walk all run in
+/// `gam_solve::profiled_rank_selection`; an exception raised by `profile` is
+/// re-raised unchanged.
+///
+/// Returns JSON: `{"status": "selected", "selected": E, "death": E | null,
+/// "birth": E | null, "moves": [{"from_rank", "to_rank", "value_gap",
+/// "accepted"}], "evaluations": n}`, or `{"status": "non_converged",
+/// "evaluation": E, "reason": str}` when a rank's profile stopped without the
+/// certificate. Each `E` is `{"evaluation_id", "rank", "log_hyperparameters",
+/// "value", "gradient", "gradient_scale", "stationarity_defect",
+/// "stationarity_tolerance"}`.
+#[pyfunction]
+fn select_rank_with_profiled_hyperparameters(
+    initial_rank: usize,
+    max_rank: usize,
+    initial_log_hyperparameters: Vec<f64>,
+    profile: &Bound<'_, PyAny>,
+) -> PyResult<String> {
+    use gam::solver::profiled_rank_selection::{
+        ProfileEvaluation, ProfileQuery, ProfileSample, RankSelectionError,
+        select_rank_with_profiled_hyperparameters as select,
+    };
+
+    fn evaluation_json(evaluation: &ProfileEvaluation) -> serde_json::Value {
+        serde_json::json!({
+            "evaluation_id": evaluation.evaluation_id,
+            "rank": evaluation.rank,
+            "log_hyperparameters": evaluation.log_hyperparameters.to_vec(),
+            "value": evaluation.value,
+            "gradient": evaluation.gradient.to_vec(),
+            "gradient_scale": evaluation.gradient_scale,
+            "stationarity_defect": evaluation.stationarity_defect(),
+            "stationarity_tolerance": evaluation.stationarity_tolerance(),
+        })
+    }
+
+    let outcome = select(
+        initial_rank,
+        max_rank,
+        Array1::from_vec(initial_log_hyperparameters),
+        |query: &ProfileQuery| -> PyResult<ProfileSample> {
+            let (value, gradient, gradient_scale) = profile
+                .call1((
+                    query.evaluation_id,
+                    query.rank,
+                    query.log_hyperparameters.to_vec(),
+                    query.transition.as_str(),
+                    query.warm_start,
+                ))?
+                .extract::<(f64, Vec<f64>, f64)>()?;
+            Ok(ProfileSample {
+                value,
+                gradient: Array1::from_vec(gradient),
+                gradient_scale,
+            })
+        },
+    );
+    let out = match outcome {
+        Ok(selection) => serde_json::json!({
+            "status": "selected",
+            "selected": evaluation_json(&selection.selected),
+            "death": selection.death.as_ref().map(evaluation_json),
+            "birth": selection.birth.as_ref().map(evaluation_json),
+            "moves": selection
+                .moves
+                .iter()
+                .map(|step| {
+                    serde_json::json!({
+                        "from_rank": step.from_rank,
+                        "to_rank": step.to_rank,
+                        "value_gap": step.value_gap,
+                        "accepted": step.accepted,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "evaluations": selection.evaluations,
+        }),
+        Err(RankSelectionError::Oracle(error)) => return Err(error),
+        Err(RankSelectionError::NonConvergence { evaluation, reason }) => serde_json::json!({
+            "status": "non_converged",
+            "evaluation": evaluation_json(&evaluation),
+            "reason": reason,
+        }),
+        Err(error @ (RankSelectionError::InvalidRequest(_)
+        | RankSelectionError::InvalidSample { .. })) => {
+            return Err(py_value_error(format!(
+                "select_rank_with_profiled_hyperparameters: {error}"
+            )));
+        }
+    };
+    serde_json::to_string(&out).map_err(|err| {
+        py_value_error(format!(
+            "select_rank_with_profiled_hyperparameters: serialise: {err}"
+        ))
+    })
+}
+
 /// Solve the stacking-of-predictive-distributions weight problem over retained
 /// topology candidates (#768). `names` aligns with the columns of the
 /// row-major held-out log-predictive-density table `log_density_rows` (each

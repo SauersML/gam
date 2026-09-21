@@ -375,6 +375,7 @@ __all__ = [
     "saved_model_class_traits",
     "saved_model_kind",
     "select_probe_by_expected_evidence",
+    "select_rank_with_profiled_hyperparameters",
     "select_topology_candidate_lifecycle",
     "separation_limit",
     "shape_matched_control",
@@ -2140,6 +2141,8 @@ def saved_model_class_traits(model: _FittedModel) -> dict[Any, Any]: ...
 def saved_model_kind(model_bytes: Sequence[int]) -> str: ...
 
 def select_probe_by_expected_evidence(delta: NDArray[np.float64], predicted_mean_null: NDArray[np.float64], predicted_mean_alt: NDArray[np.float64], fisher: NDArray[np.float64]) -> dict[Any, Any] | None: ...
+
+def select_rank_with_profiled_hyperparameters(initial_rank: int, max_rank: int, initial_log_hyperparameters: Sequence[float], profile: object) -> str: ...
 
 def select_topology_candidate_lifecycle(request_json: str) -> str: ...
 

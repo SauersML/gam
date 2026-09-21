@@ -31,19 +31,23 @@ Outer-loop REML
 ``log(activation_threshold)`` continuously from an analytic evidence/gradient
 oracle supplied by the caller's PyTorch training loop. Rank remains genuinely
 discrete and is selected by evidence-priced sequential birth/death moves. The
-result carries the two-neighbour stop certificate; failed or non-stationary
-candidates are surfaced, never skipped or replaced.
+whole outer optimization (BFGS profile, stationarity certificate, rank walk)
+runs in Rust; this module only adapts the PyTorch oracle. The result carries
+the two-neighbour stop certificate; failed or non-stationary candidates are
+surfaced, never skipped or replaced.
 """
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from numbers import Integral, Real
-from typing import Callable, Literal
+from typing import Any, Callable, Literal
 
 import torch
 from torch import nn
 
+from .._binding import rust_module
 from .penalties import SmoothThresholdPenalty
 
 
@@ -349,30 +353,11 @@ class SkipTranscoderProfile:
     gradient_scale: float
 
     def __post_init__(self) -> None:
-        values = (
-            self.log_lambda_sparse,
-            self.log_activation_threshold,
-            self.negative_log_evidence,
-            *self.gradient_log_hyperparameters,
-            self.gradient_scale,
-        )
-        if not all(math.isfinite(float(value)) for value in values):
-            raise ValueError("SkipTranscoderProfile score jet must be finite")
-        if self.gradient_scale <= 0.0:
-            raise ValueError("SkipTranscoderProfile.gradient_scale must be > 0")
         if self.rank_skip != self.smooth.rank_skip:
             raise ValueError(
                 "SkipTranscoderProfile rank does not match its fitted smooth: "
                 f"{self.rank_skip} != {self.smooth.rank_skip}"
             )
-
-    @property
-    def stationarity_tolerance(self) -> float:
-        return math.sqrt(torch.finfo(torch.float64).eps) * self.gradient_scale
-
-    @property
-    def stationarity_defect(self) -> float:
-        return math.hypot(*self.gradient_log_hyperparameters)
 
 
 @dataclass(frozen=True)
@@ -407,16 +392,28 @@ class SkipTranscoderCandidateFailed(SkipTranscoderSelectionError):
 
 
 class SkipTranscoderContinuousNonConvergence(SkipTranscoderSelectionError):
-    """Continuous profiling stopped without a stationarity certificate."""
+    """Continuous profiling stopped without a stationarity certificate.
 
-    def __init__(self, profile: SkipTranscoderProfile, reason: str) -> None:
+    ``profile`` is the checkpoint the Rust profile stopped at;
+    ``stationarity_defect`` is its gradient norm and ``stationarity_tolerance``
+    the certificate bound it failed to meet.
+    """
+
+    def __init__(
+        self,
+        profile: SkipTranscoderProfile,
+        reason: str,
+        stationarity_defect: float,
+        stationarity_tolerance: float,
+    ) -> None:
         self.profile = profile
         self.reason = reason
+        self.stationarity_defect = stationarity_defect
+        self.stationarity_tolerance = stationarity_tolerance
         super().__init__(
             f"rank {profile.rank_skip} continuous evidence optimization did not "
-            f"converge ({reason}); stationarity defect "
-            f"{profile.stationarity_defect} exceeds "
-            f"{profile.stationarity_tolerance}"
+            f"converge ({reason}); stationarity defect {stationarity_defect} "
+            f"exceeds {stationarity_tolerance}"
         )
 
 
@@ -445,6 +442,8 @@ class SkipTranscoderSelectionCertificate:
     death: RankNeighbourCertificate
     birth: RankNeighbourCertificate
     transitions: tuple[RankTransition, ...]
+    stationarity_defect: float
+    stationarity_tolerance: float
 
 
 @dataclass(frozen=True)
@@ -473,124 +472,10 @@ class SkipTranscoderSelectionResult:
         return self.profile.negative_log_evidence
 
 
-def _evaluate_profile_trial(
-    profile_trial: ProfileTrial,
-    trial: SkipTranscoderTrial,
-) -> SkipTranscoderProfile:
-    outcome = profile_trial(trial)
-    if isinstance(outcome, SkipTranscoderFailedCandidate):
-        raise SkipTranscoderCandidateFailed(outcome)
-    if not isinstance(outcome, SkipTranscoderProfile):
-        raise TypeError(
-            "profile_trial must return SkipTranscoderProfile or "
-            "SkipTranscoderFailedCandidate"
-        )
-    if outcome.rank_skip != trial.rank_skip:
-        raise ValueError(
-            f"profile_trial returned rank {outcome.rank_skip} for rank "
-            f"{trial.rank_skip} trial"
-        )
-    coordinate_tolerance = math.sqrt(torch.finfo(torch.float64).eps)
-    for name, actual, requested in (
-        (
-            "log_lambda_sparse",
-            outcome.log_lambda_sparse,
-            trial.log_lambda_sparse,
-        ),
-        (
-            "log_activation_threshold",
-            outcome.log_activation_threshold,
-            trial.log_activation_threshold,
-        ),
-    ):
-        if abs(actual - requested) > coordinate_tolerance * (1.0 + abs(requested)):
-            raise ValueError(
-                f"profile_trial returned {name}={actual} for requested {requested}"
-            )
-    return outcome
-
-
-def _continuously_profile_rank(
-    profile_trial: ProfileTrial,
-    rank_skip: int,
-    initial_logs: tuple[float, float],
-    transition: TransitionKind,
-    warm_start: SkipAffineSmooth | None,
-) -> SkipTranscoderProfile:
-    """Profile two log-hyperparameters with analytic-gradient Torch LBFGS.
-
-    One strong-Wolfe LBFGS iteration is requested at a time. There is no
-    arbitrary iteration cap: the loop terminates only at the oracle-calibrated
-    stationarity tolerance or with a typed checkpoint when no representable
-    evidence-decreasing step remains.
-    """
-
-    logs = torch.tensor(initial_logs, dtype=torch.float64, requires_grad=True)
-
-    def evaluate(kind: TransitionKind, seed: SkipAffineSmooth | None) -> SkipTranscoderProfile:
-        return _evaluate_profile_trial(
-            profile_trial,
-            SkipTranscoderTrial(
-                rank_skip=rank_skip,
-                log_lambda_sparse=float(logs[0].detach()),
-                log_activation_threshold=float(logs[1].detach()),
-                transition=kind,
-                warm_start=seed,
-            ),
-        )
-
-    current = evaluate(transition, warm_start)
-    optimizer = torch.optim.LBFGS(
-        [logs],
-        max_iter=1,
-        tolerance_grad=0.0,
-        tolerance_change=0.0,
-        line_search_fn="strong_wolfe",
-    )
-    while current.stationarity_defect > current.stationarity_tolerance:
-        previous_coordinates = tuple(float(value) for value in logs.detach())
-        previous_score = current.negative_log_evidence
-        closure_seed = current.smooth
-
-        def closure() -> torch.Tensor:
-            optimizer.zero_grad()
-            profiled = evaluate("continuous", closure_seed)
-            gradient = torch.tensor(
-                profiled.gradient_log_hyperparameters,
-                dtype=logs.dtype,
-                device=logs.device,
-            )
-            # Value-matched linear surrogate: numeric value is the exact
-            # profiled evidence; backward is the oracle's analytic gradient.
-            loss = logs.new_tensor(profiled.negative_log_evidence) + (
-                (logs - logs.detach()) * gradient
-            ).sum()
-            # torch leaves ``Tensor.backward`` unannotated.
-            loss.backward()  # type: ignore[no-untyped-call]
-            return loss
-
-        # torch leaves ``LBFGS.step`` unannotated.
-        optimizer.step(closure)  # type: ignore[no-untyped-call]
-        current = evaluate("continuous", current.smooth)
-        coordinates = tuple(float(value) for value in logs.detach())
-        if coordinates == previous_coordinates:
-            raise SkipTranscoderContinuousNonConvergence(
-                current, "no representable parameter step remains"
-            )
-        score_roundoff = torch.finfo(torch.float64).eps * (
-            1.0 + abs(previous_score) + abs(current.negative_log_evidence)
-        )
-        if current.negative_log_evidence >= previous_score - score_roundoff:
-            raise SkipTranscoderContinuousNonConvergence(
-                current, "strong-Wolfe step did not decrease evidence"
-            )
-    return current
-
-
 def _rank_neighbour_certificate(
     direction: Literal["birth", "death"],
-    selected: SkipTranscoderProfile,
-    neighbour: SkipTranscoderProfile | None,
+    selected: dict[str, Any],
+    neighbour: dict[str, Any] | None,
 ) -> RankNeighbourCertificate:
     if neighbour is None:
         return RankNeighbourCertificate(
@@ -604,14 +489,12 @@ def _rank_neighbour_certificate(
         )
     return RankNeighbourCertificate(
         direction=direction,
-        rank_skip=neighbour.rank_skip,
+        rank_skip=int(neighbour["rank"]),
         structurally_feasible=True,
-        negative_log_evidence=neighbour.negative_log_evidence,
-        gap_from_selected=(
-            neighbour.negative_log_evidence - selected.negative_log_evidence
-        ),
-        stationarity_defect=neighbour.stationarity_defect,
-        stationarity_tolerance=neighbour.stationarity_tolerance,
+        negative_log_evidence=float(neighbour["value"]),
+        gap_from_selected=float(neighbour["value"]) - float(selected["value"]),
+        stationarity_defect=float(neighbour["stationarity_defect"]),
+        stationarity_tolerance=float(neighbour["stationarity_tolerance"]),
     )
 
 
@@ -628,10 +511,14 @@ def select_skip_transcoder(
 
     ``profile_trial`` is the PyTorch interaction boundary: for every requested
     rank and pair of log-hyperparameters it must train/profile the same evidence
-    to convergence and return its analytic two-vector gradient. Rank selection
-    starts at ``initial_rank``, evaluates every feasible birth/death neighbour,
-    moves only on strict evidence improvement, and stops only after both
-    neighbours have converged continuous optima that do not improve the fit.
+    to convergence and return its analytic two-vector gradient. The outer
+    optimization runs in Rust
+    (``gam_solve::profiled_rank_selection``): ``opt``'s BFGS profiles the two
+    log-hyperparameters at each visited rank to the certificate
+    ``‖∇‖₂ ≤ √ε · gradient_scale``, and the birth/death walk from
+    ``initial_rank`` moves only on strict evidence improvement, stopping after
+    both feasible neighbours have certified continuous optima that do not
+    improve the fit. Each distinct iterate is queried exactly once.
     """
 
     if in_dim <= 0 or out_dim <= 0:
@@ -649,90 +536,86 @@ def select_skip_transcoder(
     ):
         raise ValueError("initial_activation_threshold must be finite and > 0")
 
-    initial_logs = (
-        math.log(initial_lambda_sparse),
-        math.log(initial_activation_threshold),
-    )
     profiles: dict[int, SkipTranscoderProfile] = {}
-    transitions: list[RankTransition] = []
-    current = _continuously_profile_rank(
-        profile_trial,
-        initial_rank,
-        initial_logs,
-        "seed",
-        None,
+
+    def profile(
+        evaluation_id: int,
+        rank: int,
+        logs: list[float],
+        transition: TransitionKind,
+        warm_start: int | None,
+    ) -> tuple[float, list[float], float]:
+        trial = SkipTranscoderTrial(
+            rank_skip=rank,
+            log_lambda_sparse=logs[0],
+            log_activation_threshold=logs[1],
+            transition=transition,
+            warm_start=None if warm_start is None else profiles[warm_start].smooth,
+        )
+        outcome = profile_trial(trial)
+        if isinstance(outcome, SkipTranscoderFailedCandidate):
+            raise SkipTranscoderCandidateFailed(outcome)
+        if not isinstance(outcome, SkipTranscoderProfile):
+            raise TypeError(
+                "profile_trial must return SkipTranscoderProfile or "
+                "SkipTranscoderFailedCandidate"
+            )
+        requested = (rank, logs[0], logs[1])
+        returned = (
+            outcome.rank_skip,
+            outcome.log_lambda_sparse,
+            outcome.log_activation_threshold,
+        )
+        if returned != requested:
+            raise ValueError(
+                "profile_trial must profile exactly the requested "
+                "(rank_skip, log_lambda_sparse, log_activation_threshold): "
+                f"requested {requested}, returned {returned}"
+            )
+        profiles[evaluation_id] = outcome
+        return (
+            outcome.negative_log_evidence,
+            list(outcome.gradient_log_hyperparameters),
+            outcome.gradient_scale,
+        )
+
+    report = json.loads(
+        rust_module().select_rank_with_profiled_hyperparameters(
+            initial_rank,
+            structural_max_rank,
+            [math.log(initial_lambda_sparse), math.log(initial_activation_threshold)],
+            profile,
+        )
     )
-    profiles[initial_rank] = current
-
-    while True:
-        neighbours: list[SkipTranscoderProfile] = []
-        moves: tuple[tuple[int, Literal["death", "birth"]], ...] = (
-            (current.rank_skip - 1, "death"),
-            (current.rank_skip + 1, "birth"),
+    if report["status"] == "non_converged":
+        checkpoint = report["evaluation"]
+        raise SkipTranscoderContinuousNonConvergence(
+            profiles[checkpoint["evaluation_id"]],
+            report["reason"],
+            checkpoint["stationarity_defect"],
+            checkpoint["stationarity_tolerance"],
         )
-        for candidate_rank, direction in moves:
-            if not 0 <= candidate_rank <= structural_max_rank:
-                continue
-            candidate = profiles.get(candidate_rank)
-            if candidate is None:
-                candidate = _continuously_profile_rank(
-                    profile_trial,
-                    candidate_rank,
-                    (
-                        current.log_lambda_sparse,
-                        current.log_activation_threshold,
-                    ),
-                    direction,
-                    current.smooth,
-                )
-                profiles[candidate_rank] = candidate
-            neighbours.append(candidate)
-
-        best_neighbour = min(
-            neighbours,
-            key=lambda profile: profile.negative_log_evidence,
-            default=None,
-        )
-        evidence_tolerance = torch.finfo(torch.float64).eps * (
-            1.0
-            + abs(current.negative_log_evidence)
-            + (
-                0.0
-                if best_neighbour is None
-                else abs(best_neighbour.negative_log_evidence)
+    selected = report["selected"]
+    certificate = SkipTranscoderSelectionCertificate(
+        selected_rank=int(selected["rank"]),
+        death=_rank_neighbour_certificate("death", selected, report["death"]),
+        birth=_rank_neighbour_certificate("birth", selected, report["birth"]),
+        transitions=tuple(
+            RankTransition(
+                from_rank=int(move["from_rank"]),
+                to_rank=int(move["to_rank"]),
+                negative_log_evidence_gap=float(move["value_gap"]),
+                accepted=bool(move["accepted"]),
             )
-        )
-        improves = (
-            best_neighbour is not None
-            and best_neighbour.negative_log_evidence
-            < current.negative_log_evidence - evidence_tolerance
-        )
-        for neighbour in neighbours:
-            transitions.append(
-                RankTransition(
-                    from_rank=current.rank_skip,
-                    to_rank=neighbour.rank_skip,
-                    negative_log_evidence_gap=(
-                        neighbour.negative_log_evidence
-                        - current.negative_log_evidence
-                    ),
-                    accepted=improves and neighbour is best_neighbour,
-                )
-            )
-        if not improves or best_neighbour is None:
-            death = profiles.get(current.rank_skip - 1)
-            birth = profiles.get(current.rank_skip + 1)
-            certificate = SkipTranscoderSelectionCertificate(
-                selected_rank=current.rank_skip,
-                death=_rank_neighbour_certificate("death", current, death),
-                birth=_rank_neighbour_certificate("birth", current, birth),
-                transitions=tuple(transitions),
-            )
-            return SkipTranscoderSelectionResult(
-                profile=current,
-                certificate=certificate,
-            )
-        current = best_neighbour
+            for move in report["moves"]
+        ),
+        stationarity_defect=float(selected["stationarity_defect"]),
+        stationarity_tolerance=float(selected["stationarity_tolerance"]),
+    )
+    return SkipTranscoderSelectionResult(
+        profile=profiles[selected["evaluation_id"]],
+        certificate=certificate,
+    )
 
 
 __all__ = [
