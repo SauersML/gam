@@ -3189,5 +3189,13 @@
     ],
     "reason": "#3515: the DecoderIncoherence routing coactivation is frozen per assembly and carried through CollapsePreventionGates, so the line-search value and gradient see one gate. The live per-evaluation recomputation (live_decoder_incoherence_penalty) is replaced by decoder_incoherence_penalty over the frozen gate plus refresh_decoder_incoherence_gate at assembly/reset.",
     "evidence": "No remaining callers: the only call site in penalties.rs now reads decoder_incoherence_penalty(base) with the frozen gate; covered by gam-sae lib collapse_prevention and decoder_incoherence tests."
+  },
+  {
+    "base": "08628afb310729629275eb487e7714732662d59e",
+    "items": [
+      "crates/gam-models/src/survival/location_scale/numeric_guards.rs:fn:sanitize_survival_weight_vector"
+    ],
+    "reason": "#3650: sanitize_survival_weight_vector silently zeroed non-finite dense row weights. SPEC: \"In general, do not paper over solver issues.\" It is deleted. require_finite_row_weights now refuses a non-finite weight with a NumericalFailure naming the row, and the one legitimate case (a masked row times inf) is resolved at its source in the slot fill.",
+    "evidence": "dense_row_weighting_refuses_non_finite_row_weights pins the refusal in weighted_crossprod_dense_with_parallelism, scale_dense_rows and the DiagonalOnly Hessian path."
   }
 ]

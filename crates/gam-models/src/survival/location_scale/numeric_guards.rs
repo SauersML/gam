@@ -4,12 +4,11 @@
 //! Pure relocation from `survival_location_scale.rs` (issue #780
 //! decomposition): the layered overflow guards (`safe_product`, `safe_sum2/3`,
 //! `safe_product3`, `safe_hadamard_product`), the
-//! numerically stable `softplus`, the weight-vector sanitizer, and the
+//! numerically stable `softplus`, the finite row-weight gate, and the
 //! compensated (two-difference) subtraction carrying an explicit roundoff
 //! slack into the monotonicity gate. These are domain-agnostic numerical
 //! primitives that depend on nothing in the rest of the module beyond the
-//! family error type. No behavior change — bodies are byte-identical and the
-//! entry points are re-imported by the parent so every call site is unchanged.
+//! family error type; the parent re-imports them for every call site.
 
 use super::SurvivalLocationScaleError;
 use ndarray::Array1;
@@ -94,19 +93,22 @@ pub(super) fn safe_hadamard_product(
     Ok(out)
 }
 
-pub(super) fn sanitize_survival_weight_vector(weights: &Array1<f64>) -> Array1<f64> {
-    Array1::from_shape_fn(weights.len(), |i| {
-        let value = weights[i];
-        if value.is_finite() {
-            value
-        } else if value == f64::INFINITY {
-            f64::MAX
-        } else if value == f64::NEG_INFINITY {
-            f64::MIN
-        } else {
-            0.0
-        }
-    })
+/// Refuse a non-finite per-row weight or row-scaling coefficient.
+///
+/// A NaN or infinite row curvature is a numerical failure of the row kernel,
+/// not a row to drop (NaN → 0) or an infinite curvature to report as the
+/// finite `f64::MAX`. A zero-weight row contributes exactly 0 and is zeroed
+/// where its weight is applied, never here.
+pub(super) fn require_finite_row_weights(
+    weights: &Array1<f64>,
+    context: &str,
+) -> Result<(), SurvivalLocationScaleError> {
+    match weights.iter().position(|value| !value.is_finite()) {
+        None => Ok(()),
+        Some(row) => Err(SurvivalLocationScaleError::NumericalFailure {
+            reason: format!("{context}: row {row} has non-finite weight {}", weights[row]),
+        }),
+    }
 }
 
 #[derive(Clone, Copy)]

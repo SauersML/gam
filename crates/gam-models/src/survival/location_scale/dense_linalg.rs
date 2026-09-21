@@ -181,7 +181,7 @@ pub(crate) fn weighted_crossprod_dense_with_parallelism(
     }
 
     let nrows = weights.len();
-    let sanitized_weights = sanitize_survival_weight_vector(weights);
+    require_finite_row_weights(weights, "weighted_crossprod_dense")?;
     let work = (nrows as u64)
         .saturating_mul(left.ncols() as u64)
         .saturating_mul(right.ncols() as u64);
@@ -202,7 +202,7 @@ pub(crate) fn weighted_crossprod_dense_with_parallelism(
                     && !accumulate_weighted_crossprod_dense_rows(
                         &mut local,
                         left,
-                        &sanitized_weights,
+                        weights,
                         right,
                         start..end,
                     )
@@ -234,7 +234,7 @@ pub(crate) fn weighted_crossprod_dense_with_parallelism(
         let mut weighted_right = right.clone();
         let mut fast_path_ok = true;
         'outer: for i in 0..weighted_right.nrows() {
-            let wi = sanitized_weights[i];
+            let wi = weights[i];
             if wi == 0.0 {
                 weighted_right.row_mut(i).fill(0.0);
                 continue;
@@ -259,7 +259,7 @@ pub(crate) fn weighted_crossprod_dense_with_parallelism(
         }
     }
 
-    weighted_crossprod_dense_stable(left, &sanitized_weights, right)
+    weighted_crossprod_dense_stable(left, weights, right)
 }
 
 pub(crate) fn scale_dense_rows(
@@ -273,7 +273,7 @@ pub(crate) fn scale_dense_rows(
             coeffs.len()
         );
     }
-    let sanitized_coeffs = sanitize_survival_weight_vector(coeffs);
+    require_finite_row_weights(coeffs, "scale_dense_rows")?;
     let work = mat.nrows().saturating_mul(mat.ncols());
     let mut out = mat.clone();
 
@@ -292,13 +292,13 @@ pub(crate) fn scale_dense_rows(
             .for_each(|(chunk_idx, mut rows)| {
                 let start = chunk_idx * chunk_rows;
                 for (local_i, mut row) in rows.rows_mut().into_iter().enumerate() {
-                    let coeff = sanitized_coeffs[start + local_i];
+                    let coeff = coeffs[start + local_i];
                     row.mapv_inplace(|value| safe_product(value, coeff));
                 }
             });
     } else {
         for i in 0..out.nrows() {
-            let coeff = sanitized_coeffs[i];
+            let coeff = coeffs[i];
             out.row_mut(i)
                 .mapv_inplace(|value| safe_product(value, coeff));
         }

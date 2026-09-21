@@ -2563,6 +2563,40 @@ fn scale_dense_rows_saturates_without_nan_when_coefficients_are_huge() {
 }
 
 #[test]
+fn dense_row_weighting_refuses_non_finite_row_weights() {
+    // #3650: a NaN row weight used to drop the row (NaN -> 0) and an infinite
+    // one to report the finite f64::MAX; both are numerical failures.
+    let design = array![[1.0, 2.0], [3.0, 4.0]];
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let weights = array![1.0, bad];
+        let crossprod =
+            weighted_crossprod_dense_with_parallelism(&design, &weights, &design, faer::Par::Seq);
+        assert!(
+            crossprod.as_ref().is_err_and(|err| err.contains("row 1")),
+            "weight {bad}: {crossprod:?}"
+        );
+        let scaled = scale_dense_rows(&design, &weights);
+        assert!(
+            matches!(
+                scaled,
+                Err(SurvivalLocationScaleError::NumericalFailure { ref reason })
+                    if reason.contains("row 1")
+            ),
+            "coefficient {bad}: {scaled:?}"
+        );
+    }
+    // A zero weight still drops its row exactly.
+    let crossprod = weighted_crossprod_dense_with_parallelism(
+        &design,
+        &array![1.0, 0.0],
+        &design,
+        faer::Par::Seq,
+    )
+    .expect("finite weights");
+    assert_eq!(crossprod, array![[1.0, 2.0], [2.0, 4.0]]);
+}
+
+#[test]
 fn threshold_exact_newton_hessian_matches_negative_gradient_jacobian() {
     let family = survival_exact_newton_test_family();
     let beta_t = 0.35;
@@ -2902,7 +2936,17 @@ fn joint_exact_newton_score_matches_loglikelihoodfd_for_non_probit_links() {
 
 #[test]
 fn joint_exact_newton_log_sigma_block_matches_fd_in_far_exp_tail() {
-    let family = survival_exact_newton_test_family();
+    // Row 1 (censored, x_t = 0.4, x_σ = −0.3) is outside f64's range at this
+    // fixture: η_t = 0.4·1.01e303 = 4.06e302 and η_σ = −210.3, so its index
+    // `u = (h − η_t)·e^{−η_σ} ≈ −4.06e302 · 2.15e91 ≈ −8.7e393` overflows to
+    // −∞. Its curvature weight then comes out as NaN (seen at the FD points
+    // `β_σ = 701 ± 1e-4`), which the dense Hessian assembly refuses by name
+    // (#3650) instead of silently zeroing it. The row carries nothing the test
+    // pins (the score below is rows 0 and 2 only, and `log S(−∞) = 0`), so it
+    // is given prior weight 0, which drops it exactly at the row-kernel entry
+    // (`w <= 0` builds no kernel) on every path.
+    let mut family = survival_exact_newton_test_family();
+    family.w[1] = 0.0;
     let beta_time = array![0.2];
     let beta_threshold = array![0.1 * crate::sigma_link::safe_exp(700.0)];
     let beta_log_sigma0 = 701.0_f64;

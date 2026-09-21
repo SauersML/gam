@@ -110,8 +110,8 @@ mod numeric_guards;
 // can reach them through `use super::*` exactly as the pre-split single
 // namespace did. The primitives themselves are `pub(super)` in `numeric_guards`.
 pub(in crate::survival::location_scale) use numeric_guards::{
-    compensated_difference, safe_hadamard_product, safe_product, safe_product3, safe_sum2,
-    sanitize_survival_weight_vector, softplus,
+    compensated_difference, require_finite_row_weights, safe_hadamard_product, safe_product,
+    safe_product3, safe_sum2, softplus,
 };
 
 mod baseline_theta;
