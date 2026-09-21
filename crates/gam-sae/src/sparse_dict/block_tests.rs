@@ -1400,7 +1400,7 @@ fn greedy_admission_never_prices_worse_than_the_topk_quota_2825() {
     let mut decoder = Array2::<f32>::zeros((n_blocks * b, p));
     let mut state = 0x2825_u64;
     let mut next = || {
-        state = splitmix64_block(state);
+        state = splitmix64_hash(state);
         ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
     };
     for block in 0..n_blocks {
@@ -1848,7 +1848,7 @@ fn a_blocks_code_is_a_function_of_its_stored_span_2502() {
     let doubled_block = 2usize;
     let mut state = 0x2502_u64;
     let mut next = || {
-        state = splitmix64_block(state);
+        state = splitmix64_hash(state);
         ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
     };
     let mut decoder = Array2::<f32>::zeros((n_blocks * b, p));

@@ -522,12 +522,8 @@ fn topology_seed_harmonic_windows(
 
 /// splitmix64 → pseudo-random weight in `[-1, 1]`, keyed deterministically. No
 /// RNG crate: reproducible run-to-run and across thread/device counts.
-fn splitmix_unit(mut z: u64) -> f64 {
-    z = z.wrapping_add(0x9E3779B97F4A7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^= z >> 31;
-    (z as f64 / u64::MAX as f64) * 2.0 - 1.0
+fn splitmix_unit(z: u64) -> f64 {
+    (gam_linalg::utils::splitmix64_hash(z) as f64 / u64::MAX as f64) * 2.0 - 1.0
 }
 
 /// Deterministic distinct XOR salt per chart-function slot. Slots 0 and 1 keep the

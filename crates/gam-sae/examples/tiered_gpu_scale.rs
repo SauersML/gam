@@ -33,13 +33,11 @@
 //! raised toward the #2023 `N=1e5` target. Device admission depends on `minibatch·K`
 //! (not `N`), so routing engages at `K≈1e4` at any `N`.
 
+use gam_linalg::utils::splitmix64_hash;
 use gam_sae::tiered::{TieredFitConfig, fit_tiered};
 use ndarray::Array2;
 use std::process::ExitCode;
 use std::time::Instant;
-
-mod common;
-use common::splitmix64;
 
 struct Args {
     rows: usize,
@@ -137,7 +135,7 @@ fn planted_activations(rows: usize, p: usize) -> Array2<f64> {
     let mut dirs = vec![0.0f64; n_dirs * p];
     let mut state = 0x2545_f491_4f6c_dd1du64;
     for slot in dirs.iter_mut() {
-        state = splitmix64(state);
+        state = splitmix64_hash(state);
         *slot = ((state >> 11) as f64) * (1.0 / ((1u64 << 53) as f64)) - 0.5;
     }
     Array2::from_shape_fn((rows, p), |(i, c)| {

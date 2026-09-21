@@ -1058,11 +1058,9 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
 /// value at a given global draw index.
 #[inline]
 fn indexed_replicate_seed(seed: u64, draw_index: u64) -> u64 {
-    let mut value =
-        seed.wrapping_add(0x9E3779B97F4A7C15_u64.wrapping_mul(draw_index.wrapping_add(1)));
-    value = (value ^ (value >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94D049BB133111EB);
-    value ^ (value >> 31)
+    gam_linalg::utils::splitmix64_hash(
+        seed.wrapping_add(0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(draw_index)),
+    )
 }
 
 /// Draw a seekable range of independently seeded replicate chunks.

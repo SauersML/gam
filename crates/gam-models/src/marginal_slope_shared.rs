@@ -33,6 +33,7 @@
 use crate::cubic_cell_kernel::{self, DenestedPartitionCell, LocalSpanCubic};
 use crate::custom_family::{CustomFamilyBlockPsiDerivative, ParameterBlockSpec};
 use crate::outer_subsample::{OuterScoreSubsample, WeightedOuterRow};
+use gam_linalg::utils::splitmix64;
 use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
 use gam_math::nested_dual::JetField;
 use ndarray::{Array1, Array2, Axis};
@@ -832,13 +833,6 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
 // This module defines only the types and helpers; Phase 2 wires them into
 // per-row hot loops. Default state (`outer_score_subsample = None`) keeps the
 // legacy full-data behavior bit-for-bit.
-
-/// Splitmix64: deterministic single-u64 expansion. Thin wrapper over the
-/// canonical implementation in [`gam_linalg::utils::splitmix64`].
-#[inline]
-const fn splitmix64(state: &mut u64) -> u64 {
-    gam_linalg::utils::splitmix64(state)
-}
 
 /// Noise floor on the automatic outer-score subsample size `K`.
 ///

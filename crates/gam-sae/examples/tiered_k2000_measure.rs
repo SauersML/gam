@@ -31,15 +31,13 @@
 //! exactly, so the control measures whether the curved atoms can still find the
 //! ring on the peeled residual.
 
+use gam_linalg::utils::splitmix64_hash;
 use gam_sae::manifold::{SaeSupportSparseFit, SaeSupportSparseFitRequest, fit_sae_support_sparse};
 use gam_sae::sparse_dict::{block_sparse_dictionary_transform, reconstruct_block_sparse_rows};
 use gam_sae::tiered::{TieredFitConfig, fit_tiered};
 use ndarray::{Array1, Array2, ArrayView2, Axis};
 use std::process::ExitCode;
 use std::time::Instant;
-
-mod common;
-use common::splitmix64;
 
 struct Args {
     train_rows: usize,
@@ -126,19 +124,19 @@ fn planted(n: usize, p: usize, n_circles: usize, n_linear: usize, index_base: u6
             x[[i, 2 * c + 1]] = theta.sin() as f32;
         }
         // Linear bulk: shared ramp directions with per-row random amplitudes.
-        let mut s = splitmix64(gi ^ 0x51ed_2701_a13f_7c4d);
+        let mut s = splitmix64_hash(gi ^ 0x51ed_2701_a13f_7c4d);
         for l in 0..n_linear {
             let col = lin_start + l;
             if col >= p {
                 break;
             }
-            s = splitmix64(s);
+            s = splitmix64_hash(s);
             let amp = ((s >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0;
             x[[i, col]] += amp as f32;
         }
         // Light deterministic noise on any remaining columns.
         for col in (lin_start + n_linear)..p {
-            s = splitmix64(s);
+            s = splitmix64_hash(s);
             let noise = (((s >> 11) as f64 / (1u64 << 53) as f64) - 0.5) * 0.02;
             x[[i, col]] = noise as f32;
         }
@@ -254,7 +252,7 @@ fn ring_control() -> Result<(), String> {
         ring[[i, 0]] = theta.cos();
         ring[[i, 1]] = theta.sin();
         for c in 0..p {
-            s = splitmix64(s);
+            s = splitmix64_hash(s);
             let noise = (((s >> 11) as f64 / (1u64 << 53) as f64) - 0.5) * 0.04;
             let signal = if c < 2 { ring[[i, c]] } else { 0.0 };
             z[[i, c]] = signal + noise;

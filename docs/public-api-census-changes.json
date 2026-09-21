@@ -5144,5 +5144,14 @@
     },
     "reason": "PKG-01 fork safety (#3189): gam no longer builds rayon's global pool, which a fork()ed child cannot rebuild. run_on_single_worker_pool moved a driver onto a one-thread global pool; every entry point now runs on the one process worker pool in gam_runtime::parallel (parallel::install), which is rebuilt in a forked child.",
     "evidence": "No source reference to run_on_single_worker_pool remains. tests/fork_safety.rs fits in a forked child after the parent used the pool; the multistart lane tests (multistart_tests.rs) run the lanes as tasks of the caller's pool through parallel::fan_out, and a_lane_refused_beside_a_live_search_retires_at_once_instead_of_waiting_2359 pins the non-blocking admission those pool-task lanes need."
+  },
+  {
+    "base": "a022dd5e672406ab853e3d4a4ca508be0705067a",
+    "removed": {
+      "crates/gam-sae/examples/common/mod.rs::splitmix64": 1,
+      "crates/gam-sae/src/manifold/support_seed.rs::splitmix64": 1
+    },
+    "reason": "#4454: two wrappers that only forwarded to gam_linalg::utils::splitmix64 under a local name are deleted; callers call the canonical SplitMix64 directly (single source of truth).",
+    "evidence": "https://github.com/SauersML/gam/issues/4454: examples/common/mod.rs held only the wrapper and is deleted with the three `mod common;` declarations in scale_k, tiered_gpu_scale and tiered_k2000_measure; the two call sites inside support_seed.rs now call gam_linalg::utils::splitmix64_hash (the wrapper had no caller outside that file); git grep finds no remaining caller of the removed paths."
   }
 ]

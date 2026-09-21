@@ -1,3 +1,4 @@
+use gam_linalg::utils::splitmix64_hash;
 use gam_sae::front_door::admit_sae_fit;
 use gam_sae::sparse_dict::{
     BlockSparseConfig, BlockSparseStreamState, coordinate_partition_frames,
@@ -9,9 +10,6 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-
-mod common;
-use common::splitmix64;
 
 #[derive(Clone, Debug)]
 struct Args {
@@ -733,7 +731,7 @@ fn deterministic_unit_vector(p: usize) -> Vec<f64> {
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut out = vec![0.0f64; p];
     for value in &mut out {
-        state = splitmix64(state);
+        state = splitmix64_hash(state);
         let unit = ((state >> 11) as f64) * (1.0 / ((1u64 << 53) as f64));
         *value = unit - 0.5;
     }

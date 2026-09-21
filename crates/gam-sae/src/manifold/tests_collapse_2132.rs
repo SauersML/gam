@@ -37,21 +37,13 @@ use gam_linalg::faer_ndarray::FaerSvd;
 // `eval_efs` is a method of the `OuterObjective` trait (impl for
 // SaeManifoldOuterObjective); the trait must be in scope to call it on the
 // production objective, the same import the sibling #1782 seed-eval test uses.
+use gam_linalg::utils::splitmix64_hash;
 use gam_solve::rho_optimizer::OuterObjective;
 use ndarray::{Array2, ArrayView2};
 
-/// splitmix64 mixer — deterministic, reproducible across threads / devices; no
-/// RNG crate dependency (mirrors `pca_seed::splitmix_unit`).
-fn splitmix_u64(mut z: u64) -> u64 {
-    z = z.wrapping_add(0x9E3779B97F4A7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^ (z >> 31)
-}
-
 /// splitmix64 → `[0, 1)`.
 fn splitmix01(z: u64) -> f64 {
-    (splitmix_u64(z) >> 11) as f64 / (1u64 << 53) as f64
+    (splitmix64_hash(z) >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// Single-active planted circle mixture: `n` rows, ambient dim `p`, `c` circles.
@@ -64,7 +56,7 @@ fn planted_circle_mixture(n: usize, p: usize, c: usize, sigma: f64, phase_key: u
     assert!(p >= 2 * c, "need p >= 2C for disjoint circle planes");
     let mut z = Array2::<f64>::zeros((n, p));
     for row in 0..n {
-        let circle = (splitmix_u64(row as u64 ^ 0x1234_5678_9abc_def0) % c as u64) as usize;
+        let circle = (splitmix64_hash(row as u64 ^ 0x1234_5678_9abc_def0) % c as u64) as usize;
         let theta = std::f64::consts::TAU
             * splitmix01((row as u64).wrapping_mul(0x100000001b3) ^ phase_key);
         let (cos, sin) = (theta.cos(), theta.sin());

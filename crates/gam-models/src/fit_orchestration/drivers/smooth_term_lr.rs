@@ -2721,7 +2721,7 @@ fn stratum_permutation(coordinate: usize, draws: usize) -> Vec<u32> {
     let mut state =
         0x9E37_79B9_7F4A_7C15_u64 ^ (coordinate as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
     for position in (1..order.len()).rev() {
-        state = split_mix64(state);
+        state = gam_linalg::utils::splitmix64_hash(state);
         let pick = (state % (position as u64 + 1)) as usize;
         order.swap(position, pick);
     }
@@ -2771,16 +2771,6 @@ fn stratified_chi_square(degrees_of_freedom: usize, coordinate: usize, draws: us
             gam_math::probability::chi_square_quantile(uniform, degrees_of_freedom)
         })
         .collect()
-}
-
-/// SplitMix64, used only to permute the strata. Any full-period mixer would do;
-/// what matters is that it is a pure function of an index.
-#[inline]
-fn split_mix64(state: u64) -> u64 {
-    let mut z = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
 }
 
 /// The reference distribution [`SmoothTermLrInference`] scores its statistic
@@ -5064,9 +5054,10 @@ mod selection_replay_tests {
         AxisSlice, DiagonalCriterion, ObservedDraw, SMOOTH_LR_SELECTION_DRAWS,
         SelectionDrawStream, SelectionFactor, SelectionGeometry, SmoothLrSelection,
         SmoothLrSelectionDecline, SmoothLrReferenceDf, SmoothLrReferenceSource,
-        SmoothLrSelectionProfile, SmoothLrSelectionReplay, paired_mean_with_error, split_mix64,
+        SmoothLrSelectionProfile, SmoothLrSelectionReplay, paired_mean_with_error,
         stratified_chi_square,
     };
+    use gam_linalg::utils::splitmix64_hash;
     use ndarray::Array2;
 
     /// #4086 sibling: the paired-difference spread is two-pass centred, so it
@@ -5383,7 +5374,7 @@ mod selection_replay_tests {
     /// the replay's own strata do not share (Box–Muller on SplitMix64 words).
     fn observation(rep: u64, dimension: usize) -> Vec<f64> {
         let unit = |counter: u64| {
-            ((split_mix64(0xC0FF_EE00_0000_0000 ^ counter) >> 11) as f64 + 0.5)
+            ((splitmix64_hash(0xC0FF_EE00_0000_0000 ^ counter) >> 11) as f64 + 0.5)
                 * (-53.0_f64).exp2()
         };
         (0..dimension as u64)
@@ -6161,7 +6152,7 @@ mod selection_replay_tests {
         let windows = [(-42.0_f64, 18.0_f64), (-18.0, 42.0)];
         let mut state = 0x2902_0004_u64;
         let mut uniform = move || {
-            state = split_mix64(state);
+            state = splitmix64_hash(state);
             (state >> 11) as f64 / (1u64 << 53) as f64
         };
         for (label, geometry, whole_box) in [
@@ -6421,7 +6412,7 @@ mod selection_replay_tests {
     fn brute_force_normals(seed: u64, count: usize) -> Vec<f64> {
         let mut state = seed;
         let mut uniform = || {
-            state = split_mix64(state);
+            state = splitmix64_hash(state);
             ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
         };
         (0..count)

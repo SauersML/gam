@@ -21,11 +21,7 @@ impl Splitmix64 {
 
     /// Advance the state and return the raw 64-bit output.
     pub fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^ (z >> 31)
+        gam_linalg::utils::splitmix64(&mut self.state)
     }
 
     /// Uniform sample in `[0, 1)` (53-bit mantissa).
