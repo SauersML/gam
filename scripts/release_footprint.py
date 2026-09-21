@@ -93,10 +93,10 @@ def read_by_compiler(target_dir: pathlib.Path, tree: pathlib.Path) -> set[str]:
     return read
 
 
-def is_packaging_metadata(path: str, python_package: str) -> bool:
+def is_packaging_metadata(path: str, python_package: str, build_backend: set[str]) -> bool:
     """Files the sdist needs for what they declare, not for what rustc reads."""
     parts = pathlib.PurePosixPath(path).parts
-    if parts[-1] == "Cargo.toml":
+    if parts[-1] == "Cargo.toml" or path in build_backend:
         return True
     if len(parts) == 1:
         return parts[0] in {"PKG-INFO", "pyproject.toml", "Cargo.lock", "rust-toolchain.toml"} or parts[
@@ -107,8 +107,23 @@ def is_packaging_metadata(path: str, python_package: str) -> bool:
     return parts[0] == python_package
 
 
-def unread_files(members: list[str], read: set[str], python_package: str) -> list[str]:
-    return sorted(m for m in members if m not in read and not is_packaging_metadata(m, python_package))
+def build_backend_files(pyproject: dict) -> set[str]:
+    """The in-tree build backend pip imports from ``[build-system] backend-path``:
+    the module ``build-backend`` names, as a file or a package, under each path."""
+    system = pyproject.get("build-system", {})
+    module = system.get("build-backend", "").split(":")[0]
+    files = set()
+    for root in system.get("backend-path", []):
+        base = pathlib.PurePosixPath(root, *module.split("."))
+        files.add(f"{base}.py")
+        files.add((base / "__init__.py").as_posix())
+    return files
+
+
+def unread_files(members: list[str], read: set[str], python_package: str, build_backend: set[str]) -> list[str]:
+    return sorted(
+        m for m in members if m not in read and not is_packaging_metadata(m, python_package, build_backend)
+    )
 
 
 def sdist_members(sdist: pathlib.Path) -> tuple[str, list[str]]:
@@ -129,13 +144,16 @@ def check_sdist(sdist: pathlib.Path, target_dir: pathlib.Path) -> None:
             archive.extractall(scratch, filter="data")
         tree = pathlib.Path(scratch) / root
         with (tree / "pyproject.toml").open("rb") as handle:
-            module = tomllib.load(handle)["tool"]["maturin"]["module-name"]
+            pyproject = tomllib.load(handle)
+        module = pyproject["tool"]["maturin"]["module-name"]
         subprocess.run(
             ["cargo", "check", "--locked", "--workspace", "--target-dir", str(target_dir)],
             cwd=tree,
             check=True,
         )
-        unread = unread_files(members, read_by_compiler(target_dir, tree), module.split(".")[0])
+        unread = unread_files(
+            members, read_by_compiler(target_dir, tree), module.split(".")[0], build_backend_files(pyproject)
+        )
     size = sdist.stat().st_size
     print(f"{sdist.name}: {size / MIB:.2f} MiB, {len(members)} files, compiles with its Cargo.lock")
     if unread:

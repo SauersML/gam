@@ -24,6 +24,21 @@
 // `#[pymodule] _rust` registration in `manifold/geometry_ffi.rs` lives at the
 // crate root.
 mod dense_linalg_ffi;
+/// The interpreter every bare `cargo test` of this crate attaches to. The
+/// extension runs inside a live interpreter; a test binary links libpython and
+/// must start one, which `Python::initialize` does once per process. pyo3's
+/// `auto-initialize` feature did this for the tests but refuses to build a
+/// wheel against an interpreter that embeds statically (the manylinux
+/// free-threaded cp314t), so the tests initialize explicitly.
+#[cfg(test)]
+mod test_support {
+    use pyo3::Python;
+
+    pub(crate) fn attach<R>(f: impl for<'py> FnOnce(Python<'py>) -> R) -> R {
+        Python::initialize();
+        Python::attach(f)
+    }
+}
 mod event_history_ffi;
 mod term_realization_ffi;
 mod ffi;

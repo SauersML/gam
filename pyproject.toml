@@ -169,7 +169,6 @@ exclude = [
   { path = "!crates/gam-runtime/src/test_support.rs", format = "sdist" },
   { path = "!crates/gam-models/src/fit_orchestration/drivers/*_tests.rs", format = "sdist" },
   { path = "!crates/gam-sae/src/manifold/tests_topology_fixtures.rs", format = "sdist" },
-  { path = "!crates/gam-solve/src/reml/glm_outer_hessian_fd_tests.rs", format = "sdist" },
   { path = "!crates/gam-terms/src/smooth/term_specs_tests.rs", format = "sdist" },
 ]
 # One `include` list. crates/gam-cli is not a dependency of the extension, so

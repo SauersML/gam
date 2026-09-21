@@ -1471,7 +1471,7 @@ mod sae_spectral_ffi_tests {
         assert!(report.diagram.holonomy_certificate.is_none());
         assert_eq!(report.diagram.certified_orientability(), None);
 
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             let dict = atlas_nerve_dict(py, Some(&report), "unused").unwrap();
             assert!(
                 dict.get_item("euler_characteristic")
@@ -1551,7 +1551,7 @@ mod sae_spectral_ffi_tests {
             .unwrap();
         assert!(report.diagram.holonomy_certificate.is_some());
 
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             let dict = atlas_nerve_dict(py, Some(&report), "unused").unwrap();
             let status: String = dict
                 .get_item("holonomy_status")
@@ -1713,7 +1713,7 @@ mod sae_spectral_ffi_tests {
             ambient[[row, 2]] = 0.05 * (2.0 * angle).cos();
         }
 
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             let indices_py = indices.clone().into_pyarray(py);
             let values_py = values.clone().into_pyarray(py);
             let ambient_py = ambient.clone().into_pyarray(py);
@@ -1809,7 +1809,7 @@ mod sae_spectral_ffi_tests {
 
     #[test]
     fn audit_sae_round_trip_surfaces_external_dictionary_diagnostics() {
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             let decoder = ndarray::array![[1.0_f32, 0.0_f32], [0.0_f32, 1.0_f32]];
             let codes = ndarray::array![
                 [1.0_f32, 0.0_f32],
@@ -1937,7 +1937,7 @@ mod sae_spectral_ffi_tests {
 
     #[test]
     fn audit_sae_options_rejects_unknown_keys() {
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             let options = PyDict::new(py);
             options
                 .set_item("block_sise", 2)
@@ -2441,7 +2441,7 @@ mod ffi_completeness_tests {
 
     #[test]
     fn conditional_coactivation_influence_surfaces_conditional_probability() {
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             // Rows 0,1 fire gate i; only row 0 also fires gate j. With equal
             // weights, P(j|i) = joint_mass / active_mass_i = (1/3)/(2/3) = 0.5.
             let out = conditional_coactivation_influence(
@@ -2474,7 +2474,7 @@ mod ffi_completeness_tests {
 
     #[test]
     fn coupling_robustness_certificate_surfaces_worst_case_coupling() {
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             // Perfectly correlated gate streams -> rho = 1; at epsilon = 0 the
             // worst-case coupling equals rho (no distribution shift budget).
             let out = coupling_robustness_certificate(
@@ -2503,7 +2503,7 @@ mod ffi_completeness_tests {
 
     #[test]
     fn effect_weighted_retention_ors_variance_and_effect_margins() {
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             // Atom 0: variance margin 2.0-0.5>0 and two firings of local-KL 1.0
             // clear the BIC price -> retained. Atom 1: no variance, one firing of
             // 0.01 below the price -> not retained.
@@ -2555,7 +2555,7 @@ mod ffi_completeness_tests {
 
     #[test]
     fn chart_interp_score_quotients_orientation_over_the_ffi_boundary() {
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             // Recovered coordinate runs backwards relative to the cyclic label;
             // the orientation-quotiented score still locks phase, and the signed
             // score records the reversal.
@@ -2671,7 +2671,7 @@ mod ffi_completeness_tests {
 
     #[test]
     fn dose_response_calibration_reports_slope_and_unit_speed_constancy() {
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             let out = dose_response_calibration(
                 py,
                 vec![
@@ -2701,7 +2701,7 @@ mod ffi_completeness_tests {
 
     #[test]
     fn coordinate_posterior_inverts_precision_block_over_the_ffi_boundary() {
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             let out =
                 coordinate_posterior_from_precision(py, vec![0.25, 0.75], vec![4.0, 1.0, 1.0, 3.0])
                     .expect("coordinate posterior");

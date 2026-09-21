@@ -16,7 +16,9 @@ pub mod atoms;
 pub(crate) mod continuation;
 pub(crate) mod eval;
 mod firth;
+#[cfg(test)]
 mod gaussian_sufficient_statistics_tests;
+#[cfg(test)]
 mod glm_outer_hessian_fd_tests;
 pub(super) mod hyper;
 mod inner_strategy;

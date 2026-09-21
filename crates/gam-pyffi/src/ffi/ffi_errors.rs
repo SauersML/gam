@@ -1196,12 +1196,12 @@ mod fit_failure_dispatch_tests {
     use gam::families::fit_orchestration::FitFailure;
 
     fn raise(failure: FitFailure) -> PyErr {
-        Python::attach(|py| workflow_error_to_pyerr(py, WorkflowError::Fit(failure)))
+        crate::test_support::attach(|py| workflow_error_to_pyerr(py, WorkflowError::Fit(failure)))
     }
 
     #[test]
     fn each_fit_failure_category_raises_its_own_class_2937() {
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             let seeds = raise(FitFailure::from(EstimationError::StartupSeedsRefused(
                 "no candidate seeds passed outer startup validation (custom family):".to_string(),
             )));
@@ -1277,7 +1277,7 @@ mod fit_failure_dispatch_tests {
 
     #[test]
     fn a_fit_exception_carries_the_variant_category_and_full_chain_2937() {
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             let seeds = EstimationError::StartupSeedsRefused(
                 "no candidate seeds passed outer startup validation (custom family):".to_string(),
             );
@@ -1305,7 +1305,7 @@ mod fit_failure_dispatch_tests {
 
     #[test]
     fn a_direct_estimation_invariant_raises_the_invariant_class_2937() {
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             let err = estimation_error_to_pyerr(EstimationError::FitResultInvariantViolated(
                 "UnifiedFitResult inference conditional covariance must match top-level \
                  covariance_conditional"
@@ -1342,7 +1342,7 @@ mod fit_failure_dispatch_tests {
                 ErrorCategory::Internal => py.get_type::<InternalError>(),
             }
         }
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             let estimation: [fn() -> EstimationError; 7] = [
                 || EstimationError::InvalidSpecification("bad".to_string()),
                 || EstimationError::InvalidInput("bad".to_string()),
@@ -1388,7 +1388,7 @@ mod fit_failure_dispatch_tests {
     #[test]
     fn a_fit_ending_without_a_certified_inner_mode_raises_its_class_with_the_evidence_2943() {
         use gam::families::custom_family::CustomFamilyError as EngineCustomFamilyError;
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             let terminal = EngineCustomFamilyError::fit_ended_without_certified_inner_mode(
                 uncertified_inner_solve(),
             );
@@ -1505,7 +1505,7 @@ mod saved_model_error_dispatch_tests {
     /// attributes, not an untyped refusal that cannot be told from any other.
     #[test]
     fn a_refused_saved_model_raises_its_category_with_its_variant_3008() {
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             let refused = crate::load_model_impl(b"{\"not\": \"a saved model\"}")
                 .err()
                 .expect("bytes that are not a saved model must be refused");

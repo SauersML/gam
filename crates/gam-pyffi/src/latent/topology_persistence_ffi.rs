@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn topology_persistence_payload_surfaces_covering_side() {
-        Python::attach(|py| {
+        crate::test_support::attach(|py| {
             let report = AtomTopologyPersistence {
                 raced_kind: SaeAtomBasisKind::Periodic,
                 support_size: 48,

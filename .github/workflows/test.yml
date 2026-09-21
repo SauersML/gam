@@ -563,9 +563,9 @@ jobs:
           name: nx-pyffi-archive
 
       # The gam-pyffi unit tests are archived with `--no-default-features`, so
-      # PyO3's `extension-module` is OFF and the harness LINKS libpython. With
-      # the crate's default-off-here `auto-initialize` feature, `Python::attach`
-      # initializes that SAME system `python3` the `build` job linked the archive
+      # PyO3's `extension-module` is OFF and the harness LINKS libpython. The
+      # crate's `test_support::attach` initializes that SAME system `python3` the
+      # `build` job linked the archive
       # against (nothing sets PYO3_PYTHON, so both jobs resolve `/usr/bin/python3`
       # on the identical ubuntu-latest image). Two tests drive the NumPy C-API
       # via `numpy::IntoPyArray::into_pyarray`

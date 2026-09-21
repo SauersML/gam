@@ -67,7 +67,15 @@ class UnreadFileTests(unittest.TestCase):
             "Cargo.toml", "Cargo.lock", "pyproject.toml", "PKG-INFO", "README_PYPI.md",
             "LICENSE", "rust-toolchain.toml", "crates/gam-x/Cargo.toml", "gamfit/__init__.py",
         ):
-            self.assertTrue(release_footprint.is_packaging_metadata(path, "gamfit"), path)
+            self.assertTrue(release_footprint.is_packaging_metadata(path, "gamfit", set()), path)
+
+    def test_the_in_tree_build_backend_is_read_by_pip_not_rustc(self):
+        pyproject = {"build-system": {"build-backend": "gamfit_version", "backend-path": ["scripts"]}}
+        backend = release_footprint.build_backend_files(pyproject)
+        self.assertEqual(backend, {"scripts/gamfit_version.py", "scripts/gamfit_version/__init__.py"})
+        self.assertTrue(release_footprint.is_packaging_metadata("scripts/gamfit_version.py", "gamfit", backend))
+        self.assertFalse(release_footprint.is_packaging_metadata("scripts/other.py", "gamfit", backend))
+        self.assertEqual(release_footprint.build_backend_files({}), set())
 
     def test_test_modules_fixtures_and_benches_are_refused(self):
         members = [
@@ -80,7 +88,7 @@ class UnreadFileTests(unittest.TestCase):
             "gamfit/__init__.py",
         ]
         self.assertEqual(
-            release_footprint.unread_files(members, {"crates/gam-x/src/lib.rs"}, "gamfit"),
+            release_footprint.unread_files(members, {"crates/gam-x/src/lib.rs"}, "gamfit", set()),
             [
                 "bench/run.py",
                 "crates/gam-x/benches/fit.rs",
