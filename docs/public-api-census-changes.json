@@ -5119,5 +5119,13 @@
     },
     "reason": "#3130 (9fe4f35c): the survival location-scale diagonal-only coefficient Hessian target existed only to feed the scale-coupled trust-metric floor and its ridge escalation, deleted in 1f05ba27 as a reactive floor SPEC forbids. With that floor gone nothing reads it: the coupled exact-Newton step uses DenseFull and the per-block inner Newton uses BlockDiagonal.",
     "evidence": "git grep finds no into_diagonal_only anywhere in crates/ tests/ at the head; its one caller (family_solver.rs trust-metric floor) is deleted in the same PR."
+  },
+  {
+    "base": "f5930beca8e6b774e426c13bf165f822a5e8e920",
+    "removed": {
+      "crates/gam-terms/src/basis/implicit_psi_derivative.rs::project_design": 1
+    },
+    "reason": "#3001 step 2: the fit formed a gauged smooth's X*T0 - C*R through FixedRowSpaceProjector::project_design's own lazy block operator, while a saved model's replay formed it through subtract_row_space_correction, so the two evaluated different products. project_design is replaced by FixedRowSpaceProjector::row_space_correction, which returns R only; realize_smooth_collection_gauge then forms X*T0 - C*R through subtract_row_space_correction, the operator the replay uses.",
+    "evidence": "At base 988f269d7e, git grep -n project_design finds the pub(crate) declaration (crates/gam-terms/src/basis/implicit_psi_derivative.rs:152), its one production caller (crates/gam-terms/src/smooth/term_design.rs:1315) and one unit-test call (implicit_psi_derivative.rs:4164). Both callers now use row_space_correction; the unit test asserts that value - C*R equals the dense projector and is collection-orthogonal. git grep -w -c project_design at the head gives 0. The same removal is acknowledged in docs/source-removal-changes.json."
   }
 ]
