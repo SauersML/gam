@@ -38,6 +38,28 @@
   **Behavior change:** a fit or prediction that used to return after quietly discarding
   a row, or after saturating its curvature, now fails with a `NumericalFailure` naming
   the row. The remedy is the model or the data at that row, not a retry.
+- **Owned-mode custom-family fits publish their hyperparameter smoothing correction** (gam#2677).
+  `fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance`, the entry the
+  spatial and joint-hyper fits assemble their certified mode through, hard-coded
+  `smoothing_corrected: None` and `smoothing_correction_absence: None`. So
+  `beta_covariance_corrected()` returned `None` whenever a smoothing coordinate existed,
+  the first-order uncertainty in both the smoothing parameters `rho` and the family
+  hyperparameters `psi` was dropped, and no typed reason was published for the absence.
+  At the converged mode the implicit function theorem over `theta = [rho | psi]` gives
+  `d beta / d theta_o = -H^-1 U[:, o]` with `U = [lambda_k S_k beta | g_j]`, so the
+  correction is `C = A V_theta A^T` with `A = V U`, and `Vp = V + C`. The owned-mode fit
+  now mints exactly that, through the same `first_order_smoothing_correction` the
+  rho-only path uses, with `V_theta` the identified-subspace inverse of the certified
+  outer Hessian over the same `theta`: rails are excluded and directions under the
+  certificate's gradient floor are dropped. The `psi` columns are the fixed-beta
+  inner-gradient scores the owning evaluation already assembles, captured before
+  `ExtCoordBundle::scaled`, because the curvature scale multiplies both `H` and `g` and
+  the natural frame is the one `V` and the `rho` columns are in. Where no correction can
+  be minted the absence is now typed rather than silent.
+  **Behavior change:** standard errors and intervals from spatial and joint-hyper
+  custom-family fits now carry the smoothing and hyperparameter uncertainty, so they are
+  wider than the conditional ones they used to report, and a fit that cannot mint the
+  correction says which reason applies instead of returning `None`.
 - **Multinomial smooth significance is a softmax score test, and the saved model format
   moves to version 3** (#3569, #1101). `MultinomialSavedModel::smooth_significance` ran a
   per-class Wood rank-truncated Wald test. It now runs the shared variance-component score
