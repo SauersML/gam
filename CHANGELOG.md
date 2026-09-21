@@ -60,6 +60,22 @@
   where it used to drop the offending entries and return a report, the circle transport
   dict gains a `max_angle_gap` key, and holonomy verdicts move because the tolerance is
   now an angle in radians rather than a dimensionless variance.
+- **A Duchon SAE atom's default center budget is derived from the rows** (gam#3826).
+  `sae_build_atom_plans` capped every Duchon atom without a discovery override at
+  `max(center_floor, 32)`, which the code itself called "the fixed economy ceiling".
+  Nothing derived 32 and it did not move with the row count, and because the
+  flat/EuclideanPatch discovery winner is installed as `duchon` with no override it hit
+  the cap as well. The budget is now `default_num_centers(n_obs, d)`, gam-terms'
+  production budget for a radial smooth over `d` coordinates on `n_obs` rows, which grows
+  as `n^0.4` and stays at or below `n/4`, floored as before at the identifiability bound
+  `nullspace + d + 1`. The ample budget is used rather than the `starting_num_centers`
+  pilot because an SAE atom's resolution is fixed once it is planned and no adequacy loop
+  grows it later, so the pilot's role as a refinable lower bound does not apply here;
+  under-provisioning caps reconstruction, while over-provisioning is shrunk away by the
+  atom's own REML lambda. The #2240 discovery override path is unchanged.
+  **Behavior change:** Duchon atom resolutions move in both directions at `d = 2`, from
+  32 centers to 10 at `n = 40`, to 146 at `n = 1000` and to 253 at `n = 4000`. Fits
+  whose atoms were pinned at the ceiling will reconstruct differently.
 - **Multinomial smooth significance is a softmax score test, and the saved model format
   moves to version 3** (#3569, #1101). `MultinomialSavedModel::smooth_significance` ran a
   per-class Wood rank-truncated Wald test. It now runs the shared variance-component score
