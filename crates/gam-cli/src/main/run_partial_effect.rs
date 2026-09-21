@@ -24,7 +24,7 @@ fn read_labelled_grid(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>), St
     Ok((header, rows))
 }
 
-pub(crate) fn run_partial_effect(args: PartialEffectArgs) -> Result<(), String> {
+pub(crate) fn run_partial_effect(args: PartialEffectArgs) -> CliResult<()> {
     reject_multinomial_model(&args.model, "partial-effect")?;
     let model = SavedModel::load_from_path(&args.model)?;
     let grid = match &args.grid {
@@ -58,7 +58,8 @@ pub(crate) fn run_partial_effect(args: PartialEffectArgs) -> Result<(), String> 
                     return Err(format!(
                         "partial-effect --out must end in .csv or .json; got '{}'",
                         path.display()
-                    ));
+                    )
+                    .into());
                 }
             };
             std::fs::write(path, body)

@@ -40,7 +40,7 @@ fn print_multicoordinate_alo(alo: &gam_predict::SavedModelAloDiagnostics) {
     cli_out!("{table}");
 }
 
-pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
+pub(crate) fn run_diagnose(args: DiagnoseArgs) -> CliResult<()> {
     // `diagnose` currently has exactly one diagnostic, ALO, so it is always
     // run.  Do not expose a boolean that cannot alter this behavior: the old
     // `--alo` flag was a silent no-op.
@@ -54,11 +54,9 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     // from the per-knot posterior. Surface a precise error rather than the
     // cryptic missing-resolved_termspec one (#1046).
     if model.spline_scan.is_some() {
-        return Err(
-            "diagnose --alo cannot replay this spline-scan model because its \
+        return Err("diagnose cannot replay this spline-scan model because its \
              saved state has no coefficient-space penalized Hessian"
-                .to_string(),
-        );
+            .into());
     }
     // A residual-cascade model (#1032) is the multi-resolution analogue: the
     // scattered low-d smooth is routed through the multilevel Wendland
@@ -68,9 +66,9 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     // the downstream missing-resolved_termspec one.
     if model.residual_cascade.is_some() {
         return Err(
-            "diagnose --alo cannot replay this residual-cascade model because \
+            "diagnose cannot replay this residual-cascade model because \
              its saved state has no coefficient-space penalized Hessian"
-                .to_string(),
+                .into(),
         );
     }
     let ds = load_datasetwith_model_schema_for_diagnostics(&args.data, &model)?;
@@ -78,8 +76,10 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     let col_map = ds.column_map();
     let y_col = resolve_saved_alo_response_col(&model, &parsed, &col_map)?;
     let y = ds.values.column(y_col).to_owned();
-    let weights = resolve_weight_column(&ds, &col_map, model.weight_column.as_deref())
-        .map_err(|error| format!("failed to resolve saved diagnose weights: {error}"))?;
+    let weights =
+        resolve_weight_column(&ds, &col_map, model.weight_column.as_deref()).map_err(|error| {
+            CliError::from(error).context("failed to resolve saved diagnose weights")
+        })?;
     let (offset, noise_offset) = report_offset_for(&model, &ds, &col_map)?;
     let input = build_saved_alo_predict_input(
         &model,
@@ -98,7 +98,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             prior_weights: &weights,
         },
     )
-    .map_err(|error| format!("saved-model ALO failed: {error}"))?;
+    .map_err(|error| CliError::from(error).context("saved-model ALO failed"))?;
     print_multicoordinate_alo(&alo);
 
     // Model-comparison corroboration channels (#946): exact smoothing-corrected
@@ -128,7 +128,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             weights.view(),
             Some(eta_loo.view()),
         )
-        .map_err(|err| format!("cannot resolve model-comparison dispersion: {err}"))?;
+        .map_err(|err| CliError::from(err).context("cannot resolve model-comparison dispersion"))?;
         let mut summary = Table::new();
         summary
             .load_preset(UTF8_FULL)

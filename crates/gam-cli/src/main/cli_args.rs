@@ -111,7 +111,8 @@ pub(crate) enum Command {
     /// Evaluate a marginal-slope model's conditional latent residual
     /// `(z − m(a))/√v(a)` on a dataset.
     LatentResidual(LatentResidualArgs),
-    /// Compute diagnostics (residuals, calibration, optional ALO) on a dataset.
+    /// Compute approximate leave-one-out (ALO) diagnostics and the model-comparison
+    /// criteria (corrected AIC, PSIS-LOO) on a dataset.
     Diagnose(DiagnoseArgs),
     /// Evaluate one term's partial effect with pointwise and simultaneous bands.
     PartialEffect(PartialEffectArgs),

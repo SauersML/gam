@@ -65,11 +65,8 @@ pub(crate) fn load_fit_dataset_with_roles(
     load_dataset_auto_projected_with_categorical_roles(path, requested_columns, &role_refs)
 }
 
-pub(crate) fn load_datasetwith_model_schema(
-    path: &Path,
-    model: &SavedModel,
-) -> Result<Dataset, String> {
-    load_datasetwith_model_schema_extra(path, model, &[]).map_err(String::from)
+pub(crate) fn load_datasetwith_model_schema(path: &Path, model: &SavedModel) -> CliResult<Dataset> {
+    load_datasetwith_model_schema_extra(path, model, &[])
 }
 
 /// Load a dataset for a *post-fit diagnostic* command (diagnose / sample /
@@ -86,9 +83,9 @@ pub(crate) fn load_datasetwith_model_schema(
 pub(crate) fn load_datasetwith_model_schema_for_diagnostics(
     path: &Path,
     model: &SavedModel,
-) -> Result<Dataset, String> {
+) -> CliResult<Dataset> {
     let extras = model.diagnostic_extra_columns()?;
-    load_datasetwith_model_schema_extra(path, model, &extras).map_err(String::from)
+    load_datasetwith_model_schema_extra(path, model, &extras)
 }
 
 /// Load a new-data file against a fitted model's schema, keeping only the
@@ -123,9 +120,7 @@ pub(crate) fn load_datasetwith_model_schema_columns(
     model: &SavedModel,
     columns: &[String],
 ) -> CliResult<Dataset> {
-    let schema = model
-        .require_data_schema()
-        .map_err(|err| CliError::from(err.to_string()))?;
+    let schema = model.require_data_schema()?;
     let policy =
         UnseenCategoryPolicy::encode_unknown_for_columns(model.random_effect_group_columns());
     // The typed `DataError` keeps its advice through `?`: a NaN cell or an

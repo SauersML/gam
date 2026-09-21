@@ -92,6 +92,9 @@ fn cli_fit_bad_inputs_exit_with_their_category_and_name_the_offending_input() {
     );
 }
 
+/// A saved model the engine cannot read is a data refusal
+/// (`FittedModelError::error_category`), the category `gamfit.load` raises for
+/// the same file, on every command that loads one.
 #[test]
 fn every_post_fit_command_rejects_a_bad_model_with_a_named_error() {
     let scratch = tempfile::tempdir().expect("scratch directory");
@@ -106,22 +109,27 @@ fn every_post_fit_command_rejects_a_bad_model_with_a_named_error() {
 
     for args in [
         vec!["predict", model, data, "--out", out],
+        vec!["transformation-score", model, data, "--out", out],
+        vec!["latent-residual", model, data, "--out", out],
         vec!["diagnose", model, data],
+        vec!["residuals", model, data, "--type", "response"],
+        vec!["partial-effect", model, "--term", "s(x)"],
+        vec!["summary", model],
+        vec!["compare", model],
         vec!["sample", model, data, "--out", out],
         vec!["generate", model, data, "--out", out],
         vec!["report", model, data, out],
     ] {
         let output = gam(&args);
+        let error = stderr(&output);
         assert_eq!(
             output.status.code(),
-            exit_code(gam::ErrorCategory::Formula),
-            "args={args:?}: {}",
-            stderr(&output)
+            exit_code(gam::ErrorCategory::Data),
+            "args={args:?}: {error}"
         );
         assert!(
-            stderr(&output).contains("corrupt-model.gam"),
-            "args={args:?}: {}",
-            stderr(&output)
+            error.contains("failed to parse model") && error.contains("corrupt-model.gam"),
+            "args={args:?}: {error}"
         );
     }
 }
@@ -174,12 +182,12 @@ fn a_smooth_of_a_string_column_is_a_formula_error_naming_the_column() {
     assert_eq!(by_factor.status.code(), Some(0), "{}", stderr(&by_factor));
 }
 
-#[test]
-fn cli_predict_names_the_refused_cell_and_prints_its_remedy() {
-    let scratch = tempfile::tempdir().expect("scratch directory");
-    let training = scratch.path().join("training.csv");
-    let model = scratch.path().join("model.gam");
-    let out = scratch.path().join("predictions.csv");
+/// Fit `y ~ s(x) + g + factor(k)` on a 90-row table with a string factor `g`
+/// (levels `L0..L2`) and a numeric-coded factor `k` (codes `0..2`), returning
+/// the saved model's path.
+fn fit_factor_fixture(scratch: &std::path::Path) -> std::path::PathBuf {
+    let training = scratch.join("training.csv");
+    let model = scratch.join("model.gam");
     let mut rows = String::from("y,x,g,k\n");
     for i in 0..90 {
         let x = f64::from(i) / 90.0;
@@ -200,6 +208,14 @@ fn cli_predict_names_the_refused_cell_and_prints_its_remedy() {
         model.to_str().expect("UTF-8 path"),
     ]);
     assert!(fit.status.success(), "{}", stderr(&fit));
+    model
+}
+
+#[test]
+fn cli_predict_names_the_refused_cell_and_prints_its_remedy() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let model = fit_factor_fixture(scratch.path());
+    let out = scratch.path().join("predictions.csv");
 
     let predict = |name: &str, body: &str| {
         let path = scratch.path().join(name);
@@ -251,6 +267,67 @@ fn cli_predict_names_the_refused_cell_and_prints_its_remedy() {
             assert!(
                 error.contains(needle),
                 "{name}: missing {needle:?} in\n{error}"
+            );
+        }
+    }
+}
+
+/// The post-fit commands load their data through the same model-schema loader
+/// as `predict`, so a refused cell exits with the data category and prints the
+/// typed refusal's `help:` line on every one of them, not a bare message under
+/// the invocation category.
+#[test]
+fn post_fit_commands_keep_the_data_refusal_category_and_remedy() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let model = fit_factor_fixture(scratch.path());
+    let data = scratch.path().join("labeled_nan.csv");
+    std::fs::write(&data, "y,x,g,k\n1.0,0.5,L0,0\n2.0,NaN,L1,1\n").expect("write labeled fixture");
+    let model = model.to_str().expect("UTF-8 path");
+    let data = data.to_str().expect("UTF-8 path");
+    let sample_out = scratch.path().join("posterior.csv");
+    let generate_out = scratch.path().join("generated.csv");
+    let report_out = scratch.path().join("report.html");
+    let commands: [Vec<&str>; 5] = [
+        vec!["residuals", model, data, "--type", "response"],
+        vec!["diagnose", model, data],
+        vec![
+            "sample",
+            model,
+            data,
+            "--out",
+            sample_out.to_str().expect("UTF-8 path"),
+        ],
+        vec![
+            "generate",
+            model,
+            data,
+            "--out",
+            generate_out.to_str().expect("UTF-8 path"),
+        ],
+        vec![
+            "report",
+            model,
+            data,
+            report_out.to_str().expect("UTF-8 path"),
+        ],
+    ];
+    for command in commands {
+        let output = gam(&command);
+        let error = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            exit_code(gam::ErrorCategory::Data),
+            "{}: {error}",
+            command[0]
+        );
+        for needle in [
+            "non-finite value at row 2, column 'x'",
+            "help: Drop or impute",
+        ] {
+            assert!(
+                error.contains(needle),
+                "{}: missing {needle:?} in\n{error}",
+                command[0]
             );
         }
     }
