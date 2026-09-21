@@ -2278,14 +2278,19 @@ pub(crate) fn fit_materialized_standard_with_notes(
 ///   unrelated improper-prior normalizers;
 /// * the difference exceeds the error both fits certify for their own
 ///   criterion value ([`certified_evidence_gain`]); a difference inside that
-///   error is not evidence and the smaller basis stands.
+///   error is not evidence and the smaller basis stands;
+/// * a refit that does not CONVERGE certifies nothing either, so it closes the
+///   attempt on that same rule and the certified incumbent stands (#4529). It
+///   is the absence of evidence, not a verdict on the model the caller asked
+///   for: this loop proposes every level unconditionally, so a refusal there is
+///   the outcome of an experiment the engine chose to run.
 ///
 /// Every refinement proposes the whole chain level at once, jointly for the
 /// terms that fit the residual rank together, then alone in formula order. A
-/// term whose single refinement is not certified better, or whose realized
-/// refinement is not nested, is closed and never proposed again, so the loop
-/// terminates after at most one rejected refit per term plus one accepted refit
-/// per level grown.
+/// term whose single refinement is not certified better, whose refit did not
+/// converge, or whose realized refinement is not nested, is closed and never
+/// proposed again, so the loop terminates after at most one rejected refit per
+/// term plus one accepted refit per level grown.
 fn finish_adaptive_spatial_fit(
     formula: &str,
     data: &Dataset,
@@ -2293,9 +2298,10 @@ fn finish_adaptive_spatial_fit(
     mut current: FormulaFitResult,
 ) -> Result<FormulaFitResult, WorkflowError> {
     let mut open: Option<Vec<bool>> = None;
+    let mut declined: Vec<String> = Vec::new();
     loop {
         let Some(current_standard) = standard_result(&current) else {
-            return Ok(current);
+            return Ok(with_declined_refinements(current, &mut declined));
         };
         let open = open.get_or_insert_with(|| {
             current_standard
@@ -2310,12 +2316,12 @@ fn finish_adaptive_spatial_fit(
         });
         let refinements = adaptive_refinements(current_standard, data, open)?;
         if refinements.is_empty() {
-            return Ok(current);
+            return Ok(with_declined_refinements(current, &mut declined));
         }
         // Without a certified error bar on the current criterion there is no
         // honest comparison to make, so the basis stays where it is.
         let Some(current_evidence) = certified_evidence(current_standard)? else {
-            return Ok(current);
+            return Ok(with_declined_refinements(current, &mut declined));
         };
         let term_count = current_standard.adaptive_bases.len();
         let spare_rank = spare_design_rank(current_standard, data);
@@ -2336,8 +2342,29 @@ fn finish_adaptive_spatial_fit(
                 continue;
             }
             let candidate_config = config_with_refinements(&config, term_count, &attempt);
-            let candidate = fit_from_formula_once_with_notes(formula, data, &candidate_config)
-                .map_err(|error| refinement_failure(&attempt, error.to_string(), Some(error)))?;
+            // A refit that does not converge certifies nothing, which is the
+            // same state as one that converges and certifies no criterion gain:
+            // the absence of evidence that the larger basis is better. It used
+            // to be the one outcome that discarded the incumbent — a converged,
+            // certified fit was thrown away because a refinement this loop
+            // proposes UNCONDITIONALLY refused, and the refusal reported the
+            // caller's own model as under-resolved although nothing had
+            // measured it so (#4529). It now closes the attempt on the same
+            // rule as a non-improving refit, records why, and leaves the
+            // incumbent standing. Only a refit that breaks the loop's own
+            // invariant — a different estimator representation for the same
+            // formula — is still an error.
+            let candidate = match fit_from_formula_once_with_notes(formula, data, &candidate_config)
+            {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    declined.push(refinement_declined_note(&attempt, &error.to_string()));
+                    if let [single] = attempt.as_slice() {
+                        open[single.term_index] = false;
+                    }
+                    continue;
+                }
+            };
             let Some(candidate_standard) = standard_result(&candidate) else {
                 return Err(refinement_failure(
                     &attempt,
@@ -2376,9 +2403,24 @@ fn finish_adaptive_spatial_fit(
                 config = candidate_config;
                 current = candidate;
             }
-            None => return Ok(current),
+            None => return Ok(with_declined_refinements(current, &mut declined)),
         }
     }
+}
+
+/// Carry the declined-refinement advisories out on the fit the loop returns.
+///
+/// The loop holds `current` borrowed while it reasons about the refinements, so
+/// the notes are accumulated beside it and attached at the one point the fit
+/// leaves the loop. They are advisories rather than informational notes because
+/// the basis the caller receives is smaller than the one the engine would have
+/// grown, which is the fitted model differing from the request's intent.
+fn with_declined_refinements(
+    mut current: FormulaFitResult,
+    declined: &mut Vec<String>,
+) -> FormulaFitResult {
+    current.inference_notes.advisories.append(declined);
+    current
 }
 
 /// A fit's comparable REML/LAML criterion (lower is better) together with the
@@ -2537,6 +2579,30 @@ fn refinement_failure(
         reason,
         refit_failure: refit_failure.map(Box::new),
     }
+}
+
+/// The advisory a declined refinement records: which terms were proposed, from
+/// which resolution to which, and what the refit said.
+///
+/// The fit the caller receives is the certified incumbent, so this note is the
+/// only place the refused experiment is visible; printing it is what keeps
+/// "the engine stopped growing this basis" from being silent (#4529).
+fn refinement_declined_note(refinements: &[&AdaptiveRefinement], reason: &str) -> String {
+    let proposals = refinements
+        .iter()
+        .map(|refinement| {
+            format!(
+                "'{}' {} -> {}",
+                refinement.term_name, refinement.current, refinement.proposed
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Adaptive resolution: kept the certified basis and closed the refinement {proposals} \
+         because that refit did not converge, so it is no evidence that the larger basis is \
+         better. The refit reported: {reason}"
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

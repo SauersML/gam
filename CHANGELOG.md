@@ -1,5 +1,24 @@
 ## Unreleased
 
+- **A speculative basis refinement that does not converge closes the attempt instead of
+  discarding the certified fit** (gam#4529).
+  `s(x, shape=monotone_increasing)` on pyGAM's hepatitis data raised
+  `RemlConvergenceError`, naming a refinement from 1 to 15 internal knots that "was not
+  certified". The 1-knot fit had converged and certified; what refused was a refit the
+  adaptive-resolution loop proposes on its own. That loop has no trigger threshold: it
+  offers the next nested level for every open adaptive term unconditionally, and its
+  documented rule is that the refit's own REML/LAML evidence decides whether the larger
+  basis is kept. A refit that converges and certifies no gain already closed the attempt
+  and left the incumbent standing; a refit that did not converge was the one outcome that
+  threw the incumbent away and reported the caller's model as under-resolved, although
+  nothing had measured it so. Both are the same state -- no evidence that the larger basis
+  is better -- so both now close the attempt on the same rule. The declined refinement is
+  recorded as a fit advisory naming the term, the two resolutions and the refit's own
+  refusal text, so the engine's decision to stop growing the basis is visible rather than
+  silent. `WorkflowError::SpatialUnderresolved` keeps its other producer, a refit that
+  changed estimator representation, which is an invariant breach rather than a missing
+  measurement. **Behavior change:** a formula whose refinement refit refuses now returns the
+  certified coarser fit with an advisory, where it previously raised.
 - **Skovgaard `r*` uses the sample-space `q_hat` and the full nuisance determinant form** (gam#3535).
   Two things were wrong in the assembly. In the scalar case it computed
   `u = (theta_hat - theta_0) * i_hat / sqrt(j_hat)`, which is the linear surrogate for
