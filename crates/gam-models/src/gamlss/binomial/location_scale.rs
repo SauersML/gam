@@ -2053,11 +2053,13 @@ impl crate::custom_family::JeffreysArming for BinomialLocationScaleFamily {
 impl CustomFamily for BinomialLocationScaleFamily {
     // The self-limiting Jeffreys/Firth curvature bounds a coefficient the data do
     // not, but it is armed only when the unarmed fit proves it is needed (#979).
-    // When the log-σ design carries an intercept, the threshold/log-σ map
-    // `q = −η_t/σ` has an exact likelihood gauge (`δη_t = η_t, δη_ls = 1` gives
-    // `q̇ = 0`), so the expected information is singular along it at every β, and
-    // the default full Jeffreys span holds that direction. Which span the armed
-    // refit uses is open in the #932 audit's constrained Firth/Jeffreys row.
+    // The threshold/log-σ map `q = −η_t/σ` has an exact likelihood gauge
+    // (`δη_t = η_t, δη_ls = 1` gives `q̇ = 0`) whenever the log-σ span contains
+    // the constant. The term builders remove that constant from the log-σ
+    // design (`binomial_log_sigma_gauge_spec`, #3879), so on a fitted model the
+    // gauge is outside the coefficient span and the expected information is not
+    // singular along it. Which span the armed refit uses is open in the #932
+    // audit's constrained Firth/Jeffreys row.
     fn joint_jeffreys_term_required(&self) -> bool {
         self.jeffreys_armed
     }
@@ -2091,9 +2093,13 @@ impl CustomFamily for BinomialLocationScaleFamily {
     // Jeffreys/Firth prior, which is defined on the Fisher information by
     // construction (#1020).
 
-    /// The threshold/log-σ map `q = −η_t/σ` carries an EXACT gauge null: the
-    /// direction `(δη_t = η_t, δη_ls = 1)` gives `q̇ = q_t·η_t + q_ls = 0`, so the
-    /// likelihood joint Hessian is singular along it. Under the default `Smooth`
+    /// The threshold/log-σ map `q = −η_t/σ` carries an EXACT gauge null whenever
+    /// the log-σ design spans the constant: the direction
+    /// `(δη_t = η_t, δη_ls = 1)` gives `q̇ = q_t·η_t + q_ls = 0`, so the
+    /// likelihood joint Hessian is singular along it. The term builders pin that
+    /// gauge structurally (no log-σ intercept, `binomial_log_sigma_gauge_spec`,
+    /// #3879); a family assembled directly from a design that spans the constant
+    /// still carries it, and for that design under the default `Smooth`
     /// pseudo-logdet the near-zero eigenvalue contributes a first-order
     /// `φ'(σ_min)·dσ_min/dρ` term to `d log|H|/dρ` that the analytic
     /// `u⊤(dH/dρ)u` formula cannot match (the eigenvector `u` is numerically

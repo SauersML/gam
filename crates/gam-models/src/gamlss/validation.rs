@@ -212,11 +212,13 @@ pub(super) fn validate_binomial_log_sigma_identifiable(
 ) -> Result<(), String> {
     // A parametric-linear log_sigma (heteroscedastic binary regression, i.e.
     // het-probit / het-logit) is a low-dimensional scale model whose slopes are
-    // identifiable from the per-observation composite q; the ridge-regularized
-    // fit pins the confounded scale intercept, so linear log_sigma terms are
-    // accepted. A *nonparametric* free log_sigma — a random-effect or smooth
-    // formula — is an unidentified scale gauge for 0/1 Bernoulli data and is
-    // still rejected before the exact spatial joint optimizer is entered.
+    // identifiable from the per-observation composite q. Its confounded scale
+    // intercept is not estimated at all: the builders remove it from the log-σ
+    // design (`binomial_log_sigma_gauge_spec`, σ = 1 at the reference), so
+    // linear log_sigma terms are accepted. A *nonparametric* free log_sigma — a
+    // random-effect or smooth formula — is an unidentified scale gauge for 0/1
+    // Bernoulli data and is still rejected before the exact spatial joint
+    // optimizer is entered.
     if log_sigmaspec.random_effect_terms.is_empty() && log_sigmaspec.smooth_terms.is_empty() {
         return Ok(());
     }
