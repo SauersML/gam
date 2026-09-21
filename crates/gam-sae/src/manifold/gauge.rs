@@ -364,6 +364,12 @@ mod tests {
         assert!((digamma(2.0) - (1.0 - gamma)).abs() < 1.0e-15);
         let pi2_6 = std::f64::consts::PI * std::f64::consts::PI / 6.0;
         assert!((trigamma(1.0) - pi2_6).abs() < 1.0e-15);
+        // `ln Γ(5) = ln 4! = ln 24`, the closed form the imported `ln_gamma`
+        // must reproduce. The bar is the one the deleted private Lanczos copy
+        // carried, so importing `statrs` loosens nothing; it is wide enough for
+        // any double-precision `ln Γ` and orders of magnitude too tight for a
+        // wrong import (`Γ(5) = 24` misses `ln 24` by 20.8).
+        assert!((ln_gamma(5.0) - 24.0_f64.ln()).abs() < 1.0e-13);
     }
 
     #[test]
