@@ -337,17 +337,6 @@ impl SeedQuorum {
             formed: std::sync::Condvar::new(),
         }
     }
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return None;
-            }
-            members = self
-                .formed
-                .wait_timeout(members, deadline - now)
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0;
-        }
-    }
 
     /// The floor a still-searching seed must reach below, once a quorum formed.
     fn floor(&self) -> Option<f64> {
@@ -1177,5 +1166,16 @@ mod test_support {
                 if let Some(floor) = self.floor() {
                     return Some(floor);
                 }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return None;
+                }
+                members = self
+                    .formed
+                    .wait_timeout(members, deadline - now)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
+            }
+        }
     }
 }
