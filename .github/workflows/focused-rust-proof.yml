@@ -235,6 +235,26 @@ jobs:
               ;;
           esac
 
+          # Feature selection is derived from the package's own manifest. PyO3's
+          # `extension-module` feature tells the linker NOT to link libpython
+          # (the importing interpreter supplies those symbols), so a test binary
+          # built with it enabled cannot link: `--all-features` would turn it
+          # back on and no test of such a package could ever run (#4455). A
+          # package that declares it keeps it behind its default features, so
+          # build it with every OTHER feature instead, exactly as
+          # rust-archive.yml builds gam-pyffi's unit tests.
+          declared_features=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg p "$PACKAGE" '.packages[] | select(.name == $p) | .features | keys[]')
+          if grep -qx 'extension-module' <<< "$declared_features"; then
+            other_features=$(grep -vx -e 'extension-module' -e 'default' <<< "$declared_features" \
+              | paste -sd, - || true)
+            feature_args="--no-default-features"
+            if [[ -n "$other_features" ]]; then feature_args+=" --features ${other_features}"; fi
+          else
+            feature_args="--all-features"
+          fi
+          printf 'FEATURE_ARGS=%s\n' "$feature_args" >> "$GITHUB_ENV"
+
           case "$TARGET" in
             lib)
               if [[ -n "$TEST_BINARY" ]]; then
@@ -289,6 +309,8 @@ jobs:
         run: |
           set -euo pipefail
           read -r -a target_args <<< "$TARGET_ARGS"
+          # Never empty (see "Validate inputs"), so no bash-3.2 empty-array guard.
+          read -r -a feature_args <<< "$FEATURE_ARGS"
           # `PROFILE_ARGS` is empty for the dev profile. On the macos-15 lane
           # `shell: bash` is bash 3.2, where `"${arr[@]}"` on an EMPTY array is an
           # unbound-variable error under `set -u`, so build the array explicitly
@@ -304,11 +326,11 @@ jobs:
           # zero compiler objects. Splitting it out of the per-filter loop also
           # fixes the accounting — the old single bound was charged afresh to
           # every filter even though only the first one compiled anything.
-          echo "cargo test -p ${PACKAGE} --all-features ${PROFILE_ARGS:-} ${target_args[*]} --no-run"
+          echo "cargo test -p ${PACKAGE} ${feature_args[*]} ${PROFILE_ARGS:-} ${target_args[*]} --no-run"
           started=$(date +%s)
           set +e
           "$FOCUSED_TIMEOUT" --signal=TERM --kill-after=15s "$EFFECTIVE_BUILD_BUDGET" \
-            cargo test -p "$PACKAGE" --all-features ${profile_args[@]+"${profile_args[@]}"} "${target_args[@]}" --no-run \
+            cargo test -p "$PACKAGE" "${feature_args[@]}" ${profile_args[@]+"${profile_args[@]}"} "${target_args[@]}" --no-run \
             2>&1 | tee "$log_file"
           status=${PIPESTATUS[0]}
           set -e
@@ -358,6 +380,7 @@ jobs:
         run: |
           set -euo pipefail
           read -r -a target_args <<< "$TARGET_ARGS"
+          read -r -a feature_args <<< "$FEATURE_ARGS"
           # `PROFILE_ARGS` is empty for the dev profile. On the macos-15 lane
           # `shell: bash` is bash 3.2, where `"${arr[@]}"` on an EMPTY array is an
           # unbound-variable error under `set -u`, so build the array explicitly
@@ -369,10 +392,10 @@ jobs:
           total_ran=0
           for filter in "${filters[@]}"; do
             log_file="focused-rust-logs/${filter//[:.]/_}.log"
-            echo "cargo test -p ${PACKAGE} --all-features ${PROFILE_ARGS:-} ${target_args[*]} ${filter}"
+            echo "cargo test -p ${PACKAGE} ${feature_args[*]} ${PROFILE_ARGS:-} ${target_args[*]} ${filter}"
             set +e
             "$FOCUSED_TIMEOUT" --signal=TERM --kill-after=15s "$RUN_BUDGET_SECONDS" \
-              cargo test -p "$PACKAGE" --all-features \
+              cargo test -p "$PACKAGE" "${feature_args[@]}" \
                 ${profile_args[@]+"${profile_args[@]}"} "${target_args[@]}" "$filter" \
                 -- --nocapture --test-threads=1 2>&1 | tee "$log_file"
             status=${PIPESTATUS[0]}
