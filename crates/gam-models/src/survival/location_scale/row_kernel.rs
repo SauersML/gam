@@ -720,18 +720,11 @@ impl SurvivalLsRowKernel<'_> {
     /// `p` — the scalar-independent inputs the generic row NLL
     /// ([`sls_row_nll`]) consumes. Computed once per row; reused across every
     /// `JetScalar` instantiation (value/grad/Hessian, contracted third/fourth).
-    fn row_nll_inputs(
-        &self,
-        row: usize,
-    ) -> Result<([f64; SLS_ROW_K], SurvivalExactRowKernel), String> {
-        self.row_nll_inputs_opt(row)?
-            .ok_or_else(|| format!("survival location-scale row {row} has no exact kernel"))
-    }
-
-    /// Like [`Self::row_nll_inputs`] but returns `Ok(None)` for rows whose
-    /// observation weight is non-positive. A positive-weight row whose exact
-    /// derivatives cannot be represented is an error, never a zero
-    /// contribution.
+    ///
+    /// Returns `Ok(None)` for rows whose observation weight is non-positive:
+    /// such a row carries no likelihood term, and every consumer treats it as a
+    /// structural zero. A positive-weight row whose exact derivatives cannot be
+    /// represented is an error, never a zero contribution.
     fn row_nll_inputs_opt(
         &self,
         row: usize,
@@ -2234,7 +2227,18 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
         row: usize,
         scratch: &mut SlsWiggleOrder2Scratch,
     ) -> Result<(), String> {
-        let (primaries, kernel) = self.base.row_nll_inputs(row)?;
+        // A non-positive-weight row carries no likelihood term. Its derivatives
+        // are the structural zero every other consumer already returns for such
+        // a row (`RowProgram::eval`, the log-likelihood and gradient loops), not
+        // an error (#4278).
+        let Some((primaries, kernel)) = self.base.row_nll_inputs_opt(row)? else {
+            let kw = self.primary_dimension();
+            scratch.gradient.clear();
+            scratch.gradient.resize(kw, 0.0);
+            scratch.hessian.clear();
+            scratch.hessian.resize(kw * kw, 0.0);
+            return Ok(());
+        };
         let basis = self.row_basis(row)?;
         sls_wiggle_row_order2(&primaries, &self.betaw, &kernel, &basis, scratch);
         Ok(())
@@ -2249,7 +2253,16 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
         scratch: &mut SlsWiggleThirdScratch,
     ) -> Result<(), String> {
         assert_eq!(dir.len(), self.primary_dimension());
-        let (primaries, kernel) = self.base.row_nll_inputs(row)?;
+        // A non-positive-weight row carries no likelihood term. Its derivatives
+        // are the structural zero every other consumer already returns for such
+        // a row (`RowProgram::eval`, the log-likelihood and gradient loops), not
+        // an error (#4278).
+        let Some((primaries, kernel)) = self.base.row_nll_inputs_opt(row)? else {
+            let kw = self.primary_dimension();
+            scratch.third.clear();
+            scratch.third.resize(kw * kw, 0.0);
+            return Ok(());
+        };
         let basis = self.row_basis(row)?;
         sls_wiggle_row_third(&primaries, &self.betaw, &kernel, &basis, dir, scratch);
         Ok(())
@@ -2266,7 +2279,16 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
     ) -> Result<(), String> {
         assert_eq!(dir_u.len(), self.primary_dimension());
         assert_eq!(dir_v.len(), self.primary_dimension());
-        let (primaries, kernel) = self.base.row_nll_inputs(row)?;
+        // A non-positive-weight row carries no likelihood term. Its derivatives
+        // are the structural zero every other consumer already returns for such
+        // a row (`RowProgram::eval`, the log-likelihood and gradient loops), not
+        // an error (#4278).
+        let Some((primaries, kernel)) = self.base.row_nll_inputs_opt(row)? else {
+            let kw = self.primary_dimension();
+            scratch.fourth.clear();
+            scratch.fourth.resize(kw * kw, 0.0);
+            return Ok(());
+        };
         let basis = self.row_basis(row)?;
         sls_wiggle_row_fourth(
             &primaries, &self.betaw, &kernel, &basis, dir_u, dir_v, scratch,
@@ -5927,7 +5949,13 @@ mod wiggle_jet_oracle_tests {
             row: usize,
             arena: &'arena DynamicJetArena,
         ) -> Result<DynamicOrder2<'arena>, String> {
-            let (primaries, kernel) = self.base.row_nll_inputs(row)?;
+            // The oracle is handed a row it is meant to differentiate, so a row
+            // with no exact kernel is a test-setup error here, not the
+            // structural zero production returns.
+            let (primaries, kernel) = self
+                .base
+                .row_nll_inputs_opt(row)?
+                .ok_or_else(|| format!("survival location-scale row {row} has no exact kernel"))?;
             let dimension = self.primary_dimension();
             let vars = arena.alloc_slice_fill_with(dimension, |a| {
                 let x = if a < SLS_ROW_K {

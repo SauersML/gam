@@ -4685,6 +4685,113 @@ fn survival_ls_wiggle_runtime_backend_runs_above_old_width_ceiling_932() {
     }
 }
 
+/// #4278: a zero prior weight is valid input (`prepare.rs` refuses only negative or
+/// non-finite weights), and a zero-weight row carries no likelihood term. The
+/// link-wiggle row kernel must treat it as the structural zero every other
+/// consumer does rather than refusing it, and the joint Hessian and its contracted
+/// third and fourth must stay additive in the weights: the NLL is `Σ_i w_i ℓ_i`,
+/// so `D(w_a) + D(w_b) = D(w_a + w_b)` for every derivative `D`, up to the
+/// roundoff of reassociating a four-row sum.
+#[test]
+fn survival_ls_wiggle_zero_weight_row_is_a_structural_zero() {
+    use super::row_kernel::{
+        survival_ls_wiggle_directional_derivative_dense, survival_ls_wiggle_joint_hessian_dense,
+        survival_ls_wiggle_second_directional_derivative_dense,
+    };
+    use crate::row_kernel::RowSet;
+
+    let primaries: Vec<[f64; SLS_ROW_K]> = vec![
+        [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
+        [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, -0.35],
+        [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
+    ];
+    let event = [1.0, 1.0, 1.0, 1.0];
+    let q0_exit = Array1::from_shape_fn(primaries.len(), |i| {
+        primaries[i][1] - primaries[i][3] * (-primaries[i][6]).exp()
+    });
+    let knots = array![-2.5, -2.5, -2.5, -2.5, 3.2, 3.2, 3.2, 3.2];
+    let degree = 3usize;
+    let xwiggle =
+        survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::value())
+            .expect("wiggle design");
+    let pw = xwiggle.ncols();
+    let inverse_link = residual_distribution_inverse_link(ResidualDistribution::Gaussian);
+
+    // (Hessian, contracted third, contracted fourth) of the wiggle row program at
+    // the prior weights `weight`, with monotone-feasible nonzero `βw`.
+    let derivatives = |weight: &[f64]| {
+        let mut family =
+            survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, weight);
+        family.x_link_wiggle = Some(DesignMatrix::Dense(
+            gam_linalg::matrix::DenseDesignMatrix::from(xwiggle.clone()),
+        ));
+        family.wiggle_knots = Some(knots.clone());
+        family.wiggle_degree = Some(degree);
+        let mut states = survival_ls_joint_oracle_states(&primaries);
+        let betaw = Array1::from_shape_fn(pw, |b| 0.02 + 0.005 * b as f64);
+        states.push(ParameterBlockState {
+            eta: xwiggle.dot(&betaw),
+            beta: betaw,
+        });
+        let dynamic = family
+            .build_dynamic_geometry(&states)
+            .expect("wiggle dynamic geometry");
+        family
+            .evaluate(&states)
+            .expect("a zero-weight row must not refuse the wiggle family evaluation");
+        let p: usize = states.iter().map(|state| state.beta.len()).sum();
+        let u: Vec<f64> = (0..p).map(|axis| 0.01 * (axis as f64 + 1.0)).collect();
+        let v: Vec<f64> = (0..p).map(|axis| -0.007 * (axis as f64 + 0.5)).collect();
+        let hessian = survival_ls_wiggle_joint_hessian_dense(&family, &dynamic, 0.0)
+            .expect("a zero-weight row must not refuse the wiggle joint Hessian");
+        let third = survival_ls_wiggle_directional_derivative_dense(
+            &family,
+            &dynamic,
+            0.0,
+            &RowSet::All,
+            &u,
+        )
+        .expect("a zero-weight row must not refuse the wiggle contracted third");
+        let fourth = survival_ls_wiggle_second_directional_derivative_dense(
+            &family,
+            &dynamic,
+            0.0,
+            &RowSet::All,
+            &u,
+            &v,
+        )
+        .expect("a zero-weight row must not refuse the wiggle contracted fourth");
+        [hessian, third, fourth]
+    };
+
+    let full = derivatives(&[1.0, 0.8, 1.2, 1.1]);
+    let without_row = derivatives(&[1.0, 0.0, 1.2, 1.1]);
+    let row_alone = derivatives(&[0.0, 0.8, 0.0, 0.0]);
+    for (order, ((whole, left), right)) in full
+        .iter()
+        .zip(without_row.iter())
+        .zip(row_alone.iter())
+        .enumerate()
+    {
+        let scale = whole
+            .iter()
+            .chain(left.iter())
+            .chain(right.iter())
+            .fold(1.0_f64, |acc, value| acc.max(value.abs()));
+        let tolerance = 64.0 * f64::EPSILON * scale;
+        for ((&w, &a), &b) in whole.iter().zip(left.iter()).zip(right.iter()) {
+            assert!(a.is_finite() && b.is_finite());
+            assert!(
+                (a + b - w).abs() <= tolerance,
+                "derivative order {}: D(w_a) + D(w_b) = {:.12e} but D(w_a + w_b) = {w:.12e}",
+                order + 2,
+                a + b
+            );
+        }
+    }
+}
+
 /// #932 gap (c): a DIRECT third- AND fourth-order oracle on the PRODUCTION
 /// survival-LS link-wiggle path. The existing direct wiggle tests pin only the
 /// value/gradient/Hessian; the higher-order channels the log-det adjoint
