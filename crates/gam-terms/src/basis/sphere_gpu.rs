@@ -24,8 +24,6 @@ use gam_gpu::gpu_error::GpuResultExt;
 use gam_gpu::{GpuDecision, GpuKernel, decide};
 
 #[cfg(target_os = "linux")]
-use std::collections::HashMap;
-#[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(target_os = "linux")]
@@ -561,21 +559,8 @@ void s2_wahba_legendre_colmajor(
 "#;
 
 // ────────────────────────────────────────────────────────────────────────
-// Module cache key + per-process backend.
+// Per-process backend.
 // ────────────────────────────────────────────────────────────────────────
-
-/// Module cache key. The compiled PTX depends only on the device's compute
-/// capability (the NVRTC arch) and `LMAX`, which is prepended to the source.
-/// The kernel kind reaches the device as the uploaded `c_ℓ` array, the
-/// column-major layout and `precision = f64` are baked into the source, and the
-/// (32, 8, 1) block shape is a launch parameter, so none of them keys the cache.
-#[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct S2ModuleCacheKey {
-    cc_major: i32,
-    cc_minor: i32,
-    lmax: u32,
-}
 
 /// Returns `true` if this build was compiled with the Linux + cudarc GPU
 /// backend that runs the S² Wahba kernels.
@@ -737,9 +722,13 @@ fn build_truncated_kernel_matrix_gpu_admitted(
 struct SphereGpuContext {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
-    modules: Mutex<HashMap<S2ModuleCacheKey, Arc<CudaModule>>>,
-    cc_major: i32,
-    cc_minor: i32,
+    /// Compiled modules keyed by `LMAX`, which is prepended to the source.
+    /// The backend is bound to one device, so the NVRTC arch is fixed for
+    /// every entry. The kernel kind reaches the device as the uploaded `c_ℓ`
+    /// array, the column-major layout and `precision = f64` are baked into the
+    /// source, and the (32, 8, 1) block shape is a launch parameter, so none of
+    /// them keys the cache.
+    modules: gam_gpu::device_cache::KeyedPtxModuleCache<usize>,
 }
 
 /// Process-wide sphere GPU backend. Lazy-initialised on first call to
@@ -754,36 +743,24 @@ pub(crate) struct SphereGpuBackend {
 impl SphereGpuBackend {
     /// Lazily initialise the process-wide sphere backend.
     pub fn probe() -> Result<&'static Self, GpuError> {
-        static BACKEND: OnceLock<Result<SphereGpuBackend, GpuError>> = OnceLock::new();
-        BACKEND
-            .get_or_init(Self::probe_linux)
-            .as_ref()
-            .map_err(GpuError::clone)
-    }
-
-    fn probe_linux() -> Result<Self, GpuError> {
-        let parts = gam_gpu::backend_probe::probe_cuda_backend("sphere")?;
-        Ok(SphereGpuBackend {
-            inner: SphereGpuContext {
-                ctx: parts.ctx,
-                stream: parts.stream,
-                modules: Mutex::new(HashMap::new()),
-                cc_major: parts.capability.compute_major,
-                cc_minor: parts.capability.compute_minor,
-            },
+        static BACKEND: gam_gpu::backend_probe::CachedBackend<SphereGpuBackend> =
+            gam_gpu::backend_probe::CachedBackend::new();
+        BACKEND.get_or_probe("sphere", |parts| {
+            Ok(SphereGpuBackend {
+                inner: SphereGpuContext {
+                    ctx: parts.ctx,
+                    stream: parts.stream,
+                    modules: gam_gpu::device_cache::KeyedPtxModuleCache::new(),
+                },
+            })
         })
     }
 
-    /// NVRTC-compile (or fetch from cache) the module for `key`. The
+    /// NVRTC-compile (or fetch from cache) the module for `lmax`. The
     /// returned module exposes the raw `s2_wahba_legendre_colmajor` kernel.
-    fn module_for(&self, key: S2ModuleCacheKey) -> Result<Arc<CudaModule>, GpuError> {
-        if let Ok(guard) = self.inner.modules.lock() {
-            if let Some(existing) = guard.get(&key) {
-                return Ok(existing.clone());
-            }
-        }
-        // Prepend the `LMAX` macro directly to the source, then compile through
-        // the shared arch+fmad options (`compile_ptx_arch`). #1686's
+    fn module_for(&self, lmax: usize) -> Result<Arc<CudaModule>, GpuError> {
+        // Prepend the `LMAX` macro directly to the source; the keyed cache
+        // compiles through the shared arch+fmad options. #1686's
         // `--fmad=false` keeps the spherical-harmonic evaluation bit-comparable
         // to the separately-rounded CPU reference; the #1551 arch pin keys the
         // kernel to the device's real compute capability. (The arch is resolved
@@ -791,23 +768,11 @@ impl SphereGpuBackend {
         // "cannot satisfy arch with a runtime string" limitation no longer
         // applies — the LMAX specialization rides in the source, the arch in
         // the options.)
-        let src = format!("#define LMAX {}\n{}", key.lmax, KERNEL_TEMPLATE);
-        let ptx = gam_gpu::device_cache::compile_ptx_arch(&src).gpu_ctx_with(|err| {
-            format!("sphere NVRTC compile (lmax={}): {err}", key.lmax)
-        })?;
-        let module = self
-            .inner
-            .ctx
-            .load_module(ptx)
-            .gpu_ctx("sphere module load")?;
-        if let Ok(mut guard) = self.inner.modules.lock() {
-            guard.entry(key).or_insert_with(|| module.clone());
-        }
-        Ok(module)
-    }
-
-    fn cc(&self) -> (i32, i32) {
-        (self.inner.cc_major, self.inner.cc_minor)
+        self.inner
+            .modules
+            .get_or_compile(&self.inner.ctx, lmax, "sphere", |lmax| {
+                format!("#define LMAX {lmax}\n{KERNEL_TEMPLATE}")
+            })
     }
 }
 
@@ -826,13 +791,7 @@ pub(crate) fn build_kernel_matrix_device(
     {
         use cudarc::driver::{LaunchConfig, PushKernelArg};
         let backend = SphereGpuBackend::probe()?;
-        let (cc_major, cc_minor) = backend.cc();
-        let key = S2ModuleCacheKey {
-            cc_major,
-            cc_minor,
-            lmax: inputs.lmax as u32,
-        };
-        let module = backend.module_for(key)?;
+        let module = backend.module_for(inputs.lmax)?;
         let func = module
             .load_function("s2_wahba_legendre_colmajor")
             .gpu_ctx("sphere load_function raw")?;

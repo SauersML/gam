@@ -98,8 +98,8 @@ pub(crate) const MAX_FUSED_P: usize = 32;
 /// Compile-time `R` (= border width `K`) widths the NVRTC fused kernel is
 /// templated on. The Arrow-Schur driver always builds the system at a single
 /// uniform `R = K` (the shared β width), so the host JIT selects exactly one
-/// template instantiation per `(P, R)` pair encountered. Caching matches the
-/// `S2ModuleCacheKey` pattern in `crate::terms::basis::sphere_gpu`.
+/// template instantiation per `(P, R)` pair encountered, compiled once and
+/// cached under `FusedModuleCacheKey`.
 ///
 /// # Why the fused kernel tops out at R = 32 — and why real SAE borders still
 /// # run on-device (issue #1017 deliverable 4)

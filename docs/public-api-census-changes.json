@@ -4869,6 +4869,16 @@
     "evidence": "ift_predictor_rejects_large_drho: an unmeasured predictor now takes the |dρ| = 3 step the 2.0 default cap rejected; a measured radius of 2 rejects it and 4 accepts it. warm_start_trust_radius_is_the_step_where_the_predictor_ties_the_flat_seed pins R = s·F/E, R = ∞ for an exact prediction, no update for E = F = 0 or non-finite input, and reset on clear. The same-slot test now checks the radius and staged step do not leak across RemlStates."
   },
   {
+    "base": "f10039cc745a25ab816b20958151e1d5e629289d",
+    "removed": {
+      "crates/gam-gpu/src/backend_probe.rs::probe_backend_with_compile": 1,
+      "crates/gam-models/src/bms/gpu/flex.rs::probe_linux": 1,
+      "crates/gam-solve/src/gpu_kernels/pirls_row.rs::compiled": 1
+    },
+    "reason": "#4155: seven GPU backends hand-rolled the OnceLock<Result<_, GpuError>> probe-once protocol that gam_gpu::backend_probe::CachedBackend already provides, and three hand-rolled keyed module caches duplicating gam_gpu::device_cache::KeyedPtxModuleCache. Each backend is now a static CachedBackend read through get_or_probe(label, build), and the cubic_cell, pirls_row and sphere per-key caches are KeyedPtxModuleCache. That makes the per-backend probe_linux helpers (bms flex, cubic_cell, pirls_row, sphere) the build closures of get_or_probe; probe_backend_with_compile (build(&probe_cuda_backend(label)?), whose only callers were the two hand-rolled row.rs caches) has no caller; PirlsRowBackend::compiled had no caller; and sphere's S2ModuleCacheKey and cc() existed only to key the cache on the compute capability of the one device the process-wide backend is bound to, so the key is now lmax alone.",
+    "evidence": "scripts/source_removal_guard.py and scripts/public_api_census.py with --base f10039cc745a25ab816b20958151e1d5e629289d and head the change's commit list exactly these removals. Read-proof at the head: git grep -w finds 0 occurrences of probe_backend_with_compile, S2ModuleCacheKey and PirlsRowBackend::compiled in crates/ tests/ examples/ python/, and no `static BACKEND: OnceLock<Result<` remains in crates/; before the change git grep -n -w compiled found no caller of PirlsRowBackend::compiled and git grep -n probe_backend_with_compile found only its definition and the two row.rs calls."
+  },
+  {
     "base": "88af7f36c95adcede13b6507ad702acc78ab4bd0",
     "removed": {
       "crates/gam-gpu/src/solver.rs::cholesky_logdet": 1,

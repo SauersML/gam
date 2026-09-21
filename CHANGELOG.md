@@ -57,6 +57,17 @@
   non-finite cell or an unseen level exited with the invocation (formula) code and printed no remedy.
   They now exit with the data code and print the same `help:` line `gam predict` and `gam fit` print.
   `diagnose`'s spline-scan and residual-cascade refusals no longer name the removed `--alo` flag.
+- **One process-wide GPU backend cache** (#4155). The BMS flex and row/HVP, cubic-cell,
+  row-Hessian, PIRLS row and sphere backends are now `static CachedBackend`s read through
+  `get_or_probe`, like the SAE and survival backends, instead of seven hand-rolled
+  `OnceLock<Result<_, GpuError>>` caches. `row_hessian_ops` gains the shared probe prologue,
+  so a host without a GPU now reports the labelled `DriverLibraryUnavailable` every other
+  backend reports. The per-degree, per-kernel and per-`LMAX` module caches of cubic-cell,
+  PIRLS row and sphere move onto `KeyedPtxModuleCache`; the sphere cache no longer skips
+  caching (and recompiles on every call) after a poisoned lock, and no longer keys on the
+  fixed device's compute capability. `probe_backend_with_compile`, the public
+  `probe_cuda_backend` entry, `CudaBackendParts::capability` and the unused
+  `PirlsRowBackend::compiled` are removed.
 
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
