@@ -136,6 +136,14 @@ fn an_all_interval_fit_seeds_from_the_lower_endpoint_surrogate_3711() {
             spec.weights.iter().all(|&weight| weight.is_finite() && weight > 0.0),
             "the all-interval baseline must observe every interval with positive finite weight"
         );
+        // The premise this test's name states. The two tests below make a row
+        // exact by setting `event_target[0] = 1`, so the unedited fixture must
+        // carry none; without this, a fixture that grew an exact failure would
+        // leave this test green while it measured the other branch.
+        assert!(
+            spec.event_target.iter().all(|&code| code == 0),
+            "#3711: the all-interval fixture must carry no exact-failure rows"
+        );
     })
     .expect("#3711: an all-interval latent fit must converge from its surrogate seed");
     assert_finite_fit(&fit, "all-interval");
