@@ -815,7 +815,7 @@ fn order_free_mixture_loglik_bound(
 /// so it bounds the width from above and the uniform limit is a point the
 /// search can reach and certify.
 fn wrapped_width_ceiling() -> f64 {
-    let unit_roundoff = f64::EPSILON / 2.0;
+    let unit_roundoff = gam_linalg::roundoff::UNIT_ROUNDOFF;
     ((2.0 / unit_roundoff).ln() / (2.0 * std::f64::consts::PI.powi(2))).sqrt()
 }
 
@@ -831,7 +831,7 @@ fn wrapped_width_ceiling() -> f64 {
 /// relative to the central `e^{−b²/2}` is at most
 /// `2 (1 + a⁴) e^{−(a² − b²)/2} / (1 − ρ)`.
 fn wrapped_image_count(sigma: f64) -> usize {
-    let unit_roundoff = f64::EPSILON / 2.0;
+    let unit_roundoff = gam_linalg::roundoff::UNIT_ROUNDOFF;
     let central = 0.5 / sigma;
     let mut images = 0usize;
     loop {

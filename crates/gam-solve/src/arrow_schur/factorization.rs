@@ -274,7 +274,7 @@ pub(crate) fn closed_form_row_ridge(
     }
     let spectral_radius = lambda_min.abs().max(lambda_max.abs());
     let dim = d as f64;
-    let unit_roundoff = 0.5 * f64::EPSILON;
+    let unit_roundoff = gam_linalg::roundoff::UNIT_ROUNDOFF;
     let gamma = (dim + 1.0) * unit_roundoff / (1.0 - (dim + 1.0) * unit_roundoff);
     let cholesky_rel = dim * gamma / (1.0 - dim * gamma);
     let c = 2.0 * cholesky_rel;
