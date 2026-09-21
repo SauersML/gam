@@ -84,10 +84,20 @@ const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 3;
 // never-written `latent_score_contract`, leaving 96 payload keys. Schema 37
 // (gam#3350) then stores the fit once and moves the version out of the payload:
 // the `unified` copy of `fit_result` is gone and the version lives in the
-// saved-model envelope `{kind, version, model}`, so the payload carries
-// 96 - 2 = 94 keys and the root 3. The stateful sync keeps mirroring each
-// link's point state; the link covariance stays on the fit.
-const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 94;
+// saved-model envelope `{kind, version, model}`, so the payload carried
+// 96 - 2 = 94 keys and the root 3. gam#4507 then removes four more flat
+// coefficient copies: `beta_link_wiggle` and the location-scale survival trio
+// `survival_beta_time`, `survival_beta_threshold` and `survival_beta_log_sigma`;
+// the fit's `LinkWiggle`, `Time`, `Threshold` and `Scale` blocks are the only
+// coefficient store, so the payload carries 94 - 4 = 90 keys. The four are plain
+// `Option` fields with no `skip_serializing_if`, so each one always wrote a key
+// (as `null` when absent) and each removal drops exactly one. This number is THIS
+// model's JSON key count, not the struct's declared field count: `FittedModelPayload`
+// declares 93 `pub` fields here, four of which carry `skip_serializing_if` and three
+// of which are empty in this model. Do not re-derive it by subtracting from the
+// declaration count. The stateful sync keeps mirroring each link's point state; the
+// link covariance stays on the fit.
+const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 90;
 const EXPECTED_STANDARD_FAMILY_FIELD_COUNT: usize = 6;
 
 fn read_saved_model_json(path: &Path) -> Value {

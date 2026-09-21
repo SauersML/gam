@@ -191,8 +191,7 @@ fn fit_at_anchor(
 
     let model = FittedModel::load_from_path(&model_path).expect("load saved survival model");
     // The unified coefficient vector, which the transformation family carries
-    // as one block (`survival_beta_time` is populated only by the families that
-    // split their coefficients into named channels).
+    // as one block.
     let beta = model
         .payload()
         .fit_result

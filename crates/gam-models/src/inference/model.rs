@@ -76,7 +76,15 @@ pub const SAVED_MODEL_KIND: &str = "gam";
 // linear fit's `var_coeffs` and `var_floor`; the variance stage of `theta1_cov` is in
 // log units. A v37 document carries the linear pair and no `log_var_coeffs`, so it is a
 // different wire shape at the same field names and must not be read as this one.
-pub const MODEL_PAYLOAD_VERSION: u32 = 38;
+// v39 deletes the flat coefficient copies a fit already stores in its blocks (#4507):
+// `beta_link_wiggle` and the location-scale survival trio `survival_beta_time`,
+// `survival_beta_threshold` and `survival_beta_log_sigma`. The point predictor read the
+// copy while the covariance was indexed by `fit_result`'s blocks, so a file whose copy had
+// drifted from its fit predicted as a silent mix of two models. A v38 document carries the
+// four keys and is a different wire shape at the same field names, so it must not be read
+// as this one; link-wiggle metadata without a `fit_result` or without the block is now a
+// refusal rather than a fallback to the copy.
+pub const MODEL_PAYLOAD_VERSION: u32 = 39;
 
 /// Coefficient parameterization of a saved transformation-normal (CTN) fit.
 ///
@@ -548,8 +556,6 @@ pub struct FittedModelPayload {
     /// constructor and rejects any topology or lambda-count mismatch.
     #[serde(default)]
     pub linkwiggle_penalty_metadata: Option<WigglePenaltyMetadata>,
-    #[serde(default)]
-    pub beta_link_wiggle: Option<Vec<f64>>,
     /// Frozen-index mean-coordinate shift `s` for the standard binomial-mean
     /// link-warp predict runtime (#2141). Predict evaluates the warp basis at
     /// the frozen index `η̂ = X·(β_saved + s)` the fit pinned `B` at, rather than
@@ -701,12 +707,6 @@ pub struct FittedModelPayload {
     /// default: every v11 artifact must state `null` for non-location-scale
     /// families or carry the complete structure for location-scale replay.
     pub survival_location_scale_structure: Option<SavedSurvivalLocationScaleStructure>,
-    #[serde(default)]
-    pub survival_beta_time: Option<Vec<f64>>,
-    #[serde(default)]
-    pub survival_beta_threshold: Option<Vec<f64>>,
-    #[serde(default)]
-    pub survival_beta_log_sigma: Option<Vec<f64>>,
     #[serde(default)]
     pub survival_distribution: Option<ResidualDistribution>,
     #[serde(default)]
@@ -954,7 +954,6 @@ impl FittedModelPayload {
             linkwiggle_knots: None,
             linkwiggle_degree: None,
             linkwiggle_penalty_metadata: None,
-            beta_link_wiggle: None,
             link_wiggle_index_shift: None,
             baseline_timewiggle_knots: None,
             baseline_timewiggle_degree: None,
@@ -999,9 +998,6 @@ impl FittedModelPayload {
             survival_time_anchor: None,
             survival_likelihood: None,
             survival_location_scale_structure: None,
-            survival_beta_time: None,
-            survival_beta_threshold: None,
-            survival_beta_log_sigma: None,
             survival_distribution: None,
             training_headers: None,
             training_table_kind: "unknown".to_string(),
@@ -1571,27 +1567,16 @@ pub fn gaussian_location_scale_saved_response_scale(
     }
 }
 
-fn validate_survival_saved_block_matches_payload(
+fn survival_saved_block_width(
     fit: &UnifiedFitResult,
     role: BlockRole,
-    payload_beta: Option<&Vec<f64>>,
     label: &str,
 ) -> Result<usize, FittedModelError> {
-    let block = fit
-        .block_by_role(role)
+    fit.block_by_role(role)
+        .map(|block| block.beta.len())
         .ok_or_else(|| FittedModelError::MissingField {
             reason: format!("location-scale survival saved fit is missing {label} block"),
-        })?;
-    if let Some(saved) = payload_beta
-        && block.beta.to_vec() != *saved
-    {
-        return Err(FittedModelError::SchemaMismatch {
-            reason: format!(
-                "location-scale survival saved {label} coefficients disagree with fit_result"
-            ),
-        });
-    }
-    Ok(block.beta.len())
+        })
 }
 
 fn validate_survival_covariate_time_basis(
@@ -1644,24 +1629,9 @@ fn validate_survival_location_scale_saved_fit(
             reason: "location-scale survival model is missing canonical fit_result payload"
                 .to_string(),
         })?;
-    let p_time = validate_survival_saved_block_matches_payload(
-        fit,
-        BlockRole::Time,
-        payload.survival_beta_time.as_ref(),
-        "time",
-    )?;
-    let p_threshold = validate_survival_saved_block_matches_payload(
-        fit,
-        BlockRole::Threshold,
-        payload.survival_beta_threshold.as_ref(),
-        "threshold",
-    )?;
-    let p_log_sigma = validate_survival_saved_block_matches_payload(
-        fit,
-        BlockRole::Scale,
-        payload.survival_beta_log_sigma.as_ref(),
-        "log-sigma",
-    )?;
+    let p_time = survival_saved_block_width(fit, BlockRole::Time, "time")?;
+    let p_threshold = survival_saved_block_width(fit, BlockRole::Threshold, "threshold")?;
+    let p_log_sigma = survival_saved_block_width(fit, BlockRole::Scale, "log-sigma")?;
     if let Some(basis) = structure.threshold_time_basis.as_ref() {
         let width =
             validate_survival_covariate_time_basis(basis, "location-scale survival threshold time basis")?;
@@ -1685,22 +1655,9 @@ fn validate_survival_location_scale_saved_fit(
         }
     }
     let p_wiggle = match link_wiggle {
-        Some(runtime) => {
-            let block = fit.block_by_role(BlockRole::LinkWiggle).ok_or_else(|| {
-                FittedModelError::MissingField {
-                    reason: "location-scale survival saved fit is missing link-wiggle block"
-                        .to_string(),
-                }
-            })?;
-            if block.beta.to_vec() != runtime.beta {
-                return Err(FittedModelError::SchemaMismatch {
-                    reason:
-                        "location-scale survival saved link-wiggle coefficients disagree with fit_result"
-                            .to_string(),
-                });
-            }
-            runtime.beta.len()
-        }
+        // `saved_link_wiggle` reads the runtime coefficients from this fit's
+        // LinkWiggle block, so the block exists and has exactly this width.
+        Some(runtime) => runtime.beta.len(),
         None => {
             if fit.block_by_role(BlockRole::LinkWiggle).is_some() {
                 return Err(FittedModelError::SchemaMismatch {
@@ -3995,84 +3952,55 @@ impl FittedModel {
                 reason: joint_wiggle_unsupported_link_message("link wiggle"),
             });
         }
-        let model_class = self.predict_model_class();
-        let beta = match model_class {
-            // The current frozen-basis fit residualizes `B` in observation
-            // space without changing the wiggle coefficient width. Saved-frame
-            // finalization then moves the complete fit, including every
-            // covariance, into `[Mean, LinkWiggle]` prediction coordinates.
-            // The payload copy is retained as replay metadata but must agree
-            // bit-for-bit with that canonical fitted block; accepting either
-            // source independently would let point prediction and uncertainty
-            // describe different models.
-            PredictModelClass::Standard => {
-                let fit = payload.fit_result.as_ref().ok_or_else(|| {
-                    FittedModelError::MissingField {
-                        reason:
-                            "standard link-wiggle model is missing canonical fit_result payload"
-                                .to_string(),
-                    }
-                })?;
-                if fit.blocks.len() != 2
-                    || fit.blocks[0].role != BlockRole::Mean
-                    || fit.blocks[1].role != BlockRole::LinkWiggle
-                {
-                    return Err(FittedModelError::SchemaMismatch {
-                        reason:
-                            "standard link-wiggle models must store blocks in [Mean, LinkWiggle] order"
-                                .to_string(),
-                    });
-                }
-                let block = fit.block_by_role(BlockRole::LinkWiggle).ok_or_else(|| {
-                    FittedModelError::MissingField {
-                        reason:
-                            "standard link-wiggle model is missing LinkWiggle coefficient block"
-                                .to_string(),
-                    }
-                })?;
-                let payload_beta = payload.beta_link_wiggle.as_ref().ok_or_else(|| {
-                    FittedModelError::MissingField {
-                        reason: "standard link-wiggle model is missing its exact saved prediction coefficients; refit"
-                            .to_string(),
-                    }
-                })?;
-                if payload_beta.len() != block.beta.len()
-                    || payload_beta
-                        .iter()
-                        .zip(block.beta.iter())
-                        .any(|(saved, fitted)| saved.to_bits() != fitted.to_bits())
-                {
-                    return Err(FittedModelError::SchemaMismatch {
-                        reason: "standard link-wiggle payload coefficients disagree with the fitted LinkWiggle block"
-                            .to_string(),
-                    });
-                }
-                let shift = payload.link_wiggle_index_shift.as_ref().ok_or_else(|| {
-                    FittedModelError::MissingField {
-                        reason: "standard link-wiggle model is missing its frozen-index shift; refit"
-                            .to_string(),
-                    }
-                })?;
-                if shift.len() != fit.blocks[0].beta.len() {
-                    return Err(FittedModelError::SchemaMismatch {
-                        reason: format!(
-                            "standard link-wiggle frozen-index shift has {} entries but the Mean block has {} coefficients",
-                            shift.len(),
-                            fit.blocks[0].beta.len(),
-                        ),
-                    });
-                }
-                block.beta.to_vec()
+        // The fit's LinkWiggle block is the only store of the wiggle
+        // coefficients, for every model class: point prediction and the
+        // covariance that uncertainty reads are both indexed by the fit's
+        // blocks, so they always describe one model.
+        let fit = payload
+            .fit_result
+            .as_ref()
+            .ok_or_else(|| FittedModelError::MissingField {
+                reason: "link-wiggle model is missing canonical fit_result payload".to_string(),
+            })?;
+        let block = fit.block_by_role(BlockRole::LinkWiggle).ok_or_else(|| {
+            FittedModelError::MissingField {
+                reason: "saved model has link-wiggle metadata but its fit has no LinkWiggle block"
+                    .to_string(),
             }
-            _ => payload
-                .beta_link_wiggle
-                .clone()
-                .ok_or_else(|| FittedModelError::MissingField {
+        })?;
+        // The current frozen-basis fit residualizes `B` in observation space
+        // without changing the wiggle coefficient width. Saved-frame
+        // finalization then moves the complete fit, including every
+        // covariance, into `[Mean, LinkWiggle]` prediction coordinates, and
+        // the warp basis is evaluated at the frozen index `X·(β + s)`.
+        if matches!(self.predict_model_class(), PredictModelClass::Standard) {
+            if fit.blocks.len() != 2
+                || fit.blocks[0].role != BlockRole::Mean
+                || fit.blocks[1].role != BlockRole::LinkWiggle
+            {
+                return Err(FittedModelError::SchemaMismatch {
                     reason:
-                        "saved model has link-wiggle metadata but is missing payload.beta_link_wiggle"
+                        "standard link-wiggle models must store blocks in [Mean, LinkWiggle] order"
                             .to_string(),
-                })?,
-        };
+                });
+            }
+            let shift = payload.link_wiggle_index_shift.as_ref().ok_or_else(|| {
+                FittedModelError::MissingField {
+                    reason: "standard link-wiggle model is missing its frozen-index shift; refit"
+                        .to_string(),
+                }
+            })?;
+            if shift.len() != fit.blocks[0].beta.len() {
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: format!(
+                        "standard link-wiggle frozen-index shift has {} entries but the Mean block has {} coefficients",
+                        shift.len(),
+                        fit.blocks[0].beta.len(),
+                    ),
+                });
+            }
+        }
+        let beta = block.beta.to_vec();
         let penalty_metadata = payload.linkwiggle_penalty_metadata.clone();
         if let Some(metadata) = penalty_metadata.as_ref() {
             let canonical = canonical_wiggle_function_penalties(
@@ -5784,7 +5712,6 @@ impl FittedModel {
         let has_any_saved_link_wiggle = self.linkwiggle_knots.is_some()
             || self.linkwiggle_degree.is_some()
             || self.linkwiggle_penalty_metadata.is_some()
-            || self.beta_link_wiggle.is_some()
             || self
                 .fit_result
                 .as_ref()
@@ -6025,9 +5952,6 @@ impl FittedModel {
         if let Some(v) = self.gaussian_sigma_floor {
             ensure_finite_scalar("gaussian_sigma_floor", v).map_err(corrupt)?;
         }
-        if let Some(v) = self.beta_link_wiggle.as_ref() {
-            validate_all_finite("beta_link_wiggle", v.iter().copied()).map_err(corrupt)?;
-        }
         if let Some(v) = self.link_wiggle_index_shift.as_ref() {
             validate_all_finite("link_wiggle_index_shift", v.iter().copied()).map_err(corrupt)?;
         }
@@ -6046,15 +5970,6 @@ impl FittedModel {
         }
         if let Some(v) = self.latent_measure.as_ref() {
             v.validate("latent_measure").map_err(corrupt)?;
-        }
-        if let Some(v) = self.survival_beta_time.as_ref() {
-            validate_all_finite("survival_beta_time", v.iter().copied()).map_err(corrupt)?;
-        }
-        if let Some(v) = self.survival_beta_threshold.as_ref() {
-            validate_all_finite("survival_beta_threshold", v.iter().copied()).map_err(corrupt)?;
-        }
-        if let Some(v) = self.survival_beta_log_sigma.as_ref() {
-            validate_all_finite("survival_beta_log_sigma", v.iter().copied()).map_err(corrupt)?;
         }
         Ok(())
     }

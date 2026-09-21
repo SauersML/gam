@@ -276,9 +276,7 @@ fn main() {
                 "[repro2748] OK in {dt:.2}s :: p={} finite={} warp_len={}",
                 s.fit.beta.len(),
                 s.fit.beta.iter().all(|v: &f64| v.is_finite()),
-                s.wiggle_saved_warp_beta
-                    .as_ref()
-                    .map_or(0, |beta| beta.len()),
+                s.fit.beta_link_wiggle().map_or(0, |beta| beta.len()),
             );
         }
         Ok(_) => eprintln!("[repro2748] unexpected result kind in {dt:.2}s"),

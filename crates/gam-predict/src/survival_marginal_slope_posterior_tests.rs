@@ -231,7 +231,7 @@ fn survival_surfaces(
 /// posterior quadrature does for each of its nodes.
 fn assign_survival_coefficients(model: &mut FittedModel, draw: &Array1<f64>) {
     assert!(
-        model.beta_baseline_timewiggle.is_none() && model.survival_beta_time.is_none(),
+        model.beta_baseline_timewiggle.is_none(),
         "this fixture carries its coefficients in the fit result only"
     );
     let fit = model

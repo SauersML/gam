@@ -2260,7 +2260,6 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
     assert_eq!(saved.formula, "Surv(entry, exit, event) ~ 1");
     assert_eq!(saved.formula_noise.as_deref(), Some("1"));
     assert_eq!(saved.survival_likelihood.as_deref(), Some("location-scale"));
-    assert!(saved.survival_beta_log_sigma.is_some());
     assert!(saved.resolved_termspec_noise.is_some());
     let fit_result = saved
         .fit_result
@@ -2270,22 +2269,17 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
         .beta_covariance()
         .or(fit_result.beta_covariance_corrected())
         .unwrap_or_else(|| panic!("{} failed", "saved survival fit covariance"));
-    let expected_p = saved
-        .survival_beta_time
-        .as_ref()
-        .unwrap_or_else(|| panic!("{} failed", "saved beta_time"))
-        .len()
-        + saved
-            .survival_beta_threshold
-            .as_ref()
-            .expect("saved beta_threshold")
-            .len()
-        + saved
-            .survival_beta_log_sigma
-            .as_ref()
-            .expect("saved beta_log_sigma")
-            .len()
-        + saved.beta_link_wiggle.as_ref().map_or(0, Vec::len);
+    // The fit's blocks are the only saved coefficient store (#4507).
+    let block_width = |role: BlockRole| {
+        fit_result
+            .block_by_role(role)
+            .map_or(0, |block| block.beta.len())
+    };
+    assert!(block_width(BlockRole::Scale) > 0, "saved fit has no log-sigma block");
+    let expected_p = block_width(BlockRole::Time)
+        + block_width(BlockRole::Threshold)
+        + block_width(BlockRole::Scale)
+        + block_width(BlockRole::LinkWiggle);
     assert_eq!(covariance.nrows(), expected_p);
     assert_eq!(covariance.ncols(), expected_p);
 
@@ -2332,17 +2326,14 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
 }
 
 #[test]
-fn saved_prediction_runtime_rejects_location_scale_survival_payload_drift() {
+/// #4507: the fit's blocks are the only coefficient store of a location-scale
+/// survival model, so a saved fit that lacks one of its blocks is refused by
+/// name instead of being patched from a payload-side copy.
+fn saved_prediction_runtime_rejects_location_scale_survival_fit_missing_threshold_block() {
     let blocks = vec![
         gam::estimate::FittedBlock {
             beta: array![0.1],
             role: BlockRole::Time,
-            edf: 1.0,
-            lambdas: Array1::zeros(0),
-        },
-        gam::estimate::FittedBlock {
-            beta: array![0.2],
-            role: BlockRole::Threshold,
             edf: 1.0,
             lambdas: Array1::zeros(0),
         },
@@ -2357,7 +2348,7 @@ fn saved_prediction_runtime_rejects_location_scale_survival_payload_drift() {
         blocks,
         Array1::zeros(0),
         1.0,
-        Some(Array2::<f64>::eye(3)),
+        Some(Array2::<f64>::eye(2)),
         None,
         None,
         saved_fit_summary_fixture(),
@@ -2382,24 +2373,22 @@ fn saved_prediction_runtime_rejects_location_scale_survival_payload_drift() {
     // structure: the field deliberately has no serde default, so a v11 artifact
     // states `null` for non-location-scale families or carries the complete
     // structure. Without it the runtime refuses on the MISSING STRUCTURE check
-    // before it ever reaches the coefficient-drift refusal this test pins, and
-    // the assertion reads a message about the wrong defect.
+    // before it ever reaches the missing-block refusal this test pins, and the
+    // assertion reads a message about the wrong defect.
     payload.survival_location_scale_structure = Some(SavedSurvivalLocationScaleStructure {
         time_parameterization: SurvivalLocationScaleTimeParameterization::MonotoneWarp,
         threshold_time_basis: None,
         log_sigma_time_basis: None,
     });
-    payload.survival_beta_time = Some(vec![9.9]);
-    payload.survival_beta_threshold = Some(vec![0.2]);
-    payload.survival_beta_log_sigma = Some(vec![-0.3]);
     let model = SavedModel::from_payload(payload);
 
     let err = model
         .saved_prediction_runtime()
-        .expect_err("payload drift should be rejected");
+        .expect_err("a location-scale survival fit without its threshold block must be refused");
     assert!(
         err.to_string()
-            .contains("saved time coefficients disagree with fit_result")
+            .contains("location-scale survival saved fit is missing threshold block"),
+        "unexpected refusal: {err}"
     );
 }
 
@@ -3616,7 +3605,6 @@ fn intercept_only_binomial_location_scale_model(
     payload.formula_noise = Some("1".to_string());
     payload.linkwiggle_knots = wiggle_knots;
     payload.linkwiggle_degree = wiggle_degree;
-    payload.beta_link_wiggle = beta_link_wiggle;
     payload.set_training_feature_metadata(vec![], vec![]);
     payload.resolved_termspec = Some(empty_termspec());
     payload.resolved_termspec_noise = Some(empty_termspec());
@@ -6939,7 +6927,6 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
     payload.survival_time_knots = time_build.knots.clone();
     payload.survival_time_keep_cols = time_build.keep_cols.clone();
     payload.survival_time_anchor = Some(time_anchor);
-    payload.survival_beta_time = Some(vec![0.0; p_time]);
     payload.survival_likelihood = Some("latent".to_string());
     payload.set_training_feature_metadata(
         vec!["entry".to_string(), "exit".to_string()],
@@ -7875,7 +7862,6 @@ fn survival_location_scale_saved_fit_preserves_linkwiggle_metadata() {
         .unwrap_or_else(|| panic!("{} failed", "saved survival fit_result should be present"));
     assert!(saved.linkwiggle_knots.is_some());
     assert!(saved.linkwiggle_degree.is_some());
-    assert!(saved.beta_link_wiggle.is_some());
     assert!(fit.block_by_role(BlockRole::LinkWiggle).is_some());
     assert_eq!(
         fit.artifacts.survival_link_wiggle_degree,
@@ -8045,23 +8031,16 @@ fn saved_linkwiggle_derivative_matches_exact_constrained_basis_chain_rule() {
             _ => 0.08,
         })
         .collect::<Vec<_>>();
-    let mut payload = test_payload(
-        "y ~ x",
-        ModelKind::LocationScale,
-        FittedFamily::LocationScale {
-            likelihood: LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Probit),
-            ),
-            base_link: Some(InverseLink::Standard(StandardLink::Probit)),
-        },
-        "binomial-location-scale",
+    // The wiggle coefficients are read from the fit's LinkWiggle block, the
+    // only saved coefficient store (#4507).
+    let model = intercept_only_binomial_location_scale_model(
+        0.0,
+        0.0,
+        Array2::<f64>::eye(2 + constrained_cols),
+        Some(beta_link_wiggle.clone()),
+        Some(knots),
+        Some(3),
     );
-    payload.link = Some(InverseLink::Standard(StandardLink::Probit));
-    payload.linkwiggle_knots = Some(knots);
-    payload.linkwiggle_degree = Some(3);
-    payload.beta_link_wiggle = Some(beta_link_wiggle.clone());
-    let model = SavedModel::from_payload(payload);
 
     let exact = test_saved_linkwiggle_derivative_q0(&q0, &model)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "exact derivative", e));
@@ -8428,7 +8407,11 @@ fn fit_survival_location_scale_live_warp_2695(degree: usize, internal_knots: usi
     )
     .unwrap_or_else(|e| panic!("degree={degree} survival location-scale fit failed: {e}"));
     let saved = SavedModel::load_from_path(&out_path).expect("load saved live-warp model");
-    let warp_width = saved.beta_link_wiggle.as_ref().map_or(0, |beta| beta.len());
+    let warp_width = saved
+        .fit_result
+        .as_ref()
+        .and_then(|fit| fit.block_by_role(BlockRole::LinkWiggle))
+        .map_or(0, |block| block.beta.len());
     if degree == 0 {
         assert_eq!(warp_width, 0, "a fit without linkwiggle saved a warp block");
     } else {
@@ -8504,7 +8487,11 @@ fn fit_save_predict_survival_location_scale_linkwiggle_3006(location: &str) {
         SurvivalLocationScaleTimeParameterization::ReducedParametricAft,
         "a constant-scale fit collapses the warp to the -log t location offset",
     );
-    let wiggle_width = saved.beta_link_wiggle.as_ref().map_or(0, |beta| beta.len());
+    let wiggle_width = saved
+        .fit_result
+        .as_ref()
+        .and_then(|fit| fit.block_by_role(BlockRole::LinkWiggle))
+        .map_or(0, |block| block.beta.len());
     assert!(wiggle_width > 0, "`{location}` fit saved no link-wiggle coefficients");
 
     let grid_path = dir.path().join("grid.csv");
