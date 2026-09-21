@@ -1228,6 +1228,7 @@ mod parity_tests {
     use super::{ClassPenaltyMetric, weighted_penalty_sum};
     use crate::binomial_multi::{BinomialMultiFitInputs, fit_penalized_binomial_multi};
     use crate::multinomial::{MultinomialFitInputs, fit_penalized_multinomial};
+    use gam_math::special::logistic;
     use gam_spec::{InverseLink, StandardLink};
     use gam_test_support::fd_checker::numerical_gradient_central_diff;
     use ndarray::{Array1, Array2};
@@ -1308,15 +1309,6 @@ mod parity_tests {
         );
     }
 
-    fn sigmoid(eta: f64) -> f64 {
-        if eta >= 0.0 {
-            1.0 / (1.0 + (-eta).exp())
-        } else {
-            let e = eta.exp();
-            e / (1.0 + e)
-        }
-    }
-
     /// Softmax with implicit reference column (η_ref = 0) over `M` active η.
     fn softmax_ref(eta_active: &[f64]) -> Vec<f64> {
         let m = eta_active.len();
@@ -1360,7 +1352,7 @@ mod parity_tests {
                 for i in 0..p {
                     eta += design[[row, i]] * beta[[i, a]];
                 }
-                let mu = sigmoid(eta).clamp(1.0e-12, 1.0 - 1.0e-12);
+                let mu = logistic(eta).clamp(1.0e-12, 1.0 - 1.0e-12);
                 let yv = y[[row, a]];
                 ll += yv * mu.ln() + (1.0 - yv) * (1.0 - mu).ln();
             }
@@ -1545,7 +1537,7 @@ mod parity_tests {
                 for i in 0..p {
                     eta += design[[row, i]] * fit.coefficients[[i, a]];
                 }
-                let mu = sigmoid(eta);
+                let mu = logistic(eta);
                 assert!(
                     (fit.fitted_probabilities[[row, a]] - mu).abs() < 1.0e-10,
                     "fitted probability must equal σ(X β̂)"

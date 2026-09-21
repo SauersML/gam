@@ -50,6 +50,7 @@
 //! in near-equal widths; sparse tails end in exact atoms where they matter.
 
 use gam_math::probability::{normal_logcdf, signed_probit_logcdf_and_mills_ratio};
+use gam_math::special::softplus;
 use rayon::prelude::*;
 
 use crate::latent_anchor::{AnchorGrid, AnchorGridOwned, solve_anchor};
@@ -206,11 +207,6 @@ fn log_max_hermite3_density(lo: f64, hi: f64) -> f64 {
         }
     }
     best
-}
-
-/// `log(1 + e^x)`.
-fn log1p_exp(x: f64) -> f64 {
-    if x > 36.0 { x } else { x.exp().ln_1p() }
 }
 
 /// A law's marginal tail at `(α, b)` on the smaller side, in log space.
@@ -476,7 +472,7 @@ impl CompressedLaw {
                 log_relative_error < 0.0
                     && shifted.log_tail + (-log_relative_error.exp()).ln_1p() > target
             } else {
-                shifted.log_tail + log1p_exp(log_relative_error) < target
+                shifted.log_tail + softplus(log_relative_error) < target
             }
         };
         for _ in 0..CERTIFICATE_DOUBLINGS {

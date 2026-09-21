@@ -3568,5 +3568,23 @@
     ],
     "reason": "#3001 step 2: a gauged smooth's saved-model replay formed B*(Q*T0) where the fit formed (B*Q)*T0, leaving mu 2 ulp off in 11 of 48 rows. The freeze now writes each collection-charted term's TERM-LOCAL chart z_local and its joint-null rotation Q into the spec, and the collection chart carries T0, so the replay applies Q, T0 and -C*R one at a time, as the fit does. restore_local_identifiability_chart rewrote the frozen composition z_local*Q*T0 back to z_local after the incremental psi driver froze the spec; the freeze itself now writes the local chart, so the rewrite and its post-freeze loop are deleted. FixedRowSpaceProjector::project_design returned both R and the lazily projected design X*T0 - C*R through its own block operator, a different product from the replay's subtract_row_space_correction; it is replaced by row_space_correction, which returns R only, and the fit forms X*T0 - C*R through subtract_row_space_correction, the same operator the replay uses.",
     "evidence": "At base 988f269d7e, git grep -n restore_local_identifiability_chart finds its declaration (spatial_optimization.rs:2928), its one call (spatial_optimization.rs:3396, the post-freeze loop) and three comments (design_construction.rs:4228 and 4262, spatial_hyper_dirs.rs:113); the declaration and call are deleted and the comments are rewritten to name the term-local freeze. git grep -n project_design finds its declaration (implicit_psi_derivative.rs:152), its one production call (term_design.rs:1315, realize_smooth_collection_gauge, now row_space_correction + subtract_row_space_correction) and one test call (implicit_psi_derivative.rs:4164, now asserting that the raw correction replays the dense projector's value). In the head tree git grep finds neither name. No bench, example, script or Python file names either."
+  },
+  {
+    "base": "e0cc6a6a49f08533ad51650a13bc9ae6a6bd0231",
+    "items": [
+      "crates/gam-models/src/fit_orchestration/gaussian_high_edf_observation_interval_tests.rs:fn:libm_erf",
+      "crates/gam-models/src/latent_law_compression.rs:fn:log1p_exp",
+      "crates/gam-models/src/penalized_vector_glm.rs:fn:sigmoid",
+      "crates/gam-models/src/survival/location_scale/paired_stacks.rs:fn:sigmoid_of_neg",
+      "crates/gam-models/tests/suite/multinomial_payload_matches_the_fit_2612.rs:fn:sigmoid",
+      "crates/gam-sae/src/inference/transport_class.rs:fn:log_add_exp",
+      "crates/gam-solve/src/estimate/gaussian_observation_interval_calibration_tests.rs:fn:erf_approx",
+      "crates/gam-solve/src/estimate/gaussian_observation_interval_calibration_tests.rs:fn:normal_cdf",
+      "crates/gam-solve/src/quadrature.rs:fn:logistic",
+      "crates/gam-solve/src/rho_optimizer/run_plan_dominated_plateau_2953_tests.rs:fn:logistic",
+      "crates/gam-solve/src/rho_optimizer/run_plan_dominated_plateau_2953_tests.rs:fn:softplus"
+    ],
+    "reason": "#3925: private scalar-kernel copies (logistic/sigmoid, softplus/log1p_exp, log_add_exp, and two Abramowitz-Stegun 7.1.26 erf approximations with a hand normal CDF) duplicated gam_math::special::{logistic, softplus, logaddexp} and gam_math::probability::normal_cdf; every call site now uses the gam_math kernel.",
+    "evidence": "https://github.com/SauersML/gam/issues/3925"
   }
 ]
