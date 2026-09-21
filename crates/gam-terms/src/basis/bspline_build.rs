@@ -397,16 +397,12 @@ pub(crate) fn build_bspline_basis_1d_realizing(
                 placement,
                 ..
             } => {
-                let inferred = *num_internal_knots;
-                Some(match placement {
-                    BSplineKnotPlacement::Uniform => {
-                        let range = finite_data_range(data)?;
-                        internal::generate_full_knot_vector(range, inferred, spec.degree)?
-                    }
-                    BSplineKnotPlacement::Quantile => {
-                        internal::generate_full_knot_vector_quantile(data, inferred, spec.degree)?
-                    }
-                })
+                Some(automatic_knot_vector(
+                    data,
+                    *num_internal_knots,
+                    *placement,
+                    spec.degree,
+                )?)
             }
             BSplineKnotSpec::PeriodicUniform { .. } => None,
         };
@@ -538,16 +534,8 @@ pub(crate) fn build_bspline_basis_1d_realizing(
                 placement,
                 ..
             } => {
-                let inferred = *num_internal_knots;
-                let knots = match placement {
-                    BSplineKnotPlacement::Uniform => {
-                        let range = finite_data_range(data)?;
-                        internal::generate_full_knot_vector(range, inferred, spec.degree)?
-                    }
-                    BSplineKnotPlacement::Quantile => {
-                        internal::generate_full_knot_vector_quantile(data, inferred, spec.degree)?
-                    }
-                };
+                let knots =
+                    automatic_knot_vector(data, *num_internal_knots, *placement, spec.degree)?;
                 let (basis, knots) = create_basis::<Sparse>(
                     data,
                     KnotSource::Provided(knots.view()),
@@ -600,16 +588,8 @@ pub(crate) fn build_bspline_basis_1d_realizing(
                 placement,
                 ..
             } => {
-                let inferred = *num_internal_knots;
-                let knots = match placement {
-                    BSplineKnotPlacement::Uniform => {
-                        let range = finite_data_range(data)?;
-                        internal::generate_full_knot_vector(range, inferred, spec.degree)?
-                    }
-                    BSplineKnotPlacement::Quantile => {
-                        internal::generate_full_knot_vector_quantile(data, inferred, spec.degree)?
-                    }
-                };
+                let knots =
+                    automatic_knot_vector(data, *num_internal_knots, *placement, spec.degree)?;
                 let (basis, knots) = create_basis::<Dense>(
                     data,
                     KnotSource::Provided(knots.view()),
@@ -3698,6 +3678,35 @@ pub(crate) fn maybe_auto_shrink_bspline_spec(
         BSplineKnotSpec::Provided(_)
         | BSplineKnotSpec::PeriodicUniform { .. }
         | BSplineKnotSpec::NaturalCubicRegression { .. } => (spec.clone(), None),
+    }
+}
+
+/// The clamped knot vector a [`BSplineKnotSpec::Automatic`] spec realizes on
+/// `data`: the one place each [`BSplineKnotPlacement`] becomes knots.
+fn automatic_knot_vector(
+    data: ArrayView1<'_, f64>,
+    num_internal_knots: usize,
+    placement: BSplineKnotPlacement,
+    degree: usize,
+) -> Result<Array1<f64>, BasisError> {
+    match placement {
+        BSplineKnotPlacement::Uniform => internal::generate_full_knot_vector(
+            finite_data_range(data)?,
+            num_internal_knots,
+            degree,
+        ),
+        BSplineKnotPlacement::Quantile => {
+            internal::generate_full_knot_vector_quantile(data, num_internal_knots, degree)
+        }
+        BSplineKnotPlacement::UniformRefined { root } => {
+            internal::generate_full_knot_vector_refined_uniform(
+                data,
+                finite_data_range(data)?,
+                root,
+                num_internal_knots,
+                degree,
+            )
+        }
     }
 }
 

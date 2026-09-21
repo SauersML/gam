@@ -109,7 +109,8 @@ pub fn apply_smooth_overrides(
 /// act on exactly the basis they always did, and the formula workflow never
 /// grows a smooth the caller described by hand. Uniform placement becomes the
 /// `Generate` vector over the covariate's range, which is the knot vector the
-/// adaptive spec builds.
+/// adaptive spec builds; a data-driven placement (quantile, or a refinement
+/// chain the loop already grew) stays `Automatic` and stops adapting.
 fn pin_adaptive_bspline_default(
     basis: &mut SmoothBasisSpec,
     data: &Dataset,
@@ -138,11 +139,15 @@ fn pin_adaptive_bspline_default(
                         num_internal_knots,
                     }
                 }
-                BSplineKnotPlacement::Quantile => BSplineKnotSpec::Automatic {
-                    num_internal_knots,
-                    placement,
-                    adaptive: false,
-                },
+                // Data-driven placements are not a function of the range
+                // alone, so the fixed spec replays the same placement.
+                BSplineKnotPlacement::Quantile | BSplineKnotPlacement::UniformRefined { .. } => {
+                    BSplineKnotSpec::Automatic {
+                        num_internal_knots,
+                        placement,
+                        adaptive: false,
+                    }
+                }
             };
             Ok(())
         }
