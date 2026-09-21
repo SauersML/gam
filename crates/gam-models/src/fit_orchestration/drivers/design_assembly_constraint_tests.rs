@@ -589,6 +589,31 @@ fn max_abs_diff_vector(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
 
 // `pub(super)` — shared with the sibling `adaptive_bounded_duchon_tests` #1601
 // re-home (its freeze/cache-rebuild pins compare two designs column-for-column).
+/// The scale a mismatch has to be read against: the largest entry either side
+/// carries, and the eigensolver-style band `p·ε·scale` that two assemblies of
+/// the SAME exact matrix cannot be expected to beat.
+///
+/// `max_abs=4.196e-10` (gam#2959) says nothing on its own. Against a block whose
+/// entries are 1e6 it is 4e-16 relative, the rounding of the two assemblies;
+/// against a block whose entries are 1e-2 it is a real disagreement and the
+/// memo did not clear. Every bar below is an UNDERIVED absolute literal `1e-10`
+/// (rule 23, gam#2469): it is left exactly as it was, because loosening a bar
+/// to make a test pass is forbidden, but no reader could tell those two cases
+/// apart from the old message, so the message now carries the scale.
+fn mismatch_scale(entries: impl Iterator<Item = f64>, count: usize) -> (f64, f64) {
+    let scale = entries.fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    (scale, count as f64 * f64::EPSILON * scale)
+}
+
+fn scale_note(left_scale: f64, right_scale: f64, band: f64, diff: f64) -> String {
+    let scale = left_scale.max(right_scale);
+    let relative = if scale > 0.0 { diff / scale } else { f64::NAN };
+    format!(
+        "(max|left|={left_scale:.6e}, max|right|={right_scale:.6e}, \
+         relative={relative:.6e}, two-assembly band p*eps*scale={band:.6e})"
+    )
+}
+
 pub(super) fn assert_term_collection_designs_match(
     left: &TermCollectionDesign,
     right: &TermCollectionDesign,
@@ -597,9 +622,12 @@ pub(super) fn assert_term_collection_designs_match(
     let left_design = left.design.to_dense();
     let right_design = right.design.to_dense();
     let design_diff = max_abs_diff_matrix(&left_design, &right_design);
+    let (left_scale, band) = mismatch_scale(left_design.iter().copied(), left_design.ncols());
+    let (right_scale, _) = mismatch_scale(right_design.iter().copied(), right_design.ncols());
     assert!(
         design_diff <= 1e-10,
-        "{label} design mismatch max_abs={design_diff}"
+        "{label} design mismatch max_abs={design_diff} {}",
+        scale_note(left_scale, right_scale, band, design_diff)
     );
     assert_eq!(
         left.penalties.len(),
@@ -617,9 +645,12 @@ pub(super) fn assert_term_collection_designs_match(
             "{label} penalty {idx} col_range mismatch"
         );
         let penalty_diff = max_abs_diff_matrix(&lp.local, &rp.local);
+        let (lp_scale, penalty_band) = mismatch_scale(lp.local.iter().copied(), lp.local.ncols());
+        let (rp_scale, _) = mismatch_scale(rp.local.iter().copied(), rp.local.ncols());
         assert!(
             penalty_diff <= 1e-10,
-            "{label} penalty {idx} mismatch max_abs={penalty_diff}"
+            "{label} penalty {idx} mismatch max_abs={penalty_diff} {}",
+            scale_note(lp_scale, rp_scale, penalty_band, penalty_diff)
         );
     }
     assert_eq!(

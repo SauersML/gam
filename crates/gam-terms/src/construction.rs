@@ -1577,7 +1577,11 @@ pub fn penalty_structural_ranks_at_rounding_band(
 /// eigenpairs at every ψ, so the priced penalty is a continuous function of the
 /// realized block. If the frozen rank exceeds the block's resolved eigenvalue
 /// count at this trial ([`gam_linalg::roundoff::resolved_eigenvalue_count`], the
-/// predicate the freeze counted with), the block's rank is unresolved. That trial
+/// predicate the freeze counted with), the block cannot be rooted at that rank.
+/// Two states reach that one count, and the refusal names which: the kept
+/// eigenvalue is inside the rounding band, so the rank is UNRESOLVED; or it is
+/// resolved below `−band`, so the block is INDEFINITE at this trial and is not
+/// the PSD Gram a penalty must be. That trial
 /// is refused (`TrialPointRefused`), never re-ranked. Hinted blocks keep their
 /// closed-form roots and are refused when that root's rank differs from the
 /// frozen rank.
@@ -1671,20 +1675,44 @@ fn canonicalize_penalty_spec_at_frozen_rank(
     let kept = &descending[..frozen_rank];
     let smallest_kept = analysis.eigenvalues[kept[frozen_rank - 1]];
     // The predicate the freeze counted with
-    // (`penalty_structural_ranks_at_rounding_band`). A kept eigenvalue inside the
-    // band is rounding of either sign, so the block's rank at this trial is
-    // unresolved: pricing it would put `ln(roundoff)` into `log|S|₊`, and its
-    // sign carries no information.
+    // (`penalty_structural_ranks_at_rounding_band`): a direction is penalized iff
+    // its eigenvalue is resolved ABOVE the band, so `resolved_eigenvalue_count`
+    // counts only `λ > band` and a resolved NEGATIVE eigenvalue is not a
+    // penalized direction either. The threshold is read from the one predicate
+    // (`resolved_eigenvalue_band`) rather than recomputed, so the number the
+    // refusal prints is the number the count compared against.
+    //
+    // TWO MECHANISMS, NOT ONE. The eigenvalues are sorted descending, so the
+    // `frozen_rank`-th largest failing `> band` means either
+    //   (a) it lies inside ±band: the block's rank at this trial is UNRESOLVED.
+    //       Pricing the direction would put `ln(roundoff)` into `log|S|₊`, and
+    //       its sign carries no information; or
+    //   (b) it lies below −band: the block is INDEFINITE here. That eigenvalue
+    //       is resolved, and its sign is a measurement — the block is not the
+    //       PSD Gram a penalty must be, and `analyze_penalty_block` reports such
+    //       a direction as negative curvature rather than refusing it.
+    // Both refuse this trial, because neither gives a rank-`frozen_rank` PSD
+    // root, but they are different findings and a refusal that names (a) for a
+    // block in state (b) sends the reader to the rounding band for a defect that
+    // is nowhere near it (gam#2959).
     let eigenvalues = analysis.eigenvalues.to_vec();
+    let band = gam_linalg::roundoff::resolved_eigenvalue_band(&eigenvalues, 0.0);
     if gam_linalg::roundoff::resolved_eigenvalue_count(&eigenvalues, 0.0) < frozen_rank {
-        let rounding_band = gam_linalg::roundoff::symmetric_spectrum_rounding_band(&eigenvalues);
-        return Err(EstimationError::TrialPointRefused {
-            reason: format!(
-                "{context}: penalty block idx={idx} was frozen at structural rank {frozen_rank}, \
-                 but at this trial its smallest kept eigenvalue {smallest_kept:e} is unresolved \
-                 within the Gram's rounding band {rounding_band:e}"
-            ),
-        });
+        let head = format!(
+            "{context}: penalty block idx={idx} was frozen at structural rank {frozen_rank}, \
+             but at this trial its {frozen_rank}-th largest eigenvalue {smallest_kept:e}"
+        );
+        let reason = if smallest_kept < -band {
+            format!(
+                "{head} is negative and resolved below the Gram's rounding band {band:e}: \
+                 the block is indefinite at this trial, not unresolved, and it carries \
+                 {} resolved penalized direction(s)",
+                gam_linalg::roundoff::resolved_eigenvalue_count(&eigenvalues, 0.0)
+            )
+        } else {
+            format!("{head} is unresolved within the Gram's rounding band {band:e}")
+        };
+        return Err(EstimationError::TrialPointRefused { reason });
     }
     let mut root = Array2::zeros((frozen_rank, block_dim));
     let mut positive_eigenvalues = Vec::with_capacity(frozen_rank);
