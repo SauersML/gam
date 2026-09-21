@@ -181,7 +181,10 @@ impl OuterProblemSize {
 /// `τ_stat = 1/(2n)` over `n_obs` observations, the criterion resolution
 /// [`OuterProblemSize::statistical_resolution`] documents, for callers outside
 /// this crate that judge a criterion the outer engine certified at it (the
-/// κ-profile inference endpoints, #3245). `None` when `n_obs` is zero.
+/// κ-profile inference endpoints, #3245). It is public so such a consumer
+/// re-examines an outer-certified point against the SAME resolution the
+/// certificate used, rather than raising a second, independent bar of its own
+/// (#3453). `None` when `n_obs` is zero.
 pub fn criterion_statistical_resolution(n_obs: usize) -> Option<f64> {
     (n_obs > 0).then(|| 0.5 / n_obs as f64)
 }

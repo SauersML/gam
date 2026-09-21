@@ -158,25 +158,34 @@ where
     Ok((endpoint, false))
 }
 
-/// The largest decrease the second-order model `m(t) = s·t + ½·max(c, 0)·t²`
-/// of the profile predicts over the feasible displacements `t ∈ [lower, upper]`
-/// (`lower ≤ 0 ≤ upper`). Negative curvature is dropped rather than trusted, so
-/// a non-convex point is judged by its slope over the whole feasible range —
-/// which is the conservative reading, never a smaller predicted decrease.
+/// The largest decrease the exact second-order model `m(t) = s·t + ½·c·t²` of
+/// the profile predicts over the feasible displacements `t ∈ [lower, upper]`
+/// (`lower ≤ 0 ≤ upper`).
+///
+/// `c` enters with its own sign. A quadratic attains its minimum over an
+/// interval either at its stationary point, which exists and is a minimum only
+/// for `c > 0`, or at an endpoint, so the minimum is the least of those three
+/// candidates. `t = 0` is feasible and `m(0) = 0`, so the decrease is never
+/// negative.
+///
+/// Dropping a negative `c` instead — judging a concave point by its slope alone
+/// — is NOT the conservative reading: it deletes the `½·c·t²` term that makes
+/// `m` fall away, so it reports a SMALLER decrease and certifies a local
+/// MAXIMUM along κ as an optimum whenever the slope there is small (#3453).
 ///
 /// At an interior minimum this is `s²/(2c)`, half the squared Newton decrement
 /// the outer certificate bounds; at a rail with the slope pointing out of the
 /// box the feasible side has zero length and the decrease is exactly zero.
 fn profile_model_decrease(score: f64, curvature: f64, lower: f64, upper: f64) -> f64 {
-    let convex = curvature.max(0.0);
-    let step = if convex > 0.0 {
-        (-score / convex).clamp(lower, upper)
-    } else if score > 0.0 {
-        lower
-    } else {
-        upper
-    };
-    -(score * step + 0.5 * convex * step * step)
+    let model = |t: f64| score * t + 0.5 * curvature * t * t;
+    let mut lowest = model(lower).min(model(upper));
+    if curvature > 0.0 {
+        let stationary = -score / curvature;
+        if stationary > lower && stationary < upper {
+            lowest = lowest.min(model(stationary));
+        }
+    }
+    -lowest
 }
 
 fn curvature_profile_ci_from_analytic_score<F>(
@@ -498,6 +507,95 @@ mod curvature_profile_score_tests {
             .is_err(),
             "a non-stationary INTERIOR point is not an optimum and must still be refused"
         );
+    }
+
+    /// gam#3453: this layer used to re-test κ̂ against its own bar
+    /// `|V_p'| ≤ max(rt, √ε)·(1 + |V_p|)`, which is in raw gradient units and
+    /// scales with the ADDITIVE level of the criterion — so it refused κ̂ values
+    /// the outer κ solve had already certified, and its verdict changed when a
+    /// constant was added to `V_p`. Every check is now a predicted DECREASE in
+    /// the criterion judged against the criterion's own resolution, which no
+    /// additive constant moves. The reproducer's point is pinned at three levels
+    /// spanning seven orders, together with the two shapes that must still be
+    /// refused at every level.
+    #[test]
+    fn an_outer_certified_kappa_hat_is_accepted_at_the_decrement_resolution_3453() {
+        let kappa_hat = -1.1759;
+        let curvature = 59.0;
+        let quadratic = |level: f64, gradient: f64| {
+            move |kappa: f64| -> Result<(f64, f64, f64), String> {
+                let d = kappa - kappa_hat;
+                Ok((
+                    level + gradient * d + 0.5 * curvature * d * d,
+                    gradient + curvature * d,
+                    curvature,
+                ))
+            }
+        };
+        // The issue's certified point: its predicted decrease `g²/(2H)` is five
+        // orders below the resolution, so it is stationary at the bar the outer
+        // solve certified it against.
+        let certified_gradient = -4.04e-3;
+        assert!(
+            certified_gradient * certified_gradient / (2.0 * curvature) < TEST_RESOLUTION,
+            "the reproducer's point must be stationary at the criterion resolution"
+        );
+        for level in [0.0, 5.8e2, 1.0e7] {
+            let mut profile = quadratic(level, certified_gradient);
+            let ci = curvature_profile_ci_from_analytic_score(
+                &mut profile,
+                kappa_hat,
+                -3.0,
+                3.0,
+                0.95,
+                TEST_RESOLUTION,
+            )
+            .unwrap_or_else(|e| panic!("certified kappa_hat refused at V level {level}: {e}"));
+            assert_eq!(
+                ci.kappa_hat_support,
+                gam_geometry::curvature_estimand::KappaEstimateSupport::Interior
+            );
+            assert!(ci.ci_lo < kappa_hat && kappa_hat < ci.ci_hi && ci.ci_hi < 0.0);
+        }
+
+        // A gradient whose predicted decrease exceeds the resolution is a real
+        // missed descent, and is still refused at every level.
+        let resolvable_gradient = 1.1 * (2.0 * TEST_RESOLUTION * curvature).sqrt();
+        assert!(
+            resolvable_gradient * resolvable_gradient / (2.0 * curvature) > TEST_RESOLUTION,
+            "the refused arm must actually exceed the resolution"
+        );
+        for level in [0.0, 1.0e7] {
+            let mut profile = quadratic(level, resolvable_gradient);
+            let error = curvature_profile_ci_from_analytic_score(
+                &mut profile,
+                kappa_hat,
+                -3.0,
+                3.0,
+                0.95,
+                TEST_RESOLUTION,
+            )
+            .expect_err("a resolvable decrease is not a stationary point");
+            assert!(error.contains("non-stationary"), "{error}");
+        }
+
+        // Concave with a gradient far below the resolution: dropping the
+        // negative curvature would report a decrease of 4e-9 and certify this
+        // local MAXIMUM. The exact model reports 8.7 over the same box.
+        let mut concave = |kappa: f64| -> Result<(f64, f64, f64), String> {
+            let d = kappa - kappa_hat;
+            Ok((-1.0e-9 * d - 0.5 * d * d, -1.0e-9 - d, -1.0))
+        };
+        let error = curvature_profile_ci_from_analytic_score(
+            &mut concave,
+            kappa_hat,
+            -3.0,
+            3.0,
+            0.95,
+            TEST_RESOLUTION,
+        )
+        .expect_err("a concave point is a maximum along kappa, not an optimum");
+        assert!(error.contains("non-stationary"), "{error}");
     }
 }
 
