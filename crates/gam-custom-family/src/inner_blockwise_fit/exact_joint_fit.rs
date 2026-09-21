@@ -7972,8 +7972,6 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // A budget exit carries no certificate, so it carries no Laplace
         // log-determinants either: the artifacts and the flag are read from the
         // same value rather than recomputed from a condition that cannot hold.
-        // A budget exit carries no certificate, so it carries no Laplace
-        // log-determinants either; the certified exit returned above.
         let (block_logdet_h, block_logdet_s): (Option<f64>, Option<f64>) = (None, None);
         // The joint score is reloaded immediately after every accepted
         // step and beta is restored before every rejected one, so the
