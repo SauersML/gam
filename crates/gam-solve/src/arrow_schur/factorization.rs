@@ -418,7 +418,6 @@ pub(crate) fn factor_gauge_deflated_evidence_row(
     d: usize,
     gauges: &[Array1<f64>],
 ) -> Option<ArrowRowFactorResult> {
-    const GAUGE_RAYLEIGH_EPS: f64 = 1.0e-8;
     if gauges.is_empty() {
         return None;
     }
@@ -450,7 +449,26 @@ pub(crate) fn factor_gauge_deflated_evidence_row(
         // |g^T H g| <= eps * scale * |g|^2 qualifies (the absolute value is what
         // makes this two-sided: a large-magnitude curvature of EITHER sign is
         // disqualified, so only a genuine near-null orbit is deflated).
-        let qualification_bar = GAUGE_RAYLEIGH_EPS * max_diag * norm_sq;
+        // #2822 — ONE ANCHOR FOR "FLAT", NOT A SECOND LITERAL.
+        //
+        // This bar read a private `GAUGE_RAYLEIGH_EPS: f64 = 1.0e-8` declared inside
+        // this function, 134 lines above this same file's own
+        // `pub use gam_linalg::utils::SPECTRAL_DEFLATION_REL_FLOOR` — the same number,
+        // written twice, in one file, for one notion. The anchor's doc names THIS
+        // consumer by name ("the per-row `H_tt` eigen-cutoff, matched to the gauge
+        // Rayleigh qualifier and the `SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF` data-null
+        // detection so the deflation paths agree on what 'flat' means"), states the rule
+        // the duplicate broke ("two independent consumers derive from it and must not
+        // drift") and says outright why it lives in the linear-algebra layer at all:
+        // "a second literal would be an unanchored magic constant".
+        //
+        // So the two per-row deflation decisions in this file now read ONE constant:
+        // the spectral eigen-cutoff at `SPECTRAL_DEFLATION_REL_FLOOR * max|lambda|`, and
+        // this gauge qualifier at `SPECTRAL_DEFLATION_REL_FLOOR * max_diag * |g|^2`.
+        // The value is unchanged — both literals were `1.0e-8` — so every qualification
+        // decision is bit-identical; what is removed is the seam at which the engine's
+        // finest resolvable curvature contrast could stop meaning one thing.
+        let qualification_bar = SPECTRAL_DEFLATION_REL_FLOOR * max_diag * norm_sq;
         if curvature.abs() > qualification_bar {
             // #2228/#2500: record how far the CLOSEST disqualified direction was.
             // This gate is all-or-nothing — `gauge_deflated_directions` does not
@@ -479,7 +497,7 @@ pub(crate) fn factor_gauge_deflated_evidence_row(
              gauges={})",
             closest_disqualified_ratio,
             closest_disqualified_curvature,
-            GAUGE_RAYLEIGH_EPS,
+            SPECTRAL_DEFLATION_REL_FLOOR,
             max_diag,
             gauges.len(),
         );

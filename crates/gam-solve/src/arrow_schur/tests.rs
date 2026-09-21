@@ -856,7 +856,7 @@ pub(crate) fn evidence_row_spectral_deflates_indefinite_non_gauge_block_at_unit_
     let k = 2usize;
 
     // Pre-stationarity block: e_1 is a near-null GAUGE direction (curvature
-    // 1e-10, far below GAUGE_RAYLEIGH_EPS·max_diag = 1e-8·4 = 4e-8, so it
+    // 1e-10, far below SPECTRAL_DEFLATION_REL_FLOOR·max_diag = 1e-8·4 = 4e-8, so it
     // qualifies for Faddeev-Popov deflation), e_2 is GENUINELY indefinite
     // (eigenvalue −1.0 — real negative curvature, NOT a gauge orbit). The
     // gauge deflation lifts only e_1 (→ +1), leaving the −1.0 along e_2, so
