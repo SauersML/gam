@@ -6,6 +6,7 @@
 use crate::cli_args::{
     JointEventsAction, JointEventsArgs, JointEventsFitArgs, JointEventsForecastArgs,
 };
+use crate::cli_errors::CliResult;
 use gam::event_history::MarkKind;
 use gam::event_history::joint::{
     EventTable, JointEventModel, JointTables, SubjectTable, fit_joint_event_model,
@@ -77,7 +78,7 @@ fn read_tables(subjects: &Path, events: &Path) -> Result<JointTables, String> {
     })
 }
 
-fn fit(args: JointEventsFitArgs) -> Result<(), String> {
+fn fit(args: JointEventsFitArgs) -> CliResult<()> {
     let tables = read_tables(&args.subjects, &args.events)?;
     let marks = if args.marks.is_empty() {
         None
@@ -92,15 +93,16 @@ fn fit(args: JointEventsFitArgs) -> Result<(), String> {
         Some(pairs)
     };
     let model = fit_joint_event_model(marks, &tables).map_err(|e| e.to_string())?;
-    model.save(&args.out).map_err(|e| e.to_string())
+    model.save(&args.out)?;
+    Ok(())
 }
 
 fn rows(matrix: &Array2<f64>) -> Vec<Vec<f64>> {
     matrix.rows().into_iter().map(|r| r.to_vec()).collect()
 }
 
-fn forecast(args: JointEventsForecastArgs) -> Result<(), String> {
-    let model = JointEventModel::load(&args.model).map_err(|e| e.to_string())?;
+fn forecast(args: JointEventsForecastArgs) -> CliResult<()> {
+    let model = JointEventModel::load(&args.model)?;
     let tables = read_tables(&args.subjects, &args.events)?;
     let conditioned = model.condition(&tables).map_err(|e| e.to_string())?;
     let mut forecasts = Vec::with_capacity(conditioned.len());
@@ -126,19 +128,20 @@ fn forecast(args: JointEventsForecastArgs) -> Result<(), String> {
         .map_err(|error| format!("serialising the forecasts: {error}"))?;
     match &args.out {
         Some(path) => std::fs::write(path, text)
-            .map_err(|error| format!("writing {}: {error}", path.display())),
+            .map_err(|error| format!("writing {}: {error}", path.display()))?,
         None => {
             use std::io::Write;
             let mut stdout = std::io::stdout().lock();
             stdout
                 .write_all(text.as_bytes())
                 .and_then(|()| stdout.write_all(b"\n"))
-                .map_err(|error| format!("writing the forecasts to stdout: {error}"))
+                .map_err(|error| format!("writing the forecasts to stdout: {error}"))?;
         }
     }
+    Ok(())
 }
 
-pub(crate) fn run_joint_events(args: JointEventsArgs) -> Result<(), String> {
+pub(crate) fn run_joint_events(args: JointEventsArgs) -> CliResult<()> {
     match args.action {
         JointEventsAction::Fit(args) => fit(args),
         JointEventsAction::Forecast(args) => forecast(args),

@@ -72,6 +72,29 @@ pub enum SavedModelError {
     },
 }
 
+impl SavedModelError {
+    /// Who has to act on this refusal: the one category every front end
+    /// classifies it by. A document this reader refuses (another kind or
+    /// version, a malformed body, a state its law cannot hold) is a payload
+    /// refusal, [`ErrorCategory::Data`](gam_problem::ErrorCategory::Data),
+    /// remedied by refitting or re-saving the model (gam#3008). A file that
+    /// cannot be read or written is the caller's path, so it is
+    /// [`ErrorCategory::Formula`](gam_problem::ErrorCategory::Formula), the
+    /// category the CLI gives every path it cannot read or write; Python raises
+    /// the `OSError` subclass its kind names instead. Exhaustive with no
+    /// wildcard arm.
+    #[must_use]
+    pub fn error_category(&self) -> gam_problem::ErrorCategory {
+        match self {
+            Self::Kind { .. }
+            | Self::Version { .. }
+            | Self::Malformed { .. }
+            | Self::Inconsistent { .. } => gam_problem::ErrorCategory::Data,
+            Self::Io { .. } => gam_problem::ErrorCategory::Formula,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Envelope<'m, T> {
     kind: &'static str,
@@ -523,6 +546,31 @@ mod tests {
             read_saved_model_file(&scratch.0),
             Err(SavedModelError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound
         ));
+    }
+
+    /// Every refused document is a data refusal and an unreadable path is the
+    /// caller's, whichever front end reports it.
+    #[test]
+    fn refusals_name_the_category_every_front_end_reports() {
+        use gam_problem::ErrorCategory;
+        let text = saved_model_text("test", 3, &vec![0.5_f64]).unwrap();
+        let refusals = [
+            read_saved_model_text::<Vec<f64>>(&text, "other", 3).unwrap_err(),
+            read_saved_model_text::<Vec<f64>>(&text, "test", 4).unwrap_err(),
+            read_saved_model_text::<Vec<f64>>("{", "test", 3).unwrap_err(),
+            saved_model_text("test", 3, &vec![f64::NAN]).unwrap_err(),
+        ];
+        assert!(matches!(refusals[0], SavedModelError::Kind { .. }));
+        assert!(matches!(refusals[1], SavedModelError::Version { .. }));
+        assert!(matches!(refusals[2], SavedModelError::Malformed { .. }));
+        assert!(matches!(refusals[3], SavedModelError::Inconsistent { .. }));
+        for refusal in &refusals {
+            assert_eq!(refusal.error_category(), ErrorCategory::Data, "{refusal}");
+        }
+        let directory = ScratchDirectory::new();
+        let missing = read_saved_model_file(&directory.0.join("missing.json")).unwrap_err();
+        assert!(matches!(missing, SavedModelError::Io { .. }), "{missing}");
+        assert_eq!(missing.error_category(), ErrorCategory::Formula);
     }
 
     /// A scratch directory removed with its contents when dropped.

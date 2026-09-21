@@ -9,9 +9,9 @@ pub(crate) type CliResult<T> = Result<T, CliError>;
 /// Typed library errors keep the category their own type declares, so the exit
 /// code names the same category as the Python exception class: a saved model
 /// the engine refuses to read is a [`ErrorCategory::Data`] refusal, as
-/// `FittedModelError::error_category` declares. The CLI's own refusals (a flag
-/// conflict, an output path it cannot write) are the invocation being wrong,
-/// so they are
+/// `FittedModelError::error_category` and `SavedModelError::error_category`
+/// declare. The CLI's own refusals (a flag conflict, an output path it cannot
+/// write) are the invocation being wrong, so they are
 /// [`ErrorCategory::Formula`], the code the argument parser already uses for a
 /// malformed invocation.
 #[derive(Debug, Error)]
@@ -138,5 +138,13 @@ impl From<gam::estimate::EstimationError> for CliError {
 impl From<gam_sae::manifold::SaeFitError> for CliError {
     fn from(err: gam_sae::manifold::SaeFitError) -> Self {
         Self::typed(err.to_string(), err.advice(), err.error_category())
+    }
+}
+
+impl From<gam_model_api::saved_model::SavedModelError> for CliError {
+    fn from(err: gam_model_api::saved_model::SavedModelError) -> Self {
+        // `SavedModelError` declares no advice, so, as on the Python side, the
+        // refusal carries its category and message only.
+        Self::typed(err.to_string(), None, err.error_category())
     }
 }
