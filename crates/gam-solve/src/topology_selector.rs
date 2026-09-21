@@ -1293,20 +1293,19 @@ fn topology_score_disagreement_warnings(
 // ===========================================================================
 
 /// One fitted entry of the discrete-mixture rung: the mixture order `k`, the
-/// fitted Gaussian mixture, and its BIC-form negative log evidence. Lower is
-/// better.
+/// fitted Gaussian mixture, and its Laplace log evidence. Higher is better.
 #[derive(Debug, Clone)]
 pub struct MixtureRungFit {
     pub k: usize,
     pub fit: crate::evidence::GaussianMixtureFit,
-    /// Free-parameter count `P` in the `P log(n) / 2` BIC price.
+    /// Free-parameter count `P` of the order-`k` mixture.
     pub num_parameters: usize,
-    /// `-loglik + P log(n) / 2`, on the smooth parametric candidates' scale.
-    pub bic: f64,
+    /// Laplace log marginal likelihood `ln Z_k` of the order.
+    pub log_evidence: f64,
 }
 
 /// Result of fitting the mixture rung: every fitted order plus the index
-/// of the in-class winner (lowest BIC).
+/// of the in-class winner (highest log evidence).
 #[derive(Debug, Clone)]
 pub struct MixtureRungResult {
     pub fits: Vec<MixtureRungFit>,
@@ -1434,27 +1433,27 @@ fn fit_mixture_rung_with_minimum_order(
         match fit_gaussian_mixture(data, k, config) {
             Ok(fit) => {
                 let num_parameters = fit.num_free_parameters();
-                let bic = fit.bic();
-                if bic.is_finite() {
+                let log_evidence = fit.log_evidence();
+                if log_evidence.is_finite() {
                     fits.push(MixtureRungFit {
                         k,
                         fit,
                         num_parameters,
-                        bic,
+                        log_evidence,
                     });
                     None
                 } else {
                     Some(AdaptiveRungOrderFailure {
                         k,
                         stage: AdaptiveRungFailureStage::Evidence,
-                        message: "BIC is not finite".to_string(),
+                        message: "log evidence is not finite".to_string(),
                     })
                 }
             }
-            Err(error) => Some(AdaptiveRungOrderFailure {
+            Err(message) => Some(AdaptiveRungOrderFailure {
                 k,
                 stage: AdaptiveRungFailureStage::Fit,
-                message: error.to_string(),
+                message,
             }),
         }
     };
@@ -1468,14 +1467,18 @@ fn fit_mixture_rung_with_minimum_order(
 
     // Walk the order up from the class minimum until the running winner is
     // bracketed: both immediate neighbours attempted and not better. The running
-    // winner uses the same rule as the final ranking (lower BIC, ties to the
-    // smaller k), so the walk and the ranking can never disagree about who the
+    // winner uses the same rule as the final ranking (higher log evidence, ties
+    // to the smaller k), so the walk and the ranking can never disagree about who the
     // winner is. The walk is bounded by the rows (k <= n); no ladder of orders
     // and no probe budget is consulted (SPEC rule 18, #2902).
     loop {
         let Some(best_k) = fits
             .iter()
-            .min_by(|a, b| a.bic.total_cmp(&b.bic).then(a.k.cmp(&b.k)))
+            .max_by(|a, b| {
+                a.log_evidence
+                    .total_cmp(&b.log_evidence)
+                    .then(b.k.cmp(&a.k))
+            })
             .map(|f| f.k)
         else {
             return Err(AdaptiveRungError::InvalidInput {
@@ -1497,12 +1500,12 @@ fn fit_mixture_rung_with_minimum_order(
             });
         }
     }
-    // In-class winner-take-all on the BIC scale (lower wins).
+    // In-class winner-take-all on the negative log evidence (lower wins).
     let ranked = rank_priority_candidates(
         fits.into_iter()
             .enumerate()
             .map(|(idx, row)| {
-                let score = row.bic;
+                let score = -row.log_evidence;
                 let tie = row.k; // simpler (smaller k) wins ties
                 PriorityCandidate::new(row, idx, score, tie)
             })
@@ -1745,10 +1748,11 @@ pub struct PredictiveRaceVerdict {
     pub candidate_names: Vec<String>,
     /// Whether the race actually mixed model classes (smooth vs discrete).
     pub is_cross_class: bool,
-    /// Each candidate's BIC/2, `−log-likelihood + ½·k·log n` on the shared
-    /// negative-log-likelihood scale (lower is better): a Schwarz approximation,
-    /// not a marginal likelihood. It corroborates a stacking headline and decides
-    /// only a same-class race.
+    /// Each candidate's approximate negative log evidence (lower is better): the
+    /// Laplace `−ln Z` for a candidate priced by a marginal likelihood (the free
+    /// Gaussian mixture), or the Schwarz `−log-likelihood + ½·k·log n` for one
+    /// still priced by BIC. It corroborates a stacking headline and decides only
+    /// a same-class race.
     pub bic_half: Vec<f64>,
     /// Stacking weights over the candidates (present iff `headline` is
     /// [`Headline::Stacking`]).
@@ -1813,8 +1817,9 @@ impl EvidenceCertification {
 /// per CV fold.
 pub struct PredictiveRaceCandidate<'a> {
     pub kind: PredictiveCandidateKind,
-    /// `−log-likelihood + ½·k·log n` (lower wins). A Schwarz approximation, not a
-    /// marginal likelihood.
+    /// Approximate negative log evidence (lower wins): the Laplace `−ln Z` for a
+    /// candidate priced by a marginal likelihood, or the Schwarz
+    /// `−log-likelihood + ½·k·log n` for one still priced by BIC.
     pub bic_half: f64,
     /// Certification of `bic_half`.
     pub certification: EvidenceCertification,

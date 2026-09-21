@@ -3898,5 +3898,30 @@
     ],
     "reason": "#4560: this test asserted the behaviour the issue removes, that an underivable theta root displacement 'grants nothing' and is priced as zero (`negbin_theta_joint_bound(theta, &scores, NAN) == rounding`). d502dbe66c makes the bound refuse with the missing component by name, and negbin_theta_joint_bound_4560_tests pins the new contract: an exact positive control on dyadic values, one test withholding each component by name, and one requiring every non-finite or negative displacement to refuse. A test-scoped item; nothing outside its module named it.",
     "evidence": "git grep joint_bound_adds_rounding_band_and_root_displacement at the landing parent returns only its declaration; the replacement tests are in the same file's negbin_theta_joint_bound_4560_tests module."
+  },
+  {
+    "base": "26ab422f458ff8d1de6d2f4981705cb95f085ad7",
+    "items": [
+      "crates/gam-solve/src/evidence.rs:struct:GaussianMixtureCheckpoint",
+      "crates/gam-solve/src/evidence.rs:enum:GaussianMixtureError",
+      "crates/gam-solve/src/evidence.rs:const:EM_RATE_WINDOW",
+      "crates/gam-solve/src/evidence.rs:fn:run_gaussian_mixture_em",
+      "crates/gam-solve/src/evidence.rs:fn:mixture_e_step",
+      "crates/gam-solve/src/evidence.rs:fn:mixture_m_step",
+      "crates/gam-solve/src/evidence.rs:fn:constrain_covariance",
+      "crates/gam-solve/src/evidence.rs:fn:constrained_data_covariance",
+      "crates/gam-solve/src/evidence.rs:fn:em_contraction_rate",
+      "crates/gam-solve/src/evidence.rs:fn:em_projected_iterations",
+      "crates/gam-solve/src/evidence.rs:fn:mixture_data_fingerprint",
+      "crates/gam-solve/src/evidence.rs:fn:validate_gaussian_mixture_checkpoint",
+      "crates/gam-solve/src/evidence.rs:fn:em_contraction_rate_recovers_a_planted_geometric_decay",
+      "crates/gam-solve/src/evidence.rs:fn:em_contraction_rate_does_not_contract_on_a_flat_or_growing_residual",
+      "crates/gam-solve/src/evidence.rs:fn:em_projected_iterations_inverts_the_decay_and_declines_otherwise",
+      "crates/gam-solve/src/evidence.rs:fn:gaussian_mixture_bic_is_finite_with_an_active_covariance_floor",
+      "crates/gam-solve/src/evidence.rs:fn:gaussian_mixture_fit_certificate_describes_the_exact_returned_iterate",
+      "crates/gam-solve/src/evidence.rs:fn:two_cluster_mixture_data"
+    ],
+    "reason": "#4562: the free full-covariance Gaussian-mixture rung is priced by its Laplace marginal likelihood instead of by EM plus BIC, so the EM map, its resume checkpoint, its typed error, its contraction-rate projection and the covariance-floor constraint all lose their consumer. GaussianMixtureFit::bic, ::certificate and ::iterations go with them, but those three names are NOT listed here: RingGaussianMixtureFit still declares bic, certificate and iterations in the same file, and the ring rung keeps its EM and its Schwarz price. The covariance floor is deleted rather than replaced: the Wishart(d+1, S^-1) prior keeps every component precision finite even for a component holding one row or none, so the mode is interior for every k and no floor is needed.",
+    "evidence": "The free rung's entry point fit_gaussian_mixture now calls gaussian_mixture_laplace::fit_mixture_laplace and reads only kmeans_max_iter from GaussianMixtureConfig; the remaining EM fields serve fit_ring_gaussian_mixture, whose ring_mixture_e_step, bic() and certificate() are untouched. No file outside crates/gam-solve names GaussianMixtureCheckpoint or GaussianMixtureError, and the gam-solve mod.rs re-export of the checkpoint is removed in the same commit."
   }
 ]

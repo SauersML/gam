@@ -1,5 +1,36 @@
 ## Unreleased
 
+- **The free Gaussian-mixture rung is priced by its Laplace evidence, not by EM and BIC** (gam#4562).
+  The discrete-mixture rung fitted a full-covariance mixture by EM under a
+  `covariance_floor` of `1e-6` and scored the order by `BIC/2 = −loglik + (P/2) ln n`.
+  BIC was chosen for three stated reasons, and all three were properties of that fit
+  rather than of the model: an outer product of per-observation scores is not an observed
+  Hessian, a floored covariance can put a component on a boundary where an interior
+  Laplace expansion is invalid, and without a declared parameter prior and its Jacobian a
+  raw Hessian determinant changes under reparametrization. The order is now priced by the
+  marginal likelihood `Z_k = ∫ Π_i Σ_j π_j N(y_i | μ_j, Ω_j⁻¹) π(π) Π_j π(μ_j) π(Ω_j)`
+  under proper priors carried on the data's own scale: `π ~ Dirichlet(1)`,
+  `μ_j ~ N(ȳ, S)` and `Ω_j ~ Wishart(d + 1, S⁻¹)`, the least-informative Wishart with a
+  finite mean. Each of the three objections is answered rather than worked around. The
+  Hessian is the exact analytic one at the mode `opt::Arc` certifies, so no score outer
+  product is involved. The Wishart prior keeps every component precision finite even for
+  a component holding one row or none, so the mode is interior for every `k` and the
+  covariance floor is deleted rather than replaced. And the chart carries every Jacobian
+  it needs — `dπ = Π_j π_j dz` for the additive log-ratio chart of the simplex,
+  `dΩ = 2^d Π_a R_aa^{d−a} dR` (Bartlett) and `dR_aa = R_aa dρ_a` — so the evidence is
+  invariant to the chart and equivariant under an affine change of the rows: replacing
+  `y` by `Ay + b` shifts `ln Z_k` by exactly `−n ln|det A|` for every order. The `k!`
+  relabellings of the mode carry identical mass and contribute `ln k!`. A mode the solver
+  cannot certify, or one whose negated Hessian is not positive definite, is refused: that
+  order has no evidence, and nothing falls back to a likelihood score for it.
+  **Behavior change:** the free-mixture rung ranks orders by the highest `ln Z_k`, where
+  it ranked by the lowest `BIC/2`, so a shape race that included it can select a different
+  order; ties now go to the smaller `k` on the evidence scale. `GaussianMixtureFit`
+  reports `log_evidence()` and its rounding band `log_evidence_band()` in place of `bic()`,
+  `certificate()` and `iterations()`, and the EM resume type `GaussianMixtureCheckpoint` is
+  gone. The ring rung is unchanged: it keeps its EM, its fixed-point certificate and its
+  Schwarz price, and the shared `bic_half` column now carries a Laplace `−ln Z` for the
+  free rung beside a Schwarz value for the ring one, which its doc states.
 - **The negative-binomial joint certificate names the component of its theta bound it
   could not derive, instead of pricing it at zero** (#4560). The `(theta, rho, beta)`
   certificate judges the theta-score Newton residual against the score's own rounding band
