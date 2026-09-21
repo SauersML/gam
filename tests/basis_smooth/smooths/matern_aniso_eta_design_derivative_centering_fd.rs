@@ -64,6 +64,44 @@ fn realized_design_at_psi(data: &Array2<f64>, spec: &MaternBasisSpec, psi: &[f64
         .to_dense()
 }
 
+/// Floating-point evaluation error of one realized design entry, relative to
+/// the largest design entry. An entry is a Matérn kernel value (`sqrt`, `exp`
+/// and a short polynomial, about 16 roundings) contracted with the
+/// identifiability transform over the 8 centers of these fixtures, so it
+/// carries at most about (8 + 16)·ε of rounding. The bound allows for
+/// cancellation in the contraction by rounding that up to 64·ε.
+const EVAL_REL_ERR: f64 = 64.0 * f64::EPSILON;
+
+/// Derived error bound for a central-difference stencil of order `order`
+/// (1 = first derivative, 2 = second derivative) taken at step `h`, given the
+/// same stencil at step `2h`, and `m` = the largest design entry.
+///
+/// * Truncation. Both stencils are O(h²), so D(h) − D* ≈ (D(2h) − D(h)) / 3
+///   (Richardson). This bound uses that estimate as measured.
+/// * Rounding. Each design entry carries `EVAL_REL_ERR·m` of evaluation
+///   error. The stencil's weights sum in absolute value to 2/(2h) = 1/h for the
+///   first derivative and to 4/h² for the second, so rounding contributes
+///   `EVAL_REL_ERR·m/h` or `4·EVAL_REL_ERR·m/h²`.
+///
+/// The bound comes from the step and the fixture alone. It is not a fixed
+/// tolerance: an analytic derivative that misses a term by more than the
+/// finite difference can resolve fails.
+fn central_difference_error_bound(
+    d_h: &Array2<f64>,
+    d_2h: &Array2<f64>,
+    m: f64,
+    h: f64,
+    order: i32,
+) -> f64 {
+    let richardson = max_abs(&(d_2h - d_h)) / 3.0;
+    let stencil_abs_weight = if order == 1 { 1.0 / h } else { 4.0 / (h * h) };
+    richardson + EVAL_REL_ERR * m * stencil_abs_weight
+}
+
+fn max_abs(x: &Array2<f64>) -> f64 {
+    x.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+}
+
 #[test]
 fn aniso_design_raw_psi_first_derivative_matches_single_axis_fd() {
     // A small 3-D anisotropic configuration: distinct per-axis scales, and
@@ -105,28 +143,37 @@ fn aniso_design_raw_psi_first_derivative_matches_single_axis_fd() {
     // optimizer / FD audit perturb. The NATIVE (un-centered) analytic derivative
     // must match; the old fixed-ℓ centering would not.
     let h = 1e-6;
-    for a in 0..dim {
+    let m = max_abs(&realized_design_at_psi(&data, &spec, &psi0));
+    let first_difference = |a: usize, step: f64| {
         let mut psi_p = psi0.clone();
-        psi_p[a] += h;
+        psi_p[a] += step;
         let mut psi_m = psi0.clone();
-        psi_m[a] -= h;
+        psi_m[a] -= step;
         let dplus = realized_design_at_psi(&data, &spec, &psi_p);
         let dminus = realized_design_at_psi(&data, &spec, &psi_m);
+        (&dplus - &dminus).mapv(|v| v / (2.0 * step))
+    };
+    for a in 0..dim {
+        let fd = first_difference(a, h);
+        let fd_2h = first_difference(a, 2.0 * h);
         assert_eq!(
-            dplus.raw_dim(),
+            fd.raw_dim(),
             deriv.design_first[a].raw_dim(),
             "realized design / analytic derivative shape mismatch on axis {a}"
         );
-        let fd = (&dplus - &dminus).mapv(|v| v / (2.0 * h));
         let analytic = &deriv.design_first[a];
-        let scale = analytic.iter().fold(1.0_f64, |m, &v| m.max(v.abs()));
-        let max_err = (&fd - analytic)
-            .iter()
-            .fold(0.0_f64, |m, &v| m.max(v.abs()));
+        let max_err = max_abs(&(&fd - analytic));
+        let bound = central_difference_error_bound(&fd, &fd_2h, m, h, 1);
+        eprintln!(
+            "[aniso-fd-1] axis {a}: max_err={max_err:.3e} bound={bound:.3e} \
+             max|dX|={:.3e} max|X|={m:.3e}",
+            max_abs(analytic)
+        );
         assert!(
-            max_err < 1e-5 * scale,
+            max_err <= bound,
             "aniso design raw-psi derivative mismatch on axis {a}: max_err={max_err:.3e} \
-             (scale={scale:.3e}) — the centered #1376 bug would fail this single-axis psi FD"
+             exceeds the central-difference error bound {bound:.3e} — the centered #1376 \
+             bug would fail this single-axis psi FD"
         );
     }
 }
@@ -160,33 +207,46 @@ fn aniso_design_raw_psi_second_diagonal_matches_single_axis_fd() {
 
     let deriv = build_matern_basis_log_kappa_aniso_derivatives(data.view(), &spec).unwrap();
     let dim = psi0.len();
-    // Small-n materialized path exposes the dense diagonal seconds; if the build
-    // chose the operator-only path (no dense blocks), there is nothing to FD here
-    // (the operator path is already the native reference oracle), so skip.
-    if deriv.design_second_diag.len() != dim {
-        return;
-    }
+    // The 8-row fixture is far below the operator-only threshold, so the build
+    // must take the materialized path and return one dense second-diagonal block
+    // per axis (the first-derivative test above requires the same of
+    // `design_first`). An empty result is a regression to fail on, not a case
+    // to skip.
+    assert_eq!(
+        deriv.design_second_diag.len(),
+        dim,
+        "aniso design derivative builder must return one second-diagonal matrix per axis \
+         on this 8-row materialized fixture"
+    );
 
     let s0 = realized_design_at_psi(&data, &spec, &psi0);
+    let m = max_abs(&s0);
     let h = 1e-4;
-    for a in 0..dim {
+    let second_difference = |a: usize, step: f64| {
         let mut psi_p = psi0.clone();
-        psi_p[a] += h;
+        psi_p[a] += step;
         let mut psi_m = psi0.clone();
-        psi_m[a] -= h;
+        psi_m[a] -= step;
         let sp = realized_design_at_psi(&data, &spec, &psi_p);
         let sm = realized_design_at_psi(&data, &spec, &psi_m);
-        let fd = (&sp - &(&s0 * 2.0) + &sm).mapv(|v| v / (h * h));
+        (&sp - &(&s0 * 2.0) + &sm).mapv(|v| v / (step * step))
+    };
+    for a in 0..dim {
+        let fd = second_difference(a, h);
+        let fd_2h = second_difference(a, 2.0 * h);
         let analytic = &deriv.design_second_diag[a];
         assert_eq!(fd.raw_dim(), analytic.raw_dim(), "shape mismatch axis {a}");
-        let scale = analytic.iter().fold(1.0_f64, |m, &v| m.max(v.abs()));
-        let max_err = (&fd - analytic)
-            .iter()
-            .fold(0.0_f64, |m, &v| m.max(v.abs()));
+        let max_err = max_abs(&(&fd - analytic));
+        let bound = central_difference_error_bound(&fd, &fd_2h, m, h, 2);
+        eprintln!(
+            "[aniso-fd-2] axis {a}: max_err={max_err:.3e} bound={bound:.3e} \
+             max|d2X|={:.3e} max|X|={m:.3e}",
+            max_abs(analytic)
+        );
         assert!(
-            max_err < 2e-3 * scale.max(1.0),
+            max_err <= bound,
             "aniso design raw-psi second-diagonal mismatch on axis {a}: max_err={max_err:.3e} \
-             (scale={scale:.3e})"
+             exceeds the central-difference error bound {bound:.3e}"
         );
     }
 }
