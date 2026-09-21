@@ -430,7 +430,6 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
     y: ArrayView1<'_, f64>,
-    fisher_weights: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
     hessian_weights: &mut Array1<f64>,
     hessian_c: &mut Array1<f64>,
@@ -449,12 +448,6 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
     }
     if hessian_d.len() != n {
         *hessian_d = Array1::<f64>::zeros(n);
-    }
-    if fisher_weights.len() != n {
-        crate::bail_invalid_estim!(
-            "observed Hessian Fisher-weight length mismatch: expected {n}, got {}",
-            fisher_weights.len()
-        );
     }
 
     if let Some(cell) = GenericEdmCell::classify(&likelihood.spec.response, inverse_link) {
@@ -600,7 +593,6 @@ pub(crate) fn compute_observed_hessian_curvature_arrays(
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
     y: ArrayView1<'_, f64>,
-    fisher_weights: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
 ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
     let n = eta.len();
@@ -612,7 +604,6 @@ pub(crate) fn compute_observed_hessian_curvature_arrays(
         inverse_link,
         eta,
         y,
-        fisher_weights,
         priorweights,
         &mut hessian_weights,
         &mut hessian_c,
