@@ -1,4 +1,6 @@
-use gam::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
+use gam::mixture_link::{
+    sas_log_delta_domain_bound, state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
+};
 use gam::topology_selector::{
     AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoSelector, select_topology_with_fit,
 };
@@ -41,14 +43,15 @@ fn sas_state_fromspec_bounds_delta_with_sas_log_delta_bound_transform() {
     };
     let state =
         state_from_sasspec(spec).expect("SAS spec with finite parameters should be accepted");
-    // `SAS_LOG_DELTA_BOUND`. The bounded latent map is the interior-exact
-    // compact-support splice `smooth_bound_jet`, NOT `B*tanh(x/B)`: it is the
-    // identity on `|x| <= SPLICE_INTERIOR_FRAC*B = 9.6` and saturates to exactly
-    // `+/-B` for `|x| >= (2 - SPLICE_INTERIOR_FRAC)*B = 14.4`. `log_delta = 100`
-    // is deep in the saturated branch, so the effective log-delta is exactly
-    // `B` and `delta` is exactly `exp(B)` -- a bit-exact expectation, which is
-    // strictly stronger than the old `tanh` form it replaces.
-    let bound = 12.0_f64;
+    // `B` is the log-delta chart's own domain, read from its one definition so
+    // this expectation cannot drift from the map it is about. The bounded latent
+    // map is the interior-exact compact-support splice `smooth_bound_jet`, NOT
+    // `B*tanh(x/B)`: it is the identity on `|x| <= SPLICE_INTERIOR_FRAC*B` and
+    // saturates to exactly `+/-B` for `|x| >= (2 - SPLICE_INTERIOR_FRAC)*B`.
+    // `log_delta = 100` is deep in the saturated branch, so the effective
+    // log-delta is exactly `B` and `delta` is exactly `exp(B)` -- a bit-exact
+    // expectation, which is strictly stronger than the old `tanh` form.
+    let bound = sas_log_delta_domain_bound();
     assert!(
         spec.initial_log_delta.abs() >= (2.0 - 0.8) * bound,
         "fixture must sit in the saturated branch for the exact-saturation expectation to bite"
@@ -72,8 +75,9 @@ fn beta_logistic_state_fromspec_uses_same_bounded_delta_parameterization_as_sas(
     let state = state_from_beta_logisticspec(spec)
         .expect("Beta-logistic spec with finite parameters should be accepted");
     // Same saturated-branch reasoning as the SAS test above: the shared bounded
-    // map is the compact-support splice, exactly `+/-B` past `1.2*B`.
-    let bound = 12.0_f64;
+    // map is the compact-support splice, exactly `+/-B` past `1.2*B`, with `B`
+    // read from the chart's own definition.
+    let bound = sas_log_delta_domain_bound();
     assert!(
         spec.initial_log_delta.abs() >= (2.0 - 0.8) * bound,
         "fixture must sit in the saturated branch for the exact-saturation expectation to bite"

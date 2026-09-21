@@ -1617,7 +1617,7 @@ pub(crate) fn run_outer_with_plan(
                                         exit.value,
                                         exit.iterations.max(arc_census.steps_taken()),
                                         Some(exit.grad_norm),
-                                        exit.converged,
+                                        exit.claim.converged(),
                                         *the_plan,
                                     );
                                     result.origin =
@@ -2346,7 +2346,7 @@ pub(crate) fn run_outer_with_plan(
                             // the outer result from the best iterate it
                             // published. Whether the run is CONVERGED is decided
                             // by the guard's stationarity test and rides on
-                            // `exit.converged`: `true` only when the projected
+                            // `exit.claim.converged()`: `true` only when the projected
                             // gradient at the best iterate cleared the outer
                             // gradient tolerance (a stationary optimum on a flat
                             // surface); `false` for a flat-valley floor with
@@ -2363,7 +2363,7 @@ pub(crate) fn run_outer_with_plan(
                                         exit.value,
                                         exit.iterations,
                                         Some(exit.grad_norm),
-                                        exit.converged,
+                                        exit.claim.converged(),
                                         *the_plan,
                                     );
                                     result.origin = OuterResultOrigin::BfgsCostStallExit;

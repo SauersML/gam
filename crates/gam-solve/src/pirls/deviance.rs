@@ -56,7 +56,7 @@ fn probit_binomial_geometry(y: f64, eta: f64) -> (f64, f64, f64) {
 #[inline]
 fn sas_binomial_geometry(y: f64, z: f64, dz: f64) -> (f64, f64, f64) {
     let (log_mu, log_one_minus_mu, negative_score_z) = probit_binomial_geometry(y, z);
-    // `z` is bounded by `sinh(SAS_U_CLAMP)`, so the probit Mills ratios are
+    // `z` is bounded by `sinh` of the SAS latent domain, so the probit Mills ratios are
     // finite and this product is a plain chain rule, never `inf * 0`.
     (log_mu, log_one_minus_mu, negative_score_z * dz)
 }

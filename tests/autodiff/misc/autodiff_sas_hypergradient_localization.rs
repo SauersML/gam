@@ -14,14 +14,16 @@ fn stateless_ad_output<T>(freeze: bool, output: T) -> Vec<T> {
 }
 
 const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
-const SAS_U_CLAMP: f64 = 50.0;
+const MODEL_INTERIOR_BOUND: f64 = 50.0;
 /// Mirrors `SPLICE_INTERIOR_FRAC` in `crates/gam-solve/src/mixture_link.rs`.
 ///
-/// Production bounds `u_raw` with `smooth_bound_jet` (`mixture_link.rs:801`), a SPLICE
-/// that is the EXACT IDENTITY on `|v| <= SPLICE_INTERIOR_FRAC * bound`: `g = v`,
-/// `d1 = 1`, and every higher derivative exactly zero. With `SAS_U_CLAMP = 50` that
-/// interior reaches `|v| <= 40`, and every probe in this file sits near
-/// `|u_raw| ~ 1.15` -- deep inside it.
+/// Production bounds `u_raw` with `smooth_bound_jet`, a SPLICE that is the EXACT
+/// IDENTITY on `|v| <= SPLICE_INTERIOR_FRAC * bound`: `g = v`, `d1 = 1`, and every
+/// higher derivative exactly zero. Production's bound is the latent's own domain
+/// (`mixture_link::sas_latent_domain_bound`), which is larger than the
+/// `MODEL_INTERIOR_BOUND` below, so an interior this file certifies against that
+/// number is interior for production too. Every probe here sits near
+/// `|u_raw| ~ 1.15` -- deep inside either.
 ///
 /// These helpers previously modelled the bound as `bound * tanh(v / bound)`, which only
 /// RESEMBLES a bound. Its leading error is `v^3 / (3 * bound^2)`:
@@ -285,12 +287,13 @@ fn sas_epsilon_eta_derivative_partials_match_three_autodiff_engines() {
 
     for (eta, epsilon, log_delta) in cases {
         // The reference helpers above model gam.s bound as the IDENTITY, which is
-        // exact only inside `|u_raw| <= SPLICE_INTERIOR_FRAC * SAS_U_CLAMP` (0.8 *
-        // 50 = 40). Assert every probe really is interior, so a future case that
+        // exact inside `|u_raw| <= SPLICE_INTERIOR_FRAC * MODEL_INTERIOR_BOUND`
+        // (0.8 * 50 = 40), itself inside production's identity interior. Assert
+        // every probe really is interior, so a future case that
         // reaches the splice seam fails HERE and loudly instead of silently
         // disagreeing with production by a smooth cubic, which is exactly how the
         // previous `bound * tanh(u / bound)` reference hid a 1.487e-4 error.
-        let interior = SPLICE_INTERIOR_FRAC * SAS_U_CLAMP;
+        let interior = SPLICE_INTERIOR_FRAC * MODEL_INTERIOR_BOUND;
         let probe_u_raw = sas_delta_from_raw_log_delta(log_delta) * eta.asinh() + epsilon;
         assert!(
             probe_u_raw.abs() <= interior,

@@ -2254,8 +2254,9 @@ fn link_binomial_aux_carries_sas_complement_and_zero_weights_saturated_rows() {
     );
     assert!(aux.a1.is_finite() && aux.a2.is_finite());
 
-    // Fully saturated CONSISTENT rows: the complement underflows to 0 (u clamps to
-    // SAS_U_CLAMP, z=sinh(50)≈2.6e21, Phi(-z)=0). The row is perfectly predicted —
+    // Fully saturated CONSISTENT rows: the complement underflows to 0 (u saturates
+    // at the latent domain's edge, where `sinh(u)` is past the scale at which
+    // `Phi(-z)` is representable). The row is perfectly predicted —
     // a1/a2 stay finite and variance is 0 (the caller contributes zero Fisher
     // weight, the analytic eta -> ±inf limit).
     for (eta, yi) in [(30.0, 1.0), (-30.0, 0.0)] {

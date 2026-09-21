@@ -53,6 +53,40 @@
   certified exit returns before the other two are reached, so the budget exit's
   `if converged && …` Laplace branch could never fire and is gone.
 
+- **The SAS charts are bounded by their own domains, the det-derivative fusion picks its
+  identity by support, and a cost-stall exit names what accepted it** (gam#2469, gam#2902).
+  `SAS_U_CLAMP = 50` and `SAS_LOG_DELTA_BOUND = 12` were hand-supplied bounds on the
+  sinh-arcsinh latent `u = δ·asinh(η) + ε` and on raw `log δ`. Both are replaced by the
+  domains they stood in for. `sas_latent_domain_bound()` is `ln(f64::MAX)/6`: `sinh u` and
+  `cosh u` each exceed `e^{|u|}/2 − 1`, and this link publishes a jet through `μ⁽⁶⁾`, whose
+  leading factors are their sixth powers, so the composition's arithmetic exists exactly
+  while `e^{6|u|}` is finite. `sas_log_delta_domain_bound()` is `ln(1/√ε)`, the domain
+  `gam_problem::precision_box` gives every log-scale coordinate with no penalty spectrum —
+  the same domain the standardized beta-logistic link's `[ε, log δ]` pair already takes. The
+  map itself is unchanged: its compact support still makes the saturated branch exact, with
+  every derivative identically zero, which is what annihilates the `0·∞` an overflowing
+  `sinh` would inject. The outer box on raw `log δ` is still that map's support, now
+  measured from the derived bound, and both fixtures that asserted the saturated `δ = exp(B)`
+  read `B` from its one definition instead of a copy of the number.
+  The REML det-derivative fusion chose between the block-indicator identity
+  (`det1[k] = rank`, exact) and the weighted joint-normalizer chart by asking whether the
+  computed `det1[k]` sat within `1e-9·(1 + rank)` of an integer. That distance answers
+  neither question: a badly conditioned disjoint block can miss the integer by more than a
+  well-conditioned overlapping pair misses it by. The choice is now the exact structural
+  predicate it always was — whether this coordinate's penalty shares a coefficient column
+  with any other, read off the roots' nonzero columns — because on the columns where `S_k`
+  alone acts, `S_λ` reduces to `λ_k S_k` and `det1[k] = rank(S_k)` identically. The weighted
+  chart's self-consistency gate keeps its job and reads the two routes' own resolution:
+  `p`-term accumulations plus `p·ε·κ` for the pseudo-inverse both traces pass through, with
+  `κ` the retained spectrum's condition number, which `PenaltyPseudologdet` now reports.
+  `CostStallExit.converged` becomes `claim: StationarityClaim`, which names what accepted the
+  incumbent: the first-order band it met, ARC's synchronized gradient-and-curvature gate, or
+  nothing. Six paths publish an exit and only two may claim an optimum; carrying the
+  accepting certificate instead of a bare flag makes "this exit claims nothing" a statement a
+  publisher has to make rather than a `false` it can forget — the failure that once put a
+  provisional convergence label on a still-descending iterate and left the revocation paths
+  to take it back (#2299), which now withdraw a named claim.
+
 ## gamfit 0.1.269 (2026-09-21)
 
 - A Bernoulli marginal-slope prediction table carries `mean_score_derivative`

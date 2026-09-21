@@ -1,6 +1,53 @@
 use super::*;
 use crate::estimate::reml::atoms::CriterionAtom;
 
+/// The coefficient columns a penalty coordinate's curvature `S_k = R_kᵀR_k`
+/// acts on: exactly the columns its root `R_k` has a nonzero entry in, because
+/// a structurally zero column of `R_k` is a zero row and column of `S_k`.
+///
+/// The test is on the stored bits and carries no tolerance. A column held at a
+/// rounding-level nonzero counts as support, which errs toward calling two
+/// penalties overlapping — the reading that routes the fused gradient through
+/// the weighted chart and its runtime self-consistency gate rather than
+/// asserting an identity that would then not hold.
+fn penalty_column_support(coord: &gam_problem::PenaltyCoordinate, dim: usize) -> Vec<bool> {
+    let mut support = vec![false; dim];
+    let Some((root, start, _end)) = coord.block_local_root() else {
+        // No root chart to read: the support is unknown, so it is everything.
+        return vec![true; dim];
+    };
+    for row in root.rows() {
+        for (offset, entry) in row.iter().enumerate() {
+            if *entry != 0.0 && start + offset < dim {
+                support[start + offset] = true;
+            }
+        }
+    }
+    support
+}
+
+/// Whether coordinate `idx`'s penalty shares a coefficient column with any
+/// other coordinate (#2469).
+///
+/// This is the exact statement the two det-derivative fusions are chosen by.
+/// On the columns where `S_k` alone acts, `S_λ = Σ_l λ_l S_l` reduces to
+/// `λ_k S_k`, so `det1[k] = λ_k·tr(S_λ⁺ S_k) = tr(S_k⁺ S_k) = rank(S_k)` — an
+/// integer, exactly, with no appeal to how close the computed value happens to
+/// land. Where the supports meet, `det1[k]` is a genuine fraction of the joint
+/// normalizer `log|Σ_l λ_l S_l|₊` and only the weighted chart reproduces it.
+/// The numeric distance between `det1[k]` and `rank` answers neither question:
+/// a badly conditioned disjoint block can miss the integer by more than a
+/// well-conditioned overlapping pair misses it by.
+fn penalty_supports_overlap(supports: &[Vec<bool>], idx: usize) -> bool {
+    supports.iter().enumerate().any(|(other, support)| {
+        other != idx
+            && support
+                .iter()
+                .zip(supports[idx].iter())
+                .any(|(here, mine)| *here && *mine)
+    })
+}
+
 /// `tr(G_ε(H) · λ_k S_k)` from the coordinate's penalty ROOT, when it has one.
 ///
 /// `S_k = R_kᵀR_k`, so this is `‖√λ_k R_k · G_block‖_F²`. The equivalent
@@ -1079,13 +1126,13 @@ pub(crate) fn reml_laml_evaluate(
                 // penalty-logdet cost path (both eigendecompose the same `S_λ`), so
                 // the reconstructed weight sum reproduces `det1[k]` — the runtime
                 // gate below trusts the fused value only when it does.
-                let any_fractional = (0..k).any(|idx| {
-                    let rank = solution.penalty_coords[idx].rank();
-                    (solution.penalty_logdet.first[idx] - rank as f64).abs()
-                        > 1e-9 * (1.0 + rank as f64)
-                });
-                let joint_whitening: Option<Array2<f64>> = if any_fractional {
-                    let p = ds.dim();
+                let p = ds.dim();
+                let penalty_supports: Vec<Vec<bool>> = (0..k)
+                    .map(|idx| penalty_column_support(&solution.penalty_coords[idx], p))
+                    .collect();
+                let any_fractional =
+                    (0..k).any(|idx| penalty_supports_overlap(&penalty_supports, idx));
+                let joint_whitening: Option<(Array2<f64>, f64)> = if any_fractional {
                     let mut s_lambda = Array2::<f64>::zeros((p, p));
                     for l in 0..k {
                         let (block, start, end) =
@@ -1097,7 +1144,13 @@ pub(crate) fn reml_laml_evaluate(
                         s_lambda, None,
                     )
                     .ok()
-                    .map(|pld| pld.w_factor)
+                    // The condition number of the spectrum this whitening kept is
+                    // what the two routes' agreement below is denominated in, so it
+                    // travels with the factor.
+                    .map(|pld| {
+                        let condition = pld.retained_spectral_condition();
+                        (pld.w_factor, condition)
+                    })
                 } else {
                     None
                 };
@@ -1123,8 +1176,7 @@ pub(crate) fn reml_laml_evaluate(
                         // (square full rank) or the range projector `P_{S_k}`
                         // (rank-deficient). Both are value-identical to
                         // `trace − first[idx]` and cancellation-free at the rail.
-                        let det_is_integer_rank =
-                            (det1_k - rank as f64).abs() <= 1e-9 * (1.0 + rank as f64);
+                        let det_is_integer_rank = !penalty_supports_overlap(&penalty_supports, idx);
                         if det_is_integer_rank {
                             let is_square_full_rank = end - start == rank;
                             let fused = if is_square_full_rank {
@@ -1169,7 +1221,7 @@ pub(crate) fn reml_laml_evaluate(
                         // cost's `det1[k]` — the runtime self-consistency gate that
                         // keeps this off any lane whose `det1` is not this exact
                         // joint quantity (e.g. a not-yet-cutover per-block seam).
-                        let ws = joint_whitening.as_ref()?;
+                        let (ws, whitening_condition) = joint_whitening.as_ref()?;
                         let (fused, weight_sum) = ds.fused_logdet_gradient_weighted_block(
                             idx,
                             &s_block,
@@ -1178,7 +1230,22 @@ pub(crate) fn reml_laml_evaluate(
                             curvature_lambdas[idx],
                             ws,
                         );
-                        if (weight_sum - det1_k).abs() > 1e-7 * (1.0 + det1_k.abs()) {
+                        // Both numbers are `λ_k·tr(S_λ⁺ S_k)`: one from the cost's
+                        // eigendecomposition of `S_λ`, one from this whitening's.
+                        // Two backward-stable decompositions of the same matrix
+                        // place its spectrum within `p·ε·‖S_λ‖₂` of each other, and
+                        // the pseudo-inverse turns that into a relative `p·ε·κ` on
+                        // the trace, `κ` the retained spectrum's condition number;
+                        // on top of that each sum is a `p`-term accumulation of
+                        // non-negative weights. Outside that the two routes are not
+                        // computing the same quantity, which is what this gate is
+                        // for, and the fused value is refused.
+                        let agreement_band =
+                            gam_linalg::roundoff::accumulation_band(
+                                p,
+                                weight_sum.abs() + det1_k.abs(),
+                            ) + p as f64 * f64::EPSILON * whitening_condition * det1_k.abs();
+                        if !((weight_sum - det1_k).abs() <= agreement_band) {
                             return None;
                         }
                         Some(fused + correction_trace)

@@ -14,7 +14,23 @@ use statrs::function::beta::{beta_reg, ln_beta};
 use std::ops::Neg;
 use std::sync::OnceLock;
 
-const SAS_U_CLAMP: f64 = 50.0;
+/// The half-width of the sinh-arcsinh latent's own domain: the largest `|u|`
+/// at which this link's published arithmetic exists (#2902).
+///
+/// `z = sinh(u)` and `dz/du = cosh(u)` are each bounded below by `e^{|u|}/2 − 1`,
+/// and the jet this link publishes runs to `μ⁽⁶⁾`, whose leading factors are
+/// their sixth powers (`cosh⁶` from the chain and `sinh⁶` from the probit
+/// polynomial). The composition is therefore evaluable exactly while
+/// `e^{6|u|} ≤ f64::MAX`, and not at all beyond it — this is a property of the
+/// parameterization and binary64, not a box chosen for a search. Past it
+/// `smooth_bound_jet`'s compact support makes the saturated branch exact, with
+/// every derivative identically zero, so the `0·∞` an overflowing `sinh` would
+/// inject is annihilated rather than clamped away.
+#[inline]
+pub fn sas_latent_domain_bound() -> f64 {
+    f64::MAX.ln() / 6.0
+}
+
 /// Inclusive eta domain for the solver's standard log inverse-link derivative
 /// seams. Within this conservative IEEE-754-safe interval, `exp(eta)` is finite,
 /// positive, and normal, so the value and every analytic derivative are exactly
@@ -27,7 +43,19 @@ pub(crate) const LOG_LINK_SOLVER_ETA_MAX: f64 = 700.0;
 /// `delta = exp(g(raw_log_delta))` with `g = smooth_bound_jet(·, B)`. Exposed
 /// so the outer optimizer can search raw log δ over the support of this map
 /// (`smooth_bound_support`).
-pub(crate) const SAS_LOG_DELTA_BOUND: f64 = 12.0;
+///
+/// `log δ` is a log-scale shape coordinate with no penalty spectrum, so its
+/// domain is the one `gam_problem::precision_box` gives every such coordinate:
+/// `ln(1/√ε)` e-folds either side of unit scale, the point past which a
+/// criterion gradient read through a scale ratio holds no digits (#2812). The
+/// standardized beta-logistic link's `[ε, log δ]` pair already takes exactly
+/// this domain. It is a bound on the chart's resolution, not a box chosen for
+/// the search: `δ = exp(g)` is representable far past it, and unresolvable far
+/// inside it.
+#[inline]
+pub fn sas_log_delta_domain_bound() -> f64 {
+    -gam_problem::log_gradient_resolution()
+}
 
 /// The raw interval on which `smooth_bound_jet(·, bound)` still depends on its
 /// argument (#2902 row 8). At `|x| = a + 2·(B − a)`, `a = SPLICE_INTERIOR_FRAC·B`,
@@ -1586,7 +1614,7 @@ fn smooth_bound_jet(value: f64, bound: f64) -> SmoothBoundJet {
 
 #[inline]
 fn sas_effective_log_delta(raw_log_delta: f64) -> (f64, f64) {
-    let sb = smooth_bound_jet(raw_log_delta, SAS_LOG_DELTA_BOUND);
+    let sb = smooth_bound_jet(raw_log_delta, sas_log_delta_domain_bound());
     (sb.g, sb.d1)
 }
 
@@ -2150,11 +2178,11 @@ fn mixture_link_complement(state: &MixtureLinkState, eta: f64, mu: f64) -> f64 {
 }
 
 /// Cancellation-free `1 - mu` for the SAS inverse link. `mu = Phi(z)` with
-/// `z = sinh(smooth_bound(delta*asinh(eta) + epsilon, SAS_U_CLAMP))`, so the exact
+/// `z = sinh(smooth_bound(delta*asinh(eta) + epsilon, the latent domain))`, so the exact
 /// complement is `Phi(-z)`, mirroring the `sas_inverse_link_mu_d1` forward map.
 /// `Phi(-z)` keeps the tiny upper-tail mass that `1 - Phi(z)` cancels; it
 /// underflows to `0` only once the row is genuinely fully saturated (`z` at the
-/// `SAS_U_CLAMP` sinh scale), which is the correct value there. `Phi(-z)` is
+/// latent domain's sinh scale), which is the correct value there. `Phi(-z)` is
 /// always in `[0, 1]`, so no clamp is needed.
 ///
 /// The latent `asinh(eta)` is taken through the overflow-free [`asinh_jet6`]
@@ -2178,14 +2206,14 @@ pub(crate) fn sas_link_complement(eta: f64, epsilon: f64, log_delta: f64, mu: f6
         return standard_link_complement(StandardLink::Probit, eta, mu);
     }
     let u_raw = delta * asinh_jet6(eta).value + epsilon;
-    let u = smooth_bound_jet(u_raw, SAS_U_CLAMP).g;
+    let u = smooth_bound_jet(u_raw, sas_latent_domain_bound()).g;
     normal_cdf(-u.sinh())
 }
 
 /// The SAS link's latent probit argument `z` and its first `eta` derivative.
 ///
 /// `mu = Phi(z)` with `z = sinh(smooth_bound(delta·asinh(eta) + epsilon,
-/// SAS_U_CLAMP))`, exactly as [`sas_inverse_link_mu_d1`] evaluates it — this
+/// the latent domain)`, exactly as [`sas_inverse_link_mu_d1`] evaluates it — this
 /// returns the *pre-probit* pair instead of applying `Phi`.
 ///
 /// A consumer that needs `ln mu` or `ln(1 - mu)` must have this pair, not `mu`:
@@ -2218,7 +2246,7 @@ pub(crate) fn sas_latent_probit_argument(
     }
     let asinh = asinh_jet6(eta);
     let u_raw = delta * asinh.value + epsilon;
-    let sb = smooth_bound_jet(u_raw, SAS_U_CLAMP);
+    let sb = smooth_bound_jet(u_raw, sas_latent_domain_bound());
     let u = sb.g;
     let c = u.cosh();
     let r1 = delta * asinh.d1;
@@ -2334,7 +2362,7 @@ fn sas_inverse_link_mu_d1(
     let asinh = asinh_jet6(eta);
     let delta = delta_id;
     let u_raw = delta * asinh.value + epsilon;
-    let sb = smooth_bound_jet(u_raw, SAS_U_CLAMP);
+    let sb = smooth_bound_jet(u_raw, sas_latent_domain_bound());
     let u = sb.g;
     let g1 = sb.d1;
     let s = u.sinh();
@@ -3713,8 +3741,8 @@ fn beta_logistic_latent_pdfthird_derivative_param_partials(x: f64, a: f64, b: f6
 }
 
 /// SAS inverse-link jet for:
-///   mu(eta) = Phi(sinh(smooth_bound(delta * asinh(eta) + epsilon, SAS_U_CLAMP))),
-///   delta = exp(smooth_bound(log_delta, SAS_LOG_DELTA_BOUND)).
+///   mu(eta) = Phi(sinh(smooth_bound(delta * asinh(eta) + epsilon, latent domain))),
+///   delta = exp(smooth_bound(log_delta, log-delta domain)).
 /// `smooth_bound` is the interior-exact bounded latent map (see
 /// `smooth_bound_jet`); on the interior it is the identity, so this reduces to
 /// the pure probit jet exactly at `epsilon=0, delta=1`.
@@ -3737,7 +3765,7 @@ pub fn sas_inverse_link_jet(
     let asinh = asinh_jet6(eta);
     let delta = delta_id;
     let u_raw = delta * asinh.value + epsilon;
-    let sb = smooth_bound_jet(u_raw, SAS_U_CLAMP);
+    let sb = smooth_bound_jet(u_raw, sas_latent_domain_bound());
     let u = sb.g;
     let g1 = sb.d1;
     let g2 = sb.d2;
@@ -3804,7 +3832,7 @@ pub(crate) fn sas_inverse_link_pdfthird_derivative(
     let asinh = asinh_jet6(eta);
     let delta = sas_delta_from_raw_log_delta(log_delta);
     let u_raw = delta * asinh.value + epsilon;
-    let sb = smooth_bound_jet(u_raw, SAS_U_CLAMP);
+    let sb = smooth_bound_jet(u_raw, sas_latent_domain_bound());
     let u = sb.g;
     let g1 = sb.d1;
     let g2 = sb.d2;
@@ -3883,11 +3911,11 @@ fn compose_derivatives6(outer: [f64; 6], inner: [f64; 6]) -> [f64; 6] {
     out
 }
 
-/// Bounded SAS core `u = smooth_bound(δ·asinh(η) + ε, SAS_U_CLAMP)` and its
+/// Bounded SAS core `u = smooth_bound(δ·asinh(η) + ε, latent domain)` and its
 /// derivatives in the raw core, shared by the chains that differentiate it.
 #[inline]
 fn sas_bounded_core_jet(delta: f64, asinh_value: f64, epsilon: f64) -> SmoothBoundJet {
-    smooth_bound_jet(delta * asinh_value + epsilon, SAS_U_CLAMP)
+    smooth_bound_jet(delta * asinh_value + epsilon, sas_latent_domain_bound())
 }
 
 /// Sixth derivative of the SAS inverse-link CDF (= fifth derivative of the PDF),
@@ -4031,14 +4059,14 @@ pub fn sas_inverse_link_jetwith_param_partials(
 ) -> Result<SasJetWithParamPartials, EstimationError> {
     let eta = finite_inverse_link_eta("SAS inverse link", eta)?;
     let asinh = asinh_jet6(eta);
-    let ld_sb = smooth_bound_jet(log_delta, SAS_LOG_DELTA_BOUND);
+    let ld_sb = smooth_bound_jet(log_delta, sas_log_delta_domain_bound());
     let (ld_eff, dld_eff_draw) = (ld_sb.g, ld_sb.d1);
     let d2ld_eff_draw2 = ld_sb.d2;
     let delta = ld_eff.exp();
     let ddelta_draw = delta * dld_eff_draw;
     let d2delta_draw2 = delta * (dld_eff_draw * dld_eff_draw + d2ld_eff_draw2);
     let u_raw = delta * asinh.value + epsilon;
-    let sb = smooth_bound_jet(u_raw, SAS_U_CLAMP);
+    let sb = smooth_bound_jet(u_raw, sas_latent_domain_bound());
     let u = sb.g;
     let g1 = sb.d1;
     let g2 = sb.d2;
@@ -4789,7 +4817,7 @@ mod tests {
         // At the reduction center (η=0, ε=0, log_δ=0) the bounded latent map is on
         // its exact-identity interior, so `u = ε + asinh(η)/… ` composes with no
         // bounded-map curvature. The ε–ε second partial of `d1 = μ'` is therefore
-        // the TRUE sinh-arcsinh value 0 — not the old `-2·φ(0)/SAS_U_CLAMP²`, which
+        // the TRUE sinh-arcsinh value 0 — not the old `-2·φ(0)/B²`, which
         // was precisely the spurious `tanh` third-derivative `g'''(0) = -2/B²` that
         // this fix removes. Expanding `d1(ε) = φ(sinh ε)·cosh ε = φ(0)(1 + O(ε⁴))`
         // at η=0 confirms `∂²d1/∂ε² = 0` exactly.
@@ -5224,9 +5252,9 @@ mod tests {
     /// splice — where a wrong smoothstep coefficient would otherwise hide.
     #[test]
     fn smooth_bound_jet_tower_is_c6_and_fd_exact() {
-        let b = SAS_U_CLAMP;
-        let a = SPLICE_INTERIOR_FRAC * b; // 40
-        let c = (2.0 - SPLICE_INTERIOR_FRAC) * b; // 60
+        let b = sas_latent_domain_bound();
+        let a = SPLICE_INTERIOR_FRAC * b;
+        let c = (2.0 - SPLICE_INTERIOR_FRAC) * b;
         let jet = |x: f64| smooth_bound_jet(x, b);
 
         // Interior |x| ≤ a: exact identity, every higher derivative exactly 0.
@@ -5361,7 +5389,7 @@ mod tests {
     /// repeats a value the box already holds.
     #[test]
     fn a_bounded_map_support_ends_where_the_map_stops_moving_2902() {
-        for bound in [SAS_LOG_DELTA_BOUND] {
+        for bound in [sas_log_delta_domain_bound(), sas_latent_domain_bound()] {
             let (lower, upper) = smooth_bound_support(bound);
             assert_eq!(lower, -upper);
             let inside = smooth_bound_jet(0.99 * upper, bound);

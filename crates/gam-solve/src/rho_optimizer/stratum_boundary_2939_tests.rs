@@ -388,7 +388,7 @@ fn a_window_of_rank_refusals_halts_at_the_incumbent_without_an_escape_2939() {
         .clone()
         .expect("the halt publishes the incumbent");
     assert_eq!(published.rho, incumbent, "the halt publishes the incumbent it was pinned at");
-    assert!(!published.converged, "a pinned incumbent outside the band is not converged");
+    assert!(!published.claim.converged(), "a pinned incumbent outside the band is not converged");
     let evidence = published
         .rank_boundary
         .expect("a rank-boundary halt publishes its typed evidence");
@@ -492,7 +492,7 @@ fn a_rank_refusal_below_the_incumbent_stops_the_run_for_the_crossing_2939() {
         .clone()
         .expect("the stop publishes the incumbent");
     assert_eq!(published.rho, incumbent);
-    assert!(!published.converged);
+    assert!(!published.claim.converged());
     let evidence = published
         .rank_boundary
         .expect("the stop publishes its rank-boundary evidence");

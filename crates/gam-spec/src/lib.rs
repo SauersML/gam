@@ -441,8 +441,9 @@ pub struct SasLinkState {
     /// `log_shape_center` the beta-logistic kernels expect).
     pub log_delta: f64,
     /// Derived positive companion of `log_delta`. Its meaning depends on the link:
-    /// - `Sas`: effective tail parameter `delta = exp(B * tanh(log_delta / B))`,
-    ///   `B = SAS_LOG_DELTA_BOUND`.
+    /// - `Sas`: effective tail parameter `delta = exp(g(log_delta))`, with `g` the
+    ///   interior-exact compact-support map of `mixture_link::smooth_bound_jet` on
+    ///   the log-delta chart's own domain (`sas_log_delta_domain_bound`).
     /// - `BetaLogistic`: geometric-mean beta shape `exp(log_delta) = sqrt(a*b)`.
     ///
     /// The beta-logistic derivative kernels take `log_delta` (the log center), so

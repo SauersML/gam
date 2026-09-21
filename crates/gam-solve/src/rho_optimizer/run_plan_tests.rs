@@ -3279,7 +3279,7 @@ fn finite_cost_stall_refuses_to_certify_strict_saddle_incumbent_2357() {
     // incumbent is exactly what #2357 forbids certifying.
     if let Some(snapshot) = exit.lock().unwrap().as_ref() {
         assert!(
-            !snapshot.converged,
+            !snapshot.claim.converged(),
             "a strict-saddle incumbent may be a recovery snapshot but must never \
              be published as a converged optimum"
         );
@@ -3301,7 +3301,7 @@ fn finite_cost_stall_refuses_to_certify_strict_saddle_incumbent_2357() {
         .unwrap()
         .take()
         .expect("converged stall must publish the best checkpoint");
-    assert!(published.converged);
+    assert!(published.claim.converged());
     assert_eq!(
         published.rho, settled_rho,
         "the certified checkpoint must be the PSD best, not the saddle or the oscillation point"
@@ -3371,7 +3371,7 @@ fn rejected_trials_that_move_do_not_prove_a_replay_at_a_strict_saddle() {
         "no licence reopens a proven replay"
     );
     let published = exit.lock().unwrap().take().expect("halt publishes the incumbent");
-    assert!(!published.converged, "a strict saddle is never converged");
+    assert!(!published.claim.converged(), "a strict saddle is never converged");
     assert_eq!(published.rho, incumbent);
 }
 
@@ -3462,7 +3462,7 @@ fn arc_bridge_finite_cost_stall_defers_at_bound_separation() {
     }
     let published = exit.lock().unwrap().take().expect("best iterate published");
     assert!(
-        !published.converged,
+        !published.claim.converged(),
         "the bridge may retain a recovery checkpoint but cannot certify finite \
          second-order convergence before ARC checks reduced curvature"
     );
@@ -3526,7 +3526,7 @@ fn arc_bridge_finite_stall_delivers_interior_negative_curvature() {
         assert_eq!(sample.hessian, Some(array![[-1.0]]));
     }
     let published = exit.lock().unwrap().take().expect("best checkpoint published");
-    assert!(!published.converged);
+    assert!(!published.claim.converged());
 }
 
 /// Near-separable multinomial timeout (#1082/#1237), FEASIBLE bound-pinned arm.
@@ -3607,7 +3607,7 @@ fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
     }
     let published = exit.lock().unwrap().take().expect("best iterate published");
     assert!(
-        !published.converged,
+        !published.claim.converged(),
         "ARC, not the finite bridge stall, must certify a PSD bound optimum"
     );
     assert_eq!(published.rho, lo, "best iterate is the bound-pinned ρ");
@@ -3719,7 +3719,7 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
     );
     let published = exit.lock().unwrap().take().expect("best iterate published");
     assert!(
-        !published.converged,
+        !published.claim.converged(),
         "an infeasible current probe has no synchronized Hessian, so its stored \
          best can only be a non-converged checkpoint"
     );
@@ -3937,7 +3937,7 @@ fn arc_cost_stall_guard_uses_cached_initial_sample_as_feasible_best() {
     assert_eq!(published.rho, seed);
     assert_eq!(published.value, 10.0);
     assert_eq!(published.grad_norm, 5.0e-4);
-    assert!(published.converged);
+    assert!(published.claim.converged());
 }
 
 /// A run of infeasible cubic trials cannot justify halting at an incumbent
@@ -4057,7 +4057,7 @@ fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
     assert_eq!(published.rho, seed);
     assert_eq!(published.value, 10.0);
     assert_eq!(published.grad_norm, 5.0e-4);
-    assert!(published.converged);
+    assert!(published.claim.converged());
 }
 
 #[test]
@@ -4090,7 +4090,7 @@ fn constrained_stationary_probe_replaces_stale_nonstationary_best() {
     );
     assert_eq!(published.value, 0.5);
     assert_eq!(published.grad_norm, 0.0);
-    assert!(published.converged);
+    assert!(published.claim.converged());
 }
 
 /// #1355 regression: a constrained-stationary (lower-bound separation) probe
@@ -4241,7 +4241,7 @@ fn cost_stall_far_above_tolerance_keeps_descending_not_flat_valley() {
         .take()
         .expect("best published on eventual halt");
     assert!(
-        !published.converged,
+        !published.claim.converged(),
         "a stuck halt above tolerance must report converged=false (never claim \
          a converged result with |g| far above tolerance)"
     );
@@ -4334,7 +4334,7 @@ fn cost_stall_productive_descent_replenishes_escape_budget_2253() {
     let best = published.as_ref().expect("running best remains published");
     assert_eq!(best.rho, descended);
     assert_eq!(best.value, -20.0);
-    assert!(!best.converged);
+    assert!(!best.claim.converged());
 }
 
 /// #2817: a stall only modestly above the certificate's band has no "close enough"
@@ -4383,7 +4383,7 @@ fn a_stall_modestly_above_the_band_escapes_then_halts_on_the_replay_cut_2817() {
         "no continuation licence may reopen a proven replay"
     );
     let published = exit.lock().unwrap().take().expect("best published");
-    assert!(!published.converged);
+    assert!(!published.claim.converged());
 }
 
 /// #509 regression: a cost stall at an INTERIOR ρ whose projected gradient is
@@ -4458,7 +4458,7 @@ fn a_stall_inside_its_probe_noise_floor_is_not_claimed_2241() {
         std::mem::discriminant(&verdict)
     );
     assert!(
-        exit.lock().unwrap().as_ref().is_none_or(|published| !published.converged),
+        exit.lock().unwrap().as_ref().is_none_or(|published| !published.claim.converged()),
         "no converged exit may be published for a point above the band"
     );
 }
@@ -4485,7 +4485,7 @@ fn collapsed_probe_radius_leaves_the_claim_band_unchanged_2456() {
         guard.observe(guard_sample(&array![2.0 * radius, 0.0], score + 4.0e-4, residual_grad, None), NO_MODEL_DECREASE);
         let verdict = guard.observe(guard_sample(&array![3.0 * radius, 0.0], score + 1.0e-3, residual_grad, None), NO_MODEL_DECREASE);
         let band = guard.stationarity_band();
-        let claimed = exit.lock().unwrap().as_ref().is_some_and(|published| published.converged);
+        let claimed = exit.lock().unwrap().as_ref().is_some_and(|published| published.claim.converged());
         (std::mem::discriminant(&verdict), band, claimed)
     };
     let (wide_verdict, wide_band, wide_claimed) = verdict_at_radius(1.0e-3);

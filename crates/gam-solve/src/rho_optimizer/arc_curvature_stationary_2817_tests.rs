@@ -287,7 +287,7 @@ fn a_flatlined_arc_stall_is_adjudicated_by_the_certificates_own_test_2817() {
     );
     let published = published.expect("the halt must publish the point it stopped at");
     assert!(
-        published.converged,
+        published.claim.converged(),
         "a point whose decrement is inside the criterion's resolution under a PSD \
          reduced Hessian is a convergence, not a checkpoint"
     );
@@ -355,7 +355,7 @@ fn a_creeping_flat_valley_stops_at_its_first_window_by_adjudication_2817() {
         outcomes.len()
     );
     assert!(
-        published.is_some_and(|exit| exit.converged),
+        published.is_some_and(|exit| exit.claim.converged()),
         "the adjudicated stop publishes its point as converged"
     );
 }
@@ -383,7 +383,7 @@ fn a_still_descending_search_is_never_adjudicated_2817() {
         "a descending search must never be halted: {outcomes:?}"
     );
     assert!(
-        published.is_none_or(|exit| !exit.converged),
+        published.is_none_or(|exit| !exit.claim.converged()),
         "a descending search must never be published as converged"
     );
 }
@@ -409,7 +409,7 @@ fn a_stall_with_real_available_descent_is_not_certified_2817() {
          must be handed back to ARC: {outcomes:?}"
     );
     assert!(
-        published.is_none_or(|exit| !exit.converged),
+        published.is_none_or(|exit| !exit.claim.converged()),
         "such a stall must never be published as converged"
     );
 }
@@ -497,7 +497,7 @@ fn a_strict_saddle_is_never_adjudicated_stationary_2817() {
          never be converted into a convergence: {outcomes:?}"
     );
     assert!(
-        published.is_none_or(|exit| !exit.converged),
+        published.is_none_or(|exit| !exit.claim.converged()),
         "a strict saddle must never be published as converged"
     );
 }
@@ -534,7 +534,7 @@ fn a_strict_saddle_claim_the_criterion_contradicts_stops_at_the_incumbent_1082()
         outcomes.len()
     );
     let published = published.expect("the stop publishes the incumbent");
-    assert!(published.converged);
+    assert!(published.claim.converged());
     assert_eq!(published.rho, array![0.5, 0.5]);
     assert_eq!(published.value, COST_2817);
 }
@@ -558,7 +558,7 @@ fn a_contradicted_strict_saddle_outside_the_solver_band_keeps_the_search_moving_
          {outcomes:?}"
     );
     assert!(
-        published.is_none_or(|exit| !exit.converged),
+        published.is_none_or(|exit| !exit.claim.converged()),
         "such a stall must never be published as converged"
     );
 }
@@ -617,7 +617,7 @@ fn a_bound_pinned_outward_pull_is_adjudicated_stationary_2817() {
         "a bound-pinned outward pull has no feasible descent and must end the stall"
     );
     let published = published.expect("the halt publishes its point");
-    assert!(published.converged);
+    assert!(published.claim.converged());
     assert_eq!(
         published.grad_norm, 0.0,
         "the published residual is the PROJECTED gradient, which is zero here"
@@ -640,7 +640,7 @@ fn a_route_that_declares_no_resolution_is_unchanged_2817() {
         outcomes.iter().all(|o| o.is_ok()),
         "with no declared resolution every sample reaches the solver: {outcomes:?}"
     );
-    assert!(published.is_none_or(|exit| !exit.converged));
+    assert!(published.is_none_or(|exit| !exit.claim.converged()));
 }
 
 // ─── the stop decides on the certificate's verdict (#2954) ──────────────────
@@ -775,7 +775,7 @@ fn the_online_stop_declines_a_point_the_certificates_verdict_refuses_2954() {
          {outcomes:?}"
     );
     assert!(
-        published.is_none_or(|exit| !exit.converged),
+        published.is_none_or(|exit| !exit.claim.converged()),
         "such a point must never be published as converged"
     );
 }
@@ -844,7 +844,7 @@ fn the_online_stop_halts_where_the_certificates_verdict_certifies_2954() {
         "a flatlined stall the certificate's verdict certifies must halt ARC: {outcomes:?}"
     );
     let published = published.expect("the halt publishes its point");
-    assert!(published.converged);
+    assert!(published.claim.converged());
     assert_eq!(published.value, COST_2817);
 }
 
@@ -877,7 +877,7 @@ fn a_descending_search_stops_at_the_first_point_its_verdict_certifies_2954() {
         "the first evaluated point the verdict certifies must halt ARC, with no stall"
     );
     let published = published.expect("the halt publishes its point");
-    assert!(published.converged);
+    assert!(published.claim.converged());
     assert_eq!(published.value, COST_2817);
 }
 
@@ -921,7 +921,7 @@ fn a_caller_requirement_holds_the_online_stop_until_it_is_met_3311() {
         held.iter().all(|outcome| outcome.is_ok()),
         "a requirement tighter than the certified residual must keep the search moving: {held:?}"
     );
-    assert!(published.is_none_or(|exit| !exit.converged));
+    assert!(published.is_none_or(|exit| !exit.claim.converged()));
 
     let (halted, published) = run(CERTIFIED_GRADIENT_2954);
     assert_eq!(
@@ -929,7 +929,12 @@ fn a_caller_requirement_holds_the_online_stop_until_it_is_met_3311() {
         vec![Err(ARC_CURVATURE_STATIONARY_SENTINEL.to_string())],
         "a requirement the residual meets must not hold the stop"
     );
-    assert!(published.expect("the halt publishes its point").converged);
+    assert!(
+        published
+            .expect("the halt publishes its point")
+            .claim
+            .converged()
+    );
 }
 
 /// CONTROL: the curvature-resolvability rung still waits for a stalled
@@ -953,7 +958,7 @@ fn where_no_verdict_is_taken_a_descending_search_is_not_halted_2954() {
         outcomes.iter().all(|o| o.is_ok()),
         "a descending search the verdict does not decide must never be halted: {outcomes:?}"
     );
-    assert!(published.is_none_or(|exit| !exit.converged));
+    assert!(published.is_none_or(|exit| !exit.claim.converged()));
 }
 
 /// Where no verdict is taken the certificate's `else` branch, the
@@ -982,7 +987,7 @@ fn where_no_verdict_is_taken_the_curvature_rung_still_decides_2954() {
         Some(ARC_CURVATURE_STATIONARY_SENTINEL),
         "with no verdict taken the curvature-resolvability rung halts this stall: {outcomes:?}"
     );
-    assert!(published.is_some_and(|exit| exit.converged));
+    assert!(published.is_some_and(|exit| exit.claim.converged()));
 }
 
 /// The decrement is taken at the resolution its definiteness verdict was taken at.
@@ -1088,7 +1093,7 @@ fn a_sub_resolution_negative_eigenvalue_does_not_block_the_stationary_stop_2817(
          Hessian PSD at that resolution, must end the stall: {outcomes:?}"
     );
     let published = published.expect("the halt publishes its point");
-    assert!(published.converged);
+    assert!(published.claim.converged());
 }
 
 /// NEGATIVE CONTROL: the same sub-resolution negative eigenvalue, with the
@@ -1113,7 +1118,7 @@ fn a_residual_along_a_sub_resolution_negative_direction_keeps_the_search_moving_
          thousands of resolutions must keep the search running: {outcomes:?}"
     );
     assert!(
-        published.is_none_or(|exit| !exit.converged),
+        published.is_none_or(|exit| !exit.claim.converged()),
         "such a stall must never be published as converged"
     );
 }
@@ -1157,7 +1162,7 @@ fn assert_stops_at_the_second_stall_2817(
         "the stop must be the unprogressing-stall sentinel, not an objective failure"
     );
     let exit = published.expect("the stop must publish the incumbent it stopped at");
-    assert!(!exit.converged, "an unprogressing stop makes no convergence claim");
+    assert!(!exit.claim.converged(), "an unprogressing stop makes no convergence claim");
     assert_eq!(exit.rho, array![0.5]);
     assert_eq!(exit.value, COST_2817);
 }
@@ -1392,7 +1397,7 @@ fn a_strict_saddle_stall_escapes_then_stops_on_its_proven_replay_2817() {
         "the stop at a proven replay is the unprogressing-stall sentinel: {outcomes:?}"
     );
     assert!(
-        published.is_some_and(|exit| !exit.converged),
+        published.is_some_and(|exit| !exit.claim.converged()),
         "the stop must publish its incumbent, and a strict saddle is never converged"
     );
 }
@@ -1439,7 +1444,7 @@ fn a_strict_saddle_window_on_new_trials_escapes_again_until_it_replays() {
         "the stop at a proven replay is the unprogressing-stall sentinel: {outcomes:?}"
     );
     assert!(
-        published.is_some_and(|exit| !exit.converged),
+        published.is_some_and(|exit| !exit.claim.converged()),
         "the stop must publish its incumbent, and a strict saddle is never converged"
     );
 }
@@ -1580,7 +1585,7 @@ fn a_crawl_the_evaluations_band_resolves_is_never_stalled_3018() {
          {resolved:?}"
     );
     assert!(
-        published.is_some_and(|exit| !exit.converged),
+        published.is_some_and(|exit| !exit.claim.converged()),
         "a running crawl publishes only its best-so-far snapshot, never a convergence"
     );
 
@@ -1596,7 +1601,7 @@ fn a_crawl_the_evaluations_band_resolves_is_never_stalled_3018() {
         Some(ARC_UNPROGRESSING_STALL_SENTINEL),
         "the control stops on the unprogressing sentinel: {unresolved:?}"
     );
-    assert!(stopped.is_some_and(|exit| !exit.converged));
+    assert!(stopped.is_some_and(|exit| !exit.claim.converged()));
 }
 
 /// gam#3287: an evaluation that publishes no band carries the error its value's
@@ -1629,7 +1634,7 @@ fn an_unbanded_crawl_below_tau_but_above_rounding_keeps_descending_3287() {
         "an unbanded crawl the arithmetic resolves is never stalled: {outcomes:?}"
     );
     assert!(
-        published.is_some_and(|exit| !exit.converged),
+        published.is_some_and(|exit| !exit.claim.converged()),
         "a running crawl publishes only its best-so-far snapshot, never a convergence"
     );
 }

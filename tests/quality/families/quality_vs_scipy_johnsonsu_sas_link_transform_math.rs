@@ -36,8 +36,9 @@
 //!   mu(eta) = Phi( sinh( smooth_bound( delta*asinh(eta) + epsilon, B ) ) ),
 //!   delta   = exp( smooth_bound( log_delta, B_d ) ),
 //!
-//! with `B = SAS_U_CLAMP = 50` and `B_d = SAS_LOG_DELTA_BOUND = 12`. This is the
-//! Jones-Pewsey sinh-arcsinh latent fed through a probit.
+//! with `B` the latent's own domain and `B_d` the log-delta chart's
+//! (`mixture_link::sas_latent_domain_bound` / `sas_log_delta_domain_bound`).
+//! This is the Jones-Pewsey sinh-arcsinh latent fed through a probit.
 //!
 //! `smooth_bound` is the INTERIOR-EXACT bounded latent map (gam#2389, commit
 //! 056fe5e20): `smooth_bound(x, B) = x` exactly for `|x| <= 0.8*B`, splicing
@@ -93,24 +94,26 @@ fn gam_sas_link_transform_matches_scipy_sinh_arcsinh_cdf() {
     // (the pure sinh-arcsinh CDF), not the C^5 splice. If a future grid extends
     // past it, this fails loudly instead of silently comparing against the wrong
     // reference.
-    const SAS_U_CLAMP: f64 = 50.0; // B
-    const SAS_LOG_DELTA_BOUND: f64 = 12.0; // B_d
+    // Conservative interiors: both are inside the charts' own domains, so a grid
+    // point this certifies is in production's exact-identity region too.
+    const LATENT_INTERIOR_BOUND: f64 = 50.0;
+    const LOG_DELTA_INTERIOR_BOUND: f64 = 12.0;
     const FD_MAX_OFFSET: f64 = 3.0 * 1.5e-3; // widest stencil reach (3h)
     for i in 0..n {
         let delta = logd_col[i].exp(); // identity region ⇒ delta = exp(log_delta)
         let eta_far = eta_col[i].abs() + FD_MAX_OFFSET;
         let u_raw = delta * eta_far.asinh() + eps_col[i].abs();
         assert!(
-            u_raw.abs() < 0.8 * SAS_U_CLAMP,
+            u_raw.abs() < 0.8 * LATENT_INTERIOR_BOUND,
             "grid point leaves the SAS latent identity interior: |u_raw|={:.3} >= {:.1}",
             u_raw.abs(),
-            0.8 * SAS_U_CLAMP
+            0.8 * LATENT_INTERIOR_BOUND
         );
         assert!(
-            logd_col[i].abs() < 0.8 * SAS_LOG_DELTA_BOUND,
+            logd_col[i].abs() < 0.8 * LOG_DELTA_INTERIOR_BOUND,
             "grid log_delta leaves the identity interior: |log_delta|={:.3} >= {:.1}",
             logd_col[i].abs(),
-            0.8 * SAS_LOG_DELTA_BOUND
+            0.8 * LOG_DELTA_INTERIOR_BOUND
         );
     }
 

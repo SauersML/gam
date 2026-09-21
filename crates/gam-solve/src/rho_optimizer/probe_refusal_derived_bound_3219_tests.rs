@@ -154,7 +154,7 @@ fn a_seed_whose_every_probe_is_refused_stops_within_the_derived_bound_3219() {
     assert_eq!(published.rho, array![0.0], "{published:?}");
     assert_eq!(published.value, V0_3219, "{published:?}");
     assert!(
-        !published.converged,
+        !published.claim.converged(),
         "a non-stationary seed is never claimed converged: {published:?}"
     );
     // Probes k* and k* + 1 are both refused within the seed's resolution, so the

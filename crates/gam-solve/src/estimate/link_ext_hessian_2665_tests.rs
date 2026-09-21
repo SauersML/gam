@@ -31,7 +31,7 @@ use ndarray::{Array1, Array2};
 /// A ρ away from both rails, so the criterion is smooth in every coordinate the
 /// finite difference walks and no barrier term dominates the comparison.
 const PROBE_RHO: f64 = 1.0;
-/// Link parameters well inside `SAS_LOG_DELTA_BOUND` / `SAS_U_CLAMP`, so the
+/// Link parameters well inside both SAS domain bounds, so the
 /// smooth-bound maps are in their identity region and the block under test is
 /// the genuine SAS curvature rather than a clamp's.
 const PROBE_EPSILON: f64 = 0.3;

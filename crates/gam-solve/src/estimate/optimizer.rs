@@ -1959,8 +1959,9 @@ where
                 (vec![lower; sas_dim], vec![upper; sas_dim])
             } else if use_sas {
                 let (epsilon_lower, epsilon_upper) = crate::estimate::rho_domain::precision_box();
-                let (log_delta_lower, log_delta_upper) =
-                    crate::mixture_link::smooth_bound_support(crate::mixture_link::SAS_LOG_DELTA_BOUND);
+                let (log_delta_lower, log_delta_upper) = crate::mixture_link::smooth_bound_support(
+                    crate::mixture_link::sas_log_delta_domain_bound(),
+                );
                 (
                     vec![epsilon_lower, log_delta_lower],
                     vec![epsilon_upper, log_delta_upper],

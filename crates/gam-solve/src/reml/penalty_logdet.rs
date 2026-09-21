@@ -417,6 +417,29 @@ pub struct PenaltyPseudologdet {
 }
 
 impl PenaltyPseudologdet {
+    /// The condition number `σ_max/σ_min` of the eigenspace this factorization
+    /// kept, read off the inverse squared eigenvalues it already holds
+    /// (`inv_evals_sq[i] = σ_i⁻²`, so the largest of them is `σ_min⁻²`).
+    ///
+    /// It is the amplification the pseudo-inverse applies to the spectrum's own
+    /// resolution: a quantity read through `S⁺` from a decomposition that placed
+    /// the spectrum within `p·ε·‖S‖₂` carries a relative `p·ε·κ`. A factorization
+    /// that kept nothing, or whose kept spectrum reaches zero, resolves no ratio
+    /// at all and reports an infinite condition.
+    pub(crate) fn retained_spectral_condition(&self) -> f64 {
+        let (smallest, largest) = self
+            .inv_evals_sq
+            .iter()
+            .fold((f64::INFINITY, 0.0_f64), |(smallest, largest), value| {
+                (smallest.min(*value), largest.max(*value))
+            });
+        if smallest > 0.0 && smallest.is_finite() && largest.is_finite() {
+            (largest / smallest).sqrt()
+        } else {
+            f64::INFINITY
+        }
+    }
+
     /// Compute tr(A B) = Σ_i Σ_k A[i,k] B[k,i] without materializing the product.
     #[inline]
     pub(crate) fn trace_dense_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {

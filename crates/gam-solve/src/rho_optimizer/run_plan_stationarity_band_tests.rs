@@ -341,7 +341,7 @@ fn accepted_steps_still_trip_the_cost_stall_window_2613() {
     );
     let published = published.expect("a stalled run must publish its best iterate");
     assert!(
-        published.converged,
+        published.claim.converged(),
         "a plateau whose |Pg| = {STATIONARY_GRAD_2613:.1e} clears the 1e-3 band is a stationary \
          optimum, not a floor: {published:?}",
     );

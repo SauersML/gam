@@ -346,12 +346,10 @@ pub(crate) struct CostStallExit {
     /// Accepted outer iterates observed when the stall fired (for the runner's
     /// `OuterResult.iterations` field and logging).
     pub(crate) iterations: usize,
-    /// Whether the best iterate is a genuine stationary optimum: `true` only
-    /// when its projected gradient norm cleared the outer gradient tolerance
-    /// (legitimately-flat REML surface). `false` for a flat-valley stall whose
-    /// residual gradient remains above tolerance — the runner reports the
-    /// rebuilt outer result as non-converged in that case.
-    pub(crate) converged: bool,
+    /// What accepted the best iterate as a stationary optimum, if anything.
+    /// The runner reports the rebuilt outer result as converged exactly when
+    /// this names a certificate ([`StationarityClaim::converged`]).
+    pub(crate) claim: StationarityClaim,
     /// `(noise_floor σ̂, probe_radius Δ)` measured over the stall window, reported
     /// as evidence and licensing no bound. See [`CostStallGuard::window_probe_scale`].
     pub(crate) probe_scale: Option<(f64, f64)>,
@@ -361,6 +359,42 @@ pub(crate) struct CostStallExit {
     /// Refused trials proposed from this incumbent whose model promised at most its
     /// resolution (#3400). See [`CostStallGuard::wall_refusals`].
     pub(crate) wall_refusals: usize,
+}
+
+/// What accepted the incumbent a [`CostStallExit`] publishes, if anything
+/// (#2902).
+///
+/// Six paths publish an exit and only two of them may claim a stationary
+/// optimum: the stall whose incumbent met the first-order band the terminal
+/// certificate applies at that point, and ARC's own synchronized
+/// projected-gradient-and-reduced-Hessian gate. Every other path publishes a
+/// point for the runner to halt back to and claims nothing about it.
+///
+/// Carrying what accepted the point, rather than a bare flag, is what makes
+/// "this exit claims nothing" a statement a publisher has to make instead of a
+/// `false` it can forget to write — the failure that put a provisional
+/// convergence label on a still-descending iterate and left the revocation
+/// paths below to take it back (#2299). A revocation is then the withdrawal of
+/// a named claim rather than the clearing of a bit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum StationarityClaim {
+    /// No certificate accepted this point; the terminal certificate judges the
+    /// incumbent.
+    None,
+    /// The incumbent's projected gradient met the stationarity band the
+    /// terminal certificate applies at that point
+    /// ([`CostStallGuard::stationarity_band`]).
+    FirstOrderBand { band: f64 },
+    /// ARC evaluated its certificate's rung on a synchronized analytic Hessian
+    /// AT this point and accepted it.
+    ArcCertificate,
+}
+
+impl StationarityClaim {
+    /// Whether the published exit reports a converged outer result.
+    pub(crate) fn converged(self) -> bool {
+        !matches!(self, Self::None)
+    }
 }
 
 /// Tracks the monotone best accepted-iterate REML objective and a
@@ -670,7 +704,7 @@ impl CostStallGuard {
             value: self.best_value,
             grad_norm: self.best_grad_norm,
             iterations: self.accepted_iters,
-            converged: false,
+            claim: StationarityClaim::None,
             probe_scale: None,
             rank_boundary: None,
             wall_refusals: self.wall_refusals,
@@ -1224,7 +1258,9 @@ impl CostStallGuard {
                 value: best_value,
                 grad_norm: best_grad_norm,
                 iterations: self.accepted_iters,
-                converged: false,
+                // The band was just read and this incumbent did not meet it, so
+                // nothing accepted the point.
+                claim: StationarityClaim::None,
                 probe_scale,
                 rank_boundary: Some(RankBoundaryStall {
                     kept_rank,
@@ -1328,7 +1364,7 @@ impl CostStallGuard {
                     value: best_value,
                     grad_norm: best_grad_norm,
                     iterations: self.accepted_iters,
-                    converged,
+                    claim: StationarityClaim::FirstOrderBand { band },
                     probe_scale,
                     rank_boundary: None,
                     wall_refusals: self.wall_refusals,
@@ -1401,7 +1437,9 @@ impl CostStallGuard {
                 value: best_value,
                 grad_norm: best_grad_norm,
                 iterations: self.accepted_iters,
-                converged,
+                // Past the `converged` return above, the incumbent is outside
+                // the band this stall read.
+                claim: StationarityClaim::None,
                 probe_scale,
                 rank_boundary: None,
                 wall_refusals: self.wall_refusals,
@@ -1455,7 +1493,7 @@ impl CostStallGuard {
                 value: self.best_value,
                 grad_norm: self.best_grad_norm,
                 iterations: self.accepted_iters,
-                converged: false,
+                claim: StationarityClaim::None,
                 // Not a halted stall: no window evidence is reported for a
                 // running best-so-far snapshot.
                 probe_scale: None,
@@ -1475,7 +1513,7 @@ impl CostStallGuard {
         if let Ok(mut slot) = self.exit.lock()
             && let Some(exit) = slot.as_mut()
         {
-            exit.converged = false;
+            exit.claim = StationarityClaim::None;
         }
     }
 
@@ -1487,7 +1525,7 @@ impl CostStallGuard {
         if let Ok(mut slot) = self.exit.lock()
             && let Some(exit) = slot.as_mut()
         {
-            exit.converged = false;
+            exit.claim = StationarityClaim::None;
         }
     }
 }
@@ -2285,7 +2323,7 @@ impl OuterFirstOrderBridge<'_> {
     /// gradient still exceeds the outer gradient tolerance is a flat-valley
     /// floor (`converged = false`), a stationary one is a real optimum
     /// (`converged = true`). Both share the sentinel; the verdict rides on the
-    /// published `CostStallExit.converged`.
+    /// published `CostStallExit.claim`.
     fn fold_accepted_iterate(
         &mut self,
         sample: &PendingOuterEval,
@@ -2981,7 +3019,7 @@ impl OuterSecondOrderBridge<'_> {
                 value: cost,
                 grad_norm: projected_norm,
                 iterations: guard.accepted_iters(),
-                converged: true,
+                claim: StationarityClaim::ArcCertificate,
                 // No stall fired, so no stall evidence is reported: the
                 // rung that stopped this run is the decrement.
                 probe_scale: None,
@@ -3127,7 +3165,7 @@ impl OuterSecondOrderBridge<'_> {
                 value,
                 grad_norm,
                 iterations,
-                converged: true,
+                claim: StationarityClaim::ArcCertificate,
                 // No stall's evidence is reported: the rung that
                 // stopped this run is the certificate's band.
                 probe_scale: None,
