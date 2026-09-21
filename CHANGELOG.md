@@ -16,6 +16,25 @@
   The FFI and Python rows gain `contrast` and `class`, make `edf` optional, and report
   `ref_df`, `statistic` and `p_value` as absent on a refused row.
 
+- **A custom-family refusal reaches the outer objective whole through the exact-joint spatial driver** (gam#3467).
+  `optimize_spatial_length_scale_exact_joint_typed` took closures returning
+  `Result<_, String>` and turned every error into `EstimationError::TrialPointRefused`.
+  That flattened the typed `CustomFamilyError` and with it the `RayRestoration` it
+  carries, which names a descending ray a block's penalty closes at a given
+  log-strength step. `run_plan`'s `eval_seed_restoring_rays` finds that restoration only
+  under `EstimationError::CustomFamily`, so on a separated survival marginal-slope
+  dataset startup refused its only derived seed even though the refusal named its own
+  remedy. The closure bounds now return `ExactJointRefusal`, which carries a
+  `CustomFamilyError` whole and a reason-only string as before, and
+  `into_trial_error` maps the first to `EstimationError::CustomFamily` and the second
+  to `TrialPointRefused`. The survival marginal-slope, BMS block-spec, gamlss builder,
+  latent survival, survival location-scale and transformation-normal call sites all pass
+  the typed error through instead of `to_string()`.
+  **Behavior change:** the producer's own `is_trial_point_infeasible` verdict now
+  decides the outcome, which is the design #2553 and #2590 state. A refusal that
+  verdict does not call infeasible, such as a dimension mismatch or a numerical
+  failure, therefore aborts the fit where it used to be retreated from as an
+  infeasible trial point.
 - **The joint encode row solve stops on quantities the problem states** (#4498).
   `joint_encode_refine_row` declared a row converged when `‖Jᵀ M r‖ ≤ 1e-10·(1 + ‖x‖)`.
   The gradient carries units of output² per latent unit and the bound carries units
