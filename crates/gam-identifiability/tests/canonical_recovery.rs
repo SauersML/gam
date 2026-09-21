@@ -7,8 +7,8 @@ use gam_identifiability::canonical::canonicalize_for_identifiability_with_operat
 use gam_linalg::faer_ndarray::FaerEigh;
 use gam_problem::test_support::{spec_from_dense, spec_from_dense_with_priority};
 use gam_problem::{
-    AdditiveBlockJacobian, BlockEffectiveJacobian, CoefficientCoordinate, FamilyLinearizationState,
-    PenaltyMatrix,
+    AdditiveBlockJacobian, BlockEffectiveJacobian, CoefficientCoordinate, CustomFamilyError,
+    FamilyLinearizationState, PenaltyMatrix,
 };
 use ndarray::{Array1, Array2, s};
 
@@ -919,5 +919,150 @@ fn map_uniqueness_preserves_operating_point_and_propagates_real_refusal() {
             assert_eq!(canonical.reduced_specs[0].design.ncols(), 2);
             assert_eq!(canonical.reduced_specs[1].design.ncols(), 2);
         }
+    }
+}
+
+/// The refusal a fixture block raises when asked to materialise its whole
+/// effective Jacobian at an operating point.
+const WHOLE_JACOBIAN_REFUSAL: &str =
+    "fixture block will not materialise its whole effective Jacobian at an operating point";
+
+/// A two-channel callback that streams row chunks but refuses to materialise its
+/// WHOLE effective Jacobian at an operating point.
+///
+/// `BlockEffectiveJacobian::effective_jacobian_at` asks for `0..usize::MAX`, so
+/// this refuses exactly the consumers that want the entire Jacobian in one
+/// array, while the streaming row operator the canonicaliser builds each block's
+/// transform with, which asks for bounded chunks, still evaluates. That is the
+/// shape of a real family whose duplicate is hundreds of MiB (#979), and it is
+/// the only consumer that asks for the whole Jacobian at the operating point:
+/// the MAP-uniqueness check.
+struct StreamsRowsButNotTheWholeJacobian {
+    full: Array2<f64>,
+    n: usize,
+}
+
+impl BlockEffectiveJacobian for StreamsRowsButNotTheWholeJacobian {
+    fn effective_jacobian_rows(
+        &self,
+        state: &FamilyLinearizationState<'_>,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, String> {
+        if rows.end == usize::MAX && state.family_scalars.is_some() {
+            return Err(WHOLE_JACOBIAN_REFUSAL.to_string());
+        }
+        let end = rows.end.min(self.n);
+        if rows.start > end {
+            return Err("fixture row range is reversed or out of bounds".into());
+        }
+        let width = end - rows.start;
+        let p = self.full.ncols();
+        let mut output = Array2::zeros((2 * width, p));
+        for channel in 0..2 {
+            output
+                .slice_mut(s![channel * width..(channel + 1) * width, ..])
+                .assign(&self.full.slice(s![
+                    channel * self.n + rows.start..channel * self.n + end,
+                    ..
+                ]));
+        }
+        Ok(output)
+    }
+
+    fn n_outputs(&self) -> usize {
+        2
+    }
+}
+
+/// The #2627 penalty-covered fixture: two four-column blocks over disjoint
+/// Legendre columns, each with an internal alias the penalty covers. It
+/// canonicalises cleanly, which is what makes it usable as the control below.
+fn penalty_covered_two_channel_fixture(n: usize) -> Vec<gam_problem::ParameterBlockSpec> {
+    two_channel_specs(
+        &legendre_columns(n, 8),
+        &[
+            vec![
+                vec![(0, 1.0)],
+                vec![(1, 1.0)],
+                vec![(2, 1.0)],
+                vec![(0, 1.0), (1, 1.0)],
+            ],
+            vec![
+                vec![(3, 1.0)],
+                vec![(4, 1.0)],
+                vec![(5, 1.0)],
+                vec![(3, 1.0), (4, 1.0)],
+            ],
+        ],
+        &[],
+        true,
+    )
+}
+
+/// gam#4561: the MAP-uniqueness check must see each block's effective Jacobian
+/// AT the operating point it linearizes at, so a callback it cannot evaluate
+/// there is refused by the typed error carrying the callback's own reason. It
+/// must not be replaced by the block's flat design, which is not the block's
+/// geometry: for a block whose callback exists precisely because its design is a
+/// placeholder, that substitute puts a false null direction into `JᵀWJ` and the
+/// check then runs on a geometry the solver never fits (gam#4360).
+///
+/// The two arms differ in one thing only: whether block `surface_1`'s callback
+/// can materialise its whole Jacobian at the operating point. The control
+/// establishes that this fixture, this operating point and this coordinate
+/// choice canonicalise, so the refusal below is caused by the callback and not
+/// by anything else the fixture carries.
+#[test]
+fn map_uniqueness_refuses_a_jacobian_that_fails_at_the_operating_point_4561() {
+    let n = 64;
+    let point = operating_point(vec![vec![1.0; 4], vec![1.0; 4]], false);
+
+    // Control: every block evaluates at the operating point.
+    canonicalize_for_identifiability_with_operating_scalars(
+        &penalty_covered_two_channel_fixture(n),
+        &[CoefficientCoordinate::Spanning; 2],
+        Some(Arc::clone(&point)),
+    )
+    .expect("the control fixture canonicalises at this operating point");
+
+    // Treatment: block `surface_1` streams its rows but cannot be materialised
+    // whole at the operating point, which is what the MAP-uniqueness check asks
+    // for. Its columns are the control's, so the geometry is unchanged.
+    let basis = legendre_columns(n, 8);
+    let recipe: [Vec<(usize, f64)>; 4] = [
+        vec![(0, 1.0)],
+        vec![(1, 1.0)],
+        vec![(2, 1.0)],
+        vec![(0, 1.0), (1, 1.0)],
+    ];
+    let full = Array2::from_shape_fn((2 * n, recipe.len()), |(row, column)| {
+        recipe[column]
+            .iter()
+            .map(|&(index, weight)| weight * basis[[row % n, index]])
+            .sum::<f64>()
+    });
+    let mut specs = penalty_covered_two_channel_fixture(n);
+    specs[0].jacobian_callback = Some(Arc::new(StreamsRowsButNotTheWholeJacobian { full, n }));
+
+    let error = canonicalize_for_identifiability_with_operating_scalars(
+        &specs,
+        &[CoefficientCoordinate::Spanning; 2],
+        Some(point),
+    )
+    .expect_err("a block Jacobian the MAP-uniqueness check cannot evaluate must be refused");
+    match error {
+        CustomFamilyError::DimensionMismatch { reason } => {
+            assert!(
+                reason.contains("could not evaluate the effective Jacobian of block 'surface_1'"),
+                "the refusal must name the block whose Jacobian failed: {reason}"
+            );
+            assert!(
+                reason.contains(WHOLE_JACOBIAN_REFUSAL),
+                "the refusal must carry the callback's own reason: {reason}"
+            );
+        }
+        other => panic!(
+            "an unevaluable effective Jacobian must refuse as DimensionMismatch, got {other:?}"
+        ),
     }
 }
