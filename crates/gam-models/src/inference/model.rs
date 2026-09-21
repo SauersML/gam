@@ -7901,4 +7901,41 @@ mod tests {
             current.smooth_terms_unavailable
         );
     }
+
+    /// A summary refusal keeps the category of the step that refused
+    /// (gam#4471). A saved model without its canonical fit result is a saved
+    /// payload the binary cannot summarize — a data refusal the caller fixes by
+    /// refitting — and it must reach the front ends as that, not as the
+    /// untyped string every front end then had to classify on its own (the
+    /// Python layer re-raised it as a `FormulaError`).
+    #[test]
+    fn a_summary_refusal_keeps_its_engine_category_4471() {
+        let payload = FittedModelPayload::new(
+            "y ~ x".to_string(),
+            ModelKind::Standard,
+            FittedFamily::Standard {
+                likelihood: LikelihoodSpec::binomial_probit(),
+                link: Some(StandardLink::Probit),
+                latent_cloglog_state: None,
+                mixture_state: None,
+                sas_state: None,
+            },
+            "binomial".to_string(),
+        );
+        assert!(payload.fit_result.is_none());
+        let err = crate::inference::saved_summary::saved_model_summary(&FittedModel::from_payload(
+            payload,
+        ))
+        .expect_err("a model without its fit result has no summary");
+        assert_eq!(
+            err.error_category(),
+            gam_problem::ErrorCategory::Data,
+            "a missing saved fit result is a data refusal, not a formula error: {err}"
+        );
+        assert!(
+            matches!(err, gam_solve::model_types::EstimationError::InvalidInput(ref reason)
+                if reason.contains("fit_result")),
+            "the refusal must name the missing payload field: {err:?}"
+        );
+    }
 }

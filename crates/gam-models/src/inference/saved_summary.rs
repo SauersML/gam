@@ -10,7 +10,9 @@
 //! criterion certificate, the smoothing forensics, the anisotropic scales, the
 //! measure-jet spectrum and the residual-cascade route.
 
-use crate::inference::model::{FittedFamily, FittedModel, GroupMetadata, SavedDeploymentExtension};
+use crate::inference::model::{
+    FittedFamily, FittedModel, FittedModelError, GroupMetadata, SavedDeploymentExtension,
+};
 use crate::survival::predict::fit_result_from_saved_model_for_prediction;
 use gam_report::{
     AnisotropicScalesRow, AsymptoteRailRow, BasisCheckRow, CoefficientRow, CriterionCertificateRow,
@@ -18,7 +20,7 @@ use gam_report::{
     SmoothingForensicsRow,
 };
 use gam_solve::estimate::{
-    ParametricPValueUnavailable, SmoothPValueUnavailable, UnifiedFitResult,
+    EstimationError, ParametricPValueUnavailable, SmoothPValueUnavailable, UnifiedFitResult,
 };
 use gam_terms::smooth::TermCollectionSpec;
 use ndarray::Array2;
@@ -722,8 +724,10 @@ pub struct ScanIntrospection {
 /// Reconstruct the canonical fitted quantities for a spline-scan model, or
 /// `Ok(None)` for a dense model that should follow the standard `fit_result`
 /// path (#1046).
-pub fn scan_introspection(model: &FittedModel) -> Result<Option<ScanIntrospection>, String> {
-    let Some((feature_column, fit)) = model.saved_spline_scan().map_err(|e| e.to_string())? else {
+pub fn scan_introspection(
+    model: &FittedModel,
+) -> Result<Option<ScanIntrospection>, FittedModelError> {
+    let Some((feature_column, fit)) = model.saved_spline_scan()? else {
         return Ok(None);
     };
     Ok(Some(ScanIntrospection {
@@ -756,7 +760,7 @@ const SCAN_RECORDS_NO_NULL_DEVIANCE: &str =
 fn scan_summary_payload(
     model: &FittedModel,
     scan: &ScanIntrospection,
-) -> Result<SummaryPayload, String> {
+) -> Result<SummaryPayload, EstimationError> {
     let smooth_terms = vec![SummarySmoothTermRow {
         name: scan_smooth_label(scan),
         predictor: None,
@@ -950,14 +954,16 @@ impl SummaryInformationCriteria {
     fn from_criteria(
         criteria: gam_solve::inference::information_criteria::InformationCriteria,
         missing_correction: Option<&'static str>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, EstimationError> {
         let aic_corrected_unavailable = match criteria.aic_corrected {
             Some(_) => None,
             None => Some(
                 missing_correction
                     .or(criteria.edf.unavailable_reason.map(|reason| reason.describe()))
                     .ok_or_else(|| {
-                        "corrected AIC is absent without a recorded reason".to_string()
+                        EstimationError::FitResultInvariantViolated(
+                            "corrected AIC is absent without a recorded reason".to_string(),
+                        )
                     })?,
             ),
         };
@@ -980,7 +986,7 @@ pub const NO_AIC_WITHOUT_A_SCALAR_FAMILY: &str =
 
 fn summary_information_criteria(
     fit: &UnifiedFitResult,
-) -> Result<SummaryInformationCriteria, String> {
+) -> Result<SummaryInformationCriteria, EstimationError> {
     if fit.likelihood_family.is_none() {
         return Ok(SummaryInformationCriteria::unavailable(
             NO_AIC_WITHOUT_A_SCALAR_FAMILY,
@@ -992,11 +998,8 @@ fn summary_information_criteria(
     if fit.edf_total().is_none() {
         return Ok(SummaryInformationCriteria::unavailable(NO_AIC_WITHOUT_A_RETAINED_EDF));
     }
-    let criteria = gam_solve::inference::information_criteria::information_criteria(
-        fit,
-        log_likelihood,
-    )
-    .map_err(|err| format!("failed to compute information criteria: {err}"))?;
+    let criteria =
+        gam_solve::inference::information_criteria::information_criteria(fit, log_likelihood)?;
     SummaryInformationCriteria::from_criteria(criteria, None)
 }
 
@@ -1005,7 +1008,7 @@ fn summary_information_criteria(
 /// corrected EDF is formed from.
 fn scan_information_criteria(
     scan: &ScanIntrospection,
-) -> Result<SummaryInformationCriteria, String> {
+) -> Result<SummaryInformationCriteria, EstimationError> {
     use gam_solve::inference::information_criteria::{
         CorrectedEdf, information_criteria_from_parts,
     };
@@ -1014,8 +1017,7 @@ fn scan_information_criteria(
         corrected: None,
         unavailable_reason: None,
     };
-    let criteria = information_criteria_from_parts(scan.log_likelihood, edf, 1.0)
-        .map_err(|err| format!("failed to compute spline-scan information criteria: {err}"))?;
+    let criteria = information_criteria_from_parts(scan.log_likelihood, edf, 1.0)?;
     SummaryInformationCriteria::from_criteria(criteria, Some(NO_CORRECTED_AIC_ON_SPLINE_SCAN))
 }
 
@@ -1024,11 +1026,18 @@ fn scan_information_criteria(
 /// curvature and basis-adequacy rows the fit recorded, and the fit's own
 /// convergence certificate. A spline-scan model reports what the O(n) smoother
 /// retained.
-pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String> {
+///
+/// The error keeps the category of the step that refused: a saved payload this
+/// binary cannot read is a [`FittedModelError`] (a data refusal), a dispersion
+/// or criterion the engine cannot form is the engine's own [`EstimationError`],
+/// and a fit whose recorded evidence contradicts itself is a fit-result
+/// invariant. Front ends classify the failure from that category (gam#4471).
+pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, EstimationError> {
     if let Some(scan) = scan_introspection(model)? {
         return scan_summary_payload(model, &scan);
     }
-    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    let fit = fit_result_from_saved_model_for_prediction(model)
+        .map_err(|reason| FittedModelError::MissingField { reason })?;
     let tables = summary_term_tables(model, &fit);
     let (parametric_terms, parametric_terms_unavailable) = match tables.parametric {
         Ok(rows) => (rows, None),
@@ -1068,15 +1077,15 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
     // term is a correction TO a score, not a score, so applying it to a stand-in
     // would manufacture exactly the comparable number this fit cannot have.
     let raw_reml_score = fit.reml_score();
-    let reml_score = fit
-        .comparable_reml_score()
-        .map_err(|err| format!("failed to compute comparable REML score: {err}"))?;
+    let reml_score = fit.comparable_reml_score().map_err(|err| {
+        EstimationError::FitResultInvariantViolated(format!(
+            "failed to compute comparable REML score: {err}"
+        ))
+    })?;
     // A custom family, and a family whose scale contract has no scalar
     // response dispersion (Royston-Parmar), report no scale; every other
     // family resolves one or the summary refuses.
-    let scale = fit
-        .scalar_dispersion_phi()
-        .map_err(|err| format!("failed to resolve the fitted dispersion: {err}"))?;
+    let scale = fit.scalar_dispersion_phi()?;
     let information_criteria = summary_information_criteria(&fit)?;
     Ok(SummaryPayload {
         formula: model.payload().formula.clone(),
@@ -1244,7 +1253,10 @@ pub fn compare_saved_models(
 ) -> Result<gam_solve::evidence::ModelComparison, String> {
     let candidates = models
         .iter()
-        .map(|(name, model)| comparison_candidate(name.clone(), saved_model_summary(model)?))
+        .map(|(name, model)| {
+            let summary = saved_model_summary(model).map_err(|err| err.to_string())?;
+            comparison_candidate(name.clone(), summary)
+        })
         .collect::<Result<Vec<_>, String>>()?;
     gam_solve::evidence::compare_models(candidates)
 }
@@ -1259,8 +1271,10 @@ pub fn compare_saved_models(
 /// `compare_models` table instead reports such a ratio as absent because its
 /// JSON transport cannot carry `inf`.
 pub fn saved_models_evidence_ratio(a: &FittedModel, b: &FittedModel) -> Result<f64, String> {
-    let a = comparison_candidate("a".to_string(), saved_model_summary(a)?)?;
-    let b = comparison_candidate("b".to_string(), saved_model_summary(b)?)?;
+    let a = saved_model_summary(a).map_err(|err| err.to_string())?;
+    let b = saved_model_summary(b).map_err(|err| err.to_string())?;
+    let a = comparison_candidate("a".to_string(), a)?;
+    let b = comparison_candidate("b".to_string(), b)?;
     Ok(gam_solve::evidence::log_evidence_ratio(&a, &b)?.exp())
 }
 

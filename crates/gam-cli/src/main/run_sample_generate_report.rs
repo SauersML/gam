@@ -365,7 +365,7 @@ pub(crate) fn run_generate_unified(
 pub(crate) fn run_summary(args: SummaryArgs) -> CliResult<()> {
     reject_multinomial_model(&args.model, "summary")?;
     let model = SavedModel::load_from_path(&args.model)?;
-    let summary = saved_model_summary(&model)?;
+    let summary = saved_model_summary(&model).map_err(|err| err.to_string())?;
     // `--json` prints the payload itself, the document gamfit's
     // `Model.summary()` reads; otherwise one renderer owns the text, and
     // gamfit prints the same string from the same payload.
