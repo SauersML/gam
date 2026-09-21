@@ -805,8 +805,7 @@ impl<'a> RemlState<'a> {
     ///
     /// `c_v`, `c_g` (n×k) and `c_h` (n×k×k) are the value, ρ-gradient and
     /// ρ-Hessian parts of the per-row `c` jets. Row `i` of `xk0 = XH⁻¹` is
-    /// `z_i = H⁻¹x_i`, row `i` of `xka[a] = XK_a` is `K_a x_i`, and
-    /// `k_ij[a][b] = K_ab`. Define
+    /// `z_i = H⁻¹x_i` and row `i` of `xka[a] = XK_a` is `K_a x_i`. Define
     /// `T_w = Σ_j w_j x_j⊗x_j⊗x_j`, `r_i = T_c[z_i, z_i, ·]`, `s_i = r_iᵀz_i`
     /// and `s⁽ᵇ⁾_i = T_{c_g[·,b]}[z_i, z_i, z_i]`. Relabelling `i ↔ j` under the
     /// symmetry of `H⁻¹`, `K_a` and `K_ab` turns every row-pair sum of the jet
@@ -814,9 +813,15 @@ impl<'a> RemlState<'a> {
     ///
     /// ```text
     ///   12·H[a,b] = 2 Σ_i c_h[i,a,b] s_i + Σ_i (c_g[i,a] s⁽ᵇ⁾_i + c_g[i,b] s⁽ᵃ⁾_i)
-    ///             + 3 Σ_i c_v[i] r_iᵀK_ab x_i + 6 Σ_i c_v[i] T_c[z_i, K_a x_i, K_b x_i]
-    ///             + 6 Σ_i c_g[i,a] r_iᵀK_b x_i + 6 Σ_i c_g[i,b] r_iᵀK_a x_i.
+    ///             + 3 ⟨K_ab, W⟩ + 6 Σ_i c_v[i] T_c[z_i, K_a x_i, K_b x_i]
+    ///             + 6 Σ_i c_g[i,a] r_iᵀK_b x_i + 6 Σ_i c_g[i,b] r_iᵀK_a x_i,
+    ///   W = Σ_i c_v[i] x_i r_iᵀ.
     /// ```
+    ///
+    /// The second derivative `K_ab` enters only through `⟨K_ab, W⟩`, so this
+    /// returns the other terms over 12 together with `W`, and the caller folds
+    /// `¼ W` into the one trace it contracts against every `K_ab` (see
+    /// [`Self::tk_hessian_rho_canonical_logit_with_route`]).
     ///
     /// That costs `O(n·((2 + 3k)·p³ + k²·p²))` against
     /// `O(n²·((2 + k)·p + k²))` for [`Self::tk_rho_hessian_pair_blocks`]. Returns
@@ -826,11 +831,10 @@ impl<'a> RemlState<'a> {
         x_dense: &Array2<f64>,
         xk0: &Array2<f64>,
         xka: &[Array2<f64>],
-        k_ij: &[Vec<Array2<f64>>],
         c_v: &Array1<f64>,
         c_g: &Array2<f64>,
         c_h: &ndarray::Array3<f64>,
-    ) -> Result<Option<Array2<f64>>, EstimationError> {
+    ) -> Result<Option<(Array2<f64>, Array2<f64>)>, EstimationError> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
         let k = c_g.ncols();
@@ -852,6 +856,7 @@ impl<'a> RemlState<'a> {
             n,
             |range: core::ops::Range<usize>| {
                 let mut local = Array2::<f64>::zeros((k, k));
+                let mut w = Array2::<f64>::zeros((p, p));
                 for row in range {
                     let z = xk0.row(row);
                     let x_row = x_dense.row(row);
@@ -866,31 +871,36 @@ impl<'a> RemlState<'a> {
                         let zw_a =
                             Array1::from_shape_fn(p * p, |index| z[index / p] * w_a[index % p]);
                         for b in 0..k {
-                            let w_ab = k_ij[a][b].dot(&x_row);
                             let triple = zw_a.dot(&tw[b]);
                             local[[a, b]] += (2.0 * c_h[[row, a, b]] * s
                                 + c_g[[row, a]] * s_g[b]
                                 + c_g[[row, b]] * s_g[a]
-                                + 3.0 * c_v[row] * r.dot(&w_ab)
                                 + 6.0 * c_v[row] * triple
                                 + 6.0 * c_g[[row, a]] * r_w[b]
                                 + 6.0 * c_g[[row, b]] * r_w[a])
                                 / 12.0;
                         }
                     }
+                    for u in 0..p {
+                        let scaled = c_v[row] * x_row[u];
+                        for v in 0..p {
+                            w[[u, v]] += scaled * r[v];
+                        }
+                    }
                 }
-                local
+                (local, w)
             },
-            |mut left, right| {
+            |(mut left, mut left_w), (right, right_w)| {
                 left += &right;
-                left
+                left_w += &right_w;
+                (left, left_w)
             },
         )
-        .unwrap_or_else(|| Array2::<f64>::zeros((k, k)));
+        .unwrap_or_else(|| (Array2::<f64>::zeros((k, k)), Array2::<f64>::zeros((p, p))));
         // The ledger charge covers the design tensors, so it is released after them.
         drop((t_c, t_g));
         drop(working);
-        if total.iter().any(|value| !value.is_finite()) {
+        if total.0.iter().chain(total.1.iter()).any(|value| !value.is_finite()) {
             crate::bail_invalid_estim!("{context} produced a non-finite entry");
         }
         Ok(Some(total))
@@ -905,10 +915,13 @@ impl<'a> RemlState<'a> {
     ///
     /// ```text
     ///   12·H[a,b] = 2 Σ_i c_h[i,a,b] s_i + Σ_i (c_g[i,a] s⁽ᵇ⁾_i + c_g[i,b] s⁽ᵃ⁾_i)
-    ///             + 3 ⟨K_ab, Σ_i c_v[i] x_i r_iᵀ⟩
-    ///             + 6 Σ_i c_g[i,a] r_iᵀK_b x_i + 6 Σ_i c_g[i,b] r_iᵀK_a x_i
-    ///             + 6 Σ_ij c_v[i] c_v[j] K_ij (K_a)_ij (K_b)_ij.
+    ///             + 3 ⟨K_ab, W⟩ + 6 Σ_i c_g[i,a] r_iᵀK_b x_i + 6 Σ_i c_g[i,b] r_iᵀK_a x_i
+    ///             + 6 Σ_ij c_v[i] c_v[j] K_ij (K_a)_ij (K_b)_ij,
+    ///   W = Σ_i c_v[i] x_i r_iᵀ,
     /// ```
+    ///
+    /// and, like the tensor route, it returns every term but `⟨K_ab, W⟩` over 12
+    /// together with `W`.
     ///
     /// Each row block `I` walks the column tiles `J`, forming `K_IJ` and every
     /// `(K_a)_IJ` with one GEMM each, so the last sum is a `k×k` Gram of the
@@ -919,11 +932,10 @@ impl<'a> RemlState<'a> {
         x_dense: &Array2<f64>,
         xk0: &Array2<f64>,
         xka: &[Array2<f64>],
-        k_ij: &[Vec<Array2<f64>>],
         c_v: &Array1<f64>,
         c_g: &Array2<f64>,
         c_h: &ndarray::Array3<f64>,
-    ) -> Result<Array2<f64>, EstimationError> {
+    ) -> Result<(Array2<f64>, Array2<f64>), EstimationError> {
         use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
         let n = x_dense.nrows();
         let p = x_dense.ncols();
@@ -1005,20 +1017,15 @@ impl<'a> RemlState<'a> {
             },
         );
         let Some((mut total, w)) = folded else {
-            return Ok(Array2::zeros((k, k)));
+            return Ok((Array2::zeros((k, k)), Array2::zeros((p, p))));
         };
-        for a in 0..k {
-            for b in 0..k {
-                total[[a, b]] += 3.0 * (&k_ij[a][b] * &w).sum();
-            }
-        }
         total.mapv_inplace(|value| value / 12.0);
-        if total.iter().any(|value| !value.is_finite()) {
+        if total.iter().chain(w.iter()).any(|value| !value.is_finite()) {
             crate::bail_invalid_estim!(
                 "Tierney-Kadane rho-Hessian row blocks produced a non-finite entry"
             );
         }
-        Ok(total)
+        Ok((total, w))
     }
 
     pub(crate) fn tk_scalar_from_shared(
@@ -1911,17 +1918,20 @@ impl<'a> RemlState<'a> {
         }
 
         // Each per-penalty Firth direction depends only on eta_i[idx], so it is
-        // built once and shared by the first-derivative blocks and every (i,j)
-        // pair below (#1575). The k builds are independent O(n·r²) reduced-Gram
-        // passes, fanned across Rayon with the nested-BLAS guard when there is
-        // more than one direction and more than one thread; index-ordered
-        // collection keeps the Vec identical to the serial build.
+        // built once and shared by the first-derivative blocks, by the Jeffreys
+        // trace jet of the determinant part, and by the second-order trace
+        // against `Ω` below (#1575). The k builds are independent O(n·r²)
+        // reduced-Gram passes, fanned across Rayon with the nested-BLAS guard
+        // when there is more than one direction and more than one thread;
+        // index-ordered collection keeps the Vec identical to the serial build.
         let fan_units = k > 1 && rayon::current_num_threads() > 1;
         let firth_dir_i: Vec<super::FirthDirection> = if fan_units {
             use rayon::prelude::*;
             eta_i
                 .par_iter()
-                .map(|e| gam_problem::with_nested_parallel(|| firth_op.direction_from_deta(e.clone())))
+                .map(|e| {
+                    gam_problem::with_nested_parallel(|| firth_op.direction_from_deta(e.clone()))
+                })
                 .collect()
         } else {
             eta_i
@@ -1951,10 +1961,6 @@ impl<'a> RemlState<'a> {
         let (h0_i, phi_i): (Vec<Array2<f64>>, Vec<Array2<f64>>) = first_blocks.into_iter().unzip();
         let hf_i: Vec<Array2<f64>> = h0_i.iter().zip(&phi_i).map(|(h0, phi)| h0 - phi).collect();
 
-        // D²H_φ[u,v] is evaluated for every (i,j) pair against the same identity
-        // rhs, so its single-index sub-blocks are cached once (#1575).
-        let firth_second_eye_cache = firth_op.tk_second_direction_eye_cache(&firth_dir_i);
-
         let mut beta_ij: Vec<Vec<Array1<f64>>> = (0..k)
             .map(|_| (0..k).map(|_| Array1::<f64>::zeros(p)).collect())
             .collect();
@@ -1970,53 +1976,36 @@ impl<'a> RemlState<'a> {
                 beta_ij[j][i] = bij;
             }
         }
-        // Mixed second-derivative blocks Ḧ₀,ij and Ḧ_φ,ij for every lower-triangle
-        // pair: independent full-data passes, fanned out across Rayon with the
-        // nested-BLAS guard when there is more than one pair and more than one
-        // thread; the reduction back stays in index order (#1575).
-        let h_pairs: Vec<(usize, usize)> =
-            (0..k).flat_map(|i| (0..=i).map(move |j| (i, j))).collect();
-        let compute_h_pair = |&(i, j): &(usize, usize)| -> (Array2<f64>, Array2<f64>) {
-            let eta_ij = gam_linalg::faer_ndarray::fast_av(x_dense, &beta_ij[i][j]);
-            let diag = c_array * &eta_ij + &(d_array * &(&eta_i[i] * &eta_i[j]));
-            let mut h0 = Self::tk_xt_diag_x(x_dense, &diag);
-            if i == j {
-                h0 += &a_mats[i];
-            }
-            gam_linalg::matrix::symmetrize_in_place(&mut h0);
-            let dir_ij = firth_op.direction_from_deta(eta_ij);
-            let mut phi = firth_op.hphi_direction(&dir_ij);
-            phi += &firth_op.hphisecond_direction_apply_eye_cached(
-                &firth_second_eye_cache,
-                &firth_dir_i,
-                i,
-                j,
-            );
-            gam_linalg::matrix::symmetrize_in_place(&mut phi);
-            (h0, phi)
+
+        use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
+        // Row `r` of a product `XΩ` is `Ωx_r` for symmetric `Ω`, so the row
+        // leverage `ℓ = diag(XΩXᵀ)` is the row-wise dot of `XΩ` with `X`; the
+        // jets below read `XK` and `XK_a` as GEMM operands the same way.
+        let row_dots =
+            |product: &Array2<f64>| -> Array1<f64> { (product * x_dense).sum_axis(Axis(1)) };
+        let eta_mat = Array2::from_shape_fn((n, k), |(row, a)| eta_i[a][row]);
+        // `tr(Ḧ₀,ab Ω)` for a symmetric `Ω`, with no p×p second derivative
+        // formed. `Ḧ₀,ab = Xᵀ diag(c ∘ Xβ_ab + d ∘ η_a ∘ η_b) X + δ_ab A_a`, so
+        // with `ℓ = diag(XΩXᵀ)`
+        //
+        //   tr(Ḧ₀,ab Ω) = (Xᵀ(c ∘ ℓ))·β_ab + Σ_r d_r ℓ_r η_a,r η_b,r + δ_ab ⟨A_a, Ω⟩,
+        //
+        // one O(n·p²) apply for the leverage plus O(k²) dots, against the
+        // O(k²) dense p×p assemblies it replaces (fz0034).
+        let h0_second_trace = |omega: &Array2<f64>| -> Array2<f64> {
+            let leverage = row_dots(&fast_ab(x_dense, omega));
+            let gamma = x_dense.t().dot(&(c_array * &leverage));
+            let d_leverage = d_array * &leverage;
+            let eta_gram =
+                fast_atb(&eta_mat, &(&eta_mat * &d_leverage.view().insert_axis(Axis(1))));
+            Array2::from_shape_fn((k, k), |(a, b)| {
+                let mut value = gamma.dot(&beta_ij[a][b]) + eta_gram[[a, b]];
+                if a == b {
+                    value += (&a_mats[a] * omega).sum();
+                }
+                value
+            })
         };
-        let fan_pairs = h_pairs.len() > 1 && rayon::current_num_threads() > 1;
-        let pair_blocks: Vec<(Array2<f64>, Array2<f64>)> = if fan_pairs {
-            use rayon::prelude::*;
-            h_pairs
-                .par_iter()
-                .map(|pair| gam_problem::with_nested_parallel(|| compute_h_pair(pair)))
-                .collect()
-        } else {
-            h_pairs.iter().map(compute_h_pair).collect()
-        };
-        let mut h0_ij: Vec<Vec<Array2<f64>>> = (0..k)
-            .map(|_| (0..k).map(|_| Array2::<f64>::zeros((p, p))).collect())
-            .collect();
-        let mut phi_ij: Vec<Vec<Array2<f64>>> = (0..k)
-            .map(|_| (0..k).map(|_| Array2::<f64>::zeros((p, p))).collect())
-            .collect();
-        for (&(i, j), (h0, phi)) in h_pairs.iter().zip(pair_blocks.into_iter()) {
-            h0_ij[i][j] = h0.clone();
-            h0_ij[j][i] = h0;
-            phi_ij[i][j] = phi.clone();
-            phi_ij[j][i] = phi;
-        }
 
         // Determinant part D = ½ log|H₀| − ½ log|H_F| − ½ tr(G₀H_φ), G₀ = H₀⁻¹,
         // G_F = H_F⁻¹. Its first derivative is
@@ -2027,6 +2016,9 @@ impl<'a> RemlState<'a> {
         //   D̈_ij = tr(M_H Ḧ₀,ij) + tr(M_φ Ḧ_φ,ij)
         //        + ½ [ tr(Q_jQ_i) − tr(P_jP_i) − tr(P_jΣP_i) − tr(P_iΣP_j)
         //              + tr(R_jP_i) + tr(P_jR_i) ].
+        // `M_H` and `M_φ` are symmetric and fixed across the pair loop, so both
+        // second-derivative traces are read through the identities above rather
+        // than from a materialized `Ḧ₀,ij` / `Ḧ_φ,ij` (fz0034).
         let sigma = k_mat.dot(hphi);
         let m_h = 0.5 * (&k_mat - &g_f + &sigma.dot(&k_mat));
         let m_phi = 0.5 * (&g_f - &k_mat);
@@ -2034,11 +2026,19 @@ impl<'a> RemlState<'a> {
         let q_mats: Vec<Array2<f64>> = hf_i.iter().map(|h| g_f.dot(h)).collect();
         let r_mats: Vec<Array2<f64>> = phi_i.iter().map(|h| k_mat.dot(h)).collect();
         let ps_mats: Vec<Array2<f64>> = p_mats.iter().map(|pm| pm.dot(&sigma)).collect();
+        let h0_second_m_h = h0_second_trace(&m_h);
+        // `Ḧ_φ,ij = DH_φ[β_ij] + D²H_φ[β_i, β_j]`, so `tr(M_φ Ḧ_φ,ij)` is the
+        // trace jet of `H_φ` at the fixed `M_φ`: its linear part contracts the
+        // mode's second derivative `η_ij = Xβ_ij`, its k×k part is the mixed
+        // second directional derivative already traced.
+        let (phi_linear, phi_second) = firth_op.hphi_direction_trace_jet(&m_phi, &firth_dir_i)?;
+        let phi_gamma = x_dense.t().dot(&phi_linear);
         let mut det_hessian = Array2::<f64>::zeros((k, k));
         for i in 0..k {
             for j in 0..=i {
-                let value = tk_trace_product(&m_h, &h0_ij[i][j])
-                    + tk_trace_product(&m_phi, &phi_ij[i][j])
+                let value = h0_second_m_h[[i, j]]
+                    + phi_gamma.dot(&beta_ij[i][j])
+                    + phi_second[[i, j]]
                     + 0.5
                         * (tk_trace_product(&q_mats[j], &q_mats[i])
                             - tk_trace_product(&p_mats[j], &p_mats[i])
@@ -2051,13 +2051,12 @@ impl<'a> RemlState<'a> {
             }
         }
 
-        // `K_i = -K H₀,i K` and `K_ij = K H₀,j K H₀,i K + K H₀,i K H₀,j K - K H₀,ij K`
-        // with `K = G₀ = H₀⁻¹`.
-        // With `M_i = K H₀,i` and `P_i = K H₀,i K` computed once, each pair costs
-        // four GEMMs: `K_ij = M_j P_i + M_i P_j - K H₀,ij K`. Both are symmetric in
-        // exact arithmetic and are symmetrized so the contractions below may use
-        // either index order.
-        use gam_linalg::faer_ndarray::fast_ab;
+        // `K_a = -K Ḣ₀,a K` and
+        // `K_ab = K Ḣ₀,b K Ḣ₀,a K + K Ḣ₀,a K Ḣ₀,b K - K Ḧ₀,ab K` with `K = H₀⁻¹`.
+        // `M_a = K Ḣ₀,a` and `P_a = K Ḣ₀,a K` are formed once. The second
+        // derivatives `K_ab` are never formed: every term of the jet sums below
+        // that reads one is linear in it, so they are gathered into one trace
+        // `⟨K_ab, Π⟩` against a single symmetric `Π`, contracted at the end.
         let compute_m_p = |idx: usize| -> (Array2<f64>, Array2<f64>) {
             let m = fast_ab(&k_mat, &h0_i[idx]);
             let p_mat = fast_ab(&m, &k_mat);
@@ -2080,29 +2079,6 @@ impl<'a> RemlState<'a> {
                 ki
             })
             .collect();
-        let compute_k_pair = |&(i, j): &(usize, usize)| -> Array2<f64> {
-            let mut kij = fast_ab(&m_p[j].0, &m_p[i].1);
-            kij += &fast_ab(&m_p[i].0, &m_p[j].1);
-            kij -= &fast_ab(&fast_ab(&k_mat, &h0_ij[i][j]), &k_mat);
-            gam_linalg::matrix::symmetrize_in_place(&mut kij);
-            kij
-        };
-        let k_blocks: Vec<Array2<f64>> = if fan_pairs {
-            use rayon::prelude::*;
-            h_pairs
-                .par_iter()
-                .map(|pair| gam_problem::with_nested_parallel(|| compute_k_pair(pair)))
-                .collect()
-        } else {
-            h_pairs.iter().map(compute_k_pair).collect()
-        };
-        let mut k_ij: Vec<Vec<Array2<f64>>> = (0..k)
-            .map(|_| (0..k).map(|_| Array2::<f64>::zeros((0, 0))).collect())
-            .collect();
-        for (&(i, j), kij) in h_pairs.iter().zip(k_blocks.into_iter()) {
-            k_ij[i][j] = kij.clone();
-            k_ij[j][i] = kij;
-        }
 
         #[derive(Clone)]
         struct Jet {
@@ -2151,30 +2127,17 @@ impl<'a> RemlState<'a> {
             }
         }
 
-        // Row `i` of `XK`, `XK_a` and `XK_ab` is `Kx_i`, `K_a x_i` and `K_ab x_i`
-        // (every one symmetric), so the diagonal jet `x_iᵀ(K, K_a, K_ab)x_i` is
-        // a row-wise dot of each product with `X`, and the row-pair sums below
-        // read `XK` and `XK_a` as GEMM operands.
-        let row_dots = |product: &Array2<f64>| -> Array1<f64> {
-            (product * x_dense).sum_axis(Axis(1))
-        };
+        // Row `i` of `XK` and `XK_a` is `Kx_i` and `K_a x_i` (both symmetric),
+        // so the diagonal jet `x_iᵀ(K, K_a)x_i` is a row-wise dot of each
+        // product with `X`, and the row-pair sums below read `XK` and `XK_a` as
+        // GEMM operands.
         let xk0 = fast_ab(x_dense, &k_mat);
         let xka: Vec<Array2<f64>> = k_i.iter().map(|ki| fast_ab(x_dense, ki)).collect();
         let hdiag_v = row_dots(&xk0);
         let hdiag_g: Vec<Array1<f64>> = xka.iter().map(|xk| row_dots(xk)).collect();
-        let compute_hdiag_pair = |&(i, j): &(usize, usize)| -> Array1<f64> {
-            row_dots(&fast_ab(x_dense, &k_ij[i][j]))
-        };
-        let hdiag_pairs: Vec<Array1<f64>> = if fan_pairs {
-            use rayon::prelude::*;
-            h_pairs
-                .par_iter()
-                .map(|pair| gam_problem::with_nested_parallel(|| compute_hdiag_pair(pair)))
-                .collect()
-        } else {
-            h_pairs.iter().map(compute_hdiag_pair).collect()
-        };
-        let mut hdiag: Vec<Jet> = (0..n)
+        // The `x_iᵀK_ab x_i` part of the jet is left zero: it enters only
+        // linearly and is traced through `Π` below.
+        let hdiag: Vec<Jet> = (0..n)
             .map(|row| {
                 let mut jet = Jet::constant(hdiag_v[row], k);
                 for a in 0..k {
@@ -2183,12 +2146,6 @@ impl<'a> RemlState<'a> {
                 jet
             })
             .collect();
-        for (&(i, j), diag) in h_pairs.iter().zip(hdiag_pairs.iter()) {
-            for (row, jet) in hdiag.iter_mut().enumerate() {
-                jet.h[[i, j]] = diag[row];
-                jet.h[[j, i]] = diag[row];
-            }
-        }
         let mut cjet = Vec::with_capacity(n);
         let mut djet = Vec::with_capacity(n);
         for row in 0..n {
@@ -2220,26 +2177,26 @@ impl<'a> RemlState<'a> {
         // `¹⁄₁₂ Σ_ij c_i c_j K_ij³` in second-order ρ-jets: through the design
         // tensor when that route was chosen and the ledger admits it, else by row
         // blocks. Only `total.h` is returned, so either route supplies the
-        // ρ-Hessian block alone.
+        // ρ-Hessian block alone, less its `¼ ⟨K_ab, W⟩` term.
         let c_v = Array1::from_shape_fn(n, |row| cjet[row].v);
         let c_g = Array2::from_shape_fn((n, k), |(row, a)| cjet[row].g[a]);
         let c_h = ndarray::Array3::from_shape_fn((n, k, k), |(row, a, b)| cjet[row].h[[a, b]]);
         let tensor_pairs = match route {
             TkRowPairRoute::RowPairs => None,
             TkRowPairRoute::Tensor => {
-                Self::tk_rho_hessian_pair_tensor(x_dense, &xk0, &xka, &k_ij, &c_v, &c_g, &c_h)?
+                Self::tk_rho_hessian_pair_tensor(x_dense, &xk0, &xka, &c_v, &c_g, &c_h)?
             }
         };
-        let used_route = match tensor_pairs {
-            Some(pair_hessian) => {
+        let (pair_w, used_route) = match tensor_pairs {
+            Some((pair_hessian, w)) => {
                 total.h += &pair_hessian;
-                TkRowPairRoute::Tensor
+                (w, TkRowPairRoute::Tensor)
             }
             None => {
-                total.h += &Self::tk_rho_hessian_pair_blocks(
-                    x_dense, &xk0, &xka, &k_ij, &c_v, &c_g, &c_h,
-                )?;
-                TkRowPairRoute::RowPairs
+                let (pair_hessian, w) =
+                    Self::tk_rho_hessian_pair_blocks(x_dense, &xk0, &xka, &c_v, &c_g, &c_h)?;
+                total.h += &pair_hessian;
+                (w, TkRowPairRoute::RowPairs)
             }
         };
         // `⅛ qᵀ K q` for the jet vector `q = Xᵀ(c ∘ h)` and the jet matrix
@@ -2249,7 +2206,7 @@ impl<'a> RemlState<'a> {
         //   Σ_a q_h[a]·2u_a + q_vᵀ K_ab q_v + 2(q_gᵀV + Vᵀq_g) + 2 q_gᵀ K q_g,
         //
         // so it is a handful of GEMMs and `k²` quadratic forms rather than `p²`
-        // jet products.
+        // jet products. `q_vᵀ K_ab q_v` joins `Π` below.
         let mut wh_v = Array1::<f64>::zeros(n);
         let mut wh_g = Array2::<f64>::zeros((n, k));
         let mut wh_h = Array2::<f64>::zeros((n, k * k));
@@ -2264,25 +2221,72 @@ impl<'a> RemlState<'a> {
             );
         }
         let q_v = x_dense.t().dot(&wh_v);
-        let q_g = gam_linalg::faer_ndarray::fast_atb(x_dense, &wh_g);
+        let q_g = fast_atb(x_dense, &wh_g);
         let u = k_mat.dot(&q_v);
+        let xu = x_dense.dot(&u);
         let v_mat = Array2::from_shape_fn((p, k), |(row, b)| k_i[b].row(row).dot(&q_v));
         let qh_u = wh_h
             .t()
-            .dot(&x_dense.dot(&u))
+            .dot(&xu)
             .into_shape_with_order((k, k))
             .expect("a length-k² vector reshapes to k×k");
-        let qg_v = gam_linalg::faer_ndarray::fast_atb(&q_g, &v_mat);
-        let qg_k_qg = gam_linalg::faer_ndarray::fast_atb(&q_g, &fast_ab(&k_mat, &q_g));
-        let mut quadratic = &qh_u * 2.0 + &(&qg_v * 2.0) + &(&qg_v.t() * 2.0) + &(&qg_k_qg * 2.0);
-        for &(i, j) in &h_pairs {
-            let form = q_v.dot(&k_ij[i][j].dot(&q_v));
-            quadratic[[i, j]] += form;
-            if i != j {
-                quadratic[[j, i]] += form;
+        let qg_v = fast_atb(&q_g, &v_mat);
+        let qg_k_qg = fast_atb(&q_g, &fast_ab(&k_mat, &q_g));
+        let quadratic = &qh_u * 2.0 + &(&qg_v * 2.0) + &(&qg_v.t() * 2.0) + &(&qg_k_qg * 2.0);
+        total.h += &(&quadratic * 0.125);
+
+        // Every term above that reads `K_ab` is linear in it: the diagonal jet
+        // `h_i = x_iᵀ(K, K_a, K_ab)x_i` reaches `-⅛ Σ d h²` and `⅛ qᵀKq` only
+        // through `x_iᵀK_ab x_i` (its jet part is left zero above), the
+        // quadratic reads `q_vᵀK_ab q_v`, and the row pairs read `⟨K_ab, W⟩`.
+        // So the whole `K_ab` part is `⟨K_ab, Π⟩` with
+        //
+        //   Π = Xᵀ diag(ω) X + ⅛ q_v q_vᵀ + ¼ sym(W),
+        //   ω = -¼ d ∘ h + ¼ c ∘ (X u).
+        //
+        // With `Ω = K Π K` and `J_a = M_a Ω`, cyclicity of the trace gives
+        //
+        //   ⟨K_ab, Π⟩ = tr(Ḣ₀,a J_b) + tr(Ḣ₀,b J_a) - tr(Ḧ₀,ab Ω),
+        //
+        // and `Ḧ₀,ab` traces against `Ω` through the row leverage above, so no
+        // p×p second derivative of `H₀` or `K` is ever formed. The refinement's
+        // curvature is `H₀`'s alone (#3507), so the Jeffreys part enters here
+        // only through `K`; `D²H_φ` reaches the criterion through the
+        // determinant part's `tr(M_φ Ḧ_φ,ij)` above and nowhere else.
+        let omega_weights = Array1::from_shape_fn(n, |row| {
+            0.25 * (c_array[row] * xu[row] - d_array[row] * hdiag_v[row])
+        });
+        let mut pi = Self::tk_xt_diag_x(x_dense, &omega_weights);
+        for a in 0..p {
+            for b in 0..p {
+                pi[[a, b]] += 0.125 * (q_v[a] * q_v[b] + pair_w[[a, b]] + pair_w[[b, a]]);
             }
         }
-        total.h += &(&quadratic * 0.125);
+        let mut omega = fast_ab(&fast_ab(&k_mat, &pi), &k_mat);
+        gam_linalg::matrix::symmetrize_in_place(&mut omega);
+        // `tr(Ḣ₀,a J_b)` is the Frobenius product of the symmetric `Ḣ₀,a` with
+        // `J_b`, so the `k×k` block is one Gram of the flattened blocks.
+        let flatten = |mats: Vec<Array2<f64>>| -> Array2<f64> {
+            let mut out = Array2::<f64>::zeros((p * p, k));
+            for (a, mat) in mats.into_iter().enumerate() {
+                out.column_mut(a).assign(
+                    &mat.as_standard_layout()
+                        .into_owned()
+                        .into_shape_with_order(p * p)
+                        .expect("a standard-layout p×p block flattens"),
+                );
+            }
+            out
+        };
+        let flat_h = flatten(h0_i.clone());
+        let flat_j = flatten(m_p.iter().map(|(m, _)| fast_ab(m, &omega)).collect());
+        let hj = fast_atb(&flat_h, &flat_j);
+        let h0_second_omega = h0_second_trace(&omega);
+        for a in 0..k {
+            for b in 0..k {
+                total.h[[a, b]] += hj[[a, b]] + hj[[b, a]] - h0_second_omega[[a, b]];
+            }
+        }
         let hessian = det_hessian - &total.h;
         if hessian.iter().any(|v| !v.is_finite()) {
             crate::bail_invalid_estim!(
@@ -8698,9 +8702,8 @@ mod firth_hessian_direction_reuse_tests {
     }
 
     // A wider logit design with k=4 penalties, exercising the Rayon-fanned
-    // first-derivative (h_i), eye-cache, and O(k²) second-derivative pair loops
-    // of `tk_hessian_rho_canonical_logit` (#1575). With 4 penalties the pair loop
-    // alone has 10 upper-triangle passes spread across the pool.
+    // first-derivative (h_i) loops and the per-direction Firth trace jet of
+    // `tk_hessian_rho_canonical_logit` (#1575).
     fn synthetic_logit_setup_k4() -> (
         Array2<f64>,
         Array1<f64>,
@@ -8847,16 +8850,18 @@ mod firth_hessian_direction_reuse_tests {
             }
         }
 
-        let tensor = RemlState::tk_rho_hessian_pair_tensor(&x, &xk0, &xka, &k_ij, &c_v, &c_g, &c_h)
+        // Each route returns the block less its `¼ ⟨K_ab, W⟩` term together with
+        // `W`, so the reference is matched only once `W` is traced against `K_ab`.
+        let tensor = RemlState::tk_rho_hessian_pair_tensor(&x, &xk0, &xka, &c_v, &c_g, &c_h)
             .expect("tensor pair block")
             .expect("the ledger admits a 4-column design tensor");
-        let blocks = RemlState::tk_rho_hessian_pair_blocks(&x, &xk0, &xka, &k_ij, &c_v, &c_g, &c_h)
+        let blocks = RemlState::tk_rho_hessian_pair_blocks(&x, &xk0, &xka, &c_v, &c_g, &c_h)
             .expect("row-block pair block");
-        for (route, block) in [("tensor", &tensor), ("row blocks", &blocks)] {
+        for (route, (block, w)) in [("tensor", &tensor), ("row blocks", &blocks)] {
             for a in 0..k {
                 for b in 0..k {
                     let left = reference[[a, b]];
-                    let right = block[[a, b]];
+                    let right = block[[a, b]] + 0.25 * (&k_ij[a][b] * w).sum();
                     assert!(left.abs() > 1e-6, "reference[{a},{b}] = {left:e} is too small to compare");
                     let rel = (left - right).abs() / left.abs();
                     assert!(
@@ -8927,7 +8932,229 @@ mod firth_hessian_direction_reuse_tests {
         }
     }
 
-    // The #1575 Rayon fan-out of the first-derivative / eye-cache / pair loops
+    /// The TK ρ-Hessian with every second derivative materialized: `Ḧ₀,ab`,
+    /// `Ḧ_φ,ab` and `K_ab = K Ḣ₀,b K Ḣ₀,a K + K Ḣ₀,a K Ḣ₀,b K − K Ḧ₀,ab K`, the
+    /// determinant part's two second-derivative traces taken against those
+    /// blocks, and the jet sums expanded by hand: `−⅛ Σ d h²`, the pair block
+    /// (its `K_ab` term traced directly) and `⅛ qᵀKq`. The production assembly
+    /// forms none of them, so this pins both of its identities: the trace
+    /// `⟨K_ab, Π⟩` and the row-leverage reading of `tr(M Ḧ)`.
+    fn tk_hessian_materialized_reference(
+        x: &Array2<f64>,
+        c: &Array1<f64>,
+        d: &Array1<f64>,
+        e: &Array1<f64>,
+        f: &Array1<f64>,
+        penalties: &[CanonicalPenalty],
+        lambdas: &[f64],
+        beta: &Array1<f64>,
+        firth_op: &super::super::FirthDenseOperator,
+        hphi: &Array2<f64>,
+        h_f: &TkSpdFactor,
+        h_0: &TkSpdFactor,
+    ) -> Array2<f64> {
+        let n = x.nrows();
+        let p = x.ncols();
+        let k = penalties.len();
+        let k_mat = h_0.inverse();
+        let g_f = h_f.inverse();
+        let a_mats: Vec<Array2<f64>> = (0..k)
+            .map(|a| RemlState::tk_penalty_dense(&penalties[a], lambdas[a], p))
+            .collect();
+        let mode_rhs: Vec<Array1<f64>> = (0..k)
+            .map(|a| RemlState::tk_penalty_mode_rhs(&penalties[a], lambdas[a], beta, p))
+            .collect();
+        let v: Vec<Array1<f64>> = mode_rhs.iter().map(|rhs| h_f.solve_vec(rhs)).collect();
+        let eta: Vec<Array1<f64>> = (0..k).map(|a| -x.dot(&v[a])).collect();
+        let dirs: Vec<super::super::FirthDirection> = eta
+            .iter()
+            .map(|deta| firth_op.direction_from_deta(deta.clone()))
+            .collect();
+        let eye = Array2::<f64>::eye(p);
+        let sym = |mut m: Array2<f64>| {
+            gam_linalg::matrix::symmetrize_in_place(&mut m);
+            m
+        };
+        let h0_a: Vec<Array2<f64>> = (0..k)
+            .map(|a| sym(&a_mats[a] + &RemlState::tk_xt_diag_x(x, &(c * &eta[a]))))
+            .collect();
+        let phi_a: Vec<Array2<f64>> = dirs
+            .iter()
+            .map(|dir| firth_op.hphi_direction(dir))
+            .collect();
+        let hf_a: Vec<Array2<f64>> = h0_a.iter().zip(&phi_a).map(|(h0, phi)| h0 - phi).collect();
+        let mut beta_ab = vec![vec![Array1::<f64>::zeros(p); k]; k];
+        let mut h0_ab = vec![vec![Array2::<f64>::zeros((p, p)); k]; k];
+        let mut phi_ab = vec![vec![Array2::<f64>::zeros((p, p)); k]; k];
+        let mut k_ab = vec![vec![Array2::<f64>::zeros((p, p)); k]; k];
+        for i in 0..k {
+            for j in 0..=i {
+                let mut rhs = hf_a[j].dot(&v[i]) + a_mats[i].dot(&v[j]);
+                if i == j {
+                    rhs -= &mode_rhs[i];
+                }
+                let bij = h_f.solve_vec(&rhs);
+                let eta_ij = x.dot(&bij);
+                let mut h0 =
+                    RemlState::tk_xt_diag_x(x, &(c * &eta_ij + &(d * &(&eta[i] * &eta[j]))));
+                if i == j {
+                    h0 += &a_mats[i];
+                }
+                let h0 = sym(h0);
+                let phi = sym(
+                    firth_op.hphi_direction(&firth_op.direction_from_deta(eta_ij))
+                        + firth_op.hphisecond_direction_apply(&dirs[i], &dirs[j], &eye),
+                );
+                let kh_i = k_mat.dot(&h0_a[i]).dot(&k_mat);
+                let kh_j = k_mat.dot(&h0_a[j]).dot(&k_mat);
+                let kij = sym(
+                    k_mat.dot(&h0_a[j]).dot(&kh_i) + k_mat.dot(&h0_a[i]).dot(&kh_j)
+                        - k_mat.dot(&h0).dot(&k_mat),
+                );
+                for (a, b) in [(i, j), (j, i)] {
+                    beta_ab[a][b] = bij.clone();
+                    h0_ab[a][b] = h0.clone();
+                    phi_ab[a][b] = phi.clone();
+                    k_ab[a][b] = kij.clone();
+                }
+            }
+        }
+        // Determinant part: `tr(M_H Ḧ₀,ab) + tr(M_φ Ḧ_φ,ab)` against the
+        // materialized blocks, plus the first-derivative products.
+        let sigma = k_mat.dot(hphi);
+        let m_h = 0.5 * (&k_mat - &g_f + &sigma.dot(&k_mat));
+        let m_phi = 0.5 * (&g_f - &k_mat);
+        let p_mats: Vec<Array2<f64>> = h0_a.iter().map(|h| k_mat.dot(h)).collect();
+        let q_mats: Vec<Array2<f64>> = hf_a.iter().map(|h| g_f.dot(h)).collect();
+        let r_mats: Vec<Array2<f64>> = phi_a.iter().map(|h| k_mat.dot(h)).collect();
+        let ps_mats: Vec<Array2<f64>> = p_mats.iter().map(|pm| pm.dot(&sigma)).collect();
+        let mut det_hessian = Array2::<f64>::zeros((k, k));
+        for a in 0..k {
+            for b in 0..k {
+                det_hessian[[a, b]] = tk_trace_product(&m_h, &h0_ab[a][b])
+                    + tk_trace_product(&m_phi, &phi_ab[a][b])
+                    + 0.5
+                        * (tk_trace_product(&q_mats[b], &q_mats[a])
+                            - tk_trace_product(&p_mats[b], &p_mats[a])
+                            - tk_trace_product(&ps_mats[b], &p_mats[a])
+                            - tk_trace_product(&ps_mats[a], &p_mats[b])
+                            + tk_trace_product(&r_mats[b], &p_mats[a])
+                            + tk_trace_product(&p_mats[b], &r_mats[a]));
+            }
+        }
+        let k_a: Vec<Array2<f64>> = h0_a
+            .iter()
+            .map(|h| sym(-k_mat.dot(h).dot(&k_mat)))
+            .collect();
+        let xi = |row: usize| x.row(row).to_owned();
+        // Per-row jets `(value, gradient, Hessian)` of η, h, c and d.
+        let mut total = Array2::<f64>::zeros((k, k));
+        let mut c_g = Array2::<f64>::zeros((n, k));
+        let mut c_h = ndarray::Array3::<f64>::zeros((n, k, k));
+        let mut ch_v = Array1::<f64>::zeros(n);
+        let mut ch_g = Array2::<f64>::zeros((n, k));
+        let mut ch_h = ndarray::Array3::<f64>::zeros((n, k, k));
+        for row in 0..n {
+            let x_row = xi(row);
+            let h_v = x_row.dot(&k_mat.dot(&x_row));
+            let h_g: Vec<f64> = (0..k).map(|a| x_row.dot(&k_a[a].dot(&x_row))).collect();
+            for a in 0..k {
+                c_g[[row, a]] = d[row] * eta[a][row];
+            }
+            let d_g: Vec<f64> = (0..k).map(|a| e[row] * eta[a][row]).collect();
+            ch_v[row] = c[row] * h_v;
+            for a in 0..k {
+                ch_g[[row, a]] = c_g[[row, a]] * h_v + c[row] * h_g[a];
+            }
+            for a in 0..k {
+                for b in 0..k {
+                    let eta_ab = x_row.dot(&beta_ab[a][b]);
+                    let h_h = x_row.dot(&k_ab[a][b].dot(&x_row));
+                    c_h[[row, a, b]] = d[row] * eta_ab + e[row] * eta[a][row] * eta[b][row];
+                    let d_h = e[row] * eta_ab + f[row] * eta[a][row] * eta[b][row];
+                    // `-⅛ d h²`.
+                    total[[a, b]] -= 0.125
+                        * (d_h * h_v * h_v
+                            + 2.0 * h_v * (d_g[a] * h_g[b] + d_g[b] * h_g[a])
+                            + 2.0 * d[row] * (h_g[a] * h_g[b] + h_v * h_h));
+                    ch_h[[row, a, b]] = c_h[[row, a, b]] * h_v
+                        + c_g[[row, a]] * h_g[b]
+                        + c_g[[row, b]] * h_g[a]
+                        + c[row] * h_h;
+                }
+            }
+        }
+        // `¹⁄₁₂ Σ_ij c_i c_j K_ij³`: the row-block route, pinned against the
+        // row-pair jet sum by its own test, with `¼ ⟨K_ab, W⟩` traced here.
+        let xk0 = x.dot(&k_mat);
+        let xka: Vec<Array2<f64>> = k_a.iter().map(|ka| x.dot(ka)).collect();
+        let (pairs, w) =
+            RemlState::tk_rho_hessian_pair_blocks(x, &xk0, &xka, c, &c_g, &c_h).expect("pairs");
+        total += &pairs;
+        // `⅛ qᵀKq` with `q = Xᵀ(c ∘ h)`.
+        let q_v = x.t().dot(&ch_v);
+        let q_g: Vec<Array1<f64>> = (0..k).map(|a| x.t().dot(&ch_g.column(a))).collect();
+        for a in 0..k {
+            for b in 0..k {
+                total[[a, b]] += 0.25 * (&k_ab[a][b] * &w).sum();
+                let q_h = x
+                    .t()
+                    .dot(&Array1::from_shape_fn(n, |row| ch_h[[row, a, b]]));
+                total[[a, b]] += 0.125
+                    * (2.0 * q_h.dot(&k_mat.dot(&q_v))
+                        + 2.0 * q_g[a].dot(&k_mat.dot(&q_g[b]))
+                        + 2.0 * q_g[a].dot(&k_a[b].dot(&q_v))
+                        + 2.0 * q_g[b].dot(&k_a[a].dot(&q_v))
+                        + q_v.dot(&k_ab[a][b].dot(&q_v)));
+            }
+        }
+        det_hessian - &total
+    }
+
+    // The trace-only ρ-Hessian, which never forms `Ḧ₀,ab`, `Ḧ_φ,ab` or `K_ab`,
+    // equals the materialized reference to round-off.
+    #[test]
+    fn tk_hessian_trace_identity_matches_materialized_second_derivatives() {
+        let (x, beta, op, penalties, lambdas) = synthetic_logit_setup_k4();
+        let n = x.nrows();
+        let p = x.ncols();
+        let c_array = Array1::from_shape_fn(n, |i| 0.05 + 0.02 * ((i as f64) * 0.37).sin());
+        let d_array = Array1::from_shape_fn(n, |i| -0.02 + 0.01 * ((i as f64) * 0.53).cos());
+        let e_array = Array1::from_shape_fn(n, |i| 0.01 + 0.004 * ((i as f64) * 0.71).sin());
+        let f_array = Array1::from_shape_fn(n, |i| -0.005 + 0.002 * ((i as f64) * 0.29).cos());
+        let mut h = RemlState::tk_xt_diag_x(&x, &op.pirls_hat_diag());
+        for d in 0..p {
+            h[[d, d]] += 1.0;
+        }
+        let (hphi, h_f, h_0) = firth_test_factors(&op, &h);
+        let got = RemlState::tk_hessian_rho_canonical_logit(
+            &x, &c_array, &d_array, &e_array, &f_array, &penalties, &lambdas, &beta, &op, &hphi,
+            &h_f, &h_0,
+        )
+        .expect("tk hessian");
+        let reference = tk_hessian_materialized_reference(
+            &x, &c_array, &d_array, &e_array, &f_array, &penalties, &lambdas, &beta, &op, &hphi,
+            &h_f, &h_0,
+        );
+        let scale = reference.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(
+            scale > 1e-8,
+            "reference Hessian is too small to compare: {reference:?}"
+        );
+        for a in 0..penalties.len() {
+            for b in 0..penalties.len() {
+                let diff = (got[[a, b]] - reference[[a, b]]).abs();
+                assert!(
+                    diff <= 1e-10 * scale,
+                    "H[{a},{b}]: trace {:.15e}, materialized {:.15e}",
+                    got[[a, b]],
+                    reference[[a, b]]
+                );
+            }
+        }
+    }
+
+    // The #1575 Rayon fan-out of the first-derivative and trace-jet loops
     // must not perturb the assembled Firth outer Hessian: repeated evaluation is
     // BIT-IDENTICAL (no race / mis-indexed write-back), and the result is
     // symmetric and finite. Determinism across repeats is the load-bearing guard
@@ -8937,7 +9164,7 @@ mod firth_hessian_direction_reuse_tests {
         let (x, beta, op, penalties, lambdas) = synthetic_logit_setup_k4();
         let k = penalties.len();
         // The fan-out this test guards is gated on `rayon::current_num_threads() > 1`
-        // (the `fan_units` and `fan_pairs` branches in this module). On a single-core runner or under
+        // (the `fan_units` branch in this module). On a single-core runner or under
         // `RAYON_NUM_THREADS=1` that gate is false and the assembly silently takes
         // the SERIAL path — so without pinning a multi-threaded pool the
         // determinism guard would be vacuous (it would "pass" while exercising none
@@ -8983,7 +9210,7 @@ mod firth_hessian_direction_reuse_tests {
             );
         }
         // Sanity: the off-diagonal mixed second derivatives are non-trivial, so the
-        // O(k²) pair loop is doing real work (not returning zeros).
+        // assembly is doing real work (not returning zeros).
         assert!(
             (0..k).any(|i| (0..k).any(|j| i != j && first[[i, j]].abs() > 0.0)),
             "k=4 Firth outer Hessian should have non-zero mixed second derivatives"

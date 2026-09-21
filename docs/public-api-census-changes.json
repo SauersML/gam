@@ -5211,5 +5211,14 @@
     },
     "reason": "#4165: dead code with no caller anywhere in the repo. Each name occurs on exactly one line at the base (its own declaration). encode_outer_warm_start's doc claimed warm_start_from used it; warm_start_from goes through FitArtifacts::outer_warm_start and OuterProblem::with_warm_start. set_jacobian_cache, linkchoice_supports_joint_wiggle and likelihood_spec_supports_joint_wiggle were pub(crate) helpers whose only non-test caller was a deleted fn; the two isometry tests call the pub refresh_caches instead.",
     "evidence": "https://github.com/SauersML/gam/issues/4165"
+  },
+  {
+    "base": "08628afb310729629275eb487e7714732662d59e",
+    "removed": {
+      "crates/gam-solve/src/reml/firth.rs::hphisecond_direction_apply_eye_cached": 1,
+      "crates/gam-solve/src/reml/firth.rs::tk_second_direction_eye_cache": 1
+    },
+    "reason": "fz0034 timeout (binomial n=500, PR #3441 follow-up): the Tierney-Kadane rho-Hessian no longer materializes any second derivative H_ab or K_ab. Every term that reads K_ab is linear in it, so the whole K_ab part is one trace <K_ab, Pi> = tr(H_a J_b) + tr(H_b J_a) - tr(H_ab Omega), and tr(H_ab Omega) reaches the Firth part through the O(k) trace jet hphi_direction_trace_jet. The per-pair D^2 H_phi[dir_a, dir_b](I) eye cache (FirthSecondDirEyeCache, tk_second_direction_eye_cache, hphisecond_direction_apply_eye_cached) therefore has no caller and is deleted with its bit-identity test. apply_hadamard_gram_to_matrix_by_row_blocks is generalized into the cost-dispatched apply_cross_hadamard_gram_to_matrix, which covers the same product.",
+    "evidence": "In the landing tree, grep -rn for each removed name under crates/ finds 0 matches. tk_hessian_trace_identity_matches_materialized_second_derivatives (gradient_hessian.rs) pins the trace-only rho-Hessian against a reference that materializes every H_ab (via hphi_direction plus hphisecond_direction_apply on the identity) and K_ab, with and without Firth, to 1e-10 relative. hphi_direction_trace_jet_matches_materialized_contractions and cross_hadamard_gram_routes_match_dense_hadamard_product (firth.rs) pin the new Firth trace jet and both cross Hadamard-Gram routes against dense products. tk_rho_hessian_pair_routes_match_the_row_pair_jet_sum pins the pair blocks with the <K_ab, W> term traced back in. The release lib tests filtered on tk_, firth and hadamard_gram pass."
   }
 ]

@@ -32,6 +32,16 @@ pub(crate) struct FirthSecondDirEyeCache {
     pu_qv: Vec<Array2<f64>>,
 }
 
+/// `Ω`-contractions shared by [`FirthDenseOperator::hphi_direction_trace_kernel`]
+/// and [`FirthDenseOperator::hphi_direction_trace_jet`]: the symmetrized `Ω`,
+/// `XΩ`, `Y = diag(w') Z` and the direction-independent kernel.
+struct FirthTraceContractions {
+    omega: Array2<f64>,
+    x_omega: Array2<f64>,
+    y: Array2<f64>,
+    kernel: FirthHphiTraceKernel,
+}
+
 impl<'a> RemlState<'a> {
     pub(crate) fn xt_diag_x_dense(x: &Array2<f64>, diag: &Array1<f64>) -> Array2<f64> {
         super::assembly::xt_diag_x_dense(x, diag)
@@ -360,83 +370,137 @@ impl<'a> RemlState<'a> {
         //   A_left = K_r, A_right = K_r        for Hw⊙Hw actions,
         //   A_left = K_r, A_right = A_u        for Hw⊙Nbar_u actions,
         // and symmetric variants in mixed second-direction terms.
-        //
-        // Two exact routes, taken by predicted work:
-        //   columns: one `apply_hadamard_gram` per column, c·(4nr² + 4r³);
-        //   rows:    form `M_I = (Z A_left)_I Zᵀ`, `N_I = (Z A_right)_I Zᵀ` one
-        //            row block `I` at a time and apply `(M_I⊙N_I) mat`,
-        //            4n²r (2n²r when A_left is A_right) + 2n²c + 4nr².
-        // The column route never forms an n×n block and wins once n ≳ r²; the
-        // row route wins for the wide, moderate-n designs where a p-column
-        // materialization would otherwise pay c reduced Grams.
-        let n = z.nrows();
-        let r = z.ncols();
+        Self::apply_cross_hadamard_gram_to_matrix(z, a_left, z, a_right, mat)
+    }
+
+    /// `((Z_l A_l Z_lᵀ) ⊙ (Z_r A_r Z_rᵀ)) mat` without an n×n product.
+    ///
+    /// Two exact routes, taken by predicted work with `r_l`, `r_r` the factor
+    /// widths and `c` the column count:
+    ///   columns: per column `y`, `S = Z_lᵀ diag(y) Z_r`, `T = A_l S A_r` and
+    ///            `out_i = z_{l,i}ᵀ T z_{r,i}`, c·(4n r_l r_r + 2 r_l r_r (r_l + r_r));
+    ///   rows:    form `(Z_l A_l)_I Z_lᵀ` and `(Z_r A_r)_I Z_rᵀ` one row block `I`
+    ///            at a time and apply their Hadamard product to `mat`,
+    ///            n²·(2r_l + 2r_r) (2n²r when both factors are the same) + 2n²c
+    ///            + 2n(r_l² + r_r²).
+    /// The column route never forms an n×n block and wins once n ≳ r²; the
+    /// row route wins for the wide, moderate-n designs where a p-column
+    /// materialization would otherwise pay c reduced Grams.
+    pub(crate) fn apply_cross_hadamard_gram_to_matrix(
+        z_left: &Array2<f64>,
+        a_left: &Array2<f64>,
+        z_right: &Array2<f64>,
+        a_right: &Array2<f64>,
+        mat: &Array2<f64>,
+    ) -> Array2<f64> {
+        let n = z_left.nrows();
+        let r_left = z_left.ncols();
+        let r_right = z_right.ncols();
         let c = mat.ncols();
         if n == 0 || c == 0 {
             return Array2::<f64>::zeros(mat.raw_dim());
         }
-        let same_factor = std::ptr::eq(a_left, a_right);
+        let same_design = std::ptr::eq(z_left, z_right);
+        let same_factor = same_design && std::ptr::eq(a_left, a_right);
+        let r_lr = r_left.saturating_mul(r_right);
         let columns_work = c.saturating_mul(
-            n.saturating_mul(r)
-                .saturating_mul(r)
-                .saturating_add(r.saturating_mul(r).saturating_mul(r))
-                .saturating_mul(4),
+            n.saturating_mul(r_lr)
+                .saturating_mul(4)
+                .saturating_add(r_lr.saturating_mul(r_left.saturating_add(r_right)).saturating_mul(2)),
         );
         let n_squared = n.saturating_mul(n);
-        let factor_blocks = if same_factor { 2 } else { 4 };
+        let factor_width = if same_factor {
+            r_left.saturating_mul(2)
+        } else {
+            r_left.saturating_add(r_right).saturating_mul(2)
+        };
         let rows_work = n_squared
-            .saturating_mul(r)
-            .saturating_mul(factor_blocks)
+            .saturating_mul(factor_width)
             .saturating_add(n_squared.saturating_mul(c).saturating_mul(2))
-            .saturating_add(n.saturating_mul(r).saturating_mul(r).saturating_mul(4));
+            .saturating_add(
+                n.saturating_mul(
+                    r_left
+                        .saturating_mul(r_left)
+                        .saturating_add(r_right.saturating_mul(r_right)),
+                )
+                .saturating_mul(2),
+            );
         if rows_work < columns_work {
-            return Self::apply_hadamard_gram_to_matrix_by_row_blocks(
-                z,
+            return Self::apply_cross_hadamard_gram_to_matrix_by_row_blocks(
+                z_left,
                 a_left,
+                z_right,
                 a_right,
+                same_design,
                 same_factor,
                 mat,
             );
         }
+        Self::apply_cross_hadamard_gram_to_matrix_by_columns(z_left, a_left, z_right, a_right, mat)
+    }
+
+    /// Column route of [`Self::apply_cross_hadamard_gram_to_matrix`]: for each
+    /// column `y`, `out_i = z_{l,i}ᵀ A_l (Z_lᵀ diag(y) Z_r) A_r z_{r,i}`. With
+    /// `Z_l = Z_r` this is [`Self::apply_hadamard_gram`] column by column.
+    fn apply_cross_hadamard_gram_to_matrix_by_columns(
+        z_left: &Array2<f64>,
+        a_left: &Array2<f64>,
+        z_right: &Array2<f64>,
+        a_right: &Array2<f64>,
+        mat: &Array2<f64>,
+    ) -> Array2<f64> {
         let mut out = Array2::<f64>::zeros(mat.raw_dim());
         for col in 0..mat.ncols() {
-            let v = mat.column(col).to_owned();
-            let y = Self::apply_hadamard_gram(z, a_left, a_right, &v);
-            out.column_mut(col).assign(&y);
+            let y = mat.column(col).to_owned();
+            let s = fast_atb(z_left, &Self::row_scale(z_right, &y));
+            let t = a_left.dot(&s).dot(a_right);
+            let zt = fast_ab(z_left, &t);
+            out.column_mut(col)
+                .assign(&(z_right * &zt).sum_axis(ndarray::Axis(1)));
         }
         out
     }
 
-    /// Row-block route of [`Self::apply_hadamard_gram_to_matrix`]: row `i` of
-    /// the result is `Σ_j M_ij N_ij mat_j` with `M = Z A_left Zᵀ` and
-    /// `N = Z A_right Zᵀ`, formed one row block at a time. Each block's rows
+    /// Row-block route of [`Self::apply_cross_hadamard_gram_to_matrix`]: row `i`
+    /// of the result is `Σ_j M_ij N_ij mat_j` with `M = Z_l A_l Z_lᵀ` and
+    /// `N = Z_r A_r Z_rᵀ`, formed one row block at a time. Each block's rows
     /// are independent of every other block, so the deterministic fold only
     /// concatenates them in row order.
-    fn apply_hadamard_gram_to_matrix_by_row_blocks(
-        z: &Array2<f64>,
+    fn apply_cross_hadamard_gram_to_matrix_by_row_blocks(
+        z_left: &Array2<f64>,
         a_left: &Array2<f64>,
+        z_right: &Array2<f64>,
         a_right: &Array2<f64>,
+        same_design: bool,
         same_factor: bool,
         mat: &Array2<f64>,
     ) -> Array2<f64> {
-        let n = z.nrows();
+        let n = z_left.nrows();
         let c = mat.ncols();
-        let z_left = fast_ab(z, a_left);
-        let z_right = if same_factor {
+        let z_left_a = fast_ab(z_left, a_left);
+        let z_right_a = if same_factor {
             None
         } else {
-            Some(fast_ab(z, a_right))
+            Some(fast_ab(z_right, a_right))
         };
-        let z_t = z.t().to_owned();
+        let z_left_t = z_left.t().to_owned();
+        let z_right_t = if same_design {
+            None
+        } else {
+            Some(z_right.t().to_owned())
+        };
         let blocks = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
             n,
             |range: core::ops::Range<usize>| {
                 gam_problem::with_nested_parallel(|| {
                     let rows = s![range.start..range.end, ..];
-                    let mut hadamard = fast_ab(&z_left.slice(rows).to_owned(), &z_t);
-                    match z_right.as_ref() {
-                        Some(z_right) => {
-                            let right = fast_ab(&z_right.slice(rows).to_owned(), &z_t);
+                    let mut hadamard = fast_ab(&z_left_a.slice(rows).to_owned(), &z_left_t);
+                    match z_right_a.as_ref() {
+                        Some(z_right_a) => {
+                            let right = fast_ab(
+                                &z_right_a.slice(rows).to_owned(),
+                                z_right_t.as_ref().unwrap_or(&z_left_t),
+                            );
                             hadamard *= &right;
                         }
                         None => hadamard.mapv_inplace(|m| m * m),
@@ -1004,25 +1068,32 @@ impl FirthDenseOperator {
     }
 
     /// Direction-independent contractions for `tr(D H_φ[u] Π)` against one
-    /// fixed symmetric `Π` (p×p).
+    /// fixed `Π` (p×p), symmetrized first since `D H_φ[u]` is symmetric.
     ///
     /// With `L = X Π Xᵀ`, `M = Z K_r Zᵀ`, `P = M⊙M` and the terms of
     /// `hphi_direction_apply` at `V = I` (equivalently [`Self::hphi_direction`]):
     ///   tr(Xᵀ diag(c_u) X Π)            = c_uᵀ ℓ,             ℓ = diag(L),
     ///   tr(B_uᵀ P B Π) = tr(Bᵀ P B_u Π) = b_uᵀ v,             v = (P⊙L) w',
-    ///   tr(Bᵀ P_u B Π)                  = -2 ⟨A_u, R⟩,         R = Zᵀ diag(w')(M⊙L) diag(w') Z,
-    /// using `N_u = Z A_u Zᵀ`, `P_u = -2 (M⊙N_u)` and `Σ_ij G_ij N_ij = ⟨A_u, ZᵀGZ⟩`.
-    /// `ℓ`, `v` and `R` are shared by every direction, so each trace costs one
+    ///   tr(Bᵀ P_u B Π)                  = -2 ⟨A_u, R⟩,         R = Yᵀ (M⊙L) Y,
+    /// using `N_u = Z A_u Zᵀ`, `P_u = -2 (M⊙N_u)`, `Y = diag(w') Z` and
+    /// `Σ_ij G_ij N_ij = ⟨A_u, ZᵀGZ⟩`. Row `i` of the cached `P B` is
+    /// `Σ_j P_ij w'_j x_j`, so `v = rowdot(XΠ, P B)`; `R` is one cross
+    /// Hadamard-Gram apply of `M⊙L` to the `r` columns of `Y`. `ℓ`, `v` and `R`
+    /// are shared by every direction, so each trace costs one
     /// `direction_from_deta` instead of materializing `D H_φ[u]` through `p`
-    /// Hadamard-Gram columns. The shared pass forms `M` and `L` one row block at
-    /// a time: `O(n²·(r + p))` time and `O(n)` memory per block.
+    /// Hadamard-Gram columns.
     pub(crate) fn hphi_direction_trace_kernel(
         &self,
         pi: &Array2<f64>,
     ) -> Result<FirthHphiTraceKernel, EstimationError> {
-        let n = self.x_dense.nrows();
+        self.trace_contractions(pi).map(|base| base.kernel)
+    }
+
+    fn trace_contractions(
+        &self,
+        pi: &Array2<f64>,
+    ) -> Result<FirthTraceContractions, EstimationError> {
         let p = self.x_dense.ncols();
-        let r = self.x_reduced.ncols();
         if pi.nrows() != p || pi.ncols() != p {
             crate::bail_invalid_estim!(
                 "Firth Hessian-derivative trace kernel shape mismatch: expected {p}x{p}, got {}x{}",
@@ -1030,53 +1101,163 @@ impl FirthDenseOperator {
                 pi.ncols()
             );
         }
-        let x_pi = fast_ab(&self.x_dense, pi);
-        let leverage = (&x_pi * &self.x_dense).sum_axis(Axis(1));
-        let z_k = fast_ab(&self.x_reduced, &self.k_reduced);
-        let z_t = self.x_reduced.t().to_owned();
-        let w1 = &self.w1;
-        // Row block `I`: M_I = (Z K_r)_I Zᵀ and L_I = (X Π)_I Xᵀ. The block
-        // returns v_I and its contribution Z_Iᵀ G_I Z to R; the deterministic
-        // tree concatenates the v segments in row order and sums R.
-        let folded = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
-            n,
-            |range: core::ops::Range<usize>| {
-                gam_problem::with_nested_parallel(|| {
-                    let rows = s![range.start..range.end, ..];
-                    let m_block = fast_ab(&z_k.slice(rows).to_owned(), &z_t);
-                    let l_block = fast_ab(&x_pi.slice(rows).to_owned(), &self.x_dense_t);
-                    let mut v_block = Vec::with_capacity(range.len());
-                    let mut g_block = Array2::<f64>::zeros(m_block.raw_dim());
-                    for (local, i) in range.clone().enumerate() {
-                        let m_row = m_block.row(local);
-                        let l_row = l_block.row(local);
-                        let mut v_i = 0.0;
-                        for j in 0..n {
-                            let ml = m_row[j] * l_row[j];
-                            v_i += m_row[j] * ml * w1[j];
-                            g_block[[local, j]] = w1[i] * ml * w1[j];
-                        }
-                        v_block.push(v_i);
-                    }
-                    let g_z = fast_ab(&g_block, &self.x_reduced);
-                    let r_block = fast_atb(&self.x_reduced.slice(rows).to_owned(), &g_z);
-                    (v_block, r_block)
-                })
-            },
-            |(mut v_left, r_left), (v_right, r_right)| {
-                v_left.extend(v_right);
-                (v_left, r_left + r_right)
-            },
+        let mut omega = pi.clone();
+        symmetrize_in_place(&mut omega);
+        let x_omega = fast_ab(&self.x_dense, &omega);
+        let leverage = (&x_omega * &self.x_dense).sum_axis(Axis(1));
+        let hadamard_w1 = (&x_omega * &self.p_b_base).sum_axis(Axis(1));
+        let y = RemlState::row_scale(&self.x_reduced, &self.w1);
+        let m_l_y = RemlState::apply_cross_hadamard_gram_to_matrix(
+            &self.x_reduced,
+            &self.k_reduced,
+            &self.x_dense,
+            &omega,
+            &y,
         );
-        let (hadamard_w1, reduced) = match folded {
-            Some((v, reduced)) => (Array1::from_vec(v), reduced),
-            None => (Array1::<f64>::zeros(0), Array2::<f64>::zeros((r, r))),
-        };
-        Ok(FirthHphiTraceKernel {
+        let mut reduced = fast_atb(&y, &m_l_y);
+        symmetrize_in_place(&mut reduced);
+        Ok(FirthTraceContractions {
+            omega,
+            x_omega,
+            y,
+            kernel: FirthHphiTraceKernel {
+                leverage,
+                hadamard_w1,
+                reduced,
+            },
+        })
+    }
+
+    /// First and second directional traces of `H_φ` against one fixed `Ω`:
+    /// the row vector `g` with `tr(D H_φ[dir(δη)] Ω) = g·δη` for every `δη`, and
+    /// the `k×k` matrix `S[u,v] = tr(D² H_φ[dirs[u], dirs[v]] Ω)`. Both equal the
+    /// contractions of [`Self::hphi_direction`] and
+    /// [`Self::hphisecond_direction_apply`] at `rhs = I`, without forming any
+    /// p×p directional derivative.
+    ///
+    /// With the contractions `ℓ`, `v`, `R` of [`Self::hphi_direction_trace_kernel`],
+    /// `C = Zᵀ diag(w''⊙ℓ) Z - 2R` and `κ = diag(Z K C K Zᵀ)`, the three first
+    /// order terms are linear in `δη` through `A_u = K G_u K`,
+    /// `G_u = Zᵀ diag(w'⊙δη) Z`, giving
+    ///   g = ½ (w'''⊙h⊙ℓ - 2 w''⊙v - w'⊙κ).
+    /// The second order trace is the mixed diagonal coefficient `c_uv` against
+    /// `ℓ` plus the nine-term `D²J₂[u,v]` expansion, each a bilinear form in the
+    /// directions: with `s_u = w'⊙δη_u`, `b_u = w''⊙δη_u`, `Q = P⊙L`,
+    /// `y_u = (M⊙N_u⊙L) w'`, `T_u = Yᵀ (L⊙N_u) Y` and `e_u = diag(Z A_u C K Zᵀ)`,
+    ///   2 S[u,v] = Σ (w''''⊙h⊙ℓ - 2w'''⊙v - w''⊙κ) δη_u δη_v
+    ///            + (w'''⊙ℓ⊙δη_u)·Dh[v] + (w'''⊙ℓ⊙δη_v)·Dh[u]
+    ///            + s_u·e_v + s_v·e_u - 2 b_uᵀ Q b_v
+    ///            + 4 (b_u·y_v + b_v·y_u) - 2 ⟨A_u, T_v⟩,
+    /// where `⟨A_uv, C⟩ = Σ w'' δη_u δη_v κ - s_v·e_u - s_u·e_v` has absorbed the
+    /// `A_uv` terms of `D²h` and `P_uv`. Each direction costs three
+    /// route-chosen Hadamard-Gram applies, so the whole `k×k` block is `O(k)`
+    /// applies against the `O(k²)` p-column applies of materializing every pair.
+    pub(crate) fn hphi_direction_trace_jet(
+        &self,
+        omega: &Array2<f64>,
+        dirs: &[FirthDirection],
+    ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
+        let FirthTraceContractions {
+            omega,
+            x_omega,
+            y,
+            kernel,
+        } = self.trace_contractions(omega)?;
+        let FirthHphiTraceKernel {
             leverage,
             hadamard_w1,
             reduced,
-        })
+        } = kernel;
+        let n = self.x_dense.nrows();
+        let k = dirs.len();
+        let z = &self.x_reduced;
+        let k_r = &self.k_reduced;
+        let c_mat =
+            RemlState::reducedweighted_gram(z, &(&self.w2 * &leverage)) - &(&reduced * 2.0);
+        let c_k = fast_ab(&c_mat, k_r);
+        let kappa = RemlState::reduced_diag_gram(z, &fast_ab(k_r, &c_k));
+        let h_l = &self.h_diag * &leverage;
+        let gradient = 0.5
+            * (&(&self.w3 * &h_l) - &(&(&self.w2 * &hadamard_w1) * 2.0) - &(&self.w1 * &kappa));
+
+        // Per-direction contractions `Q b_u`, `y_u`, `T_u` and `e_u`.
+        struct DirectionTraces {
+            q_b: Array1<f64>,
+            y: Array1<f64>,
+            t: Array2<f64>,
+            e: Array1<f64>,
+        }
+        let per_direction = |d: &FirthDirection| -> DirectionTraces {
+            let p_bu = RemlState::apply_hadamard_gram_to_matrix(
+                z,
+                k_r,
+                k_r,
+                &RemlState::row_scale(&self.x_dense, &d.b_uvec),
+            );
+            let pu_b =
+                RemlState::apply_hadamard_gram_to_matrix(z, k_r, &d.a_u_reduced, &self.b_base);
+            let l_nu_y = RemlState::apply_cross_hadamard_gram_to_matrix(
+                z,
+                &d.a_u_reduced,
+                &self.x_dense,
+                &omega,
+                &y,
+            );
+            DirectionTraces {
+                q_b: (&x_omega * &p_bu).sum_axis(Axis(1)),
+                y: (&x_omega * &pu_b).sum_axis(Axis(1)),
+                t: fast_atb(&y, &l_nu_y),
+                e: RemlState::reduced_diag_gram(z, &fast_ab(&d.a_u_reduced, &c_k)),
+            }
+        };
+        let traces: Vec<DirectionTraces> = if k > 1 && rayon::current_num_threads() > 1 {
+            use rayon::prelude::*;
+            dirs.par_iter()
+                .map(|d| gam_problem::with_nested_parallel(|| per_direction(d)))
+                .collect()
+        } else {
+            dirs.iter().map(per_direction).collect()
+        };
+
+        let columns = |column: &dyn Fn(usize) -> Array1<f64>| -> Array2<f64> {
+            let mut out = Array2::<f64>::zeros((n, k));
+            for u in 0..k {
+                out.column_mut(u).assign(&column(u));
+            }
+            out
+        };
+        let deta = columns(&|u| dirs[u].deta.clone());
+        let dh = columns(&|u| dirs[u].dh.clone());
+        let b = columns(&|u| dirs[u].b_uvec.clone());
+        let s_w1 = columns(&|u| &self.w1 * &dirs[u].deta);
+        let q_b = columns(&|u| traces[u].q_b.clone());
+        let y_b = columns(&|u| traces[u].y.clone());
+        let e_b = columns(&|u| traces[u].e.clone());
+        let scaled = |weights: &Array1<f64>, mat: &Array2<f64>| -> Array2<f64> {
+            mat * &weights.view().insert_axis(Axis(1))
+        };
+        let diag_weight = &(&self.w4 * &h_l)
+            - &(&(&self.w3 * &hadamard_w1) * 2.0)
+            - &(&self.w2 * &kappa);
+        let delta_dh = fast_atb(&scaled(&(&self.w3 * &leverage), &deta), &dh);
+        let s_e = fast_atb(&s_w1, &e_b);
+        let b_y = fast_atb(&b, &y_b);
+        let mut second = fast_atb(&deta, &scaled(&diag_weight, &deta));
+        second += &delta_dh;
+        second += &delta_dh.t();
+        second += &s_e;
+        second += &s_e.t();
+        second -= &(&fast_atb(&b, &q_b) * 2.0);
+        second += &(&b_y * 4.0);
+        second += &(&b_y.t() * 4.0);
+        for u in 0..k {
+            for v in 0..k {
+                second[[u, v]] -= 2.0 * (&dirs[u].a_u_reduced * &traces[v].t).sum();
+            }
+        }
+        second.mapv_inplace(|value| 0.5 * value);
+        symmetrize_in_place(&mut second);
+        Ok((gradient, second))
     }
 
     /// `tr(D H_φ[u] Π)` for the `Π` of `kernel`; equal to contracting
@@ -3375,6 +3556,69 @@ mod tests {
         }
     }
 
+    /// The trace jet of `H_φ` against a fixed `Ω` equals contracting the
+    /// materialized first and mixed second directional derivatives: the
+    /// gradient `g` reproduces `tr(D H_φ[dir(δη)] Ω)` for directions outside
+    /// the span of `dirs`, and `S[u,v]` reproduces
+    /// `tr(D² H_φ[dirs[u], dirs[v]] Ω)` for every pair.
+    #[test]
+    fn hphi_direction_trace_jet_matches_materialized_contractions() {
+        // More rows than one deterministic-fold leaf, a duplicated column so
+        // the reduced rank r is below p, and non-unit observation weights.
+        let n = 300;
+        let x = Array2::from_shape_fn((n, 5), |(i, j)| {
+            let t = i as f64 / n as f64;
+            match j {
+                0 => 1.0,
+                1 => 2.0 * t - 1.0,
+                2 => (7.0 * t).sin(),
+                3 => (3.0 * t + 0.4).cos() * (1.0 + t),
+                _ => 2.0 * t - 1.0,
+            }
+        });
+        let beta = array![0.1, -0.7, 0.4, 0.3, -0.2];
+        let eta = x.dot(&beta);
+        let weights = Array1::from_shape_fn(n, |i| 0.5 + ((i * 7) % 11) as f64 / 10.0);
+        let op = build_weighted_logit_firth_dense_operator(&x, &eta, weights.view())
+            .expect("firth operator");
+        assert!(op.x_reduced.ncols() < x.ncols());
+        let p = x.ncols();
+        // A non-symmetric Ω: only its symmetric part can enter the traces.
+        let omega = Array2::from_shape_fn((p, p), |(a, b)| {
+            ((a * 5 + b * 3) as f64 * 0.37).sin() + if a == b { 1.5 } else { 0.0 }
+        });
+        let dirs: Vec<FirthDirection> = [
+            array![0.25, -0.4, 0.35, 0.1, -0.05],
+            array![-1.0, 0.2, 0.0, 0.6, 0.3],
+            array![0.3, 0.5, -0.8, 0.0, 0.4],
+        ]
+        .iter()
+        .map(|u| op.direction_from_deta(x.dot(u)))
+        .collect();
+        let (gradient, second) = op.hphi_direction_trace_jet(&omega, &dirs).expect("trace jet");
+        let omega_scale = omega.iter().map(|v| v.abs()).fold(0.0, f64::max);
+        let check = |label: &str, got: f64, materialized: &Array2<f64>| {
+            let expected = (materialized * &omega.t()).sum();
+            let scale = materialized.iter().map(|v| v.abs()).sum::<f64>() * omega_scale;
+            assert!(
+                (got - expected).abs() <= 1e-11 * scale,
+                "{label}: jet {got:.15e} vs materialized {expected:.15e}"
+            );
+        };
+        for u in [array![0.7, 0.1, -0.2, 0.9, -0.6], array![-0.2, 0.3, 0.5, -0.4, 0.8]] {
+            let deta = x.dot(&u);
+            let dir = op.direction_from_deta(deta.clone());
+            check("gradient", gradient.dot(&deta), &op.hphi_direction(&dir));
+        }
+        let eye = Array2::<f64>::eye(p);
+        for a in 0..dirs.len() {
+            for b in 0..dirs.len() {
+                let materialized = op.hphisecond_direction_apply(&dirs[a], &dirs[b], &eye);
+                check(&format!("second[{a},{b}]"), second[[a, b]], &materialized);
+            }
+        }
+    }
+
     /// Relative Frobenius closeness `‖a−b‖ ≤ tol·max(‖b‖, f64::MIN_POSITIVE)`.
     fn assert_close_rel(a: &Array2<f64>, b: &Array2<f64>, tol: f64, what: &str) {
         assert_eq!(a.dim(), b.dim(), "{what}: shape mismatch");
@@ -3996,10 +4240,12 @@ mod tests {
             let hadamard = &m * &nn;
             let dense = hadamard.dot(&mat);
             let scale = hadamard.mapv(f64::abs).dot(&mat.mapv(f64::abs));
-            let rows = RemlState::apply_hadamard_gram_to_matrix_by_row_blocks(
+            let rows = RemlState::apply_cross_hadamard_gram_to_matrix_by_row_blocks(
                 &z,
                 left,
+                &z,
                 right,
+                true,
                 std::ptr::eq(left, right),
                 &mat,
             );
@@ -4008,6 +4254,10 @@ mod tests {
                 let y = RemlState::apply_hadamard_gram(&z, left, right, &mat.column(col).to_owned());
                 columns.column_mut(col).assign(&y);
             }
+            let cross_columns = RemlState::apply_cross_hadamard_gram_to_matrix_by_columns(
+                &z, left, &z, right, &mat,
+            );
+            assert_eq!(cross_columns, columns, "one shared design reproduces the square route");
             let dispatched = RemlState::apply_hadamard_gram_to_matrix(&z, left, right, &mat);
             for (name, got) in [("rows", &rows), ("columns", &columns), ("dispatched", &dispatched)] {
                 for ((idx, g), d) in got.indexed_iter().zip(dense.iter()) {
@@ -4018,6 +4268,52 @@ mod tests {
                 }
             }
             assert_eq!(dispatched, rows, "dispatcher takes the row-block route here");
+        }
+    }
+
+    #[test]
+    pub(crate) fn cross_hadamard_gram_routes_match_dense_hadamard_product() {
+        // Two designs of different widths; n spans two deterministic-fold
+        // leaves, and the column count takes the dispatcher to each route.
+        let (n, r_left, r_right) = (150, 12, 20);
+        let z_left = Array2::from_shape_fn((n, r_left), |(i, j)| {
+            ((i * 13 + j * 7) as f64 * 0.11).sin() + 0.1 * (j as f64 + 1.0).ln()
+        });
+        let z_right = Array2::from_shape_fn((n, r_right), |(i, j)| {
+            ((i * 5 + j * 11) as f64 * 0.07).cos() - 0.05 * j as f64
+        });
+        let spd = |r: usize, shift: f64| {
+            let g = Array2::from_shape_fn((r, r), |(a, b)| ((a * 3 + b * 5) as f64 * shift).cos());
+            let mut a = g.t().dot(&g) / r as f64 + Array2::<f64>::eye(r);
+            symmetrize_in_place(&mut a);
+            a
+        };
+        let a_left = spd(r_left, 0.21);
+        let a_right = spd(r_right, 0.47);
+        let hadamard = &z_left.dot(&a_left).dot(&z_left.t()) * &z_right.dot(&a_right).dot(&z_right.t());
+        for c in [1, 40] {
+            let mat = Array2::from_shape_fn((n, c), |(i, j)| ((i + 2 * j) as f64 * 0.05).cos());
+            let dense = hadamard.dot(&mat);
+            let scale = hadamard.mapv(f64::abs).dot(&mat.mapv(f64::abs));
+            let rows = RemlState::apply_cross_hadamard_gram_to_matrix_by_row_blocks(
+                &z_left, &a_left, &z_right, &a_right, false, false, &mat,
+            );
+            let columns = RemlState::apply_cross_hadamard_gram_to_matrix_by_columns(
+                &z_left, &a_left, &z_right, &a_right, &mat,
+            );
+            let dispatched = RemlState::apply_cross_hadamard_gram_to_matrix(
+                &z_left, &a_left, &z_right, &a_right, &mat,
+            );
+            for (name, got) in [("rows", &rows), ("columns", &columns), ("dispatched", &dispatched)] {
+                for ((idx, g), d) in got.indexed_iter().zip(dense.iter()) {
+                    assert!(
+                        (g - d).abs() <= 1e-12 * scale[idx],
+                        "{name} route at {idx:?} (c={c}): {g:.15e} vs dense {d:.15e}"
+                    );
+                }
+            }
+            let expected = if c == 1 { &columns } else { &rows };
+            assert_eq!(&dispatched, expected, "dispatcher route at c={c}");
         }
     }
 
