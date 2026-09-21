@@ -92,7 +92,12 @@ impl SaeFitLane {
 ///   coordinate block (S2). Both log-determinants factor the Gauss–Newton majorizer
 ///   rather than the exact observed information. There is no rank charge and no
 ///   collapse-prevention energy. Smoothing is shared per `(basis kind, latent
-///   dimension)` family, and the ARD precisions are fixed.
+///   dimension)` family. The Euclidean ARD log precisions are outer coordinates on the
+///   dense lane's layout, one per atom axis at every `K`, and the criterion is minimized
+///   over them as the dense one is (#2933 F27 S5); a PERIODIC axis alone is held at the
+///   caller's value, because its Laplace criterion has no minimizer where the axis
+///   carries no profiled data curvature — a refusal to invent a precision, not an
+///   approximation (`crate::manifold::SaeSupportArdLayout`).
 ///
 /// The two kinds differ in curvature operator, rank pricing, prevention energy and
 /// hyperparameter layout. Neither value approximates the other, and their
