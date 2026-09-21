@@ -52,7 +52,9 @@ use crate::scale_design::{
 
 use crate::sigma_link::exp_sigma_inverse_from_eta_scalar;
 
-use crate::survival::predict::{LocationScaleEtaComponents, location_scale_eta_components};
+use crate::survival::predict::{
+    LocationScaleEtaComponents, PosteriorMoment, location_scale_eta_components,
+};
 
 use crate::survival::time_constraints::{
     GuardConstraintFailure, GuardPolicy, build_time_derivative_guard_constraints,

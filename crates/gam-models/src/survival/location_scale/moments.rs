@@ -156,16 +156,22 @@ pub(crate) fn apply_low_rank_gaussian_factor3(
     x
 }
 
-pub(crate) fn low_rank_normal_expectation_pair_3d_result<F>(
+/// `E[f(x)]` under `N(mu, covariance)` on `(h, threshold, log σ)`, integrated
+/// over the directions the covariance carries variance in. `R` is whatever the
+/// integrand reports; the response moments report a [`PosteriorMoment`], so the
+/// Gauss–Hermite nodes are merged into a centred variance rather than into raw
+/// `E[f]` and `E[f²]` sums (gam#4086).
+pub(crate) fn low_rank_normal_expectation_3d_result<F, R>(
     quadctx: &crate::quadrature::QuadratureContext,
     mu: [f64; 3],
     covariance: [[f64; 3]; 3],
     max_n: usize,
     label: &str,
     integrand: F,
-) -> Result<(f64, f64), String>
+) -> Result<R, String>
 where
-    F: Fn([f64; 3], &[f64]) -> Result<(f64, f64), String>,
+    F: Fn([f64; 3], &[f64]) -> Result<R, String>,
+    R: gam_solve::quadrature::GhqValue,
 {
     let factorization = factorize_psd_covariance(&covariance3_to_array2(covariance), label)?;
     match factorization.factor.ncols() {
@@ -263,6 +269,16 @@ where
 // Exact response moments must stay in the original Gaussian coordinates:
 // [h, threshold, log_sigma] for non-wiggle predictions, with a nested
 // conditional Gaussian over the scalar link-wiggle contribution when present.
+//
+// The row's moments are returned as a centred [`PosteriorMoment`] of `S`
+// (gam#4086). Every Gauss–Hermite node is merged by the pairwise update, so
+// the variance is a sum of non-negative terms, and the nested rule's inner
+// moments merge into the outer ones as the law of total variance
+// `Var S = E[Var(S | y)] + Var(E[S | y])` with no subtraction. The raw pair
+// `(E[S], E[S²])` this used to return resolves `Var S = E[S²] − E[S]²` only to
+// the rounding of `E[S²] ≈ E[S]²`, of order `ε·E[S]²` times the node count, so
+// a row whose survival is nearly certain reported that rounding, or the zero
+// its `max(0)` made of it, as its response standard error.
 pub(crate) fn exact_survival_response_moments_row(
     input: &SurvivalLocationScalePredictInput,
     fit: &UnifiedFitResult,
@@ -271,7 +287,7 @@ pub(crate) fn exact_survival_response_moments_row(
     x_log_sigma_dense: &Array2<f64>,
     row: usize,
     quadctx: &crate::quadrature::QuadratureContext,
-) -> Result<(f64, f64), String> {
+) -> Result<PosteriorMoment, String> {
     if input.time_wiggle_ncols > 0 {
         return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "predict_survival_location_scale: exact response moments are not implemented for time-wiggle models"
                 .to_string(), }.into());
@@ -363,7 +379,7 @@ pub(crate) fn exact_survival_response_moments_row(
         let cov_cond =
             symmetrize_and_clip_covariance(&(cov_ww - regression.dot(&regression.t().to_owned())));
 
-        return low_rank_normal_expectation_pair_3d_result(
+        return low_rank_normal_expectation_3d_result(
             quadctx,
             mu,
             cov_htl,
@@ -451,33 +467,37 @@ pub(crate) fn exact_survival_response_moments_row(
                     [[w_var]],
                     21,
                     |eta| {
-                        let p =
-                            inverse_link_survival_prob_checked(&input.inverse_link, eta[0])?;
-                        Ok((p, p * p))
+                        Ok(PosteriorMoment::point(inverse_link_survival_prob_checked(
+                            &input.inverse_link,
+                            eta[0],
+                        )?))
                     },
                 )
             },
-        )
-        .map(|(first, second)| (first.clamp(0.0, 1.0), second.clamp(0.0, 1.0)));
+        );
     }
 
-    low_rank_normal_expectation_pair_3d_result(
+    low_rank_normal_expectation_3d_result(
         quadctx,
         mu,
         cov_htl,
         15,
         "survival response-moment projected covariance",
         |x, _| {
-            let p = inverse_link_survival_prob_checked(
+            Ok(PosteriorMoment::point(inverse_link_survival_prob_checked(
                 &input.inverse_link,
                 x[0] * exp_sigma_inverse_from_eta_scalar(x[2]) + survival_q0_from_eta(x[1], x[2]),
-            )?;
-            Ok((p, p * p))
+            )?))
         },
     )
-    .map(|(first, second)| (first.clamp(0.0, 1.0), second.clamp(0.0, 1.0)))
 }
 
+/// Every row's posterior response mean `E[S]` and centred variance `Var S`.
+///
+/// The variance is returned as its own centred quantity, never as a raw second
+/// moment `E[S²]` for the caller to subtract `E[S]²` from (gam#4086): both
+/// producers below accumulate it from deviations about a running mean, so it is
+/// non-negative by construction and resolved relative to itself.
 pub(crate) fn exact_survival_response_moments(
     input: &SurvivalLocationScalePredictInput,
     fit: &UnifiedFitResult,
@@ -537,18 +557,18 @@ pub(crate) fn exact_survival_response_moments(
     // law this covariance belongs to retains no constraint row, and then the
     // Gaussian rule below is not an approximation of the posterior but IS the
     // posterior.
-    if let Some((first, second)) = truncated_survival_response_moments(
+    if let Some((mean, variance)) = truncated_survival_response_moments(
         input,
         fit,
         covariance,
         &x_threshold_dense,
         &x_log_sigma_dense,
     )? {
-        return Ok((first, second));
+        return Ok((mean, variance));
     }
 
     let mut first = Array1::<f64>::zeros(n);
-    let mut second = Array1::<f64>::zeros(n);
+    let mut variance = Array1::<f64>::zeros(n);
     // Build a single QuadratureContext up front and share it across all
     // chunks.  Per-chunk construction wastes work (each chunk's first call
     // re-derives the Gauss-Hermite rule from scratch via OnceLock) and risks
@@ -579,20 +599,20 @@ pub(crate) fn exact_survival_response_moments(
         let first_slice = first
             .as_slice_mut()
             .expect("fresh Array1 response moments are contiguous");
-        let second_slice = second
+        let variance_slice = variance
             .as_slice_mut()
             .expect("fresh Array1 response moments are contiguous");
         let quadctx_ref = &quadctx;
         first_slice
             .par_chunks_mut(SURVIVAL_ROW_PARALLEL_CHUNK)
-            .zip(second_slice.par_chunks_mut(SURVIVAL_ROW_PARALLEL_CHUNK))
+            .zip(variance_slice.par_chunks_mut(SURVIVAL_ROW_PARALLEL_CHUNK))
             .enumerate()
             .try_for_each(
-                |(chunk_idx, (first_chunk, second_chunk))| -> Result<(), String> {
+                |(chunk_idx, (first_chunk, variance_chunk))| -> Result<(), String> {
                     let row_start = chunk_idx * SURVIVAL_ROW_PARALLEL_CHUNK;
                     for offset in 0..first_chunk.len() {
                         let row = row_start + offset;
-                        let (m1, m2) = exact_survival_response_moments_row(
+                        let moment = exact_survival_response_moments_row(
                             input,
                             fit,
                             covariance,
@@ -601,15 +621,15 @@ pub(crate) fn exact_survival_response_moments(
                             row,
                             quadctx_ref,
                         )?;
-                        first_chunk[offset] = m1;
-                        second_chunk[offset] = m2;
+                        first_chunk[offset] = response_mean(moment);
+                        variance_chunk[offset] = moment.variance();
                     }
                     Ok(())
                 },
             )?;
     } else {
         for row in 0..n {
-            let (m1, m2) = exact_survival_response_moments_row(
+            let moment = exact_survival_response_moments_row(
                 input,
                 fit,
                 covariance,
@@ -618,11 +638,17 @@ pub(crate) fn exact_survival_response_moments(
                 row,
                 &quadctx,
             )?;
-            first[row] = m1;
-            second[row] = m2;
+            first[row] = response_mean(moment);
+            variance[row] = moment.variance();
         }
     }
-    Ok((first, second))
+    Ok((first, variance))
+}
+
+/// A weighted mean of probabilities lies in `[0, 1]`; the bound only removes the
+/// rounding of the running mean's last update.
+fn response_mean(moment: PosteriorMoment) -> f64 {
+    moment.mean().clamp(0.0, 1.0)
 }
 
 /// Exact affine map from the fitted location-scale coefficient frame into the

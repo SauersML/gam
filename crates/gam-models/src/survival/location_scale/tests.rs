@@ -7331,10 +7331,12 @@ pub(crate) fn near_wall_wiggle_coordinate_keeps_cross_covariance_in_moments_2390
         }
     }
 
-    let (mean, second) =
+    let (mean, variance) =
         exact_survival_response_moments(&input, &fit, &covariance).expect("response moments");
-    let (mean_flipped, second_flipped) =
+    let (mean_flipped, variance_flipped) =
         exact_survival_response_moments(&input, &fit, &flipped).expect("flipped response moments");
+    let second = &variance + &(&mean * &mean);
+    let second_flipped = &variance_flipped + &(&mean_flipped * &mean_flipped);
 
     let mean_gap = (mean[0] - mean_flipped[0]).abs();
     let second_gap = (second[0] - second_flipped[0]).abs();
@@ -7352,15 +7354,11 @@ pub(crate) fn near_wall_wiggle_coordinate_keeps_cross_covariance_in_moments_2390
         second[0],
         second_flipped[0]
     );
-    // The moments are still probabilities, and the second moment still respects
-    // Jensen against the first.
-    for (m1, m2) in [(mean[0], second[0]), (mean_flipped[0], second_flipped[0])] {
-        assert!((0.0..=1.0).contains(&m1) && (0.0..=1.0).contains(&m2));
-        assert!(
-            m2 + 1.0e-9 >= m1 * m1,
-            "E[S^2]={m2} must dominate E[S]^2={}",
-            m1 * m1
-        );
+    // The means are still probabilities, and the variances are centred, so
+    // Jensen holds exactly rather than to a rounding allowance (gam#4086).
+    for (m1, var) in [(mean[0], variance[0]), (mean_flipped[0], variance_flipped[0])] {
+        assert!((0.0..=1.0).contains(&m1));
+        assert!(var >= 0.0, "Var[S]={var} must be non-negative");
     }
 }
 
@@ -7538,8 +7536,9 @@ fn nested_response_moment_rule_reproduces_the_scalar_gaussian_law_2446() {
     reference_first /= mass;
     reference_second /= mass;
 
-    let (mean, second) =
+    let (mean, variance) =
         exact_survival_response_moments(&input, &fit, &covariance).expect("response moments");
+    let second = &variance + &(&mean * &mean);
     assert!(
         (mean[0] - reference_first).abs() <= 5.0e-5,
         "E[S] must equal the scalar-Gaussian law: production {} vs closed-form reference {} \
@@ -7836,3 +7835,92 @@ mod absolute_newton_3090;
 
 /// #3185: the direct parametric-AFT backtracking floor and stall.
 mod line_search_3185;
+
+/// gam#4086: the response moments are merged node by node as a centred
+/// variance, so a response whose mean is large against its spread keeps that
+/// spread instead of losing it to `E[S²] − E[S]²`.
+///
+/// `f(x) = c + a·x₀` under a full-rank three-dimensional normal is linear, so the
+/// Gauss–Hermite rule integrates its mean and variance exactly and the only
+/// error left is rounding: `Var f = a²·Σ₀₀`. With `c = 0.75` and `a = 2⁻³⁰` the
+/// variance is `2⁻⁶⁰`, seven binades below `ulp(E[f]²) = 2⁻⁵³`. Both `E[f²]` and
+/// `E[f]²` lie in `[0.5, 1)`, so their difference is a multiple of `2⁻⁵³`: either
+/// zero or at least `2⁻⁵³ − 2⁻⁶⁰`, a relative error of at least one either way.
+/// That is asserted as the negative control.
+///
+/// The centred rule instead resolves each deviation `f − f̄` to the rounding of
+/// `f` and of the running mean `f̄`, each within `ulp(c)` per node; the running
+/// mean's rounding over `N ≤ 15³` nodes grows no faster than `√N` ulps, so the
+/// relative error of the variance is within `√N·ulp(c)/(a·√Σ₀₀)`.
+#[test]
+fn response_moment_rule_resolves_a_small_variance_under_a_large_mean_4086() {
+    let quadctx = crate::quadrature::QuadratureContext::new();
+    let mu = [0.3, -1.0, 2.0];
+    let covariance = [[1.0, 0.0, 0.0], [0.0, 0.25, 0.0], [0.0, 0.0, 4.0]];
+    let (c, a) = (0.75_f64, 2.0_f64.powi(-30));
+    let exact_mean = c + a * mu[0];
+    let exact_variance = a * a * covariance[0][0];
+
+    let centred: PosteriorMoment = low_rank_normal_expectation_3d_result(
+        &quadctx,
+        mu,
+        covariance,
+        15,
+        "gam#4086 fixture",
+        |x, _| Ok(PosteriorMoment::point(c + a * x[0])),
+    )
+    .expect("centred response moments");
+    let (first, second): (f64, f64) = low_rank_normal_expectation_3d_result(
+        &quadctx,
+        mu,
+        covariance,
+        15,
+        "gam#4086 fixture",
+        |x, _| {
+            let f = c + a * x[0];
+            Ok((f, f * f))
+        },
+    )
+    .expect("raw response moments");
+
+    let ulp_c = c * f64::EPSILON;
+    let mean_tolerance = 15.0_f64.powi(3).sqrt() * ulp_c;
+    let tolerance = mean_tolerance / (a * covariance[0][0].sqrt());
+    let centred_error = (centred.variance() - exact_variance).abs() / exact_variance;
+    let raw_error = ((second - first * first) - exact_variance).abs() / exact_variance;
+    eprintln!(
+        "[4086] exact Var={exact_variance:.6e}; centred {:.6e} (rel err {centred_error:.3e}, \
+         bound {tolerance:.3e}); E[f^2]-E[f]^2 {:.6e} (rel err {raw_error:.3e})",
+        centred.variance(),
+        second - first * first
+    );
+    assert!(
+        (centred.mean() - exact_mean).abs() <= mean_tolerance,
+        "E[f]={} must match the exact mean {exact_mean}",
+        centred.mean()
+    );
+    assert!(
+        centred_error <= tolerance,
+        "the centred rule must resolve Var f to its rounding: rel err {centred_error:.3e} \
+         above {tolerance:.3e}"
+    );
+    assert!(
+        raw_error >= 1.0 - tolerance,
+        "negative control: E[f^2] - E[f]^2 cannot resolve a variance below ulp(E[f]^2), \
+         yet came within {raw_error:.3e} of it"
+    );
+
+    // A response that is constant over the posterior has exactly zero spread at
+    // any node count, with no allowance for rounding.
+    let constant: PosteriorMoment = low_rank_normal_expectation_3d_result(
+        &quadctx,
+        mu,
+        covariance,
+        15,
+        "gam#4086 fixture",
+        |_, _| Ok(PosteriorMoment::point(0.1)),
+    )
+    .expect("constant response moments");
+    assert_eq!(constant.variance(), 0.0);
+    assert_eq!(constant.mean(), 0.1);
+}

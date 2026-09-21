@@ -982,130 +982,140 @@ fn survival_posterior_cone_coordinates(
     Ok(cone)
 }
 
-fn posterior_standard_error_matrix(
-    mean: &Array2<f64>,
-    second_moment: &Array2<f64>,
-    label: &str,
-) -> Result<Array2<f64>, SurvivalPredictError> {
-    if second_moment.dim() != mean.dim() {
-        return Err(SurvivalPredictError::IncompatibleSchema {
-            reason: format!(
-                "posterior {label} moment shape mismatch: mean={:?}, second={:?}",
-                mean.dim(),
-                second_moment.dim(),
-            ),
-        });
-    }
-    let mut standard_error = Array2::<f64>::zeros(mean.raw_dim());
-    for ((row, column), slot) in standard_error.indexed_iter_mut() {
-        let first = mean[[row, column]];
-        let second = second_moment[[row, column]];
-        if !(first.is_finite() && second.is_finite()) {
-            return Err(SurvivalPredictError::NumericalFailure {
-                reason: format!(
-                    "posterior {label} moments must be finite at row {row}, time column {column}: mean={first}, second={second}"
-                ),
-            });
-        }
-        let variance = second - first * first;
-        let roundoff_tolerance =
-            128.0 * f64::EPSILON * second.abs().max((first * first).abs()).max(1.0);
-        if variance < -roundoff_tolerance {
-            return Err(SurvivalPredictError::NumericalFailure {
-                reason: format!(
-                    "posterior {label} variance is negative beyond roundoff at row {row}, time column {column}: {variance}"
-                ),
-            });
-        }
-        *slot = variance.max(0.0).sqrt();
-    }
-    Ok(standard_error)
+/// The weight, mean and centred second moment `Σ wᵢ (fᵢ − f̄)²` of one
+/// posterior functional over a weighted node rule.
+///
+/// Nodes are merged by the Chan–Golub–LeVeque pairwise update, so the centred
+/// moment is a sum of non-negative terms: the variance is `≥ 0` by
+/// construction and exactly `0` for a functional that is constant over the
+/// nodes, at any node count. Recovering it as `E f² − (E f)²` instead cancels
+/// catastrophically, with a rounding error that grows with the node count and
+/// that no fixed multiple of machine epsilon bounds (gam#4086).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PosteriorMoment {
+    weight: f64,
+    mean: f64,
+    centered: f64,
 }
 
-fn posterior_standard_error_vector(
-    mean: &Array1<f64>,
-    second_moment: &Array1<f64>,
-    label: &str,
-) -> Result<Array1<f64>, SurvivalPredictError> {
-    if second_moment.len() != mean.len() {
-        return Err(SurvivalPredictError::IncompatibleSchema {
-            reason: format!(
-                "posterior {label} moment length mismatch: mean={}, second={}",
-                mean.len(),
-                second_moment.len(),
-            ),
-        });
-    }
-    let mut standard_error = Array1::<f64>::zeros(mean.len());
-    for row in 0..mean.len() {
-        let first = mean[row];
-        let second = second_moment[row];
-        if !(first.is_finite() && second.is_finite()) {
-            return Err(SurvivalPredictError::NumericalFailure {
-                reason: format!(
-                    "posterior {label} moments must be finite at row {row}: mean={first}, second={second}"
-                ),
-            });
+impl PosteriorMoment {
+    /// No nodes yet.
+    pub(crate) const EMPTY: Self = Self {
+        weight: 0.0,
+        mean: 0.0,
+        centered: 0.0,
+    };
+
+    /// One node carrying the value `value`.
+    pub(crate) fn point(value: f64) -> Self {
+        Self {
+            weight: 1.0,
+            mean: value,
+            centered: 0.0,
         }
-        let variance = second - first * first;
-        let roundoff_tolerance =
-            128.0 * f64::EPSILON * second.abs().max((first * first).abs()).max(1.0);
-        if variance < -roundoff_tolerance {
-            return Err(SurvivalPredictError::NumericalFailure {
-                reason: format!(
-                    "posterior {label} variance is negative beyond roundoff at row {row}: {variance}"
-                ),
-            });
-        }
-        standard_error[row] = variance.max(0.0).sqrt();
     }
-    Ok(standard_error)
+
+    /// A unit-weight law with the given mean and (centred, non-negative)
+    /// variance, as a closed-form producer reports it.
+    fn from_mean_variance(mean: f64, variance: f64) -> Self {
+        Self {
+            weight: 1.0,
+            mean,
+            centered: variance,
+        }
+    }
+
+    /// Add `other` with its weight multiplied by `scale ≥ 0`.
+    pub(crate) fn merge(&mut self, scale: f64, other: Self) {
+        let added = scale * other.weight;
+        if added == 0.0 {
+            return;
+        }
+        if self.weight == 0.0 {
+            *self = Self {
+                weight: added,
+                mean: other.mean,
+                centered: scale * other.centered,
+            };
+            return;
+        }
+        let total = self.weight + added;
+        let difference = other.mean - self.mean;
+        self.centered +=
+            scale * other.centered + difference * difference * (self.weight * added / total);
+        // The incremental form `f̄ + d·w/W` keeps the mean exact for a constant
+        // functional; an infinite difference (a node at ±∞) falls back to the
+        // convex combination, which carries the infinity without `∞ − ∞`.
+        self.mean = if difference.is_finite() {
+            self.mean + difference * (added / total)
+        } else {
+            self.mean * (self.weight / total) + other.mean * (added / total)
+        };
+        self.weight = total;
+    }
+
+    /// The same law with every node weight multiplied by `factor > 0`.
+    pub(crate) fn scaled(self, factor: f64) -> Self {
+        Self {
+            weight: self.weight * factor,
+            mean: self.mean,
+            centered: self.centered * factor,
+        }
+    }
+
+    pub(crate) fn mean(self) -> f64 {
+        self.mean
+    }
+
+    pub(crate) fn variance(self) -> f64 {
+        self.centered / self.weight
+    }
 }
 
-fn posterior_standard_error_surfaces(
-    mean: &[Array2<f64>],
-    second_moment: &[Array2<f64>],
-    label: &str,
-) -> Result<Vec<Array2<f64>>, SurvivalPredictError> {
-    if second_moment.len() != mean.len() {
-        return Err(SurvivalPredictError::IncompatibleSchema {
-            reason: format!(
-                "posterior {label} cause count mismatch: mean={}, second={}",
-                mean.len(),
-                second_moment.len(),
-            ),
-        });
+impl gam_solve::quadrature::GhqValue for PosteriorMoment {
+    fn zero() -> Self {
+        Self::EMPTY
     }
-    mean.iter()
-        .zip(second_moment)
-        .enumerate()
-        .map(|(cause, (first, second))| {
-            posterior_standard_error_matrix(first, second, &format!("{label} cause {}", cause + 1))
-        })
-        .collect()
+
+    fn addweighted(&mut self, weight: f64, value: Self) {
+        self.merge(weight, value);
+    }
+
+    fn scale(self, factor: f64) -> Self {
+        self.scaled(factor)
+    }
 }
 
-fn posterior_standard_error_vectors(
-    mean: &[Array1<f64>],
-    second_moment: &[Array1<f64>],
+/// The posterior means of a moment surface.
+fn posterior_moment_means<D: ndarray::Dimension>(
+    moments: &ndarray::Array<PosteriorMoment, D>,
+) -> ndarray::Array<f64, D> {
+    moments.map(|moment| moment.mean())
+}
+
+/// The posterior standard deviations of a moment surface. The centred variance
+/// is non-negative by construction, so the only refusal is a moment that is not
+/// finite.
+fn posterior_standard_errors<D: ndarray::Dimension>(
+    moments: &ndarray::Array<PosteriorMoment, D>,
     label: &str,
-) -> Result<Vec<Array1<f64>>, SurvivalPredictError> {
-    if second_moment.len() != mean.len() {
-        return Err(SurvivalPredictError::IncompatibleSchema {
+) -> Result<ndarray::Array<f64, D>, SurvivalPredictError>
+where
+    D::Pattern: std::fmt::Debug,
+{
+    if let Some((index, moment)) = moments
+        .indexed_iter()
+        .find(|(_, moment)| !(moment.mean().is_finite() && moment.variance().is_finite()))
+    {
+        return Err(SurvivalPredictError::NumericalFailure {
             reason: format!(
-                "posterior {label} cause count mismatch: mean={}, second={}",
-                mean.len(),
-                second_moment.len(),
+                "posterior {label} moments must be finite at cell {index:?}: mean={}, variance={}",
+                moment.mean(),
+                moment.variance(),
             ),
         });
     }
-    mean.iter()
-        .zip(second_moment)
-        .enumerate()
-        .map(|(cause, (first, second))| {
-            posterior_standard_error_vector(first, second, &format!("{label} cause {}", cause + 1))
-        })
-        .collect()
+    Ok(moments.map(|moment| moment.variance().sqrt()))
 }
 
 /// How the coefficient posterior enters the posterior-mean surfaces of a
@@ -1284,27 +1294,25 @@ fn predict_survival_posterior_mean(
     )
 }
 
-/// First and second posterior moments of a single-event survival prediction,
-/// row × time (row for the linear predictor at each row's own exit time), as
-/// either [`SurvivalPosteriorIntegration`] accumulates them.
+/// Posterior moments of a single-event survival prediction, row × time (row
+/// for the linear predictor at each row's own exit time), as each
+/// [`SurvivalPosteriorIntegration`] accumulates them: centred moments of the
+/// survival and the linear predictor, whose spread is published, and the
+/// posterior means of the event density and hazard.
 struct SurvivalPosteriorMoments {
-    survival_mean: Array2<f64>,
-    survival_second: Array2<f64>,
+    survival: Array2<PosteriorMoment>,
     density_mean: Array2<f64>,
     hazard_mean: Array2<f64>,
-    eta_mean: Array1<f64>,
-    eta_second: Array1<f64>,
+    eta: Array1<PosteriorMoment>,
 }
 
 impl SurvivalPosteriorMoments {
     fn zeros(n_rows: usize, n_times: usize) -> Self {
         Self {
-            survival_mean: Array2::zeros((n_rows, n_times)),
-            survival_second: Array2::zeros((n_rows, n_times)),
+            survival: Array2::from_elem((n_rows, n_times), PosteriorMoment::EMPTY),
             density_mean: Array2::zeros((n_rows, n_times)),
             hazard_mean: Array2::zeros((n_rows, n_times)),
-            eta_mean: Array1::zeros(n_rows),
-            eta_second: Array1::zeros(n_rows),
+            eta: Array1::from_elem(n_rows, PosteriorMoment::EMPTY),
         }
     }
 }
@@ -1325,19 +1333,21 @@ fn publish_survival_posterior_moments(
 ) -> Result<(), SurvivalPredictError> {
     let (n_rows, n_times) = result.survival.dim();
     for published in std::iter::once(moments).chain(uncertainty.map(|(band, _)| band)) {
-        if published.survival_mean.dim() != (n_rows, n_times)
-            || published.eta_mean.len() != n_rows
+        if published.survival.dim() != (n_rows, n_times)
+            || published.density_mean.dim() != (n_rows, n_times)
+            || published.hazard_mean.dim() != (n_rows, n_times)
+            || published.eta.len() != n_rows
         {
             return Err(SurvivalPredictError::IncompatibleSchema {
                 reason: format!(
                     "posterior survival moments have shape {:?}, but the prediction is {n_rows}x{n_times}",
-                    published.survival_mean.dim()
+                    published.survival.dim()
                 ),
             });
         }
     }
     let SurvivalPosteriorMoments {
-        survival_mean,
+        survival: survival_moments,
         density_mean,
         hazard_mean,
         ..
@@ -1348,7 +1358,7 @@ fn publish_survival_posterior_moments(
     let survival_plugin = result.survival.clone();
     for row in 0..n_rows {
         for time in 0..n_times {
-            let survival = survival_mean[[row, time]].clamp(0.0, 1.0);
+            let survival = survival_moments[[row, time]].mean().clamp(0.0, 1.0);
             let density = density_mean[[row, time]];
             if !density.is_finite() {
                 return Err(SurvivalPredictError::NumericalFailure {
@@ -1373,34 +1383,60 @@ fn publish_survival_posterior_moments(
             };
         }
     }
-    result.survival_se = uncertainty.map(|(band, _)| {
-        Array2::from_shape_fn((n_rows, n_times), |(row, time)| {
-            let mean = band.survival_mean[[row, time]];
-            (band.survival_second[[row, time]] - mean * mean)
-                .max(0.0)
-                .sqrt()
-        })
-    });
-    result.eta_se = uncertainty.map(|(band, _)| {
-        Array1::from_shape_fn(n_rows, |row| {
-            let mean = band.eta_mean[row];
-            (band.eta_second[row] - mean * mean).max(0.0).sqrt()
-        })
-    });
+    result.survival_se = uncertainty
+        .map(|(band, _)| posterior_standard_errors(&band.survival, "survival"))
+        .transpose()?;
+    result.eta_se = uncertainty
+        .map(|(band, _)| posterior_standard_errors(&band.eta, "linear predictor"))
+        .transpose()?;
     result.covariance_source = uncertainty.map(|(_, covariance_mode)| covariance_mode);
     result.survival_plugin = Some(survival_plugin);
     Ok(())
 }
 
-/// `(E S, E S², E f, E h, E η, E η²)` of one marginal-slope `(row, t)` cell over
-/// the coefficient posterior: survival `S = Φ(−η)`, event density
-/// `f = φ(η)·η′`, hazard `h = f/S`, and the linear predictor. The published
-/// hazard is `E f / E S` ([`publish_survival_posterior_moments`]); `E h` only
-/// decides between a zero and an infinite hazard where `E S = 0`.
-pub(crate) type ExactAnchorCellMoments = (f64, f64, f64, f64, f64, f64);
+/// The posterior moments of one marginal-slope `(row, t)` cell over the
+/// coefficient posterior: centred moments of the survival `S = Φ(−η)` and the
+/// linear predictor `η`, and the means `E f` of the event density
+/// `f = φ(η)·η′` and `E h` of the hazard `h = f/S`. The published hazard is
+/// `E f / E S` ([`publish_survival_posterior_moments`]); `E h` only decides
+/// between a zero and an infinite hazard where `E S = 0`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ExactAnchorCellMoments {
+    pub(crate) survival: PosteriorMoment,
+    pub(crate) density: f64,
+    pub(crate) hazard: f64,
+    pub(crate) eta: PosteriorMoment,
+}
+
+impl gam_solve::quadrature::GhqValue for ExactAnchorCellMoments {
+    fn zero() -> Self {
+        Self {
+            survival: PosteriorMoment::EMPTY,
+            density: 0.0,
+            hazard: 0.0,
+            eta: PosteriorMoment::EMPTY,
+        }
+    }
+
+    fn addweighted(&mut self, weight: f64, value: Self) {
+        self.survival.merge(weight, value.survival);
+        self.density += weight * value.density;
+        self.hazard += weight * value.hazard;
+        self.eta.merge(weight, value.eta);
+    }
+
+    fn scale(self, factor: f64) -> Self {
+        Self {
+            survival: self.survival.scaled(factor),
+            density: self.density * factor,
+            hazard: self.hazard * factor,
+            eta: self.eta.scaled(factor),
+        }
+    }
+}
 
 /// One node of the exact anchored posterior integral at the primaries
-/// `(q, b)`: `(S, S², f, h, η, η²)` with `S = Φ(−η)`, event density
+/// `(q, b)`: `S`, `f`, `h` and `η` with `S = Φ(−η)`, event density
 /// `f = φ(η)·E[η′ | q, b]` and `h = f/S`.
 ///
 /// `conditional_tangent` is `(E[q′ | q, b], E[b′ | q, b])`. The index rate
@@ -1426,15 +1462,12 @@ pub(crate) fn exact_anchor_node_moments(
 ) -> ExactAnchorCellMoments {
     let rate = eta_q * conditional_tangent[0] + eta_b * conditional_tangent[1];
     let (log_survival, mills_ratio) = signed_probit_logcdf_and_mills_ratio(-eta);
-    let survival = log_survival.exp();
-    (
-        survival,
-        survival * survival,
-        normal_pdf(eta) * rate,
-        mills_ratio * rate,
-        eta,
-        eta * eta,
-    )
+    ExactAnchorCellMoments {
+        survival: PosteriorMoment::point(log_survival.exp()),
+        density: normal_pdf(eta) * rate,
+        hazard: mills_ratio * rate,
+        eta: PosteriorMoment::point(eta),
+    }
 }
 
 /// The coefficient posterior [`SurvivalPosteriorIntegration::ExactAnchor`]
@@ -1803,12 +1836,10 @@ fn survival_sigma_point_posterior_moments(
     let (n_rows, n_times) = result.survival.dim();
     let mut moments = SurvivalPosteriorMoments::zeros(n_rows, n_times);
     let SurvivalPosteriorMoments {
-        survival_mean,
-        survival_second,
+        survival: survival_moments,
         density_mean,
         hazard_mean,
-        eta_mean,
-        eta_second,
+        eta: eta_moments,
     } = &mut moments;
 
     for_each_survival_posterior_node(&posterior_mean, &active_covariance, &cone_coords, |node, weight| {
@@ -1840,9 +1871,7 @@ fn survival_sigma_point_posterior_moments(
             });
         }
         for row in 0..n_rows {
-            let eta = draw.linear_predictor[row];
-            eta_mean[row] += weight * eta;
-            eta_second[row] += weight * eta * eta;
+            eta_moments[row].merge(weight, PosteriorMoment::point(draw.linear_predictor[row]));
             for time in 0..n_times {
                 let survival = draw.survival[[row, time]];
                 let hazard = draw.hazard[[row, time]];
@@ -1851,8 +1880,7 @@ fn survival_sigma_point_posterior_moments(
                     draw.cumulative_hazard[[row, time]],
                     hazard,
                 )?;
-                survival_mean[[row, time]] += weight * survival;
-                survival_second[[row, time]] += weight * survival * survival;
+                survival_moments[[row, time]].merge(weight, PosteriorMoment::point(survival));
                 density_mean[[row, time]] += weight * density;
                 hazard_mean[[row, time]] += weight * hazard;
             }
@@ -1916,37 +1944,18 @@ fn predict_competing_risks_with_posterior(
     };
     let cause_count = result.cif.len();
     let (n_rows, n_times) = result.overall_survival.dim();
-    let mut survival_mean = (0..cause_count)
-        .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
-        .collect::<Vec<_>>();
-    let mut survival_second = (0..cause_count)
-        .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
-        .collect::<Vec<_>>();
-    let mut hazard_mean = (0..cause_count)
-        .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
-        .collect::<Vec<_>>();
-    let mut hazard_second = (0..cause_count)
-        .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
-        .collect::<Vec<_>>();
-    let mut cumulative_hazard_mean = (0..cause_count)
-        .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
-        .collect::<Vec<_>>();
-    let mut cumulative_hazard_second = (0..cause_count)
-        .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
-        .collect::<Vec<_>>();
-    let mut cif_mean = (0..cause_count)
-        .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
-        .collect::<Vec<_>>();
-    let mut cif_second = (0..cause_count)
-        .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
-        .collect::<Vec<_>>();
-    let mut overall_mean = Array2::<f64>::zeros((n_rows, n_times));
-    let mut overall_second = Array2::<f64>::zeros((n_rows, n_times));
-    let mut eta_mean = (0..cause_count)
-        .map(|_| Array1::<f64>::zeros(n_rows))
-        .collect::<Vec<_>>();
-    let mut eta_second = (0..cause_count)
-        .map(|_| Array1::<f64>::zeros(n_rows))
+    let empty_surfaces = || {
+        (0..cause_count)
+            .map(|_| Array2::from_elem((n_rows, n_times), PosteriorMoment::EMPTY))
+            .collect::<Vec<_>>()
+    };
+    let mut survival_moments = empty_surfaces();
+    let mut hazard_moments = empty_surfaces();
+    let mut cumulative_hazard_moments = empty_surfaces();
+    let mut cif_moments = empty_surfaces();
+    let mut overall_moments = Array2::from_elem((n_rows, n_times), PosteriorMoment::EMPTY);
+    let mut eta_moments = (0..cause_count)
+        .map(|_| Array1::from_elem(n_rows, PosteriorMoment::EMPTY))
         .collect::<Vec<_>>();
 
     for_each_survival_posterior_node(&posterior_mean, &active_covariance, &cone_coords, |node, weight| {
@@ -1995,87 +2004,82 @@ fn predict_competing_risks_with_posterior(
                 });
             }
             for row in 0..n_rows {
-                let eta = draw.linear_predictor[cause][row];
-                eta_mean[cause][row] += weight * eta;
-                eta_second[cause][row] += weight * eta * eta;
-                for time in 0..n_times {
-                    let survival = draw.survival[cause][[row, time]];
-                    let hazard = draw.hazard[cause][[row, time]];
-                    let cumulative_hazard = draw.cumulative_hazard[cause][[row, time]];
-                    let cif = draw.cif[cause][[row, time]];
-                    survival_mean[cause][[row, time]] += weight * survival;
-                    survival_second[cause][[row, time]] += weight * survival * survival;
-                    hazard_mean[cause][[row, time]] += weight * hazard;
-                    hazard_second[cause][[row, time]] += weight * hazard * hazard;
-                    cumulative_hazard_mean[cause][[row, time]] += weight * cumulative_hazard;
-                    cumulative_hazard_second[cause][[row, time]] +=
-                        weight * cumulative_hazard * cumulative_hazard;
-                    cif_mean[cause][[row, time]] += weight * cif;
-                    cif_second[cause][[row, time]] += weight * cif * cif;
-                }
+                eta_moments[cause][row]
+                    .merge(weight, PosteriorMoment::point(draw.linear_predictor[cause][row]));
+            }
+            for (moments, surface) in [
+                (&mut survival_moments[cause], &draw.survival[cause]),
+                (&mut hazard_moments[cause], &draw.hazard[cause]),
+                (&mut cumulative_hazard_moments[cause], &draw.cumulative_hazard[cause]),
+                (&mut cif_moments[cause], &draw.cif[cause]),
+            ] {
+                ndarray::Zip::from(moments)
+                    .and(surface)
+                    .for_each(|moment, &value| moment.merge(weight, PosteriorMoment::point(value)));
             }
         }
-        for row in 0..n_rows {
-            for time in 0..n_times {
-                let overall_survival = draw.overall_survival[[row, time]];
-                overall_mean[[row, time]] += weight * overall_survival;
-                overall_second[[row, time]] += weight * overall_survival * overall_survival;
-            }
-        }
+        ndarray::Zip::from(&mut overall_moments)
+            .and(&draw.overall_survival)
+            .for_each(|moment, &value| moment.merge(weight, PosteriorMoment::point(value)));
         Ok(())
     })?;
 
+    let surfaces_se = |surfaces: &[Array2<PosteriorMoment>], label: &str| {
+        surfaces
+            .iter()
+            .enumerate()
+            .map(|(cause, moments)| {
+                posterior_standard_errors(moments, &format!("{label} cause {}", cause + 1))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
     let (hazard_se, survival_se, cumulative_hazard_se, cif_se, overall_survival_se, eta_se) =
         if req.with_uncertainty {
             (
-                Some(posterior_standard_error_surfaces(
-                    &hazard_mean,
-                    &hazard_second,
-                    "competing-risks hazard",
-                )?),
-                Some(posterior_standard_error_surfaces(
-                    &survival_mean,
-                    &survival_second,
-                    "competing-risks survival",
-                )?),
-                Some(posterior_standard_error_surfaces(
-                    &cumulative_hazard_mean,
-                    &cumulative_hazard_second,
+                Some(surfaces_se(&hazard_moments, "competing-risks hazard")?),
+                Some(surfaces_se(&survival_moments, "competing-risks survival")?),
+                Some(surfaces_se(
+                    &cumulative_hazard_moments,
                     "competing-risks cumulative hazard",
                 )?),
-                Some(posterior_standard_error_surfaces(
-                    &cif_mean,
-                    &cif_second,
-                    "competing-risks cumulative incidence",
-                )?),
-                Some(posterior_standard_error_matrix(
-                    &overall_mean,
-                    &overall_second,
+                Some(surfaces_se(&cif_moments, "competing-risks cumulative incidence")?),
+                Some(posterior_standard_errors(
+                    &overall_moments,
                     "competing-risks overall survival",
                 )?),
-                Some(posterior_standard_error_vectors(
-                    &eta_mean,
-                    &eta_second,
-                    "competing-risks linear predictor",
-                )?),
+                Some(
+                    eta_moments
+                        .iter()
+                        .enumerate()
+                        .map(|(cause, moments)| {
+                            posterior_standard_errors(
+                                moments,
+                                &format!("competing-risks linear predictor cause {}", cause + 1),
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
             )
         } else {
             (None, None, None, None, None, None)
         };
 
     if posterior_mean_estimand && !separate_conditional_point {
-        result.hazard = hazard_mean;
-        result.survival = survival_mean
-            .into_iter()
-            .map(|surface| surface.mapv(|value| value.clamp(0.0, 1.0)))
+        let bounded_means = |surfaces: &[Array2<PosteriorMoment>]| {
+            surfaces
+                .iter()
+                .map(|moments| moments.map(|moment| moment.mean().clamp(0.0, 1.0)))
+                .collect::<Vec<_>>()
+        };
+        result.hazard = hazard_moments.iter().map(posterior_moment_means).collect();
+        result.survival = bounded_means(&survival_moments);
+        result.cumulative_hazard = cumulative_hazard_moments
+            .iter()
+            .map(posterior_moment_means)
             .collect();
-        result.cumulative_hazard = cumulative_hazard_mean;
-        result.cif = cif_mean
-            .into_iter()
-            .map(|surface| surface.mapv(|value| value.clamp(0.0, 1.0)))
-            .collect();
-        result.overall_survival = overall_mean.mapv(|value| value.clamp(0.0, 1.0));
-        result.linear_predictor = eta_mean;
+        result.cif = bounded_means(&cif_moments);
+        result.overall_survival = overall_moments.map(|moment| moment.mean().clamp(0.0, 1.0));
+        result.linear_predictor = eta_moments.iter().map(posterior_moment_means).collect();
     }
     result.hazard_se = hazard_se;
     result.survival_se = survival_se;
@@ -3414,7 +3418,12 @@ fn predict_survival_surfaces(
                         // At the time origin every coefficient draw has S = 1 and
                         // no hazard, so the moments carry no posterior spread.
                         if exact_posterior.is_some() {
-                            row.posterior_cells.push((1.0, 1.0, 0.0, 0.0, 0.0, 0.0));
+                            row.posterior_cells.push(ExactAnchorCellMoments {
+                                survival: PosteriorMoment::point(1.0),
+                                density: 0.0,
+                                hazard: 0.0,
+                                eta: PosteriorMoment::point(0.0),
+                            });
                         }
                     } else {
                         let ((_eta_t, cum_t, haz_t), posterior) = evaluate_at(t_query)?;
@@ -3455,13 +3464,11 @@ fn predict_survival_surfaces(
                         row.posterior_cells.len()
                     )));
                 }
-                moments.eta_mean[i] = exit.4;
-                moments.eta_second[i] = exit.5;
+                moments.eta[i] = exit.eta;
                 for (j, cell) in row.posterior_cells.iter().enumerate() {
-                    moments.survival_mean[[i, j]] = cell.0;
-                    moments.survival_second[[i, j]] = cell.1;
-                    moments.density_mean[[i, j]] = cell.2;
-                    moments.hazard_mean[[i, j]] = cell.3;
+                    moments.survival[[i, j]] = cell.survival;
+                    moments.density_mean[[i, j]] = cell.density;
+                    moments.hazard_mean[[i, j]] = cell.hazard;
                 }
             }
             Ok(moments)
@@ -5802,8 +5809,7 @@ fn truncated_survival_surface_moments(
             .collect();
     let n_rows = eta_cells.len();
     let mut moments = SurvivalPosteriorMoments::zeros(n_rows, t_cols);
-    moments.survival_mean.fill(1.0);
-    moments.survival_second.fill(1.0);
+    moments.survival.fill(PosteriorMoment::point(1.0));
     let mut active_surface: Vec<usize> = (0..surface_cells.len()).collect();
     let mut active_eta: Vec<usize> = (0..n_rows).collect();
     let mut evaluated = 0usize;
@@ -5851,12 +5857,10 @@ fn truncated_survival_surface_moments(
         for &cell in &active_surface {
             let (row, time, k) = surface_cells[cell];
             let (reference_survival, reference_density) = reference_surface[cell];
-            let survival =
-                pooled.moments(|a| (a.survival[k], a.survival_square[k]), reference_survival);
-            let density = pooled.moments(|a| (a.density[k], a.density_square[k]), reference_density);
+            let survival = pooled.moments(|a| a.survival[k], reference_survival);
+            let density = pooled.moments(|a| a.density[k], reference_density);
             let hazard = pooled.mean(|a| a.hazard[k]);
             let first = survival.mean.clamp(0.0, 1.0);
-            let second = (survival.variance + first * first).clamp(0.0, 1.0);
             // `S = exp(log S)` resolves a probability to `f64::EPSILON` absolute
             // and `f` to one part in `f64::EPSILON` of itself: spread within that
             // is the integrand's rounding, which no node count removes.
@@ -5871,8 +5875,8 @@ fn truncated_survival_surface_moments(
             );
             let error = survival_error.max(density_error);
             if error <= tolerance {
-                moments.survival_mean[[row, time]] = first;
-                moments.survival_second[[row, time]] = second;
+                moments.survival[[row, time]] =
+                    PosteriorMoment::from_mean_variance(first, survival.variance);
                 moments.density_mean[[row, time]] = density.mean;
                 moments.hazard_mean[[row, time]] = hazard;
             } else {
@@ -5884,15 +5888,14 @@ fn truncated_survival_surface_moments(
         for &row in &active_eta {
             let k = eta_cells[row];
             let reference_eta = reference.eta[k];
-            let eta = pooled.moments(|a| (a.eta[k], a.eta_square[k]), reference_eta);
+            let eta = pooled.moments(|a| a.eta[k], reference_eta);
             let error = certified_fraction(
                 eta.mean_spread.max(eta.sd_spread)
                     - f64::EPSILON * reference_eta.abs().max(eta.mean.abs()),
                 eta.variance.sqrt(),
             );
             if error <= tolerance {
-                moments.eta_mean[row] = eta.mean;
-                moments.eta_second[row] = eta.variance + eta.mean * eta.mean;
+                moments.eta[row] = PosteriorMoment::from_mean_variance(eta.mean, eta.variance);
             } else {
                 uncertified_eta.push(row);
                 note_uncertified(format!("row {row}'s linear predictor"), error);
@@ -5937,20 +5940,17 @@ struct SurfaceMomentCells<'a> {
     active_eta: &'a [usize],
 }
 
-/// One replicate lattice's weighted sums, on one log scale, over the flattened
-/// cells: deviations of `S`, `f` and `η` from the plug-in cell and their
-/// squares, and the raw hazard, which only decides between a
-/// zero and an infinite published hazard where `E[S] = 0`.
+/// One replicate lattice's weighted moments, on one log scale, over the
+/// flattened cells: centred moments of the deviations of `S`, `f` and `η` from
+/// the plug-in cell, and the raw hazard sum, which only decides between a zero
+/// and an infinite published hazard where `E[S] = 0`.
 struct SurfaceMomentAccumulator {
     log_scale: f64,
     weight_sum: f64,
-    survival: Array1<f64>,
-    survival_square: Array1<f64>,
-    density: Array1<f64>,
-    density_square: Array1<f64>,
+    survival: Array1<PosteriorMoment>,
+    density: Array1<PosteriorMoment>,
     hazard: Array1<f64>,
-    eta: Array1<f64>,
-    eta_square: Array1<f64>,
+    eta: Array1<PosteriorMoment>,
 }
 
 impl SurfaceMomentAccumulator {
@@ -5958,13 +5958,10 @@ impl SurfaceMomentAccumulator {
         Self {
             log_scale: f64::NEG_INFINITY,
             weight_sum: 0.0,
-            survival: Array1::zeros(cells),
-            survival_square: Array1::zeros(cells),
-            density: Array1::zeros(cells),
-            density_square: Array1::zeros(cells),
+            survival: Array1::from_elem(cells, PosteriorMoment::EMPTY),
+            density: Array1::from_elem(cells, PosteriorMoment::EMPTY),
             hazard: Array1::zeros(cells),
-            eta: Array1::zeros(cells),
-            eta_square: Array1::zeros(cells),
+            eta: Array1::from_elem(cells, PosteriorMoment::EMPTY),
         }
     }
 
@@ -5977,16 +5974,9 @@ impl SurfaceMomentAccumulator {
         if log_weight > self.log_scale {
             let rescale = (self.log_scale - log_weight).exp();
             self.weight_sum *= rescale;
-            for sums in [
-                &mut self.survival,
-                &mut self.survival_square,
-                &mut self.density,
-                &mut self.density_square,
-                &mut self.hazard,
-                &mut self.eta,
-                &mut self.eta_square,
-            ] {
-                *sums *= rescale;
+            self.hazard *= rescale;
+            for moments in [&mut self.survival, &mut self.density, &mut self.eta] {
+                moments.map_inplace(|moment| *moment = moment.scaled(rescale));
             }
             self.log_scale = log_weight;
         }
@@ -6001,19 +5991,13 @@ impl SurfaceMomentAccumulator {
             let (_, _, k) = cells.surface_cells[cell];
             let (reference_survival, reference_density) = cells.reference_surface[cell];
             let (survival, density) = node.survival_and_density(k)?;
-            let survival_deviation = survival - reference_survival;
-            self.survival[k] += weight * survival_deviation;
-            self.survival_square[k] += weight * survival_deviation * survival_deviation;
-            let density_deviation = density - reference_density;
-            self.density[k] += weight * density_deviation;
-            self.density_square[k] += weight * density_deviation * density_deviation;
+            self.survival[k].merge(weight, PosteriorMoment::point(survival - reference_survival));
+            self.density[k].merge(weight, PosteriorMoment::point(density - reference_density));
             self.hazard[k] += weight * node.hazard[k];
         }
         for &row in cells.active_eta {
             let k = cells.eta_cells[row];
-            let deviation = node.eta[k] - cells.reference.eta[k];
-            self.eta[k] += weight * deviation;
-            self.eta_square[k] += weight * deviation * deviation;
+            self.eta[k].merge(weight, PosteriorMoment::point(node.eta[k] - cells.reference.eta[k]));
         }
         Ok(())
     }
@@ -6078,31 +6062,26 @@ impl<'a> PooledSurfaceMoments<'a> {
             / self.pooled_weight
     }
 
-    /// The moments of a quantity whose sums of deviations from `reference`, and
-    /// of their squares, `sums` reads.
+    /// The moments of a quantity whose centred moments of deviations from
+    /// `reference` `deviations` reads, the replicates merged on the pooling
+    /// scales.
     fn moments(
         &self,
-        sums: impl Fn(&SurfaceMomentAccumulator) -> (f64, f64),
+        deviations: impl Fn(&SurfaceMomentAccumulator) -> PosteriorMoment,
         reference: f64,
     ) -> CellMoments {
         let mut means = Vec::with_capacity(self.accumulators.len());
         let mut standard_deviations = Vec::with_capacity(self.accumulators.len());
-        let mut pooled_deviation = 0.0;
-        let mut pooled_square = 0.0;
-        for (accumulator, scale) in self.accumulators.iter().zip(&self.pooling_scales) {
-            let (deviation, square) = sums(accumulator);
-            let mean = deviation / accumulator.weight_sum;
-            means.push(mean);
-            standard_deviations
-                .push((square / accumulator.weight_sum - mean * mean).max(0.0).sqrt());
-            pooled_deviation += scale * deviation;
-            pooled_square += scale * square;
+        let mut pooled = PosteriorMoment::EMPTY;
+        for (accumulator, &scale) in self.accumulators.iter().zip(&self.pooling_scales) {
+            let replicate = deviations(accumulator);
+            means.push(replicate.mean());
+            standard_deviations.push(replicate.variance().sqrt());
+            pooled.merge(scale, replicate);
         }
-        let mean_deviation = pooled_deviation / self.pooled_weight;
         CellMoments {
-            mean: reference + mean_deviation,
-            variance: (pooled_square / self.pooled_weight - mean_deviation * mean_deviation)
-                .max(0.0),
+            mean: reference + pooled.mean(),
+            variance: pooled.variance(),
             mean_spread: replicate_standard_error(&means),
             sd_spread: replicate_standard_error(&standard_deviations),
         }
@@ -7003,14 +6982,11 @@ mod tests {
     fn posterior_quadrature_second_moment_honors_cross_coordinate_covariance() {
         let posterior_mean = ndarray::array![0.4, -0.2];
         let covariance = ndarray::array![[0.9, 0.35], [0.35, 0.6]];
-        let mut functional_mean = 0.0_f64;
-        let mut functional_second = 0.0_f64;
+        let mut functional = Array2::from_elem((1, 1), PosteriorMoment::EMPTY);
         let mut recovered_cross_covariance = 0.0_f64;
 
         for_each_survival_posterior_node(&posterior_mean, &covariance, &[], |node, weight| {
-            let functional = node[0] + 2.0 * node[1];
-            functional_mean += weight * functional;
-            functional_second += weight * functional * functional;
+            functional[[0, 0]].merge(weight, PosteriorMoment::point(node[0] + 2.0 * node[1]));
             recovered_cross_covariance +=
                 weight * (node[0] - posterior_mean[0]) * (node[1] - posterior_mean[1]);
             Ok(())
@@ -7020,17 +6996,11 @@ mod tests {
         let expected_mean = posterior_mean[0] + 2.0 * posterior_mean[1];
         let expected_variance =
             covariance[[0, 0]] + 4.0 * covariance[[1, 1]] + 4.0 * covariance[[0, 1]];
-        assert!((functional_mean - expected_mean).abs() <= 1e-12);
+        assert!((functional[[0, 0]].mean() - expected_mean).abs() <= 1e-12);
         assert!((recovered_cross_covariance - covariance[[0, 1]]).abs() <= 1e-12);
 
-        let mean_surface = Array2::from_elem((1, 1), functional_mean);
-        let second_surface = Array2::from_elem((1, 1), functional_second);
-        let standard_error = posterior_standard_error_matrix(
-            &mean_surface,
-            &second_surface,
-            "joint-covariance witness",
-        )
-        .expect("posterior standard error");
+        let standard_error = posterior_standard_errors(&functional, "joint-covariance witness")
+            .expect("posterior standard error");
         assert!((standard_error[[0, 0]].powi(2) - expected_variance).abs() <= 1e-11);
     }
 
@@ -7038,27 +7008,84 @@ mod tests {
     fn posterior_quadrature_zero_covariance_has_zero_standard_error() {
         let posterior_mean = ndarray::array![0.25, -0.75];
         let covariance = Array2::<f64>::zeros((2, 2));
-        let mut functional_mean = 0.0_f64;
-        let mut functional_second = 0.0_f64;
+        let mut functional = Array2::from_elem((1, 1), PosteriorMoment::EMPTY);
         let mut node_count = 0usize;
 
         for_each_survival_posterior_node(&posterior_mean, &covariance, &[], |node, weight| {
-            let functional = node[0].exp() + node[1].sin();
-            functional_mean += weight * functional;
-            functional_second += weight * functional * functional;
+            functional[[0, 0]].merge(weight, PosteriorMoment::point(node[0].exp() + node[1].sin()));
             node_count += 1;
             Ok(())
         })
         .expect("rank-zero posterior quadrature");
 
         assert_eq!(node_count, 1, "rank-zero covariance has one exact node");
-        let standard_error = posterior_standard_error_matrix(
-            &Array2::from_elem((1, 1), functional_mean),
-            &Array2::from_elem((1, 1), functional_second),
-            "rank-zero witness",
-        )
-        .expect("rank-zero posterior standard error");
+        let standard_error = posterior_standard_errors(&functional, "rank-zero witness")
+            .expect("rank-zero posterior standard error");
         assert_eq!(standard_error[[0, 0]], 0.0);
+    }
+
+    /// gam#4086: a functional that is constant over the sigma points has zero
+    /// posterior variance at any rank. The raw `E f² − (E f)²` of the same
+    /// nodes cancels to a negative number beyond `128·eps` at rank 530, which
+    /// the removed round-off gate refused as a numerical failure; the centred
+    /// moments give exactly zero.
+    #[test]
+    fn posterior_quadrature_constant_functional_has_exactly_zero_standard_error_at_high_rank() {
+        let rank = 530;
+        let posterior_mean = Array1::<f64>::zeros(rank);
+        let covariance = Array2::<f64>::eye(rank);
+        let mut functional = Array2::from_elem((1, 1), PosteriorMoment::EMPTY);
+        let mut raw_first = 0.0_f64;
+        let mut raw_second = 0.0_f64;
+        let mut node_count = 0usize;
+
+        for_each_survival_posterior_node(&posterior_mean, &covariance, &[], |_, weight| {
+            let value = 1.0_f64;
+            functional[[0, 0]].merge(weight, PosteriorMoment::point(value));
+            raw_first += weight * value;
+            raw_second += weight * value * value;
+            node_count += 1;
+            Ok(())
+        })
+        .expect("rank-530 posterior quadrature");
+
+        assert_eq!(node_count, 2 * rank);
+        assert!(
+            raw_second - raw_first * raw_first < -128.0 * f64::EPSILON,
+            "the raw moments no longer witness the cancellation: {:e}",
+            raw_second - raw_first * raw_first
+        );
+        assert_eq!(functional[[0, 0]].mean(), 1.0);
+        let standard_error = posterior_standard_errors(&functional, "constant witness")
+            .expect("a constant functional's posterior standard error");
+        assert_eq!(standard_error[[0, 0]], 0.0);
+    }
+
+    /// The pairwise merge is the exact weighted mean and centred second moment
+    /// of the merged nodes, whatever the order or weight scale.
+    #[test]
+    fn posterior_moment_merge_matches_two_pass_moments() {
+        let nodes = [(0.5, 3.0), (0.125, -1.0), (0.25, 7.5), (0.125, 2.0)];
+        let total: f64 = nodes.iter().map(|&(w, _)| w).sum();
+        let mean = nodes.iter().map(|&(w, v)| w * v).sum::<f64>() / total;
+        let variance =
+            nodes.iter().map(|&(w, v)| w * (v - mean) * (v - mean)).sum::<f64>() / total;
+
+        let mut forward = PosteriorMoment::EMPTY;
+        for &(w, v) in &nodes {
+            forward.merge(w, PosteriorMoment::point(v));
+        }
+        let mut halves = [PosteriorMoment::EMPTY; 2];
+        for (index, &(w, v)) in nodes.iter().enumerate() {
+            halves[index % 2].merge(w, PosteriorMoment::point(v));
+        }
+        let mut pooled = PosteriorMoment::EMPTY;
+        pooled.merge(3.0, halves[1]);
+        pooled.merge(3.0, halves[0]);
+        for moment in [forward, pooled.scaled(0.25)] {
+            assert!((moment.mean() - mean).abs() <= 4.0 * f64::EPSILON * mean.abs());
+            assert!((moment.variance() - variance).abs() <= 8.0 * f64::EPSILON * variance);
+        }
     }
 
     #[test]
@@ -7486,8 +7513,8 @@ mod tests {
                     (v_mean * normal_cdf(v_mean / sd) + sd * normal_pdf(v_mean / sd)) / t
                 };
                 let moments = exact_anchor_node_moments(q, 1.0, 0.0, [rate, 0.0]);
-                survival += weight * moments.0;
-                density += weight * moments.2;
+                survival += weight * moments.survival.mean();
+                density += weight * moments.density;
             }
             (survival, density)
         };
