@@ -1270,7 +1270,13 @@ pub(crate) fn run_predict_spline_scan(
         se[i] = v.max(0.0).sqrt();
     }
     let (se_opt, mean_lo, mean_hi) = if args.uncertainty {
-        let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
+        // `σ̂²` is profiled from the training data, so the pivot is Student-t
+        // on the fit's restricted degrees of freedom, not normal.
+        let z = gam_predict::IntervalReference::StudentT {
+            degrees_of_freedom: fit.residual_degrees_of_freedom(),
+        }
+        .central_multiplier(args.level)
+        .map_err(|error| error.to_string())?;
         let lo = Array1::from_iter(mean.iter().zip(se.iter()).map(|(m, s)| m - z * s));
         let hi = Array1::from_iter(mean.iter().zip(se.iter()).map(|(m, s)| m + z * s));
         (Some(se.clone()), Some(lo), Some(hi))
@@ -1354,7 +1360,13 @@ pub(crate) fn run_predict_residual_cascade(
         se[i] = v.max(0.0).sqrt();
     }
     let (se_opt, mean_lo, mean_hi) = if args.uncertainty {
-        let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
+        // `σ̂²` is profiled from the training data, so the pivot is Student-t
+        // on the fit's restricted degrees of freedom, not normal.
+        let z = gam_predict::IntervalReference::StudentT {
+            degrees_of_freedom: fit.residual_degrees_of_freedom(),
+        }
+        .central_multiplier(args.level)
+        .map_err(|error| error.to_string())?;
         let lo = Array1::from_iter(mean.iter().zip(se.iter()).map(|(m, s)| m - z * s));
         let hi = Array1::from_iter(mean.iter().zip(se.iter()).map(|(m, s)| m + z * s));
         (Some(se.clone()), Some(lo), Some(hi))

@@ -4904,6 +4904,20 @@ impl ResidualCascadeFit {
         self.training_sample_size.get()
     }
 
+    /// Restricted degrees of freedom `n − (dim + 1)` that the profiled `σ̂²`
+    /// divides the penalized residual quadratic by.
+    ///
+    /// Every posterior covariance of the cascade scales with `σ²` at fixed
+    /// `λ = σ²/τ²`, and the restricted likelihood is `∝ σ^{−(n−q)}·
+    /// exp(−rss_pen/(2σ²))` with `q` the unpenalized polynomial dimension, so
+    /// under the scale-invariant reference prior the posterior of `f(x*)` is
+    /// Student-t on exactly these degrees of freedom with scale `σ̂²·c(x*)`:
+    /// the interval reference of every band read off this fit.
+    pub fn residual_degrees_of_freedom(&self) -> f64 {
+        self.training_sample_size()
+            .saturating_sub(self.core.nullity()) as f64
+    }
+
     /// Posterior `(mean, variance)` at a raw point: the sparse basis row
     /// dotted with the coefficients, and `σ̂²·x'(X'WX+λD)^{−1}x` through one
     /// certified solve.

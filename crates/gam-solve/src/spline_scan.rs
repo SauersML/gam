@@ -5359,6 +5359,19 @@ impl SplineScanFit {
         self.training_sample_size.get()
     }
 
+    /// Restricted degrees of freedom `n − order` that the profiled `σ̂²`
+    /// divides the innovations quadratic by.
+    ///
+    /// Every posterior covariance of the scan scales with `σ²` at fixed `λ`,
+    /// and the diffuse restricted likelihood is `∝ σ^{−(n−order)}·
+    /// exp(−RSS/(2σ²))`, so under the scale-invariant reference prior the
+    /// posterior of `f(x*)` (and of a new response) is Student-t on exactly
+    /// these degrees of freedom with scale `σ̂²·c(x*)`: the interval reference
+    /// of every band read off this fit.
+    pub fn residual_degrees_of_freedom(&self) -> f64 {
+        self.training_sample_size().saturating_sub(self.order) as f64
+    }
+
     /// Gaussian deviance — the weighted DATA residual sum of squares
     /// `Σ wᵢ(yᵢ − f̂ᵢ)²` at the smoothed mean (#1046). This is the stored
     /// `data_sse`, computed against the fitted values at fit time. It is NOT

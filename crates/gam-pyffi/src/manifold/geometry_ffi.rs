@@ -7328,9 +7328,13 @@ fn predict_columns(
         columns.insert("mean_plugin".to_string(), eta.clone());
         columns.insert("posterior_mean".to_string(), eta.clone());
         if let Some(confidence_level) = options.interval {
-            let z = gam::inference::probability::standard_normal_quantile(
-                0.5 + confidence_level * 0.5,
-            )?;
+            // `σ̂²` is profiled from the training data, so both bands' pivot is
+            // Student-t on the scan's restricted degrees of freedom, not normal.
+            let z = gam_predict::IntervalReference::StudentT {
+                degrees_of_freedom: fit.residual_degrees_of_freedom(),
+            }
+            .central_multiplier(confidence_level)
+            .map_err(|error| error.to_string())?;
             let lower: Vec<f64> = eta.iter().zip(&se).map(|(m, s)| m - z * s).collect();
             let upper: Vec<f64> = eta.iter().zip(&se).map(|(m, s)| m + z * s).collect();
             // Observation (predictive) interval (#1047): the scan IS the exact
@@ -7339,7 +7343,8 @@ fn predict_columns(
             // is the off-knot posterior variance from the bridge and
             // `fit.sigma2` is the profiled Gaussian observation variance. The
             // confidence band uses `se` alone; the observation band inflates by
-            // σ². Identity link means no response-scale transform is needed.
+            // σ². Both scale with σ², so both read the same Student-t `z`.
+            // Identity link means no response-scale transform is needed.
             if options.observation_interval.unwrap_or(false) {
                 let obs_se: Vec<f64> = se
                     .iter()
