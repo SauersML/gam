@@ -61,12 +61,30 @@ impl SlopeTopology {
         raw_design: DesignMatrix,
         common_offset: &Array1<f64>,
     ) -> Result<SlopeLayout, String> {
+        let mut channel_offsets = Array2::<f64>::zeros((common_offset.len(), self.score_count()));
+        for mut column in channel_offsets.columns_mut() {
+            column.assign(common_offset);
+        }
+        self.materialize_identity_with_channel_offsets(raw_design, channel_offsets)
+    }
+
+    /// Materialise the identity-coordinate layout with one offset column per
+    /// physical channel. Column `j` is the fixed part of channel `j`'s slope,
+    /// `s_j(x) = X_j(x) beta_j + offset_{., j}`. Distinct columns arise when
+    /// the score axes carry distinct unit maps (gam#4331): a raw slope offset
+    /// `o` on score `j` standardised by scale `c_j` is the standardised-axis
+    /// offset `c_j o`, which differs across channels.
+    pub(crate) fn materialize_identity_with_channel_offsets(
+        &self,
+        raw_design: DesignMatrix,
+        channel_offsets: Array2<f64>,
+    ) -> Result<SlopeLayout, String> {
         let width = raw_design.ncols();
         self.materialize_with_design(
             raw_design.clone(),
             raw_design,
             Array2::<f64>::eye(width),
-            common_offset,
+            channel_offsets,
         )
     }
 
@@ -75,13 +93,20 @@ impl SlopeTopology {
         raw_design: DesignMatrix,
         coefficient_design: DesignMatrix,
         current_from_raw: Array2<f64>,
-        common_offset: &Array1<f64>,
+        channel_offsets: Array2<f64>,
     ) -> Result<SlopeLayout, String> {
-        if raw_design.nrows() != common_offset.len() {
+        if raw_design.nrows() != channel_offsets.nrows() {
             return Err(format!(
                 "slope layout offset length {} does not match design rows {}",
-                common_offset.len(),
+                channel_offsets.nrows(),
                 raw_design.nrows(),
+            ));
+        }
+        if channel_offsets.ncols() != self.score_count() {
+            return Err(format!(
+                "slope layout has {} offset channels but the topology has {} physical channels",
+                channel_offsets.ncols(),
+                self.score_count(),
             ));
         }
         if current_from_raw.nrows() != raw_design.ncols() {
@@ -94,7 +119,7 @@ impl SlopeTopology {
         if current_from_raw.iter().any(|value| !value.is_finite()) {
             return Err("slope layout transform contains a non-finite value".to_string());
         }
-        if common_offset.iter().any(|value| !value.is_finite()) {
+        if channel_offsets.iter().any(|value| !value.is_finite()) {
             return Err("slope layout offset contains a non-finite value".to_string());
         }
 
@@ -122,7 +147,7 @@ impl SlopeTopology {
                     nrows,
                     current_width,
                     channels: SlopeChannels::Shared {
-                        offset: Arc::new(common_offset.clone()),
+                        offset: Arc::new(channel_offsets.column(0).to_owned()),
                     },
                 })
             }
@@ -137,10 +162,6 @@ impl SlopeTopology {
                         "per-score slope",
                     )?;
                 }
-                let mut offsets = Array2::<f64>::zeros((nrows, raw_ranges.len()));
-                for mut column in offsets.columns_mut() {
-                    column.assign(common_offset);
-                }
                 Ok(SlopeLayout {
                     coefficient_design,
                     follow_up: None,
@@ -150,7 +171,7 @@ impl SlopeTopology {
                         raw_design,
                         current_from_raw: Arc::new(current_from_raw),
                         raw_ranges: Arc::clone(raw_ranges),
-                        offsets: Arc::new(offsets),
+                        offsets: Arc::new(channel_offsets),
                     },
                 })
             }
@@ -813,6 +834,34 @@ mod tests {
     }
 
     #[test]
+    fn distinct_channel_offsets_reach_their_own_channels() {
+        let raw = array![[2.0, 3.0, 5.0], [7.0, 11.0, 13.0]];
+        let topology = SlopeTopology::per_score(vec![0..1, 1..3], 3).unwrap();
+        let layout = topology
+            .materialize_identity_with_channel_offsets(
+                DesignMatrix::from(raw),
+                array![[0.5, -4.0], [1.5, 8.0]],
+            )
+            .unwrap();
+        let beta = array![17.0, 19.0, 23.0];
+        let mut workspace = layout.row_workspace(2).unwrap();
+        layout
+            .fill_per_score_row(1, beta.view(), &mut workspace)
+            .unwrap();
+        // channel 0: 7*17 + 1.5; channel 1: 11*19 + 13*23 + 8.
+        assert_eq!(workspace.values(), &[120.5, 516.0]);
+
+        let error = topology
+            .materialize_identity_with_channel_offsets(
+                DesignMatrix::from(array![[1.0, 1.0, 1.0]]),
+                array![[0.0]],
+            )
+            .err()
+            .expect("a per-score layout needs one offset column per channel");
+        assert!(error.contains("1 offset channels"), "{error}");
+    }
+
+    #[test]
     fn shared_zero_width_physical_channel_is_rejected_exactly() {
         let topology = SlopeTopology::shared();
         let raw_design = DesignMatrix::from(array![[1.0], [2.0]]);
@@ -821,7 +870,7 @@ mod tests {
                 raw_design,
                 DesignMatrix::from(Array2::<f64>::zeros((2, 0))),
                 Array2::<f64>::zeros((1, 0)),
-                &array![0.0, 0.0],
+                array![[0.0], [0.0]],
             )
             .err()
             .expect("shared physical channel cannot have zero current width");

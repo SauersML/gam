@@ -4321,16 +4321,9 @@ fn build_joint_marginal_slope_predict_context(
                 .to_string(),
         });
     }
-    let normalization = model
-        .latent_z_normalization
-        .ok_or_else(|| "saved survival marginal-slope model missing latent_z_normalization".to_string())?;
-    if !(normalization.mean == 0.0 && normalization.sd == 1.0) {
-        return Err(SurvivalPredictError::UnsupportedConfiguration {
-            reason: "saved survival marginal-slope joint latent law requires the identity score \
-                     normalisation it was saved under"
-                .to_string(),
-        });
-    }
+    // The joint law carries every score's unit map z̃_j = (z_j − m_j)/s_j
+    // (gam#4331); the replay validator already checked that the scalar
+    // `latent_z_normalization` equals the law's map for score 0.
     let z_columns = model
         .z_columns
         .as_ref()
@@ -4347,7 +4340,9 @@ fn build_joint_marginal_slope_predict_context(
         let index = *col_map
             .get(name)
             .ok_or_else(|| format!("missing score column '{name}'"))?;
-        scores.column_mut(column).assign(&data.column(index));
+        scores
+            .column_mut(column)
+            .assign(&data.column(index).mapv(|z| law.standardized_score(column, z)));
     }
 
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
@@ -4403,9 +4398,13 @@ fn build_joint_marginal_slope_predict_context(
         let values = design
             .design
             .dot(&beta_slope.slice(s![cursor..cursor + width]).to_owned());
+        // The slope on the standardized score z̃_j is s_j times the slope on
+        // the raw score, so the raw slope offset enters channel j as s_j·o
+        // (gam#4331), exactly as the fit materialised it.
+        let scale = law.score_scale[surface];
         slopes
             .column_mut(surface)
-            .assign(&(values + &offset + baseline_slope));
+            .assign(&(values + &offset.mapv(|o| scale * o) + baseline_slope));
         cursor += width;
     }
     if cursor != beta_slope.len() {

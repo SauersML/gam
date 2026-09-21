@@ -165,7 +165,14 @@ fn config(latent_measure: &str) -> FitConfig {
 }
 
 struct Fitted {
+    /// The slope on each score as recorded.
     slopes: [f64; 2],
+    /// The slope on each score in the units the fit solved in,
+    /// `(z_k − location_k)/scale_k` (gam#4331); equal to `slopes` for a fit
+    /// that keeps the scores as given.
+    standardized_slopes: [f64; 2],
+    /// `(location_k, scale_k)` of each score's fit units.
+    score_units: [(f64, f64); 2],
     exit_index: Vec<f64>,
     log_likelihood: f64,
     pooled_covariance: Array2<f64>,
@@ -184,12 +191,23 @@ fn fit(data: &gam_data::EncodedDataset, formula: &str, config: &FitConfig) -> Fi
     let slope_design = fit.slope_design.design.to_dense();
     let beta = &fit.fit.blocks[2].beta;
     assert_eq!(slope_design.ncols(), 2, "one intercept column per score surface");
-    let slopes = [
+    let standardized_slopes = [
         slope_design[[0, 0]] * beta[0] + fit.baseline_slope,
         slope_design[[0, 1]] * beta[1] + fit.baseline_slope,
     ];
+    // A fit anchored on the joint law solves score k in its weighted standard
+    // units and records the map on the law (gam#4331); the slope on the score
+    // as recorded is the standardized slope over that score's scale.
+    let score_units: [(f64, f64); 2] = std::array::from_fn(|k| {
+        fit.joint_latent_law
+            .as_ref()
+            .map_or((0.0, 1.0), |law| (law.score_location[k], law.score_scale[k]))
+    });
+    let slopes = std::array::from_fn(|k| standardized_slopes[k] / score_units[k].1);
     Fitted {
         slopes,
+        standardized_slopes,
+        score_units,
         exit_index: fit.fitted_exit_index.to_vec(),
         log_likelihood: fit.fit.log_likelihood,
         pooled_covariance: fit.score_covariance.clone(),
@@ -502,7 +520,7 @@ fn joint_law_is_persisted_and_replayed_at_prediction_2929() {
                     .map(|i| {
                         let node = law.score_mean[i]
                             + (0..=i).map(|j| factor[[i, j]] * epsilon[j]).sum::<f64>();
-                        fitted.slopes[i] * node
+                        fitted.standardized_slopes[i] * node
                     })
                     .sum::<f64>()
             })
@@ -524,7 +542,15 @@ fn joint_law_is_persisted_and_replayed_at_prediction_2929() {
         }
         let alpha = 0.5 * (low + high);
         let z = fixture.scores[row];
-        let expected = alpha + fitted.slopes[0] * z[0] + fitted.slopes[1] * z[1];
+        // The law's nodes live in the fit's standardized score units, so the
+        // row reads each score through the persisted map.
+        let expected = alpha
+            + (0..k)
+                .map(|i| {
+                    let (location, scale) = fitted.score_units[i];
+                    fitted.standardized_slopes[i] * (z[i] - location) / scale
+                })
+                .sum::<f64>();
         let saved = prediction.linear_predictor[row];
         worst_gap = worst_gap.max((saved - expected).abs());
         worst_roundtrip = worst_roundtrip.max((saved - replayed.linear_predictor[row]).abs());

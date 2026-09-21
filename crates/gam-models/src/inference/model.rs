@@ -2091,6 +2091,25 @@ fn validate_survival_marginal_slope_replay_state(
                 ),
             });
         }
+        // gam#4331: the law holds each score's unit map; the scalar map the
+        // single-score readers see is score 0's, so the two must be one map.
+        let first = payload.latent_z_normalization.as_ref().ok_or_else(|| {
+            FittedModelError::MissingField {
+                reason: format!(
+                    "survival marginal-slope saved {fit_label} is missing its latent-z normalization"
+                ),
+            }
+        })?;
+        if first.mean != law.score_location[0] || first.sd != law.score_scale[0] {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "survival marginal-slope saved {fit_label} latent-z normalization \
+                     (mean {}, sd {}) is not its joint latent law's score-0 unit map \
+                     (location {}, scale {})",
+                    first.mean, first.sd, law.score_location[0], law.score_scale[0]
+                ),
+            });
+        }
     } else if score_covariance.len() != 1
         || score_covariance[0].len() != 1
         || !score_covariance[0][0].is_finite()

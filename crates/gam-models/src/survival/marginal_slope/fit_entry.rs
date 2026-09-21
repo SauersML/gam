@@ -229,6 +229,40 @@ fn slope_hint_across_score_axes(
     }
 }
 
+/// The converged slope coefficients of a closed form, which reads every score as
+/// given, carried onto a re-solve that reads score `j` on its standard units
+/// `(z_j − m_j)/s_j` (gam#4331). A per-score channel's slope on the standardised
+/// score is `s_j` times its slope on the score as given, so the raw coefficients
+/// of channel `j` (in the identity coordinates the layout is materialised in)
+/// scale by their own `s_j`; a shift is absorbed by the row intercept. A shared
+/// channel over several scores reads one slope on the drive, which a different
+/// factor per score cannot carry, so it starts afresh.
+fn slope_hint_onto_score_units(
+    topology: &SlopeTopology,
+    score_units: &[(f64, f64)],
+    beta: &Array1<f64>,
+) -> Option<Array1<f64>> {
+    match topology {
+        SlopeTopology::Shared if score_units.len() == 1 => {
+            slope_hint_across_score_axes(Some((0.0, 1.0)), Some(score_units[0]), beta)
+        }
+        SlopeTopology::Shared => None,
+        SlopeTopology::PerScore { raw_ranges } => {
+            let covers = raw_ranges.len() == score_units.len()
+                && raw_ranges.last().is_some_and(|range| range.end == beta.len());
+            covers.then(|| {
+                let mut carried = beta.clone();
+                for (range, &(_, sd)) in raw_ranges.iter().zip(score_units) {
+                    carried
+                        .slice_mut(ndarray::s![range.clone()])
+                        .mapv_inplace(|coefficient| coefficient * sd);
+                }
+                carried
+            })
+        }
+    }
+}
+
 /// The fit itself, on `compression_design` for a declared law with many atoms
 /// (gam#2928). Returns the anchors of the converged fit whose certified error
 /// missed its target, which the caller refines at.
@@ -266,7 +300,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         spec.age_entry
             .mapv(|entry| entry <= crate::survival::base::ENTRY_AT_ORIGIN_THRESHOLD),
     );
-    let (z_standardized, z_normalization) = standardize_latent_z_matrix_with_policy(
+    let (z_standardized, policy_normalizations) = standardize_latent_z_matrix_with_policy(
         &spec.z,
         &spec.weights,
         "survival-marginal-slope",
@@ -593,58 +627,90 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // gam#3477: on a finite law `{u_k, w_k}` the anchor `Σ_k w_k Φ(a + b·u_k) =
     // Φ(q)` with `η = q·c(g) + g·z` is unchanged under `z → (z − m)/s`,
     // `u_k → (u_k − m)/s`, `g → g·s` (the row intercept absorbs the shift), so the
-    // score's units are a coordinate choice there, and a single-score fit on an
-    // uncalibrated finite law solves in the score's weighted standard units,
-    // whatever units it was recorded in (as gam#3231 does for the Bernoulli
-    // family). The Gaussian closed form states the score is `N(0, 1)` as given
-    // and a calibrated law reads the scale-free `ζ` axis, so both keep the
-    // score's own axis. A K ≥ 2 fit keeps its scores as given: the saved contract
-    // records one normalisation, not one per score.
-    let standard_units = if spec.z.ncols() == 1 {
-        let units = crate::bms::weighted_location_scale(
-            &spec.z.column(0).to_owned(),
-            &spec.weights,
-            "survival marginal-slope",
-        )
+    // score's units are a coordinate choice there, and a fit on an uncalibrated
+    // finite law solves in the score's weighted standard units, whatever units it
+    // was recorded in (as gam#3231 does for the Bernoulli family). The Gaussian
+    // closed form states the score is `N(0, 1)` as given and a calibrated law
+    // reads the scale-free `ζ` axis, so both keep the score's own axis.
+    //
+    // gam#4331: with `K ≥ 2` scores the anchor reads the drive
+    // `Σ_j g_j z_j = Σ_j (g_j s_j)·(z_j − m_j)/s_j + Σ_j g_j m_j` on the joint law of
+    // the score vector, the empirical joint law of all K columns, so each
+    // coordinate's units are a coordinate choice on its own: every uncalibrated
+    // coordinate of a fit that anchors on the joint law solves in its own weighted
+    // standard units — even one whose own gate kept the Gaussian label, since the
+    // joint law replaces the per-score labels — and the persisted law records the
+    // K maps. A `K ≥ 2` closed form keeps every score as given.
+    let score_count = spec.z.ncols();
+    let score_units = (0..score_count)
+        .map(|col| {
+            crate::bms::weighted_location_scale(
+                &spec.z.column(col).to_owned(),
+                &spec.weights,
+                "survival marginal-slope",
+            )
+            .map(|units| (units.mean, units.sd))
+        })
+        .collect::<Result<Vec<(f64, f64)>, String>>()
         .map_err(FitFailure::input)?;
-        Some((units.mean, units.sd))
-    } else {
-        None
-    };
-    let fit_units = match standard_units {
-        Some(units) => {
-            if let Some(candidates) = latent_calibration.moving_law.as_mut() {
-                candidates.set_standard_units(units.0, units.1);
-            }
+    let joint_law_requested = score_count >= 2
+        && latent_calibration
+            .per_score_measure
+            .iter()
+            .any(|measure| !matches!(measure, crate::bms::LatentMeasureKind::StandardNormal));
+    let mut fit_units = vec![(0.0, 1.0); score_count];
+    if score_count == 1 || joint_law_requested {
+        if score_count == 1
+            && let Some(candidates) = latent_calibration.moving_law.as_mut()
+        {
+            candidates.set_standard_units(score_units[0].0, score_units[0].1);
+        }
+        for col in 0..score_count {
             let measure = std::mem::replace(
-                &mut latent_calibration.per_score_measure[0],
+                &mut latent_calibration.per_score_measure[col],
                 crate::bms::LatentMeasureKind::StandardNormal,
             );
-            let (measure, fit_units) = crate::bms::finite_law_in_standard_units(
+            let (measure, law_units) = crate::bms::finite_law_in_standard_units(
                 measure,
-                &latent_calibration.per_score[0],
-                units,
+                &latent_calibration.per_score[col],
+                score_units[col],
             )
             .map_err(FitFailure::invariant)?;
-            latent_calibration.per_score_measure[0] = measure;
-            fit_units
+            latent_calibration.per_score_measure[col] = measure;
+            let uncalibrated = matches!(
+                latent_calibration.per_score[col],
+                crate::bms::LatentMeasureCalibration::None
+            );
+            fit_units[col] = if joint_law_requested && uncalibrated {
+                score_units[col]
+            } else {
+                law_units
+            };
         }
-        None => (0.0, 1.0),
-    };
-    if fit_units != (0.0, 1.0) {
-        spec.z
-            .column_mut(0)
-            .mapv_inplace(|score| (score - fit_units.0) / fit_units.1);
     }
-    // The fit's score is `(z − m)/s` in the policy's units, so the saved map
-    // composes the policy's normalisation with it.
-    let z_normalization = LatentZNormalization {
-        mean: z_normalization.mean + z_normalization.sd * fit_units.0,
-        sd: z_normalization.sd * fit_units.1,
-    };
-    // The slope offset is a slope on the score as given; on the fit's score
-    // `(z − mean)/sd` the same slope is `sd` times it (prediction applies the
-    // identical factor).
+    for (col, &units) in fit_units.iter().enumerate() {
+        if units != (0.0, 1.0) {
+            spec.z
+                .column_mut(col)
+                .mapv_inplace(|score| (score - units.0) / units.1);
+        }
+    }
+    // Score `j` in the fit is `(z_j − m_j)/s_j` in the policy's units, so each
+    // saved map composes the policy's normalisation of that score with it.
+    let score_maps: Vec<LatentZNormalization> = policy_normalizations
+        .iter()
+        .zip(fit_units.iter())
+        .map(|(policy, &(mean, sd))| LatentZNormalization {
+            mean: policy.mean + policy.sd * mean,
+            sd: policy.sd * sd,
+        })
+        .collect();
+    let z_normalization = score_maps[0];
+    // The slope offset is a slope on each score as given; on the fit's score
+    // `(z_j − m_j)/s_j` the same slope is `s_j` times it (prediction applies the
+    // identical factor). The shared channel and the single-score consumers read
+    // score 0's factor; per-score channels read their own below.
+    let raw_slope_offset = spec.slope_offset.clone();
     spec.slope_offset *= z_normalization.sd;
     // gam#2766: `Σ` in this family's defining identity is `Var(z | a)`, so the
     // pooled matrix above is only the right object when that conditional
@@ -692,6 +758,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     .conditioning
                     .as_ref()
                     .map(|design| design.view()),
+                &score_maps,
                 DEFAULT_JOINT_LATENT_NODES,
             )
             .map_err(FitFailure::unclassified)?;
@@ -748,6 +815,17 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         baseline_started.elapsed().as_secs_f64(),
     );
     let common_slope_offset = &spec.slope_offset + baseline_slope;
+    // gam#4331: per-score channel `j` carries the raw slope offset in score `j`'s
+    // own fit units, `s_j·o + b₀`.
+    let per_score_slope_offsets = slope_topology.is_per_score().then(|| {
+        let mut offsets = Array2::<f64>::zeros((n, score_count));
+        for (col, map) in score_maps.iter().enumerate() {
+            offsets
+                .column_mut(col)
+                .assign(&raw_slope_offset.mapv(|offset| map.sd * offset + baseline_slope));
+        }
+        offsets
+    });
     if let Some(surfaces) = slope_surface_designs.as_ref() {
         // gam#2938: the offset every slope surface carries is now complete. Where it
         // lies in each surface's span nothing in the likelihood identifies σ, so the
@@ -1450,8 +1528,14 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         };
         let (slope_design, slope_follow_up) = tensorize_slope(slope_design)?;
         let slope_layout = attach_slope_follow_up(
-            slope_topology
-                .materialize_identity(slope_design.design.clone(), &common_slope_offset)?,
+            match per_score_slope_offsets.as_ref() {
+                Some(offsets) => slope_topology.materialize_identity_with_channel_offsets(
+                    slope_design.design.clone(),
+                    offsets.clone(),
+                )?,
+                None => slope_topology
+                    .materialize_identity(slope_design.design.clone(), &common_slope_offset)?,
+            },
             slope_follow_up.as_ref(),
         )?;
         slope_layout.validate_for(spec.z.ncols())?;
@@ -1499,8 +1583,14 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         let (owned_slope_design, slope_follow_up) = tensorize_slope(slope_design)?;
         let slope_design = &owned_slope_design;
         let block_slope_layout = attach_slope_follow_up(
-            slope_topology
-                .materialize_identity(slope_design.design.clone(), &common_slope_offset)?,
+            match per_score_slope_offsets.as_ref() {
+                Some(offsets) => slope_topology.materialize_identity_with_channel_offsets(
+                    slope_design.design.clone(),
+                    offsets.clone(),
+                )?,
+                None => slope_topology
+                    .materialize_identity(slope_design.design.clone(), &common_slope_offset)?,
+            },
             slope_follow_up.as_ref(),
         )?;
         block_slope_layout.validate_for(spec.z.ncols())?;
@@ -2530,7 +2620,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     .map_err(FitFailure::invariant)?;
                 // The declared atoms are on the score as given, where the fit's
                 // slope on its standard-units score `(z − m)/s` is `1/s` times it.
-                let observed_slope = probit_scale * slope.exit / fit_units.1;
+                let observed_slope = probit_scale * slope.exit / fit_units[0].1;
                 anchors.push((q.q0, observed_slope));
                 anchors.push((q.q1, observed_slope));
             }
@@ -2646,6 +2736,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     .conditioning
                     .as_ref()
                     .map(|design| design.view()),
+                &score_maps,
                 DEFAULT_JOINT_LATENT_NODES,
             )
             .map_err(FitFailure::unclassified)?;
@@ -2757,14 +2848,14 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                             adequacy: adequacy.clone(),
                             residual: certificate,
                         },
-                        // The closed form reads the score as given; the finite
-                        // law is solved in its standard units.
+                        // The closed form reads every score as given; the finite
+                        // law is solved in each score's standard units.
                         hints: ThetaHints {
                             time_beta: Some(block_states[0].beta.clone()),
                             marginal_beta: Some(block_states[1].beta.clone()),
-                            slope_beta: slope_hint_across_score_axes(
-                                Some((0.0, 1.0)),
-                                Some(standard_units.unwrap_or((0.0, 1.0))),
+                            slope_beta: slope_hint_onto_score_units(
+                                &slope_topology,
+                                &score_units,
                                 &block_states[2].beta,
                             ),
                             score_warp_beta: None,
