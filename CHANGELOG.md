@@ -53,6 +53,29 @@
   **Behavior change:** a fit whose stacked design will not densify now fails the audit
   instead of returning an identifiability verdict computed from the wrong span. Nothing
   changes when the densify succeeds.
+- **An atlas nerve edge is decided by a calibrated transfer test, not a fixed epsilon** (gam#3921).
+  An edge between two co-firing 2-D charts claims that chart B's codes are a conformal
+  linear image of chart A's, and that claim was decided by an orthogonality residual
+  against a fixed `sqrt(d) * f32::EPSILON`. That threshold has no sampling model behind
+  it, so it failed on any real noise and rejected genuine overlaps, while also refusing
+  an exactly scaled rotation such as `A = 2I`, which is not a chart inconsistency at all.
+  The transfer `A = (X'X)^-1 X'Y` is now split in the orthogonal basis of 2x2 matrices,
+  `A = aI + bJ + pF + qH`, where `aI + bJ` spans the scaled rotations and `pF + qH` the
+  scaled reflections, so a scaled rotation is `(p,q) = 0`, a scaled reflection is
+  `(a,b) = 0`, and the scale is left free. `vec(A)` carries the HC2 sandwich plus the f32
+  quantization variance `ulp^2/12` of each code, which is the resolution the input
+  actually has; that term is negligible once there is sampling noise, costs at most a
+  factor of two in variance on exact data, and stops an identity transfer producing a
+  zero-variance statistic. The per-edge level is reported as `transfer_gate_level` and
+  each tested pair's p-values as `transfer_gates`.
+  **Behavior change, and it changes a Python contract.** Nerve edges move in both
+  directions: noisy real overlaps are admitted where the epsilon rejected them, and
+  scaled rotations and reflections are admitted rather than refused.
+  `atlas_nerve_diagram` no longer requires `observations` and `familywise_alpha` to be
+  given together; `familywise_alpha` alone now gates the edges, `observations` additionally
+  requires it, and without `familywise_alpha` the gates report their p-values but no edge
+  is certified at all, where the call used to return the pure combinatorial nerve. The
+  result gains `transfer_gate_level` and `transfer_gates`.
 - **Skovgaard `r*` uses the sample-space `q_hat` and the full nuisance determinant form** (gam#3535).
   Two things were wrong in the assembly. In the scalar case it computed
   `u = (theta_hat - theta_0) * i_hat / sqrt(j_hat)`, which is the linear surrogate for
