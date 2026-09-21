@@ -46,6 +46,13 @@
   the #2814 Gill–Murray descent step. The PIRLS device route and its gam-solve
   wrapper are removed; the direction is always taken on `descent_curvature(H)` under
   the one certificate.
+- **Survival I-spline time-block penalty: derived PSD band** (#3288).
+  The PSD guard on the assembled time-block penalty `Lᵀ S_B[1:,1:] L` used
+  `100·p·ε·max(|λ|, 1)`. It now reads its band from the assembly: the double
+  suffix sum's error bound, `γ_{2p+1}·‖Σ|S_B|‖_F` on the kept block, plus the
+  eigensolver's backward error. The old cut-off had an absolute floor of 1, so it
+  did not scale with the penalty. An eigendecomposition failure is now reported
+  instead of silently skipping the check.
 
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from

@@ -2027,6 +2027,7 @@ pub fn build_survival_time_basis(
             // there is no coefficient ridge in the objective (#2670), so a null
             // direction the data does not identify is refused, not floored.
             let mut penalties = Vec::<Array2<f64>>::new();
+            let mut abs_suffix_sums = Vec::<Array2<f64>>::new();
             for active_penalty in &penalty_basis.active_penalties {
                 let s_mat = &active_penalty.matrix;
                 if s_mat.nrows() != p_time_full + 1 || s_mat.ncols() != p_time_full + 1 {
@@ -2100,6 +2101,20 @@ pub fn build_survival_time_basis(
                         s_full_congruent[[i, j]] = v;
                     }
                 }
+                // The same double suffix sum of `|S_B[1:,1:]|`: the entrywise
+                // majorant the PSD check below reads its assembly band from.
+                let mut abs_suffix = s_full.mapv(f64::abs);
+                for i in 0..p_time_full {
+                    for j in (0..p_time_full.saturating_sub(1)).rev() {
+                        abs_suffix[[i, j]] += abs_suffix[[i, j + 1]];
+                    }
+                }
+                for i in (0..p_time_full.saturating_sub(1)).rev() {
+                    for j in 0..p_time_full {
+                        abs_suffix[[i, j]] += abs_suffix[[i + 1, j]];
+                    }
+                }
+                abs_suffix_sums.push(abs_suffix);
                 // Principal submatrix on the retained (shape-varying) columns.
                 let mut local = Array2::<f64>::zeros((p_time, p_time));
                 for (i_new, &i_old) in keep_cols.iter().enumerate() {
@@ -2119,34 +2134,47 @@ pub fn build_survival_time_basis(
             // regressed to the increment-space / wrong-ordering form that made the
             // penalized survival NLL unbounded below (the #979 divergence). Verify
             // it here, at construction, so the defect can never silently reach the
-            // inner solver again. The tolerance is the same relative scale the
-            // nullspace detection below uses; a numerically tiny negative (round-off
-            // on the genuine 1-D null direction) is allowed, a structural one is not.
+            // inner solver again.
+            //
+            // The band is derived, not chosen (#3288). An entry of `S_I` is
+            // `Σ_{k≥i} Σ_{l≥j} S_B[k,l]`, two running sums of depth at most
+            // `p_time_full` each, then a symmetrizing average, so it errs by at most
+            // `γ_{2·p_time_full+1}·Σ_{k≥i, l≥j} |S_B[k,l]|`. That error matrix has
+            // spectral norm at most its Frobenius norm. The eigensolver then adds
+            // its own backward error `p·ε·‖S‖₂`
+            // (`symmetric_spectrum_rounding_band`). A negative eigenvalue
+            // inside the sum is roundoff on the genuine null direction. One
+            // outside it is the structural indefiniteness of the wrong ordering.
             for (idx, s_mat) in penalties.iter().enumerate() {
                 let p = s_mat.nrows();
                 if p == 0 {
                     continue;
                 }
-                if let Ok((evals, _)) =
-                    gam_linalg::faer_ndarray::FaerEigh::eigh(s_mat, faer::Side::Lower)
-                {
-                    let evals_slice: &[f64] = evals.as_slice().ok_or_else(|| {
-                        "internal error: ispline penalty eigenvalues not contiguous".to_string()
+                let (evals, _) = gam_linalg::faer_ndarray::FaerEigh::eigh(s_mat, faer::Side::Lower)
+                    .map_err(|e| {
+                        format!("ispline time-block penalty {idx} eigendecomposition failed: {e}")
                     })?;
-                    let max_ev = evals_slice
-                        .iter()
-                        .copied()
-                        .fold(0.0_f64, |a, b| a.max(b.abs()))
-                        .max(1.0);
-                    let min_ev = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
-                    let neg_tol = -100.0 * (p as f64) * f64::EPSILON * max_ev;
-                    if min_ev < neg_tol {
-                        return Err(format!(
-                            "internal error (gam#979): assembled ispline time-block penalty {idx} is \
-                             indefinite (min eigenvalue {min_ev:.3e} < tol {neg_tol:.3e}, max |eig| \
-                             {max_ev:.3e}); the value-space congruence Lᵀ S_B[1:,1:] L must be PSD"
-                        ));
-                    }
+                let evals_slice: &[f64] = evals.as_slice().ok_or_else(|| {
+                    "internal error: ispline penalty eigenvalues not contiguous".to_string()
+                })?;
+                let abs_sums = &abs_suffix_sums[idx];
+                let frobenius = keep_cols
+                    .iter()
+                    .flat_map(|&i| keep_cols.iter().map(move |&j| abs_sums[[i, j]]))
+                    .map(|v| v * v)
+                    .sum::<f64>()
+                    .sqrt();
+                let assembly_band =
+                    gam_linalg::roundoff::accumulation_growth(2 * p_time_full + 1) * frobenius;
+                let band =
+                    gam_linalg::roundoff::resolved_eigenvalue_band(evals_slice, assembly_band);
+                let min_ev = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
+                if min_ev < -band {
+                    return Err(format!(
+                        "internal error (gam#979): assembled ispline time-block penalty {idx} is \
+                         indefinite (min eigenvalue {min_ev:.3e} below the rounding band \
+                         -{band:.3e}); the value-space congruence Lᵀ S_B[1:,1:] L must be PSD"
+                    ));
                 }
             }
 
