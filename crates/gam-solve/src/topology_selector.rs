@@ -2446,9 +2446,11 @@ mod tests {
         .expect("typed lifecycle");
         assert_eq!(result.winner_index, Some(0));
         assert_eq!(result.ranked[0].name, "smaller_raw");
-        assert!((result.ranked[0].score - 3.0 / 20.0).abs() < 1.0e-12);
+        // One division of the raw cost by the shared row count: the same operation on the
+        // same operands, so the score is this quotient to the bit.
+        assert_eq!(result.ranked[0].score, 3.0 / 20.0);
         assert_eq!(result.ranked[1].name, "larger_raw");
-        assert!((result.ranked[1].score - 5.0 / 20.0).abs() < 1.0e-12);
+        assert_eq!(result.ranked[1].score, 5.0 / 20.0);
     }
 
     /// #4556: an evidence cost is a negative log density, fixed only up to an
