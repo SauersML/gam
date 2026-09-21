@@ -8,16 +8,20 @@
 //! pointwise CI for the fitted linear predictor `η̂(x) = f̂(x)` as
 //! `η̂(x) ± z·sqrt(xᵀ Vb x)`, and measure the empirical fraction of replicates
 //! whose interval contains the true `f(x)`, pooled across the evaluation grid.
-//! A correct SE makes that empirical coverage land near 0.95. We assert the
-//! pooled coverage is within an absolute tolerance of nominal — an OBJECTIVE
-//! statement about gam alone (an SE that is too small under-covers; one that is
-//! too large over-covers; either is a real calibration bug). This is Wood's
+//! A correct SE makes that empirical coverage land near 0.95. Each replicate
+//! yields one coverage fraction `c_r`; the pooled estimate is `mean_r(c_r)` with
+//! Monte-Carlo SE `sd_r(c_r)/√reps`, and we assert, two-sided, that
+//! `|mean_r(c_r) − 0.95| ≤ Φ⁻¹(1 − α/2)·se_MC` at the shared calibration
+//! false-positive rate α — an OBJECTIVE statement about gam alone (an SE that is
+//! too small under-covers; one that is too large over-covers; either is a real
+//! calibration bug). This is Wood's
 //! "across-the-function" Bayesian coverage property (Nychka 1988; Wood 2006,
 //! §4.8), the actual quality claim behind a confidence band.
 //!
 //! BASELINE TO MATCH-OR-BEAT: mgcv fits the identical replicates and forms its
 //! own `predict(se.fit=TRUE)` intervals; we require gam's coverage error
-//! `|cov − 0.95|` to be no worse than mgcv's by more than a small slack. mgcv is
+//! `|cov − 0.95|` to be no worse than mgcv's beyond the Monte-Carlo error of the
+//! paired per-replicate coverage difference on the same data. mgcv is
 //! NOT ground truth here — it is the established baseline on the same objective
 //! calibration metric. We additionally print the rel-L2 of the per-rep SE
 //! vectors for context, but it is NOT a pass criterion.
@@ -30,6 +34,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
+use gam::test_support::calibration::{audit_replicate_coverage, replicate_mean_and_standard_error};
 use gam::test_support::reference::{Column, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
@@ -99,10 +104,12 @@ fn gam_pointwise_ci_covers_truth_and_matches_mgcv_on_gaussian_smooth() {
     // Simulation replicates. The cost is dominated by `reps` full gam fits plus
     // `reps` mgcv REML fits; the sibling coverage tests run 30–50 reps and pass
     // in ~125 s, while this variant's original 240 reps overran the 360 s
-    // reference-quality timeout. 60 reps pools 60×200 = 12 000 interval checks,
-    // whose Monte-Carlo SE on a coverage proportion is ≈ sqrt(0.95·0.05/12000)
-    // ≈ 0.002 — an order of magnitude below the ±0.04 calibration band asserted
-    // below, so the coverage claim keeps its statistical power unchanged.
+    // reference-quality timeout. The 200 interval checks inside one replicate
+    // share that replicate's fitted curve and are strongly correlated, so they
+    // are NOT 12 000 independent Bernoulli trials: the sampling unit is the
+    // replicate. The Monte-Carlo SE of the pooled coverage is therefore
+    // `sd_r(c_r)/√60`, estimated from the replicates themselves and used
+    // directly as the scale of the calibration gate below.
     let reps: usize = 60; // simulation replicates
     let sigma: f64 = 0.30; // noise SD on the response
     let z: f64 = 1.959_963_984_540_054; // 97.5% standard-normal quantile
@@ -136,7 +143,7 @@ fn gam_pointwise_ci_covers_truth_and_matches_mgcv_on_gaussian_smooth() {
     // The 60 replicate fits are independent (only `y` changes); each produces a
     // per-rep `(hit_count, se_vector)`. Fanning them across the rayon pool and
     // collecting in replicate order is bit-identical to the serial version —
-    // `gam_hit`/`gam_total` are exact integer sums and `gam_se_by_rep` keeps its
+    // the per-replicate hit counts and `gam_se_by_rep` keep their replicate
     // order — so no asserted quantity changes. The fits dominate wall-clock, so
     // this is the harness-side speedup (#1082).
     let per_rep: Vec<(usize, Vec<f64>)> = y_reps
@@ -212,16 +219,16 @@ fn gam_pointwise_ci_covers_truth_and_matches_mgcv_on_gaussian_smooth() {
         })
         .collect();
 
-    let mut gam_hit = 0usize;
-    let mut gam_total = 0usize;
+    // Per-replicate coverage fractions c_r = hits_r / n. Every replicate checks
+    // the same n points, so mean_r(c_r) equals the pooled hit fraction.
+    let mut gam_cov_by_rep: Vec<f64> = Vec::with_capacity(reps);
     let mut gam_se_by_rep: Vec<Vec<f64>> = Vec::with_capacity(reps);
     for (hit, se) in per_rep {
-        gam_hit += hit;
-        gam_total += n;
+        gam_cov_by_rep.push(hit as f64 / n as f64);
         gam_se_by_rep.push(se);
     }
-
-    let gam_coverage = gam_hit as f64 / gam_total as f64;
+    let gam_verdict = audit_replicate_coverage(&gam_cov_by_rep, 0.95);
+    let gam_coverage = gam_verdict.mean;
 
     // ---- mgcv: same replicates, its own 95% pointwise CI, its own coverage.
     // R receives x, the true f, and one y column per replicate; it fits
@@ -241,8 +248,7 @@ fn gam_pointwise_ci_covers_truth_and_matches_mgcv_on_gaussian_smooth() {
             suppressPackageStartupMessages(library(mgcv))
             reps <- {reps}
             z <- {z}
-            hit <- 0
-            tot <- 0
+            cov_by_rep <- numeric(reps)
             se_flat <- numeric(0)
             for (k in 0:(reps - 1)) {{
                 yk <- df[[paste0("y", k)]]
@@ -252,17 +258,30 @@ fn gam_pointwise_ci_covers_truth_and_matches_mgcv_on_gaussian_smooth() {
                 lo <- pr$fit - z * pr$se.fit
                 hi <- pr$fit + z * pr$se.fit
                 inside <- (df$ftrue >= lo) & (df$ftrue <= hi)
-                hit <- hit + sum(inside)
-                tot <- tot + length(inside)
+                cov_by_rep[k + 1] <- mean(inside)
                 se_flat <- c(se_flat, as.numeric(pr$se.fit))
             }}
-            emit("coverage", hit / tot)
+            emit("cov_by_rep", cov_by_rep)
             emit("se_flat", se_flat)
             "#
         ),
     );
-    let mgcv_coverage = r.scalar("coverage");
+    let mgcv_cov_by_rep = r.vector("cov_by_rep");
+    assert_eq!(
+        mgcv_cov_by_rep.len(),
+        reps,
+        "mgcv must report one coverage fraction per replicate"
+    );
     let mgcv_se_flat = r.vector("se_flat");
+    let mgcv_coverage = mgcv_cov_by_rep.iter().sum::<f64>() / reps as f64;
+    // Paired per-replicate difference d_r = c_r(gam) − c_r(mgcv): both engines
+    // fit the identical y, so the pairing cancels the shared replicate noise.
+    let diff_by_rep: Vec<f64> = gam_cov_by_rep
+        .iter()
+        .zip(mgcv_cov_by_rep.iter())
+        .map(|(g, m)| g - m)
+        .collect();
+    let (_, diff_se_mc) = replicate_mean_and_standard_error(&diff_by_rep);
 
     // rel-L2 of the pooled SE vectors (context only).
     let gam_se_flat: Vec<f64> = gam_se_by_rep.into_iter().flatten().collect();
@@ -276,32 +295,44 @@ fn gam_pointwise_ci_covers_truth_and_matches_mgcv_on_gaussian_smooth() {
     let gam_err = (gam_coverage - 0.95).abs();
     let mgcv_err = (mgcv_coverage - 0.95).abs();
 
+    let gam_se_mc = gam_verdict.se_mc;
+    let z_crit = gam_verdict.z_crit;
+    let z_eff = gam_verdict.z_eff;
     eprintln!(
         "gaussian s(x) CI coverage: n={n} reps={reps} sigma={sigma} \
-         gam_cov={gam_coverage:.4} mgcv_cov={mgcv_coverage:.4} \
-         gam_err={gam_err:.4} mgcv_err={mgcv_err:.4} se_rel_l2={se_rel:.5} (context)"
+         gam_cov={gam_coverage:.4} se_mc={gam_se_mc:.4} z_eff={z_eff:.4} (nominal z={z:.4}) \
+         mgcv_cov={mgcv_coverage:.4} gam_err={gam_err:.4} mgcv_err={mgcv_err:.4} \
+         paired_diff_se_mc={diff_se_mc:.4} z_crit={z_crit:.4} se_rel_l2={se_rel:.5} (context)"
     );
 
     // ---- PRIMARY objective assertion: gam's pointwise CI is calibrated -----
-    // Across-the-function Bayesian coverage should land near nominal. The band
-    // is ±0.04 around 0.95 (i.e. empirical coverage in [0.91, 0.99]): wide
-    // enough to absorb Monte-Carlo error at 60×200 = 12 000 interval checks (MC
-    // SE ≈ 0.002, see the `reps` comment) and the mild representation bias of the
-    // basis, tight enough that an SE that is grossly mis-scaled (variance off by a
-    // constant factor) breaks it.
+    // Across-the-function Bayesian coverage is a statement about exactly this
+    // average over design points and replicates, so it must equal nominal up to
+    // Monte-Carlo error: |mean_r(c_r) − 0.95| ≤ Φ⁻¹(1 − α/2)·sd_r(c_r)/√reps.
+    // Two-sided: over-coverage (SE too large) fails exactly like under-coverage.
     assert!(
-        gam_coverage >= 0.91 && gam_coverage <= 0.99,
-        "gam's nominal-95% pointwise CI is mis-calibrated: empirical coverage \
-         {gam_coverage:.4} (target 0.95 ± 0.04)"
+        gam_verdict.passed,
+        "gam's nominal-95% pointwise CI is mis-calibrated: mean replicate coverage \
+         {gam_coverage:.4} vs 0.95 exceeds {z_crit:.3}·se_MC = {:.4} (se_MC={gam_se_mc:.4}); \
+         implied z_eff={z_eff:.4} vs nominal {z:.4}, so the SEs are {}",
+        z_crit * gam_se_mc,
+        if gam_coverage < 0.95 {
+            "too small (under-covering)"
+        } else {
+            "too large (over-covering)"
+        }
     );
 
     // ---- SECONDARY: match-or-beat mgcv on calibration ----------------------
-    // gam's distance-from-nominal must not exceed mgcv's by more than a small
-    // slack (Monte-Carlo wiggle on equal data).
+    // By the triangle inequality gam_err − mgcv_err ≤ |mean_r(d_r)|, and under
+    // equal expected coverage |mean_r(d_r)| ≤ Φ⁻¹(1 − α/2)·sd_r(d_r)/√reps with
+    // probability 1 − α. So gam's distance-from-nominal may exceed mgcv's only by
+    // the Monte-Carlo error of the paired difference on the identical data.
     assert!(
-        gam_err <= mgcv_err + 0.02,
+        gam_err <= mgcv_err + z_crit * diff_se_mc,
         "gam's CI coverage error {gam_err:.4} is worse than mgcv's {mgcv_err:.4} \
-         by more than the 0.02 slack (gam_cov={gam_coverage:.4}, \
-         mgcv_cov={mgcv_coverage:.4})"
+         by more than {z_crit:.3}·se_MC(paired diff) = {:.4} (gam_cov={gam_coverage:.4}, \
+         mgcv_cov={mgcv_coverage:.4})",
+        z_crit * diff_se_mc
     );
 }

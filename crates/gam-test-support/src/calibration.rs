@@ -384,6 +384,79 @@ pub fn audit_coverage(hits: usize, replications: usize, nominal: f64) -> Coverag
     }
 }
 
+/// Sample mean of independent replicate statistics and the Monte-Carlo
+/// standard error of that mean, `sd(v)/√R` with the unbiased `R − 1` variance.
+///
+/// The replicate is the sampling unit: quantities pooled *within* a replicate
+/// (e.g. interval checks along one fitted curve) share that replicate's fit and
+/// are correlated, so only the between-replicate spread measures the noise of
+/// the pooled mean.
+pub fn replicate_mean_and_standard_error(values: &[f64]) -> (f64, f64) {
+    assert!(
+        values.len() >= 2,
+        "a Monte-Carlo standard error needs at least two replicates"
+    );
+    let r = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / r;
+    let var = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (r - 1.0);
+    (mean, (var / r).sqrt())
+}
+
+/// Two-sided replicate-level verdict on a pooled coverage rate (#4486).
+#[derive(Clone, Debug)]
+pub struct ReplicateCoverageVerdict {
+    /// Nominal coverage `c` the intervals were built at.
+    pub nominal: f64,
+    /// Independent replicates pooled.
+    pub replicates: usize,
+    /// `mean_r(c_r)`: the across-the-function coverage estimate.
+    pub mean: f64,
+    /// `sd_r(c_r)/√R`: Monte-Carlo standard error of `mean`.
+    pub se_mc: f64,
+    /// `Φ⁻¹(1 − α/2)` at [`COVERAGE_FALSE_POSITIVE_RATE`].
+    pub z_crit: f64,
+    /// Half-width multiplier a z-interval would need to reach `mean` coverage,
+    /// `Φ⁻¹((1 + mean)/2)`; compare with `Φ⁻¹((1 + nominal)/2)` to read the
+    /// size and direction of any SE mis-scaling. `+∞` when every check covered.
+    pub z_eff: f64,
+    /// `|mean − nominal| ≤ z_crit·se_mc`.
+    pub passed: bool,
+}
+
+/// Audit per-replicate coverage fractions `c_r` against `nominal`, two-sided.
+///
+/// Under correct calibration `mean_r(c_r)` estimates the nominal level with
+/// standard error `sd(c_r)/√R` (CLT over independent replicates), so the
+/// acceptance region is `|mean − nominal| ≤ Φ⁻¹(1 − α/2)·se_MC` at the shared
+/// [`COVERAGE_FALSE_POSITIVE_RATE`]. Over-coverage fails exactly like
+/// under-coverage: an inflated SE is a calibration defect, not a safe margin.
+pub fn audit_replicate_coverage(per_replicate: &[f64], nominal: f64) -> ReplicateCoverageVerdict {
+    assert!(
+        nominal > 0.0 && nominal < 1.0,
+        "nominal coverage must lie in (0, 1)"
+    );
+    assert!(
+        per_replicate.iter().all(|c| (0.0..=1.0).contains(c)),
+        "per-replicate coverage fractions must lie in [0, 1]"
+    );
+    let (mean, se_mc) = replicate_mean_and_standard_error(per_replicate);
+    let z_crit = standard_normal_quantile(1.0 - COVERAGE_FALSE_POSITIVE_RATE / 2.0);
+    let z_eff = if mean >= 1.0 {
+        f64::INFINITY
+    } else {
+        standard_normal_quantile((1.0 + mean) / 2.0)
+    };
+    ReplicateCoverageVerdict {
+        nominal,
+        replicates: per_replicate.len(),
+        mean,
+        se_mc,
+        z_crit,
+        z_eff,
+        passed: (mean - nominal).abs() <= z_crit * se_mc,
+    }
+}
+
 /// An interval-emitting surface auditable by [`run_coverage`].
 ///
 /// Draws a truth from the prior, then simulates data, fits, and returns the
