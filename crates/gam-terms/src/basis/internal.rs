@@ -166,6 +166,27 @@ pub fn generate_full_knot_vector(
     Ok(Array::from_vec(knots))
 }
 
+/// The support quantile interior knots are placed on: the distinct values of
+/// `sorted` (ascending) that lie strictly between its first and last entries.
+///
+/// `generate_full_knot_vector_quantile` interpolates its knots on this set, so
+/// its knots increase strictly whenever the set is non-empty. A caller that
+/// sizes a quantile knot vector reads the set from here and never places more
+/// interior knots than it has values.
+pub fn quantile_knot_support(sorted: &[f64]) -> Vec<f64> {
+    let (Some(&minval), Some(&maxval)) = (sorted.first(), sorted.last()) else {
+        return Vec::new();
+    };
+    let mut support: Vec<f64> = Vec::with_capacity(sorted.len());
+    for &x in sorted {
+        if x <= minval || x >= maxval || support.last() == Some(&x) {
+            continue;
+        }
+        support.push(x);
+    }
+    support
+}
+
 /// Generates a clamped full knot vector with internal knots placed at empirical quantiles.
 pub(super) fn generate_full_knot_vector_quantile(
     data: ArrayView1<'_, f64>,
@@ -220,18 +241,7 @@ pub(super) fn generate_full_knot_vector_quantile(
     }
 
     if num_internal_knots > 0 {
-        let mut support = Vec::with_capacity(sorted.len());
-        let mut last: Option<f64> = None;
-        for &x in &sorted {
-            if x <= minval || x >= maxval {
-                continue;
-            }
-            if last == Some(x) {
-                continue;
-            }
-            support.push(x);
-            last = Some(x);
-        }
+        let support = quantile_knot_support(&sorted);
         if support.is_empty() {
             crate::bail_invalid_basis!(
                 "quantile knot placement requires distinct interior support between {:.6e} and {:.6e}",
@@ -708,5 +718,41 @@ mod knot_scale_invariance_tests {
                 "expected InvalidKnotVector, got {err:?} at scale {scale}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod quantile_knot_support_tests {
+    use super::*;
+    use ndarray::array;
+
+    /// #3179 item 7: the quantile support is the exact set of distinct values
+    /// strictly between the extremes, and any interior count within it places
+    /// strictly increasing interior knots on tied data.
+    #[test]
+    fn quantile_knots_increase_strictly_within_the_exact_support_3179() {
+        let data = array![3.0, 0.0, 1.0, 5.0, 1.0, 3.0, 0.0, 2.0, 1.0, 5.0, 3.0, 2.0];
+        let mut sorted = data.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        assert_eq!(quantile_knot_support(&sorted), vec![1.0, 2.0, 3.0]);
+        let degree = 2;
+        for num_internal_knots in 1..=3 {
+            let knots = generate_full_knot_vector_quantile(data.view(), num_internal_knots, degree)
+                .expect("quantile placement within the support");
+            let interior = &knots.as_slice().expect("contiguous knots")
+                [degree + 1..degree + 1 + num_internal_knots];
+            assert!(
+                interior.windows(2).all(|w| w[0] < w[1]),
+                "{num_internal_knots} interior knots must increase strictly, got {interior:?}"
+            );
+            assert!(interior.iter().all(|&k| k > 0.0 && k < 5.0));
+        }
+    }
+
+    #[test]
+    fn quantile_support_is_empty_without_interior_values_3179() {
+        assert!(quantile_knot_support(&[]).is_empty());
+        assert!(quantile_knot_support(&[4.0, 4.0, 4.0]).is_empty());
+        assert!(quantile_knot_support(&[1.0, 1.0, 2.0, 2.0]).is_empty());
     }
 }

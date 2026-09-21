@@ -71,7 +71,7 @@ pub mod radial_profile;
 
 // ---- Flat re-exports: preserve the external `basis::X` path surface ----
 
-pub use internal::generate_full_knot_vector;
+pub use internal::{generate_full_knot_vector, quantile_knot_support};
 
 pub use constant_curvature_smooth::{
     ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, ConstantCurvatureKernelPsiJets,

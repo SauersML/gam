@@ -3586,5 +3586,13 @@
     ],
     "reason": "#3925: private scalar-kernel copies (logistic/sigmoid, softplus/log1p_exp, log_add_exp, and two Abramowitz-Stegun 7.1.26 erf approximations with a hand normal CDF) duplicated gam_math::special::{logistic, softplus, logaddexp} and gam_math::probability::normal_cdf; every call site now uses the gam_math kernel.",
     "evidence": "https://github.com/SauersML/gam/issues/3925"
+  },
+  {
+    "base": "6126d8488e476cc38ac6034202a1ecff952d4df9",
+    "items": [
+      "crates/gam-models/src/survival/construction.rs:fn:quantile_knot_inference_needs_uniform_fallback"
+    ],
+    "reason": "#3179 item 7: quantile knots have one placement rule. quantile_knot_inference_needs_uniform_fallback was a private copy, nested in build_survival_time_basis, of gam-terms' generate_full_knot_vector_quantile with a 1e-12*scale tie tolerance; survival ran it to decide whether to switch to Uniform knots. data_capped_internal_knots now sizes the knot count from gam_terms::basis::quantile_knot_support, the exact support the shared builder places knots on, so the count never exceeds that support and the shared placement cannot fail. The copy and the Uniform branch it selected are deleted.",
+    "evidence": "At the base, git grep -n quantile_knot_inference_needs_uniform_fallback finds it only in crates/gam-models/src/survival/construction.rs: its nested declaration inside infer_survival_time_knots_with_degree and its one call site there. Both are deleted in this change, and no other source, test, bench, script or Python file names it. The guard reports it as public false, test_scoped false, production_occurrences 2 (the declaration and the call)."
   }
 ]
