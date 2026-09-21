@@ -2578,6 +2578,38 @@ mod tests {
         }
     }
 
+    /// #4068: past `2^53` the shape and the split coincide, `a + 1 == a`, so
+    /// neither the power series nor the continued fraction can take a first
+    /// step and only the uniform expansion resolves the tail. Reference from a
+    /// 50-digit `mpmath.gammainc(a, x, inf, regularized=True)` at the exact
+    /// binary `a` and `x`.
+    ///
+    /// The bar is counted, not chosen. The correction series is certified to
+    /// `eps` where it is used, and the shared prefactor
+    /// `e^{-a h} sqrt(a / 2 pi) / Gamma*(a)` contributes about ten roundings
+    /// (`lambda`, the three of `h = lambda - 1 - ln lambda`, `a h`, `exp`, the
+    /// two of the square root, `Gamma*`, the division). A relative error in
+    /// `a h` leaves `exp(-a h)` amplified by `a h` itself, so the bound is
+    /// `16 eps (1 + a h)`; at this row `a h` is about 2, giving roughly
+    /// `48 eps`.
+    #[test]
+    fn incomplete_gamma_resolves_a_tail_past_two_to_the_fifty_third_4068() {
+        let a = 1e16_f64;
+        let x = 1.000_000_02e16_f64;
+        assert_eq!(a + 1.0, a, "this row exists because the split collapses");
+        let expected = 0.022_750_132_488_088_87_f64;
+        let lambda = x / a;
+        let bar = 16.0 * f64::EPSILON * (1.0 + a * (lambda - 1.0 - lambda.ln()));
+        let (p, q) = regularized_incomplete_gamma_pair(a, x);
+        let rel = (q - expected).abs() / expected;
+        assert!(rel <= bar, "Q({a}, {x}) = {q:e}, expected {expected:e}: rel {rel:e} > {bar:e}");
+        assert!(
+            (p + q - 1.0).abs() <= f64::EPSILON,
+            "P + Q = {} at a = {a}",
+            p + q
+        );
+    }
+
     const TOL: f64 = 1e-12;
 
     #[test]
