@@ -2181,7 +2181,8 @@ pub(crate) fn reml_laml_evaluate(
 /// Hessian solves, with `β̂̇ = −v`), the KKT gradient by `g̈_ij = M_true β̈_ij − rhs_ij` (zero at an
 /// unconstrained mode, `−rhs_ij` when every direction is pinned), and the precision by its second
 /// total drift `M̈_ij = ∂²M|_β + D_β(∂M)[β̂̇] + D²_βM[β̂̇_i, β̂̇_j] + D_βM[β̈_ij]` — the three pieces the
-/// log-determinant's pair trace sums, here applied to `y = M⁻¹g` and the columns of `R = M⁻¹Aᵀ`.
+/// log-determinant's pair trace sums, here read only as `tr(Q·M̈_ij)` against the normalizer's
+/// drift weight `Q = F₊F₊ᵀ − F₋F₋ᵀ` on `span{y, N}`, `y = M⁻¹g` (gam#3347).
 /// Cross and `ψψ` pairs are assembled only where the family supplies their fixed-β pair objects,
 /// exactly the pairs the dense Hessian assembles. Operator-side objects carry the curvature scale.
 fn cone_normalizer_outer_hessian(
@@ -2203,7 +2204,6 @@ fn cone_normalizer_outer_hessian(
     let k = curvature_lambdas.len();
     let total = mode_responses.len();
     let y = normalizer.solved_gradient();
-    let basis = normalizer.covariance_basis();
     let mode_rhs_correction = effective_deriv.mode_response_rhs_correction();
     // The family's fixed-β pair objects, fetched across the pool as the dense Hessian fetches its
     // own; the solution memoizes them, so the log-determinant's Hessian reads these same objects.
@@ -2275,10 +2275,13 @@ fn cone_normalizer_outer_hessian(
             states.push(PairState { i, j, pair, rhs, second_response });
         }
     }
-    // `D²_βM[β̂̇_i, β̂̇_j] + D_βM[β̈_ij]` for every pair in one call where the family fuses the row
-    // walk across pairs, otherwise across the pool.
-    let corrections: Vec<Option<DriftDerivResult>> = if effective_deriv.has_corrections() {
-        let triples: Vec<(Array1<f64>, Array1<f64>, Array1<f64>)> = states
+    // gam#3347: the pair value reads `M̈_ij` only as `tr(Q·M̈_ij)`, `Q = F₊F₊ᵀ − F₋F₋ᵀ` the
+    // normalizer's drift weight. The corrections `D²_βM[β̂̇_i, β̂̇_j] + D_βM[β̈_ij]` are contracted
+    // with `F₊` and `F₋` in the family's row kernel where it has one: two passes for every pair,
+    // where applying each drift to `y` and every column of `N` walks the rows `total²·r/2` times.
+    let weight = normalizer.drift_weight().map_err(RemlLamlError::ConeNormalizer)?;
+    let triples: Vec<(Array1<f64>, Array1<f64>, Array1<f64>)> = if effective_deriv.has_corrections() {
+        states
             .iter()
             .map(|state| {
                 (
@@ -2287,7 +2290,43 @@ fn cone_normalizer_outer_hessian(
                     state.second_response.clone(),
                 )
             })
-            .collect();
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let correction_traces: Option<Vec<f64>> =
+        if effective_deriv.has_corrections() && effective_deriv.has_hessian_second_derivative_correction_traces() {
+            let traced = |factor: &Array2<f64>| -> Result<Option<Vec<f64>>, String> {
+                if factor.ncols() == 0 {
+                    return Ok(Some(vec![0.0; triples.len()]));
+                }
+                let traces = effective_deriv.hessian_second_derivative_correction_traces(factor, &triples)?;
+                match traces {
+                    Some(values) if values.len() != triples.len() => Err(format!(
+                        "constrained normalizer correction traces: {} for {} pairs",
+                        values.len(),
+                        triples.len()
+                    )),
+                    other => Ok(other),
+                }
+            };
+            match (traced(weight.positive())?, traced(weight.negative())?) {
+                (Some(positive), Some(negative)) => {
+                    Some(positive.iter().zip(negative.iter()).map(|(plus, minus)| plus - minus).collect())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+    // The corrections as drifts, where a vector of them is read: the second rotation on the
+    // dropped basis of a kept-spectrum pseudo-inverse, and the trace itself for a provider with no
+    // row kernel. One call where the family fuses the row walk across pairs, otherwise across the
+    // pool.
+    let pseudo_inverse_kernel = solution.penalty_subspace_trace.as_deref();
+    let corrections: Vec<Option<DriftDerivResult>> = if effective_deriv.has_corrections()
+        && (correction_traces.is_none() || pseudo_inverse_kernel.is_some())
+    {
         if effective_deriv.has_batched_hessian_second_derivative_corrections() {
             effective_deriv.hessian_second_derivative_corrections_result(&triples)?
         } else {
@@ -2343,7 +2382,6 @@ fn cone_normalizer_outer_hessian(
     // Where `M⁻¹` is the kernel's kept-spectrum pseudo-inverse, each pair also carries its second
     // rotation (`PenaltySubspaceTrace::pseudo_inverse_second_rotation`), read off the drifts on the
     // dropped basis in operator units and scaled like the solves (gam#2952).
-    let pseudo_inverse_kernel = solution.penalty_subspace_trace.as_deref();
     let probes = pseudo_inverse_kernel.map(|_| {
         let generator = normalizer.covariance_generator();
         let mut probes = Array2::<f64>::zeros((y.len(), 1 + generator.ncols()));
@@ -2366,9 +2404,9 @@ fn cone_normalizer_outer_hessian(
         None => Vec::new(),
     };
     let mut hessian = Array2::<f64>::zeros((total, total));
-    for (state, correction) in states.iter().zip(corrections.iter()) {
+    for (index, (state, correction)) in states.iter().zip(corrections.iter()).enumerate() {
         let (i, j) = (state.i, state.j);
-        // M̈_ij applied to x, in the operator's scaled units.
+        // The fixed-β part of M̈_ij applied to x, in the operator's scaled units.
         let fixed_beta_second_drift = |x: &Array1<f64>| -> Array1<f64> {
             match state.pair.as_ref() {
                 Some(pair) => match pair.b_operator.as_ref() {
@@ -2390,16 +2428,20 @@ fn cone_normalizer_outer_hessian(
         {
             moving_drifts.push(drift);
         }
-        if let Some(drift) = correction.as_ref() {
-            moving_drifts.push(drift);
-        }
-        let second_drift = |x: &Array1<f64>| -> Array1<f64> {
+        // Every piece of M̈_ij but the correction, applied to x.
+        let formed_second_drift = |x: &Array1<f64>| -> Array1<f64> {
             let mut out = fixed_beta_second_drift(x);
             for drift in &moving_drifts {
                 out += &drift.apply(x);
             }
-            out / scale
+            out
         };
+        let correction_trace = match (correction_traces.as_ref(), correction.as_ref()) {
+            (Some(traces), _) => traces[index],
+            (None, Some(drift)) => weight.trace(&|x: &Array1<f64>| drift.apply(x)),
+            (None, None) => 0.0,
+        };
+        let precision_rate_trace = (weight.trace(&formed_second_drift) + correction_trace) / scale;
         let gradient_rate = match &input.gradient_motion {
             ConeGradientMotion::Stationary => Array1::zeros(state.rhs.len()),
             ConeGradientMotion::OnFace(stationarity) => {
@@ -2407,20 +2449,17 @@ fn cone_normalizer_outer_hessian(
             }
             ConeGradientMotion::Pinned => -&state.rhs / scale,
         };
-        let mut precision_rate_on_basis = Array2::<f64>::zeros(basis.raw_dim());
-        for column in 0..basis.ncols() {
-            precision_rate_on_basis
-                .column_mut(column)
-                .assign(&second_drift(&basis.column(column).to_owned()));
-        }
         let (inverse_rotation_on_gradient, inverse_rotation_on_generator) =
             match (pseudo_inverse_kernel, probes.as_ref()) {
                 (Some(kernel), Some(probes)) => {
                     let mut second_on_dropped = Array2::<f64>::zeros(kernel.dropped_basis.raw_dim());
                     for column in 0..kernel.dropped_basis.ncols() {
-                        second_on_dropped.column_mut(column).assign(
-                            &(second_drift(&kernel.dropped_basis.column(column).to_owned()) * scale),
-                        );
+                        let direction = kernel.dropped_basis.column(column).to_owned();
+                        let mut value = formed_second_drift(&direction);
+                        if let Some(drift) = correction.as_ref() {
+                            value += &drift.apply(&direction);
+                        }
+                        second_on_dropped.column_mut(column).assign(&value);
                     }
                     let turned = kernel.pseudo_inverse_second_rotation(
                         &|v: &Array1<f64>| drifts[i].apply(v),
@@ -2440,8 +2479,7 @@ fn cone_normalizer_outer_hessian(
         let pair_motion = crate::constrained_posterior::ConePairMotion {
             mode_response: state.second_response.clone(),
             gradient_rate,
-            precision_rate_on_y: second_drift(y),
-            precision_rate_on_basis,
+            precision_rate_trace,
             inverse_rotation_on_gradient,
             inverse_rotation_on_generator,
         };
