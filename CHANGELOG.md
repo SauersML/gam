@@ -1,84 +1,29 @@
 ## Unreleased
 
-- **The latched #784 block correction is a continuous function of rho** (gam#3113).
-  Under a latched #784 admission the block was re-selected at every rho as the `m`
-  largest-`|gamma_r|` positive-curvature eigendirections of `H`. That set swaps members
-  wherever two `|gamma_r|` cross, so a whole direction's contribution to `Delta_b`
-  jumped in and out of the criterion and the latched per-axis quadrature orders were
-  reassigned to a direction they were never certified on. On the 21-row
-  `make_blobs(n_samples=21, random_state=0)` binomial fit `y ~ x0 + x1`, `Delta_b`
-  alternated between 4.24e-1 and 1.12e-1 across a 9e-4 step in rho and the outer BFGS
-  ended not stationary at `|g| = 4.8e-2`. The latch now records the admitted block by
-  its ranks in the ascending spectrum of `H`, and every later rho integrates the
-  eigenpairs at those ranks, which is the continuous transport of the admitted block
-  wherever the eigenvalues are simple; the eigenframe splice already refuses an
-  unresolved block. The block, its quadrature and its Hessian support latch together at
-  first admission, and the path that let a caller with a fixed block dimension latch the
-  quadrature later is gone. No retry, jitter or tolerance is added.
-  **Behavior change:** two refusals that were untyped `InvalidInput` are now typed
-  stages of `BlockQuadratureCorrectionRefused` with the locality each deserves. A
-  latched dimension with no matching ranks raises the new `LatchedBlockUnavailable` and
-  is fatal, while a latched direction whose curvature is not positive at a trial rho
-  raises `NonPositivePenalizedCurvature`, which is trial-point local, so the outer
-  search backs off instead of the fit aborting.
-- **A non-finite survival location-scale row weight is refused, not silently repaired** (gam#3650).
-  `sanitize_survival_weight_vector` rewrote non-finite dense row weights before the
-  survival-LS Hessian cross-products, the `DiagonalOnly` Hessian and `scale_dense_rows`
-  (the wiggle time Jacobians in the fit and the time-warp Jacobian in prediction). A NaN
-  weight became 0, which dropped the row and reported nothing; a positive or negative
-  infinity became the corresponding `f64::MAX`, which produced a saturated Hessian that
-  still passed the final `is_finite` gate. The sanitizer is deleted and
-  `require_finite_row_weights` takes its place: any non-finite row weight or coefficient
-  is a `NumericalFailure` whose message names the row. The one case the sanitizer was
-  covering legitimately, a masked row whose zero weight met an infinite index, is fixed
-  at its source instead, in the slot fill, where a zero-weight row now contributes
-  exactly 0 so `0 * inf` never forms. Overflow saturation of finite operands in
-  `safe_product` and `safe_sum2` is unchanged, and a zero weight still drops its row
-  exactly.
-  **Behavior change:** a fit or prediction that used to return after quietly discarding
-  a row, or after saturating its curvature, now fails with a `NumericalFailure` naming
-  the row. The remedy is the model or the data at that row, not a retry.
-- **Owned-mode custom-family fits publish their hyperparameter smoothing correction** (gam#2677).
-  `fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance`, the entry the
-  spatial and joint-hyper fits assemble their certified mode through, hard-coded
-  `smoothing_corrected: None` and `smoothing_correction_absence: None`. So
-  `beta_covariance_corrected()` returned `None` whenever a smoothing coordinate existed,
-  the first-order uncertainty in both the smoothing parameters `rho` and the family
-  hyperparameters `psi` was dropped, and no typed reason was published for the absence.
-  At the converged mode the implicit function theorem over `theta = [rho | psi]` gives
-  `d beta / d theta_o = -H^-1 U[:, o]` with `U = [lambda_k S_k beta | g_j]`, so the
-  correction is `C = A V_theta A^T` with `A = V U`, and `Vp = V + C`. The owned-mode fit
-  now mints exactly that, through the same `first_order_smoothing_correction` the
-  rho-only path uses, with `V_theta` the identified-subspace inverse of the certified
-  outer Hessian over the same `theta`: rails are excluded and directions under the
-  certificate's gradient floor are dropped. The `psi` columns are the fixed-beta
-  inner-gradient scores the owning evaluation already assembles, captured before
-  `ExtCoordBundle::scaled`, because the curvature scale multiplies both `H` and `g` and
-  the natural frame is the one `V` and the `rho` columns are in. Where no correction can
-  be minted the absence is now typed rather than silent.
-  **Behavior change:** standard errors and intervals from spatial and joint-hyper
-  custom-family fits now carry the smoothing and hyperparameter uncertainty, so they are
-  wider than the conditional ones they used to report, and a fit that cannot mint the
-  correction says which reason applies instead of returning `None`.
-- **`SymmetricMatrix::factorize` has one SPD contract on both storages** (gam#3696).
-  The method behaved differently depending on how the matrix happened to be stored.
-  Dense storage went through the `StableSolver` fallback ladder, LLT then LDLT then
-  LBLT, so it accepted indefinite matrices and even negative-definite ones; sparse
-  storage used a strict SPD Cholesky and refused exactly those matrices. Every caller
-  reads the result as an SPD factor: `effectivehessian`'s admissibility check,
-  `calculate_edf`, the survival and custom-family EDF traces, the implicit-function
-  warm-start solves and the prediction precision backend. On dense storage an indefinite
-  `H` therefore passed through with no error and those quantities were computed from a
-  factorization of something that is not a precision. The lenient method is deleted and
-  the strict `factorize_spd` becomes `factorize`, so there is one contract. Both arms now
-  run an unperturbed Cholesky in which every pivot must clear its own derived
-  `gamma_2n` roundoff band, and the sparse arm first canonicalizes any triangle
-  convention through the new `factorize_sparse_spd_certified`, so callers keep their
-  storage freedom. `StableSolver` and `factorize_symmetricwith_fallback` are unchanged.
-  **Behavior change:** a dense symmetric matrix that is not positive definite is now
-  refused by `factorize` instead of being factored. A fit that used to report an EDF or
-  an admissibility verdict computed from such a factor now fails at that point, with the
-  pivot that did not clear its band.
+- **Skovgaard `r*` uses the sample-space `q_hat` and the full nuisance determinant form** (gam#3535).
+  Two things were wrong in the assembly. In the scalar case it computed
+  `u = (theta_hat - theta_0) * i_hat / sqrt(j_hat)`, which is the linear surrogate for
+  Skovgaard's `q_hat` and is exact only in the canonical parameter, so in any other
+  parameterisation `r*` lost both its invariance and its third-order accuracy: on a
+  mean-parameterised exponential at `n = 5` the tail missed the exact Gamma tail by 55 to
+  170 percent. In the matrix case `scalar_skovgaard_from_matrices` collapsed the nuisance
+  parameters into a scalar Wald variance, dropping the `|j_hat|`, `|j_tilde|` and `|S_hat|`
+  factors of Skovgaard (1996). `ScalarSkovgaardInput` now carries
+  `q_hat = cov[U(theta_hat), l(theta_hat) - l(theta_0)]` with its empirical companion, and
+  the assembly uses `u = sqrt(j_hat) * q_hat / i_hat`.
+  `skovgaard_r_star_with_nuisance` replaces `scalar_skovgaard_from_matrices` and evaluates
+  the full form
+  `u = |j_hat|^(1/2) |S_hat| c' S_hat^-1 q_hat / (|i_hat| |j_tilde|^(1/2) (c' j_tilde^-1 c)^(1/2))`,
+  taking both the full and the constrained fit, building its empirical companion from
+  per-row scores, and factoring the non-symmetric `S_hat` with a pivoted LU that keeps the
+  determinant sign.
+  **Behavior change, and it breaks a Python signature.** `r*` values and the p-values
+  derived from them move in every non-canonical parameterisation, and the `skovgaard_r_star`
+  FFI now takes twelve arguments in place of seven: `contrast`, `beta_hat`, `beta_null`,
+  `observed_info_hat`, `observed_info_null`, `expected_info`, `score_covariance`,
+  `loglik_covariance`, `row_scores_hat`, `row_scores_null`, `row_loglik_diff` and
+  `lr_statistic`. Existing calls will not type-check; the `_rust.pyi` and
+  `_rust_module.pyi` stubs are regenerated.
 - **Multinomial smooth significance is a softmax score test, and the saved model format
   moves to version 3** (#3569, #1101). `MultinomialSavedModel::smooth_significance` ran a
   per-class Wood rank-truncated Wald test. It now runs the shared variance-component score
