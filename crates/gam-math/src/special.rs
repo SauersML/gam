@@ -916,6 +916,25 @@ pub fn softplus(x: f64) -> f64 {
     x.max(0.0) + (-x.abs()).exp().ln_1p()
 }
 
+/// The inverse of [`softplus`]: the `x` with `ln(1 + e^x) = s`, defined for
+/// `s > 0`, which is softplus's range.
+///
+/// `x = ln(e^s − 1) = s + ln(1 − e^{−s})`. Writing it that way is what keeps
+/// the large branch: `e^s` overflows past `s = 709` although the answer there
+/// is an ordinary number. Once `e^{−s} < ε` the correction is smaller than one
+/// ulp of `s`, so past `s = −ln ε` the inverse is `s` itself; below that
+/// `expm1` carries the small-`s` regime with full relative accuracy.
+/// `s = 0` returns `−∞` (softplus never reaches zero) and `s < 0` returns NaN,
+/// both outside the range this inverts.
+#[inline]
+pub fn softplus_inverse(s: f64) -> f64 {
+    if s > -f64::EPSILON.ln() {
+        s
+    } else {
+        s.exp_m1().ln()
+    }
+}
+
 /// The logistic function `σ(x) = 1 / (1 + e^{-x})`, oriented so the
 /// exponential is always of a non-positive argument.
 #[inline]
@@ -1248,6 +1267,26 @@ mod exponential_family_kernel_tests {
         for &x in &[0.5_f64, 1.0, 2.0, 5.0, 40.0] {
             assert!((logistic(x) + logistic(-x) - 1.0).abs() <= f64::EPSILON);
         }
+    }
+
+    /// `softplus_inverse` inverts `softplus` on both branches, including the
+    /// arguments where `e^s` is not representable at all.
+    #[test]
+    fn softplus_inverse_inverts_softplus_on_both_branches() {
+        for &x in &[-40.0_f64, -2.0, -0.25, 0.0, 0.25, 2.0, 35.0, 40.0, 700.0] {
+            let s = softplus(x);
+            let back = softplus_inverse(s);
+            assert!(
+                (back - x).abs() <= 8.0 * f64::EPSILON * x.abs().max(1.0),
+                "softplus_inverse(softplus({x})) = {back}"
+            );
+        }
+        // The regime the naive `ln(e^s - 1)` cannot reach: `e^s` overflows
+        // while `s` is an ordinary strength.
+        let huge = 1.0e300_f64;
+        assert_eq!(softplus_inverse(huge), huge);
+        assert_eq!(softplus_inverse(0.0), f64::NEG_INFINITY);
+        assert!(softplus_inverse(-1.0).is_nan());
     }
 
     #[test]

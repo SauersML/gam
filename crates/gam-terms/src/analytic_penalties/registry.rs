@@ -50,6 +50,12 @@ macro_rules! define_analytic_penalty_kind {
                 }
             }
 
+            pub fn rho_coordinate_kinds(&self) -> Vec<RhoCoordinateKind> {
+                match self {
+                    $(AnalyticPenaltyKind::$variant(p) => <$ty as AnalyticPenalty>::rho_coordinate_kinds(p),)*
+                }
+            }
+
             pub fn kind_tag(&self) -> &'static str {
                 match self {
                     $(AnalyticPenaltyKind::$variant(_) => <$ty as PenaltyManifest>::KIND_TAG,)*
@@ -313,11 +319,11 @@ impl AnalyticPenaltyRegistry {
                 ));
             }
             for (local, &(lo, hi)) in domains.iter().enumerate() {
-                // Infinite faces deliberately represent ordinary unbounded
-                // real coordinates (for example parametric raw-beta and mu).
-                // The optimizer intersects these with its finite configured
-                // box; `validate_rho` separately refuses non-finite values.
-                if lo.is_nan() || hi.is_nan() || lo >= hi {
+                // Every face is finite (#4266). An infinite face forces the
+                // caller to invent a finite one, and an invented box is a
+                // hand-supplied box: the penalty owns its coordinate's units
+                // and is the only place the face can be derived.
+                if !(lo.is_finite() && hi.is_finite()) || lo >= hi {
                     return Err(format!(
                         "analytic penalty `{}` has invalid rho domain[{local}] [{lo}, {hi}]",
                         penalty.name()
@@ -329,6 +335,27 @@ impl AnalyticPenaltyRegistry {
             offset += domains.len();
         }
         Ok((lower, upper))
+    }
+
+    /// The unit of every registered ρ coordinate, concatenated in the order
+    /// [`Self::rho_domain_bounds`] concatenates their faces (#4266). A caller
+    /// that owns a search domain of its own applies it only where the unit
+    /// says it means something.
+    pub fn rho_coordinate_kinds(&self) -> Result<Vec<RhoCoordinateKind>, String> {
+        let mut kinds = Vec::with_capacity(self.total_rho_count());
+        for penalty in &self.penalties {
+            let published = penalty.rho_coordinate_kinds();
+            if published.len() != penalty.rho_count() {
+                return Err(format!(
+                    "analytic penalty `{}` returned {} rho coordinate kinds for {} coordinates",
+                    penalty.name(),
+                    published.len(),
+                    penalty.rho_count()
+                ));
+            }
+            kinds.extend(published);
+        }
+        Ok(kinds)
     }
 }
 

@@ -936,6 +936,24 @@ impl ParametricRowPrecisionPriorPenalty {
         alpha + beta * self.dist2(n, k, rho)
     }
 
+    /// The largest `d²(n, k)` the DECLARED map forms, i.e. at ρ = 0. It is the
+    /// factor the slope `softplus(b_k)` is multiplied by inside λ, so it is
+    /// what carries λ's strength face back onto the slope coordinate (#4266).
+    fn max_declared_dist2(&self) -> f64 {
+        let mut worst = 0.0_f64;
+        for n in 0..self.aux.nrows() {
+            for k in 0..self.mu.nrows() {
+                let mut r2 = 0.0;
+                for a in 0..self.aux.ncols() {
+                    let delta = self.aux[[n, a]] - self.mu[[k, a]];
+                    r2 += delta * delta;
+                }
+                worst = worst.max(r2);
+            }
+        }
+        worst
+    }
+
     fn dist2(&self, n: usize, k: usize, rho: ArrayView1<'_, f64>) -> f64 {
         let mut r2 = 0.0;
         for a in 0..self.aux.ncols() {
@@ -1036,17 +1054,102 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
         Ok(())
     }
 
+    /// Every coordinate's face, derived from the one quantity all four of them
+    /// feed: `λ(n, k) = α_k + softplus(b_k)·d²(n, k)` is a precision, so it is a
+    /// strength and must stay inside `[exp(LOG_STRENGTH_MIN),
+    /// exp(LOG_STRENGTH_MAX)]`. Each coordinate's face is that requirement
+    /// carried back through the map it enters by (#4266). raw_beta and mu are
+    /// not logarithms, so their faces are wide — that is the honest statement
+    /// that nothing but representability bounds them, and it is the statement
+    /// a caller needs instead of a box of its own.
     fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
-        // raw_beta and mu are ordinary additive real coordinates. They must be
-        // finite when evaluated, but they are not log-strengths and therefore
-        // have no artificial ±700 optimization face.
-        let mut domains = vec![(f64::NEG_INFINITY, f64::INFINITY); self.rho_count()];
+        let strength_ceiling =
+            checked_exp_log_strength(LOG_STRENGTH_MAX).map_err(|error| error.to_string())?;
+        let mut domains = vec![(LOG_STRENGTH_MIN, LOG_STRENGTH_MAX); self.rho_count()];
+
+        // α_k = exp(log_alpha_k + ρ): an e-fold offset on a strength.
         for (k, &base_log_alpha) in self.log_alpha.iter().enumerate() {
             domains[self.log_alpha_offset() + k] = (
                 LOG_STRENGTH_MIN - base_log_alpha,
                 LOG_STRENGTH_MAX - base_log_alpha,
             );
         }
+
+        // The slope softplus(b_k) reaches λ multiplied by d², so its own face
+        // is λ's face divided by the largest d² the declared map forms, then
+        // intersected with the strength face it must satisfy on its own. Both
+        // ends are taken in log space so neither quotient overflows. softplus
+        // is strictly increasing, so its inverse carries the face to b_k
+        // exactly; a d² so large that the two ends meet leaves the slope no
+        // interval at all and is refused rather than saturated.
+        let log_dist2 = {
+            let max_dist2 = self.max_declared_dist2();
+            if max_dist2 > 0.0 { max_dist2.ln() } else { 0.0 }
+        };
+        let log_slope_lower = (LOG_STRENGTH_MIN - log_dist2).max(LOG_STRENGTH_MIN);
+        let log_slope_upper = (LOG_STRENGTH_MAX - log_dist2).min(LOG_STRENGTH_MAX);
+        if !(log_slope_lower < log_slope_upper) {
+            return Err(format!(
+                "parametric row-precision auxiliary rows reach a squared distance of                  exp({log_dist2}), which leaves its slope coordinate no strength interval"
+            ));
+        }
+        let slope_lower = gam_math::special::softplus_inverse(
+            checked_exp_log_strength(log_slope_lower).map_err(|error| error.to_string())?,
+        );
+        let slope_upper = gam_math::special::softplus_inverse(
+            checked_exp_log_strength(log_slope_upper).map_err(|error| error.to_string())?,
+        );
+        for (k, &base_raw_beta) in self.raw_beta.iter().enumerate() {
+            if !base_raw_beta.is_finite() {
+                return Err(format!(
+                    "parametric row-precision raw-beta base {k} must be finite, got {base_raw_beta}"
+                ));
+            }
+            domains[self.raw_beta_offset() + k] =
+                (slope_lower - base_raw_beta, slope_upper - base_raw_beta);
+        }
+
+        // μ_k is a location in the auxiliary rows' own units. Every squared
+        // deviation is a term of d², so each one is bounded by λ's ceiling:
+        // |aux[n, a] − μ| ≤ √(exp(LOG_STRENGTH_MAX)) for every row n, which is the
+        // interval [max_n aux − reach, min_n aux + reach].
+        let reach = strength_ceiling.sqrt();
+        for a in 0..self.aux.ncols() {
+            let mut column_min = f64::INFINITY;
+            let mut column_max = f64::NEG_INFINITY;
+            for n in 0..self.aux.nrows() {
+                let value = self.aux[[n, a]];
+                if !value.is_finite() {
+                    return Err(format!(
+                        "parametric row-precision auxiliary row {n} axis {a} must be finite, got {value}"
+                    ));
+                }
+                column_min = column_min.min(value);
+                column_max = column_max.max(value);
+            }
+            if column_min > column_max {
+                // No auxiliary rows: d² is empty and μ never reaches λ.
+                column_min = 0.0;
+                column_max = 0.0;
+            }
+            let (mu_lower, mu_upper) = (column_max - reach, column_min + reach);
+            if !(mu_lower < mu_upper) {
+                return Err(format!(
+                    "parametric row-precision auxiliary axis {a} spans more than the                      representable squared distance, leaving its mean coordinate no interval"
+                ));
+            }
+            for k in 0..self.mu.nrows() {
+                let base_mu = self.mu[[k, a]];
+                if !base_mu.is_finite() {
+                    return Err(format!(
+                        "parametric row-precision mean base ({k}, {a}) must be finite, got {base_mu}"
+                    ));
+                }
+                domains[self.mu_offset() + k * self.aux.ncols() + a] =
+                    (mu_lower - base_mu, mu_upper - base_mu);
+            }
+        }
+
         if self.learnable_weight {
             domains[self.weight_offset()] = learnable_weight_coordinate_domain(self.weight)?
                 .ok_or_else(|| {
@@ -1054,6 +1157,21 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
                 })?;
         }
         Ok(domains)
+    }
+
+    /// `α` and the base weight are e-fold offsets on strengths; the slope's
+    /// coordinate is a softplus argument and `μ` is a location in the auxiliary
+    /// rows' units, so neither is a logarithm and a log-space face says nothing
+    /// about them (#4266).
+    fn rho_coordinate_kinds(&self) -> Vec<RhoCoordinateKind> {
+        let mut kinds = vec![RhoCoordinateKind::Location; self.rho_count()];
+        for k in 0..self.log_alpha.len() {
+            kinds[self.log_alpha_offset() + k] = RhoCoordinateKind::LogStrength;
+        }
+        if self.learnable_weight {
+            kinds[self.weight_offset()] = RhoCoordinateKind::LogStrength;
+        }
+        kinds
     }
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {

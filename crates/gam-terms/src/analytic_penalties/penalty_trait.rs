@@ -18,6 +18,26 @@ pub enum PenaltyTier {
     Rho,
 }
 
+/// The unit one analytic-penalty ρ coordinate is measured in (#4266).
+///
+/// A consumer that intersects a published face with a search domain of its own
+/// needs this. The resolvability face
+/// [`precision_box`](gam_problem::precision_box) is stated in e-folds, so it
+/// says something about a coordinate that enters through `exp` and nothing at
+/// all about a coordinate carrying the units of a data column; applying it to
+/// the second is exactly the hand-supplied box #4266 is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RhoCoordinateKind {
+    /// An e-fold offset on a positive strength: the coordinate reaches the
+    /// penalty only through `exp`, or through a base weight's logarithm.
+    LogStrength,
+    /// An ordinary additive real coordinate — a location, a regression offset,
+    /// or the argument of a map that is not a logarithm. It carries the units
+    /// of whatever it is added to, so its published face is the only face it
+    /// has.
+    Location,
+}
+
 /// Reference for the column / coordinate range a penalty operates over.
 ///
 /// Mirrors `BlockwisePenalty::col_range` for the β tier and is the natural
@@ -155,13 +175,25 @@ pub trait AnalyticPenalty: Send + Sync {
         Ok(())
     }
 
-    /// Per-local-coordinate legal intervals. The generic optimizer intersects
-    /// these with its configured box before evaluating a penalty. Ordinary
-    /// non-log coordinates may return infinite endpoints to denote an
-    /// unbounded face; evaluation still requires every supplied coordinate to
-    /// be finite.
+    /// Per-local-coordinate legal intervals, one per ρ coordinate.
+    ///
+    /// Every face is finite (#4266). A penalty owns the units of its own
+    /// coordinates, so it is the only place a face can be derived; a consumer
+    /// handed an infinite face has to invent a finite one, and the invented
+    /// one is a hand-supplied box. A coordinate whose own arithmetic bounds it
+    /// nowhere still has the face where the quantity it feeds stops being a
+    /// representable strength, which is what [`LOG_STRENGTH_MIN`] and
+    /// [`LOG_STRENGTH_MAX`] state for the default log-strength coordinate.
     fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
         Ok(vec![(LOG_STRENGTH_MIN, LOG_STRENGTH_MAX); self.rho_count()])
+    }
+
+    /// The unit of each local ρ coordinate, in the order
+    /// [`Self::rho_coordinate_domains`] publishes their faces (#4266). The
+    /// default is [`RhoCoordinateKind::LogStrength`] throughout, matching the
+    /// default face `[LOG_STRENGTH_MIN, LOG_STRENGTH_MAX]`.
+    fn rho_coordinate_kinds(&self) -> Vec<RhoCoordinateKind> {
+        vec![RhoCoordinateKind::LogStrength; self.rho_count()]
     }
 
     /// Scalar penalty contribution `P(target; ρ)`. The strength factor

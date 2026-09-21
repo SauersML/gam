@@ -6137,32 +6137,60 @@ where
 /// Search domain of the latent joint theta past its smoothing block, laid out
 /// `[latent flat t | analytic-penalty rho | direct hypers]` (#4266).
 ///
-/// A log-strength coordinate has no penalty geometry the design Gram can
-/// project. That covers every direct log-precision (the anchor's `ln μ`, each
-/// ARD `ln α_j`) and every analytic coordinate the registry publishes with
-/// finite faces. Those finite faces are a learnable weight's or a log-alpha's
-/// representable effective strength (`learnable_weight_coordinate_domain`).
-/// Such a coordinate searches the precision box
-/// [`coordinate_domain`](gam_solve::estimate::rho_domain::coordinate_domain)`(None, None)`,
-/// `[ln √ε, ln(1/√ε)]` around its declared strength. That is the law
-/// [`joint_rho_resolvability_domain`] applies to a smoothing coordinate
-/// without projectable geometry. An analytic coordinate also keeps its
-/// registry faces. A user `init_log_precision` seed is projected into this
-/// domain by the caller, so it always starts feasible.
+/// Every coordinate takes the face its own arithmetic gives it. Nothing here
+/// is truncated by a width chosen for it from outside, because a width chosen
+/// from outside is in the wrong units for at least one of the four classes
+/// below and there is no unit they share.
 ///
-/// The latent coordinates `t`, the behavioral-head coefficients and the
-/// analytic coordinates the registry leaves unbounded are not log-strengths.
-/// The unbounded ones are the parametric row-precision raw-beta and mean
-/// offsets. These have no derived domain yet (the #4266 remainder) and keep
-/// their previous box. For `t` that box is `±(max|t₀| + 10)`, taken around
-/// the seed the search actually starts from, including a persistent-cache
-/// seed. For the rest it is `±12`.
+/// **Log-strength coordinates** — every direct log-precision (the anchor's
+/// `ln μ`, each ARD `ln α_j`) and every analytic coordinate the registry
+/// publishes as [`gam_terms::RhoCoordinateKind::LogStrength`]. These have no
+/// penalty geometry the design Gram can project, so they search the precision
+/// box
+/// [`coordinate_domain`](gam_solve::estimate::rho_domain::coordinate_domain)`(None, None)`,
+/// `[ln √ε, ln(1/√ε)]` around their declared strength, intersected with the
+/// registry's own face where there is one. That is the law
+/// [`joint_rho_resolvability_domain`] applies to a smoothing coordinate
+/// without projectable geometry. A user `init_log_precision` seed is projected
+/// into this domain by the caller, so it always starts feasible.
+///
+/// **Analytic location coordinates** — the parametric row-precision raw-beta
+/// and mean offsets. The registry publishes a finite face for each and says it
+/// is not a logarithm, and that face is taken verbatim: `[ln √ε, ln(1/√ε)]`
+/// is stated in e-folds and says nothing about a coordinate carrying the units
+/// of an auxiliary column. Intersecting it there is the same hand-supplied box
+/// under another name.
+///
+/// **Latent coordinates `t`** — a non-Euclidean axis has an exact domain and
+/// it is the manifold's own set: `Interval` retracts by clamping to
+/// `[lo, hi]`, `Circle` is the same point every `period`, and `Sphere` holds a
+/// unit vector, so each of its ambient axes lies in `[-1, 1]`. Off those sets
+/// the declared manifold has no points. A Euclidean axis has no such set and
+/// takes the precision box read in the axis's own units — `1/√ε` times the
+/// largest magnitude the seed puts on that axis, past which the seed's own
+/// structure sits below the criterion's rounding. An axis the seed leaves
+/// identically zero carries no scale of its own and takes the unit one. This
+/// replaces `±(max|t₀| + 10)`, whose slack was in the latent's own units, so
+/// its width moved one way under rescaling by `c > 1` and another under
+/// `c < 1`; the reach above is exactly proportional to the seed and so is
+/// invariant.
+///
+/// **Behavioral-head coefficients** — `η[n, c] = a_c + t_n · w_c` reaches the
+/// head's likelihood only through a logistic or softmax link, so `η` is
+/// exponentiated and the supported strength domain is its face. The intercept
+/// multiplies a column of ones and takes `±LOG_STRENGTH_MAX`; the loading on
+/// axis `j` multiplies that axis and takes the same face divided by the axis's
+/// realized scale. The slots are `n_eta_channels` blocks of `1 + latent_dim`
+/// in that order, the layout `BehavioralHead::n_coeffs` counts.
 fn latent_joint_auxiliary_domain(
     auxiliary_seed: ndarray::ArrayView1<'_, f64>,
     latent_flat_dim: usize,
+    latent_supports: &[gam_terms::latent::CoordinatePriorSupport],
     registry: Option<&gam_terms::AnalyticPenaltyRegistry>,
     direct_slots: &[LatentDirectHyperSlot],
 ) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
+    use gam_terms::latent::CoordinatePriorSupport;
+
     let analytic_rho_count = registry.map_or(0, |registry| registry.total_rho_count());
     let dim = latent_flat_dim + analytic_rho_count + direct_slots.len();
     if auxiliary_seed.len() != dim {
@@ -6173,47 +6201,154 @@ fn latent_joint_auxiliary_domain(
             direct_slots.len()
         );
     }
-    let log_strength_domain = gam_solve::estimate::rho_domain::coordinate_domain(None, None);
-    let underived_face = 12.0;
-    let mut lower = Array1::<f64>::from_elem(dim, -underived_face);
-    let mut upper = Array1::<f64>::from_elem(dim, underived_face);
-
-    let latent_bound = auxiliary_seed
-        .slice(s![..latent_flat_dim])
+    let latent_dim: usize = latent_supports
         .iter()
-        .fold(1.0_f64, |acc, &v| acc.max(v.abs()))
-        + 10.0;
-    lower.slice_mut(s![..latent_flat_dim]).fill(-latent_bound);
-    upper.slice_mut(s![..latent_flat_dim]).fill(latent_bound);
+        .map(CoordinatePriorSupport::ambient_axes)
+        .sum();
+    if latent_dim == 0 {
+        if latent_flat_dim != 0 {
+            crate::bail_invalid_estim!(
+                "latent joint auxiliary domain got {latent_flat_dim} flat latent coordinates \
+                 with no prior supports to tile them"
+            );
+        }
+    } else if !latent_flat_dim.is_multiple_of(latent_dim) {
+        crate::bail_invalid_estim!(
+            "latent prior supports span {latent_dim} axes, which does not tile \
+             {latent_flat_dim} flat latent coordinates"
+        );
+    }
+    let rows = if latent_dim == 0 {
+        0
+    } else {
+        latent_flat_dim / latent_dim
+    };
+
+    let log_strength_domain = gam_solve::estimate::rho_domain::coordinate_domain(None, None);
+    // `exp(ln(1/√ε)) = 1/√ε`: the precision box's reach, read in linear units.
+    let representable_reach = log_strength_domain.1.exp();
+    let mut lower = Array1::<f64>::zeros(dim);
+    let mut upper = Array1::<f64>::zeros(dim);
+
+    // The realized scale of each latent axis, in that axis's own units.
+    let mut axis_scale = vec![0.0_f64; latent_dim];
+    for row in 0..rows {
+        for axis in 0..latent_dim {
+            let magnitude = auxiliary_seed[row * latent_dim + axis].abs();
+            axis_scale[axis] = axis_scale[axis].max(magnitude);
+        }
+    }
+    for scale in axis_scale.iter_mut() {
+        if !(*scale > 0.0) {
+            *scale = 1.0;
+        }
+    }
+
+    let mut axis = 0usize;
+    for support in latent_supports {
+        match *support {
+            CoordinatePriorSupport::Line => {
+                let reach = axis_scale[axis] * representable_reach;
+                for row in 0..rows {
+                    let index = row * latent_dim + axis;
+                    lower[index] = -reach;
+                    upper[index] = reach;
+                }
+                axis += 1;
+            }
+            CoordinatePriorSupport::Interval { lo, hi } => {
+                if !(lo.is_finite() && hi.is_finite() && lo < hi) {
+                    crate::bail_invalid_estim!(
+                        "latent axis {axis} declares an interval manifold [{lo}, {hi}] \
+                         with no searchable interior"
+                    );
+                }
+                for row in 0..rows {
+                    let index = row * latent_dim + axis;
+                    lower[index] = lo;
+                    upper[index] = hi;
+                }
+                axis += 1;
+            }
+            CoordinatePriorSupport::Circle { period } => {
+                if !(period.is_finite() && period > 0.0) {
+                    crate::bail_invalid_estim!(
+                        "latent axis {axis} declares a circle manifold of period {period}"
+                    );
+                }
+                for row in 0..rows {
+                    let index = row * latent_dim + axis;
+                    let seed = auxiliary_seed[index];
+                    lower[index] = seed - 0.5 * period;
+                    upper[index] = seed + 0.5 * period;
+                }
+                axis += 1;
+            }
+            CoordinatePriorSupport::Sphere { dim: ambient } => {
+                for row in 0..rows {
+                    for offset in 0..ambient {
+                        let index = row * latent_dim + axis + offset;
+                        lower[index] = -1.0;
+                        upper[index] = 1.0;
+                    }
+                }
+                axis += ambient;
+            }
+        }
+    }
 
     if let Some(registry) = registry {
         let (domain_lower, domain_upper) = registry
             .rho_domain_bounds()
             .map_err(EstimationError::InvalidInput)?;
+        let kinds = registry
+            .rho_coordinate_kinds()
+            .map_err(EstimationError::InvalidInput)?;
         for local in 0..analytic_rho_count {
-            let axis = latent_flat_dim + local;
-            let (lo, hi) = (domain_lower[local], domain_upper[local]);
-            if lo.is_finite() && hi.is_finite() {
-                lower[axis] = lo.max(log_strength_domain.0);
-                upper[axis] = hi.min(log_strength_domain.1);
-            } else {
-                lower[axis] = lower[axis].max(lo);
-                upper[axis] = upper[axis].min(hi);
-            }
-            if lower[axis] >= upper[axis] {
+            let index = latent_flat_dim + local;
+            let (lo, hi) = match kinds[local] {
+                gam_terms::RhoCoordinateKind::LogStrength => (
+                    domain_lower[local].max(log_strength_domain.0),
+                    domain_upper[local].min(log_strength_domain.1),
+                ),
+                gam_terms::RhoCoordinateKind::Location => {
+                    (domain_lower[local], domain_upper[local])
+                }
+            };
+            if !(lo.is_finite() && hi.is_finite() && lo < hi) {
                 return Err(EstimationError::InvalidInput(format!(
-                    "analytic-penalty rho domain has no searchable interval at coordinate {local}: lower={}, upper={}",
-                    lower[axis], upper[axis]
+                    "analytic-penalty rho domain has no searchable interval at coordinate {local}: lower={lo}, upper={hi}"
                 )));
             }
+            lower[index] = lo;
+            upper[index] = hi;
         }
     }
 
     let direct_start = latent_flat_dim + analytic_rho_count;
+    let head_start = direct_slots
+        .iter()
+        .position(|slot| *slot == LatentDirectHyperSlot::HeadCoefficient);
+    let head_block = 1 + latent_dim;
     for (slot_index, slot) in direct_slots.iter().enumerate() {
-        if *slot == LatentDirectHyperSlot::LogPrecision {
-            lower[direct_start + slot_index] = log_strength_domain.0;
-            upper[direct_start + slot_index] = log_strength_domain.1;
+        let index = direct_start + slot_index;
+        match *slot {
+            LatentDirectHyperSlot::LogPrecision => {
+                lower[index] = log_strength_domain.0;
+                upper[index] = log_strength_domain.1;
+            }
+            LatentDirectHyperSlot::HeadCoefficient => {
+                let start = head_start.expect("a head slot exists once one was found");
+                let within = (slot_index - start) % head_block;
+                let column_scale = if within == 0 {
+                    1.0
+                } else {
+                    axis_scale[within - 1]
+                };
+                let reach = gam_problem::LOG_STRENGTH_MAX / column_scale;
+                lower[index] = -reach;
+                upper[index] = reach;
+            }
         }
     }
     Ok((lower, upper))
@@ -6251,20 +6386,26 @@ mod latent_joint_auxiliary_domain_tests {
 
     /// A user ARD seed past the old `±12` box started infeasible. Every
     /// log-precision now searches the precision box and its seed is projected.
+    /// A Euclidean latent axis searches the same box read in its own units, so
+    /// rescaling the seed rescales its domain by the same factor — the
+    /// property `±(max|t₀| + 10)` did not have.
     #[test]
     fn ard_log_precisions_search_the_precision_box_and_seeds_are_feasible_4266() {
+        use gam_terms::latent::CoordinatePriorSupport;
         let mode = gam_terms::latent::LatentIdMode::DimSelection {
             init_log_precision: Some(ndarray::array![15.0, -30.0]),
         };
         let slots = latent_coord_direct_hyper_slots(&mode, 2);
         let direct = latent_coord_initial_direct_hypers(&mode, 2).unwrap();
         let latent = ndarray::array![0.5, -2.0, 1.0, 0.25];
+        let supports = vec![CoordinatePriorSupport::Line; 2];
         let mut seed = Array1::<f64>::zeros(latent.len() + direct.len());
         seed.slice_mut(s![..latent.len()]).assign(&latent);
         seed.slice_mut(s![latent.len()..]).assign(&direct);
 
         let (lower, upper) =
-            latent_joint_auxiliary_domain(seed.view(), latent.len(), None, &slots).unwrap();
+            latent_joint_auxiliary_domain(seed.view(), latent.len(), &supports, None, &slots)
+                .unwrap();
         let (box_lo, box_hi) = gam_solve::estimate::rho_domain::precision_box();
         assert!(box_hi > 12.0 && box_lo < -12.0);
         for axis in latent.len()..seed.len() {
@@ -6276,14 +6417,124 @@ mod latent_joint_auxiliary_domain_tests {
         for axis in 0..seed.len() {
             assert!(lower[axis] <= projected[axis] && projected[axis] <= upper[axis]);
         }
+
+        // Per-axis realized scale: axis 0 reaches 1.0, axis 1 reaches 2.0.
+        let reach = box_hi.exp();
+        for row in 0..2 {
+            assert_eq!((lower[row * 2], upper[row * 2]), (-reach, reach));
+            assert_eq!(
+                (lower[row * 2 + 1], upper[row * 2 + 1]),
+                (-2.0 * reach, 2.0 * reach)
+            );
+        }
+
+        // Rescaling the latent seed rescales its domain by the same factor, in
+        // both directions. The `+ 10` slack did not: it widened `c < 1` and
+        // narrowed `c > 1` relative to the seed.
+        for &c in &[0.125_f64, 8.0] {
+            let mut scaled = seed.clone();
+            for value in scaled.slice_mut(s![..latent.len()]).iter_mut() {
+                *value *= c;
+            }
+            let (scaled_lower, scaled_upper) =
+                latent_joint_auxiliary_domain(scaled.view(), latent.len(), &supports, None, &slots)
+                    .unwrap();
+            for axis in 0..latent.len() {
+                assert_eq!(scaled_lower[axis], c * lower[axis], "axis {axis} at c={c}");
+                assert_eq!(scaled_upper[axis], c * upper[axis], "axis {axis} at c={c}");
+            }
+        }
+    }
+
+    /// A non-Euclidean latent axis has an exact domain and it is the
+    /// manifold's own set; a behavioral-head coefficient takes the face on
+    /// which its contribution to η is still a representable strength.
+    #[test]
+    fn latent_axes_take_their_manifolds_set_and_head_coefficients_take_the_link_face_4266() {
+        use gam_terms::latent::CoordinatePriorSupport;
+        let supports = vec![
+            CoordinatePriorSupport::Interval { lo: -1.5, hi: 2.5 },
+            CoordinatePriorSupport::Circle {
+                period: std::f64::consts::TAU,
+            },
+            CoordinatePriorSupport::Sphere { dim: 3 },
+        ];
+        let latent_dim = 5;
+        let rows = 2;
+        let latent_flat_dim = rows * latent_dim;
+        let latent = ndarray::array![0.5, 0.3, 0.6, 0.0, 0.8, -1.0, -0.2, 0.0, 1.0, 0.0];
+        // Two η-channels of `1 + latent_dim` head coefficients, then one ARD
+        // log-precision per axis — the `AuxOutcome` slot order.
+        let head_block = 1 + latent_dim;
+        let mut slots = vec![LatentDirectHyperSlot::HeadCoefficient; 2 * head_block];
+        slots.extend(std::iter::repeat_n(
+            LatentDirectHyperSlot::LogPrecision,
+            latent_dim,
+        ));
+        let mut seed = Array1::<f64>::zeros(latent_flat_dim + slots.len());
+        seed.slice_mut(s![..latent_flat_dim]).assign(&latent);
+
+        let (lower, upper) =
+            latent_joint_auxiliary_domain(seed.view(), latent_flat_dim, &supports, None, &slots)
+                .unwrap();
+
+        for row in 0..rows {
+            let base = row * latent_dim;
+            // Interval: the retraction clamps, so the set is [lo, hi] exactly.
+            assert_eq!((lower[base], upper[base]), (-1.5, 2.5));
+            // Circle: one full period around the row's own seed covers every
+            // distinct point of the manifold.
+            let seed_angle = latent[base + 1];
+            assert_eq!(
+                (lower[base + 1], upper[base + 1]),
+                (
+                    seed_angle - std::f64::consts::PI,
+                    seed_angle + std::f64::consts::PI
+                )
+            );
+            // Sphere: a unit vector, so every ambient axis lies in [-1, 1].
+            for offset in 2..5 {
+                assert_eq!((lower[base + offset], upper[base + offset]), (-1.0, 1.0));
+            }
+        }
+
+        // Realized scales, per axis, over both rows.
+        let axis_scale = [1.0_f64, 0.3, 0.6, 1.0, 0.8];
+        let (box_lo, box_hi) = gam_solve::estimate::rho_domain::precision_box();
+        for channel in 0..2 {
+            let intercept = latent_flat_dim + channel * head_block;
+            assert_eq!(
+                (lower[intercept], upper[intercept]),
+                (
+                    -gam_problem::LOG_STRENGTH_MAX,
+                    gam_problem::LOG_STRENGTH_MAX
+                )
+            );
+            for axis in 0..latent_dim {
+                let index = intercept + 1 + axis;
+                let reach = gam_problem::LOG_STRENGTH_MAX / axis_scale[axis];
+                assert_eq!((lower[index], upper[index]), (-reach, reach));
+            }
+        }
+        for axis in 0..latent_dim {
+            let index = latent_flat_dim + 2 * head_block + axis;
+            assert_eq!((lower[index], upper[index]), (box_lo, box_hi));
+        }
+
+        // Nothing in the whole domain is the retired hand box.
+        for index in 0..seed.len() {
+            assert!(lower[index] != -12.0 && upper[index] != 12.0);
+        }
     }
 
     /// A log-strength analytic coordinate searches its registry face inside the
-    /// precision box, not `[-12, 12]`. The parametric row-precision raw-beta
-    /// and mean offsets, which the registry leaves unbounded, keep the box
-    /// that is still to be derived.
+    /// precision box, not `[-12, 12]`. A location coordinate — the parametric
+    /// row-precision raw-beta and mean offsets — takes the registry's derived
+    /// face verbatim, because the precision box is stated in e-folds and says
+    /// nothing about a coordinate in an auxiliary column's units.
     #[test]
     fn analytic_log_strengths_search_registry_faces_within_the_precision_box_4266() {
+        use gam_terms::latent::CoordinatePriorSupport;
         let mut registry = gam_terms::AnalyticPenaltyRegistry::new();
         registry.push(AnalyticPenaltyKind::OrderedBetaBernoulli(Arc::new(
             OrderedBetaBernoulliPenalty::new(3, 1.7, 0.8, true),
@@ -6304,24 +6555,43 @@ mod latent_joint_auxiliary_domain_tests {
         let analytic = registry.total_rho_count();
         assert_eq!(analytic, 8);
         let latent_flat_dim = 4;
+        let supports = vec![CoordinatePriorSupport::Line; 2];
         let seed = Array1::<f64>::zeros(latent_flat_dim + analytic);
-        let (lower, upper) =
-            latent_joint_auxiliary_domain(seed.view(), latent_flat_dim, Some(&registry), &[])
-                .unwrap();
+        let (lower, upper) = latent_joint_auxiliary_domain(
+            seed.view(),
+            latent_flat_dim,
+            &supports,
+            Some(&registry),
+            &[],
+        )
+        .unwrap();
         let (box_lo, box_hi) = gam_solve::estimate::rho_domain::precision_box();
-        // Latent coordinates: `±(max|t₀| + 10)` around the zero seed.
+        // Latent coordinates: a seed identically zero carries no scale of its
+        // own, so each axis takes the precision box's reach at unit scale.
+        let reach = box_hi.exp();
         for axis in 0..latent_flat_dim {
-            assert_eq!((lower[axis], upper[axis]), (-11.0, 11.0));
+            assert_eq!((lower[axis], upper[axis]), (-reach, reach));
         }
         // Ordered-beta alpha, both row-precision log-alphas, row-precision weight.
         for local in [0, 1, 2, 7] {
             let axis = latent_flat_dim + local;
             assert_eq!((lower[axis], upper[axis]), (box_lo, box_hi), "coordinate {local}");
         }
-        // Row-precision raw-beta and mean offsets.
+        // Row-precision raw-beta and mean offsets: the registry's face, whole.
+        let (registry_lower, registry_upper) = registry.rho_domain_bounds().unwrap();
+        let kinds = registry.rho_coordinate_kinds().unwrap();
         for local in 3..7 {
             let axis = latent_flat_dim + local;
-            assert_eq!((lower[axis], upper[axis]), (-12.0, 12.0), "coordinate {local}");
+            assert_eq!(kinds[local], gam_terms::RhoCoordinateKind::Location);
+            assert_eq!(
+                (lower[axis], upper[axis]),
+                (registry_lower[local], registry_upper[local]),
+                "coordinate {local}"
+            );
+            assert!(
+                lower[axis].is_finite() && upper[axis] > box_hi,
+                "coordinate {local} is finite and far wider than the log-space box"
+            );
         }
     }
 }
@@ -6702,6 +6972,7 @@ fn try_exact_joint_latent_coord_optimization(
     let (auxiliary_lower, auxiliary_upper) = latent_joint_auxiliary_domain(
         theta0.slice(s![rho_dim..]),
         latent_flat_dim,
+        &latent.values.effective_prior_supports(),
         latent.analytic_penalties.as_deref(),
         &direct_slots,
     )?;

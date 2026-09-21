@@ -713,7 +713,9 @@ fn parametric_row_precision_domains_distinguish_log_strengths_from_raw_coordinat
     .unwrap();
 
     let domains = penalty.rho_coordinate_domains().unwrap();
+    let kinds = penalty.rho_coordinate_kinds();
     assert_eq!(domains.len(), 7);
+    assert_eq!(kinds.len(), 7);
     assert_eq!(domains[0], (LOG_STRENGTH_MIN, LOG_STRENGTH_MAX));
     assert_eq!(
         domains[1],
@@ -722,38 +724,83 @@ fn parametric_row_precision_domains_distinguish_log_strengths_from_raw_coordinat
             LOG_STRENGTH_MAX - 2.0_f64.ln(),
         )
     );
-    for &(lower, upper) in &domains[2..6] {
-        assert_eq!(lower, f64::NEG_INFINITY);
-        assert_eq!(upper, f64::INFINITY);
-    }
     assert_eq!(
         domains[6],
         learnable_weight_coordinate_domain(1.7)
             .unwrap()
             .expect("positive weight has a coordinate domain")
     );
+    assert_eq!(
+        kinds,
+        vec![
+            RhoCoordinateKind::LogStrength,
+            RhoCoordinateKind::LogStrength,
+            RhoCoordinateKind::Location,
+            RhoCoordinateKind::Location,
+            RhoCoordinateKind::Location,
+            RhoCoordinateKind::Location,
+            RhoCoordinateKind::LogStrength,
+        ]
+    );
+
+    // Every face is finite (#4266): a caller must never have to invent one.
+    for (index, &(lower, upper)) in domains.iter().enumerate() {
+        assert!(
+            lower.is_finite() && upper.is_finite() && lower < upper,
+            "coordinate {index} face [{lower}, {upper}]"
+        );
+    }
+
+    // raw_beta: the slope softplus(b_k + rho) reaches lambda multiplied by the
+    // largest declared d^2, which here is (1 - 0)^2 = 1, so the face is where
+    // the slope itself stops being a representable strength. Both ends carry
+    // back through softplus exactly.
+    let ceiling = checked_exp_log_strength(LOG_STRENGTH_MAX).unwrap();
+    let floor = checked_exp_log_strength(LOG_STRENGTH_MIN).unwrap();
+    for (k, &base_raw_beta) in [0.0_f64, -0.5].iter().enumerate() {
+        let (lower, upper) = domains[2 + k];
+        let low_slope = gam_math::special::softplus(lower + base_raw_beta);
+        let high_slope = gam_math::special::softplus(upper + base_raw_beta);
+        assert!(
+            (low_slope / floor - 1.0).abs() < 1.0e-9,
+            "raw-beta {k} lower"
+        );
+        assert!(
+            (high_slope / ceiling - 1.0).abs() < 1.0e-9,
+            "raw-beta {k} upper"
+        );
+    }
+
+    // mu: a location in the auxiliary rows' units. Its face is every point
+    // within sqrt(exp(LOG_STRENGTH_MAX)) of the whole aux column [0, 1].
+    let reach = ceiling.sqrt();
+    for (k, &base_mu) in [0.0_f64, 0.5].iter().enumerate() {
+        assert_eq!(domains[4 + k], (1.0 - reach - base_mu, reach - base_mu));
+    }
+
     let mut registry = AnalyticPenaltyRegistry::new();
     registry.push(AnalyticPenaltyKind::ParametricRowPrecisionPrior(Arc::new(
         penalty.clone(),
     )));
     let (registry_lower, registry_upper) = registry.rho_domain_bounds().unwrap();
-    for index in 2..6 {
-        assert_eq!(registry_lower[index], f64::NEG_INFINITY);
-        assert_eq!(registry_upper[index], f64::INFINITY);
+    for index in 0..7 {
+        assert_eq!(registry_lower[index], domains[index].0);
+        assert_eq!(registry_upper[index], domains[index].1);
     }
+    assert_eq!(registry.rho_coordinate_kinds().unwrap(), kinds);
 
-    // Raw beta and mu are finite additive coordinates, not log-strengths:
-    // values beyond ±700 remain valid while a log-alpha beyond its effective
-    // face is refused.
+    // The face is a SEARCH domain; `validate_rho` asks only that the evaluated
+    // coordinate be finite, and a raw-beta or mu past the strength face is
+    // still an ordinary number, while a log-alpha past its face is refused.
     let mut rho = Array1::<f64>::zeros(7);
     rho[2] = 701.0;
     rho[4] = -701.0;
     penalty
         .validate_rho(rho.view())
-        .expect("finite raw-beta and mu coordinates are unbounded");
+        .expect("finite raw-beta and mu coordinates evaluate");
     registry
         .validate_rho(rho.view())
-        .expect("registry preserves ordinary unbounded raw coordinates");
+        .expect("registry evaluates ordinary raw coordinates");
     rho[0] = LOG_STRENGTH_MAX + 1.0e-6;
     assert!(penalty.validate_rho(rho.view()).is_err());
 

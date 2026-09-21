@@ -36,6 +36,31 @@
   reassurance; it now records why f64 needed the chart to make it true. The third-order block
   (ν ≥ 5/2) is assembled by a closed-form pair contraction rather than from a materialized
   operator and is not charted here.
+- **The latent joint search box is the union of four derived faces, not `±(max|t₀| + 10)`
+  and `±12`** (gam#4266).
+  `latent_joint_auxiliary_domain` boxed the latent coordinates `t` at `±(max|t₀| + 10)` and
+  everything else it could not classify at `±12`. The `+ 10` is a slack in the latent's own
+  units, so rescaling the initial latent by `c` widened the searchable region for `c < 1`
+  and narrowed it for `c > 1`; the `±12` sat on behavioral-head regression coefficients,
+  which are not strengths, and on the parametric row-precision raw-beta and mean offsets,
+  which the analytic-penalty registry published as infinite faces for the caller to
+  truncate. Each class now takes the face its own arithmetic gives it. A non-Euclidean
+  latent axis takes its manifold's own set exactly — `Interval` clamps to `[lo, hi]`,
+  `Circle` repeats every `period`, and `Sphere` holds a unit vector so each ambient axis
+  lies in `[-1, 1]` — because the declared manifold has no points outside it. A Euclidean
+  axis takes the precision box read in that axis's units, `1/√ε` times the largest
+  magnitude the seed puts on it, which is proportional to the seed and therefore invariant
+  under rescaling. A head coefficient reaches the likelihood only through a logistic or
+  softmax link, so `η` is exponentiated and its face is `LOG_STRENGTH_MAX` divided by the
+  column it multiplies (one, for the intercept). `AnalyticPenalty::rho_coordinate_domains`
+  now publishes a finite face for every coordinate and
+  `AnalyticPenalty::rho_coordinate_kinds` publishes each coordinate's unit, so the driver
+  intersects with the log-space precision box only where the coordinate is a logarithm:
+  `ParametricRowPrecisionPriorPenalty` derives its raw-beta and mean faces from
+  `λ = α + softplus(b)·d²` having to stay a representable strength, and the registry refuses
+  an infinite face rather than leaving a caller to invent a finite one. `gam_math::special`
+  gains `softplus_inverse`, which carries that face back through `softplus` on both
+  branches, including where `e^s` itself is not representable.
 
 - **A chart gauge normalized axes whose spread was its own rounding, and the stretches
   compounded into the smoothness Gram** (gam#2822).
