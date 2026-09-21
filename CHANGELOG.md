@@ -1,5 +1,17 @@
 ## Unreleased
 
+- **One owner for the uniform cyclic domain grid, and it closes on its end** (#3179 item 6).
+  `basis_with_jet(kind="bspline", periodic=True, n_basis=k)` built its knot grid with
+  `Array1::linspace(0.0, 1.0, k + 1)`, a second copy of
+  `position_basis::cyclic_uniform_grid`, which the formula front door
+  `resolve_basis_locations_1d` uses for the same request. The copy evaluated
+  `origin + i * step` at the last index too, and that product is one unit in the last
+  place below the end of the domain for 8 of the counts `2 <= k <= 200` on the unit
+  interval, the first at `k = 49`. `periodic_knot_domain` reads the last grid point as
+  the end of the period, so those counts got a period short by one unit in the last
+  place and a cyclic knot lattice the same request did not produce through the formula
+  door. `cyclic_uniform_grid` is now public and is the one owner: it steps only the
+  interior points and takes the last one from `end` itself.
 - **Weighted occupancy charges its likelihood on the rows its penalty counts** (#4319).
   `classify_occupancy_weighted` / `classify_occupancy_interval_weighted` ran the
   BIC race with a log-likelihood `Σ w_i ln f(x_i)` of `mass = Σ w` rows against a

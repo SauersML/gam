@@ -2914,13 +2914,23 @@ fn basis_with_jet<'py>(
                     }
                     // `n_basis` means the same thing in both branches: the
                     // number of design columns on the unit parameter domain.
-                    // A periodic basis takes its knots as the uniform lattice
-                    // `linspace(0, 1, n_basis + 1)` (one cyclic control per
-                    // interval, see `periodic_knot_domain`); an open basis
-                    // takes the canonical clamped uniform vector with
-                    // `n_basis - (degree + 1)` internal knots.
+                    // A periodic basis takes its knots as the uniform cyclic
+                    // grid over that domain (one cyclic control per interval,
+                    // see `periodic_knot_domain`); an open basis takes the
+                    // canonical clamped uniform vector with
+                    // `n_basis - (degree + 1)` internal knots. Both grids come
+                    // from the gam-terms owner that the formula front door
+                    // `resolve_basis_locations_1d` uses, so the same request
+                    // gives the same lattice through either door (#3179
+                    // item 6). `Array1::linspace(0.0, 1.0, n_basis + 1)` was
+                    // not that lattice: its last point is one unit in the last
+                    // place below 1.0 for 8 of the counts in `2..=200`, and
+                    // `periodic_knot_domain` reads the last point as the end of
+                    // the period, so the recovered period was short.
                     if periodic {
-                        Array1::linspace(0.0, 1.0, n_basis + 1)
+                        gam::terms::basis::position_basis::cyclic_uniform_grid(
+                            0.0, 1.0, n_basis,
+                        )
                     } else {
                         gam::terms::basis::generate_full_knot_vector(
                             (0.0, 1.0),

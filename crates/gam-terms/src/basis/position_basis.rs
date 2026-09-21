@@ -285,7 +285,19 @@ fn bspline_locations(
 /// The `num_basis + 1`-point uniform cyclic grid over `[origin, end]`, one
 /// cyclic control per interval: `i · step + origin`, closing exactly on `end`,
 /// the evaluation order a uniform `linspace(origin, end, num_basis + 1)` uses.
-fn cyclic_uniform_grid(origin: f64, end: f64, num_basis: usize) -> Array1<f64> {
+///
+/// This is the one owner of that grid (#3179 item 6). It is the array form of
+/// a cyclic domain `(origin, end, num_basis)`: the periodic B-spline front
+/// doors take their domain as a grid and read it back as those three numbers,
+/// so the grid must close on `end` exactly or the period they recover is short
+/// and the knot lattice they build is not the one that was asked for.
+/// `Array1::linspace(origin, end, num_basis + 1)` does NOT close on `end`: it
+/// evaluates `origin + i · step` at every index, including the last, and that
+/// product is one unit in the last place below `end` whenever the rounding of
+/// `step` does not cancel — 8 of the 199 counts `2 ≤ num_basis ≤ 200` on the
+/// unit domain, the first at `num_basis = 49`. The last point is therefore
+/// taken from `end` itself, and only the interior points are stepped.
+pub fn cyclic_uniform_grid(origin: f64, end: f64, num_basis: usize) -> Array1<f64> {
     let step = (end - origin) / num_basis as f64;
     Array1::from_iter((0..=num_basis).map(|i| {
         if i == num_basis {
@@ -611,6 +623,46 @@ mod tests {
 
     fn positions() -> Array1<f64> {
         Array1::from_iter((0..40).map(|i| 0.5 + 0.45 * (i as f64 * 1.7).sin()))
+    }
+
+    /// #3179 item 6: the cyclic domain grid is a closed period. A periodic
+    /// front door hands its domain on as this grid and reads it back as
+    /// `(first, last, len - 1)`, so a last point below `end` shortens the
+    /// period and moves the knot lattice. `linspace`'s `origin + i · step` at
+    /// `i = num_basis` does exactly that for some counts; this grid does not,
+    /// at any count and on either an exact or an inexact step.
+    #[test]
+    fn the_cyclic_domain_grid_closes_on_its_end_at_every_count_3179() {
+        let mut linspace_missed = 0usize;
+        for &(origin, end) in &[(0.0, 1.0), (-2.5, 4.25), (10.0, 10.75)] {
+            for num_basis in 2..=200usize {
+                let grid = cyclic_uniform_grid(origin, end, num_basis);
+                assert_eq!(grid.len(), num_basis + 1, "one control per interval");
+                assert_eq!(grid[0], origin, "the grid opens on its origin");
+                assert_eq!(
+                    grid[num_basis], end,
+                    "the grid must close on {end} at num_basis={num_basis}"
+                );
+                for j in 1..=num_basis {
+                    assert!(
+                        grid[j] > grid[j - 1],
+                        "the grid is strictly increasing at {j} (num_basis={num_basis})"
+                    );
+                }
+                let step = (end - origin) / num_basis as f64;
+                if origin + step * num_basis as f64 != end {
+                    linspace_missed += 1;
+                }
+            }
+        }
+        // Positive control: the stepped-through-the-end form this grid
+        // replaces really does miss the endpoint, so the assertions above are
+        // not vacuous.
+        assert!(
+            linspace_missed > 0,
+            "the `origin + i * step` form must miss `end` for at least one \
+             count, or this test proves nothing"
+        );
     }
 
     /// #2899 P4: an omitted basis size takes the formula front door's default for
