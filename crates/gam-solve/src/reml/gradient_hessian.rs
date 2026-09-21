@@ -2,6 +2,96 @@ use super::*;
 use gam_problem::OrderedRhoBounds;
 use std::sync::RwLock;
 
+/// A certified positive-definite factor of one of the Firth Laplace
+/// correction's curvature matrices (`H_F` or `H₀`): Cholesky when it
+/// succeeds, otherwise a symmetric eigendecomposition whose every eigenvalue
+/// clears the eigensolver's rounding band `γ_p·max|λ|`. Anything else is
+/// refused, because the Laplace correction is undefined off the
+/// positive-definite cone.
+pub(crate) enum TkSpdFactor {
+    Cholesky(gam_linalg::faer_ndarray::FaerCholeskyFactor),
+    Eigh {
+        evals: Array1<f64>,
+        evecs: Array2<f64>,
+    },
+}
+
+impl TkSpdFactor {
+    pub(crate) fn new(h: &Array2<f64>, label: &str) -> Result<Self, EstimationError> {
+        if let Ok(chol) = h.cholesky(Side::Lower) {
+            return Ok(Self::Cholesky(chol));
+        }
+        let Ok((evals, evecs)) = h.eigh(Side::Lower) else {
+            crate::bail_invalid_estim!("Tierney-Kadane correction could not factor {label}");
+        };
+        let spectral_scale = evals.iter().fold(0.0_f64, |acc, ev| acc.max(ev.abs()));
+        let resolvable_eigenvalue =
+            gam_linalg::roundoff::accumulation_growth(evals.len()) * spectral_scale;
+        if let Some((idx, ev)) = evals
+            .iter()
+            .enumerate()
+            .find(|(_, ev)| **ev <= resolvable_eigenvalue)
+        {
+            crate::bail_invalid_estim!(
+                "Tierney-Kadane correction requires {label} to be positive definite; \
+                 eigenvalue {idx} is {ev}"
+            );
+        }
+        Ok(Self::Eigh { evals, evecs })
+    }
+
+    pub(crate) fn solve_vec(&self, rhs: &Array1<f64>) -> Array1<f64> {
+        match self {
+            Self::Cholesky(chol) => chol.solvevec(rhs),
+            Self::Eigh { evals, evecs } => {
+                let coeffs = evecs.t().dot(rhs) / evals;
+                evecs.dot(&coeffs)
+            }
+        }
+    }
+
+    pub(crate) fn solve_mat(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        match self {
+            Self::Cholesky(chol) => {
+                let mut solved = rhs.clone();
+                chol.solve_mat_in_place(&mut solved);
+                solved
+            }
+            Self::Eigh { evals, evecs } => {
+                let mut coeffs = evecs.t().dot(rhs);
+                for (mut row, &ev) in coeffs.rows_mut().into_iter().zip(evals.iter()) {
+                    row /= ev;
+                }
+                evecs.dot(&coeffs)
+            }
+        }
+    }
+
+    pub(crate) fn inverse(&self) -> Array2<f64> {
+        let p = match self {
+            Self::Cholesky(chol) => chol.diag().len(),
+            Self::Eigh { evals, .. } => evals.len(),
+        };
+        let mut inv = self.solve_mat(&Array2::<f64>::eye(p));
+        gam_linalg::matrix::symmetrize_in_place(&mut inv);
+        inv
+    }
+
+    pub(crate) fn log_det(&self) -> f64 {
+        match self {
+            Self::Cholesky(chol) => 2.0 * chol.diag().iter().map(|v| v.ln()).sum::<f64>(),
+            Self::Eigh { evals, .. } => evals.iter().map(|v| v.ln()).sum(),
+        }
+    }
+}
+
+/// `tr(A B) = Σ_ij A_ij B_ji`.
+pub(crate) fn tk_trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+    ndarray::Zip::from(a)
+        .and(&b.t())
+        .fold(0.0, |acc, &x, &y| acc + x * y)
+}
+
 impl<'a> RemlState<'a> {
     pub(crate) const POLISH_NORM_RATIO: f64 = 0.25;
 
@@ -1068,8 +1158,6 @@ impl<'a> RemlState<'a> {
         ext_eta_fixed: &[Option<Array1<f64>>],
         ext_x_fixed: &[Option<Array2<f64>>],
         x_vks: &[Array1<f64>],
-        beta_dirs: &[Array1<f64>],
-        firth_op: Option<&super::FirthDenseOperator>,
         shared: &TkSharedIntermediates,
         gram: &mut Array2<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
@@ -1081,13 +1169,6 @@ impl<'a> RemlState<'a> {
             crate::bail_invalid_estim!(
                 "Tierney-Kadane correction internal gradient arity mismatch: {} response modes for {} coordinates",
                 x_vks.len(),
-                total_k
-            );
-        }
-        if beta_dirs.len() != total_k {
-            crate::bail_invalid_estim!(
-                "Tierney-Kadane correction internal beta-direction arity mismatch: {} beta directions for {} coordinates",
-                beta_dirs.len(),
                 total_k
             );
         }
@@ -1210,13 +1291,6 @@ impl<'a> RemlState<'a> {
             .and(x_dense.rows())
             .par_for_each(|o, xp_row, x_row| *o = xp_row.dot(&x_row));
 
-        let firth_trace_kernel = match firth_op {
-            Some(op) => Some(op.hphi_direction_trace_kernel(&p_total)?),
-            None => None,
-        };
-        let firth_trace = |beta_dir: &Array1<f64>| {
-            Self::tk_firth_beta_hessian_trace(firth_op, firth_trace_kernel.as_ref(), beta_dir, p)
-        };
 
         let mut gradient = Array1::<f64>::zeros(total_k);
         // The dominant `O(n²·p)` direct term for all `k` canonical directions
@@ -1237,9 +1311,8 @@ impl<'a> RemlState<'a> {
                     .sum::<f64>();
             let correction_trace =
                 Self::tk_active_weighted_trace(&shared.active_blocks, &x_vks[idx], &lev_p);
-            let firth_trace = firth_trace(&beta_dirs[idx])?;
             let direct = canonical_direct[idx];
-            gradient[idx] = trace_ak_p - correction_trace + firth_trace + direct;
+            gradient[idx] = trace_ak_p - correction_trace + direct;
         }
         let ext_values = (0..ext_drifts.len())
             .into_par_iter()
@@ -1263,7 +1336,6 @@ impl<'a> RemlState<'a> {
                 let x_vk_idx = k + extra_idx;
                 let correction_trace =
                     Self::tk_active_weighted_trace(&shared.active_blocks, &x_vks[x_vk_idx], &lev_p);
-                let firth_trace = firth_trace(&beta_dirs[x_vk_idx])?;
                 let mut eta_total = x_vks[x_vk_idx].mapv(|value| -value);
                 if let Some(eta_fixed) = ext_eta_fixed
                     .get(extra_idx)
@@ -1302,7 +1374,7 @@ impl<'a> RemlState<'a> {
                     &mut local_gram,
                     false,
                 )?;
-                Ok((x_vk_idx, trace_ak_p - correction_trace + firth_trace + direct))
+                Ok((x_vk_idx, trace_ak_p - correction_trace + direct))
             })
             .collect::<Result<Vec<_>, _>>()?;
         for (idx, value) in ext_values {
@@ -1317,30 +1389,6 @@ impl<'a> RemlState<'a> {
             }
         }
         Ok(gradient)
-    }
-
-    /// `-tr(D H_φ[u] Π)` for the β-direction `u = beta_dir`, through the
-    /// shared contractions of `Π` in `kernel`
-    /// (`FirthDenseOperator::hphi_direction_trace_kernel`).
-    pub(crate) fn tk_firth_beta_hessian_trace(
-        firth_op: Option<&super::FirthDenseOperator>,
-        kernel: Option<&super::FirthHphiTraceKernel>,
-        beta_dir: &Array1<f64>,
-        p: usize,
-    ) -> Result<f64, EstimationError> {
-        let (Some(firth_op), Some(kernel)) = (firth_op, kernel) else {
-            return Ok(0.0);
-        };
-        if beta_dir.len() != p {
-            crate::bail_invalid_estim!(
-                "Tierney-Kadane Firth beta-direction length mismatch: expected {}, got {}",
-                p,
-                beta_dir.len()
-            );
-        }
-        let deta = gam_linalg::faer_ndarray::fast_av(&firth_op.x_dense, beta_dir);
-        let dir = firth_op.direction_from_deta(deta);
-        Ok(-firth_op.hphi_direction_trace(kernel, &dir))
     }
 
     /// Direct analytic derivative of the TK scalar through the per-row
@@ -1720,7 +1768,38 @@ impl<'a> RemlState<'a> {
         Self::xt_diag_x_dense(x_dense, diag)
     }
 
-    pub(crate) fn tk_hessian_rho_canonical_logit<S>(
+    /// `A_k (β̂ − μ_k) = λ_k S_k (β̂ − μ_k)` in the full coefficient vector: the
+    /// right-hand side of the mode response `H_F ∂β̂/∂ρ_k = −A_k (β̂ − μ_k)`,
+    /// with the penalty centred on its prior mean exactly as the inner
+    /// objective's `½ (β − μ_k)ᵀ A_k (β − μ_k)` term is.
+    pub(crate) fn tk_penalty_mode_rhs(
+        cp: &gam_terms::construction::CanonicalPenalty,
+        lambda: f64,
+        beta: &Array1<f64>,
+        p: usize,
+    ) -> Array1<f64> {
+        let r = &cp.col_range;
+        let centered = &beta.slice(s![r.start..r.end]) - &cp.prior_mean;
+        let r_beta = cp.root.dot(&centered);
+        let mut out = Array1::<f64>::zeros(p);
+        for a in 0..cp.block_dim() {
+            out[r.start + a] = (0..cp.rank())
+                .map(|row| cp.root[[row, a]] * r_beta[row])
+                .sum::<f64>()
+                * lambda;
+        }
+        out
+    }
+
+    /// Exact ρ-Hessian of the Firth Laplace correction atom
+    /// (see [`Self::tierney_kadane_analytic_core`]),
+    ///
+    /// ```text
+    ///   C(ρ) = ½ log|H₀| − ½ log|H_F| − ½ tr(H₀⁻¹ H_φ) − TK(H₀),
+    /// ```
+    ///
+    /// with every piece evaluated at the Firth mode `β̂(ρ)`.
+    pub(crate) fn tk_hessian_rho_canonical_logit(
         x_dense: &Array2<f64>,
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
@@ -1729,12 +1808,11 @@ impl<'a> RemlState<'a> {
         tk_penalties: &[gam_terms::construction::CanonicalPenalty],
         lambdas: &[f64],
         beta: &Array1<f64>,
-        firth_op: Option<&super::FirthDenseOperator>,
-        h_inv_solve: &S,
-    ) -> Result<Array2<f64>, EstimationError>
-    where
-        S: Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
-    {
+        firth_op: &super::FirthDenseOperator,
+        hphi: &Array2<f64>,
+        h_f: &TkSpdFactor,
+        h_0: &TkSpdFactor,
+    ) -> Result<Array2<f64>, EstimationError> {
         let route = TkRowPairRoute::predicted_rho_hessian(
             x_dense.nrows(),
             x_dense.ncols(),
@@ -1750,7 +1828,9 @@ impl<'a> RemlState<'a> {
             lambdas,
             beta,
             firth_op,
-            h_inv_solve,
+            hphi,
+            h_f,
+            h_0,
             route,
         )
         .map(|(hessian, _)| hessian)
@@ -1759,7 +1839,26 @@ impl<'a> RemlState<'a> {
     /// [`Self::tk_hessian_rho_canonical_logit`] with the row-pair route chosen by
     /// the caller, returning the route that actually ran (the tensor route falls
     /// back to row pairs when the memory ledger refuses its tensors).
-    pub(crate) fn tk_hessian_rho_canonical_logit_with_route<S>(
+    ///
+    /// The mode moves on the Firth surface, so its derivatives are solved
+    /// against `H_F`:
+    ///
+    /// ```text
+    ///   β_i  = −v_i,  v_i = H_F⁻¹ A_i (β̂ − μ_i),
+    ///   β_ij = H_F⁻¹ ( Ḣ_F,j v_i + A_i v_j − δ_ij A_i (β̂ − μ_i) ),
+    /// ```
+    ///
+    /// with `Ḣ₀,i = A_i + Xᵀdiag(c ⊙ η_i)X`, `Ḣ_φ,i = DH_φ[β_i]`,
+    /// `Ḣ_F,i = Ḣ₀,i − Ḣ_φ,i`, `η_i = Xβ_i`, and the second derivatives
+    ///
+    /// ```text
+    ///   Ḧ₀,ij = Xᵀdiag(c ⊙ η_ij + d ⊙ η_i ⊙ η_j)X + δ_ij A_i,   η_ij = Xβ_ij,
+    ///   Ḧ_φ,ij = DH_φ[β_ij] + D²H_φ[β_i, β_j].
+    /// ```
+    ///
+    /// The determinant part is differentiated in closed form (below); the
+    /// Tierney–Kadane scalar is carried in second-order ρ-jets on `K = H₀⁻¹`.
+    pub(crate) fn tk_hessian_rho_canonical_logit_with_route(
         x_dense: &Array2<f64>,
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
@@ -1768,13 +1867,12 @@ impl<'a> RemlState<'a> {
         tk_penalties: &[gam_terms::construction::CanonicalPenalty],
         lambdas: &[f64],
         beta: &Array1<f64>,
-        firth_op: Option<&super::FirthDenseOperator>,
-        h_inv_solve: &S,
+        firth_op: &super::FirthDenseOperator,
+        hphi: &Array2<f64>,
+        h_f: &TkSpdFactor,
+        h_0: &TkSpdFactor,
         route: TkRowPairRoute,
-    ) -> Result<(Array2<f64>, TkRowPairRoute), EstimationError>
-    where
-        S: Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
-    {
+    ) -> Result<(Array2<f64>, TkRowPairRoute), EstimationError> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
         let k = tk_penalties.len();
@@ -1786,89 +1884,63 @@ impl<'a> RemlState<'a> {
                 "Tierney-Kadane Hessian derivative arrays have inconsistent lengths"
             );
         }
-
-        let mut k_mat = Array2::<f64>::zeros((p, p));
-        for col in 0..p {
-            let mut rhs = Array1::<f64>::zeros(p);
-            rhs[col] = 1.0;
-            let sol = h_inv_solve(&rhs)?;
-            k_mat.column_mut(col).assign(&sol);
+        if hphi.dim() != (p, p) {
+            crate::bail_invalid_estim!(
+                "Tierney-Kadane Hessian Jeffreys curvature is {}x{}, expected {p}x{p}",
+                hphi.nrows(),
+                hphi.ncols()
+            );
         }
-        gam_linalg::matrix::symmetrize_in_place(&mut k_mat);
+
+        let k_mat = h_0.inverse();
+        let g_f = h_f.inverse();
 
         let mut a_mats = Vec::with_capacity(k);
+        let mut mode_rhs = Vec::with_capacity(k);
         let mut v = Vec::with_capacity(k);
         let mut eta_i = Vec::with_capacity(k);
         for idx in 0..k {
             let a = Self::tk_penalty_dense(&tk_penalties[idx], lambdas[idx], p);
-            let rhs = a.dot(beta);
-            let vi = h_inv_solve(&rhs)?;
+            let rhs = Self::tk_penalty_mode_rhs(&tk_penalties[idx], lambdas[idx], beta, p);
+            let vi = h_f.solve_vec(&rhs);
             let bi = vi.mapv(|value| -value);
             let ei = gam_linalg::faer_ndarray::fast_av(x_dense, &bi);
             a_mats.push(a);
+            mode_rhs.push(rhs);
             v.push(vi);
             eta_i.push(ei);
         }
 
-        // Each per-penalty Firth direction depends only on eta_i[idx] (the
-        // β-direction δη for penalty idx), so it is constant across both the
-        // h_i loop below and every (i,j) pair in the second-derivative loop.
-        // Building it once here avoids the O(k²) redundant rebuilds that
-        // hphisecond_direction_apply otherwise triggered (each rebuild is an
-        // O(n·r²) reduced-Gram), which dominate the Firth outer-Hessian cost
-        // for binomial/logit REML (#1575). This is exact: direction_from_deta
-        // is a pure function of (op, eta_i[idx]).
-        //
-        // The k builds are independent and each pays two O(n·r²) reduced-Gram
-        // GEMMs (`reducedweighted_gram` + `reduced_diag_gram`), so — as with the
-        // h_i / h_ij loops below — fan them across the Rayon pool when there is
-        // more than one direction AND more than one thread, with the
-        // `with_nested_parallel` guard pinning each build's faer GEMMs to
-        // `Par::Seq` (no rayon×faer oversubscription). Index-ordered collection
-        // keeps the Vec identical to the serial build; at fixture scale the
-        // inner GEMMs are already `Par::Seq`, so the bits are unchanged (#1575).
-        let firth_dir_i: Vec<super::FirthDirection> = match firth_op {
-            Some(op) if k > 1 && rayon::current_num_threads() > 1 => {
-                use rayon::prelude::*;
-                eta_i
-                    .par_iter()
-                    .map(|e| {
-                        gam_problem::with_nested_parallel(|| op.direction_from_deta(e.clone()))
-                    })
-                    .collect()
-            }
-            Some(op) => eta_i
+        // Each per-penalty Firth direction depends only on eta_i[idx], so it is
+        // built once and shared by the first-derivative blocks and every (i,j)
+        // pair below (#1575). The k builds are independent O(n·r²) reduced-Gram
+        // passes, fanned across Rayon with the nested-BLAS guard when there is
+        // more than one direction and more than one thread; index-ordered
+        // collection keeps the Vec identical to the serial build.
+        let fan_units = k > 1 && rayon::current_num_threads() > 1;
+        let firth_dir_i: Vec<super::FirthDirection> = if fan_units {
+            use rayon::prelude::*;
+            eta_i
+                .par_iter()
+                .map(|e| gam_problem::with_nested_parallel(|| firth_op.direction_from_deta(e.clone())))
+                .collect()
+        } else {
+            eta_i
                 .iter()
-                .map(|e| op.direction_from_deta(e.clone()))
-                .collect(),
-            None => Vec::new(),
+                .map(|e| firth_op.direction_from_deta(e.clone()))
+                .collect()
         };
 
-        // First-derivative blocks H'[idx] — k independent full-data passes, each
-        // dominated (Firth path) by the O(n·r²·p) `hphi_direction` reduced-Gram
-        // apply.
-        //
-        // When there are several independent passes AND more than one thread, fan
-        // them across Rayon with the nested-BLAS guard (`with_nested_parallel`
-        // pins each pass's faer GEMMs to `Par::Seq`), spreading the passes over
-        // cores without rayon×faer oversubscription. With only one pass (k=1)
-        // there is nothing to spread and pinning the inner GEMMs to `Par::Seq`
-        // would instead STRIP the faer-level parallelism the serial path enjoys,
-        // so we fall back to the plain serial loop, leaving the inner GEMMs free
-        // to use the global pool. Either way the assembled blocks are identical:
-        // index-ordered collection in the parallel arm, and at fixture scale the
-        // inner GEMMs are already `Par::Seq` so the bits are unchanged (#1575).
-        let fan_units = k > 1 && rayon::current_num_threads() > 1;
-        let compute_h_i = |idx: usize| -> Array2<f64> {
+        // First-derivative blocks Ḣ₀,i and Ḣ_φ,i — k independent full-data
+        // passes, fanned out under the same rule as the directions above.
+        let compute_h_i = |idx: usize| -> (Array2<f64>, Array2<f64>) {
             let diag = c_array * &eta_i[idx];
-            let mut h = &a_mats[idx] + &Self::tk_xt_diag_x(x_dense, &diag);
-            if let Some(op) = firth_op {
-                h -= &op.hphi_direction(&firth_dir_i[idx]);
-            }
-            gam_linalg::matrix::symmetrize_in_place(&mut h);
-            h
+            let mut h0 = &a_mats[idx] + &Self::tk_xt_diag_x(x_dense, &diag);
+            gam_linalg::matrix::symmetrize_in_place(&mut h0);
+            let phi = firth_op.hphi_direction(&firth_dir_i[idx]);
+            (h0, phi)
         };
-        let h_i: Vec<Array2<f64>> = if fan_units {
+        let first_blocks: Vec<(Array2<f64>, Array2<f64>)> = if fan_units {
             use rayon::prelude::*;
             (0..k)
                 .into_par_iter()
@@ -1877,77 +1949,55 @@ impl<'a> RemlState<'a> {
         } else {
             (0..k).map(compute_h_i).collect()
         };
+        let (h0_i, phi_i): (Vec<Array2<f64>>, Vec<Array2<f64>>) = first_blocks.into_iter().unzip();
+        let hf_i: Vec<Array2<f64>> = h0_i.iter().zip(&phi_i).map(|(h0, phi)| h0 - phi).collect();
 
-        // The mixed second directional derivative D²H_φ[u,v] is evaluated for
-        // every (i,j) penalty pair below against the SAME identity rhs. Its
-        // single-index sub-blocks therefore have only k distinct values; cache
-        // them once here so the O(k²) pair loop reuses them instead of rebuilding
-        // an O(n·r²·p) reduced Hadamard-Gram for each pair. Exact / bit-identical
-        // to per-pair hphisecond_direction_apply(.., &eye) (#1575).
-        let firth_second_eye_cache =
-            firth_op.map(|op| op.tk_second_direction_eye_cache(&firth_dir_i));
+        // D²H_φ[u,v] is evaluated for every (i,j) pair against the same identity
+        // rhs, so its single-index sub-blocks are cached once (#1575).
+        let firth_second_eye_cache = firth_op.tk_second_direction_eye_cache(&firth_dir_i);
 
         let mut beta_ij: Vec<Vec<Array1<f64>>> = (0..k)
             .map(|_| (0..k).map(|_| Array1::<f64>::zeros(p)).collect())
             .collect();
-        let mut h_ij: Vec<Vec<Array2<f64>>> = (0..k)
-            .map(|_| (0..k).map(|_| Array2::<f64>::zeros((p, p))).collect())
-            .collect();
         for i in 0..k {
             for j in 0..=i {
-                let mut rhs = h_i[j].dot(&v[i]);
+                let mut rhs = hf_i[j].dot(&v[i]);
                 rhs += &a_mats[i].dot(&v[j]);
                 if i == j {
-                    rhs -= &a_mats[i].dot(beta);
+                    rhs -= &mode_rhs[i];
                 }
-                let bij = h_inv_solve(&rhs)?;
+                let bij = h_f.solve_vec(&rhs);
                 beta_ij[i][j] = bij.clone();
                 beta_ij[j][i] = bij;
             }
         }
-        // Mixed second-derivative blocks H''[i,j] for every upper-triangle pair.
-        // Each pair is an INDEPENDENT full-data pass — its cost is dominated, for
-        // the default-ON binomial/logit Firth path, by ~5 O(n·r²·p) reduced
-        // Hadamard-Gram applies inside `hphisecond_direction_apply_eye_cached`
-        // (#1575). The pairs share only immutable state (`op`, the cached
-        // directions/eye-blocks, `beta_ij`, the derivative arrays), so we fan the
-        // `k(k+1)/2` pairs across the Rayon pool; the `with_nested_parallel` guard
-        // pins each pair's faer GEMMs to `Par::Seq`, spreading the pairs over
-        // cores without rayon×faer oversubscription. The cheap reduction back into
-        // `h_ij` stays serial in index order, so the result is identical to the
-        // original double `for` loop. At the small regression-fixture scales the
-        // inner GEMMs are already `Par::Seq` (below faer's flop threshold), so
-        // forcing seq there changes nothing and the assembled blocks are
-        // bit-for-bit unchanged; the win is purely on the large-n perf path.
-        //
-        // As with `h_i` above, fan out only when there is more than one pair AND
-        // more than one thread; a single pair (k=1) runs serially so the inner
-        // GEMMs keep the global faer pool rather than being pinned to `Par::Seq`.
+        // Mixed second-derivative blocks Ḧ₀,ij and Ḧ_φ,ij for every lower-triangle
+        // pair: independent full-data passes, fanned out across Rayon with the
+        // nested-BLAS guard when there is more than one pair and more than one
+        // thread; the reduction back stays in index order (#1575).
         let h_pairs: Vec<(usize, usize)> =
             (0..k).flat_map(|i| (0..=i).map(move |j| (i, j))).collect();
-        let compute_h_pair = |&(i, j): &(usize, usize)| -> Array2<f64> {
+        let compute_h_pair = |&(i, j): &(usize, usize)| -> (Array2<f64>, Array2<f64>) {
             let eta_ij = gam_linalg::faer_ndarray::fast_av(x_dense, &beta_ij[i][j]);
             let diag = c_array * &eta_ij + &(d_array * &(&eta_i[i] * &eta_i[j]));
-            let mut h = Self::tk_xt_diag_x(x_dense, &diag);
+            let mut h0 = Self::tk_xt_diag_x(x_dense, &diag);
             if i == j {
-                h += &a_mats[i];
+                h0 += &a_mats[i];
             }
-            if let Some(op) = firth_op {
-                let dir_ij = op.direction_from_deta(eta_ij);
-                h -= &op.hphi_direction(&dir_ij);
-                // Reuse the per-penalty directions built once above and the
-                // single-index second-derivative sub-blocks cached once above,
-                // instead of rebuilding them per (i,j) pair (#1575).
-                let cache = firth_second_eye_cache
-                    .as_ref()
-                    .expect("firth second-direction eye cache present when firth_op is Some");
-                h -= &op.hphisecond_direction_apply_eye_cached(cache, &firth_dir_i, i, j);
-            }
-            gam_linalg::matrix::symmetrize_in_place(&mut h);
-            h
+            gam_linalg::matrix::symmetrize_in_place(&mut h0);
+            let dir_ij = firth_op.direction_from_deta(eta_ij);
+            let mut phi = firth_op.hphi_direction(&dir_ij);
+            phi += &firth_op.hphisecond_direction_apply_eye_cached(
+                &firth_second_eye_cache,
+                &firth_dir_i,
+                i,
+                j,
+            );
+            gam_linalg::matrix::symmetrize_in_place(&mut phi);
+            (h0, phi)
         };
         let fan_pairs = h_pairs.len() > 1 && rayon::current_num_threads() > 1;
-        let h_blocks: Vec<Array2<f64>> = if fan_pairs {
+        let pair_blocks: Vec<(Array2<f64>, Array2<f64>)> = if fan_pairs {
             use rayon::prelude::*;
             h_pairs
                 .par_iter()
@@ -1956,19 +2006,61 @@ impl<'a> RemlState<'a> {
         } else {
             h_pairs.iter().map(compute_h_pair).collect()
         };
-        for (&(i, j), h) in h_pairs.iter().zip(h_blocks.into_iter()) {
-            h_ij[i][j] = h.clone();
-            h_ij[j][i] = h;
+        let mut h0_ij: Vec<Vec<Array2<f64>>> = (0..k)
+            .map(|_| (0..k).map(|_| Array2::<f64>::zeros((p, p))).collect())
+            .collect();
+        let mut phi_ij: Vec<Vec<Array2<f64>>> = (0..k)
+            .map(|_| (0..k).map(|_| Array2::<f64>::zeros((p, p))).collect())
+            .collect();
+        for (&(i, j), (h0, phi)) in h_pairs.iter().zip(pair_blocks.into_iter()) {
+            h0_ij[i][j] = h0.clone();
+            h0_ij[j][i] = h0;
+            phi_ij[i][j] = phi.clone();
+            phi_ij[j][i] = phi;
         }
 
-        // `K_i = -K H_i K` and `K_ij = K H_j K H_i K + K H_i K H_j K - K H_ij K`.
-        // With `M_i = K H_i` and `P_i = K H_i K` computed once, each pair costs
-        // four GEMMs: `K_ij = M_j P_i + M_i P_j - K H_ij K`. Both are symmetric in
+        // Determinant part D = ½ log|H₀| − ½ log|H_F| − ½ tr(G₀H_φ), G₀ = H₀⁻¹,
+        // G_F = H_F⁻¹. Its first derivative is
+        //   Ḋ_i = tr(M_H Ḣ₀,i) + tr(M_φ Ḣ_φ,i),
+        //   M_H = ½ (G₀ − G_F + G₀H_φG₀),   M_φ = ½ (G_F − G₀),
+        // and differentiating M_H, M_φ once more gives, with
+        //   P_i = G₀Ḣ₀,i,  Q_i = G_FḢ_F,i,  R_i = G₀Ḣ_φ,i,  Σ = G₀H_φ,
+        //   D̈_ij = tr(M_H Ḧ₀,ij) + tr(M_φ Ḧ_φ,ij)
+        //        + ½ [ tr(Q_jQ_i) − tr(P_jP_i) − tr(P_jΣP_i) − tr(P_iΣP_j)
+        //              + tr(R_jP_i) + tr(P_jR_i) ].
+        let sigma = k_mat.dot(hphi);
+        let m_h = 0.5 * (&k_mat - &g_f + &sigma.dot(&k_mat));
+        let m_phi = 0.5 * (&g_f - &k_mat);
+        let p_mats: Vec<Array2<f64>> = h0_i.iter().map(|h| k_mat.dot(h)).collect();
+        let q_mats: Vec<Array2<f64>> = hf_i.iter().map(|h| g_f.dot(h)).collect();
+        let r_mats: Vec<Array2<f64>> = phi_i.iter().map(|h| k_mat.dot(h)).collect();
+        let ps_mats: Vec<Array2<f64>> = p_mats.iter().map(|pm| pm.dot(&sigma)).collect();
+        let mut det_hessian = Array2::<f64>::zeros((k, k));
+        for i in 0..k {
+            for j in 0..=i {
+                let value = tk_trace_product(&m_h, &h0_ij[i][j])
+                    + tk_trace_product(&m_phi, &phi_ij[i][j])
+                    + 0.5
+                        * (tk_trace_product(&q_mats[j], &q_mats[i])
+                            - tk_trace_product(&p_mats[j], &p_mats[i])
+                            - tk_trace_product(&ps_mats[j], &p_mats[i])
+                            - tk_trace_product(&ps_mats[i], &p_mats[j])
+                            + tk_trace_product(&r_mats[j], &p_mats[i])
+                            + tk_trace_product(&p_mats[j], &r_mats[i]));
+                det_hessian[[i, j]] = value;
+                det_hessian[[j, i]] = value;
+            }
+        }
+
+        // `K_i = -K H₀,i K` and `K_ij = K H₀,j K H₀,i K + K H₀,i K H₀,j K - K H₀,ij K`
+        // with `K = G₀ = H₀⁻¹`.
+        // With `M_i = K H₀,i` and `P_i = K H₀,i K` computed once, each pair costs
+        // four GEMMs: `K_ij = M_j P_i + M_i P_j - K H₀,ij K`. Both are symmetric in
         // exact arithmetic and are symmetrized so the contractions below may use
         // either index order.
         use gam_linalg::faer_ndarray::fast_ab;
         let compute_m_p = |idx: usize| -> (Array2<f64>, Array2<f64>) {
-            let m = fast_ab(&k_mat, &h_i[idx]);
+            let m = fast_ab(&k_mat, &h0_i[idx]);
             let p_mat = fast_ab(&m, &k_mat);
             (m, p_mat)
         };
@@ -1992,7 +2084,7 @@ impl<'a> RemlState<'a> {
         let compute_k_pair = |&(i, j): &(usize, usize)| -> Array2<f64> {
             let mut kij = fast_ab(&m_p[j].0, &m_p[i].1);
             kij += &fast_ab(&m_p[i].0, &m_p[j].1);
-            kij -= &fast_ab(&fast_ab(&k_mat, &h_ij[i][j]), &k_mat);
+            kij -= &fast_ab(&fast_ab(&k_mat, &h0_ij[i][j]), &k_mat);
             gam_linalg::matrix::symmetrize_in_place(&mut kij);
             kij
         };
@@ -2192,18 +2284,62 @@ impl<'a> RemlState<'a> {
             }
         }
         total.h += &(&quadratic * 0.125);
-        if total.h.iter().any(|v| !v.is_finite()) {
+        let hessian = det_hessian - &total.h;
+        if hessian.iter().any(|v| !v.is_finite()) {
             crate::bail_invalid_estim!(
                 "Tierney-Kadane analytic Hessian produced a non-finite entry"
             );
         }
-        Ok((total.h, used_route))
+        Ok((hessian, used_route))
     }
 
-    pub(crate) fn tierney_kadane_analytic_core<S>(
-        &self,
+    /// The Firth Laplace correction atom.
+    ///
+    /// The inner Firth solve maximizes the Jeffreys-penalized log posterior, so
+    /// the outer criterion approximates `−log ∫ exp(−F(β)) dβ` with
+    ///
+    /// ```text
+    ///   F(β) = F₀(β) − Φ(β),   F₀ = −ℓ(β) + ½ Σ_k (β − μ_k)ᵀA_k(β − μ_k),
+    ///   Φ(β) = ½ log|Xᵀ W(β) X|  (on the identifiable subspace),
+    ///   H₀ = ∇²F₀ = XᵀWX + S,   H_φ = ∇²Φ,   H_F = ∇²F = H₀ − H_φ.
+    /// ```
+    ///
+    /// The main objective carries `F(β̂) + ½ log|H_F| − ½ log|S|₊`. Using
+    /// `½ log|H_F|` as the Laplace curvature is where that criterion departs
+    /// from a consistent approximation: `H₀ = O(n)` while `H_φ = O(1)`, and
+    /// `H_F` is exactly singular where the Firth mode bifurcates (the
+    /// separated-data pitchfork, #3507), so `½ log|H_F| → −∞` there and the
+    /// criterion is unbounded below. Expanding the curvature term to the same
+    /// order as the Tierney–Kadane refinement,
+    ///
+    /// ```text
+    ///   ½ log|H_F| = ½ log|H₀| + ½ log|I − H₀⁻¹H_φ|
+    ///              = ½ log|H₀| − ½ tr(H₀⁻¹H_φ) + O(n⁻²),
+    /// ```
+    ///
+    /// and the refinement's third and fourth derivatives are those of `F₀`
+    /// (the `c`, `d` arrays; `Φ`'s are `O(1)` against `O(n)`), contracted
+    /// through `H₀⁻¹`. The refinement value
+    /// `TK = −⅛ Σ d_i h_i² + ¹⁄₁₂ Σ c_i c_j K_ij³ + ⅛ qᵀH₀⁻¹q` is the
+    /// log-ratio `log(∫e^{−F} / Laplace)`, so it lowers the cost. The criterion
+    /// is therefore
+    ///
+    /// ```text
+    ///   V = F(β̂) + ½ log|H₀| − ½ tr(H₀⁻¹H_φ) − TK(H₀) − ½ log|S|₊,
+    /// ```
+    ///
+    /// finite wherever `H₀` is positive definite, and the atom returned here
+    /// is its difference from the main objective,
+    ///
+    /// ```text
+    ///   C = ½ log|H₀| − ½ log|H_F| − ½ tr(H₀⁻¹H_φ) − TK(H₀),
+    /// ```
+    ///
+    /// with its gradient over the ρ and external coordinates and its exact
+    /// ρ-Hessian block. Both determinants are full-rank here: `H_F` and `H₀`
+    /// arrive as certified positive-definite factors.
+    pub(crate) fn tierney_kadane_analytic_core(
         x_dense: &Array2<f64>,
-        z: &Array2<f64>,
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
         e_array: &Array1<f64>,
@@ -2212,26 +2348,49 @@ impl<'a> RemlState<'a> {
         lambdas: &[f64],
         ext_coords: &[super::reml_outer_engine::HyperCoord],
         beta: &Array1<f64>,
-        firth_op: Option<&super::FirthDenseOperator>,
+        firth_op: &super::FirthDenseOperator,
+        hphi: &Array2<f64>,
+        h_f: &TkSpdFactor,
+        h_0: &TkSpdFactor,
         compute_gradient: bool,
         compute_hessian: bool,
-        h_inv_solve: &S,
-    ) -> Result<super::atoms::TierneyKadaneAtom, EstimationError>
-    where
-        S: Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
-    {
+    ) -> Result<super::atoms::TierneyKadaneAtom, EstimationError> {
+        let n = x_dense.nrows();
         let p = x_dense.ncols();
         let k = tk_penalties.len();
+        if hphi.dim() != (p, p) {
+            crate::bail_invalid_estim!(
+                "Tierney-Kadane Jeffreys curvature is {}x{}, expected {p}x{p}",
+                hphi.nrows(),
+                hphi.ncols()
+            );
+        }
 
+        let g_0 = h_0.inverse();
+        let sigma = g_0.dot(hphi);
+        let trace_sigma: f64 = sigma.diag().sum();
+        let det_value = 0.5 * (h_0.log_det() - h_f.log_det()) - 0.5 * trace_sigma;
+
+        let z = h_0.solve_mat(&x_dense.t().to_owned());
+        let h0_solve = |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+            Ok(h_0.solve_vec(rhs))
+        };
         let shared = Self::tk_shared_intermediates(
             x_dense,
-            z,
+            &z,
             c_array,
             "Tierney-Kadane correction",
-            h_inv_solve,
+            &h0_solve,
         )?;
         let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
-        let value = Self::tk_scalar_from_shared(x_dense, z, d_array, &shared, &mut gram)?;
+        let tk_value = Self::tk_scalar_from_shared(x_dense, &z, d_array, &shared, &mut gram)?;
+        let value = det_value - tk_value;
+        if !value.is_finite() {
+            crate::bail_invalid_estim!(
+                "Firth Laplace correction produced a non-finite value: determinant part \
+                 {det_value}, Tierney-Kadane part {tk_value}"
+            );
+        }
         if !compute_gradient {
             return Ok(super::atoms::TierneyKadaneAtom::from_terms(
                 TkCorrectionTerms {
@@ -2242,57 +2401,71 @@ impl<'a> RemlState<'a> {
             ));
         }
 
+        // Mode responses on the Firth surface: β_ρk = −H_F⁻¹A_k(β̂ − μ_k), and
+        // for an external coordinate β_τ = −H_F⁻¹g_τ. `x_vks` holds `−Xβ_θ`.
         let mut x_vks: Vec<Array1<f64>> = Vec::with_capacity(k + ext_coords.len());
-        let mut beta_dirs: Vec<Array1<f64>> = Vec::with_capacity(k + ext_coords.len());
         for idx in 0..k {
-            let cp = &tk_penalties[idx];
-            let r = &cp.col_range;
-            let beta_block = beta.slice(s![r.start..r.end]);
-            let centered = &beta_block - &cp.prior_mean;
-            let r_beta = cp.root.dot(&centered);
-            let mut s_k_beta = Array1::<f64>::zeros(p);
-            for a in 0..cp.block_dim() {
-                s_k_beta[r.start + a] = (0..cp.rank())
-                    .map(|row| cp.root[[row, a]] * r_beta[row])
-                    .sum::<f64>();
-            }
-            let a_k_beta = &s_k_beta * lambdas[idx];
-            let v_k = h_inv_solve(&a_k_beta)?;
+            let rhs = Self::tk_penalty_mode_rhs(&tk_penalties[idx], lambdas[idx], beta, p);
+            let v_k = h_f.solve_vec(&rhs);
             x_vks.push(gam_linalg::faer_ndarray::fast_av(x_dense, &v_k));
-            beta_dirs.push(v_k.mapv(|value| -value));
         }
+        // An external coordinate's drift is the fixed-β partial of `H_F`, which
+        // carries `−H_φ,τ|β` whenever its design moves. `H₀`'s drift adds it
+        // back, and the Jeffreys drift is kept for the determinant part.
+        let eye = Array2::<f64>::eye(p);
         let mut ext_drifts = Vec::with_capacity(ext_coords.len());
+        let mut ext_hphi_tau: Vec<Option<Array2<f64>>> = Vec::with_capacity(ext_coords.len());
         let mut ext_eta_fixed = Vec::with_capacity(ext_coords.len());
         let mut ext_x_fixed = Vec::with_capacity(ext_coords.len());
         for coord in ext_coords {
-            let drift = coord.drift.materialize();
-            if drift.ncols() != beta.len() || drift.nrows() != beta.len() {
+            let mut drift = coord.drift.materialize();
+            if drift.ncols() != p || drift.nrows() != p {
                 crate::bail_invalid_estim!(
-                    "Tierney-Kadane ext drift shape mismatch: expected {}x{}, got {}x{}",
-                    beta.len(),
-                    beta.len(),
+                    "Tierney-Kadane ext drift shape mismatch: expected {p}x{p}, got {}x{}",
                     drift.nrows(),
                     drift.ncols()
                 );
             }
-            if coord.g.len() != beta.len() {
+            if coord.g.len() != p {
                 crate::bail_invalid_estim!(
-                    "Tierney-Kadane ext mode RHS length mismatch: expected {}, got {}",
-                    beta.len(),
+                    "Tierney-Kadane ext mode RHS length mismatch: expected {p}, got {}",
                     coord.g.len()
                 );
             }
-            let beta_theta = h_inv_solve(&coord.g)?;
+            let beta_theta = h_f.solve_vec(&coord.g);
             x_vks.push(gam_linalg::faer_ndarray::fast_av(x_dense, &beta_theta));
-            beta_dirs.push(beta_theta.mapv(|value| -value));
+            let hphi_tau = match coord.tk_x_fixed.as_ref() {
+                Some(x_tau) if x_tau.iter().any(|value| *value != 0.0) => {
+                    if x_tau.dim() != (n, p) {
+                        crate::bail_invalid_estim!(
+                            "Tierney-Kadane ext fixed design shape mismatch: expected {n}x{p}, got {}x{}",
+                            x_tau.nrows(),
+                            x_tau.ncols()
+                        );
+                    }
+                    let Some(kernel) = Self::firth_exact_tau_kernel(firth_op, x_tau, beta, true)
+                        .tau_kernel
+                    else {
+                        crate::bail_invalid_estim!(
+                            "Tierney-Kadane ext coordinate's Jeffreys design-drift kernel is missing"
+                        );
+                    };
+                    let hphi_tau =
+                        Self::firth_hphi_tau_partial_apply(firth_op, x_tau, &kernel, &eye);
+                    drift += &hphi_tau;
+                    Some(hphi_tau)
+                }
+                _ => None,
+            };
             ext_drifts.push(drift);
+            ext_hphi_tau.push(hphi_tau);
             ext_eta_fixed.push(coord.tk_eta_fixed.clone());
             ext_x_fixed.push(coord.tk_x_fixed.clone());
         }
 
-        let gradient = Self::tk_gradient_from_shared(
+        let tk_gradient = Self::tk_gradient_from_shared(
             x_dense,
-            z,
+            &z,
             c_array,
             d_array,
             e_array,
@@ -2302,11 +2475,72 @@ impl<'a> RemlState<'a> {
             &ext_eta_fixed,
             &ext_x_fixed,
             &x_vks,
-            &beta_dirs,
-            firth_op,
             &shared,
             &mut gram,
         )?;
+
+        // Determinant part: Ḋ = tr(M_H Ḣ₀) + tr(M_φ Ḣ_φ) with
+        //   M_H = ½ (G₀ − G_F + G₀H_φG₀),   M_φ = ½ (G_F − G₀),
+        //   Ḣ₀ = (A_k | ∂H₀/∂τ|β) + Xᵀdiag(c ⊙ η̇)X,   η̇ = −x_vk,
+        //   Ḣ_φ = (0 | H_φ,τ|β) + DH_φ[β̇].
+        let g_f = h_f.inverse();
+        let m_h = 0.5 * (&g_0 - &g_f + &sigma.dot(&g_0));
+        let m_phi = 0.5 * (&g_f - &g_0);
+        // `tr(M_φ DH_φ[β̇])` for every coordinate shares one contraction of the
+        // symmetric `M_φ`, so each entry costs one Firth direction instead of a
+        // materialized `DH_φ[β̇]`.
+        let m_phi_trace_kernel = firth_op.hphi_direction_trace_kernel(&m_phi)?;
+        let x_mh = gam_linalg::faer_ndarray::fast_ab(x_dense, &m_h);
+        let mut lev_mh = Array1::<f64>::zeros(n);
+        ndarray::Zip::from(&mut lev_mh)
+            .and(x_mh.rows())
+            .and(x_dense.rows())
+            .par_for_each(|o, xm_row, x_row| *o = xm_row.dot(&x_row));
+        let total_k = k + ext_coords.len();
+        let det_gradient_entry = |idx: usize| -> f64 {
+            let eta_dot = x_vks[idx].mapv(|value| -value);
+            let curvature_trace: f64 = c_array
+                .iter()
+                .zip(eta_dot.iter())
+                .zip(lev_mh.iter())
+                .map(|((&c, &eta), &lev)| c * eta * lev)
+                .sum();
+            let drift_trace = if idx < k {
+                let cp = &tk_penalties[idx];
+                let r = &cp.col_range;
+                let block = m_h.slice(s![r.start..r.end, r.start..r.end]);
+                let rk_m = cp.root.dot(&block);
+                lambdas[idx]
+                    * (0..cp.rank())
+                        .map(|row| rk_m.row(row).dot(&cp.root.row(row)))
+                        .sum::<f64>()
+            } else {
+                tk_trace_product(&m_h, &ext_drifts[idx - k])
+            };
+            let mut phi_trace = firth_op
+                .hphi_direction_trace(&m_phi_trace_kernel, &firth_op.direction_from_deta(eta_dot));
+            if idx >= k
+                && let Some(hphi_tau) = ext_hphi_tau[idx - k].as_ref()
+            {
+                phi_trace += tk_trace_product(&m_phi, hphi_tau);
+            }
+            drift_trace + curvature_trace + phi_trace
+        };
+        let det_gradient: Vec<f64> = if total_k > 1 && rayon::current_num_threads() > 1 {
+            use rayon::prelude::*;
+            (0..total_k)
+                .into_par_iter()
+                .map(|idx| gam_problem::with_nested_parallel(|| det_gradient_entry(idx)))
+                .collect()
+        } else {
+            (0..total_k).map(det_gradient_entry).collect()
+        };
+        let gradient = Array1::from(det_gradient) - &tk_gradient;
+        if gradient.iter().any(|value| !value.is_finite()) {
+            crate::bail_invalid_estim!(
+                "Firth Laplace correction produced a non-finite gradient entry"
+            );
+        }
         let hessian = if compute_hessian {
             Some(Self::tk_hessian_rho_canonical_logit(
                 x_dense,
@@ -2318,7 +2552,9 @@ impl<'a> RemlState<'a> {
                 lambdas,
                 beta,
                 firth_op,
-                h_inv_solve,
+                hphi,
+                h_f,
+                h_0,
             )?)
         } else {
             None
@@ -2332,6 +2568,9 @@ impl<'a> RemlState<'a> {
         ))
     }
 
+    /// The Firth Laplace correction atom at the current inner mode: the
+    /// difference between the consistent Firth Laplace criterion and the main
+    /// objective's `½ log|H_F|` (see [`Self::tierney_kadane_analytic_core`]).
     pub(crate) fn tierney_kadane_terms(
         &self,
         rho: &Array1<f64>,
@@ -2407,51 +2646,14 @@ impl<'a> RemlState<'a> {
             return Ok(zero_correction());
         }
 
-        if let Some(sparse) = bundle.sparse_exact.as_ref() {
-            let x_dense = self
-                .x()
-                .try_to_dense_arc("frozen-curvature TK correction requires dense design access")
-                .map_err(EstimationError::InvalidInput)?;
-            let xt = x_dense.t().to_owned();
-            let z_mat =
-                gam_linalg::sparse_exact::solve_sparse_spdmulti(sparse.factor.as_ref(), &xt)?;
-            let factor_ref = sparse.factor.clone();
-            let h_inv_solve = |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-                Ok(gam_linalg::sparse_exact::solve_sparse_spd(
-                    &factor_ref,
-                    rhs,
-                )?)
-            };
-            let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())?;
-            let beta = self.sparse_exact_beta_original(pirls_result);
-            let firth_op = if reml_robust_jeffreys_link(&self.config).is_some() {
-                let jeffreys_link = self.runtime_inverse_link();
-                Some(std::sync::Arc::new(
-                    Self::build_firth_dense_operator_for_link(
-                        &jeffreys_link,
-                        x_dense.as_ref(),
-                        &pirls_result.final_eta.to_owned(),
-                        self.weights,
-                    )?,
-                ))
-            } else {
-                None
-            };
-            return self.tierney_kadane_analytic_core(
-                x_dense.as_ref(),
-                &z_mat,
-                &c_array,
-                &d_array,
-                &e_array,
-                &f_array,
-                &self.canonical_penalties,
-                &lambdas,
-                ext_coords,
-                &beta,
-                firth_op.as_deref(),
-                compute_gradient,
-                mode == super::reml_outer_engine::EvalMode::ValueGradientHessian,
-                &h_inv_solve,
+        // Firth fits run the dense inner solver (`inner_strategy` routes every
+        // Jeffreys-penalized fit there), so a sparse-exact bundle never reaches
+        // this correction; a bundle that did would carry no `H_φ` split and is
+        // refused rather than corrected against the wrong curvature.
+        if bundle.sparse_exact.is_some() {
+            crate::bail_invalid_estim!(
+                "the Firth Laplace correction requires the dense Firth Hessian; \
+                 a sparse-exact bundle reached it"
             );
         }
 
@@ -2480,82 +2682,6 @@ impl<'a> RemlState<'a> {
             pirls_result.x_transformed.to_dense().dot(z)
         } else {
             pirls_result.x_transformed.to_dense()
-        };
-
-        let xt = x_eff_dense.t().to_owned();
-        let p = x_eff_dense.ncols();
-        let n = x_eff_dense.nrows();
-        enum HFactor {
-            Cholesky(gam_linalg::faer_ndarray::FaerCholeskyFactor),
-            Eigh {
-                evals: Array1<f64>,
-                evecs: Array2<f64>,
-            },
-        }
-        let h_factor = if let Ok(chol) = h_tk_eval.cholesky(Side::Lower) {
-            HFactor::Cholesky(chol)
-        } else if let Ok((evals, evecs)) = h_tk_eval.eigh(Side::Lower) {
-            // An eigenvalue inside the eigensolver's rounding band `γ_p·max|λ|`
-            // (or below it) means the effective Hessian failed
-            // positive-definiteness (Cholesky already declined), so the
-            // Tierney–Kadane Laplace correction is undefined here.
-            let spectral_scale = evals.iter().fold(0.0_f64, |acc, ev| acc.max(ev.abs()));
-            let resolvable_eigenvalue =
-                gam_linalg::roundoff::accumulation_growth(evals.len()) * spectral_scale;
-            if let Some((idx, ev)) = evals
-                .iter()
-                .enumerate()
-                .find(|(_, ev)| **ev <= resolvable_eigenvalue)
-            {
-                crate::bail_invalid_estim!(
-                    "Tierney-Kadane correction requires a positive definite Hessian; eigenvalue {idx} is {ev}"
-                );
-            }
-            HFactor::Eigh { evals, evecs }
-        } else {
-            crate::bail_invalid_estim!(
-                "Tierney-Kadane correction could not factor the effective Hessian"
-            );
-        };
-
-        let z_mat = match &h_factor {
-            HFactor::Cholesky(chol) => {
-                let mut solved = xt.clone();
-                chol.solve_mat_in_place(&mut solved);
-                solved
-            }
-            HFactor::Eigh { evals, evecs } => {
-                let mut solved = Array2::<f64>::zeros((p, n));
-                for m in 0..evals.len() {
-                    let ev = evals[m];
-                    let u = evecs.column(m);
-                    let coeffs = xt.t().dot(&u).mapv(|v| v / ev);
-                    for row in 0..p {
-                        let u_row = u[row];
-                        for col in 0..n {
-                            solved[[row, col]] += u_row * coeffs[col];
-                        }
-                    }
-                }
-                solved
-            }
-        };
-
-        let h_inv_solve = move |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            match &h_factor {
-                HFactor::Cholesky(chol) => Ok(chol.solvevec(rhs)),
-                HFactor::Eigh { evals, evecs } => {
-                    let mut sol = Array1::<f64>::zeros(rhs.len());
-                    for m in 0..evals.len() {
-                        let u = evecs.column(m);
-                        let coeff = u.dot(rhs) / evals[m];
-                        for row in 0..sol.len() {
-                            sol[row] += coeff * u[row];
-                        }
-                    }
-                    Ok(sol)
-                }
-            }
         };
 
         let p_eff = x_eff_dense.ncols();
@@ -2612,23 +2738,23 @@ impl<'a> RemlState<'a> {
         } else {
             pirls_result.beta_transformed.as_ref().clone()
         };
-        let firth_op = if reml_robust_jeffreys_link(&self.config).is_some() {
-            let jeffreys_link = self.runtime_inverse_link();
-            Some(std::sync::Arc::new(
-                Self::build_firth_dense_operator_for_link(
-                    &jeffreys_link,
-                    &x_eff_dense,
-                    &pirls_result.final_eta.to_owned(),
-                    self.weights,
-                )?,
-            ))
-        } else {
-            None
-        };
-
-        self.tierney_kadane_analytic_core(
+        // The early return above guarantees a Jeffreys link here.
+        let firth_op = Self::build_firth_dense_operator_for_link(
+            &self.runtime_inverse_link(),
             &x_eff_dense,
-            &z_mat,
+            &pirls_result.final_eta.to_owned(),
+            self.weights,
+        )?;
+        // `h_total` is the Firth Hessian `H_F = H₀ − H_φ`; the plain penalized
+        // information `H₀` is recovered by adding the Jeffreys curvature back.
+        let hphi = firth_op.hphi_at_mode()?;
+        let h_f = TkSpdFactor::new(&h_tk_eval, "the Firth Hessian H_F")?;
+        let mut h0_dense = &h_tk_eval + &hphi;
+        gam_linalg::matrix::symmetrize_in_place(&mut h0_dense);
+        let h_0 = TkSpdFactor::new(&h0_dense, "the penalized information H_0")?;
+
+        Self::tierney_kadane_analytic_core(
+            &x_eff_dense,
             &c_array,
             &d_array,
             &e_array,
@@ -2637,10 +2763,12 @@ impl<'a> RemlState<'a> {
             &lambdas,
             ext_coords,
             &beta,
-            firth_op.as_deref(),
+            &firth_op,
+            &hphi,
+            &h_f,
+            &h_0,
             compute_gradient,
             mode == super::reml_outer_engine::EvalMode::ValueGradientHessian,
-            &h_inv_solve,
         )
     }
 
@@ -6626,16 +6754,10 @@ impl<'a> RemlState<'a> {
             // the transformed design column space. The hphi block below is
             // therefore the curvature of that basis-invariant penalty,
             // represented in the current transformed basis.
-            let diag_term =
-                Self::xt_diag_x_dense(&firth_op.x_dense, &(&firth_op.w2 * &firth_op.h_diag));
-            let bpb = gam_linalg::faer_ndarray::fast_atb(&firth_op.b_base, &firth_op.p_b_base);
-            let mut hphi = 0.5 * (diag_term - bpb);
-            // Numerical symmetry guard.
-            gam_linalg::matrix::symmetrize_in_place(&mut hphi);
-            // Keep tiny numerical noise from making the solve surface less stable.
-            if hphi.iter().all(|v| v.is_finite()) {
-                h_total -= &hphi;
-            }
+            // A non-finite H_φ is refused rather than skipped: dropping it would
+            // hand the outer criterion the plain `Xᵀ W X + S` while the inner
+            // solve converged on the Firth surface.
+            h_total -= &firth_op.hphi_at_mode()?;
             firth_dense_operator = Some(firth_op);
         }
 
@@ -8458,6 +8580,19 @@ mod firth_hessian_direction_reuse_tests {
         (x, beta, op, penalties, lambdas)
     }
 
+    // A test `H₀` (any SPD matrix) with the Jeffreys curvature split off:
+    // `H_F = H₀ − H_φ`, both as certified factors, the way
+    // `tierney_kadane_terms` hands them to the correction.
+    fn firth_test_factors(
+        op: &super::super::FirthDenseOperator,
+        h_0: &Array2<f64>,
+    ) -> (Array2<f64>, TkSpdFactor, TkSpdFactor) {
+        let hphi = op.hphi_at_mode().expect("finite Jeffreys curvature");
+        let h_f = TkSpdFactor::new(&(h_0 - &hphi), "the test H_F").expect("SPD test H_F");
+        let h_0 = TkSpdFactor::new(h_0, "the test H_0").expect("SPD test H_0");
+        (hphi, h_f, h_0)
+    }
+
     // The #1575 fix replaces per-(i,j)-pair rebuilds of the per-penalty Firth
     // directions with a single precomputed reuse. This locks in the invariant
     // that makes the substitution exact: a reused FirthDirection feeds
@@ -8520,16 +8655,7 @@ mod firth_hessian_direction_reuse_tests {
         for d in 0..p {
             h[[d, d]] += 1.0;
         }
-        let h_solver = h.clone();
-        let h_inv_solve = move |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            Ok(
-                gam_linalg::utils::certified_spd_factorize(&h_solver, "Firth test Hessian")
-                    .expect("well-conditioned SPD factor")
-                    .solve(rhs)
-                    .expect("certified SPD solve")
-                    .into_solution(),
-            )
-        };
+        let (hphi, h_f, h_0) = firth_test_factors(&op, &h);
 
         let hess = RemlState::tk_hessian_rho_canonical_logit(
             &x,
@@ -8540,8 +8666,10 @@ mod firth_hessian_direction_reuse_tests {
             &penalties,
             &lambdas,
             &beta,
-            Some(&op),
-            &h_inv_solve,
+            &op,
+            &hphi,
+            &h_f,
+            &h_0,
         )
         .expect("tk hessian");
 
@@ -8629,16 +8757,7 @@ mod firth_hessian_direction_reuse_tests {
         for d in 0..p {
             h[[d, d]] += 1.0;
         }
-        let h_solver = h.clone();
-        let h_inv_solve = move |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            Ok(
-                gam_linalg::utils::certified_spd_factorize(&h_solver, "Firth k4 test Hessian")
-                    .expect("well-conditioned SPD factor")
-                    .solve(rhs)
-                    .expect("certified SPD solve")
-                    .into_solution(),
-            )
-        };
+        let (hphi, h_f, h_0) = firth_test_factors(op, &h);
         RemlState::tk_hessian_rho_canonical_logit(
             x,
             &c_array,
@@ -8648,8 +8767,10 @@ mod firth_hessian_direction_reuse_tests {
             penalties,
             lambdas,
             beta,
-            Some(op),
-            &h_inv_solve,
+            op,
+            &hphi,
+            &h_f,
+            &h_0,
         )
         .expect("tk hessian")
     }
@@ -8757,16 +8878,7 @@ mod firth_hessian_direction_reuse_tests {
         for d in 0..p {
             h[[d, d]] += 1.0;
         }
-        let h_solver = h.clone();
-        let h_inv_solve = move |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            Ok(
-                gam_linalg::utils::certified_spd_factorize(&h_solver, "Firth k4 tensor route test")
-                    .expect("well-conditioned SPD factor")
-                    .solve(rhs)
-                    .expect("certified SPD solve")
-                    .into_solution(),
-            )
-        };
+        let (hphi, h_f, h_0) = firth_test_factors(&op, &h);
         let hessian = |route: TkRowPairRoute| {
             RemlState::tk_hessian_rho_canonical_logit_with_route(
                 &x,
@@ -8777,8 +8889,10 @@ mod firth_hessian_direction_reuse_tests {
                 &penalties,
                 &lambdas,
                 &beta,
-                Some(&op),
-                &h_inv_solve,
+                &op,
+                &hphi,
+                &h_f,
+                &h_0,
                 route,
             )
             .expect("tk hessian")
@@ -8817,8 +8931,7 @@ mod firth_hessian_direction_reuse_tests {
         let (x, beta, op, penalties, lambdas) = synthetic_logit_setup_k4();
         let k = penalties.len();
         // The fan-out this test guards is gated on `rayon::current_num_threads() > 1`
-        // (the `Some(op) if k > 1 && current_num_threads() > 1`, `fan_units`, and
-        // `fan_pairs` branches in this module). On a single-core runner or under
+        // (the `fan_units` and `fan_pairs` branches in this module). On a single-core runner or under
         // `RAYON_NUM_THREADS=1` that gate is false and the assembly silently takes
         // the SERIAL path — so without pinning a multi-threaded pool the
         // determinism guard would be vacuous (it would "pass" while exercising none
@@ -9021,7 +9134,6 @@ mod firth_hessian_direction_reuse_tests {
                 Array1::from_shape_fn(n, |i| 0.3 * ((i as f64 + 1.0) * (idx as f64 + 0.7)).sin())
             })
             .collect();
-        let beta_dirs: Vec<Array1<f64>> = (0..k + 1).map(|_| Array1::zeros(p)).collect();
         let drift = Array2::from_shape_fn((p, p), |(a, b)| {
             0.05 * (((a + b) as f64) * 0.9).cos() + if a == b { 0.1 } else { 0.0 }
         });
@@ -9079,8 +9191,6 @@ mod firth_hessian_direction_reuse_tests {
                 &[Some(eta_fixed.clone())],
                 &[Some(x_fixed.clone())],
                 &x_vks,
-                &beta_dirs,
-                None,
                 shared,
                 gram,
             )

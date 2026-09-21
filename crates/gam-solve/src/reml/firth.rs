@@ -855,6 +855,29 @@ impl FirthDenseOperator {
         self.half_log_det
     }
 
+    /// `H_φ = ∇²_β Φ` at the mode the operator was built on:
+    ///
+    /// ```text
+    ///   H_φ = ½ [ Xᵀ diag(w'' ⊙ h) X − Bᵀ P B ],
+    /// ```
+    ///
+    /// the curvature of the identifiable-subspace Jeffreys term represented in
+    /// the operator's design basis. The inner Firth Hessian is
+    /// `H_F = Xᵀ W X + S − H_φ`, so this block is the one piece that separates
+    /// it from the plain penalized information `H_0 = Xᵀ W X + S`, which the
+    /// Firth Laplace correction recovers as `H_F + H_φ`.
+    pub(crate) fn hphi_at_mode(&self) -> Result<Array2<f64>, EstimationError> {
+        let diag_term = RemlState::xt_diag_x_dense(&self.x_dense, &(&self.w2 * &self.h_diag));
+        let bpb = fast_atb(&self.b_base, &self.p_b_base);
+        let mut hphi = 0.5 * (diag_term - bpb);
+        symmetrize_in_place(&mut hphi);
+        if let Some(bad) = hphi.iter().find(|v| !v.is_finite()) {
+            return Err(EstimationError::InvalidInput(format!(
+                "Jeffreys curvature H_phi at the mode has a non-finite entry ({bad})"
+            )));
+        }
+        Ok(hphi)
+    }
 
     #[inline]
     pub(crate) fn jeffreys_beta_gradient(&self) -> Array1<f64> {
@@ -3262,6 +3285,34 @@ mod tests {
             hess.column_mut(j).assign(&col);
         }
         hess
+    }
+
+    /// `hphi_at_mode` is `∇²_β Φ`: it matches central differences of the
+    /// analytic Jeffreys gradient for a canonical and a non-canonical link.
+    #[test]
+    fn hphi_at_mode_matches_finite_difference_jeffreys_hessian() {
+        let x = fixed_design_5x3();
+        let beta = array![0.25, -0.40, 0.30];
+        for link in [StandardLink::Logit, StandardLink::Probit] {
+            let op = build_link_firth_op(link, &x, &beta);
+            let analytic = op.hphi_at_mode().expect("finite H_phi");
+            let fd = numeric_firth_hessian(link, &x, &beta, 1e-5);
+            let scale = analytic
+                .iter()
+                .chain(fd.iter())
+                .fold(1e-8_f64, |acc, v| acc.max(v.abs()));
+            for r in 0..beta.len() {
+                for c in 0..beta.len() {
+                    let rel = (analytic[[r, c]] - fd[[r, c]]).abs() / scale;
+                    assert!(
+                        rel < 1e-5,
+                        "H_phi[{r},{c}] analytic={} fd={} rel={rel:e}",
+                        analytic[[r, c]],
+                        fd[[r, c]]
+                    );
+                }
+            }
+        }
     }
 
     /// #1575: the cached single-index second-direction path

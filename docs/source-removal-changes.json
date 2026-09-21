@@ -3477,5 +3477,14 @@
     ],
     "reason": "#3547: the fp32+refinement Cholesky is solution-only and returns Ok only for a residual inside its rounding band. cholesky_solve_gpu (callers: three tests) and the need_logdet flag of iterative_refinement_cholesky_solve paid an fp64 POTRF after the fp32 one for a logdet, strictly more work than the fp64 solve; iterative_refinement_cholesky_solve is folded into cholesky_solve_only_gpu, and cuda::cholesky_logdet, used only by that logdet path, goes with them. REFINEMENT_MAX_STEPS (3) was a fixed correction cap justified by a quadratic rate that fixed-factor refinement does not have; refinement_step_budget(p) = (p + 6)/12 derives the cap from the fp64 solve's cost, and refinement_verdict refuses once the measured linear contraction predicts the band past it.",
     "evidence": "At base d7fe081e52 source_removal_guard.py reports exactly these four guarded removals, each with production_occurrences 0 outside gam-gpu's solver.rs. The new gam-gpu solver::tests pins cover the budget derivation and the refusal of a residual above its band."
+  },
+  {
+    "base": "d09970d03c4453f16e09a6753e86e7130a059529",
+    "items": [
+      "crates/gam-solve/src/reml/gradient_hessian.rs:enum:HFactor",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:fn:tk_firth_beta_hessian_trace"
+    ],
+    "reason": "#3507: the Firth Laplace outer criterion is rewritten as C = 1/2 log|H0| - 1/2 log|H_F| - 1/2 tr(H0^-1 H_phi) - TK(H0), with the Tierney-Kadane term evaluated on H0 and no H_phi. tk_firth_beta_hessian_trace differentiated the per-direction Firth trace inside TK(H_F), a term the bounded criterion no longer contains. The local HFactor enum (Cholesky-or-eigh factor of the Firth-augmented Hessian used by that TK(H_F) path) served only that removed evaluation; TK now reads the H0 factor the bundle already carries, and the determinant term tr(M_phi DH_phi[beta_dot]) goes through firth_op.hphi_direction_trace_kernel.",
+    "evidence": "scripts/source_removal_guard.py --base d09970d03c4453f16e09a6753e86e7130a059529 lists exactly these two removals. Before this PR tk_firth_beta_hessian_trace had one caller (gradient_hessian.rs, Self::tk_firth_beta_hessian_trace(firth_op, firth_trace_kernel, beta_dir, p) inside the TK(H_F) direction loop) and HFactor was used only in the block that built that H_F factor; git grep -w -e HFactor -e tk_firth_beta_hessian_trace at the PR head finds no remaining reference. Covered by cargo test -p gam-solve --lib -- tk_ firth hphi_at_mode firth_laml_outer_criterion_bounded firth_direction_trace_kernel tk_rho_hessian_pair tk_hessian_tensor_route and cargo test -p gam-models --lib -- binomial_separation_jeffreys."
   }
 ]

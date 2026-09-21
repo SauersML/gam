@@ -3522,8 +3522,6 @@ mod tk_math_tests {
             &[Some(eta_dot.clone())],
             &[Some(x_dot_mat)],
             &[Array1::<f64>::zeros(x_mat.nrows())],
-            &[Array1::<f64>::zeros(x_mat.ncols())],
-            None,
             &shared,
             &mut gram,
         )
