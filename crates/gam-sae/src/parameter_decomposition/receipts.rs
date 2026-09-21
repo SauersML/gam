@@ -23,6 +23,20 @@
 //! to nearest and then steps one float up, which lies at or above the exact result
 //! of nonnegative operands. So the band never rests on a rounded-down magnitude.
 //!
+//! # Underflow
+//!
+//! The relative model holds only while no operation underflows. In binary64 a
+//! rounded operation is `fl(a ∘ b) = (a ∘ b)(1 + δ) + η` with `|δ| ≤ u`, where
+//! `|η| ≤ 2^-1075` for a product or quotient that rounds into the subnormal range and
+//! `η = 0` for a sum, which is exact there (a fused multiply-add rounds once and adds
+//! one `η`). A product's `η` passes the later sums with a factor of at most
+//! `1 + γ_k ≤ 2`, and a later product scales it by the magnitude it multiplies. So an
+//! entry's error is at most `γ_k Σ|terms| + 𝒜 · 2^-1074`, with the underflow
+//! allowance `𝒜` counting each product once, scaled by the magnitudes that multiply
+//! it afterwards: `𝒜 = d` for an inner product of length `d`. The band adds that
+//! term ([`evaluation_band`]), so an entry whose products round into the subnormal
+//! range is still enclosed ([`SUBNORMAL_SPACING`], #4005).
+//!
 //! # What a band does not cover
 //!
 //! The model counts rounded binary64 operations in round-to-nearest. So a band is valid
@@ -213,9 +227,18 @@ fn check(what: &'static str, expected: usize, found: usize) -> Result<(), ShapeM
 
 /// The certified band of one evaluation: `γ_k` rounded up times an upper bound on
 /// the exact `Σ|terms|`, where `path_roundings = k` is the most rounded operations
-/// on any term's path.
-pub fn evaluation_band(path_roundings: usize, absolute_sum_upper: f64) -> f64 {
-    up(up(accumulation_growth(path_roundings)) * absolute_sum_upper)
+/// on any term's path, plus `𝒜 · 2^-1074` for an upper bound `underflow_allowance`
+/// on the entry's underflow allowance `𝒜` (see the module's *Underflow*). Every
+/// operation rounds to nearest and steps one float up, so a subnormal band does not
+/// round to zero. An entry with no products has `𝒜 = 0`, and the band is then the
+/// relative term alone: adding an exact zero rounds nothing.
+pub fn evaluation_band(path_roundings: usize, absolute_sum_upper: f64, underflow_allowance: f64) -> f64 {
+    let relative = up(up(accumulation_growth(path_roundings)) * absolute_sum_upper);
+    if underflow_allowance == 0.0 {
+        relative
+    } else {
+        up(relative + up(underflow_allowance * SUBNORMAL_SPACING))
+    }
 }
 
 /// Per-entry band of one evaluation of `x Wᵀ + b` for each row `x` of `inputs`,
@@ -223,7 +246,8 @@ pub fn evaluation_band(path_roundings: usize, absolute_sum_upper: f64) -> f64 {
 ///
 /// A term `w_jk x_k` rounds once as a product and then passes at most `d − 1`
 /// additions among the products and one for the bias, so `k = d + 1` (`d` without
-/// a bias).
+/// a bias). Its `d` products give the underflow allowance `𝒜 = d`; the bias
+/// addition adds none.
 pub fn affine_stage_band(
     weight: ArrayView2<'_, f64>,
     bias: Option<ArrayView1<'_, f64>>,
@@ -242,7 +266,7 @@ pub fn affine_stage_band(
             for (w, x) in weight.row(output).iter().zip(input.iter()) {
                 absolute_sum = up(absolute_sum + up((w * x).abs()));
             }
-            band[[row, output]] = evaluation_band(path_roundings, absolute_sum);
+            band[[row, output]] = evaluation_band(path_roundings, absolute_sum, width as f64);
         }
     }
     Ok(band)
@@ -260,6 +284,17 @@ pub fn affine_stage_band(
 /// product, `C − 1` times accumulating over components, `d − 1` times over inputs,
 /// once where the edit meets `W` and once for the bias: `k = C + d + 3`. The terms
 /// `w_jk x_k` take shorter paths.
+///
+/// The underflow allowance is the larger of the two programs' (module *Underflow*):
+/// * **matrix-free:** `d` for `x Wᵀ`; each coordinate `(x R)_c` carries `d`, which its
+///   product with `s_c` scales by `|s_c|` and adds one, and its product with `l_jc`
+///   scales by `|l_jc|` and adds one: `𝒜 = d + C + Σ_c (d |l_jc s_c| + |l_jc|)`;
+/// * **dense:** each edit term `l_jc s_c r_kc` of `W'_jk` rounds twice as a product,
+///   the second scaling the first's `η` by the factor it multiplies, in whichever
+///   association: at most `1 + |l_jc| + |s_c| + |r_kc|`. The sums into `W'` add
+///   none, and `x W'ᵀ` scales `W'_jk`'s allowance by `|x_k|` and adds one per
+///   product: `𝒜 = d + Σ_k |x_k| (C + Σ_c (|l_jc| + |s_c| + |r_kc|))`, formed as
+///   `d + Σ_k |x_k| · (C + Σ_c (|l_jc| + |s_c|)) + Σ_c Σ_k |r_kc x_k|`.
 pub fn factored_edit_stage_band(
     weight: ArrayView2<'_, f64>,
     left: ArrayView2<'_, f64>,
@@ -281,6 +316,7 @@ pub fn factored_edit_stage_band(
     let mut band = Array2::<f64>::zeros((inputs.nrows(), outputs));
     let path_roundings = components + width + 3;
     let mut read = vec![0.0; components];
+    let coefficient_sum = coefficients.iter().fold(0.0, |sum, coefficient| up(sum + coefficient.abs()));
     for (row, input) in inputs.outer_iter().enumerate() {
         for (component, slot) in read.iter_mut().enumerate() {
             let mut absolute_sum = 0.0;
@@ -289,16 +325,25 @@ pub fn factored_edit_stage_band(
             }
             *slot = absolute_sum;
         }
+        let input_sum = input.iter().fold(0.0, |sum, x| up(sum + x.abs()));
+        let read_sum = read.iter().fold(0.0, |sum, &value| up(sum + value));
         for output in 0..outputs {
             let mut absolute_sum = bias.map_or(0.0, |bias| bias[output].abs());
             for (w, x) in weight.row(output).iter().zip(input.iter()) {
                 absolute_sum = up(absolute_sum + up((w * x).abs()));
             }
+            let mut matrix_free = up(width as f64 + components as f64);
+            let mut left_sum = 0.0;
             for component in 0..components {
+                let magnitude = left[[output, component]].abs();
                 let scale = up((left[[output, component]] * coefficients[component]).abs());
                 absolute_sum = up(absolute_sum + up(scale * read[component]));
+                matrix_free = up(matrix_free + up(up(width as f64 * scale) + magnitude));
+                left_sum = up(left_sum + magnitude);
             }
-            band[[row, output]] = evaluation_band(path_roundings, absolute_sum);
+            let per_input = up(up(components as f64 + left_sum) + coefficient_sum);
+            let dense = up(up(width as f64 + up(input_sum * per_input)) + read_sum);
+            band[[row, output]] = evaluation_band(path_roundings, absolute_sum, matrix_free.max(dense));
         }
     }
     Ok(band)
@@ -621,12 +666,13 @@ fn banded_read_stage(
     compare_stage(external_execution, external, native.view(), band.view(), band.view())
 }
 
-/// Per-entry band of one evaluation of `a ⊙ u`: one rounded product, `k = 1`. The operands are
-/// floats, so `up(|fl(a·u)|)` lies at or above the exact `|a·u|`.
+/// Per-entry band of one evaluation of `a ⊙ u`: one rounded product, `k = 1`, and its
+/// underflow allowance `𝒜 = 1`. The operands are floats, so `up(|fl(a·u)|)` lies at or
+/// above the exact `|a·u|`.
 fn product_stage_band(left: ArrayView2<'_, f64>, right: ArrayView2<'_, f64>) -> Array2<f64> {
     Zip::from(left)
         .and(right)
-        .map_collect(|&a, &u| evaluation_band(1, up((a * u).abs())))
+        .map_collect(|&a, &u| evaluation_band(1, up((a * u).abs()), 1.0))
 }
 
 /// The program an external executor's RMSNorm module runs on binary64 rows, as its source
@@ -984,7 +1030,7 @@ mod tests {
         assert!(agreement.agrees && !agreement.refutes, "{agreement:?}");
 
         let absolute_sum = 2.0_f64.powi(54) + 14.0;
-        let shallow = Array2::from_elem((1, 1), evaluation_band(1, absolute_sum));
+        let shallow = Array2::from_elem((1, 1), evaluation_band(1, absolute_sum, width as f64));
         let refuted = compare_stage(
             BINARY64_CPU,
             forward.view(),
@@ -996,6 +1042,73 @@ mod tests {
         assert!(
             !refuted.agrees && refuted.refutes,
             "a depth-one band must be refuted by fourteen: {refuted:?}"
+        );
+    }
+
+    /// Two correct binary64 evaluations of an affine entry whose products round into the
+    /// subnormal range agree within the band (#4005). Each of 32 products
+    /// `3e-161 · 7e-162 ≈ 42.504 · 2^-1074` rounds up to `43 · 2^-1074`, so the native
+    /// evaluation lands on `1376 · 2^-1074`, while the correctly rounded exact sum, the most
+    /// accurate an executor can return, is `1360 · 2^-1074`. The exact error is measured with
+    /// both operands scaled by `2^600` into the normal range, where a fused multiply-add gives
+    /// each product's rounding error exactly and every power-of-two scaling is exact. The band
+    /// with its allowance `𝒜 = d` encloses the native error, and the two evaluations agree.
+    /// Positive control: the relative band alone, `γ_d Σ|terms|` rounded up to one spacing,
+    /// refutes the two correct evaluations.
+    #[test]
+    fn affine_band_encloses_products_that_round_into_the_subnormal_range() {
+        let width = 32;
+        let scale = 2.0_f64.powi(600);
+        let (weight_entry, input_entry) = (3.0e-161, 7.0e-162);
+        let weight = Array2::from_elem((1, width), weight_entry);
+        let inputs = Array2::from_elem((1, width), input_entry);
+        let native = affine_forward(&weight, &inputs);
+        let (weight_scaled, input_scaled) = (weight_entry * scale, input_entry * scale);
+        let product = weight_scaled * input_scaled;
+        let residual = weight_scaled.mul_add(input_scaled, -product);
+        let count = width as f64;
+        // The exact entry times 2^1200 is `32 (product + residual)`, 32 a power of two. The
+        // native entry times 2^1200 is within a factor two of `32 product`, so their
+        // difference is exact.
+        let exact_scaled = count * product + count * residual;
+        let error = ((native[[0, 0]] * scale * scale - count * product) - count * residual).abs();
+        assert!(
+            error > 15.0 * SUBNORMAL_SPACING * scale * scale,
+            "the fixture must lose most of sixteen subnormal spacings to underflow, lost {:e}",
+            error / (scale * scale)
+        );
+        let band = affine_stage_band(weight.view(), None, inputs.view()).expect("shapes compose");
+        assert!(
+            error <= band[[0, 0]] * scale * scale,
+            "the band {:e} must enclose the native evaluation's error {:e}",
+            band[[0, 0]],
+            error / (scale * scale)
+        );
+
+        let correctly_rounded = Array2::from_elem((1, 1), exact_scaled / scale / scale);
+        let agreement = compare_stage(
+            BINARY64_CPU,
+            correctly_rounded.view(),
+            native.view(),
+            band.view(),
+            band.view(),
+        )
+        .expect("finite arrays");
+        assert!(agreement.agrees && !agreement.refutes, "{agreement:?}");
+
+        let absolute_sum = (0..width).fold(0.0, |sum, _| up(sum + up((weight_entry * input_entry).abs())));
+        let relative = Array2::from_elem((1, 1), up(up(accumulation_growth(width)) * absolute_sum));
+        let refuted = compare_stage(
+            BINARY64_CPU,
+            correctly_rounded.view(),
+            native.view(),
+            relative.view(),
+            relative.view(),
+        )
+        .expect("finite arrays");
+        assert!(
+            !refuted.agrees && refuted.refutes,
+            "positive control: the relative band alone must refute two correct evaluations: {refuted:?}"
         );
     }
 

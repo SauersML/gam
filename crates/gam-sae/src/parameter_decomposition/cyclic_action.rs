@@ -538,12 +538,12 @@ pub fn shift_residual(
                     let residual = table[[row, column]] + change - table[[shifted, column]];
                     let bound_sum = up(up(absolute_sum + table[[row, column]].abs())
                         + table[[shifted, column]].abs());
-                    let band = evaluation_band(components + 2, bound_sum);
+                    let band = evaluation_band(components + 2, bound_sum, components as f64);
                     out.max_abs_residual = out.max_abs_residual.max(residual.abs());
                     out.max_residual_band = out.max_residual_band.max(band);
                 }
                 None => {
-                    let band = evaluation_band(components, absolute_sum);
+                    let band = evaluation_band(components, absolute_sum, components as f64);
                     out.max_abs_fixed_row_change = out.max_abs_fixed_row_change.max(change.abs());
                     out.max_fixed_row_band = out.max_fixed_row_band.max(band);
                 }
@@ -656,7 +656,7 @@ mod tests {
             for j in 0..WIDTH {
                 let absolute_sum = (0..columns)
                     .fold(0.0, |acc, t| up(acc + up((factors[[j, t]] * phi[t]).abs())));
-                let band = evaluation_band(columns, absolute_sum);
+                let band = evaluation_band(columns, absolute_sum, columns as f64);
                 planting_squares = up(planting_squares + up(band * band));
             }
         }
@@ -680,7 +680,7 @@ mod tests {
             for &c in &CYCLE[index + 1..] {
                 let separation = (0..WIDTH).fold(0.0_f64, |acc, j| {
                     let difference = (table[[b, j]] - table[[c, j]]).abs();
-                    let band = evaluation_band(1, up(table[[b, j]].abs() + table[[c, j]].abs()));
+                    let band = evaluation_band(1, up(table[[b, j]].abs() + table[[c, j]].abs()), 0.0);
                     acc.max((difference - band).next_down())
                 });
                 spacing = spacing.min(separation);
@@ -721,7 +721,7 @@ mod tests {
                     value -= term;
                     absolute_sum = up(absolute_sum + up(term.abs()));
                 }
-                let upper = up(value.abs() + evaluation_band(columns + 1, absolute_sum));
+                let upper = up(value.abs() + evaluation_band(columns + 1, absolute_sum, columns as f64));
                 out.reconstruction = out.reconstruction.max(upper);
             }
             let target = characters(basis_frequencies, (position + target_shift) % LENGTH);
@@ -733,7 +733,7 @@ mod tests {
                     value += term;
                     absolute_sum = up(absolute_sum + up(term.abs()));
                 }
-                let upper = up(value.abs() + evaluation_band(planes + 2, absolute_sum));
+                let upper = up(value.abs() + evaluation_band(planes + 2, absolute_sum, planes as f64));
                 out.rotation = out.rotation.max(upper);
             }
             out.character_max = phi
@@ -763,7 +763,7 @@ mod tests {
                     value += term;
                     absolute_sum = up(absolute_sum + up(term.abs()));
                 }
-                row_sum = up(row_sum + up(value.abs() + evaluation_band(width + 1, absolute_sum)));
+                row_sum = up(row_sum + up(value.abs() + evaluation_band(width + 1, absolute_sum, width as f64)));
             }
             norm = norm.max(row_sum);
         }
@@ -784,7 +784,7 @@ mod tests {
                     value += term;
                     absolute_sum = up(absolute_sum + up(term.abs()));
                 }
-                row_sum = up(row_sum + up(value.abs() + evaluation_band(n, absolute_sum)));
+                row_sum = up(row_sum + up(value.abs() + evaluation_band(n, absolute_sum, n as f64)));
             }
             norm = norm.max(row_sum);
         }
@@ -808,7 +808,7 @@ mod tests {
                     let absolute_sum = (0..WIDTH).fold(0.0, |acc, l| {
                         up(acc + up((table[[i, l]] * plane_inverse[[c, l]]).abs()))
                     });
-                    evaluation_band(WIDTH, absolute_sum)
+                    evaluation_band(WIDTH, absolute_sum, WIDTH as f64)
                 })
                 .collect();
             let mut row_error = 0.0;
@@ -819,7 +819,7 @@ mod tests {
                     absolute_sum = up(absolute_sum + up((coordinates[[i, c]] * block[[t, c]]).abs()));
                     propagated = up(propagated + up(coordinate_band[c] * block[[t, c]].abs()));
                 }
-                row_error = up(row_error + up(propagated + evaluation_band(planes, absolute_sum)));
+                row_error = up(row_error + up(propagated + evaluation_band(planes, absolute_sum, planes as f64)));
             }
             worst = worst.max(row_error);
         }
@@ -1039,7 +1039,7 @@ mod tests {
                     value -= term;
                     absolute_sum = up(absolute_sum + up(term.abs()));
                 }
-                let upper = up(value.abs() + evaluation_band(LENGTH + 1, absolute_sum));
+                let upper = up(value.abs() + evaluation_band(LENGTH + 1, absolute_sum, LENGTH as f64));
                 delta_squares = up(delta_squares + up(upper * upper));
             }
         }
@@ -1161,19 +1161,28 @@ mod tests {
             for j in 0..WIDTH {
                 let (mut edited, mut edited_sum) = (table[[row, j]], table[[row, j]].abs());
                 let (mut coupling, mut coupling_sum) = (0.0, 0.0);
+                // Underflow allowances of the chained products: `read = (u b) y` carries
+                // `1 + |y|`, a product with `a` scales that by `|a|` and adds one.
+                let (mut edited_allowance, mut coupling_allowance) = (0.0, 0.0);
                 for (u, block, y, others, columns) in &sections {
                     for t in 0..2 {
                         for v in 0..2 {
                             let scale = u[[j, t]] * block[[t, v]];
                             for l in 0..WIDTH {
                                 let read = scale * y[[v, l]];
+                                let read_allowance = up(1.0 + y[[v, l]].abs());
                                 let term = read * table[[row, l]];
                                 edited += term;
                                 edited_sum = up(edited_sum + up(term.abs()));
+                                edited_allowance =
+                                    up(edited_allowance + up(1.0 + up(read_allowance * table[[row, l]].abs())));
                                 for (w, &column) in columns.iter().enumerate() {
                                     let term = read * others[[l, w]] * phi[column];
                                     coupling += term;
                                     coupling_sum = up(coupling_sum + up(term.abs()));
+                                    let other_allowance = up(1.0 + up(read_allowance * others[[l, w]].abs()));
+                                    coupling_allowance =
+                                        up(coupling_allowance + up(1.0 + up(other_allowance * phi[column].abs())));
                                 }
                             }
                         }
@@ -1181,11 +1190,11 @@ mod tests {
                 }
                 let target = table[[target_row, j]];
                 let miss = edited - target;
-                let miss_band = evaluation_band(WIDTH + 9, up(edited_sum + target.abs()));
-                let coupling_band = evaluation_band(WIDTH + 13, coupling_sum);
+                let miss_band = evaluation_band(WIDTH + 9, up(edited_sum + target.abs()), edited_allowance);
+                let coupling_band = evaluation_band(WIDTH + 13, coupling_sum, coupling_allowance);
                 let difference = miss - coupling;
                 let band = up(up(miss_band + coupling_band)
-                    + evaluation_band(1, up(miss.abs() + coupling.abs())));
+                    + evaluation_band(1, up(miss.abs() + coupling.abs()), 0.0));
                 out.difference = out.difference.max((difference.abs() - band).next_down());
                 out.coupling_lower = out.coupling_lower.max((coupling.abs() - coupling_band).next_down());
                 out.miss = out.miss.max((miss.abs() - miss_band).next_down());
