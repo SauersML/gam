@@ -2159,6 +2159,14 @@ pub(crate) fn run_outer_with_plan(
                         // The criterion value's own roundoff: a value lower by no more than
                         // this is not a lower criterion.
                         let resolution = f64::EPSILON * (1.0 + final_value.abs());
+                        // WHICH refused trial is held is decided by its inner mode (gam#3173,
+                        // `better_stratum_probe`); WHETHER the run crosses to it is still decided
+                        // by the criterion, and deliberately so. The crossing loop terminates
+                        // because every crossing lowers the criterion by more than its roundoff,
+                        // and that is the only monotone quantity it has. The mode excess is not
+                        // one: it is measured at the probe's own θ, and the next run moves θ, so
+                        // crossing on it alone admits a cycle. What the excess does is name the
+                        // trial the value test is applied to.
                         if !(probe.cost < final_value - resolution) {
                             break (outcome, cost_stall_exit, last_objective_error, rank_boundary);
                         }
@@ -2179,12 +2187,17 @@ pub(crate) fn run_outer_with_plan(
                                 log::debug!(
                                     "[OUTER] {context}: seed {seed_idx} crosses from kept rank \
                                      {from_rank} to {} at criterion {:.6e} -> {:.6e} (delta {:.3e}) \
-                                     and restarts BFGS there (#2765)",
+                                     and restarts BFGS there; the trial's own mode sat below the \
+                                     incumbent branch's there by {} (#2765, gam#3173)",
                                     obj.criterion_rank()
                                         .map_or_else(|| "none".to_string(), |rank| rank.to_string()),
                                     final_value,
                                     eval.cost,
                                     eval.cost - final_value,
+                                    probe.incumbent_mode_excess.map_or_else(
+                                        || "no published mode".to_string(),
+                                        |excess| format!("{excess:.3e}")
+                                    ),
                                 );
                                 crossed_iterations = crossed_iterations.saturating_add(run_iterations);
                                 stratum_start = probe.rho;
@@ -2195,11 +2208,16 @@ pub(crate) fn run_outer_with_plan(
                                 log::debug!(
                                     "[OUTER] {context}: seed {seed_idx} stays on kept rank {from_rank}: \
                                      the refused rank-{} trial re-evaluates at {:.6e}, not below the \
-                                     run's {:.6e} by more than {:.3e} (#2765)",
+                                     run's {:.6e} by more than {:.3e}; its own mode sat below the \
+                                     incumbent branch's by {} (#2765, gam#3173)",
                                     probe.rank,
                                     eval.cost,
                                     final_value,
                                     resolution,
+                                    probe.incumbent_mode_excess.map_or_else(
+                                        || "no published mode".to_string(),
+                                        |excess| format!("{excess:.3e}")
+                                    ),
                                 );
                                 break (outcome, cost_stall_exit, last_objective_error, rank_boundary);
                             }

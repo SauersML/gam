@@ -664,6 +664,10 @@ pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static
         },
         None => direct(starts.incumbent).map_err(dropped_or_failed),
     };
+    // How far the incumbent's own mode sat above the published one, where the published one is
+    // another start's (gam#3173). It is the evidence the stratum rule needs to tell a trial that
+    // merely wandered to another kept rank from one that is on the branch this run is not.
+    let mut incumbent_mode_excess: Option<f64> = None;
     let published = if rivals.is_empty() {
         match incumbent {
             Ok(inner) => inner,
@@ -688,9 +692,12 @@ pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static
             })
         };
         let mut candidates = Vec::new();
+        let mut incumbent_penalized: Option<PenalizedObjective> = None;
         let incumbent_refusal = match incumbent {
             Ok(inner) => {
-                candidates.push(candidate(ModeStart::Incumbent, inner)?);
+                let incumbent_candidate = candidate(ModeStart::Incumbent, inner)?;
+                incumbent_penalized = Some(incumbent_candidate.penalized_objective);
+                candidates.push(incumbent_candidate);
                 None
             }
             Err(Ok(refusal)) => Some(refusal),
@@ -715,6 +722,16 @@ pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static
                 ))
             }));
         };
+        // The incumbent's own mode lost, and by more than comparing the two can round by: at
+        // this θ the branch the outer walk carries is not the posterior branch (gam#3173).
+        incumbent_mode_excess = incumbent_penalized.and_then(|incumbent| {
+            (selection.winner.start != ModeStart::Incumbent
+                && selection
+                    .winner
+                    .penalized_objective
+                    .resolvably_below(&incumbent))
+            .then(|| incumbent.value - selection.winner.penalized_objective.value)
+        });
         log::debug!(
             "[mode selection #3173] rho=[{}]: {} of {} start(s) certified a mode; published the \
              {} mode, f={:.9e}; runner-up gap {}; incumbent {}",
@@ -727,13 +744,18 @@ pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static
                 .runner_up_gap
                 .map_or_else(|| "none".to_string(), |gap| format!("{gap:.3e}")),
             incumbent_refusal.as_ref().map_or_else(
-                || "certified".to_string(),
+                || match incumbent_mode_excess {
+                    Some(excess) => format!("certified, above the published mode by {excess:.3e}"),
+                    None => "certified".to_string(),
+                },
                 |refusal| format!("dropped: {refusal}")
             ),
         );
         selection.winner.inner
     };
-    outerobjective_from_coefficient_mode_labeled(
+    let mut result = outerobjective_from_coefficient_mode_labeled(
         family, specs, options, layout, rho, rho_prior, published, eval_mode,
-    )
+    )?;
+    result.incumbent_mode_excess = incumbent_mode_excess;
+    Ok(result)
 }

@@ -1512,6 +1512,9 @@ pub(crate) fn joint_outer_evaluate(
         ext_mode_response_cols,
         psi_scores,
         criterion_rank,
+        // Only a mode SELECTION names this, and the selection happens above this assembly
+        // (gam#3173): one coefficient mode priced here is its own publication.
+        incumbent_mode_excess: None,
         inner: inner.clone(),
     })
 }

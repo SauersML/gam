@@ -3306,6 +3306,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                     ext_mode_response_cols: None,
                     psi_scores: None,
                     criterion_rank: value_only.criterion_rank,
+                    incumbent_mode_excess: None,
                     inner: inner.clone(),
                 });
             }
@@ -3812,6 +3813,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         ext_mode_response_cols: None,
                         psi_scores: None,
                         criterion_rank: value_only.criterion_rank,
+                        incumbent_mode_excess: None,
                         inner: inner.clone(),
                     });
                 }
@@ -4771,6 +4773,7 @@ mod mode_selection_value_tests {
             ext_mode_response_cols: None,
             psi_scores: None,
             criterion_rank: None,
+            incumbent_mode_excess: None,
             inner: BlockwiseInnerResult {
                 solved_inner_tol: 1e-6,
                 block_states: Vec::new(),

@@ -22,6 +22,28 @@
   is given is a property of the model, so it moved with the estimator. The pyffi handler
   is about 300 lines shorter and every number it reports is the library's.
 
+- **The outer search chose where to restart after a kept-rank stall by comparing two criteria**
+  (gam#3173, gam#2939). A criterion built on a pseudo-log-determinant keeps only the eigenpairs
+  its rank rule admits, so two kept ranks price two different functions; one BFGS run therefore
+  searches one stratum and the first-order bridge refuses a trial whose rank differs from the
+  run's start. That refusal is right and is unchanged. What was not right is what happened next:
+  the run keeps ONE of the trials it refused and restarts there, and the trial it kept was the one
+  with the lowest criterion value — a comparison between the very two criteria the refusal exists
+  because they cannot be compared. The inner mode answers the question instead. An evaluation of a
+  family whose inner objective has several local minima publishes the certified mode with the
+  lowest penalized objective `f` among its starts, and when the winner is not the incumbent's own
+  start, the branch the run is carrying is not the posterior branch at that θ. That excess is `f`
+  at one θ, not the criterion, so no pseudo-log-determinant enters it and it is the same quantity
+  whatever rank either trial kept. It is published per evaluation beside the kept rank, through
+  `OuterObjective::incumbent_mode_excess`, and the refused trial the run keeps is now the one
+  demonstrably on a branch the run is not; where neither trial published a mode there is no such
+  evidence and the criterion value decides as before. Whether the run then crosses is still
+  decided by the criterion, deliberately: every crossing lowers it by more than its roundoff, and
+  that is the only monotone quantity the crossing loop has, while the mode excess is measured at
+  the probe's own θ and the next run moves θ. gam#3173's outer seed 0 is the case: modes at
+  `f = 1296.327` (rank 30, one active constraint) and `f = 1296.533` (rank 31, interior), a search
+  that started on rank 31, and every rank-30 trial refused, so the seed halted on the inferior
+  branch at cost 1316.731 with |g| = 2.8.
 - **One error variant was reporting four different failures, with a condition number no
   producer ever computed** (gam#4468).
   `EstimationError::ModelIsIllConditioned { condition_number }` was constructed at 38

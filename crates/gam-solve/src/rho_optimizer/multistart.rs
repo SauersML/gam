@@ -699,6 +699,10 @@ impl OuterObjective for ReleasableSeed<'_> {
         self.inner.criterion_rank()
     }
 
+    fn incumbent_mode_excess(&self) -> Option<f64> {
+        self.inner.incumbent_mode_excess()
+    }
+
     fn reset(&mut self) {
         self.inner.reset();
     }

@@ -2138,22 +2138,31 @@ impl OuterFirstOrderBridge<'_> {
     ///
     /// Called once an evaluation has validated, with the criterion value it returned. The
     /// refusal is a trial-point refusal, so the line search shortens its step as it does
-    /// at any infeasible trial. The trial is kept when it is the lowest refused so far: a
-    /// run that ends above it has a lower criterion to restart from.
+    /// at any infeasible trial, and it stands whatever the trial's mode says: two ranks
+    /// price two criteria and a line search comparing them compares nothing (#2939).
+    ///
+    /// What the trial's mode does decide is which refused trial the run keeps to restart
+    /// from ([`better_stratum_probe`]): a trial whose published mode sat below the one the
+    /// incumbent's own branch reached at that same θ is on a branch this run is not, and
+    /// that comparison is in `f` at one θ rather than across two criteria (gam#3173).
     fn refuse_off_stratum_trial(&self, x: &Array1<f64>, cost: f64) -> Option<EstimationError> {
         let stratum_rank = self.stratum_rank.as_ref()?;
         let rank = self.obj.criterion_rank()?;
         if rank == *stratum_rank {
             return None;
         }
+        let incumbent_mode_excess = self.obj.incumbent_mode_excess();
         if let Some(cell) = self.stratum_probe.as_ref()
             && let Ok(mut slot) = cell.lock()
-            && slot.as_ref().is_none_or(|probe| cost < probe.cost)
+            && slot
+                .as_ref()
+                .is_none_or(|probe| better_stratum_probe(incumbent_mode_excess, cost, probe))
         {
             *slot = Some(StratumProbe {
                 rho: x.clone(),
                 cost,
                 rank: rank.clone(),
+                incumbent_mode_excess,
             });
         }
         Some(EstimationError::TrialPointRefused {
@@ -3791,12 +3800,43 @@ pub(crate) struct PendingSecondOrderTrial {
 }
 
 /// A trial the first-order bridge refused because its criterion keeps a different rank
-/// than the run's start (#2765): the point, its criterion value, and the rank it kept.
+/// than the run's start (#2765): the point, its criterion value, the rank it kept, and what
+/// its inner mode said about the run's branch (gam#3173).
 #[derive(Debug, Clone)]
 pub(crate) struct StratumProbe {
     pub(crate) rho: Array1<f64>,
     pub(crate) cost: f64,
     pub(crate) rank: CriterionRank,
+    /// How far the mode the incumbent's own start reached at THIS trial's θ sat above the mode
+    /// the trial published ([`OuterObjective::incumbent_mode_excess`]). `None` when the
+    /// incumbent's start won there, or when the objective publishes no inner mode.
+    pub(crate) incumbent_mode_excess: Option<f64>,
+}
+
+/// Whether a refused trial replaces the one the run is holding as its restart candidate
+/// (gam#3173).
+///
+/// The run restarts at ONE of the trials it refused for leaving its stratum, so the choice
+/// between them has to be a comparison that is well posed. Two refused trials on two different
+/// kept ranks price two different criteria, and that is #2939's own rule — yet a comparison of
+/// their criterion values is what chose between them. The inner mode answers it instead: at a
+/// trial's own θ, the published mode's penalized objective `f` sat below the one the incumbent's
+/// branch reached there, and `f` carries no pseudo-log-determinant, so it is the same quantity
+/// whatever rank either trial kept. A trial with that evidence is demonstrably on a branch the
+/// run's is not, so it outranks a trial with none, and between two that carry it the larger
+/// excess wins. Where neither carries any — an objective that publishes no inner mode names
+/// none — the criterion value is the only thing on offer and decides as it did before.
+fn better_stratum_probe(
+    offered_excess: Option<f64>,
+    offered_cost: f64,
+    held: &StratumProbe,
+) -> bool {
+    match (offered_excess, held.incumbent_mode_excess) {
+        (Some(offered), Some(held_excess)) => offered > held_excess,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => offered_cost < held.cost,
+    }
 }
 
 /// Cap on [`OuterFirstOrderBridge::pending_first_order`]. One BFGS iteration
@@ -5378,5 +5418,67 @@ mod termination_provenance_tests {
                  report -- if it grows one, this projection needs revisiting"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stratum_probe_choice_3173_tests {
+    use super::*;
+
+    fn probe(cost: f64, rank: usize, incumbent_mode_excess: Option<f64>) -> StratumProbe {
+        StratumProbe {
+            rho: Array1::from_vec(vec![0.5]),
+            cost,
+            rank: CriterionRank::single(rank),
+            incumbent_mode_excess,
+        }
+    }
+
+    /// gam#3173: the run restarts at ONE of the trials it refused for leaving its stratum, and
+    /// between two refused trials it is the inner mode that decides, not the criterion.
+    ///
+    /// Two refused trials on two kept ranks price two criteria, so comparing their values
+    /// certifies nothing — that is #2939's own rule, and comparing them is what the previous
+    /// choice did. A trial whose published mode sat below the one the incumbent's branch reached
+    /// at that trial's own θ is on a branch the run is not, and `f` carries no
+    /// pseudo-log-determinant, so that comparison is well posed whatever rank either trial kept.
+    ///
+    /// Each evidence arm is driven with the two criterion values ORDERED THE OTHER WAY, so a
+    /// choice that still read the value would fail it. The last arm is the control: where neither
+    /// trial published a mode there is no such evidence, and the value decides as it did before.
+    #[test]
+    fn the_restart_candidate_is_chosen_by_the_mode_not_the_criterion_3173() {
+        // Evidence outranks none, whichever way the two criterion values happen to compare.
+        assert!(better_stratum_probe(
+            Some(1.0e-3),
+            500.0,
+            &probe(1.0, 30, None)
+        ));
+        assert!(!better_stratum_probe(
+            None,
+            1.0,
+            &probe(500.0, 30, Some(1.0e-3))
+        ));
+
+        // Between two trials that both carry it, the larger excess: the further the incumbent's
+        // branch sat above the published mode there, the more decisively that trial is elsewhere.
+        assert!(better_stratum_probe(
+            Some(2.0e-3),
+            500.0,
+            &probe(1.0, 30, Some(1.0e-3))
+        ));
+        assert!(!better_stratum_probe(
+            Some(1.0e-3),
+            1.0,
+            &probe(500.0, 30, Some(2.0e-3))
+        ));
+        assert!(
+            !better_stratum_probe(Some(1.0e-3), 1.0, &probe(500.0, 30, Some(1.0e-3))),
+            "equal evidence keeps the trial the run is already holding"
+        );
+
+        // The control: with no published mode on either side, the criterion value decides.
+        assert!(better_stratum_probe(None, 1.0, &probe(2.0, 30, None)));
+        assert!(!better_stratum_probe(None, 2.0, &probe(1.0, 30, None)));
     }
 }

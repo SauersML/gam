@@ -334,6 +334,25 @@ pub trait OuterObjective {
         None
     }
 
+    /// How far the mode the INCUMBENT's own start reached sat above the mode the most recent
+    /// evaluation published, at that evaluation's own θ (gam#3173).
+    ///
+    /// An objective whose inner problem has several local minima publishes ONE of them: the
+    /// certified mode with the lowest penalized objective `f` among the evaluation's starts. When
+    /// the winner is not the incumbent's own start, the branch the outer search is carrying is not
+    /// the posterior branch AT THAT θ, and this is the amount by which it is not, resolved by the
+    /// producer's own comparison band. `None` when the incumbent's start won, certified no mode,
+    /// or was not among the starts, and for every objective that publishes no inner mode.
+    ///
+    /// Unlike a criterion value, this is comparable between two evaluations that keep different
+    /// ranks: `f` is the inner penalized objective at one θ, not the criterion, so no
+    /// pseudo-log-determinant enters it. That is what lets the stratum rule choose between the
+    /// trials it refused (`StratumProbe`, in the first-order bridge) without comparing two
+    /// criteria.
+    fn incumbent_mode_excess(&self) -> Option<f64> {
+        None
+    }
+
     /// Restore to a clean baseline for the next multi-start candidate.
     fn reset(&mut self);
 
@@ -1036,6 +1055,10 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         self.inner.criterion_rank()
     }
 
+    fn incumbent_mode_excess(&self) -> Option<f64> {
+        self.inner.incumbent_mode_excess()
+    }
+
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
         // Forward to the wrapped objective, then prime our last-inner-beta
         // cache so a subsequent finalize-write encodes the seeded β if no
@@ -1174,6 +1197,10 @@ pub struct ClosureObjective<
     /// pseudo-log-determinant over a rank that moves with the inner mode; `None` means
     /// one criterion everywhere.
     pub(crate) criterion_rank_fn: Option<Box<dyn Fn(&S) -> Option<CriterionRank>>>,
+    /// Optional published-mode hook (gam#3173). Installed by objectives that select their inner
+    /// mode among several starts; `None` means one mode everywhere, or a mode the objective does
+    /// not publish.
+    pub(crate) incumbent_mode_excess_fn: Option<Box<dyn Fn(&S) -> Option<f64>>>,
     /// Optional inner-state seeding closure. Objectives with PIRLS / Newton
     /// inner state install cached β here before the first outer eval.
     pub(crate) seed_fn: Option<Fseed>,
@@ -1339,6 +1366,10 @@ where
         self.criterion_rank_fn.as_ref()?(&self.state)
     }
 
+    fn incumbent_mode_excess(&self) -> Option<f64> {
+        self.incumbent_mode_excess_fn.as_ref()?(&self.state)
+    }
+
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
         // Empty β: by convention, "no warm-start available" — treat as a
         // no-op install. Distinct from `NoSlot` because the objective may
@@ -1460,6 +1491,19 @@ impl<S, Fc, Fe, Fr, Fefs, Feo, Fseed> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo,
         self.criterion_rank_fn = Some(Box::new(rank));
         self
     }
+
+    /// Publish how far the incumbent's own mode sat above the mode the most recent evaluation
+    /// published, at that evaluation's θ (gam#3173).
+    ///
+    /// The closure reads the state the evaluation closures just wrote. An objective whose inner
+    /// problem has one mode, or that publishes no mode, must not install this hook.
+    pub fn with_incumbent_mode_excess<Fexcess>(mut self, excess: Fexcess) -> Self
+    where
+        Fexcess: Fn(&S) -> Option<f64> + 'static,
+    {
+        self.incumbent_mode_excess_fn = Some(Box::new(excess));
+        self
+    }
 }
 
 impl<S, Fc, Fe, Fr, Fefs, Feo> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo>
@@ -1492,6 +1536,7 @@ where
             zero_smoothing_face_fn: self.zero_smoothing_face_fn,
             criterion_invariance_fn: self.criterion_invariance_fn,
             criterion_rank_fn: self.criterion_rank_fn,
+            incumbent_mode_excess_fn: self.incumbent_mode_excess_fn,
             seed_fn: Some(seed_fn),
             terminal_eval_order: self.terminal_eval_order,
         }
@@ -2219,6 +2264,12 @@ impl<'a> OuterObjective for CanonicalizedObjective<'a> {
     fn criterion_rank(&self) -> Option<CriterionRank> {
         // A rank is a property of the criterion, not of its coordinate order.
         self.inner.criterion_rank()
+    }
+
+    fn incumbent_mode_excess(&self) -> Option<f64> {
+        // Two modes' penalized objectives are two scalars; permuting the outer coordinates
+        // moves neither.
+        self.inner.incumbent_mode_excess()
     }
 
     fn criterion_invariant_directions(&mut self, rho: &Array1<f64>) -> Option<Array2<f64>> {

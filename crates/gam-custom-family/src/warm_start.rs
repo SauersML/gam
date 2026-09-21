@@ -1380,6 +1380,9 @@ pub(crate) struct CustomOuterState {
     /// Kept rank of the criterion the most recent successful evaluation priced (#2765),
     /// published to the outer search through `OuterObjective::criterion_rank`.
     pub(crate) last_criterion_rank: Option<usize>,
+    /// How far the incumbent's own mode sat above the mode the most recent successful
+    /// evaluation published (gam#3173), through `OuterObjective::incumbent_mode_excess`.
+    pub(crate) last_incumbent_mode_excess: Option<f64>,
     /// The fit's fixed starts (gam#3173): every evaluation also solves a mode from each, and
     /// publishes the certified mode with the lowest penalized objective ([`evaluate_on_branch`]).
     pub(crate) fixed_starts: Vec<Option<ConstrainedWarmStart>>,
@@ -1445,6 +1448,7 @@ impl CustomOuterState {
             walk_endpoints: Vec::new(),
             value_probe: None,
             last_criterion_rank: None,
+            last_incumbent_mode_excess: None,
             fixed_starts: Vec::new(),
         }
     }
@@ -1838,6 +1842,12 @@ pub(crate) struct OuterObjectiveEvalResult {
     /// criterion is not projected. Two evaluations whose kept ranks differ price two
     /// different criteria (#2765).
     pub(crate) criterion_rank: Option<usize>,
+    /// How far the mode the INCUMBENT's own start reached sat above the mode this evaluation
+    /// published, at this θ (gam#3173). `None` when the incumbent's start won, certified no
+    /// mode, or was not among the starts. It is the inner penalized objective `f`, not the
+    /// criterion, so it carries no pseudo-log-determinant and two evaluations on two kept
+    /// ranks can be compared through it.
+    pub(crate) incumbent_mode_excess: Option<f64>,
     /// The exact coefficient mode used to assemble this objective payload.
     ///
     /// Keeping the owned result here lets an atomic multi-start evaluation

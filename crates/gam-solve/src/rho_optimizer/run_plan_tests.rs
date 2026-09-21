@@ -1900,6 +1900,7 @@ fn closure_objective_delegates() {
         zero_smoothing_face_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
+        incumbent_mode_excess_fn: None,
         seed_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
@@ -2001,6 +2002,7 @@ fn closure_objective_seed_inner_state_delegates_when_hook_present() {
         zero_smoothing_face_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
+        incumbent_mode_excess_fn: None,
         seed_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     }
@@ -2200,6 +2202,7 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
         zero_smoothing_face_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
+        incumbent_mode_excess_fn: None,
         seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
@@ -2280,6 +2283,7 @@ fn hybrid_efs_backtracking_propagates_fatal_cost_failure() {
         zero_smoothing_face_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
+        incumbent_mode_excess_fn: None,
         seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
@@ -2371,6 +2375,7 @@ fn hybrid_efs_backtracking_halves_past_a_refused_trial_2735() {
         zero_smoothing_face_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
+        incumbent_mode_excess_fn: None,
         seed_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
@@ -2455,6 +2460,7 @@ fn efs_step_control_bridge_sample(
         zero_smoothing_face_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
+        incumbent_mode_excess_fn: None,
         seed_fn: None::<
             fn(&mut (usize, fn(f64) -> f64), &Array1<f64>) -> Result<SeedOutcome, EstimationError>,
         >,
@@ -2601,6 +2607,7 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
         zero_smoothing_face_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
+        incumbent_mode_excess_fn: None,
         seed_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };

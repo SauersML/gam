@@ -909,6 +909,7 @@ impl OuterProblem {
             zero_smoothing_face_fn: None,
             criterion_invariance_fn: None,
             criterion_rank_fn: None,
+            incumbent_mode_excess_fn: None,
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
             terminal_eval_order: None,
         }
@@ -950,6 +951,7 @@ impl OuterProblem {
             zero_smoothing_face_fn: None,
             criterion_invariance_fn: None,
             criterion_rank_fn: None,
+            incumbent_mode_excess_fn: None,
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
             terminal_eval_order: None,
         }

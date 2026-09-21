@@ -3041,6 +3041,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         outer.adopt_accepted_steps();
         // A failed evaluation prices no criterion, so it publishes no rank (#2765).
         outer.last_criterion_rank = None;
+        outer.last_incumbent_mode_excess = None;
         // Genuinely value-only fulfilment (#979). A `Value` request from an outer
         // cost or reactive-domain probe never consumes the outer
         // gradient. The inner solve in `EvalMode::ValueOnly` already produces the
@@ -3074,6 +3075,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                         outer.record_value_probe(rho, seed_identity, eval.warm_start.clone());
                     }
                     outer.last_criterion_rank = eval.criterion_rank;
+                    outer.last_incumbent_mode_excess = eval.incumbent_mode_excess;
                     let inner_beta_hint = Some(Array1::from_iter(
                         eval.warm_start
                             .block_beta
@@ -3198,6 +3200,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 );
                 outer.last_error = None;
                 outer.last_criterion_rank = eval.criterion_rank;
+                outer.last_incumbent_mode_excess = eval.incumbent_mode_excess;
                 eval
             }
             Ok(eval) => {
@@ -3308,6 +3311,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             // reads the seed, and the probe itself never replaces it.
             outer.adopt_accepted_steps();
             outer.last_criterion_rank = None;
+            outer.last_incumbent_mode_excess = None;
             let seed_identity = crate::warm_start::SeedIdentity::of(outer.seed_for(rho));
             let starts = if force_cold {
                 outer.cold_mode_starts_for(rho, canonical_seed.as_ref())
@@ -3334,6 +3338,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                         outer.record_value_probe(rho, seed_identity, eval.warm_start.clone());
                     }
                     outer.last_criterion_rank = eval.criterion_rank;
+                    outer.last_incumbent_mode_excess = eval.incumbent_mode_excess;
                     outer.last_error = None;
                     Ok(eval.objective)
                 }
@@ -3444,6 +3449,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             .last_criterion_rank
             .map(gam_solve::rho_optimizer::CriterionRank::single)
     })
+    // gam#3173: and beside the rank, the evidence that separates a trial which merely wandered
+    // to another rank from one that reached a mode this run's branch does not. The stratum rule
+    // chooses its restart candidate on this, because `f` is rank-independent and a criterion
+    // value is not.
+    .with_incumbent_mode_excess(|outer: &CustomOuterState| outer.last_incumbent_mode_excess)
     // EFS may discover the optimum, but only the labeled analytic evaluator
     // owns the exact objective/gradient/coefficient-mode identity consumed by
     // fit assembly. Force the runner's final full-fidelity installation
