@@ -2321,6 +2321,12 @@ fn lift_identity_departure(
 
 /// Solve `X W = B` for `X` given the lower Cholesky factor `L` of the symmetric
 /// `W = L Lᵀ`, i.e. return `B W⁻¹`. `W` is symmetric so `X = (W⁻¹ Bᵀ)ᵀ`.
+///
+/// The triangular solves themselves belong to `gam_linalg::triangular`, which
+/// owns the dense scalar Cholesky kernel (#4544). This keeps only the shape
+/// check and the transpose that turns a right-solve into the owner's
+/// left-solve; the owner walks the same rows in the same order, so every entry
+/// is the one the hand-rolled loop produced.
 fn cholesky_solve_right(factor: &Array2<f64>, b: &Array2<f64>) -> Result<Array2<f64>, String> {
     let q = factor.nrows();
     if b.ncols() != q {
@@ -2329,26 +2335,11 @@ fn cholesky_solve_right(factor: &Array2<f64>, b: &Array2<f64>) -> Result<Array2<
             b.ncols()
         ));
     }
-    let rows = b.nrows();
-    let mut out = Array2::<f64>::zeros((rows, q));
-    let mut work = Array1::<f64>::zeros(q);
-    for r in 0..rows {
-        for i in 0..q {
-            let mut sum = b[[r, i]];
-            for k in 0..i {
-                sum -= factor[[i, k]] * work[k];
-            }
-            work[i] = sum / factor[[i, i]];
-        }
-        for i in (0..q).rev() {
-            let mut sum = work[i];
-            for k in (i + 1)..q {
-                sum -= factor[[k, i]] * out[[r, k]];
-            }
-            out[[r, i]] = sum / factor[[i, i]];
-        }
-    }
-    Ok(out)
+    Ok(
+        gam_linalg::triangular::cholesky_solve_matrix(factor.view(), b.t())
+            .t()
+            .to_owned(),
+    )
 }
 
 /// Refuse a correction that is not a genuine variance REMOVAL. `Δ = W − Cov[u]`

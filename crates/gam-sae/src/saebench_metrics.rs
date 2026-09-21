@@ -537,14 +537,25 @@ pub fn coordinate_posterior_from_precision(
             }
         }
     }
-    let chol = cholesky_lower(precision_row_major, d)?;
-    let mut diag = vec![0.0; d];
-    for basis in 0..d {
-        let mut e = vec![0.0; d];
-        e[basis] = 1.0;
-        let col = solve_cholesky(&chol, &e, d);
-        diag[basis] = col[basis];
-    }
+    // The dense scalar Cholesky kernel is `gam_linalg::triangular`'s (#4544).
+    // The buffer is row-major and the block is symmetric, so the owner's
+    // `ArrayView2` over it reads the same lower triangle the flat loop did, and
+    // solving the identity gives the same forward/back substitutions per basis
+    // vector in the same order.
+    let precision =
+        ndarray::ArrayView2::from_shape((d, d), precision_row_major).map_err(|error| {
+            format!("coordinate_posterior: precision block is not {d}x{d}: {error}")
+        })?;
+    let chol = gam_linalg::triangular::cholesky_factor_in_place(
+        precision,
+        gam_linalg::triangular::CholeskyGuard::FiniteStrict,
+    )
+    .ok_or_else(|| {
+        "coordinate_posterior: precision block must be symmetric positive definite".to_string()
+    })?;
+    let identity = ndarray::Array2::<f64>::eye(d);
+    let inverse = gam_linalg::triangular::cholesky_solve_matrix(chol.view(), identity.view());
+    let diag: Vec<f64> = (0..d).map(|basis| inverse[[basis, basis]]).collect();
     let trace: f64 = diag.iter().sum();
     if !(trace.is_finite() && trace > 0.0) {
         return Err(
@@ -628,48 +639,4 @@ mod phase_lock_tests {
         assert_eq!(report.mean_measured_nats_per_arc_squared, 2.0);
         assert_eq!(report.cv_measured_nats_per_arc_squared, 0.0);
     }
-}
-
-fn cholesky_lower(a: &[f64], d: usize) -> Result<Vec<f64>, String> {
-    let mut l = vec![0.0; d * d];
-    for i in 0..d {
-        for j in 0..=i {
-            let mut sum = a[i * d + j];
-            for k in 0..j {
-                sum -= l[i * d + k] * l[j * d + k];
-            }
-            if i == j {
-                if !(sum.is_finite() && sum > 0.0) {
-                    return Err(
-                        "coordinate_posterior: precision block must be symmetric positive definite"
-                            .into(),
-                    );
-                }
-                l[i * d + j] = sum.sqrt();
-            } else {
-                l[i * d + j] = sum / l[j * d + j];
-            }
-        }
-    }
-    Ok(l)
-}
-
-fn solve_cholesky(l: &[f64], b: &[f64], d: usize) -> Vec<f64> {
-    let mut y = vec![0.0; d];
-    for i in 0..d {
-        let mut sum = b[i];
-        for k in 0..i {
-            sum -= l[i * d + k] * y[k];
-        }
-        y[i] = sum / l[i * d + i];
-    }
-    let mut x = vec![0.0; d];
-    for i in (0..d).rev() {
-        let mut sum = y[i];
-        for k in i + 1..d {
-            sum -= l[k * d + i] * x[k];
-        }
-        x[i] = sum / l[i * d + i];
-    }
-    x
 }

@@ -14,6 +14,19 @@
   fraction of an SSE and `γ_n` depends only on `n`, so the bit-exact scale invariance
   `crossfit_bic_selection_is_scale_invariant` pins is unchanged, and the floor does
   not bind on any non-degenerate fixture.
+- **One dense scalar Cholesky kernel, and a `NaN` pivot is a refusal everywhere** (#4544).
+  `gam_linalg::triangular` owns `cholesky_factor_in_place`, `cholesky_solve_vector`
+  and `cholesky_solve_matrix`, and four private modules re-implemented those loops
+  line for line: `gam-sae`'s `null_battery::cholesky_lower` and
+  `saebench_metrics::{cholesky_lower, solve_cholesky}`, `gam-terms`'
+  `latent::solve_spd`, and the hand-rolled forward/back solve inside `gam-solve`'s
+  `constrained_posterior::cholesky_solve_right`. They now read the owner. The
+  kernel performs the same operations in the same order, so every finite result is
+  bit-identical. **Behavior change:** the `null_battery` and `latent` copies tested
+  `sum <= 0.0`, which is false for `NaN`, so a `NaN` accumulator passed the pivot
+  test and yielded a `NaN` factor — a non-finite auxiliary column made
+  `aux_prior_targets` return `NaN` targets for `AuxPriorFamily::Linear`. Under the
+  owner's `CholeskyGuard::FiniteStrict` both are refusals that name the matrix.
 - **The composition-law test studentizes by the fitted curves' own sampling law** (#3512).
   `composition_defect` floored the defect's pointwise variance at the three maps'
   in-sample observation residual RMS, combined by Minkowski's inequality. That RMS

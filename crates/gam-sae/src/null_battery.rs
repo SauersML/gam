@@ -7,6 +7,7 @@
 //! spike-in power curve for a manufactured circle inside real residual noise.
 
 use crate::discrete_fourier::dft_in_place;
+use gam_linalg::triangular::{CholeskyGuard, cholesky_factor_in_place};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use rand::RngExt;
 use rand::SeedableRng;
@@ -1697,7 +1698,17 @@ pub fn residual_surrogate_from_moments(
     }
     validate_matrix(spec.covariance.view(), "residual surrogate covariance")?;
 
-    let chol = cholesky_lower(spec.covariance.view())?;
+    // The dense scalar Cholesky kernel is `gam_linalg::triangular`'s (#4544).
+    // `validate_matrix` above has already refused a non-finite entry and the
+    // shape check has made the block square, so `FiniteStrict` adds only the
+    // pivot test — including the `NaN` pivot the local copy's `sum <= 0.0`
+    // admitted, since `NaN <= 0.0` is false.
+    let chol = cholesky_factor_in_place(spec.covariance.view(), CholeskyGuard::FiniteStrict)
+        .ok_or_else(|| {
+            "residual surrogate covariance is not positive definite: its Cholesky reached a \
+             pivot that is not finite and strictly positive"
+                .to_string()
+        })?;
     let p = spec.mean.len();
     let mut rng = StdRng::seed_from_u64(seed);
     let mut out = Array2::<f64>::zeros((spec.rows, p));
@@ -2214,37 +2225,6 @@ fn leading_energy_fraction(data: ArrayView2<'_, f64>, rank: usize) -> Result<f64
         return Ok(0.0);
     }
     Ok(top / (top + tail))
-}
-
-fn cholesky_lower(matrix: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    if matrix.nrows() != matrix.ncols() {
-        return Err(format!(
-            "cholesky requires square covariance, got {}x{}",
-            matrix.nrows(),
-            matrix.ncols()
-        ));
-    }
-    let p = matrix.nrows();
-    let mut lower = Array2::<f64>::zeros((p, p));
-    for i in 0..p {
-        for j in 0..=i {
-            let mut sum = matrix[[i, j]];
-            for k in 0..j {
-                sum -= lower[[i, k]] * lower[[j, k]];
-            }
-            if i == j {
-                if sum <= 0.0 {
-                    return Err(format!(
-                        "covariance is not positive definite at diagonal {i}: pivot {sum}"
-                    ));
-                }
-                lower[[i, j]] = sum.sqrt();
-            } else {
-                lower[[i, j]] = sum / lower[[j, j]];
-            }
-        }
-    }
-    Ok(lower)
 }
 
 fn standardized_lognormal_radial(excess_kurtosis: f64, rng: &mut StdRng) -> f64 {

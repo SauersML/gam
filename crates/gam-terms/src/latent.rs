@@ -65,6 +65,7 @@
 use crate::basis::{BasisError, RadialScalarKind};
 use faer::Side;
 use gam_linalg::faer_ndarray::FaerEigh;
+use gam_linalg::triangular::{CholeskyGuard, cholesky_factor_in_place, cholesky_solve_matrix};
 use gam_problem::LatentRetractionRegistry;
 use gam_problem::riemannian_retraction::RetractionKind;
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
@@ -1611,7 +1612,21 @@ pub fn aux_prior_targets(
     }
     let coeffs = match family {
         AuxPriorFamily::Ridge => minimum_norm_coefficients(&gram, &rhs)?,
-        AuxPriorFamily::Linear => solve_spd(gram.view(), rhs.view())?,
+        // The dense scalar Cholesky kernel is `gam_linalg::triangular`'s
+        // (#4544). `FiniteStrict` is what the local copy meant to be: its
+        // `sum <= 0.0` pivot test admitted a `NaN`, because `NaN <= 0.0` is
+        // false, so a non-finite auxiliary column gave a `NaN` Gram and the
+        // Linear family returned `NaN` targets instead of refusing.
+        AuxPriorFamily::Linear => {
+            let factor = cholesky_factor_in_place(gram.view(), CholeskyGuard::FiniteStrict)
+                .ok_or_else(|| {
+                    "aux_prior_targets: the auxiliary Gram UᵀU is not positive definite (its \
+                     Cholesky reached a pivot that is not finite and strictly positive); the \
+                     Linear auxiliary prior has no solution there"
+                        .to_string()
+                })?;
+            cholesky_solve_matrix(factor.view(), rhs.view())
+        }
     };
     // targets = U · coeffs  (n_obs × d)
     let mut targets = Array2::<f64>::zeros((n_obs, d));
@@ -1647,62 +1662,6 @@ fn minimum_norm_coefficients(
         rotated.row_mut(k).mapv_inplace(|value| value * inverse);
     }
     Ok(evecs.dot(&rotated))
-}
-
-/// Lightweight Cholesky-based SPD solve. Keeps this module dependency-free
-/// from the broader faer-wrapping surface; matrices here are tiny
-/// (`p × p` with p = aux-feature count, typically O(10)).
-fn solve_spd(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    let n = a.nrows();
-    if a.ncols() != n {
-        return Err("solve_spd: A must be square".into());
-    }
-    if b.nrows() != n {
-        return Err("solve_spd: RHS row count mismatch".into());
-    }
-    // In-place Cholesky factorization. We pay the O(n³) copy + O(n³) factor
-    // up front; n is tiny in the auxiliary-prior path.
-    let mut l = Array2::<f64>::zeros((n, n));
-    for i in 0..n {
-        for j in 0..=i {
-            let mut sum = a[[i, j]];
-            for k in 0..j {
-                sum -= l[[i, k]] * l[[j, k]];
-            }
-            if i == j {
-                if sum <= 0.0 {
-                    return Err(format!(
-                        "solve_spd: non-positive pivot {sum} at index {i} \
-                         (matrix is not positive definite)"
-                    ));
-                }
-                l[[i, j]] = sum.sqrt();
-            } else {
-                l[[i, j]] = sum / l[[j, j]];
-            }
-        }
-    }
-    // Solve L y = b, then Lᵀ x = y, column by column.
-    let d = b.ncols();
-    let mut out = Array2::<f64>::zeros((n, d));
-    for col in 0..d {
-        let mut y = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let mut sum = b[[i, col]];
-            for k in 0..i {
-                sum -= l[[i, k]] * y[k];
-            }
-            y[i] = sum / l[[i, i]];
-        }
-        for i in (0..n).rev() {
-            let mut sum = y[i];
-            for k in (i + 1)..n {
-                sum -= l[[k, i]] * out[[k, col]];
-            }
-            out[[i, col]] = sum / l[[i, i]];
-        }
-    }
-    Ok(out)
 }
 
 #[derive(Clone, Copy, Debug)]
