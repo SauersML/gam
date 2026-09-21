@@ -1,5 +1,31 @@
 ## Unreleased
 
+- **A constrained fit's criterion was a determinant over the active face, so it fell by that
+  face's own log-eigenvalue every time a row activated** (gam#2765 stage 2, gam#3303, gam#3234,
+  gam#2695). The standard route reduced a shape- or box-constrained mode onto `Z = null(A_act)`
+  and priced `½log|ZᵀHZ|` there, over a space whose DIMENSION moves with the active set; the
+  custom-family route priced the covariance form `½log|M| + C` with `C = −½gᵀM⁻¹g − ln P(u ≥ 0)`,
+  whose two halves are separately singular where an active row's normal curvature crosses zero
+  and whose kept-eigenvalue floor dropped `M`'s material negative eigenvalues outright. Neither
+  is continuous at a face change, and the criterion has one value, not one per route. Both are
+  replaced by the constrained Laplace term `L = ½ln|M| + C`, the log-normalizer of the Laplace
+  integral over the feasible cone, priced as ONE quantity in the natural parameters of its
+  constraint sites (`ConeLaplace`, landed for gam#2765 with no consumer until now). It forms no
+  `M⁻¹`, no `W` and no `ln|M|`, and publishes `Λ = M + AᵀT̃A`, which is positive definite
+  wherever the mode is a strict minimum ON THE CONE — exactly the regime where the ambient `M`
+  is indefinite along a normal an active row blocks. `InnerAssembly::build` prices the term and
+  installs `Λ` as the criterion's log-determinant operator, leaving `M` as the inner stationarity
+  system the mode response is differentiated through, so the evaluator's own `½ln|Λ|`,
+  `½tr(Λ⁻¹Ṁ)` and `½tr(Λ⁻¹M̈) − ½tr(Λ⁻¹Ṁ_lΛ⁻¹Ṁ_k)` are precisely the three pieces the term
+  leaves to its caller and the rest of its value, gradient and Hessian are the criterion's own.
+  The face reduction, the kept-spectrum projected determinant beside it and the covariance form's
+  pseudo-inverse rotations are deleted rather than kept alongside. The term is priced wherever a
+  fit declares inequality rows, active or not — switching it on at the instant a row activates
+  would trade one jump for another — and refused by name at profiled Gaussian dispersion, whose
+  posterior precision `H/φ̂` moves with ρ through `φ̂`, and under Firth, whose `−Φ` the stored
+  penalized gradient does not carry. A reader should check that the criterion's increment across
+  a face-dimension change now sits under what a continuous function can move over that gap, while
+  the face determinant's step `½log(aᵀM⁻¹a)` does not.
 - **The event-history smoother cut its density at an underived `1e-11` and never measured what
   it discarded** (gam#4559, gam#3998). `marginal.rs` formed the smoothed marginal `raw · β` as a
   value before normalising it, which forced a floor: the product overflows where the

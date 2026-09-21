@@ -211,13 +211,13 @@ impl<'a> RemlState<'a> {
         let pirls_result = bundle.pirls_result.as_ref();
         let beta_original = match pirls_result.coordinate_frame {
             pirls::PirlsCoordinateFrame::OriginalSparseNative => {
-                if self.active_constraint_free_basis(pirls_result).is_some() {
+                if self.criterion_leaves_the_original_basis(pirls_result) {
                     return;
                 }
                 polished_solution_beta
             }
             pirls::PirlsCoordinateFrame::TransformedQs => {
-                if self.active_constraint_free_basis(pirls_result).is_some()
+                if self.criterion_leaves_the_original_basis(pirls_result)
                     || polished_solution_beta.len() != self.p
                 {
                     return;
@@ -2958,9 +2958,7 @@ impl<'a> RemlState<'a> {
         match bundle.pirls_result.coordinate_frame {
             pirls::PirlsCoordinateFrame::OriginalSparseNative => Some(cols.clone()),
             pirls::PirlsCoordinateFrame::TransformedQs
-                if self
-                    .active_constraint_free_basis(bundle.pirls_result.as_ref())
-                    .is_none() =>
+                if !self.criterion_leaves_the_original_basis(bundle.pirls_result.as_ref()) =>
             {
                 // `build_auto_assembly` routes this case through
                 // `build_dense_original_assembly`, so evaluator columns are
@@ -3034,9 +3032,8 @@ impl<'a> RemlState<'a> {
             self.clear_joint_ift_mode_response_cache();
             return;
         }
-        let active_constraints = self
-            .active_constraint_free_basis(bundle.pirls_result.as_ref())
-            .is_some();
+        let active_constraints =
+            self.criterion_leaves_the_original_basis(bundle.pirls_result.as_ref());
         if active_constraints {
             self.clear_joint_ift_mode_response_cache();
             log::debug!(
@@ -4812,6 +4809,43 @@ impl<'a> RemlState<'a> {
             return Ok(h);
         }
         Ok(bundle.h_total.as_ref().clone())
+    }
+
+    /// Whether this fit's criterion prices the constrained Laplace term `L = ½ln|M| + C` over the
+    /// feasible cone (gam#2765) instead of a determinant over the active face's free subspace.
+    ///
+    /// It prices the term whenever the inner problem carries inequality rows, active or not:
+    /// which rows are active is exactly what the criterion must stop depending on, and a term
+    /// switched on at the moment a row activates would trade one jump for another. The rows'
+    /// own bound is the only thing that decides it.
+    ///
+    /// Two modes keep the face criterion, each for a reason that is a property of the criterion
+    /// and not of the fit's difficulty:
+    /// * a profiled Gaussian scale moves the posterior precision `H/φ̂` with ρ through `φ̂`, and
+    ///   the term prices no motion of `φ̂`; and
+    /// * with Firth bias reduction armed the inner objective is `−ℓ + ½βᵀSλβ − Φ`, whose score
+    ///   `PirlsResult::penalized_gradient_transformed` does not carry, so the vector the term
+    ///   would read is not that objective's `∇F` and its KKT gradient would be wrong by `∇Φ`.
+    pub(crate) fn prices_constrained_laplace(&self, pr: &PirlsResult) -> bool {
+        if self.config.firth_bias_reduction || reml_is_gaussian_identity(&pr.likelihood) {
+            return false;
+        }
+        pr.linear_constraints_transformed
+            .as_ref()
+            .is_some_and(|lin| lin.a.nrows() > 0)
+    }
+
+    /// Whether this fit's criterion is assembled in the TRANSFORMED PIRLS frame rather than the
+    /// original basis.
+    ///
+    /// Two constructions leave the original basis: an active face, whose free basis `Z` rotates
+    /// every object into a reduced transformed subspace, and a constrained mode pricing the
+    /// constrained Laplace term, which stays full-space but keeps the transformed frame its rows,
+    /// bounds and mode live in (gam#2765). Every consumer that asks "are these coefficient-space
+    /// columns already in the original basis?" reads this one predicate, so a fit cannot be
+    /// assembled in one frame and warm-started from another.
+    pub(crate) fn criterion_leaves_the_original_basis(&self, pr: &PirlsResult) -> bool {
+        self.prices_constrained_laplace(pr) || self.active_constraint_free_basis(pr).is_some()
     }
 
     pub(crate) fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {

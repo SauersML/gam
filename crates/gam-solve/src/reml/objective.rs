@@ -746,14 +746,20 @@ impl<'a> RemlState<'a> {
         // Construct barrier config for monotonicity constraints when no
         // active-set projection is in effect (barrier indices are in the
         // full transformed-coefficient space).
-        let barrier_config = if free_basis_opt.is_none() {
-            pirls_result
-                .linear_constraints_transformed
-                .as_ref()
-                .and_then(Self::barrier_config_from_constraints)
-        } else {
-            None
-        };
+        //
+        // gam#2765: a barrier prices the same inequality rows the constrained Laplace term
+        // prices — as curvature added to the criterion's `H`, rather than as the truncation of
+        // the integral `H` appears in. Where the term is priced it is the one rule for those
+        // rows, so no barrier is installed beside it.
+        let barrier_config =
+            if free_basis_opt.is_none() && !self.prices_constrained_laplace(pirls_result) {
+                pirls_result
+                    .linear_constraints_transformed
+                    .as_ref()
+                    .and_then(Self::barrier_config_from_constraints)
+            } else {
+                None
+            };
 
         Ok(DerivativeContext {
             deriv_provider,
@@ -939,6 +945,66 @@ impl<'a> RemlState<'a> {
         Some(r.clone())
     }
 
+    /// The constraint system and KKT gradient the constrained Laplace term reads on the standard
+    /// route (gam#2765).
+    ///
+    /// A shape- or box-constrained inner solve converges to a KKT point of
+    /// `F(β) = −ℓ(β) + ½βᵀS_λβ` on `Aβ ≥ b`, so `∇F(β̂) = A_actᵀμ` up to the residual the
+    /// inner certificate measures, and [`PirlsResult::penalized_gradient_transformed`] is exactly
+    /// that vector — `Sβ̂ − ∇ℓ(β̂)` — in the same transformed frame `A`, `b` and `β̂` live in.
+    ///
+    /// The term reads the WHOLE system, not the active face. That is the point: the face
+    /// determinant `½log|ZᵀMZ|` is taken over a space whose DIMENSION moves with the active set,
+    /// so the criterion drops by that dimension's own log-eigenvalue at every face change, while
+    /// `L = ½ln|M| + C` names no active set at all (gam#3234).
+    ///
+    /// `None` exactly where [`Self::prices_constrained_laplace`] says the term does not describe
+    /// this criterion, and a non-finite or mis-shaped gradient is refused rather than dropped: a
+    /// silently absent term is the discontinuity this removes.
+    fn standard_cone_normalizer_input(
+        &self,
+        pirls_result: &PirlsResult,
+    ) -> Result<
+        Option<std::sync::Arc<super::reml_outer_engine::ConeNormalizerInput>>,
+        EstimationError,
+    > {
+        if !self.prices_constrained_laplace(pirls_result) {
+            return Ok(None);
+        }
+        let lin = pirls_result
+            .linear_constraints_transformed
+            .as_ref()
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "the constrained Laplace term was selected for a fit that declares no linear \
+                     inequality rows (gam#2765)"
+                        .to_string(),
+                )
+            })?;
+        let gradient = &pirls_result.penalized_gradient_transformed;
+        if gradient.len() != lin.a.ncols() || gradient.iter().any(|value| !value.is_finite()) {
+            crate::bail_invalid_estim!(
+                "the constrained Laplace term reads the inner KKT gradient over {} coefficients; \
+                 the converged penalized gradient has {} entries and {} of them are non-finite \
+                 (gam#2765)",
+                lin.a.ncols(),
+                gradient.len(),
+                gradient.iter().filter(|value| !value.is_finite()).count()
+            );
+        }
+        Ok(Some(std::sync::Arc::new(
+            super::reml_outer_engine::ConeNormalizerInput {
+                rows: lin.a.clone(),
+                bounds: lin.b.clone(),
+                gradient: gradient.clone(),
+                // The active geometry is resolved once, by the unified evaluator, which installs
+                // the tangent-projected mode response and the matching `ġ = M_true β̂̇ + ∂_θ∇F`
+                // from the same `Z`. Publishing a motion here would be a second reading of it.
+                gradient_motion: super::reml_outer_engine::ConeGradientMotion::Stationary,
+            },
+        )))
+    }
+
     /// Frame-mapped inner KKT residual for the ORIGINAL-basis assembly builders
     /// (`build_dense_original_assembly`, `build_sparse_assembly`). The stored
     /// residual lives in the transformed frame; the penalized score rotates with
@@ -1013,6 +1079,7 @@ impl<'a> RemlState<'a> {
         >,
         free_basis: Option<&Array2<f64>>,
         inner_kkt_residual: Option<crate::model_types::ProjectedKktResidual>,
+        cone_normalizer: Option<std::sync::Arc<super::reml_outer_engine::ConeNormalizerInput>>,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
         // When a linear-inequality active set reduces the inner solve to the
         // free subspace `β = z β_f`, the penalty coordinates must be restricted
@@ -1060,42 +1127,46 @@ impl<'a> RemlState<'a> {
         // additive `c·λ` that is invisible at `‖ρ‖ ≤ 1` and sign-flips it a
         // dozen e-folds up. A no-op when the split declares nothing null.
         let null_split = pirls_result.reparam_result.null_split();
-        let penalty_coords = match free_basis {
-            Some(z) => {
-                let face_point = pirls_result.beta_transformed.as_ref().view();
-                let original_coords = self.build_penalty_coords();
-                if pirls_result.reparam_result.canonical_transformed.len() == original_coords.len() {
-                    pirls_result
-                        .reparam_result
-                        .applied_penalties()
-                        .map_err(|error| {
-                            EstimationError::LayoutError(format!(
-                                "projecting the constraint-reduced penalty coordinates onto the \
-                                 reparameterization's penalized subspace failed: {error}"
-                            ))
-                        })?
-                        .iter()
-                        .map(|cp| {
-                            cp.to_penalty_coordinate()
-                                .project_into_subspace(z, face_point)
-                        })
-                        .collect()
-                } else {
-                    original_coords
-                        .iter()
-                        .map(|coord| {
-                            null_split
-                                .project_coordinate(coord, PenaltyFrame::Original)
-                                .project_into_subspace(z, face_point)
-                        })
-                        .collect()
-                }
+        // gam#2765: a constrained mode pricing the constrained Laplace term keeps the FULL
+        // coefficient space, so it has no free basis to project onto — but it is assembled in
+        // the transformed frame all the same, beside `β̂_transformed`, the transformed Hessian
+        // and the transformed constraint rows. The penalty coordinates are therefore read from
+        // the reparameterization exactly as the face-reduced branch reads them, and only the
+        // projection onto `z` is the face's own.
+        let transformed_frame = free_basis.is_some() || cone_normalizer.is_some();
+        let penalty_coords = if transformed_frame {
+            let face_point = pirls_result.beta_transformed.as_ref().view();
+            let onto_face = |coord: super::reml_outer_engine::PenaltyCoordinate| match free_basis {
+                Some(z) => coord.project_into_subspace(z, face_point),
+                None => coord,
+            };
+            let original_coords = self.build_penalty_coords();
+            if pirls_result.reparam_result.canonical_transformed.len() == original_coords.len() {
+                pirls_result
+                    .reparam_result
+                    .applied_penalties()
+                    .map_err(|error| {
+                        EstimationError::LayoutError(format!(
+                            "reading the constrained fit's penalty coordinates in the \
+                             reparameterization's penalized subspace failed: {error}"
+                        ))
+                    })?
+                    .iter()
+                    .map(|cp| onto_face(cp.to_penalty_coordinate()))
+                    .collect()
+            } else {
+                original_coords
+                    .iter()
+                    .map(|coord| {
+                        onto_face(null_split.project_coordinate(coord, PenaltyFrame::Original))
+                    })
+                    .collect()
             }
-            None => self
-                .build_penalty_coords()
+        } else {
+            self.build_penalty_coords()
                 .iter()
                 .map(|coord| null_split.project_coordinate(coord, PenaltyFrame::Original))
-                .collect(),
+                .collect()
         };
         if crate::estimate::outer_eval_capture::rho_outer_audit_enabled() {
             let transformed = &pirls_result.reparam_result.canonical_transformed;
@@ -1243,7 +1314,23 @@ impl<'a> RemlState<'a> {
             fixed_drift_deriv: None,
             contracted_psi_second_order: None,
             kkt_residual: inner_kkt_residual,
-            active_constraints: None,
+            // The mode response of a constrained mode lives in the tangent of the active face.
+            // The unified evaluator builds that response from this block and reads the same
+            // geometry for the motion `ġ = M_true β̂̇ + ∂_θ∇F` of the gradient the constrained
+            // Laplace term prices (gam#2765). It is recorded only where the term is priced: the
+            // face-reduced criterion already carries the active geometry in its own basis.
+            active_constraints: cone_normalizer.as_ref().and_then(|_| {
+                let lin = pirls_result.linear_constraints_transformed.as_ref()?;
+                let face =
+                    crate::active_set::active_face(pirls_result.beta_transformed.as_ref(), lin)?;
+                if face.active_idx.is_empty() {
+                    return None;
+                }
+                Some(std::sync::Arc::new(
+                    crate::model_types::ActiveLinearConstraintBlock { a: face.a_active },
+                ))
+            }),
+            cone_normalizer,
         })
     }
 
@@ -1266,7 +1353,15 @@ impl<'a> RemlState<'a> {
 
         let pirls_result = bundle.pirls_result.as_ref();
 
-        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+        let cone_normalizer = self.standard_cone_normalizer_input(pirls_result)?;
+        // gam#2765: one rule for one quantity. Where the constrained Laplace term prices the
+        // criterion, the criterion is the full-space `L = ½ln|M| + C`, so there is no face to
+        // reduce onto; where it does not, the face determinant stays exactly as it is.
+        let free_basis_opt = if cone_normalizer.is_some() {
+            None
+        } else {
+            self.active_constraint_free_basis(pirls_result)
+        };
         let (h_for_operator, e_for_logdet) = if let Some(z) = free_basis_opt.as_ref() {
             (
                 Cow::Owned(Self::projectwith_basis(bundle.h_total.as_ref(), z)),
@@ -1331,8 +1426,12 @@ impl<'a> RemlState<'a> {
         // rank decision (#2959 D1). One priced on an active-constraint face's
         // free basis does not: its matrix is the face's projection, whose rank
         // the identified-rank certificate does not evaluate.
+        // gam#2765: where the constrained Laplace term prices the criterion, this operator is
+        // `M`, which the assembly demotes to the mode-response system and replaces by `Λ` as the
+        // criterion's log-determinant operator. Its identified rank is then not the rank the
+        // criterion charges, so it is not published as one.
         let publish_spectral = |operator: std::sync::Arc<DenseSpectralOperator>| {
-            if free_basis_opt.is_none() {
+            if free_basis_opt.is_none() && cone_normalizer.is_none() {
                 bundle.publish_criterion_rank_decision(|| super::CriterionRankDecision {
                     predicate: if structural_rank.is_some() {
                         super::CriterionRankPredicate::StructuralRank
@@ -1459,24 +1558,30 @@ impl<'a> RemlState<'a> {
         // vector additionally carries a constraint-normal (Lagrange multiplier)
         // component this standard path does not strip, so present exact-KKT
         // there (unchanged behaviour) rather than a mis-projected residual.
+        //
+        // gam#2765: a constrained mode pricing the constrained Laplace term has no free basis
+        // either, but its stationarity vector is `A_actᵀμ + r` — the term reads that whole
+        // vector as the KKT gradient, and the envelope correction `−½rᵀH⁻¹r` would charge the
+        // multiplier as if it were a convergence residual. Present exact KKT there, as the
+        // face-reduced branch already does.
         let presented = populate_inner_kkt
             || crate::estimate::outer_eval_capture::certificate_parts_capture_enabled();
-        let inner_kkt_residual = if presented && free_basis_opt.is_none() {
-            self.standard_inner_kkt_residual_transformed(
-                pirls_result,
-                bundle.firth_dense_operator.is_some(),
-            )
-            // Guarded by `free_basis_opt.is_none()` directly above: this arm runs
-            // only with an empty active set, so the free subspace is the whole
-            // coefficient space.
-            .map(|r| {
-                let free_rank = r.len();
-                crate::model_types::ProjectedKktResidual::from_active_projected(r)
-                    .with_free_rank(free_rank)
-            })
-        } else {
-            None
-        };
+        let inner_kkt_residual =
+            if presented && free_basis_opt.is_none() && cone_normalizer.is_none() {
+                self.standard_inner_kkt_residual_transformed(
+                    pirls_result,
+                    bundle.firth_dense_operator.is_some(),
+                )
+                // Guarded by the two conditions directly above: this arm runs only with an empty
+                // active set, so the free subspace is the whole coefficient space.
+                .map(|r| {
+                    let free_rank = r.len();
+                    crate::model_types::ProjectedKktResidual::from_active_projected(r)
+                        .with_free_rank(free_rank)
+                })
+            } else {
+                None
+            };
         let inner_kkt_residual =
             self.presented_inner_kkt_residual(inner_kkt_residual, populate_inner_kkt);
         self.finish_assembly(
@@ -1491,6 +1596,7 @@ impl<'a> RemlState<'a> {
             None,
             free_basis_opt.as_ref(),
             inner_kkt_residual,
+            cone_normalizer,
         )
     }
 
@@ -1588,6 +1694,9 @@ impl<'a> RemlState<'a> {
             None,
             None,
             inner_kkt_residual,
+            // The sparse-exact backend runs in the original, untransformed frame and assembles
+            // no constrained fit; a constrained mode is routed to the dense builder above.
+            None,
         )
     }
 
@@ -1971,6 +2080,9 @@ impl<'a> RemlState<'a> {
             None,
             None,
             inner_kkt_residual,
+            // Reached only on an unconstrained QS frame (`build_auto_assembly`), so there is no
+            // constraint system for the term to price.
+            None,
         )
     }
 
@@ -2060,9 +2172,7 @@ impl<'a> RemlState<'a> {
         let unconstrained_qs_frame = matches!(
             bundle.pirls_result.coordinate_frame,
             pirls::PirlsCoordinateFrame::TransformedQs
-        ) && self
-            .active_constraint_free_basis(bundle.pirls_result.as_ref())
-            .is_none();
+        ) && !self.criterion_leaves_the_original_basis(bundle.pirls_result.as_ref());
         if unconstrained_qs_frame {
             self.build_dense_original_assembly(
                 rho,
@@ -2132,6 +2242,35 @@ impl<'a> RemlState<'a> {
             .then_some((cost, gradient, hessian))
     }
 
+    /// One rendering of the unified evaluator's typed verdicts (gam#2765).
+    ///
+    /// A fold at the inner mode and a constrained Laplace term that cannot be formed are both
+    /// refusals OF THIS TRIAL POINT, with no value or derivative standing in for one, so the
+    /// outer search must see `TrialPointRefused` and not a fit-level failure. `stage` names where
+    /// the refusal was raised, since the term is priced when the solution is assembled and the
+    /// rest of the criterion when it is evaluated.
+    fn refused_trial_point(
+        error: super::reml_outer_engine::RemlLamlError,
+        mode: super::reml_outer_engine::EvalMode,
+        stage: &str,
+    ) -> EstimationError {
+        match error {
+            super::reml_outer_engine::RemlLamlError::InnerModeFold(fold) => {
+                EstimationError::TrialPointRefused {
+                    reason: format!("the {mode:?} {stage} refused this trial point: {fold}"),
+                }
+            }
+            super::reml_outer_engine::RemlLamlError::ConeNormalizer(refusal) => {
+                EstimationError::TrialPointRefused {
+                    reason: format!("the {mode:?} {stage} refused this trial point: {refusal}"),
+                }
+            }
+            super::reml_outer_engine::RemlLamlError::Failed(reason) => {
+                EstimationError::InvalidInput(reason)
+            }
+        }
+    }
+
     /// Single assembly point: evaluate an `InnerAssembly`, compute prior, and
     /// apply TK correction.
     ///
@@ -2148,7 +2287,11 @@ impl<'a> RemlState<'a> {
         self.validate_tk_ext_coords(mode, &assembly.ext_coords)?;
         let tk_atom = self.tierney_kadane_terms(rho, bundle, mode, &assembly.ext_coords)?;
         let assembly_ext_len = assembly.ext_coords.len();
-        let mut inner_solution = assembly.build();
+        // gam#2765: assembling prices the constrained Laplace term, which can refuse this trial
+        // point by its typed verdict exactly as evaluating it can.
+        let mut inner_solution = assembly
+            .build()
+            .map_err(|error| Self::refused_trial_point(error, mode, "assembly"))?;
         inner_solution.gaussian_weight_log_sum_half = self.gaussian_weight_log_sum_half();
         inner_solution.dp_floor_scale = self.gaussian_dp_floor_scale();
         let solution_beta = inner_solution.beta.clone();
@@ -2159,22 +2302,7 @@ impl<'a> RemlState<'a> {
             mode,
             prior,
         )
-        .map_err(|error| match error {
-            // gam#2765: an inner mode at a fold refuses this trial point by its typed verdict.
-            super::reml_outer_engine::RemlLamlError::InnerModeFold(fold) => {
-                EstimationError::TrialPointRefused {
-                    reason: format!("the {mode:?} evaluation refused this trial point: {fold}"),
-                }
-            }
-            super::reml_outer_engine::RemlLamlError::ConeNormalizer(refusal) => {
-                EstimationError::TrialPointRefused {
-                    reason: format!("the {mode:?} evaluation refused this trial point: {refusal}"),
-                }
-            }
-            super::reml_outer_engine::RemlLamlError::Failed(reason) => {
-                EstimationError::InvalidInput(reason)
-            }
-        })?;
+        .map_err(|error| Self::refused_trial_point(error, mode, "evaluation"))?;
         let result = self.apply_theta_correction_atom_to_result(result, &tk_atom)?;
         // Adaptive, block-local Laplace-to-sampling fallback (issue #784): where
         // a curvature direction is too non-Gaussian for the Laplace summary,
@@ -2271,7 +2399,9 @@ impl<'a> RemlState<'a> {
         self.validate_tk_ext_coords(eval_mode, &assembly.ext_coords)?;
         let tk_atom = self.tierney_kadane_terms(rho, bundle, eval_mode, &assembly.ext_coords)?;
         let assembly_ext_len = assembly.ext_coords.len();
-        let mut inner_solution = assembly.build();
+        let mut inner_solution = assembly
+            .build()
+            .map_err(|error| Self::refused_trial_point(error, eval_mode, "EFS assembly"))?;
         inner_solution.gaussian_weight_log_sum_half = self.gaussian_weight_log_sum_half();
         inner_solution.dp_floor_scale = self.gaussian_dp_floor_scale();
         let inner_hessian_scale = super::reml_outer_engine::hessian_factorization_geometric_scale(
@@ -2286,26 +2416,7 @@ impl<'a> RemlState<'a> {
             eval_mode,
             prior,
         )
-        .map_err(|error| match error {
-            // gam#2765: an inner mode at a fold refuses this trial point by its typed verdict.
-            super::reml_outer_engine::RemlLamlError::InnerModeFold(fold) => {
-                EstimationError::TrialPointRefused {
-                    reason: format!(
-                        "the {eval_mode:?} EFS evaluation refused this trial point: {fold}"
-                    ),
-                }
-            }
-            super::reml_outer_engine::RemlLamlError::ConeNormalizer(refusal) => {
-                EstimationError::TrialPointRefused {
-                    reason: format!(
-                        "the {eval_mode:?} EFS evaluation refused this trial point: {refusal}"
-                    ),
-                }
-            }
-            super::reml_outer_engine::RemlLamlError::Failed(reason) => {
-                EstimationError::InvalidInput(reason)
-            }
-        })?;
+        .map_err(|error| Self::refused_trial_point(error, eval_mode, "EFS evaluation"))?;
         let cost_result = self.apply_theta_correction_atom_to_result(cost_result, &tk_atom)?;
         // Fold the #784 adaptive block-local Laplace-to-sampling correction into
         // the EFS objective too, so the EFS fixed-point and the BFGS/Newton path
@@ -2528,9 +2639,7 @@ impl<'a> RemlState<'a> {
             } else if matches!(
                 bundle.pirls_result.coordinate_frame,
                 pirls::PirlsCoordinateFrame::TransformedQs
-            ) && self
-                .active_constraint_free_basis(bundle.pirls_result.as_ref())
-                .is_none()
+            ) && !self.criterion_leaves_the_original_basis(bundle.pirls_result.as_ref())
             {
                 (
                     self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs, false)?,
@@ -2642,9 +2751,7 @@ impl<'a> RemlState<'a> {
             } else if matches!(
                 bundle.pirls_result.coordinate_frame,
                 pirls::PirlsCoordinateFrame::TransformedQs
-            ) && self
-                .active_constraint_free_basis(bundle.pirls_result.as_ref())
-                .is_none()
+            ) && !self.criterion_leaves_the_original_basis(bundle.pirls_result.as_ref())
             {
                 self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs, false)?
             } else {
@@ -3042,7 +3149,7 @@ impl<'a> RemlState<'a> {
         let needs_rotation = matches!(
             pirls_result.coordinate_frame,
             pirls::PirlsCoordinateFrame::TransformedQs
-        ) && self.active_constraint_free_basis(pirls_result).is_none();
+        ) && !self.criterion_leaves_the_original_basis(pirls_result);
         if !needs_rotation {
             return Ok(());
         }

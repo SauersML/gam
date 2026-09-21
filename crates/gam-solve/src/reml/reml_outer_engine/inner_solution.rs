@@ -49,6 +49,61 @@ pub enum ConeGradientMotion {
     Pinned,
 }
 
+/// The constrained Laplace term `L = ½ln|M| + C` priced at one inner mode (gam#2765), with how
+/// the KKT gradient it reads moves along the outer coordinates.
+///
+/// [`crate::constrained_posterior::ConeLaplace`] prices `L` in the natural parameters of its
+/// constraint sites, so it never forms `M⁻¹`, `W` or `ln|M|` and its precision
+/// `Λ = M + AᵀT̃A` is positive definite wherever the mode is a strict minimum on the cone.
+/// The assembly that prices the term installs `Λ` as the criterion's log-determinant operator
+/// ([`crate::estimate::reml::assembly::InnerAssembly::build`]), which leaves the evaluator exactly
+/// the three pieces [`ConeLaplace`](crate::constrained_posterior::ConeLaplace) does not return:
+/// `½ln|Λ|` in the value, `½tr(Λ⁻¹Ṁ)` in the gradient, and
+/// `½tr(Λ⁻¹M̈) − ½tr(Λ⁻¹Ṁ_lΛ⁻¹Ṁ_k)` in the Hessian.
+#[derive(Clone, Debug)]
+pub struct ConeNormalizerTerm {
+    /// `L` at this mode, with the state its outer derivatives contract.
+    pub laplace: crate::constrained_posterior::ConeLaplace,
+    /// How `∇F(β̂)` moves along an outer coordinate.
+    pub gradient_motion: ConeGradientMotion,
+}
+
+impl ConeNormalizerTerm {
+    /// Price `L` at a mode, and return it with `Λ = M + AᵀT̃A`, the precision the criterion's
+    /// log-determinant is then taken on.
+    ///
+    /// `precision` is `M`, the precision the criterion prices, in the objective's own (unscaled)
+    /// units; it may be indefinite along an active row's normal, which is the regime the
+    /// covariance form cannot represent. `Λ` is positive definite wherever the mode is a strict
+    /// minimum on the cone, so the criterion's log-determinant on it is an ordinary determinant
+    /// with no rank floor and no eigenvalue regularization.
+    ///
+    /// This is the ONE place `Λ` is derived. [`crate::estimate::reml::assembly::InnerAssembly`]
+    /// calls it as it builds a solution and installs the returned precision as that solution's
+    /// `hessian_op`; nothing else may form a second one.
+    pub fn price(
+        input: &ConeNormalizerInput,
+        beta: &Array1<f64>,
+        precision: &Array2<f64>,
+    ) -> Result<(Self, Array2<f64>), crate::constrained_posterior::ConeLaplaceRefusal> {
+        let laplace = crate::constrained_posterior::ConeLaplace::evaluate(
+            &input.rows,
+            &input.bounds,
+            beta,
+            &input.gradient,
+            precision,
+        )?;
+        let lambda = laplace.laplace_precision().clone();
+        Ok((
+            Self {
+                laplace,
+                gradient_motion: input.gradient_motion.clone(),
+            },
+            lambda,
+        ))
+    }
+}
+
 /// A pair callback that evaluates each fixed-β pair object once per solution: every object is a
 /// function of the one mode the solution carries, so a second request returns the first result.
 fn memoized_pair_fn(pair_fn: HyperCoordPairFn) -> HyperCoordPairFn {
@@ -311,12 +366,11 @@ pub struct InnerSolution<'dp> {
     /// constraints to project against).
     pub active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
 
-    /// The constraint system and KKT gradient the constrained Laplace normalizer reads
-    /// (gam#2765). `Some` prices `C = −½gᵀM⁻¹g − ln P(u ≥ 0)` (see
-    /// [`crate::constrained_posterior::ConeNormalizer`]) on top of the full-space
-    /// `½ log|M|`, which makes the criterion continuous where the active set changes. `None`
-    /// prices no truncation.
-    pub cone_normalizer: Option<Arc<ConeNormalizerInput>>,
+    /// The constrained Laplace term `L = ½ln|M| + C` priced at this mode (gam#2765). `Some`
+    /// replaces the criterion's full-space `½ log|M|` by the log-normalizer of the Laplace
+    /// integral over the feasible cone, which names no active set, so the criterion stays
+    /// continuous where the active set changes. `None` prices no truncation.
+    pub cone_normalizer: Option<Arc<ConeNormalizerTerm>>,
 }
 
 /// Builder for `InnerSolution` that provides sensible defaults and
@@ -349,7 +403,7 @@ pub struct InnerSolutionBuilder<'dp> {
     pub(crate) barrier_config: Option<BarrierConfig>,
     pub(crate) kkt_residual: Option<ProjectedKktResidual>,
     pub(crate) active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
-    pub(crate) cone_normalizer: Option<Arc<ConeNormalizerInput>>,
+    pub(crate) cone_normalizer: Option<Arc<ConeNormalizerTerm>>,
     pub(crate) gaussian_weight_log_sum_half: f64,
     pub(crate) dp_floor_scale: f64,
 }
@@ -524,10 +578,9 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
-    /// Stash the constraint system and KKT gradient the constrained Laplace normalizer reads
-    /// (gam#2765).
-    pub fn cone_normalizer(mut self, input: Option<Arc<ConeNormalizerInput>>) -> Self {
-        self.cone_normalizer = input;
+    /// Stash the constrained Laplace term priced at this mode (gam#2765).
+    pub fn cone_normalizer(mut self, term: Option<Arc<ConeNormalizerTerm>>) -> Self {
+        self.cone_normalizer = term;
         self
     }
 
@@ -616,7 +669,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
                 beta_dim
             );
         }
-        // A criterion that prices the constrained normalizer reads each fixed-β pair object twice,
+        // A criterion that prices the constrained Laplace term reads each fixed-β pair object twice,
         // once in its own outer Hessian and once in the log-determinant's (gam#2765).
         let (ext_coord_pair_fn, rho_ext_pair_fn) = if self.cone_normalizer.is_some() {
             (

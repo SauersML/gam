@@ -8,10 +8,11 @@
 //! [`InnerAssembly::evaluate`] or [`InnerAssembly::build`].
 
 use super::reml_outer_engine::{
-    BarrierConfig, ContractedPsiSecondOrderFn, DispersionHandling, EvalMode, FixedDriftDerivFn,
-    HessianDerivativeProvider, HessianFactorization, HyperCoord, HyperCoordPairResult,
-    InnerSolution, InnerSolutionBuilder, PenaltyCoordinate, PenaltyLogdetDerivs,
-    PenaltySubspaceTrace, RemlLamlResult, reml_laml_evaluate,
+    BarrierConfig, ConeNormalizerTerm, ContractedPsiSecondOrderFn, DenseSpectralOperator,
+    DispersionHandling, EvalMode, FixedDriftDerivFn, HessianDerivativeProvider,
+    HessianFactorization, HyperCoord, HyperCoordPairResult, InnerSolution, InnerSolutionBuilder,
+    PenaltyCoordinate, PenaltyLogdetDerivs, PenaltySubspaceTrace, PseudoLogdetMode, RemlLamlError,
+    RemlLamlResult, reml_laml_evaluate,
 };
 use crate::model_types::ProjectedKktResidual;
 use gam_linalg::faer_ndarray::{fast_xt_diag_x, fast_xt_diag_y};
@@ -207,8 +208,9 @@ pub struct InnerAssembly<'dp> {
     /// constraint-aware kernel `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`
     /// for per-coordinate mode responses `v_k = ∂β/∂ρ_k`.
     pub active_constraints: Option<Arc<crate::model_types::ActiveLinearConstraintBlock>>,
-    /// The constraint system and KKT gradient the constrained Laplace normalizer reads
-    /// (gam#2765); `None` prices no truncation.
+    /// The constraint system and KKT gradient the constrained Laplace term reads (gam#2765);
+    /// `None` prices no truncation. [`Self::build`] prices the term from it and installs the
+    /// precision the criterion's log-determinant is then taken on.
     pub cone_normalizer: Option<Arc<crate::estimate::reml::reml_outer_engine::ConeNormalizerInput>>,
 
     // === Extended hyperparameter coordinates ===
@@ -223,8 +225,124 @@ pub struct InnerAssembly<'dp> {
 }
 
 impl<'dp> InnerAssembly<'dp> {
+    /// Price the constrained Laplace term at this mode and install the precision the criterion's
+    /// log-determinant is taken on (gam#2765).
+    ///
+    /// A constrained mode's Laplace integral runs over the feasible cone, and its log-normalizer
+    /// `L = ½ln|M| + C` is ONE quantity. Priced through the covariance form the two halves are
+    /// separately singular where an active row's normal curvature `σ` crosses zero: `½ln|M|`
+    /// falls to `−∞` and `C` rises to `+∞`, and past the crossing the kept spectrum drops the
+    /// direction from both, so their sum loses `ln μ`. `ConeLaplace` prices `L` in the natural
+    /// parameters of its constraint sites instead, where nothing forms `M⁻¹`, `W` or `ln|M|`, and
+    /// publishes `Λ = M + AᵀT̃A`, positive definite wherever the mode is a strict minimum on the
+    /// cone.
+    ///
+    /// Installing `Λ` as `hessian_op` is what makes the term's derivatives the criterion's own.
+    /// `ConeLaplace::first_order` returns `dL/dθ` less `½tr(Λ⁻¹Ṁ)` and `ConeLaplace::second_order`
+    /// returns `d²L` less `½tr(Λ⁻¹M̈) − ½tr(Λ⁻¹Ṁ_lΛ⁻¹Ṁ_k)`, and those two are exactly the
+    /// log-determinant traces the evaluator already takes on `hessian_op` against the precision
+    /// drifts `Ṁ`. The mode response is differentiated through the inner stationarity system,
+    /// which is `M` and not `Λ` (#2612), so the operator `Λ` displaces becomes
+    /// [`InnerSolution::mode_response_op`] wherever the caller installed none.
+    ///
+    /// `hessian_logdet_correction` survives the substitution unchanged: it un-scales a uniform
+    /// curvature rescale, `−p·log s`, and `Λ_op = M_op + s·AᵀT̃A = s·Λ` carries the same `s` in
+    /// the same way, so `log|Λ_op| + correction` is `log|Λ|`. A kept-spectrum
+    /// [`PenaltySubspaceTrace`] does not: it is a second rule for the same log-determinant. Nor
+    /// does a profiled scale, which would have to price `φ̂`'s own motion. Both are refused here
+    /// by name rather than silently dropped.
+    fn price_cone_normalizer(&mut self) -> Result<Option<Arc<ConeNormalizerTerm>>, RemlLamlError> {
+        let Some(input) = self.cone_normalizer.take() else {
+            return Ok(None);
+        };
+        // Maximum penalized likelihood takes no `½log|H|`, so it takes no cone term either: the
+        // criterion it prices is not a Laplace integral over anything.
+        if matches!(
+            self.dispersion,
+            DispersionHandling::Fixed {
+                include_logdet_h: false,
+                ..
+            }
+        ) {
+            return Ok(None);
+        }
+        if matches!(self.dispersion, DispersionHandling::ProfiledGaussian) {
+            return Err(RemlLamlError::Failed(
+                "the constrained Laplace term is priced at fixed dispersion; a profiled-Gaussian \
+                 solution moves its posterior precision H/phi-hat with rho through phi-hat, and \
+                 the term prices no motion of phi-hat (gam#2765)"
+                    .to_string(),
+            ));
+        }
+        if self.penalty_subspace_trace.is_some() {
+            return Err(RemlLamlError::Failed(
+                "the constrained Laplace term takes the criterion's log-determinant on \
+                 Λ = M + AᵀT̃A, which is positive definite and of full rank at a strict cone \
+                 minimum, so a kept-spectrum penalty-subspace kernel beside it is a second rule \
+                 for one log-determinant (gam#2765)"
+                    .to_string(),
+            ));
+        }
+        // Operator-side objects carry the curvature scale `s`: `M_op = s·M` (see
+        // `InnerSolution::rho_curvature_scale`). The term is priced in the objective's own units,
+        // so the assembled operator is divided by `s` on the way in and `Λ` multiplied by it on
+        // the way out, which leaves `s` exactly where the unconstrained criterion already carries
+        // it.
+        let scale = self.rho_curvature_scale;
+        let precision_op = self
+            .hessian_op
+            .assemble_h_dense_for_tangent_projection()
+            .map_err(|error| {
+                RemlLamlError::Failed(format!(
+                    "the constrained Laplace term needs the dense precision its criterion \
+                     prices: {error} (gam#2765)"
+                ))
+            })?;
+        let precision = if scale == 1.0 {
+            precision_op
+        } else {
+            precision_op.mapv(|value| value / scale)
+        };
+        let (term, mut lambda) = ConeNormalizerTerm::price(&input, &self.beta, &precision)
+            .map_err(RemlLamlError::ConeNormalizer)?;
+        if scale != 1.0 {
+            lambda.mapv_inplace(|value| value * scale);
+        }
+        // `Λ` is positive definite at a strict cone minimum, which `ConeLaplace` has just
+        // certified, so the criterion prices its exact unregularized spectrum: no rank floor, no
+        // smooth eigenvalue regularization, and a refusal where the spectrum disagrees.
+        let lambda_op = DenseSpectralOperator::from_symmetric_with_mode(
+            &lambda,
+            PseudoLogdetMode::PositiveDefinite,
+        )
+        .map_err(|error| {
+            RemlLamlError::Failed(format!(
+                "the constrained Laplace term's precision Λ = M + AᵀT̃A is not a positive \
+                 definite operator: {error} (gam#2765)"
+            ))
+        })?;
+        let installed: Arc<dyn HessianFactorization> = Arc::new(lambda_op);
+        let displaced = std::mem::replace(&mut self.hessian_op, installed);
+        if self.mode_response_op.is_none() {
+            self.mode_response_op = Some(displaced);
+        }
+        log::debug!(
+            "[2765-CONE] value={:.9e} log_det_half={:.9e} share={:.9e} band={:e} \
+             retained_rows={} ep_sweeps={} ep_fraction={:e}",
+            term.laplace.value(),
+            term.laplace.log_det_half(),
+            term.laplace.share(),
+            term.laplace.value_band(),
+            term.laplace.retained_rows(),
+            term.laplace.sweeps(),
+            term.laplace.ep_step_fraction(),
+        );
+        Ok(Some(Arc::new(term)))
+    }
+
     /// Build the `InnerSolution` from these ingredients.
-    pub fn build(self) -> InnerSolution<'dp> {
+    pub fn build(mut self) -> Result<InnerSolution<'dp>, RemlLamlError> {
+        let cone_term = self.price_cone_normalizer()?;
         let mut builder = InnerSolutionBuilder::new(
             self.log_likelihood,
             self.penalty_quadratic,
@@ -251,7 +369,7 @@ impl<'dp> InnerAssembly<'dp> {
         builder = builder.barrier_config(self.barrier_config);
         builder = builder.kkt_residual(self.kkt_residual);
         builder = builder.active_constraints(self.active_constraints);
-        builder = builder.cone_normalizer(self.cone_normalizer);
+        builder = builder.cone_normalizer(cone_term);
 
         if !self.ext_coords.is_empty() {
             builder = builder.ext_coords(self.ext_coords);
@@ -267,7 +385,7 @@ impl<'dp> InnerAssembly<'dp> {
         }
         builder = builder.contracted_psi_second_order(self.contracted_psi_second_order);
 
-        builder.build()
+        Ok(builder.build())
     }
 
     /// Build and evaluate in one step.
@@ -277,7 +395,7 @@ impl<'dp> InnerAssembly<'dp> {
         mode: EvalMode,
         prior: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
     ) -> Result<RemlLamlResult, super::reml_outer_engine::RemlLamlError> {
-        let solution = self.build();
+        let solution = self.build()?;
         // The rho outer audit is a thread-local and a no-op unless armed. This
         // route gets the same fresh window and criterion record as the standard
         // assemble-and-evaluate path. Without them the coupled custom-family route

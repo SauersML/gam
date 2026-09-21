@@ -9200,59 +9200,75 @@ pub(crate) fn a_curvature_that_does_not_move_never_refuses_above_its_rounding_ba
     }
 }
 
-/// gam#2765: the constrained Laplace normalizer through the engine, next to a switch of the active set.
+/// The fixture both gam#2765 engine tests read.
 ///
-/// A Gaussian quadratic in three coefficients with two correlated inequality rows `Aβ ≥ b`. The first
-/// row's bound is the unconstrained mode's value at `ρ_s`, so the constrained mode is on that row's face
-/// on one side of `ρ_s` and interior on the other; the second row keeps half a posterior standard
-/// deviation of slack there. For a quadratic the cone-integrated criterion is
-/// `F(β*) + ½log|H| − ½log|S|₊ − ln P(u ≥ 0)` with `u ~ N(Aβ* − b, AH⁻¹Aᵀ)`, smooth in ρ across the
-/// switch where the face criterion is not, so central differences of the engine's cost may straddle it.
-/// At two points closer to the switch than either difference step, one on each side, and at two whose
-/// stencils stay on one side, the analytic gradient must match central differences of the cost and the
-/// analytic Hessian central differences of the analytic gradient. Where a stencil stays on one side,
-/// the normalizer's share of the Hessian must also match central differences of its share of the
-/// gradient, and the criterion without it must match its own. The normalizer's share of each gradient
-/// entry must exceed its agreement bar, so a wrong normalizer derivative cannot pass.
-#[test]
-pub(crate) fn the_cone_normalizer_outer_derivatives_match_central_differences_at_a_face_switch_2765() {
-    use crate::model_types::ActiveLinearConstraintBlock;
+/// A Gaussian quadratic in three coefficients with two correlated inequality rows `Aβ ≥ b`. The
+/// first row's bound is the unconstrained mode's value at [`Self::switch`], so the constrained
+/// mode is on that row's face on one side of the switch and interior on the other, and crossing
+/// it changes the DIMENSION of the active face. The second row keeps half a posterior standard
+/// deviation of slack there, so it never activates over the range either test walks.
+struct ConeFaceSwitchFixture {
+    xtx: Array2<f64>,
+    s1: Array2<f64>,
+    s2: Array2<f64>,
+    xty: Array1<f64>,
+    rows: Array2<f64>,
+    bounds: Array1<f64>,
+    switch: [f64; 2],
+}
 
-    let xtx = array![[10.0, 2.0, 1.0], [2.0, 8.0, 0.5], [1.0, 0.5, 6.0]];
-    let s1 = array![[1.0, 0.2, 0.0], [0.2, 1.0, 0.0], [0.0, 0.0, 0.0]];
-    let s2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
-    let xty = array![5.0, 3.0, 2.0];
-    let rows = array![[1.0, -0.4, 0.2], [0.3, 1.0, -0.5]];
-    let precision = |rho: &[f64]| {
+impl ConeFaceSwitchFixture {
+    fn new() -> Self {
+        let xtx = array![[10.0, 2.0, 1.0], [2.0, 8.0, 0.5], [1.0, 0.5, 6.0]];
+        let s1 = array![[1.0, 0.2, 0.0], [0.2, 1.0, 0.0], [0.0, 0.0, 0.0]];
+        let s2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let xty = array![5.0, 3.0, 2.0];
+        let rows = array![[1.0, -0.4, 0.2], [0.3, 1.0, -0.5]];
+        let switch = [0.5, 0.3];
         let mut h = xtx.clone();
-        h.scaled_add(rho[0].exp(), &s1);
-        h.scaled_add(rho[1].exp(), &s2);
-        h
-    };
-    let factor = |rho: &[f64]| {
-        DenseSpectralOperator::from_symmetric(&precision(rho))
-            .expect("the fixture precision is positive definite")
-    };
-    let switch = [0.5, 0.3];
-    let bounds = {
-        let op = factor(&switch);
+        h.scaled_add(switch[0].exp(), &s1);
+        h.scaled_add(switch[1].exp(), &s2);
+        let op = DenseSpectralOperator::from_symmetric(&h)
+            .expect("the fixture precision is positive definite");
         let free = op.solve(&xty);
         let second = rows.row(1).to_owned();
         let second_sd = second.dot(&op.solve(&second)).sqrt();
-        array![rows.row(0).dot(&free), second.dot(&free) - 0.5 * second_sd]
-    };
-    // The constrained mode: the one active set of the strictly convex quadratic whose multipliers are
-    // nonnegative and whose other rows are feasible.
-    let constrained_mode = |rho: &[f64]| -> (Array1<f64>, Vec<usize>) {
-        let op = factor(rho);
-        let free = op.solve(&xty);
+        let bounds = array![rows.row(0).dot(&free), second.dot(&free) - 0.5 * second_sd];
+        Self {
+            xtx,
+            s1,
+            s2,
+            xty,
+            rows,
+            bounds,
+            switch,
+        }
+    }
+
+    fn precision(&self, rho: &[f64]) -> Array2<f64> {
+        let mut h = self.xtx.clone();
+        h.scaled_add(rho[0].exp(), &self.s1);
+        h.scaled_add(rho[1].exp(), &self.s2);
+        h
+    }
+
+    fn factor(&self, rho: &[f64]) -> DenseSpectralOperator {
+        DenseSpectralOperator::from_symmetric(&self.precision(rho))
+            .expect("the fixture precision is positive definite")
+    }
+
+    /// The constrained mode: the one active set of the strictly convex quadratic whose multipliers
+    /// are nonnegative and whose other rows are feasible.
+    fn constrained_mode(&self, rho: &[f64]) -> (Array1<f64>, Vec<usize>) {
+        let op = self.factor(rho);
+        let free = op.solve(&self.xty);
         for active in [vec![], vec![0], vec![1], vec![0, 1]] {
             let beta = if active.is_empty() {
                 free.clone()
             } else {
-                let face = rows.select(ndarray::Axis(0), &active);
+                let face = self.rows.select(ndarray::Axis(0), &active);
                 let normals = op.solve_multi(&face.t().to_owned());
-                let deficit = &bounds.select(ndarray::Axis(0), &active) - &face.dot(&free);
+                let deficit = &self.bounds.select(ndarray::Axis(0), &active) - &face.dot(&free);
                 let multipliers = DenseSpectralOperator::from_symmetric(&face.dot(&normals))
                     .expect("the fixture rows are independent")
                     .solve(&deficit);
@@ -9261,16 +9277,25 @@ pub(crate) fn the_cone_normalizer_outer_derivatives_match_central_differences_at
                 }
                 &free + &normals.dot(&multipliers)
             };
-            let slack = &rows.dot(&beta) - &bounds;
-            if (0..rows.nrows()).all(|row| active.contains(&row) || slack[row] > 0.0) {
+            let slack = &self.rows.dot(&beta) - &self.bounds;
+            if (0..self.rows.nrows()).all(|row| active.contains(&row) || slack[row] > 0.0) {
                 return (beta, active);
             }
         }
         panic!("a strictly convex quadratic has a KKT active set at {rho:?}")
-    };
-    let evaluate = |rho: &[f64], request: EvalMode, priced: bool| {
-        let (beta, active) = constrained_mode(rho);
-        let gradient = precision(rho).dot(&beta) - &xty;
+    }
+
+    /// The engine's evaluation at this ρ, with the constrained Laplace term priced or not.
+    ///
+    /// `priced` installs what `InnerAssembly::build` installs in production: the term at this
+    /// mode, the criterion's log-determinant taken on the precision the term publishes, and `M`
+    /// left as the system the mode response is differentiated through. `!priced` is the face
+    /// criterion the term replaces, kept here as the control the bounds are shown to fail on.
+    fn evaluate(&self, rho: &[f64], request: EvalMode, priced: bool) -> RemlLamlResult {
+        use crate::model_types::ActiveLinearConstraintBlock;
+
+        let (beta, active) = self.constrained_mode(rho);
+        let gradient = self.precision(rho).dot(&beta) - &self.xty;
         let mut solution = build_gaussian_solution_at_beta(rho, beta, false);
         solution.dispersion = DispersionHandling::Fixed {
             phi: 1.0,
@@ -9283,35 +9308,89 @@ pub(crate) fn the_cone_normalizer_outer_derivatives_match_central_differences_at
         // derivatives are the ranks and its second derivatives vanish.
         solution.penalty_logdet = PenaltyLogdetDerivs {
             value: solution.penalty_logdet.value,
-            first: solution.penalty_coords.iter().map(|coordinate| coordinate.rank() as f64).collect(),
+            first: solution
+                .penalty_coords
+                .iter()
+                .map(|coordinate| coordinate.rank() as f64)
+                .collect(),
             second: Some(Array2::zeros((rho.len(), rho.len()))),
         };
         if !active.is_empty() {
             solution.active_constraints = Some(Arc::new(ActiveLinearConstraintBlock {
-                a: rows.select(ndarray::Axis(0), &active),
+                a: self.rows.select(ndarray::Axis(0), &active),
             }));
         }
         if priced {
-            solution.cone_normalizer = Some(Arc::new(ConeNormalizerInput {
-                rows: rows.clone(),
-                bounds: bounds.clone(),
+            let input = ConeNormalizerInput {
+                rows: self.rows.clone(),
+                bounds: self.bounds.clone(),
                 gradient,
                 gradient_motion: ConeGradientMotion::Stationary,
-            }));
+            };
+            let precision = self.precision(rho);
+            let (term, lambda) = ConeNormalizerTerm::price(&input, &solution.beta, &precision)
+                .unwrap_or_else(|refusal| {
+                    panic!("the fixture's constrained mode prices its term at {rho:?}: {refusal}")
+                });
+            solution.mode_response_op = Some(Arc::clone(&solution.hessian_op));
+            solution.hessian_op = Arc::new(
+                DenseSpectralOperator::from_symmetric_with_mode(
+                    &lambda,
+                    PseudoLogdetMode::PositiveDefinite,
+                )
+                .expect("Λ = M + AᵀT̃A is positive definite at a strict cone minimum"),
+            );
+            solution.cone_normalizer = Some(Arc::new(term));
         }
         reml_laml_evaluate(&solution, rho, request, None)
             .unwrap_or_else(|error| panic!("the fixture evaluates at {rho:?}: {error}"))
-    };
-    let gradient_at = |rho: &[f64], priced: bool| {
-        evaluate(rho, EvalMode::ValueAndGradient, priced)
+    }
+
+    fn cost(&self, rho: &[f64], priced: bool) -> f64 {
+        self.evaluate(rho, EvalMode::ValueOnly, priced).cost
+    }
+
+    fn gradient(&self, rho: &[f64], priced: bool) -> Array1<f64> {
+        self.evaluate(rho, EvalMode::ValueAndGradient, priced)
             .gradient
             .expect("an exact quadratic mode publishes its gradient")
-    };
-    let displaced = |rho: &[f64], coordinate: usize, step: f64| {
+    }
+
+    fn hessian(&self, rho: &[f64], priced: bool) -> Array2<f64> {
+        let evaluated = self.evaluate(rho, EvalMode::ValueGradientHessian, priced);
+        match evaluated.hessian {
+            gam_problem::HessianValue::Dense(hessian) => hessian,
+            gam_problem::HessianValue::Operator(_) | gam_problem::HessianValue::Unavailable => {
+                panic!("the fixture assembles a dense outer Hessian at {rho:?}")
+            }
+        }
+    }
+
+    fn displaced(&self, rho: &[f64], coordinate: usize, step: f64) -> Vec<f64> {
         let mut moved = rho.to_vec();
         moved[coordinate] += step;
         moved
-    };
+    }
+}
+
+/// gam#2765: the constrained Laplace term through the engine, next to a switch of the active set.
+///
+/// For a quadratic the cone-integrated criterion is `F(β*) + L − ½log|S|₊` with `L = ½ln|M| + C`
+/// the log-normalizer of the Laplace integral over the cone, which the engine prices as
+/// `½log|Λ|` on the installed precision `Λ = M + AᵀT̃A` plus the term's own share. `L` is smooth
+/// in ρ across the switch where the face criterion is not, so central differences of the engine's
+/// cost may straddle it.
+///
+/// At two points closer to the switch than either difference step, one on each side, and at two
+/// whose stencils stay on one side, the analytic gradient must match central differences of the
+/// cost and the analytic Hessian central differences of the analytic gradient. Where a stencil
+/// stays on one side, the term's share of the Hessian must also match central differences of its
+/// share of the gradient, and the criterion without it must match its own. The term's share of
+/// each gradient entry must exceed its agreement bar, so a wrong derivative of the term cannot
+/// pass.
+#[test]
+pub(crate) fn the_cone_normalizer_outer_derivatives_match_central_differences_at_a_face_switch_2765() {
+    let fixture = ConeFaceSwitchFixture::new();
     // Central differences at steps h and h/2, their Richardson combination, and a bar of the two
     // estimates' disagreement plus the rounding of the coarse one.
     let richardson = |f: &dyn Fn(f64) -> f64, h: f64| {
@@ -9323,12 +9402,7 @@ pub(crate) fn the_cone_normalizer_outer_derivatives_match_central_differences_at
     };
     let step = 1.0e-2;
     let offset = 0.25 * step;
-    let hessian_at = |rho: &[f64], priced: bool| match evaluate(rho, EvalMode::ValueGradientHessian, priced).hessian {
-        gam_problem::HessianValue::Dense(hessian) => hessian,
-        gam_problem::HessianValue::Operator(_) | gam_problem::HessianValue::Unavailable => {
-            panic!("the fixture assembles a dense outer Hessian at {rho:?}")
-        }
-    };
+    let switch = fixture.switch;
     // Two points closer to the switch than either difference step, so their stencils straddle it,
     // and two whose stencils stay on one side.
     let points = [
@@ -9337,61 +9411,80 @@ pub(crate) fn the_cone_normalizer_outer_derivatives_match_central_differences_at
         ("far below", [switch[0] - 20.0 * step, switch[1]]),
         ("far above", [switch[0] + 20.0 * step, switch[1]]),
     ];
-    let (below_active, above_active) = (constrained_mode(&points[0].1).1, constrained_mode(&points[1].1).1);
+    let (below_active, above_active) = (
+        fixture.constrained_mode(&points[0].1).1,
+        fixture.constrained_mode(&points[1].1).1,
+    );
     let mut failures = Vec::new();
     if below_active.contains(&0) == above_active.contains(&0) {
         failures.push(format!(
-            "the near points do not sit on either side of the first row's switch: {below_active:?} / {above_active:?}"
+            "the near points do not sit on either side of the first row's switch: \
+             {below_active:?} / {above_active:?}"
         ));
     }
     for (name, point) in points {
-        let active = constrained_mode(&point).1;
+        let active = fixture.constrained_mode(&point).1;
         // The stencil stays on the point's face when every difference point keeps its active rows;
         // only then is the unpriced criterion, whose gradient kinks at the switch, differentiable
         // across the stencil.
         let one_sided = (0..point.len()).all(|coordinate| {
-            [step, -step, 0.5 * step, -0.5 * step]
-                .iter()
-                .all(|&t| constrained_mode(&displaced(&point, coordinate, t)).1 == active)
+            [step, -step, 0.5 * step, -0.5 * step].iter().all(|&t| {
+                fixture
+                    .constrained_mode(&fixture.displaced(&point, coordinate, t))
+                    .1
+                    == active
+            })
         });
-        eprintln!("[2765-ENGINE] {name} rho={point:?} active={active:?} one_sided_stencil={one_sided}");
-        let gradient = gradient_at(&point, true);
-        let unpriced = gradient_at(&point, false);
-        let hessian = hessian_at(&point, true);
-        let unpriced_hessian = hessian_at(&point, false);
+        eprintln!(
+            "[2765-ENGINE] {name} rho={point:?} active={active:?} one_sided_stencil={one_sided}"
+        );
+        let gradient = fixture.gradient(&point, true);
+        let unpriced = fixture.gradient(&point, false);
+        let hessian = fixture.hessian(&point, true);
+        let unpriced_hessian = fixture.hessian(&point, false);
         for coordinate in 0..point.len() {
             let (fd, bar) = richardson(
-                &|t| evaluate(&displaced(&point, coordinate, t), EvalMode::ValueOnly, true).cost,
+                &|t| fixture.cost(&fixture.displaced(&point, coordinate, t), true),
                 step,
             );
             let share = gradient[coordinate] - unpriced[coordinate];
             eprintln!(
-                "[2765-ENGINE] {name} coordinate={coordinate} gradient={:.12e} fd={fd:.12e} bar={bar:.3e} \
-                 normalizer_share={share:.6e}",
+                "[2765-ENGINE] {name} coordinate={coordinate} gradient={:.12e} fd={fd:.12e} \
+                 bar={bar:.3e} term_share={share:.6e}",
                 gradient[coordinate]
             );
             if (gradient[coordinate] - fd).abs() > bar {
-                failures.push(format!("{name} gradient {coordinate}: {} against {fd} (bar {bar})", gradient[coordinate]));
+                failures.push(format!(
+                    "{name} gradient {coordinate}: {} against {fd} (bar {bar})",
+                    gradient[coordinate]
+                ));
             }
             if share.abs() <= bar {
-                failures.push(format!("{name} normalizer share {coordinate}: {share} within the bar {bar}"));
+                failures.push(format!(
+                    "{name} term share {coordinate}: {share} within the bar {bar}"
+                ));
             }
             for row in 0..point.len() {
-                let (fd, bar) = richardson(&|t| gradient_at(&displaced(&point, coordinate, t), true)[row], step);
+                let (fd, bar) = richardson(
+                    &|t| fixture.gradient(&fixture.displaced(&point, coordinate, t), true)[row],
+                    step,
+                );
                 let (share_fd, share_bar) = richardson(
                     &|t| {
-                        let moved = displaced(&point, coordinate, t);
-                        gradient_at(&moved, true)[row] - gradient_at(&moved, false)[row]
+                        let moved = fixture.displaced(&point, coordinate, t);
+                        fixture.gradient(&moved, true)[row] - fixture.gradient(&moved, false)[row]
                     },
                     step,
                 );
-                let (base_fd, base_bar) =
-                    richardson(&|t| gradient_at(&displaced(&point, coordinate, t), false)[row], step);
+                let (base_fd, base_bar) = richardson(
+                    &|t| fixture.gradient(&fixture.displaced(&point, coordinate, t), false)[row],
+                    step,
+                );
                 let share_hessian = hessian[[row, coordinate]] - unpriced_hessian[[row, coordinate]];
                 eprintln!(
-                    "[2765-ENGINE] {name} hessian[{row},{coordinate}]={:.12e} fd={fd:.12e} bar={bar:.3e} | \
-                     normalizer {share_hessian:.12e} fd={share_fd:.12e} bar={share_bar:.3e} | \
-                     unpriced {:.12e} fd={base_fd:.12e} bar={base_bar:.3e}",
+                    "[2765-ENGINE] {name} hessian[{row},{coordinate}]={:.12e} fd={fd:.12e} \
+                     bar={bar:.3e} | term {share_hessian:.12e} fd={share_fd:.12e} \
+                     bar={share_bar:.3e} | unpriced {:.12e} fd={base_fd:.12e} bar={base_bar:.3e}",
                     hessian[[row, coordinate]],
                     unpriced_hessian[[row, coordinate]]
                 );
@@ -9403,13 +9496,14 @@ pub(crate) fn the_cone_normalizer_outer_derivatives_match_central_differences_at
                 }
                 if one_sided && (share_hessian - share_fd).abs() > share_bar {
                     failures.push(format!(
-                        "{name} normalizer hessian [{row},{coordinate}]: {share_hessian} against {share_fd} \
-                         (bar {share_bar})"
+                        "{name} term hessian [{row},{coordinate}]: {share_hessian} against \
+                         {share_fd} (bar {share_bar})"
                     ));
                 }
                 if one_sided && (unpriced_hessian[[row, coordinate]] - base_fd).abs() > base_bar {
                     failures.push(format!(
-                        "{name} unpriced hessian [{row},{coordinate}]: {} against {base_fd} (bar {base_bar})",
+                        "{name} unpriced hessian [{row},{coordinate}]: {} against {base_fd} \
+                         (bar {base_bar})",
                         unpriced_hessian[[row, coordinate]]
                     ));
                 }
@@ -9419,70 +9513,78 @@ pub(crate) fn the_cone_normalizer_outer_derivatives_match_central_differences_at
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// Contract: `GlmCurvatureCorrectionOperator`'s streamed `mul_mat`, its
-/// row-energy trace, and the cached trace shared across coordinates all equal
-/// the per-column `mul_vec` definition of `C = Xᵀ diag(d) X`. The cached slot is
-/// keyed on the design alone, so corrections with different `d` built on
-/// clones of one design share it, while a different design never reads it.
-/// The factor is wide enough that the design streams in more than one chunk.
+/// gam#2765 / gam#3234: across a change of the active face's DIMENSION the constrained criterion
+/// moves by what a continuous function can move over that gap, and the face determinant it
+/// replaces cannot.
+///
+/// Over `[ρ_s − δ, ρ_s + δ]` a criterion differentiable on the closed interval satisfies
+/// `|V(ρ_s+δ) − V(ρ_s−δ)| ≤ 2δ·max|V'| + 4δ²·max|V''|`: the mean value theorem bounds the
+/// increment by `2δ` times the largest slope on the interval, and a second application bounds
+/// that slope by the larger of the two ENDPOINT slopes plus `2δ` times the largest curvature.
+/// Both factors are read from the engine's own analytic gradient and Hessian at the two
+/// endpoints, the only points the criterion is evaluated at; nothing in the bound is a literal.
+///
+/// What it is measured against is exact. For a unit row `a` and `Z` an orthonormal basis of its
+/// orthogonal complement, `det(M) = det(ZᵀMZ)/(aᵀM⁻¹a)`, so a criterion priced on the active
+/// face's free subspace rises by `½log(aᵀM⁻¹a)` at the instant that row activates — a step that
+/// does not shrink with `δ`, because it is not a rate. The test reports that step beside the
+/// bound and requires the bound to be the smaller of the two at both gaps: a bound no criterion
+/// can fail measures nothing.
 #[test]
-pub(crate) fn glm_curvature_correction_traces_match_column_matvecs() {
-    let n = 1100usize;
-    let p = 480usize;
-    let rank = 480usize;
-    let x_data = Array2::from_shape_fn((n, p), |(i, j)| {
-        ((i * 7 + j * 13) as f64 * 0.011).sin() + 0.02 * ((i + j) % 5) as f64
-    });
-    assert!(gam_runtime::resource::byte_balanced_row_chunk(p + rank, n) < n);
-    let design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_data.clone()));
-    let other_design =
-        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_data.mapv(|v| 0.5 * v)));
-    let factor = Array2::from_shape_fn((p, rank), |(i, k)| ((i * rank + k) as f64 * 0.017).cos());
-    let op = |x_design: &DesignMatrix, phase: f64| GlmCurvatureCorrectionOperator {
-        x_design: x_design.clone(),
-        neg_c_xv: Array1::from_shape_fn(n, |i| (i as f64 * 0.37 + phase).sin()),
-        p,
-    };
-    let ops = [op(&design, 0.0), op(&design, 1.3), op(&other_design, 2.1)];
-
-    let cache = ProjectedFactorCache::default();
-    for (idx, op) in ops.iter().enumerate() {
-        let mut column_products = Array2::<f64>::zeros((p, rank));
-        for col in 0..rank {
-            column_products
-                .column_mut(col)
-                .assign(&op.mul_vec(&factor.column(col).to_owned()));
-        }
-        let terms: Vec<f64> = factor
-            .iter()
-            .zip(column_products.iter())
-            .map(|(&f, &bf)| f * bf)
-            .collect();
-        let want: f64 = terms.iter().sum();
-        let magnitude: f64 = terms.iter().map(|t| t.abs()).sum();
-        // Every path accumulates `O(n · p · rank)` rounded products.
-        let band = (n * p * rank) as f64 * f64::EPSILON * magnitude.max(1.0);
-
-        let streamed = op.mul_mat(&factor);
-        let product_band = (n * p) as f64
-            * f64::EPSILON
-            * column_products.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
-        let product_gap = (&streamed - &column_products)
-            .iter()
-            .fold(0.0_f64, |m, v| m.max(v.abs()));
-        assert!(
-            product_gap <= product_band,
-            "op {idx}: streamed C·F differs from column matvecs by {product_gap:.3e} (band {product_band:.3e})"
+pub(crate) fn the_constrained_criterion_moves_continuously_across_a_face_dimension_change_2765() {
+    let fixture = ConeFaceSwitchFixture::new();
+    let switch = fixture.switch;
+    // The step the face determinant takes when the first row activates, in closed form at the
+    // switch: `½log(aᵀM⁻¹a)` on that row at unit scale.
+    let row = fixture.rows.row(0).to_owned();
+    let unit_row = &row / row.dot(&row).sqrt();
+    let face_step = 0.5
+        * fixture
+            .factor(&switch)
+            .solve(&unit_row)
+            .dot(&unit_row)
+            .ln()
+            .abs();
+    let mut failures = Vec::new();
+    for delta in [1.0e-2, 2.5e-3] {
+        let below = [switch[0] - delta, switch[1]];
+        let above = [switch[0] + delta, switch[1]];
+        let (below_active, above_active) = (
+            fixture.constrained_mode(&below).1,
+            fixture.constrained_mode(&above).1,
         );
-        for (label, got) in [
-            ("uncached", op.trace_projected_factor(&factor)),
-            ("cached", op.trace_projected_factor_cached(&factor, &cache)),
-            ("cache hit", op.trace_projected_factor_cached(&factor, &cache)),
-        ] {
-            assert!(
-                (got - want).abs() <= band,
-                "op {idx} {label}: trace {got:.15e} vs column matvecs {want:.15e} (band {band:.3e})"
-            );
+        if below_active.len() == above_active.len() {
+            failures.push(format!(
+                "delta {delta:e}: the two points do not straddle a face-dimension change: \
+                 {below_active:?} / {above_active:?}"
+            ));
+            continue;
+        }
+        let increment = fixture.cost(&above, true) - fixture.cost(&below, true);
+        let slope = fixture.gradient(&below, true)[0]
+            .abs()
+            .max(fixture.gradient(&above, true)[0].abs());
+        let curvature = fixture.hessian(&below, true)[[0, 0]]
+            .abs()
+            .max(fixture.hessian(&above, true)[[0, 0]].abs());
+        let bound = 2.0 * delta * slope + 4.0 * delta * delta * curvature;
+        eprintln!(
+            "[3234-SWITCH] delta={delta:e} increment={increment:.9e} bound={bound:.9e} \
+             face_step={face_step:.9e} slope={slope:.6e} curvature={curvature:.6e} \
+             active={below_active:?}->{above_active:?}"
+        );
+        if increment.abs() > bound {
+            failures.push(format!(
+                "delta {delta:e}: the constrained criterion moved {increment:e} across the \
+                 switch, above what a continuous criterion can move over that gap, {bound:e}"
+            ));
+        }
+        if face_step <= bound {
+            failures.push(format!(
+                "delta {delta:e}: the face determinant's step {face_step:e} is within the bound \
+                 {bound:e}, so this bound cannot detect the discontinuity it exists to detect"
+            ));
         }
     }
+    assert!(failures.is_empty(), "{failures:#?}");
 }

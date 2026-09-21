@@ -622,7 +622,9 @@ pub(crate) fn unified_joint_efs_eval(
     let rho_slice = rho_with_joint
         .as_slice()
         .ok_or_else(|| "outer rho vector must be contiguous".to_string())?;
-    let inner_solution = assembly.build();
+    let inner_solution = assembly.build().map_err(|error| {
+        unified_evaluation_error(error, EvalMode::ValueAndGradient, "EFS assembly")
+    })?;
     let has_psi = inner_solution
         .ext_coords
         .iter()
@@ -1001,10 +1003,16 @@ pub(crate) fn joint_outer_evaluate(
     // `∂²C/∂ψ∂ψ|_β` to each ψ pair's drift and `∂_ψ D_β C[v]` to the fixed-drift derivative where
     // the workspace contracts every ψ-moved trace Hessian; elsewhere a Hessian request on such a
     // criterion is refused, and the fit declares no outer Hessian.
+    // gam#2765: where the constrained Laplace term prices the criterion, its log-determinant is
+    // taken on Λ = M + AᵀT̃A, which is positive definite and of full rank at a strict cone
+    // minimum. A kept-spectrum projected determinant beside it would be a SECOND rule for the
+    // same quantity — the rule whose penalty-rank floor silently dropped `M`'s material negative
+    // eigenvalues (gam#3303) — so it is off wherever the term is on, exactly as `face_tangent` is.
     let projected_criterion = project_hessian_logdet
         && include_logdet_h
         && include_logdet_s
-        && pseudo_logdet_mode == PseudoLogdetMode::Smooth;
+        && pseudo_logdet_mode == PseudoLogdetMode::Smooth
+        && inner.cone_normalizer.is_none();
     let completion_priced = projected_criterion
         && robust_jeffreys_completion.is_some()
         && jeffreys_hphi_drift.as_ref().is_some_and(|drift| {
@@ -1111,9 +1119,9 @@ pub(crate) fn joint_outer_evaluate(
             }
             _ => scaled_robust_jeffreys_hphi,
         };
-    // gam#2765: a mode whose constraints the cone normalizer integrates prices `½ log|M|` over the
-    // full space, and the normalizer carries the truncation; a face determinant would drop the
-    // pinned directions a second time.
+    // gam#2765: a mode whose constraints the constrained Laplace term integrates prices its
+    // log-determinant over the full space, and the term carries the truncation; a face
+    // determinant would drop the pinned directions a second time.
     let face_tangent = if inner.cone_normalizer.is_some() {
         None
     } else {

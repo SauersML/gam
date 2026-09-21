@@ -176,9 +176,9 @@ pub enum RemlLamlError {
     /// The inner mode is at a fold: its Laplace normalizer approximates no integral, so the trial
     /// point is refused, with no value or derivative standing in for one.
     InnerModeFold(InnerModeFold),
-    /// The constrained Laplace normalizer could not be formed at this trial point (gam#2765), so it
+    /// The constrained Laplace term could not be formed at this trial point (gam#2765), so it
     /// is refused with no value or derivative standing in for one.
-    ConeNormalizer(crate::constrained_posterior::ConeNormalizerRefusal),
+    ConeNormalizer(crate::constrained_posterior::ConeLaplaceRefusal),
     /// Any other failure, with its diagnostic.
     Failed(String),
 }
@@ -1639,7 +1639,7 @@ pub(crate) fn try_tangent_projected_evaluate(
         )));
     }
 
-    // The KKT gradient's motion the constrained Laplace normalizer reads (gam#2765): on a face
+    // The KKT gradient's motion the constrained Laplace term reads (gam#2765): on a face
     // `ġ = M_true β̂̇ + ∂_θ∇F` with the same stationarity curvature the mode response solves.
     let (constrained_mode_response, gradient_motion): (
         Arc<dyn HessianFactorization>,
@@ -1773,10 +1773,12 @@ pub(crate) fn try_tangent_projected_evaluate(
         // Prevent recursive constrained-response installation. The operator
         // above already carries the active geometry.
         active_constraints: None,
-        cone_normalizer: solution.cone_normalizer.as_ref().map(|input| {
-            Arc::new(ConeNormalizerInput {
+        // The term is already priced; only the motion of the KKT gradient it reads is a
+        // property of the active geometry resolved here (gam#2765).
+        cone_normalizer: solution.cone_normalizer.as_ref().map(|term| {
+            Arc::new(ConeNormalizerTerm {
                 gradient_motion,
-                ..ConeNormalizerInput::clone(input)
+                laplace: term.laplace.clone(),
             })
         }),
     };
