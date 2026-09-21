@@ -1809,7 +1809,7 @@ pub(super) fn visit_mixed_axis_nodes<T: BlockExcessTarget + ?Sized>(
     let mut chunk = q;
     while start < q {
         chunk = chunk.min(q - start);
-        let _reservation = loop {
+        let reservation = loop {
             let admitted = governor.remaining_bytes().saturating_sub(fixed_bytes) / node_bytes;
             chunk = chunk.min(admitted).max(1);
             let requested = node_bytes
@@ -1842,6 +1842,13 @@ pub(super) fn visit_mixed_axis_nodes<T: BlockExcessTarget + ?Sized>(
             );
         }
         visit(start, z, results)?;
+        // The chunk's working memory is the governor's again before the next
+        // chunk measures the pool, so the next width is read against what is
+        // free and not against this chunk's own reservation. The guard is held
+        // across the draws, the batch and the visit because those are what it
+        // reserves for; releasing it here rather than at the end of the
+        // iteration is the whole of its lifetime.
+        drop(reservation);
         start += chunk;
     }
     Ok(())
@@ -1853,7 +1860,7 @@ pub(super) fn mixed_axis_posterior<T: BlockExcessTarget + ?Sized>(
     rule: &MixedAxisRule,
 ) -> Result<(Vec<f64>, MixedAxisPosterior), EstimationError> {
     let mut excesses = vec![f64::NAN; rule.node_count()];
-    visit_mixed_axis_nodes(target, rule, false, 0, |start, _z, results| {
+    visit_mixed_axis_nodes(target, rule, false, 0, |start, _, results| {
         for (k, (excess, _)) in results.into_iter().enumerate() {
             excesses[start + k] = excess;
         }
