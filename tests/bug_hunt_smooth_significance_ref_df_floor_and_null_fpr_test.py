@@ -16,8 +16,12 @@ not directly exercise:
    ~0.23-0.35 at alpha=0.05 because every ``edf==1.0`` fit produced p~1e-12.
    We sweep many independent pure-noise fits and bound the empirical FPR.
 
-A power control (a genuinely wiggly signal must still be flagged) guards
-against a fix that simply inflates every p-value.
+A conservative test is as wrong as an anti-conservative one, and a one-sided
+FPR bar cannot see it: with 40 fits the rejection count's lower tail is at
+zero. The null p-values are therefore also held to U(0, 1) through their mean
+(1/2, sd sqrt(1/(12 R))). The power control (a genuinely wiggly signal must
+still be flagged at p < 1e-3) does not guard against inflated p-values on its
+own: a strong signal's p-value stays tiny under almost any inflation.
 """
 
 from __future__ import annotations
@@ -90,14 +94,27 @@ def test_null_false_positive_rate_is_calibrated() -> None:
     # seed count yet far under the buggy regime.
     n_seeds = 40
     rejections = 0
+    ps: list[float] = []
     for seed in range(n_seeds):
         rng = np.random.default_rng(1000 + seed)
         x = np.linspace(0.0, 1.0, N)
         y = rng.standard_normal(N)  # pure noise
         rec = _record(x, y)
+        ps.append(rec["p_corrected"])
         if rec["p_corrected"] < ALPHA:
             rejections += 1
     fpr = rejections / n_seeds
+    # U(0, 1) has mean 1/2 and variance 1/12, so the mean of R null p-values
+    # has sd sqrt(1/(12 R)) (0.046 at R = 40). Outside 4 sd the p-values are
+    # not uniform: above means conservative, below anti-conservative.
+    mean_p = float(np.mean(ps))
+    mean_sd = (1.0 / (12.0 * n_seeds)) ** 0.5
+    assert abs(mean_p - 0.5) <= 4.0 * mean_sd, (
+        f"null p-values are not U(0, 1): mean p = {mean_p:.3f} over {n_seeds} "
+        f"pure-noise fits, outside 1/2 +- 4 sd = +-{4.0 * mean_sd:.3f} "
+        f"({'conservative' if mean_p > 0.5 else 'anti-conservative'}); "
+        f"sorted p = {[round(p, 3) for p in sorted(ps)]}"
+    )
     assert fpr <= 0.15, (
         f"null false-positive rate {fpr:.3f} ({rejections}/{n_seeds}) far exceeds "
         f"alpha={ALPHA}; the ref_df collapse is over-rejecting flat smooths"
