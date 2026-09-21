@@ -1,6 +1,5 @@
 use super::*;
 use gam_linalg::faer_ndarray::FaerEigh;
-use gam_linalg::matrix::{FiniteSignedWeightsView, LinearOperator};
 use gam_math::jet_scalar::SymmetricQuadraticCoefficients;
 use gam_math::probability::normal_logcdf_derivatives;
 use gam_row_macros::row_program;
@@ -855,83 +854,6 @@ pub(super) fn rigid_pooled_probit_pilot_eta(
         out[i] = rigid_observed_eta(q_marg, b_pre, z[i], probit_scale);
     }
     Ok(out)
-}
-
-pub(super) fn pilot_eta_for_link_dev_orthogonalisation(
-    base_link: &InverseLink,
-    y: &Array1<f64>,
-    z: &Array1<f64>,
-    weights: &Array1<f64>,
-    marginal_design: &DesignMatrix,
-    marginal_offset: &Array1<f64>,
-    slope_offset: &Array1<f64>,
-    baseline_marginal: f64,
-    baseline_slope: f64,
-    probit_scale: f64,
-) -> Result<Array1<f64>, String> {
-    let n = y.len();
-    if marginal_design.nrows() != n {
-        return Err(format!(
-            "pilot_eta_for_link_dev_orthogonalisation: marginal design has {} rows, expected {}",
-            marginal_design.nrows(),
-            n,
-        ));
-    }
-    let mut working_eta = Array1::<f64>::zeros(n);
-    let mut w_irls = Array1::<f64>::zeros(n);
-    // The IRLS right-hand side `Xᵀ W r` with `W = w·φ²/V` and `r = (y − μ)/φ`
-    // is `Xᵀ w·φ(y − μ)/V`: it is assembled from that product directly, so a
-    // density that has underflowed contributes exactly zero instead of a
-    // `(y − μ)/1e-300` residual multiplied by a zero weight.
-    let mut score_residual = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let a_pre = baseline_marginal + marginal_offset[i];
-        let b_pre = baseline_slope + slope_offset[i];
-        let q_marg = bernoulli_marginal_link_map(base_link, a_pre)
-            .map_err(|e| {
-                format!("pilot_eta_for_link_dev_orthogonalisation marginal link map: {e}")
-            })?
-            .q;
-        let eta = rigid_observed_eta(q_marg, b_pre, z[i], probit_scale);
-        working_eta[i] = eta;
-        let phi = normal_pdf(eta);
-        let (mu, mu_complement) = (normal_cdf(eta), normal_cdf(-eta));
-        let var = mu * mu_complement;
-        if phi > 0.0 && var > 0.0 {
-            w_irls[i] = weights[i] * (phi * phi) / var;
-            // `y − μ = y·Φ(−η) − (1 − y)·Φ(η)`, formed without cancellation in either tail.
-            score_residual[i] = phi * (y[i] * mu_complement - (1.0 - y[i]) * mu) / var;
-        }
-    }
-    let p_marg = marginal_design.ncols();
-    if p_marg == 0 {
-        return Ok(working_eta);
-    }
-    let xtwr = marginal_design.compute_xtwy(weights, &score_residual)?;
-    let xtwx =
-        marginal_design.xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(&w_irls)?)?;
-    // One Fisher step on the marginal block, taken as the minimum-norm solution of
-    // XᵀWX·δ = XᵀW·r on the Gram's resolved positive eigenspace. The weights
-    // `w·φ²/V` are non-negative, so the Gram is PSD and a direction the pilot data
-    // do not identify has a null or roundoff eigenvalue: it takes no step, where a
-    // chosen ridge would have given it one.
-    let (evals, evecs) = FaerEigh::eigh(&xtwx, faer::Side::Lower).map_err(|e| {
-        format!("pilot_eta_for_link_dev_orthogonalisation eigendecomposition failed: {e}")
-    })?;
-    let threshold = gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(
-        evals.as_slice().ok_or_else(|| {
-            "pilot_eta_for_link_dev_orthogonalisation: eigenvalues are not contiguous".to_string()
-        })?,
-    );
-    let projected_rhs = evecs.t().dot(&xtwr);
-    let mut delta_beta_marg = Array1::<f64>::zeros(p_marg);
-    for k in 0..p_marg {
-        if evals[k] > threshold {
-            delta_beta_marg.scaled_add(projected_rhs[k] / evals[k], &evecs.column(k));
-        }
-    }
-    let marg_contrib = marginal_design.dot(&delta_beta_marg);
-    Ok(&working_eta + &marg_contrib)
 }
 
 /// The BMS exact-joint ρ seed in `[marginal | slope | extra]` penalty order.

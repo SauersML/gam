@@ -3253,5 +3253,13 @@
     ],
     "reason": "#3743: RealizedKlValidationEvidence and its realized_* storage were a dead ledger. Nothing read realized_kl_validation, and the effect margin is the total Fisher-quadratic KL minus the BIC price. The struct is deleted with no shim.",
     "evidence": "effect_weighted_retention_ors_variance_and_effect_margins asserts margin == total - threshold_nats through the FFI, which now returns total_fisher_quadratic_kl_nats."
+  },
+  {
+    "base": "55de1eaed1e659b23702bafc520ed8361b25be88",
+    "items": [
+      "crates/gam-models/src/bms/gradient_paths.rs:fn:pilot_eta_for_link_dev_orthogonalisation"
+    ],
+    "reason": "gam#3320: the flex audit judges candidates on the calibrated pilot's total eta-Jacobian; the rigid-pilot eta helper is superseded",
+    "evidence": "crates/gam-models/src/bms/pilot_total_jacobian.rs BmsCalibratedPilot::build replaces pilot_eta_for_link_dev_orthogonalisation at its only call site in block_specs.rs"
   }
 ]

@@ -4066,6 +4066,7 @@ pub(crate) mod gradient_paths;
 pub(crate) mod hessian_paths;
 mod information_third;
 pub(crate) mod install_flex;
+pub(crate) mod pilot_total_jacobian;
 pub mod residual_repair;
 mod residual_repair_kernel;
 pub(crate) mod row_kernel;
@@ -4467,5 +4468,6 @@ pub(crate) use gradient_paths::{
     unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
 pub(crate) use install_flex::{
-    install_compiled_flex_block_into_runtime, project_monotone_feasible_beta,
+    install_bms_flex_block_on_total_jacobian, install_compiled_flex_block_into_runtime,
+    project_monotone_feasible_beta,
 };
