@@ -2762,13 +2762,16 @@ fn nested_prefix_mask_is_correct() {
 /// `Z(W, eps) = 2·eps·K_1(W·eps)`, so this central difference fails if the mass
 /// is priced in the value but not in the gradient, if it is priced in the
 /// gradient as `ln Z` rather than `d ln Z / d ln W`, or if it is dropped again.
-/// The FD budget: the value is `O(30)` here, so the roundoff term
-/// `eps_mach·|f|/h` is about `7e-9` at `h = 1e-6`, three orders under the `1e-5`
-/// bar, and every ρ-derivative of the mass is bounded by
-/// `n_rows·(1 + W_i·eps) = O(3)`.
+/// The bar is the central difference's own error, measured rather than guessed.
+/// Writing `D(h)` for the difference at step `h`, `D(h) = V' + c·h² + O(h⁴)`, so
+/// `(D(2h) − D(h))/3` IS `c·h²`, the truncation at `h`. The roundoff is the
+/// counted one: `V` is a sum of `(n_rows + 1)·F` terms — one smoothed-L¹ term
+/// per row and axis and one `ln Z` per axis — each formed to within
+/// `ROUNDINGS_PER_SUMMAND·ε` of itself, and the difference of two such sums is
+/// divided by `h`.
 #[test]
 fn nested_prefix_grad_rho_matches_finite_difference() {
-    let (t, _n, f) = nested_prefix_test_target();
+    let (t, n_rows, f) = nested_prefix_test_target();
     let target = PsiSlice::full(t.len(), Some(f));
     let pen = NestedPrefixPenalty::new(
         target,
@@ -2784,14 +2787,38 @@ fn nested_prefix_grad_rho_matches_finite_difference() {
     let rho = array![0.1_f64, -0.2, 0.3];
     pen.validate_rho(rho.view()).expect("interior rho");
     let dr = pen.grad_rho(t.view(), rho.view());
-    let eps = 1e-6;
-    for k in 0..3 {
+    let h = 1e-6;
+    let summands = ((n_rows + 1) * f) as f64;
+    // The costliest summand is `ln Z = ln 2 + ln eps + ln K_1(W·eps)`: two
+    // logarithms plus the 24-coefficient Horner fold (or the ascending series
+    // it crosses over to below `W·eps = 2`) that evaluates `ln K_1`. Fifty
+    // roundings covers that and dominates a smoothed-L¹ term's three (a square,
+    // a sum, a square root).
+    const ROUNDINGS_PER_SUMMAND: f64 = 50.0;
+    let difference = |k: usize, step: f64| {
         let mut rp = rho.clone();
         let mut rm = rho.clone();
-        rp[k] += eps;
-        rm[k] -= eps;
-        let fd = (pen.value(t.view(), rp.view()) - pen.value(t.view(), rm.view())) / (2.0 * eps);
-        assert_abs_diff_eq!(dr[k], fd, epsilon = 1e-5);
+        rp[k] += step;
+        rm[k] -= step;
+        let plus = pen.value(t.view(), rp.view());
+        let minus = pen.value(t.view(), rm.view());
+        let scale = plus.abs().max(minus.abs());
+        ((plus - minus) / (2.0 * step), scale)
+    };
+    for k in 0..3 {
+        let (fd, scale) = difference(k, h);
+        let (fd_double, _) = difference(k, 2.0 * h);
+        let truncation = (fd_double - fd) / 3.0;
+        let roundoff = ROUNDINGS_PER_SUMMAND * summands * f64::EPSILON * scale / h;
+        let band = truncation.abs() + roundoff;
+        assert!(
+            (dr[k] - fd).abs() <= band,
+            "shell {k}: analytic {} vs central difference {fd} differs by {:.3e}, above the \
+             stencil's own error {band:.3e} (truncation {:.3e}, roundoff {roundoff:.3e})",
+            dr[k],
+            (dr[k] - fd).abs(),
+            truncation.abs()
+        );
     }
 }
 
