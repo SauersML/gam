@@ -127,18 +127,66 @@ fn rmse_vs_truth(
 fn multinomial_outer_reml_selects_per_term_lambda_and_recovers_truth() {
     let (ds, truth) = synth();
     let cfg = FitConfig::default();
+    let formula = "y ~ s(x1, k=6) + s(x2, k=6) + x3";
     let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
         init_lambda: 1.0,
         max_iter: 40,
         tol: 1e-8,
-        ..MultinomialFitRequest::new(&ds, "y ~ s(x1, k=6) + s(x2, k=6) + x3", &cfg)
+        ..MultinomialFitRequest::new(&ds, formula, &cfg)
     })
     .expect("gam multinomial fit");
+    // (4)'s second fit is run HERE, before any assertion, because it is the one
+    // measurement that separates the two things this test can fail for.
+    let model_hi = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        init_lambda: 50.0,
+        max_iter: 40,
+        tol: 1e-8,
+        ..MultinomialFitRequest::new(&ds, formula, &cfg)
+    })
+    .expect("gam multinomial fit (init=50)");
+
+    // ── Every quantity this test asserts on, MEASURED AND PRINTED FIRST ──
+    //
+    // (#4004) The four assertions below are ordered truth-recovery first, and
+    // truth recovery is the one of the four that does NOT distinguish a dead
+    // smoothing selection from a live selection that landed in a worse basin.
+    // When (1) fired, the run ended there and (2), (3) and (4) — the three that
+    // do distinguish them — were never evaluated, so the receipt said only
+    // "RMSE is 0.0688" and the attribution had to be guessed. A fixture's
+    // diagnostics must not be conditional on its assertions, so every number is
+    // taken and reported before the first `assert!`.
+    let rmse = rmse_vs_truth(&model, &ds, &truth);
+    let p_per_class = model.p_per_class as f64;
+    let edf = model
+        .edf_per_class
+        .as_ref()
+        .expect("REML fit must report per-class EDF");
+    let per_block = &model.lambdas_per_block;
+    let n0 = per_block.first().copied().unwrap_or(0);
+    let class0 = &model.lambdas[..n0.min(model.lambdas.len())];
+    let lam_max = class0.iter().cloned().fold(f64::MIN, f64::max);
+    let lam_min = class0.iter().cloned().fold(f64::MAX, f64::min);
+    let echoes_seed = model_hi.lambdas.iter().all(|&l| (l - 50.0).abs() < 1e-6);
+    eprintln!(
+        "multinomial per-term lambda (#561/#4004): rmse={rmse:.5} (bar 0.065; the pinned-lambda \
+         driver measured >= 0.07 and the fused-lambda driver >= 0.13 on this DGP) \
+         p_per_class={p_per_class} edf_per_class={edf:?} lambdas_per_block={per_block:?} \
+         class0_lambda=[{lam_min:.6}, {lam_max:.6}] span={:.4} \
+         lambdas(init=1)={:?} lambdas(init=50)={:?} echoes_seed={echoes_seed}",
+        if lam_min > 0.0 { lam_max / lam_min } else { f64::INFINITY },
+        model.lambdas,
+        model_hi.lambdas,
+    );
 
     // (1) Truth recovery. The fused-λ driver measured ≥ 0.13 and the pinned-λ
     // (dead-selection) driver ≥ 0.07 on this DGP; a working per-term REML fit
     // recovers to a few percent.
-    let rmse = rmse_vs_truth(&model, &ds, &truth);
+    //
+    // NOTE (#4004): 0.065 against a pinned-λ driver at 0.07 leaves a 7% window
+    // between "working" and the failure mode this bar names, so a value inside
+    // it does not tell a small quality regression from dead selection. That is
+    // an argument for deriving the bar, not for moving it, and it is why (2),
+    // (3) and (4) are the assertions that carry the diagnosis.
     assert!(
         rmse < 0.065,
         "multinomial fit did not recover the true simplex: RMSE={rmse:.5} (>= 0.065 \
@@ -148,11 +196,6 @@ fn multinomial_outer_reml_selects_per_term_lambda_and_recovers_truth() {
     // (2) Penalization is active. Per-class EDF must sit well below the
     // per-class coefficient count; a near-unpenalized fit (EDF ≈ p) is the
     // dead-selection signature (λ pinned at the seed).
-    let p_per_class = model.p_per_class as f64;
-    let edf = model
-        .edf_per_class
-        .as_ref()
-        .expect("REML fit must report per-class EDF");
     assert_eq!(edf.len(), K - 1, "one EDF entry per active class");
     for (a, &e) in edf.iter().enumerate() {
         assert!(
@@ -167,33 +210,20 @@ fn multinomial_outer_reml_selects_per_term_lambda_and_recovers_truth() {
     // rough cubic term and the smoother sigmoid/null-space terms take very
     // different λ; a fused or dead selector returns near-equal λ (or all == the
     // seed 1.0). Check the within-class span.
-    let per_block = &model.lambdas_per_block;
     assert!(!per_block.is_empty(), "must report per-class λ block sizes");
-    let n0 = per_block[0];
     assert!(
         n0 >= 2,
         "class 0 must carry ≥2 penalty components, got {n0}"
     );
-    let class0 = &model.lambdas[..n0];
-    let lam_max = class0.iter().cloned().fold(f64::MIN, f64::max);
-    let lam_min = class0.iter().cloned().fold(f64::MAX, f64::min);
     assert!(
         lam_max / lam_min > 5.0,
         "within-class per-term λ barely differ (max={lam_max:.4} min={lam_min:.4}); \
          REML is not selecting independent per-term smoothing (fused-λ regression)"
     );
 
-    // (4) Selection is not a passthrough of the seed. Fit from a very different
-    // seed and assert the recovered λ are NOT all ≈ init (the exact
+    // (4) Selection is not a passthrough of the seed. The init=50 fit above is
+    // the control: its recovered λ must NOT all be ≈ init (the exact
     // dead-selection fingerprint: λ ≡ init for every component).
-    let model_hi = fit_penalized_multinomial_formula(&MultinomialFitRequest {
-        init_lambda: 50.0,
-        max_iter: 40,
-        tol: 1e-8,
-        ..MultinomialFitRequest::new(&ds, "y ~ s(x1, k=6) + s(x2, k=6) + x3", &cfg)
-    })
-    .expect("gam multinomial fit (init=50)");
-    let echoes_seed = model_hi.lambdas.iter().all(|&l| (l - 50.0).abs() < 1e-6);
     assert!(
         !echoes_seed,
         "every selected λ equals the init seed 50.0 — the outer smoothing search \
