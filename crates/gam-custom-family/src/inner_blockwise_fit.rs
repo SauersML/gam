@@ -2549,14 +2549,17 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
             }
         }
     }
-    let mut jeffreys_score: Option<Array1<f64>> = None;
+    // The score `∇Φ` and its rounding band from the same spectrum (#3345).
+    let mut jeffreys_score: Option<(Array1<f64>, Array1<f64>)> = None;
     let jeffreys_curvature = if family.joint_jeffreys_term_required() {
         let z_joint = build_joint_jeffreys_subspace(family, specs, ranges)?.ok_or_else(|| {
             "fresh exact joint-mode curvature certificate: Jeffreys family has no coefficient subspace"
                 .to_string()
         })?;
-        match custom_family_joint_jeffreys_term(family, states, specs, ranges, &z_joint)? {
-            Some((_phi, score, hphi)) => {
+        match custom_family_joint_jeffreys_term_with_score_band(
+            family, states, specs, ranges, &z_joint,
+        )? {
+            Some(term) => {
                 let completion = exact_joint_jeffreys_completion_at(
                     family,
                     states,
@@ -2565,8 +2568,8 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
                     total_p,
                     "fresh exact joint-mode curvature certificate",
                 )?;
-                jeffreys_score = Some(score);
-                Some((hphi, completion))
+                jeffreys_score = Some((term.gradient, term.score_rounding_band));
+                Some((term.curvature, completion))
             }
             None => None,
         }
@@ -2577,6 +2580,10 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
     // The stationarity system this returned β was solved for, `∇ℓ − Sβ + ∇Φ`,
     // read at the returned β itself. Its whitened coefficients on the certified
     // face give the Newton decrement the local model still promises there.
+    // The score the stationarity system folds, and whose band its decrements carry.
+    let folded_jeffreys_score = jeffreys_score
+        .as_ref()
+        .filter(|(score, _)| score.len() == total_p);
     let stationarity_rhs = match crate::joint_newton::load_joint_gradient_evaluation(
         family,
         specs,
@@ -2597,9 +2604,7 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
                     0.0,
                     joint_bundle,
                 );
-            if let Some(score) = jeffreys_score.as_ref()
-                && score.len() == total_p
-            {
+            if let Some(score) = folded_jeffreys_score.map(|(score, _)| score) {
                 rhs += score;
             }
             let gradient_inf = likelihood_gradient
@@ -2738,6 +2743,7 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
             s_lambdas,
             states,
             joint_bundle,
+            folded_jeffreys_score.map(|(_, score_band)| score_band),
             0.0,
         )?,
         None => DecrementResolution {

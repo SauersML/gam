@@ -158,6 +158,33 @@ fn with_penalty_rounding_bands(
     Ok(data_bands)
 }
 
+/// `bands` plus the Jeffreys score's rounding band per coefficient
+/// ([`JointJeffreysTerm::score_rounding_band`](gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysTerm::score_rounding_band)),
+/// the band of the `∇Φ` the stationarity system adds at the same β (#3345). `None`
+/// means the term is gated off or skipped there, so the system carries no score.
+fn with_jeffreys_score_band(
+    mut bands: Array1<f64>,
+    jeffreys_score_band: Option<&Array1<f64>>,
+) -> Result<Array1<f64>, CustomFamilyError> {
+    let Some(score_band) = jeffreys_score_band else {
+        return Ok(bands);
+    };
+    if score_band.len() != bands.len() {
+        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
+            "joint Newton Jeffreys score rounding band has {} coordinates for {} coefficients",
+            score_band.len(),
+            bands.len()
+        ) });
+    }
+    if !score_band.iter().all(|value| value.is_finite() && *value >= 0.0) {
+        return Err(CustomFamilyError::trial_point(
+            "joint Newton Jeffreys score rounding band is not finite and non-negative".to_string(),
+        ));
+    }
+    bands += score_band;
+    Ok(bands)
+}
+
 /// The resolution a returned mode's Newton decrements settle within, read off
 /// `spectrum`, whose right-hand side is the full-width stationarity system
 /// `∇ℓ − Sβ + ∇Φ` at `states` (#2977). One owner for the two settling heads and
@@ -165,10 +192,11 @@ fn with_penalty_rounding_bands(
 ///
 /// The right-hand side's rounding band per coefficient is its data term (the
 /// measured row-sum band where the workspace measures its summands, otherwise
-/// `γ_n · ‖∇ℓ‖∞`, the lower bound [`joint_stationarity_rounding_band`] reads) plus
-/// the penalty product's band. `tangent` maps it onto a spectrum decomposed on an
-/// active face, `Zᵀ rhs`, as `|Z|ᵀ b`. The Jeffreys score's rounding is not
-/// charged, so the band can only be too narrow. Each decrement's band is then
+/// `γ_n · ‖∇ℓ‖∞`, the lower bound [`joint_stationarity_rounding_band`] reads), the
+/// penalty product's band, and the Jeffreys score's band at `states`
+/// (`jeffreys_score_band`, [`with_jeffreys_score_band`], #3345). `tangent` maps it
+/// onto a spectrum decomposed on an active face, `Zᵀ rhs`, as `|Z|ᵀ b`. Each
+/// decrement's band is then
 /// [`whitened_spectrum::WhitenedHessianSpectrum::decrement_rounding_bands`], raised
 /// to `objective_resolution`, the change one evaluation of the objective
 /// resolves there ([`returned_mode_objective_resolution`]); the certificate that
@@ -182,6 +210,7 @@ pub(super) fn spectrum_decrement_resolution(
     s_lambdas: &[Array2<f64>],
     states: &[ParameterBlockState],
     joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
+    jeffreys_score_band: Option<&Array1<f64>>,
     objective_resolution: f64,
 ) -> Result<DecrementResolution, CustomFamilyError> {
     let block_betas: Vec<&Array1<f64>> = states.iter().map(|state| &state.beta).collect();
@@ -193,7 +222,10 @@ pub(super) fn spectrum_decrement_resolution(
             gam_linalg::roundoff::accumulation_growth(total_n.max(1)) * data_gradient_inf.abs(),
         ),
     };
-    let rhs_band = with_penalty_rounding_bands(data_bands, s_lambdas, &block_betas, joint_bundle)?;
+    let rhs_band = with_jeffreys_score_band(
+        with_penalty_rounding_bands(data_bands, s_lambdas, &block_betas, joint_bundle)?,
+        jeffreys_score_band,
+    )?;
     let chart_band = match tangent {
         Some(z) => z.t().mapv(f64::abs).dot(&rhs_band),
         None => rhs_band,
@@ -221,9 +253,11 @@ pub(super) fn spectrum_decrement_resolution(
 /// whatever the projection. The band enters per coordinate and never through a
 /// norm, which would let one coordinate settle on another's rounding. `bⱼ` is the
 /// data term `γ_depth · Σ|products|ⱼ`, the error the row terms inherit from their
-/// predictors where the workspace measures it, and the penalty product's band
-/// ([`penalty_rounding_bands`]). It omits the rest of each row term's formation
-/// and the Jeffreys score's rounding, so it can only fail to settle a state.
+/// predictors where the workspace measures it, the penalty product's band
+/// ([`penalty_rounding_bands`]), and the band of the Jeffreys score `kkt_gradient`
+/// carries at `states` (`jeffreys_score_band`, [`with_jeffreys_score_band`], #3345).
+/// It omits the rest of each row term's formation, so it can only fail to settle a
+/// state.
 ///
 /// Only a returned-mode settlement reads it, where the Newton decrement is also at
 /// the objective's resolution; every residual-only exit keeps its residual. `None`
@@ -239,6 +273,7 @@ fn returned_mode_band_shrunk_residual(
     block_constraints: &[Option<ConstraintSet>],
     block_active_sets: &[Option<Vec<usize>>],
     joint_lower_bounds: Option<&Array1<f64>>,
+    jeffreys_score_band: Option<&Array1<f64>>,
 ) -> Result<Option<f64>, CustomFamilyError> {
     let total_p = kkt_gradient.len();
     let Some(data_bands) = measured_gradient_rounding_bands(workspace, total_p)? else {
@@ -251,7 +286,10 @@ fn returned_mode_band_shrunk_residual(
         residual += score;
     }
     let block_betas: Vec<&Array1<f64>> = states.iter().map(|state| &state.beta).collect();
-    let bands = with_penalty_rounding_bands(data_bands, s_lambdas, &block_betas, joint_bundle)?;
+    let bands = with_jeffreys_score_band(
+        with_penalty_rounding_bands(data_bands, s_lambdas, &block_betas, joint_bundle)?,
+        jeffreys_score_band,
+    )?;
     // The projection forms `r = Sβ − g + score`, so the gradient that yields `r′`
     // is `g + (r̂ − r′)`.
     let mut shrunk_gradient = kkt_gradient.clone();
@@ -1110,8 +1148,8 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
     // problem that shrinking would have fixed (gam#2695).
     let mut trust_ratio_model_inconsistency: Option<String> = None;
     let mut last_joint_math: Option<JointNewtonMathDiagnostic> = None;
-    // Cross-cycle cache of the joint Jeffreys/Firth triple `(β_key, ∇Φ, H_Φ)`
-    // (gam#729/#826/#808). Computing `(∇Φ, H_Φ)` costs `p` family
+    // Cross-cycle cache of the joint Jeffreys/Firth triple `(β_key, ∇Φ, H_Φ)` and the
+    // score's rounding band from the same spectrum (gam#729/#826/#808, #3345). Computing `(∇Φ, H_Φ)` costs `p` family
     // directional-derivative calls plus the `½ S Sᵀ` GEMM; for a K-block
     // coupled family that is the dominant per-inner-cycle cost. The post-step
     // KKT residual recomputes the triple at the just-accepted β; the NEXT
@@ -1122,7 +1160,8 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
     // flattened β (β is byte-identical between an accepted post-step residual
     // and the next head), so the reused term is the exact term at the current
     // iterate — no staleness, no tolerance fudge.
-    let mut jeffreys_triple_cache: Option<(Array1<f64>, Array1<f64>, Array2<f64>)> = None;
+    let mut jeffreys_triple_cache: Option<(Array1<f64>, Array1<f64>, Array2<f64>, Array1<f64>)> =
+        None;
     // Stash for the structured cert-REFUSED report computed inside the
     // cycle loop, so the post-loop bubbled error (`coupled exact-joint
     // inner solve exited the joint Newton path …`) can emit the same
@@ -1495,7 +1534,13 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 let marked_residual: f64 = $residual;
                 finish_post_step_convergence!(@mark marked_residual, $residual_target)
             }};
-            ($residual:expr, $residual_target:expr, $workspace:expr, $kkt_gradient:expr) => {{
+            (
+                $residual:expr,
+                $residual_target:expr,
+                $workspace:expr,
+                $kkt_gradient:expr,
+                $jeffreys_score_band:expr
+            ) => {{
                 let marked_residual: f64 = $residual;
                 let marked_target: f64 = $residual_target;
                 let settling_residual = if marked_residual > marked_target {
@@ -1510,6 +1555,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         &block_constraints,
                         &cached_active_sets,
                         joint_lower_bounds.as_ref(),
+                        $jeffreys_score_band,
                     )?
                     .unwrap_or(marked_residual)
                 } else {
@@ -1841,17 +1887,19 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // O(p)-directional-derivative evaluations per cycle. The post-step
         // residual below is at the accepted β, so it correctly recomputes.
         // `None` when the term is condition-gated/skippable (∇Φ=0, H_Φ=0).
+        // The score's rounding band (#3345) rides with the triple and the cache, so a
+        // certificate at this β reads the band of the very score it settles.
         let head_beta_key: Array1<f64> = flatten_state_betas(&states, specs);
-        let head_jeffreys_term: Option<(Array1<f64>, Array2<f64>)> =
+        let head_jeffreys: Option<(Array1<f64>, Array2<f64>, Array1<f64>)> =
             if jeffreys_skippable_this_cycle {
                 None
-            } else if let Some((_, grad_phi, hphi)) = jeffreys_triple_cache
+            } else if let Some((_, grad_phi, hphi, score_band)) = jeffreys_triple_cache
                 .as_ref()
-                .filter(|(key, _, _)| beta_cache_keys_match_bitwise(key, &head_beta_key))
+                .filter(|(key, _, _, _)| beta_cache_keys_match_bitwise(key, &head_beta_key))
             {
                 // Cross-cycle cache hit: the previous cycle's post-step KKT
                 // residual already computed the exact triple at this β. Reuse.
-                Some((grad_phi.clone(), hphi.clone()))
+                Some((grad_phi.clone(), hphi.clone(), score_band.clone()))
             } else if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
                 // The cycle workspace is the authoritative exact-β row cache
                 // that supplied this very Hessian source. Ask it for the
@@ -1874,28 +1922,36 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 };
                 let exact_term = match workspace_term {
                     Some(term) => Some(term),
-                    None => {
-                        custom_family_joint_jeffreys_term(family, &states, specs, &ranges, z_joint)?
-                    }
+                    None => custom_family_joint_jeffreys_term_with_score_band(
+                        family, &states, specs, &ranges, z_joint,
+                    )?,
                 };
                 let term = match exact_term {
-                    Some((_phi, grad_phi, hphi))
-                        if grad_phi.len() == grad_joint.len()
-                            && hphi.nrows() == total_p
-                            && hphi.ncols() == total_p =>
+                    Some(term)
+                        if term.gradient.len() == grad_joint.len()
+                            && term.curvature.nrows() == total_p
+                            && term.curvature.ncols() == total_p =>
                     {
-                        Some((grad_phi, hphi))
+                        Some((term.gradient, term.curvature, term.score_rounding_band))
                     }
                     _ => None,
                 };
-                if let Some((grad_phi, hphi)) = term.as_ref() {
-                    jeffreys_triple_cache =
-                        Some((head_beta_key.clone(), grad_phi.clone(), hphi.clone()));
+                if let Some((grad_phi, hphi, score_band)) = term.as_ref() {
+                    jeffreys_triple_cache = Some((
+                        head_beta_key.clone(),
+                        grad_phi.clone(),
+                        hphi.clone(),
+                        score_band.clone(),
+                    ));
                 }
                 term
             } else {
                 None
             };
+        let (head_jeffreys_term, head_jeffreys_score_band) = match head_jeffreys {
+            Some((grad_phi, hphi, score_band)) => (Some((grad_phi, hphi)), Some(score_band)),
+            None => (None, None),
+        };
         // The divided-difference H_Φ is sufficient for globalization away
         // from the mode. Once the residual-band latch arms the Newton
         // endgame, or a first-order exit asks to certify the returned beta,
@@ -3211,6 +3267,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &s_lambdas,
                 &states,
                 joint_bundle,
+                head_jeffreys_score_band.as_ref(),
                 returned_mode_objective_resolution(lastobjective, objective_resolution_witness.measured()),
             )?;
             // The residual at its target is necessary, and a decrement at
@@ -3236,6 +3293,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     &block_constraints,
                     &cached_active_sets,
                     joint_lower_bounds.as_ref(),
+                    head_jeffreys_score_band.as_ref(),
                 )?
                 .unwrap_or(current_stationarity_residual)
             } else {
@@ -5123,7 +5181,8 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     current_kkt_norm,
                     residual_tol,
                     cached_joint_workspace.as_ref(),
-                    head_kkt_gradient.as_ref().unwrap_or(&grad_joint)
+                    head_kkt_gradient.as_ref().unwrap_or(&grad_joint),
+                    head_jeffreys_score_band.as_ref()
                 );
             }
             // Fully-rejected stall guard. See the constant declaration
@@ -5239,6 +5298,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         &s_lambdas,
                         &states,
                         joint_bundle,
+                        head_jeffreys_score_band.as_ref(),
                         returned_mode_objective_resolution(lastobjective, objective_resolution_witness.measured()),
                     )?),
                     None => None,
@@ -5314,7 +5374,8 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         current_kkt_norm,
                         residual_tol,
                         cached_joint_workspace.as_ref(),
-                        head_kkt_gradient.as_ref().unwrap_or(&grad_joint)
+                        head_kkt_gradient.as_ref().unwrap_or(&grad_joint),
+                        head_jeffreys_score_band.as_ref()
                     );
                 }
                 let last_math_summary = last_joint_math
@@ -5536,11 +5597,16 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 ),
             });
         };
-        let jeffreys_augmented_gradient: Option<Array1<f64>> = if jeffreys_skippable_this_cycle {
+        // The augmented gradient and the rounding band of the score it adds (#3345),
+        // from one Jeffreys evaluation at the accepted β.
+        let (jeffreys_augmented_gradient, post_step_jeffreys_score_band): (
+            Option<Array1<f64>>,
+            Option<Array1<f64>>,
+        ) = if jeffreys_skippable_this_cycle {
             // Well-conditioned ⇒ ∇Φ = 0, so the KKT residual is the bare
             // stationarity (and floors at 0, not ‖∇Φ‖) — matching the step,
             // which folded H_Φ=0/∇Φ=0 this cycle. Avoids the dense H/eigh.
-            None
+            (None, None)
         } else if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
             // The workspace holds the observed joint Hessian, the Jeffreys
             // information only when the family says so (gam#2922).
@@ -5560,28 +5626,34 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             // keep the existing exact family assembly.
             let jeffreys_term = match workspace_term {
                 Some(term) => Some(term),
-                None => {
-                    custom_family_joint_jeffreys_term(family, &states, specs, &ranges, z_joint)?
-                }
+                None => custom_family_joint_jeffreys_term_with_score_band(
+                    family, &states, specs, &ranges, z_joint,
+                )?,
             };
             match jeffreys_term {
-                Some((_phi, grad_phi, hphi))
-                    if grad_phi.len() == gradient.len()
-                        && hphi.nrows() == total_p
-                        && hphi.ncols() == total_p =>
+                Some(term)
+                    if term.gradient.len() == gradient.len()
+                        && term.curvature.nrows() == total_p
+                        && term.curvature.ncols() == total_p =>
                 {
-                    let augmented = gradient + &grad_phi;
+                    let augmented = gradient + &term.gradient;
+                    let score_band = term.score_rounding_band.clone();
                     // Cache the exact triple at the just-accepted β so the next
                     // cycle's head reuses it instead of recomputing the
                     // O(p)-directional-derivative + GEMM term (gam#729).
                     let post_beta_key = flatten_state_betas(&states, specs);
-                    jeffreys_triple_cache = Some((post_beta_key, grad_phi, hphi));
-                    Some(augmented)
+                    jeffreys_triple_cache = Some((
+                        post_beta_key,
+                        term.gradient,
+                        term.curvature,
+                        term.score_rounding_band,
+                    ));
+                    (Some(augmented), Some(score_band))
                 }
-                _ => None,
+                _ => (None, None),
             }
         } else {
-            None
+            (None, None)
         };
         let residual_gradient = jeffreys_augmented_gradient.as_ref().unwrap_or(gradient);
         if accepted_active_face_changed {
@@ -6102,6 +6174,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     &s_lambdas,
                     &states,
                     joint_bundle,
+                    post_step_jeffreys_score_band.as_ref(),
                     returned_mode_objective_resolution(lastobjective, objective_resolution_witness.measured()),
                 )?;
                 joint_newton_decrement_certifies(
@@ -6162,7 +6235,8 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 residual,
                 residual_tol,
                 cached_joint_workspace.as_ref(),
-                residual_gradient
+                residual_gradient,
+                post_step_jeffreys_score_band.as_ref()
             );
         }
 
@@ -6389,7 +6463,8 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         residual,
                         residual_tol,
                         cached_joint_workspace.as_ref(),
-                        residual_gradient
+                        residual_gradient,
+                        post_step_jeffreys_score_band.as_ref()
                     );
                 }
                 // Constrained exact-fixed-point acceptance (gam#797).
@@ -6549,7 +6624,8 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                             residual,
                             residual_tol,
                             cached_joint_workspace.as_ref(),
-                            residual_gradient
+                            residual_gradient,
+                            post_step_jeffreys_score_band.as_ref()
                         );
                     }
                 }
@@ -6708,7 +6784,8 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         residual,
                         residual_tol,
                         cached_joint_workspace.as_ref(),
-                        residual_gradient
+                        residual_gradient,
+                        post_step_jeffreys_score_band.as_ref()
                     );
                 }
                 // Structured per-block + per-spectrum refusal report.
@@ -7539,7 +7616,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         let final_beta_key = flatten_state_betas(&states, specs);
         let final_jeffreys_cache = jeffreys_triple_cache
             .as_ref()
-            .filter(|(beta_key, _, _)| beta_cache_keys_match_bitwise(beta_key, &final_beta_key));
+            .filter(|(beta_key, _, _, _)| beta_cache_keys_match_bitwise(beta_key, &final_beta_key));
         let penalty_value = penalty_roots.value_of_states(&states).value;
         let active_constraints = {
             let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
@@ -7566,7 +7643,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_log_lambdas,
                 options,
                 cached_joint_workspace.clone(),
-                final_jeffreys_cache.map(|(_, _, hphi)| hphi),
+                final_jeffreys_cache.map(|(_, _, hphi, _)| hphi),
                 active_constraints.as_deref(),
             )?;
             (Some(h), Some(s))
@@ -7587,7 +7664,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // condition-gated/unavailable (∇Φ=0).
         let augmented_joint_gradient: Option<Array1<f64>> = match cached_joint_gradient.as_ref() {
             Some(gradient) => match final_jeffreys_cache {
-                Some((_, grad_phi, _)) if grad_phi.len() == gradient.len() => {
+                Some((_, grad_phi, _, _)) if grad_phi.len() == gradient.len() => {
                     Some(gradient + grad_phi)
                 }
                 _ => match joint_jeffreys_subspace.as_ref() {

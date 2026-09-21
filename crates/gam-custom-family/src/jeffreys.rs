@@ -3,6 +3,7 @@
 //! second-order completion, and the outer Jeffreys H_phi (+drift) terms.
 
 use super::*;
+use gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysTerm;
 
 pub(crate) fn block_param_ranges(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
     block_offsets_from_specs(specs)
@@ -284,19 +285,6 @@ pub(crate) fn custom_family_joint_jeffreys_value<
     })
 }
 
-fn scale_jeffreys_triple(
-    mut term: (f64, Array1<f64>, Array2<f64>),
-    strength: f64,
-) -> (f64, Array1<f64>, Array2<f64>) {
-    if strength == 1.0 {
-        return term;
-    }
-    term.0 *= strength;
-    term.1 *= strength;
-    term.2 *= strength;
-    term
-}
-
 /// Evaluate the family-general Jeffreys term `(Phi, grad, H_Phi)` at the current
 /// working point from the coupled joint Hessian (Tier-B path). Returns `None`
 /// when there is no coefficient system or the family does not expose an
@@ -309,6 +297,22 @@ pub(crate) fn custom_family_joint_jeffreys_term<F: CustomFamily + Clone + Send +
     ranges: &[(usize, usize)],
     z_joint: &Array2<f64>,
 ) -> Result<Option<(f64, Array1<f64>, Array2<f64>)>, CustomFamilyError> {
+    custom_family_joint_jeffreys_term_with_score_band(family, states, specs, ranges, z_joint)
+        .map(|term| term.map(JointJeffreysTerm::into_triple))
+}
+
+/// [`custom_family_joint_jeffreys_term`] with the score's rounding band
+/// ([`JointJeffreysTerm::score_rounding_band`]) from the same spectrum, for a
+/// certificate that settles the Jeffreys-augmented score against its rounding (#3345).
+pub(crate) fn custom_family_joint_jeffreys_term_with_score_band<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    ranges: &[(usize, usize)],
+    z_joint: &Array2<f64>,
+) -> Result<Option<JointJeffreysTerm>, CustomFamilyError> {
     let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
     if total_p == 0 || z_joint.ncols() == 0 {
         return Ok(None);
@@ -332,7 +336,7 @@ fn custom_family_joint_jeffreys_term_from_information<
     specs: &[ParameterBlockSpec],
     h_joint: &Array2<f64>,
     z_joint: &Array2<f64>,
-) -> Result<(f64, Array1<f64>, Array2<f64>), CustomFamilyError> {
+) -> Result<JointJeffreysTerm, CustomFamilyError> {
     // The reduced information and its conditioning gate are authoritative and
     // are prepared before either lazy provider can run.  A gated-off term therefore
     // performs ZERO all-axes builds.  When active, a family that forms the rotated
@@ -353,14 +357,11 @@ fn custom_family_joint_jeffreys_term_from_information<
             )
         },
     )?;
-    Ok(scale_jeffreys_triple(
-        term,
-        family.joint_jeffreys_term_strength(),
-    ))
+    Ok(term.scaled(family.joint_jeffreys_term_strength()))
 }
 
-/// Evaluate the accepted-mode Jeffreys triple directly from the exact Newton
-/// workspace that was built at that same beta.
+/// Evaluate the accepted-mode Jeffreys term (with its score rounding band) directly
+/// from the exact Newton workspace that was built at that same beta.
 ///
 /// The generic family route reconstructs an information source and its
 /// all-axes derivatives from `(family, states)`. After an accepted fused trial,
@@ -374,7 +375,7 @@ pub(crate) fn custom_family_joint_jeffreys_term_from_workspace(
     total_p: usize,
     z_joint: &Array2<f64>,
     strength: f64,
-) -> Result<Option<(f64, Array1<f64>, Array2<f64>)>, CustomFamilyError> {
+) -> Result<Option<JointJeffreysTerm>, CustomFamilyError> {
     if total_p == 0 || z_joint.ncols() == 0 {
         return Ok(None);
     }
@@ -402,7 +403,7 @@ pub(crate) fn custom_family_joint_jeffreys_term_from_workspace(
         || Ok(Some(directional_derivatives)),
     )
     .map_err(CustomFamilyError::trial_point)
-    .map(|term| Some(scale_jeffreys_triple(term, strength)))
+    .map(|term| Some(term.scaled(strength)))
 }
 
 /// Evaluate the Jeffreys term and the exact remainder of its coefficient
@@ -437,7 +438,8 @@ pub(crate) fn custom_family_joint_jeffreys_term_with_exact_completion<
     }
     let (phi, gradient, hphi) = custom_family_joint_jeffreys_term_from_information(
         family, states, specs, &h_joint, z_joint,
-    )?;
+    )?
+    .into_triple();
     // An inactive plan has a vanishing completion.
     let completion =
         custom_family_joint_jeffreys_second_order_completion(family, states, specs, &h_joint, z_joint)?
@@ -656,7 +658,8 @@ pub(crate) fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send +
     // value, curvature and completion must come from the SAME information snapshot.
     let (phi, _gradient, hphi) = custom_family_joint_jeffreys_term_from_information(
         family, states, specs, &h_joint, &z_joint,
-    )?;
+    )?
+    .into_triple();
     // SECOND-ORDER COMPLETION AT THE MODE (gam#979), returned SEPARATELY. The
     // divided-difference `H_Φ` omits the second-directional-Hessian remainder
     // `½ tr(K·D_ab)`, so the TRUE Hessian of the Φ-augmented inner objective
