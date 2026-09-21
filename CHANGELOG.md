@@ -92,6 +92,16 @@
   design. An intercept-only binomial `noise_formula` has nothing left to fit and is
   refused; fit the plain binomial model instead. Shifting a scale covariate moves the
   σ = 1 reference, so it is a different model.
+- **Fixed-λ multinomial separation is decided before the fit** (#4173). The fixed-λ
+  softmax driver used to run plain penalized Newton, and when it stalled with `|η| ≥ 25`
+  it refit with Firth and returned that fit without saying so. It now checks the data
+  before fitting. A cone projection over the penalty nullspace decides whether the
+  penalized likelihood has a finite maximizer. If it does not, the Firth-penalized
+  objective is fitted to convergence. `MultinomialFitOutputs::objective` records which
+  objective was optimized, along with the separation witness and `log det I` in the
+  Firth case. `penalized_neg_log_likelihood` is the negative of that objective. The Python
+  fixed-λ result dict gains an `objective` key. The `|η| ≥ 25` trigger and
+  `VectorGlmStall::eta` are deleted.
 
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry

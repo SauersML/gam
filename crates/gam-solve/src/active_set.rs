@@ -689,7 +689,21 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
 /// generators while gathering only `O(p²)` storage. Entering rows use ascending
 /// original row id as the exact-tie break, so the unique projection is
 /// independent of warm-start history.
-fn nonnegative_cone_projection_by_rows<RowValues, GatherRows>(
+///
+/// Returns the multipliers `λ ≥ 0` in original row units (only the positive
+/// ones) and the residual `r = target − Σ λᵢ aᵢ`. The residual has passed the
+/// polarity check: every row satisfies `aᵢ·r ≤ ρ‖aᵢ‖`, where
+/// `ρ = γ_p‖r‖ + ‖band‖`, `band_j = accumulation_band(k + 1, |target_j| +
+/// Σ λᵢ|a_ij|)` and `k` is the size of the passive set. `None` means the
+/// projection could not be certified.
+///
+/// Families use the same routine as a Stiemke oracle for separation (#4173).
+/// Project `target = −Aᵀ𝟙` onto the cone. The negated residual `z = −r` then
+/// satisfies `A z ≥ 0` up to `ρ‖aᵢ‖`, and the exact projection has
+/// `‖z‖² = 𝟙ᵀA z` (Moreau: the residual is orthogonal to the projection). So a
+/// nonzero `z` is a direction no row can oppose, and `z = 0` means some
+/// strictly positive combination of the rows is zero.
+pub fn nonnegative_cone_projection_by_rows<RowValues, GatherRows>(
     row_norms: &[f64],
     target: &Array1<f64>,
     row_values: RowValues,

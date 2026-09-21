@@ -91,7 +91,8 @@ numerically (the script is named), **[C]** conjectured or supported by evidence 
 8. **Ad hoc items in the multinomial path, each with a replacement in §6:**
    - ~~`multinomial.rs:116` (inner tol 1e-5 taken from a measured plateau)~~ removed (#4053);
    - `:170` (exact outer Hessian gated at dimension ≤ 24);
-   - `:183` (separation threshold |η| > 25);
+   - ~~`:183` (separation threshold |η| > 25)~~ removed (#4173), replaced by the pre-fit
+     certificate `certify_multinomial_separation`;
    - ~~`:195` (outer tol 1e-7 as a floor)~~ removed (#4053);
    - `:129` (a penalty rescale that is harmless but unneeded);
    - `:145` and `:3537-3542` (references to "±10 box" and `effective_df_floor_rho_upper_bounds`
@@ -242,8 +243,10 @@ direction 1 ⊗ (null of X), which the ALR chart removes. ∎
   **[C]** This is the penguins signature ("softest curvature 3.096e-8 at/below rounding band").
   The certified outcome there is "no finite optimum" unless the model carries a proper prior such
   as the Jeffreys term (`joint_jeffreys_term_strength`, `multinomial_reml.rs:3119-3126`).
-- `MULTINOMIAL_SEPARATION_ETA_THRESHOLD = 25` (`multinomial.rs:183`) is a proxy for this LP
-  certificate and should be replaced by it.
+- `MULTINOMIAL_SEPARATION_ETA_THRESHOLD = 25` (`multinomial.rs:183`) was a proxy for this LP
+  certificate. #4173 deleted it: the fixed-λ driver now runs `certify_multinomial_separation`
+  (a cone projection over the penalty nullspace) on the data before fitting, and fits the
+  Firth-penalized objective to convergence only when that certificate holds.
 
 ### 3.4 Outer Hessian block structure
 
@@ -595,7 +598,7 @@ formulas of §3.4 and Thm 3.6.
   `multinomial_formula_use_outer_hessian`. The exact outer Hessian is always available analytically
   (§3.4). Its cost is O(D²) trace products, each of which reuses H^{−1}Ṡ_j. Choosing it by a
   calibrated dimension is a magic constant.
-- **Delete** `MULTINOMIAL_SEPARATION_ETA_THRESHOLD = 25` (`multinomial.rs:183`). Replace it with
+- **Done in #4173.** Deleted `MULTINOMIAL_SEPARATION_ETA_THRESHOLD = 25` (`multinomial.rs:183`), and replaced it with
   the Prop 3.5 LP pre-check on N_λ, which with the default ridges means intercepts only (an empty or
   pure class). On ∂Λ (option A) or at λ → 0, report "no finite optimum", or require the Jeffreys
   term.
