@@ -1048,12 +1048,13 @@ pub(crate) struct AnchoredContinuationCertificate {
     pub(crate) endpoint_discrepancy: f64,
     pub(crate) inner_tolerance: f64,
     pub(crate) observed_contraction_factor: Option<f64>,
-    /// Relative agreement of the criterion the seed exists to make well defined,
-    /// between this refinement's endpoint and the previous one's. This is what
-    /// the certificate is taken on.
+    /// Absolute agreement `|V_coarse − V_fine|` of the criterion the seed exists
+    /// to make well defined, between this refinement's endpoint and the previous
+    /// one's. This is what the certificate is taken on.
     pub(crate) criterion_agreement: f64,
     /// The resolution `criterion_agreement` was required to clear: the outer
-    /// solver's own relative-cost tolerance, in the criterion's own units.
+    /// search's own criterion resolution `τ_stat = 1/(2n)`, in the criterion's
+    /// own absolute units ([`continuation_criterion_resolution`]).
     pub(crate) criterion_resolution: f64,
     /// How many consecutive refinements agreed, at least
     /// [`REQUIRED_CONSECUTIVE_AGREEMENTS`].
@@ -1289,7 +1290,7 @@ pub(crate) struct ContinuationRefinementReading {
     pub(crate) discrepancy: f64,
     /// The same for the previous refinement, if there was one.
     pub(crate) previous_discrepancy: Option<f64>,
-    /// Relative distance between the two endpoints' criterion values.
+    /// Absolute distance between the two endpoints' criterion values.
     pub(crate) criterion_agreement: f64,
     /// How many consecutive refinements — INCLUDING this one — agreed.
     pub(crate) consecutive_agreements: usize,
@@ -1432,15 +1433,50 @@ pub(crate) trait RefinedContinuationPath {
     ) -> Result<f64, AnchoredContinuationRefusal>;
     /// What this path is a continuation IN, for the refinement trail below.
     fn label(&self) -> &'static str;
+    /// The number of observations the criterion `V(ρ)` sums over — the same
+    /// count the outer search declares as its problem size
+    /// ([`criterion_observation_count`]).
+    fn observation_count(&self) -> usize;
 }
 
-/// Relative distance between two criterion values, on the same scale-free form
-/// the state discrepancy uses so the two are read in the same units.
+/// The number of observations the custom-family criterion sums over: the row
+/// count of the first block's design, which every block shares. The outer search
+/// declares this as its problem size and the continuation ladder reads its
+/// resolution from it, so both take it from here.
+pub(crate) fn criterion_observation_count(specs: &[ParameterBlockSpec]) -> usize {
+    specs.first().map_or(0, |spec| spec.design.nrows())
+}
+
+/// The resolution two continuation endpoints' criterion values must agree to:
+/// the outer search's own criterion resolution `τ_stat = 1/(2n)` in the
+/// criterion's absolute units (#2954, #4053).
+///
+/// The seed exists so that `V(ρ) = ℓ_p(θ̂(ρ), ρ)` is a function of ρ; the search
+/// that consumes it reads `V` to `τ_stat` and no finer — a decrease below
+/// `τ_stat` moves no reported quantity by more than the `n^{-1/2}` sampling
+/// error the inference built on the optimum already carries (the derivation is
+/// on `OuterProblemSize::statistical_resolution` in the outer optimizer). Two
+/// endpoints closer than that are therefore the same seed for every purpose the
+/// caller has. It is absolute rather than relative for the same reason the
+/// outer's is: it does not move with an additive constant in `V`.
+///
+/// `0.0` when the criterion declares no observations: nothing is then waived as
+/// unresolvable, and only bitwise-equal criterion values agree.
+pub(crate) fn continuation_criterion_resolution(observation_count: usize) -> f64 {
+    if observation_count == 0 {
+        0.0
+    } else {
+        0.5 / observation_count as f64
+    }
+}
+
+/// Absolute distance between two criterion values, in the criterion's own units
+/// — the units its resolution [`continuation_criterion_resolution`] is in.
 fn criterion_agreement(coarser: f64, finer: f64) -> f64 {
     if !coarser.is_finite() || !finer.is_finite() {
         return f64::INFINITY;
     }
-    (coarser - finer).abs() / (1.0 + coarser.abs().max(finer.abs()))
+    (coarser - finer).abs()
 }
 
 /// How many dyadic refinements the ladder may spend.
@@ -1522,7 +1558,8 @@ pub(crate) fn continuation_refinement_budget(outer_max_iter: usize) -> usize {
 /// function of ρ only once a selection rule fixes `θ̂`; the rule is this
 /// continuation; so two endpoints that the criterion cannot tell apart are the
 /// same seed for every purpose the caller has. The bar is therefore the outer
-/// solver's own relative-cost resolution, in the criterion's own units.
+/// search's own criterion resolution `τ_stat = 1/(2n)`, in the criterion's own
+/// units ([`continuation_criterion_resolution`]).
 ///
 /// The state discrepancy is still computed and still reported — it is what makes
 /// a branch change visible in the trail — it simply is not the verdict.
@@ -1532,12 +1569,9 @@ pub(crate) fn certify_refined_continuation<P: RefinedContinuationPath>(
     refine_uncertified_waypoints: bool,
 ) -> Result<CertifiedAnchoredContinuationSeed, AnchoredContinuationRefusal> {
     let inner_tolerance = options.inner_tol;
-    // The outer solver's own relative-cost resolution: two criterion values
-    // closer than this are values the search that consumes them cannot separate.
-    // `outer_rel_cost_tol` is the relative one where a family sets it;
-    // `outer_tol` is the fallback, and it is the same quantity the outer
-    // convergence test is denominated in.
-    let criterion_resolution = options.outer_rel_cost_tol.unwrap_or(options.outer_tol);
+    // The outer search's own criterion resolution: two criterion values closer
+    // than this are values the search that consumes them cannot separate.
+    let criterion_resolution = continuation_criterion_resolution(path.observation_count());
     let max_refinements = continuation_refinement_budget(options.outer_max_iter);
     let mut coarser: Option<SweptEndpoint> = None;
     let mut previous_discrepancy: Option<f64> = None;
@@ -1854,6 +1888,10 @@ impl<F: CustomFamily + Clone + Send + Sync + 'static> RefinedContinuationPath
     fn label(&self) -> &'static str {
         "#2661 anchored"
     }
+
+    fn observation_count(&self) -> usize {
+        criterion_observation_count(self.specs)
+    }
 }
 
 /// Follow a family-declared coefficient-objective homotopy at one fixed `ρ`.
@@ -2016,6 +2054,10 @@ impl<F: CustomFamily + Clone + Send + Sync + 'static> RefinedContinuationPath
 
     fn label(&self) -> &'static str {
         "coefficient-objective"
+    }
+
+    fn observation_count(&self) -> usize {
+        criterion_observation_count(self.specs)
     }
 }
 
@@ -2684,7 +2726,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // convergence in the relative-to-cost sense.
     // Mirroring the spatial exact-joint outer fix (#1053/#1066/#1069) and
     // the primary REML outer (solver/estimate.rs) for the custom-family path.
-    let n_obs = specs.first().map(|s| s.design.nrows()).unwrap_or(0);
+    let n_obs = criterion_observation_count(specs);
     let p_total: usize = specs.iter().map(|s| s.design.ncols()).sum();
     // Establish the ρ box once, validated, so its floor and ceiling reach both
     // the optimizer bounds and the per-term tightening from a single source
