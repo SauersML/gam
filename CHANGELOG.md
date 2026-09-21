@@ -76,6 +76,29 @@
   refused cell and every α before it asserts, instead of stopping at the first, and names
   the scenario, `n` and seed of any replicate the library refuses.
 
+- **The latent-survival exact-joint search still priced its criterion at one warm start's basin,
+  and a payload its mode could not produce at one θ aborted the whole fit** (gam#3173, gam#2714).
+  The published-mode rule now covers the fourth exact-joint route. Its outer evaluation took the
+  coefficient-mode branch's single start and solved it alone
+  (`evaluate_custom_family_joint_hyper_owned`), so `V(θ)` was the value at whichever basin the
+  walk's warm start reached — the defect gam#2714 already measured on this route from another
+  angle, where seed 0's first trial solved at a higher cost and every backtracking probe then
+  started from that trial's mode. The evaluation now goes through
+  `evaluate_custom_family_joint_hyper_best_mode_shared`, which completes the branch's incumbent
+  with the fit's fixed start and publishes the certified mode with the lowest penalized objective
+  `f`; its terminal mode is consumed by the finalizer that reads that rule, so a mode chosen among
+  basins is assembled only at an outer point whose certificate admits a local minimum rather than
+  a bare stationary point. Routing it there also made a second defect load-bearing: the
+  requested-payload validation graded every failure `UnsupportedConfiguration`, which answers
+  `false` to `is_trial_point_infeasible`, so an evaluation that exposed no analytic outer Hessian
+  at one θ — a mode whose curvature is indefinite, which is a property of the surface — aborted
+  the fit instead of shortening the line search. This route carries structural inequality
+  constraints on its time block, so that θ is reachable. The classification is now split where it
+  belongs: an inner solve that missed its condition here, a non-finite objective, gradient or
+  curvature, and a missing analytic Hessian are refusals of the TRIAL POINT; a gradient of the
+  wrong length or a Hessian of the wrong order stay structural, because no θ repairs a payload of
+  the wrong shape. It is the third time this misclassification has been recorded (#2553, #2590,
+  gam#979's CTN preprocessor).
 - **The event-history smoother cut its density at an underived `1e-11` and never measured what
   it discarded** (gam#4559, gam#3998). `marginal.rs` formed the smoothed marginal `raw · β` as a
   value before normalising it, which forced a floor: the product overflows where the

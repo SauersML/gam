@@ -1121,7 +1121,11 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
                 }
                 SpatialFitProvenance::Certified { outer, mode } => {
                     let exact_options = crate::outer_subsample::exact_outer_options(options);
-                    crate::custom_family::fit_custom_family_fixed_log_lambdas_from_owned_mode(
+                    // The terminal evaluation published its mode by the gam#3173 rule, so the
+                    // finalizer is the one that reads that rule: it requires an outer curvature
+                    // certificate admitting a local minimum, not merely a stationary point. A
+                    // mode chosen among basins at a saddle names no basin.
+                    crate::custom_family::fit_custom_family_fixed_log_lambdas_from_mode_selection(
                         &family,
                         &blocks,
                         &exact_options,
@@ -1142,7 +1146,7 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
             let (family, blocks) = realize(theta)?;
             promote_pending_seed(&blocks);
             let rho = theta.slice(s![..rho_dim]).to_owned();
-            let hyper_layout = family_hyper_layout(&blocks, theta)?;
+            let hyper_layout = Arc::new(family_hyper_layout(&blocks, theta)?);
             // The requested order is served as asked: the chart axes carry the exact
             // outer Hessian (see above), so a Hessian request is never demoted to a
             // gradient (#3321).
@@ -1156,32 +1160,40 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
                     "[latent] first derivative-bearing outer evaluation: its certified mode becomes the coefficient-mode anchor every later probe starts from"
                 );
             }
-            let warm_start = candidates.into_iter().next().flatten();
-            let owned = crate::custom_family::evaluate_custom_family_joint_hyper_owned(
-                &family,
-                &blocks,
-                &eval_options,
-                &rho,
-                &hyper_layout,
-                warm_start.as_ref(),
-                eval_mode,
-            )
-            ?;
+            // gam#3173: the branch's anchor is this evaluation's INCUMBENT start, not its only
+            // one. The evaluator completes it with the fit's fixed start — the blocks' own seed,
+            // which `realize` rebuilds at every θ — and publishes the certified mode with the
+            // lowest penalized objective `f`. Solving the anchor alone left `V(θ)` a function of
+            // which basin the walk's warm start reached, and a walk that follows a mode into its
+            // saddle-node fold then prices ½log σ → −∞ with no lower mode to hand over to.
+            let selection =
+                crate::custom_family::evaluate_custom_family_joint_hyper_best_mode_shared(
+                    &family,
+                    &blocks,
+                    &eval_options,
+                    &rho,
+                    hyper_layout,
+                    &candidates,
+                    eval_mode,
+                )?;
             exact_mode_branch.borrow_mut().record_value(
                 eval_mode,
                 theta,
-                owned.result.warm_start.clone(),
-                owned.result.inner_converged,
+                selection.result.warm_start.clone(),
+                selection.result.inner_converged,
             );
             // An unconverged inner state is neither a fit nor a seed (#2902).
-            if !owned.result.inner_converged {
+            if !selection.result.inner_converged {
                 return Err("latent exact joint inner solve did not converge".to_string().into());
             }
+            let objective = selection.result.objective;
+            let gradient = selection.result.gradient.clone();
+            let hessian = selection.result.outer_hessian.clone();
             Ok(ExactJointEvaluation {
-                objective: owned.result.objective,
-                gradient: owned.result.gradient,
-                hessian: owned.result.outer_hessian,
-                mode: owned.mode,
+                objective,
+                gradient,
+                hessian,
+                mode: selection,
             })
         },
         // The latent route disables the fixed-point optimizer (the call above
@@ -1189,7 +1201,10 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
         // violation. It is refused here rather than served from a second seed
         // policy.
         |_, _: &[TermCollectionSpec], _: &[TermCollectionDesign]| {
-            Err::<ExactJointEfsEvaluation<crate::custom_family::CustomFamilyOwnedMode>, _>(
+            Err::<
+                ExactJointEfsEvaluation<crate::custom_family::CustomFamilyJointHyperModeSelection>,
+                _,
+            >(
                 "latent survival EFS callback invoked even though fixed-point optimization is disabled for this exact joint route"
                     .to_string()
                     .into(),

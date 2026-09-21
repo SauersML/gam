@@ -4746,57 +4746,241 @@ mod mode_selection_value_tests {
             "a derivative lane outside the shared roundoff envelope must be rejected"
         );
     }
+
+    /// The fields [`validate_requested_best_mode_derivatives`] reads, with the rest of an
+    /// evaluation's payload empty: it looks at the gradient, the objective, the inner solve's
+    /// verdict and the outer Hessian, and at nothing else.
+    fn requested_payload(
+        gradient: Array1<f64>,
+        outer_hessian: gam_problem::HessianValue,
+        inner_converged: bool,
+    ) -> OuterObjectiveEvalResult {
+        OuterObjectiveEvalResult {
+            objective: 1.5,
+            criterion_components: [0.0; 4],
+            gradient,
+            outer_hessian,
+            warm_start: ConstrainedWarmStart {
+                rho: Array1::zeros(0),
+                block_beta: Vec::new(),
+                active_sets: Vec::new(),
+                cached_inner: None,
+            },
+            inner_converged,
+            hyper_values: Array1::zeros(0),
+            ext_mode_response_cols: None,
+            psi_scores: None,
+            criterion_rank: None,
+            inner: BlockwiseInnerResult {
+                solved_inner_tol: 1e-6,
+                block_states: Vec::new(),
+                terminal_working_sets: None,
+                terminal_likelihood_score: None,
+                active_sets: Vec::new(),
+                log_likelihood: 0.0,
+                penalty_value: 0.0,
+                cycles: 1,
+                converged: inner_converged,
+                terminal_convergence_state: None,
+                terminal_carrying_block: None,
+                block_logdet_h: None,
+                block_logdet_s: None,
+                s_lambdas: Vec::new(),
+                joint_workspace: None,
+                kkt_residual: None,
+                active_constraints: None,
+                objective_state: crate::assembly::InnerObjectiveState::unaugmented(&[], None),
+                cone_normalizer: None,
+            },
+        }
+    }
+
+    /// gam#3173: a payload the published mode could not produce AT THIS θ refuses the trial, not
+    /// the fit; a payload of the wrong SHAPE is a configuration defect at every θ.
+    ///
+    /// `is_trial_point_infeasible` is the one question the exact-joint driver asks of this error
+    /// (`ExactJointRefusal::into_trial_error`). Grading the θ-local failures
+    /// `UnsupportedConfiguration` answered it `false`, so a trial the line search could have
+    /// shortened past aborted the whole fit instead. The shape arms are the control: they must
+    /// stay structural, or the search would grind through every trial on a defect no θ repairs.
+    #[test]
+    fn a_payload_the_mode_cannot_produce_here_refuses_the_trial_not_the_fit_3173() {
+        let one_by_one = gam_problem::HessianValue::Dense(Array2::from_elem((1, 1), 1.0));
+        let steppable = |gradient: Array1<f64>,
+                         hessian: gam_problem::HessianValue,
+                         inner_converged: bool,
+                         eval_mode: EvalMode| {
+            let error = validate_requested_best_mode_derivatives(
+                &requested_payload(gradient, hessian, inner_converged),
+                eval_mode,
+                1,
+                0,
+            )
+            .expect_err("this payload is not one the caller can use");
+            assert!(
+                error.is_trial_point_infeasible(),
+                "the outer search must be able to step away from this θ: {error}"
+            );
+        };
+        // A mode whose curvature is indefinite exposes no analytic outer Hessian here.
+        steppable(
+            Array1::from_vec(vec![0.25]),
+            gam_problem::HessianValue::Unavailable,
+            true,
+            EvalMode::ValueGradientHessian,
+        );
+        // An inner solve that missed its condition at this θ, and a gradient that is not finite.
+        steppable(
+            Array1::from_vec(vec![0.25]),
+            one_by_one.clone(),
+            false,
+            EvalMode::ValueAndGradient,
+        );
+        steppable(
+            Array1::from_vec(vec![f64::NAN]),
+            one_by_one.clone(),
+            true,
+            EvalMode::ValueAndGradient,
+        );
+
+        // The control: shape. Neither a gradient of the wrong length nor a Hessian of the wrong
+        // order becomes right by moving θ.
+        let structural = |gradient: Array1<f64>,
+                          hessian: gam_problem::HessianValue,
+                          eval_mode: EvalMode| {
+            let error = validate_requested_best_mode_derivatives(
+                &requested_payload(gradient, hessian, true),
+                eval_mode,
+                1,
+                0,
+            )
+            .expect_err("this payload does not describe a one-coordinate outer point");
+            assert!(
+                !error.is_trial_point_infeasible(),
+                "no θ repairs a payload of the wrong shape: {error}"
+            );
+        };
+        structural(
+            Array1::from_vec(vec![0.25, 0.5]),
+            one_by_one.clone(),
+            EvalMode::ValueAndGradient,
+        );
+        structural(
+            Array1::from_vec(vec![0.25]),
+            gam_problem::HessianValue::Dense(Array2::zeros((2, 2))),
+            EvalMode::ValueGradientHessian,
+        );
+
+        // A gradient request owes no curvature, and a complete payload is refused at neither
+        // order: the refusals above are the two failures and not the fixture.
+        validate_requested_best_mode_derivatives(
+            &requested_payload(
+                Array1::from_vec(vec![0.25]),
+                gam_problem::HessianValue::Unavailable,
+                true,
+            ),
+            EvalMode::ValueAndGradient,
+            1,
+            0,
+        )
+        .expect("a gradient request owes no outer Hessian");
+        validate_requested_best_mode_derivatives(
+            &requested_payload(Array1::from_vec(vec![0.25]), one_by_one, true),
+            EvalMode::ValueGradientHessian,
+            1,
+            0,
+        )
+        .expect("a finite analytic 1x1 Hessian completes a one-coordinate payload");
+    }
 }
 
+/// The derivative payload the published mode owes its caller, and whose refusal each failure is.
+///
+/// A payload of the wrong SHAPE is a configuration defect: no θ makes a gradient the wrong length
+/// or a Hessian the wrong order, so those keep the structural verdict. Everything else refused
+/// here is a property of THIS trial point — an inner solve that missed its condition at this θ, a
+/// non-finite objective, gradient or curvature, and a mode whose curvature is indefinite so the
+/// evaluation exposes no analytic outer Hessian here, which is a property of the surface and not
+/// an implementation fault. Grading those `UnsupportedConfiguration` answered `false` to
+/// [`CustomFamilyError::is_trial_point_infeasible`], so a θ the outer search could have stepped
+/// away from aborted the whole fit instead: the misclassification #2553, #2590 and gam#979's CTN
+/// preprocessor each recorded once. A caller that asks for a Hessian its family never declares is
+/// a different failure with its own detector — `rho_optimizer::run` refuses that construction by
+/// name ("CONFIGURATION CONTRADICTION"), and the exact-joint drivers request curvature only where
+/// the declared form carries it.
 fn validate_requested_best_mode_derivatives(
     result: &OuterObjectiveEvalResult,
     eval_mode: EvalMode,
     expected_theta_dim: usize,
     selected_candidate: usize,
 ) -> Result<(), CustomFamilyError> {
-    if !result.inner_converged
-        || !result.objective.is_finite()
-        || result.gradient.len() != expected_theta_dim
-        || result.gradient.iter().any(|value| !value.is_finite())
-    {
-        return Err(CustomFamilyError::UnsupportedConfiguration {
+    if result.gradient.len() != expected_theta_dim {
+        return Err(CustomFamilyError::DimensionMismatch {
             reason: format!(
-                "best coefficient-mode candidate {selected_candidate} did not produce finite, converged requested derivatives of dimension {expected_theta_dim}"
+                "best coefficient-mode candidate {selected_candidate} produced a gradient of {} \
+                 coordinates at an outer point of {expected_theta_dim}",
+                result.gradient.len()
             ),
         });
+    }
+    if !result.inner_converged
+        || !result.objective.is_finite()
+        || result.gradient.iter().any(|value| !value.is_finite())
+    {
+        return Err(CustomFamilyError::trial_point(format!(
+            "best coefficient-mode candidate {selected_candidate} did not produce finite, \
+             converged requested derivatives at this trial point"
+        )));
     }
     if eval_mode != EvalMode::ValueGradientHessian {
         return Ok(());
     }
-    if !result.outer_hessian.is_analytic() || result.outer_hessian.dim() != Some(expected_theta_dim)
+    if let Some(dim) = result.outer_hessian.dim()
+        && dim != expected_theta_dim
     {
-        return Err(CustomFamilyError::UnsupportedConfiguration {
+        return Err(CustomFamilyError::DimensionMismatch {
             reason: format!(
-                "best coefficient-mode candidate {selected_candidate} did not produce an analytic {expected_theta_dim}x{expected_theta_dim} Hessian"
+                "best coefficient-mode candidate {selected_candidate} produced a {dim}x{dim} \
+                 outer Hessian at an outer point of {expected_theta_dim}"
             ),
         });
+    }
+    if !result.outer_hessian.is_analytic() {
+        return Err(CustomFamilyError::trial_point(format!(
+            "best coefficient-mode candidate {selected_candidate} exposes no analytic \
+             {expected_theta_dim}x{expected_theta_dim} outer Hessian at this trial point"
+        )));
     }
     let dense = result
         .outer_hessian
         .materialize_dense()
-        .map_err(|error| CustomFamilyError::UnsupportedConfiguration {
-            reason: format!(
-                "best coefficient-mode candidate {selected_candidate} Hessian materialization failed: {error}"
-            ),
+        .map_err(|error| {
+            CustomFamilyError::trial_point(format!(
+                "best coefficient-mode candidate {selected_candidate} could not materialize its \
+                 outer Hessian at this trial point: {error}"
+            ))
         })?
-        .ok_or_else(|| CustomFamilyError::UnsupportedConfiguration {
-            reason: format!(
-                "best coefficient-mode candidate {selected_candidate} did not expose an analytic Hessian"
-            ),
+        .ok_or_else(|| {
+            CustomFamilyError::trial_point(format!(
+                "best coefficient-mode candidate {selected_candidate} did not expose an analytic \
+                 outer Hessian at this trial point"
+            ))
         })?;
-    if dense.dim() != (expected_theta_dim, expected_theta_dim)
-        || dense.iter().any(|value| !value.is_finite())
-    {
-        return Err(CustomFamilyError::UnsupportedConfiguration {
+    if dense.dim() != (expected_theta_dim, expected_theta_dim) {
+        return Err(CustomFamilyError::DimensionMismatch {
             reason: format!(
-                "best coefficient-mode candidate {selected_candidate} materialized Hessian was not finite with shape {expected_theta_dim}x{expected_theta_dim}"
+                "best coefficient-mode candidate {selected_candidate} materialized a {}x{} outer \
+                 Hessian at an outer point of {expected_theta_dim}",
+                dense.nrows(),
+                dense.ncols()
             ),
         });
+    }
+    if dense.iter().any(|value| !value.is_finite()) {
+        return Err(CustomFamilyError::trial_point(format!(
+            "best coefficient-mode candidate {selected_candidate} materialized a non-finite outer \
+             Hessian at this trial point"
+        )));
     }
     Ok(())
 }
