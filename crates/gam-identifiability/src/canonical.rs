@@ -54,7 +54,7 @@ use crate::families::compiler::{
     CompilerError, IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks,
     symmetric_sqrt_into,
 };
-use gam_linalg::faer_ndarray::{default_rrqr_rank_alpha, fast_ata, fast_atb};
+use gam_linalg::faer_ndarray::{fast_ata, fast_atb};
 use gam_linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use gam_problem::Gauge;
 use gam_problem::{
@@ -654,7 +654,7 @@ pub fn channel_aware_audit_at_operating_scalars(
 ///     null modes a softmax channel shares once the cross-class σ²-coupling thins
 ///     their data signal (multinomial `s(x) + s(x, by=g)`: 28 vs p_red 30).
 ///   • TOLERANCE MATCH. `count_rank` keeps a singular value `σ=√λ` down to
-///     `rank_alpha·ε·n·σ_max`; the old eigenvalue cutoff `λ > scale·64·n·ε` was
+///     its SVD rounding band `max(n,p)·ε·σ_max`; the old eigenvalue cutoff `λ > scale·64·n·ε` was
 ///     ~ε larger and demoted penalty-covered modes whose `λ` sits between
 ///     `ε²λ_max` and `ε·λ_max` (Gaussian survival location-scale: 16 vs p_red 18).
 /// An empty block list explicitly requests the bare data Gram. A supplied
@@ -744,7 +744,7 @@ fn audit_convention_rank(
     // tall-design row count exactly as the audit's
     // `rank_of_gram(.., n_design_rows + n_penalty_rows)` does. The earlier
     // eigenvalue cutoff `λ > scale·64·n·ε` was ~ε larger than `count_rank`'s
-    // σ-space `rank_alpha·ε·n·σ_max` floor and demoted penalty-covered modes whose
+    // σ-space `max(n,p)·ε·σ_max` rounding band and demoted penalty-covered modes whose
     // `λ` sits between `ε²λ_max` and `ε·λ_max` (Gaussian survival location-scale:
     // 16 vs p_red 18). A failed eigendecomposition is refused, not read as full
     // rank: substituting the column count would certify the invariant unverified
@@ -847,8 +847,7 @@ fn flat_audit_convention_rank(
         });
     }
     let m_rows = j.nrows() + n_penalty_rows;
-    let tiered =
-        priority_tiered_rank_from_gram(&gram, &col_priority, m_rows, default_rrqr_rank_alpha());
+    let tiered = priority_tiered_rank_from_gram(&gram, &col_priority, m_rows);
     Ok(tiered.rank)
 }
 

@@ -284,8 +284,7 @@ pub(crate) fn wahba_low_degree_decomposition(
         SPHERE_UNPENALIZED_LOW_DEGREE,
         radians,
     );
-    let rank_alpha = gam_linalg::faer_ndarray::default_rrqr_rank_alpha();
-    let low_rrqr = gam_linalg::faer_ndarray::rrqr_with_permutation(&complete_harmonics, rank_alpha)
+    let low_rrqr = gam_linalg::faer_ndarray::rrqr_with_permutation(&complete_harmonics)
         .map_err(BasisError::LinalgError)?;
     let low_degree_columns = low_rrqr.column_permutation[..low_rrqr.rank].to_vec();
     if low_degree_columns.is_empty() {
@@ -308,7 +307,7 @@ pub(crate) fn wahba_low_degree_decomposition(
     // shift was frozen into prediction. Canonical RRQR supplies the exact,
     // rank-adapted section instead.
     let (kernel_basis, low_rank) =
-        gam_linalg::faer_ndarray::rrqr_nullspace_basis(&low_degree_centers, rank_alpha)
+        gam_linalg::faer_ndarray::rrqr_nullspace_basis(&low_degree_centers)
             .map_err(BasisError::LinalgError)?;
     if low_rank != low_degree_centers.ncols() {
         crate::bail_invalid_basis!(
@@ -4167,13 +4166,39 @@ mod wahba_penalty_invariants_tests {
                 .map(|value| value.abs())
                 .fold(0.0_f64, f64::max)
         };
-        let roundoff_factor = gam_linalg::faer_ndarray::default_rrqr_rank_alpha()
-            * f64::EPSILON
-            * centers.nrows() as f64;
-        let gauge_roundoff =
-            roundoff_factor * max_abs(low).max(1.0) * max_abs(&decomposition.kernel_basis).max(1.0);
-        let design_roundoff =
-            roundoff_factor * max_abs(low).max(1.0) * max_abs(&centered_kernel).max(1.0);
+        // Derived bounds (#4045). `Z` and the projection `P` come from
+        // backward-stable Householder QR, so each is exact for data perturbed
+        // columnwise by the relative band `rel` (Higham, *ASNA* 2nd ed.,
+        // Thms 19.4 and 20.3):
+        // - The gauge: `Z` spans the exact null space of `(H + ΔH)ᵀ` and the
+        //   computed frame is within `√n·rel` of an exactly orthonormal one, so
+        //   `|HᵀẐ| ≤ rel·‖H‖_F·(1 + √n)`, plus the product's own
+        //   `γ_n·(|H|ᵀ|Ẑ|)`.
+        // - The design: `P` solves the least-squares problem for `H + ΔH` and
+        //   `B + ΔB`, where `B = KZ` was itself formed to within
+        //   `γ_n·(|K||Z|)`. So `|Hᵀr| ≤ rel·‖H‖_F·(‖r‖_F + ‖B‖_F + ‖H‖_F‖P‖_F)`,
+        //   plus `‖H‖_F` times the formation of `B` (in the solve and again
+        //   here) and of `HP`, plus the product `Hᵀr`.
+        let n = centers.nrows();
+        let q = low.ncols();
+        let frobenius = |matrix: &Array2<f64>| matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let abs = |matrix: &Array2<f64>| matrix.mapv(f64::abs);
+        let rel = gam_linalg::roundoff::householder_qr_backward_band(n, q, 1.0);
+        let gamma_n = gam_linalg::roundoff::accumulation_growth(n);
+        let gamma_nq = gam_linalg::roundoff::accumulation_growth(n + q);
+        let low_fro = frobenius(low);
+        let gauge_roundoff = rel * low_fro * (1.0 + (n as f64).sqrt())
+            + gamma_n * max_abs(&abs(low).t().dot(&abs(&decomposition.kernel_basis)));
+        let kernel_z = center_kernel.dot(&decomposition.kernel_basis);
+        let formation = 2.0 * &abs(&center_kernel).dot(&abs(&decomposition.kernel_basis))
+            + abs(low).dot(&abs(projection));
+        let design_roundoff = rel
+            * low_fro
+            * (frobenius(&centered_kernel)
+                + frobenius(&kernel_z)
+                + low_fro * frobenius(projection))
+            + gamma_nq * low_fro * frobenius(&formation)
+            + gamma_n * max_abs(&abs(low).t().dot(&abs(&centered_kernel)));
         assert!(
             max_abs(&gauge_residual) <= gauge_roundoff,
             "Wahba kernel chart must satisfy H^T Z = 0 without a ridge; residual={:.3e}, bound={gauge_roundoff:.3e}",

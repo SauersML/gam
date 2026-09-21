@@ -3410,7 +3410,7 @@ fn recycled_component_preconditioner(
     diagonal: &[f64],
     rank_bound: usize,
 ) -> Result<SymmetricLowRankPreconditioner, String> {
-    use gam_linalg::faer_ndarray::{default_rrqr_rank_alpha, rrqr_with_permutation};
+    use gam_linalg::faer_ndarray::rrqr_with_permutation;
 
     let m = comp.len();
     let inverse_diagonal: Vec<f64> = diagonal.iter().map(|&d| d.recip()).collect();
@@ -3445,7 +3445,7 @@ fn recycled_component_preconditioner(
             raw[[i, q]] = diagonal[i].sqrt() * recycle.directions[source][atom];
         }
     }
-    let rrqr = rrqr_with_permutation(&raw, default_rrqr_rank_alpha())
+    let rrqr = rrqr_with_permutation(&raw)
         .map_err(|err| format!("decoder recycled coarse-space RRQR failed: {err}"))?;
     let rank = rrqr.rank.min(rank_bound);
     if rank == 0 {
@@ -3465,24 +3465,34 @@ fn recycled_component_preconditioner(
     SymmetricLowRankPreconditioner::from_scaled_subspace(
         inverse_diagonal,
         independent,
-        |basis, image| {
+        |basis, image, image_error| {
             let rank = basis.ncols();
             image
                 .as_slice_mut()
                 .expect("fresh Galerkin image is standard layout")
                 .par_chunks_mut(rank)
+                .zip(
+                    image_error
+                        .as_slice_mut()
+                        .expect("fresh Galerkin error bound is standard layout")
+                        .par_chunks_mut(rank),
+                )
                 .enumerate()
-                .for_each(|(i, image_row)| {
-                    image_row.copy_from_slice(
-                        basis
-                            .row(i)
-                            .as_slice()
-                            .expect("Galerkin basis row is contiguous"),
-                    );
+                .for_each(|(i, (image_row, error_row))| {
+                    let own = basis
+                        .row(i)
+                        .as_slice()
+                        .expect("Galerkin basis row is contiguous");
+                    image_row.copy_from_slice(own);
+                    for q in 0..rank {
+                        error_row[q] = own[q].abs();
+                    }
                     // Walk the CSR structure once for the whole coarse block.
                     // For every fixed q the additions remain in canonical
                     // ascending-neighbor order, while structure is loaded once.
-                    for edge in row_ptr[i] as usize..row_ptr[i + 1] as usize {
+                    let edges = row_ptr[i] as usize..row_ptr[i + 1] as usize;
+                    let degree = edges.len();
+                    for edge in edges {
                         let j = csr_cols[edge] as usize;
                         let scaled_value = csr_vals[edge] * inverse_sqrt[i] * inverse_sqrt[j];
                         let neighbor_row = basis.row(j);
@@ -3491,7 +3501,23 @@ fn recycled_component_preconditioner(
                             .expect("Galerkin basis row is contiguous");
                         for q in 0..rank {
                             image_row[q] += scaled_value * neighbor[q];
+                            error_row[q] += (scaled_value * neighbor[q]).abs();
                         }
+                    }
+                    // The represented operator is S_ij = v_ij·r_i·r_j with the
+                    // computed inverse square roots r: exactly symmetric,
+                    // because the same r scales row and column. Each summand
+                    // carries three roundings (two for the scaled value, one
+                    // for the product) and the row adds `degree` of them to the
+                    // exact copy of u_i, so k = degree + 3 bounds every path:
+                    // |fl(SU)_iq − (SU)_iq| ≤ γ_k Σ|terms| (Higham, ASNA §3.1).
+                    // The absolute sum is itself a nonnegative k-path
+                    // accumulation of the computed terms, so γ_k/(1 − γ_k)
+                    // times its computed value bounds the exact one.
+                    let growth = gam_linalg::roundoff::accumulation_growth(degree + 3);
+                    let factor = growth / (1.0 - growth);
+                    for bound in error_row.iter_mut() {
+                        *bound *= factor;
                     }
                 });
         },

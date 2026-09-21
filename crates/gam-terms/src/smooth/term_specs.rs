@@ -5639,16 +5639,13 @@ fn tensor_margin_separable_factors(
 }
 
 fn numerical_rank(matrix: &Array2<f64>) -> Result<usize, BasisError> {
-    use gam_linalg::faer_ndarray::{FaerSvd, default_rrqr_rank_alpha};
+    use gam_linalg::faer_ndarray::FaerSvd;
     if matrix.nrows() == 0 || matrix.ncols() == 0 {
         return Ok(0);
     }
     let (_, singular, _) = matrix.svd(false, false).map_err(BasisError::LinalgError)?;
     let sigma_max = singular.iter().copied().fold(0.0_f64, f64::max);
-    let tol = default_rrqr_rank_alpha()
-        * f64::EPSILON
-        * matrix.nrows().max(matrix.ncols()) as f64
-        * sigma_max;
+    let tol = gam_linalg::roundoff::factor_singular_band(matrix.nrows(), matrix.ncols(), sigma_max);
     Ok(singular.iter().filter(|&&sigma| sigma > tol).count())
 }
 
@@ -5715,7 +5712,7 @@ fn chart_preimage_of_span(
     let projected = &left - &frame.dot(&frame.t().dot(&left));
     // `rrqr_nullspace_basis(a)` spans `null(aᵀ)`.
     let (angle_null, _) =
-        rrqr_nullspace_basis(&projected.t().to_owned(), 1.0).map_err(BasisError::LinalgError)?;
+        rrqr_nullspace_basis(&projected.t().to_owned()).map_err(BasisError::LinalgError)?;
     if angle_null.ncols() == 0 {
         return Ok(Array2::zeros((width, 0)));
     }
@@ -7136,7 +7133,7 @@ fn pca_function_mass_penalty(
     // The pivot magnitudes of a column-pivoted QR run on the Gram's eigen square
     // root cannot make this call. Squaring floors a true zero singular value at
     // the Gram's rounding, `≈ ε·σ_max²`, and the square root resurrects it as a
-    // pivot of order `√ε·σ_max`, far above that QR's `O(n·ε)·|R₀₀|` cutoff, so a
+    // pivot of order `√ε·σ_max`, far above that QR's backward-error band `γ_K·‖R̂‖_F`, so a
     // duplicated component would pass as full rank whenever its computed
     // eigenvalue rounded positive.
     let (eigenvalues, _) = FaerEigh::eigh(&raw_score_gram, faer::Side::Lower)
@@ -7148,12 +7145,9 @@ fn pca_function_mass_penalty(
     if rank != k {
         // Name the columns the pivoted order places last: the pivot sequence
         // depends only on the column geometry, never on a rank cutoff.
-        let pivoted = gam_linalg::faer_ndarray::rrqr_from_gram_with_permutation(
-            &raw_score_gram,
-            n_rows,
-            gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
-        )
-        .map_err(BasisError::LinalgError)?;
+        let pivoted =
+            gam_linalg::faer_ndarray::rrqr_from_gram_with_permutation(&raw_score_gram, n_rows)
+                .map_err(BasisError::LinalgError)?;
         let redundant_columns = &pivoted.column_permutation[rank..];
         crate::bail_invalid_basis!(
             "Pca score design is rank deficient: rank {} < {} (score Gram eigenvalues at or below the resolution band {:.6e}); redundant score columns {:?}; remove zero or dependent components instead of stabilizing them with a coefficient ridge",

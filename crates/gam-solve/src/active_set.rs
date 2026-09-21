@@ -2,7 +2,7 @@ use crate::estimate::EstimationError;
 use faer::Side;
 use gam_linalg::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerLinalgError, FaerSvd, array1_to_col_matmut,
-    col_piv_qr_solve_lstsq, default_rrqr_rank_alpha, rrqr_nullspace_basis,
+    col_piv_qr_solve_lstsq, rrqr_nullspace_basis,
 };
 use gam_linalg::gram_schmidt::ReorthogonalizedRowBasis;
 use gam_linalg::utils::{StableSolver, array_is_finite};
@@ -1588,12 +1588,11 @@ pub(crate) fn solve_kkt_direction(
     let (Some(u), Some(vt)) = (u_opt, vt_opt) else {
         crate::bail_invalid_estim!("null-space constrained quadratic SVD omitted singular vectors");
     };
-    let (mut null_basis, rank) = rrqr_nullspace_basis(&scaled_a.t(), default_rrqr_rank_alpha())
-        .map_err(|_| {
-            EstimationError::InvalidInput(
-                "null-space constrained quadratic active-equation RRQR failed".to_string(),
-            )
-        })?;
+    let (mut null_basis, rank) = rrqr_nullspace_basis(&scaled_a.t()).map_err(|_| {
+        EstimationError::InvalidInput(
+            "null-space constrained quadratic active-equation RRQR failed".to_string(),
+        )
+    })?;
     if rank == 0 {
         crate::bail_invalid_estim!(
             "null-space constrained quadratic active equations have numerical rank zero"

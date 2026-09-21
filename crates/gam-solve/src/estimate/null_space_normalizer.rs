@@ -143,10 +143,7 @@ fn penalty_null_basis(penalties: &[BlockwisePenalty], p: usize) -> Result<Array2
             .slice_mut(s![range.clone(), range])
             .scaled_add(1.0, &block.local);
     }
-    let (null_basis, _) = gam_linalg::faer_ndarray::rrqr_nullspace_basis(
-        &penalty,
-        gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
-    )
-    .map_err(|err| format!("failed to compute penalty null-space basis: {err}"))?;
+    let (null_basis, _) = gam_linalg::faer_ndarray::rrqr_nullspace_basis(&penalty)
+        .map_err(|err| format!("failed to compute penalty null-space basis: {err}"))?;
     Ok(null_basis)
 }

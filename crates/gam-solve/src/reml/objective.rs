@@ -9,7 +9,7 @@ pub(crate) fn firth_penalized_structural_rank(
     likelihood_basis: &Array2<f64>,
     penalty_root: &Array2<f64>,
 ) -> Result<usize, EstimationError> {
-    use gam_linalg::faer_ndarray::{default_rrqr_rank_alpha, rrqr_with_permutation};
+    use gam_linalg::faer_ndarray::rrqr_with_permutation;
     let p = likelihood_basis.nrows();
     if penalty_root.ncols() != p {
         crate::bail_invalid_estim!(
@@ -37,7 +37,7 @@ pub(crate) fn firth_penalized_structural_rank(
             row.mapv_inplace(|value| value / norm);
         }
     }
-    rrqr_with_permutation(&root, default_rrqr_rank_alpha())
+    rrqr_with_permutation(&root)
         .map(|factor| factor.rank)
         .map_err(EstimationError::LinearSystemSolveFailed)
 }

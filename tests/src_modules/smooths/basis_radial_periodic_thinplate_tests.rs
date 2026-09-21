@@ -5164,7 +5164,7 @@ fn test_matern_overspecified_centers_yield_full_rank_basis() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e));
     let dense = out.design.to_dense();
     let realized_cols = dense.ncols();
-    let rrqr = rrqr_with_permutation(&dense, default_rrqr_rank_alpha()).unwrap_or_else(|e| {
+    let rrqr = rrqr_with_permutation(&dense).unwrap_or_else(|e| {
         panic!(
             "{} failed: {:?}",
             "RRQR on the realized design should succeed", e

@@ -18,9 +18,7 @@ use ndarray::{Array1, Array2, Array3, Axis, s};
 
 use faer::Side;
 use gam_linalg::decision::{RankDecision, certified_rank, equilibrate_gram};
-use gam_linalg::faer_ndarray::{
-    FaerEigh, default_rrqr_rank_alpha, fast_ab, fast_atb, rrqr_with_permutation,
-};
+use gam_linalg::faer_ndarray::{FaerEigh, fast_ab, fast_atb, rrqr_with_permutation};
 
 /// Slack factor (multiples of machine ε) for the rank-revealing eigenvalue
 /// threshold used when pseudo-inverting a Gram matrix or selecting the
@@ -1093,7 +1091,7 @@ fn audit_and_drop_trailing_pivots(
     }
 
     // RRQR rank with the codebase's default α.
-    let rrqr = rrqr_with_permutation(w_joint, default_rrqr_rank_alpha())
+    let rrqr = rrqr_with_permutation(w_joint)
         .map_err(|err| CompilerError::LinalgFailure(format!("audit RRQR failed: {err:?}")))?;
     let rank = rrqr.rank;
     if rank >= p_total {

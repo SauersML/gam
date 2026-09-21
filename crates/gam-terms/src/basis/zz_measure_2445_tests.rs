@@ -192,7 +192,7 @@ fn zz_measure_2445_rank_test_frame_moves_with_psi() {
     if let Some(t) = transform.as_ref() {
         let kernel_rows_t = t.slice(s![..kernel_cols, ..]).t().to_owned();
         let (structural, rank) =
-            gam_linalg::faer_ndarray::rrqr_nullspace_basis(&kernel_rows_t, 1.0)
+            gam_linalg::faer_ndarray::rrqr_nullspace_basis(&kernel_rows_t)
                 .expect("structural transport nullspace");
         eprintln!(
             "[2445] structural transported frame: rank(T_kernel)={rank} dim={} (expected {})",

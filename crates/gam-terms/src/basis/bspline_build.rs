@@ -1276,8 +1276,7 @@ fn bspline_boundary_nullspace_transform(
     };
     let p_raw = c.ncols();
     let frob = c.iter().map(|v| v * v).sum::<f64>().sqrt();
-    let (z, rank) =
-        rrqr_nullspace_basis(&c.t(), default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
+    let (z, rank) = rrqr_nullspace_basis(&c.t()).map_err(BasisError::LinalgError)?;
     if rank >= p_raw || z.ncols() == 0 {
         return Err(BasisError::ConstraintNullspaceCollapsed {
             site: "bspline_boundary_nullspace_transform",
@@ -1336,8 +1335,7 @@ fn compute_geometric_constraint_transform_in_chart(
         let c_geom = fast_ab(&c_geom_raw, t);
         let k = c_geom.ncols();
         let frob = c_geom.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let (z, rank) = rrqr_nullspace_basis(&c_geom.t(), default_rrqr_rank_alpha())
-            .map_err(BasisError::LinalgError)?;
+        let (z, rank) = rrqr_nullspace_basis(&c_geom.t()).map_err(BasisError::LinalgError)?;
         if rank >= k || z.ncols() == 0 {
             return Err(BasisError::ConstraintNullspaceCollapsed {
                 site: "compute_geometric_constraint_transform_in_chart",
@@ -1368,8 +1366,7 @@ pub(crate) fn bspline_sum_to_zero_transform_from_cross(
     }
     let mut c_mat = Array2::<f64>::zeros((k, 1));
     c_mat.column_mut(0).assign(c);
-    let (z, rank) =
-        rrqr_nullspace_basis(&c_mat, default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
+    let (z, rank) = rrqr_nullspace_basis(&c_mat).map_err(BasisError::LinalgError)?;
     if rank >= k {
         return Err(BasisError::ConstraintNullspaceCollapsed {
             site: "bspline_sum_to_zero_transform_from_cross",
@@ -2903,7 +2900,6 @@ fn generalized_nullspace_basis(
     let whitened = symmetrize_penalty(&whitened);
     let (evals, evecs) = FaerEigh::eigh(&whitened, Side::Lower).map_err(BasisError::LinalgError)?;
     let tol = generalized_spectral_tolerance(&evals, &whitened);
-    let penalty_scale = max_abs_row_sum(&penalty_sym);
     let mut zero_idx = Vec::new();
     for (index, &value) in evals.iter().enumerate() {
         if value.abs() <= tol {
@@ -2913,20 +2909,16 @@ fn generalized_nullspace_basis(
         // Whitening by L^{-1} can amplify roundoff when the function metric is
         // ill-conditioned. Adjudicate every questionable eigenpair in the
         // original PSD quadratic: v=L^{-T}u and μ=vᵀSv because vᵀHv=1. The
-        // O(n·eps·||S||∞·||v||²) envelope is a backward-error test on the source
+        // `null_quadratic_band` envelope is a backward-error test on the source
         // penalty, so it accepts only curvature numerically indistinguishable
         // from zero rather than widening a global generalized-eigenvalue floor.
         let generalized = gam_linalg::triangular::back_substitution_lower_transpose(
             lower.view(),
             evecs.column(index),
         );
-        let coefficient_norm_squared = generalized.dot(&generalized);
         let source_quadratic = generalized.dot(&penalty_sym.dot(&generalized));
-        let source_tol = default_rrqr_rank_alpha()
-            * f64::EPSILON
-            * p.max(1) as f64
-            * penalty_scale
-            * coefficient_norm_squared;
+        let source_tol =
+            gam_linalg::roundoff::null_quadratic_band(penalty_sym.view(), generalized.view());
         if source_quadratic.abs() <= source_tol {
             zero_idx.push(index);
         } else if source_quadratic < -source_tol {
@@ -2968,7 +2960,7 @@ pub(crate) fn generalized_spectral_tolerance(evals: &Array1<f64>, operator: &Arr
     // roundoff envelope rather than a fitted absolute floor.
     let operator_scale = max_abs_row_sum(operator);
     let scale = spectral_scale.max(operator_scale);
-    default_rrqr_rank_alpha() * f64::EPSILON * operator.nrows().max(1) as f64 * scale
+    operator.nrows() as f64 * f64::EPSILON * scale
 }
 
 /// Function-mass components of a penalty's null space, one energy factor per
@@ -3107,15 +3099,25 @@ pub(crate) fn constructive_ridge_from_null_metric_factor(
             context: "null-metric restriction: right singular vectors were not returned",
         })
     })?;
-    // `‖M‖₂ = σ_max²` exactly, so the roundoff envelope is denominated in the
-    // restricted metric's own norm — no row-sum upper bound is needed to stand
-    // in for a norm the eigensolver might underestimate, because the singular
-    // values come from `B` directly rather than from two whitening solves.
+    // The rank is read on `B` itself (#2318), in singular-value units. Two
+    // errors separate a computed `σᵢ` from `B`'s exact one: the SVD's backward
+    // error, `factor_singular_band(rows, cols, σ_max)`, and the formation of
+    // `B = A_G N`, entrywise at most `γ_k·(|A_G||N|)` with `k` the inner
+    // dimension (Higham, *ASNA* 2nd ed., §3.5). By Weyl the latter moves each
+    // `σᵢ` by at most its Frobenius norm. A mode at or below the sum is not
+    // resolved from zero (#4045).
     let sigma_max = singular.iter().copied().fold(0.0_f64, f64::max);
-    let tol = default_rrqr_rank_alpha()
-        * f64::EPSILON
-        * n.ncols().max(1) as f64
-        * (sigma_max * sigma_max);
+    let formation_band = gam_linalg::roundoff::accumulation_growth(n.nrows())
+        * fast_ab(&metric_factor.mapv(f64::abs), &n.mapv(f64::abs))
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
+    let tol = gam_linalg::roundoff::factor_singular_band(
+        restricted.nrows(),
+        restricted.ncols(),
+        sigma_max,
+    ) + formation_band;
     // A SINGULAR metric is admissible. The double penalty is not obliged to
     // cover every unpenalized direction: Duchon deliberately leaves the model
     // intercept free while shrinking only the affine trend, so a null space
@@ -3127,7 +3129,7 @@ pub(crate) fn constructive_ridge_from_null_metric_factor(
     // topology depend on whether the primary's numerical null space happened to
     // coincide with the ridge's support (gam#2433).
     let kept: Vec<usize> = (0..singular.len())
-        .filter(|&index| singular[index] * singular[index] > tol)
+        .filter(|&index| singular[index] > tol)
         .collect();
     if kept.is_empty() {
         return ConstructiveQuadratic::from_energy_factor(Array2::zeros((0, n.nrows())), context);
@@ -3169,7 +3171,7 @@ pub(crate) fn constructive_ridge_from_null_metric_factor(
 /// as `nullity` for the very same block. The energy factor's singular values
 /// are `√λ`, so the cutoff transfers as `√tol`.
 ///
-/// Using RRQR's machine-precision `rank_alpha` here instead made this the one
+/// Using RRQR's machine-precision rank band here instead made this the one
 /// penalty-spectrum consumer with its own convention, five decades tighter than
 /// every other. The observable consequence (gam#2433) is that whether a block
 /// has a null space depended on whether a `try_from_dense_psd` — which applies

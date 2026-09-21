@@ -159,7 +159,6 @@ pub(crate) fn prune_unidentified_linear_terms_for_marginal_slope(
     }
     basis.push(intercept.mapv(|v| v / intercept_norm));
 
-    let rank_alpha = gam_linalg::faer_ndarray::default_rrqr_rank_alpha();
     let mut kept = Vec::<LinearTermSpec>::with_capacity(spec.linear_terms.len());
     let mut dropped = Vec::<UnidentifiedScalarTerm>::new();
 
@@ -178,7 +177,15 @@ pub(crate) fn prune_unidentified_linear_terms_for_marginal_slope(
         // so far: the residual is measured against the column's own norm. A
         // scale shared across columns would make the answer depend on the
         // units of other terms and on their order in the formula.
-        let tol = rank_alpha * f64::EPSILON * ((n + basis.len() + 1).max(1) as f64) * norm;
+        //
+        // The size of that measurement is the QR's columnwise backward error.
+        // `residualize_against_orthonormal_basis` is modified Gram-Schmidt,
+        // numerically Householder QR on `[0; A]` (Bjorck & Paige 1992), and QR
+        // perturbs each column by at most `γ_K‖a_j‖` (Higham, ASNA 2nd ed.,
+        // Thm 19.4). `Q` is exactly orthogonal in that model, so a column truly
+        // in the span leaves a computed residual no larger than that (#4045).
+        let columns = basis.len() + 1;
+        let tol = gam_linalg::roundoff::householder_qr_backward_band(n + columns, columns, norm);
         let is_data_redundant = residual_norm <= tol;
         let has_constraints = term.coefficient_min.is_some() || term.coefficient_max.is_some();
         if is_data_redundant {

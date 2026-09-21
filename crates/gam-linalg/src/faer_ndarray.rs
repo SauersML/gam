@@ -40,8 +40,6 @@ pub fn symmetric_matvec_into(
     Ok(())
 }
 
-const RRQR_RANK_ALPHA: f64 = 100.0;
-
 thread_local! {
     static NESTED_PARALLEL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -4120,32 +4118,120 @@ impl<S: Data<Elem = f64>> FaerQr for ArrayBase<S, Ix2> {
 /// null-space log-determinants, identifiability audits — finite and exact for
 /// the fully-unpenalized case. For `rank >= 1` at least one well-defined
 /// reflector seeds the block, and the reconstruction stays finite.
+///
+/// The rank is the factorization's rank at working precision
+/// ([`PivotedQrRank`]).
 pub fn rrqr_nullspace_basis<S: Data<Elem = f64>>(
     a: &ArrayBase<S, Ix2>,
-    rank_alpha: f64,
 ) -> Result<(Array2<f64>, usize), FaerLinalgError> {
-    rrqr_nullspace_basis_inner(a, RrqrRankCutoff::RelativeAlpha(rank_alpha))
+    rrqr_nullspace_basis_inner(a, RrqrRankCutoff::WorkingPrecision)
 }
 
-/// Which absolute cutoff on `|R_ii|` separates rank from null in
-/// [`rrqr_nullspace_basis_with_cutoff`] / [`rrqr_nullspace_basis`].
+/// How [`rrqr_nullspace_basis_with_cutoff`] and [`rrqr_nullspace_basis`]
+/// separate the rank from the null space.
 #[derive(Debug, Clone, Copy)]
 enum RrqrRankCutoff {
-    /// `rank_alpha · ε · max(m, n) · max(|R₀₀|, 1)` — a machine-precision
-    /// cutoff derived from the factorization's own leading pivot. This asks
-    /// "is this direction numerically distinguishable from zero at all?".
-    RelativeAlpha(f64),
-    /// A caller-supplied absolute cutoff in the units of `a`'s singular
-    /// values. Use this when the null/range partition is fixed by an external
-    /// convention (e.g. a penalty spectrum's `spectral_tolerance`) rather than
-    /// by float representability, so that two consumers of the same object
-    /// cannot disagree about which directions are unpenalized.
+    /// The factorization's rank at working precision ([`PivotedQrRank`]). This
+    /// asks "is this direction distinguishable from zero at all?".
+    WorkingPrecision,
+    /// A cutoff the caller supplies on the pivots `|R_ii|`, in the units of
+    /// `a`'s singular values. Use this when an external convention fixes the
+    /// null/range split (for example a penalty spectrum's
+    /// `spectral_tolerance`) rather than float representability, so two
+    /// consumers of the same object cannot disagree about which directions are
+    /// unpenalized.
     Absolute(f64),
 }
 
+/// Numerical rank of a column-pivoted Householder QR at working precision
+/// (#4045).
+///
+/// # Rule
+///
+/// The computed `R̂` is the exact factor of `(A + ΔA)Π = QR̂`, where `Q` is
+/// orthogonal and `‖ΔA‖_F ≤ band`
+/// ([`crate::roundoff::householder_qr_backward_band`]). Split `R̂` at `k`:
+///
+/// ```text
+/// (A + ΔA)Π = Q·[R₁₁ R₁₂; 0 0] + Q·[0 0; 0 R₂₂]
+/// ```
+///
+/// Dropping the trailing block moves the factored matrix by `‖R₂₂‖_F`. When
+/// `‖R₂₂‖_F ≤ band`, that move is no larger than the error the factorization
+/// has already committed. At working precision `A` is then indistinguishable
+/// from a rank-`k` matrix.
+///
+/// The rank is the smallest such `k`. The trailing norm
+/// `T_k = (Σ_{i≥k} ‖R̂_{i,i:}‖²)^{1/2}` does not increase with `k`, so the rank
+/// is the number of `T_k` above the band.
+///
+/// # Units
+///
+/// Both sides are in `A`'s units. The rule charges the whole trailing block
+/// against the whole backward error, rather than each pivot against a multiple
+/// of the leading one. A dependent column therefore cannot hide behind other
+/// small pivots.
+pub struct PivotedQrRank {
+    /// Number of leading pivots whose trailing block exceeds the band.
+    pub rank: usize,
+    /// The backward-error band `‖ΔA‖_F` the trailing blocks are compared to.
+    pub band: f64,
+    /// `T_k` for `k = 0..=min(m, n)`. `T_0 = ‖R̂‖_F` and `T_{min(m,n)} = 0`.
+    pub trailing_norms: Vec<f64>,
+}
+
+impl PivotedQrRank {
+    /// Rank of the thin `R̂` (`min(m, n) × n`) of a pivoted QR. `design_rows` is
+    /// the number of rows of the matrix the factorization stands for. That is
+    /// `R̂`'s own `m` for a tall QR, or the row count of the design behind a
+    /// Gram.
+    fn of(r: MatRef<'_, f64>, design_rows: usize) -> Result<Self, FaerLinalgError> {
+        let diag_len = r.nrows().min(r.ncols());
+        let mut scale = 0.0_f64;
+        let mut finite = true;
+        for i in 0..diag_len {
+            for j in i..r.ncols() {
+                let value = r[(i, j)];
+                finite &= value.is_finite();
+                scale = scale.max(value.abs());
+            }
+        }
+        if !finite {
+            return Err(FaerLinalgError::FactorizationFailed {
+                context: "pivoted QR rank: the factor has non-finite entries",
+            });
+        }
+        // Summed from the bottom, scaled by the largest entry so the squares
+        // cannot overflow. The running sum only grows, so `T_k` is exactly
+        // non-increasing in `k`.
+        let mut trailing_norms = vec![0.0_f64; diag_len + 1];
+        if scale > 0.0 {
+            let mut sum = 0.0_f64;
+            for i in (0..diag_len).rev() {
+                for j in i..r.ncols() {
+                    let value = r[(i, j)] / scale;
+                    sum += value * value;
+                }
+                trailing_norms[i] = scale * sum.sqrt();
+            }
+        }
+        let band = crate::roundoff::householder_qr_backward_band(
+            design_rows,
+            r.ncols(),
+            trailing_norms[0],
+        );
+        let rank = trailing_norms.iter().filter(|&&norm| norm > band).count();
+        Ok(Self {
+            rank,
+            band,
+            trailing_norms,
+        })
+    }
+}
+
 /// [`rrqr_nullspace_basis`] with an explicit absolute cutoff on the pivoted
-/// `|R_ii|` (i.e. in the units of `a`'s singular values) instead of the
-/// machine-precision `rank_alpha` heuristic.
+/// `|R_ii|` (in the units of `a`'s singular values) instead of the rank at
+/// working precision.
 ///
 /// A rank decision is a *convention*, not a fact about floats: the same matrix
 /// has a different null space depending on the scale below which a direction
@@ -4169,15 +4255,13 @@ fn rrqr_nullspace_basis_inner<S: Data<Elem = f64>>(
     let faerview = FaerArrayView::new(a);
     let qr = ColumnPivotedQr::new(faerview.as_ref());
     let r = qr.thin_r();
-    let diag_len = r.nrows().min(r.ncols());
-    let leading_diag = if diag_len > 0 { r[(0, 0)].abs() } else { 0.0 };
-    let tol = match cutoff {
-        RrqrRankCutoff::RelativeAlpha(rank_alpha) => {
-            rank_alpha * f64::EPSILON * (a.nrows().max(a.ncols()).max(1) as f64) * leading_diag
+    let rank = match cutoff {
+        RrqrRankCutoff::WorkingPrecision => PivotedQrRank::of(r, a.nrows())?.rank,
+        RrqrRankCutoff::Absolute(tol) => {
+            let diag_len = r.nrows().min(r.ncols());
+            (0..diag_len).filter(|&i| r[(i, i)].abs() > tol).count()
         }
-        RrqrRankCutoff::Absolute(tol) => tol,
     };
-    let rank = (0..diag_len).filter(|&i| r[(i, i)].abs() > tol).count();
     let z = if rank >= a.nrows() {
         Array2::<f64>::zeros((a.nrows(), 0))
     } else if rank == 0 {
@@ -4197,11 +4281,6 @@ fn rrqr_nullspace_basis_inner<S: Data<Elem = f64>>(
     Ok((z, rank))
 }
 
-#[inline]
-pub const fn default_rrqr_rank_alpha() -> f64 {
-    RRQR_RANK_ALPHA
-}
-
 /// Result of a column-pivoted QR with rank detection and column permutation.
 ///
 /// `A · P = Q · R` where the permutation `P` is exposed as the forward index
@@ -4215,21 +4294,19 @@ pub const fn default_rrqr_rank_alpha() -> f64 {
 pub struct RrqrWithPermutation {
     pub rank: usize,
     pub column_permutation: Vec<usize>,
-    pub leading_diag_abs: f64,
+    /// The backward-error band [`PivotedQrRank::band`] the rank was read against.
     pub rank_tol: f64,
 }
 
 /// Column-pivoted rank-revealing QR returning the rank, the column permutation,
-/// and the rank-detection tolerance. Use this when callers need to name which
-/// columns the pivoted QR demoted past the rank threshold.
+/// and the band the rank was read against. Use this when callers need to name
+/// which columns the pivoted QR demoted.
 ///
-/// The rank cutoff matches [`rrqr_nullspace_basis`]: a column-pivoted QR is
-/// computed on `a`; columns with `|R[i, i]| > tol` count toward the rank,
-/// where `tol = rank_alpha · eps · max(m, n, 1) · max(|R[0, 0]|, 1)`. Returns
-/// `Err` when `a` has zero rows.
+/// The rank is the same one [`rrqr_nullspace_basis`] uses, the rank at working
+/// precision ([`PivotedQrRank`]). Returns `Err` when `a` has zero rows or the
+/// factor is not finite.
 pub fn rrqr_with_permutation<S: Data<Elem = f64>>(
     a: &ArrayBase<S, Ix2>,
-    rank_alpha: f64,
 ) -> Result<RrqrWithPermutation, FaerLinalgError> {
     if a.nrows() == 0 {
         return Err(FaerLinalgError::FactorizationFailed {
@@ -4238,41 +4315,38 @@ pub fn rrqr_with_permutation<S: Data<Elem = f64>>(
     }
     let faerview = FaerArrayView::new(a);
     let qr = ColumnPivotedQr::new(faerview.as_ref());
-    let r = qr.thin_r();
-    let diag_len = r.nrows().min(r.ncols());
-    let leading_diag = if diag_len > 0 { r[(0, 0)].abs() } else { 0.0 };
-    // The pivoted QR's backward error is `α·ε·max(m, p)·|R₁₁|`, in the matrix's own
-    // units: a pivot inside it is zero to the precision the factorization has.
-    let tol = rank_alpha * f64::EPSILON * (a.nrows().max(a.ncols()).max(1) as f64) * leading_diag;
-    let rank = (0..diag_len).filter(|&i| r[(i, i)].abs() > tol).count();
-    let column_permutation = qr.forward.clone();
+    let resolved = PivotedQrRank::of(qr.thin_r(), a.nrows())?;
     Ok(RrqrWithPermutation {
-        rank,
-        column_permutation,
-        leading_diag_abs: leading_diag,
-        rank_tol: tol,
+        rank: resolved.rank,
+        column_permutation: qr.forward.clone(),
+        rank_tol: resolved.band,
     })
 }
 
 /// Result of a Gram-driven column-pivoted RRQR (see
-/// [`rrqr_from_gram_with_permutation`]). Carries the same rank / permutation /
-/// tolerance as [`RrqrWithPermutation`], plus a `verdict_margin` that measures
-/// how unambiguous the rank cut is — the ratio between the smallest *kept*
-/// pivot and the rank tolerance. A large margin means squaring the design into
-/// a Gram could not have flipped any rank decision; a small margin means the
-/// verdict sits near the cliff and the caller should re-confirm on the full
-/// (un-squared) design to stay bit-exact.
+/// [`rrqr_from_gram_with_permutation`]). It carries the same rank, permutation
+/// and band as [`RrqrWithPermutation`], plus a `verdict_margin` that measures
+/// how unambiguous the rank cut is. A large margin means squaring the design
+/// into a Gram could not have flipped any rank decision. A small margin means
+/// the verdict sits near the cliff, and the caller should re-confirm it on the
+/// full (un-squared) design.
 pub struct RrqrFromGram {
     pub rank: usize,
     pub column_permutation: Vec<usize>,
+    /// The backward-error band [`PivotedQrRank::band`] the rank was read
+    /// against, priced for the tall `m_rows × p` design.
     pub rank_tol: f64,
-    /// Leading pivot magnitude `|R[0,0]|` of the square-root factor — equal to
-    /// the largest column norm of the original tall design (col-piv QR pivots the
-    /// largest-norm column first), so it matches the tall path's
-    /// `RrqrWithPermutation::leading_diag_abs`.
-    pub leading_diag_abs: f64,
-    /// `min_kept_pivot / rank_tol` (∞ when full rank with no kept pivot below
-    /// tol, i.e. every pivot is comfortably above; `0` when rank is 0).
+    /// The smallest of three ratios, all `≥ 1` exactly when the verdict is
+    /// clear of its cliff:
+    ///
+    /// - `T_{rank−1} / band`: how far the smallest kept trailing block is
+    ///   above the band.
+    /// - `band / T_rank`: how far the largest dropped trailing block is below
+    ///   it.
+    /// - `min kept |R_ii| / (√ε·|R_00|)`: how far the smallest kept pivot is
+    ///   above the Gram-squaring precision floor.
+    ///
+    /// It is `∞` when no term applies, for example at rank 0 with a zero Gram.
     pub verdict_margin: f64,
 }
 
@@ -4282,39 +4356,37 @@ pub struct RrqrFromGram {
 ///
 /// # Why this is exact (in exact arithmetic)
 ///
-/// Column-pivoted QR selects, at each step, the not-yet-pivoted column with the
+/// At each step, column-pivoted QR selects the not-yet-pivoted column with the
 /// largest residual norm, where the residual is the part orthogonal to the
-/// already-chosen columns. Those residual norms — and the resulting pivot
-/// sequence, the diagonal magnitudes `|R[i,i]|`, and hence the rank cut — are a
-/// function of the column *inner products* only, i.e. of the Gram `G`. Running
-/// col-piv QR on the Cholesky factor `R₀` of `G` (`R₀ᵀR₀ = G`, `R₀` is `p × p`)
-/// reproduces the identical pivot order and identical `|R[i,i]|` as col-piv QR
-/// on the original `m × p` matrix, because both see the same column geometry.
-/// This is the standard "pivoted QR depends only on the Gram" identity and lets
-/// the joint identifiability rank verdict run in `O(p³)` instead of streaming
-/// all `m ≈ 2·10⁵` rows again.
+/// columns already chosen. Those residual norms depend only on the column
+/// *inner products*, i.e. on the Gram `G`. So do the resulting pivot sequence,
+/// the rows of `R`, and hence the rank cut.
 ///
-/// # Tolerance
+/// Take any square-root factor `F` with `FᵀF = G`. Running col-piv QR on `F`
+/// reproduces the pivot order and the rows of `R` (up to sign) that col-piv QR
+/// on the original `m × p` matrix would produce, because both see the same
+/// column geometry. This lets the joint identifiability rank verdict run in
+/// `O(p³)` instead of streaming all `m ≈ 2·10⁵` rows again.
 ///
-/// The rank cutoff must match what the tall-matrix [`rrqr_with_permutation`]
-/// would have used, so the caller passes `m_rows` (the row count of the
-/// original tall design, including any appended penalty rows). The tolerance is
-/// `rank_alpha · eps · max(m_rows, p) · max(|R[0,0]|, 1)` — bit-identical to the
-/// tall path, since `|R[0,0]|` (the leading pivot magnitude = largest column
-/// norm) is the same in both factorizations.
+/// # Band
+///
+/// The rank is read against the backward-error band of the *tall* QR that this
+/// factorization stands in for, so the caller passes `m_rows`. That is the row
+/// count of the original design, including any appended penalty rows.
+/// `‖R‖_F = ‖F‖_F = ‖A‖_F`, so the band ([`PivotedQrRank`]) is the one the tall
+/// [`rrqr_with_permutation`] computes, up to the rounding of `G`.
 ///
 /// # Finite-precision guard
 ///
 /// Forming `G = AᵀA` squares the condition number, so a rank decision that sits
-/// right at the tolerance cliff could in principle flip. The returned
-/// `verdict_margin` lets the caller detect that case and fall back to the exact
-/// tall RRQR; in the overwhelmingly common well-separated case (full column
-/// rank, smallest pivot orders of magnitude above tol) the margin is huge and
-/// no fallback is needed.
+/// right at the band could in principle flip. The returned `verdict_margin`
+/// lets the caller detect that case and re-confirm on the tall design. In the
+/// common well-separated case (full column rank, every trailing block orders of
+/// magnitude above the band, every pivot far above the Gram floor) the margin
+/// is large and the tall pass is not needed.
 pub fn rrqr_from_gram_with_permutation<S: Data<Elem = f64>>(
     gram: &ArrayBase<S, Ix2>,
     m_rows: usize,
-    rank_alpha: f64,
 ) -> Result<RrqrFromGram, FaerLinalgError> {
     let p = gram.ncols();
     if p == 0 {
@@ -4322,7 +4394,6 @@ pub fn rrqr_from_gram_with_permutation<S: Data<Elem = f64>>(
             rank: 0,
             column_permutation: Vec::new(),
             rank_tol: 0.0,
-            leading_diag_abs: 0.0,
             verdict_margin: 0.0,
         });
     }
@@ -4335,10 +4406,11 @@ pub fn rrqr_from_gram_with_permutation<S: Data<Elem = f64>>(
     // construction (AᵀA), so its eigendecomposition G = V·diag(λ)·Vᵀ gives the
     // factor F = diag(√λ₊)·Vᵀ (rows indexed by eigenpair, columns by original
     // design column). Any factor with FᵀF = G reproduces the same column
-    // geometry, which is all col-piv QR consumes — we use the eigen square root
+    // geometry, which is all col-piv QR consumes. We use the eigen square root
     // rather than a bare Cholesky because Cholesky fails on the numerically
-    // semidefinite Gram that is exactly the rank-deficient case we must classify.
-    // Tiny-negative eigenvalues from finite precision are clamped to zero.
+    // semidefinite Gram, which is exactly the rank-deficient case we must
+    // classify. Tiny negative eigenvalues from finite precision are clamped to
+    // zero.
     let (evals, evecs) = gram.eigh(Side::Lower)?;
     let mut f = Array2::<f64>::zeros((p, p));
     for k in 0..p {
@@ -4350,60 +4422,62 @@ pub fn rrqr_from_gram_with_permutation<S: Data<Elem = f64>>(
             f[[k, i]] = scale * evecs[[i, k]];
         }
     }
-    // Single col-piv QR on F. Its pivot order, per-pivot |R[i,i]| magnitudes,
-    // and leading pivot equal those of col-piv QR on the original tall design
-    // (FᵀF = G), so this reproduces the exact tall-path geometry.
+    // A single col-piv QR on F. Its pivot order and the rows of R equal those
+    // of col-piv QR on the original tall design (FᵀF = G), so the rank is read
+    // against the tall design's band.
     let faer_f = FaerArrayView::new(&f);
     let qr = ColumnPivotedQr::new(faer_f.as_ref());
     let r = qr.thin_r();
+    let resolved = PivotedQrRank::of(r, m_rows)?;
+    let rank = resolved.rank;
+    let band = resolved.band;
     let diag_len = r.nrows().min(r.ncols());
     let pivots: Vec<f64> = (0..diag_len).map(|i| r[(i, i)].abs()).collect();
     let leading_diag = pivots.first().copied().unwrap_or(0.0);
     let column_permutation = qr.forward.clone();
-    // Re-scale the tolerance from F's `max(p, p)=p` row dimension to the
-    // original tall design's `max(m_rows, p)`, keeping the rank cut bit-
-    // identical to what the tall [`rrqr_with_permutation`] would have produced.
-    let tol = rank_alpha * f64::EPSILON * (m_rows.max(p).max(1) as f64) * leading_diag;
-    let rank = pivots.iter().filter(|&&v| v > tol).count();
-    let min_kept = pivots[..rank].iter().copied().fold(f64::INFINITY, f64::min);
-    let max_dropped = pivots[rank..].iter().copied().fold(0.0f64, f64::max);
-    // Margin: how far the verdict is from the cliff. Use the smaller of
-    // (min_kept / tol) and (tol / max_dropped) so a near-tol dropped pivot also
-    // shrinks the margin. A margin ≫ 1 means no rank decision could flip.
+    // Margin: how far the verdict is from the cliff, on both sides.
+    // `T_{rank−1} > band ≥ T_rank` by the rank rule.
     let kept_margin = if rank == 0 {
         f64::INFINITY
     } else {
-        min_kept / tol
+        resolved.trailing_norms[rank - 1] / band
     };
-    // Exactly zero dropped pivots sit infinitely far below any cutoff.
-    let dropped_margin = if rank == diag_len || max_dropped == 0.0 {
+    // An exactly zero trailing block sits infinitely far below any band.
+    let dropped_tail = resolved.trailing_norms[rank];
+    let dropped_margin = if dropped_tail == 0.0 {
         f64::INFINITY
     } else {
-        tol / max_dropped
+        band / dropped_tail
     };
-    // Gram-squaring precision floor. Forming `G = XᵀX` collapses the bottom half
-    // of the spectrum: a true singular value below `√ε · σ_max` is lost in the
-    // rounding of `G` (its squared value `σ² < ε·σ_max²` underflows the Gram's
-    // representable range), and the eigen-square-root then RESURRECTS it as a
-    // SPURIOUS pivot of magnitude `≈ √(ε·σ_max²) = √ε · σ_max` — orders of
-    // magnitude ABOVE the true σ and above `tol`. That artefact makes col-piv QR
-    // on `F` KEEP a column the tall (un-squared) QR would demote: an EXACTLY
-    // collinear alias (true σ = 0, so `σ² = 0` floored at `≈ ε·σ_max²`) shows up
-    // as a kept pivot near `√ε · leading`, over-ranking the design and dropping
-    // nothing (gam#933: a callback-owned column aliased with a higher-priority
-    // anchor was never demoted, so the reduction never ran and the MAP-uniqueness
-    // check then fired on the raw collinear joint design). `min_kept / tol` does
-    // NOT catch this — the spurious pivot sits comfortably above `tol`, so the
-    // existing margin reports a falsely-confident verdict. The honest test is
-    // whether the smallest KEPT pivot is itself near the Gram precision floor
-    // `√ε · leading`: if so, the Gram path cannot distinguish it from a true zero
-    // and the verdict MUST be re-confirmed on the full-precision tall design.
-    // Encode that as a third margin term `min_kept / (√ε · leading)` so a kept
-    // pivot in the floor regime shrinks `verdict_margin` below the caller's
-    // fallback threshold; for a genuinely full-rank design every kept pivot is
-    // `≫ √ε · leading` and this term is large, leaving the fast path intact.
-    // A kept pivot implies a positive leading pivot, so this floor is positive
+    // Gram-squaring precision floor. Forming `G = XᵀX` collapses the bottom
+    // half of the spectrum. A true singular value below `√ε · σ_max` is lost in
+    // the rounding of `G`, because its squared value `σ² < ε·σ_max²` is below
+    // the rounding of `G`'s largest entries. The eigen square root then
+    // RESURRECTS it as a SPURIOUS pivot of magnitude `≈ √(ε·σ_max²) = √ε·σ_max`,
+    // orders of magnitude ABOVE the true σ and above the band.
+    //
+    // That artefact makes col-piv QR on `F` KEEP a column the tall (un-squared)
+    // QR would demote. An EXACTLY collinear alias (true σ = 0, so `σ² = 0`
+    // rounded up to `≈ ε·σ_max²`) shows up as a kept pivot near `√ε·leading`.
+    // That over-ranks the design and drops nothing. In gam#933, a
+    // callback-owned column aliased with a higher-priority anchor was never
+    // demoted, so the reduction never ran, and the MAP-uniqueness check then
+    // fired on the raw collinear joint design.
+    //
+    // `T_{rank−1} / band` does NOT catch this. The spurious pivot sits
+    // comfortably above the band, so that margin reports a falsely confident
+    // verdict. The honest test is whether the smallest KEPT pivot is itself
+    // near the Gram precision floor `√ε·leading`. If it is, the Gram path cannot
+    // distinguish it from a true zero, and the verdict MUST be re-confirmed on
+    // the full-precision tall design.
+    //
+    // Encode that as a third margin term `min_kept / (√ε·leading)`. A kept
+    // pivot in the floor regime then shrinks `verdict_margin` below the
+    // caller's threshold. For a genuinely full-rank design, every kept pivot is
+    // `≫ √ε·leading`, so this term is large and the fast path stays intact. A
+    // kept pivot implies a positive leading pivot, so this floor is positive
     // wherever it divides.
+    let min_kept = pivots[..rank].iter().copied().fold(f64::INFINITY, f64::min);
     let gram_precision_floor = f64::EPSILON.sqrt() * leading_diag;
     let kept_floor_margin = if rank == 0 {
         f64::INFINITY
@@ -4414,8 +4488,7 @@ pub fn rrqr_from_gram_with_permutation<S: Data<Elem = f64>>(
     Ok(RrqrFromGram {
         rank,
         column_permutation,
-        rank_tol: tol,
-        leading_diag_abs: leading_diag,
+        rank_tol: band,
         verdict_margin,
     })
 }
@@ -4459,7 +4532,7 @@ mod tests {
     fn rrqr_nullspace_basis_is_orthonormal_and_annihilates_transpose() {
         let a = array![[1.0, 0.0], [1.0, 0.0], [0.0, 2.0], [0.0, 0.0],];
         let (z, rank) =
-            rrqr_nullspace_basis(&a, default_rrqr_rank_alpha()).expect("RRQR should succeed");
+            rrqr_nullspace_basis(&a).expect("RRQR should succeed");
         assert_eq!(rank, 2);
         assert_eq!(z.nrows(), 4);
         assert_eq!(z.ncols(), 2);
@@ -4488,7 +4561,7 @@ mod tests {
             [0.0, 0.0, 0.0],
         ];
         let result =
-            rrqr_with_permutation(&a, default_rrqr_rank_alpha()).expect("RRQR should succeed");
+            rrqr_with_permutation(&a).expect("RRQR should succeed");
         assert_eq!(result.rank, 2);
         assert_eq!(result.column_permutation.len(), 3);
         let demoted = result.column_permutation[result.rank..].to_vec();
@@ -4517,7 +4590,7 @@ mod tests {
     fn rrqr_with_permutation_pivots_the_larger_norm_column_first() {
         let a = array![[1.0, 0.0], [0.0, 2.0], [0.0, 0.0]];
         let result =
-            rrqr_with_permutation(&a, default_rrqr_rank_alpha()).expect("RRQR should succeed");
+            rrqr_with_permutation(&a).expect("RRQR should succeed");
         assert_eq!(result.rank, 2);
         let perm = result.column_permutation.clone();
 
@@ -4554,7 +4627,7 @@ mod tests {
     #[test]
     fn rrqr_with_permutation_rejects_zero_rows() {
         let a = Array2::<f64>::zeros((0, 3));
-        assert!(rrqr_with_permutation(&a, default_rrqr_rank_alpha()).is_err());
+        assert!(rrqr_with_permutation(&a).is_err());
     }
 
     #[test]
@@ -4563,7 +4636,7 @@ mod tests {
         // the whole space, so the basis must be a finite orthonormal 3x3 set.
         let a = Array2::<f64>::zeros((3, 3));
         let (z, rank) =
-            rrqr_nullspace_basis(&a, default_rrqr_rank_alpha()).expect("RRQR should succeed");
+            rrqr_nullspace_basis(&a).expect("RRQR should succeed");
         assert_eq!(rank, 0);
         assert_eq!(z.dim(), (3, 3));
         assert!(
@@ -4582,7 +4655,7 @@ mod tests {
     fn rrqr_nullspace_basis_detectszero_rank_matrix() {
         let a = Array2::<f64>::zeros((5, 2));
         let (z, rank) =
-            rrqr_nullspace_basis(&a, default_rrqr_rank_alpha()).expect("RRQR should succeed");
+            rrqr_nullspace_basis(&a).expect("RRQR should succeed");
         assert_eq!(rank, 0);
         assert_eq!(z.dim(), (5, 5));
         let ident = Array2::<f64>::eye(5);
@@ -4830,11 +4903,9 @@ mod tests {
             a[[i, 2]] = x[i];
             a[[i, 3]] = x[i] * x[i];
         }
-        let alpha = default_rrqr_rank_alpha();
-
         // The tall (un-squared) RRQR is the full-precision reference: it must see
         // rank 3 and demote one of the duplicate x columns.
-        let tall = rrqr_with_permutation(&a, alpha).expect("tall RRQR should succeed");
+        let tall = rrqr_with_permutation(&a).expect("tall RRQR should succeed");
         assert_eq!(tall.rank, 3, "tall RRQR must demote the exact alias");
 
         // The Gram-squared RRQR must satisfy the gam#933 invariant:
@@ -4850,7 +4921,7 @@ mod tests {
         let unit = Array1::<f64>::ones(n);
         let gram = fast_xt_diag_x_with_parallelism(&a, &unit, faer::get_global_parallelism());
         let gram_rrqr =
-            rrqr_from_gram_with_permutation(&gram, n, alpha).expect("Gram RRQR should succeed");
+            rrqr_from_gram_with_permutation(&gram, n).expect("Gram RRQR should succeed");
         let ok =
             gram_rrqr.rank == 3 || gram_rrqr.verdict_margin < JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST;
         assert!(
@@ -4879,17 +4950,83 @@ mod tests {
             a[[i, 3]] = t * t * t;
             a[[i, 4]] = (t * 6.0).sin();
         }
-        let alpha = default_rrqr_rank_alpha();
         let unit = Array1::<f64>::ones(n);
         let gram = fast_xt_diag_x_with_parallelism(&a, &unit, faer::get_global_parallelism());
         let gram_rrqr =
-            rrqr_from_gram_with_permutation(&gram, n, alpha).expect("Gram RRQR should succeed");
+            rrqr_from_gram_with_permutation(&gram, n).expect("Gram RRQR should succeed");
         assert_eq!(gram_rrqr.rank, p, "full-rank design must keep all columns");
         assert!(
             gram_rrqr.verdict_margin >= JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST,
             "full-rank design must keep a high margin (fast Gram path); got {:.3e}",
             gram_rrqr.verdict_margin,
         );
+    }
+
+    /// gam#4045: the rank is the number of trailing blocks of `R̂` above the
+    /// pivoted-QR backward-error band, and nothing else. `diag(1, s)` has
+    /// `T_1 = s`, so the cut sits at `s = band`: a decade above it is kept, a
+    /// decade below it is dropped.
+    #[test]
+    fn rrqr_rank_cut_sits_at_the_householder_backward_error_band_4045() {
+        let rows = 6usize;
+        let band_of = |s: f64| {
+            crate::roundoff::householder_qr_backward_band(rows, 2, (1.0 + s * s).sqrt())
+        };
+        let unit_band = band_of(0.0);
+        assert_eq!(
+            unit_band,
+            {
+                let gamma = crate::roundoff::accumulation_growth(2 * (15 * rows + 76) + 3);
+                gamma / (1.0 - gamma)
+            },
+            "band must be γ_K/(1−γ_K)·‖R‖_F with K = min(m,n)·(15m+76) + 3"
+        );
+        for (s, expected_rank) in [(10.0 * unit_band, 2usize), (0.1 * unit_band, 1usize)] {
+            let mut a = Array2::<f64>::zeros((rows, 2));
+            a[[0, 0]] = 1.0;
+            a[[1, 1]] = s;
+            let result = rrqr_with_permutation(&a).expect("RRQR should succeed");
+            assert_eq!(
+                result.rank, expected_rank,
+                "s = {s:e} against band {:e}",
+                result.rank_tol
+            );
+            assert_eq!(result.rank_tol, band_of(s));
+        }
+    }
+
+    /// gam#4045: the band is the QR's own backward error, so a matrix that is
+    /// full rank to working precision keeps every column however badly it is
+    /// conditioned. The 8×8 Hilbert matrix has `κ₂ ≈ 1.5·10¹⁰`; its smallest
+    /// trailing block is far above `γ_K·‖H‖_F`.
+    #[test]
+    fn rrqr_keeps_an_ill_conditioned_full_rank_matrix_4045() {
+        let n = 8usize;
+        let hilbert = Array2::from_shape_fn((n, n), |(i, j)| 1.0 / ((i + j + 1) as f64));
+        let result = rrqr_with_permutation(&hilbert).expect("RRQR should succeed");
+        assert_eq!(result.rank, n);
+        let (z, rank) = rrqr_nullspace_basis(&hilbert).expect("RRQR should succeed");
+        assert_eq!(rank, n);
+        assert_eq!(z.ncols(), 0);
+    }
+
+    /// gam#4045: the band has a finite derivation only while `γ_K < 1`. Past
+    /// that there is no backward-error bound, and the band is infinite rather
+    /// than a meaningless finite threshold.
+    #[test]
+    fn householder_band_is_infinite_without_a_backward_error_bound_4045() {
+        assert_eq!(crate::roundoff::householder_reflector_roundings(10), 226);
+        assert!(crate::roundoff::householder_qr_backward_band(1 << 40, 1 << 20, 1.0).is_infinite());
+        assert_eq!(crate::roundoff::householder_qr_backward_band(10, 3, 0.0), 0.0);
+    }
+
+    /// A non-finite factor has no rank; it is refused, not counted.
+    #[test]
+    fn rrqr_refuses_a_non_finite_matrix_4045() {
+        let mut a = Array2::<f64>::eye(3);
+        a[[1, 2]] = f64::NAN;
+        assert!(rrqr_with_permutation(&a).is_err());
+        assert!(rrqr_nullspace_basis(&a).is_err());
     }
 
     // ── fast_ab / fast_atb / fast_abt / fast_av / fast_atv / fast_xt_diag_y ──

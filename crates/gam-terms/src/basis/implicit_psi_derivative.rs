@@ -61,8 +61,7 @@ impl FixedRowSpaceProjector {
             gam_linalg::faer_ndarray::FaerSvd::svd(&normalized, true, true)
                 .map_err(BasisError::LinalgError)?;
         let leading = singular.first().copied().unwrap_or(0.0);
-        let cutoff =
-            default_rrqr_rank_alpha() * f64::EPSILON * n.max(q).max(1) as f64 * leading.max(1.0);
+        let cutoff = gam_linalg::roundoff::factor_singular_band(n, q, leading);
         let rank = singular.iter().filter(|&&value| value > cutoff).count();
         let left = left.ok_or_else(|| {
             BasisError::InvalidInput(

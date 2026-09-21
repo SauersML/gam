@@ -3645,8 +3645,7 @@ pub(crate) fn matern_rank_reduce_centers(
             }
             Ok::<(), BasisError>(())
         })?;
-    let rrqr = rrqr_with_permutation(&kernel_block, default_rrqr_rank_alpha())
-        .map_err(BasisError::LinalgError)?;
+    let rrqr = rrqr_with_permutation(&kernel_block).map_err(BasisError::LinalgError)?;
     if rrqr.rank >= k {
         return Ok(centers.clone());
     }

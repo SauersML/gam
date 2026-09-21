@@ -25,7 +25,7 @@ use crate::gaussian_reml::{
 };
 use faer::Side;
 use gam_linalg::faer_ndarray::{
-    FaerCholesky, FaerEigh, default_rrqr_rank_alpha, rrqr_nullspace_basis, rrqr_with_permutation,
+    FaerCholesky, FaerEigh, rrqr_nullspace_basis, rrqr_with_permutation,
 };
 use gam_linalg::matrix::symmetrize_in_place;
 use gam_problem::LinearInequalityConstraints;
@@ -471,9 +471,12 @@ impl AffineFaceProfile {
         let weighted_base_response = &base_response * &weights.view().insert_axis(Axis(1));
         let tangent_rhs_data = tangent_design.t().dot(&weighted_base_response);
         let tangent_penalty_particular = face.z.t().dot(&penalty).dot(&beta_particular);
-        let penalty_geometry = tangent_penalty_geometry(&tangent_penalty)?;
+        let penalty_geometry = tangent_penalty_geometry(
+            &tangent_penalty,
+            projected_penalty_assembly_band(&face.z, penalty.view()),
+        )?;
         let tangent_cache = tangent_eigen_cache(tangent_gram, &tangent_penalty)?;
-        let penalty_root = tangent_penalty_geometry(&penalty.to_owned())?.root;
+        let penalty_root = tangent_penalty_geometry(&penalty.to_owned(), 0.0)?.root;
         let penalty_rank = penalty_geometry.rank;
         let penalty_logdet = penalty_geometry.logdet;
         let n_effective = weights.iter().filter(|&&value| value > 0.0).count();
@@ -632,8 +635,34 @@ fn tangent_eigen_cache(
     Ok(Some(cache))
 }
 
+/// Spectral-norm bound on the rounding in the tangent penalty `fl(Zᵀ(S Z))`.
+///
+/// Both products are `p`-term inner products (`p = S.nrows()`), so entrywise
+/// `|fl(ZᵀSZ) − ZᵀSZ| ≤ γ_{2p}·|Z|ᵀ|S||Z|` (Higham, *ASNA* 2nd ed., §3.1, with
+/// `γ_p + γ_p(1 + γ_p) ≤ γ_{2p}`). The Frobenius norm of that majorant bounds
+/// the error's spectral norm, which by Weyl moves each eigenvalue by at most as
+/// much (#4045).
+fn projected_penalty_assembly_band(z: &Array2<f64>, penalty: ArrayView2<'_, f64>) -> f64 {
+    let abs_z = z.mapv(f64::abs);
+    let majorant = abs_z.t().dot(&penalty.mapv(f64::abs)).dot(&abs_z);
+    gam_linalg::roundoff::accumulation_growth(2 * penalty.nrows())
+        * majorant
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt()
+}
+
+/// Rank, log-determinant, pseudo-inverse and root of a PSD penalty.
+///
+/// `assembly_band` bounds, in eigenvalue units, the error the matrix's own
+/// formation left in it (zero for an exact input). An eigenvalue is resolved
+/// when it exceeds [`gam_linalg::roundoff::resolved_eigenvalue_band`]: the
+/// eigensolver's `p·ε·‖S‖₂` plus that assembly band. An eigenvalue below the
+/// negative of the same band is a genuinely indefinite penalty.
 fn tangent_penalty_geometry(
     penalty: &Array2<f64>,
+    assembly_band: f64,
 ) -> Result<TangentPenaltyGeometry, EstimationError> {
     if penalty.is_empty() {
         return Ok(TangentPenaltyGeometry {
@@ -649,8 +678,12 @@ fn tangent_penalty_geometry(
     let scale = eigenvalues
         .iter()
         .fold(0.0_f64, |maximum, &value| maximum.max(value.abs()));
-    let tolerance =
-        default_rrqr_rank_alpha() * f64::EPSILON * penalty.nrows().max(1) as f64 * scale;
+    let tolerance = gam_linalg::roundoff::resolved_eigenvalue_band(
+        eigenvalues
+            .as_slice()
+            .expect("penalty eigenvalues are contiguous"),
+        assembly_band,
+    );
     let mut rank = 0usize;
     let mut logdet = 0.0;
     let mut scaled_eigenvectors = Array2::<f64>::zeros(eigenvectors.dim());
@@ -928,8 +961,8 @@ fn active_face_from_parts(
     // Canonicalize a redundant representation to independent face equations.
     // RRQR is run on A_a' so its pivoted columns name active constraint rows.
     let active_t = active.t().to_owned();
-    let rrqr = rrqr_with_permutation(&active_t, default_rrqr_rank_alpha())
-        .map_err(EstimationError::LinearSystemSolveFailed)?;
+    let rrqr =
+        rrqr_with_permutation(&active_t).map_err(EstimationError::LinearSystemSolveFailed)?;
     if rrqr.rank == 0 {
         return Err(EstimationError::GradientUnavailable {
             context: "constrained Gaussian REML backward",
@@ -942,7 +975,7 @@ fn active_face_from_parts(
         a.row_mut(row).assign(&active.row(source));
         b[row] = active_bounds[source];
     }
-    let (z, rank) = rrqr_nullspace_basis(&a.t().to_owned(), default_rrqr_rank_alpha())
+    let (z, rank) = rrqr_nullspace_basis(&a.t().to_owned())
         .map_err(EstimationError::LinearSystemSolveFailed)?;
     if rank != rrqr.rank {
         return Err(EstimationError::GradientUnavailable {
@@ -989,7 +1022,10 @@ fn face_state(
         }
         let inverse = response_basis.dot(&cache.coefficient_basis.t());
         let p_response = face.z.dot(&inverse).dot(&face.z.t());
-        let penalty_geometry = tangent_penalty_geometry(&tangent_penalty)?;
+        let penalty_geometry = tangent_penalty_geometry(
+            &tangent_penalty,
+            projected_penalty_assembly_band(&face.z, penalty.view()),
+        )?;
         let q_penalty = face.z.dot(&penalty_geometry.pseudoinverse).dot(&face.z.t());
         (
             p_response,

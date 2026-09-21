@@ -2580,11 +2580,8 @@ fn smoothness_penalty_impl(
     }
     let penalty = bspline_derivative_penalty_matrix(knots, degree, order)
         .map_err(|err| format!("failed to build smoothness penalty: {err}"))?;
-    let (null_basis, _) = gam::linalg::faer_ndarray::rrqr_nullspace_basis(
-        &penalty,
-        gam::linalg::faer_ndarray::default_rrqr_rank_alpha(),
-    )
-    .map_err(|err| format!("failed to build penalty null basis: {err}"))?;
+    let (null_basis, _) = gam::linalg::faer_ndarray::rrqr_nullspace_basis(&penalty)
+        .map_err(|err| format!("failed to build penalty null basis: {err}"))?;
     Ok((penalty, null_basis))
 }
 
