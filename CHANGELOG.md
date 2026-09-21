@@ -19,6 +19,27 @@
   changed estimator representation, which is an invariant breach rather than a missing
   measurement. **Behavior change:** a formula whose refinement refit refuses now returns the
   certified coarser fit with an advisory, where it previously raised.
+- **The average-derivative design differentiates the parametric-residualization correction** (gam#4035).
+  A residualized smooth's value block is `X*T - C(x)*R`, and `C` is rebuilt at the
+  evaluation rows, so `dC/dx * R` is part of the block's derivative.
+  `smooth_term_first_derivative_block` returned only `B'*M` and dropped it. For the
+  default `x + s(x)` the sum-to-zero columns are orthogonal to the constant, so the
+  collection takes the residualizing arm with a nonzero `x` row in `R`, and every row of
+  the derivative design was missing the constant shift `1 (x) R[x,.]`. The derivative
+  block now subtracts `dC/dx * R`, built in `build_constraint_block`'s own column order:
+  the intercept differentiates to 0, the owned linear axis equal to `deriv_col` to 1 and
+  other axes to 0, a factor-by level indicator to 0, and each owner smooth contributes
+  its own derivative block through the same function, which refuses any basis it cannot
+  differentiate exactly. The shape of `dC`, the correction and the block are cross-checked
+  and a mismatch is a `DimensionMismatch`. One helper,
+  `parametric_constraint_feature_cols`, now gives the parametric column order to both the
+  value build and the derivative, which also removes the value build's second linear-term
+  loop, unreachable because `smooth_intrinsic_parametric_feature_cols` already returns
+  every overlapping linear axis.
+  **Behavior change:** `debiased_functional(target="average_derivative")` on a
+  residualized smooth returns a different, and previously biased, number. In the numpy
+  replica of the default `x + s(x)` the fitted average derivative moves from 0.7249 to
+  0.8549.
 - **Skovgaard `r*` uses the sample-space `q_hat` and the full nuisance determinant form** (gam#3535).
   Two things were wrong in the assembly. In the scalar case it computed
   `u = (theta_hat - theta_0) * i_hat / sqrt(j_hat)`, which is the linear surrogate for
