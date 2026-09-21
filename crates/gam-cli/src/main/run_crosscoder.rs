@@ -129,8 +129,7 @@ pub(crate) fn run_crosscoder(args: CrosscoderArgs) -> CliResult<()> {
         blocks,
         config,
         cancel: None,
-    })
-    .map_err(|err| CliError::from(err.to_string()))?;
+    })?;
     let wire = fit.wire_report().map_err(CliError::from)?;
     write_wire_report(&args.out, &wire)?;
     cli_out!("Wrote crosscoder report to {}", args.out.display());

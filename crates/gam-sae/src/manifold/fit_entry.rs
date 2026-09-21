@@ -590,6 +590,38 @@ impl std::error::Error for SaeFitError {
     }
 }
 
+impl SaeFitError {
+    /// The category a front end reports for this failure, the one the class
+    /// `gamfit` raises for it declares (`sae_fit_error_to_pyerr`). An outer
+    /// search that failed reports its estimation error's category. One that
+    /// stopped without a stationarity certificate is a convergence failure. A
+    /// refused request, a failed fit step and a degenerate chart are formula
+    /// errors, the `FormulaError` Python raises for them.
+    #[must_use]
+    pub fn error_category(&self) -> gam_problem::ErrorCategory {
+        match self {
+            Self::OuterRun { source, .. } => source.error_category(),
+            Self::OuterDidNotConverge { .. } => gam_problem::ErrorCategory::Convergence,
+            Self::InvalidRequest(_) | Self::Fit(_) | Self::DegenerateChart { .. } => {
+                gam_problem::ErrorCategory::Formula
+            }
+        }
+    }
+
+    /// The remedy this failure's type declares: an outer search that failed
+    /// carries its estimation error's advice, and no other variant declares one.
+    #[must_use]
+    pub fn advice(&self) -> Option<String> {
+        match self {
+            Self::OuterRun { source, .. } => source.advice(),
+            Self::InvalidRequest(_)
+            | Self::Fit(_)
+            | Self::OuterDidNotConverge { .. }
+            | Self::DegenerateChart { .. } => None,
+        }
+    }
+}
+
 /// Ownership gate for fit-producing outer phases. The objective is returned
 /// only with a converged [`OuterResult`]; otherwise it is dropped and the
 /// complete verdict is retained in a typed error.
@@ -1002,6 +1034,53 @@ pub fn run_sae_manifold_fit(mut request: SaeFitRequest) -> Result<SaeFitOutcome,
         }
     }
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod fit_error_category_tests {
+    use super::*;
+    use gam_problem::ErrorCategory;
+    use gam_solve::rho_optimizer::{HessianSource, OuterPlan, Solver};
+
+    /// Each failure reports the category of the class `gamfit` raises for it, so
+    /// the CLI exits with the code of that category.
+    #[test]
+    fn sae_fit_error_reports_the_category_gamfit_raises() {
+        let stopped = SaeFitError::OuterDidNotConverge {
+            stage: SaeFitStage::Primary,
+            result: Box::new(OuterResult::new(
+                Array1::zeros(1),
+                1.0,
+                3,
+                false,
+                OuterPlan {
+                    solver: Solver::Bfgs,
+                    hessian_source: HessianSource::BfgsApprox,
+                },
+            )),
+        };
+        assert_eq!(stopped.error_category(), ErrorCategory::Convergence);
+        assert_eq!(stopped.advice(), None);
+
+        let source = EstimationError::InvalidInput("the anchor has a non-finite row".to_string());
+        let source_category = source.error_category();
+        let source_advice = source.advice();
+        assert_eq!(source_category, ErrorCategory::Data);
+        let failed = SaeFitError::OuterRun {
+            stage: SaeFitStage::Primary,
+            source,
+        };
+        assert_eq!(failed.error_category(), source_category);
+        assert_eq!(failed.advice(), source_advice);
+
+        for refused in [
+            SaeFitError::InvalidRequest("n_atoms must be positive".to_string()),
+            SaeFitError::Fit("the smoothing vector has the wrong length".to_string()),
+        ] {
+            assert_eq!(refused.error_category(), ErrorCategory::Formula);
+            assert_eq!(refused.advice(), None);
+        }
+    }
 }
 
 #[cfg(test)]

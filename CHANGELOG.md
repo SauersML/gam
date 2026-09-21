@@ -73,6 +73,13 @@
   `MaterializationPolicy::row_chunk_target_bytes` are removed. They were set and merged but never compared
   against anything; streamed chunk sizing reads `ResourcePolicy::row_chunk_target_bytes`, and dense
   materialization is bounded by `max_single_dense_bytes` and the process-wide memory governor.
+- **CLI: `gam crosscoder` exits with the code of the category `gamfit` raises for a failed SAE fit**
+  (#4436). The command flattened the typed `SaeFitError` into a bare message, so every failure,
+  including an outer search that stopped without a stationarity certificate, exited with the
+  invocation (formula) code and printed no `help:` line. `SaeFitError::error_category` and
+  `SaeFitError::advice` now state the category and remedy of each variant: an outer search that
+  stopped without a certificate is a convergence failure, as the `RemlConvergenceError` Python raises
+  for it, and a failed outer search keeps its estimation error's category and advice.
 
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
