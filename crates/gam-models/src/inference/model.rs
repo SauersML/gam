@@ -7923,10 +7923,12 @@ mod tests {
             "binomial".to_string(),
         );
         assert!(payload.fit_result.is_none());
-        let err = crate::inference::saved_summary::saved_model_summary(&FittedModel::from_payload(
-            payload,
-        ))
-        .expect_err("a model without its fit result has no summary");
+        let err = match crate::inference::saved_summary::saved_model_summary(
+            &FittedModel::from_payload(payload),
+        ) {
+            Ok(_) => panic!("a model without its fit result has no summary"),
+            Err(err) => err,
+        };
         assert_eq!(
             err.error_category(),
             gam_problem::ErrorCategory::Data,

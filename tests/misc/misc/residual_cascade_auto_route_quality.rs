@@ -235,7 +235,7 @@ fn cascade_matches_or_beats_dense_duchon_on_truth_recovery() {
 #[test]
 fn past_cliff_fit_from_formula_propagates_refinement_proof_capacity() {
     init_parallelism();
-    let n = 525_000;
+    let n: usize = 525_000;
     // Past the dense-kernel cliff on the rule the route itself prices: the
     // `n x default_num_centers(n, 3)` dense radial design does not fit the
     // basis layer's materialization budget (#3149 replaced the saturated

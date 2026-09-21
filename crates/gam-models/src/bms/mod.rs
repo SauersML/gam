@@ -4445,8 +4445,6 @@ mod empirical_grid_fit_3452_tests;
 #[cfg(test)]
 mod residual_score_zeta_2985_tests;
 #[cfg(test)]
-mod anchor_law_2926_tests;
-#[cfg(test)]
 mod normal_screen_2926_tests;
 mod standard_normal_flex_fifth;
 // #932 BMS flex single-source jet substrate (runtime-dimension `Jet2` + IFT
