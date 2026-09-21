@@ -605,13 +605,27 @@ fn classify_occupancy_weighted_impl(
         Err(_) => return OccupancyLaw::Indeterminate,
     };
     let mass = support.mass();
-    let ess = support.ess();
-    if !(mass > 0.0 && ess >= 4.0) {
+    let effective_rows = support.ess();
+    if !(mass > 0.0 && effective_rows >= 4.0) {
         return OccupancyLaw::Indeterminate;
     }
-    let ln_n = ess.ln();
+    // #4319 — every other side of the race is charged at the Kish effective
+    // support: the admission gate above, the BIC penalty `p·ln n` below and the
+    // width floor's resolution all read `n = ess`. The gate masses are
+    // unnormalised, so `Σ w_i ln f(x_i)` is the log-likelihood of `mass` rows;
+    // multiplying every gate by `c` scales it by `c` while leaving `ess`, the
+    // penalty and the floor fixed, and the verdict would read the unit of the
+    // masses rather than the coordinate. Renormalising the masses so they sum to
+    // the effective support puts the likelihood on the rows the penalty counts.
+    // For hard 0/1 support `mass == ess` exactly, the factor is exactly `1`, and
+    // the unweighted values are reproduced bit for bit.
+    let w: Vec<f64> = w
+        .into_iter()
+        .map(|weight| weight * (effective_rows / mass))
+        .collect();
+    let ln_n = effective_rows.ln();
     let bic_uniform = 0.0_f64;
-    let sigma_floor = 1.0 / (2.0 * ess);
+    let sigma_floor = 1.0 / (2.0 * effective_rows);
 
     // #2691 — the same collapse guard on the weighted path, against the
     // effective-sample resolution floor (`pts` is already sorted and folded).
@@ -620,7 +634,7 @@ fn classify_occupancy_weighted_impl(
     }
 
     let mixture_bic = |anchors: usize| {
-        certified_mixture_log_likelihood(&pts, &w, anchors, sigma_floor, circular, mass)
+        certified_mixture_log_likelihood(&pts, &w, anchors, sigma_floor, circular, effective_rows)
             .map(|log_likelihood| -2.0 * log_likelihood + (2 * anchors) as f64 * ln_n)
     };
 

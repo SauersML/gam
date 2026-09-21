@@ -1,5 +1,16 @@
 ## Unreleased
 
+- **Weighted occupancy charges its likelihood on the rows its penalty counts** (#4319).
+  `classify_occupancy_weighted` / `classify_occupancy_interval_weighted` ran the
+  BIC race with a log-likelihood `Σ w_i ln f(x_i)` of `mass = Σ w` rows against a
+  penalty `p·ln(ess)`, a width floor `1/(2·ess)` and an `ess ≥ 4` gate, all at the
+  Kish effective support. The support weights are unnormalised gate masses, so
+  scaling every gate by `c` scaled the evidence by `c` and left the charges fixed:
+  one 60-row arc read `Discrete { anchors: 3 }`, `Continuous` and `Uniform` at gate
+  scales `1`, `1/16` and `1/64`. The masses are now renormalised to sum to the
+  effective support before the race, so likelihood, penalty and floor count the
+  same rows and the verdict is invariant to the gate unit. Hard 0/1 support has
+  `mass == ess`, so its unweighted verdicts are unchanged.
 - **Warm-start lookup cache rows belong to one store root and see sibling writes** (#3882, #3885).
   The process-global lookup cache was keyed by fingerprint alone, so a second
   `WarmStartStore` on a different root returned, touched and could TTL-expire the

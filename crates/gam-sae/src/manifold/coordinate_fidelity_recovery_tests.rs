@@ -102,3 +102,52 @@ fn zero_mass_outliers_do_not_hide_coordinate_collapse_2691() {
         OccupancyLaw::Collapsed
     );
 }
+
+/// #4319 — the support weights are an unnormalised gate measure, so the same
+/// rows read at another gate unit are the same support and must get the same
+/// occupancy law. Before the effective-row renormalisation the mass-scale
+/// log-likelihood was charged against an ess-scale penalty and width floor, so
+/// this one arc read three different laws: `Discrete { anchors: 3 }` at `c = 1`,
+/// `Continuous` at `c = 1/16` and `Uniform` at `c = 1/64` — shrinking every
+/// evidence toward the uniform null, whose BIC is `0`, as the gates got small.
+///
+/// The scales are powers of two, so the renormalised weights are bit-identical
+/// across them and the three verdicts must agree exactly. They are free to
+/// disagree: it is exactly the disagreement this fixture exhibited. The first
+/// assertions pin the shared verdict to a resolved law, so agreement on
+/// `Indeterminate` cannot stand in for invariance.
+#[test]
+fn occupancy_verdict_is_invariant_to_the_gate_scale_4319() {
+    let rows = 60usize;
+    let coordinates: Vec<f64> = (0..rows)
+        .map(|row| {
+            let centred = 2.0 * (row as f64 + 0.5) / rows as f64 - 1.0;
+            0.3 + 0.12 * centred * centred * centred
+        })
+        .collect();
+    let unit_gates = Array1::from_elem(rows, 1.0);
+    let circle = classify_occupancy_weighted(&coordinates, unit_gates.view());
+    let interval = classify_occupancy_interval_weighted(&coordinates, unit_gates.view());
+    for (law, geometry) in [(circle, "circle"), (interval, "interval")] {
+        assert!(
+            matches!(
+                law,
+                OccupancyLaw::Uniform | OccupancyLaw::Continuous | OccupancyLaw::Discrete { .. }
+            ),
+            "the {geometry} race must reach a law at unit gates before invariance means anything, got {law:?}"
+        );
+    }
+    for scale in [1.0 / 16.0, 1.0 / 64.0] {
+        let gates = Array1::from_elem(rows, scale);
+        assert_eq!(
+            classify_occupancy_weighted(&coordinates, gates.view()),
+            circle,
+            "the circle verdict read the gate unit at scale {scale}"
+        );
+        assert_eq!(
+            classify_occupancy_interval_weighted(&coordinates, gates.view()),
+            interval,
+            "the interval verdict read the gate unit at scale {scale}"
+        );
+    }
+}
