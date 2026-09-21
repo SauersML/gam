@@ -148,12 +148,13 @@ enum FrameIntegratedRoute {
 }
 
 /// What a response probe reads off a term at one evidence factor: every atom's
-/// second jet, the border channels of that factor's layout, and the sphere
-/// blocks whose tangent projector the contraction and the read-out pass through.
+/// second jet, the border channels of that factor's layout, and the coordinate
+/// tangent blocks (spheres, pinned interval bounds) whose projector the
+/// contraction and the read-out pass through.
 struct FittedResponseProbeRows {
     second_jets: Vec<Array4<f64>>,
     border: Vec<SaeBorderChannel>,
-    sphere_tangents: Vec<SphereTangentBlock>,
+    coordinate_tangents: Vec<CoordinateTangentBlock>,
 }
 
 /// The frame-integrated fitted response applied through the lifted evidence
@@ -871,7 +872,7 @@ impl SaeManifoldTerm {
         Ok(FittedResponseProbeRows {
             second_jets: self.atom_second_jets()?,
             border: self.border_channels_for_cache(cache)?,
-            sphere_tangents: self.sphere_tangent_blocks(&cache.row_dims)?,
+            coordinate_tangents: self.coordinate_tangent_blocks(&cache.row_dims)?,
         })
     }
 
@@ -897,8 +898,9 @@ impl SaeManifoldTerm {
     /// probe contracts `J̃ᵢᵀUᵢzᵢ`, solves `A⁺`, and reads `UᵢᵀJ̃ᵢu`. On the raw frame
     /// `R = JA⁺JᵀΩ`, so it contracts `J̃ᵢᵀ√wᵢMᵢzᵢ` and reads `J̃ᵢu/√wᵢ`, and its `zᵀRz`
     /// estimates the same trace, because that `R` is similar to the likelihood
-    /// frame's. #2933 F36 — `R = J·P·A⁺·P·JᵀΩ` on sphere blocks: the contraction and
-    /// the solve's read-out both pass through the tangent projector.
+    /// frame's. #2933 F36, #3438 — `R = J·P·A⁺·P·JᵀΩ` on the coordinate tangent
+    /// blocks: the contraction and the solve's read-out both pass through the
+    /// tangent projector.
     fn fitted_response_probe(
         &self,
         cache: &ArrowFactorCache,
@@ -983,7 +985,11 @@ impl SaeManifoldTerm {
                 rhs.beta[channel.index] += sae_dot(jets.beta(position), &output);
             }
         }
-        project_sphere_tangent_slots(&rows.sphere_tangents, &cache.row_offsets, &mut rhs.t.view_mut());
+        project_coordinate_tangent_slots(
+            &rows.coordinate_tangents,
+            &cache.row_offsets,
+            &mut rhs.t.view_mut(),
+        );
         let mut solved = solve(&rhs)?;
         if solved.t.len() != total_t || solved.beta.len() != cache.k {
             return Err(format!(
@@ -993,8 +999,8 @@ impl SaeManifoldTerm {
                 cache.k
             ));
         }
-        project_sphere_tangent_slots(
-            &rows.sphere_tangents,
+        project_coordinate_tangent_slots(
+            &rows.coordinate_tangents,
             &cache.row_offsets,
             &mut solved.t.view_mut(),
         );
@@ -1314,15 +1320,24 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        // #2933 F36 — `P·G·P` on every sphere block, as the response probe projects its
-        // contraction and read-out: project each column's coordinate slots, then each row's.
-        let sphere_tangents = self.sphere_tangent_blocks(&cache.row_dims)?;
-        if !sphere_tangents.is_empty() {
+        // #2933 F36, #3438 — `P·G·P` on every coordinate tangent block, as the response
+        // probe projects its contraction and read-out: project each column's coordinate
+        // slots, then each row's.
+        let coordinate_tangents = self.coordinate_tangent_blocks(&cache.row_dims)?;
+        if !coordinate_tangents.is_empty() {
             for mut column in g.axis_iter_mut(ndarray::Axis(1)) {
-                project_sphere_tangent_slots(&sphere_tangents, &cache.row_offsets, &mut column);
+                project_coordinate_tangent_slots(
+                    &coordinate_tangents,
+                    &cache.row_offsets,
+                    &mut column,
+                );
             }
             for mut g_row in g.axis_iter_mut(ndarray::Axis(0)) {
-                project_sphere_tangent_slots(&sphere_tangents, &cache.row_offsets, &mut g_row);
+                project_coordinate_tangent_slots(
+                    &coordinate_tangents,
+                    &cache.row_offsets,
+                    &mut g_row,
+                );
             }
         }
         Ok(g)

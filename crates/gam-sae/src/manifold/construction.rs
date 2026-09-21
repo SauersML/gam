@@ -913,6 +913,7 @@ impl SaeManifoldTerm {
             row_loss_weights: None,
             crosscoder_pricing_spans: None,
             last_frames_active: false,
+            last_pinned_bound_slots: Vec::new(),
             assembly_chunk_override: None,
             fixed_decoder_assembly: false,
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),

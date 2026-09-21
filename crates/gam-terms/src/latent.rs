@@ -630,6 +630,55 @@ impl LatentManifold {
         }
     }
 
+    /// The ambient axes [`Self::project_gradient_to_tangent`] holds fixed: interval
+    /// coordinates at an endpoint whose descent direction `−g` leaves the interval.
+    /// Every other factor's projection is a smooth tangent projector and pins no
+    /// single axis. Indices are in this manifold's ambient layout, ascending.
+    pub fn gradient_pinned_axes(
+        &self,
+        t: ArrayView1<'_, f64>,
+        g: ArrayView1<'_, f64>,
+    ) -> Vec<usize> {
+        assert_eq!(t.len(), g.len());
+        let mut pinned = Vec::new();
+        self.push_gradient_pinned_axes(t, g, 0, &mut pinned);
+        pinned
+    }
+
+    fn push_gradient_pinned_axes(
+        &self,
+        t: ArrayView1<'_, f64>,
+        g: ArrayView1<'_, f64>,
+        offset: usize,
+        pinned: &mut Vec<usize>,
+    ) {
+        match self {
+            Self::Euclidean | Self::Circle { .. } | Self::Sphere { .. } => {}
+            Self::Interval { lo, hi } => {
+                if interval_descent_exits(*lo, *hi, t[0], g[0]) {
+                    pinned.push(offset);
+                }
+            }
+            Self::Product(parts)
+            | Self::ProductWithMetric {
+                manifolds: parts, ..
+            } => {
+                let mut local = 0_usize;
+                for part in parts {
+                    let dim = part.ambient_dim(1);
+                    part.push_gradient_pinned_axes(
+                        t.slice(ndarray::s![local..local + dim]),
+                        g.slice(ndarray::s![local..local + dim]),
+                        offset + local,
+                        pinned,
+                    );
+                    local += dim;
+                }
+                assert_eq!(local, g.len());
+            }
+        }
+    }
+
     /// Project an objective gradient onto the linearized feasible update space.
     ///
     /// For smooth manifolds this is the usual tangent projection. For interval
@@ -650,9 +699,7 @@ impl LatentManifold {
             }
             Self::Interval { lo, hi } => {
                 let mut out = Array1::<f64>::zeros(1);
-                let descent_exits_lo = t[0] <= *lo && g[0] > 0.0;
-                let descent_exits_hi = t[0] >= *hi && g[0] < 0.0;
-                out[0] = if descent_exits_lo || descent_exits_hi {
+                out[0] = if interval_descent_exits(*lo, *hi, t[0], g[0]) {
                     0.0
                 } else {
                     g[0]
@@ -713,9 +760,7 @@ impl LatentManifold {
             }
             Self::Interval { lo, hi } => {
                 let mut out = Array1::<f64>::zeros(1);
-                let descent_exits_lo = t[0] <= *lo && g[0] > 0.0;
-                let descent_exits_hi = t[0] >= *hi && g[0] < 0.0;
-                out[0] = if descent_exits_lo || descent_exits_hi {
+                out[0] = if interval_descent_exits(*lo, *hi, t[0], g[0]) {
                     0.0
                 } else {
                     v[0]
@@ -1381,6 +1426,14 @@ impl LatentCoordValues {
     }
 }
 
+
+/// Whether the descent direction `−g` leaves `[lo, hi]` from the point `t`: at the
+/// lower endpoint a positive gradient steps outward, at the upper one a negative
+/// gradient does. The one predicate every gradient-tangent projection of an
+/// interval coordinate and [`LatentManifold::gradient_pinned_axes`] read.
+fn interval_descent_exits(lo: f64, hi: f64, t: f64, g: f64) -> bool {
+    (t <= lo && g > 0.0) || (t >= hi && g < 0.0)
+}
 
 fn wrap_to_period(x: f64, period: f64) -> f64 {
     assert!(

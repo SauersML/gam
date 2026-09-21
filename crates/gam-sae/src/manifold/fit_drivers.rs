@@ -598,6 +598,7 @@ impl SaeManifoldTerm {
             logits: self.assignment.logits.clone(),
             coords: self.assignment.coords.clone(),
             last_row_layout: self.last_row_layout.clone(),
+            last_pinned_bound_slots: self.last_pinned_bound_slots.clone(),
         }
     }
 
@@ -821,6 +822,7 @@ impl SaeManifoldTerm {
         let restored_logits = snapshot.logits.clone();
         let restored_coords = snapshot.coords.clone();
         let restored_row_layout = snapshot.last_row_layout.clone();
+        let restored_pinned_bound_slots = snapshot.last_pinned_bound_slots.clone();
         let mut prepared = Vec::with_capacity(k);
         for atom_idx in 0..k {
             let coords = snapshot.coords[atom_idx].as_matrix();
@@ -842,6 +844,7 @@ impl SaeManifoldTerm {
         self.assignment.logits = restored_logits;
         self.assignment.coords = restored_coords;
         self.last_row_layout = restored_row_layout;
+        self.last_pinned_bound_slots = restored_pinned_bound_slots;
         Ok(())
     }
 
