@@ -865,7 +865,9 @@ fn audit_identifiability_impl(
     // (gam#1197). Use the `k·n`-row stacked operator as the block's effective
     // rank/alias geometry whenever present; plain blocks pack at their native `n` rows.
     // `stacked_design` has the SAME column count as `design`, so the joint column
-    // layout (`col_offsets`) is unchanged.
+    // layout (`col_offsets`) is unchanged. A stacked design that will not
+    // densify is refused: substituting the `n`-row design would audit exactly the
+    // mis-represented span described above.
     let block_effective_designs: Vec<std::borrow::Cow<'_, Array2<f64>>> = specs
         .iter()
         .enumerate()
@@ -873,16 +875,16 @@ fn audit_identifiability_impl(
             Some(stacked) => stacked
                 .try_to_dense_arc("identifiability::audit stacked_design rank geometry")
                 .map(|arc| std::borrow::Cow::Owned(arc.as_ref().clone()))
-                .unwrap_or_else(|error| {
-                    log::trace!(
-                        "identifiability audit: block {idx} stacked design would not \
-                         densify ({error}); using the plain block's rank geometry"
-                    );
-                    std::borrow::Cow::Borrowed(&dense_blocks[idx])
+                .map_err(|error| {
+                    EstimationError::LayoutError(format!(
+                        "identifiability audit: block {idx} ('{}') stacked design would not \
+                         densify, so its cross-channel rank geometry cannot be seen: {error}",
+                        spec.name,
+                    ))
                 }),
-            None => std::borrow::Cow::Borrowed(&dense_blocks[idx]),
+            None => Ok(std::borrow::Cow::Borrowed(&dense_blocks[idx])),
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     // Joint row count spans the tallest effective block (a `k·n`-row stacked
     // operator).
     let r_joint = block_effective_designs
