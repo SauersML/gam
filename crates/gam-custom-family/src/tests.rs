@@ -7301,6 +7301,85 @@ pub(crate) fn owned_mode_outer_finalizer_rejects_certified_objective_mismatch() 
     );
 }
 
+/// A certified owned-mode fit carries the first-order hyperparameter
+/// correction `Vp = V + (V U) V_θ (V U)ᵀ` (#2677). One Gaussian row `y = 1`
+/// under one penalty `S = [1]` at `ρ = 0` (`λ = 1`), so the mode is
+/// `β̂ = y / (1 + λ) = 1/2` and `U = λ S β̂ = β̂`; the certificate fixture's
+/// outer Hessian is `2`, so `V_θ = 1/2` and the correction is `(V β̂)² / 2`.
+/// Before #2677 this entry published no correction at all.
+#[test]
+pub(crate) fn owned_mode_certified_fit_mints_the_smoothing_correction_2677() {
+    let specs = vec![ParameterBlockSpec {
+        name: "owned_mode_correction".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
+        nullspace_dims: vec![0],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }];
+    let family = OneBlockGaussianFamily { y: array![1.0] };
+    let options = BlockwiseFitOptions {
+        use_remlobjective: false,
+        compute_covariance: true,
+        ..BlockwiseFitOptions::default()
+    };
+    let selected_theta = array![0.0];
+    let hyper_layout = test_design_hyper_layout(vec![vec![]]);
+    let owned = evaluate_custom_family_joint_hyper_owned(
+        &family,
+        &specs,
+        &options,
+        &selected_theta,
+        &hyper_layout,
+        None,
+        EvalMode::ValueOnly,
+    )
+    .expect("the coefficient mode should evaluate before certificate binding");
+    let certified_outer = certified_test_outer(selected_theta.clone(), owned.mode.objective);
+    assert_eq!(
+        certified_outer.final_hessian(),
+        Some(&array![[2.0]]),
+        "the certificate fixture publishes its analytic outer Hessian"
+    );
+
+    let fit = fit_custom_family_fixed_log_lambdas_from_owned_mode(
+        &family,
+        &specs,
+        &options,
+        owned.mode,
+        &selected_theta,
+        &certified_outer,
+    )
+    .expect("a certified owned mode assembles a fit");
+
+    assert!(
+        fit.smoothing_correction_absence().is_none(),
+        "unexpected absence: {:?}",
+        fit.smoothing_correction_absence()
+    );
+    let conditional = fit.beta_covariance().expect("requested covariance")[[0, 0]];
+    let beta = fit.beta[0];
+    // The inner certificate bounds the stationarity residual `|(1 + λ)β − y|`
+    // by `inner_tol`, and the curvature is `1 + λ = 2`.
+    assert!(
+        (beta - 0.5).abs() <= 0.5 * options.inner_tol,
+        "the fixture's mode is y / (1 + lambda) = 1/2, got {beta:.17e}"
+    );
+    let expected = conditional + 0.5 * (conditional * beta).powi(2);
+    let corrected = fit
+        .beta_covariance_corrected()
+        .expect("a certified owned mode publishes the corrected covariance")[[0, 0]];
+    assert!(
+        (corrected - expected).abs() <= 1.0e-12 * expected,
+        "corrected={corrected:.17e}, expected={expected:.17e}"
+    );
+}
+
 #[test]
 pub(crate) fn terminal_mode_binding_rejects_gradient_substitution() {
     let specs = vec![ParameterBlockSpec {
@@ -7416,6 +7495,7 @@ pub(crate) fn labeled_terminal_mode_keeps_one_outer_rho_for_two_physical_penalti
         rho: theta.clone(),
         hyper_values: Array1::zeros(0),
         inner: eval.inner,
+        psi_scores: None,
     };
     let mut state = CustomOuterState::new(None);
     state.install_terminal_mode(&theta, objective, &gradient, mode);
@@ -7866,6 +7946,7 @@ pub(crate) fn owned_mode_finalizer_preserves_prior_and_active_jeffreys_without_r
             rho: rho.clone(),
             hyper_values: Array1::zeros(0),
             inner: profiled.inner,
+            psi_scores: None,
         },
     };
     let certified_outer = certified_test_outer(rho, objective);
@@ -7926,6 +8007,7 @@ pub(crate) fn failed_terminal_probe_clears_stale_owned_mode() {
         rho: theta.clone(),
         hyper_values: Array1::zeros(0),
         inner: evaluated.mode.inner,
+        psi_scores: None,
     };
     let mut state = CustomOuterState::new(None);
     state.install_terminal_mode(&theta, objective, &array![0.0], mode);

@@ -2305,8 +2305,36 @@ pub(crate) fn joint_smoothing_correction(
     Result<(Array2<f64>, usize), gam_solve::model_types::SmoothingCorrectionAbsence>,
     CustomFamilyError,
 > {
+    let u_mat = penalty_score_columns(
+        specs,
+        block_states,
+        rho_outer,
+        &layout.physical_to_outer,
+        &layout.joint_specs,
+        &layout.joint_to_outer,
+        rho_outer.len(),
+    )?;
+    first_order_smoothing_correction(v_cond, &u_mat, outer_hessian, outer_gradient, excluded_outer)
+        .map_err(CustomFamilyError::trial_point)
+}
+
+/// The smoothing columns of the score matrix `U`, `U[:, o] = ∂(S_λ β̂)/∂ρ_o =
+/// Σ_{slots tied to o} λ_slot · S_slot · β̂`, in the stacked coefficient frame
+/// of `block_states`, with `n_columns ≥` every tied outer index. Per-block
+/// penalties act on their block slice (physical slot `i` is tied to outer
+/// `physical_to_outer[i]`); joint specs act on the full stacked space (spec `t`
+/// is tied to `joint_to_outer[t]`). Fixed (untied) slots carry no ρ coordinate,
+/// so no ρ-uncertainty flows through them.
+fn penalty_score_columns(
+    specs: &[ParameterBlockSpec],
+    block_states: &[ParameterBlockState],
+    rho_outer: &Array1<f64>,
+    physical_to_outer: &[Option<usize>],
+    joint_specs: &[gam_problem::JointPenaltySpec],
+    joint_to_outer: &[usize],
+    n_columns: usize,
+) -> Result<Array2<f64>, CustomFamilyError> {
     let p_total: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
-    let k_outer = rho_outer.len();
     if block_states.len() != specs.len() {
         return Err(CustomFamilyError::trial_point(format!(
             "joint smoothing correction: {} block states vs {} specs",
@@ -2340,13 +2368,13 @@ pub(crate) fn joint_smoothing_correction(
     // penalties act on their block slice; joint specs act on the full stacked
     // space. Fixed (untied) physical slots carry no ρ coordinate — no
     // ρ-uncertainty flows through them.
-    let mut u_mat = Array2::<f64>::zeros((p_total, k_outer));
+    let mut u_mat = Array2::<f64>::zeros((p_total, n_columns));
     let mut physical = 0usize;
     for (block_idx, spec) in specs.iter().enumerate() {
         let base = offsets[block_idx];
         let width = spec.design.ncols();
         for penalty in &spec.penalties {
-            let outer = layout.physical_to_outer.get(physical).copied().flatten();
+            let outer = physical_to_outer.get(physical).copied().flatten();
             physical += 1;
             let Some(outer) = outer else {
                 continue;
@@ -2369,8 +2397,8 @@ pub(crate) fn joint_smoothing_correction(
             }
         }
     }
-    for (joint_idx, spec) in layout.joint_specs.iter().enumerate() {
-        let outer = layout.joint_to_outer[joint_idx];
+    for (joint_idx, spec) in joint_specs.iter().enumerate() {
+        let outer = joint_to_outer[joint_idx];
         let lambda = rho_outer[outer].exp();
         if lambda == 0.0 {
             continue;
@@ -2388,6 +2416,62 @@ pub(crate) fn joint_smoothing_correction(
         }
     }
 
+    Ok(u_mat)
+}
+
+/// First-order hyperparameter-uncertainty inflation of an owned-mode fit's
+/// conditional covariance over its full certified outer coordinate
+/// `θ = [ρ | ψ]` (#2677). The implicit function theorem at the converged mode
+/// `∇_β F(β̂(θ), θ) = 0` gives `∂β̂/∂θ_o = −H⁻¹ ∂_{θ_o}∇_β F`, so the score
+/// matrix is `U = [λ_k S_k β̂ | g_j]`: the ρ columns are the smoothing
+/// penalty derivatives (each spec penalty slot is its own outer ρ coordinate,
+/// the owned mode's `rho` being the flattened spec log-λ vector) and the ψ
+/// columns are the evaluation's fixed-β inner-gradient scores
+/// `g_j = ∂_{ψ_j}∇_β F`. The correction `C = (V_cond U) V_θ (V_cond U)ᵀ` is
+/// then minted by [`first_order_smoothing_correction`] from the certified
+/// outer Hessian over the same `θ`, exactly as the ρ-only mint does.
+pub(crate) fn owned_mode_smoothing_correction(
+    v_cond: &Array2<f64>,
+    specs: &[ParameterBlockSpec],
+    rho: &Array1<f64>,
+    block_states: &[ParameterBlockState],
+    psi_scores: &Array2<f64>,
+    outer_hessian: &Array2<f64>,
+    outer_gradient: &Array1<f64>,
+    excluded_outer: &[usize],
+) -> Result<
+    Result<(Array2<f64>, usize), gam_solve::model_types::SmoothingCorrectionAbsence>,
+    CustomFamilyError,
+> {
+    let k_rho = rho.len();
+    let physical_slots: usize = specs.iter().map(|spec| spec.penalties.len()).sum();
+    if physical_slots != k_rho {
+        return Err(CustomFamilyError::trial_point(format!(
+            "owned-mode smoothing correction: {k_rho} rho coordinate(s) for {physical_slots} \
+             penalty slot(s)"
+        )));
+    }
+    let psi_dim = psi_scores.ncols();
+    let rho_slots: Vec<Option<usize>> = (0..k_rho).map(Some).collect();
+    let mut u_mat = penalty_score_columns(
+        specs,
+        block_states,
+        rho,
+        &rho_slots,
+        &[],
+        &[],
+        k_rho + psi_dim,
+    )?;
+    if psi_scores.nrows() != u_mat.nrows() {
+        return Err(CustomFamilyError::trial_point(format!(
+            "owned-mode smoothing correction: psi scores have {} row(s) for {} coefficient(s)",
+            psi_scores.nrows(),
+            u_mat.nrows()
+        )));
+    }
+    u_mat
+        .slice_mut(ndarray::s![.., k_rho..])
+        .assign(psi_scores);
     first_order_smoothing_correction(v_cond, &u_mat, outer_hessian, outer_gradient, excluded_outer)
         .map_err(CustomFamilyError::trial_point)
 }
@@ -2536,6 +2620,91 @@ mod required_covariance_tests {
                 Err(gam_solve::model_types::SmoothingCorrectionAbsence::InteriorRhoHessianRefused { .. })
             ),
             "a curvature below the certificate's bar is the typed interior refusal: {absence:?}"
+        );
+    }
+
+    /// The owned-mode correction spans `θ = [ρ | ψ]` (#2677): with
+    /// `V = [[2, ½], [½, 1]]`, `S = diag(2, 1)`, `β̂ = (1, −1)`, `λ = 3` and
+    /// ψ score `g = (½, 2)`, the columns are `V λ S β̂ = (21/2, 0)` and
+    /// `V g = (2, 9/4)`; `V_θ = diag(¼, ⅛)` gives
+    /// `C = ¼ (21/2, 0)(21/2, 0)ᵀ + ⅛ (2, 9/4)(2, 9/4)ᵀ`. Excluding the ψ
+    /// coordinate (a rail) leaves only the ρ term.
+    #[test]
+    fn owned_mode_smoothing_correction_spans_family_hyperparameters_2677() {
+        let specs = vec![ParameterBlockSpec {
+            name: "owned-mode-theta".to_string(),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 2)),
+            )),
+            offset: Array1::zeros(1),
+            penalties: vec![PenaltyMatrix::Dense(array![[2.0, 0.0], [0.0, 1.0]])],
+            nullspace_dims: vec![0],
+            initial_log_lambdas: array![0.0],
+            initial_beta: None,
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        }];
+        let states = vec![ParameterBlockState {
+            beta: array![1.0, -1.0],
+            eta: array![0.0],
+        }];
+        let v_cond = array![[2.0, 0.5], [0.5, 1.0]];
+        let rho = array![3.0_f64.ln()];
+        let psi_scores = array![[0.5], [2.0]];
+        let outer_hessian = array![[4.0, 0.0], [0.0, 8.0]];
+        let no_gradient = Array1::<f64>::zeros(0);
+
+        let (correction, active_rank) = owned_mode_smoothing_correction(
+            &v_cond,
+            &specs,
+            &rho,
+            &states,
+            &psi_scores,
+            &outer_hessian,
+            &no_gradient,
+            &[],
+        )
+        .expect("well-formed inputs")
+        .expect("a positive-definite outer Hessian mints the correction");
+        assert_eq!(active_rank, 2);
+        let expected = array![[28.0625, 0.5625], [0.5625, 0.6328125]];
+        for (&actual, &want) in correction.iter().zip(expected.iter()) {
+            assert!((actual - want).abs() <= 1.0e-12 * 28.0625, "{correction:?}");
+        }
+
+        let (rho_only, rho_rank) = owned_mode_smoothing_correction(
+            &v_cond,
+            &specs,
+            &rho,
+            &states,
+            &psi_scores,
+            &outer_hessian,
+            &no_gradient,
+            &[1],
+        )
+        .expect("well-formed inputs")
+        .expect("excluding the psi rail leaves the rho correction");
+        assert_eq!(rho_rank, 1);
+        let expected = array![[27.5625, 0.0], [0.0, 0.0]];
+        for (&actual, &want) in rho_only.iter().zip(expected.iter()) {
+            assert!((actual - want).abs() <= 1.0e-12 * 27.5625, "{rho_only:?}");
+        }
+
+        assert!(
+            owned_mode_smoothing_correction(
+                &v_cond,
+                &specs,
+                &rho,
+                &states,
+                &array![[0.5], [2.0], [1.0]],
+                &outer_hessian,
+                &no_gradient,
+                &[],
+            )
+            .is_err(),
+            "psi scores in another coefficient frame are refused"
         );
     }
 

@@ -3213,6 +3213,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             rho: rho.clone(),
             hyper_values: Array1::zeros(0),
             inner: eval_result.inner,
+            psi_scores: None,
         };
         log::trace!(
             "[OUTER-EVAL] order={order:?} request_hessian={request_hessian} cost={objective:.6e} \
@@ -3556,6 +3557,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         rho: mode_rho,
         hyper_values: mode_hyper_values,
         mut inner,
+        psi_scores: _,
     } = mode;
     if !mode_hyper_values.is_empty() {
         return Err(CustomFamilyError::Optimization {
@@ -4116,9 +4118,9 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
     provenance: OwnedModeProvenance<'_>,
     curvature_requirement: OwnedModeCurvatureRequirement,
 ) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
-    let (outer_iterations, outer_gradient_norm, criterion_certificate, certified_theta) =
+    let (outer_iterations, outer_gradient_norm, criterion_certificate, certified_theta, certified_outer) =
         match provenance {
-            OwnedModeProvenance::UserFixed => (0, None, None, None),
+            OwnedModeProvenance::UserFixed => (0, None, None, None, None),
             OwnedModeProvenance::CertifiedOuter {
                 selected_theta,
                 outer,
@@ -4168,6 +4170,7 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
                     outer.final_grad_norm(),
                     Some(outer.criterion_certificate().clone()),
                     Some((outer.rho(), outer.final_value())),
+                    Some(outer),
                 )
             }
         };
@@ -4177,6 +4180,7 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
         rho,
         hyper_values,
         mut inner,
+        psi_scores,
     } = mode;
     if !inner.converged {
         return Err(CustomFamilyError::Optimization {
@@ -4296,6 +4300,80 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
         reported_beta,
         improper_penalty_null_posterior,
     } = posterior;
+    // #2677: first-order hyperparameter-uncertainty correction over the full
+    // certified outer coordinate θ = [ρ | ψ], from the SAME analytic outer
+    // Hessian the certificate judged and the ψ scores the owning evaluation
+    // assembled. A user-fixed mode has no outer uncertainty to propagate.
+    let (smoothing_corrected, smoothing_correction_absence) = match (
+        covariance_conditional.as_ref(),
+        certified_outer,
+    ) {
+        (Some(v_cond), Some(outer)) if !rho.is_empty() || !hyper_values.is_empty() => {
+            let theta_dimension = rho.len() + hyper_values.len();
+            let psi_dimension = hyper_values.len();
+            match (outer.final_hessian(), psi_scores.as_ref()) {
+                (None, _) => (
+                    None,
+                    Some(
+                        gam_solve::model_types::SmoothingCorrectionAbsence::OuterHessianUndeclared {
+                            reason: gam_solve::model_types::OuterHessianAbsence::NotPublished,
+                        },
+                    ),
+                ),
+                (Some(_), None) if psi_dimension > 0 => (
+                    None,
+                    Some(
+                        gam_solve::model_types::SmoothingCorrectionAbsence::FamilyHyperScoresUnrecorded {
+                            psi_dimension,
+                        },
+                    ),
+                ),
+                (Some(outer_hessian), recorded) => {
+                    let no_psi_scores = Array2::<f64>::zeros((v_cond.nrows(), 0));
+                    let scores = recorded.unwrap_or(&no_psi_scores);
+                    if scores.ncols() != psi_dimension {
+                        return Err(CustomFamilyError::DimensionMismatch {
+                            reason: format!(
+                                "owned-mode smoothing correction: {} psi score column(s) for {psi_dimension} family hyperparameter(s)",
+                                scores.ncols()
+                            ),
+                        });
+                    }
+                    let certificate = outer.criterion_certificate();
+                    let mut excluded: Vec<usize> = certificate.lambdas_railed.clone();
+                    for rail in certificate.stationarity.rails() {
+                        if !excluded.contains(&rail.index) {
+                            excluded.push(rail.index);
+                        }
+                    }
+                    let no_gradient = Array1::<f64>::zeros(0);
+                    match crate::covariance::owned_mode_smoothing_correction(
+                        v_cond,
+                        specs,
+                        &rho,
+                        &inner.block_states,
+                        scores,
+                        outer_hessian,
+                        outer.final_gradient().unwrap_or(&no_gradient),
+                        &excluded,
+                    )? {
+                        Ok((correction, active_rank)) => (
+                            Some((
+                                correction,
+                                gam_solve::model_types::SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
+                                    active_rank,
+                                    rho_dimension: theta_dimension,
+                                },
+                            )),
+                            None,
+                        ),
+                        Err(absence) => (None, Some(absence)),
+                    }
+                }
+            }
+        }
+        _ => (None, None),
+    };
     install_reported_posterior_mean(
         family,
         specs,
@@ -4330,8 +4408,8 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
             criterion_certificate,
             outer_converged: true,
             joint_log_lambdas: None,
-            smoothing_corrected: None,
-            smoothing_correction_absence: None,
+            smoothing_corrected,
+            smoothing_correction_absence,
             // These entries take their mode from CustomFamilyJointHyperModeSelection,
             // which does not yet carry the rule it applied (#2661).
             coefficient_mode_selection:
