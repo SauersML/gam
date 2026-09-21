@@ -4319,6 +4319,16 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
         {
             Ok(eval) => eval,
             Err(err) => {
+                // The reason is the whole content of a refused trial: without it
+                // a trust region that halves its radius on silent refusals leaves
+                // a trail of eval starts with no end and names no domain (#3430).
+                log::debug!(
+                    "[STAGE] outer eval end elapsed={:.3}s outcome={} (operator bridge) theta={} reason={}",
+                    stage_start.elapsed().as_secs_f64(),
+                    if err.is_recoverable() { "recoverable" } else { "fatal" },
+                    format_outer_theta(x),
+                    err,
+                );
                 // A refused trial is judged by its step's model decrease once
                 // the trust region reports it, before the next evaluation
                 // (#3018).
