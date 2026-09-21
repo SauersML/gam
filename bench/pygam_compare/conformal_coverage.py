@@ -129,7 +129,8 @@ def _width(dgp: str, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
         top = 1.0 if dgp == "binomial" else np.inf
         lo_i = np.ceil(np.maximum(lo, 0.0))
         hi_i = np.floor(np.minimum(hi, top))
-        return np.maximum(hi_i - lo_i + 1.0, 0.0)
+        # An empty randomized set reports NaN bounds; it holds no response.
+        return np.nan_to_num(np.maximum(hi_i - lo_i + 1.0, 0.0), nan=0.0)
     return hi - lo
 
 
@@ -282,6 +283,15 @@ def render(records: list[dict], reps: int, m_test: int, ns: list[int], dgps: lis
         " a superset). Coverage and the verdict are over the replicates the method"
         " completed; `ok/errors` counts the rest, whose first error is in an HTML"
         " comment on the row.",
+        "",
+        "The binomial and Poisson full-conformal sets are exact for the fitting map"
+        " with the penalty frozen at the training fit. The smoothing parameter of"
+        " `s(x)` was selected on the n training responses and not the test one, so"
+        " that map is not symmetric in the n + 1 points and the route reports every"
+        " such row as `conformal_certificate = -7` (`refused:glm_frozen_penalty`)."
+        " The asymmetry is visible at small n and vanishes by n = 1000. The honest"
+        " ρ-re-selecting map for these families is the conformal-honest-rho"
+        " certificate's to provide; the route consumes it when it exists.",
         "",
         "| DGP | n | method | coverage | MCSE | median width | verdict | ok/errors | median s |",
         "|-----|---|--------|----------|------|--------------|---------|-----------|----------|",

@@ -8,8 +8,8 @@ The route now builds the full-conformal set of the augmented penalized GLM at
 the fitted smoothing parameters (``gam_models::inference::full_conformal_glm``):
 
 * binomial: exact enumeration of ``{0, 1}``;
-* Poisson / negative binomial: enumeration up to a data-derived tail beyond
-  which no count can conform;
+* Poisson / negative binomial: a certified walk in the test-score coordinate
+  up to a data-derived tail beyond which no count can conform;
 * Gamma: a certified walk on the Pearson score ``|y / mu - 1|``.
 
 Discrete ties are randomized with a seed drawn from the data, so the set is
@@ -56,7 +56,7 @@ def _draw(family: str, rng: np.random.Generator, n: int) -> pd.DataFrame:
         y = rng.binomial(1, 1.0 / (1.0 + np.exp(-eta))).astype(float)
     elif family == "poisson":
         y = rng.poisson(np.exp(1.0 + eta)).astype(float)
-    elif family == "negative_binomial":
+    elif family == "negative-binomial":
         mu = np.exp(1.0 + eta)
         y = rng.negative_binomial(3.0, 3.0 / (3.0 + mu)).astype(float)
     elif family == "gamma":
@@ -66,7 +66,7 @@ def _draw(family: str, rng: np.random.Generator, n: int) -> pd.DataFrame:
     return pd.DataFrame({"x": x, "y": y})
 
 
-FAMILIES = ["binomial", "poisson", "negative_binomial", "gamma"]
+FAMILIES = ["binomial", "poisson", "negative-binomial", "gamma"]
 
 
 @pytest.mark.parametrize("family", FAMILIES)
