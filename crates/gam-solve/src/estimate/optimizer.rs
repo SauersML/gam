@@ -4699,9 +4699,7 @@ mod shipped_joint_point_identity_2727_tests {
 
 #[cfg(test)]
 mod negative_binomial_joint_certificate_tests {
-    use super::{
-        negbin_theta_joint_bound, negbin_theta_root_rho_gain, negbin_theta_stationarity_residual,
-    };
+    use super::{negbin_theta_root_rho_gain, negbin_theta_stationarity_residual};
     use crate::penalty_invariance::judged_subspace_basis;
     use crate::pirls::{
         NegbinThetaScore, negbin_theta_score_and_info, negbin_theta_score_eta_gradient,
