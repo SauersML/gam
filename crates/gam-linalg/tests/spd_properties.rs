@@ -161,9 +161,8 @@ proptest! {
         }
         // `MᵀM` sums `n` PSD pieces per entry; the copied row and column
         // carry the first row's entries, whose band is the same.
-        prop_assert!(SymmetricMatrix::Dense(matrix.clone())
-            .factorize(SymmetricAssembly::PsdAccumulation { depth: n })
-            .is_err());
+        let assembly = SymmetricAssembly::PsdAccumulation { depth: n };
+        prop_assert!(SymmetricMatrix::Dense(matrix.clone()).factorize(assembly).is_err());
         let sparse = dense_to_upper_csc(&matrix);
         prop_assert!(factorize_sparse_spd_strict(&sparse).is_err());
     }
@@ -201,9 +200,8 @@ proptest! {
             .factorize(spd_case_assembly(n))
             .is_ok());
         // The symmetric factor `10^(e_i + e_j)` adds one rounding per entry.
-        prop_assert!(SymmetricMatrix::Dense(scaled.clone())
-            .factorize(SymmetricAssembly::PsdAccumulation { depth: n + 2 })
-            .is_ok());
+        let scaled_assembly = SymmetricAssembly::PsdAccumulation { depth: n + 2 };
+        prop_assert!(SymmetricMatrix::Dense(scaled.clone()).factorize(scaled_assembly).is_ok());
         let sparse = dense_to_upper_csc(&scaled);
         prop_assert!(factorize_sparse_spd_strict(&sparse).is_ok());
     }
