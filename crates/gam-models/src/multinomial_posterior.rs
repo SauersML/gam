@@ -517,15 +517,14 @@ fn integrate_binary(
         )));
     }
     let sigma = active_variance.sqrt();
-    let (probability_mean, mean_logistic_slope) =
-        gam_solve::quadrature::logit_posterior_meanwith_deriv(active_mean, sigma)?;
-
-    // sigmoid'(eta) = p(1-p) = p-p^2, hence
-    // E[p^2] = E[p] - d/dmu E[p].  This supplies the binary probability
-    // variance from the same controlled scalar integral without a second
-    // numerical approximation.
-    let probability_second_moment = probability_mean - mean_logistic_slope;
-    let variance = (probability_second_moment - probability_mean * probability_mean).max(0.0);
+    let probability_mean =
+        gam_solve::quadrature::logit_posterior_meanwith_deriv(active_mean, sigma)?.0;
+    // The CENTRED scalar variance (#4124). The raw difference
+    // `E[p²] − E[p]²` cancels to rounding once the variance falls below
+    // `u·E[p]²`; `logit_posterior_variance` brackets that difference by the
+    // chaos expansion of the same integral, so it is non-negative by
+    // construction and keeps its relative accuracy as `σ → 0`.
+    let variance = gam_solve::quadrature::logit_posterior_variance(active_mean, sigma)?;
     let reference_mean = 1.0 - probability_mean;
 
     let class_mean = Array1::from_vec(vec![probability_mean, reference_mean]);
@@ -559,14 +558,18 @@ fn integrate_binary(
 /// ```
 ///
 /// the class probabilities are `p_x=L`, `p_y=q(1-L)`, and
-/// `p_ref=(1-q)(1-L)`.  The controlled scalar logistic-normal evaluator gives
-/// `a=E[L|Y]` and `d=E[L(1-L)|Y]`, so all conditional first and second moments
-/// are algebra:
+/// `p_ref=(1-q)(1-L)`.  Given `Y` the class vector is affine in `L`:
 ///
 /// ```text
-/// E[L²|Y]       = a-d,
-/// E[(1-L)²|Y]   = 1-a-d,
-/// E[L(1-L)|Y]   = d.
+/// p = m(Y) + (L - a)·u(Y),   m = (a, q(1-a), (1-q)(1-a)),   u = (1, -q, -(1-q)),
+/// ```
+///
+/// with `a = E[L|Y]` from the controlled scalar logistic-normal evaluator and
+/// `v = Var(L|Y)` from its CENTRED variance, so the class covariance is the
+/// law of total covariance, never a difference of raw moments (#4124):
+///
+/// ```text
+/// Cov(p) = E_Y[v·u u'] + Cov_Y(m).
 /// ```
 ///
 /// Only the Gaussian expectation over `Y` remains.  This changes the work for
@@ -618,7 +621,7 @@ fn integrate_three_class_conditionally(
         }
 
         let rule = rules.rule(refinement_depth, rule_index)?;
-        let current = integrand.raw_moments(
+        let current = integrand.rule_moments(
             rule,
             &mut total_evaluations,
             control.maximum_function_evaluations,
@@ -629,7 +632,7 @@ fn integrate_three_class_conditionally(
             let mut maximum_difference = 0.0_f64;
             let mut deciding: Option<DecidingMoment> = None;
             for (index, (&new_value, &old_value)) in
-                current.iter().zip(previous_moments.iter()).enumerate()
+                current.raw.iter().zip(previous_moments.iter()).enumerate()
             {
                 let difference = (new_value - old_value).abs();
                 maximum_difference = maximum_difference.max(difference);
@@ -673,7 +676,7 @@ fn integrate_three_class_conditionally(
                 );
             }
         }
-        previous = Some(current);
+        previous = Some(current.raw);
         rule_index = rule_index.checked_mul(2).ok_or_else(|| {
             EstimationError::InvalidInput(
                 "three-class conditional Gauss-Hermite refinement overflowed usize".to_string(),
@@ -796,14 +799,31 @@ impl<'a> ThreeClassConditionalIntegrand<'a> {
         })
     }
 
-    fn raw_moments(
+    /// Raw moments (for certification) and the centred class covariance under
+    /// the one-dimensional outer rule.
+    ///
+    /// The covariance is the law of total covariance `E_Y[v·u u'] + Cov_Y(m)`.
+    /// The within term is a weighted sum of PSD rank-one terms. The between
+    /// term is a corrected two-pass centred sum (Björck, *Numerical Methods for
+    /// Least Squares Problems*, §2.2.3): the node means are centred about the
+    /// rule's own first raw moment `m̄`, and the residual `(Σwδ)(Σwδ)'/W`
+    /// removes the part of `m̄`'s rounding that the centring leaves behind.
+    /// Neither term ever subtracts two raw second moments (#4124).
+    fn rule_moments(
         &self,
         rule: &GaussHermiteRule,
         total_evaluations: &mut usize,
         maximum_function_evaluations: usize,
         absolute_tolerance: f64,
-    ) -> Result<Vec<f64>, EstimationError> {
+    ) -> Result<RuleMoments, EstimationError> {
         let mut accumulator = accumulator_over(packed_moment_count(3)?)?;
+        let mut nodes: Vec<ThreeClassNode> = Vec::new();
+        nodes.try_reserve_exact(rule.nodes.len()).map_err(|error| {
+            EstimationError::InvalidInput(format!(
+                "multinomial conditioned three-class quadrature could not allocate {} node moments: {error}",
+                rule.nodes.len()
+            ))
+        })?;
         for (&standard_normal, &weight) in rule.nodes.iter().zip(rule.weights.iter()) {
             if *total_evaluations >= maximum_function_evaluations {
                 return Err(EstimationError::InvalidInput(format!(
@@ -817,38 +837,36 @@ impl<'a> ThreeClassConditionalIntegrand<'a> {
             let conditioned_mean = self.active_mean[self.conditioned_class]
                 + self.conditional_regression * (outer_eta - outer_mean);
             let scalar_location = conditioned_mean - gam_math::special::softplus(outer_eta);
-            let (selected_mean, selected_slope) =
-                gam_solve::quadrature::logit_posterior_meanwith_deriv(
-                    scalar_location,
-                    self.conditional_standard_deviation,
-                )
-                .map_err(|error| {
-                    EstimationError::InvalidInput(format!(
-                        "conditioned three-class scalar logistic-normal evaluation failed: {error}"
-                    ))
-                })?;
+            let selected_mean = gam_solve::quadrature::logit_posterior_meanwith_deriv(
+                scalar_location,
+                self.conditional_standard_deviation,
+            )
+            .map_err(|error| {
+                EstimationError::InvalidInput(format!(
+                    "conditioned three-class scalar logistic-normal mean failed: {error}"
+                ))
+            })?
+            .0;
+            let selected_variance = gam_solve::quadrature::logit_posterior_variance(
+                scalar_location,
+                self.conditional_standard_deviation,
+            )
+            .map_err(|error| {
+                EstimationError::InvalidInput(format!(
+                    "conditioned three-class scalar logistic-normal variance failed: {error}"
+                ))
+            })?;
             let outer_share = (-gam_math::special::softplus(-outer_eta)).exp();
             let reference_share = 1.0 - outer_share;
-            let selected_second = selected_mean - selected_slope;
-            let remainder_second = 1.0 - selected_mean - selected_slope;
 
             let mut means = [0.0_f64; 3];
             means[self.conditioned_class] = selected_mean;
             means[self.outer_class] = outer_share * (1.0 - selected_mean);
             means[2] = reference_share * (1.0 - selected_mean);
-
-            let mut seconds = [[0.0_f64; 3]; 3];
-            seconds[self.conditioned_class][self.conditioned_class] = selected_second;
-            seconds[self.conditioned_class][self.outer_class] = outer_share * selected_slope;
-            seconds[self.outer_class][self.conditioned_class] =
-                seconds[self.conditioned_class][self.outer_class];
-            seconds[self.conditioned_class][2] = reference_share * selected_slope;
-            seconds[2][self.conditioned_class] = seconds[self.conditioned_class][2];
-            seconds[self.outer_class][self.outer_class] =
-                outer_share * outer_share * remainder_second;
-            seconds[self.outer_class][2] = outer_share * reference_share * remainder_second;
-            seconds[2][self.outer_class] = seconds[self.outer_class][2];
-            seconds[2][2] = reference_share * reference_share * remainder_second;
+            let mut direction = [0.0_f64; 3];
+            direction[self.conditioned_class] = 1.0;
+            direction[self.outer_class] = -outer_share;
+            direction[2] = -reference_share;
 
             accumulator.add_weight(weight);
             for (class, mean) in means.into_iter().enumerate() {
@@ -858,9 +876,20 @@ impl<'a> ThreeClassConditionalIntegrand<'a> {
             for row in 0..3 {
                 for column in row..3 {
                     let packed = second_offset + self.upper_offsets[row] + column - row;
-                    accumulator.add_moment(packed, weight * seconds[row][column]);
+                    accumulator.add_moment(
+                        packed,
+                        weight
+                            * (means[row] * means[column]
+                                + selected_variance * direction[row] * direction[column]),
+                    );
                 }
             }
+            nodes.push(ThreeClassNode {
+                weight,
+                means,
+                direction,
+                variance: selected_variance,
+            });
         }
         let (mut raw_moments, mass, absolute_weight_sum) = accumulator.finish();
         normalize_by_mass(
@@ -874,8 +903,81 @@ impl<'a> ThreeClassConditionalIntegrand<'a> {
                 rule.nodes.len()
             ),
         )?;
-        Ok(raw_moments)
+
+        // Second pass: the centred covariance about the rule's own mean.
+        let rule_mean = [raw_moments[0], raw_moments[1], raw_moments[2]];
+        let mut centred = accumulator_over(packed_moment_count(3)?)?;
+        let mut within_trace = 0.0_f64;
+        let mut between_trace = 0.0_f64;
+        for node in &nodes {
+            let deviation = [
+                node.means[0] - rule_mean[0],
+                node.means[1] - rule_mean[1],
+                node.means[2] - rule_mean[2],
+            ];
+            centred.add_weight(node.weight);
+            for (class, value) in deviation.iter().enumerate() {
+                centred.add_moment(class, node.weight * value);
+            }
+            let second_offset = 3;
+            for row in 0..3 {
+                for column in row..3 {
+                    let packed = second_offset + self.upper_offsets[row] + column - row;
+                    centred.add_moment(
+                        packed,
+                        node.weight * node.variance * node.direction[row] * node.direction[column],
+                    );
+                    centred.add_moment(packed, node.weight * deviation[row] * deviation[column]);
+                }
+            }
+            let direction_energy: f64 = node.direction.iter().map(|value| value * value).sum();
+            let deviation_energy: f64 = deviation.iter().map(|value| value * value).sum();
+            within_trace += node.weight.abs() * node.variance * direction_energy;
+            between_trace += node.weight.abs() * deviation_energy;
+        }
+        let (sums, centred_mass, _) = centred.finish();
+        if !(centred_mass.is_finite() && centred_mass > 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "multinomial conditioned three-class centred pass produced invalid total weight {centred_mass}"
+            )));
+        }
+        let residual = [sums[0], sums[1], sums[2]];
+        let residual_trace =
+            residual.iter().map(|value| value * value).sum::<f64>() / centred_mass;
+        let mut covariance = Array2::<f64>::zeros((3, 3));
+        for row in 0..3 {
+            for column in row..3 {
+                let packed = 3 + self.upper_offsets[row] + column - row;
+                let value =
+                    (sums[packed] - residual[row] * residual[column] / centred_mass) / centred_mass;
+                covariance[[row, column]] = value;
+                covariance[[column, row]] = value;
+            }
+        }
+        // Each summand is formed by at most four roundings (`w·v·u_r·u_c`, or
+        // the two centring subtractions and `w·δ_r·δ_c`); the residual
+        // subtraction and the division by `W` add two more. The entrywise
+        // majorant `Σ|w|(v|u||u|' + |δ||δ|')` is PSD, so its trace bounds the
+        // spectral norm of the rounding (Perron–Frobenius).
+        let covariance_rounding = gam_linalg::roundoff::compensated_band(
+            6,
+            (within_trace + between_trace) / centred_mass + residual_trace,
+        );
+        Ok(RuleMoments {
+            raw: raw_moments,
+            covariance,
+            covariance_rounding,
+        })
     }
+}
+
+/// One outer node of the conditioned three-class rule, kept for the centred
+/// second pass.
+struct ThreeClassNode {
+    weight: f64,
+    means: [f64; 3],
+    direction: [f64; 3],
+    variance: f64,
 }
 
 fn point_mass_moments(active_mean: &[f64]) -> Result<MultinomialPosteriorMoments, EstimationError> {
@@ -1015,7 +1117,7 @@ impl<'a> RowIntegrand<'a> {
         total_evaluations: &mut usize,
         maximum_function_evaluations: usize,
         absolute_tolerance: f64,
-    ) -> Result<Vec<f64>, EstimationError> {
+    ) -> Result<RuleMoments, EstimationError> {
         for &order in orders {
             if !rules.contains_key(&order) {
                 rules.insert(order, gauss_hermite_rule(order)?);
@@ -1037,13 +1139,9 @@ impl<'a> RowIntegrand<'a> {
         sparse_grid::stream_axes(&axes, 0, 1.0, &mut z, &mut |z: &[f64], weight: f64| {
             workspace.accumulate_node(z, weight)
         })?;
-        let (mut raw_moments, mass, absolute_weight_sum) = workspace.accumulator.finish();
         let node_counts: Vec<usize> = orders.iter().map(|order| 2 * order - 1).collect();
         let maximum_rule_nodes = node_counts.iter().copied().max().unwrap_or(0);
-        normalize_by_mass(
-            &mut raw_moments,
-            mass,
-            absolute_weight_sum,
+        workspace.finish(
             // `stream_axes` starts from 1.0, so its first product is exact.
             product_rule_roundings(
                 axes.len().saturating_sub(1),
@@ -1052,8 +1150,7 @@ impl<'a> RowIntegrand<'a> {
             ),
             absolute_tolerance,
             &format!("tensor rule with node counts {node_counts:?}"),
-        )?;
-        Ok(raw_moments)
+        )
     }
 
     /// One-dimensional rule index that resolves direction `direction` on its
@@ -1078,13 +1175,15 @@ impl<'a> RowIntegrand<'a> {
         let mut index = 1usize;
         loop {
             orders[direction] = index;
-            let current = self.tensor_moments(
-                rules,
-                &orders,
-                total_evaluations,
-                control.maximum_function_evaluations,
-                control.absolute_tolerance,
-            )?;
+            let current = self
+                .tensor_moments(
+                    rules,
+                    &orders,
+                    total_evaluations,
+                    control.maximum_function_evaluations,
+                    control.absolute_tolerance,
+                )?
+                .raw;
             if let Some(previous_moments) = previous.as_ref() {
                 let resolved =
                     current
@@ -1289,7 +1388,9 @@ fn integrate_anisotropic_tensor(
         let mut certified = true;
         let mut maximum_difference = 0.0_f64;
         let mut deciding: Option<DecidingMoment> = None;
-        for (index, (&new_value, &old_value)) in fine.iter().zip(coarse.iter()).enumerate() {
+        for (index, (&new_value, &old_value)) in
+            fine.raw.iter().zip(coarse.raw.iter()).enumerate()
+        {
             let difference = (new_value - old_value).abs();
             maximum_difference = maximum_difference.max(difference);
             let tolerance = control.absolute_tolerance
@@ -1398,7 +1499,7 @@ fn integrate_isotropic_sparse(
             rules.push(gauss_hermite_rule(rule_index)?);
         }
 
-        let evaluation = evaluate_smolyak_level(
+        let current = evaluate_smolyak_level(
             active_mean,
             projected,
             &rules,
@@ -1408,7 +1509,6 @@ fn integrate_isotropic_sparse(
             control.maximum_function_evaluations,
             control.absolute_tolerance,
         )?;
-        let current = evaluation.raw_moments;
 
         if let Some(previous_moments) = previous.as_ref() {
             let mut certified = level >= control.minimum_sparse_level;
@@ -1431,7 +1531,7 @@ fn integrate_isotropic_sparse(
             // instead of inviting the next reader to re-derive it.
             let mut deciding: Option<DecidingMoment> = None;
             for (index, (&new_value, &old_value)) in
-                current.iter().zip(previous_moments.iter()).enumerate()
+                current.raw.iter().zip(previous_moments.iter()).enumerate()
             {
                 let difference = (new_value - old_value).abs();
                 maximum_difference = maximum_difference.max(difference);
@@ -1485,7 +1585,7 @@ fn integrate_isotropic_sparse(
                 );
             }
         }
-        previous = Some(current);
+        previous = Some(current.raw);
     }
 
     // Report the level REACHED, not the configured ceiling.
@@ -1530,8 +1630,17 @@ struct DecidingMoment {
     tolerance: f64,
 }
 
-struct SmolyakEvaluation {
-    raw_moments: Vec<f64>,
+/// What one quadrature rule returns: the raw moments its certificate compares
+/// against the next rule, and the class covariance it assembles CENTRED, with
+/// the derived spectral-norm band on that assembly's rounding (#4124).
+///
+/// `raw` packs every `E[p_c]` and then `E[p_r p_c]` for `r <= c`. The
+/// covariance is never recovered from `raw` by subtraction: that difference
+/// cancels to rounding once the covariance falls below `u·E[p]²`.
+struct RuleMoments {
+    raw: Vec<f64>,
+    covariance: Array2<f64>,
+    covariance_rounding: f64,
 }
 
 fn evaluate_smolyak_level(
@@ -1543,7 +1652,7 @@ fn evaluate_smolyak_level(
     total_evaluations: &mut usize,
     maximum_function_evaluations: usize,
     absolute_tolerance: f64,
-) -> Result<SmolyakEvaluation, EstimationError> {
+) -> Result<RuleMoments, EstimationError> {
     let rank = projected.factor.ncols();
     let bounds = sparse_grid::isotropic_smolyak_bounds(rank, level).map_err(|_| {
         EstimationError::InvalidInput(
@@ -1576,7 +1685,6 @@ fn evaluate_smolyak_level(
         SmolyakLevelError::Visit(error) => error,
     })?;
 
-    let (mut raw_moments, mass, absolute_weight_sum) = workspace.accumulator.finish();
     // A composition's indices are at most `level + 1`, so it reads `rules[..=level]`.
     let maximum_rule_nodes = rules
         .iter()
@@ -1584,16 +1692,12 @@ fn evaluate_smolyak_level(
         .map(|rule| rule.nodes.len())
         .max()
         .unwrap_or(0);
-    normalize_by_mass(
-        &mut raw_moments,
-        mass,
-        absolute_weight_sum,
+    workspace.finish(
         // Each weight is the combination coefficient times one weight per direction.
         product_rule_roundings(rank, rank, maximum_rule_nodes),
         absolute_tolerance,
         &format!("Smolyak level {level}"),
-    )?;
-    Ok(SmolyakEvaluation { raw_moments })
+    )
 }
 
 fn packed_moment_count(k: usize) -> Result<usize, EstimationError> {
@@ -1652,13 +1756,47 @@ fn accumulator_over(moment_count: usize) -> Result<QuadratureAccumulator, Estima
     ))
 }
 
+/// Streaming accumulation of one rule's moments as DEVIATIONS from the
+/// plug-in point `p⁰ = softmax(μ)` (#4124).
+///
+/// At a node `η = μ + δ`, `δ = F z`, the class vector is `p = p⁰ + d`. The rule
+/// accumulates `Σ w d` and `Σ w d d'`, so the covariance
+/// `E[dd'] − E[d]E[d]'` subtracts quantities of order `‖δ‖²` and `‖δ‖⁴`
+/// rather than two raw moments of order one, and the raw moments the
+/// certificate compares are reassembled exactly as `p⁰ + E d` and
+/// `p⁰p⁰' + p⁰E[d]' + E[d]p⁰' + E[dd']`.
+///
+/// `d` itself is formed without cancelling `p − p⁰`. With the shifted shares
+/// `q_c = e^{μ_c − M}` (`M = max(0, max μ)`, the reference share `e^{−M}`),
+/// `T = Σ q`, `e_j = expm1(δ_j)`, `A = Σ q_j e_j` and `S = T + A`,
+///
+/// ```text
+/// d_c = q_c (T e_c − A) / (S T),     |rounding| ∝ q_c (T|e_c| + Σ|q_j e_j|) / (S T),
+/// ```
+///
+/// which is exact in form and resolves `d` to relative accuracy as `δ → 0`.
+/// Where it would cancel instead (a large `δ` with `T e_c ≈ A`), the direct
+/// difference `p_c − p⁰_c`, whose rounding scales with `p_c + p⁰_c`, is the
+/// better conditioned of the two; each node takes whichever form has the
+/// smaller rounding scale, so neither is a fallback for the other.
 struct QuadratureWorkspace<'a, 'b> {
     active_mean: &'a [f64],
     projected: &'a ProjectedGaussian,
     upper_offsets: &'a [usize],
+    displacement: Vec<f64>,
     active_eta: Vec<f64>,
     probabilities: Vec<f64>,
+    reference_probabilities: Vec<f64>,
+    /// `e^{μ_c − M}` per active class, then the reference class's `e^{−M}`.
+    reference_shares: Vec<f64>,
+    reference_share_total: f64,
+    expm1s: Vec<f64>,
+    deviation: Vec<f64>,
     accumulator: QuadratureAccumulator,
+    /// `Σ|w|·‖d‖²`: the trace of the PSD entrywise majorant of `Σ w d d'`.
+    deviation_energy: f64,
+    /// `Σ|w|·‖d‖₁`: the absolute sum behind every `Σ w d_c`.
+    deviation_abs_sum: f64,
     total_evaluations: &'b mut usize,
     maximum_function_evaluations: usize,
 }
@@ -1673,13 +1811,33 @@ impl<'a, 'b> QuadratureWorkspace<'a, 'b> {
         maximum_function_evaluations: usize,
     ) -> Result<Self, EstimationError> {
         let m = active_mean.len();
+        let mut reference_probabilities = zeroed_vec(m + 1, "plug-in softmax buffer")?;
+        softmax_with_reference_into(active_mean, &mut reference_probabilities)?;
+        // The same shift and summation order as `softmax_with_reference_into`,
+        // so `p⁰ = q / T` is the plug-in point the direct form subtracts.
+        let shift = active_mean.iter().copied().fold(0.0_f64, f64::max);
+        let mut reference_shares = zeroed_vec(m + 1, "plug-in softmax shares")?;
+        reference_shares[m] = (-shift).exp();
+        let mut reference_share_total = reference_shares[m];
+        for (class, &eta) in active_mean.iter().enumerate() {
+            reference_shares[class] = (eta - shift).exp();
+            reference_share_total += reference_shares[class];
+        }
         Ok(Self {
             active_mean,
             projected,
             upper_offsets,
+            displacement: zeroed_vec(m, "active-logit displacement buffer")?,
             active_eta: zeroed_vec(m, "active-logit quadrature buffer")?,
             probabilities: zeroed_vec(m + 1, "softmax quadrature buffer")?,
+            reference_probabilities,
+            reference_shares,
+            reference_share_total,
+            expm1s: zeroed_vec(m, "displacement expm1 buffer")?,
+            deviation: zeroed_vec(m + 1, "softmax deviation buffer")?,
             accumulator: accumulator_over(moment_count)?,
+            deviation_energy: 0.0,
+            deviation_abs_sum: 0.0,
             total_evaluations,
             maximum_function_evaluations,
         })
@@ -1695,32 +1853,140 @@ impl<'a, 'b> QuadratureWorkspace<'a, 'b> {
         }
         *self.total_evaluations += 1;
 
-        for row in 0..self.active_mean.len() {
-            let mut value = self.active_mean[row];
+        let m = self.active_mean.len();
+        for row in 0..m {
+            let mut value = 0.0_f64;
             for column in 0..z.len() {
                 value += self.projected.factor[[row, column]] * z[column];
             }
-            self.active_eta[row] = value;
+            self.displacement[row] = value;
+            self.active_eta[row] = self.active_mean[row] + value;
         }
         softmax_with_reference_into(&self.active_eta, &mut self.probabilities)?;
 
-        let k = self.probabilities.len();
-        self.accumulator.add_weight(weight);
-        for class in 0..k {
-            self.accumulator
-                .add_moment(class, weight * self.probabilities[class]);
+        let total = self.reference_share_total;
+        let mut share_change = 0.0_f64;
+        let mut share_change_magnitude = 0.0_f64;
+        for class in 0..m {
+            let expm1 = self.displacement[class].exp_m1();
+            self.expm1s[class] = expm1;
+            let change = self.reference_shares[class] * expm1;
+            share_change += change;
+            share_change_magnitude += change.abs();
         }
+        let shifted_total = total + share_change;
+        let expm1_form_defined = share_change.is_finite()
+            && share_change_magnitude.is_finite()
+            && shifted_total.is_finite()
+            && shifted_total > 0.0;
+
+        let k = m + 1;
+        for class in 0..k {
+            let probability = self.probabilities[class];
+            let reference = self.reference_probabilities[class];
+            let direct = probability - reference;
+            let direct_scale = probability + reference;
+            let share = self.reference_shares[class];
+            let expm1 = if class < m { self.expm1s[class] } else { 0.0 };
+            let mut value = direct;
+            if expm1_form_defined && share >= f64::MIN_POSITIVE {
+                let denominator = shifted_total * total;
+                let expm1_scale =
+                    share * (total * expm1.abs() + share_change_magnitude) / denominator;
+                if expm1_scale.is_finite() && expm1_scale <= direct_scale {
+                    value = share * (total * expm1 - share_change) / denominator;
+                }
+            }
+            self.deviation[class] = value;
+        }
+
+        self.accumulator.add_weight(weight);
+        let magnitude = weight.abs();
+        let mut energy = 0.0_f64;
+        let mut abs_sum = 0.0_f64;
+        for class in 0..k {
+            let value = self.deviation[class];
+            self.accumulator.add_moment(class, weight * value);
+            energy += value * value;
+            abs_sum += value.abs();
+        }
+        self.deviation_energy += magnitude * energy;
+        self.deviation_abs_sum += magnitude * abs_sum;
         let second_offset = k;
         for row in 0..k {
             for column in row..k {
                 let packed = second_offset + self.upper_offsets[row] + column - row;
                 self.accumulator.add_moment(
                     packed,
-                    weight * self.probabilities[row] * self.probabilities[column],
+                    weight * self.deviation[row] * self.deviation[column],
                 );
             }
         }
         Ok(())
+    }
+
+    /// Normalize the rule and assemble its raw moments and centred covariance.
+    ///
+    /// Rounding of the covariance, in spectral norm, with `Ê = E_rule`:
+    /// `Ê[dd']` is a compensated sum of terms formed by two products, then
+    /// divided by the mass, so it is within `compensated_band(3, Σ|w|‖d‖²)` —
+    /// the entrywise majorant `Σ|w||d||d|'` is PSD, and its trace bounds its
+    /// spectral norm. Each `Ê[d_c]` is within `Δ_c ≤ compensated_band(2,
+    /// Σ|w||d_c|)` (one product, one division), so the outer product
+    /// `Ê[d]Ê[d]'` is within `2‖Ê d‖·‖Δ‖ + ‖Δ‖² + u‖Ê d‖²` (its own product
+    /// rounding), with `‖Δ‖₂ ≤ Σ_c Δ_c`. The final subtraction rounds once more,
+    /// by at most `u(Σ|w|‖d‖² + ‖Ê d‖²)`.
+    fn finish(
+        self,
+        formation_roundings: usize,
+        absolute_tolerance: f64,
+        context: &str,
+    ) -> Result<RuleMoments, EstimationError> {
+        let k = self.reference_probabilities.len();
+        let (mut sums, mass, absolute_weight_sum) = self.accumulator.finish();
+        normalize_by_mass(
+            &mut sums,
+            mass,
+            absolute_weight_sum,
+            formation_roundings,
+            absolute_tolerance,
+            context,
+        )?;
+        let energy = self.deviation_energy / mass;
+        let first_abs = self.deviation_abs_sum / mass;
+        let reference = &self.reference_probabilities;
+        let mut raw = zeroed_vec(sums.len(), "raw moments")?;
+        let mut covariance = Array2::<f64>::zeros((k, k));
+        for class in 0..k {
+            raw[class] = reference[class] + sums[class];
+        }
+        let second_offset = k;
+        for row in 0..k {
+            for column in row..k {
+                let packed = second_offset + self.upper_offsets[row] + column - row;
+                let second = sums[packed];
+                let (row_shift, column_shift) = (sums[row], sums[column]);
+                raw[packed] = reference[row] * reference[column]
+                    + reference[row] * column_shift
+                    + reference[column] * row_shift
+                    + second;
+                let value = second - row_shift * column_shift;
+                covariance[[row, column]] = value;
+                covariance[[column, row]] = value;
+            }
+        }
+        let mean_shift_norm = sums[..k].iter().map(|value| value * value).sum::<f64>().sqrt();
+        let mean_shift_band = gam_linalg::roundoff::compensated_band(2, first_abs);
+        let covariance_rounding = gam_linalg::roundoff::compensated_band(3, energy)
+            + 2.0 * mean_shift_norm * mean_shift_band
+            + mean_shift_band * mean_shift_band
+            + gam_linalg::roundoff::UNIT_ROUNDOFF
+                * (energy + 2.0 * mean_shift_norm * mean_shift_norm);
+        Ok(RuleMoments {
+            raw,
+            covariance,
+            covariance_rounding,
+        })
     }
 }
 
@@ -1807,7 +2073,7 @@ fn softmax_with_reference_into(
 }
 
 fn moments_from_raw(
-    raw_moments: Vec<f64>,
+    rule_moments: RuleMoments,
     k: usize,
     latent_rank: usize,
     rule: MultinomialPosteriorRule,
@@ -1815,11 +2081,10 @@ fn moments_from_raw(
     max_level_difference: f64,
     projection_bound: f64,
 ) -> Result<MultinomialPosteriorMoments, EstimationError> {
-    let upper_offsets = upper_triangle_offsets(k)?;
     let raw_error = max_level_difference + projection_bound;
     let covariance_error = 3.0 * raw_error + raw_error * raw_error;
 
-    let mut means = raw_moments[..k].to_vec();
+    let mut means = rule_moments.raw[..k].to_vec();
     for (class, mean) in means.iter_mut().enumerate() {
         if *mean < -raw_error || *mean > 1.0 + raw_error || !mean.is_finite() {
             return Err(EstimationError::InvalidInput(format!(
@@ -1844,18 +2109,14 @@ fn moments_from_raw(
         *mean /= mean_sum;
     }
 
-    let second_offset = k;
-    let mut covariance = Array2::<f64>::zeros((k, k));
-    for row in 0..k {
-        for column in row..k {
-            let packed = second_offset + upper_offsets[row] + column - row;
-            let value = raw_moments[packed] - means[row] * means[column];
-            covariance[[row, column]] = value;
-            covariance[[column, row]] = value;
-        }
-    }
+    // The rule assembled the covariance centred (#4124); it is never
+    // recovered here as `E[pp'] − E[p]E[p]'`, which cancels to rounding once
+    // the covariance falls below `u·E[p]²`.
+    let mut covariance = rule_moments.covariance;
+    let assembly_band =
+        rule_moments.covariance_rounding + simplex_projection_rounding_band(&covariance);
     covariance = project_covariance_to_simplex_tangent(&covariance);
-    covariance = remove_covariance_roundoff(covariance, covariance_error)?;
+    covariance = remove_covariance_roundoff(covariance, covariance_error, assembly_band)?;
     covariance = project_covariance_to_simplex_tangent(&covariance);
 
     let mut standard_deviation = Array1::<f64>::zeros(k);
@@ -1896,9 +2157,37 @@ fn project_covariance_to_simplex_tangent(covariance: &Array2<f64>) -> Array2<f64
     })
 }
 
+/// Spectral-norm bound on the rounding of [`project_covariance_to_simplex_tangent`]
+/// applied to `covariance`.
+///
+/// With `c = max|C_ij|`: each row or column mean is a sum of `k` entries
+/// times a rounded `1/k`, within `γ_{k+1}·c`, and the grand mean of the row
+/// means within `2γ_{k+1}·c`; each output entry then adds four terms of
+/// magnitude at most `c` with three roundings, `γ_3·4c`. So every entry is
+/// within `4(γ_3 + γ_{k+1})·c`, and a `k×k` matrix whose entries are bounded
+/// by `b` has spectral norm at most `k·b`.
+fn simplex_projection_rounding_band(covariance: &Array2<f64>) -> f64 {
+    let k = covariance.nrows();
+    let largest_entry = covariance
+        .iter()
+        .fold(0.0_f64, |maximum, &value| maximum.max(value.abs()));
+    let entry_band = 4.0
+        * (gam_linalg::roundoff::accumulation_growth(3)
+            + gam_linalg::roundoff::accumulation_growth(k + 1))
+        * largest_entry;
+    k as f64 * entry_band
+}
+
+/// Clip the probability covariance's negative spectrum, after checking that no
+/// eigenvalue is negative by more than the error the integral can carry.
+///
+/// That error is the certified integration error, the caller's derived
+/// `assembly_band` on how the covariance was formed, and the eigensolver's own
+/// backward error, [`gam_linalg::roundoff::symmetric_spectrum_rounding_band`].
 fn remove_covariance_roundoff(
     covariance: Array2<f64>,
     integration_error: f64,
+    assembly_band: f64,
 ) -> Result<Array2<f64>, EstimationError> {
     let symmetric = (&covariance + &covariance.t().to_owned()) * 0.5;
     let (eigenvalues, eigenvectors) = symmetric.eigh(faer::Side::Lower).map_err(|error| {
@@ -1906,11 +2195,9 @@ fn remove_covariance_roundoff(
             "multinomial probability covariance eigendecomposition failed: {error}"
         ))
     })?;
-    let scale = eigenvalues
-        .iter()
-        .fold(0.0_f64, |maximum, &value| maximum.max(value.abs()));
-    let allowed_negative =
-        integration_error + covariance_roundoff_tolerance(scale, covariance.nrows());
+    let allowed_negative = integration_error
+        + assembly_band
+        + gam_linalg::roundoff::symmetric_spectrum_rounding_band(&eigenvalues.to_vec());
     let minimum = eigenvalues
         .iter()
         .fold(f64::INFINITY, |value, &candidate| value.min(candidate));
@@ -2045,7 +2332,18 @@ mod tests {
         .expect("binary posterior moments");
         let (expected_mean, expected_slope) =
             gam_solve::quadrature::logit_posterior_meanwith_deriv(1.1, 0.8).unwrap();
-        let expected_variance = expected_mean - expected_slope - expected_mean * expected_mean;
+        // The kernel returns the centred scalar variance (#4124). At sigma=0.8
+        // the variance is O(0.1), so the raw identity m - m' - m^2 loses no
+        // significant digits and must agree with it to rounding.
+        let expected_variance =
+            gam_solve::quadrature::logit_posterior_variance(1.1, 0.8).unwrap();
+        let identity_variance = expected_mean - expected_slope - expected_mean * expected_mean;
+        assert_close(
+            identity_variance,
+            expected_variance,
+            2.0e-14,
+            "centred variance matches the raw identity at moderate width",
+        );
 
         assert_close(result.class_mean[0], expected_mean, 2.0e-14, "binary mean");
         assert_close(
@@ -2068,6 +2366,120 @@ mod tests {
         );
         assert_eq!(result.latent_rank, 1);
         assert_eq!(result.rule, MultinomialPosteriorRule::Exact);
+    }
+
+    /// #4124: at posterior width `s = 1e-7` the binary variance is
+    /// `σ'(0)²·s² = s²/16 ≈ 6.25e-16`, only ~20× the `u·E[p]² ≈ 2.8e-17`
+    /// rounding of the raw `E[p²] − E[p]²` (and the old `m − m' − m²` identity
+    /// carried `~u/2` absolute error, ~10% relative). The centred kernel keeps it
+    /// to relative accuracy; the next term of the expansion is `O(s²)` relative.
+    #[test]
+    fn binary_variance_is_centred_at_small_posterior_width_4124() {
+        let active_variance = 1.0e-14;
+        let active_mean = Array1::from_vec(vec![0.0]);
+        let active_covariance = Array2::from_shape_vec((1, 1), vec![active_variance]).unwrap();
+        let result = integrate_logistic_normal_softmax_moments(
+            active_mean.view(),
+            active_covariance.view(),
+            &control(1.0e-10),
+        )
+        .expect("binary posterior moments at small width");
+        let expected = active_variance / 16.0;
+        let variance = result.class_covariance[[0, 0]];
+        assert!(
+            ((variance - expected) / expected).abs() <= 1.0e-10,
+            "binary variance {variance:.17e} vs delta-method {expected:.17e}"
+        );
+        assert_eq!(result.class_covariance[[0, 1]], -variance);
+        assert_eq!(result.class_covariance[[1, 1]], variance);
+    }
+
+    /// Delta-method class covariance `J V Jᵀ` of the reference-coded softmax,
+    /// `J[c, j] = p_c (δ_cj − p_j)` at `p = softmax(μ, 0)`.
+    fn delta_method_class_covariance(
+        active_mean: &Array1<f64>,
+        active_covariance: &Array2<f64>,
+    ) -> Array2<f64> {
+        let m = active_mean.len();
+        let k = m + 1;
+        let top = active_mean.iter().fold(0.0_f64, |acc, &value| acc.max(value));
+        let mut probabilities: Vec<f64> = active_mean
+            .iter()
+            .map(|&value| (value - top).exp())
+            .collect();
+        probabilities.push((-top).exp());
+        let total: f64 = probabilities.iter().sum();
+        for value in &mut probabilities {
+            *value /= total;
+        }
+        let mut jacobian = Array2::<f64>::zeros((k, m));
+        for c in 0..k {
+            for j in 0..m {
+                let indicator = if c == j { 1.0 } else { 0.0 };
+                jacobian[[c, j]] = probabilities[c] * (indicator - probabilities[j]);
+            }
+        }
+        jacobian.dot(active_covariance).dot(&jacobian.t())
+    }
+
+    /// #4124: with active-logit covariance `O(1e-16)` the class covariance is
+    /// `O(1e-18)` — below the `~u·E[p]² ≈ 1e-17` rounding of the raw
+    /// `E[pp'] − E[p]E[p]'`, which
+    /// is what the old `16·ε·k` envelope then clamped. The centred assembly (law
+    /// of total covariance for K = 3, softmax deviations for the general rule)
+    /// must reproduce the delta method `J V Jᵀ`, whose own truncation is
+    /// relative `O(‖V‖) ≈ 1e-16`, to the `~1e-8` relative accuracy of the
+    /// `O(√‖V‖)` node deviations.
+    #[test]
+    fn narrow_posterior_class_covariance_matches_delta_method_4124() {
+        let cases = [
+            (
+                Array1::from_vec(vec![0.4, -0.3]),
+                Array2::from_shape_vec((2, 2), vec![1.0e-16, 3.0e-17, 3.0e-17, 2.0e-16]).unwrap(),
+            ),
+            (
+                Array1::from_vec(vec![0.4, -0.3, 0.9]),
+                Array2::from_shape_vec(
+                    (3, 3),
+                    vec![
+                        1.0e-16, 3.0e-17, -2.0e-17, 3.0e-17, 2.0e-16, 1.0e-17, -2.0e-17, 1.0e-17,
+                        1.5e-16,
+                    ],
+                )
+                .unwrap(),
+            ),
+        ];
+        for (active_mean, active_covariance) in cases {
+            let k = active_mean.len() + 1;
+            let result = integrate_logistic_normal_softmax_moments(
+                active_mean.view(),
+                active_covariance.view(),
+                &control(1.0e-10),
+            )
+            .expect("narrow posterior moments");
+            let expected = delta_method_class_covariance(&active_mean, &active_covariance);
+            let scale = expected
+                .iter()
+                .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+            assert!(scale > 0.0);
+            for row in 0..k {
+                assert!(
+                    result.class_covariance[[row, row]] > 0.0,
+                    "K={k}: class variance {row} must be positive, got {:.6e}",
+                    result.class_covariance[[row, row]]
+                );
+                for column in 0..k {
+                    let error =
+                        (result.class_covariance[[row, column]] - expected[[row, column]]).abs();
+                    assert!(
+                        error <= 1.0e-6 * scale,
+                        "K={k}: covariance[{row},{column}]={:.6e} vs delta method {:.6e} (scale {scale:.3e})",
+                        result.class_covariance[[row, column]],
+                        expected[[row, column]]
+                    );
+                }
+            }
+        }
     }
 
     #[test]
