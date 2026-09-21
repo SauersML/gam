@@ -686,15 +686,27 @@ impl BernoulliMarginalSlopeFamily {
             return Ok([[[[[0.0; 2]; 2]; 2]; 2]; 2]);
         }
         // The probit marginal map is the identity `q = η` by construction
-        // (`bernoulli_marginal_link_map`), so the table's `q` axis is the
-        // marginal primary itself.
-        debug_assert!(
-            marginal.q == marginal.eta
-                && marginal.q1 == 1.0
-                && marginal.q2 == 0.0
-                && marginal.q3 == 0.0
-                && marginal.q4 == 0.0
-        );
+        // (`bernoulli_marginal_link_map`, the one producer of this type, which
+        // writes `q = η`, `q1 = 1` and `q2..q4 = 0` literally), so the table's
+        // `q` axis is the marginal primary itself. Every fifth partial below is
+        // read off the anchor's table in that axis, so a map that is not the
+        // identity would return a wrong derivative rather than a wrong-looking
+        // one. The invariant is therefore refused in every build: a
+        // release-inert check would let exactly the state it names through the
+        // one build that ships.
+        if !(marginal.q == marginal.eta
+            && marginal.q1 == 1.0
+            && marginal.q2 == 0.0
+            && marginal.q3 == 0.0
+            && marginal.q4 == 0.0)
+        {
+            return Err(format!(
+                "empirical fifth derivative at row {row}: the probit marginal map must be the \
+                 identity `q = η` with unit first jet and zero higher jets \
+                 (`bernoulli_marginal_link_map`), got q={}, η={}, q1={}, q2={}, q3={}, q4={}",
+                marginal.q, marginal.eta, marginal.q1, marginal.q2, marginal.q3, marginal.q4
+            ));
+        }
         let (a, taylor) = self.empirical_rigid_intercept_jet::<gam_math::jet_tower::Tower4<2>>(
             row,
             marginal,

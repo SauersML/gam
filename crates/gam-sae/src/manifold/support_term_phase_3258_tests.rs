@@ -334,7 +334,13 @@ fn noisy_ring_weak_direction_is_the_periodic_phase_3258() {
 /// or names the unresolved phases, and withholding the phase orbits refuses at the same
 /// state. Where the prior is strong the phase is resolved directly and nothing is profiled.
 /// Each prior strength is its own test so one state's outcome never masks another's.
-fn phase_pin_3258(log_lambda: f64, alpha: f64, weak: bool) {
+///
+/// The helper is not itself a `#[test]`, so a state it cannot read is returned as the
+/// refusal that names it and the calling test turns that into the failure. What the pin
+/// asserts about a state it CAN read stays an `assert!` here, each carrying `diagnostic`,
+/// which is built unconditionally at the state it describes so no assertion's message
+/// depends on which assertion fires.
+fn phase_pin_3258(log_lambda: f64, alpha: f64, weak: bool) -> Result<(), String> {
     let (seed, target) = noisy_ring_seed_3258();
     let k = seed.k_atoms();
     {
@@ -344,9 +350,9 @@ fn phase_pin_3258(log_lambda: f64, alpha: f64, weak: bool) {
         let tolerance = term.fixed_point_tolerance();
         let report = term
             .solve_fixed_point(target.view(), &lambda, &ard, tolerance, 1.0)
-            .unwrap_or_else(|error| {
-                panic!("log λ = {log_lambda}, α = {alpha:e}: the fixed point certifies: {error}")
-            });
+            .map_err(|error| {
+                format!("log λ = {log_lambda}, α = {alpha:e}: the fixed point certifies: {error}")
+            })?;
         assert!(report.recurred, "log λ = {log_lambda}, α = {alpha:e}: {report:?}");
         let parameter_scale = term.parameter_iterate_scale().expect("parameter scale");
         let bound = tolerance * parameter_scale;
@@ -382,7 +388,10 @@ fn phase_pin_3258(log_lambda: f64, alpha: f64, weak: bool) {
                 &[],
             )
             .expect("certificate without the phase orbits");
-        println!(
+        // The state this pin was read at, formatted once, before any assertion and
+        // independently of all of them. Every assertion below carries it, so the failing
+        // one reports the whole state rather than the one field it happened to test.
+        let diagnostic = format!(
             "[#3258 pin] log λ = {log_lambda}, α = {alpha:e}: {} phase orbits, unresolved \
              {:?}, verdict {verdict:?}; without the orbits {withheld:?}",
             phase_orbits.len(),
@@ -391,20 +400,23 @@ fn phase_pin_3258(log_lambda: f64, alpha: f64, weak: bool) {
         if weak {
             match &verdict {
                 SupportKantorovichVerdict::Certified { profiled_phases, .. } => {
-                    assert!(*profiled_phases > 0, "α = {alpha:e}: {verdict:?}");
-                    assert!(report.phase_unresolved_atoms.is_empty());
+                    assert!(*profiled_phases > 0, "{diagnostic}");
+                    assert!(report.phase_unresolved_atoms.is_empty(), "{diagnostic}");
                 }
                 SupportKantorovichVerdict::PhaseUnresolved { phase_atoms, .. } => {
-                    assert!(!phase_atoms.is_empty());
-                    assert_eq!(&report.phase_unresolved_atoms, phase_atoms);
+                    assert!(!phase_atoms.is_empty(), "{diagnostic}");
+                    assert_eq!(&report.phase_unresolved_atoms, phase_atoms, "{diagnostic}");
                 }
                 SupportKantorovichVerdict::NotCertified(reason) => {
-                    panic!("α = {alpha:e}: the phase-profiled certificate refused: {reason}")
+                    return Err(format!(
+                        "α = {alpha:e}: the phase-profiled certificate refused: {reason}; \
+                         {diagnostic}"
+                    ));
                 }
             }
             assert!(
                 matches!(withheld, SupportKantorovichVerdict::NotCertified(_)),
-                "α = {alpha:e}: the weak phase must defeat the direct certificate: {withheld:?}"
+                "α = {alpha:e}: the weak phase must defeat the direct certificate; {diagnostic}"
             );
         } else {
             assert!(
@@ -412,24 +424,25 @@ fn phase_pin_3258(log_lambda: f64, alpha: f64, weak: bool) {
                     verdict,
                     SupportKantorovichVerdict::Certified { profiled_phases: 0, .. }
                 ),
-                "α = {alpha:e}: a strong prior resolves the phase directly: {verdict:?}"
+                "α = {alpha:e}: a strong prior resolves the phase directly; {diagnostic}"
             );
-            assert!(report.phase_unresolved_atoms.is_empty());
+            assert!(report.phase_unresolved_atoms.is_empty(), "{diagnostic}");
         }
     }
+    Ok(())
 }
 
 #[test]
 fn phase_pin_3258_strong_prior() {
-    phase_pin_3258(0.0, 1.0, false);
+    phase_pin_3258(0.0, 1.0, false).expect("#3258 pin at log λ = 0, α = 1");
 }
 
 #[test]
 fn phase_pin_3258_alpha_1e3() {
-    phase_pin_3258(2.0, 1.0e-3, true);
+    phase_pin_3258(2.0, 1.0e-3, true).expect("#3258 pin at log λ = 2, α = 1e-3");
 }
 
 #[test]
 fn phase_pin_3258_alpha_1e4() {
-    phase_pin_3258(4.0, 1.0e-4, true);
+    phase_pin_3258(4.0, 1.0e-4, true).expect("#3258 pin at log λ = 4, α = 1e-4");
 }
