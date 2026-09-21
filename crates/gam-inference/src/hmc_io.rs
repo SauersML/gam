@@ -29,6 +29,7 @@ use gam_linalg::faer_ndarray::{
     FaerCholesky, fast_ab, fast_ata_into, fast_atv, fast_av_into,
 };
 use gam_linalg::matrix::DesignMatrix;
+use gam_linalg::roundoff::SymmetricAssembly;
 use gam_linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use gam_problem::types::{
     GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec,
@@ -408,8 +409,11 @@ struct WhiteningTransform {
     chol_t: Array2<f64>,
 }
 
+/// `assembly` is how `hessian` was assembled; it fixes the symmetry band the
+/// SPD certification enforces.
 fn hessian_whitening_transform(
     hessian: ArrayView2<f64>,
+    assembly: SymmetricAssembly,
     dim: usize,
     cov_scale: f64,
     cholesky_error_prefix: &str,
@@ -420,7 +424,7 @@ fn hessian_whitening_transform(
         ));
     }
     let hessian_owned = hessian.to_owned();
-    gam_linalg::utils::certified_spd_factorize(&hessian_owned, cholesky_error_prefix)
+    gam_linalg::utils::certified_spd_factorize(&hessian_owned, assembly, cholesky_error_prefix)
         .map_err(|error| error.to_string())?;
     let chol_factor = hessian_owned
         .cholesky(Side::Lower)
@@ -779,8 +783,11 @@ impl NutsPosterior {
         // the stored `H`, so `cov_scale == 1` and this is a no-op. This replaces
         // a previous `sqrt_phi()` multiply that wrongly scaled Gamma (and any
         // φ-bearing family) by `√φ`, mis-preconditioning against `φ·H⁻¹`.
+        // The fitted penalized Hessian `XᵀWX + S` over `n_samples` rows; its
+        // producer is not known here to mirror.
         let whitening = hessian_whitening_transform(
             hessian,
+            SymmetricAssembly::penalized_gram(n_samples, dim),
             dim,
             cov_scale,
             "Hessian Cholesky decomposition failed",
@@ -1140,17 +1147,26 @@ mod tests {
         assert_eq!(cfg.dense_max_dim, 0, "no dense-metric cap under diagonal adaptation");
     }
 
-    use super::{FamilyNutsInputs, GlmFlatInputs, NUTS_CHAINS, NutsConfig, NutsPosterior, NutsResult, SharedData, exact_glm_logp_and_grad_into, firth_jeffreys_logp_and_grad, laplace_directional_cubic_diagnostic_on_eigenpairs, laplace_skewness_threshold, laplace_trustworthiness_from_skewness, run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family};
+    use super::{
+        FamilyNutsInputs, GlmFlatInputs, NUTS_CHAINS, NutsConfig, NutsPosterior, NutsResult,
+        SharedData, exact_glm_logp_and_grad_into, firth_jeffreys_logp_and_grad,
+        laplace_directional_cubic_diagnostic_on_eigenpairs, laplace_skewness_threshold,
+        laplace_trustworthiness_from_skewness, run_logit_polya_gamma_gibbs,
+        run_nuts_sampling_flattened_family,
+    };
+    use crate::sample::PosteriorSampler;
     use gam_linalg::matrix::DesignMatrix;
     use gam_models::survival::{PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
-    use gam_problem::types::{GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LogLikelihoodNormalization, ResponseFamily, StandardLink};
+    use gam_problem::types::{
+        GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec,
+        LogLikelihoodNormalization, ResponseFamily, StandardLink,
+    };
     use gam_solve::estimate::{
         BlockRole, FitGeometry, FitInference, FittedBlock, FittedLinkState, UnifiedFitResult,
         UnifiedFitResultParts,
     };
-    use general_mcmc::generic_hmc::HamiltonianTarget;
-    use crate::sample::PosteriorSampler;
     use gam_solve::model_types::InferenceCovarianceMode;
+    use general_mcmc::generic_hmc::HamiltonianTarget;
     use ndarray::{Array1, Array2, Axis, array};
     use std::sync::Arc;
 
@@ -5724,8 +5740,16 @@ fn run_conjugate_gaussian_sampling(
     precision.scaled_add(1.0 / cov_scale, &penalty_matrix);
     let rhs = fast_atv(&weighted_x, &response).mapv(|value| value / phi);
 
+    // `fast_ab` is a full GEMM over the `n` weighted rows (depth `n + 1`), the
+    // division by `φ` one more rounding, and the declared penalty is mirrored.
+    let precision_assembly = SymmetricAssembly::PsdAccumulation {
+        depth: n.saturating_add(1),
+    }
+    .scaled()
+    .psd_sum(SymmetricAssembly::Mirrored);
     let whitening = hessian_whitening_transform(
         precision.view(),
+        precision_assembly,
         dim,
         1.0,
         "conjugate Gaussian posterior precision Cholesky failed",
@@ -5886,8 +5910,13 @@ where
     }
 
     let mode = rho_hat.to_owned();
+    // The outer ρ-Hessian is symmetric only up to its assembly; the metric is
+    // its symmetric part, which is all the whitening quadratic form reads.
+    let mut outer_metric = outer_hessian.to_owned();
+    gam_linalg::matrix::symmetrize_in_place(&mut outer_metric);
     let whitening = hessian_whitening_transform(
-        outer_hessian,
+        outer_metric.view(),
+        SymmetricAssembly::Mirrored,
         dim,
         1.0,
         "rho-posterior NUTS: outer-Hessian Cholesky failed",
@@ -8282,8 +8311,11 @@ mod survival_hmc {
             let sampler_mode = mode.to_owned();
             let dim = sampler_mode.len();
 
+            // The fitted survival Hessian: entry, exit and derivative rows per
+            // observation, plus the penalty; its producer is not known to mirror.
             let whitening = hessian_whitening_transform(
                 hessian,
+                SymmetricAssembly::penalized_gram(n.saturating_mul(3), dim),
                 dim,
                 1.0,
                 "Hessian Cholesky decomposition failed",

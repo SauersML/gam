@@ -25,6 +25,7 @@
 use super::cohort::EventHistoryError;
 use faer::Side;
 use gam_linalg::faer_ndarray::strict_symmetric_eigh;
+use gam_linalg::roundoff::SymmetricAssembly;
 use gam_math::probability::erfcx_nonnegative;
 use gam_solve::exact_jet_objective::certified_newton_minimum;
 use ndarray::{Array1, Array2};
@@ -49,19 +50,22 @@ pub fn temporal_covariance(
 }
 
 /// Eigenvalues (descending) and matching unit eigenvectors (columns) of a
-/// symmetric matrix.
+/// symmetric matrix assembled as `assembly`, which fixes the symmetry band the
+/// strict decomposition enforces.
 pub(crate) fn eigenmodes(
     matrix: &Array2<f64>,
+    assembly: SymmetricAssembly,
 ) -> Result<(Array1<f64>, Array2<f64>), EventHistoryError> {
     let n = matrix.nrows();
     if n == 0 {
         return Ok((Array1::zeros(0), Array2::zeros((0, 0))));
     }
-    let (values, vectors) = strict_symmetric_eigh(matrix, Side::Lower).map_err(|error| {
-        EventHistoryError::NumericalFailure {
-            reason: format!("eigendecomposition of a {n} × {n} covariance failed: {error}"),
-        }
-    })?;
+    let (values, vectors) =
+        strict_symmetric_eigh(matrix, assembly, Side::Lower).map_err(|error| {
+            EventHistoryError::NumericalFailure {
+                reason: format!("eigendecomposition of a {n} × {n} covariance failed: {error}"),
+            }
+        })?;
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| values[b].total_cmp(&values[a]));
     let sorted_values = Array1::from_iter(order.iter().map(|&i| values[i]));
@@ -900,7 +904,8 @@ pub(crate) fn best_new_atom(
 ) -> Result<Option<NewAtom>, EventHistoryError> {
     let evaluate = |rho: f64| -> Result<GainPoint, EventHistoryError> {
         let [m0, m1, _] = covariance_score(subjects, marks, rho, time_scale);
-        let (values, vectors) = eigenmodes(&m0)?;
+        // `covariance_score` returns `(M + Mᵀ)/2`.
+        let (values, vectors) = eigenmodes(&m0, SymmetricAssembly::Mirrored)?;
         let top = values[0];
         let v: Vec<f64> = vectors.column(0).to_vec();
         let vv = Array1::from(v.clone());

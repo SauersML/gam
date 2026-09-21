@@ -416,8 +416,12 @@ fn validate_constraint_geometry(
             draw -= &gauge.affine_shift;
         }
         let gram = gauge.t_full.t().dot(&gauge.t_full);
+        // A GEMM Gram: each entry accumulates `t_full.nrows()` products.
         let factor = gam_linalg::utils::certified_spd_factorize(
             &gram,
+            gam_linalg::roundoff::SymmetricAssembly::PsdAccumulation {
+                depth: gauge.t_full.nrows(),
+            },
             "posterior prediction coefficient-gauge inverse",
         )
         .map_err(|error| inconsistent_state_error(model_class, error.to_string()))?;

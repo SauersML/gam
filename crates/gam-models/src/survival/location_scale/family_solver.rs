@@ -46,7 +46,17 @@ pub(crate) fn aft_absolute_newton_direction(
     use gam_linalg::roundoff::{accumulation_band, accumulation_growth};
 
     let p = g.len();
-    let (eigenvalues, eigenvectors) = strict_symmetric_eigh(h, faer::Side::Lower).map_err(
+    // The row kernel's `symmetric!` writes each off-diagonal pair from ONE
+    // rounded channel value into both triangles, so `h` is bitwise symmetric.
+    // It is also deliberately allowed to be indefinite — this routine exists
+    // to take an absolute-value Newton step at a saddle — so a PSD-accumulation
+    // declaration, which refuses a negative diagonal, would be wrong here.
+    let (eigenvalues, eigenvectors) = strict_symmetric_eigh(
+        h,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        faer::Side::Lower,
+    )
+    .map_err(
         |error| SurvivalLocationScaleError::NumericalFailure {
             reason: format!(
                 "direct parametric-AFT MLE: joint Hessian eigendecomposition failed: {error}"

@@ -2544,8 +2544,10 @@ pub(crate) fn preconditioned_normal_pseudoinverse(
             m_scaled[[i, j]] *= scale[i] * scale[j];
         }
     }
+    // Symmetrized, then scaled by the commutative `scale[i]·scale[j]`: mirrored.
     let mut pinv = gam_linalg::utils::rank_certified_psd_pseudoinverse(
         &m_scaled,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
         jacobi_scaled_normal_relative_cutoff(rows, p),
     )
     .map_err(|e| format!("stacked first-stage sandwich pseudo-inverse failed: {e}"))?
@@ -2899,8 +2901,13 @@ pub(crate) fn robust_score_contributions_pvalue(
         * omega.diag().sum()
         / omega_max_diagonal
         + r as f64 * f64::EPSILON;
-    let omega_geometry = gam_linalg::utils::rank_certified_psd_pseudoinverse(&omega, relative_cutoff)
-        .map_err(|e| format!("conditional score test pseudo-inverse failed: {e}"))?;
+    // `fast_ata` accumulates one triangle and mirrors it.
+    let omega_geometry = gam_linalg::utils::rank_certified_psd_pseudoinverse(
+        &omega,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        relative_cutoff,
+    )
+    .map_err(|e| format!("conditional score test pseudo-inverse failed: {e}"))?;
     let rank = omega_geometry.rank();
     let omega_pinv = omega_geometry.into_pseudoinverse();
     if rank == 0 {
@@ -4059,8 +4066,6 @@ pub(super) const BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS: usize = 
 pub(crate) mod block_specs;
 pub mod conditional_score_covariance;
 pub(crate) mod estimated_latent_law;
-pub(crate) mod local_law_resolution;
-pub(crate) mod moving_law_rule;
 pub(crate) mod exact_eval_cache;
 mod expected_information;
 pub(crate) mod family;
@@ -4070,6 +4075,8 @@ pub(crate) mod hessian_paths;
 mod information_third;
 pub(crate) mod install_flex;
 pub(crate) mod pilot_total_jacobian;
+pub(crate) mod local_law_resolution;
+pub(crate) mod moving_law_rule;
 pub mod residual_repair;
 mod residual_repair_kernel;
 pub(crate) mod row_kernel;
@@ -4416,8 +4423,12 @@ mod stacked_first_stage_sandwich_2484_tests {
     }
 }
 
+#[cfg(test)]
+mod anchor_law_2926_tests;
 pub(crate) mod axis_direction_search;
 pub(crate) mod cell_moment_assembly;
+#[cfg(test)]
+mod closed_form_certificate_2926_tests;
 #[cfg(test)]
 mod conditional_law_gate_tests;
 #[cfg(test)]
@@ -4426,6 +4437,7 @@ mod first_stage_variance_stage_tests;
 mod empirical_intercept_solve_tests;
 #[cfg(test)]
 mod empirical_measure_2484_tests;
+pub(crate) mod empirical_measure_sensitivity;
 #[cfg(test)]
 mod empirical_grid_sampling_3452_tests;
 #[cfg(test)]
@@ -4436,10 +4448,7 @@ mod residual_score_zeta_2985_tests;
 mod anchor_law_2926_tests;
 #[cfg(test)]
 mod normal_screen_2926_tests;
-#[cfg(test)]
-mod closed_form_certificate_2926_tests;
 mod standard_normal_flex_fifth;
-pub(crate) mod empirical_measure_sensitivity;
 // #932 BMS flex single-source jet substrate (runtime-dimension `Jet2` + IFT
 // lift + cell base-moment jets). A bare `#[cfg(test)] mod` with an allowed name
 // so the build.rs ban-scanner exempts it; shared by its own FD gates and the
@@ -4490,17 +4499,17 @@ pub(crate) use block_specs::fit_bernoulli_marginal_slope_terms;
 pub use conditional_score_covariance::{
     ConditionalScoreCoordinate, ConditionalScoreCovariance, ScoreCovarianceField,
 };
-pub use residual_repair::{
-    RESIDUAL_BLOCK_NAME, ResidualBlockRuntime, ResidualRepairGeometry,
-    ResidualRepairRefusal, ResidualRepairSpec,
-};
-pub(crate) use residual_repair::residual_row_index;
 pub use gradient_paths::{
     MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
     padded_deviation_seed,
 };
 pub use install_flex::CrossBlockIdentifiabilityWarning;
 pub(crate) use install_flex::FlexCompileOutcome;
+pub(crate) use residual_repair::residual_row_index;
+pub use residual_repair::{
+    RESIDUAL_BLOCK_NAME, ResidualBlockRuntime, ResidualRepairGeometry, ResidualRepairRefusal,
+    ResidualRepairSpec,
+};
 
 // pub(crate) re-exports for internal callers:
 pub(crate) use block_specs::push_deviation_aux_blockspecs;

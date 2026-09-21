@@ -481,8 +481,12 @@ impl<'a> RandomEffectTestBasis<'a> {
             return Err(RandomEffectTestUnavailable::DesignUnavailable);
         }
         let symmetric = 0.5 * (&term.fisher_projected + &term.fisher_projected.t());
-        let (eigenvalues, _) = strict_symmetric_eigh(&symmetric, Side::Lower)
-            .map_err(|_| RandomEffectTestUnavailable::DesignUnavailable)?;
+        let (eigenvalues, _) = strict_symmetric_eigh(
+            &symmetric,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+            Side::Lower,
+        )
+        .map_err(|_| RandomEffectTestUnavailable::DesignUnavailable)?;
         // `X̃_R` is a difference of two quantities of the size of `X_R`, so an
         // eigenvalue of `V` is resolved only above the rounding of that
         // difference: `p·ε` relative to `‖X_RᵀW_F X_R‖`, whose trace bounds it.
@@ -630,7 +634,12 @@ pub(crate) fn equilibrated_pseudo_inverse(gram: &Array2<f64>) -> Option<PseudoIn
         }
     }
     let symmetric = 0.5 * (&equilibrated + &equilibrated.t());
-    let (eigenvalues, eigenvectors) = strict_symmetric_eigh(&symmetric, Side::Lower).ok()?;
+    let (eigenvalues, eigenvectors) = strict_symmetric_eigh(
+        &symmetric,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        Side::Lower,
+    )
+    .ok()?;
     let largest = eigenvalues.iter().cloned().fold(0.0_f64, f64::max);
     if !(largest > 0.0) {
         return Some(PseudoInverse {

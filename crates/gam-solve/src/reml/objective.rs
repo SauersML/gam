@@ -4280,7 +4280,8 @@ mod ift_warm_start_tests {
         // (commit ec18559d) which the integration tests only touch
         // transitively.
         let pre_built_factor = SymmetricMatrix::Dense(h_pen.clone())
-            .factorize()
+            // `h_pen` is `2·I`: structurally symmetric.
+            .factorize(gam_linalg::roundoff::SymmetricAssembly::Mirrored)
             .expect("factorize for _with_factor test");
         let predicted_via_factor = predict_warm_start_beta_ift_with_factor(
             &cache_inline,
@@ -4315,7 +4316,8 @@ mod ift_warm_start_tests {
             h_perturbed[[i, i]] *= 5.0;
         }
         let perturbed_factor = SymmetricMatrix::Dense(h_perturbed)
-            .factorize()
+            // Diagonal scaling of a diagonal matrix: still structurally symmetric.
+            .factorize(gam_linalg::roundoff::SymmetricAssembly::Mirrored)
             .expect("factorize perturbed H");
         let predicted_with_wrong_factor = predict_warm_start_beta_ift_with_factor(
             &cache_inline,

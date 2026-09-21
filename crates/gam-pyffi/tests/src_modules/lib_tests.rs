@@ -225,6 +225,7 @@ fn symmetric_curvature_solve_preserves_exact_negative_modes() {
     let rhs = array![8.0, -8.0, 1.0];
     let solved = gam::linalg::utils::certified_symmetric_solve(
         &matrix,
+        gam::linalg::roundoff::SymmetricAssembly::Mirrored,
         &rhs,
         "indefinite symmetric curvature solve",
     )

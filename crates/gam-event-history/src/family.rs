@@ -2627,7 +2627,11 @@ fn latent_report(
     for share in &atom_covariances {
         covariance += share;
     }
-    let (eigenvalues, eigenvectors) = super::covariance::eigenmodes(&covariance)?;
+    // A sum of `(S + Sᵀ)/2` shares, entrywise: mirrored.
+    let (eigenvalues, eigenvectors) = super::covariance::eigenmodes(
+        &covariance,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+    )?;
     // First-order eigenvalue perturbation: `∂(v_jᵀ A Aᵀ v_j) / ∂a_{dk} =
     // 2 (v_j)_d (v_jᵀ a_k)`, propagated through the posterior covariance of
     // the loadings.
@@ -3018,17 +3022,31 @@ fn propose_atom(
         }
         Err(error) => return Err(error),
     };
-    let (values, vectors) = super::covariance::eigenmodes(&curvature.coarse)?;
-    let (refined_values, refined_vectors) = super::covariance::eigenmodes(&curvature.refined)?;
+    // `coordinate_hessian` writes each mirrored pair from one channel, so both
+    // curvatures and their difference are mirrored.
+    let mirrored = gam_linalg::roundoff::SymmetricAssembly::Mirrored;
+    let (values, vectors) = super::covariance::eigenmodes(&curvature.coarse, mirrored)?;
+    let (refined_values, refined_vectors) =
+        super::covariance::eigenmodes(&curvature.refined, mirrored)?;
     {
         // Whether the top of the spectrum is a cluster inside which one
         // eigenvector is not identified: the gaps to the top against the
         // rung's own perturbation of the curvature.
-        let (delta_values, _) = super::covariance::eigenmodes(&(&curvature.refined - &curvature.coarse))?;
+        let (delta_values, _) =
+            super::covariance::eigenmodes(&(&curvature.refined - &curvature.coarse), mirrored)?;
         let delta_norm = delta_values.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
         let gaps = Array1::from_iter(values.iter().skip(1).map(|mu| values[0] - mu));
-        let shifts = Array1::from_iter(values.iter().zip(refined_values.iter()).map(|(a, b)| (b - a).abs()));
-        let alignment = vectors.column(0).dot(&refined_vectors.column(0)).abs().min(1.0);
+        let shifts = Array1::from_iter(
+            values
+                .iter()
+                .zip(refined_values.iter())
+                .map(|(a, b)| (b - a).abs()),
+        );
+        let alignment = vectors
+            .column(0)
+            .dot(&refined_vectors.column(0))
+            .abs()
+            .min(1.0);
         log::debug!(
             "[event-history] rank {rank} → {}: curvature spectrum at Gauss-Hermite orders {order}/{}: eigenvalues {values:.4e}, refined {refined_values:.4e}, gaps to the top {gaps:.3e}, rung shifts {shifts:.3e}, rung perturbation ‖ΔC‖₂ {delta_norm:.3e}, top-eigenvector angle {:.3e} rad",
             rank + 1,
@@ -3203,7 +3221,7 @@ fn propose_atom(
                 ),
             });
         }
-        let (mesh_values, mesh_vectors) = super::covariance::eigenmodes(&mesh_curvature)?;
+        let (mesh_values, mesh_vectors) = super::covariance::eigenmodes(&mesh_curvature, mirrored)?;
         let mesh_shift = proposal_start_shift(
             (&values, &vectors),
             (&mesh_values, &mesh_vectors),

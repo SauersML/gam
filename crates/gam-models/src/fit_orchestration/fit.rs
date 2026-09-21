@@ -1762,9 +1762,16 @@ fn survival_edf_from_dense_hessian(
     // redundant Linear time-basis constant column is dropped in
     // `build_survival_time_basis` — so a singularity HERE is now a genuine defect
     // and refuses with the named flat direction (diag a0a9771ca).
-    let factor = h_sym.factorize().map_err(|error| {
-        format!("survival edf: exact penalized-Hessian factorization failed: {error}")
-    })?;
+    // `X'W_HX` comes from the shared `fast_xt_diag_x` kernel, which mirrors,
+    // so the only rounding the two triangles can disagree by is the penalty
+    // Gram's, over at most `p` rows.
+    let factor = h_sym
+        .factorize(gam_linalg::roundoff::SymmetricAssembly::penalized_gram(
+            0, p,
+        ))
+        .map_err(|error| {
+            format!("survival edf: exact penalized-Hessian factorization failed: {error}")
+        })?;
     let solve = |values: &mut [f64]| -> Result<(), String> {
         let solved = factor.solve(&ndarray::Array1::from(values.to_vec()))?;
         for (slot, value) in values.iter_mut().zip(solved.iter()) {

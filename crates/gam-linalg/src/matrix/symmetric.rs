@@ -86,11 +86,19 @@ impl SymmetricMatrix {
     /// derived roundoff band, whether it is stored dense or sparse. An
     /// indefinite or numerically singular matrix is an error on either
     /// storage, never a silently accepted indefinite factor.
-    pub fn factorize(&self) -> Result<Box<dyn FactorizedSystem>, String> {
+    ///
+    /// `assembly` declares how a dense matrix was built, which fixes the
+    /// symmetry band [`crate::utils::validate_finite_symmetric_matrix`]
+    /// enforces; a sparse matrix stores one triangle and needs no band.
+    pub fn factorize(
+        &self,
+        assembly: crate::roundoff::SymmetricAssembly,
+    ) -> Result<Box<dyn FactorizedSystem>, String> {
         match self {
             Self::Dense(matrix) => {
                 crate::utils::validate_finite_symmetric_matrix(
                     matrix,
+                    assembly,
                     "Dense SymmetricMatrix strict SPD factorization",
                 )
                 .map_err(|error| error.to_string())?;
@@ -598,9 +606,17 @@ mod tests {
         // against the largest diagonal, gamma_(4)·1e16 exceeds the second pivot
         // 1, so the matrix was refused as numerically singular.
         let badly_scaled = SymmetricMatrix::Dense(array![[1.0e16_f64, 0.0], [0.0, 1.0]]);
-        assert!(badly_scaled.factorize().is_ok());
+        assert!(
+            badly_scaled
+                .factorize(crate::roundoff::SymmetricAssembly::Mirrored)
+                .is_ok()
+        );
         // Control: `dense2x2` has the exact null vector (2, -1) and stays refused.
-        assert!(dense2x2().factorize().is_err());
+        assert!(
+            dense2x2()
+                .factorize(crate::roundoff::SymmetricAssembly::Mirrored)
+                .is_err()
+        );
     }
 
     /// The same matrix in both storages `SymmetricMatrix` admits: dense, and
@@ -633,7 +649,9 @@ mod tests {
         ] {
             for (storage, matrix) in every_storage(&indefinite).iter().enumerate() {
                 assert!(
-                    matrix.factorize().is_err(),
+                    matrix
+                        .factorize(crate::roundoff::SymmetricAssembly::Mirrored)
+                        .is_err(),
                     "storage {storage} accepted the indefinite matrix {indefinite:?}"
                 );
             }
@@ -654,7 +672,7 @@ mod tests {
         let bound = kappa_inf * crate::roundoff::accumulation_growth(4 * spd.nrows()) * exact_norm;
         for (storage, matrix) in every_storage(&spd).iter().enumerate() {
             let factor = matrix
-                .factorize()
+                .factorize(crate::roundoff::SymmetricAssembly::Mirrored)
                 .unwrap_or_else(|error| panic!("storage {storage} refused an SPD matrix: {error}"));
             let solved = factor.solve(&rhs).expect("SPD solve");
             let error = (&solved - &exact)

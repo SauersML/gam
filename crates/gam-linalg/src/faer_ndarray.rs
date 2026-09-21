@@ -1497,7 +1497,11 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
     assert_eq!(out.ncols(), p, "output cols must match p");
 
     if !should_use_faer_matmul(p, p, n) {
+        // ndarray's GEMM rounds `A[i,j]` and `A[j,i]` as separate sums, so
+        // mirror its lower triangle like the faer paths below: every return
+        // of this function is bitwise symmetric (`SymmetricAssembly::Mirrored`).
         out.assign(&a.t().dot(a));
+        mirror_lower_to_upper(out);
         return;
     }
 
@@ -2416,9 +2420,15 @@ pub fn fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         w.len(),
         "fast_xt_diag_x row/weight length mismatch"
     );
-    if let Some(out) =
+    if let Some(mut out) =
         crate::gpu_hook::gpu_dispatch().and_then(|d| d.try_fast_xt_diag_x(x.view(), w.view()))
     {
+        // The device kernel accumulates both triangles as a full GEMM, so its
+        // `(i, j)` and `(j, i)` entries are independent roundings. Mirroring
+        // here makes this function's output exactly symmetric on every
+        // backend, which is the provenance
+        // (`roundoff::SymmetricAssembly::Mirrored`) its callers declare.
+        crate::matrix::symmetrize_in_place(&mut out);
         return out;
     }
     let p = x.ncols();
@@ -2581,6 +2591,12 @@ pub fn stream_weighted_crossprod_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>
         match accum {
             CrossprodAccum::Replace => out.assign(&gram),
             CrossprodAccum::Add => *out += &gram,
+        }
+        // `Xᵀ·(W∘X)` rounds `w_k·x_kj` before multiplying by `x_ki`, so its two
+        // triangles are different roundings; mirror as the faer paths do so a
+        // `SymmetricLower` result is bitwise symmetric on every path.
+        if structure == CrossprodStructure::SymmetricLower {
+            mirror_lower_to_upper(out);
         }
         return;
     }
@@ -3409,8 +3425,12 @@ pub fn self_adjoint_evd(a: MatRef<'_, f64>, side: Side) -> Result<(Diag<f64>, Ma
 /// attempt. It never symmetrizes, rescales, jitters the diagonal, or subtracts
 /// a repair afterward. Rank and pseudoinverse code must use this function so
 /// its reported spectrum belongs to the matrix the caller supplied.
+///
+/// `assembly` declares how `matrix` was built, which fixes the symmetry band
+/// [`crate::utils::validate_finite_symmetric_matrix`] enforces (#4350).
 pub fn strict_symmetric_eigh<S: Data<Elem = f64>>(
     matrix: &ArrayBase<S, Ix2>,
+    assembly: crate::roundoff::SymmetricAssembly,
     side: Side,
 ) -> Result<(Array1<f64>, Array2<f64>), FaerLinalgError> {
     let owned = matrix.to_owned();
@@ -3425,6 +3445,7 @@ pub fn strict_symmetric_eigh<S: Data<Elem = f64>>(
     }
     crate::utils::validate_finite_symmetric_matrix(
         &owned,
+        assembly,
         "strict self-adjoint eigendecomposition",
     )
     .map_err(
@@ -3814,11 +3835,19 @@ pub fn real_general_spectrum<S: Data<Elem = f64>>(
         let width = if im[i] == 0.0 { 1 } else { 2 };
         if !(backward_errors[i] <= band) {
             let key = (re[i], im[i].abs());
-            let (measured, singular_band) = match measured_shifts.iter().find(|(shift, _)| *shift == key) {
+            let (measured, singular_band) = match measured_shifts
+                .iter()
+                .find(|(shift, _)| *shift == key)
+            {
                 Some(&(_, outcome)) => outcome,
                 None => {
                     let outcome = catch_unwind(AssertUnwindSafe(|| {
-                        general_eigenvalue_singular_backward_error(view.as_ref(), re[i], im[i], reduction)
+                        general_eigenvalue_singular_backward_error(
+                            view.as_ref(),
+                            re[i],
+                            im[i],
+                            reduction,
+                        )
                     }))
                     .map_err(|_| FaerLinalgError::FactorizationFailed {
                         context: "general eigenvalue backward-error SVD panic boundary",

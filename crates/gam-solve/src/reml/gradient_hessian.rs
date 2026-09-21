@@ -4240,7 +4240,13 @@ impl<'a> RemlState<'a> {
         // statistical curvature, and no stabilization ridge is added
         // (#2901 V22).
         let h = &pr.stabilizedhessian_transformed;
-        if h.factorize().is_ok() {
+        // `X'WX` comes from `fast_xt_diag_x`, which mirrors; the penalty root's
+        // Gram is the only term whose two triangles can disagree.
+        let assembly = gam_linalg::roundoff::SymmetricAssembly::penalized_gram(
+            0,
+            pr.reparam_result.e_transformed.nrows(),
+        );
+        if h.factorize(assembly).is_ok() {
             return Ok(h.to_dense());
         }
 
@@ -5879,7 +5885,16 @@ impl<'a> RemlState<'a> {
                 // release-early-on-purpose: upgrade from read access to write access without deadlocking.
                 drop(read_guard);
                 let factorize_start = std::time::Instant::now();
-                let new_factor = match cache.penalized_hessian_transformed.factorize() {
+                // The cached PIRLS Hessian: mirrored design half, penalty Gram
+                // over at most `p` rows.
+                let cached_assembly = gam_linalg::roundoff::SymmetricAssembly::penalized_gram(
+                    0,
+                    cache.penalized_hessian_transformed.nrows(),
+                );
+                let cached_factor = cache
+                    .penalized_hessian_transformed
+                    .factorize(cached_assembly);
+                let new_factor = match cached_factor {
                     Ok(f) => f,
                     Err(_) => {
                         log::debug!(
@@ -8070,7 +8085,15 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
     let factor_ref: &dyn gam_linalg::matrix::FactorizedSystem = match factor_override {
         Some(f) => f,
         None => {
-            owned_factor = match cache.penalized_hessian_transformed.factorize() {
+            // Same cached PIRLS Hessian as the `_with_factor` path above.
+            let cached_assembly = gam_linalg::roundoff::SymmetricAssembly::penalized_gram(
+                0,
+                cache.penalized_hessian_transformed.nrows(),
+            );
+            let cached_factor = cache
+                .penalized_hessian_transformed
+                .factorize(cached_assembly);
+            owned_factor = match cached_factor {
                 Ok(f) => f,
                 Err(_) => {
                     log::debug!(

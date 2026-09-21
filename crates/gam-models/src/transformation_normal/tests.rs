@@ -3635,7 +3635,8 @@ pub(crate) fn ctn_observed_information_is_positive_semidefinite_2600() {
             .scop_gradient_and_negative_hessian(&beta, &quantities)
             .expect("exact SCOP information at a feasible point");
         let (eigenvalues, _) =
-            gam_linalg::faer_ndarray::strict_symmetric_eigh(&hessian, faer::Side::Lower)
+            // Mirrored `fast_xt_diag_x` blocks, placed with their transposes.
+            gam_linalg::faer_ndarray::strict_symmetric_eigh(&hessian, gam_linalg::roundoff::SymmetricAssembly::Mirrored, faer::Side::Lower)
                 .expect("symmetric eigendecomposition of the observed information");
         let largest = eigenvalues.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
         let smallest = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);

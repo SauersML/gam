@@ -808,7 +808,13 @@ pub fn reduce_to_stationary_slicing(
     let coupling = block(&marginal.hessian, 0..m, m..d);
     let coupling_band = frobenius(&block(&marginal.hessian_band, 0..m, m..d));
     let coupling_norm = frobenius(&coupling);
-    let (eigenvalues, vectors) = strict_symmetric_eigh(&curvature, Side::Lower)
+    // The marginal writes `hessian[[i, j]]` and `hessian[[j, i]]` from one
+    // rounded entry, so a sub-block of it is bitwise symmetric too.
+    let (eigenvalues, vectors) = strict_symmetric_eigh(
+        &curvature,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        Side::Lower,
+    )
         .map_err(|error| SlicingError::Eigendecomposition { reason: error.to_string() })?;
     // ρ and ε, each with the rounding of its own measurement.
     let mut residual = 0.0;

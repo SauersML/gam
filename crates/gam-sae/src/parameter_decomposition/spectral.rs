@@ -91,7 +91,7 @@ use faer::Side;
 use gam_linalg::decision::projector_error_bar;
 use gam_linalg::faer_ndarray::{FaerLinalgError, FaerSvd, strict_symmetric_eigh};
 use gam_linalg::roundoff::{
-    accumulation_growth, factor_singular_band, symmetric_spectrum_rounding_band,
+    SymmetricAssembly, accumulation_growth, factor_singular_band, symmetric_spectrum_rounding_band,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use std::f64::consts::SQRT_2;
@@ -342,7 +342,8 @@ pub fn recover_plane_rotations(
     // whose Frobenius norm is at most `u ||W||_F`. The same bound holds for `K`.
     let formation_band = accumulation_growth(1) * frobenius_norm(matrix);
     let (values, vectors) =
-        strict_symmetric_eigh(&symmetric, Side::Lower).map_err(PlaneRotationError::Linalg)?;
+        strict_symmetric_eigh(&symmetric, SymmetricAssembly::Mirrored, Side::Lower)
+            .map_err(PlaneRotationError::Linalg)?;
     let mut order: Vec<usize> = (0..dimension).collect();
     order.sort_by(|&left, &right| values[left].total_cmp(&values[right]));
     let cosines: Vec<f64> = order.iter().map(|&index| values[index]).collect();

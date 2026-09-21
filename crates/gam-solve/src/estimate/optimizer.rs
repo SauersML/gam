@@ -7,6 +7,7 @@ use crate::estimate::prefit::{
     reject_prefit_unpenalized_rank_deficiency,
 };
 use gam_linalg::matrix::FactorizedSystem;
+use gam_linalg::roundoff::SymmetricAssembly;
 use gam_math::sparse_grid::CompensatedSum;
 use gam_problem::OrderedRhoBounds;
 use gam_problem::dispersion_cov::se_from_covariance;
@@ -216,7 +217,14 @@ impl<'a> OriginalBasisHessianFactor<'a> {
                 inverse: inverse.rotated(qs),
                 label,
             }),
-            None => gam_linalg::utils::certified_spd_factorize(hessian, label).map(Self::Strict),
+            // `hessian` is `map_hessian_to_original_basis`'s congruence
+            // `Qs·H·Qsᵀ`, symmetrized there: both triangles hold one value.
+            None => gam_linalg::utils::certified_spd_factorize(
+                hessian,
+                SymmetricAssembly::Mirrored,
+                label,
+            )
+            .map(Self::Strict),
         }
     }
 
@@ -352,7 +360,13 @@ fn negbin_theta_root_sensitivity(
         return None;
     }
     let rhs = reml_state.x.transpose_vector_multiply(score_eta_gradient);
-    let factor = pirls.penalized_hessian_transformed.factorize().ok()?;
+    let factor = pirls
+        .penalized_hessian_transformed
+        .factorize(SymmetricAssembly::penalized_gram(
+            reml_state.x.nrows(),
+            pirls.reparam_result.e_transformed.nrows(),
+        ))
+        .ok()?;
     // `u` in the frame the Hessian and the KKT residual live in, and `β`, `u`
     // in the original frame the canonical penalties index.
     let (u_solved, beta_original, u_original) = match pirls.coordinate_frame {
@@ -2733,7 +2747,10 @@ where
         // is not allowed to add an unaccounted diagonal to it. When the strict
         // factor refuses, a dense H is taken on its identified subspace, the one
         // PIRLS solved it min-norm on and the criterion scored (#2901 V22).
-        let factor = match h.factorize() {
+        let factor = match h.factorize(SymmetricAssembly::penalized_gram(
+            y.len(),
+            penalty_rank_total,
+        )) {
             Ok(factor) => InferenceHessianFactor::Strict(factor),
             Err(reason) => match h {
                 gam_linalg::matrix::SymmetricMatrix::Dense(dense) => {

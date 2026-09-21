@@ -2547,50 +2547,17 @@ impl CustomFamily for BoundedLinearFamily {
     }
 }
 
+/// `Xᵀ·diag(w)·X` through the shared streamed symmetric kernel
+/// ([`gam_linalg::faer_ndarray::fast_xt_diag_x`]), which accumulates one
+/// triangle and mirrors it (on every backend), so every Hessian and jet built
+/// here is exactly symmetric and certifies as
+/// [`gam_linalg::roundoff::SymmetricAssembly::Mirrored`] (#4350). Signed `w`
+/// (observed information) is kept exactly: no square root is taken.
 fn xt_diag_x_dense(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
     if x.nrows() != w.len() {
         return Err(SmoothError::dimension_mismatch("xt_diag_x_dense row mismatch").into());
     }
-    let (n, p) = x.dim();
-    if n == 0 || p == 0 {
-        return Ok(Array2::<f64>::zeros((p, p)));
-    }
-
-    const STREAMING_BYTES_THRESHOLD: usize = 8 * 1024 * 1024;
-    let dense_work_bytes = n
-        .checked_mul(p)
-        .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
-        .unwrap_or(usize::MAX);
-    if dense_work_bytes <= STREAMING_BYTES_THRESHOLD {
-        let mut weighted = x.to_owned();
-        ndarray::Zip::from(weighted.rows_mut())
-            .and(w)
-            .par_for_each(|mut row, wi| row *= *wi);
-        return Ok(fast_atb(&x, &weighted));
-    }
-
-    let chunkrows = gam_runtime::resource::byte_balanced_row_chunk(p, n);
-    let mut weighted_chunk = Array2::<f64>::zeros((chunkrows, p));
-    let mut out = Array2::<f64>::zeros((p, p));
-    for row_start in (0..n).step_by(chunkrows) {
-        let rows = (n - row_start).min(chunkrows);
-        let x_chunk = x.slice(s![row_start..row_start + rows, ..]);
-        {
-            let mut chunk = weighted_chunk.slice_mut(s![0..rows, ..]);
-            for local_row in 0..rows {
-                let scale = w[row_start + local_row];
-                if scale == 0.0 {
-                    chunk.row_mut(local_row).fill(0.0);
-                    continue;
-                }
-                for col in 0..p {
-                    chunk[[local_row, col]] = x_chunk[[local_row, col]] * scale;
-                }
-            }
-        }
-        out += &fast_atb(&x_chunk, &weighted_chunk.slice(s![0..rows, ..]));
-    }
-    Ok(out)
+    Ok(gam_linalg::faer_ndarray::fast_xt_diag_x(&x, &w))
 }
 
 /// `tr(C·S)` for a posterior covariance `C` and a PSD penalty `S`, accumulated
@@ -2899,13 +2866,24 @@ fn certified_bounded_posterior_covariance(
     precision: &Array2<f64>,
     label: &'static str,
 ) -> Result<Array2<f64>, EstimationError> {
-    gam_linalg::utils::certified_spd_inverse(precision, label)
-        .map(gam_linalg::utils::CertifiedSpdInverse::into_inverse)
-        .map_err(|error| {
-            EstimationError::InvalidInput(format!(
-                "bounded posterior covariance requires an exact SPD precision: {error}"
-            ))
-        })
+    // Every bounded precision is `xt_diag_x_dense` (mirrored) plus diagonal
+    // prior and bounded-curvature terms, scaled by φ, plus declared penalties
+    // (exact-symmetry contract), and pushed through diagonal Jacobian scalings
+    // that divide row `i` and column `i` in the same step, so both triangles
+    // see the same rounding sequence. The user-scale precision additionally
+    // passes the conditioning congruence, which is symmetrized where it is
+    // formed. Each is mirrored (#4350).
+    gam_linalg::utils::certified_spd_inverse(
+        precision,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        label,
+    )
+    .map(gam_linalg::utils::CertifiedSpdInverse::into_inverse)
+    .map_err(|error| {
+        EstimationError::InvalidInput(format!(
+            "bounded posterior covariance requires an exact SPD precision: {error}"
+        ))
+    })
 }
 
 fn transform_bounded_latent_precision_to_user_internal(
@@ -3392,8 +3370,12 @@ fn fit_bounded_term_collection_with_design(
     latent_precision += &s_lambda_internal;
     let user_precision_internal =
         transform_bounded_latent_precision_to_user_internal(&latent_precision, &jac_diag)?;
-    let penalized_hessian =
+    // The conditioning congruence `M⁻ᵀ·H·M⁻¹` folds the intercept row and
+    // column in along different orders on the two triangles; it is symmetric
+    // in exact arithmetic, so it is mirrored where formed (#4350).
+    let mut penalized_hessian =
         conditioning.transform_penalized_hessian_to_original(&user_precision_internal);
+    gam_linalg::matrix::symmetrize_in_place(&mut penalized_hessian);
 
     // User-scale posterior covariance via the delta method. The reported
     // geometry precision `penalized_hessian` is the user-scale penalized

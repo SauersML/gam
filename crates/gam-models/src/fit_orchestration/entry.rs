@@ -1506,8 +1506,10 @@ fn exact_gaussian_coefficients(
             &adjusted_response.view().insert_axis(ndarray::Axis(1)),
         );
         let rhs = rhs_matrix.column(0).to_owned();
+        // `fast_xt_diag_x` mirrors on every backend.
         let reduced_beta = gam_linalg::utils::certified_symmetric_solve(
             &gram,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
             &rhs,
             "deterministic Gaussian normal equations",
         )

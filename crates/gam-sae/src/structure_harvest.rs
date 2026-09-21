@@ -8114,8 +8114,12 @@ fn principal_image_plane(
             k_mat[[j, i]] = v;
         }
     }
-    let (lambda, u) = strict_symmetric_eigh(&k_mat, faer::Side::Lower)
-        .map_err(|e| format!("flatten: decoder Gram spectrum failed: {e}"))?;
+    let (lambda, u) = strict_symmetric_eigh(
+        &k_mat,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        faer::Side::Lower,
+    )
+    .map_err(|e| format!("flatten: decoder Gram spectrum failed: {e}"))?;
     // L = U·Λ^{1/2}. K is PSD by construction; `max(0)` only removes the
     // EVD's roundoff below zero, it never changes a resolved eigenvalue.
     let mut l_mat = u;
@@ -8132,8 +8136,12 @@ fn principal_image_plane(
             s_mat[[j, i]] = v;
         }
     }
-    let (mu, w) = strict_symmetric_eigh(&s_mat, faer::Side::Lower)
-        .map_err(|e| format!("flatten: image Gram spectrum failed: {e}"))?;
+    let (mu, w) = strict_symmetric_eigh(
+        &s_mat,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        faer::Side::Lower,
+    )
+    .map_err(|e| format!("flatten: image Gram spectrum failed: {e}"))?;
     let mut order: Vec<usize> = (0..m).collect();
     order.sort_by(|&x, &y| mu[y].total_cmp(&mu[x]));
     if !(mu[order[0]] > 0.0) {

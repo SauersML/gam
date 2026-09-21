@@ -3287,11 +3287,17 @@ fn value_lane_prices_at_shared_fixed_point_2228() {
             .materialize_exact_hessian_dense(&rho, z.view(), &cache)
             .expect("dense exact observed information at the priced state");
         let symmetric = (&a + &a.t()) * 0.5;
-        let (eigenvalues, vectors) =
-            strict_symmetric_eigh(&symmetric, Side::Lower).expect("the exact A spectrum");
+        let (eigenvalues, vectors) = strict_symmetric_eigh(
+            &symmetric,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+            Side::Lower,
+        )
+        .expect("the exact A spectrum");
         // The pseudoinverse on the resolvable spectrum: the rank cutoff is the standard
         // `ε · dim · max|λ|`, below which an eigenvalue is indistinguishable from zero.
-        let lambda_max = eigenvalues.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        let lambda_max = eigenvalues
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
         let cutoff = f64::EPSILON * eigenvalues.len() as f64 * lambda_max;
         let mut delta = Array1::<f64>::zeros(gradient.len());
         for index in 0..eigenvalues.len() {

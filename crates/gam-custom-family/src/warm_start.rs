@@ -414,7 +414,14 @@ pub(crate) fn custom_family_blockwise_edf(
     // EDF and covariance are properties of the fitted Hessian, not of a
     // nearby matrix selected because it factors. Refuse invalid curvature
     // rather than silently reporting inference for a ridge-perturbed estimand.
-    let factor = h_sym.factorize().map_err(|error| {
+    // A custom family assembles its own observed information, so this takes
+    // the conservative reading: an accumulation over the block designs' rows
+    // with the penalty root on top.
+    let assembly = gam_linalg::roundoff::SymmetricAssembly::penalized_gram(
+        specs.iter().map(|s| s.design.nrows()).max().unwrap_or(0),
+        p,
+    );
+    let factor = h_sym.factorize(assembly).map_err(|error| {
         format!("custom-family edf: exact penalized-Hessian factorization failed: {error}")
     })?;
 

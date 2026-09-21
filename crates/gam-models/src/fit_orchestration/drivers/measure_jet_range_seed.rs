@@ -231,8 +231,13 @@ fn whiten_to_identifiable_subspace(design: &Array2<f64>) -> Option<Array2<f64>> 
         return None;
     }
     let gram = gam_linalg::faer_ndarray::fast_ata(design);
-    let (values, vectors) =
-        gam_linalg::faer_ndarray::strict_symmetric_eigh(&gram, faer::Side::Lower).ok()?;
+    let (values, vectors) = gam_linalg::faer_ndarray::strict_symmetric_eigh(
+        &gram,
+        // `fast_ata` accumulates one triangle and mirrors it.
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        faer::Side::Lower,
+    )
+    .ok()?;
     let leading = values.iter().copied().fold(0.0_f64, |a, v| a.max(v));
     if !(leading.is_finite() && leading > 0.0) {
         return None;

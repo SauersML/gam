@@ -88,7 +88,12 @@ impl<'a> PredictionCovarianceBackend<'a> {
             ));
         }
         let dim = hessian.nrows();
-        let factor = hessian.factorize()?;
+        // A persisted penalized Hessian `X'WX + S`: the design half comes
+        // from `fast_xt_diag_x`, which mirrors, so only the penalty Gram —
+        // at most `dim` accumulated rows — can leave the triangles apart.
+        let factor = hessian.factorize(gam_linalg::roundoff::SymmetricAssembly::penalized_gram(
+            0, dim,
+        ))?;
         let phi_scale = phi;
         Ok(Self::Factorized {
             factor,
@@ -578,7 +583,7 @@ mod tests {
         let precision = array![[4.0, 0.6, 0.1], [0.6, 3.0, -0.2], [0.1, -0.2, 2.5]];
         let phi = 1.7;
         let factor = SymmetricMatrix::Dense(precision.clone())
-            .factorize()
+            .factorize(gam_linalg::roundoff::SymmetricAssembly::Mirrored)
             .expect("factorize ambient precision");
         let mut dense = factor
             .solvemulti(&Array2::eye(3))
@@ -628,7 +633,7 @@ mod tests {
             normal_upper_limits: vec![f64::INFINITY, f64::INFINITY],
         };
         let factor = SymmetricMatrix::Dense(precision.clone())
-            .factorize()
+            .factorize(gam_linalg::roundoff::SymmetricAssembly::Mirrored)
             .expect("factorize active precision");
         let mut active_covariance = factor
             .solvemulti(&Array2::eye(3))

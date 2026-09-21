@@ -3879,7 +3879,12 @@ fn the_two_floors_are_incommensurable_thresholds_on_one_operator_2673() {
     use gam_linalg::faer_ndarray::strict_symmetric_eigh;
 
     let state = two_floor_state_2673();
-    let (a_eigs, a_vecs) = strict_symmetric_eigh(&state.a, Side::Lower).expect("A spectrum");
+    let (a_eigs, a_vecs) = strict_symmetric_eigh(
+        &state.a,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        Side::Lower,
+    )
+    .expect("A spectrum");
     let dim = a_eigs.len();
     let max_eig = a_eigs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let value_threshold = RETIRED_ABSOLUTE_PD_FLOOR_REL_2673 * max_eig.max(1.0);
@@ -3989,13 +3994,25 @@ fn the_classification_is_invariant_under_a_reparametrization_2673() {
         };
         let whitened = forward(&forward(a).t().to_owned());
         let symmetric = (&whitened + &whitened.t()) * 0.5;
-        let (mu, _) = strict_symmetric_eigh(&symmetric, Side::Lower).expect("pencil spectrum");
-        mu.iter().map(|value| value.abs()).fold(f64::INFINITY, f64::min)
+        let (mu, _) = strict_symmetric_eigh(
+            &symmetric,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+            Side::Lower,
+        )
+        .expect("pencil spectrum");
+        mu.iter()
+            .map(|value| value.abs())
+            .fold(f64::INFINITY, f64::min)
     }
 
     let state = two_floor_state_2673();
     let dim = state.a.nrows();
-    let (a_eigs, a_vecs) = strict_symmetric_eigh(&state.a, Side::Lower).expect("A spectrum");
+    let (a_eigs, a_vecs) = strict_symmetric_eigh(
+        &state.a,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        Side::Lower,
+    )
+    .expect("A spectrum");
     // The arrow layout puts the β border after the `total_t` chart coordinates.
     // Scale the border and nothing else — that is what a change in the target's
     // units does, and it is a reparametrization of the model rather than a
@@ -4047,7 +4064,10 @@ fn the_classification_is_invariant_under_a_reparametrization_2673() {
         eigs.iter().filter(|value| value.abs() <= floor).count()
     };
     let (scaled_eigs, scaled_vecs) =
-        strict_symmetric_eigh(&a_scaled, Side::Lower).expect("scaled A spectrum");
+        // `d` is 1 or `scale`, so `d_r·m·d_c` and `d_c·m·d_r` round identically
+        // (a factor of 1 is exact) and the congruence stays mirrored.
+        strict_symmetric_eigh(&a_scaled, gam_linalg::roundoff::SymmetricAssembly::Mirrored, Side::Lower)
+            .expect("scaled A spectrum");
     let pinned_plain = retired_pinned(&a_eigs);
     let pinned_scaled = retired_pinned(&scaled_eigs);
     println!(
@@ -4224,7 +4244,12 @@ fn two_floors_overlap_region_direction_count_2673() {
     }
 
     // Site 1: the plain `A` spectrum and its absolute floor.
-    let (a_eigs, a_vecs) = strict_symmetric_eigh(&a, Side::Lower).expect("A spectrum");
+    let (a_eigs, a_vecs) = strict_symmetric_eigh(
+        &a,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        Side::Lower,
+    )
+    .expect("A spectrum");
     let max_eig = a_eigs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let floor = RETIRED_ABSOLUTE_PD_FLOOR_REL_2673 * max_eig.max(1.0);
     let mu_floor = f64::EPSILON.sqrt();

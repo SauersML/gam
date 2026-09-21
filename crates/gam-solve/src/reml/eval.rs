@@ -547,6 +547,12 @@ fn sampled_density_laplace_geometry(
     mut density: impl FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>, Array1<f64>), String>,
 ) -> Result<(Array1<f64>, Array2<f64>), String> {
     use opt::{BacktrackConfig, backtracking_line_search, constants::ARMIJO_C1};
+    // The Laplace geometry reads only the quadratic form of the ρ-Hessian,
+    // which is its symmetric part (Clairaut); the two triangles may come from
+    // different derivative formulas, so the curvature is symmetrized once and
+    // certified as mirrored. Adding the diagonal keeps it mirrored (#4350).
+    let mut laml_hessian = laml_hessian.clone();
+    gam_linalg::matrix::symmetrize_in_place(&mut laml_hessian);
     let curvature_at = |correction_curvature: &Array1<f64>| {
         let mut hessian = laml_hessian.clone();
         for (index, &c) in correction_curvature.iter().enumerate() {
@@ -564,6 +570,7 @@ fn sampled_density_laplace_geometry(
         let hessian = curvature_at(&correction_curvature);
         let factor = gam_linalg::utils::certified_spd_factorize(
             &hessian,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
             "sampled rho density Laplace curvature",
         )
         .map_err(|error| error.to_string())?;

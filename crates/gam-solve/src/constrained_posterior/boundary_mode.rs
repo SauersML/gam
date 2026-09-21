@@ -48,6 +48,7 @@
 //! Nothing here bounds the likelihood's third-order terms. The proper-cone Laplace law
 //! ignores those too, so the approximation is no weaker in that respect.
 
+use gam_linalg::roundoff::SymmetricAssembly;
 use gam_linalg::utils::certified_spd_factorize;
 use gam_math::probability::standard_normal_quantile;
 use gam_problem::LinearInequalityConstraints;
@@ -184,13 +185,21 @@ impl BoundaryModeApproximation {
         let rows = face.a_active.clone();
 
         let gram = rows.dot(&rows.t());
-        let gram_factor = certified_spd_factorize(&gram, "boundary-mode active-row Gram AAᵀ")
-            .map_err(|error| {
-                format!(
-                    "boundary-mode approximation: the {q} active row(s) are not independent: \
+        // A full GEMM: each triangle sums the `p` products `a_ik·a_jk` of the
+        // PSD pieces `a_k a_kᵀ`, depth `p` (#4350).
+        let gram_factor = certified_spd_factorize(
+            &gram,
+            SymmetricAssembly::PsdAccumulation {
+                depth: rows.ncols(),
+            },
+            "boundary-mode active-row Gram AAᵀ",
+        )
+        .map_err(|error| {
+            format!(
+                "boundary-mode approximation: the {q} active row(s) are not independent: \
                      {error}"
-                )
-            })?;
+            )
+        })?;
         let (gram_solved_rows, _) = gram_factor.solve_matrix(&rows).map_err(|error| {
             format!("boundary-mode approximation: the active-row Gram solve failed: {error}")
         })?;
@@ -218,15 +227,18 @@ impl BoundaryModeApproximation {
         } else {
             let mut face_precision = tangent.t().dot(&precision).dot(&tangent);
             gam_linalg::matrix::symmetrize_in_place(&mut face_precision);
-            let face_factor =
-                certified_spd_factorize(&face_precision, "boundary-mode face precision ZᵀMZ")
-                    .map_err(|error| {
-                        format!(
-                            "boundary-mode approximation: the precision is not positive \
+            let face_factor = certified_spd_factorize(
+                &face_precision,
+                SymmetricAssembly::Mirrored,
+                "boundary-mode face precision ZᵀMZ",
+            )
+            .map_err(|error| {
+                format!(
+                    "boundary-mode approximation: the precision is not positive \
                              definite on the {tangent_dimension}-dimensional face tangent: \
                              {error}"
-                        )
-                    })?;
+                )
+            })?;
             let coupling = tangent.t().dot(&precision_times_right_inverse);
             let (face_solved_coupling, _) =
                 face_factor.solve_matrix(&coupling).map_err(|error| {

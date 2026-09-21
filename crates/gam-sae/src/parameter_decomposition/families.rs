@@ -110,7 +110,7 @@ use super::supports::EvidenceStatus;
 use crate::basis::{EuclideanPatchEvaluator, SaeBasisEvaluator};
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerLinalgError, strict_symmetric_eigh};
-use gam_linalg::roundoff::{accumulation_growth, resolved_eigenvalue_count};
+use gam_linalg::roundoff::{SymmetricAssembly, accumulation_growth, resolved_eigenvalue_count};
 use ndarray::{Array2, ArrayView2};
 
 /// Why a family proposal was not built, encoded or decoded.
@@ -473,7 +473,8 @@ fn principal_field_of_class(
     }
     let trace: f64 = (0..n).map(|i| gram[[i, i]]).sum();
     let assembly_band = accumulation_growth(entries + 2) * trace;
-    let (values, vectors) = strict_symmetric_eigh(&gram, Side::Lower).map_err(FamilyError::Eigen)?;
+    let (values, vectors) = strict_symmetric_eigh(&gram, SymmetricAssembly::Mirrored, Side::Lower)
+        .map_err(FamilyError::Eigen)?;
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&left, &right| values[right].total_cmp(&values[left]));
     let eigenvalues: Vec<f64> = order.iter().map(|&index| values[index]).collect();

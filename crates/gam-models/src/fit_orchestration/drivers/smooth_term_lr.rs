@@ -918,7 +918,9 @@ fn psd_root(matrix: &Array2<f64>) -> Option<Array2<f64>> {
         return Some(Array2::zeros((0, 0)));
     }
     let (values, vectors) =
-        gam_linalg::faer_ndarray::strict_symmetric_eigh(matrix, faer::Side::Lower).ok()?;
+        // Every caller hands in a `symmetrized` congruence: mirrored.
+        gam_linalg::faer_ndarray::strict_symmetric_eigh(matrix, gam_linalg::roundoff::SymmetricAssembly::Mirrored, faer::Side::Lower)
+            .ok()?;
     let largest = values.iter().copied().fold(0.0_f64, |a, b| a.max(b.abs()));
     let threshold = 100.0 * (dimension as f64) * f64::EPSILON * largest;
     let kept: Vec<usize> = (0..dimension)
@@ -4485,20 +4487,31 @@ fn lr_tested_block(
     }
     let dimension = end - start;
 
-    let (b_eigenvalues, b_vectors) =
-        gam_linalg::faer_ndarray::strict_symmetric_eigh(&b, faer::Side::Lower).ok()?;
+    let (b_eigenvalues, b_vectors) = gam_linalg::faer_ndarray::strict_symmetric_eigh(
+        &b,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        faer::Side::Lower,
+    )
+    .ok()?;
     // `B^{1/2} = U Λ^{1/2} Uᵀ`. A tiny negative eigenvalue is roundoff on a PSD
     // matrix, so its square root is zero rather than an error.
     let mut root_scaled = b_vectors.clone();
-    for (mut column, &eigenvalue) in root_scaled.columns_mut().into_iter().zip(b_eigenvalues.iter())
+    for (mut column, &eigenvalue) in root_scaled
+        .columns_mut()
+        .into_iter()
+        .zip(b_eigenvalues.iter())
     {
         let root = eigenvalue.max(0.0).sqrt();
         column.mapv_inplace(|value| value * root);
     }
     let b_root = root_scaled.dot(&b_vectors.t());
     let similar = symmetrized(b_root.dot(&s).dot(&b_root));
-    let (shrinkage, shrinkage_vectors) =
-        gam_linalg::faer_ndarray::strict_symmetric_eigh(&similar, faer::Side::Lower).ok()?;
+    let (shrinkage, shrinkage_vectors) = gam_linalg::faer_ndarray::strict_symmetric_eigh(
+        &similar,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        faer::Side::Lower,
+    )
+    .ok()?;
 
     let shares: Vec<f64> = shrinkage.iter().map(|&p| p.clamp(0.0, 1.0)).collect();
     if shares.iter().any(|p| !p.is_finite()) {
@@ -4576,7 +4589,9 @@ mod lr_null_reference_tests {
     /// it.
     fn symmetric_inverse(matrix: &Array2<f64>) -> Array2<f64> {
         let (values, vectors) =
-            gam_linalg::faer_ndarray::strict_symmetric_eigh(matrix, faer::Side::Lower)
+            // The fixtures' Gram and penalty are filled entrywise with the same
+            // operations on both triangles: mirrored.
+            gam_linalg::faer_ndarray::strict_symmetric_eigh(matrix, gam_linalg::roundoff::SymmetricAssembly::Mirrored, faer::Side::Lower)
                 .expect("symmetric PD inverse");
         let mut scaled = vectors.clone();
         for (mut column, &value) in scaled.columns_mut().into_iter().zip(values.iter()) {
@@ -4784,7 +4799,13 @@ mod profiled_scale_reference_tests {
         });
         let hessian = x.t().dot(&x) + &penalty;
         let (values, vectors) =
-            gam_linalg::faer_ndarray::strict_symmetric_eigh(&hessian, faer::Side::Lower)
+            gam_linalg::faer_ndarray::strict_symmetric_eigh(
+                &hessian,
+                // `XᵀX` by GEMM over `n` rows, plus one addition for the
+                // diagonal penalty.
+                gam_linalg::roundoff::SymmetricAssembly::PsdAccumulation { depth: n + 1 },
+                faer::Side::Lower,
+            )
                 .expect("symmetric eigendecomposition");
         assert!(values.iter().all(|value| *value > 0.0), "H must be positive definite");
         let inverse_values = Array2::from_diag(&values.mapv(f64::recip));
@@ -4796,7 +4817,15 @@ mod profiled_scale_reference_tests {
 
         let residual = Array2::<f64>::eye(n) - x.dot(&hessian_inverse).dot(&x.t());
         let (residual_values, _) =
-            gam_linalg::faer_ndarray::strict_symmetric_eigh(&residual, faer::Side::Lower)
+            gam_linalg::faer_ndarray::strict_symmetric_eigh(
+                &residual,
+                // `I − X H⁻¹ Xᵀ` is PSD here and each entry is two chained
+                // `p`-term contractions plus the subtraction from `I`.
+                gam_linalg::roundoff::SymmetricAssembly::PsdAccumulation {
+                    depth: 2 * p + 1,
+                },
+                faer::Side::Lower,
+            )
                 .expect("symmetric eigendecomposition");
         let mut expected: Vec<f64> = residual_values.iter().map(|value| value * value).collect();
         expected.sort_by(|a, b| a.partial_cmp(b).expect("finite"));

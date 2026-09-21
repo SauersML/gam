@@ -2086,8 +2086,16 @@ pub(crate) fn run_outer_with_plan(
                                     )
                                 })
                                 .and_then(|h| {
+                                    // A BFGS metric is the symmetric part of the
+                                    // transferred ρ-Hessian (Clairaut): its two
+                                    // triangles may come from different derivative
+                                    // formulas, so the metric is symmetrized here
+                                    // and certified as mirrored (#4350).
+                                    let mut metric = h.clone();
+                                    gam_linalg::matrix::symmetrize_in_place(&mut metric);
                                     match gam_linalg::utils::certified_spd_inverse(
-                                        h,
+                                        &metric,
+                                        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
                                         "transferred outer-Hessian BFGS metric",
                                     ) {
                                         Ok(inverse) => Some(inverse.into_inverse()),

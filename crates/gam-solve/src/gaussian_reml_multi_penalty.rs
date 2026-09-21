@@ -69,7 +69,7 @@ use gam_linalg::faer_ndarray::{
 };
 use gam_linalg::matrix::array2_bits_fingerprint;
 use gam_linalg::roundoff::{
-    FactorRankPartition, UNIT_ROUNDOFF, accumulation_growth, compensated_band,
+    FactorRankPartition, SymmetricAssembly, UNIT_ROUNDOFF, accumulation_growth, compensated_band,
     factor_rank_partition, factor_singular_band, resolved_eigenvalue_count,
     symmetric_spectrum_rounding_band,
 };
@@ -357,8 +357,13 @@ impl GaussianRemlMultiPenaltyProblem {
                     penalty.ncols()
                 );
             }
-            validate_finite_symmetric_matrix(penalty, "multi-penalty Gaussian REML penalty")
-                .map_err(|error| EstimationError::InvalidInput(format!("penalty {k}: {error}")))?;
+            // A declared penalty carries the exact-symmetry contract.
+            validate_finite_symmetric_matrix(
+                penalty,
+                SymmetricAssembly::Mirrored,
+                "multi-penalty Gaussian REML penalty",
+            )
+            .map_err(|error| EstimationError::InvalidInput(format!("penalty {k}: {error}")))?;
             let (eigenvalues, eigenvectors) = penalty
                 .eigh(Side::Lower)
                 .map_err(EstimationError::LinearSystemSolveFailed)?;
@@ -1394,8 +1399,12 @@ mod tests {
         let lambda = old.rho.exp();
         let gram = fast_ata(&x);
         let normal = &gram + &penalty.mapv(|value| lambda * value);
-        let inverse = certified_spd_inverse(&normal, "test penalized normal matrix")
-            .expect("the fixture's penalized normal matrix is SPD");
+        let inverse = certified_spd_inverse(
+            &normal,
+            SymmetricAssembly::Mirrored,
+            "test penalized normal matrix",
+        )
+        .expect("the fixture's penalized normal matrix is SPD");
         let inverse_trace = inverse.inverse().diag().sum();
         let design_energy = frobenius(x.view()).powi(2);
         let gram_norm = gram.iter().fold(0.0_f64, |acc, value| acc.max(value.abs())) * p as f64;
@@ -1731,10 +1740,13 @@ mod tests {
                 .expect("the planted problem")
                 .fit(None)
                 .expect("the planted fit converges");
-            let covariance =
-                certified_spd_inverse(&fit.evaluation.reml_hessian, "planted ρ̂ information")
-                    .expect("the planted fit's information is SPD")
-                    .into_inverse();
+            let covariance = certified_spd_inverse(
+                &fit.evaluation.reml_hessian,
+                SymmetricAssembly::Mirrored,
+                "planted ρ̂ information",
+            )
+            .expect("the planted fit's information is SPD")
+            .into_inverse();
             (fit.evaluation.rho, covariance)
         };
         let ratio_sd = |covariance: &Array2<f64>| {
@@ -1982,9 +1994,13 @@ mod tests {
         let penalty = curvature_penalty(p, 2);
         let mut rng = StdRng::seed_from_u64(29_460_007);
         let draws = normal_matrix(n, m, &mut rng).mapv(|value| 0.1 * value);
-        let gram_inverse = certified_spd_inverse(&fast_ata(&x), "test design Gram")
-            .expect("the cosine design has full column rank")
-            .into_inverse();
+        let gram_inverse = certified_spd_inverse(
+            &fast_ata(&x),
+            SymmetricAssembly::Mirrored,
+            "test design Gram",
+        )
+        .expect("the cosine design has full column rank")
+        .into_inverse();
         let orthogonal = &draws - &fast_ab(&x, &fast_ab(&gram_inverse, &fast_atb(&x, &draws)));
         let null_coefficients = Array2::from_shape_fn((p, m), |(row, col)| {
             if row < 2 {
@@ -2360,8 +2376,12 @@ mod tests {
         let lambda = old.rho.exp();
         let gram = fast_ata(&white_x);
         let normal = &gram + &penalty.mapv(|value| lambda * value);
-        let inverse = certified_spd_inverse(&normal, "test weighted penalized normal matrix")
-            .expect("the fixture's weighted penalized normal matrix is SPD");
+        let inverse = certified_spd_inverse(
+            &normal,
+            SymmetricAssembly::Mirrored,
+            "test weighted penalized normal matrix",
+        )
+        .expect("the fixture's weighted penalized normal matrix is SPD");
         let inverse_trace = inverse.inverse().diag().sum();
         let design_energy = frobenius(white_x.view()).powi(2);
         let gram_norm = gram.iter().fold(0.0_f64, |acc, value| acc.max(value.abs())) * p as f64;

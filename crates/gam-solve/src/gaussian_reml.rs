@@ -324,8 +324,10 @@ impl GaussianRemlBlocksDomain {
 
         let xtwx = fast_xt_diag_x(&design, &weights);
         let normal = self.normal_matrix(&xtwx, lambdas)?;
+        // `normal_matrix` symmetrizes `XᵀWX + Σ λ_k S_k` before returning it.
         gam_linalg::utils::certified_spd_factorize(
             &normal,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
             "block Gaussian REML penalized normal matrix",
         )
         .map_err(|error| {
@@ -696,8 +698,10 @@ pub fn gaussian_reml_fit_blocks_exact(
         // delegating so this block entry point rejects a singular Gram with
         // the certified factorization's diagnosis.
         let xtwx = fast_xt_diag_x(&design.view(), &weight.view());
+        // `fast_xt_diag_x` mirrors its Gram on every backend.
         gam_linalg::utils::certified_spd_factorize(
             &xtwx,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
             "one-block Gaussian REML unpenalized normal matrix",
         )
         .map_err(|error| {
@@ -8716,8 +8720,10 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
 
     let penalties = domain.local_penalties();
     let pinvs = domain.penalty_pseudoinverses()?;
+    // `certify_joint_coefficient_map` returns the symmetrized normal matrix.
     let r = gam_linalg::utils::certified_spd_inverse(
         &k_matrix,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
         "block Gaussian REML penalized normal matrix",
     )
     .map(gam_linalg::utils::CertifiedSpdInverse::into_inverse)
@@ -8933,6 +8939,7 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
         }
         let rho_adj = gam_linalg::utils::certified_symmetric_solve(
             &outer_h,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
             &alpha,
             "block Gaussian REML outer-rho adjoint",
         )
@@ -9112,7 +9119,15 @@ pub fn dense_fisher_gaussian_fit(
     add_block_diagonal_penalty(&mut hessian, penalty, lambda, n_outputs)?;
     let rhs = crate::pirls::dense_block_xtwy(design, fisher_w, y, Some(row_weights))?;
     let beta_vec =
-        gam_linalg::utils::solve_dense_block_system(&hessian, &rhs, "dense Fisher Gaussian")
+        // `dense_block_xtwx` writes each Gram entry into both mirrored
+        // positions and `add_block_diagonal_penalty` adds the symmetrized
+        // `λ (S + Sᵀ)/2` to both, so the system is exactly mirrored.
+        gam_linalg::utils::solve_dense_block_system(
+            &hessian,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+            &rhs,
+            "dense Fisher Gaussian",
+        )
             .map_err(EstimationError::InvalidInput)?;
     let mut coefficients = Array2::<f64>::zeros((k, n_outputs));
     for output in 0..n_outputs {

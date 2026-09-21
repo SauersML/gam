@@ -122,7 +122,13 @@ pub(crate) fn structural_time_initial_beta_guess(
     use gam_linalg::roundoff::accumulation_growth;
     let xtx = gam_linalg::faer_ndarray::fast_ata(design_derivative_exit);
     let xty = fast_atv(design_derivative_exit, &target);
-    let (eigenvalues, eigenvectors) = strict_symmetric_eigh(&xtx, faer::Side::Lower).ok()?;
+    // `fast_ata` accumulates one triangle and mirrors it.
+    let (eigenvalues, eigenvectors) = strict_symmetric_eigh(
+        &xtx,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        faer::Side::Lower,
+    )
+    .ok()?;
     let lambda_max = eigenvalues.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
     if !(lambda_max > 0.0) {
         return None;

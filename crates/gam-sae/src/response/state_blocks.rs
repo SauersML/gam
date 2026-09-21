@@ -87,7 +87,8 @@ use gam_linalg::faer_ndarray::{
     FaerLinalgError, fast_ab, fast_abt, fast_atb, strict_symmetric_eigh,
 };
 use gam_linalg::roundoff::{
-    accumulation_growth, resolved_eigenvalue_count, symmetric_spectrum_rounding_band,
+    SymmetricAssembly, accumulation_growth, resolved_eigenvalue_count,
+    symmetric_spectrum_rounding_band,
 };
 use ndarray::{Array2, ArrayView2, s};
 
@@ -804,11 +805,15 @@ fn admit_structure(
     let mut entry_band = 0.0_f64;
     for row in 0..count {
         for col in 0..count {
-            entry_band =
-                entry_band.max(product_band(&[member(row).factor(), member(col).factor()], size));
+            entry_band = entry_band.max(product_band(
+                &[member(row).factor(), member(col).factor()],
+                size,
+            ));
         }
     }
-    let values = strict_symmetric_eigh(&gram, Side::Lower)
+    // Entry (r, c) and (c, r) multiply the same pairs in the same order and
+    // round identically, so the Gram is mirrored.
+    let values = strict_symmetric_eigh(&gram, SymmetricAssembly::Mirrored, Side::Lower)
         .map_err(|source| StateBlockError::Eigendecomposition {
             context: "the complex structures' Gram",
             source,
@@ -829,8 +834,10 @@ fn spectral_partition(
     assembly: f64,
     context: &'static str,
 ) -> Result<SpectralSplit, StateBlockError> {
-    let (values, vectors) = strict_symmetric_eigh(operator, Side::Lower)
-        .map_err(|source| StateBlockError::Eigendecomposition { context, source })?;
+    // Every caller passes a `mirror_lower` or `symmetric_part` output.
+    let (values, vectors) =
+        strict_symmetric_eigh(operator, SymmetricAssembly::Mirrored, Side::Lower)
+            .map_err(|source| StateBlockError::Eigendecomposition { context, source })?;
     let mut order: Vec<usize> = (0..values.len()).collect();
     order.sort_by(|&left, &right| values[left].total_cmp(&values[right]));
     let sorted: Vec<f64> = order.iter().map(|&index| values[index]).collect();

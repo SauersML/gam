@@ -1290,7 +1290,16 @@ fn spd_covariance_from_precision(
     // Small positive curvature is not a structural null: its units depend on
     // the coefficient chart. Use the existing strict, unjittered Cholesky
     // and inverse backward-error certificate, not a spectral rank cutoff.
-    gam_linalg::utils::certified_spd_inverse(precision, face)
+    //
+    // Every precision reaching this gate leaves `penalized_hessian_from_owned_mode`
+    // (or the Jeffreys completion added onto it) through
+    // `symmetrize_dense_in_place`, so it is exactly mirrored and no rounding
+    // band is owed to its triangles.
+    gam_linalg::utils::certified_spd_inverse(
+        precision,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        face,
+    )
         .map(|certified| certified.into_inverse())
         .map_err(|error| CustomFamilyError::trial_point(format!(
             "joint posterior precision is non-PD at the converged optimum or its inverse could not be certified on the {face}: {error}"
@@ -2406,22 +2415,38 @@ pub fn first_order_smoothing_correction(
             .map(|&o| outer_gradient[o])
             .collect::<Array1<f64>>()
     };
-    let inverted =
-        match gam_solve::estimate::invert_identified_rho_hessian(&h_sub, 0, &g_sub, None, &[]) {
-            Ok(inverted) => inverted,
-            Err(refusal) => {
-                log::debug!(
-                    "[smoothing-correction] branch=unavailable reason=interior-rho-hessian-refused \
+    // The ρ-Hessian's triangles are separate accumulations of the same mixed
+    // partial (Clairaut), so their skew part is assembly error, not rounding:
+    // symmetrize it and forward that measured defect as a `‖δH‖₂` component,
+    // exactly as the standard lane does (#2748), since the inverter takes an
+    // exactly mirrored ρ-Hessian.
+    let symmetrization_defect = gam_linalg::matrix::symmetrization_defect_2norm(&h_sub);
+    gam_linalg::matrix::symmetrize_in_place(&mut h_sub);
+    let measured_hessian_error = [gam_linalg::curvature_resolution::MeasuredHessianError::new(
+        "outer rho-Hessian symmetrization defect |(H - H')/2|_2",
+        symmetrization_defect,
+    )];
+    let inverted = match gam_solve::estimate::invert_identified_rho_hessian(
+        &h_sub,
+        0,
+        &g_sub,
+        None,
+        &measured_hessian_error,
+    ) {
+        Ok(inverted) => inverted,
+        Err(refusal) => {
+            log::debug!(
+                "[smoothing-correction] branch=unavailable reason=interior-rho-hessian-refused \
                      rho_dimension={k_outer} railed={}: {refusal}",
-                    k_outer - ki,
-                );
-                return Ok(Err(
-                    gam_solve::model_types::SmoothingCorrectionAbsence::InteriorRhoHessianRefused {
-                        refusal,
-                    },
-                ));
-            }
-        };
+                k_outer - ki,
+            );
+            return Ok(Err(
+                gam_solve::model_types::SmoothingCorrectionAbsence::InteriorRhoHessianRefused {
+                    refusal,
+                },
+            ));
+        }
+    };
 
     // C = (V·U_inc) · V_ρ · (V·U_inc)ᵀ — symmetric PSD by construction.
     let mut u_inc = Array2::<f64>::zeros((p_total, ki));

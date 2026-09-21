@@ -627,6 +627,12 @@ fn structural_pseudo_inverse_band(
 /// excludes no coordinate; [`invert_identified_rho_hessian_off_railed`] takes
 /// the certificate's railed set and excludes it through that same call, which
 /// is what the fitted-model correction does.
+///
+/// The ρ-Hessian must be exactly symmetric ([`RHO_HESSIAN_ASSEMBLY`]): its two
+/// triangles are separate accumulations of the same mixed partial, so their
+/// difference is assembly error rather than rounding, and the caller
+/// symmetrizes and forwards that measured defect through
+/// `caller_measured_hessian_error` instead of having it judged here as noise.
 pub fn invert_identified_rho_hessian(
     hessian_rho: &Array2<f64>,
     expected_structural_nullity: usize,
@@ -643,6 +649,12 @@ pub fn invert_identified_rho_hessian(
         caller_measured_hessian_error,
     )
 }
+
+/// Assembly provenance of the ρ-Hessian both entry points take: symmetrized
+/// by the caller (Clairaut), whose skew part is forwarded as a measured
+/// `‖δH‖₂` component (#2748), so the matrix handed in is exactly mirrored.
+pub const RHO_HESSIAN_ASSEMBLY: gam_linalg::roundoff::SymmetricAssembly =
+    gam_linalg::roundoff::SymmetricAssembly::Mirrored;
 
 /// [`invert_identified_rho_hessian`] judged off the coordinates the outer
 /// certificate railed, the face the certificate itself judged on.
@@ -682,8 +694,12 @@ pub fn invert_identified_rho_hessian_off_railed(
     // Reject a non-finite Hessian before the eigensolver sees it: a NaN spectrum
     // would otherwise classify as "unresolvable" rather than as the hard input
     // defect it is.
-    gam_linalg::utils::validate_finite_symmetric_matrix(hessian_rho, "rho Hessian")
-        .map_err(|error| error.to_string())?;
+    gam_linalg::utils::validate_finite_symmetric_matrix(
+        hessian_rho,
+        RHO_HESSIAN_ASSEMBLY,
+        "rho Hessian",
+    )
+    .map_err(|error| error.to_string())?;
 
     // #2676: the criterion is EXACTLY constant along `diag(lambda)^{-1} null(G)`,
     // so the curvature there is `sum_k g_k t_k^2` — the chain-rule term, not a
@@ -1031,9 +1047,12 @@ pub fn invert_identified_rho_hessian_off_railed(
     // today moves by a single ulp — the eigen route below engages only where the
     // old code aborted.
     if active_rank == n {
-        let certified =
-            gam_linalg::utils::certified_spd_inverse(hessian_rho, "unperturbed rho Hessian")
-                .map_err(|error| error.to_string())?;
+        let certified = gam_linalg::utils::certified_spd_inverse(
+            hessian_rho,
+            RHO_HESSIAN_ASSEMBLY,
+            "unperturbed rho Hessian",
+        )
+        .map_err(|error| error.to_string())?;
         return Ok(InvertedRhoHessian {
             inverse: certified.into_inverse(),
             active_rank: n,
@@ -1076,6 +1095,9 @@ pub fn invert_identified_rho_hessian_off_railed(
     // gradient, at the one site whose whole purpose is to stop doing that.
     let matrix_max_abs = gam_linalg::utils::validate_finite_symmetric_matrix(
         work,
+        // Either the caller's mirrored ρ-Hessian or its judged-subspace
+        // compression, which `compress_to_judged_subspace` symmetrizes.
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
         "structurally singular rho Hessian",
     )
     .map_err(|error| error.to_string())?;

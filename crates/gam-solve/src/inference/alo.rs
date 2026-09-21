@@ -5,7 +5,7 @@ use faer::prelude::ReborrowMut;
 use faer::{Accum, Par};
 use gam_linalg::faer_ndarray::FaerArrayView;
 use gam_linalg::matrix::{DesignMatrix, PsdWeightsView, SignedWeightsView};
-use gam_linalg::roundoff::accumulation_growth;
+use gam_linalg::roundoff::{SymmetricAssembly, accumulation_growth};
 use gam_linalg::utils::{
     CertifiedSpdFactor, certified_spd_factorize, symmetric_extremes,
     validate_finite_symmetric_matrix,
@@ -713,7 +713,15 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
 
     validate_alo_solve_setup(input, n, p)?;
 
-    let factor = certified_spd_factorize(input.penalized_hessian, "ALO penalized Hessian")
+    // The saved penalized Hessian arrives from whichever fit produced it, so
+    // this solve cannot assume a mirrored producer: it is certified against
+    // the weighted-Gram bound of an `n`-row design plus a penalty whose root
+    // has at most `p` rows (`SymmetricAssembly::penalized_gram`).
+    let factor = certified_spd_factorize(
+        input.penalized_hessian,
+        SymmetricAssembly::penalized_gram(n, p),
+        "ALO penalized Hessian",
+    )
         .map_err(|error| AloError::InvalidInput {
             reason: format!(
                 "ALO requires an unperturbed positive-definite penalized Hessian with a certified solve: {error}"
@@ -1149,10 +1157,16 @@ fn validate_multiblock_alo_input(input: &MultiBlockAloInput<'_>) -> Result<(), A
                     ),
                 });
             }
-            validate_finite_symmetric_matrix(matrix, &format!("multi-block ALO row {row} {label}"))
-                .map_err(|error| AloError::InvalidInput {
-                    reason: error.to_string(),
-                })?;
+            // Per-row observed Hessians and score covariances are declared
+            // inputs under the exact-symmetry contract.
+            validate_finite_symmetric_matrix(
+                matrix,
+                SymmetricAssembly::Mirrored,
+                &format!("multi-block ALO row {row} {label}"),
+            )
+            .map_err(|error| AloError::InvalidInput {
+                reason: error.to_string(),
+            })?;
         }
         let covariance_scale = score_covariance
             .iter()
@@ -1212,7 +1226,14 @@ fn compute_multiblock_alo_inner(
     let b = input.n_coordinates;
     let p_tot = input.penalized_hessian.nrows();
     validate_multiblock_alo_input(input)?;
-    let factor = certified_spd_factorize(input.penalized_hessian, "multi-block ALO penalized Hessian")
+    // Saved Hessian of unknown producer: each entry of Σ_i J_iᵀ W_i J_i sums
+    // `n · b²` row-and-coordinate products, plus a penalty whose root has at
+    // most `p_tot` rows.
+    let factor = certified_spd_factorize(
+        input.penalized_hessian,
+        SymmetricAssembly::penalized_gram(n.saturating_mul(b).saturating_mul(b), p_tot),
+        "multi-block ALO penalized Hessian",
+    )
         .map_err(|error| AloError::InvalidInput {
             reason: format!(
                 "multi-block ALO requires an unperturbed positive-definite saved penalized Hessian: {error}"

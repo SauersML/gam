@@ -1502,7 +1502,14 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
     let started = std::time::Instant::now();
     let fit = fit_event_history(&mut cohort, &spec).expect("fit");
     let truth_covariance = truth.dot(&truth.t());
-    let (truth_eigenvalues, _) = super::covariance::eigenmodes(&truth_covariance).expect("eigen");
+    // A GEMM Gram over the `rank` loading columns.
+    let (truth_eigenvalues, _) = super::covariance::eigenmodes(
+        &truth_covariance,
+        gam_linalg::roundoff::SymmetricAssembly::PsdAccumulation {
+            depth: truth.ncols(),
+        },
+    )
+    .expect("eigen");
     emit(&format!(
         "[four] {:.1}s rank={} path={:?}",
         started.elapsed().as_secs_f64(),
@@ -1712,20 +1719,32 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
         let scale: Vec<f64> = (0..width)
             .map(|q| covariance[[q, q]].max(0.0).sqrt().recip())
             .collect();
-        let equilibrated =
-            Array2::from_shape_fn((width, width), |(p, q)| scale[p] * covariance[[p, q]] * scale[q]);
-        let lower = gam_linalg::faer_ndarray::FaerCholesky::cholesky(&equilibrated, faer::Side::Lower)
-            .expect("equilibrated posterior Cholesky")
-            .lower_triangular()
-            .mapv(f64::abs);
+        // Read from the lower triangle, the one the Cholesky below reads, so the
+        // equilibrated matrix is mirrored.
+        let equilibrated = Array2::from_shape_fn((width, width), |(p, q)| {
+            let (row, col) = (p.max(q), p.min(q));
+            scale[row] * covariance[[row, col]] * scale[col]
+        });
+        let lower =
+            gam_linalg::faer_ndarray::FaerCholesky::cholesky(&equilibrated, faer::Side::Lower)
+                .expect("equilibrated posterior Cholesky")
+                .lower_triangular()
+                .mapv(f64::abs);
         let steps = (3 * width + 1) as f64;
         let gamma = steps * f64::EPSILON / (1.0 - steps * f64::EPSILON);
         let rp = gamma * frobenius(&lower.dot(&lower.t())) / frobenius(&equilibrated);
-        let (spectrum, _) = super::covariance::eigenmodes(&equilibrated).expect("equilibrated spectrum");
+        let (spectrum, _) = super::covariance::eigenmodes(
+            &equilibrated,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        )
+        .expect("equilibrated spectrum");
         let largest = spectrum.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
         let smallest = spectrum.iter().fold(f64::INFINITY, |m, x| m.min(x.abs()));
         let kappa = largest / smallest;
-        emit(&format!("[four] posterior solve: κ(V_eq) = {kappa}, rp = {rp}, κ·rp = {}", kappa * rp));
+        emit(&format!(
+            "[four] posterior solve: κ(V_eq) = {kappa}, rp = {rp}, κ·rp = {}",
+            kappa * rp
+        ));
         assert!(
             kappa * rp < 1.0,
             "the posterior solve is unresolved: κ(V_eq) = {kappa}, rp = {rp}"

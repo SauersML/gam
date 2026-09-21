@@ -455,11 +455,16 @@ pub(crate) fn residualize_influence_columns(
     // dividing the formation band by it never under-states the band.
     let relative_cutoff =
         accumulation_growth(n + 1) * diagonal.sum() / max_diagonal + p_m as f64 * f64::EPSILON;
-    let pseudoinverse = rank_certified_psd_pseudoinverse(&gram, relative_cutoff)
-        .map_err(|error| {
-            format!("residualize_influence_columns: weighted marginal Gram pseudo-inverse: {error}")
-        })?
-        .into_pseudoinverse();
+    // `fast_xt_diag_x` mirrors on every backend.
+    let pseudoinverse = rank_certified_psd_pseudoinverse(
+        &gram,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        relative_cutoff,
+    )
+    .map_err(|error| {
+        format!("residualize_influence_columns: weighted marginal Gram pseudo-inverse: {error}")
+    })?
+    .into_pseudoinverse();
     // coeffs = (MᵀWM)⁺ MᵀW Z   (p_m × p₁)
     let cross = fast_xt_diag_y(&marginal_design, w_metric, z_infl);
     let coeffs = fast_ab(&pseudoinverse, &cross);

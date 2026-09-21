@@ -463,8 +463,13 @@ fn positive_pseudo_logdet_psi_jet(
             s2.len()
         );
     }
-    let (eigenvalues, eigenvectors) = strict_symmetric_eigh(s0, Side::Lower)
-        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+    let (eigenvalues, eigenvectors) = strict_symmetric_eigh(
+        s0,
+        // `sym` forms `(S + Sᵀ)/2` with commutative additions: mirrored.
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        Side::Lower,
+    )
+    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
     let mut order: Vec<usize> = (0..p).collect();
     order.sort_by(|&i, &j| {
         eigenvalues[j]

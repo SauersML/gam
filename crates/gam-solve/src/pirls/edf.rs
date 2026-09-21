@@ -123,13 +123,16 @@ pub(super) fn calculate_edf(
     }
     let rhs_arr = e_transformed.t().to_owned();
     // SymmetricMatrix::factorize() is a certified Cholesky on either storage,
-    // so an indefinite H is refused rather than turned into an EDF.
-    let factor =
-        penalized_hessian
-            .factorize()
-            .map_err(|_| EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            })?;
+    // so an indefinite H is refused rather than turned into an EDF. `X'WX`
+    // comes from `fast_xt_diag_x`, which mirrors, so the penalty root's Gram
+    // over `r` rows is the only term that can separate the two triangles.
+    let factor = penalized_hessian
+        .factorize(gam_linalg::roundoff::SymmetricAssembly::penalized_gram(
+            0, r,
+        ))
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?;
     let sol = factor
         .solvemulti(&rhs_arr)
         .map_err(|_| EstimationError::ModelIsIllConditioned {

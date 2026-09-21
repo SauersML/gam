@@ -751,8 +751,12 @@ mod latent_reml_tests {
     fn latent_decoder_ols_r2(design: &Array2<f64>, y: &Array1<f64>) -> f64 {
         let gram = design.t().dot(design);
         let rhs = design.t().dot(y);
+        // A full GEMM over the design's rows: depth `n` per triangle.
         let beta = gam_linalg::utils::certified_spd_factorize(
             &gram,
+            gam_linalg::roundoff::SymmetricAssembly::PsdAccumulation {
+                depth: design.nrows(),
+            },
             "OLS normal equations for latent decoder recovery",
         )
         .expect("OLS normal-equations SPD factor")
@@ -892,11 +896,17 @@ mod latent_reml_tests {
         let solve_fitted = |design: &Array2<f64>| -> Array1<f64> {
             let gram = design.t().dot(design);
             let rhs = design.t().dot(&y);
-            let beta = gam_linalg::utils::certified_spd_factorize(&gram, "seam OLS normal equations")
-                .expect("seam OLS SPD factor")
-                .solve(&rhs)
-                .expect("seam OLS solve")
-                .into_solution();
+            let beta = gam_linalg::utils::certified_spd_factorize(
+                &gram,
+                gam_linalg::roundoff::SymmetricAssembly::PsdAccumulation {
+                    depth: design.nrows(),
+                },
+                "seam OLS normal equations",
+            )
+            .expect("seam OLS SPD factor")
+            .solve(&rhs)
+            .expect("seam OLS solve")
+            .into_solution();
             design.dot(&beta)
         };
         let fitted_per = solve_fitted(&design_per);
