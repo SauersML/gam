@@ -19,6 +19,35 @@
   error naming the share — the promise `EventHistoryFamily` has documented since the mechanism
   was reverted by the merge of PR #3411. The Louis Hessian and `latent_state` move by at most the
   mass the old floor was discarding, which is now bounded rather than assumed.
+- **An exact-joint outer search priced its criterion at whichever inner basin one warm start
+  reached, and followed that basin into its saddle-node fold** (gam#3173, gam#3209, gam#3005).
+  The survival marginal-slope, Bernoulli marginal-slope and transformation-normal routes each
+  hand their outer evaluation ONE coefficient-mode start: the certified mode of the accepted
+  iterate, carried by the driver's coefficient-mode branch. Which basin that start
+  reaches is chosen by the walk, so `V(θ)` was not a function of `θ`. On the gam#3003 ours330
+  probit reproducer two evaluations at a `θ` agreeing to four digits returned `f = 1296.692` and
+  `f = 1297.334`, the second on a mode 0.64 above the first. The Laplace approximation is taken at
+  the posterior mode, which is the global minimizer of the inner penalized objective
+  `f = −ℓ + ½βᵀS_λβ − Φ`, so the tracked mode was not the criterion's. Following it, the search
+  descended the fold where that minimum meets the saddle separating it from the other basin: the
+  softest curvature runs as `σ ∝ √(θ*−θ)`, `½log σ → −∞`, and the criterion fell about 0.2 per
+  accepted step at a `θ` that no longer moved while `|g|` grew geometrically, for over nineteen
+  minutes until the test harness killed the run. The published-mode rule gam#3173 installed for
+  the cf-inner route now covers these three routes too: an evaluation's starts are the driver's
+  incumbent completed with the fit's fixed start — here the blocks' own seed, which the driver
+  rebuilds at every `θ` from the fit's coefficient hints, so its mode at `θ` is a function of `θ`
+  — and the published mode is the certified one with the lowest `f`, candidate order keeping every
+  tie within the rounding the comparison itself carries. This also removes the fold with no fold
+  threshold at all: at a saddle-node fold the vanishing minimum and the saddle coincide, so the
+  mountain-pass inequality `f(saddle) ≥ f(minimum)` puts the rival basin strictly below the
+  folding one in a neighbourhood of the fold, and a folding mode is therefore never the global
+  mode wherever the mode it merges with is reachable. The rule costs one further inner solve per
+  evaluation on a family whose inner objective may have more than one mode, and none on a family
+  that certifies one mode. The transformation-normal driver's second profile, which re-solved the
+  family's monotone construction when the carried anchor was infeasible at a trial point, is
+  deleted: that construction is the fixed start the evaluation now solves at every `θ`. The
+  latent-survival exact-joint route still solves its branch's one start through
+  `evaluate_custom_family_joint_hyper_owned` and is unchanged.
 - **A survival `sample()` described a different posterior than the same fit's `predict()`**
   (gam#3184). The survival NUTS path targets `π(β | ρ̂, y)` and returned those draws labelled
   `covariance_source = "conditional"`, while `predict()` on the same fit priced its bands off the

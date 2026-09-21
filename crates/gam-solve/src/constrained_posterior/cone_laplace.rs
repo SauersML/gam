@@ -146,7 +146,7 @@ impl std::fmt::Display for ConeLaplaceRefusal {
                 f,
                 "constrained Laplace term: row {row}'s continued tilted variance is {variance:e} at \
                  sweep {sweep}; the constrained mode is at a fold, outside the boundary Laplace \
-                 regime (gam#2765, gam#2979)"
+                 regime (gam#2765, gam#3173)"
             ),
             Self::NotContracting { sweeps, fraction, step } => write!(
                 f,

@@ -86,8 +86,20 @@ impl OuterWalkSignals {
 /// `|β|∞ = 9.46` and diverged onto the singular Jeffreys face). The certified
 /// modes are keyed by the bits of the full `θ`, so a ψ move is a different
 /// iterate even where `ρ` did not move.
+///
+/// The anchor is the evaluation's INCUMBENT start, not its only one. A driver
+/// that publishes through `evaluate_custom_family_joint_hyper_best_mode_shared`
+/// has that start completed there with the fit's fixed start, and the certified
+/// mode with the lowest penalized objective `f` is published (gam#3173,
+/// `joint_mode_starts` in gam-custom-family). Without that completion the anchor
+/// alone names the basin: an outer walk that follows a mode into its saddle-node
+/// fold prices `½log σ → −∞` at a `θ` that no longer moves, with no lower mode to
+/// hand over to, and the search does not terminate (gam#3173, gam#3209,
+/// gam#3005). The latent-survival driver takes this branch's one start and calls
+/// `evaluate_custom_family_joint_hyper_owned`, which solves it alone.
 pub(crate) struct ExactCoefficientModeBranch {
-    /// The mode every evaluation is solved from.
+    /// The incumbent mode every evaluation is solved from, beside the fit's
+    /// fixed start.
     anchor: Option<CustomFamilyWarmStart>,
     /// Whether `anchor` is the certified mode of an accepted outer iterate
     /// rather than a seed-time carry. Once true, seeds and value-only probes can
@@ -164,10 +176,11 @@ impl ExactCoefficientModeBranch {
         self.anchored_at_iterate = true;
     }
 
-    /// The warm-start candidates for one evaluation at `theta`: the certified
-    /// mode of the accepted iterate at `theta` when there is one, otherwise the
+    /// The incumbent's start for one evaluation at `theta`: the certified mode
+    /// of the accepted iterate at `theta` when there is one, otherwise the
     /// anchor, when it is dimensionally compatible with `rho`; otherwise a cold
-    /// solve.
+    /// solve. It is the start the WALK chooses; the best-mode evaluator solves
+    /// the fit's fixed start beside it (gam#3173).
     ///
     /// The returned flag is true exactly at the first derivative-bearing
     /// evaluation, the moment the anchor becomes iterate-owned.

@@ -411,10 +411,13 @@ pub(crate) fn fit_transformation_normal(
     }
 
     // A rank-deficient transformation chart can have multiple equivalent
-    // coefficient modes. Value-only trials compare cold and carried modes;
-    // the first derivative-bearing evaluation freezes the selected mode's
-    // INPUT as the branch anchor. Every later trial restarts from that fixed
-    // anchor, making the profile independent of rejected-trial cache history.
+    // coefficient modes. The first derivative-bearing evaluation freezes the
+    // selected mode's INPUT as the branch anchor, and every later trial restarts
+    // from that fixed anchor, making the profile independent of rejected-trial
+    // cache history. The anchor is the trial's incumbent start: every trial also
+    // solves the fit's fixed start, the blocks' own monotone construction, and
+    // publishes whichever certified mode has the lower penalized objective
+    // (gam#3173).
     let walk_signals = crate::exact_mode_branch::OuterWalkSignals::default();
     let exact_mode_branch: RefCell<ExactCoefficientModeBranch> =
         RefCell::new(ExactCoefficientModeBranch::new(walk_signals.clone()));
@@ -712,15 +715,6 @@ pub(crate) fn fit_transformation_normal(
                 )?
             } else {
                 let warm_starts = exact_mode_candidates(eval_mode, theta, &rho);
-                let carried = evaluate_custom_family_joint_hyper_best_mode_shared(
-                    &geometry.family,
-                    &geometry.blocks,
-                    &eval_options,
-                    &rho,
-                    Arc::clone(&geometry.hyper_layout),
-                    &warm_starts,
-                    eval_mode,
-                );
                 // The carried anchor is the accepted iterate's mode, certified on
                 // THAT iterate's covariate design. A trial whose log κ has moved far
                 // enough rebuilds the Duchon design, and the same coefficients can
@@ -731,30 +725,21 @@ pub(crate) fn fit_transformation_normal(
                 // smoke cohort every later seed and both saddle-escape reseeds died
                 // this way (`h' has non-positive values`, min −4.05) and the fit
                 // failed. The family's own construction has constant positive shape
-                // rows, so it is monotone on every design; the profile at this θ
-                // starts from it instead. Only the anchored case re-profiles: a
-                // refused cold profile is final, and wherever the anchor is feasible
-                // it stays the only start (#2765).
-                let selection = match carried {
-                    Err(error)
-                        if error.is_trial_point_infeasible()
-                            && warm_starts.iter().any(Option::is_some) =>
-                    {
-                        log::debug!(
-                            "[transformation-normal] carried coefficient mode is infeasible at this trial point; re-profiling from the family's monotone construction: {error}"
-                        );
-                        evaluate_custom_family_joint_hyper_best_mode_shared(
-                            &geometry.family,
-                            &geometry.blocks,
-                            &eval_options,
-                            &rho,
-                            Arc::clone(&geometry.hyper_layout),
-                            &[None],
-                            eval_mode,
-                        )
-                    }
-                    other => other,
-                }?;
+                // rows, so it is monotone on every design, and it is the fit's fixed
+                // start the evaluator solves beside the anchor at every θ (gam#3173).
+                // An anchor that is infeasible here drops out of the published-mode
+                // selection and the fixed start's mode is published, so the second
+                // profile this arm used to run would only repeat a solve that already
+                // ran at this θ.
+                let selection = evaluate_custom_family_joint_hyper_best_mode_shared(
+                    &geometry.family,
+                    &geometry.blocks,
+                    &eval_options,
+                    &rho,
+                    Arc::clone(&geometry.hyper_layout),
+                    &warm_starts,
+                    eval_mode,
+                )?;
                 for (candidate_idx, rejection) in selection.rejected_candidates.iter().enumerate() {
                     if let Some(rejection) = rejection {
                         log::debug!(

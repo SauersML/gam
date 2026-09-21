@@ -4367,15 +4367,52 @@ fn mode_profile_exhausted_error(
     }
 }
 
+/// The starts one exact-joint evaluation solves its candidate modes from (gam#3173).
+///
+/// The caller is the driver's coefficient-mode branch (gam-models'
+/// `ExactCoefficientModeBranch`), and it carries ONE start: the certified mode of the
+/// accepted outer iterate. Which basin that start reaches is chosen by the walk, so `V(θ)`
+/// is not a function of `θ`, and where the tracked mode runs into a saddle-node fold the
+/// criterion's `½log σ` falls without bound at a `θ` that no longer moves, with no mode
+/// below it to hand over to (gam#3173, gam#3209, gam#3005).
+///
+/// The rule's other half is the fit's fixed starts, whose modes at `θ` are a function of
+/// `θ`. These drivers rebuild their blocks at every `θ` from the fit's coefficient hints and
+/// solve no branch continuation, so the one start the walk does not choose is the blocks'
+/// own seed: the cold candidate. It is completed here for a family whose inner objective may
+/// have more than one mode. A family that certifies one mode keeps its single start, and
+/// [`fixed_mode_starts`] takes each distinct seed once, so a caller that already carries the
+/// cold start keeps the list it passed.
+fn joint_mode_starts<F: CustomFamily + ?Sized>(
+    family: &F,
+    candidates: &[Option<CustomFamilyWarmStart>],
+) -> Vec<Option<CustomFamilyWarmStart>> {
+    let completed = fixed_mode_starts(
+        family,
+        candidates
+            .iter()
+            .map(|start| start.as_ref().map(|start| start.inner.clone()))
+            .chain(std::iter::once(None)),
+    );
+    if completed.is_empty() {
+        return candidates.to_vec();
+    }
+    completed
+        .into_iter()
+        .map(|start| start.map(|inner| CustomFamilyWarmStart { inner }))
+        .collect()
+}
+
 /// Profile a nonconvex coefficient mode without assembling expensive outer
 /// derivatives for every candidate.
 ///
-/// Every candidate is solved once at the requested derivative quality while
-/// assembling only its value. The winner is the certified candidate with the
-/// lowest penalized objective, the published-mode rule of gam#3173
-/// ([`lowest_penalized_index`]: candidate order keeps ties within rounding). It owns the
-/// exact [`BlockwiseInnerResult`] used for that value; requested derivatives are
-/// assembled directly from that same mode.
+/// The starts are the caller's, completed with the fit's fixed start
+/// ([`joint_mode_starts`]). Every start is solved once at the requested
+/// derivative quality while assembling only its value. The winner is the
+/// certified candidate with the lowest penalized objective, the published-mode
+/// rule of gam#3173 ([`lowest_penalized_index`]: candidate order keeps ties
+/// within rounding). It owns the exact [`BlockwiseInnerResult`] used for that
+/// value; requested derivatives are assembled directly from that same mode.
 /// If the winning branch cannot provide the requested derivative payload, the
 /// evaluation errors instead of silently changing the profiled objective by
 /// selecting a worse coefficient basin.
@@ -4396,6 +4433,10 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
             reason: "at least one coefficient-mode candidate is required".to_string(),
         });
     }
+    // gam#3173: the published mode is the lowest-`f` certified mode over a set of starts the walk
+    // did not choose, so the caller's starts carry the fit's fixed start beside the incumbent's.
+    let starts = joint_mode_starts(family, candidates);
+    let candidates = starts.as_slice();
 
     let mut screened_objectives = vec![None; candidates.len()];
     let mut penalized_objectives: Vec<Option<PenalizedObjective>> = vec![None; candidates.len()];
@@ -4492,6 +4533,27 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
             &rejection_is_rho_local,
         ));
     };
+    // The one line that shows a basin change between two evaluations at one θ: which start the
+    // rule published, and how far the nearest rival's `f` sat above it (gam#3173). A single
+    // start is its own selection and prices no penalized objective, so it writes no line.
+    if let Some(published) = penalized_objectives[selected_candidate].as_ref() {
+        let certified = penalized_objectives.iter().filter(|entry| entry.is_some()).count();
+        let runner_up_gap = penalized_objectives
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != selected_candidate)
+            .filter_map(|(_, penalized)| penalized.as_ref().map(|penalized| penalized.value))
+            .reduce(f64::min)
+            .map(|rival| rival - published.value);
+        log::debug!(
+            "[mode selection #3173] exact-joint rho=[{}]: {certified} of {} start(s) certified \
+             a mode; published start {selected_candidate}, f={:.9e}; runner-up gap {}",
+            join_rho(rho_current),
+            candidates.len(),
+            published.value,
+            runner_up_gap.map_or_else(|| "none".to_string(), |gap| format!("{gap:.3e}")),
+        );
+    }
 
     if matches!(eval_mode, EvalMode::ValueOnly) {
         let owned = outer_eval_result_into_joint_hyper_owned_result(

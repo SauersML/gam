@@ -1,4 +1,4 @@
-//! Pins for the soft-line marginal (#2979).
+//! Pins for the soft-line marginal (#3173).
 //!
 //! - A Gaussian slice with moving ends has a closed form. It pins the value, the Leibniz end terms and the covariance
 //!   term of the Hessian.

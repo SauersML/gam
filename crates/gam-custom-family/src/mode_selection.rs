@@ -15,6 +15,15 @@
 //! walks that carry different incumbents to one θ publish the same value there unless an incumbent
 //! reaches a mode lower than every fixed start's, which then wins in that walk only.
 //!
+//! The exact-joint drivers that publish through `evaluate_custom_family_joint_hyper_best_mode_shared`
+//! -- the survival marginal-slope, Bernoulli marginal-slope and transformation-normal routes --
+//! carry their incumbent in a coefficient-mode branch and solve no continuation, so their starts
+//! are completed where the rule is applied (`joint_mode_starts`, beside that evaluator). Their
+//! fit's fixed start is the blocks' own seed, which the driver rebuilds at every theta from the
+//! fit's coefficient hints. The latent-survival route takes the branch's one start and calls
+//! `evaluate_custom_family_joint_hyper_owned`, which solves it alone: routing that driver through
+//! the same evaluator is the remaining site.
+//!
 //! Measured on `default_worker_stack_2967`: at ρ = [0, 0] the #2661 anchored endpoint's branch
 //! certifies `f = 2356.81` and the caller's seed's branch `f = 2330.28`. An outer search that
 //! carried only the first stayed on it into its fold near ρ = [4.30, 2.24] and ended uncertified

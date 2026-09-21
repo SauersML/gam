@@ -219,7 +219,8 @@ pub(crate) enum BranchContinuationRefusal {
     Evaluation(CustomFamilyError),
 }
 
-fn join_rho(rho: &Array1<f64>) -> String {
+/// The rho a mode-selection or continuation line names, one rendering for both (gam#3173).
+pub(crate) fn join_rho(rho: &Array1<f64>) -> String {
     rho.iter()
         .map(|value| format!("{value:.6e}"))
         .collect::<Vec<_>>()

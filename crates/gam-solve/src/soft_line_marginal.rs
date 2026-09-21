@@ -1,8 +1,8 @@
-//! The soft-line marginal: the Laplace criterion with its softest inner coordinate integrated exactly (#2979).
+//! The soft-line marginal: the Laplace criterion with its softest inner coordinate integrated exactly (#3173).
 //!
 //! # Why the Gaussian step fails at a fold
 //! The single-mode Laplace criterion `V_L = f(β̂) + ½ln|H/2π|` treats every inner coordinate as Gaussian. At an
-//! inner-mode fold (#2979), the tracked minimum meets a saddle and the pair annihilates. The softest curvature then
+//! inner-mode fold (#2765, #3173), the tracked minimum meets a saddle and the pair annihilates. The softest curvature
 //! runs as `σ ∝ √(ρ* − ρ)`, so `∂_ρ(½ln σ) ∝ 1/σ²` diverges: the criterion and its gradient are not finite there.
 //! Nothing about the likelihood is singular. Only the Gaussian step along the collapsing direction is wrong.
 //!

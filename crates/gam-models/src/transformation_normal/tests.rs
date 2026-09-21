@@ -53,7 +53,12 @@ pub(crate) fn exact_ctn_mode_branch_anchors_on_the_accepted_iterate_2765() {
     state.record_value(value_only, &theta, warm(1.0), true);
     state.record_value(value_only, &theta, warm(9.0), false);
     let (_, candidates) = state.candidates(value_only, &theta, &rho);
-    assert_eq!(candidates.len(), 1, "one start per evaluation, never a cold solve beside it");
+    assert_eq!(
+        candidates.len(),
+        1,
+        "the branch hands over one start, the incumbent's; the fit's fixed start is completed at \
+         the evaluator (gam#3173)"
+    );
     assert_eq!(anchor_beta(&candidates), 1.0);
     state.record_value(value_only, &theta, warm(2.0), true);
 

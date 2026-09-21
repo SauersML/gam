@@ -1837,3 +1837,156 @@ fn the_fixed_starts_are_left_out_only_where_the_rule_already_published_3173() {
         "at any other θ the fixed starts are solved again"
     );
 }
+
+/// The same tilted double well, over a family that declares its inner objective globally convex.
+///
+/// The declaration is false of this objective, and that is what the fixture is for: it is the one
+/// input the published-mode rule reads to decide whether an evaluation solves more than one start
+/// ([`inner_objective_may_have_several_modes`]), so a control that shows the completion moved the
+/// published mode has to drive that input and leave the objective, the specs and the starts alone.
+#[derive(Clone)]
+struct ConvexDeclaringDoubleWellFamily(TiltedDoubleWellFamily);
+
+impl CustomFamily for ConvexDeclaringDoubleWellFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        self.0.evaluate(block_states)
+    }
+
+    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+        self.0.exact_newton_joint_hessian_beta_dependent()
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.0.exact_newton_joint_hessian(block_states)
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        direction: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.0
+            .exact_newton_joint_hessian_directional_derivative(block_states, direction)
+    }
+
+    fn exact_newton_outer_curvature(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<ExactNewtonOuterCurvature>, String> {
+        self.0.exact_newton_outer_curvature(block_states)
+    }
+
+    fn inner_coefficient_objective_is_globally_convex(&self) -> bool {
+        true
+    }
+}
+
+/// The walk's accepted incumbent, in the shallow well: coefficients certified at another θ, which
+/// is what an exact-joint driver's coefficient-mode branch hands its evaluation.
+fn shallow_well_incumbent_3173() -> CustomFamilyWarmStart {
+    CustomFamilyWarmStart {
+        inner: crate::assembly::ConstrainedWarmStart {
+            rho: array![0.4],
+            block_beta: vec![array![2.0]],
+            active_sets: vec![None],
+            cached_inner: None,
+        },
+    }
+}
+
+/// #3173: an exact-joint evaluation's starts are the driver's, completed with the fit's fixed
+/// start, so the published mode is the lowest-`f` certified mode over a set the walk did not
+/// choose.
+///
+/// The exact-joint drivers hand the evaluator ONE start, their coefficient-mode branch's
+/// incumbent. Here that incumbent sits in the shallow well while the fit's blocks are seeded in
+/// the deep one. At ρ = 0.5 both wells are minima and the closed form orders them, so the
+/// completed evaluation publishes the deep mode.
+///
+/// The control is the same evaluation, the same specs and the same start, on a family that
+/// certifies one mode: it solves the one start it was handed and publishes the shallow
+/// incumbent's mode although the blocks are seeded in the deep well. So it is the completion, not
+/// the seeding, that moves the published mode. A caller that already carries the fixed start keeps
+/// the list it passed: the fixed start is taken once.
+#[test]
+fn an_exact_joint_evaluation_completes_its_starts_with_the_fits_fixed_start_3173() {
+    let family = TiltedDoubleWellFamily::new(TILT);
+    let options = double_well_options();
+    let rho = array![0.5];
+    let deep_seeded = [double_well_spec(-2.0)];
+    let layout = || Arc::new(test_design_hyper_layout(vec![Vec::new()]));
+    let completed = evaluate_custom_family_joint_hyper_best_mode_shared(
+        &family,
+        &deep_seeded,
+        &options,
+        &rho,
+        layout(),
+        &[Some(shallow_well_incumbent_3173())],
+        EvalMode::ValueOnly,
+    )
+    .expect("an evaluation at rho=0.5 certifies a mode");
+    assert_eq!(
+        completed.screened_objectives.len(),
+        2,
+        "the driver's one start is completed with the fit's fixed start"
+    );
+    let published = completed
+        .result
+        .warm_start
+        .block_beta_view(0)
+        .expect("one coefficient")[0];
+    assert!(
+        is_deep_mode_2973(0.5, published),
+        "the deep well's mode is the lower of the two, so it is published; got {published}"
+    );
+
+    let convex = ConvexDeclaringDoubleWellFamily(TiltedDoubleWellFamily::new(TILT));
+    let one_start = evaluate_custom_family_joint_hyper_best_mode_shared(
+        &convex,
+        &deep_seeded,
+        &options,
+        &rho,
+        layout(),
+        &[Some(shallow_well_incumbent_3173())],
+        EvalMode::ValueOnly,
+    )
+    .expect("a family that certifies one mode still certifies the start it was handed");
+    assert_eq!(
+        one_start.screened_objectives.len(),
+        1,
+        "a family whose inner objective has one mode is solved from one start"
+    );
+    let carried = one_start
+        .result
+        .warm_start
+        .block_beta_view(0)
+        .expect("one coefficient")[0];
+    assert!(
+        is_shallow_mode_2973(0.5, carried),
+        "the incumbent alone reaches the shallow well; got {carried}"
+    );
+    assert!(
+        double_well_penalized_objective_3173(0.5, published)
+            < double_well_penalized_objective_3173(0.5, carried),
+        "the closed form orders the deep minimum below the shallow one"
+    );
+
+    let already_carried = evaluate_custom_family_joint_hyper_best_mode_shared(
+        &family,
+        &deep_seeded,
+        &options,
+        &rho,
+        layout(),
+        &[Some(shallow_well_incumbent_3173()), None],
+        EvalMode::ValueOnly,
+    )
+    .expect("an evaluation that already carries the fixed start certifies a mode");
+    assert_eq!(
+        already_carried.screened_objectives.len(),
+        2,
+        "the fit's fixed start is taken once"
+    );
+}
