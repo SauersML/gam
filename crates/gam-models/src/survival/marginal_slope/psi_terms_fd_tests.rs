@@ -91,6 +91,12 @@ enum SlopeFrame {
     /// closed form, so the frame is nonlinear in every primary and every
     /// pullback below reads the implicit-function derivatives.
     Anchored,
+    /// The four-primary static frame with an absorbed Stage-1 influence block
+    /// (#461): a trailing coefficient block `γ` entering every row through the
+    /// `o_infl = Z̃_infl[row,:]·γ` primary. The design ψ calculus must carry the
+    /// `(ψ, influence)` score and Hessian crosses exactly as the joint Hessian
+    /// carries the influence block itself.
+    InfluenceAbsorbed,
 }
 
 impl SlopeFrame {
@@ -99,6 +105,7 @@ impl SlopeFrame {
             Self::Static => "static-slope",
             Self::FollowUpVarying => "follow-up-varying-slope",
             Self::Anchored => "anchored-slope",
+            Self::InfluenceAbsorbed => "influence-absorbed-slope",
         }
     }
 }
@@ -290,7 +297,9 @@ fn family_at(axis: PsiAxis, frame: SlopeFrame, t: f64) -> SurvivalMarginalSlopeF
     }
 
     let slope_layout: SlopeLayout = match frame {
-        SlopeFrame::Static | SlopeFrame::Anchored => (DesignMatrix::from(slope_exit)).into(),
+        SlopeFrame::Static | SlopeFrame::Anchored | SlopeFrame::InfluenceAbsorbed => {
+            (DesignMatrix::from(slope_exit)).into()
+        }
         SlopeFrame::FollowUpVarying => {
             let layout: SlopeLayout = (DesignMatrix::from(slope_exit)).into();
             layout
@@ -306,7 +315,9 @@ fn family_at(axis: PsiAxis, frame: SlopeFrame, t: f64) -> SurvivalMarginalSlopeF
         jeffreys_armed: true,
         latent_law: match frame {
             SlopeFrame::Anchored => Some(anchored_law(n)),
-            SlopeFrame::Static | SlopeFrame::FollowUpVarying => None,
+            SlopeFrame::Static | SlopeFrame::FollowUpVarying | SlopeFrame::InfluenceAbsorbed => {
+                None
+            }
         },
         n,
         event: Arc::new(event),
@@ -328,7 +339,8 @@ fn family_at(axis: PsiAxis, frame: SlopeFrame, t: f64) -> SurvivalMarginalSlopeF
         slope_layout,
         score_warp: None,
         link_dev: None,
-        influence_absorber: None,
+        influence_absorber: (frame == SlopeFrame::InfluenceAbsorbed)
+            .then(influence_absorber_design),
         time_linear_constraints: None,
         time_wiggle_knots: None,
         time_wiggle_degree: None,
@@ -336,6 +348,22 @@ fn family_at(axis: PsiAxis, frame: SlopeFrame, t: f64) -> SurvivalMarginalSlopeF
         intercept_warm_starts: None,
         flex_jet_arenas: new_flex_jet_arena_pool(),
     }
+}
+
+/// The absorbed influence design `Z̃_infl` (n × 2) of the influence frame. It
+/// is fixed data of the family, so no ψ axis moves it.
+fn influence_absorber_design() -> Array2<f64> {
+    Array2::from_shape_fn((N_ROWS, 2), |(i, j)| {
+        let x = i as f64 / N_ROWS as f64;
+        match j {
+            0 => 0.4 * (3.1 * x).sin() - 0.1,
+            _ => 0.3 * x * x - 0.15,
+        }
+    })
+}
+
+fn influence_beta() -> Array1<f64> {
+    ndarray::array![0.15, -0.1]
 }
 
 fn marginal_beta() -> Array1<f64> {
@@ -361,7 +389,7 @@ fn states_at(family: &SurvivalMarginalSlopeFamily) -> Vec<ParameterBlockState> {
         .coefficient_design()
         .to_dense()
         .to_owned();
-    vec![
+    let mut states = vec![
         ParameterBlockState {
             beta: Array1::zeros(0),
             eta: Array1::zeros(family.n),
@@ -374,15 +402,26 @@ fn states_at(family: &SurvivalMarginalSlopeFamily) -> Vec<ParameterBlockState> {
             eta: g_design.dot(&g_beta),
             beta: g_beta,
         },
-    ]
+    ];
+    if family.influence_absorber.is_some() {
+        states.push(ParameterBlockState {
+            beta: influence_beta(),
+            eta: Array1::zeros(1),
+        });
+    }
+    states
 }
 
 fn specs_for(family: &SurvivalMarginalSlopeFamily) -> Vec<ParameterBlockSpec> {
-    vec![
+    let mut specs = vec![
         fd_blockspec(0),
         fd_blockspec(family.marginal_design.ncols()),
         fd_blockspec(family.slope_layout.coefficient_design().ncols()),
-    ]
+    ];
+    if let Some(z_tilde) = family.influence_absorber.as_ref() {
+        specs.push(fd_blockspec(z_tilde.ncols()));
+    }
+    specs
 }
 
 fn fd_blockspec(cols: usize) -> ParameterBlockSpec {
@@ -544,7 +583,12 @@ fn analytic_terms(axis: PsiAxis, frame: SlopeFrame) -> (f64, Array1<f64>, Array2
             .expect("analytic baseline ψ terms")
             .expect("a nonlinear baseline chart publishes ψ terms"),
         design_axis => {
-            let layout = hyper_layout(design_axis);
+            // One (empty) derivative entry per block, including a trailing
+            // influence block when the frame carries one.
+            let mut blocks = derivative_blocks(design_axis);
+            blocks.resize_with(states.len(), Vec::new);
+            let layout = CustomFamilyHyperLayout::new(blocks, Vec::new(), Array1::zeros(1))
+                .expect("one design ψ axis");
             family
                 .psi_terms(&states, layout.design_derivative_blocks(), 0)
                 .expect("analytic design ψ terms")
@@ -649,6 +693,21 @@ fn marginal_design_psi_terms_match_finite_difference_static_2765() {
 #[test]
 fn slope_design_psi_terms_match_finite_difference_static_2765() {
     run_first_order_gate(PsiAxis::SlopeDesign, SlopeFrame::Static);
+}
+
+/// The marginal design ψ axis beside an absorbed influence block (#461). The
+/// influence coefficients enter every row through the `o_infl` primary, so
+/// `∂ψ∇_γ ℓ` and the `(ψ-block, γ)` Hessian cross are nonzero and must be
+/// published: the IFT solve `β_ψ = −H⁻¹ score_psi` reads them.
+#[test]
+fn marginal_design_psi_terms_match_finite_difference_with_influence_absorber() {
+    run_first_order_gate(PsiAxis::MarginalDesign, SlopeFrame::InfluenceAbsorbed);
+}
+
+/// The slope design ψ axis beside an absorbed influence block (#461).
+#[test]
+fn slope_design_psi_terms_match_finite_difference_with_influence_absorber() {
+    run_first_order_gate(PsiAxis::SlopeDesign, SlopeFrame::InfluenceAbsorbed);
 }
 
 /// The marginal design ψ axis with a follow-up-varying slope. The location
