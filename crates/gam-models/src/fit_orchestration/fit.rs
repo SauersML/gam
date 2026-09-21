@@ -903,6 +903,7 @@ impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
         fit_gaussian_location_scale_terms_with_selected_wiggle(
             data,
             spec,
+            pilot,
             selected_wiggle_basis,
             options,
             kappa_options,
