@@ -16,8 +16,9 @@ use super::*;
 
 use crate::fnv1a::Fnv1a;
 use crate::latent_anchor::{
-    AnchorGridOwned, AnchorTaylor, CalibrationTail, anchor_derivatives_in_slot,
+    AnchorGridOwned, AnchorTaylor, CalibrationTail, CalibrationUnit, anchor_derivatives_in_slot,
     anchor_taylor_in_slot, smaller_tail_log_target, solve_anchor, solve_log_tail_root,
+    sum_calibration_tail,
 };
 use gam_math::jet_scalar::{
     DynamicOneSeedBatch, DynamicTwoSeedBatch, FixedRuntimeJet, OneSeed, TwoSeed,
@@ -506,6 +507,9 @@ impl BernoulliMarginalSlopeFamily {
     /// observed signed-probit NLL is composed on top. Reading `(value, g, H)`
     /// off `Order2<2>` serves `primary_grad_hess`; reading `.t3` / `.t4` off
     /// `Tower4<2>` serves `third_full` / `fourth_full`.
+    ///
+    /// The row's Taylor table comes back beside the lift, so a caller that
+    /// needs the intercept's fifth order reads it from the same solve.
     fn empirical_rigid_intercept_jet<S: gam_math::jet_scalar::JetScalar<2>>(
         &self,
         row: usize,
@@ -513,9 +517,9 @@ impl BernoulliMarginalSlopeFamily {
         slope: f64,
         nodes: &[f64],
         measure_weights: &[f64],
-    ) -> Result<S, String> {
+    ) -> Result<(S, AnchorTaylor), String> {
         let observed_slope = S::variable(slope, 1).scale(self.probit_frailty_scale());
-        self.empirical_rigid_intercept_lift(
+        self.empirical_rigid_intercept_lift_and_table(
             row,
             marginal,
             &S::variable(marginal.eta, 0),
@@ -610,6 +614,29 @@ impl BernoulliMarginalSlopeFamily {
         nodes: &[f64],
         measure_weights: &[f64],
     ) -> Result<S, String> {
+        Ok(self
+            .empirical_rigid_intercept_lift_and_table(
+                row,
+                marginal,
+                m_jet,
+                observed_slope,
+                nodes,
+                measure_weights,
+            )?
+            .0)
+    }
+
+    /// [`Self::empirical_rigid_intercept_lift`] together with the row's anchor
+    /// Taylor table the lift composed.
+    fn empirical_rigid_intercept_lift_and_table<S: gam_math::jet_scalar::JetScalar<2>>(
+        &self,
+        row: usize,
+        marginal: BernoulliMarginalLinkMap,
+        m_jet: &S,
+        observed_slope: &S,
+        nodes: &[f64],
+        measure_weights: &[f64],
+    ) -> Result<(S, AnchorTaylor), String> {
         let observed_slope_value = gam_math::nested_dual::JetField::value(observed_slope);
         let taylor = match self
             .intercept_warm_starts
@@ -630,16 +657,23 @@ impl BernoulliMarginalSlopeFamily {
             }
         };
         let q_jet = m_jet.compose_unary([marginal.q, marginal.q1, marginal.q2, marginal.q3, marginal.q4]);
-        Ok(taylor.lift(&q_jet, &observed_slope.with_value(0.0)))
+        Ok((taylor.lift(&q_jet, &observed_slope.with_value(0.0)), taylor))
     }
 }
 
 impl BernoulliMarginalSlopeFamily {
 
-    /// Analytic fifth-order implicit differentiation. The known fourth-order
-    /// intercept determines the fifth Bell remainder of every node. The only
-    /// unknown fifth derivative is multiplied by the scalar F_a, so one division
-    /// finishes every symmetric component; no additional root solve is needed.
+    /// Analytic fifth-order implicit differentiation, read from the anchor's
+    /// Taylor table. The probit marginal index is `q = m` exactly
+    /// ([`bernoulli_marginal_link_map`]), so the anchored intercept
+    /// `a(m, g) = α(m, s·g)` has fifth partials
+    /// `∂_m^{5−k} ∂_g^k a = s^k·∂_q^{5−k} ∂_b^k α`, which the table holds in
+    /// density-normalized units. A row whose every node density underflows
+    /// (|q| ≳ 37.5) therefore keeps an exact fifth order. The row NLL's fifth
+    /// derivative is its composition through the intercept's order-four jet
+    /// plus the single term that reads the intercept's fifth order,
+    /// `ℓ′·∂⁵a`; no linear-probability Jacobian `Σ w φ(η)` is formed
+    /// (gam#3639).
     pub(super) fn empirical_rigid_row_fifth_full(
         &self,
         row: usize,
@@ -651,7 +685,17 @@ impl BernoulliMarginalSlopeFamily {
         if self.weights[row] == 0.0 {
             return Ok([[[[[0.0; 2]; 2]; 2]; 2]; 2]);
         }
-        let a = self.empirical_rigid_intercept_jet::<gam_math::jet_tower::Tower4<2>>(
+        // The probit marginal map is the identity `q = η` by construction
+        // (`bernoulli_marginal_link_map`), so the table's `q` axis is the
+        // marginal primary itself.
+        debug_assert!(
+            marginal.q == marginal.eta
+                && marginal.q1 == 1.0
+                && marginal.q2 == 0.0
+                && marginal.q3 == 0.0
+                && marginal.q4 == 0.0
+        );
+        let (a, taylor) = self.empirical_rigid_intercept_jet::<gam_math::jet_tower::Tower4<2>>(
             row,
             marginal,
             slope,
@@ -659,38 +703,9 @@ impl BernoulliMarginalSlopeFamily {
             measure_weights,
         )?;
         let s = self.probit_frailty_scale();
-        let mut fa = 0.0;
-        let mut remainder = [[[[[0.0; 2]; 2]; 2]; 2]; 2];
-        for (&node, &weight) in nodes.iter().zip(measure_weights) {
-            let eta = a.v + s * slope * node;
-            let d = unary_derivatives_normal_cdf(eta);
-            let fifth = (eta.powi(4) - 6.0 * eta * eta + 3.0) * d[1];
-            fa += weight * d[1];
-            let composed = implicit_intercept_fifth_composition(
-                &a,
-                s * node,
-                [d[0], d[1], d[2], d[3], d[4], fifth],
-            );
-            for i in 0..2 {
-                for j in 0..2 {
-                    for k in 0..2 {
-                        for l in 0..2 {
-                            for m in 0..2 {
-                                remainder[i][j][k][l][m] += weight * composed[i][j][k][l][m];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if !fa.is_finite() || fa <= 0.0 {
-            return Err(format!(
-                "empirical fifth derivative has non-positive calibration Jacobian {fa}"
-            ));
-        }
-        let eta = marginal.eta;
-        let mu5 = (eta.powi(4) - 6.0 * eta * eta + 3.0) * marginal.mu1;
-        remainder[0][0][0][0][0] -= mu5;
+        // ∂⁵a with k slope axes among the five: s^k·∂_q^{5−k} ∂_b^k α.
+        let intercept_fifth: [f64; 6] =
+            std::array::from_fn(|k| s.powi(k as i32) * taylor.partial(5 - k, k));
         let sign = 2.0 * self.y[row] - 1.0;
         let margin = sign * (a.v + s * slope * self.z[row]);
         let mut stack = signed_probit_neglog_unary_stack_fifth(margin, self.weights[row]);
@@ -708,11 +723,17 @@ impl BernoulliMarginalSlopeFamily {
                 for k in 0..2 {
                     for l in 0..2 {
                         for m in 0..2 {
-                            fifth[i][j][k][l][m] -= stack[1] * remainder[i][j][k][l][m] / fa;
+                            let slope_axes = i + j + k + l + m;
+                            fifth[i][j][k][l][m] += stack[1] * intercept_fifth[slope_axes];
                         }
                     }
                 }
             }
+        }
+        if !fifth.iter().flatten().flatten().flatten().flatten().all(|x| x.is_finite()) {
+            return Err(format!(
+                "empirical fifth derivative is non-finite at row {row}"
+            ));
         }
         Ok(fifth)
     }
@@ -858,6 +879,12 @@ impl BernoulliMarginalSlopeFamily {
         )?;
         // The node programs below read the root's `η` from this evaluation
         // instead of re-evaluating both spans of every node there.
+        //
+        // The constraint is written in the unit `N = Φ(−|q|)` (gam#3639): the
+        // same equation divided by a constant, so the root and every implicit
+        // derivative are unchanged, while `F_a = P′/N` and each node's stack
+        // stay of order `|q|` where `P′` and `φ(η)` themselves underflow.
+        let unit = CalibrationUnit::new(marginal.q);
         let mut root_etas = Vec::with_capacity(grid.nodes.len());
         let f_a = self
             .evaluate_empirical_grid_calibration_tail_recording(
@@ -869,10 +896,10 @@ impl BernoulliMarginalSlopeFamily {
                 survival_side,
                 Some(&mut root_etas),
             )?
-            .density;
+            .density_in_unit(unit.log_unit());
         if !(f_a.is_finite() && f_a > 0.0) {
             return Err(format!(
-                "empirical BMS calibration has invalid F_a={f_a} at row {row}"
+                "empirical BMS calibration has invalid F_a/N={f_a} at row {row}"
             ));
         }
 
@@ -880,7 +907,7 @@ impl BernoulliMarginalSlopeFamily {
         for ((node, weight), &eta) in grid.pairs().zip(&root_etas) {
             let index =
                 self.compile_empirical_bms_index_program(primary, intercept_root, slope, node)?;
-            let cdf_stack = unary_derivatives_normal_cdf(eta);
+            let cdf_stack = unit.cdf_stack(eta);
             calibration.push(BmsFlexCalibrationProgramNode {
                 index,
                 weight,
@@ -913,13 +940,7 @@ impl BernoulliMarginalSlopeFamily {
             intercept_root,
             1.0 / f_a,
             self.probit_frailty_scale(),
-            [
-                marginal.mu,
-                marginal.mu1,
-                marginal.mu2,
-                marginal.mu3,
-                marginal.mu4,
-            ],
+            unit.marginal_stack(),
         )?;
         BmsFlexRowProgram::from_parts(
             point,
@@ -2934,18 +2955,21 @@ impl BernoulliMarginalSlopeFamily {
             let dc_da = scale_coeff4(dc_da_raw, scale);
             density += exact_kernel::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
         }
-        Ok(CalibrationTail {
+        Ok(CalibrationTail::from_linear(
             tail,
             density,
-            density_slope: None,
+            None,
             summands,
             tail_rounding,
-        })
+        ))
     }
 
     /// The row calibration `P(a) = Σ_k w_k Φ(η(a, u_k))` under the finite law
     /// `grid`, read on its smaller tail: `T = Σ_k w_k Φ(∓η_k)` with
-    /// `P′ = Σ w φ(η)·η_a` and `P″ = Σ w φ(η)·(η_aa − η·η_a²)`.
+    /// `P′ = Σ w φ(η)·η_a` and `P″ = Σ w φ(η)·(η_aa − η·η_a²)`, summed by
+    /// [`sum_calibration_tail`]: linearly above its floor, by log-sum-exp
+    /// below it, so the tail keeps its log and ratios past `|q| ≈ 37.5`
+    /// (gam#3639).
     pub(super) fn evaluate_empirical_grid_calibration_tail(
         &self,
         a: f64,
@@ -2979,39 +3003,39 @@ impl BernoulliMarginalSlopeFamily {
         mut node_etas: Option<&mut Vec<f64>>,
     ) -> Result<CalibrationTail, String> {
         let scale = self.probit_frailty_scale();
-        let mut tail = 0.0;
-        let mut density = 0.0;
-        let mut density_slope = 0.0;
-        for (node, weight) in grid.pairs() {
-            // A Newton step reads only `coeff`, `dc_da` and `dc_daa`; the helper builds
-            // those bit-identically to the full observed partials and skips the rest.
-            let (coeff, dc_da, dc_daa) = shared_observed_denested_calibration_newton_coefficients(
-                node,
-                a,
-                slope,
-                self.score_warp.as_ref(),
-                beta_h,
-                self.link_dev.as_ref(),
-                beta_w,
-                scale,
-            )?;
-            let eta = eval_coeff4_at(&coeff, node);
-            let eta_a = eval_coeff4_at(&dc_da, node);
-            let eta_aa = eval_coeff4_at(&dc_daa, node);
+        // A log-space pass revisits the nodes; it records over the linear pass.
+        let recorded_from = node_etas.as_deref().map_or(0, Vec::len);
+        sum_calibration_tail(survival_side, grid.nodes.len(), |sum| {
             if let Some(etas) = node_etas.as_deref_mut() {
-                etas.push(eta);
+                etas.truncate(recorded_from);
             }
-            let pdf = normal_pdf(eta);
-            tail += weight * normal_cdf(if survival_side { -eta } else { eta });
-            density += weight * pdf * eta_a;
-            density_slope += weight * pdf * (eta_aa - eta * eta_a * eta_a);
-        }
-        Ok(CalibrationTail {
-            tail,
-            density,
-            density_slope: Some(density_slope),
-            summands: grid.nodes.len(),
-            tail_rounding: 0.0,
+            for (node, weight) in grid.pairs() {
+                // A Newton step reads only `coeff`, `dc_da` and `dc_daa`; the helper
+                // builds those bit-identically to the full observed partials and skips
+                // the rest.
+                let (coeff, dc_da, dc_daa) =
+                    shared_observed_denested_calibration_newton_coefficients(
+                        node,
+                        a,
+                        slope,
+                        self.score_warp.as_ref(),
+                        beta_h,
+                        self.link_dev.as_ref(),
+                        beta_w,
+                        scale,
+                    )?;
+                let eta = eval_coeff4_at(&coeff, node);
+                if let Some(etas) = node_etas.as_deref_mut() {
+                    etas.push(eta);
+                }
+                sum.push(
+                    weight,
+                    eta,
+                    eval_coeff4_at(&dc_da, node),
+                    eval_coeff4_at(&dc_daa, node),
+                );
+            }
+            Ok(())
         })
     }
 
@@ -4103,6 +4127,97 @@ mod empirical_rigid_jet_oracle_tests {
         }
     }
 
+    /// gam#3639: past |q| ≈ 37.5 every node density `φ(a + s·g·x_k)` of the
+    /// rigid calibration underflows to zero, so a fifth order assembled from
+    /// linear densities divides a zero remainder by a zero Jacobian and
+    /// refuses. The anchor's Taylor table is density-normalized, and the fifth
+    /// tensor read from it is still the derivative of the fourth there.
+    #[test]
+    fn empirical_fifth_tensor_stays_exact_where_node_densities_underflow_3639() {
+        let grid = test_grid();
+        let map = |eta| {
+            bernoulli_marginal_link_map(
+                &InverseLink::Standard(gam_problem::StandardLink::Probit),
+                eta,
+            )
+            .unwrap()
+        };
+        for frailty_sd in [None, Some(0.3)] {
+            for y in [0.0, 1.0] {
+                let family =
+                    empirical_family(vec![y], vec![0.5], vec![0.8], frailty_sd, grid.clone());
+                for point in [[-39.0, -0.35], [39.0, 0.3]] {
+                    let (intercept, _) = family
+                        .empirical_rigid_intercept_jet::<gam_math::jet_tower::Tower4<2>>(
+                            0,
+                            map(point[0]),
+                            point[1],
+                            &grid.nodes,
+                            &grid.weights,
+                        )
+                        .unwrap();
+                    let s = family.probit_frailty_scale();
+                    let linear_jacobian: f64 = grid
+                        .nodes
+                        .iter()
+                        .zip(&grid.weights)
+                        .map(|(&x, &w)| {
+                            w * gam_math::probability::normal_pdf(intercept.v + s * point[1] * x)
+                        })
+                        .sum();
+                    assert_eq!(
+                        linear_jacobian, 0.0,
+                        "fixture must sit where the linear calibration Jacobian underflows"
+                    );
+                    let fifth = family
+                        .empirical_rigid_row_fifth_full(
+                            0,
+                            map(point[0]),
+                            point[1],
+                            &grid.nodes,
+                            &grid.weights,
+                        )
+                        .unwrap();
+                    for axis in 0..2 {
+                        let h = 2.0e-5;
+                        let mut plus = point;
+                        let mut minus = point;
+                        plus[axis] += h;
+                        minus[axis] -= h;
+                        let eval = |x: [f64; 2]| {
+                            family
+                                .empirical_rigid_fourth_full_closed_form(
+                                    0,
+                                    map(x[0]),
+                                    x[1],
+                                    &grid.nodes,
+                                    &grid.weights,
+                                )
+                                .unwrap()
+                        };
+                        let fp = eval(plus);
+                        let fm = eval(minus);
+                        for a in 0..2 {
+                            for b in 0..2 {
+                                for c in 0..2 {
+                                    for d in 0..2 {
+                                        let fd = (fp[a][b][c][d] - fm[a][b][c][d]) / (2.0 * h);
+                                        let exact = fifth[a][b][c][d][axis];
+                                        assert!(
+                                            exact.is_finite()
+                                                && (fd - exact).abs() < 2.0e-7 * (1.0 + fd.abs()),
+                                            "frailty={frailty_sd:?} y={y} point={point:?} axes={a}{b}{c}{d}{axis} fifth={exact} fd={fd}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Independent normalized Taylor-polynomial oracle. Production stores dense
     // derivative tensors and lifts its root with a filtered jet iteration.
     // This witness stores the 21 monomial coefficients of total degree <= 5,
@@ -4977,6 +5092,8 @@ mod empirical_flex_jet_oracle_tests {
             let eta = witness_eta(fixture, intercept, slope, &beta, node, scale);
             f_a += weight * witness_normal_pdf(eta);
         }
+        // A finite-law row carries `P′` in the unit `N = Φ(−|q|)` (gam#3639).
+        let f_a = f_a / witness_normal_cdf(-q.abs());
         (
             q,
             slope,
@@ -5322,19 +5439,19 @@ mod empirical_flex_jet_oracle_tests {
                     density += weight * pdf * eta_a;
                     density_slope += weight * pdf * (eta_aa - eta * eta_a * eta_a);
                 }
-                CalibrationTail {
+                CalibrationTail::from_linear(
                     tail,
                     density,
-                    density_slope: Some(density_slope),
-                    summands: fx.grid.nodes.len(),
-                    tail_rounding: 0.0,
-                }
+                    Some(density_slope),
+                    fx.grid.nodes.len(),
+                    0.0,
+                )
             };
             let bits = |t: CalibrationTail| {
                 [
-                    t.tail.to_bits(),
-                    t.density.to_bits(),
-                    t.density_slope.map(f64::to_bits).unwrap_or(u64::MAX),
+                    t.log_tail.to_bits(),
+                    t.density_ratio.to_bits(),
+                    t.density_slope_ratio.map(f64::to_bits).unwrap_or(u64::MAX),
                     t.summands as u64,
                 ]
             };
@@ -5383,7 +5500,10 @@ mod empirical_flex_jet_oracle_tests {
                 String::new,
             )
             .expect("reference log-tail root");
-            let f_a = full_tail(root, survival_side).density;
+            // The row program writes its constraint in the unit `N = Φ(−|q|)`
+            // (gam#3639): `F_a = P′/N`, node stacks `(∓Φ(∓η), φ(η)·…)/N`.
+            let unit = CalibrationUnit::new(marginal.q);
+            let f_a = full_tail(root, survival_side).density_in_unit(unit.log_unit());
             assert_eq!(
                 plan.intercept_root.to_bits(),
                 root.to_bits(),
@@ -5407,7 +5527,7 @@ mod empirical_flex_jet_oracle_tests {
                         .observed_denested_cell_partials_at_z(node, root, b, beta_h, beta_w)
                         .expect("full observed partials at the root");
                     let eta = eval_coeff4_at(&obs.coeff, node);
-                    let cdf_stack = unary_derivatives_normal_cdf(eta);
+                    let cdf_stack = unit.cdf_stack(eta);
                     BmsFlexCalibrationProgramNode {
                         index,
                         weight,
@@ -5434,13 +5554,7 @@ mod empirical_flex_jet_oracle_tests {
                 root,
                 1.0 / f_a,
                 scale,
-                [
-                    marginal.mu,
-                    marginal.mu1,
-                    marginal.mu2,
-                    marginal.mu3,
-                    marginal.mu4,
-                ],
+                unit.marginal_stack(),
             )
             .expect("reference program point");
             let reference = BmsFlexRowProgram::from_parts(
@@ -5524,16 +5638,19 @@ mod empirical_flex_jet_oracle_tests {
                         .evaluate_denested_calibration_tail(a, 0.35, beta_h, beta_w, side)
                         .expect("denested calibration tail");
                     assert!(
-                        cells.tail > 0.0 && cells.tail_rounding > 0.0 && cells.tail_rounding < cells.tail,
-                        "kind={is_score_warp} a={a} side={side}: tail {:e}, charged bound {:e}",
-                        cells.tail,
-                        cells.tail_rounding
+                        cells.log_tail.is_finite()
+                            && cells.tail_rounding_ratio > 0.0
+                            && cells.tail_rounding_ratio < 1.0,
+                        "kind={is_score_warp} a={a} side={side}: log tail {:e}, charged bound \
+                         relative to it {:e}",
+                        cells.log_tail,
+                        cells.tail_rounding_ratio
                     );
                     let grid = fx
                         .family
                         .evaluate_empirical_grid_calibration_tail(a, 0.35, beta_h, beta_w, &fx.grid, side)
                         .expect("grid calibration tail");
-                    assert_eq!(grid.tail_rounding, 0.0);
+                    assert_eq!(grid.tail_rounding_ratio, 0.0);
                 }
             }
         }
@@ -5583,16 +5700,26 @@ mod empirical_flex_jet_oracle_tests {
                     ("grid", grid_tail(true), grid_tail(false)),
                     ("cells", cell_tail(true), cell_tail(false)),
                 ] {
+                    let (survival_tail, complement_tail) =
+                        (survival.log_tail.exp(), complement.log_tail.exp());
                     assert!(
-                        (survival.tail + complement.tail - 1.0).abs() <= 1e-12,
-                        "kind={is_score_warp} {label} a={a}: tails {:e} + {:e} != 1",
-                        survival.tail,
-                        complement.tail
+                        (survival_tail + complement_tail - 1.0).abs() <= 1e-12,
+                        "kind={is_score_warp} {label} a={a}: tails {survival_tail:e} + \
+                         {complement_tail:e} != 1"
                     );
-                    assert_eq!(
-                        survival.density.to_bits(),
-                        complement.density.to_bits(),
-                        "kind={is_score_warp} {label} a={a}: P' is side-independent"
+                    // `P′` is one sum on both sides; each side returns it as
+                    // `(P′/T)·exp(log T)`, three roundings of which the
+                    // logarithm's carries `ε·|log T|` through the exponential,
+                    // so the two agree to `ε·(6 + |log T₊| + |log T₋|)`.
+                    let (survival_density, complement_density) =
+                        (survival.density_in_unit(0.0), complement.density_in_unit(0.0));
+                    let side_band = f64::EPSILON
+                        * (6.0 + survival.log_tail.abs() + complement.log_tail.abs())
+                        * survival_density.abs();
+                    assert!(
+                        (survival_density - complement_density).abs() <= side_band,
+                        "kind={is_score_warp} {label} a={a}: P' is side-independent: \
+                         {survival_density:e} vs {complement_density:e} (band {side_band:e})"
                     );
                 }
             }
@@ -5642,14 +5769,141 @@ mod empirical_flex_jet_oracle_tests {
                 );
             }
 
-            // ∂a/∂q = μ′(q)/P′(a) against the solved root's own motion.
+            // ∂a/∂q = μ′(q)/P′(a) against the solved root's own motion, read
+            // in the row program's unit `N = Φ(−|q|)` (gam#3639) as
+            // `(φ(q)/N)/(P′/N)`.
             let h = 1e-4;
             let central = (solve(q + h, root).0 - solve(q - h, root).0) / (2.0 * h);
-            let implicit = marginal.mu1 / at_root.density;
+            let unit = CalibrationUnit::new(marginal.q);
+            let implicit = unit.density(marginal.q) / at_root.density_in_unit(unit.log_unit());
             assert!(
                 (implicit - central).abs() <= 1e-6 * implicit.abs(),
                 "kind={is_score_warp}: implicit da/dq {implicit} vs central {central}"
             );
+        }
+    }
+
+    /// gam#3639: past `|q| ≈ 37.5` every node density `φ(η_k)` of the flex
+    /// calibration underflows, so `F_a = Σ w φ(η)·η_a` read in probability
+    /// units is zero and the row program refused. Written in the unit
+    /// `N = Φ(−|q|)`, the same constraint keeps `F_a/N` and every node stack of
+    /// order `|q|`: the row program compiles at `q = ±39`, and its order-two
+    /// gradient is the derivative of its own value there.
+    #[test]
+    fn empirical_flex_row_program_is_exact_where_node_densities_underflow_3639() {
+        for is_score_warp in [true, false] {
+            // The observation sits on the far side of the marginal, so the
+            // row's negative log-likelihood `≈ q²/2` and its gradient are of
+            // order one and larger rather than underflowed to zero.
+            for (q, y) in [(-39.0_f64, 1.0_f64), (39.0, 0.0)] {
+                let mut fx = make_fixture(is_score_warp);
+                fx.family.y = Arc::new(Array1::from_vec(vec![y]));
+                let r = fx.primary.total;
+                let dev_range = if is_score_warp {
+                    fx.primary.h.clone().unwrap()
+                } else {
+                    fx.primary.w.clone().unwrap()
+                };
+                let scale = fx.family.probit_frailty_scale();
+                let mut p0 = vec![0.0; r];
+                p0[fx.primary.q] = q;
+                p0[fx.primary.slope] = 0.3;
+                for (k, i) in dev_range.clone().enumerate() {
+                    p0[i] = fx.beta_dev[k];
+                }
+                // The log-tail solve returns one root whatever the seed
+                // (gam#3333); the rigid closed form is the natural one.
+                let compile = |p: &[f64]| {
+                    let (q, b) = (p[fx.primary.q], p[fx.primary.slope]);
+                    let beta: Array1<f64> = Array1::from_iter(dev_range.clone().map(|i| p[i]));
+                    let (beta_h, beta_w) = if is_score_warp {
+                        (Some(&beta), None)
+                    } else {
+                        (None, Some(&beta))
+                    };
+                    let seed = q * (1.0 + (scale * b) * (scale * b)).sqrt() / scale;
+                    let plan = fx
+                        .family
+                        .compile_empirical_bms_row_program(
+                            0,
+                            &fx.primary,
+                            q,
+                            b,
+                            beta_h,
+                            beta_w,
+                            seed,
+                            &fx.grid,
+                        )
+                        .expect("empirical flex plan where node densities underflow");
+                    let linear_jacobian: f64 = fx
+                        .grid
+                        .pairs()
+                        .map(|(node, weight)| {
+                            let obs = fx
+                                .family
+                                .observed_denested_cell_partials_at_z(
+                                    node,
+                                    plan.intercept_root,
+                                    b,
+                                    beta_h,
+                                    beta_w,
+                                )
+                                .expect("observed partials at the root");
+                            weight * normal_pdf(eval_coeff4_at(&obs.coeff, node))
+                        })
+                        .sum();
+                    (plan, linear_jacobian)
+                };
+                let order_two = |program: &BmsFlexRowProgram, p: &[f64]| -> (f64, Vec<f64>) {
+                    let arena = DynamicJetArena::new();
+                    let vars = arena.alloc_slice_fill_with(r, |axis| {
+                        gam_math::jet_scalar::DynamicOrder2::variable(p[axis], axis, r, &arena)
+                    });
+                    let jet = program
+                        .evaluate(vars, 2, &arena)
+                        .expect("order-two row jet");
+                    (jet.value(), jet.g().iter().copied().collect())
+                };
+
+                let (plan, linear_jacobian) = compile(&p0);
+                assert_eq!(
+                    linear_jacobian, 0.0,
+                    "kind={is_score_warp} q={q}: the fixture must sit where the linear \
+                     calibration Jacobian underflows"
+                );
+                assert!(
+                    plan.inv_f_a.is_finite() && plan.inv_f_a > 0.0,
+                    "kind={is_score_warp} q={q}: N/F_a={}",
+                    plan.inv_f_a
+                );
+                let (value, gradient) = order_two(&plan, &p0);
+                assert!(
+                    value.is_finite() && value > 1.0,
+                    "kind={is_score_warp} q={q}: row value {value}"
+                );
+                // Central differences of the value from plans recompiled at
+                // `p ± h·e_j`. Each value carries its root's resolution,
+                // `δa ≈ 1.4e-12/|F′| ≈ 4e-14` at `|F′| = P′/T ≈ |q|`, times the
+                // value's slope `≈ |q|`, so the difference quotient's rounding
+                // is `2·|q|·δa/h ≈ 3e-7` at `h = 1e-5`; its truncation
+                // `h²·|f‴|/6` is `O(1e-10)` for a value whose third derivative
+                // is of order one. `1e-6·(1 + |g|)` bounds both.
+                let h = 1.0e-5;
+                for axis in 0..r {
+                    let mut plus = p0.clone();
+                    let mut minus = p0.clone();
+                    plus[axis] += h;
+                    minus[axis] -= h;
+                    let value_at = |p: &[f64]| order_two(&compile(p).0, p).0;
+                    let central = (value_at(&plus) - value_at(&minus)) / (2.0 * h);
+                    let exact = gradient[axis];
+                    assert!(
+                        exact.is_finite() && (central - exact).abs() <= 1e-6 * (1.0 + exact.abs()),
+                        "kind={is_score_warp} q={q} axis={axis}: gradient {exact} vs central \
+                         {central}"
+                    );
+                }
+            }
         }
     }
 }

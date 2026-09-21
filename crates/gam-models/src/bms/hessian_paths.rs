@@ -877,6 +877,9 @@ impl RowCellMomentsBundle {
 #[derive(Clone)]
 pub(super) struct BernoulliMarginalSlopeRowExactContext {
     pub(super) intercept: f64,
+    /// `P′(a)` at the root in the row's calibration unit: `P′/N` with
+    /// `N = Φ(−|q|)` on a finite-law row (`latent_anchor::CalibrationUnit`,
+    /// gam#3639), `P′` itself on the standard-normal cells route.
     pub(super) m_a: f64,
     pub(super) intercept_fast_path: bool,
 }
