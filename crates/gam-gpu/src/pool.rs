@@ -149,8 +149,15 @@ pub fn balanced_partition(rt: &GpuRuntime, n_units: usize) -> Vec<(usize, std::o
 /// (`cuda_context_for(ordinal).bind_to_thread()`) before calling
 /// `f(ordinal, &mut items[range])`. Returns `Some(())` only if EVERY tile's
 /// closure returned `Some(())`; if any tile fails, panics, or a context cannot
-/// be bound, returns `None` so the caller can run its deterministic whole-batch
-/// CPU fallback over the (still untouched-by-a-successful-result) `items`.
+/// be bound, returns `None`. The work was admitted before the scatter, so a
+/// `None` is a post-admission fault for the caller to surface, never a cue for
+/// a CPU or single-device re-run: tiles that succeeded have already mutated
+/// their sub-slices of `items`, which are therefore no longer the original
+/// inputs.
+///
+/// Each worker binds its own ordinal's context, but a closure that calls an
+/// API taking a `&GpuRuntime` still launches on `runtime.device` (the primary
+/// device). Closures must use ordinal-pinned entry points to run on `ordinal`.
 ///
 /// Non-linux builds have no CUDA contexts to bind and so always return `None`.
 #[cfg(target_os = "linux")]
@@ -194,8 +201,8 @@ pub fn scatter_batched<T: Send>(
             })
             .collect();
 
-        // A panicking worker yields `Err` from `join`; treat it like a tile
-        // failure so the caller falls back to CPU for the whole batch.
+        // A panicking worker yields `Err` from `join`; report it like any other
+        // tile failure.
         let mut all_ok = true;
         for handle in handles {
             match handle.join() {
@@ -211,13 +218,13 @@ pub fn scatter_batched<T: Send>(
 /// so device fan-out is unavailable.
 ///
 /// This must exist on every target, not just Linux: not every caller is inside
-/// `#[cfg(target_os = "linux")]` — the SAE manifold per-atom Gram/smoothness
-/// scatters (`src/terms/sae/manifold/mod.rs`) call it from platform-independent
-/// code. At runtime off Linux Auto resolution returns typed absence, so the
+/// `#[cfg(target_os = "linux")]` — the SAE manifold per-atom decoder-Gram
+/// scatter (`gam-sae` `manifold/fit_drivers.rs`) calls it from
+/// platform-independent code. At runtime off Linux Auto resolution returns typed absence, so the
 /// `Some(rt)` branch that reaches here is never taken; the body only needs to
 /// compile and honour the contract. `balanced_partition` yields no tiles when
-/// the runtime has no devices, so this reports `None` and the caller runs its
-/// deterministic whole-batch CPU fallback. The per-tile invocation is kept so
+/// the runtime has no devices, so this reports `None`, the same failure the
+/// Linux scatter reports. The per-tile invocation is kept so
 /// the contract is honoured verbatim if a non-Linux backend ever exposes
 /// devices: each tile's closure runs over its own disjoint sub-slice, with no
 /// device binding to perform on this platform (the only step the Linux path

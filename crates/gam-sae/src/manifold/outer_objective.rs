@@ -4889,11 +4889,11 @@ pub(crate) fn sae_manifold_newton_directional_decrease(
 ///
 ///   * groups atoms by identical `(m_k, p)` shape (the strided-batched cuBLAS
 ///     GEMM requires a uniform tile),
-///   * for each group with ≥ 2 atoms whose aggregate flop count clears the
-///     dispatch threshold, partitions the group's atoms across every available
-///     device with [`crate::gpu::pool::scatter_batched`] and runs one
-///     `try_fast_abt_strided_batched` per device tile (computing
-///     `S_k · B_k = S_k · (B_kᵀ)ᵀ`),
+///   * for each group with ≥ 2 atoms that the policy admits on the group's
+///     strided-batched op, runs ONE `try_fast_abt_strided_batched_with_policy`
+///     over the whole packed group (computing `S_k · B_k = S_k · (B_kᵀ)ᵀ`);
+///     the dispatcher itself splits a large batch across every device, each
+///     tile pinned to its own ordinal,
 ///   * uses the exact ndarray `S_k.dot(B_k)` when no GPU is admitted; once a
 ///     runtime is admitted, pool or batched-GEMM failures are propagated rather
 ///     than disguised as CPU eligibility.
@@ -4965,12 +4965,12 @@ pub(crate) fn batched_smooth_sb(
         return Ok((0..n_atoms).map(cpu_one).collect());
     }
 
-    let rt = match crate::gpu::device_runtime::GpuRuntime::resolve(gpu_policy)
+    if crate::gpu::device_runtime::GpuRuntime::resolve(gpu_policy)
         .map_err(|error| format!("decoder-smoothness CUDA admission failed: {error}"))?
+        .is_none()
     {
-        Some(rt) => rt,
-        None => return Ok((0..n_atoms).map(cpu_one).collect()),
-    };
+        return Ok((0..n_atoms).map(cpu_one).collect());
+    }
 
     let mut out: Vec<Option<Array2<f64>>> = (0..n_atoms).map(|_| None).collect();
     for ((m, p), members) in groups {
@@ -4978,9 +4978,9 @@ pub(crate) fn batched_smooth_sb(
         // the single-product `fast_*` shim (size-gated) already handles a large
         // lone GEMM, so route those straight through the CPU-or-shim helper.
         //
-        // The second condition is the SAME admission the tile's
-        // `try_fast_abt_strided_batched_with_policy` will run, on the SAME op,
-        // asked once here. Previously the caller pre-screened on a group's
+        // The second condition is the SAME admission the group's
+        // `try_fast_abt_strided_batched_with_policy` below will run, on the
+        // SAME op, asked once here. Previously the caller pre-screened on a group's
         // aggregate flops against `MIN_CALIBRATABLE_GEMM_FLOPS` — the most
         // permissive bound ANY policy can carry — and then treated the
         // calibrated policy's stricter (and correct) decline inside the scatter
@@ -4988,7 +4988,7 @@ pub(crate) fn batched_smooth_sb(
         // whole group is 1.2 MFLOP: far below a real device's calibrated
         // crossover, so a GPU host FAILED fits that a CPU host completes. The
         // decline is a routing verdict, not a fault — the exact `cpu_one`
-        // product is the right continuation, and a post-admission scatter
+        // product is the right continuation, and a post-admission batched-GEMM
         // failure below is still fatal.
         if members.len() < 2
             || m == 0
@@ -5004,75 +5004,39 @@ pub(crate) fn batched_smooth_sb(
             }
             continue;
         }
-        // Build the per-tile batched inputs lazily inside the device closure so
-        // each device only packs the atoms it owns. `items` carries the member
-        // atom indices; `scatter_batched` slices it per device ordinal.
-        let mut items: Vec<usize> = members.clone();
-        let s_ref = &s_mats;
-        // Collect per-tile results into a side channel keyed by atom index, then
-        // splice them in after scatter completes (scatter's closure borrows
-        // `items` immutably-per-tile and must stay `Sync`).
-        let tile_results: std::sync::Mutex<Vec<(usize, Array2<f64>)>> =
-            std::sync::Mutex::new(Vec::with_capacity(members.len()));
-        let ok = crate::gpu::pool::scatter_batched(rt, &mut items, |_, slice| {
-            if slice.is_empty() {
-                return Some(());
-            }
-            let batch = slice.len();
-            // A = stacked S_k  (batch, m, m); B = stacked B_kᵀ (batch, p, m) so
-            // that `A · Bᵀ` per tile yields `S_k · B_k` (batch, m, p).
-            let mut a = Array3::<f64>::zeros((batch, m, m));
-            let mut bt = Array3::<f64>::zeros((batch, p, m));
-            for (t, &idx) in slice.iter().enumerate() {
-                let s = &s_ref[idx];
-                let b = &sb_inputs[idx].1;
-                for i in 0..m {
-                    for j in 0..m {
-                        a[[t, i, j]] = s[[i, j]];
-                    }
-                }
-                for i in 0..p {
-                    for j in 0..m {
-                        bt[[t, i, j]] = b[[j, i]];
-                    }
+        // Pack the whole group and issue the SAME op the admission above asked
+        // about, so the dispatcher's verdict cannot differ from it. A = stacked
+        // S_k (batch, m, m); B = stacked B_kᵀ (batch, p, m) so that `A · Bᵀ`
+        // per slot yields `S_k · B_k` (batch, m, p). Splitting a large batch
+        // across devices is the dispatcher's job (each tile pinned to its own
+        // ordinal); re-partitioning here would re-admit sub-batches under a
+        // different op and run every tile on the primary device.
+        let batch = members.len();
+        let mut a = Array3::<f64>::zeros((batch, m, m));
+        let mut bt = Array3::<f64>::zeros((batch, p, m));
+        for (t, &idx) in members.iter().enumerate() {
+            let s = &s_mats[idx];
+            let b = &sb_inputs[idx].1;
+            for i in 0..m {
+                for j in 0..m {
+                    a[[t, i, j]] = s[[i, j]];
                 }
             }
-            let prod = crate::gpu::try_fast_abt_strided_batched_with_policy(
-                a.view(),
-                bt.view(),
-                gpu_policy,
-            )?;
-            let mut sink = tile_results.lock().expect("tile_results mutex poisoned");
-            for (t, &idx) in slice.iter().enumerate() {
-                sink.push((idx, prod.slice(s![t, .., ..]).to_owned()));
-            }
-            Some(())
-        });
-        // The scatter closure has returned, so all borrows of `items`/`s_mats`/
-        // `tile_results` are released; write the results back into `out`.
-        match ok {
-            Some(()) => {
-                let sink = tile_results
-                    .into_inner()
-                    .expect("tile_results mutex poisoned");
-                for (idx, mat) in sink {
-                    out[idx] = Some(mat);
-                }
-                // A successful scatter must produce every member exactly once.
-                for &idx in &members {
-                    if out[idx].is_none() {
-                        return Err(format!(
-                            "decoder-smoothness device scatter omitted atom {idx}"
-                        ));
-                    }
+            for i in 0..p {
+                for j in 0..m {
+                    bt[[t, i, j]] = b[[j, i]];
                 }
             }
-            None => {
-                return Err(format!(
-                    "decoder-smoothness device scatter declined admitted group m={m}, p={p}, atoms={}",
-                    members.len()
-                ));
-            }
+        }
+        let prod =
+            crate::gpu::try_fast_abt_strided_batched_with_policy(a.view(), bt.view(), gpu_policy)
+                .ok_or_else(|| {
+                    format!(
+                        "decoder-smoothness batched GEMM declined admitted group m={m}, p={p}, atoms={batch}"
+                    )
+                })?;
+        for (t, &idx) in members.iter().enumerate() {
+            out[idx] = Some(prod.slice(s![t, .., ..]).to_owned());
         }
     }
     out.into_iter()

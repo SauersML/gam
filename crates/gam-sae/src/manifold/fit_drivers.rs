@@ -8554,11 +8554,15 @@ impl SaeManifoldTerm {
         // tolerance-based identifiability RANK decision (not a fitted quantity),
         // so the device path's accumulation order is admissible.
         //
-        // Spread the atoms across EVERY device via `gpu::pool::scatter_batched`;
-        // each device tile computes its atoms' Grams through the size-gated
-        // `try_fast_xt_diag_x` shim. A device-free or wholly sub-threshold shape
-        // uses exact CPU rank-1 accumulation; after admission, a device decline
-        // or backend failure is returned to the caller.
+        // Each atom is admitted individually under this term's `gpu_policy` on
+        // the `XtDiagX { n, p: m_k }` op its Gram issues: a calibrated decline
+        // (a narrow atom, or one below the device's Gram crossover) is a
+        // routing verdict, so that atom takes the exact CPU rank-1
+        // accumulation. The admitted atoms are spread across EVERY device via
+        // `gpu::pool::scatter_batched`, each tile pinned to its own ordinal and
+        // re-admitted under the same policy on the same op (so the verdict is
+        // identical); a device failure after admission is returned to the
+        // caller, never laundered as CPU work.
         let weights: Vec<Array1<f64>> = (0..self.atoms.len())
             .map(|atom_idx| {
                 let col = assignments.column(atom_idx);
@@ -8566,8 +8570,8 @@ impl SaeManifoldTerm {
             })
             .collect();
 
-        // CPU per-atom contribution, used for fallback and as the whole path
-        // when no GPU runtime is present.
+        // CPU per-atom contribution: the whole path when no GPU runtime is
+        // present, and the route for every atom the policy does not admit.
         let cpu_one = |atom_idx: usize, gram: &mut Array2<f64>| {
             let atom = &self.atoms[atom_idx];
             let m = atom.basis_size();
@@ -8618,67 +8622,71 @@ impl SaeManifoldTerm {
             crate::gpu::device_runtime::GpuRuntime::resolve(self.gpu_policy)
                 .map_err(|error| format!("decoder-Gram CUDA admission failed: {error}"))?
         };
-        match rt {
-            None => {
-                for atom_idx in 0..self.atoms.len() {
-                    if self.atoms[atom_idx].basis_size() == 0 {
-                        continue;
-                    }
-                    cpu_one(atom_idx, &mut grams[atom_idx]);
+        let Some(rt) = rt else {
+            for atom_idx in 0..self.atoms.len() {
+                if self.atoms[atom_idx].basis_size() == 0 {
+                    continue;
                 }
+                cpu_one(atom_idx, &mut grams[atom_idx]);
             }
-            Some(rt) => {
-                // Device tiles produce each owned atom's Gram into a side channel
-                // keyed by atom index; splice them back into `grams` (with `+=`
-                // accumulation) after the scatter. A declined atom is recorded
-                // so the admitted route can fail without laundering it as CPU work.
-                let mut items: Vec<usize> = (0..self.atoms.len())
-                    .filter(|&i| self.atoms[i].basis_size() > 0)
-                    .collect();
-                let device_grams: std::sync::Mutex<Vec<(usize, Array2<f64>)>> =
-                    std::sync::Mutex::new(Vec::with_capacity(items.len()));
-                let declined: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
-                let atoms_ref = &self.atoms;
-                let weights_ref = &weights;
-                let ok = crate::gpu::pool::scatter_batched(rt, &mut items, |_, slice| {
-                    for &atom_idx in slice.iter() {
-                        let phi = atoms_ref[atom_idx].basis_values.view();
-                        let w = weights_ref[atom_idx].view();
-                        match crate::gpu::linalg_dispatch::try_fast_xt_diag_x(phi, w) {
-                            Some(g) => device_grams
-                                .lock()
-                                .expect("device_grams mutex poisoned")
-                                .push((atom_idx, g)),
-                            None => declined
-                                .lock()
-                                .expect("declined mutex poisoned")
-                                .push(atom_idx),
-                        }
-                    }
-                    Some(())
-                });
-                match ok {
-                    Some(()) => {
-                        for (atom_idx, g) in device_grams
-                            .into_inner()
-                            .expect("device_grams mutex poisoned")
-                        {
-                            grams[atom_idx] += &g;
-                        }
-                        let declined = declined.into_inner().expect("declined mutex poisoned");
-                        if !declined.is_empty() {
-                            return Err(format!(
-                                "decoder-Gram device path declined admitted atoms {declined:?}"
-                            ));
-                        }
-                    }
-                    None => {
-                        return Err(
-                            "decoder-Gram device scatter declined after CUDA admission".to_string()
-                        );
-                    }
-                }
+            return Ok(());
+        };
+        let gpu_policy = self.gpu_policy;
+        let mut items: Vec<usize> = Vec::with_capacity(self.atoms.len());
+        for atom_idx in 0..self.atoms.len() {
+            let m = self.atoms[atom_idx].basis_size();
+            if m == 0 {
+                continue;
             }
+            let op = crate::gpu::linalg_dispatch::DispatchOp::XtDiagX { n, p: m };
+            let atom_admitted =
+                crate::gpu::linalg_dispatch::route_through_gpu_with_policy(op, gpu_policy)
+                    .is_some();
+            if atom_admitted {
+                items.push(atom_idx);
+            } else {
+                cpu_one(atom_idx, &mut grams[atom_idx]);
+            }
+        }
+        if items.is_empty() {
+            return Ok(());
+        }
+        // Device tiles produce each owned atom's Gram into a side channel keyed
+        // by atom index; splice them back into `grams` (with `+=` accumulation)
+        // after the scatter.
+        let admitted = items.len();
+        let device_grams: std::sync::Mutex<Vec<(usize, Array2<f64>)>> =
+            std::sync::Mutex::new(Vec::with_capacity(admitted));
+        let atoms_ref = &self.atoms;
+        let weights_ref = &weights;
+        crate::gpu::pool::scatter_batched(rt, &mut items, |ordinal, slice| {
+            for &atom_idx in slice.iter() {
+                let phi = atoms_ref[atom_idx].basis_values.view();
+                let w = weights_ref[atom_idx].view();
+                let g = crate::gpu::linalg_dispatch::try_fast_xt_diag_x_on_ordinal_with_policy(
+                    ordinal, phi, w, gpu_policy,
+                )?;
+                device_grams
+                    .lock()
+                    .expect("device_grams mutex poisoned")
+                    .push((atom_idx, g));
+            }
+            Some(())
+        })
+        .ok_or_else(|| {
+            format!("decoder-Gram device scatter failed after CUDA admission of {admitted} atoms")
+        })?;
+        let device_grams = device_grams
+            .into_inner()
+            .expect("device_grams mutex poisoned");
+        if device_grams.len() != admitted {
+            return Err(format!(
+                "decoder-Gram device scatter returned {} Grams for {admitted} admitted atoms",
+                device_grams.len()
+            ));
+        }
+        for (atom_idx, g) in device_grams {
+            grams[atom_idx] += &g;
         }
         Ok(())
     }

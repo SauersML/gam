@@ -794,6 +794,57 @@ pub fn try_fast_xt_diag_x(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Opt
     }
 }
 
+/// Ordinal-pinned, per-request-policy counterpart of [`try_fast_xt_diag_x`] for
+/// multi-GPU scatters (`pool::scatter_batched`), whose tiles each run on their
+/// own device. Admission uses the caller's `gpu_policy` on the same
+/// work-keyed [`DispatchOp::XtDiagX`] gate, so a caller that screens its
+/// workload with `route_through_gpu_with_policy(DispatchOp::XtDiagX { .. },
+/// gpu_policy)` gets the identical verdict here; once admitted, an execution
+/// failure is fatal under every policy.
+#[inline]
+#[must_use]
+pub fn try_fast_xt_diag_x_on_ordinal_with_policy(
+    ordinal: usize,
+    x: ArrayView2<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    gpu_policy: GpuPolicy,
+) -> Option<Array2<f64>> {
+    let (n, p) = x.dim();
+    if n != w.len() {
+        invalid_gpu_request(
+            "ordinal-pinned Xᵀ·diag(w)·X",
+            "the row and weight counts differ",
+        );
+    }
+    if n == 0 || p == 0 {
+        return decline_gpu(
+            "ordinal-pinned Xᵀ·diag(w)·X",
+            "the workload has an empty dimension",
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // `ordinal` is only consumed by the Linux branch; read it once so
+        // `warnings = "deny"` does not reject the cross-platform signature.
+        log::trace!(
+            "try_fast_xt_diag_x_on_ordinal_with_policy: CUDA unavailable off Linux; declining ordinal {ordinal}"
+        );
+        return decline_gpu_with_policy(
+            "ordinal-pinned Xᵀ·diag(w)·X",
+            "the CUDA backend is not compiled on this platform",
+            gpu_policy,
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        route_through_gpu_with_policy(DispatchOp::XtDiagX { n, p }, gpu_policy)?;
+        Some(complete_gpu_attempt(
+            "ordinal-pinned Xᵀ·diag(w)·X",
+            cuda_backend::xt_diag_x_on_ordinal(ordinal, x, w),
+        ))
+    }
+}
+
 /// #1017 Phase 3: a device-resident design matrix for repeated `Xᵀ·diag(w)·X`
 /// Gram evaluations that uploads `X` to the device ONCE.
 ///
@@ -1776,6 +1827,15 @@ mod cuda_backend {
         w: ArrayView1<'_, f64>,
     ) -> Option<Array2<f64>> {
         super::super::blas::xt_diag_x_cuda(runtime, x, w)
+    }
+
+    #[inline]
+    pub(super) fn xt_diag_x_on_ordinal(
+        ordinal: usize,
+        x: ArrayView2<'_, f64>,
+        w: ArrayView1<'_, f64>,
+    ) -> Option<Array2<f64>> {
+        super::super::blas::xt_diag_x_on_ordinal_cuda(ordinal, x, w)
     }
 
     #[inline]
