@@ -455,7 +455,19 @@ impl TopologyAutoSelector {
     pub fn new(candidates: Vec<AutoTopologyKind>) -> Self {
         Self {
             candidates,
-            score_scale: TopologyScoreScale::PerEffectiveDim,
+            // Per OBSERVATION, never per effective dimension (#4556). The score
+            // is a negative log evidence, defined up to an additive constant
+            // that is a property of the data and not of the candidate (the
+            // measurement unit of the response contributes exactly such a
+            // constant). Dividing each candidate by its OWN effective dimension
+            // makes that shared constant land on the candidates unequally, so
+            // changing the unit of the response can reverse the race: costs 1
+            // and 3 at dimensions 1 and 2 rank the first candidate first
+            // (1.0 vs 1.5), and adding the same constant 4 to both ranks the
+            // second first (5.0 vs 3.5). The observation count is shared by
+            // every candidate in one race, so dividing by it rescales all of
+            // them together and cannot reorder them.
+            score_scale: TopologyScoreScale::PerObservation,
             curvature_is_estimable: false,
             curvature_fusion_subsumes: &[
                 AutoTopologyKind::Euclidean,
@@ -569,9 +581,12 @@ impl TopologySelectionScoreKind {
 /// Scale applied after the candidate's raw evidence cost is formed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopologySelectionScoreScale {
+    /// The candidate's evidence cost as computed, in nats.
     Raw,
+    /// The same cost per observation row. The divisor is shared by every
+    /// candidate in one race, so it rescales the whole set and preserves the
+    /// order `Raw` gives; it is a reporting unit, not a different rule.
     PerObservation,
-    PerEffectiveDim,
 }
 
 impl TopologySelectionScoreScale {
@@ -579,7 +594,6 @@ impl TopologySelectionScoreScale {
         match self {
             Self::Raw => "raw",
             Self::PerObservation => "per_observation",
-            Self::PerEffectiveDim => "per_effective_dim",
         }
     }
 }
@@ -893,7 +907,6 @@ where
                     evidence.raw_reml_roundoff,
                     evidence.null_dim,
                     evidence.null_space_logdet,
-                    evidence.effective_dim,
                     evidence.n_obs,
                     selector.score_scale,
                 ) {
@@ -969,7 +982,6 @@ pub fn tk_normalized_score(
     raw_reml: f64,
     null_dim: f64,
     null_space_logdet: Option<f64>,
-    effective_dim: f64,
     n_obs: usize,
     score_scale: TopologyScoreScale,
 ) -> Result<f64, String> {
@@ -978,7 +990,6 @@ pub fn tk_normalized_score(
         None,
         null_dim,
         null_space_logdet,
-        effective_dim,
         n_obs,
         score_scale,
     )
@@ -1007,7 +1018,6 @@ pub fn comparable_reml_score(
         raw_reml_score,
         null_dim,
         null_space_logdet,
-        1.0,
         1,
         TopologyScoreScale::PerObservation,
     )
@@ -1028,7 +1038,6 @@ pub(crate) fn tk_normalized_score_with_resolution(
     raw_reml_roundoff: Option<f64>,
     null_dim: f64,
     null_space_logdet: Option<f64>,
-    effective_dim: f64,
     n_obs: usize,
     score_scale: TopologyScoreScale,
 ) -> Result<(f64, Option<f64>), String> {
@@ -1045,14 +1054,6 @@ pub(crate) fn tk_normalized_score_with_resolution(
                 return Err("TopologyAutoSelector requires n_obs > 0".to_string());
             }
             n_obs as f64
-        }
-        TopologyScoreScale::PerEffectiveDim => {
-            if !(effective_dim.is_finite() && effective_dim > 0.0) {
-                return Err(
-                    "TopologyAutoSelector requires finite positive effective_dim".to_string()
-                );
-            }
-            effective_dim
         }
     };
     let score = tk / scale;
@@ -1147,16 +1148,6 @@ fn scale_topology_candidate_score(
                 ))
             } else {
                 Ok(score / evidence.n_obs as f64)
-            }
-        }
-        TopologySelectionScoreScale::PerEffectiveDim => {
-            if !(evidence.effective_dim.is_finite() && evidence.effective_dim > 0.0) {
-                Err(format!(
-                    "candidate {:?} requires finite positive effective_dim for per-effective-dimension scoring; got {:?}",
-                    evidence.name, evidence.effective_dim
-                ))
-            } else {
-                Ok(score / evidence.effective_dim)
             }
         }
     }
@@ -2441,20 +2432,58 @@ mod tests {
 
     #[test]
     fn typed_lifecycle_owns_score_scaling_and_deterministic_winner() {
+        // Per-observation scaling divides every candidate by the SAME count, so
+        // it reports the raw ranking in per-row units: the lower raw cost wins
+        // and the scores are the raw costs over n_obs = 20.
         let result = select_topology_candidate_lifecycle(
             vec![
                 lifecycle_evidence("larger_raw", 5.0, Some(5.0), 10.0),
                 lifecycle_evidence("smaller_raw", 3.0, Some(3.0), 2.0),
             ],
             TopologySelectionScoreKind::Reml,
-            TopologySelectionScoreScale::PerEffectiveDim,
+            TopologySelectionScoreScale::PerObservation,
         )
         .expect("typed lifecycle");
         assert_eq!(result.winner_index, Some(0));
-        assert_eq!(result.ranked[0].name, "larger_raw");
-        assert!((result.ranked[0].score - 0.5).abs() < 1.0e-12);
-        assert_eq!(result.ranked[1].name, "smaller_raw");
-        assert!((result.ranked[1].score - 1.5).abs() < 1.0e-12);
+        assert_eq!(result.ranked[0].name, "smaller_raw");
+        assert!((result.ranked[0].score - 3.0 / 20.0).abs() < 1.0e-12);
+        assert_eq!(result.ranked[1].name, "larger_raw");
+        assert!((result.ranked[1].score - 5.0 / 20.0).abs() < 1.0e-12);
+    }
+
+    /// #4556: an evidence cost is a negative log density, fixed only up to an
+    /// additive constant that belongs to the DATA (changing the unit the
+    /// response is measured in contributes exactly such a constant). Every
+    /// admissible scale must therefore leave the order of two candidates
+    /// unchanged when the same constant is added to both. The retired
+    /// per-effective-dimension scale failed exactly here: costs 1 and 3 at
+    /// effective dimensions 1 and 2 ranked the first candidate first
+    /// (1.0 vs 1.5), and adding 4 to both ranked the second first
+    /// (5.0 vs 3.5) — a change of measurement unit reversing a race.
+    #[test]
+    fn a_common_unit_constant_cannot_reverse_the_ranking() {
+        for scale in [
+            TopologySelectionScoreScale::Raw,
+            TopologySelectionScoreScale::PerObservation,
+        ] {
+            for shift in [0.0, 4.0, -7.5, 1.0e6] {
+                let result = select_topology_candidate_lifecycle(
+                    vec![
+                        lifecycle_evidence("thin", 1.0 + shift, None, 1.0),
+                        lifecycle_evidence("wide", 3.0 + shift, None, 2.0),
+                    ],
+                    TopologySelectionScoreKind::Reml,
+                    scale,
+                )
+                .expect("typed lifecycle");
+                assert_eq!(
+                    result.ranked[0].name, "thin",
+                    "scale {} reversed the ranking under the common shift {shift}",
+                    scale.as_str()
+                );
+                assert_eq!(result.ranked[1].name, "wide");
+            }
+        }
     }
 
     #[test]

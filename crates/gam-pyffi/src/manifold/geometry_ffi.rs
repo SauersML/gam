@@ -362,13 +362,12 @@ fn measured_coding_from_kwargs(
     }
 }
 
-#[pyfunction(signature = (points, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6, d_eff_atom = None, n_eff = None, n_rows = None, k_bar = None, d_bar = None))]
+#[pyfunction(signature = (points, mode = "kneedle", knee_slope_fraction = 0.10, flat_span_tol = 1.0e-6, d_eff_atom = None, n_eff = None, n_rows = None, k_bar = None, d_bar = None))]
 fn sae_select_k(
     py: Python<'_>,
     points: Vec<(usize, f64)>,
     mode: &str,
     knee_slope_fraction: f64,
-    complexity_penalty: f64,
     flat_span_tol: f64,
     d_eff_atom: Option<f64>,
     n_eff: Option<f64>,
@@ -380,7 +379,6 @@ fn sae_select_k(
     let config = gam::terms::sae::k_selection::KSelectionConfig {
         mode: gam::terms::sae::k_selection::KSelectionMode::parse(mode).map_err(py_value_error)?,
         knee_slope_fraction,
-        complexity_penalty,
         flat_span_tol,
         measured_coding: measured_coding_from_kwargs(d_eff_atom, n_eff, n_rows, k_bar, d_bar)?,
     };
@@ -395,7 +393,7 @@ fn sae_select_k(
     Ok(out.into())
 }
 
-#[pyfunction(signature = (manifold_points, linear_points, manifold_params_per_atom, linear_params_per_atom, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6, d_eff_atom = None, n_eff = None, n_rows = None, k_bar = None, d_bar = None))]
+#[pyfunction(signature = (manifold_points, linear_points, manifold_params_per_atom, linear_params_per_atom, mode = "kneedle", knee_slope_fraction = 0.10, flat_span_tol = 1.0e-6, d_eff_atom = None, n_eff = None, n_rows = None, k_bar = None, d_bar = None))]
 fn sae_auto_k_recommendation(
     py: Python<'_>,
     manifold_points: Vec<(usize, f64)>,
@@ -404,7 +402,6 @@ fn sae_auto_k_recommendation(
     linear_params_per_atom: f64,
     mode: &str,
     knee_slope_fraction: f64,
-    complexity_penalty: f64,
     flat_span_tol: f64,
     d_eff_atom: Option<f64>,
     n_eff: Option<f64>,
@@ -419,7 +416,6 @@ fn sae_auto_k_recommendation(
     let config = gam::terms::sae::k_selection::KSelectionConfig {
         mode: gam::terms::sae::k_selection::KSelectionMode::parse(mode).map_err(py_value_error)?,
         knee_slope_fraction,
-        complexity_penalty,
         flat_span_tol,
         measured_coding: measured_coding_from_kwargs(d_eff_atom, n_eff, n_rows, k_bar, d_bar)?,
     };

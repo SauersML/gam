@@ -39,6 +39,37 @@
   coefficient axis. A chart pair that is exact at second order is now exact in its
   coefficient motion too, so no axis of a Weibull, Gompertz or Makeham baseline chart leaves
   the curvature with a partial contract.
+- **Two model-selection scores were functions of the candidate set, and one ledger field
+  held two currencies** (gam#4556).
+  Three deterministic ranking defects in the "unify REML and MDL" programme, each
+  demonstrable on paper. (1) `k_selection`'s `PenalizedMdl` mode maximized
+  `EV(K) − γ·(K / K_max)` and called itself description length, but `K_max` is the largest
+  candidate the sweep evaluated: at `γ = 0.1`, `K = 10` at `EV = 0.80` beats `K = 20` at
+  `EV = 0.84` while the sweep stops at 20 (0.750 vs 0.740), and loses to it once a
+  dominated `K = 1000` is also evaluated (0.799 vs 0.838). A description length is a
+  property of the model and the message, so no term in it may move when a dominated
+  candidate is added; the mode and its `complexity_penalty` γ are deleted and
+  `MeasuredMdl`, which prices an atom at its measured storage `d_eff,atom · ln n_eff`
+  nats, is the one description-length rule. `"mdl"` now parses to it, and a caller that
+  supplies no measured coding ingredients is refused rather than answered by another rule.
+  (2) The topology race's per-effective-dimension scale divided each candidate's negative
+  log evidence by that candidate's OWN effective dimension. An evidence is fixed only up
+  to an additive constant carried by the data — the unit the response is measured in
+  contributes exactly such a constant — so an unequal divisor lets that shared constant
+  reverse the race: costs 1 and 3 at dimensions 1 and 2 rank the first candidate first
+  (1.0 vs 1.5), and adding 4 to both ranks the second first (5.0 vs 3.5). The scale is
+  removed from `TopologyScoreScale` and `TopologySelectionScoreScale`, `TopologyAutoSelector::new`
+  defaults to per-observation — a divisor shared by every candidate in one race, which
+  cannot reorder them — and `tk_normalized_score` drops the `effective_dim` argument it
+  only used for the deleted scale. `effective_dim` remains reported metadata.
+  (3) `MoveEvidence.dl_bits` carried both the tiered co-fit's state-objective difference
+  and the structure-search gate's sequential e-process value divided by `ln 2`. Converting
+  nats to bits converts a number; it does not make an e-value a difference of the
+  objective, and the two behave differently — a state-objective difference telescopes
+  around a closed cycle of moves, a path-dependent e-value need not. The field is split
+  into `dl_bits` and `e_process_bits`, each `Option<f64>`, a move fills at most one, and
+  the JSON payload publishes both. `MoveEvidence::none()` now records neither currency as
+  measured instead of a zero state-objective change.
 
 - **The scheduled p-value calibration run can fail** (gam#3722).
   `.github/workflows/pvalue-calibration.yml` gave the calibration harness a runner, but

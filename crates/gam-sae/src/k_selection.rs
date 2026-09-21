@@ -17,10 +17,28 @@
 //! * an **elbow / kneedle** criterion — pick the `K` at the saturation knee of
 //!   the explained-variance curve, where the marginal EV gain per added atom
 //!   first drops below a principled fraction of the early (steep-regime) slope,
-//!   or equivalently the point of maximum curvature of the normalized curve; or
-//! * a **penalized-EV / MDL** stop — maximize `EV(K) − γ · (K / K_max)`, a
-//!   description-length-style trade of reconstruction gain against dictionary
-//!   complexity.
+//!   or equivalently the point of maximum curvature of the normalized curve. It
+//!   is declared and reported as a curve-shape heuristic over the sampled
+//!   frontier, and claims no code length; or
+//! * the **measured MDL stop** — the first `K` whose marginal EV gain per atom
+//!   no longer pays that atom's measured storage. Every quantity in the rule is
+//!   read off the fit, so the stop is a property of the model and the data, not
+//!   of which sizes happened to be swept.
+//!
+//! ## Why there is no `EV(K) − γ·(K / K_max)` rule (#4556)
+//!
+//! There used to be a third mode that maximized `EV(K) − γ · (K / K_max)` and
+//! called itself description length. Its size charge was divided by `K_max`,
+//! the LARGEST CANDIDATE EVALUATED, so the charge a model paid depended on the
+//! company it was swept against: with `γ = 0.1`, `K = 10` at `EV = 0.80` beats
+//! `K = 20` at `EV = 0.84` while the sweep stops at 20 (0.750 vs 0.740), and
+//! loses to it once a dominated `K = 1000` is also evaluated (0.799 vs 0.838).
+//! A description length is a property of the model and the message, so no term
+//! in it may be a function of the candidate set; a rule that moves when a
+//! dominated candidate is added is a candidate-set heuristic wearing the name.
+//! The charge is not re-derived here: [`KSelectionMode::MeasuredMdl`] already
+//! prices an atom at its MEASURED storage `d_eff,atom · ln n_eff` nats, which
+//! is candidate-set free, and that rule replaces it.
 //!
 //! ## The manifold-vs-linear advantage
 //!
@@ -138,14 +156,10 @@ pub enum KSelectionMode {
     /// post-knee marginal slope has decayed below `knee_slope_fraction` of the
     /// initial (steep-regime) slope.
     Kneedle,
-    /// Penalized-EV / MDL: maximize `EV(K) − complexity_penalty · (K / K_max)`.
-    /// The `complexity_penalty` `γ` here is a TUNED dial — see
-    /// [`KSelectionMode::MeasuredMdl`] for the derived, tuning-free replacement.
-    PenalizedMdl,
-    /// Measured MDL stopping rule (Theorem 4 of the "Superposed Geometry" memo):
-    /// the tuning-free replacement for `PenalizedMdl`'s `γ`. Stop at the first
-    /// `K` where the marginal EV gain per atom drops below the residual fraction
-    /// times one atom's storage nats over the total coded-scalar count:
+    /// Measured MDL stopping rule (Theorem 4 of the "Superposed Geometry" memo).
+    /// Stop at the first `K` where the marginal EV gain per atom drops below the
+    /// residual fraction times one atom's storage nats over the total
+    /// coded-scalar count:
     /// ```text
     ///   ∂EV/∂K  <  (1 − EV(K)) · ( d_eff,atom · ln n_eff ) / ( N · k̄ · d̄ ).
     /// ```
@@ -161,10 +175,14 @@ impl KSelectionMode {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "kneedle" | "knee" | "elbow" => Ok(Self::Kneedle),
-            "mdl" | "penalized" | "penalized_mdl" => Ok(Self::PenalizedMdl),
-            "measured" | "measured_mdl" | "theorem4" | "theorem_4" => Ok(Self::MeasuredMdl),
+            // "mdl" names the measured rule: it is the only description-length
+            // rule here, and the retired candidate-set-scaled one (#4556) never
+            // was one. A caller that used to pass "mdl" and no measured coding
+            // ingredients is REFUSED by `select_k` rather than answered by a
+            // different rule under the name it asked for.
+            "mdl" | "measured" | "measured_mdl" | "theorem4" | "theorem_4" => Ok(Self::MeasuredMdl),
             other => Err(format!(
-                "K-selection mode must be 'kneedle', 'mdl', or 'measured'; got {other:?}"
+                "K-selection mode must be 'kneedle' or 'measured' ('mdl'); got {other:?}"
             )),
         }
     }
@@ -172,7 +190,6 @@ impl KSelectionMode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Kneedle => "kneedle",
-            Self::PenalizedMdl => "mdl",
             Self::MeasuredMdl => "measured",
         }
     }
@@ -244,16 +261,14 @@ pub struct KSelectionConfig {
     /// whose slope never decays this far is classified [`KSelectionFlag::NoKnee`]
     /// (still climbing) or [`KSelectionFlag::Linear`].
     pub knee_slope_fraction: f64,
-    /// MDL: the complexity weight `γ` on the normalized size `K / K_max`.
-    pub complexity_penalty: f64,
     /// Below this total EV span (`max EV − min EV` across the curve) the curve
     /// is treated as already saturated ([`KSelectionFlag::Flat`]) and the
     /// smallest `K` is returned.
     pub flat_span_tol: f64,
     /// The fit-measured coding ingredients for [`KSelectionMode::MeasuredMdl`].
-    /// `None` on the `Kneedle` / `PenalizedMdl` paths (they do not need it). The
-    /// `MeasuredMdl` mode requires it: [`select_k`] refuses the measured rule
-    /// without its ingredients rather than substituting the tuned knee.
+    /// `None` on the `Kneedle` path (it does not need them). The `MeasuredMdl`
+    /// mode requires them: [`select_k`] refuses the measured rule without its
+    /// ingredients rather than substituting the knee heuristic.
     pub measured_coding: Option<MeasuredCoding>,
 }
 
@@ -263,7 +278,6 @@ impl Default for KSelectionConfig {
             mode: KSelectionMode::Kneedle,
             // Knee = where marginal gain has decayed to 10% of the steep slope.
             knee_slope_fraction: 0.10,
-            complexity_penalty: 0.05,
             flat_span_tol: 1.0e-6,
             measured_coding: None,
         }
@@ -271,9 +285,8 @@ impl Default for KSelectionConfig {
 }
 
 impl KSelectionConfig {
-    /// The recommended tuning-free config: the Theorem-4 measured MDL stopping
-    /// rule fed the fit's own coding ingredients. Prefer this over a tuned
-    /// `PenalizedMdl` `γ`.
+    /// The recommended config: the Theorem-4 measured MDL stopping rule fed the
+    /// fit's own coding ingredients.
     pub fn measured(coding: MeasuredCoding) -> Self {
         Self {
             mode: KSelectionMode::MeasuredMdl,
@@ -351,7 +364,7 @@ pub fn select_k(curve: &EvVsKCurve, config: &KSelectionConfig) -> Result<KSelect
              (d_eff_atom, n_eff, n_rows, k_bar, d_bar); none were supplied"
                 .to_string()
         })?),
-        KSelectionMode::Kneedle | KSelectionMode::PenalizedMdl => None,
+        KSelectionMode::Kneedle => None,
     };
     let pts = curve.points();
     let n = pts.len();
@@ -381,7 +394,6 @@ pub fn select_k(curve: &EvVsKCurve, config: &KSelectionConfig) -> Result<KSelect
 
     Ok(match measured_coding {
         Some(coding) => select_measured(curve, &coding),
-        None if config.mode == KSelectionMode::PenalizedMdl => select_mdl(curve, config),
         None => select_kneedle(curve, config, span),
     })
 }
@@ -527,40 +539,6 @@ fn select_kneedle(curve: &EvVsKCurve, config: &KSelectionConfig, span: f64) -> K
             flag: KSelectionFlag::NoKnee,
             score: decay_fraction,
         }
-    }
-}
-
-fn select_mdl(curve: &EvVsKCurve, config: &KSelectionConfig) -> KSelection {
-    let pts = curve.points();
-    let k_max = curve.k_max() as f64;
-    let gamma = config.complexity_penalty;
-
-    let mut best_idx = 0usize;
-    let mut best_obj = f64::NEG_INFINITY;
-    for (i, p) in pts.iter().enumerate() {
-        let obj = p.ev - gamma * (p.k as f64 / k_max);
-        if obj > best_obj {
-            best_obj = obj;
-            best_idx = i;
-        }
-    }
-
-    // Classify the MDL pick the same way the Kneedle path reports its endpoints
-    // so callers get a consistent flag vocabulary: interior pick => Knee,
-    // endpoint picks => the endpoint reason.
-    let flag = if best_idx == 0 {
-        KSelectionFlag::Flat
-    } else if best_idx == pts.len() - 1 {
-        KSelectionFlag::NoKnee
-    } else {
-        KSelectionFlag::Knee
-    };
-
-    KSelection {
-        k: pts[best_idx].k,
-        ev: pts[best_idx].ev,
-        flag,
-        score: best_obj,
     }
 }
 
@@ -840,42 +818,6 @@ mod k_selection_tests {
     }
 
     #[test]
-    fn mdl_picks_interior_knee_on_saturating_curve() {
-        let curve = knee_curve();
-        let cfg = KSelectionConfig {
-            mode: KSelectionMode::PenalizedMdl,
-            complexity_penalty: 0.05,
-            ..KSelectionConfig::default()
-        };
-        let sel = select_k(&curve, &cfg).expect("select_k");
-        // MDL trades EV gain against K/K_max=K/32. Past the knee the EV gain is
-        // tiny while the size penalty keeps growing, so the optimum is interior.
-        assert!(
-            sel.k <= 8,
-            "MDL should not chase the saturated tail, got {}",
-            sel.k
-        );
-        assert!(
-            sel.k >= 3,
-            "MDL should not under-fit the steep rise, got {}",
-            sel.k
-        );
-    }
-
-    #[test]
-    fn mdl_penalty_zero_takes_full_k() {
-        let curve = knee_curve();
-        let cfg = KSelectionConfig {
-            mode: KSelectionMode::PenalizedMdl,
-            complexity_penalty: 0.0,
-            ..KSelectionConfig::default()
-        };
-        let sel = select_k(&curve, &cfg).expect("select_k");
-        // With no complexity penalty, max EV (largest K) wins.
-        assert_eq!(sel.k, 32);
-    }
-
-    #[test]
     fn advantage_metric_rewards_manifold_compression() {
         // Manifold reaches EV 0.90 at K=4; linear needs K=16 for the same. With
         // equal per-atom parameter cost the parameter ratio is 16·p / 4·p = 4x.
@@ -1006,10 +948,15 @@ mod k_selection_tests {
             KSelectionMode::parse("elbow").expect("parse"),
             KSelectionMode::Kneedle
         );
+        // "mdl" resolves to the ONE description-length rule that exists: the
+        // measured one. The retired `EV − γ·K/K_max` rule (#4556) is not
+        // reachable under any spelling.
         assert_eq!(
             KSelectionMode::parse("MDL").expect("parse"),
-            KSelectionMode::PenalizedMdl
+            KSelectionMode::MeasuredMdl
         );
+        assert!(KSelectionMode::parse("penalized").is_err());
+        assert!(KSelectionMode::parse("penalized_mdl").is_err());
         assert_eq!(
             KSelectionMode::parse("measured").expect("parse"),
             KSelectionMode::MeasuredMdl
@@ -1070,6 +1017,43 @@ mod k_selection_tests {
         assert_eq!(sel.flag, KSelectionFlag::Knee, "measured rule should bind");
         assert_eq!(sel.k, 11, "selected K = last atom that paid for itself");
         assert!(sel.score < 1.0, "marginal below threshold at the stop");
+    }
+
+    /// #4556: the surviving description-length rule must be CANDIDATE-SET FREE.
+    /// The retired `EV(K) − γ·(K / K_max)` rule divided its size charge by the
+    /// largest candidate evaluated, so extending the sweep with a dominated
+    /// larger `K` re-priced every model already on the curve and could reverse
+    /// their order. The measured rule prices an atom at its own measured
+    /// storage, so widening or narrowing the sweep around the stop cannot move
+    /// it: the same `(K, EV)` samples give the same answer whatever else was
+    /// swept. Both directions are asserted — a longer sweep and a shorter one.
+    #[test]
+    fn measured_rule_selection_is_invariant_to_the_candidate_set() {
+        let (_p, coding) = saturating_coding(1.0 / 15.5);
+        let cfg = KSelectionConfig::measured(coding);
+        // The rule binds at K = 12 and selects K = 11 (see the theory test), so
+        // every sweep whose largest K is at least 12 contains the same stop.
+        let short = select_k(&saturating_curve(5.0, 20), &cfg).expect("select_k");
+        let base = select_k(&saturating_curve(5.0, 40), &cfg).expect("select_k");
+        let long = select_k(&saturating_curve(5.0, 400), &cfg).expect("select_k");
+        assert_eq!(base.k, 11, "the stop is the one the closed form predicts");
+        assert_eq!(
+            short.k, base.k,
+            "narrowing the sweep to K_max = 20 moved the stop: {} vs {}",
+            short.k, base.k
+        );
+        assert_eq!(
+            long.k, base.k,
+            "adding dominated candidates out to K_max = 400 moved the stop: {} vs {}",
+            long.k, base.k
+        );
+        assert_eq!(short.flag, base.flag);
+        assert_eq!(long.flag, base.flag);
+        // The reported score is the marginal-vs-threshold ratio at the stop and
+        // is a property of the two samples that bracket it, so it is invariant
+        // too — the ranking is not merely re-tied at a different scale.
+        assert_eq!(short.score.to_bits(), base.score.to_bits());
+        assert_eq!(long.score.to_bits(), base.score.to_bits());
     }
 
     #[test]

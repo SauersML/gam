@@ -36,9 +36,8 @@
 //! `V` as written is the *negative log evidence* when `F` is the
 //! penalized negative log posterior. The maximizer of evidence is the
 //! minimizer of `V`. The evidence here is the **negative log evidence**, and
-//! topologies rank by the **minimum** of the configured per-row or
-//! per-effective-dimension normalization; equivalently the caller can negate
-//! and `argmax`.
+//! topologies rank by the **minimum** of the per-row normalization;
+//! equivalently the caller can negate and `argmax`.
 
 use faer::Side;
 use gam_runtime::warm_start::{Fingerprint, Fingerprinter};
@@ -56,12 +55,20 @@ use gam_math::special::{bessel_i0_centered_jet, bessel_i0_log_minus_abs_and_rati
 // ---------------------------------------------------------------------------
 
 /// Normalization applied before ranking topology candidates.
+///
+/// A negative log evidence is fixed only up to an additive constant carried by
+/// the DATA — the unit the response is measured in contributes exactly such a
+/// constant — so the divisor applied before ranking must be COMMON to the
+/// candidates, or that shared constant lands on them unequally and can reverse
+/// the race. The observation count of one race is common to it; a candidate's
+/// own effective dimension is not, which is why there is no per-effective-
+/// dimension scale (#4556): with costs 1 and 3 at effective dimensions 1 and 2
+/// it ranked the first candidate first (1.0 vs 1.5) and, after adding the same
+/// constant 4 to both, the second (5.0 vs 3.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopologyScoreScale {
     /// Compare negative log evidence per observation row.
     PerObservation,
-    /// Compare negative log evidence per effective integrated dimension.
-    PerEffectiveDim,
 }
 
 /// Convergence controls for stacking retained topology predictive densities.

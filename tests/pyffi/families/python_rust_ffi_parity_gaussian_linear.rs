@@ -149,7 +149,6 @@ fn python_rust_ffi_parity_gaussian_linear_case() {
         raw_reml_py,
         null_dim,
         value["null_space_logdet"].as_f64(),
-        1.0,
         1,
         gam::solver::evidence::TopologyScoreScale::PerObservation,
     )

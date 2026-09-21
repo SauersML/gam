@@ -1,5 +1,15 @@
 [
   {
+    "base": "ecef664da45e7dd64e61289dbf642d0e41a0e5c5",
+    "items": [
+      "crates/gam-sae/src/k_selection.rs:fn:mdl_penalty_zero_takes_full_k",
+      "crates/gam-sae/src/k_selection.rs:fn:mdl_picks_interior_knee_on_saturating_curve",
+      "crates/gam-sae/src/k_selection.rs:fn:select_mdl"
+    ],
+    "reason": "#4556 Phase 3: the penalized-EV rule that called itself description length is deleted, with the two tests that pinned its behaviour. select_mdl maximized EV(K) - gamma*(K / K_max) where K_max is the LARGEST CANDIDATE EVALUATED, so the size charge a model paid was a function of the candidate set: with gamma = 0.1, K = 10 at EV = 0.80 beats K = 20 at EV = 0.84 while the sweep stops at 20 (0.750 vs 0.740) and loses to it once a dominated K = 1000 is also evaluated (0.799 vs 0.838). A description length is a property of the model and the message, so no term in it may depend on which other sizes happened to be swept. It is replaced, not re-derived: KSelectionMode::MeasuredMdl already prices an atom at its measured storage d_eff_atom * ln n_eff nats over the measured coded-scalar count, which names no candidate but the one being priced, and the module documented it as the tuning-free replacement for this rule's gamma before this commit. The two removed tests asserted the retired rule's picks (an interior optimum at gamma = 0.05, and K_max at gamma = 0) and have no referent; measured_rule_selection_is_invariant_to_the_candidate_set replaces them by asserting the property the retired rule violated, over sweeps to K_max = 20, 40 and 400.",
+    "evidence": "At the base ecef664da4, git grep -n select_mdl finds 2 lines, both in crates/gam-sae/src/k_selection.rs: its declaration and its single call in select_k's dispatch. mdl_picks_interior_knee_on_saturating_curve and mdl_penalty_zero_takes_full_k occur once each, their own declarations, inside that file's #[cfg(test)] mod tests. No other crate, test, bench, example or Python file names any of the three. The enum variant KSelectionMode::PenalizedMdl and the field KSelectionConfig::complexity_penalty go with them; neither is an item this guard inventories, and both are named only in k_selection.rs and in the two gam-pyffi wrappers sae_select_k and sae_auto_k_recommendation, whose signatures drop the complexity_penalty keyword in the same commit. No Python file in the repository calls either wrapper or passes complexity_penalty. No pub fn is removed, so the public-function census records no loss and carries no entry."
+  },
+  {
     "base": "b8fcb448379a238f75525eac53bef90b3770c4c8",
     "items": [
       "crates/gam-terms/src/basis/types.rs:const:CENTER_GROWTH_EXPONENT",

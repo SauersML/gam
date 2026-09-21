@@ -3918,7 +3918,6 @@ fn tierney_kadane_normalized_score(
         raw_reml,
         null_dim,
         null_space_logdet,
-        1.0,
         1,
         gam::solver::evidence::TopologyScoreScale::PerObservation,
     )
@@ -4007,10 +4006,13 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
     }
     #[derive(Deserialize)]
     #[serde(rename_all = "snake_case")]
+    // No `per_effective_dim` (#4556): dividing each candidate's evidence by
+    // its OWN effective dimension lets a constant shared by the whole data set
+    // reverse the race, so a request naming it is refused by the deserializer
+    // rather than answered under a different scale.
     enum ScoreScale {
         Raw,
         PerObservation,
-        PerEffectiveDim,
     }
     #[derive(Deserialize)]
     #[serde(rename_all = "snake_case")]
@@ -4080,7 +4082,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
     let score_scale = match request.score_scale {
         ScoreScale::Raw => gam::solver::TopologySelectionScoreScale::Raw,
         ScoreScale::PerObservation => gam::solver::TopologySelectionScoreScale::PerObservation,
-        ScoreScale::PerEffectiveDim => gam::solver::TopologySelectionScoreScale::PerEffectiveDim,
     };
     let candidates: Result<Vec<_>, String> = request
         .candidates

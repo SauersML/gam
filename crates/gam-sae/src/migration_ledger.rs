@@ -10,17 +10,32 @@
 //!     fissions / glues adjudicated by an e-process and priced in a banked
 //!     `log_e` evidence value.
 //!
-//! Both are the SAME accounting: an atom is born, dies, or a proposed move is
-//! refused, and the move pays evidence. [`SaeMigrationLedger`] is that one
-//! currency. A move is a [`SaeMove`] — `Birth` (residual → linear → curved),
-//! `Death` (the reverse fall back to the residual-factor pool), `Refuse` (a
-//! proposed move the evidence did not buy), `Admit` (a proposed move the
-//! evidence bought that the fit reports without installing), or `Restructure` (an
-//! installed move that adds and removes no atom) — and every move carries the single
-//! [`MoveEvidence`] currency: a REML/LAML criterion delta, the rank/complexity
-//! charge it spends, and the net description-length change in **bits** (`dl_bits`)
-//! that unifies the tiered `curved_charge` and the e-process `log_e` (a log-e
-//! value in nats is a description-length saving; [`bits_from_nats`] converts it).
+//! Both are the SAME LIFECYCLE: an atom is born, dies, or a proposed move is
+//! refused. [`SaeMigrationLedger`] is that one stream. A move is a [`SaeMove`] —
+//! `Birth` (residual → linear → curved), `Death` (the reverse fall back to the
+//! residual-factor pool), `Refuse` (a proposed move the evidence did not buy),
+//! `Admit` (a proposed move the evidence bought that the fit reports without
+//! installing), or `Restructure` (an installed move that adds and removes no
+//! atom) — and every move carries its [`MoveEvidence`].
+//!
+//! # Two currencies, never added (#4556)
+//!
+//! The lifecycle is one stream; the evidence is NOT one number. The tiered
+//! co-fit pays a difference of one STATE OBJECTIVE, `dl_bits`: it is a function
+//! of the model before and after, so around a closed cycle of moves the
+//! differences telescope to zero. The structure-search gate banks a SEQUENTIAL
+//! e-process value, `e_process_bits`: it is a property of the PATH the gate
+//! walked, it may depend on the order the moves were tested in, and it need not
+//! telescope. Both can be written in bits, and this module writes both in bits
+//! ([`bits_from_nats`] converts a log-e value in nats), but a shared unit is not
+//! a shared quantity: dividing by `ln 2` converts a number, it does not make an
+//! e-value a difference of the objective.
+//!
+//! So each move records at most ONE of them and the other stays `None`. A reader
+//! that wants "how much description length did this fit spend" sums `dl_bits`
+//! over the moves that HAVE one; a reader that wants the gate's banked evidence
+//! sums `e_process_bits`. Nothing in this module adds the two, and no move
+//! carries both.
 //!
 use std::collections::HashMap;
 
@@ -90,11 +105,15 @@ impl BirthSeed {
     }
 }
 
-/// The single evidence currency every move pays. `dl_bits` is the net
-/// description-length change in **bits** and is the unified quantity across the
-/// tiered `curved_charge` and the e-process `log_e`; `reml_delta` and
-/// `rank_charge` carry the two half-ledgers (fit gain vs complexity spent) when a
-/// path exposes them, and are `NaN` / `0.0` when it does not.
+/// What one move paid, in the currency that priced it. `reml_delta` and
+/// `rank_charge` carry the two half-ledgers (fit gain vs complexity spent) when
+/// a path exposes them, and are `NaN` / `0.0` when it does not.
+///
+/// `dl_bits` and `e_process_bits` are the two currencies of the module doc and
+/// are mutually exclusive: a move is priced by a state-objective difference or
+/// by a sequential e-value, never by both, and the one that did not price it is
+/// `None`. `None` is not zero — it says this move's change in that currency was
+/// never measured, which is a different statement from measuring it as nothing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MoveEvidence {
     /// Change in the REML/LAML evidence criterion attributable to the move
@@ -105,43 +124,56 @@ pub struct MoveEvidence {
     /// of the description-length ledger (`0.0` for deaths and refusals, which
     /// free or spend no rank).
     pub rank_charge: f64,
-    /// Net description-length change in **bits**: the tiered co-fit's
-    /// `curved_charge` for a curved promotion, or the banked e-process evidence
-    /// `bits_from_nats(log_e)` for a structure-search move.
-    pub dl_bits: f64,
+    /// Net change of the fit's STATE objective, in **bits**: the tiered co-fit's
+    /// `curved_charge` for a curved promotion. A difference of a function of the
+    /// model, so it telescopes around a closed cycle of moves.
+    pub dl_bits: Option<f64>,
+    /// The structure-search gate's banked SEQUENTIAL e-process evidence, in
+    /// **bits** (`bits_from_nats(log_e)`). A property of the path the gate
+    /// walked: it may depend on the order the moves were tested in and need not
+    /// telescope, so it is never summed with, or substituted for, `dl_bits`.
+    pub e_process_bits: Option<f64>,
 }
 
 impl MoveEvidence {
-    /// Evidence carrying only a `dl_bits` charge (the tiered co-fit currency);
-    /// the REML delta is unscored and no rank is charged at this granularity.
+    /// Evidence for a move priced by a state-objective difference (the tiered
+    /// co-fit currency); the REML delta is unscored and no rank is charged at
+    /// this granularity.
     #[must_use]
     pub(crate) fn from_dl_bits(dl_bits: f64) -> Self {
         Self {
             reml_delta: f64::NAN,
             rank_charge: 0.0,
-            dl_bits,
+            dl_bits: Some(dl_bits),
+            e_process_bits: None,
         }
     }
 
-    /// Evidence for a structure-search move whose e-process banked `log_e` nats;
-    /// the description-length charge is that evidence in bits.
+    /// Evidence for a structure-search move whose e-process banked `log_e` nats.
+    /// It lands in `e_process_bits`, NOT in `dl_bits`: the gate measured a
+    /// sequential e-value along its path and measured no change of the state
+    /// objective, and converting nats to bits does not turn the one into the
+    /// other (#4556).
     #[must_use]
     pub(crate) fn from_log_e(log_e: f64) -> Self {
         Self {
             reml_delta: f64::NAN,
             rank_charge: 0.0,
-            dl_bits: bits_from_nats(log_e),
+            dl_bits: None,
+            e_process_bits: Some(bits_from_nats(log_e)),
         }
     }
 
-    /// The zero-charge evidence a structural tally carries (a dead-routing death,
-    /// a budget-deferred refusal): no criterion delta, no rank, no bits.
+    /// The evidence a structural tally carries (a stale/duplicate refusal, a
+    /// budget-deferred refusal): no criterion delta, no rank, and neither
+    /// currency measured.
     #[must_use]
     pub fn none() -> Self {
         Self {
             reml_delta: f64::NAN,
             rank_charge: 0.0,
-            dl_bits: 0.0,
+            dl_bits: None,
+            e_process_bits: None,
         }
     }
 }
@@ -232,11 +264,11 @@ pub struct MigrationMove {
     /// #2233 birth proposal priority: the heuristic net description-length change
     /// (bits) computed for this move at PROPOSAL time, before any refit. It orders
     /// proposals and certifies nothing (#2933 F22). `Some` only for a
-    /// residual-factor [`SaeMove::Birth`] with a finite priority (paired with the
-    /// post-refit `evidence.dl_bits` — a logged predicted-vs-realized calibration
-    /// pair); `None` for every move the priority does not price (deaths, refusals,
+    /// residual-factor [`SaeMove::Birth`] with a finite priority; `None` for
+    /// every move the priority does not price (deaths, refusals,
     /// fusions/fissions/glues, curl births, structural tallies, inconclusive
-    /// priorities).
+    /// priorities). It is a state-objective quantity, so it is comparable with
+    /// `evidence.dl_bits` and NOT with `evidence.e_process_bits` (#4556).
     pub predicted_dl_bits: Option<f64>,
 }
 
@@ -380,7 +412,10 @@ impl SaeMigrationLedger {
     }
 
     /// The ledger as a JSON record for a fitted model's payload: the tallies and
-    /// every move with its stage, seed or reason, count, round and evidence. Unscored evidence (`NaN`) is `null`.
+    /// every move with its stage, seed or reason, count, round and evidence.
+    /// Unscored evidence (`NaN`) is `null`, and so is a currency this move was
+    /// not priced in: `dl_bits` and `e_process_bits` are separate fields and a
+    /// move fills at most one of them (#4556).
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
         let moves = self
@@ -404,6 +439,7 @@ impl SaeMigrationLedger {
                     "reml_delta": mv.evidence.reml_delta,
                     "rank_charge": mv.evidence.rank_charge,
                     "dl_bits": mv.evidence.dl_bits,
+                    "e_process_bits": mv.evidence.e_process_bits,
                     "objective": mv.objective,
                     "predicted_dl_bits": mv.predicted_dl_bits,
                 })
@@ -436,11 +472,14 @@ impl SaeMigrationLedger {
     /// `birth_predictions` maps a birth candidate index (the index a
     /// [`StructureMove::Birth`] carries) to the #2233 closed-form pre-screen's
     /// predicted ΔMDL (bits) for that residual-factor birth. Each proposed birth's
-    /// prediction is stamped onto its folded record's `predicted_dl_bits`, so the
-    /// post-refit verdict (`evidence.dl_bits`) and the pre-refit prediction sit on
-    /// the SAME record — the predicted-vs-realized calibration pair. A birth not in
-    /// the map (a curl birth, or any round scored before the pre-screen existed) is
-    /// left `None`; pass an empty map when no predictions are available.
+    /// prediction is stamped onto its folded record's `predicted_dl_bits` so the
+    /// pre-refit prediction and the gate's verdict sit on the SAME record. They
+    /// are NOT a predicted-vs-realized pair (#4556): the prediction is a
+    /// state-objective ΔMDL and the verdict recorded beside it is the gate's
+    /// sequential `e_process_bits`, so the two are in different currencies and
+    /// their difference is not a calibration error. A birth not in the map (a
+    /// curl birth, or any round scored before the pre-screen existed) is left
+    /// `None`; pass an empty map when no predictions are available.
     pub(crate) fn record_search_round(
         &mut self,
         round: usize,
@@ -696,10 +735,23 @@ mod ledger_tests {
             ]
         );
         for mv in &ledger.moves {
+            // The gate banked a sequential e-value: ln 2 nats is one bit, and it
+            // lands in the e-process currency. The move changed no measured state
+            // objective, so `dl_bits` is `None` rather than a copy of it (#4556).
             assert_eq!(
-                mv.evidence.dl_bits, 1.0,
-                "ln 2 nats of banked evidence is one bit"
+                mv.evidence.e_process_bits,
+                Some(1.0),
+                "ln 2 nats of banked e-process evidence is one bit"
             );
+            assert_eq!(
+                mv.evidence.dl_bits, None,
+                "a banked e-value is not a state-objective difference"
+            );
+        }
+        let record = ledger.to_json();
+        for move_record in record["moves"].as_array().expect("moves array") {
+            assert!(move_record["dl_bits"].is_null());
+            assert_eq!(move_record["e_process_bits"].as_f64(), Some(1.0));
         }
         let record = ledger.to_json();
         assert_eq!(record["n_restructures"].as_u64(), Some(1));

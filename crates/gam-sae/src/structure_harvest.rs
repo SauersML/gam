@@ -5067,7 +5067,8 @@ fn race_spec_set(
         // The candidate scores are now PROPER closed-form REML marginal
         // likelihoods (see `fit_topology_candidate`), which ALREADY price model
         // complexity through `log|H| − log|λS|₊` + the profiled dispersion. The
-        // older `PerEffectiveDim` scale was calibrated for the previous hand-rolled
+        // older per-effective-dimension scale (retired in #4556) was calibrated
+        // for the previous hand-rolled
         // POSITIVE cost (`½·SSE + ½·log|H|`, which grew with model size and needed
         // per-parameter normalization); applied to a proper (negative) evidence it
         // DOUBLE-COUNTS complexity and inverts the ranking for higher-parameter
