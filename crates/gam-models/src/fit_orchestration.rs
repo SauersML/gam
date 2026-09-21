@@ -92,7 +92,6 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 
 use serde_json::Value as JsonValue;
 
-
 use std::collections::{BTreeMap, HashMap};
 
 use std::sync::Arc;
@@ -102,7 +101,8 @@ use std::sync::Arc;
 // level where every submodule's `use super::*;` picks them up.
 use crate::survival::construction::{
     SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalLocationScaleBaselineChart,
-    SurvivalMarginalSlopeFrozenOffsetChart, SurvivalTimeBasisConfig, add_survival_time_derivative_guard_offset, append_zero_tail_columns,
+    SurvivalMarginalSlopeFrozenOffsetChart, SurvivalTimeBasisConfig,
+    add_survival_time_derivative_guard_offset, append_zero_tail_columns,
     baseline_chain_rule_gradient, build_latent_survival_baseline_offsets,
     build_survival_time_basis, build_survival_time_offsets_for_likelihood,
     build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
