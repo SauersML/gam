@@ -47,7 +47,6 @@ pub struct NuclearNormPenalty {
     pub max_rank: Option<usize>,
     pub learnable_weight: bool,
     pub rho_index: usize,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 /// Relative eigenvalue gap `|Δλ|/λ̄` below which the Fréchet coefficient of the
@@ -155,11 +154,8 @@ impl NuclearNormPenalty {
             max_rank,
             learnable_weight,
             rho_index: 0,
-            weight_schedule: None,
         })
     }
-
-    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -656,6 +652,4 @@ impl AnalyticPenalty for NuclearNormPenalty {
     fn name(&self) -> &str {
         "nuclear_norm"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }

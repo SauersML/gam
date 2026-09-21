@@ -33,7 +33,6 @@ pub struct TotalVariationPenalty {
     pub smoothing_eps: f64,
     pub learnable_weight: bool,
     pub rho_index: usize,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl TotalVariationPenalty {
@@ -84,11 +83,8 @@ impl TotalVariationPenalty {
             smoothing_eps,
             learnable_weight,
             rho_index: 0,
-            weight_schedule: None,
         })
     }
-
-    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -412,8 +408,6 @@ impl AnalyticPenalty for TotalVariationPenalty {
     fn name(&self) -> &str {
         "total_variation"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -448,7 +442,6 @@ pub struct ShapeMonotonicityPenalty {
     pub smoothing_eps: f64,
     pub learnable_weight: bool,
     pub rho_index: usize,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl ShapeMonotonicityPenalty {
@@ -485,11 +478,8 @@ impl ShapeMonotonicityPenalty {
             smoothing_eps,
             learnable_weight,
             rho_index: 0,
-            weight_schedule: None,
         })
     }
-
-    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -634,6 +624,4 @@ impl AnalyticPenalty for ShapeMonotonicityPenalty {
     fn name(&self) -> &str {
         "monotonicity"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }

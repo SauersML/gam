@@ -121,7 +121,6 @@ pub struct BlockOrthogonalityPenalty {
     pub n_eff: usize,
     pub learnable_weight: bool,
     pub rho_index: usize,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl BlockOrthogonalityPenalty {
@@ -203,11 +202,8 @@ impl BlockOrthogonalityPenalty {
             n_eff,
             learnable_weight,
             rho_index: 0,
-            weight_schedule: None,
         })
     }
-
-    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -604,8 +600,6 @@ impl AnalyticPenalty for BlockOrthogonalityPenalty {
     fn name(&self) -> &str {
         "block_orthogonality"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -681,7 +675,6 @@ pub struct DecoderIncoherencePenalty {
     pub weight: f64,
     pub learnable_weight: bool,
     pub rho_index: usize,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 struct PreparedCoherencePair {
@@ -866,7 +859,6 @@ impl DecoderIncoherencePenalty {
             weight,
             learnable_weight,
             rho_index: 0,
-            weight_schedule: None,
         })
     }
 
@@ -956,11 +948,8 @@ impl DecoderIncoherencePenalty {
             weight,
             learnable_weight,
             rho_index: 0,
-            weight_schedule: None,
         })
     }
-
-    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -1518,8 +1507,6 @@ impl AnalyticPenalty for DecoderIncoherencePenalty {
     fn name(&self) -> &str {
         "decoder_incoherence"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -1548,7 +1535,6 @@ pub struct OrthogonalityPenalty {
     pub n_eff: usize,
     pub learnable_weight: bool,
     pub rho_index: usize,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl OrthogonalityPenalty {
@@ -1598,11 +1584,8 @@ impl OrthogonalityPenalty {
             n_eff,
             learnable_weight,
             rho_index: 0,
-            weight_schedule: None,
         })
     }
-
-    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -1861,6 +1844,4 @@ impl AnalyticPenalty for OrthogonalityPenalty {
     fn name(&self) -> &str {
         "orthogonality"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }

@@ -45,7 +45,6 @@ pub struct ARDPenalty {
     pub target: PsiSlice,
     pub latent_dim: usize,
     pub weight: f64,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
     /// Local ρ indices for the `d` per-axis log-precisions.
     pub rho_indices: Vec<usize>,
     /// Effective number of observations contributing to each latent axis.
@@ -71,13 +70,10 @@ impl ARDPenalty {
             target,
             latent_dim,
             weight: 1.0,
-            weight_schedule: None,
             rho_indices,
             n_eff: n_obs as f64,
         }
     }
-
-    impl_with_weight_schedule!(weight);
 }
 
 impl AnalyticPenalty for ARDPenalty {
@@ -175,6 +171,4 @@ impl AnalyticPenalty for ARDPenalty {
     fn name(&self) -> &str {
         "ard"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }

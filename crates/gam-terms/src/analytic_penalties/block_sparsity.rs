@@ -26,7 +26,6 @@ pub struct BlockSparsityPenalty {
     pub smoothing_eps: f64,
     pub learnable_weight: bool,
     pub rho_index: usize,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl BlockSparsityPenalty {
@@ -115,11 +114,8 @@ impl BlockSparsityPenalty {
             smoothing_eps,
             learnable_weight,
             rho_index: 0,
-            weight_schedule: None,
         })
     }
-
-    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -299,8 +295,6 @@ impl AnalyticPenalty for BlockSparsityPenalty {
     fn name(&self) -> &str {
         "block_sparsity"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +309,6 @@ pub struct MechanismSparsityPenalty {
     pub weight: f64,
     pub smoothing_eps: f64,
     pub n_eff: f64,
-    pub weight_schedule: Option<Arc<ScalarWeightSchedule>>,
     pub learnable_weight: bool,
     pub rho_index: usize,
 }
@@ -377,17 +370,9 @@ impl MechanismSparsityPenalty {
             weight,
             smoothing_eps,
             n_eff,
-            weight_schedule: None,
             learnable_weight,
             rho_index: 0,
         })
-    }
-
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(Arc::new(schedule));
-        self
     }
 
     fn validate_feature_groups(feature_groups: &[Vec<usize>]) -> Result<usize, String> {

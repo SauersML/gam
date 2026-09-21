@@ -46,7 +46,6 @@ pub struct NestedPrefixPenalty {
     pub eps: f64,
     /// Local ρ indices for the K per-shell log-strengths.
     pub rho_indices: Vec<usize>,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl NestedPrefixPenalty {
@@ -117,16 +116,7 @@ impl NestedPrefixPenalty {
             shell_weights,
             eps,
             rho_indices,
-            weight_schedule: None,
         })
-    }
-
-    /// Attach a global annealing schedule shared by all shell weights. The
-    /// REML loop still picks per-shell ρ_k on top of this baseline.
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight_schedule = Some(schedule);
-        self
     }
 
     /// Latent dimension used to slice rows. Falls back to the largest prefix.

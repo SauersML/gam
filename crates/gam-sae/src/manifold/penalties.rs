@@ -614,7 +614,6 @@ impl SaeManifoldTerm {
         )
         .map_err(|reason| format!("SAE DecoderIncoherence penalty: {reason}"))?;
         per_fit.rho_index = base.rho_index;
-        per_fit.weight_schedule = base.weight_schedule.clone();
         Ok(Some(per_fit))
     }
 

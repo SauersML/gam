@@ -40,7 +40,6 @@ pub struct HarmonicRoughnessPenalty {
     pub row_weights: Array1<f64>,
     pub learnable_weight: bool,
     pub rho_index: usize,
-    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl HarmonicRoughnessPenalty {
@@ -83,11 +82,8 @@ impl HarmonicRoughnessPenalty {
             row_weights,
             learnable_weight,
             rho_index: 0,
-            weight_schedule: None,
         })
     }
-
-    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -187,6 +183,4 @@ impl AnalyticPenalty for HarmonicRoughnessPenalty {
     fn name(&self) -> &str {
         "harmonic_roughness"
     }
-
-    impl_scalar_apply_schedule!(weight);
 }

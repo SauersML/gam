@@ -125,7 +125,7 @@ pub use self::op::PenaltyOp;
 pub(crate) use self::op::ScaledPenaltyOp;
 pub use self::sheaf::{EdgeRestriction, SheafConsistencyPenalty};
 pub(crate) use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
-pub(crate) use gam_problem::{GumbelTemperatureSchedule, ScheduleKind};
+pub(crate) use gam_problem::GumbelTemperatureSchedule;
 
 #[macro_use]
 mod penalty_trait;

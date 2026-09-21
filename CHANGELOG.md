@@ -138,6 +138,17 @@
   `wiggle(−η_t·e^{−η_σ})`, and its SE is now reported as `eta_se`. Dispersion
   location-scale full-uncertainty bands transform the mean-block η the same way
   as the posterior-mean pass. The reported mean SEs are unchanged.
+- **Analytic penalties no longer take a `weight_schedule`** (#3689). The schedule was
+  accepted from Python, the FFI and the JSON descriptor, but it never advanced: the
+  per-penalty `apply_schedule` override was an empty macro and nothing called it. A
+  scheduled penalty therefore ran at `w_start` for the whole fit, silently replacing
+  the descriptor's own `weight`, and `nested_prefix` ignored the schedule altogether.
+  The schedule still entered the REML cache key without ever changing the objective.
+  `ScalarWeightSchedule`, `set_weight_schedule`, the `weight_schedule=` keyword and the
+  descriptor field are removed. A descriptor that still carries `weight_schedule` is
+  refused as an unrecognized field, and the Python keyword raises `TypeError`. The
+  strength of an analytic penalty is its REML-selected log-weight (`weight="auto"`)
+  or a fixed positive `weight`.
 
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
