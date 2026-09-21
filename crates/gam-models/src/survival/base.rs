@@ -2959,7 +2959,7 @@ impl WorkingModelSurvival {
             let projected = match self.monotonicity_linear_constraints() {
                 Some(constraints) => {
                     let constraints = ConstraintSet::Dense(constraints);
-                    projected_linear_constraint_stationarity_vector(&raw, beta, &constraints, None)
+                    projected_linear_constraint_stationarity_vector(&raw, beta, &constraints)
                         .ok_or_else(|| {
                             EstimationError::InvalidInput(
                                 "survival LAML could not project the monotonicity KKT residual"

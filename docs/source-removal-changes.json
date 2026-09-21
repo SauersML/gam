@@ -3222,5 +3222,13 @@
     ],
     "reason": "#3522: the pyffi-side coefficient provenance and term-block reconstruction and difference_smooth's own random-effect range arithmetic are replaced by the engine-owned TermCollectionLayout, exposed once through gam_inference::coefficient_layout.",
     "evidence": "crates/gam-inference/src/coefficient_layout.rs builds CoefficientProvenance/TermBlock from frozen_term_collection_layout; difference_smooth reads its random-effect ranges from the same layout; tests coefficient_layout and difference_smooth::tests::random_effect_columns_follow_the_engine_layout* pin the no-intercept layout."
+  },
+  {
+    "base": "3d306728d71b4e24433564e05043d5e68056f47a",
+    "items": [
+      "crates/gam-custom-family/src/tests/inner_solver_numerics.rs:fn:projected_stationarity_uses_the_qp_face_without_expanding_tight_rows"
+    ],
+    "reason": "Renamed to projected_stationarity_uses_the_tangent_face_without_expanding_tight_rows: the QP-face seed argument is removed (#3513), so the test now pins the single tangent-face rule.",
+    "evidence": "crates/gam-custom-family/src/tests/inner_solver_numerics.rs keeps the same 4,096-duplicate-row assertions under the new name."
   }
 ]

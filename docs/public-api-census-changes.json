@@ -5021,5 +5021,13 @@
     },
     "reason": "#3650: sanitize_survival_weight_vector silently zeroed non-finite dense row weights. SPEC: \"In general, do not paper over solver issues.\" It is deleted. require_finite_row_weights now refuses a non-finite weight with a NumericalFailure naming the row, and the one legitimate case (a masked row times inf) is resolved at its source in the slot fill.",
     "evidence": "dense_row_weighting_refuses_non_finite_row_weights pins the refusal in weighted_crossprod_dense_with_parallelism, scale_dense_rows and the DiagonalOnly Hessian path."
+  },
+  {
+    "base": "3d306728d71b4e24433564e05043d5e68056f47a",
+    "removed": {
+      "crates/gam-custom-family/src/tests/inner_solver_numerics.rs::projected_stationarity_uses_the_qp_face_without_expanding_tight_rows": 1
+    },
+    "reason": "Renamed test (#3513): the QP-face seed argument is removed.",
+    "evidence": "Same assertions under projected_stationarity_uses_the_tangent_face_without_expanding_tight_rows."
   }
 ]
