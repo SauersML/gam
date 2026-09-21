@@ -10,17 +10,19 @@
 //! the exact production assembly `scalar_skovgaard_r_star`.
 //!
 //! Closed-form null anchor (the module's own certification family): the
-//! unit-rate Exponential. For `y_i ~ Exp(θ)` with rate `θ`,
-//!   ℓ(θ) = n·ln θ − θ·Σy,   θ̂ = n/Σy,
-//!   W  = 2n[ ln(θ̂/θ₀) − 1 + θ₀/θ̂ ]         (profile LR statistic),
-//!   ĵ  = n/θ̂²   (observed info),  î = n/θ̂²  (Fisher info; canonical ⇒ î = ĵ),
-//!   Î  = Σ_i (1/θ̂ − y_i)²                    (empirical score covariance).
-//! Even though the family is canonical (`î = ĵ = Î`), the correction is NOT
-//! trivial at finite n: the Wald root `u = (θ̂−θ₀)√ĵ` and the LR root
-//! `r = sign·√W` differ, so `r* = r + log(u/r)/r ≠ r`. This is precisely the
-//! small-sample regime where the first-order root is anti-conservative and the
-//! third-order `r*` restores calibration — so the gate has real teeth: it would
-//! fail if `r*` degraded to the (oversized) first-order test.
+//! Exponential in its MEAN parameterisation. For `y_i ~ Exp(mean μ)`,
+//!   ℓ(μ) = −n·ln μ − Σy/μ,   μ̂ = ȳ,
+//!   W  = 2n[ ln(μ₀/μ̂) + μ̂/μ₀ − 1 ]          (profile LR statistic),
+//!   ĵ  = î = n/μ̂²                             (observed = Fisher info at μ̂),
+//!   q̂  = cov_μ̂[U(μ̂), ℓ(μ̂) − ℓ(μ₀)] = n(1/μ₀ − 1/μ̂),
+//! with the empirical companions `Î = Σ sᵢ²` and `q̂_emp = Σ sᵢ(ℓᵢ(μ̂) − ℓᵢ(μ₀))`,
+//! `sᵢ = −1/μ̂ + yᵢ/μ̂²`. The mean is NOT the canonical parameter, so the
+//! sample-space derivative `q̂` is not the linear surrogate `(μ̂−μ₀)·î`; this
+//! is the parameterisation in which the pre-#3535 `u` broke invariance. The
+//! correction is not trivial at finite n: `u = √n(μ̂/μ₀ − 1)` and the LR root
+//! `r = sign·√W` differ, so `r* = r + log(u/r)/r ≠ r`. This is the small-sample
+//! regime where the first-order root is miscalibrated and the third-order
+//! `r*` restores calibration.
 //!
 //! Audit: the type-I size at `α ∈ {0.01, 0.05, 0.10}` is checked as coverage of
 //! the NON-rejection event at nominal `1−α`, so the shared Wilson verdict
@@ -41,45 +43,56 @@ const N_OBS: usize = 8;
 const N_REPLICATIONS: usize = 4000;
 /// The type-I error rates swept.
 const ALPHAS: [f64; 3] = [0.01, 0.05, 0.10];
-/// The true (and null) rate — the null is exact, so any rejection is a type-I
+/// The true (and null) mean — the null is exact, so any rejection is a type-I
 /// error. Value is immaterial (the statistic is scale-equivariant); fixed for
 /// reproducibility.
-const TRUE_RATE: f64 = 1.3;
+const TRUE_MEAN: f64 = 1.3;
 const SEED: u64 = 0x1891_5C_07_A0_00;
 
-/// One Exponential(rate) draw from the harness's uniform stream: `−ln(U)/rate`.
-fn exp_draw(rate: f64, rng: &mut CalibrationRng) -> f64 {
-    -rng.uniform_open01().ln() / rate
+/// One Exponential draw with mean `mean` from the harness's uniform stream:
+/// `−ln(U)·mean`.
+fn exp_draw(mean: f64, rng: &mut CalibrationRng) -> f64 {
+    -rng.uniform_open01().ln() * mean
 }
 
-/// The Skovgaard corrected (model-form) two-sided p-value for testing the rate
-/// `θ = θ₀` on one simulated Exponential sample, or `None` on a degenerate
-/// replication (assembly declined — the first-order root would stand).
-fn corrected_p_value(rate_true: f64, rate_null: f64, rng: &mut CalibrationRng) -> Option<f64> {
-    let ys: Vec<f64> = (0..N_OBS).map(|_| exp_draw(rate_true, rng)).collect();
-    let sum_y: f64 = ys.iter().sum();
-    if !(sum_y.is_finite() && sum_y > 0.0) {
+/// The Skovgaard ingredients for testing the mean `μ = μ₀` on one Exponential
+/// sample, or `None` when the sample mean is not a positive finite number.
+fn mean_exponential_input(ys: &[f64], mean_null: f64) -> Option<ScalarSkovgaardInput> {
+    let n = ys.len() as f64;
+    let mean_hat = ys.iter().sum::<f64>() / n;
+    if !(mean_hat.is_finite() && mean_hat > 0.0) {
         return None;
     }
-    let n = N_OBS as f64;
-    let theta_hat = n / sum_y;
-    // Profile LR statistic W = 2n[ ln(θ̂/θ₀) − 1 + θ₀/θ̂ ] ≥ 0.
-    let lr = 2.0 * n * ((theta_hat / rate_null).ln() - 1.0 + rate_null / theta_hat);
-    let observed_info = n / (theta_hat * theta_hat);
-    // Canonical family: expected info equals observed info.
-    let expected_info = observed_info;
-    // Empirical score covariance Σ (1/θ̂ − y_i)² (score s_i = ∂ℓ_i/∂θ = 1/θ − y_i).
-    let score_cov: f64 = ys.iter().map(|&y| (1.0 / theta_hat - y).powi(2)).sum();
-
-    scalar_skovgaard_r_star(&ScalarSkovgaardInput {
-        theta_hat,
-        theta_null: rate_null,
+    // Profile LR statistic W = 2n[ ln(μ₀/μ̂) + μ̂/μ₀ − 1 ] ≥ 0.
+    let lr = 2.0 * n * ((mean_null / mean_hat).ln() + mean_hat / mean_null - 1.0);
+    let info = n / (mean_hat * mean_hat);
+    let row_loglik = |mu: f64, y: f64| -mu.ln() - y / mu;
+    let (empirical_info, empirical_loglik_covariance) =
+        ys.iter()
+            .fold((0.0_f64, 0.0_f64), |(info_acc, cov_acc), &y| {
+                let score = -1.0 / mean_hat + y / (mean_hat * mean_hat);
+                let diff = row_loglik(mean_hat, y) - row_loglik(mean_null, y);
+                (info_acc + score * score, cov_acc + score * diff)
+            });
+    Some(ScalarSkovgaardInput {
+        theta_hat: mean_hat,
+        theta_null: mean_null,
         lr_statistic: lr,
-        observed_info,
-        expected_info,
-        score_cov,
+        observed_info: info,
+        expected_info: info,
+        loglik_covariance: n * (1.0 / mean_null - 1.0 / mean_hat),
+        empirical_info,
+        empirical_loglik_covariance,
     })
-    .map(|res| res.p_value_corrected)
+}
+
+/// The Skovgaard corrected (model-form) two-sided p-value for testing the mean
+/// `μ = μ₀` on one simulated Exponential sample, or `None` on a degenerate
+/// replication (assembly declined — the first-order root would stand).
+fn corrected_p_value(mean_true: f64, mean_null: f64, rng: &mut CalibrationRng) -> Option<f64> {
+    let ys: Vec<f64> = (0..N_OBS).map(|_| exp_draw(mean_true, rng)).collect();
+    scalar_skovgaard_r_star(&mean_exponential_input(&ys, mean_null)?)
+        .map(|res| res.p_value_corrected)
 }
 
 #[test]
@@ -92,7 +105,7 @@ fn skovgaard_rstar_corrected_pvalue_is_not_oversized_under_the_null() {
     let mut correction_ever_material = false;
 
     for _ in 0..N_REPLICATIONS {
-        let Some(p) = corrected_p_value(TRUE_RATE, TRUE_RATE, &mut rng) else {
+        let Some(p) = corrected_p_value(TRUE_MEAN, TRUE_MEAN, &mut rng) else {
             continue;
         };
         evaluated += 1;
@@ -123,22 +136,11 @@ fn skovgaard_rstar_corrected_pvalue_is_not_oversized_under_the_null() {
         let mut probe = CalibrationRng::new(SEED ^ 0x9E37_79B9);
         for _ in 0..64 {
             let ys: Vec<f64> = (0..N_OBS)
-                .map(|_| exp_draw(TRUE_RATE, &mut probe))
+                .map(|_| exp_draw(TRUE_MEAN, &mut probe))
                 .collect();
-            let sum_y: f64 = ys.iter().sum();
-            let n = N_OBS as f64;
-            let theta_hat = n / sum_y;
-            let lr = 2.0 * n * ((theta_hat / TRUE_RATE).ln() - 1.0 + TRUE_RATE / theta_hat);
-            let obs = n / (theta_hat * theta_hat);
-            let sc: f64 = ys.iter().map(|&y| (1.0 / theta_hat - y).powi(2)).sum();
-            if let Some(res) = scalar_skovgaard_r_star(&ScalarSkovgaardInput {
-                theta_hat,
-                theta_null: TRUE_RATE,
-                lr_statistic: lr,
-                observed_info: obs,
-                expected_info: obs,
-                score_cov: sc,
-            }) {
+            if let Some(res) = mean_exponential_input(&ys, TRUE_MEAN)
+                .and_then(|input| scalar_skovgaard_r_star(&input))
+            {
                 if (res.r_star - res.r).abs() > 1e-6 {
                     correction_ever_material = true;
                     break;
@@ -148,7 +150,7 @@ fn skovgaard_rstar_corrected_pvalue_is_not_oversized_under_the_null() {
     }
     assert!(
         correction_ever_material,
-        "r* never differed from r — the Exponential anchor is not exercising the \
+        "r* never differed from r — the mean-Exponential anchor is not exercising the \
          Barndorff-Nielsen correction, so this size curve has no teeth"
     );
 
