@@ -847,3 +847,244 @@ fn only_a_payload_that_cannot_be_published_is_dropped_3238() {
         }
     }
 }
+
+/// `V = 3 + ½(ρ − 2)²`, with its analytic gradient and Hessian: one convex well,
+/// so every seed certifies the same optimum and every local model's minimum is
+/// that optimum's value.
+fn convex_well(rho: f64) -> OuterEval {
+    OuterEval {
+        cost: 3.0 + 0.5 * (rho - 2.0).powi(2),
+        gradient: array![rho - 2.0],
+        hessian: HessianValue::Dense(array![[1.0]]),
+        inner_beta_hint: None,
+    }
+}
+
+/// The convex-well problem at `n` observations (`None`: the route declares none),
+/// started at `own`, with the analytic Hessian the ARC route certifies with.
+fn convex_well_problem(own: f64, n: Option<usize>) -> OuterProblem {
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Dense)
+        .with_initial_rho(array![own])
+        .with_bounds(array![-8.0], array![8.0]);
+    match n {
+        Some(n) => problem.with_problem_size(n, 1),
+        None => problem,
+    }
+}
+
+/// Run one convex-well seed, counting its evaluations. `hold` makes every
+/// evaluation wait until the seed's multistart has a confirmed quorum.
+fn run_convex_well_seed(
+    problem: &OuterProblem,
+    hold: bool,
+) -> (Result<CertifiedOuterResult, EstimationError>, usize) {
+    let release = problem.seed_release.clone();
+    let wait = move || {
+        if !hold {
+            return;
+        }
+        let quorum = &release.as_ref().expect("a held seed has a release handle").quorum;
+        let started = std::time::Instant::now();
+        while quorum.floor().is_none() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(120),
+                "the two fast seeds never formed a quorum"
+            );
+            std::thread::yield_now();
+        }
+    };
+    let wait_value = wait.clone();
+    let mut obj = problem.build_objective(
+        0usize,
+        move |evaluations: &mut usize, theta: &Array1<f64>| {
+            wait_value();
+            *evaluations += 1;
+            Ok(convex_well(theta[0]).cost)
+        },
+        move |evaluations: &mut usize, theta: &Array1<f64>| {
+            wait();
+            *evaluations += 1;
+            Ok(convex_well(theta[0]))
+        },
+        None::<fn(&mut usize)>,
+        None::<fn(&mut usize, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let outcome = problem.run_certified(&mut obj, "convex well");
+    (outcome, obj.state)
+}
+
+/// #3325: once two seeds certify one optimum, a seed still searching whose
+/// evidence cannot reach below it is released at its next evaluation, and the
+/// published run is the one keep-best picks among the certified seeds.
+#[test]
+fn a_certified_quorum_releases_a_seed_that_cannot_beat_it_3325() {
+    let problem = convex_well_problem(0.0, Some(200));
+    let levels = [1.0, 5.0];
+    let seeds = problem.multistart_seeds(None, &levels).expect("seeds");
+    assert_eq!(seeds, vec![array![0.0], array![1.0], array![5.0]]);
+    let evaluations = SeedRecords::new(seeds.len());
+    let outcome = problem
+        .run_certified_multistart(&levels, "quorum release", 0, 1, |index, seed_problem, _| {
+            assert!(
+                seed_problem.seed_release.is_some(),
+                "a route with an observation count gives every seed a release handle"
+            );
+            let (outcome, count) = run_convex_well_seed(&seed_problem, index == 2);
+            evaluations.record(index, count);
+            (outcome, ())
+        })
+        .expect("multistart runs");
+    let evaluations = evaluations.all();
+    let winner = outcome.winner.expect("the fast seeds certify");
+    assert!(winner < 2, "a fast seed wins, got seed {winner}");
+    let published = outcome.outcomes[winner].as_ref().expect("the winner certified");
+    assert!(
+        (published.rho()[0] - 2.0).abs() < 1.0e-3 && (published.final_value() - 3.0).abs() < 1.0e-6,
+        "published rho={} value={}",
+        published.rho()[0],
+        published.final_value(),
+    );
+    for index in 0..2 {
+        assert!(
+            outcome.outcomes[index].is_ok(),
+            "fast seed {index} certifies: {:?}",
+            outcome.outcomes[index].as_ref().err()
+        );
+    }
+    let released = outcome.outcomes[2]
+        .as_ref()
+        .err()
+        .expect("the held seed is released, not certified");
+    assert!(
+        released.is_fatal_outer_evaluation() && released.to_string().contains("released"),
+        "the held seed ends on its release: {released}"
+    );
+    assert!(
+        evaluations[2] < evaluations[0].min(evaluations[1]),
+        "the released seed stops short of a full search: evaluations {evaluations:?}"
+    );
+}
+
+/// A route that declares no observation count has no resolution to judge one
+/// optimum at, so its multistart releases nothing and every seed certifies.
+#[test]
+fn a_multistart_without_an_observation_count_releases_no_seed_3325() {
+    let problem = convex_well_problem(0.0, None);
+    let outcome = problem
+        .run_certified_multistart(&[1.0, 5.0], "no quorum", 0, 1, |_, seed_problem, _| {
+            assert!(seed_problem.seed_release.is_none());
+            run_convex_well_seed(&seed_problem, false)
+        })
+        .expect("multistart runs");
+    for (index, run) in outcome.outcomes.iter().enumerate() {
+        assert!(run.is_ok(), "seed {index} certifies: {:?}", run.as_ref().err());
+    }
+}
+
+/// Whether a seed guarded by a quorum whose floor is `floor` (`None`: no quorum
+/// yet) is admitted to its next evaluation after evaluating `script` in order.
+fn admitted_after(floor: Option<f64>, script: Vec<OuterEval>) -> bool {
+    let quorum = Arc::new(SeedQuorum::new(1.0e-3));
+    if let Some(floor) = floor {
+        quorum.floor.store(floor.to_bits(), Ordering::Release);
+    }
+    let handle = SeedReleaseHandle { quorum, seed: 7 };
+    let problem = convex_well_problem(0.0, Some(500));
+    let mut script = std::collections::VecDeque::from(script);
+    let steps = script.len();
+    let mut inner = problem.build_objective(
+        (),
+        |_: &mut (), theta: &Array1<f64>| Ok(convex_well(theta[0]).cost),
+        move |_: &mut (), theta: &Array1<f64>| {
+            Ok(script.pop_front().unwrap_or_else(|| convex_well(theta[0])))
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let mut guarded = handle.guard(&mut inner, (array![-8.0], array![8.0]), "release guard");
+    for step in 0..steps {
+        guarded
+            .eval(&array![0.0])
+            .unwrap_or_else(|error| panic!("scripted evaluation {step} is admitted: {error}"));
+    }
+    match guarded.eval(&array![0.0]) {
+        Ok(_) => true,
+        Err(error) => {
+            assert!(error.is_fatal_outer_evaluation(), "a release is fatal: {error}");
+            assert!(
+                guarded.eval_cost(&array![0.0]).is_err(),
+                "a released seed stays released"
+            );
+            false
+        }
+    }
+}
+
+fn scripted(cost: f64, gradient: f64, hessian: HessianValue) -> OuterEval {
+    OuterEval {
+        cost,
+        gradient: array![gradient],
+        hessian,
+        inner_beta_hint: None,
+    }
+}
+
+/// #3325: a seed is released only when its lowest value and its local model's
+/// minimum over the feasible box `[-8, 8]`, on an analytic Hessian, both stay
+/// above the quorum's floor. Every scripted evaluation is at `ρ = 0`.
+#[test]
+fn a_seed_is_released_only_when_its_own_evidence_stays_above_the_quorum_3325() {
+    let dense = |h: f64| HessianValue::Dense(array![[h]]);
+    // Model minimum 1.5 − ½·0.01 = 1.495 above the floor: released.
+    assert!(!admitted_after(Some(1.0), vec![scripted(1.5, 0.1, dense(1.0))]));
+    // No quorum yet: never released.
+    assert!(admitted_after(None, vec![scripted(1.5, 0.1, dense(1.0))]));
+    // Model minimum 1.5 − ½·4 = −0.5 below the floor: keeps searching.
+    assert!(admitted_after(Some(1.0), vec![scripted(1.5, 2.0, dense(1.0))]));
+    // An evaluated value below the floor: keeps searching.
+    assert!(admitted_after(
+        Some(1.0),
+        vec![scripted(0.5, 0.0, dense(1.0)), scripted(1.5, 0.1, dense(1.0))]
+    ));
+    // Negative curvature: the model falls to 1.5 + 0.8 − 32 at the box's face,
+    // below the floor, so it keeps searching.
+    assert!(admitted_after(Some(1.0), vec![scripted(1.5, 0.1, dense(-1.0))]));
+    // Slight negative curvature over the box: the model's least value is
+    // 1.5 − 0.08 − 0.032 = 1.388, above the floor, so it is released.
+    assert!(!admitted_after(Some(1.0), vec![scripted(1.5, 0.01, dense(-1.0e-3))]));
+    // No analytic Hessian bounds nothing: keeps searching.
+    assert!(admitted_after(
+        Some(1.0),
+        vec![scripted(1.5, 0.1, HessianValue::Unavailable)]
+    ));
+    // Its incumbent's model reaches below the floor, though its latest does not.
+    assert!(admitted_after(
+        Some(1.0),
+        vec![scripted(1.2, 1.0, dense(1.0)), scripted(1.5, 0.1, dense(1.0))]
+    ));
+    // Not one evaluation with derivatives yet: keeps searching.
+    assert!(admitted_after(Some(1.0), Vec::new()));
+}
+
+/// #3325: two certified runs are one optimum when their values and both
+/// Hessians' `½|δᵀHδ|` lie within the certificate's tolerance; equal values in
+/// two separate basins are not, nor is a certificate without a Hessian.
+#[test]
+fn a_quorum_needs_one_optimum_not_one_value_3325() {
+    let member = |value: f64, rho: f64, hessian: Option<f64>| QuorumMember {
+        index: 0,
+        value,
+        rho: array![rho],
+        hessian: hessian.map(|h| array![[h]]),
+    };
+    let tau = 1.0 / 400.0;
+    let optimum = member(3.0, 2.0, Some(1.0));
+    let tolerance = same_optimum(&optimum, &member(3.0 + 1.0e-4, 2.05, Some(1.0)), tau)
+        .expect("a nearby certificate of the same well confirms it");
+    assert!((tolerance - tau).abs() < 1.0e-6, "tolerance {tolerance} is max(τ − b, b)");
+    assert_eq!(same_optimum(&optimum, &member(3.0, 4.0, Some(1.0)), tau), None);
+    assert_eq!(same_optimum(&optimum, &member(3.01, 2.0, Some(1.0)), tau), None);
+    assert_eq!(same_optimum(&optimum, &member(3.0, 2.0, None), tau), None);
+}

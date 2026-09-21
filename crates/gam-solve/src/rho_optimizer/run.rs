@@ -478,6 +478,10 @@ pub struct OuterProblem {
     /// certificate is returned as the error, and the multistart runs the cold
     /// seeds itself.
     resume_only: bool,
+    /// This problem is one seed of a parallel multistart, released once a
+    /// certified quorum of other seeds confirms the optimum keep-best would
+    /// publish and this seed's own evidence cannot beat it (#3325).
+    seed_release: Option<multistart::SeedReleaseHandle>,
 }
 
 impl OuterProblem {
@@ -514,6 +518,7 @@ impl OuterProblem {
             warm_start: None,
             warm_start_source: None,
             resume_only: false,
+            seed_release: None,
         }
     }
 
@@ -940,6 +945,10 @@ impl OuterProblem {
     }
 
     /// Run the outer optimization with a given objective.
+    ///
+    /// A multistart seed runs its objective behind its release guard, so the
+    /// search ends at its next evaluation once a certified quorum has made it
+    /// redundant (#3325).
     pub fn run(
         &self,
         obj: &mut dyn OuterObjective,
@@ -951,6 +960,23 @@ impl OuterProblem {
         if objective_lower.is_some() || objective_upper.is_some() {
             install_objective_domain(&mut config, self.n_params, objective_lower, objective_upper)?;
         }
+        match &self.seed_release {
+            Some(release) => {
+                let domain = outer_model_domain_bounds_template(&config, self.n_params);
+                self.run_configured(&mut release.guard(obj, domain, context), config, context)
+            }
+            None => self.run_configured(obj, config, context),
+        }
+    }
+
+    /// [`Self::run`] on `config`, whose feasible box already holds the
+    /// objective's own domain.
+    fn run_configured(
+        &self,
+        obj: &mut dyn OuterObjective,
+        mut config: OuterConfig,
+        context: &str,
+    ) -> Result<OuterResult, EstimationError> {
         // A warm start (`with_warm_start`): on the parent's inputs the point is
         // offered as a prior certificate, and a decline leaves this search to run
         // exactly as it runs cold; on other inputs this search, which certifies
