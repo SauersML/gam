@@ -116,7 +116,7 @@ use serde::{Deserialize, Serialize};
 use faer::Side;
 
 use gam_linalg::faer_ndarray::{
-    FaerEigh, FaerSvd, default_rrqr_rank_alpha, rrqr_nullspace_basis,
+    FaerEigh, FaerSvd, rrqr_nullspace_basis,
 };
 
 use super::{
@@ -696,7 +696,7 @@ fn measure_jet_primary_structural_null_frame(
     // representer rows to get the coefficient-space null vectors.
     let representer_rows = z.slice(ndarray::s![..representer_count, ..]).to_owned();
     let (frame, _) =
-        rrqr_nullspace_basis(&representer_rows.t().to_owned(), default_rrqr_rank_alpha())
+        rrqr_nullspace_basis(&representer_rows.t().to_owned())
             .map_err(BasisError::LinalgError)?;
     // An EMPTY frame is a declaration, not a missing one: it says the chart has
     // absorbed every affine-head direction, so the Primary has no null space
@@ -1106,7 +1106,7 @@ fn representer_null_section(
     // hence the returned columns span null(C), exactly the required RBF
     // coefficient section.
     let constraint_cross = k_cc.t().dot(&weighted_affine);
-    let (section, _) = rrqr_nullspace_basis(&constraint_cross, default_rrqr_rank_alpha())
+    let (section, _) = rrqr_nullspace_basis(&constraint_cross)
         .map_err(BasisError::LinalgError)?;
     Ok((weighted_affine, section))
 }

@@ -621,7 +621,6 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             | AnalyticPenaltyKind::NestedPrefix(_)
             | AnalyticPenaltyKind::ScadMcp(_)
             | AnalyticPenaltyKind::DecoderIncoherence(_)
-            | AnalyticPenaltyKind::Isometry(_)
             | AnalyticPenaltyKind::SheafConsistency(_) => {}
         }
         let n = self.target.len();
@@ -700,7 +699,6 @@ impl FrozenAnalyticPenaltyOp {
             | AnalyticPenaltyKind::ScadMcp(_)
             | AnalyticPenaltyKind::BlockOrthogonality(_)
             | AnalyticPenaltyKind::DecoderIncoherence(_)
-            | AnalyticPenaltyKind::Isometry(_)
             | AnalyticPenaltyKind::SheafConsistency(_) => {}
         }
         let n = self.target.len();
