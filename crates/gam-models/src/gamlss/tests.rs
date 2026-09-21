@@ -2239,6 +2239,25 @@ pub(crate) fn empty_term_collection() -> TermCollectionSpec {
     }
 }
 
+pub(crate) fn single_linear_term_collection(name: &str, col: usize) -> TermCollectionSpec {
+    TermCollectionSpec {
+        linear_terms: vec![gam_terms::smooth::LinearTermSpec {
+            name: name.to_string(),
+            feature_col: col,
+            feature_cols: vec![col],
+            categorical_levels: Vec::new(),
+            double_penalty: true,
+            coefficient_geometry: gam_terms::smooth::LinearCoefficientGeometry::Unconstrained,
+            coefficient_min: None,
+            coefficient_max: None,
+            frozen_function_mass: None,
+        }],
+        random_effect_terms: Vec::new(),
+        smooth_terms: Vec::new(),
+        level: Default::default(),
+    }
+}
+
 pub(crate) fn spatial_kappa_options() -> SpatialLengthScaleOptimizationOptions {
     SpatialLengthScaleOptimizationOptions {
         enabled: true,
@@ -4422,3 +4441,70 @@ mod zz2155_mode_geography_tests;
 // gam#2647: the joint penalized Hessian's non-singularity, asserted.
 #[path = "tests_2647_gauge.rs"]
 mod gauge_2647;
+
+/// gam#3879: the block builder refuses a log-sigma design that carries the
+/// intercept, the exact scale gauge of `q = -threshold/sigma`, instead of
+/// fitting the collapse it induces. The second half is the positive control:
+/// the same term collection through `binomial_log_sigma_gauge_spec` builds, has
+/// no intercept, and carries only the formula-native penalty.
+#[test]
+pub(crate) fn binomial_location_scale_builder_refuses_log_sigma_intercept_3879() {
+    let n = 12usize;
+    let mut data = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        let t = i as f64 / (n as f64 - 1.0);
+        data[[i, 0]] = t;
+        data[[i, 1]] = (2.0 * std::f64::consts::PI * t).sin();
+    }
+    let y = Array1::from_iter((0..n).map(|i| if i % 3 == 0 || i % 5 == 0 { 1.0 } else { 0.0 }));
+    let builder = BinomialLocationScaleTermBuilder {
+        mean_offset: Array1::zeros(n),
+        noise_offset: Array1::zeros(n),
+        y,
+        weights: Array1::from_elem(n, 1.0),
+        link_kind: InverseLink::Standard(StandardLink::Probit),
+        meanspec: simple_matern_term_collection(&[0, 1], 0.45),
+        noisespec: single_linear_term_collection("x0", 0),
+    };
+    let mean_design =
+        build_term_collection_design(data.view(), builder.meanspec()).expect("mean design");
+    let noise_design =
+        build_term_collection_design(data.view(), builder.noisespec()).expect("noise design");
+    assert!(
+        !noise_design.intercept_range.is_empty(),
+        "#3879 fixture premise: an ungauged log_sigma spec carries the intercept"
+    );
+    let rho = compose_theta_from_hints_test(
+        builder.mean_penalty_count(&mean_design),
+        builder.noise_penalty_count(&noise_design),
+        &None,
+        &None,
+        &Array1::zeros(0),
+    );
+    let err = match builder.build_blocks(&rho, &mean_design, &noise_design, None, None) {
+        Ok(_) => panic!("#3879: a binomial log_sigma design with an intercept must be refused"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("exact scale gauge"), "{err}");
+
+    let gauged = binomial_log_sigma_gauge_spec(single_linear_term_collection("x0", 0));
+    let noise_design =
+        build_term_collection_design(data.view(), &gauged).expect("gauge-fixed design");
+    assert!(noise_design.intercept_range.is_empty());
+    assert_eq!(noise_design.design.ncols(), 1);
+    assert_eq!(
+        builder.noise_penalty_count(&noise_design),
+        noise_design.penalties.len(),
+        "#3879: the binomial log-sigma rho layout carries only formula-native penalties"
+    );
+    let rho = compose_theta_from_hints_test(
+        builder.mean_penalty_count(&mean_design),
+        builder.noise_penalty_count(&noise_design),
+        &None,
+        &None,
+        &Array1::zeros(0),
+    );
+    builder
+        .build_blocks(&rho, &mean_design, &noise_design, None, None)
+        .expect("#3879: the gauge-fixed log_sigma design builds");
+}

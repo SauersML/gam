@@ -203,12 +203,13 @@ pub(crate) fn monotone_wiggle_internal_degree(degree: usize) -> Result<usize, St
 /// null space of the set (at unit smoothing) is computed in the function metric
 /// and, when non-trivial, one shrinkage coordinate spanning it is appended.
 ///
-/// This is the same treatment — and the same argument — the binomial
-/// location-scale log-σ block already receives unconditionally in
-/// `build_binomial_threshold_and_scale_blocks`, where `(β_t, β_ls) ↦ (c·β_t,
-/// β_ls + ln c)` is the exactly analogous index-scale gauge and an identity
-/// shrinkage penalty is appended that the caller never asked for and cannot
-/// switch off. The wiggle block simply never received it.
+/// The binomial location-scale model has the analogous index-scale gauge
+/// `(β_t, β_ls) ↦ (c·β_t, β_ls + ln c)`, but there the orbit direction is the
+/// log-σ intercept column itself, so the formula builder removes it
+/// structurally by building the log-σ design without an intercept (#3879).
+/// Here the orbit direction `ℓ` lives inside the warp basis's penalty null
+/// space rather than in a droppable design column, so it is closed by a
+/// penalty coordinate instead.
 ///
 /// It is a **no-op on every already-well-posed configuration**: the shipped
 /// default (`orders = [1, 2, 3]`) contains the order-one roughness, which is

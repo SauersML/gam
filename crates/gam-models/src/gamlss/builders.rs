@@ -629,6 +629,22 @@ pub(crate) fn build_binomial_threshold_and_scale_blocks(
     let noise_offset = noise_design
         .compose_offset(noise_offset.view(), &format!("{context}: log_sigma"))
         .map_err(|error| error.to_string())?;
+    // The invariant above, checked rather than assumed. `q = -eta_t*e^{-eta_s}`
+    // is unchanged by `(beta_t, b_0) -> (c*beta_t, b_0 + ln c)`, so a log-sigma
+    // intercept is an exact likelihood gauge, and the threshold penalty, which
+    // scales as `c^2`, drives it to `sigma -> 0`. Both callers pass their spec
+    // through `binomial_log_sigma_gauge_spec`; a third that forgot would
+    // otherwise fit that collapse silently instead of being named here.
+    if !noise_design.intercept_range.is_empty() {
+        return Err(GamlssError::UnsupportedConfiguration {
+            reason: format!(
+                "{context}: the binomial log_sigma design carries an intercept, which is the \
+                 exact scale gauge of q = -threshold / sigma; build it from \
+                 binomial_log_sigma_gauge_spec"
+            ),
+        }
+        .into());
+    }
     let raw_log_sigma_design =
         location_scale_log_sigma_design(&mean_design.design, &noise_design.design)?;
     let mut thresholdspec = build_location_scale_block(

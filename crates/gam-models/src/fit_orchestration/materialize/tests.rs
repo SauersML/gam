@@ -3638,7 +3638,7 @@ fn binomial_location_scale_engine_matches_reference_flow() {
     let data = binomial_location_scale_dataset();
     let config = FitConfig {
         family: Some("binomial".to_string()),
-        noise_formula: Some("1".to_string()),
+        noise_formula: Some("x".to_string()),
         ..FitConfig::default()
     };
     let materialized =
