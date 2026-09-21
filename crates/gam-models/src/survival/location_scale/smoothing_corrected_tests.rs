@@ -160,6 +160,7 @@ fn penalized_location_spec(x: &Array1<f64>, age_exit: &Array1<f64>) -> SurvivalL
         cache_session: None,
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
+        baseline_theta_tangents: None,
     }
 }
 
@@ -217,7 +218,7 @@ fn assert_selected_fit_keeps_smoothing_corrected_covariance(inverse_link: Invers
         "fixture must exercise the PENALIZED coupled path, not the reduced parametric-AFT MLE"
     );
 
-    let (fit, _geometry) = fit_survival_location_scale_with_geometry(spec)
+    let fit = fit_survival_location_scale_spec(spec)
         .expect("penalized survival location-scale fit must converge on benign lognormal data");
 
     // Separate this from the `lambda_is_fixed` fallback landed in 7bbf50639

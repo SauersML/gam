@@ -2760,13 +2760,19 @@ fn payload_for_survival_location_scale(
         .map_err(|err| format!("failed to re-parse survival formula for FFI payload: {err}"))?;
     let (entryname, exitname, eventname) = parse_surv_response(&parsed.response)?
         .ok_or_else(|| "survival location-scale FFI requires Surv(...) response".to_string())?;
-    let baseline_cfg = parse_survival_baseline_config(
-        &fit_config.baseline_target,
-        fit_config.baseline_scale,
-        fit_config.baseline_shape,
-        fit_config.baseline_rate,
-        fit_config.baseline_makeham,
-    )?;
+    // A nonlinear baseline's shape is selected by the fit together with ρ
+    // (#3413), so the saved baseline is the fitted one; a linear baseline has
+    // no coordinates and is the configured one.
+    let baseline_cfg = match ls_result.fit.baseline_config.clone() {
+        Some(fitted) => fitted,
+        None => parse_survival_baseline_config(
+            &fit_config.baseline_target,
+            fit_config.baseline_scale,
+            fit_config.baseline_shape,
+            fit_config.baseline_rate,
+            fit_config.baseline_makeham,
+        )?,
+    };
 
     let fitted_inverse_link = ls_result.inverse_link.clone();
     // Compact the inner UnifiedFitResult and apply the fitted link state so

@@ -49,6 +49,12 @@ pub(crate) struct SurvivalLocationScaleFamily {
     /// on the unarmed fit's own evidence, through
     /// `fit_custom_family_arming_on_evidence` (#979).
     pub(crate) jeffreys_armed: bool,
+    /// θ-tangents of the parametric baseline's time offsets, one column per
+    /// baseline shape axis, when the baseline θ rides the outer criterion as
+    /// family-owned hyper axes after the inverse-link shape axes (#3413).
+    /// `None` for a Linear baseline target and in the reduced parametric-AFT
+    /// regime.
+    pub(crate) baseline_theta_tangents: Option<Arc<SurvivalBaselineThetaTangents>>,
 }
 
 /// The σ-scaled log-t AFT location baseline (issue #892), applied to the `q`
@@ -108,35 +114,4 @@ pub(crate) struct SurvivalRowDerivatives {
     pub(crate) grad_time_eta_h0: f64,
     pub(crate) grad_time_eta_h1: f64,
     pub(crate) grad_time_eta_d: f64,
-    pub(crate) h_time_h0: f64,
-    pub(crate) h_time_h1: f64,
-    pub(crate) h_time_d: f64,
-}
-
-impl SurvivalRowDerivatives {
-    /// NLL gradient w.r.t. the three time channels `(h0, h1, d_raw)`.
-    ///
-    /// The stored `grad_time_eta_*` are log-likelihood partials `∂ℓ/∂·`; the
-    /// NLL gradient is `-∂ℓ/∂·`, applied uniformly so the three channels can
-    /// never disagree on sign.
-    #[inline]
-    pub(crate) fn time_channel_nll_gradient(&self) -> [f64; 3] {
-        [
-            -self.grad_time_eta_h0,
-            -self.grad_time_eta_h1,
-            -self.grad_time_eta_d,
-        ]
-    }
-
-    /// NLL Hessian diagonal in time-channel space `(h0, h1, d_raw)`.
-    ///
-    /// The row likelihood factors through the functionally independent indices
-    /// `(u0, u1, g)`, so the time-channel Hessian is diagonal. All three stored
-    /// `h_time_*` hold `+∂²ℓ/∂·²` (`= -tower.h[i][i]` of the NLL jet), so the
-    /// NLL curvature `-∂²ℓ` negates each uniformly. Owning the sign here keeps
-    /// the per-channel signs locked together (gam#1396).
-    #[inline]
-    pub(crate) fn time_channel_nll_curvature_diag(&self) -> [f64; 3] {
-        [-self.h_time_h0, -self.h_time_h1, -self.h_time_d]
-    }
 }

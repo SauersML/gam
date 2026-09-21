@@ -43,7 +43,7 @@ fn reduced_parametric_aft_converges_without_stall_acceptance_3185() {
         let spec = reduced_aft_lognormal_spec(&age_exit, &event, 1.0);
         let prepared = prepare_survival_location_scale_model(&spec).expect("prepare");
         assert!(prepared.is_reduced_parametric_aft());
-        let (fit, _) = fit_survival_location_scale_with_geometry(spec)
+        let fit = fit_survival_location_scale_spec(spec)
             .unwrap_or_else(|e| panic!("n={n}: reduced parametric-AFT MLE: {e}"));
         let mu = fit.beta_threshold()[0];
         let log_sigma = fit.beta_log_sigma()[0];

@@ -72,7 +72,7 @@ pub(crate) fn fit_reduced_parametric_aft(
     // The block states carry their η in the family's native row layout — the
     // stacked `[exit; entry; deriv]` channels (`solver_design().nrows()` rows)
     // for the time block, exactly as `refresh_all_block_etas` produces and as
-    // the family's `validate_joint_states` / `offset_channel_geometry` require.
+    // the family's `validate_joint_states` requires.
     // `blockwise_fit_from_parts` validates each block's `η.len()` against
     // `spec.solver_design().nrows()`, which already resolves through
     // `stacked_design`, so the specs are handed over untouched.
@@ -118,11 +118,8 @@ pub(crate) fn fit_reduced_parametric_aft(
     .map_err(FitFailure::from)
 }
 
-/// Variant that also returns the offset-channel residuals + curvatures at the
-/// converged β̂. We have to extract these *before* `finalize_survival_location_scale_fit`
-/// runs, because the location-scale finalizer empties `UnifiedFitResult::block_states`
-/// (see `survival_fit_from_parts` — `block_states: Vec::new()`), and the family's
-/// `offset_channel_geometry` method needs the raw, populated per-block state.
+/// Which authority a location-scale fit runs under: a direct fit of a spec with
+/// no outer coordinates of its own, or the replay of a certified outer optimum.
 enum SurvivalLocationScaleFitAuthority<'a> {
     Direct,
     Certified {
@@ -132,10 +129,10 @@ enum SurvivalLocationScaleFitAuthority<'a> {
     },
 }
 
-fn fit_survival_location_scale_with_geometry_authority(
+fn fit_survival_location_scale_spec_authority(
     spec: SurvivalLocationScaleSpec,
     authority: SurvivalLocationScaleFitAuthority<'_>,
-) -> Result<(UnifiedFitResult, SurvivalLocationScaleConvergedGeometry), FitFailure> {
+) -> Result<UnifiedFitResult, FitFailure> {
     let prepared = prepare_survival_location_scale_model(&spec)?;
     let options = survival_blockwise_fit_options(&spec);
     // Fully reduced constant-scale PARAMETRIC AFT regime (issue #736/#735/#721):
@@ -145,7 +142,7 @@ fn fit_survival_location_scale_with_geometry_authority(
     // unpenalized likelihood. Route directly to a damped, line-searched joint
     // Newton MLE (converges in a handful of iterations like survreg/lifelines),
     // then assemble the identical `UnifiedFitResult` so finalize / predict /
-    // CRPS / the `offset_channel_geometry` consumer all work unchanged. Any
+    // CRPS all work unchanged. Any
     // genuinely flexible or penalized survival LS fit keeps the full coupled
     // path below.
     let fit = match authority {
@@ -156,8 +153,9 @@ fn fit_survival_location_scale_with_geometry_authority(
             fit_custom_family_arming_on_evidence(&prepared.family, &prepared.blockspecs, &options)?
         }
         // A reduced fit carries no smoothing coordinate, so it reaches this arm
-        // only through the inverse-link shape axes (#2904): the certificate is
-        // over those axes, and the fit replays the owned mode it was measured at.
+        // only through the family-owned axes, the inverse-link shape (#2904)
+        // and the baseline θ (#3413): the certificate is over those axes, and
+        // the fit replays the owned mode it was measured at.
         SurvivalLocationScaleFitAuthority::Certified { theta, outer, mode } => {
             let exact_options = crate::outer_subsample::exact_outer_options(&options);
             fit_custom_family_fixed_log_lambdas_from_owned_mode(
@@ -175,43 +173,36 @@ fn fit_survival_location_scale_with_geometry_authority(
     // path's contract and must fail before finalization.
     if fit.block_states.is_empty() {
         return Err(SurvivalLocationScaleError::InternalInvariant {
-            reason: "fit_survival_location_scale_with_geometry: fit_custom_family returned a fit \
+            reason: "fit_survival_location_scale_spec: fit_custom_family returned a fit \
                      with empty block_states"
                 .to_string(),
         }
         .into());
     }
-    let (residuals, curvatures) = prepared.family.offset_channel_geometry(&fit.block_states)?;
-    let finalized = finalize_survival_location_scale_fit(&prepared, &fit)
-        .map_err(|reason| FitFailure::raised(gam_problem::FailureCategory::Invariant, reason))?;
-    Ok((finalized, (residuals, curvatures)))
+    finalize_survival_location_scale_fit(&prepared, &fit)
+        .map_err(|reason| FitFailure::raised(gam_problem::FailureCategory::Invariant, reason))
 }
 
-pub(crate) fn fit_survival_location_scale_with_geometry(
+pub(crate) fn fit_survival_location_scale_spec(
     spec: SurvivalLocationScaleSpec,
-) -> Result<(UnifiedFitResult, SurvivalLocationScaleConvergedGeometry), FitFailure> {
-    fit_survival_location_scale_with_geometry_authority(
+) -> Result<UnifiedFitResult, FitFailure> {
+    fit_survival_location_scale_spec_authority(
         spec,
         SurvivalLocationScaleFitAuthority::Direct,
     )
 }
 
-fn fit_survival_location_scale_with_geometry_from_outer(
+fn fit_survival_location_scale_spec_from_outer(
     spec: SurvivalLocationScaleSpec,
     theta: &Array1<f64>,
     outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
     mode: crate::custom_family::CustomFamilyOwnedMode,
-) -> Result<(UnifiedFitResult, SurvivalLocationScaleConvergedGeometry), FitFailure> {
-    fit_survival_location_scale_with_geometry_authority(
+) -> Result<UnifiedFitResult, FitFailure> {
+    fit_survival_location_scale_spec_authority(
         spec,
         SurvivalLocationScaleFitAuthority::Certified { theta, outer, mode },
     )
 }
-
-/// Converged-fit geometry returned alongside the finalized location-scale fit:
-/// the offset-channel residuals + curvatures (for the baseline-θ gradient/Hessian).
-pub(crate) type SurvivalLocationScaleConvergedGeometry =
-    (OffsetChannelResiduals, OffsetChannelCurvatures);
 
 /// The inverse link's free shape parameters, in the order its parameter partials
 /// use: `(ε, log δ)` for SAS and BetaLogistic, the free ρ for a mixture, none for
@@ -406,11 +397,17 @@ pub(crate) fn fit_survival_location_scale_terms(
     .map_err(derivative_invariant)?;
     let analytic_joint_gradient_available =
         threshold_boot_derivs.is_some() && log_sigma_boot_derivs.is_some();
-    // The inverse-link shape parameters are outer coordinates of their own
-    // (#2904). The family serves their first-order terms and declines the
-    // second-order ones, so a fit that carries them runs a gradient-only outer.
+    // The inverse-link shape parameters (#2904) and a nonlinear baseline's
+    // shape θ (#3413) are family-owned outer coordinates. The family serves
+    // their first-order terms and declines the second-order ones, so a fit
+    // that carries either runs a gradient-only outer.
     let link_shape0 = inverse_link_shape(&spec.inverse_link);
+    let baseline_theta0 = spec
+        .baseline_chart
+        .as_ref()
+        .map_or_else(|| Array1::zeros(0), |chart| chart.initial_theta().clone());
     let analytic_joint_hessian_available = link_shape0.is_empty()
+        && baseline_theta0.is_empty()
         && threshold_boot_derivs
             .as_ref()
             .is_some_and(|derivs| survival_psi_derivatives_support_exact_joint_hessian(derivs))
@@ -640,61 +637,6 @@ pub(crate) fn fit_survival_location_scale_terms(
             }
         }
     }
-    // Warm-start: inject converged ρ seeds from a previous fit if supplied. The carried
-    // strengths are seeds, not bounds: the joint setup and `run_plan` project every seed
-    // onto the coordinate's derived domain (#2812), so no private box is applied here.
-    // A converged fit's log strength is finite; a non-finite carry is refused rather than
-    // silently replaced by the default seed.
-    if layout.k_threshold > 0
-        && let Some(seed) = spec.initial_threshold_log_lambdas.as_ref()
-    {
-        if seed.len() != layout.k_threshold {
-            return Err(SurvivalLocationScaleError::DimensionMismatch {
-                reason: format!(
-                    "survival threshold initial_log_lambdas length mismatch: got {}, expected {}",
-                    seed.len(),
-                    layout.k_threshold
-                ),
-            }
-            .into());
-        }
-        if let Some(bad) = seed.iter().position(|value| !value.is_finite()) {
-            return Err(SurvivalLocationScaleError::InvalidConfiguration {
-                reason: format!(
-                    "survival threshold initial_log_lambdas[{bad}] is non-finite ({})",
-                    seed[bad]
-                ),
-            }
-            .into());
-        }
-        let range = layout.threshold_range();
-        rho0.slice_mut(s![range.start..range.end]).assign(seed);
-    }
-    if layout.k_log_sigma > 0
-        && let Some(seed) = spec.initial_log_sigma_log_lambdas.as_ref()
-    {
-        if seed.len() != layout.k_log_sigma {
-            return Err(SurvivalLocationScaleError::DimensionMismatch {
-                reason: format!(
-                    "survival log_sigma initial_log_lambdas length mismatch: got {}, expected {}",
-                    seed.len(),
-                    layout.k_log_sigma
-                ),
-            }
-            .into());
-        }
-        if let Some(bad) = seed.iter().position(|value| !value.is_finite()) {
-            return Err(SurvivalLocationScaleError::InvalidConfiguration {
-                reason: format!(
-                    "survival log_sigma initial_log_lambdas[{bad}] is non-finite ({})",
-                    seed[bad]
-                ),
-            }
-            .into());
-        }
-        let range = layout.log_sigma_range();
-        rho0.slice_mut(s![range.start..range.end]).assign(seed);
-    }
     if layout.k_wiggle > 0 {
         let range = layout.wiggle_range();
         rho0.slice_mut(s![range.start..range.end])
@@ -713,18 +655,32 @@ pub(crate) fn fit_survival_location_scale_terms(
     // the flat β here on cache hit, promote to a real `CustomFamilyWarmStart`
     // once per-block widths are known from `prepare_survival_location_scale_model`.
     let pending_beta_seed = std::cell::RefCell::new(None::<Array1<f64>>);
-    // Stash the geometry and inverse link of the most recent inner fit. Updated on every
-    // value-closure call by the spatial optimizer; the last one written
-    // corresponds to the converged outer point. This avoids redoing
-    // `prepare_survival_location_scale_model` + a second fit pass after the
-    // optimizer returns, and (critically) avoids the post-finalize
-    // `block_states` wipe that would make the geometry call error out.
-    let last_geometry: std::cell::RefCell<
-        Option<(SurvivalLocationScaleConvergedGeometry, InverseLink)>,
+    // The inverse link and baseline of the most recent final fit: the point the
+    // outer optimizer certified. The fit's own result is finalized, so the
+    // outer coordinates it was built from are kept beside it here.
+    let last_fitted_point: std::cell::RefCell<
+        Option<(InverseLink, Option<crate::survival::construction::SurvivalBaselineConfig>)>,
     > = std::cell::RefCell::new(None);
 
+    // The time offsets at baseline θ (#3413): the chart's realization and its
+    // θ-tangents, or the spec's fixed offsets for a linear baseline.
+    let realize_baseline = |baseline_theta: ArrayView1<'_, f64>| -> Result<
+        Option<crate::survival::construction::SurvivalLocationScaleBaselineOffsets>,
+        String,
+    > {
+        match spec.baseline_chart.as_ref() {
+            None if baseline_theta.is_empty() => Ok(None),
+            None => Err(format!(
+                "survival location-scale fit has no baseline chart but received {} baseline θ \
+                 coordinates",
+                baseline_theta.len()
+            )),
+            Some(chart) => chart.evaluate(&baseline_theta.to_owned()).map(Some),
+        }
+    };
     let build_spec = |rho: &Array1<f64>,
                       inverse_link: InverseLink,
+                      baseline: Option<&crate::survival::construction::SurvivalLocationScaleBaselineOffsets>,
                       _: &TermCollectionSpec,
                       _: &TermCollectionSpec,
                       threshold_design: &TermCollectionDesign,
@@ -807,9 +763,18 @@ pub(crate) fn fit_survival_location_scale_terms(
                 design_entry: spec.time_block.design_entry.clone(),
                 design_exit: spec.time_block.design_exit.clone(),
                 design_derivative_exit: spec.time_block.design_derivative_exit.clone(),
-                offset_entry: spec.time_block.offset_entry.clone(),
-                offset_exit: spec.time_block.offset_exit.clone(),
-                derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
+                offset_entry: baseline.map_or_else(
+                    || spec.time_block.offset_entry.clone(),
+                    |b| b.offset_entry.clone(),
+                ),
+                offset_exit: baseline.map_or_else(
+                    || spec.time_block.offset_exit.clone(),
+                    |b| b.offset_exit.clone(),
+                ),
+                derivative_offset_exit: baseline.map_or_else(
+                    || spec.time_block.derivative_offset_exit.clone(),
+                    |b| b.derivative_offset_exit.clone(),
+                ),
                 penalties: spec.time_block.penalties.clone(),
                 nullspace_dims: spec.time_block.nullspace_dims.clone(),
                 // `initial_log_lambdas` is the per-penalty seed for THIS block's
@@ -840,6 +805,7 @@ pub(crate) fn fit_survival_location_scale_terms(
             log_sigma_block,
             timewiggle_block: spec.timewiggle_block.clone(),
             linkwiggle_block,
+            baseline_theta_tangents: baseline.map(|b| Arc::new(b.tangents.clone())),
             cache_session: spec.cache_session.clone(),
             persistent_warm_start_store: spec.persistent_warm_start_store.clone(),
             cache_mirror_sessions: spec.cache_mirror_sessions.clone(),
@@ -856,9 +822,12 @@ pub(crate) fn fit_survival_location_scale_terms(
     // count and the wiggles), identical at every ρ and κ, and is persisted here
     // because replay must never recover it from fitted coefficient values.
     let (rho_lower, rho_upper, time_parameterization) = {
+        let seed_baseline = realize_baseline(baseline_theta0.view())
+            .map_err(|reason| FitFailure::raised(gam_problem::FailureCategory::Invariant, reason))?;
         let seed_spec = build_spec(
             &rho0,
             spec.inverse_link.clone(),
+            seed_baseline.as_ref(),
             &spec.thresholdspec,
             &spec.log_sigmaspec,
             &threshold_boot_design,
@@ -881,22 +850,37 @@ pub(crate) fn fit_survival_location_scale_terms(
         rho_lower,
         rho_upper,
     )?;
-    // θ = [ρ | log κ | inverse-link shape]. A shape coordinate may be any finite
-    // real, so the only bound it has is the one working precision imposes.
-    let joint_setup = if link_shape0.is_empty() {
+    // θ = [ρ | log κ | inverse-link shape | baseline θ]. A link shape coordinate
+    // may be any finite real, so the only bound it has is the one working
+    // precision imposes; the baseline chart owns its θ domain.
+    let link_dim = link_shape0.len();
+    let baseline_dim = baseline_theta0.len();
+    let family_dim = link_dim + baseline_dim;
+    let joint_setup = if family_dim == 0 {
         joint_setup
     } else {
-        let (lower, upper) = gam_solve::estimate::rho_domain::precision_box();
-        joint_setup.with_auxiliary(
-            link_shape0.clone(),
-            Array1::from_elem(link_shape0.len(), lower),
-            Array1::from_elem(link_shape0.len(), upper),
-        )
+        let (precision_lower, precision_upper) = gam_solve::estimate::rho_domain::precision_box();
+        let mut seed = Array1::<f64>::zeros(family_dim);
+        let mut lower = Array1::<f64>::from_elem(family_dim, precision_lower);
+        let mut upper = Array1::<f64>::from_elem(family_dim, precision_upper);
+        seed.slice_mut(s![..link_dim]).assign(&link_shape0);
+        seed.slice_mut(s![link_dim..]).assign(&baseline_theta0);
+        if let Some(chart) = spec.baseline_chart.as_ref() {
+            let (chart_lower, chart_upper) = chart.theta_bounds();
+            lower.slice_mut(s![link_dim..]).assign(chart_lower);
+            upper.slice_mut(s![link_dim..]).assign(chart_upper);
+        }
+        joint_setup.with_auxiliary(seed, lower, upper)
     };
     let link_shape_start = joint_setup.rho_dim() + joint_setup.log_kappa_dim();
+    let baseline_start = link_shape_start + link_dim;
     let inverse_link_at = |theta: &Array1<f64>| -> Result<InverseLink, String> {
-        inverse_link_with_shape(&spec.inverse_link, theta.slice(s![link_shape_start..]))
+        inverse_link_with_shape(
+            &spec.inverse_link,
+            theta.slice(s![link_shape_start..baseline_start]),
+        )
     };
+    let baseline_at = |theta: &Array1<f64>| realize_baseline(theta.slice(s![baseline_start..]));
 
     let threshold_terms = spatial_length_scale_term_indices(&spec.thresholdspec);
     let log_sigma_terms = spatial_length_scale_term_indices(&spec.log_sigmaspec);
@@ -931,30 +915,31 @@ pub(crate) fn fit_survival_location_scale_terms(
                 FitFailure::raised(gam_problem::FailureCategory::Invariant, reason)
             };
             let inverse_link = inverse_link_at(theta).map_err(rebuild_invariant)?;
+            let baseline = baseline_at(theta).map_err(rebuild_invariant)?;
             let assembled = build_spec(
                 &rho,
                 inverse_link.clone(),
+                baseline.as_ref(),
                 &specs[0],
                 &specs[1],
                 &designs[0],
                 &designs[1],
             )
             .map_err(rebuild_invariant)?;
-            let (fit, geom) = match provenance {
+            let fit = match provenance {
                 SpatialFitProvenance::NoOuterOptimization => {
-                    fit_survival_location_scale_with_geometry(assembled)?
+                    fit_survival_location_scale_spec(assembled)?
                 }
                 SpatialFitProvenance::Certified { outer, mode } => {
-                    fit_survival_location_scale_with_geometry_from_outer(
-                        assembled, theta, outer, mode,
-                    )?
+                    fit_survival_location_scale_spec_from_outer(assembled, theta, outer, mode)?
                 }
             };
             time_beta_hint.replace(Some(fit.beta_time()));
             threshold_beta_hint.replace(Some(fit.beta_threshold()));
             log_sigma_beta_hint.replace(Some(fit.beta_log_sigma()));
             wiggle_beta_hint.replace(fit.beta_link_wiggle());
-            *last_geometry.borrow_mut() = Some((geom, inverse_link));
+            *last_fitted_point.borrow_mut() =
+                Some((inverse_link, baseline.map(|b| b.baseline_config)));
             Ok(fit)
         },
         |theta,
@@ -968,9 +953,11 @@ pub(crate) fn fit_survival_location_scale_terms(
                         .to_string(), }.into());
             }
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
+            let baseline = baseline_at(theta)?;
             let assembled = build_spec(
                 &rho,
                 inverse_link_at(theta)?,
+                baseline.as_ref(),
                 &specs[0],
                 &specs[1],
                 &designs[0],
@@ -1014,7 +1001,7 @@ pub(crate) fn fit_survival_location_scale_terms(
             }
             let hyper_layout = CustomFamilyHyperLayout::new(
                 derivative_blocks,
-                (0..link_shape0.len()).collect(),
+                (0..family_dim).collect(),
                 theta.slice(s![joint_setup.rho_dim()..]).to_owned(),
             )?;
             // If the caller asked for a Hessian but the family can't provide
@@ -1064,9 +1051,11 @@ pub(crate) fn fit_survival_location_scale_terms(
                         .to_string(), }.into());
             }
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
+            let baseline = baseline_at(theta)?;
             let assembled = build_spec(
                 &rho,
                 inverse_link_at(theta)?,
+                baseline.as_ref(),
                 &specs[0],
                 &specs[1],
                 &designs[0],
@@ -1110,7 +1099,7 @@ pub(crate) fn fit_survival_location_scale_terms(
             }
             let hyper_layout = CustomFamilyHyperLayout::new(
                 derivative_blocks,
-                (0..link_shape0.len()).collect(),
+                (0..family_dim).collect(),
                 theta.slice(s![joint_setup.rho_dim()..]).to_owned(),
             )?;
             let eval_options = crate::outer_subsample::exact_outer_options(
@@ -1143,10 +1132,9 @@ pub(crate) fn fit_survival_location_scale_terms(
     let mut resolved_specs = solved.resolved_specs;
     let mut designs = solved.designs;
     // The driver's fit is the fit closure's return value, and that closure
-    // stashed the offset geometry (computed pre-finalize while `block_states`
-    // was still populated) and the inverse link it fitted at. A refit at the
-    // final ρ alone would drop the fitted inverse-link shape.
-    let ((baseline_offset_residuals, baseline_offset_curvatures), inverse_link) = last_geometry
+    // stashed the inverse link and baseline it fitted at. A refit at the final
+    // ρ alone would drop the fitted inverse-link shape and baseline θ.
+    let (inverse_link, baseline_config) = last_fitted_point
         .borrow_mut()
         .take()
         .ok_or_else(|| {
@@ -1164,8 +1152,7 @@ pub(crate) fn fit_survival_location_scale_terms(
         resolved_log_sigmaspec: resolved_specs.remove(0),
         threshold_design: designs.remove(0),
         log_sigma_design: designs.remove(0),
-        baseline_offset_residuals,
-        baseline_offset_curvatures,
+        baseline_config,
         inverse_link,
     })
 }

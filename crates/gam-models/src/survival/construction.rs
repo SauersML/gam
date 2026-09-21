@@ -1175,10 +1175,9 @@ where
 /// `BaselineDerivativeContract::GradientOnly` contract, which advertises
 /// `DeclaredHessianForm::Unavailable`, so the planner routes to BFGS and
 /// builds its own quasi-Newton curvature from successive gradient
-/// evaluations. Used by the survival location-scale path which has a
-/// closed-form θ-gradient (`baseline_chain_rule_gradient` /
-/// `marginal_slope_baseline_chain_rule_gradient`) but no native analytic
-/// θ-Hessian; BFGS on a 2–3 dim problem with an exact gradient typically
+/// evaluations. Used by the survival transformation path, which has a
+/// closed-form θ-gradient (`baseline_chain_rule_gradient`) but no native
+/// analytic θ-Hessian; BFGS on a 2–3 dim problem with an exact gradient typically
 /// converges in 5–10 outer evaluations. The search domain is derived at the
 /// seed, and the Gompertz shape's radius reads the oldest exit age in
 /// `age_exit`.
@@ -2631,10 +2630,9 @@ pub fn baseline_offset_theta_partials(
 
 /// Shared chain-rule θ-gradient contraction for baseline offsets.
 ///
-/// Both [`baseline_chain_rule_gradient`] (RP eta offsets) and
-/// [`marginal_slope_baseline_chain_rule_gradient`] (probit q-offsets) reduce to
-/// the same contraction of [`OffsetChannelResiduals`] against per-age baseline
-/// θ-partials; only the `partials` provider differs. This engine owns the length
+/// [`baseline_chain_rule_gradient`] (RP eta offsets) is the contraction of
+/// [`OffsetChannelResiduals`] against per-age baseline θ-partials supplied by
+/// the `partials` provider. This engine owns the length
 /// checks, the θ-dim probe, the parallel per-row reduction, the entry gating, and
 /// the error handling. Each provider returns, per age, a length-`theta_dim` vector
 /// of `(∂eta/∂θ_k, ∂(d eta/dt)/∂θ_k)` pairs (or `(∂q/∂θ_k, ∂(dq/dt)/∂θ_k)` for the
@@ -2814,32 +2812,6 @@ pub fn baseline_chain_rule_gradient(
         cfg,
         residuals,
         baseline_offset_theta_partials,
-    )
-}
-
-/// Chain-rule θ-gradient for marginal-slope probit baseline offsets.
-///
-/// This is the probit-survival counterpart of [`baseline_chain_rule_gradient`].
-/// It contracts residuals against
-/// [`marginal_slope_baseline_offset_theta_partials`], so the offset channels
-/// are `(q_entry, q_exit, dq_exit/dt)` with `Phi(-q(t)) = exp(-H0(t))`.
-pub fn marginal_slope_baseline_chain_rule_gradient(
-    age_entry: ndarray::ArrayView1<'_, f64>,
-    age_exit: ndarray::ArrayView1<'_, f64>,
-    cfg: &SurvivalBaselineConfig,
-    residuals: &crate::survival::OffsetChannelResiduals,
-) -> Result<Option<Array1<f64>>, String> {
-    // Marginal-slope has no interval upper-bound channel; `residuals.right` is
-    // all-zero, so the right channel never contracts and `age_exit` serves as an
-    // unconsulted placeholder for the (unused) `age_right` argument.
-    baseline_chain_rule_gradient_with_partials(
-        "marginal_slope_baseline_chain_rule_gradient",
-        age_entry,
-        age_exit,
-        age_exit,
-        cfg,
-        residuals,
-        marginal_slope_baseline_offset_theta_partials,
     )
 }
 
@@ -3979,6 +3951,217 @@ impl SurvivalMarginalSlopeFrozenOffsetChart {
     }
 }
 
+/// The survival location-scale time offsets realized at one baseline chart
+/// point, with their per-row θ-tangents (#3413).
+#[derive(Clone, Debug)]
+pub struct SurvivalLocationScaleBaselineOffsets {
+    pub baseline_config: SurvivalBaselineConfig,
+    pub offset_entry: Array1<f64>,
+    pub offset_exit: Array1<f64>,
+    pub derivative_offset_exit: Array1<f64>,
+    pub tangents: crate::survival::location_scale::SurvivalBaselineThetaTangents,
+}
+
+/// Frozen nonlinear-baseline offset chart for the survival location-scale
+/// time block (#3413).
+///
+/// The time stack is prepared once, at the seed baseline. Everything the
+/// preparation derives from that baseline besides the offsets (the time
+/// designs, their penalties, the time-wiggle knots, the feasibility cone) is
+/// then held fixed, and the prepared offsets are split into the seed baseline
+/// and a frozen residual (the derivative guard, any user offset). A chart
+/// point θ realizes `residual + b(θ)` on the entry, exit and exit-derivative
+/// channels together with `∂b/∂θ`, so the outer optimizer carries θ as
+/// ordinary family-owned hyper coordinates next to ρ instead of an inner
+/// search whose value and gradient are different functions.
+#[derive(Clone, Debug)]
+pub struct SurvivalLocationScaleBaselineChart {
+    age_entry: Array1<f64>,
+    age_exit: Array1<f64>,
+    target: SurvivalBaselineTarget,
+    probit_survival: bool,
+    initial_theta: Array1<f64>,
+    lower_theta: Array1<f64>,
+    upper_theta: Array1<f64>,
+    fixed_offset_entry: Array1<f64>,
+    fixed_offset_exit: Array1<f64>,
+    fixed_derivative_offset_exit: Array1<f64>,
+}
+
+impl SurvivalLocationScaleBaselineChart {
+    pub fn new(
+        age_entry: &Array1<f64>,
+        age_exit: &Array1<f64>,
+        initial_config: &SurvivalBaselineConfig,
+        inverse_link: &InverseLink,
+        prepared_offset_entry: &Array1<f64>,
+        prepared_offset_exit: &Array1<f64>,
+        prepared_derivative_offset_exit: &Array1<f64>,
+    ) -> Result<Self, String> {
+        let n = age_exit.len();
+        if age_entry.len() != n
+            || prepared_offset_entry.len() != n
+            || prepared_offset_exit.len() != n
+            || prepared_derivative_offset_exit.len() != n
+        {
+            return Err(format!(
+                "survival location-scale baseline chart length mismatch: entry={}, exit={n}, prepared_entry={}, prepared_exit={}, prepared_derivative={}",
+                age_entry.len(),
+                prepared_offset_entry.len(),
+                prepared_offset_exit.len(),
+                prepared_derivative_offset_exit.len(),
+            ));
+        }
+        if prepared_offset_entry
+            .iter()
+            .chain(prepared_offset_exit.iter())
+            .chain(prepared_derivative_offset_exit.iter())
+            .any(|value| !value.is_finite())
+        {
+            return Err(
+                "survival location-scale prepared offsets must be finite before freezing"
+                    .to_string(),
+            );
+        }
+        let initial_theta = survival_baseline_theta_from_config(initial_config)?.ok_or_else(|| {
+            "survival location-scale baseline chart requires a nonlinear baseline".to_string()
+        })?;
+        let (lower_theta, upper_theta) =
+            survival_baseline_theta_domain(initial_config.target, &initial_theta, age_exit.view())?;
+        let probit_survival = location_scale_uses_probit_survival_baseline(Some(inverse_link));
+        let mut chart = Self {
+            age_entry: age_entry.clone(),
+            age_exit: age_exit.clone(),
+            target: initial_config.target,
+            probit_survival,
+            initial_theta,
+            lower_theta,
+            upper_theta,
+            fixed_offset_entry: Array1::zeros(n),
+            fixed_offset_exit: Array1::zeros(n),
+            fixed_derivative_offset_exit: Array1::zeros(n),
+        };
+        let (seed_entry, seed_exit, seed_derivative) = chart.baseline_offsets(initial_config)?;
+        chart.fixed_offset_entry = prepared_offset_entry - &seed_entry;
+        chart.fixed_offset_exit = prepared_offset_exit - &seed_exit;
+        chart.fixed_derivative_offset_exit = prepared_derivative_offset_exit - &seed_derivative;
+        Ok(chart)
+    }
+
+    pub fn target(&self) -> SurvivalBaselineTarget {
+        self.target
+    }
+
+    pub(crate) fn initial_theta(&self) -> &Array1<f64> {
+        &self.initial_theta
+    }
+
+    /// Finite θ domain, derived at construction by
+    /// `survival_baseline_theta_domain` and owned by the chart.
+    pub(crate) fn theta_bounds(&self) -> (&Array1<f64>, &Array1<f64>) {
+        (&self.lower_theta, &self.upper_theta)
+    }
+
+    fn baseline_offsets(
+        &self,
+        cfg: &SurvivalBaselineConfig,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
+        if self.probit_survival {
+            build_survival_marginal_slope_baseline_offsets(&self.age_entry, &self.age_exit, cfg)
+        } else {
+            build_survival_baseline_offsets(&self.age_entry, &self.age_exit, cfg)
+        }
+    }
+
+    fn theta_partials(
+        &self,
+        age: f64,
+        cfg: &SurvivalBaselineConfig,
+    ) -> Result<Vec<(f64, f64)>, String> {
+        let partials = if self.probit_survival {
+            marginal_slope_baseline_offset_theta_partials(age, cfg)?
+        } else {
+            baseline_offset_theta_partials(age, cfg)?
+        };
+        partials.ok_or_else(|| {
+            "survival location-scale nonlinear baseline chart lost its θ partials".to_string()
+        })
+    }
+
+    pub fn evaluate(
+        &self,
+        theta: &Array1<f64>,
+    ) -> Result<SurvivalLocationScaleBaselineOffsets, String> {
+        let d = self.initial_theta.len();
+        if theta.len() != d {
+            return Err(format!(
+                "survival location-scale baseline chart has {d} coordinates, got θ of length {}",
+                theta.len()
+            ));
+        }
+        let config = survival_baseline_config_from_theta(self.target, theta)?;
+        let (mut offset_entry, mut offset_exit, mut derivative_offset_exit) =
+            self.baseline_offsets(&config)?;
+        let n = self.age_exit.len();
+        let rows = (0..n)
+            .into_par_iter()
+            .map(|i| -> Result<(Vec<f64>, Vec<(f64, f64)>), String> {
+                // An origin-entry row's entry channel is the constant 0 the
+                // offset builder writes, so its tangent is 0.
+                let entry = if self.age_entry[i] <= 0.0 {
+                    vec![0.0; d]
+                } else {
+                    self.theta_partials(self.age_entry[i], &config)?
+                        .into_iter()
+                        .map(|(eta, _)| eta)
+                        .collect()
+                };
+                let exit = self.theta_partials(self.age_exit[i], &config)?;
+                if entry.len() != d || exit.len() != d {
+                    return Err(format!(
+                        "survival location-scale baseline partials have the wrong width at row {i}"
+                    ));
+                }
+                Ok((entry, exit))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut entry_tangent = Array2::<f64>::zeros((n, d));
+        let mut exit_tangent = Array2::<f64>::zeros((n, d));
+        let mut deriv_tangent = Array2::<f64>::zeros((n, d));
+        for (i, (entry, exit)) in rows.into_iter().enumerate() {
+            for k in 0..d {
+                entry_tangent[[i, k]] = entry[k];
+                exit_tangent[[i, k]] = exit[k].0;
+                deriv_tangent[[i, k]] = exit[k].1;
+            }
+        }
+        if entry_tangent
+            .iter()
+            .chain(exit_tangent.iter())
+            .chain(deriv_tangent.iter())
+            .any(|value| !value.is_finite())
+        {
+            return Err(
+                "survival location-scale baseline θ tangents must be finite".to_string(),
+            );
+        }
+        offset_entry += &self.fixed_offset_entry;
+        offset_exit += &self.fixed_offset_exit;
+        derivative_offset_exit += &self.fixed_derivative_offset_exit;
+        Ok(SurvivalLocationScaleBaselineOffsets {
+            baseline_config: config,
+            offset_entry,
+            offset_exit,
+            derivative_offset_exit,
+            tangents: crate::survival::location_scale::SurvivalBaselineThetaTangents {
+                entry: entry_tangent,
+                exit: exit_tangent,
+                deriv: deriv_tangent,
+            },
+        })
+    }
+}
+
 /// The additive time offsets of a latent-survival fit and their first and second
 /// partials with respect to a nonlinear baseline chart, realized at one chart
 /// point (#2714, #2677).
@@ -5113,7 +5296,7 @@ mod tests {
         SurvivalLikelihoodMode::LatentBinary,
     ];
 
-    use super::{SURVIVAL_TIME_FLOOR,SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalMarginalSlopeFrozenOffsetChart, SurvivalTimeBasisConfig, baseline_chain_rule_gradient, baseline_offset_theta_partials, build_survival_marginal_slope_baseline_geometry, build_survival_marginal_slope_baseline_offsets, build_survival_time_basis, build_survival_timewiggle_from_baseline, evaluate_survival_baseline, evaluate_survival_marginal_slope_baseline, fitted_weibull_baseline_from_linear_time_beta, gompertz_cumulative_shape_derivative, gompertz_cumulative_shape_second_derivative, gompertz_first_shape_series_switch, gompertz_offset_shape_series_switch, gompertz_second_shape_series_switch, gompertz_shape_derivatives, gompertz_hazard_components, marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_offset_theta_partials, resolve_survival_time_anchor_for_mode, survival_baseline_config_from_theta, survival_baseline_theta_from_config, survival_data_is_left_truncated, survival_earliest_entry_time_anchor, survival_robust_interior_time_anchor, validate_survival_time_anchor_override};
+    use super::{SURVIVAL_TIME_FLOOR,SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalMarginalSlopeFrozenOffsetChart, SurvivalTimeBasisConfig, baseline_chain_rule_gradient, baseline_offset_theta_partials, build_survival_marginal_slope_baseline_geometry, build_survival_marginal_slope_baseline_offsets, build_survival_time_basis, build_survival_timewiggle_from_baseline, evaluate_survival_baseline, evaluate_survival_marginal_slope_baseline, fitted_weibull_baseline_from_linear_time_beta, gompertz_cumulative_shape_derivative, gompertz_cumulative_shape_second_derivative, gompertz_first_shape_series_switch, gompertz_offset_shape_series_switch, gompertz_second_shape_series_switch, gompertz_shape_derivatives, gompertz_hazard_components, marginal_slope_baseline_offset_theta_partials, resolve_survival_time_anchor_for_mode, survival_baseline_config_from_theta, survival_baseline_theta_from_config, survival_data_is_left_truncated, survival_earliest_entry_time_anchor, survival_robust_interior_time_anchor, validate_survival_time_anchor_override};
     use super::optimize_survival_baseline_config_with_gradient_only;
     use super::{
         center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
@@ -5129,6 +5312,95 @@ mod tests {
     use crate::survival::OffsetChannelResiduals;
     use gam_terms::inference::formula_dsl::LinkWiggleFormulaSpec;
     use ndarray::{Array1, Array2, array};
+
+    /// #3413: the location-scale baseline chart's θ tangents are the
+    /// derivatives of the offsets it realizes, on every channel and for both
+    /// the RP-η and the probit-survival offset families, and the frozen
+    /// residual reproduces the prepared offsets at the seed.
+    #[test]
+    fn location_scale_baseline_chart_tangents_match_finite_difference_3413() {
+        use super::SurvivalLocationScaleBaselineChart;
+        use gam_problem::{InverseLink, StandardLink};
+        let seed = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::GompertzMakeham,
+            scale: None,
+            shape: Some(0.03),
+            rate: Some(0.01),
+            makeham: Some(0.002),
+        };
+        let age_entry = array![0.0, 3.0, 6.5];
+        let age_exit = array![4.0, 8.0, 12.0];
+        let guard = array![0.25, -0.5, 1.0];
+        for link in [
+            InverseLink::Standard(StandardLink::Logit),
+            InverseLink::Standard(StandardLink::Probit),
+        ] {
+            let probit = matches!(link, InverseLink::Standard(StandardLink::Probit));
+            let (seed_entry, seed_exit, seed_deriv) = if probit {
+                build_survival_marginal_slope_baseline_offsets(&age_entry, &age_exit, &seed)
+            } else {
+                super::build_survival_baseline_offsets(&age_entry, &age_exit, &seed)
+            }
+            .expect("seed offsets");
+            let prepared_entry = &seed_entry + &guard;
+            let prepared_exit = &seed_exit - &guard;
+            let prepared_deriv = &seed_deriv + &guard;
+            let chart = SurvivalLocationScaleBaselineChart::new(
+                &age_entry,
+                &age_exit,
+                &seed,
+                &link,
+                &prepared_entry,
+                &prepared_exit,
+                &prepared_deriv,
+            )
+            .expect("chart");
+            let theta0 = chart.initial_theta().clone();
+            let at_seed = chart.evaluate(&theta0).expect("seed realization");
+            for i in 0..age_exit.len() {
+                assert_close(at_seed.offset_entry[i], prepared_entry[i], 1e-14, "seed entry");
+                assert_close(at_seed.offset_exit[i], prepared_exit[i], 1e-14, "seed exit");
+                assert_close(
+                    at_seed.derivative_offset_exit[i],
+                    prepared_deriv[i],
+                    1e-14,
+                    "seed derivative",
+                );
+            }
+            let h = 1e-6;
+            for k in 0..theta0.len() {
+                let mut plus = theta0.clone();
+                let mut minus = theta0.clone();
+                plus[k] += h;
+                minus[k] -= h;
+                let plus = chart.evaluate(&plus).expect("plus");
+                let minus = chart.evaluate(&minus).expect("minus");
+                let channels = [
+                    (&plus.offset_entry, &minus.offset_entry, &at_seed.tangents.entry),
+                    (&plus.offset_exit, &minus.offset_exit, &at_seed.tangents.exit),
+                    (
+                        &plus.derivative_offset_exit,
+                        &minus.derivative_offset_exit,
+                        &at_seed.tangents.deriv,
+                    ),
+                ];
+                for (channel, (up, down, tangent)) in channels.into_iter().enumerate() {
+                    for i in 0..age_exit.len() {
+                        let fd = (up[i] - down[i]) / (2.0 * h);
+                        assert!(
+                            (tangent[[i, k]] - fd).abs() <= 1e-6 * fd.abs().max(1.0),
+                            "probit={probit} channel {channel} row {i} axis {k}: tangent={}, fd={fd}",
+                            tangent[[i, k]]
+                        );
+                    }
+                }
+            }
+            assert!(
+                at_seed.tangents.entry.row(0).iter().all(|value| *value == 0.0),
+                "an origin-entry row carries no entry tangent"
+            );
+        }
+    }
 
     #[test]
     fn fitted_weibull_baseline_uses_identified_anchor_and_slope() {
@@ -6220,63 +6492,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn marginal_slope_baseline_chain_rule_gradient_contracts_probit_partials() {
-        let cfg = SurvivalBaselineConfig {
-            target: SurvivalBaselineTarget::GompertzMakeham,
-            scale: None,
-            shape: Some(0.03),
-            rate: Some(0.01),
-            makeham: Some(0.002),
-        };
-        let age_entry = array![3.0, 6.0];
-        let age_exit = array![8.0, 12.0];
-        let residuals = OffsetChannelResiduals {
-            exit: array![0.7, -0.2],
-            entry: array![0.1, 0.4],
-            derivative: array![1.3, -0.6],
-            right: Array1::<f64>::zeros(2),
-        };
-        let grad = marginal_slope_baseline_chain_rule_gradient(
-            age_entry.view(),
-            age_exit.view(),
-            &cfg,
-            &residuals,
-        )
-        .expect("gradient")
-        .expect("nonlinear");
-
-        let mut expected = Array1::<f64>::zeros(3);
-        for i in 0..age_exit.len() {
-            let exit_partials = marginal_slope_baseline_offset_theta_partials(age_exit[i], &cfg)
-                .expect("exit partials")
-                .expect("nonlinear");
-            let entry_partials = marginal_slope_baseline_offset_theta_partials(age_entry[i], &cfg)
-                .expect("entry partials")
-                .expect("nonlinear");
-            for k in 0..3 {
-                expected[k] += residuals.exit[i] * exit_partials[k].0
-                    + residuals.derivative[i] * exit_partials[k].1
-                    + residuals.entry[i] * entry_partials[k].0;
-            }
-        }
-        for k in 0..3 {
-            assert_close(
-                grad[k],
-                expected[k],
-                1e-12,
-                &format!("gm-probit chain gradient theta[{k}]"),
-            );
-        }
-    }
-
-    /// Parity guard for the shared `baseline_chain_rule_gradient_with_partials`
-    /// engine (issue #429): both public gradient functions delegate to it with a
-    /// different partials provider. This test reimplements the pre-unification
-    /// inline contraction (the serial reference) and asserts bit-for-bit equality
-    /// against the unified engine's output for BOTH providers on the same data —
-    /// the RP-eta provider (`baseline_offset_theta_partials`) and the probit-q
-    /// provider (`marginal_slope_baseline_offset_theta_partials`). Any drift in
+    /// Parity guard for the `baseline_chain_rule_gradient_with_partials`
+    /// engine (issue #429). This test reimplements the inline contraction (the
+    /// serial reference) and asserts bit-for-bit equality against the engine's
+    /// output for the RP-eta provider (`baseline_offset_theta_partials`). Any drift in
     /// the extracted contraction (length checks, theta-dim probe, exit/derivative
     /// combination, or entry gating) breaks this with an exact (0.0) tolerance.
     #[test]
@@ -6354,30 +6573,10 @@ mod tests {
                 &format!("rp engine vs inline reference theta[{k}]"),
             );
         }
-
-        // Probit-q provider parity.
-        let probit_engine = marginal_slope_baseline_chain_rule_gradient(
-            age_entry.view(),
-            age_exit.view(),
-            &cfg,
-            &residuals,
-        )
-        .expect("probit gradient")
-        .expect("probit nonlinear");
-        let probit_reference = reference_gradient(&marginal_slope_baseline_offset_theta_partials);
-        assert_eq!(probit_engine.len(), probit_reference.len());
-        for k in 0..probit_engine.len() {
-            assert_close(
-                probit_engine[k],
-                probit_reference[k],
-                0.0,
-                &format!("probit engine vs inline reference theta[{k}]"),
-            );
-        }
     }
 
     /// Finite-difference verification of the analytic θ-gradient used by the
-    /// survival location-scale workflow path.
+    /// survival transformation workflow path.
     ///
     /// At a converged β, the envelope theorem reduces the profile-NLL gradient
     /// w.r.t. the baseline-config θ to a per-row residual contraction against
