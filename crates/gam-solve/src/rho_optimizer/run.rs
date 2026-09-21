@@ -5298,6 +5298,40 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         // refusal so a railed or budget-exhausted crawl explains which
         // certificate gate refused instead of failing silently.
         let mut summary = native_certificate_summary(&certificate, config);
+        // `|Pg|` alone does not say which coordinate carries it, so a refusal at a
+        // railed point cannot tell a projection defect (the mass sits on a railed
+        // coordinate) from a search defect (it sits on an interior one). Name the
+        // carriers in decreasing `|Pg_k|`, stopping once the rest of the squared
+        // norm is below the norm's own formation rounding, `p·ε` for a sum of `p`
+        // squares: past that point the remaining coordinates do not account for any
+        // resolved part of `|Pg|` (#3321).
+        {
+            let squared_norm: f64 = projected_gradient.iter().map(|g| g * g).sum();
+            if squared_norm > 0.0 {
+                let unresolved = projected_gradient.len() as f64 * f64::EPSILON * squared_norm;
+                let mut order: Vec<usize> = (0..projected_gradient.len()).collect();
+                order.sort_by(|&a, &b| {
+                    projected_gradient[b]
+                        .abs()
+                        .total_cmp(&projected_gradient[a].abs())
+                });
+                let mut accounted = 0.0_f64;
+                let mut carriers: Vec<String> = Vec::new();
+                for k in order {
+                    if squared_norm - accounted <= unresolved {
+                        break;
+                    }
+                    accounted += projected_gradient[k] * projected_gradient[k];
+                    carriers.push(format!(
+                        "#{} theta={:.4e} Pg={:.3e}",
+                        native_coordinate(config.native_coordinate_order.as_deref(), k),
+                        result.rho[k],
+                        projected_gradient[k]
+                    ));
+                }
+                summary = format!("{summary}; |Pg| carriers: [{}]", carriers.join(", "));
+            }
+        }
         if !curvature_requirement_met {
             // This gate refuses on two OPPOSITE grounds and used to report both
             // with one sentence, which reads as an optimizer failure in either
