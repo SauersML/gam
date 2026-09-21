@@ -600,7 +600,9 @@ pub const TORUS_FLOW_GUARD_NODES_PER_AXIS: usize = 64;
 /// Outer iteration cap for the damped Gauss–Newton flow optimization. The
 /// problem is a 48-dimensional smooth nonlinear least squares; quadratic
 /// local convergence makes this cap generous (termination is normally by the
-/// relative step / improvement tolerances below).
+/// rounding-band improvement test or the damping-escalation stop below).
+/// Exhausting the cap is NOT a termination: the flow cores return `None`
+/// (chart left as fitted) rather than commit a truncated iterate.
 pub(crate) const TORUS_FLOW_GN_MAX_ITERS: usize = 80;
 
 /// Consecutive damping escalations before the Gauss–Newton declares the
@@ -1476,7 +1478,8 @@ struct FlowMinimization {
 /// whose `min det Dφ_θ ≤ min_det` on the guard grid, so the iterate can never
 /// walk through a fold. Returns `None` (honest skip — no lossy or folded swap)
 /// when the identity chart is already isometric, the profiled scale
-/// degenerates, or no strict improvement is reachable within the family.
+/// degenerates, no strict improvement is reachable within the family, or the
+/// iteration cap runs out before the trust loop terminates.
 fn minimize_isometry_defect_flow(
     row_modes: &[Vec<FlowModeSample>],
     row_base: &[[f64; 4]],
@@ -1497,10 +1500,8 @@ fn minimize_isometry_defect_flow(
     let sqrt2 = std::f64::consts::SQRT_2;
     let mut lambda = 1.0e-4_f64;
     let mut any_accepted = false;
-    for iteration in 0..TORUS_FLOW_GN_MAX_ITERS {
-        if iteration + 1 == TORUS_FLOW_GN_MAX_ITERS {
-            break;
-        }
+    let mut terminated = false;
+    for _ in 0..TORUS_FLOW_GN_MAX_ITERS {
         // Residual r and Gauss–Newton Jacobian J at the current θ.
         let mut jmat = Array2::<f64>::zeros((3 * n, q));
         let mut rcol = Array2::<f64>::zeros((3 * n, 1));
@@ -1546,12 +1547,18 @@ fn minimize_isometry_defect_flow(
             },
         );
         any_accepted |= step.accepted;
-        if !step.accepted {
+        if !step.accepted || step.converged {
+            terminated = true;
             break;
         }
-        if step.converged {
-            break;
-        }
+    }
+    if !terminated {
+        // The iteration cap ran out while every sweep was still accepting a
+        // resolvable descent: θ is a truncated iterate, not the
+        // minimum-defect representative. Committing it would make the
+        // "canonical" chart (and every chart-dependent diagnostic computed in
+        // it) a function of the iteration budget — honest skip instead.
+        return None;
     }
     if !any_accepted || !(state.defect < defect_initial) {
         // No strict improvement within the flow family: the fitted chart is
@@ -2846,10 +2853,8 @@ fn sphere_minimize_boost_defect(
     }
     let mut lambda = 1.0e-4_f64;
     let mut any_accepted = false;
-    for iteration in 0..TORUS_FLOW_GN_MAX_ITERS {
-        if iteration + 1 == TORUS_FLOW_GN_MAX_ITERS {
-            break;
-        }
+    let mut terminated = false;
+    for _ in 0..TORUS_FLOW_GN_MAX_ITERS {
         let (rcol, jmat) =
             sphere_boost_residual_jacobian(&theta, row_coords, ghat, ghat_norm_sq, &state)?;
         let jtj = fast_ata(&jmat);
@@ -2877,10 +2882,13 @@ fn sphere_minimize_boost_defect(
         );
         any_accepted |= step.accepted;
         if !step.accepted || step.converged {
+            terminated = true;
             break;
         }
     }
-    if !any_accepted || !(state.defect < defect_initial) {
+    // Same contract as the torus/patch core: a cap-truncated iterate is not
+    // the minimum-defect representative, so it is never committed.
+    if !terminated || !any_accepted || !(state.defect < defect_initial) {
         return None;
     }
     Some(SphereFlowMinimization {
