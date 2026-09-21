@@ -56,6 +56,7 @@ pub mod row_measure;
 pub mod row_sampling_measure;
 pub mod seeding;
 pub mod sensitivity;
+pub mod soft_line_marginal;
 pub mod spline_scan;
 pub(crate) mod startup_stats;
 pub mod structure_search;
