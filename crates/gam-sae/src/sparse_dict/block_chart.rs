@@ -889,9 +889,34 @@ fn crossfit_evidence(
     // not ln(∞), while every quantity stays scale-invariant.
     let linear_total = linear_loss.iter().sum::<f64>();
     let chart_total = chart_loss.iter().sum::<f64>();
-    let s2_floor = 1.0e-12 * (linear_total.max(chart_total) / n as f64).max(1.0e-300);
-    let s2_lin = (linear_total / n as f64).max(s2_floor);
-    let s2_chart = (chart_total / n as f64).max(s2_floor);
+    // The floor under both variances is the resolution of the arithmetic that
+    // produced them, not a picked decade. Each total is an `n`-term accumulation
+    // of nonnegative row SSEs, so its relative rounding band is Wilkinson's
+    // `γ_n = n·u/(1 − n·u)` (`gam_math::roundoff`), and a variance below
+    // `γ_n · max(ŝ²_lin, ŝ²_chart)` is not resolved from zero by that sum. Using
+    // that band as the floor keeps `ln(ŝ²_lin/ŝ²_chart)` finite when one model
+    // fits the held-out rows exactly, and caps the claimed evidence at what the
+    // measurement can resolve — `½·ln(1/γ_n)` nats — instead of at the decade a
+    // literal happened to name. The floor stays a FRACTION of an SSE and `γ_n`
+    // depends only on `n`, so the whole evidence is still exactly scale-
+    // invariant, which `crossfit_bic_selection_is_scale_invariant` pins to the
+    // bit. It replaces `1.0e-12 * (…).max(1.0e-300)` (gam#2469).
+    let sse_scale = linear_total.max(chart_total);
+    let (s2_lin, s2_chart) = if sse_scale > 0.0 {
+        let s2_floor = gam_math::roundoff::accumulation_growth(n) * (sse_scale / n as f64);
+        (
+            (linear_total / n as f64).max(s2_floor),
+            (chart_total / n as f64).max(s2_floor),
+        )
+    } else {
+        // Both reconstructions are exact on every held-out row. Then every
+        // numerator `eᵢ` below is exactly zero and the half-log-ratio is
+        // `ln(s²/s²) = 0` for ANY positive `s²`, so the two models are
+        // indistinguishable on this evidence and every row deviance is exactly
+        // zero. The value cannot enter the result, which is why the ratio needs
+        // no absolute floor to stay out of `0/0`.
+        (1.0, 1.0)
+    };
     let half_log_ratio = 0.5 * (s2_lin / s2_chart).ln();
     // Each row residual `eᵢ = linear_loss[i]` is an SSE over the `q =
     // coords.ncols()` coordinate channels, so the reconstruction is a

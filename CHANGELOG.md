@@ -1,5 +1,19 @@
 ## Unreleased
 
+- **The block-chart evidence floor is the SSE sum's own rounding band** (#2469).
+  `crossfit_evidence` floored both profiled variances at `1.0e-12 * (max SSE / n)`,
+  with a second `.max(1.0e-300)` under it to keep an all-zero pair out of `0/0`.
+  Neither number was derived: the first capped a perfect chart fit's evidence at the
+  decade a literal happened to name, and the second answered a structural case with a
+  subnormal. The floor is now Wilkinson's `γ_n = n·u/(1 − n·u)` times the larger
+  profiled variance, the relative band of an `n`-term accumulation of nonnegative row
+  SSEs, so the claimed evidence is capped at what the arithmetic resolves
+  (`½·ln(1/γ_n)` nats). Two held-out losses that are both exactly zero are now stated
+  as what they are — the models are indistinguishable and the deviance is exactly
+  zero — instead of being carried through a subnormal ratio. The floor stays a
+  fraction of an SSE and `γ_n` depends only on `n`, so the bit-exact scale invariance
+  `crossfit_bic_selection_is_scale_invariant` pins is unchanged, and the floor does
+  not bind on any non-degenerate fixture.
 - **The composition-law test studentizes by the fitted curves' own sampling law** (#3512).
   `composition_defect` floored the defect's pointwise variance at the three maps'
   in-sample observation residual RMS, combined by Minkowski's inequality. That RMS
