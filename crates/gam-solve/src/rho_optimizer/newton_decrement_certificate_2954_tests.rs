@@ -50,6 +50,7 @@ fn certify_row_summed_quadratic_2954(
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
+            information_count: None,
         },
         ..OuterConfig::default()
     };
@@ -263,6 +264,7 @@ fn a_cancelling_gradient_is_charged_on_its_channels_not_its_sum_2954() {
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
+            information_count: None,
         },
         ..OuterConfig::default()
     };
@@ -346,6 +348,7 @@ fn certify_scripted_2954(
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
+            information_count: None,
         },
         model_domain_bounds: Some((array![lower], array![upper])),
         model_domain_limit_faces: limit_faces.map(|(lower, upper)| (vec![lower], vec![upper])),
@@ -862,6 +865,7 @@ fn the_objective_band_charges_the_channels_and_the_inner_factor_2954() {
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(1_000),
             p_coefficients: Some(COEFFICIENTS_2954),
+            information_count: None,
         },
         ..OuterConfig::default()
     };
@@ -992,6 +996,7 @@ fn a_coupled_tail_is_railed_as_one_face_2954() {
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
+            information_count: None,
         },
         model_domain_bounds: Some((array![-20.0, -20.0], array![20.0, 20.0])),
         model_domain_limit_faces: Some((vec![true, true], vec![true, true])),
@@ -1118,6 +1123,7 @@ fn projected_newton_path_rails_the_tail_and_leaves_the_interior_free_2954() {
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
+            information_count: None,
         },
         model_domain_bounds: Some((Array1::from_elem(5, -20.0), Array1::from_elem(5, 20.0))),
         model_domain_limit_faces: Some((vec![true; 5], vec![true; 5])),
@@ -1286,6 +1292,7 @@ fn certify_two_route_walk_2954(
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
+            information_count: None,
         },
         ..OuterConfig::default()
     };
@@ -1446,6 +1453,7 @@ fn an_inner_mode_without_a_residual_takes_no_decrement_verdict_2954() {
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(2_000),
             p_coefficients: Some(COEFFICIENTS_2954),
+            information_count: None,
         },
         ..OuterConfig::default()
     };
@@ -1779,6 +1787,7 @@ fn the_decrement_verdict_is_invariant_to_an_additive_cost_shift_c3() {
             problem_size: crate::rho_optimizer::OuterProblemSize {
                 n_obs: Some(n_obs),
                 p_coefficients: Some(COEFFICIENTS_2954),
+                information_count: None,
             },
             ..OuterConfig::default()
         };

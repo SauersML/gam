@@ -661,6 +661,7 @@ fn sized_claim_band_config_2954(n_obs: usize) -> OuterConfig {
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(VERDICT_COEFFICIENTS_2954),
+            information_count: None,
         },
         ..claim_band_config_2817(CLAIM_BAND_2817)
     }
@@ -1522,6 +1523,7 @@ fn drive_arc_crawl_3018(
         problem_size: OuterProblemSize {
             n_obs: Some(100),
             p_coefficients: Some(4),
+            information_count: None,
         },
         ..claim_band_config_2817(CLAIM_BAND_2817)
     };

@@ -457,6 +457,7 @@ fn problem_size_2954(n_obs: usize, p_coefficients: usize) -> crate::rho_optimize
     crate::rho_optimizer::OuterProblemSize {
         n_obs: Some(n_obs),
         p_coefficients: Some(p_coefficients),
+        information_count: None,
     }
 }
 
@@ -796,6 +797,7 @@ fn certify_quadratic_at_declared_curvature_2458(
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(N_OBS_2458),
             p_coefficients: Some(1),
+            information_count: None,
         },
         ..OuterConfig::default()
     };

@@ -52,6 +52,7 @@ fn the_caller_requirement_rung_names_itself_2568() {
 const SIZE_2688: crate::rho_optimizer::OuterProblemSize = crate::rho_optimizer::OuterProblemSize {
     n_obs: Some(1_000),
     p_coefficients: Some(10),
+    information_count: None,
 };
 
 /// One coordinate's published gradient parts at rank `rank`, penalty energy

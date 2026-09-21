@@ -57,6 +57,7 @@ fn config_3018() -> OuterConfig {
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(N_OBS_3018),
             p_coefficients: Some(1),
+            information_count: None,
         },
         ..claim_band_config(CLAIM_BAND_3018)
     }
@@ -198,6 +199,7 @@ fn objective_band_is_formed_from_the_evaluations_own_evidence_3018() {
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(1_000),
             p_coefficients: Some(10),
+            information_count: None,
         },
         ..config
     };

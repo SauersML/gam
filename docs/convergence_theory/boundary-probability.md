@@ -275,7 +275,7 @@ The same bound transfers, through the delta method, to any smooth functional of 
 
 Setting η = n^{−1/2} makes the optimization error in every hyperparameter functional smaller than the intrinsic first-order error of the inference built on it, uniformly in the units of y and in the parameterization. Hence
 
-  **τ_stat = η²/2 = 1/(2n)**, with n the number of observations. For grouped or weighted data, use the sum of prior weights, i.e. the Fisher-information count.
+  **τ_stat = η²/2 = 1/(2·n_eff)**, with n_eff the Fisher-information count. For every family whose prior weights are replication weights (a fixed scale, or a nuisance estimated from Σw-normalized statistics), n_eff = Σ wᵢ: a row of weight c is exactly c rows of weight one and LAML is identical under both encodings, so the resolution must be too. The profiled Gaussian scale φ̂ = D_p/(n − M_p) absorbs a global rescale w → c·w, so there n_eff is the row count; using Σw would reintroduce the unit dependence this tolerance removes (`outer_information_count` in `estimate/optimizer.rs`, #3192).
 
 **Certificate.** At a candidate point, let δ² be the projected Newton decrement:
 

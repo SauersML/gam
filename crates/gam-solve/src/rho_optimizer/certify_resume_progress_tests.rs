@@ -18,6 +18,7 @@ fn config_with_size(n_obs: Option<usize>, tolerance: f64) -> OuterConfig {
         problem_size: OuterProblemSize {
             n_obs,
             p_coefficients: n_obs.map(|_| 3),
+            information_count: None,
         },
         ..OuterConfig::default()
     }
@@ -203,4 +204,42 @@ fn a_reseed_without_certified_descent_since_the_last_refusal_returns_the_refusal
         !certify_reseed_admitted(Some(455.40), f64::NAN),
         "a non-finite certified value is never descent"
     );
+}
+
+/// #3192: the resolution is taken over the declared Fisher-information count.
+/// Rows of weight `c` resolve exactly as their `c`-fold replicated rows. The
+/// declared rows, which the rounding bands charge, stay the rows the sums
+/// run over. The declaration does not depend on the order of the builder
+/// calls, and a count that is not finite and positive resolves nothing.
+#[test]
+fn criterion_resolution_reads_the_declared_information_count_3192() {
+    use crate::rho_optimizer::OuterProblem;
+    let rows = 1_000usize;
+    let trials = 7usize;
+    let n_eff = (rows * trials) as f64;
+    let weighted = OuterProblem::new(2)
+        .with_problem_size(rows, 5)
+        .with_information_count(n_eff)
+        .config();
+    let replicated = OuterProblem::new(2)
+        .with_problem_size(rows * trials, 5)
+        .config();
+    assert_eq!(
+        outer_criterion_resolution(&weighted),
+        outer_criterion_resolution(&replicated)
+    );
+    assert_eq!(outer_criterion_resolution(&weighted), 0.5 / n_eff);
+    assert_eq!(weighted.problem_size.n_obs, Some(rows));
+    let declared_first = OuterProblem::new(2)
+        .with_information_count(n_eff)
+        .with_problem_size(rows, 5)
+        .config();
+    assert_eq!(declared_first.problem_size, weighted.problem_size);
+    for unresolvable in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        let config = OuterProblem::new(2)
+            .with_problem_size(rows, 5)
+            .with_information_count(unresolvable)
+            .config();
+        assert_eq!(outer_criterion_resolution(&config), 0.0, "n_eff = {unresolvable}");
+    }
 }

@@ -843,6 +843,7 @@ fn audit_interior_with_dense_curvature(
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(5_000),
             p_coefficients: Some(1),
+            information_count: None,
         },
         ..OuterConfig::default()
     };
@@ -1119,6 +1120,7 @@ fn problem_size_2269() -> crate::rho_optimizer::OuterProblemSize {
     crate::rho_optimizer::OuterProblemSize {
         n_obs: Some(1_000),
         p_coefficients: Some(10),
+        information_count: None,
     }
 }
 
@@ -2514,6 +2516,7 @@ fn efs_trial_within_criterion_resolution_is_accepted_3539() {
         problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(5_000),
             p_coefficients: Some(1),
+            information_count: None,
         },
         ..OuterConfig::default()
     };
