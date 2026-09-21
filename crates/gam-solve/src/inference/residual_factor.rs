@@ -40,9 +40,10 @@
 //! Whitening a residual `r_n` through it (`U_nᵀ r_n`) yields a vector whose
 //! squared Euclidean norm is `r_nᵀ Σ_n^{-1} r_n` — the Mahalanobis residual under
 //! the estimated noise model, which is exactly the likelihood-correct data-fit.
-//! The factor is built from `Σ_n^{-1}` computed in **Woodbury form** (an
-//! `r × r` solve, never a `p × p` inverse), so the estimator scales with the
-//! factor rank, not the dense output dimension.
+//! The factor is built from the SPD covariance itself: `Σ_n = L_n L_nᵀ`
+//! (Cholesky) and `U_n = L_n^{-ᵀ}`, so `U_n U_nᵀ = Σ_n^{-1}` exactly and
+//! whitening is the triangular solve `L_n^{-1} r_n`. The precision is never
+//! assembled, so there is no subtraction to cancel and no inverse to repair.
 //!
 //! This is the first real producer of `WhitenedStructured`, and therefore the
 //! first metric whose `whitens_likelihood()` is `true`: see
@@ -55,7 +56,7 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use faer::Side;
-use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
+use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_problem::RowMetric;
 
 /// Number of equal-width bins the activity coordinate `z` is partitioned into
@@ -332,14 +333,13 @@ impl StructuredResidualModel {
     /// `RowMetric`. This is the single
     /// production site of `WhitenedStructured`.
     ///
-    /// The precision is formed in **Woodbury form**:
-    /// ```text
-    ///   Σ_n^{-1} = D^{-1} − D^{-1} Λ ( c^{-1} I_r + Λᵀ D^{-1} Λ )^{-1} Λᵀ D^{-1},
-    /// ```
-    /// an `r × r` capacitance solve (never a `p × p` inverse). The factor `U_n`
-    /// is the lower-Cholesky of the assembled `Σ_n^{-1}` (`rank = p`), so
-    /// `whiten_residual_row` returns coordinates whose squared norm is the exact
-    /// Mahalanobis residual `r_nᵀ Σ_n^{-1} r_n`.
+    /// The factor comes from the SPD covariance `Σ_n = c_n·ΛΛᵀ + D` directly:
+    /// `Σ_n = L_n L_nᵀ` (Cholesky) and `U_n = L_n^{-ᵀ}` (`rank = p`), so
+    /// `U_n U_nᵀ = Σ_n^{-1}` exactly and `whiten_residual_row` returns
+    /// `L_n^{-1} r_n`, whose squared norm is the exact Mahalanobis residual
+    /// `r_nᵀ Σ_n^{-1} r_n`. The precision is never assembled (no Woodbury
+    /// subtraction to cancel), and a Cholesky failure of `Σ_n` is reported as an
+    /// error rather than repaired.
     pub fn row_metric(&self, n_rows: usize) -> Result<RowMetric, String> {
         if n_rows != self.row_scale.len() {
             return Err(format!(
@@ -348,42 +348,12 @@ impl StructuredResidualModel {
             ));
         }
         let p = self.p;
-        let r = self.factor_rank;
-        // Hoist every row-INDEPENDENT Woodbury part out of the per-row loop: the
-        // inverse diagonal D^{-1}, B = D^{-1}Λ, its transpose Bᵀ, and the Gram
-        // M0 = ΛᵀD^{-1}Λ. Only the c_n^{-1} I_r shift on the capacitance is
-        // per-row, so the per-row capacitance is M_n = M0 + c_n^{-1} I_r — a
-        // scalar-diagonal reweight of the SAME M0. Building the n-row U_n stack now costs
-        // O(p·r² + n·(p·r + r³ + p³)) instead of rebuilding B and the Gram every
-        // row. The summation order per row is unchanged, so the assembled U_n is
-        // bit-for-bit identical to the per-row-rebuild it replaces.
-        let d_inv: Vec<f64> = (0..p).map(|i| 1.0 / self.diagonal[i]).collect();
-        let mut b = Array2::<f64>::zeros((p, r));
-        let mut bt = Array2::<f64>::zeros((r, p));
-        let mut m0 = Array2::<f64>::zeros((r, r));
-        if r > 0 {
-            for i in 0..p {
-                for k in 0..r {
-                    b[[i, k]] = d_inv[i] * self.lambda[[i, k]];
-                }
-            }
-            for a in 0..r {
-                for bk in 0..r {
-                    let mut acc = 0.0_f64;
-                    for i in 0..p {
-                        acc += self.lambda[[i, a]] * b[[i, bk]];
-                    }
-                    m0[[a, bk]] = acc;
-                }
-            }
-            for k in 0..r {
-                for i in 0..p {
-                    bt[[k, i]] = b[[i, k]];
-                }
-            }
-        }
+        // Hoist the row-INDEPENDENT Gram ΛΛᵀ out of the per-row loop: only the
+        // per-row activity scale c_n multiplies it, so each row's covariance is
+        // Σ_n = c_n·ΛΛᵀ + D, an O(p²) reweight of the SAME Gram.
+        let gram = outer_product(&self.lambda);
         // Row-major flat factor matrix: u[n, i*p + k] = U_n[i, k]. Each row's
-        // Woodbury assemble + p×p Cholesky is independent of every other row's
+        // covariance assemble + p×p Cholesky is independent of every other row's
         // (no cross-row reduction), so the stack parallelizes over rows with
         // BIT-IDENTICAL output — every row runs the exact serial arithmetic and
         // writes only its own p² chunk. This was the dominant serial wall of the
@@ -399,20 +369,17 @@ impl StructuredResidualModel {
             use rayon::prelude::*;
             const PARALLEL_ROW_MIN: usize = 64;
             let build_row = |row: usize, urow: &mut [f64]| -> Option<String> {
-                let precision = match self.row_precision(&d_inv, &b, &bt, &m0, row) {
-                    Ok(m) => m,
-                    Err(err) => return Some(err),
-                };
-                let factor = match lower_cholesky_psd(&precision) {
-                    Ok(f) => f,
-                    Err(err) => return Some(err),
-                };
-                for i in 0..p {
-                    for k in 0..p {
-                        urow[i * p + k] = factor[[i, k]];
+                let c = self.row_scale[row].max(f64::MIN_POSITIVE);
+                let mut sigma = Array2::<f64>::zeros((p, p));
+                for a in 0..p {
+                    for b in 0..p {
+                        sigma[[a, b]] = c * gram[[a, b]];
                     }
+                    sigma[[a, a]] += self.diagonal[a];
                 }
-                None
+                covariance_whitening_factor(&sigma, urow)
+                    .map_err(|e| format!("StructuredResidualModel::row_metric row {row}: {e}"))
+                    .err()
             };
             let u_flat = u.as_slice_mut().ok_or_else(|| {
                 "StructuredResidualModel::row_metric: factor stack must be standard-layout"
@@ -465,13 +432,13 @@ impl StructuredResidualModel {
     }
 
     /// Damped per-row metric for the #2021 driver: blend covariances in the
-    /// **covariance domain** (before the Woodbury→Cholesky) between this model's
+    /// **covariance domain** (before the Cholesky whitening) between this model's
     /// estimate and a previous one,
     /// ```text
     ///   Σ_t(row) = (1 − γ) · Σ_prev(row) + γ · Σ̂_t(row),
     /// ```
     /// where `Σ̂_t(row) = c_t(z)·ΛΛᵀ + D` is this model's per-row covariance
-    /// (built from the hoisted-M0 / occupancy-weighted `c(z)` path), and
+    /// (built from the hoisted-Gram / occupancy-weighted `c(z)` path), and
     /// `Σ_prev(row)` is `prev`'s per-row covariance when `Some`, else the
     /// MEASURED iid anchor `φ̂·I_p` (`Self::isotropic_dispersion`, #2243 cap
     /// #2: a unit `I_p` anchor silently assumed unit noise, which on
@@ -480,8 +447,7 @@ impl StructuredResidualModel {
     /// clean-data over-penalization).
     ///
     /// Endpoints (exact):
-    /// * `γ = 1.0` ⇒ this model's [`Self::row_metric`] exactly (Woodbury path,
-    ///   byte-identical);
+    /// * `γ = 1.0` ⇒ this model's [`Self::row_metric`] exactly (byte-identical);
     /// * `γ = 0.0` ⇒ `prev`'s [`Self::row_metric`] when `Some` (byte-identical),
     ///   else the measured-scale identity `(φ̂·I)^{-1}` factors.
     ///
@@ -542,7 +508,7 @@ impl StructuredResidualModel {
         let self_gram = outer_product(&self.lambda);
         let prev_gram = prev.map(|pv| outer_product(&pv.lambda));
 
-        // Per-row blend + invert + Cholesky, parallelized over rows exactly as
+        // Per-row blend + Cholesky whitening, parallelized over rows exactly as
         // in [`Self::row_metric`]: rows are independent (each writes only its
         // own p² chunk of `u`, no cross-row reduction), so the parallel stack is
         // bit-identical to the serial one, with the same engagement discipline
@@ -592,8 +558,9 @@ impl StructuredResidualModel {
     }
 
     /// One row of the damped-metric stack: assemble the convex-blend covariance
-    /// `Σ_t(row) = γ·(c·ΛΛᵀ + D) + (1−γ)·Σ_prev(row)`, symmetrize, invert, and
-    /// write the lower-Cholesky precision factor into `urow` (row-major `p×p`).
+    /// `Σ_t(row) = γ·(c·ΛΛᵀ + D) + (1−γ)·Σ_prev(row)`, symmetrize, and write
+    /// its whitening factor `U = L^{-ᵀ}` (`Σ_t = L Lᵀ`) into `urow` (row-major
+    /// `p×p`).
     /// Factored out of [`Self::row_metric_damped`] so the serial and parallel
     /// row drivers share one arithmetic body. `iid_anchor` is the measured
     /// isotropic dispersion `φ̂` used as `Σ_prev = φ̂·I` when `prev` is `None`
@@ -642,7 +609,7 @@ impl StructuredResidualModel {
                 );
             }
         }
-        // Symmetrize against round-off before inversion.
+        // Symmetrize against round-off before the Cholesky.
         for a in 0..p {
             for b in (a + 1)..p {
                 let avg = 0.5 * (sigma[[a, b]] + sigma[[b, a]]);
@@ -650,75 +617,12 @@ impl StructuredResidualModel {
                 sigma[[b, a]] = avg;
             }
         }
-        // Σ_t is a convex combination of SPD matrices (D ≻ 0 / I ≻ 0) ⇒ SPD.
-        // Precision = Σ_t^{-1} via a Cholesky solve against I_p, then the U_n
-        // factor is the lower-Cholesky of the precision (row_metric's U
-        // convention).
-        let precision = invert_spd(&sigma)?;
-        let factor = lower_cholesky_psd(&precision)?;
-        for i in 0..p {
-            for k in 0..p {
-                urow[i * p + k] = factor[[i, k]];
-            }
-        }
-        Ok(())
-    }
-
-    /// Per-row precision `Σ_n^{-1}` via the Woodbury identity (an `r × r` solve),
-    /// given the row-independent parts precomputed by [`Self::row_metric`]:
-    /// `d_inv = D^{-1}`, `b = D^{-1}Λ`, `bt = Bᵀ`, and the Gram `m0 = ΛᵀD^{-1}Λ`.
-    /// Only the per-row capacitance `M_n = m0 + c_n^{-1} I_r` and the back-solve
-    /// depend on the row.
-    fn row_precision(
-        &self,
-        d_inv: &[f64],
-        b: &Array2<f64>,
-        bt: &Array2<f64>,
-        m0: &Array2<f64>,
-        row: usize,
-    ) -> Result<Array2<f64>, String> {
-        let p = self.p;
-        let r = self.factor_rank;
-        // Start from D^{-1}.
-        let mut precision = Array2::<f64>::zeros((p, p));
-        for i in 0..p {
-            precision[[i, i]] = d_inv[i];
-        }
-        if r == 0 {
-            return Ok(precision);
-        }
-        let c = self.row_scale[row].max(f64::MIN_POSITIVE);
-        // Per-row capacitance M_n = M0 + c^{-1} I_r (copy the hoisted Gram, then
-        // add c^{-1} to the diagonal). M_n ≻ 0 since c^{-1} > 0 and M0 ⪰ 0.
-        let mut cap = m0.clone();
-        for a in 0..r {
-            cap[[a, a]] += 1.0 / c;
-        }
-        // Σ_n^{-1} = D^{-1} − B M_n^{-1} Bᵀ. Solve M_n X = Bᵀ for X = M_n^{-1} Bᵀ
-        // (r × p) via Cholesky.
-        let chol = cap
-            .cholesky(Side::Lower)
-            .map_err(|e| format!("StructuredResidualModel::row_precision capacitance: {e:?}"))?;
-        let x = chol.solve_mat(bt); // r × p
-        for i in 0..p {
-            for j in 0..p {
-                let mut acc = 0.0_f64;
-                for k in 0..r {
-                    acc += b[[i, k]] * x[[k, j]];
-                }
-                precision[[i, j]] -= acc;
-            }
-        }
-        // Symmetrize against round-off so the Cholesky downstream sees an exactly
-        // symmetric PSD matrix.
-        for i in 0..p {
-            for j in (i + 1)..p {
-                let avg = 0.5 * (precision[[i, j]] + precision[[j, i]]);
-                precision[[i, j]] = avg;
-                precision[[j, i]] = avg;
-            }
-        }
-        Ok(precision)
+        // Σ_t is a convex combination of SPD matrices (D ≻ 0 / φ̂·I ≻ 0) ⇒ SPD,
+        // so it is whitened through its own Cholesky exactly as in
+        // [`Self::row_metric`].
+        covariance_whitening_factor(&sigma, urow).map_err(|e| {
+            format!("StructuredResidualModel::row_metric_damped row {row}: {e}")
+        })
     }
 }
 
@@ -742,66 +646,36 @@ fn outer_product(lambda: &Array2<f64>) -> Array2<f64> {
     g
 }
 
-/// Inverse of a symmetric positive-definite matrix via a Cholesky solve against
-/// the identity, symmetrized against round-off. Used to form `Σ_t^{-1}` from a
-/// densely-blended covariance in [`StructuredResidualModel::row_metric_damped`]
-/// (the blended covariance is no longer low-rank-plus-diagonal, so Woodbury does
-/// not apply).
-fn invert_spd(a: &Array2<f64>) -> Result<Array2<f64>, String> {
-    let p = a.nrows();
-    let chol = a
+/// Whitening factor of an SPD covariance: Cholesky `Σ = L Lᵀ`, then write
+/// `U = L^{-ᵀ}` into `urow` (row-major `p×p`, `urow[i*p + k] = U[i, k]`), so
+/// `U Uᵀ = L^{-ᵀ} L^{-1} = Σ^{-1}` and `Uᵀ r = L^{-1} r`. `L^{-1}` is formed
+/// column by column by forward substitution on `L x = e_j`. The precision is
+/// never assembled, and a covariance that does not factor is an error (the
+/// fitted model guarantees `Σ ≻ 0`, so a failure is a genuine defect upstream).
+fn covariance_whitening_factor(sigma: &Array2<f64>, urow: &mut [f64]) -> Result<(), String> {
+    let p = sigma.nrows();
+    debug_assert_eq!(urow.len(), p * p);
+    let l = sigma
         .cholesky(Side::Lower)
-        .map_err(|e| format!("invert_spd: blended covariance not SPD: {e:?}"))?;
-    let mut inv = chol.solve_mat(&Array2::<f64>::eye(p));
-    for i in 0..p {
-        for j in (i + 1)..p {
-            let avg = 0.5 * (inv[[i, j]] + inv[[j, i]]);
-            inv[[i, j]] = avg;
-            inv[[j, i]] = avg;
-        }
-    }
-    Ok(inv)
-}
-
-/// Ascending-eigenvalue symmetric eigendecomposition (faer convention).
-fn symmetric_eig_ascending(m: &Array2<f64>) -> Result<(Array1<f64>, Array2<f64>), String> {
-    m.eigh(Side::Lower)
-        .map_err(|e| format!("symmetric_eig: {e:?}"))
-}
-
-/// Lower-triangular Cholesky factor `L` of a (numerically) PSD matrix `A` with
-/// `L Lᵀ = A`, with a relative spectral floor so a marginally-indefinite
-/// precision (round-off) still factors. Used to turn `Σ_n^{-1}` into the
-/// `RowMetric` factor `U_n` (here `U_n = L`).
-fn lower_cholesky_psd(a: &Array2<f64>) -> Result<Array2<f64>, String> {
-    if let Ok(chol) = a.cholesky(Side::Lower) {
-        return Ok(chol.lower_triangular());
-    }
-    // Eigen-repair: clamp eigenvalues to a small positive floor, rebuild the
-    // REPAIRED matrix Q·diag(λ_clamped)·Qᵀ itself, and Cholesky that (always
-    // succeeds, PD). The returned factor must satisfy L·Lᵀ = A_repaired —
-    // rebuilding the symmetric square root here and factoring THAT would hand
-    // callers a factor with L·Lᵀ = A^{1/2}, silently taking every whitened
-    // quadratic form against the square root of the intended precision.
-    let (evals, evecs) = symmetric_eig_ascending(a)?;
-    let max_ev = evals.iter().copied().fold(0.0_f64, f64::max).max(1.0);
-    let floor = 1e-10 * max_ev;
-    let p = a.nrows();
-    let mut repaired = Array2::<f64>::zeros((p, p));
-    for i in 0..p {
-        for j in 0..p {
-            let mut acc = 0.0_f64;
-            for k in 0..p {
-                let ev = evals[k].max(floor);
-                acc += evecs[[i, k]] * ev * evecs[[j, k]];
+        .map_err(|e| format!("residual covariance is not SPD: {e:?}"))?
+        .lower_triangular();
+    urow.fill(0.0);
+    let mut x = vec![0.0_f64; p];
+    for j in 0..p {
+        // Column j of L^{-1}: x_i = 0 for i < j (L^{-1} is lower triangular).
+        for i in j..p {
+            let mut acc = if i == j { 1.0 } else { 0.0 };
+            for k in j..i {
+                acc -= l[[i, k]] * x[k];
             }
-            repaired[[i, j]] = acc;
+            x[i] = acc / l[[i, i]];
+        }
+        // U = (L^{-1})ᵀ ⇒ U[j, i] = L^{-1}[i, j].
+        for i in j..p {
+            urow[j * p + i] = x[i];
         }
     }
-    repaired
-        .cholesky(Side::Lower)
-        .map(|c| c.lower_triangular())
-        .map_err(|e| format!("lower_cholesky_psd eigen-repair: {e:?}"))
+    Ok(())
 }
 
 #[cfg(test)]
