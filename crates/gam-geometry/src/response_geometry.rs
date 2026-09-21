@@ -1390,8 +1390,13 @@ pub struct ResponseCurvatureFit {
     /// caller must report it as such and never as a silent `κ̂ = ci_hi`.
     pub railed_at_resolution_limit: bool,
     /// Twin of [`railed_at_resolution_limit`](Self::railed_at_resolution_limit)
-    /// for the HYPERBOLIC side (#2351): `true` when the κ̂ search converged ONTO
-    /// the lower chart-domain bound — the criterion is still improving as κ
+    /// for the HYPERBOLIC side (#2351), set by the same rule (#3629): `true`
+    /// exactly when the box-constrained minimum is the lower chart-domain
+    /// bound itself, i.e. the active-bound KKT condition `V'(κ_min) ≥ 0` holds.
+    /// A stationary point strictly inside the chart is a resolved κ̂, however
+    /// close to `κ_min` it lies; whether the data bound κ from below inside
+    /// the chart is reported by `profile_ci.lo_at_bound`. At the rail the
+    /// criterion is still improving as κ
     /// decreases at the limit where the cloud fills the hyperbolic ball of its
     /// own spread (the mean-centred chart-validity edge `1 + κ‖z_max‖² → 0⁺`,
     /// where the conformal restoring force diverges linearly and beats the
@@ -1837,6 +1842,13 @@ pub fn fit_response_curvature(
     // bound whose score points outward is the constrained minimum itself.
     let lower = response_curvature_criterion_jet(values, dim, kappa_min)?;
     let upper = response_curvature_criterion_jet(values, dim, kappa_max)?;
+    // Both rail flags come from this one rule, the exact active-bound KKT
+    // condition, and from nothing else (#3629). A score root strictly inside
+    // the chart is a stationary point of `V_p`, i.e. a resolved maximum-
+    // likelihood κ̂, however close it sits to a bound. How far the DATA can
+    // push κ toward the bound is a separate question, and the profile CI
+    // answers it (`profile_ci.lo_at_bound` / `hi_at_bound`), so it is not
+    // duplicated here with a proximity band.
     let (jet, railed_at_resolution_limit, railed_at_hyperbolic_bound) = if lower.score >= 0.0 {
         // V'(κ_min) ≥ 0: the constrained minimum sits ON the hyperbolic
         // chart-domain bound — the criterion is still improving as κ decreases
@@ -1858,21 +1870,9 @@ pub fn fit_response_curvature(
         (root, false, false)
     };
     let kappa_hat = jet.kappa;
-    // #2351: the hyperbolic rail flag must also fire on the BOUNDARY-LAYER
-    // interior optimum. Near the chart-domain edge the conformal restoring
-    // force diverges and can pin a nominally-interior stationary point a
-    // fraction of a percent inside κ_min (measured on isotropic unit-vector
-    // clouds: κ̂/κ_min ≈ 0.997 with p → 0). Dimensionlessly, κ̂ ≤ 0.99·κ_min
-    // means the fitted curvature says the cloud fills ≥ 99% of the hyperbolic
-    // ball of its own spread — the estimate is chart-limited, not resolved,
-    // regardless of whether the KKT condition binds exactly AT the bound.
-    let railed_at_hyperbolic_resolution_limit =
-        railed_at_hyperbolic_bound || kappa_hat <= 0.99 * kappa_min;
     let v_p_hat = jet.value;
     let base = jet.base.clone();
 
-    // The upper rail flag comes only from the exact active-bound KKT condition
-    // `V'(κ_max) ≤ 0`; proximity to a bound is not treated as convergence.
     // Dimensionless scale-free invariant κ̂·r²: the geometric content the cloud
     // actually determines (invariant under y ↦ αy). r = ρ_max is the κ=0 doubled-
     // gauge characteristic radius; for a degenerate (point) cloud r = 0 and the
@@ -1908,7 +1908,7 @@ pub fn fit_response_curvature(
         kappa_r2,
         characteristic_radius: rho_max,
         railed_at_resolution_limit,
-        railed_at_hyperbolic_resolution_limit,
+        railed_at_hyperbolic_resolution_limit: railed_at_hyperbolic_bound,
         sign_resolved,
         base,
         v_p_hat,

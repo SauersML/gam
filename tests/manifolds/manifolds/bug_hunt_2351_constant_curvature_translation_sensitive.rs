@@ -99,25 +99,33 @@ fn constant_curvature_verdict_is_translation_invariant() {
         away_from_origin.railed_at_resolution_limit,
     );
 
-    // Isotropic random unit vectors carry no genuine curvature signal beyond
-    // living on a sphere by construction; neither fit should claim a
-    // maximally confident (p < 1e-6) verdict of either sign, since that
-    // confidence has nowhere honest to come from for pure noise directions.
-    // #2351 twin-flag contract: EITHER rail flag is the honest
-    // "not a resolved point estimate" report. Unit-normalized isotropic
-    // vectors centred at their mean genuinely fill the hyperbolic ball of
-    // their own spread, so the search rails at the hyperbolic chart-domain
-    // bound and the HYPERBOLIC flag fires — the confident-looking p-value is
-    // explicitly disclaimed by that flag.
+    // A confident verdict here is only honest if the likelihood itself
+    // resolves it, not the chart edge. Mean-centred unit vectors are a thin
+    // shell: every ‖z_i‖ ≈ 1. In the constant-curvature model that radial law
+    // is real signal. Under a flat isotropic Gaussian the radii would follow a
+    // chi law, while hyperbolic volume growth concentrates the geodesic radii,
+    // so the flat member is rejected decisively (LR ≈ 1.8e3 on this seed).
+    // The optimum is a stationary point strictly inside the chart
+    // (κ̂/κ_min ≈ 0.9998), and the profile rises by ≈ 20 log-units between κ̂
+    // and κ_min, far past the χ²₁ half-threshold 1.92. So the CI closes on
+    // both sides inside the chart and neither rail's KKT condition binds
+    // (#3629). The earlier contract flagged this optimum through a
+    // `κ̂ ≤ 0.99·κ_min` proximity band that nothing derived.
     assert!(
-        at_origin.flatness.p_value > 1e-6
-            || at_origin.railed_at_resolution_limit
-            || at_origin.railed_at_hyperbolic_resolution_limit,
-        "unresolved-signal cloud reported a maximally confident, unflagged verdict: \
-         kappa_hat={} verdict={:?} p={} railed={} railed_hyperbolic={}",
+        !at_origin.railed_at_resolution_limit
+            && !at_origin.railed_at_hyperbolic_resolution_limit
+            && !at_origin.profile_ci.lo_at_bound
+            && !at_origin.profile_ci.hi_at_bound,
+        "shell cloud's hyperbolic optimum should be a resolved interior estimate: \
+         kappa_hat={} verdict={:?} p={} ci=[{}, {}] lo_at_bound={} hi_at_bound={} \
+         railed={} railed_hyperbolic={}",
         at_origin.kappa_hat,
         at_origin.profile_ci.verdict,
         at_origin.flatness.p_value,
+        at_origin.profile_ci.ci_lo,
+        at_origin.profile_ci.ci_hi,
+        at_origin.profile_ci.lo_at_bound,
+        at_origin.profile_ci.hi_at_bound,
         at_origin.railed_at_resolution_limit,
         at_origin.railed_at_hyperbolic_resolution_limit,
     );
