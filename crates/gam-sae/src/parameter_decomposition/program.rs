@@ -868,17 +868,6 @@ impl Program {
     pub fn parts(&self) -> &ProgramParts {
         &self.parts
     }
-
-    /// The mask group a control belongs to.
-    pub fn mask_group_of(&self, control: ControlId) -> Option<MaskGroupId> {
-        self.control_group.get(control.index()).copied()
-    }
-
-    /// Every control a body reaches, directly or through the bodies it calls,
-    /// composes or refines, in increasing order.
-    pub fn controls_reached(&self, body: BodyId) -> Option<&[ControlId]> {
-        self.controls_below.get(body.index()).map(Vec::as_slice)
-    }
 }
 
 fn callee_body(parts: &ProgramParts, body: BodyId) -> Result<&Body, ProgramError> {

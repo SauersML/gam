@@ -683,14 +683,6 @@ pub(crate) fn encode_iterate(
     serde_json::to_vec(&p).ok()
 }
 
-/// The cache payload of a prior fit's certified outer point, for a caller that
-/// resumes a new fit from it (`warm_start_from`). The optimizer decodes it like
-/// its own checkpoints, so the point is recertified on the new fit, never
-/// trusted.
-pub fn encode_outer_warm_start(rho: &Array1<f64>, beta: &Array1<f64>) -> Option<Vec<u8>> {
-    encode_iterate(rho, Some(beta), None, 0.0, 0)
-}
-
 pub(crate) fn decode_iterate(bytes: &[u8], expected_rho_dim: usize) -> Option<IteratePayload> {
     let mut p: IteratePayload = serde_json::from_slice(bytes).ok()?;
     if p.schema != ITERATE_PAYLOAD_SCHEMA {

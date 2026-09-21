@@ -5188,5 +5188,28 @@
     },
     "reason": "#3551 (PR #3700): the PIRLS dense Newton direction is solved on one route on every host. On a CUDA host solve_newton_direction_dense sent the raw Hessian to a device Cholesky through this gam-solve wrapper, with no size gate and no residual certificate, and a non-finite device direction was silently redone on the CPU; an indefinite Hessian (a delayed-entry survival fit away from its mode) failed that factorization and errored the fit where a CPU-only host took the #2814 Gill-Murray descent step. The direction is now always taken on descent_curvature(H), whose own positive-definiteness test is a host Cholesky of the same p x p matrix, so a device factorization could only repeat that O(p^3) work. The wrapper's sole caller was that deleted branch, so it is deleted rather than kept as an unused shim; gam_gpu::solver::cholesky_solve_only_gpu, which it delegated to, stays and remains the one device solve entry point for the arrow_gpu tests. The entry was omitted at landing and is added by the post-merge review of PR #3700; it is keyed to the merge's first parent because the PR's own merge base already carries the unrelated #2902 acknowledgement and the ledger admits one acknowledgement per base.",
     "evidence": "public_api_census.py / source_removal_guard.py --base 4264017cf3e02c0d49e7d22735d126f3d9114a81 --head cc06872445ab1509ffdad485764ebe6710285f3f (the PR #3700 merge) observe exactly this removal: that range touches only CHANGELOG.md, crates/gam-solve/src/gpu/pirls_gpu.rs and crates/gam-solve/src/pirls/newton_solve.rs, and the single declaration line it deletes is 'pub fn cholesky_solve_only_gpu('. At the first parent the function's only call is the CUDA branch of solve_newton_direction_dense, which the same change deletes. At origin/main 69b85f3adc35763639a38cf003cb48068a37b004 the name occurs 0 times in crates/gam-solve/src/gpu/pirls_gpu.rs; the surviving occurrences are the gam-gpu declaration crates/gam-gpu/src/solver.rs:1073 and its three arrow_gpu test callers (gpu_solver_dimension_mismatch_returns_error.rs, gpu_solver_matches_cpu_on_small_spd_system.rs, misc/owed_1412.rs). CHANGELOG.md carries the behaviour entry."
+  },
+  {
+    "base": "63dc278284ba6535d9c14a257ff64aa04dff6e0a",
+    "removed": {
+      "crates/gam-problem/src/lib.rs::has_operator": 1,
+      "crates/gam-sae/src/attention_kernel.rs::fit_separable_kernel": 1,
+      "crates/gam-sae/src/attention_kernel.rs::fit_stationary_kernel": 1,
+      "crates/gam-sae/src/parameter_decomposition/field.rs::instance_moments": 1,
+      "crates/gam-sae/src/parameter_decomposition/program.rs::controls_reached": 1,
+      "crates/gam-sae/src/parameter_decomposition/program.rs::mask_group_of": 1,
+      "crates/gam-sae/src/response/hermite.rs::support_energies": 1,
+      "crates/gam-solve/src/rho_optimizer/objective.rs::encode_outer_warm_start": 1,
+      "crates/gam-terms/src/analytic_penalties/isometry.rs::set_jacobian_cache": 1,
+      "crates/gam-terms/src/analytic_penalties/isometry.rs::with_jacobian_cache": 1,
+      "crates/gam-terms/src/analytic_penalties/isometry.rs::with_jacobian_second_cache": 1,
+      "crates/gam-terms/src/inference/formula_dsl.rs::formula_rhs_text": 1,
+      "crates/gam-terms/src/inference/formula_dsl.rs::likelihood_spec_supports_joint_wiggle": 1,
+      "crates/gam-terms/src/inference/formula_dsl.rs::linkchoice_supports_joint_wiggle": 1,
+      "crates/gam-terms/src/inference/formula_dsl.rs::require_likelihood_spec_supports_joint_wiggle": 1,
+      "crates/gam-terms/src/inference/formula_dsl.rs::require_linkchoice_supports_joint_wiggle": 1
+    },
+    "reason": "#4165: dead code with no caller anywhere in the repo. Each name occurs on exactly one line at the base (its own declaration). encode_outer_warm_start's doc claimed warm_start_from used it; warm_start_from goes through FitArtifacts::outer_warm_start and OuterProblem::with_warm_start. set_jacobian_cache, linkchoice_supports_joint_wiggle and likelihood_spec_supports_joint_wiggle were pub(crate) helpers whose only non-test caller was a deleted fn; the two isometry tests call the pub refresh_caches instead.",
+    "evidence": "https://github.com/SauersML/gam/issues/4165"
   }
 ]

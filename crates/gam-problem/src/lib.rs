@@ -915,10 +915,6 @@ impl HyperCoordDrift {
         }
     }
 
-    pub fn has_operator(&self) -> bool {
-        self.operator.is_some()
-    }
-
     pub fn uses_operator_fast_path(&self) -> bool {
         self.operator.is_some() || self.block_local.is_some()
     }

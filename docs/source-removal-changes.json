@@ -2566,8 +2566,8 @@
     ],
     "reason": "#3749: gam predict selected its coefficient covariance through a hand-rolled copy of gam-predict's selected_uncertainty_backend that had drifted (no coefficient-gauge lift, only the expectile covariance decline refused, no dimension checks). prediction_backend_from_model and covariance_from_model now call UncertaintyCovarianceSource::select_uncertainty_backend, so the copy's private helper factorized_covariance_fallback and its refusal text SMOOTHING_CORRECTED_ABSENT have no caller; the #2677 guidance that constant carried is kept as CLI context on the library's absent-correction refusal.",
     "evidence": "scripts/source_removal_guard.py with --base 6f2b3d221808fe901975935e854ed71355a7f9e3 and head the change's commit lists exactly these two removals. Read-proof at the head: git grep -w finds no occurrence of factorized_covariance_fallback or SMOOTHING_CORRECTED_ABSENT anywhere in the repository; both were private to crates/gam-cli/src/main/model_summary.rs, whose only consumers were the two functions rewritten here."
-    },
-    {
+  },
+  {
     "base": "5994ad54c4c39f086905591da98990d8a21a87dd",
     "items": [
       "crates/gam-predict/src/large_scale_reml_stress_tests.rs:const:NORMAL_95_TWO_SIDED_Z"
@@ -3772,5 +3772,29 @@
     ],
     "reason": "#3551 (PR #3700): the PIRLS dense Newton direction is solved on one route on every host. On a CUDA host solve_newton_direction_dense sent the raw Hessian to a device Cholesky through this gam-solve wrapper, with no size gate and no residual certificate, and a non-finite device direction was silently redone on the CPU; an indefinite Hessian (a delayed-entry survival fit away from its mode) failed that factorization and errored the fit where a CPU-only host took the #2814 Gill-Murray descent step. The direction is now always taken on descent_curvature(H), whose own positive-definiteness test is a host Cholesky of the same p x p matrix, so a device factorization could only repeat that O(p^3) work. The wrapper's sole caller was that deleted branch, so it is deleted rather than kept as an unused shim; gam_gpu::solver::cholesky_solve_only_gpu, which it delegated to, stays and remains the one device solve entry point for the arrow_gpu tests. The entry was omitted at landing and is added by the post-merge review of PR #3700; it is keyed to the merge's first parent because the PR's own merge base already carries the unrelated #2902 acknowledgement and the ledger admits one acknowledgement per base.",
     "evidence": "public_api_census.py / source_removal_guard.py --base 4264017cf3e02c0d49e7d22735d126f3d9114a81 --head cc06872445ab1509ffdad485764ebe6710285f3f (the PR #3700 merge) observe exactly this removal: that range touches only CHANGELOG.md, crates/gam-solve/src/gpu/pirls_gpu.rs and crates/gam-solve/src/pirls/newton_solve.rs, and the single declaration line it deletes is 'pub fn cholesky_solve_only_gpu('. At the first parent the function's only call is the CUDA branch of solve_newton_direction_dense, which the same change deletes. At origin/main 69b85f3adc35763639a38cf003cb48068a37b004 the name occurs 0 times in crates/gam-solve/src/gpu/pirls_gpu.rs; the surviving occurrences are the gam-gpu declaration crates/gam-gpu/src/solver.rs:1073 and its three arrow_gpu test callers (gpu_solver_dimension_mismatch_returns_error.rs, gpu_solver_matches_cpu_on_small_spd_system.rs, misc/owed_1412.rs). CHANGELOG.md carries the behaviour entry."
+  },
+  {
+    "base": "63dc278284ba6535d9c14a257ff64aa04dff6e0a",
+    "items": [
+      "crates/gam-problem/src/lib.rs:fn:has_operator",
+      "crates/gam-sae/src/attention_kernel.rs:fn:fit_separable_kernel",
+      "crates/gam-sae/src/attention_kernel.rs:fn:fit_stationary_kernel",
+      "crates/gam-sae/src/parameter_decomposition/field.rs:fn:instance_moments",
+      "crates/gam-sae/src/parameter_decomposition/program.rs:fn:controls_reached",
+      "crates/gam-sae/src/parameter_decomposition/program.rs:fn:mask_group_of",
+      "crates/gam-sae/src/response/hermite.rs:fn:support_energies",
+      "crates/gam-sae/src/response/hermite.rs:struct:SupportEnergy",
+      "crates/gam-solve/src/rho_optimizer/objective.rs:fn:encode_outer_warm_start",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:set_jacobian_cache",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:with_jacobian_cache",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:with_jacobian_second_cache",
+      "crates/gam-terms/src/inference/formula_dsl.rs:fn:formula_rhs_text",
+      "crates/gam-terms/src/inference/formula_dsl.rs:fn:likelihood_spec_supports_joint_wiggle",
+      "crates/gam-terms/src/inference/formula_dsl.rs:fn:linkchoice_supports_joint_wiggle",
+      "crates/gam-terms/src/inference/formula_dsl.rs:fn:require_likelihood_spec_supports_joint_wiggle",
+      "crates/gam-terms/src/inference/formula_dsl.rs:fn:require_linkchoice_supports_joint_wiggle"
+    ],
+    "reason": "#4165: dead code with no caller anywhere in the repo. Each name occurs on exactly one line at the base (its own declaration). encode_outer_warm_start's doc claimed warm_start_from used it; warm_start_from goes through FitArtifacts::outer_warm_start and OuterProblem::with_warm_start. set_jacobian_cache, linkchoice_supports_joint_wiggle and likelihood_spec_supports_joint_wiggle were pub(crate) helpers whose only non-test caller was a deleted fn; the two isometry tests call the pub refresh_caches instead.",
+    "evidence": "https://github.com/SauersML/gam/issues/4165"
   }
 ]

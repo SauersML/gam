@@ -8,7 +8,7 @@ use crate::removed_spellings;
 use crate::smooth::BoundedCoefficientPriorSpec;
 use crate::term_builder::{MARGINAL_SLOPE_Z_ALIAS, marginal_slope_z_alias_is_live};
 use gam_problem::types::{
-    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, StandardLink, WigglePenaltyConfig,
+    InverseLink, LinkComponent, LinkFunction, StandardLink, WigglePenaltyConfig,
 };
 
 #[derive(Parser)]
@@ -2143,39 +2143,6 @@ pub(crate) const fn linkname_supports_joint_wiggle(link: LinkFunction) -> bool {
     !matches!(link, LinkFunction::Sas | LinkFunction::BetaLogistic)
 }
 
-pub(crate) const fn linkchoice_supports_joint_wiggle(choice: &LinkChoice) -> bool {
-    match &choice.mixture_components {
-        None => linkname_supports_joint_wiggle(choice.link),
-        Some(_) => false,
-    }
-}
-
-pub fn require_linkchoice_supports_joint_wiggle(
-    choice: &LinkChoice,
-    context: &str,
-) -> Result<(), String> {
-    if linkchoice_supports_joint_wiggle(choice) {
-        Ok(())
-    } else {
-        Err(joint_wiggle_unsupported_link_message(context))
-    }
-}
-
-pub(crate) const fn likelihood_spec_supports_joint_wiggle(likelihood: &LikelihoodSpec) -> bool {
-    inverse_link_supports_joint_wiggle(&likelihood.link)
-}
-
-pub fn require_likelihood_spec_supports_joint_wiggle(
-    likelihood: &LikelihoodSpec,
-    context: &str,
-) -> Result<(), String> {
-    if likelihood_spec_supports_joint_wiggle(likelihood) {
-        Ok(())
-    } else {
-        Err(joint_wiggle_unsupported_link_message(context))
-    }
-}
-
 /// Family-agnostic capability of the joint link-wiggle machinery: which base
 /// inverse links a monotone warp can be fit over AND reconstructed from at
 /// predict time. Every state-less standard link qualifies — the warp fit and
@@ -2793,17 +2760,6 @@ fn parse_bounded_priorspec(
 // ---------------------------------------------------------------------------
 // Top-level formula and term parsers
 // ---------------------------------------------------------------------------
-
-pub fn formula_rhs_text(formula: &str) -> Result<String, String> {
-    let parsed = parse_formula_dsl(formula)?;
-    if parsed.rhs_terms.is_empty() {
-        return Err(FormulaDslError::ParseError {
-            reason: "formula right-hand side cannot be empty".to_string(),
-        }
-        .into());
-    }
-    Ok(parsed.rhs_terms.join(" + "))
-}
 
 /// Parsed Surv(...) response specification.
 ///
