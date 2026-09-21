@@ -55,6 +55,7 @@ const ROW_HV_THREADS: u32 = 32;
 /// All buffers are borrowed views over host memory; the launcher uploads
 /// them once per call. Future Phase 5 work will introduce a device-resident
 /// twin that skips the upload.
+#[derive(Clone, Copy)]
 pub(crate) struct RowHessianMatvecInputs<'a> {
     /// Number of observation rows.
     pub n_rows: usize,
@@ -80,6 +81,7 @@ pub(crate) struct RowHessianMatvecOutputs {
 }
 
 /// Per-call input bundle for [`launch_row_hessian_diag`].
+#[derive(Clone, Copy)]
 pub(crate) struct RowHessianDiagInputs<'a> {
     /// Number of observation rows.
     pub n_rows: usize,
@@ -430,8 +432,132 @@ fn launch_diag_linux(inputs: RowHessianDiagInputs<'_>) -> Result<RowHessianDiagO
     Ok(RowHessianDiagOutputs { d_rows })
 }
 
-/// CPU execution of the same per-row Hessian matvec. This is the live
-/// non-CUDA route used by the host-pin joint-Hessian consumers.
+/// Which executor runs `kernel` over `n_rows` host-resident row Hessians of
+/// width `r`: the one row-kernel decision (gam#3024), sized by the kernel's
+/// own executors timed on this shape. The rows live in host memory, so the
+/// device executor pays an upload of `n_rows·r²` values on every call and
+/// nothing about a device's presence says it is the faster; a shape the
+/// process has not timed is raced. The CPU executors are one sequential loop,
+/// so their worker count is one.
+fn host_row_hessian_decision(
+    kernel: gam_gpu::GpuKernel,
+    n_rows: usize,
+    r: usize,
+    operation: &str,
+) -> Result<gam_gpu::GpuDecision, String> {
+    let decision = gam_gpu::decide_row_kernel(
+        gam_gpu::global_policy(),
+        gam_gpu::RowKernelAdmission {
+            missing_capability: None,
+            compiled: cfg!(target_os = "linux"),
+            shape: gam_gpu::RowKernelShape {
+                kernel,
+                rows: n_rows,
+                widths: [r, 0, 0, 0],
+                threads: 1,
+            },
+        },
+        &mut gam_gpu::RuntimeDeviceProbe,
+    )
+    .map_err(|error| format!("BMS {operation}: {error}"))?;
+    decision.clone().log();
+    decision
+        .require_supported()
+        .map_err(|error| format!("BMS {operation}: {error}"))?;
+    Ok(decision)
+}
+
+/// Run a host-resident row-Hessian operation on the executor `decision`
+/// selects: a race returns the CPU product; a selected device's fault is
+/// returned, never recomputed on the CPU.
+fn on_selected_executor<T>(
+    decision: gam_gpu::GpuDecision,
+    cpu: impl FnOnce() -> T,
+    mut device: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    if let Some(shape) = decision.race {
+        return gam_gpu::race_row_kernel(shape, || Ok(cpu()), || device().map(|_| ()));
+    }
+    if decision.use_gpu {
+        return device();
+    }
+    Ok(cpu())
+}
+
+/// The device executor of a platform that compiles none. The decision is
+/// admitted with `compiled: false` there, so it never selects this.
+#[cfg(not(target_os = "linux"))]
+fn no_device_executor<T>(operation: &str) -> Result<T, String> {
+    Err(format!(
+        "BMS {operation}: no device executor is compiled on this platform"
+    ))
+}
+
+/// `y_i = H_i · v_i` for every host-resident row, on the executor
+/// [`host_row_hessian_decision`] selects.
+pub(crate) fn row_hessian_matvec(
+    operation: &str,
+    inputs: RowHessianMatvecInputs<'_>,
+) -> Result<Vec<f64>, String> {
+    let decision = host_row_hessian_decision(
+        gam_gpu::GpuKernel::RowHessianMatvec,
+        inputs.n_rows,
+        inputs.r,
+        operation,
+    )?;
+    on_selected_executor(
+        decision,
+        || cpu_row_hessian_matvec(&inputs),
+        || {
+            #[cfg(target_os = "linux")]
+            {
+                crate::bms::gpu::flex::require_selected_gpu_result(
+                    operation,
+                    launch_row_hessian_matvec(inputs),
+                )
+                .map(|outputs| outputs.y_rows)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                no_device_executor(operation)
+            }
+        },
+    )
+}
+
+/// `diag(H_i)` for every host-resident row, on the executor
+/// [`host_row_hessian_decision`] selects, as [`row_hessian_matvec`] does.
+pub(crate) fn row_hessian_diag(
+    operation: &str,
+    inputs: RowHessianDiagInputs<'_>,
+) -> Result<Vec<f64>, String> {
+    let decision = host_row_hessian_decision(
+        gam_gpu::GpuKernel::RowHessianDiagonal,
+        inputs.n_rows,
+        inputs.r,
+        operation,
+    )?;
+    on_selected_executor(
+        decision,
+        || cpu_row_hessian_diag(&inputs),
+        || {
+            #[cfg(target_os = "linux")]
+            {
+                crate::bms::gpu::flex::require_selected_gpu_result(
+                    operation,
+                    launch_row_hessian_diag(inputs),
+                )
+                .map(|outputs| outputs.d_rows)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                no_device_executor(operation)
+            }
+        },
+    )
+}
+
+/// CPU execution of the same per-row Hessian matvec.
 pub(crate) fn cpu_row_hessian_matvec(inputs: &RowHessianMatvecInputs<'_>) -> Vec<f64> {
     let n = inputs.n_rows;
     let r = inputs.r;
@@ -450,8 +576,7 @@ pub(crate) fn cpu_row_hessian_matvec(inputs: &RowHessianMatvecInputs<'_>) -> Vec
     y
 }
 
-/// CPU execution of the same per-row Hessian diagonal extraction. This is the
-/// live non-CUDA route used by the host-pin preconditioner consumers.
+/// CPU execution of the same per-row Hessian diagonal extraction.
 pub(crate) fn cpu_row_hessian_diag(inputs: &RowHessianDiagInputs<'_>) -> Vec<f64> {
     let n = inputs.n_rows;
     let r = inputs.r;
@@ -539,6 +664,39 @@ mod tests {
         diag_inputs.validate().expect("hand fixture must validate");
         let d = cpu_row_hessian_diag(&diag_inputs);
         assert_eq!(d, vec![2.0, 3.0, 4.0, 5.0]);
+    }
+
+    /// gam#3410: the BMS host row-Hessian ops go through the measured
+    /// row-kernel decision, so whichever executor it selects (the CPU with no
+    /// device or under `off`, the CPU value of a race, or a device that timed
+    /// faster) returns the same per-row product and diagonal.
+    #[test]
+    fn host_row_hessian_ops_return_the_row_products_on_any_selected_executor_3410() {
+        let h_rows = vec![2.0, 1.0, 1.0, 3.0, 4.0, 0.0, 0.0, 5.0];
+        let v_rows = vec![1.0, -1.0, 2.0, 3.0];
+        for _ in 0..3 {
+            let y = super::row_hessian_matvec(
+                "3410 fixture matvec",
+                super::RowHessianMatvecInputs {
+                    n_rows: 2,
+                    r: 2,
+                    h_rows: &h_rows,
+                    v_rows: &v_rows,
+                },
+            )
+            .expect("an admitted executor computes the matvec");
+            assert_eq!(y, vec![1.0, -2.0, 8.0, 15.0]);
+            let d = super::row_hessian_diag(
+                "3410 fixture diagonal",
+                super::RowHessianDiagInputs {
+                    n_rows: 2,
+                    r: 2,
+                    h_rows: &h_rows,
+                },
+            )
+            .expect("an admitted executor computes the diagonal");
+            assert_eq!(d, vec![2.0, 3.0, 4.0, 5.0]);
+        }
     }
 
     // Uses Linux-only `GpuError`/`validate()`; gated to match.

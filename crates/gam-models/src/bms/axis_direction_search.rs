@@ -444,40 +444,15 @@ impl BernoulliMarginalSlopeFamily {
             let h_rows_slice = h_rows_arr
                 .as_slice()
                 .expect("row_primary_hessians.hess() is row-major contiguous");
-            let inputs = row_hessian_ops::RowHessianMatvecInputs {
-                n_rows: n,
-                r: r_pr,
-                h_rows: h_rows_slice,
-                v_rows: &v_rows,
-            };
-            let y_rows = {
-                #[cfg(target_os = "linux")]
-                {
-                    if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
-                        .map_err(String::from)?
-                        .is_some()
-                    {
-                        crate::bms::gpu::flex::require_selected_gpu_result(
-                            "host-pin row-Hessian matvec",
-                            row_hessian_ops::launch_row_hessian_matvec(
-                                row_hessian_ops::RowHessianMatvecInputs {
-                                    n_rows: n,
-                                    r: r_pr,
-                                    h_rows: h_rows_slice,
-                                    v_rows: &v_rows,
-                                },
-                            ),
-                        )?
-                        .y_rows
-                    } else {
-                        row_hessian_ops::cpu_row_hessian_matvec(&inputs)
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    row_hessian_ops::cpu_row_hessian_matvec(&inputs)
-                }
-            };
+            let y_rows = row_hessian_ops::row_hessian_matvec(
+                "host-pin row-Hessian matvec",
+                row_hessian_ops::RowHessianMatvecInputs {
+                    n_rows: n,
+                    r: r_pr,
+                    h_rows: h_rows_slice,
+                    v_rows: &v_rows,
+                },
+            )?;
             // Pull back every row's action `y_rows[row]` through its design
             // rows into the joint-β image. The pullback accumulates into the
             // shared output, so fan it across rayon row chunks with a private
@@ -577,42 +552,15 @@ impl BernoulliMarginalSlopeFamily {
                             tile.rows.hess().as_slice().expect(
                                 "tiled row_primary_hessians.hess() is row-major contiguous",
                             );
-                        let inputs = row_hessian_ops::RowHessianMatvecInputs {
-                            n_rows: tile_rows,
-                            r: r_pr,
-                            h_rows: h_rows_slice,
-                            v_rows: &v_rows,
-                        };
-                        let y_rows = {
-                            #[cfg(target_os = "linux")]
-                            {
-                                if gam_gpu::device_runtime::GpuRuntime::resolve(
-                                    gam_gpu::global_policy(),
-                                )
-                                .map_err(String::from)?
-                                .is_some()
-                                {
-                                    crate::bms::gpu::flex::require_selected_gpu_result(
-                                        "tiled row-Hessian matvec",
-                                        row_hessian_ops::launch_row_hessian_matvec(
-                                            row_hessian_ops::RowHessianMatvecInputs {
-                                                n_rows: tile_rows,
-                                                r: r_pr,
-                                                h_rows: h_rows_slice,
-                                                v_rows: &v_rows,
-                                            },
-                                        ),
-                                    )?
-                                    .y_rows
-                                } else {
-                                    row_hessian_ops::cpu_row_hessian_matvec(&inputs)
-                                }
-                            }
-                            #[cfg(not(target_os = "linux"))]
-                            {
-                                row_hessian_ops::cpu_row_hessian_matvec(&inputs)
-                            }
-                        };
+                        let y_rows = row_hessian_ops::row_hessian_matvec(
+                            "tiled row-Hessian matvec",
+                            row_hessian_ops::RowHessianMatvecInputs {
+                                n_rows: tile_rows,
+                                r: r_pr,
+                                h_rows: h_rows_slice,
+                                v_rows: &v_rows,
+                            },
+                        )?;
                         for local in 0..tile_rows {
                             let row = tile.row_start + local;
                             let action_slice = &y_rows[local * r_pr..(local + 1) * r_pr];
@@ -803,42 +751,15 @@ impl BernoulliMarginalSlopeFamily {
                                     row_dir_scratch.as_slice().expect("contiguous"),
                                 );
                             }
-                            let inputs = row_hessian_ops::RowHessianMatvecInputs {
-                                n_rows: tile_rows,
-                                r: r_pr,
-                                h_rows: h_rows_slice,
-                                v_rows: &v_rows,
-                            };
-                            let y_rows = {
-                                #[cfg(target_os = "linux")]
-                                {
-                                    if gam_gpu::device_runtime::GpuRuntime::resolve(
-                                        gam_gpu::global_policy(),
-                                    )
-                                    .map_err(String::from)?
-                                    .is_some()
-                                    {
-                                        crate::bms::gpu::flex::require_selected_gpu_result(
-                                            "batched tiled row-Hessian matvec",
-                                            row_hessian_ops::launch_row_hessian_matvec(
-                                                row_hessian_ops::RowHessianMatvecInputs {
-                                                    n_rows: tile_rows,
-                                                    r: r_pr,
-                                                    h_rows: h_rows_slice,
-                                                    v_rows: &v_rows,
-                                                },
-                                            ),
-                                        )?
-                                        .y_rows
-                                    } else {
-                                        row_hessian_ops::cpu_row_hessian_matvec(&inputs)
-                                    }
-                                }
-                                #[cfg(not(target_os = "linux"))]
-                                {
-                                    row_hessian_ops::cpu_row_hessian_matvec(&inputs)
-                                }
-                            };
+                            let y_rows = row_hessian_ops::row_hessian_matvec(
+                                "batched tiled row-Hessian matvec",
+                                row_hessian_ops::RowHessianMatvecInputs {
+                                    n_rows: tile_rows,
+                                    r: r_pr,
+                                    h_rows: h_rows_slice,
+                                    v_rows: &v_rows,
+                                },
+                            )?;
                             let mut tile_out_col = tile_out.column_mut(col);
                             for local in 0..tile_rows {
                                 let row = tile.row_start + local;
@@ -960,38 +881,14 @@ impl BernoulliMarginalSlopeFamily {
             let h_rows_slice = h_rows_arr
                 .as_slice()
                 .expect("row_primary_hessians.hess() is row-major contiguous");
-            let inputs = row_hessian_ops::RowHessianDiagInputs {
-                n_rows: n,
-                r: r_pr,
-                h_rows: h_rows_slice,
-            };
-            let d_rows = {
-                #[cfg(target_os = "linux")]
-                {
-                    if gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
-                        .map_err(String::from)?
-                        .is_some()
-                    {
-                        crate::bms::gpu::flex::require_selected_gpu_result(
-                            "host-pin row-Hessian diagonal",
-                            row_hessian_ops::launch_row_hessian_diag(
-                                row_hessian_ops::RowHessianDiagInputs {
-                                    n_rows: n,
-                                    r: r_pr,
-                                    h_rows: h_rows_slice,
-                                },
-                            ),
-                        )?
-                        .d_rows
-                    } else {
-                        row_hessian_ops::cpu_row_hessian_diag(&inputs)
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    row_hessian_ops::cpu_row_hessian_diag(&inputs)
-                }
-            };
+            let d_rows = row_hessian_ops::row_hessian_diag(
+                "host-pin row-Hessian diagonal",
+                row_hessian_ops::RowHessianDiagInputs {
+                    n_rows: n,
+                    r: r_pr,
+                    h_rows: h_rows_slice,
+                },
+            )?;
             // The per-row diagonals `d_rows` are already materialised; the
             // remaining design² accumulation is a reduction over rows (every
             // row contributes to the same marginal/slope columns). Fan it
@@ -1093,40 +990,14 @@ impl BernoulliMarginalSlopeFamily {
                             tile.rows.hess().as_slice().expect(
                                 "tiled row_primary_hessians.hess() is row-major contiguous",
                             );
-                        let inputs = row_hessian_ops::RowHessianDiagInputs {
-                            n_rows: tile_rows,
-                            r: r_pr,
-                            h_rows: h_rows_slice,
-                        };
-                        let d_rows = {
-                            #[cfg(target_os = "linux")]
-                            {
-                                if gam_gpu::device_runtime::GpuRuntime::resolve(
-                                    gam_gpu::global_policy(),
-                                )
-                                .map_err(String::from)?
-                                .is_some()
-                                {
-                                    crate::bms::gpu::flex::require_selected_gpu_result(
-                                        "tiled row-Hessian diagonal",
-                                        row_hessian_ops::launch_row_hessian_diag(
-                                            row_hessian_ops::RowHessianDiagInputs {
-                                                n_rows: tile_rows,
-                                                r: r_pr,
-                                                h_rows: h_rows_slice,
-                                            },
-                                        ),
-                                    )?
-                                    .d_rows
-                                } else {
-                                    row_hessian_ops::cpu_row_hessian_diag(&inputs)
-                                }
-                            }
-                            #[cfg(not(target_os = "linux"))]
-                            {
-                                row_hessian_ops::cpu_row_hessian_diag(&inputs)
-                            }
-                        };
+                        let d_rows = row_hessian_ops::row_hessian_diag(
+                            "tiled row-Hessian diagonal",
+                            row_hessian_ops::RowHessianDiagInputs {
+                                n_rows: tile_rows,
+                                r: r_pr,
+                                h_rows: h_rows_slice,
+                            },
+                        )?;
                         for local in 0..tile_rows {
                             let row = tile.row_start + local;
                             let d_row_base = local * r_pr;
