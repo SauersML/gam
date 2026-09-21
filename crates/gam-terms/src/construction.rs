@@ -13,17 +13,6 @@ use rayon::iter::{
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
-/// Relative "numerically-PSD" floor of the symmetric eigensolver: an eigenvalue
-/// smaller than this fraction of the spectrum scale is roundoff, not genuine
-/// curvature (~`sqrt(machine ε)`; #1619). This single floor governs BOTH which
-/// eigenvalues are snapped to zero (declared null) in `classify_eigenvalues_strict`
-/// AND how much per-mode relative energy the transformed penalty root may retain
-/// in the resulting null block (`subspace_split_is_consistent`). Keeping the two
-/// tied to one constant makes the null-space definition and the leakage-consistency
-/// guard provably mutually consistent, rather than the guard demanding a precision
-/// the classifier never promised.
-const REL_PSD_FLOOR: f64 = 1.0e-8;
-
 #[derive(Clone)]
 pub enum PenaltyRepresentation {
     Dense(Array2<f64>),
@@ -176,8 +165,8 @@ fn sanitize_symmetric_faer(matrix: &Mat<f64>) -> Mat<f64> {
 
     // Finite entries are kept as computed, however small. Before an
     // eigendecomposition, `classify_eigenvalues_strict` already snaps roundoff at
-    // `max(p·ε, REL_PSD_FLOOR)·λ_max`, and every entry-level roundoff is bounded
-    // by it because `|M_ij| ≤ ‖M‖₂`.
+    // the resolved-eigenvalue band `p·ε·λ_max + assembly`, and every entry-level
+    // roundoff is bounded by it because `|M_ij| ≤ ‖M‖₂`.
     for i in 0..rows {
         for j in 0..cols {
             if !sanitized[(i, j)].is_finite() {
@@ -257,30 +246,28 @@ pub fn trace_penalty_covariance_in_orthogonal_basis(
 /// Strict spectral classifier used as a final guard on penalty eigendecompositions.
 ///
 /// Penalty matrices fed to the GAM solver are required to be PSD by construction.
-/// This routine snaps roundoff-zero eigenvalues to exact zero, accepts strictly
-/// positive eigenvalues, and rejects materially-indefinite or non-finite spectra
-/// with a hard error rather than silently rewriting them. The previous behaviour
-/// (mass-zeroing negative or non-finite eigenvalues) hid construction bugs and
-/// changed the optimisation objective downstream.
+/// This routine snaps eigenvalues the decomposition has not resolved from zero to
+/// exact zero, accepts resolved positive eigenvalues, and rejects resolved
+/// negative (materially indefinite) or non-finite spectra with a hard error
+/// rather than silently rewriting them.
 ///
-/// The acceptance tolerance is the larger of the eigendecomposition's own
-/// rounding band (`gam_linalg::roundoff::symmetric_spectrum_rounding_band`,
-/// `p·ε·scale`: a backward-stable symmetric eigensolver perturbs every
-/// eigenvalue by at most that much) and a relative "numerically PSD" floor
-/// `REL_PSD_FLOOR * scale`. The latter dominates for large high-rank penalties
-/// assembled / reparameterized at extreme λ, where roundoff produces
-/// ~1e-11-relative negative eigenvalues that are PSD to any reasonable precision
-/// yet exceeded the bare ~12×ε machine floor and spuriously failed the inner
-/// P-IRLS solve (#1619). Genuine indefiniteness is O(1) relative and is still
-/// rejected far above either floor.
+/// The band is [`gam_linalg::roundoff::resolved_eigenvalue_band`]: the
+/// eigensolver's backward error `p·ε·max|λ|` plus `assembly_band`, the caller's
+/// bound on the error the matrix's own formation left in it. By Weyl every
+/// computed eigenvalue is within that band of the exact one, so an eigenvalue
+/// inside it is not resolved from zero and its sign is not a measurement, and an
+/// eigenvalue below `−band` is a genuinely negative eigenvalue of the operator
+/// the caller meant to form. This is the SAME predicate the structural rank
+/// counts with (`resolved_eigenvalue_count(eigs, assembly_band)`), so the snap
+/// can never pre-empt the rank decision: every eigenvalue it zeroes is one the
+/// rank rule already scores as null (#4057). Extreme-λ assembly roundoff (#1619)
+/// is covered by the caller's `assembly_band`, which grows with the λ-weighted
+/// row norms that produced it, not by a fixed relative floor.
 fn classify_eigenvalues_strict(
     eigenvalues: &mut [f64],
+    assembly_band: f64,
     context: &str,
 ) -> Result<(), EstimationError> {
-    // `REL_PSD_FLOOR` (module-level): the relative threshold below which a
-    // (possibly slightly negative) eigenvalue is roundoff and is snapped to zero
-    // rather than rejected. Shared with the subspace-leakage guard so the null
-    // definition and the leakage tolerance stay mutually consistent.
     let mut scale = 0.0_f64;
     for (idx, &val) in eigenvalues.iter().enumerate() {
         if !val.is_finite() {
@@ -293,16 +280,7 @@ fn classify_eigenvalues_strict(
         scale = scale.max(val.abs());
     }
 
-    // `p·ε·scale` bounds the rounding a backward-stable symmetric
-    // eigendecomposition of a p-dimensional matrix adds to each eigenvalue. For
-    // large high-rank penalties assembled at extreme λ this machine band is
-    // tighter than the roundoff the assembly itself produced, so we take the
-    // larger of it and a relative numerically-PSD floor `REL_PSD_FLOOR * scale`
-    // (#1619).
-    let machine_floor = gam_linalg::roundoff::symmetric_spectrum_rounding_band(eigenvalues);
-    let tolerance = machine_floor
-        .max(REL_PSD_FLOOR * scale)
-        .max(f64::MIN_POSITIVE);
+    let tolerance = gam_linalg::roundoff::resolved_eigenvalue_band(eigenvalues, assembly_band);
 
     for (idx, val) in eigenvalues.iter_mut().enumerate() {
         if val.abs() <= tolerance {
@@ -322,6 +300,7 @@ fn classify_eigenvalues_strict(
 
 fn robust_eighwith_policy<M, V, E, Validate, Sanitize, EigCall, MapErr>(
     matrix: &M,
+    assembly_band: f64,
     context: &str,
     validate_input: Validate,
     sanitize: Sanitize,
@@ -344,20 +323,25 @@ where
     let candidate = sanitize(matrix);
     match eig_call(&candidate) {
         Ok((mut eigenvalues, eigenvectors)) => {
-            classify_eigenvalues_strict(&mut eigenvalues, context)?;
+            classify_eigenvalues_strict(&mut eigenvalues, assembly_band, context)?;
             Ok((eigenvalues, eigenvectors))
         }
         Err(err) => Err(map_error(err, context)),
     }
 }
 
+/// Symmetric eigendecomposition of a penalty operator with the strict PSD
+/// classification of [`classify_eigenvalues_strict`] at `assembly_band`, the
+/// caller's bound on the formation error of `matrix` (zero for exact input).
 pub(crate) fn robust_eigh_faer(
     matrix: &Mat<f64>,
     side: Side,
+    assembly_band: f64,
     context: &str,
 ) -> Result<(Vec<f64>, Mat<f64>), EstimationError> {
     robust_eighwith_policy(
         matrix,
+        assembly_band,
         context,
         |mat, ctx| {
             let (rows, cols) = mat.as_ref().shape();
@@ -385,16 +369,6 @@ pub(crate) fn robust_eigh_faer(
         },
         |err, _| EstimationError::EigendecompositionFailed(FaerLinalgError::SelfAdjointEigen(err)),
     )
-}
-
-fn robust_eigh(
-    matrix: &Array2<f64>,
-    side: Side,
-    context: &str,
-) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
-    let matrix_faer = array_to_faer(matrix);
-    let (eigenvalues, eigenvectors) = robust_eigh_faer(&matrix_faer, side, context)?;
-    Ok((Array1::from_vec(eigenvalues), mat_to_array(&eigenvectors)))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -474,29 +448,26 @@ fn assess_subspace_leakage(
 ///    and null blocks share no direction (`max |Qp'Qn| ≤ orth_tol`). This is the
 ///    structural correctness guarantee and is checked at machine precision.
 ///
-/// 2. **Bounded root leakage** — the transformed penalty root must have
-///    negligible energy on the null columns. The admissible relative-energy
-///    leakage is DERIVED from `REL_PSD_FLOOR`, the same numerically-PSD floor
-///    that `classify_eigenvalues_strict` uses to decide which modes are null:
-///    a mode the classifier is entitled to call null can, by the symmetric
-///    eigensolver's own eigenvector accuracy on a small-gap spectrum, retain up
-///    to `REL_PSD_FLOOR` of the penalty root's relative energy in that direction.
-///    Summed over the at-most-`p` near-threshold null modes the relative leakage
-///    cannot exceed `p · REL_PSD_FLOOR` without signalling a genuine
-///    (non-numerical) inconsistency, so that is the derived tolerance — matching
-///    the `p`-scaling `classify_eigenvalues_strict` already applies to its
-///    machine floor. Demanding a leakage tighter than the very floor that
-///    defined the null space is self-contradictory: it rejects well-posed smooth
-///    manifold / Duchon / sphere penalties whose Laplace-Beltrami spectrum decays
-///    through the classification threshold with no clean rank gap (#1802), even
-///    though the downstream penalty (`E'E`) is rebuilt with an EXACTLY clean null
-///    block regardless. The absolute floor keeps a vanishing-scale penalty from
-///    tripping the relative test on pure roundoff.
-fn subspace_split_is_consistent(leakage: &SubspaceLeakageMetrics, p: usize) -> bool {
-    let leakage_rel_tol = (p.max(1) as f64) * REL_PSD_FLOOR;
-    let leakage_abs_tol = 1e-12;
+/// 2. **Bounded root leakage** — the transformed penalty roots must keep no
+///    more relative energy on the null columns than `null_leakage_tolerance`,
+///    the invariant's own bound ([`balanced_null_leakage_tolerance`]) on what
+///    roundoff of the split can leave there. The null columns are exactly the
+///    balanced operator's eigenvalues NOT resolved from zero, so their energy is
+///    bounded by that operator's resolution; it no longer tracks a fixed
+///    relative rank floor. Under the old `1e-8`-relative cut a manifold / Duchon
+///    / sphere penalty whose spectrum decays through the cut with no clean gap
+///    (#1802) had a resolved eigenvalue just below it declared null, and its
+///    `~1e-8` energy there had to be admitted by a matching `p·1e-8` leakage
+///    floor. The cut is now the resolved-eigenvalue predicate, so such a
+///    direction is penalized and the leakage the split can carry is roundoff
+///    of the operator — anything above the bound means the roots and the
+///    operator the split was read from disagree.
+fn subspace_split_is_consistent(
+    leakage: &SubspaceLeakageMetrics,
+    null_leakage_tolerance: f64,
+) -> bool {
     let orth_tol = 1e-10;
-    let root_leaks = leakage.max_rel_sq > leakage_rel_tol && leakage.max_abs_sq > leakage_abs_tol;
+    let root_leaks = leakage.max_rel_sq > null_leakage_tolerance;
     let split_nonorthogonal = leakage.max_cross_gram_abs > orth_tol;
     !(root_leaks || split_nonorthogonal)
 }
@@ -844,6 +815,34 @@ fn assemble_kronecker_root_local(decomps: &[KroneckerFactorDecomp]) -> Array2<f6
     kron_root
 }
 
+/// `RᵀR` of the Kronecker root [`assemble_kronecker_root_local`] builds, as
+/// `⊗_j R_jᵀR_j` (`(A⊗B)ᵀ(A⊗B) = AᵀA ⊗ BᵀB`), at `O(Σ_j q_j³ + block_dim²)`
+/// instead of the `O(block_dim³)` of forming it from the assembled root.
+fn assemble_kronecker_gram_local(decomps: &[KroneckerFactorDecomp]) -> Array2<f64> {
+    let factor_gram = |decomp: &KroneckerFactorDecomp| decomp.root.t().dot(&decomp.root);
+    let mut gram = factor_gram(&decomps[0]);
+    for decomp in &decomps[1..] {
+        let right = factor_gram(decomp);
+        let (n1, n2) = (gram.nrows(), right.nrows());
+        let mut product = Array2::zeros((n1 * n2, n1 * n2));
+        for i1 in 0..n1 {
+            for j1 in 0..n1 {
+                let left = gram[[i1, j1]];
+                if left == 0.0 {
+                    continue;
+                }
+                for i2 in 0..n2 {
+                    for j2 in 0..n2 {
+                        product[[i1 * n2 + i2, j1 * n2 + j2]] = left * right[[i2, j2]];
+                    }
+                }
+            }
+        }
+        gram = product;
+    }
+    gram
+}
+
 /// Compute eigenvalues of the Kronecker product from per-factor eigenvalues.
 fn kronecker_eigenvalues(decomps: &[KroneckerFactorDecomp], block_dim: usize) -> (Vec<f64>, usize) {
     let mut kron_eigs = decomps[0].positive_eigenvalues.clone();
@@ -891,10 +890,13 @@ pub struct CanonicalPenalty {
     pub total_dim: usize,
     /// Structural nullity of the local penalty.
     pub nullity: usize,
-    /// The symmetrized block-local penalty matrix (block_dim × block_dim).
-    /// Cached at construction time to avoid recomputing root^T * root
-    /// in hot paths (penalty assembly, trace products). Shared storage for the
-    /// same reason as `root`.
+    /// The block-local penalty matrix `root^T * root` (block_dim × block_dim).
+    /// Cached at construction time to avoid recomputing it in hot paths
+    /// (penalty assembly, trace products). It must be that reconstruction, not
+    /// the raw input: the reparameterization reads its penalized subspace from
+    /// the `local`s and measures its consistency on the `root`s, at a
+    /// tolerance derived from the rounding of forming one from the other.
+    /// Shared storage for the same reason as `root`.
     pub local: ArcArray2<f64>,
     /// Block-local prior mean used to center this penalty.
     pub prior_mean: Array1<f64>,
@@ -1465,14 +1467,18 @@ pub fn canonicalize_penalty_spec(
             return Ok(None);
         }
         let root = assemble_kronecker_root_local(&decomps);
-        let mut local_sym = local_matrix.to_owned();
-        symmetrize_in_place(&mut local_sym);
+        // Store the PSD reconstruction RᵀR, as the generic path does, rather
+        // than the raw symmetrised input: each factor root keeps only its
+        // factor's resolved range, so the raw product can carry directions
+        // (the dropped factor eigenvalues) the root has no energy on, and the
+        // balanced operator the split is read from would then count them.
+        let local = assemble_kronecker_gram_local(&decomps);
         return Ok(Some(CanonicalPenalty {
             root: root.into_shared(),
             col_range,
             total_dim: p,
             nullity,
-            local: local_sym.into_shared(),
+            local: local.into_shared(),
             prior_mean,
             positive_eigenvalues,
             op,
@@ -1797,14 +1803,9 @@ fn canonicalize_penalty_spec_at_frozen_rank(
 /// lands, the overlapping branch of the reparameterization reads it from here.
 pub(crate) const OVERLAPPING_PENALTY_DENSE_FALLBACK_MAX_P: usize = 4096;
 
-/// Lambda-independent reparameterization invariants derived from penalty structure.
-/// Relative cut of the balanced penalty spectrum below which a direction is
-/// structurally unpenalized: `eigenvalue ≤ BALANCED_PENALTY_RANK_RELATIVE_TOL ·
-/// max|eigenvalue|` of [`balanced_penalty_sum`].
-pub(crate) const BALANCED_PENALTY_RANK_RELATIVE_TOL: f64 = 1.0e-12;
-
 /// The λ-invariant penalty operator the structural rank is read from:
-/// `Σ_k S_k / ‖S_k‖_F`, each component embedded on its own column range.
+/// `B = Σ_k S_k / ‖S_k‖_F`, each component embedded on its own column range,
+/// together with the bound on the rounding its formation left in it.
 ///
 /// # One rule, two readers
 ///
@@ -1823,40 +1824,216 @@ pub(crate) const BALANCED_PENALTY_RANK_RELATIVE_TOL: f64 = 1.0e-12;
 /// `penalty_logdet_ranks_the_same_subspace_the_hessian_carries_2454` red on
 /// main. Normalizing every component first makes the rank a property of the
 /// penalties' supports, not of their scales, which is what "structural" means.
-pub fn balanced_penalty_sum<'a, I>(components: I, p_total: usize) -> Array2<f64>
+///
+/// # The rank predicate
+///
+/// A direction is penalized iff its eigenvalue of `B` is resolved from zero:
+/// `gam_linalg::roundoff::resolved_eigenvalue_count(eigs, assembly_band)`, the
+/// eigensolver's backward error `d·ε·max|λ|` plus [`Self::assembly_band`]. Both
+/// readers — [`balanced_penalty_structural_rank`] and the reparameterization's
+/// split in [`precompute_reparam_invariant_from_canonical`] — call that one
+/// predicate on the same blocks (#4057), so no independent relative constant can
+/// make them disagree.
+pub struct BalancedPenalty {
+    /// `B`, over the block's own columns.
+    pub matrix: Array2<f64>,
+    /// Spectral-norm bound, in the units of `B`, on `B̂ − B` where `B` is the
+    /// balanced sum of the exact Grams the components represent.
+    ///
+    /// Each component is a PSD Gram `S_k = R_kᵀR_k` of at most `d_k` root rows
+    /// (the [`CanonicalPenalty`] contract: `local` is the reconstruction of the
+    /// stored root), so its computed entries carry `γ_{d_k}·(|R_k|ᵀ|R_k|)`;
+    /// scaling by `1/‖S_k‖_F` rounds once more and the `K` embedded components
+    /// of a block are added with `K − 1` additions. The entrywise majorant is
+    /// `Σ_k γ_{d_k+K+1}·|R_k|ᵀ|R_k| / ‖S_k‖_F`, PSD, so by Perron–Frobenius its
+    /// spectral norm — and the error's — is at most its trace
+    /// `Σ_k γ_{d_k+K+1}·tr(S_k)/‖S_k‖_F`, with `tr(S_k) = Σ_i |S_k,ii|`
+    /// (`gam_linalg::roundoff::weighted_gram_assembly_band`). The rounding of
+    /// the scale `1/‖S_k‖_F` itself only rescales a component by `1 + O(ε)`,
+    /// which moves no eigenvalue across zero.
+    pub assembly_band: f64,
+}
+
+/// Assemble [`BalancedPenalty`] on `p_total` columns. Components with zero
+/// Frobenius norm carry no structure and are skipped.
+pub fn balanced_penalty_sum<'a, I>(components: I, p_total: usize) -> BalancedPenalty
 where
     I: IntoIterator<Item = (ArrayView2<'a, f64>, std::ops::Range<usize>)>,
 {
-    let mut balanced = Array2::<f64>::zeros((p_total, p_total));
-    for (local, range) in components {
-        let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
-        if !(frob_norm > 0.0) {
-            continue;
-        }
+    let kept: Vec<(ArrayView2<'a, f64>, std::ops::Range<usize>, f64)> = components
+        .into_iter()
+        .filter_map(|(local, range)| {
+            let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
+            (frob_norm > 0.0).then_some((local, range, frob_norm))
+        })
+        .collect();
+    let additions = kept.len().saturating_sub(1);
+    let mut matrix = Array2::<f64>::zeros((p_total, p_total));
+    let mut assembly_band = 0.0_f64;
+    for (local, range, frob_norm) in &kept {
         let scale = 1.0 / frob_norm;
         for i in 0..local.nrows() {
             for j in 0..local.ncols() {
-                balanced[[range.start + i, range.start + j]] += scale * local[[i, j]];
+                matrix[[range.start + i, range.start + j]] += scale * local[[i, j]];
             }
         }
+        let trace: f64 = local.diag().iter().map(|value| value.abs()).sum();
+        // Gram depth `d_k` (inner products of at most `d_k` root rows, `k =
+        // d_k − 1 + 1`), one scale rounding, and the block's additions.
+        assembly_band += gam_linalg::roundoff::weighted_gram_assembly_band(
+            local.nrows(),
+            2 + additions,
+            trace * scale,
+        );
     }
-    balanced
+    BalancedPenalty {
+        matrix,
+        assembly_band,
+    }
 }
 
-/// The rank cut for a balanced penalty spectrum whose largest magnitude is
-/// `max_balanced_eigenvalue`.
-pub fn balanced_penalty_rank_tolerance(max_balanced_eigenvalue: f64) -> f64 {
-    if max_balanced_eigenvalue > 0.0 {
-        max_balanced_eigenvalue * BALANCED_PENALTY_RANK_RELATIVE_TOL
-    } else {
-        BALANCED_PENALTY_RANK_RELATIVE_TOL
+/// One block of the balanced penalty operator's partition: the components
+/// whose column ranges are exactly `col_range` (or, when two distinct ranges
+/// overlap, every component on one global block), assembled over the block.
+struct BalancedPenaltyBlock {
+    col_range: Range<usize>,
+    /// Indices of the member components, in input order.
+    members: Vec<usize>,
+    balanced: BalancedPenalty,
+    /// Every member is diagonal, so `B` is and its spectrum is its diagonal.
+    diagonal: bool,
+}
+
+/// The column blocks the balanced operator is block-diagonal over, as
+/// `(col_range, member component indices)`, and whether two distinct ranges
+/// overlap. Components with no nonzero entry carry no structure and are
+/// dropped. When ranges overlap the operator does not decompose, and the single
+/// group is the whole `0..p_total`.
+fn balanced_penalty_groups(
+    components: &[(ArrayView2<'_, f64>, Range<usize>)],
+    p_total: usize,
+) -> (Vec<(Range<usize>, Vec<usize>)>, bool) {
+    let mut groups: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
+    for (index, (local, range)) in components.iter().enumerate() {
+        if local.iter().any(|&value| value != 0.0) {
+            groups.entry((range.start, range.end)).or_default().push(index);
+        }
+    }
+    // Sorted by start: a range overlaps an earlier one iff it starts before the
+    // furthest end seen so far (a running maximum, since a short range nested in
+    // a long one does not bound the ranges after it).
+    let mut furthest_end = 0usize;
+    let mut overlapping = false;
+    for &(start, end) in groups.keys() {
+        if start < furthest_end {
+            overlapping = true;
+            break;
+        }
+        furthest_end = furthest_end.max(end);
+    }
+    if overlapping {
+        let mut members: Vec<usize> = groups.into_values().flatten().collect();
+        members.sort_unstable();
+        return (vec![(0..p_total, members)], true);
+    }
+    (
+        groups
+            .into_iter()
+            .map(|((start, end), members)| (start..end, members))
+            .collect(),
+        false,
+    )
+}
+
+/// Assemble one group of [`balanced_penalty_groups`] over its own columns.
+fn balanced_penalty_block(
+    components: &[(ArrayView2<'_, f64>, Range<usize>)],
+    col_range: Range<usize>,
+    members: Vec<usize>,
+) -> BalancedPenaltyBlock {
+    let offset = col_range.start;
+    let balanced = balanced_penalty_sum(
+        members.iter().map(|&index| {
+            let (local, member_range) = &components[index];
+            (
+                local.view(),
+                (member_range.start - offset)..(member_range.end - offset),
+            )
+        }),
+        col_range.len(),
+    );
+    let diagonal = members
+        .iter()
+        .all(|&index| is_diagonal(components[index].0.view()));
+    BalancedPenaltyBlock {
+        col_range,
+        members,
+        balanced,
+        diagonal,
     }
 }
 
-/// Structural rank of a set of penalty components: the number of eigenvalues of
-/// [`balanced_penalty_sum`] above [`balanced_penalty_rank_tolerance`]. This is
-/// the rank the reparameterization's penalized subspace has, and the rank the
-/// criterion's `log|S(λ)|₊` must range over.
+/// Bound on the relative root energy `‖R_k Q̂_n‖_F² / ‖R_k‖_F²` a penalty of a
+/// balanced block keeps on the `null_count` computed null directions `Q̂_n` of
+/// that block, when the block's eigenvalues were read against `resolved_band`.
+///
+/// A computed null eigenpair `(λ̂, q̂)` of `B̂` has `|λ̂| ≤ resolved_band` (it
+/// was not resolved from zero) and residual `‖B̂q̂ − λ̂q̂‖ ≤ d·ε·‖B̂‖ ≤
+/// resolved_band` (backward stability), and `‖B − B̂‖₂ ≤ assembly_band ≤
+/// resolved_band`, so `q̂ᵀBq̂ ≤ 2·resolved_band·‖q̂‖²`. Each member satisfies
+/// `S_k/‖S_k‖_F ≼ B`, so `tr(Q̂_nᵀS_kQ̂_n) ≤ 2·n·resolved_band·‖S_k‖_F·‖q̂‖²`,
+/// and `‖S_k‖_F ≤ tr(S_k) = ‖R_k‖_F²` for a PSD Gram: the exact product's
+/// relative null energy is at most `2·n·resolved_band·‖q̂‖²`. Forming `R_k Q̂`
+/// in floating point adds at most `γ_d·|R_k||Q̂_n|` entrywise, whose Frobenius
+/// norm is at most `γ_d·√n·‖R_k‖_F`, and `‖q̂‖² ≤ 1 + γ_d`. Hence the bound
+/// `(1 + γ_d)·(√(2·n·resolved_band) + γ_d·√n)²`. Energy above it is not
+/// roundoff of the split: the roots and the operator the split was read from
+/// disagree.
+fn balanced_null_leakage_tolerance(block_dim: usize, null_count: usize, resolved_band: f64) -> f64 {
+    if null_count == 0 {
+        return 0.0;
+    }
+    let gamma = gam_linalg::roundoff::accumulation_growth(block_dim);
+    let n = null_count as f64;
+    let amplitude = (2.0 * n * resolved_band).sqrt() + gamma * n.sqrt();
+    (1.0 + gamma) * amplitude * amplitude
+}
+
+/// Spectrum of a balanced block: a diagonal block's is its diagonal (read in
+/// `O(d)`, eigenvectors the coordinate vectors, returned as `None`); any other
+/// block is symmetrized by averaging with its transpose (the same cleanup
+/// [`robust_eigh_faer`] applies) and eigendecomposed. Both rank readers call
+/// this one routine, so they count the same computed eigenvalues.
+fn balanced_block_eigh(
+    block: &BalancedPenaltyBlock,
+) -> Result<(Vec<f64>, Option<Mat<f64>>), EstimationError> {
+    if block.balanced.matrix.iter().any(|value| !value.is_finite()) {
+        crate::bail_invalid_estim!(
+            "balanced penalty block {:?} contains non-finite entries",
+            block.col_range
+        );
+    }
+    if block.diagonal {
+        return Ok((block.balanced.matrix.diag().to_vec(), None));
+    }
+    let symmetric = sanitize_symmetric_faer(&array_to_faer(&block.balanced.matrix));
+    let (values, vectors) =
+        gam_linalg::faer_ndarray::self_adjoint_evd(symmetric.as_ref(), Side::Lower).map_err(
+            |err| EstimationError::EigendecompositionFailed(FaerLinalgError::SelfAdjointEigen(err)),
+        )?;
+    Ok(((0..values.dim()).map(|idx| values[idx]).collect(), Some(vectors)))
+}
+
+/// Structural rank of a set of penalty components: the number of resolved
+/// eigenvalues of each [`balanced_penalty_groups`] block
+/// (`resolved_eigenvalue_count` at the block's [`BalancedPenalty::assembly_band`]),
+/// summed. This is the rank the reparameterization's penalized subspace has —
+/// [`precompute_reparam_invariant_from_canonical`] partitions and counts with the
+/// same two calls — and the rank the criterion's `log|S(λ)|₊` must range over.
+///
+/// Only the count is read here, so no PSD classification is applied: a
+/// resolved negative eigenvalue is simply not counted, and the reparameterization
+/// is where an indefinite penalty is refused.
 pub fn balanced_penalty_structural_rank<'a, I>(
     components: I,
     p_total: usize,
@@ -1867,34 +2044,18 @@ where
     if p_total == 0 {
         return Ok(0);
     }
-    let components: Vec<(ArrayView2<'a, f64>, std::ops::Range<usize>)> =
-        components.into_iter().collect();
-    if components.iter().all(|(local, _)| is_diagonal(*local)) {
-        // A sum of diagonal components is diagonal: its spectrum is its
-        // diagonal, read in O(p) instead of an O(p³) eigendecomposition.
-        let mut balanced_diag = vec![0.0_f64; p_total];
-        for (local, range) in &components {
-            let frob_norm = local.diag().iter().map(|&x| x * x).sum::<f64>().sqrt();
-            if !(frob_norm > 0.0) {
-                continue;
-            }
-            for (i, &value) in local.diag().iter().enumerate() {
-                balanced_diag[range.start + i] += value / frob_norm;
-            }
-        }
-        let max_bal = balanced_diag
-            .iter()
-            .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
-        let tol = balanced_penalty_rank_tolerance(max_bal);
-        return Ok(balanced_diag.iter().filter(|&&value| value > tol).count());
+    let components: Vec<(ArrayView2<'a, f64>, Range<usize>)> = components.into_iter().collect();
+    let (groups, _) = balanced_penalty_groups(&components, p_total);
+    let mut rank = 0usize;
+    for (col_range, members) in groups {
+        let block = balanced_penalty_block(&components, col_range, members);
+        let (eigenvalues, _) = balanced_block_eigh(&block)?;
+        rank += gam_linalg::roundoff::resolved_eigenvalue_count(
+            &eigenvalues,
+            block.balanced.assembly_band,
+        );
     }
-    let balanced = array_to_faer(&balanced_penalty_sum(components, p_total));
-    let (eigenvalues, _) = robust_eigh_faer(&balanced, Side::Lower, "balanced penalty matrix")?;
-    let max_bal = eigenvalues
-        .iter()
-        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
-    let tol = balanced_penalty_rank_tolerance(max_bal);
-    Ok(eigenvalues.iter().filter(|&&value| value > tol).count())
+    Ok(rank)
 }
 
 #[derive(Clone)]
@@ -1983,6 +2144,11 @@ pub struct ReparamInvariant {
     /// the split came from one global eigendecomposition and has no block
     /// structure to exploit.
     blocks: Option<Vec<InvariantBlock>>,
+    /// Largest relative root energy `‖R_k Q_n‖_F² / ‖R_k‖_F²` any penalty may
+    /// keep on the null columns as roundoff of this split
+    /// ([`balanced_null_leakage_tolerance`] of each block); zero when nothing
+    /// is penalized.
+    null_leakage_tolerance: f64,
 }
 
 /// One disjoint penalty block of a [`ReparamInvariant`]: every penalty whose
@@ -2015,119 +2181,166 @@ pub fn is_diagonal(matrix: ArrayView2<'_, f64>) -> bool {
 /// Each `CanonicalPenalty` carries its own block-local root and column range,
 /// so the balanced sum can be assembled without ever materializing full-size
 /// penalty matrices.
+///
+/// The partition into blocks, the balanced operator of each block, its
+/// spectrum and the penalized/null cut are exactly those
+/// [`balanced_penalty_structural_rank`] reads (`balanced_penalty_groups`,
+/// `balanced_penalty_block`, `balanced_block_eigh`, `resolved_eigenvalue_count`),
+/// so the penalized subspace here has the structural rank the criterion's
+/// `log|S(λ)|₊` ranges over by construction (#4057).
 pub fn precompute_reparam_invariant_from_canonical(
     penalties: &[CanonicalPenalty],
     p_total: usize,
 ) -> Result<ReparamInvariant, EstimationError> {
     use std::cmp::Ordering;
 
-    let m = penalties.len();
+    // A penalty with an empty root carries no penalized direction.
+    let active: Vec<usize> = (0..penalties.len())
+        .filter(|&index| penalties[index].rank() > 0)
+        .collect();
+    let components: Vec<(ArrayView2<'_, f64>, Range<usize>)> = active
+        .iter()
+        .map(|&index| {
+            (
+                penalties[index].local_ref().view(),
+                penalties[index].col_range.clone(),
+            )
+        })
+        .collect();
+    let (groups, overlapping) = balanced_penalty_groups(&components, p_total);
 
-    if m == 0 {
+    if groups.is_empty() {
         return Ok(ReparamInvariant {
             split: SubspaceSplit::identity(p_total),
             qs_base: Array2::eye(p_total),
             has_nonzero: false,
             blocks: None,
+            null_leakage_tolerance: 0.0,
         });
     }
 
-    // Group penalties by col_range to detect block-diagonal structure.
-    struct PenRef {
-        penalty_index: usize,
-    }
-    let mut block_groups: BTreeMap<(usize, usize), Vec<PenRef>> = BTreeMap::new();
-    let mut has_nonzero = false;
-    for (i, cp) in penalties.iter().enumerate() {
-        if cp.rank() == 0 {
-            continue;
-        }
-        let local = cp.local_ref();
-        let frob_norm = local.iter().map(|&x| x * x).sum::<f64>().sqrt();
-        if frob_norm > 0.0 {
-            has_nonzero = true;
-        }
-        let key = (cp.col_range.start, cp.col_range.end);
-        block_groups
-            .entry(key)
-            .or_default()
-            .push(PenRef { penalty_index: i });
-    }
-
-    if !has_nonzero {
-        return Ok(ReparamInvariant {
-            split: SubspaceSplit::identity(p_total),
-            qs_base: Array2::eye(p_total),
-            has_nonzero: false,
-            blocks: None,
-        });
-    }
-
-    // Check for overlapping ranges.
-    let ranges: Vec<(usize, usize)> = block_groups.keys().copied().collect();
-    let mut overlapping = false;
-    for i in 1..ranges.len() {
-        if ranges[i].0 < ranges[i - 1].1 {
-            overlapping = true;
-            break;
-        }
-    }
-
-    if overlapping {
+    if overlapping && p_total > OVERLAPPING_PENALTY_DENSE_FALLBACK_MAX_P {
         // Without this guard, large-scale models with overlapping penalties allocated a full
         // p_total × p_total workspace and ran an O(p³) eigendecomposition
         // before any solver code saw the problem size.
-        if p_total > OVERLAPPING_PENALTY_DENSE_FALLBACK_MAX_P {
-            return Err(EstimationError::LayoutError(format!(
-                "overlapping penalty reparameterization would require dense {}x{} eigendecomposition; \
-                 large-model dense fallback is disabled. Keep penalties structured or \
-                 extend the overlapping-penalty solver path",
-                p_total, p_total
-            )));
-        }
-        // Fallback: global p×p eigendecomposition.
-        let balanced = balanced_penalty_sum(
-            penalties
-                .iter()
-                .filter(|cp| cp.rank() > 0)
-                .map(|cp| (cp.local_ref().view(), cp.col_range.clone())),
-            p_total,
-        );
-        let s_balanced = array_to_faer(&balanced);
-        let (bal_eigenvalues, bal_eigenvectors) =
-            robust_eigh_faer(&s_balanced, Side::Lower, "balanced penalty matrix")?;
+        return Err(EstimationError::LayoutError(format!(
+            "overlapping penalty reparameterization would require dense {}x{} eigendecomposition; \
+             large-model dense fallback is disabled. Keep penalties structured or \
+             extend the overlapping-penalty solver path",
+            p_total, p_total
+        )));
+    }
 
-        let mut order: Vec<usize> = (0..p_total).collect();
+    struct BlockSplit {
+        col_range: Range<usize>,
+        /// Indices into `penalties`.
+        penalty_indices: Vec<usize>,
+        q_pen_local: Array2<f64>,  // block_dim × pen_rank
+        q_null_local: Array2<f64>, // block_dim × null_rank
+        diagonal_pen_cols: Option<Vec<usize>>,
+        null_leakage_tolerance: f64,
+    }
+
+    let context = if overlapping {
+        "balanced penalty matrix"
+    } else {
+        "balanced penalty block"
+    };
+    let split_block = |(col_range, members): (Range<usize>, Vec<usize>)| -> Result<
+        BlockSplit,
+        EstimationError,
+    > {
+        let block = balanced_penalty_block(&components, col_range, members);
+        let block_dim = block.col_range.len();
+        let assembly_band = block.balanced.assembly_band;
+        // A diagonal block (every member a ridge or random-effect variance)
+        // has the coordinate vectors as eigenvectors, and its spectrum is read
+        // off the diagonal in O(block_dim) instead of an O(block_dim³) solve.
+        let (mut eigenvalues, eigenvectors) = balanced_block_eigh(&block)?;
+        let resolved_band =
+            gam_linalg::roundoff::resolved_eigenvalue_band(&eigenvalues, assembly_band);
+        let penalized_rank =
+            gam_linalg::roundoff::resolved_eigenvalue_count(&eigenvalues, assembly_band);
+        // Same band: every eigenvalue this snaps to zero is one the count
+        // above left out, and a resolved negative one is refused.
+        classify_eigenvalues_strict(&mut eigenvalues, assembly_band, context)?;
+
+        let mut order: Vec<usize> = (0..block_dim).collect();
         order.sort_by(|&i, &j| {
-            bal_eigenvalues[j]
-                .partial_cmp(&bal_eigenvalues[i])
+            eigenvalues[j]
+                .partial_cmp(&eigenvalues[i])
                 .unwrap_or(Ordering::Equal)
                 .then(i.cmp(&j))
         });
+        let null_count = block_dim - penalized_rank;
 
-        let mut qs = Mat::<f64>::zeros(p_total, p_total);
+        let mut q_pen_local = Array2::zeros((block_dim, penalized_rank));
+        let mut q_null_local = Array2::zeros((block_dim, null_count));
         for (col_idx, &idx) in order.iter().enumerate() {
-            for row in 0..p_total {
-                qs[(row, col_idx)] = bal_eigenvectors[(row, idx)];
+            let mut target = if col_idx < penalized_rank {
+                q_pen_local.column_mut(col_idx)
+            } else {
+                q_null_local.column_mut(col_idx - penalized_rank)
+            };
+            match eigenvectors.as_ref() {
+                Some(vectors) => {
+                    for row in 0..block_dim {
+                        target[row] = vectors[(row, idx)];
+                    }
+                }
+                None => target[idx] = 1.0,
             }
         }
+        let diagonal_pen_cols = eigenvectors
+            .is_none()
+            .then(|| order[..penalized_rank].to_vec());
 
-        let max_bal = order
-            .iter()
-            .map(|&idx| bal_eigenvalues[idx].abs())
-            .fold(0.0_f64, f64::max);
-        let rank_tol = balanced_penalty_rank_tolerance(max_bal);
-        let penalized_rank = order
-            .iter()
-            .take_while(|&&idx| bal_eigenvalues[idx] > rank_tol)
-            .count();
+        Ok(BlockSplit {
+            col_range: block.col_range,
+            penalty_indices: block.members.iter().map(|&member| active[member]).collect(),
+            q_pen_local,
+            q_null_local,
+            diagonal_pen_cols,
+            null_leakage_tolerance: balanced_null_leakage_tolerance(
+                block_dim,
+                null_count,
+                resolved_band,
+            ),
+        })
+    };
+
+    // Groups come out of `balanced_penalty_groups` in column order; collecting
+    // the indexed parallel iterator keeps that order while each independent
+    // block is eigendecomposed concurrently.
+    let block_splits: Vec<BlockSplit> = groups
+        .into_par_iter()
+        .map(split_block)
+        .collect::<Result<_, _>>()?;
+    let null_leakage_tolerance = block_splits
+        .iter()
+        .map(|block| block.null_leakage_tolerance)
+        .fold(0.0_f64, f64::max);
+
+    if overlapping {
+        // One global block over all `p_total` columns.
+        let block = &block_splits[0];
+        let penalized_rank = block.q_pen_local.ncols();
+        let mut qs = Mat::<f64>::zeros(p_total, p_total);
+        for row in 0..p_total {
+            for col in 0..penalized_rank {
+                qs[(row, col)] = block.q_pen_local[[row, col]];
+            }
+            for col in 0..block.q_null_local.ncols() {
+                qs[(row, penalized_rank + col)] = block.q_null_local[[row, col]];
+            }
+        }
         let split = SubspaceSplit::from_ordered_qs(&qs, penalized_rank, p_total)?;
-
         return Ok(ReparamInvariant {
             split,
             qs_base: mat_to_array(&qs),
-            has_nonzero,
+            has_nonzero: true,
             blocks: None,
+            null_leakage_tolerance,
         });
     }
 
@@ -2135,196 +2348,55 @@ pub fn precompute_reparam_invariant_from_canonical(
     // Non-overlapping: block-diagonal eigendecomposition at O(Σ p_k³).
     // -----------------------------------------------------------------------
     // The balanced sum is block-diagonal ⟹ its eigenvectors are block-local.
-    // Q_pen and Q_null are assembled by embedding block-local eigenvectors.
-
-    // Track which columns are covered by any penalty.
+    // Q_pen and Q_null are assembled by embedding block-local eigenvectors;
+    // columns no block covers are unpenalized coordinate directions.
     let mut covered = vec![false; p_total];
-    for cp in penalties {
-        for j in cp.col_range.clone() {
+    for block in &block_splits {
+        for j in block.col_range.clone() {
             covered[j] = true;
         }
     }
-    let uncovered_cols: Vec<usize> = (0..p_total).filter(|j| !covered[*j]).collect();
+    let uncovered_cols: Vec<usize> = (0..p_total).filter(|&j| !covered[j]).collect();
 
-    struct BlockResult {
-        col_range: Range<usize>,
-        q_pen_local: Array2<f64>,  // block_dim × pen_rank
-        q_null_local: Array2<f64>, // block_dim × null_rank
-        diagonal_pen_cols: Option<Vec<usize>>,
-        /// Column offset of this block's penalized directions within global Q_pen.
-        pen_col_offset: usize,
-        /// Column offset of this block's null directions within global Q_null.
-        null_col_offset: usize,
-    }
-
-    // BTreeMap iteration defines the deterministic block order; collecting the
-    // indexed parallel iterator preserves that order while eigendecomposing each
-    // independent canonical penalty block concurrently.
-    let block_specs: Vec<_> = block_groups.iter().collect();
-    let mut block_results: Vec<BlockResult> = block_specs
-        .into_par_iter()
-        .map(
-            |(&(start, end), refs)| -> Result<BlockResult, EstimationError> {
-                let block_dim = end - start;
-
-                // Build the local balanced sum under the ONE shared rule
-                // (gam#2454); a component the rule keeps has unit Frobenius
-                // norm, so the block is non-zero iff any entry is.
-                let s_balanced_local = balanced_penalty_sum(
-                    refs.iter().map(|pref| {
-                        (
-                            penalties[pref.penalty_index].local_ref().view(),
-                            0..block_dim,
-                        )
-                    }),
-                    block_dim,
-                );
-                let block_has_nonzero = s_balanced_local.iter().any(|&value| value != 0.0);
-
-                if !block_has_nonzero {
-                    return Ok(BlockResult {
-                        col_range: start..end,
-                        q_pen_local: Array2::zeros((block_dim, 0)),
-                        q_null_local: Array2::eye(block_dim),
-                        diagonal_pen_cols: Some(Vec::new()),
-                        pen_col_offset: 0,  // set later
-                        null_col_offset: 0, // set later
-                    });
-                }
-
-                // Eigendecompose the local balanced penalty. When every member
-                // Gram is diagonal the balanced sum is too, its eigenvectors are
-                // the coordinate vectors, and the O(block_dim³) eigensolver is
-                // replaced by reading the diagonal (a random-effect block with
-                // thousands of levels is exactly this case).
-                let diagonal = refs
-                    .iter()
-                    .all(|pref| is_diagonal(penalties[pref.penalty_index].local_ref().view()));
-                let (bal_eigenvalues, bal_eigenvectors) = if diagonal {
-                    let mut eigenvalues = s_balanced_local.diag().to_vec();
-                    classify_eigenvalues_strict(&mut eigenvalues, "balanced penalty block")?;
-                    (Array1::from_vec(eigenvalues), None)
-                } else {
-                    let (values, vectors) =
-                        robust_eigh(&s_balanced_local, Side::Lower, "balanced penalty block")?;
-                    (values, Some(vectors))
-                };
-
-                let mut order: Vec<usize> = (0..block_dim).collect();
-                order.sort_by(|&i, &j| {
-                    bal_eigenvalues[j]
-                        .partial_cmp(&bal_eigenvalues[i])
-                        .unwrap_or(Ordering::Equal)
-                        .then(i.cmp(&j))
-                });
-
-                let max_bal = order
-                    .iter()
-                    .map(|&idx| bal_eigenvalues[idx].abs())
-                    .fold(0.0_f64, f64::max);
-                let rank_tol = balanced_penalty_rank_tolerance(max_bal);
-                let penalized_rank = order
-                    .iter()
-                    .take_while(|&&idx| bal_eigenvalues[idx] > rank_tol)
-                    .count();
-                let null_count = block_dim - penalized_rank;
-
-                let mut q_pen_local = Array2::zeros((block_dim, penalized_rank));
-                let mut q_null_local = Array2::zeros((block_dim, null_count));
-                for (col_idx, &idx) in order.iter().enumerate() {
-                    let target = if col_idx < penalized_rank {
-                        q_pen_local.column_mut(col_idx)
-                    } else {
-                        q_null_local.column_mut(col_idx - penalized_rank)
-                    };
-                    match bal_eigenvectors.as_ref() {
-                        Some(vectors) => {
-                            let mut target = target;
-                            target.assign(&vectors.column(idx));
-                        }
-                        None => {
-                            let mut target = target;
-                            target[idx] = 1.0;
-                        }
-                    }
-                }
-                let diagonal_pen_cols = bal_eigenvectors
-                    .is_none()
-                    .then(|| order[..penalized_rank].to_vec());
-
-                Ok(BlockResult {
-                    col_range: start..end,
-                    q_pen_local,
-                    q_null_local,
-                    diagonal_pen_cols,
-                    pen_col_offset: 0,  // set later
-                    null_col_offset: 0, // set later
-                })
-            },
-        )
-        .collect::<Result<_, _>>()?;
-    // Compute column offsets for each block in the global Q_pen / Q_null layout.
-    let total_pen_rank: usize = block_results.iter().map(|br| br.q_pen_local.ncols()).sum();
-    let total_null: usize = block_results
+    let total_pen_rank: usize = block_splits
         .iter()
-        .map(|br| br.q_null_local.ncols())
-        .sum::<usize>()
-        + uncovered_cols.len();
-    {
-        let mut pen_off = 0usize;
-        let mut null_off = 0usize;
-        for br in &mut block_results {
-            br.pen_col_offset = pen_off;
-            br.null_col_offset = null_off;
-            pen_off += br.q_pen_local.ncols();
-            null_off += br.q_null_local.ncols();
-        }
-    }
-
+        .map(|block| block.q_pen_local.ncols())
+        .sum();
+    let block_null: usize = block_splits
+        .iter()
+        .map(|block| block.q_null_local.ncols())
+        .sum();
     let mut q_pen = Array2::zeros((p_total, total_pen_rank));
-    let mut q_null = Array2::zeros((p_total, total_null));
-
-    for br in &block_results {
-        let start = br.col_range.start;
-        let bd = br.q_pen_local.nrows();
-        let pen_r = br.q_pen_local.ncols();
-        let null_r = br.q_null_local.ncols();
-        if pen_r > 0 {
-            q_pen
-                .slice_mut(s![
-                    start..(start + bd),
-                    br.pen_col_offset..(br.pen_col_offset + pen_r)
-                ])
-                .assign(&br.q_pen_local);
-        }
-        if null_r > 0 {
-            q_null
-                .slice_mut(s![
-                    start..(start + bd),
-                    br.null_col_offset..(br.null_col_offset + null_r)
-                ])
-                .assign(&br.q_null_local);
-        }
+    let mut q_null = Array2::zeros((p_total, block_null + uncovered_cols.len()));
+    let mut pen_offset = 0usize;
+    let mut null_offset = 0usize;
+    for block in &block_splits {
+        let rows = block.col_range.clone();
+        let pen_rank = block.q_pen_local.ncols();
+        let null_rank = block.q_null_local.ncols();
+        q_pen
+            .slice_mut(s![rows.clone(), pen_offset..(pen_offset + pen_rank)])
+            .assign(&block.q_pen_local);
+        q_null
+            .slice_mut(s![rows, null_offset..(null_offset + null_rank)])
+            .assign(&block.q_null_local);
+        pen_offset += pen_rank;
+        null_offset += null_rank;
     }
-    let mut null_col = block_results
-        .iter()
-        .map(|br| br.q_null_local.ncols())
-        .sum::<usize>();
     for &j in &uncovered_cols {
-        q_null[[j, null_col]] = 1.0;
-        null_col += 1;
+        q_null[[j, null_offset]] = 1.0;
+        null_offset += 1;
     }
 
     let split = SubspaceSplit { q_pen, q_null };
-    let blocks = block_results
+    let blocks = block_splits
         .into_iter()
-        .zip(block_groups.values())
-        .map(|(br, refs)| InvariantBlock {
-            col_range: br.col_range,
-            penalty_indices: refs.iter().map(|pref| pref.penalty_index).collect(),
-            q_pen_local: br.q_pen_local,
-            q_null_local: br.q_null_local,
-            diagonal_pen_cols: br.diagonal_pen_cols,
+        .map(|block| InvariantBlock {
+            col_range: block.col_range,
+            penalty_indices: block.penalty_indices,
+            q_pen_local: block.q_pen_local,
+            q_null_local: block.q_null_local,
+            diagonal_pen_cols: block.diagonal_pen_cols,
         })
         .collect();
 
@@ -2336,8 +2408,9 @@ pub fn precompute_reparam_invariant_from_canonical(
     Ok(ReparamInvariant {
         split,
         qs_base: qs_global,
-        has_nonzero,
+        has_nonzero: true,
         blocks: Some(blocks),
+        null_leakage_tolerance,
     })
 }
 
@@ -2422,7 +2495,8 @@ struct PenalizedBlockSpectrum {
     /// The eigenvalue magnitude at or below which the route has not separated
     /// an eigenvalue from zero, in the units of `d`: `(max(m, n)·ε·σ_max)²` for
     /// the two factor routes (the square of the backward-error band on the
-    /// singular values of `E`), `n·ε·d_max` for the Gram route. Both are
+    /// singular values of `E`), `n·ε·d_max` plus the Gram's own formation band
+    /// for the Gram route. Both are
     /// proportional to the λ-weighted spectrum itself, so scaling every λ by
     /// `c` scales the resolution by `c` and every floored eigenvalue with it.
     resolution: f64,
@@ -2492,6 +2566,8 @@ fn penalized_block_spectrum(
     let mut have_rotation = false;
     let mut rescued_by_r_svd = false;
     let mut svd_refusal: Option<String> = None;
+    // The Gram route's formation band, set only when that route ran.
+    let mut gram_assembly_band: Option<f64> = None;
     if total_root_rows >= penalized_rank {
         let mut e_stacked = Array2::<f64>::zeros((total_root_rows, penalized_rank));
         let mut row_off = 0usize;
@@ -2578,6 +2654,7 @@ fn penalized_block_spectrum(
         // (`total_root_rows < penalized_rank`) AND a stacked-root SVD that
         // did not converge.
         let mut range_block = Mat::<f64>::zeros(penalized_rank, penalized_rank);
+        let mut weighted_row_norm_sum = 0.0_f64;
         for (lambda, root) in lambdas.iter().zip(rs_transformed.iter()) {
             let root_pen = root.as_ref().submatrix(0, 0, root.nrows(), penalized_rank);
             matmul(
@@ -2588,9 +2665,30 @@ fn penalized_block_spectrum(
                 *lambda,
                 Par::Seq,
             );
+            let mut row_norm_sq = 0.0_f64;
+            for r in 0..root.nrows() {
+                for c in 0..penalized_rank {
+                    row_norm_sq += root[(r, c)] * root[(r, c)];
+                }
+            }
+            weighted_row_norm_sum += lambda.abs() * row_norm_sq;
         }
-        let (range_eigenvalues, range_eigenvectors) =
-            robust_eigh_faer(&range_block, Side::Lower, "range penalty block")?;
+        // `Σ_k λ_k R_kᵀR_k` is the inner products of the `total_root_rows`
+        // stacked root rows, each term rounding twice (the product and its λ
+        // weight): its formation error is at most
+        // `γ_{rows+1}·Σ_k |λ_k|·‖R_k‖_F²` in spectral norm.
+        let assembly_band = gam_linalg::roundoff::weighted_gram_assembly_band(
+            total_root_rows,
+            2,
+            weighted_row_norm_sum,
+        );
+        let (range_eigenvalues, range_eigenvectors) = robust_eigh_faer(
+            &range_block,
+            Side::Lower,
+            assembly_band,
+            "range penalty block",
+        )?;
+        gram_assembly_band = Some(assembly_band);
         let mut range_order: Vec<usize> = (0..penalized_rank).collect();
         range_order.sort_by(|&i, &j| {
             range_eigenvalues[j]
@@ -2608,13 +2706,20 @@ fn penalized_block_spectrum(
             }
         }
     }
-    let resolution = if have_rotation {
-        let sigma_max = range_eigenvalues_sorted.first().map_or(0.0, |d| d.sqrt());
-        let band =
-            gam_linalg::roundoff::factor_singular_band(total_root_rows, penalized_rank, sigma_max);
-        band * band
-    } else {
-        gam_linalg::roundoff::symmetric_spectrum_rounding_band(&range_eigenvalues_sorted)
+    let resolution = match gram_assembly_band {
+        None => {
+            let sigma_max = range_eigenvalues_sorted.first().map_or(0.0, |d| d.sqrt());
+            let band = gam_linalg::roundoff::factor_singular_band(
+                total_root_rows,
+                penalized_rank,
+                sigma_max,
+            );
+            band * band
+        }
+        Some(assembly_band) => gam_linalg::roundoff::resolved_eigenvalue_band(
+            &range_eigenvalues_sorted,
+            assembly_band,
+        ),
     };
     Ok(PenalizedBlockSpectrum {
         eigenvalues: range_eigenvalues_sorted,
@@ -2777,7 +2882,7 @@ pub fn stable_reparameterizationwith_invariant(
     // Guard against any accidental penalized/null mixing. The transformed penalty
     // roots must have negligible support on null columns by construction.
     let leakage = assess_subspace_leakage(&qs, &rs_transformed, structural_rank, p);
-    if !subspace_split_is_consistent(&leakage, p) {
+    if !subspace_split_is_consistent(&leakage, invariant.null_leakage_tolerance) {
         return Err(EstimationError::LayoutError(format!(
             "Reparameterization subspace split is inconsistent: max null leakage {:.3e} (rel {:.3e}, worst penalty {}), max |Qp'Qn| {:.3e}",
             leakage.max_abs_sq.sqrt(),
@@ -3055,7 +3160,7 @@ pub fn stable_reparameterization_original_frame(
             }
         }
     }
-    if !subspace_split_is_consistent(&leakage, p) {
+    if !subspace_split_is_consistent(&leakage, invariant.null_leakage_tolerance) {
         return Err(EstimationError::LayoutError(format!(
             "Reparameterization subspace split is inconsistent: max null leakage {:.3e} (rel {:.3e}, worst penalty {}), max |Qp'Qn| {:.3e}",
             leakage.max_abs_sq.sqrt(),
@@ -3425,7 +3530,7 @@ mod tests {
     }
 
     use super::{
-        CanonicalPenalty, EngineDims, REL_PSD_FLOOR, SubspaceLeakageMetrics,
+        CanonicalPenalty, EngineDims, SubspaceLeakageMetrics,
         assess_subspace_leakage, classify_eigenvalues_strict,
         precompute_reparam_invariant_from_canonical, report_penalty_pair_redundancy,
         stable_reparameterization_original_frame, stable_reparameterizationwith_invariant,
@@ -3505,76 +3610,149 @@ mod tests {
         assert!(m.max_cross_gram_abs > 1e-3);
     }
 
-    #[test]
-    fn subspace_split_admits_near_threshold_manifold_leakage_1802() {
-        // #1802: on sphere / Duchon / spline-on-sphere bases the REML outer
-        // startup rejected EVERY candidate seed with
-        //   "Reparameterization subspace split is inconsistent:
-        //    max null leakage 1.174e-4 (rel 1.031e-4, worst penalty 0),
-        //    max |Qp'Qn| 4.316e-16"
-        // The split is perfectly ORTHOGONAL (|Qp'Qn| ≈ 4e-16); the only tripped
-        // quantity is the transformed-root null-block leakage, whose RELATIVE
-        // energy (1.031e-4)² ≈ 1.06e-8 sits right at `REL_PSD_FLOOR`. That is the
-        // eigensolver's own numerically-PSD floor — the same floor
-        // `classify_eigenvalues_strict` uses to declare a mode null — so a
-        // manifold penalty whose Laplace-Beltrami spectrum decays through the
-        // rank threshold with no clean gap MUST be admitted. Reproduce that exact
-        // signature and assert the guard accepts it.
-        let p = 40usize;
-        let structural_rank = p - 1;
-        // Unit-amplitude range column + a null column at √(REL_PSD_FLOOR)
-        // amplitude, so the null-block relative energy lands at ~REL_PSD_FLOOR.
-        let null_amp = (1.06e-8_f64).sqrt();
-        let mut rs = Mat::<f64>::zeros(1, p);
-        rs[(0, 0)] = 1.0;
-        rs[(0, p - 1)] = null_amp;
-        let qs = Mat::<f64>::identity(p, p);
-        let leakage = metrics_for(&qs, &[rs], structural_rank, p);
-        // The leakage reproduces the observed band: above the OLD fixed 1e-10
-        // tolerance (which rejected the sphere fit) yet a benign ~REL_PSD_FLOOR.
-        assert!(
-            leakage.max_rel_sq > 1e-10 && leakage.max_rel_sq < 1e-6,
-            "reproduced leakage should sit in the near-REL_PSD_FLOOR band, got {:.3e}",
-            leakage.max_rel_sq
-        );
-        assert!(leakage.max_cross_gram_abs <= 1e-12);
-        assert!(
-            subspace_split_is_consistent(&leakage, p),
-            "near-REL_PSD_FLOOR null leakage on a manifold basis must be admitted \
-             (rel_sq={:.3e}, tol={:.3e})",
-            leakage.max_rel_sq,
-            (p as f64) * REL_PSD_FLOOR,
-        );
+    /// `root = diag(√σ)·Hᵀ` for a dense Householder reflection `H`, so the
+    /// penalty `S = RᵀR` has spectrum `σ` (plus one exact null direction) in a
+    /// rotated, non-coordinate basis.
+    fn rotated_spectrum_root(sigma: &[f64]) -> Array2<f64> {
+        let p = sigma.len() + 1;
+        let v: Vec<f64> = (0..p).map(|i| 1.0 + i as f64).collect();
+        let v_norm_sq: f64 = v.iter().map(|x| x * x).sum();
+        let householder =
+            Array2::from_shape_fn((p, p), |(i, j)| {
+                let identity = if i == j { 1.0 } else { 0.0 };
+                identity - 2.0 * v[i] * v[j] / v_norm_sq
+            });
+        Array2::from_shape_fn((sigma.len(), p), |(row, col)| {
+            sigma[row].sqrt() * householder[[col, row]]
+        })
     }
 
     #[test]
-    fn subspace_split_still_rejects_genuine_inconsistency_1802() {
-        // The #1802 relaxation only widens the leakage tolerance to the
-        // classifier's own `p · REL_PSD_FLOOR` floor; it must NOT admit a
-        // genuinely broken split. A whole penalized mode dumped into the null
-        // block (O(1) relative leakage) is still rejected.
+    fn a_spectrum_decaying_through_the_old_rank_floor_is_penalized_and_splits_cleanly_1802() {
+        // #1802: on sphere / Duchon / spline-on-sphere bases the REML outer
+        // startup rejected every seed with "Reparameterization subspace split
+        // is inconsistent: max null leakage 1.174e-4 (rel 1.031e-4)". The
+        // manifold spectrum decays through the old `1e-8`-relative rank cut
+        // with no gap, so resolved eigenvalues just below the cut were
+        // declared null and carried `~1e-8` relative root energy onto the null
+        // columns. The cut is now the resolved-eigenvalue predicate: every
+        // eigenvalue here is far above the roundoff band `~p·ε`, so all of them
+        // are penalized, the split leaves only roundoff on the null column, and
+        // the derived leakage bound is roundoff-level instead of `p·1e-8`.
+        let sigma = [1.0, 1.0e-2, 1.0e-4, 1.0e-6, 5.0e-9, 1.0e-10, 1.0e-11];
+        let p = sigma.len() + 1;
+        let penalty = CanonicalPenalty::from_dense_root(rotated_spectrum_root(&sigma), p);
+        let structural = super::balanced_penalty_structural_rank(
+            [(penalty.local_ref().view(), penalty.col_range.clone())],
+            p,
+        )
+        .expect("structural rank");
+        assert_eq!(structural, sigma.len(), "every resolved eigenvalue is penalized");
+        let penalties = vec![penalty];
+        let invariant =
+            precompute_reparam_invariant_from_canonical(&penalties, p).expect("invariant");
+        assert_eq!(invariant.split.q_pen.ncols(), structural);
+        assert_eq!(invariant.split.q_null.ncols(), 1);
+        // `(1+γ)(√(2·band) + γ)²` with `band ≈ (p + γ-depth)·ε`: of order
+        // 1e-14, where the old admission floor was `p·1e-8 = 8e-8`.
+        assert!(
+            invariant.null_leakage_tolerance > 0.0 && invariant.null_leakage_tolerance < 1.0e-12,
+            "derived leakage bound must be roundoff-level, got {:.3e}",
+            invariant.null_leakage_tolerance
+        );
+        let reparam = stable_reparameterizationwith_invariant(&penalties, &[1.0], p, &invariant)
+            .expect("the split of a resolved decaying spectrum is consistent");
+        assert!(reparam.log_det.is_finite());
+    }
+
+    #[test]
+    fn subspace_split_rejects_leakage_above_the_derived_bound_1802() {
+        // The derived bound admits only roundoff of the split. The #1802
+        // signature — `~1.06e-8` relative root energy on a null column — is no
+        // longer roundoff: it can only arise when the roots and the operator
+        // the split was read from disagree, and it is rejected, as is a whole
+        // penalized mode dumped on the null block.
         let p = 40usize;
         let structural_rank = p - 1;
-        let mut rs = Mat::<f64>::zeros(1, p);
-        rs[(0, p - 1)] = 1.0; // all penalty-root energy in the null column
         let qs = Mat::<f64>::identity(p, p);
-        let leakage = metrics_for(&qs, &[rs], structural_rank, p);
-        assert!(leakage.max_rel_sq > 0.99);
-        assert!(
-            !subspace_split_is_consistent(&leakage, p),
-            "an O(1) null-block leakage is a real inconsistency and must be rejected"
+        let tolerance = super::balanced_null_leakage_tolerance(
+            p,
+            1,
+            gam_linalg::roundoff::resolved_eigenvalue_band(&vec![1.0; p], 0.0),
         );
+        for null_energy in [1.06e-8_f64, 1.0] {
+            let mut rs = Mat::<f64>::zeros(1, p);
+            rs[(0, 0)] = (1.0 - null_energy).sqrt();
+            rs[(0, p - 1)] = null_energy.sqrt();
+            let leakage = metrics_for(&qs, &[rs], structural_rank, p);
+            assert!((leakage.max_rel_sq - null_energy).abs() <= 1e-12 * null_energy);
+            assert!(
+                !subspace_split_is_consistent(&leakage, tolerance),
+                "relative null energy {null_energy:e} above the bound {tolerance:.3e} is an \
+                 inconsistent split"
+            );
+        }
+        // Exactly clean roots on an orthonormal split are admitted.
+        let mut clean_root = Mat::<f64>::zeros(1, p);
+        clean_root[(0, 0)] = 1.0;
+        let clean = metrics_for(&qs, &[clean_root], structural_rank, p);
+        assert!(subspace_split_is_consistent(&clean, tolerance));
 
         // A non-orthogonal split is rejected regardless of root leakage.
         let mut qs_bad = Mat::<f64>::identity(3, 3);
         qs_bad[(0, 1)] = 0.2;
-        let clean = Mat::<f64>::zeros(1, 3);
-        let leakage2 = metrics_for(&qs_bad, &[clean], 1, 3);
+        let zero_root = Mat::<f64>::zeros(1, 3);
+        let leakage2 = metrics_for(&qs_bad, &[zero_root], 1, 3);
         assert!(leakage2.max_cross_gram_abs > 1e-3);
         assert!(
-            !subspace_split_is_consistent(&leakage2, 3),
+            !subspace_split_is_consistent(&leakage2, tolerance),
             "a non-orthogonal Qp/Qn split must be rejected"
         );
+    }
+
+    /// #4057: the rank the criterion's `log|S|₊` ranges over
+    /// (`balanced_penalty_structural_rank`) and the rank of the
+    /// reparameterization's penalized subspace are one number, for diagonal
+    /// and dense blocks alike, including relative eigenvalues between `1e-12`
+    /// and `1e-8` that the old fixed `1e-8` cut dropped from the split only.
+    #[test]
+    fn structural_rank_and_reparam_split_rank_agree_below_the_old_floor_4057() {
+        let sigma = [1.0, 3.0e-9, 2.0e-10, 4.0e-12];
+        let dense_dim = sigma.len() + 1;
+        let diagonal_dim = sigma.len();
+        let p = dense_dim + diagonal_dim;
+        let dense = block_penalty(rotated_spectrum_root(&sigma), 0, p);
+        let mut diagonal_root = Array2::<f64>::zeros((diagonal_dim, diagonal_dim));
+        for (i, &value) in sigma.iter().enumerate() {
+            diagonal_root[[i, i]] = value.sqrt();
+        }
+        let diagonal = block_penalty(diagonal_root, dense_dim, p);
+        let penalties = vec![dense, diagonal];
+        let structural = super::balanced_penalty_structural_rank(
+            penalties
+                .iter()
+                .map(|cp| (cp.local_ref().view(), cp.col_range.clone())),
+            p,
+        )
+        .expect("structural rank");
+        assert_eq!(structural, 2 * sigma.len());
+        let invariant =
+            precompute_reparam_invariant_from_canonical(&penalties, p).expect("invariant");
+        assert_eq!(invariant.split.q_pen.ncols(), structural);
+        assert_eq!(invariant.split.q_null.ncols(), p - structural);
+        let blocks = invariant.blocks.as_ref().expect("non-overlapping blocks");
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].diagonal_pen_cols.is_none());
+        assert_eq!(blocks[1].diagonal_pen_cols.as_ref().map(Vec::len), Some(sigma.len()));
+        stable_reparameterizationwith_invariant(&penalties, &[1.0, 1.0], p, &invariant)
+            .expect("dense-frame reparameterization");
+        stable_reparameterization_original_frame(
+            &penalties,
+            &[1.0, 1.0],
+            EngineDims::new(p, penalties.len()),
+            Some(&invariant),
+        )
+        .expect("original-frame reparameterization");
     }
 
     #[test]
@@ -3906,7 +4084,7 @@ mod tests {
     #[test]
     fn classify_strict_rejects_nan_eigenvalue() {
         let mut eigs = [1.0, f64::NAN, 0.5];
-        match classify_eigenvalues_strict(&mut eigs, "test_nan") {
+        match classify_eigenvalues_strict(&mut eigs, 0.0, "test_nan") {
             Err(EstimationError::PenaltySpectrumNonFinite {
                 context,
                 index,
@@ -3923,7 +4101,7 @@ mod tests {
     #[test]
     fn classify_strict_rejects_inf_eigenvalue() {
         let mut eigs = [1.0, 0.5, f64::INFINITY];
-        match classify_eigenvalues_strict(&mut eigs, "test_inf") {
+        match classify_eigenvalues_strict(&mut eigs, 0.0, "test_inf") {
             Err(EstimationError::PenaltySpectrumNonFinite { index, value, .. }) => {
                 assert_eq!(index, 2);
                 assert!(value.is_infinite());
@@ -3936,7 +4114,7 @@ mod tests {
     fn classify_strict_rejects_materially_indefinite() {
         // -1e-2 with scale ~1.0 is well above any reasonable roundoff tolerance.
         let mut eigs = [1.0, -1e-2, 0.5];
-        match classify_eigenvalues_strict(&mut eigs, "test_indef") {
+        match classify_eigenvalues_strict(&mut eigs, 0.0, "test_indef") {
             Err(EstimationError::PenaltySpectrumIndefinite {
                 context,
                 index,
@@ -3953,52 +4131,94 @@ mod tests {
 
     #[test]
     fn classify_strict_accepts_roundoff_negative() {
-        // -1e-16 * scale is well within tol = max(p·ε, REL_PSD_FLOOR) * scale.
+        // Exact input (zero assembly band): -1e-16·scale is inside the
+        // eigensolver's own band 4·ε·scale ≈ 8.9e-16·scale.
         let scale = 1.0_f64;
         let roundoff = -1e-16 * scale;
         let mut eigs = [scale, 0.5 * scale, roundoff, 0.25 * scale];
-        classify_eigenvalues_strict(&mut eigs, "test_roundoff").expect("roundoff must classify");
+        classify_eigenvalues_strict(&mut eigs, 0.0, "test_roundoff")
+            .expect("roundoff must classify");
         // The roundoff eigenvalue is snapped to exact zero.
         assert_eq!(eigs[2], 0.0);
         // Strictly positive entries must be preserved.
         assert!(eigs[0] > 0.0 && eigs[1] > 0.0 && eigs[3] > 0.0);
     }
 
+    /// #1619: range blocks at extreme λ used to fail as "indefinite" on
+    /// roundoff, and a fixed `1e-8`-relative floor was added to admit it. The
+    /// admissible roundoff is instead the block's own formation band. Here the
+    /// block is what `penalized_block_spectrum` forms, `Σ_i λ_i d_iᵀd_i` for a
+    /// second-difference root with λ spanning `1e3..1e12`, so its exact null
+    /// space is `{1, x}` and every other eigenvalue is at least
+    /// `λ_min·σ_min(D)² ≈ 24`. At the derived band
+    /// `weighted_gram_assembly_band(rows, 2, Σ λ_i‖d_i‖²) ≈ 8e-3` (plus the
+    /// eigensolver's `p·ε·‖G‖`) the two null eigenvalues — computed at
+    /// far inside it, of either sign — snap to zero, nothing else does, and a
+    /// genuinely negative direction ten bands deep is refused.
     #[test]
-    fn classify_strict_accepts_extreme_lambda_assembly_noise_1619() {
-        // #1619: high-rank thin-plate / Duchon penalties (p≈200) assembled and
-        // reparameterized at extreme λ produce float-noise negative eigenvalues at
-        // ~1e-11 relative to the spectrum scale (~1e13 there). The bare machine-ε
-        // floor (~12×ε relative ≈ 1e-12) rejected these as "indefinite" and
-        // spuriously failed the inner P-IRLS solve. They are PSD to numerical
-        // precision and must be snapped to zero, not rejected.
-        let scale = 8.509e12_f64;
-        // Worst (eig, scale) pair observed in the issue: eig/scale ≈ -7.7e-11.
-        let noise = -6.546e2_f64;
-        assert!(
-            (noise.abs() / scale) < 1.0e-10,
-            "fixture must reproduce the ~1e-11-relative noise from #1619"
+    fn classify_strict_admits_extreme_lambda_gram_roundoff_at_its_formation_band_1619() {
+        let block_dim = 12usize;
+        let root = difference_root(block_dim, &[1.0, -2.0, 1.0]);
+        let rows = root.nrows();
+        let lambdas: Vec<f64> = (0..rows)
+            .map(|i| 10f64.powf(3.0 + 9.0 * i as f64 / (rows - 1) as f64))
+            .collect();
+        let mut gram = Mat::<f64>::zeros(block_dim, block_dim);
+        let mut weighted_row_norm_sum = 0.0_f64;
+        for (i, &lambda) in lambdas.iter().enumerate() {
+            for a in 0..block_dim {
+                weighted_row_norm_sum += lambda * root[[i, a]] * root[[i, a]];
+                for b in 0..block_dim {
+                    gram[(a, b)] += lambda * (root[[i, a]] * root[[i, b]]);
+                }
+            }
+        }
+        let assembly_band =
+            gam_linalg::roundoff::weighted_gram_assembly_band(rows, 2, weighted_row_norm_sum);
+        let (eigenvalues, _) =
+            super::robust_eigh_faer(&gram, faer::Side::Lower, assembly_band, "range penalty block")
+                .expect("formation roundoff of a PSD Gram is admitted at its own band");
+        assert_eq!(
+            eigenvalues.iter().filter(|&&value| value == 0.0).count(),
+            2,
+            "exactly the exact null space {{1, x}} snaps to zero: {eigenvalues:?}"
         );
-        let mut eigs = vec![scale, 0.5 * scale, noise, 0.1 * scale];
-        classify_eigenvalues_strict(&mut eigs, "range penalty block")
-            .expect("a ~1e-11-relative roundoff-negative eigenvalue must be accepted (#1619)");
-        // The roundoff-negative eigenvalue is snapped to exact zero.
-        assert_eq!(eigs[2], 0.0);
-        // Strictly positive entries are preserved.
-        assert!(eigs[0] > 0.0 && eigs[1] > 0.0 && eigs[3] > 0.0);
+        assert!(eigenvalues.iter().all(|&value| value >= 0.0));
+
+        // Negative control: a genuinely negative direction ten bands deep.
+        let band = gam_linalg::roundoff::resolved_eigenvalue_band(&eigenvalues, assembly_band);
+        let depth = 10.0 * band;
+        let unit = 1.0 / (block_dim as f64).sqrt();
+        let mut indefinite = gram.clone();
+        for a in 0..block_dim {
+            for b in 0..block_dim {
+                indefinite[(a, b)] -= depth * unit * unit;
+            }
+        }
+        match super::robust_eigh_faer(
+            &indefinite,
+            faer::Side::Lower,
+            assembly_band,
+            "range penalty block",
+        ) {
+            Err(EstimationError::PenaltySpectrumIndefinite { value, .. }) => {
+                assert!(value < -band, "refused eigenvalue {value:e} lies below -{band:e}");
+            }
+            other => panic!("expected PenaltySpectrumIndefinite, got {:?}", other.map(|r| r.0)),
+        }
     }
 
     #[test]
-    fn classify_strict_tolerance_is_the_larger_of_the_eigensolver_band_and_psd_floor_2469() {
-        // The reported tolerance is exactly `max(p·ε·scale, REL_PSD_FLOOR·scale)`:
-        // the eigensolver's rounding band comes from the roundoff owner, not a
-        // local slack multiplier.
+    fn classify_strict_tolerance_is_the_resolved_eigenvalue_band_2469() {
+        // The reported tolerance is exactly
+        // `resolved_eigenvalue_band(eigs, assembly_band)` — the predicate the
+        // structural rank counts with — not a local floor or slack multiplier.
         let scale = 3.0_f64;
-        let offending = -2.0 * REL_PSD_FLOOR * scale;
+        let assembly_band = 1.0e-9 * scale;
+        let offending = -2.0 * assembly_band;
         let mut eigs = [scale, 0.5 * scale, offending];
-        let expected = gam_linalg::roundoff::symmetric_spectrum_rounding_band(&eigs)
-            .max(REL_PSD_FLOOR * scale);
-        match classify_eigenvalues_strict(&mut eigs, "test_band") {
+        let expected = gam_linalg::roundoff::resolved_eigenvalue_band(&eigs, assembly_band);
+        match classify_eigenvalues_strict(&mut eigs, assembly_band, "test_band") {
             Err(EstimationError::PenaltySpectrumIndefinite { tolerance, .. }) => {
                 assert_eq!(tolerance, expected);
             }
@@ -4006,19 +4226,21 @@ mod tests {
         }
         // Negative control: just inside the same tolerance the eigenvalue is
         // roundoff and snaps to zero.
-        let mut eigs = [scale, 0.5 * scale, -0.5 * REL_PSD_FLOOR * scale];
-        classify_eigenvalues_strict(&mut eigs, "test_band").expect("inside the band snaps");
+        let mut eigs = [scale, 0.5 * scale, -0.5 * assembly_band];
+        classify_eigenvalues_strict(&mut eigs, assembly_band, "test_band")
+            .expect("inside the band snaps");
         assert_eq!(eigs[2], 0.0);
     }
 
     #[test]
     fn classify_strict_snaps_subtol_positive_to_zero() {
         // Positive eigenvalues below the tolerance are also snapped to exact 0
-        // so downstream rank counts and pseudo-logdets are deterministic.
+        // so downstream rank counts and pseudo-logdets are deterministic. With
+        // exact input the band is the eigensolver's `2·ε·scale ≈ 4.4e-16·scale`.
         let scale = 10.0_f64;
-        let subtol = 1e-15 * scale;
+        let subtol = 1e-16 * scale;
         let mut eigs = [scale, subtol];
-        classify_eigenvalues_strict(&mut eigs, "test_sub_pos").expect("sub-tol positive ok");
+        classify_eigenvalues_strict(&mut eigs, 0.0, "test_sub_pos").expect("sub-tol positive ok");
         assert_eq!(eigs[1], 0.0);
     }
 

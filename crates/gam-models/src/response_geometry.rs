@@ -806,11 +806,15 @@ impl PreparedSharedTangent {
             k,
         );
         let (values, vectors) = balanced
+            .matrix
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
-        let tolerance = gam_terms::construction::balanced_penalty_rank_tolerance(
-            values.iter().copied().fold(0.0_f64, f64::max),
-        );
+        // The penalized range is the balanced operator's resolved eigenvectors:
+        // the same predicate, at the same assembly band, the fit's structural
+        // rank counts with (`balanced_penalty_structural_rank`).
+        let values = values.to_vec();
+        let tolerance =
+            gam_linalg::roundoff::resolved_eigenvalue_band(&values, balanced.assembly_band);
         let active: Vec<usize> = values
             .iter()
             .enumerate()
