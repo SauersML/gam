@@ -399,6 +399,10 @@ impl SaeManifoldTerm {
             // chokepoint so its gradient/curvature and its line-search value share
             // one `ε` while each atom's live norm moves with the trial decoders.
             self.refresh_amplitude_barrier_gate();
+            // #3515 — freeze the user decoder-incoherence coactivation `W_jk` at the
+            // same chokepoint: its gradient/curvature (assembled below) read `W` as a
+            // constant, so the line-search value must read the same `W`.
+            self.refresh_decoder_incoherence_gate(analytic_penalties);
         }
         let n = self.n_obs();
         let p = self.output_dim();
@@ -2747,7 +2751,7 @@ impl SaeManifoldTerm {
                         rho_local,
                         penalty_scale,
                         projection,
-                    );
+                    )?;
                 }
                 PenaltyTier::Beta => {
                     self.add_factored_beta_penalty_curvature_for_penalty(
@@ -2757,7 +2761,7 @@ impl SaeManifoldTerm {
                         rho_local,
                         penalty_scale,
                         projection,
-                    );
+                    )?;
                 }
                 // A non-nuclear Ψ-tier penalty curves the latent coordinates
                 // and a ρ-tier penalty curves the hyperparameters; neither
@@ -2776,11 +2780,14 @@ impl SaeManifoldTerm {
         rho_local: ArrayView1<'_, f64>,
         penalty_scale: f64,
         projection: &FrameProjection,
-    ) {
+    ) -> Result<(), ArrowSchurError> {
         let p = self.output_dim();
         if let AnalyticPenaltyKind::DecoderIncoherence(base) = penalty {
-            let Some(per_fit) = self.live_decoder_incoherence_penalty(base) else {
-                return;
+            let Some(per_fit) = self
+                .decoder_incoherence_penalty(base)
+                .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?
+            else {
+                return Ok(());
             };
             let beta_dim = self.beta_dim();
             let mut probe = Array1::<f64>::zeros(beta_dim);
@@ -2801,7 +2808,7 @@ impl SaeManifoldTerm {
                     }
                 }
             }
-            return;
+            return Ok(());
         }
         if let AnalyticPenaltyKind::MechanismSparsity(base) = penalty {
             for (per_atom, start, end) in self.live_mechanism_sparsity_penalties(base) {
@@ -2835,7 +2842,7 @@ impl SaeManifoldTerm {
                     }
                 }
             }
-            return;
+            return Ok(());
         }
         if let AnalyticPenaltyKind::NuclearNorm(base) = penalty {
             for (per_atom, start, end) in self.live_nuclear_norm_penalties(base) {
@@ -2864,7 +2871,7 @@ impl SaeManifoldTerm {
                     }
                 }
             }
-            return;
+            return Ok(());
         }
         let beta_dim = self.beta_dim();
         let mut probe = Array1::<f64>::zeros(beta_dim);
@@ -2885,6 +2892,7 @@ impl SaeManifoldTerm {
             }
         }
         assert_eq!(p, self.output_dim());
+        Ok(())
     }
 
     /// #1610 — project the frozen-gate decoder-repulsion PSD majorizer into the

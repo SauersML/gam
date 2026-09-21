@@ -7910,6 +7910,7 @@ mod test_support {
                         endpoint.decoder_repulsion_gate = term.decoder_repulsion_gate.clone();
                         endpoint.barrier_coactivation_gate = term.barrier_coactivation_gate.clone();
                         endpoint.amplitude_barrier_gate = term.amplitude_barrier_gate;
+                        endpoint.decoder_incoherence_gate = term.decoder_incoherence_gate.clone();
                         endpoint.streaming_gates_frozen = true;
                     }
                     match *variable {

@@ -6904,6 +6904,7 @@ impl SaeManifoldTerm {
             self.refresh_decoder_repulsion_gate();
             self.refresh_barrier_coactivation_gate();
             self.refresh_amplitude_barrier_gate();
+            self.refresh_decoder_incoherence_gate(analytic_penalties);
         }
         // #1026/#2230 — keep the best state found inside this bounded inner
         // solve, keyed on the PENALIZED OBJECTIVE (`prefer_candidate_state`):
@@ -8985,6 +8986,10 @@ impl SaeManifoldTerm {
             // chunk routing), so carrying it onto the chunk keeps its assembly from
             // needing a per-chunk refresh, exactly like the gates above.
             term.amplitude_barrier_gate = self.amplitude_barrier_gate;
+            // #3515 — the decoder-incoherence weights `W_jk` are a full-resident
+            // routing statistic; a chunk recomputing them from its own rows would
+            // price a `chunk_size`-dependent penalty.
+            term.decoder_incoherence_gate = self.decoder_incoherence_gate.clone();
             term.streaming_gates_frozen = true;
         }
         Ok(term)

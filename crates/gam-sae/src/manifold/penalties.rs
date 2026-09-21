@@ -521,11 +521,17 @@ pub(crate) struct BarrierCoactivationGate {
 /// its whole hyperparameter solve ([`SaeManifoldTerm::declare_collapse_prevention_gates`]),
 /// so the value it reports is `V(ρ; w₀)` and the frozen-weight gradient is its
 /// exact derivative.
+///
+/// #3515 — the user `DecoderIncoherence` penalty's routing coactivation
+/// `W_jk = (1/n)·Σ_i a_ij·a_ik` is the same kind of routing-derived weight (its
+/// gradient differentiates only the decoder overlaps and reads `W` as a constant),
+/// so it is held in this set under the same discipline.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CollapsePreventionGates {
     pub(crate) decoder_repulsion: Option<Vec<(usize, usize, f64)>>,
     pub(crate) barrier_coactivation: Option<BarrierCoactivationGate>,
     pub(crate) amplitude_barrier: Option<f64>,
+    pub(crate) decoder_incoherence: Option<Vec<(usize, usize, f64)>>,
 }
 
 impl SaeManifoldTerm {
@@ -535,6 +541,7 @@ impl SaeManifoldTerm {
             decoder_repulsion: self.decoder_repulsion_gate.clone(),
             barrier_coactivation: self.barrier_coactivation_gate.clone(),
             amplitude_barrier: self.amplitude_barrier_gate,
+            decoder_incoherence: self.decoder_incoherence_gate.clone(),
         }
     }
 
@@ -545,6 +552,7 @@ impl SaeManifoldTerm {
         self.decoder_repulsion_gate = gates.decoder_repulsion.clone();
         self.barrier_coactivation_gate = gates.barrier_coactivation.clone();
         self.amplitude_barrier_gate = gates.amplitude_barrier;
+        self.decoder_incoherence_gate = gates.decoder_incoherence.clone();
         self.streaming_gates_frozen = true;
     }
 }
@@ -564,17 +572,78 @@ struct BarrierEdge {
 }
 
 impl SaeManifoldTerm {
-    pub(crate) fn live_decoder_incoherence_penalty(
+    /// #3515 — the user [`DecoderIncoherencePenalty`] operator at the current
+    /// decoder state, weighted by the per-assembly FROZEN routing coactivation
+    /// ([`Self::decoder_incoherence_gate`]) when one is installed.
+    ///
+    /// The penalty `P(β, z) = Σ_{j<k} W_jk(a(z))·o_jk(β)` is assembled with its
+    /// β-gradient and PSD β-curvature only; `W` enters them as a constant. The
+    /// line-search value must therefore read the SAME `W` the gradient used, not
+    /// re-derive it from the trial logits (the #1625 value/gradient desync the
+    /// sibling routing gates were frozen against). Falls back to the LIVE
+    /// coactivation only when no refresh ran — a standalone call that evaluates
+    /// value and gradient at one state, so it is self-consistent either way.
+    ///
+    /// `Ok(None)` only for `K < 2` (no pair exists). An operator that cannot be
+    /// built from the installed state (non-finite routing weight, span mismatch, …)
+    /// is an error, never a silently dropped user penalty.
+    pub(crate) fn decoder_incoherence_penalty(
         &self,
         base: &Arc<DecoderIncoherencePenalty>,
-    ) -> Option<DecoderIncoherencePenalty> {
-        let k_atoms = self.k_atoms();
-        if k_atoms < 2 {
-            return None;
+    ) -> Result<Option<DecoderIncoherencePenalty>, String> {
+        if self.k_atoms() < 2 {
+            return Ok(None);
         }
         let p = self.output_dim();
         let block_sizes: Vec<usize> = self.atoms.iter().map(|atom| atom.basis_size()).collect();
         let m_total: usize = block_sizes.iter().sum();
+        let pairs = match &self.decoder_incoherence_gate {
+            Some(frozen) => frozen.clone(),
+            None => self.decoder_incoherence_coactivation_pairs(),
+        };
+        let mut per_fit = DecoderIncoherencePenalty::new_sparse(
+            PsiSlice {
+                range: 0..m_total * p,
+                latent_dim: Some(m_total),
+            },
+            block_sizes,
+            p,
+            pairs,
+            base.weight,
+            base.learnable_weight,
+        )
+        .map_err(|reason| format!("SAE DecoderIncoherence penalty: {reason}"))?;
+        per_fit.rho_index = base.rho_index;
+        per_fit.weight_schedule = base.weight_schedule.clone();
+        Ok(Some(per_fit))
+    }
+
+    /// #3515 — freeze the user decoder-incoherence coactivation `W_jk` at assembly
+    /// entry, at the same chokepoint and under the same lagged-diffusivity
+    /// discipline as [`Self::refresh_barrier_coactivation_gate`]. Installed only
+    /// when `registry` carries a `DecoderIncoherence` penalty (the scan is
+    /// `O(N·K)`, and no other consumer reads it); `None` otherwise, and for
+    /// `K < 2`. An installed gate is the support read at this state — EMPTY when no
+    /// pair co-fires — so a frozen empty support stays empty while the routing moves.
+    pub(crate) fn refresh_decoder_incoherence_gate(
+        &mut self,
+        registry: Option<&AnalyticPenaltyRegistry>,
+    ) {
+        let registered = registry.is_some_and(|registry| {
+            registry
+                .penalties
+                .iter()
+                .any(|penalty| matches!(penalty, AnalyticPenaltyKind::DecoderIncoherence(_)))
+        });
+        self.decoder_incoherence_gate = (registered && self.k_atoms() >= 2)
+            .then(|| self.decoder_incoherence_coactivation_pairs());
+    }
+
+    /// The LIVE sparse routing coactivation `W_jk = (1/n)·Σ_i a_ij·a_ik`, `j < k`,
+    /// over the co-firing pairs only (never-co-firing pairs have `W = 0` and are
+    /// absent).
+    fn decoder_incoherence_coactivation_pairs(&self) -> Vec<(usize, usize, f64)> {
+        let k_atoms = self.k_atoms();
         let gates = self.assignment.assignments();
         let n = gates.nrows();
         let inv_n = if n > 0 { 1.0 / n as f64 } else { 0.0 };
@@ -616,30 +685,12 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        let pairs: Vec<(usize, usize, f64)> = num
-            .into_iter()
+        num.into_iter()
             .filter_map(|((j, k), s)| {
                 let w = s * inv_n;
                 (w != 0.0).then_some((j, k, w))
             })
-            .collect();
-        DecoderIncoherencePenalty::new_sparse(
-            PsiSlice {
-                range: 0..m_total * p,
-                latent_dim: Some(m_total),
-            },
-            block_sizes,
-            p,
-            pairs,
-            base.weight,
-            base.learnable_weight,
-        )
-        .ok()
-        .map(|mut per_fit| {
-            per_fit.rho_index = base.rho_index;
-            per_fit.weight_schedule = base.weight_schedule.clone();
-            per_fit
-        })
+            .collect()
     }
 
     /// #1026 — refresh the frozen per-assembly decoder-repulsion gate from the
@@ -2935,7 +2986,7 @@ impl SaeManifoldTerm {
         rho_local: ArrayView1<'_, f64>,
         penalty_scale: f64,
         dense_beta_curvature: bool,
-    ) -> bool {
+    ) -> Result<bool, ArrowSchurError> {
         // MechanismSparsityPenalty is a group-lasso over a single
         // (latent_dim, p) decoder matrix and indexes its target via
         // `target.range.start + latent * p + feature`, treating its range as
@@ -2954,10 +3005,15 @@ impl SaeManifoldTerm {
         // M_k (per-atom basis sizes), p_out, β target span, and the per-pair
         // co-activation weights `W[j,k] = mean_n gate[n,j]·gate[n,k]` are all
         // injected here from the current SAE state before the penalty's
-        // gradient / PSD curvature are accumulated into the β-tier system.
+        // gradient / PSD curvature are accumulated into the β-tier system. The
+        // coactivation is the per-assembly FROZEN gate (#3515), the same `W` the
+        // line-search value reads.
         if let AnalyticPenaltyKind::DecoderIncoherence(base) = penalty {
-            let Some(per_fit) = self.live_decoder_incoherence_penalty(base) else {
-                return false;
+            let Some(per_fit) = self
+                .decoder_incoherence_penalty(base)
+                .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?
+            else {
+                return Ok(false);
             };
             let beta_dim = self.beta_dim();
             let grad = per_fit.grad_target(target_beta, rho_local);
@@ -2965,7 +3021,7 @@ impl SaeManifoldTerm {
                 sys.gb[j] += penalty_scale * grad[j];
             }
             if !dense_beta_curvature {
-                return true;
+                return Ok(true);
             }
             // `hbb` is the PSD Newton / PIRLS curvature block. The Gauss-Newton
             // (PSD) majorizer is pair-local, so scatter it directly into `sys.hbb`
@@ -2978,7 +3034,7 @@ impl SaeManifoldTerm {
                 penalty_scale,
                 &mut sys.hbb,
             );
-            return true;
+            return Ok(true);
         }
         if let AnalyticPenaltyKind::MechanismSparsity(base) = penalty {
             let mut any = false;
@@ -2994,7 +3050,7 @@ impl SaeManifoldTerm {
                     dense_beta_curvature,
                 );
             }
-            return any;
+            return Ok(any);
         }
         // NuclearNormPenalty is a smoothed sum of singular values of a single
         // (n_eff, latent_dim) matrix. The flat SAE β layout concatenates the
@@ -3016,7 +3072,7 @@ impl SaeManifoldTerm {
                     dense_beta_curvature,
                 );
             }
-            return any;
+            return Ok(any);
         }
         let k = self.beta_dim();
         let grad = penalty.grad_target(target_beta, rho_local);
@@ -3024,7 +3080,7 @@ impl SaeManifoldTerm {
             sys.gb[j] += penalty_scale * grad[j];
         }
         if !dense_beta_curvature {
-            return true;
+            return Ok(true);
         }
         // `hbb` is the PSD Newton / PIRLS curvature block for the β tier:
         // accumulate the PSD majorizer (exact for convex penalties), not the
@@ -3033,7 +3089,7 @@ impl SaeManifoldTerm {
             for j in 0..k {
                 sys.hbb[[j, j]] += penalty_scale * diag[j];
             }
-            return true;
+            return Ok(true);
         }
         let mut probe = Array1::<f64>::zeros(k);
         for j in 0..k {
@@ -3044,7 +3100,7 @@ impl SaeManifoldTerm {
                 sys.hbb[[i, j]] += penalty_scale * hv[i];
             }
         }
-        true
+        Ok(true)
     }
 
     /// Accumulate one atom's MechanismSparsity contribution into `sys`. The
@@ -3189,7 +3245,7 @@ impl SaeManifoldTerm {
                             rho_local,
                             penalty_scale,
                             dense_beta_curvature,
-                        ) {
+                        )? {
                             beta_assembly.record_curvature(dense_beta_curvature);
                         }
                     } else {
@@ -3313,7 +3369,7 @@ impl SaeManifoldTerm {
                         rho_local,
                         penalty_scale,
                         dense_beta_curvature,
-                    ) {
+                    )? {
                         beta_assembly.record_curvature(dense_beta_curvature);
                     }
                 }

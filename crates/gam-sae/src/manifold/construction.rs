@@ -929,6 +929,7 @@ impl SaeManifoldTerm {
             decoder_repulsion_gate: None,
             barrier_coactivation_gate: None,
             amplitude_barrier_gate: None,
+            decoder_incoherence_gate: None,
             // #1801 — default false: the dense/full-batch assembly refreshes the
             // collapse-prevention gates per assembly (bit-for-bit historical). The
             // streaming fit driver re-arms this to freeze them once globally.
@@ -5333,7 +5334,10 @@ impl SaeManifoldTerm {
                 }
                 PenaltyTier::Beta => {
                     if let AnalyticPenaltyKind::DecoderIncoherence(base) = penalty {
-                        if let Some(per_fit) = self.live_decoder_incoherence_penalty(base) {
+                        if let Some(per_fit) = self
+                            .decoder_incoherence_penalty(base)
+                            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?
+                        {
                             value += penalty_scale * per_fit.value(beta.view(), rho_local);
                         }
                     } else if let AnalyticPenaltyKind::MechanismSparsity(base) = penalty {

@@ -538,7 +538,7 @@ impl SaeManifoldTerm {
         // resolved negative basin curvature, descended and converged again, all in
         // ONE gate-frozen scope, so every objective value compared below belongs to
         // the same objective (#2228 Zeno ratchet).
-        let gates_were_frozen = self.freeze_collapse_prevention_gates();
+        let gates_were_frozen = self.freeze_collapse_prevention_gates(registry);
         let evidence_root = loop {
             let cache = match self.converge_inner_for_undamped_logdet_gate_frozen(
                 target,
@@ -2598,7 +2598,7 @@ impl SaeManifoldTerm {
             ridge_ext_coord,
             ridge_beta,
         )?;
-        let gates_were_frozen = self.freeze_collapse_prevention_gates();
+        let gates_were_frozen = self.freeze_collapse_prevention_gates(registry);
         let out = self.penalized_quasi_laplace_criterion_streaming_exact_gate_frozen(
             target,
             rho,

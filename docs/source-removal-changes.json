@@ -3181,5 +3181,13 @@
     ],
     "reason": "#3541: a hybrid Duchon power is read through the fallible duchon_hybrid_s_order, which refuses a fractional s; the truncating power_as_usize view is gone. The d=4-only gh#750 test becomes a d=1,2,4 refusal table (hybrid_duchon_fractional_power_is_refused_in_every_dimension_3541).",
     "evidence": "git grep finds no remaining caller of power_as_usize; every former caller now calls DuchonBasisSpec::hybrid_s_order or duchon_hybrid_s_order."
+  },
+  {
+    "base": "74c2b1d788902aa74c5a7306ae4014e37749e4e3",
+    "items": [
+      "crates/gam-sae/src/manifold/penalties.rs:fn:live_decoder_incoherence_penalty"
+    ],
+    "reason": "#3515: the DecoderIncoherence routing coactivation is frozen per assembly and carried through CollapsePreventionGates, so the line-search value and gradient see one gate. The live per-evaluation recomputation (live_decoder_incoherence_penalty) is replaced by decoder_incoherence_penalty over the frozen gate plus refresh_decoder_incoherence_gate at assembly/reset.",
+    "evidence": "No remaining callers: the only call site in penalties.rs now reads decoder_incoherence_penalty(base) with the frozen gate; covered by gam-sae lib collapse_prevention and decoder_incoherence tests."
   }
 ]
