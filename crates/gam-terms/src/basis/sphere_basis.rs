@@ -1953,11 +1953,11 @@ pub fn build_matern_operator_penalty_psi_derivatives(
     let (s2, s2_psi, s2_psi_psi) =
         gram_and_psi_derivatives_from_operator(&d2, &d2_psi, &d2_psi_psi);
 
-    let (s0_norm, s0_norm_psi, s0_norm_psi_psi, c0) =
+    let (_, s0_norm_psi, s0_norm_psi_psi, c0) =
         normalize_penaltywith_psi_derivatives(&s0, &s0_psi, &s0_psi_psi);
-    let (s1_norm, s1_norm_psi, s1_norm_psi_psi, c1) =
+    let (_, s1_norm_psi, s1_norm_psi_psi, c1) =
         normalize_penaltywith_psi_derivatives(&s1, &s1_psi, &s1_psi_psi);
-    let (s2_norm, s2_norm_psi, s2_norm_psi_psi, c2) =
+    let (_, s2_norm_psi, s2_norm_psi_psi, c2) =
         normalize_penaltywith_psi_derivatives(&s2, &s2_psi, &s2_psi_psi);
     // Gate the operator dials on the Matérn-ν RKHS smoothness EXACTLY as the
     // forward builder `build_matern_operator_penalty_candidates` does (via
@@ -1971,34 +1971,33 @@ pub fn build_matern_operator_penalty_psi_derivatives(
     // set (gam#902).
     let matern_spec = DuchonOperatorPenaltySpec::matern_for_smoothness(nu, d);
     let mut candidates = Vec::with_capacity(4);
-    for (spec_gate, source, matrix, normalization_scale) in [
-        (&matern_spec.mass, PenaltySource::OperatorMass, s0_norm, c0),
+    for (spec_gate, source, operator, normalization_scale) in [
+        (&matern_spec.mass, PenaltySource::OperatorMass, &d0, c0),
         (
             &matern_spec.tension,
             PenaltySource::OperatorTension,
-            s1_norm,
+            &d1,
             c1,
         ),
         (
             &matern_spec.stiffness,
             PenaltySource::OperatorStiffness,
-            s2_norm,
+            &d2,
             c2,
         ),
     ] {
         if !matches!(spec_gate, OperatorPenaltySpec::Active { .. }) {
             continue;
         }
-        candidates.push(PenaltyCandidate {
-            matrix: ConstructiveQuadratic::try_from_dense_psd(
-                matrix,
-                "spherical operator penalty",
-            )?,
-            source,
+        // The forward builder's energy-factor quadratic
+        // (`collocation_operator_penalty_candidate`), so this list's surviving
+        // blocks are the forward list's.
+        candidates.push(collocation_operator_penalty_candidate(
+            operator,
             normalization_scale,
-            kronecker_factors: None,
-            op: None,
-        });
+            source,
+            "Matérn operator penalty",
+        )?);
     }
     let mut first_blocks = vec![s0_norm_psi, s1_norm_psi, s2_norm_psi];
     let mut second_blocks = vec![s0_norm_psi_psi, s1_norm_psi_psi, s2_norm_psi_psi];

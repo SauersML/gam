@@ -4071,4 +4071,135 @@ fn iso_kappa_duchon_psi_gradient_is_certified_at_a_saturated_rho_2461() {
     );
 }
 
+
+/// #3236 item 2: `y ~ matern(x, z)` under Gamma ended its iso-kappa joint REML
+/// search on a BFGS cost stall with `|g| = 1.56` at the point below. The analytic
+/// outer gradient of production's route must agree with Richardson-extrapolated
+/// central differences of the route's own value, in every coordinate, at the
+/// route's seed and at that stalled point.
+#[test]
+fn matern_gamma_surface_route_gradient_matches_its_value_3236() {
+    use crate::fit_orchestration::{FitConfig, FitRequest, materialize};
+    const CSV: &str = include_str!("../../../tests/suite/fixtures/matern_gamma_surface_3236_seed0.csv");
+    let mut reader = csv::Reader::from_reader(CSV.as_bytes());
+    let headers: Vec<String> = reader.headers().expect("header").iter().map(str::to_string).collect();
+    let rows: Vec<csv::StringRecord> = reader.records().map(|r| r.expect("row")).collect();
+    let dataset = gam_data::encode_recordswith_inferred_schema(headers, rows).expect("encode");
+    let config = FitConfig { family: Some("gamma".to_string()), ..FitConfig::default() };
+    let materialized = materialize("y ~ matern(x, z)", &dataset, &config).expect("materialize");
+    let FitRequest::Standard(req) = materialized.request else {
+        panic!("a Gamma matern formula materializes a standard request");
+    };
+    let data = req.data.view();
+    let y = req.y.as_ref().clone();
+    let weights = req.weights.as_ref().clone();
+    let offset = req.offset.as_ref().clone();
+    let SpatialKappaIncumbent::Joint { resolvedspec, best, spatial_terms, .. } = spatial_kappa_incumbent(
+        data,
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &req.spec,
+        &req.family,
+        &req.options,
+        &req.kappa_options,
+        None,
+    )
+    .unwrap_or_else(|e| panic!("incumbent failed: {e:?}"))
+    else {
+        panic!("matern(x, z) enrolls a spatial coordinate");
+    };
+    let seed = exact_joint_spatial_seed(data, &resolvedspec, &best, &spatial_terms)
+        .unwrap_or_else(|e| panic!("seed failed: {e:?}"));
+    let inputs = exact_joint_spatial_inputs(
+        seed.kind.label(),
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &best.design,
+        &req.family,
+        &req.options,
+    )
+    .unwrap_or_else(|e| panic!("route inputs failed: {e:?}"));
+    let mut route = prepare_exact_joint_spatial_route(
+        seed.kind,
+        data,
+        inputs.response(y.view()),
+        weights.view(),
+        inputs.offset.view(),
+        &inputs.external_opts,
+        &resolvedspec,
+        &best.design,
+        &req.family,
+        &req.options,
+        &spatial_terms,
+        &seed.dims_per_term,
+        &seed.theta0,
+        &seed.lower,
+        &seed.upper,
+        seed.rho_dim,
+    )
+    .unwrap_or_else(|e| panic!("route preparation failed: {e:?}"));
+    eprintln!(
+        "[#3236] rho_dim={} theta0={:?} lower={:?} upper={:?} analytic_hessian={}",
+        seed.rho_dim,
+        seed.theta0.to_vec(),
+        seed.lower.to_vec(),
+        seed.upper.to_vec(),
+        route.analytic_outer_hessian_available
+    );
+    let stalled = Array1::from(vec![
+        -7.138052615406451,
+        4.3282286611716385,
+        -0.8824115003831278,
+        6.3048482415324685,
+        1.4397792797122901,
+    ]);
+    let mut points = vec![("theta0", seed.theta0.clone())];
+    if stalled.len() == seed.theta0.len() {
+        points.push(("stalled", stalled));
+    }
+    let mut failures = Vec::new();
+    for (name, theta) in points {
+        let (value, gradient, _) = route
+            .ctx
+            .eval_full(
+                &theta,
+                gam_solve::rho_optimizer::OuterEvalOrder::ValueAndGradient,
+                route.analytic_outer_hessian_available,
+            )
+            .unwrap_or_else(|e| panic!("{name}: analytic evaluation failed: {e:?}"));
+        let base = route.ctx.eval_cost(&theta).unwrap_or_else(|e| panic!("{name}: cost failed: {e:?}"));
+        eprintln!("[#3236 {name}] value={value:+.12e} eval_cost={base:+.12e} gradient={:?}", gradient.to_vec());
+        for k in 0..theta.len() {
+            let mut cost_at = |shift: f64| -> f64 {
+                let mut t = theta.clone();
+                t[k] += shift;
+                route.ctx.eval_cost(&t).unwrap_or_else(|e| panic!("{name}: cost at k={k} shift {shift:e}: {e:?}"))
+            };
+            let h = 1e-3_f64;
+            let central = [h, 2.0 * h, 4.0 * h].map(|step| (cost_at(step) - cost_at(-step)) / (2.0 * step));
+            let reference = (4.0 * central[0] - central[1]) / 3.0;
+            let coarse = (4.0 * central[1] - central[2]) / 3.0;
+            let bar = 4.0 * (reference - coarse).abs() + 1.0e-9 * gradient[k].abs().max(reference.abs());
+            let ok = (gradient[k] - reference).abs() <= bar.max(1e-6 * (1.0 + value.abs()));
+            eprintln!(
+                "[#3236 {name} k={k}] analytic={:+.10e} reference={reference:+.10e} central={central:?} bar={bar:.3e} ok={ok}",
+                gradient[k]
+            );
+            if !ok {
+                failures.push(format!("{name} k={k}: analytic {:+.6e} vs differences {reference:+.6e}", gradient[k]));
+            }
+        }
+        // Descent probe along the analytic steepest-descent direction.
+        let gnorm = gradient.dot(&gradient).sqrt();
+        for step in [1e-4, 1e-3, 1e-2, 1e-1] {
+            let t = &theta - &(&gradient * (step / gnorm));
+            let c = route.ctx.eval_cost(&t).map(|c| c - base);
+            eprintln!("[#3236 {name} descent] step={step:e} dV={c:?} predicted={:+.6e}", -step * gnorm);
+        }
+    }
+    assert!(failures.is_empty(), "#3236 analytic outer gradient disagrees with its value: {failures:#?}");
+}
+
 }

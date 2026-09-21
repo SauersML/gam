@@ -3281,6 +3281,32 @@ pub(crate) fn operator_penalty_candidates_closed_form_pure(
     Ok(out)
 }
 
+/// A collocation operator penalty `S = DᵀD / c`, with `c = ‖DᵀD‖_F` the
+/// normalization scale, built from its exact energy factor `D / √c`.
+///
+/// The quadratic keeps every direction `D` resolves, so the block's rank is the
+/// operator's and not a cut on the rounded dense Gram's spectrum. Re-deriving a
+/// factor from the eigenvalues above `dim·1e-10·max|ev|` made the rank a
+/// function of κ: on the #3236 Gamma surface the mass block lost a direction
+/// between ψ = 1.4398 and ψ − 1e-3, the frozen-rank canonicalization refused
+/// that trial, and the outer search stalled against a descent direction it
+/// could not take.
+pub(crate) fn collocation_operator_penalty_candidate(
+    d: &Array2<f64>,
+    normalization_scale: f64,
+    source: PenaltySource,
+    context: &str,
+) -> Result<PenaltyCandidate, BasisError> {
+    let root_scale = normalization_scale.sqrt();
+    Ok(PenaltyCandidate {
+        matrix: ConstructiveQuadratic::from_energy_factor(d.mapv(|v| v / root_scale), context)?,
+        source,
+        normalization_scale,
+        kronecker_factors: None,
+        op: None,
+    })
+}
+
 /// Mass, tension and stiffness candidates gated by `spec`, followed by the
 /// third-order candidate whenever `third_order_gram` is present (its presence is
 /// the gate: the collocation builder emits it exactly when the kernel admits the
@@ -3292,46 +3318,35 @@ pub(crate) fn operator_penalty_candidates_from_collocation(
     third_order_gram: Option<&Array2<f64>>,
     spec: &DuchonOperatorPenaltySpec,
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
-    let s0_raw = symmetrize(&fast_ata(d0));
-    let (s0, c0) = normalize_penalty(&s0_raw);
-    let (s1, c1) = normalize_penalty(&symmetrize(&fast_ata(d1)));
-    let (s2, c2) = normalize_penalty(&symmetrize(&fast_ata(d2)));
+    fn collocation_candidate(
+        d: &Array2<f64>,
+        source: PenaltySource,
+        context: &str,
+    ) -> Result<PenaltyCandidate, BasisError> {
+        let (_, normalization_scale) = normalize_penalty(&symmetrize(&fast_ata(d)));
+        collocation_operator_penalty_candidate(d, normalization_scale, source, context)
+    }
     let mut out = Vec::new();
     if matches!(spec.mass, OperatorPenaltySpec::Active { .. }) {
-        out.push(PenaltyCandidate {
-            matrix: ConstructiveQuadratic::try_from_dense_psd(
-                s0,
-                "collocation operator mass penalty",
-            )?,
-            source: PenaltySource::OperatorMass,
-            normalization_scale: c0,
-            kronecker_factors: None,
-            op: None,
-        });
+        out.push(collocation_candidate(
+            d0,
+            PenaltySource::OperatorMass,
+            "collocation operator mass penalty",
+        )?);
     }
     if matches!(spec.tension, OperatorPenaltySpec::Active { .. }) {
-        out.push(PenaltyCandidate {
-            matrix: ConstructiveQuadratic::try_from_dense_psd(
-                s1,
-                "collocation operator tension penalty",
-            )?,
-            source: PenaltySource::OperatorTension,
-            normalization_scale: c1,
-            kronecker_factors: None,
-            op: None,
-        });
+        out.push(collocation_candidate(
+            d1,
+            PenaltySource::OperatorTension,
+            "collocation operator tension penalty",
+        )?);
     }
     if matches!(spec.stiffness, OperatorPenaltySpec::Active { .. }) {
-        out.push(PenaltyCandidate {
-            matrix: ConstructiveQuadratic::try_from_dense_psd(
-                s2,
-                "collocation operator stiffness penalty",
-            )?,
-            source: PenaltySource::OperatorStiffness,
-            normalization_scale: c2,
-            kronecker_factors: None,
-            op: None,
-        });
+        out.push(collocation_candidate(
+            d2,
+            PenaltySource::OperatorStiffness,
+            "collocation operator stiffness penalty",
+        )?);
     }
     if let Some(gram) = third_order_gram {
         let (s3, c3) = normalize_penalty(&symmetrize(gram));
