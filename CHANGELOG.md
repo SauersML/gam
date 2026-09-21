@@ -1,5 +1,13 @@
 ## Unreleased
 
+## gamfit 0.1.269 (2026-09-21)
+
+- A Bernoulli marginal-slope prediction table carries `mean_score_derivative`
+  (`d mean / dz`) and `probit_score_derivative` (`d probit(mean) / dz`), the
+  posterior-mean risk's analytic derivative in the score column, integrated at
+  the posterior nodes that give the risk. `gam predict` writes the same columns.
+- The marginal-slope same-β caches are keyed on the data and the latent law they
+  read, not on buffer addresses.
 - **The constrained cone term skipped every Firth fit on a premise about the stored gradient that
   is not true** (gam#2765). The criterion's constrained term was declared inapplicable under Firth
   bias reduction because `PirlsResult::penalized_gradient_transformed` was read as
