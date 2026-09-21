@@ -128,15 +128,6 @@ pub(crate) fn run_fit_multinomial(
     if fit_config.transformation_normal {
         return Err("--transformation-normal conflicts with --family multinomial".to_string());
     }
-    if parsed.linkspec.is_some() {
-        return Err(
-            "link(...) is not supported for --family multinomial; the softmax link is fixed"
-                .to_string(),
-        );
-    }
-    if parsed.linkwiggle.is_some() {
-        return Err("linkwiggle(...) is not supported for --family multinomial".to_string());
-    }
     if fit_config.firth {
         return Err(
             "--firth is not accepted for --family multinomial: the Firth/Jeffreys separation \
@@ -148,9 +139,10 @@ pub(crate) fn run_fit_multinomial(
         return Err("frailty options are not supported for --family multinomial".to_string());
     }
     // Case weights (`--weights-column` → `fit_config.weight_column`) are
-    // honored by the shared driver; offsets and the other config fields the
-    // softmax family cannot consume are rejected with a typed error inside
-    // `fit_penalized_multinomial_formula`, shared with the Python surface.
+    // honored by the shared driver; offsets, every link spelling and the other
+    // config fields the softmax family cannot consume are rejected with a typed
+    // error inside `fit_penalized_multinomial_formula`, shared with the Python
+    // surface.
     let Some(out) = args.out.as_ref() else {
         return Err(
             "fit requires --out; refusing to run a training job that writes no model".to_string(),

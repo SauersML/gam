@@ -283,22 +283,21 @@ pub(crate) fn materialize_survival<'a>(
         }
         .into());
     }
-    if parsed.linkspec.is_some()
-        && matches!(
-            survival_mode,
-            SurvivalLikelihoodMode::Transformation
-                | SurvivalLikelihoodMode::Weibull
-                | SurvivalLikelihoodMode::Latent
-                | SurvivalLikelihoodMode::LatentBinary
-        )
-    {
-        return Err(WorkflowError::InvalidConfig {
-            reason: format!(
-                "link(...) is not implemented for survival_likelihood='{}'",
+    if matches!(
+        survival_mode,
+        SurvivalLikelihoodMode::Transformation
+            | SurvivalLikelihoodMode::Weibull
+            | SurvivalLikelihoodMode::Latent
+            | SurvivalLikelihoodMode::LatentBinary
+    ) {
+        refuse_link_spellings(
+            parsed.linkspec.as_ref(),
+            config,
+            &format!(
+                "survival_likelihood='{}'",
                 config.resolved_survival_likelihood()
             ),
-        }
-        .into());
+        )?;
     }
     // The threshold and log-sigma time margins exist only in the location-scale
     // likelihood. Every other mode would build the template and drop it.
@@ -496,9 +495,13 @@ pub(crate) fn materialize_survival<'a>(
     // The formula's `link(...)` with its initialization options names the
     // inverse link, as `link` does; both are read, and a `link` argument that
     // names a different link from the formula's is refused by name. A fit
-    // without a link takes its inverse link from the residual law.
+    // without a link takes its inverse link from the residual law. The link
+    // choice (strict or flexible) is the resolver's reading of all three
+    // spellings, so a `flexible(...)` in the `link` argument beside the
+    // formula's `link(...)`, or `flexible_link=True`, is read (gam#3298).
     let formula_link = parsed.linkspec.as_ref();
-    resolve_link_spellings(formula_link, config.link.as_deref(), false)?;
+    let resolved_link_choice =
+        resolve_link_spellings(formula_link, config.link.as_deref(), config.flexible_link)?;
     let link_name = formula_link
         .map(|spec| spec.link.as_str())
         .or(config.link.as_deref());
@@ -516,14 +519,29 @@ pub(crate) fn materialize_survival<'a>(
         },
     )?;
     // `loglog` and `cauchit` are single-component mixtures, not link choices a
-    // link deviation can flex.
-    let link_choice = if link_name.is_some_and(|name| {
-        let name = name.trim();
-        name.eq_ignore_ascii_case("loglog") || name.eq_ignore_ascii_case("cauchit")
-    }) {
-        None
-    } else {
-        parse_link_choice(link_name, config.flexible_link)?
+    // link deviation can flex, so a request to flex one, by `flexible_link` or
+    // by `flexible(...)`, is refused here rather than dropped or refused only
+    // after the location-scale fit has run (gam#3298).
+    let link_choice = match resolved_link_choice {
+        Some(choice)
+            if choice.mixture_components.is_none()
+                && matches!(choice.link, LinkFunction::LogLog | LinkFunction::Cauchit) =>
+        {
+            if matches!(choice.mode, gam_terms::inference::formula_dsl::LinkMode::Flexible) {
+                return Err(WorkflowError::InvalidConfig {
+                    reason: format!(
+                        "a survival {} link is a single-component mixture, not a link a link \
+                         deviation can flex, so flexible(...) and flexible_link=True are refused \
+                         for it; use the plain {} link",
+                        choice.link.name(),
+                        choice.link.name()
+                    ),
+                }
+                .into());
+            }
+            None
+        }
+        choice => choice,
     };
     // Only the location-scale and marginal-slope likelihoods fit the anchored link
     // deviation a `flexible(...)` link asks for, the one `linkwiggle(...)` gives them;

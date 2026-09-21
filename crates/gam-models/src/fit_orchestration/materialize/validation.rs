@@ -279,6 +279,34 @@ pub(super) fn resolve_link_spellings(
     }))
 }
 
+/// Refuse every link spelling a request carries, for a model with no link to
+/// choose (gam#3298). A request names its link in three places: the formula's
+/// `link(...)`, the `link` argument and the `flexible_link` flag (gamfit's
+/// `link=` and `flexible_link=`). A model whose likelihood has no link, or
+/// fixes its own, fits bit-identically with or without any of them, so each is
+/// refused by name rather than accepted and never read.
+pub(crate) fn refuse_link_spellings(
+    linkspec: Option<&gam_terms::inference::formula_dsl::LinkFormulaSpec>,
+    config: &FitConfig,
+    model: &str,
+) -> Result<(), WorkflowError> {
+    let spelling = if let Some(linkspec) = linkspec {
+        format!("the formula's link(type={})", linkspec.link.trim())
+    } else if let Some(link) = config.link.as_deref() {
+        format!("link=\"{}\"", link.trim())
+    } else if config.flexible_link {
+        "flexible_link=True".to_string()
+    } else {
+        return Ok(());
+    };
+    Err(WorkflowError::InvalidConfig {
+        reason: format!(
+            "{model} has no link to choose, so {spelling} would be accepted and never read; \
+             remove it"
+        ),
+    })
+}
+
 /// Reject a `flexible(...)` link choice (the implicit link wiggle) when the
 /// resolved response family is not binomial.
 ///
@@ -449,5 +477,49 @@ mod binary_response_tests {
         assert!(!is_binary_response(array![1.0e-13, 1.0].view()));
         assert!(!is_binary_response(array![0.0, f64::NAN].view()));
         assert!(!is_binary_response(Array1::<f64>::zeros(0).view()));
+    }
+}
+
+#[cfg(test)]
+mod link_spelling_tests {
+    use super::refuse_link_spellings;
+    use crate::fit_orchestration::{FitConfig, WorkflowError};
+    use gam_terms::inference::formula_dsl::LinkFormulaSpec;
+
+    fn refusal(linkspec: Option<&LinkFormulaSpec>, config: &FitConfig) -> Option<String> {
+        match refuse_link_spellings(linkspec, config, "this model") {
+            Ok(()) => None,
+            Err(WorkflowError::InvalidConfig { reason }) => Some(reason),
+            Err(other) => panic!("a link spelling is a configuration refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_link_spelling_is_refused_by_name_3298() {
+        assert_eq!(refusal(None, &FitConfig::default()), None);
+
+        let formula_link = LinkFormulaSpec {
+            link: " probit ".to_string(),
+            mixture_rho: None,
+            sas_init: None,
+            beta_logistic_init: None,
+        };
+        let reason = refusal(Some(&formula_link), &FitConfig::default()).unwrap();
+        assert!(reason.contains("the formula's link(type=probit)"), "{reason}");
+        assert!(reason.starts_with("this model has no link to choose"), "{reason}");
+
+        let argument_link = FitConfig {
+            link: Some("logit".to_string()),
+            ..FitConfig::default()
+        };
+        let reason = refusal(None, &argument_link).unwrap();
+        assert!(reason.contains("link=\"logit\""), "{reason}");
+
+        let flexible = FitConfig {
+            flexible_link: true,
+            ..FitConfig::default()
+        };
+        let reason = refusal(None, &flexible).unwrap();
+        assert!(reason.contains("flexible_link=True"), "{reason}");
     }
 }

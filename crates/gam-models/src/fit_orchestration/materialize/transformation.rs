@@ -7,12 +7,11 @@ pub(crate) fn materialize_transformation_normal<'a>(
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
     reject_unrealized_precision_priors(config, "transformation-normal models", false)?;
-    if parsed.linkspec.is_some() {
-        return Err(WorkflowError::InvalidConfig {
-            reason: "link(...) is not supported for the transformation-normal family".to_string(),
-        }
-        .into());
-    }
+    refuse_link_spellings(
+        parsed.linkspec.as_ref(),
+        config,
+        "the transformation-normal family",
+    )?;
     if parsed.linkwiggle.is_some() {
         return Err(WorkflowError::InvalidConfig {
             reason: "linkwiggle(...) is not supported for the transformation-normal family"
