@@ -63,9 +63,17 @@ runs:
         # against jammy's R while the runner now ships noble's newer R, so every
         # binary mismatches and install silently falls back to a source build
         # that the old `try(silent=TRUE)` swallowed -> the "no package called
-        # 'tram'/'scoringrules'" + "dependency 'gsl' is not available" REF_ERRORs
+        # 'tram'" + "dependency 'gsl' is not available" REF_ERRORs
         # (#1071). Derive the codename from the live runner so the binary
         # snapshot always matches the R that loads the packages.
+        #
+        # CRAN is case-sensitive and the two ecosystems disagree on this name:
+        # the R forecast-verification package is `scoringRules`, the PyPI one is
+        # `scoringrules`. The list below carried the PyPI spelling, so every run
+        # spent a binary pass and a source pass on a name CRAN does not have
+        # ("package 'scoringrules' is not available ... Perhaps you meant
+        # 'scoringRules'?") and the load check then reported the comparator
+        # missing. The R name is now the R one; the pip line keeps the PyPI one.
         . /etc/os-release
         CODENAME="${VERSION_CODENAME:-noble}"
         POSIT="https://packagemanager.posit.co/cran/__linux__/${CODENAME}/latest"
@@ -82,7 +90,7 @@ runs:
                     "scam","splines2","cmprsk","lme4","nlme","fields","gss","GpGp",
                     "gsl","quantreg","mlt","tram","basefun","loo","jsonlite",
                     "spheresmooth","Directional","nprotreg","compositions",
-                    "robCompositions","scoringrules","gamboostLSS","mboost","bamlss",
+                    "robCompositions","scoringRules","gamboostLSS","mboost","bamlss",
                     "gamlss.add","DirichletReg",
                     # KFAS: mature R state-space/Kalman smoother — the second
                     # opinion beside INLA on the RW2/SPDE penalised-baseline
@@ -91,7 +99,7 @@ runs:
           for (p in pkgs) if (!requireNamespace(p, quietly=TRUE))
             try(install.packages(p), silent=TRUE)
           # SECOND pass: anything still missing (a binary that mismatched the
-          # runner R, or a snapshot gap such as scoringrules / tram / gsl) is
+          # runner R, or a snapshot gap such as tram / gsl) is
           # force-built from SOURCE off canonical CRAN, where every CRAN package
           # is always available for the current R. This is the durable cure for
           # the REF_ERRORs rather than papering over a distro/R-version skew.
@@ -319,11 +327,11 @@ runs:
         Rscript -e 'for (p in c("mgcv","gamlss","survival")) library(p, character.only=TRUE); cat("R core refs ok\n")'
         # Surface the EXACT load error for the two tools this action provisions
         # but cannot hard-require (large/native): INLA's bundled-binary dyn.load
-        # and the source-built scoringrules. Non-fatal — the quality suite
+        # and the source-built scoringRules. Non-fatal — the quality suite
         # classifies a still-missing tool as a captured reference error — but the
         # message tells us precisely which system lib / binary arch is missing.
         Rscript -e '
-          for (p in c("INLA","scoringrules")) {
+          for (p in c("INLA","scoringRules")) {
             ok <- tryCatch({ suppressMessages(library(p, character.only=TRUE)); TRUE },
                            error = function(e) { cat(sprintf("%s load error: %s\n", p, conditionMessage(e))); FALSE })
             cat(sprintf("  %-12s loadable=%s\n", p, ok))

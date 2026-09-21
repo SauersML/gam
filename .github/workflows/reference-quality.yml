@@ -148,7 +148,7 @@ jobs:
           # REF_ERROR among comparators the job GUARANTEES are installed (the
           # install-reference-tools action hard-fails if mgcv/gamlss/survival do
           # not load). For those tests a lost reference is a genuine breakage, not the
-          # tolerated "optional native tool missing" case (INLA/scoringrules/PyMC),
+          # tolerated "optional native tool missing" case (INLA/scoringRules/PyMC),
           # so it must gate the run rather than be absorbed by the 25% global floor.
           guaranteed_referr=0
           # EVERYTHING the run produced lands under one directory that is uploaded
@@ -585,7 +585,7 @@ jobs:
           fi
           # PER-COMPARATOR COVERAGE FLOOR (#1082, GPT-5.5 Pro concern: "quality runs
           # passing without reference coverage"). The 25% global floor below tolerates
-          # missing OPTIONAL native references (INLA/scoringrules/PyMC). But the job
+          # missing OPTIONAL native references (INLA/scoringRules/PyMC). But the job
           # HARD-VERIFIES that mgcv/gamlss/survival load before running (the
           # install-reference-tools action fails otherwise), so a REF_ERROR on any test
           # backed by one of those is NOT a missing-infra waiver — it is a genuine
