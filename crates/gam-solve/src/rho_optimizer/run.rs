@@ -3664,6 +3664,7 @@ fn certify_fixed_point_optimality(
         ),
         newton_polish: None,
         curvature_floor: None,
+        criterion_error: None,
     };
     result.criterion_certificate = Some(certificate.clone());
     if !certificate.certifies() {
@@ -3838,6 +3839,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             railed_facts: Vec::new(),
             newton_polish: None,
             curvature_floor: None,
+            criterion_error: None,
         };
         result.final_value = value;
         result.final_grad_norm = Some(0.0);
@@ -4672,6 +4674,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                     ),
                     newton_polish: None,
                     curvature_floor: None,
+                    criterion_error: None,
                 };
                 // Move the certified curvature onto the result; the mint path returns
                 // immediately, so the fall-through below never observes the move.
@@ -4698,6 +4701,10 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     }
 
     let mut certified_projected_grad_norm = projected_grad_norm;
+    // Whether the large-step flatness certificate below moved coordinates onto
+    // the face. Their decrease left is bounded only across the ±1 probe, not to
+    // the minimum, so the criterion value then carries no error bound (#3331).
+    let mut flatness_moved_face = false;
     if projected_grad_norm > stationarity_bound
         && let Some(hessian) = analytic_hessian.as_ref()
         && certificate_hessian_is_psd_off_railed(
@@ -4773,6 +4780,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             }
         }
         if !probe_failed && !saturated_flat.is_empty() {
+            flatness_moved_face = true;
             // Recompute |Pg| with the provably macroscopically-flat coordinates
             // removed: their measured gradient is deterministic cancellation bias,
             // not slope. Coordinates that moved keep their component and still count
@@ -4905,6 +4913,18 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                 criterion_invariance.as_ref(),
             )
         }),
+        // #3331: the Newton decrement bounds the decrease left to the minimum;
+        // no other rung bounds the criterion value, so only it records one.
+        criterion_error: decrement_decided
+            .as_ref()
+            .filter(|_| !flatness_moved_face)
+            .and_then(|(decision, _)| match &decision.verdict {
+                opt::DecrementVerdict::Certified(evidence) => Some(CriterionErrorBound {
+                    decrease_left: evidence.lambda_sq + evidence.band_lambda_sq,
+                    value_band: decision.objective_band.total(),
+                }),
+                _ => None,
+            }),
     };
     // Install the measured evidence before deciding its verdict.  A rejected
     // candidate is retained only as a resumable checkpoint, and that

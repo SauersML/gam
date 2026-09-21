@@ -24,6 +24,7 @@ fn clean_criterion() -> OuterCriterionCertificate {
         railed_facts: Vec::new(),
         newton_polish: None,
         curvature_floor: None,
+        criterion_error: None,
     }
 }
 

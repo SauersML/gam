@@ -1583,7 +1583,7 @@ fn planned_radial_centers(basis: &SmoothBasisSpec) -> (usize, bool) {
 }
 
 #[test]
-fn adaptive_univariate_duchon_start_preserves_formula_floor_and_applies_growth_1867() {
+fn adaptive_univariate_duchon_start_keeps_the_provisioned_default_it_cannot_grow_1867_3331() {
     let data = univariate_radial_workflow_dataset();
 
     let label = "Duchon";
@@ -1615,18 +1615,24 @@ fn adaptive_univariate_duchon_start_preserves_formula_floor_and_applies_growth_1
     };
     let (initial_centers, initial_is_auto) =
         planned_radial_centers(&initial_request.spec.smooth_terms[0].basis);
-    // #3149: the orchestrated request starts at the pilot (here the rate count
-    // `starting_num_centers`, which the pilot `s(x)` floor does not exceed:
-    // both are sized at the minimal embedding order, #3331), and the raw
-    // request, which nothing grows, at the provisioned default above it.
+    // #3149 starts at the pilot only a basis the loop grows. The 1-D Duchon
+    // default places its centers on a uniform grid, and a refined uniform grid
+    // re-places every center rather than nesting the coarse one. So the loop
+    // never grows it (#3331, `adaptive_refinement_can_nest`), and the
+    // orchestrated request keeps the provisioned default, the same as the raw
+    // request.
+    let basis = &initial_request.spec.smooth_terms[0].basis;
+    assert!(
+        !gam_terms::smooth::adaptive_refinement_can_nest(basis),
+        "the 1-D {label} uniform-grid default must not be a nesting refinement"
+    );
     assert_eq!(
-        initial_centers,
-        starting_num_centers(data.values.nrows(), 1, 2),
-        "an absent adaptive proposal must start the 1-D {label} at its pilot"
+        initial_centers, raw_centers,
+        "a 1-D {label} the loop cannot grow must keep its provisioned default, not the pilot"
     );
     assert!(
-        raw_centers > initial_centers,
-        "the provisioned 1-D {label} default ({raw_centers}) sits above the pilot ({initial_centers})"
+        raw_centers > starting_num_centers(data.values.nrows(), 1, 2),
+        "the provisioned 1-D {label} default ({raw_centers}) sits above the pilot"
     );
     assert!(
         initial_is_auto,

@@ -6195,6 +6195,7 @@ fn strict_curvature_requirement_does_not_reinterpret_floor_clearance_as_psd() {
             decided_at_resolution: f64::EPSILON.sqrt(),
             cleared: true,
         }),
+        criterion_error: None,
     };
     assert!(
         floor_cleared.certifies(),
@@ -6244,6 +6245,7 @@ fn strict_curvature_requirement_does_not_reinterpret_floor_clearance_as_psd() {
         railed_facts: Vec::new(),
         newton_polish: None,
         curvature_floor: None,
+        criterion_error: None,
     };
     assert!(
         !certificate_meets_curvature_requirement(

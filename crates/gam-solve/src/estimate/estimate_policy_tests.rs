@@ -1297,6 +1297,7 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
                 railed_facts: Vec::new(),
                 newton_polish: None,
                 curvature_floor: None,
+                criterion_error: None,
             }),
             ..Default::default()
         },

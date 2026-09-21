@@ -19,7 +19,7 @@
 //!
 //! # Why a score test and not an EDF-saturation rule
 //!
-//! The engine's `basis_is_saturated` predicate asks whether the term's
+//! An EDF-saturation rule (the deleted `basis_is_saturated`, #3331) asks whether the term's
 //! *penalized* EDF has reached its algebraic ceiling `realized_width −
 //! nullspace_dim`. That fires only when λ has been driven to its floor and the
 //! basis is exhausted. It cannot see a basis that is far too small while λ is
@@ -27,7 +27,7 @@
 //! trades them off against each other. On the #2774 fixture — a 16-D Duchon
 //! smooth with `centers=24`, whose 17-column linear null space leaves a
 //! penalized capacity of ~6 — the fit sits at penalized EDF 3.91, i.e. 65% of
-//! capacity, so `basis_is_saturated` reports "certified" while the residual
+//! capacity, so a saturation rule reports "certified" while the residual
 //! confounding is large enough to produce a `6.2e-5` false association.
 //!
 //! Nor is local residual differencing (mgcv's `k.index`) a substitute. Measured

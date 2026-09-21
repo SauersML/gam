@@ -12,17 +12,17 @@
 //! the spec. An explicit user size carries no adaptive provenance and is never
 //! touched.
 
-use ndarray::{ArrayView1, ArrayView2, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use serde::{Deserialize, Serialize};
 
 use super::{ByVarKind, ByVariableSpec, FactorSmoothFlavour, SmoothBasisSpec};
 use crate::basis::{
     BSplineKnotPlacement, BSplineKnotSpec, CenterStrategy, DuchonNullspaceOrder,
     OneDimensionalBoundary, SPHERICAL_HARMONIC_MAX_DEGREE, SphereMethod, center_strategy_is_auto,
-    center_strategy_with_num_centers, count_unique_coordinate_rows,
+    center_strategy_spectral_basis, center_strategy_with_num_centers, count_unique_coordinate_rows,
     default_spherical_harmonic_degree, duchon_nullspace_dimension, penalized_resolution_rank,
-    refined_harmonic_degree, refined_internal_knots, refined_num_centers, refined_periodic_basis,
-    starting_num_centers, thin_plate_polynomial_basis_dimension,
+    realized_center_strategy, refined_harmonic_degree, refined_internal_knots, refined_num_centers,
+    refined_periodic_basis, starting_num_centers, thin_plate_polynomial_basis_dimension,
 };
 use crate::term_builder::{
     factor_smooth_pilot_internal_knots, pilot_cyclic_basis_dim, pilot_duchon_center_count,
@@ -112,12 +112,20 @@ impl std::fmt::Display for AdaptiveResolution {
 }
 
 fn radial_center_strategy(basis: &SmoothBasisSpec) -> Option<(&CenterStrategy, &[usize])> {
+    radial_center_strategy_any(basis)
+        .filter(|(strategy, cols)| !cols.is_empty() && center_strategy_is_auto(strategy))
+}
+
+/// The center strategy of a radial basis whether or not anybody sized it: a
+/// frozen (fitted) spec carries `UserProvided` centers, which the nesting
+/// check reads.
+fn radial_center_strategy_any(basis: &SmoothBasisSpec) -> Option<(&CenterStrategy, &[usize])> {
     use SmoothBasisSpec as B;
     match basis {
         B::ByVariable { inner, .. } | B::FactorSumToZero { inner, .. } => {
-            radial_center_strategy(inner)
+            radial_center_strategy_any(inner)
         }
-        B::BySmooth { smooth, .. } => radial_center_strategy(smooth),
+        B::BySmooth { smooth, .. } => radial_center_strategy_any(smooth),
         B::ThinPlate {
             feature_cols, spec, ..
         } => Some((&spec.center_strategy, feature_cols.as_slice())),
@@ -138,7 +146,6 @@ fn radial_center_strategy(basis: &SmoothBasisSpec) -> Option<(&CenterStrategy, &
         // contract, so the resolution loop does not claim it.
         _ => None,
     }
-    .filter(|(strategy, cols)| !cols.is_empty() && center_strategy_is_auto(strategy))
 }
 
 fn radial_center_strategy_mut(
@@ -166,6 +173,156 @@ fn radial_center_strategy_mut(
             Some((&mut spec.center_strategy, feature_cols.clone()))
         }
         _ => None,
+    }
+}
+
+/// Whether one level of [`refined_adaptive_resolution`] of `basis` realizes a
+/// basis whose span CONTAINS the current one (#3331).
+///
+/// The growth loop compares two fits' REML/LAML evidence. That comparison is a
+/// Bayes factor between nested smoothing priors only when the coarse basis is a
+/// subspace of the fine one with the same unpenalized null space and penalty
+/// order; between non-nested bases the difference in evidence is the
+/// difference of two unrelated prior normalizers and says nothing about
+/// resolution. So a term is eligible only when its refinement is nested by
+/// construction:
+///
+/// * open B-spline, factor-smooth marginal: `K → 2K + 1` internal knots keeps
+///   every old knot (quantile placement `j/(K+1)` and uniform spacing `h/2`
+///   are both exact in floating point at the refined level);
+/// * cyclic basis: `b → 2b` on the same period halves the uniform spacing;
+/// * harmonic degree: the span of degrees `≤ L` is structural;
+/// * radial centers: only farthest-point centers without a learned spectral
+///   subspace, whose greedy maximin order is (up to capped tie orbits, which
+///   [`realized_basis_nests`] rejects after the fact) a prefix of the refined
+///   selection. Equal-mass, k-means, grid and spectral plans re-place every
+///   center and never nest.
+pub fn adaptive_refinement_can_nest(basis: &SmoothBasisSpec) -> bool {
+    match adaptive_resolution_of(basis) {
+        Some(AdaptiveResolution::Centers(_)) => {
+            radial_center_strategy(basis).is_some_and(|(strategy, _)| {
+                center_strategy_spectral_basis(strategy).is_none()
+                    && matches!(
+                        realized_center_strategy(strategy),
+                        CenterStrategy::FarthestPoint { .. }
+                    )
+            })
+        }
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// `a ⊆ b` as multisets of sorted knot vectors, by exact equality.
+fn knots_nest(coarse: &Array1<f64>, fine: &Array1<f64>) -> bool {
+    let mut fine_iter = fine.iter().copied();
+    'coarse: for &c in coarse.iter() {
+        for f in fine_iter.by_ref() {
+            if f == c {
+                continue 'coarse;
+            }
+            if f > c {
+                return false;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+fn knotspec_nests(coarse: &BSplineKnotSpec, fine: &BSplineKnotSpec) -> bool {
+    match (coarse, fine) {
+        (BSplineKnotSpec::Provided(a), BSplineKnotSpec::Provided(b)) => knots_nest(a, b),
+        (
+            BSplineKnotSpec::PeriodicUniform {
+                data_range: range_a,
+                num_basis: b1,
+                ..
+            },
+            BSplineKnotSpec::PeriodicUniform {
+                data_range: range_b,
+                num_basis: b2,
+                ..
+            },
+        ) => range_a == range_b && *b1 > 0 && b2 % b1 == 0,
+        _ => false,
+    }
+}
+
+fn bspline_nests(
+    coarse: &crate::basis::BSplineBasisSpec,
+    fine: &crate::basis::BSplineBasisSpec,
+) -> bool {
+    coarse.degree == fine.degree
+        && coarse.penalty_order == fine.penalty_order
+        && coarse.double_penalty == fine.double_penalty
+        && std::mem::discriminant(&coarse.boundary) == std::mem::discriminant(&fine.boundary)
+        && knotspec_nests(&coarse.knotspec, &fine.knotspec)
+}
+
+fn rows_nest(coarse: &Array2<f64>, fine: &Array2<f64>) -> bool {
+    coarse.ncols() == fine.ncols()
+        && coarse
+            .rows()
+            .into_iter()
+            .all(|row| fine.rows().into_iter().any(|other| other == row))
+}
+
+/// Whether the FROZEN (fitted) spec `fine` realizes a basis whose span contains
+/// the frozen spec `coarse`'s, with the same degree, penalty order and null
+/// space (#3331). Both arguments come from
+/// [`super::freeze_term_collection_from_design`], so they carry the knots and
+/// centers the fits actually used, not the requests that produced them. The
+/// check is exact: a refinement whose realized knots or centers drifted is not
+/// nested and its evidence is never compared against the coarse fit's.
+pub fn realized_basis_nests(coarse: &SmoothBasisSpec, fine: &SmoothBasisSpec) -> bool {
+    use SmoothBasisSpec as B;
+    match (coarse, fine) {
+        (B::ByVariable { inner: a, .. }, B::ByVariable { inner: b, .. })
+        | (B::FactorSumToZero { inner: a, .. }, B::FactorSumToZero { inner: b, .. }) => {
+            realized_basis_nests(a, b)
+        }
+        (B::BySmooth { smooth: a, .. }, B::BySmooth { smooth: b, .. }) => {
+            realized_basis_nests(a, b)
+        }
+        (
+            B::BSpline1D {
+                feature_col: col_a,
+                spec: a,
+            },
+            B::BSpline1D {
+                feature_col: col_b,
+                spec: b,
+            },
+        ) => col_a == col_b && bspline_nests(a, b),
+        (B::FactorSmooth { spec: a }, B::FactorSmooth { spec: b }) => {
+            a.continuous_cols == b.continuous_cols
+                && a.group_col == b.group_col
+                && std::mem::discriminant(&a.flavour) == std::mem::discriminant(&b.flavour)
+                && bspline_nests(&a.marginal, &b.marginal)
+        }
+        (B::Sphere { spec: a, .. }, B::Sphere { spec: b, .. })
+            if matches!(a.method, SphereMethod::Harmonic)
+                && matches!(b.method, SphereMethod::Harmonic) =>
+        {
+            a.penalty_order == b.penalty_order
+                && a.double_penalty == b.double_penalty
+                && matches!((a.max_degree, b.max_degree), (Some(la), Some(lb)) if lb >= la)
+        }
+        _ => match (
+            radial_center_strategy_any(coarse),
+            radial_center_strategy_any(fine),
+        ) {
+            (
+                Some((CenterStrategy::UserProvided(a), cols_a)),
+                Some((CenterStrategy::UserProvided(b), cols_b)),
+            ) => {
+                std::mem::discriminant(coarse) == std::mem::discriminant(fine)
+                    && cols_a == cols_b
+                    && rows_nest(a, b)
+            }
+            _ => false,
+        },
     }
 }
 
@@ -577,6 +734,58 @@ pub fn apply_adaptive_resolution(
 #[cfg(test)]
 mod tests {
     use super::AdaptiveResolution as R;
+    use super::{knots_nest, knotspec_nests};
+    use crate::basis::BSplineKnotSpec;
+    use ndarray::Array1;
+
+    /// Quantile knots at level `k` sit at `j/(k+1)`; the refined level
+    /// `2k+1` places `2j/(2k+2)`, which rounds to the same float, so the
+    /// realized coarse knot vector is a sub-multiset of the refined one.
+    #[test]
+    fn quantile_and_uniform_knot_chains_nest_exactly() {
+        let lo = -1.3_f64;
+        let hi = 2.7_f64;
+        for k in [1usize, 3, 4, 7, 10, 19] {
+            let fine_k = crate::basis::refined_internal_knots(k);
+            let quantile =
+                |m: usize| -> Array1<f64> { (1..=m).map(|j| j as f64 / (m + 1) as f64).collect() };
+            assert!(
+                knots_nest(&quantile(k), &quantile(fine_k)),
+                "quantile k={k}"
+            );
+            let uniform = |m: usize| -> Array1<f64> {
+                let h = (hi - lo) / (m + 1) as f64;
+                let mut v: Vec<f64> = vec![lo; 4];
+                v.extend((1..=m).map(|j| lo + j as f64 * h));
+                v.extend([hi; 4]);
+                Array1::from(v)
+            };
+            assert!(knots_nest(&uniform(k), &uniform(fine_k)), "uniform k={k}");
+            // A different, non-refined level does not nest.
+            assert!(
+                !knots_nest(&uniform(k + 1), &uniform(fine_k)),
+                "k+1={}",
+                k + 1
+            );
+        }
+        // Boundary multiplicity counts: a coarse vector with more repeats
+        // than the fine one is not contained.
+        let a = Array1::from(vec![0.0, 0.0, 0.0, 1.0]);
+        let b = Array1::from(vec![0.0, 0.0, 0.5, 1.0]);
+        assert!(!knots_nest(&a, &b));
+    }
+
+    #[test]
+    fn periodic_chain_nests_only_on_the_same_period() {
+        let spec = |range: (f64, f64), b: usize| BSplineKnotSpec::PeriodicUniform {
+            data_range: range,
+            num_basis: b,
+            adaptive: false,
+        };
+        assert!(knotspec_nests(&spec((0.0, 1.0), 6), &spec((0.0, 1.0), 12)));
+        assert!(!knotspec_nests(&spec((0.0, 1.0), 6), &spec((0.0, 1.0), 9)));
+        assert!(!knotspec_nests(&spec((0.0, 1.0), 6), &spec((0.0, 1.1), 12)));
+    }
 
     #[test]
     fn path_reaches_the_target_and_never_retreats() {

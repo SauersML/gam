@@ -458,6 +458,7 @@ pub fn fit_shared_tangent_reml(
                 railed_facts: Vec::new(),
                 newton_polish: None,
                 curvature_floor: None,
+                criterion_error: None,
             },
         )
     } else {

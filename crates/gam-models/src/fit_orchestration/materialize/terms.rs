@@ -49,22 +49,36 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
 /// Only a smooth whose size nobody chose carries an adaptive resolution
 /// ([`gam_terms::smooth::adaptive_resolution_of`]); every explicit
 /// formula/programmatic size is left alone. A plan entry is the loop's
-/// evidence-backed refinement of that smooth; a missing entry starts it at its
-/// pilot ([`gam_terms::smooth::starting_resolution`]). The pilot is also the
-/// root every refinement is nested over, so it is written with the target.
-/// Python `smooths={...}` overrides are applied by the caller AFTER this, so
-/// they override the refined value unconditionally.
+/// evidence-backed refinement of that smooth. A missing entry starts it at its
+/// pilot ([`gam_terms::smooth::starting_resolution`]), but only when the loop
+/// can grow it, meaning its refinement nests
+/// ([`gam_terms::smooth::adaptive_refinement_can_nest`], #3331). A basis whose
+/// refinement does not nest is never grown, so it keeps its provisioned
+/// default; started at the pilot, it would stay there (#3149). The pilot is
+/// also the root every refinement is nested over, so it is written with the
+/// target. Python `smooths={...}` overrides are applied by the caller AFTER
+/// this, so they override the refined value unconditionally.
 fn apply_adaptive_resolution_plan(
     spec: &mut TermCollectionSpec,
     data: &Dataset,
     plan: &[Option<gam_terms::smooth::AdaptiveResolution>],
 ) -> Result<(), WorkflowError> {
-    use gam_terms::smooth::{adaptive_resolution_of, apply_adaptive_resolution, starting_resolution};
+    use gam_terms::smooth::{
+        adaptive_refinement_can_nest, adaptive_resolution_of, apply_adaptive_resolution,
+        starting_resolution,
+    };
     if data.values.nrows() == 0 {
         return Ok(());
     }
     for (term_index, term) in spec.smooth_terms.iter_mut().enumerate() {
         if adaptive_resolution_of(&term.basis).is_none() {
+            continue;
+        }
+        let requested = plan.get(term_index).cloned().flatten();
+        // A basis whose refinement does not nest is never grown by the loop
+        // (#3331), so it keeps its provisioned default: started at the pilot it
+        // could never leave, it would only lose resolution (#3149).
+        if requested.is_none() && !adaptive_refinement_can_nest(&term.basis) {
             continue;
         }
         let start = starting_resolution(&term.basis, data.values.view()).ok_or_else(|| {
@@ -75,11 +89,7 @@ fn apply_adaptive_resolution_plan(
                 ),
             }
         })?;
-        let target = plan
-            .get(term_index)
-            .cloned()
-            .flatten()
-            .unwrap_or_else(|| start.clone());
+        let target = requested.unwrap_or_else(|| start.clone());
         // Applied even when the count already equals the target: the start is
         // the root the refinement chain grows from, and the spec records it.
         apply_adaptive_resolution(&mut term.basis, &start, &target).map_err(

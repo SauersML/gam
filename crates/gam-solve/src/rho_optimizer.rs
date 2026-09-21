@@ -75,8 +75,8 @@ pub mod zero_smoothing_face;
 
 pub(crate) use crate::model_types::CERTIFICATE_RAIL_MARGIN;
 pub use crate::model_types::{
-    CurvatureFloorClearance, OuterCriterionCertificate, OuterStationarityCertificate,
-    CertifiedRung, CurvatureEvidence, FacePositivityRoute, RailCoordinate, RailTailEvidence,
+    CriterionErrorBound, CurvatureFloorClearance, OuterCriterionCertificate,
+    OuterStationarityCertificate, CertifiedRung, CurvatureEvidence, FacePositivityRoute, RailCoordinate, RailTailEvidence,
     RailedCoordinateFact,
 };
 pub(crate) use bridges::*;
