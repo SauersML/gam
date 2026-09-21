@@ -19,6 +19,25 @@
   for an unfactorable or non-descent system is gone and the trust region starts open.
   **Behavior change:** a row's `converged` verdict, and so `unconverged_fraction`,
   now reads the same at every scaling of the targets and the decoder.
+- **A smooth term whose smoothing-parameter selection cannot be replayed publishes no
+  p-value** (#3857, #3648). `tail_probability_with_bound` answered every
+  `SmoothLrSelection::Declined(_)` with the conditional, fixed-`λ` tail. That law is the
+  selection law only when nothing was selected: `no_penalty_components`, `no_information`
+  (the block was absorbed whole) and `window_closed` (`ρ̂` railed against both walls of
+  its box). Every other decline is a replay that failed while `λ̂` WAS chosen, and the
+  conditional tail then prices `λ̂` as given, which is the anti-conservative reference the
+  replay exists to correct: .1817 / .0917 / .0167 at nominal .10 / .05 / .01 on a Gaussian
+  `n = 200` null. `SmoothLrSelectionDecline::is_refusal` splits the two, refused rows now
+  report `unavailable_reason = "selection_refused"` with no p-value, and a degraded reference
+  lane on a term that does carry estimated penalty components declines with the new
+  `no_spectrum` rather than claiming it had nothing to select. `DiagonalCriterion` also stops
+  forming the share complement as `1 − s`, which cancelled near `s = 1` and left `s(1 − s)`
+  with an absolute error of `ε` instead of `ε·(1 − s)`; it reads `1/(1 + x)` directly, so the
+  second-order enclosure is no longer empty on a Bernoulli null. When the fit has fewer rows
+  than coefficients the profiled-scale residual law keeps `min(n, p)` shares and drops the
+  unit shares of the `p − n` coefficient directions no row reaches, so `h + r` is the fit's own
+  `ν = n − M_p` in both regimes.
+
 - **The block-chart evidence floor is the SSE sum's own rounding band** (#2469).
   `crossfit_evidence` floored both profiled variances at `1.0e-12 * (max SSE / n)`,
   with a second `.max(1.0e-300)` under it to keep an all-zero pair out of `0/0`.
