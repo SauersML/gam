@@ -79,6 +79,7 @@ fn a_stopped_run_takes_the_guards_lower_feasible_iterate_2953() {
         converged: false,
         probe_scale: None,
         rank_boundary: None,
+        wall_refusals: 3,
     };
     let result = stopped_run_checkpoint(
         "reject floor #2953",
@@ -99,6 +100,10 @@ fn a_stopped_run_takes_the_guards_lower_feasible_iterate_2953() {
         "{:?}",
         result.origin
     );
+    assert_eq!(
+        result.domain_wall_refusals, 3,
+        "the substituted iterate keeps the guard's domain-wall evidence (#3400)"
+    );
 
     let higher = CostStallExit {
         rho: array![6.0],
@@ -108,6 +113,7 @@ fn a_stopped_run_takes_the_guards_lower_feasible_iterate_2953() {
         converged: false,
         probe_scale: None,
         rank_boundary: None,
+        wall_refusals: 5,
     };
     let kept = stopped_run_checkpoint(
         "reject floor #2953",
@@ -121,4 +127,48 @@ fn a_stopped_run_takes_the_guards_lower_feasible_iterate_2953() {
         6.907748424675003_f64.to_bits(),
         "a higher feasible iterate never replaces the stopped one"
     );
+    assert_eq!(
+        kept.domain_wall_refusals, 0,
+        "evidence about another point never travels with the stopped iterate (#3400)"
+    );
+}
+
+/// The guard's domain-wall evidence travels with the stopped iterate exactly when that
+/// iterate is the guard's incumbent (#3400): the plan ladder reads it before resuming
+/// the next plan there.
+#[test]
+fn a_stopped_run_at_the_guards_incumbent_keeps_its_domain_wall_evidence_3400() {
+    let incumbent = CostStallExit {
+        rho: array![6.907748424675003],
+        value: -5.907172032664134e5,
+        grad_norm: 8.259e-2,
+        iterations: 7,
+        converged: false,
+        probe_scale: None,
+        rank_boundary: None,
+        wall_refusals: 4,
+    };
+    let result = stopped_run_checkpoint(
+        "reject floor #3400",
+        "ARC reject-floor",
+        stopped_solution(6.907748424675003, -5.907172032664134e5),
+        Some(incumbent),
+        arc_plan(),
+    );
+    assert!(!result.solver_claimed_convergence());
+    assert!(
+        matches!(result.origin, OuterResultOrigin::Solver),
+        "the incumbent is the solver's own iterate: {:?}",
+        result.origin
+    );
+    assert_eq!(result.domain_wall_refusals, 4);
+
+    let clean = stopped_run_checkpoint(
+        "reject floor #3400",
+        "ARC reject-floor",
+        stopped_solution(6.907748424675003, -5.907172032664134e5),
+        None,
+        arc_plan(),
+    );
+    assert_eq!(clean.domain_wall_refusals, 0, "no guard, no evidence");
 }

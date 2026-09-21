@@ -1735,6 +1735,14 @@ pub struct OuterResult {
     /// Set when the search halted where its kept rank ends (#2939). See
     /// [`RankBoundaryStall`]. Reported, and never a converged claim.
     pub rank_boundary_stall: Option<RankBoundaryStall>,
+    /// Refused trials the cost-stall guard saw proposed from this result's point
+    /// whose step's model promised at most the point's resolution (#3400). Each
+    /// proves the criterion's domain ends within an unresolvable step along that
+    /// trial's direction, so the point is pinned at a domain wall, such as the
+    /// inner-mode fold (#2765) or a non-finite region. Zero when no guard ran or
+    /// none was refused. The plan ladder does not resume a later plan from a point
+    /// that carries it (#3306).
+    pub domain_wall_refusals: usize,
     /// Which lane produced this result. See [`OuterResultOrigin`].
     pub origin: OuterResultOrigin,
     /// The lowest certified optimum a plan attempt of this search declined because an
@@ -1800,6 +1808,7 @@ impl OuterResult {
             active_set_reseed: None,
             cost_stall_probe_scale: None,
             rank_boundary_stall: None,
+            domain_wall_refusals: 0,
             origin: OuterResultOrigin::Solver,
             dominated_plateau: None,
         }
@@ -7256,6 +7265,19 @@ pub(crate) fn run_outer_uncertified(
     // the seed. A state carried in from an earlier search is only this ladder's
     // comparator (`carried_checkpoint`), never its start: the caller chose this
     // ladder's seed, and a multistart member keeps its own basin.
+    //
+    // The resume rests on one premise: the next plan continues, from the
+    // incumbent, the descent the refused plan could not finish. A stop whose
+    // guard saw a refused trial whose model promised at most the incumbent's
+    // resolution (`domain_wall_refusals`) refutes it (#3400). Such a trial proves the
+    // criterion's domain ends within an unresolvable step along its direction, so
+    // no plan can continue the descent there, and exact curvature only re-proves
+    // the wall. On the Gaussian location-scale fit, BFGS stopped against the
+    // inner-mode fold (#2765) at 78.6854; ARC resumed there spent 78 iterations on
+    // trials the fold refused and died at its reject floor, while ARC from the
+    // derived start certified a lower interior optimum at 77.2273. Such a stop
+    // stays this ladder's comparator (`best_checkpoint`), and the next plan
+    // searches from the start the caller derived.
     let mut ladder_incumbent: Option<OuterResult> = None;
     // Iterations spent by attempts whose results this function discards: a plan
     // the degraded ladder replaces, a fixed-point walk handed to BFGS.
@@ -7490,6 +7512,7 @@ pub(crate) fn run_outer_uncertified(
                             || result.final_value < checkpoint.final_value
                     });
                 let improves_incumbent = result.final_value.is_finite()
+                    && result.domain_wall_refusals == 0
                     && ladder_incumbent
                         .as_ref()
                         .is_none_or(|incumbent| result.final_value < incumbent.final_value);

@@ -44,6 +44,12 @@ fn stopped_run_checkpoint(
     best_feasible: Option<CostStallExit>,
     the_plan: OuterPlan,
 ) -> OuterResult {
+    // The guard's domain-wall evidence describes its incumbent point, so it travels
+    // with the last iterate only when that iterate IS the incumbent (#3400).
+    let wall_refusals = best_feasible
+        .as_ref()
+        .filter(|best| outer_theta_bitwise_eq(&best.rho, &last_solution.final_point))
+        .map_or(0, |best| best.wall_refusals);
     match best_feasible {
         Some(best)
             if best.value.is_finite()
@@ -63,8 +69,27 @@ fn stopped_run_checkpoint(
             // the iterate adopted here.
             best_iterate_checkpoint(best, last_solution.iterations, the_plan)
         }
-        _ => solution_into_outer_result(last_solution, false, the_plan),
+        _ => {
+            let mut result = solution_into_outer_result(last_solution, false, the_plan);
+            result.domain_wall_refusals = wall_refusals;
+            result
+        }
     }
+}
+
+/// The domain-wall evidence the cost-stall guard published with its incumbent
+/// (#3400) when that incumbent is the point `at` a run stopped on, else zero: the
+/// evidence says the domain ends within an unresolvable step of the incumbent, and
+/// says nothing about any other point.
+fn published_wall_refusals(exit: &Mutex<Option<CostStallExit>>, at: &Array1<f64>) -> usize {
+    exit.lock()
+        .ok()
+        .and_then(|slot| {
+            slot.as_ref()
+                .filter(|exit| outer_theta_bitwise_eq(&exit.rho, at))
+                .map(|exit| exit.wall_refusals)
+        })
+        .unwrap_or(0)
 }
 
 /// The cost-stall guard's best feasible accepted iterate as a non-converged
@@ -83,6 +108,7 @@ fn best_iterate_checkpoint(
         the_plan,
     );
     result.origin = OuterResultOrigin::ArcBestIterateSubstitution;
+    result.domain_wall_refusals = best.wall_refusals;
     result
 }
 
@@ -1256,6 +1282,7 @@ pub(crate) fn run_outer_with_plan(
                                     );
                                     result.origin =
                                         OuterResultOrigin::OperatorUnprogressingStallCheckpoint;
+                                    result.domain_wall_refusals = exit.wall_refusals;
                                     result.operator_trust_radius = final_radius;
                                     Ok(result)
                                 }
@@ -1552,6 +1579,7 @@ pub(crate) fn run_outer_with_plan(
                                     );
                                     result.origin =
                                         OuterResultOrigin::ArcInfeasibleStallCheckpoint;
+                                    result.domain_wall_refusals = exit.wall_refusals;
                                     // The stall window's evidence travels with the
                                     // checkpoint as reported text only (#2817).
                                     result.cost_stall_probe_scale = exit.probe_scale;
@@ -1587,6 +1615,7 @@ pub(crate) fn run_outer_with_plan(
                                     );
                                     result.origin =
                                         OuterResultOrigin::ArcUnprogressingStallCheckpoint;
+                                    result.domain_wall_refusals = exit.wall_refusals;
                                     Ok(result)
                                 }
                                 None => Err(EstimationError::RemlOptimizationFailed(format!(
@@ -2262,7 +2291,14 @@ pub(crate) fn run_outer_with_plan(
                     let stratum_result = match outcome {
                         Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                         Err(BfgsError::MaxIterationsReached { last_solution }) => {
-                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                            let wall_refusals = published_wall_refusals(
+                                &cost_stall_exit,
+                                &last_solution.final_point,
+                            );
+                            let mut outer_result =
+                                solution_into_outer_result(*last_solution, false, *the_plan);
+                            outer_result.domain_wall_refusals = wall_refusals;
+                            Ok(outer_result)
                         }
                         Err(BfgsError::LineSearchFailed {
                             last_solution,
@@ -2289,11 +2325,16 @@ pub(crate) fn run_outer_with_plan(
                                 // but nothing improved the objective) and
                                 // `MaxAttempts` (the bracket never closed) are
                                 // different defects with different repairs.
+                                let wall_refusals = published_wall_refusals(
+                                    &cost_stall_exit,
+                                    &last_solution.final_point,
+                                );
                                 let mut outer_result =
                                     solution_into_outer_result(*last_solution, false, *the_plan);
                                 outer_result.line_search_failure =
                                     Some((failure_reason, max_attempts));
                                 outer_result.rank_boundary_stall = rank_boundary;
+                                outer_result.domain_wall_refusals = wall_refusals;
                                 Ok(outer_result)
                             } else {
                                 Err(EstimationError::RemlOptimizationFailed(
@@ -2341,6 +2382,10 @@ pub(crate) fn run_outer_with_plan(
                                     // So does a halt where the search's kept rank
                                     // ends (#2939).
                                     result.rank_boundary_stall = exit.rank_boundary;
+                                    // And so does the evidence that the incumbent is
+                                    // pinned at a domain wall, which the plan ladder
+                                    // reads before resuming it (#3400).
+                                    result.domain_wall_refusals = exit.wall_refusals;
                                     // The mandatory final analytic certificate
                                     // judges this point by its own ladder, and
                                     // the guard claimed it only inside that
