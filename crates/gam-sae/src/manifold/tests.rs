@@ -2846,6 +2846,7 @@ pub(crate) fn planted_circle_ordered_beta_bernoulli_n40_sigma018_reaches_high_ev
 
 #[test]
 pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionless_rho_seed() {
+    gam_runtime::test_support::install_diagnostic_logger();
     for assignment_mode in [
         PlantedCircleAssignmentMode::Softmax,
         PlantedCircleAssignmentMode::OrderedBetaBernoulli,
