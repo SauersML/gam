@@ -833,7 +833,8 @@ pub enum EstimationError {
     },
 
     /// A certified optimum that an evaluated state of the same search beats beyond the
-    /// criterion's rounding envelope, with nothing certified in its place (#2953).
+    /// dominance band (the criterion's statistical resolution plus its rounding
+    /// envelope, #4024), with nothing certified in its place (#2953).
     ///
     /// The plan runner declines such an optimum and continues the search from the state
     /// that beats it (#2596, #2627): a certificate says a point is stationary, not that it
@@ -845,7 +846,7 @@ pub enum EstimationError {
         "Outer smoothing-parameter optimization declined a certified optimum that an \
          evaluated state beats, and certified nothing in its place ({context}): {kind}. The \
          declined optimum has objective {plateau_value:.6e} at rho {plateau_rho:?}; a state \
-         {gap:.3e} below it, beyond the criterion's rounding envelope {band:.3e}, resumed the \
+         {gap:.3e} below it, beyond the dominance band {band:.3e}, resumed the \
          search, and that continuation {continuation}. The best checkpoint has objective \
          {incumbent_value:.6e} and projected gradient norm {}; resume by seeding the outer \
          search at rho_checkpoint = {incumbent_rho:?}. Its terminal certificate refused: \
@@ -871,8 +872,9 @@ pub enum EstimationError {
         /// The declined optimum's objective minus the re-evaluated objective of the
         /// state that beat it, measured when the optimum was declined.
         gap: f64,
-        /// `outer_value_agreement_bound` of those two values: the resolution the gap
-        /// was judged against.
+        /// The dominance band of those two values, the criterion's statistical
+        /// resolution plus their rounding envelope: the resolution the gap was
+        /// judged against (#4024).
         band: f64,
         /// How the search from the state that beat the optimum ended.
         continuation: String,

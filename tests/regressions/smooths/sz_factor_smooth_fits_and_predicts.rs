@@ -151,3 +151,57 @@ fn sz_factor_smooth_fits_replays_and_keeps_levels_distinct() {
         "#700: sz per-level curves collapsed onto one shared shape (min |pearson|={min_abs_corr:.3})"
     );
 }
+
+/// #4024: the outer REML search must certify the sz factor smooth under BOTH
+/// documented knot placements and on every seed. PR #3078 measured
+/// `knot_placement=quantile` turning this design into a
+/// `DominatedCertifiedPlateau` refusal, and uniform placement failing on one
+/// of four seeds. A refusal here is an optimizer defect, not a data property:
+/// the design is a well-posed Gaussian additive model with 60 rows per level.
+#[test]
+fn sz_factor_smooth_certifies_under_both_knot_placements_across_seeds_4024() {
+    init_parallelism();
+    let ux = Uniform::new(0.0, 1.0).expect("uniform");
+    let noise = Normal::new(0.0, SIGMA).expect("normal");
+    let mut failures = Vec::<String>::new();
+    for seed in SEED..SEED + 4 {
+        for placement in ["uniform", "quantile"] {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let n = N_LEVELS * N_PER_LEVEL;
+            let headers = vec!["x".to_string(), "g".to_string(), "y".to_string()];
+            let mut rows = Vec::<StringRecord>::with_capacity(n);
+            for level in 0..N_LEVELS {
+                for _ in 0..N_PER_LEVEL {
+                    let xi = ux.sample(&mut rng);
+                    let yi = truth(level, xi) + noise.sample(&mut rng);
+                    rows.push(StringRecord::from(vec![
+                        xi.to_string(),
+                        format!("grp{level}"),
+                        yi.to_string(),
+                    ]));
+                }
+            }
+            let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode sz dataset");
+            let cfg = FitConfig {
+                family: Some("gaussian".to_string()),
+                ..FitConfig::default()
+            };
+            let formula = format!("y ~ s(g, x, bs=\"sz\", knot_placement=\"{placement}\")");
+            match fit_from_formula(&formula, &ds, &cfg) {
+                Ok(FitResult::Standard(fit)) => {
+                    if !fit.fit.beta.iter().all(|v| v.is_finite()) {
+                        failures.push(format!("seed {seed} {placement}: non-finite beta"));
+                    }
+                }
+                Ok(_) => failures.push(format!("seed {seed} {placement}: not a standard fit")),
+                Err(e) => failures.push(format!("seed {seed} {placement}: {e}")),
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "#4024: {} of 8 sz fits refused to certify:\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
