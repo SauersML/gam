@@ -914,7 +914,7 @@ where
         let cached_state_matches = iter > 1
             && final_state.is_some()
             && final_state_cache_key.as_ref() == Some(&requested_cache_key);
-        let mut state = if cached_state_matches {
+        let state = if cached_state_matches {
             final_state
                 .take()
                 .expect("cached_state_matches implies final_state.is_some()")
