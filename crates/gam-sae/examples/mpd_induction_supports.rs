@@ -70,22 +70,25 @@
 //!
 //! # Stage S3: position-scoped supports at one occurrence
 //! Declared by `"positions": {"rows": [[sequence, position], …], "baseline_fractions": [f, …], "null_seed": s}`,
-//! each row one occurrence of the mechanism. A component is one head read at one position alone: its `d_head`
-//! columns of `W_O` at that row of `block::ComponentMasks` (one center row per position). A row `t`'s components
-//! are every head of a layer below the last at every position `s ≤ t`, and every head of the last layer at `t`
-//! alone: the last layer's write at another position reaches only that position's logits, and no position after
-//! `t` reaches it. Every other head and position stays on.
+//! each row one occurrence of the mechanism. A component is one head read at a set of positions: its `d_head`
+//! columns of `W_O` at those rows of `block::ComponentMasks` (one center row per position). The row's token occurs
+//! earlier at `t − n`, so an induction head at `t` reads its key at the source `t − n + 1`, read off the tokens
+//! alone. A row `t`'s components are each head of a layer below the last at the source alone and at every other
+//! position `s ≤ t` together, and each head of the last layer at `t` alone: the last layer's write at another
+//! position reaches only that position's logits, and no position after `t` reaches it. Every other head and
+//! position stays on. (One component per head and position, `n_heads (t + 1) + n_heads` of them, left the box
+//! oracle's enclosures too wide to certify at `t = 30`: the first probe's third separation ran 15 minutes.)
 //! * **Divergence:** `KL(teacher ‖ artifact under the mask)` at row `t` alone, over both logit boxes. The
 //!   tolerances are fractions of the row's own all-off divergence.
 //! * **Search:** `BoxSeparationOracle` and `minimum_code_support` with the padded head code over the row's
 //!   components, a function of the size alone, so the minimum-code support keeps the fewest instances. The report
 //!   also gives the code that sends each distinct kept head once, and how many instances the same heads keep
 //!   when each is kept at every position.
-//! * **The mechanism's prediction, from the tokens alone:** the earlier occurrence of the row's token is at
-//!   `t − n`, so an induction head at `t` reads its key at the source `t − n + 1`. The report counts the
-//!   support's lower-layer instances at the source and elsewhere.
-//! * **Null at equal count:** the support's lower-layer instances each moved to a uniformly drawn other position
-//!   (declared seed), with every other instance off, must miss the tolerance; the support alone must meet it.
+//! * **The mechanism's prediction:** the support's lower-layer heads are needed at the source and not at the
+//!   rest. The report counts the support's source and rest components.
+//! * **Null at equal count:** each kept source component read at a uniformly drawn other position instead
+//!   (declared seed), with every other head and position off, must miss the tolerance; the support alone must
+//!   meet it.
 
 use gam_sae::parameter_decomposition::attention::AttentionGeometry;
 use gam_sae::parameter_decomposition::block::{
@@ -355,10 +358,10 @@ impl HeadNetwork {
     }
 
     /// The logits of one sequence, `T × vocab`, with their radius, under a box of position-scoped head masks:
-    /// `instances[i]` is head `head` of layer `layer` at `position` alone, under the box's control `i`, and every
-    /// head at every other position stays on. A free instance's columns read `1/2 ± 1/2` at its position. Also
-    /// each free instance's spread `Σ |W_O[:, head]| (|z_s| + r_s)` over its position's mixed row, and zero for
-    /// the others.
+    /// `instances[i]` is head `head` of layer `layer` at its `positions`, under the box's control `i`, and every
+    /// head at every other position stays on. A free instance's columns read `1/2 ± 1/2` at its positions. Also
+    /// each free instance's spread `Σ_s Σ |W_O[:, head]| (|z_s| + r_s)` over its positions' mixed rows, and zero
+    /// for the others.
     fn scoped_logits(&self, tokens: &[i64], instances: &[Instance], mask: &MaskBox) -> Result<(Rows, Vec<f64>), String> {
         let network = &self.network;
         let (count, head_dim) = (network.heads, network.head_dim);
@@ -373,8 +376,10 @@ impl HeadNetwork {
                 MaskSide::Free => (0.5, 0.5),
             };
             let columns = instance.head * head_dim..(instance.head + 1) * head_dim;
-            centers[instance.layer].slice_mut(s![instance.position, columns.clone()]).fill(center);
-            half_widths[instance.layer].slice_mut(s![instance.position, columns]).fill(half_width);
+            for &position in &instance.positions {
+                centers[instance.layer].slice_mut(s![position, columns.clone()]).fill(center);
+                half_widths[instance.layer].slice_mut(s![position, columns.clone()]).fill(half_width);
+            }
             free[instance.layer] |= *side == MaskSide::Free;
         }
         let reads: Vec<AttentionLayerReads<'_>> = centers
@@ -400,9 +405,14 @@ impl HeadNetwork {
             *spread = (instance.head * head_dim..(instance.head + 1) * head_dim)
                 .map(|column| {
                     let column_mass: f64 = output.column(column).iter().map(|entry| entry.abs()).sum();
-                    column_mass
-                        * (attention.mixed[[instance.position, column]].abs()
-                            + attention.mixed_radius[[instance.position, column]])
+                    let reach: f64 = instance
+                        .positions
+                        .iter()
+                        .map(|&position| {
+                            attention.mixed[[position, column]].abs() + attention.mixed_radius[[position, column]]
+                        })
+                        .sum();
+                    column_mass * reach
                 })
                 .sum();
         }
@@ -410,29 +420,50 @@ impl HeadNetwork {
     }
 }
 
-/// One S3 component: head `head` of layer `layer` read at `position` alone.
+/// Where an S3 component reads its head: the source position the mechanism predicts, every other position up to
+/// the row, or the row itself (a last-layer head).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    Source,
+    Rest,
+    Row,
+}
+
+/// One S3 component: head `head` of layer `layer` read at `positions` together.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Instance {
     layer: usize,
     head: usize,
-    position: usize,
+    scope: Scope,
+    positions: Vec<usize>,
 }
 
 impl Instance {
     fn name(&self) -> String {
-        format!("L{}H{}@{}", self.layer, self.head, self.position)
+        let at = match self.scope {
+            Scope::Source => format!("src{}", self.positions[0]),
+            Scope::Rest => "rest".to_string(),
+            Scope::Row => format!("{}", self.positions[0]),
+        };
+        format!("L{}H{}@{at}", self.layer, self.head)
     }
 }
 
-/// The components of the induction row at `position`: every head of a layer below the last at every position up
-/// to it, and every head of the last layer at it alone. The last layer's write at another position reaches only
-/// that position's logits, and a position after the row reaches no earlier one, so neither can move the row.
-fn row_instances(layers: usize, heads: usize, position: usize) -> Vec<Instance> {
+/// The components of the induction row at `position`, whose mechanism reads its key at `source`: each head of a
+/// layer below the last at the source alone and at every other position up to the row, and each head of the last
+/// layer at the row alone. The last layer's write at another position reaches only that position's logits, and a
+/// position after the row reaches no earlier one, so neither can move the row.
+fn row_instances(layers: usize, heads: usize, position: usize, source: usize) -> Vec<Instance> {
     let mut instances = Vec::new();
     for layer in 0..layers {
-        let positions = if layer + 1 < layers { 0..position + 1 } else { position..position + 1 };
-        for at in positions {
-            instances.extend((0..heads).map(|head| Instance { layer, head, position: at }));
+        for head in 0..heads {
+            if layer + 1 < layers {
+                instances.push(Instance { layer, head, scope: Scope::Source, positions: vec![source] });
+                let rest = (0..=position).filter(|&at| at != source).collect();
+                instances.push(Instance { layer, head, scope: Scope::Rest, positions: rest });
+            } else {
+                instances.push(Instance { layer, head, scope: Scope::Row, positions: vec![position] });
+            }
         }
     }
     instances
@@ -1537,16 +1568,16 @@ struct PositionTolerance {
     support: Vec<String>,
     separations: usize,
     edges: usize,
-    /// The support's lower-layer instances at the source position `t − n + 1` the mechanism reads, and elsewhere.
+    /// The support's lower-layer components at the source `t − n + 1` the mechanism reads, and at the rest.
     at_source: usize,
     elsewhere: usize,
-    /// The support's distinct heads, its code with each distinct head's codeword sent once, and the instances
-    /// the same heads keep when each is kept at every position of the row.
+    /// The support's distinct heads, its code with each distinct head's codeword sent once, and the components
+    /// the same heads keep when each is kept at every position (a lower-layer head's source and rest).
     distinct_heads: usize,
     scoped_code_bits: u64,
     global_instances: usize,
-    /// The support alone (every other instance off), and the same heads with every lower-layer instance moved
-    /// to another position (declared seed), at equal or smaller count.
+    /// The support alone (every other head and position off), and the same support with each kept source
+    /// component read at a drawn other position instead (declared seed), at equal count.
     alone: Option<Bounds>,
     alone_verdict: String,
     moved: Vec<String>,
@@ -1583,10 +1614,10 @@ fn position_row(
     rng: &mut StdRng,
 ) -> Result<PositionRowReport, String> {
     let layers = artifact.network.layers.len();
-    let instances = row_instances(layers, artifact.heads(), position);
+    let source = position + 1 - segment;
+    let instances = row_instances(layers, artifact.heads(), position, source);
     let count = instances.len();
     let family = ScopedFamily { sequence, position, instances: count };
-    let source = position + 1 - segment;
     let vertex = |on: Vec<usize>| {
         ComponentSet::new(count, on).map(|on| MaskBox::vertex(&on)).map_err(|error| error.to_string())
     };
@@ -1616,41 +1647,46 @@ fn position_row(
             Err(_) => (None, 0, 0),
         };
         let support = members.clone().unwrap_or_default();
-        let lower: Vec<&Instance> =
-            support.iter().map(|&member| &instances[member]).filter(|instance| instance.layer + 1 < layers).collect();
-        let at_source = lower.iter().filter(|instance| instance.position == source).count();
+        let at_source = support.iter().filter(|&&member| instances[member].scope == Scope::Source).count();
+        let elsewhere = support.iter().filter(|&&member| instances[member].scope == Scope::Rest).count();
         let mut heads: Vec<(usize, usize)> = support.iter().map(|&member| (instances[member].layer, instances[member].head)).collect();
         heads.sort_unstable();
         heads.dedup();
         let scoped_code_bits = subset_code_len_bits(count, support.len()).map_err(|error| format!("{error:?}"))?
             + prefix_integer_len_bits(head_bits).map_err(|error| format!("{error:?}"))?
             + heads.len() as u64 * head_bits;
-        let global_instances = heads.iter().map(|&(layer, _)| if layer + 1 < layers { position + 1 } else { 1 }).sum();
-        let (alone, moved, moved_risk) = match &members {
-            Some(members) => {
-                let alone = oracle.evaluate(&vertex(members.clone())?).map_err(|error| format!("{error:?}"))?;
-                let mut moved: Vec<usize> = Vec::with_capacity(members.len());
-                for &member in members {
-                    let instance = instances[member];
-                    let target = if instance.layer + 1 < layers && position > 0 {
-                        let drawn = rng.random_range(0..position);
-                        let at = if drawn >= instance.position { drawn + 1 } else { drawn };
-                        instances
-                            .iter()
-                            .position(|other| *other == Instance { position: at, ..instance })
-                            .ok_or_else(|| format!("no instance {} at {at}", instance.name()))?
-                    } else {
-                        member
-                    };
-                    moved.push(target);
-                }
-                moved.sort_unstable();
-                moved.dedup();
-                let moved_status = oracle.evaluate(&vertex(moved.clone())?).map_err(|error| format!("{error:?}"))?;
-                (Some(Bounds::of(&alone)), moved, Some(Bounds::of(&moved_status)))
-            }
-            None => (None, Vec::new(), None),
+        let global_instances = heads.iter().map(|&(layer, _)| if layer + 1 < layers { 2 } else { 1 }).sum();
+        let alone = match &members {
+            Some(members) => Some(oracle.evaluate(&vertex(members.clone())?).map_err(|error| format!("{error:?}"))?),
+            None => None,
         };
+        // The moved null: every kept source component read at a drawn other position instead, the kept rest and
+        // row components as they are, and every other head and position off.
+        let (moved, moved_risk) = match &members {
+            Some(members) if at_source > 0 && position > 0 => {
+                let mut moved = instances.clone();
+                for &member in members {
+                    if instances[member].scope != Scope::Source {
+                        continue;
+                    }
+                    let drawn = rng.random_range(0..position);
+                    let at = if drawn >= source { drawn + 1 } else { drawn };
+                    let rest = moved
+                        .iter()
+                        .position(|other| other.layer == instances[member].layer && other.head == instances[member].head && other.scope == Scope::Rest)
+                        .ok_or_else(|| format!("no rest component for {}", instances[member].name()))?;
+                    moved[member].positions = vec![at];
+                    moved[rest].positions = (0..=position).filter(|&other| other != at).collect();
+                }
+                let mut null_enclosed = BTreeMap::new();
+                let mut program = ScopedBoxes { artifact, tokens, reference, family, instances: &moved, enclosed: &mut null_enclosed };
+                let status = program.enclose(&vertex(members.clone())?)?.evidence;
+                let names = members.iter().map(|&member| moved[member].name()).collect();
+                (names, Some(Bounds::of(&status)))
+            }
+            _ => (Vec::new(), None),
+        };
+        let alone = alone.as_ref().map(Bounds::of);
         let verdict = |bounds: &Option<Bounds>| bounds.as_ref().map_or("none", |bounds| bounds.verdict(tolerance)).to_string();
         tolerances.push(PositionTolerance {
             fraction,
@@ -1663,13 +1699,13 @@ fn position_row(
             separations,
             edges,
             at_source,
-            elsewhere: lower.len() - at_source,
+            elsewhere,
             distinct_heads: heads.len(),
             scoped_code_bits,
             global_instances,
             alone_verdict: verdict(&alone),
             alone,
-            moved: moved.iter().map(|&member| instances[member].name()).collect(),
+            moved,
             moved_verdict: verdict(&moved_risk),
             moved_risk,
         });

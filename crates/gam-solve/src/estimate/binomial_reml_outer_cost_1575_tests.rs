@@ -1229,14 +1229,16 @@ fn a_fits_identified_rank_refuses_over_a_step_that_reaches_its_band_2901() {
              {penalty_norm:.3e}",
             at_zero_step.smallest_identified,
         );
+        let reaching_hessian = outer_hessian.mapv(|entry| entry / reaching_step);
+        let reaching_gradient = Array1::<f64>::ones(coordinates);
         let refusal = super::identified_hessian::certify_fitted_identified_rank(
             pirls,
             &spectrum,
             &fit.lambdas,
             &design,
             super::identified_hessian::OuterCertificatePoint {
-                hessian_rho: &outer_hessian.mapv(|entry| entry / reaching_step),
-                gradient: &Array1::<f64>::ones(coordinates),
+                hessian_rho: &reaching_hessian,
+                gradient: &reaching_gradient,
                 railed: &[],
                 rho: &rho,
                 lower: &unbounded_below,
@@ -1251,5 +1253,26 @@ fn a_fits_identified_rank_refuses_over_a_step_that_reaches_its_band_2901() {
             ),
             "{refusal}"
         );
+        // The same Newton step, where the search domain ends at ρ̂ on both sides: the
+        // stationary point the certificate vouches for cannot leave ρ̂, so nothing the
+        // step reaches outside the domain is charged, and the rank certifies as at a
+        // zero step.
+        let (confined, confined_radius) = super::identified_hessian::certify_fitted_identified_rank(
+            pirls,
+            &spectrum,
+            &fit.lambdas,
+            &design,
+            super::identified_hessian::OuterCertificatePoint {
+                hessian_rho: &reaching_hessian,
+                gradient: &reaching_gradient,
+                railed: &[],
+                rho: &rho,
+                lower: &rho,
+                upper: &rho,
+            },
+        )
+        .expect("a step the search domain confines to ρ̂ certifies the fitted rank");
+        assert_eq!(confined_radius, 0.0);
+        assert_eq!(confined.rank, at_zero_step.rank);
     }
 }

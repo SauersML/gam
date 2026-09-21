@@ -451,6 +451,131 @@ impl BinomialLocationScaleFamily {
         Ok(Some(d2_h))
     }
 
+    /// `{D³I[u, v, e_a]}` of the expected joint information along every coefficient axis, the
+    /// third information derivative an armed Jeffreys objective's exact outer Hessian reads
+    /// (#2677). `D³I` is linear in its third direction, so each row's coefficient triples along a
+    /// unit `η_t` and a unit `η_ls` perturbation are formed once, and axis `a` weights the triple
+    /// of its own block by its design entry.
+    pub(crate) fn expected_joint_information_third_directional_all_axes_from_designs(
+        &self,
+        block_states: &[ParameterBlockState],
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        validate_block_count::<GamlssError>("BinomialLocationScaleFamily", 2, block_states.len())?;
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if eta_t.len() != n
+            || eta_ls.len() != n
+            || self.weights.len() != n
+            || x_t.nrows() != n
+            || x_ls.nrows() != n
+        {
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleFamily expected d3I input size mismatch".to_string(),
+            }
+            .into());
+        }
+        let pt = x_t.ncols();
+        let pls = x_ls.ncols();
+        let total = pt + pls;
+        if d_beta_u_flat.len() != total || d_beta_v_flat.len() != total {
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleFamily expected d3I direction lengths {} / {}, expected {total}",
+                    d_beta_u_flat.len(),
+                    d_beta_v_flat.len()
+                ),
+            }
+            .into());
+        }
+        let d_eta_t_u = fast_av(x_t, &d_beta_u_flat.slice(s![0..pt]));
+        let d_eta_ls_u = fast_av(x_ls, &d_beta_u_flat.slice(s![pt..total]));
+        let d_eta_t_v = fast_av(x_t, &d_beta_v_flat.slice(s![0..pt]));
+        let d_eta_ls_v = fast_av(x_ls, &d_beta_v_flat.slice(s![pt..total]));
+        let core = binomial_location_scale_core(
+            &self.y,
+            &self.weights,
+            eta_t,
+            eta_ls,
+            None,
+            &self.link_kind,
+        )?;
+        let rows = (0..n)
+            .into_par_iter()
+            .map(|i| -> Result<[(f64, f64, f64); 2], String> {
+                let d4 = gam_solve::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
+                    &self.link_kind,
+                    core.q0[i],
+                )
+                .map_err(|error| {
+                    format!(
+                        "binomial location-scale inverse-link fourth derivative failed at row {i}: {error}"
+                    )
+                })?;
+                let (f, f1, f2, f3) = binomial_expected_q_information_third_derivatives(
+                    self.weights[i],
+                    core.mu[i],
+                    core.dmu_dq[i],
+                    core.d2mu_dq2[i],
+                    core.d3mu_dq3[i],
+                    d4,
+                );
+                if !f3.is_finite() {
+                    return Err(format!(
+                        "binomial location-scale expected information third derivative is non-finite at row {i}"
+                    ));
+                }
+                let q = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
+                let u = [d_eta_t_u[i], d_eta_ls_u[i]];
+                let v = [d_eta_t_v[i], d_eta_ls_v[i]];
+                Ok([
+                    binomial_expected_location_scale_third_coefficients(
+                        q,
+                        [f, f1, f2, f3],
+                        [u, v, [1.0, 0.0]],
+                    ),
+                    binomial_expected_location_scale_third_coefficients(
+                        q,
+                        [f, f1, f2, f3],
+                        [u, v, [0.0, 1.0]],
+                    ),
+                ])
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut axes = Vec::with_capacity(total);
+        for axis in 0..total {
+            let (block_design, column, lane) = if axis < pt {
+                (x_t, axis, 0)
+            } else {
+                (x_ls, axis - pt, 1)
+            };
+            let mut coeff_tt = Array1::<f64>::zeros(n);
+            let mut coeff_tl = Array1::<f64>::zeros(n);
+            let mut coeff_ll = Array1::<f64>::zeros(n);
+            for (i, triples) in rows.iter().enumerate() {
+                let design_entry = block_design[[i, column]];
+                let (tt, tl, ll) = triples[lane];
+                coeff_tt[i] = design_entry * tt;
+                coeff_tl[i] = design_entry * tl;
+                coeff_ll[i] = design_entry * ll;
+            }
+            let d3_h_tt = xt_diag_x_dense(x_t, &coeff_tt)?;
+            let d3_h_tl = xt_diag_y_dense(x_t, &coeff_tl, x_ls)?;
+            let d3_h_ll = xt_diag_x_dense(x_ls, &coeff_ll)?;
+            let mut d3_h = Array2::<f64>::zeros((total, total));
+            d3_h.slice_mut(s![0..pt, 0..pt]).assign(&d3_h_tt);
+            d3_h.slice_mut(s![0..pt, pt..total]).assign(&d3_h_tl);
+            d3_h.slice_mut(s![pt..total, pt..total]).assign(&d3_h_ll);
+            mirror_upper_to_lower(&mut d3_h);
+            axes.push(d3_h);
+        }
+        Ok(axes)
+    }
+
     pub(crate) fn expected_joint_contracted_trace_hessian_from_designs(
         &self,
         block_states: &[ParameterBlockState],
@@ -2038,6 +2163,30 @@ impl BinomialLocationScaleFamily {
     }
 }
 
+impl crate::custom_family::JeffreysThirdInformationDerivative for BinomialLocationScaleFamily {
+    /// `{D³I[u, v, e_a]}` of the expected joint information the Jeffreys term reads, on the dense
+    /// designs the block specs supply (#2677).
+    fn third_directional_all_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        self.expected_joint_information_third_directional_all_axes_from_designs(
+            block_states,
+            &x_t,
+            &x_ls,
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )
+        .map(Some)
+    }
+}
+
 impl crate::custom_family::JeffreysArming for BinomialLocationScaleFamily {
     fn with_jeffreys_armed(
         &self,
@@ -2539,6 +2688,14 @@ impl CustomFamily for BinomialLocationScaleFamily {
 
     fn joint_jeffreys_information_contracted_trace_hessian_available(&self) -> bool {
         true
+    }
+
+    /// The expected information's third directional derivative is formed exactly on the dense
+    /// designs the block specs always supply (#2677).
+    fn jeffreys_third_information_derivative(
+        &self,
+    ) -> Option<&dyn crate::custom_family::JeffreysThirdInformationDerivative> {
+        Some(self)
     }
 
     fn joint_jeffreys_information_matches_observed_hessian(&self) -> bool {

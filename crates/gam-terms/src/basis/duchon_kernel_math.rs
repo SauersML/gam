@@ -1747,8 +1747,10 @@ pub(crate) fn duchon_partial_fraction_coeffs(
 /// [`duchon_radial_profile`] represents once per process, certified against
 /// its own adaptive reference integral (a fixed 64-node Gauss–Legendre rule
 /// on `w` was measured 1 % off for half-integer `b` at every distance and
-/// 100 % off for `κ r ≳ 10³`; see that module). The `r = 0` diagonal is the
-/// closed form `φ(0) = (4π)^{-d/2} Γ(b)/(Γ(p)Γ(s)) κ^{-2b} B(s−b, p)`.
+/// 100 % off for `κ r ≳ 10³`; see that module). The value returned is `φ(r) − φ(0)`
+/// with `φ(0) = (4π)^{-d/2} Γ(b)/(Γ(p)Γ(s)) κ^{-2b} B(s−b, p)`: the origin constant,
+/// which the Duchon constraint annihilates, is removed by construction
+/// ([`DuchonHybridEvaluator::value`], gam#2735).
 ///
 /// Requires `b = p + s − d/2 > 0` (kernel existence, `2(p+s) > d`) and
 /// `s − b = d/2 − p > 0` (integrable `w → 0` endpoint), i.e. `2p < d`. Callers
@@ -1783,9 +1785,6 @@ pub(crate) struct DuchonHybridEvaluator {
     kappa: f64,
     /// `pref · κ^{-2b}`.
     scale: f64,
-    /// `pref · κ^{-2b} · G(0)`, the closed-form `r = 0` diagonal, or `None`
-    /// for a kernel singular at the origin (`2(p+s) ≤ d`).
-    origin: Option<f64>,
 }
 
 impl DuchonHybridEvaluator {
@@ -1805,7 +1804,6 @@ impl DuchonHybridEvaluator {
         );
         let profile = duchon_radial_profile(p_order, s_order, k_dim)?;
         let scale = profile.kappa_scale(kappa);
-        let origin = profile.origin_value().ok().map(|g0| scale * g0);
         Ok(Self {
             profile,
             p_order,
@@ -1813,23 +1811,35 @@ impl DuchonHybridEvaluator {
             k_dim,
             kappa,
             scale,
-            origin,
         })
     }
 
-    /// `φ(r)`, including the closed-form `r = 0` diagonal.
+    /// `φ(r) − φ(0)`: the kernel with its origin value removed.
+    ///
+    /// `φ(0) = pref · κ^{-2b} · G(0)` is a constant, a degree-zero polynomial
+    /// that every Duchon constraint `Z` annihilates, on both sides of `Zᵀ K Z`
+    /// and on the centre side of `K(x, c) Z`. At long length scales its
+    /// `κ^{-2b}` growth is the whole magnitude of the kernel, so forming `K`
+    /// with it and projecting afterwards cancels about `2b · log₁₀ ℓ` digits. At
+    /// `d = 6`, `p = s = 2`, `ℓ ≈ 2e7`, `max|K_CC|` was 1e11 against
+    /// `max|Zᵀ K Z|` ≈ 1e-2, and the constrained penalty went indefinite
+    /// (gam#2735, MSI job 1152423). The represented function differs from `φ`
+    /// by that constant alone, so every projected quantity is unchanged in
+    /// exact arithmetic. The scaling-law ψ derivative `δ φ + r φ_r` also stays
+    /// exact for it, because `∂/∂ln κ` of `c₀ κ^δ` is `δ c₀ κ^δ`. A kernel
+    /// singular at the origin has no constant to remove and owns its `r = 0`
+    /// refusal.
     pub(crate) fn value(&self, r: f64) -> Result<f64, BasisError> {
         if !r.is_finite() || r < 0.0 {
             crate::bail_invalid_basis!("Duchon kernel distance must be finite and non-negative");
         }
         let value = if r == 0.0 {
-            match self.origin {
-                Some(origin) => origin,
-                // The profile owns the refusal for a kernel singular at `r = 0`.
-                None => self.scale * self.profile.origin_value()?,
+            if let Err(error) = self.profile.origin_value() {
+                return Err(error);
             }
+            0.0
         } else {
-            self.scale * self.profile.value(self.kappa * r)
+            self.scale * self.profile.origin_reduced_value(self.kappa * r)
         };
         if !value.is_finite() {
             crate::bail_invalid_basis!(

@@ -1900,7 +1900,7 @@ pub(crate) fn duchon_structural_trend_null_frame(
             }
             let kernel_rows_t = transform.slice(s![..kernel_cols, ..]).t().to_owned();
             let (frame, _rank) =
-                gam_linalg::faer_ndarray::rrqr_nullspace_basis(&kernel_rows_t)
+                gam_linalg::faer_ndarray::rrqr_nullspace_basis(&kernel_rows_t, 1.0)
                     .map_err(BasisError::LinalgError)?;
             Ok(frame)
         }
@@ -3002,6 +3002,102 @@ mod hybrid_high_dim_psd_tests {
         assert!(
             evals.iter().all(|&v| v >= -3.0 * f64::EPSILON),
             "clamped spectrum {evals:?}"
+        );
+    }
+
+    /// gam#2735: at the stress fixture's order (`d = 6`, `Linear` so `p = 2`,
+    /// `s = 2`) the constrained bending penalty stays PSD at long length scales
+    /// because the hybrid kernel is formed without its origin constant
+    /// `φ(0) = pref · κ^{-2b} · G(0)`, which grows like `ℓ²` and which `Z`
+    /// annihilates. On 500 deterministic centres along the fixture's ψ̄ ladder:
+    /// 1. `Zᵀ K Z` is PSD to the penalty pipeline's own spectral cutoff at every rung;
+    /// 2. `max|K_CC|` stays within `1 + |ψ̄|` of the pure κ → 0 kernel's, because the
+    ///    only divergent term left is the `r² ln κ` null-space piece;
+    /// 3. restoring the constant (today's representative) moves `Zᵀ K Z` only by
+    ///    the roundoff of annihilating it, where today's build is well conditioned;
+    /// 4. the restored constant reproduces materially negative modes at the trial.
+    #[test]
+    fn the_long_length_scale_constrained_penalty_is_psd_without_the_origin_constant_2735() {
+        let d = 6;
+        let s_order = 2usize;
+        let centers = deterministic_centers(d, 500);
+        let effective =
+            duchon_effective_nullspace_order(centers.view(), DuchonNullspaceOrder::Linear);
+        let p_order = duchon_p_from_nullspace_order(effective);
+        assert_eq!(p_order, 2, "the ladder is the fixture's Linear order");
+        let poly_block = polynomial_block_from_order(centers.view(), effective);
+        let z = kernel_constraint_nullspace_from_matrix(poly_block.view())
+            .expect("kernel null-space basis must build");
+        let column_l1 = (0..z.ncols())
+            .map(|col| z.column(col).iter().map(|v| v.abs()).sum::<f64>())
+            .fold(0.0_f64, f64::max);
+        let profile = duchon_radial_profile(p_order, s_order, d).expect("profile builds");
+        let g0 = profile.origin_value().expect("b > 0 has an origin value");
+        let max_abs = |m: &Array2<f64>| m.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        let project = |m: &Array2<f64>| fast_ab(&fast_atb(&z, m), &z);
+        let min_eigenvalue_and_cutoff = |m: &Array2<f64>| {
+            let (evals, _) = FaerEigh::eigh(&symmetrize(m), Side::Lower).expect("eigh");
+            let min = evals.iter().copied().fold(f64::INFINITY, f64::min);
+            (min, spectral_tolerance(&evals))
+        };
+        let (pure_kernel, pure_amp) = duchon_center_kernel_value_matrix(
+            centers.view(),
+            None,
+            s_order as f64,
+            effective,
+            None,
+        )
+        .expect("pure centre kernel must build");
+        let pure_magnitude = pure_amp * max_abs(&pure_kernel);
+        let incumbent_psi_bar = -11.5135_f64;
+        let trial_psi_bar = -16.8665_f64;
+        let mut restored_at_trial = None;
+        for psi_bar in [0.0_f64, -4.0, -8.0, incumbent_psi_bar, -14.19, -15.52825, trial_psi_bar] {
+            let length_scale = (-psi_bar).exp();
+            let (raw_kernel, amp) = duchon_center_kernel_value_matrix(
+                centers.view(),
+                Some(length_scale),
+                s_order as f64,
+                effective,
+                None,
+            )
+            .expect("hybrid centre kernel must build");
+            let kernel = raw_kernel.mapv(|v| v * amp);
+            let omega = project(&kernel);
+            let (min_ev, cutoff) = min_eigenvalue_and_cutoff(&omega);
+            assert!(
+                min_ev >= -cutoff,
+                "(1) ψ̄={psi_bar}: λ_min(ZᵀKZ) = {min_ev:.3e} is below the cutoff −{cutoff:.3e}"
+            );
+            let magnitude = max_abs(&kernel);
+            assert!(
+                magnitude <= (1.0 + psi_bar.abs()) * pure_magnitude,
+                "(2) ψ̄={psi_bar}: max|K_CC| = {magnitude:.3e} exceeds (1 + |ψ̄|) × the pure limit's \
+                 {pure_magnitude:.3e}"
+            );
+            let origin = amp * profile.kappa_scale(1.0 / length_scale) * g0;
+            let restored = kernel.mapv(|v| v + origin);
+            let restored_omega = project(&restored);
+            if psi_bar >= incumbent_psi_bar {
+                let gap = max_abs(&(&restored_omega - &omega));
+                let annihilation_roundoff =
+                    2.0 * z.nrows() as f64 * f64::EPSILON * origin.abs() * column_l1 * column_l1;
+                assert!(
+                    gap <= annihilation_roundoff,
+                    "(3) ψ̄={psi_bar}: restoring φ(0) = {origin:.3e} moves ZᵀKZ by {gap:.3e}, more \
+                     than the roundoff of annihilating it ({annihilation_roundoff:.3e})"
+                );
+            }
+            if psi_bar == trial_psi_bar {
+                restored_at_trial = Some(restored_omega);
+            }
+        }
+        let restored_omega = restored_at_trial.expect("the ladder ends at the trial");
+        let (restored_min, restored_cutoff) = min_eigenvalue_and_cutoff(&restored_omega);
+        assert!(
+            restored_min < -restored_cutoff,
+            "(4) restoring φ(0) at the trial ψ̄ must reproduce the refused spectrum: λ_min = \
+             {restored_min:.3e} against the cutoff −{restored_cutoff:.3e}"
         );
     }
 }

@@ -21,9 +21,80 @@ pub(crate) struct BinomialLocationScaleWiggleRowProgram<'a> {
     eta_ls: &'a Array1<f64>,
     etaw: &'a Array1<f64>,
     pub(super) beta_w: &'a Array1<f64>,
+    parts: BinomialLocationScaleWiggleRowPartsSource<'a>,
+    /// The highest basis derivative this program reads. Shared parts may hold more.
+    derivative_order: usize,
+}
+
+/// The direction-independent pieces of the row program at one set of block states: the
+/// binomial core and the wiggle basis derivatives. They depend only on the states, so a Hessian
+/// workspace builds them once and every directional operator it builds reads them (#2940).
+pub(crate) struct BinomialLocationScaleWiggleRowParts {
     core: BinomialLocationScaleCore,
     /// `basis_derivatives[d][[row, j]] = d^d B_j(q0[row]) / dq0^d`.
-    pub(super) basis_derivatives: Vec<Array2<f64>>,
+    basis_derivatives: Vec<Array2<f64>>,
+}
+
+/// Everything a binomial location-scale wiggle directional Hessian operator reads that does not
+/// depend on its direction: the row program's parts at the workspace's frozen states, and every
+/// design as a shared channel. A workspace builds one, so its operators share one row evaluation
+/// and one pair-gram identity per design (#2940).
+pub(crate) struct BlsWiggleOperatorGeometry {
+    parts: BinomialLocationScaleWiggleRowParts,
+    x_t: SharedDesign,
+    x_ls: SharedDesign,
+    /// `B`, `B'`, `B''`, `B'''` at `q0`, as far as the parts reach.
+    basis: Vec<SharedDesign>,
+}
+
+enum BinomialLocationScaleWiggleRowPartsSource<'a> {
+    Owned(BinomialLocationScaleWiggleRowParts),
+    Shared(&'a BinomialLocationScaleWiggleRowParts),
+}
+
+impl BinomialLocationScaleWiggleRowParts {
+    /// The core and the basis derivatives through `derivative_order` at `block_states`.
+    fn new(
+        family: &BinomialLocationScaleWiggleFamily,
+        block_states: &[ParameterBlockState],
+        derivative_order: usize,
+    ) -> Result<Self, String> {
+        assert!(derivative_order <= 4);
+        let (_, eta_t, eta_ls, etaw) = family.validated_block_etas(block_states)?;
+        let beta_w = &block_states[BinomialLocationScaleWiggleFamily::BLOCK_WIGGLE].beta;
+        let core = binomial_location_scale_core(
+            &family.y,
+            &family.weights,
+            eta_t,
+            eta_ls,
+            Some(etaw),
+            &family.link_kind,
+        )?;
+        let mut basis_derivatives = Vec::with_capacity(derivative_order + 1);
+        for order in 0..=derivative_order {
+            let basis = monotone_wiggle_basis_with_derivative_order(
+                core.q0.view(),
+                &family.wiggle_knots,
+                family.wiggle_degree,
+                order,
+            )?;
+            if basis.ncols() != beta_w.len() {
+                return Err(GamlssError::DimensionMismatch {
+                    reason: format!(
+                        "binomial wiggle row program derivative-{order} basis width {} != beta width {}",
+                        basis.ncols(),
+                        beta_w.len()
+                    ),
+                }
+                .into());
+            }
+            basis_derivatives.push(basis);
+        }
+        Ok(Self {
+            core,
+            basis_derivatives,
+        })
+    }
 }
 
 /// Which outer scalar the canonical row program composes onto `q(β)`.
@@ -95,51 +166,82 @@ fn binomial_location_scale_wiggle_predictor_expression<S: Clone>(
 }
 
 impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
+    /// The program at `block_states` over its own parts, built through `derivative_order`.
     pub(super) fn new(
         family: &'a BinomialLocationScaleWiggleFamily,
         block_states: &'a [ParameterBlockState],
         derivative_order: usize,
     ) -> Result<Self, String> {
-        assert!(derivative_order <= 4);
+        let parts =
+            BinomialLocationScaleWiggleRowParts::new(family, block_states, derivative_order)?;
+        Self::over_parts(
+            family,
+            block_states,
+            BinomialLocationScaleWiggleRowPartsSource::Owned(parts),
+            derivative_order,
+        )
+    }
+
+    /// The program at `block_states` over `parts` built at those same states, reading the basis
+    /// derivatives through `derivative_order` only, so it evaluates exactly as a program built
+    /// through that order would.
+    fn from_parts(
+        family: &'a BinomialLocationScaleWiggleFamily,
+        block_states: &'a [ParameterBlockState],
+        parts: &'a BinomialLocationScaleWiggleRowParts,
+        derivative_order: usize,
+    ) -> Result<Self, String> {
+        if parts.basis_derivatives.len() <= derivative_order {
+            return Err(GamlssError::InvalidInput {
+                reason: format!(
+                    "binomial wiggle row program needs basis derivatives through order \
+                     {derivative_order}, but its parts hold {}",
+                    parts.basis_derivatives.len()
+                ),
+            }
+            .into());
+        }
+        Self::over_parts(
+            family,
+            block_states,
+            BinomialLocationScaleWiggleRowPartsSource::Shared(parts),
+            derivative_order,
+        )
+    }
+
+    fn over_parts(
+        family: &'a BinomialLocationScaleWiggleFamily,
+        block_states: &'a [ParameterBlockState],
+        parts: BinomialLocationScaleWiggleRowPartsSource<'a>,
+        derivative_order: usize,
+    ) -> Result<Self, String> {
         let (_, eta_t, eta_ls, etaw) = family.validated_block_etas(block_states)?;
         let beta_w = &block_states[BinomialLocationScaleWiggleFamily::BLOCK_WIGGLE].beta;
-        let core = binomial_location_scale_core(
-            &family.y,
-            &family.weights,
-            eta_t,
-            eta_ls,
-            Some(etaw),
-            &family.link_kind,
-        )?;
-        let mut basis_derivatives = Vec::with_capacity(derivative_order + 1);
-        for order in 0..=derivative_order {
-            let basis = monotone_wiggle_basis_with_derivative_order(
-                core.q0.view(),
-                &family.wiggle_knots,
-                family.wiggle_degree,
-                order,
-            )?;
-            if basis.ncols() != beta_w.len() {
-                return Err(GamlssError::DimensionMismatch {
-                    reason: format!(
-                        "binomial wiggle row program derivative-{order} basis width {} != beta width {}",
-                        basis.ncols(),
-                        beta_w.len()
-                    ),
-                }
-                .into());
-            }
-            basis_derivatives.push(basis);
-        }
         Ok(Self {
             family,
             eta_t,
             eta_ls,
             etaw,
             beta_w,
-            core,
-            basis_derivatives,
+            parts,
+            derivative_order,
         })
+    }
+
+    fn parts(&self) -> &BinomialLocationScaleWiggleRowParts {
+        match &self.parts {
+            BinomialLocationScaleWiggleRowPartsSource::Owned(parts) => parts,
+            BinomialLocationScaleWiggleRowPartsSource::Shared(parts) => parts,
+        }
+    }
+
+    fn core(&self) -> &BinomialLocationScaleCore {
+        &self.parts().core
+    }
+
+    /// `d^d B(q0) / dq0^d` for `d` through this program's derivative order.
+    pub(super) fn basis_derivatives(&self) -> &[Array2<f64>] {
+        &self.parts().basis_derivatives[..=self.derivative_order]
     }
 
     #[inline]
@@ -151,7 +253,7 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
     ) -> [f64; 5] {
         assert_eq!(coefficients.len(), self.beta_w.len());
         let mut stack = [0.0; 5];
-        for (order, basis) in self.basis_derivatives.iter().enumerate() {
+        for (order, basis) in self.basis_derivatives().iter().enumerate() {
             stack[order] = basis.row(row).dot(&coefficients);
         }
         if let Some(value) = authoritative_value {
@@ -162,15 +264,15 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
 
     #[inline]
     fn objective_stack(&self, row: usize, derivative_order: usize) -> Result<[f64; 5], String> {
-        let q = self.core.q0[row] + self.etaw[row];
+        let q = self.core().q0[row] + self.etaw[row];
         let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
             self.family.y[row],
             self.family.weights[row],
             q,
-            self.core.mu[row],
-            self.core.dmu_dq[row],
-            self.core.d2mu_dq2[row],
-            self.core.d3mu_dq3[row],
+            self.core().mu[row],
+            self.core().dmu_dq[row],
+            self.core().d2mu_dq2[row],
+            self.core().d3mu_dq3[row],
             &self.family.link_kind,
         );
         let m4 = if derivative_order >= 4 {
@@ -178,10 +280,10 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
                 self.family.y[row],
                 self.family.weights[row],
                 q,
-                self.core.mu[row],
-                self.core.dmu_dq[row],
-                self.core.d2mu_dq2[row],
-                self.core.d3mu_dq3[row],
+                self.core().mu[row],
+                self.core().dmu_dq[row],
+                self.core().d2mu_dq2[row],
+                self.core().d3mu_dq3[row],
                 &self.family.link_kind,
             )?
         } else {
@@ -202,12 +304,12 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
             BinomialWiggleRowOuter::ExpectedInformation => {
                 let (information, first, second) = binomial_expected_q_information_derivatives(
                     self.family.weights[row],
-                    self.core.q0[row] + self.etaw[row],
+                    self.core().q0[row] + self.etaw[row],
                     &self.family.link_kind,
-                    self.core.mu[row],
-                    self.core.dmu_dq[row],
-                    self.core.d2mu_dq2[row],
-                    self.core.d3mu_dq3[row],
+                    self.core().mu[row],
+                    self.core().dmu_dq[row],
+                    self.core().d2mu_dq2[row],
+                    self.core().d3mu_dq3[row],
                 )?;
                 Ok([0.0, 0.0, information, first, second])
             }
@@ -276,8 +378,8 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         let n = self.family.y.len();
         let mut rows = BinomialWiggleOrder2Rows::zeros(
             n,
-            self.basis_derivatives[0].clone(),
-            self.basis_derivatives[1].clone(),
+            self.basis_derivatives()[0].clone(),
+            self.basis_derivatives()[1].clone(),
         );
         for row in 0..n {
             let h = self.order2_row(row, self.eta_t[row], self.eta_ls[row], outer)?;
@@ -472,12 +574,12 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         for row in 0..n {
             let (f, f1, _) = binomial_expected_q_information_derivatives(
                 self.family.weights[row],
-                self.core.q0[row] + self.etaw[row],
+                self.core().q0[row] + self.etaw[row],
                 &self.family.link_kind,
-                self.core.mu[row],
-                self.core.dmu_dq[row],
-                self.core.d2mu_dq2[row],
-                self.core.d3mu_dq3[row],
+                self.core().mu[row],
+                self.core().dmu_dq[row],
+                self.core().d2mu_dq2[row],
+                self.core().d3mu_dq3[row],
             )?;
             // Row carries no expected information (weight 0 / saturated tail):
             // every coefficient below is a multiple of f or f1, so leave the
@@ -485,7 +587,7 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
             if f == 0.0 && f1 == 0.0 {
                 continue;
             }
-            let q0g = nonwiggle_q_derivs(self.eta_t[row], self.core.sigma[row]);
+            let q0g = nonwiggle_q_derivs(self.eta_t[row], self.core().sigma[row]);
             let ud = nonwiggle_q_directional(q0g, d_eta_t[row], d_eta_ls[row]);
             let warp = self.linear_basis_stack(row, self.beta_w.view(), Some(self.etaw[row]));
             let m = 1.0 + warp[1];
@@ -549,17 +651,17 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         for row in 0..n {
             let (f, f1, f2) = binomial_expected_q_information_derivatives(
                 self.family.weights[row],
-                self.core.q0[row] + self.etaw[row],
+                self.core().q0[row] + self.etaw[row],
                 &self.family.link_kind,
-                self.core.mu[row],
-                self.core.dmu_dq[row],
-                self.core.d2mu_dq2[row],
-                self.core.d3mu_dq3[row],
+                self.core().mu[row],
+                self.core().dmu_dq[row],
+                self.core().d2mu_dq2[row],
+                self.core().d3mu_dq3[row],
             )?;
             if f == 0.0 && f1 == 0.0 && f2 == 0.0 {
                 continue;
             }
-            let q0g = nonwiggle_q_derivs(self.eta_t[row], self.core.sigma[row]);
+            let q0g = nonwiggle_q_derivs(self.eta_t[row], self.core().sigma[row]);
             let ud = nonwiggle_q_directional(q0g, d_eta_t_u[row], d_eta_ls_u[row]);
             let vd = nonwiggle_q_directional(q0g, d_eta_t_v[row], d_eta_ls_v[row]);
             let warp = self.linear_basis_stack(row, self.beta_w.view(), Some(self.etaw[row]));
@@ -2732,7 +2834,7 @@ impl BinomialLocationScaleWiggleFamily {
         Ok(Some(rows.assemble_dense(
             x_t.as_ref(),
             x_ls.as_ref(),
-            &program.basis_derivatives,
+            program.basis_derivatives(),
         )?))
     }
 
@@ -2765,7 +2867,7 @@ impl BinomialLocationScaleWiggleFamily {
         Ok(Some(rows.assemble_dense(
             x_t.as_ref(),
             x_ls.as_ref(),
-            &program.basis_derivatives,
+            program.basis_derivatives(),
         )?))
     }
 }
@@ -2989,23 +3091,57 @@ impl BinomialWiggleSecondDirectionalRows {
 }
 
 impl BinomialLocationScaleWiggleFamily {
-    /// Build a matrix-free `RowCoeffOperator` for the BLS Wiggle joint
-    /// directional derivative `D_β H_L[u]`. Channels (in order):
-    /// X_t, X_ls, B (b0), B' (d0), B'' (dd0). The operator acts on the
-    /// joint coefficient vector `(β_t, β_ls, β_w)`. `row_factor` is the
-    /// outer-subsample Horvitz–Thompson row factor (`None` for all rows), so
-    /// the operator differentiates the value Hessian on its own row measure.
-    pub(crate) fn bls_wiggle_directional_operator(
+    /// The operator geometry at `block_states`: the row program's parts through
+    /// `derivative_order`, and every design the operators read as a shared channel, with
+    /// identities minted here. A workspace builds it once at fourth order and hands it to
+    /// every directional operator it builds (#2940).
+    pub(crate) fn bls_wiggle_operator_geometry(
         &self,
         block_states: &[ParameterBlockState],
         x_t_arc: Arc<Array2<f64>>,
         x_ls_arc: Arc<Array2<f64>>,
+        derivative_order: usize,
+    ) -> Result<BlsWiggleOperatorGeometry, String> {
+        let parts = BinomialLocationScaleWiggleRowParts::new(self, block_states, derivative_order)?;
+        // The operators' channels read B through B'''.
+        let basis = parts
+            .basis_derivatives
+            .iter()
+            .take(4)
+            .map(|basis| SharedDesign::new(basis.clone()))
+            .collect();
+        Ok(BlsWiggleOperatorGeometry {
+            parts,
+            x_t: SharedDesign::from_arc(x_t_arc),
+            x_ls: SharedDesign::from_arc(x_ls_arc),
+            basis,
+        })
+    }
+
+    /// Build a matrix-free `RowCoeffOperator` for the BLS Wiggle joint
+    /// directional derivative `D_β H_L[u]`, at the states `operator_geometry`
+    /// was built from. Channels (in order): X_t, X_ls, B (b0), B' (d0),
+    /// B'' (dd0). The operator acts on the joint coefficient vector
+    /// `(β_t, β_ls, β_w)`. `row_factor` is the outer-subsample
+    /// Horvitz–Thompson row factor (`None` for all rows), so the operator
+    /// differentiates the value Hessian on its own row measure.
+    pub(crate) fn bls_wiggle_directional_operator(
+        &self,
+        block_states: &[ParameterBlockState],
+        operator_geometry: &BlsWiggleOperatorGeometry,
         d_beta_flat: &Array1<f64>,
         row_factor: Option<&Array1<f64>>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
+        let x_t_arc = operator_geometry.x_t.matrix();
+        let x_ls_arc = operator_geometry.x_ls.matrix();
         let pt = x_t_arc.ncols();
         let pls = x_ls_arc.ncols();
-        let program = BinomialLocationScaleWiggleRowProgram::new(self, block_states, 3)?;
+        let program = BinomialLocationScaleWiggleRowProgram::from_parts(
+            self,
+            block_states,
+            &operator_geometry.parts,
+            3,
+        )?;
         let pw = program.beta_w.len();
         let beta_layout = GamlssBetaLayout::withwiggle(pt, pls, pw);
         let total = beta_layout.total();
@@ -3037,20 +3173,14 @@ impl BinomialLocationScaleWiggleFamily {
             coeff_ww_bd,
         } = program.first_directional_rows(&d_eta_t, &d_eta_ls, uw.view())?;
 
-        // This call builds its own row program, so its designs mint fresh identities: a
-        // pair-gram cache miss, never a false hit (#2940).
-        let basis = SharedDesign::new(program.basis_derivatives[0].clone());
-        let basis_d1 = SharedDesign::new(program.basis_derivatives[1].clone());
-        let basis_d2 = SharedDesign::new(program.basis_derivatives[2].clone());
-
         Ok(Some(Arc::new(RowCoeffOperator::from_directions(
             vec![pt, pls, pw],
             vec![
-                (0, SharedDesign::from_arc(x_t_arc)),
-                (1, SharedDesign::from_arc(x_ls_arc)),
-                (2, basis),
-                (2, basis_d1),
-                (2, basis_d2),
+                (0, operator_geometry.x_t.clone()),
+                (1, operator_geometry.x_ls.clone()),
+                (2, operator_geometry.basis[0].clone()),
+                (2, operator_geometry.basis[1].clone()),
+                (2, operator_geometry.basis[2].clone()),
             ],
             vec![
                 // (X_t, X_t)  ← `xt_diag_x_dense(&x_t, &coeff_tt)`
@@ -3081,22 +3211,29 @@ impl BinomialLocationScaleWiggleFamily {
     }
 
     /// Build the matrix-free `D²H[u,v]` operator from the K=8 typed-probe
-    /// instantiation of the canonical row expression. Probe Hessian entries
-    /// lower directly onto the B/B'/B''/B''' channel plan. `row_factor` puts
-    /// it on the outer-subsample row measure, as for
+    /// instantiation of the canonical row expression, at the states
+    /// `operator_geometry` was built from. Probe Hessian entries lower directly
+    /// onto the B/B'/B''/B''' channel plan. `row_factor` puts it on the
+    /// outer-subsample row measure, as for
     /// [`Self::bls_wiggle_directional_operator`].
     pub(crate) fn bls_wiggle_second_directional_operator(
         &self,
         block_states: &[ParameterBlockState],
-        x_t_arc: Arc<Array2<f64>>,
-        x_ls_arc: Arc<Array2<f64>>,
+        operator_geometry: &BlsWiggleOperatorGeometry,
         d_beta_u: &Array1<f64>,
         d_beta_v: &Array1<f64>,
         row_factor: Option<&Array1<f64>>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
+        let x_t_arc = operator_geometry.x_t.matrix();
+        let x_ls_arc = operator_geometry.x_ls.matrix();
         let pt = x_t_arc.ncols();
         let pls = x_ls_arc.ncols();
-        let program = BinomialLocationScaleWiggleRowProgram::new(self, block_states, 4)?;
+        let program = BinomialLocationScaleWiggleRowProgram::from_parts(
+            self,
+            block_states,
+            &operator_geometry.parts,
+            4,
+        )?;
         let pw = program.beta_w.len();
         let layout = GamlssBetaLayout::withwiggle(pt, pls, pw);
         let (u_t, u_ls, u_w) = layout.split_three(d_beta_u, "wiggle d2H operator u")?;
@@ -3130,21 +3267,15 @@ impl BinomialLocationScaleWiggleFamily {
             v_w.view(),
         )?;
 
-        // Fresh identities for this call's own row program, as in the first directional
-        // operator (#2940).
-        let basis = SharedDesign::new(program.basis_derivatives[0].clone());
-        let basis_d1 = SharedDesign::new(program.basis_derivatives[1].clone());
-        let basis_d2 = SharedDesign::new(program.basis_derivatives[2].clone());
-        let basis_d3 = SharedDesign::new(program.basis_derivatives[3].clone());
         Ok(Some(Arc::new(RowCoeffOperator::from_directions(
             vec![pt, pls, pw],
             vec![
-                (0, SharedDesign::from_arc(x_t_arc)),
-                (1, SharedDesign::from_arc(x_ls_arc)),
-                (2, basis),
-                (2, basis_d1),
-                (2, basis_d2),
-                (2, basis_d3),
+                (0, operator_geometry.x_t.clone()),
+                (1, operator_geometry.x_ls.clone()),
+                (2, operator_geometry.basis[0].clone()),
+                (2, operator_geometry.basis[1].clone()),
+                (2, operator_geometry.basis[2].clone()),
+                (2, operator_geometry.basis[3].clone()),
             ],
             vec![
                 (0, 0, coeff_tt),

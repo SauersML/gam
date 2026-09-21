@@ -22,6 +22,9 @@ pub use model::{ConditionedJointModel, JointEventModel, JointForecast, fit_joint
 // law.rs (jls-law after slice 0): specification, history, complete-path density
 mod law;
 
+// jumps.rs (jls-jumps): learned disease-associated state jumps
+// [unlanded: jumps.rs]
+
 // data.rs (jls-ingest): long-table data contract and the frozen encoding schema
 mod data;
 pub use data::{EventTable, JointTables, SubjectTable};

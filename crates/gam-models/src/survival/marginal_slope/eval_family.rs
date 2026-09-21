@@ -786,23 +786,25 @@ impl SurvivalMarginalSlopeFamily {
         weights
     }
 
-    /// Closed-form fifth likelihood derivatives exist for the rigid shared-slope
-    /// row program only: no per-score slope, score warp, link deviation, influence
-    /// absorber or time wiggle.
+    /// Exact fifth likelihood derivatives exist for the rigid shared-slope row
+    /// program only: no per-score slope, score warp, link deviation, influence
+    /// absorber or time wiggle. On a declared latent law they come through the
+    /// anchor's Taylor tables (gam#2945), on the standard-normal law from the
+    /// Gaussian lowering's closed form.
     pub(crate) fn rigid_third_information_available(&self) -> bool {
-        !(self.per_z_slope_active()
-            || self.flex_active()
-            || self.flex_timewiggle_active()
-            || self.anchored_law_active())
+        !(self.per_z_slope_active() || self.flex_active() || self.flex_timewiggle_active())
     }
 
     /// Whether [`Self::baseline_contracted_trace_hessian_psi_with_options`] serves this frame: the
-    /// rigid time-constant slope, the frame with closed-form fifth likelihood derivatives.
+    /// rigid time-constant slope on the standard-normal law, the frame with closed-form fifth and
+    /// sixth likelihood derivatives. A declared latent law prices no completion, whose
+    /// contractions read sixth derivatives through the anchor root.
     pub(crate) fn baseline_contracted_trace_hessian_psi_available(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<bool, String> {
         Ok(self.rigid_third_information_available()
+            && !self.anchored_law_active()
             && !self.slope_is_follow_up_varying()
             && !self.effective_flex_active(block_states)?)
     }
@@ -979,7 +981,7 @@ impl SurvivalMarginalSlopeFamily {
         .design_contracted_trace_hessian_psi_pair(derivative_blocks, psi_i, psi_j, weight, &row_weights)
     }
 
-    /// Refuse a frame without closed-form fifth likelihood derivatives; see
+    /// Refuse a frame without exact rigid fifth likelihood derivatives; see
     /// [`Self::rigid_third_information_available`].
     fn require_rigid_third(
         &self,
@@ -988,7 +990,7 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<(), String> {
         if self.effective_flex_active(block_states)? || !self.rigid_third_information_available() {
             return Err(format!(
-                "survival marginal-slope {context} has closed-form fifth likelihood derivatives on the rigid shared-slope Gaussian row program only; FLEX, time-wiggle, per-score slopes and a declared latent law have none"
+                "survival marginal-slope {context} has exact fifth likelihood derivatives on the rigid shared-slope row program only; FLEX, time-wiggle and per-score slopes have none"
             ));
         }
         Ok(())

@@ -33,17 +33,15 @@ impl crate::custom_family::JeffreysThirdInformationDerivative for SurvivalMargin
             return Ok(None);
         }
         // The flex program carries a declared latent law through its own
-        // anchored timepoints (gam#2948), so it serves either law; the rigid
-        // closed form below is the Gaussian lowering's only.
+        // anchored timepoints (gam#2948), so it serves either law. The rigid
+        // frames below serve either law too: the Gaussian lowering's closed
+        // form, or the anchor's Taylor tables on a declared law (gam#2945).
         if self.effective_flex_active(states)? {
             return self
                 .exact_newton_joint_hessian_third_directional_derivative_flex_no_wiggle_all_axes(
                     states, u, v,
                 )
                 .map(Some);
-        }
-        if self.anchored_law_active() {
-            return Ok(None);
         }
         in_slope_frame!(self, P, Frame, {
             let kernel =
@@ -855,26 +853,21 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         Ok(true)
     }
 
-    /// The rigid single-slope row kernel has a closed-form third information derivative, and a
-    /// score warp or link deviation without a time wiggle has the order-five flex contraction
-    /// pulled back linearly. A time wiggle has the ζ composition of `timewiggle_third` on every
-    /// frame it serves, from the FLEX base or the rigid closed-form fifth derivatives. A per-score
-    /// slope, and an influence absorber without a time wiggle, have none; exposing it there would
-    /// plan an outer Hessian with no derivative to consume.
+    /// The rigid single-slope row kernel has an exact third information derivative on either
+    /// law: the closed-form fifth derivatives of the Gaussian lowering, or, on a declared latent
+    /// law, the fifth derivatives through the anchor's Taylor tables (gam#2945). A score warp or
+    /// link deviation without a time wiggle has the order-five flex contraction pulled back
+    /// linearly, anchored on the law itself (gam#2948). A time wiggle has the ζ composition of
+    /// `timewiggle_third` on every frame it serves, from the FLEX base or the rigid closed-form
+    /// fifth derivatives. A per-score slope, and an influence absorber without a time wiggle,
+    /// have none; exposing it there would plan an outer Hessian with no derivative to consume.
     fn jeffreys_third_information_derivative(
         &self,
     ) -> Option<&dyn crate::custom_family::JeffreysThirdInformationDerivative> {
-        // The closed-form fifth and sixth derivatives are the Gaussian
-        // lowering's; a declared latent law (gam#2923) has no such closed form
-        // and opts out exactly as the per-score and absorber frames do, unless a
-        // flex block runs the row through the order-five flex contraction, which
-        // anchors on the law itself (gam#2948).
         let served = if self.flex_timewiggle_active() {
             self.timewiggle_zeta_fifth_available()
         } else {
-            !self.per_z_slope_active()
-                && self.influence_absorber.is_none()
-                && (self.flex_active() || !self.anchored_law_active())
+            !self.per_z_slope_active() && self.influence_absorber.is_none()
         };
         if served { Some(self) } else { None }
     }

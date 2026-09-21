@@ -24,6 +24,9 @@ pub(crate) struct NonWiggleQDerivs {
     pub(crate) q_ll: f64,
     pub(crate) q_tl_ls: f64,
     pub(crate) q_ll_ls: f64,
+    /// `∂_t ∂²_ls q` and `∂³_ls q`: every further `η_ls` derivative flips the sign (#2677).
+    pub(crate) q_tl_ls_ls: f64,
+    pub(crate) q_ll_ls_ls: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -50,6 +53,8 @@ pub(crate) fn nonwiggle_q_derivs(eta_t: f64, sigma: f64) -> NonWiggleQDerivs {
     let q_ll = -eta_t * inv_sigma;
     let q_tl_ls = -inv_sigma;
     let q_ll_ls = eta_t * inv_sigma;
+    let q_tl_ls_ls = inv_sigma;
+    let q_ll_ls_ls = -eta_t * inv_sigma;
     NonWiggleQDerivs {
         q_t,
         q_ls,
@@ -57,6 +62,8 @@ pub(crate) fn nonwiggle_q_derivs(eta_t: f64, sigma: f64) -> NonWiggleQDerivs {
         q_ll,
         q_tl_ls,
         q_ll_ls,
+        q_tl_ls_ls,
+        q_ll_ls_ls,
     }
 }
 
@@ -335,6 +342,124 @@ pub(crate) fn binomial_expected_location_scale_second_coefficients(
         + 2.0 * f1 * u.delta_q * q.q_ls * v.delta_q_ls
         + 2.0 * f1 * v.delta_q * q.q_ls * u.delta_q_ls
         + 2.0 * f * (q.q_ls * q_ls_uv + u.delta_q_ls * v.delta_q_ls);
+    (tt, tl, ll)
+}
+
+/// `(f, f′, f″, f‴)` of the per-row expected information in q, `f = w·μ′²/(μ(1−μ))`:
+/// [`binomial_expected_q_information_derivatives`] through one more order, from the inverse
+/// link's fourth derivative `d4 = μ⁗`, by the same quotient algebra so the four stay one
+/// numerical route (#2677).
+#[inline]
+pub(crate) fn binomial_expected_q_information_third_derivatives(
+    weight: f64,
+    mu: f64,
+    d1: f64,
+    d2: f64,
+    d3: f64,
+    d4: f64,
+) -> (f64, f64, f64, f64) {
+    let (f, f1, f2) = binomial_expected_q_information_derivatives(weight, mu, d1, d2, d3);
+    if f == 0.0 && f1 == 0.0 && f2 == 0.0 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let var = mu * (1.0 - mu);
+    let one_minus_two_mu = 1.0 - 2.0 * mu;
+    let var1 = d1 * one_minus_two_mu;
+    let var2 = d2 * one_minus_two_mu - 2.0 * d1 * d1;
+    let var3 = d3 * one_minus_two_mu - 6.0 * d1 * d2;
+    let g = d1 * d1;
+    let g1 = 2.0 * d1 * d2;
+    let g2 = 2.0 * (d2 * d2 + d1 * d3);
+    let g3 = 2.0 * (3.0 * d2 * d3 + d1 * d4);
+    let num1 = g1 * var - g * var1;
+    let num1_prime = g2 * var - g * var2;
+    let num1_second = g3 * var + g2 * var1 - g1 * var2 - g * var3;
+    let var_squared = var * var;
+    let f3 = weight
+        * (num1_second / var_squared
+            - (4.0 * num1_prime * var1 + 2.0 * num1 * var2) / (var_squared * var)
+            + 6.0 * num1 * var1 * var1 / (var_squared * var_squared));
+    (f, f1, f2, f3)
+}
+
+/// Row coefficients `(tt, tl, ll)` of the expected information's third directional derivative
+/// `D³I[u, v, w]` for the non-wiggle map `q = −η_t·e^{−η_ls}`: each row's `I_ab = f(q)·q_a·q_b`
+/// differentiated along three predictor perturbations `[d_eta_t, d_eta_ls]`. By the product rule
+/// every direction lands on one of the three factors. The `f(q)` factor differentiates through
+/// the set partitions of the directions it receives (Faà di Bruno), with `f = [f, f′, f″, f‴]`,
+/// and every partial of the map beyond first order is a pure `η_ls` derivative, since `q` is
+/// linear in `η_t` (#2677).
+pub(crate) fn binomial_expected_location_scale_third_coefficients(
+    q: NonWiggleQDerivs,
+    f: [f64; 4],
+    directions: [[f64; 2]; 3],
+) -> (f64, f64, f64) {
+    let t = |index: usize| directions[index][0];
+    let ls = |index: usize| directions[index][1];
+    let members = |mask: usize| (0..3usize).filter(move |&bit| mask & (1 << bit) != 0);
+    let ls_product = |mask: usize| members(mask).map(ls).product::<f64>();
+    // Σ over the members of the mask of the product that reads that one member through `t`
+    // and every other member through `ls`.
+    let one_t_rest_ls = |mask: usize| {
+        members(mask)
+            .map(|chosen| {
+                members(mask)
+                    .map(|index| if index == chosen { t(index) } else { ls(index) })
+                    .product::<f64>()
+            })
+            .sum::<f64>()
+    };
+    // Directional derivatives of q along the directions of a non-empty mask.
+    let q_along = |mask: usize| match mask.count_ones() {
+        1 => {
+            let index = mask.trailing_zeros() as usize;
+            q.q_t * t(index) + q.q_ls * ls(index)
+        }
+        2 => q.q_tl * one_t_rest_ls(mask) + q.q_ll * ls_product(mask),
+        _ => q.q_tl_ls * one_t_rest_ls(mask) + q.q_ll_ls * ls_product(mask),
+    };
+    // Directional derivatives of the partials `q_t` and `q_ls` along a possibly empty mask.
+    let q_t_along = |mask: usize| match mask.count_ones() {
+        0 => q.q_t,
+        1 => q.q_tl * ls_product(mask),
+        2 => q.q_tl_ls * ls_product(mask),
+        _ => q.q_tl_ls_ls * ls_product(mask),
+    };
+    let q_ls_along = |mask: usize| match mask.count_ones() {
+        0 => q.q_ls,
+        1 => q.q_tl * one_t_rest_ls(mask) + q.q_ll * ls_product(mask),
+        2 => q.q_tl_ls * one_t_rest_ls(mask) + q.q_ll_ls * ls_product(mask),
+        _ => q.q_tl_ls_ls * one_t_rest_ls(mask) + q.q_ll_ls_ls * ls_product(mask),
+    };
+    let f_along = |mask: usize| match mask.count_ones() {
+        0 => f[0],
+        1 => f[1] * q_along(mask),
+        2 => {
+            let low = mask & mask.wrapping_neg();
+            let high = mask ^ low;
+            f[2] * q_along(low) * q_along(high) + f[1] * q_along(mask)
+        }
+        _ => {
+            f[3] * q_along(1) * q_along(2) * q_along(4)
+                + f[2]
+                    * (q_along(3) * q_along(4) + q_along(5) * q_along(2) + q_along(6) * q_along(1))
+                + f[1] * q_along(7)
+        }
+    };
+    let (mut tt, mut tl, mut ll) = (0.0, 0.0, 0.0);
+    for assignment in 0..27usize {
+        let mut masks = [0usize; 3];
+        let mut code = assignment;
+        for direction in 0..3usize {
+            masks[code % 3] |= 1 << direction;
+            code /= 3;
+        }
+        let [f_mask, first_mask, second_mask] = masks;
+        let scalar = f_along(f_mask);
+        tt += scalar * q_t_along(first_mask) * q_t_along(second_mask);
+        tl += scalar * q_t_along(first_mask) * q_ls_along(second_mask);
+        ll += scalar * q_ls_along(first_mask) * q_ls_along(second_mask);
+    }
     (tt, tl, ll)
 }
 

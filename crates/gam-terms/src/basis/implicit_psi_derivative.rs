@@ -61,7 +61,8 @@ impl FixedRowSpaceProjector {
             gam_linalg::faer_ndarray::FaerSvd::svd(&normalized, true, true)
                 .map_err(BasisError::LinalgError)?;
         let leading = singular.first().copied().unwrap_or(0.0);
-        let cutoff = gam_linalg::roundoff::factor_singular_band(n, q, leading);
+        let cutoff =
+            default_rrqr_rank_alpha() * f64::EPSILON * n.max(q).max(1) as f64 * leading.max(1.0);
         let rank = singular.iter().filter(|&&value| value > cutoff).count();
         let left = left.ok_or_else(|| {
             BasisError::InvalidInput(
@@ -3493,10 +3494,12 @@ pub(crate) fn design_chart_jets(
     per_axis: bool,
     share_c: f64,
 ) -> Result<Option<DesignChartJets>, BasisError> {
-    if chart.scale == 1.0 {
-        return Ok(None);
-    }
+    // A chart with a reference pair carries `ln α` jets whatever its value; `α`
+    // can equal 1 at one ψ and still move with ψ (gam#2735).
     let Some((i, j)) = chart.reference_pair else {
+        if chart.scale == 1.0 {
+            return Ok(None);
+        }
         return Err(BasisError::InvalidInput(format!(
             "design kernel chart is amplified (scale={}) but names no reference center pair",
             chart.scale

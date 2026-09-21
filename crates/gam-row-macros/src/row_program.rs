@@ -123,6 +123,7 @@ struct EmissionSurfaces {
     fifth_contracted: bool,
     full: bool,
     witnesses: bool,
+    witness_jets: bool,
     cuda: bool,
 }
 
@@ -138,11 +139,12 @@ impl EmissionSurfaces {
             "fifth_contracted" => &mut self.fifth_contracted,
             "full" => &mut self.full,
             "witnesses" => &mut self.witnesses,
+            "witness_jets" => &mut self.witness_jets,
             "cuda" => &mut self.cuda,
             _ => {
                 return Err(syn::Error::new_spanned(
                     surface,
-                    "row_program emission surface must be one of `generic`, `runtime`, `order2`, `third`, `fourth`, `fifth`, `fifth_contracted`, `full`, `witnesses`, or `cuda`",
+                    "row_program emission surface must be one of `generic`, `runtime`, `order2`, `third`, `fourth`, `fifth`, `fifth_contracted`, `full`, `witnesses`, `witness_jets`, or `cuda`",
                 ));
             }
         };
@@ -166,6 +168,7 @@ impl EmissionSurfaces {
             || self.fifth_contracted
             || self.full
             || self.witnesses
+            || self.witness_jets
             || self.cuda)
     }
 }
@@ -4877,6 +4880,12 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
             "row_program cannot emit a `witnesses` surface with no declared witnesses",
         ));
     }
+    if emissions.witness_jets && witnesses.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &name,
+            "row_program cannot emit a `witness_jets` surface with no declared witnesses",
+        ));
+    }
     let dimension = primaries.len();
 
     let generic_function = if emissions.generic {
@@ -5225,6 +5234,81 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
         quote!()
     };
 
+    // The witnesses as jets of any compile-time derivative width, over the same
+    // dependency slice the scalar witness surface evaluates. A consumer that
+    // needs a domain witness's derivative along a coefficient direction reads it
+    // from the one declaration instead of restating the witness expression.
+    let witness_jet_function = if emissions.witness_jets {
+        let jet_witness_dependencies = witness_dependencies(&statements, &witnesses);
+        let jet_witness_scalar_dependencies =
+            witness_scalar_dependencies(&statements, &jet_witness_dependencies)?;
+        let jet_witness_statements = statements
+            .iter()
+            .filter_map(|statement| match statement {
+                Statement::Local {
+                    name,
+                    mutable,
+                    value,
+                } if jet_witness_dependencies.contains(&name.to_string()) => {
+                    let value = rust_expression(value, &leaves);
+                    Some(if *mutable {
+                        quote!(let mut #name = #value;)
+                    } else {
+                        quote!(let #name = #value;)
+                    })
+                }
+                Statement::If {
+                    condition,
+                    assignments,
+                } => {
+                    let assignments = assignments
+                        .iter()
+                        .filter(|(target, _)| {
+                            jet_witness_dependencies.contains(&target.to_string())
+                        })
+                        .map(|(target, value)| {
+                            let value = rust_expression(value, &leaves);
+                            quote!(#target = #value;)
+                        })
+                        .collect::<Vec<_>>();
+                    (!assignments.is_empty()).then(|| quote!(if #condition { #(#assignments)* }))
+                }
+                Statement::Local { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let jet_witness_name = format_ident!("{}_witness_jets", name);
+        let jet_witness_values = witnesses
+            .iter()
+            .map(|witness| quote!(<S as ::core::clone::Clone>::clone(&#witness)));
+        let jet_witness_body = quote! {
+            #(#jet_witness_statements)*
+            [#(#jet_witness_values),*]
+        };
+        let jet_witness_dependent = primaries
+            .iter()
+            .filter(|primary| jet_witness_dependencies.contains(&primary.to_string()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let jet_witness_primaries = primary_parameters(&jet_witness_dependent, &jet_witness_body);
+        let jet_witness_constants = constants
+            .iter()
+            .filter(|constant| jet_witness_scalar_dependencies.contains(&constant.to_string()));
+        quote! {
+            #[inline(always)]
+            #visibility fn #jet_witness_name<
+                const __ROW_PROGRAM_DERIVATIVE_DIMENSION: usize,
+                S: ::gam_math::jet_scalar::JetScalar<__ROW_PROGRAM_DERIVATIVE_DIMENSION>,
+            >(
+                #(#jet_witness_primaries: &S,)*
+                #(#jet_witness_constants: f64),*
+            ) -> [S; #witness_count] {
+                #jet_witness_body
+            }
+        }
+    } else {
+        quote!()
+    };
+
     let cuda_constant = if emissions.cuda {
         let cuda = cuda_source(
             &name,
@@ -5252,6 +5336,7 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
         #fifth_contracted_function
         #full_function
         #scalar_witness_function
+        #witness_jet_function
         #cuda_constant
     })
 }
@@ -5485,7 +5570,7 @@ mod tests {
         });
         assert!(
             unknown.contains(
-                "must be one of `generic`, `runtime`, `order2`, `third`, `fourth`, `fifth`, `fifth_contracted`, `full`, `witnesses`, or `cuda`"
+                "must be one of `generic`, `runtime`, `order2`, `third`, `fourth`, `fifth`, `fifth_contracted`, `full`, `witnesses`, `witness_jets`, or `cuda`"
             )
         );
 
@@ -5511,6 +5596,57 @@ mod tests {
         .expect("parse row program");
         let error = expand(input).expect_err("empty witness surface must be rejected");
         assert!(error.to_string().contains("no declared witnesses"));
+    }
+
+    #[test]
+    fn rejects_empty_witness_jet_surface() {
+        let input = syn::parse2::<Input>(quote! {
+            fn empty_witness_jets(x;)
+            emit [witness_jets];
+            leaves {}
+            witnesses [];
+            { return x; }
+        })
+        .expect("parse row program");
+        let error = expand(input).expect_err("empty witness-jet surface must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("`witness_jets` surface with no declared witnesses")
+        );
+    }
+
+    #[test]
+    fn witness_jets_return_the_sliced_witnesses_as_jets() {
+        let rust = emitted_function(
+            quote! {
+                fn witness_formula(x, y; take, shift)
+                emit [witness_jets];
+                leaves { curve => curve_stack => d_curve }
+                witnesses [shifted];
+                {
+                    let sum = add(x, y);
+                    let shifted = add_constant(sum, shift);
+                    let curved = compose(curve, shifted);
+                    let mut out = zero();
+                    if (take > 0.0) { out = add(curved, x); }
+                    return add(out, curved);
+                }
+            },
+            "witness_formula_witness_jets",
+        );
+        assert!(
+            rust.contains("-> [S ;"),
+            "the surface returns the witnesses as jets: {rust}"
+        );
+        assert!(
+            rust.contains("let shifted"),
+            "the witness binding is emitted: {rust}"
+        );
+        assert!(
+            !rust.contains("let curved") && !rust.contains("take"),
+            "statements and constants outside the witness slice are not emitted: {rust}"
+        );
     }
 
     #[test]

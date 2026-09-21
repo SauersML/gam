@@ -479,12 +479,17 @@ fn duchon_operator_penalty_psi_jets_match_the_forward_16d_linear_power9() {
     assert_operator_penalty_gaps(&gaps, "opers_16d_linear_power9");
 }
 
-/// The un-amplified sibling: the same jets with `α = 1`, so a gap here is a
-/// formula gap and not a scale one.
+/// The low-dimensional sibling at 3-D, order 0, power 9. Every chart is the
+/// frozen reference pair's normalization `1/|φ̃(r*)|` (gam#2735), so a gap here
+/// is a formula gap at another dimension, not a missing chart jet.
 #[test]
 fn duchon_operator_penalty_psi_jets_match_the_forward_3d_order0_power9() {
     let (data, spec) = frozen_hybrid_fixture(3, 160, 10, DuchonNullspaceOrder::Zero, 9.0);
-    assert_eq!(chart_amplification(data.view(), &spec), 1.0, "3-D order-0 power-9 is not amplified");
+    let amplification = chart_amplification(data.view(), &spec);
+    assert!(
+        amplification.is_finite() && amplification > 0.0,
+        "the 3-D chart must be a positive finite normalization, got {amplification}"
+    );
     let gaps = operator_penalty_gaps(data.view(), &spec, "opers_3d_order0_power9");
     assert_operator_penalty_gaps(&gaps, "opers_3d_order0_power9");
 }

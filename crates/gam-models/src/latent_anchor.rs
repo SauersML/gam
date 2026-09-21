@@ -1407,36 +1407,47 @@ const ANCHOR_TAYLOR_ORDER: usize = 5;
 /// Coefficient slots per axis of the table: degrees `0..=ANCHOR_TAYLOR_ORDER`.
 const TAYLOR_SLOTS: usize = ANCHOR_TAYLOR_ORDER + 1;
 
-/// `n!` for `n ≤ 5`: the factor between a Taylor coefficient and the
-/// derivative stack a carrier composes.
-const FACTORIAL: [f64; TAYLOR_SLOTS] = [1.0, 1.0, 2.0, 6.0, 24.0, 120.0];
+/// Slots per axis of the order-six table the exact fifth likelihood derivative
+/// reads (gam#2945): the event row's `log α̇₁ = log(α_q·q̇₁)` through order five
+/// is `α` through order six. It is built on demand and never stored, so a
+/// root slot keeps its order-five table.
+pub(crate) const ANCHOR_SIXTH_SLOTS: usize = 7;
 
-/// Slices of `δα^r` the table's solve reads: degree `e` for `2 ≤ r ≤ e ≤ 5`.
+/// `n!` for `n ≤ 6`: the factor between a Taylor coefficient and the
+/// derivative stack a carrier composes.
+const FACTORIAL: [f64; ANCHOR_SIXTH_SLOTS] = [1.0, 1.0, 2.0, 6.0, 24.0, 120.0, 720.0];
+
+/// Slices of `δα^r` the order-five solve reads: degree `e` for `2 ≤ r ≤ e ≤ 5`.
 const POWER_SLICES: usize = 10;
 
-/// Where the degree-`e` part of `δα^r` sits among the [`POWER_SLICES`]
-/// (`2 ≤ r ≤ e ≤ 5`): degrees in order, powers ascending within each.
+/// Slices of `δα^r` the order-six solve reads: degree `e` for `2 ≤ r ≤ e ≤ 6`.
+const SIXTH_POWER_SLICES: usize = 15;
+
+/// Where the degree-`e` part of `δα^r` sits among a solve's power slices
+/// (`2 ≤ r ≤ e`): degrees in order, powers ascending within each.
 #[inline]
 fn power_slice(r: usize, degree: usize) -> usize {
     (degree - 1) * (degree - 2) / 2 + (r - 2)
 }
 
-/// `[·, F′, F″, F‴, F⁗, F⁽⁵⁾](x)` with `F(x) = Φ(−x)`, `F^{(n)} = (−1)^n
-/// He_{n−1}(x) φ(x)`, with `φ(x)` replaced by the caller's `density` — a
-/// normalized node weight or the ratio `φ(q)/Σ w φ(η)` (gam#2941). The value
-/// slot is never read and holds zero.
+/// `[·, F′, F″, F‴, F⁗, F⁽⁵⁾, F⁽⁶⁾](x)` through slot `SLOTS − 1`, with
+/// `F(x) = Φ(−x)`, `F^{(n)} = (−1)^n He_{n−1}(x) φ(x)`, with `φ(x)` replaced by
+/// the caller's `density` — a normalized node weight or the ratio
+/// `φ(q)/Σ w φ(η)` (gam#2941). The value slot is never read and holds zero.
 #[inline]
-fn survival_cdf_derivative_stack(x: f64, density: f64) -> [f64; TAYLOR_SLOTS] {
-    let pdf = density;
+fn survival_cdf_derivative_stack<const SLOTS: usize>(x: f64, density: f64) -> [f64; SLOTS] {
+    const { assert!(SLOTS <= ANCHOR_SIXTH_SLOTS) };
     let x2 = x * x;
-    [
+    let hermite = [
         0.0,
-        -pdf,
-        x * pdf,
-        (1.0 - x2) * pdf,
-        (x2 * x - 3.0 * x) * pdf,
-        -(x2 * x2 - 6.0 * x2 + 3.0) * pdf,
-    ]
+        -1.0,
+        x,
+        1.0 - x2,
+        x2 * x - 3.0 * x,
+        -(x2 * x2 - 6.0 * x2 + 3.0),
+        (x2 * x2 - 10.0 * x2 + 15.0) * x,
+    ];
+    std::array::from_fn(|n| hermite[n] * density)
 }
 
 /// The anchor's Taylor table at a solved root (gam#2928): `c[i][j] =
@@ -1464,6 +1475,124 @@ pub(crate) struct AnchorTaylor {
     coefficients: [[f64; TAYLOR_SLOTS]; TAYLOR_SLOTS],
 }
 
+/// The implicit-differentiation solve of [`AnchorTaylor`] through total order
+/// `SLOTS − 1`, with `SLICES` the number of power slices that order reads.
+///
+/// The order-six solve (gam#2945) runs the order-five one's arithmetic
+/// unchanged and adds degree six after it, so its orders through five are the
+/// order-five table's bits.
+fn anchor_taylor_coefficients<const SLOTS: usize, const SLICES: usize>(
+    alpha: f64,
+    q: f64,
+    observed_slope: f64,
+    grid: AnchorGrid<'_>,
+) -> Result<[[f64; SLOTS]; SLOTS], String> {
+    const { assert!(SLICES == (SLOTS - 1) * (SLOTS - 2) / 2) };
+    // moments[n][s] = Σ_k w_k u_k^s F^{(n)}(η_k), 1 ≤ n < SLOTS, s ≤ n, divided
+    // through by `Σ_k w_k φ(η_k)` like `G` of the implicit derivatives: the
+    // table is homogeneous of degree zero in `H`, and the normalized form
+    // stays finite where every node's density underflows (gam#2941).
+    let density = AnchorDensity::at(alpha, observed_slope, grid)?;
+    let mut moments = [[0.0_f64; SLOTS]; SLOTS];
+    for (&u, &omega) in grid.nodes.iter().zip(density.weights().iter()) {
+        let stack = survival_cdf_derivative_stack::<SLOTS>(alpha + observed_slope * u, omega);
+        let mut power = 1.0;
+        for s in 0..SLOTS {
+            for n in s.max(1)..SLOTS {
+                moments[n][s] += stack[n] * power;
+            }
+            power *= u;
+        }
+    }
+    let h_alpha = moments[1][0];
+    if !(h_alpha.is_finite() && h_alpha < 0.0) {
+        return Err(format!(
+            "survival marginal-slope anchor has no finite gradient: H_α={h_alpha:e} at α={alpha}, q={q}, b={observed_slope}"
+        ));
+    }
+    let target = survival_cdf_derivative_stack::<SLOTS>(q, density.log_density_ratio(q).exp());
+    // parts[d][i]: the coefficient of δq^i·δb^(d−i) in δα. powers holds the
+    // degree-e part of δα^r for 2 ≤ r ≤ e only — the slices the solve reads —
+    // at `power_slice(r, e)`, so an order-five table zeroes 480 bytes of
+    // scratch instead of the whole 6·6·6 cube (gam#2928).
+    let mut parts = [[0.0_f64; SLOTS]; SLOTS];
+    let mut powers = [[0.0_f64; SLOTS]; SLICES];
+    for degree in 1..SLOTS {
+        // [δα^r]_degree = Σ_j A_j·[δα^(r−1)]_(degree−j) reads parts below
+        // `degree` only.
+        for r in 2..=degree {
+            let mut power = [0.0_f64; SLOTS];
+            for j in 1..=degree + 1 - r {
+                let lower = degree - j;
+                let right = if r == 2 { &parts[lower] } else { &powers[power_slice(r - 1, lower)] };
+                for i1 in 0..=j {
+                    for i2 in 0..=lower {
+                        power[i1 + i2] += parts[j][i1] * right[i2];
+                    }
+                }
+            }
+            powers[power_slice(r, degree)] = power;
+        }
+        // Everything of degree `degree` in the expanded equation except
+        // `H_10·A_degree`: the slope moment `H_{0,degree}·δb^degree / degree!`,
+        // the target's `δq^degree` term, and `H_rs·[δα^r]_(degree−s)·δb^s`.
+        let mut rest = [0.0_f64; SLOTS];
+        rest[0] = moments[degree][degree] / FACTORIAL[degree];
+        rest[degree] -= target[degree] / FACTORIAL[degree];
+        for s in 0..degree {
+            let lower = degree - s;
+            for r in 1..=lower {
+                if (r, s) == (1, 0) {
+                    continue;
+                }
+                let scale = moments[r + s][s] / (FACTORIAL[r] * FACTORIAL[s]);
+                let source = if r == 1 { &parts[lower] } else { &powers[power_slice(r, lower)] };
+                for i in 0..=lower {
+                    rest[i] += scale * source[i];
+                }
+            }
+        }
+        for i in 0..=degree {
+            parts[degree][i] = -rest[i] / h_alpha;
+        }
+    }
+    let mut coefficients = [[0.0_f64; SLOTS]; SLOTS];
+    for (degree, part) in parts.iter().enumerate().skip(1) {
+        for i in 0..=degree {
+            coefficients[i][degree - i] = part[i];
+        }
+    }
+    coefficients[0][0] = alpha;
+    if !coefficients.iter().flatten().all(|c| c.is_finite()) {
+        return Err(format!(
+            "survival marginal-slope anchor Taylor table is non-finite at α={alpha}, q={q}, b={observed_slope}"
+        ));
+    }
+    Ok(coefficients)
+}
+
+/// The anchor's Taylor table through total order six at an already solved
+/// anchor, `c[i][j] = ∂_q^i ∂_b^j α / (i!·j!)` for `i + j ≤ 6` (gam#2945).
+///
+/// The exact fifth likelihood derivative of an event row reads
+/// `log α_q(q₁, b)` through order five, which is `α` through order six. Only
+/// that kernel reads the sixth order, so the table is solved on demand at the
+/// root its slot returns and never published: orders through five are the
+/// slot's order-five table bit for bit ([`anchor_taylor_coefficients`]).
+pub(crate) fn anchor_taylor_through_sixth(
+    alpha: f64,
+    q: f64,
+    observed_slope: f64,
+    grid: AnchorGrid<'_>,
+) -> Result<[[f64; ANCHOR_SIXTH_SLOTS]; ANCHOR_SIXTH_SLOTS], String> {
+    anchor_taylor_coefficients::<ANCHOR_SIXTH_SLOTS, SIXTH_POWER_SLICES>(
+        alpha,
+        q,
+        observed_slope,
+        grid,
+    )
+}
+
 impl AnchorTaylor {
     /// The table at an already solved anchor.
     pub(crate) fn at(
@@ -1472,87 +1601,14 @@ impl AnchorTaylor {
         observed_slope: f64,
         grid: AnchorGrid<'_>,
     ) -> Result<Self, String> {
-        // moments[n][s] = Σ_k w_k u_k^s F^{(n)}(η_k), 1 ≤ n ≤ 5, s ≤ n, divided
-        // through by `Σ_k w_k φ(η_k)` like `G` of the implicit derivatives: the
-        // table is homogeneous of degree zero in `H`, and the normalized form
-        // stays finite where every node's density underflows (gam#2941).
-        let density = AnchorDensity::at(alpha, observed_slope, grid)?;
-        let mut moments = [[0.0_f64; TAYLOR_SLOTS]; TAYLOR_SLOTS];
-        for (&u, &omega) in grid.nodes.iter().zip(density.weights().iter()) {
-            let stack = survival_cdf_derivative_stack(alpha + observed_slope * u, omega);
-            let mut power = 1.0;
-            for s in 0..TAYLOR_SLOTS {
-                for n in s.max(1)..TAYLOR_SLOTS {
-                    moments[n][s] += stack[n] * power;
-                }
-                power *= u;
-            }
-        }
-        let h_alpha = moments[1][0];
-        if !(h_alpha.is_finite() && h_alpha < 0.0) {
-            return Err(format!(
-                "survival marginal-slope anchor has no finite gradient: H_α={h_alpha:e} at α={alpha}, q={q}, b={observed_slope}"
-            ));
-        }
-        let target = survival_cdf_derivative_stack(q, density.log_density_ratio(q).exp());
-        // parts[d][i]: the coefficient of δq^i·δb^(d−i) in δα. powers holds the
-        // degree-e part of δα^r for 2 ≤ r ≤ e ≤ 5 only — the ten slices the
-        // solve reads — at `power_slice(r, e)`, so a table zeroes 480 bytes of
-        // scratch instead of the whole 6·6·6 cube (gam#2928).
-        let mut parts = [[0.0_f64; TAYLOR_SLOTS]; TAYLOR_SLOTS];
-        let mut powers = [[0.0_f64; TAYLOR_SLOTS]; POWER_SLICES];
-        for degree in 1..TAYLOR_SLOTS {
-            // [δα^r]_degree = Σ_j A_j·[δα^(r−1)]_(degree−j) reads parts below
-            // `degree` only.
-            for r in 2..=degree {
-                let mut power = [0.0_f64; TAYLOR_SLOTS];
-                for j in 1..=degree + 1 - r {
-                    let lower = degree - j;
-                    let right = if r == 2 { &parts[lower] } else { &powers[power_slice(r - 1, lower)] };
-                    for i1 in 0..=j {
-                        for i2 in 0..=lower {
-                            power[i1 + i2] += parts[j][i1] * right[i2];
-                        }
-                    }
-                }
-                powers[power_slice(r, degree)] = power;
-            }
-            // Everything of degree `degree` in the expanded equation except
-            // `H_10·A_degree`: the slope moment `H_{0,degree}·δb^degree / degree!`,
-            // the target's `δq^degree` term, and `H_rs·[δα^r]_(degree−s)·δb^s`.
-            let mut rest = [0.0_f64; TAYLOR_SLOTS];
-            rest[0] = moments[degree][degree] / FACTORIAL[degree];
-            rest[degree] -= target[degree] / FACTORIAL[degree];
-            for s in 0..degree {
-                let lower = degree - s;
-                for r in 1..=lower {
-                    if (r, s) == (1, 0) {
-                        continue;
-                    }
-                    let scale = moments[r + s][s] / (FACTORIAL[r] * FACTORIAL[s]);
-                    let source = if r == 1 { &parts[lower] } else { &powers[power_slice(r, lower)] };
-                    for i in 0..=lower {
-                        rest[i] += scale * source[i];
-                    }
-                }
-            }
-            for i in 0..=degree {
-                parts[degree][i] = -rest[i] / h_alpha;
-            }
-        }
-        let mut coefficients = [[0.0_f64; TAYLOR_SLOTS]; TAYLOR_SLOTS];
-        for (degree, part) in parts.iter().enumerate().skip(1) {
-            for i in 0..=degree {
-                coefficients[i][degree - i] = part[i];
-            }
-        }
-        coefficients[0][0] = alpha;
-        if !coefficients.iter().flatten().all(|c| c.is_finite()) {
-            return Err(format!(
-                "survival marginal-slope anchor Taylor table is non-finite at α={alpha}, q={q}, b={observed_slope}"
-            ));
-        }
-        Ok(Self { coefficients })
+        anchor_taylor_coefficients::<TAYLOR_SLOTS, POWER_SLICES>(alpha, q, observed_slope, grid)
+            .map(|coefficients| Self { coefficients })
+    }
+
+    /// `c[i][j] = ∂_q^i ∂_b^j α / (i!·j!)` for `i + j ≤ 5`, zero above.
+    #[inline]
+    pub(crate) fn coefficients(&self) -> &[[f64; TAYLOR_SLOTS]; TAYLOR_SLOTS] {
+        &self.coefficients
     }
 
     /// The anchor and its implicit derivatives through order three, from the
@@ -2871,6 +2927,39 @@ mod anchor_tests {
                     let target = normal_cdf(q);
                     assert!(((failure - target) / target).abs() < 1e-9, "q={q} b={b}: {failure:e} vs {target:e}");
                 }
+            }
+        }
+    }
+
+    /// gam#2945: the order-six table the exact fifth likelihood derivative solves on demand
+    /// extends the order-five table a root slot publishes. Its orders through five are that
+    /// table's bits, so the fifth derivative reads the same anchor the value path and every
+    /// carrier read, and its sixth order is not the zero a truncated table would leave.
+    #[test]
+    fn sixth_order_table_extends_the_published_table_bitwise_2945() {
+        let grid = skewed_grid();
+        for &q in &[-2.1, -0.6, 0.3, 1.6, 3.4] {
+            for &b in &[-1.2, -0.2, 0.0, 0.7, 1.9] {
+                let alpha = solve_anchor(q, b, grid.view()).expect("anchor");
+                let published = AnchorTaylor::at(alpha, q, b, grid.view()).expect("order-five table");
+                let sixth =
+                    anchor_taylor_through_sixth(alpha, q, b, grid.view()).expect("order-six table");
+                for i in 0..TAYLOR_SLOTS {
+                    for j in 0..TAYLOR_SLOTS - i {
+                        assert_eq!(
+                            sixth[i][j].to_bits(),
+                            published.coefficients[i][j].to_bits(),
+                            "q={q} b={b}: c[{i}][{j}] = {:+.17e} against the published {:+.17e}",
+                            sixth[i][j],
+                            published.coefficients[i][j]
+                        );
+                    }
+                }
+                let top = ANCHOR_SIXTH_SLOTS - 1;
+                assert!(
+                    (0..=top).any(|i| sixth[i][top - i] != 0.0),
+                    "q={q} b={b}: the skewed law's anchor has no sixth-order term"
+                );
             }
         }
     }
