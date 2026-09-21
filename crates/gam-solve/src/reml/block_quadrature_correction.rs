@@ -659,8 +659,10 @@ impl<'a> RemlState<'a> {
             }
         });
 
+        let row_block_design = gam_linalg::faer_ndarray::fast_ab(x_dense.as_ref(), &block_vecs);
         let target = Gam784BlockTarget {
             x_transformed: x_dense.as_ref(),
+            row_block_design,
             block_vecs,
             block_lambdas,
             eta_hat,
@@ -842,7 +844,7 @@ impl<'a> RemlState<'a> {
         };
         let mixed = match (axis_split, curvature_derivatives.as_ref()) {
             (true, Some((c_obs, d_obs, e_obs))) => {
-                let mut whitened = x.dot(&target.block_vecs);
+                let mut whitened = target.row_block_design.clone();
                 for r in 0..m {
                     let scale = target.block_lambdas[r].sqrt().recip();
                     whitened.column_mut(r).mapv_inplace(|v| v * scale);
@@ -1370,7 +1372,7 @@ fn block_target_channel_moments(
     let x = target.x_transformed;
     let n_rows = x.nrows();
     let width = target.block_vecs.ncols();
-    let xv = x.dot(&target.block_vecs); // n × width
+    let xv = target.row_block_design.view(); // n × width
     let ngs_base = target
         .base_neg_score()
         .map_err(EstimationError::InvalidInput)?;
@@ -1428,6 +1430,11 @@ pub(super) fn block_axis_target<'t>(target: &Gam784BlockTarget<'t>, r: usize) ->
         x_transformed: target.x_transformed,
         block_vecs: target
             .block_vecs
+            .column(r)
+            .to_owned()
+            .insert_axis(ndarray::Axis(1)),
+        row_block_design: target
+            .row_block_design
             .column(r)
             .to_owned()
             .insert_axis(ndarray::Axis(1)),
