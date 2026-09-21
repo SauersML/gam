@@ -100,17 +100,6 @@ fn bspline_basis(x: &[f64], k: usize) -> Array2<f64> {
     b
 }
 
-/// Squared-second-difference penalty `D_2' D_2`, k x k.
-fn second_difference_penalty(k: usize) -> Array2<f64> {
-    let mut d = Array2::<f64>::zeros((k - 2, k));
-    for i in 0..(k - 2) {
-        d[[i, i]] = 1.0;
-        d[[i, i + 1]] = -2.0;
-        d[[i, i + 2]] = 1.0;
-    }
-    d.t().dot(&d)
-}
-
 #[test]
 fn large_scale_convergence_regression() {
     let n = N;
@@ -152,7 +141,7 @@ fn large_scale_convergence_regression() {
     let offset = Array1::<f64>::zeros(n);
 
     // Single smooth block — k_smoothing = 1.
-    let s_block = second_difference_penalty(k);
+    let s_block = gam::test_support::coefficient_difference_penalty(k, 2);
     let s_list = vec![BlockwisePenalty::new(1..(1 + k), s_block)];
 
     let start = Instant::now();

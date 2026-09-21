@@ -7585,16 +7585,6 @@ mod tests {
     // against a dense evaluation of the SAME REML objective on the full,
     // positive-definite `H = XᵀWX + λS`.
 
-    fn second_difference_penalty(p: usize) -> Array2<f64> {
-        let mut d = Array2::<f64>::zeros((p - 2, p));
-        for row in 0..p - 2 {
-            d[[row, row]] = 1.0;
-            d[[row, row + 1]] = -2.0;
-            d[[row, row + 2]] = 1.0;
-        }
-        d.t().dot(&d)
-    }
-
     fn wide_design_3366() -> (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>) {
         let (n, p) = (9usize, 12usize);
         let x = Array2::from_shape_fn((n, p), |(i, j)| {
@@ -7607,7 +7597,7 @@ mod tests {
             (2.3 * t).sin() + 0.4 * (11.0 * t + 0.7).sin()
         });
         let w = Array1::from_shape_fn(n, |i| 1.0 + 0.2 * (0.9 * i as f64).cos());
-        (x, y, second_difference_penalty(p), w)
+        (x, y, gam_linalg_test_support::coefficient_difference_penalty(p, 2), w)
     }
 
     fn zero_column_design_3366() -> (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>) {
@@ -7622,7 +7612,7 @@ mod tests {
             0.3 + 0.8 * t - 0.5 * t * t + 0.15 * (9.0 * t).sin()
         });
         let w = Array1::from_shape_fn(n, |i| 1.0 + 0.1 * (0.5 * i as f64).sin());
-        (x, y, second_difference_penalty(7), w)
+        (x, y, gam_linalg_test_support::coefficient_difference_penalty(7, 2), w)
     }
 
     struct DenseRemlReference {
@@ -7755,7 +7745,7 @@ mod tests {
         // The zero column is identified only through the penalty; a penalty
         // that does not touch it leaves that coefficient unidentified.
         let (x, y, _, w) = zero_column_design_3366();
-        let mut s = second_difference_penalty(7);
+        let mut s = gam_linalg_test_support::coefficient_difference_penalty(7, 2);
         s.row_mut(3).fill(0.0);
         s.column_mut(3).fill(0.0);
         assert!(matches!(

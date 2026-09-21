@@ -47,16 +47,6 @@ fn fixture(family: &ResponseFamily) -> (Array2<f64>, Array1<f64>) {
     (x, y)
 }
 
-fn second_difference_penalty(k: usize) -> Array2<f64> {
-    let mut d = Array2::<f64>::zeros((k - 2, k));
-    for r in 0..k - 2 {
-        d[[r, r]] = 1.0;
-        d[[r, r + 1]] = -2.0;
-        d[[r, r + 2]] = 1.0;
-    }
-    d.t().dot(&d)
-}
-
 /// What one evaluation at `rho` on a freshly built REML state returns: the value
 /// and gradient bits, the armed capture's evidence, and the inner solve's
 /// residual, penalized Hessian and coefficients in its own frame.
@@ -75,7 +65,7 @@ fn evaluate(family: ResponseFamily, link: StandardLink, rho: f64, armed: bool) -
     let offset = Array1::<f64>::zeros(ROWS);
     let specs = vec![PenaltySpec::from_blockwise_ref(&BlockwisePenalty::new(
         0..BASIS,
-        second_difference_penalty(BASIS),
+        gam_linalg_test_support::coefficient_difference_penalty(BASIS, 2),
     ))];
     let ext = ExternalOptimOptions {
         family: LikelihoodSpec::new(family, InverseLink::Standard(link)),

@@ -84,18 +84,6 @@ fn cubic_bspline_design(xs: &[f64], n_basis: usize) -> Array2<f64> {
     b
 }
 
-/// 2nd-order difference penalty `S = DᵀD` (nullspace dim 2).
-fn second_difference_penalty(k: usize) -> Array2<f64> {
-    let m = k - 2;
-    let mut d = Array2::<f64>::zeros((m, k));
-    for r in 0..m {
-        d[[r, r]] = 1.0;
-        d[[r, r + 1]] = -2.0;
-        d[[r, r + 2]] = 1.0;
-    }
-    d.t().dot(&d)
-}
-
 fn build_fixture() -> (Array2<f64>, Array1<f64>, Vec<BlockwisePenalty>) {
     build_fixture_n(N, K)
 }
@@ -130,7 +118,7 @@ fn build_fixture_n(n: usize, k: usize) -> (Array2<f64>, Array1<f64>, Vec<Blockwi
         let start = 1 + j * k;
         s_list.push(BlockwisePenalty::new(
             start..(start + k),
-            second_difference_penalty(k),
+            gam_linalg_test_support::coefficient_difference_penalty(k, 2),
         ));
     }
 

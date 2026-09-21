@@ -3308,5 +3308,25 @@
     ],
     "reason": "#4082: the GPU calibration cache persisted the whole GpuDispatchPolicy and load_cached_policy returned it verbatim, so never-calibrated fields kept the writing build's defaults and calibrated floors were not bounded by the current grid. The cache now stores GridTimings (CPU/GPU seconds per grid point) and policy_from_timings rebuilds the policy on every load. MeasurementRecord (a field-for-field copy of Measurement with a String operation, written and never read) and its into_record converter go; measure_gemm, measure_potrf and measure_xtwx are folded into calibrate_device, which now returns the grid timings; store_cached_policy is store_cached_timings. GpuDispatchPolicy and GpuMixedPrecisionPolicy drop their serde derives, which only the cache used.",
     "evidence": "scripts/source_removal_guard.py with --base d027be231ca8fdf6f8104690ae68869486db51ab (re-pointed to main f5930beca8 when main was merged in) and head the change's commit lists exactly these removals, all private to crates/gam-gpu/src/calibration.rs. Read-proof at the head: git grep -w finds 0 occurrences of MeasurementRecord (in gam-gpu), into_record (in gam-gpu), measure_gemm, measure_potrf, measure_xtwx and store_cached_policy in crates/ tests/ examples/; calibration.rs was their only file."
+  },
+  {
+    "base": "c71ab489e70eefb87c90a1fa5826491a8781b986",
+    "items": [
+      "crates/gam-models/src/multinomial_reml.rs:fn:second_difference_penalty",
+      "crates/gam-solve/src/estimate/binomial_reml_outer_cost_1575_tests.rs:fn:second_difference_penalty",
+      "crates/gam-solve/src/estimate/inner_residual_charge_2954_tests.rs:fn:second_difference_penalty",
+      "crates/gam-solve/src/gaussian_reml.rs:fn:second_difference_penalty",
+      "crates/gam-solve/tests/block_quadrature_units_784.rs:fn:second_difference_penalty",
+      "tests/autodiff/misc/contract_gradient_gates.rs:fn:second_difference_penalty",
+      "tests/autodiff/misc/derivative_consistency_fd.rs:fn:second_difference_penalty",
+      "tests/autodiff/misc/objective_gradient_consistency_universal.rs:fn:second_difference_penalty",
+      "tests/regressions/misc/bug_hunt_2623_sampled_marginal_outer_gradient_frame.rs:fn:second_difference_penalty",
+      "tests/regressions/misc/large_scale_dense_regression_guard.rs:fn:second_difference_penalty",
+      "tests/regressions/optimization/large_scale_convergence_regression.rs:fn:second_difference_penalty",
+      "tests/regressions/optimization/reml_laml_rho_derivatives_fd_bug_hunt.rs:fn:second_difference_penalty",
+      "tests/regressions/optimization/reml_unified_2_3.rs:fn:second_difference_penalty"
+    ],
+    "reason": "#4245: test-local second_difference_penalty(k) copies were the same D2'D2 matrix as the shared test fixture gam_linalg_test_support::coefficient_difference_penalty(k, 2) (re-exported as gam::test_support::coefficient_difference_penalty); every caller now uses the shared fixture.",
+    "evidence": "https://github.com/SauersML/gam/issues/4245"
   }
 ]

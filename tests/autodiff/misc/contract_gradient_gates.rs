@@ -516,16 +516,6 @@ fn sae_k2_periodic_overlap_row() -> Vec<GradientChannel> {
     ]
 }
 
-fn second_difference_penalty(k: usize) -> Array2<f64> {
-    let mut d = Array2::<f64>::zeros((k - 2, k));
-    for i in 0..(k - 2) {
-        d[[i, i]] = 1.0;
-        d[[i, i + 1]] = -2.0;
-        d[[i, i + 2]] = 1.0;
-    }
-    d.t().dot(&d)
-}
-
 fn glm_reml_outer_row() -> Vec<GradientChannel> {
     let n = 96usize;
     let k = 6usize;
@@ -546,8 +536,8 @@ fn glm_reml_outer_row() -> Vec<GradientChannel> {
     let weights = Array1::<f64>::ones(n);
     let offset = Array1::<f64>::zeros(n);
     let penalties = vec![
-        BlockwisePenalty::new(1..(1 + k), second_difference_penalty(k)),
-        BlockwisePenalty::new((1 + k)..p, second_difference_penalty(k)),
+        BlockwisePenalty::new(1..(1 + k), gam::test_support::coefficient_difference_penalty(k, 2)),
+        BlockwisePenalty::new((1 + k)..p, gam::test_support::coefficient_difference_penalty(k, 2)),
     ];
     let opts = ExternalOptimOptions {
         latent_cloglog: None,
@@ -660,8 +650,8 @@ fn glm_reml_binomial_noncanonical_outer_row() -> Vec<GradientChannel> {
     let weights = Array1::<f64>::ones(n);
     let offset = Array1::<f64>::zeros(n);
     let penalties = vec![
-        BlockwisePenalty::new(1..(1 + k), second_difference_penalty(k)),
-        BlockwisePenalty::new((1 + k)..p, second_difference_penalty(k)),
+        BlockwisePenalty::new(1..(1 + k), gam::test_support::coefficient_difference_penalty(k, 2)),
+        BlockwisePenalty::new((1 + k)..p, gam::test_support::coefficient_difference_penalty(k, 2)),
     ];
     let opts = ExternalOptimOptions {
         latent_cloglog: None,

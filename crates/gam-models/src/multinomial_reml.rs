@@ -7352,23 +7352,6 @@ mod tests {
         );
     }
 
-    /// A second-difference penalty on `p` coefficients: `D₂ᵀD₂` where `D₂` is the
-    /// `(p−2)×p` second-difference operator. Rank `p−2` (nullspace = constants +
-    /// linears), a realistic smooth-term penalty with a genuine nullspace.
-    fn second_difference_penalty(p: usize) -> Array2<f64> {
-        let mut s = Array2::<f64>::zeros((p, p));
-        for r in 0..p.saturating_sub(2) {
-            // row of D₂: [.. 1, -2, 1 ..]
-            let d = [1.0_f64, -2.0, 1.0];
-            for (a, &da) in d.iter().enumerate() {
-                for (b, &db) in d.iter().enumerate() {
-                    s[[r + a, r + b]] += da * db;
-                }
-            }
-        }
-        s
-    }
-
     /// gam#1587: the reference-symmetric centered penalty `M ⊗ S` is a symmetric
     /// function of all `K` classes, so its quadratic form is identical under
     /// every choice of reference class — while the legacy reference-anchored
@@ -7378,7 +7361,7 @@ mod tests {
     #[test]
     fn centered_penalty_is_reference_class_invariant_1587() {
         let p = 5usize;
-        let s = second_difference_penalty(p);
+        let s = gam_linalg_test_support::coefficient_difference_penalty(p, 2);
         // A fixed set of full per-class smooth coefficients γ_0,γ_1,γ_2 (K=3).
         // The softmax depends only on η differences, so the penalized fit must
         // not care which class is pinned to η ≡ 0.
@@ -7462,7 +7445,8 @@ mod tests {
     fn centered_joint_penalty_spec_is_psd_with_declared_nullspace_1587() {
         use gam_linalg::faer_ndarray::FaerEigh;
         let p = 5usize;
-        let s = second_difference_penalty(p); // rank p-2 ⇒ ns(S) = 2
+        // rank p-2 ⇒ ns(S) = 2
+        let s = gam_linalg_test_support::coefficient_difference_penalty(p, 2);
         let k = 4usize; // K=4 ⇒ m=3
         let m = k - 1;
         let metric = centered_class_metric(m, k);

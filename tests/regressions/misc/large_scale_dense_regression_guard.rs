@@ -94,8 +94,8 @@ fn build_problem(
     let weights = Array1::ones(n);
 
     // Squared-second-difference penalty on each smooth block.
-    let s1 = second_difference_penalty(k1);
-    let s2 = second_difference_penalty(k2);
+    let s1 = gam::test_support::coefficient_difference_penalty(k1, 2);
+    let s2 = gam::test_support::coefficient_difference_penalty(k2, 2);
     let s_list = vec![
         BlockwisePenalty::new(1..(1 + k1), s1),
         BlockwisePenalty::new((1 + k1)..p, s2),
@@ -104,18 +104,6 @@ fn build_problem(
     let true_p = Array1::from_iter(true_eta.iter().map(|e| 1.0 / (1.0 + (-e).exp())));
 
     (x, y, weights, s_list, true_p)
-}
-
-fn second_difference_penalty(k: usize) -> Array2<f64> {
-    // D_2 is (k-2) x k with rows [..., 1, -2, 1, ...].
-    // S = D_2' D_2 is k x k pentadiagonal.
-    let mut d = Array2::<f64>::zeros((k - 2, k));
-    for i in 0..(k - 2) {
-        d[[i, i]] = 1.0;
-        d[[i, i + 1]] = -2.0;
-        d[[i, i + 2]] = 1.0;
-    }
-    d.t().dot(&d)
 }
 
 #[test]
