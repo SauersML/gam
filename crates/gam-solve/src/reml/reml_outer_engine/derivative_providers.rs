@@ -510,10 +510,7 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
             gam_linalg::faer_ndarray::fast_av(&self.firth_op.x_dense, v_l).mapv(|v| -v);
         let dir_l = self.firth_op.direction_from_deta(deta_l);
         let p = v_k.len();
-        let eye = Array2::<f64>::eye(p);
-        let firth_second = self
-            .firth_op
-            .hphisecond_direction_apply(&dir_k, &dir_l, &eye);
+        let firth_second = self.firth_op.hphisecond_direction(&dir_k, &dir_l);
 
         let mut result = match base_corr {
             Some(bc) => bc,
