@@ -5091,6 +5091,11 @@ impl SaeManifoldTerm {
         // #2933 F24 — rows holding an embedded-sphere block factor the Riemannian
         // conversion of their ambient row, which moves with θ too (`SphereRowConversion`).
         let sphere_blocks = self.sphere_tangent_blocks_by_row(&cache.row_dims)?;
+        // #4077 — the interval slots the assembly pinned at an active bound, projected out
+        // of this route's slot derivatives exactly as the dense θ-adjoint projects them:
+        // `A` carries a pinned slot as the metric's constant unit direction, so the
+        // ambient derivative formed there is not `∂A`.
+        let pinned_blocks = self.pinned_bound_slots_by_row(&cache.row_dims)?;
         let sphere_axis_periods = self.all_ard_axis_periods();
 
         for row in 0..n {
@@ -5312,7 +5317,12 @@ impl SaeManifoldTerm {
                     exact_a,
                 )
             };
-            let collect_matrices = defl_live || sphere_conversion.is_some();
+            let pinned_locals = pinned_blocks[row].as_slice();
+            // A pinned row takes the matrix path: its slot derivative is projected before
+            // it is contracted, so the incremental scalar sum cannot be used there (#4077).
+            let collect_matrices =
+                defl_live || sphere_conversion.is_some() || !pinned_locals.is_empty();
+            let collect_border = sphere_conversion.is_some() || !pinned_locals.is_empty();
             let contract_converted = |d_tt: &Array2<f64>, d_tbeta: &Array2<f64>| -> f64 {
                 let mut converted = 0.0_f64;
                 for a in 0..q {
@@ -5364,7 +5374,7 @@ impl SaeManifoldTerm {
                 } else {
                     Array2::<f64>::zeros((q, q))
                 };
-                let mut dh_border = if sphere_conversion.is_some() {
+                let mut dh_border = if collect_border {
                     Array2::<f64>::zeros((q, border.len()))
                 } else {
                     Array2::<f64>::zeros((0, 0))
@@ -5536,7 +5546,7 @@ impl SaeManifoldTerm {
                                 channel,
                             );
                         }
-                        if sphere_conversion.is_some() {
+                        if collect_border {
                             dh_border[[a, beta_pos]] = dh;
                         }
                         gamma += 2.0 * inv_vbeta[[a, channel.index]] * dh;
@@ -5573,10 +5583,39 @@ impl SaeManifoldTerm {
                     }
                 }
                 match sphere_conversion.as_ref() {
-                    None => gamma_t[base + w] = gamma,
+                    None if pinned_locals.is_empty() => gamma_t[base + w] = gamma,
+                    None => {
+                        // #4077 — the pinned slots carry no `∂A`; drop the incremental sum
+                        // and contract the projected row derivative instead, the clamp and
+                        // basin legs included since they read the same block.
+                        project_pinned_row_slot_derivative(
+                            pinned_locals,
+                            &mut deflated_base_dh_mat,
+                            &mut dh_border,
+                        );
+                        let mut converted =
+                            contract_converted(&deflated_base_dh_mat, &dh_border) + beta_beta;
+                        if let (Some((explicit, response)), Some((_, clamp_dt))) =
+                            (clamp_price.as_ref(), clamp_price_inputs.as_ref())
+                        {
+                            converted += explicit[w] * clamp_dt[base + w]
+                                + (response * &deflated_base_dh_mat).sum();
+                        }
+                        if let (Some((row_weights, _)), Some((_, clamp_dt))) =
+                            (beta_basin.as_ref(), clamp_price_inputs.as_ref())
+                        {
+                            converted += row_weights[row].1[w] * clamp_dt[base + w];
+                        }
+                        gamma_t[base + w] = converted;
+                    }
                     Some(conversion) => {
-                        let (d_tt, d_tbeta) =
+                        let (mut d_tt, mut d_tbeta) =
                             conversion.slot_derivative(w, &deflated_base_dh_mat, &dh_border);
+                        project_pinned_row_slot_derivative(
+                            pinned_locals,
+                            &mut d_tt,
+                            &mut d_tbeta,
+                        );
                         let mut converted = contract_converted(&d_tt, &d_tbeta) + beta_beta;
                         if let (Some((explicit, response)), Some((_, clamp_dt))) =
                             (clamp_price.as_ref(), clamp_price_inputs.as_ref())
@@ -5606,7 +5645,7 @@ impl SaeManifoldTerm {
                 } else {
                     Array2::<f64>::zeros((q, q))
                 };
-                let mut dh_border = if sphere_conversion.is_some() {
+                let mut dh_border = if collect_border {
                     Array2::<f64>::zeros((q, border.len()))
                 } else {
                     Array2::<f64>::zeros((0, 0))
@@ -5650,17 +5689,34 @@ impl SaeManifoldTerm {
                         if exact_a {
                             dh += sae_dot(jets.beta(w_beta_pos), jets.beta_deriv(a, beta_pos));
                         }
-                        if sphere_conversion.is_some() {
+                        if collect_border {
                             dh_border[[a, beta_pos]] = dh;
                         }
                         gamma += 2.0 * inv_vbeta[[a, channel.index]] * dh;
                     }
                 }
                 match sphere_conversion.as_ref() {
-                    None => gamma_beta[w_channel.index] += gamma,
+                    None if pinned_locals.is_empty() => gamma_beta[w_channel.index] += gamma,
+                    None => {
+                        project_pinned_row_slot_derivative(
+                            pinned_locals,
+                            &mut dh_mat,
+                            &mut dh_border,
+                        );
+                        let mut converted = contract_converted(&dh_mat, &dh_border);
+                        if let Some((_, response)) = clamp_price.as_ref() {
+                            converted += (response * &dh_mat).sum();
+                        }
+                        gamma_beta[w_channel.index] += converted;
+                    }
                     Some(conversion) => {
-                        let (d_tt, d_tbeta) =
+                        let (mut d_tt, mut d_tbeta) =
                             conversion.border_derivative(w_beta_pos, &dh_mat, &dh_border);
+                        project_pinned_row_slot_derivative(
+                            pinned_locals,
+                            &mut d_tt,
+                            &mut d_tbeta,
+                        );
                         let mut converted = contract_converted(&d_tt, &d_tbeta);
                         if let Some((_, response)) = clamp_price.as_ref() {
                             converted += (response * &d_tt).sum();

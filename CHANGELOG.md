@@ -149,6 +149,25 @@
   **Behavior change:** `gam predict --alo` on a survival marginal-slope model whose latent
   measure is local-empirical now produces diagnostics; it previously failed with "its
   per-row training mixtures are not persisted".
+- **A latent pinned at an interval's active bound no longer moves the SAE evidence
+  gradient** (gam#4077, gam#3438).
+  `B`'s Riemannian conversion zeroes an active-bound slot's gradient, row and column;
+  gam#3438 projected `ΔC` there too; and the evidence factor's row deflation carries what
+  is left at the metric's unit stiffness. So `A`'s row and column at such a slot are the
+  constant unit direction `e_u`, which `½log|A|` prices at `log 1 = 0`. Its DERIVATIVE was
+  still read off the raw slots: the per-outer-coordinate maps of `∂A/∂ρ` kept the ARD
+  prior's `w_row·α` on the pinned diagonal, and the two θ-adjoint routes
+  (`logdet_theta_adjoint_dense`, `logdet_theta_adjoint_from_probes`) contracted the ambient
+  `∂B/∂θ` and `∂ΔC/∂θ` there, because both read the sphere blocks only where the `ΔC`
+  assembly reads `coordinate_tangent_blocks`. With `A⁺` reading `1/1` on that slot, the
+  analytic gradient carried a leg the value it differentiates does not have. One rule now
+  owns it: a slot the assembly pinned is projected out of the row's `(tt, tβ)` slot
+  derivative before any contraction, and out of the `ρ` maps in the one owner every
+  consumer reads. A pinned row therefore takes the matrix path in both towers rather than
+  the incremental scalar sum. `the_rho_maps_of_the_exact_information_drop_the_pinned_bound_slots_4077`
+  pins the exact zero against the unprojected assembly as its positive control. The
+  half-line Laplace mass of the pinned coordinate itself is still missing from the value
+  and is tracked on gam#4077.
 
 - **The scheduled p-value calibration run can fail** (gam#3722).
   `.github/workflows/pvalue-calibration.yml` gave the calibration harness a runner, but

@@ -1556,6 +1556,61 @@ impl SaeManifoldTerm {
         }
         Ok(by_row)
     }
+
+    /// The [`CoordinateTangentBlock::PinnedBound`] slots of
+    /// [`Self::coordinate_tangent_blocks`] grouped by row: entry `row` lists each pinned
+    /// `local`, empty on a row that holds none.
+    ///
+    /// #4077 — at an active bound `B`'s Riemannian conversion zeroes the slot's gradient,
+    /// row and column; `ΔC` is projected there too (#3438); and the evidence factor's row
+    /// deflation carries what is left at the metric's unit stiffness. So `A`'s row and
+    /// column at a pinned slot are the CONSTANT unit direction `e_u` — the state
+    /// `interval_active_bound_slot_leaves_the_exact_information_3438` pins to `ε·max|A|`
+    /// on both the diagonal and the coupling. A constant row has no derivative, so the
+    /// AMBIENT slot derivative the row towers form on those positions is not `∂A` and may
+    /// not reach any trace of `log|A|`: the θ-adjoints project it through
+    /// [`project_pinned_row_slot_derivative`], and the direct `ρ` maps of
+    /// [`Self::exact_stationarity_penalty_derivatives_by_flat`] are projected in place.
+    pub(crate) fn pinned_bound_slots_by_row(
+        &self,
+        row_dims: &[usize],
+    ) -> Result<Vec<Vec<usize>>, String> {
+        let mut by_row = vec![Vec::new(); row_dims.len()];
+        if self.last_pinned_bound_slots.is_empty() {
+            return Ok(by_row);
+        }
+        for block in self.coordinate_tangent_blocks(row_dims)? {
+            if let CoordinateTangentBlock::PinnedBound { row, local } = block {
+                by_row[row].push(local);
+            }
+        }
+        Ok(by_row)
+    }
+}
+
+/// Zero one row's `(tt, tβ)` slot derivative on every slot the assembly pinned at an
+/// active bound, the projector [`SaeManifoldTerm::assemble_exact_hessian_minus_b_rows`]
+/// applies to `ΔC` itself.
+///
+/// `A`'s pinned row and column are the metric's constant unit direction
+/// ([`SaeManifoldTerm::pinned_bound_slots_by_row`]), so their ambient derivative belongs
+/// to no trace of `log|A|`. Without this the θ-adjoint reports a leg where the value
+/// prices `log 1 = 0`, and the analytic gradient and the value it differentiates
+/// disagree by exactly that leg (#4077).
+fn project_pinned_row_slot_derivative(
+    pinned: &[usize],
+    d_tt: &mut Array2<f64>,
+    d_tbeta: &mut Array2<f64>,
+) {
+    for &local in pinned {
+        if local < d_tt.nrows() {
+            d_tt.row_mut(local).fill(0.0);
+            d_tt.column_mut(local).fill(0.0);
+        }
+        if local < d_tbeta.nrows() {
+            d_tbeta.row_mut(local).fill(0.0);
+        }
+    }
 }
 
 /// #2933 F24 — the Riemannian conversion's share of one sphere row's log-determinant
@@ -3151,6 +3206,27 @@ impl SaeManifoldTerm {
                 }
             }
         }
+        // #4077 — the maps above are assembled on the RAW slots, where an ARD or gate
+        // prior still writes a diagonal at a coordinate the assembly pinned at an active
+        // bound. `A`'s row and column there are the metric's constant unit direction
+        // ([`Self::pinned_bound_slots_by_row`]), so they move with no outer coordinate,
+        // and the direct `ρ` traces `½⟨A⁺, ∂A/∂ρ⟩` must read a zero there or they price a
+        // slot the value prices at `log 1 = 0`. The same projector `ΔC` is assembled
+        // under, applied to the one owner every consumer of these maps reads — including
+        // the #2515 finite difference against
+        // [`Self::materialize_exact_hessian_dense_with_gap_border`], which is projected.
+        let pinned = self.pinned_bound_slots_by_row(&cache.row_dims)?;
+        if pinned.iter().any(|locals| !locals.is_empty()) {
+            for da in derivatives.values_mut() {
+                for (row, locals) in pinned.iter().enumerate() {
+                    for &local in locals {
+                        let index = cache.row_offsets[row] + local;
+                        da.row_mut(index).fill(0.0);
+                        da.column_mut(index).fill(0.0);
+                    }
+                }
+            }
+        }
         Ok(derivatives)
     }
 
@@ -3792,6 +3868,11 @@ impl SaeManifoldTerm {
         // #2933 F24 — rows holding an embedded-sphere block factor the Riemannian
         // conversion of their ambient row, which moves with θ too (`SphereRowConversion`).
         let sphere_blocks = self.sphere_tangent_blocks_by_row(&cache.row_dims)?;
+        // #4077 — the interval slots the assembly pinned at an active bound. `A` carries
+        // each as the metric's constant unit direction, so the ambient derivative this
+        // tower forms there is not `∂A` and is projected out before it is contracted, the
+        // same projector `ΔC` is assembled under.
+        let pinned_blocks = self.pinned_bound_slots_by_row(&cache.row_dims)?;
         let sphere_axis_periods = self.all_ard_axis_periods();
         let mut jet_window: std::collections::VecDeque<SaeRowJets> =
             std::collections::VecDeque::new();
@@ -3898,7 +3979,13 @@ impl SaeManifoldTerm {
                     exact_a,
                 )
             };
-            let collect_matrices = defl_live || sphere_conversion.is_some();
+            let pinned_locals = pinned_blocks[row].as_slice();
+            // A pinned row takes the matrix path: its slot derivative has to be projected
+            // before it is contracted, so the incremental scalar accumulation cannot be
+            // used there (#4077).
+            let collect_matrices =
+                defl_live || sphere_conversion.is_some() || !pinned_locals.is_empty();
+            let collect_border = sphere_conversion.is_some() || !pinned_locals.is_empty();
             let contract_converted = |d_tt: &Array2<f64>, d_tbeta: &Array2<f64>| -> f64 {
                 let mut converted = 0.0_f64;
                 for a in 0..q {
@@ -3949,7 +4036,7 @@ impl SaeManifoldTerm {
                 } else {
                     Array2::<f64>::zeros((q, q))
                 };
-                let mut dh_border = if sphere_conversion.is_some() {
+                let mut dh_border = if collect_border {
                     Array2::<f64>::zeros((q, border.len()))
                 } else {
                     Array2::<f64>::zeros((0, 0))
@@ -4126,7 +4213,7 @@ impl SaeManifoldTerm {
                                 ch,
                             );
                         }
-                        if sphere_conversion.is_some() {
+                        if collect_border {
                             dh_border[[a, beta_pos]] = dh;
                         }
                         gamma += 2.0 * inv.entry(base + a, total_t + ch.index) * dh;
@@ -4142,9 +4229,25 @@ impl SaeManifoldTerm {
                     }
                 }
                 match sphere_conversion.as_ref() {
-                    None => gamma_t[base + w] = gamma,
+                    None if pinned_locals.is_empty() => gamma_t[base + w] = gamma,
+                    None => {
+                        // #4077 — the pinned slots carry no `∂A`; drop the incremental
+                        // sum and contract the projected row derivative instead.
+                        project_pinned_row_slot_derivative(
+                            pinned_locals,
+                            &mut dh_mat,
+                            &mut dh_border,
+                        );
+                        gamma_t[base + w] = contract_converted(&dh_mat, &dh_border) + beta_beta;
+                    }
                     Some(conversion) => {
-                        let (d_tt, d_tbeta) = conversion.slot_derivative(w, &dh_mat, &dh_border);
+                        let (mut d_tt, mut d_tbeta) =
+                            conversion.slot_derivative(w, &dh_mat, &dh_border);
+                        project_pinned_row_slot_derivative(
+                            pinned_locals,
+                            &mut d_tt,
+                            &mut d_tbeta,
+                        );
                         sphere_slot_functional[w] = contract_converted(&d_tt, &d_tbeta) + beta_beta;
                     }
                 }
@@ -4162,7 +4265,7 @@ impl SaeManifoldTerm {
                 } else {
                     Array2::<f64>::zeros((q, q))
                 };
-                let mut dh_border = if sphere_conversion.is_some() {
+                let mut dh_border = if collect_border {
                     Array2::<f64>::zeros((q, border.len()))
                 } else {
                     Array2::<f64>::zeros((0, 0))
@@ -4199,17 +4302,30 @@ impl SaeManifoldTerm {
                         if exact_a {
                             dh += sae_dot(jets.beta(w_beta_pos), jets.beta_deriv(a, beta_pos));
                         }
-                        if sphere_conversion.is_some() {
+                        if collect_border {
                             dh_border[[a, beta_pos]] = dh;
                         }
                         gamma += 2.0 * inv.entry(base + a, total_t + ch.index) * dh;
                     }
                 }
                 match sphere_conversion.as_ref() {
-                    None => gamma_beta[w_channel.index] += gamma,
+                    None if pinned_locals.is_empty() => gamma_beta[w_channel.index] += gamma,
+                    None => {
+                        project_pinned_row_slot_derivative(
+                            pinned_locals,
+                            &mut dh_mat,
+                            &mut dh_border,
+                        );
+                        gamma_beta[w_channel.index] += contract_converted(&dh_mat, &dh_border);
+                    }
                     Some(conversion) => {
-                        let (d_tt, d_tbeta) =
+                        let (mut d_tt, mut d_tbeta) =
                             conversion.border_derivative(w_beta_pos, &dh_mat, &dh_border);
+                        project_pinned_row_slot_derivative(
+                            pinned_locals,
+                            &mut d_tt,
+                            &mut d_tbeta,
+                        );
                         gamma_beta[w_channel.index] += contract_converted(&d_tt, &d_tbeta);
                     }
                 }

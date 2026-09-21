@@ -8,6 +8,14 @@
 //! `A = B + ΔC` with the same slot projected out. Otherwise `A` carries the slot's
 //! raw curvature on its diagonal and a `ΔC_uβ` coupling, the IFT moves a coordinate
 //! the retraction holds fixed, and `½log|A|` prices a direction the mode cannot take.
+//!
+//! #4077 — the same slot must leave the DERIVATIVE of `log|A|`. With `A`'s pinned row
+//! and column the metric's constant unit direction (asserted below to `ε·max|A|`), that
+//! row moves with no outer coordinate at all, so every map of `∂A/∂ρ` and every θ-adjoint
+//! contraction has to read a zero there. Before this the per-coordinate ρ maps still
+//! carried the raw ARD diagonal at the pinned slot, and with `A⁺` reading `1` on that
+//! same slot the direct ρ trace `½⟨A⁺, ∂A/∂ρ⟩` priced a leg the value prices at
+//! `log 1 = 0`.
 
 use super::construction::ExactHessianDeltaRow;
 use super::*;
@@ -288,4 +296,96 @@ fn interval_active_bound_slot_leaves_the_exact_information_3438() {
             "the IFT moves a coordinate the bound holds fixed: {value:.6e} (bound {leakage:.3e})"
         );
     }
+}
+
+/// #4077 — the per-outer-coordinate maps of `∂A/∂ρ` read an exact zero on every slot
+/// the assembly pinned at an active bound, and the unprojected assembly does not.
+///
+/// The existing test above pins the value side: `A`'s pinned row and column are the
+/// metric's unit direction to `ε·max|A|`, so `A[u,·] ≡ e_uᵀ` at every `(ρ, θ)`. A
+/// constant row has no derivative. The maps are assembled on the RAW slots, though,
+/// where the ARD prior still writes `w_row·α` on the pinned coordinate's diagonal, and
+/// the pencil's `A⁺` reads `1/1 = 1` there because the slot is retained at the metric's
+/// unit stiffness. So the direct trace `½⟨A⁺, ∂A/∂ρ⟩` used to charge `½·w_row·α` per
+/// pinned slot to a direction `½log|A|` prices at `log 1 = 0`.
+///
+/// The unprojected clone is the positive control: the same map, with only the pinned
+/// list cleared, must still carry that diagonal, or this test would pass on a fixture
+/// whose prior happens to be silent at the bound.
+#[test]
+fn the_rho_maps_of_the_exact_information_drop_the_pinned_bound_slots_4077() {
+    let (mut term, target, rho) = interval_fixture();
+    term.penalized_quasi_laplace_criterion_with_cache(
+        target.view(),
+        &rho,
+        None,
+        60,
+        0.4,
+        1.0e-8,
+        1.0e-8,
+    )
+    .expect("the criterion prices the interval fixture");
+
+    let system = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .expect("the inner system assembles at the fitted state");
+    let pinned = term.last_pinned_bound_slots.clone();
+    println!("[#4077] pinned (row, slot) = {pinned:?}");
+    assert!(
+        !pinned.is_empty(),
+        "no interval coordinate sits at an active bound"
+    );
+
+    let options = term.evidence_factor_options();
+    let (_, _, cache) = solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &options)
+        .expect("the evidence factor holds at the fitted state");
+
+    let mut unprojected = term.clone();
+    unprojected.last_pinned_bound_slots.clear();
+    let raw_maps = unprojected
+        .exact_stationarity_penalty_derivatives_by_flat(&rho, &cache)
+        .expect("unprojected ∂A/∂ρ maps");
+    let maps = term
+        .exact_stationarity_penalty_derivatives_by_flat(&rho, &cache)
+        .expect("∂A/∂ρ maps");
+
+    let indices: Vec<usize> = pinned
+        .iter()
+        .map(|&(row, local)| cache.row_offsets[row] + local)
+        .collect();
+
+    let mut raw_pinned_magnitude = 0.0_f64;
+    let mut projected_pinned_magnitude = 0.0_f64;
+    for (flat, da) in &maps {
+        let raw = raw_maps
+            .get(flat)
+            .expect("the projection removes no outer coordinate from the map");
+        for &index in &indices {
+            for other in 0..da.nrows() {
+                raw_pinned_magnitude = raw_pinned_magnitude
+                    .max(raw[[index, other]].abs())
+                    .max(raw[[other, index]].abs());
+                projected_pinned_magnitude = projected_pinned_magnitude
+                    .max(da[[index, other]].abs())
+                    .max(da[[other, index]].abs());
+            }
+        }
+    }
+    println!(
+        "[#4077] max |∂A/∂ρ| on the pinned rows and columns over {} outer coordinates: \
+         unprojected {raw_pinned_magnitude:.6e}, projected {projected_pinned_magnitude:.6e}",
+        maps.len()
+    );
+    // Premise: the prior's curvature at the pinned coordinate is live, so this fixture
+    // measures the projection and not an accidentally silent map.
+    assert!(
+        raw_pinned_magnitude > 0.0,
+        "the unprojected ∂A/∂ρ maps carry nothing on the pinned slots, so the projection \
+         is unmeasured here"
+    );
+    // The projection writes an exact zero; nothing is added after it.
+    assert_eq!(
+        projected_pinned_magnitude, 0.0,
+        "a ∂A/∂ρ map keeps a leg on a slot A carries at the metric's constant unit stiffness"
+    );
 }
