@@ -1,10 +1,6 @@
 use super::*;
+use crate::estimate::evaluation::materialize_link_outer_hessian;
 use crate::estimate::edf_accounting::penalized_edf_bundle_within_bands;
-use crate::estimate::evaluation::{
-    materialize_link_outer_hessian, sas_effective_epsilon, sas_effective_epsilon_second,
-    sas_log_delta_edge_barriercostgrad, sas_log_delta_edge_barriercostgradhess,
-    sas_log_deltaridgeweight,
-};
 use crate::estimate::penalty::scaled_covariance;
 use crate::estimate::prefit::{
     arm_jeffreys_on_prefit_binomial_separation, reject_prefit_unidentifiable_unpenalized_space,
@@ -505,8 +501,8 @@ fn negbin_theta_joint_bound(
 /// optimize. So the shipped point is reassembled in the optimizer's OWN
 /// coordinate system and compared whole. It has to be the raw `theta`
 /// coordinates rather than the shipped link state, because the state stores
-/// values that have been through the smooth-bound maps
-/// (`sas_effective_epsilon`) while the certificate holds the pre-image.
+/// values that have been through the smooth-bound maps (SAS log δ's
+/// `smooth_bound_jet`) while the certificate holds the pre-image.
 ///
 /// The comparison stays BITWISE for the reason the rho-only one did: point
 /// identity is decided exactly by bit equality, and re-judging a gradient here
@@ -1576,16 +1572,7 @@ where
         .map(|s| s.initial_rho.len())
         .unwrap_or(0);
     let sas_dim = if sas_optspec.is_some() { 2 } else { 0 };
-    let student_t_dim = if student_t_reference_scale.is_some() {
-        2
-    } else {
-        0
-    };
-    let sasridgeweight = if sas_dim > 0 {
-        sas_log_deltaridgeweight()
-    } else {
-        0.0
-    };
+    let student_t_dim = if student_t_reference_scale.is_some() { 2 } else { 0 };
     // Estimated Negative-Binomial theta and smoothing rho are solved by block
     // coordinate optimization, but acceptance is JOINT: both analytic partials
     // are measured at the identical fixed-theta PIRLS solution. The outer
@@ -1596,8 +1583,8 @@ where
     // #2727: the link-shape coordinates of the shipped point, in the OUTER
     // optimizer's own coordinate system (raw `theta`, before the link state's
     // smooth-bound maps). Empty on every rho-only arm. Carried separately
-    // because the shipped link STATE stores transformed values
-    // (`sas_effective_epsilon`), so it cannot be compared against the
+    // because the shipped link STATE stores transformed values (SAS log δ's
+    // `smooth_bound_jet`), so it cannot be compared against the
     // certificate's raw coordinates.
     let mut final_link_coords: Array1<f64>;
     let mut final_mixture_state;
@@ -1940,11 +1927,10 @@ where
             // box. ρ is searched in the #2812 resolvability domain. A link
             // coordinate has no penalty spectrum, so it takes the range its own
             // chart resolves: a mixture free logit is a log-scale coordinate
-            // (`precision_box`), SAS raw ε is a tanh chart (`sas_epsilon_domain`),
-            // SAS raw log δ passes through `smooth_bound_jet`, which stops moving at
-            // the edge of its support (`smooth_bound_support`), and the standardized
-            // beta-logistic `[ε, log δ]` are log-shape coordinates like the mixture
-            // logit (#2902 row 34).
+            // (`precision_box`); SAS ε and the standardized beta-logistic `[ε, log δ]`
+            // are shape coordinates like the mixture logit (#2902 row 34, #4482),
+            // and SAS raw log δ passes through `smooth_bound_jet`, which stops moving
+            // at the edge of its support (`smooth_bound_support`).
             let (mut link_lower, mut link_upper): (Vec<f64>, Vec<f64>) = if use_mixture {
                 let (lower, upper) = crate::estimate::rho_domain::precision_box();
                 (vec![lower; mixture_dim], vec![upper; mixture_dim])
@@ -1955,11 +1941,9 @@ where
                 let (lower, upper) = crate::estimate::rho_domain::precision_box();
                 (vec![lower; sas_dim], vec![upper; sas_dim])
             } else if use_sas {
-                let (epsilon_lower, epsilon_upper) =
-                    crate::estimate::evaluation::sas_epsilon_domain();
-                let (log_delta_lower, log_delta_upper) = crate::mixture_link::smooth_bound_support(
-                    crate::mixture_link::SAS_LOG_DELTA_BOUND,
-                );
+                let (epsilon_lower, epsilon_upper) = crate::estimate::rho_domain::precision_box();
+                let (log_delta_lower, log_delta_upper) =
+                    crate::mixture_link::smooth_bound_support(crate::mixture_link::SAS_LOG_DELTA_BOUND);
                 (
                     vec![epsilon_lower, log_delta_lower],
                     vec![epsilon_upper, log_delta_upper],
@@ -2035,12 +2019,7 @@ where
                     );
                 }
                 if use_sas {
-                    let epsilon = if use_beta_logistic {
-                        theta[k]
-                    } else {
-                        let (v, _) = sas_effective_epsilon(theta[k]);
-                        v
-                    };
+                    let epsilon = theta[k];
                     let delta_like = theta[k + 1];
                     cfg_eval.link_kind = if use_beta_logistic {
                         InverseLink::BetaLogistic(
@@ -2081,23 +2060,11 @@ where
                 Ok(rho)
             };
 
-            // SAS ridge/barrier cost correction (shared between cost_fn, eval_fn, efs_fn).
-            // SAS only.
-            //
-            // #2902 row 34: #2685 had given the beta-logistic block this weak ridge on
-            // both coordinates, because its shapes and `β` shared the scale of `η` and
-            // nothing opposed the drift of `log δ` toward −∞. The link now standardizes
-            // `logit(U)` to logit's location and scale, which removes that gauge, so
-            // `[ε, log δ]` carry no counter-term.
-            let sas_ridge_cost = |theta: &Array1<f64>| -> f64 {
-                if use_sas && !use_beta_logistic && sasridgeweight > 0.0 {
-                    let log_delta = theta[k + 1];
-                    let (barriercost, _) = sas_log_delta_edge_barriercostgrad(log_delta);
-                    0.5 * sasridgeweight * log_delta * log_delta + barriercost
-                } else {
-                    0.0
-                }
-            };
+            // The link-shape block carries no counter-term: the criterion is the
+            // LAML itself, so the reported shape is its optimum, not a MAP under a
+            // hand-set prior. #2902 row 34 dropped the beta-logistic ridge once its
+            // gauge was removed; SAS `sinh(δ·asinh η − ε)` has no gauge (its tails
+            // go as `η^δ`), so its log-δ ridge and edge barrier went too (#4482).
 
             let obj = problem.build_objective(
             &mut reml_state,
@@ -2113,8 +2080,7 @@ where
                 let value_mode =
                     crate::estimate::reml::reml_outer_engine::EvalMode::ValueOnly;
                 let result = state.evaluate_unified_with_link_ext(&rho, value_mode)?;
-                let cost = result.cost + sas_ridge_cost(theta);
-                Ok(cost)
+                Ok(result.cost)
             },
             |state: &mut &mut crate::estimate::reml::RemlState<'_>,
              theta: &Array1<f64>| {
@@ -2129,8 +2095,8 @@ where
                     crate::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian;
                 let mut result = state.evaluate_unified_with_link_ext(&rho, eval_mode)?;
 
-                let cost = result.cost + sas_ridge_cost(theta);
-                let mut grad = result
+                let cost = result.cost;
+                let grad = result
                     .gradient_for_mode(eval_mode, theta_dim)
                     .map_err(|reason| EstimationError::TrialPointRefused { reason })?;
 
@@ -2142,30 +2108,7 @@ where
                     theta_dim
                 );
 
-                let grad_effective = grad.clone();
-                let mut hessian = materialize_link_outer_hessian(result.hessian, theta_dim)?;
-
-                // SAS epsilon reparameterization chain rule.
-                if use_sas && !use_beta_logistic {
-                    let (_, d_eps_d_raw, d2_eps_d_raw2) = sas_effective_epsilon_second(theta[k]);
-                    for j in 0..theta_dim {
-                        hessian[[k, j]] *= d_eps_d_raw;
-                        hessian[[j, k]] *= d_eps_d_raw;
-                    }
-                    hessian[[k, k]] += grad_effective[k] * d2_eps_d_raw2;
-                    grad[k] *= d_eps_d_raw;
-                }
-                // Link-block ridge (+ the SAS-only edge barrier) gradient and
-                // Hessian, matching `sas_ridge_cost` term for term (#2685).
-                if use_sas && !use_beta_logistic && sasridgeweight > 0.0 {
-                    let log_delta = theta[k + 1];
-                    grad[k + 1] += sasridgeweight * log_delta;
-                    hessian[[k + 1, k + 1]] += sasridgeweight;
-                    let (_, barriergrad, barrierhess) =
-                        sas_log_delta_edge_barriercostgradhess(log_delta);
-                    grad[k + 1] += barriergrad;
-                    hessian[[k + 1, k + 1]] += barrierhess;
-                }
+                let hessian = materialize_link_outer_hessian(result.hessian, theta_dim)?;
 
                 let cost_sec = tcost.elapsed().as_secs_f64();
                 let aux_dim = mixture_dim + sas_dim + student_t_dim;
@@ -2194,30 +2137,7 @@ where
                 |state: &mut &mut crate::estimate::reml::RemlState<'_>,
                  theta: &Array1<f64>| {
                     let rho = apply_link_theta(state, theta)?;
-                    let mut efs_eval = state.compute_efs_steps_with_link_ext(&rho)?;
-
-                    // SAS reparameterization chain rule on ψ steps.
-                    if use_sas && !use_beta_logistic {
-                        let (_, d_eps_d_raw) = sas_effective_epsilon(theta[k]);
-                        if efs_eval.steps.len() > k {
-                            efs_eval.steps[k] *= d_eps_d_raw;
-                        }
-                        if let Some(ref mut pg) = efs_eval.psi_gradient
-                            && !pg.is_empty() {
-                                pg[0] *= d_eps_d_raw;
-                            }
-                    }
-
-                    // SAS log-δ ridge + edge barrier: their gradients enter
-                    // `result.gradient` from the unified evaluator (estimate.rs
-                    // 2170+), and `compute_efs_steps_with_link_ext` runs the
-                    // universal-form EFS step `Δρ = log(1 − 2·g_full/q_eff)`
-                    // which absorbs them automatically. We only need to
-                    // mirror that contribution into the *cost* slot here so
-                    // the outer fixed-point bridge's line search compares
-                    // augmented-cost trial points consistently.
-                    efs_eval.cost += sas_ridge_cost(theta);
-                    Ok(efs_eval)
+                    state.compute_efs_steps_with_link_ext(&rho)
                 },
             ),
         );
@@ -2266,12 +2186,7 @@ where
                 None
             };
             let final_sas_state = if use_sas {
-                let epsilon_eff = if use_beta_logistic {
-                    outer_result.rho[k]
-                } else {
-                    let (v, _) = sas_effective_epsilon(outer_result.rho[k]);
-                    v
-                };
+                let epsilon_eff = outer_result.rho[k];
                 Some(if use_beta_logistic {
                     state_from_beta_logisticspec(SasLinkSpec {
                         initial_epsilon: epsilon_eff,

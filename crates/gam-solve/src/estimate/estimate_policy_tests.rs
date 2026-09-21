@@ -5,10 +5,6 @@
 //! itself, so the compiler enforces it rather than a naming convention.
 #![cfg(test)]
 
-use super::evaluation::{
-    sas_effective_epsilon, sas_effective_epsilon_second, sas_log_delta_edge_barriercostgrad,
-    sas_log_delta_edge_barriercostgradhess,
-};
 use super::external_options::{resolve_external_family, resolved_external_config};
 use super::optimizer::freeze_lambda_search_nuisance_at_canonical_anchor;
 use super::prefit::{
@@ -1145,42 +1141,6 @@ fn prefit_rank_check_accepts_well_conditioned_unpenalized_design() {
     );
 }
 
-#[test]
-fn sas_raw_epsilon_hessian_chain_rule_matches_chained_gradient_slope() {
-    let raw0 = 1.3_f64;
-    let (eps0, d1, d2) = sas_effective_epsilon_second(raw0);
-    let g0 = array![0.4, -0.7, 0.2];
-    let h_eff = array![[2.0, 0.3, -0.1], [0.3, 1.5, 0.25], [-0.1, 0.25, 0.8]];
-
-    let analytic = h_eff[[0, 0]] * d1 * d1 + g0[0] * d2;
-    let chained_grad = |raw: f64| {
-        let (eps, deps_draw) = sas_effective_epsilon(raw);
-        let delta = array![eps - eps0, 0.0, 0.0];
-        let g_eff = &g0 + &h_eff.dot(&delta);
-        g_eff[0] * deps_draw
-    };
-    let h = 1e-6;
-    let fd = (chained_grad(raw0 + h) - chained_grad(raw0 - h)) / (2.0 * h);
-    assert!(
-        (analytic - fd).abs() < 2e-8,
-        "SAS raw epsilon Hessian chain rule mismatch: analytic={analytic:.12e} fd={fd:.12e}"
-    );
-}
-
-#[test]
-fn sas_log_delta_barrier_hessian_matches_gradient_slope() {
-    let raw = 2.25_f64;
-    let (_, _, analytic_hess) = sas_log_delta_edge_barriercostgradhess(raw);
-    let h = 1e-6;
-    let (_, gp) = sas_log_delta_edge_barriercostgrad(raw + h);
-    let (_, gm) = sas_log_delta_edge_barriercostgrad(raw - h);
-    let fd = (gp - gm) / (2.0 * h);
-    assert!(
-        (analytic_hess - fd).abs() < 2e-9,
-        "SAS log-delta barrier Hessian mismatch: analytic={analytic_hess:.12e} fd={fd:.12e}"
-    );
-}
-
 fn decode_invariant_test_parts() -> UnifiedFitResultParts {
     let log_lambdas = array![0.2_f64.ln(), 0.8_f64.ln()];
     let lambdas = log_lambdas
@@ -1729,7 +1689,7 @@ fn dense_penalty_test_inputs(
 }
 
 #[test]
-fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
+fn sas_beta_epsilon_sensitivity_matchesfd_at_seed19() {
     let seed = 19_u64;
     let n = 20usize;
     let x = build_tiny_design(n);
@@ -1785,7 +1745,7 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
     let (penalty_specs, canonical_penalties, active_nullspace_dims) = dense_penalty_test_inputs(
         &s_list,
         x.ncols(),
-        "sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19",
+        "sas_beta_epsilon_sensitivity_matchesfd_at_seed19",
     );
     let conditioning = ParametricColumnConditioning::infer_from_penalty_specs(
         &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x.clone())),
@@ -1808,9 +1768,8 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
     )
     .expect("reml_state");
     let rho = theta.slice(s![..1]).to_owned();
-    let (epsilon_eff, d_eps_d_raw) = sas_effective_epsilon(theta[1]);
     let sas_state = state_from_sasspec(SasLinkSpec {
-        initial_epsilon: epsilon_eff,
+        initial_epsilon: theta[1],
         initial_log_delta: theta[2],
     })
     .expect("sas state");
@@ -1842,10 +1801,9 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
         })
         .collect();
     let du_by_eps = Array1::from_vec(du_vec);
-    let score_at = |raw_eps: f64| -> Array1<f64> {
-        let (eps_eff, _) = sas_effective_epsilon(raw_eps);
+    let score_at = |eps: f64| -> Array1<f64> {
         let sas_state = state_from_sasspec(SasLinkSpec {
-            initial_epsilon: eps_eff,
+            initial_epsilon: eps,
             initial_log_delta: theta[2],
         })
         .expect("score sas state");
@@ -1869,18 +1827,17 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
     };
     let score_p = score_at(theta[1] + 1e-4 * (1.0 + theta[1].abs()));
     let score_m = score_at(theta[1] - 1e-4 * (1.0 + theta[1].abs()));
-    let fd_du_raw = (&score_p - &score_m).mapv(|v| v / (2.0 * 1e-4 * (1.0 + theta[1].abs())));
-    let du_raw = du_by_eps.mapv(|v| v * d_eps_d_raw);
-    // `du/d(raw ε)` at FIXED η compares an analytic single-row jet channel to a
+    let fd_du = (&score_p - &score_m).mapv(|v| v / (2.0 * 1e-4 * (1.0 + theta[1].abs())));
+    // `du/dε` at FIXED η compares an analytic single-row jet channel to a
     // fixed-η central difference — no PIRLS re-solve, so there is no solver
     // noise floor. The two agree to ~1e-8; a 1e-5 bound is a meaningful guard
     // (still ~1000× the observed residual) that would catch a dropped ε-jet
     // channel without flaking (gam#855).
     gam_linalg_test_support::fd_checker::assert_matrix_derivativefd(
-        &fd_du_raw.insert_axis(Axis(1)),
-        &du_raw.insert_axis(Axis(1)),
+        &fd_du.insert_axis(Axis(1)),
+        &du_by_eps.clone().insert_axis(Axis(1)),
         1e-5,
-        "sas du / d raw epsilon at fixed eta",
+        "sas du / d epsilon at fixed eta",
     );
     let rhs = x_t.transpose_vector_multiply(&du_by_eps);
     let neg_du_deta_vec: Vec<f64> = (0..eta.len())
@@ -1917,10 +1874,9 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
     let mut dbeta_matrix = gam_linalg::faer_ndarray::array1_to_col_matmut(&mut dbeta_exact);
     factor.solve_in_place(dbeta_matrix.as_mut());
     assert!(dbeta_exact.iter().all(|value| value.is_finite()));
-    dbeta_exact *= d_eps_d_raw;
 
     let fd_h = 1e-4 * (1.0 + theta[1].abs());
-    let beta_at = |raw_eps: f64| -> Array1<f64> {
+    let beta_at = |eps: f64| -> Array1<f64> {
         let mut state = RemlState::newwith_offset(
             y.view(),
             conditioning.apply_to_design(&DesignMatrix::Dense(
@@ -1936,9 +1892,8 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
             None,
         )
         .expect("fd state");
-        let (eps_eff, _) = sas_effective_epsilon(raw_eps);
         let sas_state = state_from_sasspec(SasLinkSpec {
-            initial_epsilon: eps_eff,
+            initial_epsilon: eps,
             initial_log_delta: theta[2],
         })
         .expect("fd sas state");
@@ -2056,9 +2011,8 @@ fn sas_true_score_beta_jacobian_matchesfd_at_seed19() {
     )
     .expect("reml_state");
     let rho = theta.slice(s![..1]).to_owned();
-    let (epsilon_eff, _) = sas_effective_epsilon(theta[1]);
     let sas_state = state_from_sasspec(SasLinkSpec {
-        initial_epsilon: epsilon_eff,
+        initial_epsilon: theta[1],
         initial_log_delta: theta[2],
     })
     .expect("sas state");
@@ -2222,9 +2176,8 @@ fn sas_pirlshessian_matches_true_score_jacobian_at_seed19() {
     )
     .expect("reml_state");
     let rho = theta.slice(s![..1]).to_owned();
-    let (epsilon_eff, _) = sas_effective_epsilon(theta[1]);
     let sas_state = state_from_sasspec(SasLinkSpec {
-        initial_epsilon: epsilon_eff,
+        initial_epsilon: theta[1],
         initial_log_delta: theta[2],
     })
     .expect("sas state");
