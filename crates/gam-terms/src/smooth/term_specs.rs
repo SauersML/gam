@@ -2214,8 +2214,6 @@ pub struct BlockwisePenalty {
     /// The local penalty matrix — dimensions `block_p × block_p` where
     /// `block_p = col_range.len()`.
     pub local: Array2<f64>,
-    /// Optional nonzero centering vector for this coefficient block.
-    pub prior_mean: gam_problem::CoefficientPriorMean,
     /// Optional structural hint so downstream spectral/logdet code can stay
     /// block-local or factorized without reverse-engineering the matrix.
     pub structure_hint: Option<PenaltyStructureHint>,
@@ -2234,7 +2232,6 @@ impl std::fmt::Debug for BlockwisePenalty {
                 "local",
                 &format_args!("{}×{}", self.local.nrows(), self.local.ncols()),
             )
-            .field("prior_mean", &self.prior_mean)
             .field("structure_hint", &self.structure_hint)
             .field("op", &self.op.as_ref().map(|o| o.dim()))
             .finish()
@@ -2249,7 +2246,6 @@ impl BlockwisePenalty {
         Self {
             col_range,
             local,
-            prior_mean: gam_problem::CoefficientPriorMean::Zero,
             structure_hint: None,
             op: None,
         }
@@ -2273,7 +2269,6 @@ impl BlockwisePenalty {
         Self {
             col_range,
             local,
-            prior_mean: gam_problem::CoefficientPriorMean::Zero,
             structure_hint: Some(PenaltyStructureHint::Ridge(scale)),
             op: None,
         }
@@ -2289,7 +2284,6 @@ impl BlockwisePenalty {
         Self {
             col_range,
             local,
-            prior_mean: gam_problem::CoefficientPriorMean::Zero,
             structure_hint: Some(PenaltyStructureHint::Kronecker(factors)),
             op: None,
         }

@@ -9,8 +9,8 @@
 //!
 //! Fit `f` penalizes its block `b` with `λ_f · (β−m)ᵀS_b(β−m)`, where `S_b` is
 //! the block's penalty in the fit's coefficient frame and `m` its centre (the
-//! block's prior mean, or the gauge's affine shift, see
-//! [`penalty_posterior_moments`]). The fit's likelihood is scaled by `1/c_f`,
+//! gauge's affine shift, see [`penalty_posterior_moments`]). The fit's
+//! likelihood is scaled by `1/c_f`,
 //! where `c_f` is [`UnifiedFitResult::coefficient_covariance_scale`] (`σ̂²` for
 //! the profiled Gaussian, `1` for every family whose working weights carry the
 //! dispersion), so the Gaussian prior the penalty encodes has precision
@@ -130,37 +130,29 @@ fn penalty_moments(
 /// The centre `m` the fit's penalty on `columns` is measured from, returned as
 /// `β̂ − m`.
 ///
-/// A block is centred at its prior mean `μ`, and a coefficient gauge
-/// `β = Tθ + a` centres its active penalty `θᵀS_θθ` at the shift `a` in the
-/// saved frame ([`UnifiedFitResult::beta_from_gauge_shift`]). One of the two
-/// is always zero on a block in the fits the engine builds. When both move the
-/// same block the centre of the saved penalty is not determined by the saved
-/// state, and the block is refused rather than measured from either.
+/// A coefficient gauge `β = Tθ + a` centres its active penalty `θᵀS_θθ` at
+/// the shift `a` in the saved frame
+/// ([`UnifiedFitResult::beta_from_gauge_shift`]). It is the only centre a
+/// block carries: no route builds a penalty with a coefficient prior mean, so
+/// an unshifted block is centred at the origin.
 fn centred_block(
     fit: &UnifiedFitResult,
     gauge_centred: &Array1<f64>,
     columns: std::ops::Range<usize>,
-    prior_mean: &Array1<f64>,
-    context: &str,
-) -> Result<Array1<f64>, String> {
+) -> Array1<f64> {
     let raw = fit.beta.slice(s![columns.clone()]);
     let shifted = gauge_centred.slice(s![columns]);
-    let gauge_moves_block = raw.iter().zip(shifted.iter()).any(|(r, g)| r != g);
-    let prior_moves_block = prior_mean.iter().any(|&value| value != 0.0);
-    match (gauge_moves_block, prior_moves_block) {
-        (false, _) => Ok(&raw - prior_mean),
-        (true, false) => Ok(shifted.to_owned()),
-        (true, true) => Err(format!(
-            "{context}: both the block's prior mean and the coefficient gauge's affine shift \
-             are nonzero, so the saved fit does not determine the penalty's centre"
-        )),
+    if raw.iter().zip(shifted.iter()).any(|(r, g)| r != g) {
+        shifted.to_owned()
+    } else {
+        raw.to_owned()
     }
 }
 
 /// The posterior moments of every penalty block of a saved fit, in the fit's
 /// flat penalty order.
 ///
-/// The penalty blocks, their ranks, normalizations and prior means come from
+/// The penalty blocks, their ranks and normalizations come from
 /// the frozen-basis replay the summary tables use
 /// ([`saved_predictor_designs`]), checked against the fit's coefficient and
 /// smoothing-parameter layout. `β̂`, `Vb` and `c` come from the saved fit.
@@ -229,12 +221,7 @@ pub fn penalty_posterior_moments(
                     penalty.local.ncols()
                 ));
             }
-            let prior_mean = penalty
-                .prior_mean
-                .evaluate(width, &context)
-                .map_err(|err| err.to_string())?;
-            let centre =
-                centred_block(fit, &gauge_centred, columns.clone(), &prior_mean, &context)?;
+            let centre = centred_block(fit, &gauge_centred, columns.clone());
             let (quadratic_form, trace_penalty_covariance) = penalty_moments(
                 penalty.local.view(),
                 centre.view(),

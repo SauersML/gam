@@ -168,9 +168,8 @@ impl WorkingState {
     /// floor — a caller asking for `tol = 1e-12` gets a 1e-11 band, not
     /// the 1e-5 the old `tol.max(1e-6) * 10` formula silently widened it
     /// to. The 1e-6 floor was masking real convergence regressions
-    /// (e.g. `constant_prior_mean_centers_penalty`'s LM-ridge induced
-    /// 2.5e-8 bias visible only when the user asked for sub-1e-6
-    /// precision).
+    /// (e.g. an LM-ridge induced 2.5e-8 bias visible only when the user
+    /// asked for sub-1e-6 precision).
     #[inline]
     pub(crate) fn near_stationary_kkt(&self, g_norm: f64, tol: f64) -> bool {
         self.relative_gradient_norm(g_norm) <= tol * 10.0

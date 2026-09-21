@@ -493,8 +493,8 @@ fn expectile_free_row_jacobian(
     }
     let h_inverse = |vector: &Array1<f64>| -> Array1<f64> { vb.dot(vector) / phi };
 
-    // u_k = λ_k S_k (β̂ − m_k) embedded in the global coefficient vector, and
-    // its H⁻¹ image −∂β̂/∂ρ_k.
+    // u_k = λ_k S_k β̂ embedded in the global coefficient vector, and its
+    // H⁻¹ image −∂β̂/∂ρ_k.
     let mut penalty_scores = Vec::with_capacity(k_count);
     for (k, block) in design.penalties.iter().enumerate() {
         let range = block.col_range.clone();
@@ -504,15 +504,11 @@ fn expectile_free_row_jacobian(
                 block.local.dim()
             ));
         }
-        let mean = block
-            .prior_mean
-            .evaluate(range.len(), "expectile generalized fixed point")
-            .map_err(|error| error.to_string())?;
-        let centered = &fit.beta.slice(ndarray::s![range.clone()]) - &mean;
+        let beta_block = fit.beta.slice(ndarray::s![range.clone()]);
         let mut score = Array1::<f64>::zeros(p);
         score
             .slice_mut(ndarray::s![range])
-            .assign(&(block.local.dot(&centered) * fit.lambdas[k]));
+            .assign(&(block.local.dot(&beta_block) * fit.lambdas[k]));
         let image = h_inverse(&score);
         penalty_scores.push((score, image));
     }
@@ -925,15 +921,6 @@ fn deterministic_gaussian_standard_fit(
                 FailureCategory::Numerical,
                 format!(
                     "deterministic Gaussian shortcut received non-finite penalty {penalty_index}"
-                ),
-            ));
-        }
-        if !matches!(&block.prior_mean, gam_problem::CoefficientPriorMean::Zero) {
-            return Err(raised_fit_failure(
-                FailureCategory::Input,
-                format!(
-                    "deterministic Gaussian shortcut does not admit a nonzero coefficient \
-                     prior mean on penalty {penalty_index}"
                 ),
             ));
         }
@@ -1903,10 +1890,6 @@ fn exact_gaussian_boundary(
     if design.design.ncols() == 0
         || design.coefficient_lower_bounds.is_some()
         || design.linear_constraints.is_some()
-        || design
-            .penalties
-            .iter()
-            .any(|block| !matches!(&block.prior_mean, gam_problem::CoefficientPriorMean::Zero))
     {
         return Ok(ExactGaussianVerdict::Interior(design));
     }

@@ -162,7 +162,6 @@ pub fn fit_nested_at_fitted_log_lambdas(
         kept_specs.push(PenaltySpec::Block {
             local: penalty.local.clone(),
             col_range,
-            prior_mean: penalty.prior_mean.clone(),
             structure_hint: penalty.structure_hint.clone(),
             op: penalty.op.clone(),
         });

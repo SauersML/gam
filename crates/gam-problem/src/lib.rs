@@ -19,7 +19,6 @@ pub mod basis_error;
 pub mod block_count_error;
 pub mod block_role;
 pub mod block_spec;
-pub mod coefficient_prior_mean;
 mod constraint_set;
 pub mod custom_family_blockwise;
 pub mod custom_family_error;
@@ -94,7 +93,6 @@ pub use block_spec::{
     ParameterBlockSpec,
     ParameterBlockState,
 };
-pub use coefficient_prior_mean::{CoefficientPriorMean, PriorMeanError};
 pub use constraint_set::{
     ConstraintRowId,
     ConstraintSet,

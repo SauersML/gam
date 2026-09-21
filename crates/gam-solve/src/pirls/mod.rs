@@ -99,9 +99,7 @@ use edf::{
 };
 
 pub(crate) use penalty::PirlsPenalty;
-use penalty::{
-    WorkingCoordinateDesign, WorkingReparamTransform, attach_penalty_shift,
-};
+use penalty::{WorkingCoordinateDesign, WorkingReparamTransform};
 
 use pls_solver::solve_penalized_least_squares_implicit;
 
@@ -126,7 +124,7 @@ pub use state::{
 };
 
 // loop_driver owns: default_beta_guess_external, solve_intercept_for_prevalence,
-// assemble_pirls_result, canonical_prior_shift,
+// assemble_pirls_result,
 // PirlsProblem, PenaltyConfig, fit_model_for_fixed_rho,
 // fit_model_for_fixed_rho_with_adaptive_kkt, PirlsConfig, make_reparam_operator,
 // build_transformed_lower_bound_constraints*, build_transformed_linear_constraints*,

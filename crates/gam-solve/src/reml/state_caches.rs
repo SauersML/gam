@@ -42,8 +42,7 @@ pub(crate) fn transformed_penalty_matvec(
 ) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(beta.len());
     let beta_block = beta.slice(ndarray::s![penalty.col_range.clone()]);
-    let centered = &beta_block - &penalty.prior_mean;
-    let local = penalty.local.dot(&centered);
+    let local = penalty.local.dot(&beta_block);
     out.slice_mut(ndarray::s![penalty.col_range.clone()])
         .assign(&local);
     out
@@ -785,7 +784,6 @@ pub(crate) fn hash_canonical_penalties(
         hasher.write_usize(penalty.nullity);
         hash_array2(hasher, &penalty.root);
         hash_array2(hasher, &penalty.local);
-        hash_array_view(hasher, penalty.prior_mean.view());
         hasher.write_usize(penalty.positive_eigenvalues.len());
         for &value in &penalty.positive_eigenvalues {
             hasher.write_f64(value);

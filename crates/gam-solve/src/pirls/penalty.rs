@@ -55,8 +55,6 @@ pub(crate) enum PirlsPenalty {
     Dense {
         s_transformed: Array2<f64>,
         e_transformed: Array2<f64>,
-        linear_shift: Array1<f64>,
-        constant_shift: f64,
     },
 }
 
@@ -116,14 +114,13 @@ impl PirlsPenalty {
         }
     }
 
-    /// Write the affine penalty residual `q` whose normal-equation image is
-    /// the exact shifted penalty gradient: `E' q = S beta - linear_shift`.
+    /// Write the penalty residual `q = E beta` whose normal-equation image is
+    /// the exact penalty gradient: `E' q = S beta`.
     ///
     /// Keeping this residual in root space lets the stiff-penalty PIRLS path
-    /// solve the augmented least-squares problem directly. Forming the two
-    /// large terms in coefficient space and subtracting them first would lose
-    /// precisely the stationarity digits that the root solve is meant to
-    /// preserve.
+    /// solve the augmented least-squares problem directly. Forming `S beta` in
+    /// coefficient space first would lose precisely the stationarity digits
+    /// that the root solve is meant to preserve.
     pub(super) fn write_root_residual(
         &self,
         beta: &Array1<f64>,
@@ -131,21 +128,10 @@ impl PirlsPenalty {
         first_row: usize,
     ) {
         match self {
-            Self::Dense {
-                e_transformed,
-                linear_shift,
-                ..
-            } => {
+            Self::Dense { e_transformed, .. } => {
                 let e_beta = fast_av(e_transformed, beta);
-                for (local_row, row) in e_transformed.rows().into_iter().enumerate() {
-                    let energy = row.dot(&row);
-                    let affine_shift = if energy > 0.0 {
-                        row.dot(linear_shift) / energy
-                    } else {
-                        0.0
-                    };
-                    out[first_row + local_row] = e_beta[local_row] - affine_shift;
-                }
+                out.slice_mut(ndarray::s![first_row..first_row + e_beta.len()])
+                    .assign(&e_beta);
             }
         }
     }
@@ -179,32 +165,15 @@ impl PirlsPenalty {
         }
     }
 
-    pub(super) fn linear_shift(&self) -> &Array1<f64> {
+    /// The penalty energy `beta' S beta`, evaluated as `||E beta||²` on the
+    /// root for the same reason as [`Self::apply`].
+    pub(super) fn quadratic(&self, beta: &Array1<f64>) -> f64 {
         match self {
-            Self::Dense { linear_shift, .. } => linear_shift,
-        }
-    }
-
-    pub(super) fn constant_shift(&self) -> f64 {
-        match self {
-            Self::Dense { constant_shift, .. } => *constant_shift,
-        }
-    }
-
-    pub(super) fn shifted_gradient(&self, beta: &Array1<f64>) -> Array1<f64> {
-        let mut value = self.apply(beta);
-        value -= self.linear_shift();
-        value
-    }
-
-    pub(super) fn shifted_quadratic(&self, beta: &Array1<f64>) -> f64 {
-        let unshifted = match self {
             Self::Dense { e_transformed, .. } => {
                 let e_beta = fast_av(e_transformed, beta);
                 e_beta.dot(&e_beta)
             }
-        };
-        unshifted - 2.0 * beta.dot(self.linear_shift()) + self.constant_shift()
+        }
     }
 }
 
@@ -225,13 +194,11 @@ mod tests {
         let penalty = PirlsPenalty::Dense {
             s_transformed,
             e_transformed,
-            linear_shift: Array1::zeros(2),
-            constant_shift: 0.0,
         };
         let beta = array![1.0, -1.0];
 
-        assert_eq!(penalty.shifted_quadratic(&beta), 4.0);
-        assert_eq!(penalty.shifted_gradient(&beta), array![2.0, -2.0]);
+        assert_eq!(penalty.quadratic(&beta), 4.0);
+        assert_eq!(penalty.apply(&beta), array![2.0, -2.0]);
     }
 
     #[test]
@@ -239,14 +206,10 @@ mod tests {
         let stiff = PirlsPenalty::Dense {
             s_transformed: array![[1.0e10, 0.0], [0.0, 1.0]],
             e_transformed: array![[1.0e5, 0.0], [0.0, 1.0]],
-            linear_shift: Array1::zeros(2),
-            constant_shift: 0.0,
         };
         let ordinary = PirlsPenalty::Dense {
             s_transformed: array![[1.0e6, 0.0], [0.0, 1.0]],
             e_transformed: array![[1.0e3, 0.0], [0.0, 1.0]],
-            linear_shift: Array1::zeros(2),
-            constant_shift: 0.0,
         };
 
         assert!(stiff.requires_root_solve(0.0));
@@ -255,22 +218,17 @@ mod tests {
         let rank_one = PirlsPenalty::Dense {
             s_transformed: array![[1.0e10, 1.0e10], [1.0e10, 1.0e10]],
             e_transformed: array![[1.0e5, 1.0e5]],
-            linear_shift: Array1::zeros(2),
-            constant_shift: 0.0,
         };
         assert!(rank_one.requires_root_solve(1.0));
         assert!(!rank_one.requires_root_solve(1.0e4));
     }
 
     #[test]
-    fn affine_root_residual_maps_to_shifted_penalty_gradient() {
+    fn root_residual_maps_to_penalty_gradient() {
         let root = array![[3.0, 0.0], [0.0, 2.0]];
-        let linear_shift = array![4.5, -2.0];
         let penalty = PirlsPenalty::Dense {
             s_transformed: root.t().dot(&root),
             e_transformed: root.clone(),
-            linear_shift,
-            constant_shift: 0.0,
         };
         let beta = array![0.25, -0.75];
         let mut residual = Array1::<f64>::zeros(4);
@@ -278,29 +236,11 @@ mod tests {
         penalty.write_root_residual(&beta, &mut residual, 2);
         let mapped = root.t().dot(&residual.slice(ndarray::s![2..]).to_owned());
 
-        assert_eq!(mapped, penalty.shifted_gradient(&beta));
+        assert_eq!(mapped, penalty.apply(&beta));
     }
 }
 
 #[inline]
 pub(super) fn symmetrize_dense_matrix(matrix: &Array2<f64>) -> Array2<f64> {
     (matrix + &matrix.t().to_owned()) * 0.5
-}
-
-/// Attach a penalty shift (prior-mean correction) to an existing PirlsPenalty.
-pub(super) fn attach_penalty_shift(
-    penalty: &mut PirlsPenalty,
-    linear_shift: Array1<f64>,
-    constant_shift: f64,
-) {
-    match penalty {
-        PirlsPenalty::Dense {
-            linear_shift: target,
-            constant_shift: constant,
-            ..
-        } => {
-            *target = linear_shift;
-            *constant = constant_shift;
-        }
-    }
 }

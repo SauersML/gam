@@ -4868,7 +4868,6 @@ fn coefficient_groups_are_refused_on_survival_fits() {
             )],
             parent: None,
             prior: None,
-            prior_mean: Default::default(),
         }],
         ..FitConfig::default()
     };

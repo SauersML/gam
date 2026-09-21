@@ -46,7 +46,6 @@ mod matern_nu_sweep_easy_truth;
 mod matern_quality_batch_e;
 mod nonperiodic_bspline_derivative_no_wrap;
 mod penalty_joint_nullspace_check;
-mod penalty_prior_mean_hard;
 mod periodic_bspline_wrap_derivative_continuity_bug;
 mod periodic_duchon_seam_continuity;
 mod psi_gram_tensor_adversarial;

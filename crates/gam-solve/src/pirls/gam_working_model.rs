@@ -989,7 +989,7 @@ impl<'a> GamWorkingModel<'a> {
         }
 
         let deviance = self.current_deviance()?;
-        let penalty_term = self.penalty.shifted_quadratic(beta.as_ref());
+        let penalty_term = self.penalty.quadratic(beta.as_ref());
         // Finiteness is a property of the (deviance, penalty) pair regardless of
         // the family dispersion scale `k` applied later in the gain ratio, so the
         // arithmetic screen uses the bare, unscaled `deviance + penalty_term`.
@@ -1312,7 +1312,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 *wr = (eta - zi) * wi;
             });
         let mut gradient = self.transformed_transpose_matvec(&self.workspace.weighted_residual);
-        let s_beta = self.penalty.shifted_gradient(beta.as_ref());
+        let s_beta = self.penalty.apply(beta.as_ref());
         let gradient_natural_scale = penalized_gradient_natural_scale(&xt_w_eta, &xt_w_z, &s_beta);
         gradient += &s_beta;
         let hessian_curvature = self.update_hessian_curvature_arrays(requested_curvature)?;
@@ -1411,7 +1411,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         // correction.
         let (deviance, log_likelihood) = self.current_data_objective()?;
 
-        let penalty_term = self.penalty.shifted_quadratic(beta.as_ref());
+        let penalty_term = self.penalty.quadratic(beta.as_ref());
         self.last_penalty_term = penalty_term;
 
         self.working_array_beta_bits

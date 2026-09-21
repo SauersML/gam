@@ -34,7 +34,6 @@ use super::{
     WorkingState,
     // misc helpers
     array1_l2_norm,
-    attach_penalty_shift,
     penalized_gradient_natural_scale,
     // compute functions
     calculate_deviance_from_eta,
@@ -835,26 +834,6 @@ pub(super) fn assemble_pirls_result(
     })
 }
 
-pub(super) fn canonical_prior_shift(
-    penalties: &[gam_terms::construction::CanonicalPenalty],
-    lambdas: &[f64],
-    p: usize,
-) -> (Array1<f64>, f64) {
-    let mut linear = Array1::<f64>::zeros(p);
-    let mut constant = 0.0;
-    for (idx, cp) in penalties.iter().enumerate() {
-        let Some(&lambda) = lambdas.get(idx) else {
-            continue;
-        };
-        if lambda == 0.0 {
-            continue;
-        }
-        linear += &cp.prior_linear_shift(lambda);
-        constant += cp.prior_constant_shift(lambda);
-    }
-    (linear, constant)
-}
-
 pub struct PirlsProblem<'a, X> {
     pub x: X,
     pub offset: ArrayView1<'a, f64>,
@@ -1107,7 +1086,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 .expect("dense Qs should exist for the transformed path"),
         )))
     };
-    let mut penalty_active = if use_sparse_native {
+    let penalty_active = if use_sparse_native {
         // Sparse-native inner penalty in original (identity) coordinates. Use
         // the reparameterized declared root and Gram so `H = XᵀWX + S` matches
         // the penalty whose log-determinant REML reports.
@@ -1117,8 +1096,6 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         PirlsPenalty::Dense {
             s_transformed: sparse_reparam.s_transformed.clone(),
             e_transformed: sparse_reparam.e_transformed.clone(),
-            linear_shift: Array1::zeros(penalty.p),
-            constant_shift: 0.0,
         }
     } else {
         let dense = dense_reparam_result
@@ -1127,17 +1104,8 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         PirlsPenalty::Dense {
             s_transformed: dense.s_transformed.clone(),
             e_transformed: dense.e_transformed.clone(),
-            linear_shift: Array1::zeros(penalty.p),
-            constant_shift: 0.0,
         }
     };
-    let (shift_original, shift_constant) =
-        canonical_prior_shift(penalty.canonical_penalties, lambdas_slice, penalty.p);
-    let shift_active = transform_active
-        .as_ref()
-        .map(|transform| transform.apply_transpose(&shift_original))
-        .unwrap_or(shift_original);
-    attach_penalty_shift(&mut penalty_active, shift_active, shift_constant);
     // Build transformed constraints now that dense_reparam_result is available.
     let linear_constraints = if let Some(reparam) = dense_reparam_result.as_ref() {
         let tb = build_transformed_lower_bound_constraints(
@@ -1513,11 +1481,11 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             log_likelihood,
             max_abs_eta,
         } = rows;
-        let s_beta = penalty_active.shifted_gradient(beta_transformed.as_ref());
+        let s_beta = penalty_active.apply(beta_transformed.as_ref());
         let gradient_natural_scale = penalized_gradient_natural_scale(&xt_w_eta, &xt_w_z, &s_beta);
         let mut gradient = gradient_data;
         gradient += &s_beta;
-        let penalty_term = penalty_active.shifted_quadratic(beta_transformed.as_ref());
+        let penalty_term = penalty_active.quadratic(beta_transformed.as_ref());
         // `solve_penalized_least_squares_implicit` assembles `H = XᵀWX + S_λ`
         // with no stabilization ridge on both of its branches (#2901 V22), so
         // `penalized_hessian` is the exact matrix the outer criterion reads, and

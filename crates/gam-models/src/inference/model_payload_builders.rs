@@ -292,13 +292,8 @@ fn standard_conformal_penalty(
         let family = family.trim().to_ascii_lowercase();
         family == "expectile" || family.starts_with("expectile(")
     });
-    // The conformal refits minimize the plain penalized likelihood: a shifted
-    // prior mean or an inequality-constrained coefficient space is a different
-    // fitting map.
-    let shifted_prior = design
-        .penalties
-        .iter()
-        .any(|penalty| !matches!(penalty.prior_mean, gam_problem::CoefficientPriorMean::Zero));
+    // The conformal refits minimize the plain penalized likelihood: an
+    // inequality-constrained coefficient space is a different fitting map.
     let constrained = design.linear_constraints.is_some()
         || design
             .coefficient_lower_bounds
@@ -307,7 +302,6 @@ fn standard_conformal_penalty(
     if expectile
         || fit_config.weight_column.is_some()
         || fit_config.flexible_link
-        || shifted_prior
         || constrained
     {
         return None;

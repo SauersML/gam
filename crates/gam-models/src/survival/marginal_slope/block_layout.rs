@@ -129,8 +129,7 @@ pub(crate) fn stripe_score_warp_across_z_coords(
         let col_range = coord * p..(coord + 1) * p;
         for (penalty_idx, penalty) in base_penalties.iter().enumerate() {
             let local = match penalty {
-                gam_terms::penalty_spec::PenaltySpec::Dense(matrix)
-                | gam_terms::penalty_spec::PenaltySpec::DenseWithMean { matrix, .. } => {
+                gam_terms::penalty_spec::PenaltySpec::Dense(matrix) => {
                     matrix.clone()
                 }
                 gam_terms::penalty_spec::PenaltySpec::Block { local, .. } => local.clone(),
@@ -140,7 +139,6 @@ pub(crate) fn stripe_score_warp_across_z_coords(
                 .push(gam_terms::penalty_spec::PenaltySpec::Block {
                     local,
                     col_range: col_range.clone(),
-                    prior_mean: gam_problem::CoefficientPriorMean::Zero,
                     structure_hint: None,
                     op: None,
                 });

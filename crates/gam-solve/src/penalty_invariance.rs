@@ -9,17 +9,16 @@
 //! `lambda` ONLY through the assembled penalty
 //!
 //! ```text
-//!     P_lambda(beta) = sum_i lambda_i (beta - mu_i)' S_i (beta - mu_i).
+//!     P_lambda(beta) = sum_i lambda_i beta' S_i beta.
 //! ```
 //!
-//! So if a vector `w` satisfies `sum_i w_i S_i = 0` **and** the two companion
-//! conditions its prior means impose (see [`PenaltyMapInvariance`]), then
+//! So if a vector `w` satisfies `sum_i w_i S_i = 0`, then
 //! `P_{lambda + s w} = P_lambda` identically in `s`, and the criterion is
 //! EXACTLY constant along that line of `lambda`. Nothing about the fit, the
 //! data, or the family enters: it is a property of the penalty map alone.
 //!
 //! Such a `w` is precisely a null vector of the Gram matrix
-//! `G_ij = <A_i, A_j>_F` of the penalty operators, because
+//! `G_ij = <A_i, A_j>_F` of the penalty operators `A_i = S_i`, because
 //! `w' G w = ||sum_i w_i A_i||_F^2`.
 //!
 //! That identity is the definition and NOT the algorithm. It carries the
@@ -275,21 +274,8 @@ impl PenaltyMapInvariance {
 
     /// Build from the canonical penalty bundle.
     ///
-    /// The Gram is taken over the AUGMENTED operators
-    ///
-    /// ```text
-    ///     A_i = [[ S_i,        -S_i mu_i        ],
-    ///            [ -mu_i' S_i,  mu_i' S_i mu_i  ]]
-    /// ```
-    ///
-    /// so that `sum_i w_i A_i = 0` is equivalent to the FULL centered quadratic
-    /// `sum_i lambda_i (beta - mu_i)' S_i (beta - mu_i)` being invariant along
-    /// `w` — the quadratic, linear and constant parts all at once. With zero
-    /// prior means (the overwhelmingly common case) `A_i` is `S_i` bordered by
-    /// zeros and the Gram is bit-identical to the plain `tr(S_i S_j)` one, so
-    /// this generalisation cannot move any existing verdict; with nonzero
-    /// means it can only ADD conditions, i.e. shrink the invariance, which is
-    /// the conservative direction.
+    /// The Gram is `G_ij = tr(S_i S_j)`, so `sum_i w_i S_i = 0` is exactly the
+    /// quadratic `sum_i lambda_i beta' S_i beta` being invariant along `w`.
     pub fn from_canonical_penalties(
         canonical: &[CanonicalPenalty],
         coefficient_dimension: usize,
@@ -305,14 +291,12 @@ impl PenaltyMapInvariance {
             let block_dimension = penalty.col_range.end.saturating_sub(penalty.col_range.start);
             if penalty.col_range.end > coefficient_dimension
                 || penalty.local.dim() != (block_dimension, block_dimension)
-                || penalty.prior_mean.len() != block_dimension
             {
                 return Err(format!(
-                    "canonical penalty {index} has range {:?}, local shape {:?}, prior mean length \
-                     {}, coefficient dimension {coefficient_dimension}",
+                    "canonical penalty {index} has range {:?}, local shape {:?}, coefficient \
+                     dimension {coefficient_dimension}",
                     penalty.col_range,
                     penalty.local.dim(),
-                    penalty.prior_mean.len(),
                 ));
             }
         }
@@ -320,12 +304,11 @@ impl PenaltyMapInvariance {
         // ── Disjoint supports carry no invariance, and that is a theorem ──
         //
         // If no two penalties share a coefficient column then `tr(S_i S_j) = 0`
-        // and `c_i . c_j = 0` for every `i != j`, so
+        // for every `i != j`, so
         //
-        //     G = diag(||S_i||_F^2 + 2||c_i||^2) + q q',    q_i = mu_i' S_i mu_i,
+        //     G = diag(||S_i||_F^2),
         //
-        // which is a positive-definite diagonal plus a rank-1 PSD term: strictly
-        // positive definite, hence `null(G) = {0}`. This is the ordinary
+        // which is strictly positive definite, hence `null(G) = {0}`. This is the ordinary
         // additive model — one penalty per smooth, on its own coefficient block
         // — i.e. very nearly every fit, and it exits here in `O(k^2)` range
         // comparisons instead of the `O(k^2 * block^2)` Gram. That matters
@@ -351,35 +334,7 @@ impl PenaltyMapInvariance {
             });
         }
 
-        // The centering vectors c_i = S_i mu_i, in GLOBAL coefficient
-        // coordinates so that overlapping blocks add correctly, and the
-        // scalars q_i = mu_i' S_i mu_i. Allocated only when some prior mean is
-        // nonzero: `k x p` is 13 MB at `k = 50, p = 4096`, and the overwhelming
-        // majority of penalty maps are centered at zero, where `A_i` is `S_i`
-        // bordered by exact zeros and the whole border term vanishes.
-        let centered = canonical
-            .iter()
-            .any(|penalty| penalty.prior_mean.iter().any(|value| *value != 0.0));
-        let mut centering =
-            Array2::<f64>::zeros((k, if centered { coefficient_dimension } else { 0 }));
-        let mut quadratic = Array1::<f64>::zeros(k);
-        for (index, penalty) in canonical.iter().enumerate() {
-            if !centered || penalty.prior_mean.iter().all(|value| *value == 0.0) {
-                continue;
-            }
-            let start = penalty.col_range.start;
-            let block = penalty.col_range.end - start;
-            for row in 0..block {
-                let mut accumulated = 0.0_f64;
-                for col in 0..block {
-                    accumulated += penalty.local[[row, col]] * penalty.prior_mean[col];
-                }
-                centering[[index, start + row]] = accumulated;
-                quadratic[index] += penalty.prior_mean[row] * accumulated;
-            }
-        }
-
-        // Gram of the unscaled augmented maps, in DOUBLE-DOUBLE. Positive
+        // Gram of the unscaled maps, in DOUBLE-DOUBLE. Positive
         // lambdas only rescale the columns of the map and therefore cannot
         // change this rank.
         //
@@ -409,21 +364,6 @@ impl PenaltyMapInvariance {
                         ));
                     }
                 }
-                // The two border blocks of A_i contribute 2 c_i . c_j, the
-                // corner contributes q_i q_j. Both enter the same accumulator:
-                // they are terms of the same inner product, and splitting them
-                // off would reintroduce a rounding at exactly the scale the
-                // decision is taken at.
-                let mut border = DoubleDouble::ZERO;
-                for column in 0..centering.ncols() {
-                    border = border.add(DoubleDouble::from_product(
-                        centering[[i, column]],
-                        centering[[j, column]],
-                    ));
-                }
-                accumulator = accumulator.add(border.mul(DoubleDouble::new(2.0)));
-                accumulator =
-                    accumulator.add(DoubleDouble::from_product(quadratic[i], quadratic[j]));
                 if !accumulator.is_finite() {
                     return Err(format!(
                         "penalty-map Gram entry ({i},{j}) is not finite"

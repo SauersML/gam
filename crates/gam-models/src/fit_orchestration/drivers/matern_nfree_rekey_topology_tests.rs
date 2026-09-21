@@ -124,7 +124,6 @@ mod matern_nfree_rekey_topology_tests {
             .map(|b| gam_solve::estimate::PenaltySpec::Block {
                 local: b.local.clone(),
                 col_range: b.col_range.clone(),
-                prior_mean: b.prior_mean.clone(),
                 structure_hint: b.structure_hint.clone(),
                 op: b.op.clone(),
             })

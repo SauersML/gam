@@ -1046,7 +1046,6 @@ pub(crate) fn tensorize_slope_design_over_time(
         penalties.push(BlockwisePenalty {
             col_range: start..end,
             local,
-            prior_mean: gam_problem::CoefficientPriorMean::Zero,
             structure_hint: None,
             op: None,
         });
@@ -1078,7 +1077,6 @@ pub(crate) fn tensorize_slope_design_over_time(
         penalties.push(BlockwisePenalty {
             col_range: 0..p_cov * p_time,
             local,
-            prior_mean: gam_problem::CoefficientPriorMean::Zero,
             structure_hint: None,
             op: None,
         });

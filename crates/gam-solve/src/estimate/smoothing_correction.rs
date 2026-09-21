@@ -1598,7 +1598,7 @@ pub(crate) fn compute_smoothing_correction(
     }
 
     let n_coeffs_trans = final_fit.beta_transformed.len();
-    // The mode response `dβ̂/dρ_k = −H⁻¹λ_k S̃_k(β̂ − μ_k)` and the penalty map's
+    // The mode response `dβ̂/dρ_k = −H⁻¹λ_k S̃_k β̂` and the penalty map's
     // invariance read the penalties `H` carries, `S̃_k = Π S_k Π` (#2454, #2901).
     // On `y ~ s(x) + s(x, g, bs='fs')` (seed 0) the raw roots moved the fs
     // coordinate's response by 1.79e4 against a response of 1.09e-6.
@@ -1636,13 +1636,13 @@ pub(crate) fn compute_smoothing_correction(
     // subspace itself. They used to be split — the count was kept, the
     // eigenvectors thrown away — which is why the gate could only ask "how
     // many directions must be null?" and never "is THIS direction one of
-    // them?". Nothing else about the count changes: with zero prior means the
-    // augmented Gram is bit-identical to the `tr(S_i S_j)` one this replaces.
+    // them?". Nothing else about the count changes: the Gram is the
+    // `tr(S_i S_j)` one it always was.
     //
     // The invariance is read in the ORIGINAL frame, from the block-local
     // `S̃_k = Π S_k Π` the criterion applies there. `null(w ↦ Σ w_k A_k)` and the
     // Gram `⟨A_i, A_j⟩` are invariant under the orthogonal congruence by `Qs`
-    // (`S_k ↦ QsᵀS_kQs`, `μ_k ↦ Qsᵀμ_k`), so this is the same subspace; but the
+    // (`S_k ↦ QsᵀS_kQs`), so this is the same subspace; but the
     // rotated penalties are dense, and their double-double Gram costs
     // `O(K² p²)` against `O(Σ_overlapping block²)`. On forty coordinates at
     // `p = 221` that was two thirds of the post-fit correction.
@@ -1701,11 +1701,11 @@ pub(crate) fn compute_smoothing_correction(
     // Step 1: Compute the Jacobian J = d(beta)/d(rho) in transformed space.
     //
     // Exact implicit-function identity at the inner optimum:
-    //   dβ̂/dρ_k = -H^{-1}(S_k^ρ (β̂ - μ_k)),   S_k^ρ = λ_k S_k,
+    //   dβ̂/dρ_k = -H^{-1}(S_k^ρ β̂),   S_k^ρ = λ_k S_k,
     //   λ_k = exp(ρ_k).
     //
     // In transformed coordinates with root penalties S_k = R_kᵀR_k:
-    //   S_k (β̂ - μ_k) = R_kᵀ(R_k (β̂ - μ_k)),
+    //   S_k β̂ = R_kᵀ(R_k β̂),
     // so each Jacobian column is one linear solve with H.
 
     // Use the same objective-consistent inner Hessian surface used by REML:
@@ -1760,7 +1760,7 @@ pub(crate) fn compute_smoothing_correction(
 
     // Factor the Hessian for solving. When its strict Cholesky refuses, the IFT
     // solve is taken on the identified subspace post-fit inference uses: each
-    // column of G_ρ is λ_k·S_k(β − μ_k), which lies in range(S_k) and so is
+    // column of G_ρ is λ_k·S_k β, which lies in range(S_k) and so is
     // orthogonal to null(H), where the min-norm solve is exact (#2901 V22).
     let h_chol;
     let identified_inverse;
@@ -1799,7 +1799,7 @@ pub(crate) fn compute_smoothing_correction(
 
     let beta_trans = final_fit.beta_transformed.as_ref();
     // Build the stationarity-gradient derivative matrix G_ρ where column k is
-    // ∂g(β,ρ)/∂ρ_k = λ_k S_k(β - μ_k), then delegate the IFT solve
+    // ∂g(β,ρ)/∂ρ_k = λ_k S_k β, then delegate the IFT solve
     // dβ/dρ = -H⁻¹G_ρ to the canonical evidence helper. This keeps the
     // coefficient-space prediction correction and the joint-evidence
     // Arrow-Schur path on the same hand-derived IFT identity.
@@ -1815,12 +1815,11 @@ pub(crate) fn compute_smoothing_correction(
         if cp.rank() == 0 {
             continue;
         }
-        // S_k(β - μ) — block-local: R^T (R (β[block] - μ)), embedded into p-vector.
+        // S_k β — block-local: R^T (R β[block]), embedded into p-vector.
         let r = &cp.col_range;
         col_supports[k] = r.start..r.end;
         let beta_block = beta_trans.slice(s![r.start..r.end]);
-        let centered = &beta_block - &cp.prior_mean;
-        let r_beta = cp.root.dot(&centered);
+        let r_beta = cp.root.dot(&beta_block);
         for a in 0..cp.block_dim() {
             dg_drho_trans[[r.start + a, k]] = lambdas[k]
                 * (0..cp.rank())

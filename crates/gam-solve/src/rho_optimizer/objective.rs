@@ -273,8 +273,7 @@ pub trait OuterObjective {
     /// every pre-#2676 verdict bit for bit.
     ///
     /// A penalized criterion sees `lambda` only through
-    /// `sum_i lambda_i (beta - mu_i)' S_i (beta - mu_i)`, so any `w` with
-    /// `sum_i w_i S_i = 0` (plus the two conditions a nonzero `mu_i` imposes)
+    /// `sum_i lambda_i beta' S_i beta`, so any `w` with `sum_i w_i S_i = 0`
     /// leaves it unchanged along `lambda + s w`. Lifted to `rho = log lambda`
     /// by `t = diag(lambda)^{-1} w`, the exact chain rule
     /// `H_rho = diag(lambda) H_lambda diag(lambda) + diag(g_rho)` gives

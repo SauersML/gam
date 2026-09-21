@@ -1291,7 +1291,6 @@ mod tests {
                     col_range: 0..p,
                     total_dim: p,
                     nullity: p - rank,
-                    prior_mean: Array1::zeros(p),
                     positive_eigenvalues: vec![1.0; rank],
                     op: None,
                 }
@@ -2919,7 +2918,6 @@ mod tests {
                     total_dim: r.ncols(),
                     nullity: 0,
                     local: local.into_shared(),
-                    prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
                 }
@@ -3042,7 +3040,6 @@ mod tests {
             col_range: 0..2,
             total_dim: 2,
             nullity: 2,
-            prior_mean: Array1::zeros(2),
             positive_eigenvalues: Vec::new(),
             op: None,
         }];
@@ -3173,7 +3170,6 @@ mod tests {
                     total_dim: r.ncols(),
                     nullity: 0,
                     local: local.into_shared(),
-                    prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
                 }
@@ -4852,7 +4848,6 @@ mod root_cause_tests {
                     total_dim: r.ncols(),
                     nullity: 0,
                     local: local.into_shared(),
-                    prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
                 }
@@ -4953,7 +4948,6 @@ mod root_cause_tests {
                         total_dim: r.ncols(),
                         nullity: 0,
                         local: local.into_shared(),
-                        prior_mean: Array1::zeros(r.ncols()),
                         positive_eigenvalues: Vec::new(),
                         op: None,
                     }
@@ -5081,7 +5075,6 @@ mod root_cause_tests {
             col_range: 0..p,
             total_dim: p,
             nullity: 0,
-            prior_mean: Array1::zeros(p),
             positive_eigenvalues: Vec::new(),
             op: None,
         }];

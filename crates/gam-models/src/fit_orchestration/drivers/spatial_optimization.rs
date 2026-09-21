@@ -3374,7 +3374,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
     /// data rows) and the spec's `(power, nullspace_order, operator_penalties,
     /// nu, …)`; only the length-scale moves. The reconstructed term-local
     /// penalty matrices replace the `local` of the FROZEN
-    /// `design.penalties` templates (whose `col_range` / `prior_mean` /
+    /// `design.penalties` templates (whose `col_range` /
     /// `structure_hint` / `op` are ψ-invariant), so the resulting
     /// `PenaltySpec`s are bit-identical in topology to the slow path's; running
     /// them through the SAME `canonicalize_penalty_specs` pipeline yields the
@@ -3541,7 +3541,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             }
         };
         // The frozen collection penalties for THIS term are the templates whose
-        // ψ-invariant structure (col_range / prior_mean / structure_hint / op)
+        // ψ-invariant structure (col_range / structure_hint / op)
         // we keep, swapping only the numeric `local`. For a single-spatial-term
         // collection the term owns the whole penalty list.
         let templates = &self.design.penalties;
@@ -3559,7 +3559,6 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             .map(|(tmpl, local)| gam_solve::estimate::PenaltySpec::Block {
                 local,
                 col_range: tmpl.col_range.clone(),
-                prior_mean: tmpl.prior_mean.clone(),
                 structure_hint: tmpl.structure_hint.clone(),
                 op: tmpl.op.clone(),
             })

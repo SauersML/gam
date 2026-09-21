@@ -1,8 +1,7 @@
 //! Penalty specification for the public estimate API.
 //!
 //! `PenaltySpec` is a *penalty spec* keyed entirely on `gam-terms` penalty
-//! types (`PenaltyStructureHint`, `PenaltyOp`, `BlockwisePenalty`) plus the
-//! neutral `gam_problem::CoefficientPriorMean`. It therefore lives in
+//! types (`PenaltyStructureHint`, `PenaltyOp`, `BlockwisePenalty`). It therefore lives in
 //! `gam-terms` (the layer that owns those penalty primitives); the solver
 //! consumes it from above via `gam_terms::PenaltySpec`.
 //!
@@ -18,13 +17,6 @@ use ndarray::{Array2, s};
 
 use crate::smooth::{BlockwisePenalty, PenaltyStructureHint};
 
-/// Programmatic prior mean for a coefficient penalty block.
-///
-/// This type lives in the neutral `gam-problem` crate (with its inherent
-/// `evaluate` returning `gam_problem::PriorMeanError`); re-exported here so all
-/// existing `PenaltySpec`-adjacent references keep resolving. Solver-side
-/// callers map `PriorMeanError` into `EstimationError::InvalidInput`.
-pub use gam_problem::CoefficientPriorMean;
 pub use gam_problem::EstimationError;
 
 /// A penalty specification for the public estimate API.
@@ -33,6 +25,11 @@ pub use gam_problem::EstimationError;
 /// the O(p^2) cost of embedding into a full penalty matrix.
 /// `Dense` stores a full `p x p` penalty matrix for callers that already
 /// have one.
+///
+/// Every penalty is centred at the origin: its quadratic is `βᵀSβ`. That is
+/// what makes the penalized normal equations read `Hβ̂ = XᵀWz` at every
+/// converged fit, the identity the smooth-term score test recovers its
+/// score from (#3443).
 #[derive(Clone)]
 pub enum PenaltySpec {
     /// Block-local penalty: `local` is `block_dim x block_dim`,
@@ -40,7 +37,6 @@ pub enum PenaltySpec {
     Block {
         local: Array2<f64>,
         col_range: Range<usize>,
-        prior_mean: CoefficientPriorMean,
         /// Optional structural hint for fast-path spectral decomposition.
         structure_hint: Option<PenaltyStructureHint>,
         /// Optional operator-form handle bit-equivalent to `local`.
@@ -48,12 +44,6 @@ pub enum PenaltySpec {
     },
     /// Full dense penalty matrix (`p x p`).
     Dense(Array2<f64>),
-    /// Full dense penalty matrix with a programmatic prior mean in the same
-    /// global coefficient basis.
-    DenseWithMean {
-        matrix: Array2<f64>,
-        prior_mean: CoefficientPriorMean,
-    },
 }
 
 impl std::fmt::Debug for PenaltySpec {
@@ -62,7 +52,6 @@ impl std::fmt::Debug for PenaltySpec {
             PenaltySpec::Block {
                 local,
                 col_range,
-                prior_mean,
                 structure_hint,
                 op,
             } => f
@@ -72,21 +61,12 @@ impl std::fmt::Debug for PenaltySpec {
                     &format_args!("{}×{}", local.nrows(), local.ncols()),
                 )
                 .field("col_range", col_range)
-                .field("prior_mean", prior_mean)
                 .field("structure_hint", structure_hint)
                 .field("op", &op.as_ref().map(|o| o.dim()))
                 .finish(),
             PenaltySpec::Dense(m) => f
                 .debug_tuple("Dense")
                 .field(&format_args!("{}×{}", m.nrows(), m.ncols()))
-                .finish(),
-            PenaltySpec::DenseWithMean { matrix, prior_mean } => f
-                .debug_struct("DenseWithMean")
-                .field(
-                    "matrix",
-                    &format_args!("{}×{}", matrix.nrows(), matrix.ncols()),
-                )
-                .field("prior_mean", prior_mean)
                 .finish(),
         }
     }
@@ -102,10 +82,6 @@ impl PenaltySpec {
                 assert_eq!(m.ncols(), p);
                 0..p
             }
-            PenaltySpec::DenseWithMean { matrix, .. } => {
-                assert_eq!(matrix.ncols(), p);
-                0..p
-            }
         }
     }
 
@@ -113,7 +89,7 @@ impl PenaltySpec {
     pub fn op(&self) -> Option<&std::sync::Arc<dyn crate::analytic_penalties::PenaltyOp>> {
         match self {
             PenaltySpec::Block { op, .. } => op.as_ref(),
-            PenaltySpec::Dense(_) | PenaltySpec::DenseWithMean { .. } => None,
+            PenaltySpec::Dense(_) => None,
         }
     }
 
@@ -122,7 +98,6 @@ impl PenaltySpec {
         PenaltySpec::Block {
             local: bp.local,
             col_range: bp.col_range,
-            prior_mean: bp.prior_mean,
             structure_hint: bp.structure_hint,
             op: bp.op,
         }
@@ -132,7 +107,6 @@ impl PenaltySpec {
         PenaltySpec::Block {
             local: bp.local.clone(),
             col_range: bp.col_range.clone(),
-            prior_mean: bp.prior_mean.clone(),
             structure_hint: bp.structure_hint.clone(),
             op: bp.op.clone(),
         }
@@ -144,7 +118,6 @@ impl PenaltySpec {
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
             PenaltySpec::Dense(m) => m.clone(),
-            PenaltySpec::DenseWithMean { matrix, .. } => matrix.clone(),
             PenaltySpec::Block {
                 local, col_range, ..
             } => {
@@ -167,10 +140,6 @@ impl PenaltySpec {
             PenaltySpec::Dense(m) => {
                 assert_eq!(m.nrows(), p_total);
                 m.clone()
-            }
-            PenaltySpec::DenseWithMean { matrix, .. } => {
-                assert_eq!(matrix.nrows(), p_total);
-                matrix.clone()
             }
             PenaltySpec::Block {
                 local, col_range, ..
@@ -223,15 +192,6 @@ pub fn validate_penalty_spec_shape(
                     "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
                     m.nrows(),
                     m.ncols()
-                );
-            }
-        }
-        PenaltySpec::DenseWithMean { matrix, .. } => {
-            if matrix.nrows() != p || matrix.ncols() != p {
-                crate::bail_invalid_estim!(
-                    "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
-                    matrix.nrows(),
-                    matrix.ncols()
                 );
             }
         }

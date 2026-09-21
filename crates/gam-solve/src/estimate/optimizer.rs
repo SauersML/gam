@@ -325,10 +325,10 @@ struct NegbinThetaRootSensitivity {
 /// The root solves `θ·score(θ, η) = 0`, so the implicit-function theorem gives
 /// `dτ* = θ·dscore / c`, with `c = θ²·info − θ·score` the log-theta curvature
 /// and `dscore = g_ηᵀ X dβ` (`g_η = ∂score/∂η`). The mode moves by
-/// `dβ/dρ_k = −H⁻¹ e^{ρ_k} S_k (β − μ_k)` (the implicit derivative the IFT warm
+/// `dβ/dρ_k = −H⁻¹ e^{ρ_k} S_k β` (the implicit derivative the IFT warm
 /// start extrapolates with) and, for a residual `r` left by the inner solve, by
 /// `δβ = −H⁻¹ r`. One solve `u = H⁻¹ Xᵀ g_η` serves both:
-/// `j_k = −θ e^{ρ_k} uᵀ S_k (β − μ_k) / c`, and `|θ uᵀ r| / c ≤ θ‖u‖‖r‖ / c`.
+/// `j_k = −θ e^{ρ_k} uᵀ S_k β / c`, and `|θ uᵀ r| / c ≤ θ‖u‖‖r‖ / c`.
 ///
 /// `None` whenever that derivative is not the one the mode obeys, or cannot be
 /// formed exactly: a Firth-adjusted or inequality-constrained mode moves by a
@@ -379,8 +379,7 @@ fn negbin_theta_root_sensitivity(
         if r.end > beta_original.len() {
             return None;
         }
-        let centered = &beta_original.slice(ndarray::s![r.start..r.end]) - &cp.prior_mean;
-        let pull = cp.local.dot(&centered);
+        let pull = cp.local.dot(&beta_original.slice(ndarray::s![r.start..r.end]));
         let projection = u_original.slice(ndarray::s![r.start..r.end]).dot(&pull);
         rho_gradient[k] = -rho[k].exp() * theta * projection / curvature;
     }
@@ -4096,7 +4095,7 @@ where
         // Vp = Vb + J·V_ρ·Jᵀ, both terms on the SAME dispersion (variance) scale.
         //
         // The smoothing correction is built from the coefficient sensitivities
-        // J = dβ̂/dρ = −H⁻¹(λ_k S_k(β̂ − μ_k)), which are linear in β̂, and from
+        // J = dβ̂/dρ = −H⁻¹(λ_k S_k β̂), which are linear in β̂, and from
         // V_ρ = (∇²_ρρ V)⁻¹. Under a Gaussian rescaling y → c·y the fit is exactly
         // equivariant: β̂ → c·β̂ (so J → c·J), H is response-scale-invariant, the
         // REML/LAML cost gains only a ρ-independent (n/2)·log(c²) offset (so its
