@@ -169,26 +169,6 @@ impl SaeManifoldTerm {
         ))
     }
 
-    /// #3434 — the lifted-chart certificate of the root `cache` was factored at, or
-    /// `None` where the frame-integrated information is not priced on the dense
-    /// lifted chart.
-    pub(crate) fn frame_lifted_certificate(
-        &self,
-        target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
-        registry: Option<&AnalyticPenaltyRegistry>,
-        cache: &ArrowFactorCache,
-    ) -> Result<Option<FrameLiftedCertificate>, String> {
-        if !self.frame_lifted_chart_admitted(cache.delta_t_len())? {
-            return Ok(None);
-        }
-        let information = self.frame_marginal_information(rho, target, registry)?;
-        Ok(Some(
-            self.frame_lifted_verdict(target, rho, registry, &information)?
-                .certificate,
-        ))
-    }
-
     /// The pencil `(A_ξ, Φ_ξ)` classified as the fixed-frame refined root is
     /// ([`Self::exact_root_classification`]): resolved negative directions go to the
     /// concave-clamp basin, and otherwise the exact decrement decides through
@@ -497,5 +477,32 @@ impl SaeManifoldTerm {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    impl SaeManifoldTerm {
+        /// #3434 — the lifted-chart certificate of the root `cache` was factored at, or
+        /// `None` where the frame-integrated information is not priced on the dense
+        /// lifted chart.
+        pub(crate) fn frame_lifted_certificate(
+            &self,
+            target: ArrayView2<'_, f64>,
+            rho: &SaeManifoldRho,
+            registry: Option<&AnalyticPenaltyRegistry>,
+            cache: &ArrowFactorCache,
+        ) -> Result<Option<FrameLiftedCertificate>, String> {
+            if !self.frame_lifted_chart_admitted(cache.delta_t_len())? {
+                return Ok(None);
+            }
+            let information = self.frame_marginal_information(rho, target, registry)?;
+            Ok(Some(
+                self.frame_lifted_verdict(target, rho, registry, &information)?
+                    .certificate,
+            ))
+        }
     }
 }
