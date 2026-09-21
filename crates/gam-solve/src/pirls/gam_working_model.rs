@@ -402,129 +402,100 @@ impl<'a> GamWorkingModel<'a> {
         Ok(factor)
     }
 
-    fn write_scaled_dense_design(
-        design: &Array2<f64>,
-        weights: &Array1<f64>,
-        out: &mut Array2<f64>,
+    /// Write rows `rows` of the working-coordinate design (the basis the inner
+    /// objective is optimized in) into `out`, without materializing the full
+    /// `n × p` design. When the Firth design factor has been built it already
+    /// holds this basis densely, so its rows are copied directly; otherwise
+    /// sparse designs scatter their CSR rows, explicit designs read their own
+    /// row chunk, and the implicit reparameterization forms `X[rows, :] · Qs`
+    /// for the chunk alone.
+    fn write_working_design_rows(
+        &self,
+        rows: std::ops::Range<usize>,
+        mut out: ndarray::ArrayViewMut2<'_, f64>,
     ) -> Result<(), EstimationError> {
-        if design.nrows() != weights.len()
-            || out.nrows() < design.nrows()
-            || out.ncols() != design.ncols()
-        {
-            crate::bail_invalid_estim!(
-                "PIRLS square-root design shape mismatch: design={}x{}, weights={}, root={}x{}",
-                design.nrows(),
-                design.ncols(),
-                weights.len(),
-                out.nrows(),
-                out.ncols()
-            );
-        }
-        for i in 0..design.nrows() {
-            let weight = weights[i];
-            if !(weight.is_finite() && weight >= 0.0) {
-                crate::bail_invalid_estim!(
-                    "Fisher square-root solve requires finite nonnegative weight, got {weight} at row {i}"
-                );
-            }
-            let scale = weight.sqrt();
-            for j in 0..design.ncols() {
-                out[[i, j]] = scale * design[[i, j]];
-            }
-        }
-        Ok(())
-    }
-
-    fn write_scaled_sparse_design(
-        design: &SparseRowMat<usize, f64>,
-        weights: &Array1<f64>,
-        out: &mut Array2<f64>,
-    ) -> Result<(), EstimationError> {
-        if design.nrows() != weights.len()
-            || out.nrows() < design.nrows()
-            || out.ncols() != design.ncols()
-        {
-            crate::bail_invalid_estim!(
-                "PIRLS sparse square-root design shape mismatch: design={}x{}, weights={}, root={}x{}",
-                design.nrows(),
-                design.ncols(),
-                weights.len(),
-                out.nrows(),
-                out.ncols()
-            );
-        }
-        let view = design.as_ref();
-        for i in 0..design.nrows() {
-            let weight = weights[i];
-            if !(weight.is_finite() && weight >= 0.0) {
-                crate::bail_invalid_estim!(
-                    "Fisher square-root solve requires finite nonnegative weight, got {weight} at row {i}"
-                );
-            }
-            let scale = weight.sqrt();
-            for (&column, &value) in view
-                .col_idx_of_row_raw(i)
-                .iter()
-                .zip(view.val_of_row(i).iter())
-            {
-                out[[i, column.unbound()]] = scale * value;
-            }
-        }
-        Ok(())
-    }
-
-    fn write_fisher_design_root(&self, out: &mut Array2<f64>) -> Result<(), EstimationError> {
+        let materialization_error = |error: gam_runtime::resource::MatrixMaterializationError| {
+            EstimationError::InvalidInput(format!(
+                "PIRLS square-root solve could not read working design rows: {error}"
+            ))
+        };
         if let Some(factor) = self.firth_design_factor.as_ref() {
-            return Self::write_scaled_dense_design(
-                &factor.x_dense,
-                &self.lasthessian_weights,
-                out,
-            );
+            if rows.end > factor.x_dense.nrows()
+                || out.dim() != (rows.len(), factor.x_dense.ncols())
+            {
+                crate::bail_invalid_estim!(
+                    "PIRLS square-root Firth design rows {:?} do not fit design={}x{} into chunk={}x{}",
+                    rows,
+                    factor.x_dense.nrows(),
+                    factor.x_dense.ncols(),
+                    out.nrows(),
+                    out.ncols()
+                );
+            }
+            out.assign(&factor.x_dense.slice(ndarray::s![rows, ..]));
+            return Ok(());
         }
         match &self.coordinate_design {
             WorkingCoordinateDesign::TransformedExplicit {
                 x_transformed,
                 x_csr,
-            } => {
-                if let Some(dense) = x_transformed.as_dense() {
-                    Self::write_scaled_dense_design(dense, &self.lasthessian_weights, out)
-                } else if let Some(csr) = x_csr.as_ref() {
-                    Self::write_scaled_sparse_design(csr, &self.lasthessian_weights, out)
-                } else {
-                    let dense = x_transformed
-                        .try_to_dense_arc("PIRLS square-root solve requires the transformed design")
-                        .map_err(EstimationError::InvalidInput)?;
-                    Self::write_scaled_dense_design(dense.as_ref(), &self.lasthessian_weights, out)
-                }
-            }
-            WorkingCoordinateDesign::TransformedImplicit { transform } => {
-                let n = self.x_original.nrows();
-                let p = self.x_original.ncols();
-                let implicit_design_reservation = gam_runtime::resource::MemoryGovernor::global()
-                    .try_reserve_dense_f64(
-                        n,
-                        p,
-                        "PIRLS implicit transformed design for square-root solve",
-                    )
-                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-                let original = self
+            } => match x_csr.as_ref() {
+                Some(csr) => Self::write_csr_rows(csr, rows, out),
+                None => x_transformed
+                    .row_chunk_into(rows, out)
+                    .map_err(materialization_error),
+            },
+            WorkingCoordinateDesign::TransformedImplicit {
+                transform: WorkingReparamTransform::Dense(qs),
+            } => self
+                .x_original
+                .row_chunk_matmul_into(rows, qs.view(), out)
+                .map_err(materialization_error),
+            WorkingCoordinateDesign::OriginalSparseNative => match self.x_original_csr.as_ref() {
+                Some(csr) => Self::write_csr_rows(csr, rows, out),
+                None => self
                     .x_original
-                    .try_to_dense_arc(
-                        "PIRLS square-root solve requires the original implicit design",
-                    )
-                    .map_err(EstimationError::InvalidInput)?;
-                let transformed = fast_ab(original.as_ref(), &transform.materialize_dense());
-                let result =
-                    Self::write_scaled_dense_design(&transformed, &self.lasthessian_weights, out);
-                drop(implicit_design_reservation);
-                result
-            }
-            WorkingCoordinateDesign::OriginalSparseNative => crate::bail_invalid_estim!(
-                "sparse-native square-root solve bypassed its tall-skinny QR route"
-            ),
+                    .row_chunk_into(rows, out)
+                    .map_err(materialization_error),
+            },
         }
     }
 
+    fn write_csr_rows(
+        csr: &SparseRowMat<usize, f64>,
+        rows: std::ops::Range<usize>,
+        mut out: ndarray::ArrayViewMut2<'_, f64>,
+    ) -> Result<(), EstimationError> {
+        if rows.end > csr.nrows() || out.dim() != (rows.len(), csr.ncols()) {
+            crate::bail_invalid_estim!(
+                "PIRLS square-root sparse design rows {:?} do not fit design={}x{} into chunk={}x{}",
+                rows,
+                csr.nrows(),
+                csr.ncols(),
+                out.nrows(),
+                out.ncols()
+            );
+        }
+        out.fill(0.0);
+        let view = csr.as_ref();
+        for (local, row) in rows.enumerate() {
+            for (&column, &value) in view
+                .col_idx_of_row_raw(row)
+                .iter()
+                .zip(view.val_of_row(row).iter())
+            {
+                out[[local, column.unbound()]] = value;
+            }
+        }
+        Ok(())
+    }
+
+    /// Solve the damped Fisher/penalty Newton system through its augmented
+    /// square root `[W^{1/2} X; E; sqrt(λ D²)]`, streamed row-block by
+    /// row-block through [`TallSkinnyQrLeastSquares`]. Every coordinate design
+    /// takes the same route, so the live storage is set by the block height
+    /// and `p`, never by `n`: a stiff penalty or Firth reduction no longer turns
+    /// a large-`n` fit into an `(n + rank(E) + p) × p` dense allocation.
     fn solve_fisher_direction_from_root(
         &self,
         beta: &Coefficients,
@@ -537,83 +508,7 @@ impl<'a> GamWorkingModel<'a> {
         let n = self.lasthessian_weights.len();
         let p = state.gradient.len();
         let penalty_rows = self.penalty.rank();
-        if matches!(
-            &self.coordinate_design,
-            WorkingCoordinateDesign::OriginalSparseNative
-        ) && self.firth_design_factor.is_none()
-        {
-            // Preserve the square-root problem without materializing sparse X
-            // as an n×p dense root. Blocking at p rows retains Householder QR's
-            // conditioning while bounding all live matrices by O(p²).
-            let block_rows = p.checked_mul(2).ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "PIRLS tall-skinny QR block row count overflowed usize".to_string(),
-                )
-            })?;
-            let qr_reservation = gam_runtime::resource::MemoryGovernor::global()
-                .try_reserve_dense_f64_copies(
-                    block_rows,
-                    p,
-                    4,
-                    "PIRLS sparse tall-skinny QR square-root solve",
-                )
-                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-            let csr = self.x_original_csr.as_ref().ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "missing CSR cache for sparse-native PIRLS square-root solve".to_string(),
-                )
-            })?;
-            let mut qr = TallSkinnyQrLeastSquares::new(p)?;
-            let mut row = Array1::<f64>::zeros(p);
-            let view = csr.as_ref();
-            for i in 0..n {
-                let weight = self.lasthessian_weights[i];
-                if !(weight.is_finite() && weight >= 0.0) {
-                    crate::bail_invalid_estim!(
-                        "Fisher square-root solve requires finite nonnegative weight, got {weight} at row {i}"
-                    );
-                }
-                let scale = weight.sqrt();
-                for (&column, &value) in view
-                    .col_idx_of_row_raw(i)
-                    .iter()
-                    .zip(view.val_of_row(i).iter())
-                {
-                    row[column.unbound()] = scale * value;
-                }
-                qr.push_row(row.view(), (state.eta[i] - self.lastz[i]) * scale)?;
-                row.fill(0.0);
-            }
-
-            let mut penalty_root = Array2::<f64>::zeros((penalty_rows, p).f());
-            let mut penalty_residual = Array1::<f64>::zeros(penalty_rows);
-            self.penalty.write_root_rows(&mut penalty_root, 0);
-            self.penalty
-                .write_root_residual(beta.as_ref(), &mut penalty_residual, 0);
-            for i in 0..penalty_rows {
-                qr.push_row(penalty_root.row(i), penalty_residual[i])?;
-            }
-            for j in 0..p {
-                let energy = loop_lambda * lm_d2[j];
-                if !(energy.is_finite() && energy >= 0.0) {
-                    crate::bail_invalid_estim!(
-                        "PIRLS square-root LM diagonal must be finite and nonnegative, got {energy} at coefficient {j}"
-                    );
-                }
-                if energy > 0.0 {
-                    let root_energy = energy.sqrt();
-                    row[j] = root_energy;
-                    qr.push_row(row.view(), 0.0)?;
-                    row[j] = 0.0;
-                } else {
-                    qr.push_row(row.view(), 0.0)?;
-                }
-            }
-            let result = qr.solve(firth_hessian, direction_out);
-            drop(qr_reservation);
-            return result;
-        }
-        let rows = n
+        let total_rows = n
             .checked_add(penalty_rows)
             .and_then(|value| value.checked_add(p))
             .ok_or_else(|| {
@@ -621,22 +516,61 @@ impl<'a> GamWorkingModel<'a> {
                     "PIRLS square-root row count overflowed usize".to_string(),
                 )
             })?;
-        // Peak live storage is the root, faer's QR factor, the temporary Q,
-        // and the augmented least-squares residual. Charge all four atomically.
-        let root_qr_reservation = gam_runtime::resource::MemoryGovernor::global()
-            .try_reserve_dense_f64_copies(rows, p, 4, "PIRLS Householder QR square-root solve")
+        // Block height: the shared row-chunk byte budget used by every other
+        // streamed design pass, raised to `p` because a Householder block
+        // reduction needs at least as many rows as columns.
+        let block_rows = gam_linalg::utils::row_chunk_for_byte_budget(total_rows, p).max(p);
+        let block_storage_rows = block_rows.checked_add(p).ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "PIRLS tall-skinny QR block row count overflowed usize".to_string(),
+            )
+        })?;
+        // Peak live storage, all at most `(block_rows + p) × p`: the design
+        // chunk, the pending QR block, and during a block reduction the stacked
+        // `[R; block]`, faer's working factor, its reflector basis and the thin
+        // Q. (Filling an implicit `X·Qs` chunk transiently needs two further
+        // chunk-sized buffers, fewer than a reduction.) Charge six atomically.
+        let qr_reservation = gam_runtime::resource::MemoryGovernor::global()
+            .try_reserve_dense_f64_copies(
+                block_storage_rows,
+                p,
+                6,
+                "PIRLS tall-skinny QR square-root solve",
+            )
             .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-        let mut root = Array2::<f64>::zeros((rows, p).f());
-        let mut residual = Array1::<f64>::zeros(rows);
-        self.write_fisher_design_root(&mut root)?;
-        for i in 0..n {
-            let weight = self.lasthessian_weights[i];
-            let scale = weight.sqrt();
-            residual[i] = (state.eta[i] - self.lastz[i]) * scale;
+        let mut qr = TallSkinnyQrLeastSquares::new(p, block_rows)?;
+
+        let chunk_rows = block_rows.min(n);
+        let mut design_chunk = Array2::<f64>::zeros((chunk_rows, p));
+        let mut start = 0;
+        while start < n {
+            let end = (start + chunk_rows).min(n);
+            let mut chunk = design_chunk.slice_mut(ndarray::s![..end - start, ..]);
+            self.write_working_design_rows(start..end, chunk.view_mut())?;
+            for i in start..end {
+                let weight = self.lasthessian_weights[i];
+                if !(weight.is_finite() && weight >= 0.0) {
+                    crate::bail_invalid_estim!(
+                        "Fisher square-root solve requires finite nonnegative weight, got {weight} at row {i}"
+                    );
+                }
+                let scale = weight.sqrt();
+                let mut row = chunk.row_mut(i - start);
+                row.mapv_inplace(|value| scale * value);
+                qr.push_row(row.view(), (state.eta[i] - self.lastz[i]) * scale)?;
+            }
+            start = end;
         }
-        self.penalty.write_root_rows(&mut root, n);
-        self.penalty.write_root_residual(beta.as_ref(), &mut residual, n);
-        let diagonal_start = n + penalty_rows;
+
+        let mut penalty_root = Array2::<f64>::zeros((penalty_rows, p).f());
+        let mut penalty_residual = Array1::<f64>::zeros(penalty_rows);
+        self.penalty.write_root_rows(&mut penalty_root, 0);
+        self.penalty
+            .write_root_residual(beta.as_ref(), &mut penalty_residual, 0);
+        for i in 0..penalty_rows {
+            qr.push_row(penalty_root.row(i), penalty_residual[i])?;
+        }
+        let mut diagonal_row = Array1::<f64>::zeros(p);
         for j in 0..p {
             let energy = loop_lambda * lm_d2[j];
             if !(energy.is_finite() && energy >= 0.0) {
@@ -645,23 +579,15 @@ impl<'a> GamWorkingModel<'a> {
                 );
             }
             // The exact bare-Hessian stationarity certificate calls this path
-            // with transient LM damping equal to zero.  Its augmented diagonal
-            // row is then mathematically absent; leave the preallocated row and
-            // residual at zero rather than manufacturing a ridge merely to make
-            // the storage rectangular.
-            if energy == 0.0 {
-                continue;
-            }
-            let root_energy = energy.sqrt();
-            root[[diagonal_start + j, j]] = root_energy;
+            // with transient LM damping equal to zero. Its augmented diagonal
+            // row is then mathematically absent and contributes a zero row,
+            // rather than a manufactured ridge.
+            diagonal_row[j] = energy.sqrt();
+            qr.push_row(diagonal_row.view(), 0.0)?;
+            diagonal_row[j] = 0.0;
         }
-        let result = solve_newton_direction_from_root_with_firth_hessian(
-            &root,
-            &residual,
-            firth_hessian,
-            direction_out,
-        );
-        drop(root_qr_reservation);
+        let result = qr.solve(firth_hessian, direction_out);
+        drop(qr_reservation);
         result
     }
 
