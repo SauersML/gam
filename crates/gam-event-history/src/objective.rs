@@ -125,7 +125,7 @@ impl EventHistoryFamily {
                 designs: None,
                 log_normaliser: held.as_deref(),
             };
-            subject_marginal(&inputs, false).map(|result| result.loglik)
+            subject_marginal(&inputs, Evaluation::Value).map(|result| result.loglik)
         }).collect();
         Ok(pairwise_sum(&results?, &beta[0].constant_like(0.0)))
     }
@@ -489,7 +489,7 @@ mod tests {
             ParameterBlockState { beta: array![loading], eta: Array1::zeros(nodes.total_nodes) },
         ];
         let family = EventHistoryFamily::new(nodes.clone(), vec![Arc::new(Array2::ones((nodes.total_nodes, 1)))],
-            1, order, 1.0, vec![Some(rate)]).unwrap().with_reference(Some(Arc::new(tables)));
+            1, order, 1.0, vec![Some(rate)], EventHistorySpec::new(Vec::new()).quadrature_tolerance).unwrap().with_reference(Some(Arc::new(tables)));
         (family, states)
     }
 
@@ -622,7 +622,7 @@ mod tests {
             ParameterBlockState { beta: array![2.0, 0.0], eta: Array1::zeros(nodes.total_nodes) },
         ];
         let family = EventHistoryFamily::new(nodes.clone(), vec![Arc::new(Array2::ones((nodes.total_nodes, 1)))],
-            2, order, 1.0, rates).unwrap();
+            2, order, 1.0, rates, EventHistorySpec::new(Vec::new()).quadrature_tolerance).unwrap();
         (family, states)
     }
 
@@ -988,7 +988,8 @@ mod tests {
             ParameterBlockState { beta, eta },
             ParameterBlockState { beta: array![0.9], eta: Array1::zeros(nodes.total_nodes) },
         ];
-        let family = EventHistoryFamily::new(nodes.clone(), vec![Arc::new(design)], 1, 9, 1.0, vec![Some(1e-8)])
+        let family = EventHistoryFamily::new(nodes.clone(), vec![Arc::new(design)], 1, 9, 1.0, vec![Some(1e-8)],
+            EventHistorySpec::new(Vec::new()).quadrature_tolerance)
             .unwrap().with_reference(Some(Arc::new(tables)));
         (family, states)
     }
