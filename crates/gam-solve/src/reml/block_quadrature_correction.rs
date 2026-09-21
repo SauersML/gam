@@ -655,7 +655,6 @@ impl<'a> RemlState<'a> {
             }
         });
 
-        let row_block_design = gam_linalg::faer_ndarray::fast_ab(x_dense.as_ref(), &block_vecs);
         let target = Gam784BlockTarget {
             x_transformed: x_dense.as_ref(),
             block_design: Gam784BlockDesign::new(x_dense.as_ref(), &block_vecs),

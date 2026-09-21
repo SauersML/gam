@@ -669,7 +669,7 @@ impl OuterObjective for ReleasableSeed<'_> {
         self.inner.criterion_invariant_directions(theta)
     }
 
-    fn criterion_rank(&self) -> Option<usize> {
+    fn criterion_rank(&self) -> Option<crate::rho_optimizer::objective::CriterionRank> {
         self.inner.criterion_rank()
     }
 
