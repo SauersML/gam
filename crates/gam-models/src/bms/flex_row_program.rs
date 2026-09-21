@@ -844,6 +844,10 @@ impl BmsFlexRowProgram {
         })
     }
 
+    /// The index expression BEFORE its `scale`: `a + b*z + b*score_warp +
+    /// link_warp`. Callers fold `scale` into the operation that consumes the
+    /// index (the calibration sum's input scales, the observed term's sign),
+    /// so no per-node jet is written only to be rescaled.
     #[inline]
     fn evaluate_index<'arena, S: RuntimeJetScalar<'arena>>(
         &self,
@@ -881,7 +885,7 @@ impl BmsFlexRowProgram {
                 &inside,
             );
         }
-        inside.scale(self.scale)
+        inside
     }
 
     /// Interpret the canonical program in a runtime-sized derivative algebra.
@@ -922,7 +926,10 @@ impl BmsFlexRowProgram {
                 stack
             })
             .collect();
-        let calibration_scales = vec![1.0; self.calibration.len()];
+        // `F(scale·x)` is the composed sum's affine input law, so the index
+        // scale rides in the input scales instead of a `scale` pass that
+        // wrote a fresh `(1 + lanes)·(d + d²)` block per node (gam#3290).
+        let calibration_scales = vec![self.scale; self.calibration.len()];
         let constraint = |a: &S| -> S {
             let etas: Vec<S> = self
                 .calibration
@@ -948,7 +955,7 @@ impl BmsFlexRowProgram {
         );
         let signed = self
             .evaluate_index(&intercept, vars, &self.observed, workspace)
-            .scale(self.observed_sign);
+            .scale(self.scale * self.observed_sign);
         Ok(signed.compose_unary(self.observed_neglog_stack))
     }
 }
