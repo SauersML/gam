@@ -4,8 +4,8 @@ use super::*;
 use gam_problem::{DominanceRefusalKind, StationarityRung, StationarityStandard};
 
 use super::asymptote_certificate::{
-    AsymptoteSample, AsymptoteSide, AsymptoteTolerances, AsymptoteVerdict, AsymptoteWindow,
-    MIN_TAIL_SAMPLES, assess_coordinate,
+    AsymptoteSample, AsymptoteSide, AsymptoteVerdict, AsymptoteWindow, MIN_TAIL_SAMPLES,
+    assess_coordinate, settle_tail_constant,
 };
 use super::rail_face::{
     RailFaceLimitOutcome, RailFaceProof, RailFaceVerdict, certify_rail_face,
@@ -4067,10 +4067,6 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // certified.
     let rail_projection_bounds = rail_relaxed_bounds(&bounds);
     let grad_norm = evaluation.gradient.dot(&evaluation.gradient).sqrt();
-    // The terminal inner coefficients β(ρ̂), published by the REML bridge on
-    // every eval (`inner_beta_hint`). Used to scale the estimand tolerance for
-    // the asymptote-rail certificate (#2348 Inc 1).
-    let terminal_beta = evaluation.inner_beta_hint.clone();
     // KKT-projected gradient VECTOR (not just its norm): the norm feeds the
     // stationarity certificate below, and the vector feeds the curvature-scaled
     // flat-valley Newton decrement (#2253/#2249/#2015) once the analytic Hessian
@@ -4623,11 +4619,10 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                     layout,
                     hessian,
                     bounds: &bounds,
-                    terminal_beta: terminal_beta.as_ref(),
                     stationarity_bound: StationarityBound::from_ladder(stationarity_bound, bound_source),
                     objective_tol: asymptote_objective_tol,
                     context,
-                    native_coordinate_order: config.native_coordinate_order.as_deref(),
+                    config,
                 },
             )?)
         }
@@ -5178,14 +5173,6 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         //       exponential tail and declines on any coordinate that has none.
         // (1) takes precedence: a wrong rail must be pulled back, never frozen.
         if allow_certify_reseed && !certificate_railed.is_empty() {
-            let beta_norm = terminal_beta
-                .as_ref()
-                .map(|b| b.dot(b).sqrt())
-                .filter(|v| v.is_finite())
-                .unwrap_or(0.0);
-            let mut rail_tol =
-                AsymptoteTolerances::exp4_rail_bands(ASYMPTOTE_ESTIMAND_REL_TOL * (1.0 + beta_norm));
-            rail_tol.tail_drift_rel = RAIL_TAIL_DRIFT_REL;
             let (lower, upper) = &bounds;
             let mut wrong_rail_point: Option<Array1<f64>> = None;
             for &k in certificate_railed.iter() {
@@ -5202,7 +5189,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                     &result.rho,
                     k,
                     side,
-                    &rail_tol,
+                    config,
                     (lower[k], upper[k]),
                 )? {
                     let mut reseed = result.rho.clone();
@@ -5465,38 +5452,6 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     Ok(certificate)
 }
 
-/// Estimand tolerance relative to the fitted coefficient scale for the
-/// asymptote-rail certificate (#2348 Inc 1): the remaining coefficient travel
-/// to the rail limit must fall below `ASYMPTOTE_ESTIMAND_REL_TOL·(1 + ‖β‖)` for
-/// the fitted model to be certified equal to the rail-limit fit.
-const ASYMPTOTE_ESTIMAND_REL_TOL: f64 = 1.0e-4;
-
-/// Number of one-e-fold-in-`ρ` probes stepped back from a railed coordinate
-/// toward the interior when reconstructing its exponential tail (#2348 Inc 1).
-/// Enough to span both the finite-difference floor next to the rail (rejected)
-/// and a confirmable-tail run further in.
-// 18 e-folds: the window must REACH the finite-difference-clean constant-ĉ
-// band from a coordinate railed AT the box ceiling. The fused-Hessian
-// trajectory (#2348) rails fits at ρ=30 that previously stalled mid-box, and
-// the #2299 fixture's clean band sits 13–16 e-folds inside — the old 12-probe
-// window (sized for mid-box crawls) stopped one row short of it, so a fully
-// confirmed tail declined with "no finite-difference-clean tail window". Six
-// extra value+gradient evals, paid only at certification of railed fits.
-const ASYMPTOTE_PROBE_COUNT: usize = 18;
-
-/// Local confirmation resolution used only when the one-e-fold ladder cannot
-/// find a clean run. A finite smoothing box can intersect a perfectly regular
-/// asymptote before three whole e-folds of the leading-order tail are visible;
-/// half-e-fold probes resolve that band without relaxing any certificate gate.
-///
-/// The probes remain equally spaced, which is load-bearing: the estimand
-/// certificate interprets consecutive coefficient moves as one geometric
-/// sequence. Six samples cover three e-folds, so the fallback still observes
-/// curvature over a material interval instead of manufacturing constancy from
-/// an arbitrarily small neighborhood.
-const ASYMPTOTE_LOCAL_PROBE_DELTA: f64 = 0.5;
-const ASYMPTOTE_LOCAL_PROBE_COUNT: usize = 6;
-
 /// Read-only inputs to [`try_certify_asymptote_rail`], bundled so the certify
 /// path passes one borrow rather than a long positional argument list.
 struct AsymptoteRailInputs<'a> {
@@ -5509,7 +5464,6 @@ struct AsymptoteRailInputs<'a> {
     layout: OuterThetaLayout,
     hessian: &'a Array2<f64>,
     bounds: &'a (Array1<f64>, Array1<f64>),
-    terminal_beta: Option<&'a Array1<f64>>,
     /// The ladder bound the full problem was judged against, carrying the rung
     /// that set it. A gradient-magnitude rung is already in the exact projected
     /// residual currency used on the face. A curvature-derived rung is not:
@@ -5517,20 +5471,28 @@ struct AsymptoteRailInputs<'a> {
     /// bound, and the replacement's rung is what the resulting certificate —
     /// or refusal — must report (#2458/#2559).
     stationarity_bound: StationarityBound,
-    /// The run's relative objective tolerance resolved at the certified cost —
-    /// the same flat-valley floor the cost-stall guard and the curvature-scaled
-    /// widening use. The railed interior judgment applies the identical
-    /// Newton-decrement criterion on the interior SUB-BLOCK (the full-Hessian
-    /// widening is disabled exactly when a noise-corrupted tail entry makes the
-    /// full matrix non-PD).
+    /// The criterion's statistical resolution ([`outer_criterion_resolution`]):
+    /// the smallest criterion difference the data can distinguish. The railed
+    /// interior judgment applies the Newton-decrement criterion on the interior
+    /// SUB-BLOCK against it (the full-Hessian widening is disabled exactly when
+    /// a noise-corrupted tail entry makes the full matrix non-PD), and the rail
+    /// itself is certified only once the criterion value still available by
+    /// running to the rail falls below it.
     objective_tol: f64,
     context: &'a str,
-    /// The canonical run's coordinate map, so every decline this certificate
-    /// writes names native coordinates ([`native_coordinate`], #2817).
-    native_coordinate_order: Option<&'a [usize]>,
+    /// The run's configuration. It carries the canonical coordinate map, so
+    /// every decline this certificate writes names native coordinates
+    /// ([`native_coordinate`], #2817), and the problem size the probes'
+    /// rounding bands are derived from ([`outer_coordinate_bands`], #3565).
+    config: &'a OuterConfig,
 }
 
 impl AsymptoteRailInputs<'_> {
+    /// The canonical run's coordinate map (#2817).
+    fn native_order(&self) -> Option<&[usize]> {
+        self.config.native_coordinate_order.as_deref()
+    }
+
     /// Split the railed set into the coordinates the exponential tail law
     /// speaks for and the ones it does not (#2453).
     ///
@@ -5557,8 +5519,8 @@ impl AsymptoteRailInputs<'_> {
 /// Returns `Some((interior_projected_grad_norm, rails))` when the interior
 /// (non-railed) coordinates are gradient-stationary, the interior Hessian
 /// sub-block is PSD, and EVERY railed coordinate is certified on a confirmed
-/// exponential tail whose fitted model has reached the rail limit to within the
-/// estimand tolerance. Returns `None` (fall through to the generic verdict) on
+/// exponential tail whose remaining criterion value gap to the rail limit is
+/// below the criterion's statistical resolution. Returns `None` (fall through to the generic verdict) on
 /// any failure — a non-stationary interior, indefinite interior curvature, or
 /// any railed coordinate whose tail is not confirmable. Never errors on a
 /// refusal; the only `Err` is a genuinely broken objective that cannot restore
@@ -5610,16 +5572,6 @@ fn try_certify_asymptote_rail(
     {
         return Ok(Err("interior Hessian sub-block is not PSD".to_string()));
     }
-    let beta_norm = inputs
-        .terminal_beta
-        .map(|b| b.dot(b).sqrt())
-        .filter(|v| v.is_finite())
-        .unwrap_or(0.0);
-    let estimand_tol = ASYMPTOTE_ESTIMAND_REL_TOL * (1.0 + beta_norm);
-    let mut tol = AsymptoteTolerances::exp4_rail_bands(estimand_tol);
-    // Real REML tails hold ĉ to ~5e-3 relative, not the exp4 synthetic
-    // characterization's 1e-3 (measured on the #2299 fixture during Inc 2c).
-    tol.tail_drift_rel = RAIL_TAIL_DRIFT_REL;
     let (lower, upper) = inputs.bounds;
 
     // #2453: only the log-λ coordinates go to the tail law. A ψ rail stays in
@@ -5632,7 +5584,7 @@ fn try_certify_asymptote_rail(
             "no railed coordinate parameterizes log λ; {} bound-active ψ coordinate(s) {:?} carry \
              no exponential tail to certify",
             box_railed.len(),
-            native_coordinates(inputs.native_coordinate_order, &box_railed),
+            native_coordinates(inputs.native_order(), &box_railed),
         )));
     }
     if !box_railed.is_empty() {
@@ -5642,8 +5594,8 @@ fn try_certify_asymptote_rail(
              runs on log-λ coordinate(s) {:?}",
             inputs.context,
             box_railed.len(),
-            native_coordinates(inputs.native_coordinate_order, &box_railed),
-            native_coordinates(inputs.native_coordinate_order, &tail_railed),
+            native_coordinates(inputs.native_order(), &box_railed),
+            native_coordinates(inputs.native_order(), &tail_railed),
         );
     }
 
@@ -5657,7 +5609,7 @@ fn try_certify_asymptote_rail(
         if k >= rho.len() || k >= lower.len() || k >= upper.len() {
             return Ok(Err(format!(
                 "railed coordinate {} outside the box layout",
-                native_coordinate(inputs.native_coordinate_order, k)
+                native_coordinate(inputs.native_order(), k)
             )));
         }
         if (upper[k] - rho[k]).abs() <= (rho[k] - lower[k]).abs() {
@@ -5679,15 +5631,14 @@ fn try_certify_asymptote_rail(
             return Ok(Err(format!(
                 "the face spans both ends of the box: coordinate(s) {:?} rail at λ → ∞ and {:?} \
                  at λ → 0, and no closed form expands the criterion jointly at that corner",
-                native_coordinates(inputs.native_coordinate_order, &upper_face),
-                native_coordinates(inputs.native_coordinate_order, &lower_face),
+                native_coordinates(inputs.native_order(), &upper_face),
+                native_coordinates(inputs.native_order(), &lower_face),
             )));
         }
         return match try_certify_zero_smoothing_face_analytically(
             obj,
             inputs,
             &lower_face,
-            estimand_tol,
         )? {
             Ok((rails, proof)) => {
                 log::debug!(
@@ -5725,7 +5676,7 @@ fn try_certify_asymptote_rail(
     // by a sound lower bound on that law over the whole release simplex. When
     // the objective cannot form that limit, or the proof does not hold, the
     // measured-tail path below is unchanged.
-    match try_certify_face_analytically(obj, inputs, &upper_face, estimand_tol)? {
+    match try_certify_face_analytically(obj, inputs, &upper_face)? {
         Ok((rails, proof)) => {
             log::debug!(
                 "[CERTIFICATE] {}: analytic λ=∞ face proof on {} coordinate(s) via {:?}: \
@@ -5765,9 +5716,9 @@ fn try_certify_asymptote_rail(
             rho,
             k,
             AsymptoteSide::Upper,
-            &tol,
+            inputs.config,
+            inputs.objective_tol,
             (lower[k], upper[k]),
-            native_coordinate(inputs.native_coordinate_order, k),
         )? {
             Ok(rail) => rails.push(rail),
             Err(reason) => {
@@ -5820,7 +5771,6 @@ fn try_certify_face_analytically(
     obj: &mut dyn OuterObjective,
     inputs: &AsymptoteRailInputs<'_>,
     upper_face: &[usize],
-    estimand_tol: f64,
 ) -> Result<Result<(Vec<RailCoordinate>, RailFaceProof), String>, EstimationError> {
     // `upper_face` rails at the INFINITE-smoothing bound only; the caller
     // routes the zero-smoothing end to its own law.
@@ -5841,14 +5791,17 @@ fn try_certify_face_analytically(
         RailFaceVerdict::Refused { reason } => return Ok(Err(reason)),
     };
     // The face being optimal does not by itself mean the SHIPPED fit is the
-    // limit fit; the estimand gate is the same one the measured path applies,
-    // now answered by the exact first-order coefficient offset rather than a
-    // geometric extrapolation of observed steps.
-    if !(proof.estimand_travel <= estimand_tol) {
+    // limit fit. The gate is the same one the measured path applies: the
+    // criterion value still available by running to the face, `V(ρ̂) − V_∞`,
+    // must be below what the data can resolve. Here it is answered by the
+    // exact first-order form rather than a tail extrapolation. A relative
+    // coefficient tolerance would be a chosen number; the criterion's own
+    // resolution is not (#3565).
+    if !(proof.value_gap <= inputs.objective_tol) {
         return Ok(Err(format!(
-            "λ=∞ face proven, but the shipped fit has not reached it: coefficient travel \
-             {:.3e} > estimand tolerance {estimand_tol:.3e}",
-            proof.estimand_travel
+            "λ=∞ face proven, but the shipped fit has not reached it: remaining value gap \
+             {:.3e} > criterion resolution {:.3e}",
+            proof.value_gap, inputs.objective_tol
         )));
     }
     let rails: Vec<RailCoordinate> = limit
@@ -5890,7 +5843,6 @@ fn try_certify_zero_smoothing_face_analytically(
     obj: &mut dyn OuterObjective,
     inputs: &AsymptoteRailInputs<'_>,
     lower_face: &[usize],
-    estimand_tol: f64,
 ) -> Result<Result<(Vec<RailCoordinate>, ZeroSmoothingProof), String>, EstimationError> {
     let law = match obj.zero_smoothing_face(inputs.rho, lower_face)? {
         ZeroSmoothingFaceOutcome::Available(law) => *law,
@@ -5907,11 +5859,14 @@ fn try_certify_zero_smoothing_face_analytically(
         Ok(proof) => proof,
         Err(reason) => return Ok(Err(reason)),
     };
-    if !(proof.estimand_travel <= estimand_tol) {
+    // Same gate as the λ=∞ proof: the criterion value still available by
+    // running to the face, `V(ρ̂) − V(0) = Σ_j c′_j λ_j` on the exact
+    // first-order law, must be below what the data can resolve (#3565).
+    if !(proof.value_gap <= inputs.objective_tol) {
         return Ok(Err(format!(
-            "λ=0 face proven, but the shipped fit has not reached it: coefficient travel \
-             {:.3e} > estimand tolerance {estimand_tol:.3e}",
-            proof.estimand_travel
+            "λ=0 face proven, but the shipped fit has not reached it: remaining value gap \
+             {:.3e} > criterion resolution {:.3e}",
+            proof.value_gap, inputs.objective_tol
         )));
     }
     let rails: Vec<RailCoordinate> = law
@@ -6051,367 +6006,308 @@ pub(crate) fn certify_interior_stationarity(
     }
 }
 
-/// Relative drift band for a measured rail-tail window, wider than the exp4
-/// characterization band (1e-3). The window's evidentiary strength comes from
-/// the EXTRAPOLATED-GAP margin, not the band tightness: a 1–2% spread in `ĉ`
-/// across the clean run moves the extrapolated remaining gradient `ĉ·e^{∓ρ}`
-/// by the same 1–2%, immaterial against the orders-of-magnitude margin the
-/// rail decision demands — while the true tail on a REAL fixture still carries
-/// visible sub-percent curvature contamination at probe depth (measured on
-/// #2299: ĉ ∈ {6544, 6565, 6574} over three e-folds, drift 4.6e-3, against a
-/// wildly swinging noise region above).
-const RAIL_TAIL_DRIFT_REL: f64 = 1.0e-2;
-
-/// Reconstruct one railed coordinate's exponential tail by probing the analytic
-/// gradient back from the rail at coarse and, when needed, local resolution;
-/// locate the longest finite-difference-clean run (rejecting the noise floor
-/// adjacent to the rail); and assess it against the tail law (#2348 Inc 1 /
-/// #2337 Thm 2.1). Returns the certified [`RailCoordinate`] or `None` if no
-/// confirmable tail is found.
-fn build_and_assess_rail_coordinate(
-    obj: &mut dyn OuterObjective,
-    rho: &Array1<f64>,
-    coord: usize,
-    side: AsymptoteSide,
-    tol: &AsymptoteTolerances,
-    domain: (f64, f64),
-    native: usize,
-) -> Result<Result<RailCoordinate, String>, EstimationError> {
-    let window = match probe_tail_window(obj, rho, coord, side, tol, domain)? {
-        (Some(window), _) => window,
-        (None, rows) => {
-            return Ok(Err(format!(
-                "k={native}: no finite-difference-clean tail window; probes {rows}"
-            )));
-        }
-    };
-    match assess_coordinate(&window, tol) {
-        AsymptoteVerdict::CertifiedAtAsymptote {
-            side,
-            tail_constant,
-            value_gap,
-            estimand_travel_bound,
-        } => Ok(Ok(RailCoordinate {
-            index: coord,
-            side,
-            tail_constant,
-            value_gap,
-            estimand_travel_bound,
-            evidence: RailTailEvidence::ProbedTail {
-                noise_floor: tol.tail_noise_floor,
-                drift_band: tol.tail_drift_rel,
-            },
-        })),
-        other => Ok(Err(format!("k={native}: tail verdict {other:?}"))),
-    }
+/// One rail-tail probe: the railed coordinate's value, its analytic
+/// `∂V/∂ρ`, the rigorous rounding bound on that component at this probe, and
+/// the inner coefficients the evaluation settled at (#3565).
+struct RailProbe {
+    rho: f64,
+    grad: f64,
+    grad_band: f64,
+    beta: Option<Array1<f64>>,
 }
 
-/// Detect a WRONG-RAIL coordinate (#2392): one sitting AT its ρ box bound whose
-/// clean-band probes prove the objective strictly DECREASES as the coordinate
-/// moves INWARD — the outer search drove it to the wrong bound. Returns the
-/// interior ρ to reseed the coordinate at (the deepest drift-clean probe, where
-/// `|g|` is largest and the descent is most informative) when the proof holds,
-/// else `None`.
+/// The rail-tail probe ladder for a coordinate at `rho_k` on `side`'s rail:
+/// unit e-fold steps `ρ̂ ∓ j`, `j = 1, 2, …`, toward the interior.
 ///
-/// # Proof condition (evidence-gated; cannot launder a genuine λ→∞ / λ→0 optimum)
+/// The tail law is a statement about `e^{∓ρ}`, so the natural probe spacing is
+/// one e-fold: consecutive pencil-constant differences then contract by the
+/// next-order ratio `e^{−1}` on a clean tail, which is what
+/// [`settle_tail_constant`] resolves. The ladder stops at the midpoint of the
+/// coordinate's own box: past it the nearer rail is the OTHER one, so a probe
+/// there samples the opposite asymptote (or the interior optimum between
+/// them), not this rail's tail. Every probe is therefore strictly inside the
+/// box and at least one e-fold from the rail it steps away from: at (or
+/// within `1e-8` of) a recorded bound the ρ-gradient assembly freezes the axis
+/// to the #197 KKT projection, a literal `0.0` that is no evidence about the
+/// tail (#2388).
 ///
-/// Probe up to [`ASYMPTOTE_PROBE_COUNT`] e-folds inward and let the FIRST
-/// contiguous clean, drift-stable run of at least `MIN_TAIL_SAMPLES` decide
-/// the local rail:
-/// 1. above the gradient interior floor, `|g| > interior_grad_tol` (so a probe
-///    whose gradient has decayed into finite-difference cancellation next to the
-///    rail is excluded rather than read as a settled tail);
-/// 2. above the pencil-constant noise floor, `|ĉ| > tail_noise_floor`, where
-///    `ĉ = side.tail_constant(ρ, g)` uses the coordinate's ACTUAL rail side;
-/// 3. drift-band-clean in `ĉ` within `tail_drift_rel` (the same constant-pencil
-///    band the genuine tail uses — `run_drift_within_band` keys on `|mean|`, so a
-///    uniformly-negative run is judged on its magnitude).
-///
-/// A first clean run with `ĉ < 0` proves descent AWAY from the bound and returns
-/// its deepest point. A first clean run with `ĉ > 0` proves descent TOWARD the
-/// bound and refuses the pull-back immediately. Deciding on the first clean run
-/// is load-bearing: the question is the LOCAL orientation of the objective at
-/// this rail. Continuing another fifteen expensive objective evaluations after
-/// that proof could discover a remote sign reversal in the interior, but must
-/// not use it to relabel a locally genuine bound as a wrong rail.
-fn detect_wrong_rail_pullback(
-    obj: &mut dyn OuterObjective,
-    rho: &Array1<f64>,
-    coord: usize,
-    side: AsymptoteSide,
-    tol: &AsymptoteTolerances,
-    domain: (f64, f64),
-) -> Result<Option<f64>, EstimationError> {
-    const PROBE_DELTA: f64 = 1.0;
-    const PROBE_DOMAIN_MARGIN: f64 = 1.0e-6;
+/// `None` when the box is not finite or does not contain `rho_k`: there is no
+/// rail to probe back from.
+fn rail_probe_ladder(rho_k: f64, side: AsymptoteSide, domain: (f64, f64)) -> Option<Vec<f64>> {
+    let (lower, upper) = domain;
+    if !(lower.is_finite() && upper.is_finite() && (lower..=upper).contains(&rho_k)) {
+        return None;
+    }
+    let midpoint = 0.5 * (lower + upper);
     // Upper rail (ρ → +∞): step ρ DOWN into the interior. Lower rail: step UP.
     let sign = match side {
         AsymptoteSide::Upper => -1.0,
         AsymptoteSide::Lower => 1.0,
     };
-    // The closest finite-difference-clean constant-pencil run is the local rail
-    // evidence. Noise rows reset the run; a sign change starts a new candidate.
-    let mut run_sign = 0_i8;
-    let mut run_constants: Vec<f64> = Vec::with_capacity(MIN_TAIL_SAMPLES);
-    for j in 1..=ASYMPTOTE_PROBE_COUNT {
-        let stepped = rho[coord] + sign * (j as f64) * PROBE_DELTA;
-        if stepped <= domain.0 + PROBE_DOMAIN_MARGIN || stepped >= domain.1 - PROBE_DOMAIN_MARGIN {
-            break;
-        }
-        let mut probe = rho.clone();
-        probe[coord] = stepped;
-        let eval = match obj.eval_with_order(&probe, OuterEvalOrder::ValueAndGradient) {
-            Ok(eval) => eval,
-            Err(_) => break,
-        };
-        if !eval.cost.is_finite()
-            || coord >= eval.gradient.len()
-            || !eval.gradient[coord].is_finite()
-        {
-            break;
-        }
-        let gradient = eval.gradient[coord];
-        let constant = side.tail_constant(stepped, gradient);
-        let clean = constant.is_finite()
-            && constant.abs() > tol.tail_noise_floor
-            && gradient.abs() > tol.interior_grad_tol;
-        if !clean {
-            run_sign = 0;
-            run_constants.clear();
-            continue;
-        }
-        let constant_sign = if constant < 0.0 { -1 } else { 1 };
-        if constant_sign != run_sign {
-            run_sign = constant_sign;
-            run_constants.clear();
-        }
-        run_constants.push(constant);
-        if run_constants.len() > MIN_TAIL_SAMPLES {
-            run_constants.remove(0);
-        }
-        if run_constants.len() >= MIN_TAIL_SAMPLES
-            && run_drift_within_band(&run_constants, tol.tail_drift_rel)
-        {
-            return if run_sign < 0 {
-                Ok(Some(stepped))
-            } else {
-                Ok(None)
-            };
-        }
-    }
-    Ok(None)
+    Some(
+        (1_u32..)
+            .map(|j| rho_k + sign * f64::from(j))
+            .take_while(|&stepped| {
+                lower < stepped
+                    && stepped < upper
+                    && match side {
+                        AsymptoteSide::Upper => stepped > midpoint,
+                        AsymptoteSide::Lower => stepped < midpoint,
+                    }
+            })
+            .collect(),
+    )
 }
 
-/// Probe one coordinate's tail toward the interior (the shared probing engine
-/// of [`build_and_assess_rail_coordinate`]).
-/// The one-e-fold ladder runs first; if it finds no clean run, a short
-/// half-e-fold ladder resolves a narrower local band without mixing step sizes
-/// in one estimand window. Returns the longest finite-difference-clean
-/// constant-`ĉ` run (newest sample nearest `rho[coord]`), or `None` when neither
-/// resolution contains at least `MIN_TAIL_SAMPLES` clean rows. The second
-/// element dumps `(ρ, ∂V/∂ρ, ĉ)` evidence for every attempted resolution.
-fn probe_tail_window(
+/// Evaluate the criterion with `rho[coord]` moved to `stepped` and read the
+/// coordinate's gradient together with its Theorem 9 rounding bound `ε`
+/// ([`outer_coordinate_bands`]) from the parts the evaluation itself
+/// published. A coordinate the evaluation published no parts for is held to
+/// the caller's absolute `tolerance`, the convention every other band reader
+/// uses. `None` when the evaluation fails or yields a non-finite value or
+/// component: a failed probe is not evidence for or against a tail.
+fn probe_rail_gradient(
     obj: &mut dyn OuterObjective,
     rho: &Array1<f64>,
     coord: usize,
-    side: AsymptoteSide,
-    tol: &AsymptoteTolerances,
-    domain: (f64, f64),
-) -> Result<(Option<AsymptoteWindow>, String), EstimationError> {
-    let (coarse_window, coarse_rows) = probe_tail_window_at_resolution(
-        obj,
-        rho,
-        coord,
-        side,
-        tol,
-        domain,
-        (1.0, ASYMPTOTE_PROBE_COUNT),
-    )?;
-    if coarse_window.is_some() {
-        return Ok((coarse_window, coarse_rows));
+    stepped: f64,
+    config: &OuterConfig,
+) -> Option<RailProbe> {
+    let mut probe = rho.clone();
+    probe[coord] = stepped;
+    let (eval, evidence) = super::bridges::evaluate_with_certificate_evidence(true, || {
+        obj.eval_with_order(&probe, OuterEvalOrder::ValueAndGradient)
+    });
+    let eval = eval.ok()?;
+    if !eval.cost.is_finite() || coord >= eval.gradient.len() || !eval.gradient[coord].is_finite() {
+        return None;
     }
-
-    // The coarse ladder is deliberately retained as the first pass: railed
-    // dense REML fits can have several e-folds of cancellation noise beside
-    // the box followed by a clean band far inside it. The local pass addresses
-    // the complementary geometry exposed by #2358, where a modest finite box
-    // contains a narrow but regular tail and unit steps skip over it.
-    let (local_window, local_rows) = probe_tail_window_at_resolution(
-        obj,
-        rho,
-        coord,
-        side,
-        tol,
-        domain,
-        (
-            ASYMPTOTE_LOCAL_PROBE_DELTA,
-            ASYMPTOTE_LOCAL_PROBE_COUNT,
-        ),
-    )?;
-    Ok((
-        local_window,
-        format!("coarse[{coarse_rows}] local[{local_rows}]"),
-    ))
+    let grad_band = outer_coordinate_bands(config, eval.gradient.len(), &evidence)
+        .and_then(|bands| bands.get(coord).copied().flatten())
+        .map_or(config.tolerance, |band| band.epsilon);
+    Some(RailProbe {
+        rho: stepped,
+        grad: eval.gradient[coord],
+        grad_band,
+        beta: eval.inner_beta_hint,
+    })
 }
 
-/// Probe a single equally-spaced resolution of one coordinate's tail.
-///
-/// Keeping each returned window at one resolution is essential for
-/// `assess_coordinate`: its coefficient-travel bound estimates a geometric
-/// ratio from consecutive steps, which is only meaningful when their `Δρ`
-/// values are identical.
-fn probe_tail_window_at_resolution(
-    obj: &mut dyn OuterObjective,
-    rho: &Array1<f64>,
-    coord: usize,
-    side: AsymptoteSide,
-    tol: &AsymptoteTolerances,
-    domain: (f64, f64),
-    resolution: (f64, usize),
-) -> Result<(Option<AsymptoteWindow>, String), EstimationError> {
-    let (probe_delta, probe_count) = resolution;
-    // Strictly-inside guard for probes against the probed coordinate's own box
-    // interval (#2388). The ρ-gradient assembly freezes any coordinate at (or
-    // within 1e-8 of) its recorded upper bound to the #197 KKT projection — a
-    // literal 0.0 — so a probe at or past a box bound samples the frozen-axis
-    // convention, not the criterion's tail: a fabricated hard-zero tail that
-    // the drift band can never confirm. Out-of-box points are outside the
-    // λ-selection domain altogether; they are not evidence for or against a
-    // tail, so the ladder stops at the last strictly-in-domain probe.
-    const PROBE_DOMAIN_MARGIN: f64 = 1.0e-6;
-    // Upper rail (ρ → +∞): step ρ DOWN into the tail. Lower rail: step UP.
-    let sign = match side {
-        AsymptoteSide::Upper => -1.0,
-        AsymptoteSide::Lower => 1.0,
-    };
-    // rows[r] corresponds to probe j=r+1: r=0 is the point CLOSEST to the rail,
-    // increasing r steps further into the interior (larger |grad|).
-    let mut rows: Vec<(f64, f64, Option<Array1<f64>>)> = Vec::new();
-    for j in 1..=probe_count {
-        let stepped = rho[coord] + sign * (j as f64) * probe_delta;
-        if stepped <= domain.0 + PROBE_DOMAIN_MARGIN || stepped >= domain.1 - PROBE_DOMAIN_MARGIN {
-            break;
-        }
-        let mut probe = rho.clone();
-        probe[coord] = stepped;
-        let eval = match obj.eval_with_order(&probe, OuterEvalOrder::ValueAndGradient) {
-            Ok(eval) => eval,
-            // A failed probe is not evidence against a tail; stop probing and
-            // assess whatever clean run the earlier probes established.
-            Err(_) => break,
-        };
-        if !eval.cost.is_finite()
-            || coord >= eval.gradient.len()
-            || !eval.gradient[coord].is_finite()
-        {
-            break;
-        }
-        rows.push((probe[coord], eval.gradient[coord], eval.inner_beta_hint));
-    }
-    let rows_summary = rows
-        .iter()
-        .map(|(r, g, _)| {
-            format!(
-                "(ρ={r:.2}, g={g:.3e}, ĉ={:.3e})",
-                side.tail_constant(*r, *g)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    if rows.len() < MIN_TAIL_SAMPLES {
-        return Ok((None, rows_summary));
-    }
-
-    // Per-row pencil constant ĉ and the element-clean predicate: ĉ above the
-    // noise floor AND the gradient above the interior floor (so a row adjacent to
-    // the rail, whose gradient has decayed into finite-difference cancellation, is
-    // excluded rather than mistaken for a settled tail).
-    let constants: Vec<f64> = rows
-        .iter()
-        .map(|(r, g, _)| side.tail_constant(*r, *g))
-        .collect();
-    let element_clean: Vec<bool> = rows
-        .iter()
-        .zip(&constants)
-        .map(|((_, g, _), c)| {
-            c.is_finite() && *c > tol.tail_noise_floor && g.abs() > tol.interior_grad_tol
-        })
-        .collect();
-
-    // Longest contiguous run that is element-clean AND holds ĉ within the drift
-    // band; ties broken toward the rail (smallest start) for the most settled
-    // estimand.
-    let mut best: Option<(usize, usize)> = None;
-    for a in 0..rows.len() {
-        if !element_clean[a] {
-            continue;
-        }
-        for b in a..rows.len() {
-            if !element_clean[b] {
-                break;
-            }
-            if b - a + 1 < MIN_TAIL_SAMPLES {
-                continue;
-            }
-            if !run_drift_within_band(&constants[a..=b], tol.tail_drift_rel) {
-                continue;
-            }
-            let len = b - a + 1;
-            match best {
-                Some((ba, bb)) if bb - ba + 1 >= len => {}
-                _ => best = Some((a, b)),
-            }
-        }
-    }
-    let (a, b) = match best {
-        Some(run) => run,
-        None => return Ok((None, rows_summary)),
-    };
-
-    // Build the window oldest → newest: newest (window `latest`) is the row
-    // CLOSEST to the rail (r=a). A sample's coefficient move is ‖β(r) − β(r+1)‖,
-    // the step from the next-farther retained row toward the rail.
-    let mut window = AsymptoteWindow::with_capacity(b - a + 1);
-    for r in (a..=b).rev() {
-        let (rho_r, grad_r, beta_r) = &rows[r];
-        let coef_step_norm = match (beta_r, rows.get(r + 1).map(|row| &row.2)) {
-            (Some(cur), Some(Some(farther))) if cur.len() == farther.len() => {
-                (cur - farther).iter().map(|v| v * v).sum::<f64>().sqrt()
+/// The asymptote window of consecutive probes, given in ladder order (nearest
+/// the rail first). The window runs from the interior toward the rail, so the
+/// deepest probe is pushed first and the rail-most one is its latest sample.
+/// Each sample's coefficient move is the step into it from the next-deeper
+/// probe; the deepest has no predecessor in the run and records none.
+fn rail_tail_window(run: &[RailProbe]) -> AsymptoteWindow {
+    let mut window = AsymptoteWindow::with_capacity(run.len());
+    let mut deeper: Option<&RailProbe> = None;
+    for probe in run.iter().rev() {
+        let coef_step_norm = match (probe.beta.as_ref(), deeper.and_then(|d| d.beta.as_ref())) {
+            (Some(here), Some(before)) if here.len() == before.len() => {
+                (here - before).iter().map(|v| v * v).sum::<f64>().sqrt()
             }
             _ => 0.0,
         };
         window.push(AsymptoteSample {
-            rho: *rho_r,
-            grad: *grad_r,
+            rho: probe.rho,
+            grad: probe.grad,
+            grad_band: probe.grad_band,
             coef_step_norm,
         });
+        deeper = Some(probe);
     }
-
-    Ok((Some(window), rows_summary))
+    window
 }
 
-/// Whether a run of pencil constants holds constant within the relative drift
-/// band `(max − min)/|mean| ≤ band` (deterministic, ordered).
-fn run_drift_within_band(constants: &[f64], band: f64) -> bool {
-    if constants.len() < MIN_TAIL_SAMPLES {
-        return false;
-    }
-    let mut sum = 0.0_f64;
-    let mut lo = f64::INFINITY;
-    let mut hi = f64::NEG_INFINITY;
-    for &c in constants {
-        if !c.is_finite() {
-            return false;
+/// `(ρ, ∂V/∂ρ, ε, ĉ)` for every probe, for decline messages.
+fn rail_probe_rows(side: AsymptoteSide, probes: &[RailProbe]) -> String {
+    probes
+        .iter()
+        .map(|p| {
+            format!(
+                "(ρ={:.2}, g={:.3e}, ε={:.1e}, ĉ={:.3e})",
+                p.rho,
+                p.grad,
+                p.grad_band,
+                side.tail_constant(p.rho, p.grad)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Reconstruct one railed coordinate's exponential tail by probing the
+/// analytic gradient back from the rail one e-fold at a time
+/// ([`rail_probe_ladder`]) and assess it against the tail law (#2348 Inc 1 /
+/// #2337 Thm 2.1, #3565).
+///
+/// Every judgement is made in the probe's own resolution. A probe whose
+/// gradient is inside its rounding band `ε` carries no sign and breaks the
+/// run (the cancellation floor beside the rail); a resolved probe whose pencil
+/// constant is not positive proves the criterion does not keep improving
+/// toward this rail, so no single tail joins the shipped point to it. The
+/// first three consecutive resolved probes whose pencil constants settle
+/// ([`assess_coordinate`]) decide: their value gap to the rail from `ρ̂` is
+/// judged against the criterion's resolution `value_gap_tol`. A settled tail
+/// that still leaves more than that on the table declines; a window that does
+/// not settle slides one probe deeper. Declines name the native coordinate
+/// ([`native_coordinate`], #2817).
+fn build_and_assess_rail_coordinate(
+    obj: &mut dyn OuterObjective,
+    rho: &Array1<f64>,
+    coord: usize,
+    side: AsymptoteSide,
+    config: &OuterConfig,
+    value_gap_tol: f64,
+    domain: (f64, f64),
+) -> Result<Result<RailCoordinate, String>, EstimationError> {
+    let native = native_coordinate(config.native_coordinate_order.as_deref(), coord);
+    let Some(ladder) = rail_probe_ladder(rho[coord], side, domain) else {
+        return Ok(Err(format!(
+            "k={native}: no finite box around ρ={:.3} to probe its {side:?} rail from",
+            rho[coord]
+        )));
+    };
+    let mut probes: Vec<RailProbe> = Vec::with_capacity(ladder.len());
+    let mut run_start = 0_usize;
+    let mut last_reason = "no probe resolved above its rounding band".to_string();
+    for stepped in ladder {
+        let Some(probe) = probe_rail_gradient(obj, rho, coord, stepped, config) else {
+            last_reason = format!("probe at ρ={stepped:.2} failed to evaluate");
+            break;
+        };
+        let resolved = probe.grad.abs() > probe.grad_band;
+        let constant = side.tail_constant(probe.rho, probe.grad);
+        probes.push(probe);
+        if !resolved {
+            run_start = probes.len();
+            continue;
         }
-        sum += c;
-        lo = lo.min(c);
-        hi = hi.max(c);
+        if !(constant > 0.0) {
+            return Ok(Err(format!(
+                "k={native}: the resolved gradient at ρ={stepped:.2} points away from the \
+                 {side:?} rail (ĉ={constant:.3e}); no single tail joins the shipped point to \
+                 the rail; probes {}",
+                rail_probe_rows(side, &probes)
+            )));
+        }
+        if probes.len() - run_start < MIN_TAIL_SAMPLES {
+            continue;
+        }
+        let window = rail_tail_window(&probes[probes.len() - MIN_TAIL_SAMPLES..]);
+        match assess_coordinate(&window, side, rho[coord], value_gap_tol) {
+            AsymptoteVerdict::CertifiedAtAsymptote {
+                side,
+                tail_constant,
+                extrapolation_radius,
+                gradient_band,
+                value_gap,
+                estimand_travel_bound,
+            } => {
+                return Ok(Ok(RailCoordinate {
+                    index: coord,
+                    side,
+                    tail_constant,
+                    value_gap,
+                    estimand_travel_bound,
+                    evidence: RailTailEvidence::ProbedTail {
+                        gradient_band,
+                        extrapolation_radius,
+                    },
+                }));
+            }
+            AsymptoteVerdict::OnTailNotYetEquivalent {
+                side,
+                tail_constant,
+                extrapolation_radius,
+                value_gap,
+                value_gap_tol,
+            } => {
+                return Ok(Err(format!(
+                    "k={native}: settled {side:?} tail ĉ={tail_constant:.3e} ± \
+                     {extrapolation_radius:.3e} still leaves a value gap {value_gap:.3e} > \
+                     criterion resolution {value_gap_tol:.3e}; probes {}",
+                    rail_probe_rows(side, &probes)
+                )));
+            }
+            AsymptoteVerdict::NoAsymptote { reason } => last_reason = reason,
+        }
     }
-    let mean = sum / constants.len() as f64;
-    if !(mean.abs() > 0.0) {
-        return false;
+    Ok(Err(format!(
+        "k={native}: no settled tail window ({last_reason}); probes {}",
+        rail_probe_rows(side, &probes)
+    )))
+}
+
+/// Detect a WRONG-RAIL coordinate (#2392): one sitting AT its ρ box bound whose
+/// probes prove the objective strictly DECREASES as the coordinate moves
+/// INWARD — the outer search drove it to the wrong bound. Returns the interior
+/// ρ to reseed the coordinate at (the deepest probe of the deciding run, where
+/// `|g|` is largest and the descent is most informative) when the proof holds,
+/// else `None`.
+///
+/// # Proof condition (evidence-gated; cannot launder a genuine λ→∞ / λ→0 optimum)
+///
+/// Probe the same unit-e-fold ladder as the tail certificate
+/// ([`rail_probe_ladder`]) and let the FIRST run of `MIN_TAIL_SAMPLES`
+/// consecutive probes that settles decide the local rail:
+/// 1. every probe's gradient is resolved above its own rounding bound,
+///    `|g| > ε` (a probe inside its band carries no sign and breaks the run);
+/// 2. the pencil constants `ĉ = side.tail_constant(ρ, g)`, on the coordinate's
+///    ACTUAL rail side, share one sign (a sign change starts a new run);
+/// 3. their magnitudes settle to a single tail ([`settle_tail_constant`]) whose
+///    whole interval `|ĉ| ± R` excludes zero.
+///
+/// A first settled run with `ĉ < 0` proves descent AWAY from the bound and
+/// returns its deepest point. A first settled run with `ĉ > 0` proves descent
+/// TOWARD the bound and refuses the pull-back immediately. Deciding on the
+/// first settled run is load-bearing: the question is the LOCAL orientation of
+/// the objective at this rail. Probing further could discover a remote sign
+/// reversal in the interior, but must not use it to relabel a locally genuine
+/// bound as a wrong rail.
+fn detect_wrong_rail_pullback(
+    obj: &mut dyn OuterObjective,
+    rho: &Array1<f64>,
+    coord: usize,
+    side: AsymptoteSide,
+    config: &OuterConfig,
+    domain: (f64, f64),
+) -> Result<Option<f64>, EstimationError> {
+    let Some(ladder) = rail_probe_ladder(rho[coord], side, domain) else {
+        return Ok(None);
+    };
+    // (ĉ, band of ĉ) for the current run, in ladder order (rail-most first).
+    let mut run: Vec<(f64, f64)> = Vec::with_capacity(MIN_TAIL_SAMPLES);
+    for stepped in ladder {
+        let Some(probe) = probe_rail_gradient(obj, rho, coord, stepped, config) else {
+            break;
+        };
+        if !(probe.grad.abs() > probe.grad_band) {
+            run.clear();
+            continue;
+        }
+        let constant = side.tail_constant(probe.rho, probe.grad);
+        let band = side.tail_constant(probe.rho, probe.grad_band).abs();
+        if run.last().is_some_and(|&(previous, _)| (previous < 0.0) != (constant < 0.0)) {
+            run.clear();
+        }
+        run.push((constant, band));
+        if run.len() > MIN_TAIL_SAMPLES {
+            run.remove(0);
+        }
+        if run.len() < MIN_TAIL_SAMPLES {
+            continue;
+        }
+        // Interior → rail, the order the settlement reads.
+        let magnitudes: Vec<f64> = run.iter().rev().map(|&(c, _)| c.abs()).collect();
+        let bands: Vec<f64> = run.iter().rev().map(|&(_, b)| b).collect();
+        if let Ok(settled) = settle_tail_constant(&magnitudes, &bands)
+            && settled.limit - settled.radius > 0.0
+        {
+            return Ok((constant < 0.0).then_some(stepped));
+        }
     }
-    (hi - lo) / mean.abs() <= band
+    Ok(None)
 }
 
 /// Why the operator trust-region outer loop stopped.

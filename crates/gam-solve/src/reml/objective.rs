@@ -774,6 +774,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn build_sparse_derivative_context(
         &self,
         pirls_result: &PirlsResult,
+        bundle: &EvalShared,
     ) -> Result<DerivativeContext, EstimationError> {
         use super::reml_outer_engine::{
             DispersionHandling, FirthAwareGlmDerivatives, GaussianDerivatives,
@@ -785,20 +786,24 @@ impl<'a> RemlState<'a> {
         // Sparse exact still uses the same dense Jeffreys operator; only the
         // H^{-1} applications move to the sparse Cholesky operator.
         let firth_op = if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
-            let x_dense = self
-                .x()
-                .try_to_dense_arc(
-                    "sparse exact REML runtime requires dense design for Firth operator",
-                )
-                .map_err(EstimationError::InvalidInput)?;
-            Some(std::sync::Arc::new(
-                Self::build_firth_dense_operator_for_link(
-                    &jeffreys_link,
-                    x_dense.as_ref(),
-                    &pirls_result.final_eta.to_owned(),
-                    self.weights,
-                )?,
-            ))
+            if let Some(cached) = bundle.firth_dense_operator_original.clone() {
+                Some(cached)
+            } else {
+                let x_dense = self
+                    .x()
+                    .try_to_dense_arc(
+                        "sparse exact REML runtime requires dense design for Firth operator",
+                    )
+                    .map_err(EstimationError::InvalidInput)?;
+                Some(std::sync::Arc::new(
+                    Self::build_firth_dense_operator_for_link(
+                        &jeffreys_link,
+                        x_dense.as_ref(),
+                        &pirls_result.final_eta.to_owned(),
+                        self.weights,
+                    )?,
+                ))
+            }
         } else {
             None
         };
@@ -1540,7 +1545,7 @@ impl<'a> RemlState<'a> {
             second: det2,
         };
 
-        let ctx = self.build_sparse_derivative_context(pirls_result)?;
+        let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
         // Sparse-exact `log|H|` is the ordinary Cholesky log determinant of
         //
         //     H(ρ) = X'W(ρ)X + S_λ(ρ),
@@ -1563,7 +1568,8 @@ impl<'a> RemlState<'a> {
         let inner_kkt_residual = if presented {
             self.inner_kkt_residual_original_basis(
                 pirls_result,
-                bundle.firth_dense_operator.is_some(),
+                bundle.firth_dense_operator.is_some()
+                    || bundle.firth_dense_operator_original.is_some(),
             )
         } else {
             None
@@ -1693,7 +1699,13 @@ impl<'a> RemlState<'a> {
 
         // Match the transformed assembly's structural-rank Firth operator.
         // A strong penalty changes curvature, never coefficient identifiability.
-        let structural_rank = if let Some(firth) = bundle.firth_dense_operator.as_ref() {
+        let structural_rank = if let Some(firth) = bundle.firth_dense_operator_original.as_ref() {
+            let root_original = pirls_result
+                .reparam_result
+                .e_transformed
+                .dot(&pirls_result.reparam_result.qs.t());
+            Some(firth_penalized_structural_rank(&firth.q_basis, &root_original)?)
+        } else if let Some(firth) = bundle.firth_dense_operator.as_ref() {
             let qs = &pirls_result.reparam_result.qs;
             let root_original = pirls_result.reparam_result.e_transformed.dot(&qs.t());
             Some(firth_penalized_structural_rank(&qs.dot(&firth.q_basis), &root_original)?)
@@ -1929,7 +1941,7 @@ impl<'a> RemlState<'a> {
             );
         }
 
-        let ctx = self.build_sparse_derivative_context(pirls_result)?;
+        let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
         // Original-basis envelope residual: `β` and `H` here are rotated into
         // the original basis, and `build_dense_original_assembly` is only ever
         // reached on the unconstrained QS frame, so the transformed residual
@@ -1939,7 +1951,8 @@ impl<'a> RemlState<'a> {
         let inner_kkt_residual = if presented {
             self.inner_kkt_residual_original_basis(
                 pirls_result,
-                bundle.firth_dense_operator.is_some(),
+                bundle.firth_dense_operator.is_some()
+                    || bundle.firth_dense_operator_original.is_some(),
             )
         } else {
             None

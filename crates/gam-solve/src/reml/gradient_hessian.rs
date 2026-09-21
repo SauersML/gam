@@ -6735,6 +6735,7 @@ impl<'a> RemlState<'a> {
             h_total: Arc::new(h_total),
             sparse_exact: None,
             firth_dense_operator,
+            firth_dense_operator_original: None,
             penalty_pseudologdet: std::sync::OnceLock::new(),
             root_scale_hessian_operator: std::sync::OnceLock::new(),
             criterion_rank_decision: Arc::new(std::sync::OnceLock::new()),
@@ -6833,6 +6834,25 @@ impl<'a> RemlState<'a> {
         let logdet_s_pos = penalty_logdet.value();
         let (det1_values, _) =
             penalty_logdet.rho_derivatives_from_penalties(&applied_penalties, lambdas_slice);
+        // Built at every problem scale, for the same reason as the dense bundle:
+        // the inner solve carries Φ whenever Firth is requested (#825, #2900).
+        let firth_dense_operator_original = if let Some(jeffreys_link) =
+            reml_robust_jeffreys_link(&self.config)
+        {
+            let x_dense = self
+                .x()
+                .try_to_dense_arc("sparse exact REML runtime requires dense design for Firth operator")
+                .map_err(EstimationError::InvalidInput)?;
+            Some(Arc::new(Self::build_firth_dense_operator_for_link(
+                &jeffreys_link,
+                x_dense.as_ref(),
+                &pirls_result.final_eta.to_owned(),
+                self.weights,
+            )?))
+        } else {
+            None
+        };
+
         Ok(Some(EvalShared {
             key,
             pirls_result,
@@ -6858,6 +6878,7 @@ impl<'a> RemlState<'a> {
                 }
             })),
             firth_dense_operator: None,
+            firth_dense_operator_original,
             penalty_pseudologdet: std::sync::OnceLock::new(),
             root_scale_hessian_operator: std::sync::OnceLock::new(),
             criterion_rank_decision: Arc::new(std::sync::OnceLock::new()),

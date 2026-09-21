@@ -3,6 +3,44 @@ use crate::rho_optimizer::rail_face::RailFaceLimit;
 use crate::rho_optimizer::zero_smoothing_face::{ZeroSmoothingFace, ZeroSmoothingFaceOutcome};
 use ndarray::array;
 
+/// The problem size every fixture below declares: `n = 100` observations and
+/// `p = 5` coefficients. It fixes the criterion's statistical resolution
+/// `1/(2n) = 5e-3` ([`outer_criterion_resolution`]) and the formation count
+/// `m = n + p²` the probes' rounding bands are charged at
+/// ([`outer_coordinate_bands`]).
+fn test_config() -> OuterConfig {
+    OuterConfig {
+        problem_size: OuterProblemSize {
+            n_obs: Some(100),
+            p_coefficients: Some(5),
+        },
+        ..OuterConfig::default()
+    }
+}
+
+/// Publish coordinate 0's gradient parts the way the REML assembly does beside
+/// a rail: the component `g` is the small difference of an `O(scale)` penalty
+/// channel and an `O(scale)` log-determinant channel, so its rounding bound is
+/// set by `scale`, not by `|g|`. The `e^{±ρ}` amplification of that bound in
+/// the pencil constant is what makes the probes nearest a rail unresolved.
+fn publish_cancelling_parts(rho: f64, g: f64, scale: f64) {
+    crate::estimate::outer_eval_capture::record_certificate_parts(&[
+        crate::estimate::outer_eval_capture::RhoGradientParts {
+            index: 0,
+            lambda: rho.exp(),
+            block_quadratic: 0.0,
+            rank: 1,
+            dim: 1,
+            fixed_beta: 0.5 * scale,
+            logdet_h: g - 0.5 * scale,
+            frozen_logdet_h: 0.0,
+            mode_response_logdet_h: 0.0,
+            logdet_s: 0.0,
+            total: g,
+        },
+    ]);
+}
+
 /// A proven λ=∞ face certifies on the proof alone, whatever the depth of the
 /// shipped rail.
 ///
@@ -13,7 +51,9 @@ use ndarray::array;
 /// anyway: its "ideal" pull-back `½(ln(tol/gap) + ρ̂) = 0.14` e-folds fell
 /// under its one-e-fold floor ("no room inside the box to falsify the face
 /// law"), and the rail went to the finite-difference tail ladder. The proof
-/// must mint without spending a criterion evaluation.
+/// must mint without spending a criterion evaluation: the value still
+/// available on the face, `2e^{−12} ≈ 1.2e−5`, is far below the criterion's
+/// resolution `1/(2n) = 5e−3`.
 #[test]
 fn proven_face_certifies_a_shallow_rail_without_a_value_probe() {
     let rho_hat = 12.0_f64;
@@ -58,6 +98,7 @@ fn proven_face_certifies_a_shallow_rail_without_a_value_probe() {
     let gradient = array![0.0];
     let hessian = array![[2.0 * (-rho_hat).exp()]];
     let bounds = (array![-30.0], array![30.0]);
+    let config = test_config();
     let inputs = AsymptoteRailInputs {
         rho: &rho,
         projected_gradient: &gradient,
@@ -65,11 +106,10 @@ fn proven_face_certifies_a_shallow_rail_without_a_value_probe() {
         layout: OuterThetaLayout::new(1, 0),
         hessian: &hessian,
         bounds: &bounds,
-        terminal_beta: None,
         stationarity_bound: StationarityBound::from_ladder(1.0e-6, StationarityBoundSource::SolverBand),
-        objective_tol: 1.0e-10,
+        objective_tol: outer_criterion_resolution(&config),
         context: "proven face on a shallow rail",
-        native_coordinate_order: None,
+        config: &config,
     };
 
     let (_, _, rails) = try_certify_asymptote_rail(&mut obj, &inputs)
@@ -155,6 +195,7 @@ fn lower_rail_inputs<'a>(
     gradient: &'a Array1<f64>,
     hessian: &'a Array2<f64>,
     bounds: &'a (Array1<f64>, Array1<f64>),
+    config: &'a OuterConfig,
 ) -> AsymptoteRailInputs<'a> {
     AsymptoteRailInputs {
         rho,
@@ -163,11 +204,10 @@ fn lower_rail_inputs<'a>(
         layout: OuterThetaLayout::new(1, 0),
         hessian,
         bounds,
-        terminal_beta: None,
         stationarity_bound: StationarityBound::from_ladder(1.0e-6, StationarityBoundSource::SolverBand),
-        objective_tol: 1.0e-10,
+        objective_tol: outer_criterion_resolution(config),
         context: "zero-smoothing rail",
-        native_coordinate_order: None,
+        config,
     }
 }
 
@@ -198,7 +238,8 @@ fn proven_zero_smoothing_face_certifies_a_lower_rail_without_probing() {
     let gradient = array![0.0];
     let hessian = array![[slope * rho_hat.exp()]];
     let bounds = (array![-30.0], array![30.0]);
-    let inputs = lower_rail_inputs(&rho, &gradient, &hessian, &bounds);
+    let config = test_config();
+    let inputs = lower_rail_inputs(&rho, &gradient, &hessian, &bounds, &config);
 
     let (_, _, rails) = try_certify_asymptote_rail(&mut obj, &inputs)
         .expect("certification must not error")
@@ -242,7 +283,8 @@ fn zero_smoothing_rail_without_a_law_is_refused_without_probing() {
     let gradient = array![0.0];
     let hessian = array![[3.0 * rho_hat.exp()]];
     let bounds = (array![-30.0], array![30.0]);
-    let inputs = lower_rail_inputs(&rho, &gradient, &hessian, &bounds);
+    let config = test_config();
+    let inputs = lower_rail_inputs(&rho, &gradient, &hessian, &bounds, &config);
 
     let refusal = try_certify_asymptote_rail(&mut obj, &inputs)
         .expect("certification must not error")
@@ -258,26 +300,44 @@ fn zero_smoothing_rail_without_a_law_is_refused_without_probing() {
     );
 }
 
-/// Build a one-coordinate UPPER-rail tail-law objective: at ρ its gradient is
-/// `−c·e^{−ρ}` (so `ĉ = −e^{ρ}·grad = c` is constant) and its published inner
-/// β is `a·e^{−ρ}` (so consecutive-probe `‖Δβ‖` contracts geometrically).
-/// `drift_amp` ramps `ĉ` with ρ to model the finite-difference noise regime
-/// (a non-constant pencil constant that no drift band can confirm).
-fn upper_tail_objective(c: f64, a: f64, drift_amp: f64) -> impl OuterObjective {
+/// Evaluation counter shared between a fixture's gradient closure and the test.
+fn eval_counter() -> (
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let in_eval = std::sync::Arc::clone(&count);
+    (count, in_eval)
+}
+
+/// Build a one-coordinate UPPER-rail tail-law objective at criterion scale
+/// `scale`: at ρ its gradient is `−scale·c_eff(ρ)·e^{−ρ}` with
+/// `c_eff = c + drift_amp·ρ` (so `ĉ = −e^{ρ}·grad = scale·c_eff`), its value
+/// carries the additive constant `offset`, and its published inner β is
+/// `a·e^{−ρ}` (so consecutive-probe `‖Δβ‖` contracts by `e^{−1}`).
+/// `drift_amp ≠ 0` models a pencil constant that keeps moving by the same
+/// amount every e-fold: no tail law, so nothing may settle.
+fn upper_tail_objective(
+    c: f64,
+    a: f64,
+    drift_amp: f64,
+    scale: f64,
+    offset: f64,
+    evaluations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> impl OuterObjective {
     let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
+    let value = move |r: f64| offset + scale * ((c + drift_amp * r) * (-r).exp()).abs();
     problem.build_objective(
         (),
+        move |_: &mut (), rho: &Array1<f64>| Ok(value(rho[0])),
         move |_: &mut (), rho: &Array1<f64>| {
+            evaluations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let r = rho[0];
-            let c_eff = c + drift_amp * r;
-            Ok((c_eff * (-r).exp()).abs())
-        },
-        move |_: &mut (), rho: &Array1<f64>| {
-            let r = rho[0];
-            let c_eff = c + drift_amp * r;
+            let g = -scale * (c + drift_amp * r) * (-r).exp();
+            publish_cancelling_parts(r, g, scale);
             Ok(OuterEval {
-                cost: (c_eff * (-r).exp()).abs(),
-                gradient: array![-c_eff * (-r).exp()],
+                cost: value(r),
+                gradient: array![g],
                 hessian: HessianValue::Unavailable,
                 inner_beta_hint: Some(array![a * (-r).exp()]),
             })
@@ -287,21 +347,24 @@ fn upper_tail_objective(c: f64, a: f64, drift_amp: f64) -> impl OuterObjective {
     )
 }
 
-/// An exact upper-rail exponential tail is certified: the reconstructed
-/// pencil constant is `c`, and the value-gap / estimand-travel are finite.
+/// An exact upper-rail exponential tail is certified from the first three
+/// probes: every pencil constant is `c` to rounding, so the settlement radius
+/// is the derived rounding band of the constants (`e^{ρ}·ε`, `≈ 0.05` at one
+/// e-fold from the rail) and the certificate carries it as its evidence.
 #[test]
 fn asymptote_rail_mints_on_exact_tail_law() {
-    let mut obj = upper_tail_objective(6723.0, 1.0, 0.0);
+    let config = test_config();
+    let (count, in_eval) = eval_counter();
+    let mut obj = upper_tail_objective(6723.0, 1.0, 0.0, 1.0, 0.0, in_eval);
     let rho = array![29.9];
-    let tol = AsymptoteTolerances::exp4_rail_bands(1.0e-2);
     let rail = build_and_assess_rail_coordinate(
         &mut obj,
         &rho,
         0,
         AsymptoteSide::Upper,
-        &tol,
-        (f64::NEG_INFINITY, f64::INFINITY),
-        0,
+        &config,
+        outer_criterion_resolution(&config),
+        (-30.0, 30.0),
     )
     .expect("probing the tail-law objective must not error")
     .expect("an exact exponential tail must certify a rail");
@@ -312,47 +375,84 @@ fn asymptote_rail_mints_on_exact_tail_law() {
         "recovered ĉ={} should equal c=6723",
         rail.tail_constant,
     );
+    let RailTailEvidence::ProbedTail {
+        gradient_band,
+        extrapolation_radius,
+    } = rail.evidence
+    else {
+        panic!("a measured tail must carry probed evidence: {:?}", rail.evidence);
+    };
+    assert!(gradient_band > 0.0 && gradient_band.is_finite());
+    assert!(
+        (rail.tail_constant - 6723.0).abs() <= extrapolation_radius,
+        "the settlement radius {extrapolation_radius} must cover the true constant"
+    );
+    assert!(
+        extrapolation_radius < 1.0,
+        "on an exact tail the radius is the constants' rounding band alone, got \
+         {extrapolation_radius}"
+    );
+    assert!(rail.evidence.admits(rail.tail_constant));
     assert!(rail.value_gap.is_finite() && rail.value_gap >= 0.0);
+    assert!(rail.value_gap <= outer_criterion_resolution(&config));
     assert!(rail.estimand_travel_bound.is_finite() && rail.estimand_travel_bound >= 0.0);
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "three resolved probes that settle are a complete certificate"
+    );
 }
 
-/// A drifting pencil constant (finite-difference noise regime) never
-/// certifies: no finite-difference-clean run of the required length exists.
+/// A pencil constant that moves by the same amount every e-fold never
+/// certifies: its steps do not contract, so no window on the ladder settles,
+/// down to the midpoint of the box where the ladder ends.
 #[test]
 fn asymptote_rail_refuses_on_drifting_constant() {
-    let mut obj = upper_tail_objective(6723.0, 1.0, 3000.0);
+    let config = test_config();
+    let (count, in_eval) = eval_counter();
+    let mut obj = upper_tail_objective(6723.0, 1.0, 3000.0, 1.0, 0.0, in_eval);
     let rho = array![29.9];
-    let tol = AsymptoteTolerances::exp4_rail_bands(1.0e-2);
     let verdict = build_and_assess_rail_coordinate(
         &mut obj,
         &rho,
         0,
         AsymptoteSide::Upper,
-        &tol,
-        (f64::NEG_INFINITY, f64::INFINITY),
-        0,
+        &config,
+        outer_criterion_resolution(&config),
+        (-30.0, 30.0),
     )
     .expect("probing must not error");
+    let reason = verdict.expect_err("a drifting ĉ must not certify a tail");
     assert!(
-        verdict.is_err(),
-        "a drifting ĉ must not certify a tail, got {verdict:?}",
+        reason.contains("no settled tail window"),
+        "the decline must name the settlement, got: {reason}"
+    );
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::Relaxed),
+        rail_probe_ladder(29.9, AsymptoteSide::Upper, (-30.0, 30.0))
+            .expect("finite box")
+            .len(),
+        "an unsettled tail walks the whole ladder to the box midpoint"
     );
 }
 
-/// #2358: a finite smoothing box can expose fewer than three whole
-/// e-folds of the leading-order tail even though the compactified
-/// criterion is already regular there. For
+/// #2358: a finite smoothing box can expose only a few e-folds of the
+/// leading-order tail. For
 ///
 /// `V(ρ) = c·e⁻ρ + (d/2)·e⁻²ρ`,
 ///
-/// the pencil constant is `ĉ(ρ) = c + d·e⁻ρ`: the ordinary asymptotic law
-/// plus its first vanishing correction. Unit probes from ρ=10 step into
-/// enough correction curvature that no three-row clean run exists; the
-/// equal-spaced half-e-fold fallback resolves the local tail without
-/// changing the drift, estimand, sign, or noise gates.
+/// the pencil constant is `ĉ(ρ) = c + d·e⁻ρ`: the asymptotic law plus its
+/// first vanishing correction. The retired drift band read the correction as
+/// drift and refused. The settlement reads it as what it is: consecutive
+/// constants differ by `d(e^{−ρ} − e^{−ρ−1})`, contracting by exactly `e^{−1}`
+/// toward the rail, and summing that series bounds the distance from the
+/// rail-most constant to `c`. The first three unit probes from ρ̂ = 10
+/// (ρ = 9, 8, 7) certify, and the radius covers the true limit `c = 7.1`.
 #[test]
 fn tail_probe_resolves_narrow_regular_band_before_finite_box_2358() {
     let (c, d, a) = (7.1_f64, 400.0_f64, 1.0e-3_f64);
+    let config = test_config();
+    let (count, in_eval) = eval_counter();
     let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
     let mut obj = problem.build_objective(
         (),
@@ -361,10 +461,13 @@ fn tail_probe_resolves_narrow_regular_band_before_finite_box_2358() {
             Ok(c * tau + 0.5 * d * tau * tau)
         },
         move |_: &mut (), rho: &Array1<f64>| {
+            in_eval.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let tau = (-rho[0]).exp();
+            let g = -c * tau - d * tau * tau;
+            publish_cancelling_parts(rho[0], g, 1.0);
             Ok(OuterEval {
                 cost: c * tau + 0.5 * d * tau * tau,
-                gradient: array![-c * tau - d * tau * tau],
+                gradient: array![g],
                 hessian: HessianValue::Unavailable,
                 inner_beta_hint: Some(array![a * tau]),
             })
@@ -373,94 +476,95 @@ fn tail_probe_resolves_narrow_regular_band_before_finite_box_2358() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let rho = array![10.0];
-    let mut tol = AsymptoteTolerances::exp4_rail_bands(1.0e-2);
-    tol.tail_drift_rel = RAIL_TAIL_DRIFT_REL;
-
-    let (coarse, coarse_rows) = probe_tail_window_at_resolution(
+    let rail = build_and_assess_rail_coordinate(
         &mut obj,
         &rho,
         0,
         AsymptoteSide::Upper,
-        &tol,
-        (-10.0, 10.5),
-        (1.0, ASYMPTOTE_PROBE_COUNT),
-    )
-    .expect("coarse probing must not error");
-    assert!(
-        coarse.is_none(),
-        "unit probes must not manufacture a pure tail through the curved band: {coarse_rows}"
-    );
-
-    let (window, rows) = probe_tail_window(
-        &mut obj,
-        &rho,
-        0,
-        AsymptoteSide::Upper,
-        &tol,
+        &config,
+        outer_criterion_resolution(&config),
         (-10.0, 10.5),
     )
-    .expect("multi-resolution probing must not error");
-    let window = window.unwrap_or_else(|| {
-        panic!("the half-e-fold fallback must resolve the regular tail: {rows}")
-    });
+    .expect("probing must not error")
+    .unwrap_or_else(|reason| panic!("the regular tail must settle and certify: {reason}"));
+    let RailTailEvidence::ProbedTail {
+        extrapolation_radius,
+        ..
+    } = rail.evidence
+    else {
+        panic!("a measured tail must carry probed evidence: {:?}", rail.evidence);
+    };
     assert!(
-        matches!(
-            assess_coordinate(&window, &tol),
-            AsymptoteVerdict::CertifiedAtAsymptote { .. }
-        ),
-        "the resolved tail must pass the unchanged asymptote gates"
+        (rail.tail_constant - c).abs() <= extrapolation_radius,
+        "the settlement ĉ={} ± {extrapolation_radius} must cover the true constant {c}",
+        rail.tail_constant
     );
+    assert!(
+        extrapolation_radius < 0.1,
+        "the radius is the remaining correction d·e^{{−9}} ≈ 0.049, got {extrapolation_radius}"
+    );
+    assert!(rail.evidence.admits(rail.tail_constant));
+    assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 3);
 }
 
-/// #2392 wrong-rail pull-back FIRES: a coordinate sitting at the UPPER bound
-/// whose clean-band probes carry a POSITIVE gradient (`∂V/∂ρ > 0`, so the
-/// pencil constant `ĉ = −e^{ρ}·g < 0` — descent points INWARD, away from the
-/// bound) was driven to the wrong rail. `detect_wrong_rail_pullback` returns
-/// an interior reseed target strictly below the coordinate's current ρ.
-#[test]
-fn wrong_rail_pullback_fires_on_inward_descent_2392() {
-    // V(ρ) = −c·e^{−ρ} ⇒ ∂V/∂ρ = +c·e^{−ρ} > 0: the descent runs ρ DOWN, away
-    // from the upper rail, and ĉ_upper = −e^{ρ}·(c·e^{−ρ}) = −c < 0 uniformly.
-    let c = 6723.0;
-    let evaluation_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let count_during_eval = std::sync::Arc::clone(&evaluation_count);
+/// A one-coordinate objective `V(ρ) = sign·c·e^{−ρ}` whose gradient closure
+/// counts its evaluations and publishes its parts.
+fn signed_upper_tail_objective(
+    signed_c: f64,
+    evaluations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> impl OuterObjective {
     let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
-    let mut obj = problem.build_objective(
+    problem.build_objective(
         (),
-        move |_: &mut (), rho: &Array1<f64>| Ok(-c * (-rho[0]).exp()),
+        move |_: &mut (), rho: &Array1<f64>| Ok(signed_c * (-rho[0]).exp()),
         move |_: &mut (), rho: &Array1<f64>| {
-            count_during_eval.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            evaluations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let g = -signed_c * (-rho[0]).exp();
+            publish_cancelling_parts(rho[0], g, 1.0);
             Ok(OuterEval {
-                cost: -c * (-rho[0]).exp(),
-                gradient: array![c * (-rho[0]).exp()],
+                cost: signed_c * (-rho[0]).exp(),
+                gradient: array![g],
                 hessian: HessianValue::Unavailable,
                 inner_beta_hint: Some(array![(-rho[0]).exp()]),
             })
         },
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
-    );
+    )
+}
+
+/// #2392 wrong-rail pull-back FIRES: a coordinate sitting at the UPPER bound
+/// whose resolved probes carry a POSITIVE gradient (`∂V/∂ρ > 0`, so the
+/// pencil constant `ĉ = −e^{ρ}·g < 0` — descent points INWARD, away from the
+/// bound) was driven to the wrong rail. `detect_wrong_rail_pullback` returns
+/// the deepest probe of the deciding run as the interior reseed target.
+#[test]
+fn wrong_rail_pullback_fires_on_inward_descent_2392() {
+    // V(ρ) = −c·e^{−ρ} ⇒ ∂V/∂ρ = +c·e^{−ρ} > 0: the descent runs ρ DOWN, away
+    // from the upper rail, and ĉ_upper = −e^{ρ}·(c·e^{−ρ}) = −c < 0 uniformly.
+    let config = test_config();
+    let (count, in_eval) = eval_counter();
+    let mut obj = signed_upper_tail_objective(-6723.0, in_eval);
     let rho = array![29.9];
-    let tol = AsymptoteTolerances::exp4_rail_bands(1.0e-2);
     let target = detect_wrong_rail_pullback(
         &mut obj,
         &rho,
         0,
         AsymptoteSide::Upper,
-        &tol,
+        &config,
         (-30.0, 30.0),
     )
     .expect("probing the wrong-rail objective must not error")
     .expect("an inward-descent rail must publish a pull-back target");
     assert!(
-        target < rho[0] && target.is_finite(),
-        "the reseed must move the coordinate INWARD (ρ down), got {target}",
+        (target - 26.9).abs() <= 1.0e-12,
+        "the reseed is the deciding run's deepest probe ρ̂ − 3 = 26.9, got {target}",
     );
     assert_eq!(
-        evaluation_count.load(std::sync::atomic::Ordering::Relaxed),
-        5,
-        "two near-rail rows are below the gradient floor; the next three \
-         clean rows are already a complete wrong-rail proof"
+        count.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "three resolved rows whose constants settle away from zero are a complete \
+         wrong-rail proof"
     );
 }
 
@@ -469,33 +573,16 @@ fn wrong_rail_pullback_fires_on_inward_descent_2392() {
 /// which must never be pulled off its rail.
 #[test]
 fn wrong_rail_pullback_refuses_a_genuine_upper_tail_2392() {
-    let c = 6723.0;
-    let evaluation_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let count_during_eval = std::sync::Arc::clone(&evaluation_count);
-    let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
-    let mut obj = problem.build_objective(
-        (),
-        move |_: &mut (), rho: &Array1<f64>| Ok(c * (-rho[0]).exp()),
-        move |_: &mut (), rho: &Array1<f64>| {
-            count_during_eval.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(OuterEval {
-                cost: c * (-rho[0]).exp(),
-                gradient: array![-c * (-rho[0]).exp()],
-                hessian: HessianValue::Unavailable,
-                inner_beta_hint: Some(array![(-rho[0]).exp()]),
-            })
-        },
-        None::<fn(&mut ())>,
-        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
-    );
+    let config = test_config();
+    let (count, in_eval) = eval_counter();
+    let mut obj = signed_upper_tail_objective(6723.0, in_eval);
     let rho = array![29.9];
-    let tol = AsymptoteTolerances::exp4_rail_bands(1.0e-2);
     let verdict = detect_wrong_rail_pullback(
         &mut obj,
         &rho,
         0,
         AsymptoteSide::Upper,
-        &tol,
+        &config,
         (-30.0, 30.0),
     )
     .expect("probing must not error");
@@ -504,10 +591,10 @@ fn wrong_rail_pullback_refuses_a_genuine_upper_tail_2392() {
         "a genuine λ→∞ tail (ĉ>0) must not be pulled off its rail, got {verdict:?}",
     );
     assert_eq!(
-        evaluation_count.load(std::sync::atomic::Ordering::Relaxed),
-        5,
-        "the first three finite-difference-clean rows prove a genuine rail; \
-         probing thirteen more interior points cannot change that local fact"
+        count.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "the first settled run proves a genuine rail; probing further interior \
+         points cannot change that local fact"
     );
 }
 
@@ -612,17 +699,14 @@ fn gradient_floor_absorbs_at_most_max_interior_gradient_weyl_bound() {
 /// outside its own box interval. Past a box bound the ρ-gradient assembly
 /// reports the #197 frozen-axis projection — a literal `0.0` — so an
 /// out-of-box probe fabricates a hard-zero tail row (`1.531e0 → 0.000e0` in
-/// one e-fold in the #2388 evidence) that the drift band can never confirm,
-/// and the fit refuses. The ladder must stop at the last strictly-in-domain
-/// probe, and the in-domain rows alone must still confirm an exact tail.
+/// one e-fold in the #2388 evidence). The ladder stops at the midpoint of the
+/// coordinate's box, so every probe is strictly inside it and on this rail's
+/// half, and the in-domain rows alone confirm the exact tail.
 #[test]
 fn tail_probe_ladder_never_leaves_the_coordinate_box_2388() {
     let c = 6723.0_f64;
-    // Deep enough that the in-domain ladder keeps a healthy-gradient run
-    // (probes at |g| below the interior floor are rightly judged unclean),
-    // shallow enough that the 18-probe ladder would cross it without the
-    // domain clip.
     let box_lower = 12.0_f64;
+    let config = test_config();
     let probed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
     let probed_in_eval = std::sync::Arc::clone(&probed);
     let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
@@ -639,6 +723,7 @@ fn tail_probe_ladder_never_leaves_the_coordinate_box_2388() {
             } else {
                 -c * (-r).exp()
             };
+            publish_cancelling_parts(r, grad, 1.0);
             Ok(OuterEval {
                 cost: (c * (-r).exp()).abs(),
                 gradient: array![grad],
@@ -650,15 +735,14 @@ fn tail_probe_ladder_never_leaves_the_coordinate_box_2388() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let rho = array![29.9];
-    let tol = AsymptoteTolerances::exp4_rail_bands(1.0e-2);
     let rail = build_and_assess_rail_coordinate(
         &mut obj,
         &rho,
         0,
         AsymptoteSide::Upper,
-        &tol,
+        &config,
+        outer_criterion_resolution(&config),
         (box_lower, 30.0),
-        0,
     )
     .expect("probing must not error")
     .expect("the in-domain rows alone must certify the exact tail");
@@ -667,11 +751,96 @@ fn tail_probe_ladder_never_leaves_the_coordinate_box_2388() {
         "recovered ĉ={} should equal c={c}",
         rail.tail_constant,
     );
+    let midpoint = 0.5 * (box_lower + 30.0);
     let seen = probed.lock().expect("probe log").clone();
     assert!(
-        !seen.is_empty() && seen.iter().all(|&r| r > box_lower),
-        "no probe may leave the λ-selection domain (lower bound {box_lower}): {seen:?}",
+        !seen.is_empty() && seen.iter().all(|&r| r > box_lower && r > midpoint),
+        "no probe may leave the upper rail's half of the box ({midpoint}, 30): {seen:?}",
     );
+}
+
+/// The ladder itself: unit e-folds back from the rail, strictly inside the
+/// box, ending at the box midpoint where the other rail becomes the nearer
+/// one, and absent when there is no finite box around the coordinate.
+#[test]
+fn rail_probe_ladder_steps_unit_e_folds_to_the_box_midpoint() {
+    let upper = rail_probe_ladder(29.9, AsymptoteSide::Upper, (12.0, 30.0))
+        .expect("a finite box containing ρ has a ladder");
+    let expected_upper: Vec<f64> = (1_u32..=8).map(|j| 29.9 - f64::from(j)).collect();
+    assert_eq!(upper.len(), expected_upper.len(), "ladder {upper:?}");
+    for (got, want) in upper.iter().zip(&expected_upper) {
+        assert!((got - want).abs() <= 1.0e-12, "ladder {upper:?}");
+    }
+    assert!(upper.iter().all(|&r| r > 21.0 && r < 30.0));
+
+    let lower = rail_probe_ladder(-9.5, AsymptoteSide::Lower, (-10.0, 4.0))
+        .expect("a finite box containing ρ has a ladder");
+    let expected_lower: Vec<f64> = (1_u32..=6).map(|j| -9.5 + f64::from(j)).collect();
+    assert_eq!(lower.len(), expected_lower.len(), "ladder {lower:?}");
+    for (got, want) in lower.iter().zip(&expected_lower) {
+        assert!((got - want).abs() <= 1.0e-12, "ladder {lower:?}");
+    }
+    assert!(lower.iter().all(|&r| r > -10.0 && r < -3.0));
+
+    assert!(rail_probe_ladder(29.9, AsymptoteSide::Upper, (f64::NEG_INFINITY, 30.0)).is_none());
+    assert!(rail_probe_ladder(31.0, AsymptoteSide::Upper, (-30.0, 30.0)).is_none());
+    assert_eq!(
+        rail_probe_ladder(29.9, AsymptoteSide::Upper, (29.0, 30.0)),
+        Some(Vec::new()),
+        "a box narrower than one e-fold past its midpoint has no probe"
+    );
+}
+
+/// #3565: the verdict is a property of the tail, not of the criterion's
+/// units. The probes' rounding bands are charged on the magnitudes of the
+/// parts each gradient was summed from, so multiplying the criterion by `s`
+/// multiplies every constant, band and radius by `s` and changes nothing
+/// else; an additive constant in `V` changes nothing at all. The retired
+/// absolute noise floor on `ĉ` refused the same tail at one scale and
+/// certified it at another.
+#[test]
+fn rail_certificate_is_invariant_to_criterion_units_3565() {
+    let config = test_config();
+    let certify = |scale: f64, offset: f64| {
+        let (count, in_eval) = eval_counter();
+        let mut obj = upper_tail_objective(6723.0, 1.0, 0.0, scale, offset, in_eval);
+        let rail = build_and_assess_rail_coordinate(
+            &mut obj,
+            &array![29.9],
+            0,
+            AsymptoteSide::Upper,
+            &config,
+            outer_criterion_resolution(&config),
+            (-30.0, 30.0),
+        )
+        .expect("probing must not error")
+        .unwrap_or_else(|reason| panic!("scale {scale}: the exact tail must certify: {reason}"));
+        let RailTailEvidence::ProbedTail {
+            extrapolation_radius,
+            ..
+        } = rail.evidence
+        else {
+            panic!("a measured tail must carry probed evidence: {:?}", rail.evidence);
+        };
+        (
+            rail.tail_constant / scale,
+            extrapolation_radius / scale,
+            count.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    };
+    let (reference_constant, reference_radius, reference_evals) = certify(1.0, 0.0);
+    for (scale, offset) in [(1.0e-9, 0.0), (1.0e3, 0.0), (1.0, 1.0e6)] {
+        let (constant, radius, evals) = certify(scale, offset);
+        assert!(
+            (constant - reference_constant).abs() <= 1.0e-12 * reference_constant,
+            "scale {scale}, offset {offset}: ĉ/s = {constant} vs {reference_constant}"
+        );
+        assert!(
+            (radius - reference_radius).abs() <= 1.0e-8 * reference_radius,
+            "scale {scale}, offset {offset}: R/s = {radius} vs {reference_radius}"
+        );
+        assert_eq!(evals, reference_evals, "scale {scale}, offset {offset}");
+    }
 }
 
 /// Build a two-coordinate objective: coordinate 0 follows the upper-rail tail
@@ -683,6 +852,7 @@ fn upper_tail_with_interior(c: f64, a: f64) -> impl OuterObjective {
         move |_: &mut (), rho: &Array1<f64>| Ok((c * (-rho[0]).exp()).abs()),
         move |_: &mut (), rho: &Array1<f64>| {
             let r = rho[0];
+            publish_cancelling_parts(r, -c * (-r).exp(), 1.0);
             Ok(OuterEval {
                 cost: (c * (-r).exp()).abs(),
                 gradient: array![-c * (-r).exp(), 0.0],
@@ -704,6 +874,7 @@ fn asymptote_rail_requires_psd_interior_sub_block() {
     let projected = array![0.0, 0.0];
     let bounds = (array![-30.0, -30.0], array![30.0, 30.0]);
     let railed = [0usize];
+    let config = test_config();
 
     let mut obj = upper_tail_with_interior(6723.0, 1.0);
     let hessian_psd = array![[1.0, 0.0], [0.0, 2.0]];
@@ -714,11 +885,10 @@ fn asymptote_rail_requires_psd_interior_sub_block() {
         layout: OuterThetaLayout::new(2, 0),
         hessian: &hessian_psd,
         bounds: &bounds,
-        terminal_beta: None,
         stationarity_bound: StationarityBound::from_ladder(1.0e-6, StationarityBoundSource::SolverBand),
         objective_tol: 1.0e-5,
         context: "asymptote-rail psd test",
-        native_coordinate_order: None,
+        config: &config,
     };
     let minted = try_certify_asymptote_rail(&mut obj, &inputs_psd)
         .expect("certification must not error");
@@ -768,6 +938,7 @@ fn asymptote_rail_refuses_a_psi_coordinate_with_a_perfect_tail() {
     let bounds = (array![-30.0, -30.0], array![30.0, 30.0]);
     let railed = [0usize];
     let hessian = array![[1.0, 0.0], [0.0, 2.0]];
+    let config = test_config();
 
     let mut obj = upper_tail_with_interior(6723.0, 1.0);
     let as_psi = AsymptoteRailInputs {
@@ -779,14 +950,13 @@ fn asymptote_rail_refuses_a_psi_coordinate_with_a_perfect_tail() {
         layout: OuterThetaLayout::new(2, 2),
         hessian: &hessian,
         bounds: &bounds,
-        terminal_beta: None,
         stationarity_bound: StationarityBound::from_ladder(
             1.0e-6,
             StationarityBoundSource::SolverBand,
         ),
         objective_tol: 1.0e-5,
         context: "asymptote-rail psi-identity test",
-        native_coordinate_order: None,
+        config: &config,
     };
     let refused =
         try_certify_asymptote_rail(&mut obj, &as_psi).expect("certification must not error");
