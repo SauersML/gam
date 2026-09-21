@@ -1276,9 +1276,15 @@ mod exponential_family_kernel_tests {
         for &x in &[-40.0_f64, -2.0, -0.25, 0.0, 0.25, 2.0, 35.0, 40.0, 700.0] {
             let s = softplus(x);
             let back = softplus_inverse(s);
+            // Seven roundings at half an ulp of a value of this magnitude:
+            // three in `softplus` (`exp`, `ln_1p`, the sum), two in its inverse
+            // (`expm1`, `ln`), and the representation of the value itself at
+            // each end. Below `|x| = 1` the magnitude is the unit one, since
+            // the round trip passes through `softplus(x) >= ln 2`.
+            let round_trip_band = 7.0 * f64::EPSILON * x.abs().max(1.0);
             assert!(
-                (back - x).abs() <= 8.0 * f64::EPSILON * x.abs().max(1.0),
-                "softplus_inverse(softplus({x})) = {back}"
+                (back - x).abs() <= round_trip_band,
+                "softplus_inverse(softplus({x})) = {back}, off by more than {round_trip_band:e}"
             );
         }
         // The regime the naive `ln(e^s - 1)` cannot reach: `e^s` overflows

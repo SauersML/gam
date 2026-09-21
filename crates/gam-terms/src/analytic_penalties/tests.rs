@@ -757,17 +757,23 @@ fn parametric_row_precision_domains_distinguish_log_strengths_from_raw_coordinat
     // back through softplus exactly.
     let ceiling = checked_exp_log_strength(LOG_STRENGTH_MAX).unwrap();
     let floor = checked_exp_log_strength(LOG_STRENGTH_MIN).unwrap();
+    // The round trip runs through a logarithm of magnitude `LOG_STRENGTH_MAX`,
+    // so the recovered strength's RELATIVE error is the ABSOLUTE rounding the
+    // logarithm carries: seven roundings at half an ulp of a value of that
+    // magnitude — `exp`, `expm1`, `ln`, the two base-offset additions, and
+    // `softplus`'s `exp` and `ln_1p`.
+    let strength_round_trip_band = 7.0 * f64::EPSILON * LOG_STRENGTH_MAX;
     for (k, &base_raw_beta) in [0.0_f64, -0.5].iter().enumerate() {
         let (lower, upper) = domains[2 + k];
         let low_slope = gam_math::special::softplus(lower + base_raw_beta);
         let high_slope = gam_math::special::softplus(upper + base_raw_beta);
         assert!(
-            (low_slope / floor - 1.0).abs() < 1.0e-9,
-            "raw-beta {k} lower"
+            (low_slope / floor - 1.0).abs() < strength_round_trip_band,
+            "raw-beta {k} lower: {low_slope:e} against {floor:e}"
         );
         assert!(
-            (high_slope / ceiling - 1.0).abs() < 1.0e-9,
-            "raw-beta {k} upper"
+            (high_slope / ceiling - 1.0).abs() < strength_round_trip_band,
+            "raw-beta {k} upper: {high_slope:e} against {ceiling:e}"
         );
     }
 
