@@ -1,6 +1,4 @@
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GpuDispatchPolicy {
     pub xtwx_flops_min: usize,
     pub gemm_min_flops: usize,

@@ -3295,5 +3295,18 @@
     ],
     "reason": "#4080: warm_start::Session kept two loaders, try_load_with_source and peek_load_with_source, with identical bodies (store lookup, record the error, wrap in LoadedEntry with source LoadSource::Exact). LoadSource had the single variant Exact, so the only test of it (objective.rs classify_cache_entry_for_outer, loaded.source == LoadSource::Exact) was always true, and LoadedEntry only paired an entry with that constant. Both loaders, the enum and the wrapper are replaced by one Session::load returning Option<WarmStartEntry>. #4081: Fingerprinter::write_f64_slice_payload_slow and write_f64_slice_payload_slow_iter were two copies of the element-wise write_f64 loop; both are replaced by one write_f64_elements.",
     "evidence": "scripts/source_removal_guard.py and scripts/public_api_census.py with --base d027be231ca8fdf6f8104690ae68869486db51ab and head the change's commit list exactly these removals. Read-proof at the head: git grep -w finds 0 occurrences of LoadSource, LoadedEntry, try_load_with_source, peek_load_with_source, write_f64_slice_payload_slow and write_f64_slice_payload_slow_iter in crates/ tests/ examples/ python/. Before the change the callers were run.rs (try_load_with_source), marginal_slope fit_entry.rs (peek_load_with_source) and run_plan_warm_start_cache_tests.rs (LoadedEntry literals), all moved to Session::load / WarmStartEntry."
+  },
+  {
+    "base": "81994b4a582ee6a9b9b2a6ebe0e05e7ac0e9209d",
+    "items": [
+      "crates/gam-gpu/src/calibration.rs:fn:into_record",
+      "crates/gam-gpu/src/calibration.rs:fn:measure_gemm",
+      "crates/gam-gpu/src/calibration.rs:fn:measure_potrf",
+      "crates/gam-gpu/src/calibration.rs:fn:measure_xtwx",
+      "crates/gam-gpu/src/calibration.rs:fn:store_cached_policy",
+      "crates/gam-gpu/src/calibration.rs:struct:MeasurementRecord"
+    ],
+    "reason": "#4082: the GPU calibration cache persisted the whole GpuDispatchPolicy and load_cached_policy returned it verbatim, so never-calibrated fields kept the writing build's defaults and calibrated floors were not bounded by the current grid. The cache now stores GridTimings (CPU/GPU seconds per grid point) and policy_from_timings rebuilds the policy on every load. MeasurementRecord (a field-for-field copy of Measurement with a String operation, written and never read) and its into_record converter go; measure_gemm, measure_potrf and measure_xtwx are folded into calibrate_device, which now returns the grid timings; store_cached_policy is store_cached_timings. GpuDispatchPolicy and GpuMixedPrecisionPolicy drop their serde derives, which only the cache used.",
+    "evidence": "scripts/source_removal_guard.py with --base d027be231ca8fdf6f8104690ae68869486db51ab (re-pointed to main f5930beca8 when main was merged in) and head the change's commit lists exactly these removals, all private to crates/gam-gpu/src/calibration.rs. Read-proof at the head: git grep -w finds 0 occurrences of MeasurementRecord (in gam-gpu), into_record (in gam-gpu), measure_gemm, measure_potrf, measure_xtwx and store_cached_policy in crates/ tests/ examples/; calibration.rs was their only file."
   }
 ]

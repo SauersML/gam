@@ -37,6 +37,14 @@
   fields that no dispatch decision read: `xtwx_n_min`, `xtwx_use_fused_below_p`,
   `syevd_min_p`, `sparse_min_nnz`, `keep_design_resident_min_bytes`,
   `prefer_gpu_factorization_min_p` and `mixed_precision`.
+- **GPU calibration cache stores timings, not a policy** (#4082). The cache under
+  `$TMPDIR/gam/gpu/policy/v1/` held a whole `GpuDispatchPolicy`, so a file written by an
+  older build pinned that build's defaults for every never-calibrated field and could
+  carry calibrated floors below the current measurement grid. It now holds the CPU/GPU
+  timings at each grid point, and every load rebuilds the policy from them and the
+  current defaults, exactly as a fresh calibration does. Old cache files are ignored
+  (schema version 2), and `GpuDispatchPolicy` no longer implements
+  `Serialize`/`Deserialize`.
 
 - **The PIRLS dense Newton direction is solved the same way on every host** (#3551).
   On a CUDA host the direction was sent to a device Cholesky on the raw Hessian, with

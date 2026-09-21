@@ -257,7 +257,7 @@ impl DispatchOp {
     /// calibration crossover floors ([`GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS`],
     /// `GpuDispatchPolicy::MIN_CALIBRATABLE_POTRF_P`) for the calibrated
     /// fields, and the [`GpuDispatchPolicy::default`] values for the
-    /// small-dense-batched-POTRF fields, which `calibration::calibrate_device`
+    /// small-dense-batched-POTRF fields, which `calibration::policy_from_timings`
     /// never adjusts. A `false` here means EVERY reachable policy's
     /// [`route_through_gpu`] admission would also refuse, so the caller may
     /// return to the CPU path WITHOUT resolving GPU availability — i.e.
