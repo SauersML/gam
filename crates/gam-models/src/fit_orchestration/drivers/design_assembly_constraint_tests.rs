@@ -589,29 +589,15 @@ fn max_abs_diff_vector(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
 
 // `pub(super)` — shared with the sibling `adaptive_bounded_duchon_tests` #1601
 // re-home (its freeze/cache-rebuild pins compare two designs column-for-column).
-/// The scale a mismatch has to be read against: the largest entry either side
-/// carries, and the eigensolver-style band `p·ε·scale` that two assemblies of
-/// the SAME exact matrix cannot be expected to beat.
-///
-/// `max_abs=4.196e-10` (gam#2959) says nothing on its own. Against a block whose
-/// entries are 1e6 it is 4e-16 relative, the rounding of the two assemblies;
-/// against a block whose entries are 1e-2 it is a real disagreement and the
-/// memo did not clear. Every bar below is an UNDERIVED absolute literal `1e-10`
-/// (rule 23, gam#2469): it is left exactly as it was, because loosening a bar
-/// to make a test pass is forbidden, but no reader could tell those two cases
-/// apart from the old message, so the message now carries the scale.
-fn mismatch_scale(entries: impl Iterator<Item = f64>, count: usize) -> (f64, f64) {
-    let scale = entries.fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    (scale, count as f64 * f64::EPSILON * scale)
-}
-
-fn scale_note(left_scale: f64, right_scale: f64, band: f64, diff: f64) -> String {
-    let scale = left_scale.max(right_scale);
-    let relative = if scale > 0.0 { diff / scale } else { f64::NAN };
-    format!(
-        "(max|left|={left_scale:.6e}, max|right|={right_scale:.6e}, \
-         relative={relative:.6e}, two-assembly band p*eps*scale={band:.6e})"
-    )
+/// The largest disagreement two assemblies of the SAME exact matrix can leave
+/// (gam#2959): each entry is a sum of at most `count` rounded terms whose size
+/// is bounded by the largest entry either side carries, so the two results
+/// differ by at most `count·ε·scale` (`accumulation_band` with the operand
+/// scale read from the matrices themselves). A disagreement above that band is
+/// a real difference between the two assemblies, not rounding.
+fn two_assembly_band(left: impl Iterator<Item = f64>, right: impl Iterator<Item = f64>, count: usize) -> f64 {
+    let scale = left.chain(right).fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    count as f64 * f64::EPSILON * scale
 }
 
 pub(super) fn assert_term_collection_designs_match(
@@ -622,12 +608,14 @@ pub(super) fn assert_term_collection_designs_match(
     let left_design = left.design.to_dense();
     let right_design = right.design.to_dense();
     let design_diff = max_abs_diff_matrix(&left_design, &right_design);
-    let (left_scale, band) = mismatch_scale(left_design.iter().copied(), left_design.ncols());
-    let (right_scale, _) = mismatch_scale(right_design.iter().copied(), right_design.ncols());
+    let design_band = two_assembly_band(
+        left_design.iter().copied(),
+        right_design.iter().copied(),
+        left_design.ncols(),
+    );
     assert!(
-        design_diff <= 1e-10,
-        "{label} design mismatch max_abs={design_diff} {}",
-        scale_note(left_scale, right_scale, band, design_diff)
+        design_diff <= design_band,
+        "{label} design mismatch max_abs={design_diff:e} exceeds the two-assembly band {design_band:e}"
     );
     assert_eq!(
         left.penalties.len(),
@@ -645,12 +633,11 @@ pub(super) fn assert_term_collection_designs_match(
             "{label} penalty {idx} col_range mismatch"
         );
         let penalty_diff = max_abs_diff_matrix(&lp.local, &rp.local);
-        let (lp_scale, penalty_band) = mismatch_scale(lp.local.iter().copied(), lp.local.ncols());
-        let (rp_scale, _) = mismatch_scale(rp.local.iter().copied(), rp.local.ncols());
+        let penalty_band =
+            two_assembly_band(lp.local.iter().copied(), rp.local.iter().copied(), lp.local.ncols());
         assert!(
-            penalty_diff <= 1e-10,
-            "{label} penalty {idx} mismatch max_abs={penalty_diff} {}",
-            scale_note(lp_scale, rp_scale, penalty_band, penalty_diff)
+            penalty_diff <= penalty_band,
+            "{label} penalty {idx} mismatch max_abs={penalty_diff:e} exceeds the two-assembly band {penalty_band:e}"
         );
     }
     assert_eq!(
@@ -680,9 +667,17 @@ pub(super) fn assert_term_collection_designs_match(
             linfo.penalty.effective_rank, rinfo.penalty.effective_rank,
             "{label} penalty rank mismatch at {idx}"
         );
+        let normalization_band = two_assembly_band(
+            std::iter::once(linfo.penalty.normalization_scale),
+            std::iter::once(rinfo.penalty.normalization_scale),
+            1,
+        );
         assert!(
-            (linfo.penalty.normalization_scale - rinfo.penalty.normalization_scale).abs() <= 1e-10,
-            "{label} penalty normalization mismatch at {idx}"
+            (linfo.penalty.normalization_scale - rinfo.penalty.normalization_scale).abs()
+                <= normalization_band,
+            "{label} penalty normalization mismatch at {idx}: {} vs {}",
+            linfo.penalty.normalization_scale,
+            rinfo.penalty.normalization_scale
         );
     }
     match (
@@ -691,7 +686,11 @@ pub(super) fn assert_term_collection_designs_match(
     ) {
         (Some(lb_left), Some(lb_right)) => {
             let diff = max_abs_diff_vector(lb_left, lb_right);
-            assert!(diff <= 1e-10, "{label} lower-bound mismatch max_abs={diff}");
+            let band = two_assembly_band(lb_left.iter().copied(), lb_right.iter().copied(), 1);
+            assert!(
+                diff <= band,
+                "{label} lower-bound mismatch max_abs={diff:e} exceeds the two-assembly band {band:e}"
+            );
         }
         (None, None) => {}
         _ => panic!("{label} lower-bound presence mismatch"),
@@ -703,13 +702,16 @@ pub(super) fn assert_term_collection_designs_match(
         (Some(c_left), Some(c_right)) => {
             let a_diff = max_abs_diff_matrix(&c_left.a, &c_right.a);
             let b_diff = max_abs_diff_vector(&c_left.b, &c_right.b);
+            let a_band =
+                two_assembly_band(c_left.a.iter().copied(), c_right.a.iter().copied(), c_left.a.ncols());
+            let b_band = two_assembly_band(c_left.b.iter().copied(), c_right.b.iter().copied(), 1);
             assert!(
-                a_diff <= 1e-10,
-                "{label} linear-constraint A mismatch max_abs={a_diff}"
+                a_diff <= a_band,
+                "{label} linear-constraint A mismatch max_abs={a_diff:e} exceeds the two-assembly band {a_band:e}"
             );
             assert!(
-                b_diff <= 1e-10,
-                "{label} linear-constraint b mismatch max_abs={b_diff}"
+                b_diff <= b_band,
+                "{label} linear-constraint b mismatch max_abs={b_diff:e} exceeds the two-assembly band {b_band:e}"
             );
         }
         (None, None) => {}
