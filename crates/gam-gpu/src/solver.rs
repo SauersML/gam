@@ -999,11 +999,13 @@ pub use cuda::{
 /// budget past this point makes the mixed-precision solve slower than the fp64
 /// solve it replaces. It bounds cost only; the residual's rounding band alone
 /// decides accuracy.
+#[cfg(target_os = "linux")]
 pub(crate) fn refinement_step_budget(p: usize) -> usize {
     (p + 6) / 12
 }
 
 /// What a refinement correction's new residual says about continuing.
+#[cfg(target_os = "linux")]
 #[derive(Debug, PartialEq)]
 pub(crate) enum RefinementVerdict {
     /// The residual is inside its rounding band: the solution is certified.
@@ -1025,6 +1027,7 @@ pub(crate) enum RefinementVerdict {
 /// `κ(A)·u_f32 ≥ 1`, and a band predicted past the budget is cheaper reached
 /// by the fp64 factorization; both refuse, so refinement never hands on a
 /// solution its own certificate has not accepted.
+#[cfg(target_os = "linux")]
 pub(crate) fn refinement_verdict(
     prev_norm: f64,
     new_norm: f64,
@@ -1118,7 +1121,7 @@ pub(crate) fn cholesky_lower_on_ordinal_gpu(
     cuda::cholesky_lower_on_ordinal(ordinal, hessian)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::{RefinementVerdict, refinement_step_budget, refinement_verdict};
 
