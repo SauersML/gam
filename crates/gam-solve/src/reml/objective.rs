@@ -965,9 +965,16 @@ impl<'a> RemlState<'a> {
     /// `None` exactly where [`Self::prices_constrained_laplace`] says the term does not describe
     /// this criterion, and a non-finite or mis-shaped gradient is refused rather than dropped: a
     /// silently absent term is the discontinuity this removes.
+    ///
+    /// At profiled Gaussian dispersion the integral is `∫_{Aβ ≥ b} exp(−E(β)/φ̂)`, so the term
+    /// is priced on the posterior `φ̂` describes and the scale travels on the input (gam#3234).
+    /// It is read through the same [`profiled_gaussian_scale`] the criterion's own
+    /// `½ν·log(2πφ̂)` reads, from the same four quantities, so the two cannot disagree.
     fn standard_cone_normalizer_input(
         &self,
         pirls_result: &PirlsResult,
+        ctx: &DerivativeContext,
+        nullspace_dim: f64,
     ) -> Result<
         Option<std::sync::Arc<super::reml_outer_engine::ConeNormalizerInput>>,
         EstimationError,
@@ -996,6 +1003,20 @@ impl<'a> RemlState<'a> {
                 gradient.iter().filter(|value| !value.is_finite()).count()
             );
         }
+        let profiled_scale = match ctx.dispersion {
+            super::reml_outer_engine::DispersionHandling::ProfiledGaussian => Some(
+                super::reml_outer_engine::profiled_gaussian_scale(
+                    ctx.log_likelihood,
+                    pirls_result.stable_penalty_term,
+                    self.positive_weight_observation_count(),
+                    nullspace_dim,
+                    self.gaussian_dp_floor_scale(),
+                )
+                .map_err(EstimationError::InvalidInput)?
+                .scale,
+            ),
+            super::reml_outer_engine::DispersionHandling::Fixed { .. } => None,
+        };
         Ok(Some(std::sync::Arc::new(
             super::reml_outer_engine::ConeNormalizerInput {
                 rows: lin.a.clone(),
@@ -1005,6 +1026,7 @@ impl<'a> RemlState<'a> {
                 // the tangent-projected mode response and the matching `ġ = M_true β̂̇ + ∂_θ∇F`
                 // from the same `Z`. Publishing a motion here would be a second reading of it.
                 gradient_motion: super::reml_outer_engine::ConeGradientMotion::Stationary,
+                profiled_scale,
             },
         )))
     }
@@ -1356,11 +1378,13 @@ impl<'a> RemlState<'a> {
 
         let pirls_result = bundle.pirls_result.as_ref();
 
-        let cone_normalizer = self.standard_cone_normalizer_input(pirls_result)?;
         // gam#2765: one rule for one quantity. Where the constrained Laplace term prices the
         // criterion, the criterion is the full-space `L = ½ln|M| + C`, so there is no face to
-        // reduce onto; where it does not, the face determinant stays exactly as it is.
-        let free_basis_opt = if cone_normalizer.is_some() {
+        // reduce onto; where it does not, the face determinant stays exactly as it is. The term
+        // itself is built below, once the derivative context names the dispersion its posterior
+        // is priced at.
+        let prices_cone = self.prices_constrained_laplace(pirls_result);
+        let free_basis_opt = if prices_cone {
             None
         } else {
             self.active_constraint_free_basis(pirls_result)
@@ -1434,7 +1458,7 @@ impl<'a> RemlState<'a> {
         // criterion's log-determinant operator. Its identified rank is then not the rank the
         // criterion charges, so it is not published as one.
         let publish_spectral = |operator: std::sync::Arc<DenseSpectralOperator>| {
-            if free_basis_opt.is_none() && cone_normalizer.is_none() {
+            if free_basis_opt.is_none() && !prices_cone {
                 bundle.publish_criterion_rank_decision(|| super::CriterionRankDecision {
                     predicate: if structural_rank.is_some() {
                         super::CriterionRankPredicate::StructuralRank
@@ -1555,6 +1579,8 @@ impl<'a> RemlState<'a> {
 
         let ctx =
             self.build_dense_derivative_context(pirls_result, bundle, &free_basis_opt, true)?;
+        let cone_normalizer =
+            self.standard_cone_normalizer_input(pirls_result, &ctx, nullspace_dim)?;
         // Inner-KKT envelope residual (transformed frame). Only the
         // unconstrained branch maps a raw transformed residual directly onto the
         // Hessian operator; under an active-set free basis the stationarity

@@ -4811,28 +4811,53 @@ impl<'a> RemlState<'a> {
         Ok(bundle.h_total.as_ref().clone())
     }
 
-    /// Whether this fit's criterion prices the constrained Laplace term `L = ½ln|M| + C` over the
+    /// Whether this FIT's criterion prices the constrained Laplace term `L = ½ln|M| + C` over the
     /// feasible cone (gam#2765) instead of a determinant over the active face's free subspace.
     ///
-    /// It prices the term whenever the inner problem carries inequality rows, active or not:
-    /// which rows are active is exactly what the criterion must stop depending on, and a term
-    /// switched on at the moment a row activates would trade one jump for another. The rows'
-    /// own bound is the only thing that decides it.
+    /// It prices the term whenever the model declares inequality rows — active or not, at
+    /// profiled or fixed dispersion. Which rows are active is exactly what the criterion must
+    /// stop depending on, and a term switched on at the moment a row activates would trade one
+    /// jump for another; the rows' own declaration is the only thing that decides it.
     ///
-    /// Two modes keep the face criterion, each for a reason that is a property of the criterion
-    /// and not of the fit's difficulty:
-    /// * a profiled Gaussian scale moves the posterior precision `H/φ̂` with ρ through `φ̂`, and
-    ///   the term prices no motion of `φ̂`; and
-    /// * with Firth bias reduction armed the inner objective is `−ℓ + ½βᵀSλβ − Φ`, whose score
-    ///   `PirlsResult::penalized_gradient_transformed` does not carry, so the vector the term
-    ///   would read is not that objective's `∇F` and its KKT gradient would be wrong by `∇Φ`.
+    /// One mode keeps the face criterion, for a reason that is a property of the criterion and
+    /// not of the fit's difficulty: with Firth bias reduction armed the inner objective is
+    /// `−ℓ + ½βᵀSλβ − Φ`, whose score `PirlsResult::penalized_gradient_transformed` does not
+    /// carry, so the vector the term would read is not that objective's `∇F` and its KKT gradient
+    /// would be wrong by `∇Φ`.
+    ///
+    /// This is the fit-level answer, decided before any inner solve, because the outer plan needs
+    /// it: a criterion carrying the term is not an EFS fixed point, and at profiled dispersion it
+    /// declares no outer Hessian (see [`Self::declares_analytic_outer_hessian`]).
+    pub(crate) fn fit_prices_constrained_laplace(&self) -> bool {
+        !self.config.firth_bias_reduction
+            && self
+                .linear_constraints
+                .as_ref()
+                .is_some_and(|lin| lin.a.nrows() > 0)
+    }
+
+    /// [`Self::fit_prices_constrained_laplace`] at one inner mode, which additionally carries the
+    /// transformed rows the term reads.
     pub(crate) fn prices_constrained_laplace(&self, pr: &PirlsResult) -> bool {
-        if self.config.firth_bias_reduction || reml_is_gaussian_identity(&pr.likelihood) {
-            return false;
-        }
-        pr.linear_constraints_transformed
-            .as_ref()
-            .is_some_and(|lin| lin.a.nrows() > 0)
+        self.fit_prices_constrained_laplace()
+            && pr
+                .linear_constraints_transformed
+                .as_ref()
+                .is_some_and(|lin| lin.a.nrows() > 0)
+    }
+
+    /// Whether this fit publishes an analytic outer Hessian to the outer plan.
+    ///
+    /// A criterion carrying the constrained Laplace term at PROFILED dispersion does not
+    /// (gam#3234): `d²L` there carries the profiled scale's own second-order channel, whose
+    /// `ℓ̇_kl = d²log φ̂` is a function of `d²D_p`, and the evaluator declines to assemble it
+    /// rather than publish the fixed-scale matrix in its place. The plan reads this before the
+    /// search starts, so the search is gradient-only rather than an ARC route that would be
+    /// handed a refusal at its first second-order request.
+    pub(crate) fn declares_analytic_outer_hessian(&self) -> bool {
+        self.analytic_outer_hessian_enabled()
+            && !(self.fit_prices_constrained_laplace()
+                && reml_is_gaussian_identity(&self.config.likelihood))
     }
 
     /// Whether this fit's criterion is assembled in the TRANSFORMED PIRLS frame rather than the

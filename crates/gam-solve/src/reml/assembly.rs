@@ -248,9 +248,15 @@ impl<'dp> InnerAssembly<'dp> {
     /// `hessian_logdet_correction` survives the substitution unchanged: it un-scales a uniform
     /// curvature rescale, `−p·log s`, and `Λ_op = M_op + s·AᵀT̃A = s·Λ` carries the same `s` in
     /// the same way, so `log|Λ_op| + correction` is `log|Λ|`. A kept-spectrum
-    /// [`PenaltySubspaceTrace`] does not: it is a second rule for the same log-determinant. Nor
-    /// does a profiled scale, which would have to price `φ̂`'s own motion. Both are refused here
-    /// by name rather than silently dropped.
+    /// [`PenaltySubspaceTrace`] does not: it is a second rule for the same log-determinant, and
+    /// is refused here by name.
+    ///
+    /// A profiled Gaussian scale is carried, not refused (gam#3234): the producer reads `φ̂` from
+    /// [`profiled_gaussian_scale`](super::reml_outer_engine::profiled_gaussian_scale) and puts it
+    /// on the input, [`ConeNormalizerTerm::price`] divides the precision and the gradient by it,
+    /// and the criterion's log-determinant is taken on `Λ̃ = M + φ̂AᵀT̃A`, whose `φ̂` is the same
+    /// one `½ν·log(2πφ̂)` already prices. The two must agree about the dispersion they describe,
+    /// which is checked here rather than assumed.
     fn price_cone_normalizer(&mut self) -> Result<Option<Arc<ConeNormalizerTerm>>, RemlLamlError> {
         let Some(input) = self.cone_normalizer.take() else {
             return Ok(None);
@@ -266,13 +272,19 @@ impl<'dp> InnerAssembly<'dp> {
         ) {
             return Ok(None);
         }
-        if matches!(self.dispersion, DispersionHandling::ProfiledGaussian) {
-            return Err(RemlLamlError::Failed(
-                "the constrained Laplace term is priced at fixed dispersion; a profiled-Gaussian \
-                 solution moves its posterior precision H/phi-hat with rho through phi-hat, and \
-                 the term prices no motion of phi-hat (gam#2765)"
-                    .to_string(),
-            ));
+        let profiled_dispersion = matches!(self.dispersion, DispersionHandling::ProfiledGaussian);
+        if profiled_dispersion != input.profiled_scale.is_some() {
+            return Err(RemlLamlError::Failed(format!(
+                "the constrained Laplace term's input declares profiled_scale = {:?} against a \
+                 {} solution: the posterior it truncates and the criterion's own scale term would \
+                 describe two different dispersions (gam#2765, gam#3234)",
+                input.profiled_scale,
+                if profiled_dispersion {
+                    "profiled-Gaussian"
+                } else {
+                    "fixed-dispersion"
+                }
+            )));
         }
         if self.penalty_subspace_trace.is_some() {
             return Err(RemlLamlError::Failed(

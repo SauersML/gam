@@ -9215,6 +9215,10 @@ struct ConeFaceSwitchFixture {
     rows: Array2<f64>,
     bounds: Array1<f64>,
     switch: [f64; 2],
+    /// Whether the criterion profiles the Gaussian scale out. At fixed dispersion the term
+    /// truncates the objective's own posterior; at profiled dispersion it truncates `N(·, φ̂M⁻¹)`
+    /// and `φ̂` moves with ρ (gam#3234).
+    profiled: bool,
 }
 
 impl ConeFaceSwitchFixture {
@@ -9242,6 +9246,15 @@ impl ConeFaceSwitchFixture {
             rows,
             bounds,
             switch,
+            profiled: false,
+        }
+    }
+
+    /// The same fixture with the Gaussian scale profiled out.
+    fn profiled() -> Self {
+        Self {
+            profiled: true,
+            ..Self::new()
         }
     }
 
@@ -9297,11 +9310,13 @@ impl ConeFaceSwitchFixture {
         let (beta, active) = self.constrained_mode(rho);
         let gradient = self.precision(rho).dot(&beta) - &self.xty;
         let mut solution = build_gaussian_solution_at_beta(rho, beta, false);
-        solution.dispersion = DispersionHandling::Fixed {
-            phi: 1.0,
-            include_logdet_h: true,
-            include_logdet_s: true,
-        };
+        if !self.profiled {
+            solution.dispersion = DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            };
+        }
         // The builder differences `log|S|₊` numerically, and its second difference carries a
         // rounding error near 1e-6, the size of the disagreement graded here. `S₁` and `S₂` act on
         // disjoint coefficients, so `log|S|₊` is `Σ_k rank(S_k)·ρ_k` plus a constant: its first
@@ -9321,11 +9336,26 @@ impl ConeFaceSwitchFixture {
             }));
         }
         if priced {
+            // The production producer reads `φ̂` from this same function, from the same four
+            // quantities, so the posterior the term truncates and the one the criterion's
+            // `½ν·log(2πφ̂)` prices are one posterior (gam#3234).
+            let profiled_scale = self.profiled.then(|| {
+                profiled_gaussian_scale(
+                    solution.log_likelihood,
+                    solution.penalty_quadratic,
+                    solution.n_observations,
+                    solution.nullspace_dim,
+                    solution.dp_floor_scale,
+                )
+                .expect("the fixture leaves residual degrees of freedom")
+                .scale
+            });
             let input = ConeNormalizerInput {
                 rows: self.rows.clone(),
                 bounds: self.bounds.clone(),
                 gradient,
                 gradient_motion: ConeGradientMotion::Stationary,
+                profiled_scale,
             };
             let precision = self.precision(rho);
             let (term, lambda) = ConeNormalizerTerm::price(&input, &solution.beta, &precision)
@@ -9587,4 +9617,151 @@ pub(crate) fn the_constrained_criterion_moves_continuously_across_a_face_dimensi
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// gam#3234: at profiled Gaussian dispersion the constrained criterion's gradient is still the
+/// derivative of its value across a change of the active face's dimension, and the value still
+/// moves by what a continuous function can move over that gap.
+///
+/// The term truncates the posterior the scale describes, `N(·, φ̂M⁻¹)`, and `φ̂ = D_p/ν` moves
+/// with every outer coordinate. Two channels therefore reach the term: the family's own precision
+/// drift, and the scale, which rescales the precision and the KKT gradient together. If the
+/// second were dropped the gradient would be the derivative of a criterion evaluated at a frozen
+/// scale — a different function of ρ — so the test differences the criterion's own COST, with
+/// stencils that straddle the switch, and requires the analytic gradient to match.
+///
+/// The continuity bound is the gradient's own: over `[ρ_s − δ, ρ_s + δ]` the mean value theorem
+/// gives `|ΔV| ≤ 2δ·max|V'|`, and a second application bounds the interior slope by the larger
+/// endpoint slope plus `2δ` times the interior curvature, which the two endpoint gradients
+/// measure as their own secant `|g₊ − g₋|/(2δ)`. Nothing in it is a literal. The face
+/// determinant's step `½log(aᵀM⁻¹a)` must exceed it, so a bound that could not detect that step
+/// is itself a failure.
+#[test]
+pub(crate) fn the_profiled_constrained_criterion_is_differentiable_across_a_face_switch_3234() {
+    let fixture = ConeFaceSwitchFixture::profiled();
+    let switch = fixture.switch;
+    let row = fixture.rows.row(0).to_owned();
+    let unit_row = &row / row.dot(&row).sqrt();
+    let face_step = 0.5
+        * fixture
+            .factor(&switch)
+            .solve(&unit_row)
+            .dot(&unit_row)
+            .ln()
+            .abs();
+    // Central differences at steps h and h/2, Richardson-combined, with a bar of the two
+    // estimates' disagreement plus the rounding the coarse quotient amplifies.
+    let richardson = |f: &dyn Fn(f64) -> f64, h: f64| {
+        let (plus, minus) = (f(h), f(-h));
+        let coarse = (plus - minus) / (2.0 * h);
+        let fine = (f(0.5 * h) - f(-0.5 * h)) / h;
+        let rounding = f64::EPSILON * (plus.abs() + minus.abs()) / h;
+        (
+            (4.0 * fine - coarse) / 3.0,
+            (fine - coarse).abs() + 4.0 * rounding,
+        )
+    };
+    let step = 1.0e-2;
+    let offset = 0.25 * step;
+    let mut failures = Vec::new();
+    for (name, point) in [
+        ("below", [switch[0] - offset, switch[1]]),
+        ("above", [switch[0] + offset, switch[1]]),
+    ] {
+        let gradient = fixture.gradient(&point, true);
+        let unpriced = fixture.gradient(&point, false);
+        for coordinate in 0..point.len() {
+            let (fd, bar) = richardson(
+                &|t| fixture.cost(&fixture.displaced(&point, coordinate, t), true),
+                step,
+            );
+            let share = gradient[coordinate] - unpriced[coordinate];
+            eprintln!(
+                "[3234-PROFILED] {name} coordinate={coordinate} gradient={:.12e} fd={fd:.12e} \
+                 bar={bar:.3e} term_share={share:.6e}",
+                gradient[coordinate]
+            );
+            if (gradient[coordinate] - fd).abs() > bar {
+                failures.push(format!(
+                    "{name} gradient {coordinate}: {} against {fd} (bar {bar})",
+                    gradient[coordinate]
+                ));
+            }
+            if share.abs() <= bar {
+                failures.push(format!(
+                    "{name} term share {coordinate}: {share} within the bar {bar}"
+                ));
+            }
+        }
+    }
+    for delta in [1.0e-2, 2.5e-3] {
+        let below = [switch[0] - delta, switch[1]];
+        let above = [switch[0] + delta, switch[1]];
+        let (below_active, above_active) = (
+            fixture.constrained_mode(&below).1,
+            fixture.constrained_mode(&above).1,
+        );
+        if below_active.len() == above_active.len() {
+            failures.push(format!(
+                "delta {delta:e}: the two points do not straddle a face-dimension change: \
+                 {below_active:?} / {above_active:?}"
+            ));
+            continue;
+        }
+        let increment = fixture.cost(&above, true) - fixture.cost(&below, true);
+        let (slope_below, slope_above) = (
+            fixture.gradient(&below, true)[0],
+            fixture.gradient(&above, true)[0],
+        );
+        let bound = 2.0 * delta * slope_below.abs().max(slope_above.abs())
+            + 2.0 * delta * (slope_above - slope_below).abs();
+        eprintln!(
+            "[3234-PROFILED] delta={delta:e} increment={increment:.9e} bound={bound:.9e} \
+             face_step={face_step:.9e} slopes={slope_below:.6e},{slope_above:.6e} \
+             active={below_active:?}->{above_active:?}"
+        );
+        if increment.abs() > bound {
+            failures.push(format!(
+                "delta {delta:e}: the profiled constrained criterion moved {increment:e} across \
+                 the switch, above what a continuous criterion can move over that gap, {bound:e}"
+            ));
+        }
+        if face_step <= bound {
+            failures.push(format!(
+                "delta {delta:e}: the face determinant's step {face_step:e} is within the bound \
+                 {bound:e}, so this bound cannot detect the discontinuity it exists to detect"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// gam#3234: a criterion carrying the constrained Laplace term at PROFILED dispersion declares no
+/// outer Hessian, rather than publishing the fixed-scale matrix as if it were the second
+/// derivative of the value.
+///
+/// The positive control is the same fixture at FIXED dispersion, where the scale is not a
+/// function of ρ and the full second order is assembled: a refusal that fired everywhere would
+/// say nothing about the scale.
+#[test]
+pub(crate) fn a_profiled_constrained_criterion_declares_no_outer_hessian_3234() {
+    let fixed = ConeFaceSwitchFixture::new();
+    let point = [fixed.switch[0] - 0.25e-2, fixed.switch[1]];
+    let assembled = fixed.evaluate(&point, EvalMode::ValueGradientHessian, true);
+    assert!(
+        matches!(assembled.hessian, gam_problem::HessianValue::Dense(_)),
+        "at fixed dispersion the term's outer Hessian is assembled: {:?}",
+        assembled.hessian
+    );
+    let profiled = ConeFaceSwitchFixture::profiled();
+    let declined = profiled.evaluate(&point, EvalMode::ValueGradientHessian, true);
+    assert!(
+        matches!(declined.hessian, gam_problem::HessianValue::Unavailable),
+        "at profiled dispersion the term declares no outer Hessian: {:?}",
+        declined.hessian
+    );
+    assert!(
+        declined.gradient.is_some(),
+        "the value and gradient are published where the Hessian is not"
+    );
 }

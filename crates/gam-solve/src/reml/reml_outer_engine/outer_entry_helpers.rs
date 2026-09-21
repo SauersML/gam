@@ -268,6 +268,53 @@ pub(crate) fn profiled_gaussian_residual_dof(
     }
 }
 
+/// The profiled Gaussian scale `φ̂ = D_p/ν` at an inner mode, with the pieces the criterion's
+/// value and derivatives read.
+///
+/// `D_p = −2ℓ(β̂) + β̂ᵀS_λβ̂` is the penalized deviance, floored smoothly and relative to the
+/// response's own deviance scale ([`crate::estimate::smooth_floor_dp`]), and `ν = n − M_p` is the
+/// residual degrees of freedom the scale is estimated from.
+pub(crate) struct ProfiledGaussianScale {
+    /// `D_p` before the floor, which the ρ audit reports beside the floored value.
+    pub(crate) raw_deviance: f64,
+    /// The floored `D_p` and the floor's first and second derivatives in the raw deviance.
+    pub(crate) deviance: f64,
+    pub(crate) deviance_gradient: f64,
+    pub(crate) deviance_curvature: f64,
+    /// `ν = n − M_p`.
+    pub(crate) residual_dof: f64,
+    /// `φ̂ = D_p/ν`.
+    pub(crate) scale: f64,
+}
+
+/// The profiled Gaussian scale at an inner mode, from the four quantities it is a function of.
+///
+/// This is the ONE rule for `φ̂`. The criterion reads it in [`reml_laml_evaluate`], and the
+/// constrained Laplace term reads it again when it prices its integral on the posterior precision
+/// `H/φ̂` (gam#2765): two spellings of `φ̂` would price two posteriors for one mode, and the
+/// term's gradient would then not be the derivative of the criterion's value.
+pub(crate) fn profiled_gaussian_scale(
+    log_likelihood: f64,
+    penalty_quadratic: f64,
+    n_observations: usize,
+    nullspace_dim: f64,
+    deviance_floor_scale: f64,
+) -> Result<ProfiledGaussianScale, String> {
+    // `penalty_quadratic` is the FULL `β̂ᵀSλβ̂`; the criterion halves it itself.
+    let raw_deviance = -2.0 * log_likelihood + penalty_quadratic;
+    let (deviance, deviance_gradient, deviance_curvature) =
+        crate::estimate::smooth_floor_dp(raw_deviance, deviance_floor_scale);
+    let residual_dof = profiled_gaussian_residual_dof(n_observations, nullspace_dim)?;
+    Ok(ProfiledGaussianScale {
+        raw_deviance,
+        deviance,
+        deviance_gradient,
+        deviance_curvature,
+        residual_dof,
+        scale: deviance / residual_dof,
+    })
+}
+
 /// Apply the curvature-conditioning scale `s = rho_curvature_scale` to a
 /// raw ρ-coordinate `λ_k = exp(ρ_k)`.
 ///
@@ -1779,6 +1826,7 @@ pub(crate) fn try_tangent_projected_evaluate(
             Arc::new(ConeNormalizerTerm {
                 gradient_motion,
                 laplace: term.laplace.clone(),
+                profiled: term.profiled.clone(),
             })
         }),
     };

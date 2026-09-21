@@ -35,6 +35,14 @@ pub struct ConeNormalizerInput {
     pub gradient: Array1<f64>,
     /// How that gradient moves with the outer coordinates.
     pub gradient_motion: ConeGradientMotion,
+    /// `Some(φ̂)` where the criterion profiles a Gaussian scale out, `None` at fixed dispersion.
+    ///
+    /// The Laplace integral the term normalizes is `∫_{Aβ ≥ b} exp(−E(β)/φ̂) dβ`, so the
+    /// posterior it truncates has precision `M/φ̂` and KKT gradient `g/φ̂`. At fixed dispersion
+    /// `φ̂` is 1 and the two are the objective's own. Read through
+    /// [`profiled_gaussian_scale`](super::profiled_gaussian_scale), the one rule for `φ̂`, so
+    /// the term and the criterion cannot price two posteriors for one mode (gam#2765).
+    pub profiled_scale: Option<f64>,
 }
 
 /// How the KKT gradient `g = ∇F(β̂(θ), θ)` moves along an outer coordinate (gam#2765).
@@ -66,6 +74,39 @@ pub struct ConeNormalizerTerm {
     pub laplace: crate::constrained_posterior::ConeLaplace,
     /// How `∇F(β̂)` moves along an outer coordinate.
     pub gradient_motion: ConeGradientMotion,
+    /// The state a profiled scale's own motion moves, `None` at fixed dispersion where `φ̂` is
+    /// not a function of the outer coordinates.
+    pub profiled: Option<ProfiledConeScale>,
+}
+
+/// What a profiled Gaussian scale contributes to the constrained Laplace term's derivatives
+/// (gam#2765, gam#3234).
+///
+/// At profiled dispersion the posterior the term truncates is `N(·, (M/φ̂)⁻¹)`, and `φ̂ = D_p/ν`
+/// moves with every outer coordinate. So the precision and the KKT gradient the term reads move
+/// through TWO channels: the family's own drift `Ṁ`, and the scale, which rescales both. Writing
+/// `ℓ_k = φ̂̇_k/φ̂`,
+///
+/// ```text
+/// d(M/φ̂)/dθ_k = Ṁ_k/φ̂ − ℓ_k·(M/φ̂),    d(g/φ̂)/dθ_k = ġ_k/φ̂ − ℓ_k·(g/φ̂),
+/// ```
+///
+/// which is why the second term of each is held here, already applied to the two vectors
+/// [`ConeLaplaceMotion`](crate::constrained_posterior::ConeLaplaceMotion) contracts them with.
+#[derive(Clone, Debug)]
+pub struct ProfiledConeScale {
+    /// `g/φ̂`, the KKT gradient the term was priced on.
+    pub gradient: Array1<f64>,
+    /// `(M/φ̂)δ̄` and `(M/φ̂)R`, `R = Λ⁻¹Aᵀ`.
+    pub precision_on_mean: Array1<f64>,
+    pub precision_on_normals: Array2<f64>,
+    /// `tr(Λ⁻¹AᵀT̃A) = p − tr(Λ⁻¹M/φ̂)`.
+    ///
+    /// The criterion's log-determinant is taken on `Λ̃ = M + φ̂AᵀT̃A`, so its own gradient trace
+    /// prices `½tr(Λ̃⁻¹Ṁ_k)` and misses the scale channel of the determinant entirely. The
+    /// difference is exactly `½ℓ_k` times this trace: `½ℓ_k[p − tr(Λ̃⁻¹M)]`, with the `p` coming
+    /// from `(p/2)ln φ̂`, the part of `½ln|Λ̃|` that is pure scale.
+    pub trace_deficit: f64,
 }
 
 impl ConeNormalizerTerm {
@@ -86,18 +127,52 @@ impl ConeNormalizerTerm {
         beta: &Array1<f64>,
         precision: &Array2<f64>,
     ) -> Result<(Self, Array2<f64>), crate::constrained_posterior::ConeLaplaceRefusal> {
+        // The integral is `∫_{Aβ ≥ b} exp(−E(β)/φ̂)`, so the posterior it truncates has precision
+        // `M/φ̂` and gradient `g/φ̂`. At fixed dispersion `φ̂` is 1 and both are the objective's
+        // own; a profiled scale divides them, and `Λ̃ = φ̂Λ = M + φ̂AᵀT̃A` multiplies back, so the
+        // criterion's log-determinant stays on a precision in the objective's units.
+        let phi = input.profiled_scale.unwrap_or(1.0);
+        let scaled_precision = if phi == 1.0 {
+            precision.clone()
+        } else {
+            precision.mapv(|value| value / phi)
+        };
+        let scaled_gradient = if phi == 1.0 {
+            input.gradient.clone()
+        } else {
+            input.gradient.mapv(|value| value / phi)
+        };
         let laplace = crate::constrained_posterior::ConeLaplace::evaluate(
             &input.rows,
             &input.bounds,
             beta,
-            &input.gradient,
-            precision,
+            &scaled_gradient,
+            &scaled_precision,
         )?;
-        let lambda = laplace.laplace_precision().clone();
+        let mut lambda = laplace.laplace_precision().clone();
+        if phi != 1.0 {
+            lambda.mapv_inplace(|value| value * phi);
+        }
+        let profiled = input.profiled_scale.map(|_| {
+            let inverse = laplace.laplace_precision_inverse();
+            // Both factors are symmetric, so the trace is their entrywise product.
+            let kept: f64 = inverse
+                .iter()
+                .zip(scaled_precision.iter())
+                .map(|(left, right)| left * right)
+                .sum();
+            ProfiledConeScale {
+                precision_on_mean: scaled_precision.dot(laplace.mean_offset()),
+                precision_on_normals: scaled_precision.dot(laplace.normal_solves()),
+                trace_deficit: beta.len() as f64 - kept,
+                gradient: scaled_gradient,
+            }
+        });
         Ok((
             Self {
                 laplace,
                 gradient_motion: input.gradient_motion.clone(),
+                profiled,
             },
             lambda,
         ))

@@ -1,6 +1,5 @@
 use super::*;
 use crate::estimate::reml::atoms::CriterionAtom;
-use crate::estimate::smooth_floor_dp;
 
 /// `tr(G_ε(H) · λ_k S_k)` from the coordinate's penalty ROOT, when it has one.
 ///
@@ -196,11 +195,25 @@ pub(crate) fn reml_laml_evaluate(
             // `dp_raw = deviance + penalty = −2ℓ + βᵀSβ`. The atom carries the
             // ½-scaled penalty energy, so the deviance-scale (un-halved) penalty
             // is `2 · penalty_quad_value`.
-            let dp_raw = -2.0 * solution.log_likelihood + 2.0 * penalty_quad_value;
-            let (dp_c, dp_cgrad, dp_cgrad2) = smooth_floor_dp(dp_raw, solution.dp_floor_scale);
-            let denom =
-                profiled_gaussian_residual_dof(solution.n_observations, solution.nullspace_dim)?;
-            let phi = dp_c / denom;
+            //
+            // gam#3234: the constrained Laplace term prices its integral on the posterior
+            // `φ̂` describes, so `φ̂` is read here through the one rule both it and this criterion
+            // call, rather than spelled twice.
+            let profiled = profiled_gaussian_scale(
+                solution.log_likelihood,
+                2.0 * penalty_quad_value,
+                solution.n_observations,
+                solution.nullspace_dim,
+                solution.dp_floor_scale,
+            )?;
+            let dp_raw = profiled.raw_deviance;
+            let (dp_c, dp_cgrad, dp_cgrad2) = (
+                profiled.deviance,
+                profiled.deviance_gradient,
+                profiled.deviance_curvature,
+            );
+            let denom = profiled.residual_dof;
+            let phi = profiled.scale;
 
             let cost = dp_c / (2.0 * phi)
                 + 0.5 * (log_det_h - log_det_s)
@@ -614,6 +627,16 @@ pub(crate) fn reml_laml_evaluate(
             Some(term)
         }
         _ => None,
+    };
+    // gam#3234: a term priced on a profiled posterior reads `φ̂`'s own motion, and the criterion's
+    // log-determinant gradient does not carry it. `ν` is the denominator that turns the profiled
+    // penalty channel into `ℓ_k = φ̂̇_k/φ̂`; it is the one the cost above priced.
+    let cone_profiled_dof = match cone_term.and_then(|term| term.profiled.as_ref()) {
+        Some(_) => Some(profiled_gaussian_residual_dof(
+            solution.n_observations,
+            solution.nullspace_dim,
+        )?),
+        None => None,
     };
     let logdet_h_component = if incl_logdet_h { 0.5 * log_det_h } else { 0.0 };
     let logdet_s_component = if incl_logdet_s { -0.5 * log_det_s } else { 0.0 };
@@ -1661,7 +1684,7 @@ pub(crate) fn reml_laml_evaluate(
                 (&ext_v_is[coordinate - k], &solution.ext_coords[coordinate - k].g)
             };
             let mode_response = -response;
-            let gradient_rate = match &term.gradient_motion {
+            let mut gradient_rate = match &term.gradient_motion {
                 ConeGradientMotion::Stationary => Array1::zeros(mode_response.len()),
                 ConeGradientMotion::OnFace(stationarity) => {
                     (stationarity.dot(&mode_response) + fixed_beta_rate) / cone_scale
@@ -1669,12 +1692,36 @@ pub(crate) fn reml_laml_evaluate(
                 ConeGradientMotion::Pinned => fixed_beta_rate / cone_scale,
             };
             let drift = &drifts[coordinate];
-            let precision_rate_on_mean = drift.apply(&mean_offset) / cone_scale;
+            let mut precision_rate_on_mean = drift.apply(&mean_offset) / cone_scale;
             let mut precision_rate_on_normals = Array2::<f64>::zeros(normal_solves.raw_dim());
             for column in 0..normal_solves.ncols() {
                 precision_rate_on_normals
                     .column_mut(column)
                     .assign(&(drift.apply(&normal_solves.column(column).to_owned()) / cone_scale));
+            }
+            // gam#3234: at profiled dispersion the posterior the term truncates is
+            // `N(·, (M/φ̂)⁻¹)`, and `φ̂` moves with this coordinate too. The precision and the KKT
+            // gradient therefore move by `Ṁ_k/φ̂ − ℓ_k(M/φ̂)` and `ġ_k/φ̂ − ℓ_k(g/φ̂)`, with
+            // `ℓ_k = φ̂̇_k/φ̂`. Since `φ̂ = D_p/ν` and the fixed-β cost derivative `a_k` is half the
+            // raw deviance's, `ℓ_k = 2·dp_cgrad·a_k/(νφ̂)` — the profiled penalty channel this
+            // gradient already prices, read through the same two scalars.
+            if let (Some(profiled), Some(residual_dof)) =
+                (term.profiled.as_ref(), cone_profiled_dof)
+            {
+                let fixed_beta_cost_rate = if coordinate < k {
+                    penalty_quad_atom.rho_frozen_d1(coordinate)
+                } else {
+                    solution.ext_coords[coordinate - k].a
+                };
+                let ell = 2.0 * dp_cgrad * fixed_beta_cost_rate / (residual_dof * profiled_scale);
+                gradient_rate = gradient_rate / profiled_scale - &profiled.gradient * ell;
+                precision_rate_on_mean =
+                    precision_rate_on_mean / profiled_scale - &profiled.precision_on_mean * ell;
+                precision_rate_on_normals = precision_rate_on_normals / profiled_scale
+                    - &profiled.precision_on_normals * ell;
+                // `½ℓ_k[p − tr(Λ̃⁻¹M)]`: the scale channel of `½ln|Λ̃|`, which the criterion's own
+                // trace `½tr(Λ̃⁻¹Ṁ_k)` does not see.
+                grad[coordinate] += 0.5 * ell * profiled.trace_deficit;
             }
             let motion = crate::constrained_posterior::ConeLaplaceMotion {
                 mode_response,
@@ -1773,6 +1820,18 @@ pub(crate) fn reml_laml_evaluate(
     // dispatch at the top of this function (`try_tangent_projected_evaluate`,
     // refs Wood 2011 §4; Wood–Pya–Säfken 2016 §3; Marra–Wood 2012 §2).
     let envelope_suppresses_outputs = envelope_inconsistent.is_some();
+    // gam#3234: the second derivative of a term priced on a PROFILED posterior is not assembled.
+    // `d²L` there carries the scale's own second-order channel — the pair terms
+    // `−½ℓ_l tr(Λ̃⁻¹Ṁ_k(I − Λ̃⁻¹M))` and their transpose, `½ℓ_kℓ_l tr(Λ̃⁻¹M(I − Λ̃⁻¹M))`, and
+    // `½ℓ̇_kl` times the same trace deficit the gradient prices — and `ℓ̇_kl` is a function of
+    // `d²D_p`, which is assembled a function away from here. Publishing the fixed-scale Hessian
+    // in its place would hand the outer search a matrix that is not the second derivative of the
+    // value it certifies against. The criterion declares no Hessian instead, and the outer plan
+    // reads that declaration before the search starts.
+    let profiled_cone_declines_hessian = solution
+        .cone_normalizer
+        .as_deref()
+        .is_some_and(|term| term.profiled.is_some());
     if envelope_inconsistent.is_some()
         && matches!(solution.dispersion, DispersionHandling::Fixed { .. })
         && solution.kkt_residual.is_none()
@@ -1795,7 +1854,11 @@ pub(crate) fn reml_laml_evaluate(
     // gam#2765: the constrained Laplace term's exact outer Hessian, added to whichever route
     // assembles the rest of it.
     let cone_hessian: Option<Array2<f64>> = match cone_term {
-        Some(term) if mode == EvalMode::ValueGradientHessian && !envelope_suppresses_outputs => {
+        Some(term)
+            if mode == EvalMode::ValueGradientHessian
+                && !envelope_suppresses_outputs
+                && !profiled_cone_declines_hessian =>
+        {
             let rho_vs = rho_v_ks
                 .as_ref()
                 .expect("the constrained Laplace term requests every rho mode response");
@@ -1823,7 +1886,10 @@ pub(crate) fn reml_laml_evaluate(
         }
         _ => None,
     };
-    let hessian = if mode == EvalMode::ValueGradientHessian && !envelope_suppresses_outputs {
+    let hessian = if mode == EvalMode::ValueGradientHessian
+        && !envelope_suppresses_outputs
+        && !profiled_cone_declines_hessian
+    {
         // First, allow the family to short-circuit with its own exact outer
         // Hv operator.  Default `None` keeps the fall-through identical to
         // the historical kernel-based assembly path; CTN/survival/GAMLSS

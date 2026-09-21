@@ -1639,7 +1639,7 @@ where
                 .as_ref()
                 .and_then(|rho| rho.as_slice())
                 .or(heuristic_log_lambdas);
-            let analytic_outer_hessian_available = reml_state.analytic_outer_hessian_enabled();
+            let analytic_outer_hessian_available = reml_state.declares_analytic_outer_hessian();
             // Every family's search consumes the declared exact outer Hessian
             // (ARC), as profiled Gaussian identity always has. The #2359 split
             // that held non-Gaussian links to gradient-only BFGS, paying the
@@ -1660,6 +1660,13 @@ where
                         fit_linear_constraints.as_ref(),
                     ),
                 )
+                // gam#2765: the EFS multiplicative fixed point models the penalty-trace structure
+                // of the criterion's gradient. A criterion carrying the constrained Laplace term
+                // has a share of that gradient which is not a penalty trace at all, so its fixed
+                // point is the fixed point of a DIFFERENT criterion — the same reason the
+                // custom-family route refuses EFS at a constrained mode. Declared here, before
+                // the plan is chosen, rather than discovered when the iteration stops moving.
+                .with_disable_fixed_point(reml_state.fit_prices_constrained_laplace())
                 .with_tolerance(reml_tol)
                 .with_inner_progress_feedback(reml_inner_progress_feedback(&reml_state))
                 .with_problem_size(n_obs, x_o.ncols())

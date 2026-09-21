@@ -2362,6 +2362,9 @@ pub(crate) fn custom_family_cone_normalizer_input<F: CustomFamily + Clone + Send
             bounds: Array1::from(bounds),
             gradient,
             gradient_motion: gam_solve::estimate::reml::reml_outer_engine::ConeGradientMotion::Stationary,
+            // Every custom family evaluates at fixed dispersion, so the posterior the term
+            // truncates is the objective's own and no scale divides it (gam#3234).
+            profiled_scale: None,
         },
     )))
 }

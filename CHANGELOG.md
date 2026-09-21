@@ -44,6 +44,37 @@
   `f = 1296.327` (rank 30, one active constraint) and `f = 1296.533` (rank 31, interior), a search
   that started on rank 31, and every rank-30 trial refused, so the seed halted on the inferior
   branch at cost 1316.731 with |g| = 2.8.
+- **A shape-constrained Gaussian fit still priced its criterion on the active face, because the
+  constrained cone term refused a profiled scale** (gam#3234, gam#2765 stage 2). The term
+  normalizes `∫_{Aβ ≥ b} exp(−E(β)/φ̂)`, so the posterior it truncates has precision `M/φ̂` and
+  KKT gradient `g/φ̂`; at fixed dispersion `φ̂` is 1 and it was priced, and at profiled dispersion
+  it was refused, which left exactly the fits the issue reports — a default `te(x, z, shape=[…])`
+  on a Gaussian response — on the face determinant whose value falls by `½log(aᵀM⁻¹a)` the
+  instant a row activates. The term is now priced there too: the producer reads `φ̂` through the
+  same `profiled_gaussian_scale` the criterion's own `½ν·log(2πφ̂)` reads, from the same four
+  quantities, so the two cannot describe different posteriors for one mode; the term divides both
+  its inputs by it; and the criterion's log-determinant is taken on `Λ̃ = M + φ̂AᵀT̃A`, which
+  carries the `(p/2)log φ̂` the profiled value already owes. The gradient carries the scale's own
+  channel, not just the family's: `φ̂ = D_p/ν` moves with every coordinate, so the precision and
+  the gradient move by `Ṁ_k/φ̂ − ℓ_kM/φ̂` and `ġ_k/φ̂ − ℓ_kg/φ̂` with `ℓ_k = φ̂̇_k/φ̂`, and the
+  determinant gains `½ℓ_k·tr(Λ̃⁻¹AᵀT̃A)` — a term the criterion's own trace `½tr(Λ̃⁻¹Ṁ_k)` cannot
+  see. `ℓ_k` is not a new quantity: it is `2·dp_cgrad·a_k/(νφ̂)`, the profiled penalty channel the
+  gradient already prices, read through the same two scalars.
+- **An EFS fixed point iterated a criterion the standard route no longer evaluates** (gam#2765).
+  The multiplicative update models the penalty-trace structure of the criterion's gradient, and a
+  criterion carrying the constrained Laplace term has a share of that gradient which is not a
+  penalty trace at all, so its fixed point is the fixed point of a different function. The
+  custom-family route has refused EFS at a constrained mode since the term existed; the standard
+  route now declares the same refusal, at plan time rather than when the iteration stops moving.
+- **The profiled constrained criterion declares no outer Hessian instead of publishing the
+  fixed-scale one** (gam#3234). `d²L` at a profiled scale carries the scale's second-order
+  channel, whose `d²log φ̂` is a function of `d²D_p`, assembled a function away from the term's
+  own pair loop. Publishing the fixed-scale matrix as the analytic Hessian would hand the outer
+  search a matrix that is not the second derivative of the value it certifies against, so the
+  evaluator assembles none and the outer plan reads that declaration before the search starts:
+  those fits search on the analytic gradient. A reader should check that the fixed-dispersion
+  route still assembles its Hessian, which is the control that makes the refusal a statement
+  about the scale rather than about constrained modes.
 - **One error variant was reporting four different failures, with a condition number no
   producer ever computed** (gam#4468).
   `EstimationError::ModelIsIllConditioned { condition_number }` was constructed at 38
