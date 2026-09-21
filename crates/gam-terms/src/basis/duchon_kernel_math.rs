@@ -3679,8 +3679,31 @@ mod duchon_hybrid_psd_tests {
         }
     }
 
-    /// The `d = 1, p = 2, s = 2` hybrid kernel with its polynomial head
-    /// removed, in closed form and independent of the production assembly.
+    /// How many binary64 roundings one hybrid-kernel assembly costs, in ulp
+    /// of its own absolute scale.
+    ///
+    /// Charged per call: a `gamma_lanczos` at two ulp (its own doc at
+    /// [`bessel_k_half_integer_order`] records the Lanczos form as accurate to
+    /// about one ulp at the integer and half-integer arguments this shape
+    /// uses), a libm `powf`, `powi`, `exp` or `ln` at four (the portable
+    /// contract for those, not the one ulp a particular libm may reach), the
+    /// half-integer Bessel-K at eight for its closed-form seed and upward
+    /// recurrence, and one each for a multiply or divide. That makes a block
+    /// VALUE twenty-two (two `powf`, one `gamma_lanczos`, the Bessel-K, four
+    /// multiplies) and one block's Taylor coefficient at one order sixteen
+    /// (three `gamma_lanczos`, a `powf`, a `powi`, five multiplies or
+    /// divides). Every sum over them runs through `CompensatedSum`, two ulp of
+    /// the absolute sum whatever the term count, and the series form stops
+    /// only where it has certified its untaken tail below one ulp of that same
+    /// sum: at most seven more. Forty-eight ulp of an assembly's absolute
+    /// scale bounds each of the sums the evaluator can answer from.
+    const KERNEL_ULPS: f64 = 48.0;
+
+    /// The `d = 1, p = 2, s = 2` hybrid kernel in closed form and independent
+    /// of the production assembly: its value, the polynomial head the
+    /// constraint null space annihilates, the reduced kernel that is their
+    /// difference, and the absolute scales each assembly of the reduced value
+    /// rounds against.
     ///
     /// The partial-fraction data of that shape are `a₁ = −2κ^{-6}`,
     /// `a₂ = κ^{-4}`, `b₁ = 2κ^{-6}`, `b₂ = κ^{-4}` over blocks `Φ₁ = −r/2`,
@@ -3691,24 +3714,65 @@ mod duchon_hybrid_psd_tests {
     /// polyharmonic blocks EXACTLY, leaving
     /// `φ(r) = κ^{-7} Σ_k (−1)^k (5/4 − k/4) z^k / k!`
     /// for every `k ∉ {1, 3}`. The head the constraint null space annihilates
-    /// is `k = 0` and `k = 2`, so the reduced kernel is that series from
-    /// `k = 4`, whose first orders are `z⁴/96`, `0·z⁵`, `−z⁶/2880` and
-    /// `z⁷/10080`.
-    fn d1_p2_s2_reduced_closed_form(r: f64, length_scale: f64) -> f64 {
+    /// is `k = 0` and `k = 2` — `κ^{-7}(5/4 + (3/8) z²)` — so the reduced
+    /// kernel is that series from `k = 4`, whose first orders are `z⁴/96`,
+    /// `0·z⁵`, `−z⁶/2880` and `z⁷/10080`.
+    ///
+    /// Every one of the four blocks is POSITIVE at every radius here, so the
+    /// absolute sum the value form rounds against is `φ(r)` itself and the
+    /// difference form's is `φ(r) + head(r)`.
+    struct D1P2S2ClosedForm {
+        /// `φ(r)`, and the absolute scale of the four-block value assembly.
+        value: f64,
+        /// The absolute scale of the head's own assembly,
+        /// `κ^{-7}(5/4 + (7/8) z²)`. The `r⁰` order is `κ^{-7}` from `b₁M₁`
+        /// plus `κ^{-7}/4` from `b₂M₂`, both positive, so its scale IS its
+        /// value `5/4`; the `r²` order is `1/2`, `−1/4` and `1/8` of
+        /// `κ^{-5}`, which sum to `3/8` but are assembled from `7/8`.
+        head_scale: f64,
+        /// `φ(r) − κ^{-7}(5/4 + (3/8) z²)`.
+        reduced: f64,
+        /// `Σ_{k≥4} κ^{-7} z^k (1 + (k−1)/4) / k!`: the sum of the ABSOLUTE
+        /// contributions the two Matérn blocks make to the orders the
+        /// reduction keeps, since `b₁ M₁ = κ^{-7} e^{-z}` contributes
+        /// `κ^{-7}(−z)^k/k!` and `b₂ M₂ = κ^{-7} e^{-z}(1 + z)/4` contributes
+        /// `κ^{-7}(−1)^k (1−k) z^k/(4 k!)`, while the polyharmonic blocks
+        /// reach only `k = 1` and `k = 3`, both below the first order kept.
+        series_scale: f64,
+        /// This reference's own rounding: order `k` is formed with four
+        /// roundings and inherits one from each of the two recurrences that
+        /// carried `k!` and `z^k` to it, so it carries `2(k−4) + 4` ulp of
+        /// its own magnitude.
+        reference_rounding: f64,
+    }
+
+    fn d1_p2_s2_closed_form(r: f64, length_scale: f64) -> D1P2S2ClosedForm {
         let kappa = 1.0 / length_scale;
+        let scale = kappa.powi(-7);
         let z = kappa * r;
-        let mut sum = 0.0_f64;
+        let mut reduced = 0.0_f64;
+        let mut series_scale = 0.0_f64;
+        let mut reference_rounding = 0.0_f64;
         let mut factorial = 24.0_f64; // 4!
         let mut z_power = z * z * z * z;
         // `z ≤ 4` on every fixture below and the terms fall off as `z/k`, so by
         // `k = 60` the omitted tail is under 1e-40 of the leading order.
         for k in 4..60usize {
             let sign = if k.is_multiple_of(2) { 1.0 } else { -1.0 };
-            sum += sign * (1.25 - 0.25 * k as f64) / factorial * z_power;
+            let term = sign * (1.25 - 0.25 * k as f64) / factorial * z_power;
+            reduced += term;
+            series_scale += (1.0 + 0.25 * (k as f64 - 1.0)) / factorial * z_power;
+            reference_rounding += (2.0 * (k as f64 - 4.0) + 4.0) * f64::EPSILON * term.abs();
             factorial *= (k + 1) as f64;
             z_power *= z;
         }
-        sum * kappa.powi(-7)
+        D1P2S2ClosedForm {
+            value: scale * (z + z * z * z / 12.0 + (-z).exp() * (1.25 + 0.25 * z)),
+            head_scale: scale * (1.25 + 0.875 * z * z),
+            reduced: scale * reduced,
+            series_scale: scale * series_scale,
+            reference_rounding: scale * reference_rounding,
+        }
     }
 
     /// gam#4558 — the null-space-reduced hybrid kernel against that closed
@@ -3717,9 +3781,12 @@ mod duchon_hybrid_psd_tests {
     /// The point of the reduction is the long length scale: at
     /// `length_scale = 100` the kernel's own value is `≈ 1.25e14` while the
     /// reduced value at `r = 1` is `≈ 1.0e4`, so a form that computes the
-    /// value and subtracts cannot carry more than about seven digits. The bar
-    /// here is relative and the same at every scale, so a route that degraded
-    /// with `κ` would fail at the long end while passing at the short one.
+    /// value and subtracts cannot carry more than about seven digits. The band
+    /// is the two assemblies' own counted rounding, which at
+    /// `length_scale = 100` is `1e−13` of the value and at `length_scale = 0.5`
+    /// is `1e−15` of it — a route that subtracted the head numerically would
+    /// miss it by six decades at the long end while clearing it at the short
+    /// one.
     #[test]
     fn nullspace_reduced_hybrid_kernel_matches_its_closed_form_4558() {
         let (d, p_order, s_order) = (1usize, 2usize, 2usize);
@@ -3736,12 +3803,23 @@ mod duchon_hybrid_psd_tests {
                     &coeffs,
                 )
                 .expect("the reduced hybrid kernel is defined for d=1, p=2, s=2");
-                let want = d1_p2_s2_reduced_closed_form(r, length_scale);
-                let relative = (got - want).abs() / want.abs().max(f64::MIN_POSITIVE);
+                let want = d1_p2_s2_closed_form(r, length_scale);
+                // The evaluator answers with whichever of its two forms bounds
+                // its own assembly more tightly, so its error is `KERNEL_ULPS`
+                // of the smaller absolute scale: the series' per-order block
+                // contributions, or the difference form's `φ` — the absolute
+                // sum of the four blocks, every one of them positive here —
+                // plus the head's own assembly. This reference's rounding is
+                // counted term by term as it sums.
+                let assembly = want.series_scale.min(want.value.abs() + want.head_scale);
+                let band = KERNEL_ULPS * f64::EPSILON * assembly + want.reference_rounding;
+                let error = (got - want.reduced).abs();
                 assert!(
-                    relative <= 1.0e-12,
+                    error <= band,
                     "reduced hybrid kernel at ls={length_scale}, r={r}: got {got:.17e}, \
-                     closed form {want:.17e} (relative {relative:.3e})"
+                     closed form {:.17e}; error {error:.3e} against the two assemblies' \
+                     own rounding {band:.3e}",
+                    want.reduced
                 );
             }
             // The head is the whole value at the origin, so the reduced
@@ -3762,10 +3840,26 @@ mod duchon_hybrid_psd_tests {
         }
     }
 
+    /// `max_j Σ_i |Z_ij|`, the factor by which one contraction against the
+    /// constraint chart can magnify a per-entry perturbation of its operand.
+    ///
+    /// `Zᵀ M Z` contracts over the `k` centers twice, so a per-entry
+    /// perturbation `δ` of `M` reaches the projection as at most
+    /// `column_sum² δ`, and the products' own rounding — at most
+    /// `k ε Σ_l |A_il| |B_lj|` for an inner dimension of `k`, once per
+    /// product — reaches it as at most `2 k ε column_sum² max|M|`.
+    fn nullspace_column_sum(z: &Array2<f64>) -> f64 {
+        (0..z.ncols())
+            .map(|j| z.column(j).iter().map(|v| v.abs()).sum::<f64>())
+            .fold(0.0_f64, f64::max)
+    }
+
     /// gam#4558 — the identity the reduction rests on: the Duchon constraint
     /// null space annihilates every even power `r^{2j}` with `j < p`, which is
     /// exactly the head the reduced kernel drops. `r^{2p}` is NOT annihilated,
-    /// so the test also shows the head stops where it is claimed to.
+    /// and its projection has a closed form of its own, so the head is shown to
+    /// stop exactly where it is claimed to rather than merely to leave
+    /// something behind.
     #[test]
     fn constraint_nullspace_annihilates_the_head_the_reduction_drops_4558() {
         let d = 1usize;
@@ -3775,6 +3869,15 @@ mod duchon_hybrid_psd_tests {
         let z = kernel_constraint_nullspace(centers.view(), nullspace_order, &mut cache)
             .expect("constraint null space");
         let k = centers.nrows();
+        // In `d = 1`, `r⁴ = x⁴ − 4x³y + 6x²y² − 4xy³ + y⁴`, and `Z` annihilates
+        // every term carrying a factor of degree `≤ p−1 = 1` on one side. Only
+        // `6 (x²)(y²)ᵀ` survives, so the exact projection of `r⁴` is `6 u uᵀ`
+        // with `u = Zᵀ x²` — the closed form the `r⁰` and `r²` zeros are the
+        // other face of.
+        let squares = Array2::from_shape_fn((k, 1), |(i, _)| centers[[i, 0]] * centers[[i, 0]]);
+        let u = fast_atb(&z, &squares);
+        let quartic = fast_ab(&u, &u.t().to_owned()).mapv(|value| 6.0 * value);
+        let column_sum = nullspace_column_sum(&z);
         for power in [0usize, 2, 4] {
             let mut matrix = Array2::<f64>::zeros((k, k));
             for i in 0..k {
@@ -3785,18 +3888,32 @@ mod duchon_hybrid_psd_tests {
             }
             let scale = matrix.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
             let projected = fast_ab(&fast_atb(&z, &matrix), &z);
-            let projected_scale = projected.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
-            if power < 2 * duchon_p_from_nullspace_order(nullspace_order) {
-                assert!(
-                    projected_scale <= 1.0e-13 * scale.max(1.0),
-                    "Zᵀ r^{power} Z must vanish identically: max|·| = {projected_scale:.3e} \
-                     against a max|r^{power}| of {scale:.3e}"
-                );
+            let band = 2.0 * k as f64 * f64::EPSILON * column_sum * column_sum * scale;
+            let exact = if power < 2 * duchon_p_from_nullspace_order(nullspace_order) {
+                Array2::<f64>::zeros((z.ncols(), z.ncols()))
             } else {
+                quartic.clone()
+            };
+            let mut worst = 0.0_f64;
+            for (got, want) in projected.iter().zip(exact.iter()) {
+                worst = worst.max((got - want).abs());
+            }
+            assert!(
+                worst <= band,
+                "Zᵀ r^{power} Z misses its closed form by {worst:.3e}, above the two \
+                 contractions' own rounding {band:.3e} on a max|r^{power}| of {scale:.3e}"
+            );
+            let exact_peak = exact.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+            if power < 2 * duchon_p_from_nullspace_order(nullspace_order) {
+                assert_eq!(exact_peak, 0.0, "the head's projection is identically zero");
+            } else {
+                // The control is only a control if its closed form is outside
+                // the band the vanishing cases are inside.
                 assert!(
-                    projected_scale >= 1.0e-3 * scale,
-                    "Zᵀ r^{power} Z must NOT vanish — the head stops below r^{{2p}}: \
-                     max|·| = {projected_scale:.3e} against a max|r^{power}| of {scale:.3e}"
+                    exact_peak > band,
+                    "Zᵀ r⁴ Z must NOT vanish — the head stops below r^{{2p}}: its closed \
+                     form peaks at {exact_peak:.3e}, inside the projection's own rounding \
+                     {band:.3e}"
                 );
             }
         }
@@ -3839,16 +3956,45 @@ mod duchon_hybrid_psd_tests {
         let amp2 = amplification * amplification;
         let unreduced = fast_ab(&fast_atb(&z, &value_kernel), &z).mapv(|value| value * amp2);
 
-        let scale = reduced.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        // Exactly, `Zᵀ K Z = Zᵀ K̃ Z`: the two penalties can differ only by how
+        // each kernel was rounded and by the two projections' own rounding.
+        // A kernel entry costs `KERNEL_ULPS` of its assembly's absolute scale —
+        // `φ(r)` for the value form, since every partial-fraction block of this
+        // shape is positive and their absolute sum IS `φ`, and `φ(r)` plus the
+        // head's own assembly for the reduced form's difference route — so the
+        // peak of each over the center pairs is the perturbation each
+        // projection carries in.
+        let k = centers.nrows();
+        let mut value_peak = 0.0_f64;
+        let mut reduced_assembly_peak = 0.0_f64;
+        for i in 0..k {
+            for j in 0..k {
+                let r = euclidean_distance_rows(centers.view(), i, centers.view(), j);
+                let form = d1_p2_s2_closed_form(r, length_scale);
+                value_peak = value_peak.max(form.value.abs());
+                reduced_assembly_peak =
+                    reduced_assembly_peak.max(form.value.abs() + form.head_scale);
+            }
+        }
+        // Each projection contributes its own `2 k ε column_sum²` on its
+        // kernel's scale, and carries that kernel's per-entry rounding —
+        // `KERNEL_ULPS` of the same scale — through the same `column_sum²`.
+        let column_sum = nullspace_column_sum(&z);
+        let band = amp2
+            * column_sum
+            * column_sum
+            * f64::EPSILON
+            * (2.0 * k as f64 + KERNEL_ULPS)
+            * (value_peak + reduced_assembly_peak);
         let mut worst = 0.0_f64;
         for (a, b) in reduced.iter().zip(unreduced.iter()) {
             worst = worst.max((a - b).abs());
         }
         assert!(
-            worst <= 1.0e-11 * scale,
-            "reduced and unreduced constrained penalties disagree by {worst:.3e} \
-             against a penalty scale of {scale:.3e} at a length scale where both \
-             forms are conditioned"
+            worst <= band,
+            "reduced and unreduced constrained penalties disagree by {worst:.3e}, above \
+             the two kernels' and two projections' own rounding {band:.3e}, at a length \
+             scale where both forms are conditioned"
         );
     }
 
