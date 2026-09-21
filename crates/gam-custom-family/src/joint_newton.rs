@@ -6601,6 +6601,7 @@ mod constrained_numerical_fixed_point_tests {
             3.7e-1,
             objective_floor,
             1e-12,
+            objective_floor,
             8e-14,
             4.3e-11,
         ));
@@ -6609,6 +6610,7 @@ mod constrained_numerical_fixed_point_tests {
             2.0e-12,
             objective_floor,
             1e-12,
+            objective_floor,
             8e-14,
             4.3e-11,
         ));

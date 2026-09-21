@@ -747,12 +747,6 @@ impl JointExitCertificate {
             Self::NonCertifying { carrying_block } => carrying_block.clone(),
         }
     }
-
-    /// Whether this exit may carry the Laplace log-determinants, which
-    /// `BlockwiseInnerResult` defines only at a certified inner mode.
-    fn carries_laplace_artifacts(&self) -> bool {
-        self.converged()
-    }
 }
 
 pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
