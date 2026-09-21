@@ -1,5 +1,22 @@
 ## Unreleased
 
+- **A pure-Duchon closed-form penalty refuses a centre set with no separation, where the cause
+  is visible** (gam#2469). Outside the regimes `closed_form_penalty::self_pair_bundle` covers,
+  the self-pair integral does not converge and the diagonal is read at the smallest lag the
+  centre set resolves, `√(γ_d·R²_max)`. A centre set whose every pair coincides resolves no lag
+  at all, and `pure_duchon_diagonal_epsilon` used to answer `0`: the pair kernel was then read
+  at its singularity and the non-representable Gram surfaced two layers later, in
+  `PenaltyCandidate::from_energy_factor`, naming neither the centres nor the regime. It now
+  returns `Result` and refuses with both. The decision between "there is an analytic zero-lag
+  value" and "read the smallest resolved lag" moves into one function,
+  `basis::closed_form_diagonal_lag`, and every route takes its answer as an argument:
+  `closed_form_anisotropic_pair_block_with_origin`,
+  `closed_form_operator_penalty_in_total_basis` and `ClosedFormPenaltyOperator::new`. That is
+  what lets the operator stay infallible — the `PenaltyOp` contract cannot carry a refusal, and
+  `matvec` and `dense_form` now rest on a lag their caller validated — and what stops the dense
+  Gram and the operator handle beside it from forming a diagonal on two different rules.
+  `basis::closed_form_anisotropic_pair_block` returns `Result` for the same reason.
+
 - **Every check that compared the tree against a list of tolerated offenders is deleted, and
   the bar is zero** (gam#2469, gam#2899, gam#2902).
   `scripts/spec_ban_ratchet.py` compared the tree against `scripts/spec_ban_ledger.tsv`, a

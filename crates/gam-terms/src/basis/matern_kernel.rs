@@ -2492,8 +2492,10 @@ pub fn closed_form_anisotropic_pair_block(
     s: usize,
     kappa: f64,
     aniso_log_scales: Option<&[f64]>,
-) -> Array2<f64> {
-    closed_form_anisotropic_pair_block_with_origin(
+) -> Result<Array2<f64>, BasisError> {
+    let diagonal_epsilon =
+        closed_form_diagonal_lag(centers, q, m, s, kappa, aniso_log_scales)?;
+    Ok(closed_form_anisotropic_pair_block_with_origin(
         centers,
         q,
         m,
@@ -2501,12 +2503,19 @@ pub fn closed_form_anisotropic_pair_block(
         kappa,
         aniso_log_scales,
         closed_form_penalty::PairOrigin::Full,
-    )
+        diagonal_epsilon,
+    ))
 }
 
 /// [`closed_form_anisotropic_pair_block`] for a named kernel representative.
 /// [`closed_form_penalty::PairOrigin::Reduced`] subtracts the kernel's origin
 /// value from every entry, which only a kernel-constraint transform Z annihilates.
+///
+/// `diagonal_epsilon` is the lag the self-pair is read at, from
+/// [`closed_form_diagonal_lag`]. It is an ARGUMENT rather than a decision made
+/// here, so a caller holding an operator that already validated its centre set
+/// hands the same lag back instead of re-deriving it, and this routine stays
+/// infallible for the matrix-free paths that cannot carry a refusal.
 pub(crate) fn closed_form_anisotropic_pair_block_with_origin(
     centers: ArrayView2<'_, f64>,
     q: usize,
@@ -2515,6 +2524,7 @@ pub(crate) fn closed_form_anisotropic_pair_block_with_origin(
     kappa: f64,
     aniso_log_scales: Option<&[f64]>,
     origin: closed_form_penalty::PairOrigin,
+    diagonal_epsilon: f64,
 ) -> Array2<f64> {
     // Math team Letter A §9: G_q(η_raw, κ) ≠ G_q(η_centered, κ) in general;
     // the relation involves an exp((2d-4m-4s)μ) prefactor and a κ rescaling
@@ -2533,12 +2543,6 @@ pub(crate) fn closed_form_anisotropic_pair_block_with_origin(
             &zeros
         }
     };
-    let r_eps = if closed_form_penalty::analytic_self_pair_bundle(q, m, s, kappa, eta_raw).is_some()
-    {
-        0.0
-    } else {
-        pure_duchon_diagonal_epsilon(centers, eta_raw)
-    };
     let powers = closed_form_penalty::AnisoMetricPowers::new(eta_raw);
 
     // Parallelize by independent lower-triangular rows. This keeps one lag
@@ -2556,7 +2560,7 @@ pub(crate) fn closed_form_anisotropic_pair_block_with_origin(
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
             let value = closed_form_anisotropic_pair_value_with_powers(
-                q, m, s, kappa, eta_raw, &powers, &r_buf, r_eps, origin,
+                q, m, s, kappa, eta_raw, &powers, &r_buf, diagonal_epsilon, origin,
             );
             // SAFETY: values has k(k+1)/2 slots; for i in 0..k and j ∈ 0..=i,
             // lower_triangular_offset(i)+j is in bounds. Each rayon iteration
@@ -2673,32 +2677,73 @@ pub fn closed_form_anisotropic_pair_block_pure(
 /// scale-covariant: rescaling the centres moves the diagonal's lag by the same
 /// factor as every off-diagonal lag.
 ///
-/// A centre set with no separation at all (`k <= 1`, or every centre identical)
-/// has no lag scale. The band is then `0`, the pair kernel is read at its
-/// singularity, and the non-finite penalty that produces is refused downstream
-/// rather than handed an invented separation.
+/// A centre set with no separation at all (`k <= 1`, `d == 0`, or every centre
+/// identical) has no lag scale, and this regime has no zero-lag value either, so
+/// there is no radius at which the self-pair can be read. That is refused here,
+/// where the cause is visible, rather than left to surface downstream as a
+/// non-representable Gram.
 pub(crate) fn pure_duchon_diagonal_epsilon(
     centers: ArrayView2<'_, f64>,
     eta_log_scales: &[f64],
-) -> f64 {
+) -> Result<f64, BasisError> {
     let k = centers.nrows();
     let d = centers.ncols();
-    if k <= 1 || d == 0 {
-        return 0.0;
-    }
     let mut widest_squared_lag = 0.0_f64;
-    for i in 0..k {
-        for j in 0..i {
-            let mut acc = 0.0_f64;
-            for axis in 0..d {
-                let delta = centers[[i, axis]] - centers[[j, axis]];
-                let b = (-2.0 * eta_log_scales[axis]).exp();
-                acc += b * delta * delta;
+    if k > 1 && d > 0 {
+        for i in 0..k {
+            for j in 0..i {
+                let mut acc = 0.0_f64;
+                for axis in 0..d {
+                    let delta = centers[[i, axis]] - centers[[j, axis]];
+                    let b = (-2.0 * eta_log_scales[axis]).exp();
+                    acc += b * delta * delta;
+                }
+                widest_squared_lag = widest_squared_lag.max(acc);
             }
-            widest_squared_lag = widest_squared_lag.max(acc);
         }
     }
-    gam_linalg::roundoff::accumulation_band(d, widest_squared_lag).sqrt()
+    if !(widest_squared_lag > 0.0) {
+        crate::bail_invalid_basis!(
+            "pure-Duchon closed-form penalty: {k} centre(s) in {d} dimension(s) carry no \
+             separation the lag formula `R² = Σ_a exp(−2η_a)·δ_a²` resolves, and this \
+             (q, m, s, κ) has no analytic zero-lag self-pair value, so there is no radius at \
+             which the diagonal can be read. Supply centres that differ, or a smoothness and \
+             curvature order whose self-pair integral converges"
+        );
+    }
+    Ok(gam_linalg::roundoff::accumulation_band(d, widest_squared_lag).sqrt())
+}
+
+/// The lag a closed-form pair block reads its diagonal at.
+///
+/// Exactly `0` wherever `closed_form_penalty::self_pair_bundle` has the
+/// analytic zero-lag value (the pair routine reads it there and never touches
+/// the lag), and otherwise the smallest separation the centre set resolves,
+/// which refuses when there is none. This is the ONE place that decides between
+/// the two; the pair block, its ψ-derivative sibling and the operator all take
+/// the answer as an argument, so no route can form a diagonal on a different
+/// rule than the one that validated it.
+pub fn closed_form_diagonal_lag(
+    centers: ArrayView2<'_, f64>,
+    q: usize,
+    m: usize,
+    s: usize,
+    kappa: f64,
+    aniso_log_scales: Option<&[f64]>,
+) -> Result<f64, BasisError> {
+    let d = centers.ncols();
+    let zeros: Vec<f64>;
+    let eta_raw: &[f64] = match aniso_log_scales {
+        Some(eta) => eta,
+        None => {
+            zeros = vec![0.0_f64; d];
+            &zeros
+        }
+    };
+    if closed_form_penalty::analytic_self_pair_bundle(q, m, s, kappa, eta_raw).is_some() {
+        return Ok(0.0);
+    }
+    pure_duchon_diagonal_epsilon(centers, eta_raw)
 }
 
 /// The pair-kernel representative a Gram restricted by `kernel_nullspace` may use.
@@ -2726,6 +2771,7 @@ pub(crate) fn closed_form_operator_penalty_in_total_basis(
     kernel_nullspace: Option<&Array2<f64>>,
     polynomial_block_cols: usize,
     outer_identifiability: Option<&Array2<f64>>,
+    diagonal_epsilon: f64,
 ) -> Array2<f64> {
     // 1. Closed-form penalty in raw kernel basis (K×K). Z annihilates the
     //    constant, so a constrained Gram is read on the origin-reduced kernel.
@@ -2738,6 +2784,7 @@ pub(crate) fn closed_form_operator_penalty_in_total_basis(
         kappa,
         aniso_log_scales,
         origin,
+        diagonal_epsilon,
     );
     // 2. Apply kernel-constraint nullspace transform Z (K×kernel_cols).
     let g_kernel = if let Some(z) = kernel_nullspace {
@@ -2786,7 +2833,7 @@ pub(crate) fn closed_form_psi_derivatives_in_total_basis(
     kernel_nullspace: Option<&Array2<f64>>,
     polynomial_block_cols: usize,
     outer_identifiability: Option<&Array2<f64>>,
-) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
+) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), BasisError> {
     let k = centers.nrows();
     let d = centers.ncols();
     let zeros: Vec<f64>;
@@ -2797,14 +2844,7 @@ pub(crate) fn closed_form_psi_derivatives_in_total_basis(
             &zeros
         }
     };
-    let r_eps =
-        if closed_form_penalty::analytic_self_pair_bundle(q, p_order, s_order, kappa, eta_raw)
-            .is_some()
-        {
-            0.0
-        } else {
-            pure_duchon_diagonal_epsilon(centers, eta_raw)
-        };
+    let r_eps = closed_form_diagonal_lag(centers, q, p_order, s_order, kappa, aniso_log_scales)?;
     let powers = closed_form_penalty::AnisoMetricPowers::new(eta_raw);
     let origin = closed_form_pair_origin(kernel_nullspace);
 
@@ -2858,7 +2898,7 @@ pub(crate) fn closed_form_psi_derivatives_in_total_basis(
     let g_psi_psi = symmetric_matrix_from_lower_values(k, &g_psi_psi_values);
 
     // Apply Z + poly-pad + T to each of g, g_psi, g_psi_psi identically.
-    (
+    Ok((
         transform_closed_form_raw_block(
             &g,
             kernel_nullspace,
@@ -2877,7 +2917,7 @@ pub(crate) fn closed_form_psi_derivatives_in_total_basis(
             polynomial_block_cols,
             outer_identifiability,
         ),
-    )
+    ))
 }
 
 #[inline(always)]
@@ -2980,7 +3020,11 @@ pub(crate) fn operator_penalty_candidates_closed_form(
 
     use crate::analytic_penalties::{PenaltyOp, ScaledPenaltyOp};
 
-    let make_op = |q: usize, c: f64| -> Option<std::sync::Arc<dyn PenaltyOp>> {
+    // `diagonal_lag` is read ONCE per order, by the caller below, and handed to
+    // both the dense Gram and the operator handle, so the two cannot form a
+    // diagonal on different rules. The read is what refuses a centre set with no
+    // separation, and it happens before either of them is built on it.
+    let make_op = |q: usize, c: f64, diagonal_lag: f64| -> Option<std::sync::Arc<dyn PenaltyOp>> {
         if !emit_operator {
             return None;
         }
@@ -2998,6 +3042,7 @@ pub(crate) fn operator_penalty_candidates_closed_form(
                 kernel_nullspace,
                 polynomial_block_cols,
                 outer_identifiability,
+                diagonal_lag,
             ),
         );
         // The candidate's `matrix` is the closed-form Gram divided by its
@@ -3031,8 +3076,17 @@ pub(crate) fn operator_penalty_candidates_closed_form(
         });
     }
     if matches!(spec.tension, OperatorPenaltySpec::Active { .. }) {
-        let s1_raw = if duchon_closed_form_operator_penalty_converges(1, p_order, s_order as f64, d)
-        {
+        let tension_closed_form =
+            duchon_closed_form_operator_penalty_converges(1, p_order, s_order as f64, d);
+        // Read the diagonal lag before anything is built on it. Outside the
+        // closed-form regime nothing reads it, and `make_op` refuses the handle
+        // on the same predicate, so no lag is derived for a route that has none.
+        let tension_lag = if tension_closed_form {
+            closed_form_diagonal_lag(centers, 1, p_order, s_order, kappa, aniso_log_scales)?
+        } else {
+            0.0
+        };
+        let s1_raw = if tension_closed_form {
             amp2 * closed_form_operator_penalty_in_total_basis(
                 centers,
                 1,
@@ -3043,12 +3097,13 @@ pub(crate) fn operator_penalty_candidates_closed_form(
                 kernel_nullspace,
                 polynomial_block_cols,
                 outer_identifiability,
+                tension_lag,
             )
         } else {
             symmetrize(&fast_ata(d1))
         };
         let (s1, c1) = normalize_penalty(&s1_raw);
-        let op = make_op(1, c1);
+        let op = make_op(1, c1, tension_lag);
         out.push(PenaltyCandidate {
             matrix: ConstructiveQuadratic::try_from_dense_psd(
                 s1,
@@ -3061,8 +3116,17 @@ pub(crate) fn operator_penalty_candidates_closed_form(
         });
     }
     if matches!(spec.stiffness, OperatorPenaltySpec::Active { .. }) {
-        let s2_raw = if duchon_closed_form_operator_penalty_converges(2, p_order, s_order as f64, d)
-        {
+        let stiffness_closed_form =
+            duchon_closed_form_operator_penalty_converges(2, p_order, s_order as f64, d);
+        // Read the diagonal lag before anything is built on it. Outside the
+        // closed-form regime nothing reads it, and `make_op` refuses the handle
+        // on the same predicate, so no lag is derived for a route that has none.
+        let stiffness_lag = if stiffness_closed_form {
+            closed_form_diagonal_lag(centers, 2, p_order, s_order, kappa, aniso_log_scales)?
+        } else {
+            0.0
+        };
+        let s2_raw = if stiffness_closed_form {
             amp2 * closed_form_operator_penalty_in_total_basis(
                 centers,
                 2,
@@ -3073,12 +3137,13 @@ pub(crate) fn operator_penalty_candidates_closed_form(
                 kernel_nullspace,
                 polynomial_block_cols,
                 outer_identifiability,
+                stiffness_lag,
             )
         } else {
             symmetrize(&fast_ata(d2))
         };
         let (s2, c2) = normalize_penalty(&s2_raw);
-        let op = make_op(2, c2);
+        let op = make_op(2, c2, stiffness_lag);
         out.push(PenaltyCandidate {
             matrix: ConstructiveQuadratic::try_from_dense_psd(
                 s2,

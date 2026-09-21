@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 
 use crate::basis::{
     closed_form_anisotropic_pair_block_with_origin, closed_form_anisotropic_pair_value_with_powers,
-    closed_form_pair_origin, closed_form_penalty, pure_duchon_diagonal_epsilon,
+    closed_form_pair_origin, closed_form_penalty,
 };
 use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
 
@@ -88,6 +88,16 @@ impl Clone for ClosedFormPenaltyOperator {
 impl ClosedFormPenaltyOperator {
     /// Build an operator with the same closed-form parameters that
     /// `basis::closed_form_operator_penalty_in_total_basis` consumes.
+    ///
+    /// `diagonal_epsilon` is the lag the self-pair is read at, from
+    /// [`crate::basis::closed_form_diagonal_lag`]. The operator takes it rather
+    /// than deriving it, for two reasons: deriving it can REFUSE (a centre set
+    /// with no separation, in a regime with no analytic zero-lag value, has no
+    /// radius to read the diagonal at) and every method on this operator is
+    /// infallible by the `PenaltyOp` contract; and the dense Gram the caller
+    /// builds beside the operator must read the same lag, which it can only do
+    /// if one place decides it. `matvec` and `dense_form` therefore rest on a
+    /// lag their caller has already validated.
     pub fn new(
         centers: ArrayView2<'_, f64>,
         q: usize,
@@ -98,6 +108,7 @@ impl ClosedFormPenaltyOperator {
         kernel_nullspace: Option<&Array2<f64>>,
         polynomial_block_cols: usize,
         outer_identifiability: Option<&Array2<f64>>,
+        diagonal_epsilon: f64,
     ) -> Self {
         let d = centers.ncols();
         let eta_raw: Vec<f64> = if let Some(eta) = aniso_log_scales {
@@ -110,12 +121,6 @@ impl ClosedFormPenaltyOperator {
         } else {
             vec![0.0_f64; d]
         };
-        let diagonal_epsilon =
-            if closed_form_penalty::analytic_self_pair_bundle(q, m, s, kappa, &eta_raw).is_some() {
-                0.0
-            } else {
-                pure_duchon_diagonal_epsilon(centers, &eta_raw)
-            };
         Self {
             q,
             m,
@@ -305,6 +310,10 @@ impl ClosedFormPenaltyOperator {
                 Some(self.eta_raw.as_slice())
             },
             closed_form_pair_origin(self.kernel_nullspace.as_ref()),
+            // The lag this operator was constructed with. Re-deriving it here
+            // would be a second rule for one quantity, and this method cannot
+            // carry the refusal that deriving it may raise.
+            self.diagonal_epsilon,
         );
         let kernel_cols = self
             .kernel_nullspace
@@ -383,8 +392,25 @@ impl ClosedFormPenaltyOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::basis::closed_form_diagonal_lag;
     use approx::assert_abs_diff_eq;
     use ndarray::Array;
+
+    /// The lag these fixtures' operators read their diagonal at, from the one
+    /// place that decides it. Every fixture below uses separated centres, so the
+    /// refusal arm is not reachable here; the fixture that exercises it lives in
+    /// `refuses_a_centre_set_with_no_separation`.
+    fn fixture_lag(
+        centers: &Array2<f64>,
+        q: usize,
+        m: usize,
+        s: usize,
+        kappa: f64,
+        eta: Option<&[f64]>,
+    ) -> f64 {
+        closed_form_diagonal_lag(centers.view(), q, m, s, kappa, eta)
+            .expect("the fixture centres are separated")
+    }
 
     fn small_centers() -> Array2<f64> {
         Array::from_shape_vec(
@@ -400,6 +426,37 @@ mod tests {
         .unwrap()
     }
 
+    /// The refusal the lag decision exists to raise. Five coincident centres in
+    /// a regime with no analytic zero-lag self-pair have no radius at which the
+    /// diagonal can be read, and the error names that rather than leaving a
+    /// non-representable Gram to surface later. The positive control is every
+    /// other fixture here, which reads a lag from the same call.
+    #[test]
+    fn refuses_a_centre_set_with_no_separation() {
+        let coincident = Array::from_shape_vec(
+            (5, 2),
+            vec![
+                0.30, 0.40, //
+                0.30, 0.40, //
+                0.30, 0.40, //
+                0.30, 0.40, //
+                0.30, 0.40, //
+            ],
+        )
+        .expect("coincident centre fixture");
+        let refusal = closed_form_diagonal_lag(coincident.view(), 1, 2, 1, 0.0, None)
+            .expect_err("coincident centres carry no lag the formula resolves");
+        let rendered = refusal.to_string();
+        assert!(
+            rendered.contains("no separation"),
+            "the refusal must name the centre set as the cause: {rendered}"
+        );
+        assert!(
+            closed_form_diagonal_lag(small_centers().view(), 1, 2, 1, 0.0, None).is_ok(),
+            "separated centres at the same orders must still resolve a lag"
+        );
+    }
+
     #[test]
     fn test_operator_dense_agrees_unconstrained() {
         let centers = small_centers();
@@ -413,6 +470,7 @@ mod tests {
             None,
             0,
             None,
+            fixture_lag(&centers, 1, 2, 1, 1.0, None),
         );
         let dense = op.dense_form();
         let n = op.dim();
@@ -442,6 +500,7 @@ mod tests {
             None,
             0,
             None,
+            fixture_lag(&centers, 2, 2, 1, 0.5, Some(&[0.10, -0.10])),
         );
         let dense = op.dense_form();
         let diag_op = op.diag();
@@ -463,6 +522,7 @@ mod tests {
             None,
             0,
             None,
+            fixture_lag(&centers, 0, 2, 1, 1.5, None),
         );
         let dense = op.dense_form();
         let n = op.dim();
@@ -497,6 +557,7 @@ mod tests {
             None,
             0,
             None,
+            fixture_lag(&centers, 1, 2, 1, 1.0, Some(&[0.35, 0.10])),
         );
         let v = Array1::from_vec(vec![0.2, -0.1, 0.4, -0.3, 0.7]);
         let mut out = Array1::<f64>::zeros(op.dim());
@@ -521,7 +582,18 @@ mod tests {
         let centers = small_centers();
         let eta = [0.35, 0.10];
         let op =
-            ClosedFormPenaltyOperator::new(centers.view(), 1, 2, 1, 1.0, Some(&eta), None, 0, None);
+            ClosedFormPenaltyOperator::new(
+                centers.view(),
+                1,
+                2,
+                1,
+                1.0,
+                Some(&eta),
+                None,
+                0,
+                None,
+                fixture_lag(&centers, 1, 2, 1, 1.0, Some(&eta)),
+            );
         let dense = op.dense_form();
         let reference = crate::basis::closed_form_operator_penalty_in_total_basis(
             centers.view(),
@@ -533,6 +605,7 @@ mod tests {
             None,
             0,
             None,
+            fixture_lag(&centers, 1, 2, 1, 1.0, Some(&eta)),
         );
         for i in 0..op.dim() {
             for j in 0..op.dim() {
@@ -574,6 +647,7 @@ mod tests {
             Some(&z),
             0,
             None,
+            fixture_lag(&centers, 1, 2, 1, 1.0, Some(&[0.05, -0.05])),
         );
         let dense = op.dense_form();
         let n = op.dim();
@@ -594,7 +668,18 @@ mod tests {
     #[test]
     fn test_log_det_plus_lambda_matches_dense() {
         let centers = small_centers();
-        let op = ClosedFormPenaltyOperator::new(centers.view(), 1, 2, 1, 1.0, None, None, 0, None);
+        let op = ClosedFormPenaltyOperator::new(
+            centers.view(),
+            1,
+            2,
+            1,
+            1.0,
+            None,
+            None,
+            0,
+            None,
+            fixture_lag(&centers, 1, 2, 1, 1.0, None),
+        );
         let dense = op.dense_form();
         let n = op.dim();
         let lambda = 10.0_f64;

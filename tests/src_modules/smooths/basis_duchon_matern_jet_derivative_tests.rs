@@ -1749,16 +1749,19 @@ fn build_closed_form_operator_penalty(
     let p_order =
         duchon_p_from_nullspace_order(duchon_effective_nullspace_order(centers, nullspace_order));
     let kappa = 1.0 / length_scale;
+    let s_order = duchon_power_to_usize(power);
     closed_form_operator_penalty_in_total_basis(
         centers,
         q,
         p_order,
-        duchon_power_to_usize(power),
+        s_order,
         kappa,
         aniso_log_scales,
         ops.kernel_nullspace_transform.as_ref(),
         ops.polynomial_block_cols,
         None,
+        closed_form_diagonal_lag(centers, q, p_order, s_order, kappa, aniso_log_scales)
+            .expect("the fixture centres are separated"),
     )
 }
 
@@ -2748,7 +2751,8 @@ fn test_pair_block_psd_in_convergent_regime() {
             }
             let eta: Vec<f64> = (0..d).map(|_| (det_rand(&mut seed) - 0.5) * 0.4).collect();
 
-            let g = closed_form_anisotropic_pair_block(centers.view(), q, m, s, kappa, Some(&eta));
+            let g = closed_form_anisotropic_pair_block(centers.view(), q, m, s, kappa, Some(&eta))
+                .expect("the sampled centres are separated");
 
             let order = DuchonNullspaceOrder::Linear;
             let p_block = polynomial_block_from_order(centers.view(), order);
@@ -2796,7 +2800,8 @@ fn singular_convergent_derivative_builders_use_analytic_self_pair() {
     ];
     let eta = vec![0.12, -0.08, 0.04];
 
-    let value = closed_form_anisotropic_pair_block(centers.view(), q, m, s, kappa, Some(&eta));
+    let value = closed_form_anisotropic_pair_block(centers.view(), q, m, s, kappa, Some(&eta))
+        .expect("the fixture centres are separated");
     let (psi_value, _, _) = closed_form_psi_derivatives_in_total_basis(
         centers.view(),
         q,
@@ -2807,7 +2812,8 @@ fn singular_convergent_derivative_builders_use_analytic_self_pair() {
         None,
         0,
         None,
-    );
+    )
+    .expect("the fixture centres are separated");
 
     for i in 0..centers.nrows() {
         for j in 0..centers.nrows() {
@@ -3125,7 +3131,8 @@ fn test_full_dim_validity_d4_d8_d16_with_resolved_orders() {
         }
         let eta: Vec<f64> = vec![0.0_f64; d];
 
-        let g = closed_form_anisotropic_pair_block(centers.view(), q, m, s, kappa, Some(&eta));
+        let g = closed_form_anisotropic_pair_block(centers.view(), q, m, s, kappa, Some(&eta))
+            .expect("the fixture centres are separated");
 
         assert_eq!(g.dim(), (k, k), "wrong dim for d={d}");
         for i in 0..k {

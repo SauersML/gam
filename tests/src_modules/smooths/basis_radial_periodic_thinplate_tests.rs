@@ -528,7 +528,8 @@ fn stable_hybrid_duchon_gram_is_psd_at_high_dimension() {
                 centers[[i, j]] = ((seed >> 33) as f64) / ((1u64 << 31) as f64);
             }
         }
-        let g = closed_form_anisotropic_pair_block(centers.view(), 0, m, s, kappa, None);
+        let g = closed_form_anisotropic_pair_block(centers.view(), 0, m, s, kappa, None)
+            .expect("the fixture centres are separated");
         let sym = symmetrize(&g);
         let (_, evals, _) = spectral_summary(&sym).unwrap();
         let max_ev = evals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -4224,6 +4225,8 @@ fn test_hybrid_duchon_candidate_factory_admits_log_riesz_closed_form() {
         None,
         0,
         None,
+        closed_form_diagonal_lag(centers.view(), 1, 1, 2, 1.0 / 0.8, Some(&eta))
+            .expect("the fixture centres are separated"),
     );
     let norm = reference.iter().map(|v| v * v).sum::<f64>().sqrt();
     assert!(norm > 1e-12);

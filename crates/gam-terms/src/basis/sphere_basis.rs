@@ -2598,7 +2598,7 @@ pub(crate) fn build_duchon_operator_penalty_psi_derivatives_in_directions(
                 Some(&z_kernel),
                 poly_cols,
                 identifiability_transform,
-            );
+            )?;
             s1 = amp2 * cf_s;
             s1_psi = amp2 * cf_s_psi;
             s1_psi_psi = amp2 * cf_s_psi_psi;
@@ -2632,7 +2632,7 @@ pub(crate) fn build_duchon_operator_penalty_psi_derivatives_in_directions(
                 Some(&z_kernel),
                 poly_cols,
                 identifiability_transform,
-            );
+            )?;
             s2 = amp2 * cf_s;
             s2_psi = amp2 * cf_s_psi;
             s2_psi_psi = amp2 * cf_s_psi_psi;

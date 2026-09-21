@@ -5157,6 +5157,8 @@ mod root_cause_tests {
             None,
             0,
             None,
+            gam_terms::basis::closed_form_diagonal_lag(centers.view(), 2, 2, 1, 1.0, None)
+                .expect("the fixture centres are separated"),
         ));
         let p = op.dim();
         assert_eq!(p, K);
