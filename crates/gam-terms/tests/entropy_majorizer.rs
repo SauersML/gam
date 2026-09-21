@@ -13,7 +13,9 @@ use ndarray::{Array1, Array2, array};
 fn gershgorin_majorizes_entropy_where_fisher_does_not_1419() {
     let penalty = SoftmaxAssignmentSparsityPenalty::new(2, 1.0);
     let row = array![19.0_f64.ln(), 0.0];
-    let rho = array![0.0];
+    // The entropy strength is the penalty's own `weight`, never an outer
+    // coordinate: its prior on this chart is improper (#4291).
+    let rho = Array1::<f64>::zeros(0);
     let direction = array![1.0, -1.0];
     let hv = penalty.hvp(row.view(), rho.view(), direction.view());
     // Independent scalar entropy differentiation at p=0.95. This is also
@@ -39,8 +41,11 @@ fn smooth_gershgorin_majorizes_entropy_within_the_derived_budget_2339() {
     let mut max_roundoff_budget_fraction = 0.0_f64;
     let mut max_majorization_deficit_in_roundoff = 0.0_f64;
     for (k, temperature, scale) in [(2, 1.0, 1.0), (3, 0.75, 2.5), (5, 1.4, 0.3), (8, 0.6, 1.7)] {
-        let penalty = SoftmaxAssignmentSparsityPenalty::new(k, temperature);
-        let rho = array![(scale * temperature * temperature).ln()];
+        let mut penalty = SoftmaxAssignmentSparsityPenalty::new(k, temperature);
+        // The strength that used to arrive as `exp(rho)` is the `weight` field
+        // now; the penalty owns no rho axis (#4291).
+        penalty.weight = scale * temperature * temperature;
+        let rho = Array1::<f64>::zeros(0);
         let mut seed = 0x2339_0000 + k as u64;
         for fixture in 0..8 {
             let row = Array1::from_shape_fn(k, |axis| match fixture {
@@ -195,11 +200,13 @@ fn smooth_gershgorin_is_degree_one_homogeneous_in_scale_2339() {
 fn smooth_gershgorin_weighting_routes_agree_by_scale_equivariance_2339() {
     let temperature = 1.1_f64;
     let row = array![0.3, -0.6, 0.9, 0.2, -1.4, 1.7];
-    let rho = array![(0.75 * temperature * temperature).ln()];
-    let scale = rho[0].exp() * (1.0 / temperature) * (1.0 / temperature);
+    let strength = 0.75 * temperature * temperature;
+    let rho = Array1::<f64>::zeros(0);
+    let scale = strength * (1.0 / temperature) * (1.0 / temperature);
     for weight in [0.5, 2.0, 4.0, 0.37, 1.9, 6.25] {
-        let penalty =
+        let mut penalty =
             SoftmaxAssignmentSparsityPenalty::new(6, temperature).with_row_weights(Some(&[weight]));
+        penalty.weight = strength;
         // Compare the actual trait channel to the arrow assembly's folded
         // strength. This exercises the two consumers, not one helper twice.
         let trait_diagonal = penalty.psd_majorizer_diag(row.view(), rho.view()).unwrap();
@@ -215,9 +222,10 @@ fn smooth_gershgorin_weighting_routes_agree_by_scale_equivariance_2339() {
 
 #[test]
 fn smooth_gershgorin_is_exactly_zero_on_an_underflowed_atom_2339() {
-    let penalty = SoftmaxAssignmentSparsityPenalty::new(3, 1.0);
+    let mut penalty = SoftmaxAssignmentSparsityPenalty::new(3, 1.0);
+    penalty.weight = 2.0;
     let row = array![0.0, -800.0, -1.0];
-    let rho = array![2.0_f64.ln()];
+    let rho = Array1::<f64>::zeros(0);
     let diagonal = penalty.psd_majorizer_abs_row_sums(row.as_slice().unwrap(), 2.0);
     assert_eq!(diagonal[1], 0.0);
     assert!(diagonal[0] > 0.01 && diagonal[2] > 0.01);

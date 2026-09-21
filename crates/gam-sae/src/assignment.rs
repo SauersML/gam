@@ -1421,13 +1421,17 @@ pub(crate) fn assignment_prior_value_weighted(
             temperature,
             sparsity,
         } => {
-            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature)
-                .with_row_weights(row_weights);
-            let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
+            let (penalty, strength) = softmax_assignment_sparsity_penalty(
+                assignment,
+                temperature,
+                sparsity,
+                rho,
+                row_weights,
+            )?;
+            let rho_view = Array1::<f64>::zeros(0);
             // #2933 F45 — `exp(−λH)` is a density over the simplex only with its partition.
             penalty.value(target.view(), rho_view.view())
-                + softmax_entropy_partition_weighted(assignment, rho_view[0].exp(), row_weights)?
-                    .0
+                + softmax_entropy_partition_weighted(assignment, strength, row_weights)?.0
         }
         AssignmentMode::OrderedBetaBernoulli {
             temperature, alpha, ..
@@ -1494,12 +1498,16 @@ pub(crate) fn assignment_prior_log_strength_derivative_weighted(
         } => {
             // `∂_ρ[λ·Σ w·H + Σ w·ln Z_K(λ)]`: the energy is degree one in `λ = e^ρ`, the
             // partition is not.
-            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature)
-                .with_row_weights(row_weights);
-            let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
+            let (penalty, strength) = softmax_assignment_sparsity_penalty(
+                assignment,
+                temperature,
+                sparsity,
+                rho,
+                row_weights,
+            )?;
+            let rho_view = Array1::<f64>::zeros(0);
             penalty.value(target.view(), rho_view.view())
-                + softmax_entropy_partition_weighted(assignment, rho_view[0].exp(), row_weights)?
-                    .1
+                + softmax_entropy_partition_weighted(assignment, strength, row_weights)?.1
         }
         AssignmentMode::ThresholdGate {
             temperature,
@@ -1569,9 +1577,14 @@ pub(crate) fn assignment_prior_log_strength_hdiag_weighted(
             temperature,
             sparsity,
         } => {
-            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature)
-                .with_row_weights(row_weights);
-            let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
+            let (penalty, _strength) = softmax_assignment_sparsity_penalty(
+                assignment,
+                temperature,
+                sparsity,
+                rho,
+                row_weights,
+            )?;
+            let rho_view = Array1::<f64>::zeros(0);
             penalty
                 .hessian_diag(target.view(), rho_view.view())
                 .ok_or_else(|| {
@@ -1701,6 +1714,35 @@ impl ThresholdGateLogPartition {
     pub(crate) fn log_strength_derivative(self) -> f64 {
         self.log_strength_derivative
     }
+}
+
+/// The softmax assignment-sparsity penalty at THIS fit's strength
+/// `lambda = exp(rho.log_lambda_sparse) * sparsity`, returned with that strength.
+///
+/// #4291 — the strength is the penalty's `weight` field, not an analytic-penalty
+/// rho coordinate. A penalty rho axis exists only where the penalty itself
+/// prices `ln Z(lambda)`, and this penalty does not: on the `(N, K)` logit chart
+/// its energy `H(a)` is bounded and shift-invariant, so that integral diverges.
+/// The SAE route is the one that legitimately selects this strength, because it
+/// normalizes on the `(K-1)`-free-logit SIMPLEX chart, where the mass is finite
+/// and is added here by [`softmax_entropy_partition_weighted`] (#2933 F45). So
+/// the selection and the normalizer stay together in this module, and the
+/// penalty is handed a strength rather than a coordinate.
+///
+/// [`resolve_learnable_weight`] keeps the effective log strength inside the
+/// representable band and refuses outside it, exactly as the rho path did.
+fn softmax_assignment_sparsity_penalty(
+    assignment: &SaeAssignment,
+    temperature: f64,
+    sparsity: f64,
+    rho: &SaeManifoldRho,
+    row_weights: Option<&[f64]>,
+) -> Result<(SoftmaxAssignmentSparsityPenalty, f64), String> {
+    let strength = resolve_learnable_weight(1.0, rho.log_lambda_sparse + sparsity.ln())?;
+    let mut penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature)
+        .with_row_weights(row_weights);
+    penalty.weight = strength;
+    Ok((penalty, strength))
 }
 
 /// `(Σ_i w_i·ln Z_K(λ), Σ_i w_i·∂ ln Z_K/∂ ln λ)`: the softmax entropy prior's partition per unit
@@ -2258,9 +2300,14 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
             temperature,
             sparsity,
         } => {
-            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature)
-                .with_row_weights(row_weights);
-            let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
+            let (penalty, _strength) = softmax_assignment_sparsity_penalty(
+                assignment,
+                temperature,
+                sparsity,
+                rho,
+                row_weights,
+            )?;
+            let rho_view = Array1::<f64>::zeros(0);
             let g = penalty.grad_target(target.view(), rho_view.view());
             let d = penalty
                 .hessian_diag(target.view(), rho_view.view())

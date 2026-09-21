@@ -34,7 +34,7 @@ mod center_selection;
 pub mod closed_form_operator;
 mod cubic_regression;
 mod derivative_penalty;
-mod duchon_kernel_math;
+pub(crate) mod duchon_kernel_math;
 mod duchon_psi_derivatives;
 mod duchon_radial_profile;
 mod duchon_thinplate;

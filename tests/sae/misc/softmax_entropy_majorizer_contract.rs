@@ -55,8 +55,14 @@ fn majorizer_dominates_dense_hessian_in_loewner_order() {
 
     for &(k, tau) in configs {
         for &rho_val in &[0.0_f64, 0.8, -0.5] {
-            let pen = SoftmaxAssignmentSparsityPenalty::new(k, tau);
-            let rho = Array1::from(vec![rho_val]);
+            let mut pen = SoftmaxAssignmentSparsityPenalty::new(k, tau);
+            // The strength is the penalty's own `weight`, not an outer
+            // coordinate: on the (N, K) logit chart the entropy prior is
+            // improper, so no rho axis exists (#4291). The sweep keeps its
+            // three strengths by setting the field the coordinate used to
+            // multiply — dropping it would leave a one-strength sweep.
+            pen.weight = rho_val.exp();
+            let rho = Array1::<f64>::zeros(0);
 
             // Build a multi-row target spanning all patterns.
             let mut t = Vec::new();

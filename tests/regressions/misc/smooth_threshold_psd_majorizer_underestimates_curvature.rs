@@ -67,8 +67,9 @@ fn smooth_threshold_psd_majorizer_dominates_exact_hessian_below_threshold() {
         eps,
     )
     .expect("construct smooth threshold penalty");
-    // rho_count == latent_dim; rho = 0 keeps the threshold at its base `tau`.
-    let rho = Array1::from(vec![0.0_f64]);
+    // The thresholds are the caller's: this penalty owns no rho axis, because
+    // its bounded gate energy has no prior mass to select `tau` against (#4291).
+    let rho = Array1::<f64>::zeros(0);
     let target = Array1::from(vec![0.0, 0.7, 1.0, 2.0]);
 
     let exact = p

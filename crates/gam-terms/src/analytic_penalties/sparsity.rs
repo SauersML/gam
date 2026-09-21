@@ -83,14 +83,43 @@ pub enum SparsityKind {
 /// ext-coordinate slice. For SAE codes specifically, smoothed-L¹ with REML-selected `ε`
 /// gives the principled relaxation of the L¹ objective without giving up
 /// differentiability.
+///
+/// # The strength and the smoothing are fixed unless the caller asks (#4291)
+///
+/// `value` is `−log p(x | λ, ε)` only up to the sparsifier's own mass
+/// `Z(λ, ε) = ∫ exp(−λ·σ(x)) dx`. Minimizing an outer criterion over `log λ`
+/// without `log Z` is not REML: `∂value/∂log λ = value ≥ 0` for every target, so
+/// the strength has no interior optimum and the outer search walks it to a box
+/// face, replacing the `weight` the caller wrote with a value some five orders of
+/// magnitude smaller — the penalty is switched off and the fit still reports
+/// convergence. The same holds for `ε`.
+///
+/// So this penalty owns NO ρ-axis by default, and the axes it can own are gated
+/// on a normalizer existing in closed form:
+///
+/// * `SmoothedL1` — mass `Z = 2ε·K₁(λ·ε)`
+///   ([`smoothed_laplace_log_partition`]); both the strength
+///   ([`Self::with_learnable_weight`]) and the smoothing
+///   ([`Self::with_learnable_smoothing`]) may be learned, and the value and
+///   `grad_rho` then carry `n · ln Z`.
+/// * `Hoyer` — the energy is bounded and scale-invariant, so `∫ exp(−λ·H) dx`
+///   diverges for every `λ`: the prior is improper and neither axis exists.
+/// * `Log` — the mass `δ·√π·Γ(λ−½)/Γ(λ)` exists for `λ > ½` but is not
+///   implemented here, so both axes are refused by name rather than fitted
+///   against a missing term.
 #[derive(Debug, Clone)]
 pub struct SparsityPenalty {
     pub target_tier: PenaltyTier,
     pub kind: SparsityKind,
     pub weight: f64,
-    /// Whether local rho coordinate 1 learns `log ε` (or `log δ`). Coordinate
-    /// 0 is always the log-strength. Keeping this as a boolean makes invalid
-    /// local index layouts unrepresentable.
+    /// Whether the log-strength is an outer coordinate. When set it is local ρ
+    /// coordinate 0; when clear the strength is exactly the `weight` field and
+    /// the penalty owns no strength axis (#4291).
+    learnable_weight: bool,
+    /// Whether a local rho coordinate learns `log ε`. It sits immediately after
+    /// the strength axis, so its index is `usize::from(learnable_weight)`.
+    /// Keeping both as booleans makes invalid local index layouts
+    /// unrepresentable.
     learnable_smoothing: bool,
 }
 
@@ -120,6 +149,14 @@ pub struct SoftmaxAssignmentSparsityPenalty {
     pub k_atoms: usize,
     pub temperature: f64,
     pub weight: f64,
+    /// Whether the log-strength is an outer coordinate (#4291). Always `false`:
+    /// [`Self::with_learnable_weight`] refuses, because on THIS chart — the
+    /// full `(N, K)` logit matrix — the energy is bounded and shift-invariant,
+    /// so `∫exp(−λ·ΣH) dℓ` diverges for every `λ`. The SAE assignment prior
+    /// selects its own strength on the `(K−1)`-free-logit simplex chart, where
+    /// [`softmax_entropy_log_partition`] is the finite mass; that normalizer
+    /// belongs to that chart and is priced there.
+    learnable_weight: bool,
     /// #991 design-honesty per-row weights `w_i` (mean-1). When present, row `i`'s
     /// prior contribution is scaled by `w_i` in EVERY aggregate channel — value,
     /// `grad_target`, `hessian_diag`, `hvp`, `psd_majorizer_diag`, `grad_rho`.
@@ -141,6 +178,7 @@ impl SoftmaxAssignmentSparsityPenalty {
             k_atoms,
             temperature,
             weight: 1.0,
+            learnable_weight: false,
             row_weights: None,
         }
     }
@@ -160,6 +198,32 @@ impl SoftmaxAssignmentSparsityPenalty {
     #[must_use]
     pub fn row_weight(&self, row: usize) -> f64 {
         self.row_weights.as_ref().map_or(1.0, |w| w[row])
+    }
+
+    /// Refuse a learnable strength: this penalty's prior has no mass on the
+    /// chart it scores (#4291).
+    #[must_use = "invalid learnable-weight requests must be handled"]
+    pub fn with_learnable_weight(self) -> Result<Self, String> {
+        Err(format!(
+            "softmax assignment sparsity cannot own a learnable strength: its energy              H(a) ∈ [0, ln K] is bounded and the (N, K) logit chart it scores is              shift-invariant, so ∫exp(−λ·ΣH) dℓ diverges for every λ and the prior is              improper. The finite mass `softmax_entropy_log_partition` normalizes the              (K−1)-free-logit SIMPLEX chart, which is a different measure; the SAE              assignment prior prices it there. Selecting λ here against the unnormalized              energy sends it to a box face, silently switching the entropy gate off              (k_atoms = {}, weight = {})",
+            self.k_atoms, self.weight
+        ))
+    }
+
+    /// Whether the strength is an outer coordinate. Structurally `false`.
+    #[must_use]
+    pub fn learns_weight(&self) -> bool {
+        self.learnable_weight
+    }
+
+    /// The effective strength: the `weight` field, or `weight · exp(ρ₀)` if a
+    /// strength coordinate is ever admitted.
+    fn strength(&self, rho: ArrayView1<'_, f64>) -> f64 {
+        if self.learnable_weight {
+            validated_learnable_weight(self.weight, rho[0])
+        } else {
+            self.weight
+        }
     }
 
     fn softmax_row(&self, row: &[f64]) -> Vec<f64> {
@@ -381,17 +445,23 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     }
 
     fn validate_rho(&self, rho: ArrayView1<'_, f64>) -> Result<(), String> {
-        if rho.len() != 1 {
+        if rho.len() != self.rho_count() {
             return Err(format!(
-                "softmax assignment sparsity rho length {} != 1",
-                rho.len()
+                "softmax assignment sparsity rho length {} != declared {}",
+                rho.len(),
+                self.rho_count()
             ));
         }
-        resolve_learnable_weight(self.weight, rho[0])?;
+        if self.learnable_weight {
+            resolve_learnable_weight(self.weight, rho[0])?;
+        }
         Ok(())
     }
 
     fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
+        if !self.learnable_weight {
+            return Ok(Vec::new());
+        }
         Ok(vec![
             learnable_weight_coordinate_domain(self.weight)?
                 .ok_or_else(|| "softmax assignment sparsity has zero base weight".to_string())?,
@@ -399,7 +469,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     }
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
-        let lambda = validated_learnable_weight(self.weight, rho[0]);
+        let lambda = self.strength(rho);
         let n = target.len() / self.k_atoms;
         let values: Vec<f64> = target.iter().copied().collect();
         let mut acc = 0.0;
@@ -417,7 +487,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     }
 
     fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        let lambda = validated_learnable_weight(self.weight, rho[0]);
+        let lambda = self.strength(rho);
         let n = target.len() / self.k_atoms;
         let values: Vec<f64> = target.iter().copied().collect();
         let mut out = Array1::<f64>::zeros(target.len());
@@ -462,7 +532,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         // This matches `hvp(...) . e_k` analytically (see derivation in the
         // bug-fix comment on `hvp`) and gives Newton/Arrow-Schur callers a
         // principled diagonal surrogate without per-row dense factorization.
-        let lambda = validated_learnable_weight(self.weight, rho[0]);
+        let lambda = self.strength(rho);
         let inv_tau = 1.0 / self.temperature;
         let scale = lambda * inv_tau * inv_tau;
         let n = target.len() / self.k_atoms;
@@ -501,7 +571,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         below. `hessian_diag` returns the analytic diagonal extracted from
         this HVP by setting v = e_k row-by-row.
         */
-        let lambda = validated_learnable_weight(self.weight, rho[0]);
+        let lambda = self.strength(rho);
         assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
         let n = target.len() / self.k_atoms;
         let values: Vec<f64> = target.iter().copied().collect();
@@ -555,7 +625,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         // (see `psd_majorizer_abs_row_sums`): a genuine PSD diagonal with
         // `D ⪰ H` and `D ⪰ 0`. Coordinate-indexed, so the inherited
         // `psd_majorizer_hvp` applies `D` as a diagonal operator consistently.
-        let lambda = validated_learnable_weight(self.weight, rho[0]);
+        let lambda = self.strength(rho);
         let inv_tau = 1.0 / self.temperature;
         let scale = lambda * inv_tau * inv_tau;
         let n = target.len() / self.k_atoms;
@@ -573,11 +643,14 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     }
 
     fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
+        if !self.learnable_weight {
+            return Array1::<f64>::zeros(0);
+        }
         Array1::from_vec(vec![self.value(target, rho)])
     }
 
     fn rho_count(&self) -> usize {
-        1
+        usize::from(self.learnable_weight)
     }
 
     fn name(&self) -> &str {
@@ -599,6 +672,7 @@ impl SparsityPenalty {
             target_tier,
             kind: SparsityKind::SmoothedL1 { eps },
             weight: 1.0,
+            learnable_weight: false,
             learnable_smoothing: false,
         })
     }
@@ -616,6 +690,7 @@ impl SparsityPenalty {
             target_tier,
             kind: SparsityKind::Log { delta },
             weight: 1.0,
+            learnable_weight: false,
             learnable_smoothing: false,
         })
     }
@@ -628,21 +703,54 @@ impl SparsityPenalty {
             target_tier,
             kind: SparsityKind::Hoyer,
             weight: 1.0,
+            learnable_weight: false,
             learnable_smoothing: false,
         }
     }
 
+    /// Refuse a learnable axis on a kernel whose prior has no mass this module
+    /// can form, naming what is missing (#4291).
+    fn require_normalizer(&self, axis: &str) -> Result<(), String> {
+        match self.kind {
+            SparsityKind::SmoothedL1 { .. } => Ok(()),
+            SparsityKind::Hoyer => Err(format!(
+                "Hoyer sparsity cannot own a learnable {axis}: its energy is bounded and \
+                 scale-invariant, so ∫exp(−λ·H(x)) dx diverges for every λ and the prior has \
+                 no normalizer. Without one the outer search has no interior optimum in λ and \
+                 can only walk it to a face, silently switching the penalty off (#4291)"
+            )),
+            SparsityKind::Log { .. } => Err(format!(
+                "log sparsity cannot own a learnable {axis}: its mass is the Student-t \
+                 normalizer δ·√π·Γ(λ−½)/Γ(λ) (finite only for λ > ½), which this module does \
+                 not form. Selecting λ or δ against the unnormalized energy is not REML — the \
+                 optimum would be on a box face, not interior (#4291)"
+            )),
+        }
+    }
+
+    /// Make the log-strength an outer coordinate `λ = weight · exp(ρ₀)`, with
+    /// the sparsifier's own mass priced alongside it (#4291).
+    #[must_use = "invalid learnable-weight requests must be handled"]
+    pub fn with_learnable_weight(mut self) -> Result<Self, String> {
+        self.require_normalizer("strength")?;
+        self.learnable_weight = true;
+        Ok(self)
+    }
+
     #[must_use = "invalid learnable-smoothing requests must be handled"]
     pub fn with_learnable_smoothing(mut self) -> Result<Self, String> {
-        if matches!(self.kind, SparsityKind::Hoyer) {
-            return Err("Hoyer sparsity has no smoothing coordinate to learn".to_string());
-        }
-        // Coordinate 0 is the strength and coordinate 1 is the optional
-        // smoothing log-scale. Do not accept an arbitrary index: rho_count is
-        // exactly two in this state, so any other index is structurally
-        // impossible and would defer a builder error into evaluator indexing.
+        self.require_normalizer("smoothing")?;
+        // The strength axis, when present, is coordinate 0 and the smoothing
+        // log-scale follows it. Do not accept an arbitrary index: rho_count
+        // fixes the layout, so any other index is structurally impossible and
+        // would defer a builder error into evaluator indexing.
         self.learnable_smoothing = true;
         Ok(self)
+    }
+
+    #[must_use]
+    pub fn learns_weight(&self) -> bool {
+        self.learnable_weight
     }
 
     #[must_use]
@@ -650,50 +758,62 @@ impl SparsityPenalty {
         self.learnable_smoothing
     }
 
+    /// Local ρ index of the smoothing log-scale, which follows the strength axis
+    /// when that axis exists.
+    fn smoothing_rho_index(&self) -> usize {
+        usize::from(self.learnable_weight)
+    }
+
     /// Resolve `(strength, eps_or_delta)` from the current ρ view.
     fn resolved(&self, rho: ArrayView1<'_, f64>) -> (f64, f64) {
-        let strength = validated_learnable_weight(self.weight, rho[0]);
+        let strength = if self.learnable_weight {
+            validated_learnable_weight(self.weight, rho[0])
+        } else {
+            self.weight
+        };
         let smoothing = match (self.learnable_smoothing, self.kind) {
             // The owning seam validates this log-smoothing coordinate before
             // exact exponentiation, so it stays positive without a saturated
             // tail or value/derivative mismatch.
-            (true, _) => validated_exp_log_strength(rho[1]),
+            (true, _) => validated_exp_log_strength(rho[self.smoothing_rho_index()]),
             (false, SparsityKind::SmoothedL1 { eps }) => eps,
             (false, SparsityKind::Log { delta }) => delta,
             (false, SparsityKind::Hoyer) => 0.0,
         };
         (strength, smoothing)
     }
-}
 
-impl AnalyticPenalty for SparsityPenalty {
-    fn tier(&self) -> PenaltyTier {
-        self.target_tier
-    }
-
-    fn validate_rho(&self, rho: ArrayView1<'_, f64>) -> Result<(), String> {
-        if rho.len() != self.rho_count() {
-            return Err(format!(
-                "sparsity rho length {} != declared {}",
-                rho.len(),
-                self.rho_count()
-            ));
+    /// `n · ln Z(λ, ε)` and its `(∂/∂ln λ, ∂/∂ln ε)` derivatives for a target of
+    /// `len` coordinates, or `None` when the penalty owns no ρ-axis.
+    ///
+    /// The prior factorizes over coordinates, so the mass of the whole target is
+    /// the per-coordinate mass to the power `len`. It is priced exactly where a
+    /// λ- or ε-derivative is taken and omitted where both are fixed — there it
+    /// is an additive constant that would move every pinned criterion value
+    /// without moving any fit.
+    fn log_partition(&self, len: usize, rho: ArrayView1<'_, f64>) -> Option<(f64, f64, f64)> {
+        if self.rho_count() == 0 {
+            return None;
         }
-        resolve_learnable_weight(self.weight, rho[0])?;
-        if self.learnable_smoothing {
-            checked_exp_log_strength(rho[1]).map_err(|error| error.to_string())?;
-        }
-        Ok(())
+        let (lam, smooth) = self.resolved(rho);
+        let partition = smoothed_laplace_log_partition(lam, smooth)
+            .expect("sparsity rho must be validated before partition evaluation");
+        let rows = len as f64;
+        Some((
+            rows * partition.value,
+            rows * partition.log_strength_derivative,
+            rows * partition.log_smoothing_derivative,
+        ))
     }
 
-    fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
-        let mut domains = vec![(LOG_STRENGTH_MIN, LOG_STRENGTH_MAX); self.rho_count()];
-        domains[0] = learnable_weight_coordinate_domain(self.weight)?
-            .ok_or_else(|| "sparsity has zero base weight".to_string())?;
-        Ok(domains)
-    }
-
-    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+    /// The sparsifier ENERGY `λ·σ(x)` alone, without the prior's mass.
+    ///
+    /// [`AnalyticPenalty::value`] is this plus `n·ln Z(λ, ε)` wherever a ρ-axis
+    /// exists, and [`AnalyticPenalty::grad_rho`] differentiates the two pieces
+    /// separately — the mass's log-coordinate derivatives are NOT the mass
+    /// itself, so reading the energy back out of the value by subtraction would
+    /// be a cancelling subtraction of two large numbers (#4291).
+    fn energy(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
         let (lam, smooth) = self.resolved(rho);
         match self.kind {
             SparsityKind::SmoothedL1 { .. } => {
@@ -728,6 +848,82 @@ impl AnalyticPenalty for SparsityPenalty {
                 }
                 lam * acc
             }
+        }
+    }
+}
+
+impl AnalyticPenalty for SparsityPenalty {
+    fn tier(&self) -> PenaltyTier {
+        self.target_tier
+    }
+
+    fn validate_rho(&self, rho: ArrayView1<'_, f64>) -> Result<(), String> {
+        if rho.len() != self.rho_count() {
+            return Err(format!(
+                "sparsity rho length {} != declared {}",
+                rho.len(),
+                self.rho_count()
+            ));
+        }
+        if self.learnable_weight {
+            resolve_learnable_weight(self.weight, rho[0])?;
+        }
+        if self.learnable_smoothing {
+            checked_exp_log_strength(rho[self.smoothing_rho_index()])
+                .map_err(|error| error.to_string())?;
+        }
+        if self.rho_count() > 0 {
+            // A ρ-axis exists, so the mass is priced; refuse here rather than
+            // let `value` meet a strength/smoothing pair whose `K₁(λ·ε)` has no
+            // digits (#4291).
+            let (lam, smooth) = self.resolved(rho);
+            smoothed_laplace_log_partition(lam, smooth)?;
+        }
+        Ok(())
+    }
+
+    fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
+        if self.rho_count() == 0 {
+            return Ok(Vec::new());
+        }
+        let SparsityKind::SmoothedL1 { eps } = self.kind else {
+            return Err(format!(
+                "analytic penalty `{}` owns a ρ-axis on a kernel with no normalizer; \
+                 this state is unreachable through its builders (#4291)",
+                self.name()
+            ));
+        };
+        // The mass is computable exactly where `ln λ + ln ε` is a legal log
+        // strength, which couples the two axes. A per-axis interval can only
+        // state that coupling when the other axis is FIXED: with ε fixed the
+        // strength's band is `smoothed_laplace_strength_log_band(ε)` shifted by
+        // `−ln|w|`; with ε itself a coordinate no interval in ρ₀ alone is tight,
+        // so the axis keeps its ordinary log-strength band and `validate_rho`
+        // makes the exact joint test at the point the search proposes.
+        let mut domains = Vec::with_capacity(self.rho_count());
+        if self.learnable_weight {
+            let domain = if self.learnable_smoothing {
+                learnable_weight_coordinate_domain(self.weight)?.ok_or_else(|| {
+                    "sparsity has zero base weight".to_string()
+                })?
+            } else {
+                let (lower, upper) = smoothed_laplace_strength_log_band(eps)?;
+                let log_weight = self.weight.abs().ln();
+                (lower - log_weight, upper - log_weight)
+            };
+            domains.push(domain);
+        }
+        if self.learnable_smoothing {
+            domains.push((LOG_STRENGTH_MIN, LOG_STRENGTH_MAX));
+        }
+        Ok(domains)
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        let energy = self.energy(target, rho);
+        match self.log_partition(target.len(), rho) {
+            Some((log_partition, _, _)) => energy + log_partition,
+            None => energy,
         }
     }
 
@@ -1000,12 +1196,23 @@ impl AnalyticPenalty for SparsityPenalty {
     }
 
     fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        // Strength axis: ∂P/∂ρ_strength = P (chain rule through exp).
-        // ε axis (if owned): ∂P/∂ρ_eps = ε · ∂P/∂ε.
+        // Strength axis: ∂E/∂ρ_strength = E (chain rule through exp), plus the
+        // mass's own `∂ln Z/∂ln λ` — which is NOT `ln Z`, so the energy is read
+        // from `energy` and never recovered from `value` (#4291).
+        // ε axis (if owned): ∂E/∂ρ_eps = ε · ∂E/∂ε, plus `∂ln Z/∂ln ε`.
         let n_rho = self.rho_count();
         let mut out = Array1::<f64>::zeros(n_rho);
-        let p_val = self.value(target, rho);
-        out[0] = p_val;
+        if n_rho == 0 {
+            return out;
+        }
+        let partition = self.log_partition(target.len(), rho);
+        if self.learnable_weight {
+            let mut strength_axis = self.energy(target, rho);
+            if let Some((_, d_log_strength, _)) = partition {
+                strength_axis += d_log_strength;
+            }
+            out[0] = strength_axis;
+        }
         if self.learnable_smoothing {
             let (lam, smooth) = self.resolved(rho);
             let mut dp_deps = 0.0;
@@ -1027,13 +1234,17 @@ impl AnalyticPenalty for SparsityPenalty {
                 SparsityKind::Hoyer => {}
             }
             // Chain through ρ_eps = log(ε)  ⇒  ∂ε/∂ρ_eps = ε.
-            out[1] = smooth * dp_deps;
+            let mut smoothing_axis = smooth * dp_deps;
+            if let Some((_, _, d_log_smoothing)) = partition {
+                smoothing_axis += d_log_smoothing;
+            }
+            out[self.smoothing_rho_index()] = smoothing_axis;
         }
         out
     }
 
     fn rho_count(&self) -> usize {
-        1 + usize::from(self.learnable_smoothing)
+        usize::from(self.learnable_weight) + usize::from(self.learnable_smoothing)
     }
 
     fn name(&self) -> &str {
@@ -1191,6 +1402,13 @@ pub struct SmoothThresholdPenalty {
     pub thresholds: Array1<f64>,
     pub weight: f64,
     pub smoothing_eps: f64,
+    /// Whether the `latent_dim` log-thresholds are outer coordinates (#4291).
+    /// Always `false`: [`Self::with_learnable_thresholds`] refuses, because the
+    /// energy `w·Σ τ·σ((x−τ)/ε)` is bounded above by `w·n·τ`, so `∫exp(−E) dx`
+    /// diverges and the prior has no mass. Its infimum over `τ` is at `τ → 0`
+    /// for EVERY target, which is exactly the face an unnormalized outer search
+    /// walks to — switching the threshold gate off while reporting convergence.
+    learnable_thresholds: bool,
 }
 
 impl SmoothThresholdPenalty {
@@ -1236,13 +1454,33 @@ impl SmoothThresholdPenalty {
             thresholds,
             weight,
             smoothing_eps,
+            learnable_thresholds: false,
         })
+    }
+
+    /// Refuse learnable thresholds: this penalty's prior has no mass (#4291).
+    #[must_use = "invalid learnable-threshold requests must be handled"]
+    pub fn with_learnable_thresholds(self) -> Result<Self, String> {
+        Err(format!(
+            "smooth-threshold cannot own learnable thresholds: its energy              w·Σ τ·σ((x−τ)/ε) ∈ (0, w·n·τ) is bounded, so ∫exp(−E(x; τ)) dx diverges and              the prior has no normalizer. The energy's infimum over τ is at τ → 0 for              every target, so an outer search selecting log τ against it can only reach              that face and switch the gate off with no warning              (latent_dim = {}, weight = {})",
+            self.latent_dim, self.weight
+        ))
+    }
+
+    /// Whether the thresholds are outer coordinates. Structurally `false`.
+    #[must_use]
+    pub fn learns_thresholds(&self) -> bool {
+        self.learnable_thresholds
     }
 
     fn threshold(&self, axis: usize, rho: ArrayView1<'_, f64>) -> f64 {
         // Resolve the exact multiplicative threshold after the owning seam has
         // validated its effective log-strength domain.
-        validated_learnable_weight(self.thresholds[axis], rho[axis])
+        if self.learnable_thresholds {
+            validated_learnable_weight(self.thresholds[axis], rho[axis])
+        } else {
+            self.thresholds[axis]
+        }
     }
 
     pub(crate) fn sigmoid_gate(&self, x: f64) -> f64 {
@@ -1305,12 +1543,15 @@ impl AnalyticPenalty for SmoothThresholdPenalty {
     }
 
     fn validate_rho(&self, rho: ArrayView1<'_, f64>) -> Result<(), String> {
-        if rho.len() != self.latent_dim {
+        if rho.len() != self.rho_count() {
             return Err(format!(
-                "smooth-threshold rho length {} != latent dimension {}",
+                "smooth-threshold rho length {} != declared {}",
                 rho.len(),
-                self.latent_dim
+                self.rho_count()
             ));
+        }
+        if !self.learnable_thresholds {
+            return Ok(());
         }
         for axis in 0..self.latent_dim {
             resolve_learnable_weight(self.thresholds[axis], rho[axis])?;
@@ -1319,6 +1560,9 @@ impl AnalyticPenalty for SmoothThresholdPenalty {
     }
 
     fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
+        if !self.learnable_thresholds {
+            return Ok(Vec::new());
+        }
         self.thresholds
             .iter()
             .map(|&threshold| {
@@ -1428,7 +1672,10 @@ impl AnalyticPenalty for SmoothThresholdPenalty {
     fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
         let d = self.latent_dim;
         let n_obs = target.len() / d;
-        let mut out = Array1::<f64>::zeros(d);
+        let mut out = Array1::<f64>::zeros(self.rho_count());
+        if !self.learnable_thresholds {
+            return out;
+        }
         for axis in 0..d {
             let tau = self.threshold(axis, rho);
             let mut g_tau = 0.0;
@@ -1443,7 +1690,11 @@ impl AnalyticPenalty for SmoothThresholdPenalty {
     }
 
     fn rho_count(&self) -> usize {
-        self.latent_dim
+        if self.learnable_thresholds {
+            self.latent_dim
+        } else {
+            0
+        }
     }
 
     fn name(&self) -> &str {

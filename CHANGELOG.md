@@ -206,6 +206,41 @@
   measured beside gam's but never fail a run. `report.FALSE_ALARM` (10⁻³ per run,
   Bonferroni-split across the run's checks) was already documented as the false-alarm rate
   of this smoke test and is now the rate at which it actually fires.
+- **Five analytic penalties offered the outer search a strength whose criterion had no
+  interior optimum, so REML switched them off** (gam#4291). `SparsityPenalty`,
+  `SoftmaxAssignmentSparsityPenalty`, `NestedPrefixPenalty`, `IsometryPenalty` and
+  `SmoothThresholdPenalty` each declared a `rho_count` unconditionally, and
+  `analytic_penalty_objective_contribution` added `penalty.value` and `penalty.grad_rho`
+  and nothing else. A penalty value is `-log p(target | lambda)` only up to the prior's
+  mass `log Z(lambda)`, and for every one of these five the energy's sign in `log lambda`
+  is the same at EVERY target: `>= 0` for the sparsifiers, the entropy and the isometry
+  gauge, and infimal at `tau -> 0` for the smooth threshold. The outer minimizer therefore
+  could not have an interior optimum in those coordinates and went to a face — every
+  strength to `w*e^-12`, about 1.6e5 times weaker than the `weight` the caller wrote, the
+  smoothed-L1 `eps` to `e^-12` where the surrogate is non-smooth at 0, the log-sparsifier
+  `delta` to `e^+12` where `log(1 + x^2/delta^2) ~ 0` — and the fit returned at a
+  bound-active KKT point with no warning, with the requested sparsity, nesting, entropy or
+  isometry structure effectively absent. `ArdPenalty` and `RowPrecisionPriorPenalty` never
+  had this defect because they carry `-1/2 n_eff log(w e^rho)`, and the macro-gated
+  penalties never had it because they contribute no `rho` unless `learnable_weight` is set.
+  The rule is now one rule for every penalty: a strength or scale is an outer coordinate
+  ONLY when the caller asks for it AND the penalty prices its own `log Z`. All five hold
+  the caller's `weight`, `shell_weights` or `thresholds` fixed by default, and a
+  descriptor's `"learnable": true` is answered by the penalty: nested-prefix shells and
+  smoothed-L1 accept it and carry the exact smoothed-Laplace mass
+  `Z(W, eps) = 2*eps*K_1(W*eps)` with `d log Z / d log W = -(1 + W*eps*K_0/K_1)` and
+  `d log Z / d log eps = -W*eps*K_0/K_1` (`smoothed_laplace_log_partition`, evaluated
+  through a new exponentially scaled `ln K_1` / `K_0/K_1` pair so it is defined across the
+  whole legal log-strength band rather than underflowing past `W*eps ~ 745`); Hoyer, the
+  log sparsifier, the softmax entropy, the isometry gauge and the smooth threshold refuse
+  by name, each naming the integral that does not exist or is not formed here. The
+  descriptor refusal is the correct outcome for a capability that cannot be given an
+  interior optimum: a named refusal is strictly better than a fit that rails. Readers
+  should check that `nested_prefix_grad_rho_matches_finite_difference` differences the
+  value INCLUDING the mass, and that
+  `nested_prefix_shell_strengths_are_fixed_and_normalized_4291` finds the
+  `rho_k`-derivative negative at a vanishing strength and positive at a large one — the
+  sign change that did not exist before.
 
 - **The default spatial center count is a derived resolution rate, not a table of seven
   constants** (gam#3149, gam#2993).

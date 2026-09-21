@@ -963,16 +963,44 @@ fn parametric_row_precision_derivatives_match_central_differences() {
     assert_abs_diff_eq!(frozen_log_det, expected_log_det, epsilon = 1e-12 * n as f64);
 }
 
+/// #4291 — a sparsity rho axis exists only where the kernel's prior has a mass
+/// this module forms, and no axis exists unless the caller asks for it.
+///
+/// Before #4291 the strength was an outer coordinate unconditionally, on every
+/// kernel, with no normalizer; `∂value/∂rho_strength = value ≥ 0` at every
+/// target, so the outer search could only walk it to a face. The three
+/// assertions below fail if any of that comes back: a default penalty owning an
+/// axis, a Hoyer or log kernel accepting one, or the smoothed-L1 pair losing the
+/// joint `ln(lambda·eps)` domain its normalizer needs.
 #[test]
-fn sparsity_learnable_smoothing_has_one_structural_coordinate() {
-    assert!(
-        SparsityPenalty::hoyer(PenaltyTier::Psi)
-            .with_learnable_smoothing()
-            .is_err(),
-        "Hoyer has no smoothing scale and must not acquire a dead rho axis"
-    );
+fn sparsity_learnable_axes_exist_only_with_a_normalizer_4291() {
+    // Nothing is learnable by default: the caller's `weight` and `eps` stand.
+    for penalty in [
+        SparsityPenalty::smoothed_l1(PenaltyTier::Psi, 1.0e-3).unwrap(),
+        SparsityPenalty::log(PenaltyTier::Psi, 0.5).unwrap(),
+        SparsityPenalty::hoyer(PenaltyTier::Psi),
+    ] {
+        assert_eq!(penalty.rho_count(), 0, "{} owns an unasked-for rho", penalty.name());
+        assert!(penalty.rho_coordinate_domains().unwrap().is_empty());
+        penalty
+            .validate_rho(Array1::<f64>::zeros(0).view())
+            .expect("an empty rho is the whole vector");
+    }
+
+    // Hoyer is scale-invariant with a bounded energy and log's Student-t mass is
+    // not formed here, so both refuse BOTH axes rather than fitting against a
+    // missing term.
+    for kind in [
+        SparsityPenalty::hoyer(PenaltyTier::Psi),
+        SparsityPenalty::log(PenaltyTier::Psi, 0.5).unwrap(),
+    ] {
+        assert!(kind.clone().with_learnable_smoothing().is_err());
+        assert!(kind.with_learnable_weight().is_err());
+    }
 
     let penalty = SparsityPenalty::smoothed_l1(PenaltyTier::Psi, 1.0e-3)
+        .unwrap()
+        .with_learnable_weight()
         .unwrap()
         .with_learnable_smoothing()
         .unwrap();
@@ -988,6 +1016,23 @@ fn sparsity_learnable_smoothing_has_one_structural_coordinate() {
             .validate_rho(array![0.0, LOG_STRENGTH_MAX + 1.0e-6].view())
             .is_err()
     );
+    // The mass couples the two axes: `ln(lambda·eps)` must itself be a legal log
+    // strength, so the closed smoothing face is legal at `lambda = 1` and
+    // illegal once the strength is pushed past it.
+    assert!(
+        penalty
+            .validate_rho(array![1.0, LOG_STRENGTH_MAX].view())
+            .is_err(),
+        "K_1(lambda·eps) has no digits past the log-strength band"
+    );
+
+    // With the strength fixed the smoothing axis stands alone at index 0.
+    let smoothing_only = SparsityPenalty::smoothed_l1(PenaltyTier::Psi, 1.0e-3)
+        .unwrap()
+        .with_learnable_smoothing()
+        .unwrap();
+    assert_eq!(smoothing_only.rho_count(), 1);
+    assert_eq!(smoothing_only.rho_coordinate_domains().unwrap().len(), 1);
 }
 
 #[test]
@@ -1209,7 +1254,9 @@ fn isometry_refuses_the_undefined_gauge_at_a_vanishing_jacobian_3440() {
     let (n_obs, p, d, j, h) = isometry_gn_fixture();
     let n = n_obs * d;
     let t = Array1::<f64>::zeros(n);
-    let rho = array![0.0_f64];
+    // The isometry strength is the penalty's `scalar_weight`, never an outer
+    // coordinate: its normalizer lives in metric space (#4291).
+    let rho = Array1::<f64>::zeros(0);
     let at = |scale: f64| {
         let pen = IsometryPenalty::new_euclidean(PsiSlice::full(n, Some(d)), p);
         pen.refresh_caches(Some(Arc::new(&*j * scale)), Some(Arc::new(&*h * scale)));
@@ -1244,7 +1291,7 @@ fn frozen_isometry_dense_and_diag_are_its_psd_matvec_3440() {
     pen.refresh_caches(Some(j), Some(h));
     let t = Array1::<f64>::zeros(n);
     let op = AnalyticPenaltyKind::Isometry(Arc::new(pen))
-        .freeze(t, array![0.0_f64])
+        .freeze(t, Array1::<f64>::zeros(0))
         .expect("J and H define the frozen majorizer");
     let dense = op.as_dense();
     let diag = op.diag();
@@ -1277,11 +1324,15 @@ fn smooth_threshold_sweep_fixture() -> (
     f64,
     f64,
 ) {
-    let thresholds = array![0.25_f64, 0.8];
-    let rho = array![0.0_f64, 1.5_f64.ln()];
+    // The per-axis thresholds are the caller's; they are no longer multiplied by
+    // an outer `exp(rho)` coordinate, so the sweep's second threshold carries the
+    // factor 1.5 the coordinate used to supply and the fixture is unchanged
+    // (0.25 and 1.2) while the penalty owns no rho (#4291).
+    let thresholds = array![0.25_f64, 1.2];
+    let rho = Array1::<f64>::zeros(0);
     let eps = 0.04_f64;
     let weight = 1.3_f64;
-    let scaled_thresholds = [thresholds[0] * rho[0].exp(), thresholds[1] * rho[1].exp()];
+    let scaled_thresholds = [thresholds[0], thresholds[1]];
     let latent_dim = thresholds.len();
     let offsets = [-5.0_f64, -2.0, -0.5, -0.05, 0.0, 0.05, 0.5, 2.0, 5.0];
     let mut values = Vec::with_capacity(offsets.len() * latent_dim);
@@ -1450,10 +1501,18 @@ fn assert_diagonal_penalty_matches_central_differences(
 ///   about `2.3e-9`.
 /// - Log with `δ = 0.5`, `λ = e^{−0.1}`: the third derivative of
 ///   `2λx/(δ² + x²)` peaks at `12λ/δ⁴ ≈ 174`, which gives about `2.9e-9`.
+/// - Log with `δ = 0.5`, `λ = 1` (its strength is no longer an outer
+///   coordinate, #4291): the same third derivative peaks at `12λ/δ⁴ ≈ 192`,
+///   which gives about `3.2e-9`.
 /// - Smooth threshold with `ε = 0.2`: the gradient is `wτ σ'(z)/ε` with
 ///   `z = (x − τ)/ε`. Its third x-derivative is `wτ σ''''(z)/ε⁴`, and
-///   `|σ''''| ≤ 1/8`, `wτ ≤ 1.3 · 0.8 e^{−0.2}`, so it is at most about 66,
-///   which gives about `1.1e-9`.
+///   `|σ''''| ≤ 1/8`, `wτ ≤ 1.3 · 0.8` (the thresholds are the caller's, #4291),
+///   so it is at most about 81, which gives about `1.3e-9`.
+/// - The smoothed-L¹ arm's value now carries `n·ln Z(λ, ε) = n·ln(2ε K₁(λε))`,
+///   so its `grad_rho` FD checks the NORMALIZER's `∂/∂ln λ` and `∂/∂ln ε` as
+///   well as the energy's (#4291). At `λ = e^{0.2}`, `ε = 0.3` the term is
+///   `O(1)` per coordinate and every ρ-derivative of it is bounded by
+///   `1 + λε·K₀/K₁ ≤ 1 + λε`, so it adds nothing to the budget below.
 /// - Hoyer and TopK stay at least `0.05` from every kink and every magnitude
 ///   tie, so the stencil never crosses one. Hoyer's terms are `O(1)`
 ///   (about `2e-11`), and TopK's value is quadratic, which leaves pure
@@ -1467,6 +1526,8 @@ fn sparsity_threshold_and_topk_derivatives_match_central_differences() {
 
     let smoothed_l1 = SparsityPenalty::smoothed_l1(PenaltyTier::Psi, 0.3)
         .expect("smoothed L1")
+        .with_learnable_weight()
+        .expect("learnable strength")
         .with_learnable_smoothing()
         .expect("learnable eps");
     let rho = array![0.2_f64, 0.3_f64.ln()];
@@ -1476,11 +1537,16 @@ fn sparsity_threshold_and_topk_derivatives_match_central_differences() {
         .expect("smoothed L1 Hessian is diagonal");
     assert_diagonal_penalty_matches_central_differences(&smoothed_l1, &x, &rho, &diag, tol);
 
-    let log = SparsityPenalty::log(PenaltyTier::Psi, 0.5)
-        .expect("log sparsity")
-        .with_learnable_smoothing()
-        .expect("learnable delta");
-    let rho = array![-0.1_f64, 0.5_f64.ln()];
+    // The log sparsifier's Student-t mass is not formed here, so neither axis
+    // is offered and its strength and delta are the caller's (#4291).
+    assert!(
+        SparsityPenalty::log(PenaltyTier::Psi, 0.5)
+            .expect("log sparsity")
+            .with_learnable_smoothing()
+            .is_err()
+    );
+    let log = SparsityPenalty::log(PenaltyTier::Psi, 0.5).expect("log sparsity");
+    let rho = Array1::<f64>::zeros(0);
     log.validate_rho(rho.view()).expect("interior rho");
     let diag = log
         .hessian_diag(x.view(), rho.view())
@@ -1493,7 +1559,7 @@ fn sparsity_threshold_and_topk_derivatives_match_central_differences() {
 
     let h = 1e-5;
     let hoyer = SparsityPenalty::hoyer(PenaltyTier::Psi);
-    let rho = array![0.3_f64];
+    let rho = Array1::<f64>::zeros(0);
     let worst = value_grad_fd_max_abs_error(&hoyer, x.view(), rho.view(), h);
     assert!(
         worst <= tol,
@@ -1506,12 +1572,10 @@ fn sparsity_threshold_and_topk_derivatives_match_central_differences() {
     for i in 0..x.len() {
         assert_abs_diff_eq!(hv[i], (gp[i] - gm[i]) / (2.0 * h), epsilon = tol);
     }
-    let gr = hoyer.grad_rho(x.view(), rho.view());
-    assert_eq!(gr.len(), 1);
-    let fd_rho = (hoyer.value(x.view(), array![0.3 + h].view())
-        - hoyer.value(x.view(), array![0.3 - h].view()))
-        / (2.0 * h);
-    assert_abs_diff_eq!(gr[0], fd_rho, epsilon = tol);
+    // Hoyer owns no rho axis: its energy is bounded and scale-invariant, so the
+    // prior it would be selected under does not integrate (#4291).
+    assert_eq!(hoyer.rho_count(), 0);
+    assert_eq!(hoyer.grad_rho(x.view(), rho.view()).len(), 0);
 
     let t = array![0.1_f64, 0.5, 0.3, 0.9, 0.45, 1.1];
     let threshold = SmoothThresholdPenalty::new(
@@ -1521,8 +1585,9 @@ fn sparsity_threshold_and_topk_derivatives_match_central_differences() {
         0.2,
     )
     .expect("smooth threshold");
-    let rho = array![0.1_f64, -0.2];
+    let rho = Array1::<f64>::zeros(0);
     threshold.validate_rho(rho.view()).expect("interior rho");
+    assert_eq!(threshold.rho_count(), 0);
     let diag = threshold
         .hessian_diag(t.view(), rho.view())
         .expect("smooth threshold Hessian is diagonal");
@@ -2609,7 +2674,8 @@ fn nested_prefix_grad_matches_finite_difference() {
         1e-3,
     )
     .expect("valid nested-prefix penalty");
-    let rho = array![0.0_f64, 0.0, 0.0];
+    // Shell strengths are the caller's `shell_weights` unless asked for (#4291).
+    let rho = Array1::<f64>::zeros(0);
     let g = pen.grad_target(t.view(), rho.view());
     let eps = 1e-6;
     let fd = gam_linalg_test_support::fd_checker::numerical_gradient_central_diff(
@@ -2640,7 +2706,7 @@ fn nested_prefix_hessian_diag_is_psd() {
         1e-3,
     )
     .expect("valid nested-prefix penalty");
-    let rho = array![0.0_f64, 0.0, 0.0];
+    let rho = Array1::<f64>::zeros(0);
     let h = pen
         .hessian_diag(t.view(), rho.view())
         .expect("nested-prefix Hessian is diagonal");
@@ -2662,7 +2728,7 @@ fn nested_prefix_mask_is_correct() {
     let eps = 0.5;
     let pen =
         NestedPrefixPenalty::new(target, PenaltyTier::Psi, prefixes, weights, eps).expect("valid");
-    let rho = Array1::<f64>::zeros(3);
+    let rho = Array1::<f64>::zeros(0);
     let v = pen.value(t.view(), rho.view());
 
     // W_i = Σ_{k: m_k > i} λ_k.
@@ -2683,6 +2749,17 @@ fn nested_prefix_mask_is_correct() {
     assert_abs_diff_eq!(v, expected, epsilon = 1e-10);
 }
 
+/// #4291 — a learnable shell carries the smoothed-Laplace normalizer, and
+/// `grad_rho` is the derivative of the value INCLUDING it.
+///
+/// The criterion is `P(t; rho) + n_rows·sum_i ln Z(W_i, eps)` with
+/// `Z(W, eps) = 2·eps·K_1(W·eps)`, so this central difference fails if the mass
+/// is priced in the value but not in the gradient, if it is priced in the
+/// gradient as `ln Z` rather than `d ln Z / d ln W`, or if it is dropped again.
+/// The FD budget: the value is `O(30)` here, so the roundoff term
+/// `eps_mach·|f|/h` is about `7e-9` at `h = 1e-6`, three orders under the `1e-5`
+/// bar, and every ρ-derivative of the mass is bounded by
+/// `n_rows·(1 + W_i·eps) = O(3)`.
 #[test]
 fn nested_prefix_grad_rho_matches_finite_difference() {
     let (t, _n, f) = nested_prefix_test_target();
@@ -2694,8 +2771,12 @@ fn nested_prefix_grad_rho_matches_finite_difference() {
         vec![0.7, 0.5, 0.3],
         1e-3,
     )
-    .expect("valid");
+    .expect("valid")
+    .with_learnable_shells()
+    .expect("smoothed-L1 shells carry their own normalizer");
+    assert_eq!(pen.rho_count(), 3);
     let rho = array![0.1_f64, -0.2, 0.3];
+    pen.validate_rho(rho.view()).expect("interior rho");
     let dr = pen.grad_rho(t.view(), rho.view());
     let eps = 1e-6;
     for k in 0..3 {
@@ -2705,6 +2786,65 @@ fn nested_prefix_grad_rho_matches_finite_difference() {
         rm[k] -= eps;
         let fd = (pen.value(t.view(), rp.view()) - pen.value(t.view(), rm.view())) / (2.0 * eps);
         assert_abs_diff_eq!(dr[k], fd, epsilon = 1e-5);
+    }
+}
+
+/// #4291 — the nested-prefix shells are fixed at what the caller wrote, a zero
+/// shell weight is refused where it is written rather than at fit setup, and the
+/// learnable strengths have an INTERIOR optimum because the mass is priced.
+///
+/// The last assertion is the one the issue is about: without `ln Z` the
+/// `rho_k`-derivative is a sum of `sqrt(t_i² + eps²) > 0` terms and is strictly
+/// positive at every `rho`, so the search can only leave through the lower face.
+/// With `ln Z` the derivative is negative at a small strength and positive at a
+/// large one, so a root exists strictly inside.
+#[test]
+fn nested_prefix_shell_strengths_are_fixed_and_normalized_4291() {
+    let (t, _n, f) = nested_prefix_test_target();
+    let target = PsiSlice::full(t.len(), Some(f));
+    let build = || {
+        NestedPrefixPenalty::new(
+            target.clone(),
+            PenaltyTier::Psi,
+            vec![1_usize, 2, 4],
+            vec![0.7, 0.5, 0.3],
+            1e-3,
+        )
+        .expect("valid")
+    };
+    let fixed = build();
+    assert_eq!(fixed.rho_count(), 0);
+    assert!(fixed.rho_coordinate_domains().unwrap().is_empty());
+    assert!(!fixed.learns_shells());
+
+    assert!(
+        NestedPrefixPenalty::new(
+            target.clone(),
+            PenaltyTier::Psi,
+            vec![1_usize, 2, 4],
+            vec![0.7, 0.0, 0.3],
+            1e-3,
+        )
+        .is_err(),
+        "a zero shell weight is refused where it is written, not at fit setup"
+    );
+
+    let learnable = build()
+        .with_learnable_shells()
+        .expect("smoothed-L1 shells carry their own normalizer");
+    let low = learnable.grad_rho(t.view(), array![-8.0_f64, -8.0, -8.0].view());
+    let high = learnable.grad_rho(t.view(), array![8.0_f64, 8.0, 8.0].view());
+    for k in 0..3 {
+        assert!(
+            low[k] < 0.0,
+            "shell {k} derivative must be negative at a vanishing strength; got {}",
+            low[k]
+        );
+        assert!(
+            high[k] > 0.0,
+            "shell {k} derivative must be positive at a large strength; got {}",
+            high[k]
+        );
     }
 }
 

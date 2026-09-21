@@ -81,9 +81,22 @@
 //! Each penalty owns a (possibly empty) sub-range of the global `ρ` vector.
 //! See [`AnalyticPenaltyKind::rho_count`]. The outer REML loop concatenates
 //! these onto the existing per-smooth `ρ`s, exactly the way anisotropic
-//! kernel-shape paths append ext-coords. The IsometryPenalty owns one `ρ`; the
-//! SparsityPenalty owns either zero (`ε` fixed) or one (`ε` REML-selected) plus
-//! one strength; the ARDPenalty owns `d` (one per latent axis);
+//! kernel-shape paths append ext-coords.
+//!
+//! **A ρ-axis exists only where the penalty carries its own prior normalizer**
+//! (#4291). A penalty value is `−log p(target | λ)` only up to `log Z(λ)`, so an
+//! outer search that minimizes the value over `log λ` without `log Z` is not
+//! REML: for every sparsifier, entropy and isometry strength the sign of
+//! `∂value/∂log λ` is the same for EVERY target, the optimum is on a box face,
+//! and the strength the caller wrote is silently replaced by the face value.
+//! Every penalty therefore holds its weight FIXED at what the caller wrote
+//! unless the caller asks for `learnable`, and asking is refused by name on a
+//! penalty with no normalizer. The normalizers that exist are
+//! [`smoothed_laplace_log_partition`] (smoothed-L¹ / nested-prefix shells),
+//! [`softmax_entropy_log_partition`] (the SAE simplex chart) and the Gaussian
+//! `−½·n_eff·log λ` carried by [`ARDPenalty`] / [`RowPrecisionPriorPenalty`].
+//!
+//! The ARDPenalty owns `d` (one per latent axis);
 //! NuclearNorm, BlockSparsity, BlockOrthogonality, ScadMcp,
 //! DecoderIncoherence, RowPrecisionPrior, and Orthogonality each own one
 //! strength only when their weight is learnable.
@@ -96,8 +109,11 @@
 //!
 //! | Penalty   | Target tier | ρ-axes owned         |
 //! |-----------|-------------|----------------------|
-//! | Isometry  | ext-coord (latent t) | 1 (log μ_iso)        |
-//! | Sparsity  | β or ext-coord       | 1 (strength) [+1 ε]  |
+//! | Isometry  | ext-coord (latent t) | 0 (no prior normalizer) |
+//! | Sparsity  | β or ext-coord       | 0 or 1 (strength) [+1 ε], smoothed-L¹ only |
+//! | SoftmaxAssignmentSparsity | ext-coord (logits) | 0 (normalizer is the SAE simplex chart's) |
+//! | SmoothThreshold | ext-coord (latent t) | 0 (bounded energy, no normalizer) |
+//! | NestedPrefix | ext-coord (latent t) | 0 or K (per-shell log-strength) |
 //! | Ordered Beta--Bernoulli | ext-coord (logits) | 0 or 1 (log α) |
 //! | ARD       | ext-coord (latent t) | d (one per axis)     |
 //! | TV        | ext-coord (latent t) | 0 or 1 (log μ_tv)    |
@@ -146,6 +162,7 @@ mod registry;
 mod row_precision;
 mod scad_mcp;
 mod sheaf;
+mod smoothed_laplace_partition;
 mod softmax_entropy_partition;
 mod sparsity;
 mod total_variation;
@@ -162,6 +179,7 @@ pub use penalty_trait::*;
 pub use registry::*;
 pub use row_precision::*;
 pub use scad_mcp::*;
+pub use smoothed_laplace_partition::*;
 pub use softmax_entropy_partition::*;
 pub use sparsity::*;
 pub use total_variation::*;

@@ -569,12 +569,20 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 descriptor_no_unknown_keys(
                     descriptor,
                     &context,
-                    &["kind", "target", "weight", "p_out"],
+                    &["kind", "target", "weight", "p_out", "learnable"],
                 )?;
                 let weight = descriptor_weight_scalar(descriptor, &context)?;
                 let p_out = descriptor_usize(descriptor, "p_out", target.d)?;
                 let mut penalty = IsometryPenalty::new_euclidean(slice, p_out);
                 penalty.scalar_weight = weight;
+                // `learnable` is accepted so the refusal names the mathematics
+                // rather than the key. The isometry strength has no prior
+                // normalizer, so it is never an outer coordinate (#4291).
+                if descriptor_learnable(descriptor, &context)? {
+                    penalty = penalty
+                        .with_learnable_weight()
+                        .map_err(|err| format!("{context}: {err}"))?;
+                }
                 registry.push(AnalyticPenaltyKind::Isometry(Arc::new(penalty)));
             }
             "ard" => {
@@ -599,13 +607,30 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 descriptor_no_unknown_keys(
                     descriptor,
                     &context,
-                    &["kind", "target", "thresholds", "weight", "smoothing_eps"],
+                    &[
+                        "kind",
+                        "target",
+                        "thresholds",
+                        "weight",
+                        "smoothing_eps",
+                        "learnable",
+                    ],
                 )?;
                 let thresholds = descriptor_array1_flat(descriptor, "thresholds", &context)?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-3)?;
-                let penalty = SmoothThresholdPenalty::new(slice, thresholds, weight, smoothing_eps)
-                    .map_err(|err| format!("{context}: {err}"))?;
+                let mut penalty =
+                    SmoothThresholdPenalty::new(slice, thresholds, weight, smoothing_eps)
+                        .map_err(|err| format!("{context}: {err}"))?;
+                // The thresholds were outer coordinates unconditionally until
+                // #4291; they are now fixed at what the caller wrote, and asking
+                // for them back is refused by name because the gate energy is
+                // bounded and its prior has no mass.
+                if descriptor_learnable(descriptor, &context)? {
+                    penalty = penalty
+                        .with_learnable_thresholds()
+                        .map_err(|err| format!("{context}: {err}"))?;
+                }
                 registry.push(AnalyticPenaltyKind::SmoothThreshold(Arc::new(penalty)));
             }
             "orthogonality" => {
@@ -632,6 +657,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "weight",
                         "eps",
                         "eps_weight",
+                        "learnable",
                     ],
                 )?;
                 let weight = descriptor_weight_scalar(descriptor, &context)?;
@@ -657,12 +683,25 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                             "{context}.eps_weight='auto' is not meaningful for Hoyer sparsity"
                         ));
                     }
-                    "auto" => penalty.with_learnable_smoothing()?,
+                    "auto" => penalty
+                        .with_learnable_smoothing()
+                        .map_err(|err| format!("{context}: {err}"))?,
                     other => {
                         return Err(format!(
                             "{context}.eps_weight must be 'auto' or 'fixed'; got {other:?}"
                         ));
                     }
+                };
+                // The strength was an outer coordinate unconditionally until
+                // #4291. It is now the `weight` the caller wrote unless they ask
+                // for it to be learned, and asking is refused on the kernels
+                // whose prior has no mass this module forms.
+                let penalty = if descriptor_learnable(descriptor, &context)? {
+                    penalty
+                        .with_learnable_weight()
+                        .map_err(|err| format!("{context}: {err}"))?
+                } else {
+                    penalty
                 };
                 registry.push(AnalyticPenaltyKind::Sparsity(Arc::new(penalty)));
             }
@@ -846,11 +885,21 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 descriptor_no_unknown_keys(
                     descriptor,
                     &context,
-                    &["kind", "target", "k_atoms", "temperature"],
+                    &["kind", "target", "k_atoms", "temperature", "learnable"],
                 )?;
                 let k_atoms = descriptor_usize(descriptor, "k_atoms", target.d)?;
                 let temperature = descriptor_f64(descriptor, "temperature", 1.0)?;
                 let penalty = SoftmaxAssignmentSparsityPenalty::new(k_atoms, temperature);
+                // The entropy strength was an outer coordinate unconditionally
+                // until #4291; on this chart the prior is improper, so asking
+                // for it is refused by name (#4291).
+                let penalty = if descriptor_learnable(descriptor, &context)? {
+                    penalty
+                        .with_learnable_weight()
+                        .map_err(|err| format!("{context}: {err}"))?
+                } else {
+                    penalty
+                };
                 registry.push(AnalyticPenaltyKind::SoftmaxAssignmentSparsity(Arc::new(
                     penalty,
                 )));
@@ -1171,6 +1220,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "shell_weights",
                         "eps",
                         "tier",
+                        "learnable",
                     ],
                 )?;
                 let prefix_values = descriptor
@@ -1218,6 +1268,17 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 let penalty =
                     NestedPrefixPenalty::new(slice, tier, prefix_sizes, shell_weights, eps)
                         .map_err(|err| format!("{context}: {err}"))?;
+                // The per-shell strengths were outer coordinates
+                // unconditionally until #4291; they are now the `shell_weights`
+                // the caller wrote unless asked for, and asking brings the
+                // smoothed-Laplace normalizer with them.
+                let penalty = if descriptor_learnable(descriptor, &context)? {
+                    penalty
+                        .with_learnable_shells()
+                        .map_err(|err| format!("{context}: {err}"))?
+                } else {
+                    penalty
+                };
                 registry.push(AnalyticPenaltyKind::NestedPrefix(Arc::new(penalty)));
             }
             other => {

@@ -23,8 +23,12 @@ fn active_softmax_dense_entropy_hessian_entry_matches_dense_block_1410() {
     let k = 48;
     let temperature = 1.3_f64;
     let scale = 0.9_f64;
-    let penalty = SoftmaxAssignmentSparsityPenalty::new(k, temperature);
-    let rho = Array1::from_elem(1, (scale * temperature * temperature).ln());
+    let mut penalty = SoftmaxAssignmentSparsityPenalty::new(k, temperature);
+    // The entropy strength is the penalty's `weight`, not an outer coordinate:
+    // on the (N, K) logit chart its prior is improper, so no rho axis exists
+    // (#4291). The oracle's `scale` is unchanged.
+    penalty.weight = scale * temperature * temperature;
+    let rho = Array1::<f64>::zeros(0);
     let mut largest_reference = 0.0_f64;
     let mut largest_error = 0.0_f64;
     for fixture in 0..3 {

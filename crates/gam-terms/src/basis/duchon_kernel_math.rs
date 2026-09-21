@@ -569,14 +569,58 @@ const SCALED_BESSEL_K1_CHEBYSHEV: [f64; 24] = [
     0.000565154088568589,
 ];
 
+/// `Σ_k c_k y^k` with `y = 2/x`: the large-argument series ALONE, without the
+/// `e^{−x}/√x` envelope. Split out because a caller that wants `ln K_ν` must
+/// never form the envelope — `e^{−x}` underflows for `x > 745` while `ln K_ν`
+/// stays perfectly representable there (#4291). Both the value branch and the
+/// log branch read this one Horner fold, so they cannot drift apart.
+#[inline(always)]
+fn scaled_bessel_k_series(x: f64, coefficients: &[f64; 24]) -> f64 {
+    let y = 2.0 / x;
+    coefficients.iter().rev().fold(0.0, |acc, &c| acc * y + c)
+}
+
 /// `e^{−x}/√x · Σ_k c_k y^k` with `y = 2/x`, the common envelope of both
 /// large-argument branches. Kept in one place so `K₀` and `K₁` cannot drift
 /// apart in how they form it.
 #[inline(always)]
 fn scaled_bessel_k_large(x: f64, coefficients: &[f64; 24]) -> f64 {
-    let y = 2.0 / x;
-    let series = coefficients.iter().rev().fold(0.0, |acc, &c| acc * y + c);
-    (-x).exp() / x.sqrt() * series
+    (-x).exp() / x.sqrt() * scaled_bessel_k_series(x, coefficients)
+}
+
+/// `(ln K₁(x), K₀(x)/K₁(x))` for `x > 0`, formed so that neither piece is
+/// computed through a value that overflows or underflows anywhere in the legal
+/// log-strength domain `x ∈ [ε·e^{−700}, ε·e^{+700}]` (#4291).
+///
+/// * `x > 2`: `K_ν(x) = e^{−x} x^{−1/2} S_ν(2/x)`, so
+///   `ln K₁ = −x − ½ln x + ln S₁` and `K₀/K₁ = S₀/S₁`. The envelope cancels in
+///   the ratio and never appears in the logarithm, which is why the pair is
+///   derived here rather than from [`bessel_k0_stable`] / [`bessel_k1_stable`]:
+///   past `x ≈ 745` both of those are exactly `0` and their logarithm and ratio
+///   carry no digits at all.
+/// * `x ≤ 2`: the ascending series already returns `K₀` and `K₁` with full
+///   relative accuracy (`K₁ ~ 1/x` and `K₀ ~ −ln(x/2) − γ` as `x → 0⁺`, both
+///   representable down to the smallest legal `x`), so the logarithm and the
+///   ratio are taken directly.
+///
+/// The two branches meet at `x = 2`, where the Chebyshev fit and the ascending
+/// series agree to the accuracy pinned by
+/// `bessel_k_branch_crossover_has_no_step`.
+pub(crate) fn log_bessel_k1_and_k0_over_k1(x: f64) -> (f64, f64) {
+    assert!(
+        x.is_finite() && x > 0.0,
+        "log_bessel_k1_and_k0_over_k1 requires a finite x > 0; got {x}"
+    );
+    if x <= 2.0 {
+        let (k0, k1) = bessel_k0_k1_small_series(x);
+        return (k1.ln(), k0 / k1);
+    }
+    let series_k0 = scaled_bessel_k_series(x, &SCALED_BESSEL_K0_CHEBYSHEV);
+    let series_k1 = scaled_bessel_k_series(x, &SCALED_BESSEL_K1_CHEBYSHEV);
+    (
+        -x - 0.5 * x.ln() + series_k1.ln(),
+        series_k0 / series_k1,
+    )
 }
 
 // The modified Bessel functions of the second kind have a pole at the origin:
@@ -608,7 +652,14 @@ pub(crate) fn bessel_k1_stable(x: f64) -> f64 {
 pub(crate) fn bessel_k0_k1_small_series(x: f64) -> (f64, f64) {
     const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
     let y = 0.25 * x * x;
-    let log_half_plus_gamma = 0.5 * y.ln() + EULER_GAMMA;
+    // `ln(x/2) + γ`, written on `x` itself rather than as `½·ln(x²/4)`. The two
+    // are the same number in exact arithmetic, but `y = x²/4` underflows to `0`
+    // for `x < 3e-162` and `ln 0 = −∞` then poisons both `K₀` and `K₁` at
+    // arguments that are perfectly ordinary for this series (`K₁ ~ 1/x`,
+    // `K₀ ~ −ln(x/2) − γ`). Reading `x` directly also removes one rounding: the
+    // argument of the logarithm is exact instead of `x²` rounded, and the two
+    // constants fold into one (#4291).
+    let log_half_plus_gamma = x.ln() + (EULER_GAMMA - std::f64::consts::LN_2);
     let mut i0 = 1.0;
     let mut i1 = 0.5 * x;
     let mut harmonic = 0.0;

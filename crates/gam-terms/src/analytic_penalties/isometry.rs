@@ -149,6 +149,16 @@ pub struct IsometryPenalty {
     /// `O(p²)` per row.
     pub weight: WeightField,
     pub scalar_weight: f64,
+    /// Whether the log-strength is an outer coordinate (#4291). Always `false`:
+    /// [`Self::with_learnable_weight`] refuses. `∂P/∂ρ_iso = P ≥ 0` for every
+    /// target, so without a prior normalizer the outer minimizer has no
+    /// interior optimum in `ρ_iso` and can only walk it to the lower face,
+    /// where the gauge this penalty exists to fix is effectively absent while
+    /// the fit still reports convergence. The isometry energy's normalizer is
+    /// an integral in METRIC space (over the pullback `JᵀWJ`), not over the
+    /// latent coordinates this penalty's `value` integrates, so it is not a
+    /// term this module can form.
+    learnable_weight: bool,
 }
 
 struct IsometryHvpState {
@@ -315,6 +325,35 @@ impl IsometryPenalty {
             p_out,
             weight: WeightField::Identity,
             scalar_weight: 1.0,
+            learnable_weight: false,
+        }
+    }
+
+    /// Refuse a learnable isometry strength: the energy's normalizer lives in
+    /// metric space, not in the latent coordinates it is integrated over
+    /// (#4291).
+    #[must_use = "invalid learnable-weight requests must be handled"]
+    pub fn with_learnable_weight(self) -> Result<Self, String> {
+        Err(format!(
+            "isometry cannot own a learnable strength: ∂P/∂ρ_iso = P ≥ 0 at every target,              and the prior mass that would make the optimum interior is an integral over              the pullback metric JᵀWJ rather than over the latent coordinates this value              is a function of. Selecting μ_iso against the unnormalized energy sends it to              the lower face, removing the gauge fix the penalty exists for while the fit              still certifies (p_out = {}, scalar_weight = {})",
+            self.p_out, self.scalar_weight
+        ))
+    }
+
+    /// Whether the isometry strength is an outer coordinate. Structurally
+    /// `false`.
+    #[must_use]
+    pub fn learns_weight(&self) -> bool {
+        self.learnable_weight
+    }
+
+    /// Effective isometry strength: the `scalar_weight` field, or
+    /// `scalar_weight · exp(ρ_iso)` if a strength coordinate is ever admitted.
+    fn strength(&self, rho: ArrayView1<'_, f64>) -> f64 {
+        if self.learnable_weight {
+            validated_learnable_weight(self.scalar_weight, rho[self.rho_index])
+        } else {
+            self.scalar_weight
         }
     }
 
@@ -444,6 +483,7 @@ impl Clone for IsometryPenalty {
             p_out: self.p_out,
             weight: self.weight.clone(),
             scalar_weight: self.scalar_weight,
+            learnable_weight: self.learnable_weight,
         }
     }
 }
@@ -702,7 +742,7 @@ impl IsometryPenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        let mu = validated_learnable_weight(self.scalar_weight, rho[self.rho_index]);
+        let mu = self.strength(rho);
         let d = state.d;
         let n_obs = state.n_obs;
         let p = state.p;
@@ -1021,7 +1061,7 @@ impl IsometryPenalty {
         );
         let g = self.pullback_metric(d).expect(INSTALLED_JACOBIAN);
         let metric = self.normalized_metric_state(g, n_obs, d);
-        let mu = validated_learnable_weight(self.scalar_weight, rho[self.rho_index]);
+        let mu = self.strength(rho);
         for n in 0..n_obs {
             let wj = self.weighted_jacobian_row(n, d).expect(INSTALLED_JACOBIAN);
             for i in 0..p {
@@ -1044,14 +1084,23 @@ impl AnalyticPenalty for IsometryPenalty {
     }
 
     fn validate_rho(&self, rho: ArrayView1<'_, f64>) -> Result<(), String> {
-        if rho.len() != 1 {
-            return Err(format!("isometry rho length {} != 1", rho.len()));
+        if rho.len() != self.rho_count() {
+            return Err(format!(
+                "isometry rho length {} != declared {}",
+                rho.len(),
+                self.rho_count()
+            ));
         }
-        resolve_learnable_weight(self.scalar_weight, rho[self.rho_index])?;
+        if self.learnable_weight {
+            resolve_learnable_weight(self.scalar_weight, rho[self.rho_index])?;
+        }
         Ok(())
     }
 
     fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
+        if !self.learnable_weight {
+            return Ok(Vec::new());
+        }
         Ok(vec![
             learnable_weight_coordinate_domain(self.scalar_weight)?
                 .ok_or_else(|| "isometry scalar weight must be positive".to_string())?,
@@ -1067,7 +1116,7 @@ impl AnalyticPenalty for IsometryPenalty {
         self.require_evaluation_state("value", IsometryEvaluationOrder::Value, target.len());
         let g = self.pullback_metric(d).expect(INSTALLED_JACOBIAN);
         let metric = self.normalized_metric_state(g, n_obs, d);
-        let mu = validated_learnable_weight(self.scalar_weight, rho[self.rho_index]);
+        let mu = self.strength(rho);
         let mut acc = 0.0;
         for n in 0..n_obs {
             for k in 0..(d * d) {
@@ -1104,7 +1153,7 @@ impl AnalyticPenalty for IsometryPenalty {
         let g = self.pullback_metric(d).expect(INSTALLED_JACOBIAN);
         let metric = self.normalized_metric_state(g, n_obs, d);
         let p = self.p_out;
-        let mu = validated_learnable_weight(self.scalar_weight, rho[self.rho_index]);
+        let mu = self.strength(rho);
         let mut grad = Array1::<f64>::zeros(target.len());
         let jac2 = self.jacobian_second_cache().expect(INSTALLED_JETS);
         assert_eq!(jac2.ncols(), p * d * d);
@@ -1178,7 +1227,7 @@ impl AnalyticPenalty for IsometryPenalty {
         let g = self.pullback_metric(d).expect(INSTALLED_JACOBIAN);
         let metric = self.normalized_metric_state(g, n_obs, d);
         let p = self.p_out;
-        let mu = validated_learnable_weight(self.scalar_weight, rho[self.rho_index]);
+        let mu = self.strength(rho);
         let mut out = Array1::<f64>::zeros(v.len());
         let mut wj_rows = Vec::with_capacity(n_obs);
         for n in 0..n_obs {
@@ -1227,12 +1276,15 @@ impl AnalyticPenalty for IsometryPenalty {
         // P(ρ) = ½ μ · S, where S is the (ρ-independent) Frobenius sum and
         // μ = exp(ρ_iso). So ∂P/∂ρ_iso = P.
         let mut out = Array1::<f64>::zeros(self.rho_count());
+        if !self.learnable_weight {
+            return out;
+        }
         out[self.rho_index] = self.value(target, rho);
         out
     }
 
     fn rho_count(&self) -> usize {
-        1
+        usize::from(self.learnable_weight)
     }
 
     fn name(&self) -> &str {
