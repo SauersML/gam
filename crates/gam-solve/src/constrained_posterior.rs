@@ -3223,17 +3223,33 @@ fn saddle_point_tilt(
     let unknowns = 2 * q - 1;
     // Residual of the stationarity system at `v = (z, μ_1..μ_{q−1})`, with the
     // truncated means `ρ` and wall derivatives `D` the Jacobian reuses.
-    let residual = |v: &[f64]| -> Option<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+    // The residual's entries, the truncated means and wall derivatives the
+    // Jacobian reuses, and the band each entry's own evaluation carries. The band
+    // travels with the residual because only the loop that forms an entry can see
+    // the magnitudes it accumulated and cancelled.
+    let residual = |v: &[f64]| -> Option<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> {
         let (z, mu) = v.split_at(q);
         let tilt_at = |i: usize| if i + 1 < q { mu[i] } else { 0.0 };
         let mut rho = vec![0.0f64; q];
         let mut wall_derivative = vec![0.0f64; q];
+        // Rounding each wall carries, which `ρ[i]` inherits scaled by the wall
+        // derivative the same call returns.
+        let mut wall_band = vec![0.0f64; q];
         for i in 0..q {
             let mut bound = -mean[i];
+            let mut bound_magnitude = mean[i].abs();
             for j in 0..i {
-                bound -= factor[[i, j]] * z[j];
+                let term = factor[[i, j]] * z[j];
+                bound -= term;
+                bound_magnitude += term.abs();
             }
             let low = bound / diagonal[i] - tilt_at(i);
+            // `low` costs `i` products and `i` subtractions to reach `bound`, one
+            // division, and the tilt subtraction.
+            wall_band[i] = gam_linalg::roundoff::accumulation_band(
+                2 * i + 2,
+                bound_magnitude / diagonal[i] + tilt_at(i).abs(),
+            );
             let high = if upper[i].is_finite() {
                 low + upper[i] / diagonal[i]
             } else {
@@ -3244,25 +3260,46 @@ fn saddle_point_tilt(
             wall_derivative[i] = law.mean_wall_derivative;
         }
         let mut f = vec![0.0f64; unknowns];
+        let mut band = vec![0.0f64; unknowns];
         for i in 0..q {
             f[i] = z[i] - tilt_at(i) - rho[i];
+            // The entry is exactly zero at the root, so what is left there is the
+            // arithmetic that formed it, denominated in the SUMMANDS and not in
+            // the vanishing difference: the two subtractions over these three
+            // magnitudes, plus `ρ[i]`'s own formation. `ρ[i]` is the truncated
+            // mean `E[Z | low ≤ Z ≤ high]`, which moves with its wall at exactly
+            // the `mean_wall_derivative` the same call returns, so the wall's
+            // rounding reaches the entry scaled by that derivative.
+            band[i] = gam_linalg::roundoff::accumulation_band(
+                2,
+                z[i].abs() + tilt_at(i).abs() + rho[i].abs(),
+            ) + wall_derivative[i].abs() * wall_band[i];
         }
         for k in 0..(q - 1) {
             let mut coupling = 0.0;
+            let mut coupling_magnitude = mu[k].abs();
             for i in (k + 1)..q {
-                coupling += rho[i] * factor[[i, k]] / diagonal[i];
+                let term = rho[i] * factor[[i, k]] / diagonal[i];
+                coupling += term;
+                coupling_magnitude += term.abs();
             }
             f[q + k] = mu[k] - coupling;
+            // Two multiplies and one addition per coupled row, and the final
+            // subtraction, over the same magnitude sum.
+            band[q + k] = gam_linalg::roundoff::accumulation_band(
+                3 * (q - k - 1) + 1,
+                coupling_magnitude,
+            );
         }
         if f.iter().any(|value| !value.is_finite()) {
             return None;
         }
-        Some((f, rho, wall_derivative))
+        Some((f, rho, wall_derivative, band))
     };
     let infinity_norm = |f: &[f64]| f.iter().fold(0.0f64, |worst, value| worst.max(value.abs()));
 
     let mut v = vec![0.0f64; unknowns];
-    let Some((mut f, _, mut wall_derivative)) = residual(&v) else {
+    let Some((mut f, _, mut wall_derivative, mut evaluation_band)) = residual(&v) else {
         return (
             None,
             TiltStatus::Untilted {
@@ -3274,8 +3311,15 @@ fn saddle_point_tilt(
     const MAX_NEWTON_STEPS: usize = 200;
     for iteration in 0..=MAX_NEWTON_STEPS {
         let norm = infinity_norm(&f);
-        let scale = 1.0 + v.iter().fold(0.0f64, |worst, value| worst.max(value.abs()));
-        if norm <= 1e-10 * scale {
+        // The stationarity system is solved when its residual is inside the band
+        // the residual's OWN evaluation leaves. Every entry is a cancelling
+        // difference that is exactly zero at the root, so what a converged
+        // iterate reads is the accumulation of the summands it differenced —
+        // `accumulation_band` at those magnitudes, formed beside each entry. A
+        // bar denominated in `1 + max|v|` measures the ITERATE, which is not the
+        // quantity being driven to zero and shares none of its units.
+        let band = infinity_norm(&evaluation_band);
+        if norm <= band {
             let mut tilt = Array1::<f64>::zeros(q);
             for k in 0..(q - 1) {
                 tilt[k] = v[q + k];
@@ -3342,12 +3386,16 @@ fn saddle_point_tilt(
             if trial == v {
                 break;
             }
-            if let Some((trial_f, _, trial_derivative)) = residual(&trial)
+            if let Some((trial_f, _, trial_derivative, trial_band)) = residual(&trial)
                 && infinity_norm(&trial_f) <= (1.0 - opt::constants::ARMIJO_C1 * alpha) * norm
             {
                 v = trial;
                 f = trial_f;
                 wall_derivative = trial_derivative;
+                // The band belongs to the residual it was formed beside, so it
+                // travels with it: the next iteration judges this `f` against
+                // this evaluation's rounding, not the previous one's.
+                evaluation_band = trial_band;
                 accepted = true;
                 break;
             }

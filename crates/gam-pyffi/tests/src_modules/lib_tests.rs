@@ -1511,6 +1511,7 @@ fn batched_state_round_trip_matches_refit() {
                 fitted: forward.fitted.slice(s![start..end, ..]).to_owned(),
                 reml_score: forward.reml_scores[b],
                 reml_score_roundoff: None,
+                reml_hess_rho_roundoff: None,
                 reml_grad_lambda: forward.reml_grad_lambdas[b],
                 reml_hess_lambda: forward.reml_hess_lambdas[b],
                 reml_grad_rho: forward.reml_grad_rhos[b],

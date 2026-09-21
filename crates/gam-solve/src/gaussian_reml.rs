@@ -937,6 +937,17 @@ pub struct GaussianRemlMultiResult {
     pub reml_hess_lambda: f64,
     pub reml_grad_rho: f64,
     pub reml_hess_rho: f64,
+    /// Forward-error bound on `reml_hess_rho`, accumulated by the same evaluator
+    /// that produced it from the same term bounds.
+    ///
+    /// `None` means NO bound was accumulated, with exactly the meaning
+    /// `reml_score_roundoff`'s `None` carries: a result rebuilt from a wire
+    /// format says so rather than inventing one, and a consumer must treat it as
+    /// "this curvature has no established resolution", never as zero. The
+    /// implicit λ̂-root channel `−V_ρθ/V_ρρ` divides by this curvature, so a
+    /// curvature that is not resolved above its own bound does not identify that
+    /// channel at all.
+    pub reml_hess_rho_roundoff: Option<f64>,
     pub edf: f64,
     pub sigma2: Array1<f64>,
     pub cache: GaussianRemlEigenCache,
@@ -1018,6 +1029,11 @@ struct ObjectiveEval {
     /// carries one — a score compared against another score is only a decision
     /// above this magnitude; below it the comparison has no digits left.
     cost_roundoff: f64,
+    /// Forward-error bound on `hess`, accumulated in lock-step with it from the
+    /// same term bounds. A ρ-curvature at or below this magnitude was not
+    /// resolved by the evaluation that produced it, so the implicit λ̂-root
+    /// channel it would divide by is not identified.
+    hess_roundoff: f64,
 }
 
 /// A single Gaussian closed-form REML objective term, carrying its analytic
@@ -1040,6 +1056,12 @@ struct TermDerivs {
     /// same reason the derivatives are: a bound derived anywhere else is a
     /// guess about an expression nobody evaluated.
     roundoff: f64,
+    /// Forward-error bound on `hess`, for the same reason and from the same
+    /// intermediates. The ρ-Hessian decides whether the implicit λ̂-root channel
+    /// is differentiable at all, and that decision is only a measurement above
+    /// this magnitude: a curvature inside its own rounding is a curvature the
+    /// evaluation did not resolve, not a small one.
+    hess_roundoff: f64,
 }
 
 /// Density change from whitened residual coordinates back to the observed
@@ -1067,6 +1089,9 @@ fn gaussian_reml_observation_measure(weights: ArrayView1<'_, f64>, n_outputs: us
         roundoff: scale.abs()
             * accumulation_growth(active.saturating_mul(2).saturating_add(2))
             * magnitude,
+        // This term is constant in ρ, so its ρ-Hessian is the exact zero — not a
+        // computed zero — and carries no error at all.
+        hess_roundoff: 0.0,
     }
 }
 
@@ -1148,8 +1173,11 @@ impl std::ops::AddAssign<TermDerivs> for ObjectiveEval {
         self.grad += rhs.grad;
         self.hess += rhs.hess;
         // The term's own bound plus the rounding of THIS addition, priced on the
-        // running total it just produced.
+        // running total it just produced. The Hessian's bound folds the same way
+        // from the same term, so value and curvature can no more disagree about
+        // their resolution than they can about their arithmetic.
         self.cost_roundoff += rhs.roundoff + UNIT_ROUNDOFF * self.cost.abs();
+        self.hess_roundoff += rhs.hess_roundoff + UNIT_ROUNDOFF * self.hess.abs();
     }
 }
 
@@ -1196,11 +1224,23 @@ fn gaussian_reml_logdet_term(
         .len()
         .saturating_mul(2)
         .saturating_add(5);
+    // The Hessian `½d·Σ w` is a sum of NON-NEGATIVES (`w = u·v` with `u, v ∈
+    // [0, 1]`), so it cannot cancel and `trace_h_deriv` is its own magnitude sum.
+    // Each `w` costs seven rounded operations to reach through `modal_kernels`
+    // (`ln`, the `ρ` addition, `exp`, the `1 + t` addition, the quotient, the
+    // `1 − ·` complement, the product), plus one addition to accumulate it, and
+    // the two outer multiplies close the count.
+    let hess_operation_count = cache
+        .penalty_eigenvalues
+        .len()
+        .saturating_mul(8)
+        .saturating_add(2);
     let term = TermDerivs {
         value,
         grad: 0.5 * n_outputs * (trace_h - cache.penalty_rank as f64),
         hess: 0.5 * n_outputs * trace_h_deriv,
         roundoff: 0.5 * n_outputs * accumulation_growth(operation_count) * logdet_magnitude,
+        hess_roundoff: 0.5 * n_outputs * accumulation_growth(hess_operation_count) * trace_h_deriv,
     };
     (term, edf)
 }
@@ -1246,6 +1286,11 @@ fn dispersion_residual_parts(
     let mut penalized_residual = 0.0;
     let mut dp_grad = 0.0;
     let mut dp_hess = 0.0;
+    // `k = w·(v − u)` changes sign across the spectrum, so `dp_hess` is a
+    // CANCELLING sum and its absolute error is set by the summands' magnitudes,
+    // not by the total. `dp_grad`'s summands `c²·w` are all non-negative, so
+    // `dp_grad` is its own magnitude sum and needs no second accumulator.
+    let mut dp_hess_magnitude = 0.0;
     let spectrum = PenaltyRangeSpectrum::of(cache);
     for eig in 0..spectrum.len() {
         let c2 = projected_rhs_squared[[eig, output]];
@@ -1254,6 +1299,7 @@ fn dispersion_residual_parts(
         penalized_residual += c2 * mode.u;
         dp_grad += c2 * mode.w;
         dp_hess += c2 * mode.k;
+        dp_hess_magnitude += (c2 * mode.k).abs();
     }
     let unpenalized_residual = unpenalized_residual[output];
     DispersionResidualParts {
@@ -1261,6 +1307,7 @@ fn dispersion_residual_parts(
         penalized_residual,
         dp_grad,
         dp_hess,
+        dp_hess_magnitude,
         total_c2,
     }
 }
@@ -1278,6 +1325,9 @@ struct DispersionResidualParts {
     penalized_residual: f64,
     dp_grad: f64,
     dp_hess: f64,
+    /// `Σ |c²·k|`: the magnitude sum `dp_hess` accumulated, which is what its
+    /// absolute error is denominated in. `dp_hess` itself cancels.
+    dp_hess_magnitude: f64,
     total_c2: f64,
 }
 
@@ -1315,11 +1365,43 @@ fn gaussian_reml_dispersion_term(
     // error into the value's absolute error, which is why a deviance sitting at
     // its own cancellation floor leaves this term with no significant digits.
     // Plus the rounding of the log, the division and the two multiplies.
+    // The Hessian `½ν·(a − b²)`, `a = dp_hess/dp`, `b = dp_grad/dp`, is a
+    // cancelling difference of two quotients that share a denominator carrying
+    // `dp_roundoff`. Each numerator is a `len`-direction accumulation: `k` costs
+    // nine rounded operations through `modal_kernels` (seven to reach `w`, the
+    // `v − u` difference and the product), `w` seven, and each summand adds a
+    // multiply by `c²` and one addition. Propagating both, with `dp`'s own
+    // relative error entering each quotient once:
+    //
+    //   Δa ≤ Δ(dp_hess)/dp + |a|·Δ(dp)/dp,
+    //   Δb ≤ Δ(dp_grad)/dp + |b|·Δ(dp)/dp,   Δ(b²) = 2|b|·Δb,
+    //
+    // and the two divisions, the square, the difference and the two outer
+    // multiplies add `γ₆` on the assembled magnitude.
+    let hess_terms = |per_direction: usize| {
+        accumulation_growth(
+            cache
+                .penalty_eigenvalues
+                .len()
+                .saturating_mul(per_direction)
+                .saturating_add(1),
+        )
+    };
+    let dp_relative_roundoff = dp_roundoff / dp;
+    let a = parts.dp_hess / dp;
+    let b = parts.dp_grad / dp;
+    let a_roundoff = hess_terms(11) * parts.dp_hess_magnitude / dp + a.abs() * dp_relative_roundoff;
+    let b_roundoff = hess_terms(9) * parts.dp_grad / dp + b.abs() * dp_relative_roundoff;
+    // Formed exactly as it was before the band was derived beside it: `a` and
+    // `b` price the error, they do not re-associate the value.
+    let hess = 0.5 * nu * (parts.dp_hess / dp - (parts.dp_grad * parts.dp_grad) / (dp * dp));
     TermDerivs {
         value,
         grad: 0.5 * nu * parts.dp_grad / dp,
-        hess: 0.5 * nu * (parts.dp_hess / dp - (parts.dp_grad * parts.dp_grad) / (dp * dp)),
+        hess,
         roundoff: 0.5 * nu * (dp_roundoff / dp) + accumulation_growth(4) * value.abs(),
+        hess_roundoff: 0.5 * nu * (a_roundoff + 2.0 * b.abs() * b_roundoff)
+            + accumulation_growth(6) * hess.abs(),
     }
 }
 
@@ -1514,6 +1596,7 @@ pub fn gaussian_reml_multi_shared_dispersion_closed_form(
         reml_hess_lambda,
         reml_grad_rho: objective.grad,
         reml_hess_rho: objective.hess,
+        reml_hess_rho_roundoff: Some(objective.hess_roundoff),
         edf: objective.edf,
         sigma2: Array1::from_elem(d, shared_sigma2),
         cache: prepared.cache,
@@ -2308,6 +2391,7 @@ fn gaussian_reml_multi_closed_form_from_parts(
         reml_hess_lambda,
         reml_grad_rho: eval.grad,
         reml_hess_rho: eval.hess,
+        reml_hess_rho_roundoff: Some(eval.hess_roundoff),
         edf: eval.edf,
         sigma2,
         cache: prepared.cache,
@@ -2513,8 +2597,17 @@ pub fn gaussian_reml_multi_closed_form_backward_from_fit(
     // The closed-form selector evaluates both walls exactly, from the same domain
     // it reports in `rho_domain`, so a railed rho-hat is the wall value itself (#2469).
     let rho_at_bound = fit.rho == fit.rho_domain.0 || fit.rho == fit.rho_domain.1;
-    let implicit_rho_usable =
-        fit.reml_hess_rho.is_finite() && fit.reml_hess_rho.abs() > 1.0e-14 && !rho_at_bound;
+    // "Usable ρ-curvature" is a question about resolution, and the evaluator that
+    // produced the curvature is the only thing that knows its answer. A Hessian
+    // at or below its own forward error was not measured, so the quotient
+    // `−V_ρθ/V_ρρ` divides by noise; a fixed `1e-14` asks the same question of a
+    // criterion at scale `1e6` and one at scale `1e-6` and is wrong for both. A
+    // result carrying no bound has no established resolution and is not usable.
+    let implicit_rho_usable = fit.reml_hess_rho.is_finite()
+        && fit
+            .reml_hess_rho_roundoff
+            .is_some_and(|band| fit.reml_hess_rho.abs() > band)
+        && !rho_at_bound;
     let weight = gaussian_reml_weights(n, weights)?;
     let inverse_hessian = gaussian_reml_inverse_hessian_from_cache(&fit.cache, lambda)?;
     gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
@@ -2721,8 +2814,14 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
             // endpoint is locally the constant projection — its channel is 0).
             let rho_at_bound = problem.fit.rho == problem.fit.rho_domain.0
                 || problem.fit.rho == problem.fit.rho_domain.1;
+            // Same resolution rule as the single-problem entry above: the
+            // curvature is a measurement only above the bound its own evaluator
+            // accumulated, and a result that carries no bound is not usable.
             let implicit_rho_usable = problem.fit.reml_hess_rho.is_finite()
-                && problem.fit.reml_hess_rho.abs() > 1.0e-14
+                && problem
+                    .fit
+                    .reml_hess_rho_roundoff
+                    .is_some_and(|band| problem.fit.reml_hess_rho.abs() > band)
                 && !rho_at_bound;
             gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
                 problem.x.view(),
@@ -5440,6 +5539,7 @@ fn evaluate_reml_profile(
         hess: 0.0,
         edf,
         cost_roundoff: 0.0,
+        hess_roundoff: 0.0,
     };
     eval += logdet_term;
     for output in 0..ywy.len() {
@@ -6097,6 +6197,7 @@ mod tests {
                     // representable, so its cost carries no accumulated
                     // forward error to declare (#2729).
                     cost_roundoff: 0.0,
+                    hess_roundoff: 0.0,
                 }
             }
         };
@@ -8226,6 +8327,7 @@ mod tests {
             edf: 0.0,
             // An analytic fixture: its cost is exact by construction.
             cost_roundoff: 0.0,
+            hess_roundoff: 0.0,
         };
         // Deliberately uninformative but endpoint-valid enclosures force the
         // resolution-floor branch without an expensive production-depth tree.

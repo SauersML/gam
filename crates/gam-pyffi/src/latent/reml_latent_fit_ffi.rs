@@ -1292,6 +1292,7 @@ fn gaussian_reml_fit_state_from_pydict(
         // accumulated score roundoff, so this reconstruction says so rather
         // than fabricating a bound it never measured.
         reml_score_roundoff: None,
+        reml_hess_rho_roundoff: None,
         reml_grad_lambda: get(state, "reml_grad_lambda")?
             .extract::<f64>()
             .map_err(|err| err.to_string())?,
@@ -1477,6 +1478,7 @@ fn batched_gaussian_reml_fits_from_pydict(
             reml_score: reml_scores[b],
             // #2729: not carried across the FFI boundary; see above.
             reml_score_roundoff: None,
+            reml_hess_rho_roundoff: None,
             reml_grad_lambda: reml_grad_lambdas[b],
             reml_hess_lambda: reml_hess_lambdas[b],
             reml_grad_rho: reml_grad_rhos[b],

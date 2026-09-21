@@ -1397,9 +1397,32 @@ pub fn deviance_eta_row_on_measure(
             let saturated = beta_fitted_loglikelihood_unit_from_eta(y, saturated_eta, *phi)?;
             let fitted = beta_fitted_loglikelihood_unit_from_eta(y, eta, *phi)?;
             let eta_difference = eta - saturated_eta;
+            // `saturated − fitted` is a cancelling difference of two unit
+            // log-likelihoods that coincide at `η = η*`, where the half-deviance
+            // is zero. How close `η` may come before that difference stops
+            // carrying digits is not a property of `η`: it is the rounding of the
+            // two evaluations being differenced.
+            // `beta_fitted_loglikelihood_unit_from_eta` builds each one as a
+            // Kahan-Babuska-Neumaier sum of five terms, each formed in at most
+            // eight rounded operations (a softplus, the `log φ` addition, a
+            // logarithm, the `log_coefficient` addition, an exponential and a
+            // signed multiply), so the difference is resolved from zero only
+            // above `compensated_band(8, |saturated| + |fitted|)` (Higham, *ASNA*
+            // 2nd ed., §4.3). Below it the direct route returns rounding, and the
+            // local expansion about the saturated point — whose own error is the
+            // omitted cubic term, `O(Δη³)` — is the accurate reading. The
+            // half-deviance is strictly increasing in `|Δη|`, so this is a
+            // statement about a neighbourhood of `η*` exactly as the fixed
+            // `1e-6` meant to be, but placed where the arithmetic puts it rather
+            // than where a number did.
+            let cancellation_band = gam_linalg::roundoff::compensated_band(
+                8,
+                saturated.abs() + fitted.abs(),
+            );
+            let direct_difference = saturated - fitted;
             let half_unit = if eta_difference == 0.0 {
                 0.0
-            } else if eta_difference.abs() <= 1.0e-6 {
+            } else if direct_difference <= cancellation_band {
                 let (saturated_mu, saturated_one_minus_mu) = logit_probability_pair(saturated_eta);
                 let saturated_a = saturated_mu * *phi;
                 let saturated_b = saturated_one_minus_mu * *phi;
@@ -2708,8 +2731,24 @@ pub(crate) fn tweedie_exact_series_loglik_from_eta(
         let components = [poisson_log_mass, gamma_log_density];
         let value = stable_finite_signed_sum(&components, "exact Tweedie series term")?;
         let absolute_sum: f64 = components.iter().map(|component| component.abs()).sum();
-        let input_roundoff_bound = 16.0 * f64::EPSILON * absolute_sum;
-        if !absolute_sum.is_finite() || input_roundoff_bound > 1.0e-10 * value.abs().max(1.0) {
+        // `value` is a LOG density, so an absolute error `β` in it is a RELATIVE
+        // error `expm1(β)` in the term `exp(value)` that the series actually
+        // sums. Its own magnitude is therefore not what `β` must be measured
+        // against — a term with `value ≈ 0` is `exp(0) = 1`, perfectly
+        // determined, and the former bar refused exactly there until a `max(…,
+        // 1)` was put under it. What `β` must stay below is `1`: at a log
+        // uncertain by a factor of `e` the term it stands for has no digits at
+        // all, and below that it has `−log β` of them.
+        //
+        // `β` itself is the two-term Kahan-Babuska-Neumaier sum's forward error,
+        // `(2 + k)·u·Σ|components|` with no dependence on the term count
+        // (Higham, *ASNA* 2nd ed., §4.3). Each component costs at most eight
+        // rounded operations to form — above the Stirling threshold a `bd0`, a
+        // logarithm, the `2π` addition, the halving, two subtractions and the
+        // Binet remainder; below it a three-term compensated sum of equally
+        // short terms.
+        let input_roundoff_bound = gam_linalg::roundoff::compensated_band(8, absolute_sum);
+        if !absolute_sum.is_finite() || input_roundoff_bound >= 1.0 {
             return Err(EstimationError::pirls_row_geometry_unrepresentable(
                 row,
                 "exact Tweedie series-term cancellation certificate",
