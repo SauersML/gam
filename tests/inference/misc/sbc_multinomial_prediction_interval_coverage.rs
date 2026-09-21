@@ -16,8 +16,8 @@
 //! a two-class categorical response `y ~ Categorical(σ(η(x)))`, fit
 //! `y ~ s(x)`, and at one independent interior covariate value check whether the
 //! true class-1 probability lies inside the reported `[mean_lower, mean_upper]`
-//! band. Audited by the shared Wilson verdict at 80/90/95; only anti-conservative
-//! under-coverage gates.
+//! band. Audited by the shared Wilson verdict at 80/90/95; both tails gate
+//! (#3534).
 
 use csv::StringRecord;
 use gam::families::multinomial::{
@@ -26,7 +26,7 @@ use gam::families::multinomial::{
 };
 use gam::{FitConfig, encode_recordswith_inferred_schema};
 use gam_math::special::logistic;
-use gam_test_support::calibration::{CalibrationRng, CoverageClass, audit_coverage};
+use gam_test_support::calibration::{CalibrationRng, audit_coverage};
 
 const N_TRAIN: usize = 240;
 const N_REPLICATIONS: usize = 80;
@@ -142,22 +142,13 @@ fn multinomial_mean_prediction_interval_covers_true_probability_at_nominal() {
     let mut failures = Vec::new();
     for (level_idx, &level) in NOMINAL_LEVELS.iter().enumerate() {
         let verdict = audit_coverage(hits[level_idx], N_REPLICATIONS, level);
-        if verdict.class == CoverageClass::AntiConservative {
-            failures.push(format!(
-                "level {level}: empirical={:.4} (hits {}/{}), Wilson CI=[{:.4},{:.4}], \
-                 nominal ABOVE the CI by {:.4} — anti-conservative multinomial mean interval",
-                verdict.empirical,
-                verdict.hits,
-                verdict.replications,
-                verdict.ci_lo,
-                verdict.ci_hi,
-                -verdict.slack(),
-            ));
+        if !verdict.passed {
+            failures.push(format!("level {level}: {}", verdict.describe()));
         }
     }
     assert!(
         failures.is_empty(),
-        "multinomial mean-probability interval under-covers the true class probability:\n{}",
+        "multinomial mean-probability interval is miscalibrated for the true class probability:\n{}",
         failures.join("\n")
     );
 }

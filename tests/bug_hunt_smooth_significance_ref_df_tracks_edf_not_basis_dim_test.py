@@ -32,6 +32,7 @@ Both fail loudly the instant ``ref_df`` is pinned to the basis dimension.
 from __future__ import annotations
 
 import importlib
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -148,7 +149,10 @@ def test_moderate_signal_is_not_judged_over_conservatively() -> None:
     )
 
 
-def test_pure_noise_fits_converge_and_null_p_values_are_uniform() -> None:
+def test_pure_noise_fits_converge_and_null_p_values_are_uniform(
+    coverage_audit: Callable[[int, int, float], Any],
+    coverage_replications: Callable[[float], int],
+) -> None:
     # Pure noise: the smooth has no effect, so the term's p-value must be
     # U(0, 1) -- neither piled near 0 (the #1766 collapse, where a stalled
     # flat-valley fit's large W was referenced against its ~0 edf) nor pushed
@@ -165,16 +169,16 @@ def test_pure_noise_fits_converge_and_null_p_values_are_uniform() -> None:
     # (bench/pvalue_calibration/pv-lr-refit: 500 of 500 fits converged, null
     # p-values uniform, no mass at p = 1).
     #
-    # Two-sided gates, derived from the null law with R = 60 fits:
+    # Two-sided gates, derived from the null law over R fits:
     #  * the mean p-value of U(0, 1) is 1/2 with variance 1/12, so the mean of
-    #    R null p-values has sd sqrt(1/(12 R)) = 0.037; it must lie within
-    #    4 sd of 1/2;
-    #  * the rejection rate at alpha = 0.05 keeps its existing upper bar of
-    #    0.15 (Binomial(R, alpha) sd on the rate is 0.028, so the bar is 3.6 sd
-    #    above alpha). Its lower side is below zero at this R, which is why the
-    #    mean gate is the one that sees a conservative test.
-    n_seeds = 60
+    #    R null p-values has sd sqrt(1/(12 R)); it must lie within 4 sd of 1/2;
+    #  * the rejection rate at alpha is audited with the shared two-sided
+    #    Wilson verdict (tests/conftest.py, #3534), over the smallest R at
+    #    which a test that never rejects can fail the conservative tail. The
+    #    hand-picked upper bar of 0.15 this replaces could not see an
+    #    undersized test at any R.
     alpha = 0.05
+    n_seeds = coverage_replications(1.0 - alpha)
     ps: list[float] = []
     uncertified = []
     for seed in range(n_seeds):
@@ -193,22 +197,16 @@ def test_pure_noise_fits_converge_and_null_p_values_are_uniform() -> None:
     )
     mean_p = float(np.mean(ps))
     mean_sd = (1.0 / (12.0 * n_seeds)) ** 0.5
-    fpr = sum(p < alpha for p in ps) / n_seeds
+    rejections = sum(p < alpha for p in ps)
     assert abs(mean_p - 0.5) <= 4.0 * mean_sd, (
         f"null p-values are not U(0, 1): mean p = {mean_p:.3f} over {n_seeds} "
         f"pure-noise fits, outside 1/2 +- 4 sd = +-{4.0 * mean_sd:.3f} "
         f"({'conservative' if mean_p > 0.5 else 'anti-conservative'}); "
         f"sorted p = {[round(p, 3) for p in sorted(ps)]}"
     )
-    assert fpr <= 0.15, (
-        f"null false-positive rate {fpr:.3f} at alpha = {alpha} over {n_seeds} "
-        "pure-noise fits exceeds 0.15; the #1766 over-rejection is back"
+    verdict = coverage_audit(n_seeds - rejections, n_seeds, 1.0 - alpha)
+    assert verdict.passed, (
+        f"null false-positive rate {rejections / n_seeds:.3f} "
+        f"({rejections}/{n_seeds}) at alpha={alpha} over pure-noise fits is "
+        f"miscalibrated; non-rejection {verdict.describe()}"
     )
-
-
-if __name__ == "__main__":  # pragma: no cover - manual smoke run
-    test_ref_df_stays_in_edf1_band_not_basis_dimension()
-    test_ref_df_varies_with_fitted_complexity()
-    test_moderate_signal_is_not_judged_over_conservatively()
-    test_pure_noise_fits_converge_and_null_p_values_are_uniform()
-    print("ok")

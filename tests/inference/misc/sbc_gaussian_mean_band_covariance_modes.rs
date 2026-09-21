@@ -20,7 +20,7 @@
 //! truth from a prior, simulate y = f + N(0, σ²), fit, and check whether the
 //! true predictor f(x⋆) at one independent interior evaluation point lies inside
 //! each mode's band, audited by the shared Wilson verdict over the 80/90/95
-//! sweep. Only anti-conservative under-coverage gates; over-coverage is reported.
+//! sweep. Both tails gate: under- and over-coverage are each a miscalibration.
 
 use csv::StringRecord;
 use gam_data::{EncodedDataset, encode_recordswith_inferred_schema};
@@ -28,7 +28,7 @@ use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 use gam_predict::{
     InferenceCovarianceMode, PredictUncertaintyOptions, predict_gamwith_uncertainty,
 };
-use gam_test_support::calibration::{CalibrationRng, CoverageClass, audit_coverage};
+use gam_test_support::calibration::{CalibrationRng, audit_coverage};
 use ndarray::Array1;
 
 const N_TRAIN: usize = 160;
@@ -214,24 +214,18 @@ fn gaussian_mean_band_covers_truth_under_both_covariance_modes() {
     for (config_idx, config) in CONFIGS.iter().enumerate() {
         for (level_idx, &level) in NOMINAL_LEVELS.iter().enumerate() {
             let verdict = audit_coverage(hits[config_idx][level_idx], N_REPLICATIONS, level);
-            if verdict.class == CoverageClass::AntiConservative {
+            if !verdict.passed {
                 failures.push(format!(
-                    "{} @ level {level}: empirical={:.4} (hits {}/{}), \
-                     Wilson CI=[{:.4},{:.4}], nominal ABOVE the CI by {:.4} — anti-conservative",
+                    "{} @ level {level}: {}",
                     config.label,
-                    verdict.empirical,
-                    verdict.hits,
-                    verdict.replications,
-                    verdict.ci_lo,
-                    verdict.ci_hi,
-                    -verdict.slack(),
+                    verdict.describe()
                 ));
             }
         }
     }
     assert!(
         failures.is_empty(),
-        "gaussian mean band under-covers the truth (per covariance mode):\n{}",
+        "gaussian mean band is miscalibrated (per covariance mode):\n{}",
         failures.join("\n")
     );
 }

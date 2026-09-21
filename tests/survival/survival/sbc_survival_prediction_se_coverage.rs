@@ -30,8 +30,7 @@
 //! the `survival_posterior_mean_se` registry target's `audited_by` list. In
 //! each, the reported Wald interval `survival_mean ± z(level)·survival_se`
 //! must contain the true S(t⋆ | x⋆) at the nominal rate, audited by the shared
-//! Wilson verdict over the 80/90/95 sweep; only anti-conservative
-//! under-coverage gates.
+//! Wilson verdict over the 80/90/95 sweep; both tails gate (#3534).
 
 use std::path::Path;
 use std::process::Command;
@@ -44,9 +43,7 @@ use gam::families::survival::predict::{
 };
 use gam::inference::model::FittedModel;
 use gam::test_support::cli_harness::run_or_panic;
-use gam_test_support::calibration::{
-    CalibrationRng, CoverageClass, audit_coverage, standard_normal_quantile,
-};
+use gam_test_support::calibration::{CalibrationRng, audit_coverage, standard_normal_quantile};
 use ndarray::Array1;
 
 const WEIBULL_SHAPE: f64 = 1.3;
@@ -228,22 +225,13 @@ fn survival_posterior_mean_se_covers_true_survival_probability_at_nominal() {
     let mut failures = Vec::new();
     for (level_idx, &level) in NOMINAL_LEVELS.iter().enumerate() {
         let verdict = audit_coverage(hits[level_idx], N_REPLICATIONS, level);
-        if verdict.class == CoverageClass::AntiConservative {
-            failures.push(format!(
-                "level {level}: empirical={:.4} (hits {}/{}), Wilson CI=[{:.4},{:.4}], \
-                 nominal ABOVE the CI by {:.4} — anti-conservative survival posterior-mean SE",
-                verdict.empirical,
-                verdict.hits,
-                verdict.replications,
-                verdict.ci_lo,
-                verdict.ci_hi,
-                -verdict.slack(),
-            ));
+        if !verdict.passed {
+            failures.push(format!("level {level}: {}", verdict.describe()));
         }
     }
     assert!(
         failures.is_empty(),
-        "survival posterior-mean survival_se under-covers the true survival probability:\n{}",
+        "survival posterior-mean survival_se is miscalibrated for the true survival probability:\n{}",
         failures.join("\n")
     );
 }
@@ -407,23 +395,14 @@ fn survival_location_scale_delta_method_se_covers_true_survival_probability_at_n
     let mut failures = Vec::new();
     for (level_idx, &level) in NOMINAL_LEVELS.iter().enumerate() {
         let verdict = audit_coverage(hits[level_idx], LS_N_REPLICATIONS, level);
-        if verdict.class == CoverageClass::AntiConservative {
-            failures.push(format!(
-                "level {level}: empirical={:.4} (hits {}/{}), Wilson CI=[{:.4},{:.4}], \
-                 nominal ABOVE the CI by {:.4} — anti-conservative location-scale delta-method SE",
-                verdict.empirical,
-                verdict.hits,
-                verdict.replications,
-                verdict.ci_lo,
-                verdict.ci_hi,
-                -verdict.slack(),
-            ));
+        if !verdict.passed {
+            failures.push(format!("level {level}: {}", verdict.describe()));
         }
     }
     assert!(
         failures.is_empty(),
-        "location-scale survival delta-method survival_se under-covers the true survival \
-         probability:\n{}",
+        "location-scale survival delta-method survival_se is miscalibrated for the true \
+         survival probability:\n{}",
         failures.join("\n")
     );
 }

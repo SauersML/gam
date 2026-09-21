@@ -17,9 +17,20 @@
 //! from the prior, simulate a training set from the family, fit `y ~ s(x)`, then
 //! draw a genuinely NEW response y_new ~ family(μ_true(x⋆)) at one independent
 //! interior point and check it lands inside the requested predictive interval.
-//! Empirical coverage over the 80/90/95 sweep is adjudicated by the shared
-//! Wilson verdict: only anti-conservative under-coverage gates; discreteness /
-//! skew over-coverage is reported but never gates.
+//! Empirical coverage over each family's level sweep is adjudicated by the
+//! shared Wilson verdict. Both tails gate (#3534): under-coverage and
+//! over-coverage are each a miscalibration of the reported interval.
+//!
+//! The coverage a band owes is its predictive content, not its level. A
+//! continuous predictive holds exactly `p_hi − p_lo` between its quantiles, but
+//! a discrete one's quantiles are atoms: `[F⁻¹(p_lo), F⁻¹(p_hi)]` holds
+//! `F(hi) − F(lo⁻)`, and `F(hi) ≥ p_hi`, `F(lo⁻) < p_lo` put that strictly above
+//! the level by the edge atoms' mass (a Bernoulli band `{0, 1}` holds 1 at any
+//! level). Each replication's band reports that content
+//! (`observation_content`), and the gate's target at a level is its mean `c̄`
+//! over the replications: hits are then a Poisson-binomial count with mean
+//! `R·c̄` and variance at most the binomial `R·c̄(1 − c̄)`, so the Wilson verdict
+//! at `c̄` keeps its false-alarm rate. A target of one admits no miss at all.
 //!
 //! Determinism: a fixed per-family seed threads truth draw, simulation, fit, and
 //! the new-observation draw, so each gate reproduces bit-for-bit (the harness is
@@ -32,17 +43,17 @@ use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 use gam_predict::{
     InferenceCovarianceMode, PredictUncertaintyOptions, predict_gamwith_uncertainty,
 };
-use gam_test_support::calibration::{CalibrationRng, CoverageClass, audit_coverage};
+use gam_test_support::calibration::{CalibrationRng, audit_coverage};
 use ndarray::Array1;
 
 const N_TRAIN: usize = 240;
 const N_REPLICATIONS: usize = 120;
-const NOMINAL_LEVELS: [f64; 3] = [0.80, 0.90, 0.95];
+const NOMINAL_LEVELS: &[f64] = &[0.80, 0.90, 0.95];
 
 /// A low-frequency smooth linear-predictor truth η(x) drawn from the prior. The
 /// same shape family the mean-band gates use: comfortably inside the span of a
 /// penalized 1-D smooth so smoother bias stays small and a calibrated interval
-/// sits at or above nominal.
+/// covers at nominal.
 struct SmoothEta {
     center: f64,
     amplitude: f64,
@@ -148,6 +159,8 @@ struct FamilyCase {
     log_link: bool,
     /// Draw one response from the family at mean μ.
     sample: Box<dyn Fn(f64, &mut CalibrationRng) -> f64>,
+    /// Central levels the band is requested and audited at.
+    levels: &'static [f64],
 }
 
 impl FamilyCase {
@@ -178,12 +191,13 @@ fn simulate_dataset(
         .expect("encode family replication dataset")
 }
 
-/// The predictive (observation) interval at every training row and level.
+/// The predictive (observation) interval at every training row and level, with
+/// the predictive probability each row's band holds.
 fn predictive_interval(
     fit: &FitResult,
     family_name: &str,
     level: f64,
-) -> (Array1<f64>, Array1<f64>) {
+) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
     let FitResult::Standard(standard) = fit else {
         panic!("{family_name} `y ~ s(x)` must fit through the dense standard path");
     };
@@ -217,7 +231,10 @@ fn predictive_interval(
     let upper = result
         .observation_upper
         .expect("observation_upper present whenever observation_lower is");
-    (lower, upper)
+    let content = result
+        .observation_content
+        .unwrap_or_else(|| panic!("{family_name} observation band carries no predictive content"));
+    (lower, upper, content)
 }
 
 /// The shared per-family coverage sweep: fit, draw a new observation, audit.
@@ -228,7 +245,8 @@ fn run_family_predictive_gate(case: &FamilyCase) {
     let span = interior_hi - interior_lo;
 
     let mut rng = CalibrationRng::new(case.seed);
-    let mut hits = [0usize; NOMINAL_LEVELS.len()];
+    let mut hits = vec![0usize; case.levels.len()];
+    let mut content_sum = vec![0.0_f64; case.levels.len()];
     let mut positive_width_seen = false;
 
     for _ in 0..N_REPLICATIONS {
@@ -253,8 +271,15 @@ fn run_family_predictive_gate(case: &FamilyCase) {
         // cover.
         let y_new = (case.sample)(mu_true, &mut rng);
 
-        for (level_idx, &level) in NOMINAL_LEVELS.iter().enumerate() {
-            let (lower, upper) = predictive_interval(&fit, case.family, level);
+        for (level_idx, &level) in case.levels.iter().enumerate() {
+            let (lower, upper, content) = predictive_interval(&fit, case.family, level);
+            assert!(
+                (0.0..=1.0).contains(&content[j]),
+                "{} band content {} at eval point {j} (level {level}) is not a probability",
+                case.family,
+                content[j]
+            );
+            content_sum[level_idx] += content[j];
             assert!(
                 lower[j].is_finite() && upper[j].is_finite() && upper[j] >= lower[j],
                 "{} degenerate predictive interval at eval point {j} (level {level}): [{}, {}]",
@@ -278,25 +303,30 @@ fn run_family_predictive_gate(case: &FamilyCase) {
     );
 
     let mut failures = Vec::new();
-    for (level_idx, &level) in NOMINAL_LEVELS.iter().enumerate() {
-        let verdict = audit_coverage(hits[level_idx], N_REPLICATIONS, level);
-        if verdict.class == CoverageClass::AntiConservative {
+    for (level_idx, &level) in case.levels.iter().enumerate() {
+        let target = content_sum[level_idx] / N_REPLICATIONS as f64;
+        if target >= 1.0 {
+            // Every band held its whole predictive law, so any miss is an
+            // observation the predictive gave no mass at all.
+            if hits[level_idx] != N_REPLICATIONS {
+                failures.push(format!(
+                    "level {level}: every band holds predictive mass 1 yet covered {}/{}",
+                    hits[level_idx], N_REPLICATIONS
+                ));
+            }
+            continue;
+        }
+        let verdict = audit_coverage(hits[level_idx], N_REPLICATIONS, target);
+        if !verdict.passed {
             failures.push(format!(
-                "level {level}: empirical={:.4} (hits {}/{}), Wilson CI=[{:.4},{:.4}], \
-                 nominal ABOVE the CI by {:.4} — anti-conservative predictive interval \
-                 (the #1875/#1878 recycled/mis-scaled or #817/#1193/#1194 dropped-skew signature)",
-                verdict.empirical,
-                verdict.hits,
-                verdict.replications,
-                verdict.ci_lo,
-                verdict.ci_hi,
-                -verdict.slack(),
+                "level {level} (mean band content {target:.4}): {}",
+                verdict.describe()
             ));
         }
     }
     assert!(
         failures.is_empty(),
-        "{} predictive interval under-covers a new observation:\n{}",
+        "{} predictive interval is miscalibrated for a new observation:\n{}",
         case.family,
         failures.join("\n")
     );
@@ -312,6 +342,7 @@ fn poisson_predictive_interval_covers_new_observation_at_nominal() {
         eta_prior: (1.1, 1.0, 0.9),
         log_link: true,
         sample: Box::new(|mu, rng| poisson_draw(mu, rng)),
+        levels: NOMINAL_LEVELS,
     });
 }
 
@@ -326,6 +357,7 @@ fn negative_binomial_predictive_interval_covers_new_observation_at_nominal() {
         eta_prior: (1.2, 0.9, 0.8),
         log_link: true,
         sample: Box::new(move |mu, rng| negbin_draw(mu, theta, rng)),
+        levels: NOMINAL_LEVELS,
     });
 }
 
@@ -341,6 +373,7 @@ fn gamma_predictive_interval_covers_new_observation_at_nominal() {
         eta_prior: (0.6, 1.0, 0.7),
         log_link: true,
         sample: Box::new(move |mu, rng| gamma_draw(shape, mu / shape, rng)),
+        levels: NOMINAL_LEVELS,
     });
 }
 
@@ -359,6 +392,7 @@ fn beta_predictive_interval_covers_new_observation_at_nominal() {
             let m = mu.clamp(1e-4, 1.0 - 1e-4);
             beta_draw(m * phi, (1.0 - m) * phi, rng)
         }),
+        levels: NOMINAL_LEVELS,
     });
 }
 
@@ -377,20 +411,26 @@ fn tweedie_predictive_interval_covers_new_observation_at_nominal() {
         eta_prior: (0.7, 0.9, 0.7),
         log_link: true,
         sample: Box::new(move |mu, rng| tweedie_draw(mu, phi, power, rng)),
+        levels: NOMINAL_LEVELS,
     });
 }
 
 #[test]
 fn binomial_predictive_interval_covers_new_observation_at_nominal() {
-    // Bernoulli response (single-trial binomial): the predictive interval must
-    // cover a fresh 0/1 draw. Degenerate-discrete, but the coverage sweep is
-    // still meaningful — an interval that excludes the realized class under-
-    // covers, and the Wilson verdict tolerates the necessary discreteness slack.
+    // Bernoulli response (single-trial binomial): the predictive set must cover
+    // a fresh 0/1 draw as often as its content says. The prior keeps
+    // m ∈ [0.18, 0.82], where every band at 0.8 and above is the whole support
+    // `{0, 1}` and covers surely, which tests nothing. At level `L` the set
+    // collapses to `{0}` for `m ≤ (1 − L)/2` and to `{1}` for `m > (1 + L)/2`, so
+    // the levels below reach singleton sets over most of that range (at 0.2:
+    // `m ≤ 0.4` or `m > 0.6`), and a singleton that is the wrong class
+    // under-covers against its content `1 − m` or `m`.
     run_family_predictive_gate(&FamilyCase {
         family: "binomial",
         seed: 0x1891_B1_00_C0DE,
         eta_prior: (-0.6, 1.2, 0.9),
         log_link: false,
         sample: Box::new(|mu, rng| if rng.uniform_open01() < mu { 1.0 } else { 0.0 }),
+        levels: &[0.2, 0.35, 0.5],
     });
 }

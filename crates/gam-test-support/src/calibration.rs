@@ -211,9 +211,13 @@ pub fn audit_sbc_uniformity(
 // confidence interval for the coverage proportion — the Wilson score interval,
 // the standard interval-for-a-proportion, evaluated at the same fixed 1%
 // false-positive rate the SBC verdict uses. A surface is anti-conservative (the
-// #1870/#1871/#1878 failure signature) only when the nominal level sits ABOVE
-// the whole CI; conservative when it sits below (reported with a named slack,
-// per the issue: anti-conservative gates the build, conservative reports).
+// #1870/#1871/#1878 failure signature) when the nominal level sits ABOVE the
+// whole CI and conservative when it sits BELOW it. Both tails gate: the truth is
+// drawn from the model's own prior (or the data from an exact null), so a
+// correct surface covers at exactly its nominal level and over-coverage is as
+// much a miscalibration as under-coverage (#3534). The Wilson interval is
+// two-sided at `COVERAGE_FALSE_POSITIVE_RATE`, so gating both tails keeps the
+// per-level false-positive rate at exactly that constant.
 // ---------------------------------------------------------------------------
 
 /// Fixed false-positive rate for the coverage verdict — the same 1% the SBC
@@ -297,11 +301,12 @@ pub fn standard_normal_quantile(p: f64) -> f64 {
 pub enum CoverageClass {
     /// Nominal level lies inside the (1 − α) Wilson CI — calibrated.
     Calibrated,
-    /// Nominal level lies ABOVE the whole CI: the surface under-covers. This is
-    /// the anti-conservative failure that gates the build.
+    /// Nominal level lies ABOVE the whole CI: the surface under-covers
+    /// (intervals too narrow, or a test that rejects too often). Fails the gate.
     AntiConservative,
-    /// Nominal level lies BELOW the whole CI: the surface over-covers. Reported
-    /// with a named slack, not gated.
+    /// Nominal level lies BELOW the whole CI: the surface over-covers
+    /// (intervals too wide, or an undersized test that has lost power). Fails
+    /// the gate.
     Conservative,
 }
 
@@ -322,22 +327,46 @@ pub struct CoverageVerdict {
     pub ci_hi: f64,
     /// Classification of `nominal` against the CI.
     pub class: CoverageClass,
-    /// `true` unless the surface is anti-conservative. Conservative and
-    /// calibrated both pass (over-coverage is safe); only under-coverage gates.
+    /// `true` exactly when the surface is [`CoverageClass::Calibrated`]. Both
+    /// anti-conservative and conservative surfaces fail.
     pub passed: bool,
 }
 
 impl CoverageVerdict {
     /// Signed slack of the nominal level outside the CI: positive when
     /// conservative (nominal below `ci_lo`), negative when anti-conservative
-    /// (nominal above `ci_hi`), zero when calibrated. Lets a conservative report
-    /// name its margin.
+    /// (nominal above `ci_hi`), zero when calibrated. Its sign names the
+    /// direction of a failure and its magnitude the margin by which the nominal
+    /// level misses the CI.
     pub fn slack(&self) -> f64 {
         match self.class {
             CoverageClass::Conservative => self.ci_lo - self.nominal,
             CoverageClass::AntiConservative => self.ci_hi - self.nominal,
             CoverageClass::Calibrated => 0.0,
         }
+    }
+
+    /// One-line account of the verdict for a gate's failure message: the
+    /// empirical rate, the Wilson CI, and which side of it the nominal level
+    /// falls on (by how much). For a size curve audited as non-rejection
+    /// coverage, "under-covers" reads as an oversized test and "over-covers" as
+    /// an undersized one.
+    pub fn describe(&self) -> String {
+        let placement = match self.class {
+            CoverageClass::Calibrated => "inside the CI (calibrated)".to_string(),
+            CoverageClass::AntiConservative => format!(
+                "ABOVE the CI by {:.4} (anti-conservative: under-covers)",
+                -self.slack()
+            ),
+            CoverageClass::Conservative => format!(
+                "BELOW the CI by {:.4} (conservative: over-covers)",
+                self.slack()
+            ),
+        };
+        format!(
+            "empirical={:.4} (hits {}/{}), Wilson CI=[{:.4},{:.4}], nominal {} {placement}",
+            self.empirical, self.hits, self.replications, self.ci_lo, self.ci_hi, self.nominal
+        )
     }
 }
 
@@ -383,7 +412,7 @@ pub fn audit_coverage(hits: usize, replications: usize, nominal: f64) -> Coverag
         ci_lo,
         ci_hi,
         class,
-        passed: class != CoverageClass::AntiConservative,
+        passed: class == CoverageClass::Calibrated,
     }
 }
 
@@ -505,8 +534,9 @@ pub fn run_coverage<M: CoverageModel>(
 /// away from `1.0` plants a miscalibration (over-confident below `1.0`,
 /// over-dispersed above) that SBC must detect. The same closed form gives an
 /// exact credible interval, so the model is also the first [`CoverageModel`]
-/// consumer: at scale `1.0` its intervals cover at nominal, and a narrowed scale
-/// under-covers (the anti-conservative signature the coverage gate must catch).
+/// consumer: at scale `1.0` its intervals cover at nominal, a narrowed scale
+/// under-covers and a widened scale over-covers (the anti-conservative and
+/// conservative signatures the two-sided coverage gate must both catch).
 #[derive(Clone, Copy, Debug)]
 pub struct ConjugateGaussianModel {
     /// Prior mean `μ₀`.
@@ -671,10 +701,10 @@ pub enum SurfaceKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuditMode {
     /// Empirical coverage vs nominal at [`COVERAGE_NOMINAL_LEVELS`]
-    /// (`run_coverage` + `audit_coverage`); anti-conservative gates.
+    /// (`run_coverage` + `audit_coverage`); both tails gate.
     CoverageSweep,
     /// Type-I size curve at `α ∈ {0.01, 0.05, 0.10}` under a simulated null; an
-    /// empirical size above `α` beyond MC error gates.
+    /// empirical size away from `α` beyond MC error (either side) gates.
     TestSizeCurve,
     /// SBC rank-uniformity histogram (`run_sbc` + `audit_sbc_uniformity`).
     SbcRankUniformity,
@@ -1079,11 +1109,11 @@ mod tests {
         let under = audit_coverage(731, 1000, 0.95);
         assert_eq!(under.class, CoverageClass::AntiConservative);
         assert!(!under.passed && 0.95 > under.ci_hi && under.slack() < 0.0);
-        // Conservative: 995/1000 at nominal 0.90 — over-covers, reports positive
-        // slack but does NOT gate.
+        // Conservative: 995/1000 at nominal 0.90 — over-covers, positive slack,
+        // and fails the gate just like under-coverage.
         let over = audit_coverage(995, 1000, 0.90);
         assert_eq!(over.class, CoverageClass::Conservative);
-        assert!(over.passed && over.slack() > 0.0);
+        assert!(!over.passed && 0.90 < over.ci_lo && over.slack() > 0.0);
     }
 
     #[test]
@@ -1123,6 +1153,27 @@ mod tests {
             v.ci_hi
         );
         assert!(!v.passed, "narrowed interval must fail the coverage gate");
+    }
+
+    #[test]
+    fn widened_interval_fails_coverage_sweep() {
+        use super::{COVERAGE_REPLICATIONS, CoverageClass, audit_coverage, run_coverage};
+        // Teeth on the other tail (#3534): intervals widened to twice the
+        // posterior sd (posterior_sd_scale = 2.0) over-cover, so the gate must
+        // classify conservative and fail. A one-sided gate would let this pass.
+        let model = conjugate_model(2.0);
+        let level = 0.80;
+        let hits = run_coverage(&model, PLANTED_SEED, COVERAGE_REPLICATIONS, level);
+        let v = audit_coverage(hits, COVERAGE_REPLICATIONS, level);
+        assert_eq!(
+            v.class,
+            CoverageClass::Conservative,
+            "widened interval must be flagged conservative: empirical={:.4} CI=[{:.4},{:.4}]",
+            v.empirical,
+            v.ci_lo,
+            v.ci_hi
+        );
+        assert!(!v.passed, "widened interval must fail the coverage gate");
     }
 
     #[test]

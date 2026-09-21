@@ -13,9 +13,9 @@
 //! the true mean λ(x⋆) at one independent interior evaluation point lies inside
 //! the band, audited by the shared Wilson verdict over the 80/90/95 sweep.
 //!
-//! Honest gate: only anti-conservative under-coverage fails; over-coverage is
-//! reported but never gates. Low-frequency truths keep smoother bias small so a
-//! calibrated band sits at or above nominal.
+//! Both tails gate (#3534): under- and over-coverage are each a
+//! miscalibration. Low-frequency truths keep smoother bias small so a
+//! calibrated band covers at nominal.
 
 use csv::StringRecord;
 use gam_data::{EncodedDataset, encode_recordswith_inferred_schema};
@@ -23,7 +23,7 @@ use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 use gam_predict::{
     InferenceCovarianceMode, PredictUncertaintyOptions, predict_gamwith_uncertainty,
 };
-use gam_test_support::calibration::{CalibrationRng, CoverageClass, audit_coverage};
+use gam_test_support::calibration::{CalibrationRng, audit_coverage};
 use ndarray::Array1;
 
 const N_TRAIN: usize = 250;
@@ -168,22 +168,13 @@ fn poisson_glm_mean_band_covers_truth_at_nominal() {
     let mut failures = Vec::new();
     for (level_idx, &level) in NOMINAL_LEVELS.iter().enumerate() {
         let verdict = audit_coverage(hits[level_idx], N_REPLICATIONS, level);
-        if verdict.class == CoverageClass::AntiConservative {
-            failures.push(format!(
-                "level {level}: empirical={:.4} (hits {}/{}), Wilson CI=[{:.4},{:.4}], \
-                 nominal ABOVE the CI by {:.4} — anti-conservative (the #1870/#1871 signature)",
-                verdict.empirical,
-                verdict.hits,
-                verdict.replications,
-                verdict.ci_lo,
-                verdict.ci_hi,
-                -verdict.slack(),
-            ));
+        if !verdict.passed {
+            failures.push(format!("level {level}: {}", verdict.describe()));
         }
     }
     assert!(
         failures.is_empty(),
-        "poisson GLM mean credible band under-covers the truth:\n{}",
+        "poisson GLM mean credible band is miscalibrated:\n{}",
         failures.join("\n")
     );
 }

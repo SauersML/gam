@@ -24,8 +24,7 @@
 //!   μ̂(x⋆) ± z·√(se_μ̂(x⋆)² + σ̂(x⋆)²)
 //! (mean uncertainty + observation scatter — the proper predictive interval,
 //! reconstructed from the CLI's mean band and σ column). Audited by the shared
-//! Wilson verdict over the 80/90/95 sweep; only anti-conservative under-coverage
-//! gates, over-coverage is reported.
+//! Wilson verdict over the 80/90/95 sweep; both tails gate (#3534).
 //!
 //! Runtime: small n and R with a single fit + single predict per replication
 //! (the level sweep is reconstructed analytically from the level-independent
@@ -34,9 +33,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use gam_test_support::calibration::{
-    CalibrationRng, CoverageClass, audit_coverage, standard_normal_quantile,
-};
+use gam_test_support::calibration::{CalibrationRng, audit_coverage, standard_normal_quantile};
 
 /// Resolve the `gam` CLI binary for this profile. Mirrors the `gam_binary!`
 /// macro but as a direct call — `option_env!` must be expanded at this crate's
@@ -248,23 +245,13 @@ fn location_scale_predictive_interval_covers_new_observation_at_nominal() {
     let mut failures = Vec::new();
     for (level_idx, &level) in NOMINAL_LEVELS.iter().enumerate() {
         let verdict = audit_coverage(hits[level_idx], N_REPLICATIONS, level);
-        if verdict.class == CoverageClass::AntiConservative {
-            failures.push(format!(
-                "level {level}: empirical={:.4} (hits {}/{}), Wilson CI=[{:.4},{:.4}], \
-                 nominal ABOVE the CI by {:.4} — anti-conservative (over-smoothed log-σ / \
-                 the #1561 signature)",
-                verdict.empirical,
-                verdict.hits,
-                verdict.replications,
-                verdict.ci_lo,
-                verdict.ci_hi,
-                -verdict.slack(),
-            ));
+        if !verdict.passed {
+            failures.push(format!("level {level}: {}", verdict.describe()));
         }
     }
     assert!(
         failures.is_empty(),
-        "location-scale predictive interval under-covers a new observation:\n{}",
+        "location-scale predictive interval is miscalibrated for a new observation:\n{}",
         failures.join("\n")
     );
 }
