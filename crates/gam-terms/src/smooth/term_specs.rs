@@ -5303,16 +5303,19 @@ fn operator_chart_scale(operator: &Array2<f64>) -> f64 {
     f64::from_bits(((1023 + shift) as u64) << 52)
 }
 
-/// One operator's Gram, formed in the chart of [`operator_chart_scale`] (#3430).
-fn charted_operator_gram(operator: &Array2<f64>) -> Array2<f64> {
+/// One operator in the chart of [`operator_chart_scale`] (#3430).
+///
+/// The charted operator, not its Gram, is what the penalty is built from: it is
+/// the exact energy factor of `S = DᵀD`, and the Gram it forms below is used
+/// only to read the normalization scale `c = ‖DᵀD‖_F`. `scale == 1.0` returns
+/// the operator's own values, so every representable case carries the entries
+/// that were multiplied out before #3430.
+fn charted_operator(operator: &Array2<f64>) -> Array2<f64> {
     let scale = operator_chart_scale(operator);
     if scale == 1.0 {
-        // The chart is inert: form the Gram from the operator itself, so every
-        // representable case is the arithmetic that was performed before #3430.
-        operator.t().dot(operator)
+        operator.to_owned()
     } else {
-        let charted = operator.mapv(|value| value * scale);
-        charted.t().dot(&charted)
+        operator.mapv(|value| value * scale)
     }
 }
 
@@ -5384,16 +5387,38 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
         // κ search visits produce the same normalized penalty instead of a zero
         // matrix (#3430). The gate above runs first: a block the order gate skips
         // is no longer multiplied out at all.
-        let raw = charted_operator_gram(operator);
+        let charted = charted_operator(operator);
+        let raw = charted.t().dot(&charted);
         let sym = (&raw + &raw.t()) * 0.5;
-        let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym)?;
-        candidates.push(PenaltyCandidate {
-            matrix: ConstructiveQuadratic::try_from_dense_psd(matrix, "Matérn operator penalty")?,
-            source,
+        // The Gram is read for its normalization scale only. The penalty itself
+        // is built from `charted / √c`, its exact energy factor, by the shared
+        // `collocation_operator_penalty_candidate` (#3236) — the same
+        // construction `operator_penalty_candidates_from_collocation` uses, so
+        // the two builders of this object agree.
+        //
+        // `try_from_dense_psd` on the Gram keeps only the eigen-directions above
+        // `dim·1e-10·max|ev|` and rebuilds the matrix from them, which makes the
+        // BLOCK'S RANK A FUNCTION OF κ: every direction below that cut becomes an
+        // exact zero, so the rank the freeze pins at the build ψ is the count
+        // above a cut the trial ψ's own spectrum crosses. #3236 measured the
+        // crossing (a mass block at rank 118 at ψ = 1.4398 and 117 at ψ − 1e-3),
+        // `canonicalize_penalty_specs_at_frozen_ranks` refuses that trial, and
+        // the outer search cost-stalls against a correct descent gradient. #3236
+        // removed the cut from `operator_penalty_candidates_from_collocation`
+        // and this builder kept it, so for a `matern()` term the cut was still
+        // the one in effect: `build_single_local_smooth_term_for` replaces a
+        // `SmoothBasisSpec::Matern` term's active penalties with this triplet,
+        // so the other builder's output never reaches the fit. The refusals name
+        // the cut's fingerprint — a kept eigenvalue of ±1e-17 beside a rounding
+        // band of 8.5e-15 is the cliff of a truncated reconstruction, not a
+        // decaying Gram tail.
+        let (_, normalization_scale) = normalize_penalty_in_constrained_space(&sym)?;
+        candidates.push(collocation_operator_penalty_candidate(
+            &charted,
             normalization_scale,
-            kronecker_factors: None,
-            op: None,
-        });
+            source,
+            "Matérn operator penalty",
+        )?);
     }
     if let Some(gram) = ops.third_order_gram.as_ref() {
         let sym = (gram + &gram.t()) * 0.5;

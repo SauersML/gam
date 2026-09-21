@@ -31,6 +31,31 @@
   gradient-only `ModelIsIllConditioned` arm in the outer objective was character for
   character the `Err(e)` fallback two lines below it.
 
+- **A `matern()` term's penalty was still rebuilt from a `1e-10` cut on its Gram, so its rank
+  moved with the length scale and every κ trial was refused** (gam#3236, gam#2901, gam#1561).
+  `matern_operator_penalty_triplet_at_length_scale` — the builder whose own doc calls itself the
+  single source of truth for the Matérn penalty topology, and the one
+  `build_single_local_smooth_term_for` uses to REPLACE a Matérn term's active penalties — formed
+  each operator penalty with `ConstructiveQuadratic::try_from_dense_psd` on the materialized Gram
+  `DᵀD`. That constructor keeps only the eigen-directions above `dim·1e-10·max|ev|` and rebuilds
+  the matrix from them, so every direction below the cut becomes an exact zero and the block's
+  rank is the count above a RELATIVE cut on a spectrum that moves with κ. The joint ρ+ψ fit
+  freezes each block's structural rank once at the build ψ and roots every later realization at
+  it, so one direction crossing that cut makes
+  `canonicalize_penalty_specs_at_frozen_ranks` refuse the trial and the outer search stall
+  against a descent gradient it cannot take. gam#3236 removed this cut from
+  `operator_penalty_candidates_from_collocation` and measured the crossing it caused (a mass
+  block at rank 118 at ψ = 1.4398 and 117 at ψ − 1e-3), but a Matérn term never reaches that
+  builder, so for `matern()` the cut was untouched. The refusals carry its fingerprint: a kept
+  eigenvalue of ±1e-17 beside a rounding band of 8.5e-15 is the cliff of a truncated
+  reconstruction, not a decaying Gram tail. The triplet builder now routes through the shared
+  `collocation_operator_penalty_candidate`, which builds `S = DᵀD/c` from its exact energy factor
+  `D/√c`, so the two builders of this object construct it identically and the penalty keeps every
+  direction the operator resolves. The `operator_chart_scale` power-of-two chart (gam#3430) is
+  applied to the operator before the factor is taken, and the published `normalization_scale`
+  stays `‖S‖_F` read through `normalize_penalty_in_constrained_space`, which also still refuses
+  material negative curvature. The third-order block is unchanged: its collocation builder emits
+  a Gram and no factor, exactly as on the sibling path.
 - **A constrained fit's criterion was a determinant over the active face, so it fell by that
   face's own log-eigenvalue every time a row activated** (gam#2765 stage 2, gam#3303, gam#3234,
   gam#2695). The standard route reduced a shape- or box-constrained mode onto `Z = null(A_act)`
