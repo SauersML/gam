@@ -182,6 +182,7 @@ impl StandardPredictor {
             mean,
             eta_se: Some(eta_se),
             mean_se: Some(mean_se),
+            response_index: None,
             // Posterior-mean integration always uses the conditional posterior.
             covariance_source: InferenceCovarianceMode::Conditional,
         })
@@ -202,6 +203,7 @@ impl PredictionTransform for StandardPredictor {
             mean: with_se.mean,
             eta_se: with_se.eta_se,
             mean_se: with_se.mean_se,
+            response_index: None,
             // Point state is built from the predictor's stored conditional
             // covariance.
             covariance_source: InferenceCovarianceMode::Conditional,
@@ -243,6 +245,7 @@ impl PredictionTransform for StandardPredictor {
                     mean,
                     eta_se: Some(eta_se),
                     mean_se: Some(mean_se),
+                    response_index: None,
                     covariance_source,
                 })
             }
@@ -255,15 +258,16 @@ impl PredictionTransform for StandardPredictor {
         strategy.inverse_link_array(eta.view())
     }
 
-    fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval {
-        match pass {
-            // Wiggle full uncertainty reports a genuine η interval and a
-            // delta-method response interval.
-            PredictPass::FullUncertainty => ResponseInterval::SymmetricDelta,
-            // Wiggle posterior-mean bounds transform the η endpoints through the
-            // inverse link (the `enrich_posterior_mean_bounds` policy).
-            PredictPass::PosteriorMean => ResponseInterval::TransformEta,
-        }
+    fn response_jacobian_rows(&self) -> Result<ResponseInterval, EstimationError> {
+        // Both passes report the image of the wiggled-η interval
+        // `η ± z·SE(η)` under the monotone inverse link. The wiggle is already
+        // inside η and its SE carries the warp chain rule exactly, so the band
+        // lies inside the link's range by construction; a delta band
+        // `μ ± z·|dμ/dη|·SE(η)` leaves `[0, 1]` wherever the link saturates.
+        // Half-line links (sqrt/inverse/identity on a positive family) cut
+        // the η interval at the feasible boundary before mapping it.
+        let spec = spec_from_family_link(self.family.clone(), self.link_kind.as_ref());
+        Ok(ResponseInterval::TransformEta(EtaDomain::of_spec(&spec)?))
     }
 
     fn bounds(&self) -> ResponseBounds {
@@ -458,7 +462,6 @@ impl PredictableModel for StandardPredictor {
                 let unc_options = PredictUncertaintyOptions {
                     confidence_level: level,
                     covariance_mode: options.covariance_mode,
-                    mean_interval_method: MeanIntervalMethod::TransformEta,
                     // The engine builds the observation band from the posterior
                     // moments of μ under the requested covariance's η law (#3140),
                     // so it is adopted as it comes.

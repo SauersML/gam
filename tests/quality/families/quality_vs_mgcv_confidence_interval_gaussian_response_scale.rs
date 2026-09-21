@@ -45,8 +45,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use gam_predict::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
-    predict_gamwith_uncertainty,
+    InferenceCovarianceMode, PredictUncertaintyOptions, predict_gamwith_uncertainty,
 };
 use ndarray::Array1;
 use rand::SeedableRng;
@@ -166,7 +165,6 @@ fn response_scale_ci_is_calibrated_and_matches_or_beats_mgcv() {
                 // Conditional Vb path, used as the baseline for the explicit
                 // rho-marginalized default below.
                 covariance_mode: InferenceCovarianceMode::Conditional,
-                mean_interval_method: MeanIntervalMethod::Delta,
                 includeobservation_interval: false,
                 ..PredictUncertaintyOptions::default()
             },
@@ -197,7 +195,6 @@ fn response_scale_ci_is_calibrated_and_matches_or_beats_mgcv() {
             &PredictUncertaintyOptions {
                 confidence_level: NOMINAL,
                 covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
-                mean_interval_method: MeanIntervalMethod::Delta,
                 includeobservation_interval: false,
                 ..PredictUncertaintyOptions::default()
             },

@@ -45,7 +45,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use gam_predict::{
-    InferenceCovarianceMode, IntervalReference, MeanIntervalMethod, PredictUncertaintyOptions,
+    InferenceCovarianceMode, IntervalReference, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
 };
 use ndarray::{Array1, Array2};
@@ -257,7 +257,6 @@ fn fit_tweedie(x: &[f64], y: &[f64], eval: &[f64]) -> TweedieFit {
         &PredictUncertaintyOptions {
             confidence_level: CONFIDENCE_LEVEL,
             covariance_mode: InferenceCovarianceMode::Conditional,
-            mean_interval_method: MeanIntervalMethod::Delta,
             includeobservation_interval: true,
             ..PredictUncertaintyOptions::default()
         },

@@ -5,7 +5,7 @@
 //! (#1787), which pins the CURVED (posterior-mean) arm. The two `run_predict_unified`
 //! uncertainty arms are independent: the curved arm routes through
 //! `predict_posterior_mean`, while the linear/identity arm builds
-//! `PredictUncertaintyOptions { mean_interval_method: TransformEta, .. }`. That arm
+//! `PredictUncertaintyOptions` for `predict_full_uncertainty`. That arm
 //! used to recentre η by a frequentist de-shrinkage `X·H⁻¹S(λ̂)β̂` — so requesting
 //! an interval silently moved the reported `mean`/`linear_predictor` (~2.5%)
 //! relative to the plain plug-in point that plain `gam predict` and the Python

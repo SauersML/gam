@@ -23,8 +23,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use gam_predict::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
-    predict_gamwith_uncertainty,
+    InferenceCovarianceMode, PredictUncertaintyOptions, predict_gamwith_uncertainty,
 };
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
@@ -116,7 +115,6 @@ fn fit_and_predict_eta(seed: u64, n: usize, eval: &[(f64, f64)]) -> Vec<(f64, f6
         &PredictUncertaintyOptions {
             confidence_level: 0.95,
             covariance_mode: InferenceCovarianceMode::Conditional,
-            mean_interval_method: MeanIntervalMethod::Delta,
             includeobservation_interval: false,
             ..PredictUncertaintyOptions::default()
         },
@@ -211,4 +209,3 @@ fn gamma_log_eta_wald_intervals_have_nominal_coverage() {
          coverage {buggy_coverage:.4} than to nominal 0.95 — Vb is too narrow"
     );
 }
-

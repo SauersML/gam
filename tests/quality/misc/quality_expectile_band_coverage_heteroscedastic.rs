@@ -49,7 +49,7 @@ use gam::{
 };
 use gam_math::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
 use gam_predict::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
+    InferenceCovarianceMode, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
 };
 use ndarray::{Array1, Array2};
@@ -171,7 +171,6 @@ fn expectile_bands_cover_true_expectile_under_heteroscedastic_noise() {
     let options = PredictUncertaintyOptions {
         confidence_level: NOMINAL,
         covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
-        mean_interval_method: MeanIntervalMethod::Delta,
         includeobservation_interval: false,
         ..PredictUncertaintyOptions::default()
     };

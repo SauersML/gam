@@ -68,8 +68,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use gam_predict::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
-    predict_gamwith_uncertainty,
+    InferenceCovarianceMode, PredictUncertaintyOptions, predict_gamwith_uncertainty,
 };
 use ndarray::Array1;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -131,7 +130,6 @@ fn confidence_intervals_cover_truth_under_logistic_link() {
             let options = PredictUncertaintyOptions {
                 confidence_level: 0.95,
                 covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
-                mean_interval_method: MeanIntervalMethod::Delta,
                 includeobservation_interval: false,
                 ..PredictUncertaintyOptions::default()
             };

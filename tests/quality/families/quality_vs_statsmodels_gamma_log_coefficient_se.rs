@@ -33,8 +33,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use gam_predict::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
-    predict_gamwith_uncertainty,
+    InferenceCovarianceMode, PredictUncertaintyOptions, predict_gamwith_uncertainty,
 };
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
@@ -123,7 +122,6 @@ fn gamma_log_coefficient_se_matches_statsmodels_no_double_count() {
         &PredictUncertaintyOptions {
             confidence_level: 0.95,
             covariance_mode: InferenceCovarianceMode::Conditional,
-            mean_interval_method: MeanIntervalMethod::Delta,
             includeobservation_interval: false,
             ..PredictUncertaintyOptions::default()
         },

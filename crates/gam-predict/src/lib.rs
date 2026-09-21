@@ -29,10 +29,10 @@ pub(crate) use crate::dispersion_location_scale::DispersionLocationScalePredicto
 use crate::gaussian_location_scale::GaussianLocationScalePredictor;
 pub use gam_inference::interval_reference::IntervalReference;
 use crate::interval_policy::{
-    EtaInterval, LinearState, MeanBoundMethod, PredictPass, PredictionTransform, ResponseBounds,
+    EtaDomain, LinearState, MeanBoundMethod, PredictPass, PredictionTransform, ResponseBounds,
     ResponseInterval, assemble_posterior_mean_bounds, predict_full_uncertainty_generic,
     predict_plugin_response_generic, predict_posterior_mean_generic,
-    predict_with_uncertainty_generic,
+    predict_with_uncertainty_generic, transform_eta_interval,
 };
 use crate::linalg::{
     PredictionCovarianceBackend, design_row_chunk, rowwise_local_covariances_parallel,
@@ -1572,10 +1572,11 @@ impl PosteriorMeanOptions {
 
 /// Compute and attach TransformEta confidence bounds to a posterior-mean result.
 ///
-/// This mirrors the bound construction in [`predict_gamwith_uncertainty`] using
-/// the `TransformEta` method: transform `eta ± z * eta_se` through the inverse
-/// link, then clamp to [0, 1] for bounded-response families. `z` is the central
-/// multiplier of `reference`, the fit's [`IntervalReference`].
+/// This mirrors the bound construction in [`predict_gamwith_uncertainty`]: the
+/// band is the image of `eta ± z * eta_se` under the inverse link, restricted to
+/// the link's feasible η set, so it lies in the family support with no clamp.
+/// `z` is the central multiplier of `reference`, the fit's
+/// [`IntervalReference`].
 ///
 /// Call this after [`PredictableModel::predict_posterior_mean`] whenever a
 /// confidence level is available so that `mean_lower` / `mean_upper` are
@@ -1603,17 +1604,15 @@ pub(crate) fn enrich_posterior_mean_bounds(
     // the link-scale `σ_η` (#1536). TransformEta bounds remain the image of the
     // η-scale interval and never substitute this SD.
     result.mean_standard_error = Some(mean_standard_error);
-    // TransformEta bounds: transform the η endpoints through the inverse link,
-    // handle non-monotone transforms, and clamp to the family support. The
-    // shared engine owns this construction so it cannot drift from the
+    // TransformEta bounds: the image of the η interval under the inverse link.
+    // The shared engine owns this construction so it cannot drift from the
     // per-predictor interval paths.
     assemble_posterior_mean_bounds(
         result,
         Some(confidence_level),
         reference,
-        EtaInterval::Symmetric,
         MeanBoundMethod::TransformEta {
-            bounds: ResponseBounds::for_family(&spec.response),
+            domain: EtaDomain::of_spec(&spec)?,
             response_map: &|eta: &Array1<f64>| apply_family_inverse_link(eta, &spec),
         },
     )
@@ -1639,8 +1638,6 @@ pub struct PredictUncertaintyOptions {
     pub confidence_level: f64,
     /// Covariance mode used for eta/mean intervals.
     pub covariance_mode: InferenceCovarianceMode,
-    /// Mean-scale interval construction method.
-    pub mean_interval_method: MeanIntervalMethod,
     /// Return observation intervals for supported response families using
     /// Var(y_new | x) = Var(mu_hat) + Var(Y | mu).
     pub includeobservation_interval: bool,
@@ -1682,22 +1679,12 @@ impl Default for PredictUncertaintyOptions {
         Self {
             confidence_level: 0.95,
             covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
-            mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: true,
             extrapolation_variance: None,
             conformal_level: None,
             observation_prior_weights: None,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MeanIntervalMethod {
-    /// Interval on mean scale from delta-method SEs.
-    Delta,
-    /// Transform eta interval endpoints through inverse link.
-    /// This is usually better behaved for nonlinear links.
-    TransformEta,
 }
 
 #[derive(Debug)]
@@ -2717,13 +2704,6 @@ where
         // by `constrained_law` (#2784): conditional from the persisted moments,
         // smoothing-corrected by re-deriving them from `Vp`, exactly as the
         // fit publishes its own truncated `Vp` for `summary()`.
-        if options.mean_interval_method != MeanIntervalMethod::TransformEta {
-            return Err(EstimationError::InvalidInput(
-                "inequality-truncated credible intervals require TransformEta response bounds; \
-                 a delta interval is not a quantile of the persisted posterior"
-                    .to_string(),
-            ));
-        }
         if options.extrapolation_variance.is_some() {
             return Err(EstimationError::InvalidInput(
                 "inequality-truncated credible intervals cannot combine the persisted posterior \
@@ -2916,45 +2896,16 @@ where
     let posterior_mean = Array1::from_vec(posterior_mean);
     let mean_standard_error = Array1::from_vec(mean_standard_error);
 
-    let (mut mean_lower, mut mean_upper) = match options.mean_interval_method {
-        MeanIntervalMethod::Delta => (
-            Array1::from_iter(
-                mean.iter()
-                    .zip(mean_standard_error.iter())
-                    .zip(z_lower_per_row.iter())
-                    .map(|((&m, &s), &zl)| m - zl * s),
-            ),
-            Array1::from_iter(
-                mean.iter()
-                    .zip(mean_standard_error.iter())
-                    .zip(z_upper_per_row.iter())
-                    .map(|((&m, &s), &zu)| m + zu * s),
-            ),
-        ),
-        MeanIntervalMethod::TransformEta => {
-            let transformed_lower = apply_family_inverse_link(&eta_lower, &likelihood)?;
-            let transformed_upper = apply_family_inverse_link(&eta_upper, &likelihood)?;
-            let mut lower = Array1::<f64>::zeros(mean.len());
-            let mut upper = Array1::<f64>::zeros(mean.len());
-            for i in 0..mean.len() {
-                let (lo, hi) = (transformed_lower[i], transformed_upper[i]);
-                if !(lo.is_finite() && hi.is_finite()) {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "response-scale interval transform is non-finite at row {i}: \
-                         lower={lo}, upper={hi}"
-                    )));
-                }
-                lower[i] = lo.min(hi);
-                upper[i] = lo.max(hi);
-            }
-            (lower, upper)
-        }
-    };
-
+    // The mean band is the image of the η interval under the inverse link,
+    // restricted to the link's feasible η set: it lies in the family support by
+    // construction, so nothing clamps it (#3140).
     let spec = &likelihood;
-    let response_bounds = ResponseBounds::for_family(&spec.response);
-    response_bounds.clamp_in_place(&mut mean_lower);
-    response_bounds.clamp_in_place(&mut mean_upper);
+    let (mean_lower, mean_upper) = transform_eta_interval(
+        &eta_lower,
+        &eta_upper,
+        EtaDomain::of_spec(spec)?,
+        |e: &Array1<f64>| apply_family_inverse_link(e, spec),
+    )?;
 
     let (observation_lower, observation_upper) = if options.includeobservation_interval {
         // A probability-valued mean carries its complement from the same η posterior.
@@ -3239,7 +3190,6 @@ mod tests {
         let options = PredictUncertaintyOptions {
             confidence_level: 0.95,
             covariance_mode: InferenceCovarianceMode::Conditional,
-            mean_interval_method: MeanIntervalMethod::Delta,
             includeobservation_interval: true,
             ..PredictUncertaintyOptions::default()
         };
@@ -3306,7 +3256,6 @@ mod tests {
         let options = PredictUncertaintyOptions {
             confidence_level: 0.95,
             covariance_mode: InferenceCovarianceMode::Conditional,
-            mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
             ..PredictUncertaintyOptions::default()
         };
@@ -3626,7 +3575,6 @@ mod tests {
         let options = PredictUncertaintyOptions {
             confidence_level: 0.95,
             covariance_mode: published,
-            mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
             ..PredictUncertaintyOptions::default()
         };
@@ -3660,7 +3608,6 @@ mod tests {
         let options = PredictUncertaintyOptions {
             confidence_level: 0.95,
             covariance_mode: InferenceCovarianceMode::Conditional,
-            mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
             ..PredictUncertaintyOptions::default()
         };
@@ -3948,7 +3895,6 @@ mod tests {
         let options = PredictUncertaintyOptions {
             confidence_level: 0.95,
             covariance_mode: InferenceCovarianceMode::Conditional,
-            mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
             ..PredictUncertaintyOptions::default()
         };
@@ -3989,7 +3935,6 @@ mod tests {
         let base_options = PredictUncertaintyOptions {
             confidence_level: 0.95,
             covariance_mode: InferenceCovarianceMode::Conditional,
-            mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
             ..PredictUncertaintyOptions::default()
         };
@@ -4585,7 +4530,6 @@ mod tests {
         PredictUncertaintyOptions {
             confidence_level: 0.95,
             covariance_mode: InferenceCovarianceMode::Conditional,
-            mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
             ..PredictUncertaintyOptions::default()
         }
@@ -5203,6 +5147,7 @@ mod tests {
                 eta_se: Some(Array1::from_elem(n, 0.01)),
                 mean_se: Some(Array1::from_elem(n, 0.01)),
                 covariance_source: InferenceCovarianceMode::Conditional,
+                response_index: None,
             })
         }
 
@@ -5241,16 +5186,10 @@ mod tests {
             Ok(eta.mapv(|value| (-value.exp()).exp()))
         }
 
-        fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval {
-            // The horizon indicator reports a genuine η interval *and* a
-            // response-scale delta SE on both passes, so the policy is the same
-            // either way. Enumerating the passes keeps that a stated fact: a new
-            // pass has to come back here and choose.
-            match pass {
-                PredictPass::FullUncertainty | PredictPass::PosteriorMean => {
-                    ResponseInterval::SymmetricDelta
-                }
-            }
+        fn response_jacobian_rows(&self) -> Result<ResponseInterval, EstimationError> {
+            // The horizon indicator is the decreasing map `exp(−e^η)` of one
+            // unrestricted η.
+            Ok(ResponseInterval::TransformEta(EtaDomain::Unrestricted))
         }
 
         fn bounds(&self) -> ResponseBounds {

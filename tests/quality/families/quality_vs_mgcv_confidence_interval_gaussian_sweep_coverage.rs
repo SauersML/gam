@@ -44,8 +44,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use gam_predict::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
-    predict_gamwith_uncertainty,
+    InferenceCovarianceMode, PredictUncertaintyOptions, predict_gamwith_uncertainty,
 };
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
@@ -185,7 +184,6 @@ fn gam_confidence_interval_domain_averaged_coverage_hits_nominal() {
                 &PredictUncertaintyOptions {
                     confidence_level: CONFIDENCE_LEVEL,
                     covariance_mode: InferenceCovarianceMode::Conditional,
-                    mean_interval_method: MeanIntervalMethod::TransformEta,
                     includeobservation_interval: false,
                     ..PredictUncertaintyOptions::default()
                 },

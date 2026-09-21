@@ -239,6 +239,7 @@ impl PredictionTransform for DispersionLocationScalePredictor {
             mean,
             eta_se,
             mean_se,
+            response_index: None,
             covariance_source: InferenceCovarianceMode::Conditional,
         })
     }
@@ -269,8 +270,8 @@ impl PredictionTransform for DispersionLocationScalePredictor {
         };
         let (eta, plugin_mean, eta_se, mean_se) = self.state_from_backend(input, &backend)?;
         let mean = match pass {
-            // Plug-in mean is correct for the symmetric-delta full-uncertainty
-            // report (the point is the inverse link of the conditional η).
+            // The full-uncertainty point is the inverse link of the
+            // conditional η.
             PredictPass::FullUncertainty => plugin_mean,
             // The curved inverse link makes `E[g^{-1}(η)] ≠ g^{-1}(E[η])`, so the
             // posterior-mean point integrates the inverse link over the
@@ -289,6 +290,7 @@ impl PredictionTransform for DispersionLocationScalePredictor {
             mean,
             eta_se: Some(eta_se),
             mean_se: Some(mean_se),
+            response_index: None,
             covariance_source,
         })
     }
@@ -297,15 +299,12 @@ impl PredictionTransform for DispersionLocationScalePredictor {
         self.strategy().inverse_link_array(eta.view())
     }
 
-    fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval {
-        match pass {
-            // Full uncertainty reports a genuine η interval and a delta-method
-            // response interval through the inverse link.
-            PredictPass::FullUncertainty => ResponseInterval::SymmetricDelta,
-            // Posterior-mean bounds transform the η endpoints through the
-            // inverse link.
-            PredictPass::PosteriorMean => ResponseInterval::TransformEta,
-        }
+    fn response_jacobian_rows(&self) -> Result<ResponseInterval, EstimationError> {
+        // Both passes transform the mean-block η endpoints through the
+        // inverse link, so the band lies in the family's support.
+        Ok(ResponseInterval::TransformEta(EtaDomain::of_spec(
+            &self.likelihood,
+        )?))
     }
 
     fn bounds(&self) -> ResponseBounds {

@@ -1,10 +1,9 @@
 #![cfg(test)]
-use gam_spec::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use crate::{
-    InferenceCovarianceMode, IntervalReference, MeanIntervalMethod, PredictPosteriorMeanResult,
-    PredictUncertaintyOptions,
-    enrich_posterior_mean_bounds, predict_gamwith_uncertainty,
+    InferenceCovarianceMode, IntervalReference, PredictPosteriorMeanResult,
+    PredictUncertaintyOptions, enrich_posterior_mean_bounds, predict_gamwith_uncertainty,
 };
+use gam_spec::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, array};
 
 fn like(response: ResponseFamily, link: StandardLink) -> LikelihoodSpec {
@@ -26,7 +25,6 @@ fn predict_uncertainty_bounds_track_requested_alpha_level_for_logit() {
         &PredictUncertaintyOptions {
             confidence_level: 0.8,
             covariance_mode: InferenceCovarianceMode::Conditional,
-            mean_interval_method: MeanIntervalMethod::TransformEta,
             ..PredictUncertaintyOptions::default()
         },
     )
@@ -123,7 +121,6 @@ fn delta_method_variance_matches_posterior_simulation_for_small_logit_problem() 
         like(ResponseFamily::Binomial, StandardLink::Logit),
         &cov,
         &PredictUncertaintyOptions {
-            mean_interval_method: MeanIntervalMethod::Delta,
             covariance_mode: InferenceCovarianceMode::Conditional,
             ..PredictUncertaintyOptions::default()
         },

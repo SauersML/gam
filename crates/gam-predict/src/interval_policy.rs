@@ -9,16 +9,21 @@
 //!   1. the central multiplier `z = F⁻¹(½ + ½·level)` of the fit's
 //!      [`IntervalReference`] (normal, or Student-t for an estimated scale),
 //!   2. the η-scale interval `η ± z·SE(η)`,
-//!   3. the response-scale interval, either by transforming the η endpoints
-//!      through the (monotone) inverse link or by the delta-method `μ ± z·SE(μ)`,
-//!   4. clamping the response-scale bounds to the family support, and
-//!   5. assembling [`PredictUncertaintyResult`] / [`PredictPosteriorMeanResult`].
+//!   3. the response-scale interval, the image of an index interval
+//!      `u ± z·SE(u)` under the monotone response map `h` (the inverse link of
+//!      `η`, or a two-block family's own response index), intersected with the
+//!      map's feasible argument set, and
+//!   4. assembling [`PredictUncertaintyResult`] / [`PredictPosteriorMeanResult`].
+//!
+//! Every mean band is such an image, so it lies in the response support by
+//! construction and nothing clamps it (#3140). Only the observation band, a
+//! symmetric predictive set, is clamped to the support.
 //!
 //! Centralizing this here means the confidence-level convention, quantile
-//! routine, covariance-mode plumbing, and response-bound clamps live in one
-//! place. A predictor defines only its linear state + response transform and
-//! delegates the policy to the helpers below, so interval/posterior-mean
-//! behaviour cannot drift between families.
+//! routine and covariance-mode plumbing live in one place. A predictor defines
+//! only its linear state + response transform and delegates the policy to the
+//! helpers below, so interval/posterior-mean behaviour cannot drift between
+//! families.
 
 use crate::{
     InferenceCovarianceMode, IntervalReference, PointCovarianceProvenance, PosteriorMeanOptions, PredictInput,
@@ -27,17 +32,20 @@ use crate::{
 };
 use gam_problem::EstimationError;
 use gam_solve::model_types::UnifiedFitResult;
-use gam_spec::ResponseFamily;
+use gam_spec::{EtaFeasibility, InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::Array1;
 
-/// Closed response-scale support `[lo, hi]` used to clamp transformed interval
-/// endpoints. `None` means the response is unbounded and must not be clamped.
+/// Closed response-scale support `[lo, hi]` used to clamp a symmetric
+/// observation (predictive) band. `None` means the response is unbounded and
+/// must not be clamped. Mean bands are never clamped: they are images of an
+/// index interval under the response map and lie in the support by
+/// construction.
 ///
 /// This is the predict-side policy mirror of
 /// [`ResponseFamily::mean_clamp_bounds`]: families expose their natural mean
 /// support and the engine applies it uniformly. Predictors whose response is a
-/// probability that is *already* evaluated post-transformation (survival tail,
-/// binomial location-scale) report the closed `[0, 1]` bounds directly.
+/// probability (survival tail, binomial location-scale) report the closed
+/// `[0, 1]` bounds directly.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ResponseBounds(Option<(f64, f64)>);
 
@@ -87,86 +95,188 @@ pub(crate) fn symmetric_interval(
     (center - &half_width, center + &half_width)
 }
 
-/// Response-scale interval built by transforming the η-scale interval through
-/// a monotone response map, then clamping to `bounds`.
+/// The feasible argument set of a response map, with the map's limit at the
+/// set's finite boundary.
+///
+/// A cell whose mean map is defined on a half-line only (`√`, `1/η`, `η^{-1/2}`,
+/// identity on a positive family, `exp(η) < 1` for a log-link probability; see
+/// [`LikelihoodSpec::eta_feasibility`]) has an η interval that may cross the
+/// origin although its point is feasible. The mean band is the image of the
+/// feasible part of that interval, so the infeasible part is cut at the
+/// boundary and the boundary endpoint takes the map's limit there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EtaDomain {
+    /// The map is defined on every finite argument.
+    Unrestricted,
+    /// The map is defined on the open half-line `feasibility` (never
+    /// [`EtaFeasibility::Unrestricted`]); `boundary_mean` is its limit as the
+    /// argument tends to the half-line's finite end `0` from inside.
+    HalfLine {
+        feasibility: EtaFeasibility,
+        boundary_mean: f64,
+    },
+}
+
+impl EtaDomain {
+    /// The feasible argument set of `spec`'s inverse link over its family.
+    ///
+    /// Every restricted cell changes admissibility at `η = 0`, and the limit
+    /// of its inverse link there is read off the link itself: `0` for the
+    /// identity and `η²`, `1` for `exp`, and `+∞` for `1/η` and `η^{-1/2}`.
+    pub(crate) fn of_spec(spec: &LikelihoodSpec) -> Result<Self, EstimationError> {
+        let feasibility = spec.eta_feasibility();
+        if feasibility == EtaFeasibility::Unrestricted {
+            return Ok(Self::Unrestricted);
+        }
+        let boundary_mean = match &spec.link {
+            InverseLink::Standard(StandardLink::Identity | StandardLink::Sqrt) => 0.0,
+            InverseLink::Standard(StandardLink::Log) => 1.0,
+            InverseLink::Standard(StandardLink::Inverse | StandardLink::InverseSquared) => {
+                f64::INFINITY
+            }
+            other => {
+                return Err(EstimationError::InvalidInput(format!(
+                    "response-scale interval: the {} cell restricts η to {feasibility:?} but its \
+                     link {other:?} has no boundary limit on record",
+                    spec.response.name()
+                )));
+            }
+        };
+        Ok(Self::HalfLine {
+            feasibility,
+            boundary_mean,
+        })
+    }
+}
+
+/// Response-scale interval: the image of the index interval
+/// `[lower, upper]` under a monotone response map, restricted to the map's
+/// feasible argument set `domain`.
 ///
 /// `response_map` is the predictor's inverse-link / response transform, and
 /// every one routed here is monotone. The base inverse links are CDF-shaped
-/// (logit, probit, cloglog, SAS, beta-logistic, mixtures). The Bernoulli
-/// marginal-slope mean is `Φ(η)`. A learnable link wiggle is a monotone warp
-/// that already sits inside `η`. Survival tails decrease. The image of
-/// `[η_lo, η_hi]` is therefore exactly the span of the two endpoint images, so
-/// the endpoints are transformed and ordered, and nothing is scanned (SPEC rule
-/// 18, #2902). The ordering also handles a decreasing map.
+/// (logit, probit, cloglog, SAS, beta-logistic, mixtures) or monotone on their
+/// half-line (`exp`, `√`, `1/η`). The Bernoulli marginal-slope mean is `Φ(η)`.
+/// A learnable link wiggle is a monotone warp that already sits inside `η`.
+/// Survival tails decrease in their index. The image of `[lower, upper]` is
+/// therefore exactly the span of the two endpoint images, so the endpoints are
+/// transformed and ordered, and nothing is scanned (SPEC rule 18, #2902). The
+/// ordering also handles a decreasing map. The image lies in the map's range,
+/// so it lies in the response support and nothing clamps it (#3140).
 ///
-/// Both transformed endpoints must be finite. A non-finite response image is a
-/// typed prediction failure: changing that row to a delta-method interval would
-/// silently substitute a different uncertainty estimand. Degenerate all-zero
-/// count responses are rejected at the family-validation boundary before a fit
-/// is minted (#2255).
+/// On a half-line domain an endpoint at or past the boundary is cut there and
+/// takes the map's boundary limit, which may be infinite (the image of
+/// `(0, u]` under `1/η` is `[1/u, ∞)`). An interval entirely outside the
+/// domain has an infeasible point and is a typed error.
+///
+/// Every endpoint image evaluated inside the domain must be finite. A
+/// non-finite one is a typed prediction failure: changing that row to a
+/// delta-method interval would silently substitute a different uncertainty
+/// estimand. Degenerate all-zero count responses are rejected at the
+/// family-validation boundary before a fit is minted (#2255).
 pub(crate) fn transform_eta_interval<F>(
     eta_lower: &Array1<f64>,
     eta_upper: &Array1<f64>,
-    bounds: ResponseBounds,
+    domain: EtaDomain,
     response_map: F,
 ) -> Result<(Array1<f64>, Array1<f64>), EstimationError>
 where
     F: Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
 {
     let n = eta_lower.len();
-    let at_lower = response_map(eta_lower)?;
-    let at_upper = response_map(eta_upper)?;
+    // Each row's evaluation points, with the side cut at the boundary (if any).
+    // A half-line has one finite end, so at most one side of a row is cut, and
+    // that side is evaluated at the row's other, feasible endpoint and then
+    // replaced by the boundary limit.
+    let mut lower_arg = eta_lower.clone();
+    let mut upper_arg = eta_upper.clone();
+    let mut lower_at_boundary = vec![false; n];
+    let mut upper_at_boundary = vec![false; n];
+    if let EtaDomain::HalfLine { feasibility, .. } = domain {
+        let (a, b) = feasibility.interval();
+        for i in 0..n {
+            let (lo, hi) = (eta_lower[i], eta_upper[i]);
+            if !(lo <= hi && hi > a && lo < b) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "response-scale interval: row {i} has the index interval [{lo}, {hi}], \
+                     which does not meet the feasible set ({a}, {b}) of the response map"
+                )));
+            }
+            if lo <= a {
+                lower_at_boundary[i] = true;
+                lower_arg[i] = hi;
+            }
+            if hi >= b {
+                upper_at_boundary[i] = true;
+                upper_arg[i] = lo;
+            }
+        }
+    }
+    let boundary_mean = match domain {
+        EtaDomain::HalfLine { boundary_mean, .. } => boundary_mean,
+        EtaDomain::Unrestricted => f64::NAN,
+    };
+    let at_lower = response_map(&lower_arg)?;
+    let at_upper = response_map(&upper_arg)?;
     let mut mean_lower = Array1::<f64>::zeros(n);
     let mut mean_upper = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let (first, second) = (at_lower[i], at_upper[i]);
         // `f64::min`/`max` return the non-NaN argument, so a single `+inf`/NaN
         // endpoint would otherwise slip through as a finite-but-meaningless bound.
-        if !(first.is_finite() && second.is_finite()) {
+        if !(at_lower[i].is_finite() && at_upper[i].is_finite()) {
             return Err(EstimationError::InvalidInput(format!(
                 "response-scale interval transform produced a non-finite value at row {i}"
             )));
         }
+        let first = if lower_at_boundary[i] {
+            boundary_mean
+        } else {
+            at_lower[i]
+        };
+        let second = if upper_at_boundary[i] {
+            boundary_mean
+        } else {
+            at_upper[i]
+        };
         mean_lower[i] = first.min(second);
         mean_upper[i] = first.max(second);
     }
-    bounds.clamp_in_place(&mut mean_lower);
-    bounds.clamp_in_place(&mut mean_upper);
     Ok((mean_lower, mean_upper))
 }
 
-/// Response-scale interval built by the delta method `μ ± z·SE(μ)`, then
-/// clamped to `bounds`.
-pub(crate) fn delta_mean_interval(
-    mean: &Array1<f64>,
-    mean_se: &Array1<f64>,
-    z: f64,
-    bounds: ResponseBounds,
-) -> (Array1<f64>, Array1<f64>) {
-    let (mut mean_lower, mut mean_upper) = symmetric_interval(mean, mean_se, z);
-    bounds.clamp_in_place(&mut mean_lower);
-    bounds.clamp_in_place(&mut mean_upper);
-    (mean_lower, mean_upper)
+/// A two-block family's response index `u` and its posterior SD, the argument
+/// its mean band is formed on.
+///
+/// A two-block response `μ = h(u(η₁, η₂))` is a monotone map of one scalar
+/// index `u` built from both linear predictors (survival: the standardized
+/// threshold `q0 = −η_t·e^{−η_σ}`, with `S = 1 − F(q0)`). Its band is the image
+/// of `u ± z·SD(u)` under `h`, which lies in `h`'s range; no single linear
+/// predictor's interval maps onto the response.
+#[derive(Clone, Debug)]
+pub struct ResponseIndex {
+    /// The index `u` per row.
+    pub index: Array1<f64>,
+    /// Posterior SD of `u` per row, under the pass's covariance.
+    pub index_se: Array1<f64>,
 }
 
-/// How a predictor maps its η-scale interval onto the response scale.
+/// How a predictor maps its interval onto the response scale.
 ///
-/// This is the policy split the predictors used to inline: probability /
-/// survival families transform the η endpoints through their response map
-/// (well-behaved for nonlinear links), Gaussian-identity families reuse the
-/// η interval directly, and dispersion families take the delta-method route.
+/// Every variant forms the band as the image of an index interval under the
+/// response map, so the band lies in the support by construction.
 pub(crate) enum MeanBoundMethod<'a> {
-    /// Transform `η ± z·SE(η)` through the supplied monotone response map and
-    /// clamp to `bounds`. Non-finite transformed values are errors; this path
-    /// never substitutes a delta-method interval.
+    /// The image of `η ± z·SE(η)` under the supplied monotone response map,
+    /// restricted to `domain`. Non-finite interior images are errors; this
+    /// path never substitutes a delta-method interval.
     TransformEta {
-        bounds: ResponseBounds,
+        domain: EtaDomain,
         response_map: &'a (dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError> + 'a),
     },
-    /// `μ ± z·SE(μ)` clamped to `bounds`.
-    Delta {
-        mean_se: &'a Array1<f64>,
-        bounds: ResponseBounds,
+    /// The image of the response index interval `u ± z·SD(u)` under the
+    /// supplied monotone response map of `u`.
+    TransformIndex {
+        index: &'a ResponseIndex,
+        response_map: &'a (dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError> + 'a),
     },
     /// The response equals the linear predictor (identity link); the response
     /// bounds are exactly the η bounds.
@@ -177,48 +287,27 @@ pub(crate) enum MeanBoundMethod<'a> {
 pub(crate) fn mean_bounds(
     eta_lower: &Array1<f64>,
     eta_upper: &Array1<f64>,
-    mean: &Array1<f64>,
     z: f64,
     method: MeanBoundMethod<'_>,
 ) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
     match method {
         MeanBoundMethod::TransformEta {
-            bounds,
+            domain,
             response_map,
-        } => transform_eta_interval(eta_lower, eta_upper, bounds, response_map),
-        MeanBoundMethod::Delta { mean_se, bounds } => {
-            Ok(delta_mean_interval(mean, mean_se, z, bounds))
+        } => transform_eta_interval(eta_lower, eta_upper, domain, response_map),
+        MeanBoundMethod::TransformIndex {
+            index,
+            response_map,
+        } => {
+            let (index_lower, index_upper) = symmetric_interval(&index.index, &index.index_se, z);
+            transform_eta_interval(
+                &index_lower,
+                &index_upper,
+                EtaDomain::Unrestricted,
+                response_map,
+            )
         }
         MeanBoundMethod::IdentityEta => Ok((eta_lower.clone(), eta_upper.clone())),
-    }
-}
-
-/// How the η-scale confidence interval is produced for a predictor.
-///
-/// Most families form the central interval `η ± z·SE(η)`. Threshold-scale
-/// families (binomial location-scale) have an η predictor whose interval is not
-/// directly meaningful on the response scale, so they collapse the η interval
-/// onto the point predictor and carry all uncertainty through the delta-method
-/// response interval instead.
-pub(crate) enum EtaInterval {
-    /// Central interval `η ± z·SE(η)`.
-    Symmetric,
-    /// η interval collapsed to the point predictor (`η_lower = η_upper = η`);
-    /// response uncertainty is carried entirely by the mean-bound method.
-    Collapsed,
-}
-
-impl EtaInterval {
-    fn endpoints(
-        &self,
-        eta: &Array1<f64>,
-        eta_se: &Array1<f64>,
-        z: f64,
-    ) -> (Array1<f64>, Array1<f64>) {
-        match self {
-            EtaInterval::Symmetric => symmetric_interval(eta, eta_se, z),
-            EtaInterval::Collapsed => (eta.clone(), eta.clone()),
-        }
     }
 }
 
@@ -295,9 +384,9 @@ pub(crate) fn symmetric_predictive_band(
 /// This is the shared tail every `predict_full_uncertainty` impl used to inline:
 /// validate the confidence level, form the η interval with the multiplier of
 /// `reference`, map it onto the response scale via `method`, optionally attach
-/// an observation interval, and populate the result struct. Predictors supply only the family-specific quantities
-/// (`eta`, `mean`, the two standard errors) plus the policy choices
-/// (`eta_interval`, `method`); the engine owns everything else so interval
+/// an observation interval, and populate the result struct. Predictors supply
+/// only the family-specific quantities (`eta`, `mean`, the two standard errors)
+/// plus the policy choice `method`; the engine owns everything else so interval
 /// construction cannot drift between families.
 pub(crate) fn assemble_uncertainty_result(
     confidence_level: f64,
@@ -306,14 +395,13 @@ pub(crate) fn assemble_uncertainty_result(
     mean: Array1<f64>,
     eta_standard_error: Array1<f64>,
     mean_standard_error: Array1<f64>,
-    eta_interval: EtaInterval,
     method: MeanBoundMethod<'_>,
     observation: Option<ObservationInterval<'_>>,
     provenance: UncertaintyProvenance,
 ) -> Result<PredictUncertaintyResult, EstimationError> {
     let z = reference.central_multiplier(confidence_level)?;
-    let (eta_lower, eta_upper) = eta_interval.endpoints(&eta, &eta_standard_error, z);
-    let (mean_lower, mean_upper) = mean_bounds(&eta_lower, &eta_upper, &mean, z, method)?;
+    let (eta_lower, eta_upper) = symmetric_interval(&eta, &eta_standard_error, z);
+    let (mean_lower, mean_upper) = mean_bounds(&eta_lower, &eta_upper, z, method)?;
     let (observation_lower, observation_upper) = match observation {
         // A skew-aware predictor (dispersion location-scale) supplies its
         // equal-tailed band directly; use it verbatim (already support-clamped).
@@ -346,21 +434,19 @@ pub(crate) fn assemble_uncertainty_result(
 /// `predict_posterior_mean` impl used to inline: validate the level, form the η
 /// interval, map it onto the response scale via `method`, and set
 /// `mean_lower` / `mean_upper`. When no level is supplied the bounds are left
-/// `None`. `eta` / `eta_se` are taken from `result`, so a predictor whose η
-/// interval is not meaningful supplies `EtaInterval::Collapsed`.
+/// `None`. `eta` / `eta_se` are taken from `result`.
 pub(crate) fn assemble_posterior_mean_bounds(
     result: &mut PredictPosteriorMeanResult,
     confidence_level: Option<f64>,
     reference: IntervalReference,
-    eta_interval: EtaInterval,
     method: MeanBoundMethod<'_>,
 ) -> Result<(), EstimationError> {
     let Some(level) = confidence_level else {
         return Ok(());
     };
     let z = reference.central_multiplier(level)?;
-    let (eta_lower, eta_upper) = eta_interval.endpoints(&result.eta, &result.eta_standard_error, z);
-    let (mean_lower, mean_upper) = mean_bounds(&eta_lower, &eta_upper, &result.mean, z, method)?;
+    let (eta_lower, eta_upper) = symmetric_interval(&result.eta, &result.eta_standard_error, z);
+    let (mean_lower, mean_upper) = mean_bounds(&eta_lower, &eta_upper, z, method)?;
     result.mean_lower = Some(mean_lower);
     result.mean_upper = Some(mean_upper);
     Ok(())
@@ -373,9 +459,11 @@ pub(crate) fn assemble_posterior_mean_bounds(
 /// in the two passes (notably the threshold-scale probability families, whose
 /// posterior mean is a bivariate Gauss–Hermite integral rather than the plug-in
 /// delta evaluation used for full uncertainty). The pass is threaded into
-/// [`PredictionTransform::linear_state`] and
-/// [`PredictionTransform::response_jacobian_rows`] so the family can branch its
-/// numerics and its interval policy while the assembly stays unified.
+/// [`PredictionTransform::linear_state`] so the family can branch its numerics
+/// while the assembly stays unified. The interval policy does not depend on the
+/// pass: every mean band is the image of an index interval under the family's
+/// monotone response map (#3140), so
+/// [`PredictionTransform::response_jacobian_rows`] takes no pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PredictPass {
     /// `predict_full_uncertainty`: η/μ point + η- and mean-scale SEs, with the
@@ -391,26 +479,27 @@ pub enum PredictPass {
 /// inline directly into `assemble_uncertainty_result` / `mean_bounds`; a
 /// [`PredictionTransform`] now declares it once and the generic drivers thread
 /// it through both the full-uncertainty and posterior-mean pipelines.
+///
+/// Every policy forms the band as the image of an index interval under the
+/// monotone [`PredictionTransform::response`], so it lies in the response
+/// support by construction and nothing clamps it (#3140).
 pub enum ResponseInterval {
-    /// Transform the η endpoints `η ± z·SE(η)` through the monotone
-    /// [`PredictionTransform::response`], then clamp to [`PredictionTransform::bounds`].
-    /// Used by families whose response is a smooth inverse-link image of η
-    /// (standard link-wiggle, Bernoulli marginal-slope).
-    TransformEta,
+    /// The image of `η ± z·SE(η)` under the monotone
+    /// [`PredictionTransform::response`], restricted to the map's feasible
+    /// argument set. Used by families whose response is an inverse-link image
+    /// of one linear predictor (standard, link wiggle, Bernoulli
+    /// marginal-slope, binomial and dispersion location-scale, whose `η` is
+    /// the inverse link's argument).
+    TransformEta(EtaDomain),
     /// Identity link: the response equals the linear predictor, so the response
     /// interval is exactly the η interval (Gaussian location-scale, PIT).
     IdentityEta,
-    /// Delta method `μ ± z·SE(μ)` clamped to [`PredictionTransform::bounds`],
-    /// with the η interval collapsed onto the point predictor. Used by
-    /// threshold-scale probability families whose η interval is not directly
-    /// meaningful on the response scale (binomial location-scale, survival
-    /// tail).
-    CollapsedDelta,
-    /// Delta method `μ ± z·SE(μ)` clamped to [`PredictionTransform::bounds`]
-    /// with a symmetric η interval retained. Used by families that report a
-    /// genuine η interval *and* a response-scale delta SE (survival full
-    /// uncertainty).
-    SymmetricDelta,
+    /// The image of the response index interval `u ± z·SD(u)` under the
+    /// monotone [`PredictionTransform::response`] of `u`, with `u` carried in
+    /// [`LinearState::response_index`]. Used by two-block families whose
+    /// response is a map of an index built from both linear predictors
+    /// (survival tail).
+    TransformIndex,
 }
 
 /// The η-scale state a [`PredictionTransform`] produces for one prediction
@@ -420,8 +509,8 @@ pub enum ResponseInterval {
 /// Each predictor computes these via whatever bespoke gradient backend its
 /// parameterisation requires (dense matvec, link-wiggle chain rule, projected
 /// two-block covariance, bivariate GHQ). The generic drivers below consume the
-/// finished arrays and own the *policy* layer — interval construction, support
-/// clamping, and result assembly — so that layer cannot drift between families.
+/// finished arrays and own the *policy* layer — interval construction and
+/// result assembly — so that layer cannot drift between families.
 pub struct LinearState {
     /// Linear predictor η.
     pub eta: Array1<f64>,
@@ -436,6 +525,10 @@ pub struct LinearState {
     /// full-uncertainty driver propagates it into the public result. Point-state
     /// and posterior-mean construction use conditional covariance.
     pub covariance_source: InferenceCovarianceMode,
+    /// The response index and its SD under the same covariance as `eta_se`,
+    /// for a [`ResponseInterval::TransformIndex`] transform; `None` for every
+    /// other policy and whenever no covariance is available.
+    pub response_index: Option<ResponseIndex>,
 }
 
 /// Family-specific supplier for the shared predict pipeline.
@@ -447,20 +540,18 @@ pub struct LinearState {
 ///     predictor, its response image, and the standard errors, computed with
 ///     the predictor's own gradient backend (issue #422 keeps these bespoke;
 ///     they are genuine numerics, not boilerplate);
-///   * [`response`](PredictionTransform::response) — the response map μ = T(η),
-///     used to transform η-interval endpoints onto the response scale;
+///   * [`response`](PredictionTransform::response) — the monotone response
+///     map, whose image of the index interval is the mean band;
 ///   * [`response_jacobian_rows`](PredictionTransform::response_jacobian_rows) —
-///     whether the mean SE supplied by `linear_state` is consumed via the
-///     delta method or is the η SE itself (identity link);
+///     which [`ResponseInterval`] policy maps the index interval onto the
+///     response scale;
 ///   * [`bounds`](PredictionTransform::bounds) — the response-scale support
-///     clamp;
-///   * `response_interval` — which
-///     [`ResponseInterval`] policy maps the η interval onto the response scale;
+///     the symmetric observation band is clamped to;
 ///   * [`observation_noise`](PredictionTransform::observation_noise) — the
 ///     optional response-scale observation-noise σ.
 ///
 /// Everything else — confidence-level validation, η/mean interval construction,
-/// support clamping, observation intervals, and result-struct assembly — lives
+/// observation intervals, and result-struct assembly — lives
 /// in the generic drivers `predict_full_uncertainty_generic` and
 /// `predict_posterior_mean_generic`, so the pipeline is one source of truth.
 pub trait PredictionTransform {
@@ -500,19 +591,21 @@ pub trait PredictionTransform {
         }
     }
 
-    /// Response map μ = T(η), used to transform η-interval endpoints onto the
-    /// response scale through `transform_eta_interval`. It must be monotone in
-    /// `η`, which every inverse link is.
-    fn response(&self, eta: &Array1<f64>) -> Result<Array1<f64>, EstimationError>;
+    /// The monotone response map whose image of the index interval is the
+    /// mean band: `μ = T(η)` for [`ResponseInterval::TransformEta`], and the
+    /// map of the response index `u` for [`ResponseInterval::TransformIndex`].
+    fn response(&self, argument: &Array1<f64>) -> Result<Array1<f64>, EstimationError>;
 
-    /// Which [`ResponseInterval`] policy maps the η interval onto the response
-    /// scale for `pass`. This is the policy mirror of supplying explicit
-    /// response-scale Jacobian rows to the SE backend vs. transforming η
-    /// endpoints; it selects between the `Delta`/`TransformEta`/`IdentityEta`
-    /// arms and the collapsed/symmetric η interval.
-    fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval;
+    /// Which [`ResponseInterval`] policy maps the index interval onto the
+    /// response scale. It is the same on both passes: the band is the image of
+    /// an index interval under [`response`](PredictionTransform::response).
+    /// An error when the transform's link has no recorded feasible argument
+    /// set.
+    fn response_jacobian_rows(&self) -> Result<ResponseInterval, EstimationError>;
 
-    /// Response-scale support `[lo, hi]` clamp.
+    /// Response-scale support `[lo, hi]` the symmetric observation band is
+    /// clamped to. The mean band never consults it: it is an image of the
+    /// response map and lies in the support by construction.
     fn bounds(&self) -> ResponseBounds;
 
     /// The response distribution family. Used by the generic posterior-mean
@@ -587,36 +680,29 @@ pub trait PredictionTransform {
 }
 
 /// Build the `MeanBoundMethod` selected by a transform's [`ResponseInterval`]
-/// policy, borrowing the response closure / mean SE as needed.
-fn mean_bound_method_for<'a, T: PredictionTransform>(
-    transform: &'a T,
+/// policy, borrowing the response closure and the response index as needed.
+fn mean_bound_method_for<'a>(
     policy: &ResponseInterval,
     response_map: &'a (dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError> + 'a),
-    mean_se: &'a Array1<f64>,
-) -> MeanBoundMethod<'a> {
-    match policy {
-        ResponseInterval::TransformEta => MeanBoundMethod::TransformEta {
-            bounds: transform.bounds(),
+    response_index: Option<&'a ResponseIndex>,
+) -> Result<MeanBoundMethod<'a>, EstimationError> {
+    Ok(match policy {
+        ResponseInterval::TransformEta(domain) => MeanBoundMethod::TransformEta {
+            domain: *domain,
             response_map,
         },
         ResponseInterval::IdentityEta => MeanBoundMethod::IdentityEta,
-        ResponseInterval::CollapsedDelta | ResponseInterval::SymmetricDelta => {
-            MeanBoundMethod::Delta {
-                mean_se,
-                bounds: transform.bounds(),
-            }
-        }
-    }
-}
-
-/// The η-interval policy implied by a [`ResponseInterval`].
-fn eta_interval_for(policy: &ResponseInterval) -> EtaInterval {
-    match policy {
-        ResponseInterval::CollapsedDelta => EtaInterval::Collapsed,
-        ResponseInterval::TransformEta
-        | ResponseInterval::IdentityEta
-        | ResponseInterval::SymmetricDelta => EtaInterval::Symmetric,
-    }
+        ResponseInterval::TransformIndex => MeanBoundMethod::TransformIndex {
+            index: response_index.ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "response-scale interval: the transform bands its response index but \
+                     supplied none for this pass"
+                        .to_string(),
+                )
+            })?,
+            response_map,
+        },
+    })
 }
 
 /// Refuse a measure-jet extrapolation variance a generic driver cannot carry.
@@ -682,8 +768,9 @@ pub(crate) fn predict_full_uncertainty_generic<T: PredictionTransform>(
             "full uncertainty requires covariance (mean_se unavailable)".to_string(),
         )
     })?;
-    let policy = transform.response_jacobian_rows(PredictPass::FullUncertainty);
-    let response_map = move |eta: &Array1<f64>| transform.response(eta);
+    let policy = transform.response_jacobian_rows()?;
+    let response_index = state.response_index;
+    let response_map = move |argument: &Array1<f64>| transform.response(argument);
     let reference = IntervalReference::of_fit(fit)?;
     let observation = if options.includeobservation_interval {
         transform.observation_noise(input)?
@@ -751,9 +838,8 @@ pub(crate) fn predict_full_uncertainty_generic<T: PredictionTransform>(
         state.eta,
         state.mean,
         eta_se,
-        mean_se.clone(),
-        eta_interval_for(&policy),
-        mean_bound_method_for(transform, &policy, &response_map, &mean_se),
+        mean_se,
+        mean_bound_method_for(&policy, &response_map, response_index.as_ref())?,
         observation_interval,
         UncertaintyProvenance { covariance_source },
     )
@@ -779,7 +865,7 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
         PredictPass::PosteriorMean,
         InferenceCovarianceMode::Conditional,
     )?;
-    let policy = transform.response_jacobian_rows(PredictPass::PosteriorMean);
+    let policy = transform.response_jacobian_rows()?;
     let has_covariance = state.eta_se.is_some();
     let cond_eta_se = state
         .eta_se
@@ -806,6 +892,7 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
             ));
         }
     };
+    let cond_response_index = state.response_index;
     let mut result = PredictPosteriorMeanResult {
         eta: state.eta,
         eta_standard_error: cond_eta_se.clone(),
@@ -835,8 +922,8 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
     // `Conditional` keeps the posterior pass's own SE. `SmoothingCorrected`
     // re-derives the SEs from the full-uncertainty pass and errors if the fit
     // cannot supply that exact covariance definition.
-    let (eta_se, mean_se) = match options.covariance_mode {
-        InferenceCovarianceMode::Conditional => (cond_eta_se, cond_mean_se),
+    let (eta_se, mean_se, response_index) = match options.covariance_mode {
+        InferenceCovarianceMode::Conditional => (cond_eta_se, cond_mean_se, cond_response_index),
         InferenceCovarianceMode::SmoothingCorrected => {
             let unc = transform.linear_state(
                 input,
@@ -868,7 +955,7 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
                         .to_string(),
                 ));
             }
-            (eta_se, mean_se)
+            (eta_se, mean_se, unc.response_index)
         }
     };
     result.uncertainty_covariance_source = Some(options.covariance_mode);
@@ -880,13 +967,12 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
 
     let reference = IntervalReference::of_fit(fit)?;
     {
-        let response_map = |eta: &Array1<f64>| transform.response(eta);
+        let response_map = |argument: &Array1<f64>| transform.response(argument);
         assemble_posterior_mean_bounds(
             &mut result,
             Some(level),
             reference,
-            eta_interval_for(&policy),
-            mean_bound_method_for(transform, &policy, &response_map, &mean_se),
+            mean_bound_method_for(&policy, &response_map, response_index.as_ref())?,
         )?;
     }
 
@@ -984,7 +1070,6 @@ pub(crate) fn predict_with_uncertainty_generic<T: PredictionTransform>(
         mean_se: state.mean_se,
     })
 }
-
 
 /// What a prediction surface asks for, independent of how it renders the answer.
 pub struct PredictionRequest {
@@ -1098,7 +1183,7 @@ pub fn resolve_prediction_request(
                     EstimationError::InvalidInput(
                         "posterior-mean prediction did not return confidence bounds".to_string(),
                     )
-            })?;
+                })?;
             Ok(PredictionColumns {
                 linear_predictor_plugin: plugin.eta,
                 mean_plugin: plugin.mean,
@@ -1115,14 +1200,13 @@ pub fn resolve_prediction_request(
             })
         }
         // Effectively-linear model + interval: the plug-in equals the posterior
-        // mean, so the delta-method path reports the same point as the plain
+        // mean, so the uncertainty path reports the same point as the plain
         // branch and only adds the band; the point never moves because an
         // interval was requested (#398, #2115).
         (Some(level), false) => {
             let options = PredictUncertaintyOptions {
                 confidence_level: level,
                 covariance_mode: request.covariance_mode,
-                mean_interval_method: crate::MeanIntervalMethod::TransformEta,
                 includeobservation_interval: request.observation_interval,
                 observation_prior_weights: request.observation_prior_weights.clone(),
                 extrapolation_variance: request.extrapolation_variance.clone(),
@@ -1231,21 +1315,28 @@ mod parity_tests {
         }
     }
 
-    /// StandardPredictor (link-wiggle) / SurvivalPredictor shape:
-    /// symmetric η interval, delta-method response interval.
+    /// SurvivalPredictor shape: a symmetric η interval, and the response band
+    /// is the image of the response-index interval `u ± z·SD(u)` under the
+    /// decreasing survival tail, so its endpoints swap and it lies in `[0, 1]`.
     #[test]
-    fn delta_symmetric_matches_inline() {
+    fn transform_index_decreasing_map_matches_inline() {
         let eta = array![0.2, -0.5, 1.3];
-        let mean = array![0.55, 0.38, 0.78];
         let eta_se = array![0.1, 0.2, 0.15];
+        let index = ResponseIndex {
+            index: array![-1.0, 0.4, 2.5],
+            index_se: array![0.3, 0.5, 0.2],
+        };
+        let tail = |q: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+            Ok(q.mapv(|x| 1.0 / (1.0 + x.exp())))
+        };
+        let mean = tail(&index.index).unwrap();
         let mean_se = array![0.04, 0.06, 0.05];
         let z = z95();
 
-        // Hand-built reference (the old inline path).
         let ref_eta_lower = &eta - &eta_se.mapv(|s| z * s);
         let ref_eta_upper = &eta + &eta_se.mapv(|s| z * s);
-        let ref_mean_lower = (&mean - &mean_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0));
-        let ref_mean_upper = (&mean + &mean_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0));
+        let ref_mean_lower = tail(&(&index.index + &index.index_se.mapv(|s| z * s))).unwrap();
+        let ref_mean_upper = tail(&(&index.index - &index.index_se.mapv(|s| z * s))).unwrap();
 
         let out = assemble_uncertainty_result(
             LEVEL,
@@ -1254,10 +1345,9 @@ mod parity_tests {
             mean.clone(),
             eta_se.clone(),
             mean_se.clone(),
-            EtaInterval::Symmetric,
-            MeanBoundMethod::Delta {
-                mean_se: &mean_se,
-                bounds: ResponseBounds::UNIT_PROBABILITY,
+            MeanBoundMethod::TransformIndex {
+                index: &index,
+                response_map: &tail,
             },
             None,
             UncertaintyProvenance {
@@ -1274,6 +1364,10 @@ mod parity_tests {
         assert_close(&out.eta_upper, &ref_eta_upper, "eta upper");
         assert_close(&out.mean_lower, &ref_mean_lower, "mean lower");
         assert_close(&out.mean_upper, &ref_mean_upper, "mean upper");
+        for i in 0..mean.len() {
+            assert!(0.0 < out.mean_lower[i] && out.mean_lower[i] <= mean[i]);
+            assert!(mean[i] <= out.mean_upper[i] && out.mean_upper[i] < 1.0);
+        }
         assert!(out.observation_lower.is_none());
         assert!(out.observation_upper.is_none());
         assert_eq!(out.covariance_source, InferenceCovarianceMode::Conditional);
@@ -1306,9 +1400,8 @@ mod parity_tests {
             mean.clone(),
             eta_se.clone(),
             mean_se.clone(),
-            EtaInterval::Symmetric,
             MeanBoundMethod::TransformEta {
-                bounds: ResponseBounds::UNIT_PROBABILITY,
+                domain: EtaDomain::Unrestricted,
                 response_map: &logistic,
             },
             None,
@@ -1330,13 +1423,9 @@ mod parity_tests {
         let eta_upper = array![800.0_f64];
         let exponential =
             |eta: &Array1<f64>| -> Result<Array1<f64>, EstimationError> { Ok(eta.mapv(f64::exp)) };
-        let error = transform_eta_interval(
-            &eta_lower,
-            &eta_upper,
-            ResponseBounds::UNBOUNDED,
-            exponential,
-        )
-        .expect_err("a non-finite transformed interval must not switch estimands");
+        let error =
+            transform_eta_interval(&eta_lower, &eta_upper, EtaDomain::Unrestricted, exponential)
+                .expect_err("a non-finite transformed interval must not switch estimands");
         assert!(
             error.to_string().contains("non-finite value at row 0"),
             "unexpected error: {error}"
@@ -1374,7 +1463,6 @@ mod parity_tests {
             mean.clone(),
             eta_se.clone(),
             eta_se.clone(),
-            EtaInterval::Symmetric,
             MeanBoundMethod::IdentityEta,
             Some(ObservationInterval::Symmetric {
                 noise_sd: &sigma,
@@ -1405,43 +1493,109 @@ mod parity_tests {
         );
     }
 
-    /// BinomialLocationScalePredictor shape: the threshold-scale η interval is
-    /// collapsed onto the point predictor, so the η bounds equal η exactly and
-    /// the response interval is the delta method on `[0, 1]`.
+    /// A saturated logistic band is the image of the η interval: it lies in
+    /// `[0, 1]` because the logistic does, with no clamp in the path, where a
+    /// delta band `μ ± z·SE(μ)` would leave the support.
     #[test]
-    fn delta_collapsed_eta_matches_inline() {
-        let eta = array![-0.3, 0.7, 0.1];
-        let mean = array![0.42, 0.66, 0.51];
-        let mean_se = array![0.05, 0.08, 0.04];
+    fn saturated_logistic_band_is_an_image_inside_the_support() {
+        let eta = array![6.0, -7.5];
+        let eta_se = array![3.0, 4.0];
+        let logistic = |e: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+            Ok(e.mapv(|x| 1.0 / (1.0 + (-x).exp())))
+        };
         let z = z95();
-
-        let ref_mean_lower = (&mean - &mean_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0));
-        let ref_mean_upper = (&mean + &mean_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0));
-
-        let out = assemble_uncertainty_result(
-            LEVEL,
-            IntervalReference::Normal,
-            eta.clone(),
-            mean.clone(),
-            mean_se.clone(),
-            mean_se.clone(),
-            EtaInterval::Collapsed,
-            MeanBoundMethod::Delta {
-                mean_se: &mean_se,
-                bounds: ResponseBounds::UNIT_PROBABILITY,
-            },
-            None,
-            UncertaintyProvenance {
-                covariance_source: InferenceCovarianceMode::Conditional,
+        let (eta_lower, eta_upper) = symmetric_interval(&eta, &eta_se, z);
+        let (lower, upper) = mean_bounds(
+            &eta_lower,
+            &eta_upper,
+            z,
+            MeanBoundMethod::TransformEta {
+                domain: EtaDomain::Unrestricted,
+                response_map: &logistic,
             },
         )
-        .expect("engine assembly");
+        .expect("image band");
+        assert_close(&lower, &logistic(&eta_lower).unwrap(), "lower is the image");
+        assert_close(&upper, &logistic(&eta_upper).unwrap(), "upper is the image");
+        for i in 0..eta.len() {
+            assert!(0.0 < lower[i] && lower[i] < upper[i] && upper[i] < 1.0);
+        }
+    }
 
-        // Collapsed η interval: both endpoints equal the point predictor.
-        assert_close(&out.eta_lower, &eta, "eta lower == eta");
-        assert_close(&out.eta_upper, &eta, "eta upper == eta");
-        assert_close(&out.mean_lower, &ref_mean_lower, "mean lower");
-        assert_close(&out.mean_upper, &ref_mean_upper, "mean upper");
+    /// The inverse link's jet refuses a non-positive argument, as the real
+    /// reciprocal-power jets do, so a boundary endpoint must never reach it.
+    fn reciprocal(e: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+        if e.iter().any(|&x| x <= 0.0) {
+            return Err(EstimationError::InvalidInput(
+                "reciprocal evaluated off its half-line".to_string(),
+            ));
+        }
+        Ok(e.mapv(|x| 1.0 / x))
+    }
+
+    /// An inverse-link Gamma η interval that crosses the origin is cut at the
+    /// boundary: the band is the image `[1/u, ∞)` of its feasible part `(0, u]`,
+    /// never a negative mean.
+    #[test]
+    fn half_line_inverse_link_band_crossing_origin_is_unbounded_above() {
+        let domain = EtaDomain::of_spec(&LikelihoodSpec {
+            response: ResponseFamily::Gamma,
+            link: InverseLink::Standard(StandardLink::Inverse),
+        })
+        .expect("inverse link has a boundary limit");
+        assert_eq!(
+            domain,
+            EtaDomain::HalfLine {
+                feasibility: EtaFeasibility::Positive,
+                boundary_mean: f64::INFINITY,
+            }
+        );
+        let (lower, upper) =
+            transform_eta_interval(&array![-0.5, 0.5], &array![2.0, 4.0], domain, reciprocal)
+                .expect("feasible part of each row is non-empty");
+        assert_close(&lower, &array![0.5, 0.25], "lower is 1/u");
+        assert_eq!(upper[0], f64::INFINITY);
+        assert!((upper[1] - 2.0).abs() < 1e-12);
+    }
+
+    /// A log-link probability interval crossing `η = 0` is cut at the boundary,
+    /// where `exp(η)` tends to `1`, so the band stays inside `[0, 1]`.
+    #[test]
+    fn half_line_log_link_probability_band_stops_at_one() {
+        let domain = EtaDomain::of_spec(&LikelihoodSpec {
+            response: ResponseFamily::Binomial,
+            link: InverseLink::Standard(StandardLink::Log),
+        })
+        .expect("log link has a boundary limit");
+        let exp_below_zero = |e: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+            if e.iter().any(|&x| x >= 0.0) {
+                return Err(EstimationError::InvalidInput(
+                    "log-link probability evaluated at η ≥ 0".to_string(),
+                ));
+            }
+            Ok(e.mapv(f64::exp))
+        };
+        let (lower, upper) =
+            transform_eta_interval(&array![-0.5], &array![0.3], domain, exp_below_zero)
+                .expect("the lower endpoint is feasible");
+        assert!((lower[0] - (-0.5_f64).exp()).abs() < 1e-12);
+        assert_eq!(upper[0], 1.0);
+    }
+
+    /// An interval with no feasible part has no feasible point, which is a
+    /// typed error rather than a band.
+    #[test]
+    fn half_line_interval_outside_the_domain_is_a_typed_error() {
+        let domain = EtaDomain::HalfLine {
+            feasibility: EtaFeasibility::Positive,
+            boundary_mean: f64::INFINITY,
+        };
+        let error = transform_eta_interval(&array![-3.0], &array![-1.0], domain, reciprocal)
+            .expect_err("an infeasible interval has no image");
+        assert!(
+            error.to_string().contains("does not meet the feasible set"),
+            "unexpected error: {error}"
+        );
     }
 
     /// Posterior-mean bounds: `None` level leaves bounds unset; a `Some` level
@@ -1474,9 +1628,8 @@ mod parity_tests {
             &mut none_result,
             None,
             IntervalReference::Normal,
-            EtaInterval::Symmetric,
             MeanBoundMethod::TransformEta {
-                bounds: ResponseBounds::UNIT_PROBABILITY,
+                domain: EtaDomain::Unrestricted,
                 response_map: &logistic,
             },
         )
@@ -1507,9 +1660,8 @@ mod parity_tests {
             &mut some_result,
             Some(LEVEL),
             IntervalReference::Normal,
-            EtaInterval::Symmetric,
             MeanBoundMethod::TransformEta {
-                bounds: ResponseBounds::UNIT_PROBABILITY,
+                domain: EtaDomain::Unrestricted,
                 response_map: &logistic,
             },
         )
@@ -1546,9 +1698,8 @@ mod parity_tests {
             mean.clone(),
             eta_se.clone(),
             eta_se.clone(),
-            EtaInterval::Symmetric,
             MeanBoundMethod::TransformEta {
-                bounds: ResponseBounds::UNIT_PROBABILITY,
+                domain: EtaDomain::Unrestricted,
                 response_map: &decreasing,
             },
             None,

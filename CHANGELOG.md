@@ -124,6 +124,21 @@
   only for a slice that holds `-0.0`: a NaN hashes its own bits on both paths, so
   sending NaN slices down the slow path produced the same bytes. Keys are unchanged.
 
+- **Every mean band is the image of an index interval, so it lies in the support
+  without a clamp** (#3140). The delta-method mean band `μ ± z·SE(μ)` and the
+  clamp that pulled it back into the support are deleted, together with
+  `MeanIntervalMethod` and `PredictUncertaintyOptions::mean_interval_method`.
+  Each band is now the image of `η ± z·SE(η)` under the monotone inverse link.
+  For a half-line link (log-binomial, identity/sqrt/inverse links on a positive
+  family) the η interval is cut at the feasible boundary, and that endpoint takes
+  the link's limit there. An inverse link whose η interval reaches 0 therefore
+  reports an unbounded upper mean. Two-block families use their scalar response
+  index. Survival bands are the image of `q0 ± z·SD(q0)` under the survival
+  tail. Binomial location-scale bands are the image of the link argument
+  `wiggle(−η_t·e^{−η_σ})`, and its SE is now reported as `eta_se`. Dispersion
+  location-scale full-uncertainty bands transform the mean-block η the same way
+  as the posterior-mean pass. The reported mean SEs are unchanged.
+
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
   `μ̂ ≤ c₀·a²·(1−1/SNR)·(1−C_κκ)/K`, with the chosen constants `c₀ = 1` and

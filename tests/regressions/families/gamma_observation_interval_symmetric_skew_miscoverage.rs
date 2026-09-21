@@ -28,8 +28,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use gam_predict::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
-    predict_gamwith_uncertainty,
+    InferenceCovarianceMode, PredictUncertaintyOptions, predict_gamwith_uncertainty,
 };
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
@@ -117,7 +116,6 @@ fn gamma_observation_interval_covers_each_tail_not_just_the_total() {
         &PredictUncertaintyOptions {
             confidence_level: 0.95,
             covariance_mode: InferenceCovarianceMode::Conditional,
-            mean_interval_method: MeanIntervalMethod::Delta,
             includeobservation_interval: true,
             ..PredictUncertaintyOptions::default()
         },

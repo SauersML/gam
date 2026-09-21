@@ -28,7 +28,7 @@ use gam::families::multinomial::{
 use gam::families::survival::predict::SurvivalPredictResult;
 use gam::terms::inference::smooth_test::SmoothTestResult;
 use gam_predict::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictPosteriorMeanResult,
+    InferenceCovarianceMode, PredictPosteriorMeanResult,
     PredictUncertaintyResult,
 };
 use gam_test_support::calibration::{
@@ -655,7 +655,7 @@ fn multinomial_smooth_significance_fields_are_all_registered() {
     assert_registry_covers_fields(&audits, &registry);
 }
 
-/// The covariance/interval MODES a caller can select are each backed by a
+/// The covariance MODES a caller can select are each backed by a
 /// registered band target — the "credible bands (conditional and smoothing-
 /// corrected)" completeness requirement in #1891. The `match` is exhaustive (no
 /// wildcard), so a new mode variant must be classified here.
@@ -675,20 +675,6 @@ fn covariance_and_interval_modes_map_to_registered_bands() {
         assert!(
             names.contains(target),
             "covariance mode {mode:?} maps to unregistered band `{target}`"
-        );
-    }
-
-    for method in [MeanIntervalMethod::TransformEta, MeanIntervalMethod::Delta] {
-        // Both mean-scale interval constructions feed the same registered mean
-        // band; the exhaustive match forces a new method to be classified.
-        let target = match method {
-            MeanIntervalMethod::TransformEta | MeanIntervalMethod::Delta => {
-                "mean_credible_band_conditional"
-            }
-        };
-        assert!(
-            names.contains(target),
-            "interval method {method:?} unmapped"
         );
     }
 }

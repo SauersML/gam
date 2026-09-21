@@ -2908,7 +2908,6 @@ pub(crate) fn run_predict_survival(
             &PredictUncertaintyOptions {
                 confidence_level: args.level,
                 covariance_mode,
-                mean_interval_method: MeanIntervalMethod::TransformEta,
                 includeobservation_interval: false,
                 ..PredictUncertaintyOptions::default()
             },
