@@ -23,6 +23,22 @@
   relative error `n*eps` it inherits. An axis below those floors keeps unit scale; a chart
   axis that has genuinely collapsed stays the collapsed-chart refusal's to adjudicate
   (gam#2691).
+- **A latent survival fit with an armed Jeffreys term refused every chart-axis trial point**
+  (gam#4510). Once the latent baseline chart was searched with its exact outer Hessian
+  (gam#3321), the Jeffreys curvature asked the latent families for the coefficient motion of
+  their chart-axis information derivatives and got the trait's "unavailable": both latent
+  families published `∂_ψH`, `D_β∂_ψH` and `∂²_{ψψ}H` but nothing one derivative deeper. The
+  curvature refuses an incomplete derivative contract rather than dropping a term, so the fit
+  stopped at outer startup with `active Jeffreys psi pair (0,0) requires exact third
+  information derivatives` and no model came back. The chart moves only the additive time
+  offsets, so each missing object is the pair's own row kernel with one more seed:
+  `D_βH_ab[e_γ] = X_iᵀ(−∇⁵ℓ_i[d_a, d_b, e_γ] − ∇⁴ℓ_i[d_ab, e_γ])X_i`, and the completion's
+  `∂_θD²_βH[v, e_γ] = X_iᵀ(−∇⁵ℓ_i[d_θ, X_i v, e_γ])X_i`, with the background-scale axis `ln m`
+  read through `φ = ∂ℓ/∂ln m`. Both latent families now serve them from the fifth-order row
+  lifts gam#2677 already built, one lift per touched primary rather than one row pass per
+  coefficient axis. A chart pair that is exact at second order is now exact in its
+  coefficient motion too, so no axis of a Weibull, Gompertz or Makeham baseline chart leaves
+  the curvature with a partial contract.
 
 - **The scheduled p-value calibration run can fail** (gam#3722).
   `.github/workflows/pvalue-calibration.yml` gave the calibration harness a runner, but

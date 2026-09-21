@@ -519,6 +519,62 @@ impl CustomFamily for LatentSurvivalFamily {
             .map(Some)
     }
 
+    /// `{D_β ∂²_{ψ_iψ_j}H[e_a]}` over every coefficient axis (#4510): the
+    /// coefficient motion of [`Self::exact_newton_joint_psisecond_order_terms`]'s
+    /// information derivative. An armed Jeffreys curvature over the chart axes
+    /// differentiates the term it prices, so the pair that supplies `∂²_{ψψ}H` also
+    /// supplies that matrix's β-derivative; a chart whose pairs are exact has no
+    /// axis on which this is unavailable.
+    fn exact_newton_joint_psisecond_order_hessian_directional_derivative_all_beta_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "exact_newton_joint_psisecond_order_hessian_directional_derivative_all_beta_axes: {} parameter-block specs for {} block states",
+                specs.len(),
+                block_states.len()
+            ));
+        }
+        let (rows, axis_i) = self.baseline_theta_family_axis(hyper_layout, psi_i)?;
+        let (_, axis_j) = self.baseline_theta_family_axis(hyper_layout, psi_j)?;
+        self.baseline_theta_psisecond_order_hessian_axes_dense(block_states, &rows, axis_i, axis_j)
+            .map(Some)
+    }
+
+    /// `{∂_ψ D²_βH[v, e_a]}` over every coefficient axis (#4510): the mixed third
+    /// information derivative the ψ-moving Jeffreys completion reads, on the same
+    /// chart axis whose first-order terms
+    /// [`Self::exact_newton_joint_psi_terms`] serves.
+    fn exact_newton_joint_psihessian_second_directional_derivative_all_beta_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "exact_newton_joint_psihessian_second_directional_derivative_all_beta_axes: {} parameter-block specs for {} block states",
+                specs.len(),
+                block_states.len()
+            ));
+        }
+        let (rows, axis) = self.baseline_theta_family_axis(hyper_layout, psi_index)?;
+        self.baseline_theta_psihessian_second_directional_axes_dense(
+            block_states,
+            &rows,
+            axis,
+            d_beta_flat,
+        )
+        .map(Some)
+    }
+
     fn requires_joint_outer_hyper_path(&self) -> bool {
         true
     }
@@ -970,6 +1026,62 @@ impl CustomFamily for LatentBinaryFamily {
         let (_, axis_j) = self.baseline_theta_family_axis(hyper_layout, psi_index_j)?;
         self.baseline_theta_psisecond_order_terms_dense(block_states, &rows, axis_i, axis_j)
             .map(Some)
+    }
+
+    /// `{D_β ∂²_{ψ_iψ_j}H[e_a]}` over every coefficient axis (#4510): the
+    /// coefficient motion of [`Self::exact_newton_joint_psisecond_order_terms`]'s
+    /// information derivative. An armed Jeffreys curvature over the chart axes
+    /// differentiates the term it prices, so the pair that supplies `∂²_{ψψ}H` also
+    /// supplies that matrix's β-derivative; a chart whose pairs are exact has no
+    /// axis on which this is unavailable.
+    fn exact_newton_joint_psisecond_order_hessian_directional_derivative_all_beta_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "exact_newton_joint_psisecond_order_hessian_directional_derivative_all_beta_axes: {} parameter-block specs for {} block states",
+                specs.len(),
+                block_states.len()
+            ));
+        }
+        let (rows, axis_i) = self.baseline_theta_family_axis(hyper_layout, psi_i)?;
+        let (_, axis_j) = self.baseline_theta_family_axis(hyper_layout, psi_j)?;
+        self.baseline_theta_psisecond_order_hessian_axes_dense(block_states, &rows, axis_i, axis_j)
+            .map(Some)
+    }
+
+    /// `{∂_ψ D²_βH[v, e_a]}` over every coefficient axis (#4510): the mixed third
+    /// information derivative the ψ-moving Jeffreys completion reads, on the same
+    /// chart axis whose first-order terms
+    /// [`Self::exact_newton_joint_psi_terms`] serves.
+    fn exact_newton_joint_psihessian_second_directional_derivative_all_beta_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "exact_newton_joint_psihessian_second_directional_derivative_all_beta_axes: {} parameter-block specs for {} block states",
+                specs.len(),
+                block_states.len()
+            ));
+        }
+        let (rows, axis) = self.baseline_theta_family_axis(hyper_layout, psi_index)?;
+        self.baseline_theta_psihessian_second_directional_axes_dense(
+            block_states,
+            &rows,
+            axis,
+            d_beta_flat,
+        )
+        .map(Some)
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {
