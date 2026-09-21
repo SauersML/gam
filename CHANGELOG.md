@@ -350,6 +350,17 @@
   column. The latent-window survival and event-probability tables used to publish their
   bounds with no `std_error` at all and now carry it. A band is one `ResponseBand` (SD and
   both bounds), so a partial band is an internal error instead of a smaller table.
+- **`gam predict` selects its coefficient covariance through the library** (gam#3749).
+  The CLI kept its own copy of `gam-predict`'s covariance-source selection, and the copy
+  had drifted. It factored a saved penalized Hessian without the coefficient-gauge lift
+  (#1561), so a gauged fit got a covariance on its active coordinates. It honoured only
+  the expectile covariance decline, so a fit that withheld its covariance (#2718, #2985)
+  still produced bands. It also skipped the dimension checks. `gam predict` now calls
+  `UncertaintyCovarianceSource::select_uncertainty_backend`, the same selection the
+  library and Python use. In that selection, a fit whose constrained posterior moments
+  were declined is refused in both modes, including when a dense `Vp` was persisted. A
+  saved Hessian whose precision cannot be built reports why, instead of saying that no
+  covariance exists.
 
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry

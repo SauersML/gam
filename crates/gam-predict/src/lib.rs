@@ -335,7 +335,10 @@ fn conditional_prediction_backend<'a>(
                 .map_err(EstimationError::InvalidInput)?,
             None => None,
         };
-        match PredictionCovarianceBackend::from_factorized_hessian_scaled_with_correction(
+        // A usable saved Hessian whose precision backend cannot be built is a
+        // fault of the precision the fit shipped, not an absent source: surface
+        // why, rather than report that no covariance or Hessian exists.
+        return PredictionCovarianceBackend::from_factorized_hessian_scaled_with_correction(
             SymmetricMatrix::Dense(hessian.clone()),
             scale,
             constrained_correction,
@@ -343,14 +346,13 @@ fn conditional_prediction_backend<'a>(
         .and_then(|backend| match gauge_lift {
             Some(lift) => backend.with_gauge_lift(lift),
             None => Ok(backend),
-        }) {
-            Ok(backend) => return Ok(Some(backend)),
-            Err(err) => {
-                log::debug!(
-                    "{label}: failed to build factorized prediction precision backend: {err}"
-                );
-            }
-        }
+        })
+        .map(Some)
+        .map_err(|err| {
+            EstimationError::InvalidInput(format!(
+                "{label}: failed to build the saved penalized-Hessian precision: {err}"
+            ))
+        });
     }
     Ok(None)
 }
@@ -362,6 +364,10 @@ fn selected_uncertainty_backend<'a>(
     label: &str,
 ) -> Result<(PredictionCovarianceBackend<'a>, InferenceCovarianceMode), EstimationError> {
     refuse_declined_covariance(fit, label)?;
+    // A declined posterior moment refuses both modes: the conditional and the
+    // factorized corrected sources already refused it, and a persisted dense
+    // `Vp` is no more the truncated law's covariance than `Vb` is.
+    fit.require_posterior_mean(label)?;
     match requested_mode {
         InferenceCovarianceMode::Conditional => {
             conditional_prediction_backend(fit, expected_dim, label)?
@@ -5070,6 +5076,64 @@ mod tests {
             error.to_string().contains("does not match"),
             "the refusal names the mismatch: {error}"
         );
+    }
+
+    /// gam#3749: a fit whose constrained posterior moments were declined stores
+    /// its optimizer mode, not a posterior mean, and a persisted dense `Vp` is
+    /// no more that truncated law's covariance than `Vb` is. Every source —
+    /// the dense corrected covariance included — refuses it, in both modes.
+    #[test]
+    fn a_declined_posterior_moment_refuses_every_covariance_source_3749() {
+        use gam_solve::constrained_posterior::{
+            ConePosteriorMomentDecline, ConePropernessEvidence, ConstrainedPosteriorGeometry,
+        };
+        let mut fit = smoothing_corrected_half_normal_fit(4.0);
+        let (control, source) = selected_uncertainty_backend(
+            &fit,
+            1,
+            InferenceCovarianceMode::SmoothingCorrected,
+            "moment control",
+        )
+        .expect("a certified constrained fit serves its dense corrected covariance");
+        assert_eq!(
+            (control.nrows(), source),
+            (1, InferenceCovarianceMode::SmoothingCorrected)
+        );
+        let geometry = fit.geometry.as_mut().expect("fit geometry");
+        let constraints = geometry
+            .constrained_posterior
+            .as_ref()
+            .expect("constrained geometry")
+            .constraints
+            .clone();
+        geometry.constrained_posterior = Some(ConstrainedPosteriorGeometry::with_decline(
+            constraints,
+            array![0.0],
+            ConePosteriorMomentDecline {
+                ambient_precision_failure: "the pinned ambient precision".to_string(),
+                properness: ConePropernessEvidence::CertificationFailed {
+                    reason: "the pinned certificate".to_string(),
+                },
+                active_rows: Vec::new(),
+                boundary_approximation_refusal: None,
+            },
+        ));
+        assert!(fit.beta_covariance_corrected().is_some());
+        for mode in [
+            InferenceCovarianceMode::Conditional,
+            InferenceCovarianceMode::SmoothingCorrected,
+        ] {
+            let message = expect_estimation_error(
+                selected_uncertainty_backend(&fit, 1, mode, "declined moment interval"),
+                "a declined posterior moment must not serve an interval",
+            )
+            .to_string();
+            assert!(
+                message.contains("declined moment interval")
+                    && message.contains("requires posterior-mean coefficients"),
+                "the refusal names the posterior-moment decline ({mode:?}): {message}"
+            );
+        }
     }
 
     /// gam#2985: a withheld fit's posterior-mean point is still the posterior
