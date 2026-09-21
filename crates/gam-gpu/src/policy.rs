@@ -61,24 +61,12 @@ impl GpuDispatchPolicy {
     /// activates when the GPU factorization path is already chosen.
     pub const REFINEMENT_MIN_P: usize = 64;
 
-    /// Maximum number of fp32-correction steps per solve: a COST budget, not an
-    /// accuracy guarantee.
-    ///
-    /// With a fixed fp32 factor, iterative refinement contracts the error
-    /// linearly — after `k` corrections it is ≈ (κ(A)·u_f32)^{k+1} relative,
-    /// u_f32 ≈ 6 × 10⁻⁸ — so reaching the fp64 band κ(A)·u_f64 within 3
-    /// corrections needs κ(A)³ ≲ u_f64 / u_f32⁴, i.e. κ(A) ≲ 2 × 10⁴. Accuracy
-    /// is decided by the solver's residual certificate
-    /// (`‖b − A·x‖ ≤ γ_{p+1}·(‖A‖_F‖x‖ + ‖b‖)`), not by this count: when the
-    /// budget ends above that band the fp32 path reports failure and the solve
-    /// is done by fp64 POTRF.
-    pub const REFINEMENT_MAX_STEPS: usize = 3;
-
     /// Return `true` when the problem is large enough that attempting fp32
     /// factorization + iterative refinement can be profitable (`p ≥
     /// REFINEMENT_MIN_P`: below it the fp64 residual GEMV is not amortised by
     /// the fp32 POTRF savings). The caller still factors in fp64 when the fp32
-    /// POTRF fails or the refined residual does not certify.
+    /// POTRF fails or the refined residual does not certify within
+    /// `crate::solver::refinement_step_budget`.
     #[inline]
     pub const fn iterative_refinement_should_attempt(p: usize) -> bool {
         p >= Self::REFINEMENT_MIN_P

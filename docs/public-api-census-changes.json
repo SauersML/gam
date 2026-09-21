@@ -5085,5 +5085,15 @@
     },
     "reason": "#3138: the Wahba pseudo-spline sphere kernel (kernel=pseudo|mgcv|sos|wahba_pseudo silently ran the harmonic construction) is deleted with its closed forms, derivative chain, GPU kind and coefficient table; spectral Duchon landmarks now come from the engine's deterministic center design, so the R-Mersenne-Twister uniform subsample (select_r_uniform_subsample_centers) is gone. Breaking change, no shim.",
     "evidence": "No caller of any removed function remains in the tree (git grep). The removed spellings are refused with an error naming kernel=sobolev / kernel=harmonic: gam-terms lib, manifolds sphere_methods_parse_and_removed_method_spellings and quality sphere_removed_method_aliases_are_refused pass."
+  },
+  {
+    "base": "ab473b6224779385764ead6828d090563953995f",
+    "removed": {
+      "crates/gam-gpu/src/solver.rs::cholesky_logdet": 1,
+      "crates/gam-gpu/src/solver.rs::cholesky_solve_gpu": 1,
+      "crates/gam-gpu/src/solver.rs::iterative_refinement_cholesky_solve": 1
+    },
+    "reason": "#3547: the fp32+refinement Cholesky is solution-only and returns Ok only for a residual inside its rounding band. cholesky_solve_gpu (callers: three tests) and the need_logdet flag of iterative_refinement_cholesky_solve paid an fp64 POTRF after the fp32 one for a logdet, strictly more work than the fp64 solve; iterative_refinement_cholesky_solve is folded into cholesky_solve_only_gpu, and cuda::cholesky_logdet, used only by that logdet path, goes with them. REFINEMENT_MAX_STEPS (3) was a fixed correction cap justified by a quadratic rate that fixed-factor refinement does not have; refinement_step_budget(p) = (p + 6)/12 derives the cap from the fp64 solve's cost, and refinement_verdict refuses once the measured linear contraction predicts the band past it.",
+    "evidence": "At base d7fe081e52 public_api_census.py reports exactly these three removals. git grep -w finds none of the three names in the head tree; the three GPU tests call cholesky_solve_only_gpu."
   }
 ]
