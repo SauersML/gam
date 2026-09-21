@@ -801,7 +801,8 @@ class Model:
           (``"empty_coefficient_block"``, ``"degenerate_reference"``,
           ``"full_refit_failed"``, ``"null_fit_not_converged"``,
           ``"null_fit_unsupported"``,
-          ``"null_log_likelihood_not_finite"``, ``"tail_not_computable"``)
+          ``"null_log_likelihood_not_finite"``, ``"tail_not_computable"``,
+          ``"selection_refused"``)
           with ``unavailable_message`` saying what happened; every inference
           field of such a row is ``None``.
 
