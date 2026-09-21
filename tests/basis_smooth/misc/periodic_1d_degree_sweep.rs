@@ -1,25 +1,25 @@
 //! Periodic 1D B-spline with non-default degree. Default is cubic
-//! (degree=3); verify lower (linear=1, quadratic=2) and higher
-//! (quintic=5) all fit, and that each recovers the truth to within its own
-//! Bayesian band: the across-the-function coverage statistic of the fit's
-//! `Vb` against the known truth must not exceed its derived bound (see
-//! [`across_function_coverage`]). Every degree here has k = degree + 10 ≥ 11
-//! basis functions on 200 distinct points, so every case is well-posed and a
-//! refusal is a failure.
+//! (degree=3); lower (linear=1, quadratic=2) and higher (quintic=5) degrees are
+//! all well-posed here (k = degree + 10 on 200 distinct points), so each must
+//! fit and is scored against the known truth by the across-the-function
+//! coverage statistic of its own posterior.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
+use gam::test_support::calibration::{AcrossFunctionCoverage, audit_across_function_coverage};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use gam_math::probability::chi_square_quantile;
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
 
 const TAU: f64 = std::f64::consts::TAU;
+
+/// Family-wise upper-tail size of the sweep's coverage gates.
+const FAMILY_ALPHA: f64 = 0.01;
 
 fn make_dataset() -> gam::data::EncodedDataset {
     let mut rng = StdRng::seed_from_u64(7);
@@ -40,54 +40,7 @@ fn make_dataset() -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
-/// Family-wise significance level of this test's coverage gates, split
-/// Bonferroni-style over the cases the test sweeps.
-const FAMILY_ALPHA: f64 = 0.01;
-
-/// Across-the-function coverage statistic of the fit's Bayesian band
-/// (Nychka 1988; Marra & Wood 2012), with its derived upper bound.
-///
-/// `x_probe` is the probe design, `cov` the fit's conditional Bayesian
-/// coefficient covariance `Vb` (`fit.beta_covariance()`) and `err` the
-/// errors `f̂(x_i) − f(x_i)` against the known truth. With `C = X_p Vb X_pᵀ`,
-/// `s_i = √C_ii` and correlation `R = D⁻¹CD⁻¹`, the statistic is
-/// `Q = (1/P) Σ e_i²/s_i²`. Under the model behind the band, `e ~ N(0, C)`, so
-/// `E[Q] = 1` and `Var[Q] = 2·tr(R²)/P²`. Smoothing bias adds to `e` while
-/// over-smoothing shrinks `s`, so a fit that loses signal drives `Q ≫ 1`.
-/// The returned bound is the `1 − alpha` quantile of the moment-matched
-/// scaled `χ²` (Satterthwaite): `Q ≈ g·χ²_h` with `g = tr(R²)/P²`, `h = 1/g`.
-fn across_function_coverage(
-    x_probe: &Array2<f64>,
-    cov: &Array2<f64>,
-    err: &[f64],
-    alpha: f64,
-) -> Result<(f64, f64), String> {
-    let c = x_probe.dot(cov).dot(&x_probe.t());
-    let p = err.len();
-    let s: Vec<f64> = (0..p).map(|i| c[[i, i]].sqrt()).collect();
-    if let Some(i) = s.iter().position(|v| !(v.is_finite() && *v > 0.0)) {
-        return Err(format!("posterior SE at probe {i} is {}", s[i]));
-    }
-    let q = err
-        .iter()
-        .zip(s.iter())
-        .map(|(e, si)| (e / si).powi(2))
-        .sum::<f64>()
-        / p as f64;
-    let mut tr_r2 = 0.0;
-    for i in 0..p {
-        for j in 0..p {
-            let r = c[[i, j]] / (s[i] * s[j]);
-            tr_r2 += r * r;
-        }
-    }
-    let g = tr_r2 / (p * p) as f64;
-    let bound = g * chi_square_quantile(1.0 - alpha, 1.0 / g);
-    Ok((q, bound))
-}
-
-/// Fit one degree and return `(rmse, Q, bound)` on the probe grid.
-fn try_fit(degree: usize, alpha: f64) -> Result<(f64, f64, f64), String> {
+fn try_fit(degree: usize, alpha: f64) -> Result<AcrossFunctionCoverage, String> {
     let data = make_dataset();
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -117,31 +70,37 @@ fn try_fit(degree: usize, alpha: f64) -> Result<(f64, f64, f64), String> {
         .iter()
         .map(|t| t.cos() + 0.3 * (2.0 * t).sin())
         .collect();
-    let err: Vec<f64> = pred.iter().zip(truth.iter()).map(|(p, t)| p - t).collect();
-    let rmse = (err.iter().map(|e| e * e).sum::<f64>() / err.len() as f64).sqrt();
+    let error = Array1::from_shape_fn(pred.len(), |i| pred[i] - truth[i]);
     let cov = fit
         .fit
         .beta_covariance()
-        .ok_or_else(|| "fit carries no Bayesian covariance Vb".to_string())?;
-    let x_probe = design.design.to_dense();
-    let (q, bound) = across_function_coverage(&x_probe, cov, &err, alpha)?;
-    eprintln!("[per-deg{degree}] rmse={rmse:.4} Q={q:.3} (E=1, bound={bound:.3})");
-    Ok((rmse, q, bound))
+        .ok_or_else(|| "no coefficient covariance".to_string())?;
+    let coverage = audit_across_function_coverage(
+        error.view(),
+        design.design.to_dense().view(),
+        cov.view(),
+        alpha,
+    );
+    let rmse = (error.dot(&error) / error.len() as f64).sqrt();
+    eprintln!(
+        "[per-deg{degree}] rmse={rmse:.4} Q={:.3} (E=1, bound={:.3}, h={:.1})",
+        coverage.q, coverage.bound, coverage.dof,
+    );
+    Ok(coverage)
 }
 
 #[test]
 fn periodic_1d_degree_sweep() {
     init_parallelism();
-    let degrees = [1usize, 2, 3, 4, 5];
-    let alpha = FAMILY_ALPHA / degrees.len() as f64;
     let mut failures = Vec::new();
+    let degrees = [1usize, 2, 3, 4, 5];
     for degree in degrees {
-        match try_fit(degree, alpha) {
-            Ok((rmse, q, bound)) => {
-                if q > bound {
+        match try_fit(degree, FAMILY_ALPHA / degrees.len() as f64) {
+            Ok(coverage) => {
+                if !coverage.passes() {
                     failures.push(format!(
-                        "degree={degree}: coverage statistic Q={q:.3} > bound {bound:.3} \
-                         (alpha={alpha:.4}); rmse={rmse:.4}"
+                        "degree={degree}: Q={:.3} > bound {:.3} (α={:.4})",
+                        coverage.q, coverage.bound, coverage.alpha,
                     ));
                 }
             }
