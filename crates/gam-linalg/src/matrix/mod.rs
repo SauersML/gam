@@ -205,12 +205,6 @@ fn merge_operator_materialization_policies(
             max_single_dense_bytes: left
                 .max_single_dense_bytes
                 .min(right.max_single_dense_bytes),
-            max_cached_dense_bytes: left
-                .max_cached_dense_bytes
-                .min(right.max_cached_dense_bytes),
-            row_chunk_target_bytes: left
-                .row_chunk_target_bytes
-                .min(right.row_chunk_target_bytes),
             allow_operator_materialization: left.allow_operator_materialization
                 && right.allow_operator_materialization,
             allow_diagnostic_materialization: left.allow_diagnostic_materialization

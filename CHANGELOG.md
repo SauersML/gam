@@ -68,6 +68,11 @@
   fixed device's compute capability. `probe_backend_with_compile`, the public
   `probe_cuda_backend` entry, `CudaBackendParts::capability` and the unused
   `PirlsRowBackend::compiled` are removed.
+- **Breaking (Rust): resource policies drop three caps that no code consulted** (#4400).
+  `ResourcePolicy::max_spatial_distance_cache_bytes`, `MaterializationPolicy::max_cached_dense_bytes` and
+  `MaterializationPolicy::row_chunk_target_bytes` are removed. They were set and merged but never compared
+  against anything; streamed chunk sizing reads `ResourcePolicy::row_chunk_target_bytes`, and dense
+  materialization is bounded by `max_single_dense_bytes` and the process-wide memory governor.
 
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry

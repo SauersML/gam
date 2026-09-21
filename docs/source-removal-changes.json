@@ -3407,5 +3407,14 @@
     ],
     "reason": "#4346: test-local scalar kernels duplicated gam_math. Private logistic/sigmoid/inv_logit/logit_inv copies were gam_math::special::logistic; private normal_cdf/norm_cdf/big_phi/standard_normal_cdf (Abramowitz-Stegun 7.1.26, statrs/libm erf, a Numerical Recipes erfc, or thin gam::probability wrappers) and every 0.5*(1+erf_approx(z/sqrt 2)) call were gam_math::probability::normal_cdf; private norm_pdf/phi/standard_normal_pdf were gam_math::probability::normal_pdf. The two erfc helpers served only a deleted normal_cdf copy. SPEC: 'It's required that the CLI, Python library, and Rust library are unified, have a single source of truth'.",
     "evidence": "https://github.com/SauersML/gam/issues/4346: every former call site now imports the canonical gam_math kernel; git grep -w finds no remaining call to a removed name in the edited files."
+  },
+  {
+    "base": "3d306728d71b4e24433564e05043d5e68056f47a",
+    "items": [
+      "crates/gam-runtime/src/resource.rs:fn:for_problem_dimension_overflow_defers_to_typed_reservation",
+      "crates/gam-runtime/src/resource.rs:fn:for_problem_has_no_row_or_column_cliff"
+    ],
+    "reason": "#4400: for_problem_has_no_row_or_column_cliff and for_problem_dimension_overflow_defers_to_typed_reservation each called ResourcePolicy::for_problem(ProblemHints::default()) and asserted MaterializeIfSmall, exactly what for_problem_small_data_uses_materialize_if_small already asserts. for_problem takes no shape argument, so neither test could exercise the row/column cliff or dimension overflow its name claims; they were copies, not coverage.",
+    "evidence": "scripts/source_removal_guard.py with --base 3d306728d71b4e24433564e05043d5e68056f47a and head the change's commit lists exactly these removals. for_problem_small_data_uses_materialize_if_small and for_problem_marginal_slope_hint_is_strict stay and cover both branches of ResourcePolicy::for_problem."
   }
 ]

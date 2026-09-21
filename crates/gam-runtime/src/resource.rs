@@ -46,7 +46,6 @@ pub fn byte_balanced_row_chunk(cols: usize, n_rows: usize) -> usize {
 pub struct ResourcePolicy {
     pub max_single_materialization_bytes: usize,
     pub max_operator_cache_bytes: usize,
-    pub max_spatial_distance_cache_bytes: usize,
     pub max_owned_data_cache_bytes: usize,
     pub row_chunk_target_bytes: usize,
     pub derivative_storage_mode: DerivativeStorageMode,
@@ -814,8 +813,6 @@ pub enum DerivativeStorageMode {
 #[derive(Clone, Debug)]
 pub struct MaterializationPolicy {
     pub max_single_dense_bytes: usize,
-    pub max_cached_dense_bytes: usize,
-    pub row_chunk_target_bytes: usize,
     pub allow_operator_materialization: bool,
     pub allow_diagnostic_materialization: bool,
 }
@@ -902,7 +899,6 @@ impl ResourcePolicy {
         Self {
             max_single_materialization_bytes: single_cap,
             max_operator_cache_bytes: single_cap,
-            max_spatial_distance_cache_bytes: single_cap,
             max_owned_data_cache_bytes: single_cap,
             row_chunk_target_bytes: LIBRARY_ROW_CHUNK_TARGET_BYTES,
             derivative_storage_mode: DerivativeStorageMode::MaterializeIfSmall,
@@ -943,8 +939,6 @@ impl ResourcePolicy {
     pub const fn material_policy(&self) -> MaterializationPolicy {
         MaterializationPolicy {
             max_single_dense_bytes: self.max_single_materialization_bytes,
-            max_cached_dense_bytes: self.max_operator_cache_bytes,
-            row_chunk_target_bytes: self.row_chunk_target_bytes,
             allow_operator_materialization: matches!(
                 self.derivative_storage_mode,
                 DerivativeStorageMode::MaterializeIfSmall
@@ -1510,29 +1504,6 @@ mod resource_policy_tests {
     }
 
     #[test]
-    fn for_problem_has_no_row_or_column_cliff() {
-        let narrow = ResourcePolicy::for_problem(ProblemHints::default());
-        let wide = ResourcePolicy::for_problem(ProblemHints::default());
-        assert_eq!(
-            narrow.derivative_storage_mode,
-            DerivativeStorageMode::MaterializeIfSmall
-        );
-        assert_eq!(
-            wide.derivative_storage_mode,
-            DerivativeStorageMode::MaterializeIfSmall
-        );
-    }
-
-    #[test]
-    fn for_problem_dimension_overflow_defers_to_typed_reservation() {
-        let policy = ResourcePolicy::for_problem(ProblemHints::default());
-        assert_eq!(
-            policy.derivative_storage_mode,
-            DerivativeStorageMode::MaterializeIfSmall
-        );
-    }
-
-    #[test]
     fn for_problem_marginal_slope_hint_is_strict() {
         let p = ResourcePolicy::for_problem(ProblemHints {
             marginal_slope_large_scale_active: true,
@@ -1567,8 +1538,6 @@ mod resource_policy_tests {
             mp.max_single_dense_bytes,
             policy.max_single_materialization_bytes
         );
-        assert_eq!(mp.max_cached_dense_bytes, policy.max_operator_cache_bytes);
-        assert_eq!(mp.row_chunk_target_bytes, policy.row_chunk_target_bytes);
     }
 
     // ── MemoryGovernor ledger ────────────────────────────────────────────────
