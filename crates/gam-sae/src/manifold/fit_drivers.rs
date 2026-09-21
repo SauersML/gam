@@ -1079,19 +1079,59 @@ impl SaeManifoldTerm {
             *value /= weight_sum;
         }
 
+        // #2822 — AN AXIS IS NORMALIZED ONLY WHERE ITS SPREAD IS RESOLVED, AND THE
+        // BAR IS THE SPREAD'S OWN ROUNDING FLOOR, NOT A LITERAL.
+        //
+        // `scale[axis] = rms` divides the chart by that axis's weighted rms, and the
+        // gauge composes onto the CURRENT evaluator after every accepted inner
+        // iteration, so its stretches MULTIPLY across a fit. The bar this replaces was
+        // the absolute literal `1e-12`, which is not a scale at all: it admitted every
+        // axis whose spread was the rounding of the sum below, and each such axis
+        // handed `solve_basis_transport` a `1/rms` stretch. Measured on
+        // `planted_circle_multi_atom_threshold_gate_clears_startup_validation_1782`
+        // (#2822): `transport_smooth_penalty_for_decoder` logged 18 541 transports
+        // that grew `max|S|` by more than 1e3, EVERY one of them with
+        // `s in [1e-12, 1e-8)` and NONE below `1e-12` — the literal was the whole
+        // admission criterion — and they compounded `max|S|` from 3.138572e14 to
+        // 3.593128e26. `rank_dof_from_grams` then met `S` eigenvalues `{0, 4.473e52}`
+        // against `G` eigenvalues `3e-5` and refused, because forming `G + lambda*S`
+        // in binary64 rounds the sum at `lambda*4.5e52*eps ~ 1.5e38` and loses the
+        // direction `G` lives in.
+        //
+        // The bar is the resolution of the second moment itself. `var` accumulates `n`
+        // products in binary64, so its absolute rounding error is at most
+        // `n*eps*sum_i w_i*c_i^2 <= n*eps*W*M^2` with `M = max_i |c_i|` the axis's own
+        // centered coordinate extent. `rms = sqrt(var/W)` therefore carries information
+        // only above `sqrt(n*eps)*M`, and the first moment `shift` — one `n`-term sum
+        // of the same magnitudes — only above `n*eps*M`. Below those floors the moment
+        // IS its own rounding: `1/rms` is a rounding-driven stretch of the chart, so the
+        // axis keeps unit scale. A chart axis that has genuinely collapsed is a
+        // degeneracy the collapsed-chart refusal adjudicates (#2691); it is not
+        // manufactured into a 1e12 congruence here.
+        //
+        // `scale` is a ratio, so its own bar is dimensionless: `rms` inherits the
+        // relative error `n*eps` of `var`, and a scale nearer to 1 than that is the
+        // same rounding seen from the other side.
         let mut scale = vec![1.0_f64; d];
         let mut changed = false;
         for axis in 0..d {
             let mut var = 0.0_f64;
+            let mut extent = 0.0_f64;
             for row in 0..n {
                 let centered = coords[[row, axis]] - shift[axis];
                 var += weights[row] * centered * centered;
+                extent = extent.max(centered.abs());
             }
+            let moment_relative_resolution = (n as f64) * f64::EPSILON;
+            let resolved_rms = moment_relative_resolution.sqrt() * extent;
+            let resolved_shift = moment_relative_resolution * extent;
             let rms = (var / weight_sum).sqrt();
-            if rms.is_finite() && rms > 1.0e-12 {
+            if rms.is_finite() && rms > resolved_rms {
                 scale[axis] = rms;
             }
-            if shift[axis].abs() > 1.0e-12 || (scale[axis] - 1.0).abs() > 1.0e-12 {
+            if shift[axis].abs() > resolved_shift
+                || (scale[axis] - 1.0).abs() > moment_relative_resolution
+            {
                 changed = true;
             }
         }

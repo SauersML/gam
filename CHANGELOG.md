@@ -1,5 +1,29 @@
 ## Unreleased
 
+- **A chart gauge normalized axes whose spread was its own rounding, and the stretches
+  compounded into the smoothness Gram** (gam#2822).
+  `canonicalize_atom_affine_gauge` divides each latent axis by its weighted rms, and it
+  composes onto the atom's current evaluator after every accepted inner iteration, so the
+  factors multiply across a fit. Its admission bar was the absolute literal `1e-12`, which
+  is not a scale: an axis whose spread was the rounding of the weighted second moment was
+  normalized anyway, handing the basis transport a `1/rms` stretch, and the smoothness Gram
+  travels with that transport as the congruence `T^-T S T^-1`. Both canonicalizations gate
+  the decoded IMAGE, which the congruence leaves invariant by construction, so nothing saw
+  the transport's conditioning. On
+  `planted_circle_multi_atom_threshold_gate_clears_startup_validation_1782` this produced
+  18 541 transports that grew `max|S|` by more than 1e3 — every one of them at
+  `s` in `[1e-12, 1e-8)` and none below `1e-12`, so the literal was the whole admission
+  criterion — compounding `max|S|` from 3.14e14 to 3.59e26; `rank_dof_from_grams` then met
+  `S` eigenvalues `{0, 4.473e52}` against `G` eigenvalues `3e-5` and refused, because
+  forming `G + lambda*S` in binary64 rounds at `lambda*4.5e52*eps ~ 1.5e38` and loses the
+  direction `G` lives in. The bar is now the moment's own resolution: `var` accumulates `n`
+  products, so its absolute error is at most `n*eps*W*M^2` for `M` the axis's centered
+  extent, and the rms carries information only above `sqrt(n*eps)*M`, the first moment only
+  above `n*eps*M`, and the dimensionless scale only where it differs from 1 by more than the
+  relative error `n*eps` it inherits. An axis below those floors keeps unit scale; a chart
+  axis that has genuinely collapsed stays the collapsed-chart refusal's to adjudicate
+  (gam#2691).
+
 - **The scheduled p-value calibration run can fail** (gam#3722).
   `.github/workflows/pvalue-calibration.yml` gave the calibration harness a runner, but
   `bench.pvalue_calibration.run` returned 0 whatever the records said, so the weekly `ci`
