@@ -44,7 +44,9 @@ fn term_spec(length_scale: f64) -> SmoothTermSpec {
                 radial_reparam: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                 periodic: None,
-                length_scale: Some(length_scale),
+                length_scale: Some(gam::terms::basis::MaternLengthScale::auto_resolved(
+                    length_scale,
+                )),
                 power: 1.0,
                 nullspace_order: DuchonNullspaceOrder::Linear,
                 identifiability: SpatialIdentifiability::default(),
@@ -125,7 +127,7 @@ fn main() {
     ] {
         let mut trial = frozen.smooth_terms[0].clone();
         if let SmoothBasisSpec::Duchon { spec, .. } = &mut trial.basis {
-            spec.length_scale = Some(ell);
+            spec.length_scale = Some(gam::terms::basis::MaternLengthScale::auto_resolved(ell));
         }
         let local = gam_terms::smooth::build_single_local_smooth_term(x.view(), &trial, &mut ws)
             .expect("local rebuild from the replay spec");

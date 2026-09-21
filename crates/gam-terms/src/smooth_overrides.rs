@@ -517,18 +517,22 @@ fn apply_duchon(
         spec.power = s;
     }
     if let Some(ls) = descriptor.get("length_scale") {
+        // null → scale-free pure Duchon; "auto" → hybrid with a learned κ;
+        // a number → hybrid with κ pinned exactly as supplied (gam#3020).
         if ls.is_null() {
             spec.length_scale = None;
+        } else if ls.as_str() == Some("auto") {
+            spec.length_scale = Some(MaternLengthScale::auto());
         } else {
             let v = ls.as_f64().ok_or_else(|| {
-                format!("smooths[{symbol:?}].length_scale must be a number or null")
+                format!("smooths[{symbol:?}].length_scale must be a number, \"auto\", or null")
             })?;
             if !v.is_finite() || v <= 0.0 {
                 return Err(format!(
                     "smooths[{symbol:?}].length_scale must be a positive finite value, got {v}"
                 ));
             }
-            spec.length_scale = Some(v);
+            spec.length_scale = Some(MaternLengthScale::fixed(v));
         }
     }
     if let Some(anis) = descriptor.get("aniso_log_scales") {

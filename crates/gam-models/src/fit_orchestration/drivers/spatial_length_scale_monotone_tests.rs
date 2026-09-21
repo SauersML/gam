@@ -128,7 +128,7 @@ mod spatial_length_scale_monotone_tests {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers },
-                        length_scale: gam_terms::basis::MaternLengthScale::fixed(short_seed),
+                        length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(short_seed),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: true,
@@ -250,7 +250,7 @@ mod spatial_length_scale_monotone_tests {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                        length_scale: gam_terms::basis::MaternLengthScale::fixed(20.0),
+                        length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(20.0),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: true,
@@ -306,7 +306,7 @@ mod spatial_length_scale_monotone_tests {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                        length_scale: gam_terms::basis::MaternLengthScale::fixed(12.0),
+                        length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(12.0),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: true,

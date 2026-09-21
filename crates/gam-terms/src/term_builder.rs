@@ -1666,6 +1666,53 @@ fn reject_unconsumable_period_declaration(
     Ok(())
 }
 
+/// Parse a Duchon smooth's `length_scale=` option into its provenance
+/// (gam#3020): absent → `None` (scale-free pure Duchon, no κ); `auto` →
+/// `Some(Auto)` (hybrid Duchon–Matérn kernel, κ seeded from the data and
+/// learned); a positive finite number → `Some(Fixed(ℓ))` (hybrid, κ pinned).
+fn parse_duchon_length_scale(
+    options: &BTreeMap<String, String>,
+) -> Result<Option<MaternLengthScale>, String> {
+    if options
+        .get("length_scale")
+        .is_some_and(|raw| raw.eq_ignore_ascii_case("auto"))
+    {
+        return Ok(Some(MaternLengthScale::auto()));
+    }
+    match option_f64(options, "length_scale")? {
+        None => Ok(None),
+        Some(value) if value > 0.0 => Ok(Some(MaternLengthScale::fixed(value))),
+        Some(value) => Err(TermBuilderError::incompatible_config(format!(
+            "duchon length_scale must be positive (or `auto` to learn it), got {value}"
+        ))
+        .to_string()),
+    }
+}
+
+/// An explicit `length_scale=<number>` pins the kernel scale in every family
+/// (gam#3020). `scale_dims=true` asks REML to learn per-axis log-scales, which
+/// the outer search parameterizes as ψ_a = log κ + η_a with the global κ one of
+/// its coordinates; there is no pinned-κ-with-learned-contrasts search, so the
+/// two requests contradict each other. Refuse the combination instead of
+/// silently dropping one of them.
+fn reject_pinned_length_scale_with_scale_dims(
+    kind: &str,
+    vars: &[String],
+    options: &BTreeMap<String, String>,
+    length_scale_is_pinned: bool,
+) -> Result<(), String> {
+    if length_scale_is_pinned && option_bool(options, "scale_dims")?.unwrap_or(false) {
+        return Err(TermBuilderError::incompatible_config(format!(
+            "{kind} smooth '{}' sets both an explicit length_scale (a pinned kernel scale) and \
+             scale_dims=true (learned per-axis scales); drop length_scale to learn the scales, \
+             or drop scale_dims to keep the pinned isotropic scale",
+            vars.join(", ")
+        ))
+        .to_string());
+    }
+    Ok(())
+}
+
 /// The radial (`thinplate` / `matern` / `duchon`) counterpart of
 /// [`reject_unconsumable_period_declaration`] (#2781).
 ///
@@ -3763,8 +3810,8 @@ pub(crate) fn build_smooth_basis(
             // REML therefore selects it by default.
             //
             // An explicit `length_scale=` is a request, not a seed, so it pins ℓ
-            // — the same short-circuit `all_spatial_terms_kappa_fixed` gives an
-            // explicitly-scaled Matérn. `learn_length_scale=` overrides either
+            // — the same pin an explicitly-scaled Matérn or Duchon gets from
+            // `spatial_term_supports_hyper_optimization` (gam#3020). `learn_length_scale=` overrides either
             // way.
             let learn_length_scale =
                 option_bool(options, "learn_length_scale")?.unwrap_or(length_scale_opt.is_none());
@@ -3834,6 +3881,15 @@ pub(crate) fn build_smooth_basis(
                 ))
                 .to_string());
             }
+            let matern_length_scale = explicit_positive_length_scale(options, "matern")?
+                .map(MaternLengthScale::fixed)
+                .unwrap_or_else(MaternLengthScale::auto);
+            reject_pinned_length_scale_with_scale_dims(
+                "matern",
+                vars,
+                options,
+                matern_length_scale.is_fixed(),
+            )?;
             let aniso_log_scales = if option_bool(options, "scale_dims")?.unwrap_or(false) {
                 Some(vec![0.0; cols.len()])
             } else {
@@ -3867,9 +3923,7 @@ pub(crate) fn build_smooth_basis(
                     // thin-plate/tensor on identical data, and insensitive to `k`).
                     // Typed Auto starts REML in the resolving regime it can escape
                     // from and cannot be confused with explicit zero.
-                    length_scale: explicit_positive_length_scale(options, "matern")?
-                        .map(MaternLengthScale::fixed)
-                        .unwrap_or_else(MaternLengthScale::auto),
+                    length_scale: matern_length_scale,
                     nu,
                     include_intercept: option_bool(options, "include_intercept")?.unwrap_or(false),
                     double_penalty: smooth_double_penalty,
@@ -3894,7 +3948,18 @@ pub(crate) fn build_smooth_basis(
                 .to_string());
             }
             let requested_nullspace_order = parse_duchon_order_opt(options)?;
-            let length_scale = option_f64(options, "length_scale")?;
+            // gam#3020 — `length_scale` carries provenance: omitted is the
+            // scale-free pure Duchon (no κ), `length_scale=auto` is the hybrid
+            // Duchon–Matérn kernel with κ seeded from the data and learned, and
+            // `length_scale=<number>` is the hybrid with κ PINNED exactly as
+            // supplied in every family.
+            let length_scale = parse_duchon_length_scale(options)?;
+            reject_pinned_length_scale_with_scale_dims(
+                "duchon",
+                vars,
+                options,
+                length_scale.is_some_and(|scale| scale.is_fixed()),
+            )?;
             // Resolve `(nullspace_order, power)`. The default (magic) path is a
             // structural amplitude/slope/curvature smoother: an affine (`Linear`)
             // polynomial nullspace and spectral power `s = (d - 1)/2`, giving the
@@ -4587,6 +4652,11 @@ pub(crate) fn build_smooth_basis(
 }
 
 /// Initialise per-axis anisotropic log-scales on eligible spatial smooth specs.
+///
+/// A term whose kernel scale the user pinned (`length_scale=<number>`, i.e.
+/// `MaternLengthScale::Fixed`) is not eligible: per-axis scales are learned
+/// through ψ_a = log κ + η_a with κ one of the coordinates, and a pinned κ is
+/// never searched (gam#3020), so such a term stays isotropic exactly as written.
 pub fn enable_scale_dimensions(spec: &mut TermCollectionSpec) {
     for smooth in spec.smooth_terms.iter_mut() {
         // A multi-axis thin-plate term cannot carry per-axis anisotropy on its
@@ -4602,7 +4672,7 @@ pub fn enable_scale_dimensions(spec: &mut TermCollectionSpec) {
                 spec: matern,
                 ..
             } => {
-                if matern.aniso_log_scales.is_none() {
+                if matern.aniso_log_scales.is_none() && !matern.length_scale.is_fixed() {
                     let d = feature_cols.len();
                     matern.aniso_log_scales = Some(vec![0.0; d]);
                 }
@@ -4612,7 +4682,7 @@ pub fn enable_scale_dimensions(spec: &mut TermCollectionSpec) {
                 spec: duchon,
                 ..
             } => {
-                if duchon.aniso_log_scales.is_none() {
+                if duchon.aniso_log_scales.is_none() && !duchon.length_scale_is_fixed() {
                     let d = feature_cols.len();
                     duchon.aniso_log_scales = Some(vec![0.0; d]);
                 }

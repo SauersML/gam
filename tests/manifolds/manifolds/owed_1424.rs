@@ -146,7 +146,7 @@ fn high_dim_hybrid_duchon_matern_penalty_is_psd_1424() {
         periodic: None,
         // Hybrid Matérn blend: length_scale = Some triggers the
         // partial-fraction / stable-integral kernel; power = 3 → s = 3.
-        length_scale: Some(0.75),
+        length_scale: Some(gam::terms::basis::MaternLengthScale::auto_resolved(0.75)),
         power: 3.0,
         // Constants-only null space → p = 1. With d = 6 this is the
         // catastrophic-cancellation regime 2p < d < 2(p+s) (2 < 6 < 8):

@@ -32,7 +32,7 @@ mod n_block_realization_refusal_2953_tests {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
-                        length_scale: gam_terms::basis::MaternLengthScale::fixed(0.7),
+                        length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(0.7),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: true,

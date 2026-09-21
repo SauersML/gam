@@ -2558,10 +2558,21 @@ fn set_single_term_spatial_length_scale(
             spec.length_scale.set_resolved(length_scale);
             Ok(())
         }
-        SmoothBasisSpec::Duchon { spec, .. } => {
-            spec.length_scale = Some(length_scale);
-            Ok(())
-        }
+        // A pure Duchon (`length_scale = None`) is scale-free: writing a κ into
+        // it would silently turn it into the hybrid Duchon–Matérn kernel, a
+        // different model. A hybrid keeps its owner (Auto stays Auto, Fixed stays
+        // Fixed); only Auto terms are ever enrolled for κ search (gam#3020).
+        // This mirrors `gam_terms::smooth::set_spatial_length_scale`.
+        SmoothBasisSpec::Duchon { spec, .. } => match spec.length_scale.as_mut() {
+            Some(scale) => {
+                scale.set_resolved(length_scale);
+                Ok(())
+            }
+            None => Err(EstimationError::InvalidInput(format!(
+                "term '{}' is a scale-free (pure) Duchon smooth and has no length scale to set",
+                term.name
+            ))),
+        },
         _ => Err(EstimationError::InvalidInput(format!(
             "term '{}' does not expose a spatial length scale",
             term.name
@@ -3633,7 +3644,16 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                         .to_standardized_units(gam_terms::OriginalUnits::new(length))
                         .standardized_value()
                 });
-                spec.length_scale = effective_ls;
+                // Keep the width's owner: a user-pinned ℓ stays Fixed, a planner
+                // width stays Auto with the standardized value realized into it.
+                let pinned = spec.length_scale_is_fixed();
+                spec.length_scale = effective_ls.map(|length| {
+                    if pinned {
+                        gam_terms::basis::MaternLengthScale::fixed(length)
+                    } else {
+                        gam_terms::basis::MaternLengthScale::auto_resolved(length)
+                    }
+                });
                 spec.power = *power;
                 spec.nullspace_order = *nullspace_order;
                 spec.aniso_log_scales = aniso_log_scales.clone();

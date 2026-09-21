@@ -932,7 +932,15 @@ impl MaternLengthScale {
         Self::Fixed(value)
     }
 
-    pub(crate) const fn is_fixed(self) -> bool {
+    /// An engine-owned (learned) scale whose numeric value is already known,
+    /// e.g. a data-derived seed or a value replayed from a frozen fit.
+    pub const fn auto_resolved(value: f64) -> Self {
+        Self::Auto {
+            resolved: Some(value),
+        }
+    }
+
+    pub const fn is_fixed(self) -> bool {
         matches!(self, Self::Fixed(_))
     }
 
@@ -1113,10 +1121,17 @@ pub struct DuchonBasisSpec {
     pub center_strategy: CenterStrategy,
     #[serde(default)]
     pub periodic: Option<Vec<Option<f64>>>,
-    /// Optional hybrid Matérn width. `None` means pure scale-free Duchon with
-    /// spectrum `||w||^(2p + 2s)`. `Some(length_scale)` enables the hybrid
-    /// spectrum `||w||^(2p) * (kappa^2 + ||w||^2)^s`, `kappa = 1/length_scale`.
-    pub length_scale: Option<f64>,
+    /// Optional hybrid Matérn width, with its provenance (#3020).
+    ///
+    /// * `None` — pure scale-free Duchon, spectrum `||w||^(2p + 2s)`; there is
+    ///   no κ to learn or pin.
+    /// * `Some(_)` — the hybrid spectrum `||w||^(2p) * (kappa^2 + ||w||^2)^s`,
+    ///   `kappa = 1/length_scale`, where the [`MaternLengthScale`] records who
+    ///   owns ℓ: `Fixed(ℓ)` is a user-pinned width that no family re-learns,
+    ///   and `Auto` is a width the planner seeds from the data and REML then
+    ///   estimates. A κ write-back goes through [`MaternLengthScale::set_resolved`],
+    ///   so a learned value never masquerades as a typed one.
+    pub length_scale: Option<MaternLengthScale>,
     /// Literal Duchon spectral power `s` (`f64`, fractional values fully
     /// threaded end-to-end). The pure-Duchon kernel exponent is `2(p + s) − d`,
     /// so this is the knob that sets `φ(r)`: `s = 0` is the integer-order Duchon
@@ -1165,6 +1180,33 @@ pub struct DuchonBasisSpec {
 }
 
 impl DuchonBasisSpec {
+    /// Whether this is the hybrid Duchon–Matérn kernel (a κ exists), whatever
+    /// owns its width.
+    pub const fn is_hybrid(&self) -> bool {
+        self.length_scale.is_some()
+    }
+
+    /// Whether the hybrid width is user-pinned (`length_scale=ℓ`).
+    pub const fn length_scale_is_fixed(&self) -> bool {
+        matches!(self.length_scale, Some(MaternLengthScale::Fixed(_)))
+    }
+
+    /// The realized hybrid width ℓ = 1/κ: `Ok(None)` for the scale-free
+    /// kernel, `Ok(Some(ℓ))` for a pinned or resolved hybrid width, and an
+    /// error for an `Auto` width the planner has not resolved yet — building
+    /// from it would silently realize the scale-free kernel instead.
+    pub fn hybrid_length_scale(&self) -> Result<Option<f64>, BasisError> {
+        match self.length_scale {
+            None => Ok(None),
+            Some(scale) => scale.resolved().map(Some).ok_or_else(|| {
+                BasisError::InvalidInput(
+                    "hybrid Duchon Auto length_scale must be resolved before basis construction"
+                        .to_string(),
+                )
+            }),
+        }
+    }
+
     /// The integer Matérn order `s` of a hybrid spec (`length_scale = Some`);
     /// see [`duchon_hybrid_s_order`].
     pub(crate) fn hybrid_s_order(&self) -> Result<usize, BasisError> {

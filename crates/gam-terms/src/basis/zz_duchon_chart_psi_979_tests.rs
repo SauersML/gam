@@ -55,7 +55,7 @@ fn frozen_hybrid_fixture(
         center_strategy: CenterStrategy::FarthestPoint {
             num_centers: centers,
         },
-        length_scale: Some(1.0),
+        length_scale: Some(crate::basis::MaternLengthScale::fixed(1.0)),
         power,
         nullspace_order: order,
         identifiability: SpatialIdentifiability::default(),
@@ -95,7 +95,7 @@ fn fixture_centers(spec: &DuchonBasisSpec) -> Array2<f64> {
 /// The frozen spec with the isotropic coordinate moved to `ψ`: `ℓ = e^{−ψ}`.
 fn spec_at_psi(spec: &DuchonBasisSpec, psi: f64) -> DuchonBasisSpec {
     let mut out = spec.clone();
-    out.length_scale = Some((-psi).exp());
+    out.length_scale = Some(crate::basis::MaternLengthScale::fixed((-psi).exp()));
     out
 }
 
@@ -108,7 +108,10 @@ fn chart_amplification(data: ArrayView2<'_, f64>, spec: &DuchonBasisSpec) -> f64
     let order = duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(order);
     let s_order = spec.hybrid_s_order().expect("integer hybrid power");
-    let length_scale = spec.length_scale.expect("hybrid fixture");
+    let length_scale = spec
+        .hybrid_length_scale()
+        .expect("resolved")
+        .expect("hybrid fixture");
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
     duchon_kernel_chart(
         centers.view(),
@@ -166,7 +169,7 @@ fn forward_operator_penalties(
         collocation.view(),
         centers.view(),
         &spec.operator_penalties,
-        spec.length_scale,
+        spec.hybrid_length_scale().expect("resolved"),
         spec.power,
         spec.nullspace_order,
         false,
@@ -193,7 +196,10 @@ fn mass_reconstruction(
     let order = duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(order);
     let s_order = spec.hybrid_s_order().expect("integer hybrid power");
-    let ell = spec.length_scale.expect("hybrid fixture");
+    let ell = spec
+        .hybrid_length_scale()
+        .expect("resolved")
+        .expect("hybrid fixture");
     let d = centers.ncols();
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ell);
     let amp = duchon_kernel_amplification(
@@ -277,7 +283,7 @@ fn operator_penalty_gaps(
                 centers.view(),
                 collocation.view(),
                 None,
-                spec.length_scale,
+                spec.hybrid_length_scale().expect("resolved"),
                 spec.power,
                 spec.nullspace_order,
                 None,
@@ -294,7 +300,7 @@ fn operator_penalty_gaps(
                 centers.view(),
                 collocation.view(),
                 None,
-                spec.length_scale,
+                spec.hybrid_length_scale().expect("resolved"),
                 spec.power,
                 spec.nullspace_order,
                 None,
@@ -308,7 +314,10 @@ fn operator_penalty_gaps(
                 let order = duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
                 let p_order = duchon_p_from_nullspace_order(order);
                 let s_order = spec.hybrid_s_order().expect("integer hybrid power");
-                let ell = spec.length_scale.expect("hybrid fixture");
+                let ell = spec
+                    .hybrid_length_scale()
+                    .expect("resolved")
+                    .expect("hybrid fixture");
                 let d = centers.ncols();
                 let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ell);
                 let mut workspace = BasisWorkspace::default();

@@ -79,7 +79,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
                     radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                    length_scale: Some(1.0),
+                    length_scale: Some(gam_terms::basis::MaternLengthScale::auto_resolved(1.0)),
                     power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),

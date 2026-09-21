@@ -43,7 +43,7 @@ fn cyclic_duchon_penalty_is_frobenius_normalized() {
         radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(centers),
         periodic: None,
-        length_scale: Some(0.25),
+        length_scale: Some(gam::basis::MaternLengthScale::auto_resolved(0.25)),
         power: 2.0,
         nullspace_order: DuchonNullspaceOrder::Zero,
         identifiability: SpatialIdentifiability::None,

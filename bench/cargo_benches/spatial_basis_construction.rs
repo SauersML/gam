@@ -41,7 +41,7 @@ fn bench_spatial_basis_construction(c: &mut Criterion) {
         let spec = DuchonBasisSpec {
             radial_reparam: None,
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
-            length_scale: Some(1.5),
+            length_scale: Some(gam::terms::basis::MaternLengthScale::auto_resolved(1.5)),
             power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: Default::default(),

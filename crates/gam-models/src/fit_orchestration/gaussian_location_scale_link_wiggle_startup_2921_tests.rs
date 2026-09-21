@@ -73,7 +73,7 @@ fn gnomon_48_row_table() -> Table {
 /// variant of it.
 fn termspec(request: Request) -> TermCollectionSpec {
     let (length_scale, power, linear_feature_cols) = match request {
-        Request::Gnomon => (Some(1.0), 1.0, Vec::new()),
+        Request::Gnomon => (Some(gam_terms::basis::MaternLengthScale::fixed(1.0)), 1.0, Vec::new()),
         Request::Issue => (None, 0.0, vec![1]),
     };
     TermCollectionSpec {

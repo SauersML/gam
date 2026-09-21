@@ -45,7 +45,7 @@ fn duchon_pc_term(name: &str, d: usize, centers: usize, power: usize) -> SmoothT
                 center_strategy: CenterStrategy::FarthestPoint {
                     num_centers: centers,
                 },
-                length_scale: Some(1.0),
+                length_scale: Some(gam::basis::MaternLengthScale::auto_resolved(1.0)),
                 periodic: None,
                 power: power as f64,
                 nullspace_order: DuchonNullspaceOrder::Zero,

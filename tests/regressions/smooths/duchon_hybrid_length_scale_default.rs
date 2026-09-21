@@ -119,7 +119,7 @@ fn hybrid_duchon_cubic_default_resolves_to_admissible_integer_power() {
 
         assert_eq!(
             length_scale,
-            Some(1.0),
+            Some(gam::basis::MaternLengthScale::fixed(1.0)),
             "d={d}: hybrid length_scale must survive resolution"
         );
         assert!(

@@ -16,7 +16,7 @@ fn anisotropic_build_handles_dominant_axis_without_instability() {
         radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: None,
-        length_scale: Some(1.0),
+        length_scale: Some(gam::terms::basis::MaternLengthScale::auto_resolved(1.0)),
         power: 2.0,
         nullspace_order: DuchonNullspaceOrder::Linear,
         identifiability: Default::default(),

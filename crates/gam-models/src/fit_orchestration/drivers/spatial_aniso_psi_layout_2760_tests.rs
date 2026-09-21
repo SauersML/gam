@@ -57,7 +57,7 @@ mod spatial_aniso_psi_layout_2760_tests {
                         radial_reparam: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 24 },
                         periodic: None,
-                        length_scale: Some(1.0),
+                        length_scale: Some(gam_terms::basis::MaternLengthScale::auto_resolved(1.0)),
                         power: power as f64,
                         nullspace_order,
                         identifiability: SpatialIdentifiability::default(),

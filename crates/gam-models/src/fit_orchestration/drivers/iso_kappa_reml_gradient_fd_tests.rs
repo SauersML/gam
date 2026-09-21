@@ -319,7 +319,7 @@ fn build_iso_kappa_fixture(
             spec: MaternBasisSpec {
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                 periodic: None,
-                length_scale: gam_terms::basis::MaternLengthScale::fixed(1.0),
+                length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(1.0),
                 nu: MaternNu::FiveHalves,
                 include_intercept: false,
                 // The realized Matérn design ALWAYS carries the operator triplet
@@ -344,7 +344,7 @@ fn build_iso_kappa_fixture(
                 center_strategy: CenterStrategy::FarthestPoint {
                     num_centers: duchon_centers_from_label(label),
                 },
-                length_scale: Some(1.0),
+                length_scale: Some(gam_terms::basis::MaternLengthScale::auto_resolved(1.0)),
                 // gam#979 — the label can move the hybrid's two integer orders
                 // off the historical `(Linear, 1)` pair. `bench/large_scale`'s
                 // shared CTN preprocessor ships `duchon(pc1..pc16, order=0,
@@ -1069,7 +1069,7 @@ fn iso_kappa_matern_2d_psi_fd_step_sweep_diagnostic() {
                 spec: MaternBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 37 },
                     periodic: None,
-                    length_scale: gam_terms::basis::MaternLengthScale::fixed(length_scale),
+                    length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(length_scale),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -1413,7 +1413,7 @@ fn build_duchon_probit_setup() -> DuchonProbitSetup {
                     radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                    length_scale: Some(1.0),
+                    length_scale: Some(gam_terms::basis::MaternLengthScale::auto_resolved(1.0)),
                     power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
@@ -1956,7 +1956,7 @@ fn iso_kappa_duchon_dx_dpsi_matches_fd() {
                     radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                    length_scale: Some(1.0),
+                    length_scale: Some(gam_terms::basis::MaternLengthScale::auto_resolved(1.0)),
                     power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
@@ -1982,7 +1982,8 @@ fn iso_kappa_duchon_dx_dpsi_matches_fd() {
             ..
         } = s.smooth_terms[0].basis
         {
-            duchon.length_scale = Some((-psi).exp());
+            duchon.length_scale =
+                Some(gam_terms::basis::MaternLengthScale::auto_resolved((-psi).exp()));
         }
         let d = build_term_collection_design(data.view(), &s).unwrap_or_else(|e| panic!("{} failed: {:?}", "rebuild", e));
         d.design.to_dense()
@@ -2219,7 +2220,7 @@ fn zz_measure_monotone_fixture_through_checkable_evaluator_2454() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                    length_scale: gam_terms::basis::MaternLengthScale::fixed(12.0),
+                    length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(12.0),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -2499,7 +2500,7 @@ fn rho_gradient_part_ladder_family_2454(
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                    length_scale: gam_terms::basis::MaternLengthScale::fixed(12.0),
+                    length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(12.0),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -3466,7 +3467,7 @@ fn assert_production_kappa_route_psi_gradient_matches_its_value(
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                    length_scale: gam_terms::basis::MaternLengthScale::fixed(12.0),
+                    length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(12.0),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,

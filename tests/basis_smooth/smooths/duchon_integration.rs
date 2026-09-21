@@ -208,7 +208,7 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
                     radial_reparam: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                     // Hybrid Duchon (length_scale is Some) -- required for aniso.
-                    length_scale: Some(1.0),
+                    length_scale: Some(gam::basis::MaternLengthScale::auto_resolved(1.0)),
                     power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: gam::basis::SpatialIdentifiability::default(),
@@ -360,7 +360,7 @@ fn duchon_2d_scale_dimensions_does_not_abort_on_clean_data_issue_382() {
                     radial_reparam: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 15 },
                     // Hybrid Duchon (length_scale is Some) — required for aniso.
-                    length_scale: Some(1.0),
+                    length_scale: Some(gam::basis::MaternLengthScale::auto_resolved(1.0)),
                     power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: gam::basis::SpatialIdentifiability::default(),

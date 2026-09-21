@@ -157,7 +157,9 @@ fn duchon_aniso_pc_spec() -> TermCollectionSpec {
                     center_strategy: CenterStrategy::FarthestPoint {
                         num_centers: K_CENTERS,
                     },
-                    length_scale: Some(HYBRID_LENGTH_SCALE),
+                    length_scale: Some(gam::basis::MaternLengthScale::auto_resolved(
+                        HYBRID_LENGTH_SCALE,
+                    )),
                     power: power as f64,
                     nullspace_order,
                     identifiability: gam::basis::SpatialIdentifiability::default(),

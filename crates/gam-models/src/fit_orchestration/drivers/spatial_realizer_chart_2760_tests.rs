@@ -50,7 +50,7 @@ mod spatial_realizer_chart_2760_tests {
                         radial_reparam: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                         periodic: None,
-                        length_scale: Some(1.0),
+                        length_scale: Some(gam_terms::basis::MaternLengthScale::auto_resolved(1.0)),
                         power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
@@ -92,7 +92,7 @@ mod spatial_realizer_chart_2760_tests {
                     spec: MaternBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                         periodic: None,
-                        length_scale: gam_terms::basis::MaternLengthScale::fixed(1.0),
+                        length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(1.0),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: true,

@@ -126,7 +126,7 @@ fn local_synth_copd_like_duchon_rejects_inadmissible_explicit_power() {
                 center_strategy: CenterStrategy::FarthestPoint {
                     num_centers: DUCHON_CENTERS,
                 },
-                length_scale: Some(1.0),
+                length_scale: Some(gam::basis::MaternLengthScale::auto_resolved(1.0)),
                 // Preserve the literal request from the reproducer.  With
                 // Zero null space (p=1), s=2, d=10, pointwise kernel existence
                 // fails because 2*(p+s)=6 <= 10.  Rewriting s to 6 made this

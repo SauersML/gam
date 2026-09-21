@@ -41,7 +41,7 @@ fn assert_raw_axis_design_derivatives(length_scale: f64, contrast: f64) {
         radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-        length_scale: Some(length_scale),
+        length_scale: Some(gam_terms::basis::MaternLengthScale::fixed(length_scale)),
         power: 1.0,
         nullspace_order: DuchonNullspaceOrder::Linear,
         identifiability: SpatialIdentifiability::default(),
@@ -92,8 +92,11 @@ fn assert_raw_axis_design_derivatives(length_scale: f64, contrast: f64) {
     let realize = |steps: [f64; 2]| {
         let mut shifted = spec.clone();
         let mean = steps.iter().sum::<f64>() / 2.0;
-        shifted.length_scale =
-            Some(spec.length_scale.expect("hybrid length scale") * (-mean).exp());
+        let base = spec
+            .hybrid_length_scale()
+            .expect("resolved")
+            .expect("hybrid length scale");
+        shifted.length_scale = Some(gam_terms::basis::MaternLengthScale::fixed(base * (-mean).exp()));
         for (j, value) in shifted
             .aniso_log_scales
             .as_mut()

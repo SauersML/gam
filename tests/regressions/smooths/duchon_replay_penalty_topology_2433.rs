@@ -58,7 +58,7 @@ fn spec_1d(length_scale: f64) -> TermCollectionSpec {
                     radial_reparam: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                     periodic: None,
-                    length_scale: Some(length_scale),
+                    length_scale: Some(gam::basis::MaternLengthScale::auto_resolved(length_scale)),
                     power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
@@ -110,7 +110,7 @@ fn frozen_replay(
 ) -> gam_terms::smooth::LocalSmoothTermBuild {
     let mut term = frozen.smooth_terms[0].clone();
     if let (Some(ls), SmoothBasisSpec::Duchon { spec, .. }) = (length_scale, &mut term.basis) {
-        spec.length_scale = Some(ls);
+        spec.length_scale = Some(gam::basis::MaternLengthScale::auto_resolved(ls));
     }
     let mut workspace = gam_terms::basis::BasisWorkspace::default();
     gam_terms::smooth::build_single_local_smooth_term(data, &term, &mut workspace)

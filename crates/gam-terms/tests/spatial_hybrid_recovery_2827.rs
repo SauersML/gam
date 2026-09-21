@@ -23,7 +23,7 @@ fn six_dimensional_hybrid_design_retains_its_algebraic_tail_2827() {
     let spec = DuchonBasisSpec {
         center_strategy: CenterStrategy::UserProvided(centers),
         periodic: None,
-        length_scale: Some(1.0),
+        length_scale: Some(gam_terms::basis::MaternLengthScale::fixed(1.0)),
         power: 3.0,
         nullspace_order: DuchonNullspaceOrder::Zero,
         identifiability: SpatialIdentifiability::None,

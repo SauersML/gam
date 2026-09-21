@@ -213,7 +213,8 @@ pub(crate) fn build_thin_plate_basiswithworkspace(
         let duchon_spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(original_centers.clone()),
             periodic: spec.periodic.clone(),
-            length_scale: Some(promotion_length_scale),
+            // Engine-derived (center-spacing) scale, never the user's.
+            length_scale: Some(MaternLengthScale::auto_resolved(promotion_length_scale)),
             power: s as f64,
             nullspace_order,
             identifiability: spec.identifiability.clone(),

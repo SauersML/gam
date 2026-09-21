@@ -266,7 +266,9 @@ class Duchon(Smooth):
         scale-free pure Duchon spectrum ``‖w‖^(2(p+s))``. A positive
         value enables the hybrid spectrum
         ``‖w‖^(2p) · (κ² + ‖w‖²)^s`` with ``κ = 1/length_scale``,
-        which is closer to a Matérn for finite kernels at high d.
+        which is closer to a Matérn for finite kernels at high d. The value
+        is used exactly as given (pinned, never re-learned); in a formula,
+        ``duchon(..., length_scale=auto)`` asks REML to learn it instead.
         Honored on both the formula API and the primitive numpy API
         (``gamfit.basis.duchon_basis`` / ``gamfit.basis.duchon_function_norm_penalty``);
         the hybrid kernel keeps the polynomial nullspace order **linear in

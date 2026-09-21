@@ -69,7 +69,9 @@ fn run() -> Result<(), String> {
     if spec.radial_reparam.is_none() {
         return Err("cold build did not freeze a radial chart".into());
     }
-    spec.length_scale = Some(length_scale);
+    spec.length_scale = Some(gam_terms::basis::MaternLengthScale::auto_resolved(
+        length_scale,
+    ));
     let mut workspace = BasisWorkspace::default();
     eprintln!(
         "[2827-basis] rows={rows} cold_seconds={cold_seconds:.9} frozen local rebuild begins log_kappa={log_kappa:.9}"

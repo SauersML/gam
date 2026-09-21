@@ -123,7 +123,9 @@ fn duchon_spec(pc_dim: usize, k_centers: usize, eta: &[f64]) -> TermCollectionSp
                     center_strategy: CenterStrategy::FarthestPoint {
                         num_centers: k_centers,
                     },
-                    length_scale: Some(HYBRID_LENGTH_SCALE),
+                    length_scale: Some(gam::terms::basis::MaternLengthScale::auto_resolved(
+                        HYBRID_LENGTH_SCALE,
+                    )),
                     power: power as f64,
                     nullspace_order,
                     identifiability: gam::basis::SpatialIdentifiability::default(),

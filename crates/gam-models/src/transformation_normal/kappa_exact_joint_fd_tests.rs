@@ -114,7 +114,7 @@ fn build_fixture_with_penalties(
                     center_strategy: CenterStrategy::FarthestPoint {
                         num_centers: centers,
                     },
-                    length_scale: Some(1.0),
+                    length_scale: Some(gam_terms::basis::MaternLengthScale::auto_resolved(1.0)),
                     power,
                     nullspace_order: order,
                     identifiability: SpatialIdentifiability::default(),

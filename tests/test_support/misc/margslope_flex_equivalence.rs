@@ -88,7 +88,7 @@ fn pc16_duchon_smooth(name: &str) -> SmoothTermSpec {
             spec: DuchonBasisSpec {
                 radial_reparam: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 24 },
-                length_scale: Some(1.0),
+                length_scale: Some(gam::terms::basis::MaternLengthScale::auto_resolved(1.0)),
                 power: 8.0,
                 nullspace_order: DuchonNullspaceOrder::Linear,
                 identifiability: Default::default(),

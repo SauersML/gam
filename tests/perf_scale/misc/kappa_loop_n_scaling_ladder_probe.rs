@@ -63,7 +63,7 @@ fn spec_1d() -> TermCollectionSpec {
                     radial_reparam: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                     periodic: None,
-                    length_scale: Some(1.0),
+                    length_scale: Some(gam::basis::MaternLengthScale::auto_resolved(1.0)),
                     power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),

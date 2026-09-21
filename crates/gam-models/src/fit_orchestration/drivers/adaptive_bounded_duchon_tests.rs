@@ -403,7 +403,7 @@ mod adaptive_bounded_duchon_tests {
                     radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                    length_scale: Some(length_scale),
+                    length_scale: Some(gam_terms::basis::MaternLengthScale::auto_resolved(length_scale)),
                     power: 3.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),

@@ -4060,7 +4060,7 @@ fn warns_for_repeated_univariate_duchon_spatial_terms() {
                     spec: DuchonBasisSpec {
                         radial_reparam: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                        length_scale: Some(1.0),
+                        length_scale: Some(gam::basis::MaternLengthScale::auto_resolved(1.0)),
                         power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
@@ -4082,7 +4082,7 @@ fn warns_for_repeated_univariate_duchon_spatial_terms() {
                     spec: DuchonBasisSpec {
                         radial_reparam: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                        length_scale: Some(1.0),
+                        length_scale: Some(gam::basis::MaternLengthScale::auto_resolved(1.0)),
                         power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
@@ -4104,7 +4104,7 @@ fn warns_for_repeated_univariate_duchon_spatial_terms() {
                     spec: DuchonBasisSpec {
                         radial_reparam: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                        length_scale: Some(1.0),
+                        length_scale: Some(gam::basis::MaternLengthScale::auto_resolved(1.0)),
                         power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
@@ -4247,7 +4247,7 @@ fn warns_for_linear_terms_overlappingwith_smoothvariables() {
                 spec: DuchonBasisSpec {
                     radial_reparam: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                    length_scale: Some(1.0),
+                    length_scale: Some(gam::basis::MaternLengthScale::auto_resolved(1.0)),
                     power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
@@ -4289,7 +4289,7 @@ fn warns_for_nested_smooth_terms_with_hierarchical_ownership() {
                     spec: DuchonBasisSpec {
                         radial_reparam: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                        length_scale: Some(1.0),
+                        length_scale: Some(gam::basis::MaternLengthScale::auto_resolved(1.0)),
                         power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),

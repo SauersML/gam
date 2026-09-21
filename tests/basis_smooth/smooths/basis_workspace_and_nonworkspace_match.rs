@@ -15,7 +15,7 @@ fn workspace_variant_matches_nonworkspace_result() {
         radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: None,
-        length_scale: Some(1.3),
+        length_scale: Some(gam::terms::basis::MaternLengthScale::auto_resolved(1.3)),
         power: 2.0,
         nullspace_order: DuchonNullspaceOrder::Linear,
         identifiability: Default::default(),

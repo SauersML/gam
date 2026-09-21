@@ -38,7 +38,7 @@ fn frozen_fixture() -> (Array2<f64>, DuchonBasisSpec) {
         radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-        length_scale: Some(1.0),
+        length_scale: Some(crate::basis::MaternLengthScale::fixed(1.0)),
         power: 1.0,
         nullspace_order: DuchonNullspaceOrder::Linear,
         identifiability: SpatialIdentifiability::default(),
