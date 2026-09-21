@@ -866,7 +866,6 @@ fn gamma_and_beta_rows_are_accurate_at_large_shape_4252() {
     }
     let gamma = DispersionFamilyKind::Gamma;
     let beta = DispersionFamilyKind::Beta;
-    #[rustfmt::skip]
     let references = [
         Reference { kind: gamma, eta_d: 23.025850929940457, y: 1.000007, loglik: 10.348981075102735, score_mu: 70000.0000009027, score_d: 0.2550011433293454, hessian_dd: -0.24499885668732124, fisher_d: 0.5000000000166667, step_d: 0.5100022866416908 },
         Reference { kind: gamma, eta_d: 27.631021115928547, y: 1.0000007, loglik: 12.651571439117804, score_mu: 699999.9999646172, score_d: 0.25500011435812436, hessian_dd: -0.24499988564204228, fisher_d: 0.5000000000001666, step_d: 0.5100002287160788 },

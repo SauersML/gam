@@ -2878,7 +2878,7 @@ mod derivative_stack_tests {
         }
         eprintln!("Stirling gap: worst relative error {worst:e}");
         // The cancelling forms this kernel replaces, at a Gamma shape of 1e10.
-        let x = 1.0e10;
+        let x = 1.0e10_f64;
         let naive_first = x.ln() - digamma_positive(x);
         assert!(
             ((naive_first - 5.0000000000833333333e-11) / 5.0000000000833333333e-11).abs() > 1.0e-9,
