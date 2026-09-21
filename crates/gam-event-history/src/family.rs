@@ -373,6 +373,34 @@ impl EventHistoryFamily {
         self.computed_reference(states)
     }
 
+    /// The reference evolution at a coefficient vector, or `None` where the
+    /// family has no reference population and the baselines are centred on
+    /// the stationary prior.
+    ///
+    /// A prediction averaged over the parameter posterior evaluates this once
+    /// per state: the reference population's own evolution moves with the
+    /// coefficients, so carrying the fitted snapshot across states would pair
+    /// a perturbed baseline with the risk sets of a different model
+    /// (`super::posterior`).
+    pub(crate) fn reference_at_coefficients(
+        &self,
+        beta: &[f64],
+    ) -> Result<Option<RiskSetCentring>, EventHistoryError> {
+        if self.reference.is_none() {
+            return Ok(None);
+        }
+        let width = self.total_width();
+        if beta.len() != width {
+            return Err(EventHistoryError::InvalidInput {
+                reason: format!(
+                    "the reference evolution needs {width} coefficients in the family's layout, got {}",
+                    beta.len()
+                ),
+            });
+        }
+        self.reference_at(beta).map(Some)
+    }
+
     /// Start of an evaluation: a refusal an earlier evaluation left is gone.
     fn clear_reference_refusal(&self) {
         if let Ok(mut refusal) = self.reference_refusal.lock() {
@@ -1362,34 +1390,76 @@ pub struct EventHistoryFit {
     pub inference_notes: FitNotes,
 }
 
+/// `log M_d(t)` for one stratum under a reference evolution, by the same
+/// linear interpolation in the log of the normaliser the fit used. Empty when
+/// there is no evolution, which is what tells the filter to centre on the
+/// stationary prior instead.
+///
+/// One rule, read by two owners: [`EventHistoryFit::risk_set_normaliser_at`]
+/// reads the fit's own snapshot, and a posterior-predictive average reads the
+/// evolution of the state it is currently at (`super::posterior`). A
+/// prediction must not be able to take one from the fit while the rest of it
+/// runs at another state's coefficients.
+pub(crate) fn risk_set_normaliser_of(
+    snapshot: Option<&RiskSetCentring>,
+    marks: usize,
+    stratum: usize,
+    t: f64,
+) -> Result<Vec<f64>, EventHistoryError> {
+    let Some(snapshot) = snapshot else {
+        if stratum != 0 {
+            return Err(EventHistoryError::InvalidInput {
+                reason: "a model without reference strata requires stratum zero".to_string(),
+            });
+        }
+        return Ok(Vec::new());
+    };
+    if stratum >= snapshot.profiles.nrows() {
+        return Err(EventHistoryError::InvalidInput {
+            reason: format!(
+                "reference stratum {stratum} is outside 0..{}",
+                snapshot.profiles.nrows()
+            ),
+        });
+    }
+    let grid = &snapshot.grid;
+    let nodes = grid.len();
+    let (lower, weight) = grid.locate(t)?;
+    let base = stratum * nodes;
+    Ok((0..marks)
+        .map(|d| {
+            let low = snapshot.log_normaliser[(base + lower) * marks + d];
+            let high = snapshot.log_normaliser[(base + lower + 1) * marks + d];
+            low + weight * (high - low)
+        })
+        .collect())
+}
+
 impl EventHistoryFit {
     /// `log M_d(t)` for one stratum at an arbitrary time, by the same linear
     /// interpolation in the log of the normaliser the fit used. Empty when
     /// the baselines are centred on the stationary prior.
     pub fn risk_set_normaliser_at(&self, stratum: usize, t: f64) -> Result<Vec<f64>, EventHistoryError> {
-        let marks = self.marks();
-        let Some(snapshot) = self.centring.as_ref() else {
-            if stratum != 0 {
-                return Err(EventHistoryError::InvalidInput { reason: "a model without reference strata requires stratum zero".to_string() });
-            }
-            return Ok(Vec::new());
-        };
-        if stratum >= snapshot.profiles.nrows() {
-            return Err(EventHistoryError::InvalidInput {
-                reason: format!("reference stratum {stratum} is outside 0..{}", snapshot.profiles.nrows()),
-            });
-        }
-        let grid = &snapshot.grid;
-        let nodes = grid.len();
-        let (lower, weight) = grid.locate(t)?;
-        let base = stratum * nodes;
-        Ok((0..marks)
-            .map(|d| {
-                let low = snapshot.log_normaliser[(base + lower) * marks + d];
-                let high = snapshot.log_normaliser[(base + lower + 1) * marks + d];
-                low + weight * (high - low)
-            })
-            .collect())
+        risk_set_normaliser_of(self.centring.as_ref(), self.marks(), stratum, t)
+    }
+
+    /// The fit's coefficients in the family's layout: the mark blocks in mark
+    /// order, then the latent block. This is the vector the posterior
+    /// covariance is expressed in, so it is also the centre a
+    /// posterior-predictive rule steps away from
+    /// ([`super::posterior::ParameterState`]).
+    pub fn fitted_coefficients(&self) -> Vec<f64> {
+        self.fit
+            .block_states
+            .iter()
+            .flat_map(|state| state.beta.iter().copied())
+            .collect()
+    }
+
+    /// Where each block starts in [`Self::fitted_coefficients`], with the
+    /// total width last.
+    pub(crate) fn coefficient_block_offsets(&self) -> Vec<usize> {
+        self.family.block_offsets()
     }
 
     /// The rank of the latent covariance the fit carries: the rank the

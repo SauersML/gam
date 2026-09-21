@@ -64,17 +64,29 @@ impl EventHistoryFamily {
     pub(super) fn computed_reference(&self, states: &[ParameterBlockState]) -> Result<RiskSetCentring, EventHistoryError> {
         self.validate_states(states).map_err(|reason| EventHistoryError::InvalidInput { reason })?;
         let beta: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
+        self.reference_at(&beta)
+    }
+
+    /// The same reference law from the coefficients alone.
+    ///
+    /// The evolution is a function of `beta` and of the reference tables; the
+    /// node predictors a [`ParameterBlockState`] also carries never enter it.
+    /// A prediction that has to evaluate the law at a coefficient vector the
+    /// fit never took — every state of a posterior-predictive average
+    /// (`super::posterior`) — therefore does not have to fabricate node
+    /// predictors of the training cohort's length to ask for it.
+    pub(super) fn reference_at(&self, beta: &[f64]) -> Result<RiskSetCentring, EventHistoryError> {
         let latent_offset = self.block_offsets()[self.marks()];
         let latent = Array1::from(beta[latent_offset..].to_vec());
         let rates = self.atom_rates(&latent);
-        let out = self.reference_values(&beta,
+        let out = self.reference_values(beta,
             &beta[latent_offset..latent_offset + self.marks() * self.atoms], &rates)?;
         let tables = self.reference.as_ref().ok_or_else(|| EventHistoryError::InvalidInput {
             reason: "reference centring requires reference tables".to_string(),
         })?;
         let (_, mask_of_mark) = crate::preserve::killing_masks(&tables.kinds);
         Ok(RiskSetCentring { grid: tables.grid.clone(), profiles: tables.profiles.clone(),
-            coefficients: beta, node_stratum: tables.node_stratum.clone(),
+            coefficients: beta.to_vec(), node_stratum: tables.node_stratum.clone(),
             log_normaliser: out.log_normaliser,
             log_risk_mass: out.log_risk_mass, masks: out.masks, mask_of_mark })
     }

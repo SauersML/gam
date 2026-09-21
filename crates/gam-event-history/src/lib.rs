@@ -22,6 +22,7 @@ mod forecast;
 mod formula;
 pub mod joint;
 mod marginal;
+mod posterior;
 mod preserve;
 mod scalar;
 mod static_state;
@@ -39,8 +40,10 @@ pub use family::{
 pub use forecast::{
     Forecast, ForecastRequest, FutureSegment, HistoryForecastRequest, PopulationForecastRequest,
     SmoothedLatentState, SpellPit, forecast, forecast_history, latent_state, pit_uniform_distance,
-    population_forecast, predictive_pit, baseline_log_rates,
+    population_forecast, posterior_predictive_forecast, posterior_predictive_forecast_history,
+    posterior_predictive_population_forecast, predictive_pit, baseline_log_rates,
 };
+pub use posterior::PosteriorPredictiveForecast;
 pub use preserve::{ReferenceGrid, ReferenceStrata};
 
 #[cfg(test)]

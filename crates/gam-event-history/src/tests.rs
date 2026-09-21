@@ -17,7 +17,7 @@ use super::family::{
 use super::forecast::{
     ForecastRequest, FutureSegment, HistoryForecastRequest, PopulationForecastRequest, SpellPit,
     forecast, forecast_history, latent_state, pit_uniform_distance, population_forecast,
-    predictive_pit,
+    posterior_predictive_forecast, predictive_pit,
 };
 use super::marginal::{Evaluation, SubjectInputs, subject_marginal};
 use super::preserve::{ReferenceGrid, ReferenceStrata, killing_masks, stratum_normalisers};
@@ -3890,6 +3890,234 @@ fn constant_hazard_forecasts_are_exact_at_every_horizon() {
             );
         }
     }
+}
+
+/// The censored subject of the constant-hazard fixture and three horizons
+/// placed at integrated terminal hazards of one half, one and two from its
+/// exit.
+fn constant_hazard_window(
+    cohort: &EventHistoryCohort,
+    rates: &[f64],
+) -> (SubjectHistory, Vec<f64>) {
+    let total_terminal = rates[0] + rates[1];
+    let censored = cohort
+        .subjects
+        .iter()
+        .find(|s| s.terminal_event(&cohort.mark_kinds).is_none())
+        .expect("a censored subject")
+        .clone();
+    let horizons = [0.5, 1.0, 2.0]
+        .iter()
+        .map(|h| censored.exit + h / total_terminal)
+        .collect();
+    (censored, horizons)
+}
+
+/// A posterior that spreads along no direction leaves the average with one
+/// state, and that state is the fitted one, so the posterior-predictive
+/// forecast IS the conditional forecast — bit for bit, not within a bar
+/// (gam#2964).
+///
+/// This is the control the whole averaging layer rests on. Every other arm of
+/// it perturbs the coefficients, rebuilds a reference evolution and refilters
+/// a history; if that path did not reproduce the fitted state when handed the
+/// fitted coefficients, every averaged probability would be measured from a
+/// different model than the conditional one it is compared against, and no
+/// gap would reveal it.
+#[test]
+fn a_posterior_that_spreads_nowhere_averages_to_the_conditional_forecast_2964() {
+    install_test_logger();
+    let (cohort, mut fit, rates) = constant_hazard_fit();
+    let width = fit.family.total_width();
+    // A fit whose coefficients are determined: the average has nothing to
+    // integrate over and its rule is the single fitted state.
+    fit.fit.covariance_corrected = Some(Array2::<f64>::zeros((width, width)));
+    let (censored, horizons) = constant_hazard_window(&cohort, &rates);
+    let request = ForecastRequest {
+        history: &censored,
+        horizons: &horizons,
+        future: &[],
+        stratum: 0,
+    };
+    // The state rebuilt at the fitted coefficients is the fitted state.
+    let rebuilt = super::posterior::ParameterState::at(&fit, &fit.fitted_coefficients())
+        .expect("the state at the fitted coefficients");
+    let fitted = super::posterior::ParameterState::fitted(&fit);
+    assert_eq!(rebuilt.log_rates, fitted.log_rates);
+    assert_eq!(rebuilt.loadings, fitted.loadings);
+    for (d, (a, b)) in rebuilt.mark_betas.iter().zip(fitted.mark_betas.iter()).enumerate() {
+        assert_eq!(
+            a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "mark {d}: the rebuilt block differs from the fitted one"
+        );
+    }
+    let conditional = forecast(&fit, &cohort, &request).expect("conditional forecast");
+    let averaged = posterior_predictive_forecast(&fit, &cohort, &request)
+        .expect("posterior-predictive forecast");
+    emit(&format!(
+        "[2964 zero] directions {} states {} / {} at orders {} / {}; unresolved posterior variance {:e}",
+        averaged.directions,
+        averaged.states,
+        averaged.check_states,
+        averaged.order,
+        averaged.check_order,
+        averaged.unresolved_posterior_variance
+    ));
+    assert_eq!(averaged.directions, 0, "a zero covariance resolves no direction");
+    assert_eq!((averaged.states, averaged.check_states), (1, 1));
+    for (i, &h) in horizons.iter().enumerate() {
+        assert_eq!(
+            averaged.survival[i].to_bits(),
+            conditional.survival[i].to_bits(),
+            "horizon {h}: averaged survival {} against conditional {}",
+            averaged.survival[i],
+            conditional.survival[i]
+        );
+        assert_eq!(
+            averaged.survival_error[i].to_bits(),
+            conditional.survival_error[i].to_bits()
+        );
+        assert_eq!(
+            averaged.survival_posterior_gap[i], 0.0,
+            "one state on both rungs leaves no gap to measure"
+        );
+        for d in 0..3 {
+            assert_eq!(
+                averaged.expected_counts[[i, d]].to_bits(),
+                conditional.expected_counts[[i, d]].to_bits(),
+                "mark {d} at horizon {h}"
+            );
+            assert_eq!(
+                averaged.expected_count_errors[[i, d]].to_bits(),
+                conditional.expected_count_errors[[i, d]].to_bits()
+            );
+            assert_eq!(averaged.expected_count_posterior_gaps[[i, d]], 0.0);
+        }
+    }
+}
+
+/// Along one posterior direction the average is a one-dimensional Gaussian
+/// integral with a closed integrand, and the layer must reproduce it
+/// (gam#2964).
+///
+/// The fixture is rank zero and intercept-only, so the survival at one
+/// parameter state is exactly `exp(−(λ₀ + λ₁)(h − exit))` — the identity
+/// `constant_hazard_forecasts_are_exact_at_every_horizon` already pins. Give
+/// the posterior a single direction along mark zero's intercept, at the
+/// standard deviation the fit itself reports for that coefficient, and the
+/// posterior-predictive survival is
+/// `E_ξ[exp(−(e^{β̂₀+σξ} + λ₁)(h − exit))]` with `ξ` standard normal. The
+/// reference is that expectation taken independently, at Gauss-Hermite order
+/// 65, and the bar is derived: the rule's own gap the layer returns, plus the
+/// window's own error, plus the reference's own convergence, measured by
+/// halving its order.
+#[test]
+fn a_one_direction_posterior_average_matches_its_own_gaussian_integral_2964() {
+    install_test_logger();
+    let (cohort, mut fit, rates) = constant_hazard_fit();
+    let width = fit.family.total_width();
+    let conditional_covariance = fit
+        .fit
+        .beta_covariance()
+        .expect("the fit publishes a conditional covariance")
+        .clone();
+    let sd = conditional_covariance[[0, 0]].sqrt();
+    assert!(
+        sd.is_finite() && sd > 0.0,
+        "mark zero's intercept has no posterior spread to average over: {sd}"
+    );
+    // One direction: mark zero's intercept, at the spread the fit reports.
+    let mut covariance = Array2::<f64>::zeros((width, width));
+    covariance[[0, 0]] = sd * sd;
+    fit.fit.covariance_corrected = Some(covariance);
+    let (censored, horizons) = constant_hazard_window(&cohort, &rates);
+    let request = ForecastRequest {
+        history: &censored,
+        horizons: &horizons,
+        future: &[],
+        stratum: 0,
+    };
+    let averaged = posterior_predictive_forecast(&fit, &cohort, &request)
+        .expect("posterior-predictive forecast");
+    assert_eq!(averaged.directions, 1, "a rank-one covariance resolves one direction");
+    assert_eq!(averaged.states, averaged.order);
+    assert_eq!(averaged.check_states, averaged.check_order);
+    let beta0 = fit.mark_coefficients(0)[0];
+    // `E_ξ[exp(−(e^{β̂₀+σξ} + λ₁)(h − exit))]` at Gauss-Hermite order `order`.
+    let reference = |order: usize, elapsed: f64| -> f64 {
+        let gh = GaussHermite::new(order).expect("reference rule");
+        gh.nodes
+            .iter()
+            .zip(gh.normal_weights.iter())
+            .map(|(x, w)| {
+                let lambda0 = (beta0 + sd * std::f64::consts::SQRT_2 * x).exp();
+                w * (-(lambda0 + rates[1]) * elapsed).exp()
+            })
+            .sum()
+    };
+    for (i, &h) in horizons.iter().enumerate() {
+        let elapsed = h - censored.exit;
+        let dense = reference(65, elapsed);
+        let coarse = reference(33, elapsed);
+        let bar = averaged.survival_posterior_gap[i]
+            + averaged.survival_error[i]
+            + (dense - coarse).abs();
+        emit(&format!(
+            "[2964 one] horizon {h}: averaged {:e}, reference {dense:e}, rule gap {:e}, window error {:e}, reference convergence {:e}",
+            averaged.survival[i],
+            averaged.survival_posterior_gap[i],
+            averaged.survival_error[i],
+            (dense - coarse).abs()
+        ));
+        assert!(dense > bar, "the reference survival {dense} is not above its bar {bar}");
+        assert!(
+            (averaged.survival[i] - dense).abs() <= bar,
+            "horizon {h}: the averaged survival {} misses its own Gaussian integral {dense} by {:e}, past {bar:e}",
+            averaged.survival[i],
+            (averaged.survival[i] - dense).abs()
+        );
+    }
+    // Averaging the probabilities is not evaluating at the averaged
+    // parameter, and the difference has a sign this model names exactly:
+    // `d²S/dβ₀² = t λ₀ S (t λ₀ − 1)`, so the average stands above the plug-in
+    // where mark zero's integrated hazard passes one and below it where it
+    // does not. The three horizons straddle that crossing, so each arm is a
+    // control on the other: a layer that evaluated at an averaged parameter
+    // would sit on the plug-in at every horizon, and one that averaged with
+    // the wrong curvature would fail on one side.
+    let conditional = forecast(&fit, &cohort, &request).expect("conditional forecast");
+    let lambda0 = beta0.exp();
+    let (mut above, mut below) = (0, 0);
+    for (i, &h) in horizons.iter().enumerate() {
+        let elapsed = h - censored.exit;
+        let curvature = lambda0 * elapsed - 1.0;
+        let difference = averaged.survival[i] - conditional.survival[i];
+        let separation = averaged.survival_posterior_gap[i]
+            + averaged.survival_error[i]
+            + conditional.survival_error[i];
+        emit(&format!(
+            "[2964 one] horizon {h}: averaged {:e} against conditional {:e}, difference {difference:+e}, t·λ₀ − 1 = {curvature:+.4}, separation bar {separation:e}",
+            averaged.survival[i], conditional.survival[i]
+        ));
+        assert!(
+            difference.abs() > separation,
+            "horizon {h}: the average {} and the plug-in {} differ by {difference:e}, inside the {separation:e} their own errors carry; the layer is not averaging probabilities",
+            averaged.survival[i],
+            conditional.survival[i]
+        );
+        if curvature > 0.0 {
+            assert!(difference > 0.0, "horizon {h}: t·λ₀ = {} exceeds one, so the average must stand above the plug-in, and it is {difference:e} from it", lambda0 * elapsed);
+            above += 1;
+        } else {
+            assert!(difference < 0.0, "horizon {h}: t·λ₀ = {} is under one, so the average must stand below the plug-in, and it is {difference:e} from it", lambda0 * elapsed);
+            below += 1;
+        }
+    }
+    assert!(
+        above > 0 && below > 0,
+        "the fixture's horizons must straddle t·λ₀ = 1 for either arm to be a control: {above} above, {below} below"
+    );
 }
 
 #[test]

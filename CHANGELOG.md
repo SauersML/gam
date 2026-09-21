@@ -8,6 +8,26 @@
   the posterior nodes that give the risk. `gam predict` writes the same columns.
 - The marginal-slope same-β caches are keyed on the data and the latent law they
   read, not on buffer addresses.
+- **Event-history forecasts averaged over the parameter posterior, not evaluated at its mean**
+  (gam#2964). Every event probability the crate returned was `P(· | data, θ̂)`: `node_eta0` read one
+  stored coefficient vector, `latent_parameters` one stored set of loadings and rates, and the one
+  stored `RiskSetCentring` supplied the baseline at every state. The probabilities are nonlinear in
+  the parameters, so averaging the parameters and then evaluating is not evaluating and then
+  averaging — with an exponential posterior of mean one on an event rate, the posterior-predictive
+  one-unit event probability is 1/2 while the plug-in reads `1 − e^{−1} ≈ 0.632`. The new
+  `posterior_predictive_forecast`, `posterior_predictive_forecast_history` and
+  `posterior_predictive_population_forecast` return `E_θ[P(· | data, θ)]`. The approximation is a
+  Gauss-Hermite product rule over the Gaussian posterior of the coefficients, on the directions its
+  covariance resolves, and every state the rule visits rebuilds its OWN reference evolution and
+  refilters the history at its own coefficients: no averaged loading covariance, no averaged
+  baseline, no probability at averaged coefficients. Its resolution is checked on what is returned,
+  not asserted — the average is taken again on the next Gauss-Hermite rung `2G − 1`, the gap is
+  returned beside every probability, and a gap the fit's quadrature tolerance does not cover is a
+  typed refusal. A rule whose states do not fit the machine's materialisation budget is refused
+  with its direction and point counts named, rather than trimmed to a cheaper rule that would make
+  the probability a function of the machine. The conditional entry points keep their names and
+  their meaning, labelled, which is what SPEC 25 asks of a conditional prediction that is kept.
+
 - **The constrained cone term skipped every Firth fit on a premise about the stored gradient that
   is not true** (gam#2765). The criterion's constrained term was declared inapplicable under Firth
   bias reduction because `PirlsResult::penalized_gradient_transformed` was read as
