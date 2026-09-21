@@ -1624,8 +1624,9 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // Fix: after the solve converges, re-estimate ν at the converged η. If it
     // moved, re-solve β (warm-started, ν held fixed at the refreshed value) and
     // repeat, driving the pair (β, ν) to their joint fixed point at the current
-    // λ. At convergence the reported dispersion is the Gamma ML estimate at the
-    // converged mean (mgcv's post-hoc Pearson/deviance scale), and the final
+    // λ. At convergence the reported dispersion is the Gamma shape that makes
+    // the Laplace marginal likelihood stationary at the converged mean (the
+    // profile score less the edf/(2ν) charge of −½ log|H|, #4075), and the final
     // working state — `finalweights`, the penalized Hessian, the deviance, μ —
     // is rebuilt with that same ν, so `Vb = H⁻¹·φ̂` stays internally consistent.
     // Warm-started solves (every REML cost eval) already sit near the converged
@@ -1652,11 +1653,17 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         // reported quantity meaningfully (far under statistical resolution).
         const SHAPE_REFRESH_REL_TOL: f64 = 1e-4;
         for refresh_iter in 0..MAX_SHAPE_REFRESH {
+            // The shape is the stationary point of the Laplace marginal
+            // likelihood at fixed λ, whose −½ log|H| term charges the edf of
+            // the mean model (#4075); the edf is read off the current Hessian.
+            let mean_model_edf =
+                calculate_edf_with_penalty(&working_summary.state.hessian, &penalty_active)?;
             let refreshed_shape = super::estimate_gamma_shape_from_eta(
                 &working_model.likelihood.spec.link,
                 y,
                 working_summary.state.eta.as_ref(),
                 priorweights,
+                mean_model_edf,
             )?;
             let prior_shape = working_model
                 .likelihood
@@ -1747,11 +1754,16 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             // here), so cold starts settle in 1–2 re-solves and warm starts in
             // zero.
             for refresh_iter in 0..MAX_PHI_REFRESH {
+                // Pearson moment on the residual degrees of freedom n₊ − edf
+                // (#4075), with the edf of the current converged mean model.
+                let mean_model_edf =
+                    calculate_edf_with_penalty(&working_summary.state.hessian, &penalty_active)?;
                 let refreshed_phi = super::estimate_tweedie_phi_from_eta(
                     y,
                     working_summary.state.eta.as_ref(),
                     priorweights,
                     p,
+                    mean_model_edf,
                 )?;
                 let prior_phi = working_model
                     .likelihood
@@ -1801,10 +1813,12 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
 
     // ── Gaussian (non-identity link) / inverse Gaussian dispersion φ ─────────
     //
-    // The same converged-η refresh as the Tweedie φ above, with the exact MLE
-    // `φ̂ = Σ wᵢ dᵢ / n₊` in place of the Pearson moment. As in every
-    // converged-η refresh, a φ still moving on the last allowed pass is a failed
-    // fit, not a reported one: the reported φ must be the MLE at the reported η.
+    // The same converged-η refresh as the Tweedie φ above, with the scale that
+    // makes the Laplace marginal likelihood stationary at fixed λ,
+    // `φ̂ = Σ wᵢ dᵢ / (n₊ − edf)` (#4075), in place of the Pearson moment. As in
+    // every converged-η refresh, a φ still moving on the last allowed pass is a
+    // failed fit, not a reported one: the reported φ must be the estimate at the
+    // reported η.
     if refine_dispersion_at_converged_eta
         && matches!(
             working_model
@@ -1819,12 +1833,15 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     {
         let mut converged = false;
         for _ in 0..MAX_PHI_REFRESH {
+            let mean_model_edf =
+                calculate_edf_with_penalty(&working_summary.state.hessian, &penalty_active)?;
             let refreshed_phi = super::estimate_dispersion_phi_from_eta(
                 &working_model.likelihood.spec.response,
                 &working_model.likelihood.spec.link,
                 y,
                 working_summary.state.eta.as_ref(),
                 priorweights,
+                mean_model_edf,
             )?;
             let prior_phi = working_model
                 .likelihood

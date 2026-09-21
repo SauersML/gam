@@ -1067,6 +1067,9 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 self.y,
                 &self.workspace.eta_buf,
                 self.priorweights,
+                // Warm-start seed: no converged mean model exists yet to charge
+                // edf for; the reported fit re-estimates on n₊ − edf (#4075).
+                0.0,
             )?;
             self.likelihood = self.likelihood.clone().with_gamma_shape(shape);
             self.gamma_shape_locked = true;
@@ -1114,6 +1117,8 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     &self.workspace.eta_buf,
                     self.priorweights,
                     p,
+                    // Warm-start seed; see the Gamma shape seed above.
+                    0.0,
                 )?;
                 self.likelihood = self.likelihood.clone().with_tweedie_phi(phi);
                 self.tweedie_phi_locked = true;
@@ -1138,6 +1143,8 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 self.y,
                 &self.workspace.eta_buf,
                 self.priorweights,
+                // Warm-start seed; see the Gamma shape seed above.
+                0.0,
             )?;
             self.likelihood = self.likelihood.clone().with_dispersion_phi(phi);
             self.dispersion_phi_locked = true;

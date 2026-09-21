@@ -2964,11 +2964,14 @@ mod tests {
             .likelihood
             .gamma_shape()
             .expect("gamma fit should expose fitted shape");
+        // `fit_model_for_fixed_rho` does not run the reported-fit refresh, so
+        // its shape is the plug-in (edf-free) estimate.
         let profiled_shape = super::estimate_gamma_shape_from_eta(
             &result.likelihood.spec.link,
             y.view(),
             &result.final_eta.to_owned(),
             w.view(),
+            0.0,
         )
         .expect("converged Gamma shape must be representable");
         let eta = result.final_eta[0];

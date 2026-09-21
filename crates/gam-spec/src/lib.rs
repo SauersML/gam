@@ -2435,7 +2435,10 @@ pub enum LikelihoodScaleMetadata {
     FixedDispersion { phi: f64 },
     /// Fixed Gamma shape `k`, equivalent to `phi = 1 / k`.
     FixedGammaShape { shape: f64 },
-    /// Gamma shape `k` estimated jointly with the mean model.
+    /// Gamma shape `k` estimated jointly with the mean model. The reported fit
+    /// takes the root of the Laplace marginal-likelihood shape score at fixed λ,
+    /// the profile score less the `edf/(2k)` charge of `−½ log|H|`, so a large
+    /// shape tracks `(n₊ − edf)/D` rather than `n₊/D` (#4075).
     EstimatedGammaShape { shape: f64 },
     /// Beta-regression precision `phi` estimated jointly with the mean model.
     /// `Var(y) = mu(1-mu)/(1+phi)`; larger `phi` means less noise. Estimated
@@ -2458,9 +2461,10 @@ pub enum LikelihoodScaleMetadata {
     /// Tweedie exponential-dispersion `phi` estimated jointly with the mean
     /// model. `Var(y) = phi · mu^p` with `phi` a genuine free parameter (unlike
     /// Binomial/Poisson, where `phi ≡ 1`). Estimated by the Pearson moment
-    /// estimator `phî = Σ wᵢ (yᵢ − μᵢ)² / μᵢ^p / n₊` (prior weights are
+    /// estimator `phî = Σ wᵢ (yᵢ − μᵢ)² / μᵢ^p / (n₊ − edf)` (prior weights are
     /// precisions, `Var(yᵢ) = phi · μᵢ^p / wᵢ`; `n₊` counts the positive-weight
-    /// rows) at the converged η and
+    /// rows and `edf` is the mean model's effective degrees of freedom, #4075)
+    /// at the converged η and
     /// refreshed across outer iterations, exactly like the Gamma shape and the
     /// Beta precision. `phi` enters the IRLS working weight `prior·μ^{2−p}/phi`,
     /// so the coefficient covariance `Vb = H⁻¹` already scales as `phi` and the
@@ -2470,9 +2474,11 @@ pub enum LikelihoodScaleMetadata {
     /// the families whose log-density couples `phi` to the data only through
     /// the unit deviance, `ℓ = −d(y,μ)/(2φ) − ½·log(2πφ·a(y))`: inverse-Gaussian
     /// (`a(y) = y³`) and Gaussian with a non-identity link (`a(y) = 1`). The
-    /// exact MLE under precision prior weights (`φ/wᵢ` per row) is then
-    /// `phî = Σ wᵢ dᵢ / n₊` over the `n₊` positive-weight rows at the converged
-    /// η. `phi` is
+    /// reported estimate under precision prior weights (`φ/wᵢ` per row) is the
+    /// stationary point of the Laplace marginal likelihood at fixed λ,
+    /// `phî = Σ wᵢ dᵢ / (n₊ − edf)` over the `n₊` positive-weight rows at the
+    /// converged η (#4075; the plug-in MLE `Σ wᵢ dᵢ / n₊` ignores the edf the
+    /// mean model spent). `phi` is
     /// stored as the dispersion itself (not `√phi`) and enters the IRLS working
     /// weight as `prior·(dμ/dη)²/(phi·V(μ))`, so `Vb = H⁻¹` already scales as
     /// `phi`. Held as [`Self::FixedDispersion`] across the λ search and
