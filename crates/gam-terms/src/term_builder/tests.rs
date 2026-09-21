@@ -4655,6 +4655,66 @@ fn a_continuous_by_smooth_keeps_its_constant_in_the_penalised_block() {
     );
 }
 
+/// The continuous-`by=` constant rule is about the varying coefficient, so a
+/// tensor inner obeys it too (#4191): `te(x, x2, by=z)` must not keep the
+/// full-tensor sum-to-zero gauge that deletes `z·c`. `ti()` keeps its
+/// per-margin centring (its structure), an explicit option still wins, and a
+/// binary by-variable keeps the factor convention.
+#[test]
+fn a_continuous_by_tensor_keeps_its_constant_in_the_penalised_block() {
+    let rows = (0..60)
+        .map(|i| {
+            let t = i as f64 / 59.0;
+            let u = ((7 * i) % 60) as f64 / 59.0;
+            vec![(6.0 * t).sin() * u, t, u, 0.3 * t - 0.1, f64::from(i % 2)]
+        })
+        .collect::<Vec<_>>();
+    let mut ds = continuous_dataset(&["y", "x", "x2", "z", "b"], rows);
+    ds.schema.columns[4].kind = ColumnKindTag::Binary;
+    ds.column_kinds[4] = ColumnKindTag::Binary;
+    let col_map = ds.column_map();
+    let inner_identifiability = |body: &str| -> crate::smooth::TensorBSplineIdentifiability {
+        let parsed = parse_formula(&format!("y ~ {body}")).expect("parse by-tensor formula");
+        let terms = build_termspec(&parsed.terms, &ds, &col_map, &mut Vec::new())
+            .expect("build by-tensor");
+        let SmoothBasisSpec::ByVariable { inner, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected a by-smooth for '{body}'");
+        };
+        let SmoothBasisSpec::TensorBSpline { spec, .. } = inner.as_ref() else {
+            panic!("expected a tensor B-spline inside the by-smooth for '{body}'");
+        };
+        spec.identifiability.clone()
+    };
+    assert!(
+        matches!(
+            inner_identifiability("te(x, x2, by=z)"),
+            crate::smooth::TensorBSplineIdentifiability::None
+        ),
+        "a continuous by-tensor keeps its constant"
+    );
+    assert!(
+        matches!(
+            inner_identifiability("ti(x, x2, by=z)"),
+            crate::smooth::TensorBSplineIdentifiability::MarginalSumToZero
+        ),
+        "a ti() inner keeps its per-margin structure"
+    );
+    assert!(
+        matches!(
+            inner_identifiability("te(x, x2, by=z, identifiability=sum_tozero)"),
+            crate::smooth::TensorBSplineIdentifiability::SumToZero
+        ),
+        "an explicit identifiability request wins"
+    );
+    assert!(
+        matches!(
+            inner_identifiability("te(x, x2, by=b) + b"),
+            crate::smooth::TensorBSplineIdentifiability::SumToZero
+        ),
+        "a binary by-variable keeps the factor convention"
+    );
+}
+
 #[test]
 fn parse_duchon_order_accepts_supportedvalues() {
     let options = BTreeMap::new();
