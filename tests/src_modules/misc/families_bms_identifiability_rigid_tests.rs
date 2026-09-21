@@ -2611,8 +2611,10 @@ fn zero_deviation_intercept_fast_path_matches_denested_calibration() {
     let calibration = family
         .evaluate_denested_calibration_tail(rigid_a, slope, Some(&beta_h), Some(&beta_w), false)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "denested zero-deviation calibration", e));
-    let f_rigid = calibration.tail - marginal.mu;
-    let f_a_rigid = calibration.density;
+    // The tail is held in log form (gam#3639): `T = exp(log T)` and `P′ = (P′/T)·T`.
+    let tail = calibration.log_tail.exp();
+    let f_rigid = tail - marginal.mu;
+    let f_a_rigid = calibration.density_ratio * tail;
     assert!(
         f_rigid.abs() <= 5e-13,
         "closed-form rigid intercept residual should be at machine epsilon, got {f_rigid}"

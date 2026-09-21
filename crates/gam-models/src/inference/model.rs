@@ -6273,7 +6273,6 @@ mod tests {
     #[test]
     fn gaussian_response_scale_is_required_and_positive() {
         let mut payload = FittedModelPayload::new(
-            MODEL_PAYLOAD_VERSION,
             "y ~ 1".to_string(),
             ModelKind::LocationScale,
             FittedFamily::LocationScale {

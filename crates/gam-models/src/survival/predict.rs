@@ -8602,7 +8602,7 @@ mod tests {
         match &sigma_point {
             Ok(result) => eprintln!(
                 "[3575] fraction-to-boundary sigma points: survival SE {:?}",
-                result.survival_se.as_ref().map(|se| se.to_vec())
+                result.survival_se.as_ref().map(|se| se.iter().copied().collect::<Vec<f64>>())
             ),
             Err(error) => eprintln!("[3575] fraction-to-boundary sigma points refused: {error}"),
         }

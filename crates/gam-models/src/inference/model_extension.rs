@@ -707,6 +707,7 @@ mod unseen_level_prior_scale_tests {
                 coefficient_mode_selection:
                     gam_solve::model_types::CoefficientModeSelection::NotRecorded,
                 random_effect_tests: Vec::new(),
+                linear_term_tests: Vec::new(),
             },
             inner_cycles: 0,
         })
