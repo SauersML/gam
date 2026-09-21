@@ -2266,6 +2266,92 @@ fn survival_conditional_covariance_from_penalized_hessian(
     Some(symm)
 }
 
+/// The cone-truncated posterior of a bound-constrained survival transformation
+/// fit (gam#3575).
+///
+/// The inner solve minimizes `F(β) = −ℓ(β) + ½βᵀSβ` over `{β : β_j ≥ lb_j}`.
+/// Its second-order expansion at the returned mode `β̂`, with gradient `g` and
+/// Hessian `H`, is the Gaussian `N(β̂ − H⁻¹g, H⁻¹)`: at an interior mode `g = 0`
+/// and the centre is the mode, but on an active bound `g_j` is the bound's
+/// multiplier and the ambient centre sits outside the cone. The posterior is
+/// that Gaussian restricted to the cone, and its mean and covariance are the
+/// truncated-Gaussian moments the shared constrained-posterior construction
+/// computes — the same construction the custom-family and standard-GAM fits
+/// publish. Each finite bound is one row `e_jᵀβ ≥ lb_j`.
+///
+/// `None` when nothing is bounded or when no bound is within reach of the
+/// ambient law at f64 resolution, where the truncation is invisible and the
+/// Gaussian IS the posterior.
+fn survival_bound_truncated_posterior(
+    ambient: &Array2<f64>,
+    mode: &Array1<f64>,
+    penalized_gradient: &Array1<f64>,
+    lower_bounds: &Array1<f64>,
+    mode_log_likelihood: f64,
+) -> Result<Option<gam_solve::constrained_posterior::ConstrainedPosteriorGeometry>, String> {
+    let p = mode.len();
+    if ambient.dim() != (p, p) || penalized_gradient.len() != p || lower_bounds.len() != p {
+        return Err(format!(
+            "survival truncated posterior: a length-{p} mode against a {:?} covariance, a \
+             length-{} gradient and {} lower bounds",
+            ambient.dim(),
+            penalized_gradient.len(),
+            lower_bounds.len()
+        ));
+    }
+    let bounded: Vec<usize> = (0..p).filter(|&j| lower_bounds[j].is_finite()).collect();
+    if bounded.is_empty() {
+        return Ok(None);
+    }
+    let mut a = Array2::<f64>::zeros((bounded.len(), p));
+    let mut b = Array1::<f64>::zeros(bounded.len());
+    for (row, &j) in bounded.iter().enumerate() {
+        a[[row, j]] = 1.0;
+        b[row] = lower_bounds[j];
+    }
+    let constraints = gam_problem::LinearInequalityConstraints::new(a, b)?;
+    let center = mode - &ambient.dot(penalized_gradient);
+    let Some(correction) =
+        gam_solve::constrained_posterior::constrained_posterior_correction_from_covariance(
+            ambient,
+            &center,
+            &constraints,
+        )?
+    else {
+        return Ok(None);
+    };
+    let mut geometry = gam_solve::constrained_posterior::ConstrainedPosteriorGeometry::with_moments(
+        constraints,
+        mode.clone(),
+        center,
+        Some(correction),
+    );
+    geometry.mode_log_likelihood = Some(mode_log_likelihood);
+    geometry.validate_for_dimension(p)?;
+    Ok(Some(geometry))
+}
+
+/// `N(β_unc, Σ)` restricted to the fit's cone, for the ambient covariance `Σ`
+/// of one covariance definition (conditional `Vb` or corrected `Vp`). The
+/// truncation is rebuilt AT `Σ` — its own lift `ΣAᵀW⁻¹` and orthant moments at
+/// `W = AΣAᵀ` — because a lift derived from another covariance is not a
+/// projector for this one; it is assembled in the sum-of-Grams form whose
+/// diagonal cannot cancel below zero (#2705).
+fn survival_truncated_covariance(
+    geometry: &gam_solve::constrained_posterior::ConstrainedPosteriorGeometry,
+    ambient: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    let center = geometry.unconstrained_center()?;
+    match gam_solve::constrained_posterior::constrained_posterior_correction_from_covariance(
+        ambient,
+        center,
+        &geometry.constraints,
+    )? {
+        Some(correction) => correction.truncated_covariance_psd(ambient, &geometry.constraints),
+        None => Ok(ambient.clone()),
+    }
+}
+
 fn survival_unified_fit_result(
     beta: Array1<f64>,
     lambdas: Array1<f64>,
@@ -2286,6 +2372,14 @@ fn survival_unified_fit_result(
     // The outer gradient at the selected ρ, whose certificate floor decides
     // which ρ directions the correction resolves (#2346).
     outer_gradient: Option<Array1<f64>>,
+    // The coefficient lower bounds the inner solve enforced (the I-spline
+    // baseline's monotonicity cone `β_j ≥ 0`), which truncate the posterior
+    // (gam#3575). `None` when the solve was unbounded.
+    coefficient_lower_bounds: Option<&Array1<f64>>,
+    // The working state at an arbitrary coefficient vector, so the published
+    // posterior mean's log-likelihood and deviance are read at the published
+    // coefficients (gam#2921).
+    evaluate_at: &dyn Fn(&Array1<f64>) -> Result<gam_solve::pirls::WorkingState, String>,
 ) -> Result<UnifiedFitResult, String> {
     if state.eta.len() != training_sample_size {
         return Err(format!(
@@ -2367,8 +2461,28 @@ fn survival_unified_fit_result(
     // Hessian yields the symmetrized inverse; a non-SPD one mints the fit with a
     // typed-absent covariance so predict refuses honestly rather than consuming
     // a fabricated nearby matrix.
-    let covariance_conditional =
+    let ambient_conditional =
         survival_conditional_covariance_from_penalized_hessian(&penalized_hessian);
+    // gam#3575: the inner solve enforced the baseline cone `β_j ≥ lb_j`, so the
+    // posterior is `N(β_unc, H⁻¹)` restricted to the cone, not the Gaussian
+    // itself. Its mean — not the mode — is what the fit publishes, and its
+    // covariance is the truncated one. With no cone row within reach of the
+    // ambient law the truncation is invisible and nothing changes.
+    let constrained_posterior = match (ambient_conditional.as_ref(), coefficient_lower_bounds) {
+        (Some(ambient), Some(lower_bounds)) => survival_bound_truncated_posterior(
+            ambient,
+            &beta,
+            &state.gradient,
+            lower_bounds,
+            state.log_likelihood,
+        )?,
+        _ => None,
+    };
+    let covariance_conditional = match (constrained_posterior.as_ref(), ambient_conditional.as_ref())
+    {
+        (Some(geometry), Some(ambient)) => Some(survival_truncated_covariance(geometry, ambient)?),
+        _ => ambient_conditional.clone(),
+    };
     // Standard errors derive from this matrix (#2955) under the one gate that
     // owns the negative-diagonal judgement (`gam_problem::se_from_covariance`),
     // not a local `max(0, ·)`. A clamp reports a materially negative variance as
@@ -2420,8 +2534,11 @@ fn survival_unified_fit_result(
     let (smoothing_corrected, smoothing_correction_absence) = if lambda_is_fixed {
         (None, None)
     } else {
+        // `A = Vb·U` is the sensitivity of the UNTRUNCATED law's centre, so the
+        // correction is built from the ambient `Vb`, and the corrected law is
+        // truncated afterwards at its own `Vp`.
         match (
-            covariance_conditional.as_ref(),
+            ambient_conditional.as_ref(),
             outer_hessian.as_ref(),
             criterion_certificate.as_ref(),
         ) {
@@ -2482,10 +2599,16 @@ fn survival_unified_fit_result(
     let covariance_corrected = if lambda_is_fixed {
         covariance_conditional.clone()
     } else {
-        smoothing_corrected
+        let ambient_corrected = smoothing_corrected
             .as_ref()
-            .zip(covariance_conditional.as_ref())
-            .map(|((correction, _), v_cond)| v_cond + correction)
+            .zip(ambient_conditional.as_ref())
+            .map(|((correction, _), v_cond)| v_cond + correction);
+        match (ambient_corrected, constrained_posterior.as_ref()) {
+            (Some(ambient), Some(geometry)) => {
+                Some(survival_truncated_covariance(geometry, &ambient)?)
+            }
+            (ambient, _) => ambient,
+        }
     };
     covariance_corrected
         .as_ref()
@@ -2525,9 +2648,31 @@ fn survival_unified_fit_result(
         working_residual: None,
     };
 
+    // The published coefficients are the posterior mean (gam#3575), and the
+    // log-likelihood and deviance are read at them so the returned model
+    // reproduces its own statistics (gam#2921). The REML score, penalized
+    // objective and penalty stay the certified criterion at the mode; the mode's
+    // log-likelihood is kept on the geometry beside the mode.
+    let (published_beta, log_likelihood, deviance) = match constrained_posterior.as_ref() {
+        Some(geometry) => {
+            let mean = geometry.posterior_mean()?;
+            let published = evaluate_at(&mean)?;
+            gam_solve::estimate::ensure_finite_scalar(
+                "survival posterior-mean log_likelihood",
+                published.log_likelihood,
+            )?;
+            gam_solve::estimate::ensure_finite_scalar(
+                "survival posterior-mean deviance",
+                published.deviance,
+            )?;
+            (mean, published.log_likelihood, published.deviance)
+        }
+        None => (beta.clone(), state.log_likelihood, state.deviance),
+    };
+
     UnifiedFitResult::try_from_parts(gam_solve::estimate::UnifiedFitResultParts {
         blocks: vec![gam_solve::estimate::FittedBlock {
-            beta: beta.clone(),
+            beta: published_beta,
             role: gam_problem::BlockRole::Mean,
             edf: edf_total,
             lambdas: lambdas.clone(),
@@ -2538,8 +2683,8 @@ fn survival_unified_fit_result(
         likelihood_family: Some(LikelihoodSpec::royston_parmar()),
         likelihood_scale: gam_problem::LikelihoodScaleMetadata::Unspecified,
         log_likelihood_normalization: gam_problem::LogLikelihoodNormalization::UserProvided,
-        log_likelihood: state.log_likelihood,
-        deviance: state.deviance,
+        log_likelihood,
+        deviance,
         reml_score: Some(reml_score),
         stable_penalty_term: state.penalty_term,
         penalized_objective: Some(reml_score),
@@ -2562,7 +2707,7 @@ fn survival_unified_fit_result(
         geometry: Some(gam_solve::estimate::FitGeometry {
             coefficient_gauge: gam_problem::gauge::Gauge::identity(&[beta.len()]),
             penalized_hessian,
-            constrained_posterior: None,
+            constrained_posterior,
             working: None,
         }),
         block_states: Vec::new(),
@@ -3762,6 +3907,12 @@ pub(crate) fn fit_survival_transformation_model(
         survival_outer_certificate,
         survival_outer_hessian,
         survival_outer_gradient,
+        opts.coefficient_lower_bounds.as_ref(),
+        &|coefficients: &Array1<f64>| {
+            model
+                .update_state(coefficients)
+                .map_err(|error| format!("survival posterior-mean state: {error}"))
+        },
     )
     // Result assembly from the fit's own state (#2937).
     .map_err(FitFailure::invariant)?;
