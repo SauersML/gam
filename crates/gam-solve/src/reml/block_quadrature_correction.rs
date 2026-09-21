@@ -511,8 +511,7 @@ impl<'a> RemlState<'a> {
         // `H` (ascending) where that resolves `log|H|` and the root SVD
         // (descending) where it does not (#2644), and the route can change
         // between two ρ of one search.
-        let mut ascending: Vec<usize> = (0..evals.len()).collect();
-        ascending.sort_by(|&a, &b| evals[a].total_cmp(&evals[b]).then(a.cmp(&b)));
+        let ascending = ascending_spectral_order(&evals);
         let latched_quadrature = self
             .block_correction_axis_orders
             .lock()
@@ -521,31 +520,46 @@ impl<'a> RemlState<'a> {
             .filter(|latch| Some(latch.block_positions.len()) == latched_block_dim);
         let mut block_cols: Vec<usize> = match (&latched_quadrature, latched_block_dim) {
             (Some(latch), _) => {
-                if let Some(&k) = latch
+                // The spectrum's dimension is the model's, so a latched position
+                // outside it is a broken latch at every ρ, not a trial point.
+                let Some(cols) = latch
                     .block_positions
                     .iter()
-                    .find(|&&k| k >= ascending.len() || evals[ascending[k]] <= 0.0)
+                    .map(|&k| ascending.get(k).copied())
+                    .collect::<Option<Vec<usize>>>()
+                else {
+                    return Err(EstimationError::BlockQuadratureCorrectionRefused {
+                        stage: BlockQuadratureCorrectionStage::LatchedBlockUnavailable {
+                            block_dim: latch.block_positions.len(),
+                            spectrum_dim: evals.len(),
+                        },
+                    });
+                };
+                // The block is whitened by `√λ_r`, so a latched direction whose
+                // curvature is not positive at this ρ has no block marginal. That
+                // is a fact about this trial point, which the outer search backs
+                // away from (#3113).
+                if let Some(&r) = cols
+                    .iter()
+                    .find(|&&r| !(evals[r].is_finite() && evals[r] > 0.0))
                 {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "#784 latched block direction at spectral position {k} has no positive \
-                         curvature at this rho (eigenvalue {:?}); the block the admission \
-                         integrated does not exist here",
-                        ascending.get(k).map(|&r| evals[r])
-                    )));
+                    return Err(EstimationError::BlockQuadratureCorrectionRefused {
+                        stage: BlockQuadratureCorrectionStage::NonPositivePenalizedCurvature {
+                            min_eigenvalue: evals[r],
+                        },
+                    });
                 }
-                latch
-                    .block_positions
-                    .iter()
-                    .map(|&k| ascending[k])
-                    .collect()
+                cols
             }
             // The admission and its block are latched together below, so an
             // admission without its block is a broken latch, not a model.
             (None, Some(m)) => {
-                return Err(EstimationError::InvalidInput(format!(
-                    "#784 block correction latched with block dimension {m} but without the \
-                     block it integrated"
-                )));
+                return Err(EstimationError::BlockQuadratureCorrectionRefused {
+                    stage: BlockQuadratureCorrectionStage::LatchedBlockUnavailable {
+                        block_dim: m,
+                        spectrum_dim: evals.len(),
+                    },
+                });
             }
             (None, None) => verdict
                 .untrustworthy_directions
@@ -1292,6 +1306,17 @@ fn block_correction_design_admission(
         });
     }
     Ok(())
+}
+
+/// The eigen indices of `evals` in ascending order of curvature, ties broken by
+/// index: `order[k]` is the index of the rank-`k` eigenpair. The spectrum's own
+/// index order is not a rank (it is ascending for `eigh` and descending for the
+/// stacked-root SVD, see `order_block_axes_by_curvature`), so a block latched
+/// by spectral position (#3113) is resolved through this order.
+fn ascending_spectral_order(evals: &Array1<f64>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..evals.len()).collect();
+    order.sort_by(|&a, &b| evals[a].total_cmp(&evals[b]).then(a.cmp(&b)));
+    order
 }
 
 /// Put the block's eigendirections in ascending-curvature order, ties broken by

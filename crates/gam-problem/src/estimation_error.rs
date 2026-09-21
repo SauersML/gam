@@ -2283,6 +2283,10 @@ pub enum BlockQuadratureCorrectionStage {
     /// reserves an absent moment set for the empty block, so this is the corrector's defect at
     /// every rho, not a property of one.
     CorrectorReturnedNoMoments { block_dim: usize },
+    /// The admission latched a block dimension without the block's spectral positions, or with
+    /// positions outside this rho's spectrum. The admission and its block latch together, so this
+    /// is a broken latch at every rho, not a property of one.
+    LatchedBlockUnavailable { block_dim: usize, spectrum_dim: usize },
     /// The penalized Hessian at this rho's mode has a non-positive or non-finite eigenvalue, so
     /// the implicit mode response the exact gradient channels contract against is undefined.
     NonPositivePenalizedCurvature { min_eigenvalue: f64 },
@@ -2316,7 +2320,9 @@ impl BlockQuadratureCorrectionStage {
             | Self::EigenpairResolutionUnavailable { .. }
             | Self::EigenframeNearDegeneracy { .. }
             | Self::AxisSplitWithoutExactCurvature { .. } => true,
-            Self::CorrectorReturnedNoMoments { .. } => false,
+            Self::CorrectorReturnedNoMoments { .. } | Self::LatchedBlockUnavailable { .. } => {
+                false
+            }
         }
     }
 }
@@ -2342,6 +2348,14 @@ impl std::fmt::Display for BlockQuadratureCorrectionStage {
                 f,
                 "the corrector returned no gradient moments for a {block_dim}-direction block; \
                  its contract reserves absent moments for the empty block"
+            ),
+            Self::LatchedBlockUnavailable {
+                block_dim,
+                spectrum_dim,
+            } => write!(
+                f,
+                "the admission latched a {block_dim}-direction block whose spectral positions are \
+                 absent or outside this rho's {spectrum_dim}-dimensional spectrum"
             ),
             Self::NonPositivePenalizedCurvature { min_eigenvalue } => write!(
                 f,

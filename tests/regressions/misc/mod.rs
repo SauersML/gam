@@ -73,6 +73,7 @@ mod regression_1082_block_correction_decided_at_optimum;
 mod regression_2644_outer_criterion_conditioning;
 mod regression_2726_joint_psi_seed_shares_theta0;
 mod regression_2748_block_correction_continuity;
+mod regression_3113_block_subspace_continuity;
 mod regression_block_correction_outer_hessian_fd;
 mod regression_poisson_te_block_axis_split;
 mod regression_rare_event_binomial_block_eigensystem;
