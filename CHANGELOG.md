@@ -1,5 +1,26 @@
 ## Unreleased
 
+- **The latched #784 block correction is a continuous function of rho** (gam#3113).
+  Under a latched #784 admission the block was re-selected at every rho as the `m`
+  largest-`|gamma_r|` positive-curvature eigendirections of `H`. That set swaps members
+  wherever two `|gamma_r|` cross, so a whole direction's contribution to `Delta_b`
+  jumped in and out of the criterion and the latched per-axis quadrature orders were
+  reassigned to a direction they were never certified on. On the 21-row
+  `make_blobs(n_samples=21, random_state=0)` binomial fit `y ~ x0 + x1`, `Delta_b`
+  alternated between 4.24e-1 and 1.12e-1 across a 9e-4 step in rho and the outer BFGS
+  ended not stationary at `|g| = 4.8e-2`. The latch now records the admitted block by
+  its ranks in the ascending spectrum of `H`, and every later rho integrates the
+  eigenpairs at those ranks, which is the continuous transport of the admitted block
+  wherever the eigenvalues are simple; the eigenframe splice already refuses an
+  unresolved block. The block, its quadrature and its Hessian support latch together at
+  first admission, and the path that let a caller with a fixed block dimension latch the
+  quadrature later is gone. No retry, jitter or tolerance is added.
+  **Behavior change:** two refusals that were untyped `InvalidInput` are now typed
+  stages of `BlockQuadratureCorrectionRefused` with the locality each deserves. A
+  latched dimension with no matching ranks raises the new `LatchedBlockUnavailable` and
+  is fatal, while a latched direction whose curvature is not positive at a trial rho
+  raises `NonPositivePenalizedCurvature`, which is trial-point local, so the outer
+  search backs off instead of the fit aborting.
 - **Multinomial smooth significance is a softmax score test, and the saved model format
   moves to version 3** (#3569, #1101). `MultinomialSavedModel::smooth_significance` ran a
   per-class Wood rank-truncated Wald test. It now runs the shared variance-component score
