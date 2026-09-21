@@ -7059,11 +7059,12 @@ pub(crate) fn born_circle_atom(
 /// ([`SaeManifoldTerm::set_row_loss_weights`]): a candidate is refit with the
 /// currently-held-out shards' rows at weight `0` (no fitting pressure) and the
 /// estimation rows at weight `1`, then EVALUATED on the held-out rows. The
-/// predictable-plugin e-process streams the shards: shard `k` is evaluated under
-/// a candidate that has not yet seen its rows, then folded into the estimation
-/// set (un-masked) for shard `k+1` — exactly the contract
+/// predictable-plugin e-process streams the shards in order: shard `k` is
+/// scored under a candidate that never saw its rows, against the null's
+/// profiled supremum over the evaluated stream prefix (shards `0..=k`) —
+/// exactly the call order
 /// [`run_atom_birth_gate`](gam_terms::inference::structure_evidence::run_atom_birth_gate)
-/// guarantees the call order of.
+/// guarantees.
 #[derive(Clone, Debug)]
 pub struct RowBlockShard {
     /// The full target, shared across shards (`(N, p)`).
@@ -7082,6 +7083,10 @@ pub struct EstimationEvalSplit {
     /// Estimation row indices (the candidate is refit on these; held-out rows
     /// carry weight `0`).
     pub estimation_rows: Vec<usize>,
+    /// Every held-out evaluation row, in stream order: the concatenation of the
+    /// shards' rows. A stream prefix `eval_rows[..t]` is the data the null's
+    /// profiled supremum is taken over after `t` evaluated rows.
+    pub eval_rows: Vec<usize>,
     /// The evaluation shards, in stream order.
     pub shards: Vec<RowBlockShard>,
 }
@@ -7101,6 +7106,7 @@ pub(crate) fn estimation_eval_split(target: ArrayView2<'_, f64>, n_shards: usize
     if n == 0 {
         return EstimationEvalSplit {
             estimation_rows: Vec::new(),
+            eval_rows: Vec::new(),
             shards: Vec::new(),
         };
     }
@@ -7129,6 +7135,7 @@ pub(crate) fn estimation_eval_split(target: ArrayView2<'_, f64>, n_shards: usize
     }
     EstimationEvalSplit {
         estimation_rows,
+        eval_rows,
         shards,
     }
 }
@@ -7296,9 +7303,29 @@ impl Default for CurlConfig {
 /// evaluates on the held-out shard stream. A non-converged candidate has no
 /// valid likelihood score and therefore aborts the search. The shard
 /// fold is a no-op: the candidate is fixed across the stream (a predictable
-/// plug-in), and each shard contributes its held-out reconstruction
-/// likelihood-ratio against the null state that `null_fit` independently refits
-/// on that shard to obtain the honest constrained supremum.
+/// plug-in). The gate's split likelihood ratio is Gaussian in the
+/// reconstruction residuals with the dispersion treated as a parameter on both
+/// sides (#4327), never fixed at one:
+///
+/// * numerator, shard `s` with `m_s` residual coordinates and residual sum of
+///   squares `SSE_s`: `−½·m_s·ln(2π·σ̂²) − SSE_s/(2σ̂²)`, where
+///   `σ̂² = SSE_est/(n_est·p)` is the candidate's dispersion MLE on its OWN
+///   estimation rows. It is fixed before any held-out row is seen, so the
+///   plug-in density stays predictable.
+/// * denominator: the null's joint supremum over (structure, σ²) of the
+///   evaluated stream prefix `D_t` (shards `0..=t`, `M_t` coordinates).
+///   `null_fit` refits the parent structure on exactly those rows, and
+///   profiling σ² gives `R_t = −½·M_t·(ln(2π·SSE_null(D_t)/M_t) + 1)`. The
+///   closure returns the increment `R_t − R_{t−1}`, so the gate's additive
+///   log-e-process equals `Σ_s ℓ_alt(s) − R_t`.
+///
+/// For every null (θ₀, σ₀²), `R_t ≥ log p_{θ₀,σ₀}(D_t)`. So `E_t` is bounded by
+/// the product of predictable-density ratios, which is a test martingale under
+/// that null, and Ville's inequality gives `P(sup_t E_t ≥ 1/α) ≤ α`. Rescaling
+/// the target by `c` shifts both sides by `−M_t·ln c`, so the evidence is exactly
+/// scale invariant. The old unit-dispersion score `−½·ΔSSE` was neither: it had
+/// `E_0[e] = exp(½(σ²−1)·‖d‖²)` for σ² > 1, and it lost power by a factor of
+/// 1/σ² on standardized fits.
 pub fn run_structure_search_rounds(
     mut term: SaeManifoldTerm,
     mut rho: SaeManifoldRho,
@@ -7437,6 +7464,8 @@ pub fn run_structure_search_rounds(
         let collapse_events = term.collapse_events().to_vec();
         let decoders = birth_seeds;
         let estimation_rows = split.estimation_rows.clone();
+        let eval_rows = &split.eval_rows;
+        let mut null_stream = NullStreamSup::default();
         let certified_glues = std::mem::take(&mut report.certified_glues);
         let proposals = std::mem::take(&mut report.proposals);
         let outcome: SearchOutcome<State> = search(
@@ -7454,11 +7483,20 @@ pub fn run_structure_search_rounds(
                 // Refit the restructured candidate on the estimation rows only.
                 candidate_fit(cand_term, cand_rho, &estimation_rows)
             },
-            |state: &State, shard: &RowBlockShard| eval_log_lik(&state.0, shard),
             |state: &State, shard: &RowBlockShard| {
-                let (null_term, _null_rho) =
-                    null_fit(state.0.clone(), state.1.clone(), &shard.rows)?;
-                eval_log_lik(&null_term, shard)
+                alternative_shard_log_lik(&state.0, &estimation_rows, shard)
+            },
+            |state: &State, shard: &RowBlockShard| {
+                // The null's supremum is over the whole evaluated stream prefix,
+                // so the parent structure is refit on every row evaluated so far.
+                let (rows_before, rows_after) = stream_prefix_bounds(eval_rows, &shard.rows)?;
+                let prefix = &eval_rows[..rows_after];
+                let (null_term, _null_rho) = null_fit(state.0.clone(), state.1.clone(), prefix)?;
+                let fitted = fitted_reconstruction(&null_term, &shard.target)?;
+                let (prefix_sse, prefix_count) = residual_sse(&fitted, &shard.target, prefix)?;
+                let reconstruction =
+                    null_stream.advance(rows_before, rows_after, prefix_sse, prefix_count)?;
+                Ok(reconstruction + gate_block_log_evidence(&null_term, shard)?)
             },
             // No-op fold: the candidate is the fixed predictable plug-in across
             // the held-out stream.
@@ -8240,61 +8278,202 @@ fn flatten_candidates(
         .collect())
 }
 
-/// Per-row Gaussian reconstruction log-likelihood of a shard under the current
-/// (restructured, possibly shard-refit) state. The gate's evaluation statistic;
-/// the engine guarantees a shard is evaluated strictly before it is folded in.
-fn eval_log_lik(term: &SaeManifoldTerm, shard: &RowBlockShard) -> Result<f64, String> {
-    // The fitted reconstruction at the shard's held-out rows, scored against the
-    // full target. The term's per-row routing/basis covers all N rows, so the
-    // reconstruction at a held-out row is the model's prediction for it.
-    let fitted = term.try_fitted_target_aware(shard.target.view(), None)?;
-    let n_full = fitted.nrows();
-    let p = fitted.ncols();
-    if p != shard.target.ncols() || n_full != shard.target.nrows() {
+/// The term's fitted reconstruction of the full `(N, p)` target. The term's
+/// per-row routing/basis covers all `N` rows, so the reconstruction at a
+/// held-out row is the model's prediction for it.
+fn fitted_reconstruction(
+    term: &SaeManifoldTerm,
+    target: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    let fitted = term.try_fitted_target_aware(target.view(), None)?;
+    if fitted.dim() != target.dim() {
         return Err(format!(
             "structure-search fitted shape {:?} does not match target {:?}",
             fitted.dim(),
-            shard.target.dim()
+            target.dim()
         ));
     }
+    Ok(fitted)
+}
+
+/// Residual sum of squares of `fitted` against `target` over `rows`, together
+/// with the number of residual coordinates it sums (`rows.len()·p`).
+fn residual_sse(
+    fitted: &Array2<f64>,
+    target: &Array2<f64>,
+    rows: &[usize],
+) -> Result<(f64, usize), String> {
+    let (n_full, p) = target.dim();
     let mut sse = 0.0_f64;
-    let mut count = 0usize;
-    for &row in &shard.rows {
+    for &row in rows {
         if row >= n_full {
             return Err(format!(
                 "structure-search evaluation row {row} is out of range for {n_full} rows"
             ));
         }
         for out in 0..p {
-            let d = fitted[[row, out]] - shard.target[[row, out]];
-            sse_accumulate(&mut sse, d);
+            sse_accumulate(&mut sse, fitted[[row, out]] - target[[row, out]]);
         }
-        count += p;
     }
+    let count = rows.len() * p;
     if count == 0 {
-        return Err("structure-search evaluation shard must contain rows".to_string());
+        return Err("structure-search residual block must contain rows and outputs".to_string());
     }
-    // Gaussian log-lik up to the additive constant that cancels in every
-    // e-value ratio: −½·SSE (unit dispersion). The gate forms differences of
-    // this against the null sup, so the constant and the dispersion scale drop
-    // out of the certified evidence.
-    let reconstruction = -0.5 * sse;
+    if !sse.is_finite() {
+        return Err(format!(
+            "structure-search residual sum of squares is not finite ({sse})"
+        ));
+    }
+    Ok((sse, count))
+}
+
+/// Gaussian log-likelihood of `count` independent residual coordinates with
+/// residual sum of squares `sse` at dispersion `sigma2`:
+/// `−½·count·ln(2π·σ²) − sse/(2σ²)`.
+fn gaussian_log_lik(sse: f64, count: usize, sigma2: f64) -> Result<f64, String> {
+    if !(sigma2.is_finite() && sigma2 > 0.0) {
+        return Err(format!(
+            "Gaussian reconstruction dispersion must be finite and positive, got {sigma2}"
+        ));
+    }
+    let m = count as f64;
+    Ok(-0.5 * m * (2.0 * std::f64::consts::PI * sigma2).ln() - sse / (2.0 * sigma2))
+}
+
+/// Gaussian log-likelihood maximized over the dispersion. The maximizer is
+/// `σ̂² = sse/count`, which gives `−½·count·(ln(2π·sse/count) + 1)`. A zero
+/// residual sum means the fit interpolates the block. The supremum over σ² is
+/// then unbounded, so no finite supremum exists; that is an error, not a
+/// number.
+fn gaussian_profiled_sup_log_lik(sse: f64, count: usize) -> Result<f64, String> {
+    if count == 0 {
+        return Err("profiled Gaussian supremum needs at least one residual coordinate".to_string());
+    }
+    if !(sse.is_finite() && sse > 0.0) {
+        return Err(format!(
+            "the null reconstruction interpolates the evaluated stream (residual sum of \
+             squares {sse}); its likelihood supremum over the dispersion is unbounded"
+        ));
+    }
+    gaussian_log_lik(sse, count, sse / count as f64)
+}
+
+/// Locate a shard in the evaluation stream. Returns `(rows_before,
+/// rows_after)` such that `eval_rows[rows_before..rows_after] == shard_rows`.
+/// The evaluated prefix after this shard is `eval_rows[..rows_after]`.
+fn stream_prefix_bounds(
+    eval_rows: &[usize],
+    shard_rows: &[usize],
+) -> Result<(usize, usize), String> {
+    let first = *shard_rows
+        .first()
+        .ok_or_else(|| "structure-search evaluation shard must contain rows".to_string())?;
+    let rows_before = eval_rows
+        .iter()
+        .position(|&row| row == first)
+        .ok_or_else(|| format!("evaluation shard row {first} is not in the evaluation stream"))?;
+    let rows_after = rows_before + shard_rows.len();
+    if eval_rows.get(rows_before..rows_after) != Some(shard_rows) {
+        return Err(format!(
+            "evaluation shard starting at row {first} is not a contiguous block of the \
+             evaluation stream"
+        ));
+    }
+    Ok((rows_before, rows_after))
+}
+
+/// The null's profiled reconstruction supremum over the evaluated stream
+/// prefix, carried across one gate's shard stream (#4327).
+///
+/// The universal-inference denominator after `t` shards is
+/// `R_t = sup_{θ,σ²} log p_{θ,σ²}(D_t)` over the WHOLE evaluated prefix `D_t`.
+/// It is not a sum of per-shard suprema: that sum is larger, which only costs
+/// power, and with one-row shards each per-shard sup is a single-row fit. The
+/// gate accumulates per-shard log-ratios additively, so this state returns the
+/// increment `R_t − R_{t−1}`, and the running log-e-value is
+/// `Σ_s ℓ_alt(s) − R_t`. A gate always starts its stream at the first shard.
+/// The empty prefix has `R = 0`, the log of the empty product, and every other
+/// shard must continue exactly where the previous one ended. Any other order
+/// breaks the engine's streaming contract and is an error.
+#[derive(Debug, Default)]
+struct NullStreamSup {
+    /// Evaluation rows already folded into `reconstruction_sup`.
+    evaluated_rows: usize,
+    /// `R_t` for the current prefix.
+    reconstruction_sup: f64,
+}
+
+impl NullStreamSup {
+    fn advance(
+        &mut self,
+        rows_before: usize,
+        rows_after: usize,
+        prefix_sse: f64,
+        prefix_count: usize,
+    ) -> Result<f64, String> {
+        if rows_before == 0 {
+            self.evaluated_rows = 0;
+            self.reconstruction_sup = 0.0;
+        } else if rows_before != self.evaluated_rows {
+            return Err(format!(
+                "structure-search null stream holds a supremum over {} evaluated rows but \
+                 was handed the shard that follows row {rows_before}; the gate must stream \
+                 shards in order from the first",
+                self.evaluated_rows
+            ));
+        }
+        if rows_after <= rows_before {
+            return Err("structure-search evaluation shard must contain rows".to_string());
+        }
+        let sup = gaussian_profiled_sup_log_lik(prefix_sse, prefix_count)?;
+        let increment = sup - self.reconstruction_sup;
+        self.evaluated_rows = rows_after;
+        self.reconstruction_sup = sup;
+        Ok(increment)
+    }
+}
+
+/// The candidate's held-out log-likelihood of one shard: the gate's
+/// `alternative_log_lik`, with the engine guaranteeing the shard is scored
+/// before it is folded in.
+///
+/// The Gaussian dispersion is the candidate's own estimation-row MLE
+/// `σ̂² = SSE_est/(n_est·p)`. It depends only on the estimation rows, which the
+/// candidate was fit on, so the plug-in density is fixed before any held-out
+/// row is seen. That is the predictability universal inference needs. A
+/// candidate that reproduces its estimation rows exactly has zero plug-in
+/// dispersion and no Gaussian density, so that case is an error.
+fn alternative_shard_log_lik(
+    term: &SaeManifoldTerm,
+    estimation_rows: &[usize],
+    shard: &RowBlockShard,
+) -> Result<f64, String> {
+    let fitted = fitted_reconstruction(term, &shard.target)?;
+    let (estimation_sse, estimation_count) =
+        residual_sse(&fitted, &shard.target, estimation_rows)?;
+    if estimation_sse <= 0.0 {
+        return Err(format!(
+            "the candidate reconstruction interpolates its estimation rows (residual sum \
+             of squares {estimation_sse}); its plug-in dispersion is zero and the held-out \
+             Gaussian density is undefined"
+        ));
+    }
+    let sigma2 = estimation_sse / estimation_count as f64;
+    let (sse, count) = residual_sse(&fitted, &shard.target, &shard.rows)?;
+    let reconstruction = gaussian_log_lik(sse, count, sigma2)?;
 
     // Occam-priced gate-block evidence (#1016/#1218). The split-LR difference
-    // this gate forms is between the K+1 candidate (alternative) and the K null;
-    // the gate/assignment-logit block is the weakest-Gaussian piece of the SAE
-    // evidence and is mispriced by a plain Laplace quadratic near a birth. The
+    // this gate forms is between the K+1 candidate (alternative) and the K null.
+    // The gate/assignment-logit block is the weakest-Gaussian piece of the SAE
+    // evidence, and a plain Laplace quadratic misprices it near a birth. The
     // deterministic Pólya–Gamma gate-block marginal supplies the correct
-    // normalizer, whose `−½·d_g·log(2π)` term scales with the gate dimension
-    // `d_g` (one coordinate per atom). Because the candidate carries one more
-    // gate coordinate than the null, that `d_g`-dependent normalizer does NOT
-    // cancel in the K-vs-(K+1) difference — it is exactly the per-coordinate
-    // `log(2π)` Occam term #1218 corrects the sign of. Folding it into the
-    // evaluation likelihood is what makes the corrected sign reach the live
-    // gate decision (the unit test alone never touched this path).
-    let gate_evidence = gate_block_log_evidence(term, shard);
-
-    Ok(reconstruction + gate_evidence?)
+    // normalizer. Its `−½·d_g·log(2π)` term scales with the gate dimension `d_g`
+    // (one coordinate per atom). The candidate carries one more gate coordinate
+    // than the null, so that normalizer does NOT cancel in the K-vs-(K+1)
+    // difference: it is exactly the per-coordinate `log(2π)` Occam term #1218
+    // corrects the sign of. The null side adds its own per-shard gate block (see
+    // the null closure in [`run_structure_search_rounds`]).
+    Ok(reconstruction + gate_block_log_evidence(term, shard)?)
 }
 
 /// The deterministic Pólya–Gamma gate-block marginal log-evidence of the
@@ -8475,14 +8654,14 @@ pub fn run_production_structure_search(
             )
         },
         // Honest constrained null supremum: refit the current K-atom state on
-        // exactly the shard being scored. Under-fitting this side would inflate
-        // the e-value.
-        move |null_term, null_rho, shard_rows| {
+        // exactly the evaluated stream prefix (every held-out row scored so far,
+        // #4327). Under-fitting this side would inflate the e-value.
+        move |null_term, null_rho, prefix_rows| {
             null_refit(
                 full_target_null.view(),
                 null_term,
                 null_rho,
-                shard_rows,
+                prefix_rows,
                 full_iters,
             )
         },
