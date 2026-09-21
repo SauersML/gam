@@ -585,15 +585,26 @@ def fit_hybrid_flat_checkpoint(
         max_epochs=flat_config["max_epochs"],
         score_mode=flat_config["score_mode"],
     )
-    tr_tr = flat.transform(x_tr, score_mode=flat_config["score_mode"])
+    # #2283 — the training rows' encoding is the fit's OWN certified codes, not a
+    # fresh route of the same rows. The flat trainer's epoch map admits a routed
+    # support only when it lowers that row's penalized loss and otherwise keeps the
+    # certified one (`0243a382d`), so the arbitrated support is the map the
+    # objective was descended on. `transform` routes pure top-s by |score|, which on
+    # a coherent K >> rank dictionary is not the loss minimizer; re-encoding the
+    # training rows through it published a SECOND map for one model, and the curved
+    # tier's residual `x_tr - flat_recon_tr` was then the router's rather than the
+    # fitted model's. `flat.fitted` reconstructs from `flat.indices` / `flat.codes`,
+    # the routing the certificate closed on. Held-out rows have no certified support
+    # to retain, so `transform` is their only encoding and stays.
     tr_te = flat.transform(x_te, score_mode=flat_config["score_mode"])
-    flat_recon_tr = flat.reconstruct(tr_tr.indices, tr_tr.codes)
+    flat_recon_tr = flat.fitted
     flat_recon_te = flat.reconstruct(tr_te.indices, tr_te.codes)
     ev_flat = held_out_ev(x_te, flat_recon_te, mean_tr)
+    # The training encode is no longer a route of its own: it is the fit's, and the
+    # fit's own counters already certify where it ran.
     route_stats = _certify_sparse_routes(
         {
             "fit": flat.score_route_stats,
-            "train": tr_tr.score_route_stats,
             "held_out": tr_te.score_route_stats,
         },
         flat_config["score_mode"],
@@ -601,8 +612,8 @@ def fit_hybrid_flat_checkpoint(
     convergence = _convergence_payload(flat)
     arrays = {
         "decoder": np.asarray(flat.decoder, dtype=np.float32),
-        "train_indices": np.asarray(tr_tr.indices, dtype=np.uint32),
-        "train_codes": np.asarray(tr_tr.codes, dtype=np.float32),
+        "train_indices": np.asarray(flat.indices, dtype=np.uint32),
+        "train_codes": np.asarray(flat.codes, dtype=np.float32),
         "held_out_indices": np.asarray(tr_te.indices, dtype=np.uint32),
         "held_out_codes": np.asarray(tr_te.codes, dtype=np.float32),
         "train_reconstruction": np.asarray(flat_recon_tr, dtype=np.float32),
