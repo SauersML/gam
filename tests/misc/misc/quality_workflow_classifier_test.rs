@@ -406,7 +406,7 @@ fn merge_script(yaml: &str) -> String {
 fn test_reference_quality_merge_folds_every_shard_row_exactly_once() {
     let yaml = std::fs::read_to_string(".github/workflows/reference-quality.yml").unwrap();
     let dir = std::env::temp_dir().join(format!("quality_merge_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).expect("the fixture directory is removed after the test");
     std::fs::create_dir_all(&dir).unwrap();
 
     // Point the block at this fixture instead of the job's absolute paths. The
@@ -454,7 +454,7 @@ fn test_reference_quality_merge_folds_every_shard_row_exactly_once() {
                      2\tPASS\tok\tb::t4\t0\t2\t1\t0\t\t\n";
 
     let run = || -> (Vec<String>, String) {
-        let _ = std::fs::remove_dir_all(&merged);
+        std::fs::remove_dir_all(&merged).expect("the merged fixture directory is removed after the test");
         let output = Command::new("bash").arg(&script).output().unwrap();
         assert!(
             output.status.success(),
@@ -565,7 +565,7 @@ fn test_reference_quality_merge_folds_every_shard_row_exactly_once() {
 fn test_reference_quality_shard_plan_fits_every_shard_in_the_step_cap() {
     let yaml = std::fs::read_to_string(".github/workflows/reference-quality.yml").unwrap();
     let dir = std::env::temp_dir().join(format!("quality_plan_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::remove_dir_all(&dir).expect("the fixture directory is removed after the test");
     std::fs::create_dir_all(&dir).unwrap();
 
     // The plan is a python heredoc in the `plan` job; run the same body.
