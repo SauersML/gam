@@ -1639,8 +1639,7 @@ pub(super) struct MixedAxisPosterior {
 
 pub(super) struct MixedAxisPiecePosterior {
     pub(super) coefficient: f64,
-    pub(super) axes: usize,
-    /// `f_T`.
+    /// `f_T`; the posterior's value is `Σ_T κ_T f_T` over these pieces.
     pub(super) log_ratio: f64,
     /// `(node, p_T(z))` over the piece's feasible nodes.
     pub(super) nodes: Vec<(usize, f64)>,
@@ -1720,7 +1719,6 @@ impl MixedAxisRule {
                 excesses[node]
             );
         }
-        let mut value = 0.0;
         let mut mass = 0.0;
         let mut node_weights = Array1::<f64>::zeros(q);
         let mut pieces = Vec::with_capacity(self.pieces.len());
@@ -1741,15 +1739,14 @@ impl MixedAxisRule {
             for &(node, prob) in &nodes {
                 node_weights[node] += piece.coefficient * prob;
             }
-            value += piece.coefficient * log_ratio;
             mass += piece.coefficient;
             pieces.push(MixedAxisPiecePosterior {
                 coefficient: piece.coefficient,
-                axes: piece.axes,
                 log_ratio,
                 nodes,
             });
         }
+        let value = pieces.iter().map(|piece| piece.coefficient * piece.log_ratio).sum::<f64>();
         Ok(MixedAxisPosterior {
             value,
             node_weights,
@@ -2093,8 +2090,8 @@ mod mixed_axis_rule_tests {
             });
             let posterior = rule.posterior(&values).unwrap();
             let mut bound = 0.0;
-            for piece in &posterior.pieces {
-                let size = piece.axes as f64;
+            for (piece, rule_piece) in posterior.pieces.iter().zip(&rule.pieces) {
+                let size = rule_piece.axes as f64;
                 assert!(
                     piece.log_ratio >= size * (2.0_f64 / 3.0).ln() - 1e-12
                         && piece.log_ratio <= 1.5 * size + 1e-12,
