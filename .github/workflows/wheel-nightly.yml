@@ -130,11 +130,23 @@ jobs:
           echo "$matrix"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
-      - name: Build manylinux_2_28 x86_64 wheel
+      # The abi3 wheel on the requires-python floor plus one wheel per
+      # free-threaded version (scripts/wheel_smoke.py); maturin builds an
+      # interpreter the image lacks from its bundled sysconfig.
+      - name: Plan the build interpreters
+        id: interpreters
+        shell: bash
+        run: |
+          set -euo pipefail
+          versions=$(python3 scripts/wheel_smoke.py interpreters)
+          echo "$versions"
+          echo "linux=$(printf 'python%s ' $versions)" >> "$GITHUB_OUTPUT"
+
+      - name: Build manylinux_2_28 x86_64 wheels
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --strip -o dist -i python3.10
+          args: --release --strip -o dist -i ${{ steps.interpreters.outputs.linux }}
           manylinux: 2_28
           sccache: true
           # build.rs queries git history (author guard); inside the manylinux
@@ -155,6 +167,17 @@ jobs:
           # rebuilds for ~10% runtime. Numerics are unaffected.
           CARGO_PROFILE_RELEASE_LTO: "off"
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+      # The runtime channel is one wheel (validate-one.yml and every
+      # `pip install dist/gamfit-*.whl` consumer rely on that), so the
+      # free-threaded wheels travel in their own artifact for the smoke lanes.
+      - name: Set the free-threaded wheels apart
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir free-threaded
+          mv dist/gamfit-*-cp3*t-*.whl free-threaded/
+          ls free-threaded
 
       - name: Seal exact runtime provenance
         shell: bash
@@ -193,6 +216,14 @@ jobs:
             dist/RUNTIME_PROVENANCE.txt
           retention-days: 14
 
+      - name: Keep the free-threaded wheels as a run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamfit-free-threaded-${{ steps.target.outputs.sha }}
+          path: free-threaded/gamfit-*.whl
+          if-no-files-found: error
+          retention-days: 14
+
   # The same installed-wheel gate pypi-wheels.yml runs before an upload
   # (scripts/wheel_smoke.py), on every rolling build, so an undeclared
   # dependency or missing package file is caught on the push that adds it
@@ -217,7 +248,7 @@ jobs:
           sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@v4
         with:
-          name: gamfit-runtime-${{ needs.wheel.outputs.sha }}
+          name: gamfit-${{ matrix.free_threaded && 'free-threaded' || 'runtime' }}-${{ needs.wheel.outputs.sha }}
           path: runtime
       - uses: actions/setup-python@v5
         with:

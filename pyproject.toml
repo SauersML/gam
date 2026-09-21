@@ -16,7 +16,8 @@ readme = { file = "README_PYPI.md", content-type = "text/markdown" }
 # The floor and every classifier version below are installed from the built
 # wheels by scripts/wheel_smoke.py (pypi-wheels.yml, wheel-nightly.yml), which
 # derives its Python matrix from these classifiers and refuses a floor that
-# disagrees with this line. The extension is abi3-py310 (crates/gam-pyffi).
+# disagrees with this line. The extension is abi3-py310 (crates/gam-pyffi); the
+# stable ABI does not cover free-threaded builds, so those get one wheel each.
 requires-python = ">=3.10"
 # SPDX expression (PEP 639). License :: classifiers are deliberately absent:
 # PEP 639 forbids combining them with a license expression.
@@ -50,6 +51,10 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
+  # The extension declares `gil_used = false`, and every advertised version
+  # PyO3 builds free-threaded (3.14t on; scripts/wheel_smoke.py) gets its own
+  # wheel and smoke lane.
+  "Programming Language :: Python :: Free Threading :: 2 - Beta",
   "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Rust",
   "Topic :: Scientific/Engineering",
@@ -136,10 +141,47 @@ module-name = "gamfit._rust"
 # One authoritative Cargo-resolution policy for wheels, sdists, PEP 517, and
 # direct maturin use. Subcommand-specific CLI placement cannot drift.
 locked = true
-# The build backend ([build-system] backend-path): an sdist carries it, so a
-# build from the unpacked sdist runs it too and reads the version the sdist
-# recorded.
-include = [{ path = "scripts/gamfit_version.py", format = "sdist" }]
+# The sdist carries what building the extension reads, not the test suite:
+# integration tests, cfg(test) modules and the fixtures they open, examples,
+# helper binaries and benchmarks. `scripts/release_footprint.py sdist` compiles
+# the unpacked sdist and refuses any file that compilation did not read, so a
+# glob here can neither drop a source the build needs nor miss a test module
+# (it runs on every PR touching the crates or the packaging, and before every
+# PyPI upload). PyPI
+# holds every file of every release against one project size limit (RELEASING.md).
+exclude = [
+  { path = "crates/**/tests/**", format = "sdist" },
+  { path = "crates/**/tests.rs", format = "sdist" },
+  { path = "crates/**/tests_*.rs", format = "sdist" },
+  { path = "crates/**/*_tests.rs", format = "sdist" },
+  { path = "crates/**/*_tests_*.rs", format = "sdist" },
+  { path = "crates/**/test_support.rs", format = "sdist" },
+  { path = "crates/**/*.json", format = "sdist" },
+  { path = "crates/*/examples/**", format = "sdist" },
+  { path = "crates/*/src/bin/**", format = "sdist" },
+  { path = "bench/**", format = "sdist" },
+  # `!` keeps a file a glob above drops: the library reads it. gam-problem and
+  # gam-runtime export test_support to downstream crates' tests; the others are
+  # test part-files spliced in with an unconditional `include!` or an
+  # unconditional `mod` (their contents are cfg(test), but rustc still opens
+  # them).
+  { path = "!crates/gam-problem/src/test_support.rs", format = "sdist" },
+  { path = "!crates/gam-runtime/src/test_support.rs", format = "sdist" },
+  { path = "!crates/gam-models/src/fit_orchestration/drivers/*_tests.rs", format = "sdist" },
+  { path = "!crates/gam-sae/src/manifold/tests_topology_fixtures.rs", format = "sdist" },
+  { path = "!crates/gam-solve/src/reml/glm_outer_hessian_fd_tests.rs", format = "sdist" },
+  { path = "!crates/gam-terms/src/smooth/term_specs_tests.rs", format = "sdist" },
+]
+# One `include` list. crates/gam-cli is not a dependency of the extension, so
+# maturin would leave it out, and Cargo.lock (which lists it and its
+# dependencies) would then describe a workspace the sdist does not have;
+# `locked = true` refuses to build from that. scripts/gamfit_version.py is the
+# build backend ([build-system] backend-path): an sdist carries it, so a build
+# from the unpacked sdist runs it too and reads the version the sdist recorded.
+include = [
+  { path = "crates/gam-cli/**/*", format = "sdist" },
+  { path = "scripts/gamfit_version.py", format = "sdist" },
+]
 
 [tool.pytest.ini_options]
 # Use importlib mode so pytest does not prepend each test file's parent
