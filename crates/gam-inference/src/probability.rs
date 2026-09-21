@@ -138,9 +138,10 @@ fn zero_point_mass_content(mu: f64, total_var: f64, lower: f64, upper: f64) -> O
 ///
 /// Returns `None` when the inputs are degenerate (non-positive mean or
 /// variance, non-finite), or when the incomplete-gamma inverse yields a
-/// non-finite / mis-ordered pair — which happens for an enormous shape, where
-/// the Gamma is essentially Gaussian and the caller should fall back to the
-/// then-accurate symmetric edges.
+/// non-finite / mis-ordered pair. An enormous shape is not such a case: the
+/// incomplete gamma is evaluated by Temme's uniform expansion wherever the
+/// series and the continued fraction stall (#4068), so the band stays the
+/// Gamma's own however close to Gaussian it is.
 pub fn gamma_moment_matched_interval(
     mu: f64,
     total_var: f64,
@@ -1672,6 +1673,32 @@ mod tests {
         assert!(gamma_moment_matched_interval(1.0, f64::INFINITY, 0.025, 0.975).is_none());
         // A finite, well-conditioned case still returns Some.
         assert!(gamma_moment_matched_interval(3.0, 2.0, 0.025, 0.975).is_some());
+    }
+
+    /// #4068: an enormous shape is a band, not a refusal. The doc on
+    /// [`gamma_moment_matched_interval`] used to say the caller should fall
+    /// back to symmetric edges there; nothing in the code ever did, and since
+    /// the incomplete gamma resolves every shape there is nothing to fall back
+    /// from. References are 40-digit quadrature values.
+    ///
+    /// The bar counts the roundings between the references and the returned
+    /// edge: `shape = mu * mu / total_var` is two, `scale = total_var / mu` is
+    /// one, the quantile is certified by its own inversion, and the final
+    /// multiply by `scale` is one.
+    #[test]
+    fn large_count_and_large_shape_bands_carry_their_nominal_mass_4068() {
+        // Q(1001961, 1e6) = 0.9750004 >= 0.975 > Q(1001960, 1e6) = 0.9749452,
+        // so the 97.5% Poisson quantile at mu = 1e6 is 1001960.
+        assert_eq!(poisson_quantile(0.975, 1.0e6), 1_001_960.0);
+        // Mean = variance = 1e7 is Gamma(shape 1e7, scale 1); its 2.5%
+        // quantile by bisection at 40 digits on the quadrature CDF.
+        let (lower, _) = gamma_moment_matched_interval(1.0e7, 1.0e7, 0.025, 0.975)
+            .expect("an enormous shape still has a Gamma band");
+        let want = 9_993_802.996_884_266_918_8;
+        assert!(
+            (lower - want).abs() <= 4.0 * f64::EPSILON * want,
+            "lower edge {lower}, want {want}"
+        );
     }
 
     #[test]
