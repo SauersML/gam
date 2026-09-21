@@ -413,3 +413,50 @@ fn dispersion_and_shape_reports_name_the_routing_they_condition_on_2933_f37() {
         );
     }
 }
+
+/// A 0/1 estimation mask, the structure-search held-out split, is the fitted
+/// sample restricted to its live rows. The mask must be stored as exactly 0/1,
+/// and the dispersion must be the live-row RSS over the live-row scalar count.
+/// If the weights were normalized over every row, each live row would carry
+/// `n / n_live` and both scales would be inflated by that factor.
+#[test]
+fn zero_one_estimation_mask_prices_the_live_rows_at_unit_weight() {
+    let targets = symmetric_targets(40);
+    let (mut term, rho, target) =
+        two_center_term(&targets, AssignmentMode::top_k_support(1), 1.0, 0.0);
+    let n = targets.len();
+    // Every fourth row is held out: 30 live rows of 40.
+    let mask: Vec<f64> = (0..n)
+        .map(|row| if row % 4 == 0 { 0.0 } else { 1.0 })
+        .collect();
+    let live = mask.iter().filter(|weight| **weight > 0.0).count();
+    term.set_row_loss_weights(mask.clone())
+        .expect("a 0/1 mask with live rows is a valid design");
+    assert_eq!(
+        term.row_loss_weights()
+            .expect("a nonuniform mask is stored"),
+        mask.as_slice(),
+        "a 0/1 estimation mask must be stored as exactly 0/1"
+    );
+    let residual = term
+        .reconstruction_residual(target.view(), &rho)
+        .expect("fitted and target shapes agree");
+    let live_rss: f64 = residual
+        .outer_iter()
+        .zip(&mask)
+        .filter(|(_, weight)| **weight > 0.0)
+        .map(|(row, _)| row.iter().map(|value| value * value).sum::<f64>())
+        .sum();
+    assert!(live_rss > 0.0, "the fixture must leave a live residual");
+    let expected = live_rss / (live * term.output_dim()) as f64;
+    let dispersion = term
+        .unfactored_reconstruction_dispersion(target.view(), &rho)
+        .expect("the masked two-center dispersion is defined");
+    for (label, phi) in scales(dispersion) {
+        assert!(
+            (phi - expected).abs() <= 1e-12 * expected,
+            "{label} {phi} must equal the live-row RSS over the live scalars, {expected} \
+             ({live} live rows of {n})"
+        );
+    }
+}
