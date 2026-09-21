@@ -40,6 +40,19 @@
   residualized smooth returns a different, and previously biased, number. In the numpy
   replica of the default `x + s(x)` the fitted average derivative moves from 0.7249 to
   0.8549.
+- **The identifiability audit refuses a stacked design that will not densify** (gam#4088).
+  `audit_identifiability_impl` caught a `stacked_design` densify failure, logged it at
+  trace level, and then audited the block on its `n`-row design instead. That is the
+  geometry the surrounding comment already calls a mis-representation (gam#1197): the
+  stacked `k*n`-row operator is the block's cross-channel rank and alias geometry, and
+  substituting the plain block audits a span the model does not have. The failure is now
+  an `EstimationError::LayoutError` naming the block by index and by spec name, which is
+  how the two nearest paths already behave, the `effective_jacobian_at` build directly
+  above and `canonicalize`'s MAP-uniqueness check, both of which refuse when they cannot
+  densify the same stacked design.
+  **Behavior change:** a fit whose stacked design will not densify now fails the audit
+  instead of returning an identifiability verdict computed from the wrong span. Nothing
+  changes when the densify succeeds.
 - **Skovgaard `r*` uses the sample-space `q_hat` and the full nuisance determinant form** (gam#3535).
   Two things were wrong in the assembly. In the scalar case it computed
   `u = (theta_hat - theta_0) * i_hat / sqrt(j_hat)`, which is the linear surrogate for
