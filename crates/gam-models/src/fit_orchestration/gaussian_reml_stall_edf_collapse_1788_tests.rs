@@ -1,4 +1,3 @@
-#![cfg(test)]
 //! Regression for #1788 at the real smooth-spline pipeline layer.
 //!
 //! For an ordinary Gaussian additive fit `y ~ s(x1)+s(x2)+s(x3)` the reported
@@ -13,24 +12,19 @@
 //! `tr(F) ≈ 0`; that both violated EDF additivity and surfaced NO
 //! non-convergence signal on the reported EDF.
 //!
-//! The invariant this file pins — the reported EDF may never contradict the
-//! fitted coefficients — is enforced along two independent paths that together
-//! close the pathology:
-//!   * the outer optimizer no longer parking at the `λ` ceiling on the #1788
-//!     fixture (grid-free stationary-point enumeration in `gaussian_reml.rs`,
-//!     commit 101b087e8, now lands the interior ρ optimum so the trace channel
-//!     assembles an honest EDF); and
-//!   * the `guard_untrusted_edf_collapse` correction, which — for any fixture
-//!     that still stalls with railed `λ` — substitutes the per-term dimension
-//!     floor so the reported EDF cannot fall below what the live coefficients
-//!     imply.
+//! The pathology is closed at its source: the outer optimizer no longer parks
+//! at the `λ` ceiling on this fixture (grid-free stationary-point enumeration
+//! in `gaussian_reml.rs`, commit 101b087e8, lands the interior ρ optimum), and
+//! under the sealed `FitConvergenceEvidence` contract a stalled outer search
+//! cannot mint a fit at all. There is no EDF "collapse guard" left to exercise.
 //!
-//! This file was re-pinned to the post-101b087e8 optimizer contract: the #1788
-//! fixture (`seed=2`) now CONVERGES, so the headline test asserts the
-//! pathology is fixed at the source (converged + self-consistent EDF) rather
-//! than pinning the earlier stall. The collapse-guard branch keeps coverage
-//! through a seed scan that asserts the same EDF invariant on any fixture that
-//! still stalls (the guard is defensive-only once the optimizer is robust).
+//! What this file therefore pins is the whole contract on a well-posed problem:
+//! a Gaussian additive model with three smooth effects of a strong wiggly
+//! signal (R² ≈ 0.75) at n = 600 has an interior REML optimum, so EVERY seed
+//! must converge, return wiggly coefficients, and report an EDF consistent with
+//! them. A seed that refuses to converge is a solver bug on the easiest model
+//! this crate fits (SPEC: "do not paper over solver issues"), not a case to
+//! step over.
 //!
 //! The top-level `gam` crate cannot build in this environment (a `build.rs`
 //! author tripwire), so the issue's `fit_from_formula` path is exercised here in
@@ -69,9 +63,9 @@ struct StallProbe {
 
 impl StallProbe {
     /// The returned coefficients are demonstrably wiggly: they track the
-    /// response and light up many basis columns. Both the converged and the
-    /// stalled-then-guarded worlds must keep the reported EDF consistent with
-    /// THIS, so it is the shared precondition for asserting on EDF.
+    /// response and light up many basis columns. The reported EDF of a
+    /// converged fit must be consistent with THIS, so it is asserted before
+    /// any EDF claim is checked.
     fn coefficients_are_wiggly(&self) -> bool {
         self.corr > 0.5 && self.n_active_cols >= 10
     }
@@ -184,7 +178,7 @@ fn fit_three_smooth(n: usize, seed: u64, noise_sd: f64) -> Result<StallProbe, St
 /// stayed wiggly. Grid-free stationary-point enumeration (`gaussian_reml.rs`,
 /// 101b087e8) now lands the interior ρ optimum on this fixture, so the fit
 /// CONVERGES and the trace-channel EDF assembles honestly — the pathology is
-/// fixed at the source, no guard substitution required.
+/// fixed at the source.
 ///
 /// The enduring #1788 invariant is unchanged and still asserted: three active,
 /// wiggly smooths cannot honestly report `edf_total ≈ 1.0`; the reported EDF
@@ -227,29 +221,31 @@ fn stalled_reml_edf_not_collapsed_to_intercept_1788() {
     );
 }
 
-/// EDF-consistency coverage without a hand-picked seed. We scan a small band
-/// of seeds through the real fit pipeline. Under the sealed
-/// `FitConvergenceEvidence` contract the old #1788 stall lane (railed `λ`,
-/// `outer_converged == false`, collapsed EDF) is unrepresentable: a stalled
-/// fixture returns a typed non-convergence error and never reports an EDF at
-/// all. What remains to pin is the positive half of the invariant — every fit
-/// that IS minted (and therefore carries a convergence certificate) must
-/// report an EDF consistent with its wiggly coefficients, never collapsed to
-/// the intercept-only floor.
+/// EDF-consistency coverage without a hand-picked seed: a band of seeds
+/// through the real fit pipeline. Every seed draws the same well-posed
+/// problem (three smooth effects of a signal with variance ≈ 0.73 under
+/// noise variance 0.25, n = 600), so every seed must converge to its interior
+/// REML optimum; a typed non-convergence here is a live solver regression and
+/// fails the test rather than being stepped over. Every converged fit must
+/// track the wiggly truth and report an EDF consistent with its coefficients,
+/// never collapsed to the intercept-only floor.
 #[test]
-fn stalled_fixtures_keep_edf_consistent_via_guard_1788() {
+fn every_seed_converges_with_edf_consistent_with_its_coefficients_1788() {
     for seed in 0..12u64 {
-        let p = match fit_three_smooth(600, seed, 0.5) {
-            Ok(p) => p,
-            // A stalled fixture now refuses to mint a fit (typed
-            // non-convergence from the sealed evidence constructor), so there
-            // is no reported EDF to collapse — the #1788 laundering surface
-            // is gone by construction on the stall lane.
-            Err(_) => continue,
-        };
-        if !p.coefficients_are_wiggly() {
-            continue;
-        }
+        let p = fit_three_smooth(600, seed, 0.5).unwrap_or_else(|error| {
+            panic!(
+                "#1788: seed={seed} of the well-posed Gaussian three-smooth fixture \
+                 (n=600, noise_sd=0.5) did not converge: {error}"
+            )
+        });
+        assert!(
+            p.coefficients_are_wiggly(),
+            "#1788: seed={seed} converged but its coefficients do not track the \
+             wiggly truth (corr={:.3}, active={}); population R² is ≈ 0.75, so a \
+             fit this flat has lost the signal",
+            p.corr,
+            p.n_active_cols,
+        );
         assert!(
             p.edf_is_self_consistent(),
             "#1788: seed={seed} minted a fit with wiggly coefficients \
@@ -263,17 +259,14 @@ fn stalled_fixtures_keep_edf_consistent_via_guard_1788() {
             p.edf_by_block,
         );
     }
-    // Not a failure if every seed converges: the EDF invariant above is a
-    // property over every minted fit, and the stall lane is covered by the
-    // typed-refusal contract (`Err` ⇒ no EDF is ever reported).
 }
 
-/// The guard must be INERT on a healthy converged fit: `n=600, noise_sd=0.5,
-/// seed=3` converges cleanly (~16 EDF, dozens of active columns). The reported
-/// EDF must be untouched by the #1788 correction — no over-flooring, no
-/// additivity drift.
+/// A healthy converged fit reports a plausible, additive EDF: `n=600,
+/// noise_sd=0.5, seed=3` converges cleanly (~16 EDF, dozens of active
+/// columns), and `edf_total` must be `Σ edf_by_block` plus the small
+/// unpenalized-column offset — no over-flooring, no additivity drift.
 #[test]
-fn converged_fit_edf_untouched_by_guard_1788() {
+fn converged_fit_edf_is_plausible_and_additive_1788() {
     let p = fit_three_smooth(600, 3, 0.5)
         .expect("#1788 sanity seed expected to converge (fit existence is the proof)");
     assert!(
