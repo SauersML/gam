@@ -27,6 +27,25 @@
   test and yielded a `NaN` factor — a non-finite auxiliary column made
   `aux_prior_targets` return `NaN` targets for `AuxPriorFamily::Linear`. Under the
   owner's `CholeskyGuard::FiniteStrict` both are refusals that name the matrix.
+- **The SAE decoder seed is the MAP under the fit's own smoothness prior, not a spectral ridge** (#3090).
+  `sae_decoder_lsq_init` seeded every atom's decoder block from
+  `(XᵀX + 1e-4·max diag(XᵀX)·I) B = XᵀZ`. Nothing derived that ridge. It was chosen so the
+  #671 near-collinear multi-atom seed, where every atom shares the leading principal
+  component, would stop producing decoder coefficients of order `1e5` that blew the
+  cubic DecoderIncoherence gradient up; the price was a relative `1e-4` of the design's
+  dominant eigenvalue charged against every seed, including the well-conditioned ones
+  that never needed it. The seed is now the conditional optimum of the objective the fit
+  itself minimizes at the seed assignments, `½‖Z − XB‖² + ½ λ Σ_k tr(B_kᵀ S_k B_k)`,
+  obtained from the augmented system `[X; √λ·blockdiag(R_k)] B ≈ [Z; 0]` with
+  `S_k = R_kᵀR_k`, solved through the rank-certified SVD design solve. Near-collinear
+  atoms are bounded by the same prior the fit charges, and the directions that neither
+  the prior nor the data identify take the minimum-norm solution rather than a
+  ridge-biased one. `sae_decoder_lsq_init` takes `smooth_penalties` and `smoothness`,
+  `sae_refine_routing_seed` takes `smoothness`, and `SaeMinimalSeedRequest` carries a
+  `smoothness` field, each fed the fit's own `λ`. The ban-ledger row for the jitter is
+  removed with the ridge.
+  **Behavior change:** every cold SAE decoder seed moves, so a fit that starts from it
+  can converge to a different optimum than before.
 - **The composition-law test studentizes by the fitted curves' own sampling law** (#3512).
   `composition_defect` floored the defect's pointwise variance at the three maps'
   in-sample observation residual RMS, combined by Minkowski's inequality. That RMS
