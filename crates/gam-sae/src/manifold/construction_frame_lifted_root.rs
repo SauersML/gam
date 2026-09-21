@@ -192,7 +192,8 @@ impl SaeManifoldTerm {
     /// The pencil `(A_ξ, Φ_ξ)` classified as the fixed-frame refined root is
     /// ([`Self::exact_root_classification`]): resolved negative directions go to the
     /// concave-clamp basin, and otherwise the exact decrement decides through
-    /// [`Self::inner_decrement_certifies`].
+    /// [`Self::inner_relative_decrement`] and [`Self::inner_decrement_certifies`],
+    /// the same two the fixed-frame root reads.
     fn frame_lifted_verdict(
         &self,
         target: ArrayView2<'_, f64>,
@@ -246,7 +247,11 @@ impl SaeManifoldTerm {
             .map(|index| coefficients[index] * coefficients[index] / joint.eigenvalues[index])
             .sum::<f64>();
         let objective = self.penalized_objective_banded(target, rho, registry, 1.0)?;
-        let relative = 0.5 * lambda_sq / (objective.value.abs() + 1.0);
+        // The one owner of the `½λ²/scale` ratio the decrement predicate reads,
+        // so a non-finite objective is NaN here and refuses. Written out, an
+        // infinite objective would divide by an infinite scale, giving a ratio
+        // of 0, and 0 certifies every decrement.
+        let relative = Self::inner_relative_decrement(lambda_sq, objective.value);
         let certified = (resolved_negative.is_none() || clamp_explained)
             && Self::inner_decrement_certifies(relative);
         Ok(FrameLiftedVerdict {
