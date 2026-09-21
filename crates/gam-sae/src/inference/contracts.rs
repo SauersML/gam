@@ -392,35 +392,68 @@ pub fn invert_o2_edge(edge: (i8, f64)) -> (i8, f64) {
 /// that cannot be distinguished from the identity — the honest measure-don't-latch
 /// verdict (a cleaner loop, with smaller defects, gets a tighter tolerance and
 /// so is easier to certify nontrivial).
-pub fn loop_holonomy(edges: &[(i8, f64)], defects: &[f64]) -> HolonomyReport {
+///
+/// Each `defects[i]` is therefore a sup-norm angular gap in radians between edge
+/// `i`'s realized transport and its `O(2)` element, such as
+/// [`CircleTransportReport::max_angle_gap`](crate::inference::transport_class::CircleTransportReport::max_angle_gap).
+/// The circular variance `CircleTransportReport::defect` (`1 − R`) is not an
+/// angle. It is about half the squared gap, so summing it gives a tolerance far
+/// below the bound and calls noisy loops nontrivial.
+///
+/// Every input must be what the tolerance derivation assumes, so a malformed
+/// loop is refused rather than repaired:
+/// - one defect per edge, since the bound sums over every edge;
+/// - every defect finite and non-negative, since dropping one would shrink the
+///   tolerance and let an edge of unknown size certify a nontrivial loop;
+/// - every sign `+1` or `−1` and every angle finite, since an element outside
+///   `O(2)` has no place in the fold.
+pub fn loop_holonomy(edges: &[(i8, f64)], defects: &[f64]) -> Result<HolonomyReport, String> {
+    if defects.len() != edges.len() {
+        return Err(format!(
+            "loop_holonomy: the loop has {} edges but {} defects were declared; the tolerance \
+             sums one defect per edge",
+            edges.len(),
+            defects.len()
+        ));
+    }
+    for (index, (&(sign, angle), &defect)) in edges.iter().zip(defects).enumerate() {
+        if sign != 1 && sign != -1 {
+            return Err(format!(
+                "loop_holonomy: edge {index} has sign {sign}; an O(2) element has sign +1 or -1"
+            ));
+        }
+        if !angle.is_finite() {
+            return Err(format!("loop_holonomy: edge {index} has a non-finite angle {angle}"));
+        }
+        if !(defect.is_finite() && defect >= 0.0) {
+            return Err(format!(
+                "loop_holonomy: edge {index} has defect {defect}; it must be finite and non-negative"
+            ));
+        }
+    }
+
     // Fold the O(2) elements in loop order: acc ← edge ∘ acc.
     let mut acc_sign = 1i8;
     let mut acc_angle = 0.0_f64;
-    for &(sign, angle) in edges.iter() {
-        let s = if sign >= 0 { 1i8 } else { -1i8 };
-        acc_angle = (s as f64) * acc_angle + angle;
-        acc_sign *= s;
+    for &(sign, angle) in edges {
+        acc_angle = f64::from(sign) * acc_angle + angle;
+        acc_sign *= sign;
     }
     let net_angle = wrap_pi(acc_angle);
 
     // Derived tolerance: composed defect bound of the loop = Σ defects, since
-    // isometries have Lipschitz 1 (see the doc comment). Defensive against a
-    // caller passing a mismatched-length or non-finite defect slice.
-    let angle_tolerance = defects
-        .iter()
-        .copied()
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .sum::<f64>();
+    // isometries have Lipschitz 1 (see the doc comment).
+    let angle_tolerance = defects.iter().sum::<f64>();
 
     let is_trivial = acc_sign == 1 && net_angle.abs() <= angle_tolerance;
 
-    HolonomyReport {
+    Ok(HolonomyReport {
         loop_len: edges.len(),
         net_sign: acc_sign,
         net_angle,
         is_trivial,
         angle_tolerance,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -487,7 +520,7 @@ mod tests {
         // Pure rotations that sum to 2π ≡ 0, tiny defects.
         let edges = [(1i8, 2.0), (1, 2.0), (1, TAU - 4.0)];
         let defects = [1e-6, 1e-6, 1e-6];
-        let r = loop_holonomy(&edges, &defects);
+        let r = loop_holonomy(&edges, &defects).unwrap();
         assert_eq!(r.net_sign, 1);
         assert!(r.net_angle.abs() < 1e-9, "net_angle = {}", r.net_angle);
         assert!(r.is_trivial);
@@ -498,7 +531,7 @@ mod tests {
         // Net rotation π/7, defects far below it → cannot be excluded as noise.
         let edges = [(1i8, PI / 7.0)];
         let defects = [1e-4];
-        let r = loop_holonomy(&edges, &defects);
+        let r = loop_holonomy(&edges, &defects).unwrap();
         assert_eq!(r.net_sign, 1);
         assert!((r.net_angle - PI / 7.0).abs() < 1e-12);
         assert!(!r.is_trivial);
@@ -508,7 +541,7 @@ mod tests {
     fn two_reflections_compose_to_a_rotation() {
         let edges = [(-1i8, 0.3), (-1, 0.9)];
         let defects = [1e-6, 1e-6];
-        let r = loop_holonomy(&edges, &defects);
+        let r = loop_holonomy(&edges, &defects).unwrap();
         // (-1)·(-1) = +1: net rotation.
         assert_eq!(r.net_sign, 1);
         // acc: start (1,0); edge0 → (-1, 0.3); edge1 = (-1,0.9)∘(-1,0.3):
@@ -520,7 +553,7 @@ mod tests {
     fn single_reflection_stays_a_reflection() {
         let edges = [(1i8, 0.2), (-1, 0.4)];
         let defects = [1e-6, 1e-6];
-        let r = loop_holonomy(&edges, &defects);
+        let r = loop_holonomy(&edges, &defects).unwrap();
         assert_eq!(r.net_sign, -1);
         // A reflection is never the identity.
         assert!(!r.is_trivial);
@@ -533,18 +566,37 @@ mod tests {
         // trivial (we do not latch a nontrivial verdict the data can't support).
         let edges = [(1i8, PI / 7.0)];
         let defects = [PI / 7.0 + 0.01];
-        let r = loop_holonomy(&edges, &defects);
+        let r = loop_holonomy(&edges, &defects).unwrap();
         assert!(r.angle_tolerance > (PI / 7.0));
         assert!(r.is_trivial);
     }
 
     #[test]
     fn empty_loop_is_trivial_identity() {
-        let r = loop_holonomy(&[], &[]);
+        let r = loop_holonomy(&[], &[]).unwrap();
         assert_eq!(r.loop_len, 0);
         assert_eq!(r.net_sign, 1);
         assert_eq!(r.net_angle, 0.0);
         assert!(r.is_trivial);
+    }
+
+    #[test]
+    fn loop_holonomy_refuses_inputs_the_tolerance_cannot_bound() {
+        // A net rotation of π/7 with one tiny defect and one NaN defect used to
+        // drop the NaN and certify the loop nontrivial on a tolerance of 1e-4.
+        let edges = [(1i8, PI / 7.0), (1, 0.0)];
+        for defects in [[1e-4, f64::NAN], [1e-4, f64::INFINITY], [1e-4, -1.0]] {
+            let error = loop_holonomy(&edges, &defects).expect_err("invalid defect");
+            assert!(error.contains("edge 1 has defect"), "{error}");
+        }
+        // One defect short: the missing edge's defect is unknown.
+        let error = loop_holonomy(&edges, &[1e-4]).expect_err("short defects");
+        assert!(error.contains("2 edges but 1 defects"), "{error}");
+        // Signs outside {+1, -1} and non-finite angles are not O(2) elements.
+        let error = loop_holonomy(&[(0i8, 0.1)], &[0.0]).expect_err("sign 0");
+        assert!(error.contains("sign 0"), "{error}");
+        let error = loop_holonomy(&[(1i8, f64::NAN)], &[0.0]).expect_err("NaN angle");
+        assert!(error.contains("non-finite angle"), "{error}");
     }
 
     #[test]
@@ -553,7 +605,7 @@ mod tests {
         // A rotation and its inverse compose to the identity.
         let e = (1i8, 0.7);
         let inv = invert_o2_edge(e);
-        let r = loop_holonomy(&[e, inv], &[0.0, 0.0]);
+        let r = loop_holonomy(&[e, inv], &[0.0, 0.0]).unwrap();
         assert_eq!(r.net_sign, 1);
         assert!(r.net_angle.abs() < 1e-12);
         assert!(r.is_trivial);
@@ -561,7 +613,7 @@ mod tests {
         let f = (-1i8, 1.1);
         let finv = invert_o2_edge(f);
         assert_eq!(finv.0, -1);
-        let r2 = loop_holonomy(&[f, finv], &[0.0, 0.0]);
+        let r2 = loop_holonomy(&[f, finv], &[0.0, 0.0]).unwrap();
         assert_eq!(r2.net_sign, 1);
         assert!(r2.net_angle.abs() < 1e-12);
     }

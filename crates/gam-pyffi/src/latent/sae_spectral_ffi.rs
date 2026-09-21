@@ -143,6 +143,7 @@ fn transport_report_dict<'py>(
     out.set_item("phase", report.phase)?;
     out.set_item("phase_degrees", report.phase_degrees())?;
     out.set_item("defect", report.defect)?;
+    out.set_item("max_angle_gap", report.max_angle_gap)?;
     out.set_item("resultant_shift", report.resultant_shift)?;
     out.set_item("resultant_reflect", report.resultant_reflect)?;
     let class_probabilities = PyDict::new(py);
@@ -2029,12 +2030,15 @@ fn recover_spikes(
 
 /// Compose a closed loop of circle isometries and report the net `O(2)` element.
 /// `edges` are `(sign, angle)` (`sign = +1` rotation, `−1` reflection); `defects`
-/// are the per-edge `O(2)` departures whose sum is the derived trivial-verdict
+/// are the per-edge sup-norm angular gaps in radians (a circle transport report's
+/// `max_angle_gap`, not its `defect`), whose sum is the derived trivial-verdict
 /// tolerance. Returns the net sign/angle and the measure-don't-latch triviality
-/// verdict.
+/// verdict. Raises `ValueError` unless there is one finite non-negative defect
+/// per edge, every sign is ±1 and every angle is finite.
 #[pyfunction(signature = (edges, defects))]
 fn loop_holonomy(py: Python<'_>, edges: Vec<(i8, f64)>, defects: Vec<f64>) -> PyResult<Py<PyDict>> {
-    let report = gam::terms::sae::inference::contracts::loop_holonomy(&edges, &defects);
+    let report = gam::terms::sae::inference::contracts::loop_holonomy(&edges, &defects)
+        .map_err(py_value_error)?;
     let out = PyDict::new(py);
     out.set_item("loop_len", report.loop_len)?;
     out.set_item("net_sign", report.net_sign)?;

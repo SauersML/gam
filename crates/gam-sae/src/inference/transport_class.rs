@@ -92,6 +92,16 @@ pub struct CircleTransportReport {
     /// influence on the winning resultant, `√Σ(cos(ψ_k − φ) − R)²/n`; for a fitted
     /// map, by the delta method through the fit's coefficient covariance.
     pub defect_se: f64,
+    /// `max_k |θ_out,k − (winding·θ_in,k + φ)|`, wrapped to `[0, π]`: the largest
+    /// angular gap in radians between the sampled transport and its `O(2)`
+    /// element. This is the sup-norm defect that a
+    /// [`Contract`](crate::inference::contracts::Contract) chain and
+    /// [`loop_holonomy`](crate::inference::contracts::loop_holonomy) add up.
+    /// [`Self::defect`] is a circular variance and is not an angle. With
+    /// residuals `δ_k`, `1 − R = mean(1 − cos δ_k)` is about `δ²/2`, far below
+    /// the gap it would stand in for. The gap is taken over the samples, so it
+    /// bounds the map only where it was sampled.
+    pub max_angle_gap: f64,
     /// Resultants for both hypotheses (diagnostics).
     pub resultant_shift: f64,
     pub resultant_reflect: f64,
@@ -152,8 +162,15 @@ fn log_add_exp(log_a: f64, log_b: f64) -> f64 {
 ///
 /// `R = 1` with `n ≥ 3` makes the integral diverge: the pairs fix the map
 /// exactly, so `+∞` is returned and the class takes all the probability.
+///
+/// `r` must be a resultant length from [`mean_resultant_length`], which is in
+/// `[0, 1]` by construction. Any other value is refused.
 fn log_rigid_bayes_factor(n: usize, r: f64) -> Result<f64, String> {
-    let r = r.clamp(0.0, 1.0);
+    if !(0.0..=1.0).contains(&r) {
+        return Err(format!(
+            "circle transport class probability: resultant length must lie in [0, 1], got {r}"
+        ));
+    }
     if r == 1.0 && n >= 3 {
         return Ok(f64::INFINITY);
     }
@@ -232,6 +249,30 @@ fn log_rigid_bayes_factor(n: usize, r: f64) -> Result<f64, String> {
     }
 }
 
+/// Mean resultant length `R = |Σ (c_i, s_i)| / n` of `n` unit vectors whose
+/// summed components are `c` and `s`.
+///
+/// By the triangle inequality `R ≤ 1` in exact arithmetic. In floating point,
+/// each of the `n` computed `(cos, sin)` pairs has modulus within `1 + ε` of
+/// one (libm is accurate to one ulp). The `n − 1` additions, the two squares,
+/// their sum, the square root and the division add one rounding each. So the
+/// computed value is at most `1 + γ_{n+4}`, with `γ_k = kε/(1 − kε)`. A
+/// value in `(1, 1 + γ_{n+4}]` is an exactly rigid sample seen through
+/// rounding, and is returned as `1`. Anything larger cannot come from unit
+/// vectors and is refused, as is a non-finite sum.
+fn mean_resultant_length(c: f64, s: f64, n: usize) -> Result<f64, String> {
+    let r = (c * c + s * s).sqrt() / n as f64;
+    let k = (n + 4) as f64 * f64::EPSILON;
+    let rounding = k / (1.0 - k);
+    if !(r.is_finite() && r <= 1.0 + rounding) {
+        return Err(format!(
+            "circle transport: resultant length {r} of {n} unit vectors exceeds 1 by more than \
+             its rounding bound {rounding:e}"
+        ));
+    }
+    Ok(r.min(1.0))
+}
+
 /// Posterior class probabilities for `n` pairs with resultant lengths
 /// `r_shift` and `r_reflect`, with the three classes equally probable a priori.
 fn posterior_class_probabilities(
@@ -293,8 +334,8 @@ pub(crate) fn classify_circle_transport(
         cm += s.cos();
         sm += s.sin();
     }
-    let r_shift = (cp * cp + sp * sp).sqrt() / nf;
-    let r_reflect = (cm * cm + sm * sm).sqrt() / nf;
+    let r_shift = mean_resultant_length(cp, sp, n)?;
+    let r_reflect = mean_resultant_length(cm, sm, n)?;
     let (winding, phase, best) = if r_shift >= r_reflect {
         (1i8, sp.atan2(cp), r_shift)
     } else {
@@ -311,6 +352,14 @@ pub(crate) fn classify_circle_transport(
         })
         .sum();
     let defect_se = influence_sq.sqrt() / nf;
+    let max_angle_gap = theta_in
+        .iter()
+        .zip(theta_out.iter())
+        .map(|(&a, &b)| {
+            let residual = b - winning_sign * a - phase;
+            residual.sin().atan2(residual.cos()).abs()
+        })
+        .fold(0.0_f64, f64::max);
     let class_probabilities = posterior_class_probabilities(n, r_shift, r_reflect)?;
     Ok(CircleTransportReport {
         layer_from,
@@ -320,6 +369,7 @@ pub(crate) fn classify_circle_transport(
         phase,
         defect,
         defect_se,
+        max_angle_gap,
         resultant_shift: r_shift,
         resultant_reflect: r_reflect,
         class_probabilities,
@@ -434,6 +484,26 @@ mod tests {
         assert!(r.class_probabilities.shift > r.class_probabilities.reflect);
     }
 
+    /// The sup-norm gap is the largest residual angle, not the circular variance
+    /// `1 − R`, which for residuals `±δ` is `1 − cos δ ≈ δ²/2`.
+    #[test]
+    fn max_angle_gap_is_the_largest_residual_angle() {
+        let phi = 0.4_f64;
+        let delta = 0.1_f64;
+        let a = [0.0, 1.0, 2.0, 3.0];
+        let b: Vec<f64> = a
+            .iter()
+            .enumerate()
+            .map(|(k, &th)| th + phi + if k % 2 == 0 { delta } else { -delta })
+            .collect();
+        let r = classify_circle_transport(&a, &b, 0, 1).unwrap();
+        assert_eq!(r.winding, 1);
+        assert!((r.phase - phi).abs() < 1e-12, "phase {}", r.phase);
+        assert!((r.max_angle_gap - delta).abs() < 1e-12, "gap {}", r.max_angle_gap);
+        assert!((r.defect - (1.0 - delta.cos())).abs() < 1e-12, "defect {}", r.defect);
+        assert!(r.defect < r.max_angle_gap / 10.0);
+    }
+
     #[test]
     fn recovers_reflection() {
         let mut s = 5u64;
@@ -502,5 +572,34 @@ mod tests {
         assert!((p.mixing - 1.0 / 3.0).abs() < 1e-12, "{p:?}");
         assert!((p.shift - 1.0 / 3.0).abs() < 1e-12, "{p:?}");
         assert!((p.reflect - 1.0 / 3.0).abs() < 1e-12, "{p:?}");
+    }
+
+    /// An exactly rigid sample can round its resultant length just above one.
+    /// It is read as one, so the defect is never negative and the rigid class
+    /// takes all the probability.
+    #[test]
+    fn rigid_sample_resultant_rounds_to_one_not_past_it() {
+        let n = 1000;
+        let theta_in: Vec<f64> = (0..n).map(|i| 0.001 * i as f64).collect();
+        let theta_out: Vec<f64> = theta_in.iter().map(|a| a + 0.7).collect();
+        let report = classify_circle_transport(&theta_in, &theta_out, 0, 1).unwrap();
+        assert!(report.resultant_shift <= 1.0, "{}", report.resultant_shift);
+        assert!(report.defect >= 0.0, "{}", report.defect);
+        let k = (n + 4) as f64 * f64::EPSILON;
+        assert_eq!(mean_resultant_length(n as f64 * (1.0 + 0.5 * k), 0.0, n).unwrap(), 1.0);
+    }
+
+    /// A resultant longer than any rounding of `n` unit vectors allows, or a
+    /// non-finite one, is refused rather than clamped into range.
+    #[test]
+    fn impossible_resultant_lengths_are_refused() {
+        assert!(mean_resultant_length(4.0, 0.0, 3).is_err());
+        assert!(mean_resultant_length(f64::NAN, 0.0, 3).is_err());
+        assert!(log_rigid_bayes_factor(3, 1.5).is_err());
+        assert!(log_rigid_bayes_factor(3, -0.1).is_err());
+        assert!(log_rigid_bayes_factor(3, f64::NAN).is_err());
+        let theta_in = [0.0, f64::NAN, 1.0];
+        let theta_out = [0.0, 0.5, 1.0];
+        assert!(classify_circle_transport(&theta_in, &theta_out, 0, 1).is_err());
     }
 }
