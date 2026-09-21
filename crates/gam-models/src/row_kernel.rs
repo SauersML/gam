@@ -764,6 +764,16 @@ pub(crate) fn evaluate_every_row_into<const K: usize>(
 /// Every row's `(nll, gradient, Hessian)` through the per-row loop
 /// ([`evaluate_every_row_into`]), as the three `n`-length channels a batched
 /// pass returns.
+///
+/// Materialising the channels is asked for by exactly one consumer: the CPU
+/// arm of the device race (`gam_gpu::race_row_kernel`), which has to hand back
+/// a value the accelerator arm can be compared against. Every other caller
+/// owns its slots already and goes through [`evaluate_every_row_into`]. The
+/// device row jet is compiled on Linux alone, so the race — and this
+/// function — have the same platform boundary as their consumer; the same gate
+/// the Stage 3.3 PIRLS dispatch wire carries. Without it `-D warnings` fails
+/// the windows-msvc and apple-darwin release builds on `dead_code`.
+#[cfg(target_os = "linux")]
 pub(crate) fn evaluate_every_row<const K: usize>(
     kern: &(impl RowKernel<K> + ?Sized),
 ) -> Result<(Vec<f64>, Vec<[f64; K]>, Vec<[[f64; K]; K]>), String> {
