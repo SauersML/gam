@@ -1,6 +1,8 @@
 //! Sphere fit with each supported `penalty_order` (m=1..4).
-//! Each should produce a finite, bounded fit; the smoothness biases vary
-//! but the pipeline must never NaN/panic.
+//! Each sweep case must recover the truth to within its own Bayesian band:
+//! the across-the-function coverage statistic of the fit's `Vb` against the
+//! known truth must not exceed its derived bound (see
+//! [`across_function_coverage`]).
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -8,6 +10,7 @@ use gam::smooth::build_term_collection_design;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
+use gam_math::probability::chi_square_quantile;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -36,7 +39,55 @@ fn make_dataset(n: usize) -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
-fn run(formula: &str) -> Result<(f64, f64, f64), String> {
+/// Family-wise significance level of this test's coverage gates, split
+/// Bonferroni-style over the cases the test sweeps.
+const FAMILY_ALPHA: f64 = 0.01;
+
+/// Across-the-function coverage statistic of the fit's Bayesian band
+/// (Nychka 1988; Marra & Wood 2012), with its derived upper bound.
+///
+/// `x_probe` is the probe design, `cov` the fit's conditional Bayesian
+/// coefficient covariance `Vb` (`fit.beta_covariance()`) and `err` the
+/// errors `f̂(x_i) − f(x_i)` against the known truth. With `C = X_p Vb X_pᵀ`,
+/// `s_i = √C_ii` and correlation `R = D⁻¹CD⁻¹`, the statistic is
+/// `Q = (1/P) Σ e_i²/s_i²`. Under the model behind the band, `e ~ N(0, C)`, so
+/// `E[Q] = 1` and `Var[Q] = 2·tr(R²)/P²`. Smoothing bias adds to `e` while
+/// over-smoothing shrinks `s`, so a fit that loses signal drives `Q ≫ 1`.
+/// The returned bound is the `1 − alpha` quantile of the moment-matched
+/// scaled `χ²` (Satterthwaite): `Q ≈ g·χ²_h` with `g = tr(R²)/P²`, `h = 1/g`.
+fn across_function_coverage(
+    x_probe: &Array2<f64>,
+    cov: &Array2<f64>,
+    err: &[f64],
+    alpha: f64,
+) -> Result<(f64, f64), String> {
+    let c = x_probe.dot(cov).dot(&x_probe.t());
+    let p = err.len();
+    let s: Vec<f64> = (0..p).map(|i| c[[i, i]].sqrt()).collect();
+    if let Some(i) = s.iter().position(|v| !(v.is_finite() && *v > 0.0)) {
+        return Err(format!("posterior SE at probe {i} is {}", s[i]));
+    }
+    let q = err
+        .iter()
+        .zip(s.iter())
+        .map(|(e, si)| (e / si).powi(2))
+        .sum::<f64>()
+        / p as f64;
+    let mut tr_r2 = 0.0;
+    for i in 0..p {
+        for j in 0..p {
+            let r = c[[i, j]] / (s[i] * s[j]);
+            tr_r2 += r * r;
+        }
+    }
+    let g = tr_r2 / (p * p) as f64;
+    let bound = g * chi_square_quantile(1.0 - alpha, 1.0 / g);
+    Ok((q, bound))
+}
+
+/// Fit `formula` and return `(rmse, min, max, Q, bound)` on the probe grid,
+/// with `bound` at level `alpha`.
+fn run(formula: &str, alpha: f64) -> Result<(f64, f64, f64, f64, f64), String> {
     let data = make_dataset(400);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -73,16 +124,21 @@ fn run(formula: &str) -> Result<(f64, f64, f64), String> {
                 + 0.3 * lat.to_radians().cos() * lon.to_radians().cos()
         })
         .collect();
-    let sumsq: f64 = pred
-        .iter()
-        .zip(truth.iter())
-        .map(|(p, t)| (p - t).powi(2))
-        .sum();
-    let rmse = (sumsq / pred.len() as f64).sqrt();
+    let err: Vec<f64> = pred.iter().zip(truth.iter()).map(|(p, t)| p - t).collect();
+    let rmse = (err.iter().map(|e| e * e).sum::<f64>() / err.len() as f64).sqrt();
     let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
     let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    eprintln!("[m-sweep] `{formula}` rmse={rmse:.4} range=[{mn:.3}, {mx:.3}]");
-    Ok((rmse, mn, mx))
+    let cov = fit
+        .fit
+        .beta_covariance()
+        .ok_or_else(|| "fit carries no Bayesian covariance Vb".to_string())?;
+    let x_probe = design.design.to_dense();
+    let (q, bound) = across_function_coverage(&x_probe, cov, &err, alpha)?;
+    eprintln!(
+        "[m-sweep] `{formula}` rmse={rmse:.4} Q={q:.3} (E=1, bound={bound:.3}) \
+         range=[{mn:.3}, {mx:.3}]"
+    );
+    Ok((rmse, mn, mx, q, bound))
 }
 
 #[test]
@@ -98,17 +154,22 @@ fn sphere_wahba_penalty_order_sweep_low_orders() {
     // log-singular at coincidence, so it has no Gram diagonal and the basis
     // builder refuses the family (#2475); `lmax=` is the shipped way to state
     // the spectral resolution a finite m=1 diagonal implies.
+    let orders = [1usize, 2, 3];
+    let alpha = FAMILY_ALPHA / orders.len() as f64;
     let mut failures = Vec::new();
-    for m in [1usize, 2, 3] {
+    for m in orders {
         let formula = if m == 1 {
             "y ~ sphere(lat, lon, k=30, penalty_order=1, lmax=200)".to_string()
         } else {
             format!("y ~ sphere(lat, lon, k=30, penalty_order={m})")
         };
-        match run(&formula) {
-            Ok((rmse, mn, mx)) => {
-                if rmse > 0.25 || mn < -5.0 || mx > 5.0 {
-                    failures.push(format!("m={m}: rmse={rmse:.4} range=[{mn:.3}, {mx:.3}]"));
+        match run(&formula, alpha) {
+            Ok((rmse, mn, mx, q, bound)) => {
+                if q > bound {
+                    failures.push(format!(
+                        "m={m}: coverage statistic Q={q:.3} > bound {bound:.3} \
+                         (alpha={alpha:.4}); rmse={rmse:.4} range=[{mn:.3}, {mx:.3}]"
+                    ));
                 }
             }
             Err(e) => failures.push(format!("m={m}: {e}")),
@@ -138,8 +199,8 @@ fn sphere_wahba_m4_must_fit_smooth_truth() {
     // someone derives the correct m=4 kernel constants. Don't silence
     // it — that's the whole point of failing here.
     init_parallelism();
-    let (rmse, mn, mx) =
-        run("y ~ sphere(lat, lon, k=30, penalty_order=4)").expect("wahba m=4 fit must succeed");
+    let (rmse, mn, mx, ..) = run("y ~ sphere(lat, lon, k=30, penalty_order=4)", FAMILY_ALPHA)
+        .expect("wahba m=4 fit must succeed");
     // The other Wahba orders (m=1, 2, 3) all hit rmse ≤ 0.018 on the
     // same data. Require m=4 to be in the same ballpark — generous 5×
     // budget = 0.10.
@@ -155,13 +216,18 @@ fn sphere_wahba_m4_must_fit_smooth_truth() {
 #[test]
 fn sphere_harmonic_penalty_order_sweep() {
     init_parallelism();
+    let orders = [1usize, 2, 3, 4];
+    let alpha = FAMILY_ALPHA / orders.len() as f64;
     let mut failures = Vec::new();
-    for m in [1usize, 2, 3, 4] {
+    for m in orders {
         let formula = format!("y ~ sphere(lat, lon, method=harmonic, max_degree=4, penalty_order={m})");
-        match run(&formula) {
-            Ok((rmse, mn, mx)) => {
-                if rmse > 0.25 || mn < -5.0 || mx > 5.0 {
-                    failures.push(format!("m={m}: rmse={rmse:.4} range=[{mn:.3}, {mx:.3}]"));
+        match run(&formula, alpha) {
+            Ok((rmse, mn, mx, q, bound)) => {
+                if q > bound {
+                    failures.push(format!(
+                        "m={m}: coverage statistic Q={q:.3} > bound {bound:.3} \
+                         (alpha={alpha:.4}); rmse={rmse:.4} range=[{mn:.3}, {mx:.3}]"
+                    ));
                 }
             }
             Err(e) => failures.push(format!("m={m}: {e}")),
