@@ -68,8 +68,7 @@ fn transformation_normal_draws_come_from_the_persisted_truncated_law_3724() {
         "the fixture must produce a transformation-normal model"
     );
     let published_mean = model
-        .unified
-        .as_ref()
+        .unified()
         .expect("a saved CTN model carries its unified fit")
         .beta
         .clone();

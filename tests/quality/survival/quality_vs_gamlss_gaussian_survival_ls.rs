@@ -170,9 +170,9 @@ fn gam_gaussian_survival_location_scale_matches_gamlss() {
     )
     .expect("gam survival location-scale fit");
     let unified = payload
-        .unified
+        .fit_result
         .clone()
-        .expect("a survival location-scale payload carries its unified fit");
+        .expect("a survival location-scale payload carries its fit result");
     let thresholdspec = payload
         .resolved_termspec
         .clone()

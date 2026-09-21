@@ -61,7 +61,7 @@ pub(crate) use gam::data::{
 };
 
 pub(crate) use gam::inference::model::{
-    FittedFamily, FittedModel, FittedModelPayload, GroupMetadata, PredictModelClass,
+    FittedFamily, FittedModel, GroupMetadata, PredictModelClass,
 };
 
 pub(crate) use gam::inference::model_extension::ExtendGroupRequest;
