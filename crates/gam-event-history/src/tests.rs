@@ -6268,7 +6268,6 @@ fn kinked_constant_hazard_fit(times: &[f64], log_normaliser: &[f64]) -> (EventHi
         grid: ReferenceGrid { times: times.to_vec(), gaps },
         profiles: Array2::zeros((1, cohort.covariates.ncols())),
         coefficients: Vec::new(),
-        node_stratum: vec![0; times.len()],
         log_normaliser: log_normaliser.iter().flat_map(|&m| std::iter::repeat_n(m, marks)).collect(),
         log_risk_mass: vec![0.0; times.len() * marks],
         masks: 0,

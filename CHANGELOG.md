@@ -28,6 +28,19 @@
   the probability a function of the machine. The conditional entry points keep their names and
   their meaning, labelled, which is what SPEC 25 asks of a conditional prediction that is kept.
 
+- **A reference-law snapshot carried an index into the training cohort's nodes** (gam#2966).
+  `RiskSetCentring` is the object a prediction reads its baselines' normaliser from, and the one the
+  saved event-history predictor must carry, and it is documented as travelling "when the snapshot is
+  saved or used for prediction". It held `node_stratum`, one entry per node of the TRAINING cohort,
+  written from `ReferenceTables` at every refresh and read by nothing: no production or test line
+  outside its own construction touched it. A serving artifact does not need the training
+  participants' records, so a snapshot that names them is a schema hazard that would have frozen
+  into the saved payload. The field is gone, and the snapshot now describes the reference
+  population alone: its profiles, the grid it is run forward on, and the evolution its coefficients
+  give it. Where each training node sits on that grid stays in `ReferenceTables`, which the fit
+  holds and a prediction never reads. The round-trip test asserts the saved document names no
+  training node, rather than asserting that a field it should not have survives serialisation.
+
 - **The constrained cone term skipped every Firth fit on a premise about the stored gradient that
   is not true** (gam#2765). The criterion's constrained term was declared inapplicable under Firth
   bias reduction because `PirlsResult::penalized_gradient_transformed` was read as

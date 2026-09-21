@@ -86,7 +86,7 @@ impl EventHistoryFamily {
         })?;
         let (_, mask_of_mark) = crate::preserve::killing_masks(&tables.kinds);
         Ok(RiskSetCentring { grid: tables.grid.clone(), profiles: tables.profiles.clone(),
-            coefficients: beta.to_vec(), node_stratum: tables.node_stratum.clone(),
+            coefficients: beta.to_vec(),
             log_normaliser: out.log_normaliser,
             log_risk_mass: out.log_risk_mass, masks: out.masks, mask_of_mark })
     }
@@ -541,8 +541,18 @@ mod tests {
         assert_eq!(reference.log_risk_mass, restored.log_risk_mass);
         assert_eq!(reference.grid.times, restored.grid.times);
         assert_eq!(reference.profiles, restored.profiles);
-        assert_eq!(reference.node_stratum, restored.node_stratum);
         assert_eq!(reference.mask_of_mark, restored.mask_of_mark);
+        // A reference law describes the reference population and nothing
+        // else: a snapshot that travels to a serving artifact carries no
+        // per-training-node field to lose in the round trip (#2966).
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded)
+                .unwrap()
+                .as_object()
+                .map(|fields| fields.contains_key("node_stratum")),
+            Some(false),
+            "the saved reference law must name no training node"
+        );
         assert!(reference.log_normaliser.last().unwrap() < &reference.log_normaliser[0]);
         assert!((reference.log_risk_mass.last().unwrap() + 6.0 * (-1.2_f64).exp()).abs() < 2e-4);
     }

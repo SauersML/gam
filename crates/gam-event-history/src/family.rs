@@ -161,12 +161,20 @@ pub struct EventHistoryFamily {
 /// A reference-law snapshot evaluated at one coefficient state. The grid,
 /// profile order, risk masks, coefficients, and numerical evolution travel
 /// together when the snapshot is saved or used for prediction.
+///
+/// Everything here describes the REFERENCE population — its profiles, the
+/// grid it is run forward on, and the evolution those coefficients give it —
+/// and nothing here describes a training participant. That is what lets a
+/// snapshot be a serving artifact's reference law (gam#2966): a saved
+/// predictor carries the population the baselines are normalised against, not
+/// the people the model was fitted on. The placement of each TRAINING node on
+/// the grid belongs to [`ReferenceTables`], which the fit holds and a
+/// prediction never reads.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RiskSetCentring {
     pub grid: ReferenceGrid,
     pub profiles: Array2<f64>,
     pub coefficients: Vec<f64>,
-    pub node_stratum: Vec<usize>,
     pub log_normaliser: Vec<f64>,
     pub log_risk_mass: Vec<f64>,
     pub masks: usize,
