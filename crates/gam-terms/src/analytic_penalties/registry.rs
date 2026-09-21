@@ -215,7 +215,8 @@ impl AnalyticPenaltyRegistry {
     }
 
     /// Check every isometry penalty holds the decoder jets an evaluation of
-    /// `order` reads for a `target_len`-coordinate target, returning the first
+    /// `order` reads for a `target_len`-coordinate target and has a defined
+    /// scale-invariant gauge, returning the first
     /// refusal ([`IsometryPenalty::evaluation_state_precondition`]). No other
     /// registered penalty reads state its owner installs, so the others pass.
     pub fn isometry_evaluation_precondition(
@@ -364,6 +365,13 @@ impl FrozenAnalyticPenaltyOp {
         rho: Array1<f64>,
     ) -> Result<Self, String> {
         penalty.validate_rho(rho.view())?;
+        // Every read of the frozen curvature (matvec, diag, dense) probes the PSD
+        // majorizer, which for an isometry penalty reads the decoder Jacobian and
+        // its motion and needs a defined scale-invariant gauge.
+        if let AnalyticPenaltyKind::Isometry(isometry) = &penalty {
+            isometry
+                .evaluation_state_precondition(IsometryEvaluationOrder::Gradient, target.len())?;
+        }
         Ok(Self {
             penalty,
             target,
@@ -613,6 +621,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             | AnalyticPenaltyKind::NestedPrefix(_)
             | AnalyticPenaltyKind::ScadMcp(_)
             | AnalyticPenaltyKind::DecoderIncoherence(_)
+            | AnalyticPenaltyKind::Isometry(_)
             | AnalyticPenaltyKind::SheafConsistency(_) => {}
         }
         let n = self.target.len();
@@ -691,6 +700,7 @@ impl FrozenAnalyticPenaltyOp {
             | AnalyticPenaltyKind::ScadMcp(_)
             | AnalyticPenaltyKind::BlockOrthogonality(_)
             | AnalyticPenaltyKind::DecoderIncoherence(_)
+            | AnalyticPenaltyKind::Isometry(_)
             | AnalyticPenaltyKind::SheafConsistency(_) => {}
         }
         let n = self.target.len();

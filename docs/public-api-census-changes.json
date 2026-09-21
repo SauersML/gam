@@ -5153,5 +5153,32 @@
     },
     "reason": "#4454: two wrappers that only forwarded to gam_linalg::utils::splitmix64 under a local name are deleted; callers call the canonical SplitMix64 directly (single source of truth).",
     "evidence": "https://github.com/SauersML/gam/issues/4454: examples/common/mod.rs held only the wrapper and is deleted with the three `mod common;` declarations in scale_k, tiered_gpu_scale and tiered_k2000_measure; the two call sites inside support_seed.rs now call gam_linalg::utils::splitmix64_hash (the wrapper had no caller outside that file); git grep finds no remaining caller of the removed paths."
+  },
+  {
+    "base": "08628afb310729629275eb487e7714732662d59e",
+    "removed": {
+      "crates/gam-sae/src/manifold/construction_rank_charge_derivative.rs::rank_charge_audit": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::basis_edf": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::conditional_decoder_tempered_posterior": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::conditional_noise_null": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::effective_sample_size": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::false_rank_probability_bound": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::isotropic": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::mp_reconstruction_rank": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::mp_reconstruction_rank_edge": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::nearest_mp_boundary": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::production_charge": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::production_chargeable_rank": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::production_dof": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::rank_charge_stratum": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::reconstruction_energies": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::tempered_gaussian_excess_loss": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::top_reconstruction_energy": 1,
+      "crates/gam-sae/src/manifold/wbic_audit.rs::total": 1,
+      "crates/gam-terms/src/analytic_penalties/isometry.rs::hvp_state": 1,
+      "crates/gam-terms/src/analytic_penalties/isometry.rs::hvp_with_precomputed_state": 1
+    },
+    "reason": "#3440 F31 and F02 (PR #3484). The unconsumed public WBIC audit surface of gam-sae (wbic_audit.rs and rank_charge_audit) is deleted and its one production use, the rank-charge stratum, becomes the crate-private manifold/rank_charge_stratum.rs; the noise-only Wishart law survives as a test oracle in tests_wbic_rank_charge_2933. In gam-terms isometry.rs, hvp_state and hvp_with_precomputed_state narrow from pub(crate) to private: their only callers are the IsometryPenalty methods in the same impl.",
+    "evidence": "scripts/public_api_census.py --base 08628afb310729629275eb487e7714732662d59e observes exactly these losses for the PR #3484 merge head; git grep -w at the head finds no caller of the removed gam-sae functions outside the test oracle, and hvp_state / hvp_with_precomputed_state are still declared (as private fns) in crates/gam-terms/src/analytic_penalties/isometry.rs with all callers in that file."
   }
 ]

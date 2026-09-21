@@ -151,7 +151,7 @@ pub struct IsometryPenalty {
     pub scalar_weight: f64,
 }
 
-pub(crate) struct IsometryHvpState {
+struct IsometryHvpState {
     d: usize,
     n_obs: usize,
     p: usize,
@@ -470,12 +470,21 @@ impl IsometryPenalty {
     }
 
     /// Check that the decoder jets an evaluation of `order` reads are installed
-    /// and shaped for a target of `target_len` latent coordinates.
+    /// and shaped for a target of `target_len` latent coordinates, and that the
+    /// scale-invariant gauge is defined at them.
     ///
     /// The penalty is a function of the decoder Jacobian `J = ∂f/∂t`, never of
     /// the target directly: without `J` it has no value, and without `H = ∂J/∂t`
-    /// no target derivative. Every evaluation route
-    /// installs the jets it reads (the SAE atom refresh), or checks this first
+    /// no target derivative. The residual `R_n = g_n/ḡ − g^ref_n/ḡ^ref` divides
+    /// by the average trace per dimension `ḡ = (1/(N d)) Σ_n tr(g_n)` of the
+    /// pullback metric, which is zero exactly when `U_nᵀ J_n = 0` on every row.
+    /// There the gauge has no value (along `J = εJ₀` it tends to the nonzero
+    /// residual of `J₀`, not to zero), so a metric whose average trace per
+    /// dimension is not a finite value of at least `f64::MIN_POSITIVE` (the
+    /// smallest normal value, whose reciprocal is finite), for the pullback or
+    /// for the reference, is refused here rather than evaluated as a zero
+    /// penalty. Every evaluation route installs the jets it reads (the SAE
+    /// atom refresh), or checks this first
     /// and refuses by the returned text (the pyffi `analytic_penalty_*` entry
     /// points and the latent-coordinate fit routes, through
     /// [`AnalyticPenaltyRegistry::isometry_evaluation_precondition`]).
@@ -514,6 +523,8 @@ impl IsometryPenalty {
             }
             Some(_) => {}
         }
+        self.metric_normalizer(d)?;
+        self.reference_normalizer(n_obs, d)?;
         if order == IsometryEvaluationOrder::Value {
             return Ok(());
         }
@@ -560,8 +571,8 @@ impl IsometryPenalty {
         Ok(())
     }
 
-    /// Stop an evaluation that lacks the decoder jets `order` reads. That is an
-    /// owner bug, never a zero penalty.
+    /// Stop an evaluation that lacks the decoder jets `order` reads, or whose
+    /// gauge is undefined at them. That is an owner bug, never a zero penalty.
     fn require_evaluation_state(
         &self,
         method: &str,
@@ -576,12 +587,6 @@ impl IsometryPenalty {
             // silently drop the gauge from the objective.
             panic!("IsometryPenalty::{method}: {reason}");
         }
-    }
-
-    /// Log an evaluation that returns zero because the decoder metric is
-    /// degenerate.
-    fn log_zero_default(&self, method: &str, detail: &str) {
-        log::debug!("IsometryPenalty::{method} {detail}; returning the zero default");
     }
 
     /// Build `M_n = U_n^T J_n ∈ ℝ^{r_n × d}` for row `n`. For
@@ -684,7 +689,7 @@ impl IsometryPenalty {
         }
     }
 
-    pub(crate) fn hvp_state(&self, target: ArrayView1<'_, f64>) -> Option<IsometryHvpState> {
+    fn hvp_state(&self, target: ArrayView1<'_, f64>) -> IsometryHvpState {
         let d = self
             .target
             .latent_dim
@@ -695,12 +700,12 @@ impl IsometryPenalty {
         let jac2 = self.jacobian_second_cache().expect(INSTALLED_JETS);
         let jac3 = self.third_decoder_derivative().expect(INSTALLED_JETS);
         let g = self.pullback_metric(d).expect(INSTALLED_JACOBIAN);
-        let metric = self.normalized_metric_state(g, n_obs, d)?;
+        let metric = self.normalized_metric_state(g, n_obs, d);
         let mut wj_rows = Vec::with_capacity(n_obs);
         for n in 0..n_obs {
             wj_rows.push(self.weighted_jacobian_row(n, d).expect(INSTALLED_JACOBIAN));
         }
-        Some(IsometryHvpState {
+        IsometryHvpState {
             d,
             n_obs,
             p,
@@ -708,10 +713,10 @@ impl IsometryPenalty {
             jac3,
             metric,
             wj_rows,
-        })
+        }
     }
 
-    pub(crate) fn hvp_with_precomputed_state(
+    fn hvp_with_precomputed_state(
         &self,
         state: &IsometryHvpState,
         rho: ArrayView1<'_, f64>,
@@ -845,13 +850,55 @@ impl IsometryPenalty {
     /// scale-free, so without the factor the joint Newton step collapses and
     /// the proximal ridge saturates at 1e15 (#795). It stays PSD (a positive
     /// scalar on an already-PSD Gram block), so the Schur complement is
-    /// unaffected. `None` when the metric is unavailable or degenerate, mirror-
-    /// ing `normalized_metric_state`'s non-positive-normalizer guard.
-    pub fn metric_normalizer(&self, latent_dim: usize) -> Option<f64> {
-        let g = self.pullback_metric(latent_dim)?;
+    /// unaffected. Refused, with the reason, when no dimensioned Jacobian is
+    /// installed or the metric has no positive finite average trace, where the
+    /// gauge is undefined ([`Self::evaluation_state_precondition`]).
+    pub fn metric_normalizer(&self, latent_dim: usize) -> Result<f64, String> {
+        let g = self.pullback_metric(latent_dim).ok_or_else(|| {
+            format!(
+                "IsometryPenalty pullback metric needs a decoder Jacobian shaped (n_obs, \
+                 p_out·latent_dim) with p_out·latent_dim = {}, and none is installed",
+                self.p_out * latent_dim
+            )
+        })?;
         let n_obs = g.nrows();
         let normalizer = average_trace_per_dim(g.view(), n_obs, latent_dim);
-        (normalizer.is_finite() && normalizer > f64::MIN_POSITIVE).then_some(normalizer)
+        if normalizer.is_finite() && normalizer > f64::MIN_POSITIVE {
+            Ok(normalizer)
+        } else {
+            Err(format!(
+                "IsometryPenalty scale-invariant gauge g_n/ḡ − g^ref_n/ḡ^ref is undefined: the \
+                 decoder pullback metric has average trace per dimension ḡ = {normalizer} \
+                 (the weighted decoder Jacobian vanishes on every row or is non-finite)"
+            ))
+        }
+    }
+
+    /// Average trace per dimension `ḡ^ref` of the reference metric on `n_obs`
+    /// rows, the reference side's normalizer (exactly `1` for `Euclidean`).
+    /// Refused when a user-supplied reference is misshapen or has no positive
+    /// finite average trace.
+    fn reference_normalizer(&self, n_obs: usize, d: usize) -> Result<f64, String> {
+        if let IsometryReference::UserSupplied(a) = &self.reference
+            && a.dim() != (n_obs, d * d)
+        {
+            return Err(format!(
+                "IsometryPenalty user-supplied reference metric has shape {:?}, but this target \
+                 needs (n_obs, latent_dim²) = ({n_obs}, {})",
+                a.dim(),
+                d * d
+            ));
+        }
+        let g_ref = self.reference_metric(n_obs, d);
+        let normalizer = average_trace_per_dim(g_ref.view(), n_obs, d);
+        if normalizer.is_finite() && normalizer > f64::MIN_POSITIVE {
+            Ok(normalizer)
+        } else {
+            Err(format!(
+                "IsometryPenalty reference metric has average trace per dimension \
+                 ḡ^ref = {normalizer}, so the scale-invariant gauge is undefined"
+            ))
+        }
     }
 
     /// Reference metric per row for the normalized pullback metric, `(n_obs, d*d)`.
@@ -887,40 +934,37 @@ impl IsometryPenalty {
     ///
     /// All value, gradient, and HVP paths consume this state so the global
     /// normalizer's derivative is never detached.
+    ///
+    /// Both normalizers are positive and finite here: every caller runs after
+    /// [`Self::require_evaluation_state`], whose precondition refuses a
+    /// degenerate pullback or reference metric.
     fn normalized_metric_state(
         &self,
         g: Array2<f64>,
         n_obs: usize,
         d: usize,
-    ) -> Option<IsometryMetricState> {
+    ) -> IsometryMetricState {
         let dd = d * d;
         let trace_denominator = (n_obs * d) as f64;
         let normalizer = average_trace_per_dim(g.view(), n_obs, d);
-        if !(normalizer.is_finite() && normalizer > f64::MIN_POSITIVE) {
-            self.log_zero_default(
-                "normalized_metric_state",
-                &format!(
-                    "unit-average-speed normalizer is non-positive or non-finite: {normalizer}"
-                ),
-            );
-            return None;
-        }
         let g_ref = self.reference_metric(n_obs, d);
         // Normalize the reference by its own average trace per dim so the gauge
         // is scale-invariant on both sides: a decoder metric proportional to the
         // reference (up to an arbitrary global scale, common for external chart
         // metrics / GP-LVM warm starts) gives a zero residual. For `Euclidean`,
-        // `ref_normalizer == 1.0` exactly, preserving the prior behavior bit-for-bit.
+        // `ref_normalizer == 1.0` exactly.
         let ref_normalizer = average_trace_per_dim(g_ref.view(), n_obs, d);
-        if !(ref_normalizer.is_finite() && ref_normalizer > f64::MIN_POSITIVE) {
-            self.log_zero_default(
-                "normalized_metric_state",
-                &format!(
-                    "reference-metric normalizer is non-positive or non-finite: {ref_normalizer}"
-                ),
-            );
-            return None;
-        }
+        // `evaluation_state_precondition` refuses a pullback or reference metric
+        // without a positive finite average trace, and every caller has passed
+        // `require_evaluation_state` on the same installed jets.
+        assert!(
+            normalizer.is_finite()
+                && normalizer > f64::MIN_POSITIVE
+                && ref_normalizer.is_finite()
+                && ref_normalizer > f64::MIN_POSITIVE,
+            "IsometryPenalty::normalized_metric_state: gauge normalizers ḡ = {normalizer}, \
+             ḡ^ref = {ref_normalizer} passed the evaluation precondition"
+        );
         let mut residual = Array2::<f64>::zeros((n_obs, dd));
         let inv_norm = 1.0 / normalizer;
         let inv_ref_norm = 1.0 / ref_normalizer;
@@ -949,14 +993,14 @@ impl IsometryPenalty {
                 }
             }
         }
-        Some(IsometryMetricState {
+        IsometryMetricState {
             g,
             residual,
             metric_grad,
             normalizer,
             trace_denominator,
             residual_dot_g,
-        })
+        }
     }
 
     /// Exact closed-form gradient of the isometry penalty with respect to the
@@ -996,9 +1040,7 @@ impl IsometryPenalty {
             target.len(),
         );
         let g = self.pullback_metric(d).expect(INSTALLED_JACOBIAN);
-        let Some(metric) = self.normalized_metric_state(g, n_obs, d) else {
-            return grad;
-        };
+        let metric = self.normalized_metric_state(g, n_obs, d);
         let mu = validated_learnable_weight(self.scalar_weight, rho[self.rho_index]);
         for n in 0..n_obs {
             let wj = self.weighted_jacobian_row(n, d).expect(INSTALLED_JACOBIAN);
@@ -1044,9 +1086,7 @@ impl AnalyticPenalty for IsometryPenalty {
         let n_obs = target.len() / d;
         self.require_evaluation_state("value", IsometryEvaluationOrder::Value, target.len());
         let g = self.pullback_metric(d).expect(INSTALLED_JACOBIAN);
-        let Some(metric) = self.normalized_metric_state(g, n_obs, d) else {
-            return 0.0;
-        };
+        let metric = self.normalized_metric_state(g, n_obs, d);
         let mu = validated_learnable_weight(self.scalar_weight, rho[self.rho_index]);
         let mut acc = 0.0;
         for n in 0..n_obs {
@@ -1082,9 +1122,7 @@ impl AnalyticPenalty for IsometryPenalty {
             target.len(),
         );
         let g = self.pullback_metric(d).expect(INSTALLED_JACOBIAN);
-        let Some(metric) = self.normalized_metric_state(g, n_obs, d) else {
-            return Array1::<f64>::zeros(target.len());
-        };
+        let metric = self.normalized_metric_state(g, n_obs, d);
         let p = self.p_out;
         let mu = validated_learnable_weight(self.scalar_weight, rho[self.rho_index]);
         let mut grad = Array1::<f64>::zeros(target.len());
@@ -1128,9 +1166,7 @@ impl AnalyticPenalty for IsometryPenalty {
         //   B_{ab,cd} = K_{a,cd}^T W J_b + H_{a,c}^T W H_{b,d}
         //             + H_{a,d}^T W H_{b,c} + J_a^T W K_{b,cd},
         // where K is the third decoder derivative and H is the second.
-        let Some(state) = self.hvp_state(target) else {
-            return Array1::<f64>::zeros(v.len());
-        };
+        let state = self.hvp_state(target);
         self.hvp_with_precomputed_state(&state, rho, v)
     }
 
@@ -1160,9 +1196,7 @@ impl AnalyticPenalty for IsometryPenalty {
         );
         let jac2 = self.jacobian_second_cache().expect(INSTALLED_JETS);
         let g = self.pullback_metric(d).expect(INSTALLED_JACOBIAN);
-        let Some(metric) = self.normalized_metric_state(g, n_obs, d) else {
-            return Array1::<f64>::zeros(v.len());
-        };
+        let metric = self.normalized_metric_state(g, n_obs, d);
         let p = self.p_out;
         let mu = validated_learnable_weight(self.scalar_weight, rho[self.rho_index]);
         let mut out = Array1::<f64>::zeros(v.len());

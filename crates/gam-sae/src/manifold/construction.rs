@@ -88,8 +88,8 @@ fn lift_tier0_reconstruction(
 // a learning coefficient, but nothing in this crate proves that `½·r_k·edf_k` is
 // that coefficient for the joint decoder/coordinate/gate model, and the MP edge is
 // not a calibrated boundary for the fitted, projected, gated reconstruction it
-// thresholds. `wbic_audit` states what the edge is and what the noise-only law of
-// that spectrum looks like. Physical rank, chargeable rank, storage dimension, EDF,
+// thresholds. `rank_charge_stratum` states what the edge is and what the noise-only
+// law of that spectrum looks like. Physical rank, chargeable rank, storage dimension, EDF,
 // intrinsic dimension and RLCT stay distinct quantities.
 //
 // The production criterion has one charge currency: the chargeable-rank branch.
@@ -459,7 +459,7 @@ fn floating_point_accumulation_gamma(rounded_operations: usize) -> Option<f64> {
 /// Callers supply the per-observation reconstruction-Gram eigenvalues `mu`, the
 /// MP reconstruction-rank `edge`. Inputs are validated by
 /// [`validate_rank_charge_problem`] before production reaches this helper;
-/// `super::wbic_audit::rank_charge_stratum` is the one producer that calls it.
+/// `super::rank_charge_stratum::rank_charge_stratum` is the one producer that calls it.
 pub(super) fn classify_reconstruction_rank(
     mu: &[f64],
     edge: f64,
@@ -698,7 +698,7 @@ fn realised_rank_charge_stratum(
 ) -> Result<super::wbic_audit::RankChargeStratum, String> {
     // One stratum producer for the value, its analytic derivative and the audit,
     // so all three classify the same branch of the same state (#2933 F32).
-    let stratum = super::wbic_audit::rank_charge_stratum(
+    let stratum = super::rank_charge_stratum::rank_charge_stratum(
         gram,
         decoder,
         n_eff,

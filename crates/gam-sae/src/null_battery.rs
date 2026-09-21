@@ -132,7 +132,7 @@ pub fn label_shuffle_permutation(n_rows: usize, seed: u64, draw: u64) -> Vec<usi
 /// of independent variance-`R` noise. A fitted, basis-projected, gated
 /// reconstruction spectrum is not such a matrix, so this edge is a rank
 /// diagnostic, not a calibrated false-rank boundary (the conditional noise-only
-/// law is in `crate::manifold::wbic_audit`), and not an information-theoretic
+/// law is derived in `crate::manifold::rank_charge_stratum`), and not an information-theoretic
 /// detection limit. The predictive 2-D shape race does not threshold on it: a
 /// direction below this edge is omitted from the hard reconstruction-rank
 /// count, but that fact neither negates nor overrides a shape verdict.

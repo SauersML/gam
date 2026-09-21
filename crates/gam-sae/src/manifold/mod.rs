@@ -38,7 +38,7 @@
 //!   thresholded reconstruction rank on the atom's occupancy scale `n_eff`. It is
 //!   a named criterion convention: hard rank, basis EDF and a singular learning
 //!   coefficient are distinct quantities and are not identified with one another.
-//!   Grounding in `construction`, `wbic_audit`.
+//!   Grounding in `construction`, `rank_charge_stratum`.
 //!
 //! Learnability trichotomy: structure resolves in the strict order existence ->
 //! dimension -> topology, and *fidelity cannot buy topology, only occupancy can*
@@ -233,7 +233,7 @@ mod term;
 // module is reachable from every descendant test module without being public.
 pub(crate) mod tests_topology_fixtures;
 mod transport_law;
-mod wbic_audit;
+mod rank_charge_stratum;
 
 #[cfg(test)]
 mod tests;
@@ -675,4 +675,3 @@ pub use support_seed::*;
 pub use support_term::*;
 pub use term::*;
 pub use transport_law::*;
-pub use wbic_audit::*;
