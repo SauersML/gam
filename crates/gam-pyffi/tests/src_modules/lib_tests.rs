@@ -2,7 +2,7 @@ use super::*;
 // Payload-construction names the lib no longer imports: the fit-dispatch and
 // payload assembly moved to `gam::inference::model_payload_builders` (#2470),
 // so only these tests still reach them.
-use gam::inference::model::{MODEL_PAYLOAD_VERSION, ModelKind};
+use gam::inference::model::{FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind};
 use ndarray::{array, s};
 
 #[test]
