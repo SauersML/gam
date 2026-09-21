@@ -53,6 +53,16 @@
   eigensolver's backward error. The old cut-off had an absolute floor of 1, so it
   did not scale with the penalty. An eigendecomposition failure is now reported
   instead of silently skipping the check.
+- **Warm-start `Session` has one loader** (#4080). `try_load_with_source` and
+  `peek_load_with_source` had the same body, and the `LoadSource` they returned had
+  the single variant `Exact`, so the outer optimizer's `source == Exact` test was
+  always true. Both loaders, `LoadSource` and `LoadedEntry` are replaced by
+  `Session::load() -> Option<WarmStartEntry>`.
+- **One element-wise `f64` writer in the warm-start `Fingerprinter`** (#4081).
+  `write_f64_slice_payload_slow` and `write_f64_slice_payload_slow_iter` were two
+  copies of the same loop, now `write_f64_elements`. The bulk fast path now falls back
+  only for a slice that holds `-0.0`: a NaN hashes its own bits on both paths, so
+  sending NaN slices down the slow path produced the same bytes. Keys are unchanged.
 
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from

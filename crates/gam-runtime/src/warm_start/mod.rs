@@ -66,5 +66,5 @@ pub mod store;
 
 pub use configured::ConfiguredWarmStartStore;
 pub use key::{Fingerprint, Fingerprinter};
-pub use session::{LoadSource, LoadedEntry, Session};
+pub use session::Session;
 pub use store::{EntryKind, StoreError, StoreOptions, WarmStartEntry, WarmStartStore};

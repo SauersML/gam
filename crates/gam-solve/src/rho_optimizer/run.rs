@@ -1017,8 +1017,8 @@ impl OuterProblem {
         let short_key = &key_hex[..8.min(key_hex.len())];
         let mut had_hit = false;
         let mut cached_inner_seed: Option<BoundInnerSeed> = None;
-        if let Some(loaded) = session.try_load_with_source() {
-            match classify_cache_entry_for_outer(&loaded, self.n_params) {
+        if let Some(entry) = session.load() {
+            match classify_cache_entry_for_outer(&entry, self.n_params) {
                 CacheSeedDecision::ExactFinal {
                     rho,
                     beta,

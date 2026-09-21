@@ -709,10 +709,9 @@ pub(crate) enum CacheSeedDecision {
 }
 
 pub(crate) fn classify_cache_entry_for_outer(
-    loaded: &gam_runtime::warm_start::LoadedEntry,
+    entry: &gam_runtime::warm_start::WarmStartEntry,
     expected_rho_dim: usize,
 ) -> CacheSeedDecision {
-    let entry = &loaded.entry;
     let Some(payload) = decode_iterate(&entry.payload, expected_rho_dim) else {
         return CacheSeedDecision::Discard {
             reason: "payload-shape-mismatch",
@@ -736,8 +735,7 @@ pub(crate) fn classify_cache_entry_for_outer(
             all_rho_finite: Some(false),
         };
     }
-    if loaded.source == LoadSource::Exact && entry.kind == gam_runtime::warm_start::EntryKind::Final
-    {
+    if entry.kind == gam_runtime::warm_start::EntryKind::Final {
         return CacheSeedDecision::ExactFinal {
             rho: cached_rho,
             beta: payload.beta,
@@ -765,11 +763,11 @@ pub(crate) fn classify_cache_entry_for_outer(
 }
 
 pub fn cache_entry_would_help_outer(
-    loaded: &gam_runtime::warm_start::LoadedEntry,
+    entry: &gam_runtime::warm_start::WarmStartEntry,
     expected_rho_dim: usize,
 ) -> bool {
     matches!(
-        classify_cache_entry_for_outer(loaded, expected_rho_dim),
+        classify_cache_entry_for_outer(entry, expected_rho_dim),
         CacheSeedDecision::ExactFinal { .. } | CacheSeedDecision::Seed { .. }
     )
 }

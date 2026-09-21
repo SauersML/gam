@@ -100,19 +100,16 @@ fn iterate_payload_round_trips_converged_outer_hessian() {
 
     // The classifier surfaces the square Hessian as a (dim, flat) pair on the
     // Seed decision so the resume path can reconstruct and invert it.
-    let loaded = gam_runtime::warm_start::LoadedEntry {
-        entry: gam_runtime::warm_start::WarmStartEntry {
-            payload: bytes,
-            objective: Some(1.0),
-            iteration: Some(0),
-            kind: gam_runtime::warm_start::EntryKind::Checkpoint,
-            written_unix_secs: 0,
-        },
-        source: gam_runtime::warm_start::LoadSource::Exact,
+    let entry = gam_runtime::warm_start::WarmStartEntry {
+        payload: bytes,
+        objective: Some(1.0),
+        iteration: Some(0),
+        kind: gam_runtime::warm_start::EntryKind::Checkpoint,
+        written_unix_secs: 0,
     };
     let CacheSeedDecision::Seed {
         hessian: decoded_h, ..
-    } = classify_cache_entry_for_outer(&loaded, 2)
+    } = classify_cache_entry_for_outer(&entry, 2)
     else {
         panic!("expected Seed decision");
     };
@@ -145,19 +142,16 @@ fn classify_extracts_beta_from_v2_payload() {
     let rho = array![1.0, 2.0];
     let beta = array![10.0, 20.0, 30.0];
     let payload = encode_iterate(&rho, Some(&beta), None, 1.0, 0).expect("encode");
-    let loaded = gam_runtime::warm_start::LoadedEntry {
-        entry: gam_runtime::warm_start::WarmStartEntry {
-            payload,
-            objective: Some(1.0),
-            iteration: Some(0),
-            kind: gam_runtime::warm_start::EntryKind::Checkpoint,
-            written_unix_secs: 0,
-        },
-        source: gam_runtime::warm_start::LoadSource::Exact,
+    let entry = gam_runtime::warm_start::WarmStartEntry {
+        payload,
+        objective: Some(1.0),
+        iteration: Some(0),
+        kind: gam_runtime::warm_start::EntryKind::Checkpoint,
+        written_unix_secs: 0,
     };
     let CacheSeedDecision::Seed {
         beta: decoded_beta, ..
-    } = classify_cache_entry_for_outer(&loaded, 2)
+    } = classify_cache_entry_for_outer(&entry, 2)
     else {
         panic!("expected Seed decision");
     };
@@ -165,19 +159,16 @@ fn classify_extracts_beta_from_v2_payload() {
 
     // ρ-only payload (legacy or family-without-β) decodes to empty beta.
     let payload = encode_iterate(&rho, None, None, 1.0, 0).expect("encode");
-    let loaded = gam_runtime::warm_start::LoadedEntry {
-        entry: gam_runtime::warm_start::WarmStartEntry {
-            payload,
-            objective: Some(1.0),
-            iteration: Some(0),
-            kind: gam_runtime::warm_start::EntryKind::Checkpoint,
-            written_unix_secs: 0,
-        },
-        source: gam_runtime::warm_start::LoadSource::Exact,
+    let entry = gam_runtime::warm_start::WarmStartEntry {
+        payload,
+        objective: Some(1.0),
+        iteration: Some(0),
+        kind: gam_runtime::warm_start::EntryKind::Checkpoint,
+        written_unix_secs: 0,
     };
     let CacheSeedDecision::Seed {
         beta: decoded_beta, ..
-    } = classify_cache_entry_for_outer(&loaded, 2)
+    } = classify_cache_entry_for_outer(&entry, 2)
     else {
         panic!("expected Seed decision");
     };
@@ -440,19 +431,16 @@ fn cache_entry_classifier_honors_finite_seeds_regardless_of_saturation() {
     // making the cold-β failure mode impossible to re-create from cache.
     for rho_seed in [array![9.0, 0.0], array![10.0, -10.0], array![-10.0, 10.0]] {
         let payload = encode_iterate(&rho_seed, None, None, 1.0, 0).expect("encode");
-        let loaded = gam_runtime::warm_start::LoadedEntry {
-            entry: gam_runtime::warm_start::WarmStartEntry {
-                payload,
-                objective: Some(1.0),
-                iteration: Some(0),
-                kind: gam_runtime::warm_start::EntryKind::Checkpoint,
-                written_unix_secs: 0,
-            },
-            source: gam_runtime::warm_start::LoadSource::Exact,
+        let entry = gam_runtime::warm_start::WarmStartEntry {
+            payload,
+            objective: Some(1.0),
+            iteration: Some(0),
+            kind: gam_runtime::warm_start::EntryKind::Checkpoint,
+            written_unix_secs: 0,
         };
 
-        assert!(cache_entry_would_help_outer(&loaded, 2));
-        let CacheSeedDecision::Seed { rho, .. } = classify_cache_entry_for_outer(&loaded, 2) else {
+        assert!(cache_entry_would_help_outer(&entry, 2));
+        let CacheSeedDecision::Seed { rho, .. } = classify_cache_entry_for_outer(&entry, 2) else {
             panic!(
                 "finite seed {:?} must be honored unchanged; the read-side clamp / \
                      all-saturated-discard branches were band-aids over the missing β cache",
@@ -475,18 +463,15 @@ fn cache_entry_classifier_rejects_only_structural_failures() {
     // cost), but the entry-level objective is NaN — discard as
     // non-finite-payload.
     let payload = encode_iterate(&array![0.5, 0.5], None, None, 1.0, 0).expect("encode");
-    let loaded = gam_runtime::warm_start::LoadedEntry {
-        entry: gam_runtime::warm_start::WarmStartEntry {
-            payload,
-            objective: Some(f64::NAN),
-            iteration: Some(0),
-            kind: gam_runtime::warm_start::EntryKind::Checkpoint,
-            written_unix_secs: 0,
-        },
-        source: gam_runtime::warm_start::LoadSource::Exact,
+    let entry = gam_runtime::warm_start::WarmStartEntry {
+        payload,
+        objective: Some(f64::NAN),
+        iteration: Some(0),
+        kind: gam_runtime::warm_start::EntryKind::Checkpoint,
+        written_unix_secs: 0,
     };
     assert!(matches!(
-        classify_cache_entry_for_outer(&loaded, 2),
+        classify_cache_entry_for_outer(&entry, 2),
         CacheSeedDecision::Discard {
             reason: "non-finite-payload",
             ..
@@ -496,18 +481,15 @@ fn cache_entry_classifier_rejects_only_structural_failures() {
     // Dimension mismatch: 2-D payload viewed as a 3-D problem → decode
     // rejects shape → "payload-shape-mismatch".
     let payload = encode_iterate(&array![0.5, 0.5], None, None, 1.0, 0).expect("encode");
-    let loaded = gam_runtime::warm_start::LoadedEntry {
-        entry: gam_runtime::warm_start::WarmStartEntry {
-            payload,
-            objective: Some(1.0),
-            iteration: Some(0),
-            kind: gam_runtime::warm_start::EntryKind::Checkpoint,
-            written_unix_secs: 0,
-        },
-        source: gam_runtime::warm_start::LoadSource::Exact,
+    let entry = gam_runtime::warm_start::WarmStartEntry {
+        payload,
+        objective: Some(1.0),
+        iteration: Some(0),
+        kind: gam_runtime::warm_start::EntryKind::Checkpoint,
+        written_unix_secs: 0,
     };
     assert!(matches!(
-        classify_cache_entry_for_outer(&loaded, 3),
+        classify_cache_entry_for_outer(&entry, 3),
         CacheSeedDecision::Discard {
             reason: "payload-shape-mismatch",
             ..
@@ -518,20 +500,17 @@ fn cache_entry_classifier_rejects_only_structural_failures() {
 #[test]
 fn exact_final_warm_start_hit_is_helpful_even_at_boundary() {
     let payload = encode_iterate(&array![10.0, -10.0], None, None, 1.0, 3).expect("encode");
-    let loaded = gam_runtime::warm_start::LoadedEntry {
-        entry: gam_runtime::warm_start::WarmStartEntry {
-            payload,
-            objective: Some(1.0),
-            iteration: Some(3),
-            kind: gam_runtime::warm_start::EntryKind::Final,
-            written_unix_secs: 0,
-        },
-        source: gam_runtime::warm_start::LoadSource::Exact,
+    let entry = gam_runtime::warm_start::WarmStartEntry {
+        payload,
+        objective: Some(1.0),
+        iteration: Some(3),
+        kind: gam_runtime::warm_start::EntryKind::Final,
+        written_unix_secs: 0,
     };
 
-    assert!(cache_entry_would_help_outer(&loaded, 2));
+    assert!(cache_entry_would_help_outer(&entry, 2));
     assert!(matches!(
-        classify_cache_entry_for_outer(&loaded, 2),
+        classify_cache_entry_for_outer(&entry, 2),
         CacheSeedDecision::ExactFinal { iterations: 3, .. }
     ));
 }

@@ -1799,10 +1799,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // these hints at the cached smoothing point.
     // Running the rigid pilot in that regime is pure latency at large scale
     // (the log shows ~15s for n≈196k), and worse, it seeds β at ρ=0 while the
-    // cached outer seed may be far from ρ=0. Do a non-consuming peek so the
-    // optimizer still receives the cached entry via `try_load_with_source`.
+    // cached outer seed may be far from ρ=0. Loading is read-only, so this
+    // check leaves the entry for the outer optimizer's own `Session::load`.
     //
-    // The peek must use the same validity criterion as the outer optimizer's
+    // The check must use the same validity criterion as the outer optimizer's
     // cache loader. A poisoned all-boundary checkpoint is not a usable seed:
     // skipping the pilot for such an entry leaves the subsequent cold seed
     // validation without coefficient hints, which is exactly the failure mode
@@ -1820,9 +1820,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let outer_cache_seed_available = options
         .cache_session
         .as_ref()
-        .and_then(|session| session.peek_load_with_source())
-        .is_some_and(|loaded| {
-            gam_solve::rho_optimizer::cache_entry_would_help_outer(&loaded, setup.rho_dim())
+        .and_then(|session| session.load())
+        .is_some_and(|entry| {
+            gam_solve::rho_optimizer::cache_entry_would_help_outer(&entry, setup.rho_dim())
         });
     let kappa_options_ref: &SpatialLengthScaleOptimizationOptions = kappa_options;
     // gam#2994, gam#2995: one objective per model, whatever route the driver
