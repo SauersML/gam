@@ -145,8 +145,12 @@ bounded(x, min=0, max=1, target=0.5, strength=3)
   interval map that favours neither bound.
 - `none` — flat on the transformed scale, no penalty: the constrained
   maximum-likelihood fit.
-- `uniform` — flat on the original scale, applied as a log-Jacobian
-  correction.
+- `uniform` — flat on the coefficient over `[min, max]`. That is the
+  posterior of the unpenalised box-constrained linear coefficient, so
+  `bounded(x, min, max, prior=uniform)` is the same term as
+  `linear(x, min=min, max=max, double_penalty=false)` and publishes its
+  truncated posterior mean. It cannot be combined with
+  `double_penalty=true`.
 - `center` — `Beta(2, 2)` toward the midpoint.
 
 `target` plus `strength` is shorthand for a Beta prior:

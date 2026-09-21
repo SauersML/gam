@@ -4000,28 +4000,25 @@ fn parse_bounded_linear_term_with_center_prior() {
 }
 
 #[test]
-fn parse_bounded_linear_termwith_uniform_prior() {
+fn parse_bounded_uniform_prior_as_the_boxed_linear_term() {
     let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1, prior=\"uniform\") + z")
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     assert_eq!(parsed.terms.len(), 2);
     match &parsed.terms[0] {
-        ParsedTerm::BoundedLinear {
+        ParsedTerm::Linear {
             name,
-            min,
-            max,
-            prior,
+            explicit,
             double_penalty,
+            coefficient_min,
+            coefficient_max,
         } => {
             assert_eq!(name, "mu_hat");
-            assert_eq!(*min, 0.0);
-            assert_eq!(*max, 1.0);
-            match prior {
-                BoundedCoefficientPriorSpec::Uniform => {}
-                other => panic!("unexpected prior: {other:?}"),
-            }
+            assert!(*explicit);
+            assert_eq!(*coefficient_min, Some(0.0));
+            assert_eq!(*coefficient_max, Some(1.0));
             assert!(!*double_penalty);
         }
-        other => panic!("unexpected term: {other:?}"),
+        other => panic!("bounded(prior=uniform) must be the boxed linear term, got {other:?}"),
     }
 }
 
