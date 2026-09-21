@@ -1619,9 +1619,8 @@ pub(super) struct MixedAxisRule {
 
 pub(super) struct MixedAxisPiece {
     pub(super) coefficient: f64,
-    /// `|T|`.
-    pub(super) axes: usize,
-    /// `(node, ln w_T(z))` for each of the piece's `3^|T|` nodes.
+    /// `(node, ln w_T(z))` for each of the piece's `3^|T|` nodes; the node
+    /// count is the one record of `|T|`.
     pub(super) nodes: Vec<(usize, f64)>,
 }
 
@@ -1681,7 +1680,6 @@ impl MixedAxisRule {
                 }
                 pieces.push(MixedAxisPiece {
                     coefficient: coefficient as f64,
-                    axes: size,
                     nodes,
                 });
             });
@@ -2091,7 +2089,8 @@ mod mixed_axis_rule_tests {
             let posterior = rule.posterior(&values).unwrap();
             let mut bound = 0.0;
             for (piece, rule_piece) in posterior.pieces.iter().zip(&rule.pieces) {
-                let size = rule_piece.axes as f64;
+                // A piece over `|T|` axes holds exactly `3^|T|` nodes.
+                let size = (rule_piece.nodes.len() as f64).log(3.0).round();
                 assert!(
                     piece.log_ratio >= size * (2.0_f64 / 3.0).ln() - 1e-12
                         && piece.log_ratio <= 1.5 * size + 1e-12,
