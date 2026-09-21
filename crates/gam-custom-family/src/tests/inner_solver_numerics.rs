@@ -708,13 +708,20 @@ impl CustomFamily for OneBlockCovarianceErrorFamily {
     }
 }
 
-/// gam#2637: a trust-region step whose MODEL prediction has fallen under the
-/// objective's round-off floor, but whose REALIZED reduction is measurably
-/// above it, must be taken rather than rejected — and the radius held rather
-/// than shrunk. The numbers are the measured cycle-8 attempt-0 state of
+/// gam#2637: a trust-region step whose MODEL prediction is far below the
+/// objective's rounding, but whose REALIZED reduction is measurably above it,
+/// must be taken rather than rejected — and the radius held rather than shrunk.
+/// The numbers are the measured cycle-8 attempt-0 state of
 /// `binomial_location_scale_engine_matches_reference_flow`, where the pre-fix
 /// controller returned `rho = -inf` and shrank the radius three times in a row,
 /// freezing the solve for 31 cycles.
+///
+/// Since gam#3240 the controller forms the Sun–Nocedal ratio
+/// `(a + 8ε_f)/(p + 8ε_f)`; no floor turns a tiny prediction into a
+/// rejection, so no override is needed to turn it back into an accept. The
+/// step is taken on the ratio with no band at all (the classical
+/// `a/p ≈ 7.1e3`) and with the resolution that fixture measured
+/// (`ε_f = 4.156e-13`).
 #[test]
 pub(crate) fn joint_trust_region_takes_a_measured_decrease_the_model_cannot_resolve_2637() {
     // Measured decision variables, cycle 8 attempt 0.
@@ -724,46 +731,40 @@ pub(crate) fn joint_trust_region_takes_a_measured_decrease_the_model_cannot_reso
     const OBJECTIVE_TOL: f64 = 1.0e-6 * (1.0 + OBJECTIVE_SCALE);
     const MEASURED_ACTUAL: f64 = 2.090494888e-9;
     const MEASURED_PREDICTED: f64 = 2.944376434e-13;
+    const MEASURED_RESOLUTION: f64 = 4.156290748e-13;
 
-    // The branch under test is defined by these two inequalities. Assert them
-    // so a change to the floor that moves the fixture OUT of the branch fails
-    // here instead of silently making the rest of this test vacuous.
-    let noise_floor = OBJECTIVE_SCALE * JOINT_TRUST_NOISE_FLOOR_REL;
-    assert!(
-        MEASURED_PREDICTED <= noise_floor,
-        "fixture must sit under the model-resolution floor: pred={MEASURED_PREDICTED:.6e} > floor={noise_floor:.6e}"
-    );
-    assert!(
-        MEASURED_ACTUAL > noise_floor,
-        "fixture must carry a resolvable realized decrease: actual={MEASURED_ACTUAL:.6e} <= floor={noise_floor:.6e}"
-    );
-
-    let update = update_joint_trust_region_radius(
-        OLD_RADIUS,
-        STEP_NORM,
-        MEASURED_ACTUAL,
-        MEASURED_PREDICTED,
-        MEASURED_PREDICTED,
-        OBJECTIVE_SCALE,
-        OBJECTIVE_TOL,
-        0.0,
-        0.0,
-        false,
-    );
-    assert_eq!(
-        update.decision.label(),
-        "accept_model_noise_floor",
-        "the gam#2637 branch must be the one that fired, got {}",
-        update.decision.label()
-    );
-    assert!(
-        update.accepted,
-        "a realized decrease {MEASURED_ACTUAL:.6e} above the floor {noise_floor:.6e} must be taken"
-    );
-    assert_eq!(
-        update.radius, OLD_RADIUS,
-        "the radius must be HELD, not shrunk: the chord is radius-scaled, so shrinking makes the next prediction smaller and the rejection self-reinforcing"
-    );
+    for measured_resolution in [0.0, MEASURED_RESOLUTION] {
+        let update = update_joint_trust_region_radius(
+            OLD_RADIUS,
+            STEP_NORM,
+            MEASURED_ACTUAL,
+            MEASURED_PREDICTED,
+            MEASURED_PREDICTED,
+            OBJECTIVE_TOL,
+            measured_resolution,
+            0.0,
+            false,
+        );
+        assert!(
+            update.accepted,
+            "a realized decrease {MEASURED_ACTUAL:.6e} against a prediction \
+             {MEASURED_PREDICTED:.6e} must be taken (band {measured_resolution:.3e}): rho={:.6e}",
+            update.rho
+        );
+        let band = measured_resolution;
+        let expected_rho = (MEASURED_ACTUAL + 8.0 * band) / (MEASURED_PREDICTED + 8.0 * band);
+        assert!(
+            (update.rho - expected_rho).abs() <= 1.0e-12 * expected_rho,
+            "rho must be the band-carrying ratio: got {:.6e}, expected {expected_rho:.6e}",
+            update.rho
+        );
+        assert_eq!(update.decision, JointTrustRegionDecision::HoldInside);
+        assert_eq!(
+            update.radius, OLD_RADIUS,
+            "the radius must be HELD, not shrunk: the chord is radius-scaled, so shrinking \
+             makes the next prediction smaller and the rejection self-reinforcing"
+        );
+    }
 
     // Non-vacuity 1 — a model that predicts ASCENT still rejects and shrinks.
     let ascent = update_joint_trust_region_radius(
@@ -772,15 +773,15 @@ pub(crate) fn joint_trust_region_takes_a_measured_decrease_the_model_cannot_reso
         MEASURED_ACTUAL,
         -1.0,
         -1.0,
-        OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
-        0.0,
+        MEASURED_RESOLUTION,
         0.0,
         false,
     );
     assert!(
         !ascent.accepted,
-        "a negative predicted reduction is model disagreement and must still reject"
+        "a negative predicted reduction far beyond the band is model disagreement and must \
+         still reject"
     );
     assert!(
         ascent.radius < OLD_RADIUS,
@@ -789,16 +790,15 @@ pub(crate) fn joint_trust_region_takes_a_measured_decrease_the_model_cannot_reso
     );
 
     // Non-vacuity 2 — an unresolvable prediction with NO realized decrease
-    // still rejects: the branch keys on the measurement, not on the model.
+    // still rejects: the ratio keys on the measurement, not on the model.
     let no_gain = update_joint_trust_region_radius(
         OLD_RADIUS,
         STEP_NORM,
         -1.0e-3,
         MEASURED_PREDICTED,
         MEASURED_PREDICTED,
-        OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
-        0.0,
+        MEASURED_RESOLUTION,
         0.0,
         false,
     );
@@ -807,15 +807,13 @@ pub(crate) fn joint_trust_region_takes_a_measured_decrease_the_model_cannot_reso
         "an objective that got WORSE must reject however small the prediction was"
     );
 
-    // Non-vacuity 3 — a resolvable prediction is untouched by this change, so
-    // the ordinary gain-ratio path keeps its labels and its arithmetic.
+    // Non-vacuity 3 — a resolvable prediction keeps the ordinary gain ratio.
     let resolvable = update_joint_trust_region_radius(
         OLD_RADIUS,
         STEP_NORM,
         1.0e-3,
         1.0e-3,
         1.0e-3,
-        OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
         0.0,
@@ -830,25 +828,27 @@ pub(crate) fn joint_trust_region_takes_a_measured_decrease_the_model_cannot_reso
         "the gain ratio must still be actual/predicted, got {:.6e}",
         resolvable.rho
     );
-    assert_ne!(
-        resolvable.decision.label(),
-        "accept_model_noise_floor",
-        "the gam#2637 branch must not swallow steps the model CAN resolve"
-    );
+    assert_eq!(resolvable.decision, JointTrustRegionDecision::HoldInside);
 }
 
-/// gam#2977 S2 (gnomon#2370): the gam#2637 override converts a rejection into
-/// an accept on the premise that the realized change is a fact about `β`. With
-/// nothing measured yet its floor is the `|F|·1e-14` fallback, a LOWER bound on
-/// the evaluation's rounding, so a rounding-level change cleared it. Measured on
-/// gnomon's 48-row Gaussian location-scale fixture at 605dff0f92, cycle 0
-/// attempt 3: `|F| = 2.4`, `pred ≈ 2e-22`, realized `+2.330e-11`, while the
-/// witness measured the evaluation's rounding at `2.644462e-11` one ladder
+/// gam#2977 S2 (gnomon#2370), restated for the band-carrying ratio (gam#3240).
+/// Measured on gnomon's 48-row Gaussian location-scale fixture at 605dff0f92,
+/// cycle 0 attempt 3: `|F| = 2.4`, `pred ≈ 2e-22`, realized `+2.330e-11`, while
+/// the witness measured the evaluation's rounding at `2.644462e-11` one ladder
 /// later (so the arithmetic ceiling, which admitted that measurement, is at
-/// least that). The accept ended the ladder, the noise-decided shrinks stood at
-/// `r = 1.160e-10`, and the solve refused on a fully-rejected stall.
+/// least that). Under the classical ratio every rounding-level attempt of that
+/// ladder read as a model failure and shrank the radius, until an override
+/// accepted one and left the noise-decided shrinks standing at
+/// `r = 1.160e-10`; the solve then refused on a fully-rejected stall.
+///
+/// With `ε_f = ½·ceiling` in the ratio, a realized change anywhere inside the
+/// `±2ε_f = ±ceiling` the comparison can carry reads `rho` within `1/4` of
+/// one: it is accepted and NEVER shrinks the region. On the boundary, with the
+/// prediction below the band and the residual above tolerance, the region is
+/// the binding constraint on an unreadable objective and grows (gam#2612). An
+/// ascent the band cannot excuse is still rejected.
 #[test]
-pub(crate) fn a_rounding_level_change_is_not_a_measured_decrease_2977() {
+pub(crate) fn a_rounding_level_change_never_shrinks_the_region_2977() {
     const OLD_RADIUS: f64 = 4.64e-10;
     const STEP_NORM: f64 = 4.64e-10;
     const OBJECTIVE_SCALE: f64 = 2.4;
@@ -857,80 +857,91 @@ pub(crate) fn a_rounding_level_change_is_not_a_measured_decrease_2977() {
     const PREDICTED: f64 = 2.0e-22;
     const CEILING: f64 = 2.644462e-11;
 
-    let noise_floor = OBJECTIVE_SCALE * JOINT_TRUST_NOISE_FLOOR_REL;
+    let band = joint_objective_evaluation_band(0.0, CEILING);
+    assert_eq!(band, 0.5 * CEILING);
     assert!(
-        PREDICTED <= noise_floor && REALIZED > noise_floor && REALIZED <= CEILING,
-        "fixture must clear the fallback floor {noise_floor:.3e} yet sit inside the ceiling \
-         {CEILING:.3e}: realized={REALIZED:.3e} pred={PREDICTED:.3e}"
+        REALIZED.abs() <= 2.0 * band && PREDICTED <= band,
+        "fixture must sit inside the comparison's rounding: realized={REALIZED:.3e} \
+         pred={PREDICTED:.3e} band={band:.3e}"
     );
 
-    let refused = update_joint_trust_region_radius(
+    for realized in [REALIZED, -REALIZED, CEILING, -CEILING, 0.0] {
+        let update = update_joint_trust_region_radius(
+            OLD_RADIUS,
+            STEP_NORM,
+            realized,
+            PREDICTED,
+            PREDICTED,
+            OBJECTIVE_TOL,
+            0.0,
+            CEILING,
+            true,
+        );
+        assert!(
+            (update.rho - 1.0).abs() < 0.25,
+            "a change {realized:.3e} within the comparison's rounding {CEILING:.3e} must read \
+             rho within 1/4 of one; got {:.6e}",
+            update.rho
+        );
+        assert!(update.accepted);
+        assert_eq!(
+            update.decision,
+            JointTrustRegionDecision::GrowAtBoundary,
+            "realized={realized:.3e}"
+        );
+        assert!(update.radius > OLD_RADIUS);
+    }
+
+    // Off the boundary the same rounding-level attempt holds the region.
+    let interior = update_joint_trust_region_radius(
         OLD_RADIUS,
-        STEP_NORM,
+        0.5 * STEP_NORM,
         REALIZED,
         PREDICTED,
         PREDICTED,
-        OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
         CEILING,
         true,
     );
-    assert!(
-        !refused.accepted,
-        "a change {REALIZED:.3e} within the evaluation's rounding ceiling {CEILING:.3e} is not \
-         evidence of a decrease; got {}",
-        refused.decision.label()
-    );
-    assert_ne!(refused.decision.label(), "accept_model_noise_floor");
+    assert!(interior.accepted);
+    assert_eq!(interior.decision, JointTrustRegionDecision::HoldInside);
+    assert_eq!(interior.radius, OLD_RADIUS);
 
-    // Control: the same attempt with the ceiling set to zero is the pre-fix
-    // controller, and it takes the rounding as a decrease.
-    let pre_fix = update_joint_trust_region_radius(
+    // Control: an ascent of `8ε_f = 4·ceiling` — four times what the
+    // comparison can carry — reads `rho = 0` and is rejected and shrunk.
+    let ascent = update_joint_trust_region_radius(
         OLD_RADIUS,
         STEP_NORM,
-        REALIZED,
+        -8.0 * band,
         PREDICTED,
         PREDICTED,
-        OBJECTIVE_SCALE,
-        OBJECTIVE_TOL,
-        0.0,
-        0.0,
-        true,
-    );
-    assert_eq!(pre_fix.decision.label(), "accept_model_noise_floor");
-
-    // A change that clears the ceiling is still taken, so the gam#2637 branch
-    // keeps its purpose.
-    let resolvable = update_joint_trust_region_radius(
-        OLD_RADIUS,
-        STEP_NORM,
-        4.0 * CEILING,
-        PREDICTED,
-        PREDICTED,
-        OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
         CEILING,
         true,
     );
-    assert_eq!(resolvable.decision.label(), "accept_model_noise_floor");
-    assert!(resolvable.accepted);
+    assert!(!ascent.accepted, "rho={:.6e}", ascent.rho);
+    assert!(ascent.radius < OLD_RADIUS);
 
-    // An evaluation the ceiling cannot size certifies no change.
+    // An evaluation the ceiling cannot size carries no band: the classical
+    // ratio `a/p` decides, and a decrease against a tiny prediction is a very
+    // successful step that is held (nothing reads the objective as unreadable).
     let unsizable = update_joint_trust_region_radius(
         OLD_RADIUS,
         STEP_NORM,
         4.0 * CEILING,
         PREDICTED,
         PREDICTED,
-        OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
         f64::INFINITY,
         true,
     );
-    assert_ne!(unsizable.decision.label(), "accept_model_noise_floor");
+    assert_eq!(joint_objective_evaluation_band(0.0, f64::INFINITY), 0.0);
+    assert!(unsizable.accepted);
+    assert!((unsizable.rho - 4.0 * CEILING / PREDICTED).abs() <= 1.0e-12 * unsizable.rho);
+    assert_eq!(unsizable.decision, JointTrustRegionDecision::HoldInside);
 }
 
 #[test]
@@ -5254,20 +5265,20 @@ pub(crate) fn rowwise_kronecker_psi_row_chunks_are_window_consistent() {
 
 #[test]
 pub(crate) fn joint_trust_region_radius_update_accept_reject_logic() {
-    let accepted = update_joint_trust_region_radius(1.0, 1.0, 2.0, 2.0, 2.0, 1.0, 1.0e-6, 0.0, 0.0, false);
+    let accepted = update_joint_trust_region_radius(1.0, 1.0, 2.0, 2.0, 2.0, 1.0e-6, 0.0, 0.0, false);
     assert!(accepted.accepted);
     assert!((accepted.rho - 1.0).abs() < 1.0e-12);
     assert!((accepted.radius - 2.0).abs() < 1.0e-12);
     assert_eq!(accepted.decision.label(), "grow_at_boundary");
 
-    let rejected = update_joint_trust_region_radius(1.0, 0.5, -0.1, 2.0, 2.0, 1.0, 1.0e-6, 0.0, 0.0, false);
+    let rejected = update_joint_trust_region_radius(1.0, 0.5, -0.1, 2.0, 2.0, 1.0e-6, 0.0, 0.0, false);
     assert!(!rejected.accepted);
     assert!(rejected.rho < 0.0);
     assert!((rejected.radius - 0.25).abs() < 1.0e-12);
     assert_eq!(rejected.decision.label(), "shrink_reject");
 
     let rejected_inside_radius =
-        update_joint_trust_region_radius(1.0, 1.0e-3, -0.1, 2.0, 2.0, 1.0, 1.0e-6, 0.0, 0.0, false);
+        update_joint_trust_region_radius(1.0, 1.0e-3, -0.1, 2.0, 2.0, 1.0e-6, 0.0, 0.0, false);
     assert!(!rejected_inside_radius.accepted);
     assert!(
         rejected_inside_radius.radius < 1.0e-3,
@@ -5276,11 +5287,20 @@ pub(crate) fn joint_trust_region_radius_update_accept_reject_logic() {
     assert!((rejected_inside_radius.radius - 5.0e-4).abs() < 1.0e-12);
     assert_eq!(rejected_inside_radius.decision.label(), "shrink_reject");
 
-    let poor = update_joint_trust_region_radius(1.0, 0.5, 0.1, 1.0, 1.0, 1.0, 1.0e-6, 0.0, 0.0, false);
+    // `eta_accept = 0.1 < rho < eta_shrink = 0.25`: taken, radius quartered.
+    let poor = update_joint_trust_region_radius(1.0, 0.5, 0.15, 1.0, 1.0, 1.0e-6, 0.0, 0.0, false);
     assert!(poor.accepted);
-    assert!((poor.rho - 0.1).abs() < 1.0e-12);
+    assert!((poor.rho - 0.15).abs() < 1.0e-12);
     assert!((poor.radius - 0.25).abs() < 1.0e-12);
     assert_eq!(poor.decision.label(), "shrink_marginal_accept");
+
+    // `0 < rho <= eta_accept`: a decrease, but a tenth of what the model
+    // promised or less is not sufficient decrease (Sun–Nocedal Algorithm 1).
+    let insufficient =
+        update_joint_trust_region_radius(1.0, 0.5, 0.05, 1.0, 1.0, 1.0e-6, 0.0, 0.0, false);
+    assert!(!insufficient.accepted);
+    assert!((insufficient.rho - 0.05).abs() < 1.0e-12);
+    assert_eq!(insufficient.decision.label(), "shrink_reject");
 }
 
 /// gam#2600: geometric boundary contact only warrants a larger trust region
@@ -5290,7 +5310,6 @@ pub(crate) fn joint_trust_region_radius_update_accept_reject_logic() {
 #[test]
 pub(crate) fn joint_trust_region_growth_requires_predicted_decrease_above_objective_tol_2600() {
     const OLD_RADIUS: f64 = 1.0;
-    const OBJECTIVE_SCALE: f64 = 1.0;
     const OBJECTIVE_TOL: f64 = 1.0e-3;
 
     let below_tolerance = update_joint_trust_region_radius(
@@ -5299,7 +5318,6 @@ pub(crate) fn joint_trust_region_growth_requires_predicted_decrease_above_object
         1.0e-2,
         0.5 * OBJECTIVE_TOL,
         0.5 * OBJECTIVE_TOL,
-        OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
         0.0,
@@ -5315,7 +5333,6 @@ pub(crate) fn joint_trust_region_growth_requires_predicted_decrease_above_object
         2.0 * OBJECTIVE_TOL,
         2.0 * OBJECTIVE_TOL,
         2.0 * OBJECTIVE_TOL,
-        OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
         0.0,
@@ -5331,7 +5348,6 @@ pub(crate) fn joint_trust_region_growth_requires_predicted_decrease_above_object
         -0.1,
         0.5 * OBJECTIVE_TOL,
         0.5 * OBJECTIVE_TOL,
-        OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
         0.0,
@@ -5347,7 +5363,6 @@ pub(crate) fn joint_trust_region_growth_requires_predicted_decrease_above_object
         2.0 * OBJECTIVE_TOL,
         2.0 * OBJECTIVE_TOL,
         2.0 * OBJECTIVE_TOL,
-        OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
         0.0,
@@ -5442,7 +5457,6 @@ pub(crate) fn a_truncated_convex_chord_grows_the_region_its_own_prediction_would
         PREDICTED,
         PREDICTED,
         PREDICTED,
-        OBJECTIVE,
         objective_tol,
         0.0,
         0.0,
@@ -5462,7 +5476,6 @@ pub(crate) fn a_truncated_convex_chord_grows_the_region_its_own_prediction_would
         PREDICTED,
         PREDICTED,
         along_ray,
-        OBJECTIVE,
         objective_tol,
         0.0,
         0.0,
@@ -5485,7 +5498,6 @@ pub(crate) fn a_truncated_convex_chord_grows_the_region_its_own_prediction_would
         PREDICTED,
         PREDICTED,
         along_ray,
-        OBJECTIVE,
         objective_tol,
         0.0,
         0.0,
@@ -5522,7 +5534,7 @@ pub(crate) fn joint_newton_collapsed_trust_region_all_reject_exits_before_grindi
     let mut radius = 1.0_f64;
     for _ in 0..200 {
         let rejected =
-            update_joint_trust_region_radius(radius, 0.5 * radius, -1.0, 2.0, 2.0, 1.0, 1.0e-6, 0.0, 0.0, false);
+            update_joint_trust_region_radius(radius, 0.5 * radius, -1.0, 2.0, 2.0, 1.0e-6, 0.0, 0.0, false);
         assert!(
             !rejected.accepted,
             "a genuine objective increase must reject"
@@ -5534,7 +5546,7 @@ pub(crate) fn joint_newton_collapsed_trust_region_all_reject_exits_before_grindi
         "sustained rejection must collapse the radius to its absolute 1e-12 floor"
     );
     assert_eq!(
-        update_joint_trust_region_radius(radius, 0.5 * radius, -1.0, 2.0, 2.0, 1.0, 1.0e-6, 0.0, 0.0, false)
+        update_joint_trust_region_radius(radius, 0.5 * radius, -1.0, 2.0, 2.0, 1.0e-6, 0.0, 0.0, false)
             .decision
             .label(),
         "reject_floor",
@@ -5617,18 +5629,22 @@ pub(crate) fn joint_newton_collapsed_trust_region_all_reject_exits_before_grindi
     );
 }
 
+/// gam#3240: near convergence at a large objective scale both the prediction
+/// and the realized change are inside one evaluation's band, and rounding can
+/// flip the sign of the realized change. The Sun–Nocedal ratio
+/// `(a + 8ε_f)/(p + 8ε_f)` judges the step on the band the arithmetic carries:
+/// `|a − p| ≤ 2ε_f` gives `|rho − 1| < 1/4`, so the step is taken and the
+/// region is not shrunk on the sign of rounding.
 #[test]
-pub(crate) fn joint_trust_region_noise_floor_accepts_round_off_negative_actual() {
-    // Near-converged iterate at large objective scale: both the
-    // model-predicted decrease and the realized objective change are
-    // below the noise floor. Round-off can flip the sign of `actual`;
-    // the principled response is to accept (rho ≈ 1) rather than
-    // declare failure on the sign of noise. Mirrors the noise-floor
-    // branch in `src/solver/pirls.rs`.
+pub(crate) fn joint_trust_region_band_judges_a_rounding_level_sign_flip_3240() {
     let objective_scale: f64 = 1.66e5;
-    let noise_floor = objective_scale * 1e-14;
-    let predicted = noise_floor * 0.1;
-    let actual = -noise_floor * 0.5;
+    // The accumulation's bound on the rounding of `F(β) − F(β + δ)`; half of it
+    // is the per-evaluation band.
+    let ceiling = 2.0 * objective_scale * 1.0e-14;
+    let band = joint_objective_evaluation_band(0.0, ceiling);
+    assert_eq!(band, 0.5 * ceiling);
+    let predicted = 0.1 * band;
+    let actual = -0.5 * band;
     let objective_tol = 1.0e-6 * (1.0 + objective_scale.abs());
     let update = update_joint_trust_region_radius(
         1.0,
@@ -5636,27 +5652,36 @@ pub(crate) fn joint_trust_region_noise_floor_accepts_round_off_negative_actual()
         actual,
         predicted,
         predicted,
-        objective_scale,
         objective_tol,
         0.0,
-        0.0,
+        ceiling,
         false,
+    );
+    let expected_rho = (actual + 8.0 * band) / (predicted + 8.0 * band);
+    assert!((update.rho - expected_rho).abs() <= 1.0e-12 * expected_rho.abs());
+    assert!(
+        (update.rho - 1.0).abs() < 0.25,
+        "a realized change within 2·ε_f of the prediction must read as faithful; rho={}",
+        update.rho
     );
     assert!(
         update.accepted,
-        "sub-noise-floor sign flip must not reject as failure"
+        "a rounding-level sign flip must not reject as failure"
     );
-    assert!((update.rho - 1.0).abs() < 1.0e-12);
+    assert_eq!(update.decision.label(), "hold_inside");
+    assert_eq!(update.radius, 1.0);
 }
 
+/// gam#3240: the band excuses rounding and nothing more. An objective increase
+/// far beyond `2ε_f` is rejected against a rounding-level prediction, and a
+/// model that predicts an ascent beyond what the band excuses
+/// (`predicted ≤ −8ε_f`) forms no ratio at all.
 #[test]
-pub(crate) fn joint_trust_region_noise_floor_rejects_genuine_increase() {
-    // Genuine objective increase clearly beyond the noise floor must
-    // still be rejected even when predicted_reduction is sub-floor:
-    // this is real model failure, not round-off.
+pub(crate) fn joint_trust_region_band_does_not_excuse_a_genuine_increase_3240() {
     let objective_scale: f64 = 1.66e5;
-    let noise_floor = objective_scale * 1e-14;
-    let predicted = noise_floor * 0.1;
+    let ceiling = 2.0 * objective_scale * 1.0e-14;
+    let band = joint_objective_evaluation_band(0.0, ceiling);
+    let predicted = 0.1 * band;
     let actual = -1.0;
     let objective_tol = 1.0e-6 * (1.0 + objective_scale.abs());
     let update = update_joint_trust_region_radius(
@@ -5665,17 +5690,33 @@ pub(crate) fn joint_trust_region_noise_floor_rejects_genuine_increase() {
         actual,
         predicted,
         predicted,
-        objective_scale,
         objective_tol,
         0.0,
-        0.0,
+        ceiling,
         false,
     );
     assert!(
         !update.accepted,
-        "objective increase beyond noise must reject"
+        "objective increase beyond the band must reject"
     );
-    assert!(update.rho.is_infinite() && update.rho < 0.0);
+    assert!(update.rho.is_finite() && update.rho < 0.0);
+    assert_eq!(update.decision.label(), "shrink_reject");
+    assert!(update.radius <= 0.25);
+
+    let ascent = update_joint_trust_region_radius(
+        1.0,
+        0.5,
+        actual,
+        -9.0 * band,
+        -9.0 * band,
+        objective_tol,
+        0.0,
+        ceiling,
+        false,
+    );
+    assert!(!ascent.accepted);
+    assert!(ascent.rho.is_infinite() && ascent.rho < 0.0);
+    assert_eq!(ascent.decision.label(), "shrink_reject");
 }
 
 /// One rung of a backtracking ladder, in the quantities the witness reads.
@@ -5801,7 +5842,6 @@ pub(crate) fn the_runaway_step_is_rejected_once_its_resolution_claim_is_refused_
             -8.049e8, // actual reduction: the objective got WORSE by 8.049e8
             1.609e8,  // predicted reduction
             1.609e8,  // reduction along the ray: no convexity certificate
-            objective_scale,
             objective_tol,
             measured_resolution,
             0.0,
@@ -5809,25 +5849,30 @@ pub(crate) fn the_runaway_step_is_rejected_once_its_resolution_claim_is_refused_
         )
     };
 
-    // NON-VACUITY: with the ladder's own claim installed as the noise floor,
-    // the controller reports `rho = 1` and TAKES the step. This is the defect,
-    // asserted so the fixture cannot stop exercising it.
-    let with_claim = attempt(9.658287e8);
+    // NON-VACUITY: with the ladder's own claim installed as the evaluation
+    // band, the noise-tolerant ratio `(a + 8ε_f)/(p + 8ε_f)` excuses the
+    // increase as rounding and TAKES the step. This is the defect, asserted so
+    // the fixture cannot stop exercising it: the claim licenses its own
+    // acceptance whatever form the controller's noise handling takes.
+    let claimed_band = 9.658287e8_f64;
+    let with_claim = attempt(claimed_band);
     assert!(
         with_claim.accepted,
-        "the measured-resolution floor is what accepted an 8.049e8 increase; if this \
+        "the measured-resolution band is what accepted an 8.049e8 increase; if this \
          stops being true the arm below is no longer a repair of anything"
     );
+    let expected_rho = (-8.049e8 + 8.0 * claimed_band) / (1.609e8 + 8.0 * claimed_band);
     assert!(
-        (with_claim.rho - 1.0).abs() < 1.0e-12,
-        "the accept is the noise-floor branch's neutral rho, not a genuine gain ratio: \
-         rho={:.6e}",
+        (with_claim.rho - expected_rho).abs() <= 1.0e-12 * expected_rho.abs(),
+        "the accept is the band-carrying ratio, not a genuine gain ratio: \
+         rho={:.6e}, expected {:.6e}",
         with_claim.rho,
+        expected_rho,
     );
 
-    // With the claim refused as impossible, `measured_resolution` stays 0 and the
-    // controller falls back to its own `eps|F|` floor, which an 8.049e8 increase
-    // clears by fifteen orders.
+    // With the claim refused as impossible, `measured_resolution` stays 0 and,
+    // with no ceiling passed, the band is 0: the classical ratio
+    // `−8.049e8/1.609e8 ≈ −5` rejects it outright.
     let refused = attempt(0.0);
     assert!(
         !refused.accepted,
@@ -6253,27 +6298,37 @@ pub(crate) fn shrink_active_joint_block_trust_radii_strictly_decreases_max_radiu
     );
 }
 
-/// gam#2612: the accept-below-model-noise-floor branch must not HOLD a radius
-/// that is itself the binding constraint.
+/// gam#2612: a boundary step whose prediction the objective cannot read must not
+/// HOLD a radius that is itself the binding constraint.
 ///
 /// "Held, not grown" (gam#2637) is right for an INTERIOR step — the region did
 /// not choose the step length, so enlarging it changes nothing. On the boundary
 /// it is a fixed point: the step is short because the radius is small, the
 /// prediction is unreadable because the step is short, and "unreadable ⇒ do not
-/// grow" then freezes the radius for every remaining cycle. The three inputs
-/// that justify growing are measurements, not predictions — a realized decrease
-/// above the noise floor, geometric boundary contact, and a stationarity
-/// residual still above its own tolerance.
+/// grow" then freezes the radius for every remaining cycle. What justifies
+/// growing is geometric boundary contact, a very successful band-carrying ratio,
+/// a positive prediction no larger than one evaluation's band `ε_f` (gam#3240),
+/// and a stationarity residual still above its own tolerance.
 #[test]
-pub(crate) fn a_boundary_step_below_the_model_noise_floor_grows_the_region_2612() {
+pub(crate) fn a_boundary_step_below_the_evaluation_band_grows_the_region_2612() {
     let objective_scale: f64 = 1.66e5;
-    let noise_floor = objective_scale * 1e-14;
-    // The model's predicted decrease is under the objective's resolution; the
+    let ceiling = 2.0 * objective_scale * 1.0e-14;
+    let band = joint_objective_evaluation_band(0.0, ceiling);
+    // The model's predicted decrease is under one evaluation's band; the
     // realized decrease is an order above it.
-    let predicted = noise_floor * 0.1;
-    let actual = noise_floor * 10.0;
+    let predicted = 0.1 * band;
+    let actual = 10.0 * band;
     let objective_tol = 1.0e-6 * (1.0 + objective_scale.abs());
+    assert!(
+        predicted <= objective_tol,
+        "the fixture must be one objective_tol alone would hold"
+    );
     let radius = 1.0_f64;
+    let expected_rho = (actual + 8.0 * band) / (predicted + 8.0 * band);
+    assert!(
+        expected_rho > 0.75,
+        "the fixture's ratio must be very successful"
+    );
 
     let on_boundary = update_joint_trust_region_radius(
         radius,
@@ -6281,22 +6336,22 @@ pub(crate) fn a_boundary_step_below_the_model_noise_floor_grows_the_region_2612(
         actual,
         predicted,
         predicted,
-        objective_scale,
         objective_tol,
         0.0,
-        0.0,
+        ceiling,
         true,
     );
+    assert!(on_boundary.accepted);
+    assert!((on_boundary.rho - expected_rho).abs() <= 1.0e-12 * expected_rho);
     assert_eq!(
         on_boundary.decision,
-        JointTrustRegionDecision::AcceptBelowModelNoiseFloor,
-        "the fixture must reach the branch under test"
+        JointTrustRegionDecision::GrowAtBoundary
     );
-    assert!(on_boundary.accepted);
     assert!(
         on_boundary.radius > radius,
-        "a boundary step whose REALIZED decrease cleared the noise floor, with the residual still \
-         above tolerance, must enlarge the region — holding it is the #2612 fixed point; got {:.3e}",
+        "a boundary step whose prediction sits inside the evaluation band, with the residual \
+         still above tolerance, must enlarge the region — holding it is the #2612 fixed point; \
+         got {:.3e}",
         on_boundary.radius
     );
 
@@ -6308,20 +6363,16 @@ pub(crate) fn a_boundary_step_below_the_model_noise_floor_grows_the_region_2612(
         actual,
         predicted,
         predicted,
-        objective_scale,
         objective_tol,
         0.0,
-        0.0,
+        ceiling,
         true,
     );
+    assert!(interior.accepted);
+    assert_eq!(interior.decision, JointTrustRegionDecision::HoldInside);
     assert_eq!(
-        interior.decision,
-        JointTrustRegionDecision::AcceptBelowModelNoiseFloor
-    );
-    assert!(
-        interior.radius <= radius,
-        "an interior step is not evidence for a larger region (gam#2637); got {:.3e}",
-        interior.radius
+        interior.radius, radius,
+        "an interior step is not evidence for a larger region (gam#2637)"
     );
 
     // Residual already inside its tolerance: the solve has nothing left to
@@ -6332,22 +6383,37 @@ pub(crate) fn a_boundary_step_below_the_model_noise_floor_grows_the_region_2612(
         actual,
         predicted,
         predicted,
-        objective_scale,
         objective_tol,
         0.0,
-        0.0,
+        ceiling,
         false,
     );
+    assert!(converged_residual.accepted);
     assert_eq!(
         converged_residual.decision,
-        JointTrustRegionDecision::AcceptBelowModelNoiseFloor
+        JointTrustRegionDecision::HoldInside
     );
-    assert!(
-        converged_residual.radius <= radius,
-        "with the stationarity residual already at tolerance there is nothing to grow toward; got \
-         {:.3e}",
-        converged_residual.radius
+    assert_eq!(
+        converged_residual.radius, radius,
+        "with the stationarity residual already at tolerance there is nothing to grow toward"
     );
+
+    // An accumulation that cannot size its rounding carries no band, so nothing
+    // is "unreadable" and `objective_tol` alone decides: held.
+    let unsizable = update_joint_trust_region_radius(
+        radius,
+        radius,
+        actual,
+        predicted,
+        predicted,
+        objective_tol,
+        0.0,
+        f64::INFINITY,
+        true,
+    );
+    assert!(unsizable.accepted);
+    assert_eq!(unsizable.decision, JointTrustRegionDecision::HoldInside);
+    assert_eq!(unsizable.radius, radius);
 }
 
 /// gam#2612: a step sitting EXACTLY on the joint trust sphere must not read as
@@ -6409,7 +6475,6 @@ pub(crate) fn the_joint_norm_is_what_lets_a_well_modelled_boundary_step_grow_261
     // but the boundary test decides whether the region may grow.
     let actual = 1.0_f64;
     let predicted = 1.0_f64;
-    let objective_scale = 1.0_f64;
     let objective_tol = 1.0e-6_f64;
 
     let joint = update_joint_trust_region_radius(
@@ -6418,7 +6483,6 @@ pub(crate) fn the_joint_norm_is_what_lets_a_well_modelled_boundary_step_grow_261
         actual,
         predicted,
         predicted,
-        objective_scale,
         objective_tol,
         0.0,
         0.0,
@@ -6437,7 +6501,6 @@ pub(crate) fn the_joint_norm_is_what_lets_a_well_modelled_boundary_step_grow_261
         actual,
         predicted,
         predicted,
-        objective_scale,
         objective_tol,
         0.0,
         0.0,
@@ -6668,7 +6731,6 @@ pub(crate) fn joint_trust_region_rosenbrock_like_quadratic_is_armijo_safe() {
         actual,
         predicted,
         predicted,
-        old_objective,
         objective_tol,
         0.0,
         0.0,

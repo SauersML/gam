@@ -4320,9 +4320,12 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             // same substitution (proposal stays pred≤0), pinning the residual
             // far above tol until the cycle budget exhausted → seed rejected →
             // hard raise. At the step floor we instead take the tiny proposal
-            // as-is and let the trust-region noise-floor guard accept it at
-            // ρ=1 (it neither helps nor hurts the objective beyond round-off),
-            // so the inner keeps polishing the KKT residual to tol.
+            // as-is and let the trust-region ratio judge it on what it
+            // realized: its rounding-level `pred ≤ 0` stays inside the
+            // noise-tolerant denominator `pred + r·ε_f > 0`, so a realized
+            // change within the evaluation band reads ρ≈1 (it neither helps
+            // nor hurts the objective beyond round-off, gam#3240), and the
+            // inner keeps polishing the KKT residual to tol.
             let proposal_at_step_floor = joint_proposal_at_step_floor(step_inf, step_tol);
             if (!predicted_reduction.is_finite() || predicted_reduction <= 0.0)
                 && !proposal_at_step_floor
@@ -4700,7 +4703,6 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 actual_reduction,
                 predicted_reduction,
                 reduction_along_ray,
-                old_objective,
                 objective_tol,
                 measured_objective_resolution,
                 accumulation.roundoff_ceiling(),
@@ -4724,10 +4726,27 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     objective_tol,
                     measured_objective_resolution,
                 );
+            // The acceptance gate must read the SAME rounding the controller's
+            // ratio carried (gam#3240). The controller forms the Sun–Nocedal
+            // ratio with `ε_f = joint_objective_evaluation_band(measured,
+            // ceiling)`, the per-evaluation band whose `2ε_f` bounds the
+            // rounding of `old − trial`. A gate that allowed only the measured
+            // resolution (or `64ε(1+|F|)`) below that would turn every
+            // rounding-level shortfall the controller correctly accepted into
+            // a "stall", and the stall branch shrinks the active radii by 4× —
+            // the noise ratchet the ratio removes. The trial is therefore
+            // refused as an ascent only when it rose by more than the rounding
+            // of the comparison itself can explain.
             let roundoff_slack = joint_objective_roundoff_slack(
                 old_objective,
                 trialobjective,
                 measured_objective_resolution,
+            )
+            .max(
+                2.0 * joint_objective_evaluation_band(
+                    measured_objective_resolution,
+                    accumulation.roundoff_ceiling(),
+                ),
             );
             let secondary_ok = !floor_reached
                 && trialobjective.is_finite()
@@ -4780,7 +4799,6 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                             actual_reduction,
                             predicted_reduction,
                             reduction_along_ray,
-                            old_objective,
                             objective_tol,
                             measured_objective_resolution,
                             accumulation.roundoff_ceiling(),
