@@ -26,6 +26,25 @@
   penalized gradient does not carry. A reader should check that the criterion's increment across
   a face-dimension change now sits under what a continuous function can move over that gap, while
   the face determinant's step `½log(aᵀM⁻¹a)` does not.
+- **An outer engine that cannot certify a local conformal refit is raised, not recorded as a
+  row refusal** (gam#3394).
+  `refit_at` in the honest full-conformal map ran a one-coordinate box-constrained REML
+  refit with an analytic gradient and an analytic Hessian, and turned ANY failure of that
+  run into `ConformalRefusal::RefitFailed`, discarding the engine's error with a
+  `let Ok(..) else`. The row then silently took the frozen-ρ set and the only trace was the
+  label. That is a fallback over a solver failure: there is no configuration of the data for
+  which one smooth coordinate on a box legitimately fails to converge, and with the error
+  thrown away the failure could be seen (2 of 2000 heavy-tailed n = 20 replicates) but never
+  attributed. The two outcomes are now separated by the producer's own classification. An
+  error that answers `is_trial_point_infeasible` means the objective refused every trial
+  point it was offered, which is the augmented data having no positive penalized residual
+  sum of squares and is exactly `RemlUndefined`; so is a criterion undefined at the point
+  the engine returned. Anything else is carried out of `honest_full_conformal` with the
+  engine's message, the chart point and the searched interval. `RefitFailed` has no producer
+  left and is deleted, leaving code `-6` unused. The coverage fixture now reports every
+  refused cell and every α before it asserts, instead of stopping at the first, and names
+  the scenario, `n` and seed of any replicate the library refuses.
+
 - **The event-history smoother cut its density at an underived `1e-11` and never measured what
   it discarded** (gam#4559, gam#3998). `marginal.rs` formed the smoothed marginal `raw · β` as a
   value before normalising it, which forced a floor: the product overflows where the

@@ -423,7 +423,9 @@ struct Replicate {
     honest_factorizations: [usize; 2],
 }
 
-fn replicate(scenario: Scenario, n: usize, seed: u64) -> Replicate {
+/// The library's own failures are carried out rather than swallowed, so the run
+/// that sees one names the replicate that produced it (#3394).
+fn replicate(scenario: Scenario, n: usize, seed: u64) -> Result<Replicate, String> {
     let (x, y, x_star, y_star) = scenario.sample(n, seed);
     let weights = unit_weights(n);
     let s = curvature_penalty();
@@ -446,7 +448,7 @@ fn replicate(scenario: Scenario, n: usize, seed: u64) -> Replicate {
             (None, &s_lambda),
         ] {
             let row = honest_full_conformal(&x, &y, &weights, penalty, count, &x_star, alpha)
-                .expect("conformal row");
+                .map_err(|error| format!("α={alpha} penalty_count={count:?}: {error}"))?;
             if count == Some(1) {
                 honest_extra_refits[a] = row.cost.extra_refits;
                 honest_factorizations[a] = row.cost.factorizations;
@@ -454,11 +456,11 @@ fn replicate(scenario: Scenario, n: usize, seed: u64) -> Replicate {
             rows.push((row.certificate.label(), a, contains(&row.set, y_star)));
         }
     }
-    Replicate {
+    Ok(Replicate {
         rows,
         honest_extra_refits,
         honest_factorizations,
-    }
+    })
 }
 
 /// One `(scenario, n)` cell of the coverage study: coverage of every row class
@@ -473,7 +475,11 @@ fn coverage_cell(scenario: Scenario, seed_index: usize, n: usize, size_index: us
     let base = 1_000_003 * (1 + seed_index as u64) + 10_007 * (1 + size_index as u64);
     let reps: Vec<Replicate> = (0..REPS as u64)
         .into_par_iter()
-        .map(|r| replicate(scenario, n, base + r))
+        .map(|r| {
+            let seed = base + r;
+            replicate(scenario, n, seed)
+                .unwrap_or_else(|error| panic!("{scenario:?} n={n} seed={seed}: {error}"))
+        })
         .collect();
     let mut failures = Vec::new();
     let mut refits = Vec::new();
@@ -507,14 +513,20 @@ fn coverage_cell(scenario: Scenario, seed_index: usize, n: usize, size_index: us
             ));
         }
     }
-    // Every K = 1 row is honest: none silently fell back.
+    // Every K = 1 row is honest: none silently fell back. Collected over both
+    // α rather than asserted inside the loop (#3394): a cell that refuses rows
+    // at α = 0.1 AND at α = 0.05 used to report only the first, and the refusal
+    // count is the quantity this bar is about.
+    let mut refusals = Vec::new();
     for a in 0..ALPHAS.len() {
         let honest = tallies.get(&("honest_refit", a)).map_or(0, |t| t.0);
-        assert_eq!(
-            honest, REPS,
-            "{scenario:?} n={n}: {} of {REPS} single-penalty rows were refused",
-            REPS - honest
-        );
+        if honest != REPS {
+            refusals.push(format!(
+                "{scenario:?} n={n} α={}: {} of {REPS} single-penalty rows were refused",
+                ALPHAS[a],
+                REPS - honest
+            ));
+        }
     }
     refits.sort_unstable();
     let median = refits[refits.len() / 2];
@@ -522,6 +534,10 @@ fn coverage_cell(scenario: Scenario, seed_index: usize, n: usize, size_index: us
         "{scenario:?} n={n} honest rows: median extra refits {median}, max {}, one \
          factorization each",
         refits.last().copied().unwrap_or(0)
+    );
+    assert!(
+        refusals.is_empty(),
+        "single-penalty rows were refused instead of fitted: {refusals:#?}"
     );
     assert!(
         failures.is_empty(),

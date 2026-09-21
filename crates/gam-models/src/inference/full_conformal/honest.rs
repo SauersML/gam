@@ -125,8 +125,6 @@ pub enum ConformalRefusal {
     /// A cold REML refit found a criterion value below every candidate the bound
     /// retained.
     RefitOutsideTube,
-    /// The outer engine could not complete a local refit.
-    RefitFailed,
     /// A likelihood without an implemented re-selecting map whose fit selected a
     /// smoothing strength (or a
     /// negative-binomial θ) on the training rows: the set is that of the
@@ -143,7 +141,6 @@ impl ConformalRefusal {
             ConformalRefusal::AugmentedGramSingular => "refused:augmented_gram_singular",
             ConformalRefusal::RemlUndefined => "refused:reml_undefined",
             ConformalRefusal::RefitOutsideTube => "refused:refit_outside_tube",
-            ConformalRefusal::RefitFailed => "refused:refit_failed",
             ConformalRefusal::GlmFrozenPenalty => "refused:glm_frozen_penalty",
         }
     }
@@ -155,7 +152,6 @@ impl ConformalRefusal {
             ConformalRefusal::AugmentedGramSingular => -3,
             ConformalRefusal::RemlUndefined => -4,
             ConformalRefusal::RefitOutsideTube => -5,
-            ConformalRefusal::RefitFailed => -6,
             ConformalRefusal::GlmFrozenPenalty => -7,
         }
     }
@@ -193,8 +189,10 @@ impl ConformalCertificate {
     /// Numeric code for column output: `0` exact_frozen, `1` honest_refit,
     /// `2` conservative_frozen,
     /// negative for a refusal (`-1` multi_penalty, `-2` unknown_penalty_structure,
-    /// `-3` augmented_gram_singular, `-4` reml_undefined, `-5` refit_outside_tube, `-6` refit_failed,
-    /// `-7` glm_frozen_penalty).
+    /// `-3` augmented_gram_singular, `-4` reml_undefined, `-5` refit_outside_tube,
+    /// `-7` glm_frozen_penalty). `-6` was `refit_failed` and has no producer:
+    /// an outer engine that cannot certify a local refit is a solver failure,
+    /// which this map raises rather than records (#3394).
     pub fn code(self) -> i32 {
         match self {
             ConformalCertificate::ExactFrozen => 0,
@@ -1459,7 +1457,23 @@ enum RefitCheck {
 /// One cold REML refit at the chart point `s`, through the outer engine,
 /// checked against the tube at that point: a refit whose criterion lies below
 /// the lower bound of every retained box contradicts the bound.
-fn refit_at(basis: &Basis, data: &ChartData, s: f64, required: usize) -> RefitCheck {
+///
+/// Two outcomes are not the same and used to share one refusal (#3394). A
+/// refit whose criterion is undefined at the point the engine reached is a
+/// fact about the row, and it is the fact `RemlUndefined` already names. An
+/// outer engine that RUNS and does not certify is a fact about the solver:
+/// this refit is one smooth coordinate on a box with an analytic gradient and
+/// an analytic Hessian, so there is no configuration of the data for which it
+/// legitimately fails to converge. Recording that as a row refusal made the
+/// row's set the frozen one and left nothing that named the termination, which
+/// is why #3394 could be seen but not attributed. It is raised instead, with
+/// the engine's own error.
+fn refit_at(
+    basis: &Basis,
+    data: &ChartData,
+    s: f64,
+    required: usize,
+) -> Result<RefitCheck, String> {
     use gam_problem::{Derivative, HessianValue, OuterEval};
     use gam_solve::estimate::EstimationError;
     use gam_solve::rho_optimizer::OuterProblem;
@@ -1473,7 +1487,7 @@ fn refit_at(basis: &Basis, data: &ChartData, s: f64, required: usize) -> RefitCh
         let rss = data.rss(&basis.shrinkage(r1));
         let d = rss.value(s) - basis.growth * rss.magnitude();
         if !(d > 0.0) {
-            return RefitCheck::Refused(ConformalRefusal::RemlUndefined);
+            return Ok(RefitCheck::Refused(ConformalRefusal::RemlUndefined));
         }
         let log_det = basis.log_det_part(r2);
         lower_bound = lower_bound.min(c * d.ln() + log_det);
@@ -1508,16 +1522,28 @@ fn refit_at(basis: &Basis, data: &ChartData, s: f64, required: usize) -> RefitCh
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<gam_problem::EfsEval, EstimationError>>,
     );
-    let Ok(result) = problem.run(&mut objective, &context) else {
-        return RefitCheck::Refused(ConformalRefusal::RefitFailed);
+    let result = match problem.run(&mut objective, &context) {
+        Ok(result) => result,
+        // The objective refused every trial point it was offered: the
+        // penalized residual sum of squares is not positive there, which is
+        // `RemlUndefined` and a property of this row's augmented data.
+        Err(error) if error.is_trial_point_infeasible() => {
+            return Ok(RefitCheck::Refused(ConformalRefusal::RemlUndefined));
+        }
+        Err(error) => {
+            return Err(format!(
+                "{context}: the outer engine did not certify this one-coordinate refit \
+                 on [{lower}, {upper}]: {error}"
+            ));
+        }
     };
     let Some((value, _, _, band)) = criterion_at(basis, data, result.rho[0], s) else {
-        return RefitCheck::Refused(ConformalRefusal::RefitFailed);
+        return Ok(RefitCheck::Refused(ConformalRefusal::RemlUndefined));
     };
     if value + band < lower_bound - bound_band {
-        RefitCheck::Refused(ConformalRefusal::RefitOutsideTube)
+        Ok(RefitCheck::Refused(ConformalRefusal::RefitOutsideTube))
     } else {
-        RefitCheck::Consistent
+        Ok(RefitCheck::Consistent)
     }
 }
 
@@ -1705,7 +1731,9 @@ pub fn honest_full_conformal_with_uniform(
         for (z, (chart, s)) in [(piece.lo, piece.lo_point), (piece.hi, piece.hi_point)] {
             if z.is_finite() {
                 cost.extra_refits += 1;
-                if let RefitCheck::Refused(reason) = refit_at(&basis, &charts[chart], s, required) {
+                if let RefitCheck::Refused(reason) =
+                    refit_at(&basis, &charts[chart], s, required)?
+                {
                     return Ok(HonestFullConformal {
                         set: frozen_set,
                         certificate: ConformalCertificate::Refused(reason),

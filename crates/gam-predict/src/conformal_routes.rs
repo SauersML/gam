@@ -109,7 +109,7 @@ impl From<String> for FullConformalError {
 /// `2` conservative_frozen (GLM numerical enclosure), and a negative
 /// code for a typed refusal (`-1` multi_penalty, `-2`
 /// unknown_penalty_structure, `-3` augmented_gram_singular, `-4`
-/// reml_undefined, `-5` refit_outside_tube, `-6` refit_failed, `-7`
+/// reml_undefined, `-5` refit_outside_tube, `-7`
 /// glm_frozen_penalty), where the row gets the frozen-penalty set with no
 /// finite-sample guarantee for the selection step. The set is a union of
 /// `conformal_set_components` intervals; `posterior_mean_lower` /
