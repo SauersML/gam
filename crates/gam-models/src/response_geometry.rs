@@ -1405,17 +1405,14 @@ fn validated_metric(mut metric: Array2<f64>, row: usize) -> Result<Array2<f64>, 
             "fisher_metric row {row} contains non-finite values"
         )));
     }
-    let scale = metric
-        .iter()
-        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    let tolerance = f64::EPSILON.sqrt() * metric.nrows().max(1) as f64 * scale;
+    // The metric enters the fit only through the quadratic form `rᵀ M r`, and
+    // `rᵀ M r = rᵀ ½(M + Mᵀ) r` exactly, so the symmetric part *is* the metric
+    // this row supplies. The antisymmetric part carries nothing the criterion
+    // can see, so it is removed rather than judged against a tolerance that
+    // cannot tell roundoff from intent. Positive definiteness of the symmetric
+    // part is the one requirement.
     for a in 0..metric.nrows() {
         for b in (a + 1)..metric.ncols() {
-            if (metric[[a, b]] - metric[[b, a]]).abs() > tolerance {
-                return Err(invalid(format!(
-                    "fisher_metric row {row} is not symmetric at ({a}, {b})"
-                )));
-            }
             let average = 0.5 * (metric[[a, b]] + metric[[b, a]]);
             metric[[a, b]] = average;
             metric[[b, a]] = average;

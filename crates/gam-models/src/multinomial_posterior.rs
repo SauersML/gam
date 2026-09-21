@@ -473,36 +473,15 @@ fn validate_inputs(
             "multinomial posterior integration covariance[{row},{column}] is non-finite: {value}"
         )));
     }
-
-    let scale = active_covariance
-        .iter()
-        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
-    // STRUCTURAL asymmetry only. This covariance is symmetric by construction,
-    // so whatever difference survives between the triangles is roundoff from
-    // the chain that assembled it — and a `c·ε·m·scale` envelope silently
-    // encodes an assumed chain length. It fired at 51·ε on a 2×2 penguins
-    // posterior (asymmetry 5.218e-15 against a 3.260e-15 bound), refusing a
-    // correct fit over noise carrying no information.
-    //
-    // A caller error that this check exists to catch — a transposed factor,
-    // the wrong triangle — shows up at O(1) RELATIVE asymmetry, so gate there,
-    // using the same √ε relative convention `outer_value_agreement_bound` uses
-    // for two lanes that should agree up to roundoff. The matrix actually
-    // integrated is the symmetrized one (see `symmetrized_covariance`), so
-    // sub-threshold asymmetry is removed rather than propagated.
-    let symmetry_tolerance = f64::EPSILON.sqrt() * scale.max(1.0);
-    let mut maximum_asymmetry = 0.0_f64;
-    for row in 0..m {
-        for column in (row + 1)..m {
-            maximum_asymmetry = maximum_asymmetry
-                .max((active_covariance[[row, column]] - active_covariance[[column, row]]).abs());
-        }
-    }
-    if maximum_asymmetry > symmetry_tolerance {
-        return Err(EstimationError::InvalidInput(format!(
-            "multinomial posterior integration covariance is not symmetric: max asymmetry {maximum_asymmetry:.6e} exceeds structural tolerance {symmetry_tolerance:.6e} (scale {scale:.6e})"
-        )));
-    }
+    // No symmetry gate. The covariance is `xᵀ Σ_ab x`, symmetric by
+    // construction, and the Gaussian it parameterizes depends on it only
+    // through quadratic forms, which see exactly its symmetric part: that part
+    // is what `symmetrized_covariance` hands the integrator. The residual
+    // antisymmetry is assembly roundoff, and any tolerance on it encodes an
+    // assumed chain length (a `c·ε·m·scale` envelope fired at 51·ε on a 2×2
+    // penguins posterior). The caller errors it was meant to catch, a
+    // transposed factor or the wrong triangle of a symmetric product, leave a
+    // symmetric matrix and pass any symmetry check anyway.
     Ok(())
 }
 

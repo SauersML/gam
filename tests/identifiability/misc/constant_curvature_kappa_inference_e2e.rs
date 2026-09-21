@@ -236,7 +236,6 @@ fn fit_and_infer(feats: &Array2<f64>, y: &Array1<f64>) -> CurvatureInference {
         &fitted.resolvedspec,
         0,
         LikelihoodSpec::gaussian_identity(),
-        &options,
         0.95,
     )
     .expect("curvature inference")
