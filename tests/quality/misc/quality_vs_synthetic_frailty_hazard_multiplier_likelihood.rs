@@ -35,12 +35,16 @@
 //! information is positive, and the Newton step still available from R's point
 //! moves `sigma` by less than the additive tolerance of the comparison below.
 //! Both engines see byte-identical
-//! `(M, h_0, event)` data. We additionally assert gam's recovery error is no
-//! worse than R's, `|sigma_hat_gam - sigma_true| <= |sigma_hat_r - sigma_true|
-//! * 1.10 + 1e-3` — gam matches or beats the mature quadrature on ACCURACY of
-//! truth recovery. Because both maximize the exact frailty-integrated likelihood,
-//! the two MLEs should in fact agree to quadrature precision; the comparison is a
-//! baseline, never the pass criterion.
+//! `(M, h_0, event)` data and maximize the SAME exact frailty-integrated
+//! likelihood, so their MLEs must coincide to quadrature/optimizer precision:
+//! we assert `|sigma_hat_gam - sigma_hat_r| <= 1e-3` directly. Comparing each
+//! engine's distance to the truth instead would let gam sit on the far side of
+//! `sigma_true` from R's optimum (a disagreement of up to ~2|err_r|) and pass.
+//! gam's own optimum carries the same stationarity certificate as R's: its
+//! remaining Newton step, computed from gam's analytic score and information at
+//! `sigma_hat_gam`, must move `sigma` by less than that tolerance. The Newton
+//! loop's step-size stop cannot serve as that certificate, since a line search
+//! that exhausts its backtracks also takes a vanishing step.
 
 use gam::families::survival::lognormal_kernel::{LatentSurvivalRow, LatentSurvivalRowJet};
 use gam::quadrature::QuadratureContext;
@@ -180,7 +184,7 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
     // administratively censored at `tau` to produce a censored/event mix.
     //
     // 200 groups (1600 rows): the frailty-scale MLE's sampling error scales as
-    // ~1/sqrt(#groups), and the PRIMARY recovery bar below is `max(3*se_sigma, 0.05)`
+    // ~1/sqrt(#groups), and the PRIMARY recovery bar below is `3*se_sigma`
     // with se_sigma read from the observed information at the optimum — so halving
     // the group count widens the bar by ~sqrt(2) *exactly* as it widens the actual
     // MLE error. The err/bar ratio is therefore group-count-invariant: a
@@ -231,6 +235,7 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
     let quadctx = QuadratureContext::new();
     let mut log_sigma = 0.0_f64; // start at sigma = 1.0, away from the truth (0.5)
     let mut last_loglik = f64::NEG_INFINITY;
+    let mut newton_converged = false;
     for _iter in 0..100 {
         let sigma = log_sigma.exp();
         let (loglik, score, neg_hess) =
@@ -260,14 +265,20 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
         log_sigma = next_log_sigma;
         last_loglik = loglik;
         if converged {
+            newton_converged = true;
             break;
         }
     }
+    assert!(
+        newton_converged,
+        "gam's damped Newton on log sigma did not converge in 100 iterations \
+         (last log sigma {log_sigma:.6e})"
+    );
     let sigma_hat_gam = log_sigma.exp();
     // Observed-information standard error of the frailty-scale MLE, from gam's own
     // Hessian at the optimum. Var(log sigma_hat) ~ 1 / I(log sigma); by the delta
     // method se(sigma_hat) = sigma_hat * se(log sigma_hat).
-    let (_, _, neg_hess_at_opt) = gam_logsigma_jet(
+    let (_, score_at_opt, neg_hess_at_opt) = gam_logsigma_jet(
         &quadctx,
         &cum_hazard,
         &events,
@@ -278,6 +289,17 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
         neg_hess_at_opt > 0.0,
         "frailty-scale log-likelihood must be concave at the MLE (observed info \
          {neg_hess_at_opt:.3e})"
+    );
+    // Stationarity certificate for gam's optimum, the same one the R reference
+    // must pass below: the Newton step still available from sigma_hat_gam,
+    // expressed in sigma, lies within the reference agreement tolerance.
+    let gam_newton_displacement = sigma_hat_gam * (score_at_opt / neg_hess_at_opt).abs();
+    assert!(
+        gam_newton_displacement <= REFERENCE_AGREEMENT_TOLERANCE,
+        "gam's frailty-scale optimum is not stationary: score={score_at_opt:.3e} \
+         information={neg_hess_at_opt:.3e} Newton displacement in sigma \
+         {gam_newton_displacement:.3e} > {REFERENCE_AGREEMENT_TOLERANCE:.0e} \
+         (sigma_hat_gam={sigma_hat_gam:.6})"
     );
     let se_log_sigma = (1.0 / neg_hess_at_opt).sqrt();
     let se_sigma = sigma_hat_gam * se_log_sigma;
@@ -361,6 +383,8 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
          groups={M_GROUPS} events={n_events} sigma_true={SIGMA_TRUE} \
          sigma_hat_gam={sigma_hat_gam:.6} sigma_hat_r={sigma_hat_r:.6} \
          se_sigma={se_sigma:.6} err_gam={err_gam:.3e} err_r={err_r:.3e} \
+         gam_score_log_sigma={score_at_opt:.3e} \
+         gam_newton_displacement={gam_newton_displacement:.3e} \
          last_loglik={last_loglik:.6} gam_loglik_at_opt={gam_loglik_at_opt:.6} \
          r_loglik={r_loglik:.6} r_nlm_code={r_nlm_code} \
          r_score_log_sigma={r_score:.3e} r_information_log_sigma={r_information:.3e} \
@@ -370,8 +394,10 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
     // ---- PRIMARY objective assertion: gam recovers the true frailty variance --
     // The MLE error must lie within a few asymptotic standard errors of the true
     // sigma. 3*se is the principled sampling-error budget (a ~99.7% Gaussian
-    // band); a floor protects against an over-tight se from the observed info.
-    let recovery_bar = (3.0 * se_sigma).max(0.05);
+    // band), with se read from gam's own observed information at its certified
+    // optimum. No absolute floor: an se the observed information gets wrong is a
+    // kernel defect this test exists to catch, not something to widen past.
+    let recovery_bar = 3.0 * se_sigma;
     assert!(
         err_gam <= recovery_bar,
         "gam's lognormal kernel failed to recover the true frailty variance: \
@@ -405,15 +431,19 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
          (sigma_hat_r={sigma_hat_r:.6})"
     );
 
-    // ---- match-or-beat the mature quadrature on recovery ACCURACY ------------
-    // Both maximize the EXACT frailty-integrated likelihood on identical data, so
-    // their MLEs should coincide to quadrature precision; gam must be no less
-    // accurate than R at recovering the truth. REFERENCE_AGREEMENT_TOLERANCE absorbs
-    // the residual quadrature/optimizer disagreement near the (shared) optimum.
+    // ---- agree with the mature quadrature MLE ---------------------------------
+    // Both maximize the EXACT frailty-integrated likelihood on identical data, and
+    // both optima are certified stationary above, so the two MLEs must coincide.
+    // REFERENCE_AGREEMENT_TOLERANCE absorbs the residual quadrature/optimizer
+    // disagreement near the shared optimum. The check is on the two estimates
+    // themselves: comparing their distances to sigma_true would pass a gam
+    // optimum on the opposite side of the truth from R's.
+    let mle_disagreement = (sigma_hat_gam - sigma_hat_r).abs();
     assert!(
-        err_gam <= err_r * 1.10 + REFERENCE_AGREEMENT_TOLERANCE,
-        "gam recovered the frailty variance less accurately than the R \
-         Gauss-Hermite MLE baseline: err_gam={err_gam:.3e} err_r={err_r:.3e} \
-         (sigma_hat_gam={sigma_hat_gam:.6} sigma_hat_r={sigma_hat_r:.6})"
+        mle_disagreement <= REFERENCE_AGREEMENT_TOLERANCE,
+        "gam's frailty-scale MLE disagrees with the R Gauss-Hermite MLE of the same \
+         likelihood: |sigma_hat_gam - sigma_hat_r|={mle_disagreement:.3e} > \
+         {REFERENCE_AGREEMENT_TOLERANCE:.0e} (sigma_hat_gam={sigma_hat_gam:.6} \
+         sigma_hat_r={sigma_hat_r:.6} err_gam={err_gam:.3e} err_r={err_r:.3e})"
     );
 }
