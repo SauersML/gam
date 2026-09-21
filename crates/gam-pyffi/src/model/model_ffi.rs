@@ -546,6 +546,8 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "equivariant_rho_so3",
             "equivariant_rho_so3_jvp",
             "equivariant_gauge_companion_loss",
+            "dense_orthonormal_range_basis",
+            "dense_symmetric_eigen",
         ],
     )?;
     info.set_item(

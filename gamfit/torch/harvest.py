@@ -50,10 +50,15 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 import torch
+
+from .._binding import rust_module
+
+if TYPE_CHECKING:
+    from .._rust_module import RustModule
 
 __all__ = [
     "HarvestShard",
@@ -63,6 +68,22 @@ __all__ = [
     "save_harvest_shard",
     "load_harvest_shard",
 ]
+
+
+def _rust() -> RustModule:
+    """The compiled engine.
+
+    SPEC: Python is a thin wrapper. The autograd below is torch's — it is a
+    user-supplied model's own JVPs and VJPs, and nothing else can take them —
+    but every DECOMPOSITION is the engine's, through this handle.
+    """
+    return rust_module()
+
+
+def _to_engine(tensor: torch.Tensor) -> np.ndarray:
+    """A tensor as the contiguous float64 array the engine boundary takes."""
+    return np.ascontiguousarray(tensor.detach().to("cpu", torch.float64).numpy())
+
 
 # The provenance tags a harvest shard may carry:
 #   * ``output_fisher`` / ``output_fisher_downstream`` — the gauge-only #980
@@ -304,10 +325,15 @@ def _pullback_matvec(
 
 
 def _orthonormalize(M: torch.Tensor) -> torch.Tensor:
-    """Thin QR returning an orthonormal ``(p, m)`` basis for ``range(M)``."""
-    q: torch.Tensor
-    q, _ = torch.linalg.qr(M, mode="reduced")
-    return q
+    """An orthonormal ``(p, m)`` basis for ``range(M)``, from the engine.
+
+    The decomposition is ``gam::linalg``'s, the same one every Rust caller reads
+    a range basis from, so the harvest and the engine cannot disagree about a
+    subspace. It runs in the engine's working precision, float64, and the basis
+    returns in ``M``'s own dtype and device.
+    """
+    basis = _rust().dense_orthonormal_range_basis(_to_engine(M))
+    return torch.from_numpy(basis).to(device=M.device, dtype=M.dtype)
 
 
 def _top_r_eigenpairs(
@@ -340,8 +366,13 @@ def _top_r_eigenpairs(
     # Rayleigh–Ritz on the captured subspace: T = Qᵀ G Q is (m, m).
     GQ = matvec(Q)
     T = Q.transpose(0, 1) @ GQ
-    T = 0.5 * (T + T.transpose(0, 1))  # symmetrize against round-off
-    evals, evecs = torch.linalg.eigh(T)  # ascending
+    # The symmetrization and the decomposition are both the engine's: it averages
+    # `T` with its transpose and enters its strict self-adjoint routine with that
+    # assembly DECLARED, so the two triangles are known to hold one rounded value
+    # each rather than assumed to agree.
+    values, vectors = _rust().dense_symmetric_eigen(_to_engine(T))
+    evals = torch.from_numpy(values).to(device=T.device, dtype=T.dtype)
+    evecs = torch.from_numpy(vectors).to(device=T.device, dtype=T.dtype)
     # Descending, take leading r.
     order = torch.argsort(evals, descending=True)
     top = order[:r]
