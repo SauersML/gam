@@ -3857,6 +3857,89 @@ fn row_precision_prior_dense_hessian_and_diagonal_match_hvp() {
     assert!(penalty.hessian_diag(t.view(), rho.view()).is_none());
 }
 
+/// Hoyer's exact Hessian `A/L2³·[−(s xᵀ + x sᵀ) − L1 I + 3 L1 x xᵀ/L2²]` is
+/// indefinite, and it used to be the "PSD majorizer" too: `psd_majorizer_diag`
+/// returned `None`, so `psd_majorizer_hvp` fell back to the exact `hvp`. The
+/// frozen PSD operator then took `log det(B + λI)` as the product of the
+/// diagonal of that dense matrix. The majorizer must be PSD and dominate the
+/// exact Hessian, and the frozen log-determinant must be the eigensolve of the
+/// frozen dense form, not the Hadamard product bound.
+#[test]
+fn hoyer_psd_majorizer_is_psd_dominates_hessian_and_gives_exact_log_det() {
+    let pen = SparsityPenalty::hoyer(PenaltyTier::Psi);
+    let rho = Array1::<f64>::zeros(pen.rho_count());
+    let n = 6;
+    let targets = [
+        Array1::from_elem(n, 1.0),
+        Array1::from_shape_fn(n, |i| ((i * 37 % 11) as f64 - 5.0) / 3.0),
+        array![0.8, 0.0, -1.7, 0.3, 0.0, 2.2],
+    ];
+    for (case, target) in targets.iter().enumerate() {
+        let mut hessian = Array2::<f64>::zeros((n, n));
+        let mut majorizer = Array2::<f64>::zeros((n, n));
+        for j in 0..n {
+            let mut e = Array1::<f64>::zeros(n);
+            e[j] = 1.0;
+            hessian
+                .column_mut(j)
+                .assign(&pen.hvp(target.view(), rho.view(), e.view()));
+            majorizer.column_mut(j).assign(&pen.psd_majorizer_hvp(
+                target.view(),
+                rho.view(),
+                e.view(),
+            ));
+        }
+        let scale = hessian
+            .iter()
+            .chain(majorizer.iter())
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(scale > 0.0, "case {case}: nonzero curvature");
+        let tol = 1e-12 * scale;
+        for i in 0..n {
+            for j in 0..n {
+                assert_abs_diff_eq!(majorizer[[i, j]], majorizer[[j, i]], epsilon = tol);
+            }
+        }
+        let min_eig = |m: &Array2<f64>| {
+            <Array2<f64> as PenaltyOp>::eigendecompose(m)
+                .expect("symmetric eigensolve")
+                .0
+                .iter()
+                .fold(f64::INFINITY, |acc, &v| acc.min(v))
+        };
+        if case == 0 {
+            // At x = 1 every direction orthogonal to 1 has exact curvature
+            // −A·L1/L2³, so the exact Hessian cannot serve as the PSD block.
+            assert!(
+                min_eig(&hessian) < -1e-3 * scale,
+                "Hoyer's exact Hessian is indefinite at the equal-magnitude point"
+            );
+        }
+        assert!(min_eig(&majorizer) >= -tol, "case {case}: B must be PSD");
+        assert!(
+            min_eig(&(&majorizer - &hessian)) >= -tol,
+            "case {case}: B must dominate the exact Hessian"
+        );
+
+        let kind = AnalyticPenaltyKind::Sparsity(Arc::new(pen.clone()));
+        let op = FrozenAnalyticPenaltyOp::new(kind, target.clone(), rho.clone())
+            .expect("frozen operator");
+        let dense = op.as_dense();
+        let diag = op.diag();
+        for i in 0..n {
+            assert_abs_diff_eq!(diag[i], majorizer[[i, i]], epsilon = tol);
+            for j in 0..n {
+                assert_abs_diff_eq!(dense[[i, j]], majorizer[[i, j]], epsilon = tol);
+            }
+        }
+        let lambda = 0.3;
+        let exact = <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&majorizer, lambda)
+            .expect("dense log det");
+        let log_det = op.log_det_plus_lambda_i(lambda).expect("frozen log det");
+        assert_abs_diff_eq!(log_det, exact, epsilon = 1e-9 * exact.abs().max(1.0));
+    }
+}
+
 /// The row-precision energy ½ tᵀΛt reads only the symmetric part of Λ, so a
 /// penalty built from an asymmetric Λ is the penalty built from (Λ + Λᵀ)/2:
 /// value, gradient, curvature and the log-determinant agree exactly. An input

@@ -58,7 +58,9 @@ pub fn soft_abs_squared_scale(x: f64, eps_sq: f64) -> f64 {
 /// * `Hoyer` — `(‖x‖_1 / ‖x‖_2 − 1) / (√n − 1)`, which maps the ratio
 ///   `‖x‖_1 / ‖x‖_2 ∈ [1, √n]` onto `[0, 1]`: `0` for a 1-sparse vector and
 ///   `1` for an equal-magnitude dense one. Scale-invariant; encourages
-///   absolute sparsity even when the global scale of `x` drifts.
+///   absolute sparsity even when the global scale of `x` drifts. Its exact
+///   Hessian is dense and indefinite, so PSD consumers use the rank-2
+///   majorizer in `psd_majorizer_hvp`.
 /// * `Log { delta }` — `Σ_i log(1 + x_i² / δ²)`. Strongly concave; aggressive
 ///   sparsifier suitable for active-set / iterative-reweighted paths.
 #[derive(Debug, Clone, Copy)]
@@ -938,9 +940,74 @@ impl AnalyticPenalty for SparsityPenalty {
                 }
                 Some(d)
             }
-            // Hoyer's Hessian is dense; no diagonal majorizer. Callers fall
-            // back to the exact dense `hvp` through `psd_majorizer_hvp`.
+            // Hoyer's majorizer is dense (rank 2); it is served by the
+            // `psd_majorizer_hvp` override below, not by a diagonal.
             SparsityKind::Hoyer => None,
+        }
+    }
+
+    fn psd_majorizer_hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let n_target = target.len();
+        assert_eq!(v.len(), n_target, "psd_majorizer_hvp dimension mismatch");
+        match self.kind {
+            SparsityKind::SmoothedL1 { .. } | SparsityKind::Log { .. } => {
+                let diag = self
+                    .psd_majorizer_diag(target, rho)
+                    .expect("SmoothedL1 and Log expose a diagonal PSD majorizer");
+                &diag * &v
+            }
+            SparsityKind::Hoyer => {
+                // The exact Hoyer Hessian
+                //   H = A/L2³ · [ −(s xᵀ + x sᵀ) − L1 I + 3 L1 x xᵀ/L2² ]
+                // is indefinite (at x = 1 the direction ⊥ 1 has curvature
+                // −A·L1/L2³ < 0), so it cannot be the PSD block. Use
+                //   B = A/L2³ · [ t s sᵀ + (1/t + 3 L1/L2²) x xᵀ ],  t > 0,
+                // which is PSD, and
+                //   B − H = A/L2³ · [ (√t s + x/√t)(√t s + x/√t)ᵀ + L1 I ] ⪰ 0.
+                // t = L2/‖s‖₂ minimizes tr B = A/L2³ · (t‖s‖² + L2²/t + 3 L1).
+                let n = n_target as f64;
+                assert!(n > 1.0, "Hoyer requires n > 1");
+                let mut out = Array1::<f64>::zeros(n_target);
+                let l1: f64 = target.iter().map(|x| x.abs()).sum();
+                let l2: f64 = target.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if l2 == 0.0 {
+                    return out;
+                }
+                let (lam, _) = self.resolved(rho);
+                let a = lam / (n.sqrt() - 1.0);
+                let inv_l2_cubed = 1.0 / (l2 * l2 * l2);
+                let sign = |x: f64| {
+                    if x > 0.0 {
+                        1.0
+                    } else if x < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    }
+                };
+                let mut x_dot_v = 0.0;
+                let mut s_dot_v = 0.0;
+                let mut s_norm_sq = 0.0;
+                for i in 0..n_target {
+                    let si = sign(target[i]);
+                    x_dot_v += target[i] * v[i];
+                    s_dot_v += si * v[i];
+                    s_norm_sq += si * si;
+                }
+                // l2 > 0 implies some x_i != 0, hence ‖s‖² >= 1.
+                let t = l2 / s_norm_sq.sqrt();
+                let x_coef = 1.0 / t + 3.0 * l1 / (l2 * l2);
+                for i in 0..n_target {
+                    let si = sign(target[i]);
+                    out[i] = a * inv_l2_cubed * (t * si * s_dot_v + x_coef * target[i] * x_dot_v);
+                }
+                out
+            }
         }
     }
 
