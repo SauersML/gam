@@ -2737,10 +2737,11 @@ pub(crate) fn joint_trust_region_metric_step_norm_view(
     metric_diag: ArrayView1<f64>,
 ) -> f64 {
     assert_eq!(delta.len(), metric_diag.len());
+    let floor = crate::covariance::joint_metric_resolution_floor(metric_diag);
     delta
         .iter()
         .zip(metric_diag.iter())
-        .map(|(step, weight)| step * step * positive_joint_diagonal_entry(*weight))
+        .map(|(step, weight)| step * step * positive_joint_diagonal_entry(*weight, floor))
         .sum::<f64>()
         .sqrt()
 }
@@ -2909,8 +2910,9 @@ pub(crate) fn joint_dogleg_step_to_block_metric_radii(
         // d = δ_N − δ_C, a = ‖d‖²_M, b = 2·⟨δ_C, d⟩_M, c = ‖δ_C‖²_M − radius².
         let mut a = 0.0_f64;
         let mut b = 0.0_f64;
+        let floor = crate::covariance::joint_metric_resolution_floor(metric_view);
         for ((cb, nb), w) in cauchy_b.iter().zip(newton_b.iter()).zip(metric_view.iter()) {
-            let m = positive_joint_diagonal_entry(*w);
+            let m = positive_joint_diagonal_entry(*w, floor);
             let d = nb - cb;
             a += m * d * d;
             b += 2.0 * m * cb * d;
@@ -3588,8 +3590,9 @@ pub(crate) mod whitened_spectrum {
     impl WhitenedHessianSpectrum {
         /// Eigendecompose the `D`-whitened penalized Hessian once. `metric_diag`
         /// supplies the positive trust-region metric `D` (each entry is passed
-        /// through [`positive_joint_diagonal_entry`] so a non-positive curvature
-        /// estimate becomes a safe positive scale). `rank_tol` is the relative
+        /// through [`positive_joint_diagonal_entry`] at the metric's own
+        /// resolution floor, so a non-positive curvature estimate becomes the
+        /// smallest scale that metric resolves). `rank_tol` is the relative
         /// near-singularity cutoff; the genuine numerical-rank floor is derived from
         /// the whitened spectrum exactly as the legacy spectral solve did.
         pub(crate) fn decompose(
@@ -3608,10 +3611,11 @@ pub(crate) mod whitened_spectrum {
                     metric_diag.len()
                 )));
             }
+            let floor = crate::covariance::joint_metric_resolution_floor(metric_diag.view());
             let d_inv_sqrt = Array1::from_iter(
                 metric_diag
                     .iter()
-                    .map(|w| 1.0 / positive_joint_diagonal_entry(*w).sqrt()),
+                    .map(|w| 1.0 / positive_joint_diagonal_entry(*w, floor).sqrt()),
             );
             // A = D^{-1/2} H D^{-1/2}; symmetric since H is symmetric and D
             // diagonal. This runs once per joint-Newton cycle on a ~p²-element
@@ -4402,10 +4406,11 @@ mod trust_region_subproblem_tests {
     use ndarray::array;
 
     pub(crate) fn metric_norm(delta: &Array1<f64>, d: &Array1<f64>) -> f64 {
+        let floor = crate::covariance::joint_metric_resolution_floor(d.view());
         delta
             .iter()
             .zip(d.iter())
-            .map(|(x, w)| x * x * positive_joint_diagonal_entry(*w))
+            .map(|(x, w)| x * x * positive_joint_diagonal_entry(*w, floor))
             .sum::<f64>()
             .sqrt()
     }
@@ -6210,8 +6215,35 @@ pub(crate) struct JointNewtonMathDiagnostic {
 
 impl JointNewtonMathDiagnostic {
     pub(crate) fn scalar_model_relative_error(&self) -> f64 {
-        (self.actual_reduction - self.predicted_reduction).abs()
-            / self.predicted_reduction.abs().max(1.0)
+        (self.actual_reduction - self.predicted_reduction).abs() / self.model_scale()
+    }
+
+    /// The denominator [`Self::scalar_model_relative_error`] and
+    /// [`Self::model_agreement_relative_bound`] both carry, so that the error
+    /// and the bound it is read against are one predicate whatever it is.
+    fn model_scale(&self) -> f64 {
+        self.predicted_reduction.abs().max(1.0)
+    }
+
+    /// The bound [`Self::scalar_model_relative_error`] must meet for the local
+    /// quadratic model and the realized objective change to be the same number.
+    ///
+    /// `evaluation_difference_band` is the rounding the DIFFERENCE of the two
+    /// objective evaluations can carry — `2·ε_f` for the per-evaluation band
+    /// `ε_f` of [`joint_objective_evaluation_band`], which is
+    /// `ObjectiveAccumulation::roundoff_ceiling` over the same two endpoints
+    /// (gam#3240). `actual_reduction` IS that difference, so a disagreement
+    /// within the band is one the arithmetic can explain and anything above it
+    /// is the model, not the rounding.
+    ///
+    /// Both sides carry [`Self::model_scale`], so the predicate is exactly
+    /// `|actual − predicted| ≤ evaluation_difference_band`. The `1e-3` it
+    /// replaces was denominated in `max(|predicted|, 1)`, which made it vacuous
+    /// exactly where this gate fires: on a plateau `|predicted| ≪ 1`, so `1e-3`
+    /// admitted a disagreement orders of magnitude larger than the prediction
+    /// being checked (gam#2469).
+    pub(crate) fn model_agreement_relative_bound(&self, evaluation_difference_band: f64) -> f64 {
+        evaluation_difference_band / self.model_scale()
     }
 
     pub(crate) fn linearized_rel(&self) -> f64 {
@@ -6224,12 +6256,14 @@ pub(crate) fn constrained_stationary_certificate_decision(
     objective_change: f64,
     objective_tol: f64,
     step_tol: f64,
+    evaluation_difference_band: f64,
     geometric_tail_bound: Option<f64>,
     residual: f64,
     residual_tol: f64,
 ) -> ConstrainedStationaryCertificate {
     let linearized_rel = math.linearized_rel();
     let scalar_model_relerr = math.scalar_model_relative_error();
+    let model_relerr_bound = math.model_agreement_relative_bound(evaluation_difference_band);
     let objective_exhausted = objective_change <= objective_tol
         || geometric_tail_bound.is_some_and(|tail| tail <= objective_tol);
     let step_exhausted =
@@ -6238,7 +6272,7 @@ pub(crate) fn constrained_stationary_certificate_decision(
     if !(objective_exhausted
         && step_exhausted
         && linearized_rel >= 0.5
-        && scalar_model_relerr <= 1e-3)
+        && scalar_model_relerr <= model_relerr_bound)
     {
         return ConstrainedStationaryCertificate::NotCandidate;
     }
@@ -6253,7 +6287,8 @@ pub(crate) fn constrained_stationary_certificate_decision(
     // The band is a small MULTIPLE of `residual_tol`, not exactly `1x`: this
     // branch fires only once the iterate is already proven stationary (objective
     // exhausted, step exhausted, `linearized_rel >= 0.5` so the residual is
-    // multiplier/null mass not a gradient defect, `scalar_relerr <= 1e-3` so the
+    // multiplier/null mass not a gradient defect, and the model's disagreement with
+    // the realized change inside the two evaluations' own rounding, so the
     // quadratic model is exact). There the active-projected residual stalls at the
     // conditioning/round-off floor — for the survival baseline-hazard block
     // (well-conditioned after the data-seeded baseline, gam#797) it floors a hair
@@ -6290,7 +6325,7 @@ pub(crate) fn constrained_stationary_certificate_decision(
 ///
 /// Safety (why this cannot certify a non-converged iterate): a still-DESCENDING
 /// iterate has `|Δobjective| > objective_floor` and fails immediately; a
-/// non-exact local model (`scalar_model_relerr > 1e-3`) fails; and the caller
+/// non-exact local model (a relative error above `model_relerr_bound`) fails; and the caller
 /// additionally requires `hpen_nullity == 0` (H_pen full rank ⇒ the residual is a
 /// genuine active-constraint multiplier, not an H-null defect) and
 /// `linearized_rel ≥ 0.5` (the feasible Newton step leaves the residual, so it is
@@ -6314,6 +6349,7 @@ pub(crate) fn constrained_numerical_fixed_point_failures(
     objective_change: f64,
     objective_floor: f64,
     scalar_model_relerr: f64,
+    model_relerr_bound: f64,
     accepted_step_inf: f64,
     step_tol: f64,
 ) -> Vec<gam_problem::ConstrainedFixedPointCondition> {
@@ -6326,11 +6362,11 @@ pub(crate) fn constrained_numerical_fixed_point_failures(
             objective_floor,
         });
     }
-    let model_exact = scalar_model_relerr <= CONSTRAINED_FIXED_POINT_MODEL_RELERR_BOUND;
+    let model_exact = scalar_model_relerr <= model_relerr_bound;
     if !model_exact {
         failures.push(Condition::ModelInexact {
             scalar_model_relerr,
-            bound: CONSTRAINED_FIXED_POINT_MODEL_RELERR_BOUND,
+            bound: model_relerr_bound,
         });
     }
     let step_within_tol = accepted_step_inf.is_finite() && accepted_step_inf <= step_tol;
@@ -6342,10 +6378,6 @@ pub(crate) fn constrained_numerical_fixed_point_failures(
     }
     failures
 }
-
-/// Largest relative error of the scalar Newton model at which the constrained
-/// fixed-point certificate still treats that model as exact.
-pub(crate) const CONSTRAINED_FIXED_POINT_MODEL_RELERR_BOUND: f64 = 1e-3;
 
 /// The acceptance conditions of the constrained fixed-point certificate that
 /// declined the iterate: the numerical fixed-point failures, or, once those all
@@ -6499,6 +6531,7 @@ mod constrained_numerical_fixed_point_tests {
         objective_change: f64,
         objective_floor: f64,
         scalar_model_relerr: f64,
+        model_relerr_bound: f64,
         accepted_step_inf: f64,
         step_tol: f64,
     ) -> bool {
@@ -6506,6 +6539,7 @@ mod constrained_numerical_fixed_point_tests {
             objective_change,
             objective_floor,
             scalar_model_relerr,
+            model_relerr_bound,
             accepted_step_inf,
             step_tol,
         )
@@ -6526,6 +6560,9 @@ mod constrained_numerical_fixed_point_tests {
         let objective_change = 1.421e-13;
         let objective_floor = 1.10e-12; // 64*eps*(1+|obj|), |obj| ~ 76.5
         let scalar_model_relerr = 9.425e-13;
+        // The model arm's bound at this iterate: the endpoints' own rounding
+        // ceiling, which at `|predicted| < 1` is the ceiling itself.
+        let model_relerr_bound = objective_floor;
         let accepted_step_inf = 7.994e-14; // 1.69x the eps step floor 4.73e-14 ...
         let step_tol = 4.328e-11; // ... but 540x BELOW step_tol
         assert!(
@@ -6533,6 +6570,7 @@ mod constrained_numerical_fixed_point_tests {
                 objective_change,
                 objective_floor,
                 scalar_model_relerr,
+                model_relerr_bound,
                 accepted_step_inf,
                 step_tol,
             ),
@@ -6547,7 +6585,7 @@ mod constrained_numerical_fixed_point_tests {
     #[test]
     fn accepts_when_step_also_at_eps_floor() {
         assert!(constrained_numerical_fixed_point_reached(
-            1e-14, 1e-12, 1e-10, 4.0e-14, 4.3e-11,
+            1e-14, 1e-12, 1e-10, 1e-9, 4.0e-14, 4.3e-11,
         ));
     }
 
@@ -6581,17 +6619,17 @@ mod constrained_numerical_fixed_point_tests {
     #[test]
     fn rejects_when_accepted_step_exceeds_step_tol() {
         assert!(!constrained_numerical_fixed_point_reached(
-            1e-13, 1.10e-12, 1e-12, 1e-6, 4.3e-11,
+            1e-13, 1.10e-12, 1e-12, 1e-9, 1e-6, 4.3e-11,
         ));
     }
 
-    // An inexact local quadratic model (scalar_model_relerr above 1e-3) means the
-    // Hessian/gradient are not trustworthy at this β, so "objective flat" is not a
-    // reliable fixed-point signal.
+    // An inexact local quadratic model — a relative error above the bound the
+    // endpoints' rounding allows — means the Hessian/gradient are not trustworthy
+    // at this β, so "objective flat" is not a reliable fixed-point signal.
     #[test]
     fn rejects_when_local_model_is_inexact() {
         assert!(!constrained_numerical_fixed_point_reached(
-            1e-13, 1.10e-12, 1e-2, 8e-14, 4.3e-11,
+            1e-13, 1.10e-12, 1e-2, 1.10e-12, 8e-14, 4.3e-11,
         ));
     }
 
@@ -6602,6 +6640,7 @@ mod constrained_numerical_fixed_point_tests {
             1e-13,
             1.10e-12,
             1e-12,
+            1e-9,
             f64::INFINITY,
             4.3e-11,
         ));
@@ -6617,8 +6656,9 @@ mod constrained_numerical_fixed_point_tests {
             constrained_fixed_point_declining_conditions, constrained_fixed_point_verdict,
             constrained_numerical_fixed_point_failures,
         };
-        let ctn_failures =
-            constrained_numerical_fixed_point_failures(8.811e-13, 2.4455e-12, 8.810e-13, 8.242e-13, 7.633e-9);
+        let ctn_failures = constrained_numerical_fixed_point_failures(
+            8.811e-13, 2.4455e-12, 8.810e-13, 2.4455e-12, 8.242e-13, 7.633e-9,
+        );
         assert!(ctn_failures.is_empty(), "{ctn_failures:?}");
         let nullity = constrained_fixed_point_declining_conditions(true, &ctn_failures, Some(Some(2)));
         let nullity_verdict = constrained_fixed_point_verdict(&nullity).expect("declined");
@@ -6629,8 +6669,9 @@ mod constrained_numerical_fixed_point_tests {
         };
         assert!(terminal.to_string().contains("H_pen nullity=2"), "{terminal}");
 
-        let step_failures =
-            constrained_numerical_fixed_point_failures(1e-13, 1.10e-12, 1e-12, 1e-6, 4.3e-11);
+        let step_failures = constrained_numerical_fixed_point_failures(
+            1e-13, 1.10e-12, 1e-12, 1.10e-12, 1e-6, 4.3e-11,
+        );
         let step = constrained_fixed_point_declining_conditions(true, &step_failures, None);
         let step_verdict = constrained_fixed_point_verdict(&step).expect("declined");
         assert!(

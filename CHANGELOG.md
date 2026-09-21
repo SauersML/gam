@@ -24,6 +24,35 @@
   `scripts/assertionless_tests.py` and `scripts/src_items_used_only_by_tests.py` lose their
   `--ledger` modes, leaving the zero-demanding scan as the only mode each has.
 
+- **The joint trust metric's positive floor and the local model's exactness gate are read off
+  the arithmetic that produced them** (gam#2469, gam#2902).
+  `positive_joint_diagonal_entry` floored every entry of the joint PCG preconditioner and
+  trust-region metric at `1e-10`, a scale unrelated to the metric: on a metric of norm `1e6`
+  that left a `1e16` conditioning and on one of norm `1e-6` it erased every real scale
+  difference in the block. The floor is now `joint_metric_resolution_floor`, the assembled
+  diagonal's own resolution `p·ε·‖D‖₂` over its finite entries — the band below which an
+  entry is not separated from zero by a decomposition of that metric — so it is covariant
+  with the metric and caps its condition number at `1/(p·ε)`. A diagonal with no finite
+  positive entry carries no scale at all and the metric is Euclidean. Every site that turns a
+  metric entry into a scale (the preconditioner assembly, the block metric, the M-norm, the
+  dogleg blend, the whitened spectrum, the Cauchy leg) reads the floor from the diagonal it
+  holds, so there is one rule and no second opinion.
+  The constrained-stationary certificate demanded `|actual − predicted| / max(|predicted|, 1)
+  ≤ 1e-3` of the local quadratic model, and the constrained fixed-point certificate demanded
+  the same quantity against a `1e-3` named `CONSTRAINED_FIXED_POINT_MODEL_RELERR_BOUND`. That
+  denominator made the test vacuous exactly where both fire: on a plateau `|predicted| ≪ 1`,
+  so `1e-3` admitted a disagreement orders of magnitude larger than the prediction being
+  checked. Both now read `JointNewtonMathDiagnostic::model_agreement_relative_bound`, whose
+  band is the rounding the two endpoint objective evaluations carry between them
+  (`ObjectiveAccumulation::roundoff_ceiling`, the `2·ε_f` the trust-region ratio is already
+  formed with): `actual_reduction` IS that difference, so a disagreement inside the band is
+  one the arithmetic explains and anything above it is the model. The ceiling is formed once
+  per cycle and both gates read it.
+  `fit_exact_joint`'s three exits state a `JointExitCertificate` instead of writing a
+  convergence flag, a carrying block and the Laplace log-determinants independently; the
+  certified exit returns before the other two are reached, so the budget exit's
+  `if converged && …` Laplace branch could never fire and is gone.
+
 ## gamfit 0.1.269 (2026-09-21)
 
 - A Bernoulli marginal-slope prediction table carries `mean_score_derivative`

@@ -2445,7 +2445,13 @@ pub(crate) fn block_penalized_metric_diagonal(
     }
     for j in 0..diagonal.len() {
         diagonal[j] += s_lambda[[j, j]];
-        diagonal[j] = positive_joint_diagonal_entry(diagonal[j]);
+    }
+    // The floor is the assembled diagonal's own resolution, so it is read after
+    // every penalty diagonal has been added and before any entry is used as a
+    // scale (#2469).
+    let floor = crate::covariance::joint_metric_resolution_floor(diagonal.view());
+    for j in 0..diagonal.len() {
+        diagonal[j] = positive_joint_diagonal_entry(diagonal[j], floor);
     }
     Ok(diagonal)
 }

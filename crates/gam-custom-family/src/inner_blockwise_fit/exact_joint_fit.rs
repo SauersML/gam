@@ -708,6 +708,53 @@ fn descending_ray_restoration(
     best
 }
 
+/// What the joint Newton path certified about the iterate an exit of
+/// [`fit_exact_joint`] returns (#2902).
+///
+/// A `BlockwiseInnerResult` carries the convergence flag, the name of the block
+/// holding an unresolved KKT residual, and the Laplace artifacts that its own
+/// documentation defines only at a certified mode. Those are one fact about the
+/// exit, not four independent fields: a result that claims convergence while
+/// naming a carrying block, or that names none while carrying no certificate,
+/// describes no state this solver can reach. Every exit therefore states its
+/// certificate once and reads the four from it.
+///
+/// This is a value and not an `Err` because a joint path that left without a
+/// certificate is a non-certifying inner mode AT THIS RHO, not invalid input:
+/// the outer optimizer rejects the ρ from the finite iterate returned here and
+/// keeps searching, and `fit_custom_family_fixed_log_lambdas` /
+/// `outer_efs_*` turn the same fact into their own typed refusal one level up.
+/// Raising it here instead would abort a fit for a single infeasible trial ρ.
+enum JointExitCertificate {
+    /// The projected KKT certificate held at the returned iterate.
+    Certified,
+    /// The path left the joint Newton loop without a certificate.
+    /// `carrying_block` is the block holding the largest unresolved residual,
+    /// from this exit's refusal report (gam#2943).
+    NonCertifying { carrying_block: Option<String> },
+}
+
+impl JointExitCertificate {
+    fn converged(&self) -> bool {
+        matches!(self, Self::Certified)
+    }
+
+    /// The block to report as carrying the exit's residual: a certified mode
+    /// has none by construction.
+    fn carrying_block(&self) -> Option<String> {
+        match self {
+            Self::Certified => None,
+            Self::NonCertifying { carrying_block } => carrying_block.clone(),
+        }
+    }
+
+    /// Whether this exit may carry the Laplace log-determinants, which
+    /// `BlockwiseInnerResult` defines only at a certified inner mode.
+    fn carries_laplace_artifacts(&self) -> bool {
+        self.converged()
+    }
+}
+
 pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
     context: ExactJointFitContext<'_, F>,
 ) -> Result<BlockwiseInnerResult, CustomFamilyError> {
@@ -3424,8 +3471,11 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         let dogleg_cauchy: Option<Array1<f64>> =
             if search_joint_active_set.is_none() && joint_spectrum.is_none() {
                 let mut p_sd = Array1::<f64>::zeros(total_p);
+                let metric_floor = crate::covariance::joint_metric_resolution_floor(
+                    joint_trust_metric_diag.view(),
+                );
                 for (i, (r, w)) in rhs.iter().zip(joint_trust_metric_diag.iter()).enumerate() {
-                    p_sd[i] = r / positive_joint_diagonal_entry(*w);
+                    p_sd[i] = r / positive_joint_diagonal_entry(*w, metric_floor);
                 }
                 let mut h_psd = Array1::<f64>::zeros(total_p);
                 let mut cauchy_penalty_scratch = Array1::<f64>::zeros(total_p);
@@ -6298,11 +6348,12 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         //     ≤ 50 % of g; the remainder is structurally outside the
         //     solver's range, i.e. it's a Lagrange multiplier of the
         //     active constraints, not a defect of the linear solve.
-        //   • `|actual − pred| / max(|pred|, …) ≤ 1e-3` — the local
-        //     quadratic Newton model agrees with the actual objective
-        //     change to roundoff, so the Hessian and gradient are
-        //     correct AT this β.  The "stuck" residual is not noise
-        //     in the linearisation; it's a real multiplier.
+        //   • `|actual − pred|` inside the rounding the two endpoint
+        //     evaluations carry between them — the local quadratic Newton
+        //     model agrees with the actual objective change to roundoff, so
+        //     the Hessian and gradient are correct AT this β.  The "stuck"
+        //     residual is not noise in the linearisation; it's a real
+        //     multiplier.
         //   • `|Δobjective| ≤ objective_tol` — the objective has
         //     ceased moving meaningfully.
         //   • `|δ|∞ ≤ step_tol` — the accepted feasible Newton step is
@@ -6330,6 +6381,24 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         if let Some(math) = last_joint_math.as_ref() {
             let linearized_rel = math.linearized_rel();
             let scalar_model_relerr = math.scalar_model_relative_error();
+            // The rounding the two endpoint evaluations can carry between them
+            // (gam#2959). It is the band the objective's numerical floor is read
+            // against below AND the band the local quadratic model's agreement
+            // with the realized change is read against, because `actual_reduction`
+            // is exactly that difference: one accumulation, formed once, so the
+            // two conditions cannot disagree about what this cycle resolved.
+            let accepted_beta: Vec<Array1<f64>> =
+                states.iter().map(|state| state.beta.clone()).collect();
+            let accepted_penalty_accumulation = penalty_roots.value(&accepted_beta).magnitude;
+            let objective_floor = ObjectiveAccumulation::between_endpoints(
+                total_joint_n,
+                penalty_entries,
+                [old_objective, lastobjective - new_phi],
+                [old_penalty_accumulation, accepted_penalty_accumulation],
+                [old_jeffreys.roundoff, new_jeffreys_roundoff],
+            )
+            .roundoff_ceiling();
+            let model_relerr_bound = math.model_agreement_relative_bound(objective_floor);
             let geometric_tail_bound = if geometric_tail_history.len() == GEOMETRIC_TAIL_WINDOW {
                 let values = geometric_tail_history.iter().copied().collect::<Vec<_>>();
                 let mut max_ratio = 0.0_f64;
@@ -6365,6 +6434,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 objective_change,
                 objective_tol,
                 step_tol,
+                objective_floor,
                 geometric_tail_bound,
                 residual,
                 residual_tol,
@@ -6508,17 +6578,6 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // at most `Σ|ℓ_i|` and the floor errs small, which only declines more.
                 // Where the floor is still loose, the step and exact-model arms carry
                 // the guarantee (`constrained_numerical_fixed_point_failures`).
-                let accepted_beta: Vec<Array1<f64>> =
-                    states.iter().map(|state| state.beta.clone()).collect();
-                let accepted_penalty_accumulation = penalty_roots.value(&accepted_beta).magnitude;
-                let objective_floor = ObjectiveAccumulation::between_endpoints(
-                    total_joint_n,
-                    penalty_entries,
-                    [old_objective, lastobjective - new_phi],
-                    [old_penalty_accumulation, accepted_penalty_accumulation],
-                    [old_jeffreys.roundoff, new_jeffreys_roundoff],
-                )
-                .roundoff_ceiling();
                 // `step_at_eps_floor` records whether the accepted step also reached
                 // its OWN machine-eps floor, used only to label the log line with
                 // which stationarity witness fired (strict eps step vs the gam#2358
@@ -6557,6 +6616,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         objective_change,
                         objective_floor,
                         scalar_model_relerr,
+                        model_relerr_bound,
                         accepted_step_inf,
                         step_tol,
                     );
@@ -7681,6 +7741,9 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         )?;
         let kkt_residual =
             require_projected_kkt_residual(kkt_residual, "joint-Newton converged exit")?;
+        // This branch is entered on the certificate and returns inside it, so it
+        // is the only exit of this function that carries one.
+        let certificate = JointExitCertificate::Certified;
         // Thread the cert tolerance + free subspace rank through to
         // the unified evaluator's certificate so the outer
         // optimiser's InnerStatus carrier sees honest numbers
@@ -7722,13 +7785,13 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             log_likelihood: current_log_likelihood,
             penalty_value,
             cycles: cycles_done,
-            converged,
+            converged: certificate.converged(),
             terminal_convergence_state,
             block_logdet_h,
             block_logdet_s,
             s_lambdas,
             joint_workspace: cached_joint_workspace.clone(),
-            terminal_carrying_block: None,
+            terminal_carrying_block: certificate.carrying_block(),
             kkt_residual: Some(kkt_residual),
             active_constraints,
             objective_state,
@@ -7783,6 +7846,12 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 last_joint_math.as_ref(),
             )
         }
+    };
+    // Everything below the certified exit above — which returns inside its own
+    // branch — left the joint Newton path without a certificate, so one value
+    // states that for both remaining exits.
+    let certificate = JointExitCertificate::NonCertifying {
+        carrying_block: exit_report.carrying_block_name(),
     };
     if cycles_done >= inner_max_cycles {
         if !converged {
@@ -7900,22 +7969,12 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             )
             .map(std::sync::Arc::new)
         };
-        let (block_logdet_h, block_logdet_s) =
-            if converged && product.requires_laplace_artifacts() {
-                let (h, s) = blockwise_logdet_terms_with_workspace(
-                    family,
-                    specs,
-                    &mut states,
-                    block_log_lambdas,
-                    options,
-                    cached_joint_workspace.clone(),
-                    None,
-                    active_constraints.as_deref(),
-                )?;
-                (Some(h), Some(s))
-            } else {
-                (None, None)
-            };
+        // A budget exit carries no certificate, so it carries no Laplace
+        // log-determinants either: the artifacts and the flag are read from the
+        // same value rather than recomputed from a condition that cannot hold.
+        // A budget exit carries no certificate, so it carries no Laplace
+        // log-determinants either; the certified exit returned above.
+        let (block_logdet_h, block_logdet_s): (Option<f64>, Option<f64>) = (None, None);
         // The joint score is reloaded immediately after every accepted
         // step and beta is restored before every rejected one, so the
         // vector held here belongs to the states being returned. Bind
@@ -7940,17 +7999,13 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             log_likelihood: current_log_likelihood,
             penalty_value,
             cycles: cycles_done,
-            converged,
+            converged: certificate.converged(),
             terminal_convergence_state,
             block_logdet_h,
             block_logdet_s,
             s_lambdas,
             joint_workspace: cached_joint_workspace.clone(),
-            terminal_carrying_block: if converged {
-                None
-            } else {
-                exit_report.carrying_block_name()
-            },
+            terminal_carrying_block: certificate.carrying_block(),
             kkt_residual: None,
             active_constraints,
             objective_state,
@@ -8015,13 +8070,13 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             log_likelihood: current_log_likelihood,
             penalty_value,
             cycles: cycles_done,
-            converged: false,
+            converged: certificate.converged(),
             terminal_convergence_state,
             block_logdet_h: None,
             block_logdet_s: None,
             s_lambdas,
             joint_workspace: cached_joint_workspace.clone(),
-            terminal_carrying_block: exit_report.carrying_block_name(),
+            terminal_carrying_block: certificate.carrying_block(),
             kkt_residual: None,
             active_constraints,
             objective_state,

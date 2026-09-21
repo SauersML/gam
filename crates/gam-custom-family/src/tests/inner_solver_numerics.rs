@@ -4491,7 +4491,8 @@ pub(crate) fn projected_stationarity_inf_norm_respects_kkt_multipliers() {
 ///        unreduced component lives in the constraint-active subspace
 ///        and IS a Lagrange multiplier, not a defect of the solve.
 ///
-///   2. `scalar_model_relative_error()` ≤ 1e-3
+///   2. `|actual − predicted|` inside the rounding the two objective
+///      evaluations carry between them
 ///      — the local quadratic Newton model agrees with the observed
 ///        objective change to roundoff, proving the Hessian+gradient
 ///        are correct at this β.  Rules out genuine model mismatch
@@ -4523,10 +4524,14 @@ pub(crate) fn joint_newton_math_constrained_stationary_signature_matches_aou_fai
         linearized_rel,
     );
     // (2) Scalar Newton model is correct to roundoff — Hessian+gradient OK.
+    // The realized and predicted reductions are the same number here, so the
+    // model agrees with the evaluations exactly: the band it is read against is
+    // zero and the arm still passes.
     let relerr = math.scalar_model_relative_error();
     assert!(
-        relerr <= 1e-3,
-        "large-scale exit has scalar_model_relerr = {:.3e}, must be <= 1e-3 \
+        relerr <= math.model_agreement_relative_bound(0.0),
+        "large-scale exit has scalar_model_relerr = {:.3e}, must agree with the realized \
+             reduction to the rounding of the evaluations \
              (model agrees with actual ⇒ residual is a real multiplier)",
         relerr,
     );
@@ -4568,7 +4573,7 @@ pub(crate) fn constrained_stationary_certificate_keeps_iterating_when_step_is_la
     // seed as soon as objective change touched tolerance.
     let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
     assert!(linearized_rel >= 0.5);
-    assert!(math.scalar_model_relative_error() <= 1e-3);
+    assert!(math.scalar_model_relative_error() <= math.model_agreement_relative_bound(0.0));
     assert!(objective_change <= objective_tol);
     assert!(math.step_inf > step_tol);
 
@@ -4581,6 +4586,7 @@ pub(crate) fn constrained_stationary_certificate_keeps_iterating_when_step_is_la
             objective_change,
             objective_tol,
             step_tol,
+            0.0,
             None,
             residual,
             residual_tol,
@@ -4648,6 +4654,7 @@ pub(crate) fn constrained_stationary_certificate_refuses_only_when_step_is_exhau
             objective_change,
             objective_tol,
             step_tol,
+            0.0,
             None,
             residual_tol,
             residual_tol,
@@ -4660,6 +4667,7 @@ pub(crate) fn constrained_stationary_certificate_refuses_only_when_step_is_exhau
             objective_change,
             objective_tol,
             step_tol,
+            0.0,
             None,
             // Still within 4x: a residual a hair above 1x must remain
             // accepted, because the active-projected residual genuinely
@@ -4678,6 +4686,7 @@ pub(crate) fn constrained_stationary_certificate_refuses_only_when_step_is_exhau
             objective_change,
             objective_tol,
             step_tol,
+            0.0,
             None,
             4.0 * residual_tol + 1.0e-6,
             residual_tol,
@@ -4705,7 +4714,7 @@ pub(crate) fn joint_newton_math_unconstrained_progress_does_not_match_certificat
     };
     assert_eq!(
         constrained_stationary_certificate_decision(
-            &math, 1.0e-12, 1.0e-8, 1.0e-8, None, 1.0e-12, 1.0e-8,
+            &math, 1.0e-12, 1.0e-8, 1.0e-8, 0.0, None, 1.0e-12, 1.0e-8,
         ),
         ConstrainedStationaryCertificate::NotCandidate,
         "objective and step exhaustion must not certify a Newton step whose linearized residual is genuinely falling"

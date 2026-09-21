@@ -147,7 +147,8 @@ pub(crate) fn apply_joint_block_penalty_into(
 /// Penalty-aware Jacobi preconditioner used by every matrix-free PCG path
 /// in the inner coefficient solve.
 ///
-/// Builds `|diag(H)| + Σ_k gershgorin(S_k(λ)) + ridge`, clamped at 1e-10, where
+/// Builds `|diag(H)| + Σ_k gershgorin(S_k(λ)) + ridge`, floored at the assembled
+/// diagonal's own resolution ([`joint_metric_resolution_floor`]), where
 /// `gershgorin(S)[i] = Σ_j |S[i,j]|` is the absolute row-sum (Gershgorin
 /// radius) of each penalty block. This strictly dominates `diag(S)` for any
 /// penalty with off-diagonal mass — the high-order difference / thin-plate
@@ -158,12 +159,12 @@ pub(crate) fn apply_joint_block_penalty_into(
 ///
 /// The absolute likelihood diagonal is essential for exact-Newton families:
 /// their observed Hessian may be indefinite away from the mode.  A negative
-/// diagonal is real curvature scale, not an absent direction.  Flooring it to
-/// `1e-10` makes the trust metric nearly singular, inflates the corresponding
-/// whitened eigenvalue, and can misclassify a resolvable direction as numerical
-/// null space.  `|diag(H)|` is the standard positive Jacobi scale for an
-/// indefinite operator; for Fisher/PIRLS Hessians (whose diagonal is already
-/// non-negative) it is exactly unchanged.
+/// diagonal is real curvature scale, not an absent direction.  Flooring it at a
+/// scale unrelated to the metric makes the trust metric nearly singular,
+/// inflates the corresponding whitened eigenvalue, and can misclassify a
+/// resolvable direction as numerical null space.  `|diag(H)|` is the standard
+/// positive Jacobi scale for an indefinite operator; for Fisher/PIRLS Hessians
+/// (whose diagonal is already non-negative) it is exactly unchanged.
 ///
 /// Why the row-sum and not just the diagonal: a plain Jacobi (diagonal-only)
 /// preconditioner collapses to `diag(S_λ)` exactly in the saturated-softmax
@@ -186,11 +187,44 @@ pub(crate) fn apply_joint_block_penalty_into(
 /// rescale every CG iteration: PCG applies `M^{-1}` to residuals directly.
 /// Do not square-root or trace-normalize these entries, and do not apply a
 /// second preconditioner-side rescale to the returned Newton step.
-pub(crate) fn positive_joint_diagonal_entry(value: f64) -> f64 {
-    if value.is_finite() && value > 1.0e-10 {
+pub(crate) fn positive_joint_diagonal_entry(value: f64, resolution_floor: f64) -> f64 {
+    if value.is_finite() && value > resolution_floor {
         value
     } else {
-        1.0e-10
+        resolution_floor
+    }
+}
+
+/// The scale below which an entry of an assembled joint metric diagonal is not
+/// resolved from zero, read off that diagonal.
+///
+/// The metric is the diagonal of a symmetric `p × p` operator assembled from
+/// non-negative pieces, so its entries ARE its spectrum, and a symmetric
+/// decomposition resolves that spectrum only to `p·ε·‖D‖₂`
+/// (`gam_linalg::roundoff::symmetric_spectrum_rounding_band`, written here as
+/// `2p·u·‖D‖₂` from the same unit roundoff because the operator norm is taken
+/// over the FINITE entries alone — a non-finite entry is not a scale and cannot
+/// enter a norm). An entry at or below that band is indistinguishable from zero
+/// in the arithmetic that produced it, so the band is the scale it gets, and the
+/// metric's condition number is capped at `1/(p·ε)`.
+///
+/// The band is covariant with the metric — `D ↦ cD` scales it by `c` — which is
+/// exactly what the fixed `1e-10` floor this replaces was not: on a metric of
+/// norm `1e6` that floor left a `1e16` conditioning, and on one of norm `1e-6`
+/// it erased every real scale difference in the block.
+///
+/// A diagonal with no finite positive entry carries no scale at all: there is
+/// nothing to whiten with, and the metric of a space with no curvature
+/// information is the Euclidean one, `D = I`.
+pub(crate) fn joint_metric_resolution_floor(diagonal: ArrayView1<'_, f64>) -> f64 {
+    let spectral_radius = diagonal
+        .iter()
+        .filter(|value| value.is_finite())
+        .fold(0.0_f64, |worst, value| worst.max(value.abs()));
+    if spectral_radius > 0.0 {
+        2.0 * diagonal.len() as f64 * gam_linalg::roundoff::UNIT_ROUNDOFF * spectral_radius
+    } else {
+        1.0
     }
 }
 
@@ -236,7 +270,8 @@ pub(crate) fn joint_penalty_preconditioner_diag(
     {
         bundle.add_diag(&mut diag);
     }
-    diag.mapv(positive_joint_diagonal_entry)
+    let floor = joint_metric_resolution_floor(diag.view());
+    diag.mapv(|value| positive_joint_diagonal_entry(value, floor))
 }
 
 pub(crate) fn log_joint_pcg_diagnostics(
