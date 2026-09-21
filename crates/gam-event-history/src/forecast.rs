@@ -2,6 +2,32 @@
 //! forecast, and the predictive probability integral transform, all
 //! expectations under the latent state.
 //!
+//! # Everything here is CONDITIONAL on the fitted parameter state
+//!
+//! The expectations this module takes integrate the subject's LATENT state
+//! and nothing else. The global parameters — the baseline coefficients, the
+//! canonical loadings and the atom rates — enter at their fitted values, read
+//! once from the fit, and the fit's posterior covariance of them never
+//! reaches a probability. So every quantity below is `P(· | data, θ̂)`, a
+//! plug-in conditional prediction, and NOT the posterior-predictive
+//! `E_θ[P(· | data, θ)]` that `SPEC.md:3` makes the default.
+//!
+//! The two differ because the probabilities are nonlinear in `θ`: averaging
+//! the parameters and then evaluating is not evaluating and then averaging.
+//! The gap is largest for sparse outcomes and weakly identified effects. It
+//! is a real difference in the returned number, not a caveat about precision,
+//! and no error field reported here bounds it — the refinement errors below
+//! measure the quadratures at the fitted `θ̂`, on the assumption that `θ̂` is
+//! the parameter.
+//!
+//! This labelling is what `SPEC.md:25` requires of a conditional prediction
+//! that is kept. Averaging over a controlled approximation of the global
+//! parameter posterior — each state carrying its own matching
+//! [`ReferenceGrid`](crate::ReferenceGrid) reference evolution and
+//! its own history-conditioned latent law, with the approximation's
+//! resolution reported and checked on the returned quantity — is gam#2964 and
+//! is not in the tree.
+//!
 //! A forecast filters the subject's own history into its latent state and
 //! then integrates the killed process forward: the survival to a horizon is
 //! `E[exp(−∫ Λ_T(t) dt)]` with `Λ_T` the total intensity of the terminal
@@ -159,6 +185,11 @@ pub struct HistoryForecastRequest<'a> {
 /// fired, and the expected count of every mark (its cumulative incidence
 /// when terminal, its first-occurrence probability when once-only), each
 /// with the numerical error its integration checked.
+///
+/// Every probability here is CONDITIONAL on the fitted parameter state
+/// `θ̂` — see the module documentation. The error fields bound the window's
+/// quadratures at that `θ̂`; none of them bounds the distance to the
+/// posterior-predictive probability (gam#2964).
 #[derive(Clone, Debug)]
 pub struct Forecast {
     pub horizons: Vec<f64>,
@@ -290,6 +321,10 @@ pub fn baseline_log_rates(fit: &EventHistoryFit, rows: ArrayView2<'_, f64>) -> R
 /// whole history. This is the quantity a discovery analysis wants — with its
 /// covariance, so that a fitted path is propagated as the uncertain object
 /// it is rather than read as observed.
+///
+/// The covariance is the LATENT state's, CONDITIONAL on the fitted parameter
+/// state: it is the spread of `z` given the history at `θ̂`, and it does not
+/// carry the fit's own uncertainty about `θ` (see the module documentation).
 #[derive(Clone, Debug)]
 pub struct SmoothedLatentState {
     /// The node times, entry to exit.
@@ -900,7 +935,8 @@ fn future_table(
     Ok((table, segments))
 }
 
-/// Forecast one training subject beyond its observed exit.
+/// Forecast one training subject beyond its observed exit, CONDITIONAL on
+/// the fitted parameter state (see the module documentation).
 pub fn forecast(
     fit: &EventHistoryFit,
     cohort: &EventHistoryCohort,
@@ -923,6 +959,8 @@ pub fn forecast(
 /// own covariate rows, which must be laid out in the cohort's columns and
 /// level codes. The training subjects' rows are never consulted, so a
 /// serving artifact needs the fit, not the cohort's histories.
+///
+/// CONDITIONAL on the fitted parameter state (see the module documentation).
 pub fn forecast_history(
     fit: &EventHistoryFit,
     cohort: &EventHistoryCohort,
@@ -1011,7 +1049,8 @@ fn forecast_on_table(
     })
 }
 
-/// Forecast a subject with no observed history from covariate values alone.
+/// Forecast a subject with no observed history from covariate values alone,
+/// CONDITIONAL on the fitted parameter state (see the module documentation).
 pub fn population_forecast(
     fit: &EventHistoryFit,
     cohort: &EventHistoryCohort,
@@ -1074,6 +1113,11 @@ pub fn population_forecast(
 /// one per event, and one for the censored tail when the follow-up did not
 /// end with an event. The event spells carry the predictive mark
 /// probabilities at the event.
+///
+/// "Predictive" here means under the latent state, CONDITIONAL on the fitted
+/// parameter state: a PIT computed at `θ̂` is uniform when the model AND its
+/// parameters are right, so a departure from uniformity does not separate a
+/// wrong model from parameter uncertainty (see the module documentation).
 pub fn predictive_pit(
     fit: &EventHistoryFit,
     cohort: &EventHistoryCohort,
