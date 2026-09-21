@@ -1996,15 +1996,53 @@ impl ConstructiveQuadratic {
         if frame.iter().any(|value| !value.is_finite()) {
             crate::bail_invalid_basis!("{context}: structural null frame is not finite");
         }
-        // Orthonormality is what makes the congruence transport below exact.
+        // Orthonormality is what makes the congruence transport below exact. How
+        // far a frame that IS orthonormal may read off `FᵀF = I` is not a taste
+        // parameter; it is the sum of three bands, each read off the frame:
+        //
+        //  * the frame was orthogonalized in binary64, so a column's residual
+        //    against the other `ncols − 1` directions sits inside
+        //    `gram_schmidt_residual_band` at unit norm — that band covers a
+        //    reorthogonalized Gram-Schmidt append and bounds the shorter
+        //    Householder-QR residual;
+        //  * a column normalized in binary64 reads `‖f‖² = 1` only within
+        //    `unit_normalization_band(rows)`;
+        //  * forming `FᵀF` is a `rows`-term inner product per entry, within
+        //    `accumulation_band(rows, Σ|F_ir·F_ic|)` of the exact Gram, and
+        //    Cauchy-Schwarz bounds that magnitude sum by `‖f_r‖·‖f_c‖`.
+        //
+        // The last term is per-entry and read at the columns' own scale, so a
+        // frame that is not normalized at all is judged at its own magnitude
+        // rather than at an assumed unit one.
         let gram = fast_ata(&frame);
+        let rows = frame.nrows();
+        let column_energy: Vec<f64> = (0..frame.ncols())
+            .map(|col| {
+                frame
+                    .column(col)
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f64>()
+            })
+            .collect();
+        let construction_band = gam_math::roundoff::gram_schmidt_residual_band(
+            gam_math::roundoff::GRAM_SCHMIDT_PASSES,
+            frame.ncols().saturating_sub(1),
+            rows,
+            1.0,
+        ) + gam_math::roundoff::unit_normalization_band(rows);
         for row in 0..gram.nrows() {
             for col in 0..gram.ncols() {
                 let expected = if row == col { 1.0 } else { 0.0 };
-                if (gram[[row, col]] - expected).abs() > 1e-8 {
+                let band = construction_band
+                    + gam_linalg::roundoff::accumulation_band(
+                        rows,
+                        (column_energy[row] * column_energy[col]).sqrt(),
+                    );
+                if (gram[[row, col]] - expected).abs() > band {
                     crate::bail_invalid_basis!(
                         "{context}: structural null frame is not orthonormal \
-                         (FᵀF deviates by {:.3e} at [{row},{col}])",
+                         (FᵀF deviates by {:.3e} at [{row},{col}], band {band:.3e})",
                         (gram[[row, col]] - expected).abs()
                     );
                 }
@@ -2036,7 +2074,17 @@ impl ConstructiveQuadratic {
             .filter(|(row, _)| *row < lo || *row >= hi)
             .flat_map(|(_, row)| row.to_vec())
             .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-        if outside > 1e-12 {
+        // A declared frame's columns are unit vectors orthogonalized in binary64,
+        // so a coordinate outside the block is rounding only up to the residual
+        // that orthogonalization leaves on a unit vector. Above it, the frame
+        // genuinely has support the block does not own.
+        let support_band = gam_math::roundoff::gram_schmidt_residual_band(
+            gam_math::roundoff::GRAM_SCHMIDT_PASSES,
+            frame.ncols(),
+            frame.nrows(),
+            1.0,
+        );
+        if outside > support_band {
             return None;
         }
         Some(frame.slice(s![lo..hi, ..]).to_owned())

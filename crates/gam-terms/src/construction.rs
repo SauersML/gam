@@ -2937,7 +2937,25 @@ pub fn stable_reparameterizationwith_invariant(
     );
 
     {
-        // Structural check: transformed S must not leak into declared null coordinates.
+        // `s_truncated = EᵀE` is exactly zero on the declared null coordinates:
+        // every row of `E` is a penalty root already restricted to the penalized
+        // range. What binary64 leaves there is the Gram's own formation — entry
+        // `(i, j)` is an `e_rows`-term inner product of two columns of `E`, so it
+        // lies within `γ_{e_rows}·Σ_r |E_ri·E_rj|` of the exact zero (Higham,
+        // *ASNA* 2nd ed., §3.1), and Cauchy-Schwarz bounds that magnitude sum by
+        // `‖e_i‖·‖e_j‖ ≤ ‖E‖_F²`. The band therefore scales with the penalty's own
+        // magnitude, which a fixed number cannot: at `λ ~ 1e12` the roots carry
+        // `√λ` and a leakage of `1e-9` is rounding, while at unit scale the same
+        // number is a penalty acting on a coordinate declared null.
+        let e_rows = e_transformed_mat.nrows();
+        let mut e_frobenius_squared = 0.0_f64;
+        for r in 0..e_rows {
+            for c in 0..p {
+                let entry = e_transformed_mat[(r, c)];
+                e_frobenius_squared += entry * entry;
+            }
+        }
+        let leakage_band = gam_linalg::roundoff::accumulation_band(e_rows, e_frobenius_squared);
         let mut max_null_diag = 0.0_f64;
         let mut max_null_offdiag = 0.0_f64;
         for i in structural_rank..p {
@@ -2948,10 +2966,12 @@ pub fn stable_reparameterizationwith_invariant(
                 }
             }
         }
-        assert!(
-            max_null_diag <= 1e-10 && max_null_offdiag <= 1e-10,
-            "null-space leakage in transformed penalty: max_null_diag={max_null_diag:.3e}, max_null_offdiag={max_null_offdiag:.3e}"
-        );
+        if max_null_diag > leakage_band || max_null_offdiag > leakage_band {
+            return Err(EstimationError::InvalidInput(format!(
+                "null-space leakage in transformed penalty: max_null_diag={max_null_diag:.3e}, \
+                 max_null_offdiag={max_null_offdiag:.3e}, Gram formation band {leakage_band:.3e}"
+            )));
+        }
     }
 
     let qs_array = mat_to_array(&qs);

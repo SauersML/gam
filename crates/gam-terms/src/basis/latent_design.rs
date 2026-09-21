@@ -49,12 +49,21 @@ pub fn radial_input_location_jet(
                 r2 += delta * delta;
             }
             let r = r2.sqrt();
-            if r <= 1.0e-12 {
+            // `∂φ(r)/∂t_a = φ'(r)·(t_a − c_a)/r` exists at every separation and is
+            // undefined only where the point IS the centre — exactly `r == 0`,
+            // because `r²` is a sum of squares that vanishes only when every
+            // component does. There is no separation below which the jet stops
+            // existing, so there is no threshold here.
+            //
+            // The unit component `(t_a − c_a)/r` is formed FIRST: it lies in
+            // `[−1, 1]` by construction, so the product cannot overflow, whereas
+            // the former `φ'(r)/r` prefactor overflows at a subnormal `r` and then
+            // multiplies an infinity by a subnormal component.
+            if !(r > 0.0) {
                 continue;
             }
-            let scale = phi_r[[n, k]] / r;
             for a in 0..t_mat.ncols() {
-                out[[n, k, a]] = scale * (t_mat[[n, a]] - centers[[k, a]]);
+                out[[n, k, a]] = phi_r[[n, k]] * ((t_mat[[n, a]] - centers[[k, a]]) / r);
             }
         }
     }

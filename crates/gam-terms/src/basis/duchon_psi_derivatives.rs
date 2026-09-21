@@ -1220,13 +1220,19 @@ pub(crate) fn duchon_phi_even_derivative_collision(
     let total_log = total_log.value();
     let total_log_abs_scale = total_log_abs_scale.value();
 
-    // The ln(r) coefficients should cancel to zero (guaranteed by the PFD
-    // identity when 2(p+s) > d+2j).  Check this as a sanity guard.
-    let log_cancel_tol = 1e-10 * total_log_abs_scale.max(total_pure.abs()).max(1e-30);
-    if total_log.abs() > log_cancel_tol {
+    // The `ln r` coefficients cancel exactly (the PFD identity, whenever
+    // 2(p+s) > d+2j), so `total_log` sums to a real zero and carries only its own
+    // summation error. `CompensatedSum` is Kahan-Babuska-Neumaier, whose forward
+    // error is `(2 + k)·u·Σ|terms|` independently of the term count (Higham,
+    // *ASNA* 2nd ed., §4.3), with one product per summand here;
+    // `total_log_abs_scale` is exactly that `Σ|terms|`. A residue above the band
+    // is a failure of the identity rather than rounding, and the band is read off
+    // the log terms rather than off the pure part, a different quantity.
+    let log_cancel_band = gam_linalg::roundoff::compensated_band(1, total_log_abs_scale);
+    if total_log.abs() > log_cancel_band {
         crate::bail_invalid_basis!(
             "Duchon Taylor a_{} log-coefficient did not cancel: log={total_log:.6e}, pure={total_pure:.6e}; \
-             log_abs_scale={total_log_abs_scale:.6e}, tol={log_cancel_tol:.6e}; p={p_order}, s={s_order}, d={k_dim}",
+             log_abs_scale={total_log_abs_scale:.6e}, band={log_cancel_band:.6e}; p={p_order}, s={s_order}, d={k_dim}",
             2 * j
         );
     }
@@ -1299,12 +1305,16 @@ pub(crate) fn duchon_phi_even_derivative_collision_psi_triplet(
         log_value.add(b_n * log.0);
         log_psi.add(beta_n * b_n * log.0 + b_n * log.1);
         log_psi_psi.add(beta_n * beta_n * b_n * log.0 + 2.0 * beta_n * b_n * log.1 + b_n * log.2);
-        let log_v = b_n * log.0;
-        let log_p = beta_n * b_n * log.0 + b_n * log.1;
-        let log_pp = beta_n * beta_n * b_n * log.0 + 2.0 * beta_n * b_n * log.1 + b_n * log.2;
-        log_abs_scale.add(log_v.abs());
-        log_abs_scale.add(log_p.abs());
-        log_abs_scale.add(log_pp.abs());
+        // Every PRODUCT the three sums accumulate, in absolute value. A Matern
+        // block's ψ and ψψ summands are themselves two- and three-term sums, so
+        // charging only the composed summand would miss the cancellation inside
+        // it and understate the band.
+        log_abs_scale.add((b_n * log.0).abs());
+        log_abs_scale.add((beta_n * b_n * log.0).abs());
+        log_abs_scale.add((b_n * log.1).abs());
+        log_abs_scale.add((beta_n * beta_n * b_n * log.0).abs());
+        log_abs_scale.add((2.0 * beta_n * b_n * log.1).abs());
+        log_abs_scale.add((b_n * log.2).abs());
     }
 
     let value = value.value();
@@ -1314,13 +1324,19 @@ pub(crate) fn duchon_phi_even_derivative_collision_psi_triplet(
     let log_psi = log_psi.value();
     let log_psi_psi = log_psi_psi.value();
     let log_abs_scale = log_abs_scale.value();
-    let scale = value.abs().max(psi.abs()).max(psi_psi.abs()).max(1e-30);
-    let log_cancel_tol = 1e-10 * log_abs_scale.max(scale);
-    if log_value.abs().max(log_psi.abs()).max(log_psi_psi.abs()) > log_cancel_tol {
+    // All three `ln r` coefficient sums cancel exactly, so each carries only its
+    // Kahan-Babuska-Neumaier forward error `(2 + k)·u·Σ|terms|` (Higham, *ASNA*
+    // 2nd ed., §4.3). The longest summand is
+    // `β²·b_n·log.0 + 2·β·b_n·log.1 + b_n·log.2`: three products and two
+    // additions, so `k = 5`. `log_abs_scale` is the magnitude sum of every one of
+    // those products, which majorizes each of the three sums' own `Σ|terms|`, so
+    // one band covers all three.
+    let log_cancel_band = gam_linalg::roundoff::compensated_band(5, log_abs_scale);
+    if log_value.abs().max(log_psi.abs()).max(log_psi_psi.abs()) > log_cancel_band {
         crate::bail_invalid_basis!(
             "Duchon Taylor a_{} log-coefficient derivative did not cancel: \
              log=({log_value:.6e}, {log_psi:.6e}, {log_psi_psi:.6e}), \
-             value=({value:.6e}, {psi:.6e}, {psi_psi:.6e}), log_abs_scale={log_abs_scale:.6e}, tol={log_cancel_tol:.6e}; \
+             value=({value:.6e}, {psi:.6e}, {psi_psi:.6e}), log_abs_scale={log_abs_scale:.6e}, band={log_cancel_band:.6e}; \
              p={p_order}, s={s_order}, d={k_dim}",
             2 * j
         );

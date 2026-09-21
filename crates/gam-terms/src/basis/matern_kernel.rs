@@ -2654,10 +2654,29 @@ pub fn closed_form_anisotropic_pair_block_pure(
     symmetric_matrix_from_lower_values(k, &values)
 }
 
-/// Median off-diagonal anisotropic lag scaled by 1e-6, used for
-/// regularizing self-pair R=0 evaluations in pure-Duchon (κ=0) closed-form
-/// penalties. Matches the magnitude used by hybrid κ>0 collocation builders
-/// where the ε-regularization is implicit in the Matérn kernel finiteness.
+/// The lag at which a pure-Duchon (κ = 0) self-pair is read when its zero-lag
+/// integral has no closed form.
+///
+/// `closed_form_penalty::self_pair_bundle` supplies the exact diagonal wherever
+/// the self-pair integral converges, and
+/// `closed_form_anisotropic_pair_value_with_powers` reads it there. Where it does
+/// not converge, the pointwise radial chain is singular at `R = 0` and the
+/// diagonal is a CONVENTION — but the convention is fixed by the arithmetic
+/// rather than chosen. Every lag in the block is formed by one expression,
+/// `R² = Σ_a b_a·δ_a²` with `b_a = exp(−2η_a)`, a `d`-term accumulation whose
+/// forward error is `γ_d·Σ_a b_a·δ_a²` (Higham, *ASNA* 2nd ed., §3.1). At the
+/// block's widest separation that error is
+/// `gam_linalg::roundoff::accumulation_band(d, R²_max)`, and its square root is
+/// the smallest `R` the formula that produced every off-diagonal entry still
+/// resolves from zero. Reading the diagonal there places it as close to the
+/// singularity as binary64 can place a lag that is still a lag, and it is
+/// scale-covariant: rescaling the centres moves the diagonal's lag by the same
+/// factor as every off-diagonal lag.
+///
+/// A centre set with no separation at all (`k <= 1`, or every centre identical)
+/// has no lag scale. The band is then `0`, the pair kernel is read at its
+/// singularity, and the non-finite penalty that produces is refused downstream
+/// rather than handed an invented separation.
 pub(crate) fn pure_duchon_diagonal_epsilon(
     centers: ArrayView2<'_, f64>,
     eta_log_scales: &[f64],
@@ -2665,9 +2684,9 @@ pub(crate) fn pure_duchon_diagonal_epsilon(
     let k = centers.nrows();
     let d = centers.ncols();
     if k <= 1 || d == 0 {
-        return 1e-12;
+        return 0.0;
     }
-    let mut lags = Vec::with_capacity(k * (k - 1) / 2);
+    let mut widest_squared_lag = 0.0_f64;
     for i in 0..k {
         for j in 0..i {
             let mut acc = 0.0_f64;
@@ -2676,18 +2695,10 @@ pub(crate) fn pure_duchon_diagonal_epsilon(
                 let b = (-2.0 * eta_log_scales[axis]).exp();
                 acc += b * delta * delta;
             }
-            let r = acc.sqrt();
-            if r > 0.0 {
-                lags.push(r);
-            }
+            widest_squared_lag = widest_squared_lag.max(acc);
         }
     }
-    if lags.is_empty() {
-        return 1e-12;
-    }
-    lags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = lags[lags.len() / 2];
-    (median * 1e-6).max(1e-12)
+    gam_linalg::roundoff::accumulation_band(d, widest_squared_lag).sqrt()
 }
 
 /// The pair-kernel representative a Gram restricted by `kernel_nullspace` may use.

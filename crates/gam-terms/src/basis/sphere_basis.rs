@@ -2262,7 +2262,17 @@ pub(crate) fn build_duchon_operator_penalty_psi_derivatives_in_directions(
                         if !need_d1 && !need_d2 {
                             continue;
                         }
-                        if r > 1e-10 {
+                        // The pointwise radial chain here and the collision
+                        // limit in the `else` arm are the two branches of ONE
+                        // function: the chain is the kernel at a separation, the
+                        // limit is its exact value at no separation. A pair is at
+                        // the collision exactly when the collocation point IS the
+                        // centre, which is `r == 0` — `r` is a norm of coordinate
+                        // differences and vanishes only when every difference
+                        // does. Any positive `r` is a real separation with a
+                        // nonzero first derivative, so routing it to the
+                        // zero-separation limit drops a contribution that exists.
+                        if r > 0.0 {
                             let jets =
                                 duchon_radial_jets(r, length_scale, p_order, s_order, d, &coeffs)?;
                             let q = jets.q;

@@ -2099,6 +2099,9 @@ pub(crate) fn duchon_hybrid_kernel_collision_value(
     let kappa = duchon_inverse_length_scale(length_scale, "Duchon hybrid collision value")?;
     let mut pure = CompensatedSum::default();
     let mut log_part = CompensatedSum::default();
+    // The magnitude sum of exactly the terms `log_part` accumulates: the
+    // quantity that bands its forward error below.
+    let mut log_abs_scale = CompensatedSum::default();
     for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
         if a_m == 0.0 {
             continue;
@@ -2106,6 +2109,7 @@ pub(crate) fn duchon_hybrid_kernel_collision_value(
         let (block_pure, block_log) = duchon_polyharmonic_block_taylor_r2j(m, k_dim, 0);
         pure.add(a_m * block_pure);
         log_part.add(a_m * block_log);
+        log_abs_scale.add((a_m * block_log).abs());
     }
     for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
         if b_n == 0.0 {
@@ -2114,12 +2118,22 @@ pub(crate) fn duchon_hybrid_kernel_collision_value(
         let (block_pure, block_log) = duchon_matern_block_taylor_r2j(kappa, n, k_dim, 0);
         pure.add(b_n * block_pure);
         log_part.add(b_n * block_log);
+        log_abs_scale.add((b_n * block_log).abs());
     }
     let value = pure.value();
     let log_value = log_part.value();
-    if log_value.abs() > 1e-8 * value.abs().max(1e-30) {
+    // The partial-fraction identity cancels the `ln r` coefficients in exact
+    // arithmetic, so `log_part` sums to a real zero and holds nothing but its
+    // own summation error. `CompensatedSum` is a Kahan-Babuska-Neumaier sum,
+    // whose forward error is `(2 + k)·u·Σ|terms|` with NO dependence on the term
+    // count (Higham, *ASNA* 2nd ed., §4.3); each summand here costs one product
+    // to form, so `k = 1`. The band is denominated in the log terms' own
+    // magnitudes: the pure part is a different quantity and is free to be zero
+    // where the log terms are not.
+    let log_cancel_band = gam_linalg::roundoff::compensated_band(1, log_abs_scale.value());
+    if log_value.abs() > log_cancel_band {
         crate::bail_invalid_basis!(
-            "Duchon hybrid diagonal log terms did not cancel: log={log_value:.6e}, value={value:.6e}; p={p_order}, s={s_order}, d={k_dim}"
+            "Duchon hybrid diagonal log terms did not cancel: log={log_value:.6e}, band={log_cancel_band:.6e}, value={value:.6e}; p={p_order}, s={s_order}, d={k_dim}"
         );
     }
     if !value.is_finite() {
