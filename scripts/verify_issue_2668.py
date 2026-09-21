@@ -7,9 +7,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import time
+import tomllib
 
 
 # Each row names the test binary it lives in. #2899 (5f1c8e4d80) moved rows 5 and 18
@@ -39,15 +41,68 @@ def sha256(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def bound_seconds(timeout, where):
+    """`slow-timeout` as whole seconds: nextest kills at period x terminate-after."""
+    if not (isinstance(timeout, dict) and "period" in timeout and "terminate-after" in timeout):
+        raise SystemExit(
+            f"{where}: slow-timeout {timeout!r} has no terminate-after, so nextest never kills there"
+        )
+    period = re.fullmatch(r"(\d+)s", timeout["period"])
+    if period is None:
+        raise SystemExit(f"{where}: period {timeout['period']!r} is not a whole number of seconds")
+    return int(period.group(1)) * int(timeout["terminate-after"])
+
+
+def declared_bounds(root):
+    """The per-test wall-clock bound this repository declares, and its per-test overrides.
+
+    THE BOUND IS NOT THIS SCRIPT'S TO CHOOSE (#2668). `.config/nextest.toml`'s
+    `[profile.default]` is the one place the repository states how long a single
+    `#[test]` may run before it is a hang, and it states the derivation there: the
+    slowest legitimate test is a REML/PIRLS or joint-Newton solve, or a
+    reference-comparison test shelling out to R, and the period is set to clear
+    those with margin while still terminating an infinite solver loop. Every
+    nextest route inherits it. This script used to carry its own `--timeout`,
+    defaulting to 60 s — a tenth of the declared bound, invented here, and
+    nowhere derived. It decided the issue's ACCEPTANCE: rows 29 and 30 were
+    reported `timeout` rather than passed or failed, so `{"passed": 30}` was
+    unreachable whatever the contracts did. One quantity, one declaration: the
+    bound is read from the same file, by the same rule the reference-quality
+    workflow reads it with, including the `[[profile.default.overrides]]` a test
+    name matches. An override this reader cannot evaluate refuses the run rather
+    than applying a bound nextest would not.
+
+    A bound is still a HARNESS SAFETY NET and never a verdict: a row that trips
+    it is recorded `timeout`, which is not a pass, exactly as before.
+    """
+    with (root / ".config/nextest.toml").open("rb") as handle:
+        profiles = tomllib.load(handle)["profile"]
+    default = bound_seconds(profiles["default"]["slow-timeout"], "profile.default")
+    overrides = []
+    for index, override in enumerate(profiles["default"].get("overrides", [])):
+        if "slow-timeout" not in override:
+            continue
+        where = f"profile.default.overrides[{index}]"
+        pattern = re.fullmatch(r"test\(/(.*)/\)", override["filter"])
+        if pattern is None:
+            raise SystemExit(f"{where}: filter {override['filter']!r} is not a test(/regex/) filter")
+        overrides.append((re.compile(pattern.group(1)), bound_seconds(override["slow-timeout"], where)))
+    return default, overrides
+
+
+def bound_for(test, default, overrides):
+    return next((seconds for regex, seconds in overrides if regex.search(test)), default)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
     parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--timeout", type=float, default=60.0)
     args = parser.parse_args()
-    if args.workers < 1 or args.timeout <= 0:
-        parser.error("workers and timeout must be positive")
+    if args.workers < 1:
+        parser.error("workers must be positive")
     root = Path(__file__).resolve().parent.parent
+    default_bound, bound_overrides = declared_bounds(root)
     entries = json.loads((root / "tests/data/issue_2668_regressions.json").read_text())
     unknown = sorted({entry["harness"] for entry in entries} - HARNESSES.keys())
     if unknown:
@@ -95,6 +150,7 @@ def main():
         if len(matches) != 1:
             return dict(record, status="missing" if not matches else "ambiguous")
         log = args.output / (entry["test"] + ".log")
+        bound = bound_for(matches[0], default_bound, bound_overrides)
         start = time.monotonic()
         with log.open("w") as stream:
             process = subprocess.Popen(
@@ -103,7 +159,7 @@ def main():
                 start_new_session=True,
             )
             try:
-                code = process.wait(timeout=args.timeout)
+                code = process.wait(timeout=bound)
                 status = "passed" if code == 0 else "failed"
             except subprocess.TimeoutExpired:
                 # This process group belongs exclusively to the test we started.
@@ -112,7 +168,7 @@ def main():
                 status = "timeout"
         if status == "passed" and "1 passed; 0 failed; 0 ignored;" not in log.read_text():
             status = "unmeasured"
-        record.update(status=status, exit_code=code,
+        record.update(status=status, exit_code=code, timeout_seconds=bound,
                       seconds=time.monotonic() - start, log=str(log))
         return record
 
@@ -126,8 +182,10 @@ def main():
             receipt = dict(binaries={h: str(b) for h, b in binaries.items()},
                            binary_sha256=digests, gam_binary=str(cli), gam_sha256=cli_digest,
                            gam_opt_level=cli_artifacts[0]["profile"]["opt_level"],
-                           test_timeout_seconds=args.timeout, workers=args.workers,
-                           results=records)
+                           test_timeout_seconds_default=default_bound,
+                           test_timeout_source=".config/nextest.toml [profile.default] slow-timeout"
+                                               " (period x terminate-after), with its overrides",
+                           workers=args.workers, results=records)
             (args.output / "results.json").write_text(json.dumps(receipt, indent=2) + "\n")
     counts = {status: sum(r["status"] == status for r in records)
               for status in sorted({r["status"] for r in records})}
