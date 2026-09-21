@@ -3042,52 +3042,27 @@ impl SaeSupportSparseTerm {
                         centre[channel] += image[[probe, channel]] / probes as f64;
                     }
                 }
-                let mut total = 0.0_f64;
-                let mut along = 0.0_f64;
-                // Power along the dominant direction vs total: one power
-                // iteration on the centred image's Gram is enough to
-                // separate a segment from a genuine ellipse.
-                let mut direction = vec![0.0_f64; self.output_dim];
-                for channel in 0..self.output_dim {
-                    direction[channel] = image[[0, channel]] - centre[channel];
-                }
-                let mut norm = direction.iter().map(|v| v * v).sum::<f64>().sqrt();
-                for _ in 0..8 {
-                    if !(norm > 0.0) {
-                        break;
-                    }
-                    for value in direction.iter_mut() {
-                        *value /= norm;
-                    }
-                    let mut next = vec![0.0_f64; self.output_dim];
-                    for probe in 0..probes {
-                        let mut dot = 0.0_f64;
-                        for channel in 0..self.output_dim {
-                            dot += (image[[probe, channel]] - centre[channel]) * direction[channel];
-                        }
-                        for channel in 0..self.output_dim {
-                            next[channel] += dot * (image[[probe, channel]] - centre[channel]);
-                        }
-                    }
-                    direction = next;
-                    norm = direction.iter().map(|v| v * v).sum::<f64>().sqrt();
-                }
-                if norm > 0.0 {
-                    for value in direction.iter_mut() {
-                        *value /= norm;
-                    }
-                    for probe in 0..probes {
-                        let mut dot = 0.0_f64;
-                        let mut sq = 0.0_f64;
-                        for channel in 0..self.output_dim {
-                            let centred = image[[probe, channel]] - centre[channel];
-                            dot += centred * direction[channel];
-                            sq += centred * centred;
-                        }
-                        total += sq;
-                        along += dot * dot;
+                // Power along the dominant direction vs total. The dominant
+                // power is the top eigenvalue of the centred image's second
+                // moment, which the smaller of the two centred Grams
+                // (probes x probes or channels x channels) shares exactly; a
+                // dense symmetric solve gives it without an iteration budget.
+                let mut centred = Array2::<f64>::zeros((probes, self.output_dim));
+                for probe in 0..probes {
+                    for channel in 0..self.output_dim {
+                        centred[[probe, channel]] = image[[probe, channel]] - centre[channel];
                     }
                 }
+                let gram = if probes <= self.output_dim {
+                    centred.dot(&centred.t())
+                } else {
+                    centred.t().dot(&centred)
+                };
+                let total = gram.diag().sum();
+                let (spectrum, _) = gram.eigh(Side::Lower).map_err(|error| {
+                    format!("atom {atom_index}: degeneracy probe Gram eigensolve: {error}")
+                })?;
+                let along = spectrum.iter().copied().fold(0.0_f64, f64::max);
                 let across = (total - along).max(0.0);
                 let resolution = total / probes as f64 / (probes as f64).powi(2);
                 if total > 0.0 && across <= resolution * probes as f64 {
