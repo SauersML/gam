@@ -36,6 +36,7 @@ mod codes;
 mod coordinate;
 #[cfg(target_os = "linux")]
 mod decoder_gpu;
+mod decoder_newton;
 mod residual_reservoir;
 #[cfg(target_os = "linux")]
 mod score_router_backend;
@@ -200,7 +201,9 @@ pub struct SparseDictConvergence {
     pub decoder_residual: f64,
     /// Full-map, gauge-invariant decoder fixed-point threshold.
     pub decoder_tolerance: f64,
-    /// Relative sparse-code/reconstruction displacement under one full inner map.
+    /// Sparse-code displacement in the row loss's metric `DDᵀ + ρI`, or the
+    /// reconstruction displacement if larger, relative to `‖X‖²`, under one full
+    /// inner map.
     pub routing_residual: f64,
     /// Full-map routing fixed-point threshold.
     pub routing_tolerance: f64,

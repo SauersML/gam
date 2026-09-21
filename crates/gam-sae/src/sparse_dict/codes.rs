@@ -92,7 +92,7 @@ pub fn solve_row_codes(
             gram[[j, i]] = g;
         }
     }
-    let solution = solve_resolved_posterior_mean(&gram, &rhs, ridge as f64, p);
+    let solution = ResolvedActiveGram::new(&gram, ridge as f64, p).solve(rhs.view());
 
     let mut indices = Vec::with_capacity(s);
     let mut codes = Vec::with_capacity(s);
@@ -108,8 +108,10 @@ pub fn solve_row_codes(
     SparseCode { indices, codes }
 }
 
-/// Posterior-mean active codes `(G + ρI)⁻¹ Dᵀx` on the eigenspace the stored atoms
-/// resolve.
+/// The ridged active Gram `G + ρI` restricted to the eigenspace the stored atoms
+/// resolve, applied as an inverse. [`solve_row_codes`] applies it to `Dᵀx` for the
+/// posterior-mean codes, and the decoder Newton step (#3193) applies it to the code
+/// sensitivities, so both read one resolution rule.
 ///
 /// `gram` is `G = DᵀD` over the `m` active f32 decoder rows, formed in f64 over `p`
 /// entries per pair, and `ridge` is `ρ`. Two sources bound what `G` separates from zero.
@@ -129,46 +131,58 @@ pub fn solve_row_codes(
 /// unresolved ones contribute nothing, which is the minimum-norm code on the resolved
 /// subspace. With zero ridge and exactly collinear atoms this is the Moore–Penrose joint
 /// least-squares code. At no point are off-diagonal Gram terms discarded.
-fn solve_resolved_posterior_mean(
-    gram: &Array2<f64>,
-    rhs: &Array1<f64>,
-    ridge: f64,
-    p: usize,
-) -> Array1<f64> {
-    use faer::Side;
-    use gam_linalg::faer_ndarray::FaerEigh;
+pub(super) struct ResolvedActiveGram {
+    /// `(λ + ρ, v)` for every resolved eigenpair of `G`.
+    directions: Vec<(f64, Array1<f64>)>,
+}
 
-    let m = rhs.len();
-    let (eigenvalues, eigenvectors) = gram
-        .eigh(Side::Lower)
-        .expect("an active Gram matrix must admit a symmetric eigendecomposition");
-    let trace = gram.diag().sum();
-    let norm_sum: f64 = gram.diag().iter().map(|value| value.max(0.0).sqrt()).sum();
-    let unit_roundoff = f64::from(f32::EPSILON) / 2.0;
-    let accumulation = p as f64 * f64::EPSILON;
-    let resolution = if accumulation < 1.0 {
-        unit_roundoff * unit_roundoff * trace
-            + accumulation / (1.0 - accumulation) * norm_sum * norm_sum
-    } else {
-        f64::INFINITY
-    };
-    let mut out = Array1::<f64>::zeros(m);
-    for eigen_index in 0..m {
-        let eigenvalue = eigenvalues[eigen_index];
-        assert!(
-            eigenvalue >= -resolution,
-            "active Gram matrix is not positive semidefinite: eigenvalue {eigenvalue:e}, resolution {resolution:e}"
-        );
-        if eigenvalue <= resolution {
-            continue;
+impl ResolvedActiveGram {
+    /// Factor `gram`, the f64 Gram of `m` active f32 decoder rows over `p` entries.
+    pub(super) fn new(gram: &Array2<f64>, ridge: f64, p: usize) -> Self {
+        use faer::Side;
+        use gam_linalg::faer_ndarray::FaerEigh;
+
+        let m = gram.nrows();
+        let (eigenvalues, eigenvectors) = gram
+            .eigh(Side::Lower)
+            .expect("an active Gram matrix must admit a symmetric eigendecomposition");
+        let trace = gram.diag().sum();
+        let norm_sum: f64 = gram.diag().iter().map(|value| value.max(0.0).sqrt()).sum();
+        let unit_roundoff = f64::from(f32::EPSILON) / 2.0;
+        let accumulation = p as f64 * f64::EPSILON;
+        let resolution = if accumulation < 1.0 {
+            unit_roundoff * unit_roundoff * trace
+                + accumulation / (1.0 - accumulation) * norm_sum * norm_sum
+        } else {
+            f64::INFINITY
+        };
+        let mut directions = Vec::with_capacity(m);
+        for eigen_index in 0..m {
+            let eigenvalue = eigenvalues[eigen_index];
+            assert!(
+                eigenvalue >= -resolution,
+                "active Gram matrix is not positive semidefinite: eigenvalue {eigenvalue:e}, resolution {resolution:e}"
+            );
+            if eigenvalue <= resolution {
+                continue;
+            }
+            directions.push((
+                eigenvalue + ridge,
+                eigenvectors.column(eigen_index).to_owned(),
+            ));
         }
-        let eigenvector = eigenvectors.column(eigen_index);
-        let projection = eigenvector.dot(rhs) / (eigenvalue + ridge);
-        for coordinate in 0..m {
-            out[coordinate] += projection * eigenvector[coordinate];
-        }
+        Self { directions }
     }
-    out
+
+    /// `Σ_resolved v vᵀ rhs / (λ + ρ)`.
+    pub(super) fn solve(&self, rhs: ArrayView1<'_, f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(rhs.len());
+        for (scale, eigenvector) in &self.directions {
+            let projection = eigenvector.dot(&rhs) / scale;
+            out.scaled_add(projection, eigenvector);
+        }
+        out
+    }
 }
 
 #[cfg(test)]

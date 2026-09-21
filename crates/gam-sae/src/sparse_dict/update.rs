@@ -23,6 +23,7 @@
 //! estimate reported with the epoch diagnostics.
 
 use super::codes::{SparseCode, solve_row_codes};
+use super::decoder_newton::decoder_newton_step;
 use super::scoring::{ScoreRoutePath, ScoreRouteStats, TileScorer};
 use super::{SparseDictConfig, SparseDictConvergence, SparseDictFit};
 use gam_linalg::pcg::{
@@ -291,56 +292,77 @@ pub(super) fn decoder_fixed_point_residual(previous: &Array2<f32>, next: &Array2
         .fold(0.0, f64::max)
 }
 
-/// Fixed-point residual of the exposed sparse routing. It is the larger of the
-/// relative coefficient displacement and the reconstruction displacement,
-/// evaluated without materialising either `N×K` codes or a second `N×P` matrix.
+/// Fixed-point residual of the exposed sparse routing: the larger of the code
+/// displacement and the reconstruction displacement, each in loss units relative to
+/// `‖X‖²`, evaluated without materialising either `N×K` codes or a second `N×P` matrix.
+///
+/// A row's code step minimises `‖x − Dᵀc‖² + ρ‖c‖²` on its support, whose Hessian is
+/// `H = DDᵀ + ρI` over the active atoms. At the solved code `ĉ`, the quadratic gives
+/// `F(c) − F(ĉ) = (c − ĉ)ᵀH(c − ĉ)` for every `c` on that support, so the code
+/// displacement is measured in `H`: `‖Dᵀ(c' − c)‖² + ρ‖c' − c‖²` over the union of
+/// both supports at the image decoder. On a retained support this is exactly the loss
+/// the certified codes give up at the image, the currency the stationarity test and
+/// the tolerance `tol·TSS` already use; a support change pays for every entry that
+/// enters or leaves.
+///
+/// The Euclidean relative displacement `‖c' − c‖²/‖c‖²` weights every direction by one,
+/// including those `H` weights by only `λ + ρ`. There [`solve_row_codes`] takes the
+/// coordinate `vᵀDx/(λ + ρ)`, whose right-hand side is a rounding-level quantity for a
+/// near-coincident atom pair, so a rounding-level decoder change moves the split of the
+/// code by `ε_f32·‖x‖/(λ + ρ)` while the fit does not move. At `K > N` every row can own
+/// atoms and such pairs are the fixed point, which that metric refused (#3193,
+/// `large_k_fit_…`: EV 1 − 1.4e-15, decoder residual 2.7e-14, routing 2.2e-6 for 30
+/// epochs). In `H` the same swing costs `(λ + ρ)‖Δ‖²`, which is the loss it moves.
 fn routing_fixed_point_residual(
     x: ArrayView2<'_, f32>,
     previous_decoder: ArrayView2<'_, f32>,
     previous: &[SparseCode],
     next_decoder: ArrayView2<'_, f32>,
     next: &[SparseCode],
+    code_ridge: f32,
 ) -> f64 {
+    let ridge = f64::from(code_ridge);
+    let p = x.ncols();
     let mut code_delta2 = 0.0f64;
-    let mut code_scale2 = 0.0f64;
     let mut reconstruction_delta2 = 0.0f64;
     let mut data_scale2 = 0.0f64;
+    let mut displacement: Vec<(u32, f64)> = Vec::new();
+    let mut image = vec![0.0f64; p];
 
     for row in 0..x.nrows() {
         let old = &previous[row];
         let new = &next[row];
-        for (slot, &atom) in old.indices.iter().enumerate() {
-            let old_value = old.codes[slot] as f64;
-            if old_value == 0.0 {
-                continue;
-            }
-            let new_value = new
-                .indices
-                .iter()
-                .zip(new.codes.iter())
-                .filter(|(candidate, _)| **candidate == atom)
-                .map(|(_, &value)| value as f64)
-                .sum::<f64>();
-            let delta = new_value - old_value;
-            code_delta2 += delta * delta;
-            code_scale2 += old_value * old_value + new_value * new_value;
-        }
-        for (slot, &atom) in new.indices.iter().enumerate() {
-            let new_value = new.codes[slot] as f64;
-            if new_value == 0.0
-                || old
-                    .indices
-                    .iter()
-                    .zip(old.codes.iter())
-                    .any(|(&candidate, &value)| candidate == atom && value != 0.0)
-            {
-                continue;
-            }
-            code_delta2 += new_value * new_value;
-            code_scale2 += new_value * new_value;
-        }
 
-        for column in 0..x.ncols() {
+        // `c' − c` over the union of both supports; a padded slot carries a zero code
+        // and repeated indices accumulate, as in the reconstruction.
+        displacement.clear();
+        let entries = old
+            .indices
+            .iter()
+            .zip(old.codes.iter())
+            .map(|(&atom, &value)| (atom, -f64::from(value)))
+            .chain(
+                new.indices
+                    .iter()
+                    .zip(new.codes.iter())
+                    .map(|(&atom, &value)| (atom, f64::from(value))),
+            );
+        for (atom, delta) in entries {
+            match displacement.iter_mut().find(|(seen, _)| *seen == atom) {
+                Some((_, total)) => *total += delta,
+                None => displacement.push((atom, delta)),
+            }
+        }
+        image.fill(0.0);
+        for &(atom, delta) in &displacement {
+            code_delta2 += ridge * delta * delta;
+            for (slot, &entry) in image.iter_mut().zip(next_decoder.row(atom as usize).iter()) {
+                *slot += delta * f64::from(entry);
+            }
+        }
+        code_delta2 += image.iter().map(|value| value * value).sum::<f64>();
+
+        for column in 0..p {
             let old_value = old
                 .indices
                 .iter()
@@ -362,19 +384,13 @@ fn routing_fixed_point_residual(
         }
     }
 
-    let code_residual = if code_scale2 > 0.0 {
-        code_delta2 / code_scale2
-    } else {
-        0.0
-    };
-    let reconstruction_residual = if data_scale2 > 0.0 {
-        reconstruction_delta2 / data_scale2
-    } else if reconstruction_delta2 == 0.0 {
+    if data_scale2 > 0.0 {
+        code_delta2.max(reconstruction_delta2) / data_scale2
+    } else if code_delta2 == 0.0 && reconstruction_delta2 == 0.0 {
         0.0
     } else {
         f64::INFINITY
-    };
-    code_residual.max(reconstruction_residual)
+    }
 }
 
 /// [`route_and_code_all`] for an epoch that has certified codes to descend from.
@@ -564,103 +580,6 @@ fn penalized_objective(
         f64::INFINITY
     };
     (loss, band + accumulation)
-}
-
-/// Displacement between two decoders' live rows, compared as lines. The second row takes
-/// the sign that agrees with the first before the difference is formed, because
-/// [`unit_norm_rows`] orients each row on its own. Rows marked `frozen`, and rows that are
-/// zero in either decoder, contribute nothing. Per-atom squares are summed in atom order,
-/// so the norm does not depend on the thread count.
-fn aligned_displacement_norm(
-    certified: ArrayView2<'_, f32>,
-    refreshed: ArrayView2<'_, f32>,
-    frozen: &[bool],
-) -> f64 {
-    let squares: Vec<f64> = certified
-        .axis_iter(Axis(0))
-        .into_par_iter()
-        .zip(refreshed.axis_iter(Axis(0)).into_par_iter())
-        .zip(frozen.par_iter())
-        .map(|((old, new), &skip)| {
-            if skip
-                || old.iter().all(|&value| value == 0.0)
-                || new.iter().all(|&value| value == 0.0)
-            {
-                return 0.0;
-            }
-            let dot = old
-                .iter()
-                .zip(new.iter())
-                .map(|(&left, &right)| f64::from(left) * f64::from(right))
-                .sum::<f64>();
-            let sign = if dot < 0.0 { -1.0 } else { 1.0 };
-            old.iter()
-                .zip(new.iter())
-                .map(|(&left, &right)| {
-                    let difference = sign * f64::from(right) - f64::from(left);
-                    difference * difference
-                })
-                .sum::<f64>()
-        })
-        .collect();
-    squares.iter().sum::<f64>().sqrt()
-}
-
-/// The decoder one Aitken step reaches from an epoch of a linearly contracting map
-/// (#2283). When the map's error contracts by `r` per epoch, `x_{e+1} − x* ≈ r·(x_e − x*)`,
-/// so the limit sits at `x_{e+1} + r/(1 − r)·(x_{e+1} − x_e)`, and `step` is that
-/// `r/(1 − r)`. Rows are aligned as in [`aligned_displacement_norm`], frozen and zero rows
-/// are copied unchanged, and the caller re-norms the result.
-fn aitken_decoder_candidate(
-    certified: ArrayView2<'_, f32>,
-    refreshed: ArrayView2<'_, f32>,
-    frozen: &[bool],
-    step: f64,
-) -> Array2<f32> {
-    let mut candidate = refreshed.to_owned();
-    candidate
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .zip(certified.axis_iter(Axis(0)).into_par_iter())
-        .zip(frozen.par_iter())
-        .for_each(|((mut row, old), &skip)| {
-            if skip
-                || old.iter().all(|&value| value == 0.0)
-                || row.iter().all(|&value| value == 0.0)
-            {
-                return;
-            }
-            let dot = old
-                .iter()
-                .zip(row.iter())
-                .map(|(&left, &right)| f64::from(left) * f64::from(right))
-                .sum::<f64>();
-            let sign = if dot < 0.0 { -1.0 } else { 1.0 };
-            for (slot, &left) in row.iter_mut().zip(old.iter()) {
-                let aligned = sign * f64::from(*slot);
-                *slot = (aligned + step * (aligned - f64::from(left))) as f32;
-            }
-        });
-    candidate
-}
-
-/// Null every revival proposal in `decoder` that no code in `codes` fires. A rejected
-/// proposal is dormant capacity, not a trained direction, and the plain epoch image nulls
-/// its own rejected proposals the same way.
-fn null_unfired_revivals(decoder: &mut Array2<f32>, revived_atoms: &[usize], codes: &[SparseCode]) {
-    let mut fired = vec![false; decoder.nrows()];
-    for code in codes {
-        for (&atom, &value) in code.indices.iter().zip(code.codes.iter()) {
-            if value != 0.0 {
-                fired[atom as usize] = true;
-            }
-        }
-    }
-    for &atom in revived_atoms {
-        if !fired[atom] {
-            decoder.row_mut(atom).fill(0.0);
-        }
-    }
 }
 
 /// The loss `‖X − C D‖² − ‖X‖²` of two decoders at the codes that assembled `eq`,
@@ -888,9 +807,12 @@ fn run_from_decoder(
     // tightest achievable fixed point, which in floating point is the rounding
     // floor of the residual reductions, not literal zero.
     let fixed_point_tol = fixed_point_tolerance(config.tolerance, n, k, p);
-    // Norm of the preceding epoch's decoder displacement: the contraction rate the
-    // Aitken step reads is the ratio of successive displacements (#2283).
-    let mut previous_displacement_norm: Option<f64> = None;
+    // The explained variance is `1 − RSS/TSS`, so a loss decrease `δ` is an EV change
+    // of `δ/TSS`, and the tolerance in loss units is `fixed_point_tol · TSS` (#3193).
+    let loss_tolerance = {
+        let (means, _) = column_means_and_energy(x);
+        fixed_point_tol * reconstruction_rss_tss_chunks(x, &codes, decoder.view(), Some(&means)).1
+    };
 
     for epoch in 0..config.max_epochs {
         epochs_run = epoch + 1;
@@ -915,8 +837,9 @@ fn run_from_decoder(
         let accumulate_secs = epoch_start.elapsed().as_secs_f64();
         let sigma = residual_scale(x, &codes, decoder.view());
         let sigma_secs = epoch_start.elapsed().as_secs_f64() - accumulate_secs;
-        let stats = if s == 1 {
+        let (stats, movable) = if s == 1 {
             let gate = routability_gate_decisions(&normal_eq, sigma);
+            let movable: Vec<bool> = gate.iter().map(|decision| decision.refresh).collect();
             let mut members = vec![Vec::new(); k];
             for (row, code) in certified_codes.iter().enumerate() {
                 members[code.indices[0] as usize].push(row);
@@ -934,13 +857,14 @@ fn run_from_decoder(
                     }
                     Ok(())
                 })?;
-            DecoderSolveStats {
+            let stats = DecoderSolveStats {
                 component_count: k,
                 max_component_size: 1,
                 cg_residual_stop: decoder_solve_relative_tolerance(),
                 cg_recycling_admitted: false,
                 ..DecoderSolveStats::default()
-            }
+            };
+            (stats, movable)
         } else {
             let (solve_stats, gate) = solve_decoder_with_routability_gate_recycled(
                 &mut decoder,
@@ -968,7 +892,7 @@ fn run_from_decoder(
                 decoder.assign(&certified_decoder);
                 polish_unit_rows_against_normal_eq(&mut decoder, &normal_eq, &refresh)?;
             }
-            solve_stats
+            (solve_stats, refresh)
         };
         decoder_solve_stats = stats;
         let refresh_secs = epoch_start.elapsed().as_secs_f64();
@@ -990,39 +914,27 @@ fn run_from_decoder(
             unit_norm_rows(&mut decoder)?;
         }
 
-        // (f) Aitken step along the epoch displacement (#2283). Where coherent atoms
-        // relax a tiling or rotate within a span, the epoch map converges linearly: its
-        // error contracts by `r` per epoch, and a budget can run out a few epochs short
-        // of a fixed point the map would reach (job 640872: the torus K=8 decoder
-        // residual falls at ~0.7 per epoch and is refused at 30 epochs). The measured rate
-        // `r = ‖Δ_e‖/‖Δ_{e−1}‖` gives the candidate `D + r/(1 − r)·Δ`. The candidate is
-        // routed after the certificate check below, and adopted only for a state its plain
-        // image did not certify and only on a lower penalized loss. So the step can neither
-        // hold a certificate open nor raise the loss. Revival proposals have no trajectory
-        // and stay put.
-        let mut frozen = vec![false; k];
-        for &atom in &revived_atoms {
-            frozen[atom] = true;
-        }
-        let displacement_norm =
-            aligned_displacement_norm(certified_decoder.view(), decoder.view(), &frozen);
-        let extrapolated = match previous_displacement_norm
-            .filter(|&previous| displacement_norm > 0.0 && displacement_norm < previous)
-        {
-            Some(previous) => {
-                let rate = displacement_norm / previous;
-                let mut candidate = aitken_decoder_candidate(
-                    certified_decoder.view(),
-                    decoder.view(),
-                    &frozen,
-                    rate / (1.0 - rate),
-                );
-                unit_norm_rows(&mut candidate)?;
-                Some(candidate)
-            }
-            None => None,
-        };
-        previous_displacement_norm = Some(displacement_norm);
+        // (f) Newton step on the profiled decoder objective at the certified state
+        // (#3193). Where coherent atoms rotate inside their span, only the ridge picks
+        // the rotation, and the map above contracts at a rate near one: 0.9975 per epoch
+        // on the `returned_ev_is_fresh_code_ev` fixture, so a per-epoch displacement can
+        // sit inside the tolerance while the state is still `step/(1 − r)` from the fixed
+        // point. The Newton decrement is that distance in loss units, and the step
+        // reaches it. The atoms the refresh held are held here too.
+        let newton = decoder_newton_step(
+            x,
+            certified_decoder.view(),
+            &certified_codes,
+            config.code_ridge,
+            &movable,
+            decoder_solve_relative_tolerance(),
+        );
+        let (_, certified_band) = penalized_objective(
+            x,
+            certified_decoder.view(),
+            &certified_codes,
+            config.code_ridge,
+        );
 
         // (a)+(b) FRESH codes against the just-refreshed, unit-normed decoder.
         // These are the codes that define the post-epoch model, so they (i) feed
@@ -1091,6 +1003,7 @@ fn run_from_decoder(
             &certified_codes,
             decoder.view(),
             &next_codes,
+            config.code_ridge,
         );
 
         // Per-epoch heartbeat at debug level: silent by default, and streamed
@@ -1171,8 +1084,18 @@ fn run_from_decoder(
         let numerically_sound = decoder_solve_stats.cg_nonconverged_columns == 0
             && decoder_solve_stats.cg_relative_residual <= decoder_solve_stats.cg_residual_stop;
         let structure_settled = accepted_births == 0;
+        // The residuals bound one epoch's step. The decrement bounds what the profiled
+        // objective still gives up at these supports: inside the tolerance in loss units,
+        // or inside the loss's own rounding, where no arithmetic resolves it (#3193).
+        // The attainable gap bounds the same loss for every unit decoder at once, so it
+        // certifies where the Hessian cannot: at a zero-residual fit its gauge directions
+        // are flat and the computed curvature is rounding of either sign. An unresolved
+        // solve reports an infinite decrement, so only the gap can certify such a state.
+        let stationary =
+            newton.decrement.min(newton.attainable_gap) <= loss_tolerance.max(certified_band);
         let certified_fixed_point = structure_settled
             && numerically_sound
+            && stationary
             && ev_residual <= fixed_point_tol
             && decoder_residual <= fixed_point_tol
             && routing_residual <= fixed_point_tol;
@@ -1196,11 +1119,21 @@ fn run_from_decoder(
                 accepted_births,
             });
         }
-        // The Aitken candidate is considered only for a state its plain image did not
-        // certify, so an accelerator can never hold a certificate open. It is adopted only
-        // when its routed state has the lower penalized loss beyond both states' rounding,
-        // so the step never raises the loss the plain map lowers (#2283).
-        if let Some(mut candidate) = extrapolated {
+        // The Newton candidate is considered only for a state its plain image did not
+        // certify, so it can never hold a certificate open, and it is carried forward in
+        // place of the plain image only when its routed state has a penalized loss lower
+        // by more than both losses' rounding bands. A decrease inside the bands is not
+        // resolved, and adopting it would let rounding pick the state and churn routing.
+        // At a crawl the plain image gains `(1 − r)` of what the Newton point gains, so
+        // the margin is `r` times the decrement, and it falls inside the bands only where
+        // the decrement already certifies.
+        // Revival proposals have no profiled trajectory, so the candidate carries the
+        // plain image's proposals and nulls any its own routing leaves unfired.
+        if let Some(mut candidate) = newton.candidate {
+            for &atom in &revived_atoms {
+                candidate.row_mut(atom).assign(&decoder.row(atom));
+            }
+            unit_norm_rows(&mut candidate)?;
             let candidate_codes = route_and_code_retaining_descent(
                 x,
                 candidate.view(),
@@ -1212,16 +1145,31 @@ fn run_from_decoder(
                 Some(&mut score_route_stats),
                 &certified_codes,
             )?;
+            let mut fired = vec![false; k];
+            for code in &candidate_codes {
+                for (&atom, &value) in code.indices.iter().zip(code.codes.iter()) {
+                    fired[atom as usize] |= value != 0.0;
+                }
+            }
+            for &atom in &revived_atoms {
+                if !fired[atom] {
+                    candidate.row_mut(atom).fill(0.0);
+                }
+            }
             let (plain_loss, plain_band) =
                 penalized_objective(x, decoder.view(), &next_codes, config.code_ridge);
             let (candidate_loss, candidate_band) =
                 penalized_objective(x, candidate.view(), &candidate_codes, config.code_ridge);
+            log::debug!(
+                "[SAE epoch {epochs_run}] decoder Newton: decrement={:.3e} resolved={} \
+                 attainable_gap={:.3e} hessian_products={} plain_loss={plain_loss:.9e} \
+                 newton_loss={candidate_loss:.9e}",
+                newton.decrement,
+                newton.resolved,
+                newton.attainable_gap,
+                newton.hessian_products,
+            );
             if candidate_loss + candidate_band < plain_loss - plain_band {
-                log::debug!(
-                    "[SAE epoch {epochs_run}] Aitken step adopted: penalized loss \
-                     {plain_loss:.9e} -> {candidate_loss:.9e}"
-                );
-                null_unfired_revivals(&mut candidate, &revived_atoms, &candidate_codes);
                 decoder = candidate;
                 next_codes = candidate_codes;
                 next_ev = explained_variance(x, &next_codes, decoder.view());
@@ -4275,10 +4223,20 @@ fn explained_variance(
     codes: &[SparseCode],
     decoder: ArrayView2<'_, f32>,
 ) -> f64 {
+    let (means, energy) = column_means_and_energy(x);
+    let (rss, tss) = reconstruction_rss_tss_chunks(x, codes, decoder, Some(&means));
+    crate::k_selection::explained_variance_within_band(
+        rss,
+        tss,
+        crate::k_selection::centered_tss_rounding_band(x.nrows(), energy),
+    )
+}
+
+/// Column means and raw energy `Σ x²` of `x`, from per-chunk partials combined in
+/// ascending chunk order (deterministic, thread-count-independent).
+fn column_means_and_energy(x: ArrayView2<'_, f32>) -> (Vec<f64>, f64) {
     let n = x.nrows();
     let p = x.ncols();
-    // Column means for TSS: per-chunk column partials, combined in ascending
-    // chunk order (deterministic, thread-count-independent).
     let mean_partials: Vec<(Vec<f64>, f64)> = (0..n)
         .collect::<Vec<_>>()
         .par_chunks(RECONSTRUCTION_ROW_CHUNK)
@@ -4307,13 +4265,7 @@ fn explained_variance(
     for c in 0..p {
         means[c] /= n as f64;
     }
-
-    let (rss, tss) = reconstruction_rss_tss_chunks(x, codes, decoder, Some(&means));
-    crate::k_selection::explained_variance_within_band(
-        rss,
-        tss,
-        crate::k_selection::centered_tss_rounding_band(n, energy),
-    )
+    (means, energy)
 }
 
 fn residual_scale(
@@ -5989,6 +5941,154 @@ mod exact_solve_tests {
             fit.explained_variance > 0.999_999,
             "an exact 1-sparse fit must reconstruct at EV≈1; got {}",
             fit.explained_variance
+        );
+    }
+    /// #3193: the routing residual measures code displacement in the row loss's own
+    /// Hessian `DDᵀ + ρI`. On a fixed support it equals the loss the displaced codes
+    /// give up against the solved codes; a split swing across a near-coincident atom
+    /// pair costs only its `(λ + ρ)` share, where the Euclidean relative displacement
+    /// is order one; and a swap to a distinct atom costs the whole row.
+    #[test]
+    fn routing_residual_is_the_row_loss_the_code_displacement_gives_up_3193() {
+        use super::routing_fixed_point_residual;
+        use crate::sparse_dict::codes::solve_row_codes;
+
+        let loss = |x: &[f64], decoder: &Array2<f32>, code: &SparseCode, ridge: f64| -> f64 {
+            let mut fit = vec![0.0f64; x.len()];
+            let mut penalty = 0.0f64;
+            for (&atom, &value) in code.indices.iter().zip(code.codes.iter()) {
+                penalty += f64::from(value) * f64::from(value);
+                for (slot, &entry) in fit.iter_mut().zip(decoder.row(atom as usize).iter()) {
+                    *slot += f64::from(value) * f64::from(entry);
+                }
+            }
+            x.iter()
+                .zip(fit.iter())
+                .map(|(observed, fitted)| (observed - fitted) * (observed - fitted))
+                .sum::<f64>()
+                + ridge * penalty
+        };
+
+        // Fixed support, well-conditioned pair: the residual is the loss gap.
+        let decoder =
+            Array2::from_shape_vec((2, 3), vec![1.0f32, 0.0, 0.0, 0.6, 0.8, 0.0]).unwrap();
+        let x = Array2::from_shape_vec((1, 3), vec![0.9f32, 0.5, 0.3]).unwrap();
+        let ridge = 0.125f32;
+        let solved = solve_row_codes(x.row(0), decoder.view(), &[(0, 0.0), (1, 0.0)], 2, ridge);
+        let displaced = SparseCode {
+            indices: solved.indices.clone(),
+            codes: vec![solved.codes[0] + 0.25, solved.codes[1] - 0.125],
+        };
+        let row: Vec<f64> = x.iter().map(|&value| f64::from(value)).collect();
+        let data_scale2: f64 = row.iter().map(|value| value * value).sum();
+        let gap = loss(&row, &decoder, &displaced, f64::from(ridge))
+            - loss(&row, &decoder, &solved, f64::from(ridge));
+        let residual = routing_fixed_point_residual(
+            x.view(),
+            decoder.view(),
+            std::slice::from_ref(&displaced),
+            decoder.view(),
+            std::slice::from_ref(&solved),
+            ridge,
+        );
+        // The stored codes are the solve rounded to f32, `ĉ = c* + δ` with
+        // `‖δ‖ ≤ ε_f32‖ĉ‖`, so the gap carries the linear term `2δᵀHΔ`, at most
+        // `2‖H‖·ε_f32‖ĉ‖·‖Δ‖` with `‖H‖ ≤ tr(G) + ρ = 2 + ρ` for two unit atoms.
+        let norm = |code: &SparseCode| {
+            code.codes
+                .iter()
+                .map(|&value| f64::from(value) * f64::from(value))
+                .sum::<f64>()
+                .sqrt()
+        };
+        let step = displaced
+            .codes
+            .iter()
+            .zip(solved.codes.iter())
+            .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let linear =
+            2.0 * (2.0 + f64::from(ridge)) * f64::from(f32::EPSILON) * norm(&solved) * step;
+        assert!(
+            (residual * data_scale2 - gap).abs() <= linear,
+            "fixed-support residual {:.9e} must equal the loss gap {:.9e}",
+            residual * data_scale2,
+            gap
+        );
+
+        // Near-coincident pair at the production ridge: a split swing is invisible
+        // to the fit and costs only its (λ + ρ) share.
+        let theta = 2.0f64.powi(-10);
+        let decoder = Array2::from_shape_vec(
+            (3, 2),
+            vec![
+                1.0f32,
+                0.0,
+                theta.cos() as f32,
+                theta.sin() as f32,
+                0.0,
+                1.0,
+            ],
+        )
+        .unwrap();
+        let x = Array2::from_shape_vec((1, 2), vec![1.0f32, 0.0]).unwrap();
+        let ridge = 1.0e-6f32;
+        let before = SparseCode {
+            indices: vec![0, 1],
+            codes: vec![0.625, 0.375],
+        };
+        let after = SparseCode {
+            indices: vec![0, 1],
+            codes: vec![0.375, 0.625],
+        };
+        // The Euclidean relative displacement of this swing is order one.
+        let euclidean = before
+            .codes
+            .iter()
+            .zip(after.codes.iter())
+            .map(|(&a, &b)| (f64::from(b) - f64::from(a)).powi(2))
+            .sum::<f64>()
+            / norm(&before).powi(2);
+        assert!(
+            euclidean > 0.1,
+            "the fixture must swing the split: {euclidean:.3e}"
+        );
+        let swing = routing_fixed_point_residual(
+            x.view(),
+            decoder.view(),
+            std::slice::from_ref(&before),
+            decoder.view(),
+            std::slice::from_ref(&after),
+            ridge,
+        );
+        let bound = 2.0 * 0.25f64 * 0.25 * (theta * theta + f64::from(ridge));
+        assert!(
+            swing <= bound,
+            "a split swing across a coincident pair moved the residual to {swing:.3e}, \
+             above its (λ + ρ) share {bound:.3e}"
+        );
+
+        // A swap to a distinct atom moves the whole row.
+        let swapped = SparseCode {
+            indices: vec![2, 1],
+            codes: vec![1.0, 0.0],
+        };
+        let whole = SparseCode {
+            indices: vec![0, 1],
+            codes: vec![1.0, 0.0],
+        };
+        let swap = routing_fixed_point_residual(
+            x.view(),
+            decoder.view(),
+            std::slice::from_ref(&whole),
+            decoder.view(),
+            std::slice::from_ref(&swapped),
+            ridge,
+        );
+        assert!(
+            swap >= 1.0,
+            "a swap to a distinct atom must cost the row; got {swap:.3e}"
         );
     }
 }
