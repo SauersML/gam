@@ -713,10 +713,10 @@ pub struct SaeManifoldTerm {
     /// sees which atoms genuinely earn their curvature and which collapse to the
     /// linear tail. Read via [`Self::hybrid_split_report`].
     pub(crate) hybrid_split_report: Option<crate::hybrid_split::SaeHybridSplitReport>,
-    /// Per-atom inner-decoder-smooth byproducts harvested post-fit (#1097 /
-    /// #1103), one entry per atom in [`Self::atoms`] order. Each is the fixed
-    /// fitted snapshot the residual-gauge certificate's three post-PIRLS atom
-    /// inference reports consume
+    /// Per-atom inner-decoder-smooth byproducts harvested post-fit (#1097), one
+    /// entry per atom in [`Self::atoms`] order. Each is the fixed fitted
+    /// snapshot the residual-gauge certificate's post-PIRLS atom functional
+    /// report consumes
     /// ([`crate::identifiability::AtomInnerFit`]). `None` until
     /// [`Self::set_atom_inner_fits`] runs (it needs the reconstruction target
     /// `Z`, available only at the post-fit harness seam where the dispersion is

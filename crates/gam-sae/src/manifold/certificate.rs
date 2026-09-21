@@ -77,13 +77,12 @@ pub struct SaeManifoldFitDiagnostics {
     /// needed for the SNR proxy; absent for legacy callers that only need the
     /// existing diagnostics.
     pub incoherence_report: Option<DictionaryIncoherenceReport>,
-    /// Per-atom Riesz-debiased smooth-functional inference and the any-n-valid
-    /// split-LRT smooth-structure e-value (#1097 / #1103), one entry per fitted
-    /// atom in atom order.
-    /// Each entry's `functionals` / `smooth_significance` are `Some` only when
+    /// Per-atom Riesz-debiased smooth-functional point summaries (#1097), one
+    /// entry per fitted atom in atom order.
+    /// Each entry's `functionals` is `Some` only when
     /// the atom's inner-decoder smooth was harvested at fit time (the caller ran
     /// [`SaeManifoldTerm::set_atom_inner_fits`] and the inner penalized Hessian
-    /// was SPD on a non-empty active set); otherwise they degrade to `None`.
+    /// was SPD on a non-empty active set); otherwise it degrades to `None`.
     pub atom_inference: Vec<crate::identifiability::AtomInferenceReport>,
     /// #2081 — per-atom chart coordinate-fidelity certificate: the circular
     /// coordinate-uniformity statistic (Watson `U²` + closed-form p-value)

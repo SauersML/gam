@@ -215,13 +215,11 @@ def build_payload() -> dict[str, Any]:
                 "atom_index": 0,
                 "atom_name": "circle_0",
                 "functionals": {"slope": 0.2},
-                "smooth_significance": {"log_e_nonconstant": 3.4},
             },
             {
                 "atom_index": 1,
                 "atom_name": "line_1",
                 "functionals": None,
-                "smooth_significance": {"log_e_nonconstant": None},
             },
         ],
         "certificates": {

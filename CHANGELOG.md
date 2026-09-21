@@ -28,6 +28,20 @@
   one. The message gives `D̂`, the p-value bounds and the failed ledger.
   **Behavior change:** such declarations now raise instead of returning a fitted
   model; drop the declaration to anchor on the estimated law.
+- **The SAE per-atom non-constancy e-value is removed** (#3929).
+  `AtomSmoothSignificance::log_e_nonconstant` split the atom's inner-fit rows by
+  parity and reported `ℓ_alt(D₀) − ℓ_null(D₀)` as a split-likelihood-ratio
+  e-value. Every input on the evaluation fold came from the full-data fit: the
+  latent coordinate `t̂_i` is itself fitted to `Z_i`, and the assignment weights
+  `a_ik²`, the partial residuals and the plug-in dispersion `φ̂` all depend on the
+  evaluation responses. Under H0 the design is therefore fitted to the noise it
+  is scored on, so `E_{H0}[E] ≤ 1` does not hold. The null was also not maximised
+  over `φ`. No function of the stored inner-fit snapshot is a valid e-value,
+  because a valid one needs a dictionary refitted without the evaluation rows.
+  The struct, its computation, the `AtomInnerFit::dispersion` field it alone
+  read, and the `smooth_significance` key of `atom_inference_reports` are
+  deleted. The penalty-debiased functional point summaries (`functionals`) are
+  unchanged.
 
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
