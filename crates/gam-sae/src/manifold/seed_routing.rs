@@ -912,9 +912,11 @@ pub fn sae_decoder_lsq_init(
 /// carry the interval extension needed to enumerate their complete stationary
 /// sets.
 ///
-/// Only invoked for cold-start multi-atom softmax / ordered Beta--Bernoulli
-/// fits; the smooth threshold gate keeps its threshold-centered seed and warm
-/// starts are respected verbatim.
+/// Only invoked for cold-start multi-atom softmax / ordered Beta--Bernoulli /
+/// hard-TopK fits; the smooth threshold gate keeps its threshold-centered seed
+/// and warm starts are respected verbatim. `top_k` is the TopK support size (and
+/// `None` for every other family), so the decoder refit weights rows by the same
+/// hard gate the fit applies.
 pub(crate) fn sae_refine_routing_seed(
     term: &mut SaeManifoldTerm,
     z: ArrayView2<'_, f64>,
@@ -924,6 +926,7 @@ pub(crate) fn sae_refine_routing_seed(
     tau: f64,
     threshold_gate_threshold: f64,
     smoothness: f64,
+    top_k: Option<usize>,
 ) -> Result<(), String> {
     const SAE_SEED_REFINE_ROUNDS: usize = 4;
     const SAE_RESIDUAL_SEED_GAIN: f64 = 4.0;
@@ -986,7 +989,7 @@ pub(crate) fn sae_refine_routing_seed(
             alpha,
             tau,
             threshold_gate_threshold,
-            None,
+            top_k,
         )?;
         for atom_idx in 0..k_atoms {
             let m_k = basis_sizes[atom_idx];

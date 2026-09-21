@@ -201,7 +201,10 @@ pub fn build_sae_minimal_seed(
     };
     // Every routing map that picks atoms per row needs the atoms' cold charts
     // separated by the data, or each atom sees the same shared PCA chart and no
-    // row prefers any atom. Hard TopK is such a map too (#4519).
+    // row prefers any atom. Hard TopK is such a map too (#4519, #4020), and it
+    // needs the separation most: its routing logits are fixed parameters of the
+    // fit (`logits_are_fixed`) and the dense lane has no support refresh, so the
+    // support the seed selects is the support the fit keeps.
     let cold_routing = k_atoms > 1
         && matches!(
             request.assignment_kind,
@@ -264,9 +267,9 @@ pub fn build_sae_minimal_seed(
     };
     // Neutral cold logits are a tie on every row. Hard TopK breaks ties toward
     // the lower atom index, so it would route every row to the first `top_k`
-    // atoms and leave the rest with an identically zero decoder (#4519). The
-    // residual seed is the data's own per-row preference; TopK reads only its
-    // order, and rows the data leave tied stay tied.
+    // atoms and keep them for the whole fit, whatever the rows contained
+    // (#4519, #4020). The residual seed is the data's own per-row preference;
+    // TopK reads only its order, and rows the data leave tied stay tied.
     if logits_are_cold && cold_routing {
         const RESIDUAL_SEED_GAIN: f64 = 4.0;
         initial_logits = sae_residual_seed_logits(
@@ -409,6 +412,7 @@ mod tests {
             threshold: 0.0,
             top_k: Some(1),
             random_state: 45,
+            smoothness: 1.0,
             initial_logits: None,
             initial_coords: None,
         })
@@ -431,6 +435,76 @@ mod tests {
                 "atom {atom_idx} has an identically zero cold decoder"
             );
         }
+    }
+
+    /// #4020 — the companion of the test above, from the other side. Winning at
+    /// least one row is not enough: the cold TopK support is the FITTED support,
+    /// because the routing logits are fixed parameters and the dense lane never
+    /// refreshes them. So the seed's top-1 atom must follow what each row
+    /// actually contains. Two periodic atoms here write disjoint output blocks,
+    /// and the seed's logits must be the residual seed itself, not a tie.
+    #[test]
+    fn cold_topk_seed_routes_rows_by_the_residual_seed_not_atom_index_4020() {
+        let n = 48usize;
+        let block = [
+            [[1.0, 0.35, 0.0], [0.0, 0.80, 0.45]],
+            [[0.90, -0.30, 0.0], [0.0, 0.65, 1.05]],
+        ];
+        let mut target = Array2::<f64>::zeros((n, 6));
+        let mut truth = vec![0usize; n];
+        for row in 0..n {
+            let atom = row % 2;
+            truth[row] = atom;
+            let theta = std::f64::consts::TAU * ((row as f64 * 0.618_033_988_75).fract());
+            let (sin, cos) = theta.sin_cos();
+            for col in 0..3 {
+                target[[row, 3 * atom + col]] =
+                    sin * block[atom][0][col] + cos * block[atom][1][col];
+            }
+        }
+        let report = build_sae_minimal_seed(SaeMinimalSeedRequest {
+            target: target.view(),
+            atom_basis: vec!["periodic".to_string(); 2],
+            atom_dim: vec![1; 2],
+            assignment_kind: SaeFitAssignmentKind::TopK,
+            alpha: 1.0,
+            tau: 1.0,
+            threshold: 0.0,
+            top_k: Some(1),
+            random_state: 0,
+            smoothness: 1.0,
+            initial_logits: None,
+            initial_coords: None,
+        })
+        .expect("a planted two-block TopK seed must build");
+        let basis_sizes: Vec<usize> = report
+            .geometry_plans
+            .iter()
+            .map(|plan| plan.basis_size().expect("seed plans carry a basis size"))
+            .collect();
+        let residual =
+            sae_residual_seed_logits(report.basis_values.view(), &basis_sizes, target.view(), 4.0)
+                .expect("the residual seed of the report's own basis must build");
+        assert_eq!(
+            report.initial_logits, residual,
+            "cold TopK logits must be the residual seed, not the all-zero tie"
+        );
+        let top1: Vec<usize> = (0..n)
+            .map(|row| {
+                let logits = report.initial_logits.row(row);
+                if logits[1] > logits[0] { 1 } else { 0 }
+            })
+            .collect();
+        // The atom labels are arbitrary, so agreement is read up to the one
+        // permutation of two atoms. A seed that puts every row on one atom
+        // scores n/2 here and fails, which is the defect this pins.
+        let direct = (0..n).filter(|&row| top1[row] == truth[row]).count();
+        let agreement = direct.max(n - direct);
+        assert!(
+            agreement * 10 >= n * 9,
+            "cold TopK support must follow the planted blocks: {agreement}/{n} rows agree \
+             (top-1 atoms {top1:?})"
+        );
     }
 
     #[test]

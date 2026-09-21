@@ -414,11 +414,15 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
         base_term.set_temperature_schedule(schedule)?;
     }
 
+    // Hard TopK is refined with the routed families: its routing logits are fixed
+    // parameters of the fit, so the refined seed support is the support it keeps.
     if request.seed_refine_routing
         && k_atoms > 1
         && matches!(
             request.assignment_kind,
-            SaeFitAssignmentKind::Softmax | SaeFitAssignmentKind::OrderedBetaBernoulli
+            SaeFitAssignmentKind::Softmax
+                | SaeFitAssignmentKind::OrderedBetaBernoulli
+                | SaeFitAssignmentKind::TopK
         )
     {
         sae_refine_routing_seed(
@@ -430,6 +434,7 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
             request.tau,
             request.threshold,
             smoothness,
+            request.top_k,
         )?;
     }
 
