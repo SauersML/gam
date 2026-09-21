@@ -63,7 +63,7 @@ use super::*;
 use gam_math::jet_scalar::{JetScalar, SymmetricQuadraticCoefficients};
 use gam_math::jet_tower::Tower4;
 use gam_math::nested_dual::JetField;
-use crate::latent_anchor::{AnchorGridOwned, AnchorTaylor, solve_anchor};
+use crate::latent_anchor::{AnchorDensity, AnchorGridOwned, AnchorTaylor, solve_anchor};
 use ndarray::Zip;
 
 /// Name of the residual block in the parameter-block list and in the
@@ -75,17 +75,17 @@ pub const RESIDUAL_BLOCK_NAME: &str = "residual_repair";
 /// marginal or slope surface), above the flex deviations.
 pub(super) const GAUGE_PRIORITY_RESIDUAL: u8 = 110;
 
-/// The channel a fit with this block and a fired conditional latent-z
-/// calibration has no Murphy–Topel correction for, so its covariance is
-/// withheld (gam#2985,
+/// The channel a fit with this block under the conditional joint covariance
+/// Σ(a) and a fired conditional latent-z calibration has no Murphy–Topel
+/// correction for, so its covariance is withheld (gam#2985,
 /// `CovarianceDeclined::BmsGeneratedRegressorResidualRepairChannelUnavailable`).
+/// Under the pooled law the block's row, covariance and finite-law channels are
+/// carried ([`super::residual_repair_kernel::ResidualDriveKernel::score_zeta_sensitivity`]).
 pub(super) const RESIDUAL_REPAIR_GENERATED_REGRESSOR_CHANNEL: &str =
-    "the block reads the calibrated score through each row's own ζ_i and through the joint \
-     (z, r) covariance Σ(a), whose regression of r on the score and innovation variances are \
-     fitted on the calibrated score itself, so every ζ_j moves every row's anchor. Neither the \
-     row channel ∂score_i/∂ζ_i for the block's coordinates nor the covariance fit's cross-row \
-     channel ∂Σ̂/∂ζ_j is implemented, and the rigid channels cover only the marginal and slope \
-     blocks";
+    "the joint (z, r) covariance escalated to the conditional Σ(a), whose regressions of r on \
+     the score and innovation variances are an M-estimate fitted on the calibrated score itself, \
+     so every ζ_j moves every row's anchor through Σ(a). The implicit derivative ∂Σ(a)/∂ζ_j of \
+     that fit is not implemented; the pooled covariance's channel is";
 
 /// Why a residual block was refused. Each reason names the contract that was
 /// not met; none is a solver failure.
@@ -712,6 +712,42 @@ pub(super) fn residual_row_nll<const N: usize, S: JetScalar<N>>(
     g: &S,
     drive: &ResidualDrive<S>,
 ) -> Result<S, String> {
+    residual_row_nll_perturbed(state, eta_m, g, drive, None).map(|eval| eval.nll)
+}
+
+/// First-order perturbations of what a row's likelihood reads from the
+/// calibrated score ζ, as extra jet primaries (gam#2985): the row's own score,
+/// and the finite law's anchor `ã(q, B)` through its value and its two slopes.
+///
+/// The generated-regressor correction differentiates the β-score `∇_β ℓ`, which
+/// reads the anchor only through `ã`, `∂ã/∂q` and `∂ã/∂B` at the row's
+/// `(q, B)`. So `ã + ε_A + ε_q·δq + ε_B·δB` carries exactly the directions in
+/// which moving the law's nodes can move that score, and the mixed second
+/// derivatives `∂²ℓ/∂p∂ε` are the score's node sensitivities up to the anchor's
+/// own node derivatives ([`mixture_anchor_node_sensitivity`]).
+pub(super) struct ScorePerturbation<S> {
+    /// `δζ_i`, entering the linear read as `s·g·δζ_i`.
+    pub(super) zeta: S,
+    /// `(ε_A, ε_q, ε_B)`: on a declared finite law only.
+    pub(super) anchor: [S; 3],
+}
+
+/// A row's negative log-likelihood, and on a declared finite law the `(q, B)`
+/// at which its anchor was solved.
+pub(super) struct ResidualRowEval<S> {
+    pub(super) nll: S,
+    pub(super) anchor_point: Option<[f64; 2]>,
+}
+
+/// [`residual_row_nll`] with the score perturbations of [`ScorePerturbation`]
+/// added to what it reads; `None` is `residual_row_nll` itself.
+pub(super) fn residual_row_nll_perturbed<const N: usize, S: JetScalar<N>>(
+    state: &ResidualRowState<'_>,
+    eta_m: &S,
+    g: &S,
+    drive: &ResidualDrive<S>,
+    perturbation: Option<&ScorePerturbation<S>>,
+) -> Result<ResidualRowEval<S>, String> {
     let s = state.probit_scale;
     let marginal = state.marginal;
     // q = Φ⁻¹(Φ(η_m)) through the supplied link stack.
@@ -733,7 +769,11 @@ pub(super) fn residual_row_nll<const N: usize, S: JetScalar<N>>(
             "residual repair row: the anchor quadratic form b̃ᵀΣb̃ = {quad_value} is not admissible"
         ));
     }
-    let linear = g.scale(s * state.z).add(&drive.t.scale(s));
+    let mut linear = g.scale(s * state.z).add(&drive.t.scale(s));
+    if let Some(perturbation) = perturbation {
+        linear = linear.add(&g.mul(&perturbation.zeta).scale(s));
+    }
+    let mut anchor_point = None;
     let eta = match state.grid {
         None => {
             let c = quad.compose_unary(sqrt1p_stack((1.0 + quad_value.max(0.0)).sqrt()));
@@ -752,7 +792,16 @@ pub(super) fn residual_row_nll<const N: usize, S: JetScalar<N>>(
             let tau = v.compose_unary(sqrt1p_stack((1.0 + v_value.max(0.0)).sqrt()));
             let b_scaled = m.mul(&tau.recip());
             let tower = mixture_anchor_tower(marginal.q, b_scaled.value(), grid)?;
-            compose_bivariate_tower(&tower, &q, &b_scaled).multiply_add(&tau, &linear)
+            let mut anchor = compose_bivariate_tower(&tower, &q, &b_scaled);
+            if let Some(perturbation) = perturbation {
+                let [value, slope_q, slope_b] = &perturbation.anchor;
+                anchor = anchor
+                    .add(value)
+                    .add(&slope_q.mul(&q.with_value(0.0)))
+                    .add(&slope_b.mul(&b_scaled.with_value(0.0)));
+            }
+            anchor_point = Some([marginal.q, b_scaled.value()]);
+            anchor.multiply_add(&tau, &linear)
         }
     };
     let margin = eta.scale(2.0 * state.y - 1.0);
@@ -765,7 +814,54 @@ pub(super) fn residual_row_nll<const N: usize, S: JetScalar<N>>(
             state.w
         ));
     }
-    Ok(nll)
+    Ok(ResidualRowEval { nll, anchor_point })
+}
+
+/// The derivatives of the finite-law anchor `ã(q, B)` and of its two slopes in
+/// each node `x_k` of the law, at fixed weights (gam#2985): `[∂ã/∂x_k,
+/// ∂ã_q/∂x_k, ∂ã_B/∂x_k]`.
+///
+/// Implicit differentiation of `Σ_k w_k Φ(ã + B x_k) = Φ(q)`, with `ω` the
+/// law's density weights at the root ([`AnchorDensity`]), `e_k = ã + B x_k`,
+/// `x̄ = Σω x`, `ē = Σω e` and `C = Σω (x − x̄)(e − ē)`:
+///
+/// ```text
+///   ∂ã/∂x_k   = −B ω_k
+///   ∂ã_q/∂x_k = ã_q·B ω_k (e_k − ē)
+///   ∂ã_B/∂x_k = −ω_k − B ω_k (C − (x_k − x̄) e_k)
+/// ```
+///
+/// A shift of every node by `δ` moves the root by `−Bδ`, `ã_q` not at all and
+/// `ã_B = −x̄` by `−δ`: the three rows sum to `−B`, `0` and `−1`.
+pub(super) fn mixture_anchor_node_sensitivity(
+    q: f64,
+    b: f64,
+    grid: &EmpiricalZGrid,
+) -> Result<[Vec<f64>; 3], String> {
+    let owned = AnchorGridOwned::from_grid(grid);
+    let view = owned.view();
+    let root = solve_anchor(q, b, view)?;
+    let density = AnchorDensity::at(root, b, view)?;
+    let a_q = AnchorTaylor::at(root, q, b, view)?.derivatives().a_q;
+    let omega = density.weights();
+    let nodes = &owned.nodes;
+    let x_bar: f64 = omega.iter().zip(nodes).map(|(w, x)| w * x).sum();
+    let e_bar = root + b * x_bar;
+    let covariance: f64 = omega
+        .iter()
+        .zip(nodes)
+        .map(|(w, x)| w * (x - x_bar) * (root + b * x - e_bar))
+        .sum();
+    let mut value = Vec::with_capacity(nodes.len());
+    let mut slope_q = Vec::with_capacity(nodes.len());
+    let mut slope_b = Vec::with_capacity(nodes.len());
+    for (&w, &x) in omega.iter().zip(nodes) {
+        let e = root + b * x;
+        value.push(-b * w);
+        slope_q.push(a_q * b * w * (e - e_bar));
+        slope_b.push(-w - b * w * (covariance - (x - x_bar) * e));
+    }
+    Ok([value, slope_q, slope_b])
 }
 
 /// The row index and its first derivatives in plain `f64`: the value-only

@@ -45,7 +45,11 @@
 
 use super::family::*;
 use super::hessian_paths::BlockSlices;
-use super::residual_repair::{ResidualBlockRuntime, ResidualDrive, ResidualRowState, residual_row_nll};
+use super::empirical_measure_sensitivity::EmpiricalZGridBuild;
+use super::residual_repair::{
+    ResidualBlockRuntime, ResidualDrive, ResidualRowState, ScorePerturbation,
+    mixture_anchor_node_sensitivity, residual_row_nll, residual_row_nll_perturbed,
+};
 use super::*;
 use crate::row_kernel::{RowKernel, RowKernelCache, RowSet};
 use gam_math::jet_scalar::{JetScalar, SymmetricQuadraticCoefficients};
@@ -831,6 +835,320 @@ impl ResidualDriveKernel {
         }
         let moments = DriveMoments::at(self.runtime.field.at_row(row), self.beta());
         f(&moments.gamma, &moments.sigma_beta, moments.u, moments.v)
+    }
+
+    /// Calls `f` with row `row`'s data as the row likelihood reads it.
+    fn with_row_state<T>(
+        &self,
+        row: usize,
+        f: impl FnOnce(&ResidualRowState<'_>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if row >= self.family.y.len() {
+            return Err(format!("ResidualDriveKernel: row {row} out of range"));
+        }
+        let marginal = self
+            .family
+            .marginal_link_map(self.block_states[0].eta[row])?;
+        let grid = self
+            .family
+            .latent_measure
+            .empirical_grid_for_training_row(row)?;
+        let state = ResidualRowState {
+            marginal,
+            z: self.family.z[row],
+            y: self.family.y[row],
+            w: self.family.weights[row],
+            probit_scale: self.family.probit_frailty_scale(),
+            grid: grid.as_deref(),
+        };
+        f(&state).map_err(|e| format!("row {row}: {e}"))
+    }
+
+    /// The Murphy–Topel sensitivity of the β-score to the calibrated score
+    /// (gam#2985): the `n × p_β` matrix whose row `j` is `d(∇_β log L)/dζ_j`,
+    /// LOG-LIKELIHOOD sign, the object
+    /// [`super::gradient_paths::rigid_standard_normal_score_zeta_sensitivity`]
+    /// returns for a fit without the block.
+    ///
+    /// The block reads `ζ` three ways, and the total derivative is their sum:
+    ///
+    /// * **The row's own score.** `ζ_i` enters the linear read `s·g·ζ_i`, so
+    ///   its channel is `J_iᵀ ∂²ℓ_i/∂p∂ζ_i`.
+    /// * **The pooled joint covariance.** `γ = Σ̂_r0/Σ̂_00` and
+    ///   `Σ_rr = Σ̂_rr + κ·Σ̂_r0Σ̂_0r`, `κ = Σ̂_00⁻² − Σ̂_00⁻¹`
+    ///   ([`super::residual_repair::declare_unit_score_variance`]), are fitted
+    ///   on `ζ` with the weighted central moments `a = Σ̂_00`, `c = Σ̂_r0`, so
+    ///   every `ζ_j` moves every row's `u = γᵀβ` and `v = βᵀΣ_rrβ` and the
+    ///   `u`, `v` rows `γ`, `2Σ_rrβ` of every `J_i`:
+    ///
+    ///   ```text
+    ///     ∂a/∂ζ_j = 2w_j(ζ_j − ζ̄)/W,   ∂c/∂ζ_j = w_j(r_j − r̄)/W
+    ///     d∇_β ℓ/dζ_j = Σ_i J_iᵀ(h_i[·,u]·∂u/∂ζ_j + h_i[·,v]·∂v/∂ζ_j)
+    ///                   + [residual] Σ_i (g_i[u]·∂γ/∂ζ_j + g_i[v]·2∂Σ_rr/∂ζ_j·β)
+    ///   ```
+    ///
+    ///   The row sums do not depend on `j`, so the channel is one pass over the
+    ///   rows and then `O(p_β + K²)` per `j`.
+    /// * **The declared finite law.** A global-empirical grid is built from `ζ`,
+    ///   and a row's β-score reads the grid only through the anchor `ã(q, B)`
+    ///   and its two slopes, seeded as the perturbation primaries of
+    ///   [`super::residual_repair::residual_row_nll_perturbed`]. Contracting
+    ///   their mixed second derivatives with the anchor's node derivatives
+    ///   ([`super::residual_repair::mixture_anchor_node_sensitivity`]) gives the
+    ///   β-score's node sensitivity `U_Q`, pulled back to the rows by the grid's
+    ///   build record exactly as the rigid empirical channel is.
+    ///
+    /// A row-varying `Σ(a)` is refused: its regressions and innovations are an
+    /// M-estimate on `ζ` whose implicit derivative this does not carry, so there
+    /// is no channel to add rather than a smaller one.
+    pub(super) fn score_zeta_sensitivity(
+        &self,
+        build: Option<&EmpiricalZGridBuild>,
+    ) -> Result<Array2<f64>, String> {
+        use gam_math::jet_scalar::Order2;
+        let pooled = self.pooled.as_ref().ok_or_else(|| {
+            "residual score/ζ sensitivity: the joint (z, r) covariance is the conditional Σ(a)"
+                .to_string()
+        })?;
+        let n = self.family.y.len();
+        let p = self.slices.total;
+        let k = self.residual.len();
+        let build = match (&self.family.latent_measure, build) {
+            (LatentMeasureKind::StandardNormal, _) => None,
+            (LatentMeasureKind::GlobalEmpirical { grid }, Some(build)) => {
+                if build.grid != *grid || build.n_rows != n {
+                    return Err(format!(
+                        "residual score/ζ sensitivity: the build record ({} nodes over {} rows) is \
+                         not the fit's global-empirical measure ({} nodes over {n} rows)",
+                        build.grid.nodes.len(),
+                        build.n_rows,
+                        grid.nodes.len()
+                    ));
+                }
+                Some(build)
+            }
+            (LatentMeasureKind::GlobalEmpirical { .. }, None) => {
+                return Err(
+                    "residual score/ζ sensitivity: a global-empirical measure without its build \
+                     record"
+                        .to_string(),
+                );
+            }
+            (LatentMeasureKind::LocalEmpirical { .. }, _) => {
+                return Err(
+                    "residual score/ζ sensitivity: a local-empirical measure has no build record"
+                        .to_string(),
+                );
+            }
+        };
+        let m = build.map_or(0, |build| build.grid.nodes.len());
+
+        // One row: its own channel into `out_row`, its covariance row sums, and
+        // on a finite law its node coefficients `C_i[a][·]` for the marginal,
+        // slope and residual reads (`nodes`) and the `u`, `v` reads (returned).
+        let row_pass = |row: usize,
+                        out_row: &mut [f64],
+                        nodes: Option<[&mut [f64]; 3]>|
+         -> Result<RowZetaSums, String> {
+            let primaries = self.primaries(row)?;
+            let var = |value: f64, axis: usize| <Order2<9> as JetScalar<9>>::variable(value, axis);
+            let x: [Order2<9>; 5] = std::array::from_fn(|a| var(primaries[a], a));
+            let perturbation = ScorePerturbation {
+                zeta: var(0.0, 5),
+                anchor: [var(0.0, 6), var(0.0, 7), var(0.0, 8)],
+            };
+            let drive = ResidualDrive {
+                t: x[2],
+                u: x[3],
+                v: x[V],
+            };
+            let eval = self.with_row_state(row, |state| {
+                residual_row_nll_perturbed(state, &x[0], &x[1], &drive, Some(&perturbation))
+            })?;
+            let (_, g, h) = eval.nll.into_channels();
+            let column = |axis: usize| -> [f64; 5] { std::array::from_fn(|a| h[a][axis]) };
+            let own: [f64; 5] = std::array::from_fn(|a| -h[a][5]);
+            self.jacobian_transpose_action(row, &own, out_row);
+            let mut sums = RowZetaSums::zeros(p, m);
+            self.jacobian_transpose_action(row, &column(3), &mut sums.p_u);
+            self.jacobian_transpose_action(row, &column(V), &mut sums.p_v);
+            sums.g_u = g[3];
+            sums.g_v = g[V];
+            if let Some([c_m, c_s, c_r]) = nodes {
+                let [q, b] = eval.anchor_point.ok_or_else(|| {
+                    format!("row {row}: a finite law whose row read no anchor")
+                })?;
+                let grid = &build.expect("a node pass has a build record").grid;
+                let t = mixture_anchor_node_sensitivity(q, b, grid)
+                    .map_err(|e| format!("row {row}: {e}"))?;
+                for node in 0..m {
+                    let c: [f64; 5] = std::array::from_fn(|a| {
+                        (0..3).map(|e| h[a][6 + e] * t[e][node]).sum::<f64>()
+                    });
+                    c_m[node] = c[0];
+                    c_s[node] = c[1];
+                    c_r[node] = c[2];
+                    sums.node_u[node] = c[3];
+                    sums.node_v[node] = c[V];
+                }
+            }
+            Ok(sums)
+        };
+
+        let mut out = vec![0.0_f64; n * p];
+        let (sums, node_blocks) = if m == 0 {
+            let sums = out
+                .par_chunks_mut(p)
+                .enumerate()
+                .map(|(row, out_row)| row_pass(row, out_row, None))
+                .try_reduce(|| RowZetaSums::zeros(p, 0), |a, b| Ok(a.merge(b)))?;
+            (sums, None)
+        } else {
+            let mut c_m = vec![0.0_f64; n * m];
+            let mut c_s = vec![0.0_f64; n * m];
+            let mut c_r = vec![0.0_f64; n * m];
+            let sums = out
+                .par_chunks_mut(p)
+                .zip(c_m.par_chunks_mut(m))
+                .zip(c_s.par_chunks_mut(m).zip(c_r.par_chunks_mut(m)))
+                .enumerate()
+                .map(|(row, ((out_row, c_m), (c_s, c_r)))| row_pass(row, out_row, Some([c_m, c_s, c_r])))
+                .try_reduce(|| RowZetaSums::zeros(p, m), |a, b| Ok(a.merge(b)))?;
+            (sums, Some([c_m, c_s, c_r]))
+        };
+        let mut out = Array2::from_shape_vec((n, p), out).map_err(|e| e.to_string())?;
+
+        // The pooled covariance channel, from the sample moments the declared
+        // covariance was formed from.
+        let features = &self.runtime.features;
+        let mut scores = Array2::<f64>::zeros((n, k + 1));
+        scores.column_mut(0).assign(&self.family.z);
+        scores.slice_mut(s![.., 1..]).assign(features);
+        let sample = marginal_slope_covariance_from_scores(scores.view(), &self.family.weights)?.to_dense();
+        let a = sample[[0, 0]];
+        if !(a.is_finite() && a > 0.0) {
+            return Err(format!("residual score/ζ sensitivity: the score has weighted variance {a}"));
+        }
+        let c: Vec<f64> = (1..=k).map(|j| sample[[j, 0]]).collect();
+        let beta = self.beta();
+        let cb = dot(&c, beta);
+        let kappa = a.powi(-2) - a.recip();
+        let kappa_a = -2.0 * a.powi(-3) + a.powi(-2);
+        let total_weight: f64 = self.family.weights.sum();
+        let mean = |column: ndarray::ArrayView1<'_, f64>| {
+            column
+                .iter()
+                .zip(self.family.weights.iter())
+                .map(|(v, w)| w * v)
+                .sum::<f64>()
+                / total_weight
+        };
+        let z_bar = mean(self.family.z.view());
+        let r_bar: Vec<f64> = (0..k).map(|j| mean(features.column(j))).collect();
+        let residual = self.residual.clone();
+        out.axis_iter_mut(ndarray::Axis(0))
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(j, mut out_row)| {
+                let w = self.family.weights[j];
+                let da = 2.0 * w * (self.family.z[j] - z_bar) / total_weight;
+                let dc: Vec<f64> = (0..k)
+                    .map(|l| w * (features[[j, l]] - r_bar[l]) / total_weight)
+                    .collect();
+                let dcb = dot(&dc, beta);
+                let du = dcb / a - cb * da / (a * a);
+                let dv = kappa_a * da * cb * cb + 2.0 * kappa * cb * dcb;
+                for (entry, (p_u, p_v)) in out_row.iter_mut().zip(sums.p_u.iter().zip(&sums.p_v)) {
+                    *entry -= p_u * du + p_v * dv;
+                }
+                for l in 0..k {
+                    let d_gamma = dc[l] / a - c[l] * da / (a * a);
+                    let d_sigma_beta = kappa_a * da * cb * c[l] + kappa * (dc[l] * cb + c[l] * dcb);
+                    out_row[residual.start + l] -= sums.g_u * d_gamma + 2.0 * sums.g_v * d_sigma_beta;
+                }
+            });
+
+        // The declared finite law's cross-row channel: `U_Qᵀ` in the
+        // negative-log-likelihood sign, pulled back through the build record.
+        if let (Some(build), Some([c_m, c_s, c_r])) = (build, node_blocks) {
+            let block = |coefficients: Vec<f64>| Array2::from_shape_vec((n, m), coefficients);
+            let (c_m, c_s, c_r) = (
+                block(c_m).map_err(|e| e.to_string())?,
+                block(c_s).map_err(|e| e.to_string())?,
+                block(c_r).map_err(|e| e.to_string())?,
+            );
+            let marginal = self
+                .family
+                .marginal_design
+                .try_to_dense_arc("residual score/ζ sensitivity marginal design")?;
+            let slope = self
+                .family
+                .slope_design
+                .try_to_dense_arc("residual score/ζ sensitivity slope design")?;
+            let mut node_score = Array2::<f64>::zeros((m, p));
+            node_score
+                .slice_mut(s![.., self.slices.marginal.clone()])
+                .assign(&gam_linalg::faer_ndarray::fast_atb(&c_m, marginal.as_ref()));
+            node_score
+                .slice_mut(s![.., self.slices.slope.clone()])
+                .assign(&gam_linalg::faer_ndarray::fast_atb(&c_s, slope.as_ref()));
+            let mut residual_block = gam_linalg::faer_ndarray::fast_atb(&c_r, features);
+            let doubled_sigma_beta: Vec<f64> = pooled.sigma_beta.iter().map(|x| 2.0 * x).collect();
+            for (node, mut row) in residual_block.rows_mut().into_iter().enumerate() {
+                for (l, entry) in row.iter_mut().enumerate() {
+                    *entry += sums.node_u[node] * pooled.gamma[l] + sums.node_v[node] * doubled_sigma_beta[l];
+                }
+            }
+            node_score.slice_mut(s![.., residual]).assign(&residual_block);
+            node_score.mapv_inplace(|v| -v);
+            out += &build.node_zeta_vjp(node_score.view())?;
+        }
+        if !out.iter().all(|v| v.is_finite()) {
+            return Err("residual score/ζ sensitivity produced a non-finite entry".to_string());
+        }
+        Ok(out)
+    }
+}
+
+/// Row sums of the residual block's score/ζ channels
+/// ([`ResidualDriveKernel::score_zeta_sensitivity`]): `Σ_i J_iᵀh_i[·,u]`,
+/// `Σ_i J_iᵀh_i[·,v]`, `Σ_i g_i[u]`, `Σ_i g_i[v]` and the node coefficients of
+/// the `u` and `v` reads, in the negative-log-likelihood sign.
+struct RowZetaSums {
+    p_u: Vec<f64>,
+    p_v: Vec<f64>,
+    g_u: f64,
+    g_v: f64,
+    node_u: Vec<f64>,
+    node_v: Vec<f64>,
+}
+
+impl RowZetaSums {
+    fn zeros(p: usize, m: usize) -> Self {
+        Self {
+            p_u: vec![0.0; p],
+            p_v: vec![0.0; p],
+            g_u: 0.0,
+            g_v: 0.0,
+            node_u: vec![0.0; m],
+            node_v: vec![0.0; m],
+        }
+    }
+
+    fn merge(mut self, other: Self) -> Self {
+        for (a, b) in [
+            (&mut self.p_u, &other.p_u),
+            (&mut self.p_v, &other.p_v),
+            (&mut self.node_u, &other.node_u),
+            (&mut self.node_v, &other.node_v),
+        ] {
+            for (x, y) in a.iter_mut().zip(b) {
+                *x += y;
+            }
+        }
+        self.g_u += other.g_u;
+        self.g_v += other.g_v;
+        self
     }
 }
 

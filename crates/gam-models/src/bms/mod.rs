@@ -4382,6 +4382,8 @@ mod empirical_grid_sampling_3452_tests;
 #[cfg(test)]
 mod empirical_grid_fit_3452_tests;
 #[cfg(test)]
+mod residual_score_zeta_2985_tests;
+#[cfg(test)]
 mod anchor_law_2926_tests;
 #[cfg(test)]
 mod normal_screen_2926_tests;

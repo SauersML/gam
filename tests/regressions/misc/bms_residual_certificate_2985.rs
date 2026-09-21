@@ -12,10 +12,12 @@
 //!    fit without the block, or the two differ by less than one standard error.
 //! 2. **Moving law.** On a location-scale law of the score with `r` independent of
 //!    `z`, the moving-law certificate chooses the same arm with the block as
-//!    without it. The moving law fires the conditional calibration, and the
-//!    block's coordinates have no Murphy–Topel channel, so the block's fit
-//!    withholds its covariance with that reason instead of failing, and the
-//!    record survives the wire.
+//!    without it. The moving law fires the conditional calibration, so the
+//!    score is a generated regressor; with `r` independent of `z` the joint
+//!    covariance stays pooled, whose Murphy–Topel channel the block carries, so
+//!    the block's fit corrects and publishes its covariance as the score-only
+//!    fit does. Only the conditional `Σ(a)` withholds it, and that record
+//!    survives the wire.
 use csv::StringRecord;
 use gam::estimate::CovarianceDeclined;
 use gam::families::bms::{
@@ -208,26 +210,15 @@ fn a_residual_repair_fit_certifies_the_same_moving_law_arm_as_without_the_block_
     let with_fit = fitted("y ~ x1 + x2", &data, true);
     let without_fit = fitted("y ~ x1 + x2", &data, false);
     // The moving law fires the conditional calibration, so the score is a
-    // generated regressor. Without the block the Murphy–Topel correction is
-    // applied and the covariance published; the block's coordinates have no
-    // channel, so with it the covariance is withheld with that reason.
-    assert!(
-        without_fit.covariance_published && without_fit.covariance_declined.is_none(),
-        "the score-only fit corrects and publishes its covariance: declined {:?}",
-        without_fit.covariance_declined
-    );
-    assert!(
-        !with_fit.covariance_published,
-        "a calibrated residual repair fit must not publish an uncorrected covariance"
-    );
-    match &with_fit.covariance_declined {
-        Some(CovarianceDeclined::BmsGeneratedRegressorResidualRepairChannelUnavailable {
-            unavailable_channel,
-        }) => assert!(
-            unavailable_channel.contains("(z, r) covariance"),
-            "the record names the missing channel: {unavailable_channel}"
-        ),
-        other => panic!("the withheld covariance must say why: {other:?}"),
+    // generated regressor. With `r` independent of `z` the block's joint
+    // covariance is the pooled one, whose channel the correction carries: both
+    // fits correct and publish their covariance.
+    for (fit, block) in [(&with_fit, true), (&without_fit, false)] {
+        assert!(
+            fit.covariance_published && fit.covariance_declined.is_none(),
+            "a calibrated fit corrects and publishes its covariance (block={block}): declined {:?}",
+            fit.covariance_declined
+        );
     }
     let with = moving_law_certificate(&with_fit.law);
     let without = moving_law_certificate(&without_fit.law);
@@ -260,8 +251,7 @@ fn a_residual_repair_fit_certifies_the_same_moving_law_arm_as_without_the_block_
 #[test]
 fn a_withheld_residual_repair_covariance_survives_the_wire_2985() {
     let declined = CovarianceDeclined::BmsGeneratedRegressorResidualRepairChannelUnavailable {
-        unavailable_channel: "the joint (z, r) covariance is fitted on the calibrated score"
-            .to_string(),
+        unavailable_channel: "the joint (z, r) covariance is the conditional Σ(a)".to_string(),
     };
     let explanation = declined.explain();
     assert!(

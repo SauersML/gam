@@ -2464,14 +2464,14 @@ pub enum CovarianceDeclined {
         unavailable_channel: String,
     },
     /// Bernoulli marginal-slope, conditional latent-z calibration active, and a
-    /// gam#2924 residual repair block (gam#2985).
+    /// gam#2924 residual repair block whose joint `(z, r)` covariance escalated
+    /// to the conditional `Σ(a)` (gam#2985).
     ///
-    /// Whatever the latent measure: the block's coordinates read the calibrated
-    /// score through each row's own `zeta_i` and through the joint `(z, r)`
-    /// covariance, which is fitted on the calibrated score, so every `zeta_j`
-    /// moves every row's anchor. No channel supplies either derivative for the
-    /// block's coordinates, and the rigid channels cover only the marginal and
-    /// slope blocks.
+    /// Whatever the latent measure: `Σ(a)` is an M-estimate fitted on the
+    /// calibrated score, so every `zeta_j` moves every row's anchor through it,
+    /// and that implicit derivative is not supplied. Under the pooled joint
+    /// covariance the block's channels are carried and the covariance IS
+    /// corrected.
     ///
     /// Point estimation is unaffected and IS published.
     BmsGeneratedRegressorResidualRepairChannelUnavailable {
@@ -2546,8 +2546,8 @@ impl CovarianceDeclined {
                      fitted score is a GENERATED regressor whose first stage was estimated from \
                      the same data, and the fit carries a gam#2924 residual repair block. The \
                      Murphy-Topel correction needs the total derivative of every coefficient's \
-                     score in the latent coordinate, and for the residual block's coefficients \
-                     it has none: {unavailable_channel}. Publishing the UNCORRECTED covariance \
+                     score in the latent coordinate, and this block's is missing one channel: \
+                     {unavailable_channel}. Publishing the UNCORRECTED covariance \
                      instead is not admissible: it omits the first-stage uncertainty the \
                      correction exists to add, so the intervals would be too narrow and, on the \
                      wire, indistinguishable from corrected ones. The point estimates are \

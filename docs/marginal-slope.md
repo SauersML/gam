@@ -741,12 +741,18 @@ unchanged, and a fit with the block is certified like one without it.
   values in the presence of the block; pass `length_scale=` to choose them.
 - When the score's conditional law moves and the conditional location-scale
   calibration fires, the calibrated score is a generated regressor, and the
-  block has no Murphy–Topel channel: it reads the score through each row's
-  `ζ_i` and through the joint covariance, which is fitted on the calibrated
-  score. The fit publishes its point estimates and certificate and withholds
-  the coefficient covariance, recording why
-  (`CovarianceDeclined::BmsGeneratedRegressorResidualRepairChannelUnavailable`,
-  gam#2985). An uncorrected covariance would be too narrow.
+  block reads it three ways: through each row's own `ζ_i`, through the pooled
+  joint covariance (`γ = c/a`, `Σ_rr` and the anchor's `u`, `v` are weighted
+  moments of `ζ`, so every `ζ_j` moves every row's anchor), and, on a
+  global-empirical law, through the grid built from `ζ`. The Murphy–Topel
+  correction carries all three (gam#2985) under the standard-normal and
+  global-empirical laws. When the joint covariance escalates to the
+  conditional `Σ(a)`, its regressions are an M-estimate fitted on the
+  calibrated score whose implicit derivative is not implemented, so the fit
+  publishes its point estimates and certificate and withholds the
+  coefficient covariance, recording why
+  (`CovarianceDeclined::BmsGeneratedRegressorResidualRepairChannelUnavailable`).
+  An uncorrected covariance would be too narrow.
 
 ### On a declared finite law of the score
 
