@@ -1616,7 +1616,8 @@ fn adaptive_univariate_duchon_start_preserves_formula_floor_and_applies_growth_1
     let (initial_centers, initial_is_auto) =
         planned_radial_centers(&initial_request.spec.smooth_terms[0].basis);
     // #3149: the orchestrated request starts at the pilot (here the rate count
-    // `starting_num_centers`, above the pilot `s(x)` floor), and the raw
+    // `starting_num_centers`, which the pilot `s(x)` floor does not exceed:
+    // both are sized at the minimal embedding order, #3331), and the raw
     // request, which nothing grows, at the provisioned default above it.
     assert_eq!(
         initial_centers,

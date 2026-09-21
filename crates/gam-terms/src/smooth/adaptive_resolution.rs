@@ -292,7 +292,9 @@ fn radial_inner(basis: &SmoothBasisSpec) -> &SmoothBasisSpec {
 /// grow ([`adaptive_resolution_of`]), which keeps its provisioned formula
 /// default: the pilot is a start the loop refines, not a final basis (#3149).
 ///
-/// * open B-spline: the order-`m` null space plus `⌈n^{1/(2m+1)}⌉` directions;
+/// * open B-spline: the order-`m` null space plus the `⌈n^{1/3}⌉` directions
+///   the roughest admissible truth keeps (the penalized resolution rank of the
+///   minimal embedding order, not of the penalty's own order; #3331);
 /// * cyclic basis: the constant plus the same rank, at least `degree + 1`;
 /// * factor-smooth marginal: the least-populated group's pilot, held below the
 ///   smallest group's covariate resolution;
@@ -364,11 +366,7 @@ pub fn starting_resolution(
             ))
         }
         (AdaptiveResolution::PeriodicBasis(_), B::BSpline1D { spec, .. }) => {
-            AdaptiveResolution::PeriodicBasis(pilot_cyclic_basis_dim(
-                n,
-                spec.degree,
-                spec.penalty_order.min(spec.degree).max(1),
-            ))
+            AdaptiveResolution::PeriodicBasis(pilot_cyclic_basis_dim(n, spec.degree))
         }
         (AdaptiveResolution::HarmonicDegree(_), B::Sphere { spec, .. }) => {
             AdaptiveResolution::HarmonicDegree(default_spherical_harmonic_degree(

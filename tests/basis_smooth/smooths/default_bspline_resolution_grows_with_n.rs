@@ -168,6 +168,12 @@ fn default_smooth_truth_error_falls_with_n_and_passes_its_adequacy_test() {
 /// The contract is about the typical fit: the median EDF over replicates.
 /// Every replicate must also keep its basis at the pilot size, since a truth
 /// the pilot already represents gives the adequacy test no reason to grow.
+/// At n = 4000 the pilot is the order-2 null space plus the penalized
+/// resolution rank of the roughest admissible (order-1) truth,
+/// `2 + ⌈4000^{1/3}⌉ = 18` cubic functions, 17 columns after the sum-to-zero
+/// constraint (#3331).
+const PILOT_BASIS_DIM_AT_4000: usize = 17;
+
 fn median_edf(truth: fn(f64) -> f64, label: &str) -> f64 {
     let mut edfs: Vec<f64> = (0..5u64)
         .map(|seed| {
@@ -177,7 +183,7 @@ fn median_edf(truth: fn(f64) -> f64, label: &str) -> f64 {
                 fit.basis_dim, fit.edf
             );
             assert_eq!(
-                fit.basis_dim, 11,
+                fit.basis_dim, PILOT_BASIS_DIM_AT_4000,
                 "{label} seed={seed}: a truth the pilot basis represents must not grow it"
             );
             fit.edf
