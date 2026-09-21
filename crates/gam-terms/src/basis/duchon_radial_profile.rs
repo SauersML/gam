@@ -593,79 +593,6 @@ impl TermEvaluator {
     }
 }
 
-/// `G(ρ) − G(0)` as `Σ c · ρ^q · ln(ρ/2)^{0|1}`, valid for `ρ ≤` [`SERIES_CROSSOVER_Z`].
-///
-/// The ascending series of `T_0(z) = z^b K_b(z)` (for half-integer `b`, the
-/// Laurent polynomial with `e^{-z}` expanded until `SERIES_CROSSOVER_Z^k / k!`
-/// falls under `ε`) is integrated term by term against the reference weight
-/// `2^{2−b} v^{d−2p−1} (1−v²)^{p−1}`, with `z = ρ v`, `ln(ρ v/2) = ln(ρ/2) + ln v` and
-///
-/// ```text
-/// ∫₀¹ v^{2a−1} (1−v²)^{p−1} dv       = ½ B(a, p),
-/// ∫₀¹ v^{2a−1} (1−v²)^{p−1} ln v dv  = ¼ B(a, p) (ψ(a) − ψ(a + p)),   a = (d − 2p + q)/2.
-/// ```
-///
-/// Every power `q ≥ 0`, so `a ≥ d/2 − p > 0`. The plain `q = 0` term integrates to
-/// `Γ(b) B(s − b, p) = G(0)` and is dropped: the deviation from the origin value
-/// is summed directly, not formed as the difference of two numbers that agree
-/// to every digit at small `ρ` (gam#2735). `z ≤ ρ` on the whole weight, so the
-/// integrated series has the integrand series' own validity range.
-fn integrated_origin_series(shape: &ProfileShape) -> Vec<Monomial> {
-    let integrand = match &shape.terms.mode {
-        TermMode::Integer { series } => series[0].clone(),
-        TermMode::HalfInteger { laurent } => {
-            let mut expansion_terms = 1usize;
-            let mut tail = SERIES_CROSSOVER_Z;
-            while tail > f64::EPSILON {
-                expansion_terms += 1;
-                tail *= SERIES_CROSSOVER_Z / expansion_terms as f64;
-            }
-            let mut expanded = Vec::with_capacity(laurent[0].len() * (expansion_terms + 1));
-            for monomial in &laurent[0] {
-                let mut coef = std::f64::consts::FRAC_PI_2.sqrt() * monomial.coef;
-                for k in 0..=expansion_terms {
-                    expanded.push(Monomial {
-                        coef,
-                        power: monomial.power + k as i32,
-                        logged: false,
-                    });
-                    coef *= -1.0 / (k + 1) as f64;
-                }
-            }
-            normalize_monomials(expanded)
-        }
-    };
-    let p = shape.p as f64;
-    let weight = 2.0_f64.powf(2.0 - shape.b);
-    let mut integrated = Vec::with_capacity(2 * integrand.len());
-    for monomial in &integrand {
-        let a = 0.5 * (shape.d as f64 - 2.0 * p + monomial.power as f64);
-        let beta = gamma_lanczos(a) * gamma_lanczos(p) / gamma_lanczos(a + p);
-        let scaled = weight * monomial.coef * beta;
-        if monomial.logged {
-            integrated.push(Monomial {
-                coef: 0.5 * scaled,
-                power: monomial.power,
-                logged: true,
-            });
-            integrated.push(Monomial {
-                coef: 0.25
-                    * scaled
-                    * (gam_math::special::digamma(a) - gam_math::special::digamma(a + p)),
-                power: monomial.power,
-                logged: false,
-            });
-        } else if monomial.power != 0 {
-            integrated.push(Monomial {
-                coef: 0.5 * scaled,
-                power: monomial.power,
-                logged: false,
-            });
-        }
-    }
-    normalize_monomials(integrated)
-}
-
 /// The reference integrand's shape parameters.
 #[derive(Clone, Debug)]
 struct ProfileShape {
@@ -856,9 +783,6 @@ pub(crate) struct DuchonRadialProfile {
     /// `G(0) = Γ(b) B(s − b, p)` when `b > 0`; `None` for a kernel singular
     /// at the origin.
     g0: Option<f64>,
-    /// `G(ρ) − G(0) = Σ c · ρ^q · ln(ρ/2)^{0|1}` for `ρ ≤` [`SERIES_CROSSOVER_Z`]
-    /// ([`integrated_origin_series`]); `None` exactly when `g0` is.
-    origin_series: Option<Vec<Monomial>>,
     u_value_lo: f64,
     u_lo: f64,
     u_hi: f64,
@@ -907,11 +831,6 @@ impl DuchonRadialProfile {
         } else {
             None
         };
-        let origin_series = if g0.is_some() {
-            Some(integrated_origin_series(&shape))
-        } else {
-            None
-        };
         let prefactor = (4.0 * std::f64::consts::PI).powf(-0.5 * d as f64)
             / (gamma_lanczos(p as f64) * gamma_lanczos(s as f64));
         let u_value_lo = rho_value_floor(d, p).ln();
@@ -924,7 +843,6 @@ impl DuchonRadialProfile {
             shape,
             prefactor,
             g0,
-            origin_series,
             u_value_lo,
             u_lo,
             u_hi,
@@ -987,30 +905,6 @@ impl DuchonRadialProfile {
                 self.shape.p, self.shape.s, self.shape.d
             ))
         })
-    }
-
-    /// `G(ρ) − G(0)` for `ρ > 0`, the profile with its origin value removed; `G(ρ)`
-    /// for a kernel singular at the origin, which has no origin value.
-    ///
-    /// Below [`rho_value_floor`] the profile IS `G(0)`, and well above it the
-    /// deviation is still under `ε · G(0)` for the smallest radii a long length
-    /// scale produces, so `value(ρ) − G(0)` returns roundoff where the kernel
-    /// carries all of its projected content. Up to [`SERIES_CROSSOVER_Z`] the
-    /// deviation is instead summed from [`integrated_origin_series`], whose
-    /// terms start at `ρ²` (or `ρ^{2b}`) and do not cancel. Past it, `G(ρ) − G(0)`
-    /// is a large fraction of `G(0)`, and the certified profile's absolute bound
-    /// is a relative bound on the difference.
-    pub(crate) fn origin_reduced_value(&self, rho: f64) -> f64 {
-        match (self.origin_series.as_deref(), self.g0) {
-            (Some(series), Some(g0)) => {
-                if rho <= SERIES_CROSSOVER_Z {
-                    evaluate_monomials(series, rho, (0.5 * rho).ln())
-                } else {
-                    self.value(rho) - g0
-                }
-            }
-            _ => self.value(rho),
-        }
     }
 
     /// The panel holding `u` for channel `m` and the abscissa to evaluate it
@@ -1465,41 +1359,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    /// gam#2735: the origin-reduced value is `G(ρ) − G(0)` on the series side and
-    /// on the profile side of the crossover, and the two sides meet to the
-    /// profile's own certificate.
-    #[test]
-    fn the_origin_reduced_value_is_the_deviation_from_the_origin_value() {
-        for &(d, p, s) in SHAPES.iter().filter(|(d, p, s)| 2 * (p + s) > *d) {
-            let profile = duchon_radial_profile(p, s, d).expect("profile builds");
-            let g0 = profile.origin_value().expect("b > 0 has an origin value");
-            for rho in [0.05_f64, 0.3, 1.0, SERIES_CROSSOVER_Z, 1.5 * SERIES_CROSSOVER_Z] {
-                let reference = profile.reference(rho).expect("reference converges")[0];
-                let got = profile.origin_reduced_value(rho);
-                // The reference integral carries REFERENCE_RTOL of |G(ρ)|, and the
-                // closed-form origin value its own rounding.
-                let bar = profile.resolution(0, rho)
-                    + REFERENCE_RTOL * reference.abs()
-                    + 8.0 * f64::EPSILON * g0;
-                assert!(
-                    (got - (reference - g0)).abs() <= bar,
-                    "(d={d}, p={p}, s={s}) rho={rho:.3e}: reduced {got:.16e} vs reference − G(0) \
-                     {:.16e}, |Δ|={:.3e} > {bar:.3e}",
-                    reference - g0,
-                    (got - (reference - g0)).abs()
-                );
-            }
-            let series_side = profile.origin_reduced_value(SERIES_CROSSOVER_Z);
-            let profile_side = profile.value(SERIES_CROSSOVER_Z) - g0;
-            let bar = profile.resolution(0, SERIES_CROSSOVER_Z) + 8.0 * f64::EPSILON * g0;
-            assert!(
-                (series_side - profile_side).abs() <= bar,
-                "(d={d}, p={p}, s={s}): the reduced value jumps at the series crossover: \
-                 {series_side:.16e} vs {profile_side:.16e} (bar {bar:.2e})"
-            );
         }
     }
 
