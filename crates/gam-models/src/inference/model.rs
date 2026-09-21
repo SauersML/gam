@@ -1712,9 +1712,12 @@ fn validate_survival_location_scale_saved_fit(
     match structure.time_parameterization {
         SurvivalLocationScaleTimeParameterization::MonotoneWarp => {}
         SurvivalLocationScaleTimeParameterization::ReducedParametricAft => {
-            if payload.beta_baseline_timewiggle.is_some() || link_wiggle.is_some() {
+            // The collapse needs no time wiggle; a link wiggle composes on the
+            // shifted location `q₀(η_t − log t, η_ls)` and replays through the
+            // same `−log t` threshold shift (#3006).
+            if payload.beta_baseline_timewiggle.is_some() {
                 return Err(FittedModelError::SchemaMismatch {
-                    reason: "reduced parametric-AFT location-scale survival cannot carry a time or link wiggle"
+                    reason: "reduced parametric-AFT location-scale survival cannot carry a time wiggle"
                         .to_string(),
                 });
             }

@@ -11,22 +11,25 @@ use crate::survival::location_scale::family_solver::aft_resolvable_trial_count;
 #[test]
 fn resolvable_trial_count_stops_at_the_rounding_band_3185() {
     // Gains 1, 2⁻¹, …, 2⁻⁹ exceed 2⁻¹⁰; the tenth halving lands on the band.
-    assert_eq!(aft_resolvable_trial_count(1.0, 1.0, 0.5, 2f64.powi(-10)), 10);
+    assert_eq!(aft_resolvable_trial_count(1.0, 1.0, 0.0, 0.5, 2f64.powi(-10)), 10);
     // The same gain split as α₀ = 1/4 and g·δ = 4.
-    assert_eq!(aft_resolvable_trial_count(0.25, 4.0, 0.5, 2f64.powi(-10)), 10);
+    assert_eq!(aft_resolvable_trial_count(0.25, 4.0, 0.0, 0.5, 2f64.powi(-10)), 10);
     // A slower contraction resolves more trials: 0.9ᵏ > 0.5 for k ≤ 6.
-    assert_eq!(aft_resolvable_trial_count(1.0, 1.0, 0.9, 0.5), 7);
+    assert_eq!(aft_resolvable_trial_count(1.0, 1.0, 0.0, 0.9, 0.5), 7);
+    // A saddle escape draws its gain from negative curvature alone: with
+    // g·δ = 0 and κ = 2 the gains are α², i.e. 1, 2⁻², …, 2⁻⁸ above 2⁻¹⁰.
+    assert_eq!(aft_resolvable_trial_count(1.0, 0.0, 2.0, 0.5, 2f64.powi(-10)), 5);
 }
 
 #[test]
 fn resolvable_trial_count_is_zero_without_a_resolvable_gain_3185() {
     // A first gain at or under the band cannot be told from rounding.
-    assert_eq!(aft_resolvable_trial_count(1.0, 1e-9, 0.5, 1e-9), 0);
-    assert_eq!(aft_resolvable_trial_count(1e-3, 1e-7, 0.5, 1e-9), 0);
+    assert_eq!(aft_resolvable_trial_count(1.0, 1e-9, 0.0, 0.5, 1e-9), 0);
+    assert_eq!(aft_resolvable_trial_count(1e-3, 1e-7, 0.0, 0.5, 1e-9), 0);
     // A non-ascent or non-finite prediction offers nothing to try.
-    assert_eq!(aft_resolvable_trial_count(1.0, -1.0, 0.5, 0.0), 0);
-    assert_eq!(aft_resolvable_trial_count(1.0, f64::NAN, 0.5, 0.0), 0);
-    assert_eq!(aft_resolvable_trial_count(f64::INFINITY, 1.0, 0.5, 0.0), 0);
+    assert_eq!(aft_resolvable_trial_count(1.0, -1.0, 0.0, 0.5, 0.0), 0);
+    assert_eq!(aft_resolvable_trial_count(1.0, f64::NAN, 0.0, 0.5, 0.0), 0);
+    assert_eq!(aft_resolvable_trial_count(f64::INFINITY, 1.0, 0.0, 0.5, 0.0), 0);
 }
 
 /// Without the stall acceptance every fit must converge on the decrement test

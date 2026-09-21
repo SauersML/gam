@@ -1,32 +1,36 @@
 use super::*;
 use gam_problem::ConstraintSet;
-use gam_linalg::faer_ndarray::FaerEigh;
-use gam_linalg::roundoff::{accumulation_band, symmetric_spectrum_rounding_band};
 use opt::{BacktrackConfig, backtracking_line_search, constants};
 use std::convert::Infallible;
 
 /// Absolute-value Newton direction of the direct parametric-AFT MLE, with the
-/// spectral facts the stopping rule needs.
+/// spectral facts the stopping rule and the saddle escape need.
 pub(crate) struct AftNewtonDirection {
     /// `δ = Q|Λ|⁻¹Qᵀg` over the eigenvalues resolved from zero.
     pub(crate) delta: Array1<f64>,
+    /// The decrement `λ² = gᵀδ = Σ cᵢ²/|λᵢ|` over the same eigenvalues.
+    pub(crate) decrement: f64,
     /// Eigenvalues of `H = −∇²ℓ` resolved below zero.
     pub(crate) negative_curvature: usize,
-    /// The spectrum's rounding band `p·ε·‖H‖₂`.
+    /// The spectrum's rounding band (see [`aft_absolute_newton_direction`]).
     pub(crate) spectrum_band: f64,
     pub(crate) min_eigenvalue: f64,
+    /// Unit eigenvector of `min_eigenvalue`.
+    pub(crate) min_eigenvector: Array1<f64>,
 }
 
-/// Ascent direction for `ℓ` given `H = −∇²ℓ` and `g = ∇ℓ`.
+/// Ascent direction for `ℓ` given `H = −∇²ℓ` and `g = ∇ℓ`, where `H` was
+/// accumulated from `accumulated_rows` per-row terms (zero for an exact matrix).
 ///
 /// With `H = Q Λ Qᵀ` and `cᵢ = qᵢᵀg`, the direction is `δ = Σ (cᵢ/|λᵢ|) qᵢ` over
 /// the eigenvalues outside the spectrum's rounding band
-/// ([`symmetric_spectrum_rounding_band`]). It equals the Newton step `H⁻¹g`
-/// when `H` is positive definite and is an ascent direction for any symmetric
-/// `H`, since `g·δ = Σ cᵢ²/|λᵢ| > 0` (Dauphin et al., "Identifying and
-/// attacking the saddle point problem", NeurIPS 2014). It replaces a Levenberg
-/// ladder `H + τI` whose starting `τ`, growth factor and cap were tuned
-/// constants (#3090).
+/// `b_H = γ_{rows+3p+1}·‖H‖₂` (the row accumulation followed by a
+/// `p`-dimensional backward-stable eigensolve). It equals the Newton step
+/// `H⁻¹g` when `H` is positive definite and is an ascent direction for any
+/// symmetric `H`, since `g·δ = Σ cᵢ²/|λᵢ| > 0` (Dauphin et al., "Identifying
+/// and attacking the saddle point problem", NeurIPS 2014). It replaces a
+/// Levenberg ladder `H + τI` whose starting `τ`, growth factor and cap were
+/// tuned constants (#3090).
 ///
 /// An eigenvalue inside the band carries no curvature, so the quadratic model
 /// has no maximizer along its eigenvector unless the gradient is flat there.
@@ -36,25 +40,34 @@ pub(crate) struct AftNewtonDirection {
 pub(crate) fn aft_absolute_newton_direction(
     h: &Array2<f64>,
     g: &Array1<f64>,
+    accumulated_rows: usize,
 ) -> Result<AftNewtonDirection, SurvivalLocationScaleError> {
+    use gam_linalg::faer_ndarray::strict_symmetric_eigh;
+    use gam_linalg::roundoff::{accumulation_band, accumulation_growth};
+
     let p = g.len();
-    let (eigenvalues, eigenvectors) =
-        h.eigh(faer::Side::Lower)
-            .map_err(|error| SurvivalLocationScaleError::NumericalFailure {
-                reason: format!(
-                    "direct parametric-AFT MLE: joint Hessian eigendecomposition failed: {error}"
-                ),
-            })?;
-    let spectrum: Vec<f64> = eigenvalues.iter().copied().collect();
-    let spectrum_band = symmetric_spectrum_rounding_band(&spectrum);
+    let (eigenvalues, eigenvectors) = strict_symmetric_eigh(h, faer::Side::Lower).map_err(
+        |error| SurvivalLocationScaleError::NumericalFailure {
+            reason: format!(
+                "direct parametric-AFT MLE: joint Hessian eigendecomposition failed: {error}"
+            ),
+        },
+    )?;
+    let h_norm = eigenvalues.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let spectrum_band = accumulation_growth(accumulated_rows + 3 * p + 1) * h_norm;
     let mut delta = Array1::<f64>::zeros(p);
+    let mut decrement = 0.0_f64;
     let mut negative_curvature = 0_usize;
-    for (k, &lambda) in spectrum.iter().enumerate() {
+    let mut min_index = 0_usize;
+    for (k, &lambda) in eigenvalues.iter().enumerate() {
+        if lambda < eigenvalues[min_index] {
+            min_index = k;
+        }
         let q = eigenvectors.column(k);
         let c = q.dot(g);
         if lambda.abs() <= spectrum_band {
             let absolute_sum: f64 = q.iter().zip(g.iter()).map(|(a, b)| (a * b).abs()).sum();
-            let component_band = accumulation_band(p, absolute_sum);
+            let component_band = accumulation_band(accumulated_rows + p, absolute_sum);
             if c.abs() > component_band {
                 return Err(SurvivalLocationScaleError::NumericalFailure {
                     reason: format!(
@@ -70,35 +83,44 @@ pub(crate) fn aft_absolute_newton_direction(
         if lambda < 0.0 {
             negative_curvature += 1;
         }
-        delta.scaled_add(c / lambda.abs(), &q);
+        let weight = c / lambda.abs();
+        delta.scaled_add(weight, &q);
+        decrement += c * weight;
     }
-    let min_eigenvalue = spectrum.iter().copied().fold(f64::INFINITY, f64::min);
     Ok(AftNewtonDirection {
         delta,
+        decrement,
         negative_curvature,
         spectrum_band,
-        min_eigenvalue,
+        min_eigenvalue: eigenvalues[min_index],
+        min_eigenvector: eigenvectors.column(min_index).to_owned(),
     })
 }
 
 /// Number of backtracking trials, starting at `alpha0` and contracting by
-/// `contraction`, whose predicted gain `α·g·δ` stays above the objective's
-/// rounding band. Below that band the Armijo sufficient-increase test compares
-/// log-likelihoods that round to the same value, so a further trial can only
-/// accept rounding noise (#3185).
+/// `contraction`, whose predicted second-order gain
+/// `m(α) = α·g·δ + ½α²·κ` stays above the objective's rounding band. Below
+/// that band the Armijo sufficient-increase test compares log-likelihoods
+/// that round to the same value, so a further trial can only accept rounding
+/// noise (#3185). `m` is increasing in `α > 0` wherever it is positive, so the
+/// trials resolvable from `alpha0` are exactly the leading run above the band.
 pub(crate) fn aft_resolvable_trial_count(
     alpha0: f64,
-    directional: f64,
+    slope: f64,
+    curvature_gain: f64,
     contraction: f64,
     objective_band: f64,
 ) -> usize {
     let mut trials = 0_usize;
-    let mut predicted_gain = alpha0 * directional;
-    while predicted_gain.is_finite() && predicted_gain > objective_band {
+    let mut alpha = alpha0;
+    loop {
+        let predicted_gain = alpha * slope + 0.5 * alpha * alpha * curvature_gain;
+        if !(predicted_gain.is_finite() && predicted_gain > objective_band) {
+            return trials;
+        }
         trials += 1;
-        predicted_gain *= contraction;
+        alpha *= contraction;
     }
-    trials
 }
 
 impl SurvivalLocationScaleFamily {
@@ -160,58 +182,83 @@ impl SurvivalLocationScaleFamily {
     /// exact-joint REML machinery is the wrong tool (issue #736/#735/#721): it
     /// runs an outer ρ search around an inner per-block trust-region Newton that
     /// oscillates and never certifies stationarity on this tiny unpenalized
-    /// likelihood. Instead we run a line-searched joint Newton directly
-    /// on the negative log-likelihood `−ℓ(θ)`, converging in a handful of
-    /// iterations exactly like `survreg`/`lifelines`.
+    /// likelihood. Instead we run a globally convergent modified Newton directly
+    /// on the negative log-likelihood `−ℓ(θ)`.
     ///
-    /// The step is `δ = H⁻¹ g` with `g = ∇ℓ` (the block-concatenated
-    /// log-likelihood gradient) and `H = −∇²ℓ` (the exact joint Hessian, all
-    /// cross-blocks included). When `H` is not positive definite at the current
-    /// iterate the step is the absolute-value Newton step `Q|Λ|⁻¹Qᵀg`
-    /// ([`aft_absolute_newton_direction`]), an ascent direction with the same
-    /// curvature scaling. The step length is first capped to keep the monotone
-    /// time-warp feasible (`max_feasible_step_size`) and then Armijo-backtracked
-    /// on `−ℓ`, so the time derivative stays `≥ guard` at every observed time
-    /// and `ℓ` increases monotonically.
+    /// # Step
+    ///
+    /// With `g = ∇ℓ` (the block-concatenated log-likelihood gradient) and
+    /// `H = −∇²ℓ = QΛQᵀ` (the exact joint Hessian, all cross-blocks included),
+    /// the ascent direction is the Newton step in the absolute-value metric
+    /// `|H| = Q|Λ|Qᵀ` restricted to the numerically nonzero spectrum,
+    ///
+    ///   `δ = Σ_{|Λ_i| > b_H} q_i (q_iᵀg) / |Λ_i|`,
+    ///
+    /// where `b_H = γ_{n+3p+1}·‖H‖₂` is the rounding band of the assembled
+    /// spectrum (an `n`-row accumulation followed by a `p`-dimensional
+    /// eigensolve). Where `H ≻ 0` this IS the Newton step `H⁻¹g`, so the local
+    /// rate is quadratic; where `H` is indefinite (the `(β, log σ)` likelihood is
+    /// not concave off the optimum) `|H|` is a positive definite metric on the
+    /// kept subspace, `gᵀδ > 0`, and Armijo backtracking along `δ` converges to a
+    /// stationary point by Zoutendijk's theorem (the modified Newton of Thm 3.11,
+    /// with `|H|` as the positive definite metric — the censored, delayed-entry
+    /// likelihood has no closed-form Fisher information). This replaces the
+    /// Levenberg `H + τI` escalation, whose damping schedule was a set of magic
+    /// constants and whose first-order fixed point can be a saddle.
+    ///
+    /// Once the decrement is at its band but `H` has a direction of negative
+    /// curvature below `−b_H`, the iterate is a saddle, not a mode (Prop 3.13):
+    /// the step is the eigenvector of the smallest eigenvalue, signed uphill in
+    /// `ℓ` and scaled to unit `|H|`-length, with the same sufficient-increase
+    /// test on the second-order model gain (Moré & Sorensen 1979). A numerically
+    /// zero eigenvalue at a stationary point is a flat, non-identified direction
+    /// and is refused.
+    ///
+    /// The initial step length is the barrier step of Thm B′,
+    /// `α₀ = min(1, 1/(1+ρ_b))` with `ρ_b = 1/α_max` from the monotone
+    /// time-warp's feasibility boundary (`max_feasible_step_size`), so every
+    /// trial stays strictly inside the domain without landing on its edge.
+    /// Backtracking halves `α` while the predicted gain
+    /// `m(α) = α·gᵀδ + ½α²·max(0, −δᵀHδ)` is still resolvable above the
+    /// objective's rounding band, accepting the first trial with the sufficient
+    /// increase `ℓ(θ + αδ) ≥ ℓ(θ) + c₁·m(α)`; a search exhausted
+    /// at that resolution while the decrement is above its band is a genuine
+    /// curvature-model failure and is surfaced as an error.
     ///
     /// # Convergence criterion
     ///
     /// Stationarity is certified by the **Newton decrement**
-    /// `λ²(θ) = gᵀH⁻¹g = g·δ ≥ 0`, whose half is a second-order estimate of the
+    /// `λ²(θ) = gᵀδ ≥ 0`, whose half is a second-order estimate of the
     /// log-likelihood gap `ℓ(θ*) − ℓ(θ) ≈ ½λ²` (equivalently, `λ²` is the squared
     /// Mahalanobis distance from `θ` to the optimum in the observed-information
-    /// metric). The fit stops when `½λ² ≤ obj_tol` and `H` has no eigenvalue
-    /// resolved below zero; a stationary point with negative curvature is not
-    /// the MLE and is reported as a failure.
+    /// metric), together with the Cholesky-level certificate `Λ_min > b_H` that
+    /// the stationary point is a strict local maximum of `ℓ`. The fit stops when
+    /// `½λ² ≤ γ_{n+p²}·|ℓ|`: that objective band is the resolution below which a
+    /// predicted gain cannot be told from zero (§6.4, interior stop
+    /// `λ² ≤ 2·band_f`), so the stop is the floating-point floor itself — no
+    /// user tolerance enters, and the rule is invariant to rescaling the case
+    /// weights (`ℓ`, `λ²` and the band all scale together). There is no
+    /// iteration cap: every accepted step raises `ℓ` by more than the band, so
+    /// the loop terminates at this stop.
     ///
     /// A raw gradient-norm test is NOT used here: `g = ∇ℓ` is a SUM over the `n`
     /// observations, so at the true MLE its attainable sup-norm floor in double
     /// precision grows like `n·ε`, and an absolute gradient tolerance therefore
     /// spuriously fails to converge on perfectly benign data with rising
-    /// frequency as `n` grows (gam#2112). The decrement `gᵀH⁻¹g` divides the
-    /// n-scaled gradient by the n-scaled curvature, so it is invariant to the
-    /// sample size and to any affine reparameterization: a single fixed `obj_tol`
-    /// certifies stationarity uniformly across `n`, and its own round-off floor
-    /// (`~ n·ε²·κ(H)`) stays vanishingly far below any usable tolerance.
-    ///
-    /// The backtracking tries steps only while their predicted gain `α·g·δ`
-    /// exceeds the objective's rounding band ([`aft_resolvable_trial_count`]).
-    /// If none of them is Armijo-sufficient, `ℓ` disagrees with its own
-    /// derivatives at a point whose decrement is still above tolerance: that is
-    /// not an MLE and is surfaced as an error, never accepted.
+    /// frequency as `n` grows (gam#2112). The decrement divides the n-scaled
+    /// gradient by the n-scaled curvature, so it is invariant to the sample size
+    /// and to any affine reparameterization.
     ///
     /// Returns the converged block states, the log-likelihood at the MLE, and
-    /// the joint negative-log-likelihood Hessian `H` (the observed information),
-    /// whose inverse is the conditional covariance the caller assembles.
-    ///
-    /// `obj_tol` is the caller's objective-suboptimality tolerance on `½λ²`
-    /// described above, raised to the objective's own rounding band.
+    /// the joint negative-log-likelihood Hessian `H` (the observed information,
+    /// certified positive definite), whose inverse is the conditional covariance
+    /// the caller assembles.
     pub(crate) fn fit_parametric_aft_direct_mle(
         &self,
         specs: &[ParameterBlockSpec],
-        max_iter: usize,
-        obj_tol: f64,
     ) -> Result<(Vec<ParameterBlockState>, f64, Array2<f64>), SurvivalLocationScaleError> {
+        use gam_linalg::roundoff::accumulation_growth;
+
         self.validate_joint_specs(
             specs,
             "SurvivalLocationScaleFamily direct parametric-AFT MLE",
@@ -253,24 +300,19 @@ impl SurvivalLocationScaleFamily {
                 .slice_mut(s![offsets[b]..offsets[b + 1]])
                 .assign(&state.beta);
         }
-        let mut ll = self.log_likelihood_only(&states)?;
-        if !ll.is_finite() {
+        let initial_ll = self.log_likelihood_only(&states)?;
+        if !initial_ll.is_finite() {
             return Err(SurvivalLocationScaleError::NumericalFailure {
                 reason: format!(
-                    "direct parametric-AFT MLE: non-finite initial log-likelihood {ll}"
+                    "direct parametric-AFT MLE: non-finite initial log-likelihood {initial_ll}"
                 ),
             }
             .into());
         }
+        let n_rows = states.iter().map(|state| state.eta.len()).max().unwrap_or(0);
 
-        // Newton iterations on −ℓ(θ).
-        let mut converged = false;
-        let mut last_grad_norm = f64::INFINITY;
-        let mut last_newton_decrement = f64::INFINITY;
-        for _ in 0..max_iter {
-            let (ll_now, block_gradients) =
-                self.evaluate_log_likelihood_and_block_gradients(&states)?;
-            ll = ll_now;
+        loop {
+            let (ll, block_gradients) = self.evaluate_log_likelihood_and_block_gradients(&states)?;
             // Concatenate the block log-likelihood gradients g = ∇ℓ.
             let mut g = Array1::<f64>::zeros(p_total);
             if block_gradients.len() != specs.len() {
@@ -296,133 +338,97 @@ impl SurvivalLocationScaleFamily {
                 }
                 g.slice_mut(s![offsets[b]..offsets[b + 1]]).assign(gb);
             }
-            if !g.iter().all(|v| v.is_finite()) {
+            if !ll.is_finite() || !g.iter().all(|v| v.is_finite()) {
                 return Err(SurvivalLocationScaleError::NumericalFailure {
-                    reason: "direct parametric-AFT MLE: non-finite gradient".to_string(),
+                    reason: "direct parametric-AFT MLE: non-finite log-likelihood or gradient"
+                        .to_string(),
                 }
                 .into());
             }
-            // The step `H δ = g` is solved on a consistent (objective, gradient,
-            // Hessian) triple for EVERY residual distribution: `g = ∇ℓ` above is
-            // the block-gradient reduction
-            // (`evaluate_log_likelihood_and_block_gradients`) and `H = −∇²ℓ` below
-            // is the packed 27-pair coefficient lowering; both are pinned to the
-            // ONE single-sourced `sls_row_nll` program to ≤1e-9 by the analytic
-            // oracles (`survival_ls_block_gradient_matches_single_sourced_tower_932`
-            // for the gradient across Gaussian/Gumbel/Logistic on the every-channel
-            // time-varying shape;
-            // `survival_ls_time_varying_joint_hessian_matches_single_sourced_tower_932`
-            // for the Hessian). This closes gam#1110, where an earlier hand block
-            // gradient diverged from the jet for the logit (log-logistic) residual
-            // and pinned the `age` location coefficient to its cold-start 0: the
-            // oracle now forbids any dropped cross-channel term from reappearing.
-            // Retained for diagnostics only — the stopping test is the Newton
-            // decrement computed below, NOT this raw summed-gradient sup-norm
-            // (whose attainable floor scales with `n`; see the doc comment /
-            // gam#2112).
-            let grad_norm = g.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-            last_grad_norm = grad_norm;
-
-            // H = −∇²ℓ (positive (semi)definite near the optimum). The exact
-            // joint Hessian assembly returns it directly, symmetrized.
+            // The (objective, gradient, Hessian) triple is consistent for EVERY
+            // residual distribution: `g = ∇ℓ` above is the block-gradient
+            // reduction (`evaluate_log_likelihood_and_block_gradients`) and
+            // `H = −∇²ℓ` below is the packed 27-pair coefficient lowering; both
+            // are pinned to the ONE single-sourced `sls_row_nll` program to
+            // ≤1e-9 by the analytic oracles
+            // (`survival_ls_block_gradient_matches_single_sourced_tower_932`;
+            // `survival_ls_time_varying_joint_hessian_matches_single_sourced_tower_932`).
+            // This closes gam#1110, where an earlier hand block gradient diverged
+            // from the jet for the logit (log-logistic) residual.
             let h = self.exact_newton_joint_hessian(&states)?.ok_or_else(|| {
                 SurvivalLocationScaleError::NumericalFailure {
                     reason: "direct parametric-AFT MLE: joint Hessian assembly failed".to_string(),
                 }
             })?;
-            if !h.iter().all(|v| v.is_finite()) {
-                return Err(SurvivalLocationScaleError::NumericalFailure {
-                    reason: "direct parametric-AFT MLE: non-finite joint Hessian".to_string(),
-                }
-                .into());
-            }
+            let gain_band = accumulation_growth(n_rows + p_total * p_total) * ll.abs();
 
-            // Ascent direction for ℓ from the spectrum of H = Q Λ Qᵀ: the
-            // absolute-value (saddle-free) Newton step δ = Q|Λ|⁻¹Qᵀg. It is the
-            // Newton step H⁻¹g whenever H is positive definite, and off the
-            // optimum, where H may be indefinite, it keeps Newton's curvature
-            // scaling while flipping the negative-curvature directions into
-            // ascent, so g·δ = Σ cᵢ²/|λᵢ| > 0 with no damping to tune (#3090).
+            // Modified-Newton ascent direction in the |H| metric on the
+            // numerically nonzero spectrum; its decrement λ² = gᵀδ.
             let AftNewtonDirection {
-                delta,
+                mut delta,
+                decrement,
                 negative_curvature,
-                spectrum_band,
-                min_eigenvalue,
-            } = aft_absolute_newton_direction(&h, &g)?;
-            if !delta.iter().all(|v| v.is_finite()) {
-                return Err(SurvivalLocationScaleError::NumericalFailure {
-                    reason: "direct parametric-AFT MLE: non-finite Newton step".to_string(),
+                spectrum_band: spectral_band,
+                min_eigenvalue: lambda_min,
+                min_eigenvector,
+            } = aft_absolute_newton_direction(&h, &g, n_rows)?;
+
+            if 0.5 * decrement <= gain_band {
+                if lambda_min > spectral_band {
+                    // Stationary to the objective's resolution with a positive
+                    // definite observed information: a certified strict MLE.
+                    return Ok((states, ll, h));
                 }
-                .into());
+                if lambda_min >= -spectral_band {
+                    return Err(SurvivalLocationScaleError::NumericalFailure {
+                        reason: format!(
+                            "direct parametric-AFT MLE: stationary point has a numerically zero \
+                             observed-information eigenvalue {lambda_min:.6e} (band {spectral_band:.6e}); \
+                             the likelihood is flat along that direction, so the model is not identified"
+                        ),
+                    }
+                    .into());
+                }
+                // A saddle: continue along the most negative curvature direction,
+                // signed uphill in ℓ, at unit |H|-length.
+                let sign = if g.dot(&min_eigenvector) >= 0.0 { 1.0 } else { -1.0 };
+                delta = min_eigenvector.mapv(|v| sign * v / lambda_min.abs().sqrt());
             }
 
-            // Affine-invariant stationarity test: the Newton decrement
-            //   λ² = gᵀH⁻¹g = g·δ ≥ 0,   ℓ(θ*) − ℓ(θ) ≈ ½λ².
-            // Because δ = H⁻¹g divides the n-scaled gradient by the n-scaled
-            // curvature, ½λ² (the estimated log-likelihood gap, equivalently the
-            // squared Mahalanobis distance to θ* in the observed-information
-            // metric) is invariant to the sample size — so a single `obj_tol`
-            // certifies stationarity uniformly across `n`, unlike the raw
-            // summed-gradient sup-norm whose floor grows like n·ε (gam#2112).
-            // Where H is indefinite the decrement is g·δ = gᵀ|H|⁻¹g, the same
-            // quadratic form in the |H| metric; a small value there is a
-            // stationary point that is not a maximum, which the second-order
-            // certificate below refuses rather than accepts.
-            let newton_decrement = g.dot(&delta);
-            // Second-order optimality: a stationary iterate is the MLE only if
-            // H = −∇²ℓ has no eigenvalue resolved below zero. A saddle or a
-            // minimum of ℓ is reported with its inertia, never certified.
-            let certify_maximum = || -> Result<(), SurvivalLocationScaleError> {
-                if negative_curvature == 0 {
-                    return Ok(());
-                }
-                Err(SurvivalLocationScaleError::NumericalFailure {
-                    reason: format!(
-                        "direct parametric-AFT MLE: stationary point is not a maximum of the \
-                         log-likelihood ({negative_curvature} of {p_total} eigenvalues of −∇²ℓ \
-                         below −{spectrum_band:.3e}; smallest {min_eigenvalue:.6e})"
-                    ),
-                })
-            };
-            last_newton_decrement = newton_decrement;
-            // The log-likelihood accumulates `n` rows and the decrement `p²`
-            // products; a predicted gain inside that accumulation's rounding band
-            // `γ_{n+p²}·|ℓ|` cannot be told from zero, so the caller's tolerance is
-            // raised to it.
-            let n_rows = states.iter().map(|state| state.eta.len()).max().unwrap_or(0);
-            let objective_band =
-                gam_linalg::roundoff::accumulation_growth(n_rows + p_total * p_total) * ll.abs();
-            if 0.5 * newton_decrement <= obj_tol.max(objective_band) {
-                certify_maximum()?;
-                converged = true;
-                break;
-            }
+            // Second-order model gain of ℓ along δ: m(α) = α·gᵀδ + ½α²·κ with
+            // κ = max(0, −δᵀHδ), the gain the quadratic model draws from negative
+            // curvature of −ℓ. Where δᵀHδ ≥ 0, κ = 0 and this is the classical
+            // Armijo slope test.
+            let slope = g.dot(&delta);
+            let curvature_gain = (-delta.dot(&h.dot(&delta))).max(0.0);
+            let model_gain = |alpha: f64| alpha * slope + 0.5 * alpha * alpha * curvature_gain;
 
-            // Cap the step to keep the monotone time-warp feasible: the family's
-            // per-block feasibility barrier reports the largest α that keeps the
-            // derivative guard satisfied (only the time block constrains it).
+            // Thm B′ barrier step: stay strictly inside the monotone time-warp
+            // domain, α₀ = 1/(1+ρ_b) with ρ_b = 1/α_max.
             let mut alpha = 1.0_f64;
             for (b, spec_offset) in offsets.iter().take(specs.len()).enumerate() {
                 let block_delta = delta.slice(s![*spec_offset..offsets[b + 1]]).to_owned();
                 if let Some(a_max) = self.max_feasible_step_size(&states, b, &block_delta)? {
-                    alpha = alpha.min(a_max);
+                    alpha = alpha.min(a_max / (1.0 + a_max));
                 }
             }
 
-            // Armijo backtracking on −ℓ along the (feasibility-capped) Newton
-            // ascent direction. `g·δ > 0` because δ is an ascent direction, so a
-            // sufficient-increase condition on ℓ is well posed. The directional
-            // derivative is exactly the Newton decrement computed above.
-            let directional = newton_decrement;
-            let contraction = constants::BACKTRACK_CONTRACTION;
-            let max_steps =
-                aft_resolvable_trial_count(alpha, directional, contraction, objective_band);
+            // A trial whose predicted gain m(α) is inside the objective band
+            // cannot be told from no change, so the trial count is the number
+            // of step lengths whose predicted gain is above that resolution.
+            let max_steps = aft_resolvable_trial_count(
+                alpha,
+                slope,
+                curvature_gain,
+                constants::BACKTRACK_CONTRACTION,
+                gain_band,
+            );
             // A trial whose block-state rebuild or likelihood evaluation errors
-            // is INVALID (`Ok(None)`): halve without consulting the Armijo test.
+            // is INVALID (`Ok(None)`): contract without consulting the test.
             let accepted = match backtracking_line_search::<_, Infallible>(
                 BacktrackConfig {
                     initial_step: alpha,
-                    contraction,
+                    contraction: constants::BACKTRACK_CONTRACTION,
                     max_steps,
                 },
                 |alpha| {
@@ -439,64 +445,32 @@ impl SurvivalLocationScaleFamily {
                 },
                 |alpha, cand_ll| {
                     cand_ll.is_finite()
-                        && cand_ll >= ll + constants::ARMIJO_C1 * alpha * directional
+                        && cand_ll >= ll + constants::ARMIJO_C1 * model_gain(alpha)
                 },
             ) {
                 Ok(result) => result,
                 Err(never) => match never {},
             };
-            match accepted.map(|step| (step.payload.0, step.payload.1, step.value)) {
-                Some((new_theta, new_states, new_ll)) => {
-                    theta = new_theta;
-                    states = new_states;
-                    ll = new_ll;
+            match accepted {
+                Some(step) => {
+                    theta = step.payload.0;
+                    states = step.payload.1;
                 }
-                // No trial with a resolvable predicted gain is Armijo-sufficient,
-                // yet the decrement is above tolerance (a smaller one converged
-                // above): ℓ disagrees with its own gradient and curvature here, so
-                // this iterate is not certified as the MLE (#3185).
                 None => {
                     return Err(SurvivalLocationScaleError::NumericalFailure {
                         reason: format!(
-                            "direct parametric-AFT MLE: line search failed before convergence \
-                             (½·Newton-decrement {half_decrement:.6e} > tolerance {obj_tol:.6e}; \
-                             gradient sup-norm {grad_norm:.6e})",
-                            half_decrement = 0.5 * newton_decrement
+                            "direct parametric-AFT MLE: no sufficient-increase step is resolvable \
+                             above the objective band {gain_band:.6e} (½·decrement {half:.6e}, \
+                             smallest observed-information eigenvalue {lambda_min:.6e}, \
+                             {negative_curvature} of {p_total} resolved below zero); the \
+                             curvature model disagrees with the likelihood",
+                            half = 0.5 * decrement
                         ),
                     }
                     .into());
                 }
             }
         }
-
-        if !converged {
-            return Err(SurvivalLocationScaleError::NumericalFailure {
-                reason: format!(
-                    "direct parametric-AFT MLE: failed to converge after {max_iter} Newton iterations \
-                     (last ½·Newton-decrement {half_decrement:.6e} > tolerance {obj_tol:.6e}; \
-                     last gradient sup-norm {last_grad_norm:.6e})",
-                    half_decrement = 0.5 * last_newton_decrement
-                ),
-            }
-            .into());
-        }
-
-        // Observed information at the MLE: the joint negative-log-likelihood
-        // Hessian. This is the conditional precision; its inverse is the
-        // covariance the caller lifts to the raw coordinate system.
-        let h_final = self.exact_newton_joint_hessian(&states)?.ok_or_else(|| {
-            SurvivalLocationScaleError::NumericalFailure {
-                reason: "direct parametric-AFT MLE: final joint Hessian assembly failed"
-                    .to_string(),
-            }
-        })?;
-        if !h_final.iter().all(|v| v.is_finite()) {
-            return Err(SurvivalLocationScaleError::NumericalFailure {
-                reason: "direct parametric-AFT MLE: non-finite final joint Hessian".to_string(),
-            }
-            .into());
-        }
-        Ok((states, ll, h_final))
     }
 
     /// Compute the log-scale shift needed to keep CLogLog survival
@@ -1871,98 +1845,6 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 .max_feasible_link_wiggle_step(&block_states[Self::BLOCK_LINK_WIGGLE].beta, delta);
         }
         Ok(None)
-    }
-
-    fn joint_trust_metric_block_floor(
-        &self,
-        block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-    ) -> Result<Option<Array1<f64>>, String> {
-        // The floor is returned in the packed joint coefficient space this
-        // family lays out, so the caller's blocks must be the blocks that
-        // layout describes — otherwise the returned vector would be applied to
-        // a metric it does not index.
-        self.validate_joint_specs(
-            specs,
-            "SurvivalLocationScaleFamily joint trust metric floor",
-        )?;
-        // Scale-aware trust-metric floor for the coupled smooth-scale fit
-        // (issue #1569). The free scale predictor `η_σ` enters the likelihood
-        // through the standardized index `u = inv_sigma·(h − η_t)` with
-        // `inv_sigma = exp(−η_σ)`, so `∂u/∂h = inv_sigma` and
-        // `∂u/∂η_t = −inv_sigma`: the TIME, LOCATION (threshold) and LOG-σ
-        // channels all carry an `exp(−η_σ)` factor in their gradient and an
-        // `exp(−2 η_σ)` factor in their likelihood-Hessian diagonal, since the
-        // scale divides the whole residual (#2695). When the scale predictor
-        // drives some rows to small σ (large `exp(−η_σ)`), a coefficient loading
-        // mostly on the large-σ rows is METRIC-STARVED relative to one loading on the small-σ
-        // rows; the affine-covariant Moré–Sorensen step then over-reaches on the
-        // starved coordinate, the gain ratio never justifies growing the radius,
-        // and the inner solve grinds. We floor each scale-coupled block's metric
-        // entries at `SCALE_COUPLED_TRUST_METRIC_FLOOR_REL × (block max metric)`,
-        // capping the `exp(−η_σ)`-induced metric condition number so no
-        // coordinate is starved. The floor is derived ENTIRELY from the
-        // scale-coupled Hessian diagonal (no knob); `max(D_i, floor_i)` can only
-        // tighten the metric and self-vanishes at the KKT fixed point.
-        let offsets = self.joint_block_offsets();
-        if offsets.len() < 2 {
-            return Ok(None);
-        }
-        let p_total = *offsets
-            .last()
-            .ok_or_else(|| "missing joint block offsets".to_string())?;
-        // Lower only the joint likelihood diagonal from the scale-stabilized
-        // packed coefficients. The uniform `exp(−L)` rescale cancels in the
-        // relative floor `fraction × max(diag)`, so the floor is scale-invariant.
-        let log_scale = self.hessian_deriv_log_rescale(block_states);
-        let dynamic = self.build_dynamic_geometry(block_states)?;
-        let h_diagonal = if self.x_link_wiggle.is_some() {
-            super::row_kernel::survival_ls_wiggle_joint_hessian_dense(self, &dynamic, log_scale)?
-                .diag()
-                .to_owned()
-        } else {
-            self.survival_ls_coefficient_hessian(
-                &dynamic,
-                log_scale,
-                None,
-                SlsCoefficientHessianTarget::DiagonalOnly,
-            )?
-            .into_diagonal_only()?
-        };
-        if h_diagonal.len() != p_total {
-            return Ok(None);
-        }
-        let mut floor = Array1::<f64>::zeros(p_total);
-        let mut any = false;
-        // Floor the LOCATION (threshold) and LOG-σ blocks. The time block carries
-        // the same factor but is left unfloored: its metric range comes as much
-        // from the warp basis as from σ, and flooring it would move the metric of
-        // every constant-scale fit whose time block spans six decades.
-        for &block in &[Self::BLOCK_THRESHOLD, Self::BLOCK_LOG_SIGMA] {
-            if block + 1 >= offsets.len() {
-                continue;
-            }
-            let (start, end) = (offsets[block], offsets[block + 1]);
-            if end <= start {
-                continue;
-            }
-            let max_diag = (start..end)
-                .map(|j| h_diagonal[j].abs())
-                .filter(|v| v.is_finite())
-                .fold(0.0_f64, f64::max);
-            if !(max_diag.is_finite() && max_diag > 0.0) {
-                continue;
-            }
-            let floor_value = SCALE_COUPLED_TRUST_METRIC_FLOOR_REL * max_diag;
-            if !(floor_value.is_finite() && floor_value > 0.0) {
-                continue;
-            }
-            for j in start..end {
-                floor[j] = floor_value;
-            }
-            any = true;
-        }
-        if any { Ok(Some(floor)) } else { Ok(None) }
     }
 
     fn post_update_block_beta(

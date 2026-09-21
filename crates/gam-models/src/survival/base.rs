@@ -2910,7 +2910,7 @@ impl WorkingModelSurvival {
         use gam_problem::PseudoLogdetMode;
         use gam_solve::estimate::reml::assembly::InnerAssembly;
         use gam_solve::estimate::reml::reml_outer_engine::{
-            DenseSpectralOperator, DispersionHandling,
+            DenseSpectralOperator, DispersionHandling, HessianFactorization,
         };
         use gam_solve::estimate::reml::reparameterized_inner::{
             RawInnerReparamContext, assemble_reparameterized_inner,
@@ -3227,7 +3227,12 @@ impl WorkingModelSurvival {
             reason: format!(
                 "survival LAML requires a positive-definite inner Hessian at this rho: {reason}"
             ),
-        })?;
+        })?
+        // A large smoothing strength grades H' by orders of magnitude; the
+        // eigensolver's normwise error then moves `log|H'|` by up to 1e-7 at a
+        // fixed mode, which the LLT's componentwise error does not (#1561).
+        .with_cholesky_logdet(&reparam_inner.hessian_transformed);
+        let logdet_forward_error = hop.logdet_forward_error();
 
         // Penalty coordinates: the per-block TRANSFORMED roots (Q_s frame), the
         // single source of truth for penalty roots there. One coordinate per ρ
@@ -3305,12 +3310,15 @@ impl WorkingModelSurvival {
         let gradient = result
             .gradient_for_mode(mode, rho.len())
             .map_err(|reason| EstimationError::TrialPointRefused { reason })?;
+        // The value's resolution: the rounding of the summed components, plus
+        // the forward error of the `½·log|H'|` term the operator certifies.
         let resolution = f64::EPSILON
             * (1.0
                 + result.criterion_components.fixed_beta.abs()
                 + result.criterion_components.logdet_h.abs()
                 + result.criterion_components.logdet_s.abs()
-                + result.criterion_components.kkt.abs());
+                + result.criterion_components.kkt.abs())
+            + 0.5 * logdet_forward_error.unwrap_or(f64::INFINITY);
         Ok((result.cost, gradient, result.hessian, resolution))
     }
 

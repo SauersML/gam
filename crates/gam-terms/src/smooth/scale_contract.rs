@@ -26,6 +26,7 @@ pub enum BasisScaleFamily {
     FactorSmoothFs,
     FactorSmoothSz,
     FactorSmoothRe,
+    FactorSmoothLevelSlopes,
     ThinPlate,
     SphereWahba,
     SphereHarmonic,
@@ -41,7 +42,7 @@ pub enum BasisScaleFamily {
 impl BasisScaleFamily {
     /// Canonical registry order.  The registry-completeness test walks this
     /// array and compares it with a concrete `SmoothBasisSpec` zoo.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::ByVariableNumeric,
         Self::ByVariableFactor,
         Self::FactorSumToZero,
@@ -53,6 +54,7 @@ impl BasisScaleFamily {
         Self::FactorSmoothFs,
         Self::FactorSmoothSz,
         Self::FactorSmoothRe,
+        Self::FactorSmoothLevelSlopes,
         Self::ThinPlate,
         Self::SphereWahba,
         Self::SphereHarmonic,
@@ -107,6 +109,10 @@ pub enum BasisDesignScaleLaw {
     /// degree-one columns in each factor level: intercept columns are invariant
     /// and slope columns gain one power of the abscissa scale.
     RandomInterceptSlopeDegreesZeroAndOne,
+    /// Every column is a level contrast times the centered abscissa `x - c`,
+    /// with `c` moving with the knots, so each entry gains exactly one power
+    /// of the abscissa scale.
+    LevelContrastSlopeDegreeOne,
     /// Every design entry gains exactly one power of the chart scale `a`.
     ///
     /// The constant-curvature smooth's kernel is `ℓ·(e^{−d_κ/ℓ} − 1)`, which is
@@ -576,6 +582,19 @@ impl SmoothBasisSpec {
                     children: vec![bspline_contract(&spec.marginal)],
                     input_frame: InputFrameNormalization::Delegated,
                 },
+                FactorSmoothFlavour::LevelSlopes => BasisScaleContract {
+                    family: BasisScaleFamily::FactorSmoothLevelSlopes,
+                    coordinate_action: BasisCoordinateScaleAction::PositiveAffineAbscissa,
+                    design: BasisDesignScaleLaw::LevelContrastSlopeDegreeOne,
+                    penalty: BasisPenaltyScaleLaw::FrobeniusNormalizedInvariant,
+                    derivatives: BasisDerivativeScaleLaw::InverseCoordinatePower {
+                        maximum_order: 1,
+                    },
+                    null_geometry: BasisNullGeometryScaleLaw::FullRankRandomEffect,
+                    dimensionful_parameters: vec![scale(1, DimensionfulBasisParameter::Knots)],
+                    children: vec![bspline_contract(&spec.marginal)],
+                    input_frame: InputFrameNormalization::Delegated,
+                },
             },
             SmoothBasisSpec::ThinPlate { .. } => BasisScaleContract::leaf(
                 BasisScaleFamily::ThinPlate,
@@ -891,6 +910,7 @@ mod tests {
             factor_spec(FactorSmoothFlavour::Fs {}),
             factor_spec(FactorSmoothFlavour::Sz),
             factor_spec(FactorSmoothFlavour::Re),
+            factor_spec(FactorSmoothFlavour::LevelSlopes),
             SmoothBasisSpec::ThinPlate {
                 feature_cols: vec![0, 1],
                 spec: ThinPlateBasisSpec {
@@ -1015,7 +1035,8 @@ mod tests {
                 | BasisScaleFamily::BySmoothFactor
                 | BasisScaleFamily::FactorSmoothFs
                 | BasisScaleFamily::FactorSmoothSz
-                | BasisScaleFamily::FactorSmoothRe => {
+                | BasisScaleFamily::FactorSmoothRe
+                | BasisScaleFamily::FactorSmoothLevelSlopes => {
                     assert_eq!(contract.children.len(), 1, "{:?}", contract.family);
                 }
                 BasisScaleFamily::TensorBSpline => {
@@ -1295,6 +1316,9 @@ mod tests {
             BasisScaleFamily::FactorSmoothFs => factor_smooth(FactorSmoothFlavour::Fs {}),
             BasisScaleFamily::FactorSmoothSz => factor_smooth(FactorSmoothFlavour::Sz),
             BasisScaleFamily::FactorSmoothRe => factor_smooth(FactorSmoothFlavour::Re),
+            BasisScaleFamily::FactorSmoothLevelSlopes => {
+                factor_smooth(FactorSmoothFlavour::LevelSlopes)
+            }
             BasisScaleFamily::OpenBSpline
             | BasisScaleFamily::CyclicBSpline
             | BasisScaleFamily::NaturalCubic
@@ -1399,6 +1423,28 @@ mod tests {
                 joint_unpenalized_dim(actual.dim, &actual.active_penalties),
                 0,
                 "the combined random-intercept/slope penalty must be full rank"
+            );
+        }
+
+        // Level-slope deviations: every column is a contrast times `x - c`.
+        let family = BasisScaleFamily::FactorSmoothLevelSlopes;
+        let reference = build_local(&data, wrapper_basis(family, 1.0));
+        for factor in [1e-9_f64, 1.0, 1e9] {
+            let mut scaled = data.clone();
+            scaled.column_mut(0).mapv_inplace(|value| factor * value);
+            let actual = build_local(&scaled, wrapper_basis(family, factor));
+            let pulled_back = actual.design.to_dense().mapv(|value| value / factor);
+            assert_matrix_close(&pulled_back, &reference.design.to_dense(), 2e-9);
+            assert_eq!(actual.active_penalties.len(), 1);
+            assert_matrix_close(
+                &actual.active_penalties[0].matrix,
+                &reference.active_penalties[0].matrix,
+                2e-10,
+            );
+            assert_eq!(
+                joint_unpenalized_dim(actual.dim, &actual.active_penalties),
+                0,
+                "the level-slope penalty must be full rank"
             );
         }
     }
@@ -1615,6 +1661,7 @@ mod tests {
             | BasisScaleFamily::FactorSmoothFs
             | BasisScaleFamily::FactorSmoothSz
             | BasisScaleFamily::FactorSmoothRe
+            | BasisScaleFamily::FactorSmoothLevelSlopes
             | BasisScaleFamily::SphereWahba
             | BasisScaleFamily::SphereHarmonic
             | BasisScaleFamily::ConstantCurvature

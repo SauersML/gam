@@ -1170,6 +1170,76 @@ where
     run_baseline_theta_optimizer(initial, age_exit, context, contract, cost_fn, eval_fn)
 }
 
+/// The Weibull scaffold as a direct summand of the monotone I-spline time
+/// block (docs/convergence_theory/transformation-survival.md Thm 5.1, gam#1561).
+///
+/// The Weibull target enters the log-cumulative-hazard channel as the offset
+/// `o_θ(t) = k·(log t − log λ)`, with `o_D = k/t`. Both θ tangents,
+/// `∂o/∂log λ = −k` and `∂o/∂log k = o_θ`, lie in span{1, log t}:
+///
+/// * The constant is the location's unpenalized constant (`ModelLevel::Intercept`:
+///   the intercept column, or a term that spans it).
+/// * `log t` is the time block's own affine direction. The I-spline time basis
+///   is the right-cumulative sum `I_j = Σ_{i≥j} B_i` of a clamped B-spline of
+///   degree ≥ 1 on the `log t` axis, with linear tails, so it reproduces
+///   `u = log t` exactly: `u = Σ_i ξ*_i B_i` (Greville abscissae) gives
+///   `u = ξ*_0 + Σ_{j≥1} a_j I_j` with `a_j = ξ*_j − ξ*_{j−1} > 0`. The anchor
+///   centering moves only the constant. The time penalty is a curvature Gram,
+///   so `a` lies in its null space, and the derivative design maps `a` to
+///   `1/t = o_D/k` row by row.
+/// * The build keeps the columns that vary on the data (`keep_cols`), and its
+///   penalty is the principal submatrix of the full congruence on them. The
+///   full congruence has the one-dimensional null space span{a}, so a null
+///   vector `v` of the kept block extends by zeros to a multiple of `a`. The
+///   kept block therefore has a null direction (`nullspace_dims == [1]`)
+///   exactly when every dropped column has `a_j = 0`, i.e. when the kept
+///   columns alone carry `log t`. That recorded nullity is the certificate
+///   read here.
+///
+/// So `γ' = γ + k·a` turns the Weibull(k) model into the Linear-target model
+/// with the same likelihood and the same penalty. The monotone guard
+/// `X'γ + k/t ≥ g` becomes `X'γ' ≥ g`, and the coordinate cone `γ ≥ 0` becomes
+/// `γ' ≥ k·a ⊂ {γ' ≥ 0}`. The union of these sets over `k > 0` is dense in
+/// the Linear-target domain, so `inf_{θ,γ}` of the Weibull-target criterion is
+/// the Linear-target optimum. A θ search over that criterion moves along an
+/// exact flat direction whenever the Linear optimum clears `γ' ≥ k·a`, and
+/// otherwise it walks `k → 0`, a boundary with no minimizer. The fit therefore
+/// runs the Linear target, with no θ.
+///
+/// It returns the Linear configuration exactly when that argument holds:
+/// * the target is Weibull;
+/// * the offset is the log-cumulative-hazard channel (not the probit channel
+///   `−Φ⁻¹(exp(−H₀))`, which is nonlinear in `log t`);
+/// * there is no time wiggle (a wiggle composes with the target);
+/// * the time basis is the structural I-spline, and its single penalty keeps
+///   the affine null direction;
+/// * the location carries an unpenalized constant.
+///
+/// Otherwise it returns `None` and the target keeps its parameters. The
+/// Gompertz shape enters as `exp(shape·t)`, which is not in the span, so it is
+/// never collapsed here.
+pub fn weibull_scaffold_direct_sum(
+    cfg: &SurvivalBaselineConfig,
+    time_build: &SurvivalTimeBuildOutput,
+    log_cumulative_hazard_channel: bool,
+    has_timewiggle: bool,
+    location_level: gam_terms::smooth::ModelLevel,
+) -> Option<SurvivalBaselineConfig> {
+    let aliased = cfg.target == SurvivalBaselineTarget::Weibull
+        && log_cumulative_hazard_channel
+        && !has_timewiggle
+        && survival_basis_supports_structural_monotonicity(&time_build.basisname)
+        && time_build.nullspace_dims == [1]
+        && location_level == gam_terms::smooth::ModelLevel::Intercept;
+    aliased.then_some(SurvivalBaselineConfig {
+        target: SurvivalBaselineTarget::Linear,
+        scale: None,
+        shape: None,
+        rate: None,
+        makeham: None,
+    })
+}
+
 /// Gradient-only outer baseline-config optimizer. Thin adapter over
 /// `run_baseline_theta_optimizer` under the
 /// `BaselineDerivativeContract::GradientOnly` contract, which advertises
@@ -1689,19 +1759,13 @@ pub fn build_survival_time_basis(
                     }
                 }
             }
-            let x_derivative_time =
-                match faer::sparse::SparseColMat::try_new_from_triplets(n, p_time, &deriv_triplets)
-                {
-                    Ok(sparse) => DesignMatrix::Sparse(SparseDesignMatrix::new(sparse)),
-                    Err(_) => {
-                        // Fallback: build dense
-                        let mut dense = Array2::<f64>::zeros((n, p_time));
-                        for &faer::sparse::Triplet { row, col, val } in &deriv_triplets {
-                            dense[[row, col]] = val;
-                        }
-                        DesignMatrix::Dense(DenseDesignMatrix::from(dense))
-                    }
-                };
+            // Every triplet is indexed inside `n × p_time` by construction, so
+            // assembly fails only on allocation, which is an error, not a
+            // reason to build a second (dense) copy of the same matrix.
+            let x_derivative_time = DesignMatrix::Sparse(SparseDesignMatrix::new(
+                faer::sparse::SparseColMat::try_new_from_triplets(n, p_time, &deriv_triplets)
+                    .map_err(|e| format!("failed to assemble the time derivative design: {e:?}"))?,
+            ));
 
             let nullspace_dims = entry_basis
                 .active_penalties
@@ -1962,18 +2026,13 @@ pub fn build_survival_time_basis(
                     col + 1
                 ));
             }
-            let x_derivative_time =
-                match faer::sparse::SparseColMat::try_new_from_triplets(n, p_time, &deriv_triplets)
-                {
-                    Ok(sparse) => DesignMatrix::Sparse(SparseDesignMatrix::new(sparse)),
-                    Err(_) => {
-                        let mut dense = Array2::<f64>::zeros((n, p_time));
-                        for &faer::sparse::Triplet { row, col, val } in &deriv_triplets {
-                            dense[[row, col]] = val;
-                        }
-                        DesignMatrix::Dense(DenseDesignMatrix::from(dense))
-                    }
-                };
+            // Every triplet is indexed inside `n × p_time` by construction, so
+            // assembly fails only on allocation, which is an error, not a
+            // reason to build a second (dense) copy of the same matrix.
+            let x_derivative_time = DesignMatrix::Sparse(SparseDesignMatrix::new(
+                faer::sparse::SparseColMat::try_new_from_triplets(n, p_time, &deriv_triplets)
+                    .map_err(|e| format!("failed to assemble the time derivative design: {e:?}"))?,
+            ));
 
             let penalty_basis = build_bspline_basis_1d(
                 log_exit.view(),

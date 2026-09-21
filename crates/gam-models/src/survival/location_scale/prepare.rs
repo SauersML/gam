@@ -96,8 +96,6 @@ pub(crate) fn survival_blockwise_fit_options(
         // The inner mode is where survival LAML is evaluated, so the solve must meet
         // the survival family's projected-KKT stationarity contract.
         inner_tol: crate::survival::SURVIVAL_LAML_STATIONARITY_RELATIVE_TOL,
-        outer_max_iter: BLOCKWISE_OUTER_MAX_ITER,
-        outer_tol: BLOCKWISE_OUTER_TOL,
         compute_covariance: true,
         cache_session: spec.cache_session.clone(),
         persistent_warm_start_store: spec.persistent_warm_start_store.clone(),

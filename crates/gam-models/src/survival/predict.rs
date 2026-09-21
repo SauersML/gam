@@ -5497,6 +5497,8 @@ fn predict_survival_location_scale_batch(
         let hdot = match x_time_derivative.as_ref() {
             None => Array1::zeros(total_rows),
             Some(x_time_derivative) => location_scale_eta_derivative_components(
+                &eval_entry,
+                &eval_exit,
                 x_time_derivative,
                 &derivative_offset_exit,
                 &pred_input.x_time_exit,
@@ -6260,6 +6262,8 @@ pub(crate) fn location_scale_eta_components(
 }
 
 fn location_scale_eta_derivative_components(
+    eval_entry: &Array1<f64>,
+    eval_exit: &Array1<f64>,
     x_time_derivative: &Array2<f64>,
     derivative_offset_exit: &Array1<f64>,
     x_time_exit: &Array2<f64>,
@@ -6271,6 +6275,8 @@ fn location_scale_eta_derivative_components(
 ) -> Result<Array1<f64>, String> {
     let n = x_time_exit.nrows();
     if x_time_derivative.nrows() != n
+        || eval_entry.len() != n
+        || eval_exit.len() != n
         || derivative_offset_exit.len() != n
         || eta_time_offset_exit.len() != n
     {
@@ -6309,13 +6315,28 @@ fn location_scale_eta_derivative_components(
     if let Some(dq) = time_components.time_wiggle_dq.as_ref() {
         eta_derivative *= dq;
     }
-    if eta_derivative
+    if let Some(row) = eta_derivative
         .iter()
-        .any(|value| !(value.is_finite() && *value > 0.0))
+        .position(|value| !(value.is_finite() && *value > 0.0))
     {
-        return Err(
-            "survival location-scale hazard derivative must be finite and positive".to_string(),
-        );
+        let basis_part = if p_base > 0 {
+            x_time_derivative.row(row).dot(&beta_base)
+        } else {
+            0.0
+        };
+        return Err(format!(
+            "survival location-scale hazard derivative must be finite and positive: row {row} \
+             (entry={:.6}, exit={:.6}) has dη/dt={:.6e} (basis part {basis_part:.6e}, offset part \
+             {:.6e}, time-wiggle dq {:?})",
+            eval_entry[row],
+            eval_exit[row],
+            eta_derivative[row],
+            derivative_offset_exit[row],
+            time_components
+                .time_wiggle_dq
+                .as_ref()
+                .map(|dq| dq[row]),
+        ));
     }
     Ok(eta_derivative)
 }

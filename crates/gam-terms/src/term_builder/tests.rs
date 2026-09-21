@@ -6356,6 +6356,187 @@ fn categorical_column_in_a_numeric_axis_term_is_rejected() {
     }
 }
 
+/// Two-level factor frame for the per-level slope hand-off: `x` is
+/// continuous and `g` has levels `a`/`b` (encoded 0.0/1.0), interleaved so
+/// each level spans the whole `x` range.
+fn factor_dataset_l2() -> Dataset {
+    let rows = (0..40)
+        .map(|i| {
+            let x = i as f64 / 39.0;
+            let g = (i % 2) as f64;
+            vec![(1.0 + g) * x, x, g]
+        })
+        .collect::<Vec<_>>();
+    Dataset {
+        headers: vec!["y".into(), "x".into(), "g".into()],
+        values: Array2::from_shape_vec(
+            (rows.len(), 3),
+            rows.into_iter().flat_map(|row| row.into_iter()).collect(),
+        )
+        .expect("rectangular L=2 factor test data"),
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "x".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "g".into(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["a".into(), "b".into()],
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Categorical,
+        ],
+    }
+}
+
+/// Convergence theory Thm 4.1: with `y ~ s(x, by=g) + x`, every factor-by
+/// level smooth used to keep `x·1_g` in its design while its range penalty
+/// left that direction unpenalized. Each level then carried its own null
+/// ridge on the same slope, so the per-level null strengths were not jointly
+/// identified and the outer REML Hessian was singular along their
+/// differences.
+///
+/// The fix projects `x·1_g` out of each level smooth and hands the level
+/// slopes to ONE `level_slopes(x,g)` term. That term has `G−1` orthonormal
+/// Helmert contrasts of `(x−c)`, residualized against `[1 | x]`, under a
+/// single identity penalty. This test pins:
+/// - exactly one `G−1 = 1` column slope term;
+/// - level smooths orthogonal to `1_g` and `x·1_g`;
+/// - a slope term orthogonal to `[1, x]`;
+/// - one slope strength, with the level smooths carrying full-rank range
+///   penalties only (no per-level null ridge);
+/// - save/load consistency: the frozen spec reproduces the fit-time design
+///   on the same rows.
+#[test]
+fn factor_by_level_slopes_share_one_strength_orthogonal_to_parametric_slope_thm41() {
+    let ds = factor_dataset_l2();
+    let col_map = ds.column_map();
+    let parsed = parse_formula("y ~ s(x, by=g) + x").expect("formula parses");
+    let mut notes = Vec::new();
+    let spec = build_termspec(&parsed.terms, &ds, &col_map, &mut notes).expect("termspec builds");
+    let slope_terms: Vec<usize> = spec
+        .smooth_terms
+        .iter()
+        .enumerate()
+        .filter(|(_, term)| term.name == "level_slopes(x,g)")
+        .map(|(idx, _)| idx)
+        .collect();
+    assert_eq!(
+        slope_terms.len(),
+        1,
+        "exactly one shared level-slope term, got smooth terms {:?}",
+        spec.smooth_terms
+            .iter()
+            .map(|t| &t.name)
+            .collect::<Vec<_>>()
+    );
+    let slope_idx = slope_terms[0];
+
+    let design = crate::smooth::build_term_collection_design(ds.values.view(), &spec)
+        .expect("design builds");
+    let x = ds.values.column(1).to_owned();
+    let g = ds.values.column(2).to_owned();
+    let n = x.len();
+    let ones = Array1::<f64>::ones(n);
+    let inner = |a: &Array1<f64>, b: ndarray::ArrayView1<f64>| a.dot(&b);
+
+    // The slope term: G−1 = 1 column, orthogonal to [1, x], one penalty.
+    let slope_design = design.smooth.term_designs[slope_idx].to_dense();
+    assert_eq!(slope_design.ncols(), 1, "G−1 slope contrasts for G=2");
+    let slope_col = slope_design.column(0);
+    let slope_norm = slope_col.dot(&slope_col).sqrt();
+    assert!(
+        slope_norm > 0.0,
+        "the level-slope contrast must be non-trivial"
+    );
+    for (label, basis) in [("1", &ones), ("x", &x)] {
+        let rel = inner(basis, slope_col).abs() / (basis.dot(basis).sqrt() * slope_norm);
+        assert!(
+            rel <= 1e-10,
+            "level-slope column must be orthogonal to {label}, relative inner product {rel:e}"
+        );
+    }
+    let slope_term = &design.smooth.terms[slope_idx];
+    assert_eq!(
+        slope_term.active_penalties.len(),
+        1,
+        "the level slopes share ONE strength"
+    );
+    assert_eq!(
+        slope_term.active_penalties[0].nullity, 0,
+        "the slope penalty is full rank on its G−1 contrasts"
+    );
+
+    // The level smooths: orthogonal to 1_g and x·1_g on every level, and no
+    // per-level null ridge remains.
+    let mut level_smooths = 0_usize;
+    for (idx, term) in design.smooth.terms.iter().enumerate() {
+        if idx == slope_idx {
+            continue;
+        }
+        level_smooths += 1;
+        let block = design.smooth.term_designs[idx].to_dense();
+        for level in [0.0_f64, 1.0] {
+            let indicator = g.mapv(|v| if v == level { 1.0 } else { 0.0 });
+            let slope = &indicator * &x;
+            for (label, basis) in [("1_g", &indicator), ("x·1_g", &slope)] {
+                let basis_norm = basis.dot(basis).sqrt();
+                for (col_idx, column) in block.columns().into_iter().enumerate() {
+                    let col_norm = column.dot(&column).sqrt();
+                    if col_norm == 0.0 {
+                        continue;
+                    }
+                    let rel = inner(basis, column).abs() / (basis_norm * col_norm);
+                    assert!(
+                        rel <= 1e-10,
+                        "{}: column {col_idx} is not orthogonal to {label} on level {level}, \
+                         relative inner product {rel:e}",
+                        term.name
+                    );
+                }
+            }
+        }
+        for penalty in &term.active_penalties {
+            assert_eq!(
+                penalty.nullity, 0,
+                "{}: a level smooth must not keep a per-level null direction once x·1_g is \
+                 handed to the shared slope term",
+                term.name
+            );
+        }
+    }
+    assert!(level_smooths >= 2, "one level smooth per level of g");
+
+    // Save/load: the frozen spec rebuilds the same design on the same rows.
+    let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &design)
+        .expect("freezing against the fit-time design succeeds");
+    let rebuilt = crate::smooth::build_term_collection_design(ds.values.view(), &frozen)
+        .expect("frozen spec rebuilds");
+    let fit_dense = design.design.to_dense();
+    let rebuilt_dense = rebuilt.design.to_dense();
+    assert_eq!(fit_dense.dim(), rebuilt_dense.dim());
+    let scale = fit_dense.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    let drift = (&fit_dense - &rebuilt_dense)
+        .iter()
+        .fold(0.0_f64, |m, v| m.max(v.abs()));
+    assert!(
+        drift <= 1e-12 * scale,
+        "frozen rebuild must reproduce the fit-time design, max drift {drift:e} at scale {scale:e}"
+    );
+}
+
 /// `s(b) + te(b, c)` puts the tensor in a collection gauge whose coefficient
 /// transform whitens the design Gram. The frozen spec rebuilds the tensor in
 /// the composite chart at predict time, and its null-function block ridges

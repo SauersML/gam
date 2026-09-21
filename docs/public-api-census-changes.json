@@ -5111,5 +5111,13 @@
     },
     "reason": "#3572: HyperCoordPair::zero built the empty identity pair that the n*p > 50_000_000 guards in reml/hyper.rs returned in place of the psi/tau hyper-coordinates, silently dropping those derivatives from the outer gradient. The guards are deleted (a design too large to densify is refused with a typed DensificationRefused error by try_to_dense_arc), so the constructor has no caller and is deleted with them.",
     "evidence": "On main at 74c2b1d788, git grep -n 'HyperCoordPair::zero' finds only the two identity-pair early returns inside the deleted tau guard in crates/gam-solve/src/reml/hyper.rs (lines 1335 and 1340); the merged head names HyperCoordPair::zero 0 times outside the removal ledgers. scripts/public_api_census.py --base 74c2b1d788 on the merged head reports exactly this one removal."
+  },
+  {
+    "base": "ffc9c29f9e1cf7f1f4dd20e20a3459cbc947dd58",
+    "removed": {
+      "crates/gam-models/src/survival/location_scale/row_kernel.rs::into_diagonal_only": 1
+    },
+    "reason": "#3130 (9fe4f35c): the survival location-scale diagonal-only coefficient Hessian target existed only to feed the scale-coupled trust-metric floor and its ridge escalation, deleted in 1f05ba27 as a reactive floor SPEC forbids. With that floor gone nothing reads it: the coupled exact-Newton step uses DenseFull and the per-block inner Newton uses BlockDiagonal.",
+    "evidence": "git grep finds no into_diagonal_only anywhere in crates/ tests/ at the head; its one caller (family_solver.rs trust-metric floor) is deleted in the same PR."
   }
 ]

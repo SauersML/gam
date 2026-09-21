@@ -3540,5 +3540,24 @@
     ],
     "reason": "#4083: process_monitor.rs kept three copies of the /proc line parser (parse_status_kb and parse_status_count byte-identical, parse_io_bytes the same minus a no-op first-token split), a clock_ticks_per_second with an unreachable non-Linux 0.0 arm, and a CpuSampler last_cores fallback reachable only for a zero wall-clock delta; the heartbeat also labelled every average with the nominal interval instead of the measured window. parse_proc_value replaces the three parsers, CLOCK_TICKS_PER_SECOND replaces clock_ticks_per_second, and the five parser unit tests become parse_proc_value_reads_status_and_io_lines and parse_proc_value_wrong_key_returns_none, which keep every assertion; busy_cores_averages_over_the_measured_window is new.",
     "evidence": "scripts/source_removal_guard.py with --base d027be231ca8fdf6f8104690ae68869486db51ab and head the change's commit lists exactly these removals, all private to crates/gam-runtime/src/process_monitor.rs. Read-proof at the head: git grep -w finds 0 occurrences of parse_status_count, parse_io_bytes and clock_ticks_per_second in crates/ tests/ examples/; parse_status_kb survives only as an unrelated local helper in crates/gam-sae/examples/scale_k.rs."
+  },
+  {
+    "base": "ffc9c29f9e1cf7f1f4dd20e20a3459cbc947dd58",
+    "items": [
+      "crates/gam-custom-family/src/tests.rs:fn:joint_trust_metric_block_floor",
+      "crates/gam-model-api/src/families/custom_family/family_trait.rs:fn:joint_trust_metric_block_floor",
+      "crates/gam-models/src/survival/location_scale/constants.rs:const:BLOCKWISE_OUTER_MAX_ITER",
+      "crates/gam-models/src/survival/location_scale/constants.rs:const:BLOCKWISE_OUTER_TOL",
+      "crates/gam-models/src/survival/location_scale/constants.rs:const:DYKSTRA_PROJECTION_MAX_SWEEPS",
+      "crates/gam-models/src/survival/location_scale/constants.rs:const:SCALE_COUPLED_TRUST_METRIC_FLOOR_REL",
+      "crates/gam-models/src/survival/location_scale/constants.rs:const:STRUCTURAL_GUESS_RIDGE_REL",
+      "crates/gam-models/src/survival/location_scale/family_solver.rs:fn:joint_trust_metric_block_floor",
+      "crates/gam-models/src/survival/location_scale/row_kernel.rs:fn:into_diagonal_only",
+      "crates/gam-models/src/survival/location_scale/tests.rs:fn:spec_from_dense_for_test",
+      "crates/gam-models/src/survival/location_scale/tests.rs:fn:survival_ls_heteroscedastic_two_col_location_family",
+      "crates/gam-models/src/survival/location_scale/tests.rs:fn:survival_ls_scale_aware_location_block_trust_metric_floor_caps_starvation_1569"
+    ],
+    "reason": "Survival location-scale solver cleanup (#3130). The scale-coupled trust-metric floor (joint_trust_metric_block_floor on the custom-family trait, its survival-LS impl and test impls, SCALE_COUPLED_TRUST_METRIC_FLOOR_REL) was a hand-set constant with an escalate-ridge retry; it is deleted because the exact joint Newton step already carries its own curvature certificate (SPEC: no hard-coded knobs, do not paper over solver issues). into_diagonal_only fed only that floor. BLOCKWISE_OUTER_MAX_ITER / BLOCKWISE_OUTER_TOL / DYKSTRA_PROJECTION_MAX_SWEEPS were local caps: the blockwise options now inherit the model-api defaults and constraint projection returns a typed ConstraintViolation instead of a capped Dykstra sweep. STRUCTURAL_GUESS_RIDGE_REL is replaced by a min-norm least-squares solve on the nonzero spectrum of X'X. The test helpers spec_from_dense_for_test, survival_ls_heteroscedastic_two_col_location_family and the floor-caps-starvation test existed only to exercise the deleted floor.",
+    "evidence": "git grep -w for every listed name returns 0 hits in the PR head; commits 1f05ba27 (floor + retry), 47652d63 (caps), 9fe4f35c (DiagonalOnly target), 7e4dd751 (structural-guess ridge). cargo check --workspace --tests and the targeted survival location-scale / heteroscedastic-globalization tests are recorded in the PR body."
   }
 ]

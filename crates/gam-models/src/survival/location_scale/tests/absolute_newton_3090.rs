@@ -20,7 +20,7 @@ fn absolute_newton_direction_flips_negative_curvature_3090() {
     let h = q.dot(&Array2::from_diag(&Array1::from(lambda.to_vec()))).dot(&q.t());
     let g = array![0.7, -1.1];
 
-    let step = aft_absolute_newton_direction(&h, &g).expect("regular indefinite H");
+    let step = aft_absolute_newton_direction(&h, &g, 0).expect("regular indefinite H");
     let c = q.t().dot(&g);
     let expected = q.dot(&array![c[0] / 3.0, c[1] / 0.5]);
     for k in 0..2 {
@@ -44,7 +44,7 @@ fn absolute_newton_direction_flips_negative_curvature_3090() {
 fn absolute_newton_direction_is_newton_on_positive_definite_hessian_3090() {
     let h = array![[4.0, 1.0], [1.0, 3.0]];
     let g = array![1.0, -2.0];
-    let step = aft_absolute_newton_direction(&h, &g).expect("PD H");
+    let step = aft_absolute_newton_direction(&h, &g, 0).expect("PD H");
     // H⁻¹g with det 11.
     let newton = array![(3.0 * 1.0 - 1.0 * -2.0) / 11.0, (-1.0 * 1.0 + 4.0 * -2.0) / 11.0];
     for k in 0..2 {
@@ -60,13 +60,13 @@ fn absolute_newton_direction_refuses_gradient_along_flat_curvature_3090() {
     // Gradient in the range of H: the flat direction carries no slope, so the
     // step is the pseudo-inverse one.
     let g_range = q.column(0).to_owned() * 1.5;
-    let step = aft_absolute_newton_direction(&h, &g_range).expect("flat direction, no slope");
+    let step = aft_absolute_newton_direction(&h, &g_range, 0).expect("flat direction, no slope");
     for k in 0..2 {
         assert!((step.delta[k] - q[[k, 0]] * 0.75).abs() <= 1e-14);
     }
     // A slope along the flat direction has no Newton maximizer.
     let g_flat = &g_range + &(q.column(1).to_owned() * 0.25);
-    let error = aft_absolute_newton_direction(&h, &g_flat)
+    let error = aft_absolute_newton_direction(&h, &g_flat, 0)
         .err()
         .expect("slope along a flat direction must be refused");
     assert!(

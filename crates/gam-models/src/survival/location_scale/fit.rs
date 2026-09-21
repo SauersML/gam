@@ -19,16 +19,13 @@ use crate::fit_orchestration::FitFailure;
 /// exactly as for any custom-family fit.
 pub(crate) fn fit_reduced_parametric_aft(
     prepared: &PreparedSurvivalLocationScaleModel,
-    options: &BlockwiseFitOptions,
 ) -> Result<UnifiedFitResult, FitFailure> {
     use gam_linalg::faer_ndarray::FaerCholesky;
 
     let specs = &prepared.blockspecs;
-    let (states, log_likelihood, h) = prepared.family.fit_parametric_aft_direct_mle(
-        specs,
-        options.inner_max_cycles.max(1),
-        options.inner_tol,
-    )?;
+    let (states, log_likelihood, h) = prepared
+        .family
+        .fit_parametric_aft_direct_mle(specs)?;
 
     let p_total = h.nrows();
     // Conditional covariance Var(θ | λ) = H⁻¹ in the reduced coordinate system.
@@ -147,7 +144,7 @@ fn fit_survival_location_scale_spec_authority(
     // path below.
     let fit = match authority {
         SurvivalLocationScaleFitAuthority::Direct if prepared.is_reduced_parametric_aft() => {
-            fit_reduced_parametric_aft(&prepared, &options)?
+            fit_reduced_parametric_aft(&prepared)?
         }
         SurvivalLocationScaleFitAuthority::Direct => {
             fit_custom_family_arming_on_evidence(&prepared.family, &prepared.blockspecs, &options)?
@@ -256,6 +253,7 @@ fn inverse_link_with_shape(
 
 pub(crate) fn select_survival_link_wiggle_basis_from_pilot(
     pilot: &SurvivalLocationScaleTermFitResult,
+    age_exit: ArrayView1<'_, f64>,
     wiggle_cfg: &WiggleBlockConfig,
     wiggle_penalty_orders: &[usize],
 ) -> Result<SelectedWiggleBasis, FitFailure> {
@@ -270,11 +268,28 @@ pub(crate) fn select_survival_link_wiggle_basis_from_pilot(
         .log_sigma_design
         .apply(pilot.fit.beta_log_sigma().view())
         .map_err(|error| pilot_invariant(error.to_string()))?;
+    // The seed is the index the wiggle is composed on. In the reduced
+    // parametric-AFT regime the `−log t` baseline rides the location before
+    // `q₀` (`LocationLogTimeOffset`), so the wiggle sees `q₀(η_t − log t, η_ls)`;
+    // seeding on `η_t` alone places the knots over the wrong range, and over a
+    // single point once the location is constant (#3006).
+    let reduced_parametric_aft = matches!(
+        pilot.time_parameterization,
+        SurvivalLocationScaleTimeParameterization::ReducedParametricAft
+    );
     let q_seed = Array1::from_iter(
         eta_threshold
             .iter()
             .zip(eta_log_sigma.iter())
-            .map(|(&threshold, &ls)| survival_q0_from_eta(threshold, ls)),
+            .zip(age_exit.iter())
+            .map(|((&threshold, &ls), &t)| {
+                let location = if reduced_parametric_aft {
+                    threshold - t.max(crate::survival::construction::SURVIVAL_TIME_FLOOR).ln()
+                } else {
+                    threshold
+                };
+                survival_q0_from_eta(location, ls)
+            }),
     );
     // The composed link warp: `q = q₀ + Σ βw_j·I_j(q₀)` with `q₀` moving with β,
     // so the inner objective differentiates the basis and a clamped boundary

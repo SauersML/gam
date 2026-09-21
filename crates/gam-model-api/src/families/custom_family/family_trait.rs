@@ -904,53 +904,6 @@ pub trait CustomFamily {
         Ok(None)
     }
 
-    /// Optional scale-aware floor for the joint trust-region metric `D`.
-    ///
-    /// The joint Newton globalization whitens its step by a positive diagonal
-    /// metric `D` (the penalized joint-Hessian diagonal) and solves the exact
-    /// Moré–Sorensen trust-region subproblem `min −rhsᵀδ + ½δᵀHδ s.t. ‖δ‖_D ≤ r`
-    /// in that metric. The metric is affine-covariant, so a coordinate whose
-    /// `D`-entry badly understates its true per-coordinate curvature scale gets
-    /// an anomalously large whitened step component `c_k/(γ_k+λ)`, which the
-    /// global trust multiplier `λ` cannot selectively repair — degrading step
-    /// quality and stalling the inner solve.
-    ///
-    /// This is exactly the failure mode of a coupled location-scale survival fit
-    /// (#1569): the free scale predictor `η_σ` enters the standardized index as
-    /// `u = exp(−η_σ)·(h − η_t)`, so `∂u/∂η_t = −exp(−η_σ)` and the LOCATION and
-    /// LOG-σ channels' likelihood-Hessian diagonals scale as
-    /// `Σ_r exp(−2 η_σ,r) X_{rj}²` (the flexible time baseline `h` has
-    /// `∂u/∂h = 1` and is scale-free, so it is NOT inflated). When the free scale
-    /// predictor drives some rows to small σ (large `exp(−η_σ)`), the bare diagonal
-    /// is dominated by those rows for the coefficients they load on, yet
-    /// UNDERSTATES the curvature scale for coefficients that load mostly on
-    /// large-σ rows — so the whitened step over-reaches on the latter and the
-    /// trust loop grinds.
-    ///
-    /// A family that owns a free-scale-coupled block may return `Some(floor)` — a
-    /// per-coordinate, NON-negative additive floor over the FULL joint coefficient
-    /// vector (length = total joint width, zero outside the block(s) it scales) —
-    /// derived automatically from the current scale-predictor magnitude (NO new
-    /// knob). The driver takes `max(D_i, floor_i)` per coordinate, so the floor
-    /// can only TIGHTEN (never loosen) the trust metric; it shapes the trajectory
-    /// only and self-vanishes at the KKT fixed point (the converged β, the KKT
-    /// certificate, and the REML/LAML the residual feeds are unchanged), exactly
-    /// like the existing self-vanishing trust-region damping. Returns `None` (the
-    /// default) for every family that has no free-scale-coupled block.
-    fn joint_trust_metric_block_floor(
-        &self,
-        block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-    ) -> Result<Option<Array1<f64>>, String> {
-        // A returned floor is indexed over the full joint coefficient vector,
-        // so states and specs must agree on what that vector is before any
-        // implementor - including an override calling back into this default -
-        // can size one.
-        assert_valid_blockspecs(specs, "joint trust metric block floor");
-        assert_states_match_specs(block_states, specs, "joint trust metric block floor");
-        Ok(None)
-    }
-
     /// Optional inequality constraints for a block update: `A * beta_block
     /// >= b`, carried either as explicit rows or as a factored cone
     /// ([`ConstraintSet`]). Small blocks return

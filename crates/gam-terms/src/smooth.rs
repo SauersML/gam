@@ -54,6 +54,7 @@ pub use self::structure_warnings::collect_smooth_structure_warnings;
 // policy-carrying builders the joint-build variants that stay in gam-models
 // call, and `term_collection_has_anchored_bspline` (`spatial_optimization.rs`).
 mod term_design;
+pub(crate) use term_design::factor_by_level_slope_axes;
 pub use term_design::{
     CollectionGaugedTerm, LocalTermRealization, RealizedCollectionGauge,
     TermCollectionDerivativeDesign,

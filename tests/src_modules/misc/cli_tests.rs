@@ -8479,6 +8479,221 @@ fn survival_location_scale_live_warp_fits_linkwiggle_degree4_2695() {
     fit_survival_location_scale_live_warp_2695(4, 4);
 }
 
+/// gam#3006: a constant-scale location-scale fit with a link wiggle. The
+/// constant scale collapses the time warp to the `−log t` location offset
+/// (#892), so the fit is `ReducedParametricAft` and the wiggle composes on
+/// `q₀(η_t − log t, η_ls)`. The fit must reach the outer with one ρ per wiggle
+/// penalty, save beside the collapsed time axis, load, and predict a survival
+/// curve that falls with time.
+fn fit_save_predict_survival_location_scale_linkwiggle_3006(location: &str) {
+    let dir = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
+    let csv_path = dir.path().join("lognormal_aft.csv");
+    let mut rng = StdRng::seed_from_u64(3006);
+    let mut rows = String::from("entry,exit,event,x\n");
+    for _ in 0..400 {
+        let x = 2.0 * normal_cdf(StandardNormal.sample(&mut rng)) - 1.0;
+        let eps: f64 = StandardNormal.sample(&mut rng);
+        let event_time = (1.0 + 0.5 * x + 0.6 * eps).exp();
+        let censor_draw: f64 = StandardNormal.sample(&mut rng);
+        let censor_time = (1.6 + 0.8 * censor_draw).exp();
+        let (exit, event) = if event_time <= censor_time {
+            (event_time, 1)
+        } else {
+            (censor_time, 0)
+        };
+        rows.push_str(&format!("0,{exit:.6},{event},{x:.6}\n"));
+    }
+    std::fs::write(&csv_path, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "write csv", e));
+    let model_path = dir.path().join("linkwiggle_3006.model.json");
+    run_fit_request_document(
+        csv_path,
+        model_path.clone(),
+        &format!(
+            r#"{{"schema":"gam.fit-request","schema_version":1,
+                 "formula":"Surv(entry, exit, event) ~ {location} + linkwiggle(internal_knots=4)",
+                 "config":{{"survival_likelihood":"location-scale"}}}}"#
+        ),
+    )
+    .unwrap_or_else(|e| panic!("`{location}` link-wiggle location-scale fit failed: {e}"));
+
+    let saved = SavedModel::load_from_path(&model_path)
+        .unwrap_or_else(|e| panic!("`{location}` saved link-wiggle model failed to load: {e:?}"));
+    let structure = saved
+        .survival_location_scale_structure
+        .as_ref()
+        .expect("location-scale survival fit saves its replay structure");
+    assert_eq!(
+        structure.time_parameterization,
+        SurvivalLocationScaleTimeParameterization::ReducedParametricAft,
+        "a constant-scale fit collapses the warp to the -log t location offset",
+    );
+    let wiggle_width = saved.beta_link_wiggle.as_ref().map_or(0, |beta| beta.len());
+    assert!(wiggle_width > 0, "`{location}` fit saved no link-wiggle coefficients");
+
+    let grid_path = dir.path().join("grid.csv");
+    let exits = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
+    let mut grid = String::from("entry,exit,event,x\n");
+    for exit in exits {
+        grid.push_str(&format!("0,{exit},0,0.25\n"));
+    }
+    std::fs::write(&grid_path, grid).unwrap_or_else(|e| panic!("{} failed: {:?}", "write grid", e));
+    let pred_path = dir.path().join("grid_pred.csv");
+    run_predict(PredictArgs {
+        model: model_path,
+        new_data: grid_path,
+        out: pred_path.clone(),
+        offset_column: None,
+        noise_offset_column: None,
+        id_column: None,
+        uncertainty: false,
+        level: 0.95,
+        covariance_mode: None,
+        conformal: false,
+        calibration: None,
+        training_data: None,
+    })
+    .unwrap_or_else(|e| panic!("`{location}` saved link-wiggle model failed to predict: {e}"));
+    let mut rdr = csv::Reader::from_path(&pred_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "open prediction csv", e));
+    let survival = rdr
+        .deserialize::<BTreeMap<String, String>>()
+        .map(|row| {
+            let row = row.unwrap_or_else(|e| panic!("{} failed: {:?}", "parse prediction row", e));
+            row["survival_prob"]
+                .parse::<f64>()
+                .unwrap_or_else(|e| panic!("{} failed: {:?}", "survival_prob should parse", e))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(survival.len(), exits.len());
+    for (k, pair) in survival.windows(2).enumerate() {
+        assert!(
+            pair[0].is_finite() && pair[1].is_finite() && pair[1] < pair[0],
+            "`{location}`: survival must fall from t={} to t={}: {survival:?}",
+            exits[k],
+            exits[k + 1],
+        );
+    }
+    assert!(
+        survival[0] < 1.0 && survival[exits.len() - 1] > 0.0,
+        "`{location}`: survival over the grid must stay inside (0, 1): {survival:?}",
+    );
+}
+
+#[test]
+fn survival_location_scale_linear_location_linkwiggle_saves_and_predicts_3006() {
+    fit_save_predict_survival_location_scale_linkwiggle_3006("x");
+}
+
+#[test]
+fn survival_location_scale_smooth_location_linkwiggle_saves_and_predicts_3006() {
+    fit_save_predict_survival_location_scale_linkwiggle_3006("s(x, k=6)");
+}
+
+/// Delayed-entry age-scale survival frame in the shape of gnomon's hypertension
+/// study (#3037/#3038): six ancestry PCs, sex, two study-design covariates and a
+/// standardized score `z`, with a Gompertz age hazard observed from a
+/// left-truncated entry age.
+fn write_delayed_entry_pc_survival_frame_3037(path: &std::path::Path, n: usize, seed: u64) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let uniform = |rng: &mut StdRng| normal_cdf(StandardNormal.sample(rng));
+    let mut rows = String::from(
+        "entry_age,exit_age,event,sex,PC1,PC2,PC3,PC4,PC5,PC6,admin_years,lookback_years,z\n",
+    );
+    for _ in 0..n {
+        let sex = f64::from(u8::from(uniform(&mut rng) < 0.5));
+        let pcs: Vec<f64> = (0..6)
+            .map(|k| {
+                let draw: f64 = StandardNormal.sample(&mut rng);
+                draw / (1.0 + k as f64)
+            })
+            .collect();
+        let admin_years = 1.0 + 11.0 * uniform(&mut rng);
+        let lookback_years = 10.0 * uniform(&mut rng);
+        let z: f64 = StandardNormal.sample(&mut rng);
+        let entry = 18.0 + 57.0 * uniform(&mut rng);
+        let linear = -8.4 + 0.45 * z + 0.2 * sex + 0.8 * pcs[0] - 0.5 * pcs[1]
+            + 0.03 * lookback_years;
+        let slope = 0.08;
+        let rate = linear.exp();
+        let unit_exponential = -(1.0 - uniform(&mut rng)).ln();
+        let event_age =
+            ((slope * entry).exp() + slope * unit_exponential / rate).ln() / slope;
+        let censor_age = entry + admin_years;
+        let (exit, event) = if event_age <= censor_age {
+            (event_age, 1)
+        } else {
+            (censor_age, 0)
+        };
+        rows.push_str(&format!(
+            "{entry:.6},{exit:.6},{event},{sex},{},{},{},{},{},{},{admin_years:.6},{lookback_years:.6},{z:.6}\n",
+            pcs[0], pcs[1], pcs[2], pcs[3], pcs[4], pcs[5]
+        ));
+    }
+    std::fs::write(path, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "write frame", e));
+}
+
+/// gam#3037 / gam#3038: a linear-PC log-scale location-scale fit on a
+/// delayed-entry age-scale frame must fit certified and then predict the band
+/// rows whose entry sits at a band's lower edge (exit = entry + 3).
+fn fit_predict_linear_pc_log_scale_3037(n: usize) {
+    gam_runtime::test_support::install_diagnostic_logger();
+    let dir = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
+    let csv_path = dir.path().join("pc_frame.csv");
+    write_delayed_entry_pc_survival_frame_3037(&csv_path, n, 3037);
+    let model_path = dir.path().join("pc_frame.model.json");
+    run_fit_request_document(
+        csv_path,
+        model_path.clone(),
+        r#"{"schema":"gam.fit-request","schema_version":1,
+             "formula":"Surv(entry_age, exit_age, event) ~ sex + duchon(PC1, PC2, PC3, PC4, PC5, PC6, centers=24) + admin_years + lookback_years + z",
+             "config":{"survival_likelihood":"location-scale",
+                       "noise_formula":"PC1 + PC2 + PC3 + PC4 + PC5 + PC6"}}"#,
+    )
+    .unwrap_or_else(|e| panic!("linear-PC log-scale location-scale fit failed: {e}"));
+
+    let band_path = dir.path().join("bands.csv");
+    let mut bands = String::from(
+        "entry_age,exit_age,event,sex,PC1,PC2,PC3,PC4,PC5,PC6,admin_years,lookback_years,z\n",
+    );
+    for lower in [18.0, 28.0, 38.0, 48.0, 58.0, 68.0] {
+        for (k, z) in [-1.5_f64, 0.0, 1.5].iter().enumerate() {
+            let entry = lower + 3.0 * k as f64;
+            bands.push_str(&format!(
+                "{entry},{},0,{},0.3,-0.2,0.1,0.05,-0.05,0.02,5,4,{z}\n",
+                entry + 3.0,
+                k % 2
+            ));
+        }
+    }
+    std::fs::write(&band_path, bands).unwrap_or_else(|e| panic!("{} failed: {:?}", "write bands", e));
+    let pred_path = dir.path().join("bands_pred.csv");
+    run_predict(PredictArgs {
+        model: model_path,
+        new_data: band_path,
+        out: pred_path.clone(),
+        offset_column: None,
+        noise_offset_column: None,
+        id_column: None,
+        uncertainty: false,
+        level: 0.95,
+        covariance_mode: None,
+        conformal: false,
+        calibration: None,
+        training_data: None,
+    })
+    .unwrap_or_else(|e| panic!("linear-PC log-scale model failed to predict band rows: {e}"));
+}
+
+#[test]
+fn survival_location_scale_linear_pc_log_scale_fits_and_predicts_3037() {
+    fit_predict_linear_pc_log_scale_3037(3828);
+}
+
+#[test]
+fn survival_location_scale_linear_pc_log_scale_large_frame_predicts_bands_3038() {
+    fit_predict_linear_pc_log_scale_3037(19400);
+}
+
 /// gam#2904: a SAS survival location-scale fit selects the link shape together
 /// with ρ by the LAML, as auxiliary coordinates of one certified outer. The truth
 /// is a Weibull AFT, whose log-time residual law is the skewed Gumbel minimum and

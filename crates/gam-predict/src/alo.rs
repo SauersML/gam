@@ -2432,9 +2432,12 @@ fn compute_saved_location_scale_survival_alo(
         gam_models::survival::SurvivalLocationScaleTimeParameterization::ReducedParametricAft
     );
     if reduced_parametric_aft {
-        if runtime.baseline_time_wiggle.is_some() || runtime.link_wiggle.is_some() {
+        // The saved threshold rows carry the `−log t` shift, so a link wiggle
+        // composes on the same `q₀` the fit used (#3006); only a time wiggle is
+        // outside the collapsed regime.
+        if runtime.baseline_time_wiggle.is_some() {
             return Err(invalid(
-                "saved reduced parametric-AFT location-scale ALO cannot carry time/link wiggles",
+                "saved reduced parametric-AFT location-scale ALO cannot carry a time wiggle",
             ));
         }
         for (label, design) in [

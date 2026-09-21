@@ -1988,7 +1988,7 @@ impl CustomFamily for InnerPreludeWorkspaceFamily {
         Ok(FamilyEvaluation {
             log_likelihood: 0.0,
             blockworking_sets: vec![BlockWorkingSet::ExactNewton {
-                gradient: array![0.0],
+                gradient: array![1.0],
                 hessian: SymmetricMatrix::Dense(array![[1.0]]),
             }],
         })
@@ -2019,7 +2019,8 @@ impl CustomFamily for InnerPreludeWorkspaceFamily {
         assert_specs_consistent(specs, "inner-prelude joint gradient");
         Ok(Some(ExactNewtonJointGradientEvaluation {
             log_likelihood: 0.0,
-            gradient: array![0.0],
+            // Off the mode, so cycle 0 takes a step.
+            gradient: array![1.0],
         }))
     }
 
@@ -2033,13 +2034,23 @@ impl CustomFamily for InnerPreludeWorkspaceFamily {
         self.advertise_workspace_gradient
     }
 
-    fn joint_trust_metric_block_floor(
+    // Seating the start leaves beta at its initial zero; the first moved beta
+    // is cycle 0's step, formed from the prevalidated source. Stopping there
+    // pins how many sources were built.
+    fn post_update_block_beta(
         &self,
         states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-    ) -> Result<Option<Array1<f64>>, String> {
-        assert_states_finite(states, "inner-prelude trust-metric floor");
-        assert_specs_consistent(specs, "inner-prelude trust-metric floor");
+        block_idx: usize,
+        block_spec: &ParameterBlockSpec,
+        beta: Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        assert_states_finite(states, "inner-prelude post-update");
+        assert_specs_consistent(std::slice::from_ref(block_spec), "inner-prelude post-update");
+        assert_eq!(block_idx, 0, "inner-prelude fixture has one block");
+        assert!(beta.iter().all(|v| v.is_finite()), "inner-prelude trial beta finite");
+        if beta.iter().all(|v| *v == 0.0) {
+            return Ok(beta);
+        }
         Err("inner-prelude-workspace-cycle0-reached".to_string())
     }
 }

@@ -1131,6 +1131,8 @@ pub fn build_termspec(
         }
     }
 
+    push_factor_level_slope_terms(ds, &linear_terms, &mut smooth_terms)?;
+
     // Freeing the constant any other way would leave a penalty on it or strip
     // one from a direction that is not the constant: the intercept is exactly
     // the constant, unpenalized, and a full-level ridge beside it profiles to
@@ -1163,6 +1165,83 @@ pub fn build_termspec(
         inference_notes.advise(warning);
     }
     Ok(spec)
+}
+
+/// Carry the per-level slope deviations of every factor-by smooth `s(x, by=g)`
+/// beside a linear `x` in ONE term per `(g, x)`.
+///
+/// Each level smooth hands its linear direction `x·1_g` off (see
+/// `factor_by_level_slope_axes`); what the `G` levels handed off is the span
+/// `{x·1_g}`, of which the linear `x` main effect already carries the common
+/// slope. The remaining `G − 1` directions are the slope deviations `b_g − b̄`,
+/// and they are exchangeable across levels, so they share one strength: the
+/// `LevelSlopes` block `(x − c)·Q[g, ·]` with `Q` orthonormal Helmert contrasts
+/// and penalty `I_{G−1}`, i.e. `Σ_g (b_g − b̄)²`.
+fn push_factor_level_slope_terms(
+    ds: &Dataset,
+    linear_terms: &[LinearTermSpec],
+    smooth_terms: &mut Vec<SmoothTermSpec>,
+) -> Result<(), TermBuilderError> {
+    let mut pairs = Vec::<(usize, usize)>::new();
+    for term in smooth_terms.iter() {
+        let SmoothBasisSpec::ByVariable { by_col, .. } = &term.basis else {
+            continue;
+        };
+        for axis in crate::smooth::factor_by_level_slope_axes(linear_terms, term) {
+            if !pairs.contains(&(*by_col, axis)) {
+                pairs.push((*by_col, axis));
+            }
+        }
+    }
+    for (by_col, axis) in pairs {
+        let n_levels = ds
+            .values
+            .column(by_col)
+            .iter()
+            .map(|&value| gam_data::canonical_level_bits(value))
+            .collect::<BTreeSet<_>>()
+            .len();
+        if n_levels < 2 {
+            continue;
+        }
+        let (minv, maxv) = col_minmax(ds.values.column(axis))?;
+        let header = |col: usize| {
+            ds.headers
+                .get(col)
+                .cloned()
+                .unwrap_or_else(|| format!("col{col}"))
+        };
+        smooth_terms.push(SmoothTermSpec {
+            frozen_parametric_residualization: None,
+            name: format!("level_slopes({},{})", header(axis), header(by_col)),
+            basis: SmoothBasisSpec::FactorSmooth {
+                spec: FactorSmoothSpec {
+                    continuous_cols: vec![axis],
+                    group_col: by_col,
+                    marginal: BSplineBasisSpec {
+                        degree: 1,
+                        penalty_order: 1,
+                        knotspec: BSplineKnotSpec::Generate {
+                            data_range: (minv, maxv),
+                            num_internal_knots: 0,
+                        },
+                        double_penalty: false,
+                        identifiability: BSplineIdentifiability::None,
+                        boundary: OneDimensionalBoundary::Open,
+                        boundary_conditions: BSplineBoundaryConditions::default(),
+                    },
+                    flavour: FactorSmoothFlavour::LevelSlopes,
+                    group_frozen_levels: None,
+                    frozen_global_orthogonality: None,
+                    // A level slope is one linear piece per level by construction.
+                    adaptive: false,
+                },
+            },
+            shape: ShapeSpec::None,
+            joint_null_rotation: None,
+        });
+    }
+    Ok(())
 }
 
 fn split_list_option(raw: &str) -> Vec<String> {
