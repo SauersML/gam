@@ -26,7 +26,7 @@
 use crate::gpu_polya_gamma::{PgSeed, PolyaGammaBatchInput};
 use faer::Side;
 use gam_linalg::faer_ndarray::{
-    FaerCholesky, fast_ab, fast_ata_into, fast_atv, fast_av, fast_av_into,
+    FaerCholesky, fast_ab, fast_ata_into, fast_atv, fast_av_into,
 };
 use gam_linalg::matrix::DesignMatrix;
 use gam_linalg::triangular::back_substitution_lower_transpose_guarded_into;
@@ -1159,20 +1159,13 @@ mod tests {
         hessian: &Array2<f64>,
         design: &DesignMatrix,
         c_weights: &Array1<f64>,
-        refine_supremum: bool,
     ) -> Result<(f64, Array1<f64>), String> {
         use gam_linalg::faer_ndarray::FaerEigh;
         let sym_h = (hessian + &hessian.t()) * 0.5;
         let (evals, evecs) = sym_h
             .eigh(faer::Side::Lower)
             .map_err(|e| format!("directional cubic diagnostic eigendecomposition failed: {e}"))?;
-        laplace_directional_cubic_diagnostic_on_eigenpairs(
-            &evals,
-            &evecs,
-            design,
-            c_weights,
-            refine_supremum,
-        )
+        laplace_directional_cubic_diagnostic_on_eigenpairs(&evals, &evecs, design, c_weights)
     }
 
     #[test]
@@ -2464,14 +2457,12 @@ mod tests {
             &h,
             &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x)),
             &c,
-            true,
         )
         .expect("base diagnostic");
         let (rot_max, rot_vals) = laplace_directional_cubic_diagnostic(
             &h_rot,
             &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_rot)),
             &c,
-            true,
         )
         .expect("rotated diagnostic");
 
@@ -2505,7 +2496,7 @@ mod tests {
     /// design tall enough to cross the row-panel boundary.
     #[test]
     fn batched_directional_cubics_match_the_single_direction_contraction() {
-        use super::{directional_cubic_contraction, directional_cubic_contractions};
+        use super::directional_cubic_contractions;
         use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 
         let n = 37;
@@ -2539,8 +2530,13 @@ mod tests {
         for (label, design) in [("dense", &dense), ("sparse", &sparse)] {
             let batched = directional_cubic_contractions(design, &c, &directions.view());
             for r in 0..directions.ncols() {
-                let reference =
-                    directional_cubic_contraction(design, &c, &directions.column(r).view());
+                // `Σ_i c_i (x_iᵀ v_r)³`, one direction and one row at a time.
+                let reference: f64 = x
+                    .rows()
+                    .into_iter()
+                    .zip(c.iter())
+                    .map(|(row, &weight)| weight * row.dot(&directions.column(r)).powi(3))
+                    .sum();
                 assert!(
                     (batched[r] - reference).abs() <= 1.0e-9 * reference.abs().max(1.0),
                     "{label} arm disagreed on direction {r}: batched {} vs reference {}",
@@ -2549,43 +2545,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// The power-iteration refinement should find non-Gaussianity at least
-    /// as large as the eigenvector-only pass (it's a supremum search).
-    #[test]
-    fn directional_cubic_power_iteration_finds_larger_or_equal_skewness() {
-        // Construct a design where the maximum |gamma| occurs off-axis.
-        // A single row with asymmetric structure makes the cubic form
-        // peak between eigenvectors.
-        let x = array![
-            [2.0, 1.0],
-            [-1.0, 2.0],
-            [0.5, -0.5],
-            [1.5, 0.3],
-            [-0.8, 1.7],
-        ];
-        let c = array![1.0, -0.5, 0.3, -0.7, 0.4];
-        let h = array![[3.0, 1.0], [1.0, 2.0]];
-
-        let (max_val, eigenvector_vals) = laplace_directional_cubic_diagnostic(
-            &h,
-            &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x)),
-            &c,
-            true,
-        )
-        .expect("diagnostic");
-
-        // max_val should be >= max of eigenvector-only values.
-        let eig_max = eigenvector_vals
-            .iter()
-            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        assert!(
-            max_val >= eig_max - 1.0e-12,
-            "power iteration result {} should be >= eigenvector max {}",
-            max_val,
-            eig_max,
-        );
     }
 
     #[test]
@@ -3508,14 +3467,12 @@ mod tests {
             eigenvectors: &Array2<f64>,
             design: &DesignMatrix,
             c_weights: &Array1<f64>,
-            refine_supremum: bool,
         ) -> Result<(f64, Array1<f64>), String> {
             super::laplace_directional_cubic_diagnostic_on_eigenpairs(
                 eigenvalues,
                 eigenvectors,
                 design,
                 c_weights,
-                refine_supremum,
             )
         }
         fn block_quadrature_marginal_correction(
@@ -3604,11 +3561,10 @@ mod tests {
             eigenvectors: &Array2<f64>,
             design: &DesignMatrix,
             c_weights: &Array1<f64>,
-            refine_supremum: bool,
         ) -> Result<(f64, Array1<f64>), String> {
             Err(format!(
                 "the scripted corrector has no diagnostic ({} eigenvalues, {}x{} eigenvectors, \
-                 {} rows, {} weights, refine={refine_supremum})",
+                 {} rows, {} weights)",
                 eigenvalues.len(),
                 eigenvectors.nrows(),
                 eigenvectors.ncols(),
@@ -6112,18 +6068,13 @@ pub fn run_nuts_sampling_flattened_family(
 /// and reports `max_r |gamma_r|`. This is invariant to arbitrary coordinate
 /// relabeling and uses the full directional cubic contraction rather than only
 /// diagonal tensor entries.
-/// `refine_supremum` controls Phase 2, the cubic power-iteration that sharpens
-/// the returned scalar `max_abs` toward the true supremum of `|γ(u)|` over the
-/// H-unit sphere (which can exceed the per-eigenvector maximum). That scalar is
-/// the ONLY thing Phase 2 affects — the per-direction `directional` vector,
-/// which drives [`laplace_trustworthiness_from_skewness`]'s direction selection
-/// AND its own internally-recomputed `max_abs_skewness`, comes entirely from
-/// Phase 1. The #784 block-local REML correction
-/// (`block_local_sampled_correction`) consumes `directional` and uses `max_abs`
-/// only for a `> 0` finiteness guard that Phase 1 already satisfies, so it
-/// passes `false` and skips Phase 2's multi-probe O(probes·iters·np) refinement
-/// on every inner evaluation. Diagnostic callers that report the true supremum
-/// pass `true`.
+/// `max_abs` is the maximum over those eigen-directions, which is exactly what
+/// each consumer needs: [`laplace_trustworthiness_from_skewness`] selects
+/// directions from, and recomputes its own `max_abs_skewness` from, the
+/// per-direction `directional` vector, and the #784 block-local REML correction
+/// (`block_local_sampled_correction`) uses `max_abs` only as a `> 0` guard. It
+/// is not the supremum of `|γ(u)|` over the whole H-unit sphere, which can
+/// exceed it; no consumer asks for that supremum (#4260).
 ///
 /// The diagnostic runs along caller-supplied eigenpairs
 /// `(eigenvalues[r], eigenvectors[:, r])`, in any order, so the #784
@@ -6134,7 +6085,6 @@ pub(crate) fn laplace_directional_cubic_diagnostic_on_eigenpairs(
     evecs: &Array2<f64>,
     design: &DesignMatrix,
     c_weights: &Array1<f64>,
-    refine_supremum: bool,
 ) -> Result<(f64, Array1<f64>), String> {
     let p = evals.len();
     if p == 0 {
@@ -6182,38 +6132,6 @@ pub(crate) fn laplace_directional_cubic_diagnostic_on_eigenpairs(
         }
     }
 
-    // Phase 2: power-iteration refinement in whitened space.
-    //
-    // The supremum of |gamma(u)| over ||u||_H=1 can exceed the max over
-    // eigenvectors. We approximate it with a few rounds of cubic power
-    // iteration: given current direction v, the gradient of T[v,v,v] w.r.t.
-    // v on the H-unit sphere is 3 T[·,v,v] projected onto the tangent space.
-    // Since T[·,v,v] = X^T diag(c_i (x_i^T v)^2) which is a matrix-vector
-    // product, each iteration is O(np).
-    //
-    // We seed from the eigenvector with largest |gamma_r| and also from a
-    // few random probe directions.
-    if refine_supremum && p >= 2 {
-        // Build H^{-1/2} columns for whitening: H^{-1/2} = V diag(1/sqrt(lam)) V^T
-        // We need it to map whitened u -> original v = H^{-1/2} u, and
-        // H^{1/2} to project back: H^{1/2} v = V diag(sqrt(lam)) V^T v.
-        let positive_mask: Vec<bool> = evals.iter().map(|&ev| ev > tol).collect();
-        let n_pos = positive_mask.iter().filter(|&&m| m).count();
-        if n_pos >= 2 {
-            let max_abs_from_probes = cubic_power_iteration_refinement(
-                design,
-                c_weights,
-                &evals,
-                &evecs,
-                &positive_mask,
-                n_pos,
-            );
-            if max_abs_from_probes > max_abs {
-                max_abs = max_abs_from_probes;
-            }
-        }
-    }
-
     Ok((max_abs, directional))
 }
 
@@ -6225,11 +6143,11 @@ const CUBIC_PANEL_DOUBLES: usize = 1 << 21;
 /// Compute `T[v_r,v_r,v_r] = Σ_i c_i (x_iᵀ v_r)³` for EVERY column `v_r` of
 /// `directions` (p × k) in one pass.
 ///
-/// The single-direction [`directional_cubic_contraction`] forms `X v`, so
-/// calling it once per direction forms `X v_1, …, X v_k` — which is the GEMM
-/// `X V` spelled as k separate GEMVs. The diagnostic's phase 1 does exactly
-/// that over every positive-curvature eigenvector, so the whole O(n·p²) step
-/// was running at BLAS-2 intensity: each GEMV re-streams all of `X` from
+/// A single-direction contraction forms `X v`, so calling it once per
+/// direction forms `X v_1, …, X v_k` — which is the GEMM `X V` spelled as k
+/// separate GEMVs. The diagnostic's phase 1 did exactly that over every
+/// positive-curvature eigenvector, so the whole O(n·p²) step ran at BLAS-2
+/// intensity: each GEMV re-streams all of `X` from
 /// memory to reuse a single vector. Forming the product once lets the rows of
 /// `X` be reused across all k directions while they are in cache, which is the
 /// entire difference between a memory-bound and a compute-bound kernel.
@@ -6317,268 +6235,6 @@ fn directional_cubic_contractions(
     cubics
 }
 
-/// Compute T[v,v,v] = Σ_i c_i (x_i^T v)^3 for a given direction v.
-fn directional_cubic_contraction(
-    design: &DesignMatrix,
-    c_weights: &Array1<f64>,
-    v: &ArrayView1<f64>,
-) -> f64 {
-    match design.as_sparse() {
-        Some(x_sparse) => {
-            let (symbolic, values) = x_sparse.as_ref().parts();
-            let col_ptr = symbolic.col_ptr();
-            let row_idx = symbolic.row_idx();
-            let mut row_scores = vec![0.0_f64; x_sparse.nrows()];
-            for col in 0..x_sparse.ncols() {
-                let coeff = v[col];
-                for ptr in col_ptr[col]..col_ptr[col + 1] {
-                    row_scores[row_idx[ptr]] += values[ptr] * coeff;
-                }
-            }
-            let mut cubic = 0.0_f64;
-            for i in 0..row_scores.len().min(c_weights.len()) {
-                cubic += c_weights[i] * row_scores[i].powi(3);
-            }
-            cubic
-        }
-        None => {
-            let x_dense = design.to_dense_cow();
-            let x_dense = x_dense.as_ref();
-            let rows = x_dense.nrows().min(c_weights.len());
-            if rows == 0 {
-                return 0.0;
-            }
-            // `x_i · v` for every row IS `X v`. Issuing it as `rows` separate
-            // 1-D dots leaves ndarray on its scalar `dot_generic` fallback —
-            // this crate builds ndarray without the `blas` feature, so its
-            // `dot` never reaches a GEMV kernel. A profile of a temporal fit
-            // put 44% of total runtime in that one symbol, called from here
-            // and from `directional_cubic_gradient` under the power iteration
-            // below. One faer GEMV does the same arithmetic against the SIMD
-            // microkernels. The sparse arm above already batches this way.
-            let projections = fast_av(&x_dense.slice(s![..rows, ..]), v);
-            let mut cubic = 0.0_f64;
-            for i in 0..rows {
-                cubic += c_weights[i] * projections[i].powi(3);
-            }
-            cubic
-        }
-    }
-}
-
-/// Compute the gradient of T[v,v,v] w.r.t. v:  3 X^T diag(c_i (x_i^T v)^2) 1.
-/// More precisely: ∂/∂v T[v,v,v] = 3 Σ_i c_i (x_i^T v)^2 x_i.
-fn directional_cubic_gradient(
-    design: &DesignMatrix,
-    c_weights: &Array1<f64>,
-    v: &Array1<f64>,
-) -> Array1<f64> {
-    let p = v.len();
-    match design.as_sparse() {
-        Some(x_sparse) => {
-            let (symbolic, values) = x_sparse.as_ref().parts();
-            let col_ptr = symbolic.col_ptr();
-            let row_idx = symbolic.row_idx();
-            let n = x_sparse.nrows();
-            let mut row_scores = vec![0.0_f64; n];
-            for col in 0..x_sparse.ncols() {
-                let coeff = v[col];
-                for ptr in col_ptr[col]..col_ptr[col + 1] {
-                    row_scores[row_idx[ptr]] += values[ptr] * coeff;
-                }
-            }
-            // quadratic weights: 3 c_i (x_i^T v)^2
-            let mut quad_weights = vec![0.0_f64; n];
-            for i in 0..n.min(c_weights.len()) {
-                quad_weights[i] = 3.0 * c_weights[i] * row_scores[i] * row_scores[i];
-            }
-            // X^T quad_weights
-            let mut grad = Array1::<f64>::zeros(p);
-            for col in 0..x_sparse.ncols() {
-                let mut acc = 0.0_f64;
-                for ptr in col_ptr[col]..col_ptr[col + 1] {
-                    acc += values[ptr] * quad_weights[row_idx[ptr]];
-                }
-                grad[col] = acc;
-            }
-            grad
-        }
-        None => {
-            let x_dense = design.to_dense_cow();
-            let x_dense = x_dense.as_ref();
-            let rows = x_dense.nrows().min(c_weights.len());
-            if rows == 0 {
-                return Array1::<f64>::zeros(p);
-            }
-            // Same two products the sparse arm above forms explicitly:
-            // `X v` for the projections, then `Xᵀ w` for the gradient. Written
-            // row-at-a-time this was a scalar 1-D dot plus a hand-rolled
-            // `grad += w · row` inner loop, both of which show up in a fit
-            // profile (`dot_generic` and `scaled_add`, together the single
-            // largest cost in a temporal fit). Two faer GEMVs replace the
-            // whole nest.
-            let x_rows = x_dense.slice(s![..rows, ..]);
-            let projections = fast_av(&x_rows, v);
-            let mut quad_weights = Array1::<f64>::zeros(rows);
-            for i in 0..rows {
-                quad_weights[i] = 3.0 * c_weights[i] * projections[i] * projections[i];
-            }
-            fast_atv(&x_rows, &quad_weights)
-        }
-    }
-}
-
-/// Power-iteration refinement for the supremum of |gamma(u)| over ||u||_H = 1.
-///
-/// Seeds from the best eigenvector direction plus deterministic probe
-/// directions constructed from pairs of eigenvectors. Runs a few Riemannian
-/// gradient ascent steps on the whitened unit sphere.
-fn cubic_power_iteration_refinement(
-    design: &DesignMatrix,
-    c_weights: &Array1<f64>,
-    evals: &Array1<f64>,
-    evecs: &Array2<f64>,
-    positive_mask: &[bool],
-    n_pos: usize,
-) -> f64 {
-    let p = evals.len();
-    let max_probes = 8;
-    let max_iters = 5;
-
-    // Helper: convert whitened u -> original v = Σ_r (u_r / sqrt(lam_r)) * evec_r
-    // (only over positive eigenspace).
-    let to_original = |u: &Array1<f64>| -> Array1<f64> {
-        let mut v = Array1::<f64>::zeros(p);
-        let mut idx = 0;
-        for r in 0..p {
-            if positive_mask[r] {
-                let scale = u[idx] / evals[r].sqrt();
-                let col = evecs.column(r);
-                for j in 0..p {
-                    v[j] += scale * col[j];
-                }
-                idx += 1;
-            }
-        }
-        v
-    };
-
-    // Helper: project original-space vector to whitened: u_j = sqrt(lam_r) (evec_r^T g)
-    let to_whitened = |g: &Array1<f64>| -> Array1<f64> {
-        let mut u = Array1::<f64>::zeros(n_pos);
-        let mut idx = 0;
-        for r in 0..p {
-            if positive_mask[r] {
-                u[idx] = evals[r].sqrt() * evecs.column(r).dot(g);
-                idx += 1;
-            }
-        }
-        u
-    };
-
-    // Evaluate |gamma(u)| for whitened direction u.
-    // A direction normalizes exactly for every positive finite norm; only a zero
-    // (or non-finite) norm has no direction to evaluate or refine.
-    let eval_gamma = |u: &Array1<f64>| -> f64 {
-        let norm = u.dot(u).sqrt();
-        if !(norm > 0.0 && norm.is_finite()) {
-            return 0.0;
-        }
-        let u_normed: Array1<f64> = u / norm;
-        let v = to_original(&u_normed);
-        // gamma = T[v,v,v] since v already has ||v||_H = 1
-        let cubic = directional_cubic_contraction(design, c_weights, &v.view());
-        if cubic.is_finite() { cubic.abs() } else { 0.0 }
-    };
-
-    // One step of Riemannian gradient ascent on the whitened sphere for |T[v,v,v]|.
-    let refine_step = |u: &Array1<f64>| -> Array1<f64> {
-        let norm = u.dot(u).sqrt();
-        if !(norm > 0.0 && norm.is_finite()) {
-            return u.clone();
-        }
-        let u_normed: Array1<f64> = u / norm;
-        let v = to_original(&u_normed);
-        // Gradient of T[v,v,v] w.r.t. v in original space
-        let grad_v = directional_cubic_gradient(design, c_weights, &v);
-        // Map to whitened space
-        let mut grad_u = to_whitened(&grad_v);
-        // Project onto tangent plane of sphere: grad - (grad . u) u
-        let dot = grad_u.dot(&u_normed);
-        grad_u.scaled_add(-dot, &u_normed);
-        // Sign: we want to maximize |T|, so follow sign(T) * grad
-        let cubic_val = directional_cubic_contraction(design, c_weights, &v.view());
-        let sign = if cubic_val >= 0.0 { 1.0 } else { -1.0 };
-        let step_size = 0.3;
-        let mut u_new = &u_normed + &(&grad_u * (sign * step_size));
-        let new_norm = u_new.dot(&u_new).sqrt();
-        if new_norm > 0.0 && new_norm.is_finite() {
-            u_new /= new_norm;
-        }
-        u_new
-    };
-
-    let mut best = 0.0_f64;
-
-    // Build seed directions:
-    // (a) The eigenvector with largest |gamma_r| (already computed by caller,
-    //     but we re-derive the whitened form here).
-    // (b) Deterministic probe directions from pairs of top eigenvectors:
-    //     (e_i + e_j) / sqrt(2) and (e_i - e_j) / sqrt(2) in whitened space.
-    let mut seeds: Vec<Array1<f64>> = Vec::with_capacity(max_probes);
-
-    // Seed (a): each eigenvector is a standard basis vector in whitened space.
-    // Find the one with largest |gamma|.
-    let mut best_eig_idx = 0;
-    let mut best_eig_gamma = 0.0_f64;
-    for j in 0..n_pos {
-        let mut u = Array1::<f64>::zeros(n_pos);
-        u[j] = 1.0;
-        let g = eval_gamma(&u);
-        if g > best_eig_gamma {
-            best_eig_gamma = g;
-            best_eig_idx = j;
-        }
-    }
-    best = best.max(best_eig_gamma);
-    let mut u_best = Array1::<f64>::zeros(n_pos);
-    u_best[best_eig_idx] = 1.0;
-    seeds.push(u_best);
-
-    // Seed (b): pairwise combinations of the top few eigenvectors.
-    let n_top = n_pos.min(4);
-    for i in 0..n_top {
-        for j in (i + 1)..n_top {
-            if seeds.len() >= max_probes {
-                break;
-            }
-            let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
-            let mut u_plus = Array1::<f64>::zeros(n_pos);
-            u_plus[i] = inv_sqrt2;
-            u_plus[j] = inv_sqrt2;
-            seeds.push(u_plus);
-            if seeds.len() < max_probes {
-                let mut u_minus = Array1::<f64>::zeros(n_pos);
-                u_minus[i] = inv_sqrt2;
-                u_minus[j] = -inv_sqrt2;
-                seeds.push(u_minus);
-            }
-        }
-    }
-
-    // Run power iteration from each seed.
-    for seed in &seeds {
-        let mut u = seed.clone();
-        for _ in 0..max_iters {
-            u = refine_step(&u);
-        }
-        let g = eval_gamma(&u);
-        best = best.max(g);
-    }
-
-    best
-}
-
 // ───────────────── #1521 laplace-sampler contract re-exports ─────────────────
 //
 // The neutral DATA carriers + the caller-supplied [`BlockExcessTarget`]
@@ -6609,14 +6265,12 @@ impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector
         eigenvectors: &Array2<f64>,
         design: &DesignMatrix,
         c_weights: &Array1<f64>,
-        refine_supremum: bool,
     ) -> Result<(f64, Array1<f64>), String> {
         laplace_directional_cubic_diagnostic_on_eigenpairs(
             eigenvalues,
             eigenvectors,
             design,
             c_weights,
-            refine_supremum,
         )
     }
 
