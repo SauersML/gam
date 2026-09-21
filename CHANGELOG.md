@@ -1,5 +1,32 @@
 ## Unreleased
 
+- **The default spatial center count is a derived resolution rate, not a table of seven
+  constants** (gam#3149, gam#2993).
+  `default_num_centers(n, d)` was `ceil(8 · (1 + 0.15·(d−1)) · n^0.4)`, floored at
+  `min(200, n/8)`, capped at `2000` and again at `n/4`. None of those seven numbers came
+  from the data, from `eps`, or from a stated budget, and the 15%-per-axis factor bought
+  the opposite of its documented rationale: constant per-axis mesh density in `d`
+  dimensions needs exponential growth, so in 16-D the factor paid for a 2000-column dense
+  block without resolving one extra direction. A joint Duchon over 16 ancestry PCs took
+  1 971 centers at n = 50 000 and the cap from n = 250 000 up, twice over in a
+  marginal-slope fit. The count is now one level of `refined_num_centers` on
+  `penalized_resolution_rank(n, d, minimal_embedding_order(d))` — the same derived
+  smoothing rate `starting_num_centers` already gives the resolution loop's pilot, which
+  carries the domain dimension through the exponent `d/(2m+d)` rather than through a
+  percentage. It is held to the row count and to `SPATIAL_CENTER_GRAM_MAX_COLUMNS`, the
+  widest center set whose dense center-center Gram fits the basis layer's declared
+  materialization budget, so the one remaining bound is derived from that budget and moves
+  with it. The 16-D defaults become 326 at n = 50 000 and 694 at n = 250 000, and they keep
+  growing with `n` instead of saturating. `past_dense_kernel_cliff` read the deleted
+  2000-column cap to decide the residual-cascade auto-route; a saturation test against a
+  rate that never saturates is a branch that cannot fire, so it now prices the fact the
+  cliff always meant — the `n x K` dense radial design no longer fits that same budget.
+  **Behavior change:** every spatial smooth whose size nobody chose (`tps`, `matern`,
+  `duchon`, `curv`, Wahba `sphere`, the 1-D position basis) is built at a smaller,
+  n-growing default, and the residual-cascade auto-route fires from n ≈ 1.9e5 at d = 3
+  instead of n ≈ 5.1e5. Explicit `centers=`/`k=` is unaffected, and so is the standard
+  formula workflow's pilot, which was already derived.
+
 - **A speculative basis refinement that does not converge closes the attempt instead of
   discarding the certified fit** (gam#4529).
   `s(x, shape=monotone_increasing)` on pyGAM's hepatitis data raised

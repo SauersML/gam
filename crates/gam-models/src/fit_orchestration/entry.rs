@@ -4029,18 +4029,35 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
     Some(SplineScanInputs { x, y, w, order })
 }
 
-/// Derived dense-kernel cliff: the cascade auto-route fires only once the dense
-/// radial basis the smooth would otherwise use has SATURATED at its center cap
-/// (`default_num_centers == K_MAX`), so the dense `O(n·K² + K³)` kernel solve
-/// can no longer grow resolution with `n` and the streaming cascade's
-/// `O(n·polylog)` is the only path that keeps improving. This is the structural
-/// "past the dense-kernel cliff" condition the issue names — derived from the
-/// dense sizing rule, NOT a magic n constant or a user flag.
+/// Derived dense-kernel cliff: the cascade auto-route fires once the dense
+/// radial design the smooth would otherwise build no longer fits the basis
+/// layer's declared materialization budget, so the dense `O(n·K² + K³)` kernel
+/// solve cannot be formed at the resolution the data asks for and the
+/// streaming cascade's `O(n·polylog)` is the only path left. Derived from the
+/// dense sizing rule and a stated budget, NOT a magic `n` constant or a user
+/// flag.
+///
+/// It used to read `default_num_centers(n, d) >= 2000`, i.e. "the center count
+/// has SATURATED at its cap". That cap was one of the seven hand-set constants
+/// #3149 removed, and the rule that replaced it is a resolution RATE with no
+/// saturation point at all — so a saturation test against it is a branch that
+/// can never fire. The fact the cliff always meant is a materialization one:
+/// the dense route holds an `n x K` design of `f64`, and past
+/// [`gam_terms::basis::SPATIAL_CENTER_CENTER_MAX_BYTES`] it cannot hold it.
+/// At `d = 3` that crossover is `n ≈ 1.9e5`, against `n ≈ 5.1e5` under the
+/// deleted cap.
 fn past_dense_kernel_cliff(n: usize, d: usize) -> bool {
-    // `default_num_centers` clamps to K_MAX = 2000; equality means the dense
-    // basis is pinned at the cap and cannot densify further with n.
-    const DENSE_CENTER_CAP: usize = 2000;
-    gam_terms::basis::default_num_centers(n, d) >= DENSE_CENTER_CAP
+    let centers = gam_terms::basis::default_num_centers(n, d);
+    dense_radial_design_bytes(n, centers) > gam_terms::basis::SPATIAL_CENTER_CENTER_MAX_BYTES
+}
+
+/// Bytes the dense radial route holds for its `n x centers` `f64` design, the
+/// object [`past_dense_kernel_cliff`] prices. Saturating, so a width that
+/// overflows `usize` reads as "does not fit" rather than wrapping to a small
+/// number and reporting that it does.
+fn dense_radial_design_bytes(n: usize, centers: usize) -> usize {
+    n.saturating_mul(centers)
+        .saturating_mul(std::mem::size_of::<f64>())
 }
 
 /// Map a Duchon/Matérn smoothness order onto the cascade's Sobolev order,

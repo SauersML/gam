@@ -236,9 +236,19 @@ fn cascade_matches_or_beats_dense_duchon_on_truth_recovery() {
 fn past_cliff_fit_from_formula_propagates_refinement_proof_capacity() {
     init_parallelism();
     let n = 525_000;
+    // Past the dense-kernel cliff on the rule the route itself prices: the
+    // `n x default_num_centers(n, 3)` dense radial design does not fit the
+    // basis layer's materialization budget (#3149 replaced the saturated
+    // 2000-center cap this used to read with a resolution rate that never
+    // saturates, so a cap test here would assert a branch that cannot fire).
+    let dense_design_bytes = n
+        .saturating_mul(gam::basis::default_num_centers(n, 3))
+        .saturating_mul(std::mem::size_of::<f64>());
     assert!(
-        gam::basis::default_num_centers(n, 3) >= 2_000,
-        "test shape must be past the dense-kernel center cliff"
+        dense_design_bytes > gam::basis::SPATIAL_CENTER_CENTER_MAX_BYTES,
+        "test shape must be past the dense-kernel cliff: dense design {dense_design_bytes} B \
+         is within the {} B materialization budget",
+        gam::basis::SPATIAL_CENTER_CENTER_MAX_BYTES
     );
     let data = sample(3, n);
     let cfg = gaussian_config();

@@ -1,5 +1,14 @@
 [
   {
+    "base": "b8fcb448379a238f75525eac53bef90b3770c4c8",
+    "items": [
+      "crates/gam-terms/src/basis/types.rs:const:CENTER_GROWTH_EXPONENT",
+      "crates/gam-terms/src/basis/types.rs:const:ROWS_PER_SUPPORTED_CENTER"
+    ],
+    "reason": "#3149/#2993: default_num_centers no longer has a growth exponent or a rows-per-center divisor to name. Its body was seven hand-set constants (C = 8, n^0.4, 15%/dimension, a 200 floor, a 2000 cap, n/4, n/8); it is now one level of refined_num_centers on penalized_resolution_rank(n, d, minimal_embedding_order(d)), the same derived smoothing rate the resolution loop's pilot uses, held to the row count and to the center-Gram width the basis layer's materialization budget admits. CENTER_GROWTH_EXPONENT was the 0.4 in the deleted rate and ROWS_PER_SUPPORTED_CENTER the 8 in the deleted min(200, n/8) floor, so both have no referent under the new rule. Both were private module consts of types.rs.",
+    "evidence": "At the base b8fcb44837, git grep -n finds CENTER_GROWTH_EXPONENT on 2 lines and ROWS_PER_SUPPORTED_CENTER on 3 lines, all in crates/gam-terms/src/basis/types.rs: each declaration plus its uses inside default_num_centers. No other crate, test, bench or example names either. Both are private (no pub), so the public API census is unaffected; the same commit ADDS two pub items (SPATIAL_CENTER_GRAM_MAX_COLUMNS, and pub visibility on the existing SPATIAL_CENTER_CENTER_MAX_BYTES), which the census does not gate."
+  },
+  {
     "base": "5d70150bb9d25ce48ae037b046bae04646c969f3",
     "items": [
       "crates/gam-sae/src/null_battery.rs:fn:cholesky_lower",

@@ -478,70 +478,85 @@ pub(crate) enum CenterStrategyKind {
     UniformGrid,
 }
 
-/// Adaptive default center count for spatial smooths (TPS, Duchon, Matérn).
+/// Provisioned default center count for a spatial smooth (thin plate, Duchon,
+/// Matérn, constant curvature, Wahba sphere) whose size nobody chose.
 ///
-/// Use this when the user has not explicitly specified a knot/center count.
-/// The basis size is the sub-linear `ceil(8 * d_factor * n^0.4)`, clamped above
-/// at `K_MAX = 2000` and below at a *data-proportional* floor `min(200, n/8)` so
-/// the floor only engages once there are enough observations to support a rich
-/// basis. The result is additionally capped at `n/4` so the penalty matrices
-/// stay well-conditioned relative to the data:
+/// This is the size a route WITHOUT a resolution loop builds at, and the size
+/// a basis the loop cannot grow keeps (#3149). The route that does grow its
+/// bases starts them one step lower, at [`starting_num_centers`], and refines
+/// from there on the converged fit's own REML evidence.
 ///
-/// | n      | d=1  | d=2  | d=5  |
-/// |--------|------|------|------|
-/// | 800    | 116  | 134  | 186  |
-/// | 1 000  | 127  | 146  | 200  |
-/// | 2 000  | 200  | 200  | 268  |
-/// | 10 000 | 319  | 367  | 510  |
-/// | 100 000| 801  | 921  | 1281 |
-/// | 400 000| 1393 | 1602 | 2000 |
-/// | 1 000 000| 2000 | 2000 | 2000 |
+/// # Where the number comes from
 ///
-/// The flat `200` floor used to inflate moderate-`n` spatial smooths (a few
-/// hundred to ~2000 rows) up to a dense 200-column design even though the raw
-/// sub-linear count — and the mesh/knot density that mgcv and R-INLA use on the
-/// same data — is far smaller. On ~800 rows that turned a single 2-D thin-plate
-/// REML fit into an `O(n·p² + p³)` grind at `p ≈ 200` (#718). Smoothness is
-/// already controlled by REML's penalty weight λ, not by the center count, so a
-/// data-proportional floor recovers the same surface at a fraction of the cost.
+/// Two derived quantities and nothing else:
+///
+/// * [`penalized_resolution_rank`]`(n, d, `[`minimal_embedding_order`]`(d))` —
+///   the number of directions an optimally smoothed order-`m` penalized smooth
+///   on `d` covariates keeps at `n` rows, `⌈n^{d/(2m+d)}⌉`. It carries the
+///   domain dimension through the SAME exponent the smoothing rate does, which
+///   is the property the deleted `1 + 0.15·(d−1)` factor claimed and did not
+///   have: a 15%-per-axis widening keeps per-axis mesh density constant in no
+///   dimension, so in 16-D it bought a 2000-column dense block and not one
+///   extra resolved direction (#2993).
+/// * one level of [`refined_num_centers`] on top of it. The rank is the
+///   SMALLEST basis that does not bias the fit before λ is chosen; a route
+///   that will never refine has to enter above that floor, and the loop's own
+///   refinement step — every center's cell receives one new center — is the
+///   step this basis is being handed in advance instead of earning.
+///
+/// The result is held to what can be built and to what exists: the widest
+/// center set whose dense center–center Gram fits
+/// [`SPATIAL_CENTER_CENTER_MAX_BYTES`]
+/// ([`SPATIAL_CENTER_GRAM_MAX_COLUMNS`]), and the row count, since a center is
+/// a row.
+///
+/// | n         | d=1 | d=2 | d=3 | d=5 | d=16 |
+/// |-----------|-----|-----|-----|-----|------|
+/// | 800       | 20  | 20  | 36  | 42  | 48   |
+/// | 10 000    | 44  | 44  | 104 | 132 | 154  |
+/// | 50 000    | 74  | 74  | 208 | 274 | 326  |
+/// | 100 000   | 94  | 94  | 278 | 376 | 452  |
+/// | 300 000   | 134 | 134 | 446 | 618 | 756  |
+///
+/// The 16-D column is the one #2993 reported: a joint Duchon over 16 ancestry
+/// PCs took 1 971 centers at n = 50 000 and the 2 000-column cap from n =
+/// 250 000 up, two dense `n x 2000` blocks in a marginal-slope fit. It now
+/// takes 326 and 694, and it keeps GROWING with n instead of saturating,
+/// because the count is a resolution rate and not a cap.
+///
+/// # What is NOT here any more
+///
+/// `C = 8`, the `n^0.4` growth exponent, the 15%-per-dimension factor, the
+/// `K_MIN = 200` floor, the `K_MAX = 2000` cap, the `n/4` conditioning cap and
+/// the `n/8` support divisor: seven hand-set constants, none of which came from
+/// the data, from `eps`, or from a stated budget (#3149). Conditioning is not
+/// bought by an `n/4` ratio — it is what the REML penalty weight λ is for, as
+/// the deleted comment itself said — and a floor of 200 columns on 1 600 rows
+/// was the cost that floor was introduced to avoid (#718).
 ///
 /// # Arguments
 /// * `n` - sample size (number of observations)
 /// * `d` - covariate dimensionality (number of input variables in the smooth)
 pub fn default_num_centers(n: usize, d: usize) -> usize {
-    const K_MIN: usize = 200;
-    const K_MAX: usize = 2000;
-    const C: f64 = 8.0;
-    /// Per-extra-dimension growth in the center count: each covariate axis
-    /// beyond the first widens the basis by 15% to keep the per-axis mesh
-    /// density roughly constant as the smooth's domain dimensionality grows.
-    const PER_DIM_GROWTH: f64 = 0.15;
-    /// Divisor for the conditioning cap: the center count never exceeds `n /
-    /// COND_N_DIVISOR`, keeping the penalty matrices well-conditioned relative
-    /// to the data.
-    const COND_N_DIVISOR: usize = 4;
-
-    let d_factor = 1.0 + PER_DIM_GROWTH * (d.max(1) - 1) as f64;
-    let raw = (C * d_factor * (n as f64).powf(CENTER_GROWTH_EXPONENT)).ceil() as usize;
-
-    // Data-proportional floor: never inflate beyond n/ROWS_PER_SUPPORTED_CENTER,
-    // so the K_MIN-center floor only takes effect once n is large enough (~1600)
-    // to genuinely support that many basis columns.
-    let floor = K_MIN.min(n / ROWS_PER_SUPPORTED_CENTER);
-    let k = raw.clamp(floor, K_MAX);
-
-    // Never exceed n itself; cap at n/COND_N_DIVISOR to keep the penalty
-    // matrices well-conditioned relative to the data.
-    k.min(n).min(n / COND_N_DIVISOR)
+    let pilot = starting_num_centers(n, d, 0);
+    refined_num_centers(pilot)
+        .min(SPATIAL_CENTER_GRAM_MAX_COLUMNS)
+        .min(n)
+        .max(1)
 }
 
-/// Sample-size growth exponent of the production center budget:
-/// [`default_num_centers`] grows as `n^0.4`.
-const CENTER_GROWTH_EXPONENT: f64 = 0.4;
-
-/// Rows per center below which a center count is not data-supported. The
-/// production budget's `min(K_MIN, n / 8)` floor engages only at this density.
-const ROWS_PER_SUPPORTED_CENTER: usize = 8;
+/// Widest center set whose dense center–center Gram is inside the basis
+/// layer's declared materialization budget: `k` centers form a `k × k` `f64`
+/// kernel matrix, so the budget bounds `k` at
+/// `sqrt(SPATIAL_CENTER_CENTER_MAX_BYTES / size_of::<f64>())`.
+///
+/// Derived from the budget rather than chosen, so moving the budget moves the
+/// width and the two cannot drift apart. It is the same budget
+/// `assert_spatial_centers_below_large_scale_cap` refuses a realized center set
+/// against, so a default can never ask for a center set the realization would
+/// then reject.
+pub const SPATIAL_CENTER_GRAM_MAX_COLUMNS: usize =
+    (SPATIAL_CENTER_CENTER_MAX_BYTES / std::mem::size_of::<f64>()).isqrt();
 
 /// Conservative center count for a *secondary* (distributional) predictor's
 /// spatial smooth — e.g. the log-σ scale model in a Gaussian location-scale
@@ -2575,7 +2590,7 @@ impl AnisoBasisPsiDerivatives {
 //  Implicit derivative operator for scalable anisotropic REML gradients
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub(crate) const SPATIAL_CENTER_CENTER_MAX_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
+pub const SPATIAL_CENTER_CENTER_MAX_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
 pub(crate) const DESIGN_CROSS_CHUNK_SIZE: usize = 1024;
 
 /// Determine whether implicit operators should be used based on problem size
@@ -3418,11 +3433,13 @@ mod saturation_escalation_tests {
         // dimension, where `10 * 3^(d-1)` pinned it.
         assert!(starting_num_centers(100_000, 2, 3) > starting_num_centers(10_000, 2, 3));
         assert!(starting_num_centers(10_000, 2, 3) > starting_num_centers(1_000, 2, 3));
-        // Bounded only by the row count, never by the production heuristic
-        // budget: at n = 16 that budget's `n / 4` conditioning cap would hold
-        // a 2-D thin plate below its 3 null directions plus a penalized span.
+        // Bounded only by the row count: at n = 16 a 2-D thin plate keeps its
+        // 3 null directions plus the penalized span the rows resolve.
         assert_eq!(starting_num_centers(16, 2, 3), 3 + 3);
-        assert!(starting_num_centers(16, 2, 3) > default_num_centers(16, 2));
+        // The provisioned default is one nested refinement of the SAME rank,
+        // carrying no null space of its own, so the two sit a factor of two
+        // apart and neither is a clamp on the other (#3149).
+        assert_eq!(default_num_centers(16, 2), refined_num_centers(3));
         for (n, d) in [(20, 2), (100, 4), (100_000, 1), (5_000, 16)] {
             assert!(starting_num_centers(n, d, d + 1) <= n);
         }
