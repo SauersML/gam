@@ -621,34 +621,11 @@ pub(super) fn solve_newton_direction_dense(
         *direction_out = Array1::zeros(gradient.len());
     }
 
-    if gam_gpu::cuda_selected()
-        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?
-    {
-        let rhs = Array2::from_shape_vec((p, 1), gradient.to_vec()).map_err(|e| {
-            EstimationError::InvalidInput(format!("CUDA PIRLS RHS layout failed: {e}"))
-        })?;
-        // Solution-only: the Newton direction discards the logdet, so route
-        // through the mixed-precision solution-only path that skips the
-        // redundant fp64 POTRF (the fp32 factor + fp64 refinement already gives
-        // a full-fp64-accurate direction). This is where the mixed-precision
-        // speedup is actually realized for the inner Newton solve.
-        let solved = crate::gpu::pirls_gpu::cholesky_solve_only_gpu(hessian.view(), rhs.view())
-            .map_err(EstimationError::InvalidInput)?;
-        direction_out.assign(&solved.column(0));
-        direction_out.mapv_inplace(|v| -v);
-        if array_is_finite(direction_out) {
-            log::debug!(
-                "[STAGE] PIRLS dense newton solve backend=CUDA p={} flops~{} elapsed={:.3}s route=\"cuSOLVER potrf/potrs\"",
-                p,
-                (p as u64).saturating_mul((p as u64).saturating_mul(p as u64)) / 3,
-                dense_solve_start.elapsed().as_secs_f64(),
-            );
-            return Ok(());
-        }
-    }
-
-    let cpu_route = String::from("CPU stable solver");
-
+    // One system, one host route, on every host (#3551). The direction is taken
+    // on `descent_curvature(H)`, whose positive-definiteness test is itself a
+    // host Cholesky, so a device factorization of the same p×p matrix could
+    // only repeat that O(p³) work; and the raw `H` a device route would see is
+    // exactly the indefinite matrix the #2814 Gill–Murray floor exists for.
     let curvature = descent_curvature(hessian)?;
     let factor = StableSolver::new()
         .factorize(curvature.as_ref())
@@ -680,11 +657,10 @@ pub(super) fn solve_newton_direction_dense(
         ))
     })?;
     log::debug!(
-        "[STAGE] PIRLS dense newton solve backend=CPU p={} flops~{} elapsed={:.3}s route=\"{}\"",
+        "[STAGE] PIRLS dense newton solve backend=CPU p={} flops~{} elapsed={:.3}s route=\"CPU stable solver\"",
         p,
         (p as u64).saturating_mul((p as u64).saturating_mul(p as u64)) / 3,
         dense_solve_start.elapsed().as_secs_f64(),
-        cpu_route,
     );
     Ok(())
 }

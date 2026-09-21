@@ -22,6 +22,15 @@
   `syevd_min_p`, `sparse_min_nnz`, `keep_design_resident_min_bytes`,
   `prefer_gpu_factorization_min_p` and `mixed_precision`.
 
+- **The PIRLS dense Newton direction is solved the same way on every host** (#3551).
+  On a CUDA host the direction was sent to a device Cholesky on the raw Hessian, with
+  no size gate and no residual certificate, and a non-finite device result was silently
+  redone on the CPU. An indefinite Hessian (a delayed-entry survival fit away from its
+  mode) failed the device factorization and the fit errored, where a CPU-only host took
+  the #2814 Gill–Murray descent step. The PIRLS device route and its gam-solve
+  wrapper are removed; the direction is always taken on `descent_curvature(H)` under
+  the one certificate.
+
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
   `μ̂ ≤ c₀·a²·(1−1/SNR)·(1−C_κκ)/K`, with the chosen constants `c₀ = 1` and
