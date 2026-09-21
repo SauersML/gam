@@ -188,7 +188,7 @@ def main() -> None:
     feature("summary", lambda: {k: v for k, v in list(model.summary().items())[:8]
                                  if isinstance(v, (int, float, str, type(None)))})
     feature("repr", lambda: repr(model)[:200])
-    feature("description_length", lambda: model.description_length())
+    feature("description_length", lambda: model.description_length(train))
     feature("diagnostics", lambda: sorted((model.diagnostics or {}).keys())[:12])
     feature("curvature_report", lambda: None if model.curvature_report is None
             else {"n_atoms": len(model.curvature_report.get("atoms", []))})

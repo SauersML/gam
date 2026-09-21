@@ -320,10 +320,16 @@ class ManifoldSAE(nn.Module):
         return self._fitted.summary()
 
     def description_length(
-        self, *, l_param_bits: float | None = None
+        self, x: torch.Tensor, *, l_param_bits: float | None = None
     ) -> dict[str, Any] | None:
-        """Delegate to the native fit description-length report."""
-        return self._fitted.description_length(l_param_bits=l_param_bits)
+        """Delegate to the native fit description-length report.
+
+        ``x`` is the ``(N, P)`` data the model was fitted to: the code length is
+        priced at the distortion the fit delivers on it.
+        """
+        return self._fitted.description_length(
+            to_numpy_f64(x), l_param_bits=l_param_bits
+        )
 
 
 __all__ = [
