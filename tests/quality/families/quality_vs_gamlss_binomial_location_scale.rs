@@ -48,7 +48,10 @@ fn gam_binomial_location_scale_rejects_smooth_log_sigma_on_bernoulli_data() {
         "unexpected error: {msg}"
     );
     assert!(
-        msg.contains("log_sigma must be a parametric-linear scale"),
+        msg.contains(
+            "log_sigma must be intercept-only/fixed or a parametric-linear scale, \
+             not a random-effect or smooth formula"
+        ),
         "unexpected error: {msg}"
     );
 }
