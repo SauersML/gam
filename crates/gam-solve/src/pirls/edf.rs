@@ -56,8 +56,8 @@ pub(super) fn calculate_edfwithworkspace_from_factor(
                     workspace.final_aug_matrix[(i, j)]
                 });
             }
-            Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
+            Err(EstimationError::InnerSolveUnresolvedAtRho {
+                context: "penalized Hessian augmented solve",
             })
         }
     }
@@ -88,27 +88,27 @@ pub(super) fn calculate_edf_from_sparse_factor(
     if r == 0 {
         return Ok(p as f64);
     }
-    let ill_conditioned = || EstimationError::ModelIsIllConditioned {
-        condition_number: f64::INFINITY,
+    let unresolved_at_rho = || EstimationError::InnerSolveUnresolvedAtRho {
+        context: "penalized Hessian selected inverse",
     };
     let solve_flops = 4usize.saturating_mul(factor.factor_nnz()).saturating_mul(r);
     if factor.selected_inverse_flops() < solve_flops {
-        let taka = factor.selected_inverse().map_err(|_| ill_conditioned())?;
+        let taka = factor.selected_inverse().map_err(|_| unresolved_at_rho())?;
         let tr = taka.trace_root_gram(e_transformed.view(), 0);
         if tr.is_finite() {
             return Ok((p as f64 - tr).clamp(mp, p as f64));
         }
-        return Err(ill_conditioned());
+        return Err(unresolved_at_rho());
     }
     let rhs_arr = e_transformed.t().to_owned();
     let sol = gam_linalg::sparse_exact::solve_sparse_spdmulti(factor, &rhs_arr)
-        .map_err(|_| ill_conditioned())?;
+        .map_err(|_| unresolved_at_rho())?;
     if sol.nrows() == p && sol.ncols() == r && sol.iter().all(|v| v.is_finite()) {
         return edf_from_solution(p, r, mp, e_transformed, |i, j| {
             sol[[i, j]]
         });
     }
-    Err(ill_conditioned())
+    Err(unresolved_at_rho())
 }
 
 pub(super) fn calculate_edf(
@@ -130,22 +130,23 @@ pub(super) fn calculate_edf(
         .factorize(gam_linalg::roundoff::SymmetricAssembly::penalized_gram(
             0, r,
         ))
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+        .map_err(|_| EstimationError::InnerSolveUnresolvedAtRho {
+            context: "penalized Hessian Cholesky",
         })?;
-    let sol = factor
-        .solvemulti(&rhs_arr)
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        })?;
+    let sol =
+        factor
+            .solvemulti(&rhs_arr)
+            .map_err(|_| EstimationError::InnerSolveUnresolvedAtRho {
+                context: "penalized Hessian multi-solve",
+            })?;
     if sol.nrows() == p && sol.ncols() == r && sol.iter().all(|v| v.is_finite()) {
         return edf_from_solution(p, r, mp, e_transformed, |i, j| {
             sol[[i, j]]
         });
     }
 
-    Err(EstimationError::ModelIsIllConditioned {
-        condition_number: f64::INFINITY,
+    Err(EstimationError::InnerSolveUnresolvedAtRho {
+        context: "penalized Hessian solve produced a non-finite EDF block",
     })
 }
 
@@ -182,8 +183,8 @@ pub(super) fn calculate_edfwithworkspace(
 
     let factor = StableSolver::new()
         .factorize(penalized_hessian)
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+        .map_err(|_| EstimationError::InnerSolveUnresolvedAtRho {
+            context: "penalized Hessian stable factorization",
         })?;
     {
         let mut rhsview = array2_to_matmut(&mut workspace.final_aug_matrix);
@@ -198,8 +199,8 @@ pub(super) fn calculate_edfwithworkspace(
         });
     }
 
-    Err(EstimationError::ModelIsIllConditioned {
-        condition_number: f64::INFINITY,
+    Err(EstimationError::InnerSolveUnresolvedAtRho {
+        context: "penalized Hessian solve produced a non-finite EDF block",
     })
 }
 
@@ -235,8 +236,8 @@ where
     // `clamp` passes NaN through, so a non-finite trace must be refused here:
     // there is no EDF to report when tr(H⁻¹S) is not a number.
     if !tr.is_finite() {
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+        return Err(EstimationError::InnerSolveUnresolvedAtRho {
+            context: "the penalized trace tr(H^-1 S) is not a number",
         });
     }
     Ok((p as f64 - tr).clamp(mp, p as f64))

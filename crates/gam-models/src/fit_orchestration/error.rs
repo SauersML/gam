@@ -958,8 +958,8 @@ mod fit_failure_tests {
                 reason: "outer smoothing optimization failed".to_string(),
                 last_refusal: None,
                 search_inner_refusal: None,
-                outer_error: Arc::new(EstimationError::ModelIsIllConditioned {
-                    condition_number: 1e18,
+                outer_error: Arc::new(EstimationError::ModelIsUnidentified {
+                    context: "weighted design range",
                 }),
             }));
         let advice = wrapped.advice().expect("custom-family fit failure advice");
@@ -971,8 +971,8 @@ mod fit_failure_tests {
             attempted_resolution: "k=20".to_string(),
             reason: "refit failed".to_string(),
             refit_failure: Some(Box::new(WorkflowError::from(FitFailure::from(
-                EstimationError::ModelIsIllConditioned {
-                    condition_number: 1e18,
+                EstimationError::ModelIsUnidentified {
+                    context: "weighted design range",
                 },
             )))),
         };

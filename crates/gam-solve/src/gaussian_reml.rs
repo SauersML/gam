@@ -1758,8 +1758,8 @@ fn block_orthogonal_conditional_scale(
 ) -> Result<Array1<f64>, EstimationError> {
     let q = block_orthogonal_profiled_residual(evals, unpenalized_residual);
     if q.iter().any(|value| !value.is_finite() || *value <= 0.0) {
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+        return Err(EstimationError::InnerSolveUnresolvedAtRho {
+            context: "block-orthogonal profiled residual",
         });
     }
     let scale = q.mapv(|value| nu / value);
@@ -1767,8 +1767,8 @@ fn block_orthogonal_conditional_scale(
         .iter()
         .any(|value| !value.is_finite() || *value <= 0.0)
     {
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+        return Err(EstimationError::InnerSolveUnresolvedAtRho {
+            context: "block-orthogonal conditional scale",
         });
     }
     Ok(scale)
@@ -1857,8 +1857,8 @@ fn block_orthogonal_profile_hessian(
         }
     }
     if hessian.iter().any(|value| !value.is_finite()) {
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+        return Err(EstimationError::InnerSolveUnresolvedAtRho {
+            context: "block-orthogonal rho-Hessian",
         });
     }
     Ok(hessian)
@@ -2097,8 +2097,8 @@ pub fn gaussian_reml_blocks_orthogonal_shared_scale(
     }
     let q = block_orthogonal_profiled_residual(&evals, unpenalized_residual);
     if q.iter().any(|value| !value.is_finite() || *value <= 0.0) {
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+        return Err(EstimationError::InnerSolveUnresolvedAtRho {
+            context: "block-orthogonal profiled residual at the selected rho",
         });
     }
     let lambdas = Array1::from_vec(gam_problem::checked_exp_log_strengths(
@@ -2881,8 +2881,8 @@ fn gaussian_reml_inverse_hessian_from_cache(
         inverse.scaled_add(1.0 / lambda, &data_null);
     }
     if inverse.iter().any(|value| !value.is_finite()) {
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+        return Err(EstimationError::InnerSolveUnresolvedAtRho {
+            context: "penalized inverse at this smoothing strength",
         });
     }
     Ok(inverse)
@@ -3616,8 +3616,24 @@ fn sign_normalized_design_qr(
     qr: gam_linalg::faer_ndarray::HouseholderQr,
 ) -> Result<WeightedDesignQr, EstimationError> {
     let mut upper = householder_upper(&qr);
-    if upper.nrows() != upper.ncols() || upper.diag().iter().any(|v| !v.is_finite() || *v == 0.0) {
-        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+    if upper.nrows() != upper.ncols() {
+        return Err(EstimationError::FitResultInvariantViolated(format!(
+            "the weighted design's QR upper factor is {}x{}, not square",
+            upper.nrows(),
+            upper.ncols()
+        )));
+    }
+    if let Some((index, &pivot)) = upper
+        .diag()
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite() || **value == 0.0)
+    {
+        return Err(EstimationError::SingularFactorPivot {
+            context: "weighted design QR upper",
+            index,
+            pivot,
+        });
     }
     let mut row_signs = vec![1.0; upper.nrows()];
     for row in 0..upper.nrows() {
@@ -3664,12 +3680,16 @@ fn weighted_design_range(
     let qr = gam_linalg::faer_ndarray::HouseholderQr::new(weighted_view.as_ref());
     let upper = householder_upper(&qr);
     if upper.iter().any(|value| !value.is_finite()) {
-        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+        return Err(EstimationError::FitResultInvariantViolated(
+            "the weighted design's QR upper factor carries a non-finite entry".to_string(),
+        ));
     }
     let (null_basis, rank) = gam_linalg::faer_ndarray::rrqr_nullspace_basis(&upper.t().to_owned())
         .map_err(EstimationError::LinearSystemSolveFailed)?;
     if rank == 0 {
-        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+        return Err(EstimationError::ModelIsUnidentified {
+            context: "the weighted design has no numerical rank",
+        });
     }
     if rank == p {
         return Ok(WeightedDesignRange {
@@ -3682,7 +3702,12 @@ fn weighted_design_range(
         .map_err(EstimationError::LinearSystemSolveFailed)?;
     if null_basis.dim() != (p, p - rank) || null_rank != p - rank || range_basis.dim() != (p, rank)
     {
-        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+        return Err(EstimationError::FitResultInvariantViolated(format!(
+            "the weighted design's null and range bases disagree with its rank: \
+             null {:?}, null rank {null_rank}, range {:?}, rank {rank} of {p} columns",
+            null_basis.dim(),
+            range_basis.dim()
+        )));
     }
     let factor = weighted_design_qr(dense_ab(x, range_basis.view()).view(), weight)?;
     Ok(WeightedDesignRange {
@@ -3726,16 +3751,21 @@ fn gaussian_reml_eigen_cache_from_design_range(
         return gaussian_reml_eigen_cache_from_lower(lower, penalty, nullspace_dim, xtwx_fingerprint);
     };
     let null_basis = &range.null_basis;
-    let unidentified = || EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY };
-    let (natural_eigenvalues, _) = penalty.eigh(Side::Lower).map_err(|_| unidentified())?;
+    let unidentified = || EstimationError::ModelIsUnidentified {
+        context: "the penalty leaves a direction of the design's null space unpenalized",
+    };
+    let (natural_eigenvalues, _) = penalty
+        .eigh(Side::Lower)
+        .map_err(EstimationError::EigendecompositionFailed)?;
     let natural_tolerance = penalty_range_tolerance(natural_eigenvalues.view());
     if natural_eigenvalues.iter().any(|&value| value < -natural_tolerance) {
         crate::bail_invalid_estim!("Gaussian REML penalty is not positive semidefinite");
     }
     let penalty_on_null = dense_ab(penalty, null_basis.view());
     let null_block = canonicalize_penalty(dense_atb(null_basis.view(), penalty_on_null.view()).view());
-    let (null_eigenvalues, null_eigenvectors) =
-        null_block.eigh(Side::Lower).map_err(|_| unidentified())?;
+    let (null_eigenvalues, null_eigenvectors) = null_block
+        .eigh(Side::Lower)
+        .map_err(EstimationError::EigendecompositionFailed)?;
     // Identification certificate: the penalty must reach every data-null direction,
     // at the same rank convention that classifies the penalty's own spectrum.
     if null_eigenvalues.iter().any(|&value| !(value > natural_tolerance)) {
@@ -3939,9 +3969,9 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
     let logdet_xtwx = 2.0 * lower.diag().iter().map(|v| v.ln()).sum::<f64>();
     // Congruence preserves rank. Determine it in the supplied penalty's frame:
     // data whitening can give even S=I a 1e12 spectral spread (#2833).
-    let (natural_eigenvalues, natural_eigenvectors) = penalty.eigh(Side::Lower).map_err(|_| {
-        EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY }
-    })?;
+    let (natural_eigenvalues, natural_eigenvectors) = penalty
+        .eigh(Side::Lower)
+        .map_err(EstimationError::EigendecompositionFailed)?;
     let natural_tolerance = penalty_range_tolerance(natural_eigenvalues.view());
     if natural_eigenvalues.iter().any(|&value| value < -natural_tolerance) {
         crate::bail_invalid_estim!("Gaussian REML penalty is not positive semidefinite");
@@ -3952,9 +3982,9 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
         .count();
     let nullity = p - penalty_rank;
     let (mut penalty_eigenvalues, eigenvectors) = match precomputed_transform {
-        Some(transformed) => transformed.eigh(Side::Lower).map_err(|_| {
-            EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY }
-        })?,
+        Some(transformed) => transformed
+            .eigh(Side::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?,
         None => {
             // S = C'C. Singular values of C L^-T preserve relative accuracy
             // without forming the ill-conditioned squared operator L^-1 S L^-T.
@@ -3966,11 +3996,16 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
                 }
             });
             let whitened_root = solve_lower_triangular_matrix(&lower, &root_transpose)?;
-            let (_, singular, vt) = whitened_root.t().svd(false, true).map_err(|_| {
-                EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY }
-            })?;
-            let vt = vt.ok_or_else(|| EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
+            let (_, singular, vt) = whitened_root
+                .t()
+                .svd(false, true)
+                .map_err(EstimationError::EigendecompositionFailed)?;
+            let vt = vt.ok_or_else(|| {
+                EstimationError::FitResultInvariantViolated(
+                    "the whitened penalty root's SVD returned no right factor although one \
+                     was requested"
+                        .to_string(),
+                )
             })?;
             let values = Array1::from_shape_fn(p, |col| singular[p - 1 - col].powi(2));
             let vectors = Array2::from_shape_fn((p, p), |(row, col)| vt[[p - 1 - col, row]]);
@@ -3998,7 +4033,10 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
         }
     }
     if penalty_eigenvalues.iter().skip(nullity).any(|&value| value <= 0.0) {
-        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+        return Err(EstimationError::FitResultInvariantViolated(format!(
+            "the penalty spectrum has a non-positive eigenvalue past its nullity {nullity} \
+             after the tolerance sweep accepted it"
+        )));
     }
     penalty_eigenvalues.slice_mut(s![..nullity]).fill(0.0);
     if let Some(expected_nullity) = nullspace_dim
@@ -4036,15 +4074,17 @@ fn gaussian_reml_cholesky_lower(xtwx: Array2<f64>) -> Result<Array2<f64>, Estima
     match gam_gpu::try_cholesky_lower_inplace(&mut gpu_candidate) {
         Some(gam_gpu::CholeskyVerdict::Factored) => return Ok(gpu_candidate),
         Some(gam_gpu::CholeskyVerdict::NotPositiveDefinite) => {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
+            return Err(EstimationError::ModelIsUnidentified {
+                context: "the unpenalized Gram X'WX is not positive definite",
             });
         }
         None => {}
     }
     xtwx.cholesky(Side::Lower)
         .map(|chol| chol.lower_triangular())
-        .map_err(|_| EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY })
+        .map_err(|_| EstimationError::ModelIsUnidentified {
+            context: "the unpenalized Gram X'WX is not positive definite",
+        })
 }
 
 fn validate_gaussian_reml_eigen_cache(
@@ -5445,8 +5485,10 @@ fn solve_lower_triangular_matrix(
             }
             let diag = lower[[i, i]];
             if !(diag.is_finite() && diag.abs() > 0.0) {
-                return Err(EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
+                return Err(EstimationError::SingularFactorPivot {
+                    context: "lower-triangular solve",
+                    index: i,
+                    pivot: diag,
                 });
             }
             out[[i, col]] = value / diag;
@@ -5476,8 +5518,10 @@ fn solve_upper_triangular_matrix(
             }
             let diag = upper[[i, i]];
             if !(diag.is_finite() && diag.abs() > 0.0) {
-                return Err(EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
+                return Err(EstimationError::SingularFactorPivot {
+                    context: "upper-triangular solve",
+                    index: i,
+                    pivot: diag,
                 });
             }
             out[[i, col]] = value / diag;
@@ -7749,7 +7793,7 @@ mod tests {
         s.column_mut(3).fill(0.0);
         assert!(matches!(
             gaussian_reml_multi_closed_form(x.view(), y.view(), s.view(), Some(w.view()), None),
-            Err(EstimationError::ModelIsIllConditioned { .. })
+            Err(EstimationError::ModelIsUnidentified { .. })
         ));
     }
 
@@ -8023,7 +8067,7 @@ mod tests {
             build_gaussian_reml_eigen_cache_with_nullspace_dim(
                 design.view(), blind_penalty.view(), None, None,
             ),
-            Err(EstimationError::ModelIsIllConditioned { .. })
+            Err(EstimationError::ModelIsUnidentified { .. })
         ));
 
         let batched = build_gaussian_reml_eigen_cache_batched(
@@ -8033,7 +8077,7 @@ mod tests {
         );
         assert_eq!(batched.len(), 2);
         match &batched[0] {
-            Err(EstimationError::ModelIsIllConditioned { .. }) => {}
+            Err(EstimationError::ModelIsUnidentified { .. }) => {}
             Err(other) => panic!("singular Gram gave the wrong error: {other}"),
             Ok(cache) => panic!(
                 "singular Gram produced a cache with logdet_xtwx={:.6e}",
@@ -8044,7 +8088,7 @@ mod tests {
         assert!((regular_cache.logdet_xtwx - 11.0_f64.ln()).abs() <= 1.0e-12);
         assert!(matches!(
             gaussian_reml_eigen_cache_from_xtwx(singular, penalty.view(), None),
-            Err(EstimationError::ModelIsIllConditioned { .. })
+            Err(EstimationError::ModelIsUnidentified { .. })
         ));
     }
 

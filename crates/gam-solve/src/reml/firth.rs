@@ -187,8 +187,8 @@ impl<'a> RemlState<'a> {
             }
         }
         if !kept_positive_direction {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
+            return Err(EstimationError::InnerSolveUnresolvedAtRho {
+                context: "the reduced Fisher information has no positive direction",
             });
         }
         Ok((k_reduced, half_log_det))
@@ -217,8 +217,9 @@ impl<'a> RemlState<'a> {
         let tol = Self::reduced_fisher_eigen_tolerance(&evals_ir);
         let retained: Vec<f64> = evals_ir.iter().copied().filter(|&eig| eig > tol).collect();
         if retained.is_empty() {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
+            return Err(EstimationError::InnerSolveUnresolvedAtRho {
+                context: "the reduced Fisher information retains no eigenvalue above its \
+                          own tolerance",
             });
         }
         Ok(retained.iter().map(|eig| 0.5 * eig.ln()).sum())
@@ -597,8 +598,8 @@ impl FirthDenseOperator {
             .filter_map(|(i, &value)| if value > tol { Some(i) } else { None })
             .collect();
         if keep.is_empty() {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
+            return Err(EstimationError::InnerSolveUnresolvedAtRho {
+                context: "no Firth eigenvalue clears its tolerance at this smoothing strength",
             });
         }
 

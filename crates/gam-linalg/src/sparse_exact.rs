@@ -336,12 +336,15 @@ pub fn factorize_sparse_spd_strict(
         }
     }
     let gamma = crate::roundoff::accumulation_growth(2 * h_upper.ncols());
+    // The operator this factors is the PENALIZED Hessian on every production
+    // route that reaches here, so a pivot that does not clear the accumulated
+    // rounding is a fact about the current smoothing strength (#4468).
     if (0..simplicial.n).any(|permuted| {
         let pivot = simplicial.l_values[simplicial.l_col_ptr[permuted]];
         pivot * pivot <= gamma * own_diagonal[permuted]
     }) {
-        return Err(LinalgError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+        return Err(LinalgError::PenalizedPivotUnresolvedAtRho {
+            context: "sparse exact penalized Cholesky",
         });
     }
     let logdet = simplicial.logdet;
@@ -779,8 +782,8 @@ fn analyze_canonical_upper(
             amd::Control::default(),
             MemStack::new(&mut mem),
         )
-        .map_err(|_| LinalgError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+        .map_err(|_| LinalgError::SymbolicFactorizationFailed {
+            stage: "fill-reducing ordering",
         })?;
     }
 
@@ -844,8 +847,8 @@ fn analyze_canonical_upper(
             &col_counts,
             stack,
         )
-        .map_err(|_| LinalgError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+        .map_err(|_| LinalgError::SymbolicFactorizationFailed {
+            stage: "symbolic Cholesky",
         })?
     };
 

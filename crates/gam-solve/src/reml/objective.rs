@@ -238,11 +238,15 @@ impl<'a> RemlState<'a> {
         let t_pirls = std::time::Instant::now();
         let bundle = match self.obtain_outer_eval_bundle(p) {
             Ok(bundle) => bundle,
-            Err(EstimationError::ModelIsIllConditioned { .. }) => {
+            Err(EstimationError::InnerSolveUnresolvedAtRho { context }) => {
                 self.cache_manager.invalidate_eval_bundle();
-                // Inner linear algebra says "too singular" — treat as barrier.
+                // The penalized object did not resolve HERE; a heavier penalty
+                // can resolve it, so the point is priced at +inf and the search
+                // steps away. A lambda-free failure no longer reaches this arm
+                // (#4468): it is not a fact about this rho and is returned.
                 log::trace!(
-                    "P-IRLS flagged ill-conditioning for current rho; returning +inf cost to retreat."
+                    "the penalized inner solve did not resolve at this rho ({context}); \
+                     returning +inf cost to retreat."
                 );
                 return Ok(f64::INFINITY);
             }
@@ -2710,11 +2714,11 @@ impl<'a> RemlState<'a> {
     ) -> Result<gam_problem::EfsEval, EstimationError> {
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
-            Err(EstimationError::ModelIsIllConditioned { .. }) => {
+            Err(EstimationError::InnerSolveUnresolvedAtRho { context }) => {
                 self.cache_manager.invalidate_eval_bundle();
-                return Err(EstimationError::RemlOptimizationFailed(
-                    "inner solve ill-conditioned during EFS evaluation".to_string(),
-                ));
+                return Err(EstimationError::RemlOptimizationFailed(format!(
+                    "the penalized inner solve did not resolve during EFS evaluation ({context})"
+                )));
             }
             Err(e) => {
                 self.cache_manager.invalidate_eval_bundle();
@@ -2733,11 +2737,12 @@ impl<'a> RemlState<'a> {
     ) -> Result<gam_problem::EfsEval, EstimationError> {
         let bundle = match self.obtain_eval_bundle(rho) {
             Ok(bundle) => bundle,
-            Err(EstimationError::ModelIsIllConditioned { .. }) => {
+            Err(EstimationError::InnerSolveUnresolvedAtRho { context }) => {
                 self.cache_manager.invalidate_eval_bundle();
-                return Err(EstimationError::RemlOptimizationFailed(
-                    "inner solve ill-conditioned during psi-ext EFS evaluation".to_string(),
-                ));
+                return Err(EstimationError::RemlOptimizationFailed(format!(
+                    "the penalized inner solve did not resolve during psi-ext EFS \
+                     evaluation ({context})"
+                )));
             }
             Err(e) => {
                 self.cache_manager.invalidate_eval_bundle();
@@ -2794,10 +2799,6 @@ impl<'a> RemlState<'a> {
         let t_pirls = std::time::Instant::now();
         let bundle = match self.obtain_outer_eval_bundle(p) {
             Ok(bundle) => bundle,
-            Err(err @ EstimationError::ModelIsIllConditioned { .. }) => {
-                self.cache_manager.invalidate_eval_bundle();
-                return Err(err);
-            }
             Err(e) => {
                 self.cache_manager.invalidate_eval_bundle();
                 return Err(e);

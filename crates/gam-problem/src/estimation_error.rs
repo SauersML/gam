@@ -931,10 +931,51 @@ pub enum EstimationError {
     #[error("An internal error occurred during model layout or coefficient mapping: {0}")]
     LayoutError(String),
 
+    /// The PENALIZED object an inner solve is built on did not resolve at this
+    /// ρ: the penalized Hessian `H = XᵀWX + S(λ)` and its solves, the augmented
+    /// design `[√W X; E(λ)]`, the block-orthogonal profiled residual `q(λ)`, or
+    /// the reduced Fisher at the coefficients those produce. Every one of them
+    /// carries `λ`, so the same computation can succeed at a heavier penalty:
+    /// this is a fact about the trial point, and the outer search walks away
+    /// from it (#4468).
     #[error(
-        "Model is ill-conditioned with condition number {condition_number:.2e}. This typically occurs when the model is over-parameterized (too many knots relative to data points). Consider reducing the number of knots or increasing regularization."
+        "The penalized inner solve did not resolve at this smoothing strength ({context}).          The object that failed carries the penalty, so a heavier penalty can resolve it;          the outer search treats this smoothing strength as infeasible."
     )]
-    ModelIsIllConditioned { condition_number: f64 },
+    InnerSolveUnresolvedAtRho { context: &'static str },
+
+    /// The model is not identified by its design and its penalty together, at
+    /// any smoothing strength: the weighted design has no rank, or the penalty
+    /// leaves a direction of the design's null space unpenalized, so
+    /// `XᵀWX + λS` is singular for EVERY `λ`. Moving ρ cannot change that, so
+    /// it is fatal, and it is the one class for which "reduce the number of
+    /// knots or increase regularization" is the right advice (#3310, #4468).
+    #[error(
+        "The model is not identified by its design and penalty together ({context}): the          penalized Hessian is singular at every smoothing strength, so no smoothing          parameter can be scored. Reduce the number of basis functions, or penalize the          direction the design does not identify."
+    )]
+    ModelIsUnidentified { context: &'static str },
+
+    /// A triangular factor lost rank exactly at one coordinate. Unlike a
+    /// conditioning statement this names the coordinate and the pivot that was
+    /// read there, both of which the factorization already held (#4468). Its
+    /// producers factor λ-free objects — the unpenalized Gram `XᵀWX`, a tangent
+    /// precision — so no smoothing strength repairs it.
+    #[error(
+        "The {context} factor is singular at coordinate {index}: its pivot is {pivot:.3e}.          The factored operator carries no penalty, so no smoothing strength repairs it."
+    )]
+    SingularFactorPivot {
+        context: &'static str,
+        index: usize,
+        pivot: f64,
+    },
+
+    /// A sparse factorization's SYMBOLIC stage failed — the fill-reducing
+    /// ordering or the symbolic Cholesky. Those read the sparsity PATTERN and
+    /// no numerical value at all, so the failure has no conditioning content
+    /// and no smoothing strength changes it (#4468).
+    #[error(
+        "The sparse factorization's {stage} stage failed. That stage reads only the          sparsity pattern, so the failure is structural: it carries no conditioning and          no smoothing strength changes it."
+    )]
+    SymbolicFactorizationFailed { stage: &'static str },
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
@@ -1155,7 +1196,10 @@ impl EstimationError {
             Self::PrefitRankDeficientDesignDetected { column_indices, .. } => Some(format!(
                 "Matrix conditioning issue in unpenalized columns {column_indices:?}. {CONDITIONING}"
             )),
-            Self::ModelIsIllConditioned { .. }
+            Self::ModelIsUnidentified { .. }
+            | Self::InnerSolveUnresolvedAtRho { .. }
+            | Self::SingularFactorPivot { .. }
+            | Self::SymbolicFactorizationFailed { .. }
             | Self::HessianNotPositiveDefinite { .. }
             | Self::LinearSystemSolveFailed(_)
             | Self::EigendecompositionFailed(_) => Some(format!(
@@ -1202,7 +1246,7 @@ impl EstimationError {
             // at one layer and a fatal at this one; #2593 unified them, and
             // `is_inner_solve_retreat` now reads this table rather than keeping
             // a second one.
-            Self::ModelIsIllConditioned { .. }
+            Self::InnerSolveUnresolvedAtRho { .. }
             | Self::PerfectSeparationDetected { .. }
             | Self::MultinomialSeparationDetected { .. }
             | Self::PirlsDidNotConverge { .. }
@@ -1216,6 +1260,13 @@ impl EstimationError {
             // request: none of these becomes true or false by moving rho.
             Self::InvalidStabilization { .. }
             | Self::BasisError { .. }
+            // The design and the penalty together identify nothing, a factor
+            // lost rank at a coordinate of a λ-free operator, or a symbolic
+            // stage failed: none of the three becomes true or false by moving
+            // ρ (#4468).
+            | Self::ModelIsUnidentified { .. }
+            | Self::SingularFactorPivot { .. }
+            | Self::SymbolicFactorizationFailed { .. }
             | Self::LinearSystemSolveFailed { .. }
             | Self::EigendecompositionFailed { .. }
             | Self::PenaltySpectrumNonFinite { .. }
@@ -1437,7 +1488,7 @@ impl EstimationError {
             | Self::PrefitRankDeficientDesignDetected { .. }
             | Self::MultinomialSeparationDetected { .. }
             | Self::PredictiveIntervalsDeclined { .. }
-            | Self::ModelIsIllConditioned { .. }
+            | Self::ModelIsUnidentified { .. }
             | Self::InvalidInput(_)
             | Self::ProfiledResidualUnresolved { .. }
             // A statement about the size of the data the caller supplied.
@@ -1446,6 +1497,9 @@ impl EstimationError {
             | Self::PredictionError => FailureCategory::Input,
             Self::LinearSystemSolveFailed(_)
             | Self::EigendecompositionFailed(_)
+            | Self::InnerSolveUnresolvedAtRho { .. }
+            | Self::SingularFactorPivot { .. }
+            | Self::SymbolicFactorizationFailed { .. }
             | Self::PenaltySpectrumNonFinite { .. }
             | Self::PenaltySpectrumIndefinite { .. }
             // Its producers are row-level survival monotonicity refusals at
@@ -1553,7 +1607,12 @@ impl EstimationError {
             Self::FitDidNotConverge { .. } => "EstimationError::FitDidNotConverge",
             Self::GradientUnavailable { .. } => "EstimationError::GradientUnavailable",
             Self::LayoutError(_) => "EstimationError::LayoutError",
-            Self::ModelIsIllConditioned { .. } => "EstimationError::ModelIsIllConditioned",
+            Self::InnerSolveUnresolvedAtRho { .. } => "EstimationError::InnerSolveUnresolvedAtRho",
+            Self::ModelIsUnidentified { .. } => "EstimationError::ModelIsUnidentified",
+            Self::SingularFactorPivot { .. } => "EstimationError::SingularFactorPivot",
+            Self::SymbolicFactorizationFailed { .. } => {
+                "EstimationError::SymbolicFactorizationFailed"
+            }
             Self::InvalidInput(_) => "EstimationError::InvalidInput",
             Self::FitResultInvariantViolated(_) => "EstimationError::FitResultInvariantViolated",
             Self::ProfiledResidualUnresolved { .. } => {
@@ -1601,8 +1660,8 @@ mod advice_policy_tests {
         assert!(advice.contains("Jeffreys"), "{advice}");
         assert!(advice.contains("Fix the SAS or mixture link parameters"), "{advice}");
 
-        let conditioning = EstimationError::ModelIsIllConditioned {
-            condition_number: 1e18,
+        let conditioning = EstimationError::ModelIsUnidentified {
+            context: "weighted design range",
         };
         let advice = conditioning.advice().expect("conditioning advice");
         assert!(advice.contains("collinear"), "{advice}");
@@ -1630,13 +1689,13 @@ mod advice_policy_tests {
             reason: "outer smoothing optimization failed".to_string(),
             last_refusal: None,
             search_inner_refusal: None,
-            outer_error: std::sync::Arc::new(EstimationError::ModelIsIllConditioned {
-                condition_number: 1e18,
+            outer_error: std::sync::Arc::new(EstimationError::ModelIsUnidentified {
+                context: "weighted design range",
             }),
         });
         assert_eq!(
             wrapped.variant_name(),
-            "EstimationError::ModelIsIllConditioned"
+            "EstimationError::ModelIsUnidentified"
         );
         let advice = wrapped
             .advice()
@@ -1656,8 +1715,8 @@ mod trial_point_classification_tests {
     #[test]
     fn every_inner_solve_retreat_is_a_trial_point_infeasibility() {
         let retreats = [
-            EstimationError::ModelIsIllConditioned {
-                condition_number: 1.0e18,
+            EstimationError::InnerSolveUnresolvedAtRho {
+                context: "penalized Hessian factorization",
             },
             EstimationError::PerfectSeparationDetected {
                 iteration: 3,
@@ -1736,8 +1795,24 @@ impl From<LinalgError> for EstimationError {
             LinalgError::HessianNotPositiveDefinite { min_eigenvalue } => {
                 EstimationError::HessianNotPositiveDefinite { min_eigenvalue }
             }
-            LinalgError::ModelIsIllConditioned { condition_number } => {
-                EstimationError::ModelIsIllConditioned { condition_number }
+            // gam-linalg reports the matrix it was handed. The PIRLS caller
+            // hands it the penalized Hessian, so a numeric pivot loss there is
+            // ρ-local, while the symbolic stages read only the sparsity
+            // pattern and are structural (#4468).
+            LinalgError::SingularFactorPivot {
+                context,
+                index,
+                pivot,
+            } => EstimationError::SingularFactorPivot {
+                context,
+                index,
+                pivot,
+            },
+            LinalgError::PenalizedPivotUnresolvedAtRho { context } => {
+                EstimationError::InnerSolveUnresolvedAtRho { context }
+            }
+            LinalgError::SymbolicFactorizationFailed { stage } => {
+                EstimationError::SymbolicFactorizationFailed { stage }
             }
         }
     }
@@ -1866,14 +1941,37 @@ mod tests {
 
     // ── is_inner_solve_retreat ────────────────────────────────────────────────
 
+    /// The penalized object carries λ, so its failure is a fact about this ρ
+    /// and the search retreats; the λ-free classes it was split from do not
+    /// (#4468).
     #[test]
-    fn model_ill_conditioned_is_retreat() {
+    fn a_penalized_inner_solve_failure_is_a_retreat_and_the_lambda_free_ones_are_not() {
         assert!(
-            EstimationError::ModelIsIllConditioned {
-                condition_number: 1e15
+            EstimationError::InnerSolveUnresolvedAtRho {
+                context: "penalized Hessian factorization"
             }
             .is_inner_solve_retreat()
         );
+        for fatal in [
+            EstimationError::ModelIsUnidentified {
+                context: "weighted design range",
+            },
+            EstimationError::SingularFactorPivot {
+                context: "lower-triangular solve",
+                index: 3,
+                pivot: 0.0,
+            },
+            EstimationError::SymbolicFactorizationFailed {
+                stage: "fill-reducing ordering",
+            },
+        ] {
+            assert!(
+                !fatal.is_inner_solve_retreat(),
+                "{} is λ-free, so no ρ repairs it",
+                fatal.variant_name()
+            );
+            assert!(!fatal.is_trial_point_infeasible());
+        }
     }
 
     #[test]

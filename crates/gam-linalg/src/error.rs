@@ -8,10 +8,31 @@ pub enum LinalgError {
     )]
     HessianNotPositiveDefinite { min_eigenvalue: f64 },
 
+    /// A factorization lost rank exactly at one coordinate, with the pivot the
+    /// factorization read there. The caller decides whether the operator it
+    /// handed in carried a penalty (#4468).
     #[error(
-        "Model is ill-conditioned with condition number {condition_number:.2e}. This typically occurs when the model is over-parameterized (too many knots relative to data points). Consider reducing the number of knots or increasing regularization."
+        "The {context} factor is singular at coordinate {index}: its pivot is {pivot:.3e}."
     )]
-    ModelIsIllConditioned { condition_number: f64 },
+    SingularFactorPivot {
+        context: &'static str,
+        index: usize,
+        pivot: f64,
+    },
+
+    /// A pivot test failed on an operator the caller declares PENALIZED, so a
+    /// heavier penalty can make the same factorization succeed (#4468).
+    #[error(
+        "The {context} did not factor at this smoothing strength: a pivot did not clear \
+         the factorization's own accumulated rounding."
+    )]
+    PenalizedPivotUnresolvedAtRho { context: &'static str },
+
+    /// A fill-reducing ordering or a symbolic Cholesky failed. Both read the
+    /// sparsity pattern and no numerical value, so neither is a statement
+    /// about conditioning (#4468).
+    #[error("The sparse factorization's {stage} stage failed on the sparsity pattern.")]
+    SymbolicFactorizationFailed { stage: &'static str },
 }
 
 #[cfg(test)]
@@ -32,11 +53,32 @@ mod tests {
         assert!(err.to_string().to_lowercase().contains("positive definite"));
     }
 
+    /// Each variant names the thing that failed rather than a condition number
+    /// no producer computes (#4468).
     #[test]
-    fn ill_conditioned_display_contains_condition_number() {
-        let err = LinalgError::ModelIsIllConditioned {
-            condition_number: 1.5e12,
+    fn each_factorization_failure_names_what_failed() {
+        let pivot = LinalgError::SingularFactorPivot {
+            context: "sparse exact Cholesky",
+            index: 7,
+            pivot: 0.0,
         };
-        assert!(err.to_string().to_lowercase().contains("ill-conditioned"));
+        let text = pivot.to_string();
+        assert!(text.contains("coordinate 7"), "{text}");
+        assert!(text.contains("sparse exact Cholesky"), "{text}");
+
+        let penalized = LinalgError::PenalizedPivotUnresolvedAtRho {
+            context: "sparse exact penalized Cholesky",
+        };
+        assert!(
+            penalized.to_string().contains("smoothing strength"),
+            "{penalized}"
+        );
+
+        let symbolic = LinalgError::SymbolicFactorizationFailed {
+            stage: "fill-reducing ordering",
+        };
+        let text = symbolic.to_string();
+        assert!(text.contains("fill-reducing ordering"), "{text}");
+        assert!(text.contains("sparsity pattern"), "{text}");
     }
 }

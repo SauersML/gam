@@ -4247,8 +4247,8 @@ impl<'a> RemlState<'a> {
             return Ok(h.to_dense());
         }
 
-        Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+        Err(EstimationError::InnerSolveUnresolvedAtRho {
+            context: "penalized Hessian dense factorization",
         })
     }
 

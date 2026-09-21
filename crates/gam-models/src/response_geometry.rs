@@ -1480,12 +1480,23 @@ struct TangentPrecisionFactor {
 
 impl TangentPrecisionFactor {
     fn from_upper(upper: Array2<f64>) -> Result<(Self, f64), EstimationError> {
-        if upper.nrows() != upper.ncols()
-            || upper.iter().any(|value| !value.is_finite())
-            || upper.diag().iter().any(|value| *value == 0.0)
+        if upper.nrows() != upper.ncols() || upper.iter().any(|value| !value.is_finite()) {
+            return Err(EstimationError::FitResultInvariantViolated(format!(
+                "a tangent precision factor is {}x{} with a non-finite entry",
+                upper.nrows(),
+                upper.ncols()
+            )));
+        }
+        if let Some((index, &pivot)) = upper
+            .diag()
+            .iter()
+            .enumerate()
+            .find(|(_, value)| **value == 0.0)
         {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
+            return Err(EstimationError::SingularFactorPivot {
+                context: "tangent precision",
+                index,
+                pivot,
             });
         }
         let log_determinant = 2.0
@@ -1495,9 +1506,11 @@ impl TangentPrecisionFactor {
                 .map(|value| value.abs().ln())
                 .sum::<f64>();
         if !log_determinant.is_finite() {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            });
+            return Err(EstimationError::FitResultInvariantViolated(
+                "a tangent precision factor with finite non-zero diagonal produced a \
+                 non-finite log determinant"
+                    .to_string(),
+            ));
         }
         Ok((Self { upper }, log_determinant))
     }
@@ -1562,12 +1575,9 @@ fn normal_equation_residual_charge(
 fn spd_factor_and_logdet(
     matrix: &Array2<f64>,
 ) -> Result<(TangentPrecisionFactor, f64), EstimationError> {
-    let factor =
-        matrix
-            .cholesky(Side::Lower)
-            .map_err(|_| EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            })?;
+    let factor = matrix
+        .cholesky(Side::Lower)
+        .map_err(EstimationError::LinearSystemSolveFailed)?;
     TangentPrecisionFactor::from_upper(factor.lower_triangular().t().to_owned())
 }
 

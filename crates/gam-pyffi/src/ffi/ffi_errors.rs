@@ -549,7 +549,14 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         | EstimationError::PrefitUnpenalizedSpaceExceedsObservations { .. } => {
             ModelOverparameterizedError::new_err(message)
         }
-        EstimationError::ModelIsIllConditioned { .. } => IllConditionedError::new_err(message),
+        // The published `IllConditionedError` keeps both classes the retired
+        // `ModelIsIllConditioned` raised it for (#4468): a model its design and
+        // penalty do not identify, and a penalized inner solve that reached
+        // Python only because the outer search found no rho it could evaluate.
+        EstimationError::ModelIsUnidentified { .. }
+        | EstimationError::InnerSolveUnresolvedAtRho { .. } => {
+            IllConditionedError::new_err(message)
+        }
         EstimationError::InvalidInput(_) | EstimationError::ProfiledResidualUnresolved { .. } => {
             InvalidInputError::new_err(message)
         }
@@ -558,6 +565,11 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         // numerical failures of the solve, not properties of the input.
         EstimationError::InverseLinkDomainViolation { .. }
         | EstimationError::PirlsRowGeometryUnrepresentable { .. }
+        // A factor that lost rank at a named coordinate, and a symbolic stage
+        // that failed on the sparsity pattern: both are numerical failures of
+        // the solve rather than statements about the data (#4468).
+        | EstimationError::SingularFactorPivot { .. }
+        | EstimationError::SymbolicFactorizationFailed { .. }
         | EstimationError::LogStrengthDomainViolation { .. } => FitNumericalError::new_err(message),
         // The data put the likelihood maximum on the edge of the link's
         // feasible set (an all-zero group under identity-Poisson, say), like a

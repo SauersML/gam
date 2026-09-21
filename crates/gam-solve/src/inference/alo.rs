@@ -24,7 +24,7 @@ use std::ops::Range;
 /// enum is materialized at leaf sites and converted at the boundary via
 /// `From<AloError> for EstimationError` so error text remains byte-identical
 /// to the previous `EstimationError::InvalidInput(format!(...))` /
-/// `ModelIsIllConditioned { ... }` output.
+/// `InnerSolveUnresolvedAtRho { .. }` output.
 #[derive(Debug, Clone)]
 pub enum AloError {
     /// Caller-supplied configuration is structurally invalid: dimension

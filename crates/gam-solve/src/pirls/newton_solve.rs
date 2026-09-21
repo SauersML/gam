@@ -830,8 +830,8 @@ impl TallSkinnyQrLeastSquares {
             }
             let diagonal = r[[i, i]];
             if !(diagonal.is_finite() && diagonal != 0.0) {
-                return Err(EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
+                return Err(EstimationError::InnerSolveUnresolvedAtRho {
+                    context: "augmented design QR back-substitution",
                 });
             }
             direction_out[i] = value / diagonal;

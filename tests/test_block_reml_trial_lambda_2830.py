@@ -58,7 +58,7 @@ the driver's own rank certificate accepts):
 Expected: an SPD/positivity breakdown at a trial ``rho`` is evidence about that
 ``rho`` only.  It must be reported as an infeasible trial point (``+inf`` cost /
 ``TrialPointRefused``) so the trust region rejects the step and continues, exactly
-as ``PirlsDidNotConverge`` and ``ModelIsIllConditioned`` already are.  The fit
+as ``PirlsDidNotConverge`` and ``InnerSolveUnresolvedAtRho`` already are.  The fit
 that the very same objective certifies at neighbouring starting points must be
 returned.
 

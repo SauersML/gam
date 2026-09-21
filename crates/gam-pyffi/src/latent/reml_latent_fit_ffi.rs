@@ -1760,7 +1760,10 @@ fn gaussian_reml_fit_batched_impl(
                 cache_ref,
             ) {
                 Ok(result) => Ok((b, Some(result))),
-                Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
+                Err(
+                    EstimationError::InnerSolveUnresolvedAtRho { .. }
+                    | EstimationError::ModelIsUnidentified { .. },
+                ) => Ok((b, None)),
                 Err(err) => Err(format!("batched Gaussian REML fit {b} failed: {err}")),
             }
         })
@@ -1952,7 +1955,10 @@ fn gaussian_reml_fit_batched_backward_impl(
             .zip(indices.into_iter())
             .map(|(result, b)| match result {
                 Ok(backward) => Ok((b, Some(backward))),
-                Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
+                Err(
+                    EstimationError::InnerSolveUnresolvedAtRho { .. }
+                    | EstimationError::ModelIsUnidentified { .. },
+                ) => Ok((b, None)),
                 Err(err) => Err(format!("batched Gaussian REML backward {b} failed: {err}")),
             })
             .collect()
@@ -1988,7 +1994,10 @@ fn gaussian_reml_fit_batched_backward_impl(
                 );
                 match backward_result {
                     Ok(backward) => Ok((b, Some(backward))),
-                    Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
+                    Err(
+                        EstimationError::InnerSolveUnresolvedAtRho { .. }
+                        | EstimationError::ModelIsUnidentified { .. },
+                    ) => Ok((b, None)),
                     Err(err) => Err(format!("batched Gaussian REML backward {b} failed: {err}")),
                 }
             })
@@ -2557,7 +2566,10 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
                 cache_ref,
             ) {
                 Ok(result) => Ok((b, Some(result))),
-                Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
+                Err(
+                    EstimationError::InnerSolveUnresolvedAtRho { .. }
+                    | EstimationError::ModelIsUnidentified { .. },
+                ) => Ok((b, None)),
                 Err(err) => Err(format!(
                     "batched position Gaussian REML fit {b} failed: {err}"
                 )),
@@ -2828,7 +2840,10 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
                         )),
                     ))
                 }
-                Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
+                Err(
+                    EstimationError::InnerSolveUnresolvedAtRho { .. }
+                    | EstimationError::ModelIsUnidentified { .. },
+                ) => Ok((b, None)),
                 Err(err) => Err(format!(
                     "batched position Gaussian REML backward {b} failed: {err}"
                 )),

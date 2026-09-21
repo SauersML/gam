@@ -1,5 +1,36 @@
 ## Unreleased
 
+- **One error variant was reporting four different failures, with a condition number no
+  producer ever computed** (gam#4468).
+  `EstimationError::ModelIsIllConditioned { condition_number }` was constructed at 38
+  production sites and every one of them passed `f64::INFINITY`, so every user read "Model
+  is ill-conditioned with condition number inf" followed by advice ("reduce the number of
+  knots") that was a guess at all but one site. The variant was also the catch-all for
+  failures that are not conditioning at all: a discarded faer eigendecomposition or SVD
+  error, a zero pivot at a named coordinate, a rank-accounting disagreement inside the
+  engine, and `amd::order` / the symbolic Cholesky failing on a sparsity pattern with no
+  numerical value read. Because one variant carries one classification, all four answered
+  `is_trial_point_infeasible` the same way, so a failed eigensolve was silently degraded
+  into "this smoothing strength is infeasible, retreat". It is replaced by four variants
+  that each name what failed, and the classification follows the OBJECT that failed rather
+  than the operation: an object that carries `λ` -- the penalized Hessian `XᵀWX + S(λ)` and
+  its solves, the augmented design `[√W X; E(λ)]`, the block-orthogonal profiled residual
+  `q(λ)`, the reduced Fisher at the coefficients those produce -- is a fact about the trial
+  point (`InnerSolveUnresolvedAtRho`, which keeps today's retreat and the outer objective's
+  `+inf` shortcut), and an object that does not -- the unpenalized Gram `XᵀWX` and its
+  Cholesky, the weighted design's QR, the penalty alone, a tangent precision, a symbolic
+  ordering -- is fatal (`ModelIsUnidentified`, `SingularFactorPivot` with the coordinate and
+  the pivot the factorization already held, `SymbolicFactorizationFailed` with the stage).
+  Every discarded `FaerLinalgError` is now kept through `EigendecompositionFailed` /
+  `LinearSystemSolveFailed`, and the engine-invariant sites report
+  `FitResultInvariantViolated` with the shapes that disagreed. `LinalgError` is split the
+  same way. The published Python `IllConditionedError` is unchanged: it is raised for the
+  two classes the retired variant raised it for, a model its design and penalty do not
+  identify and a penalized inner solve that reached Python because the outer search found
+  no ρ it could evaluate. One consumer arm is deleted rather than rewritten -- the
+  gradient-only `ModelIsIllConditioned` arm in the outer objective was character for
+  character the `Err(e)` fallback two lines below it.
+
 - **A constrained fit's criterion was a determinant over the active face, so it fell by that
   face's own log-eigenvalue every time a row activated** (gam#2765 stage 2, gam#3303, gam#3234,
   gam#2695). The standard route reduced a shape- or box-constrained mode onto `Z = null(A_act)`
