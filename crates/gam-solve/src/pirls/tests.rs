@@ -2533,9 +2533,7 @@ mod tests {
             &InverseLink::Standard(StandardLink::Logit),
             &eta,
             y.view(),
-            &Array1::zeros(eta.len()),
-            prior.view(),
-        )
+            prior.view())
         .expect("Beta-logit observed curvature");
         for i in 0..eta.len() {
             assert_eq!(
@@ -2616,9 +2614,7 @@ mod tests {
             &link,
             &eta,
             y.view(),
-            &fisher,
-            prior.view(),
-        )
+            prior.view())
         .expect("Tweedie-log observed curvature should evaluate");
         for i in 0..eta.len() {
             let expected = fisher[i] * ((p - 1.0) * y[i] / mu[i] + (2.0 - p));
@@ -2840,7 +2836,7 @@ mod tests {
         }
 
         let (w_obs, c_obs, d_obs) =
-            compute_observed_hessian_curvature_arrays(&likelihood, &link, &eta, y.view(), &fisher, prior.view())
+            compute_observed_hessian_curvature_arrays(&likelihood, &link, &eta, y.view(), prior.view())
                 .expect("latent cloglog observed curvature");
         for i in 0..eta.len() {
             // Two algebraic arrangements of the same five jet values: the
@@ -2891,9 +2887,7 @@ mod tests {
                         -prior * probability.ln()
                     };
                     let (weights, _, _) = compute_observed_hessian_curvature_arrays(
-                        &likelihood, &link, &array![eta], array![y].view(),
-                        &array![0.0], array![prior].view(),
-                    ).unwrap();
+                        &likelihood, &link, &array![eta], array![y].view(), array![prior].view()).unwrap();
                     for h in [0.002_f64, 0.001] {
                         let reference = (-nll(eta + 2.0 * h) + 16.0 * nll(eta + h)
                             - 30.0 * nll(eta) + 16.0 * nll(eta - h)

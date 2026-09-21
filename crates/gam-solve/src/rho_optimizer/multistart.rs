@@ -337,19 +337,6 @@ impl SeedQuorum {
             formed: std::sync::Condvar::new(),
         }
     }
-
-    /// Block until a quorum has formed, or `timeout` elapses; the floor if one
-    /// exists by then.
-    fn wait_floor(&self, timeout: std::time::Duration) -> Option<f64> {
-        let deadline = std::time::Instant::now() + timeout;
-        let mut members = self
-            .certified
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        loop {
-            if let Some(floor) = self.floor() {
-                return Some(floor);
-            }
             let now = std::time::Instant::now();
             if now >= deadline {
                 return None;
@@ -1172,3 +1159,23 @@ fn displaces(incumbent: f64, value: f64) -> bool {
 #[cfg(test)]
 #[path = "multistart_tests.rs"]
 mod multistart_tests;
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    impl SeedQuorum {
+        /// Block until a quorum has formed, or `timeout` elapses; the floor if one
+        /// exists by then.
+        pub(crate) fn wait_floor(&self, timeout: std::time::Duration) -> Option<f64> {
+            let deadline = std::time::Instant::now() + timeout;
+            let mut members = self
+                .certified
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            loop {
+                if let Some(floor) = self.floor() {
+                    return Some(floor);
+                }
+    }
+}
