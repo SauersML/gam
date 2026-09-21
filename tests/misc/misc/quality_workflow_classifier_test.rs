@@ -239,14 +239,15 @@ fn test_publish_action_names_failed_steps_verbatim() {
     );
 }
 
-/// The run step's `panicmsg=$(awk ... "$log")` assignment, lifted out of the
-/// workflow so no test can hold a second copy of it.
+/// Everything the run step does to build `panicmsg`, lifted out of the workflow
+/// so no test can hold a second copy of it.
 ///
-/// The assignment spans the awk program's lines, so it is read as a block: it
-/// opens at `panicmsg=$(awk` and closes on the line that ends the command
-/// substitution with the log path. Each line is trimmed, which awk does not
-/// care about and which keeps the extracted script free of the workflow's YAML
-/// indentation.
+/// That is two statements — the awk over the panic message, then the `if` that
+/// falls back to libtest's `Error:` line for a test that returned an error
+/// instead of panicking — so the block is read from `panicmsg=$(awk` to the
+/// `fi` that closes the fallback. Each line is trimmed, which neither awk nor
+/// bash cares about and which keeps the extracted script free of the workflow's
+/// YAML indentation.
 fn panic_message_assignment(yaml: &str) -> String {
     let mut lines: Vec<&str> = Vec::new();
     for line in yaml.lines() {
@@ -255,13 +256,15 @@ fn panic_message_assignment(yaml: &str) -> String {
             continue;
         }
         lines.push(trimmed);
-        if trimmed.ends_with("\"$log\")") {
+        if trimmed == "fi" {
             break;
         }
     }
     assert!(
-        lines.last().is_some_and(|last| last.ends_with("\"$log\")")),
-        "the run step builds `panicmsg` with `panicmsg=$(awk ... \"$log\")`"
+        lines.last().is_some_and(|last| *last == "fi")
+            && lines.iter().any(|line| line.ends_with("\"$log\")")),
+        "the run step builds `panicmsg` with `panicmsg=$(awk ... \"$log\")` and \
+         then falls back to the libtest `Error:` line, closing with `fi`"
     );
     lines.join("\n")
 }
@@ -334,8 +337,20 @@ fn test_reference_quality_panic_message_keeps_every_line() {
          gam additive fit: Fit(Estimation(did not certify a stationary optimum))"
     );
 
-    // A log with no panic at all yields nothing, so the classifier's
-    // `${panicmsg:-nonzero exit $rc}` fallback still fires.
+    // A test declared `-> Result<(), E>` never panics; libtest reports its
+    // returned error on an `Error:` line, and that line is the verdict.
+    assert_eq!(
+        capture(
+            "running 1 test\n\
+             ---- misc::fit_quality_stress::hifreq_tensor_k4 stdout ----\n\
+             Error: \"hifreq_tensor_k4: band does not cover f_B, Q=7.4\"\n\
+             test result: FAILED\n"
+        ),
+        "Error: \"hifreq_tensor_k4: band does not cover f_B, Q=7.4\""
+    );
+
+    // A log with neither a panic nor a returned error yields nothing, so the
+    // classifier's `${panicmsg:-nonzero exit $rc}` fallback still fires.
     assert_eq!(capture("running 1 test\ntest result: FAILED\n"), "");
     std::fs::remove_dir_all(&dir).unwrap();
 }

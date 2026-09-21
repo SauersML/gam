@@ -405,6 +405,19 @@ jobs:
                 print out
                 exit
               }' "$log")
+            # A test declared `-> Result<(), E>` fails by RETURNING an error and
+            # never panics: libtest prints `Error: <Debug of E>` at column 0 in
+            # the failure section. The capture above sees nothing, so the row
+            # falls through to the `nonzero exit $rc` fallback and records no
+            # verdict at all — which is what run 35628754711's row for
+            # misc::fit_quality_stress::hifreq_tensor_k4 says, and every probe in
+            # that file returns `Result<(), String>`, so the whole file is dark.
+            # Read that line instead when there is no panic; the classifier below
+            # then judges its text on the same rules, so a returned gam fit error
+            # still lands in GAM_ERROR and a returned quality miss in METRIC_OFF.
+            if [ -z "$panicmsg" ]; then
+              panicmsg=$(grep -aE '^Error: ' "$log" | head -1)
+            fi
             # gam-side fit errors (the fit crashed/refused/failed to converge).
             # `LayoutError`/`identifiability audit` are gam's OWN model-layout /
             # identifiability verdicts — they must classify as GAM_ERROR even
