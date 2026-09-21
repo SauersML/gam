@@ -30,7 +30,7 @@
 pub fn random_effect_test_records(
     design: &gam_terms::smooth::TermCollectionDesign,
     fit: &UnifiedFitResult,
-) -> Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord> {
+) -> VarianceComponentTestRecords {
     use gam_terms::inference::random_effect_test::{
         RandomEffectTermRequest, RandomEffectTestBasis, RandomEffectTestInput,
         RandomEffectTestOutcome, RandomEffectTestRecord, RandomEffectTestScale,
@@ -54,10 +54,18 @@ pub fn random_effect_test_records(
                 coefficient_range: range.clone(),
                 outcome,
             })
-            .collect()
+            .collect();
+        let linear_term = records.split_off(random_effect_count);
+        VarianceComponentTestRecords {
+            random_effect: records,
+            linear_term,
+        }
     };
+    if ranges.is_empty() {
+        return split(Vec::new());
+    }
     let unavailable = |reason: RandomEffectTestUnavailable| {
-        records(
+        split(
             ranges
                 .iter()
                 .map(|_| RandomEffectTestOutcome::Unavailable { reason })
@@ -104,7 +112,7 @@ pub fn random_effect_test_records(
             range: range.clone(),
         })
         .collect();
-    records(
+    split(
         basis
             .test_terms(&requests)
             .into_iter()

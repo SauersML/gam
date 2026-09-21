@@ -19,7 +19,9 @@
 //! and record the random-effect rows read.
 
 use crate::estimate::smooth_term_summary::SummaryBlockOffset;
-use crate::estimate::summary::ParametricTermSummary;
+use crate::estimate::summary::{
+    ParametricPValueUnavailable, ParametricTermSummary, ParametricTest,
+};
 use crate::model_types::result_types::UnifiedFitResult;
 use gam_math::probability::{normal_two_sided_probability, student_t_two_sided_probability};
 use gam_terms::inference::random_effect_test::RandomEffectTestOutcome;
@@ -76,32 +78,38 @@ pub fn parametric_term_summary_rows(
             std_error,
             statistic,
             pvalue,
+            test: ParametricTest::Wald,
+            pvalue_unavailable: None,
         }
     };
 
-    // The score-tested row of a ridged slope. The recorded statistic is on the
-    // chi-square scale with one reference degree of freedom — `z²` for a known
-    // scale, the `F(1, ν)` ratio `t²` for an estimated one — so the row carries
-    // its signed square root, oriented by the fitted slope, beside the exact
-    // tail the record already holds.
+    // The score-tested row of a ridged slope. The record carries the signed
+    // root `u/√(φ̂·μ)` of its own score — `z` for a known scale, the partial
+    // `t` for an estimated one — beside the exact tail it already holds. The
+    // sign is the score's, not the shrunk estimate's: under the null REML
+    // drives `β̂` toward zero, so `β̂`'s sign carries nothing about the
+    // effect's direction. A record that could not be tested, and a ridged term
+    // with no record at all, name their reason instead of reporting nothing.
     let ridged_row = |name: String, local: usize, outcome: Option<&RandomEffectTestOutcome>| {
         let idx = offset.coefficients + local;
         let estimate = fit.beta.get(idx).copied().unwrap_or(f64::NAN);
         let std_error = se.and_then(|s| s.get(idx).copied());
-        let (statistic, pvalue) = match outcome {
-            Some(RandomEffectTestOutcome::Tested(test)) if test.rank == 1 => {
-                let magnitude = test.statistic.max(0.0).sqrt();
-                let statistic = if estimate < 0.0 {
-                    -magnitude
-                } else {
-                    magnitude
-                };
-                (
-                    Some(statistic).filter(|z| z.is_finite()),
-                    Some(test.p_value).filter(|p| p.is_finite()),
-                )
-            }
-            _ => (None, None),
+        let (statistic, pvalue, pvalue_unavailable) = match outcome {
+            Some(RandomEffectTestOutcome::Tested(test)) => (
+                test.signed_root.filter(|z| z.is_finite()),
+                Some(test.p_value).filter(|p| p.is_finite()),
+                None,
+            ),
+            Some(RandomEffectTestOutcome::Unavailable { reason }) => (
+                None,
+                None,
+                Some(ParametricPValueUnavailable::VarianceComponent(*reason)),
+            ),
+            None => (
+                None,
+                None,
+                Some(ParametricPValueUnavailable::VarianceComponentTestNotRecorded),
+            ),
         };
         ParametricTermSummary {
             name,
@@ -109,6 +117,8 @@ pub fn parametric_term_summary_rows(
             std_error,
             statistic,
             pvalue,
+            test: ParametricTest::VarianceComponentScore,
+            pvalue_unavailable,
         }
     };
 

@@ -125,7 +125,8 @@ pub use smoothing_correction::{
     invert_identified_rho_hessian_off_railed,
 };
 pub use summary::{
-    ContinuousSmoothnessOrder, ContinuousSmoothnessOrderStatus, ParametricTermSummary,
+    ContinuousSmoothnessOrder, ContinuousSmoothnessOrderStatus,
+    ParametricPValueUnavailable, ParametricTermSummary, ParametricTest,
     SmoothPValueUnavailable, SmoothTermSummary,
 };
 

@@ -17,7 +17,9 @@ use gam_report::{
     CriterionStationarityRow, EdfBlockRow, MeasureJetSpectrumRow, ReportInput,
     SmoothingForensicsRow,
 };
-use gam_solve::estimate::{SmoothPValueUnavailable, UnifiedFitResult};
+use gam_solve::estimate::{
+    ParametricPValueUnavailable, SmoothPValueUnavailable, UnifiedFitResult,
+};
 use gam_terms::smooth::TermCollectionSpec;
 use ndarray::Array2;
 use serde::Serialize;
@@ -582,6 +584,8 @@ fn parametric_rows(
         std_error: row.std_error,
         statistic: row.statistic,
         p_value: row.pvalue,
+        test: row.test.label(),
+        p_value_unavailable: row.pvalue_unavailable,
     })
     .collect()
 }
@@ -1156,8 +1160,11 @@ fn deviance_explained(fit: &UnifiedFitResult, model: &FittedModel) -> Result<Fit
 }
 
 /// One row of the parametric-coefficient table: an intercept or linear-term
-/// coefficient with its Wald statistic, referred to the distribution
-/// `SummaryPayload::parametric_statistic` names.
+/// coefficient with its test statistic, referred to the distribution
+/// `SummaryPayload::parametric_statistic` names. The statistic is the Wald
+/// ratio for an unpenalized coefficient and the signed root of the
+/// variance-component score statistic for a ridged linear term (#3573); both
+/// carry that one law under the null.
 #[derive(Serialize)]
 pub struct SummaryParametricTermRow {
     pub name: String,
@@ -1169,6 +1176,26 @@ pub struct SummaryParametricTermRow {
     pub std_error: Option<f64>,
     pub statistic: Option<f64>,
     pub p_value: Option<f64>,
+    /// `"wald"` or `"variance_component_score"`; see
+    /// [`gam_solve::estimate::ParametricTest`].
+    pub test: &'static str,
+    /// Why `p_value` is absent for a ridged linear term, serialized as its
+    /// label; see [`gam_solve::estimate::ParametricPValueUnavailable`].
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_parametric_pvalue_unavailable"
+    )]
+    pub p_value_unavailable: Option<ParametricPValueUnavailable>,
+}
+
+fn serialize_parametric_pvalue_unavailable<S: serde::Serializer>(
+    reason: &Option<ParametricPValueUnavailable>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match reason {
+        Some(reason) => serializer.serialize_str(reason.label()),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// The comparison candidate a saved model's summary defines, or the summary's
