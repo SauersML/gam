@@ -1110,7 +1110,7 @@ fn response_geometry_sphere_normalize_base<'py>(
     base: PyReadonlyArray1<'py, f64>,
 ) -> PyResult<Py<PyArray1<f64>>> {
     let owned = base.as_array().to_owned();
-    let normalized = py.detach(move || rg_normalize_sphere_base(owned.view()));
+    let normalized = py.detach_on_pool(move || rg_normalize_sphere_base(owned.view()));
     let normalized = normalized.map_err(PyValueError::new_err)?;
     Ok(normalized.into_pyarray(py).unbind())
 }
@@ -1406,7 +1406,7 @@ fn sae_circular_concordance<'py>(
 ) -> PyResult<Py<PyDict>> {
     let coordinates_owned = coordinates.as_array().to_owned();
     let report = py
-        .detach(move || {
+        .detach_on_pool(move || {
             gam::terms::sae::circular_concordance::circular_concordance(
                 coordinates_owned.view(),
                 period,
@@ -1467,7 +1467,7 @@ fn sae_row_trust_scores<'py>(
     let assignments_owned = assignments.as_array().to_owned();
     let atom_trust_owned = atom_trust.as_array().to_owned();
     let (row, per_atom) = py
-        .detach(move || {
+        .detach_on_pool(move || {
             gam::terms::sae::trust_scores::row_trust_scores(
                 assignments_owned.view(),
                 atom_trust_owned.view(),
@@ -1482,7 +1482,7 @@ fn sae_row_trust_scores<'py>(
 
 #[pyfunction]
 fn sinkhorn_circular_cost<'py>(py: Python<'py>, m: usize) -> PyResult<Py<PyArray2<f64>>> {
-    let out = py.detach(move || sinkhorn_circular_cost_impl(m));
+    let out = py.detach_on_pool(move || sinkhorn_circular_cost_impl(m));
     Ok(out.into_pyarray(py).unbind())
 }
 
@@ -1565,7 +1565,7 @@ fn numerics_sigmoid_stable<'py>(
     x: PyReadonlyArrayDyn<'py, f64>,
 ) -> PyResult<Py<PyArrayDyn<f64>>> {
     let owned = x.as_array().to_owned();
-    let out = py.detach(move || owned.mapv(sigmoid_stable));
+    let out = py.detach_on_pool(move || owned.mapv(sigmoid_stable));
     Ok(out.into_pyarray(py).unbind())
 }
 
@@ -1575,7 +1575,7 @@ fn numerics_inverse_softplus<'py>(
     x: PyReadonlyArrayDyn<'py, f64>,
 ) -> PyResult<Py<PyArrayDyn<f64>>> {
     let owned = x.as_array().to_owned();
-    let out = py.detach(move || owned.mapv(inverse_softplus_scalar));
+    let out = py.detach_on_pool(move || owned.mapv(inverse_softplus_scalar));
     Ok(out.into_pyarray(py).unbind())
 }
 
@@ -4225,12 +4225,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // straight to stderr: silent by default, shown by
     // `logging.getLogger("gamfit").setLevel(logging.DEBUG)`.
     crate::ffi::python_log::install();
-    // Background process monitor: emits a `[process-monitor] elapsed=… rss=…`
-    // line every 60s for the life of the process, so silent stretches
-    // inside long PIRLS line-searches still surface a process-alive
-    // signal with current memory footprint. Unconditional — does not
-    // depend on any family pushing a tracked scope.
-    gam_runtime::process_monitor::start();
     module.add("__doc__", "PyO3 boundary for the gam Rust engine.")?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     // gamfit exception hierarchy (see `ffi/ffi_errors.rs`). Registering the
@@ -6203,7 +6197,7 @@ impl SparseDictStream {
             ..SparseDictConfig::default()
         };
         let inner = py
-            .detach(|| SparseDictStreamState::new(seed_values.view(), &config))
+            .detach_on_pool(|| SparseDictStreamState::new(seed_values.view(), &config))
             .map_err(py_value_error)?;
         Ok(Self { inner })
     }
@@ -6218,7 +6212,7 @@ impl SparseDictStream {
     ) -> PyResult<Py<PyDict>> {
         let shard_values = shard.as_array().to_owned();
         let stats = py
-            .detach(|| self.inner.partial_fit(shard_values.view()))
+            .detach_on_pool(|| self.inner.partial_fit(shard_values.view()))
             .map_err(py_value_error)?;
         let out = PyDict::new(py);
         out.set_item("rows", stats.rows)?;
@@ -6236,7 +6230,7 @@ impl SparseDictStream {
     /// Returns `{explained_variance, revived, dead, decoder_residual, converged, epoch}`.
     fn end_epoch(&mut self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let stats = py
-            .detach(|| self.inner.end_epoch())
+            .detach_on_pool(|| self.inner.end_epoch())
             .map_err(py_value_error)?;
         let out = PyDict::new(py);
         out.set_item("explained_variance", stats.explained_variance)?;
@@ -6336,7 +6330,7 @@ impl BlockSparseDictStream {
             ..BlockSparseConfig::default()
         };
         let inner = py
-            .detach(|| BlockSparseStreamState::new(seed_values.view(), &config))
+            .detach_on_pool(|| BlockSparseStreamState::new(seed_values.view(), &config))
             .map_err(py_value_error)?;
         Ok(Self { inner })
     }
@@ -6350,7 +6344,7 @@ impl BlockSparseDictStream {
     ) -> PyResult<Py<PyDict>> {
         let shard_values = shard.as_array().to_owned();
         let stats = py
-            .detach(|| self.inner.partial_fit(shard_values.view()))
+            .detach_on_pool(|| self.inner.partial_fit(shard_values.view()))
             .map_err(py_value_error)?;
         let out = PyDict::new(py);
         out.set_item("rows", stats.rows)?;
@@ -6368,7 +6362,7 @@ impl BlockSparseDictStream {
     /// support_changes, mean_admitted_blocks, converged, epoch}`.
     fn end_epoch(&mut self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let stats = py
-            .detach(|| self.inner.end_epoch())
+            .detach_on_pool(|| self.inner.end_epoch())
             .map_err(py_value_error)?;
         let out = PyDict::new(py);
         out.set_item("explained_variance", stats.explained_variance)?;
@@ -6469,7 +6463,7 @@ impl BlockSparseDictStream {
     /// epoch has closed yet.
     fn block_rank_charges(&self, py: Python<'_>, n_obs: usize) -> PyResult<Py<PyDict>> {
         let charges = py
-            .detach(|| self.inner.block_rank_charges(n_obs))
+            .detach_on_pool(|| self.inner.block_rank_charges(n_obs))
             .map_err(py_value_error)?;
         let out = PyDict::new(py);
         out.set_item("block", charges.block)?;
@@ -6502,7 +6496,7 @@ fn rank_charge_dof(
 ) -> PyResult<f64> {
     let gram_values = gram.as_array().to_owned();
     let decoder_values = decoder.as_array().to_owned();
-    py.detach(|| {
+    py.detach_on_pool(|| {
         gam::terms::sae::manifold::rank_charge_dof(
             &gram_values,
             &decoder_values,
@@ -7478,7 +7472,7 @@ fn generative_replicates(
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let result =
-        py.detach(|| generative_replicates_encoded_impl(&model, dataset, 0, n_draws, seed));
+        py.detach_on_pool(|| generative_replicates_encoded_impl(&model, dataset, 0, n_draws, seed));
     match result {
         Ok((flat, n_rows)) => {
             let arr = ndarray::Array2::<f64>::from_shape_vec((n_draws, n_rows), flat)
@@ -7507,8 +7501,9 @@ fn generative_replicate_chunk(
     let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
-    let result = py
-        .detach(|| generative_replicates_encoded_impl(&model, dataset, draw_start, n_draws, seed));
+    let result = py.detach_on_pool(|| {
+        generative_replicates_encoded_impl(&model, dataset, draw_start, n_draws, seed)
+    });
     match result {
         Ok((flat, n_rows)) => {
             let array = ndarray::Array2::<f64>::from_shape_vec((n_draws, n_rows), flat).map_err(

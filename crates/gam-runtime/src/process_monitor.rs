@@ -12,10 +12,22 @@
 //!      the old `active_threads` counter only ever saw the handful of threads
 //!      inside an instrumented `track_scope` (rayon workers are not) and so
 //!      reported a misleading `0`.
+//!
+//! The monitor exists only once [`start`] has been called — the Python binding
+//! calls it when the `gamfit` logger reaches DEBUG, the only level the monitor
+//! writes at, and the CLI when its verbosity does. Importing the library starts
+//! no thread. Until then [`track_scope`] records nothing.
+//!
+//! The monitor's state belongs to one process. A `fork()`ed child of a process
+//! that started the monitor inherits the request but neither the heartbeat
+//! thread nor a usable registry (a parent thread may have held its lock at the
+//! fork), so the child's first use builds a fresh state and heartbeat of its
+//! own and leaks the parent's.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,7 +43,13 @@ const PROCESS_MONITOR_MAX_PHASE_LINES: usize = 8;
 /// phase is impossible to miss in the log.
 const PROCESS_MONITOR_STALL_THRESHOLD: Duration = Duration::from_secs(120);
 
-static PROCESS_MONITOR: OnceLock<Arc<ProcessMonitorState>> = OnceLock::new();
+/// Whether [`start`] has been called in this process or in the process it was
+/// forked from.
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// The current process's monitor state. Lock-free for the same reason as the
+/// worker pool's cell: a lock held at a `fork()` stays held in the child.
+static PROCESS_MONITOR: AtomicPtr<ProcessMonitorState> = AtomicPtr::new(std::ptr::null_mut());
 
 thread_local! {
     static THREAD_STACK: RefCell<ThreadStack> = RefCell::new(ThreadStack::new());
@@ -50,6 +68,7 @@ struct ThreadSnapshot {
 }
 
 struct ProcessMonitorState {
+    pid: u32,
     started: Instant,
     threads: Mutex<BTreeMap<String, ThreadSnapshot>>,
     cpu: Mutex<CpuSampler>,
@@ -61,7 +80,10 @@ struct ThreadStack {
     stack: Vec<FrameSnapshot>,
 }
 
-pub struct ProcessScopeGuard;
+/// Pops the scope [`track_scope`] pushed, if it pushed one.
+pub struct ProcessScopeGuard {
+    pushed: bool,
+}
 
 impl ThreadStack {
     fn new() -> Self {
@@ -208,52 +230,88 @@ impl ProcessMonitorState {
 
 impl Drop for ProcessScopeGuard {
     fn drop(&mut self) {
+        if !self.pushed {
+            return;
+        }
         let state = process_monitor();
         THREAD_STACK.with(|stack| {
             let mut stack = stack.borrow_mut();
             stack.stack.pop();
-            state.update_thread(&stack);
+            if let Some(state) = state {
+                state.update_thread(&stack);
+            }
         });
     }
 }
 
-/// Start the background process monitor thread if it is not already running.
+/// Start the process monitor: from now on this process, and any process forked
+/// from it, keeps a heartbeat thread and records [`track_scope`] frames.
 pub fn start() {
+    ENABLED.store(true, Ordering::Release);
     process_monitor();
 }
 
+/// Record `label` as the current thread's innermost operation until the guard
+/// drops. A no-op while the monitor is not started.
 pub fn track_scope(label: impl Into<String>) -> ProcessScopeGuard {
-    push_scope(label.into())
-}
-
-fn push_scope(label: String) -> ProcessScopeGuard {
-    let state = process_monitor();
+    let Some(state) = process_monitor() else {
+        return ProcessScopeGuard { pushed: false };
+    };
     THREAD_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         stack.stack.push(FrameSnapshot {
-            label,
+            label: label.into(),
             entered: Instant::now(),
         });
         state.update_thread(&stack);
     });
-    ProcessScopeGuard
+    ProcessScopeGuard { pushed: true }
 }
 
-fn process_monitor() -> Arc<ProcessMonitorState> {
-    PROCESS_MONITOR
-        .get_or_init(|| {
-            let state = Arc::new(ProcessMonitorState {
-                started: Instant::now(),
-                threads: Mutex::new(BTreeMap::new()),
-                cpu: Mutex::new(CpuSampler::new()),
-            });
-            start_process_monitor_thread(Arc::clone(&state));
-            state
-        })
-        .clone()
+/// The current process's monitor, started on first use once [`start`] has been
+/// called; `None` before that.
+fn process_monitor() -> Option<&'static ProcessMonitorState> {
+    if !ENABLED.load(Ordering::Acquire) {
+        return None;
+    }
+    let pid = std::process::id();
+    loop {
+        let current = PROCESS_MONITOR.load(Ordering::Acquire);
+        // SAFETY: a non-null pointer in `PROCESS_MONITOR` came from
+        // `Box::into_raw` and is never freed, so it is valid for the rest of the
+        // process.
+        if let Some(state) = unsafe { current.as_ref() }
+            && state.pid == pid
+        {
+            return Some(state);
+        }
+        let fresh = Box::into_raw(Box::new(ProcessMonitorState {
+            pid,
+            started: Instant::now(),
+            threads: Mutex::new(BTreeMap::new()),
+            cpu: Mutex::new(CpuSampler::new()),
+        }));
+        match PROCESS_MONITOR.compare_exchange(current, fresh, Ordering::AcqRel, Ordering::Acquire)
+        {
+            // A state left by the parent of a forked process is leaked: its
+            // heartbeat thread is gone and its locks may be held by threads that
+            // no longer exist.
+            Ok(_) => {
+                // SAFETY: `fresh` was just published and is never freed.
+                let state: &'static ProcessMonitorState = unsafe { &*fresh };
+                start_process_monitor_thread(state);
+                return Some(state);
+            }
+            Err(_) => {
+                // SAFETY: `fresh` came from `Box::into_raw` above and was not
+                // published.
+                drop(unsafe { Box::from_raw(fresh) });
+            }
+        }
+    }
 }
 
-fn start_process_monitor_thread(state: Arc<ProcessMonitorState>) {
+fn start_process_monitor_thread(state: &'static ProcessMonitorState) {
     let builder = thread::Builder::new().name("gam-process-monitor".to_string());
     match builder.spawn(move || {
         loop {
@@ -643,5 +701,50 @@ mod format_tests {
             ncpu: Some(8),
         };
         assert_eq!(snapshot.format(), "cpu=4.0/8 cores (avg over 3s)");
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn monitor_thread_count() -> usize {
+        // Linux keeps a thread's name in a 16-byte `comm` buffer: at most 15
+        // bytes of the name survive.
+        let comm_name = &"gam-process-monitor"[..15];
+        std::fs::read_dir("/proc/self/task")
+            .map(|tasks| {
+                tasks
+                    .filter_map(Result::ok)
+                    .filter(|task| {
+                        std::fs::read_to_string(task.path().join("comm"))
+                            .is_ok_and(|comm| comm.trim() == comm_name)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    // The only test in this crate that calls `start`, so the "before" half sees
+    // the process as it is at import.
+    #[test]
+    fn the_monitor_starts_only_when_asked() {
+        assert!(!track_scope("before start").pushed);
+        if cfg!(target_os = "linux") {
+            assert_eq!(monitor_thread_count(), 0);
+        }
+        start();
+        start();
+        let guard = track_scope("after start");
+        assert!(guard.pushed);
+        drop(guard);
+        if cfg!(target_os = "linux") {
+            // The heartbeat names itself once it runs.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while monitor_thread_count() == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(monitor_thread_count(), 1, "one heartbeat per process");
+        }
     }
 }

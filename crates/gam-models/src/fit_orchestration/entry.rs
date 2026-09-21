@@ -136,7 +136,8 @@ fn residual_cascade_failure(
 /// (`try_deterministic_gaussian_standard_fit`) has already been refused. That
 /// certificate builds its own dense design and normal equations, so a caller
 /// that already ran it hands the request here rather than back through
-/// [`fit_model`], which would build and refuse it a second time.
+/// [`fit_model`], which would build and refuse it a second time. Like
+/// [`fit_model`], it runs on the process worker pool.
 ///
 /// `realized_design` is the design that certificate realized, when it built one;
 /// the REML fit starts from it instead of realizing the same design again.
@@ -144,13 +145,21 @@ fn fit_standard_past_exact_gaussian_boundary(
     request: StandardFitRequest<'_>,
     realized_design: Option<TermCollectionDesign>,
 ) -> Result<FitResult, WorkflowError> {
-    fit_standard_model_on_design(request, realized_design)
-        .map(FitResult::Standard)
-        .map_err(|failure| WorkflowError::from(failure.ending_the_fit()))
+    gam_runtime::parallel::install(move || {
+        fit_standard_model_on_design(request, realized_design)
+            .map(FitResult::Standard)
+            .map_err(|failure| WorkflowError::from(failure.ending_the_fit()))
+    })
 }
 
+/// Fit a materialized request on the process worker pool
+/// ([`gam_runtime::parallel::install`]), so every parallel operation of the fit
+/// runs on the pool that belongs to this process.
 pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
-    let request = request;
+    gam_runtime::parallel::install(move || fit_model_on_pool(request))
+}
+
+fn fit_model_on_pool(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
     // Every arm hands back the helper's `FitFailure` whole. This boundary used
     // to wrap each helper's text as `IntegrationFailed`, so every solver
     // failure reached Python as `IntegrationError` whatever had failed (#2937).
@@ -2189,6 +2198,14 @@ pub struct FormulaFitResult {
 /// An automatic `.` term is expanded against `data` first; its notes (the
 /// first of which spells out the fitted formula) lead the returned notes.
 pub fn fit_from_formula_with_notes(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<FormulaFitResult, WorkflowError> {
+    gam_runtime::parallel::install(|| fit_from_formula_with_notes_on_pool(formula, data, config))
+}
+
+fn fit_from_formula_with_notes_on_pool(
     formula: &str,
     data: &Dataset,
     config: &FitConfig,
@@ -4237,7 +4254,7 @@ pub fn materialize<'a>(
             reason: "CTN composition requires fit_from_formula or fit_formula_to_payload".into(),
         });
     }
-    materialize_impl(formula, data, config, false)
+    gam_runtime::parallel::install(|| materialize_impl(formula, data, config, false))
 }
 
 /// Structural-only materialization for `validate_formula`: builds the same
@@ -4248,7 +4265,7 @@ pub fn materialize_structural<'a>(
     data: &'a Dataset,
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
-    materialize_impl(formula, data, config, true)
+    gam_runtime::parallel::install(|| materialize_impl(formula, data, config, true))
 }
 
 fn materialize_impl<'a>(
@@ -4625,13 +4642,15 @@ pub fn fit_residual_cascade_from_formula(
         return Ok(None);
     };
     let coord_refs: Vec<&[f64]> = inputs.coords.iter().map(Vec::as_slice).collect();
-    gam_solve::residual_cascade::fit_residual_cascade(
-        &coord_refs,
-        &inputs.y,
-        &inputs.w,
-        &inputs.metric,
-        inputs.sobolev_s,
-    )
+    gam_runtime::parallel::install(|| {
+        gam_solve::residual_cascade::fit_residual_cascade(
+            &coord_refs,
+            &inputs.y,
+            &inputs.w,
+            &inputs.metric,
+            inputs.sobolev_s,
+        )
+    })
     .map(Some)
     .map_err(residual_cascade_failure)
 }
@@ -4666,9 +4685,11 @@ pub fn fit_spline_scan_from_formula(
     let Some(inputs) = spline_scan_fast_path(&request) else {
         return Ok(None);
     };
-    gam_solve::spline_scan::fit_spline_scan(&inputs.x, &inputs.y, &inputs.w, inputs.order)
-        .map(Some)
-        .map_err(spline_scan_failure)
+    gam_runtime::parallel::install(|| {
+        gam_solve::spline_scan::fit_spline_scan(&inputs.x, &inputs.y, &inputs.w, inputs.order)
+    })
+    .map(Some)
+    .map_err(spline_scan_failure)
 }
 
 #[cfg(test)]

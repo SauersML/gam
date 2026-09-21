@@ -216,8 +216,8 @@ fn the_streamed_lambda_max_is_the_dense_spectrums() {
 /// outputs — so the parallel pass is the same arithmetic in the same order as
 /// the serial one, not merely the same in distribution.
 ///
-/// The serial arm is reached by running inside a rayon worker, which is exactly
-/// the nesting guard the operator uses; comparing the two factors BIT FOR BIT is
+/// The serial arm is reached by running inside a rayon worker that runs no root
+/// computation, which is exactly the nesting guard the operator uses; comparing the two factors BIT FOR BIT is
 /// what makes "no reduction, therefore no schedule dependence" a checked claim.
 /// Splitting the observations instead would have needed per-chunk partial
 /// factors combined pairwise, and Givens rotations do not commute — this gate is
@@ -235,7 +235,7 @@ fn the_parallel_generator_pass_is_bit_identical_to_the_serial_one() {
     let views: Vec<ArrayView1<'_, f64>> = directions.iter().map(|d| d.view()).collect();
 
     assert!(
-        rayon::current_thread_index().is_none(),
+        gam_runtime::parallel::at_top_level(),
         "the outer arm must be the parallel one for this gate to compare two passes"
     );
     let parallel = operator.project_root(&views).expect("parallel pass");
@@ -244,7 +244,7 @@ fn the_parallel_generator_pass_is_bit_identical_to_the_serial_one() {
     rayon::scope(|scope| {
         scope.spawn(|_| {
             assert!(
-                rayon::current_thread_index().is_some(),
+                !gam_runtime::parallel::at_top_level(),
                 "inside a rayon worker the operator must take its serial arm"
             );
             serial = operator.project_root(&views).expect("serial pass");

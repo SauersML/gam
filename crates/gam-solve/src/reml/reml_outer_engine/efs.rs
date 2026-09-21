@@ -56,8 +56,8 @@ fn efs_penalty_like_steps(
         (idx, efs_log_step_from_grad(q_eff, gradient[idx]))
     };
     let rho_candidates: Vec<(usize, Option<f64>)> =
-        if k >= HYBRID_EFS_SCALAR_PAR_THRESHOLD && rayon::current_thread_index().is_none() {
-            (0..k).into_par_iter().map(rho_step).collect()
+        if k >= HYBRID_EFS_SCALAR_PAR_THRESHOLD && gam_runtime::parallel::at_top_level() {
+            gam_runtime::parallel::fan_out(|| (0..k).into_par_iter().map(rho_step).collect())
         } else {
             (0..k).map(rho_step).collect()
         };
@@ -84,9 +84,9 @@ fn efs_penalty_like_steps(
     };
     let tau_candidates: Vec<(usize, Option<f64>)> = if tau_local.len()
         >= HYBRID_EFS_SCALAR_PAR_THRESHOLD
-        && rayon::current_thread_index().is_none()
+        && gam_runtime::parallel::at_top_level()
     {
-        tau_local.into_par_iter().map(tau_step).collect()
+        gam_runtime::parallel::fan_out(|| tau_local.into_par_iter().map(tau_step).collect())
     } else {
         tau_local.into_iter().map(tau_step).collect()
     };
@@ -365,16 +365,18 @@ pub fn compute_hybrid_efs_update(
         let gram = {
             let mut gram = ndarray::Array2::<f64>::zeros((n_psi, n_psi));
             let parallel_psi_drifts = n_psi >= HYBRID_EFS_PSI_DRIFT_PAR_THRESHOLD
-                && rayon::current_thread_index().is_none();
+                && gam_runtime::parallel::at_top_level();
             let drift_ops: Vec<Option<Arc<dyn HyperOperator>>> = if parallel_psi_drifts {
                 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-                (0..n_psi)
-                    .into_par_iter()
-                    .map(|idx| {
-                        let drift = &solution.ext_coords[psi_local_indices[idx]].drift;
-                        hyper_coord_drift_operator_arc(drift, hop.dim())
-                    })
-                    .collect()
+                gam_runtime::parallel::fan_out(|| {
+                    (0..n_psi)
+                        .into_par_iter()
+                        .map(|idx| {
+                            let drift = &solution.ext_coords[psi_local_indices[idx]].drift;
+                            hyper_coord_drift_operator_arc(drift, hop.dim())
+                        })
+                        .collect()
+                })
             } else {
                 psi_local_indices
                     .iter()
@@ -386,13 +388,15 @@ pub fn compute_hybrid_efs_update(
             };
             let dense_drifts: Vec<Option<Array2<f64>>> = if parallel_psi_drifts {
                 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-                (0..n_psi)
-                    .into_par_iter()
-                    .map(|idx| {
-                        let drift = &solution.ext_coords[psi_local_indices[idx]].drift;
-                        drift_ops[idx].is_none().then(|| drift.materialize())
-                    })
-                    .collect()
+                gam_runtime::parallel::fan_out(|| {
+                    (0..n_psi)
+                        .into_par_iter()
+                        .map(|idx| {
+                            let drift = &solution.ext_coords[psi_local_indices[idx]].drift;
+                            drift_ops[idx].is_none().then(|| drift.materialize())
+                        })
+                        .collect()
+                })
             } else {
                 psi_local_indices
                     .iter()
@@ -405,7 +409,7 @@ pub fn compute_hybrid_efs_update(
             };
             let pair_count = n_psi * (n_psi + 1) / 2;
             let parallel_gram_pairs = pair_count >= HYBRID_EFS_GRAM_PAIR_PAR_THRESHOLD
-                && rayon::current_thread_index().is_none();
+                && gam_runtime::parallel::at_top_level();
             if let Some(dense_hop) = hop.as_dense_spectral() {
                 // Batch the operator-backed drifts so the chunked X·F sweep
                 // is shared across all matching axes (compute_xf runs once,
@@ -444,15 +448,20 @@ pub fn compute_hybrid_efs_update(
                 if parallel_gram_pairs {
                     use rayon::iter::{IntoParallelIterator, ParallelIterator};
                     let pair_count = n_psi * (n_psi + 1) / 2;
-                    let pair_values: Vec<(usize, usize, f64)> = (0..pair_count)
-                        .into_par_iter()
-                        .map(|pair_idx| {
-                            let (d, e) = upper_triangle_pair_from_index(pair_idx, n_psi);
-                            let val = dense_hop
-                                .trace_projected_cross(&projected_drifts[d], &projected_drifts[e]);
-                            (d, e, val)
-                        })
-                        .collect();
+                    let pair_values: Vec<(usize, usize, f64)> =
+                        gam_runtime::parallel::fan_out(|| {
+                            (0..pair_count)
+                                .into_par_iter()
+                                .map(|pair_idx| {
+                                    let (d, e) = upper_triangle_pair_from_index(pair_idx, n_psi);
+                                    let val = dense_hop.trace_projected_cross(
+                                        &projected_drifts[d],
+                                        &projected_drifts[e],
+                                    );
+                                    (d, e, val)
+                                })
+                                .collect()
+                        });
                     for (d, e, val) in pair_values {
                         gram[[d, e]] = val;
                         gram[[e, d]] = val;
@@ -470,20 +479,22 @@ pub fn compute_hybrid_efs_update(
             } else if parallel_gram_pairs {
                 use rayon::iter::{IntoParallelIterator, ParallelIterator};
                 let pair_count = n_psi * (n_psi + 1) / 2;
-                let pair_values: Vec<(usize, usize, f64)> = (0..pair_count)
-                    .into_par_iter()
-                    .map(|pair_idx| {
-                        let (d, e) = upper_triangle_pair_from_index(pair_idx, n_psi);
-                        let val = trace_hinv_cached_drift_cross(
-                            hop,
-                            dense_drifts[d].as_ref(),
-                            drift_ops[d].as_deref(),
-                            dense_drifts[e].as_ref(),
-                            drift_ops[e].as_deref(),
-                        );
-                        (d, e, val)
-                    })
-                    .collect();
+                let pair_values: Vec<(usize, usize, f64)> = gam_runtime::parallel::fan_out(|| {
+                    (0..pair_count)
+                        .into_par_iter()
+                        .map(|pair_idx| {
+                            let (d, e) = upper_triangle_pair_from_index(pair_idx, n_psi);
+                            let val = trace_hinv_cached_drift_cross(
+                                hop,
+                                dense_drifts[d].as_ref(),
+                                drift_ops[d].as_deref(),
+                                dense_drifts[e].as_ref(),
+                                drift_ops[e].as_deref(),
+                            );
+                            (d, e, val)
+                        })
+                        .collect()
+                });
                 for (d, e, val) in pair_values {
                     gram[[d, e]] = val;
                     gram[[e, d]] = val;

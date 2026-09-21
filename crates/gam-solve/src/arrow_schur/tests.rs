@@ -3763,7 +3763,7 @@ pub(crate) fn resident_scalar_jacobi_col_dot_hoist_bit_identical() {
 /// parallel build must (a) be bit-identical run-to-run and (b) reproduce the
 /// serial chunk-free build up to chunk reassociation (asserted to `rel < 1e-12`,
 /// NOT bit-for-bit; the serial branch is taken inside a single-thread rayon
-/// worker, where `current_thread_index()` is `Some`). A diagonal drifting beyond
+/// worker, which is nested: `gam_runtime::parallel::at_top_level()` is false). A diagonal drifting beyond
 /// that margin would change the PCG iterate and could move the criterion ranking
 /// — the #1017 determinism gate. Because (b) is tolerance-equal not bit-exact,
 /// the ranking is stable only up to the reassociation margin; a near-tie winner
@@ -3802,7 +3802,7 @@ pub(crate) fn parallel_resident_scalar_jacobi_deterministic_and_matches_serial()
     }
 
     // Serial branch: force the nested-worker gate (single-thread pool ⇒
-    // `current_thread_index()` is `Some` ⇒ sequential `row = 0..n` sweep). The
+    // nested, not at top level ⇒ sequential `row = 0..n` sweep). The
     // chunk-ordered fold (`diag - Σ_chunk partial`) regroups the per-row
     // subtractions vs the serial path's `(diag - a) - b - …`, so the difference
     // is pure ULP-scale float reassociation (the SAME reassociation the generic

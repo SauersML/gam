@@ -1,6 +1,7 @@
 mod cgroup_memory;
 
 pub mod loop_progress;
+pub mod parallel;
 pub mod process_monitor;
 pub mod resource;
 pub mod span;

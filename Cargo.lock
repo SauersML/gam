@@ -3561,6 +3561,7 @@ dependencies = [
  "gam-terms",
  "gam-test-support",
  "general-mcmc",
+ "libc",
  "libm",
  "log",
  "ndarray 0.17.2",
@@ -3647,6 +3648,7 @@ version = "0.3.157"
 dependencies = [
  "arrow",
  "csv",
+ "gam-runtime",
  "gam-spec",
  "log",
  "ndarray 0.17.2",
@@ -3905,6 +3907,7 @@ dependencies = [
  "faer",
  "gam-geometry",
  "gam-linalg",
+ "gam-runtime",
  "gam-spec",
  "ndarray 0.17.2",
  "opt",
@@ -3961,6 +3964,7 @@ version = "0.3.157"
 dependencies = [
  "log",
  "ndarray 0.17.2",
+ "rayon",
  "serde",
  "serde_json",
  "sha2 0.11.0",

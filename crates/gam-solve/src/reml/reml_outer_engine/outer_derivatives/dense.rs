@@ -476,7 +476,7 @@ pub(crate) fn compute_outer_hessian(
     // `adjoint_z_c`, `leverage`, and `fourth_trace_matrix` are all read-only
     // shared state, so the closure body is genuinely thread-safe. The default
     // `HyperOperator::mul_mat` already short-circuits to sequential when
-    // `rayon::current_thread_index().is_some()`, preventing nested-rayon
+    // nested (`!gam_runtime::parallel::at_top_level()`), preventing nested-rayon
     // oversubscription inside the family callbacks invoked by
     // `compute_ift_correction_trace`.
     let rho_pair_count = k * (k + 1) / 2;

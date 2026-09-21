@@ -13,6 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 arrow = { version = "59", default-features = false, features = ["ffi"] }
 csv = "1.4.0"
+gam-runtime = { path = "../gam-runtime", version = "=0.3.157" }
 gam-spec = { path = "../gam-spec", version = "=0.3.157" }
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }

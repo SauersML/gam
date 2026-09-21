@@ -1569,17 +1569,16 @@ fn record_input_fingerprint(payload: &mut FittedModelPayload, input_fingerprint:
 /// stores (and `model.formula` shows) the formula that was actually fitted, and
 /// the expansion's notes lead the payload's inference notes.
 ///
-/// On a one-thread pool the fit runs on the pool's worker, so its parallel
-/// loops never hand work across threads
-/// (`gam_linalg::parallel::run_on_single_worker_pool`).
+/// The fit runs on a worker of the process pool
+/// ([`gam_runtime::parallel::install`]), so its parallel loops start where they
+/// run: on a one-thread pool they run in place and never hand work across
+/// threads.
 pub fn fit_formula_to_payload(
     formula: String,
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
 ) -> Result<FittedModelPayload, WorkflowError> {
-    gam_linalg::parallel::run_on_single_worker_pool(|| {
-        fit_formula_to_payload_here(formula, dataset, fit_config)
-    })
+    gam_runtime::parallel::install(|| fit_formula_to_payload_here(formula, dataset, fit_config))
 }
 
 fn fit_formula_to_payload_here(

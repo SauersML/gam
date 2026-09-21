@@ -131,6 +131,7 @@ ad_trait = "0.3.0"
 criterion = "0.8"
 tempfile = "3.27.0"
 approx = "0.5.1"
+libc = "0.2"
 opt.workspace = true
 
 [[bench]]

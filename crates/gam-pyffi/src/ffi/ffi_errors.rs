@@ -669,12 +669,43 @@ fn py_panic_error(context: &'static str, payload: Box<dyn std::any::Any + Send>)
     ))
 }
 
+/// Release the GIL and run a computation on gam's process worker pool.
+///
+/// Every GIL-detached engine call goes through here, so the computation and
+/// every parallel operation inside it run on the pool that belongs to this
+/// process — the pool a `fork()`ed child builds afresh for itself.
+pub(crate) trait DetachOnPool {
+    fn detach_on_pool<R, F>(self, f: F) -> R
+    where
+        R: Send,
+        F: FnOnce() -> R + Send;
+}
+
+impl DetachOnPool for Python<'_> {
+    fn detach_on_pool<R, F>(self, f: F) -> R
+    where
+        R: Send,
+        F: FnOnce() -> R + Send,
+    {
+        self.detach(move || gam_runtime::parallel::install(f))
+    }
+}
+
+/// [`DetachOnPool::detach_on_pool`], catching a panic.
+fn detach_catching<R, F>(py: Python<'_>, f: F) -> std::thread::Result<R>
+where
+    R: Send,
+    F: FnOnce() -> R + Send,
+{
+    py.detach_on_pool(move || catch_unwind(AssertUnwindSafe(f)))
+}
+
 pub(crate) fn detach_py_result<T, F>(py: Python<'_>, context: &'static str, f: F) -> PyResult<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, String> + Send + 'static,
 {
-    match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
+    match detach_catching(py, f) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(message)) => Err(py_value_error(message)),
         Err(payload) => Err(py_panic_error(context, payload)),
@@ -697,7 +728,7 @@ where
     F: FnOnce() -> Result<T, E> + Send + 'static,
     M: FnOnce(Python<'_>, E) -> PyErr,
 {
-    match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
+    match detach_catching(py, f) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(map_error(py, error)),
         Err(payload) => Err(py_panic_error(context, payload)),
@@ -784,7 +815,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> PyResult<T> + Send + 'static,
 {
-    match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
+    match detach_catching(py, f) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => Err(err),
         Err(payload) => Err(py_panic_error(context, payload)),
@@ -806,7 +837,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, EstimationError> + Send + 'static,
 {
-    match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
+    match detach_catching(py, f) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => Err(estimation_error_to_pyerr(err)),
         Err(payload) => Err(py_panic_error(context, payload)),
@@ -1060,7 +1091,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, WorkflowError> + Send + 'static,
 {
-    match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
+    match detach_catching(py, f) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => Err(workflow_error_to_pyerr(py, err)),
         Err(payload) => Err(py_panic_error(context, payload)),
@@ -1091,7 +1122,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, EngineGeometryError> + Send + 'static,
 {
-    match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
+    match detach_catching(py, f) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => Err(geometry_error_to_pyerr(err)),
         Err(payload) => Err(py_panic_error(context, payload)),

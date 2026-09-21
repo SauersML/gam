@@ -395,9 +395,9 @@ impl BernoulliMarginalSlopeFamily {
             // forces that build exactly once (matching the warm-up discipline in
             // the directional-derivative passes), so the parallel chunks below
             // read already-materialised rows in O(r_pr) with no nested lazy
-            // build / nested-rayon race. Fall back to a serial fill when already
-            // inside a rayon worker (an outer par_iter holds the pool) or when
-            // the pool is single-threaded.
+            // build / nested-rayon race. Fall back to a serial fill when not at
+            // top level (an outer par_iter holds the pool) or when the pool is
+            // single-threaded.
             if n > 0 {
                 let mut warm = Array1::<f64>::zeros(r_pr);
                 self.row_primary_direction_from_flat_into(
@@ -406,7 +406,7 @@ impl BernoulliMarginalSlopeFamily {
                 v_rows[0..r_pr].copy_from_slice(warm.as_slice().expect("contiguous"));
             }
             let fill_serial =
-                rayon::current_thread_index().is_some() || rayon::current_num_threads() <= 1;
+                !gam_runtime::parallel::at_top_level() || rayon::current_num_threads() <= 1;
             if fill_serial {
                 let mut row_dir_scratch = Array1::<f64>::zeros(r_pr);
                 for row in 1..n {
@@ -423,22 +423,24 @@ impl BernoulliMarginalSlopeFamily {
             } else {
                 use rayon::iter::{IndexedParallelIterator, ParallelIterator};
                 use rayon::slice::ParallelSliceMut;
-                v_rows
-                    .par_chunks_mut(r_pr)
-                    .enumerate()
-                    .skip(1)
-                    .try_for_each(|(row, slot)| -> Result<(), String> {
-                        let mut row_dir_scratch = Array1::<f64>::zeros(r_pr);
-                        self.row_primary_direction_from_flat_into(
-                            row,
-                            slices,
-                            primary,
-                            direction,
-                            &mut row_dir_scratch,
-                        )?;
-                        slot.copy_from_slice(row_dir_scratch.as_slice().expect("contiguous"));
-                        Ok(())
-                    })?;
+                gam_runtime::parallel::fan_out(|| {
+                    v_rows
+                        .par_chunks_mut(r_pr)
+                        .enumerate()
+                        .skip(1)
+                        .try_for_each(|(row, slot)| -> Result<(), String> {
+                            let mut row_dir_scratch = Array1::<f64>::zeros(r_pr);
+                            self.row_primary_direction_from_flat_into(
+                                row,
+                                slices,
+                                primary,
+                                direction,
+                                &mut row_dir_scratch,
+                            )?;
+                            slot.copy_from_slice(row_dir_scratch.as_slice().expect("contiguous"));
+                            Ok(())
+                        })
+                })?;
             }
             let h_rows_arr = host_pin.hess();
             let h_rows_slice = h_rows_arr
@@ -3251,13 +3253,13 @@ impl BernoulliMarginalSlopeFamily {
         }
         // Even with the warm-up above, fall back to a serial row loop when the
         // par_iter cannot pay for its own dispatch overhead, or when we are
-        // already inside a rayon worker (so an outer par_iter is holding pool
+        // not at top level (so an outer par_iter is holding pool
         // slots and a nested `into_par_iter` here would risk pool starvation
         // on the LRU mutex inside `evaluate_cell_derivative_moments_lru`,
         // etc.). At large-scale n_rows the per-row body's design materialization
         // and pullback work dominates dispatch, so the par_iter is preserved.
         const ROW_PAR_MIN_ROWS: usize = 4_096;
-        let run_rows_serial = rayon::current_thread_index().is_some()
+        let run_rows_serial = !gam_runtime::parallel::at_top_level()
             || rayon::current_num_threads() <= 1
             || n_rows < ROW_PAR_MIN_ROWS;
         let mut accs = if !flex_active && dense_contiguous_rows {
@@ -3374,31 +3376,34 @@ impl BernoulliMarginalSlopeFamily {
                 }
                 accs
             } else {
-                gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
-                    chunks.len(),
-                    chunk_rows,
-                    // Pin faer's per-chunk GEMM parallelism to `Par::Seq` so the
-                    // chunk fan-out (this tree fold) owns the global Rayon
-                    // pool and the inner `fast_ab` / weighted-Gram GEMMs do not
-                    // re-fan it and oversubscribe — same discipline as the FLEX
-                    // chunked path.
-                    |chunk_range| -> Result<_, String> {
-                        let mut accs = make_accs();
-                        for chunk in &chunks[chunk_range] {
-                            let partial = gam_problem::with_nested_parallel(|| chunk_body(*chunk))?;
-                            for (l, r) in accs.iter_mut().zip(partial.iter()) {
+                gam_runtime::parallel::fan_out(|| {
+                    gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
+                        chunks.len(),
+                        chunk_rows,
+                        // Pin faer's per-chunk GEMM parallelism to `Par::Seq` so the
+                        // chunk fan-out (this tree fold) owns the global Rayon
+                        // pool and the inner `fast_ab` / weighted-Gram GEMMs do not
+                        // re-fan it and oversubscribe — same discipline as the FLEX
+                        // chunked path.
+                        |chunk_range| -> Result<_, String> {
+                            let mut accs = make_accs();
+                            for chunk in &chunks[chunk_range] {
+                                let partial =
+                                    gam_problem::with_nested_parallel(|| chunk_body(*chunk))?;
+                                for (l, r) in accs.iter_mut().zip(partial.iter()) {
+                                    l.add(r);
+                                }
+                            }
+                            Ok(accs)
+                        },
+                        |mut left, right| -> Result<_, String> {
+                            for (l, r) in left.iter_mut().zip(right.iter()) {
                                 l.add(r);
                             }
-                        }
-                        Ok(accs)
-                    },
-                    |mut left, right| -> Result<_, String> {
-                        for (l, r) in left.iter_mut().zip(right.iter()) {
-                            l.add(r);
-                        }
-                        Ok(left)
-                    },
-                )?
+                            Ok(left)
+                        },
+                    )
+                })?
                 .unwrap_or_else(make_accs)
             }
         } else if !flex_active {
@@ -3431,43 +3436,46 @@ impl BernoulliMarginalSlopeFamily {
                 }
                 accs
             } else {
-                gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
-                    weighted_rows.len(),
-                    |index_range| -> Result<_, String> {
-                        let mut accs = make_accs();
-                        for wr in &weighted_rows[index_range] {
-                            let row = wr.index;
-                            let w = wr.weight;
-                            // Direction-independent per-row third tensor: read the
-                            // serially-prewarmed cache (built once before this
-                            // par_iter, so no nested lazy build / nested par_iter
-                            // races inside a Rayon worker) and contract each
-                            // direction cheaply, instead of rebuilding the heavy jet
-                            // `n_dirs` times per row.
-                            let full = self.rigid_third_full_cached(block_states, cache, row)?;
-                            for (idx, d_beta_flat) in d_beta_flats.iter().enumerate() {
-                                let dq = self.marginal_design.dot_row_view(
-                                    row,
-                                    d_beta_flat.slice(s![slices.marginal.clone()]),
-                                );
-                                let dg = self.slope_design.dot_row_view(
-                                    row,
-                                    d_beta_flat.slice(s![slices.slope.clone()]),
-                                );
-                                let t = contract_third_full(full, dq, dg);
-                                accs[idx].add_pullback_rigid_2x2(self, row, &t, w);
+                gam_runtime::parallel::fan_out(|| {
+                    gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                        weighted_rows.len(),
+                        |index_range| -> Result<_, String> {
+                            let mut accs = make_accs();
+                            for wr in &weighted_rows[index_range] {
+                                let row = wr.index;
+                                let w = wr.weight;
+                                // Direction-independent per-row third tensor: read the
+                                // serially-prewarmed cache (built once before this
+                                // par_iter, so no nested lazy build / nested par_iter
+                                // races inside a Rayon worker) and contract each
+                                // direction cheaply, instead of rebuilding the heavy jet
+                                // `n_dirs` times per row.
+                                let full =
+                                    self.rigid_third_full_cached(block_states, cache, row)?;
+                                for (idx, d_beta_flat) in d_beta_flats.iter().enumerate() {
+                                    let dq = self.marginal_design.dot_row_view(
+                                        row,
+                                        d_beta_flat.slice(s![slices.marginal.clone()]),
+                                    );
+                                    let dg = self.slope_design.dot_row_view(
+                                        row,
+                                        d_beta_flat.slice(s![slices.slope.clone()]),
+                                    );
+                                    let t = contract_third_full(full, dq, dg);
+                                    accs[idx].add_pullback_rigid_2x2(self, row, &t, w);
+                                }
+                                bump_progress(&progress);
                             }
-                            bump_progress(&progress);
-                        }
-                        Ok(accs)
-                    },
-                    |mut left, right| -> Result<_, String> {
-                        for (l, r) in left.iter_mut().zip(right.iter()) {
-                            l.add(r);
-                        }
-                        Ok(left)
-                    },
-                )?
+                            Ok(accs)
+                        },
+                        |mut left, right| -> Result<_, String> {
+                            for (l, r) in left.iter_mut().zip(right.iter()) {
+                                l.add(r);
+                            }
+                            Ok(left)
+                        },
+                    )
+                })?
                 .unwrap_or_else(make_accs)
             }
         } else if dense_contiguous_rows {
@@ -3583,31 +3591,34 @@ impl BernoulliMarginalSlopeFamily {
                 }
                 accs
             } else {
-                gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
-                    chunks.len(),
-                    chunk_rows,
-                    // Each chunk runs on a Rayon worker and issues `fast_ab` /
-                    // weighted-Gram GEMMs; pin their faer parallelism to
-                    // `Par::Seq` so they do not re-fan the global Rayon pool
-                    // against this already-parallel chunk fan-out. The serial
-                    // path above intentionally keeps top-level pool parallelism.
-                    |chunk_range| -> Result<_, String> {
-                        let mut accs = make_accs();
-                        for chunk in &chunks[chunk_range] {
-                            let partial = gam_problem::with_nested_parallel(|| chunk_body(*chunk))?;
-                            for (l, r) in accs.iter_mut().zip(partial.iter()) {
+                gam_runtime::parallel::fan_out(|| {
+                    gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
+                        chunks.len(),
+                        chunk_rows,
+                        // Each chunk runs on a Rayon worker and issues `fast_ab` /
+                        // weighted-Gram GEMMs; pin their faer parallelism to
+                        // `Par::Seq` so they do not re-fan the global Rayon pool
+                        // against this already-parallel chunk fan-out. The serial
+                        // path above intentionally keeps top-level pool parallelism.
+                        |chunk_range| -> Result<_, String> {
+                            let mut accs = make_accs();
+                            for chunk in &chunks[chunk_range] {
+                                let partial =
+                                    gam_problem::with_nested_parallel(|| chunk_body(*chunk))?;
+                                for (l, r) in accs.iter_mut().zip(partial.iter()) {
+                                    l.add(r);
+                                }
+                            }
+                            Ok(accs)
+                        },
+                        |mut left, right| -> Result<_, String> {
+                            for (l, r) in left.iter_mut().zip(right.iter()) {
                                 l.add(r);
                             }
-                        }
-                        Ok(accs)
-                    },
-                    |mut left, right| -> Result<_, String> {
-                        for (l, r) in left.iter_mut().zip(right.iter()) {
-                            l.add(r);
-                        }
-                        Ok(left)
-                    },
-                )?
+                            Ok(left)
+                        },
+                    )
+                })?
                 .unwrap_or_else(make_accs)
             }
         } else {
@@ -3646,22 +3657,24 @@ impl BernoulliMarginalSlopeFamily {
                 }
                 accs
             } else {
-                gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
-                    weighted_rows.len(),
-                    |index_range| -> Result<_, String> {
-                        let mut accs = make_accs();
-                        for wr in &weighted_rows[index_range] {
-                            row_body(*wr, &mut accs)?;
-                        }
-                        Ok(accs)
-                    },
-                    |mut left, right| -> Result<_, String> {
-                        for (l, r) in left.iter_mut().zip(right.iter()) {
-                            l.add(r);
-                        }
-                        Ok(left)
-                    },
-                )?
+                gam_runtime::parallel::fan_out(|| {
+                    gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                        weighted_rows.len(),
+                        |index_range| -> Result<_, String> {
+                            let mut accs = make_accs();
+                            for wr in &weighted_rows[index_range] {
+                                row_body(*wr, &mut accs)?;
+                            }
+                            Ok(accs)
+                        },
+                        |mut left, right| -> Result<_, String> {
+                            for (l, r) in left.iter_mut().zip(right.iter()) {
+                                l.add(r);
+                            }
+                            Ok(left)
+                        },
+                    )
+                })?
                 .unwrap_or_else(make_accs)
             }
         };
@@ -4008,7 +4021,7 @@ impl BernoulliMarginalSlopeFamily {
             self.prewarm_flex_cell_bundle(block_states, cache, 21)?;
         }
         const ROW_PAR_MIN_ROWS: usize = 4_096;
-        let run_rows_serial = rayon::current_thread_index().is_some()
+        let run_rows_serial = !gam_runtime::parallel::at_top_level()
             || rayon::current_num_threads() <= 1
             || n_rows < ROW_PAR_MIN_ROWS;
 
@@ -4045,49 +4058,53 @@ impl BernoulliMarginalSlopeFamily {
                 }
                 accs
             } else {
-                gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
-                    weighted_rows.len(),
-                    |index_range| -> Result<_, String> {
-                        let mut accs = make_accs();
-                        for wr in &weighted_rows[index_range] {
-                            let row = wr.index;
-                            let w = wr.weight;
-                            let projections = unique_dirs
-                                .iter()
-                                .map(|direction| {
-                                    let q = self.marginal_design.dot_row_view(
-                                        row,
-                                        direction.slice(s![slices.marginal.clone()]),
-                                    );
-                                    let g = self.slope_design.dot_row_view(
-                                        row,
-                                        direction.slice(s![slices.slope.clone()]),
-                                    );
-                                    (q, g)
-                                })
-                                .collect::<Vec<_>>();
-                            let t = self.rigid_fourth_full_cached(block_states, cache, row)?;
-                            for (idx, (u_idx, v_idx)) in pair_indices.iter().copied().enumerate() {
-                                let (uq, ug) = projections[u_idx];
-                                let (vq, vg) = projections[v_idx];
-                                let f = contract_fourth_full(t, uq, ug, vq, vg);
-                                let mut f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
-                                if w != 1.0 {
-                                    f_arr.mapv_inplace(|value| value * w);
+                gam_runtime::parallel::fan_out(|| {
+                    gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                        weighted_rows.len(),
+                        |index_range| -> Result<_, String> {
+                            let mut accs = make_accs();
+                            for wr in &weighted_rows[index_range] {
+                                let row = wr.index;
+                                let w = wr.weight;
+                                let projections = unique_dirs
+                                    .iter()
+                                    .map(|direction| {
+                                        let q = self.marginal_design.dot_row_view(
+                                            row,
+                                            direction.slice(s![slices.marginal.clone()]),
+                                        );
+                                        let g = self.slope_design.dot_row_view(
+                                            row,
+                                            direction.slice(s![slices.slope.clone()]),
+                                        );
+                                        (q, g)
+                                    })
+                                    .collect::<Vec<_>>();
+                                let t = self.rigid_fourth_full_cached(block_states, cache, row)?;
+                                for (idx, (u_idx, v_idx)) in
+                                    pair_indices.iter().copied().enumerate()
+                                {
+                                    let (uq, ug) = projections[u_idx];
+                                    let (vq, vg) = projections[v_idx];
+                                    let f = contract_fourth_full(t, uq, ug, vq, vg);
+                                    let mut f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
+                                    if w != 1.0 {
+                                        f_arr.mapv_inplace(|value| value * w);
+                                    }
+                                    accs[idx].add_pullback(self, row, slices, primary, &f_arr);
                                 }
-                                accs[idx].add_pullback(self, row, slices, primary, &f_arr);
+                                bump_progress(&progress);
                             }
-                            bump_progress(&progress);
-                        }
-                        Ok(accs)
-                    },
-                    |mut left, right| -> Result<_, String> {
-                        for (l, r) in left.iter_mut().zip(right.iter()) {
-                            l.add(r);
-                        }
-                        Ok(left)
-                    },
-                )?
+                            Ok(accs)
+                        },
+                        |mut left, right| -> Result<_, String> {
+                            for (l, r) in left.iter_mut().zip(right.iter()) {
+                                l.add(r);
+                            }
+                            Ok(left)
+                        },
+                    )
+                })?
                 .unwrap_or_else(make_accs)
             }
         } else if run_rows_serial {
@@ -4123,50 +4140,52 @@ impl BernoulliMarginalSlopeFamily {
             }
             accs
         } else {
-            gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
-                weighted_rows.len(),
-                |index_range| -> Result<_, String> {
-                    let mut accs = make_accs();
-                    for wr in &weighted_rows[index_range] {
-                        let row = wr.index;
-                        let w = wr.weight;
-                        let row_dirs = unique_dirs
-                            .iter()
-                            .map(|direction| {
-                                self.row_primary_direction_from_flat(
-                                    row, slices, primary, direction,
-                                )
-                            })
-                            .collect::<Result<Vec<_>, String>>()?;
-                        let row_ctx = Self::row_ctx(cache, row);
-                        let row_pairs = pair_indices
-                            .iter()
-                            .map(|&(u_idx, v_idx)| (&row_dirs[u_idx], &row_dirs[v_idx]))
-                            .collect::<Vec<_>>();
-                        let fourths = self.row_primary_fourth_contracted_many(
-                            row,
-                            block_states,
-                            cache,
-                            row_ctx,
-                            &row_pairs,
-                        )?;
-                        for (idx, mut fourth) in fourths.into_iter().enumerate() {
-                            if w != 1.0 {
-                                fourth.mapv_inplace(|value| value * w);
+            gam_runtime::parallel::fan_out(|| {
+                gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                    weighted_rows.len(),
+                    |index_range| -> Result<_, String> {
+                        let mut accs = make_accs();
+                        for wr in &weighted_rows[index_range] {
+                            let row = wr.index;
+                            let w = wr.weight;
+                            let row_dirs = unique_dirs
+                                .iter()
+                                .map(|direction| {
+                                    self.row_primary_direction_from_flat(
+                                        row, slices, primary, direction,
+                                    )
+                                })
+                                .collect::<Result<Vec<_>, String>>()?;
+                            let row_ctx = Self::row_ctx(cache, row);
+                            let row_pairs = pair_indices
+                                .iter()
+                                .map(|&(u_idx, v_idx)| (&row_dirs[u_idx], &row_dirs[v_idx]))
+                                .collect::<Vec<_>>();
+                            let fourths = self.row_primary_fourth_contracted_many(
+                                row,
+                                block_states,
+                                cache,
+                                row_ctx,
+                                &row_pairs,
+                            )?;
+                            for (idx, mut fourth) in fourths.into_iter().enumerate() {
+                                if w != 1.0 {
+                                    fourth.mapv_inplace(|value| value * w);
+                                }
+                                accs[idx].add_pullback(self, row, slices, primary, &fourth);
                             }
-                            accs[idx].add_pullback(self, row, slices, primary, &fourth);
+                            bump_progress(&progress);
                         }
-                        bump_progress(&progress);
-                    }
-                    Ok(accs)
-                },
-                |mut left, right| -> Result<_, String> {
-                    for (l, r) in left.iter_mut().zip(right.iter()) {
-                        l.add(r);
-                    }
-                    Ok(left)
-                },
-            )?
+                        Ok(accs)
+                    },
+                    |mut left, right| -> Result<_, String> {
+                        for (l, r) in left.iter_mut().zip(right.iter()) {
+                            l.add(r);
+                        }
+                        Ok(left)
+                    },
+                )
+            })?
             .unwrap_or_else(make_accs)
         };
         log::debug!(

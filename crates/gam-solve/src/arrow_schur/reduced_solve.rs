@@ -432,12 +432,12 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
         // ranking is stable EXCEPT for candidates tying within the margin, where
         // the winner can flip; it is not an exact no-move guarantee (#1211). For
         // an exact-order guarantee, take the serial path. Stay in-place serial
-        // below the row floor and when already inside a rayon worker (the topology
+        // below the row floor and when nested (the topology
         // race fans candidates with `run_topology_race_parallel`) to avoid
         // nested-rayon oversubscription — the same guard the matvec uses.
         let n_rows = sys.rows.len();
         let parallel =
-            n_rows >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+            n_rows >= SCHUR_MATVEC_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
         if parallel {
             // Deterministic ordered fold: chunk partials hold `-Σ contribution`
             // over their rows, so `schur += partial` reproduces the serial
@@ -464,14 +464,16 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
                 },
             );
             if let TouchedPairFold::Chunked { partials } = fold {
-                let folded = fold_touched_pair_chunk_partials(
-                    sys,
-                    htt_factors,
-                    backend,
-                    kind,
-                    schur,
-                    partials,
-                );
+                let folded = gam_runtime::parallel::fan_out(|| {
+                    fold_touched_pair_chunk_partials(
+                        sys,
+                        htt_factors,
+                        backend,
+                        kind,
+                        schur,
+                        partials,
+                    )
+                });
                 drop(charge);
                 return folded;
             }
@@ -2070,9 +2072,9 @@ impl SaeResidentReducedSchur {
             ResidentRowFactor { di, y: y_flat }
         };
         let rows: Vec<ResidentRowFactor> =
-            if n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
+            if n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level() {
                 use rayon::prelude::*;
-                (0..n).into_par_iter().map(build_row).collect()
+                gam_runtime::parallel::fan_out(|| (0..n).into_par_iter().map(build_row).collect())
             } else {
                 (0..n).map(build_row).collect()
             };
@@ -2209,13 +2211,13 @@ pub(crate) fn schur_matvec<B: BatchedBlockSolver + Sync>(
     // (g·δ ≈ 0 — a non-descent direction that defeats the line search).
     out.fill(0.0);
     let k = sys.k;
-    // Top-level (not nested in a rayon worker) and big enough to amortize the
+    // At top level (not nested) and big enough to amortize the
     // fan-out: the single gate that authorizes BOTH the dense penalty-prologue
     // GEMV and the per-row point-elimination loop to go parallel. The topology
-    // race fans candidates with `run_topology_race_parallel`, so inside a worker
+    // race fans candidates with `run_topology_race_parallel`, so when nested
     // both stay sequential (no nested-rayon oversubscription).
     let parallel =
-        sys.rows.len() >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        sys.rows.len() >= SCHUR_MATVEC_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
     // Route the penalty-side (H_ββ + ridge·I) x product through the prologue:
     // no Arc-clone hot-path cost when penalty_op is None (falls back to hbb
     // inline); the dense fallback fans across cores at the wide SAE border (#1017).
@@ -5409,22 +5411,23 @@ impl JacobiPreconditioner {
             }
         };
         let n = sys.rows.len();
-        let parallel =
-            n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
         if parallel {
             use rayon::prelude::*;
             const CHUNK: usize = 64;
-            let partials: Vec<Array1<f64>> = (0..n)
-                .into_par_iter()
-                .chunks(CHUNK)
-                .map(|idxs| {
-                    let mut diag_part = Array1::<f64>::zeros(k);
-                    for i in idxs {
-                        row_into(i, &sys.rows[i], &mut diag_part);
-                    }
-                    diag_part
-                })
-                .collect();
+            let partials: Vec<Array1<f64>> = gam_runtime::parallel::fan_out(|| {
+                (0..n)
+                    .into_par_iter()
+                    .chunks(CHUNK)
+                    .map(|idxs| {
+                        let mut diag_part = Array1::<f64>::zeros(k);
+                        for i in idxs {
+                            row_into(i, &sys.rows[i], &mut diag_part);
+                        }
+                        diag_part
+                    })
+                    .collect()
+            });
             // Deterministic ordered reduction: fold chunk partials left-to-right.
             for part in &partials {
                 for a in 0..k {
@@ -5559,26 +5562,27 @@ impl JacobiPreconditioner {
                 }
             }
         };
-        let parallel =
-            n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
         if parallel {
             use rayon::prelude::*;
             const CHUNK: usize = 64;
-            let partials: Vec<Array1<f64>> = (0..n)
-                .into_par_iter()
-                .chunks(CHUNK)
-                .map(|idxs| {
-                    let mut diag_part = Array1::<f64>::zeros(k);
-                    let mut col_dot = vec![0.0_f64; p];
-                    let slice = diag_part
-                        .as_slice_mut()
-                        .expect("diag_part must be contiguous");
-                    for i in idxs {
-                        row_into(i, slice, &mut col_dot);
-                    }
-                    diag_part
-                })
-                .collect();
+            let partials: Vec<Array1<f64>> = gam_runtime::parallel::fan_out(|| {
+                (0..n)
+                    .into_par_iter()
+                    .chunks(CHUNK)
+                    .map(|idxs| {
+                        let mut diag_part = Array1::<f64>::zeros(k);
+                        let mut col_dot = vec![0.0_f64; p];
+                        let slice = diag_part
+                            .as_slice_mut()
+                            .expect("diag_part must be contiguous");
+                        for i in idxs {
+                            row_into(i, slice, &mut col_dot);
+                        }
+                        diag_part
+                    })
+                    .collect()
+            });
             // Deterministic ordered reduction: fold chunk partials left-to-right
             // (each partial already holds the per-row terms subtracted, so add
             // them into `diag` in chunk order to mirror the serial subtraction).
@@ -5704,30 +5708,31 @@ impl JacobiPreconditioner {
         };
 
         let n = resident.rows.len();
-        let parallel =
-            n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
         if parallel {
             let n_blocks = block_offsets.len();
             let block_dims: Vec<usize> = block_offsets.iter().map(|r| r.end - r.start).collect();
-            let Ok(()) = fold_row_chunk_partials(
-                n,
-                || {
-                    block_dims
-                        .iter()
-                        .map(|&b| Array2::<f64>::zeros((b, b)))
-                        .collect::<Vec<_>>()
-                },
-                |local| local.iter_mut().for_each(|block| block.fill(0.0)),
-                |i, local| {
-                    row_into(i, local);
-                    Ok::<(), std::convert::Infallible>(())
-                },
-                |local| {
-                    for bidx in 0..n_blocks {
-                        schur_blocks[bidx] += &local[bidx];
-                    }
-                },
-            );
+            let Ok(()) = gam_runtime::parallel::fan_out(|| {
+                fold_row_chunk_partials(
+                    n,
+                    || {
+                        block_dims
+                            .iter()
+                            .map(|&b| Array2::<f64>::zeros((b, b)))
+                            .collect::<Vec<_>>()
+                    },
+                    |local| local.iter_mut().for_each(|block| block.fill(0.0)),
+                    |i, local| {
+                        row_into(i, local);
+                        Ok::<(), std::convert::Infallible>(())
+                    },
+                    |local| {
+                        for bidx in 0..n_blocks {
+                            schur_blocks[bidx] += &local[bidx];
+                        }
+                    },
+                )
+            });
         } else {
             for row in 0..n {
                 row_into(row, &mut schur_blocks);
@@ -5861,31 +5866,32 @@ impl JacobiPreconditioner {
         // triangular solves — the preconditioner build's whole per-row cost at
         // the SAE LLM shape (#1017), and the rows are independent. Fan over fixed
         // row chunks above the threshold, staying serial for the handful-of-rows
-        // non-SAE callers and inside a rayon worker (topology-race nesting guard)
+        // non-SAE callers and when nested (topology-race nesting guard)
         // — the same gate `schur_matvec` uses.
         let n = sys.rows.len();
-        let parallel =
-            n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
         if parallel {
             let n_blocks = block_offsets.len();
             let block_dims: Vec<usize> = block_offsets.iter().map(|r| r.end - r.start).collect();
             // Deterministic ordered reduction: fold chunk partials left-to-right.
-            fold_row_chunk_partials(
-                n,
-                || {
-                    block_dims
-                        .iter()
-                        .map(|&b| Array2::<f64>::zeros((b, b)))
-                        .collect::<Vec<_>>()
-                },
-                |local| local.iter_mut().for_each(|block| block.fill(0.0)),
-                |i, local| row_into(i, &sys.rows[i], local),
-                |local| {
-                    for bidx in 0..n_blocks {
-                        schur_blocks[bidx] += &local[bidx];
-                    }
-                },
-            )?;
+            gam_runtime::parallel::fan_out(|| {
+                fold_row_chunk_partials(
+                    n,
+                    || {
+                        block_dims
+                            .iter()
+                            .map(|&b| Array2::<f64>::zeros((b, b)))
+                            .collect::<Vec<_>>()
+                    },
+                    |local| local.iter_mut().for_each(|block| block.fill(0.0)),
+                    |i, local| row_into(i, &sys.rows[i], local),
+                    |local| {
+                        for bidx in 0..n_blocks {
+                            schur_blocks[bidx] += &local[bidx];
+                        }
+                    },
+                )
+            })?;
         } else {
             for (i, row) in sys.rows.iter().enumerate() {
                 row_into(i, row, &mut schur_blocks)?;
@@ -6134,18 +6140,20 @@ pub(crate) fn assemble_local_schur_block<B: BatchedBlockSolver + Sync>(
         }
     };
     let n = sys.rows.len();
-    let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+    let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
     if parallel {
-        let Ok(()) = fold_row_chunk_partials(
-            n,
-            || Array2::<f64>::zeros((b, b)),
-            |local| local.fill(0.0),
-            |i, local| {
-                cluster_row_into(i, &sys.rows[i], local);
-                Ok::<(), std::convert::Infallible>(())
-            },
-            |local| s_block += local,
-        );
+        let Ok(()) = gam_runtime::parallel::fan_out(|| {
+            fold_row_chunk_partials(
+                n,
+                || Array2::<f64>::zeros((b, b)),
+                |local| local.fill(0.0),
+                |i, local| {
+                    cluster_row_into(i, &sys.rows[i], local);
+                    Ok::<(), std::convert::Infallible>(())
+                },
+                |local| s_block += local,
+            )
+        });
     } else {
         for (row_idx, row) in sys.rows.iter().enumerate() {
             cluster_row_into(row_idx, row, &mut s_block);

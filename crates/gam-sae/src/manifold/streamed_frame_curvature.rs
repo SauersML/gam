@@ -342,12 +342,14 @@ impl StreamedFrameCurvature for StreamedFrameCurvatureOperator<'_> {
                     }
                 }
             };
-            if count > 1 && rayon::current_thread_index().is_none() {
+            if count > 1 && gam_runtime::parallel::at_top_level() {
                 use rayon::prelude::*;
-                columns
-                    .par_chunks_mut(rank)
-                    .enumerate()
-                    .for_each(|(j, slot)| contract(j, slot));
+                gam_runtime::parallel::fan_out(|| {
+                    columns
+                        .par_chunks_mut(rank)
+                        .enumerate()
+                        .for_each(|(j, slot)| contract(j, slot))
+                });
             } else {
                 for (j, slot) in columns.chunks_mut(rank).enumerate() {
                     contract(j, slot);

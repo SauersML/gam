@@ -1018,7 +1018,7 @@ impl BernoulliRigidRowKernel {
         };
 
         let run_serial =
-            rayon::current_thread_index().is_some() || rayon::current_num_threads() <= 1;
+            !gam_runtime::parallel::at_top_level() || rayon::current_num_threads() <= 1;
         if run_serial {
             let mut acc = BernoulliBlockHessianAccumulator::new(slices);
             for chunk in chunks {
@@ -1026,21 +1026,23 @@ impl BernoulliRigidRowKernel {
             }
             return Ok(acc.to_dense(slices));
         }
-        let acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
-            chunks.len(),
-            chunk_rows,
-            |range| -> Result<BernoulliBlockHessianAccumulator, String> {
-                let mut acc = BernoulliBlockHessianAccumulator::new(slices);
-                for chunk in &chunks[range] {
-                    acc.add(&chunk_body(*chunk)?);
-                }
-                Ok(acc)
-            },
-            |mut left, right| -> Result<BernoulliBlockHessianAccumulator, String> {
-                left.add(&right);
-                Ok(left)
-            },
-        )?
+        let acc = gam_runtime::parallel::fan_out(|| {
+            gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
+                chunks.len(),
+                chunk_rows,
+                |range| -> Result<BernoulliBlockHessianAccumulator, String> {
+                    let mut acc = BernoulliBlockHessianAccumulator::new(slices);
+                    for chunk in &chunks[range] {
+                        acc.add(&chunk_body(*chunk)?);
+                    }
+                    Ok(acc)
+                },
+                |mut left, right| -> Result<BernoulliBlockHessianAccumulator, String> {
+                    left.add(&right);
+                    Ok(left)
+                },
+            )
+        })?
         .unwrap_or_else(|| BernoulliBlockHessianAccumulator::new(slices));
         Ok(acc.to_dense(slices))
     }
@@ -1107,12 +1109,12 @@ impl BernoulliRigidRowKernel {
         // Parallel over chunks: each chunk body is an independent BLAS-3 GEMM
         // pair over `CHUNK_ROWS` rows reading the already-built shared third
         // tensor, so the fold has no nested cache contention. Use a serial
-        // chunk loop when already inside a Rayon worker (the outer
+        // chunk loop when not at top level (the outer
         // joint-Newton / ψ-sweep par_iter holds the pool) so a nested
         // `into_par_iter` does not starve the pool — the same guard the batched
         // builder uses.
         let run_serial =
-            rayon::current_thread_index().is_some() || rayon::current_num_threads() <= 1;
+            !gam_runtime::parallel::at_top_level() || rayon::current_num_threads() <= 1;
         if run_serial {
             let mut acc = BernoulliBlockHessianAccumulator::new(slices);
             for chunk in chunks {
@@ -1121,22 +1123,24 @@ impl BernoulliRigidRowKernel {
             }
             return Ok(acc.to_dense(slices));
         }
-        let acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
-            chunks.len(),
-            chunk_rows,
-            |range| -> Result<BernoulliBlockHessianAccumulator, String> {
-                let mut acc = BernoulliBlockHessianAccumulator::new(slices);
-                for chunk in &chunks[range] {
-                    let partial = chunk_body(*chunk)?;
-                    acc.add(&partial);
-                }
-                Ok(acc)
-            },
-            |mut left, right| -> Result<BernoulliBlockHessianAccumulator, String> {
-                left.add(&right);
-                Ok(left)
-            },
-        )?
+        let acc = gam_runtime::parallel::fan_out(|| {
+            gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
+                chunks.len(),
+                chunk_rows,
+                |range| -> Result<BernoulliBlockHessianAccumulator, String> {
+                    let mut acc = BernoulliBlockHessianAccumulator::new(slices);
+                    for chunk in &chunks[range] {
+                        let partial = chunk_body(*chunk)?;
+                        acc.add(&partial);
+                    }
+                    Ok(acc)
+                },
+                |mut left, right| -> Result<BernoulliBlockHessianAccumulator, String> {
+                    left.add(&right);
+                    Ok(left)
+                },
+            )
+        })?
         .unwrap_or_else(|| BernoulliBlockHessianAccumulator::new(slices));
         Ok(acc.to_dense(slices))
     }
@@ -1285,14 +1289,16 @@ impl BernoulliRigidRowKernel {
 
         let p_total = p_m + p_g;
         let run_serial =
-            rayon::current_thread_index().is_some() || rayon::current_num_threads() <= 1;
+            !gam_runtime::parallel::at_top_level() || rayon::current_num_threads() <= 1;
         if run_serial {
             (0..p_total).map(build_axis).collect::<Result<Vec<_>, _>>()
         } else {
-            (0..p_total)
-                .into_par_iter()
-                .map(build_axis)
-                .collect::<Result<Vec<_>, _>>()
+            gam_runtime::parallel::fan_out(|| {
+                (0..p_total)
+                    .into_par_iter()
+                    .map(build_axis)
+                    .collect::<Result<Vec<_>, _>>()
+            })
         }
     }
 
@@ -1416,14 +1422,16 @@ impl BernoulliRigidRowKernel {
 
         let p_total = p_m + p_g;
         let run_serial =
-            rayon::current_thread_index().is_some() || rayon::current_num_threads() <= 1;
+            !gam_runtime::parallel::at_top_level() || rayon::current_num_threads() <= 1;
         if run_serial {
             (0..p_total).map(build_axis).collect::<Result<Vec<_>, _>>()
         } else {
-            (0..p_total)
-                .into_par_iter()
-                .map(build_axis)
-                .collect::<Result<Vec<_>, _>>()
+            gam_runtime::parallel::fan_out(|| {
+                (0..p_total)
+                    .into_par_iter()
+                    .map(build_axis)
+                    .collect::<Result<Vec<_>, _>>()
+            })
         }
     }
 }

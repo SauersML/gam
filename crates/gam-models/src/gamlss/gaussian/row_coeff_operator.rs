@@ -282,14 +282,16 @@ impl RowCoeffOperator {
                 }
             }
         };
-        if rayon::current_thread_index().is_none() && self.nrows > rows_per_chunk {
-            grams
-                .axis_chunks_iter_mut(Axis(0), rows_per_chunk)
-                .into_par_iter()
-                .enumerate()
-                .for_each(|(chunk_idx, out_chunk)| {
-                    fill_chunk(chunk_idx * rows_per_chunk, out_chunk)
-                });
+        if gam_runtime::parallel::at_top_level() && self.nrows > rows_per_chunk {
+            gam_runtime::parallel::fan_out(|| {
+                grams
+                    .axis_chunks_iter_mut(Axis(0), rows_per_chunk)
+                    .into_par_iter()
+                    .enumerate()
+                    .for_each(|(chunk_idx, out_chunk)| {
+                        fill_chunk(chunk_idx * rows_per_chunk, out_chunk)
+                    })
+            });
         } else {
             for start in (0..self.nrows).step_by(rows_per_chunk) {
                 let end = (start + rows_per_chunk).min(self.nrows);
@@ -651,14 +653,16 @@ impl DesignTwoBlockRowCoeffOperator {
                 out_chunk[[local_i, 2]] = bb;
             }
         };
-        if rayon::current_thread_index().is_none() && self.nrows > rows_per_chunk {
-            grams
-                .axis_chunks_iter_mut(Axis(0), rows_per_chunk)
-                .into_par_iter()
-                .enumerate()
-                .for_each(|(chunk_idx, out_chunk)| {
-                    fill_chunk(chunk_idx * rows_per_chunk, out_chunk)
-                });
+        if gam_runtime::parallel::at_top_level() && self.nrows > rows_per_chunk {
+            gam_runtime::parallel::fan_out(|| {
+                grams
+                    .axis_chunks_iter_mut(Axis(0), rows_per_chunk)
+                    .into_par_iter()
+                    .enumerate()
+                    .for_each(|(chunk_idx, out_chunk)| {
+                        fill_chunk(chunk_idx * rows_per_chunk, out_chunk)
+                    })
+            });
         } else {
             for start in (0..self.nrows).step_by(rows_per_chunk) {
                 let end = (start + rows_per_chunk).min(self.nrows);

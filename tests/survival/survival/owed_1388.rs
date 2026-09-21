@@ -143,8 +143,8 @@ fn assert_underdetermined_joint_canonicalizes(n: usize, n_levels: usize, stack_b
     // A genuine unbounded / data-proportional recursion in the canonicalisation
     // fan-out (failure #2) would overflow this bounded worker and abort it; a
     // bounded, iterative fan-out completes well within it. (Production gives
-    // this path a 64 MiB Rayon worker / 512 MiB CLI stack; the tight bound here
-    // is the active guard.)
+    // this path a 64 MiB pool worker, `gam::parallel::WORKER_STACK_SIZE`; the
+    // tight bound here is the active guard.)
     let worker = std::thread::Builder::new()
         .name("owed-1388-canon".to_string())
         .stack_size(stack_bytes)

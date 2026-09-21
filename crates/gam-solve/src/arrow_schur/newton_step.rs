@@ -1463,31 +1463,33 @@ pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
     // `collect` + in-order fold reproduce the serial push order bit-for-bit
     // (deterministic assembly — no cross-row reduction). #1557 — pin the nested
     // faer eigendecomp GEMMs to `Par::Seq` inside each row worker.
-    let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+    let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
     let results = if parallel {
         use rayon::prelude::*;
-        (0..n)
-            .into_par_iter()
-            .map(|row_idx| {
-                gam_problem::with_nested_parallel(|| {
-                    factor_one_row_result(
-                        &sys.rows[row_idx],
-                        ridge_t,
-                        sys.row_dims[row_idx],
-                        row_idx,
-                        evidence_factorization,
-                        sys.row_gauge_deflation
-                            .as_ref()
-                            .map_or(&[], |deflation| deflation.row(row_idx)),
-                        true,
-                        refuse_resolved_indefinite,
-                        sys.exact_a_classification
-                            .as_ref()
-                            .and_then(|geometry| geometry.rows.get(row_idx)),
-                    )
+        gam_runtime::parallel::fan_out(|| {
+            (0..n)
+                .into_par_iter()
+                .map(|row_idx| {
+                    gam_problem::with_nested_parallel(|| {
+                        factor_one_row_result(
+                            &sys.rows[row_idx],
+                            ridge_t,
+                            sys.row_dims[row_idx],
+                            row_idx,
+                            evidence_factorization,
+                            sys.row_gauge_deflation
+                                .as_ref()
+                                .map_or(&[], |deflation| deflation.row(row_idx)),
+                            true,
+                            refuse_resolved_indefinite,
+                            sys.exact_a_classification
+                                .as_ref()
+                                .and_then(|geometry| geometry.rows.get(row_idx)),
+                        )
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, ArrowSchurError>>()?
+                .collect::<Result<Vec<_>, ArrowSchurError>>()
+        })?
     } else {
         let mut results = Vec::with_capacity(n);
         for (row_idx, row) in sys.rows.iter().enumerate() {
@@ -1589,10 +1591,10 @@ fn back_substitute_rows<B: BatchedBlockSolver + Sync>(
     // `Δt_i = -(H_tt^(i))⁻¹ (g_t^(i) + H_tβ^(i) Δβ)` is row-block-independent:
     // each row writes only its own contiguous `delta_t[row_offsets[i]..]`
     // segment. Fan out over the SAE LLM row count with the same nesting guard
-    // (`rayon::current_thread_index()`) and row-min gate the `schur_matvec` hot
+    // (`gam_runtime::parallel::at_top_level()`) and row-min gate the `schur_matvec` hot
     // loop uses (#1017), so the topology race's outer candidate fan-out is not
     // oversubscribed. Disjoint writes ⇒ no reduction, no run-to-run drift.
-    let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+    let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
     let solve_row = |i: usize, out: &mut [f64]| {
         let di = sys.row_dims[i];
         assert!(
@@ -1642,14 +1644,16 @@ fn back_substitute_rows<B: BatchedBlockSolver + Sync>(
             segments.push((start, seg));
             prev_end = row_offsets[end];
         }
-        segments.into_par_iter().for_each(|(start, seg)| {
-            let end = (start + CHUNK).min(n);
-            let mut local = 0usize;
-            for i in start..end {
-                let di = sys.row_dims[i];
-                solve_row(i, &mut seg[local..local + di]);
-                local += di;
-            }
+        gam_runtime::parallel::fan_out(|| {
+            segments.into_par_iter().for_each(|(start, seg)| {
+                let end = (start + CHUNK).min(n);
+                let mut local = 0usize;
+                for i in start..end {
+                    let di = sys.row_dims[i];
+                    solve_row(i, &mut seg[local..local + di]);
+                    local += di;
+                }
+            })
         });
     } else {
         for i in 0..n {
@@ -1792,28 +1796,30 @@ pub fn arrow_operator_apply(
     // penalty + ridge prologue) in chunk order — bit-identical run-to-run (the
     // #1017 determinism gate). Used by the iterative-refinement residual /
     // backward-error certificate, so it runs once per refinement pass.
-    let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+    let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
     if parallel {
         use rayon::prelude::*;
         const CHUNK: usize = 64;
-        let chunks: Vec<(usize, Vec<f64>, Array1<f64>)> = (0..n)
-            .into_par_iter()
-            .chunks(CHUNK)
-            .map(|idxs| {
-                let first = idxs[0];
-                let last = idxs[idxs.len() - 1];
-                let seg_start = sys.row_offsets[first];
-                let seg_end = sys.row_offsets[last] + sys.row_dims[last];
-                let mut seg = vec![0.0_f64; seg_end - seg_start];
-                let mut acc = Array1::<f64>::zeros(sys.k);
-                for i in idxs {
-                    cross_row_matvec_row_into(
-                        sys, ridge_t, i, x_t, x_beta, seg_start, &mut seg, &mut acc,
-                    );
-                }
-                (seg_start, seg, acc)
-            })
-            .collect();
+        let chunks: Vec<(usize, Vec<f64>, Array1<f64>)> = gam_runtime::parallel::fan_out(|| {
+            (0..n)
+                .into_par_iter()
+                .chunks(CHUNK)
+                .map(|idxs| {
+                    let first = idxs[0];
+                    let last = idxs[idxs.len() - 1];
+                    let seg_start = sys.row_offsets[first];
+                    let seg_end = sys.row_offsets[last] + sys.row_dims[last];
+                    let mut seg = vec![0.0_f64; seg_end - seg_start];
+                    let mut acc = Array1::<f64>::zeros(sys.k);
+                    for i in idxs {
+                        cross_row_matvec_row_into(
+                            sys, ridge_t, i, x_t, x_beta, seg_start, &mut seg, &mut acc,
+                        );
+                    }
+                    (seg_start, seg, acc)
+                })
+                .collect()
+        });
         for (seg_start, seg, acc) in &chunks {
             for (o, v) in seg.iter().enumerate() {
                 y_t[seg_start + o] = *v;
@@ -2359,25 +2365,27 @@ pub(crate) fn reduced_rhs_beta<B: BatchedBlockSolver + Sync>(
     // already fans out (#1017): each row contributes an independent length-`K`
     // vector. Reuse the identical deterministic chunk-fold so the f64 reduction
     // is bit-identical run-to-run (the topology-candidate ranking gate must not
-    // move), and the identical nesting guard (`rayon::current_thread_index()`)
+    // move), and the identical nesting guard (`gam_runtime::parallel::at_top_level()`)
     // so the topology race's outer fan-out is not oversubscribed.
-    let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+    let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
     if parallel {
         use rayon::prelude::*;
         const CHUNK: usize = 64;
-        let partials: Vec<Array1<f64>> = (0..n)
-            .into_par_iter()
-            .chunks(CHUNK)
-            .map(|idxs| {
-                let mut acc = Array1::<f64>::zeros(k);
-                for i in idxs {
-                    let row = &sys.rows[i];
-                    let v = backend.solve_block_vector(htt_factors.factor(i), row.gt.view());
-                    sys_htbeta_accumulate_transpose(sys, i, row, v.view(), &mut acc);
-                }
-                acc
-            })
-            .collect();
+        let partials: Vec<Array1<f64>> = gam_runtime::parallel::fan_out(|| {
+            (0..n)
+                .into_par_iter()
+                .chunks(CHUNK)
+                .map(|idxs| {
+                    let mut acc = Array1::<f64>::zeros(k);
+                    for i in idxs {
+                        let row = &sys.rows[i];
+                        let v = backend.solve_block_vector(htt_factors.factor(i), row.gt.view());
+                        sys_htbeta_accumulate_transpose(sys, i, row, v.view(), &mut acc);
+                    }
+                    acc
+                })
+                .collect()
+        });
         for acc in &partials {
             for j in 0..k {
                 rhs_beta[j] += acc[j];

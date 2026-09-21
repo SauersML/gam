@@ -5136,5 +5136,13 @@
     },
     "reason": "Delete the response-aware anisotropy seed nudge (#2902 row `clamp(+-MAX_NUDGE)`): a per-axis seed shift clamped to a hand-picked ln 2 box, added in #1376 to steer the kappa/anisotropy optimizer away from a symmetric start that the then-mis-centered psi gradient could not leave. The exact centered psi gradient (#1376 root fix) makes the seed a plain starting point of a gradient optimizer, so the bounded response heuristic is an unnecessary knob; SPEC: 'Hand-supplied search boxes or bounds are never allowed.' and 'In general, do not paper over solver issues.'",
     "evidence": "git grep -n 'response_aware\\|MAX_NUDGE' at f4a293a63f finds only the two definitions and their doc in term_specs.rs, the single call in fit_orchestration/drivers/spatial_optimization.rs (removed here) and the spec_ban_ledger row (removed here). Anisotropy recovery tests aniso_matern_full_outer_loop_recovers_planted_signal_r2, aniso_matern_recovery_ablation_eta_direction_robust_across_penalty, aniso_matern_recovers_signal_axis run on this branch via focused-rust-proof."
+  },
+  {
+    "base": "ffc9c29f9e1cf7f1f4dd20e20a3459cbc947dd58",
+    "removed": {
+      "crates/gam-linalg/src/parallel.rs::run_on_single_worker_pool": 1
+    },
+    "reason": "PKG-01 fork safety (#3189): gam no longer builds rayon's global pool, which a fork()ed child cannot rebuild. run_on_single_worker_pool moved a driver onto a one-thread global pool; every entry point now runs on the one process worker pool in gam_runtime::parallel (parallel::install), which is rebuilt in a forked child.",
+    "evidence": "No source reference to run_on_single_worker_pool remains. tests/fork_safety.rs fits in a forked child after the parent used the pool; the multistart lane tests (multistart_tests.rs) run the lanes as tasks of the caller's pool through parallel::fan_out, and a_lane_refused_beside_a_live_search_retires_at_once_instead_of_waiting_2359 pins the non-blocking admission those pool-task lanes need."
   }
 ]
