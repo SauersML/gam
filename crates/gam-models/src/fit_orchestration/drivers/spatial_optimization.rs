@@ -4470,6 +4470,47 @@ pub struct ExactJointEfsEvaluation<M> {
     pub mode: M,
 }
 
+/// Why an exact-joint evaluation produced no evaluation at this θ.
+///
+/// A custom-family inner solve's refusal is carried whole. Its certificate
+/// names what would fix the trial point: a descending ray a block's penalty
+/// closes at a named log-strength step. The outer startup restores such a seed
+/// from that certificate (#2695). Flattened to its message, the certificate was
+/// unreadable there, so the only derived seed was refused even though the
+/// refusal named its own remedy (#3467).
+#[derive(Debug)]
+pub enum ExactJointRefusal {
+    CustomFamily(gam_problem::CustomFamilyError),
+    Reason(String),
+}
+
+impl From<gam_problem::CustomFamilyError> for ExactJointRefusal {
+    fn from(error: gam_problem::CustomFamilyError) -> Self {
+        Self::CustomFamily(error)
+    }
+}
+
+impl From<String> for ExactJointRefusal {
+    fn from(reason: String) -> Self {
+        Self::Reason(reason)
+    }
+}
+
+impl ExactJointRefusal {
+    /// The outer objective's typed error for this refusal. The solver's own
+    /// error keeps its variant, so `is_trial_point_infeasible` and the startup
+    /// ray restoration read it; a reason-only refusal is a refusal at this
+    /// trial point.
+    fn into_trial_error(self, context: &str) -> EstimationError {
+        match self {
+            Self::CustomFamily(error) => EstimationError::CustomFamily(error),
+            Self::Reason(reason) => EstimationError::TrialPointRefused {
+                reason: format!("{context}: {reason}"),
+            },
+        }
+    }
+}
+
 pub enum SpatialFitProvenance<'a, M> {
     NoOuterOptimization,
     Certified {
@@ -5026,6 +5067,88 @@ mod penalty_alignment_2953_tests {
 /// search as an active constraint the criterion wants to cross — and a domain
 /// read off the term's own spectrum has no wall for an incumbent to sit on.
 #[cfg(test)]
+mod exact_joint_refusal_3467_tests {
+    use super::*;
+    use gam_problem::{
+        CustomFamilyError, DescendingRayExit, InnerConvergenceTerminalState,
+        JointNewtonTerminalReason, RayRestoration,
+    };
+
+    /// The #3467 refusal: the time block's penalty closes the ray the inner
+    /// solve stalled on at `rho[0..1] += 4.3551`.
+    fn stalled_on_closable_ray() -> CustomFamilyError {
+        CustomFamilyError::InnerSolveNotConverged {
+            cycles: 44,
+            terminal: Some(InnerConvergenceTerminalState::JointNewton {
+                cycle: 43,
+                stationarity_residual: 2.667373e3,
+                residual_tol: 3.412203e-3,
+                stationarity_scale: 1.0,
+                step_inf: 1.305e-4,
+                step_tol: 1.0e-8,
+                resolvable_negative_curvature: false,
+                best_stationarity_residual: 2.667373e3,
+                cycles_since_best_residual: 0,
+                termination_reason: JointNewtonTerminalReason::StalledOnDescendingRay {
+                    residual: 2.735813e3,
+                    residual_tol: 3.375449e-3,
+                    cycles: 44,
+                    ray: RayRestoration {
+                        block: 0,
+                        rho_first: 0,
+                        rho_count: 1,
+                        log_strength_ratio: 4.3551,
+                        likelihood_slope: -3.643e-2,
+                        penalty_slope: 4.677e-4,
+                        block_step_inf: 1.305e-4,
+                        direction: std::sync::Arc::from(vec![1.0, -0.5]),
+                    },
+                },
+            }),
+            kkt_residual: None,
+            kkt_tol: None,
+            theta_dim: 2,
+            rho_dim: 1,
+            psi_dim: 0,
+            cycle_budget: Some(44),
+            carrying_block: None,
+        }
+    }
+
+    #[test]
+    fn a_solver_refusal_reaches_the_outer_objective_with_its_ray_3467() {
+        let refusal = ExactJointRefusal::from(stalled_on_closable_ray());
+        let error = refusal.into_trial_error("n-block exact-joint spatial evaluation failed");
+        assert!(
+            error.is_trial_point_infeasible(),
+            "a stalled inner solve is a refusal at this trial point: {error}"
+        );
+        let EstimationError::CustomFamily(solver) = &error else {
+            panic!("the solver's refusal must keep its variant, got {error:?}");
+        };
+        let Some(DescendingRayExit::Closable(ray)) = solver.descending_ray_exit() else {
+            panic!("the startup ray restoration must read the closable ray, got {error:?}");
+        };
+        assert_eq!((ray.block, ray.rho_first, ray.rho_count), (0, 0, 1));
+        assert_eq!(ray.log_strength_ratio, 4.3551);
+    }
+
+    #[test]
+    fn a_reason_only_refusal_is_a_trial_point_refusal_3467() {
+        let error = ExactJointRefusal::from("no mode at this theta".to_string())
+            .into_trial_error("n-block exact-joint spatial cost evaluation failed");
+        assert!(error.is_trial_point_infeasible());
+        let EstimationError::TrialPointRefused { reason } = &error else {
+            panic!("a reason-only refusal is a trial-point refusal, got {error:?}");
+        };
+        assert_eq!(
+            reason,
+            "n-block exact-joint spatial cost evaluation failed: no mode at this theta"
+        );
+    }
+}
+
+#[cfg(test)]
 mod joint_rho_resolvability_domain_tests {
     use super::*;
 
@@ -5306,12 +5429,12 @@ where
         &[TermCollectionDesign],
         gam_solve::estimate::reml::reml_outer_engine::EvalMode,
         Option<Mode>,
-    ) -> Result<ExactJointEvaluation<Mode>, String>,
+    ) -> Result<ExactJointEvaluation<Mode>, ExactJointRefusal>,
     ExactEfsFn: FnMut(
         &Array1<f64>,
         &[TermCollectionSpec],
         &[TermCollectionDesign],
-    ) -> Result<ExactJointEfsEvaluation<Mode>, String>,
+    ) -> Result<ExactJointEfsEvaluation<Mode>, ExactJointRefusal>,
     SeedFn: FnMut(&Array1<f64>) -> Result<gam_solve::rho_optimizer::SeedOutcome, EstimationError>,
 {
     let n_blocks = block_specs.len();
@@ -5722,9 +5845,7 @@ where
                 // `RemlOptimizationFailed`, `is_trial_point_infeasible`
                 // answered false and `into_objective_error` graded it Fatal,
                 // aborting the fit instead of the trial (#2627).
-                Err(err) => Err(EstimationError::TrialPointRefused {
-                    reason: format!("n-block exact-joint spatial evaluation failed: {err}"),
-                }),
+                Err(err) => Err(err.into_trial_error("n-block exact-joint spatial evaluation failed")),
             }
         };
 
@@ -5781,11 +5902,9 @@ where
                         ctx.cache.store_cost_only(theta, cost);
                         Ok(cost)
                     }
-                    Err(err) => Err(EstimationError::TrialPointRefused {
-                        reason: format!(
-                            "n-block exact-joint spatial cost evaluation failed: {err}"
-                        ),
-                    }),
+                    Err(err) => Err(err.into_trial_error(
+                        "n-block exact-joint spatial cost evaluation failed",
+                    )),
                 }
             },
             |ctx: &mut &mut NBlockExactJointState<'_, Mode>, theta: &Array1<f64>| {
@@ -5824,8 +5943,8 @@ where
                         elapsed_s,
                     );
                     let ExactJointEfsEvaluation { evaluation, mode } =
-                        eval_result.map_err(|reason| EstimationError::TrialPointRefused {
-                            reason,
+                        eval_result.map_err(|err| {
+                            err.into_trial_error("n-block exact-joint spatial EFS evaluation failed")
                         })?;
                     // An EFS solve can select a different coefficient mode at
                     // the same theta.  Revoke any derivative memo assembled

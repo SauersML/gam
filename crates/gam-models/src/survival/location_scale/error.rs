@@ -81,6 +81,14 @@ impl From<String> for SurvivalLocationScaleError {
     }
 }
 
+impl From<SurvivalLocationScaleError> for crate::fit_orchestration::drivers::ExactJointRefusal {
+    /// This module's own refusals carry only a reason; the inner solver's
+    /// typed refusal reaches the exact-joint driver separately, whole.
+    fn from(error: SurvivalLocationScaleError) -> Self {
+        Self::Reason(error.to_string())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Overflow-safe arithmetic for the survival exact-Newton chain
 // ---------------------------------------------------------------------------

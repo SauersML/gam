@@ -2227,11 +2227,17 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 let tolerance_options =
                     joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
                 let outer_options = crate::outer_subsample::exact_outer_options(&tolerance_options);
-                let cycle_budget_evidence = || {
-                    format!(
-                        "inner cycle budget inputs: base={}",
+                // The solver's refusal travels typed: its certificate (a ray a
+                // block's penalty closes, #2695) is what the outer startup
+                // restores the seed from, and what the arming lifecycle reads
+                // (#979). A message would carry neither (#3467).
+                let refuse = |error: gam_problem::CustomFamilyError| {
+                    log::debug!(
+                        "[survival-marginal-slope/outer-eval] refused at inner cycle budget {}: {error}",
                         outer_options.inner_max_cycles,
-                    )
+                    );
+                    outer_refusal_evidence.replace(error.jeffreys_arming_evidence());
+                    ExactJointRefusal::from(error)
                 };
                 let selection = if let Some(value_selection) = owned_value_mode {
                     log::debug!(
@@ -2246,10 +2252,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                         value_selection,
                         effective_mode,
                     )
-                    .map_err(|error| {
-                        outer_refusal_evidence.replace(error.jeffreys_arming_evidence());
-                        format!("{error}; {}", cycle_budget_evidence())
-                    })?
+                    .map_err(refuse)?
                 } else {
                     let (first_iterate, candidates) = exact_mode_branch
                         .borrow_mut()
@@ -2268,10 +2271,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                         &candidates,
                         effective_mode,
                     )
-                    .map_err(|error| {
-                        outer_refusal_evidence.replace(error.jeffreys_arming_evidence());
-                        format!("{error}; {}", cycle_budget_evidence())
-                    })?
+                    .map_err(refuse)?
                 };
                 outer_refusal_evidence.replace(None);
                 exact_mode_branch.borrow_mut().record_value(
@@ -2282,7 +2282,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 );
                 if !selection.result.inner_converged {
                     return Err(
-                        "exact survival marginal-slope inner solve did not converge".to_string()
+                        "exact survival marginal-slope inner solve did not converge"
+                            .to_string()
+                            .into(),
                     );
                 }
                 log::debug!(
@@ -2338,8 +2340,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 })
             },
             |_, _, _| {
-                Err::<ExactJointEfsEvaluation<CustomFamilyJointHyperModeSelection>, String>(
-                    "survival marginal-slope EFS callback invoked even though fixed-point optimization is disabled for beta-dependent exact curvature".to_string(),
+                Err::<ExactJointEfsEvaluation<CustomFamilyJointHyperModeSelection>, _>(
+                    ExactJointRefusal::Reason(
+                        "survival marginal-slope EFS callback invoked even though fixed-point optimization is disabled for beta-dependent exact curvature".to_string(),
+                    ),
                 )
             },
             crate::marginal_slope_shared::make_beta_seed_validator(&pending_beta_seed),
