@@ -760,18 +760,9 @@ pub fn lawley_lr_mean_shift_with_rho_variation(
     }
     for b in 0..m {
         for c in 0..m {
-            let v_bc = rho_cov[[b, c]];
-            if !v_bc.is_finite() {
+            if !rho_cov[[b, c]].is_finite() {
                 return Err(format!(
                     "lawley_lr_mean_shift_with_rho_variation: rho_cov[{b},{c}] is not finite"
-                ));
-            }
-            let v_cb = rho_cov[[c, b]];
-            let tol = 1e-10 * (1.0 + v_bc.abs().max(v_cb.abs()));
-            if (v_bc - v_cb).abs() > tol {
-                return Err(format!(
-                    "lawley_lr_mean_shift_with_rho_variation: rho_cov must be symmetric; \
-                     entries [{b},{c}]={v_bc} and [{c},{b}]={v_cb} differ"
                 ));
             }
         }
@@ -793,8 +784,14 @@ pub fn lawley_lr_mean_shift_with_rho_variation(
         }
     }
 
+    // A variance is non-negative, and the engine's `Cov(ρ̂)` keeps that exactly
+    // in floating point: `invert_identified_rho_hessian` forms it as
+    // `Σ_j v_j v_jᵀ / σ_j` over identified eigenpairs with `σ_j > 0`, so every
+    // diagonal entry is a sum of non-negative products `v_bj² / σ_j` and cannot
+    // round below zero. A negative diagonal therefore means the matrix is not a
+    // covariance at all, and is refused at zero with no roundoff band.
     for b in 0..m {
-        if rho_cov[[b, b]] < -1e-14 {
+        if rho_cov[[b, b]] < 0.0 {
             return Err(format!(
                 "lawley_lr_mean_shift_with_rho_variation: rho_cov[{b},{b}] must be non-negative; got {}",
                 rho_cov[[b, b]]
@@ -804,13 +801,18 @@ pub fn lawley_lr_mean_shift_with_rho_variation(
 
     let (conditional, hessian) =
         lawley_lr_mean_shift_rho_hessian(x, kappas, penalty, tested, components)?;
+    // `½ tr(H Cov)` with `H` symmetric reads only the symmetric part of `Cov`:
+    // `tr(H V) = tr(H (V + Vᵀ)/2)` for any `V`. The contraction below consumes
+    // that part directly, so an input whose two triangles differ by roundoff
+    // (or by anything else) contributes exactly the quadratic form it defines,
+    // with no symmetry tolerance to choose.
     let mut quad = 0.0;
     for b in 0..m {
         quad += 0.5 * hessian[[b, b]] * rho_cov[[b, b]];
         for c in (b + 1)..m {
-            // Symmetric Hessian and covariance contribute the off-diagonal term
-            // twice inside the one-half trace contraction.
-            quad += hessian[[b, c]] * rho_cov[[b, c]];
+            // The off-diagonal pair (b,c),(c,b) enters the one-half trace
+            // contraction twice; each copy carries half of V_bc + V_cb.
+            quad += 0.5 * hessian[[b, c]] * (rho_cov[[b, c]] + rho_cov[[c, b]]);
         }
     }
 
@@ -1762,41 +1764,100 @@ mod tests {
             )
             .is_err()
         );
-        // The #740 handoff is a covariance matrix; accepting a non-symmetric
-        // matrix would silently use only the upper triangle and misstate the
-        // ρ̂-variation contribution.
-        let nonsymmetric_cov = Array2::from_shape_vec((1, 1), vec![1.0]).unwrap();
-        assert!(
-            lawley_lr_mean_shift_with_rho_variation(
-                x.view(),
-                &kappas,
-                s.view(),
-                1..2,
-                &components,
-                nonsymmetric_cov.view(),
-            )
-            .is_ok()
-        );
-        let components2 = vec![
+    }
+
+    /// The ρ̂-variation term `½ tr(H Cov)` reads only the symmetric part of
+    /// `Cov`: an input whose triangles differ gives exactly the shift of its
+    /// symmetrization `(V + Vᵀ)/2` (never just the upper triangle), and the
+    /// variance guard refuses a negative diagonal at zero while accepting an
+    /// exactly zero variance.
+    #[test]
+    fn rho_variation_consumes_the_symmetric_part_of_the_covariance() {
+        let n = 12usize;
+        let jets = RowExpectedJets::poisson_log(0.2);
+        let kappas = vec![jets.kappas().expect("kappas"); n];
+        let mut x = Array2::<f64>::zeros((n, 3));
+        for i in 0..n {
+            let t = i as f64 / (n - 1) as f64 - 0.5;
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = t;
+            x[[i, 2]] = t * t - 1.0 / 12.0;
+        }
+        let mut s1 = Array2::<f64>::zeros((3, 3));
+        s1[[1, 1]] = 0.8;
+        let mut s2 = Array2::<f64>::zeros((3, 3));
+        s2[[2, 2]] = 1.3;
+        s2[[1, 2]] = 0.2;
+        s2[[2, 1]] = 0.2;
+        let penalty = &s1 + &s2;
+        let components = vec![
             RhoPenaltyComponent {
-                s_component: s.clone(),
+                s_component: s1.clone(),
             },
             RhoPenaltyComponent {
-                s_component: s.clone(),
+                s_component: s2.clone(),
             },
         ];
-        let bad_sym = Array2::from_shape_vec((2, 2), vec![1.0, 0.25, 0.20, 1.0]).unwrap();
-        assert!(
+        let shift = |cov: &Array2<f64>| {
             lawley_lr_mean_shift_with_rho_variation(
                 x.view(),
                 &kappas,
-                s.view(),
-                1..2,
-                &components2,
-                bad_sym.view(),
+                penalty.view(),
+                1..3,
+                &components,
+                cov.view(),
             )
-            .is_err()
+        };
+        let asymmetric = Array2::from_shape_vec((2, 2), vec![0.9, 0.35, 0.05, 0.6]).unwrap();
+        let symmetrized = Array2::from_shape_vec((2, 2), vec![0.9, 0.2, 0.2, 0.6]).unwrap();
+        let upper_only = Array2::from_shape_vec((2, 2), vec![0.9, 0.35, 0.35, 0.6]).unwrap();
+        let (conditional, hessian) =
+            lawley_lr_mean_shift_rho_hessian(x.view(), &kappas, penalty.view(), 1..3, &components)
+                .expect("rho hessian");
+        assert!(hessian[[0, 1]].abs() > 0.0, "cross curvature must be live");
+        // The shift is `conditional + Σ` of three curvature-times-covariance
+        // products, the conditional part bit-identical across calls. Each call
+        // rounds a handful of adds/multiplies over terms of at most this size,
+        // so two calls agree within γ_8 of it (each call rounds at most
+        // eight times along any one term's path, input representation included).
+        let magnitude = |cov: &Array2<f64>| {
+            conditional.abs()
+                + 0.5 * (hessian[[0, 0]] * cov[[0, 0]]).abs()
+                + 0.5 * (hessian[[1, 1]] * cov[[1, 1]]).abs()
+                + 0.5 * hessian[[0, 1]].abs() * (cov[[0, 1]].abs() + cov[[1, 0]].abs())
+        };
+        let gamma_8 = gam_linalg::roundoff::accumulation_growth(8);
+        let from_asymmetric = shift(&asymmetric).expect("asymmetric input is a quadratic form");
+        let from_symmetrized = shift(&symmetrized).expect("symmetric covariance");
+        let from_upper = shift(&upper_only).expect("symmetric covariance");
+        // Pin: the asymmetric input is exactly its symmetrization.
+        let pin_band = gamma_8 * (magnitude(&asymmetric) + magnitude(&symmetrized));
+        assert!(
+            (from_asymmetric - from_symmetrized).abs() <= pin_band,
+            "asymmetric {from_asymmetric} vs symmetrized {from_symmetrized} (band {pin_band:e})"
         );
+        // Negative control: reading only the upper triangle is a different
+        // number, off by exactly H_01·(0.35 − 0.2), so the pin is not vacuous.
+        let expected_gap = hessian[[0, 1]] * (0.35 - 0.2);
+        let gap_band = gamma_8 * (magnitude(&upper_only) + magnitude(&symmetrized));
+        assert!(
+            expected_gap.abs() > gap_band,
+            "the upper-triangle reading must be resolvable: gap {expected_gap:e}, band {gap_band:e}"
+        );
+        assert!(
+            ((from_upper - from_symmetrized) - expected_gap).abs() <= gap_band,
+            "upper-only gap {} vs H_01·ΔV {expected_gap} (band {gap_band:e})",
+            from_upper - from_symmetrized
+        );
+
+        // Variance guard at zero: an exactly zero variance is a covariance
+        // (a railed / unidentified axis); the smallest negative one is not.
+        let zero_variance = Array2::from_shape_vec((2, 2), vec![0.0, 0.0, 0.0, 0.6]).unwrap();
+        assert!(shift(&zero_variance).is_ok());
+        let negative_variance =
+            Array2::from_shape_vec((2, 2), vec![-f64::MIN_POSITIVE, 0.0, 0.0, 0.6]).unwrap();
+        let err = shift(&negative_variance).expect_err("negative variance is refused");
+        assert!(err.contains("must be non-negative"), "{err}");
     }
 
     /// A Poisson slope tested beside an intercept, with the slope's ridge
