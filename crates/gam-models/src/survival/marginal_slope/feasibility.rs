@@ -153,12 +153,13 @@ impl SurvivalMarginalSlopeFamily {
             let row_norm = row_norm_sq.sqrt();
             let rhs = guard - offset;
             let scale = row_norm.max(rhs.abs()).max(1.0);
-            // Scaled violation = max(0, (guard - qd1) / scale); zero rows of the
-            // design contribute no constraint (the bound is then carried by the
-            // offset alone and checked at constraint-build time), so they cannot
-            // be repaired by `beta` and are excluded from the scaled metric.
+            // Scaled violation = max(0, (guard - qd1) / scale); immovable rows
+            // contribute no constraint (the bound is then carried by the offset
+            // alone and checked at constraint-build time), so they cannot be
+            // repaired by `beta` and are excluded from the scaled metric. The
+            // predicate is the builder's own.
             let shortfall = guard - qd1;
-            if shortfall > 0.0 && row_norm_sq > 1e-24 {
+            if shortfall > 0.0 && !derivative_row_is_immovable(derivative_dense.row(row)) {
                 let scaled = shortfall / scale;
                 if scaled > worst_scaled_violation {
                     worst_scaled_violation = scaled;

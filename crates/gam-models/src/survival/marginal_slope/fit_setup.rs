@@ -126,12 +126,8 @@ pub(crate) fn inner_fit_from_certified_outer(
 /// Marginal-slope guard policy: the guard is required to be strictly positive
 /// (`q'(t) ≥ guard > 0`), because the row-wise representation here is the *only*
 /// place the monotonicity barrier lives — a zero guard would silently collapse
-/// it. Coefficient-free row feasibility uses the family's epsilon-scaled slack
-/// (`survival_derivative_guard_tolerance`).
-pub(crate) const MARGINAL_SLOPE_GUARD_POLICY: GuardConstraintPolicy = GuardConstraintPolicy {
-    guard_policy: GuardPolicy::Positive,
-    feasibility: FeasibilityTolerance::EpsilonScaled,
-};
+/// it.
+pub(crate) const MARGINAL_SLOPE_GUARD_POLICY: GuardPolicy = GuardPolicy::Positive;
 
 pub(crate) fn time_derivative_guard_constraints(
     design_derivative_exit: &DesignMatrix,

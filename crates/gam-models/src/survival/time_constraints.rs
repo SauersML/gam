@@ -7,17 +7,17 @@
 //!   `D β + o ≥ guard`   ⇔   `D β ≥ guard − o`
 //!
 //! that enforces `q'(t) ≥ guard` (survival-time monotonicity / derivative
-//! safety) inside the inner active-set / KKT machinery. The two families used to
-//! carry byte-for-byte duplicates of this construction with two policy
-//! differences buried in the copies:
+//! safety) inside the inner active-set / KKT machinery. This module hosts the
+//! single implementation. The one policy difference between families, the
+//! admissible guard range, is an explicit [`GuardPolicy`] input. Everything
+//! else is shared:
 //!
-//! * the admissible guard range (`survival_location_scale` accepts a zero guard,
-//!   `survival_marginal_slope` requires a strictly positive guard), and
-//! * the feasibility slack used when deciding whether a row with no usable time
-//!   coefficients can satisfy the guard from its offset alone.
+//! * [`derivative_row_is_immovable`] decides which rows no `β` can move, and
+//!   the marginal-slope feasibility validator reads the same predicate;
+//! * [`derivative_guard_feasibility_band`] is the one slack for "does `q'`
+//!   clear the guard", used here for rows that must clear it from their
+//!   offset alone and by the marginal-slope likelihood-domain predicate.
 //!
-//! This module hosts the single implementation and makes both differences
-//! explicit, configurable inputs ([`GuardPolicy`] and [`FeasibilityTolerance`]).
 //! The builder is error-type agnostic: it reports structured failures via
 //! [`GuardConstraintFailure`], and each family renders that into its own error
 //! enum/wording through a small adapter. No family keeps a second copy.
@@ -69,40 +69,47 @@ impl GuardPolicy {
     }
 }
 
-/// Feasibility slack used when a row carries no usable time coefficients and
-/// must clear the guard from its offset alone.
+/// Width of the band below `guard` in which a derivative value `q_prime` still
+/// counts as clearing the guard: `q_prime + band ≥ guard`.
 ///
-/// Both families compare `offset + tol(offset, guard) ≥ guard` (equivalently
-/// `guard − offset ≤ tol`). They use different slack factors of the same shape
-/// `factor · (1 + max(|offset|, |guard|))`; the variants below name the active
-/// policy directly.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum FeasibilityTolerance {
-    /// `1e-12 · (1 + max(|offset|, |guard|))`.
-    AbsoluteScaled,
-    /// `256 · f64::EPSILON · (1 + max(|offset|, |guard|))` —
-    /// `survival_marginal_slope`'s epsilon-scaled slack.
-    EpsilonScaled,
+/// A movable row reaches the solver as `a·β ≥ rhs` scaled by
+/// `max(‖row‖, |rhs|, 1)`, and the active-set solver certifies that scaled
+/// row to [`gam_solve::pirls::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`]. So a
+/// converged active constraint legitimately sits up to that tolerance times
+/// the row scale on the infeasible side of the exact bound. The band is that
+/// contract with the row scale replaced by the value-side magnitude
+/// `1 + max(|q'|, |guard|)`, which does not depend on a design row, so it
+/// applies equally to a row with no movable coefficients. The factor 4
+/// absorbs the re-evaluation of `q'` from `β` against the scaled residual the
+/// solver reported (#788).
+///
+/// Every "does `q'` clear the guard" test in the survival families reads this
+/// band: the offset-only test for immovable rows here, and the marginal-slope
+/// likelihood-domain predicate `survival_derivative_guard_violated`. So a row
+/// the builder admits from its offset is never refused by the row kernel for
+/// the same `q' = offset`, and vice versa.
+#[inline]
+pub(crate) fn derivative_guard_feasibility_band(q_prime: f64, guard: f64) -> f64 {
+    4.0 * gam_solve::pirls::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+        * (1.0 + q_prime.abs().max(guard.abs()))
 }
 
-impl FeasibilityTolerance {
-    #[inline]
-    fn slack(self, offset: f64, guard: f64) -> f64 {
-        let scale = 1.0 + offset.abs().max(guard.abs());
-        match self {
-            FeasibilityTolerance::AbsoluteScaled => 1e-12 * scale,
-            FeasibilityTolerance::EpsilonScaled => 256.0 * f64::EPSILON * scale,
-        }
-    }
+/// True when a row that no `β` can move clears the guard from its offset.
+#[inline]
+fn offset_clears_guard(offset: f64, guard: f64) -> bool {
+    offset + derivative_guard_feasibility_band(offset, guard) >= guard
 }
 
-/// Explicit policy bundle a family hands the shared builder.
-#[derive(Clone, Copy, Debug)]
-pub struct GuardConstraintPolicy {
-    /// Admissible guard range for this family.
-    pub guard_policy: GuardPolicy,
-    /// Feasibility slack used for coefficient-free rows.
-    pub feasibility: FeasibilityTolerance,
+/// True when no coefficient vector can move this derivative-design row: every
+/// entry is exactly zero.
+///
+/// This is the only unit-free "cannot move" test. A change of time unit
+/// rescales `D`, so any positive cutoff on `‖row‖` would classify the same row
+/// as immovable in one unit system and movable in another. A row with any
+/// nonzero entry is moved by `β` and goes to the solver as a constraint.
+#[inline]
+pub(crate) fn derivative_row_is_immovable<'a>(row: impl IntoIterator<Item = &'a f64>) -> bool {
+    row.into_iter().all(|&value| value == 0.0)
 }
 
 /// Structured failure produced by the shared builder. Each family maps this onto
@@ -139,13 +146,13 @@ pub enum GuardConstraintFailure {
 /// row is scaled by `max(‖row‖, |rhs|, 1)` so the downstream active-set
 /// feasibility tolerance applies uniformly across rows of disparate magnitude.
 ///
-/// Policy differences between families are supplied through `policy`; failures
-/// are reported structurally so each family can render its own wording.
+/// The family's admissible guard range is supplied through `guard_policy`;
+/// failures are reported structurally so each family can render its own wording.
 pub fn build_time_derivative_guard_constraints(
     design_derivative_exit: &DesignMatrix,
     derivative_offset_exit: &Array1<f64>,
     derivative_guard: f64,
-    policy: GuardConstraintPolicy,
+    guard_policy: GuardPolicy,
 ) -> Result<Option<LinearInequalityConstraints>, GuardConstraintFailure> {
     if design_derivative_exit.nrows() != derivative_offset_exit.len() {
         return Err(GuardConstraintFailure::RowOffsetMismatch {
@@ -153,10 +160,10 @@ pub fn build_time_derivative_guard_constraints(
             offsets: derivative_offset_exit.len(),
         });
     }
-    if !policy.guard_policy.admits(derivative_guard) {
+    if !guard_policy.admits(derivative_guard) {
         return Err(GuardConstraintFailure::GuardOutOfRange {
             guard: derivative_guard,
-            range: policy.guard_policy.range_description(),
+            range: guard_policy.range_description(),
         });
     }
 
@@ -168,7 +175,7 @@ pub fn build_time_derivative_guard_constraints(
             if !offset.is_finite() {
                 return Err(GuardConstraintFailure::NonFiniteOffset { row, offset });
             }
-            if offset + policy.feasibility.slack(offset, derivative_guard) < derivative_guard {
+            if !offset_clears_guard(offset, derivative_guard) {
                 return Err(GuardConstraintFailure::InfeasibleRow {
                     row,
                     offset,
@@ -187,19 +194,13 @@ pub fn build_time_derivative_guard_constraints(
         if !offset.is_finite() {
             return Err(GuardConstraintFailure::NonFiniteOffset { row, offset });
         }
-        let mut row_norm_sq = 0.0_f64;
-        for col in 0..p {
-            let value = dense[[row, col]];
-            if !value.is_finite() {
-                return Err(GuardConstraintFailure::NonFiniteDesign { row, col });
-            }
-            row_norm_sq += value * value;
+        if let Some(col) = (0..p).find(|&col| !dense[[row, col]].is_finite()) {
+            return Err(GuardConstraintFailure::NonFiniteDesign { row, col });
         }
-        let required = derivative_guard - offset;
-        if row_norm_sq <= 1e-24 {
-            // A zero derivative-design row cannot be moved by any β; it must
-            // already satisfy the guard from its offset alone.
-            if required > policy.feasibility.slack(offset, derivative_guard) {
+        if derivative_row_is_immovable(dense.row(row)) {
+            // No β moves this row; it must already satisfy the guard from its
+            // offset alone.
+            if !offset_clears_guard(offset, derivative_guard) {
                 return Err(GuardConstraintFailure::InfeasibleRow {
                     row,
                     offset,
@@ -239,14 +240,8 @@ mod tests {
     use super::*;
     use ndarray::array;
 
-    const LS_POLICY: GuardConstraintPolicy = GuardConstraintPolicy {
-        guard_policy: GuardPolicy::NonNegative,
-        feasibility: FeasibilityTolerance::AbsoluteScaled,
-    };
-    const MS_POLICY: GuardConstraintPolicy = GuardConstraintPolicy {
-        guard_policy: GuardPolicy::Positive,
-        feasibility: FeasibilityTolerance::EpsilonScaled,
-    };
+    const LS_POLICY: GuardPolicy = GuardPolicy::NonNegative;
+    const MS_POLICY: GuardPolicy = GuardPolicy::Positive;
 
     fn dense(rows: usize, cols: usize, data: &[f64]) -> DesignMatrix {
         DesignMatrix::from(Array2::from_shape_vec((rows, cols), data.to_vec()).unwrap())
@@ -326,7 +321,7 @@ mod tests {
     /// Coefficient-free block: rows must clear the guard from offsets alone, and
     /// the structured infeasibility failure carries the offending row.
     #[test]
-    fn coefficient_free_feasibility_uses_policy_slack() {
+    fn coefficient_free_feasibility_uses_offset_band() {
         let design = dense(2, 0, &[]);
 
         // Offsets comfortably above the guard: feasible, no constraints.
@@ -368,6 +363,96 @@ mod tests {
                 assert!(!no_time_coefficients);
             }
             other => panic!("expected zero-row infeasibility, got {other:?}"),
+        }
+    }
+
+    /// A change of time unit rescales `D`, the offsets and the guard by the
+    /// same `c`, so the accept/refuse verdict and the set of constrained rows
+    /// must not depend on `c` (#3766). Row 0 is tiny but nonzero (the old
+    /// `‖row‖² ≤ 1e-24` cutoff called it immovable at `c = 1` and refused the
+    /// block, yet called it movable at `c = 1e3`); row 1 is exactly zero with
+    /// an offset above the guard; row 2 is an ordinary movable row.
+    #[test]
+    fn verdict_is_invariant_to_a_change_of_time_unit_3766() {
+        let base_design = [1e-13, 0.0, 0.0, 0.0, 0.5, 2.0];
+        let base_offsets = [0.0, 0.3, -0.1];
+        let base_guard = 0.2;
+        for c in [1e-3, 1.0, 1e3] {
+            let design = dense(
+                3,
+                2,
+                &base_design.iter().map(|v| v * c).collect::<Vec<_>>(),
+            );
+            let offsets = Array1::from_iter(base_offsets.iter().map(|v| v * c));
+            for policy in [LS_POLICY, MS_POLICY] {
+                let built = build_time_derivative_guard_constraints(
+                    &design,
+                    &offsets,
+                    base_guard * c,
+                    policy,
+                )
+                .unwrap_or_else(|failure| panic!("c={c}: must build, got {failure:?}"))
+                .unwrap_or_else(|| panic!("c={c}: rows 0 and 2 are movable"));
+                assert_eq!(
+                    built.a.nrows(),
+                    2,
+                    "c={c}: exactly the two movable rows are constrained"
+                );
+            }
+
+            // The exactly-zero row with its offset below the guard is refused
+            // at every scale.
+            let short = Array1::from_iter(
+                [0.0, 0.1, -0.1].iter().map(|v: &f64| v * c),
+            );
+            match build_time_derivative_guard_constraints(&design, &short, base_guard * c, MS_POLICY)
+            {
+                Err(GuardConstraintFailure::InfeasibleRow {
+                    row,
+                    no_time_coefficients,
+                    ..
+                }) => {
+                    assert_eq!(row, 1, "c={c}");
+                    assert!(!no_time_coefficients, "c={c}");
+                }
+                other => panic!("c={c}: zero row below the guard must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// Both family policies admit an offset-only row by the same band, and it
+    /// is the band the marginal-slope likelihood-domain predicate applies to
+    /// `q' = offset`: the build-time and evaluation-time verdicts coincide on
+    /// either side of the band edge.
+    #[test]
+    fn offset_band_matches_the_marginal_slope_domain_predicate_3766() {
+        let design = dense(1, 0, &[]);
+        for guard in [1e-6, 0.5, 40.0] {
+            let edge = guard - derivative_guard_feasibility_band(guard, guard);
+            for offset in [
+                guard,
+                edge + 1e-3 * (guard - edge),
+                edge - 1e-3 * (guard - edge),
+                guard - 1e-3,
+            ] {
+                let domain_ok =
+                    !crate::survival::marginal_slope::survival_derivative_guard_violated(
+                        offset, guard,
+                    );
+                for policy in [LS_POLICY, MS_POLICY] {
+                    let built = build_time_derivative_guard_constraints(
+                        &design,
+                        &array![offset],
+                        guard,
+                        policy,
+                    );
+                    assert_eq!(
+                        built.is_ok(),
+                        domain_ok,
+                        "guard={guard:e}, offset={offset:e}: builder and domain predicate disagree"
+                    );
+                }
+            }
         }
     }
 }
