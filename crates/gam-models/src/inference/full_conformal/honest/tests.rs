@@ -461,69 +461,136 @@ fn replicate(scenario: Scenario, n: usize, seed: u64) -> Replicate {
     }
 }
 
-/// Coverage of every row class, `n ∈ {20, 50, 200}`, three misspecified noise
-/// laws, `α ∈ {0.1, 0.05}` from the same replicates: `≥ 1 − α − 2·MCSE`, no row
-/// excluded. Also reports the cost of the honest rows: one factorization each,
-/// and the median number of local refits.
-#[test]
-fn full_conformal_coverage_holds_for_every_row_class() {
+/// One `(scenario, n)` cell of the coverage study: coverage of every row class
+/// at `α ∈ {0.1, 0.05}` from the same replicates, `≥ 1 − α − 2·MCSE`, no row
+/// excluded. Also asserts the cost of this cell's honest rows: one
+/// factorization each, and a median local-refit count of at most two.
+///
+/// `seed_index` and `size_index` are the cell's position in
+/// `Scenario::ALL × [20, 50, 200]`; they enter the seed exactly as they did
+/// when the nine cells were one test, so every replicate is the same draw.
+fn coverage_cell(scenario: Scenario, seed_index: usize, n: usize, size_index: usize) {
+    let base = 1_000_003 * (1 + seed_index as u64) + 10_007 * (1 + size_index as u64);
+    let reps: Vec<Replicate> = (0..REPS as u64)
+        .into_par_iter()
+        .map(|r| replicate(scenario, n, base + r))
+        .collect();
     let mut failures = Vec::new();
-    let mut all_refits = Vec::new();
-    for (s_index, scenario) in Scenario::ALL.into_iter().enumerate() {
-        for (n_index, n) in [20usize, 50, 200].into_iter().enumerate() {
-            let base = 1_000_003 * (1 + s_index as u64) + 10_007 * (1 + n_index as u64);
-            let reps: Vec<Replicate> = (0..REPS as u64)
-                .into_par_iter()
-                .map(|r| replicate(scenario, n, base + r))
-                .collect();
-            let mut tallies: std::collections::BTreeMap<(&str, usize), (usize, usize)> =
-                Default::default();
-            for rep in &reps {
-                for &(label, a, covered) in &rep.rows {
-                    let entry = tallies.entry((label, a)).or_default();
-                    entry.0 += 1;
-                    entry.1 += usize::from(covered);
-                }
-                for a in 0..ALPHAS.len() {
-                    assert_eq!(
-                        rep.honest_factorizations[a], 1,
-                        "an honest row refactorized the normal matrix"
-                    );
-                    all_refits.push(rep.honest_extra_refits[a]);
-                }
-            }
-            for (&(label, a), &(rows, covered)) in &tallies {
-                let alpha = ALPHAS[a];
-                let coverage = covered as f64 / rows as f64;
-                let mcse = (coverage * (1.0 - coverage) / rows as f64).sqrt();
-                eprintln!(
-                    "{scenario:?} n={n} α={alpha} {label}: coverage {coverage:.4} ± {mcse:.4} \
-                     over {rows} rows"
-                );
-                if coverage < 1.0 - alpha - 2.0 * mcse {
-                    failures.push(format!(
-                        "{scenario:?} n={n} α={alpha} {label}: {coverage:.4} < {:.4}",
-                        1.0 - alpha - 2.0 * mcse
-                    ));
-                }
-            }
-            // Every K = 1 row is honest: none silently fell back.
-            for a in 0..ALPHAS.len() {
-                let honest = tallies.get(&("honest_refit", a)).map_or(0, |t| t.0);
-                assert_eq!(
-                    honest, REPS,
-                    "{scenario:?} n={n}: {} of {REPS} single-penalty rows were refused",
-                    REPS - honest
-                );
-            }
+    let mut refits = Vec::new();
+    let mut tallies: std::collections::BTreeMap<(&str, usize), (usize, usize)> = Default::default();
+    for rep in &reps {
+        for &(label, a, covered) in &rep.rows {
+            let entry = tallies.entry((label, a)).or_default();
+            entry.0 += 1;
+            entry.1 += usize::from(covered);
+        }
+        for a in 0..ALPHAS.len() {
+            assert_eq!(
+                rep.honest_factorizations[a], 1,
+                "an honest row refactorized the normal matrix"
+            );
+            refits.push(rep.honest_extra_refits[a]);
         }
     }
-    all_refits.sort_unstable();
-    let median = all_refits[all_refits.len() / 2];
+    for (&(label, a), &(rows, covered)) in &tallies {
+        let alpha = ALPHAS[a];
+        let coverage = covered as f64 / rows as f64;
+        let mcse = (coverage * (1.0 - coverage) / rows as f64).sqrt();
+        eprintln!(
+            "{scenario:?} n={n} α={alpha} {label}: coverage {coverage:.4} ± {mcse:.4} \
+             over {rows} rows"
+        );
+        if coverage < 1.0 - alpha - 2.0 * mcse {
+            failures.push(format!(
+                "{scenario:?} n={n} α={alpha} {label}: {coverage:.4} < {:.4}",
+                1.0 - alpha - 2.0 * mcse
+            ));
+        }
+    }
+    // Every K = 1 row is honest: none silently fell back.
+    for a in 0..ALPHAS.len() {
+        let honest = tallies.get(&("honest_refit", a)).map_or(0, |t| t.0);
+        assert_eq!(
+            honest, REPS,
+            "{scenario:?} n={n}: {} of {REPS} single-penalty rows were refused",
+            REPS - honest
+        );
+    }
+    refits.sort_unstable();
+    let median = refits[refits.len() / 2];
     eprintln!(
-        "honest rows: median extra refits {median}, max {}, one factorization each",
-        all_refits.last().copied().unwrap_or(0)
+        "{scenario:?} n={n} honest rows: median extra refits {median}, max {}, one \
+         factorization each",
+        refits.last().copied().unwrap_or(0)
     );
-    assert!(failures.is_empty(), "coverage below 1 − α − 2·MCSE: {failures:#?}");
-    assert!(median <= 2, "median extra refits per honest row is {median}");
+    assert!(
+        failures.is_empty(),
+        "coverage below 1 − α − 2·MCSE: {failures:#?}"
+    );
+    assert!(
+        median <= 2,
+        "{scenario:?} n={n}: median extra refits per honest row is {median}"
+    );
+}
+
+// The study is nine independent `(scenario, n)` cells, and it is nine tests
+// (#3338). As one test it was over nextest's per-test cap (600 s = slow-timeout
+// 300 s × 2) from the day it landed -- PR #3213 reported about 870 s on 4 cores
+// -- and a run that is killed at the cap has measured only the cells it reached:
+// `direct-dy5-w2oc-3275-g1.log` got through 5 of the 9 before the kill, so four
+// cells were asserting nothing at all. A per-test cap is a per-test budget, so
+// the packaging is what was wrong: the cells share no state, the seeds are
+// unchanged, and each one now carries its own verdict instead of being folded
+// into one timeout. The refit median is also now asserted per cell, which is
+// STRICTER than the single median over all nine that it replaces -- that one
+// could be held under two by the cheap cells while an expensive cell drifted.
+//
+// This does not change the cost of an honest row. The z branch-and-bound is
+// 94-97 % of the honest call at 1,000-2,100 cells and 35-121 ms per row, and
+// every production row with `conformal_certificate = honest_refit` pays it;
+// #3338's cell-count item is open, and the cap is not raised for it here.
+
+#[test]
+fn full_conformal_coverage_misspecified_mean_n20() {
+    coverage_cell(Scenario::MisspecifiedMean, 0, 20, 0);
+}
+
+#[test]
+fn full_conformal_coverage_misspecified_mean_n50() {
+    coverage_cell(Scenario::MisspecifiedMean, 0, 50, 1);
+}
+
+#[test]
+fn full_conformal_coverage_misspecified_mean_n200() {
+    coverage_cell(Scenario::MisspecifiedMean, 0, 200, 2);
+}
+
+#[test]
+fn full_conformal_coverage_heavy_tails_n20() {
+    coverage_cell(Scenario::HeavyTails, 1, 20, 0);
+}
+
+#[test]
+fn full_conformal_coverage_heavy_tails_n50() {
+    coverage_cell(Scenario::HeavyTails, 1, 50, 1);
+}
+
+#[test]
+fn full_conformal_coverage_heavy_tails_n200() {
+    coverage_cell(Scenario::HeavyTails, 1, 200, 2);
+}
+
+#[test]
+fn full_conformal_coverage_heteroscedastic_n20() {
+    coverage_cell(Scenario::Heteroscedastic, 2, 20, 0);
+}
+
+#[test]
+fn full_conformal_coverage_heteroscedastic_n50() {
+    coverage_cell(Scenario::Heteroscedastic, 2, 50, 1);
+}
+
+#[test]
+fn full_conformal_coverage_heteroscedastic_n200() {
+    coverage_cell(Scenario::Heteroscedastic, 2, 200, 2);
 }

@@ -1,5 +1,13 @@
 [
   {
+    "base": "1ff20e8c50aee42fa28ef696a428b6b3e093cda3",
+    "items": [
+      "crates/gam-models/src/inference/full_conformal/honest/tests.rs:fn:full_conformal_coverage_holds_for_every_row_class"
+    ],
+    "reason": "#3338: the nine-cell coverage study becomes nine tests, one per (scenario, n) cell, so this single test function is replaced by coverage_cell plus full_conformal_coverage_{misspecified_mean,heavy_tails,heteroscedastic}_n{20,50,200}. Nothing it asserted is dropped. Every cell keeps its own seed (base = 1_000_003*(1+s_index) + 10_007*(1+n_index), with the same indices), so the replicates are the same draws; each cell keeps the per-row-class coverage bound 1 - alpha - 2*MCSE at both alphas, the one-factorization-per-honest-row assertion, and the refusal count. The median extra-refit assertion is now made per cell, which is STRICTER than the single median over all nine it replaces: a global median can be held under two by the cheap cells while one expensive cell drifts. The reason for the split is that one test could not finish: nextest's per-test cap is 600 s (slow-timeout 300 s doubled), PR #3213 reported the study at about 870 s on 4 cores when it landed, and direct-dy5-w2oc-3275-g1.log was killed after 5 of the 9 cells, so four cells asserted nothing at all. A per-test cap is a per-test budget and the cells share no state; the cap is not raised and the honest row's cost is not changed by this commit.",
+    "evidence": "At the base 1ff20e8c50, git grep -n full_conformal_coverage_holds_for_every_row_class -- '*.rs' finds 1 line, its own declaration at crates/gam-models/src/inference/full_conformal/honest/tests.rs:469. No other crate, test, bench, example, workflow or Python file names it; its only other occurrences in the tree are inside the evidence prose of one earlier entry in this file and in docs/public-api-census-changes.json, which describe a different removal (select_rho / GaussianRemlRhoResponse) and name this test only as a caller of the test support it kept. The file's stem is tests.rs, so the whole file is test scope and the removal is guarded for that reason alone; it is not public and nothing links it. The nine replacements are declared in the same file and call one new private helper, coverage_cell, in the same module."
+  },
+  {
     "base": "ecef664da45e7dd64e61289dbf642d0e41a0e5c5",
     "items": [
       "crates/gam-sae/src/k_selection.rs:fn:mdl_penalty_zero_takes_full_k",
