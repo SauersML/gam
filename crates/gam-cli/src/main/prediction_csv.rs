@@ -46,6 +46,21 @@ pub(crate) const PREDICTION_STD_ERROR_COLUMN: &str = "std_error";
 /// different quantity and never rides under that name.
 pub(crate) const PREDICTION_ETA_STD_ERROR_COLUMN: &str = "eta_std_error";
 
+/// Response-scale observation (prediction) band for a new response, the
+/// `gam predict --observation-interval` columns. The names are the ones the
+/// Python `predict(observation_interval=True)` surface publishes.
+pub(crate) const OBSERVATION_INTERVAL_COLUMNS: [&str; 2] =
+    ["observation_lower", "observation_upper"];
+
+/// A `(lower, upper)` observation band as the writers receive it.
+pub(crate) type ObservationBand<'a> = (ArrayView1<'a, f64>, ArrayView1<'a, f64>);
+
+/// Materialise an observation band into contiguous columns for
+/// [`write_prediction_csv_unified`].
+fn observation_band_columns(band: Option<ObservationBand<'_>>) -> Option<(Vec<f64>, Vec<f64>)> {
+    band.map(|(lower, upper)| (lower.to_vec(), upper.to_vec()))
+}
+
 /// A posterior band on the published response-scale mean: its posterior
 /// standard deviation and its credible bounds, which always travel together.
 #[derive(Clone, Copy)]
@@ -272,6 +287,7 @@ pub(crate) fn write_prediction_csv(
     eta: ArrayView1<'_, f64>,
     mean: ArrayView1<'_, f64>,
     band: Option<ResponseBand<'_>>,
+    observation_band: Option<ObservationBand<'_>>,
 ) -> CliResult<()> {
     let mut columns = vec![
         (SPECIALIZED_PREDICTION_BASE_COLUMNS[0], eta.to_vec()),
@@ -279,6 +295,10 @@ pub(crate) fn write_prediction_csv(
     ];
     if let Some(band) = band {
         band.append_to(&mut columns);
+    }
+    if let Some((lower, upper)) = observation_band {
+        columns.push((OBSERVATION_INTERVAL_COLUMNS[0], lower.to_vec()));
+        columns.push((OBSERVATION_INTERVAL_COLUMNS[1], upper.to_vec()));
     }
     write_owned_prediction_columns(path, &columns)
 }
@@ -302,6 +322,7 @@ pub(crate) fn write_estimand_explicit_prediction_csv(
     posterior_mean_standard_error: Option<ArrayView1<'_, f64>>,
     posterior_mean_lower: Option<ArrayView1<'_, f64>>,
     posterior_mean_upper: Option<ArrayView1<'_, f64>>,
+    observation_band: Option<ObservationBand<'_>>,
 ) -> CliResult<()> {
     let linear_predictor_plugin = linear_predictor_plugin.to_vec();
     let mean_plugin = mean_plugin.to_vec();
@@ -361,6 +382,11 @@ pub(crate) fn write_estimand_explicit_prediction_csv(
             });
         }
     }
+    let observation = observation_band_columns(observation_band);
+    if let Some((lower, upper)) = observation.as_ref() {
+        columns.push((OBSERVATION_INTERVAL_COLUMNS[0], lower));
+        columns.push((OBSERVATION_INTERVAL_COLUMNS[1], upper));
+    }
     write_prediction_csv_unified(path, &columns)
 }
 
@@ -413,6 +439,7 @@ pub(crate) fn write_survival_binary_prediction_csv(
     event_prob_plugin: ArrayView1<'_, f64>,
     event_prob: ArrayView1<'_, f64>,
     band: Option<ResponseBand<'_>>,
+    observation_band: Option<ObservationBand<'_>>,
 ) -> CliResult<()> {
     let event: Vec<f64> = event_prob.iter().map(|&v| v.clamp(0.0, 1.0)).collect();
     let survival: Vec<f64> = event.iter().map(|&p| (1.0 - p).clamp(0.0, 1.0)).collect();
@@ -433,6 +460,10 @@ pub(crate) fn write_survival_binary_prediction_csv(
     ];
     if let Some(band) = band {
         band.append_to(&mut columns);
+    }
+    if let Some((lower, upper)) = observation_band {
+        columns.push((OBSERVATION_INTERVAL_COLUMNS[0], lower.to_vec()));
+        columns.push((OBSERVATION_INTERVAL_COLUMNS[1], upper.to_vec()));
     }
     write_owned_prediction_columns(path, &columns)
 }

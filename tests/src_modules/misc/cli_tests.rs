@@ -2298,6 +2298,7 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
         id_column: None,
         uncertainty: false,
         level: 0.95,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
@@ -2521,6 +2522,7 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
         id_column: None,
         uncertainty: false,
         level: 0.95,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
@@ -3132,6 +3134,7 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         id_column: None,
         uncertainty: false,
         level: 0.95,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
@@ -3174,6 +3177,7 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         id_column: None,
         uncertainty: true,
         level: 0.95,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
@@ -3415,6 +3419,7 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         id_column: None,
         uncertainty: false,
         level: 0.95,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
@@ -3457,6 +3462,7 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         id_column: None,
         uncertainty: true,
         level: 0.95,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
@@ -3635,6 +3641,7 @@ fn posterior_mean_prediction_for_model(model: &SavedModel) -> f64 {
         id_column: None,
         uncertainty: false,
         level: 0.95,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
@@ -5034,6 +5041,7 @@ fn saved_bernoulli_marginal_slope_prediction_replays_latent_z_normalization() {
         id_column: None,
         uncertainty: false,
         level: 0.95,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
@@ -5428,7 +5436,7 @@ fn survival_binary_prediction_csv_includes_explicit_semantics_columns() {
 
     let eta: Array1<f64> = array![0.5, -0.25];
     let event = array![0.7, 0.2];
-    write_survival_binary_prediction_csv(&path, eta.view(), event.view(), event.view(), None)
+    write_survival_binary_prediction_csv(&path, eta.view(), event.view(), event.view(), None, None)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival binary prediction csv", e));
 
     let text =
@@ -5575,6 +5583,7 @@ fn survival_binary_prediction_csv_publishes_the_event_probability_band() {
             lower: lower.view(),
             upper: upper.view(),
         }),
+        None,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -5608,7 +5617,7 @@ fn prediction_csv_can_prepend_id_column() {
 
     let eta = array![0.5, -0.25];
     let mean = array![0.62, 0.44];
-    write_prediction_csv(&path, eta.view(), mean.view(), None)
+    write_prediction_csv(&path, eta.view(), mean.view(), None, None)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "write prediction csv", e));
     prepend_id_column_to_prediction_csv(&path, "person_id", &["p1".to_string(), "p2".to_string()])
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "prepend id column", e));
@@ -5670,6 +5679,7 @@ fn location_scale_prediction_csv_uses_estimand_explicit_schema() {
         None,
         None,
         None,
+        None,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -5708,6 +5718,7 @@ fn location_scale_map_prediction_omits_the_posterior_estimand() {
         None,
         Some(sigma.view()),
         &[],
+        None,
         None,
         None,
         None,
@@ -5758,6 +5769,7 @@ fn location_scale_prediction_csv_names_posterior_uncertainty_explicitly() {
         Some(std_error.view()),
         Some(mean_lower.view()),
         Some(mean_upper.view()),
+        None,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -6558,6 +6570,7 @@ fn cli_survival_marginal_slope_predict_publishes_library_posterior_mean_3316() {
         id_column: None,
         uncertainty: true,
         level: 0.9,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::Conditional),
         conformal: false,
         calibration: None,
@@ -6783,6 +6796,7 @@ fn run_predict_survival_supports_saved_baseline_timewiggle_model() {
         id_column: None,
         uncertainty: false,
         level: 0.95,
+        observation_interval: false,
         // The fit's published definition: these fixtures carry a conditional
         // covariance only, and naming `SmoothingCorrected` is a requirement the
         // fit refuses (#2779). The posterior-mean point needs a backend the
@@ -6946,6 +6960,7 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
         id_column: None,
         uncertainty: false,
         level: 0.95,
+        observation_interval: false,
         // The fit's published definition: these fixtures carry a conditional
         // covariance only, and naming `SmoothingCorrected` is a requirement the
         // fit refuses (#2779). The posterior-mean point needs a backend the
