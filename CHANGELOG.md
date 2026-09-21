@@ -21,6 +21,23 @@
   is fatal, while a latched direction whose curvature is not positive at a trial rho
   raises `NonPositivePenalizedCurvature`, which is trial-point local, so the outer
   search backs off instead of the fit aborting.
+- **A non-finite survival location-scale row weight is refused, not silently repaired** (gam#3650).
+  `sanitize_survival_weight_vector` rewrote non-finite dense row weights before the
+  survival-LS Hessian cross-products, the `DiagonalOnly` Hessian and `scale_dense_rows`
+  (the wiggle time Jacobians in the fit and the time-warp Jacobian in prediction). A NaN
+  weight became 0, which dropped the row and reported nothing; a positive or negative
+  infinity became the corresponding `f64::MAX`, which produced a saturated Hessian that
+  still passed the final `is_finite` gate. The sanitizer is deleted and
+  `require_finite_row_weights` takes its place: any non-finite row weight or coefficient
+  is a `NumericalFailure` whose message names the row. The one case the sanitizer was
+  covering legitimately, a masked row whose zero weight met an infinite index, is fixed
+  at its source instead, in the slot fill, where a zero-weight row now contributes
+  exactly 0 so `0 * inf` never forms. Overflow saturation of finite operands in
+  `safe_product` and `safe_sum2` is unchanged, and a zero weight still drops its row
+  exactly.
+  **Behavior change:** a fit or prediction that used to return after quietly discarding
+  a row, or after saturating its curvature, now fails with a `NumericalFailure` naming
+  the row. The remedy is the model or the data at that row, not a retry.
 - **Multinomial smooth significance is a softmax score test, and the saved model format
   moves to version 3** (#3569, #1101). `MultinomialSavedModel::smooth_significance` ran a
   per-class Wood rank-truncated Wald test. It now runs the shared variance-component score
