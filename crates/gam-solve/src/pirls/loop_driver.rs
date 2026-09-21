@@ -1813,7 +1813,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // ── Gaussian (non-identity link) / inverse Gaussian dispersion φ ─────────
     //
     // The same converged-η refresh as the Tweedie φ above, with the exact MLE
-    // `φ̂ = Σ wᵢ dᵢ / Σ wᵢ` in place of the Pearson moment. As in every
+    // `φ̂ = Σ wᵢ dᵢ / n₊` in place of the Pearson moment. As in every
     // converged-η refresh, a φ still moving on the last allowed pass is a failed
     // fit, not a reported one: the reported φ must be the MLE at the reported η.
     if refine_dispersion_at_converged_eta
