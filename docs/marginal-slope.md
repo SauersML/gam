@@ -527,18 +527,27 @@ measure and replayed at prediction and in leave-one-out diagnostics by
 the same anchoring equation; the saved coefficients are defined against
 that law's anchor and mean nothing under another.
 
+A score-warp or link-deviation flex block anchors on the fit's own law as
+well (gam#2948). The flex row program solves each timepoint's intercept on
+the law's nodes through the warp `h(u)` and the deviation `w(·)` —
+`Σ_k w_k Φ(−η_k) = Φ(−q)` with `η_k = s·(U + b·h(u_k) + w(U))` and
+`U = α + b·u_k` — so neither surface can move the anchor, and where the
+certificate prefers the estimated law the fit re-solves on it from the
+closed form's coefficients, flex coefficients included. With `K ≥ 2` scores
+the anchor is the joint law of the score vector, which carries no scalar
+grid for that program, so a flex block beside several scores is refused by
+name.
+
 Current boundaries, refused with a message rather than silently
 reinterpreted: a declared law is a law of one score (several scores anchor
-on their joint law, below); no score-warp or
-link-deviation flex block, no CTN Stage-1 influence absorber, no
+on their joint law, below); no CTN Stage-1 influence absorber, no
 time-wiggle baseline, and a time-constant slope. On those configurations an
 explicitly requested finite law is refused by name, and the default keeps the
-closed form and certifies it by `D̂` as above: a flex block through its own
-de-nested index at each node of the estimated law, a follow-up-varying slope on
+closed form and certifies it by `D̂` as above: a follow-up-varying slope on
 each anchor's own slope, and an influence absorber on the offset-free anchor
 the fit solves, because the absorber's offset is added only after the anchor.
 Where the certificate prefers the estimated law, which nothing there can
-re-solve on yet (gam#2948), the fit keeps the closed form, recorded
+re-solve on yet, the fit keeps the closed form, recorded
 `gaussian-uncertified` with that certificate and why nothing re-solves on it,
 which `require_certified` refuses by name. A fit on any of
 them whose law departs or moves records `gaussian-uncertified` with a warning

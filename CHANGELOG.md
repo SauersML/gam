@@ -28,6 +28,24 @@
   place and a cyclic knot lattice the same request did not produce through the formula
   door. `cyclic_uniform_grid` is now public and is the one owner: it steps only the
   interior points and takes the last one from `end` itself.
+- **A survival marginal-slope flex block anchors on the fit's own latent law** (#2948).
+  The fit-entry gate refused a finite latent law beside a score-warp or link-deviation
+  block by name, because those surfaces "run the flex row program, which lowers the
+  identity in closed form". That has not been true since #2948's engine landed: the flex
+  row program solves each timepoint's intercept on the family's own law,
+  `Σ_k w_k Φ(−η_k) = Φ(−q)` with `η_k = s·(U + b·h(u_k) + w(U))` and `U = α + b·u_k`, and
+  every jet differentiates that solve. The gate now refuses only what the program cannot
+  read: it anchors on ONE score's scalar grid, and a `K ≥ 2` fit anchors on the joint law
+  of the score vector, which has no scalar grid. **Behavior change:** a survival
+  marginal-slope fit with a score warp or a link deviation and one score now accepts
+  `latent_measure="global-empirical"` and `declared_latent_law=` instead of refusing them,
+  and under the default policy a converged closed form whose excess-KL estimate `D̂`
+  prefers the estimated law re-solves on it rather than being recorded
+  `gaussian-uncertified`. That re-solve now also starts each flex surface from the
+  coefficients the closed form converged to, read through one block-position rule
+  (`flex_block_hints`), except on a moving-law arm that changes the score axis, where the
+  warp and deviation bases are evaluated at a different point and the coefficients do not
+  carry.
 - **Weighted occupancy charges its likelihood on the rows its penalty counts** (#4319).
   `classify_occupancy_weighted` / `classify_occupancy_interval_weighted` ran the
   BIC race with a log-likelihood `Σ w_i ln f(x_i)` of `mass = Σ w` rows against a

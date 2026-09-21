@@ -1081,6 +1081,103 @@ fn test_family(
     }
 }
 
+/// A two-row spec over `score_dim` latent scores, optionally carrying a
+/// score-warp flex block, with every other anchored-frame boundary absent: a
+/// static slope, no time wiggle, no CTN influence absorber and no declared law.
+/// So `anchored_kernel_unavailable_reason` answers only about the score count
+/// and the flex block.
+fn flex_gate_spec(score_dim: usize, score_warp: bool) -> SurvivalMarginalSlopeTermSpec {
+    SurvivalMarginalSlopeTermSpec {
+        age_entry: array![0.0, 0.0],
+        age_exit: array![1.0, 1.0],
+        event_target: array![0.0, 1.0],
+        weights: array![1.0, 1.0],
+        z: Array2::from_shape_fn((2, score_dim), |(row, col)| {
+            if (row + col) % 2 == 0 { -1.0 } else { 1.0 }
+        }),
+        base_link: InverseLink::Standard(StandardLink::Probit),
+        marginalspec: empty_termspec(),
+        marginal_offset: Array1::zeros(2),
+        frailty: FrailtySpec::None,
+        slope_template: SurvivalCovariateTermBlockTemplate::Static,
+        derivative_guard: DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
+        baseline_hyper: SurvivalMarginalSlopeBaselineHyperSpec::Linear {
+            config: crate::survival::construction::SurvivalBaselineConfig {
+                target: crate::survival::construction::SurvivalBaselineTarget::Linear,
+                scale: None,
+                shape: None,
+                rate: None,
+                makeham: None,
+            },
+        },
+        time_block: TimeBlockInput {
+            design_entry: DesignMatrix::from(Array2::zeros((2, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((2, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::ones((2, 1))),
+            offset_entry: Array1::zeros(2),
+            offset_exit: Array1::zeros(2),
+            derivative_offset_exit: Array1::from_elem(
+                2,
+                DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
+            ),
+            ..base_time_block()
+        },
+        timewiggle_block: None,
+        slopespec: empty_termspec(),
+        // The per-score slope topology, so the K >= 2 arms above the flex one
+        // pass and the flex arm is what answers.
+        slopespecs: (score_dim > 1).then(|| vec![empty_termspec(); score_dim]),
+        slope_offset: Array1::zeros(2),
+        score_warp: score_warp.then(|| DeviationBlockConfig {
+            degree: 3,
+            num_internal_knots: 1,
+            penalty_order: 2,
+            penalty_orders: vec![1, 2, 3],
+            double_penalty: false,
+            monotonicity_eps: 1e-4,
+        }),
+        link_dev: None,
+        score_influence_jacobian: None,
+        latent_z_policy: LatentZPolicy::default(),
+        declared_latent_law: None,
+    }
+}
+
+/// gam#2948: the anchored-frame gate admits a score-warp flex block on ONE
+/// score, and refuses it on a joint law.
+///
+/// The flex row program solves each timepoint's intercept on the family's own
+/// law, so a warp cannot move the anchor and the frame serves the fit. What it
+/// cannot read is a joint law: it anchors on one score's scalar grid, and a
+/// `K >= 2` fit has none (`SurvivalLatentLaw::scalar_grid`). The two arms are
+/// each other's controls: the same spec differing only in the score count must
+/// give opposite verdicts, so neither a gate that always admits nor one that
+/// always refuses passes.
+#[test]
+fn a_score_warp_anchors_on_a_scalar_law_and_refuses_a_joint_one_2948() {
+    assert_eq!(
+        anchored_kernel_unavailable_reason(&flex_gate_spec(1, false)),
+        None,
+        "the rigid one-score spec is the frame's own configuration"
+    );
+    assert_eq!(
+        anchored_kernel_unavailable_reason(&flex_gate_spec(1, true)),
+        None,
+        "a score warp on one score anchors on that score's scalar law (gam#2948)"
+    );
+    assert_eq!(
+        anchored_kernel_unavailable_reason(&flex_gate_spec(2, false)),
+        None,
+        "two scores on the per-score slope topology anchor on their joint law"
+    );
+    let joint = anchored_kernel_unavailable_reason(&flex_gate_spec(2, true))
+        .expect("a score warp beside a joint law has no scalar grid to anchor on");
+    assert!(
+        joint.contains("scalar law of ONE score") && joint.contains("no scalar grid"),
+        "the refusal must name the joint law's missing scalar grid; got {joint}"
+    );
+}
+
 #[test]
 fn validate_spec_rejects_coordinate_cone_without_guard_offset() {
     let spec = SurvivalMarginalSlopeTermSpec {

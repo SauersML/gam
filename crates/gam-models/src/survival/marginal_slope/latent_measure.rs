@@ -131,13 +131,18 @@ pub(crate) fn anchored_kernel_unavailable_reason(
                  sum, and the anchored scalar frame does not build that sum's law",
             );
         }
-    }
-    if spec.score_warp.is_some() || spec.link_dev.is_some() {
-        return Some(
-            "a declared latent law is not yet supported together with a score-warp or \
-             link-deviation flex block: those surfaces run the flex row program, which lowers \
-             the identity in closed form",
-        );
+        // gam#2948: the flex row program solves each timepoint's intercept on the
+        // family's own law, and it reads that law as ONE score's scalar grid
+        // (`SurvivalLatentLaw::scalar_grid`). A K ≥ 2 fit anchors on the joint law
+        // of the score vector, which carries no scalar grid, so the combination is
+        // refused here rather than at the first row solve.
+        if spec.score_warp.is_some() || spec.link_dev.is_some() {
+            return Some(
+                "a score-warp or link-deviation flex block anchors each timepoint on the \
+                 scalar law of ONE score: with K ≥ 2 scores the fit anchors on the joint law \
+                 of the score vector, which carries no scalar grid for the flex row program",
+            );
+        }
     }
     if spec
         .score_influence_jacobian

@@ -263,6 +263,35 @@ fn slope_hint_onto_score_units(
     }
 }
 
+/// The converged score-warp and link-deviation coefficients of a solve, read off
+/// its block states.
+///
+/// `build_blocks` pushes `[time, marginal, slope]`, then the score warp when the
+/// spec carries one, then the link deviation, so the flex surfaces sit at 3 and
+/// 4 (or 3 alone). This is the ONE place that position rule is read, so the
+/// outer loop's carry and a re-solve's starting point cannot drift apart.
+///
+/// A re-solve on another latent law rebuilds the same blocks, and since gam#2948
+/// the flex row program anchors on whichever law the family carries, so a warp
+/// or deviation coefficient means the same thing under the new law's anchor and
+/// the re-solve starts from it.
+fn flex_block_hints(
+    block_states: &[ParameterBlockState],
+    score_warp_present: bool,
+    link_dev_present: bool,
+) -> (Option<Array1<f64>>, Option<Array1<f64>>) {
+    let score_warp_beta = score_warp_present
+        .then(|| block_states.get(3).map(|block| block.beta.clone()))
+        .flatten();
+    let link_dev_beta = link_dev_present
+        .then(|| {
+            let index = if score_warp_present { 4 } else { 3 };
+            block_states.get(index).map(|block| block.beta.clone())
+        })
+        .flatten();
+    (score_warp_beta, link_dev_beta)
+}
+
 /// The fit itself, on `compression_design` for a declared law with many atoms
 /// (gam#2928). Returns the anchors of the converged fit whose certified error
 /// missed its target, which the caller refines at.
@@ -2311,16 +2340,16 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 if let Some(block) = fit.block_states.get(2) {
                     hints_mut.slope_beta = Some(block.beta.clone());
                 }
-                if score_warp_prepared.is_some()
-                    && let Some(block) = fit.block_states.get(3)
-                {
-                    hints_mut.score_warp_beta = Some(block.beta.clone());
+                let (score_warp_beta, link_dev_beta) = flex_block_hints(
+                    &fit.block_states,
+                    score_warp_prepared.is_some(),
+                    link_dev_prepared.is_some(),
+                );
+                if score_warp_beta.is_some() {
+                    hints_mut.score_warp_beta = score_warp_beta;
                 }
-                if link_dev_prepared.is_some() {
-                    let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
-                    if let Some(block) = fit.block_states.get(link_idx) {
-                        hints_mut.link_dev_beta = Some(block.beta.clone());
-                    }
+                if link_dev_beta.is_some() {
+                    hints_mut.link_dev_beta = link_dev_beta;
                 }
                 log::debug!(
                     "[survival-marginal-slope/outer-inner-fit] end elapsed={:.3}s inner_cycles={} pirls_status={:?}",
@@ -2850,6 +2879,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                          score",
                     )
                 })?;
+                let (score_warp_beta, link_dev_beta) = flex_block_hints(
+                    block_states,
+                    score_warp_prepared.is_some(),
+                    link_dev_prepared.is_some(),
+                );
                 return Ok((
                     SurvivalCertifiedFit::ReSolve(SurvivalClosedFormFallback {
                         calibrations: vec![
@@ -2866,7 +2900,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                             residual: certificate,
                         },
                         // The closed form reads every score as given; the finite
-                        // law is solved in each score's standard units.
+                        // law is solved in each score's standard units. A flex
+                        // surface reads its own coefficients under either law
+                        // (gam#2948), so it starts from the converged ones.
                         hints: ThetaHints {
                             time_beta: Some(block_states[0].beta.clone()),
                             marginal_beta: Some(block_states[1].beta.clone()),
@@ -2875,8 +2911,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                 &score_units,
                                 &block_states[2].beta,
                             ),
-                            score_warp_beta: None,
-                            link_dev_beta: None,
+                            score_warp_beta,
+                            link_dev_beta,
                             influence_beta: None,
                         },
                     }),
@@ -2961,11 +2997,24 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 certificate.chosen.label(),
                 certificate.summary()
             );
-            let slope_beta = slope_hint_across_score_axes(
-                candidates.score_axis(certificate.fitted),
-                candidates.score_axis(certificate.chosen),
-                &block_states[2].beta,
-            );
+            let fitted_axis = candidates.score_axis(certificate.fitted);
+            let chosen_axis = candidates.score_axis(certificate.chosen);
+            let slope_beta =
+                slope_hint_across_score_axes(fitted_axis, chosen_axis, &block_states[2].beta);
+            // The warp and deviation bases are read AT the score on the fitted
+            // axis, so an arm on another axis evaluates every basis function at
+            // a different point and no rescaling of the coefficients carries
+            // them. They carry exactly when the axis is unchanged and start
+            // afresh otherwise (gam#2948).
+            let (score_warp_beta, link_dev_beta) = if fitted_axis == chosen_axis {
+                flex_block_hints(
+                    block_states,
+                    score_warp_prepared.is_some(),
+                    link_dev_prepared.is_some(),
+                )
+            } else {
+                (None, None)
+            };
             let chosen = certificate.chosen;
             let decision = candidates.decision_for(chosen, Some(certificate))?;
             return Ok((
@@ -2977,8 +3026,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     time_beta: Some(block_states[0].beta.clone()),
                     marginal_beta: Some(block_states[1].beta.clone()),
                     slope_beta,
-                    score_warp_beta: None,
-                    link_dev_beta: None,
+                    score_warp_beta,
+                    link_dev_beta,
                     influence_beta: None,
                 },
                 }),
