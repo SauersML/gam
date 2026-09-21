@@ -37,154 +37,41 @@ use ndarray::{Array1, Array2, ArrayView1};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use gam_model_api::saved_model::{
+    SavedModelError, read_saved_model_bytes, saved_model_text, write_saved_model,
+};
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
-/// Canonical saved-model payload schema version.
+/// The kind a saved GAM file carries in the shared saved-model envelope
+/// (`gam_model_api::saved_model`).
+pub const SAVED_MODEL_KIND: &str = "gam";
+
+/// Saved-model schema version: the envelope version of every file of
+/// [`SAVED_MODEL_KIND`].
 ///
-/// Every `FittedModelPayload` written by any binary (CLI `gam`, gam-pyffi,
-/// downstream library users) must set this as its `version` field, and every
-/// load path asserts equality via `validate_for_persistence`. Bump this when:
-///   - A required field is added to `FittedModelPayload` and the set of
-///     `Option<T>` fields that must be `Some(...)` for a given `family_state`
-///     changes (otherwise the `#[serde(default)]` decode would silently fill
-///     the new field with `None` when loading an older model and the CLI
-///     predict path would run with stale metadata).
-///   - The on-wire shape of any `serde`-tagged enum variant changes such that
-///     older payloads no longer round-trip losslessly.
-///   - The semantics of an existing field change (e.g. sign convention,
-///     coordinate frame) in a way that predict output would silently diverge
-///     between old and new readers.
-///
-/// Do NOT bump for purely additive `Option<T>` fields that the save-time
-/// invariant (`validate_for_persistence`) does not yet require. Those are
-/// forward-compatible.
-// v15 makes the original training row count required on every mutually
-// exclusive fit representation (`UnifiedFitResult`, spline scan, residual
-// cascade). Readers must never guess it from optional working evidence or
-// prediction-time reconstruction grids.
-// v17 changes what a binomial beta-logistic link's `(epsilon, log_delta)` mean. The
-// link now standardizes `Z = logit(U)`, `U ~ Beta(a, b)`, to logit's location and
-// scale (#2902 row 34), so a v16 beta-logistic model would predict through a
-// different link; it is refused by name (`payload_version_mismatch`).
-// v18 persists the Tier-0 rho-posterior seam's typed outcome (`FitArtifacts::rho_posterior`,
-// #2627), which v17 skipped at serialization and which carries no serde default, so a v17
-// payload is refused by name before the field is parsed.
-// v19 stores the coefficient covariance once (#2955): `FitInference` no longer
-// carries `beta_covariance`, `beta_standard_errors` or their corrected twins, and
-// the standard errors derive from `UnifiedFitResult::covariance_conditional` /
-// `covariance_corrected`. A v18 payload's copies were checked bit for bit against
-// those stores at save, so it still loads (`payload_version_is_readable`).
-// v20 publishes each penalty block's EDF rank-bound status beside its trace
-// (`FitInference::edf_rank_bound`, #2901): a trace that is not certified to lie in
-// `[0, rank]` is published unclamped, and the status says so. The field carries a
-// serde default, and a v19 or v18 payload, which predates it, loads with an empty
-// list, which reads as "none recorded".
-// v21 renames the Tier-0 rho-posterior diagnostic's saved tokens (#2946 T2): the outcome
-// tag `Certified` is now `Assessed`, the grade key `certificate` is now `adequacy`, and the
-// grade `PlugInCertified` is now `PlugInAdequate`. The old tokens are read-only serde
-// aliases, so a v20, v19 or v18 payload still loads, and a v20 binary refuses a v21
-// payload by version instead of failing on an unknown variant.
-// v22 records the #2954 certificate's Newton polish
-// (`OuterCriterionCertificate::newton_polish`) and each railed coordinate's face kind
-// (`RailedCoordinateFact::face`, `NewtonPolishRail::face`) inside the fit artifacts. Both carry
-// serde defaults, so an older payload loads with no polish and every face `Unrecorded`: no
-// record is ever read as a face kind it did not record.
-// v23 records which latent law a marginal-slope fit consumed (`latent_law_consumed`,
-// gam#2926): an estimate with its certificate, a declaration, or the Gaussian closed form.
-// The field carries a serde default, so a v22, v21, v20, v19 or v18 payload, which predates it,
-// loads with no record, which reads as the law the pre-gam#2926 automatic gate chose; a v22
-// binary refuses a v23 payload by version.
-// v24 adds a `CovarianceDeclined` variant (gam#2985): a marginal-slope fit with a residual
-// repair block and a fired latent-z calibration withholds its covariance and records why.
-// No v23 payload carries the variant, so a v23 payload loads unchanged; a v23 binary
-// refuses a v24 payload by version instead of failing on an unknown variant.
-// v25 records the certified outer point of a custom-family fit
-// (`FitArtifacts::outer_warm_start`), in the outer objective's own coordinates, for
-// `warm_start_from`. It carries a serde default, so a v24 or older payload loads with no
-// point, and `warm_start_from` refuses it by name; a v24 binary refuses a v25 payload by
-// version.
-// v26 divides the whole survival location-scale residual by σ (#2695): the kernel's
-// standardized residual is `u = (h(t) − η_t)·e^{−η_σ}` and the event log-density
-// carries the scale's `−η_σ`. Before it the scale divided the location alone,
-// `u = h(t) − η_t·e^{−η_σ}`. A v25, v24, v23, v22, v21, v20, v19 or v18 survival
-// location-scale payload whose log-σ predictor and time-warp coefficients can both be
-// nonzero describes a different model and is refused by name
-// (`validate_survival_location_scale_saved_fit`). Every other payload of those versions
-// loads: a zero log-σ predictor makes σ ≡ 1, and an all-zero warp (the reduced
-// parametric-AFT lift, the σ-scaled log-t baseline of #892) fits `h ≡ 0`, where the two
-// kernels agree.
-// v27 records which rule selected a custom-family fit's coefficient mode
-// (`FitArtifacts::coefficient_mode_selection`, gam#2661): the #2661 anchored continuation, a
-// family objective homotopy, a unique mode, or the caller's seed when no rule applied. The field
-// carries a serde default, so an older payload loads as `NotRecorded`, which claims nothing; a
-// v26 binary refuses a v27 payload by version.
-// v28 records, beside a certified outer point, the criterion value certified there and the
-// fingerprint of the fit's inputs (`OuterWarmStartRecord::{value, input_fingerprint}`, gam#3002),
-// and names its coordinates `theta` (the `rho` of a v25 to v27 record reads as its alias). Both
-// fields carry serde defaults, so an older point loads without them and can only join a search,
-// never resume one; a v27 binary refuses a v28 payload by version.
-// v29 stops persisting per-row training data in a standard fit (speed F6): the exact
-// full-conformal field keeps only the p × p frozen penalty `s_lambda` (the labeled rows are
-// supplied again at prediction time), and `FitGeometry::working` (the final PIRLS weights and
-// working response, n each) is no longer serialized, so a saved standard GAM no longer grows
-// with the training rows. A v28 or older payload still loads: its conformal `x` and `y` and
-// its working geometry are read past and dropped. A v28 binary refuses a v29 payload by
-// version instead of failing on the conformal field's missing `x`.
-// v30 records whether the certificate's Newton polish ended on a settling step, in place of
-// the step budget it no longer has (`NewtonPolishRecord::settled`, #3012). 996d0af2c1 made
-// that change at v29, so a v29 payload has two shapes (gam#3166): one written before it
-// carries `step_budget`, which this binary reads past, and one written after it carries
-// `settled`. Both load, and `settled` reads as false where it is absent. A v29 binary
-// refuses a v30 payload by version instead of failing on the missing `step_budget`.
-// v31 records the Gaussian location-scale σ floor (`gaussian_sigma_floor`): the recording-grid
-// bound δ/√12 of the standardized response, which replaced the fixed floor 0.01. The field carries
-// a serde default so every other family's older payload reads through; a Gaussian location-scale
-// payload without it was fitted under the old floor, and the saved-fit validator refuses it by name.
-// v32 records each moving-law arm's Gaussian-residual adequacy screen
-// (`MovingLawArmScore::adequacy`, gam#2926): an arm whose residual the screen rejects is
-// scored but not a candidate. It carries a serde default, so an older payload loads with no
-// screen, which reads as the rule it was chosen by, where every arm was a candidate; a v31
-// binary refuses a v32 payload by version.
-// v33 records, beside the exact full-conformal frozen penalty, the fit's smoothing-parameter
-// count (`ExactFullConformalPenalty::penalty_count`, gam#3296), which decides whether the REML
-// re-selecting map is computable. It carries a serde default, so an older payload loads with no
-// count and its conformal rows are refused by name (`UnknownPenaltyStructure`); a v32 binary
-// refuses a v33 payload by version instead of publishing its frozen-λ set for a fit whose
-// selection it cannot see.
+/// A file is read only at exactly this version; any other version, and any
+/// document that is not a `gam` envelope, is refused by name and must be
+/// refitted. Bump it whenever the on-wire shape or the meaning of any saved
+/// field changes, so that a reader never decodes a file it would misread.
 // v34 records the closed-form certificate's null law (gam#2926):
 // `ClosedFormAnchorResidual::{null_p_value, null_p_value_relative_error, null_modes}`,
 // whose decision is now the null tail against its design rate instead of the sign of
-// `D̂`. All three carry serde defaults, so a v33 or older payload loads with none
-// recorded, its decision as it was made; a v33 binary refuses a v34 payload by version.
+// `D̂`.
 // v35 carries the constant variance stage in the latent-Z calibration's first-stage
 // covariance (`theta1_cov`, gam#3030): a fit whose variance stage does not fire now
 // records the `(p+2)²` joint covariance, with the variance row and column, where v34
-// recorded `(p+1)²`. A v34 payload still loads and predicts; its generated-regressor
-// correction refuses the narrower covariance by name, so no interval is published
-// without the stage.
+// recorded `(p+1)²`.
 // v36 freezes a gauged smooth's term-local chart and its joint-null rotation `Q` apart, and
 // records the collection chart `T` on the term's parametric residualization chart
 // (`ParametricResidualizationChart::coefficient_transform`, #3001), so the replay forms
 // `((B·z_local)·Q)·T − C·R` in the fit's own order instead of `B·(z_local·Q·T) − C·R`, which
-// moved μ by up to 2 ulp. An older payload froze the composed chart and no `T`, so it cannot
-// be replayed in that order: every older version is refused by name, and a v35 binary refuses
-// a v36 payload by version.
-pub const MODEL_PAYLOAD_VERSION: u32 = 36;
-
-/// Every payload version this binary reads. Each older schema froze a gauged smooth's
-/// composed chart without the collection chart `T` its replay now applies (#3001), so a
-/// payload written at any other version is refused by name (`payload_version_mismatch`).
-/// Callers that need a refused or an accepted version read it from here rather than
-/// offsetting [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
-/// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 1] = [MODEL_PAYLOAD_VERSION];
-
-/// Whether this binary reads a payload written at `version`.
-fn payload_version_is_readable(version: u32) -> bool {
-    READABLE_PAYLOAD_VERSIONS.contains(&version)
-}
+// moved μ by up to 2 ulp.
+// v37 moves the version out of the payload and into the shared `{kind, version, model}`
+// envelope, stores the fit once (the `unified` copy of `fit_result` is gone) and reads the
+// file in one streaming pass (#3350).
+pub const MODEL_PAYLOAD_VERSION: u32 = 37;
 
 /// Coefficient parameterization of a saved transformation-normal (CTN) fit.
 ///
@@ -537,7 +424,6 @@ pub struct FittedModelPayload {
     pub score_transform: Option<Box<FittedModelPayload>>,
     /// Row-aligned nuisance folds, absent for an externally fitted transform.
     pub score_crossfit_folds: Option<Vec<usize>>,
-    pub version: u32,
     pub formula: String,
     pub model_kind: ModelKind,
     pub family_state: FittedFamily,
@@ -594,9 +480,6 @@ pub struct FittedModelPayload {
     pub used_device: bool,
     #[serde(default)]
     pub fit_result: Option<UnifiedFitResult>,
-    /// Unified (family-agnostic) representation of the fit result.
-    #[serde(default)]
-    pub unified: Option<UnifiedFitResult>,
     /// Exact O(n) spline-scan fit representation (#1030/#1034): the
     /// state-space smoothing-spline posterior of a single 1-D Gaussian
     /// smooth. When `Some`, this standard Gaussian model's predictions
@@ -1030,14 +913,12 @@ pub fn append_deployment_extension_columns(
 
 impl FittedModelPayload {
     pub fn new(
-        version: u32,
         formula: String,
         model_kind: ModelKind,
         family_state: FittedFamily,
         family: String,
     ) -> Self {
         Self {
-            version,
             formula,
             model_kind,
             family_state,
@@ -1049,7 +930,6 @@ impl FittedModelPayload {
             basis_adequacy: Vec::new(),
             used_device: false,
             fit_result: None,
-            unified: None,
             spline_scan: None,
             residual_cascade: None,
             data_schema: None,
@@ -1209,87 +1089,51 @@ impl FittedModelPayload {
         self.survival_time_keep_cols = snapshot.keep_cols.clone();
         self.survival_time_anchor = Some(snapshot.anchor);
     }
+}
 
-    fn validate_payload_version(&self) -> Result<(), FittedModelError> {
-        if !payload_version_is_readable(self.version) {
-            return Err(payload_version_mismatch(
-                self.version,
-                Some(&self.family_state.likelihood()),
-            ));
+/// A refusal of the shared saved-model reader or writer, as the model's own
+/// error. A document of another kind or version names the remedy: refit.
+fn saved_model_error(error: SavedModelError) -> FittedModelError {
+    match error {
+        SavedModelError::Kind { .. } | SavedModelError::Version { .. } => {
+            FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "{error}. This build reads only saved GAM models of kind \"{SAVED_MODEL_KIND}\" \
+                     at version {MODEL_PAYLOAD_VERSION}; refit the model with this build"
+                ),
+            }
         }
-        Ok(())
+        SavedModelError::Malformed { .. }
+        | SavedModelError::Inconsistent { .. }
+        | SavedModelError::Io { .. } => FittedModelError::PayloadCorrupt {
+            reason: error.to_string(),
+        },
     }
 }
 
-/// The two fields a stale payload is judged by, and nothing else: the version, and
-/// the family's likelihood when it has one (#2902 row 34). Every other field of the
-/// saved model is ignored, so a schema change elsewhere cannot turn the typed
-/// refusal into a parse error.
-#[derive(Deserialize)]
-struct PayloadVersionProbe {
-    payload: PayloadVersionProbeFields,
-}
-
-#[derive(Deserialize)]
-struct PayloadVersionProbeFields {
-    version: u32,
-    family_state: PayloadFamilyProbe,
-}
-
-/// Two `FittedFamily` variants carry no likelihood, and a likelihood whose wire
-/// shape no longer converts keeps the generic reason, so it is read as raw JSON.
-#[derive(Deserialize)]
-struct PayloadFamilyProbe {
-    #[serde(default)]
-    likelihood: Option<serde_json::Value>,
-}
-
-/// The payload version at which a binomial beta-logistic link's `(epsilon,
-/// log_delta)` changed meaning: the link standardizes `Z = logit(U)`,
-/// `U ~ Beta(a, b)`, to logit's location and scale from here on (#2902 row 34).
-const BETA_LOGISTIC_STANDARDIZED_PAYLOAD_VERSION: u32 = 17;
-
-/// The typed refusal for a payload written at another schema version.
-///
-/// Every stale payload gets the generic reason. A binomial beta-logistic payload
-/// written before [`BETA_LOGISTIC_STANDARDIZED_PAYLOAD_VERSION`] also names the
-/// parameterization change: its saved shapes and coefficients describe the
-/// unstandardized link, so loading it would silently predict through a different
-/// link. `likelihood` is `None` when the family cannot be read, which keeps the
-/// generic reason.
-fn payload_version_mismatch(version: u32, likelihood: Option<&LikelihoodSpec>) -> FittedModelError {
-    let generic = format!(
-        "saved model payload schema mismatch: file has version={version}, \
-         this binary expects MODEL_PAYLOAD_VERSION={MODEL_PAYLOAD_VERSION}. \
-         Refit with the current CLI, or rebuild the reader at the same \
-         version the model was written with."
-    );
-    let reason = match likelihood {
-        Some(likelihood)
-            if version < BETA_LOGISTIC_STANDARDIZED_PAYLOAD_VERSION
-                && likelihood.is_binomial_beta_logistic() =>
-        {
-            format!(
-                "{generic} This is a binomial beta-logistic model written before payload \
-                 version {BETA_LOGISTIC_STANDARDIZED_PAYLOAD_VERSION}, where the link's \
-                 (epsilon, log_delta) changed meaning: the link now standardizes \
-                 Z = logit(U), U ~ Beta(a, b), to logit's location and scale, so the saved \
-                 shapes and coefficients describe a different link. Refit."
-            )
-        }
-        _ => generic,
-    };
-    FittedModelError::SchemaMismatch { reason }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "model_type", rename_all = "kebab-case")]
+/// A fitted model. Its variant is a function of the payload's `model_kind`
+/// and likelihood (`FittedModel::from_payload`), so the wire form is the
+/// payload alone: it serializes as its payload and deserializes by decoding
+/// the payload once and classifying it, with no tag to buffer or keep in step.
+#[derive(Clone)]
 pub enum FittedModel {
     Standard { payload: FittedModelPayload },
     LocationScale { payload: FittedModelPayload },
     MarginalSlope { payload: FittedModelPayload },
     Survival { payload: FittedModelPayload },
     TransformationNormal { payload: FittedModelPayload },
+}
+
+impl Serialize for FittedModel {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.payload().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for FittedModel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        FittedModelPayload::deserialize(deserializer).map(FittedModel::from_payload)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -3700,32 +3544,13 @@ impl FittedModel {
 
     fn synchronize_stateful_link_metadata(&mut self) {
         let payload = self.payload_mut();
-        // `fit_result` and `unified` are two names for the SAME canonical
-        // UnifiedFitResult — every production builder (run_fit, the
-        // model_payload_builders) sets both to the identical fit. Consumers and
-        // the mutual-exclusivity persistence checks read `fit_result.or(unified)`,
-        // but the dense-path persistence gate and the marginal-slope serialization
-        // key on `fit_result` alone (`self.fit_result.as_ref().expect("checked
-        // above")`). A payload constructed directly from just a `unified` fit
-        // (nothing wrong with that — it is the same value) would then fail
-        // `validate_for_persistence` with "missing canonical fit_result payload".
-        // Mirror the two so whichever the caller populated, the canonical
-        // `fit_result` slot (and its `unified` alias) is always present.
-        match (payload.fit_result.is_none(), payload.unified.is_none()) {
-            (true, false) => payload.fit_result = payload.unified.clone(),
-            (false, true) => payload.unified = payload.fit_result.clone(),
-            // Both populated (already mirrored) or both absent (no fit to
-            // mirror) — nothing to copy either way.
-            (true, true) | (false, false) => {}
-        }
         payload.used_device = payload
             .fit_result
             .as_ref()
-            .or(payload.unified.as_ref())
             .is_some_and(|fit| fit.used_device);
         payload.synchronize_empty_feature_contract();
         payload.synchronize_role_column_kinds();
-        let Some(fit) = payload.fit_result.as_ref().or(payload.unified.as_ref()) else {
+        let Some(fit) = payload.fit_result.as_ref() else {
             return;
         };
         // Only the `Standard` family shape owns stateful-link slots; the
@@ -4397,7 +4222,6 @@ impl FittedModel {
     }
 
     pub fn saved_prediction_runtime(&self) -> Result<SavedPredictionRuntime, FittedModelError> {
-        self.payload().validate_payload_version()?;
         if matches!(
             self.predict_model_class(),
             PredictModelClass::BernoulliMarginalSlope | PredictModelClass::Survival
@@ -4468,20 +4292,20 @@ impl FittedModel {
             runtime.model_class,
             PredictModelClass::BernoulliMarginalSlope
         ) {
-            let unified =
+            let fit =
                 self.payload()
-                    .unified
+                    .fit_result
                     .as_ref()
                     .ok_or_else(|| FittedModelError::MissingField {
-                        reason: "marginal-slope model is missing unified fit payload; refit"
+                        reason: "marginal-slope model is missing its fit_result payload; refit"
                             .to_string(),
                     })?;
             validate_marginal_slope_saved_fit(
-                unified,
+                fit,
                 runtime.residual_repair.as_ref(),
                 runtime.score_warp.as_ref(),
                 runtime.link_deviation.as_ref(),
-                "unified",
+                "fit_result",
             )?;
         } else if matches!(runtime.model_class, PredictModelClass::Survival)
             && self
@@ -5098,143 +4922,54 @@ impl FittedModel {
 
     /// Access the unified fit result, if stored.
     pub fn unified(&self) -> Option<&UnifiedFitResult> {
-        self.payload().unified.as_ref()
+        self.payload().fit_result.as_ref()
     }
 
-    pub fn load_from_path(path: &Path) -> Result<Self, FittedModelError> {
-        let payload = fs::read_to_string(path).map_err(|e| FittedModelError::PayloadCorrupt {
-            reason: format!("failed to read model '{}': {e}", path.display()),
-        })?;
-        // A stale payload is judged by its version and family alone, before the full
-        // parse, so a schema whose other fields no longer parse still gets the typed
-        // refusal instead of a parse error (#2902 row 34).
-        if let Ok(probe) = serde_json::from_str::<PayloadVersionProbe>(&payload)
-            && !payload_version_is_readable(probe.payload.version)
-        {
-            let likelihood = probe
-                .payload
-                .family_state
-                .likelihood
-                .and_then(|value| serde_json::from_value::<LikelihoodSpec>(value).ok());
-            return Err(payload_version_mismatch(
-                probe.payload.version,
-                likelihood.as_ref(),
-            ));
-        }
+    /// The saved document of this model: the `gam` envelope at
+    /// [`MODEL_PAYLOAD_VERSION`], as compact JSON.
+    ///
+    /// Every writer (the CLI's `save_to_path`, the Python surface) encodes
+    /// through here, so every saved model is synchronized and validated
+    /// before a byte is written. The shared writer refuses a non-finite float
+    /// by name (#2601): `serde_json` would write it as `null`, which an
+    /// `Option<f64>` reads back as `None`, silently.
+    pub fn to_saved_bytes(&self) -> Result<Vec<u8>, FittedModelError> {
+        let normalized = self.clone().with_synchronized_stateful_link_metadata();
+        normalized.validate_for_persistence()?;
+        normalized.validate_numeric_finiteness()?;
+        saved_model_text(SAVED_MODEL_KIND, u64::from(MODEL_PAYLOAD_VERSION), &normalized)
+            .map(String::into_bytes)
+            .map_err(saved_model_error)
+    }
+
+    /// The model in a saved document, decoded in one streaming pass.
+    ///
+    /// Every reader decodes through here. A document that is not a `gam`
+    /// envelope at exactly [`MODEL_PAYLOAD_VERSION`] is refused by name before
+    /// its model is read, and the decoded model must pass the same checks a
+    /// save does.
+    pub fn from_saved_bytes(bytes: &[u8]) -> Result<Self, FittedModelError> {
         let model: Self =
-            serde_json::from_str(&payload).map_err(|e| FittedModelError::PayloadCorrupt {
-                reason: format!("failed to parse model '{}': {e}", path.display()),
-            })?;
+            read_saved_model_bytes(bytes, SAVED_MODEL_KIND, u64::from(MODEL_PAYLOAD_VERSION))
+                .map_err(saved_model_error)?;
         let model = model.with_synchronized_stateful_link_metadata();
         model.validate_for_persistence()?;
         model.validate_numeric_finiteness()?;
         Ok(model)
     }
 
+    pub fn load_from_path(path: &Path) -> Result<Self, FittedModelError> {
+        let bytes = fs::read(path).map_err(|e| FittedModelError::PayloadCorrupt {
+            reason: format!("failed to read model '{}': {e}", path.display()),
+        })?;
+        Self::from_saved_bytes(&bytes)
+    }
+
+    /// Write the saved document to `path` atomically: a crash mid-write never
+    /// corrupts the file already there.
     pub fn save_to_path(&self, path: &Path) -> Result<(), FittedModelError> {
-        let normalized = self.clone().with_synchronized_stateful_link_metadata();
-        // `serde_json` writes NaN and ±inf as `null`: a required `f64` then fails to
-        // parse back, but an `Option<f64>` reloads as `None`, silently. The structural
-        // guard walks every float the writer would emit and names the first
-        // non-finite one (#2601), before any other check runs or the disk is touched.
-        gam_problem::ensure_serialized_floats_are_finite(&normalized).map_err(|found| {
-            FittedModelError::PayloadCorrupt {
-                reason: format!("refusing to persist a non-finite float: {found}"),
-            }
-        })?;
-        normalized.validate_for_persistence()?;
-        normalized.validate_numeric_finiteness()?;
-        normalized.validate_persisted_form_parses_back()?;
-        // Write to a sibling temp file, fsync, then rename into place so a
-        // crash mid-write never corrupts the user's existing saved fit.
-        // Concurrent writers to the same path each have a distinct temp
-        // suffix (pid + nanos), so neither stomps the other's in-flight
-        // bytes; the rename winner is last-rename-wins, which is the
-        // expected last-write-wins semantics for a single canonical path.
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let file_name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("model.json");
-        let pid = std::process::id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let tmp = parent.join(format!(".{file_name}.tmp.{pid}.{nanos:x}"));
-        let file = fs::File::create(&tmp).map_err(|e| FittedModelError::PayloadCorrupt {
-            reason: format!("failed to write model '{}': {e}", tmp.display()),
-        })?;
-        let mut writer = std::io::BufWriter::new(file);
-        let ser_result = serde_json::to_writer(&mut writer, &normalized);
-        if let Err(e) = ser_result {
-            // Best-effort temp cleanup on serialization failure: the
-            // serialization error below is the one the caller acts on, so
-            // neither of these may replace it. Log them so a temp file left
-            // behind in the model directory is explainable.
-            if let Err(flush_err) = std::io::Write::flush(&mut writer) {
-                log::trace!(
-                    "model publish: flushing the failed temp '{}' errored: {flush_err}",
-                    tmp.display()
-                );
-            }
-            drop(writer);
-            if let Err(rm_err) = fs::remove_file(&tmp) {
-                log::trace!(
-                    "model publish: could not remove the failed temp '{}': {rm_err}",
-                    tmp.display()
-                );
-            }
-            return Err(FittedModelError::PayloadCorrupt {
-                reason: format!("failed to serialize model: {e}"),
-            });
-        }
-        std::io::Write::flush(&mut writer).map_err(|e| FittedModelError::PayloadCorrupt {
-            reason: format!("failed to write model '{}': {e}", tmp.display()),
-        })?;
-        // Recover the underlying File to fsync its contents before rename.
-        let inner = writer
-            .into_inner()
-            .map_err(|e| FittedModelError::PayloadCorrupt {
-                reason: format!("failed to flush model '{}': {}", tmp.display(), e.error()),
-            })?;
-        if let Err(sync_err) = inner.sync_all() {
-            // The rename below still publishes the model, so this is not fatal
-            // — but the contents are no longer known to have reached disk, and
-            // that is exactly what a post-crash truncated model looks like.
-            log::debug!(
-                "model publish: fsync of '{}' failed, contents may not survive a crash: {sync_err}",
-                tmp.display()
-            );
-        }
-        drop(inner);
-        if let Err(e) = fs::rename(&tmp, path) {
-            if let Err(rm_err) = fs::remove_file(&tmp) {
-                log::trace!(
-                    "model publish: could not remove the unpublished temp '{}': {rm_err}",
-                    tmp.display()
-                );
-            }
-            return Err(FittedModelError::PayloadCorrupt {
-                reason: format!("failed to publish model '{}': {e}", path.display()),
-            });
-        }
-        // fsync the parent directory so the rename itself is durable
-        // across a crash; without this, the rename can be lost even though
-        // file contents reached disk. Best-effort on platforms that don't
-        // support opening a directory for fsync.
-        if let Ok(d) = fs::File::open(parent)
-            && let Err(sync_err) = d.sync_all()
-        {
-            // Platforms that cannot fsync a directory land here; the model file
-            // itself is already durable, only the rename's durability is
-            // unconfirmed.
-            log::trace!(
-                "model publish: directory fsync of '{}' failed: {sync_err}",
-                parent.display()
-            );
-        }
-        Ok(())
+        let bytes = self.to_saved_bytes()?;
+        write_saved_model(path, &bytes).map_err(saved_model_error)
     }
 
     pub fn require_data_schema(&self) -> Result<&DataSchema, FittedModelError> {
@@ -5426,20 +5161,6 @@ impl FittedModel {
     }
 
     pub fn validate_for_persistence(&self) -> Result<(), FittedModelError> {
-        // Hard version gate. The struct's ~40 Option<T> fields carry
-        // `#[serde(default)]`, which is by design forward-compatible: old
-        // payloads missing a new optional field decode with `None`. BUT:
-        // when a new CLI release adds a required field for some family_state
-        // (enforced below), an older model loaded by the newer CLI would have
-        // `None` in that slot and the family-specific branch below would
-        // correctly reject it — unless the new field also happens to slot
-        // under a branch that hasn't been touched. Conversely, a newer model
-        // loaded by an older CLI silently drops fields the older struct
-        // doesn't know about. Both directions are silent-drift hazards. We
-        // close them with an exact-version check anchored to the canonical
-        // MODEL_PAYLOAD_VERSION constant — every payload must round-trip
-        // identically between writers and readers running the same schema.
-        self.validate_payload_version()?;
         if self.score_transform.is_none() && self.score_crossfit_folds.is_some() {
             return Err(FittedModelError::SchemaMismatch { reason: "CTN folds require a saved score transform".into() });
         }
@@ -5454,19 +5175,6 @@ impl FittedModel {
                 return Err(FittedModelError::SchemaMismatch { reason: "score_transform must be a standalone CTN".into() });
             }
             transform.validate_for_persistence()?;
-        }
-        if let (Some(fit_result), Some(unified)) =
-            (self.fit_result.as_ref(), self.unified.as_ref())
-            && fit_result.training_sample_size() != unified.training_sample_size()
-        {
-            return Err(FittedModelError::SchemaMismatch {
-                reason: format!(
-                    "saved model fit_result training_sample_size {} disagrees with its unified \
-                     materialization {}; regenerate the model",
-                    fit_result.training_sample_size(),
-                    unified.training_sample_size()
-                ),
-            });
         }
         let (expectile_family_tag, joint_expectile_family_tag) = {
             let family = self.family.trim().to_ascii_lowercase();
@@ -5578,9 +5286,9 @@ impl FittedModel {
             // the fit. It is exclusive with the dense representation, only
             // standard Gaussian-identity models can carry it, and the state
             // must restore cleanly so predict never sees a corrupt snapshot.
-            if self.fit_result.is_some() || self.unified.is_some() {
+            if self.fit_result.is_some() {
                 return Err(FittedModelError::SchemaMismatch {
-                    reason: "spline-scan model must not also carry a dense fit_result/unified \
+                    reason: "spline-scan model must not also carry a dense fit_result \
                              payload; the representations are mutually exclusive"
                         .to_string(),
                 });
@@ -5625,10 +5333,10 @@ impl FittedModel {
             // Residual-cascade representation (#1032): a multilevel
             // Wendland-frame model for a scattered d ∈ {2,3} Gaussian smooth.
             // Exclusive with the dense representation and with the scan.
-            if self.spline_scan.is_some() || self.fit_result.is_some() || self.unified.is_some() {
+            if self.spline_scan.is_some() || self.fit_result.is_some() {
                 return Err(FittedModelError::SchemaMismatch {
                     reason: "residual-cascade model must not also carry spline_scan / \
-                             fit_result / unified payloads; the representations are \
+                             fit_result payloads; the representations are \
                              mutually exclusive"
                         .to_string(),
                 });
@@ -6130,20 +5838,6 @@ impl FittedModel {
                 self.link_deviation_runtime.as_ref(),
                 "fit_result",
             )?;
-            let unified = self
-                .unified
-                .as_ref()
-                .ok_or_else(|| FittedModelError::MissingField {
-                    reason: "marginal-slope model is missing unified fit payload; refit"
-                        .to_string(),
-                })?;
-            validate_marginal_slope_saved_fit(
-                unified,
-                self.residual_repair.as_ref(),
-                self.score_warp_runtime.as_ref(),
-                self.link_deviation_runtime.as_ref(),
-                "unified",
-            )?;
         }
         if self
             .survival_likelihood
@@ -6155,9 +5849,6 @@ impl FittedModel {
                 self.fit_result.as_ref().expect("checked above"),
                 "fit_result",
             )?;
-            if let Some(unified) = self.unified.as_ref() {
-                validate_survival_marginal_slope_saved_fit(self, unified, "unified")?;
-            }
         }
 
         Ok(())
@@ -6249,58 +5940,6 @@ impl FittedModel {
                 ),
             })?;
         Ok(())
-    }
-
-    /// Refuse to persist a model that cannot be read back.
-    ///
-    /// [`Self::validate_numeric_finiteness`] below is a hand-maintained
-    /// enumeration of roughly forty named fields. It is incomplete by
-    /// construction: every field added after it was written is unguarded, and
-    /// the omission is invisible until a LOAD fails somewhere else entirely.
-    /// That is how a non-finite `f64` reaches disk. `serde_json` renders
-    /// `f64::NAN` and `±inf` as JSON `null`, so the value serialises silently
-    /// and then fails deserialisation as `invalid type: null, expected f64`
-    /// (#2601) — in a different session, with no field name and no way back to
-    /// the fit that produced it.
-    ///
-    /// This states the same demand against the SERIALISATION instead of against
-    /// a list of names, so it covers every field that exists or will exist.
-    /// [`Self::load_from_path`] is `serde_json::from_str::<Self>`, so a model
-    /// that fails this check is already unloadable — refusing to write it
-    /// cannot lose anything that could have been recovered, and it moves the
-    /// error to the fit that caused it.
-    ///
-    /// The null-valued paths are reported alongside serde's own message
-    /// because serde names a line and column in a document nobody kept.
-    pub(crate) fn validate_persisted_form_parses_back(&self) -> Result<(), FittedModelError> {
-        let value =
-            serde_json::to_value(self).map_err(|error| FittedModelError::PayloadCorrupt {
-                reason: format!("failed to serialize model: {error}"),
-            })?;
-        let Err(parse_error) = serde_json::from_value::<Self>(value.clone()) else {
-            return Ok(());
-        };
-        let mut nulls = Vec::new();
-        collect_json_null_paths(&value, "$", &mut nulls);
-        // A model carries many legitimately-absent `Option` fields, so the list
-        // is a lead rather than a verdict, and it is capped: the point is to
-        // name the candidates, not to reproduce the document.
-        const REPORTED_NULL_PATHS: usize = 24;
-        let truncated = nulls.len().saturating_sub(REPORTED_NULL_PATHS);
-        nulls.truncate(REPORTED_NULL_PATHS);
-        Err(FittedModelError::PayloadCorrupt {
-            reason: format!(
-                "refusing to persist a model that cannot be parsed back: {parse_error}. \
-                 A non-finite f64 serialises as JSON null, so these null-valued paths are \
-                 the candidates: [{}]{}",
-                nulls.join(", "),
-                if truncated > 0 {
-                    format!(" (+{truncated} more)")
-                } else {
-                    String::new()
-                },
-            ),
-        })
     }
 
     pub fn validate_numeric_finiteness(&self) -> Result<(), FittedModelError> {
@@ -6583,35 +6222,6 @@ pub fn load_survival_time_basis_config_from_model(
     }
 }
 
-/// Every JSON path under `value` holding `null`, in `$.a.b[3].c` form.
-///
-/// A non-finite `f64` is indistinguishable from `Option::None` once serialised
-/// — both are `null` — so this cannot decide which is which on its own. It is
-/// used only alongside a failed round-trip, where serde has already established
-/// that at least one of them is not an `Option`, and it supplies the field names
-/// serde's line-and-column message cannot.
-fn collect_json_null_paths(value: &serde_json::Value, path: &str, out: &mut Vec<String>) {
-    match value {
-        serde_json::Value::Null => out.push(path.to_string()),
-        serde_json::Value::Array(items) => {
-            for (index, item) in items.iter().enumerate() {
-                collect_json_null_paths(item, &format!("{path}[{index}]"), out);
-            }
-        }
-        serde_json::Value::Object(entries) => {
-            for (key, item) in entries {
-                collect_json_null_paths(item, &format!("{path}.{key}"), out);
-            }
-        }
-        // A bool, number or string holds no nested value: there is nothing to
-        // descend into and nothing to record. Returning states that, where an
-        // empty block would only have looked like an unfinished case — and an
-        // empty arm here fails the root build script's ban scanner, which
-        // blocks every wheel build in the repository.
-        _ => return,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6636,9 +6246,8 @@ mod tests {
     /// geometry record is present) the CTN branch of `validate_for_persistence`.
     /// The response-basis snapshot fields are made consistent with the geometry
     /// record so the cross-checks accept.
-    fn transformation_normal_payload(version: u32, fit: UnifiedFitResult) -> FittedModelPayload {
+    fn transformation_normal_payload(fit: UnifiedFitResult) -> FittedModelPayload {
         let mut payload = FittedModelPayload::new(
-            version,
             "y ~ s(x)".to_string(),
             ModelKind::TransformationNormal,
             FittedFamily::TransformationNormal {
@@ -6646,8 +6255,7 @@ mod tests {
             },
             "transformation-normal".to_string(),
         );
-        payload.fit_result = Some(fit.clone());
-        payload.unified = Some(fit);
+        payload.fit_result = Some(fit);
         payload.data_schema = Some(DataSchema {
             columns: vec![
                 SchemaColumn {
@@ -6697,7 +6305,7 @@ mod tests {
     /// round-trip and keep validating, with every field preserved.
     #[test]
     fn transformation_normal_geometry_round_trips_and_validates() {
-        let payload = transformation_normal_payload(MODEL_PAYLOAD_VERSION, transformation_normal_fit());
+        let payload = transformation_normal_payload(transformation_normal_fit());
         let model = FittedModel::from_payload(payload);
         model
             .validate_for_persistence()
@@ -6732,7 +6340,7 @@ mod tests {
     #[test]
     fn validate_for_persistence_rejects_ctn_without_geometry_record() {
         let mut payload =
-            transformation_normal_payload(MODEL_PAYLOAD_VERSION, transformation_normal_fit());
+            transformation_normal_payload(transformation_normal_fit());
         payload.transformation_geometry = None;
         let err = FittedModel::from_payload(payload)
             .validate_for_persistence()
@@ -6750,7 +6358,7 @@ mod tests {
         // also rejected (cross-check), so a partially-migrated payload cannot
         // slip through.
         let mut mismatched =
-            transformation_normal_payload(MODEL_PAYLOAD_VERSION, transformation_normal_fit());
+            transformation_normal_payload(transformation_normal_fit());
         if let Some(geometry) = mismatched.transformation_geometry.as_mut() {
             geometry.response_knot_count += 1;
         }
@@ -6856,7 +6464,6 @@ mod tests {
 
     fn standard_gaussian_payload() -> FittedModelPayload {
         FittedModelPayload::new(
-            MODEL_PAYLOAD_VERSION,
             "y ~ 1".to_string(),
             ModelKind::Standard,
             FittedFamily::Standard {
@@ -6980,7 +6587,6 @@ mod tests {
 
     fn standard_binomial_model(fit: UnifiedFitResult) -> FittedModel {
         let mut payload = FittedModelPayload::new(
-            MODEL_PAYLOAD_VERSION,
             "y ~ 1".to_string(),
             ModelKind::Standard,
             FittedFamily::Standard {
@@ -6992,37 +6598,8 @@ mod tests {
             },
             "binomial".to_string(),
         );
-        payload.fit_result = Some(fit.clone());
-        payload.unified = Some(fit);
+        payload.fit_result = Some(fit);
         FittedModel::from_payload(payload)
-    }
-
-    #[test]
-    fn dense_materializations_must_share_training_sample_size() {
-        let canonical = saved_fit(vec![FittedBlock {
-            beta: array![0.25],
-            role: BlockRole::Mean,
-            edf: 1.0,
-            lambdas: Array1::zeros(0),
-        }]);
-        let mut encoded = serde_json::to_value(&canonical).expect("serialize canonical fit");
-        encoded
-            .as_object_mut()
-            .expect("fit serializes as an object")
-            .insert("training_sample_size".to_string(), serde_json::json!(17));
-        let divergent =
-            serde_json::from_value::<UnifiedFitResult>(encoded).expect("decode divergent alias");
-
-        let model = standard_binomial_model(canonical);
-        let mut payload = model.payload().clone();
-        payload.unified = Some(divergent);
-        let error = FittedModel::from_payload(payload)
-            .validate_for_persistence()
-            .expect_err("dense aliases cannot disagree about training rows");
-        assert!(
-            error.to_string().contains("training_sample_size"),
-            "alias disagreement reported an unrelated error: {error}"
-        );
     }
 
     #[test]
@@ -7221,9 +6798,8 @@ mod tests {
         assert!(!refusal.contains("Cholesky"), "got: {refusal}");
     }
 
-    fn marginal_slope_payload(version: u32, fit: UnifiedFitResult) -> FittedModelPayload {
+    fn marginal_slope_payload(fit: UnifiedFitResult) -> FittedModelPayload {
         let mut payload = FittedModelPayload::new(
-            version,
             "y ~ 1".to_string(),
             ModelKind::MarginalSlope,
             FittedFamily::MarginalSlope {
@@ -7233,8 +6809,7 @@ mod tests {
             },
             "bernoulli-marginal-slope".to_string(),
         );
-        payload.fit_result = Some(fit.clone());
-        payload.unified = Some(fit);
+        payload.fit_result = Some(fit);
         payload.data_schema = Some(DataSchema {
             columns: vec![SchemaColumn {
                 name: "z".to_string(),
@@ -7272,7 +6847,7 @@ mod tests {
             },
         ]);
         fit.used_device = true;
-        let mut payload = marginal_slope_payload(MODEL_PAYLOAD_VERSION, fit);
+        let mut payload = marginal_slope_payload(fit);
         payload.used_device = false;
 
         let model = FittedModel::from_payload(payload);
@@ -7280,9 +6855,8 @@ mod tests {
         assert!(model.payload().used_device);
     }
 
-    fn survival_marginal_slope_payload(version: u32, fit: UnifiedFitResult) -> FittedModelPayload {
+    fn survival_marginal_slope_payload(fit: UnifiedFitResult) -> FittedModelPayload {
         let mut payload = FittedModelPayload::new(
-            version,
             "Surv(entry, exit, event) ~ 1".to_string(),
             ModelKind::Survival,
             FittedFamily::Survival {
@@ -7293,8 +6867,7 @@ mod tests {
             },
             "survival".to_string(),
         );
-        payload.fit_result = Some(fit.clone());
-        payload.unified = Some(fit);
+        payload.fit_result = Some(fit);
         payload.survival_likelihood = Some("marginal-slope".to_string());
         payload.survival_distribution = Some(ResidualDistribution::Gaussian);
         payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
@@ -7324,7 +6897,6 @@ mod tests {
         // route it to `DispersionLocationScale`, NOT the binomial threshold-scale
         // class (issue #1064).
         let mut payload = FittedModelPayload::new(
-            MODEL_PAYLOAD_VERSION,
             "y ~ x".to_string(),
             ModelKind::LocationScale,
             FittedFamily::LocationScale {
@@ -7825,7 +7397,7 @@ mod tests {
                 lambdas: Array1::zeros(0),
             },
         ]);
-        let mut payload = marginal_slope_payload(MODEL_PAYLOAD_VERSION, fit);
+        let mut payload = marginal_slope_payload(fit);
         payload.score_warp_runtime = Some(anchored_runtime(2));
 
         let err = FittedModel::from_payload(payload)
@@ -7862,7 +7434,7 @@ mod tests {
                 lambdas: Array1::zeros(0),
             },
         ]);
-        let mut payload = survival_marginal_slope_payload(MODEL_PAYLOAD_VERSION, fit);
+        let mut payload = survival_marginal_slope_payload(fit);
         payload.link_deviation_runtime = Some(anchored_runtime(2));
 
         let err = FittedModel::from_payload(payload)
@@ -7900,7 +7472,7 @@ mod tests {
                 lambdas: Array1::zeros(0),
             },
         ]);
-        let mut payload = survival_marginal_slope_payload(MODEL_PAYLOAD_VERSION, fit);
+        let mut payload = survival_marginal_slope_payload(fit);
 
         // Snapshot writes must match every persisted survival_time_* field —
         // forgetting one is exactly the marginal-slope save
@@ -7947,7 +7519,7 @@ mod tests {
                 lambdas: Array1::zeros(0),
             },
         ]);
-        let mut payload = survival_marginal_slope_payload(MODEL_PAYLOAD_VERSION, fit);
+        let mut payload = survival_marginal_slope_payload(fit);
         // Pass the time_basis presence check but deliberately omit the
         // anchor — this is exactly the partial-write shape that the CLI's
         // marginal-slope+time-wiggle save path had before the structural
@@ -7983,7 +7555,7 @@ mod tests {
                 lambdas: Array1::zeros(0),
             },
         ]);
-        let payload = survival_marginal_slope_payload(MODEL_PAYLOAD_VERSION, fit);
+        let payload = survival_marginal_slope_payload(fit);
 
         let err = FittedModel::from_payload(payload)
             .validate_for_persistence()
@@ -7991,146 +7563,85 @@ mod tests {
         assert!(err.to_string().contains("missing survival_time_basis"));
     }
 
+    /// #3350: a saved GAM file is the `gam` envelope at exactly
+    /// `MODEL_PAYLOAD_VERSION`. A document of another version, of another kind,
+    /// or from before the envelope is refused by name before its model is read,
+    /// with the remedy (refit), and a document whose model does not parse is
+    /// corrupt rather than stale.
     #[test]
-    fn saved_prediction_runtime_rejects_stale_payload_version() {
-        let fit = saved_fit(vec![
-            FittedBlock {
-                beta: array![0.1],
-                role: BlockRole::Mean,
-                edf: 1.0,
-                lambdas: Array1::zeros(0),
-            },
-            FittedBlock {
-                beta: array![0.2],
-                role: BlockRole::Scale,
-                edf: 1.0,
-                lambdas: Array1::zeros(0),
-            },
-        ]);
-        let oldest_readable = READABLE_PAYLOAD_VERSIONS
-            .iter()
-            .copied()
-            .min()
-            .expect("this binary reads at least its own payload version");
-        let payload = marginal_slope_payload(oldest_readable - 1, fit);
-
-        let err = FittedModel::from_payload(payload)
-            .saved_prediction_runtime()
-            .expect_err("stale payload version should fail before runtime assembly");
-        assert!(err.to_string().contains("payload schema mismatch"));
-    }
-
-    /// #3001: an older payload froze a gauged smooth's composed chart and no collection
-    /// chart, so this binary cannot replay it in the fit's order. Every version but its own,
-    /// older or later, is refused by the named version error before a field is read.
-    #[test]
-    fn every_payload_version_but_this_binarys_is_refused_by_name_3001() {
-        let blocks = || {
-            vec![FittedBlock {
-                beta: array![0.1],
-                role: BlockRole::Mean,
-                edf: 1.0,
-                lambdas: Array1::zeros(0),
-            }]
+    fn a_saved_model_of_another_version_or_kind_is_refused_by_name_3350() {
+        let model = FittedModel::from_payload(standard_gaussian_payload());
+        let payload = serde_json::to_value(model.payload()).expect("serialize payload");
+        let refused = |document: serde_json::Value| -> FittedModelError {
+            match FittedModel::from_saved_bytes(document.to_string().as_bytes()) {
+                Ok(_) => panic!("refused document loaded: {document}"),
+                Err(error) => error,
+            }
         };
-        FittedModel::from_payload(marginal_slope_payload(MODEL_PAYLOAD_VERSION, saved_fit(blocks())))
-            .payload()
-            .validate_payload_version()
-            .expect("a payload at this binary's version is readable");
-        assert_eq!(READABLE_PAYLOAD_VERSIONS, [MODEL_PAYLOAD_VERSION]);
-        for version in (0..MODEL_PAYLOAD_VERSION).chain([MODEL_PAYLOAD_VERSION + 1]) {
-            let err = FittedModel::from_payload(marginal_slope_payload(version, saved_fit(blocks())))
-                .payload()
-                .validate_payload_version()
-                .expect_err("a payload at another version is refused");
-            let message = err.to_string();
+        // #3001 kept this exhaustive: every version but this binary's own is
+        // refused, not just its immediate neighbours.
+        let mut documents: Vec<(String, serde_json::Value)> = (0..MODEL_PAYLOAD_VERSION)
+            .chain([MODEL_PAYLOAD_VERSION + 1])
+            .map(|version| {
+                (
+                    format!("version {version}"),
+                    serde_json::json!({"kind": "gam", "version": version, "model": payload}),
+                )
+            })
+            .collect();
+        documents.push((
+            "other kind".to_string(),
+            serde_json::json!({"kind": "joint", "version": MODEL_PAYLOAD_VERSION, "model": payload}),
+        ));
+        documents.push((
+            "pre-envelope".to_string(),
+            serde_json::json!({"model_type": "standard", "payload": payload}),
+        ));
+        for (name, document) in documents {
+            let error = refused(document);
             assert!(
-                message.contains("payload schema mismatch")
-                    && message.contains(&format!("file has version={version}"))
-                    && message.contains(&format!("MODEL_PAYLOAD_VERSION={MODEL_PAYLOAD_VERSION}")),
-                "payload version {version} must be refused by its version: {message}"
+                matches!(error, FittedModelError::SchemaMismatch { .. }),
+                "{name}: {error}"
             );
+            assert!(error.to_string().contains("refit"), "{name}: {error}");
         }
+        let error = refused(serde_json::json!({
+            "kind": "gam",
+            "version": MODEL_PAYLOAD_VERSION,
+            "model": {"formula": 42},
+        }));
+        assert!(matches!(error, FittedModelError::PayloadCorrupt { .. }), "{error}");
     }
 
-    /// gam#3002: a certified point saved before v28 reads with its `rho` as `theta` and with
-    /// no value or fingerprint, so a warm start from it can only join a search; a v28 point
-    /// round-trips whole.
+    /// #3350: the saved document carries the kind and version first, then the
+    /// model once: no `model_type` tag and no second copy of the fit.
     #[test]
-    fn a_certified_point_before_v28_loads_without_its_value_or_fingerprint_3002() {
-        use gam_solve::model_types::OuterWarmStartRecord;
-        let record: OuterWarmStartRecord =
-            serde_json::from_str(r#"{"rho":[1.5,-2.0],"beta":[0.25]}"#).expect("a v27 point reads");
-        assert_eq!(record.theta, vec![1.5, -2.0]);
+    fn a_saved_model_is_one_envelope_holding_the_fit_once_3350() {
+        let mut payload = standard_gaussian_payload();
+        payload.fit_result = Some(saved_fit(vec![FittedBlock {
+            beta: array![0.25],
+            role: BlockRole::Mean,
+            edf: 1.0,
+            lambdas: Array1::zeros(0),
+        }]));
+        let model = FittedModel::from_payload(payload);
+        let text = serde_json::to_string(&model).expect("serialize model");
+        let document: serde_json::Value = serde_json::from_str(&format!(
+            "{{\"kind\":\"gam\",\"version\":{MODEL_PAYLOAD_VERSION},\"model\":{text}}}"
+        ))
+        .expect("parse document");
+        let saved = document["model"].as_object().expect("model object");
+        assert!(saved.contains_key("fit_result"));
+        assert!(!saved.contains_key("unified"));
+        assert!(!saved.contains_key("version"));
+        assert!(!saved.contains_key("model_type"));
+        let restored: FittedModel = serde_json::from_str(&text).expect("restore model");
+        assert_eq!(restored.model_kind, model.model_kind);
         assert_eq!(
-            (record.value, record.input_fingerprint.as_deref()),
-            (None, None)
+            serde_json::to_string(&restored).expect("reserialize"),
+            text,
+            "the payload round-trips byte for byte"
         );
-        let current = OuterWarmStartRecord {
-            value: Some(3.0),
-            input_fingerprint: Some("00ff".to_string()),
-            ..record
-        };
-        let text = serde_json::to_string(&current).expect("a v28 point writes");
-        let read: OuterWarmStartRecord = serde_json::from_str(&text).expect("a v28 point reads");
-        assert_eq!(read, current);
-    }
-
-    /// #2902 row 34: at payload version 17 a binomial beta-logistic link's
-    /// `(epsilon, log_delta)` changed meaning, because the link now standardizes
-    /// `Z = logit(U)` to logit's location and scale. A stale beta-logistic payload
-    /// is refused by that name; any other stale payload keeps the generic reason.
-    /// The refusal is chosen from the version and the family alone, so it survives
-    /// a stale field that no longer parses.
-    #[test]
-    fn a_stale_beta_logistic_payload_is_refused_by_the_standardized_link_2902() {
-        const NAMED: &str = "standardizes Z = logit(U)";
-        let state = SasLinkState {
-            epsilon: 0.1,
-            log_delta: -0.2,
-            delta: (-0.2_f64).exp(),
-        };
-        let beta_logistic = FittedModelPayload::new(
-            16,
-            "y ~ x".to_string(),
-            ModelKind::Standard,
-            FittedFamily::Standard {
-                likelihood: LikelihoodSpec::new(
-                    ResponseFamily::Binomial,
-                    InverseLink::BetaLogistic(state),
-                ),
-                link: None,
-                latent_cloglog_state: None,
-                mixture_state: None,
-                sas_state: Some(state),
-            },
-            "binomial".to_string(),
-        );
-        let mut gaussian = standard_gaussian_payload();
-        gaussian.version = 16;
-        let dir = tempfile::tempdir().expect("tempdir");
-        for (name, payload, named) in [("beta-logistic", beta_logistic, true), ("gaussian", gaussian, false)]
-        {
-            let mut encoded =
-                serde_json::to_value(FittedModel::Standard { payload }).expect("serialize model");
-            let path = dir.path().join(format!("{name}.json"));
-            std::fs::write(&path, encoded.to_string()).expect("write model");
-            let Err(error) = FittedModel::load_from_path(&path) else {
-                panic!("{name}: a version-16 payload must refuse");
-            };
-            let reason = error.to_string();
-            assert!(reason.contains("payload schema mismatch"), "{name}: {reason}");
-            assert_eq!(reason.contains(NAMED), named, "{name}: {reason}");
-
-            encoded["payload"]["formula"] = serde_json::json!(42);
-            std::fs::write(&path, encoded.to_string()).expect("write stale-field model");
-            let Err(error) = FittedModel::load_from_path(&path) else {
-                panic!("{name}: a version-16 payload with a stale field must refuse");
-            };
-            let reason = error.to_string();
-            assert!(reason.contains("payload schema mismatch"), "{name}, stale field: {reason}");
-            assert_eq!(reason.contains(NAMED), named, "{name}, stale field: {reason}");
-        }
     }
 
     /// #2902 row 34: a v17 binomial beta-logistic model round-trips through the
@@ -8151,7 +7662,6 @@ mod tests {
             lambdas: Array1::zeros(0),
         }]);
         let mut payload = FittedModelPayload::new(
-            MODEL_PAYLOAD_VERSION,
             "y ~ 1".to_string(),
             ModelKind::Standard,
             FittedFamily::Standard {
@@ -8166,16 +7676,11 @@ mod tests {
             },
             "binomial".to_string(),
         );
-        payload.fit_result = Some(fit.clone());
-        payload.unified = Some(fit);
+        payload.fit_result = Some(fit);
         let model = FittedModel::from_payload(payload);
 
         let json = serde_json::to_string(&model).expect("serialize fitted model");
         let restored: FittedModel = serde_json::from_str(&json).expect("restore fitted model");
-        restored
-            .payload()
-            .validate_payload_version()
-            .expect("a current-version beta-logistic payload loads");
         let original_state = model
             .saved_beta_logistic_state()
             .expect("original link state")
@@ -8378,7 +7883,6 @@ mod tests {
         let summary_with = |saved_lambdas: usize| {
             let fit = mean_block_fit_2953(width, saved_lambdas);
             let mut payload = FittedModelPayload::new(
-                MODEL_PAYLOAD_VERSION,
                 "y ~ matern(x, z)".to_string(),
                 ModelKind::Standard,
                 FittedFamily::Standard {
@@ -8390,8 +7894,7 @@ mod tests {
                 },
                 "binomial".to_string(),
             );
-            payload.fit_result = Some(fit.clone());
-            payload.unified = Some(fit);
+            payload.fit_result = Some(fit);
             payload.resolved_termspec = Some(frozen.clone());
             payload.set_training_feature_metadata(
                 vec!["x".to_string(), "z".to_string()],

@@ -79,8 +79,8 @@ def _compare_reml_scores(current: float, baseline: float) -> dict[str, float]:
 def _unwrap_payload(blob: Any) -> dict[str, Any] | None:
     if not isinstance(blob, dict):
         return None
-    if "payload" in blob and isinstance(blob["payload"], dict):
-        return blob["payload"]
+    if "model" in blob and isinstance(blob["model"], dict):
+        return blob["model"]
     return blob
 
 

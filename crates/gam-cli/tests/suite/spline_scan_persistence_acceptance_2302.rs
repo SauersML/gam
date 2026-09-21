@@ -82,7 +82,6 @@ fn fresh_processes_replay_saved_scan_for_predict_and_report() {
     let saved = FittedModel::load_from_path(&model_path).expect("load fitted scan payload");
     assert!(saved.payload().spline_scan.is_some());
     assert!(saved.payload().fit_result.is_none());
-    assert!(saved.payload().unified.is_none());
     assert!(saved.payload().resolved_termspec.is_none());
     let (feature_column, scan) = saved
         .saved_spline_scan()

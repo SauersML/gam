@@ -228,61 +228,6 @@ fn heteroscedastic_records(
     (headers, rows)
 }
 
-/// #2695: a payload written before the whole-residual kernel was fit under the
-/// location-only kernel `u = h(t) − η_t/σ`, so a heteroscedastic one whose log-σ
-/// predictor and time warp both move means something else under `u = (h(t) − η_t)/σ`.
-/// Every payload that old is refused by its version (#3001), before the kernel is read.
-#[test]
-fn a_pre_2695_heteroscedastic_payload_is_refused_by_its_version_2695() {
-    use gam_models::inference::model::{FittedModel, MODEL_PAYLOAD_VERSION};
-    use gam_models::inference::model_payload_builders::fit_formula_to_payload;
-    use gam_problem::BlockRole;
-
-    super::initialize_cpu_fitting();
-    let (headers, rows) = heteroscedastic_records(180, 1.2, 7);
-    let data = encode_recordswith_inferred_schema(headers, rows).expect("encode data");
-    let cfg = FitConfig {
-        survival_likelihood: Some("location-scale".to_string()),
-        survival_distribution: "gaussian".to_string(),
-        noise_formula: Some("s(x, k=8)".to_string()),
-        ..FitConfig::default()
-    };
-    let heteroscedastic =
-        fit_formula_to_payload("Surv(entry, exit, event) ~ s(x, k=8)".to_string(), &data, &cfg)
-            .expect("#2695: survival location-scale fit");
-    let block_can_move = |role: BlockRole| {
-        heteroscedastic
-            .fit_result
-            .as_ref()
-            .and_then(|fit| fit.block_by_role(role))
-            .map(|block| block.beta.iter().any(|value| *value != 0.0))
-            .expect("#2695: the survival location-scale fit carries this block")
-    };
-    assert!(
-        block_can_move(BlockRole::Scale) && block_can_move(BlockRole::Time),
-        "#2695: the heteroscedastic fit must carry a moving log-σ and a moving warp, or the \
-         refusal below is not the kernel-change case"
-    );
-    FittedModel::from_payload(heteroscedastic.clone())
-        .validate_for_persistence()
-        .expect("#2695: the current payload validates");
-
-    // Payload version 25 is the last one written under the location-only kernel.
-    let mut stale = heteroscedastic;
-    stale.version = 25;
-    let error = FittedModel::from_payload(stale)
-        .validate_for_persistence()
-        .expect_err("#2695: a heteroscedastic payload from before the kernel change is refused");
-    assert!(
-        error.to_string().contains("payload schema mismatch")
-            && error.to_string().contains("file has version=25")
-            && error
-                .to_string()
-                .contains(&format!("MODEL_PAYLOAD_VERSION={MODEL_PAYLOAD_VERSION}")),
-        "#2695: the refusal must name the payload's version, got: {error}"
-    );
-}
-
 /// #2695: a saved survival location-scale model, predicting every training row at its
 /// own exit time, gives back the log-likelihood its fit reports: over the plug-in
 /// surfaces, `Σ d·ln λ(t) + ln S(t)` equals `UnifiedFitResult::log_likelihood`. Before
@@ -347,7 +292,7 @@ fn a_saved_model_predicts_the_log_likelihood_it_was_fit_at_2695() {
             "#2695 {label}: the fit must take the monotone-warp route this test covers"
         );
         let fitted = payload
-            .unified
+            .fit_result
             .as_ref()
             .map(|unified| unified.log_likelihood)
             .expect("#2695: the payload carries its fit's log-likelihood");

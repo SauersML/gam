@@ -24,6 +24,7 @@ from ._validation import FormulaValidation
 from ._warnings import emit_inference_warnings
 
 if TYPE_CHECKING:
+    from ._joint_events import JointEventModel
     from ._model import MultinomialModel
     from ._rust import ManifoldSAESupport
     from ._sae_manifold import ManifoldSAE
@@ -42,6 +43,7 @@ MultinomialFamily: TypeAlias = Literal[
 # Every class ``load``/``loads`` can return; the payload header selects one.
 LoadedModel: TypeAlias = (
     "Model | MultinomialModel | ResponseGeometryModel | ManifoldSAE | ManifoldSAESupport"
+    " | JointEventModel"
 )
 
 
@@ -1404,7 +1406,7 @@ def load(path: str | Path) -> LoadedModel:
 
     Returns
     -------
-    Model, MultinomialModel, ResponseGeometryModel, ManifoldSAE or ManifoldSAESupport
+    Model, MultinomialModel, ResponseGeometryModel, ManifoldSAE, ManifoldSAESupport or JointEventModel
         Fitted model ready for prediction.
 
     Examples
@@ -1418,9 +1420,11 @@ def load(path: str | Path) -> LoadedModel:
 def loads(model_bytes: bytes) -> LoadedModel:
     """Load a fitted model from an in-memory bytes payload.
 
-    The Rust ``saved_model_kind`` reads the payload header and selects the
-    loader: manifold SAE (the ``schema`` names the class, #2567), response
-    geometry, multinomial, or the scalar :class:`Model` archive.
+    The Rust ``saved_model_kind`` reads the saved model's header and selects
+    the loader: manifold SAE (the ``schema`` names the class, #2567), response
+    geometry, multinomial, a joint event model (kind ``"joint"``, #3053), or a
+    saved GAM (kind ``"gam"``) for :class:`Model`. A saved model of any other
+    kind is refused by name.
 
     Parameters
     ----------
@@ -1430,7 +1434,7 @@ def loads(model_bytes: bytes) -> LoadedModel:
 
     Returns
     -------
-    Model, MultinomialModel, ResponseGeometryModel, ManifoldSAE or ManifoldSAESupport
+    Model, MultinomialModel, ResponseGeometryModel, ManifoldSAE, ManifoldSAESupport or JointEventModel
         Fitted model ready for prediction.
 
     Raises
@@ -1458,6 +1462,21 @@ def loads(model_bytes: bytes) -> LoadedModel:
         return MultinomialModel(
             _model_bytes=model_bytes,
             _training_table_kind=str(metadata["training_table_kind"]),
+        )
+    if kind == "joint":
+        from ._joint_events import JointEventModel  # local import avoids cycle
+
+        try:
+            native = rust_module().loads_joint_event_model(model_bytes)
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        return JointEventModel(native)
+    if kind != "gam":
+        from ._exceptions import SchemaMismatchError
+
+        raise SchemaMismatchError(
+            f"this is a saved model of kind {kind!r}; gamfit.loads reads saved "
+            "GAM, multinomial, response-geometry, joint event and manifold SAE models"
         )
     return Model(_model_bytes=model_bytes)
 

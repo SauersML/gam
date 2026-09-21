@@ -1571,25 +1571,34 @@ fn is_multinomial_family_name(family: &str) -> bool {
     gam::families::fit_orchestration::is_multinomial_family_name(family)
 }
 
-/// The kind of a saved gamfit model payload, read from its JSON header. A
+/// The kind of a saved gamfit model, read from its header. A document in the
+/// shared saved-model envelope (gam#3350) is named by its `kind` (`"gam"`,
+/// `"joint"`, ...), read without decoding the model it holds. The containers
+/// that predate the envelope are named by their own tags: a
 /// `gamfit.ManifoldSAE` schema of any version is `"manifold_sae"`, so a stale
 /// version reaches its own refusal; the response-geometry container is
-/// `"response_geometry"`; the multinomial envelope is `"multinomial"`. Every
-/// other payload, including bytes that are not JSON, is `"scalar"`, whose
-/// loader reports what is wrong with it.
+/// `"response_geometry"`; the multinomial container is `"multinomial"`. Every
+/// other document, including bytes that are not JSON, is `"gam"`, whose loader
+/// refuses it by name.
 #[pyfunction]
-fn saved_model_kind(model_bytes: Vec<u8>) -> &'static str {
+fn saved_model_kind(model_bytes: Vec<u8>) -> String {
+    if let Ok(header) = gam_model_api::saved_model::saved_model_header(&model_bytes)
+        && let Some(kind) = header.kind
+    {
+        return kind;
+    }
     #[derive(Deserialize)]
-    struct SavedModelHeader {
+    struct ContainerTags {
         #[serde(default)]
         schema: Option<String>,
         #[serde(default)]
         model_class: Option<String>,
     }
-    let Ok(header) = serde_json::from_slice::<SavedModelHeader>(&model_bytes) else {
-        return "scalar";
+    let gam_kind = gam::inference::model::SAVED_MODEL_KIND.to_string();
+    let Ok(tags) = serde_json::from_slice::<ContainerTags>(&model_bytes) else {
+        return gam_kind;
     };
-    let schema_family = header
+    let schema_family = tags
         .schema
         .as_deref()
         .and_then(|schema| schema.split_once('/'))
@@ -1598,15 +1607,15 @@ fn saved_model_kind(model_bytes: Vec<u8>) -> &'static str {
         .split_once('/')
         .map(|(family, _)| family);
     if schema_family.is_some() && schema_family == manifold_family {
-        return "manifold_sae";
+        return "manifold_sae".to_string();
     }
-    if header.schema.as_deref() == Some(RESPONSE_GEOMETRY_SCHEMA) {
-        return "response_geometry";
+    if tags.schema.as_deref() == Some(RESPONSE_GEOMETRY_SCHEMA) {
+        return "response_geometry".to_string();
     }
-    if header.model_class.as_deref() == Some(gam::families::multinomial::MULTINOMIAL_MODEL_CLASS) {
-        return "multinomial";
+    if tags.model_class.as_deref() == Some(gam::families::multinomial::MULTINOMIAL_MODEL_CLASS) {
+        return "multinomial".to_string();
     }
-    "scalar"
+    gam_kind
 }
 
 /// Write a saved gamfit model's bytes to `path` through the one saved-model

@@ -41,7 +41,7 @@
 //!      mean Poisson deviance and compare to the null model and to each other.
 
 use gam::inference::model::{
-    FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
+    FittedFamily, FittedModel, FittedModelPayload, ModelKind,
 };
 use gam::smooth::{freeze_term_collection_from_design, weighted_blockwise_penalty_sum};
 use gam::test_support::reference::{Column, QualityPair, pearson, relative_l2, run_python};
@@ -256,7 +256,6 @@ fn gam_nuts_poisson_loglink_predicts_heldout_counts() {
     let frozen = freeze_term_collection_from_design(&fit.resolvedspec, &fit.design)
         .expect("freeze resolved term-collection spec");
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         "count ~ s(age) + s(los)".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -272,7 +271,6 @@ fn gam_nuts_poisson_loglink_predicts_heldout_counts() {
         "poisson".to_string(),
     );
     payload.fit_result = Some(fit.fit.clone());
-    payload.unified = Some(fit.fit.clone());
     payload.data_schema = Some(agg_ds.schema.clone());
     payload.resolved_termspec = Some(frozen);
     payload.set_training_feature_metadata(agg_ds.headers.clone(), agg_ds.feature_ranges());

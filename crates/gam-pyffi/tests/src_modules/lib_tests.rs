@@ -554,7 +554,6 @@ fn response_geometry_parametric_only_rhs_fits_frechet_mean() {
 #[test]
 fn load_model_rejects_payload_version_mismatch() {
     let model = FittedModel::from_payload(FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION + 1,
         "y ~ x".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -569,7 +568,12 @@ fn load_model_rejects_payload_version_mismatch() {
         },
         "gaussian".to_string(),
     ));
-    let mismatched_bytes = serde_json::to_vec(&model).expect("mismatched model should serialize");
+    let mismatched_bytes = serde_json::to_vec(&serde_json::json!({
+        "kind": "gam",
+        "version": MODEL_PAYLOAD_VERSION + 1,
+        "model": model,
+    }))
+    .expect("mismatched model should serialize");
 
     let err = match load_model_impl(&mismatched_bytes) {
         Ok(_) => panic!("load_model_impl should reject mismatched payload versions"),
@@ -577,7 +581,7 @@ fn load_model_rejects_payload_version_mismatch() {
     };
     assert!(
         matches!(err, gam::inference::model::FittedModelError::SchemaMismatch { .. })
-            && err.to_string().contains("saved model payload schema mismatch"),
+            && err.to_string().contains("refit"),
         "unexpected error: {err:?}"
     );
 }
@@ -1603,7 +1607,6 @@ fn gaussian_log_loss_value_rejects_invalid_sigma_length() {
 #[test]
 fn weighted_model_projection_retains_weight_column_2033() {
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         "y ~ x".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {

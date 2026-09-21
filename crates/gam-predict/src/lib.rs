@@ -4296,9 +4296,8 @@ mod tests {
     }
 
     fn saved_survival_location_scale_model(link: Option<InverseLink>) -> FittedModel {
-        use gam_models::inference::model::{FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind};
+        use gam_models::inference::model::{FittedModelPayload, ModelKind};
         let mut payload = FittedModelPayload::new(
-            MODEL_PAYLOAD_VERSION,
             "Surv(t0, t1, event) ~ 1".to_string(),
             ModelKind::Survival,
             FittedFamily::Survival {
@@ -4309,7 +4308,7 @@ mod tests {
             },
             "survival".to_string(),
         );
-        payload.unified = Some(survival_fit_with_covariance(
+        payload.fit_result = Some(survival_fit_with_covariance(
             array![-1.0],
             array![0.0],
             Array2::zeros((2, 2)),
@@ -4319,9 +4318,9 @@ mod tests {
     }
 
     fn saved_standard_predictor_fixture(fit: Option<UnifiedFitResult>) -> FittedModel {
-        use gam_models::inference::model::{FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind};
+        use gam_models::inference::model::{FittedModelPayload, ModelKind};
         let mut payload = FittedModelPayload::new(
-            MODEL_PAYLOAD_VERSION, "y ~ 1".to_string(), ModelKind::Standard,
+            "y ~ 1".to_string(), ModelKind::Standard,
             FittedFamily::Standard {
                 likelihood: gam_spec::LikelihoodSpec::gaussian_identity(),
                 link: Some(StandardLink::Identity),
@@ -4329,7 +4328,7 @@ mod tests {
             },
             "gaussian".to_string(),
         );
-        payload.unified = fit;
+        payload.fit_result = fit;
         FittedModel::from_payload(payload)
     }
 
@@ -4341,17 +4340,17 @@ mod tests {
     }
 
     pub(super) fn saved_gaussian_predictor_fixture(scale: Option<f64>) -> FittedModel {
-        use gam_models::inference::model::{FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind};
+        use gam_models::inference::model::{FittedModelPayload, ModelKind};
         let mut fit = survival_fit_with_covariance(array![2.0], array![0.0], Array2::zeros((2, 2)));
         fit.blocks[0].role = BlockRole::Location;
         let mut payload = FittedModelPayload::new(
-            MODEL_PAYLOAD_VERSION, "y ~ 1".to_string(), ModelKind::LocationScale,
+            "y ~ 1".to_string(), ModelKind::LocationScale,
             FittedFamily::LocationScale {
                 likelihood: gam_spec::LikelihoodSpec::gaussian_identity(), base_link: None,
             },
             "gaussian-location-scale".to_string(),
         );
-        payload.unified = Some(fit);
+        payload.fit_result = Some(fit);
         payload.gaussian_sigma_floor = Some(0.01);
         payload.gaussian_response_scale = scale;
         FittedModel::from_payload(payload)

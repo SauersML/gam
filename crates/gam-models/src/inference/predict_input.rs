@@ -1794,7 +1794,6 @@ mod tests {
     fn local_law_model() -> FittedModel {
         use crate::inference::model::{FittedFamily, FittedModelPayload, ModelKind};
         let mut payload = FittedModelPayload::new(
-            crate::inference::model::MODEL_PAYLOAD_VERSION,
             "y ~ 1".to_string(),
             ModelKind::MarginalSlope,
             FittedFamily::MarginalSlope {

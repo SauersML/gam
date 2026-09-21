@@ -4,7 +4,7 @@ use gam::families::survival::lognormal_kernel::FrailtySpec;
 // which moved into `gam-predict` when the prediction engine was peeled out.
 use gam::inference::model::{
     FittedEstimator, FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION,
-    ModelKind, PredictModelClass,
+    ModelKind, PredictModelClass, SAVED_MODEL_KIND,
 };
 use gam::solver::estimate::{
     BlockRole, FitArtifacts, FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts,
@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use tempfile::tempdir;
 
-const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 2;
+const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 3;
 // Any payload-field or skip-rule change requires a fresh enumeration and a
 // stateful-sync audit before the key-count pin below changes: the count is
 // what detects a payload field the stateful sync has not been audited for.
@@ -81,10 +81,13 @@ const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 2;
 // prediction reads), `beta_noise` (a copy of the fit's `Scale` block, which
 // prediction reads), `slope_formulas` and `baseline_slopes` (singleton mirrors
 // of `slope_formula` and `baseline_slope` that nothing read) and the
-// never-written `latent_score_contract`. `FittedModelPayload` now declares 100
-// `pub` fields, so the JSON payload carries 100 - 4 = 96 keys. The stateful sync
-// keeps mirroring each link's point state; the link covariance stays on the fit.
-const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 96;
+// never-written `latent_score_contract`, leaving 96 payload keys. Schema 37
+// (gam#3350) then stores the fit once and moves the version out of the payload:
+// the `unified` copy of `fit_result` is gone and the version lives in the
+// saved-model envelope `{kind, version, model}`, so the payload carries
+// 96 - 2 = 94 keys and the root 3. The stateful sync keeps mirroring each
+// link's point state; the link covariance stays on the fit.
+const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 94;
 const EXPECTED_STANDARD_FAMILY_FIELD_COUNT: usize = 6;
 
 fn read_saved_model_json(path: &Path) -> Value {
@@ -100,9 +103,14 @@ fn assert_saved_model_schema_is_pinned(saved: &Value) {
         "saved model root fields changed; audit enum envelope coverage before updating this test"
     );
     assert_eq!(
-        saved.get("model_type").and_then(Value::as_str),
-        Some("standard"),
+        saved.get("kind").and_then(Value::as_str),
+        Some(SAVED_MODEL_KIND),
         "saved model envelope changed; audit stateful sync coverage before updating this test"
+    );
+    assert_eq!(
+        saved.get("version").and_then(Value::as_u64),
+        Some(u64::from(MODEL_PAYLOAD_VERSION)),
+        "a saved model must record, once, the version this binary writes"
     );
     let payload = saved_model_payload(saved);
     assert_eq!(
@@ -110,30 +118,18 @@ fn assert_saved_model_schema_is_pinned(saved: &Value) {
         EXPECTED_MODEL_PAYLOAD_FIELD_COUNT,
         "saved model payload fields changed; audit stateful sync coverage before updating this test"
     );
-    assert_eq!(
-        payload.get("version").and_then(Value::as_u64),
-        Some(u64::from(MODEL_PAYLOAD_VERSION)),
-        "a saved model must record the payload version this binary writes"
-    );
+    for duplicate in ["unified", "version", "model_type"] {
+        assert!(
+            payload.get(duplicate).is_none(),
+            "a saved model records `{duplicate}` at most once, outside the model"
+        );
+    }
     if let Some(fit) = payload.get("fit_result").and_then(Value::as_object) {
-        for (label, materialization) in [
-            ("fit_result", fit),
-            (
-                "unified",
-                payload
-                    .get("unified")
-                    .and_then(Value::as_object)
-                    .expect("dense saved fit carries its synchronized unified materialization"),
-            ),
-        ] {
-            assert_eq!(
-                materialization
-                    .get("training_sample_size")
-                    .and_then(Value::as_u64),
-                Some(8),
-                "{label} must persist the same authoritative training row count"
-            );
-        }
+        assert_eq!(
+            fit.get("training_sample_size").and_then(Value::as_u64),
+            Some(8),
+            "fit_result must persist the authoritative training row count"
+        );
     }
     assert_eq!(
         serde_json::from_value::<FittedEstimator>(
@@ -150,7 +146,7 @@ fn assert_saved_model_schema_is_pinned(saved: &Value) {
 
 fn saved_model_payload(saved: &Value) -> &serde_json::Map<String, Value> {
     saved
-        .get("payload")
+        .get("model")
         .and_then(Value::as_object)
         .expect("saved model payload object")
 }
@@ -292,7 +288,6 @@ fn minimal_standard_model_with_group_metadata(
     group_metadata: Option<BTreeMap<String, Value>>,
 ) -> FittedModel {
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         "y ~ group(g)".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -361,7 +356,6 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
     let covariance =
         Array2::from_shape_vec((2, 2), vec![0.1, 0.02, 0.02, 0.2]).expect("2x2 covariance");
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         "y ~ x".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -450,73 +444,9 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
 }
 
 #[test]
-fn save_and_load_syncs_standard_sas_state_from_unified_fit_result() {
-    let log_delta = -0.4;
-    let sas_state =
-        gam::mixture_link::sas_link_state_from_raw(0.25, log_delta).expect("valid sas state");
-    let covariance =
-        Array2::from_shape_vec((2, 2), vec![0.1, 0.02, 0.02, 0.2]).expect("2x2 covariance");
-    let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
-        "y ~ x".to_string(),
-        ModelKind::Standard,
-        FittedFamily::Standard {
-            likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(sas_state)),
-            link: None,
-            latent_cloglog_state: None,
-            mixture_state: None,
-            sas_state: None,
-        },
-        "binomial-sas".to_string(),
-    );
-    payload.unified = Some(minimal_fit_result(FittedLinkState::Sas {
-        state: sas_state,
-        covariance: Some(covariance.clone()),
-    }));
-    payload.data_schema = Some(gam::inference::model::DataSchema { columns: vec![] });
-    payload.resolved_termspec = Some(gam::terms::smooth::TermCollectionSpec {
-        linear_terms: vec![],
-        smooth_terms: vec![],
-        random_effect_terms: vec![],
-        level: Default::default(),
-    });
-
-    let model = FittedModel::from_payload(payload);
-    let saved_state = model
-        .saved_sas_state()
-        .expect("saved sas state")
-        .expect("expected synchronized sas state from unified fit");
-    assert_eq!(saved_state, sas_state);
-
-    let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("unified-model.json");
-    model.save_to_path(&path).expect("save model");
-
-    let saved = read_saved_model_json(&path);
-    let family_state = standard_family_state(&saved);
-    assert_eq!(
-        family_state.get("sas_state"),
-        Some(&serde_json::to_value(sas_state).expect("sas state json")),
-        "serialized model should include synchronized family_state.sas_state from unified fit"
-    );
-
-    let loaded = FittedModel::load_from_path(&path).expect("load model");
-    let loaded_state = loaded
-        .saved_sas_state()
-        .expect("loaded sas state")
-        .expect("expected loaded sas state");
-    assert_eq!(loaded_state, sas_state);
-    let FittedModel::Standard { payload } = loaded else {
-        panic!("expected standard model");
-    };
-    assert_loaded_sas_covariance(&payload, &covariance);
-}
-
-#[test]
 fn save_and_load_syncs_standard_latent_cloglog_state_from_fit_result() {
     let latent_state = LatentCLogLogState::new(0.65).expect("valid latent state");
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         "y ~ x".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -623,7 +553,6 @@ fn save_and_load_syncs_standard_latent_cloglog_state_from_fit_result() {
 #[test]
 fn survival_marginal_slope_saved_models_require_special_predict_handling() {
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         "Surv(t0, t1, event) ~ s(x)".to_string(),
         ModelKind::Survival,
         FittedFamily::Survival {
@@ -637,7 +566,7 @@ fn survival_marginal_slope_saved_models_require_special_predict_handling() {
         },
         "survival".to_string(),
     );
-    payload.unified = Some(minimal_survival_fit_result());
+    payload.fit_result = Some(minimal_survival_fit_result());
     let model = FittedModel::from_payload(payload);
 
     assert_eq!(model.predict_model_class(), PredictModelClass::Survival);

@@ -24,7 +24,7 @@
 
 use gam::hmc::NutsConfig;
 use gam::inference::model::{
-    FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
+    FittedFamily, FittedModel, FittedModelPayload, ModelKind,
 };
 use gam::sample::sample_saved_model;
 use gam::smooth::{
@@ -82,7 +82,6 @@ fn saved_monotone_model(
         .expect("freeze training term collection");
 
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         formula.to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -94,8 +93,7 @@ fn saved_monotone_model(
         },
         "gaussian".to_string(),
     );
-    payload.fit_result = Some(fit.fit.clone());
-    payload.unified = Some(fit.fit);
+    payload.fit_result = Some(fit.fit);
     payload.data_schema = Some(ds.schema.clone());
     payload.resolved_termspec = Some(frozenspec);
     payload.set_training_feature_metadata(ds.headers.clone(), ds.feature_ranges());
@@ -135,7 +133,7 @@ fn posterior_draws_of_monotone_smooth_stay_in_the_cone() {
     assert!(a.nrows() > 0, "expected at least one monotonicity row");
 
     // Sanity: the fitted mode is in the cone (the fit honours the constraint).
-    let beta = &model.unified.as_ref().expect("unified fit").beta;
+    let beta = &model.fit_result.as_ref().expect("saved fit").beta;
     let ax_mode = a.dot(beta);
     let worst_mode = (0..a.nrows())
         .map(|r| ax_mode[r] - b[r])

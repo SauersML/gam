@@ -291,7 +291,7 @@ def test_group_metadata_roundtrips_through_saved_model(tmp_path: pathlib.Path) -
     path = tmp_path / "group_metadata.gam"
     model.save(path)
     saved_payload = json.loads(path.read_text())
-    assert saved_payload["payload"]["group_metadata"] == metadata
+    assert saved_payload["model"]["group_metadata"] == metadata
     loaded = gamfit.load(path)
 
     assert model.group_metadata == metadata

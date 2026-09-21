@@ -57,9 +57,6 @@ pub enum TransformationNormalConflict {
 /// be resumed is refused by the rule it breaks rather than dropped for a cold fit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WarmStartRefusal {
-    /// The model was saved at another payload version, whose record this binary
-    /// does not read. Refit it with this version to resume from it.
-    RefitRequired { payload_version: u32 },
     /// The model's fit recorded no certified outer point: its route records none.
     NoRecordedPoint,
     /// The model was fitted with another formula.
@@ -250,12 +247,6 @@ impl std::fmt::Display for WorkflowError {
             }
             WorkflowError::Data(source) => std::fmt::Display::fmt(source, f),
             WorkflowError::WarmStartRefused { refusal } => match refusal {
-                WarmStartRefusal::RefitRequired { payload_version } => write!(
-                    f,
-                    "warm_start_from: the model was saved at payload v{payload_version}, whose \
-                     certified outer point this binary does not read; refit it with this version \
-                     to resume from it"
-                ),
                 WarmStartRefusal::NoRecordedPoint => f.write_str(
                     "warm_start_from: the model's fit recorded no certified outer point, because \
                      its route records none",

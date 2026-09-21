@@ -264,7 +264,9 @@ impl JointEventModel {
         saved_model_text(JOINT_EVENT_MODEL_KIND, JOINT_EVENT_MODEL_VERSION, self)
     }
 
-    fn from_saved_text(text: &str) -> Result<Self, SavedModelError> {
+    /// The model in a saved document's text, refusing another kind or
+    /// version, or a state its law cannot hold.
+    pub fn from_saved_text(text: &str) -> Result<Self, SavedModelError> {
         let model: Self =
             read_saved_model_text(text, JOINT_EVENT_MODEL_KIND, JOINT_EVENT_MODEL_VERSION)?;
         let inconsistent =

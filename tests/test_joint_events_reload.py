@@ -11,6 +11,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 
 import gamfit
 
@@ -50,3 +51,29 @@ def test_a_saved_joint_model_forecasts_bit_identically_in_a_fresh_process(tmp_pa
     reloaded = json.loads(completed.stdout)
     for key in FIELDS:
         assert reloaded[key] == _hex(in_memory[key]), key
+
+
+def test_gamfit_load_reads_a_saved_joint_model_by_its_envelope_kind_3053(tmp_path) -> None:
+    """``gamfit.load`` is the inverse of a joint model's ``save``: the saved
+    document's header names the kind ``joint``, and the load dispatches on it."""
+    subjects = pd.DataFrame({"id": ["a", "b"], "entry": [0.0, 0.0], "exit": [4.0, 6.0]})
+    events = pd.DataFrame(
+        {"id": ["a", "b", "b", "b"], "time": [4.0, 0.0, 1.0, 5.0], "mark": ["cvd_death", "diagnosis", "visit", "visit"]}
+    )
+    model = gamfit.fit_joint_event_model(subjects, events, marks=MARKS)
+    in_memory = model.forecast(*HISTORY, HORIZONS)
+    path = tmp_path / "model.json"
+    model.save(path)
+    for reloaded in (gamfit.load(path), gamfit.loads(path.read_bytes())):
+        assert isinstance(reloaded, gamfit.JointEventModel)
+        forecast = reloaded.forecast(*HISTORY, HORIZONS)
+        for key in FIELDS:
+            assert _hex(forecast[key]) == _hex(in_memory[key]), key
+
+    document = json.loads(path.read_text())
+    document["version"] += 1
+    with pytest.raises(gamfit.errors.GamfitError, match="refit"):
+        gamfit.loads(json.dumps(document).encode())
+    document["kind"] = "not-a-model-kind"
+    with pytest.raises(gamfit.errors.SchemaMismatchError, match="not-a-model-kind"):
+        gamfit.loads(json.dumps(document).encode())
