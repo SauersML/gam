@@ -2114,7 +2114,6 @@ fn optimize_survival_transformation_smoothing(
                 let opts = gam_solve::pirls::WorkingModelPirlsOptions {
                     max_iterations: SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS,
                     convergence_tolerance: SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL,
-                    adaptive_kkt_tolerance: None,
                     max_step_halving: SURVIVAL_TRANSFORMATION_PIRLS_MAX_STEP_HALVING,
                     firth_bias_reduction: false,
                     coefficient_lower_bounds: structural_lower_bounds.cloned(),
@@ -3504,9 +3503,6 @@ fn store_survival_transformation_persistent_warm_start(
     record.last_pirls_lm_lambda = (summary.final_lm_lambda.is_finite()
         && summary.final_lm_lambda > 0.0)
         .then_some(summary.final_lm_lambda);
-    record.last_pirls_accept_rho = summary
-        .final_accept_rho
-        .filter(|value| value.is_finite() && *value >= 0.0);
     gam_solve::persistent_warm_start::store_record(store, &record);
     gam_solve::persistent_warm_start::load_record(store, &record.key).is_some_and(|stored| {
         stored.rho == record.rho
@@ -3816,7 +3812,6 @@ pub(crate) fn fit_survival_transformation_model(
                 let opts = gam_solve::pirls::WorkingModelPirlsOptions {
                     max_iterations: SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS,
                     convergence_tolerance: SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL,
-                    adaptive_kkt_tolerance: None,
                     max_step_halving: SURVIVAL_TRANSFORMATION_PIRLS_MAX_STEP_HALVING,
                     firth_bias_reduction: false,
                     coefficient_lower_bounds: structural_lower_bounds,
@@ -3957,7 +3952,6 @@ pub(crate) fn fit_survival_transformation_model(
     let opts = gam_solve::pirls::WorkingModelPirlsOptions {
         max_iterations: SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS,
         convergence_tolerance: SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL,
-        adaptive_kkt_tolerance: None,
         max_step_halving: SURVIVAL_TRANSFORMATION_PIRLS_MAX_STEP_HALVING,
         firth_bias_reduction: false,
         coefficient_lower_bounds: structural_lower_bounds,

@@ -1,7 +1,7 @@
 //! Outer driver for a single fixed-ρ PIRLS fit.
 //!
 //! Owns:
-//! - `fit_model_for_fixed_rho` and `fit_model_for_fixed_rho_with_adaptive_kkt`
+//! - `fit_model_for_fixed_rho` and `fit_model_for_fixed_rho_configured`
 //!   — build the working model, run the inner LM loop, assemble the final result.
 //! - `PirlsProblem`, `PenaltyConfig`, `PirlsConfig` — the configuration types.
 //! - Helper functions exclusive to the fixed-ρ fitting path: constraint
@@ -12,7 +12,6 @@
 
 use super::{
     // state re-exports
-    AdaptiveKktTolerance,
     ExportedLaplaceCurvature,
     FirthDiagnostics,
     GamWorkingModel,
@@ -43,7 +42,6 @@ use super::{
     compute_constraint_kkt_diagnostics,
     computeworkingweight_derivatives_from_eta,
     constrained_stationarity_norm,
-    effective_kkt_tolerance,
     inf_norm,
     pirls_data_log_kernel_from_eta,
     runworking_model_pirls,
@@ -80,8 +78,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// it accepted β̂, so it is asked with the same certificate and at the same
 /// band: the dimensionless residual `‖g‖ / ‖natural scale‖`
 /// ([`WorkingState::relative_gradient_norm`]) against the tolerance THIS solve
-/// decided against (`final_kkt_tolerance` — the adaptive value when the outer
-/// schedule supplied one, the configured one otherwise), widened to the
+/// decided against (`final_kkt_tolerance`, which since #3536 is just
+/// `WorkingModelPirlsOptions::convergence_tolerance`: the outer loop supplies no
+/// per-evaluation KKT schedule), widened to the
 /// near-stationary band `10·tol` exactly when that is the band the solve itself
 /// was accepted under ([`WorkingState::near_stationary_kkt`], the
 /// `StalledAtValidMinimum` acceptance).
@@ -100,7 +99,7 @@ fn converged_eta_refresh_band(
 ) -> f64 {
     let tolerance = summary
         .final_kkt_tolerance
-        .unwrap_or_else(|| effective_kkt_tolerance(options));
+        .unwrap_or(options.convergence_tolerance);
     let accepted = if matches!(summary.status, PirlsStatus::StalledAtValidMinimum) {
         tolerance * 10.0
     } else {
@@ -898,13 +897,12 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     config: &PirlsConfig,
     warm_start_beta: Option<&Coefficients>,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
-    fit_model_for_fixed_rho_with_adaptive_kkt(
+    fit_model_for_fixed_rho_configured(
         rho,
         problem,
         penalty,
         config,
         warm_start_beta,
-        None,
         false,
         None,
     )
@@ -931,13 +929,12 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 /// (μ ≈ 0.5) attenuates every slope toward zero; here the fixed point is
 /// load-bearing — it is what recovers the correct mean coefficients (the betareg
 /// alternating mean-fit ↔ φ-estimate scheme).
-pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix> + Clone>(
+pub(crate) fn fit_model_for_fixed_rho_configured<'a, X: Into<DesignMatrix> + Clone>(
     rho: LogSmoothingParamsView<'_>,
     problem: PirlsProblem<'a, X>,
     penalty: PenaltyConfig<'_>,
     config: &PirlsConfig,
     warm_start_beta: Option<&Coefficients>,
-    adaptive_kkt_tolerance: Option<AdaptiveKktTolerance>,
     refine_dispersion_at_converged_eta: bool,
     // Shared invariant row carrier for a Gaussian value-only evaluation.
     //
@@ -1746,7 +1743,6 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         // the caller's `max_iterations` and trips as a hard error if exceeded.
         max_iterations: config.max_iterations,
         convergence_tolerance: config.convergence_tolerance,
-        adaptive_kkt_tolerance,
         // LM step-halving is a per-iteration damping retry budget; it is
         // independent of the total outer-iteration cap. Tying the two
         // together collapsed step halving to 3 under a low outer-imposed

@@ -889,12 +889,9 @@ fn reml_inner_progress_feedback(
     state: &crate::estimate::reml::RemlState<'_>,
 ) -> crate::rho_optimizer::InnerProgressFeedback {
     crate::rho_optimizer::InnerProgressFeedback {
-        cap: Arc::clone(&state.outer_inner_cap),
         accepted_iter: Arc::new(AtomicUsize::new(0)),
         last_iters: Arc::clone(&state.last_inner_iters),
         last_converged: Arc::clone(&state.last_inner_converged),
-        ift_residual: Arc::clone(&state.last_ift_prediction_residual),
-        accept_rho: Arc::clone(&state.last_pirls_accept_rho),
         // The standard REML path does not consume the cold-reeval pulse
         // (#2349); give it an inert, unshared flag so the guard's writes go
         // nowhere and behavior is unchanged.
@@ -1650,7 +1647,7 @@ where
                     ),
                 )
                 .with_tolerance(reml_tol)
-                .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
+                .with_inner_progress_feedback(reml_inner_progress_feedback(&reml_state))
                 .with_problem_size(n_obs, x_o.ncols())
                 .with_information_count(outer_information_count(
                     resolved_likelihood_scale,
@@ -1981,7 +1978,7 @@ where
                     ),
                 )
                 .with_tolerance(reml_tol)
-                .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
+                .with_inner_progress_feedback(reml_inner_progress_feedback(&reml_state))
                 .with_bounds(theta_lower, theta_upper);
             let problem = if let Some(h) = heuristic_theta_ref {
                 problem.with_heuristic_log_lambdas(h.to_vec())
@@ -2512,7 +2509,7 @@ where
         } else {
             reml_state.gaussian_fixed_cache_if_eligible()
         };
-        let pirls_res_pair = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
+        let pirls_res_pair = pirls::fit_model_for_fixed_rho_configured(
             LogSmoothingParamsView::new(final_rho.view())?,
             pirls::PirlsProblem {
                 x: reml_state.x(),
@@ -2545,7 +2542,6 @@ where
                 },
                 ..cfg.as_pirls_config()
             },
-            None,
             None,
             // Final, reported fit at the REML-selected λ: refine the family's
             // estimated dispersion nuisance at the converged η. For Gamma this

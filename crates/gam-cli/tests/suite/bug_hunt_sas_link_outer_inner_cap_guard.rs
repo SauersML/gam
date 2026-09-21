@@ -30,9 +30,8 @@
 //! (`final_rho = outer_result.rho.slice(s![..k])`) before the accept-fit — the
 //! guard call one statement earlier simply forgot to.
 //!
-//! The guard only re-evaluates when the adaptive outer-inner-cap schedule was
-//! lifted during the search (`prev_cap != 0`), which the standard CLI fit path
-//! does on this dataset — hence this is exercised through the `gam` binary.
+//! That guard and the outer-driven inner cap it lifted no longer exist (#3536);
+//! the test stays as a regression pin on the SAS arm's augmented-θ handling.
 //!
 //! This test fits a clean, well-separated binomial SAS-link model through the
 //! real `gam fit` CLI and asserts the fit SUCCEEDS. Before the fix it aborts with

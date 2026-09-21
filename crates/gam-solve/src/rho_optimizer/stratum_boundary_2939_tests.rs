@@ -544,10 +544,8 @@ fn terminal_boundary_evidence_requires_pure_refusals_at_the_actual_checkpoint() 
     let mut bridge = OuterFirstOrderBridge {
         obj: &mut objective,
         layout: OuterThetaLayout::new(2, 0),
-        outer_inner_cap: None,
+        inner_progress: None,
         first_order_evals: 0,
-        g_norm_initial: None,
-        last_g_norm: None,
         last_value_grad_rho: None,
         value_probe_cache: Vec::new(),
         cost_stall: Some(guard),

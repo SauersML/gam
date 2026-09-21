@@ -230,15 +230,6 @@ pub fn array1_l2_norm(v: &Array1<f64>) -> f64 {
     v.iter().map(|x| x * x).sum::<f64>().sqrt()
 }
 
-/// Adaptive KKT tolerance parameters for the inner PIRLS convergence test.
-#[derive(Clone, Copy, Debug)]
-pub struct AdaptiveKktTolerance {
-    pub eta: f64,
-    pub floor: f64,
-    pub ceiling: f64,
-    pub outer_grad_norm: f64,
-}
-
 /// Per-iteration PIRLS diagnostic info reported to the callback.
 #[derive(Clone, Debug)]
 pub struct WorkingModelIterationInfo {
@@ -263,15 +254,13 @@ pub struct WorkingModelPirlsResult {
     pub max_abs_eta: f64,
     pub constraint_kkt: Option<ConstraintKktDiagnostics>,
     /// The KKT tolerance this solve's convergence certificate was actually
-    /// decided against — `crate::pirls::convergence::effective_kkt_tolerance`,
-    /// i.e. the ADAPTIVE value when the outer schedule supplied one and the
-    /// configured tolerance otherwise.
+    /// decided against (`WorkingModelPirlsOptions::convergence_tolerance`).
     ///
     /// Carried because a refusal that says "the inner mode did not converge"
     /// is unreadable without it: the certificate is
     /// `‖g‖/natural scale < tol`, and the bound moves
-    /// with `tol` while `tol` itself tightens monotonically toward
-    /// `reml_tolerance/100` as the outer search converges. Without this number
+    /// with `tol`, which the REML caller tightens to the outer-derivative
+    /// tolerance `reml_tolerance/100`. Without this number
     /// a reader cannot tell a fit that stalled from a fit that was asked for
     /// more precision than the inner solver's own tolerances can deliver
     /// (#2705 group B).
@@ -500,8 +489,8 @@ pub struct PirlsResult {
     /// which equals `Sβ − ∇ℓ` because `Xᵀ(η−z)·w = −∇ℓ`). Storing the vector —
     /// not just its norm — lets the outer REML/LAML evaluator engage the
     /// inner-KKT envelope correction `Ṽ = V − ½·rᵀH⁻¹r` on design-moving
-    /// flexible-link and ψ/anisotropy paths, where the outer optimizer may
-    /// accept β̂ at a first-order inner cap short of exact stationarity. The
+    /// flexible-link and ψ/anisotropy paths, where the inner solve certifies β̂
+    /// at a finite KKT tolerance short of exact stationarity. The
     /// correction and its θ-gradient vanish as `r → 0`, so a fully-converged
     /// fit is unchanged. See [`crate::model_types::ProjectedKktResidual`].
     pub penalized_gradient_transformed: Array1<f64>,
@@ -519,7 +508,7 @@ pub struct PirlsResult {
     /// rejection-exhausted, MaxIterations without acceptance). Mirrors
     /// `WorkingModelPirlsResult::final_accept_rho`. Programmatic
     /// counterpart to the per-iter `[PIRLS lm-trajectory]` log line's
-    /// `accept_rho` field, queryable by outer consumers (cap schedule,
+    /// `accept_rho` field, queryable by outer consumers (diagnostics,
     /// convergence guard) for inner-Newton model-fidelity decisions.
     pub final_accept_rho: Option<f64>,
     /// Optional KKT diagnostics when inequality constraints were active.

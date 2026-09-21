@@ -1,7 +1,7 @@
 use super::*;
 use ::opt::FixedPointObjective;
 use ndarray::array;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Report the trial just evaluated as accepted, as `OuterAcceptObserver` does
@@ -922,51 +922,46 @@ fn curvature_widening_still_rejects_genuine_nonstationarity() {
     );
 }
 
-fn terminal_fidelity_feedback(cap_value: usize) -> InnerProgressFeedback {
+fn terminal_fidelity_feedback() -> InnerProgressFeedback {
     InnerProgressFeedback {
-        cap: Arc::new(AtomicUsize::new(cap_value)),
         accepted_iter: Arc::new(AtomicUsize::new(0)),
-        last_iters: Arc::new(AtomicUsize::new(cap_value)),
+        last_iters: Arc::new(AtomicUsize::new(3)),
         last_converged: Arc::new(AtomicBool::new(false)),
-        ift_residual: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
-        accept_rho: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
         force_cold: Arc::new(AtomicBool::new(false)),
     }
 }
 
 /// Standard REML regression for #2309.  The search cache contains a
-/// cap-produced sample whose moderate gradient is paired with artificial stiff
-/// curvature; the old certificate reused it and widened its bound enough to
-/// certify.  Terminal certification must clear that cache, evaluate at cap=0,
-/// and reject the genuinely non-stationary full-fidelity gradient.
+/// trajectory-produced sample whose moderate gradient is paired with
+/// artificial stiff curvature; the old certificate reused it and widened its
+/// bound enough to certify.  Terminal certification must clear that cache,
+/// evaluate once afresh, and reject the genuinely non-stationary gradient.
 #[test]
-fn standard_reml_certificate_uses_fresh_uncapped_inner_state_2309() {
+fn standard_reml_certificate_uses_fresh_inner_state_2309() {
     struct StandardState {
         feedback: InnerProgressFeedback,
         coarse_cache_present: bool,
         reset_count: usize,
-        evaluated_caps: Vec<usize>,
+        fresh_evaluations: usize,
     }
 
-    let feedback = terminal_fidelity_feedback(3);
+    let feedback = terminal_fidelity_feedback();
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_tolerance(1.0e-6)
-        .with_outer_inner_cap(feedback.clone());
+        .with_inner_progress_feedback(feedback.clone());
     let config = problem.config();
     let state = StandardState {
         feedback,
         coarse_cache_present: true,
         reset_count: 0,
-        evaluated_caps: Vec::new(),
+        fresh_evaluations: 0,
     };
     let mut obj = problem.build_objective(
         state,
         |_: &mut StandardState, _: &Array1<f64>| Ok(10.0),
         |state: &mut StandardState, _: &Array1<f64>| {
-            let cap = state.feedback.cap.load(Ordering::Relaxed);
-            state.evaluated_caps.push(cap);
             if state.coarse_cache_present {
                 return Ok(OuterEval {
                     cost: 10.0,
@@ -975,11 +970,12 @@ fn standard_reml_certificate_uses_fresh_uncapped_inner_state_2309() {
                     inner_beta_hint: None,
                 });
             }
+            state.fresh_evaluations += 1;
             state.feedback.last_iters.store(12, Ordering::Relaxed);
             state
                 .feedback
                 .last_converged
-                .store(cap == 0, Ordering::Relaxed);
+                .store(true, Ordering::Relaxed);
             Ok(OuterEval {
                 cost: 10.0,
                 gradient: array![37.0],
@@ -1011,49 +1007,46 @@ fn standard_reml_certificate_uses_fresh_uncapped_inner_state_2309() {
 
     assert!(
         certify_outer_optimality(&mut obj, &config, "standard REML #2309", &mut result).is_err(),
-        "the full-fidelity gradient has real descent and must not inherit the coarse widened bound",
+        "the fresh gradient has real descent and must not inherit the stale widened bound",
     );
     assert_eq!(obj.state.reset_count, 1);
-    assert_eq!(obj.state.evaluated_caps, vec![0]);
-    assert_eq!(obj.state.feedback.cap.load(Ordering::Relaxed), 3);
+    assert_eq!(obj.state.fresh_evaluations, 1);
     assert_eq!(result.final_gradient(), Some(&array![37.0]));
 }
 
 /// Mixture/SAS regression for the augmented `[rho | link]` layout.  It proves
 /// that terminal reset happens before the final link state is evaluated and
-/// that a coarse rho-only artifact cannot donate its curvature-scaled bound to
+/// that a stale rho-only artifact cannot donate its curvature-scaled bound to
 /// the fresh link-coordinate gradient.
 #[test]
-fn mixture_reml_certificate_recomputes_augmented_theta_at_full_fidelity_2309() {
+fn mixture_reml_certificate_recomputes_augmented_theta_fresh_2309() {
     struct MixtureState {
         feedback: InnerProgressFeedback,
         coarse_rho_cache_present: bool,
         reset_count: usize,
-        evaluated_caps: Vec<usize>,
+        fresh_evaluations: usize,
         last_theta: Option<Array1<f64>>,
     }
 
-    let feedback = terminal_fidelity_feedback(3);
+    let feedback = terminal_fidelity_feedback();
     let problem = OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_psi_dim(1)
         .with_tolerance(1.0e-6)
-        .with_outer_inner_cap(feedback.clone());
+        .with_inner_progress_feedback(feedback.clone());
     let config = problem.config();
     let state = MixtureState {
         feedback,
         coarse_rho_cache_present: true,
         reset_count: 0,
-        evaluated_caps: Vec::new(),
+        fresh_evaluations: 0,
         last_theta: None,
     };
     let mut obj = problem.build_objective(
         state,
         |_: &mut MixtureState, _: &Array1<f64>| Ok(10.0),
         |state: &mut MixtureState, theta: &Array1<f64>| {
-            let cap = state.feedback.cap.load(Ordering::Relaxed);
-            state.evaluated_caps.push(cap);
             state.last_theta = Some(theta.clone());
             if state.coarse_rho_cache_present {
                 return Ok(OuterEval {
@@ -1063,11 +1056,12 @@ fn mixture_reml_certificate_recomputes_augmented_theta_at_full_fidelity_2309() {
                     inner_beta_hint: None,
                 });
             }
+            state.fresh_evaluations += 1;
             state.feedback.last_iters.store(14, Ordering::Relaxed);
             state
                 .feedback
                 .last_converged
-                .store(cap == 0, Ordering::Relaxed);
+                .store(true, Ordering::Relaxed);
             Ok(OuterEval {
                 cost: 10.0,
                 gradient: array![0.0, 37.0],
@@ -1101,12 +1095,11 @@ fn mixture_reml_certificate_recomputes_augmented_theta_at_full_fidelity_2309() {
 
     assert!(
         certify_outer_optimality(&mut obj, &config, "mixture REML #2309", &mut result).is_err(),
-        "the full-fidelity link gradient has real descent and must not inherit the coarse widened bound",
+        "the fresh link gradient has real descent and must not inherit the stale widened bound",
     );
     assert_eq!(obj.state.reset_count, 1);
-    assert_eq!(obj.state.evaluated_caps, vec![0]);
+    assert_eq!(obj.state.fresh_evaluations, 1);
     assert_eq!(obj.state.last_theta.as_ref(), Some(&theta_hat));
-    assert_eq!(obj.state.feedback.cap.load(Ordering::Relaxed), 3);
     assert_eq!(result.final_gradient(), Some(&array![0.0, 37.0]));
 }
 
@@ -2912,10 +2905,8 @@ fn first_order_bridge_keeps_true_gradient_on_repeated_flat_cost() {
     let mut bridge = OuterFirstOrderBridge {
         obj: &mut obj,
         layout: OuterThetaLayout::new(1, 0),
-        outer_inner_cap: None,
+        inner_progress: None,
         first_order_evals: 0,
-        g_norm_initial: None,
-        last_g_norm: None,
         last_value_grad_rho: None,
         value_probe_cache: Vec::new(),
         cost_stall: None,
@@ -2940,7 +2931,6 @@ fn first_order_bridge_keeps_true_gradient_on_repeated_flat_cost() {
     assert_eq!(second.gradient[0], 4.0);
     assert_eq!(third.gradient[0], 4.0);
     assert_eq!(fourth.gradient[0], 4.0);
-    assert_eq!(bridge.last_g_norm, Some(4.0));
     assert_eq!(eval_calls.load(Ordering::Relaxed), 4);
 }
 
@@ -2982,9 +2972,7 @@ fn outer_second_order_bridge_separates_first_and_second_order_requests() {
         layout: OuterThetaLayout::new(1, 0),
         hessian_source: HessianSource::Analytic,
         eval_count: 0,
-        outer_inner_cap: None,
-        g_norm_initial: None,
-        last_g_norm: None,
+        inner_progress: None,
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
@@ -3047,9 +3035,7 @@ fn outer_second_order_bridge_rejects_a_candidate_whose_row_geometry_refuses_2627
         layout: OuterThetaLayout::new(1, 0),
         hessian_source: HessianSource::Analytic,
         eval_count: 0,
-        outer_inner_cap: None,
-        g_norm_initial: None,
-        last_g_norm: None,
+        inner_progress: None,
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
@@ -3121,9 +3107,7 @@ fn outer_second_order_bridge_keeps_structural_refusals_fatal_2627() {
         layout: OuterThetaLayout::new(1, 0),
         hessian_source: HessianSource::Analytic,
         eval_count: 0,
-        outer_inner_cap: None,
-        g_norm_initial: None,
-        last_g_norm: None,
+        inner_progress: None,
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
@@ -3179,9 +3163,7 @@ fn analytic_route_unavailable_hessian_is_fatal() {
         layout: OuterThetaLayout::new(1, 0),
         hessian_source: HessianSource::Analytic,
         eval_count: 0,
-        outer_inner_cap: None,
-        g_norm_initial: None,
-        last_g_norm: None,
+        inner_progress: None,
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
@@ -3453,9 +3435,7 @@ fn arc_bridge_finite_cost_stall_defers_at_bound_separation() {
         layout: OuterThetaLayout::new(1, 0),
         hessian_source: HessianSource::Analytic,
         eval_count: 0,
-        outer_inner_cap: None,
-        g_norm_initial: None,
-        last_g_norm: None,
+        inner_progress: None,
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
@@ -3523,9 +3503,7 @@ fn arc_bridge_finite_stall_delivers_interior_negative_curvature() {
         layout: OuterThetaLayout::new(1, 0),
         hessian_source: HessianSource::Analytic,
         eval_count: 0,
-        outer_inner_cap: None,
-        g_norm_initial: None,
-        last_g_norm: None,
+        inner_progress: None,
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((array![-10.0], array![10.0])),
@@ -3604,9 +3582,7 @@ fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
         layout: OuterThetaLayout::new(1, 0),
         hessian_source: HessianSource::Analytic,
         eval_count: 0,
-        outer_inner_cap: None,
-        g_norm_initial: None,
-        last_g_norm: None,
+        inner_progress: None,
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
@@ -3692,9 +3668,7 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
         layout: OuterThetaLayout::new(1, 0),
         hessian_source: HessianSource::Analytic,
         eval_count: 0,
-        outer_inner_cap: None,
-        g_norm_initial: None,
-        last_g_norm: None,
+        inner_progress: None,
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
@@ -3803,9 +3777,7 @@ fn arc_bridge_cost_stall_halts_on_a_run_of_typed_refusals_2735() {
         layout: OuterThetaLayout::new(1, 0),
         hessian_source: HessianSource::Analytic,
         eval_count: 0,
-        outer_inner_cap: None,
-        g_norm_initial: None,
-        last_g_norm: None,
+        inner_progress: None,
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
@@ -3876,10 +3848,8 @@ fn bfgs_bridge_value_probe_carries_the_refusal_reason_where_plus_inf_names_nothi
         let mut bridge = OuterFirstOrderBridge {
             obj: &mut obj,
             layout: OuterThetaLayout::new(1, 0),
-            outer_inner_cap: None,
+            inner_progress: None,
             first_order_evals: 0,
-            g_norm_initial: None,
-            last_g_norm: None,
             last_value_grad_rho: None,
             value_probe_cache: Vec::new(),
             cost_stall: None,
@@ -4036,10 +4006,8 @@ fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
     let mut bridge = OuterFirstOrderBridge {
         obj: &mut obj,
         layout: OuterThetaLayout::new(1, 0),
-        outer_inner_cap: None,
+        inner_progress: None,
         first_order_evals: 0,
-        g_norm_initial: None,
-        last_g_norm: None,
         last_value_grad_rho: None,
         value_probe_cache: Vec::new(),
         cost_stall: Some(guard),

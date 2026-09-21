@@ -1980,7 +1980,7 @@ extern "C" __global__ void status_first_ladder(
 
     /// Optional host-side inputs that turn the bare GPU loop result
     /// into a full-surface `PirlsLoopOutcome` matching the CPU oracle
-    /// `fit_model_for_fixed_rho_with_adaptive_kkt`.
+    /// `fit_model_for_fixed_rho_configured`.
     ///
     /// When supplied, the postpass at loop exit runs the same host-side
     /// helpers the CPU oracle uses
@@ -2695,7 +2695,7 @@ extern "C" __global__ void status_first_ladder(
     /// `compute_observed_hessian_curvature_arrays` produce the
     /// solve-side aux jets and the curvature-promoted Hessian-side
     /// weights. All of this is bit-identical to the corresponding CPU
-    /// oracle code paths in `fit_model_for_fixed_rho_with_adaptive_kkt`.
+    /// oracle code paths in `fit_model_for_fixed_rho_configured`.
     fn build_loop_outcome(
         ws: &mut SigmaPirlsGpuWorkspace,
         loop_ws: &mut PirlsLoopWorkspace,

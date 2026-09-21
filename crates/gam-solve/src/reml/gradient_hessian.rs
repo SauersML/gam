@@ -3242,7 +3242,7 @@ impl<'a> RemlState<'a> {
     }
 
     /// Wipe every atomic-bit-packed signal used by the adaptive
-    /// policies (inner-cap schedule margin, IFT |Δρ| cap, LM-λ
+    /// policies (inner convergence report, IFT |Δρ| cap, LM-λ
     /// hint clamp). Called from the same invalidation paths as
     /// `clear_warm_start_predictor_state`, plus from
     /// `execute_pirls_if_needed`'s failure branch.
@@ -3262,11 +3262,6 @@ impl<'a> RemlState<'a> {
         // 0.0 — possible if β_predicted matched β_converged element-wise
         // — is not confused with "no signal yet".
         self.last_ift_prediction_residual
-            .store(IFT_RESIDUAL_NO_SIGNAL_BITS, Ordering::Relaxed);
-        // Same NaN-sentinel discipline as last_ift_prediction_residual:
-        // a recorded gain ratio of exactly 0 (degenerate but possible
-        // for noise-floor steps) must not collide with "no signal yet".
-        self.last_pirls_accept_rho
             .store(IFT_RESIDUAL_NO_SIGNAL_BITS, Ordering::Relaxed);
         self.clear_warm_start_trust_state();
     }
@@ -4362,7 +4357,6 @@ impl<'a> RemlState<'a> {
             ift_mode_response_slot: std::sync::Mutex::new(None),
             ift_joint_mode_response_slot: std::sync::Mutex::new(None),
             warm_start_enabled: AtomicBool::new(true),
-            outer_inner_cap: Arc::new(AtomicUsize::new(0)),
             last_inner_iters: Arc::new(AtomicUsize::new(0)),
             last_inner_converged: Arc::new(AtomicBool::new(false)),
             ift_warm_start_cache: RwLock::new(None),
@@ -4373,7 +4367,6 @@ impl<'a> RemlState<'a> {
             frozen_beta_phi: Arc::new(AtomicU64::new(0)),
             frozen_dispersion_phi: Arc::new(AtomicU64::new(0)),
             last_ift_prediction_residual: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
-            last_pirls_accept_rho: Arc::new(AtomicU64::new(IFT_RESIDUAL_NO_SIGNAL_BITS)),
             ift_cached_factor: RwLock::new(None),
             gaussian_fixed_cache: RwLock::new(None),
             gaussian_cost_only_frozen_rows: RwLock::new(None),
@@ -4631,11 +4624,7 @@ impl<'a> RemlState<'a> {
     /// Returns None if any component is NaN, in which case caching is skipped.
     /// Maps -0.0 to 0.0 to ensure consistency in caching.
     pub(crate) fn rhokey_sanitized(&self, rho: &Array1<f64>) -> Option<Vec<u64>> {
-        // A capped inner solve is a different mathematical state from an
-        // uncapped solve at the same rho.  Keep both cap identities in every
-        // eval, bundle, and PIRLS key so terminal cap=0 evidence can never
-        // replay a search-time entry produced under cap=3..64.
-        super::rho_key::sanitized_eval_state_key(rho, self.outer_inner_cap.load(Ordering::Relaxed))
+        super::rho_key::sanitized_rhokey(rho)
     }
 
     pub(super) fn prepare_eval_bundlewithkey(
@@ -4817,26 +4806,6 @@ impl<'a> RemlState<'a> {
             return Ok(h);
         }
         Ok(bundle.h_total.as_ref().clone())
-    }
-
-    pub(crate) fn previous_outer_gradient_norm(
-        &self,
-        current_key: &Option<Vec<u64>>,
-    ) -> Option<f64> {
-        let guard = self
-            .cache_manager
-            .current_outer_eval
-            .read()
-            .expect("current outer-eval slot lock poisoned");
-        let (cached_key, eval) = guard.as_ref()?;
-        if current_key
-            .as_ref()
-            .is_some_and(|current_key| current_key == cached_key)
-        {
-            return None;
-        }
-        let norm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-        (norm.is_finite() && norm >= 0.0).then_some(norm)
     }
 
     pub(crate) fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {
@@ -5662,10 +5631,6 @@ impl<'a> RemlState<'a> {
             finite_nonnegative_bits_or_no_signal(record.last_ift_prediction_residual),
             Ordering::Relaxed,
         );
-        self.last_pirls_accept_rho.store(
-            finite_nonnegative_bits_or_no_signal(record.last_pirls_accept_rho),
-            Ordering::Relaxed,
-        );
         log::debug!("[warm-start-cache] restored persistent warm start key={key}");
     }
 
@@ -5735,8 +5700,6 @@ impl<'a> RemlState<'a> {
             finite_positive_from_bits(self.last_pirls_lm_lambda.load(Ordering::Relaxed));
         record.last_ift_prediction_residual =
             finite_nonnegative_from_bits(self.last_ift_prediction_residual.load(Ordering::Relaxed));
-        record.last_pirls_accept_rho =
-            finite_nonnegative_from_bits(self.last_pirls_accept_rho.load(Ordering::Relaxed));
         store_record(store, &record);
     }
 
@@ -6264,19 +6227,16 @@ impl<'a> RemlState<'a> {
     }
 
     pub(crate) fn reset_outer_seed_state(&self) {
-        if self.inner_mode_is_seed_independent() {
-            // Every inner solve, and every outer evaluation built on one, is a
-            // function of its key alone, so what the state already holds is what
-            // a cold restart would rebuild, bit for bit: the bundle, the PIRLS
-            // LRU, the outer-eval LRU and the warm start that publishes each
-            // evaluation's `inner_beta_hint` all survive. Their keys carry the
-            // inner cap, which still separates a capped screening solve from a
-            // terminal one. Only the previous-evaluation mirror is trajectory
-            // state, and it goes.
-            self.cache_manager.forget_previous_outer_eval();
-        } else {
+        // When the inner mode is seed-independent, every inner solve, and every
+        // outer evaluation built on one, is a function of its key alone, so what
+        // the state already holds is what a cold restart would rebuild, bit for
+        // bit: the bundle, the PIRLS LRU, the outer-eval LRU and the warm start
+        // that publishes each evaluation's `inner_beta_hint` all survive.
+        if !self.inner_mode_is_seed_independent() {
             self.cache_manager.invalidate_eval_bundle();
-            // Drop cross-call PIRLS LRU entries: cached β may have been computed under a coarsened inner cap, so reusing them on retry skips real work and bit-replays the prior attempt.
+            // Drop cross-call PIRLS LRU entries: a cached β was warm-started
+            // along the previous trajectory, so reusing it on retry would
+            // bit-replay the prior attempt instead of solving from the new seed.
             self.cache_manager
                 .pirls_cache
                 .write()
@@ -6289,22 +6249,14 @@ impl<'a> RemlState<'a> {
             self.clear_warm_start_predictor_state();
         }
         // The previous trajectory's adaptive signals would mislead the adaptive
-        // cap policies of the next one.
+        // warm-start policies of the next one.
         self.clear_warm_start_adaptive_signals();
-        // Inner-PIRLS iteration caps are cross-trajectory state: the
-        // previous outer's first-order bridge writes `outer_inner_cap`
-        // on every accepted gradient eval. A value left over from the
-        // prior trajectory would silently shape the first PIRLS solve at
-        // the new seed under a cap the new trajectory never chose. The
-        // next outer is responsible for re-establishing any cap it wants
-        // via its own bridge; zeroing here is the safe baseline.
-        self.outer_inner_cap.store(0, Ordering::Relaxed);
     }
 
     /// Whether the inner mode at a key is a function of that key and the frozen
     /// state alone. An eligible Gaussian-identity fit has no inner iteration: its
-    /// mode is one direct penalized least-squares solve, which no warm start,
-    /// adaptive signal or cap reaches.
+    /// mode is one direct penalized least-squares solve, which no warm start or
+    /// adaptive signal reaches.
     fn inner_mode_is_seed_independent(&self) -> bool {
         self.gaussian_fixed_cache_eligible()
     }
@@ -6927,19 +6879,6 @@ impl<'a> RemlState<'a> {
         }))
     }
 
-    /// The inner P-IRLS iteration budget in force for one solve: the configured
-    /// budget, lowered to the outer schedule's cap when one is set. One
-    /// definition, read both where the solve is configured and where its
-    /// non-convergence is reported, so a refusal never names a budget the solve
-    /// was not actually given (#2705).
-    fn effective_inner_iteration_budget(configured: usize, outer_cap: usize) -> usize {
-        if outer_cap > 0 {
-            configured.min(outer_cap)
-        } else {
-            configured
-        }
-    }
-
     /// Runs the inner P-IRLS loop, caching the result. `rows` is the row kind
     /// the caller can consume; the returned kind is what the result carries
     /// (`SufficientStatistics` is only honoured when the frozen Gaussian
@@ -6955,11 +6894,6 @@ impl<'a> RemlState<'a> {
             .load(Ordering::Relaxed);
         // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
         let key_opt = self.rhokey_sanitized(rho);
-        // A request under an outer iteration cap is also answered by the mode
-        // certified uncapped at the same rho. The outer search probes a trial
-        // rho by value with no cap and then asks for the gradient there under
-        // its schedule's cap; without the stand-in that gradient re-ran P-IRLS
-        // to the mode already in the cache.
         if use_cache
             && let Some(key) = &key_opt
             && let Some(cached) = {
@@ -6968,10 +6902,7 @@ impl<'a> RemlState<'a> {
                     .pirls_cache
                     .write()
                     .expect("PIRLS result cache lock poisoned");
-                cache.get(key).or_else(|| {
-                    super::rho_key::uncapped_stand_in_key(key)
-                        .and_then(|uncapped| cache.get(&uncapped))
-                })
+                cache.get(key)
             }
         {
             // Do not overwrite the current warm start from cache hits.
@@ -6994,12 +6925,6 @@ impl<'a> RemlState<'a> {
             }
             return Ok((cached, BundleRows::Observed));
         }
-
-        // Outer-aware cap: an atomic that only caps the inner Newton iteration
-        // count. It does NOT suppress cache writes / warm-start updates / KKT
-        // enforcement — it is purely a budget. Driven by the outer optimizer to
-        // coarsen early-iter inner solves when ρ is far from converged.
-        let outer_cap = self.outer_inner_cap.load(Ordering::Relaxed);
 
         // Run P-IRLS with original matrices to perform fresh reparameterization
         // The returned result will include the transformation matrix qs.
@@ -7056,31 +6981,18 @@ impl<'a> RemlState<'a> {
             };
             let warm_start_ref = predicted_warm_start.as_ref().or(fallback_warm_start_ref);
             let mut pirls_config = self.config.as_pirls_config();
-            let original_cap = pirls_config.max_iterations;
-            pirls_config.max_iterations =
-                Self::effective_inner_iteration_budget(original_cap, outer_cap);
-            if outer_cap == 0 {
-                // Full-fidelity samples must resolve the inner mode at the
-                // accuracy the outer derivative budget permits. Resetting the
-                // warm caches also resets the adaptive tolerance history;
-                // using the ordinary inner tolerance here would then make a
-                // terminal certificate LESS accurate than the search it
-                // audits (#2668). The existing derivative-budget floor is
-                // independent of that history and honors tighter caller input.
-                pirls_config.convergence_tolerance = pirls_config
-                    .convergence_tolerance
-                    .min(self.config.reml_convergence_tolerance / ADAPTIVE_KKT_FLOOR_REML_DIVISOR);
-            }
-            if pirls_config.max_iterations != original_cap {
-                log::trace!(
-                    "[PIRLS cap] inner_max_iterations={} (full={} outer={}) inner_tol={:.1e} (full_tol={:.1e})",
-                    pirls_config.max_iterations,
-                    original_cap,
-                    if outer_cap > 0 { outer_cap as i64 } else { -1 },
-                    pirls_config.convergence_tolerance,
-                    self.config.pirls_convergence_tolerance,
-                );
-            }
+            // Every inner solve — value or gradient, mid-search or terminal —
+            // resolves the mode at the accuracy the outer derivative budget
+            // permits, under the full configured iteration budget (#3536). The
+            // outer gradient is the envelope derivative at the inner mode; an
+            // inner mode resolved looser than the outer tolerance puts an
+            // O(‖r‖) error into that gradient, and a value and a gradient taken
+            // at different inner fidelities at one rho describe two different
+            // functions (#2309, #2668). The derivative-budget floor honours a
+            // tighter caller tolerance.
+            pirls_config.convergence_tolerance = pirls_config
+                .convergence_tolerance
+                .min(self.config.reml_convergence_tolerance / INNER_KKT_REML_DIVISOR);
             pirls_config.link_kind = self.runtime_inverse_link();
             self.apply_lambda_search_freezes(&mut pirls_config.likelihood)?;
             // Levenberg-Marquardt damping warm-start: the λ the previous
@@ -7096,29 +7008,6 @@ impl<'a> RemlState<'a> {
                 pirls_config.initial_lm_lambda =
                     lm_lambda_warm_start_hint(cached_lambda, last_iters, last_converged);
             }
-            let adaptive_kkt_tolerance =
-                if let Some(outer_grad_norm) = self.previous_outer_gradient_norm(&key_opt) {
-                    // Ceiling is pinned to the tight inner tolerance. Loosening
-                    // it to a fixed 1e-6 ceiling (#1575) made every inner solve
-                    // uniformly coarse so the outer REML gradient was inaccurate
-                    // and the optimizer stalled, declaring convergence at a
-                    // non-stationary point (‖g‖≈0.38). The adaptive schedule
-                    // still tightens monotonically to `floor` as ‖g_outer‖ → 0;
-                    // with the ceiling at the tight tolerance the clamp can only
-                    // tighten, preserving the genuine REML stationary point.
-                    let ceiling = pirls_config.convergence_tolerance;
-                    let floor = (self.config.reml_convergence_tolerance
-                        / ADAPTIVE_KKT_FLOOR_REML_DIVISOR)
-                        .min(ceiling);
-                    (floor > 0.0 && ceiling >= floor).then_some(pirls::AdaptiveKktTolerance {
-                        eta: ADAPTIVE_KKT_ETA,
-                        floor,
-                        ceiling,
-                        outer_grad_norm,
-                    })
-                } else {
-                    None
-                };
             // Gaussian + Identity outer REML reuses a precomputed XᵀWX and
             // XᵀW(y − offset) across every inner solve; for other families /
             // links this returns None and the inner solver falls back to the
@@ -7156,13 +7045,12 @@ impl<'a> RemlState<'a> {
                 linear_constraints_original: self.linear_constraints.as_ref(),
             };
             let pirls_start = std::time::Instant::now();
-            let result = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
+            let result = pirls::fit_model_for_fixed_rho_configured(
                 LogSmoothingParamsView::new(rho.view())?,
                 problem,
                 penalty,
                 &pirls_config,
                 warm_start_ref,
-                adaptive_kkt_tolerance,
                 // REML cost eval: never re-profile the family dispersion (Gamma
                 // shape / Beta precision) against the trial λ's residuals — that
                 // would couple the scale to λ and bias selection (#678, #769).
@@ -7229,12 +7117,8 @@ impl<'a> RemlState<'a> {
             // with the SAME configuration and the SAME convergence tolerance;
             // only the initializer changes, and a point that fails both ways
             // keeps its original verdict. It costs one extra inner solve on
-            // exactly the path that today returns a wrong +inf. One exclusion
-            // keeps it from firing where a non-minimum is the intended outcome:
-            // a solve stopped at the outer schedule's throttled cap is a budget event
-            // the schedule itself corrects on the next outer iteration
-            // (`inner_budget_exhaustion_was_scheduled`). The first-Fisher-step
-            // Gram is deliberately not carried into the retry: the flat variant
+            // exactly the path that today returns a wrong +inf. The
+            // first-Fisher-step Gram is deliberately not carried into the retry: the flat variant
             // is admissible only when a warm start supplied its frozen working
             // weight.
             let warm_started_non_minimum = warm_start_ref.is_some()
@@ -7244,11 +7128,6 @@ impl<'a> RemlState<'a> {
                             res.status,
                             pirls::PirlsStatus::Converged
                                 | pirls::PirlsStatus::StalledAtValidMinimum
-                        ) && !inner_budget_exhaustion_was_scheduled(
-                            res.status,
-                            res.iteration,
-                            outer_cap,
-                            self.config.max_iterations,
                         )
                     }
                     Err(_) => false,
@@ -7269,13 +7148,12 @@ impl<'a> RemlState<'a> {
                     coefficient_lower_bounds: self.coefficient_lower_bounds.as_ref(),
                     linear_constraints_original: self.linear_constraints.as_ref(),
                 };
-                let cold = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
+                let cold = pirls::fit_model_for_fixed_rho_configured(
                     LogSmoothingParamsView::new(rho.view())?,
                     problem_cold,
                     penalty_cold,
                     &pirls_config,
                     None,
-                    adaptive_kkt_tolerance,
                     false,
                     cost_only_gaussian_rows.as_ref(),
                 );
@@ -7671,22 +7549,6 @@ impl<'a> RemlState<'a> {
                     self.last_pirls_lm_lambda
                         .store(pirls_result.final_lm_lambda.to_bits(), Ordering::Relaxed);
                 }
-                // Persist the accepted gain ratio so the cap
-                // schedule can adapt to inner Newton model fidelity
-                // alongside `last_iters` and `last_converged`. The
-                // LM accept-branch invariant (rho > 0 is necessary
-                // for acceptance) means a finite-positive value is
-                // the only "meaningful signal" outcome; anything
-                // else (None, NaN) leaves the NaN sentinel in
-                // place so the schedule falls back to the
-                // default margin.
-                if let Some(rho) = pirls_result.final_accept_rho
-                    && rho.is_finite()
-                    && rho >= 0.0
-                {
-                    self.last_pirls_accept_rho
-                        .store(rho.to_bits(), Ordering::Relaxed);
-                }
                 self.store_persistent_warm_start();
                 // Cache only if key is valid (not NaN).
                 if use_cache
@@ -7715,47 +7577,14 @@ impl<'a> RemlState<'a> {
                     pirls::PirlsStatus::LmStepSearchExhausted => "LM step search exhausted",
                     _ => "max iterations reached",
                 };
-                // The only thing that can shorten the inner budget below
-                // the configured one is the outer schedule.
-                // `MaxIterationsReached` under that
-                // throttle is the scheduled budget event the geometric
-                // backoff immediately below exists to correct — NOT a
-                // statement about the fit. Both the gradient norm and the
-                // iteration index describe a solve that was stopped early
-                // on purpose, so reporting them at ERROR under a
-                // certification verdict makes a routine, self-correcting
-                // event indistinguishable from a real refusal to any
-                // consumer reading the log stream. `LmStepSearchExhausted`
-                // is a genuine step-search failure at any budget and keeps
-                // its ERROR.
                 let configured_cap = self.config.max_iterations;
-                let budget_was_throttled = inner_budget_exhaustion_was_scheduled(
-                    pirls_result.status,
+                log::debug!(
+                    "P-IRLS could not certify a valid minimum: {kind} (gradient norm \
+                     {:.3e}, iter {} of configured budget {})",
+                    pirls_result.lastgradient_norm,
                     pirls_result.iteration,
-                    outer_cap,
                     configured_cap,
                 );
-                if budget_was_throttled {
-                    log::trace!(
-                        "P-IRLS stopped at the scheduled inner cap: {kind} (gradient norm \
-                         {:.3e}, iter {}; scheduled cap {} of configured budget {}). The \
-                         outer schedule grows the cap for the next outer iteration.",
-                        pirls_result.lastgradient_norm,
-                        pirls_result.iteration,
-                        outer_cap,
-                        configured_cap,
-                    );
-                } else {
-                    log::debug!(
-                        "P-IRLS could not certify a valid minimum: {kind} (gradient norm \
-                         {:.3e}, iter {} of configured budget {})",
-                        pirls_result.lastgradient_norm,
-                        pirls_result.iteration,
-                        configured_cap,
-                    );
-                }
-                // Adaptive-cap feedback: cap was hit. Geometric
-                // backoff on the next outer iter's cap.
                 self.last_inner_iters
                     .store(pirls_result.iteration, Ordering::Relaxed);
                 self.last_inner_converged.store(false, Ordering::Relaxed);
@@ -7775,10 +7604,7 @@ impl<'a> RemlState<'a> {
                 self.take_staged_warm_start_prediction_step();
                 Err(EstimationError::PirlsDidNotConverge {
                     iterations: pirls_result.iteration,
-                    budget: Self::effective_inner_iteration_budget(
-                        self.config.max_iterations,
-                        outer_cap,
-                    ),
+                    budget: configured_cap,
                     stop: kind.to_string(),
                     last_change: pirls_result.lastgradient_norm,
                 })
@@ -7834,15 +7660,12 @@ mod stateless_pirls_tests {
             };
 
             let pirls_start = std::time::Instant::now();
-            let result = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
+            let result = pirls::fit_model_for_fixed_rho_configured(
                 LogSmoothingParamsView::new(rho.view())?,
                 problem,
                 penalty,
                 &pirls_config,
                 // Cold start: no warm-start state is read.
-                None,
-                // No adaptive-KKT outer-grad lookup: that state is owned by the
-                // production trajectory.
                 None,
                 // Gamma scale refinement stays OFF (only the final reported fit
                 // refines — see #678).
@@ -7926,140 +7749,6 @@ fn apply_frozen_search_scale(
         .resolved_scale()
         .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
     Ok(())
-}
-
-/// Whether an inner P-IRLS budget exhaustion is the outer schedule's own
-/// truncation rather than evidence about the fit.
-///
-/// The outer→inner cap schedule (`first_order_inner_cap_schedule`) hands the
-/// inner solver as few as `INNER_CAP_FLOOR` iterations and grows the budget
-/// geometrically as soon as a solve reports it ran out — the truncation is the
-/// mechanism, and hitting it is the signal the backoff consumes. That schedule
-/// is the only thing that can shorten the budget below the configured
-/// `max_iterations`, so a `MaxIterationsReached` at or under the scheduled cap
-/// is routine and self-correcting: its gradient norm and iteration index
-/// describe a solve stopped early on purpose and say nothing about whether a
-/// minimum exists at this ρ.
-///
-/// `LmStepSearchExhausted` is a genuine step-search failure at any budget and
-/// is never scheduled.
-pub(crate) fn inner_budget_exhaustion_was_scheduled(
-    status: pirls::PirlsStatus,
-    iteration: usize,
-    scheduled_cap: usize,
-    configured_cap: usize,
-) -> bool {
-    matches!(status, pirls::PirlsStatus::MaxIterationsReached)
-        && scheduled_cap > 0
-        && scheduled_cap < configured_cap
-        && iteration <= scheduled_cap
-}
-
-#[cfg(test)]
-mod scheduled_inner_cap_exhaustion_tests {
-    use super::inner_budget_exhaustion_was_scheduled;
-    use crate::pirls::PirlsStatus;
-
-    /// The configured inner budget a production fit runs under. Any scheduled
-    /// cap is strictly below this; the point of the predicate is to tell the
-    /// two apart.
-    const CONFIGURED: usize = 200;
-
-    #[test]
-    fn schedules_cold_start_caps_are_recognized_as_scheduled() {
-        // `first_order_inner_cap_schedule` returns 3 / 5 / 10 for the first
-        // outer iterations before any inner-progress history exists. Each of
-        // those exhausting its budget is the schedule working, not a fit
-        // verdict.
-        for cap in [3usize, 5, 10] {
-            assert!(
-                inner_budget_exhaustion_was_scheduled(
-                    PirlsStatus::MaxIterationsReached,
-                    cap,
-                    cap,
-                    CONFIGURED,
-                ),
-                "cold-start scheduled cap {cap} must read as scheduled"
-            );
-        }
-    }
-
-    #[test]
-    fn the_widest_throttle_below_the_budget_is_still_scheduled() {
-        // The schedule can grow the cap geometrically; as long as it stays
-        // strictly under the configured budget the exhaustion is still the
-        // schedule's, not the fit's.
-        assert!(inner_budget_exhaustion_was_scheduled(
-            PirlsStatus::MaxIterationsReached,
-            CONFIGURED - 1,
-            CONFIGURED - 1,
-            CONFIGURED,
-        ));
-    }
-
-    #[test]
-    fn exhausting_the_configured_budget_is_not_scheduled() {
-        // `scheduled_cap == 0` is the "no cap from this source" sentinel: the
-        // solve ran on the caller's own budget and genuinely failed.
-        assert!(!inner_budget_exhaustion_was_scheduled(
-            PirlsStatus::MaxIterationsReached,
-            CONFIGURED,
-            0,
-            CONFIGURED,
-        ));
-    }
-
-    #[test]
-    fn a_schedule_that_does_not_shorten_the_budget_is_not_scheduled() {
-        // A scheduled cap at or above the configured budget throttles nothing,
-        // so exhaustion under it is exhaustion of the real budget.
-        assert!(!inner_budget_exhaustion_was_scheduled(
-            PirlsStatus::MaxIterationsReached,
-            CONFIGURED,
-            CONFIGURED,
-            CONFIGURED,
-        ));
-        assert!(!inner_budget_exhaustion_was_scheduled(
-            PirlsStatus::MaxIterationsReached,
-            CONFIGURED,
-            CONFIGURED + 8,
-            CONFIGURED,
-        ));
-    }
-
-    #[test]
-    fn lm_step_search_exhaustion_is_never_scheduled() {
-        // A collapsed LM step search is a real failure of the inner Newton at
-        // whatever budget it had; the schedule never produces it.
-        assert!(!inner_budget_exhaustion_was_scheduled(
-            PirlsStatus::LmStepSearchExhausted,
-            5,
-            5,
-            CONFIGURED,
-        ));
-    }
-
-    #[test]
-    fn converged_and_stalled_states_are_not_scheduled_exhaustion() {
-        for status in [PirlsStatus::Converged, PirlsStatus::StalledAtValidMinimum] {
-            assert!(!inner_budget_exhaustion_was_scheduled(
-                status, 5, 5, CONFIGURED,
-            ));
-        }
-    }
-
-    #[test]
-    fn running_past_the_scheduled_cap_is_not_scheduled() {
-        // If the solve reached more iterations than the scheduled cap allowed,
-        // something other than the schedule bounded it, so the schedule cannot
-        // claim the exhaustion.
-        assert!(!inner_budget_exhaustion_was_scheduled(
-            PirlsStatus::MaxIterationsReached,
-            12,
-            5,
-            CONFIGURED,
-        ));
-    }
 }
 
 /// What the IFT predictor's inner computation actually did with the
@@ -9554,20 +9243,21 @@ mod firth_hessian_direction_reuse_tests {
 }
 
 #[cfg(test)]
-mod capped_request_cache_tests {
-    use super::BundleRows;
+mod single_fidelity_inner_solve_tests_3536 {
     use super::super::super::RemlConfig;
     use super::super::super::tests::{binomial_logit_glm_spec, build_logit_state};
+    use super::BundleRows;
+    use super::INNER_KKT_REML_DIVISOR;
     use ndarray::{Array1, array};
+    use std::sync::atomic::Ordering;
 
+    /// #3536: a value probe and a gradient request at one rho are answered by
+    /// ONE inner mode, solved once, at the outer-derivative tolerance
+    /// `min(pirls_tol, reml_tol / INNER_KKT_REML_DIVISOR)`. There is no
+    /// outer-driven iteration cap or looser mid-search tolerance that could
+    /// make the gradient describe a different inner mode than the value.
     #[test]
-    fn capped_gradient_request_reuses_uncapped_mode_at_same_rho() {
-        // The outer search probes a trial rho by value with no inner cap, then
-        // asks for the gradient at that rho under its schedule's cap. The
-        // uncapped mode is already certified and cached, so the capped request
-        // must be answered from it rather than re-running P-IRLS: at n=1e4 the
-        // repeat solve was a third of every value+gradient pair.
-        use std::sync::atomic::Ordering;
+    fn value_and_gradient_share_one_inner_mode_at_the_outer_derivative_tolerance() {
         let y = array![0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -9580,46 +9270,50 @@ mod capped_request_cache_tests {
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.1, 0.15], [0.0, 0.15, 0.8],];
         let rho = array![0.0];
-        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-10, false);
+        // A loose outer tolerance, so the derivative-budget tightening is the
+        // binding term rather than the inner floor.
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-4, false);
         let state = build_logit_state(&y, &w, &x, &s0, &cfg);
 
-        state.outer_inner_cap.store(0, Ordering::Relaxed);
         state
             .compute_outer_eval_with_order(&rho, crate::rho_optimizer::OuterEvalOrder::Value)
-            .expect("uncapped value probe should succeed");
-        let uncapped = state
+            .expect("value probe should succeed");
+        let value_mode = state
             .execute_pirls_if_needed(&rho, BundleRows::Observed)
-            .expect("uncapped mode is cached")
+            .expect("value mode is cached")
             .0;
+
+        let expected_tol = cfg
+            .pirls_convergence_tolerance
+            .min(cfg.reml_convergence_tolerance / INNER_KKT_REML_DIVISOR);
+        assert_eq!(
+            value_mode.final_kkt_tolerance,
+            Some(expected_tol),
+            "the value probe's inner solve must be certified at the outer-derivative tolerance"
+        );
 
         // A fresh solve records its iteration count; a cache answer does not.
         let untouched = usize::MAX;
         state.last_inner_iters.store(untouched, Ordering::Relaxed);
-        state.outer_inner_cap.store(5, Ordering::Relaxed);
-        let capped = state
+        state
+            .compute_outer_eval_with_order(
+                &rho,
+                crate::rho_optimizer::OuterEvalOrder::ValueAndGradient,
+            )
+            .expect("gradient request should succeed");
+        let gradient_mode = state
             .execute_pirls_if_needed(&rho, BundleRows::Observed)
-            .expect("capped request should succeed")
+            .expect("gradient mode is cached")
             .0;
-
         assert_eq!(
             state.last_inner_iters.load(Ordering::Relaxed),
             untouched,
-            "the capped request re-ran P-IRLS instead of reusing the uncapped mode"
+            "the gradient request re-ran P-IRLS instead of reusing the value probe's mode"
         );
-        assert_eq!(capped.beta_transformed.as_ref(), uncapped.beta_transformed.as_ref());
-
-        // The converse stays closed (#2309): a mode cached under a cap never
-        // answers an uncapped request.
-        let rho_capped_only = array![0.5];
-        state
-            .execute_pirls_if_needed(&rho_capped_only, BundleRows::Observed)
-            .expect("capped solve should succeed");
-        state.outer_inner_cap.store(0, Ordering::Relaxed);
-        state.last_inner_iters.store(untouched, Ordering::Relaxed);
-        state
-            .execute_pirls_if_needed(&rho_capped_only, BundleRows::Observed)
-            .expect("uncapped solve should succeed");
-        assert_ne!(state.last_inner_iters.load(Ordering::Relaxed), untouched);
+        assert_eq!(
+            gradient_mode.beta_transformed.as_ref(),
+            value_mode.beta_transformed.as_ref()
+        );
     }
 }
 

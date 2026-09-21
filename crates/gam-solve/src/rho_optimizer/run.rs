@@ -112,33 +112,6 @@ pub(crate) fn install_matching_initial_inner_seed(
     Ok(())
 }
 
-/// Temporarily require a complete inner solve.
-///
-/// Search-time REML evaluations may deliberately cap P-IRLS, but a sample
-/// used as mathematical evidence about the true profiled objective cannot.
-/// Seed samples, terminal certificates, and final state installation therefore
-/// lift the cap for the duration of their evaluation and restore the scheduler's
-/// value afterward. Callers that may hold capped cached state reset the
-/// objective before making the full-fidelity request.
-pub(crate) struct FullFidelityInnerCapGuard<'a> {
-    cap: &'a AtomicUsize,
-    previous: usize,
-}
-
-impl<'a> FullFidelityInnerCapGuard<'a> {
-    pub(crate) fn lift(feedback: &'a InnerProgressFeedback) -> Self {
-        let cap = feedback.cap.as_ref();
-        let previous = cap.swap(0, Ordering::Relaxed);
-        Self { cap, previous }
-    }
-}
-
-impl Drop for FullFidelityInnerCapGuard<'_> {
-    fn drop(&mut self) {
-        self.cap.store(self.previous, Ordering::Relaxed);
-    }
-}
-
 /// Declared size of the problem behind an outer objective: the number of
 /// observation rows and inner coefficients, and the criterion's information
 /// count. The decrement-band certificate charges its floating-point formation
@@ -292,14 +265,12 @@ pub(crate) struct OuterConfig {
     /// otherwise declines with an error. It never searches
     /// (`resume_prior_certificate`).
     pub(crate) resume_value: Option<f64>,
-    /// Outer-aware inner-PIRLS iteration cap.
-    /// When set, the BFGS bridge drives this atomic on every accepted
-    /// gradient eval to coarsen the inner Newton solve at early outer iters
-    /// (when ρ is far from converged) and lift it back to full as
-    /// convergence approaches. It does NOT suppress cache writes /
-    /// warm-start updates / KKT enforcement; it is purely a budget. See
-    /// `RemlObjectiveState::outer_inner_cap` for dual-cap semantics.
-    pub(crate) outer_inner_cap: Option<InnerProgressFeedback>,
+    /// Inner-PIRLS progress channel ([`InnerProgressFeedback`]). When set,
+    /// the bridges read the last inner solve's convergence flag so the outer
+    /// certificate refuses a stationarity claim taken at a non-converged
+    /// inner mode, and the terminal certificate re-solves from a clean
+    /// objective state. It never limits the inner iteration budget (#3536).
+    pub(crate) inner_progress: Option<InnerProgressFeedback>,
     pub(crate) operator_initial_trust_radius: Option<f64>,
     pub(crate) arc_initial_regularization: Option<f64>,
     /// Optional persistent-cache session. When `Some`, every finite objective
@@ -459,7 +430,7 @@ impl Default for OuterConfig {
             fallback_policy: FallbackPolicy::Automatic,
             initial_rho_is_prior_terminal_certificate: false,
             resume_value: None,
-            outer_inner_cap: None,
+            inner_progress: None,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
             cache_session: None,
@@ -505,7 +476,7 @@ pub struct OuterProblem {
     initial_rho: Option<Array1<f64>>,
     initial_curvature: Option<BoundOuterCurvature>,
     fallback_policy: FallbackPolicy,
-    outer_inner_cap: Option<InnerProgressFeedback>,
+    inner_progress: Option<InnerProgressFeedback>,
     operator_initial_trust_radius: Option<f64>,
     arc_initial_regularization: Option<f64>,
     cache_session: Option<Arc<CacheSession>>,
@@ -551,7 +522,7 @@ impl OuterProblem {
             initial_rho: None,
             initial_curvature: None,
             fallback_policy: FallbackPolicy::Automatic,
-            outer_inner_cap: None,
+            inner_progress: None,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
             cache_session: None,
@@ -706,21 +677,16 @@ impl OuterProblem {
         }
         Some(warm_start)
     }
-    /// Wire the bidirectional inner-PIRLS feedback channel.
+    /// Wire the inner-PIRLS progress channel.
     ///
-    /// The outer bridge writes a coarsened iteration cap into
-    /// `feedback.cap` on every accepted gradient/Hessian eval; the inner
-    /// solver writes back into `feedback.last_iters` /
-    /// `feedback.last_converged` after each inner solve so the
-    /// next outer iter's schedule can adapt to the inner solver's
-    /// actual convergence behavior. Typical caller passes
-    /// `InnerProgressFeedback {
-    ///     cap: Arc::clone(&reml_state.outer_inner_cap),
-    ///     last_iters: Arc::clone(&reml_state.last_inner_iters),
-    ///     last_converged: Arc::clone(&reml_state.last_inner_converged),
-    /// }` so the inner and outer observe the same atomics.
-    pub(crate) fn with_outer_inner_cap(mut self, feedback: InnerProgressFeedback) -> Self {
-        self.outer_inner_cap = Some(feedback);
+    /// The inner solver writes `feedback.last_iters` /
+    /// `feedback.last_converged` after each inner solve; the bridges read the
+    /// convergence flag so a stationarity certificate is never issued at a
+    /// non-converged inner mode. Typical caller passes the
+    /// `RemlObjectiveState` atomics (`last_inner_iters`,
+    /// `last_inner_converged`) so the inner and outer observe the same state.
+    pub(crate) fn with_inner_progress_feedback(mut self, feedback: InnerProgressFeedback) -> Self {
+        self.inner_progress = Some(feedback);
         self
     }
 
@@ -734,18 +700,16 @@ impl OuterProblem {
     /// converge to different ridge points whose Laplace `½log|H(β)|`, hence the
     /// profiled objective, differ by more than the outer descent resolution, so
     /// the optimizer's step-acceptance cannot separate real descent from that
-    /// hysteresis and grinds to `max_iter` at a non-stationary point. Uncapping
-    /// the inner cycle budget does not cure it (a fully converged warm solve
-    /// still lands on the warm-biased ridge point); the objective must re-solve
-    /// COLD to see a consistent surface.
+    /// hysteresis and grinds to `max_iter` at a non-stationary point. A fully
+    /// converged warm solve still lands on the warm-biased ridge point, so the
+    /// objective must re-solve COLD to see a consistent surface.
     ///
     /// The caller shares this `Arc<AtomicBool>` with its objective closure and
     /// consults it there, re-solving the inner problem from a canonical seed
     /// (dropping the warm cache) whenever the flag is raised. The signal rides
-    /// the internal inner-cap feedback channel, but its `cap` slot is a private
-    /// throwaway so wiring the signal never perturbs the caller's own inner-cap
-    /// scheduling (custom families hold their real inner cap separately).
-    /// Objectives that do not warm-start, or never near-separate, simply never
+    /// the internal inner-progress channel; its `last_iters` / `last_converged`
+    /// slots are private and never written, so the convergence gate reads the
+    /// same "no report" default as an unwired objective. Objectives that do not warm-start, or never near-separate, simply never
     /// observe the flag raised.
     ///
     /// `accepted_steps` becomes the channel's accepted-step counter, which the
@@ -758,17 +722,12 @@ impl OuterProblem {
         signal: Arc<AtomicBool>,
         accepted_steps: Arc<AtomicUsize>,
     ) -> Self {
-        self.with_outer_inner_cap(InnerProgressFeedback {
-            cap: Arc::new(AtomicUsize::new(0)),
+        self.with_inner_progress_feedback(InnerProgressFeedback {
             accepted_iter: accepted_steps,
-            // `last_iters == 0` ⇒ `snapshot()` returns `None` ⇒ no cap-schedule
-            // adaptation is derived from this dummy; `last_converged == true`
-            // matches the `None` default of `inner_solve_converged`, so
-            // terminal-fidelity gating is byte-for-byte unchanged.
+            // `last_iters == 0` ⇒ `inner_solve_converged` reads the unwired
+            // default (`true`), so the convergence gate is unchanged.
             last_iters: Arc::new(AtomicUsize::new(0)),
             last_converged: Arc::new(AtomicBool::new(true)),
-            ift_residual: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
-            accept_rho: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
             force_cold: signal,
         })
     }
@@ -893,7 +852,7 @@ impl OuterProblem {
             // hit, which says so where it sets `initial_rho`.
             initial_rho_is_prior_terminal_certificate: false,
             resume_value: None,
-            outer_inner_cap: self.outer_inner_cap.clone(),
+            inner_progress: self.inner_progress.clone(),
             operator_initial_trust_radius: self.operator_initial_trust_radius,
             arc_initial_regularization: self.arc_initial_regularization,
             cache_session: self.cache_session.clone(),
@@ -3529,7 +3488,7 @@ fn certify_fixed_point_optimality(
     // read taken after both lanes cannot speak for this one (#2228). Mirrors the
     // capture-immediately discipline already used for `terminal_inner_converged`.
     let value_lane_inner_converged =
-        value_only.map(|_| inner_solve_converged(config.outer_inner_cap.as_ref()));
+        value_only.map(|_| inner_solve_converged(config.inner_progress.as_ref()));
     // #2228: these two lanes run back-to-back on ONE `&mut obj` with no reset
     // between them. Criteria that fit `(t, β)` in place therefore warm-start
     // this certificate lane from wherever the value-only lane above stopped —
@@ -3589,7 +3548,7 @@ fn certify_fixed_point_optimality(
                 StationarityStandard::NoComparison,
             )
         })?;
-    let certificate_lane_inner_converged = inner_solve_converged(config.outer_inner_cap.as_ref());
+    let certificate_lane_inner_converged = inner_solve_converged(config.inner_progress.as_ref());
     if !certificate_lane_inner_converged {
         return Err(outer_nonconvergence_error(
             context,
@@ -3781,6 +3740,22 @@ pub(crate) enum CertificationFidelity {
     Mint,
 }
 
+/// Whether the terminal certificate and the final-state installation start
+/// from a reset objective.
+///
+/// Objectives that report inner progress (the REML/mixture objectives) warm
+/// start every inner solve from the search trajectory; objectives that own a
+/// terminal coefficient mode (#2334) install that mode. For both, the terminal
+/// evaluation must be a function of `rho_star` alone, not of the path that
+/// reached it, so the certifying re-evaluation and `finalize_outer_result`
+/// both begin from the same clean baseline and the installed mode's
+/// objective bitwise matches the certified `final_value` even when the inner
+/// solve is bimodal at `rho_star`. Other objectives keep their ordinary
+/// stateful certification semantics.
+pub(crate) fn terminal_state_is_reset(obj: &dyn OuterObjective, config: &OuterConfig) -> bool {
+    config.inner_progress.is_some() || obj.owns_terminal_coefficient_mode()
+}
+
 pub(crate) fn certify_outer_optimality(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
@@ -3798,28 +3773,12 @@ pub(crate) fn certify_outer_optimality_with_fidelity(
     fidelity: CertificationFidelity,
 ) -> Result<OuterCriterionCertificate, EstimationError> {
     result.termination.begin_certification();
-    let terminal_cap_guard = config
-        .outer_inner_cap
-        .as_ref()
-        .map(FullFidelityInnerCapGuard::lift);
-    if terminal_cap_guard.is_some() || obj.owns_terminal_coefficient_mode() {
-        // `reset` is deliberately conditional on the presence of the cap
-        // contract.  Those are the REML/mixture objectives whose search cache
-        // can contain a coarse inner state; uncapped objectives retain their
-        // ordinary stateful certification semantics.
-        //
-        // The `owns_terminal_coefficient_mode()` disjunct (#2334) closes the
-        // gap for cap-less objectives that install an owned coefficient mode:
-        // the certifying re-eval below must start from the same clean baseline
-        // that `finalize_outer_result` used, so the mode's objective bitwise
-        // matches the certified `final_value` even when the inner solve is
-        // bimodal at `rho_star`.
+    if terminal_state_is_reset(obj, config) {
         obj.reset();
     }
     let outcome = certify_outer_optimality_at_terminal_fidelity(
         obj, config, context, result, true, fidelity, None,
     );
-    drop(terminal_cap_guard);
     if outcome.is_err() {
         result.termination.refuse_certificate();
     }
@@ -3993,7 +3952,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // also run, so it can only speak for that one (#2228). Measured: this is the
     // audit site that actually fires in practice, and it was reporting
     // "value-lane=unsampled" because only the fixed-point route was wired.
-    let value_lane_inner_converged = inner_solve_converged(config.outer_inner_cap.as_ref());
+    let value_lane_inner_converged = inner_solve_converged(config.inner_progress.as_ref());
     if !value_only.is_finite() {
         return Err(outer_nonconvergence_error(
             context,
@@ -4061,7 +4020,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         super::decrement_bands::outer_value_band(config, evaluation.cost, Some(&terminal_evidence));
     let point_resolution = super::decrement_bands::outer_resolution(tau_stat, point_band);
 
-    let analytic_lane_inner_converged = inner_solve_converged(config.outer_inner_cap.as_ref());
+    let analytic_lane_inner_converged = inner_solve_converged(config.inner_progress.as_ref());
     if !analytic_lane_inner_converged {
         return Err(outer_nonconvergence_error(
             context,
@@ -6810,38 +6769,21 @@ pub(crate) fn run_outer(
     let certify_and_install = |obj: &mut dyn OuterObjective,
                                result: &mut OuterResult|
      -> Result<OuterCriterionCertificate, EstimationError> {
-        // Reinstall the selected point under cap=0 so the certificate below
-        // measures the full-fidelity state belonging to `result.rho`, not
-        // whatever capped search evaluation last touched the objective
-        // (seeding beta alone does not restore weights, factors, or link
-        // state). Reset forces a real installation instead of an LRU value hit.
-        let terminal_cap_guard = config
-            .outer_inner_cap
-            .as_ref()
-            .map(FullFidelityInnerCapGuard::lift);
-        // Reset is conditional on the cap contract, mirroring
-        // `certify_outer_optimality`'s own doctrine: REML/mixture
-        // objectives with a cap can hold a coarse search cache that must
-        // not be installed as terminal state, while uncapped stateful
-        // objectives (reactive-domain entries among them) retain the very
-        // state their evaluation at `result.rho` depends on — an
-        // unconditional reset here wiped it and made the certification
-        // evaluation non-finite on the reactive fixture.
-        //
-        // OR-in the terminal-coefficient-mode ownership signal (#2334):
-        // objectives that install an owned coefficient mode here but hold
-        // their inner cap in a different field (custom families) leave
-        // `outer_inner_cap` `None`, so the cap gate alone never fires and
-        // `finalize` here could land in a different inner basin than the
-        // certifying re-eval below — a spurious bitwise bind failure on a
-        // bimodal inner solve. Forcing the reset for mode-owning objectives
-        // makes both installations start from the same clean baseline.
-        if terminal_cap_guard.is_some() || obj.owns_terminal_coefficient_mode() {
+        // Reinstall the selected point so the certificate below measures the
+        // state belonging to `result.rho`, not whatever search evaluation last
+        // touched the objective (seeding beta alone does not restore weights,
+        // factors, or link state). The reset, gated by
+        // `terminal_state_is_reset`, forces a real installation from the same
+        // clean baseline the certifying re-eval uses instead of an LRU value
+        // hit. It is not unconditional: stateful objectives outside that gate
+        // (reactive-domain entries among them) retain the very state their
+        // evaluation at `result.rho` depends on, and an unconditional reset
+        // made the certification evaluation non-finite on the reactive fixture.
+        if terminal_state_is_reset(obj, config) {
             obj.reset();
         }
         let terminal_installation = obj.finalize_outer_result(&result.rho, &result.plan_used);
-        let terminal_inner_converged = inner_solve_converged(config.outer_inner_cap.as_ref());
-        drop(terminal_cap_guard);
+        let terminal_inner_converged = inner_solve_converged(config.inner_progress.as_ref());
         terminal_installation?;
         if !terminal_inner_converged {
             return Err(outer_nonconvergence_error(
