@@ -43,6 +43,8 @@ use super::{
     calculate_edfwithworkspace_with_penalty,
     compute_constraint_kkt_diagnostics,
     computeworkingweight_derivatives_from_eta,
+    constrained_stationarity_norm,
+    effective_kkt_tolerance,
     inf_norm,
     pirls_data_log_kernel_from_eta,
     runworking_model_pirls,
@@ -51,7 +53,9 @@ use super::{
     standard_inverse_link_jet,
     update_glmvectors,
 };
-use super::{GamModelFinalState, WorkingLikelihood, project_coefficients_to_lower_bounds};
+use super::{
+    GamModelFinalState, WorkingLikelihood, WorkingModel, project_coefficients_to_lower_bounds,
+};
 use crate::active_set;
 use crate::estimate::EstimationError;
 use crate::gpu::pirls_host_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
@@ -68,13 +72,236 @@ use ndarray::{ArcArray1, Array1, Array2, ArrayView1, ArrayView2, s};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Converged-η dispersion refreshes (Tweedie Pearson φ, Gaussian / inverse
-/// Gaussian φ MLE) allowed after the reported solve. The φ map is a strong
-/// contraction, so cold starts settle in 1–2 re-solves and warm starts in zero.
-const MAX_PHI_REFRESH: usize = 5;
-/// Relative φ change below which a re-solve cannot move any reported quantity
-/// meaningfully (far under statistical resolution).
-const PHI_REFRESH_REL_TOL: f64 = 1e-4;
+/// The stationarity band a converged-η scale refresh holds the reported pair
+/// `(β̂, scale)` to.
+///
+/// A refresh installs a scale estimated at the converged η and then has to
+/// answer whether the coefficients it will be reported with are still
+/// stationary THERE. That is the question the inner solve already answered when
+/// it accepted β̂, so it is asked with the same certificate and at the same
+/// band: the dimensionless residual `‖g‖ / ‖natural scale‖`
+/// ([`WorkingState::relative_gradient_norm`]) against the tolerance THIS solve
+/// decided against (`final_kkt_tolerance` — the adaptive value when the outer
+/// schedule supplied one, the configured one otherwise), widened to the
+/// near-stationary band `10·tol` exactly when that is the band the solve itself
+/// was accepted under ([`WorkingState::near_stationary_kkt`], the
+/// `StalledAtValidMinimum` acceptance).
+///
+/// Floored at the residual β̂ already carries: the refreshed gradient differs
+/// from the reported one only by the scale-induced term, so no band below the
+/// residual already present is reachable however little the scale moved, and a
+/// band below it would refuse every fit. This is the `max(τ, ε)` floor — the
+/// certificate cannot demand more precision than the state it is reading was
+/// produced with. On every accepted path `ε` is already inside the band by
+/// construction, so the floor binds only where a state was minted without a
+/// certificate being evaluated at all.
+fn converged_eta_refresh_band(
+    summary: &WorkingModelPirlsResult,
+    options: &WorkingModelPirlsOptions,
+) -> f64 {
+    let tolerance = summary
+        .final_kkt_tolerance
+        .unwrap_or_else(|| effective_kkt_tolerance(options));
+    let accepted = if matches!(summary.status, PirlsStatus::StalledAtValidMinimum) {
+        tolerance * 10.0
+    } else {
+        tolerance
+    };
+    let carried = summary
+        .state
+        .relative_gradient_norm(summary.lastgradient_norm);
+    if carried.is_finite() {
+        accepted.max(carried)
+    } else {
+        accepted
+    }
+}
+
+/// Rebuild the reported working state at the scale a converged-η refresh has
+/// just installed, and certify the reported coefficients against it.
+///
+/// The scale is not a free multiplier of the objective for every family — for
+/// the Beta precision and the negative-binomial θ it enters the mean score
+/// itself — so the stationarity residual a refresh induces is READ, not
+/// predicted: one working-state evaluation at the unchanged β̂ under the
+/// installed scale gives the exact penalized gradient, Hessian, working
+/// weights and deviance of the pair that is about to be reported. η is a
+/// function of β̂ and the offset alone, so this evaluation cannot move it, and
+/// the installed scale therefore remains the estimate at the reported η — the
+/// invariant every one of these refreshes publishes. The check is the same one
+/// [`GamWorkingModel::refresh_working_arrays_for_state`] makes.
+///
+/// The returned state is the one to report when it certifies: the same
+/// coefficients, read at the installed scale, with `Vb = H⁻¹`, the EDF, the
+/// deviance and every reported weight assembled from THAT scale rather than the
+/// previous one.
+fn certify_converged_eta_scale(
+    working_model: &mut GamWorkingModel<'_>,
+    summary: &WorkingModelPirlsResult,
+    options: &WorkingModelPirlsOptions,
+) -> Result<ConvergedEtaScaleReading, EstimationError> {
+    let state =
+        working_model.update_with_curvature(&summary.beta, summary.state.hessian_curvature)?;
+    if state.eta.as_ref() != summary.state.eta.as_ref() {
+        crate::bail_invalid_estim!(
+            "converged-η scale refresh changed the authoritative linear predictor"
+        );
+    }
+    let residual = constrained_stationarity_norm(
+        &state.gradient,
+        summary.beta.as_ref(),
+        options.coefficient_lower_bounds.as_ref(),
+        options.linear_constraints.as_ref(),
+    );
+    let relative_residual = state.relative_gradient_norm(residual);
+    Ok(ConvergedEtaScaleReading {
+        state,
+        residual,
+        relative_residual,
+    })
+}
+
+/// What [`certify_converged_eta_scale`] read at the installed scale: the
+/// rebuilt working state, its projected stationarity residual, and that
+/// residual in the dimensionless form the KKT certificate is stated in.
+struct ConvergedEtaScaleReading {
+    state: WorkingState,
+    residual: f64,
+    relative_residual: f64,
+}
+
+/// Report a certified converged-η refresh: the state, its stationarity residual
+/// and the constraint-KKT diagnostics all come from the scale that is reported.
+fn install_certified_refresh(
+    summary: &mut WorkingModelPirlsResult,
+    options: &WorkingModelPirlsOptions,
+    state: WorkingState,
+    residual: f64,
+) {
+    summary.constraint_kkt = options.linear_constraints.as_ref().map(|constraints| {
+        compute_constraint_kkt_diagnostics(
+            summary.beta.as_ref(),
+            &state.gradient,
+            state.gradient_natural_scale,
+            constraints,
+        )
+    });
+    summary.lastgradient_norm = residual;
+    summary.state = state;
+}
+
+/// The progress record of a converged-η scale alternation
+/// `scale ← estimate(η̂(scale))`.
+///
+/// The loop it guards ends at its certificate, never at a pass count: a pass is
+/// run because the reported pair is not yet stationary at the installed scale,
+/// and stops being justified when the alternation can no longer reach a scale
+/// at which it would be. Two facts end it, both read off the sequence:
+///
+/// * **The scale stopped resolving.** A movement at or below `resolution` — the
+///   relative band the estimator's own `n`-term accumulation can hold — is one
+///   the estimator cannot see. The alternation has converged; if β̂ is still not
+///   stationary there, no further pass can change that, and the contradiction
+///   is the fact to report.
+/// * **The alternation oscillates without contracting.** A pass that neither
+///   contracts (`rel_k < rel_{k−1}`) nor continues in the direction the
+///   previous pass moved is neither approaching a fixed point nor leaving the
+///   region where one could exist.
+///
+/// A MONOTONE non-contracting run is deliberately left alone. Refusing on
+/// `r_k ≥ 1` alone would refuse fits that converge: the measured Beta cold
+/// start recorded at that refresh below climbs `φ: 1.1 → 6.4 → 50 → 1.6e3`
+/// with `r_k > 1` at every step, and the same fixture carrying dispersion
+/// climbed to `φ ≈ 1.5e5` through such passes before the next pass converged.
+/// A monotone run that does NOT converge leaves the representable range, and
+/// the estimator and the inner re-solve refuse it there — which is what that
+/// incident measured.
+///
+/// `net` is the caller's own budget for a fixed-point search at this site
+/// (`WorkingModelPirlsOptions::max_iterations`, the iterations it allotted the
+/// inner β fixed point). It is a net, not the criterion: the two rules above
+/// end every healthy and every recognisable unhealthy alternation far inside
+/// it, and reaching it means neither fired while the certificate never passed.
+struct ScaleAlternationProgress {
+    previous_relative_change: Option<f64>,
+    previous_direction: Option<f64>,
+    passes: usize,
+    net: usize,
+}
+
+impl ScaleAlternationProgress {
+    fn new(options: &WorkingModelPirlsOptions) -> Self {
+        Self {
+            previous_relative_change: None,
+            previous_direction: None,
+            passes: 0,
+            net: options.max_iterations,
+        }
+    }
+
+    /// Record pass `k`'s relative scale movement and the direction it moved in,
+    /// and say whether another pass is justified.
+    fn justifies_another_pass(
+        &mut self,
+        relative_change: f64,
+        direction: f64,
+        resolution: f64,
+    ) -> bool {
+        self.passes += 1;
+        let contracting = match self.previous_relative_change {
+            Some(previous) => relative_change < previous,
+            None => true,
+        };
+        let monotone = match self.previous_direction {
+            Some(previous) => previous == direction,
+            None => true,
+        };
+        self.previous_relative_change = Some(relative_change);
+        self.previous_direction = Some(direction);
+        relative_change > resolution && (contracting || monotone) && self.passes < self.net
+    }
+
+    /// The refusal a stalled alternation earns, naming both halves of the
+    /// verdict: the reported pair is not stationary at the scale it would be
+    /// reported with, and no further pass is implied by the passes already run.
+    fn refuse(
+        &self,
+        quantity: &str,
+        relative_change: f64,
+        resolution: f64,
+        residual: f64,
+        band: f64,
+    ) -> EstimationError {
+        let ended = if relative_change <= resolution {
+            "the scale has converged to the resolution of its own estimator"
+        } else if self.passes >= self.net {
+            "the inner solve's own fixed-point budget is spent"
+        } else {
+            "the alternation neither contracts nor keeps its direction"
+        };
+        let previous = match self.previous_relative_change {
+            Some(previous) => format!("{previous:e}"),
+            None => "none".to_string(),
+        };
+        EstimationError::InvalidInput(format!(
+            "{quantity} did not reach its converged-η fixed point: after {passes} pass(es) β̂ is \
+             not stationary at the refreshed value (relative stationarity residual {residual:e} \
+             > certificate band {band:e}) and {ended} (relative change {relative_change:e}, \
+             previous {previous}, estimator resolution {resolution:e})",
+            passes = self.passes
+        ))
+    }
+}
+
+/// The relative band the converged-η scale estimators can resolve: every one of
+/// them accumulates `n` per-row terms from η̂, so `γ_n` — Wilkinson's growth
+/// factor for an `n`-term accumulation, the unit roundoff already inside it —
+/// is the movement below which two estimates differ by arithmetic rather than
+/// by the alternation.
+#[inline]
+fn scale_estimator_resolution(n: usize) -> f64 {
+    gam_linalg::roundoff::accumulation_growth(n)
+}
 
 /// #1868 deterministic n-independence instrument.
 ///
