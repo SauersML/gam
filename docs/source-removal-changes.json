@@ -3197,5 +3197,14 @@
     ],
     "reason": "#3650: sanitize_survival_weight_vector silently zeroed non-finite dense row weights. SPEC: \"In general, do not paper over solver issues.\" It is deleted. require_finite_row_weights now refuses a non-finite weight with a NumericalFailure naming the row, and the one legitimate case (a masked row times inf) is resolved at its source in the slot fill.",
     "evidence": "dense_row_weighting_refuses_non_finite_row_weights pins the refusal in weighted_crossprod_dense_with_parallelism, scale_dense_rows and the DiagonalOnly Hessian path."
+  },
+  {
+    "base": "f10039cc745a25ab816b20958151e1d5e629289d",
+    "items": [
+      "crates/gam-models/src/spatial_psi_bridge.rs:fn:transform_design",
+      "crates/gam-models/src/survival/location_scale/covariate_blocks.rs:fn:transform_design"
+    ],
+    "reason": "#3681: the dense-design branch of spatial_psi_bridge was unreachable. When x_psi_local is non-empty, build_embedded_dense_psi_operator always yields Some, so materialize_dense_design was always false. The branch, the trait method transform_design and both overrides (coefficient and survival time-varying) are deleted.",
+    "evidence": "Emitted blocks keep x_psi = 0x0 and x_psi_psi = None as before. survival_static_spatial_psi_blocks_match_shared_engine and build_block_spatial_psi_derivatives_supports_3d_aniso_matern pin the operator path."
   }
 ]

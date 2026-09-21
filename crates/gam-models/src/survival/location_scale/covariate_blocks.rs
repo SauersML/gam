@@ -655,23 +655,6 @@ impl crate::spatial_psi_bridge::SpatialPsiBlockTransform for SurvivalTimeVarying
         .map_err(|error| error.to_string())
     }
 
-    fn transform_design(&self, base: Array2<f64>) -> Array2<f64> {
-        let base_dm = DesignMatrix::Dense(DenseDesignMatrix::from(base));
-        let exit_design = rowwise_kronecker(&base_dm, &self.time_basis_exit);
-        let entry_design = rowwise_kronecker(&base_dm, &self.time_basis_entry);
-        let deriv_design = rowwise_kronecker(&base_dm, &self.time_basis_derivative_exit);
-        let exit_cow = exit_design.to_dense_cow();
-        let entry_cow = entry_design.to_dense_cow();
-        let deriv_cow = deriv_design.to_dense_cow();
-        let n = exit_cow.nrows();
-        let p = exit_cow.ncols();
-        let mut stacked = Array2::<f64>::zeros((3 * n, p));
-        stacked.slice_mut(s![0..n, ..]).assign(&*exit_cow);
-        stacked.slice_mut(s![n..2 * n, ..]).assign(&*entry_cow);
-        stacked.slice_mut(s![2 * n..3 * n, ..]).assign(&*deriv_cow);
-        stacked
-    }
-
     fn transform_penalty(&self, base: Array2<f64>) -> Array2<f64> {
         self.metric.covariate_penalty(&base)
     }
