@@ -309,7 +309,10 @@ pub struct SavedSurvivalLocationScaleStructure {
 /// supplied by caller-owned catalogs. `FittedModelPayload::group_metadata`
 /// wraps this in `Option` with `#[serde(default)]`, so model files written
 /// before the field existed deserialize as `None`.
-pub type GroupMetadata = BTreeMap<String, JsonValue>;
+pub type GroupMetadata = BTreeMap<String, GroupMetadataValue>;
+
+/// One group's metadata entry in [`GroupMetadata`].
+pub type GroupMetadataValue = JsonValue;
 
 /// Saved exact spline-scan fit (#1030/#1034): the predict-time feature column
 /// plus the lossless smoother state the Gaussian-bridge `predict` replays.

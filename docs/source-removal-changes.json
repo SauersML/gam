@@ -3206,5 +3206,21 @@
     ],
     "reason": "#3681: the dense-design branch of spatial_psi_bridge was unreachable. When x_psi_local is non-empty, build_embedded_dense_psi_operator always yields Some, so materialize_dense_design was always false. The branch, the trait method transform_design and both overrides (coefficient and survival time-varying) are deleted.",
     "evidence": "Emitted blocks keep x_psi = 0x0 and x_psi_psi = None as before. survival_static_spatial_psi_blocks_match_shared_engine and build_block_spatial_psi_derivatives_supports_3d_aniso_matern pin the operator path."
+  },
+  {
+    "base": "3d306728d71b4e24433564e05043d5e68056f47a",
+    "items": [
+      "crates/gam-inference/src/difference_smooth.rs:fn:random_effect_ranges",
+      "crates/gam-inference/src/difference_smooth.rs:fn:random_effect_ranges_follow_the_design_intercept_gauge",
+      "crates/gam-inference/src/difference_smooth.rs:fn:random_effect_spec",
+      "crates/gam-pyffi/src/manifold/manifold_and_posterior_ffi.rs:fn:categorical_level_name_for_bits",
+      "crates/gam-pyffi/src/manifold/manifold_and_posterior_ffi.rs:fn:coefficient_provenance_for_state",
+      "crates/gam-pyffi/src/manifold/manifold_and_posterior_ffi.rs:fn:smooth_basis_kind_label",
+      "crates/gam-pyffi/src/manifold/manifold_and_posterior_ffi.rs:fn:smooth_term_column_ranges",
+      "crates/gam-pyffi/src/manifold/manifold_and_posterior_ffi.rs:struct:CoefficientProvenancePayload",
+      "crates/gam-pyffi/src/manifold/manifold_and_posterior_ffi.rs:struct:TermBlock"
+    ],
+    "reason": "#3522: the pyffi-side coefficient provenance and term-block reconstruction and difference_smooth's own random-effect range arithmetic are replaced by the engine-owned TermCollectionLayout, exposed once through gam_inference::coefficient_layout.",
+    "evidence": "crates/gam-inference/src/coefficient_layout.rs builds CoefficientProvenance/TermBlock from frozen_term_collection_layout; difference_smooth reads its random-effect ranges from the same layout; tests coefficient_layout and difference_smooth::tests::random_effect_columns_follow_the_engine_layout* pin the no-intercept layout."
   }
 ]

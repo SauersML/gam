@@ -213,7 +213,7 @@ fn build_term_collection_design_inner_with_policy_and_plan(
     }
 
     // Track random-effect column ranges in the global coordinate system.
-    // Global layout: [intercept(1) | linear(p_lin) | RE_0(q0) | RE_1(q1) | … | smooth(p_smooth)]
+    // Global layout: [intercept(p_intercept) | linear(p_lin) | RE_0(q0) | RE_1(q1) | … | smooth(p_smooth)]
     let mut random_effect_ranges =
         Vec::<(String, Range<usize>)>::with_capacity(random_blocks.len());
     let mut random_effect_levels = Vec::<(String, Vec<u64>)>::with_capacity(random_blocks.len());
@@ -619,38 +619,58 @@ pub fn build_term_collection_prediction_design(
     let mut planned_spec = spec.clone();
     planned_spec.smooth_terms = planned_smooth_terms;
     let policy = gam_runtime::resource::ResourcePolicy::default_library();
-    let TermCollectionDesign {
-        design,
-        affine_offset,
-        linear_ranges,
-        random_effect_ranges,
-        smooth,
-        ..
-    } = build_term_collection_design_inner_with_policy_and_plan(
+    let full = build_term_collection_design_inner_with_policy_and_plan(
         data,
         &planned_spec,
         &policy,
         true,
         SmoothPenaltyDemand::DesignOnly,
     )?;
-    // The smooth block closes the global layout, so its first column sits one
-    // smooth-block width before the design's last.
-    let smooth_start = design.ncols() - smooth.total_smooth_cols();
+    let layout = full.column_layout();
     Ok(TermCollectionPredictionDesign {
-        design,
-        affine_offset,
-        linear_ranges,
-        random_effect_ranges,
-        smooth_ranges: smooth
-            .terms
-            .into_iter()
-            .map(|term| {
-                let range = term.coeff_range;
-                let columns = (smooth_start + range.start)..(smooth_start + range.end);
-                (term.name, columns)
-            })
-            .collect(),
+        design: full.design,
+        affine_offset: full.affine_offset,
+        layout,
     })
+}
+
+/// The global coefficient layout of a fitted (frozen) spec, as the design
+/// builder realizes it.
+///
+/// Every width is a property of the frozen spec: a random effect owns one
+/// column per frozen level, and each smooth owns the columns its frozen basis
+/// realizes. The layout is read off one prediction build over two anchor rows,
+/// each training column's minimum and maximum, so it is by construction the
+/// layout every prediction design of this spec carries. A random effect with no
+/// frozen levels would take its width from the anchor rows rather than from the
+/// fit, so it is rejected, as is a range that is not a finite interval.
+pub fn frozen_term_collection_layout(
+    spec: &TermCollectionSpec,
+    training_feature_ranges: &[(f64, f64)],
+) -> Result<TermCollectionLayout, BasisError> {
+    if let Some(term) = spec
+        .random_effect_terms
+        .iter()
+        .find(|term| term.frozen_levels.is_none())
+    {
+        crate::bail_invalid_basis!(
+            "random-effect term '{}' has no frozen levels, so its coefficient width is not a \
+             property of the fitted spec",
+            term.name
+        );
+    }
+    let mut anchors = Array2::<f64>::zeros((2, training_feature_ranges.len()));
+    for (column, &(lo, hi)) in training_feature_ranges.iter().enumerate() {
+        if !(lo.is_finite() && hi.is_finite() && lo <= hi) {
+            crate::bail_invalid_basis!(
+                "training feature range for column {column} must be a finite interval; got \
+                 ({lo:?}, {hi:?})"
+            );
+        }
+        anchors[[0, column]] = lo;
+        anchors[[1, column]] = hi;
+    }
+    Ok(build_term_collection_prediction_design(anchors.view(), spec)?.layout)
 }
 
 /// One linear, random-effect or smooth term's design columns on new rows: the
@@ -737,7 +757,7 @@ pub fn build_term_prediction_columns(
         level: spec.level,
     };
     let design = build_term_collection_prediction_design(data, &reduced)?;
-    let range = design.term_range(term).ok_or_else(|| {
+    let range = design.layout.term_range(term).ok_or_else(|| {
         BasisError::InvalidInput(format!(
             "term {term:?} has no columns in its restricted design"
         ))

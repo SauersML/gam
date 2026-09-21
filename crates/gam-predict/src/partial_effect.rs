@@ -168,7 +168,8 @@ pub fn partial_effect(
     let rows = table.table.values.view();
     let layout =
         build_term_collection_prediction_design(rows.slice(s![..rows.nrows().min(1), ..]), &spec)
-            .map_err(|err| format!("failed to build design matrix: {err}"))?;
+            .map_err(|err| format!("failed to build design matrix: {err}"))?
+            .layout;
     let block = layout.term_range(term).ok_or_else(|| {
         format!(
             "partial effect: term {term:?} has no coefficient block; available: {:?}",

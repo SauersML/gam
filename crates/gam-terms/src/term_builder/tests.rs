@@ -5740,6 +5740,47 @@ fn prediction_design_dataset(n: usize) -> Dataset {
     ds
 }
 
+/// #3522: a model with no global intercept column (`0 + …` with nothing that
+/// spans the constant, or an anchored B-spline whose endpoint pin is the level
+/// gauge) starts its layout at column 0. The frozen layout every consumer reads
+/// must be exactly the fitted design's: no intercept block, the linear term at
+/// column 0 and the random effect right after it. Re-deriving the offsets as
+/// `1 + linear_terms.len()` put every block one column to the right.
+#[test]
+fn frozen_layout_is_the_fitted_layout_without_a_global_intercept() {
+    let train = prediction_design_dataset(160);
+    for formula in ["y ~ 0 + x + group(g)", "y ~ x + group(g) + s(z, bc=anchored)"] {
+        let spec = build_formula(formula, &train);
+        assert!(
+            !crate::smooth::term_collection_has_global_intercept(&spec),
+            "`{formula}` realizes no global intercept column"
+        );
+        let fitted = crate::smooth::build_term_collection_design(train.values.view(), &spec)
+            .unwrap_or_else(|err| panic!("`{formula}` training design: {err}"));
+        let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted)
+            .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
+        let layout =
+            crate::smooth::frozen_term_collection_layout(&frozen, &train.feature_ranges())
+                .unwrap_or_else(|err| panic!("`{formula}` frozen layout: {err}"));
+        assert_eq!(
+            layout,
+            fitted.column_layout(),
+            "`{formula}`: the frozen layout is the fitted design's"
+        );
+        assert_eq!(layout.ncols(), fitted.design.ncols(), "`{formula}`: layout width");
+        assert!(layout.intercept_range.is_empty(), "`{formula}`: no intercept block");
+        assert_eq!(layout.linear_ranges.len(), 1, "`{formula}`: one linear term");
+        assert_eq!(layout.linear_ranges[0].1, 0..1, "`{formula}`: x owns column 0");
+        assert_eq!(layout.random_effect_ranges.len(), 1, "`{formula}`: one random effect");
+        let (name, range) = &layout.random_effect_ranges[0];
+        assert_eq!(*range, 1..4, "`{formula}`: the three levels of g follow x");
+        assert_eq!(layout.term_range(name), Some(1..4));
+        if let Some((_, smooth)) = layout.smooth_ranges.first() {
+            assert_eq!(smooth.start, 4, "`{formula}`: the smooth follows the random effect");
+        }
+    }
+}
+
 /// Prediction evaluates a fitted (frozen) spec on new rows, and reads only the
 /// design and its affine offset. The prediction builder must return exactly
 /// what the full build returns for those, while realizing no penalty for a
@@ -5788,7 +5829,7 @@ fn prediction_design_matches_full_build_without_realizing_penalties() {
             "`{formula}`: the prediction offset must equal the full rebuild's"
         );
         assert_eq!(
-            prediction.linear_ranges, full.linear_ranges,
+            prediction.layout.linear_ranges, full.linear_ranges,
             "`{formula}`: the prediction linear ranges must equal the full rebuild's"
         );
         let width = |ranges: &[(String, std::ops::Range<usize>)]| -> usize {
@@ -5808,7 +5849,7 @@ fn prediction_design_matches_full_build_without_realizing_penalties() {
             })
             .collect();
         assert_eq!(
-            prediction.smooth_ranges, full_ranges,
+            prediction.layout.smooth_ranges, full_ranges,
             "`{formula}`: the prediction smooth ranges must be the full rebuild's, placed after \
              the intercept, linear and random-effect columns"
         );
@@ -5880,12 +5921,13 @@ fn term_prediction_columns_match_the_full_prediction_design() {
             .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
         let full = crate::smooth::build_term_collection_prediction_design(new_rows.view(), &frozen)
             .unwrap_or_else(|err| panic!("`{formula}` prediction design: {err}"));
-        random_effects_checked += full.random_effect_ranges.len();
+        random_effects_checked += full.layout.random_effect_ranges.len();
         for (name, range) in full
+            .layout
             .linear_ranges
             .iter()
-            .chain(&full.random_effect_ranges)
-            .chain(&full.smooth_ranges)
+            .chain(&full.layout.random_effect_ranges)
+            .chain(&full.layout.smooth_ranges)
         {
             let columns =
                 crate::smooth::build_term_prediction_columns(new_rows.view(), &frozen, name)
