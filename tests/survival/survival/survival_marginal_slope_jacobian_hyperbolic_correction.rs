@@ -25,29 +25,29 @@
 //! Away from g=0 the `q·c1` term is the hyperbolic correction; it grows with |g|
 //! and is O(1) once s_f·|g| ~ 1.
 //!
-//! # What this test guards
+//! # What this file guards
 //!
-//! T1's `BlockEffectiveJacobian` implementation for the slope block must
-//! return the FULL formula above — not the simpler `s_f·diag(z)·Phi` shortcut
-//! that only holds at β=0.  A static diagonal-scaling shortcut would
-//! pass the β=0 point but fail the moderate-β finite-difference check below.
+//! The production slope-block `BlockEffectiveJacobian` is crate-internal
+//! (#2352); its hyperbolic-correction contract is FD-checked in-crate by
+//! `crates/gam-models/src/survival/marginal_slope/tests.rs::
+//! slope_jacobian_hyperbolic_correction_matches_fd_with_scalars`.
 //!
-//! ## Failure mode of the shortcut
+//! This file drives the PUBLIC machinery that consumes such a Jacobian, using a
+//! test-local model of the slope block (`SlopeJacobianImpl`, `SlopeOperator`)
+//! whose formula is the one written above:
 //!
-//! If T1 uses a static diagonal scaling `s_f · z` (i.e. the static diagonal
-//! scaling that equals the correct Jacobian only at g=0), then at moderate β
-//! the `effective_jacobian_at` output will equal `diag(s_f · z) · Phi` while
-//! the FD reference will equal `diag(q·c1 + s_f·z) · Phi`.  The rel-error
-//! will be O(1) (not O(ε)), causing the moderate-β FD assertion to fail.
+//! * `ParameterBlockSpec::effective_jacobian_at` must dispatch to the block's
+//!   callback at the requested linearization point and must forward
+//!   `family_scalars` (a stale stored q must not leak through);
+//! * `audit_identifiability_channel_aware` must see the distinct per-row
+//!   scalings of the marginal (c_i) and slope (q·c1_i + s_f·z_i) blocks at
+//!   moderate β and report their overlap as strictly below 1, not a fatal
+//!   alias. A static `s_f·z` shortcut would make both blocks collinear
+//!   (overlap = 1.0) and trigger a spurious fatal audit halt.
 //!
-//! ## Channel-aware audit at moderate β
-//!
-//! With the correct Jacobian, marginal and slope blocks have DIFFERENT
-//! per-row scale factors (c_i vs. q·c1_i + s_f·z_i), so their effective
-//! designs in the (n·K=3·n) channel-stacked space are NOT collinear.  The
-//! pairwise overlap is strictly less than 1.0.  With a static diagonal shortcut,
-//! both marginal and slope blocks would have scale factor s_f·z_i,
-//! yielding overlap = 1.0 — triggering a spurious fatal audit halt.
+//! No test here compares the test-local formula against an FD of the same
+//! test-local η map in isolation: such a check exercises no library code and
+//! cannot fail on any change to it.
 
 use gam::custom_family::{
     BlockEffectiveJacobian, FamilyLinearizationState, ParameterBlockSpec,
@@ -537,46 +537,6 @@ fn make_slope_spec(
 // that the error is O(h^2) ~ 1e-12 for smooth functions, so 1e-5 is an
 // extremely generous bound that will catch any O(1) shortcut error.
 
-fn check_slope_jacobian(
-    data: &SyntheticData,
-    beta_slope: &[f64],
-    q0: &Array1<f64>,
-    q1: &Array1<f64>,
-    qd1: &Array1<f64>,
-    s_f: f64,
-    label: &str,
-) {
-    let analytic =
-        analytical_slope_jacobian(&data.phi, beta_slope, q0, q1, qd1, &data.z, s_f);
-    let beta_arr = Array1::from(beta_slope.to_vec());
-    let phi_ref = &data.phi;
-    let q0_ref = q0;
-    let q1_ref = q1;
-    let qd1_ref = qd1;
-    let z_ref = &data.z;
-    let fd = finite_diff_jacobian(
-        |b| {
-            compute_eta_stack(
-                phi_ref,
-                b.as_slice().unwrap(),
-                q0_ref,
-                q1_ref,
-                qd1_ref,
-                z_ref,
-                s_f,
-            )
-        },
-        &beta_arr,
-        1e-6,
-    );
-    let rel_err = max_col_rel_error(&analytic, &fd);
-    assert!(
-        rel_err < 1e-5,
-        "{label}: analytical slope Jacobian rel-error vs FD = {rel_err:.3e} (expected < 1e-5); \
-         the hyperbolic correction formula is wrong",
-    );
-}
-
 fn check_effective_jacobian_matches_fd(
     spec: &ParameterBlockSpec,
     beta: &[f64],
@@ -623,159 +583,12 @@ fn check_effective_jacobian_matches_fd(
     assert!(
         rel_err < 1e-5,
         "{label}: effective_jacobian_at rel-error vs FD = {rel_err:.3e} (expected < 1e-5). \
-         If this fires at moderate β but passes at β=0, T1's implementation is using \
-         a static diagonal shortcut (s_f·diag(z)·Phi) instead of the full hyperbolic \
-         correction (q·c1 + s_f·z)·Phi.",
+         `effective_jacobian_at` did not return the block callback's Jacobian at this \
+         linearization point (or dropped the supplied family_scalars).",
     );
 }
 
 // ── Main tests ───────────────────────────────────────────────────────────
-
-/// At β_slope = 0: g_i = 0 for all i, c_i = 1, c1_i = 0.
-/// The slope Jacobian must equal s_f · diag(z) · Phi — NOT raw Phi.
-#[test]
-fn slope_jacobian_at_zero_beta_equals_sf_diag_z_phi() {
-    let data = make_synthetic_data(42);
-    for s_f in [1.0_f64, 0.8] {
-        let beta_zero = vec![0.0; P_BLOCK];
-        // At g=0: c=1, c1=0, so ∂η_r/∂β = s_f·z·Phi for η0/η1, and 0 for ad1.
-        let analytic = analytical_slope_jacobian(
-            &data.phi,
-            &beta_zero,
-            &data.q0_base,
-            &data.q1_base,
-            &data.qd1_base,
-            &data.z,
-            s_f,
-        );
-        // Verify against formula: first N rows = s_f * z * Phi.
-        for i in 0..N {
-            for j in 0..P_BLOCK {
-                let expected_eta0 = s_f * data.z[i] * data.phi[[i, j]];
-                let got = analytic[[i, j]];
-                let err = (got - expected_eta0).abs();
-                let scale = expected_eta0.abs().max(1e-14);
-                assert!(
-                    err / scale < 1e-10 || err < 1e-12,
-                    "s_f={s_f}: row={i} col={j}: η0-Jacobian at β=0 should be \
-                     s_f*z*Phi={expected_eta0:.6e} got {got:.6e}",
-                );
-            }
-        }
-        // Verify ad1 rows (2N..3N) are all zero at β=0.
-        for i in 0..N {
-            for j in 0..P_BLOCK {
-                let got = analytic[[2 * N + i, j]];
-                assert!(
-                    got.abs() < 1e-12,
-                    "s_f={s_f}: ad1 Jacobian row {i} col {j} should be 0 at β=0, got {got:.3e}",
-                );
-            }
-        }
-        // FD check.
-        let label = format!("beta=0 s_f={s_f}");
-        check_slope_jacobian(
-            &data,
-            &beta_zero,
-            &data.q0_base,
-            &data.q1_base,
-            &data.qd1_base,
-            s_f,
-            &label,
-        );
-    }
-}
-
-/// At small random β: g_i small but nonzero, c1_i ≈ 0 but not exactly 0.
-/// FD must still agree with analytical formula.
-#[test]
-fn slope_jacobian_at_small_beta_matches_fd() {
-    let data = make_synthetic_data(123);
-    assert_eq!(data.phi.nrows(), N, "synthetic data must have N rows");
-    let mut rng = Splitmix64::new(0xDEAD_BEEF_u64);
-    for s_f in [1.0_f64, 0.8] {
-        let beta_small: Vec<f64> = (0..P_BLOCK).map(|_| rng.next_gauss() * 0.05).collect();
-        let label = format!("beta=small s_f={s_f}");
-        check_slope_jacobian(
-            &data,
-            &beta_small,
-            &data.q0_base,
-            &data.q1_base,
-            &data.qd1_base,
-            s_f,
-            &label,
-        );
-    }
-}
-
-/// At moderate β (g_i ~ O(1)): the hyperbolic correction q·c1 is comparable
-/// to s_f·z. FD check distinguishes the correct formula from the shortcut.
-///
-/// SENTINEL: if this test fails while the β=0 test passes, T1's impl uses
-/// a static diagonal shortcut (s_f·z) everywhere, which is only correct at g=0.
-#[test]
-fn slope_jacobian_at_moderate_beta_has_hyperbolic_correction() {
-    let data = make_synthetic_data(777);
-    let mut rng = Splitmix64::new(0xC0_FFEE_u64);
-    for s_f in [1.0_f64, 0.8] {
-        // Scale β so that s_f * g_i ~ O(1) on average.
-        // With Phi containing values ~ O(1/sqrt(P)) and P=9, and N=200,
-        // scale ~ 1/(s_f * sqrt(P)) gives s_f * g_i ~ O(1).
-        let scale = 1.0 / (s_f * (P_BLOCK as f64).sqrt());
-        let beta_moderate: Vec<f64> = (0..P_BLOCK).map(|_| rng.next_gauss() * scale).collect();
-
-        let label = format!("beta=moderate s_f={s_f}");
-        check_slope_jacobian(
-            &data,
-            &beta_moderate,
-            &data.q0_base,
-            &data.q1_base,
-            &data.qd1_base,
-            s_f,
-            &label,
-        );
-
-        // Confirm the hyperbolic correction is actually nonzero at moderate β:
-        // at least some rows should have |q·c1| > 1e-3 * |s_f·z|.
-        let scalars = compute_row_scalars(&data.phi, &beta_moderate, s_f);
-        let hyperbolic_fractions: Vec<f64> = (0..N)
-            .map(|i| {
-                let hyp = (data.q0_base[i] * scalars.c1[i]).abs();
-                let base = (s_f * data.z[i]).abs().max(1e-8);
-                hyp / base
-            })
-            .collect();
-        let max_frac = hyperbolic_fractions.iter().cloned().fold(0.0_f64, f64::max);
-        assert!(
-            max_frac > 1e-3,
-            "s_f={s_f}: moderate β did not produce meaningful hyperbolic correction \
-             (max |q·c1|/|s_f·z| = {max_frac:.3e}); the test is not exercising the \
-             non-trivial g branch",
-        );
-
-        // Confirm ad1 rows are nonzero at moderate β (since qd1·c1 ≠ 0 when g ≠ 0).
-        let analytic = analytical_slope_jacobian(
-            &data.phi,
-            &beta_moderate,
-            &data.q0_base,
-            &data.q1_base,
-            &data.qd1_base,
-            &data.z,
-            s_f,
-        );
-        let ad1_norm: f64 = analytic
-            .slice(ndarray::s![2 * N.., ..])
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt();
-        assert!(
-            ad1_norm > 1e-8,
-            "s_f={s_f}: ad1 Jacobian rows are all zero at moderate β (norm={ad1_norm:.3e}); \
-             the qd1·c1 term is not being computed",
-        );
-    }
-}
 
 /// Call `spec.effective_jacobian_at` on a `ParameterBlockSpec` with a
 /// `SlopeJacobianImpl` callback, and verify it matches FD at three β
@@ -984,5 +797,6 @@ fn channel_aware_audit_overlap_below_one_at_moderate_beta() {
 // The production `SlopeBlockJacobian` contract test moved in-crate
 // (crates/gam-models/src/survival/marginal_slope/tests.rs::
 // slope_jacobian_hyperbolic_correction_matches_fd_with_scalars) when the
-// constructor went crate-internal (#2352). The local-model tests above keep
-// guarding the hyperbolic-correction formula through the public trait.
+// constructor went crate-internal (#2352). The local-model tests above guard
+// the public plumbing (`effective_jacobian_at`, channel-aware audit), not the
+// production formula.
