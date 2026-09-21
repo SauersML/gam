@@ -106,7 +106,7 @@ fn bench_operator_matvec(c: &mut Criterion) {
     for &k in &[200_usize, 500, 1000, 2000] {
         let centers = synthetic_centers(k, D_TYPICAL);
         let eta = vec![0.0_f64; D_TYPICAL];
-        let diagonal_lag = gam::terms::basis::closed_form_operator::closed_form_diagonal_lag(
+        let diagonal_lag = gam::terms::basis::closed_form_diagonal_lag(
             centers.view(),
             /* q = */ 2,
             M_TYPICAL,
@@ -125,6 +125,7 @@ fn bench_operator_matvec(c: &mut Criterion) {
             /* kernel_nullspace = */ None,
             /* polynomial_block_cols = */ 0,
             /* outer_identifiability = */ None,
+            diagonal_lag,
         );
         // Warm cached dense form outside the timed loop so we measure pure
         // matvec cost, not the one-shot build.
@@ -168,7 +169,7 @@ fn bench_hessian_solve_dense_vs_implicit(c: &mut Criterion) {
     for &k in &[500_usize, 1000, 2000, 5000] {
         let centers = synthetic_centers(k, D_TYPICAL);
         let eta = vec![0.0_f64; D_TYPICAL];
-        let diagonal_lag = gam::terms::basis::closed_form_operator::closed_form_diagonal_lag(
+        let diagonal_lag = gam::terms::basis::closed_form_diagonal_lag(
             centers.view(),
             /* q = */ 2,
             M_TYPICAL,
