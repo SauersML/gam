@@ -1320,7 +1320,10 @@ impl<'a> RemlState<'a> {
         // A design the process cannot densify is refused by the memory
         // governor inside the builder, by name; the coordinates are never
         // dropped, since that would hand the outer plan a ρ-only gradient for
-        // a [ρ, ψ] θ.
+        // a [ρ, ψ] θ. gam#3572: the dense-versus-implicit choice is made inside
+        // the same builders the value+gradient lane calls, so the Hessian lane
+        // never evaluates a different coordinate set — or a different `log|H|`
+        // surface — than the gradient lane at the same θ.
         let n_x = self.x().nrows();
         let p_x = self.x().ncols();
         let backend_label;

@@ -1019,18 +1019,6 @@ pub type HyperCoordPairResult = Result<HyperCoordPair, String>;
 /// projection internally, so a clone-through is mathematically exact.
 pub type HyperCoordPairFn = Arc<dyn Fn(usize, usize) -> HyperCoordPairResult + Send + Sync>;
 
-impl HyperCoordPair {
-    pub fn zero() -> Self {
-        Self {
-            a: 0.0,
-            g: Array1::zeros(0),
-            b_mat: Array2::zeros((0, 0)),
-            b_operator: None,
-            ld_s: 0.0,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub enum DriftDerivResult {
     Dense(Array2<f64>),
