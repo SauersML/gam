@@ -114,6 +114,18 @@ impl PyEventHistoryModel {
         self.cohort.subjects.iter().map(|s| s.exit).collect()
     }
 
+    /// Advisories from the covariate formulas: where the fitted bases differ
+    /// from the literal request.
+    fn inference_notes(&self) -> Vec<String> {
+        self.fit.inference_notes.advisories.clone()
+    }
+
+    /// Defaults the covariate formulas' term builder chose on the user's
+    /// behalf.
+    fn informational_notes(&self) -> Vec<String> {
+        self.fit.inference_notes.informational.clone()
+    }
+
     fn rank(&self) -> usize {
         self.fit.rank()
     }

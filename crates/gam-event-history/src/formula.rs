@@ -4,6 +4,7 @@
 
 use super::cohort::{EventHistoryCohort, EventHistoryError};
 use gam_data::{ColumnKindTag, DataSchema, EncodedDataset, SchemaColumn};
+use gam_terms::FitNoteSink;
 use gam_terms::inference::formula_dsl::parse_formula;
 use gam_terms::smooth::TermCollectionSpec;
 use gam_terms::term_builder::build_termspec;
@@ -63,10 +64,15 @@ pub(crate) fn node_dataset(
 
 /// Resolve a formula right-hand side such as `x + s(time)` into the term
 /// collection that every mark's log-intensity uses, against `rows`.
+///
+/// The term builder's notes about the resolved basis (for example a smooth
+/// requested at more knots than its covariate has distinct values) go to
+/// `notes`, so the fit can hand them to the caller instead of dropping them.
 pub(crate) fn covariate_spec_from_formula(
     right_hand_side: &str,
     rows: ArrayView2<'_, f64>,
     cohort: &EventHistoryCohort,
+    notes: &mut impl FitNoteSink,
 ) -> Result<TermCollectionSpec, EventHistoryError> {
     let rhs = right_hand_side.trim().trim_start_matches('~').trim();
     let formula = format!("events ~ {}", if rhs.is_empty() { "1" } else { rhs });
@@ -75,14 +81,12 @@ pub(crate) fn covariate_spec_from_formula(
     })?;
     let dataset = node_dataset(rows, cohort)?;
     let col_map = dataset.column_map();
-    let mut notes = Vec::new();
-    build_termspec(
-        &parsed.terms,
-        &dataset,
-        &col_map,
-        &mut notes,
-    )
-    .map_err(|error| EventHistoryError::InvalidInput {
-        reason: format!("event-history formula {right_hand_side:?}: {}", String::from(error)),
+    build_termspec(&parsed.terms, &dataset, &col_map, notes).map_err(|error| {
+        EventHistoryError::InvalidInput {
+            reason: format!(
+                "event-history formula {right_hand_side:?}: {}",
+                String::from(error)
+            ),
+        }
     })
 }

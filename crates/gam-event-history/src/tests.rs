@@ -25,6 +25,7 @@ use gam_model_api::families::custom_family::BlockwiseFitOptions;
 use gam_problem::ParameterBlockState;
 use gam_math::jet_scalar::{OneSeed, TwoSeed};
 use gam_math::nested_dual::JetField;
+use gam_terms::FitNotes;
 use gam_terms::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, TermCollectionSpec, build_term_collection_design,
 };
@@ -1297,15 +1298,69 @@ fn formula_right_hand_side_resolves_against_the_node_columns() {
     let mut cohort = simulate_cohort(4, 3.0, -0.5, 0.4, 0.0, 0.5, 5);
     cohort.validate().expect("valid");
     let rows = design_rows(&cohort, 3).expect("rows");
-    let spec = super::formula::covariate_spec_from_formula("x + s(time)", rows.view(), &cohort)
-        .expect("spec");
+    let mut notes = FitNotes::default();
+    let spec = super::formula::covariate_spec_from_formula(
+        "x + s(time)",
+        rows.view(),
+        &cohort,
+        &mut notes,
+    )
+    .expect("spec");
     assert_eq!(spec.linear_terms.len(), 1);
     assert_eq!(spec.linear_terms[0].feature_col, 0);
     assert_eq!(spec.smooth_terms.len(), 1);
-    let error = super::formula::covariate_spec_from_formula("nope", rows.view(), &cohort)
-        .err()
-        .expect("unknown column must fail");
+    assert!(
+        notes.advisories.is_empty(),
+        "a formula the data supports as written is built as written: {notes:?}"
+    );
+    let error = super::formula::covariate_spec_from_formula(
+        "nope",
+        rows.view(),
+        &cohort,
+        &mut FitNotes::default(),
+    )
+    .err()
+    .expect("unknown column must fail");
     assert!(error.to_string().contains("nope"), "{error}");
+}
+
+/// A formula the term builder cannot build as written — here a cubic
+/// regression smooth asking for k=10 on a covariate with five distinct values,
+/// which caps it to k=5 — reaches the fit's notes (#4002), and with one
+/// formula per mark the note names the mark it belongs to.
+#[test]
+fn a_basis_built_differently_from_its_formula_is_recorded_per_mark_4002() {
+    let mut cohort = competing_risks_cohort(7);
+    cohort.validate().expect("valid");
+    let mut rows = design_rows(&cohort, 3).expect("rows");
+    for (i, mut row) in rows.rows_mut().into_iter().enumerate() {
+        row[0] = (i % 5) as f64;
+    }
+    let formula = r#"s(x, bs="cr", k=10)"#;
+
+    let mut notes = FitNotes::default();
+    super::formula::covariate_spec_from_formula(formula, rows.view(), &cohort, &mut notes)
+        .expect("a capped basis still builds");
+    assert_eq!(notes.advisories.len(), 1, "{notes:?}");
+    assert!(
+        notes.advisories[0].contains("cubic-regression")
+            && notes.advisories[0].contains("from k=10 to k=5"),
+        "{notes:?}"
+    );
+
+    let (_, shared) = super::family::covariate_specs_from_formulas(&cohort, &[formula], rows.view())
+        .expect("one shared formula");
+    assert_eq!(shared.advisories, notes.advisories, "one shared formula carries no mark label");
+
+    let (specs, per_mark) =
+        super::family::covariate_specs_from_formulas(&cohort, &[formula, "1", "x"], rows.view())
+            .expect("one formula per mark");
+    assert_eq!(specs.len(), 3);
+    assert_eq!(per_mark.advisories.len(), 1, "only the first mark's formula degrades: {per_mark:?}");
+    assert_eq!(
+        per_mark.advisories[0],
+        format!("mark {:?}: {}", cohort.mark_names[0], notes.advisories[0])
+    );
 }
 
 #[test]
@@ -4517,6 +4572,11 @@ fn per_mark_formulas_give_each_mark_its_own_terms() {
     assert_eq!(fit.mark_coefficients(0).len(), 2, "intercept and x");
     assert_eq!(fit.mark_coefficients(1).len(), 1, "intercept alone");
     assert_eq!(fit.mark_coefficients(2).len(), 2);
+    assert!(
+        fit.inference_notes.advisories.is_empty(),
+        "formulas the data supports record no advisory: {:?}",
+        fit.inference_notes
+    );
     let refused =
         fit_event_history_formulas(&mut cohort, &["x", "1"], BlockwiseFitOptions::default(), None)
             .err()
@@ -4783,8 +4843,13 @@ fn a_risk_set_centred_fit_reads_its_baseline_as_the_marginal_incidence() {
     let mut spec = EventHistorySpec::new(Vec::new());
     let rows = design_rows(&cohort, spec.quadrature_order).expect("design rows");
     spec.covariates = vec![
-        super::formula::covariate_spec_from_formula("s(time)", rows.view(), &cohort)
-            .expect("baseline formula"),
+        super::formula::covariate_spec_from_formula(
+            "s(time)",
+            rows.view(),
+            &cohort,
+            &mut FitNotes::default(),
+        )
+        .expect("baseline formula"),
     ];
     let prior_centred = fit_event_history(&mut cohort, &spec).expect("prior-centred fit");
     spec.reference = Some(ReferenceStrata::single(0, cohort.subjects.len()));
@@ -5101,8 +5166,13 @@ fn a_certified_rank_is_the_admitted_candidate_2627() {
     let mut spec = EventHistorySpec::new(Vec::new());
     let rows = design_rows(&cohort, spec.quadrature_order).expect("design rows");
     spec.covariates = vec![
-        super::formula::covariate_spec_from_formula("s(time)", rows.view(), &cohort)
-            .expect("baseline formula"),
+        super::formula::covariate_spec_from_formula(
+            "s(time)",
+            rows.view(),
+            &cohort,
+            &mut FitNotes::default(),
+        )
+        .expect("baseline formula"),
     ];
     let marks = cohort.marks();
     let setting = (spec.gauss_hermite_order, 0);

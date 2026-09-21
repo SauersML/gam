@@ -2,6 +2,7 @@
 //! write a JSON summary with optional forecasts.
 
 use crate::cli_args::FitEventsArgs;
+use crate::model_build::print_inference_summary;
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::event_history::{
     CovariateCells, CovariateSegment, Event, EventHistoryCohort, ForecastRequest, FutureSegment,
@@ -258,6 +259,10 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
         reference,
     )
     .map_err(|e| e.to_string())?;
+    print_inference_summary(
+        &fit.inference_notes.advisories,
+        &fit.inference_notes.informational,
+    );
 
     let mut summary = Map::new();
     summary.insert("marks".to_string(), json!(mark_names));
@@ -274,6 +279,15 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
         } else {
             json!(formulas)
         },
+    );
+    // The formulas' notes: where the fitted bases differ from the literal
+    // request, and the defaults chosen on the user's behalf.
+    summary.insert(
+        "inference_notes".to_string(),
+        json!({
+            "advisories": fit.inference_notes.advisories,
+            "informational": fit.inference_notes.informational,
+        }),
     );
     summary.insert("rank".to_string(), json!(fit.rank()));
     // Whether the rank is the one the evidence selected, or the certified
