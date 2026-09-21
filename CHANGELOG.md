@@ -46,6 +46,26 @@
   removed with the ridge.
   **Behavior change:** every cold SAE decoder seed moves, so a fit that starts from it
   can converge to a different optimum than before.
+- **The BMS host row-Hessian matvec and diagonal go through the measured row-kernel decision** (#3410).
+  Five sites in `axis_direction_search.rs` each carried the same hand-written dispatch:
+  on Linux, if `GpuRuntime::resolve` returned any device, send the per-row Hessian matvec
+  or diagonal to it; otherwise run the CPU loop. Off Linux the block was compiled out
+  entirely and the CPU loop ran whatever the policy said. A resolved device says nothing
+  about which executor is faster for this kernel: the rows live in host memory, so the
+  device pays an upload of `n_rows·r²` values on every call, and the row kernels' own
+  crossover is the only thing that answers it (#3024). Both operations are now one entry
+  point each, `row_hessian_ops::row_hessian_matvec` and `row_hessian_ops::row_hessian_diag`,
+  admitted through `decide_row_kernel` under the new `GpuKernel::RowHessianMatvec` and
+  `GpuKernel::RowHessianDiagonal` at `RowKernelShape { rows, widths: [r, 0, 0, 0],
+  threads: 1 }` (the CPU executors are one sequential loop, so their worker count is one).
+  `off` never probes the device, `required` needs a supported backend, and `auto` races a
+  shape the process has not timed and reads the recorded timings afterwards. The decision
+  is logged like every other row kernel, and a fault on a selected device is still
+  returned rather than recomputed on the CPU.
+  **Behavior change:** on Linux with a device, `gpu="auto"` now runs these two operations
+  on whichever executor measured faster instead of always on the device, so results can
+  differ at roundoff between runs near the crossover. Off Linux, `gpu="required"` now
+  refuses them instead of silently running the CPU loop.
 - **The composition-law test studentizes by the fitted curves' own sampling law** (#3512).
   `composition_defect` floored the defect's pointwise variance at the three maps'
   in-sample observation residual RMS, combined by Minkowski's inequality. That RMS
