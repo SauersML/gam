@@ -3044,12 +3044,20 @@ fn cloglog_inverse_link_controlled_values(
     max_order: usize,
 ) -> ([f64; 7], IntegratedExpectationMode) {
     assert!(max_order <= 6);
-    if sigma <= 1e-10 {
+    // The closed-form jet at `sigma = 0`, which the latent integral is a
+    // perturbation of. It is the reading wherever the moment combinations below
+    // have cancelled away every digit they had.
+    let point_jet = |mu: f64| -> [f64; 7] {
         let (mean, d1, d2, d3, d4, d5) = cloglog_point_jet5(mu);
-        return (
-            [mean, d1, d2, d3, d4, d5, cloglog_point_d6(mu)],
-            IntegratedExpectationMode::ExactClosedForm,
-        );
+        [mean, d1, d2, d3, d4, d5, cloglog_point_d6(mu)]
+    };
+    // `sigma = 0` is not a small `sigma`: it IS the point evaluation, and the
+    // lognormal-Laplace kernel below has no `sigma = 0` to integrate against.
+    // That is the only structural branch; how small a POSITIVE `sigma` has to be
+    // before the integral stops being readable is decided by the arithmetic, per
+    // order, at the combinations themselves.
+    if !(sigma > 0.0) {
+        return (point_jet(mu), IntegratedExpectationMode::ExactClosedForm);
     }
 
     let (k, log_k0, mode) = latent_cloglog_kernel_terms(ctx, mu, sigma, max_order);
@@ -3081,23 +3089,58 @@ fn cloglog_inverse_link_controlled_values(
             worse_integrated_expectation_mode(mode, IntegratedExpectationMode::QuadratureFallback),
         );
     }
-    if max_order >= 2 {
-        values[2] = k[1] - k[2];
-    }
-    if max_order >= 3 {
-        values[3] = k[1] - 3.0 * k[2] + k[3];
-    }
-    if max_order >= 4 {
-        values[4] = k[1] - 7.0 * k[2] + 6.0 * k[3] - k[4];
-    }
-    if max_order >= 5 {
-        values[5] = k[1] - 15.0 * k[2] + 25.0 * k[3] - 10.0 * k[4] + k[5];
-    }
-    if max_order >= 6 {
-        values[6] = k[1] - 31.0 * k[2] + 90.0 * k[3] - 65.0 * k[4] + 15.0 * k[5] - k[6];
+    // Every derivative above first order is a SIGNED combination of kernel terms
+    // whose magnitudes are each `O(1)` while the combination is what survives
+    // after they cancel. Its rounding is therefore denominated in the SUMMANDS,
+    // `accumulation_band` over `Σ|c·K|` at one product and one addition per term
+    // (Higham, *ASNA* 2nd ed., §3.1), and not in the vanishing result. Below that
+    // band the moment route reports its own rounding and nothing else, and the
+    // point jet — the `sigma = 0` value this route perturbs by `O(sigma²)` — is
+    // the reading that still has digits.
+    //
+    // The decision is per ORDER, because the combinations cancel at different
+    // rates: at one `sigma` the sixth may carry nothing while the second is
+    // fully resolved. Each substitution is taken only where the moment value
+    // sits inside its own rounding, and the point value differs from it by less
+    // than that, so the jet stays consistent to whatever resolution its entries
+    // have.
+    let mut point_values: Option<[f64; 7]> = None;
+    for order in 2..=max_order {
+        let coefficients = CLOGLOG_MOMENT_COEFFICIENTS[order - 2];
+        let mut value = 0.0_f64;
+        let mut magnitude = 0.0_f64;
+        for (index, &coefficient) in coefficients.iter().enumerate() {
+            let term = coefficient * k[index + 1];
+            value += term;
+            magnitude += term.abs();
+        }
+        let band = gam_linalg::roundoff::accumulation_band(2 * coefficients.len(), magnitude);
+        values[order] = if value.abs() > band {
+            value
+        } else {
+            point_values.get_or_insert_with(|| point_jet(mu))[order]
+        };
     }
     (values, mode)
 }
+
+/// `mu⁽ʲ⁾ = Σ_i c_{j,i}·K_{i,1}`: the signed combinations that turn the
+/// lognormal-Laplace kernel terms into the latent-cloglog inverse link's
+/// derivatives, row `j − 2` holding the coefficients of `K_{1,1} … K_{j,1}`.
+///
+/// These are the Stirling numbers of the second kind with alternating signs, a
+/// fixed mathematical table and not a set of candidates: the rows are read by
+/// index at the order asked for, never searched over. Accumulating a row left to
+/// right reproduces the expressions these replaced bit for bit — a negated
+/// coefficient times a term is exactly the negation of the product, and adding
+/// it is exactly the subtraction.
+const CLOGLOG_MOMENT_COEFFICIENTS: [&[f64]; 5] = [
+    &[1.0, -1.0],
+    &[1.0, -3.0, 1.0],
+    &[1.0, -7.0, 6.0, -1.0],
+    &[1.0, -15.0, 25.0, -10.0, 1.0],
+    &[1.0, -31.0, 90.0, -65.0, 15.0, -1.0],
+];
 
 #[inline]
 pub(crate) fn latent_cloglog_inverse_link_jet5_controlled(
