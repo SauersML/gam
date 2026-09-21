@@ -70,27 +70,23 @@ def _normal_cdf(z: np.ndarray) -> np.ndarray:
     return vec(z)
 
 
-def _predicted_survival(model, times, base_row) -> np.ndarray | None:
-    """Best-effort model-free survival surface S(t) at a fixed covariate row.
+def _predicted_survival(model, times, base_row) -> np.ndarray:
+    """Model-free survival curve S(t) on times at ONE covariate row.
 
-    Returns None if this build's predict surface does not expose a survival
-    probability column (the convergence assertion still stands on its own)."""
-    rows = pd.DataFrame({"time": times, "event": np.ones_like(times), **base_row})
-    try:
-        pred = model.predict(rows, interval=0.9)
-    except Exception:
-        try:
-            pred = model.predict(rows)
-        except Exception:
-            return None
-    for key in ("survival", "surv", "S"):
-        try:
-            col = pred[key]
-        except Exception:
-            col = None
-        if col is not None:
-            return np.asarray(col, dtype=float)
-    return None
+    predict on a survival fit returns a SurvivalPrediction whose curve
+    is read with survival_at(times) (rows x times). This helper used to
+    subscript the prediction (pred["survival"]) inside except
+    Exception, which raises on that dataclass, so it always returned None
+    and every correctness check below was skipped. Any failure now surfaces."""
+    row = {"time": [float(np.max(times))], "event": [0.0]}
+    row.update({k: [float(v)] for k, v in base_row.items()})
+    surv = np.asarray(
+        model.predict(pd.DataFrame(row)).survival_at(np.asarray(times, dtype=float)),
+        dtype=float,
+    )
+    assert surv.shape == (1, len(times)), f"survival_at shape {surv.shape}"
+    assert np.all(np.isfinite(surv)), f"non-finite survival {surv}"
+    return surv[0]
 
 
 def test_reduced_parametric_aft_converges_exact_issue_repro() -> None:
@@ -110,17 +106,24 @@ def test_reduced_parametric_aft_converges_exact_issue_repro() -> None:
     assert len(coefs) >= 2
     assert all(math.isfinite(float(c)) for c in coefs)
 
-    # Model-free correctness: the predicted survival curve must track the
-    # closed-form lognormal MLE. (Skipped only if this build's predict surface
-    # does not surface a survival column.)
+    # Model-free correctness: the predicted survival curve must reproduce the
+    # closed-form lognormal MLE (mu_hat, sigma_hat = mean, ddof-0 sd of log t).
+    # The fit IS that MLE, so the only admissible gap is the posterior-mean vs
+    # plug-in difference, second order in the sampling sd of the MLE, i.e.
+    # O(1/n) = 5e-4 here. The bar is 1/sqrt(n) = 0.022, one sampling-sd scale
+    # of S: an error that large means the fit is not the MLE. (The old bar,
+    # relative L2 < 0.1, allowed about 0.05 per point, several sampling sds.)
     mu_hat = float(np.mean(log_t))
     sigma_hat = float(np.std(log_t))
     grid = np.array([2.0, 3.0, 4.0, 6.0, 9.0])
     surv = _predicted_survival(model, grid, {})
-    if surv is not None:
-        truth = 1.0 - _normal_cdf((np.log(grid) - mu_hat) / sigma_hat)
-        rel = np.sqrt(np.sum((surv - truth) ** 2) / np.sum(truth**2))
-        assert rel < 0.1, f"predicted survival diverges from lognormal MLE: rel_l2={rel:.4f}"
+    truth = 1.0 - _normal_cdf((np.log(grid) - mu_hat) / sigma_hat)
+    err = float(np.max(np.abs(surv - truth)))
+    bar = 1.0 / math.sqrt(len(log_t))
+    assert err <= bar, (
+        f"predicted survival diverges from the closed-form lognormal MLE: "
+        f"max |S_fit - S_mle| = {err:.4g} > {bar:.4g}; S_fit={surv}, S_mle={truth}"
+    )
 
 
 def test_reduced_parametric_aft_converges_across_n_and_seeds() -> None:
@@ -178,13 +181,11 @@ def test_reduced_parametric_aft_converges_with_censoring_and_covariate() -> None
     # A converged covariate fit moves the location with x (the slope is not
     # pinned at its cold-start 0): predicted survival at x=+1 must exceed x=-1
     # (larger mu => longer survival, since the true slope 0.8 > 0). Checked
-    # model-free via the survival surface when available; otherwise the finite,
-    # non-trivial coefficient vector above already witnesses convergence.
+    # model-free via the survival surface.
     grid = np.array([2.0, 4.0, 8.0])
-    s_lo = _predicted_survival(model_x, grid, {"x": np.full_like(grid, -1.0)})
-    s_hi = _predicted_survival(model_x, grid, {"x": np.full_like(grid, 1.0)})
-    if s_lo is not None and s_hi is not None:
-        assert np.all(s_hi >= s_lo - 1e-6), (
-            f"survival must increase with x: S(x=-1)={s_lo} S(x=+1)={s_hi}"
-        )
-        assert np.max(np.abs(s_hi - s_lo)) > 0.02, "covariate has no effect on survival"
+    s_lo = _predicted_survival(model_x, grid, {"x": -1.0})
+    s_hi = _predicted_survival(model_x, grid, {"x": 1.0})
+    assert np.all(s_hi >= s_lo - 1e-6), (
+        f"survival must increase with x: S(x=-1)={s_lo} S(x=+1)={s_hi}"
+    )
+    assert np.max(np.abs(s_hi - s_lo)) > 0.02, "covariate has no effect on survival"
