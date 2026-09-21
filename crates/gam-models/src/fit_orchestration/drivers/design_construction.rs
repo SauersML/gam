@@ -4340,10 +4340,17 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             let mut spec_local = spec.clone();
             if let Some(scale) = input_scale {
                 scale.standardize(&mut x);
-                spec_local.length_scale = spec.length_scale.map(|length| {
-                    scale
-                        .to_standardized_units(gam_terms::OriginalUnits::new(length))
-                        .standardized_value()
+                // The scale keeps its provenance (auto vs fixed); only its resolved
+                // numeric value changes units.
+                spec_local.length_scale = spec.length_scale.map(|mut length| {
+                    if let Some(value) = length.resolved() {
+                        length.set_resolved(
+                            scale
+                                .to_standardized_units(gam_terms::OriginalUnits::new(value))
+                                .standardized_value(),
+                        );
+                    }
+                    length
                 });
             }
             let BasisMetadata::Duchon {
