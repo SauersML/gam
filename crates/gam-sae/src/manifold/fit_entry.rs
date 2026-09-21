@@ -1058,6 +1058,10 @@ mod fit_error_category_tests {
                     hessian_source: HessianSource::BfgsApprox,
                 },
             )),
+            // The result carries `converged = false`: the solver itself stopped, so
+            // `certify_outer_result` never ran and refused nothing (#3841). This is
+            // the `SaeOuterRun::Unconverged` arm of `certify_outer_stage`.
+            certification_refusal: None,
         };
         assert_eq!(stopped.error_category(), ErrorCategory::Convergence);
         assert_eq!(stopped.advice(), None);

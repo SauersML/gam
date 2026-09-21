@@ -516,7 +516,16 @@ fn duchon_small_chi_even_d_analytic_coefficient(
     kappa: f64,
     i: usize,
 ) -> [f64; 3] {
-    debug_assert!(d.is_multiple_of(2));
+    // `half_d = d / 2` below is the log-Riesz block index `j = d/2 + i`, an integer
+    // only at even `d`; at odd `d` the block order is a half-integer and the
+    // partial-fraction form above is the wrong one (the caller takes the
+    // Mellin-Barnes branch there). Truncating `d / 2` would silently price an odd
+    // `d` on the even formula, so the parity is checked in every build, not only
+    // in debug.
+    assert!(
+        d.is_multiple_of(2),
+        "the even-d Duchon analytic coefficient has no odd-d branch: d={d}"
+    );
     let half_d = d / 2;
     let base = a + b;
     let mut out = [0.0_f64; 3];

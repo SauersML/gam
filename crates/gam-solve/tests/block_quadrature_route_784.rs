@@ -83,13 +83,12 @@ impl LaplaceMarginalCorrector for RuleRecorder {
         eigenvectors: &Array2<f64>,
         design: &DesignMatrix,
         c_weights: &Array1<f64>,
-        refine_supremum: bool,
     ) -> Result<(f64, Array1<f64>), String> {
         let p = eigenvalues.len();
         if eigenvectors.dim() != (p, p) || design.ncols() != p || c_weights.len() != design.nrows()
         {
             return Err(format!(
-                "the recorder's diagnostic (refine_supremum={refine_supremum}) got {p} \
+                "the recorder's diagnostic got {p} \
                  eigenvalues, {}x{} eigenvectors, a {}x{} design and {} curvature weights",
                 eigenvectors.nrows(),
                 eigenvectors.ncols(),

@@ -18,10 +18,9 @@
 //!
 //! The data term, both prior normalizers and the integrated coordinate block are the
 //! dense SAE criterion's (#2933 F24–F26, F27 S1–S2). The Euclidean ARD log precisions
-//! are outer coordinates on the dense lane's layout, one per atom axis below
-//! `SAE_SHARED_ARD_K_THRESHOLD` atoms and one per axis index above it, and the criterion
-//! is minimized over them as the dense one is (#3433, F27 S5). The value still departs
-//! from the dense criterion in four ways:
+//! are outer coordinates on the dense lane's layout, one per atom axis at every `K`,
+//! and the criterion is minimized over them as the dense one is (#3433, F27 S5;
+//! #3824). The value still departs from the dense criterion in four ways:
 //! - a periodic axis's precision is held at the caller's value, because its Laplace
 //!   criterion has no minimizer where the axis carries no profiled data curvature
 //!   ([`SaeSupportArdLayout`]);
@@ -165,10 +164,13 @@ impl SaeSupportSmoothingLayout {
 
 /// Which outer log-precision coordinate prices each atom axis's ARD prior (#3433).
 ///
-/// The layout is the dense lane's (`fit_seed`): one coordinate per atom axis below
-/// `SAE_SHARED_ARD_K_THRESHOLD` atoms, and above it one per axis index, shared by
-/// every atom that has that axis. A support route and a dense route of one request
-/// therefore search the same Euclidean precision coordinates.
+/// The layout is the dense lane's (`fit_seed`): one coordinate per Euclidean atom
+/// axis, at every atom count. A support route and a dense route of one request
+/// therefore search the same Euclidean precision coordinates. There is no
+/// atom-count crossover to a per-axis-index coordinate shared by every atom: that
+/// mode changed the prior family, and so the criterion, at an arbitrary `K`, and it
+/// was deleted from the dense lane with its threshold (#3824). Axis `j` of two
+/// unrelated atoms is not a replicate of axis `j` of the other.
 ///
 /// A periodic (von-Mises) axis is held at the caller's precision and is not an
 /// outer coordinate. On a circle of period `P` with `κ = 2π/P`, the prior's exact
@@ -196,8 +198,6 @@ pub struct SaeSupportArdLayout {
     pub entry_precisions: Vec<Vec<f64>>,
     /// Number of ARD log-precision coordinates.
     pub coordinates: usize,
-    /// Whether the coordinates are shared by axis index.
-    pub shared: bool,
 }
 
 impl SaeSupportArdLayout {
@@ -237,50 +237,26 @@ impl SaeSupportArdLayout {
             }
             euclidean.push(periods.iter().map(Option::is_none).collect::<Vec<_>>());
         }
-        let shared = term.k_atoms() >= super::fit_seed::SAE_SHARED_ARD_K_THRESHOLD;
-        let (atom_coordinate, coordinates) = if shared {
-            // One coordinate per axis index some atom prices as Euclidean.
-            let width = euclidean.iter().map(Vec::len).max().unwrap_or(0);
-            let mut index_of_axis = vec![None; width];
-            let mut next = 0usize;
-            for (axis, slot) in index_of_axis.iter_mut().enumerate() {
-                if euclidean.iter().any(|axes| axes.get(axis).copied().unwrap_or(false)) {
-                    *slot = Some(next);
-                    next += 1;
-                }
-            }
-            let map = euclidean
-                .iter()
-                .map(|axes| {
-                    axes.iter()
-                        .enumerate()
-                        .map(|(axis, &free)| if free { index_of_axis[axis] } else { None })
-                        .collect()
-                })
-                .collect();
-            (map, next)
-        } else {
-            let mut next = 0usize;
-            let map = euclidean
-                .iter()
-                .map(|axes| {
-                    axes.iter()
-                        .map(|&free| {
-                            free.then(|| {
-                                next += 1;
-                                next - 1
-                            })
+        // One coordinate per Euclidean (atom, axis) at every atom count, the dense
+        // lane's only layout since #3824.
+        let mut next = 0usize;
+        let atom_coordinate = euclidean
+            .iter()
+            .map(|axes| {
+                axes.iter()
+                    .map(|&free| {
+                        free.then(|| {
+                            next += 1;
+                            next - 1
                         })
-                        .collect()
-                })
-                .collect();
-            (map, next)
-        };
+                    })
+                    .collect()
+            })
+            .collect();
         Ok(Self {
             atom_coordinate,
             entry_precisions: ard_precisions.to_vec(),
-            coordinates,
-            shared,
+            coordinates: next,
         })
     }
 
@@ -686,12 +662,9 @@ impl SaeSupportOuterObjective {
                         .map(move |(axis, _)| (atom, axis))
                 })
                 .next();
-            match (self.ard_layout.shared, priced) {
-                (true, Some((_, axis))) => format!("shared ARD log precision of axis {axis}"),
-                (false, Some((atom, axis))) => {
-                    format!("ARD log precision of atom {atom} axis {axis}")
-                }
-                (_, None) => format!("ARD log precision {}", index - groups),
+            match priced {
+                Some((atom, axis)) => format!("ARD log precision of atom {atom} axis {axis}"),
+                None => format!("ARD log precision {}", index - groups),
             }
         }
     }
