@@ -8926,10 +8926,25 @@ pub fn default_survival_time_grid(
             "survival exit times must extend beyond entry times; got min entry {lo:?} and max exit {hi:?}"
         ));
     }
-    let span = hi - lo;
-    let hi_padded = hi + (span * 1.0e-6).max(1.0e-9);
-    let step = (hi_padded - lo) / 63.0;
+    // 64 uniform points with BOTH endpoints exact. The last point is `hi`
+    // itself, not the accumulation `lo + 63·step`, which lands off the frame's
+    // upper edge by the step's own rounding; the padding that used to hide that
+    // pushed the grid PAST `hi`, which is the stretch #1717 rules out and which
+    // this function's own contract ("spanning the prediction frame's
+    // `[min entry, max exit]`") forbids. Every interior point is
+    // `lo + (hi − lo)·t` with `t < 1`, so it lies strictly inside the frame and
+    // the sequence is monotone.
+    const GRID_POINTS: usize = 64;
+    let last = GRID_POINTS - 1;
     Ok(Some(
-        (0..64).map(|index| lo + step * (index as f64)).collect(),
+        (0..GRID_POINTS)
+            .map(|index| {
+                if index == last {
+                    hi
+                } else {
+                    lo + (hi - lo) * (index as f64 / last as f64)
+                }
+            })
+            .collect(),
     ))
 }

@@ -5505,25 +5505,23 @@ fn binary_from_log_survival(
         });
     }
     let (log_lik, ell_prime, ell_pp) = binary_log_survival_scales(log_survival)?;
-    let grad_scale = ell_prime;
-    let neg_hess_scale = ell_prime; // coefficient on (-d²s/dβ²); equals ℓ'.
-    let outer_scale = -ell_pp;
     // The Newton accumulator at the call sites computes
     //     neg_Hess(log_lik) = neg_hess_scale * (-d²s/dβ²) + outer_scale * (ds/dβ)²
-    // For this identity to hold by the chain rule, the coefficient on the
-    // neg_hessian term must equal ℓ' (== grad_scale). Document the invariant.
-    assert!(
-        (grad_scale - neg_hess_scale).abs() <= 1e-15 * grad_scale.abs().max(1.0),
-        "binary_from_log_survival invariant: neg_hess_scale ({neg_hess_scale}) must equal grad_scale ({grad_scale}) so that grad_scale and the coefficient on neg_hessian share sign"
-    );
+    // so by the chain rule the coefficient on the neg-Hessian term IS ℓ' — the
+    // same ℓ' the gradient scales by. Both fields therefore read ONE binding:
+    // the identity is a fact of the construction rather than a tolerance
+    // between two numbers. The assertion that stood here compared `ell_prime`
+    // with itself, so it was green whatever the construction did.
+    let chain_scale = ell_prime;
+    let outer_scale = -ell_pp;
     assert!(
         outer_scale >= 0.0 || !outer_scale.is_finite(),
         "binary_from_log_survival invariant: outer_scale (= -ℓ'') must be non-negative for event=1; got {outer_scale}"
     );
     Ok(BinaryFromLogSurvival {
         log_lik,
-        grad_scale,
-        neg_hess_scale,
+        grad_scale: chain_scale,
+        neg_hess_scale: chain_scale,
         outer_scale,
     })
 }

@@ -707,6 +707,20 @@ fn bounded_latent_injective_limit() -> f64 {
     (2.0 / f64::EPSILON).ln()
 }
 
+/// The representative of `logit`'s fibre under `bounded()`'s interval map: the
+/// coordinate itself inside the injective domain, and the domain's endpoint
+/// outside it, where every coordinate shares one `beta`.
+///
+/// This is a projection onto the coordinates the model can tell apart, not a
+/// bound chosen for the search. [`bounded_latent_injective_limit`] is read off
+/// binary64's representation of `sigma`, and `beta`, the linear predictor, the
+/// log-likelihood and every derivative the solver reads are bit-identical at
+/// `logit` and at its representative.
+fn bounded_latent_representative(logit: f64) -> f64 {
+    let domain = bounded_latent_injective_limit();
+    logit.clamp(-domain, domain)
+}
+
 fn bounded_latent_derivatives(
     theta: f64,
     min: f64,
@@ -2490,12 +2504,19 @@ impl CustomFamily for BoundedLinearFamily {
             ))
             .into());
         }
-        let limit = bounded_latent_injective_limit();
         let mut clamped = beta;
         for term in &self.bounded_terms {
-            // The limit bounds the logit coordinate `t + c`, not `t` itself.
+            // The domain bounds the logit coordinate `t + c`, not `t` itself, so
+            // the centre is added before the projection and removed after it.
+            // A coordinate already inside the domain is left ALONE: forming
+            // `(t + c) − c` rounds twice, so the former unconditional round trip
+            // displaced every unsaturated coefficient by up to `2u·|t + c|` on
+            // every post-update, a move no step had proposed.
             let logit = clamped[term.col_idx] + term.latent_center;
-            clamped[term.col_idx] = logit.clamp(-limit, limit) - term.latent_center;
+            let representative = bounded_latent_representative(logit);
+            if representative != logit {
+                clamped[term.col_idx] = representative - term.latent_center;
+            }
         }
         Ok(clamped)
     }

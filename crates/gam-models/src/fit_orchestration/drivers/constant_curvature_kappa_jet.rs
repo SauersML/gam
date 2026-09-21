@@ -150,6 +150,7 @@ fn profiled_gaussian_reml_psi_jet(
 ) -> Result<ProfiledRemlPsiJet, EstimationError> {
     use faer::Side;
     use gam_linalg::faer_ndarray::FaerCholesky;
+    use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 
     let (n, p) = design.dim();
     let design_shape_ok = blocks
@@ -308,14 +309,76 @@ fn profiled_gaussian_reml_psi_jet(
         })
         .collect();
 
-    // The value, recomputed in this chart, must be the shipped objective.
+    // The value, recomputed in this chart, must be the shipped objective. The two
+    // routes evaluate ONE closed form from the same inputs by different linear
+    // algebra, so they may differ by their two forward errors and by nothing
+    // else. The forward route publishes its own (#2729); this chart's is
+    // accumulated here, term by term, from the operands it sums.
     let rho = fit.rho;
-    let value = 0.5 * (logdet_h - (logdet_s_positive + rank as f64 * rho))
-        + 0.5 * nu * (1.0 + (2.0 * std::f64::consts::PI * dp / nu).ln());
-    if !value.is_finite() || (value - fit.reml_score).abs() > 1.0e-7 * (1.0 + fit.reml_score.abs())
+    let determinant = 0.5 * (logdet_h - (logdet_s_positive + rank as f64 * rho));
+    let dispersion = 0.5 * nu * (1.0 + (2.0 * std::f64::consts::PI * dp / nu).ln());
+    let value = determinant + dispersion;
+    let Some(forward_roundoff) = fit.reml_score_roundoff else {
+        crate::bail_invalid_estim!(
+            "constant-curvature profile ψ-jet cannot certify its chart: the forward REML score carries no forward-error bound, so the two routes have no established resolution to be compared at"
+        );
+    };
+
+    // `log|H|`. Since `d log det H = tr(H⁻¹ dH)`, a perturbation `ΔH` moves the
+    // log-determinant by at most `‖H⁻¹‖_F·‖ΔH‖_F`. `ΔH` is this chart's own
+    // assembly plus the factorization: `XᵀX` is an `n`-term Gram, within
+    // `γ_n·‖X‖_F²` in Frobenius norm; the symmetrization, the scaling by λ and
+    // the addition round once each; and the Cholesky satisfies
+    // `|ΔH| ≤ γ_{p+1}|R̂ᵀ||R̂|` with `‖ |R̂ᵀ||R̂| ‖_F ≤ ‖R̂‖_F² = tr(H)` (Higham,
+    // *ASNA* 2nd ed., Thm 10.3). Summing the `p` logarithms of the factor's
+    // diagonal adds `γ_{2p−1}·Σ|ln dᵢ|`, doubled with the factor of two.
+    let design_frobenius_squared = design.iter().map(|value| value * value).sum::<f64>();
+    let gram_frobenius = a0.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let penalty_frobenius = s0.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let hessian_trace = (0..p)
+        .map(|i| a0[(i, i)].abs() + lambda.abs() * s0[(i, i)].abs())
+        .sum::<f64>();
+    // Three single-rounding steps stand between the Gram and `H`: the
+    // symmetrization `(M + Mᵀ)/2`, the scaling of `S` by λ, and their addition.
+    // Each is bounded by `‖A‖_F + λ‖S‖_F` in Frobenius norm.
+    let assembly_scale = gram_frobenius + lambda.abs() * penalty_frobenius;
+    let hessian_perturbation = accumulation_growth(n) * design_frobenius_squared
+        + 3.0 * UNIT_ROUNDOFF * assembly_scale
+        + accumulation_growth(p + 1) * hessian_trace;
+    let inverse = chol.solve_mat(&Array2::<f64>::eye(p));
+    let inverse_frobenius = inverse.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let log_diagonal_magnitude = chol.diag().iter().map(|value| value.ln().abs()).sum::<f64>();
+    let logdet_h_roundoff = inverse_frobenius * hessian_perturbation
+        + 2.0 * accumulation_growth(2 * p - 1) * log_diagonal_magnitude;
+
+    // The penalized deviance. `r = y − Xβ` forms each entry as a `p`-term inner
+    // product and one subtraction, so `‖Δr‖₂ ≤ γ_{p+1}·(‖X‖_F‖β‖₂ + ‖y‖₂)`;
+    // `rᵀr` then carries `2‖r‖‖Δr‖ + ‖Δr‖²` from the displacement of `r` itself
+    // and `γ_n·‖r‖₂²` from its own accumulation. The penalty quadratic `βᵀS₀β`
+    // is a matvec and a dot, `γ_{2p}·‖β‖₂²‖S₀‖_F`, and the scaling by λ and the
+    // final addition round once each.
+    let response_norm = response.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let beta_norm = beta0.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let residual_norm = residual.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let residual_perturbation = accumulation_growth(p + 1)
+        * (design_frobenius_squared.sqrt() * beta_norm + response_norm);
+    let dp_roundoff = 2.0 * residual_norm * residual_perturbation
+        + residual_perturbation * residual_perturbation
+        + accumulation_growth(n) * residual_norm * residual_norm
+        + accumulation_growth(2 * p) * lambda.abs() * beta_norm * beta_norm * penalty_frobenius
+        + UNIT_ROUNDOFF * dp;
+
+    // `V = ½(log|H| − log|S|₊ − rank·ρ) + ½ν(1 + ln(2π·dp/ν))`. The logarithm
+    // carries `dp`'s RELATIVE error and its own three roundings (`2π·dp`, `/ν`,
+    // `ln`), and combining and scaling the five terms costs six more.
+    let chart_roundoff = 0.5 * (logdet_h_roundoff + logdet_s.value_roundoff)
+        + 0.5 * nu * (dp_roundoff / dp + accumulation_growth(3))
+        + accumulation_growth(6) * (determinant.abs() + dispersion.abs());
+    if !value.is_finite()
+        || !((value - fit.reml_score).abs() <= chart_roundoff + forward_roundoff)
     {
         crate::bail_invalid_estim!(
-            "constant-curvature profile ψ-jet chart does not reproduce the REML score it differentiates: chart {value:.9e} vs forward {:.9e}",
+            "constant-curvature profile ψ-jet chart does not reproduce the REML score it differentiates: chart {value:.9e} vs forward {:.9e}, apart by more than the two routes' forward errors ({chart_roundoff:.3e} here, {forward_roundoff:.3e} there)",
             fit.reml_score
         );
     }
@@ -395,6 +458,10 @@ fn profiled_gaussian_reml_psi_jet(
 /// [`profiled_gaussian_reml_psi_jet`].
 struct PseudoLogdetPsiJet {
     value: f64,
+    /// Forward-error bound on `value`: the eigensolver's resolution of the
+    /// spectrum carried through the logarithm, plus the sum's own accumulation.
+    /// Read by the chart's certificate against the forward fit's score.
+    value_roundoff: f64,
     first: [f64; 2],
     second: [f64; 3],
 }
@@ -505,6 +572,19 @@ fn positive_pseudo_logdet_psi_jet(
     let second_blocks: Vec<Array2<f64>> = s2.iter().map(|m| project(m)).collect();
 
     let value = values[..rank].iter().map(|v| v.ln()).sum::<f64>();
+    // By Weyl every computed eigenvalue is within `band` of an exact one, so
+    // `|ln λ̂ − ln λ| ≤ band / (λ̂ − band)`; the refusal above establishes
+    // `λ̂ > band` for the smallest of the `rank` positive eigenvalues, hence for
+    // all of them. Summing the logarithms commits one rounding per logarithm and
+    // `rank − 1` additions, which is `γ_{2·rank−1}` on `Σ|ln λ̂|`.
+    let mut spectrum_error = 0.0_f64;
+    let mut log_magnitude = 0.0_f64;
+    for &eigenvalue in &values[..rank] {
+        spectrum_error += band / (eigenvalue - band);
+        log_magnitude += eigenvalue.ln().abs();
+    }
+    let value_roundoff = spectrum_error
+        + gam_linalg::roundoff::accumulation_growth(2 * rank - 1) * log_magnitude;
     let first: [f64; 2] = std::array::from_fn(|a| {
         (0..rank)
             .map(|i| first_blocks[a][(i, i)] / values[i])
@@ -532,6 +612,7 @@ fn positive_pseudo_logdet_psi_jet(
     });
     Ok(PseudoLogdetPsiJet {
         value,
+        value_roundoff,
         first,
         second,
     })

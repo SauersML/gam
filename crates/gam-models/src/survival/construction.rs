@@ -1387,7 +1387,15 @@ pub fn build_survival_time_basis(
             .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
                 (lo.min(v), hi.max(v))
             });
-        let entry_degenerate = (entry_range.1 - entry_range.0).abs() < 1e-8;
+        // "Degenerate" means the entry times carry no spread at all: every row
+        // enters at the same instant, so `log_entry` is one value repeated and
+        // the knot input learns nothing from it. That is an exact statement
+        // about the data, `max == min`, and not a distance. Two entry times that
+        // differ at all are two distinct points, and `quantile_knot_support`
+        // below already collapses duplicates and caps the knot count by the
+        // distinct interior points, so a nearly-degenerate entry column needs no
+        // separate handling here.
+        let entry_degenerate = entry_range.0.total_cmp(&entry_range.1).is_eq();
         if entry_degenerate {
             log_exit.clone()
         } else {
@@ -4708,9 +4716,15 @@ pub fn build_survival_timewiggle_from_baseline(
     }
     // Guard: if baseline offsets are all zero (linear baseline), the timewiggle
     // construction is degenerate — it adds only a constant, not time-varying structure.
-    let all_zero = eta_entry.iter().all(|&v| v.abs() < 1e-15)
-        && eta_exit.iter().all(|&v| v.abs() < 1e-15)
-        && derivative_exit.iter().all(|&v| v.abs() < 1e-15);
+    // "All zero" is the LINEAR baseline, whose offsets are exact zeros: that
+    // baseline contributes `η = 0` and `∂η/∂t = 0` at every row by construction,
+    // not by cancellation. An offset that is nonzero at all is time-varying
+    // structure the warp can index, so the test is exact.
+    let all_zero = eta_entry
+        .iter()
+        .chain(eta_exit.iter())
+        .chain(derivative_exit.iter())
+        .all(|&v| v == 0.0);
     if all_zero {
         return Err(
             "timewiggle requires a non-linear scalar survival baseline target; \

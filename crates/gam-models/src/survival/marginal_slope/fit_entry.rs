@@ -3066,11 +3066,32 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 .design
                 .try_to_dense_arc("survival marginal-slope resolved conditioning check")
                 .map_err(FitFailure::input)?;
+            // Two densifications of ONE conditioning map. A design the
+            // length-scale search did not move is rebuilt by the same
+            // deterministic basis evaluation on the same inputs, so its entries
+            // agree bitwise; one that passed through a reparameterizing rotation
+            // of its `q` columns can differ by that rotation's accumulation,
+            // `γ_q·Σ|row|`, read per row at the row's own magnitude rather than
+            // at an assumed unit scale. A design the search DID move differs by
+            // a relative O(1) on the rows whose basis values changed, which no
+            // rounding band covers.
             conditioning.shape() == resolved.shape()
                 && conditioning
-                    .iter()
-                    .zip(resolved.iter())
-                    .all(|(gate, resolved)| (gate - resolved).abs() <= 1e-10 * (1.0 + gate.abs()))
+                    .rows()
+                    .into_iter()
+                    .zip(resolved.rows())
+                    .all(|(gate_row, resolved_row)| {
+                        let magnitude: f64 =
+                            resolved_row.iter().map(|value| value.abs()).sum();
+                        let band = gam_linalg::roundoff::accumulation_band(
+                            resolved_row.len(),
+                            magnitude,
+                        );
+                        gate_row
+                            .iter()
+                            .zip(resolved_row.iter())
+                            .all(|(gate, value)| (gate - value).abs() <= band)
+                    })
         }
         // No conditional calibration ⇒ nothing to reproduce.
         _ => true,

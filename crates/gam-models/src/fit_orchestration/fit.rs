@@ -3464,14 +3464,14 @@ fn load_survival_transformation_persistent_warm_start(
     rho: &[f64],
 ) -> Option<(Array1<f64>, Option<f64>)> {
     let record = gam_solve::persistent_warm_start::load_record(store, key)?;
-    if !record.is_compatible(key, spec.age_entry.len(), n_cols)
-        || record.rho.len() != rho.len()
-        || !record
-            .rho
-            .iter()
-            .zip(rho.iter())
-            .all(|(cached, expected)| (*cached - *expected).abs() <= 1e-10)
-    {
+    // A warm start is reusable when it was solved at the ρ being asked for — the
+    // SAME point, not a nearby one. The record's ρ round-trips through the store
+    // bit for bit, which `store_survival_transformation_persistent_warm_start`
+    // below reads back and asserts with `stored.rho == record.rho`, and a repeat
+    // visit to a ρ is produced by the same code from the same inputs, so equality
+    // is the structural test. A tolerance here hands a cached mode fitted at one
+    // smoothing state to a fit running at another.
+    if !record.is_compatible(key, spec.age_entry.len(), n_cols) || record.rho != rho {
         return None;
     }
     log::debug!("[warm-start-cache] restored survival transformation warm start key={key}");

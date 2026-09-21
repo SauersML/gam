@@ -1240,7 +1240,7 @@ pub struct EmpiricalZGrid {
 impl EmpiricalZGrid {
     /// Construct a grid whose node/weight invariants (equal length ≥ 2, finite
     /// ascending nodes, finite positive weights, weights summing to 1 within
-    /// 1e-8) are enforced up-front. Sorted order is part of the input contract
+    /// `empirical_weight_sum_band`) are enforced up-front. Sorted order is part of the input contract
     /// so hot denested-cell kernels can consume contiguous buckets without a
     /// constructor-side reorder or allocation. Prefer this over building the
     /// struct literally; every code path that goes through `new` satisfies the
@@ -1583,6 +1583,36 @@ fn sort_empirical_node_weight_pairs(nodes: &mut [f64], weights: &mut [f64]) {
     }
 }
 
+/// The band within which the stored weights of an `n`-node empirical latent
+/// measure may miss summing to one.
+///
+/// A grid's weights are produced by normalizing raw masses,
+/// `wᵢ = fl(rᵢ / fl(Σ r_j))`: that is what [`combine_empirical_grids`] does
+/// below, and what
+/// `empirical_measure_sensitivity::build_empirical_z_grid_with_alpha` does
+/// before handing a grid to [`EmpiricalZGrid::new`]. The divisor is an `n`-term
+/// sum carrying `γ_{n−1}`, each quotient rounds once, and re-summing the stored
+/// weights here costs another `n − 1` additions. With Higham's
+/// `γ_a + γ_b + γ_aγ_b ≤ γ_{a+b}` (*ASNA* 2nd ed., Lemma 3.3) the three stages
+/// compose to
+///
+/// ```text
+///   |fl(Σ wᵢ) − 1|  ≤  (γ_n + γ_{n−1}) / (1 − γ_{n−1})  ≤  γ_{2n} / (1 − γ_{n−1}),
+/// ```
+///
+/// which is what this returns, and it is infinite once the re-summation's own
+/// growth reaches one, where no bound holds. The band moves with the node
+/// count, which a fixed allowance does not: a three-node law that misses by
+/// `1e-9` is not a probability measure, while a ten-thousand-node one that
+/// misses by `1e-12` is exactly what binary64 normalization leaves.
+fn empirical_weight_sum_band(nodes: usize) -> f64 {
+    let resummation = gam_linalg::roundoff::accumulation_growth(nodes.saturating_sub(1));
+    if !(resummation < 1.0) {
+        return f64::INFINITY;
+    }
+    gam_linalg::roundoff::accumulation_growth(nodes.saturating_mul(2)) / (1.0 - resummation)
+}
+
 pub(crate) fn validate_empirical_z_grid(
     nodes: &[f64],
     weights: &[f64],
@@ -1622,9 +1652,11 @@ pub(crate) fn validate_empirical_z_grid(
         previous_node = node;
         total += weight;
     }
-    if !(total.is_finite() && (total - 1.0).abs() <= 1e-8) {
+    let band = empirical_weight_sum_band(nodes.len());
+    if !(total.is_finite() && (total - 1.0).abs() <= band) {
         return Err(format!(
-            "{context} empirical latent measure weights must sum to 1, got {total}"
+            "{context} empirical latent measure weights must sum to 1 within the \
+             normalization's rounding band {band:e}, got {total}"
         ));
     }
     Ok(())
@@ -3810,15 +3842,27 @@ fn normal_screen_bounds(n: f64, policy: &LatentZPolicy) -> Result<NormalScreenBo
 /// `P(K > λ) = 2 Σ_{j≥1} (−1)^{j−1} e^{−2 j² λ²}`, by bisection on its
 /// decreasing survival function.
 fn kolmogorov_upper_quantile(alpha: f64) -> f64 {
+    // `P(K > λ) = 2 Σ_{j≥1} (−1)^{j−1} e^{−2j²λ²}` alternates with strictly
+    // decreasing terms, so the tail after term `j` is bounded by term `j + 1`.
+    // The series is therefore summed to COMPLETION rather than truncated at a
+    // chosen size: once a term no longer resolves against the partial sum it
+    // would be added to, the addition is the identity and every later term is
+    // smaller still, so the computed sum cannot move again. `e^{−2j²λ²}` falls
+    // under that bar at a finite `j` for every `λ > 0`, which is what
+    // terminates the loop; the bisection below only ever evaluates this on
+    // `(0.2, 5)`. The former fixed term count did the same job by accident and
+    // silently truncated whenever the bar was not reached inside it.
     let survival = |lambda: f64| {
-        let mut sum = 0.0;
-        for j in 1..=100_u32 {
+        let mut sum = 0.0_f64;
+        let mut j = 1_u32;
+        loop {
             let jf = f64::from(j);
             let term = (-2.0 * jf * jf * lambda * lambda).exp();
-            sum += if j % 2 == 1 { term } else { -term };
-            if term < 1e-18 {
+            if term <= gam_linalg::roundoff::UNIT_ROUNDOFF * sum {
                 break;
             }
+            sum += if j % 2 == 1 { term } else { -term };
+            j += 1;
         }
         2.0 * sum
     };
