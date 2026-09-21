@@ -2295,7 +2295,7 @@ struct ClosedFormFallback {
 /// `(m, s)` of the map. The standard-normal law states that the score is
 /// `N(0, 1)` as given, and a calibrated law reads the scale-free `ζ` axis, so
 /// both keep the score's own axis, `(0, 1)`.
-fn finite_law_in_standard_units(
+pub(crate) fn finite_law_in_standard_units(
     kind: LatentMeasureKind,
     calibration: &LatentMeasureCalibration,
     (mean, sd): (f64, f64),
@@ -2307,7 +2307,7 @@ fn finite_law_in_standard_units(
         EmpiricalZGrid::new(
             grid.nodes.iter().map(|&u| (u - mean) / sd).collect(),
             grid.weights.clone(),
-            "bernoulli marginal-slope finite latent law in standard units",
+            "finite latent law in standard units",
         )
     };
     let kind = match kind {

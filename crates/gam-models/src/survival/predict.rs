@@ -4077,12 +4077,23 @@ fn build_marginal_slope_predict_context(
     let slope_input = slope_clipped.as_ref().map_or(data, |arr| arr.view());
     let slope_design = build_term_collection_design(slope_input, &slopespec)
         .map_err(|e| format!("failed to build survival marginal-slope slope design: {e}"))?;
+    // The slope offset is a slope on the score as given; the model reads the
+    // score `(z − mean)/sd`, on which the same slope is `sd` times it, the factor
+    // the fit applied (gam#3477).
+    let score_sd = model
+        .latent_z_normalization
+        .as_ref()
+        .ok_or_else(|| {
+            "saved survival marginal-slope model missing latent_z_normalization".to_string()
+        })?
+        .sd;
     let effective_noise_offset = slope_design
         .compose_offset(
             noise_offset.view(),
             "survival marginal-slope slope block",
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+        * score_sd;
     // gam#2765 / gam#2767: the term spec names the covariate factor only. With a
     // follow-up margin the fitted coefficients live against `X_cov ⊗ᵣ B(log t)`,
     // so keep BOTH — the factor, which the per-`(row, t)` replay re-tensors at

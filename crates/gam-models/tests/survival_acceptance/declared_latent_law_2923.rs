@@ -326,11 +326,20 @@ fn fit(data: &gam_data::EncodedDataset, config: &FitConfig) -> Fitted {
     };
     let exit_index: Vec<f64> = fit.fitted_exit_index.to_vec();
     // An intercept-only slope surface: every row's slope is the same number.
+    // gam#3477: a fit on a finite law solves in the score's standard units
+    // `(z − m)/s`, the saved score map; its slope and its law are read back on
+    // the score as given, which is what the planted model is stated on.
+    let (score_mean, score_sd) = (fit.z_normalization.mean, fit.z_normalization.sd);
     let slope_design = fit.slope_design.design.to_dense();
-    let slope = slope_design.row(0).dot(&fit.fit.blocks[2].beta) + fit.baseline_slope;
+    let slope =
+        (slope_design.row(0).dot(&fit.fit.blocks[2].beta) + fit.baseline_slope) / score_sd;
     let grid = match &fit.latent_measure {
         gam_models::bms::LatentMeasureKind::GlobalEmpirical { grid } => Some(Law {
-            nodes: grid.nodes.clone(),
+            nodes: grid
+                .nodes
+                .iter()
+                .map(|&u| score_mean + score_sd * u)
+                .collect(),
             weights: grid.weights.clone(),
         }),
         _ => None,
@@ -667,9 +676,23 @@ fn declared_law_is_persisted_and_replayed_at_prediction_2923() {
     let fitted = fit(&data, &config);
     let payload = fit_formula_to_payload("Surv(time, event) ~ 1".to_string(), &data, &config)
         .expect("fit to a saved payload");
+    // gam#3477: the saved latent measure lives on the model's score axis, the
+    // saved score map `(z − mean)/sd`, so the persisted law is the declared law
+    // carried onto that axis node by node, by the same arithmetic the fit used.
+    let score_map = payload
+        .latent_z_normalization
+        .expect("a saved survival marginal-slope model carries its score map");
+    let declared_on_model_axis: Vec<f64> = law
+        .nodes
+        .iter()
+        .map(|&u| (u - score_map.mean) / score_map.sd)
+        .collect();
     match payload.latent_measure.as_ref() {
         Some(gam_models::bms::LatentMeasureKind::GlobalEmpirical { grid }) => {
-            assert_eq!(grid.nodes, law.nodes, "the persisted law must be the declared nodes");
+            assert_eq!(
+                grid.nodes, declared_on_model_axis,
+                "the persisted law must be the declared nodes on the model's score axis"
+            );
             assert_eq!(grid.weights, law.weights, "the persisted law must be the declared weights");
         }
         other => panic!(

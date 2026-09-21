@@ -4112,6 +4112,7 @@ mod rigid_row_tensors_3022_tests;
 pub(crate) mod row_primary_hessian;
 mod second_correction_traces;
 
+pub(crate) use block_specs::finite_law_in_standard_units;
 pub(crate) use block_specs::fit_bernoulli_marginal_slope_terms;
 pub use conditional_score_covariance::{
     ConditionalScoreCoordinate, ConditionalScoreCovariance, ScoreCovarianceField,
@@ -4138,6 +4139,7 @@ pub(crate) use family::{
 };
 pub(crate) use gradient_paths::MarginalSlopeCovarianceRef;
 pub(crate) use gradient_paths::standardize_latent_z_with_policy;
+pub(crate) use gradient_paths::weighted_location_scale;
 pub(crate) use gradient_paths::{
     empirical_intercept, signed_probit_neglog_derivatives_up_to_fourth,
     unary_derivatives_inverse_sqrt, unary_derivatives_log, unary_derivatives_log_normal_pdf,
