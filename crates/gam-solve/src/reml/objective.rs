@@ -1271,7 +1271,6 @@ impl<'a> RemlState<'a> {
             );
         }
         Ok(super::assembly::InnerAssembly {
-            cone_normalizer: None,
             // The single-eta GLM lane prices its logdet on the same operator its
             // inner solve converged against, so the mode response has nothing to
             // separate from (#2612).

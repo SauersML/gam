@@ -9224,7 +9224,7 @@ impl ConeFaceSwitchFixture {
         let s2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
         let xty = array![5.0, 3.0, 2.0];
         let rows = array![[1.0, -0.4, 0.2], [0.3, 1.0, -0.5]];
-        let switch = [0.5, 0.3];
+        let switch = [0.5_f64, 0.3];
         let mut h = xtx.clone();
         h.scaled_add(switch[0].exp(), &s1);
         h.scaled_add(switch[1].exp(), &s2);
