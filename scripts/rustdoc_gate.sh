@@ -2,8 +2,8 @@
 #
 # Does every crate in the workspace document with ZERO rustdoc errors? (#2753)
 #
-# WHY THIS EXISTS, AND WHY IT IS NO LONGER A RATCHET
-# --------------------------------------------------
+# WHY THIS EXISTS, AND WHY ITS BAR IS ZERO
+# ----------------------------------------
 # `cargo doc` exits 101 on this workspace and no CI job had ever noticed
 # (#2711): nothing in `.github/` ran `cargo doc` or `rustdoc` at all, and
 # `docs.yml` -- mkdocs, green every night -- said nothing about it. The errors
@@ -12,19 +12,15 @@
 # (`rustdoc::private_intra_doc_links`, `rustdoc::broken_intra_doc_links`)
 # become hard errors that `cargo build` and `cargo test` never see.
 #
-# #2711 landed this as a RATCHET against a committed ledger of 15 known-red
-# crates, because a zero bar would have been red on arrival and a gate that is
-# red the day it lands is ignored from the day it lands. #2753 paid the debt
-# off: every remaining rustdoc error in the workspace is fixed, the ledger is
-# empty, and the bar is ZERO for every crate. A ratchet at N licenses the
-# N+1'th, which is the whole failure mode this surface has.
+# #2753 fixed every rustdoc error in the workspace, so the bar is ZERO for
+# every crate and no list of tolerated offenders exists.
 #
 # THE COVERAGE CONTROL, AND WHY A GREEN HERE CANNOT BE A NON-RUN
 # ---------------------------------------------------------------
-# The ratchet's positive control was the ledger itself: known-failing crates
-# run through the same command every time, so a scan that silently did nothing
-# would report them "clean" and fail loudly. Emptying the ledger DESTROYS that
-# control. With zero errors everywhere, `rc=0, errors=0` for every crate is
+# The ledger this gate replaced was its own positive control: known-failing
+# crates run through the same command every time, so a scan that silently did
+# nothing would report them "clean" and fail loudly. A zero bar has no such
+# inputs. With zero errors everywhere, `rc=0, errors=0` for every crate is
 # byte-identical to a scan that never ran rustdoc at all -- wrong flags, no
 # toolchain, an empty crate list, a typo in a package name.
 #
@@ -125,8 +121,8 @@ for crate in "${CRATES[@]}"; do
   rc=$?
   # Strip ANSI before counting. Cargo colours diagnostics whenever it decides
   # the sink is a terminal, and `^error` then fails to match a line that really
-  # begins with an escape sequence -- which is how the first version of the
-  # ratchet reported `errors=0` beside `rc=101` on all fifteen red crates.
+  # begins with an escape sequence -- which is how the first per-crate sweep of
+  # this surface reported `errors=0` beside `rc=101` on all fifteen red crates.
   sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$log" >"${log}.plain"
   errors="$(grep -cE '^error(\[|:)' "${log}.plain")"
   SCANNED=$((SCANNED + 1))
@@ -172,7 +168,7 @@ if [ "${#RED[@]}" -gt 0 ]; then
     echo "  Reproduce with: cargo doc -p ${c} --no-deps"
   done
   echo "  The bar is ZERO, deliberately: this surface was dark for the whole project's history (#2711),"
-  echo "  and a ratchet at N licenses the N+1'th. Fix the link; do not add an allowance."
+  echo "  and an allowance at N licenses the N+1'th. Fix the link; there is no allowance file."
 fi
 
 if [ "${#UNDOCUMENTED[@]}" -gt 0 ]; then

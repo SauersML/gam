@@ -6,16 +6,11 @@ name: Rustdoc census
 # ~50s, and builds the mkdocs site; it never touches Rust. So "docs is green"
 # was true and carried no information about rustdoc, which exits 101.
 #
-# What this job asserted was deliberately NOT "zero rustdoc errors" when it
-# landed: hundreds existed across most of the workspace, so a zero bar would
-# have been red on arrival, and a gate that is red the day it lands is ignored
-# from the day it lands. It was a ratchet against a ledger of known-red crates.
-#
-# #2753 paid that debt off. The tree-wide census measured 754 errors across 15
-# crates -- the issue quoted 182, because nobody had swept every crate -- every
-# one is fixed, and `scripts/rustdoc_gate.sh` now demands ZERO for every crate,
-# with a per-crate coverage control standing in for the ledger's positive
-# control. See that script's header for why a green here is not a non-run.
+# The bar is ZERO for every crate: `scripts/rustdoc_gate.sh` fails on any
+# rustdoc error and there is no list of tolerated crates. #2753 measured the
+# tree-wide debt at 754 errors across 15 crates -- the issue quoted 182, because
+# nobody had swept every crate -- and fixed every one. See that script's header
+# for the per-crate coverage control that keeps a green from being a non-run.
 #
 # THE GATE NOW LIVES IN `cross-check.yml`, on push. This workflow is the
 # on-demand full census, not the gate, and it is deliberately no longer
@@ -23,10 +18,9 @@ name: Rustdoc census
 #
 # It was introduced schedule-only, deferring promotion to "the commit that can
 # demonstrate it green there". Run 30690710961 on 407d66f16 was that
-# demonstration -- green on an ordinary commit, 24 crates scanned, 9 clean, all
-# 15 ledger crates still red -- so the deferral's condition was met and the step
-# moved to `linux-native-check`, which already has every dependency's rmeta
-# built under sccache. (The ledger it refers to is gone as of #2753.)
+# demonstration -- green on an ordinary commit, 24 crates scanned -- so the
+# deferral's condition was met and the step moved to `linux-native-check`,
+# which already has every dependency's rmeta built under sccache.
 #
 # The nightly cron was REMOVED with that move rather than kept as a second
 # opinion. A scheduled job whose verdict nobody is required to look at is the

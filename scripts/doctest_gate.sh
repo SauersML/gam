@@ -16,11 +16,10 @@
 # comment is a Markdown indented code block, and rustdoc compiles those as
 # Rust. Twenty-five blocks of ASCII/Unicode mathematics were therefore being
 # handed to rustc, which died on `½`, `·`, `⁺`, `ᵀ`, `δ`, `ρ`. They are fenced
-# as ```text now, and the workspace is green, which is why this is a ZERO BAR
-# and not the ratchet-with-ledger that `scripts/doctest_ratchet.sh` was built
-# for: there is no debt left to ratchet against. That script survives as the
-# per-crate CENSUS instrument (triage, and the measurement that produced the
-# numbers above); this is the gate.
+# as ```text now, and the workspace is green. The bar here is ZERO: any failing
+# doctest fails this gate, and there is no ledger of tolerated crates.
+# `scripts/doctest_census.sh` is the per-crate triage instrument (it produced
+# the numbers above and gates nothing); this is the gate.
 #
 # WHY IT IS ONE WORKSPACE PASS AND NOT 24 PER-CRATE PASSES
 # The census shells `cargo test --doc -p <crate>` once per crate and takes
@@ -56,7 +55,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Same exclusion as cross-check.yml's compile jobs, the rustdoc ratchet and the
+# Same exclusion as cross-check.yml's compile jobs, the rustdoc gate and the
 # doctest census: building gam-pyffi needs a configured Python interpreter for
 # pyo3-ffi. Excluded is NOT a claim of cleanliness, and this script says so.
 EXCLUDED_CRATES=("gam-pyffi")
@@ -115,8 +114,8 @@ rc="${PIPESTATUS[0]}"
 
 # Strip ANSI before matching. cargo colours its output when it decides the sink
 # is a terminal, and `Doc-tests` then fails to match a line that begins with an
-# escape sequence -- the rustdoc ratchet reported `errors=0` beside `rc=101`
-# for exactly that reason before it was fixed.
+# escape sequence -- the first per-crate rustdoc sweep reported `errors=0`
+# beside `rc=101` on all fifteen red crates for exactly that reason.
 sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' "${LOG}" >"${LOG}.plain"
 
 status=0

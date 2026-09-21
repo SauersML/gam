@@ -71,12 +71,9 @@ jobs:
         # then-live build.rs gate reported exactly 2, so re-measure that.
         run: python scripts/assertionless_tests.py --positive-control
       - name: Demand zero assertion-less tests
-        # The tree scan is ENFORCING and demands zero. It used to ratchet against
-        # scripts/assertionless_ledger.txt, whose entries doubled as known-offending
-        # inputs. Its last entry, the #2695 warp ladder, was deleted, and the ledger
-        # check refuses an empty ledger because it can certify nothing, so the ledger
-        # went with it. The positive-control step above still re-measures the #2110
-        # incident through the same detector.
+        # The bar is zero: any assertion-less `#[test]` fails, with no ledger of
+        # tolerated ones. The positive-control step above re-measures the #2110
+        # incident through the same detector, so this green cannot be a non-run.
         run: python scripts/assertionless_tests.py --root .
       - name: Compare immutable source inventories
         env:
@@ -88,19 +85,13 @@ jobs:
           python scripts/test_census.py --base "$BASE_SHA" --head "$HEAD_SHA" --output test-census.json
           python scripts/source_removal_guard.py --base "$BASE_SHA" --head "$HEAD_SHA"
           python scripts/public_api_census.py --base "$BASE_SHA" --head "$HEAD_SHA" --output public-api-census.json
-      - name: SPEC ban ratchet
-        # scripts/spec_ban_ledger.tsv lists every known shape-level SPEC
-        # violation (grid, box, jitter, unconverged, magic, fd, gcv,
-        # python-math), each linked to its issue. The positive control plants
-        # one violation per rule; the check demands tree == ledger and that the
-        # ledger only lost lines relative to the base.
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          set -euo pipefail
-          git fetch --no-tags --depth=1 origin "$BASE_SHA"
-          python scripts/spec_ban_ratchet.py --positive-control
-          python scripts/spec_ban_ratchet.py --base "$BASE_SHA"
+      - name: Demand zero shape-level SPEC violations
+        # The bar is zero for every shape-level rule (grid, box, jitter,
+        # unconverged, magic, fd, gcv, python-math, roundoff), with no ledger of
+        # tolerated offenders. The scan plants one violation per rule and
+        # requires each to be detected before it reads the tree, so this green
+        # cannot be a non-run; that control is why no base revision is fetched.
+        run: python scripts/spec_ban_scan.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:

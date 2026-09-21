@@ -1,129 +1,22 @@
 name: Doctest census (#2732)
 
-# STALE HEADER CORRECTED 2026-09-05. This file used to open with "`cargo test
-# --doc` runs in NO CI job (#2732)", in the present tense, and that stopped
-# being true when the gate landed: `cross-check.yml`'s `doctest-gate` job runs
-# `scripts/doctest_gate.sh` (one `--workspace` pass) on every push, and it is
-# green. Reading this header at face value cost a dispatched 1h39m re-measure of
-# an already-gated, already-green surface before anyone checked `cross-check.yml`.
-# A comment that describes the world before a fix, written in the present tense,
-# is indistinguishable from a live finding.
+# A MEASUREMENT, NOT A GATE, on `workflow_dispatch` only.
 #
-# `scripts/doctest_red_crates.txt` is empty ON PURPOSE and is not an oversight:
-# the census (run 30696464338, 24 crates, 1h39m) found 25 failing doctests in
-# four crates, all one defect -- an indented ASCII-math block in a `///` comment
-# that rustdoc compiles as Rust -- and fixing 25 blocks was cheaper than carrying
-# a ledger for them. An empty ledger is not a ratchet, so the ratchet mode in
-# `scripts/doctest_ratchet.sh` is retained and unused. `scripts/doctest_ratchet.sh`
-# says all of this; this file did not, and this file is the one a reader opens
-# first because it is the one with `--census` in its name.
+# The gate is `cross-check.yml`'s `doctest-gate` job: `scripts/doctest_gate.sh`,
+# one `cargo test --doc --workspace` pass on every push, at a bar of ZERO --
+# any failing doctest fails it, and there is no ledger of tolerated crates.
 #
-# WHAT THIS FILE IS STILL FOR: per-crate ATTRIBUTION, on `workflow_dispatch`
-# only. The gate answers "is the surface green"; it cannot say WHICH crate went
-# red, and at ~1h39m that attribution is a triage cost rather than a push cost.
-# Dispatch it when the gate goes red, not to find out whether it is.
+# This workflow answers the one question that gate cannot: WHICH crate went red.
+# `scripts/doctest_census.sh` shells `cargo test --doc -p <crate>` once per
+# crate, which measured ~1h39m over 24 crates (run 30696464338), so it is a
+# triage cost rather than a push cost. Dispatch it when the gate goes red, not
+# to find out whether it is.
 #
-# It exists separately from the rustdoc ratchet because they are different
-# commands over different surfaces -- `cargo doc --no-deps` generates docs,
-# `cargo test --doc` compiles and RUNS every doctest -- and folding them into one
-# green would make both uninterpretable.
-#
-# Two things this run is for, in order:
-#   1. the per-crate table, so `scripts/doctest_red_crates.txt` is written from
-#      measurement instead of from a guess. One crate was measured by hand
-#      (gam-solve: 0 passed, 12 failed); the workspace-wide count is unknown and
-#      is not being extrapolated from it.
-#   2. the COST. `cargo test --doc` compiles and links each doctest, a different
-#      cost class from a `--no-deps` doc pass -- and the doc pass alone measured
-#      ~6 minutes for 24 crates, enough to move it off the shared push-gate job.
-#      Whether this can gate on push, and where, is decided on this number.
-#
-# The mistake this ordering exists to avoid was made one issue ago: the rustdoc
-# step went onto the push gate reasoning "the dependencies are already built, so
-# the marginal work is the passes alone" -- true, and never multiplied out
-# against the 5.2-minute baseline it was being added to.
-#
-# ===========================================================================
-# TRIGGER DISCHARGED -- the gate exists, and it is NOT the ratchet below.
-# ===========================================================================
-# Run 30696464338 executed this census over the whole workspace: 24 crates,
-# 1h39m, 19 passing, 5 "failing". Reading it produced two corrections to the
-# plan the trigger below was written under.
-#
-#   1. The debt was 25 doctests in FOUR crates -- gam-solve 12, gam-terms 8,
-#      gam-models 3, gam-sae 2 -- and all 25 were one defect, an indented
-#      ASCII-math block in a `///` comment that rustdoc compiles as Rust. That
-#      is small enough to FIX, and fixing it beats ledgering it: a ledger is
-#      how you gate a surface you cannot afford to clean, and this one cost 25
-#      fenced blocks. The workspace is green, so
-#      `scripts/doctest_red_crates.txt` was never written and condition (1)
-#      below is moot rather than met.
-#   2. The fifth "failing" crate, gam-cli, was an ARTIFACT: `no library targets
-#      found in package gam-cli`. It is binary-only and has no doctests to run.
-#      Both scripts now derive their crate list from lib targets, so the
-#      question is no longer asked of crates that cannot answer it.
-#
-# Condition (3) is still the one that decided placement, and it decided it the
-# same way: the gate is its OWN top-level job in `cross-check.yml`
-# (`doctest-gate`), never serialized ahead of the compile verdict, because
-# `cargo test --doc` codegens and links where the ~6-minute rustdoc pass does
-# not. It runs `scripts/doctest_gate.sh` -- ONE `--workspace` invocation, not
-# this per-crate loop, whose 1h39m is a triage cost.
-#
-# This workflow stays dispatch-only and keeps its original purpose: per-crate
-# attribution when doctest debt returns. The trigger text below is preserved
-# unedited because it is the reasoning the discharge was measured against.
-#
-# ---------------------------------------------------------------------------
-# PROMOTION TRIGGER -- a condition, not an intention. Anyone can check whether
-# it has been met without re-deriving any of the reasoning above.
-# ---------------------------------------------------------------------------
-# The rustdoc ratchet sat dispatch/nightly-only for a while behind the words
-# "promotion belongs with the commit that can demonstrate it green" -- which had
-# no owner and no test, and moved only because someone happened to check whether
-# it was already green. It was. Do not repeat that here; the condition is:
-#
-#   PROMOTE `scripts/doctest_ratchet.sh` (gate mode, no --census) into
-#   `cross-check.yml` when ALL THREE hold:
-#
-#     (1) `scripts/doctest_red_crates.txt` exists and was written from the
-#         per-crate output of a census run, with that run's ID recorded in the
-#         ledger header. A ledger written from anything else is a guess.
-#     (2) One gate-mode run has come back GREEN on an ordinary (non-docs-only)
-#         commit. That run is the evidence; cite its ID in the promoting commit.
-#         A green gate-mode run also proves the second ratchet direction fired,
-#         since every ledger crate had to still fail for it to pass.
-#     (3) Placement is decided by the MEASURED scan duration from (2), not by
-#         argument:
-#           < 2 min  -> may be a step in `linux-native-check`, which already has
-#                       every dependency's rmeta built under sccache.
-#           >= 2 min -> its own top-level job in `cross-check.yml`, parallel,
-#                       never serialized ahead of the compile verdict. For
-#                       calibration: the rustdoc pass is ~6 min and had to be
-#                       split out (`893cbc6aa`) for exactly this reason, and
-#                       `cargo test --doc` compiles AND LINKS each doctest, so
-#                       it is the heavier of the two.
-#
-# WHAT THE CENSUS MUST PRODUCE FOR (1), and why the total is not enough:
-#   * PER-CRATE results. A ledger keyed on a workspace total cannot ratchet --
-#     there is nothing to add or remove a line for. `gam-solve` at 0/12 is one
-#     crate; the workspace-wide count is UNMEASURED and is not extrapolated from
-#     it in either direction.
-#   * The failing set must be distinguishable from crates that merely FAILED TO
-#     BUILD. The script separates those: a non-zero exit with no `test result:`
-#     line is reported as a build failure, because that is a different finding
-#     with a different owner and must not enter the ledger as doctest debt.
-#
-# WHAT THIS SURFACE DOES NOT COVER, stated so a green is not over-read:
-#   * It says nothing about `cargo doc`, and `cargo doc` says nothing about it.
-#     They share a root cause -- indented ASCII-math in `///` comments that
-#     rustdoc compiles as Rust and that dies on `½`, `·`, `⁺` -- but the repairs
-#     differ (fence the block as a text block, versus reformatting the math), so
-#     the two ledgers will shrink at DIFFERENT RATES. One green covering both
-#     commands would hide exactly that, which is why they are separate.
-#   * `gam-pyffi` is excluded from the scan entirely, inheriting the same hole
-#     as both compile jobs and the rustdoc ratchet. Excluded is not clean.
-#   * Doctests only. Ordinary `#[test]` bodies are a different lane.
+# It is separate from the rustdoc gate because they are different commands over
+# different surfaces -- `cargo doc --no-deps` generates docs, `cargo test --doc`
+# compiles and RUNS every doctest -- and folding them into one green would make
+# both uninterpretable. It covers doctests only; ordinary `#[test]` bodies are a
+# different lane.
 
 on:
   workflow_dispatch:
@@ -152,7 +45,7 @@ jobs:
           CARGO_INCREMENTAL: "0"
         run: |
           set +e
-          scripts/doctest_ratchet.sh --census
+          scripts/doctest_census.sh
           status=$?
           if [ "$status" -eq 2 ]; then
             echo "::error title=Doctest census could not measure::The scan did not run to completion, so this run says nothing about the doctest surface. Treat it as a non-run, not as a pass."

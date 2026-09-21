@@ -1,7 +1,6 @@
 import importlib.util
 from pathlib import Path
 import sys
-import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
@@ -116,19 +115,13 @@ class SrcItemsUsedOnlyByTests(unittest.TestCase):
         self.assertEqual(identities(report, "test_only"), ["crates/a/src/user.rs:fn:consumer"])
         self.assertEqual(scanner.scan(files)["unreferenced"], [], "without the flag bare pub stays out of scope")
 
-    def test_the_ledger_ratchets_in_both_directions_2818(self):
+    def test_every_finding_is_reported_with_its_class_2818(self):
+        """The bar is zero: both classes are printed, and there is no list to excuse one."""
         report = {"test_only": [{"identity": "crates/a/src/lib.rs:fn:helper", "line": 1, "test_reference": "x"}],
-                  "unreferenced": [{"identity": "crates/a/src/lib.rs:fn:new_orphan", "line": 2}]}
-        with tempfile.TemporaryDirectory() as directory:
-            ledger = Path(directory) / "ledger.txt"
-            ledger.write_text("# known findings\ntest-only crates/a/src/lib.rs:fn:helper\n"
-                              "unreferenced crates/a/src/lib.rs:fn:gone\n")
-            regressions, stale = scanner.ratchet(report, scanner.read_ledger(ledger))
-            self.assertEqual(regressions, ["unreferenced crates/a/src/lib.rs:fn:new_orphan"])
-            self.assertEqual(stale, ["unreferenced crates/a/src/lib.rs:fn:gone"])
-            ledger.write_text("unreferenced b\nunreferenced a\n")
-            with self.assertRaisesRegex(ValueError, "not sorted"):
-                scanner.read_ledger(ledger)
+                  "unreferenced": [{"identity": "crates/a/src/lib.rs:fn:orphan", "line": 2}]}
+        self.assertEqual(scanner.finding_lines(report),
+                         ["test-only crates/a/src/lib.rs:fn:helper",
+                          "unreferenced crates/a/src/lib.rs:fn:orphan"])
 
 
 if __name__ == "__main__":

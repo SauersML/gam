@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""SPEC ban ratchet: shape-level scan for SPEC.md violations the build.rs
-hygiene bans do not see, against a burn-down ledger that may only shrink.
+"""SPEC ban scan: shape-level scan for SPEC.md violations the build.rs
+hygiene bans do not see. The bar is ZERO -- any hit fails.
 
 `build.rs` bans a fixed list of tokens (`#[allow]`, `todo!`, wall clocks, ...).
 It has no rule for the SPEC bans that live in the SHAPE of production code:
@@ -39,24 +39,29 @@ declaration, and a file whose `mod` declaration is test-gated (or whose parent
 module file is test code) is test code. The two test-support crates, which
 hold the finite-difference oracles, are test code.
 
-Every current hit is listed in scripts/spec_ban_ledger.tsv as
-`rule<TAB>path<TAB>token<TAB>issue-url`, one line per hit (a multiset; line
-numbers are deliberately absent so unrelated edits do not churn it). The
-check demands that the tree and the ledger agree EXACTLY:
+THERE IS NO LEDGER. Every hit is a violation and fails the scan, printed as
+`file:line`, rule and token. A violation is removed by fixing the code: moving
+it to another production file does not clear it, and there is no allowance file
+to record it in. Spelling the literal differently, or lifting it into a named
+constant, only hides it from this scan -- the SPEC rule is about where the
+quantity comes from, not about how it is written.
 
-  * a hit with no ledger line is a NEW violation -> exit 1;
-  * a ledger line with no hit is STALE -> exit 1, so a fix must delete it;
-  * with --base REV, every ledger line must already be in the ledger at REV:
-    deleting a line is the only change the ledger accepts. Moving a violation
-    to another file, or rewording its token, is a new violation.
+WHY A GREEN HERE IS NOT A NON-RUN. While a ledger existed, its lines doubled as
+known-offending inputs: a scan that silently measured nothing reported them
+clean and failed loudly. A zero bar has no such inputs of its own, and zero hits
+over the real tree is byte for byte what a scan over the wrong root prints. So
+every run first plants one violation per rule and requires the detector to
+report each one, and to report none of them from test-gated or commented code
+(`positive_control`); a detector that has stopped detecting exits 2. Every run
+also refuses a root with no production Rust source at all, and prints the number
+of files it read.
 
-Exit codes: 0 agreement, 1 violations, 2 the check could not run (missing
-ledger, malformed ledger, unreadable base revision).
+Exit codes: 0 no hit, 1 one or more violations, 2 the scan could not run (the
+planted controls were not detected, or the root holds no production source).
 
 Usage:
-  scripts/spec_ban_ratchet.py [--root DIR] [--base REV]
-  scripts/spec_ban_ratchet.py --positive-control
-  scripts/spec_ban_ratchet.py --prune     # delete stale lines, nothing else
+  scripts/spec_ban_scan.py [--root DIR]
+  scripts/spec_ban_scan.py --positive-control
 """
 
 from __future__ import annotations
@@ -66,16 +71,12 @@ import bisect
 import io
 import os
 import re
-import subprocess
 import sys
 import tokenize
 from collections import Counter
 from pathlib import Path
 
-LEDGER_REL = "scripts/spec_ban_ledger.tsv"
-SCRIPT_REL = "scripts/spec_ban_ratchet.py"
 TEST_SUPPORT_CRATES = ("crates/gam-test-support/", "crates/gam-linalg-test-support/")
-ISSUE_URL = re.compile(r"^https://github\.com/SauersML/gam/issues/\d+$")
 RULES = ("grid", "box", "jitter", "unconverged", "magic", "fd", "gcv", "python-math", "roundoff")
 
 
@@ -573,7 +574,7 @@ def rule_python_math(text: str):
 
 
 # ---------------------------------------------------------------------------
-# Scan, ledger, comparison
+# Scan
 # ---------------------------------------------------------------------------
 
 def _hits_for(files, rules):
@@ -591,136 +592,36 @@ def _hits_for(files, rules):
 
 
 def scan(root: Path):
-    hits = _hits_for(production_rust(root), RUST_RULES)
-    hits += _hits_for(production_python(root), {"python-math": rule_python_math})
+    """(hits, files_read) over the production Rust and Python sources under root."""
+    rust = production_rust(root)
+    if not rust:
+        raise CannotMeasure(
+            f"no production Rust source under {root}; a scan that read nothing certifies nothing"
+        )
+    python = production_python(root)
+    hits = _hits_for(rust, RUST_RULES)
+    hits += _hits_for(python, {"python-math": rule_python_math})
     hits.sort(key=lambda h: (h[0], h[1], h[3], h[2]))
-    return hits
+    return hits, len(rust) + len(python)
 
 
-def parse_ledger(text: str, where: str) -> Counter:
-    entries: Counter = Counter()
-    for n, line in enumerate(text.split("\n"), 1):
-        if not line.strip() or line.startswith("#"):
-            continue
-        cols = line.split("\t")
-        if len(cols) != 4:
-            raise CannotMeasure(f"{where}:{n}: expected 4 tab-separated columns, got {len(cols)}")
-        rule, path, token, url = cols
-        if rule not in RULES:
-            raise CannotMeasure(f"{where}:{n}: unknown rule {rule!r}")
-        if not ISSUE_URL.match(url):
-            raise CannotMeasure(f"{where}:{n}: issue column must be a SauersML/gam issue URL, got {url!r}")
-        entries[(rule, path, token, url)] += 1
-    return entries
-
-
-def compare(hits, ledger: Counter):
-    """(new, stale): hits the ledger lacks, and ledger lines no hit accounts for."""
-    have = Counter((h[0], h[1], h[2]) for h in hits)
-    listed = Counter()
-    for (rule, path, token, _url), k in ledger.items():
-        listed[(rule, path, token)] += k
-    new_keys = have - listed
-    stale = listed - have
-    new = []
-    budget = Counter(new_keys)
-    # Report the LAST occurrences in each file as new: an addition usually
-    # appends, and all occurrences of one key are interchangeable anyway.
-    for h in reversed(hits):
-        key = (h[0], h[1], h[2])
-        if budget[key] > 0:
-            budget[key] -= 1
-            new.append(h)
-    new.reverse()
-    return new, stale
-
-
-def shrink_violations(head: Counter, base: Counter) -> Counter:
-    return head - base
-
-
-def read_base_ledger(root: Path, rev: str) -> Counter | None:
-    """Ledger at rev, or None when rev predates the ratchet entirely."""
-    def show(path):
-        return subprocess.run(
-            ["git", "-C", str(root), "show", f"{rev}:{path}"],
-            capture_output=True, text=True,
-        )
-
-    probe = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"],
-        capture_output=True, text=True,
-    )
-    if probe.returncode != 0:
-        raise CannotMeasure(f"base revision {rev!r} is not reachable")
-    got = show(LEDGER_REL)
-    if got.returncode == 0:
-        return parse_ledger(got.stdout, f"{rev}:{LEDGER_REL}")
-    if show(SCRIPT_REL).returncode == 0:
-        raise CannotMeasure(f"{rev} has {SCRIPT_REL} but no {LEDGER_REL}; refusing to treat that as empty")
-    return None
-
-
-def run_check(root: Path, ledger_path: Path, base: str | None, out=sys.stdout, err=sys.stderr) -> int:
-    if not ledger_path.is_file():
-        raise CannotMeasure(f"no ledger at {ledger_path}")
-    ledger = parse_ledger(ledger_path.read_text(encoding="utf-8"), str(ledger_path))
-    if not ledger:
-        raise CannotMeasure(f"{ledger_path} lists nothing; an empty ledger certifies nothing")
-    hits = scan(root)
-    if not hits:
-        raise CannotMeasure("the scan found no hit anywhere; the scanner or the root is broken")
-    new, stale = compare(hits, ledger)
-    status = 0
-    for rule, path, token, ln, src in new:
-        print(f"error: {path}:{ln}: [{rule}] {token} -- new SPEC violation: {src}", file=err)
-        status = 1
-    for (rule, path, token), k in sorted(stale.items()):
-        print(
-            f"error: {LEDGER_REL}: stale entry x{k}: {rule}\t{path}\t{token} -- "
-            f"no longer in the tree; delete the line (scripts/spec_ban_ratchet.py --prune)",
-            file=err,
-        )
-        status = 1
-    if base is not None:
-        base_ledger = read_base_ledger(root, base)
-        if base_ledger is None:
-            print(f"spec_ban_ratchet: {base} predates the ledger; shrink check starts here", file=out)
-        else:
-            grown = shrink_violations(ledger, base_ledger)
-            for (rule, path, token, url), k in sorted(grown.items()):
-                print(
-                    f"error: {LEDGER_REL}: line not in the ledger at {base} (x{k}): "
-                    f"{rule}\t{path}\t{token}\t{url} -- the ledger only accepts deletions",
-                    file=err,
-                )
-                status = 1
+def run_check(root: Path, out=sys.stdout, err=sys.stderr) -> int:
+    hits, files_read = scan(root)
+    for rule, path, token, ln, src in hits:
+        print(f"error: {path}:{ln}: [{rule}] {token} -- SPEC violation: {src}", file=err)
     by_rule = Counter(h[0] for h in hits)
     summary = ", ".join(f"{r}={by_rule.get(r, 0)}" for r in RULES)
-    print(f"spec_ban_ratchet: {len(hits)} tracked hits ({summary}); "
-          f"{len(new)} new, {sum(stale.values())} stale", file=out)
-    return status
-
-
-def prune(root: Path, ledger_path: Path) -> int:
-    """Delete stale ledger lines. Never adds a line."""
-    text = ledger_path.read_text(encoding="utf-8")
-    parse_ledger(text, str(ledger_path))
-    have = Counter((h[0], h[1], h[2]) for h in scan(root))
-    kept, dropped = [], 0
-    for line in text.split("\n"):
-        cols = line.split("\t")
-        if line.startswith("#") or len(cols) != 4:
-            kept.append(line)
-            continue
-        key = tuple(cols[:3])
-        if have[key] > 0:
-            have[key] -= 1
-            kept.append(line)
-        else:
-            dropped += 1
-    ledger_path.write_text("\n".join(kept), encoding="utf-8")
-    print(f"spec_ban_ratchet: pruned {dropped} stale line(s)")
+    print(f"spec_ban_scan: read {files_read} production file(s); "
+          f"{len(hits)} hit(s) ({summary})", file=out)
+    if hits:
+        print(
+            f"\n{len(hits)} SPEC violation(s). The bar is zero: there is no ledger and no "
+            f"allowance file, and moving a hit to another production file does not clear it. "
+            f"Derive the quantity where it stands, or refuse. Lifting a literal into a named "
+            f"constant only hides it from this scan.",
+            file=err,
+        )
+        return 1
     return 0
 
 
@@ -768,21 +669,24 @@ def positive_control(out=sys.stdout, err=sys.stderr) -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default=str(Path(__file__).resolve().parent.parent))
-    ap.add_argument("--ledger", default=None)
-    ap.add_argument("--base", default=None, help="revision whose ledger this one may only shrink from")
-    ap.add_argument("--positive-control", action="store_true")
-    ap.add_argument("--prune", action="store_true", help="delete stale ledger lines, then exit")
+    ap.add_argument("--positive-control", action="store_true",
+                    help="run only the planted-violation control and stop")
     args = ap.parse_args(argv)
     root = Path(args.root).resolve()
-    ledger_path = Path(args.ledger) if args.ledger else root / LEDGER_REL
     try:
+        # The control runs before every scan, not only under its own flag: with no
+        # ledger there are no known-offending inputs in the tree, so this is the
+        # only thing standing between a clean tree's green and a dead detector's.
+        if positive_control() != 0:
+            raise CannotMeasure(
+                "the planted violations above were not all detected; this run says "
+                "nothing about the tree"
+            )
         if args.positive_control:
-            return positive_control()
-        if args.prune:
-            return prune(root, ledger_path)
-        return run_check(root, ledger_path, args.base)
+            return 0
+        return run_check(root)
     except CannotMeasure as exc:
-        print(f"spec_ban_ratchet: cannot measure: {exc}", file=sys.stderr)
+        print(f"spec_ban_scan: cannot measure: {exc}", file=sys.stderr)
         return 2
 
 

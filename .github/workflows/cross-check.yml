@@ -143,13 +143,11 @@ jobs:
   # Rustdoc had no CI job at all (#2711): nothing in `.github/` ran `cargo doc`
   # or `rustdoc`, so a surface that exits 101 was dark by omission while
   # `docs.yml` -- mkdocs, ~50s, nightly -- was green and said nothing about it.
-  # It landed (#2711) as a RATCHET against a ledger of 15 known-red crates,
-  # because zero was unreachable that day. #2753 measured the real tree -- 754
-  # rustdoc errors across 15 crates, four times the 182 the issue quoted -- and
-  # fixed every one, so the ledger is gone and the bar is ZERO for every crate.
-  # A ratchet at N licenses the N+1'th; see scripts/rustdoc_gate.sh for the
-  # coverage control that keeps a green from being a non-run now that there are
-  # no known-failing crates left to act as the positive control.
+  # The bar is ZERO for every crate, with no list of tolerated ones: #2753
+  # measured the real tree -- 754 rustdoc errors across 15 crates, four times
+  # the 182 the issue quoted -- and fixed every one. See scripts/rustdoc_gate.sh
+  # for the coverage control that keeps a green from being a non-run now that
+  # there are no known-failing crates left to act as the positive control.
   #
   # WHY ITS OWN JOB, AND NOT A STEP IN `linux-native-check`.
   # It was first added as a step there, on the reasoning that the workspace
@@ -199,12 +197,11 @@ jobs:
   # predicts the other. The rustdoc job's green must not be read as covering
   # this one, which is why they are two jobs with two names.
   #
-  # It lands as a ZERO BAR rather than a ledger-ratchet because the debt it was
-  # designed against is gone. The workspace census (run 30696464338, 24 crates,
-  # 1h39m) measured 25 failing doctests across gam-solve (12), gam-terms (8),
-  # gam-models (3) and gam-sae (2); every one was an indented ASCII-math block
-  # in a `///` comment that rustdoc was compiling as Rust, and all 25 are fenced
-  # as text now. A ledger with nothing in it is not a ratchet.
+  # Its bar is ZERO, with no list of tolerated crates. The workspace census (run
+  # 30696464338, 24 crates, 1h39m) measured 25 failing doctests across gam-solve
+  # (12), gam-terms (8), gam-models (3) and gam-sae (2); every one was an
+  # indented ASCII-math block in a `///` comment that rustdoc was compiling as
+  # Rust, and all 25 are fenced as text now.
   #
   # WHY ITS OWN JOB. Same reasoning that split the rustdoc gate out
   # (`893cbc6aa`): `cargo test --doc` is the HEAVIER of the two, because it

@@ -67,7 +67,6 @@ FOREIGN_EXPORT = re.compile(r"\b(?:no_mangle|export_name|pyfunction|pymethods|py
 FOREIGN_EXPORT_CRATE = "crates/gam-pyffi/"
 PYTHON_ROOT = "gamfit"
 ROOTS = ("crates", "src", "tests", "examples", "bench", "benches")
-LEDGER = "scripts/src_items_used_only_by_tests_ledger.txt"
 CLASSES = {"test_only": "test-only", "unreferenced": "unreferenced"}
 # At 439a62e76 main was red under `-D warnings` on exactly these three `pub(crate)`
 # wrappers, whose only callers were `#[cfg(test)]` code. Re-measuring them is how a
@@ -232,25 +231,8 @@ def scan(files, include_public=False):
     return report
 
 
-def ledger_lines(report):
+def finding_lines(report):
     return sorted(f"{CLASSES[kind]} {entry['identity']}" for kind in CLASSES for entry in report[kind])
-
-
-def read_ledger(path):
-    """Recorded findings, one `<class> <identity>` per line, sorted and unique."""
-    entries = [raw.split("#", 1)[0].strip() for raw in path.read_text(encoding="utf-8").splitlines()]
-    entries = [entry for entry in entries if entry]
-    if len(set(entries)) != len(entries):
-        raise ValueError("the ledger records the same finding twice")
-    if entries != sorted(entries):
-        raise ValueError("the ledger is not sorted; keep it in one canonical order")
-    return entries
-
-
-def ratchet(report, recorded):
-    """(regressions, stale): findings missing from the ledger, and ledger lines no longer found."""
-    found, known = set(ledger_lines(report)), set(recorded)
-    return sorted(found - known), sorted(known - found)
 
 
 def positive_control(root):
@@ -265,7 +247,6 @@ def positive_control(root):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--head", default="HEAD", help="immutable revision whose tree is scanned")
-    parser.add_argument("--ledger", type=Path, help=f"ratchet against a committed ledger, normally {LEDGER}")
     parser.add_argument("--output", type=Path, help="write the report as JSON")
     parser.add_argument("--include-public", action="store_true",
                         help="also report bare `pub` items only tests name; a re-export is not a consumer")
@@ -283,16 +264,10 @@ def main(argv=None):
     if args.output is not None:
         args.output.write_text(json.dumps(dict(report, revision=head), indent=2, sort_keys=True) + "\n")
     print(f"{head[:9]}: {len(report['test_only'])} test-only, {len(report['unreferenced'])} unreferenced")
-    if args.ledger is None:
-        for line in ledger_lines(report):
-            print(f"  {line}")
-        return 1 if report["test_only"] or report["unreferenced"] else 0
-    regressions, stale = ratchet(report, read_ledger(args.ledger))
-    for line in regressions:
-        print(f"  NEW   {line}", file=sys.stderr)
-    for line in stale:
-        print(f"  GONE  {line} (delete this line from {args.ledger.name} in the same commit)", file=sys.stderr)
-    return 1 if regressions or stale else 0
+    # The bar is zero: every finding fails, and there is no list of tolerated ones.
+    for line in finding_lines(report):
+        print(f"  {line}")
+    return 1 if report["test_only"] or report["unreferenced"] else 0
 
 
 if __name__ == "__main__":

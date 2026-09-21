@@ -365,63 +365,27 @@ class StripSourceCrossesLines(unittest.TestCase):
             self.assertEqual(len(raw), len(stripped))
 
 
-class TheLedgerRatchet(unittest.TestCase):
-    """The ratchet that made the tree scan enforceable while offenders remain.
-
-    A gate demanding zero would have been red on arrival with 19 offenders, and
-    a gate that is red on arrival is ignored. Both directions have to fire or
-    the ledger rots into a rubber stamp.
-    """
+class TheZeroBar(unittest.TestCase):
+    """Any assertion-less `#[test]` in the tree is reported; none is tolerated."""
 
     PRINTS_ONLY = "#[test]\nfn print_only() {\n    println!(\"x\");\n}\n"
     ASSERTS = "#[test]\nfn print_only() {\n    assert_eq!(1, 1);\n}\n"
 
-    def _repo(self, source: str, ledger: str):
+    def _repo(self, source: str):
         root = Path(tempfile.mkdtemp())
         (root / "src").mkdir()
         (root / "src" / "lib.rs").write_text(source)
-        ledger_path = root / "ledger.txt"
-        ledger_path.write_text(ledger)
-        return root, ledger_path
+        return root
 
-    def test_a_recorded_offender_is_accepted(self):
-        root, ledger = self._repo(self.PRINTS_ONLY, "src/lib.rs::print_only\n")
-        self.assertEqual(gate.check_ledger(root, ledger), 0)
+    def test_an_offender_is_reported_with_its_path_and_line(self):
+        offenders = list(gate.scan_tree(self._repo(self.PRINTS_ONLY)))
+        self.assertEqual([(rel, line) for rel, line, _ in offenders], [("src/lib.rs", 2)])
 
-    def test_an_unrecorded_offender_is_a_regression(self):
-        root, ledger = self._repo(self.PRINTS_ONLY, "src/other.rs::something_else\n")
-        self.assertEqual(gate.check_ledger(root, ledger), 1)
-
-    def test_a_recorded_test_that_now_asserts_makes_the_ledger_stale(self):
-        """The direction that keeps the ratchet from rotting, and the scan's
-        own positive control: a scan that measured nothing reports exactly this."""
-        root, ledger = self._repo(self.ASSERTS, "src/lib.rs::print_only\n")
-        self.assertEqual(gate.check_ledger(root, ledger), 1)
-
-    def test_an_empty_ledger_cannot_certify_anything(self):
-        root, ledger = self._repo(self.ASSERTS, "# nothing recorded\n")
-        self.assertEqual(gate.check_ledger(root, ledger), 2)
-
-    def test_an_unsorted_ledger_is_refused(self):
-        root, ledger = self._repo(self.PRINTS_ONLY, "src/z.rs::b\nsrc/a.rs::a\n")
-        self.assertEqual(gate.check_ledger(root, ledger), 2)
-
-    def test_a_duplicated_entry_is_refused(self):
-        root, ledger = self._repo(self.PRINTS_ONLY, "src/lib.rs::print_only\nsrc/lib.rs::print_only\n")
-        self.assertEqual(gate.check_ledger(root, ledger), 2)
-
-    def test_a_missing_ledger_is_refused(self):
-        root, ledger = self._repo(self.PRINTS_ONLY, "src/lib.rs::print_only\n")
-        self.assertEqual(gate.check_ledger(root, ledger.parent / "absent.txt"), 2)
-
-    def test_identity_is_the_function_name_not_the_line(self):
-        self.assertEqual(
-            gate.identity("a/b.rs", "fn zz_measure_thing() {"), "a/b.rs::zz_measure_thing"
-        )
+    def test_a_tree_whose_tests_assert_reports_nothing(self):
+        self.assertEqual(list(gate.scan_tree(self._repo(self.ASSERTS))), [])
 
     def test_this_tree_has_no_assertion_less_tests(self):
-        """The wired gate, run against the repository it guards. The ledger was
-        deleted with its last entry, so the tree must reach zero."""
+        """The wired gate, run against the repository it guards."""
         repo = Path(__file__).resolve().parents[2]
         self.assertEqual(list(gate.scan_tree(repo)), [])
 

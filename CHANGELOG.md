@@ -1,5 +1,29 @@
 ## Unreleased
 
+- **Every check that compared the tree against a list of tolerated offenders is deleted, and
+  the bar is zero** (gam#2469, gam#2899, gam#2902).
+  `scripts/spec_ban_ratchet.py` compared the tree against `scripts/spec_ban_ledger.tsv`, a
+  53-line list of SPEC violations CI accepted for as long as the list only shrank. A list at
+  N licenses the N+1'th, and a line nobody is obliged to delete is a violation nobody is
+  obliged to fix, so the list and the machinery that read it are gone.
+  `scripts/spec_ban_scan.py` runs the same nine rules (grid, box, jitter, unconverged, magic,
+  fd, gcv, python-math, roundoff) over the same production-only file set with the same test
+  mask, and exits 1 on ANY hit, printing `file:line`, the rule and the token. There is no
+  `--base`, no `--prune` and no allowance file. The ledger had also been the scan's positive
+  control -- its lines were known-offending inputs, so a scan that silently measured nothing
+  reported them clean and failed loudly -- so the planted-violation control now runs before
+  every scan rather than only under its own flag, a root with no production Rust source is
+  refused instead of reported clean, and the run prints how many files it read. The 53
+  violations the ledger tolerated are fixed at the root separately; until every one is gone
+  this scan is red, which is what a bar of zero means.
+  `scripts/doctest_ratchet.sh` becomes `scripts/doctest_census.sh`: the dispatch-only
+  per-crate attribution it was actually used for is kept, and the ledger-gate mode, which
+  needed a ledger that was never written, is deleted. `scripts/rustdoc_ratchet.sh` and
+  `scripts/rustdoc_red_crates.txt` are deleted outright -- `scripts/rustdoc_gate.sh` has
+  demanded zero for every crate since #2753 and nothing called either file.
+  `scripts/assertionless_tests.py` and `scripts/src_items_used_only_by_tests.py` lose their
+  `--ledger` modes, leaving the zero-demanding scan as the only mode each has.
+
 ## gamfit 0.1.269 (2026-09-21)
 
 - A Bernoulli marginal-slope prediction table carries `mean_score_derivative`

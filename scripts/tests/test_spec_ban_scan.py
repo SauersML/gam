@@ -1,25 +1,22 @@
 import importlib.util
 import io
 from pathlib import Path
-import subprocess
 import tempfile
 import textwrap
 import unittest
 
 
 REPO = Path(__file__).resolve().parents[2]
-SPEC = importlib.util.spec_from_file_location("spec_ban_ratchet", REPO / "scripts" / "spec_ban_ratchet.py")
-ratchet = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(ratchet)
-
-ISSUE = "https://github.com/SauersML/gam/issues/1"
+SPEC = importlib.util.spec_from_file_location("spec_ban_scan", REPO / "scripts" / "spec_ban_scan.py")
+scanner = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(scanner)
 
 
 def tokens(rule, rust):
     """Tokens `rule` reports for production Rust source (test regions masked)."""
-    stripped = ratchet.strip_rust(textwrap.dedent(rust)).split("\n")
-    text = "\n".join("" if t else s for s, t in zip(stripped, ratchet.test_mask(stripped)))
-    return [t for _, t in ratchet.RUST_RULES[rule](text)]
+    stripped = scanner.strip_rust(textwrap.dedent(rust)).split("\n")
+    text = "\n".join("" if t else s for s, t in zip(stripped, scanner.test_mask(stripped)))
+    return [t for _, t in scanner.RUST_RULES[rule](text)]
 
 
 def write(root, files):
@@ -29,21 +26,12 @@ def write(root, files):
         p.write_text(textwrap.dedent(text))
 
 
-def git(root, *args):
-    subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
-
-
-def commit(root, files):
-    write(root, files)
-    git(root, "add", "-A")
-    git(root, "-c", "user.name=ratchet", "-c", "user.email=ratchet@example.invalid", "commit", "-q", "-m", "rev")
-
-
-def check(root, base=None):
+def check(root):
+    """(exit code, stderr) of one scan, with 2 carrying the reason it could not run."""
     out, err = io.StringIO(), io.StringIO()
     try:
-        rc = ratchet.run_check(root, root / ratchet.LEDGER_REL, base, out=out, err=err)
-    except ratchet.CannotMeasure as exc:
+        rc = scanner.run_check(root, out=out, err=err)
+    except scanner.CannotMeasure as exc:
         return 2, str(exc)
     return rc, err.getvalue()
 
@@ -54,20 +42,25 @@ VIOLATING_LIB = """
         raw
     }
 """
-LEDGER_LINE = f"magic\tcrates/demo/src/lib.rs\t< 1e-9\t{ISSUE}\n"
+CLEAN_LIB = """
+    pub fn step(raw: f64) -> f64 {
+        if raw.abs() < f64::EPSILON { return 0.0; }
+        raw
+    }
+"""
 
 
 class Stripping(unittest.TestCase):
     def test_comments_strings_and_chars_are_blanked_with_columns_kept(self):
         src = 'let a = "x < 1e-9"; // g < 1e-9\n/* outer /* inner */ < 1e-9 */ let c = \'{\';\nlet r = r#"1e-9 "q""#;'
-        out = ratchet.strip_rust(src)
+        out = scanner.strip_rust(src)
         self.assertEqual([len(l) for l in out.split("\n")], [len(l) for l in src.split("\n")])
         self.assertNotIn("1e-9", out)
         self.assertNotIn("{", out)
         self.assertIn("let c", out)
 
     def test_lifetimes_are_not_char_literals(self):
-        out = ratchet.strip_rust("fn f<'a>(x: &'a [f64]) -> f64 { x[0] < 1e-9 }")
+        out = scanner.strip_rust("fn f<'a>(x: &'a [f64]) -> f64 { x[0] < 1e-9 }")
         self.assertIn("1e-9", out)
 
 
@@ -82,7 +75,7 @@ class TestMask(unittest.TestCase):
             }
             fn after() {}
         """).split("\n")
-        mask = ratchet.test_mask(ratchet.strip_rust("\n".join(src)).split("\n"))
+        mask = scanner.test_mask(scanner.strip_rust("\n".join(src)).split("\n"))
         masked = {line.strip() for line, t in zip(src, mask) if t}
         self.assertIn("fn t() {}", masked)
         self.assertNotIn("fn live() { let a = 1; }", masked)
@@ -90,10 +83,10 @@ class TestMask(unittest.TestCase):
 
     def test_gated_mod_declaration_gates_only_itself(self):
         src = ["#[cfg(test)]", "mod tests;", "fn live() {", "}"]
-        self.assertEqual(ratchet.test_mask(src), [True, True, False, False])
+        self.assertEqual(scanner.test_mask(src), [True, True, False, False])
 
     def test_inner_cfg_test_masks_whole_file(self):
-        self.assertEqual(ratchet.test_mask(["#![cfg(test)]", "fn f() {}"]), [True, True])
+        self.assertEqual(scanner.test_mask(["#![cfg(test)]", "fn f() {}"]), [True, True])
 
     def test_test_gated_module_file_is_dropped(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -105,7 +98,7 @@ class TestMask(unittest.TestCase):
                 "crates/demo/src/live.rs": "pub fn f(g: f64) -> bool { g < 1e-9 }\n",
                 "crates/gam-test-support/src/lib.rs": "pub fn f(g: f64) -> bool { g < 1e-9 }\n",
             })
-            self.assertEqual(sorted(ratchet.production_rust(root)),
+            self.assertEqual(sorted(scanner.production_rust(root)),
                              ["crates/demo/src/lib.rs", "crates/demo/src/live.rs"])
 
 
@@ -196,15 +189,14 @@ class Rules(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write(root, {
-                "crates/demo/src/lib.rs": VIOLATING_LIB,
-                ratchet.ROUNDOFF_OWNER: "pub const UNIT_ROUNDOFF: f64 = f64::EPSILON / 2.0;\n",
-                ratchet.LEDGER_REL: LEDGER_LINE,
+                "crates/demo/src/lib.rs": CLEAN_LIB,
+                scanner.ROUNDOFF_OWNER: "pub const UNIT_ROUNDOFF: f64 = f64::EPSILON / 2.0;\n",
             })
             self.assertEqual(check(root)[0], 0)
             write(root, {"crates/demo/src/band.rs": "pub fn u() -> f64 { f64::EPSILON / 2.0 }\n"})
             rc, err = check(root)
             self.assertEqual(rc, 1)
-            self.assertIn("[roundoff] f64::EPSILON / 2.0 -- new SPEC violation", err)
+            self.assertIn("[roundoff] f64::EPSILON / 2.0 -- SPEC violation", err)
 
     def test_python_math(self):
         src = textwrap.dedent('''
@@ -216,113 +208,73 @@ class Rules(unittest.TestCase):
                 s = "torch.linalg.qr"
                 return torch.linalg.svd(a)
         ''')
-        found = [t for _, t in ratchet.rule_python_math(ratchet.python_code_only(src))]
+        found = [t for _, t in scanner.rule_python_math(scanner.python_code_only(src))]
         self.assertEqual(found, ["from scipy.optimize import", "torch.linalg.svd"])
 
     def test_positive_control_passes(self):
-        self.assertEqual(ratchet.positive_control(out=io.StringIO(), err=io.StringIO()), 0)
+        self.assertEqual(scanner.positive_control(out=io.StringIO(), err=io.StringIO()), 0)
 
 
-class Ledger(unittest.TestCase):
-    def test_malformed_ledger_cannot_measure(self):
-        for bad in ("magic\tp\tt\n", f"nope\tp\tt\t{ISSUE}\n", "magic\tp\tt\thttps://example.com/1\n"):
-            with self.assertRaises(ratchet.CannotMeasure):
-                ratchet.parse_ledger(bad, "ledger")
+class ZeroBar(unittest.TestCase):
+    """The bar is zero, so there is nothing for a hit to be excused by."""
 
-    def test_compare_reports_new_and_stale_as_multisets(self):
-        hits = [("magic", "a.rs", "< 1e-9", 3, ""), ("magic", "a.rs", "< 1e-9", 9, "")]
-        ledger = ratchet.parse_ledger(f"magic\ta.rs\t< 1e-9\t{ISSUE}\nbox\tb.rs\tconst X_STEP_CAP\t{ISSUE}\n", "l")
-        new, stale = ratchet.compare(hits, ledger)
-        self.assertEqual([h[3] for h in new], [9])
-        self.assertEqual(dict(stale), {("box", "b.rs", "const X_STEP_CAP"): 1})
-
-    def test_tree_must_equal_ledger(self):
+    def test_a_clean_tree_passes_and_one_violation_fails_naming_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            write(root, {"crates/demo/src/lib.rs": CLEAN_LIB})
+            self.assertEqual(check(root), (0, ""))
             write(root, {"crates/demo/src/lib.rs": VIOLATING_LIB})
-            self.assertEqual(check(root)[0], 2)  # no ledger
-            write(root, {ratchet.LEDGER_REL: "# only a comment\n"})
-            self.assertEqual(check(root)[0], 2)  # empty ledger certifies nothing
-            write(root, {ratchet.LEDGER_REL: LEDGER_LINE})
-            self.assertEqual(check(root)[0], 0)
-            write(root, {"crates/demo/src/lib.rs": VIOLATING_LIB + "pub fn g(x: f64) -> f64 { x.max(1e-12) }\n"})
             rc, err = check(root)
             self.assertEqual(rc, 1)
-            self.assertIn("[magic] .max(1e-12) -- new SPEC violation", err)
-            write(root, {"crates/demo/src/lib.rs": "pub fn g(x: f64) -> f64 { x }\n"})
-            rc, err = check(root)
-            self.assertEqual(rc, 2)  # zero hits anywhere: the scanner, not the tree, is suspect
-            write(root, {"crates/demo/src/other.rs": "pub fn g(x: f64) -> bool { x < 1e-3 }\n"})
-            rc, err = check(root)
-            self.assertEqual(rc, 1)
-            self.assertIn("stale entry", err)
-            self.assertIn("new SPEC violation", err)
+            self.assertIn("crates/demo/src/lib.rs:3: [magic] < 1e-9 -- SPEC violation", err)
 
-    def test_prune_only_deletes(self):
+    def test_every_hit_is_reported_not_just_the_last(self):
+        """A ledgered scan reported only the unaccounted-for hits; this reports all."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write(root, {
                 "crates/demo/src/lib.rs": VIOLATING_LIB,
-                ratchet.LEDGER_REL: "# header\n" + LEDGER_LINE + f"box\tcrates/demo/src/lib.rs\tclamp(+-2.0)\t{ISSUE}\n",
+                "crates/demo/src/other.rs": "pub fn g(x: f64) -> f64 { x.max(1e-12) }\n",
             })
-            ratchet.prune(root, root / ratchet.LEDGER_REL)
-            self.assertEqual((root / ratchet.LEDGER_REL).read_text(), "# header\n" + LEDGER_LINE)
-            self.assertEqual(check(root)[0], 0)
+            rc, err = check(root)
+            self.assertEqual(rc, 1)
+            self.assertIn("crates/demo/src/lib.rs:3: [magic] < 1e-9", err)
+            self.assertIn("crates/demo/src/other.rs:1: [magic] .max(1e-12)", err)
+            self.assertIn("2 SPEC violation(s)", err)
 
-    def test_ledger_only_shrinks_against_base(self):
+    def test_moving_a_violation_to_another_file_does_not_clear_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            git(root, "init", "-q")
-            commit(root, {"README": "x\n"})
-            write(root, {"crates/demo/src/lib.rs": VIOLATING_LIB, ratchet.LEDGER_REL: LEDGER_LINE})
-            rc, _ = check(root, "HEAD")
-            self.assertEqual(rc, 0)  # the base predates the ratchet: introduction passes
-            commit(root, {ratchet.SCRIPT_REL: "# ratchet\n", ratchet.LEDGER_REL: LEDGER_LINE,
-                          "crates/demo/src/lib.rs": VIOLATING_LIB})
-            self.assertEqual(check(root, "HEAD")[0], 0)
-
-            # adding a violation together with its ledger line is refused
-            grown = VIOLATING_LIB + "pub fn g(x: f64) -> f64 { x.max(1e-12) }\n"
-            write(root, {"crates/demo/src/lib.rs": grown, ratchet.LEDGER_REL:
-                         LEDGER_LINE + f"magic\tcrates/demo/src/lib.rs\t.max(1e-12)\t{ISSUE}\n"})
-            rc, err = check(root, "HEAD")
+            write(root, {"crates/demo/src/lib.rs": "mod moved;\n", "crates/demo/src/moved.rs": VIOLATING_LIB})
+            rc, err = check(root)
             self.assertEqual(rc, 1)
-            self.assertIn("the ledger only accepts deletions", err)
+            self.assertIn("crates/demo/src/moved.rs:3: [magic] < 1e-9", err)
 
-            # moving a violation to another file is a new line, so it is refused too
-            write(root, {"crates/demo/src/lib.rs": "mod moved;\npub fn f(g: f64) -> f64 { g.max(1e-12) }\n",
-                         "crates/demo/src/moved.rs": VIOLATING_LIB,
-                         ratchet.LEDGER_REL: f"magic\tcrates/demo/src/moved.rs\t< 1e-9\t{ISSUE}\n"
-                                             f"magic\tcrates/demo/src/lib.rs\t.max(1e-12)\t{ISSUE}\n"})
-            self.assertEqual(check(root, "HEAD")[0], 1)
+    def test_a_root_with_no_production_source_cannot_measure(self):
+        """Zero hits over an empty root prints the same green as zero hits over the tree."""
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, why = check(Path(tmp))
+            self.assertEqual(rc, 2)
+            self.assertIn("no production Rust source", why)
 
-            # deleting the fixed line is accepted
-            commit(root, {"crates/demo/src/lib.rs": grown, ratchet.LEDGER_REL:
-                          LEDGER_LINE + f"magic\tcrates/demo/src/lib.rs\t.max(1e-12)\t{ISSUE}\n"})
-            (root / "crates/demo/src/moved.rs").unlink()
-            write(root, {"crates/demo/src/lib.rs": "pub fn g(x: f64) -> f64 { x.max(1e-12) }\n",
-                         ratchet.LEDGER_REL: f"magic\tcrates/demo/src/lib.rs\t.max(1e-12)\t{ISSUE}\n"})
-            self.assertEqual(check(root, "HEAD")[0], 0)
-
-            # a base with the script but no ledger cannot be measured, and neither can a bogus revision
-            git(root, "rm", "-q", "-f", ratchet.LEDGER_REL)
-            git(root, "-c", "user.name=r", "-c", "user.email=r@example.invalid", "commit", "-q", "-m", "drop")
-            write(root, {ratchet.LEDGER_REL: f"magic\tcrates/demo/src/lib.rs\t.max(1e-12)\t{ISSUE}\n"})
-            self.assertEqual(check(root, "HEAD")[0], 2)
-            self.assertEqual(check(root, "no-such-rev")[0], 2)
+    def test_a_dead_detector_cannot_measure(self):
+        """The planted controls are the only thing that tells a clean tree from a dead scan."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, {"crates/demo/src/lib.rs": CLEAN_LIB})
+            live = scanner.RUST_RULES["magic"]
+            scanner.RUST_RULES["magic"] = lambda text: []
+            try:
+                self.assertEqual(scanner.main(["--root", str(root)]), 2)
+            finally:
+                scanner.RUST_RULES["magic"] = live
+            self.assertEqual(scanner.main(["--root", str(root)]), 0)
 
 
 class RealTree(unittest.TestCase):
-    def test_repository_agrees_with_its_ledger(self):
+    def test_the_repository_holds_no_SPEC_violation(self):
         rc, err = check(REPO)
         self.assertEqual(rc, 0, err)
-
-    def test_every_ledger_line_is_a_distinct_well_formed_entry(self):
-        text = (REPO / ratchet.LEDGER_REL).read_text(encoding="utf-8")
-        ledger = ratchet.parse_ledger(text, ratchet.LEDGER_REL)
-        self.assertGreater(sum(ledger.values()), 0)
-        body = [l for l in text.split("\n") if l and not l.startswith("#")]
-        self.assertEqual(body, sorted(body), "keep the ledger sorted so deletions diff cleanly")
 
 
 if __name__ == "__main__":
