@@ -220,6 +220,9 @@ fn fixed_point_json(report: &SaeSupportFixedPointReport, tolerance: f64) -> serd
         "newton_decrement_sq": report.newton_displacement.decrement_sq,
         "max_recurrence_change": report.max_recurrence_change,
         "recurred": report.recurred,
+        // #3258: periodic atoms whose phase the certificate could not place within the
+        // tolerance; every phase-invariant output is certified, their phases are not.
+        "phase_unresolved_atoms": report.phase_unresolved_atoms,
         "tolerance": tolerance,
     })
 }

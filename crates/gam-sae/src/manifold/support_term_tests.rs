@@ -2132,6 +2132,9 @@ fn a_symmetry_the_certificate_is_not_given_is_refused_2576() {
             .support_exact_symmetry_generators(&ard, &offsets, beta_dim)
             .expect("generators");
         assert!(!generators.is_empty(), "{name}: the fixture declares its symmetry");
+        let phase_orbits = term
+            .support_phase_orbits(&ard, &offsets, beta_dim, bound)
+            .expect("phase orbits");
         let admitted = term
             .support_kantorovich_certificate_on_slice(
                 target.view(),
@@ -2140,6 +2143,7 @@ fn a_symmetry_the_certificate_is_not_given_is_refused_2576() {
                 &newton,
                 bound,
                 &generators,
+                &phase_orbits,
             )
             .expect("certificate on the declared slice");
         assert!(
@@ -2153,6 +2157,7 @@ fn a_symmetry_the_certificate_is_not_given_is_refused_2576() {
                 &ard,
                 &newton,
                 bound,
+                &[],
                 &[],
             )
             .expect("certificate without the quotient")
@@ -2307,3 +2312,6 @@ fn sphere_rows_certify_the_tangent_coordinate_gradient_4006() {
         "row {stationary_row} is not a constrained stationary point with a residual (ambient KKT {ambient_max:.3e})"
     );
 }
+
+#[path = "support_term_phase_3258_tests.rs"]
+mod phase_3258;
