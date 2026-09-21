@@ -1584,7 +1584,7 @@ mod frozen_factor_level_collection_tests {
 
 #[cfg(test)]
 mod operator_chart_tests {
-    use super::{charted_operator_gram, operator_chart_scale};
+    use super::{charted_operator, operator_chart_scale};
     use ndarray::Array2;
 
     /// A well-scaled operator is not charted at all, and its Gram is the same
@@ -1597,7 +1597,8 @@ mod operator_chart_tests {
             ((row + 1) as f64).sqrt() - 0.25 * col as f64
         });
         assert_eq!(operator_chart_scale(&operator), 1.0);
-        let charted = charted_operator_gram(&operator);
+        let factor = charted_operator(&operator);
+        let charted = factor.t().dot(&factor);
         let plain = operator.t().dot(&operator);
         for (a, b) in charted.iter().zip(plain.iter()) {
             assert_eq!(a.to_bits(), b.to_bits(), "charted {a} vs unscaled {b}");
@@ -1625,7 +1626,8 @@ mod operator_chart_tests {
             plain.iter().all(|value| *value == 0.0),
             "the fixture must reproduce the underflow it exists for: {plain:?}"
         );
-        let charted = charted_operator_gram(&tiny);
+        let factor = charted_operator(&tiny);
+        let charted = factor.t().dot(&factor);
         let norm = charted.iter().map(|v| v * v).sum::<f64>().sqrt();
         assert!(
             norm.is_finite() && norm > 0.0,

@@ -478,9 +478,10 @@ fn coverage_cell(scenario: Scenario, seed_index: usize, n: usize, size_index: us
         .map(|r| {
             let seed = base + r;
             replicate(scenario, n, seed)
-                .unwrap_or_else(|error| panic!("{scenario:?} n={n} seed={seed}: {error}"))
+                .map_err(|error| format!("{scenario:?} n={n} seed={seed}: {error}"))
         })
-        .collect();
+        .collect::<Result<Vec<Replicate>, String>>()
+        .expect("every replicate of the coverage cell fits");
     let mut failures = Vec::new();
     let mut refits = Vec::new();
     let mut tallies: std::collections::BTreeMap<(&str, usize), (usize, usize)> = Default::default();
