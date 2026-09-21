@@ -3524,5 +3524,21 @@
     ],
     "reason": "#3572: HYPER_MAX_DENSE_WORK and LINK_EXT_MAX_DENSE_WORK were n*p > 50_000_000 magic cut-offs that silently replaced the psi/tau hyper-coordinate pair with HyperCoordPair::zero() and returned an empty link-ext coordinate list for the SAS and mixture links, so the outer optimizer received a rho-sized gradient for a theta that also carries psi/tau/link coordinates (a dropped derivative, not an approximation). A design too large to densify is now refused with a typed DensificationRefused error by the memory-governor policy in try_to_dense_arc (gam-linalg matrix/mod.rs) instead of being dropped. HyperCoordPair::zero had no callers other than the two removed identity-pair early returns.",
     "evidence": "At base d5f641efbd, git grep -w finds HYPER_MAX_DENSE_WORK only at crates/gam-solve/src/reml/hyper.rs:1323-1324 (declaration and its single guard), LINK_EXT_MAX_DENSE_WORK only at hyper.rs:3045-3046 and 3247-3248 (the two SAS/mixture link-ext declarations and their guards), and HyperCoordPair::zero only at its definition in crates/gam-problem/src/lib.rs and its two calls at hyper.rs:1335 and 1340 inside the removed guard. focused-rust-proof run 35499295354 (issue key HN-12-3572-1) on this branch is green."
+  },
+  {
+    "base": "d027be231ca8fdf6f8104690ae68869486db51ab",
+    "items": [
+      "crates/gam-runtime/src/process_monitor.rs:fn:clock_ticks_per_second",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_io_bytes",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_io_bytes_valid_line",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_io_bytes_wrong_key_returns_none",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_count",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_count_valid_line",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_kb",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_kb_valid_line",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_kb_wrong_key_returns_none"
+    ],
+    "reason": "#4083: process_monitor.rs kept three copies of the /proc line parser (parse_status_kb and parse_status_count byte-identical, parse_io_bytes the same minus a no-op first-token split), a clock_ticks_per_second with an unreachable non-Linux 0.0 arm, and a CpuSampler last_cores fallback reachable only for a zero wall-clock delta; the heartbeat also labelled every average with the nominal interval instead of the measured window. parse_proc_value replaces the three parsers, CLOCK_TICKS_PER_SECOND replaces clock_ticks_per_second, and the five parser unit tests become parse_proc_value_reads_status_and_io_lines and parse_proc_value_wrong_key_returns_none, which keep every assertion; busy_cores_averages_over_the_measured_window is new.",
+    "evidence": "scripts/source_removal_guard.py with --base d027be231ca8fdf6f8104690ae68869486db51ab and head the change's commit lists exactly these removals, all private to crates/gam-runtime/src/process_monitor.rs. Read-proof at the head: git grep -w finds 0 occurrences of parse_status_count, parse_io_bytes and clock_ticks_per_second in crates/ tests/ examples/; parse_status_kb survives only as an unrelated local helper in crates/gam-sae/examples/scale_k.rs."
   }
 ]

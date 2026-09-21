@@ -150,6 +150,11 @@
   strength of an analytic penalty is its REML-selected log-weight (`weight="auto"`)
   or a fixed positive `weight`.
 
+- **Process-monitor CPU average names its real window** (#4083). The `[process-monitor]`
+  heartbeat printed every busy-core average as `(avg over 1m00s)` even when a failed
+  `/proc/self/stat` read or an early wakeup meant it covered a different span. It now prints
+  the measured window. The three identical `/proc` line parsers are now one.
+
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
   `μ̂ ≤ c₀·a²·(1−1/SNR)·(1−C_κκ)/K`, with the chosen constants `c₀ = 1` and
