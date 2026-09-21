@@ -3963,7 +3963,6 @@ impl FirstOrderObjective for OuterOperatorBridge<'_> {
             .eval_with_order(x, OuterEvalOrder::ValueAndGradient)
             .map_err(|err| into_objective_error("outer eval failed", err))?;
         let eval = finite_outer_first_order_eval_or_error("outer eval failed", self.layout, eval)?;
-        let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
         self.last_value_grad_rho = Some(x.clone());
         Ok(FirstOrderSample {
             value: eval.cost,

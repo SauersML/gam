@@ -13,6 +13,7 @@ fn test_config() -> OuterConfig {
         problem_size: OuterProblemSize {
             n_obs: Some(100),
             p_coefficients: Some(5),
+            information_count: None,
         },
         ..OuterConfig::default()
     }

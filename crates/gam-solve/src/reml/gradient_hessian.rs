@@ -9264,7 +9264,7 @@ mod firth_hessian_direction_reuse_tests {
 }
 
 #[cfg(test)]
-mod single_fidelity_inner_solve_tests_3536 {
+mod tests_single_fidelity_inner_solve_3536 {
     use super::super::super::RemlConfig;
     use super::super::super::tests::{binomial_logit_glm_spec, build_logit_state};
     use super::BundleRows;

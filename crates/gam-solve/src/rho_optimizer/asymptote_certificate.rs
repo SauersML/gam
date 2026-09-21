@@ -618,8 +618,8 @@ mod asymptote_certificate_tests {
     /// band beside a rail, or a curved region) is not a settled tail.
     #[test]
     fn drifting_constant_is_rejected_as_not_settling() {
-        let rhos = [-9.0, -9.5, -10.0, -10.5];
-        let cs = [6723.0, 6731.0, 9111.0, 4200.0];
+        let rhos = [-9.0_f64, -9.5, -10.0, -10.5];
+        let cs = [6723.0_f64, 6731.0, 9111.0, 4200.0];
         let mut w = AsymptoteWindow::with_capacity(4);
         for (&rho, &c) in rhos.iter().zip(cs.iter()) {
             let grad = c * rho.exp();
