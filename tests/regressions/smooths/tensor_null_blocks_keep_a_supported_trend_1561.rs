@@ -54,15 +54,17 @@ fn tensor_null_blocks_keep_a_supported_trend_and_shrink_absent_ones() {
         panic!("expected a standard Poisson fit");
     };
     let log_lambdas: Vec<f64> = fit.fit.log_lambdas.iter().copied().collect();
-    // Two margin roughness coordinates, then one null ridge per block retained
-    // by the sum-to-zero chart, in block order: x trend, z trend, x·z trend.
+    // Four margin roughness coordinates (each margin's roughness through the
+    // other margin's null functions and through their complement, #3951), then
+    // one null ridge per block retained by the sum-to-zero chart, in block
+    // order: x trend, z trend, x·z trend.
     assert_eq!(
         log_lambdas.len(),
-        5,
+        7,
         "te(x, z) must carry its x, z and x·z null trends as separate REML coordinates; \
          log_lambdas = {log_lambdas:?}"
     );
-    let (x_trend, z_trend, xz_trend) = (log_lambdas[2], log_lambdas[3], log_lambdas[4]);
+    let (x_trend, z_trend, xz_trend) = (log_lambdas[4], log_lambdas[5], log_lambdas[6]);
     assert!(
         x_trend < z_trend && x_trend < xz_trend,
         "REML must keep the supported x trend and shrink the absent z and x·z trends: \

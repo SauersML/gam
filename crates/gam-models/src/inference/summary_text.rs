@@ -323,8 +323,13 @@ fn convergence_text(convergence: &SummaryConvergence) -> String {
         "NOT certified"
     };
     let mut text = format!(
-        "{verdict}; inner P-IRLS: {} after {} iterations; {} outer iterations",
-        convergence.inner_status, convergence.inner_iterations, convergence.outer_iterations
+        "{verdict}; inner P-IRLS: {} after {} iterations; {} outer iterations; \
+         whole fit: {} criterion evaluations, {} inner solves",
+        convergence.inner_status,
+        convergence.inner_iterations,
+        convergence.outer_iterations,
+        convergence.outer_cost_evals,
+        convergence.inner_pirls_solves,
     );
     match &convergence.outer {
         None => text.push_str("; no smoothing parameter was optimized"),
@@ -452,6 +457,8 @@ mod tests {
                 inner_status: "Converged".to_string(),
                 outer_iterations: 7,
                 inner_iterations: 5,
+                outer_cost_evals: 23,
+                inner_pirls_solves: 19,
                 outer: Some(SummaryOuterCertificate {
                     kind: "analytic_gradient".to_string(),
                     gradient_norm: 2e-9,
@@ -503,7 +510,7 @@ Conditional AIC: 155.5
 Corrected AIC: 157.25
 Effective dof: 6.875
 Coefficient covariance: smoothing-corrected
-Convergence: certified; inner P-IRLS: Converged after 5 iterations; 7 outer iterations; analytic_gradient stationarity: projected gradient 1.5e-09 <= bound 1e-06; Hessian positive semidefinite
+Convergence: certified; inner P-IRLS: Converged after 5 iterations; 7 outer iterations; whole fit: 23 criterion evaluations, 19 inner solves; analytic_gradient stationarity: projected gradient 1.5e-09 <= bound 1e-06; Hessian positive semidefinite
 ";
         assert_eq!(render_summary_text(&fixed_small_model()), golden);
     }

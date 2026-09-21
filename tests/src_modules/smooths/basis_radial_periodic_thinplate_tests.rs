@@ -4607,7 +4607,10 @@ fn filter_penalty_candidates_preserves_matching_kronecker_factors() {
     let filtered = filter_penalty_candidates(vec![PenaltyCandidate {
         matrix: ConstructiveQuadratic::try_from_dense_psd(kron, "matching Kronecker test penalty")
             .expect("PSD Kronecker penalty"),
-        source: PenaltySource::TensorMarginal { dim: 0 },
+        source: PenaltySource::TensorMarginal {
+            dim: 0,
+            range_margins: vec![],
+        },
         normalization_scale: 1.0,
         kronecker_factors: Some(vec![s.clone(), identity.clone()]),
         op: None,
@@ -4643,7 +4646,10 @@ fn filter_penalty_candidates_drops_stale_kronecker_factors_after_projection() {
         .expect("constructive projection");
     let filtered = filter_penalty_candidates(vec![PenaltyCandidate {
         matrix: projected,
-        source: PenaltySource::TensorMarginal { dim: 0 },
+        source: PenaltySource::TensorMarginal {
+            dim: 0,
+            range_margins: vec![],
+        },
         normalization_scale: 1.0,
         kronecker_factors: Some(vec![s, identity]),
         op: None,

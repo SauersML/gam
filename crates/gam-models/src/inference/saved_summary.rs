@@ -866,6 +866,8 @@ fn summary_convergence(fit: &gam_solve::estimate::UnifiedFitResult) -> SummaryCo
         inner_status: evidence.inner_status().label().to_string(),
         outer_iterations: evidence.outer_iterations(),
         inner_iterations: fit.inner_cycles,
+        outer_cost_evals: fit.outer_cost_evals,
+        inner_pirls_solves: fit.inner_pirls_solves,
         outer,
         estimator: SummaryEstimator::of(fit),
     }
@@ -1581,6 +1583,18 @@ pub struct SummaryConvergence {
     /// smoothing parameters (P-IRLS iterations, or blockwise cycles for a
     /// custom family).
     pub inner_iterations: usize,
+    /// Outer criterion evaluations the whole fit executed: seeding, screening,
+    /// every multistart candidate and the certified solve. `outer_iterations`
+    /// counts only the iterations of the solve the certificate covers, so it
+    /// understates the outer work of a fit that screened or restarted (#3951).
+    /// Zero on routes that do not run the external smoothing-parameter
+    /// optimizer.
+    pub outer_cost_evals: usize,
+    /// Full-data inner P-IRLS solves the whole fit performed (criterion
+    /// evaluations that missed the inner-mode cache). This is the fit's cost in
+    /// units of one penalized solve; zero on routes that do not run the
+    /// external smoothing-parameter optimizer.
+    pub inner_pirls_solves: usize,
     /// `None` when no smoothing coordinate was optimized: there is no outer
     /// stationarity equation to solve, which is a different statement from a
     /// projected gradient that happened to be zero.

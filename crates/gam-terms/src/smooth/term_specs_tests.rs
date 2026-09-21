@@ -98,14 +98,20 @@ mod joint_unpenalized_dim_tests {
                 4,
                 2,
                 0,
-                PenaltySource::TensorMarginal { dim: 0 },
+                PenaltySource::TensorMarginal {
+                    dim: 0,
+                    range_margins: vec![],
+                },
             ),
             active_penalty(
                 kron(&Array2::eye(3), &s_z),
                 3,
                 3,
                 1,
-                PenaltySource::TensorMarginal { dim: 1 },
+                PenaltySource::TensorMarginal {
+                    dim: 1,
+                    range_margins: vec![],
+                },
             ),
         ];
         assert_eq!(joint_unpenalized_dim(6, &penalties), 1);
@@ -118,7 +124,16 @@ mod joint_unpenalized_dim_tests {
         let wrong: Array2<f64> = array![[1.0]];
         let penalties = [
             active_penalty(full, 1, 1, 0, PenaltySource::Primary),
-            active_penalty(wrong, 1, 0, 1, PenaltySource::TensorMarginal { dim: 0 }),
+            active_penalty(
+                wrong,
+                1,
+                0,
+                1,
+                PenaltySource::TensorMarginal {
+                    dim: 0,
+                    range_margins: vec![],
+                },
+            ),
         ];
         joint_unpenalized_dim(2, &penalties);
     }
@@ -360,27 +375,73 @@ mod tensor_function_space_runtime_tests {
         spec.double_penalty = false;
         let singly_penalized = build_tensor_bspline_basis(data.view(), &[0, 1], &spec, true)
             .expect("single-penalty tensor basis");
-        // Each margin block is `S_dim ⊗ G_other / 1ᵀ G_other 1` (#1561, SPEC rule 5).
-        let mut margin_blocks = 0usize;
-        for penalty in &singly_penalized.active_penalties {
-            let PenaltySource::TensorMarginal { dim } = &penalty.info.source else {
-                continue;
+        // Margin `dim`'s roughness is `S̃_dim ⊗ G_other / 1ᵀ G_other 1` (#1561, SPEC
+        // rule 5), resolved into the part through the other margin's null-function
+        // mass `M` and the part through its complement `R` (#3951).
+        for dim in 0..2 {
+            let mut parts = std::collections::BTreeMap::<bool, Array2<f64>>::new();
+            for penalty in &singly_penalized.active_penalties {
+                let PenaltySource::TensorMarginal {
+                    dim: part_dim,
+                    range_margins,
+                } = &penalty.info.source
+                else {
+                    continue;
+                };
+                if *part_dim != dim {
+                    continue;
+                }
+                let factors = penalty
+                    .info
+                    .kronecker_factors
+                    .as_ref()
+                    .expect("a tensor margin part keeps its Kronecker factors");
+                assert_eq!(factors.len(), 2);
+                let through_range = match range_margins.as_slice() {
+                    [] => false,
+                    [other] if *other == 1 - dim => true,
+                    other => panic!("margin {dim} part through unexpected margins {other:?}"),
+                };
+                let previous = parts.insert(through_range, factors[1 - dim].clone());
+                assert!(previous.is_none(), "margin {dim} repeats a part");
+            }
+            let null_mass = parts.get(&false).expect("null-function part");
+            let complement_mass = parts.get(&true).expect("complement part");
+            // Together they are the other margin's Gram averaged over its domain.
+            let gram = null_mass + complement_mass;
+            // Rounding band of the split: the complement is formed through `G⁻¹`
+            // from eigendecompositions of `G`, whose backward error is
+            // `p·ε·‖G‖₂` (the spectrum band) and whose forward error in `G⁻¹`
+            // carries `κ(G)`; a quadratic form against `1` multiplies by
+            // `‖1‖² = p`, and summing the `p²` entries adds `γ_{2p²}`.
+            let (gram_evals, _) = {
+                use gam_linalg::faer_ndarray::FaerEigh;
+                gram.eigh(faer::Side::Lower).expect("other-margin Gram spectrum")
             };
-            margin_blocks += 1;
-            let factors = penalty
-                .info
-                .kronecker_factors
-                .as_ref()
-                .expect("a tensor margin block keeps its Kronecker factors");
-            assert_eq!(factors.len(), 2);
-            let gram = &factors[1 - *dim];
-            let measure = gram.sum();
+            let largest = gram_evals.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+            let smallest = gram_evals.iter().fold(f64::INFINITY, |acc, &v| acc.min(v));
+            assert!(smallest > 0.0, "margin {dim}: other-margin Gram is not positive definite");
+            let spectrum_band = gam_linalg::roundoff::symmetric_spectrum_rounding_band(
+                gram_evals.as_slice().expect("contiguous spectrum"),
+            );
+            let tol = gam_linalg::roundoff::accumulation_growth(2 * gram.len())
+                + (largest / smallest) * gram.nrows() as f64 * spectrum_band;
             assert!(
-                (measure - 1.0).abs() <= gam_linalg::roundoff::accumulation_growth(2 * gram.len()),
-                "margin {dim}'s other-margin Gram is not averaged over its domain: 1ᵀG1 = {measure}"
+                (gram.sum() - 1.0).abs() <= tol,
+                "margin {dim}'s other-margin Gram is not averaged over its domain: 1ᵀG1 = {}",
+                gram.sum()
+            );
+            // The constant lies in the order-1 penalty's null space, so all of its
+            // mass is null-function mass and none is complement mass.
+            let ones = Array1::<f64>::ones(gram.nrows());
+            let null_of_ones = ones.dot(&null_mass.dot(&ones));
+            let complement_of_ones = ones.dot(&complement_mass.dot(&ones));
+            assert!(
+                (null_of_ones - 1.0).abs() <= tol && complement_of_ones.abs() <= tol,
+                "margin {dim}: the constant splits as {null_of_ones} null + \
+                 {complement_of_ones} complement"
             );
         }
-        assert_eq!(margin_blocks, 2, "one penalty block per margin");
     }
 
     fn cubic_marginal() -> BSplineBasisSpec {

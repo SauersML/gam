@@ -383,7 +383,10 @@ class Summary:
         verdict the mint gate used; ``inner_status`` is the terminal P-IRLS
         status; ``outer_iterations`` is the iteration count the proof covers;
         ``inner_iterations`` is the P-IRLS iteration count of the final
-        coefficient solve;
+        coefficient solve; ``outer_cost_evals`` and ``inner_pirls_solves``
+        count the outer criterion evaluations and full-data inner solves of the
+        whole fit (seeding, screening and every restart included), which is
+        the fit's real outer work (#3951);
         ``outer`` is ``None`` when no smoothing coordinate was optimized (there
         is no outer stationarity equation, which is *not* the same as a zero
         gradient), else a mapping carrying ``kind``, ``gradient_norm``,
@@ -484,7 +487,8 @@ class Summary:
     deployment_extensions: list[dict[str, Any]] = field(default_factory=list)
     #: How the optimization that produced this fit terminated (#2411), read
     #: from the certificate the fit itself carries. Keys: ``certified``,
-    #: ``inner_status``, ``outer_iterations``, ``inner_iterations``, and ``outer`` — the last being
+    #: ``inner_status``, ``outer_iterations``, ``inner_iterations``,
+    #: ``outer_cost_evals``, ``inner_pirls_solves``, and ``outer`` — the last being
     #: ``None`` when no smoothing coordinate was optimized, else a mapping with
     #: ``kind``, ``gradient_norm``, ``projected_gradient_norm``,
     #: ``stationarity_bound``, ``hessian_psd`` and ``lambdas_railed``.
