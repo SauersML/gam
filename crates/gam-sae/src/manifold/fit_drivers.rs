@@ -3011,6 +3011,43 @@ impl SaeManifoldTerm {
         material_floor: f64,
         snapshot: &SaeManifoldMutableState,
     ) -> Result<ObjectiveLineMinimum, String> {
+        self.minimize_objective_along_curve(
+            target,
+            rho,
+            registry,
+            &|term: &mut Self, alpha: f64| {
+                term.apply_newton_step(
+                    direction.slice(s![..dense_len]),
+                    direction.slice(s![dense_len..]),
+                    alpha,
+                )
+            },
+            base,
+            slope,
+            negative_curvature,
+            material_floor,
+            snapshot,
+        )
+    }
+
+    /// [`Self::minimize_objective_along`] on a curve `α ↦ x(α)` that `advance`
+    /// moves the snapshot state to (#3434): `slope = −φ′(0)` and
+    /// `negative_curvature = max(−φ″(0), 0)` are those of `φ(α) = f(x(α))`, which a
+    /// retraction of a unit tangent carries to second order when its own
+    /// second-order term is priced in `φ″(0)`. A straight line is the case
+    /// `x(α) = x₀ + α·d̂`.
+    pub(crate) fn minimize_objective_along_curve(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        advance: &dyn Fn(&mut Self, f64) -> Result<(), String>,
+        base: BandedPenalizedObjective,
+        slope: f64,
+        negative_curvature: f64,
+        material_floor: f64,
+        snapshot: &SaeManifoldMutableState,
+    ) -> Result<ObjectiveLineMinimum, String> {
         let base_objective = base.value;
         let mut line = ObjectiveLineMinimum {
             alpha: 0.0,
@@ -3047,11 +3084,7 @@ impl SaeManifoldTerm {
                         alpha: f64,
                         line: &mut ObjectiveLineMinimum|
          -> Result<BandedPenalizedObjective, String> {
-            let value = match term.apply_newton_step(
-                direction.slice(s![..dense_len]),
-                direction.slice(s![dense_len..]),
-                alpha,
-            ) {
+            let value = match advance(term, alpha) {
                 Ok(()) => {
                     line.objective_evaluations += 1;
                     match term.penalized_objective_banded(target, rho, registry, 1.0) {

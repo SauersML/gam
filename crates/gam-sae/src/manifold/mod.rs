@@ -397,6 +397,11 @@ mod tests_fitted_response_sphere_2933;
 #[cfg(test)]
 mod tests_fitted_response_frames_2933;
 
+/// #3434 — the priced evidence root of a framed fit is a certified minimum in the
+/// lifted chart of its learned frames.
+#[cfg(test)]
+mod tests_frame_lifted_acceptance_3434;
+
 /// #2933 F37/F38 — the dispersion is conditional on the fitted routing and its
 /// scale equation is explicit.
 #[cfg(test)]
