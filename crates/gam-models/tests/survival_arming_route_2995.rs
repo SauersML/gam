@@ -24,6 +24,7 @@
 use csv::StringRecord;
 use gam_data::encode_recordswith_inferred_schema;
 use gam_linalg::utils::splitmix64;
+use gam_math::probability::normal_cdf;
 use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -89,10 +90,6 @@ fn next_gaussian(state: &mut u64) -> f64 {
     let u1 = next_unit(state).max(f64::MIN_POSITIVE);
     let u2 = next_unit(state);
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
-}
-
-fn normal_cdf(x: f64) -> f64 {
-    gam_math::probability::normal_cdf(x)
 }
 
 /// Standard-normal quantile by bisection on `Φ`, independent of the crate.

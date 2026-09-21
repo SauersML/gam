@@ -3630,5 +3630,22 @@
     ],
     "reason": "PKG-01 fork safety: gam no longer builds rayon's global pool (a fork()ed child cannot rebuild it) or spawns its own wide-stack driver threads. Every entry point runs on the one process worker pool in gam_runtime::parallel, which is rebuilt in a forked child and whose workers carry WORKER_STACK_SIZE = 64 MiB (the stack rayon's global-pool workers had; gam#2967's inline(never) leaf owners bound the deep frames). The per-site stack constants it replaces are gone: RAYON_WORKER_STACK_SIZE (the global pool build in init_parallelism), CLI_WORKER_STACK_SIZE (the CLI's driver thread, now parallel::install(run)), SAE_FIT_WORKER_STACK_SIZE (the SAE fit's driver thread) and SEED_RUN_STACK_BYTES (multistart's OS-thread lanes, now tasks of the pool the caller runs on through parallel::fan_out). run_on_single_worker_pool moved a driver onto a one-thread global pool, which no longer exists, and its test binary built that global pool. process_monitor's push_scope was folded into the enter-scope function when the monitor became opt-in (started only at debug level), so a disabled monitor returns an inert guard. The multistart test is renamed, because the lanes no longer come in two kinds (pool tasks or OS threads), only two pools.",
     "evidence": "git grep -w finds none of the removed names under crates, src or tests (gam-predict's test_support keeps a private alias of parallel::WORKER_STACK_SIZE). crates/gam-runtime/src/parallel.rs tests install_runs_on_the_process_pool, install_marks_the_root_and_fan_out_marks_its_pieces_nested, as_root_tasks_are_roots_and_a_foreign_pool_is_nested and a_panic_in_install_reaches_the_caller cover the pool; tests/fork_safety.rs a_forked_child_fits_exactly_like_its_parent and tests/fork_safety_after_import_test.py cover a forked child; multistart_tests.rs the_winner_is_the_same_on_every_pool_width_and_pool_2359 keeps the renamed test's assertions (same seed, same bits at pool widths 1, 4 and 12, lanes bounded by the pool)."
+  },
+  {
+    "base": "8887329660b68e029b7ecef370539e4879d5c0af",
+    "items": [
+      "crates/gam-cli/examples/finite_response_teacher_2946.rs:fn:logistic",
+      "crates/gam-inference/src/skovgaard.rs:fn:normal_pdf",
+      "crates/gam-models/src/fit_orchestration/drivers/measure_jet_range_seed.rs:fn:normal_cdf",
+      "crates/gam-models/src/fit_orchestration/drivers/measure_jet_range_seed.rs:fn:normal_pdf",
+      "crates/gam-models/tests/survival_acceptance/covariate_constant_slope_2930.rs:fn:normal_cdf",
+      "crates/gam-models/tests/survival_acceptance/declared_latent_law_2923.rs:fn:normal_cdf",
+      "crates/gam-models/tests/survival_acceptance/joint_latent_law_2929.rs:fn:normal_cdf",
+      "crates/gam-models/tests/survival_acceptance/landmark_short_horizon_calibration_2336.rs:fn:normal_cdf",
+      "crates/gam-models/tests/survival_acceptance/moving_law_certificate_2926.rs:fn:normal_cdf",
+      "crates/gam-models/tests/survival_arming_route_2995.rs:fn:normal_cdf"
+    ],
+    "reason": "#4406: private scalar kernels outside tests/ duplicated gam_math. The bench softplus/sigmoid, the gam-cli example logistic and the root example sigmoid were gam_math::special::{softplus, logistic}; the bench, measure_jet_range_seed test module and gam-models survival test normal_cdf copies (statrs erf/erfc or pass-through wrappers) and the repro979 A&S erf_approx were gam_math::probability::normal_cdf; the skovgaard and measure_jet_range_seed test normal_pdf copies were gam_math::probability::normal_pdf. SPEC: 'It's required that the CLI, Python library, and Rust library are unified, have a single source of truth'.",
+    "evidence": "https://github.com/SauersML/gam/issues/4406: every former call site now imports the canonical gam_math kernel; git grep -w finds no remaining call to a removed name in the edited files."
   }
 ]

@@ -10,6 +10,7 @@ use crate::bms::*;
 use csv::StringRecord;
 use gam_data::encode_recordswith_inferred_schema;
 use gam_linalg::utils::splitmix64;
+use gam_math::probability::normal_cdf;
 use gam_terms::smooth::{
     LinearTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
 };
@@ -22,10 +23,6 @@ fn next_gauss(state: &mut u64) -> f64 {
     let u1 = next_unit(state);
     let u2 = next_unit(state);
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
-}
-
-fn normal_cdf(x: f64) -> f64 {
-    gam_math::probability::normal_cdf(x)
 }
 
 const N: usize = 2_000;

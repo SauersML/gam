@@ -56,6 +56,7 @@
 
 use clap::{Parser, Subcommand};
 use gam::faer_ndarray::{FaerSvd, fast_atb};
+use gam_math::special::logistic;
 use gam_sae::response::raw_block::UnabsorbedGatedBlock;
 use ndarray::{Array1, Array2, ArrayD, ArrayView2, Axis, IxDyn, s};
 use npyz::{NpyFile, Order, WriterBuilder};
@@ -480,15 +481,6 @@ impl Activation {
                 p * (1.0 + t * (1.0 - p))
             }
         }
-    }
-}
-
-fn logistic(t: f64) -> f64 {
-    if t >= 0.0 {
-        1.0 / (1.0 + (-t).exp())
-    } else {
-        let e = t.exp();
-        e / (1.0 + e)
     }
 }
 

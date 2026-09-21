@@ -57,6 +57,7 @@ use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{
     FitRequest, FitResult, LinkWiggleConfig, StandardBinomialWiggleConfig, StandardFitRequest,
 };
+use gam_math::special::logistic;
 use ndarray::{Array1, Array2};
 use std::time::Instant;
 
@@ -112,10 +113,6 @@ impl Rng {
     }
 }
 
-fn sigmoid(x: f64) -> f64 {
-    1.0 / (1.0 + (-x).exp())
-}
-
 /// `gam_test_support::synthetic::geo_disease_columns`, inlined — examples skip
 /// dev-dependencies, so the generator cannot be imported.
 fn geo_disease_columns(n: usize, seed: u64) -> (Array2<f64>, Array1<f64>) {
@@ -134,7 +131,7 @@ fn geo_disease_columns(n: usize, seed: u64) -> (Array2<f64>, Array1<f64>) {
             + 0.30 * (2.0 * std::f64::consts::PI * equator * lon).sin();
         let southness = (-lat).clamp(0.0, 1.0);
         let eta = geo_signal + rng.normal(0.0, 0.20 + 0.85 * southness.powf(1.35));
-        y[i] = if rng.bernoulli(sigmoid(eta)) { 1.0 } else { 0.0 };
+        y[i] = if rng.bernoulli(logistic(eta)) { 1.0 } else { 0.0 };
         for j in 0..16 {
             let jf = j as f64;
             let a = 0.95 - 0.045 * jf;

@@ -551,7 +551,7 @@ fn assemble_modified_root(
 mod tests {
     use super::*;
     use gam_linalg::roundoff::accumulation_growth;
-    use gam_math::probability::normal_cdf;
+    use gam_math::probability::{normal_cdf, normal_pdf};
     use ndarray::array;
 
     /// `|actual − expected| ≤ γ_ops · max(|actual|, |expected|)`: agreement to the
@@ -1158,11 +1158,6 @@ mod tests {
     // sufficient statistic the canonical-family `u` equals the Wald root
     // `q = (θ̂−θ₀)·√ĵ` with `ĵ = nμ̂ = S` (the exact observed information in θ),
     // and the LR root is `r = sign(θ̂−θ₀)·√W`, `W = 2[S log(S/(nμ₀)) − (S−nμ₀)]`.
-
-    /// Standard normal pdf.
-    fn normal_pdf(z: f64) -> f64 {
-        (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt()
-    }
 
     /// The right-tail `P(X ≥ x)` for the Poisson saddlepoint problem, computed two
     /// independent ways from a single `(r, u)`: our Barndorff-Nielsen `r*` tail and
