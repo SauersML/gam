@@ -109,8 +109,11 @@ location-scale models that expose a fitted response-side scale add
 `posterior_mean_standard_error` (posterior SD of the response),
 `posterior_mean_lower`, and `posterior_mean_upper`. Survival predictions write `eta`,
 `survival_prob_plugin` (the plug-in `S(η̂)`), `survival_prob` (the posterior
-mean `E[S(η)]`), `failure_prob`, and `risk_score`, plus `std_error`,
-`mean_lower`, and `mean_upper` with `--uncertainty`. Transformation-normal and
+mean `E[S(η)]`), `failure_prob`, and `risk_score`. With `--uncertainty` they
+add `eta_std_error` (posterior SD of η), `std_error` (posterior SD of
+`survival_prob`), `mean_lower`, and `mean_upper`; the latent-window survival
+table integrates over the joint posterior of η and the window's baseline and
+has no single η SD, so it omits `eta_std_error`. Transformation-normal and
 marginal-slope predictions retain their model-specific schemas.
 
 ## Sample and Generate

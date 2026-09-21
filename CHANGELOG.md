@@ -102,6 +102,16 @@
   Firth case. `penalized_neg_log_likelihood` is the negative of that objective. The Python
   fixed-λ result dict gains an `objective` key. The `|η| ≥ 25` trigger and
   `VectorGlmStall::eta` are deleted.
+- **`gam predict` survival tables publish `std_error` on the survival scale** (#4533).
+  With `--uncertainty`, the survival CSV (Royston-Parmar, survival location-scale, survival
+  marginal-slope) used to publish the posterior SD of η under `std_error`, beside the
+  response-scale `mean_lower` / `mean_upper`, and drop the posterior SD of
+  `survival_prob` that the band was built from. `std_error` is now the posterior SD of
+  `survival_prob`, the quantity every other table's `std_error` /
+  `posterior_mean_standard_error` carries, and the η SD has its own `eta_std_error`
+  column. The latent-window survival and event-probability tables used to publish their
+  bounds with no `std_error` at all and now carry it. A band is one `ResponseBand` (SD and
+  both bounds), so a partial band is an internal error instead of a smaller table.
 
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry

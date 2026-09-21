@@ -3604,5 +3604,16 @@
     ],
     "reason": "Delete the response-aware anisotropy seed nudge (#2902 row `clamp(+-MAX_NUDGE)`): a per-axis seed shift clamped to a hand-picked ln 2 box, added in #1376 to steer the kappa/anisotropy optimizer away from a symmetric start that the then-mis-centered psi gradient could not leave. The exact centered psi gradient (#1376 root fix) makes the seed a plain starting point of a gradient optimizer, so the bounded response heuristic is an unnecessary knob; SPEC: 'Hand-supplied search boxes or bounds are never allowed.' and 'In general, do not paper over solver issues.'",
     "evidence": "git grep -n 'response_aware\\|MAX_NUDGE' at f4a293a63f finds only the two definitions and their doc in term_specs.rs, the single call in fit_orchestration/drivers/spatial_optimization.rs (removed here) and the spec_ban_ledger row (removed here). Anisotropy recovery tests aniso_matern_full_outer_loop_recovers_planted_signal_r2, aniso_matern_recovery_ablation_eta_direction_robust_across_penalty, aniso_matern_recovers_signal_axis run on this branch via focused-rust-proof."
+  },
+  {
+    "base": "c5ae0bf28114117ad67f97a98eb1648feddd293e",
+    "items": [
+      "tests/src_modules/misc/cli_tests.rs:fn:survival_binary_prediction_csv_emits_bounds_without_std_error",
+      "tests/src_modules/misc/cli_tests.rs:fn:survival_binary_prediction_csv_errors_on_half_supplied_bounds",
+      "tests/src_modules/misc/cli_tests.rs:fn:survival_prediction_csv_emits_bounds_without_std_error",
+      "tests/src_modules/misc/cli_tests.rs:fn:survival_prediction_csv_errors_on_half_supplied_bounds"
+    ],
+    "reason": "#4533: the survival writers take one ResponseBand (posterior SD and both bounds) instead of three independent Options, so bounds without their SD and one bound without the other are no longer representable. The two emits_bounds_without_std_error tests pinned the table that dropped the SD; the two half_supplied tests pinned the per-writer String errors that are gone.",
+    "evidence": "scripts/source_removal_guard.py with --base c5ae0bf28114117ad67f97a98eb1648feddd293e and head the change's commit lists exactly these removals. survival_prediction_csv_publishes_eta_and_survival_standard_errors_by_name and survival_binary_prediction_csv_publishes_the_event_probability_band pin the band columns and values; prediction_band_refuses_partial_parts_as_an_internal_error pins every partial combination as CliError::Internal."
   }
 ]
