@@ -615,29 +615,29 @@ impl<'a> RemlState<'a> {
             return Ok(None);
         };
 
-        if let Some(z) = free_basis_opt.as_ref() {
-            // No problem-scale gate: the inner solve carries Φ whenever Firth is
-            // requested, so the projected outer basis must too (#825, #2900).
-            let x_projected = pirls_result.x_transformed.to_dense().dot(z);
-            return Ok(Some(std::sync::Arc::new(
-                Self::build_firth_dense_operator_for_link(
-                    &jeffreys_link,
-                    &x_projected,
-                    &pirls_result.final_eta.to_owned(),
-                    self.weights,
-                )?,
-            )));
+        if free_basis_opt.is_none() {
+            if let Some(cached) = bundle.firth_dense_operator.clone() {
+                return Ok(Some(cached));
+            }
         }
 
-        if let Some(cached) = bundle.firth_dense_operator.clone() {
-            return Ok(Some(cached));
-        }
-
-        let x_dense = pirls_result.x_transformed.to_dense();
+        // Borrow the governed dense design: `to_dense()` would deep-copy the
+        // n×p matrix before the operator copies it again.
+        let x_dense = pirls_result
+            .x_transformed
+            .try_to_dense_arc("the dense Firth operator requires dense transformed design")
+            .map_err(EstimationError::InvalidInput)?;
+        // No problem-scale gate: the inner solve carries Φ whenever Firth is
+        // requested, so the projected outer basis must too (#825, #2900).
+        let x_projected = free_basis_opt.as_ref().map(|z| {
+            gam_linalg::matrix::DenseRightProductView::new(x_dense.as_ref())
+                .with_factor(z)
+                .materialize()
+        });
         Ok(Some(std::sync::Arc::new(
             Self::build_firth_dense_operator_for_link(
                 &jeffreys_link,
-                &x_dense,
+                x_projected.as_ref().unwrap_or_else(|| x_dense.as_ref()),
                 &pirls_result.final_eta.to_owned(),
                 self.weights,
             )?,
