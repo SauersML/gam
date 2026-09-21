@@ -49,10 +49,12 @@ pub enum BasisAdequacyProvenance {
     /// The test itself declined: no estimable enrichment direction survived the
     /// projection, or the assembled quadratic form was not finite.
     StatisticUnavailable,
-    /// The coefficient-covariance multiplier that scales the score's variance
-    /// (`φ̂` for the profiled Gaussian, `1` for families carrying their
-    /// dispersion in the IRLS weight) could not be resolved to a finite
-    /// positive value, so the score has no scale to be read against.
+    /// A KNOWN-scale fit's coefficient-covariance multiplier (`1` for families
+    /// carrying their dispersion in the IRLS weight) could not be resolved to a
+    /// finite positive value, so the score has no scale to be read against. An
+    /// estimated-scale fit does not reach this: its reference is the
+    /// unpenalized residual on the report's own rows, and a residual that
+    /// cannot hold the test's rank is `StatisticUnavailable`.
     DispersionUnavailable,
     /// Canonical binomial/Poisson fits only: the unpenalized null-model MLE the
     /// conditional reference is built at did not certify on the test's rows
@@ -710,35 +712,50 @@ pub fn basis_adequacy_report(
                     .map(|idx| undetermined(idx, BasisAdequacyProvenance::DesignGramUnavailable))
                     .collect();
             };
-            // The dispersion that scales the score's variance is the same
-            // multiplier the fit publishes on its coefficient covariance (`1`
-            // for every family carrying its dispersion inside the IRLS weight,
-            // `φ̂` for the profiled Gaussian). One the fit cannot resolve is a
-            // typed absence, never a substituted `1`: that would publish a
-            // p-value on a scale the fit never had.
-            let dispersion = match fit.coefficient_covariance_scale() {
-                Ok(value) if value.is_finite() && value > 0.0 => value,
-                _ => {
-                    return (0..term_count)
-                        .map(|idx| {
-                            undetermined(idx, BasisAdequacyProvenance::DispersionUnavailable)
-                        })
-                        .collect();
-                }
-            };
+            let score_weights = select_rows(rows_state.score_weights.view(), &report_rows);
+            let score = select_rows(rows_state.score.view(), &report_rows);
             let scale = if fit.likelihood_scale.wald_scale_is_estimated() {
-                gam_terms::inference::smooth_test::SmoothTestScale::Estimated
+                // The estimated scale is the UNPENALIZED residual on these same
+                // rows, never the fit's `φ̂ = RSS_λ/(n − edf)`: that residual is
+                // the penalized one, biased by the shrinkage and not orthogonal
+                // to the score, and it belongs to all `n` rows rather than the
+                // report's sample (see the gam-terms module header).
+                let Some(residual) = gam_terms::inference::basis_adequacy::unpenalized_residual(
+                    gathered_design.view(),
+                    hessian_weights.view(),
+                    score_weights.view(),
+                    score.view(),
+                    &design_gram,
+                ) else {
+                    return (0..term_count)
+                        .map(|idx| undetermined(idx, BasisAdequacyProvenance::StatisticUnavailable))
+                        .collect();
+                };
+                gam_terms::inference::basis_adequacy::BasisAdequacyScale::Estimated(residual)
             } else {
-                gam_terms::inference::smooth_test::SmoothTestScale::Known
+                // A known dispersion is the multiplier the fit publishes on its
+                // coefficient covariance (`1` for every family carrying its
+                // dispersion inside the IRLS weight). One the fit cannot
+                // resolve is a typed absence, never a substituted `1`: that
+                // would publish a p-value on a scale the fit never had.
+                let dispersion = match fit.coefficient_covariance_scale() {
+                    Ok(value) if value.is_finite() && value > 0.0 => value,
+                    _ => {
+                        return (0..term_count)
+                            .map(|idx| {
+                                undetermined(idx, BasisAdequacyProvenance::DispersionUnavailable)
+                            })
+                            .collect();
+                    }
+                };
+                gam_terms::inference::basis_adequacy::BasisAdequacyScale::Known { dispersion }
             };
             ScoreReference::Product {
                 hessian_weights,
-                score_weights: select_rows(rows_state.score_weights.view(), &report_rows),
-                score: select_rows(rows_state.score.view(), &report_rows),
+                score_weights,
+                score,
                 design_gram,
-                dispersion,
                 scale,
-                residual_df: fit.wald_residual_degrees_of_freedom(),
             }
         }
     };
@@ -802,9 +819,7 @@ pub fn basis_adequacy_report(
                     score_weights,
                     score,
                     design_gram,
-                    dispersion,
                     scale,
-                    residual_df,
                 } => gam_terms::inference::basis_adequacy::basis_adequacy_score_test(
                     gam_terms::inference::basis_adequacy::BasisAdequacyInput {
                         enrichment: enrichment.view(),
@@ -813,8 +828,6 @@ pub fn basis_adequacy_report(
                         score_weights: score_weights.view(),
                         score: score.view(),
                         design_gram,
-                        dispersion: *dispersion,
-                        residual_df: *residual_df,
                         scale: *scale,
                     },
                 )
@@ -848,9 +861,7 @@ enum ScoreReference {
         score_weights: Array1<f64>,
         score: Array1<f64>,
         design_gram: gam_terms::inference::basis_adequacy::DesignGramFactor,
-        dispersion: f64,
-        scale: gam_terms::inference::smooth_test::SmoothTestScale,
-        residual_df: Option<f64>,
+        scale: gam_terms::inference::basis_adequacy::BasisAdequacyScale,
     },
     /// The conditional reference for a canonical binomial/Poisson fit.
     Conditional(gam_terms::inference::basis_adequacy::CanonicalNullFit),
