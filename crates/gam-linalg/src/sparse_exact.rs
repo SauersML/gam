@@ -263,6 +263,20 @@ pub fn factorize_sparse_spd(
     })
 }
 
+/// SPD factorization of symmetric CSC storage in any triangle convention,
+/// certified pivot by pivot.
+///
+/// The input is canonicalized exactly as [`factorize_sparse_spd`] does, and the
+/// canonical upper triangle then goes through [`factorize_sparse_spd_strict`],
+/// so every Cholesky pivot must clear its own derived roundoff band. This is
+/// the sparse arm of `SymmetricMatrix::factorize`, whose dense arm applies the
+/// same certificate (gam#3696).
+pub fn factorize_sparse_spd_certified(
+    h: &SparseColMat<usize, f64>,
+) -> Result<SparseExactFactor, LinalgError> {
+    factorize_sparse_spd_strict(&canonicalize_sparse_symmetric_upper(h)?)
+}
+
 /// Strict SPD factorization of canonical symmetric-upper CSC storage.
 ///
 /// Unlike [`factorize_sparse_spd`], this covariance/inference entrypoint does
@@ -311,7 +325,7 @@ pub fn factorize_sparse_spd_strict(
     // Each Schur-complement pivot forms a length-n dot product and subtracts
     // it: at most 2n rounded operations, hence Wilkinson's gamma_(2n). The
     // backward error is componentwise, so a pivot is roundoff only relative to
-    // its OWN row's diagonal (see `SymmetricMatrix::factorize_spd`). `L` factors
+    // its OWN row's diagonal (see `SymmetricMatrix::factorize`). `L` factors
     // the AMD-permuted matrix: original row `r` is permuted pivot `perm_inv[r]`.
     let mut own_diagonal = vec![0.0_f64; simplicial.n];
     for column in 0..h_upper.ncols() {

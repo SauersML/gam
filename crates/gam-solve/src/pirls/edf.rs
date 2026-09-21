@@ -122,8 +122,8 @@ pub(super) fn calculate_edf(
         return Ok(p as f64);
     }
     let rhs_arr = e_transformed.t().to_owned();
-    // Use SymmetricMatrix::factorize() which dispatches to sparse Cholesky
-    // for sparse Hessians and dense Cholesky for dense ones.
+    // SymmetricMatrix::factorize() is a certified Cholesky on either storage,
+    // so an indefinite H is refused rather than turned into an EDF.
     let factor =
         penalized_hessian
             .factorize()

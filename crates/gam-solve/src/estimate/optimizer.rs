@@ -333,7 +333,7 @@ fn negbin_theta_root_sensitivity(
         return None;
     }
     let rhs = reml_state.x.transpose_vector_multiply(score_eta_gradient);
-    let factor = pirls.penalized_hessian_transformed.factorize_spd().ok()?;
+    let factor = pirls.penalized_hessian_transformed.factorize().ok()?;
     // `u` in the frame the Hessian and the KKT residual live in, and `β`, `u`
     // in the original frame the canonical penalties index.
     let (u_solved, beta_original, u_original) = match pirls.coordinate_frame {
@@ -2754,7 +2754,7 @@ where
         // is not allowed to add an unaccounted diagonal to it. When the strict
         // factor refuses, a dense H is taken on its identified subspace, the one
         // PIRLS solved it min-norm on and the criterion scored (#2901 V22).
-        let factor = match h.factorize_spd() {
+        let factor = match h.factorize() {
             Ok(factor) => InferenceHessianFactor::Strict(factor),
             Err(reason) => match h {
                 gam_linalg::matrix::SymmetricMatrix::Dense(dense) => {

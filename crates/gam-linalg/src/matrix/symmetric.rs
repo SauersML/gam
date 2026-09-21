@@ -79,28 +79,14 @@ impl SymmetricMatrix {
         Ok(dense)
     }
 
-    pub fn factorize(&self) -> Result<Box<dyn FactorizedSystem>, String> {
-        match self {
-            Self::Dense(mat) => {
-                let factor = crate::utils::StableSolver::new()
-                    .factorize(mat)
-                    .map_err(|e| format!("Dense SymmetricMatrix factorization failed: {e:?}"))?;
-                Ok(Box::new(factor))
-            }
-            Self::Sparse(mat) => {
-                let factor = crate::sparse_exact::factorize_sparse_spd(mat)
-                    .map_err(|e| format!("Sparse SymmetricMatrix factorization failed: {e:?}"))?;
-                Ok(Box::new(factor))
-            }
-        }
-    }
-
-    /// Strict factorization for covariance and other SPD-only estimands.
+    /// SPD factorization, with one contract for both storages (gam#3696).
     ///
-    /// No LDLT/LBLT route and no diagonal jitter is admitted: dense matrices
-    /// must pass an unperturbed Cholesky factorization, while sparse matrices
-    /// use the existing exact sparse-SPD factorization.
-    pub fn factorize_spd(&self) -> Result<Box<dyn FactorizedSystem>, String> {
+    /// No LDLT/LBLT route and no diagonal jitter is admitted: the matrix must
+    /// pass an unperturbed Cholesky factorization whose every pivot clears its
+    /// derived roundoff band, whether it is stored dense or sparse. An
+    /// indefinite or numerically singular matrix is an error on either
+    /// storage, never a silently accepted indefinite factor.
+    pub fn factorize(&self) -> Result<Box<dyn FactorizedSystem>, String> {
         match self {
             Self::Dense(matrix) => {
                 crate::utils::validate_finite_symmetric_matrix(
@@ -138,7 +124,7 @@ impl SymmetricMatrix {
                 }
                 Ok(Box::new(factor) as Box<dyn FactorizedSystem>)
             }
-            Self::Sparse(matrix) => crate::sparse_exact::factorize_sparse_spd_strict(matrix)
+            Self::Sparse(matrix) => crate::sparse_exact::factorize_sparse_spd_certified(matrix)
                 .map(|factor| Box::new(factor) as Box<dyn FactorizedSystem>)
                 .map_err(|error| {
                     format!("Sparse SymmetricMatrix strict SPD factorization failed: {error:?}")
@@ -612,9 +598,73 @@ mod tests {
         // against the largest diagonal, gamma_(4)·1e16 exceeds the second pivot
         // 1, so the matrix was refused as numerically singular.
         let badly_scaled = SymmetricMatrix::Dense(array![[1.0e16_f64, 0.0], [0.0, 1.0]]);
-        assert!(badly_scaled.factorize_spd().is_ok());
+        assert!(badly_scaled.factorize().is_ok());
         // Control: `dense2x2` has the exact null vector (2, -1) and stays refused.
-        assert!(dense2x2().factorize_spd().is_err());
+        assert!(dense2x2().factorize().is_err());
+    }
+
+    /// The same matrix in both storages `SymmetricMatrix` admits: dense, and
+    /// sparse holding the upper triangle (the convention `to_dense` reads).
+    fn every_storage(matrix: &Array2<f64>) -> [SymmetricMatrix; 2] {
+        use faer::sparse::{SparseColMat, Triplet};
+        let n = matrix.nrows();
+        let upper: Vec<Triplet<usize, usize, f64>> = (0..n)
+            .flat_map(|column| (0..=column).map(move |row| (row, column)))
+            .filter(|&(row, column)| matrix[[row, column]] != 0.0)
+            .map(|(row, column)| Triplet::new(row, column, matrix[[row, column]]))
+            .collect();
+        let sparse = SparseColMat::try_new_from_triplets(n, n, &upper).expect("upper CSC");
+        [
+            SymmetricMatrix::Dense(matrix.clone()),
+            SymmetricMatrix::Sparse(sparse),
+        ]
+    }
+
+    #[test]
+    fn factorize_has_one_spd_contract_on_every_storage() {
+        // gam#3696: the dense arm used to fall through LLT -> LDLT -> LBLT and
+        // hand back a factor of an indefinite matrix, while the sparse arm
+        // refused the same matrix. Both matrices below are exactly
+        // representable and have no SPD factor at all: [[1, 2], [2, 1]] has
+        // eigenvalues 3 and -1, and -I is negative definite.
+        for indefinite in [
+            array![[1.0_f64, 2.0], [2.0, 1.0]],
+            array![[-1.0_f64, 0.0], [0.0, -1.0]],
+        ] {
+            for (storage, matrix) in every_storage(&indefinite).iter().enumerate() {
+                assert!(
+                    matrix.factorize().is_err(),
+                    "storage {storage} accepted the indefinite matrix {indefinite:?}"
+                );
+            }
+        }
+
+        // Control: an SPD matrix factors on every storage and every factor
+        // solves it. B = [[3, 1], [1, 2]] has B^{-1} = [[2, -1], [-1, 3]] / 5,
+        // so B x = (1, 1) has the exact solution x = (1/5, 2/5). The forward
+        // error of a Cholesky solve is bounded by kappa_inf(B) times a
+        // Wilkinson growth factor; kappa_inf(B) = ||B||_inf ||B^{-1}||_inf.
+        let spd = array![[3.0_f64, 1.0], [1.0, 2.0]];
+        let rhs = array![1.0_f64, 1.0];
+        let exact = array![0.2_f64, 0.4];
+        let kappa_inf = 4.0 * (4.0 / 5.0);
+        let exact_norm = exact
+            .iter()
+            .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+        let bound = kappa_inf * crate::roundoff::accumulation_growth(4 * spd.nrows()) * exact_norm;
+        for (storage, matrix) in every_storage(&spd).iter().enumerate() {
+            let factor = matrix
+                .factorize()
+                .unwrap_or_else(|error| panic!("storage {storage} refused an SPD matrix: {error}"));
+            let solved = factor.solve(&rhs).expect("SPD solve");
+            let error = (&solved - &exact)
+                .iter()
+                .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+            assert!(
+                error <= bound,
+                "storage {storage}: forward error {error:e} exceeds kappa-derived bound {bound:e}"
+            );
+        }
     }
 
     // ── variant dispatch ──────────────────────────────────────────────────────
