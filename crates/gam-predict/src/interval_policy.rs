@@ -588,6 +588,22 @@ pub struct LinearState {
     /// for a [`ResponseInterval::TransformIndex`] transform; `None` for every
     /// other policy and whenever no covariance is available.
     pub response_index: Option<ResponseIndex>,
+    /// The posterior-mean point's derivative in the model's score column,
+    /// integrated at the same posterior nodes as `mean`. `None` for every
+    /// predictor without a score column and for every pass that does not
+    /// integrate the posterior mean over those nodes.
+    pub score_derivative: Option<ScoreDerivative>,
+}
+
+/// `∂/∂z` of a posterior-mean probability `p̄(z) = E_θ[Φ(η(θ, z))]`, `z` the
+/// score column as supplied, one entry per row.
+#[derive(Clone, Debug)]
+pub struct ScoreDerivative {
+    /// `p̄′(z) = E_θ[φ(η)·∂η/∂z]`, on the probability scale.
+    pub mean: Array1<f64>,
+    /// `∂Φ⁻¹(p̄)/∂z = p̄′/φ(Φ⁻¹(p̄))`, on the probit scale. NaN where `p̄`
+    /// rounds to 0 or 1 and has no finite probit.
+    pub probit: Array1<f64>,
 }
 
 /// Family-specific supplier for the shared predict pipeline.
@@ -970,6 +986,7 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
         eta_standard_error: cond_eta_se.clone(),
         mean: state.mean,
         mean_standard_error: None,
+        score_derivative: state.score_derivative,
         mean_lower: None,
         mean_upper: None,
         observation_lower: None,
@@ -1204,6 +1221,10 @@ pub struct PredictionColumns {
     pub linear_predictor_plugin: Array1<f64>,
     pub mean_plugin: Array1<f64>,
     pub posterior_mean: Option<Array1<f64>>,
+    /// The posterior mean's derivative in the model's score column
+    /// ([`LinearState::score_derivative`]); the same in every arm below,
+    /// because an interval request never moves the point.
+    pub score_derivative: Option<ScoreDerivative>,
     /// Link-scale posterior SD `SE(η) = √diag(X V Xᵀ)` under the covariance
     /// the band was built from; the response-scale credible bounds are the
     /// inverse link applied to the η quantiles this SD defines.
@@ -1284,6 +1305,7 @@ pub fn resolve_prediction_request(
                     )
                 })?;
             Ok(PredictionColumns {
+                score_derivative: prediction.score_derivative,
                 linear_predictor_plugin: plugin.eta,
                 mean_plugin: plugin.mean,
                 posterior_mean: Some(prediction.mean),
@@ -1314,6 +1336,7 @@ pub fn resolve_prediction_request(
             let prediction = predictor.predict_full_uncertainty(input, fit, &options)?;
             let mean_plugin = prediction.mean.clone();
             Ok(PredictionColumns {
+                score_derivative: None,
                 linear_predictor_plugin: prediction.eta,
                 mean_plugin: mean_plugin.clone(),
                 posterior_mean: Some(mean_plugin),
@@ -1344,6 +1367,7 @@ pub fn resolve_prediction_request(
                 &PosteriorMeanOptions::point_only(),
             )?;
             Ok(PredictionColumns {
+                score_derivative: prediction.score_derivative,
                 linear_predictor_plugin: plugin.eta,
                 mean_plugin: plugin.mean,
                 posterior_mean: Some(prediction.mean),
@@ -1364,6 +1388,7 @@ pub fn resolve_prediction_request(
             let prediction = predictor.predict_plugin_response(input)?;
             let mean_plugin = prediction.mean.clone();
             Ok(PredictionColumns {
+                score_derivative: None,
                 linear_predictor_plugin: prediction.eta,
                 mean_plugin: mean_plugin.clone(),
                 posterior_mean: Some(mean_plugin),
@@ -1711,6 +1736,7 @@ mod parity_tests {
 
         // No level: bounds stay None.
         let mut none_result = PredictPosteriorMeanResult {
+            score_derivative: None,
             eta: eta.clone(),
             eta_standard_error: eta_se.clone(),
             mean: mean.clone(),
@@ -1743,6 +1769,7 @@ mod parity_tests {
         let ref_mean_upper = logistic(&ref_eta_upper).unwrap();
 
         let mut some_result = PredictPosteriorMeanResult {
+            score_derivative: None,
             eta: eta.clone(),
             eta_standard_error: eta_se.clone(),
             mean: mean.clone(),

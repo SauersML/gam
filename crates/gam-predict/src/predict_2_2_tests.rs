@@ -40,6 +40,7 @@ fn predict_uncertainty_bounds_track_requested_alpha_level_for_logit() {
 #[test]
 fn enrich_posterior_mean_bounds_clamps_domains_for_probability_and_count_families() {
     let mut beta_result = PredictPosteriorMeanResult {
+        score_derivative: None,
         eta: array![-4.0, 4.0],
         eta_standard_error: array![3.0, 3.0],
         mean: array![0.2, 0.8],
@@ -70,6 +71,7 @@ fn enrich_posterior_mean_bounds_clamps_domains_for_probability_and_count_familie
     }
 
     let mut pois_result = PredictPosteriorMeanResult {
+        score_derivative: None,
         eta: array![-3.0, 1.0],
         eta_standard_error: array![5.0, 5.0],
         mean: array![0.0, 0.0],

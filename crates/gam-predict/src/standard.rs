@@ -178,6 +178,7 @@ impl StandardPredictor {
             })
             .collect::<Result<Array1<f64>, _>>()?;
         Ok(LinearState {
+            score_derivative: None,
             eta: plugin.eta,
             mean,
             eta_se: Some(eta_se),
@@ -199,6 +200,7 @@ impl PredictionTransform for StandardPredictor {
     fn point_state(&self, input: &PredictInput) -> Result<LinearState, EstimationError> {
         let with_se = self.predict_with_uncertainty(input)?;
         Ok(LinearState {
+            score_derivative: None,
             eta: with_se.eta,
             mean: with_se.mean,
             eta_se: with_se.eta_se,
@@ -241,6 +243,7 @@ impl PredictionTransform for StandardPredictor {
                 let (eta, mean, eta_se, mean_se) =
                     self.wiggle_state_from_backend(input, &backend)?;
                 Ok(LinearState {
+                    score_derivative: None,
                     eta,
                     mean,
                     eta_se: Some(eta_se),

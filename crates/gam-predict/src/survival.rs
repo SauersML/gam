@@ -240,6 +240,7 @@ impl SurvivalPredictor {
             design_noise,
         )?;
         Ok(LinearState {
+            score_derivative: None,
             eta: eta_threshold,
             mean: survival_prob,
             eta_se: Some(eta_se),
@@ -263,6 +264,7 @@ impl SurvivalPredictor {
             let (eta_threshold, eta_log_sigma, _) = self.linear_predictors(input)?;
             let survival_prob = self.compute_survival(&eta_threshold, &eta_log_sigma)?;
             Ok(LinearState {
+                score_derivative: None,
                 eta: eta_threshold,
                 mean: survival_prob,
                 eta_se: None,
@@ -367,6 +369,7 @@ impl PredictionTransform for SurvivalPredictor {
                     design_noise,
                 )?;
                 Ok(LinearState {
+                    score_derivative: None,
                     eta: eta_threshold,
                     mean,
                     eta_se: Some(eta_se),

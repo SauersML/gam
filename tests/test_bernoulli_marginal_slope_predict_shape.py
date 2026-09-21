@@ -262,6 +262,30 @@ def test_withheld_fit_point_note_reaches_the_prediction_dict_2985(monkeypatch: A
     assert "point_covariance_note" not in plain
 
 
+def test_bernoulli_marginal_slope_table_carries_the_score_derivative(monkeypatch: Any) -> None:
+    """The point's analytic derivative in the score column reaches the table as
+    the Rust core emitted it, beside the clipped probability, interval or not."""
+    columns = {
+        "linear_predictor": [-0.2, 0.3],
+        "mean": [0.43, 0.61],
+        "mean_score_derivative": [0.11, 0.09],
+        "probit_score_derivative": [0.28, 0.24],
+    }
+    payload = _payload(
+        "marginal-slope",
+        "bernoulli-marginal-slope",
+        "marginal_slope_probability",
+        "mean",
+        columns,
+    )
+
+    out = _dispatch(monkeypatch, payload, return_type="dict")
+
+    assert list(out) == ["mean", "mean_score_derivative", "probit_score_derivative"]
+    np.testing.assert_array_equal(out["mean_score_derivative"], [0.11, 0.09])
+    np.testing.assert_array_equal(out["probit_score_derivative"], [0.28, 0.24])
+
+
 def test_bernoulli_marginal_slope_no_interval_stays_1d(monkeypatch: Any) -> None:
     """Without an interval request the marginal-slope point payload is still a
     bare 1-D probability vector even if the backend volunteered extra columns —

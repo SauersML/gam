@@ -243,6 +243,7 @@ impl PredictionTransform for DispersionLocationScalePredictor {
             (None, None)
         };
         Ok(LinearState {
+            score_derivative: None,
             eta,
             mean,
             eta_se,
@@ -282,6 +283,7 @@ impl PredictionTransform for DispersionLocationScalePredictor {
             }
         };
         Ok(LinearState {
+            score_derivative: None,
             eta,
             mean,
             eta_se: Some(eta_se),

@@ -140,6 +140,32 @@ impl FittedLatentScoreMap<'_> {
             .map_err(EstimationError::InvalidInput)
     }
 
+    /// `∂ζ/∂z_raw` of each row, the latent score `ζ` against the score column as
+    /// supplied: `1/sd` from the normalisation, times `1/√v(a)` under a
+    /// conditional location-scale calibration. `None` under a rank-INT
+    /// calibration, whose interpolated empirical CDF has a kink at every knot.
+    pub(crate) fn raw_score_derivative(
+        &self,
+        primary_design: &DesignMatrix,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        if self.rank_int.is_some() {
+            return Ok(None);
+        }
+        let normalised = 1.0 / self.normalization.sd;
+        let Some(cal) = self.conditional else {
+            return Ok(Some(Array1::from_elem(primary_design.nrows(), normalised)));
+        };
+        let design = primary_design.to_dense();
+        let a_block = self.conditioning_span(design.view())?;
+        Ok(Some(
+            a_block
+                .rows()
+                .into_iter()
+                .map(|a_row| normalised / cal.conditional_var(a_row).sqrt())
+                .collect(),
+        ))
+    }
+
     /// The calibration steps on normalised scores: the rank-INT or the
     /// conditional location-scale map, whichever the fit minted.
     pub(crate) fn calibrate(
@@ -214,6 +240,9 @@ impl FittedLatentScoreMap<'_> {
 /// [`BernoulliMarginalSlopePredictor::anchored_row_kernels`].
 pub struct AnchoredRowKernel {
     z: f64,
+    /// `∂z/∂z_raw`, the latent score against the score column as supplied;
+    /// `None` where the fitted score map is not differentiable (rank-INT).
+    z_per_raw_score: Option<f64>,
     probit_scale: f64,
     base_link: InverseLink,
     /// `None` is the rigid standard-normal law; `Some` is the declared
@@ -258,6 +287,15 @@ impl AnchoredRowKernel {
                 Ok(intercept + sb * self.z)
             }
         }
+    }
+
+    /// `(∂η/∂z_raw)/b`, the score column as supplied: `s·∂z/∂z_raw`. The anchor
+    /// integrates the latent law and never reads this row's score, so the
+    /// direct `s·b·z` term carries the whole dependence and `∂η/∂z_raw` is this
+    /// times the slope `b`.
+    pub fn eta_raw_score_derivative_per_slope(&self) -> Option<f64> {
+        self.z_per_raw_score
+            .map(|z_per_raw| self.probit_scale * z_per_raw)
     }
 
     /// [`Self::eta`] together with its partials `(η, ∂η/∂q, ∂η/∂b)` at the
@@ -2628,11 +2666,15 @@ impl BernoulliMarginalSlopePredictor {
             ));
         }
         let z = self.prediction_latent_z(input)?;
+        let z_per_raw_score = self
+            .latent_score_map()
+            .raw_score_derivative(&input.design)?;
         let probit_scale = self.probit_frailty_scale();
         (0..z.len())
             .map(|row| {
                 Ok(AnchoredRowKernel {
                     z: z[row],
+                    z_per_raw_score: z_per_raw_score.as_ref().map(|d| d[row]),
                     probit_scale,
                     base_link: self.base_link.clone(),
                     grid: self.empirical_grid_for_prediction_row(input, row)?,

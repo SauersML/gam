@@ -309,7 +309,14 @@ class Model:
               (``pred["posterior_mean"]``) and column attributes
               (``pred.posterior_mean``, ``pred.posterior_mean_standard_error``,
               ``pred.posterior_mean_lower``, ``pred.posterior_mean_upper``).
-            * Bernoulli marginal-slope: a 1-D ``ndarray`` of probabilities.
+            * Bernoulli marginal-slope: a 1-D ``ndarray`` of probabilities. Its
+              table form carries ``mean`` and, for a fit with no score warp,
+              link deviation or residual repair block, the analytic
+              derivative of that posterior-mean probability in the score
+              column as supplied: ``mean_score_derivative``
+              (``d mean / dz``) and ``probit_score_derivative``
+              (``d probit(mean) / dz``, NaN where ``mean`` rounds to 0 or 1).
+              Both come from the posterior nodes that integrate ``mean``.
             * Transformation-normal: a 1-D ``ndarray`` of the response-scale
               conditional mean ``E[Y|x]`` (issue #1612), a covariate-only
               quantity that does not require the outcome column.

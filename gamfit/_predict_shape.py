@@ -198,7 +198,8 @@ def _point_payload_spec(
       coefficient covariance, so they are clipped to ``(0, 1)`` exactly like
       the point ``mean``; ``std_error`` is the probability-scale posterior SE
       (the documented response-scale column, not the η-scale SE) and is left
-      untouched.
+      untouched. ``mean_score_derivative`` / ``probit_score_derivative`` (the
+      point's analytic derivative in the score column) are carried as emitted.
     * **joint expectile fit** — one curve per expectile level: an ``(n, K)``
       array whose columns are the Rust ``point_columns`` (``expectile_{tau}``,
       increasing level order); table form is the full payload, which carries
@@ -241,6 +242,9 @@ def _point_payload_spec(
         if has_interval and "linear_predictor" in columns:
             table_columns["linear_predictor"] = columns["linear_predictor"]
         table_columns[point_column] = probs
+        for derivative_key in ("mean_score_derivative", "probit_score_derivative"):
+            if derivative_key in columns:
+                table_columns[derivative_key] = columns[derivative_key]
         if has_interval:
             table_columns["std_error"] = columns["std_error"]
             for bound_key in (

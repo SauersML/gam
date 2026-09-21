@@ -389,6 +389,7 @@ fn posterior_mean_payload_field_audits(payload: &PredictPosteriorMeanResult) -> 
         eta,
         eta_standard_error,
         mean,
+        score_derivative,
         mean_standard_error,
         mean_lower,
         mean_upper,
@@ -402,6 +403,7 @@ fn posterior_mean_payload_field_audits(payload: &PredictPosteriorMeanResult) -> 
         eta,
         eta_standard_error,
         mean,
+        score_derivative,
         mean_standard_error,
         mean_lower,
         mean_upper,
@@ -415,6 +417,8 @@ fn posterior_mean_payload_field_audits(payload: &PredictPosteriorMeanResult) -> 
         FieldAudit::point("eta"),
         FieldAudit::audited("eta_standard_error", "eta_credible_band_conditional"),
         FieldAudit::point("mean"),
+        // The point's own derivative in the score column: a point, not a band.
+        FieldAudit::point("score_derivative"),
         FieldAudit::audited("mean_standard_error", "mean_credible_band_conditional"),
         FieldAudit::audited("mean_lower", "mean_credible_band_conditional"),
         FieldAudit::audited("mean_upper", "mean_credible_band_conditional"),
@@ -607,6 +611,7 @@ fn payload_probe() -> PredictUncertaintyResult {
 fn posterior_mean_probe() -> PredictPosteriorMeanResult {
     let one = Array1::<f64>::zeros(1);
     PredictPosteriorMeanResult {
+        score_derivative: None,
         eta: one.clone(),
         eta_standard_error: one.clone(),
         mean: one.clone(),

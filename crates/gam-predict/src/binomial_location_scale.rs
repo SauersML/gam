@@ -111,6 +111,7 @@ impl BinomialLocationScalePredictor {
                 let (q0_base, _, _) = self.compute_q0_and_sigma(input)?;
                 let (eta, prob) = self.apply_link(&q0_base)?;
                 Ok(LinearState {
+                    score_derivative: None,
                     eta,
                     mean: prob,
                     eta_se: None,
@@ -135,6 +136,7 @@ impl BinomialLocationScalePredictor {
         let eta_se = self.link_argument_se_from_backend(input, backend, &q0_base, &sigma, &eta_t)?;
         let mean_se = Array1::from_shape_fn(eta_se.len(), |i| dmu_deta[i].abs() * eta_se[i]);
         Ok(LinearState {
+            score_derivative: None,
             eta,
             mean: prob,
             eta_se: Some(eta_se),
@@ -446,6 +448,7 @@ impl BinomialLocationScalePredictor {
         // `eta` is the inverse-link argument at the mode and `eta_se` its SD;
         // the band is their inverse-link image, inside `[0, 1]` by construction.
         Ok(LinearState {
+            score_derivative: None,
             eta,
             mean,
             eta_se: Some(eta_se),

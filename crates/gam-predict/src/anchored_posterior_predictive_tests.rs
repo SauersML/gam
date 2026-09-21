@@ -482,3 +482,99 @@ fn anchored_posterior_predictive_matches_monte_carlo_over_the_coefficient_poster
         fitted[2], fitted[3]
     );
 }
+
+/// The published posterior mean at every prediction row, the score column
+/// moved by `shift`.
+fn published_mean_at(
+    model: &FittedModel,
+    predictor: &BernoulliMarginalSlopePredictor,
+    fit: &UnifiedFitResult,
+    shift: f64,
+) -> Array1<f64> {
+    let (mut data, col_map, _) = prediction_frame();
+    data.column_mut(col_map["z"]).mapv_inplace(|z| z + shift);
+    predictor
+        .predict_posterior_mean(
+            &predict_input_for(model, &data, &col_map),
+            fit,
+            &PosteriorMeanOptions::point_only(),
+        )
+        .expect("posterior-mean pass")
+        .mean
+}
+
+/// Five-point central difference of the published posterior mean in the score
+/// column, step `h`.
+fn published_mean_difference(
+    model: &FittedModel,
+    predictor: &BernoulliMarginalSlopePredictor,
+    fit: &UnifiedFitResult,
+    h: f64,
+) -> Array1<f64> {
+    let at = |shift: f64| published_mean_at(model, predictor, fit, shift);
+    (at(-2.0 * h) - at(2.0 * h) + (at(h) - at(-h)) * 8.0) / (12.0 * h)
+}
+
+/// The posterior-mean pass reports `∂p̄/∂z` and `∂Φ⁻¹(p̄)/∂z` from the nodes
+/// that integrate `p̄`. The reference differences the published `p̄` itself at
+/// two steps; their disagreement bounds the finer one's truncation error, and
+/// the rounding of five probabilities over `12h` bounds the rest.
+#[test]
+fn the_posterior_mean_pass_reports_its_own_score_derivative() {
+    init_parallelism();
+    let model = fit_marginal_slope_model(400, 20260916);
+    let fit = model
+        .fit_result
+        .clone()
+        .expect("fitted model carries its fit result");
+    let mut wide_fit = fit.clone();
+    let wide_cov = fit.beta_covariance().expect("covariance").mapv(|v| 9.0 * v);
+    wide_fit.covariance_conditional = Some(wide_cov.clone());
+    let rigid = model
+        .bernoulli_marginal_slope_predictor()
+        .expect("fitted marginal-slope predictor");
+    let mut empirical = model
+        .bernoulli_marginal_slope_predictor()
+        .expect("fitted marginal-slope predictor");
+    empirical.latent_measure = LatentMeasureKind::GlobalEmpirical {
+        grid: heavy_tailed_grid(),
+    };
+    empirical.covariance = Some(wide_cov);
+
+    let (data, col_map, cells) = prediction_frame();
+    let input = predict_input_for(&model, &data, &col_map);
+    // A step wide enough that the stencil's truncation error, which the two
+    // steps measure, stands far above the anchor root solve's own resolution.
+    let h = 0.25;
+    for (label, predictor, fit) in [
+        ("rigid/fitted-V", &rigid, &fit),
+        ("empirical/9×V", &empirical, &wide_fit),
+    ] {
+        let published = predictor
+            .predict_posterior_mean(&input, fit, &PosteriorMeanOptions::point_only())
+            .expect("posterior-mean pass");
+        let derivative = published
+            .score_derivative
+            .expect("an untransformed score is differentiable");
+        let coarse = published_mean_difference(&model, predictor, fit, h);
+        let fine = published_mean_difference(&model, predictor, fit, h / 2.0);
+        let rounding = 18.0 * f64::EPSILON / (12.0 * h / 2.0);
+        for row in 0..cells.len() {
+            let band = (coarse[row] - fine[row]).abs() + rounding;
+            assert!(
+                (derivative.mean[row] - fine[row]).abs() <= band,
+                "[{label}] row {row} {:?}: analytic dp/dz {:.12e}, differenced {:.12e}, band {band:.2e}",
+                cells[row],
+                derivative.mean[row],
+                fine[row],
+            );
+            let probit_p = gam_math::probability::standard_normal_quantile(published.mean[row])
+                .expect("an interior probability has a probit");
+            assert_eq!(
+                derivative.probit[row].to_bits(),
+                (derivative.mean[row] / gam_math::probability::normal_pdf(probit_p)).to_bits(),
+                "[{label}] the probit-scale derivative is the chain rule on the published mean at row {row}"
+            );
+        }
+    }
+}

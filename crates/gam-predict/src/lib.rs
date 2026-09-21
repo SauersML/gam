@@ -28,6 +28,7 @@ use crate::binomial_location_scale::BinomialLocationScalePredictor;
 pub(crate) use crate::dispersion_location_scale::DispersionLocationScalePredictor;
 use crate::gaussian_location_scale::GaussianLocationScalePredictor;
 pub use gam_inference::interval_reference::IntervalReference;
+pub use crate::interval_policy::ScoreDerivative;
 use crate::interval_policy::{
     EtaDomain, LinearState, MeanBoundMethod, PassCovariance, PredictPass, PredictionTransform,
     ResponseBounds,
@@ -981,14 +982,15 @@ fn padded_design_standard_errors_from_backend(
 /// Posterior mean of `integrand(η₀, η₁)` under `N(mu, cov)`, integrated over
 /// every direction in which `cov` carries variance
 /// ([`gam_solve::quadrature::BivariateNormalSupport`]).
-fn projected_bivariate_posterior_mean_result<F>(
+fn projected_bivariate_posterior_mean_result<F, R>(
     quadctx: &gam_solve::quadrature::QuadratureContext,
     mu: [f64; 2],
     cov: [[f64; 2]; 2],
     integrand: F,
-) -> Result<f64, EstimationError>
+) -> Result<R, EstimationError>
 where
-    F: Fn(f64, f64) -> Result<f64, EstimationError>,
+    F: Fn(f64, f64) -> Result<R, EstimationError>,
+    R: gam_solve::quadrature::GhqValue,
 {
     if !cov.iter().flatten().all(|entry| entry.is_finite()) {
         return Err(EstimationError::InvalidInput(format!(
@@ -1466,6 +1468,9 @@ pub struct PredictPosteriorMeanResult {
     /// tables (#1536) so the reported SE matches the `mean`/`mean_lower`/
     /// `mean_upper` columns beside it instead of the link-scale `σ_η`.
     pub mean_standard_error: Option<Array1<f64>>,
+    /// The point's analytic sensitivity to the model's score column, where
+    /// the predictor has one ([`LinearState::score_derivative`]).
+    pub score_derivative: Option<ScoreDerivative>,
     /// Response-scale lower confidence bound (set by
     /// `enrich_posterior_mean_bounds`).
     pub mean_lower: Option<Array1<f64>>,
@@ -1771,6 +1776,7 @@ fn predict_gam_posterior_mean_from_backend(
         .collect();
 
     Ok(PredictPosteriorMeanResult {
+        score_derivative: None,
         eta,
         eta_standard_error,
         mean: Array1::from_vec(means?),
@@ -5509,6 +5515,7 @@ mod tests {
             let n = mean.len();
             let eta = mean.mapv(|survival| (-survival.ln()).ln());
             Ok(LinearState {
+                score_derivative: None,
                 eta,
                 mean,
                 eta_se: Some(Array1::from_elem(n, 0.01)),

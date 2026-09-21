@@ -171,6 +171,7 @@ impl PredictionTransform for TransformationNormalPredictor {
         // posterior does not have.
         let h = input.offset.clone();
         Ok(LinearState {
+            score_derivative: None,
             eta: h.clone(),
             mean: h,
             eta_se: None,
@@ -255,6 +256,7 @@ impl PredictableModel for TransformationNormalPredictor {
         let h = posterior_mean_response(input)?;
         let n = h.len();
         let mut result = PredictPosteriorMeanResult {
+            score_derivative: None,
             eta: h.clone(),
             // The result struct requires an SE array; epistemic uncertainty is
             // unavailable (see the struct-level contract), so no credible

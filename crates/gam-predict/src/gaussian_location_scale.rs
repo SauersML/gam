@@ -278,6 +278,7 @@ impl PredictionTransform for GaussianLocationScalePredictor {
             (None, None)
         };
         Ok(LinearState {
+            score_derivative: None,
             eta,
             mean,
             eta_se,
@@ -311,6 +312,7 @@ impl PredictionTransform for GaussianLocationScalePredictor {
             self.eta_standard_error_from_backend(input, &backend, eta.len(), p_mu, p_sigma, p_w)?;
         let mean = eta.clone();
         Ok(LinearState {
+            score_derivative: None,
             eta,
             mean,
             eta_se: Some(eta_se.clone()),

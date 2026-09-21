@@ -7188,6 +7188,18 @@ fn predict_columns(
             columns.insert("mean_upper".to_string(), upper.to_vec());
         }
     }
+    // The posterior mean's analytic derivative in the score column, from the
+    // same posterior nodes as the point; present where the predictor has one.
+    if let Some(score_derivative) = resolved.score_derivative {
+        columns.insert(
+            "mean_score_derivative".to_string(),
+            score_derivative.mean.to_vec(),
+        );
+        columns.insert(
+            "probit_score_derivative".to_string(),
+            score_derivative.probit.to_vec(),
+        );
+    }
     // Observation (prediction) interval: present only when the request was made
     // AND the family exposes a conditional response variance. Separate columns
     // keep the standard schema untouched when off and never overwrite the

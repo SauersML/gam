@@ -1,4 +1,5 @@
 use super::*;
+use gam_math::probability::{normal_pdf, standard_normal_quantile};
 
 fn bernoulli_eta_standard_error_from_covariance(
     predictor: &BernoulliMarginalSlopePredictor,
@@ -86,6 +87,21 @@ pub fn bernoulli_marginal_slope_posterior_mean(
     fit: &UnifiedFitResult,
     integration: AnchoredPosteriorIntegration,
 ) -> Result<Array1<f64>, EstimationError> {
+    posterior_mean_and_score_derivative(predictor, input, fit, integration).map(|(mean, _)| mean)
+}
+
+/// [`bernoulli_marginal_slope_posterior_mean`] with the point's derivative in
+/// the score column beside it. The exact integration accumulates both at the
+/// same nodes, off one anchor solve per node: `p̄ = E[Φ(η)]` and
+/// `p̄′ = E[φ(η)·∂η/∂z]`, where `∂η/∂z = s·b·∂ζ/∂z` because the anchor never
+/// reads the row's own score. The shortcuts integrate no nodes and report
+/// none, and so does a fitted score map that is not differentiable.
+fn posterior_mean_and_score_derivative(
+    predictor: &BernoulliMarginalSlopePredictor,
+    input: &PredictInput,
+    fit: &UnifiedFitResult,
+    integration: AnchoredPosteriorIntegration,
+) -> Result<(Array1<f64>, Option<ScoreDerivative>), EstimationError> {
     let theta = predictor.theta();
     let eta = predictor.final_eta_from_theta(input, &theta)?;
     let backend = || {
@@ -107,10 +123,10 @@ pub fn bernoulli_marginal_slope_posterior_mean(
         })
     };
     match integration {
-        AnchoredPosteriorIntegration::PlugIn => predictor.mean_from_eta(&eta),
+        AnchoredPosteriorIntegration::PlugIn => Ok((predictor.mean_from_eta(&eta)?, None)),
         AnchoredPosteriorIntegration::LinearisedAnchorGaussian => {
             let eta_se = bernoulli_eta_standard_error_from_backend(predictor, input, &backend()?)?;
-            gaussian_eta_mean(&eta_se)
+            Ok((gaussian_eta_mean(&eta_se)?, None))
         }
         AnchoredPosteriorIntegration::FrozenAnchorGaussian
         | AnchoredPosteriorIntegration::ExactAnchor => {
@@ -139,25 +155,58 @@ pub fn bernoulli_marginal_slope_posterior_mean(
                         (sz * sz * var_b_i).sqrt()
                     },
                 ));
-                return gaussian_eta_mean(&eta_se);
+                return Ok((gaussian_eta_mean(&eta_se)?, None));
             }
             // Exact: every quadrature node re-solves the anchor. Rows are
             // independent, and an empirical law costs a root solve per node,
             // so spread them across the pool.
-            let rows: Result<Vec<f64>, EstimationError> = (0..eta.len())
-                .into_par_iter()
-                .map(|i| {
-                    PREDICT_QUADRATURE_CONTEXT.with(|quadctx| {
-                        projected_bivariate_posterior_mean_result(
-                            quadctx,
-                            [q[i], b[i]],
-                            [[var_q[i], cov_qb[i]], [cov_qb[i], var_b[i]]],
-                            |q_node, b_node| Ok(normal_cdf(kernels[i].eta(q_node, b_node)?)),
-                        )
-                    })
+            let integrate = |i: usize, eta_z_per_slope: Option<f64>| {
+                PREDICT_QUADRATURE_CONTEXT.with(|quadctx| {
+                    projected_bivariate_posterior_mean_result(
+                        quadctx,
+                        [q[i], b[i]],
+                        [[var_q[i], cov_qb[i]], [cov_qb[i], var_b[i]]],
+                        |q_node, b_node| {
+                            let eta_node = kernels[i].eta(q_node, b_node)?;
+                            let mean_z = eta_z_per_slope
+                                .map_or(0.0, |per_slope| normal_pdf(eta_node) * per_slope * b_node);
+                            Ok((normal_cdf(eta_node), mean_z))
+                        },
+                    )
                 })
+            };
+            let eta_z_per_slope: Option<Vec<f64>> = kernels
+                .iter()
+                .map(|kernel| kernel.eta_raw_score_derivative_per_slope())
                 .collect();
-            Ok(Array1::from_vec(rows?))
+            let rows: Vec<(f64, f64)> = (0..eta.len())
+                .into_par_iter()
+                .map(|i| integrate(i, eta_z_per_slope.as_ref().map(|per_slope| per_slope[i])))
+                .collect::<Result<_, EstimationError>>()?;
+            let (mean, mean_z): (Vec<f64>, Vec<f64>) = rows.into_iter().unzip();
+            let score_derivative = match eta_z_per_slope {
+                None => None,
+                Some(_) => {
+                    let probit = mean
+                        .iter()
+                        .zip(&mean_z)
+                        .map(|(&p, &p_z)| {
+                            if p > 0.0 && p < 1.0 {
+                                standard_normal_quantile(p)
+                                    .map(|probit_p| p_z / normal_pdf(probit_p))
+                                    .map_err(EstimationError::InvalidInput)
+                            } else {
+                                Ok(f64::NAN)
+                            }
+                        })
+                        .collect::<Result<Array1<f64>, _>>()?;
+                    Some(ScoreDerivative {
+                        mean: Array1::from_vec(mean_z),
+                        probit,
+                    })
+                }
+            };
+            Ok((Array1::from_vec(mean), score_derivative))
         }
     }
 }
@@ -184,6 +233,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
             (None, None)
         };
         Ok(LinearState {
+            score_derivative: None,
             eta,
             mean,
             eta_se,
@@ -215,6 +265,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
                 let mean = self.mean_from_eta(&eta)?;
                 let mean_se = eta_se.clone() * self.mean_derivative_from_eta(&eta)?;
                 Ok(LinearState {
+                    score_derivative: None,
                     eta,
                     mean,
                     eta_se: Some(eta_se),
@@ -236,7 +287,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
                 // ANCHORED model: the anchor is re-solved at every coefficient
                 // node, not linearised at θ̂ and pushed through the Gaussian
                 // probit identity (`AnchoredPosteriorIntegration` names both).
-                let mean = bernoulli_marginal_slope_posterior_mean(
+                let (mean, score_derivative) = posterior_mean_and_score_derivative(
                     self,
                     input,
                     fit,
@@ -247,6 +298,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
                 // reported as a probability-scale SE.
                 let mean_se = eta_se.clone() * self.mean_derivative_from_eta(&eta)?;
                 Ok(LinearState {
+                    score_derivative,
                     eta,
                     mean,
                     eta_se: Some(eta_se),

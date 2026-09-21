@@ -1069,6 +1069,7 @@ pub(crate) fn run_predict_unified(
         point_covariance,
         uncertainty_covariance,
         point_provenance,
+        score_derivative,
     ) = (
         columns.linear_predictor_plugin,
         columns.mean_plugin,
@@ -1082,6 +1083,7 @@ pub(crate) fn run_predict_unified(
         columns.point_covariance_source,
         columns.uncertainty_covariance_source,
         columns.point_covariance_provenance,
+        columns.score_derivative,
     );
     let specialised_point = posterior_mean
         .as_ref()
@@ -1154,11 +1156,12 @@ pub(crate) fn run_predict_unified(
             // reads back through `csv_mean_at`. The binary schema keeps `mean`
             // and adds the derived probabilities, which is what both callers
             // need.
-            write_survival_binary_prediction_csv(
+            write_marginal_slope_prediction_csv(
                 &args.out,
                 linear_predictor_plugin.view(),
                 mean_plugin.view(),
                 specialised_point.view(),
+                score_derivative.as_ref(),
                 ResponseBand::from_parts(
                     posterior_mean_standard_error.as_ref().map(|a| a.view()),
                     posterior_mean_lower.as_ref().map(|a| a.view()),

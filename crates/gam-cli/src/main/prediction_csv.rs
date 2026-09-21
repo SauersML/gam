@@ -12,6 +12,10 @@ pub(crate) const STANDARD_PREDICTION_STD_ERROR_COLUMN: &str =
 pub(crate) const STANDARD_PREDICTION_ETA_STD_ERROR_COLUMN: &str =
     "linear_predictor_standard_error";
 pub(crate) const PREDICTION_NOISE_SCALE_COLUMN: &str = "noise_scale";
+/// The Bernoulli marginal-slope posterior mean's derivative in its score
+/// column, on the probability and the probit scale.
+pub(crate) const SCORE_DERIVATIVE_COLUMNS: [&str; 2] =
+    ["mean_score_derivative", "probit_score_derivative"];
 pub(crate) const SPECIALIZED_PREDICTION_BASE_COLUMNS: [&str; 2] = ["eta", "mean"];
 /// Survival prediction columns. `survival_prob_plugin` is the plug-in
 /// `S(η̂)` at the fitted coefficients; `survival_prob` is the posterior mean
@@ -441,6 +445,28 @@ pub(crate) fn write_survival_binary_prediction_csv(
     band: Option<ResponseBand<'_>>,
     observation_band: Option<ObservationBand<'_>>,
 ) -> CliResult<()> {
+    write_marginal_slope_prediction_csv(
+        path,
+        eta,
+        event_prob_plugin,
+        event_prob,
+        None,
+        band,
+        observation_band,
+    )
+}
+
+/// [`write_survival_binary_prediction_csv`] with the Bernoulli marginal-slope
+/// point's derivative in its score column, where the predictor reports one.
+pub(crate) fn write_marginal_slope_prediction_csv(
+    path: &Path,
+    eta: ArrayView1<'_, f64>,
+    event_prob_plugin: ArrayView1<'_, f64>,
+    event_prob: ArrayView1<'_, f64>,
+    score_derivative: Option<&gam_predict::ScoreDerivative>,
+    band: Option<ResponseBand<'_>>,
+    observation_band: Option<ObservationBand<'_>>,
+) -> CliResult<()> {
     let event: Vec<f64> = event_prob.iter().map(|&v| v.clamp(0.0, 1.0)).collect();
     let survival: Vec<f64> = event.iter().map(|&p| (1.0 - p).clamp(0.0, 1.0)).collect();
     let mut columns = vec![
@@ -458,6 +484,10 @@ pub(crate) fn write_survival_binary_prediction_csv(
         (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[5], survival),
         (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[6], eta.to_vec()),
     ];
+    if let Some(score_derivative) = score_derivative {
+        columns.push((SCORE_DERIVATIVE_COLUMNS[0], score_derivative.mean.to_vec()));
+        columns.push((SCORE_DERIVATIVE_COLUMNS[1], score_derivative.probit.to_vec()));
+    }
     if let Some(band) = band {
         band.append_to(&mut columns);
     }

@@ -3978,6 +3978,10 @@ const PREFERRED_PREDICTION_COLUMNS: &[&str] = &[
     "std_error",
     "mean_lower",
     "mean_upper",
+    // The marginal-slope posterior mean's derivative in its score column, on
+    // the probability and the probit scale.
+    "mean_score_derivative",
+    "probit_score_derivative",
     // Response-scale observation (prediction) interval, emitted only when
     // `observation_interval=True` and the family supports it; ordered after
     // the credible mean interval so the standard schema stays stable when off.
