@@ -239,6 +239,12 @@ impl HessianFactorization for FirstOrderTraceSkipOperator {
         self.inner.logdet()
     }
 
+    /// The inner backend's: `logdet` is the inner backend's, so its forward
+    /// error is too (#3321).
+    fn logdet_forward_error(&self) -> Option<f64> {
+        self.inner.logdet_forward_error()
+    }
+
     fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
         self.inner.trace_hinv_product(a)
     }

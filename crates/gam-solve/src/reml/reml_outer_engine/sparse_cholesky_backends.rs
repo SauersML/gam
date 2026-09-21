@@ -1424,6 +1424,11 @@ impl HessianFactorization for BlockCoupledOperator {
         self.inner.as_factorization().logdet()
     }
 
+    /// The inner factorization's, whose `logdet` this is (#3321).
+    fn logdet_forward_error(&self) -> Option<f64> {
+        self.inner.as_factorization().logdet_forward_error()
+    }
+
     fn as_exact_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
         match &self.inner {
             BlockCoupledFactorization::Spectral(operator) => Some(operator),

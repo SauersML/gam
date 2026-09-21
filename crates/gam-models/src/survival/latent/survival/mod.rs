@@ -1086,12 +1086,14 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
         }
     };
     let outer_policy = seed_family.outer_derivative_policy(seed_blocks, options);
-    // The chart axes are family-owned hyper axes. The evaluator's exact outer
-    // Hessian reads their coefficient drift through an owned exact-ψ workspace
-    // (`build_psi_drift_deriv_callback`), which neither latent family serves, so a
-    // Hessian request refuses every trial point. The route searches first-order
-    // until the chart axes have that workspace (#2677).
-    let analytic_outer_hessian_available = false;
+    // The chart axes are family-owned hyper axes whose exact fixed-β first- and
+    // second-order terms and coefficient drift `D_β H_θ[u]` the latent families
+    // serve through their per-index ψ hooks, so the exact outer Hessian is
+    // available; the realized outer-derivative policy decides whether it is used.
+    // A first-order-only route certifies only against the caller's raw tolerance,
+    // with no Newton-decrement standard, and stalled short of it on the #2714
+    // loaded/unloaded fixture (#3321).
+    let analytic_outer_hessian_available = true;
     let kappa_options = gam_terms::smooth::SpatialLengthScaleOptimizationOptions {
         enabled: false,
         ..Default::default()
@@ -1141,13 +1143,9 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
             promote_pending_seed(&blocks);
             let rho = theta.slice(s![..rho_dim]).to_owned();
             let hyper_layout = family_hyper_layout(&blocks, theta)?;
-            // No exact outer Hessian along the chart axes (see above): ask for the gradient.
-            let eval_mode = match eval_mode {
-                gam_problem::EvalMode::ValueGradientHessian => {
-                    gam_problem::EvalMode::ValueAndGradient
-                }
-                other => other,
-            };
+            // The requested order is served as asked: the chart axes carry the exact
+            // outer Hessian (see above), so a Hessian request is never demoted to a
+            // gradient (#3321).
             let eval_options = crate::outer_subsample::exact_outer_options(options);
             let (first_iterate, candidates) =
                 exact_mode_branch
