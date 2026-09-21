@@ -1702,15 +1702,23 @@ fn canonicalize_penalty_spec_at_frozen_rank(
             "{context}: penalty block idx={idx} was frozen at structural rank {frozen_rank}, \
              but at this trial its {frozen_rank}-th largest eigenvalue {smallest_kept:e}"
         );
+        // Name the operator the band belongs to. `band` is
+        // `resolved_eigenvalue_band` of THIS PENALTY BLOCK's own spectrum, not
+        // of the design Gram, and "the Gram's rounding band" has already sent a
+        // reader to the design's conditioning for a number the penalty owns
+        // (gam#3344). Under an orthonormal coefficient chart the two are many
+        // decades apart, which is exactly when this refusal fires.
         let reason = if smallest_kept < -band {
             format!(
-                "{head} is negative and resolved below the Gram's rounding band {band:e}: \
-                 the block is indefinite at this trial, not unresolved, and it carries \
-                 {} resolved penalized direction(s)",
+                "{head} is negative and resolved below this penalty block's own rounding \
+                 band {band:e}: the block is indefinite at this trial, not unresolved, and \
+                 it carries {} resolved penalized direction(s)",
                 gam_linalg::roundoff::resolved_eigenvalue_count(&eigenvalues, 0.0)
             )
         } else {
-            format!("{head} is unresolved within the Gram's rounding band {band:e}")
+            format!(
+                "{head} is unresolved within this penalty block's own rounding band {band:e}"
+            )
         };
         return Err(EstimationError::TrialPointRefused { reason });
     }
@@ -3339,7 +3347,8 @@ fn block_original_frame(
 #[cfg(test)]
 mod tests {
     /// #2469: the freeze and the trial read one band. A kept eigenvalue inside
-    /// the Gram's rounding band is an unresolved rank, refused whatever its sign.
+    /// the penalty block's own rounding band is an unresolved rank, refused
+    /// whatever its sign.
     /// The sign test it replaces accepted positive roundoff and priced
     /// `ln(roundoff)` into `log|S|₊`. A tail above the band is still priced.
     #[test]
@@ -3372,7 +3381,9 @@ mod tests {
                 matches!(
                     &outcome,
                     Err(super::EstimationError::TrialPointRefused { reason })
-                        if reason.contains("unresolved within the Gram's rounding band")
+                        if reason.contains(
+                            "unresolved within this penalty block's own rounding band"
+                        )
                 ),
                 "tail {tail:e} inside the rounding band must be an unresolved-rank refusal, got {:?}",
                 outcome.as_ref().map(|(active, _)| active.len())
