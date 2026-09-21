@@ -12,8 +12,13 @@ name: p-value calibration
 # (gam#3722).
 #
 # Manual dispatch picks the plan. The weekly schedule runs `ci`: a few cheap
-# cells at 200 reps, gamfit only. `quick` regenerates the committed baseline;
-# commit its output and regenerate the docs table with bench.pvalue_calibration.report.
+# cells at 200 reps, gamfit only. `ci` asserts its calibration, so the run step
+# exits nonzero -- this job goes red -- when any gamfit surface of any of its
+# cells is miscalibrated or reports no p-value; the report and the records are
+# still published, because the steps below it run on failure. Without that the
+# job could only ever be green and the harness would still measure nothing.
+# `quick` regenerates the committed baseline; commit its output and regenerate
+# the docs table with bench.pvalue_calibration.report.
 # pyGAM comes from bench/pygam_compare/requirements.txt (bench-only; never a
 # runtime dependency of gamfit).
 

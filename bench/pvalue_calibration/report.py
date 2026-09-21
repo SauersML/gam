@@ -203,6 +203,60 @@ def miscalibrated(table: list[Row]) -> list[tuple[Row, str, float | None]]:
     return flagged
 
 
+def failure_lines(table: list[Row]) -> list[str]:
+    """One bullet per failed check: the count that failed it and the bound it broke.
+
+    This is both the report's "Miscalibrated" section and, for a plan that
+    asserts its calibration, the reason the run exits nonzero. One rule, one
+    place: a row listed here is exactly a row the run fails on.
+    """
+    checks = n_checks(table)
+    lines: list[str] = []
+    for r, kind, a in miscalibrated(table):
+        holes = r.reps - r.usable
+        if a is None:
+            lines.append(
+                f"- `{r.cell}` {r.surface}: {kind}: KS D {r.ks_d:.3f} over {r.usable} "
+                f"usable reps, worst-case KS p {worst_ks_p(r):.2g} with {holes} "
+                f"unusable placed at 0 or 1; the check fires at {FALSE_ALARM / checks:.2g}"
+            )
+            continue
+        i = LEVELS.index(a)
+        if kind == ANTI:
+            bound = f"a calibrated p-value exceeds {reject_bound(r.reps, a, checks)}"
+            count = f"{r.rejections[i]} rejections plus {holes} unusable"
+        else:
+            bound = f"a calibrated p-value falls below {reject_floor(r.reps, a, checks)}"
+            count = f"{r.rejections[i]} rejections (unusable counted as none)"
+        lines.append(
+            f"- `{r.cell}` {r.surface}: {kind} at {a:g}: {count} of {r.reps} "
+            f"(size {r.size(i):.3f} over {r.usable} usable); {bound} only with "
+            "the stated false-alarm probability"
+        )
+    return lines
+
+
+def gate_failures(records: list[Record]) -> list[str]:
+    """Every reason a run of an asserting plan (``plans.Plan``) is a failure.
+
+    Restricted to the gamfit surfaces: pyGAM's size is measured beside gam's so
+    the table compares like with like, but another library's miscalibration is
+    not a defect of this repository and never fails a run here.
+
+    A surface with no usable rep is a failure of that surface -- a missing
+    p-value is a defect, never a skip -- and ``miscalibrated`` cannot speak for
+    it because it has no size to score, so it is listed on its own.
+    """
+    table = [r for r in rows(records) if r.surface.startswith("gamfit.")]
+    dead = [
+        f"- `{r.cell}` {r.surface}: NO P-VALUE in any of {r.reps} reps; "
+        "a missing p-value is a defect of that surface, never a skip"
+        for r in table
+        if not r.usable
+    ]
+    return dead + failure_lines(table)
+
+
 def _size(r: Row, i: int) -> str:
     s, e = r.size(i), r.mcse(i)
     if s is None or e is None:
@@ -315,32 +369,8 @@ def render(records: list[Record], meta: dict[str, Any] | None = None) -> str:
         "## Miscalibrated",
         "",
     ]
-    table = rows(records)
-    checks = n_checks(table)
-    flagged = miscalibrated(table)
-    for r, kind, a in flagged:
-        holes = r.reps - r.usable
-        if a is None:
-            lines.append(
-                f"- `{r.cell}` {r.surface}: {kind}: KS D {r.ks_d:.3f} over {r.usable} "
-                f"usable reps, worst-case KS p {worst_ks_p(r):.2g} with {holes} "
-                f"unusable placed at 0 or 1; the check fires at {FALSE_ALARM / checks:.2g}"
-            )
-            continue
-        i = LEVELS.index(a)
-        if kind == ANTI:
-            bound = f"a calibrated p-value exceeds {reject_bound(r.reps, a, checks)}"
-            count = f"{r.rejections[i]} rejections plus {holes} unusable"
-        else:
-            bound = f"a calibrated p-value falls below {reject_floor(r.reps, a, checks)}"
-            count = f"{r.rejections[i]} rejections (unusable counted as none)"
-        lines.append(
-            f"- `{r.cell}` {r.surface}: {kind} at {a:g}: {count} of {r.reps} "
-            f"(size {r.size(i):.3f} over {r.usable} usable); {bound} only with "
-            "the stated false-alarm probability"
-        )
-    if not flagged:
-        lines.append("None.")
+    flagged = failure_lines(rows(records))
+    lines += flagged or ["None."]
     lines += ["", "## Unusable reps", ""]
     lines += unusable(records) or ["None."]
     return "\n".join(lines) + "\n"

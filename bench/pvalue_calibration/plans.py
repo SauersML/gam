@@ -45,6 +45,16 @@ class Plan:
     chunk: int
     timeout_s: float
     libs: tuple[str, ...] = field(default=LIBS)
+    # Whether this plan's verdict is an ASSERTION rather than a measurement.
+    # A run of an asserting plan exits nonzero when any gamfit surface of any
+    # of its cells comes out miscalibrated or produces no p-value at all
+    # (``report.gate_failures``); that is what makes a scheduled run able to go
+    # red, and ``report.FALSE_ALARM`` is the rate at which a fully calibrated
+    # harness does so by chance. A plan asserts when its cells are a fixed
+    # regression subset; the grid plans sweep every family x null in order to
+    # PRODUCE the committed baseline and the docs table, so a flagged row there
+    # is the finding the run exists to report, not a failure of the run.
+    asserts_calibration: bool = False
 
 
 def _grid(
@@ -72,6 +82,7 @@ PLANS: dict[str, Plan] = {
             chunk=25,
             timeout_s=900.0,
             libs=("gamfit",),
+            asserts_calibration=True,
         ),
         Plan(
             name="quick",

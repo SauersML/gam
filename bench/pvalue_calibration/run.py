@@ -9,6 +9,13 @@ whose chunk timed out, blew the memory cap or crashed), ``DIR/meta.json``
 (host, versions, git sha, pinned thread env, safety-net values, one entry per
 invocation) and ``DIR/report.md`` (see ``report.py``).
 
+Exit status is 0, except that a plan which ASSERTS its calibration
+(``plans.Plan.asserts_calibration``; the ``ci`` plan) exits 1 when any gamfit
+surface of any of its cells is miscalibrated or produced no p-value at all, with
+``report.gate_failures``'s bullets on stderr. That is what lets a scheduled run
+go red. The records and ``DIR/report.md`` are written either way, so a red run
+still publishes everything a green one does.
+
 Resumable: re-running into the same ``DIR`` skips every (cell, seed) already
 in ``records.jsonl``, so an interrupted run picks up where it stopped and a
 larger ``--reps`` only runs the new seeds.
@@ -290,7 +297,19 @@ def main(argv: list[str] | None = None) -> int:
     memcap = args.memcap_mb if args.memcap_mb is not None else default_memcap_mb(args.jobs)
     records = run_plan(plan, args.out, args.jobs, memcap, progress=not args.quiet)
     print(f"{len(records)} records for plan {plan.name} in {args.out}", file=sys.stderr)
-    return 0
+    if not plan.asserts_calibration:
+        return 0
+    failures = report.gate_failures(records)
+    if not failures:
+        return 0
+    print(
+        f"plan {plan.name} asserts its calibration and {len(failures)} check(s) failed; "
+        f"the bounds are in {args.out / 'report.md'}:",
+        file=sys.stderr,
+    )
+    for line in failures:
+        print(line, file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

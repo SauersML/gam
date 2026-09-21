@@ -1,5 +1,23 @@
 ## Unreleased
 
+- **The scheduled p-value calibration run can fail** (gam#3722).
+  `.github/workflows/pvalue-calibration.yml` gave the calibration harness a runner, but
+  `bench.pvalue_calibration.run` returned 0 whatever the records said, so the weekly `ci`
+  plan was green by construction and the `ci` plan's own description ("the smoke test
+  fails if any gamfit surface rejects more often than a calibrated test can") named a
+  check that existed nowhere. A plan now declares whether its verdict is an assertion or a
+  measurement: `Plan.asserts_calibration` is set on `ci`, whose cells are a fixed
+  regression subset, and is unset on `quick` and `nightly`, whose sweep of every family ×
+  null exists to produce the committed baseline and the docs table. A run of an asserting
+  plan exits 1 when any gamfit surface of any of its cells is miscalibrated, in either
+  direction, or produced no p-value in any rep — a missing p-value is a defect of that
+  surface, not a skip. The rows it fails on are exactly the report's "Miscalibrated"
+  bullets: `report.failure_lines` is now the single producer of both, and
+  `report.gate_failures` adds the surfaces with nothing to score. pyGAM's rows are
+  measured beside gam's but never fail a run. `report.FALSE_ALARM` (10⁻³ per run,
+  Bonferroni-split across the run's checks) was already documented as the false-alarm rate
+  of this smoke test and is now the rate at which it actually fires.
+
 - **The default spatial center count is a derived resolution rate, not a table of seven
   constants** (gam#3149, gam#2993).
   `default_num_centers(n, d)` was `ceil(8 · (1 + 0.15·(d−1)) · n^0.4)`, floored at
