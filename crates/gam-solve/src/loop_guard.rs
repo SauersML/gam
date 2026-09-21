@@ -27,8 +27,8 @@
 //! safety mechanisms of an unbounded damped-retry loop, kept as two types
 //! on purpose. The bound owns the per-iteration hard count: it ticks once
 //! at the top of EVERY pass — including `continue` paths that neither
-//! accept a step nor reach a reject ritual (Fisher fallback, special
-//! cases) — and is the net that makes an unbounded `loop {}` safe. The
+//! accept a step nor reach a reject ritual (a failed direction solve,
+//! special cases) — and is the net that makes an unbounded `loop {}` safe. The
 //! escalator owns the geometric damping discipline applied on REJECTS
 //! only. A single type coupling "count++" to "reject" would either
 //! double-count iterations or silently assume every non-accepting pass
@@ -323,15 +323,7 @@ impl RejectEscalator {
         }
     }
 
-    /// Restart the schedule — the problem changed under the chain (e.g. a
-    /// Fisher fallback swapped the Hessian curvature), so the trajectory
-    /// begins anew. Pairs with the caller resetting its damping baseline.
-    pub fn restart(&mut self) {
-        self.factor = MADSEN_INITIAL_REJECT_FACTOR;
-        self.rejects = 0;
-    }
-
-    /// Rejections recorded since construction/restart (diagnostics).
+    /// Rejections recorded since construction (diagnostics).
     pub fn rejects(&self) -> usize {
         self.rejects
     }
@@ -518,23 +510,6 @@ mod tests {
             assert_eq!(damping, MADSEN_INITIAL_REJECT_FACTOR);
             assert_eq!(esc.rejects(), 1);
         }
-    }
-
-    #[test]
-    fn restart_rewinds_the_geometric_schedule() {
-        let mut esc = RejectEscalator::new();
-        let mut damping = 1.0;
-        esc.escalate(&mut damping); // ×2
-        esc.escalate(&mut damping); // ×4
-        assert_eq!(damping, 8.0);
-        esc.restart();
-        assert_eq!(esc.rejects(), 0);
-        let mut fresh = 1.0;
-        esc.escalate(&mut fresh);
-        assert_eq!(
-            fresh, MADSEN_INITIAL_REJECT_FACTOR,
-            "schedule restarts at ×2"
-        );
     }
 
     /// The streak discipline alone (caller-owned flatness predicate, the

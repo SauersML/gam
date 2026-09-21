@@ -3647,66 +3647,42 @@ impl PirlsWorkingModel for WorkingModelSurvival {
     /// Under left truncation the exact Hessian differs from any positive
     /// definite stepping curvature — the per-row term is
     /// `exp(η_exit)·a₁a₁ᵀ − exp(η_entry)·a₀a₀ᵀ + δ·ddᵀ/s²`, a DIFFERENCE of
-    /// positive semidefinite terms — so the inner loop's observed-then-Fisher
-    /// protocol applies to this model (#2814).
+    /// positive semidefinite terms — so the exported Laplace curvature must be
+    /// certified at β̂ rather than assumed (#2814).
     fn supports_observed_information_curvature(&self) -> bool {
         true
     }
 
     /// `Observed` is the exact Hessian of the penalized negative log-likelihood,
-    /// the matrix the LAML criterion's `log|H|` is taken of. It is refused — so
-    /// the inner loop steps on `Fisher` — when it is not positive definite to
-    /// within its own rounding band (`γ_p·‖H‖₂`, [`observed_information_band`]): a Newton direction on an
-    /// indefinite matrix is not a descent direction, and a heterogeneous-entry
-    /// Weibull cohort spent the whole 400-iteration budget on damped non-steps
-    /// at `|g| ≈ 1.3` on every seed.
+    /// the matrix the LAML criterion's `log|H|` is taken of, and it is the
+    /// inner loop's Newton system at every iterate, definite or not (#3962).
+    /// The loop's Newton solves take their direction on the descent curvature
+    /// of the block they factorise (`newton_solve::descent_curvature` — the
+    /// exact block where it is positive definite, its Gill–Murray modification
+    /// otherwise), which is what turned the heterogeneous-entry Weibull cohort
+    /// that crawled at `|g| ≈ 1.3` on saddle steps into a converging fit. The
+    /// model must not pre-modify the full matrix: doing so was measured to
+    /// pollute the free block of the active-set step once the concave direction
+    /// was blocked by a structural bound — the full-space floor mixed `+10³` of
+    /// curvature into a face whose true curvature was `≈ 0`, and the projected
+    /// Newton step crawled at `10⁻⁵`. At the certified mode the loop's export
+    /// certifies the inertia of this matrix, and an indefinite answer there is
+    /// exported as `InvalidObservedCurvature`, never relabelled.
     ///
-    /// `Fisher` is the SAME exact Hessian carrying the `Fisher` label: the
-    /// inner loop's Newton solves take their direction on the descent
-    /// curvature of the block they factorise (`newton_solve::descent_curvature`
-    /// — the exact block where it is positive definite, its Gill–Murray
-    /// modification otherwise), so the model must not pre-modify the full
-    /// matrix. Doing so was measured to pollute the free block of the
-    /// active-set step once the concave direction was blocked by a structural
-    /// bound: the full-space floor mixed `+10³` of curvature into a face whose
-    /// true curvature was `≈ 0`, and the projected Newton step crawled at
-    /// `10⁻⁵`. At the certified mode the loop asks for `Observed` again, and an
-    /// indefinite answer there is exported as `InvalidObservedCurvature`, never
-    /// relabelled.
+    /// `Fisher` is the SAME exact Hessian carrying the `Fisher` label; this
+    /// model has no separate expected-information surface.
     fn update_with_curvature(
         &mut self,
         beta: &Coefficients,
         curvature: gam_solve::pirls::HessianCurvatureKind,
     ) -> Result<WorkingState, EstimationError> {
         let mut state = self.update_state(beta)?;
-        let Some(dense) = state.hessian.as_dense() else {
-            return Ok(state);
-        };
-        let (eigenvalues, _) =
-            gam_linalg::faer_ndarray::FaerEigh::eigh(dense, faer::Side::Lower).map_err(|error| {
-                EstimationError::InvalidInput(format!(
-                    "survival observed information eigendecomposition failed: {error:?}"
-                ))
-            })?;
-        let band = observed_information_band(dense.nrows(), &eigenvalues);
-        let min_eig = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
-        match curvature {
-            gam_solve::pirls::HessianCurvatureKind::Observed => {
-                if !(min_eig > -band) {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "survival observed information is indefinite at this iterate \
-                         (λ_min = {min_eig:.3e}, band = {band:.3e}): a delayed-entry cohort's \
-                         exact curvature is a difference of positive terms; the loop steps on \
-                         its descent curvature"
-                    )));
-                }
-                Ok(state)
-            }
-            gam_solve::pirls::HessianCurvatureKind::Fisher => {
-                state.hessian_curvature = gam_solve::pirls::HessianCurvatureKind::Fisher;
-                Ok(state)
-            }
+        if curvature == gam_solve::pirls::HessianCurvatureKind::Fisher
+            && state.hessian.as_dense().is_some()
+        {
+            state.hessian_curvature = gam_solve::pirls::HessianCurvatureKind::Fisher;
         }
+        Ok(state)
     }
 }
 
@@ -3726,16 +3702,6 @@ fn add_scaled_row_outer(target: &mut Array2<f64>, row: &[f64], scale: f64) {
             target[[r, c]] += scaled * row_c;
         }
     }
-}
-
-/// The rounding band of the eigenvalues of a symmetric `n×n` observed information:
-/// `γ_n·‖H‖₂`, with `‖H‖₂` the spectral radius. An eigenvalue inside `±band` is
-/// indistinguishable from zero in the arithmetic that formed the matrix. `γ_n` already
-/// carries the unit roundoff; this band used to multiply it by `u` a second time, so it
-/// was `~u²·ρ` and refused informations whose most negative eigenvalue was rounding.
-fn observed_information_band(dimension: usize, eigenvalues: &Array1<f64>) -> f64 {
-    let spectral_radius = eigenvalues.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
-    gam_linalg::roundoff::accumulation_growth(dimension) * spectral_radius
 }
 
 #[cfg(test)]
@@ -5420,30 +5386,6 @@ mod tests {
             model.stabilized_structural_derivative(-2.0 * derived_band, derivative[0]),
             None,
             "a derivative beyond its band must still be refused"
-        );
-    }
-
-    /// The observed information is refused only when an eigenvalue is negative beyond
-    /// `γ_n·‖H‖₂`. The band used to carry a second factor of `u` (`~u²·ρ`), which
-    /// refused an information whose most negative eigenvalue was rounding.
-    #[test]
-    fn observed_information_band_resolves_roundoff_level_indefiniteness() {
-        let growth = gam_linalg::roundoff::accumulation_growth(5);
-        let inside = array![1.0, 0.5, 0.2, 0.1, -0.5 * growth];
-        let band = observed_information_band(5, &inside);
-        assert!(
-            band >= growth && band <= 2.0 * growth,
-            "band {band:.3e} must be γ_5·ρ = {growth:.3e} for ρ = 1"
-        );
-        assert!(
-            inside[4] > -band,
-            "λ_min = {:.3e} is rounding inside the band {band:.3e}",
-            inside[4]
-        );
-        let beyond = array![1.0, 0.5, 0.2, 0.1, -2.0 * growth];
-        assert!(
-            !(beyond[4] > -observed_information_band(5, &beyond)),
-            "an eigenvalue beyond the band must still be refused"
         );
     }
 

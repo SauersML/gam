@@ -4312,19 +4312,155 @@ mod root_cause_tests {
             model.observed_updates, 1,
             "the PIRLS iteration should start on observed curvature once"
         );
+        // #3962: a failed candidate raises the LM damping and nothing else. The
+        // Newton system stays the model's observed curvature at this iterate;
+        // no failure may swap it for Fisher.
         assert_eq!(
-            model.fisher_updates, 1,
-            "candidate failure should trigger exactly one observed->Fisher fallback"
+            model.fisher_updates, 0,
+            "a candidate failure must not swap the observed Newton system for Fisher"
         );
         assert_eq!(
-            model.observed_candidate_calls, 1,
-            "observed candidate evaluation should fail once before the Fisher fallback"
+            model.observed_candidate_calls, options.max_step_halving,
+            "every LM attempt evaluates its candidate under the same observed curvature, \
+             up to the configured LM retry budget"
         );
         assert_eq!(
-            model.fisher_candidate_calls,
-            options.max_step_halving - 1,
-            "Fisher candidate evaluation must stop at the configured LM retry budget"
+            model.fisher_candidate_calls, 0,
+            "no candidate is ever evaluated under a substituted Fisher curvature"
         );
+    }
+
+    /// #3962 regression model: a scalar non-canonical objective whose observed
+    /// curvature is indefinite on an interval of early iterates.
+    ///
+    /// `F(β) = β⁴/4 − β²/2 − β + 3`, so `g = β³ − β − 1` and `H = 3β² − 1`.
+    /// `H < 0` on `|β| < 1/√3`, and `g = 0` has exactly one real root (the
+    /// cubic's discriminant is `−23 < 0`): the plastic number
+    /// `ρ = 1.324 717 957 244 746…`, where `H(ρ) = 3ρ² − 1 ≈ 4.265 > 0`. The
+    /// deviance is `2F` (PIRLS minimises `½·deviance`); the `+3` keeps it
+    /// positive (`min F ≈ 1.57`). Every call records the curvature it was asked
+    /// for, so the test can prove Fisher is never requested.
+    #[derive(Default)]
+    pub(crate) struct IndefiniteEarlyObservedQuartic {
+        pub(crate) requested: Vec<HessianCurvatureKind>,
+    }
+
+    impl IndefiniteEarlyObservedQuartic {
+        pub(crate) const PLASTIC_NUMBER: f64 = 1.324_717_957_244_746;
+
+        pub(crate) fn state(beta: &Coefficients, curvature: HessianCurvatureKind) -> WorkingState {
+            let b = beta.as_ref()[0];
+            let objective = 0.25 * b.powi(4) - 0.5 * b * b - b + 3.0;
+            let objective_magnitude = 0.25 * b.powi(4) + 0.5 * b * b + b.abs() + 3.0;
+            WorkingState {
+                eta: LinearPredictor::new(array![b]),
+                gradient: array![b.powi(3) - b - 1.0],
+                hessian: gam_linalg::matrix::SymmetricMatrix::Dense(array![[3.0 * b * b - 1.0]]),
+                log_likelihood: -objective,
+                deviance: 2.0 * objective,
+                deviance_magnitude: 2.0 * objective_magnitude,
+                penalty_term: 0.0,
+                firth: FirthDiagnostics::Inactive,
+                hessian_curvature: curvature,
+                // The operands whose cancellation forms g: |β³| + |β| + 1.
+                gradient_natural_scale: b.abs().powi(3) + b.abs() + 1.0,
+            }
+        }
+    }
+
+    impl WorkingModel for IndefiniteEarlyObservedQuartic {
+        fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
+            self.update_with_curvature(beta, HessianCurvatureKind::Observed)
+        }
+
+        fn update_with_curvature(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            self.requested.push(curvature);
+            Ok(Self::state(beta, curvature))
+        }
+
+        fn update_candidate(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            self.requested.push(curvature);
+            Ok(Self::state(beta, curvature))
+        }
+
+        fn supports_observed_information_curvature(&self) -> bool {
+            true
+        }
+    }
+
+    /// #3962: an indefinite observed Hessian at the early iterates is answered
+    /// by the Gill–Murray descent curvature and the LM damping, never by
+    /// swapping the Newton system for Fisher. Three starts — two where
+    /// `H(β₀) < 0` and one convex — all converge to the unique stationary point
+    /// `ρ`, request Observed at every model evaluation, and export the exact
+    /// observed curvature at the mode.
+    #[test]
+    pub(crate) fn indefinite_early_observed_hessian_converges_without_fisher_3962() {
+        let options = WorkingModelPirlsOptions {
+            max_iterations: 100,
+            convergence_tolerance: 1e-10,
+            adaptive_kkt_tolerance: None,
+            max_step_halving: 60,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: None,
+            linear_constraints: None,
+            initial_lm_lambda: None,
+        };
+        for start in [0.0_f64, -0.5, 3.0] {
+            let initial_curvature = 3.0 * start * start - 1.0;
+            let mut model = IndefiniteEarlyObservedQuartic::default();
+            let summary = runworking_model_pirls(
+                &mut model,
+                Coefficients::new(array![start]),
+                &options,
+                None,
+            )
+            .unwrap_or_else(|err| {
+                panic!("start β₀={start} (H(β₀)={initial_curvature}) must converge: {err:?}")
+            });
+            assert!(
+                matches!(summary.status, PirlsStatus::Converged),
+                "start β₀={start}: status {:?}",
+                summary.status
+            );
+            assert_relative_eq!(
+                summary.beta.as_ref()[0],
+                IndefiniteEarlyObservedQuartic::PLASTIC_NUMBER,
+                max_relative = 1e-9
+            );
+            assert!(!model.requested.is_empty());
+            assert!(
+                model
+                    .requested
+                    .iter()
+                    .all(|kind| *kind == HessianCurvatureKind::Observed),
+                "start β₀={start}: Fisher was requested {} of {} times; the Newton system \
+                 must stay the model's observed curvature at every iteration",
+                model
+                    .requested
+                    .iter()
+                    .filter(|kind| **kind == HessianCurvatureKind::Fisher)
+                    .count(),
+                model.requested.len()
+            );
+            assert_eq!(summary.state.hessian_curvature, HessianCurvatureKind::Observed);
+            assert!(
+                matches!(
+                    summary.exported_laplace_curvature,
+                    ExportedLaplaceCurvature::ObservedExact
+                ),
+                "start β₀={start}: H(ρ) ≈ 4.265 > 0 must export ObservedExact, got {:?}",
+                summary.exported_laplace_curvature
+            );
+        }
     }
 
     #[test]
@@ -5104,20 +5240,17 @@ mod root_cause_tests {
 
     // ─── Issue 4: ExportedLaplaceCurvature labelling regressions ─────────────
     //
-    // The inner LM step search may accept Fisher curvature when observed went
-    // non-SPD or produced a bad gain ratio mid-iteration. The exported Laplace
-    // curvature on `WorkingModelPirlsResult` (and downstream `PirlsResult`) is
-    // re-evaluated at the accepted β̂ in a post-convergence finalization step
-    // and must reflect the *actual* Hessian status — never silently mislabel a
-    // Fisher fallback as exact, and never silently substitute Fisher when the
-    // Observed Hessian is indefinite.
+    // The inner LM step search iterates on observed curvature, which may be
+    // indefinite away from the mode (#3962). The exported Laplace curvature on
+    // `WorkingModelPirlsResult` (and downstream `PirlsResult`) is re-evaluated
+    // at the accepted β̂ in a post-convergence finalization step and must
+    // reflect the *actual* Hessian status — never label an uncertified
+    // Hessian exact, and never silently substitute Fisher when the Observed
+    // Hessian is indefinite.
 
-    /// Inner-loop accepts a step under Fisher (it's the only curvature this
-    /// model offers during the inner loop), but in post-convergence
-    /// finalization we explicitly recompute the Observed Hessian. Result:
-    /// the exported label flips from whatever the inner loop used to
-    /// `ObservedExact` (when SPD) — Fisher → Observed substitution is
-    /// detected by the inertia gate, not silently accepted.
+    /// Post-convergence finalization explicitly recomputes the Observed
+    /// Hessian at β̂ and exports `ObservedExact` only when its inertia gate
+    /// certifies it SPD.
     #[derive(Default)]
     pub(crate) struct InnerFisherButObservedSpdAtMode {
         pub(crate) observed_post_calls: usize,
