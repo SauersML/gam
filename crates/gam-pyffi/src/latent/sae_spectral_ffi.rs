@@ -2175,7 +2175,9 @@ fn coupling_robustness_certificate(
 /// `(atom, fisher_quadratic_kl_nats)` ablated-firing contributions that build the
 /// Fisher local-KL effect ledger through the real streaming accumulator.
 /// Retention is an OR of the variance margin (`delta_deviance − charge`) and the
-/// Fisher-effect margin (mean local-KL over the per-atom one-degree BIC price).
+/// Fisher-effect margin (`total_fisher_quadratic_kl_nats − threshold_nats`: the
+/// atom's summed local-KL over its one-degree BIC price `0.5·ln(max(n_firings, 2))`;
+/// BIC is an additive evidence price, so the total, not the mean, pays it).
 /// Returns per-atom `{atom, variance, effect, retained_by_variance,
 /// retained_by_effect, retained}` under `atoms`.
 #[pyfunction(signature = (variance, firings))]
@@ -2230,6 +2232,10 @@ fn effect_weighted_retention(
                 ed.set_item(
                     "mean_fisher_quadratic_kl_nats",
                     e.mean_fisher_quadratic_kl_nats,
+                )?;
+                ed.set_item(
+                    "total_fisher_quadratic_kl_nats",
+                    e.total_fisher_quadratic_kl_nats,
                 )?;
                 ed.set_item(
                     "max_fisher_quadratic_kl_nats",
@@ -2527,6 +2533,23 @@ mod ffi_completeness_tests {
             let r1: bool = a1.get_item("retained").unwrap().unwrap().extract().unwrap();
             assert!(!r1, "atom 1 should not be retained");
             assert!(a1.get_item("variance").unwrap().unwrap().is_none());
+            // The returned margin is the total local-KL over the BIC price, and
+            // the total it is computed from is on the boundary.
+            for (atom, total, n) in [(&a0, 2.0_f64, 2_usize), (&a1, 0.01, 1)] {
+                let e_any = atom.get_item("effect").unwrap().unwrap();
+                let e = e_any.cast::<PyDict>().unwrap();
+                let get =
+                    |k: &str| -> f64 { e.get_item(k).unwrap().unwrap().extract().unwrap() };
+                let n_firings: usize = e
+                    .get_item("n_firings")
+                    .unwrap()
+                    .unwrap()
+                    .extract()
+                    .unwrap();
+                assert_eq!(n_firings, n);
+                assert_eq!(get("total_fisher_quadratic_kl_nats"), total);
+                assert_eq!(get("margin"), total - get("threshold_nats"));
+            }
         });
     }
 

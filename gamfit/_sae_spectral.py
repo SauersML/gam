@@ -1138,6 +1138,7 @@ class FisherEffectEvidence:
 
     atom: int
     mean_fisher_quadratic_kl_nats: float
+    total_fisher_quadratic_kl_nats: float
     max_fisher_quadratic_kl_nats: float
     n_firings: int
     threshold_nats: float
@@ -1164,7 +1165,9 @@ def effect_weighted_retention(
     ``(delta_deviance_nats, charge_nats)`` charge evidence for atom ``a`` (list
     length = atom count); ``firings`` are streamed ``(atom, fisher_local_kl_nats)``
     contributions that build the Fisher effect ledger. Retention is the OR of the
-    variance margin and the Fisher-effect margin (per-atom BIC price)."""
+    variance margin and the Fisher-effect margin, ``total_fisher_quadratic_kl_nats
+    - threshold_nats`` (the summed local-KL over the per-atom one-degree BIC
+    price)."""
     variance_payload = [
         None if entry is None else (float(entry[0]), float(entry[1]))
         for entry in variance
@@ -1191,6 +1194,9 @@ def effect_weighted_retention(
                     atom=int(effect_row["atom"]),
                     mean_fisher_quadratic_kl_nats=float(
                         effect_row["mean_fisher_quadratic_kl_nats"]
+                    ),
+                    total_fisher_quadratic_kl_nats=float(
+                        effect_row["total_fisher_quadratic_kl_nats"]
                     ),
                     max_fisher_quadratic_kl_nats=float(
                         effect_row["max_fisher_quadratic_kl_nats"]
