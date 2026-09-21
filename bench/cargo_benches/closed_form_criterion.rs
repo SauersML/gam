@@ -106,6 +106,15 @@ fn bench_operator_matvec(c: &mut Criterion) {
     for &k in &[200_usize, 500, 1000, 2000] {
         let centers = synthetic_centers(k, D_TYPICAL);
         let eta = vec![0.0_f64; D_TYPICAL];
+        let diagonal_lag = gam::terms::basis::closed_form_operator::closed_form_diagonal_lag(
+            centers.view(),
+            /* q = */ 2,
+            M_TYPICAL,
+            S_TYPICAL,
+            KAPPA_TYPICAL,
+            Some(&eta),
+        )
+        .expect("the synthetic centres are separated, so the closed form has a diagonal lag");
         let op = ClosedFormPenaltyOperator::new(
             centers.view(),
             /* q = */ 2,
@@ -159,6 +168,15 @@ fn bench_hessian_solve_dense_vs_implicit(c: &mut Criterion) {
     for &k in &[500_usize, 1000, 2000, 5000] {
         let centers = synthetic_centers(k, D_TYPICAL);
         let eta = vec![0.0_f64; D_TYPICAL];
+        let diagonal_lag = gam::terms::basis::closed_form_operator::closed_form_diagonal_lag(
+            centers.view(),
+            /* q = */ 2,
+            M_TYPICAL,
+            S_TYPICAL,
+            KAPPA_TYPICAL,
+            Some(&eta),
+        )
+        .expect("the synthetic centres are separated, so the closed form has a diagonal lag");
         let op_inner = std::sync::Arc::new(ClosedFormPenaltyOperator::new(
             centers.view(),
             /* q = */ 2,
@@ -169,6 +187,7 @@ fn bench_hessian_solve_dense_vs_implicit(c: &mut Criterion) {
             None,
             0,
             None,
+            diagonal_lag,
         ));
         let p = op_inner.dim();
         let s_dense = op_inner.as_dense();
