@@ -48,6 +48,24 @@ impl Fnv1a {
         }
     }
 
+    /// Mix a count or index as its 64-bit little-endian bytes.
+    #[inline]
+    pub(crate) fn mix_usize(&mut self, n: usize) {
+        for b in (n as u64).to_le_bytes() {
+            self.mix_byte(b);
+        }
+    }
+
+    /// Mix a run of scalars: its length, then each element's canonicalized
+    /// bits (via [`Fnv1a::mix_f64`]).
+    #[inline]
+    pub(crate) fn mix_f64s<'a>(&mut self, values: impl ExactSizeIterator<Item = &'a f64>) {
+        self.mix_usize(values.len());
+        for &x in values {
+            self.mix_f64(x);
+        }
+    }
+
     /// Mix an optional coefficient slice tagged by `marker`. `None` feeds a
     /// distinguished `0xff` sentinel; `Some` feeds a length prefix followed by
     /// each element's canonicalized bits (via [`Fnv1a::mix_f64`]).

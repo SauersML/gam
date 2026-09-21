@@ -316,3 +316,39 @@ fn a_multistart_members_values_are_bit_identical_at_one_and_six_lanes_2359() {
         );
     }
 }
+
+/// A fit on its own reads the process-wide store, which outlives it. Its key is
+/// the content its rows read: a family with the same values in fresh buffers
+/// hits, and a family whose empirical law alone differs — same data, same β,
+/// same η — misses, where a key on buffer addresses and the law's variant hit.
+#[test]
+fn the_process_wide_exact_cache_is_keyed_on_the_data_and_the_law_it_reads() {
+    let on_law = |weights: [f64; 3]| {
+        let (mut family, states) = rigid_fixture();
+        let law = LatentMeasureKind::GlobalEmpirical {
+            grid: EmpiricalZGrid::new(vec![-1.5, 0.0, 1.5], weights.to_vec(), "test law")
+                .expect("valid grid"),
+        };
+        family.intercept_warm_starts = Some(
+            new_intercept_warm_start_cache_on_law(&law, family.y.len())
+                .expect("an intercept cache on the empirical law"),
+        );
+        family.latent_measure = law;
+        (family, states)
+    };
+    let options = BlockwiseFitOptions::default();
+    let build = |(family, states): &(BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>)| {
+        family
+            .build_or_reuse_shared_exact_cache(states, &options, false)
+            .expect("empirical exact eval cache")
+    };
+    let first = build(&on_law([0.25, 0.5, 0.25]));
+    assert!(
+        Arc::ptr_eq(&build(&on_law([0.25, 0.5, 0.25])), &first),
+        "the same data, law and β in fresh buffers missed the exact cache"
+    );
+    assert!(
+        !Arc::ptr_eq(&build(&on_law([0.3, 0.4, 0.3])), &first),
+        "a different empirical law reused another law's exact cache"
+    );
+}

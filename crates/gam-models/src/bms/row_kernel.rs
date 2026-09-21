@@ -20,8 +20,8 @@ use std::sync::{Mutex, OnceLock};
 // it with a FIFO-2 store so the immediate Value→ValueAndGradient pair at one β̂,
 // and any line-search ρ that maps back to a seen β̂, share one table instead of
 // rebuilding. Reuse is gated on exact byte-equality of a content fingerprint
-// over the data-buffer Arc identities, the frailty/latent/deviation
-// discriminants, and every block's β + η, so a hit returns an `Arc` to a table
+// over the data, the frailty scale, the base link, the latent law's own nodes
+// and weights, the deviation flags, and every block's β + η, so a hit returns an `Arc` to a table
 // whose rows are bit-identical to a fresh build (or misses).
 //
 // The store holds per-row [`RigidRowTensors`] tables, not built vectors
@@ -159,42 +159,19 @@ impl BernoulliRigidRowKernel {
     }
 
     /// Content fingerprint of every input the per-row rigid third/fourth jet
-    /// reads: the family/data identity (stable `Arc::as_ptr` of the immutable
-    /// `y`/`z`/`weights` buffers), the probit-frailty scale, the latent-measure
-    /// discriminant, the score-warp / link-deviation presence flags, and every
-    /// block's β + η. `rigid_row_third_full`/`rigid_row_fourth_full` are pure
+    /// reads: the data, frailty scale, base link and latent law
+    /// (`BernoulliMarginalSlopeFamily::mix_data_and_law`), the score-warp /
+    /// link-deviation presence flags, and every block's β + η. `rigid_row_third_full`/`rigid_row_fourth_full` are pure
     /// functions of exactly these (the per-row build reads `block_states[*].eta`,
     /// `self.z[row]`/`y[row]`/`weights[row]`, the frailty scale, and the latent
-    /// grid pinned by the data-buffer address), so equal fingerprints ⇒
+    /// grid), so equal fingerprints ⇒
     /// bit-identical tensors. The `domain` byte separates the third- and
     /// fourth-tensor key streams. Mirrors
     /// `BernoulliMarginalSlopeFamily::shared_exact_cache_fingerprint`.
     fn rigid_tensor_fingerprint(&self, domain: u8) -> u64 {
         let mut hash = Fnv1a::new();
         hash.mix_byte(domain);
-        for &ptr in &[
-            Arc::as_ptr(&self.family.y) as usize,
-            Arc::as_ptr(&self.family.z) as usize,
-            Arc::as_ptr(&self.family.weights) as usize,
-        ] {
-            for b in (ptr as u64).to_le_bytes() {
-                hash.mix_byte(b);
-            }
-        }
-        hash.mix_byte(0xf1);
-        match self.family.gaussian_frailty_sd {
-            Some(sd) => {
-                hash.mix_byte(0x01);
-                hash.mix_f64(sd);
-            }
-            None => hash.mix_byte(0x00),
-        }
-        let latent_byte: u8 = match self.family.latent_measure {
-            LatentMeasureKind::StandardNormal => 0x10,
-            LatentMeasureKind::GlobalEmpirical { .. } => 0x11,
-            LatentMeasureKind::LocalEmpirical { .. } => 0x12,
-        };
-        hash.mix_byte(latent_byte);
+        self.family.mix_data_and_law(&mut hash);
         hash.mix_byte(0xf2);
         hash.mix_byte(u8::from(self.family.score_warp.is_some()));
         hash.mix_byte(u8::from(self.family.link_dev.is_some()));

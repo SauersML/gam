@@ -1689,19 +1689,95 @@ impl BernoulliMarginalSlopeFamily {
     /// numerically equal coefficients hash equal; `mix_opt_beta` is unused here
     /// because we hash every block's β and η directly).
     ///
-    /// Family/data identity is folded as the stable `Arc::as_ptr` addresses of
-    /// the immutable `y`/`z`/`weights` buffers (a fresh fit allocates fresh
-    /// `Arc`s, so two fits never share all three; repeated evals on one family
-    /// share them), plus the probit-frailty SD and a latent-measure variant
-    /// byte. The β-state is pinned by hashing, for every block, the full β
+    /// Family/data identity is the content [`Self::mix_data_and_law`] folds: the
+    /// `y`/`z`/`weights` values, the probit-frailty SD, the base link and the
+    /// latent law's own nodes and weights. The β-state is pinned by hashing, for every block, the full β
     /// coefficient vector AND the linear-predictor η (the moments consume η, and
     /// the flex deviation bases consume the score-warp / link-deviation β slices;
     /// hashing all blocks' β and η covers both without per-block special-casing).
-    /// The outer-score subsample is folded by the `Arc::as_ptr` of its row mask
-    /// plus its scalar identity fields, so a distinct subsample misses rather
-    /// than aliasing. `want_primary_hessians` is in the key because the build
+    /// The outer-score subsample is folded by its row mask's indices plus its
+    /// scalar identity fields, so a distinct subsample misses rather than
+    /// aliasing. `want_primary_hessians` is in the key because the build
     /// optionally materializes `row_primary_hessians`, which a consumer expecting
     /// it must observe.
+    /// Mixes the content of everything a row kernel reads besides the β-state:
+    /// the `y`/`z`/`weights` values, the probit-frailty SD, the base link, and
+    /// the latent law itself — an empirical law's nodes and weights, and a local
+    /// law's centres, scales and per-row mixtures. Content, not the buffers'
+    /// allocation addresses: the process-wide stores outlive a fit, and an
+    /// address freed by one fit can be handed to the next.
+    pub(super) fn mix_data_and_law(&self, hash: &mut Fnv1a) {
+        hash.mix_byte(0xd0);
+        for values in [&self.y, &self.z, &self.weights] {
+            hash.mix_f64s(values.iter());
+        }
+        hash.mix_byte(0xd1);
+        match self.gaussian_frailty_sd {
+            Some(sd) => {
+                hash.mix_byte(0x01);
+                hash.mix_f64(sd);
+            }
+            None => hash.mix_byte(0x00),
+        }
+        hash.mix_byte(0xd2);
+        for b in format!("{:?}", self.base_link).bytes() {
+            hash.mix_byte(b);
+        }
+        hash.mix_byte(0xd3);
+        let mix_grid = |hash: &mut Fnv1a, grid: &EmpiricalZGrid| {
+            hash.mix_f64s(grid.nodes.iter());
+            hash.mix_f64s(grid.weights.iter());
+        };
+        match &self.latent_measure {
+            LatentMeasureKind::StandardNormal => hash.mix_byte(0x10),
+            LatentMeasureKind::GlobalEmpirical { grid } => {
+                hash.mix_byte(0x11);
+                mix_grid(hash, grid);
+            }
+            LatentMeasureKind::LocalEmpirical {
+                feature_cols,
+                input_scales,
+                centers,
+                grids,
+                top_k,
+                bandwidth,
+                mixture,
+                train_row_mixtures,
+            } => {
+                hash.mix_byte(0x12);
+                hash.mix_usize(feature_cols.len());
+                for &col in feature_cols {
+                    hash.mix_usize(col);
+                }
+                match input_scales {
+                    Some(scales) => hash.mix_f64s(scales.iter()),
+                    None => hash.mix_byte(0xff),
+                }
+                hash.mix_usize(centers.len());
+                for center in centers {
+                    hash.mix_f64s(center.iter());
+                }
+                hash.mix_usize(grids.len());
+                for grid in grids {
+                    mix_grid(hash, grid);
+                }
+                hash.mix_usize(*top_k);
+                hash.mix_f64(*bandwidth);
+                for b in format!("{mixture:?}").bytes() {
+                    hash.mix_byte(b);
+                }
+                hash.mix_usize(train_row_mixtures.len());
+                for row in train_row_mixtures.iter() {
+                    hash.mix_usize(row.len());
+                    for &(center, weight) in row {
+                        hash.mix_usize(center);
+                        hash.mix_f64(weight);
+                    }
+                }
+            }
+        }
+    }
+
     fn shared_exact_cache_fingerprint(
         &self,
         block_states: &[ParameterBlockState],
@@ -1711,37 +1787,9 @@ impl BernoulliMarginalSlopeFamily {
         let mut hash = Fnv1a::new();
         // Domain separator for the exact-cache fingerprint stream.
         hash.mix_byte(0xe0);
-        // Family/data identity: stable Arc allocation addresses of the immutable
-        // data buffers (cheap O(1); distinct fits never share all three).
-        for &ptr in &[
-            Arc::as_ptr(&self.y) as usize,
-            Arc::as_ptr(&self.z) as usize,
-            Arc::as_ptr(&self.weights) as usize,
-        ] {
-            for b in (ptr as u64).to_le_bytes() {
-                hash.mix_byte(b);
-            }
-        }
-        // Probit-frailty scale source.
-        hash.mix_byte(0xe1);
-        match self.gaussian_frailty_sd {
-            Some(sd) => {
-                hash.mix_byte(0x01);
-                hash.mix_f64(sd);
-            }
-            None => hash.mix_byte(0x00),
-        }
-        // Latent-measure variant discriminant (the measure data itself is
-        // immutable and already pinned by the data-buffer addresses above).
-        let latent_byte: u8 = match self.latent_measure {
-            LatentMeasureKind::StandardNormal => 0x10,
-            LatentMeasureKind::GlobalEmpirical { .. } => 0x11,
-            LatentMeasureKind::LocalEmpirical { .. } => 0x12,
-        };
-        hash.mix_byte(latent_byte);
-        // Deviation-runtime presence flags (their knots/anchors are immutable
-        // and tied to this family instance, so the addresses above suffice;
-        // the presence bits guard against an unexpected shape mismatch).
+        self.mix_data_and_law(&mut hash);
+        // Deviation-runtime presence flags; their coefficients are in the
+        // β-state below.
         hash.mix_byte(0xe2);
         hash.mix_byte(u8::from(self.score_warp.is_some()));
         hash.mix_byte(u8::from(self.link_dev.is_some()));
@@ -1771,12 +1819,9 @@ impl BernoulliMarginalSlopeFamily {
             None => hash.mix_byte(0x00),
             Some(subsample) => {
                 hash.mix_byte(0x01);
-                let mask_ptr = Arc::as_ptr(&subsample.mask) as usize as u64;
-                for b in mask_ptr.to_le_bytes() {
-                    hash.mix_byte(b);
-                }
-                for b in (subsample.mask.len() as u64).to_le_bytes() {
-                    hash.mix_byte(b);
+                hash.mix_usize(subsample.mask.len());
+                for &row in subsample.mask.iter() {
+                    hash.mix_usize(row);
                 }
                 for b in (subsample.n_full as u64).to_le_bytes() {
                     hash.mix_byte(b);
