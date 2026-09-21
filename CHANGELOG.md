@@ -11,6 +11,31 @@
   publish no corrected band either. The constrained samplers (`bounded()`, shape- and
   box-constrained) still draw at `ρ̂`: their law on the cone is the object gam#3229 is open on, and
   a displacement cannot be added to a draw without leaving the cone.
+- **A Matérn operator penalty underflowed to an exactly zero matrix, and the refusal that
+  followed collapsed the outer trust region** (gam#3430).
+  A Bernoulli marginal-slope fit whose Matérn log κ is an outer coordinate ended at
+  `OperatorUnprogressingStallCheckpoint` with an indefinite Hessian and `|Pg|` several times
+  its bound. ARC was not the cause. The tension and stiffness collocation operators carry
+  `φ'(r)/r ∝ exp(−√(2ν)·r/ℓ)`, so at the short length scales the κ search visits (ψ ≈ 5,
+  ℓ ≈ 7e-3, nearest-centre separation of order 1) their entries are around `1e-167` and the
+  products their Gram sums are around `1e-334` — below the subnormal floor. The Gram was not
+  small, it was exactly zero: it normalized to nothing, the block was recorded as a dropped
+  zero matrix, the trial was refused for a changed penalty block count, and the trust region
+  halved on a step it had never evaluated, which the cost-stall guard then read as
+  unprogressing. The penalty the optimizer sees is `S̃ = DᵀD / ‖DᵀD‖_F`, which is invariant
+  under `D ↦ sD`, so each operator is now charted by a power of two before its Gram is
+  formed. The scale is exactly `1` whenever `max|D| ≥ √(f64::MIN_POSITIVE) = 2⁻⁵¹¹`, the
+  smallest magnitude whose square is still a normal f64, so every fit whose Gram is
+  representable today takes the same unscaled arithmetic and the same bits; below that floor
+  the chart lifts `max|D|` into `[1, 2)`. A power of two multiplies every entry exactly, so
+  the charted Gram is exactly `s²·DᵀD` and the normalized penalty is the same object. Past
+  the wall the published `normalization_scale`, which converts `λ̃` to a physical `λ` for
+  reporting, is the charted norm `s²·‖DᵀD‖_F`; the physical one is not an f64 there at all.
+  The doc that called the penalty block count "ψ-stable by construction" said so from the
+  ℓ-free order gate `m = ν + d/2`, which is true in exact arithmetic and was the defect's own
+  reassurance; it now records why f64 needed the chart to make it true. The third-order block
+  (ν ≥ 5/2) is assembled by a closed-form pair contraction rather than from a materialized
+  operator and is not charted here.
 
 - **A chart gauge normalized axes whose spread was its own rounding, and the stretches
   compounded into the smoothness Gram** (gam#2822).

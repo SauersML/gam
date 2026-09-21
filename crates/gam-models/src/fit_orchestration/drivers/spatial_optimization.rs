@@ -4273,14 +4273,23 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 }
                 // A cached block the rebuild DROPPED at this psi is a trial whose
                 // rho coordinate has no matrix behind it, not a broken invariant.
-                // The Matérn collocation Grams of odd derivative order are exactly
-                // zero once every off-diagonal kernel value underflows, which a
-                // length scale far below the center spacing produces. MSI job
-                // 602008 (`y ~ matern(x, periodic=true, period=2π)`, n = 400)
-                // reached this branch at an ARC trial with psi = 9.43, where the
-                // rebuild kept originals [0, 2] of the 4 cached, and the InvalidInput
-                // aborted the whole fit. The model does not exist at that trial, so
-                // it is refused and the search shortens its step or rejects the seed.
+                // MSI job 602008 (`y ~ matern(x, periodic=true, period=2π)`,
+                // n = 400) reached this branch at an ARC trial with psi = 9.43,
+                // where the rebuild kept originals [0, 2] of the 4 cached and the
+                // InvalidInput aborted the whole fit.
+                //
+                // The reading that got this branch here -- the Matérn collocation
+                // Grams of odd derivative order "are exactly zero" at a length
+                // scale far below the centre spacing, so "the model does not exist
+                // at that trial" -- was wrong about the model and right only about
+                // f64 (#3430). `S̃ = DᵀD/‖DᵀD‖_F` is scale free and converges to
+                // the nearest-pair shape; it was the UNNORMALIZED Gram whose f64
+                // image vanished, because each product it summed was below the
+                // subnormal floor. The operator is now charted by a power of two
+                // before its Gram is formed (`operator_chart_scale`), so that
+                // trial builds its penalty instead of being refused. This branch
+                // stays for a block that is genuinely absent at a trial: a refusal
+                // shortens the step or rejects the seed rather than aborting.
                 PenaltyAlignment::DroppedAtTrial {
                     original_index,
                     source,

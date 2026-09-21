@@ -5252,6 +5252,70 @@ pub fn matern_operator_penalty_triplet_from_metadata(
     )
 }
 
+/// The power-of-two chart that makes an operator's Gram representable (#3430).
+///
+/// `DᵀD` is EXACTLY zero, not merely small, once every entry of `D` is below
+/// about `1e-154`: each product the Gram sums is then below the subnormal floor.
+/// The Matérn tension and stiffness operators carry `φ'(r)/r ∝ exp(−√(2ν)·r/ℓ)`,
+/// so at the short length scales an outer κ search visits (ψ ≈ 5, ℓ ≈ 7e-3, with
+/// a nearest-centre separation of order 1) their entries are `1e-167` and their
+/// products `1e-334`. The Gram then normalizes to nothing, the block is recorded
+/// as a zero matrix and dropped, the trial is refused for a changed block count,
+/// and the outer trust region halves on a step it never evaluated — which is the
+/// stall #3430 reports, not a property of the model.
+///
+/// The penalty the optimizer sees is `S̃ = DᵀD / ‖DᵀD‖_F`, which is invariant
+/// under `D ↦ sD` for any `s > 0`, so the operator may be charted before its Gram
+/// is formed. `s` is a POWER OF TWO, which multiplies every entry exactly, so the
+/// charted Gram is exactly `s²·DᵀD` entry by entry wherever neither under- nor
+/// overflows — the normalized penalty is the same object, computed where f64 can
+/// hold it.
+///
+/// `s` is exactly `1` whenever `max|D| ≥ √(f64::MIN_POSITIVE) = 2⁻⁵¹¹`, the
+/// smallest magnitude whose square is still a normal f64: every fit whose Gram is
+/// representable today takes the unscaled operator and its Gram is bit-identical.
+/// Below that floor `s` lifts `max|D|` into `[1, 2)`, the whole exponent range
+/// away from both ends, capped at `2¹⁰²³` so `s` itself stays finite (the cap
+/// binds only for an operator whose largest entry is subnormal, and still leaves
+/// `max|sD| ≥ 2⁻⁵¹` and its square normal).
+fn operator_chart_scale(operator: &Array2<f64>) -> f64 {
+    let max_abs = operator
+        .iter()
+        .fold(0.0_f64, |held, value| held.max(value.abs()));
+    // An exactly zero operator has an exactly zero Gram at every scale, and a
+    // non-finite one is a defect for the caller's finiteness check to report.
+    if !(max_abs > 0.0) || !max_abs.is_finite() || max_abs >= f64::MIN_POSITIVE.sqrt() {
+        return 1.0;
+    }
+    let bits = max_abs.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let exponent = if biased == 0 {
+        // Subnormal: the value is `mantissa · 2⁻¹⁰⁷⁴`, so its binary exponent is
+        // that of the mantissa's leading bit. `max_abs > 0` here, so the mantissa
+        // is nonzero and `leading_zeros` is at most 63.
+        let mantissa = bits & ((1u64 << 52) - 1);
+        63 - mantissa.leading_zeros() as i32 - 1074
+    } else {
+        biased - 1023
+    };
+    // `max|D| < 2⁻⁵¹¹` gives `exponent ≤ -512`, so the shift is positive.
+    let shift = (-exponent).min(1023);
+    f64::from_bits(((1023 + shift) as u64) << 52)
+}
+
+/// One operator's Gram, formed in the chart of [`operator_chart_scale`] (#3430).
+fn charted_operator_gram(operator: &Array2<f64>) -> Array2<f64> {
+    let scale = operator_chart_scale(operator);
+    if scale == 1.0 {
+        // The chart is inert: form the Gram from the operator itself, so every
+        // representable case is the arithmetic that was performed before #3430.
+        operator.t().dot(operator)
+    } else {
+        let charted = operator.mapv(|value| value * scale);
+        charted.t().dot(&charted)
+    }
+}
+
 /// Build the canonical Matérn operator-penalty triplet (mass / tension /
 /// stiffness) at an explicit **effective** length scale — i.e. the
 /// isotropic-scale-compensated, standardized-frame scale the design's kernel was built
@@ -5266,9 +5330,15 @@ pub fn matern_operator_penalty_triplet_from_metadata(
 ///
 /// Sharing the body makes the penalty BLOCK COUNT and the per-block numerics
 /// one deterministic function of `(geometry, ν, η, ℓ_eff)`. The active-operator
-/// gate is `m = ν + d/2`, which is independent of ℓ, so the block count is
-/// **ψ-stable by construction**: the re-key can never produce a different number
-/// of blocks than the frozen design (the desync that #1270 hard-errored on).
+/// gate is `m = ν + d/2`, which is independent of ℓ.
+///
+/// That gate being ℓ-free made the block count ψ-stable in exact arithmetic
+/// only, and the difference was not academic (#3430): an operator whose entries
+/// decay like `exp(−√(2ν)·r/ℓ)` has an EXACTLY zero f64 Gram at the short length
+/// scales a κ search visits, so its block normalized to nothing, was dropped as a
+/// zero matrix, and the count moved after all. The Gram is now formed in the
+/// power-of-two chart of [`operator_chart_scale`], which is inert wherever the
+/// unscaled Gram is representable, so the count is ψ-stable in f64 as well.
 pub fn matern_operator_penalty_triplet_at_length_scale(
     centers: ArrayView2<'_, f64>,
     periodic: Option<&[Option<f64>]>,
@@ -5301,19 +5371,20 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
     let d = penalty_centers.ncols();
     let m = nu.half_integer_value() + 0.5 * d as f64;
     let mut candidates = Vec::with_capacity(4);
-    for (raw, source, min_order) in [
-        (ops.d0.t().dot(&ops.d0), PenaltySource::OperatorMass, 0.0),
-        (ops.d1.t().dot(&ops.d1), PenaltySource::OperatorTension, 1.0),
-        (
-            ops.d2.t().dot(&ops.d2),
-            PenaltySource::OperatorStiffness,
-            2.0,
-        ),
+    for (operator, source, min_order) in [
+        (&ops.d0, PenaltySource::OperatorMass, 0.0),
+        (&ops.d1, PenaltySource::OperatorTension, 1.0),
+        (&ops.d2, PenaltySource::OperatorStiffness, 2.0),
     ] {
         let nondifferentiable_ou = matches!(nu, crate::basis::MaternNu::Half);
         if min_order > 0.0 && (nondifferentiable_ou || m < min_order) {
             continue;
         }
+        // Charted before the Gram is formed, so the short length scales an outer
+        // κ search visits produce the same normalized penalty instead of a zero
+        // matrix (#3430). The gate above runs first: a block the order gate skips
+        // is no longer multiplied out at all.
+        let raw = charted_operator_gram(operator);
         let sym = (&raw + &raw.t()) * 0.5;
         let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym)?;
         candidates.push(PenaltyCandidate {

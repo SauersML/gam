@@ -1581,3 +1581,73 @@ mod frozen_factor_level_collection_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod operator_chart_tests {
+    use super::{charted_operator_gram, operator_chart_scale};
+    use ndarray::Array2;
+
+    /// A well-scaled operator is not charted at all, and its Gram is the same
+    /// arithmetic it was before #3430 — bit for bit, not to a tolerance. The
+    /// chart is a branch, so this is a property of the code and not of the data
+    /// it happened to be given: `scale == 1.0` selects the unscaled Gram.
+    #[test]
+    fn a_representable_operator_is_left_uncharted_and_its_gram_is_bit_identical() {
+        let operator = Array2::from_shape_fn((5, 3), |(row, col)| {
+            ((row + 1) as f64).sqrt() - 0.25 * col as f64
+        });
+        assert_eq!(operator_chart_scale(&operator), 1.0);
+        let charted = charted_operator_gram(&operator);
+        let plain = operator.t().dot(&operator);
+        for (a, b) in charted.iter().zip(plain.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "charted {a} vs unscaled {b}");
+        }
+        // The floor is exactly where the square stops being a normal f64, so an
+        // operator sitting on it is still uncharted and one just below it is not.
+        let floor = f64::MIN_POSITIVE.sqrt();
+        assert_eq!(operator_chart_scale(&Array2::from_elem((2, 2), floor)), 1.0);
+        assert!(operator_chart_scale(&Array2::from_elem((2, 2), floor / 2.0)) > 1.0);
+        // An exactly zero operator has an exactly zero Gram at every scale.
+        assert_eq!(operator_chart_scale(&Array2::<f64>::zeros((2, 2))), 1.0);
+    }
+
+    /// Below the floor the plain Gram is EXACTLY zero — the state that made the
+    /// penalty a dropped zero matrix and refused the trial (#3430) — while the
+    /// charted Gram carries the same normalized penalty. The reference is the
+    /// SAME operator written at a magnitude f64 can square, so the assertion is
+    /// against the exact answer and not against the charted path's own output.
+    #[test]
+    fn an_underflowing_operator_keeps_its_normalized_penalty_3430() {
+        let shape = |(row, col): (usize, usize)| ((row + 1) as f64).sqrt() - 0.25 * col as f64;
+        let tiny = Array2::from_shape_fn((5, 3), shape).mapv(|value| value * 1.0e-170);
+        let plain = tiny.t().dot(&tiny);
+        assert!(
+            plain.iter().all(|value| *value == 0.0),
+            "the fixture must reproduce the underflow it exists for: {plain:?}"
+        );
+        let charted = charted_operator_gram(&tiny);
+        let norm = charted.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(
+            norm.is_finite() && norm > 0.0,
+            "the charted Gram must be representable, got norm {norm}"
+        );
+        let reference = Array2::from_shape_fn((5, 3), shape);
+        let reference_gram = reference.t().dot(&reference);
+        let reference_norm = reference_gram.iter().map(|v| v * v).sum::<f64>().sqrt();
+        // Every fixture entry is positive, so the Gram sums nothing that
+        // cancels: each entry carries the two roundings of `value * 1.0e-170`,
+        // the product's own, and the five-term summation's, and the norm adds
+        // the same again. Thirty-two units of the last place is that budget with
+        // room, and is a rounding allowance rather than a slackened bar — the
+        // charted and exact normalized penalties are the SAME matrix.
+        for (charted_entry, reference_entry) in charted.iter().zip(reference_gram.iter()) {
+            let left = charted_entry / norm;
+            let right = reference_entry / reference_norm;
+            assert!(right > 0.0, "fixture entry must be positive, got {right}");
+            assert!(
+                (left - right).abs() <= 32.0 * f64::EPSILON * right,
+                "normalized penalty entry {left} does not match the exact {right}"
+            );
+        }
+    }
+}
