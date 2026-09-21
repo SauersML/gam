@@ -262,6 +262,45 @@ impl From<MarginalSlopeCovariance> for ScoreCovarianceField {
 }
 
 impl ScoreCovarianceField {
+    /// Absorb the field into a persistent warm-start key (#3697): the pooled
+    /// covariance, the conditional model, and the materialised per-row stack
+    /// the row program actually reads. The stack is hashed as well as the
+    /// model because it is the model evaluated on a span this type does not
+    /// carry, so the model alone does not pin it.
+    pub(crate) fn fingerprint_into(
+        &self,
+        hasher: &mut gam_runtime::warm_start::Fingerprinter,
+    ) -> Result<(), String> {
+        let Self {
+            pooled,
+            per_row,
+            model,
+        } = self;
+        pooled.fingerprint_into(hasher);
+        match model {
+            None => hasher.write_bool(false),
+            Some(model) => {
+                hasher.write_bool(true);
+                let bytes = serde_json::to_vec(model.as_ref()).map_err(|error| {
+                    format!("conditional score covariance fingerprint serialization failed: {error}")
+                })?;
+                hasher.write_usize(bytes.len());
+                hasher.write_bytes(&bytes);
+            }
+        }
+        match per_row {
+            None => hasher.write_bool(false),
+            Some(stack) => {
+                hasher.write_bool(true);
+                hasher.write_usize(stack.len());
+                for covariance in stack.iter() {
+                    covariance.fingerprint_into(hasher);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The pooled, row-invariant field. This is the pre-gam#2766 object.
     pub fn pooled(pooled: MarginalSlopeCovariance) -> Self {
         Self::from(pooled)

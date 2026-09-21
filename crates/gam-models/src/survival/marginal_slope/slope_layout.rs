@@ -283,6 +283,74 @@ pub(crate) struct SlopeLayout {
 }
 
 impl SlopeLayout {
+    /// Absorb the whole layout into a persistent warm-start key (#3697): the
+    /// coefficient design, every follow-up channel design and margin, and the
+    /// physical channels with their offsets. Each struct is destructured
+    /// exhaustively, so a field added later cannot silently escape the key.
+    pub(crate) fn fingerprint_into(
+        &self,
+        hasher: &mut gam_runtime::warm_start::Fingerprinter,
+    ) -> Result<(), String> {
+        let Self {
+            coefficient_design,
+            follow_up,
+            nrows,
+            current_width,
+            channels,
+        } = self;
+        hasher.write_usize(*nrows);
+        hasher.write_usize(*current_width);
+        gam_custom_family::hash_cf_design_matrix(hasher, coefficient_design)?;
+        match follow_up {
+            None => hasher.write_bool(false),
+            Some(SlopeFollowUpDesigns {
+                entry,
+                derivative_exit,
+                time_margin,
+            }) => {
+                hasher.write_bool(true);
+                gam_custom_family::hash_cf_design_matrix(hasher, entry)?;
+                gam_custom_family::hash_cf_design_matrix(hasher, derivative_exit)?;
+                match time_margin {
+                    None => hasher.write_bool(false),
+                    Some(SlopeTimeMargin {
+                        entry,
+                        exit,
+                        derivative_exit,
+                    }) => {
+                        hasher.write_bool(true);
+                        hasher.write_f64_array2(entry);
+                        hasher.write_f64_array2(exit);
+                        hasher.write_f64_array2(derivative_exit);
+                    }
+                }
+            }
+        }
+        match channels {
+            SlopeChannels::Shared { offset } => {
+                hasher.write_str("shared");
+                hasher.write_f64_array1(offset);
+            }
+            SlopeChannels::PerScore {
+                raw_design,
+                current_from_raw,
+                raw_ranges,
+                offsets,
+            } => {
+                hasher.write_str("per-score");
+                gam_custom_family::hash_cf_design_matrix(hasher, raw_design)?;
+                hasher.write_f64_array2(current_from_raw);
+                hasher.write_usize(raw_ranges.len());
+                for range in raw_ranges.iter() {
+                    hasher.write_usize(range.start);
+                    hasher.write_usize(range.end);
+                }
+                hasher.write_f64_array2(offsets);
+            }
+        }
+        Ok(())
+    }
+
     #[inline]
     pub(crate) fn is_per_score(&self) -> bool {
         matches!(self.channels, SlopeChannels::PerScore { .. })

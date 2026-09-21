@@ -217,43 +217,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         {
             return None;
         }
-        let mut hasher = gam_runtime::warm_start::Fingerprinter::new();
-        hasher.write_str("survival-marginal-slope-family");
-        hasher.write_usize(self.n);
-        hasher.write_usize(self.event.len());
-        for &value in self.event.iter() {
-            hasher.write_f64(value);
-        }
-        hasher.write_usize(self.weights.len());
-        for &value in self.weights.iter() {
-            hasher.write_f64(value);
-        }
-        hasher.write_usize(self.z.nrows());
-        hasher.write_usize(self.z.ncols());
-        for &value in self.z.iter() {
-            hasher.write_f64(value);
-        }
-        match self.gaussian_frailty_sd {
-            Some(value) => {
-                hasher.write_bool(true);
-                hasher.write_f64(value);
-            }
-            None => hasher.write_bool(false),
-        }
-        hasher.write_f64(self.derivative_guard);
-        hasher.write_usize(self.offset_entry.len());
-        for &value in self.offset_entry.iter() {
-            hasher.write_f64(value);
-        }
-        hasher.write_usize(self.offset_exit.len());
-        for &value in self.offset_exit.iter() {
-            hasher.write_f64(value);
-        }
-        hasher.write_usize(self.derivative_offset_exit.len());
-        for &value in self.derivative_offset_exit.iter() {
-            hasher.write_f64(value);
-        }
-        Some(hasher.finish_hex())
+        self.likelihood_fingerprint().ok()
     }
 
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {

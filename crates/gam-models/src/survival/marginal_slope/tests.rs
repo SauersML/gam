@@ -9643,3 +9643,103 @@ fn link_deviation_row_likelihood_is_c1_across_its_support_end_2971() {
         left_slope_est + right_slope_est
     );
 }
+
+/// #3697: a persistent warm-start key hit returns the cached mode,
+/// log-likelihood, penalty and log-determinants without re-evaluating them, so
+/// every field that changes the likelihood must move the family fingerprint.
+/// Each variant below differs from the base family in exactly one field that
+/// the fingerprint used to skip; all of them used to share the base key.
+#[test]
+fn warm_start_fingerprint_moves_with_every_likelihood_field_3697() {
+    let n = 12;
+    let base = make_closed_form_test_family(n);
+    let specs = [ParameterBlockSpec {
+        name: "time".to_string(),
+        design: DesignMatrix::from(Array2::zeros((n, 1))),
+        offset: Array1::zeros(n),
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(Array1::zeros(1)),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }];
+    let options = BlockwiseFitOptions::default();
+    let key = |family: &SurvivalMarginalSlopeFamily| {
+        family
+            .persistent_warm_start_fingerprint(&specs, &options)
+            .expect("a family whose designs hash has a warm-start key")
+    };
+    let column = |value: f64| DesignMatrix::from(Array2::from_elem((n, 1), value));
+    let law = {
+        let grid = crate::test_support::skewed_grid();
+        let grid = crate::bms::EmpiricalZGrid::new(
+            grid.nodes.clone(),
+            grid.weights.clone(),
+            "gam#3697 warm-start key law",
+        )
+        .expect("a valid law");
+        Arc::new(
+            SurvivalLatentLaw::from_kind(
+                &crate::bms::LatentMeasureKind::GlobalEmpirical { grid },
+                n,
+            )
+            .expect("materialise the law")
+            .expect("an empirical law is a law"),
+        )
+    };
+
+    let base_key = key(&base);
+    assert_eq!(key(&base.clone()), base_key, "the key is a pure function of the family");
+
+    let mut variants: Vec<(&str, SurvivalMarginalSlopeFamily)> = Vec::new();
+    let mut vary = |label, edit: &dyn Fn(&mut SurvivalMarginalSlopeFamily)| {
+        let mut family = base.clone();
+        edit(&mut family);
+        variants.push((label, family));
+    };
+    vary("entry_at_origin", &|f| {
+        let mut at_origin = Array1::from_elem(n, false);
+        at_origin[0] = true;
+        f.entry_at_origin = Arc::new(at_origin);
+    });
+    vary("score_covariance", &|f| {
+        f.score_covariance = ScoreCovarianceField::pooled(
+            MarginalSlopeCovariance::diagonal(array![2.0]).unwrap(),
+        );
+    });
+    vary("design_entry", &|f| f.design_entry = column(1.0));
+    vary("design_exit", &|f| f.design_exit = column(1.0));
+    vary("design_derivative_exit", &|f| f.design_derivative_exit = column(1.0));
+    vary("marginal_design ones", &|f| f.marginal_design = column(1.0));
+    vary("marginal_design twos", &|f| f.marginal_design = column(2.0));
+    vary("slope_layout", &|f| f.slope_layout = column(1.0).into());
+    vary("influence_absorber", &|f| {
+        f.influence_absorber = Some(Array2::from_elem((n, 1), 0.5));
+    });
+    vary("time_linear_constraints", &|f| {
+        f.time_linear_constraints = Some(LinearInequalityConstraints {
+            a: array![[1.0]],
+            b: array![0.0],
+        });
+    });
+    vary("time_wiggle_knots", &|f| f.time_wiggle_knots = Some(array![0.0, 1.0]));
+    vary("time_wiggle_degree", &|f| f.time_wiggle_degree = Some(3));
+    vary("time_wiggle_ncols", &|f| f.time_wiggle_ncols = 2);
+    vary("jeffreys_armed", &|f| f.jeffreys_armed = !f.jeffreys_armed);
+    vary("latent_law", &|f| f.latent_law = Some(Arc::clone(&law)));
+
+    let mut seen = vec![("base", base_key)];
+    for (label, family) in &variants {
+        let variant_key = key(family);
+        for (other, other_key) in &seen {
+            assert_ne!(
+                &variant_key, other_key,
+                "changing {label} left the warm-start key equal to that of {other}"
+            );
+        }
+        seen.push((*label, variant_key));
+    }
+}

@@ -294,6 +294,35 @@ pub(crate) struct JointLatentLawRuntime {
 }
 
 impl JointLatentLawRuntime {
+    /// Absorb the runtime into a persistent warm-start key (#3697).
+    pub(crate) fn fingerprint_into(&self, hasher: &mut gam_runtime::warm_start::Fingerprinter) {
+        let Self {
+            score_dim,
+            node_count,
+            residual_nodes,
+            weights,
+            log_weights,
+            score_mean,
+            factors,
+        } = self;
+        hasher.write_usize(*score_dim);
+        hasher.write_usize(*node_count);
+        hasher.write_f64_slice(residual_nodes);
+        hasher.write_f64_slice(weights);
+        hasher.write_f64_slice(log_weights);
+        hasher.write_f64_slice(score_mean);
+        match factors {
+            JointFactors::Pooled(factor) => {
+                hasher.write_str("pooled");
+                hasher.write_f64_slice(factor);
+            }
+            JointFactors::PerRow(stack) => {
+                hasher.write_str("per-row");
+                hasher.write_f64_slice(stack);
+            }
+        }
+    }
+
     #[inline]
     pub(crate) fn score_dim(&self) -> usize {
         self.score_dim
