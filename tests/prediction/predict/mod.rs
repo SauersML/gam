@@ -5,3 +5,4 @@ mod predict_linear_term_extrapolation_se_grows;
 mod predict_new_row_eta_uses_training_column_order;
 mod predict_outside_train_range_bounded;
 mod predict_uncertainty_interval_coverage;
+mod diag_3502;

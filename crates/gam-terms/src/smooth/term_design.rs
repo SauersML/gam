@@ -1234,7 +1234,25 @@ pub struct RealizedCollectionGauge {
 /// stored on [`SmoothCollectionGauge`]; differentiating or replaying freshly
 /// chosen vectors would differentiate a numerical coordinate convention rather
 /// than the statistical smooth (gam#2760).
+///
+/// The arm fixes the realized SPAN as an orthonormal frame; the coordinates
+/// inside it are then balanced against the term's own penalties by
+/// [`penalty_balanced_collection_chart`], because those coordinates are what
+/// every later penalty-rank decision is measured in.
 fn derive_smooth_collection_coefficient_transform(
+    design_local: &DesignMatrix,
+    arm: SmoothCollectionGaugeArm,
+    block: ArrayView2<'_, f64>,
+    block_is_owned: bool,
+    active_penalties: &[ActivePenalty],
+    termname: &str,
+) -> Result<Array2<f64>, BasisError> {
+    let frame = derive_smooth_collection_span_frame(design_local, arm, block, block_is_owned)?;
+    penalty_balanced_collection_chart(design_local, block, frame, active_penalties, termname)
+}
+
+/// The orthonormal coefficient frame of the span a collection arm keeps.
+fn derive_smooth_collection_span_frame(
     design_local: &DesignMatrix,
     arm: SmoothCollectionGaugeArm,
     block: ArrayView2<'_, f64>,
@@ -1265,6 +1283,111 @@ fn derive_smooth_collection_coefficient_transform(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Choose the collection chart's coordinates inside the span `frame` keeps.
+///
+/// The chart is frozen at the reference realization and every later trial of
+/// the term's basis parameters is read in it: the penalties are re-evaluated
+/// there and each block's frozen structural rank is re-checked against its own
+/// rounding band `n·ε·λ_max`. So the chart decides which spectral spread a
+/// penalty must survive, and it has to measure a penalty against the energy
+/// the design and the penalties themselves give each direction, not against
+/// absolute coefficient size. With
+///
+/// `G = (P_C X F)ᵀ(P_C X F)`, `P_k = Fᵀ S_k F`, `M = G + ‖G‖₂ Σ_k P_k/‖P_k‖₂`,
+/// `M = VΛVᵀ`, `T = F V Λ^{-1/2}` (so `TᵀMT = I`):
+///
+/// * **Design scale.** `TᵀGT ≤ TᵀMT = I`, so no realized column carries more
+///   than unit energy on the fit rows. A direction the rows barely see but a
+///   penalty charges — a basis function inside a data gap — keeps `M` large
+///   through that penalty, so the chart does not blow it up at a new row in
+///   the gap. That is what the pure whitener `F Λ_G^{-1/2}` did.
+/// * **Penalty spectrum.** `M ⪰ ‖G‖₂ P_k/‖P_k‖₂` gives
+///   `λ_max(TᵀP_kT) ≤ ‖P_k‖₂/‖G‖₂`, and `M ⪯ (1+K)‖G‖₂ I` gives
+///   `λ_j(TᵀP_kT) ≥ λ_j(P_k)/((1+K)‖G‖₂)` (Courant–Fischer, `K` penalties).
+///   So a penalty's spectrum relative to its largest eigenvalue is never
+///   below `1/(1+K)` of what the orthonormal frame gives it, and a rank the
+///   frame resolves stays resolved. That was the pure whitener's failure the
+///   other way round.
+/// * **Collinear directions.** Where design and penalties both nearly vanish
+///   — kernel columns that become collinear at a long length scale — `M` is
+///   small too, and the chart measures the penalty relative to that small
+///   energy. In the orthonormal frame the same penalty is measured in
+///   absolute coefficient units, so a Matérn mass block frozen at full rank
+///   sat at `1.2e-21` against a band of `1.3e-14` one κ step away and every
+///   longer length scale was refused (gam#3502, #3344).
+///
+/// `T` is invariant to rescaling the design and to rescaling each penalty
+/// independently, and to the choice of orthonormal basis for the span, so no
+/// constant here is a tuning choice. With no penalty there is nothing to
+/// balance and the frame is kept.
+fn penalty_balanced_collection_chart(
+    design_local: &DesignMatrix,
+    block: ArrayView2<'_, f64>,
+    frame: Array2<f64>,
+    active_penalties: &[ActivePenalty],
+    termname: &str,
+) -> Result<Array2<f64>, BasisError> {
+    use gam_linalg::faer_ndarray::{FaerEigh, fast_ab, fast_atb};
+    let p = design_local.ncols();
+    if frame.ncols() == 0 || active_penalties.is_empty() {
+        return Ok(frame);
+    }
+    let top_eigenvalue = |matrix: &Array2<f64>| -> Result<f64, BasisError> {
+        let (eigenvalues, _) =
+            FaerEigh::eigh(matrix, faer::Side::Lower).map_err(BasisError::LinalgError)?;
+        Ok(eigenvalues.iter().copied().fold(0.0_f64, f64::max))
+    };
+    let symmetrized = |matrix: Array2<f64>| (&matrix + &matrix.t()) * 0.5;
+    let mut penalty_sum = Array2::<f64>::zeros((frame.ncols(), frame.ncols()));
+    for penalty in active_penalties {
+        if penalty.matrix.dim() != (p, p) {
+            gam_problem::bail_dim_basis!(
+                "collection chart for term '{termname}': a penalty is {}x{} but the design has {p} columns",
+                penalty.matrix.nrows(),
+                penalty.matrix.ncols()
+            );
+        }
+        let restricted = symmetrized(fast_atb(&frame, &fast_ab(&penalty.matrix, &frame)));
+        let norm = top_eigenvalue(&restricted)?;
+        if !norm.is_finite() {
+            crate::bail_invalid_basis!(
+                "collection chart for term '{termname}': a penalty restricted to the kept span is not finite"
+            );
+        }
+        if norm > 0.0 {
+            penalty_sum.scaled_add(1.0 / norm, &restricted);
+        }
+    }
+    let realized = apply_smooth_transform_to_design(design_local.clone(), &frame, termname)?;
+    let (realized, _) = crate::basis::FixedRowSpaceProjector::from_constraint_block(block)?
+        .project_design(realized, termname)?;
+    let mut gram = Array2::<f64>::zeros((frame.ncols(), frame.ncols()));
+    for start in (0..realized.nrows()).step_by(crate::basis::DESIGN_CROSS_CHUNK_SIZE) {
+        let end = (start + crate::basis::DESIGN_CROSS_CHUNK_SIZE).min(realized.nrows());
+        let chunk = realized
+            .try_row_chunk(start..end)
+            .map_err(|e| BasisError::InvalidInput(e.to_string()))?;
+        gram += &fast_atb(&chunk, &chunk);
+    }
+    let gram = symmetrized(gram);
+    let design_scale = top_eigenvalue(&gram)?;
+    let metric = &gram + &(penalty_sum * design_scale);
+    let (eigenvalues, eigenvectors) =
+        FaerEigh::eigh(&metric, faer::Side::Lower).map_err(BasisError::LinalgError)?;
+    // `M ⪰ FᵀGF`, which the arm kept strictly above its rank tolerance, so a
+    // non-positive eigenvalue here means the inputs are not what they claim.
+    if let Some(bad) = eigenvalues.iter().find(|value| !(value.is_finite() && **value > 0.0)) {
+        crate::bail_invalid_basis!(
+            "collection chart for term '{termname}': the balanced metric on the kept span has eigenvalue {bad:e}"
+        );
+    }
+    let mut balance = eigenvectors;
+    for (mut column, &value) in balance.columns_mut().into_iter().zip(eigenvalues.iter()) {
+        column /= value.sqrt();
+    }
+    Ok(fast_ab(&frame, &balance))
 }
 
 /// Put a freshly built TERM-LOCAL design into a collection's FROZEN gauge.
@@ -2035,6 +2158,8 @@ fn apply_global_smooth_identifiability(
                     SmoothCollectionGaugeArm::Delete,
                     block.view(),
                     delete_block_is_owned,
+                    &term.active_penalties,
+                    &term.name,
                 )?,
             ),
             GlobalIdentifiabilityPlan::Residualize { block } => Some(
@@ -2043,6 +2168,8 @@ fn apply_global_smooth_identifiability(
                     SmoothCollectionGaugeArm::Residualize,
                     block.view(),
                     factor_by_level,
+                    &term.active_penalties,
+                    &term.name,
                 )?,
             ),
         };
