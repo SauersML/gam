@@ -16,6 +16,21 @@
   p-value is emitted.
   **Behavior change:** composition p-values on stochastic pairs are smaller, and the
   test's power now grows with the sample.
+- **The structured residual model reads its activity-law resolution from the evidence** (#3337).
+  `ACTIVITY_SCALE_BINS = 8` fixed the piecewise-constant activity law `c(z)` at eight
+  equal-width bins of `z`. Nothing derived 8: it did not move with `n` and it did not
+  move with how much a bin could say about its own scale. The law is now binned by equal
+  *count*, which at the null law `c ≡ 1` is equal Fisher information for each bin's
+  scale, and the number of bins is chosen by the same Laplace evidence that chooses the
+  factor rank, on the nested doubling ladder `B = 1, 2, 4, ...`. Rung 1 is the null law
+  exactly, so it stays recoverable and it is where the search starts. A rung whose best
+  rank is 0 carries no activity law, so its evidence is rung 1's rank-0 evidence on a
+  different grouping of the same sums and is not read as a refinement. The ladder also
+  skips a refinement that splits no bin (the identical model) and stops once every bin
+  holds one distinct value of `z`. `StructuredResidualModel::activity_bins` reports the
+  resolution that was kept. Under a null activity law the search now costs two rungs at
+  one slot where the fixed law paid eight slots; under a real law it pays
+  `log2(B) + 2` rank ladders for the resolution it keeps.
 - **One owner for the uniform cyclic domain grid, and it closes on its end** (#3179 item 6).
   `basis_with_jet(kind="bspline", periodic=True, n_basis=k)` built its knot grid with
   `Array1::linspace(0.0, 1.0, k + 1)`, a second copy of

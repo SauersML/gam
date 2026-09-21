@@ -20,7 +20,11 @@
 //!   independent noise), and
 //! * `c(z) > 0` is the **activity-scale law**: a strictly-positive scalar that
 //!   modulates the factor energy with the activity coordinate, piecewise
-//!   constant over equal-width bins of `z` and normalized to row-mean one.
+//!   constant over equal-*count* bins of `z` and normalized to row-mean one.
+//!   Equal counts are equal Fisher information per bin at the null law, so the
+//!   law has one resolution number, and that number is read from the evidence
+//!   on a nested doubling ladder rather than fixed (#3337); see
+//!   [`StructuredResidualModel::fit`].
 //!
 //! Each rank `r` is fitted to its certified posterior mode by a Newton
 //! trust-region solve with exact analytic derivatives, under priors centred on
@@ -29,7 +33,9 @@
 //! evidence maximizer over every rank the model identifies,
 //! `0 ≤ r ≤ L(p)` with `L(p)` the Ledermann bound; a higher rank is taken only
 //! on strictly larger evidence. The candidate set is fixed by identifiability
-//! alone, so no caller-supplied cap can truncate the model comparison.
+//! alone, so no caller-supplied cap can truncate the model comparison. The
+//! **resolution of `c(z)`** is read from the same evidence on the nested
+//! doubling ladder `B = 1, 2, 4, …`, and is likewise not a knob.
 //!
 //! # What it produces
 //!
@@ -59,12 +65,64 @@ use faer::Side;
 use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_problem::RowMetric;
 
-/// Number of equal-width bins the activity coordinate `z` is partitioned into
-/// for the activity-scale law `c(z)`, which is constant within a bin. A fixed
-/// structural resolution of the law: every occupied bin's scale is a free
-/// parameter of the evidence, centred on the null law `c ≡ 1` by the Dirichlet
-/// activity prior and integrated out with the rest of the model.
-const ACTIVITY_SCALE_BINS: usize = 8;
+/// The bin of every row at resolution `bins`: equal-*count* (quantile) bins of
+/// the activity coordinate `z`.
+///
+/// Equal count, not equal width, because the quantity a bin has to carry is
+/// information about its own scale parameter. At the null law `c ≡ 1` — the
+/// Dirichlet prior's centre, and the state the resolution is chosen at — every
+/// bin sees the same `Σ_b = ΛΛᵀ + D`, so the Fisher information for `ln c_b`
+/// is `(n_b / 2)·tr[(Σ⁻¹ΛΛᵀ)²]`: the same constant for every bin times its own
+/// row count. Equal counts therefore *are* equal information per bin, which is
+/// what makes one resolution number meaningful for the whole law. Equal-width
+/// bins put that information wherever `z` happens to be dense.
+///
+/// The edges are the `j / bins` empirical quantiles. Doubling `bins` keeps
+/// every existing edge (`⌊2j·n / 2B⌋ = ⌊j·n / B⌋`), so the ladder in
+/// [`StructuredResidualModel::fit`] is nested: the finer partition refines the
+/// coarser one, and the finer model's law contains the coarser one's.
+///
+/// A row's bin is a function of its `z` alone (the count of edges at or below
+/// it), so tied `z` values always share a bin and the assignment is monotone.
+/// `bins <= 1`, and a `z` with no spread, put every row in one bin — the
+/// homoscedastic law `c ≡ 1`.
+fn activity_bin_assignment(z: ArrayView1<'_, f64>, bins: usize) -> Vec<usize> {
+    let n = z.len();
+    if bins <= 1 || n == 0 {
+        return vec![0; n];
+    }
+    let mut sorted: Vec<f64> = z.iter().copied().collect();
+    sorted.sort_by(f64::total_cmp);
+    let edges: Vec<f64> = (1..bins)
+        .map(|j| sorted[((j as u128 * n as u128) / bins as u128) as usize])
+        .collect();
+    z.iter()
+        .map(|value| edges.partition_point(|edge| edge <= value))
+        .collect()
+}
+
+/// How many of the `bins` bins hold at least one row.
+fn occupied_bin_count(row_bin: &[usize], bins: usize) -> usize {
+    let mut seen = vec![false; bins];
+    let mut count = 0usize;
+    for &b in row_bin {
+        if !seen[b] {
+            seen[b] = true;
+            count += 1;
+        }
+    }
+    count
+}
+
+/// How many distinct values `z` takes. The saturated resolution: once that
+/// many bins are occupied every bin holds exactly one value of `z`, and no
+/// finer partition can regroup a single row.
+fn distinct_activity_values(z: ArrayView1<'_, f64>) -> usize {
+    let mut sorted: Vec<f64> = z.iter().copied().collect();
+    sorted.sort_by(f64::total_cmp);
+    sorted.dedup();
+    sorted.len()
+}
 
 /// The fitted structured residual-covariance model: low-rank factor `Λ`,
 /// idiosyncratic diagonal `D`, and the smooth activity-scale `c(z)` evaluated at
@@ -83,8 +141,11 @@ pub struct StructuredResidualModel {
     diagonal: Array1<f64>,
     /// Per-row activity scale `c(z_n) > 0`, length `n`.
     row_scale: Array1<f64>,
-    /// Laplace log marginal likelihood of the selected rank, in raw residual
-    /// units: the value the rank search maximized.
+    /// Selected resolution of the activity law: the number of equal-count bins
+    /// of `z` the evidence kept. `1` is the homoscedastic law `c ≡ 1`.
+    activity_bins: usize,
+    /// Laplace log marginal likelihood of the selected rank and resolution, in
+    /// raw residual units: the value the search maximized.
     log_evidence: f64,
 }
 
@@ -136,6 +197,49 @@ impl StructuredResidualModel {
     /// on a tie). Errors on shape / non-finite input, on a residual channel that
     /// is identically zero, and on any rank whose mode the solver cannot certify:
     /// a rank with no certified evidence cannot be compared.
+    ///
+    /// # The activity law's resolution
+    ///
+    /// The number of bins the activity law `c(z)` is piecewise constant over is
+    /// read from the same evidence, on the same ladder discipline as the rank
+    /// (#3337). It is not a constant of this module.
+    ///
+    /// The rungs are `B = 1, 2, 4, …` equal-count bins of `z`
+    /// ([`activity_bin_assignment`]). Doubling is the least nested refinement
+    /// that reaches every bin — the smallest integer ratio above one — and it
+    /// keeps every existing edge, so rung `2B` refines rung `B` and its law
+    /// contains rung `B`'s. Rung 1 is the null law `c ≡ 1` exactly: one slot
+    /// leaves no free scale, so it is always recoverable and it is where the
+    /// search starts.
+    ///
+    /// Evidences are comparable across rungs for the same reason they are
+    /// comparable across ranks: the same rows under the same Gaussian
+    /// likelihood, the factor and activity priors both proper with their
+    /// normalizers included, and the flat `η` prior and the standardization
+    /// offset `n·Σ_j ln s_j` identical at every rung (the channel scales sum
+    /// over all slots, so they do not move with `B`).
+    ///
+    /// The ladder stops at the first refinement whose best evidence does not
+    /// beat the best so far — the adequacy discipline a nested refinement is
+    /// entitled to, and the one the spatial resolution loop uses (#1689). A
+    /// rung whose best rank is 0 does not count as a refinement whatever its
+    /// evidence reads: rank 0 has no activity law (`has_kappa` is false), so
+    /// its evidence is the same number at every resolution and what separates
+    /// two readings of it is the rounding of a different grouping of the same
+    /// sums. Two structural stops bound the ladder further: a refinement that
+    /// splits no bin is the
+    /// identical model (nested edges, so an unchanged occupied-bin count means
+    /// no bin split; `binned_moments` drops the empty bins and returns the same
+    /// moments), so it is skipped without a refit; and once the occupied bins
+    /// number as many as `z` has distinct values, every bin holds one value and
+    /// no finer partition regroups anything. `B` never exceeds `n`, the
+    /// saturated one-row-per-bin resolution.
+    ///
+    /// Cost: one rank ladder per *fitted* rung instead of one in total. Under a
+    /// null activity law the search stops at rung 2, and rung 1 carries one
+    /// slot where the fixed eight-bin law carried eight, so it is cheaper than
+    /// what it replaces; under a real law it pays `log2(B) + 2` rank ladders
+    /// for the resolution it keeps.
     pub fn fit(input: ResidualFactorInput<'_>) -> Result<Self, String> {
         let r = input.residuals;
         let z = input.activity;
@@ -159,48 +263,69 @@ impl StructuredResidualModel {
             return Err("StructuredResidualModel::fit: activity must be finite".to_string());
         }
 
-        // Bin assignment for the activity-scale law: deterministic equal-width
-        // bins over the observed z-range. A degenerate (zero-width) range maps
-        // every row to bin 0, recovering a single homoscedastic scale.
-        let bins = ACTIVITY_SCALE_BINS;
-        let z_min = z.iter().copied().fold(f64::INFINITY, f64::min);
-        let z_max = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let z_span = z_max - z_min;
-        let row_bin: Vec<usize> = (0..n)
-            .map(|i| {
-                if z_span <= 0.0 {
-                    0
-                } else {
-                    let frac = (z[i] - z_min) / z_span;
-                    let idx = (frac * bins as f64).floor() as isize;
-                    idx.clamp(0, bins as isize - 1) as usize
-                }
-            })
-            .collect();
-
-        let moments = evidence::binned_moments(r, &row_bin, bins)?;
         let max_rank = evidence::ledermann_bound(p);
-        let mut best: Option<(usize, evidence::RankFit)> = None;
-        for rank in 0..=max_rank {
-            let candidate = evidence::fit_rank(&moments, rank)?;
-            let take = best
-                .as_ref()
-                .map_or(true, |(_, b)| candidate.log_evidence > b.log_evidence);
-            if take {
-                best = Some((rank, candidate));
+        let saturated = distinct_activity_values(z);
+        let mut selected: Option<(usize, usize, evidence::RankFit, Vec<usize>)> = None;
+        let mut fitted_occupancy = 0usize;
+        let mut bins = 1usize;
+        while bins <= n {
+            let row_bin = activity_bin_assignment(z, bins);
+            let occupied = occupied_bin_count(&row_bin, bins);
+            if occupied > fitted_occupancy {
+                fitted_occupancy = occupied;
+                let moments = evidence::binned_moments(r, &row_bin, bins)?;
+                let mut rung: Option<(usize, evidence::RankFit)> = None;
+                for rank in 0..=max_rank {
+                    let candidate = evidence::fit_rank(&moments, rank)?;
+                    let take = rung
+                        .as_ref()
+                        .map_or(true, |(_, b)| candidate.log_evidence > b.log_evidence);
+                    if take {
+                        rung = Some((rank, candidate));
+                    }
+                }
+                let (rank, fit) = rung.ok_or_else(|| {
+                    "StructuredResidualModel::fit: empty rank search".to_string()
+                })?;
+                // A rung whose best rank is 0 carries no activity law at all —
+                // `c ≡ 1` exactly, at every resolution — so its evidence is
+                // rung 1's rank-0 evidence recomputed on a different grouping
+                // of the same sums, and the difference between them is
+                // rounding. It is never a refinement of anything, and it can
+                // never beat an accepted rank-1 rung either, because that rung
+                // already beat the same number at rung 1.
+                let refines = match selected.as_ref() {
+                    None => true,
+                    Some((_, _, best, _)) => rank > 0 && fit.log_evidence > best.log_evidence,
+                };
+                if !refines {
+                    break;
+                }
+                selected = Some((bins, rank, fit, moments.row_slot));
             }
+            if fitted_occupancy >= saturated {
+                break;
+            }
+            bins = bins.saturating_mul(2);
         }
-        let (factor_rank, fit) =
-            best.ok_or_else(|| "StructuredResidualModel::fit: empty rank search".to_string())?;
-        let row_scale = Array1::from_iter(moments.row_slot.iter().map(|&s| fit.slot_scale[s]));
+        let (activity_bins, factor_rank, fit, row_slot) = selected
+            .ok_or_else(|| "StructuredResidualModel::fit: empty resolution ladder".to_string())?;
+        let row_scale = Array1::from_iter(row_slot.iter().map(|&s| fit.slot_scale[s]));
         Ok(Self {
             p,
             factor_rank,
             lambda: fit.lambda,
             diagonal: fit.diagonal,
             row_scale,
+            activity_bins,
             log_evidence: fit.log_evidence,
         })
+    }
+
+    /// The resolution of the fitted activity law: the number of equal-count
+    /// bins of `z` the evidence kept. `1` is the homoscedastic law `c ≡ 1`.
+    pub fn activity_bins(&self) -> usize {
+        self.activity_bins
     }
 
     /// Selected factor rank `r`.
@@ -730,23 +855,26 @@ mod tests {
         (residuals, activity)
     }
 
-    /// Reproduce `fit`'s equal-width bin assignment for a test activity vector.
-    fn assign_bins(activity: &Array1<f64>) -> Vec<usize> {
-        let bins = ACTIVITY_SCALE_BINS;
-        let z_min = activity.iter().copied().fold(f64::INFINITY, f64::min);
-        let z_max = activity.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let span = z_max - z_min;
-        activity
-            .iter()
-            .map(|&z| {
-                if span <= 0.0 {
-                    0
-                } else {
-                    let frac = (z - z_min) / span;
-                    (frac * bins as f64).floor().clamp(0.0, bins as f64 - 1.0) as usize
-                }
+    /// The best evidence over every rank at one resolution, with the rank that
+    /// carries it: the rung `fit`'s ladder scores.
+    fn rung_evidence(
+        residuals: ArrayView2<'_, f64>,
+        activity: &Array1<f64>,
+        bins: usize,
+    ) -> (usize, f64) {
+        let row_bin = activity_bin_assignment(activity.view(), bins);
+        let moments = evidence::binned_moments(residuals, &row_bin, bins).expect("moments");
+        let max_rank = evidence::ledermann_bound(residuals.ncols());
+        (0..=max_rank)
+            .map(|rank| {
+                (
+                    rank,
+                    evidence::fit_rank(&moments, rank).expect("rank fit").log_evidence,
+                )
             })
-            .collect()
+            .fold((0usize, f64::NEG_INFINITY), |best, cand| {
+                if cand.1 > best.1 { cand } else { best }
+            })
     }
 
     /// Per-rank evidence on the planted single-factor activity-law DGP: the
@@ -756,26 +884,166 @@ mod tests {
     #[test]
     fn evidence_prefers_planted_rank_one() {
         let (residuals, activity) = planted_rank_one_activity();
-        let row_bin = assign_bins(&activity);
-        let moments = evidence::binned_moments(residuals.view(), &row_bin, ACTIVITY_SCALE_BINS)
-            .expect("moments");
         assert_eq!(evidence::ledermann_bound(4), 1);
-        let ev: Vec<f64> = (0..=1usize)
-            .map(|rank| evidence::fit_rank(&moments, rank).expect("rank fit").log_evidence)
-            .collect();
-        assert!(
-            ev[1] > ev[0],
-            "evidence must prefer the planted rank 1: log Z_0 = {:.3}, log Z_1 = {:.3}",
-            ev[0],
-            ev[1]
-        );
         let model = StructuredResidualModel::fit(ResidualFactorInput {
             residuals: residuals.view(),
             activity: activity.view(),
         })
         .expect("fit");
         assert_eq!(model.factor_rank(), 1);
+
+        // At the resolution the fit selected, the planted rank 1 must beat the
+        // null rank 0, and the fit's own evidence must be that rank's.
+        let bins = model.activity_bins();
+        let row_bin = activity_bin_assignment(activity.view(), bins);
+        let moments =
+            evidence::binned_moments(residuals.view(), &row_bin, bins).expect("moments");
+        let ev: Vec<f64> = (0..=1usize)
+            .map(|rank| evidence::fit_rank(&moments, rank).expect("rank fit").log_evidence)
+            .collect();
+        assert!(
+            ev[1] > ev[0],
+            "evidence must prefer the planted rank 1 at the selected {bins}-bin \
+             resolution: log Z_0 = {:.3}, log Z_1 = {:.3}",
+            ev[0],
+            ev[1]
+        );
         assert_eq!(model.log_evidence(), ev[1]);
+    }
+
+    /// #3337: the activity law's resolution is read from the evidence, not
+    /// fixed. On the planted `c(z) = e^{1.3 z}` DGP the search must leave the
+    /// null resolution, and the resolution it keeps must be the one the ladder
+    /// actually maximizes: strictly better than the rung below it, and not
+    /// beaten by the rung above it (the rung the ladder stopped at).
+    #[test]
+    fn the_activity_resolution_is_the_evidence_maximizer_3337() {
+        let (residuals, activity) = planted_rank_one_activity();
+        let model = StructuredResidualModel::fit(ResidualFactorInput {
+            residuals: residuals.view(),
+            activity: activity.view(),
+        })
+        .expect("fit");
+        let bins = model.activity_bins();
+        assert!(
+            bins > 1,
+            "a planted activity law must buy more than the null resolution; got {bins} bin(s)"
+        );
+        assert!(bins.is_power_of_two(), "the ladder doubles; got {bins}");
+
+        let here = rung_evidence(residuals.view(), &activity, bins);
+        assert_eq!(model.log_evidence(), here.1);
+        assert_eq!(model.factor_rank(), here.0);
+        let below = rung_evidence(residuals.view(), &activity, bins / 2);
+        assert!(
+            here.1 > below.1,
+            "the kept resolution must beat the rung below it: {bins} bins gives \
+             {:.4} against {:.4} at {} bins",
+            here.1,
+            below.1,
+            bins / 2
+        );
+        let above = rung_evidence(residuals.view(), &activity, bins * 2);
+        assert!(
+            above.0 == 0 || above.1 <= here.1,
+            "the ladder stopped at {bins} bins, so the next rung must carry no \
+             activity law or not beat it: {} bins gives rank {} at {:.4} against \
+             {:.4}",
+            bins * 2,
+            above.0,
+            above.1,
+            here.1
+        );
+    }
+
+    /// #3337: a constant activity coordinate carries no resolution to buy, and
+    /// the law is the null `c ≡ 1` on one bin. This is the recoverability the
+    /// ladder has to keep: the search starts at the null and never leaves it
+    /// when `z` cannot separate a single row.
+    #[test]
+    fn a_constant_activity_coordinate_keeps_the_null_law_3337() {
+        let n = 400usize;
+        let p = 3usize;
+        let mut seed = 0x1234_5678_9ABC_DEF0_u64;
+        let mut residuals = Array2::<f64>::zeros((n, p));
+        for row in 0..n {
+            for j in 0..p {
+                residuals[[row, j]] = (0.4 + 0.2 * j as f64) * lcg_normal(&mut seed);
+            }
+        }
+        let activity = Array1::<f64>::zeros(n);
+        let model = StructuredResidualModel::fit(ResidualFactorInput {
+            residuals: residuals.view(),
+            activity: activity.view(),
+        })
+        .expect("fit");
+        assert_eq!(model.activity_bins(), 1);
+        assert!(model.row_scale.iter().all(|&c| c == 1.0));
+    }
+
+    /// #3337: the bin assignment is equal count, tie-safe, monotone in `z`, and
+    /// nested under doubling — the four properties the resolution ladder rests
+    /// on. Nesting is what makes rung `2B`'s law contain rung `B`'s, so the
+    /// evidence comparison between them is a refinement comparison.
+    #[test]
+    fn the_activity_bins_are_equal_count_and_nested_3337() {
+        let n = 96usize;
+        // Heavily tied, unevenly spread: equal-width bins would put most rows
+        // in one bin.
+        let z = Array1::from_iter((0..n).map(|i| ((i % 12) as f64 / 11.0).powi(3)));
+        for bins in [2usize, 4, 8, 16] {
+            let coarse = activity_bin_assignment(z.view(), bins);
+            let fine = activity_bin_assignment(z.view(), 2 * bins);
+            for i in 0..n {
+                for k in 0..n {
+                    // Tie-safe and monotone: the bin is a function of z alone,
+                    // and it does not decrease as z increases.
+                    if z[i] == z[k] {
+                        assert_eq!(coarse[i], coarse[k], "tied z must share a bin");
+                    }
+                    if z[i] < z[k] {
+                        assert!(coarse[i] <= coarse[k], "bins must be monotone in z");
+                    }
+                    // Nested: rows together at 2B were together at B.
+                    if fine[i] == fine[k] {
+                        assert_eq!(
+                            coarse[i], coarse[k],
+                            "the {}-bin partition must refine the {bins}-bin one",
+                            2 * bins
+                        );
+                    }
+                }
+            }
+            let occupied = occupied_bin_count(&coarse, bins);
+            assert!(occupied >= 1 && occupied <= bins);
+        }
+    }
+
+    /// #3337: with no tie to hold rows together, the assignment is exactly
+    /// equal count — every bin holds `⌊n/B⌋` or `⌈n/B⌉` rows, for every `B` up
+    /// to one row per bin. That is the property that makes a bin's Fisher
+    /// information for its own scale the same as every other bin's at the null
+    /// law, which is what the one resolution number means.
+    #[test]
+    fn tie_free_activity_bins_hold_equal_counts_3337() {
+        let n = 97usize; // prime, so no B divides it evenly
+        let z = Array1::from_iter((0..n).map(|i| (i as f64) * 0.37 - 5.0));
+        for bins in 1..=n {
+            let row_bin = activity_bin_assignment(z.view(), bins);
+            let mut counts = vec![0usize; bins];
+            for &b in &row_bin {
+                counts[b] += 1;
+            }
+            let floor = n / bins;
+            let ceil = n.div_ceil(bins);
+            assert_eq!(counts.iter().sum::<usize>(), n, "every row is binned");
+            for (b, &count) in counts.iter().enumerate() {
+                assert!(
+                    count == floor || count == ceil,
+                    "bin {b} of {bins} holds {count} rows, not {floor} or {ceil}"
+                );
+            }
+        }
     }
 
     /// The fitted model is the posterior mode, so its likelihood score in each
