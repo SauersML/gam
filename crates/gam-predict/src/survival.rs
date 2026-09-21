@@ -1,4 +1,5 @@
 use super::*;
+use crate::interval_policy::ResponseIndex;
 
 /// Survival location-scale predictor: two blocks (threshold + log-sigma).
 ///

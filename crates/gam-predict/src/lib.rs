@@ -2440,7 +2440,7 @@ where
                 predictive_variance()?.expect("Poisson has a closed-form conditional variance");
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
                 let (lo, hi) = poisson_moment_matched_interval(mean[i], total_var, p_lo, p_hi)?;
-                Some((lo, hi, poisson_moment_matched_content(mean[i], total_var, lo, hi)?))
+                Some((lo, hi, poisson_moment_matched_content(mean[i], total_var, lo, hi)))
             })
         }
         ResponseFamily::NegativeBinomial { theta, theta_fixed } => {
@@ -2470,7 +2470,7 @@ where
                     negative_binomial_moment_matched_interval(mean[i], theta, total_var, p_lo, p_hi)?;
                 let content =
                     negative_binomial_moment_matched_content(mean[i], theta, total_var, lo, hi)?;
-                Some((lo, hi, content))
+                Some((lo, hi, Some(content)))
             })
         }
         ResponseFamily::Tweedie { p } => {
@@ -2492,7 +2492,7 @@ where
                     tweedie_moment_matched_interval(mean[i], phi, power, total_var, p_lo, p_hi)?;
                 let content =
                     tweedie_moment_matched_content(mean[i], phi, power, total_var, lo, hi)?;
-                Some((lo, hi, content))
+                Some((lo, hi, Some(content)))
             })
         }
         ResponseFamily::Gamma => {
@@ -5636,7 +5636,8 @@ mod tests {
         .unwrap()
         .expect("the Bernoulli band always exists");
         assert_eq!((band.lower[0], band.upper[0]), (1.0, 1.0));
-        assert_eq!(band.content[0], mean, "the set {{1}} holds P(Y = 1) = m");
+        let content = band.content.as_ref().expect("the Bernoulli set states its mass");
+        assert_eq!(content[0], mean, "the set {{1}} holds P(Y = 1) = m");
     }
 
     /// #3140: a moment pair no law in the family carries is a typed error naming the
@@ -5767,8 +5768,10 @@ mod tests {
                 Some(weights),
             )
         };
-        let (lower, upper) = band(&fit, &trials).expect("trial counts name a binomial law");
-        let (lower, upper) = (lower.expect("lower edge"), upper.expect("upper edge"));
+        let band_of = band(&fit, &trials)
+            .expect("trial counts name a binomial law")
+            .expect("the binomial band exists");
+        let (lower, upper) = (&band_of.lower, &band_of.upper);
         // Binomial(100, 0.5) has 2.5% and 97.5% quantiles 40 and 60; the
         // beta-binomial with mean 0.5 and Var(p) = 0.01 has 28 and 72.
         assert_eq!((lower[0], upper[0]), (0.40, 0.60));
@@ -5787,7 +5790,8 @@ mod tests {
             &fit,
             Some(&trials),
         )
-        .expect("the proportion's predictive variance");
+        .expect("the proportion's predictive variance")
+        .expect("a binomial proportion has a closed-form predictive variance");
         // Var(K/m) = μc/m + Var(p)(m − 1)/m.
         let expected = [0.0025, 0.0025 + 0.01 * 0.99, 0.25];
         for (i, (&got, want)) in variance.iter().zip(expected).enumerate() {
@@ -5795,9 +5799,11 @@ mod tests {
         }
 
         let case_weighted = test_fit_with_covariance(array![0.0], Array2::eye(1));
-        let (lower, upper) = band(&case_weighted, &trials).expect("the Bernoulli set");
-        assert_eq!(lower.expect("lower edge"), array![0.0, 0.0, 0.0]);
-        assert_eq!(upper.expect("upper edge"), array![1.0, 1.0, 1.0]);
+        let bernoulli = band(&case_weighted, &trials)
+            .expect("the Bernoulli set")
+            .expect("case weights keep the Bernoulli set");
+        assert_eq!(bernoulli.lower, array![0.0, 0.0, 0.0]);
+        assert_eq!(bernoulli.upper, array![1.0, 1.0, 1.0]);
 
         let refused = band(&fit, &array![100.0, 12.5, 1.0])
             .expect_err("a fractional trial count names no binomial law");
@@ -5831,9 +5837,10 @@ mod tests {
         // The content is the predictive mass of the support points held: both
         // (`(1 − m) + m = 1`), or the single point's own mass, 0.999 either way,
         // above the 0.95 level by the atom's surplus (#3534).
-        assert_eq!(band.content[0], 1.0);
-        assert_eq!(band.content[1], mean[1]);
-        assert_eq!(band.content[2], 1.0 - mean[2]);
+        let content = band.content.as_ref().expect("the Bernoulli set states its mass");
+        assert_eq!(content[0], 1.0);
+        assert_eq!(content[1], mean[1]);
+        assert_eq!(content[2], 1.0 - mean[2]);
         assert_eq!(
             (lower[0], upper[0]),
             (0.0, 1.0),
