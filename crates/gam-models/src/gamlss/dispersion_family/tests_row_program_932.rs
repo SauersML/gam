@@ -4,7 +4,11 @@
 //! The `retired_*` functions are the closed forms production ran from `bf64d52d8`
 //! and `de14c2367` until the row programs replaced them, copied verbatim: the
 //! η-space score and observed Hessian, the third-derivative tensor, and the row
-//! kernel's working sets. The first test holds every production surface to them on
+//! kernel's working sets. The one departure is the Tweedie positive-row arm:
+//! production moved from the saddlepoint density to the exact series density
+//! (#3511), so that arm carries the same closed forms with the series `ln W`'s
+//! `η_d`-derivatives from `tweedie_series` in place of the saddlepoint's
+//! `0.5 − κ·dev/2`. The first test holds every production surface to them on
 //! randomized rows of every member, shows the band resolves a one-part-per-million
 //! change in the supplied stacks, and pins each declaration's value channel to the
 //! row log-likelihood. The second races production's entry points against them.
@@ -89,16 +93,17 @@ fn retired_eta_loglik_second(
             let kappa = ed.exp();
             let mu_two = mu.powf(two_minus_p);
             if yi > 0.0 {
+                // Exact density (#3511): ℓ = −κ K(μ) + ln W(η_d) − ln y with
+                // K = μ^{2−p}/(2−p) − y μ^{1−p}/(1−p) and the series ln W's
+                // η_d-derivatives its index cumulants over (p−1)^k.
                 let mu_one = mu.powf(one_minus_p);
-                let dev = 2.0
-                    * (mu_two / two_minus_p - yi * mu_one / one_minus_p
-                        + yi.powf(two_minus_p) / (one_minus_p * two_minus_p));
-                let dev_m = 2.0 * (mu_two - yi * mu_one);
-                let dev_mm = 2.0 * (two_minus_p * mu_two - one_minus_p * yi * mu_one);
-                let half_kappa = 0.5 * kappa;
+                let series = tweedie_series(yi, p, ed);
+                let kernel = mu_two / two_minus_p - yi * mu_one / one_minus_p;
+                let l_m = -kappa * (mu_two - yi * mu_one);
+                let l_mm = -kappa * (two_minus_p * mu_two - one_minus_p * yi * mu_one);
                 (
-                    [-half_kappa * dev_m, 0.5 - half_kappa * dev],
-                    [-half_kappa * dev_mm, -half_kappa * dev_m, -half_kappa * dev],
+                    [l_m, -kappa * kernel + series.derivatives[0]],
+                    [l_mm, l_m, -kappa * kernel + series.derivatives[1]],
                 )
             } else {
                 let c = mu_two / two_minus_p;
@@ -199,20 +204,15 @@ fn retired_eta_loglik_third(kind: DispersionFamilyKind, yi: f64, em: f64, ed: f6
             let mu_two = mu.powf(two_minus_p);
             if yi > 0.0 {
                 let mu_one = mu.powf(one_minus_p);
-                let dev = 2.0
-                    * (mu_two / two_minus_p - yi * mu_one / one_minus_p
-                        + yi.powf(two_minus_p) / (one_minus_p * two_minus_p));
-                let dev_m = 2.0 * (mu_two - yi * mu_one);
-                let dev_mm = 2.0 * (two_minus_p * mu_two - one_minus_p * yi * mu_one);
-                let dev_mmm = 2.0
-                    * (two_minus_p * two_minus_p * mu_two
-                        - one_minus_p * one_minus_p * yi * mu_one);
-                let half_kappa = 0.5 * kappa;
+                let series = tweedie_series(yi, p, ed);
+                let kernel = mu_two / two_minus_p - yi * mu_one / one_minus_p;
                 [
-                    -half_kappa * dev_mmm,
-                    -half_kappa * dev_mm,
-                    -half_kappa * dev_m,
-                    -half_kappa * dev,
+                    -kappa
+                        * (two_minus_p * two_minus_p * mu_two
+                            - one_minus_p * one_minus_p * yi * mu_one),
+                    -kappa * (two_minus_p * mu_two - one_minus_p * yi * mu_one),
+                    -kappa * (mu_two - yi * mu_one),
+                    -kappa * kernel + series.derivatives[2],
                 ]
             } else {
                 let c = mu_two / two_minus_p;
@@ -379,14 +379,13 @@ fn retired_row_kernel(
             let two_minus_p = 2.0 - p;
             let mean_weight = wi * mu.powf(two_minus_p) / phi;
             let mean_response = em + (yi - mu) / mu;
-            let loglik = dispersion_tweedie_loglik(yi, em, ed, p, wi);
+            let series = tweedie_row_series(yi, p, ed);
+            let loglik = dispersion_tweedie_loglik_with_series(yi, em, ed, p, wi, series);
             let one_minus_p = 1.0 - p;
-            let (s_eta, curvature_eta) = if yi > 0.0 {
-                let dev = (mu.powf(two_minus_p) * (1.0 / two_minus_p)
-                    - mu.powf(one_minus_p) * (yi / one_minus_p)
-                    + yi.powf(two_minus_p) / (one_minus_p * two_minus_p))
-                    * 2.0;
-                (0.5 - 0.5 * dev / phi, 0.5)
+            let (s_eta, curvature_eta) = if let Some(series) = series {
+                let kernel = mu.powf(two_minus_p) * (1.0 / two_minus_p)
+                    - mu.powf(one_minus_p) * (yi / one_minus_p);
+                (-kernel / phi + series.derivatives[0], 0.5)
             } else {
                 let info = mu.powf(two_minus_p) * (1.0 / two_minus_p) / phi;
                 (-info, info)
@@ -609,7 +608,9 @@ fn corrupted(mut stacks: DispersionRowStacks) -> DispersionRowStacks {
             response_first,
             response_second,
             response_third,
-            deviance_offset,
+            series_first,
+            series_second,
+            series_third,
             ..
         } => {
             *mean_term *= bump;
@@ -620,7 +621,9 @@ fn corrupted(mut stacks: DispersionRowStacks) -> DispersionRowStacks {
             *response_first *= bump;
             *response_second *= bump;
             *response_third *= bump;
-            *deviance_offset *= bump;
+            *series_first *= bump;
+            *series_second *= bump;
+            *series_third *= bump;
         }
         DispersionRowStacks::TweedieZero {
             mean_term,
@@ -673,16 +676,19 @@ fn with_values(mut stacks: DispersionRowStacks, row: Row) -> DispersionRowStacks
             *ln_gamma_first_shape = ln_gamma(*mean * *precision);
             *ln_gamma_second_shape = ln_gamma((1.0 - *mean) * *precision);
         }
-        DispersionRowStacks::TweediePositive { log_normalizer, .. } => {
+        DispersionRowStacks::TweediePositive {
+            series_value,
+            log_normalizer,
+            ..
+        } => {
             // A Tweedie stack comes only from a Tweedie row; any other kind poisons
             // the value channel instead of passing silently.
             let power = match row.kind {
                 DispersionFamilyKind::Tweedie { p } => p,
                 _ => f64::NAN,
             };
-            *log_normalizer = 0.5 * row.eta_d
-                - 0.5 * (2.0 * std::f64::consts::PI).ln()
-                - 0.5 * power * row.y.ln();
+            *series_value = tweedie_series(row.y, power, row.eta_d).log_series;
+            *log_normalizer = -row.y.ln();
         }
         DispersionRowStacks::TweedieZero { .. } => {}
     }
@@ -885,9 +891,9 @@ where
 /// argument's polygamma entries from one recurrence (`polygamma_stack`), and the
 /// row kernel reads its Fisher information's `ψ′` from the score's stack. The
 /// retired forms call the per-order scalars, which walk the recurrence once per
-/// order. The Tweedie cells evaluate no polygamma at all, so they race the
-/// generated arithmetic against the hand arithmetic on equal transcendental
-/// calls.
+/// order. The Tweedie cells evaluate no polygamma; both arms read the same
+/// `tweedie_series` for a positive row, so they race the generated arithmetic
+/// against the hand arithmetic on equal transcendental calls.
 #[test]
 fn dispersion_row_programs_are_not_slower_than_the_retired_hand_932() {
     let fixtures: Vec<(Member, Vec<Row>)> = MEMBERS
