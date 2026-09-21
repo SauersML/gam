@@ -550,45 +550,28 @@ fn expectile_free_row_jacobian(
     Ok(jacobian)
 }
 
-/// Solve the square system `a·x = b` by Gaussian elimination with partial
-/// pivoting. An exactly zero pivot is a typed singularity, never a
-/// regularized solve.
-fn solve_square_partial_pivot(
-    mut a: Array2<f64>,
-    mut b: Array1<f64>,
-) -> Result<Array1<f64>, String> {
+/// Solve the square system `a·x = b` through the workspace's partial-pivoting
+/// LU, [`gam_linalg::faer_ndarray::FaerLu`], which is the owner of this
+/// operation: it names the first column with no usable pivot instead of
+/// dividing by it, so a singular system is a typed refusal here and never a
+/// regularized solve. An empty system has the empty solution and nothing to
+/// factor.
+fn solve_square_partial_pivot(a: Array2<f64>, b: Array1<f64>) -> Result<Array1<f64>, String> {
     let m = b.len();
     if a.dim() != (m, m) {
-        return Err(format!("system {:?} does not match right-hand side {m}", a.dim()));
+        return Err(format!(
+            "system {:?} does not match right-hand side {m}",
+            a.dim()
+        ));
     }
-    for col in 0..m {
-        let pivot_row = (col..m)
-            .max_by(|&i, &j| a[[i, col]].abs().total_cmp(&a[[j, col]].abs()))
-            .unwrap_or(col);
-        if a[[pivot_row, col]] == 0.0 {
-            return Err(format!("the {m}x{m} system is singular at column {col}"));
-        }
-        if pivot_row != col {
-            for c in 0..m {
-                a.swap([pivot_row, c], [col, c]);
-            }
-            b.swap(pivot_row, col);
-        }
-        for row in col + 1..m {
-            let factor = a[[row, col]] / a[[col, col]];
-            if factor != 0.0 {
-                for c in col..m {
-                    a[[row, c]] -= factor * a[[col, c]];
-                }
-                b[row] -= factor * b[col];
-            }
-        }
+    if m == 0 {
+        return Ok(b);
     }
-    let mut x = Array1::<f64>::zeros(m);
-    for row in (0..m).rev() {
-        let tail = (row + 1..m).map(|c| a[[row, c]] * x[c]).sum::<f64>();
-        x[row] = (b[row] - tail) / a[[row, row]];
-    }
+    let view = gam_linalg::faer_ndarray::FaerArrayView::new(&a);
+    let lu = gam_linalg::faer_ndarray::FaerLu::new(view.as_ref())
+        .map_err(|column| format!("the {m}x{m} system is singular at column {column}"))?;
+    let solved = lu.solve(faer::Mat::from_fn(m, 1, |row, _| b[row]).as_ref());
+    let x = Array1::from_shape_fn(m, |row| solved[(row, 0)]);
     if x.iter().any(|value| !value.is_finite()) {
         return Err("the solution is not finite".to_string());
     }
