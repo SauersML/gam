@@ -490,7 +490,6 @@ mod constant_curvature_kappa_range_identification_tests {
                 let eta = eta_star + offset;
                 let jet = ProfiledRemlPsiJet {
                     value: v(kappa, eta),
-                    rho_at_bound: false,
                     gradient: [a * kappa + b * eta + g, b * kappa + c * eta + f],
                     hessian: [[a, b], [b, c]],
                 };

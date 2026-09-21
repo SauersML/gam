@@ -188,6 +188,17 @@ fn profile_model_decrease(score: f64, curvature: f64, lower: f64, upper: f64) ->
     -lowest
 }
 
+/// `value_ceiling` is a κ-free upper bound on the profile over the whole chart,
+/// `V_p(κ) ≤ value_ceiling` for every κ in `[kappa_min, kappa_max]` (for the
+/// constant-curvature smooth, [`ConstantCurvatureProfile::value_ceiling`]; pass
+/// `f64::INFINITY` when none is known). When it sits within the Wilks level of
+/// `V_p(κ̂)`, every κ in the chart satisfies `r(κ) = V_p(κ) − V_p(κ̂) − ½z² ≤ 0`:
+/// the likelihood-ratio set IS the chart, exactly, so the interval is the chart
+/// with both ends open and no endpoint search is needed (gam#3509). This is the
+/// Wilks set itself, so it is calibrated rather than conservative, and it is the
+/// only thing that identifies the set when the profile has an interior maximum
+/// between κ̂ and a chart bound that no probe visits — the bound's own value and
+/// slope cannot see such a bump.
 fn curvature_profile_ci_from_analytic_score<F>(
     profile: &mut F,
     kappa_hat: f64,
@@ -195,6 +206,7 @@ fn curvature_profile_ci_from_analytic_score<F>(
     kappa_max: f64,
     level: f64,
     resolution: f64,
+    value_ceiling: f64,
 ) -> Result<gam_geometry::curvature_estimand::KappaProfileCi, String>
 where
     F: FnMut(f64) -> Result<(f64, f64, f64), String>,
@@ -255,22 +267,41 @@ where
         ));
     }
 
-    let (ci_lo, lo_at_bound) = curvature_profile_lr_endpoint(
-        profile,
-        kappa_hat,
-        value_hat,
-        kappa_min,
-        half_threshold,
-        resolution,
-    )?;
-    let (ci_hi, hi_at_bound) = curvature_profile_lr_endpoint(
-        profile,
-        kappa_hat,
-        value_hat,
-        kappa_max,
-        half_threshold,
-        resolution,
-    )?;
+    if value_ceiling.is_nan() || value_hat > value_ceiling + resolution {
+        // The ceiling is a theorem about the profile, so a κ̂ above it means the
+        // ceiling's premise (the smooth switched off leaves only the intercept)
+        // does not hold for this profile, not that κ̂ is fine.
+        return Err(format!(
+            "curvature profile exceeds its kappa-free ceiling: V(kappa_hat={kappa_hat})=\
+             {value_hat:.9e}, ceiling={value_ceiling:.9e}, resolution={resolution:.6e}"
+        ));
+    }
+
+    let ((ci_lo, lo_at_bound), (ci_hi, hi_at_bound)) =
+        if value_ceiling - value_hat <= half_threshold {
+            // sup_κ r(κ) ≤ value_ceiling − V_p(κ̂) − ½z² ≤ 0: the whole chart is
+            // in the likelihood-ratio set, and both ends are the chart's walls.
+            ((kappa_min, true), (kappa_max, true))
+        } else {
+            (
+                curvature_profile_lr_endpoint(
+                    profile,
+                    kappa_hat,
+                    value_hat,
+                    kappa_min,
+                    half_threshold,
+                    resolution,
+                )?,
+                curvature_profile_lr_endpoint(
+                    profile,
+                    kappa_hat,
+                    value_hat,
+                    kappa_max,
+                    half_threshold,
+                    resolution,
+                )?,
+            )
+        };
     let verdict = if ci_lo > 0.0 {
         gam_geometry::curvature_estimand::CurvatureVerdict::Spherical
     } else if ci_hi < 0.0 {
@@ -337,6 +368,7 @@ pub fn curvature_inference_forspec(
     };
     let x_term = select_columns(data, feature_cols).map_err(EstimationError::from)?;
     let profile = ConstantCurvatureProfile::new(x_term.view(), y, base_spec)?;
+    let value_ceiling = profile.value_ceiling()?;
 
     // The profile is a total negative log-evidence, so its resolution is the
     // one the outer certificate that produced κ̂ used.
@@ -361,6 +393,7 @@ pub fn curvature_inference_forspec(
         kappa_max,
         level,
         resolution,
+        value_ceiling,
     )
     .map_err(EstimationError::RemlOptimizationFailed)?;
     let flatness = gam_geometry::curvature_estimand::flatness_lr_test(
@@ -409,6 +442,7 @@ mod curvature_profile_score_tests {
             3.0,
             level,
             resolution,
+            f64::INFINITY,
         )
         .expect("analytic quadratic profile CI");
         let z = gam_geometry::curvature_estimand::wald_half_width(1.0, level)
@@ -435,6 +469,7 @@ mod curvature_profile_score_tests {
             0.1,
             0.95,
             TEST_RESOLUTION,
+            f64::INFINITY,
         )
         .expect("open bounded profile CI");
         assert_eq!(ci.ci_lo, -0.1);
@@ -467,6 +502,7 @@ mod curvature_profile_score_tests {
             kappa_max,
             0.95,
             TEST_RESOLUTION,
+            f64::INFINITY,
         )
         .expect("a boundary optimum with the score pointing out of the box is stationary");
         assert_eq!(
@@ -485,6 +521,7 @@ mod curvature_profile_score_tests {
             kappa_max,
             0.95,
             TEST_RESOLUTION,
+            f64::INFINITY,
         )
         .expect("the mirrored boundary optimum");
         assert_eq!(
@@ -503,6 +540,7 @@ mod curvature_profile_score_tests {
                 kappa_max,
                 0.95,
                 TEST_RESOLUTION,
+                f64::INFINITY,
             )
             .is_err(),
             "a non-stationary INTERIOR point is not an optimum and must still be refused"
@@ -549,6 +587,7 @@ mod curvature_profile_score_tests {
                 3.0,
                 0.95,
                 TEST_RESOLUTION,
+                f64::INFINITY,
             )
             .unwrap_or_else(|e| panic!("certified kappa_hat refused at V level {level}: {e}"));
             assert_eq!(
@@ -574,6 +613,7 @@ mod curvature_profile_score_tests {
                 3.0,
                 0.95,
                 TEST_RESOLUTION,
+                f64::INFINITY,
             )
             .expect_err("a resolvable decrease is not a stationary point");
             assert!(error.contains("non-stationary"), "{error}");
@@ -593,9 +633,134 @@ mod curvature_profile_score_tests {
             3.0,
             0.95,
             TEST_RESOLUTION,
+            f64::INFINITY,
         )
         .expect_err("a concave point is a maximum along kappa, not an optimum");
         assert!(error.contains("non-stationary"), "{error}");
+    }
+
+    /// gam#3509: a chart bound ABOVE the Wilks level brackets the endpoint, so
+    /// the profile's slope there says nothing about the interval. On
+    /// `V = aκ² − bκ⁴` the profile peaks at `κ² = a/2b` and is falling again at
+    /// the bounds `±1`, but `V(±1) = a − b` is still above `½z²`; the interval
+    /// is the first crossing of `aκ² − bκ⁴ = ½z²`, found THROUGH the falling
+    /// bound rather than refused because of it.
+    #[test]
+    fn a_bound_above_the_wilks_level_brackets_the_crossing_whatever_its_slope_3509() {
+        let (a, b) = (8.0_f64, 5.0_f64);
+        let level = 0.95;
+        let z = gam_geometry::curvature_estimand::wald_half_width(1.0, level)
+            .expect("valid normal quantile");
+        let half_threshold = 0.5 * z * z;
+        // The fixture must actually be the awkward case: the bound is above the
+        // level AND the profile is falling there.
+        assert!(a - b > half_threshold && 2.0 * a - 4.0 * b < 0.0);
+        let mut profile = |kappa: f64| -> Result<(f64, f64, f64), String> {
+            let k2 = kappa * kappa;
+            Ok((
+                a * k2 - b * k2 * k2,
+                2.0 * a * kappa - 4.0 * b * k2 * kappa,
+                2.0 * a - 12.0 * b * k2,
+            ))
+        };
+        let ci = curvature_profile_ci_from_analytic_score(
+            &mut profile,
+            0.0,
+            -1.0,
+            1.0,
+            level,
+            TEST_RESOLUTION,
+            f64::INFINITY,
+        )
+        .expect("a bound above the level is a bracket, not a refusal");
+        let first_crossing = ((a - (a * a - 4.0 * b * half_threshold).sqrt()) / (2.0 * b)).sqrt();
+        // Same endpoint accounting as the quadratic case: the bracket closes
+        // once the residual is within the resolution, i.e. within
+        // `resolution / slope` of the crossing.
+        let slope =
+            2.0 * a * first_crossing - 4.0 * b * first_crossing * first_crossing * first_crossing;
+        let endpoint_bound = TEST_RESOLUTION / slope;
+        assert!(
+            (ci.ci_hi - first_crossing).abs() <= endpoint_bound,
+            "{ci:?}"
+        );
+        assert!(
+            (ci.ci_lo + first_crossing).abs() <= endpoint_bound,
+            "{ci:?}"
+        );
+        assert!(!ci.lo_at_bound && !ci.hi_at_bound);
+    }
+
+    /// gam#3509, the other half: a profile whose supremum over the chart is
+    /// already inside the Wilks level. `V = aκ² − bκ⁴` with peak `a²/4b` below
+    /// `½z²` keeps every κ in the set. The κ-free ceiling certifies that
+    /// directly — the interval is the chart, open at both walls, decided
+    /// WITHOUT evaluating the profile anywhere but κ̂.
+    #[test]
+    fn a_ceiling_within_the_wilks_level_certifies_the_whole_chart_3509() {
+        let (a, b) = (0.5_f64, 0.3_f64);
+        let level = 0.95;
+        let z = gam_geometry::curvature_estimand::wald_half_width(1.0, level)
+            .expect("valid normal quantile");
+        let supremum = a * a / (4.0 * b);
+        assert!(supremum < 0.5 * z * z && 2.0 * a - 4.0 * b < 0.0);
+        let evaluations = std::cell::Cell::new(0_usize);
+        let mut profile = |kappa: f64| -> Result<(f64, f64, f64), String> {
+            evaluations.set(evaluations.get() + 1);
+            let k2 = kappa * kappa;
+            Ok((
+                a * k2 - b * k2 * k2,
+                2.0 * a * kappa - 4.0 * b * k2 * kappa,
+                2.0 * a - 12.0 * b * k2,
+            ))
+        };
+        let ci = curvature_profile_ci_from_analytic_score(
+            &mut profile,
+            0.0,
+            -1.0,
+            1.0,
+            level,
+            TEST_RESOLUTION,
+            supremum,
+        )
+        .expect("the ceiling certifies the whole chart");
+        assert_eq!((ci.ci_lo, ci.ci_hi), (-1.0, 1.0));
+        assert!(ci.lo_at_bound && ci.hi_at_bound);
+        assert_eq!(
+            ci.verdict,
+            gam_geometry::curvature_estimand::CurvatureVerdict::Flat
+        );
+        // κ̂ only. A single evaluation is what distinguishes the certificate
+        // from an endpoint search that happened to walk out to the same walls.
+        assert_eq!(
+            evaluations.get(),
+            1,
+            "the ceiling must settle the interval without an endpoint search"
+        );
+
+        // A ceiling below V_p(κ̂) contradicts the profile it claims to bound,
+        // so the fit is refused rather than reported.
+        let mut shifted = |kappa: f64| -> Result<(f64, f64, f64), String> {
+            let k2 = kappa * kappa;
+            Ok((
+                1.0 + a * k2 - b * k2 * k2,
+                2.0 * a * kappa - 4.0 * b * k2 * kappa,
+                2.0 * a - 12.0 * b * k2,
+            ))
+        };
+        assert!(
+            curvature_profile_ci_from_analytic_score(
+                &mut shifted,
+                0.0,
+                -1.0,
+                1.0,
+                level,
+                TEST_RESOLUTION,
+                supremum,
+            )
+            .is_err(),
+            "a ceiling below V(kappa_hat) is a violated premise, not a usable bound"
+        );
     }
 }
 

@@ -27,7 +27,7 @@ fn constant_curvature_psi_profile_value(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
     spec: &gam_terms::basis::ConstantCurvatureBasisSpec,
-) -> Result<(f64, bool), EstimationError> {
+) -> Result<f64, EstimationError> {
     // ONE penalty, because this criterion is a single-λ closed form. That is a
     // restriction on the MODEL, not a formatting choice, so
     // `ConstantCurvatureProfile::new` refuses a `double_penalty=` term outright
@@ -61,11 +61,9 @@ fn constant_curvature_psi_profile_value(
         None,
         None,
     )?;
-    let (rho_lower, rho_upper) = fit.rho_domain;
-    // The closed-form selector evaluates both walls exactly and starts from the
-    // better one, so a railed ρ̂ is the wall value itself.
-    let rho_at_bound = fit.rho == rho_lower || fit.rho == rho_upper;
-    Ok((fit.reml_score, rho_at_bound))
+    // A ρ̂ on a face of `fit.rho_domain` is a λ-profile value like any other; see
+    // `ConstantCurvatureProfile::evaluate_value` for why it is comparable.
+    Ok(fit.reml_score)
 }
 
 /// Value, exact gradient and exact Hessian of the continuously
@@ -211,9 +209,8 @@ struct ConstantCurvatureProfile<'a> {
     /// realized center plus the intercept. Sizes the outer engine's resolution.
     p_coefficients: usize,
     cache: std::cell::RefCell<std::collections::HashMap<(u64, u64), ProfiledRemlPsiJet>>,
-    /// Value-only cache for the bracketing scan: `(V, ρ̂ railed)`; see
-    /// [`Self::evaluate_value`].
-    value_cache: std::cell::RefCell<std::collections::HashMap<(u64, u64), (f64, bool)>>,
+    /// Value-only cache for the bracketing scan; see [`Self::evaluate_value`].
+    value_cache: std::cell::RefCell<std::collections::HashMap<(u64, u64), f64>>,
 }
 
 /// Identity of the profile, WITHOUT the caller's data or the memo tables.
@@ -492,11 +489,73 @@ impl<'a> ConstantCurvatureProfile<'a> {
         })
     }
 
+    /// A κ-free ceiling on the profile: `V_p(κ) ≤ value_ceiling()` at EVERY κ
+    /// and η of the chart (gam#3509).
+    ///
+    /// At any `(κ, η)` the closed form is, in the penalty's whitened spectrum
+    /// `δ_j` (`t_j = e^ρ δ_j`, rank `r`, `dp(ρ) = r0 + Σ_j c_j² t_j/(1+t_j)`),
+    ///
+    /// ```text
+    ///   V(ρ) = ½[log|XᵀX| + Σ_j log(1+t_j) − log|S|₊ − rρ] + ½ν·(1 + log(2π·dp/ν)) + const.
+    /// ```
+    ///
+    /// The penalty's null space is exactly the ψ-free intercept column (the
+    /// kernel Gram is strictly positive definite on the sum-to-zero frame), so
+    /// `ν = n − 1` and, as `ρ → ∞`, `log|XᵀX + λS| − log|λS|₊ → log n` and
+    /// `dp → Σ(y − ȳ)²`: `V_∞` is the REML value of the intercept-only model, the
+    /// same number at every ψ. The finite-ρ excess is
+    /// `½Σ_j log(1 + 1/t_j) + ½ν·log(dp(ρ)/dp_∞)`, whose second part is `≤ 0`
+    /// (`dp` rises to `dp_∞`). At the upper face of the resolvability domain,
+    /// `ρ_up = −log √ε − log δ_min`, every `1/t_j ≤ √ε·δ_min/δ_j ≤ √ε`, so
+    /// `V(ρ_up) ≤ V_∞ + ½r·log(1 + √ε)`. The ρ selector evaluates that face and
+    /// returns a value no larger, and the η profile then takes a minimum over
+    /// such values, so the bound holds for `V_p(κ)` itself. `r ≤ p_coefficients − 1`.
+    fn value_ceiling(&self) -> Result<f64, EstimationError> {
+        let n = self.response.len();
+        let intercept = Array2::<f64>::ones((n, 1));
+        let no_penalty = Array2::<f64>::zeros((1, 1));
+        let response_2d = self.response.insert_axis(ndarray::Axis(1));
+        let smooth_absent = gam_solve::gaussian_reml::gaussian_reml_multi_closed_form(
+            intercept.view(),
+            response_2d.view(),
+            no_penalty.view(),
+            None,
+            None,
+        )?;
+        let penalized_modes = self.p_coefficients.saturating_sub(1) as f64;
+        let face_excess_per_mode = gam_solve::estimate::rho_domain::log_gradient_resolution()
+            .exp()
+            .ln_1p();
+        Ok(smooth_absent.reml_score + 0.5 * penalized_modes * face_excess_per_mode)
+    }
+
     /// The profile VALUE at one point of the plane, without derivative blocks.
     ///
     /// Shares the jet cache: a point already evaluated at full order answers
     /// from there, so the bracket never re-pays for a point the Newton has
     /// visited and vice versa.
+    ///
+    /// **A ρ̂ on a face of its domain is a λ-profile value, and is compared like
+    /// one** (gam#3509). The domain is not a box: it is the #2812 resolvability
+    /// interval `[ln(√ε·γ_min), ln(γ_max/√ε)]` of the pair's own penalty
+    /// spectrum (`gam_solve::estimate::rho_domain`). In each penalized direction
+    /// the ρ-gradient of `V` is carried by `γ_j/(γ_j + λ)` (and, in the
+    /// deviance, by the same factor times that direction's squared score), so
+    /// past the upper face every direction contributes `≤ γ_j/λ ≤ √ε·e^{ρ_up−ρ}`
+    /// and the whole tail `∫_{ρ_up}^{∞} |V_ρ| dρ` is bounded by the same `√ε`
+    /// per direction — the value on the face IS `lim_{λ→∞} V`, the term switched
+    /// off, to the gradient's own resolution. The lower face is the mirror image
+    /// (`λ/γ_j ≤ √ε`: the term unpenalized). So a railed value is not "a
+    /// truncated minimum": it is the infimum along the ρ ray, which is exactly
+    /// what the λ-profile is, and it is the SAME model value at every ψ the rail
+    /// is reached from (at λ = ∞ only the ψ-free intercept survives). Refusing it
+    /// made the profile undefined on the one dataset where that limit is the
+    /// truth — constant mean plus noise, `κ⋆ = 0` — and turned the flatness test
+    /// into an error instead of a flat profile and `LR ≈ 0`.
+    ///
+    /// The derivative side already agrees: `profiled_gaussian_reml_psi_jet`
+    /// drops the `V_ρψ²/V_ρρ` Schur term on a face, because `dρ̂/dψ = 0` while
+    /// the face is active (envelope theorem at an active bound).
     fn evaluate_value(&self, kappa: f64, eta: f64) -> Result<f64, EstimationError> {
         if !(kappa.is_finite() && eta.is_finite()) {
             crate::bail_invalid_estim!(
@@ -505,59 +564,16 @@ impl<'a> ConstantCurvatureProfile<'a> {
         }
         let key = (kappa.to_bits(), eta.to_bits());
         if let Some(cached) = self.cache.borrow().get(&key) {
-            return Self::comparable_value(kappa, eta, cached.value, cached.rho_at_bound);
+            return Ok(cached.value);
         }
         if let Some(&cached) = self.value_cache.borrow().get(&key) {
-            return Self::comparable_value(kappa, eta, cached.0, cached.1);
+            return Ok(cached);
         }
         let mut probe_spec = self.spec.clone();
         probe_spec.kappa = kappa;
         probe_spec.length_scale = eta.exp();
-        let sample = constant_curvature_psi_profile_value(self.data, self.response, &probe_spec)?;
-        self.value_cache.borrow_mut().insert(key, sample);
-        Self::comparable_value(kappa, eta, sample.0, sample.1)
-    }
-
-    /// A criterion value the range search is allowed to COMPARE, or a refusal
-    /// naming why not.
-    ///
-    /// `V` is a λ-profile only where `ρ̂` is interior. At a rail it is a
-    /// constrained minimum over a truncated λ range, and a constrained minimum
-    /// is not comparable to an unconstrained one — picking the smaller of the
-    /// two is picking whichever happened to be truncated harder.
-    ///
-    /// **The reason this was written is gone, and the check is kept anyway.**
-    /// It was added because the range coordinate DROVE `ρ̂`: the realized design
-    /// scaled like `1/ℓ`, so λ had to follow it and `ρ̂ ≈ const − ln ℓ`
-    /// (measured: each ×100 in `ℓ` cost 4.6 in `ρ̂`, which is `ln 100`), and a
-    /// range box eight orders wide was therefore always wide enough to walk `ρ̂`
-    /// into `RHO_LOWER` for no statistical reason whatever. That was the
-    /// `exp(−d/ℓ)` gauge's `1/ℓ` collapse, and gam#2747 removed it at the
-    /// source: in the contrast gauge `ℓ·(e^{−d/ℓ} − 1)` the design does not
-    /// collapse and `ρ̂` is flat in the range (measured: `−5.0978 ± 1e-4` across
-    /// eleven decades on the κ=1 sphere fixture). So this refusal should now
-    /// almost never fire from the range coordinate.
-    ///
-    /// It stays because the ARGUMENT was never about the range. A constrained
-    /// minimum is not comparable to an unconstrained one whatever drove it
-    /// there, and a dataset whose λ̂ genuinely wants to leave the ρ box still
-    /// exists. What changed is its status: it was a systematic artefact of a
-    /// gauge and is now a rare, real event.
-    ///
-    /// Refusing rather than clamping is deliberate: the point is not infeasible
-    /// for the MODEL, only unusable as a comparison, and the search treats a
-    /// refusal exactly as it treats an unbuildable design — it moves on.
-    fn comparable_value(
-        kappa: f64,
-        eta: f64,
-        value: f64,
-        rho_at_bound: bool,
-    ) -> Result<f64, EstimationError> {
-        if rho_at_bound {
-            crate::bail_invalid_estim!(
-                "constant-curvature profile at ψ = ({kappa}, ln ℓ = {eta}) railed ρ̂ at its bound,                  so its value is a truncated minimum and not comparable across the range"
-            );
-        }
+        let value = constant_curvature_psi_profile_value(self.data, self.response, &probe_spec)?;
+        self.value_cache.borrow_mut().insert(key, value);
         Ok(value)
     }
 
