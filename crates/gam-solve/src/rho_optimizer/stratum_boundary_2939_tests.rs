@@ -70,18 +70,20 @@ struct StratumRequest {
 }
 
 /// The fixture as an objective that publishes the kept rank of its latest evaluation
-/// and records every request, so a test reads what the search asked for.
+/// and records every request, so a test reads what the search asked for. `publish`
+/// maps the fixture's side of the boundary to the rank the objective publishes.
 struct RecordingStratum {
     fixture: StratumFixture,
     requests: Vec<StratumRequest>,
-    last_rank: Option<usize>,
+    publish: fn(usize) -> CriterionRank,
+    last_rank: Option<CriterionRank>,
 }
 
 impl RecordingStratum {
     fn serve(&mut self, rho: &Array1<f64>, order: OuterEvalOrder) -> OuterEval {
         let eval = self.fixture.eval(rho);
         let rank = self.fixture.rank(rho);
-        self.last_rank = Some(rank);
+        self.last_rank = Some((self.publish)(rank));
         self.requests.push(StratumRequest {
             order,
             rho: rho.clone(),
@@ -118,8 +120,8 @@ impl OuterObjective for RecordingStratum {
     ) -> Result<OuterEval, EstimationError> {
         Ok(self.serve(rho, order))
     }
-    fn criterion_rank(&self) -> Option<usize> {
-        self.last_rank
+    fn criterion_rank(&self) -> Option<CriterionRank> {
+        self.last_rank.clone()
     }
     fn reset(&mut self) {}
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
@@ -148,12 +150,14 @@ fn stratum_problem() -> OuterProblem {
 
 fn run_stratum(
     fixture: StratumFixture,
+    publish: fn(usize) -> CriterionRank,
     context: &str,
 ) -> (Result<OuterResult, EstimationError>, Vec<StratumRequest>) {
     let problem = stratum_problem();
     let mut obj = RecordingStratum {
         fixture,
         requests: Vec::new(),
+        publish,
         last_rank: None,
     };
     let outcome = problem.run(&mut obj, context);
@@ -201,7 +205,8 @@ fn a_search_pinned_at_its_rank_boundary_crosses_after_one_window_2939() {
         center0: 4.0,
         across_shift: 3.0,
     };
-    let (outcome, requests) = run_stratum(fixture, "stratum wall above #2939");
+    let (outcome, requests) =
+        run_stratum(fixture, CriterionRank::single, "stratum wall above #2939");
     let result = outcome.expect("the rank-55 minimum certifies once the pinned rank-56 search crosses");
     assert!(
         result
@@ -268,7 +273,8 @@ fn a_rank_boundary_halt_publishes_typed_evidence_and_never_certifies_2939() {
         center0: 4.0,
         across_shift: 12.0,
     };
-    let (outcome, requests) = run_stratum(fixture, "stratum wall far above #2939");
+    let (outcome, requests) =
+        run_stratum(fixture, CriterionRank::single, "stratum wall far above #2939");
     assert!(
         requests
             .iter()
@@ -352,7 +358,7 @@ fn a_window_of_rank_refusals_halts_at_the_incumbent_without_an_escape_2939() {
             matches!(
                 guard.observe_off_stratum(
                 &refused,
-                KEPT_RANK_INSIDE,
+                CriterionRank::single(KEPT_RANK_INSIDE),
                 refused_value,
                 refused_resolution,
                 ADAPTING_DECREASE,
@@ -364,7 +370,7 @@ fn a_window_of_rank_refusals_halts_at_the_incumbent_without_an_escape_2939() {
     }
     let verdict = guard.observe_off_stratum(
                 &refused,
-                KEPT_RANK_INSIDE,
+                CriterionRank::single(KEPT_RANK_INSIDE),
                 refused_value,
                 refused_resolution,
                 NO_MODEL_DECREASE,
@@ -387,7 +393,8 @@ fn a_window_of_rank_refusals_halts_at_the_incumbent_without_an_escape_2939() {
         .rank_boundary
         .expect("a rank-boundary halt publishes its typed evidence");
     assert_eq!(
-        evidence.kept_rank, KEPT_RANK_INSIDE,
+        evidence.kept_rank,
+        CriterionRank::single(KEPT_RANK_INSIDE),
         "the evidence names the rank the search searched"
     );
     assert_eq!(
@@ -417,7 +424,7 @@ fn a_window_holding_an_infeasible_probe_keeps_the_1426_escape_2939() {
             matches!(
                 guard.observe_off_stratum(
                 &refused,
-                KEPT_RANK_INSIDE,
+                CriterionRank::single(KEPT_RANK_INSIDE),
                 refused_value,
                 refused_resolution,
                 ADAPTING_DECREASE,
@@ -429,7 +436,7 @@ fn a_window_holding_an_infeasible_probe_keeps_the_1426_escape_2939() {
     }
     let verdict = guard.observe_off_stratum(
                 &refused,
-                KEPT_RANK_INSIDE,
+                CriterionRank::single(KEPT_RANK_INSIDE),
                 refused_value,
                 refused_resolution,
                 NO_MODEL_DECREASE,
@@ -468,7 +475,7 @@ fn a_rank_refusal_below_the_incumbent_stops_the_run_for_the_crossing_2939() {
     );
     let verdict = guard.observe_off_stratum(
         &refused,
-        KEPT_RANK_INSIDE,
+        CriterionRank::single(KEPT_RANK_INSIDE),
         value,
         resolution,
         ADAPTING_DECREASE,
@@ -489,7 +496,7 @@ fn a_rank_refusal_below_the_incumbent_stops_the_run_for_the_crossing_2939() {
     let evidence = published
         .rank_boundary
         .expect("the stop publishes its rank-boundary evidence");
-    assert_eq!(evidence.kept_rank, KEPT_RANK_INSIDE);
+    assert_eq!(evidence.kept_rank, CriterionRank::single(KEPT_RANK_INSIDE));
     assert_eq!(evidence.refused_trials, 1);
 }
 
@@ -503,7 +510,7 @@ fn feasible_unaccepted_probe_ends_refusal_streak_without_granting_progress() {
     let best = guard.best_value();
     let accepted = guard.accepted_iters();
     assert!(matches!(guard.observe_off_stratum(
-        &refused, KEPT_RANK_INSIDE, value, resolution, ADAPTING_DECREASE,
+        &refused, CriterionRank::single(KEPT_RANK_INSIDE), value, resolution, ADAPTING_DECREASE,
     ), CostStallVerdict::Continue));
     assert_eq!(guard.off_stratum_streak(), 1);
     guard.observe_feasible_probe();
@@ -516,7 +523,7 @@ fn feasible_unaccepted_probe_ends_refusal_streak_without_granting_progress() {
     assert_eq!(publication.iterations, accepted);
     assert!(publication.rank_boundary.is_none());
     assert!(matches!(guard.observe_off_stratum(
-        &refused, KEPT_RANK_INSIDE, value, resolution, ADAPTING_DECREASE,
+        &refused, CriterionRank::single(KEPT_RANK_INSIDE), value, resolution, ADAPTING_DECREASE,
     ), CostStallVerdict::Continue));
     assert_eq!(guard.off_stratum_streak(), 1);
     assert_eq!(guard.infeasible_streak(), 1);
@@ -528,7 +535,12 @@ fn terminal_boundary_evidence_requires_pure_refusals_at_the_actual_checkpoint() 
     let (guard, _, incumbent) = pinned_guard();
     let fixture = StratumFixture { cutoff: 0.05, center0: 4.0, across_shift: 12.0 };
     let eval = fixture.eval(&incumbent);
-    let mut objective = RecordingStratum { fixture, requests: Vec::new(), last_rank: Some(KEPT_RANK_INSIDE) };
+    let mut objective = RecordingStratum {
+        fixture,
+        requests: Vec::new(),
+        publish: CriterionRank::single,
+        last_rank: Some(CriterionRank::single(KEPT_RANK_INSIDE)),
+    };
     let mut bridge = OuterFirstOrderBridge {
         obj: &mut objective,
         layout: OuterThetaLayout::new(2, 0),
@@ -543,7 +555,7 @@ fn terminal_boundary_evidence_requires_pure_refusals_at_the_actual_checkpoint() 
         accepted_steps: Arc::default(),
         pending_first_order: Vec::new(),
         incumbent: Some(OuterIncumbent { rho: incumbent.clone(), cost: eval.cost, gradient: eval.gradient }),
-        stratum_rank: Some(KEPT_RANK_INSIDE),
+        stratum_rank: Some(CriterionRank::single(KEPT_RANK_INSIDE)),
         stratum_probe: Some(Arc::default()),
     };
     // A generic solver failure without any rank refusal carries no such diagnosis.
@@ -565,4 +577,72 @@ fn terminal_boundary_evidence_requires_pure_refusals_at_the_actual_checkpoint() 
     assert_eq!(bridge.terminal_rank_boundary(&incumbent).unwrap().refused_trials, 1);
     assert!(bridge.eval_cost(&feasible).is_ok(), "cached feasible probes have the same reset semantics");
     assert!(bridge.terminal_rank_boundary(&incumbent).is_none());
+}
+
+/// The ranks a two-atom criterion publishes on each side of the fixture's boundary.
+/// It sums one rank decision per atom, as the sparse-autoencoder dictionary's
+/// realized-rank charge does (#3436). Both sides keep 56 directions in total, and
+/// only the split moves: atom 0 gains a kept direction where atom 1 loses one.
+fn split_ranks_3436(side: usize) -> CriterionRank {
+    if side == KEPT_RANK_INSIDE {
+        CriterionRank::per_component(vec![28, 28])
+    } else {
+        CriterionRank::per_component(vec![29, 27])
+    }
+}
+
+#[test]
+fn a_per_atom_rank_crossing_at_a_constant_total_is_a_stratum_boundary_3436() {
+    // The two sides price two different functions although the total rank is the same,
+    // so the search must treat the split's change as a stratum boundary. It refuses the
+    // other side's trials at value order, and reaches the other side only through the
+    // seed loop's full re-evaluation there, as it does for a single rank decision
+    // (#2939). A total-rank tag cannot see this crossing: it compares 56 with 56.
+    let inside = split_ranks_3436(KEPT_RANK_INSIDE);
+    let across = split_ranks_3436(KEPT_RANK_ACROSS);
+    assert_eq!(
+        inside.total(),
+        across.total(),
+        "fixture premise: the total rank does not move across the boundary"
+    );
+    assert_ne!(inside, across, "fixture premise: the per-atom split does");
+    let fixture = StratumFixture {
+        cutoff: 0.05,
+        center0: 4.0,
+        across_shift: 3.0,
+    };
+    let (outcome, requests) = run_stratum(fixture, split_ranks_3436, "per-atom split #3436");
+    let result = outcome.expect("the other split's minimum certifies once the search crosses");
+    assert!(
+        result
+            .criterion_certificate
+            .as_ref()
+            .is_some_and(|cert| cert.certifies()),
+        "the fit must ship a certified point"
+    );
+    assert_eq!(
+        fixture.rank(&result.rho),
+        KEPT_RANK_ACROSS,
+        "the certified point lies on the split the search crossed to: {:?}",
+        result.rho,
+    );
+    let crossing = requests
+        .iter()
+        .position(|request| {
+            request.rank == KEPT_RANK_ACROSS
+                && matches!(request.order, OuterEvalOrder::ValueAndGradient)
+        })
+        .expect("the seed crosses to the other split");
+    let first_refused = requests[..crossing]
+        .iter()
+        .position(|request| request.rank == KEPT_RANK_ACROSS)
+        .expect("the search proposes trials on the other split before it crosses");
+    assert!(
+        requests[first_refused..crossing]
+            .iter()
+            .all(|request| request.rank == KEPT_RANK_ACROSS
+                && matches!(request.order, OuterEvalOrder::Value)),
+        "every trial on the other split before the crossing must be refused at value order: \
+         requests {first_refused}..{crossing}"
+    );
 }

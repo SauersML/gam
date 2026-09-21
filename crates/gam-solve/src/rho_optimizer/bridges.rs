@@ -129,8 +129,9 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     /// Kept rank of the criterion at this run's start (#2765), read from
     /// [`OuterObjective::criterion_rank`]. A trial whose criterion keeps a different
     /// rank prices a different function, so it is refused as a trial point and the line
-    /// search shortens its step. `None` keeps no rank.
-    pub(crate) stratum_rank: Option<usize>,
+    /// search shortens its step. `None` keeps no rank. A criterion with several rank
+    /// decisions keeps all of them, compared component by component (#3436).
+    pub(crate) stratum_rank: Option<CriterionRank>,
     /// The lowest-criterion trial refused for leaving [`Self::stratum_rank`], read by the
     /// seed loop, which restarts the search there when the run ends above it.
     pub(crate) stratum_probe: Option<Arc<Mutex<Option<StratumProbe>>>>,
@@ -1170,7 +1171,7 @@ impl CostStallGuard {
     pub(crate) fn observe_off_stratum(
         &mut self,
         rho: &Array1<f64>,
-        kept_rank: usize,
+        kept_rank: CriterionRank,
         value: f64,
         resolution: f64,
         predicted_decrease: f64,
@@ -1855,7 +1856,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                         .incumbent
                         .as_ref()
                         .map_or(f64::NAN, |incumbent| incumbent.linear_model_decrease(x));
-                    let verdict = match (left_stratum, self.stratum_rank) {
+                    let verdict = match (left_stratum, self.stratum_rank.as_ref()) {
                         (Some(refused_cost), Some(kept_rank)) => {
                             // The value lane publishes no evidence, so the trial's
                             // value carries only its own rounding.
@@ -1863,7 +1864,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                                 guard.value_resolution(refused_cost, &Default::default());
                             guard.observe_off_stratum(
                                 x,
-                                kept_rank,
+                                kept_rank.clone(),
                                 refused_cost,
                                 refused_resolution,
                                 predicted_decrease,
@@ -1922,6 +1923,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                                      the incumbent otherwise.",
                                     guard.infeasible_streak(),
                                     self.stratum_rank
+                                        .as_ref()
                                         .map_or_else(|| "none".to_string(), |rank| rank.to_string()),
                                     residual_grad_norm,
                                     guard.best_value(),
@@ -2169,7 +2171,7 @@ impl OuterFirstOrderBridge<'_> {
             return None;
         }
         Some(RankBoundaryStall {
-            kept_rank: self.stratum_rank?,
+            kept_rank: self.stratum_rank.clone()?,
             refused_trials: guard.off_stratum_streak,
             band: guard.stationarity_band(),
         })
@@ -2182,9 +2184,9 @@ impl OuterFirstOrderBridge<'_> {
     /// at any infeasible trial. The trial is kept when it is the lowest refused so far: a
     /// run that ends above it has a lower criterion to restart from.
     fn refuse_off_stratum_trial(&self, x: &Array1<f64>, cost: f64) -> Option<EstimationError> {
-        let stratum_rank = self.stratum_rank?;
+        let stratum_rank = self.stratum_rank.as_ref()?;
         let rank = self.obj.criterion_rank()?;
-        if rank == stratum_rank {
+        if rank == *stratum_rank {
             return None;
         }
         if let Some(cell) = self.stratum_probe.as_ref()
@@ -2194,7 +2196,7 @@ impl OuterFirstOrderBridge<'_> {
             *slot = Some(StratumProbe {
                 rho: x.clone(),
                 cost,
-                rank,
+                rank: rank.clone(),
             });
         }
         Some(EstimationError::TrialPointRefused {
@@ -4075,7 +4077,7 @@ pub(crate) struct PendingSecondOrderTrial {
 pub(crate) struct StratumProbe {
     pub(crate) rho: Array1<f64>,
     pub(crate) cost: f64,
-    pub(crate) rank: usize,
+    pub(crate) rank: CriterionRank,
 }
 
 /// Cap on [`OuterFirstOrderBridge::pending_first_order`]. One BFGS iteration

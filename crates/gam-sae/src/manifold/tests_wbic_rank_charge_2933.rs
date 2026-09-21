@@ -3,12 +3,15 @@
 //! displacement; the rank-charge audit fills every field from one evaluated
 //! state; the MP edge's false-rank rate under a fitted noise-only null is
 //! measured against the derived conditional law; and a stratum names the
-//! boundary a crossing changes.
+//! boundary a crossing changes, which the outer objective publishes as its
+//! criterion rank (#3436).
 
 use super::tests::{TestPeriodicEvaluator, periodic_basis};
+use super::tests_sparse_curvature_operator_2500::threshold_gate_tiny_fixture;
 use super::wbic_audit::rank_charge_stratum;
 use super::*;
 use gam_linalg::utils::splitmix64;
+use gam_solve::rho_optimizer::{CriterionRank, OuterEvalOrder, OuterObjective};
 use ndarray::array;
 
 fn uniform01(state: &mut u64) -> f64 {
@@ -279,13 +282,17 @@ fn rank_charge_audit_fills_every_field_from_one_state_2933() {
     term.accumulate_decoder_gram(&mut grams)
         .expect("the decoder Gram accumulates on the CPU fixture");
     let n_eff = term.per_atom_effective_sample_size();
-    let priced_dof = term
+    let priced = term
         .rank_dof_from_grams(&grams, &n_eff, &rho, dispersion)
         .expect("the priced rank-charge DOF exists at the fixture state");
-    assert_eq!(audit.stratum.production_dof().to_bits(), priced_dof[0].to_bits());
+    assert_eq!(audit.stratum.production_dof().to_bits(), priced.dof[0].to_bits());
+    assert_eq!(
+        priced.chargeable_rank,
+        vec![audit.stratum.production_chargeable_rank()]
+    );
     assert_eq!(
         audit.stratum.production_charge().to_bits(),
-        (0.5 * priced_dof[0] * n_eff[0].max(1.0).ln()).to_bits()
+        (0.5 * priced.dof[0] * n_eff[0].max(1.0).ln()).to_bits()
     );
     assert!((audit.stratum.effective_sample_size() - 24.0).abs() <= 1.0e-12);
     assert!((audit.lambda_smooth - 0.8).abs() <= 1.0e-12);
@@ -850,4 +857,140 @@ fn rank_charge_stratum_names_the_mp_edge_branch_2933() {
     let priced = realised_rank_charge_dof(&gram, &decoder, n_eff, p as f64, dispersion, 0.0, None)
         .expect("the diagonal fixture prices a finite DOF");
     assert_eq!(priced.to_bits(), resolved.production_dof().to_bits());
+}
+
+/// #3436 — a reconstruction energy at its Marchenko--Pastur edge is a stratum
+/// boundary of the criterion, and the outer objective says which side a value
+/// was priced on.
+///
+/// The rank charge `Σ_k ½·r_k·edf_k·log N_eff,k` is piecewise constant in the
+/// chargeable ranks `r_k`, and `r_k` counts the energies `μ_j > e(R)` with
+/// `e(R) = R·(1+√(p/N_eff))²`. Holding the state and moving the dispersion across
+/// `R* = μ_min/(1+√(p/N_eff))²` by one part in 10⁹ moves the edge across the
+/// smaller energy and nothing else: `r` drops from 2 to 1 and the priced DOF by
+/// exactly one `edf`. Two values that far apart in `R` are on two smooth pieces,
+/// so the per-atom ranks they publish must differ, which is what makes the outer
+/// line search refuse to compare them.
+#[test]
+fn an_energy_at_its_mp_edge_splits_the_rank_charge_into_two_strata_3436() {
+    let (mut term, target, rho) = resolved_single_atom_state();
+    let loss = term
+        .loss(target.view(), &rho)
+        .expect("the fixture loss is finite");
+    let sys = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .expect("the fixture arrow system assembles");
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
+    let (_delta_t, _delta_beta, cache) =
+        solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
+            .expect("the resolved fixture has a positive definite evidence factor");
+    let audit = term
+        .rank_charge_audit(target.view(), &rho, &loss, &cache)
+        .expect("the plain single-atom state is auditable")
+        .remove(0);
+    let mut grams = term.empty_decoder_gram_accumulator();
+    term.accumulate_decoder_gram(&mut grams)
+        .expect("the decoder Gram accumulates on the CPU fixture");
+    let n_eff = term.per_atom_effective_sample_size();
+    let smallest_energy = audit
+        .stratum
+        .reconstruction_energies()
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let unit_edge = crate::null_battery::mp_reconstruction_rank_edge(
+        audit.stratum.effective_sample_size(),
+        audit.output_dim as f64,
+        1.0,
+    )
+    .expect("positive occupancy and width give a finite edge");
+    let edge_dispersion = smallest_energy / unit_edge;
+    assert!(edge_dispersion.is_finite() && edge_dispersion > 0.0);
+
+    let price_at = |dispersion: f64| {
+        term.rank_dof_from_grams(&grams, &n_eff, &rho, dispersion)
+            .expect("the rank charge prices at a positive dispersion")
+    };
+    let below = price_at(edge_dispersion * (1.0 - 1.0e-9));
+    let above = price_at(edge_dispersion * (1.0 + 1.0e-9));
+    assert_eq!(below.chargeable_rank, vec![2]);
+    assert_eq!(above.chargeable_rank, vec![1]);
+    let edf = audit.stratum.basis_edf();
+    assert!(
+        (below.dof[0] - above.dof[0] - edf).abs() <= 1.0e-12 * edf,
+        "the crossing moves the DOF by one edf: below {} above {} edf {edf}",
+        below.dof[0],
+        above.dof[0]
+    );
+    let below_stratum = CriterionRank::per_component(below.chargeable_rank.clone());
+    let above_stratum = CriterionRank::per_component(above.chargeable_rank.clone());
+    assert_ne!(below_stratum, above_stratum);
+    // Each side is one stratum: a second price on the same side names the same one.
+    assert_eq!(
+        CriterionRank::per_component(price_at(edge_dispersion * (1.0 - 1.0e-6)).chargeable_rank),
+        below_stratum
+    );
+    assert_eq!(
+        CriterionRank::per_component(price_at(edge_dispersion * (1.0 + 1.0e-6)).chargeable_rank),
+        above_stratum
+    );
+}
+
+/// #3436 — every outer lane publishes the rank-charge branch of the value it
+/// returned, read off the state that value was priced on: the value lane, the
+/// gradient lane that differentiates the value lane's handed-off state, and
+/// nothing after a reset.
+#[test]
+fn the_outer_objective_publishes_the_branch_its_value_was_priced_on_3436() {
+    let (term, target, rho) = threshold_gate_tiny_fixture(false);
+    let rho_flat = rho.flat_coordinates();
+    let audit = || {
+        SaeManifoldOuterObjective::new(
+            term.clone(),
+            target.clone(),
+            None,
+            rho.clone(),
+            0,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
+        .for_installed_state_audit()
+    };
+
+    // The priced branch of the fixture's own state, through the dense route.
+    let mut fresh = audit();
+    let route_rho = fresh.baseline_rho.clone();
+    fresh
+        .evaluate_outer_criterion_route(&route_rho, true, false)
+        .expect("the route prices the fixture at its own rho");
+    let expected = CriterionRank::per_component(
+        fresh
+            .term
+            .priced_rank_stratum
+            .as_ref()
+            .expect("a priced value records its branch")
+            .to_vec(),
+    );
+    assert_eq!(expected.components().len(), fresh.term.k_atoms());
+
+    let mut objective = audit();
+    assert_eq!(objective.criterion_rank(), None);
+    let cost = objective
+        .eval_cost(&rho_flat)
+        .expect("the value lane prices the fixture at its own rho");
+    assert!(cost.is_finite());
+    assert_eq!(objective.criterion_rank(), Some(expected.clone()));
+    let sample = objective
+        .eval(&rho_flat)
+        .expect("the gradient lane differentiates the handed-off state");
+    assert_eq!(sample.cost.to_bits(), cost.to_bits());
+    assert_eq!(objective.criterion_rank(), Some(expected.clone()));
+    let probe = objective
+        .eval_with_order(&rho_flat, OuterEvalOrder::Value)
+        .expect("the line-search value order prices the fixture");
+    assert!(probe.cost.is_finite());
+    assert_eq!(objective.criterion_rank(), Some(expected));
+    objective.reset();
+    assert_eq!(objective.criterion_rank(), None);
 }
