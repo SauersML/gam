@@ -113,6 +113,37 @@ impl SymmetricAssembly {
             depth: terms.saturating_sub(1).saturating_add(2),
         }
     }
+
+    /// The assembly after every entry is multiplied by one scalar: one more
+    /// rounding on an accumulated entry's path, while a mirrored matrix stays
+    /// bitwise symmetric (the same product on the same operand in both triangles).
+    pub const fn scaled(self) -> Self {
+        match self {
+            Self::Mirrored => Self::Mirrored,
+            Self::PsdAccumulation { depth } => Self::PsdAccumulation {
+                depth: depth.saturating_add(1),
+            },
+        }
+    }
+
+    /// The assembly of the entrywise sum with another symmetric PSD matrix.
+    /// Two mirrored operands sum to a mirrored matrix; an accumulation gains one
+    /// addition on every entry's path, plus the other operand's own path when
+    /// that operand is itself an accumulation.
+    pub const fn psd_sum(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Mirrored, Self::Mirrored) => Self::Mirrored,
+            (Self::PsdAccumulation { depth }, Self::Mirrored)
+            | (Self::Mirrored, Self::PsdAccumulation { depth }) => Self::PsdAccumulation {
+                depth: depth.saturating_add(1),
+            },
+            (Self::PsdAccumulation { depth: a }, Self::PsdAccumulation { depth: b }) => {
+                Self::PsdAccumulation {
+                    depth: a.saturating_add(b).saturating_add(1),
+                }
+            }
+        }
+    }
 }
 
 /// The largest disagreement `|A_ij − A_ji|` the assembly `assembly` can leave
