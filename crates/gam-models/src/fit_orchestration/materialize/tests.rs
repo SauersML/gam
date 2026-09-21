@@ -4882,3 +4882,95 @@ fn coefficient_groups_are_refused_on_survival_fits() {
         "{message}"
     );
 }
+
+/// A log-σ formula without an intercept has no column to carry the raw
+/// remap's `+ln(s)` shift. Dividing a raw response by its scale `s` is the
+/// same model with the log-σ offset lowered by `ln s`:
+/// `y ~ N(μ, exp(Xβ))` is `y/s ~ N(μ/s, exp(Xβ − ln s))`. So the fit of the
+/// raw response must publish the log-σ coefficients of the pre-standardized
+/// fit that carries that offset, and mean coefficients `s` times its own.
+/// Before the fix the raw fit solved `log σ_raw = ln(s) + Xβ` instead and
+/// published σ in standardized units.
+#[test]
+fn gaussian_location_scale_no_intercept_noise_formula_fits_the_raw_model() {
+    let data = gaussian_location_scale_dataset();
+    let config = FitConfig {
+        family: Some("gaussian".to_string()),
+        noise_formula: Some("0 + x".to_string()),
+        ..FitConfig::default()
+    };
+    let materialized =
+        materialize("y ~ x", &data, &config).expect("gaussian location-scale materialization");
+    let FitRequest::GaussianLocationScale(request) = materialized.request else {
+        panic!("expected a Gaussian location-scale request");
+    };
+    let GaussianLocationScaleFitRequest {
+        data: req_data,
+        mut spec,
+        options,
+        kappa_options,
+        ..
+    } = request;
+    assert!(
+        !gam_terms::smooth::term_collection_has_global_intercept(&spec.log_sigmaspec),
+        "`0 + x` must realize a log-σ design without a global intercept"
+    );
+    // Put the response far from unit spread so the standardization matters.
+    spec.y.mapv_inplace(|v| 25.0 * v);
+    let s = gaussian_response_sample_std(spec.y.view());
+    assert!(s > 5.0, "response scale {s}");
+
+    let raw = fit_gaussian_location_scale_model(GaussianLocationScaleFitRequest {
+        data: req_data,
+        spec: spec.clone(),
+        wiggle: None,
+        options: options.clone(),
+        kappa_options: kappa_options.clone(),
+    })
+    .expect("raw-response no-intercept log-σ fit");
+
+    let mut standardized = spec.clone();
+    standardized.y.mapv_inplace(|v| v / s);
+    standardized.mean_offset.mapv_inplace(|v| v / s);
+    standardized.log_sigma_offset.mapv_inplace(|v| v - s.ln());
+    let reference = fit_gaussian_location_scale_model(GaussianLocationScaleFitRequest {
+        data: req_data,
+        spec: standardized,
+        wiggle: None,
+        options,
+        kappa_options,
+    })
+    .expect("pre-standardized no-intercept log-σ fit");
+
+    let block_beta = |fit: &GaussianLocationScaleFitResult, roles: &[gam_problem::BlockRole]| {
+        fit.fit
+            .fit
+            .blocks
+            .iter()
+            .find(|block| roles.contains(&block.role))
+            .map(|block| block.beta.clone())
+            .expect("fitted block")
+    };
+    let scale_roles = [gam_problem::BlockRole::Scale];
+    let mean_roles = [gam_problem::BlockRole::Location, gam_problem::BlockRole::Mean];
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-5 * (1.0 + a.abs().max(b.abs()));
+    let raw_scale = block_beta(&raw, &scale_roles);
+    let ref_scale = block_beta(&reference, &scale_roles);
+    assert_eq!(raw_scale.len(), ref_scale.len());
+    for (j, (&a, &b)) in raw_scale.iter().zip(ref_scale.iter()).enumerate() {
+        assert!(
+            close(a, b),
+            "log-σ coefficient {j}: raw fit {a:e} against the equivalent standardized fit {b:e}"
+        );
+    }
+    let raw_mean = block_beta(&raw, &mean_roles);
+    let ref_mean = block_beta(&reference, &mean_roles);
+    assert_eq!(raw_mean.len(), ref_mean.len());
+    for (j, (&a, &b)) in raw_mean.iter().zip(ref_mean.iter()).enumerate() {
+        assert!(
+            close(a, s * b),
+            "mean coefficient {j}: raw fit {a:e} against s × standardized fit {:e}",
+            s * b
+        );
+    }
+}

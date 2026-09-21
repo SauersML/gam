@@ -1515,19 +1515,44 @@ pub(crate) fn fit_gaussian_location_scale_model(
         ));
     }
     let raw_offsets = GaussianLocationScaleRawOffsets::of(&request.spec);
+    // The raw remap carries `σ_raw = s·σ_internal` by shifting the log-σ
+    // intercept by `+ln(s)`. A log-σ design with no global intercept (`0 + x`,
+    // `x - 1`, or an anchored B-spline that gauges the level) has no column
+    // to carry that shift, so the standardized fit would solve a different
+    // model, `log σ_raw = ln(s) + Xβ`, and publish σ in standardized units.
+    // For that design the `−ln(s)` rides the log-σ offset instead:
+    // `y/s ~ N(μ/s, exp(o − ln s + Xβ))` is exactly the requested raw model,
+    // so the fitted β needs no shift and the published predictors (built from
+    // the raw offsets) are the raw ones.
+    let noise_has_intercept =
+        gam_terms::smooth::term_collection_has_global_intercept(&request.spec.log_sigmaspec);
     if response_scale != 1.0 {
         request.spec.y.mapv_inplace(|v| v / response_scale);
-        // The mean (identity-link) offset rides in the same units as y; the
-        // log-σ offset is on the log-scale axis and is unaffected by the
-        // multiplicative response rescale.
+        // The mean (identity-link) offset rides in the same units as y.
         request
             .spec
             .mean_offset
             .mapv_inplace(|v| v / response_scale);
+        // The log-σ offset is on the log-scale axis: the multiplicative
+        // response rescale reaches it only when no intercept absorbs it.
+        if !noise_has_intercept {
+            let ln_s = response_scale.ln();
+            request.spec.log_sigma_offset.mapv_inplace(|v| v - ln_s);
+        }
     }
 
     let mut result =
         fit_location_scale_with_optional_wiggle::<GaussianLocationScaleWorkflow>(request)?;
+    if noise_has_intercept == result.fit.noise_design.intercept_range.is_empty() {
+        return Err(crate::gamlss::assembly_failure(format!(
+            "gaussian location-scale raw remap: the log-σ spec {} a global intercept but its \
+             realized design has {} intercept column(s), so the response-scale shift would be \
+             applied {}",
+            if noise_has_intercept { "declares" } else { "suppresses" },
+            result.fit.noise_design.intercept_range.len(),
+            if noise_has_intercept { "nowhere" } else { "twice" },
+        )));
+    }
 
     // The raw-unit remap rewrites a fitted result the engine assembled, so its
     // refusals are shape disagreements inside that result (#2937).
