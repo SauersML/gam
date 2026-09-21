@@ -7685,60 +7685,125 @@ fn atom_ambient_image(atom: &SaeManifoldAtom) -> Array2<f64> {
 }
 
 /// Top principal direction of the rows of `img` about `center`, restricted to
-/// `active` rows, by a few power iterations on `Σ (g−c)(g−c)ᵀ` (formed
-/// implicitly, so the cost is `O(active·p)` per iteration, never `p²`).
-fn power_iter_top_dir(
+/// `active` rows: the leading eigenvector of `C = Σ (g−c)(g−c)ᵀ` (formed
+/// implicitly, so the cost is `O(active·p)` per matvec, never `p²`), certified
+/// by the full-reorthogonalization extreme Lanczos solve.
+///
+/// The start vector is the highest-norm centered active row, which lies in
+/// `range C`, so the Krylov space it generates has dimension at most
+/// `rank C ≤ min(p, active)`. That budget is exact, not a guess. `Ok(None)` is
+/// an image with no centered signal (`C = 0`), which frames nothing. A solve
+/// that does not certify within the exact budget is an error the harvest
+/// propagates, never a silently skipped atom and never a plane adjudicated on
+/// an unconverged direction.
+fn certified_top_dir(
     img: ArrayView2<'_, f64>,
     center: &Array1<f64>,
     active: &[usize],
-) -> Array1<f64> {
+) -> Result<Option<Array1<f64>>, String> {
     let p = img.ncols();
-    let mut v = Array1::<f64>::zeros(p);
-    // Seed from the highest-norm centered active row (a strong signal direction).
+    let m = active.len();
+    if p == 0 || m == 0 {
+        return Ok(None);
+    }
+    let apply_c = |x: &[f64], out: &mut [f64]| {
+        out.fill(0.0);
+        for &r in active {
+            let mut dot = 0.0_f64;
+            for j in 0..p {
+                dot += (img[[r, j]] - center[j]) * x[j];
+            }
+            for j in 0..p {
+                out[j] += (img[[r, j]] - center[j]) * dot;
+            }
+        }
+    };
+    // Seed from the highest-norm centered active row (a strong signal
+    // direction); `trace C` is the sum of those squared norms, exactly.
+    let mut seed = vec![0.0_f64; p];
     let mut best_norm = 0.0_f64;
+    let mut trace = 0.0_f64;
     for &r in active {
         let mut nrm = 0.0_f64;
         for j in 0..p {
             let d = img[[r, j]] - center[j];
             nrm += d * d;
         }
+        trace += nrm;
         if nrm > best_norm {
             best_norm = nrm;
             for j in 0..p {
-                v[j] = img[[r, j]] - center[j];
+                seed[j] = img[[r, j]] - center[j];
             }
         }
     }
-    let vn = v.dot(&v).sqrt();
-    if vn <= 0.0 {
-        return v;
+    if !trace.is_finite() {
+        return Err(format!(
+            "linear-atom frame: the centered image trace is not finite ({trace})"
+        ));
     }
-    v.mapv_inplace(|x| x / vn);
-    for _ in 0..5 {
-        // w = C v = Σ (g−c) ((g−c)·v)
-        let mut w = Array1::<f64>::zeros(p);
-        for &r in active {
-            let mut dot = 0.0_f64;
-            for j in 0..p {
-                dot += (img[[r, j]] - center[j]) * v[j];
-            }
-            for j in 0..p {
-                w[j] += (img[[r, j]] - center[j]) * dot;
-            }
-        }
-        let wn = w.dot(&w).sqrt();
-        if wn <= 0.0 {
-            break;
-        }
-        w.mapv_inplace(|x| x / wn);
-        v = w;
+    if !(best_norm > 0.0) {
+        return Ok(None);
     }
-    v
+    // Normalize the operator by the seed's Rayleigh quotient `ρ₀ ≤ λ₁`, so the
+    // solver's `max(|λ|, 1)` residual scale is `λ₁/ρ₀ ≥ 1`: the certificate is
+    // relative to `λ₁` whatever the image's units.
+    let mut c_seed = vec![0.0_f64; p];
+    apply_c(&seed, &mut c_seed);
+    let rho0 = seed.iter().zip(&c_seed).map(|(s, c)| s * c).sum::<f64>() / best_norm;
+    // `seed ∈ range C` and `seed ≠ 0`, so `ρ₀ ≥ ‖seed‖² > 0` in exact
+    // arithmetic; a non-positive or non-finite quotient is a failed evaluation.
+    if !(rho0 > 0.0 && rho0.is_finite()) {
+        return Err(format!(
+            "linear-atom frame: the seed Rayleigh quotient is not a positive finite \
+             number ({rho0})"
+        ));
+    }
+    // One scaled matvec commits `p + 2` roundings per row projection (centering,
+    // product, sum), `m + 2` per output accumulation, and one in `/ρ₀`, against
+    // the magnitude `‖Σ |g−c||g−c|ᵀ‖/ρ₀ ≤ tr C/ρ₀`. That is the resolution of
+    // `C v / ρ₀` at working precision: a Krylov residual inside it is an
+    // exhausted space, and a Ritz residual inside it is certified.
+    let matvec_band = gam_linalg::roundoff::accumulation_growth(p + m + 5) * trace / rho0;
+    let pairs = gam_linalg::lanczos::symmetric_extreme_lanczos_eigenpairs(
+        p,
+        &seed,
+        gam_linalg::lanczos::SymmetricExtremeLanczosOptions {
+            target_rank: 1,
+            max_steps: p.min(m),
+            check_every: 10usize.min((p / 10).max(1)),
+            relative_residual_tol: matvec_band,
+            breakdown_tol: matvec_band,
+        },
+        |x, out| {
+            apply_c(x, out);
+            for value in out.iter_mut() {
+                *value /= rho0;
+            }
+            Ok(())
+        },
+    )
+    .map_err(|error| format!("linear-atom frame direction did not certify: {error}"))?;
+    let mut v = pairs.eigenvectors.column(0).to_owned();
+    let vnorm = v.dot(&v).sqrt();
+    if !(vnorm > 0.0 && vnorm.is_finite()) {
+        return Err(format!(
+            "linear-atom frame: the certified Ritz vector has norm {vnorm}"
+        ));
+    }
+    // The eigenvector's sign is a gauge; orient it along the seed row so the
+    // direction is deterministic.
+    let orientation = v.iter().zip(&seed).map(|(a, b)| a * b).sum::<f64>();
+    let sign = if orientation < 0.0 { -1.0 } else { 1.0 };
+    v.mapv_inplace(|x| sign * x / vnorm);
+    Ok(Some(v))
 }
 
 /// Assemble the fitted linear atoms' `(atom index, unit direction, active mask,
 /// ambient image)` — the raw material coalescing and candidate generation read.
-fn linear_atom_frames(term: &SaeManifoldTerm) -> Vec<(usize, Array1<f64>, Vec<bool>, Array2<f64>)> {
+fn linear_atom_frames(
+    term: &SaeManifoldTerm,
+) -> Result<Vec<(usize, Array1<f64>, Vec<bool>, Array2<f64>)>, String> {
     let assignments = term.assignment.assignments();
     let n = assignments.nrows();
     let k = assignments.ncols();
@@ -7769,13 +7834,12 @@ fn linear_atom_frames(term: &SaeManifoldTerm) -> Vec<(usize, Array1<f64>, Vec<bo
             }
         }
         center.mapv_inplace(|x| x / active_idx.len() as f64);
-        let dir = power_iter_top_dir(img.view(), &center, &active_idx);
-        if dir.dot(&dir).sqrt() <= 0.0 {
+        let Some(dir) = certified_top_dir(img.view(), &center, &active_idx)? else {
             continue;
-        }
+        };
         out.push((a, dir, active_mask, img));
     }
-    out
+    Ok(out)
 }
 
 /// Mine flat-pair → circle promotion candidates from the fitted dictionary
@@ -7803,7 +7867,7 @@ fn curl_candidates(
         },
         SaeReferenceMetricPlan::UnitCircle,
     )?;
-    let frames = linear_atom_frames(term);
+    let frames = linear_atom_frames(term)?;
     if frames.len() < 2 {
         return Ok(Vec::new());
     }
