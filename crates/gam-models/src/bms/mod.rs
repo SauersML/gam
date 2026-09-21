@@ -1477,6 +1477,70 @@ impl LatentMeasureKind {
             }
         }
     }
+
+    /// The same law with every training row's mixture rebuilt from the scaled
+    /// conditioning covariates `conditioning`, one row per training row
+    /// (gam#2929).
+    ///
+    /// A local law's `train_row_mixtures` is `#[serde(skip)]`, and that is not
+    /// an omission: a row's mixture is a function of its own covariates and the
+    /// saved centres, so the saved law carries the function and the values are
+    /// rebuilt wherever the fitted rows are replayed. This is the one rule that
+    /// rebuilds them, and it composes each row's weights with
+    /// [`estimated_latent_law::local_empirical_mixture_for_point`] — the same
+    /// composer the fit used for its training rows (gam#2926) and prediction
+    /// uses for a prediction row — so the law a row was fitted under and the law
+    /// it is replayed under are one object.
+    ///
+    /// A law with no per-row mixtures (the standard-normal closed form, one
+    /// global grid) has nothing to rebuild and is returned unchanged, so a
+    /// caller does not have to know which kind it holds.
+    pub fn with_rebuilt_training_mixtures(
+        &self,
+        conditioning: ndarray::ArrayView2<'_, f64>,
+    ) -> Result<Self, String> {
+        let Self::LocalEmpirical {
+            feature_cols,
+            input_scales,
+            centers,
+            grids,
+            top_k,
+            bandwidth,
+            mixture,
+            ..
+        } = self
+        else {
+            return Ok(self.clone());
+        };
+        let width = centers.first().map_or(0, Vec::len);
+        if conditioning.ncols() != width {
+            return Err(format!(
+                "local empirical latent law conditioning is {} columns wide, but its centres are \
+                 {width}-dimensional; a row's mixture reads the centres' own coordinates",
+                conditioning.ncols()
+            ));
+        }
+        let train_row_mixtures = conditioning
+            .rows()
+            .into_iter()
+            .map(|row| {
+                let point = row.to_vec();
+                estimated_latent_law::local_empirical_mixture_for_point(
+                    &point, centers, *top_k, *bandwidth, *mixture,
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self::LocalEmpirical {
+            feature_cols: feature_cols.clone(),
+            input_scales: input_scales.clone(),
+            centers: centers.clone(),
+            grids: grids.clone(),
+            top_k: *top_k,
+            bandwidth: *bandwidth,
+            mixture: *mixture,
+            train_row_mixtures: Arc::new(train_row_mixtures),
+        })
+    }
 }
 
 /// Allocation-free heapsort of parallel empirical node/weight storage.
@@ -4442,6 +4506,8 @@ pub(crate) mod empirical_measure_sensitivity;
 mod empirical_grid_sampling_3452_tests;
 #[cfg(test)]
 mod empirical_grid_fit_3452_tests;
+#[cfg(test)]
+mod local_law_replay_2929_tests;
 #[cfg(test)]
 mod residual_score_zeta_2985_tests;
 #[cfg(test)]

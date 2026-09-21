@@ -87,6 +87,12 @@ pub struct SavedMarginalSlopeSurvivalAloInput {
     /// along follow-up (gam#2765, gam#2767). `None` is the time-constant slope.
     slope_follow_up: Option<(DesignMatrix, DesignMatrix)>,
     slope_offset: Array1<f64>,
+    /// The scaled conditioning covariates a LOCAL latent law reads, one row per
+    /// carrier row (gam#2929). A saved local law does not carry its training
+    /// rows' mixtures — they are a function of these covariates and the saved
+    /// centres — so the replay rebuilds them from here. `None` for every other
+    /// law.
+    local_law_conditioning: Option<Array2<f64>>,
 }
 
 /// One fitted affine block evaluated on survival entry, exit, and exit-time
@@ -418,6 +424,7 @@ impl SavedMarginalSlopeSurvivalAloInput {
         slope_design: DesignMatrix,
         slope_follow_up: Option<(DesignMatrix, DesignMatrix)>,
         slope_offset: Array1<f64>,
+        local_law_conditioning: Option<Array2<f64>>,
     ) -> Result<Self, String> {
         let n = event.len();
         if n == 0
@@ -482,6 +489,15 @@ impl SavedMarginalSlopeSurvivalAloInput {
                 "saved survival marginal-slope ALO event[{row}] must be exactly 0 or 1, got {value}"
             ));
         }
+        if let Some(conditioning) = local_law_conditioning.as_ref()
+            && (conditioning.nrows() != n || conditioning.ncols() == 0)
+        {
+            return Err(format!(
+                "saved survival marginal-slope ALO local latent-law conditioning is {}x{}; expected {n} rows and at least one feature",
+                conditioning.nrows(),
+                conditioning.ncols(),
+            ));
+        }
         Ok(Self {
             event,
             latent_z,
@@ -497,6 +513,7 @@ impl SavedMarginalSlopeSurvivalAloInput {
             slope_design,
             slope_follow_up,
             slope_offset,
+            local_law_conditioning,
         })
     }
 }
@@ -2948,6 +2965,7 @@ fn compute_saved_marginal_slope_survival_alo(
             influence_design: influence_design.as_ref(),
             gaussian_frailty_sd,
             latent_measure: payload.latent_measure.as_ref(),
+            local_law_conditioning: input.local_law_conditioning.as_ref(),
         })
         .map_err(|reason| {
             invalid(format!(

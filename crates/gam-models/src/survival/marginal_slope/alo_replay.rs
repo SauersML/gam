@@ -57,6 +57,17 @@ pub struct SurvivalMarginalSlopeSavedAloReplayInput<'a> {
     /// declared empirical law is replayed by the anchored frame, exactly as the
     /// fit ran it; `None` or `StandardNormal` is the Gaussian closed form.
     pub latent_measure: Option<&'a crate::bms::LatentMeasureKind>,
+    /// The scaled conditioning covariates a LOCAL latent law reads, one row per
+    /// replayed row, in the law's own feature order (gam#2929).
+    ///
+    /// A saved local law carries its centres, grids, bandwidth and mixture rule
+    /// but not its training rows' mixtures, which are a function of exactly
+    /// these covariates
+    /// ([`crate::bms::LatentMeasureKind::with_rebuilt_training_mixtures`]), so
+    /// the replay rebuilds them here the way prediction rebuilds a prediction
+    /// row's. `None` for every other law; a local law without them names no
+    /// per-row grid and is refused rather than replayed on the pooled one.
+    pub local_law_conditioning: Option<&'a Array2<f64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -361,20 +372,32 @@ pub fn replay_saved_survival_marginal_slope_alo(
         }
     };
     // gam#2923: the coefficients of a fit on a declared latent law are defined
-    // against that law's anchor, so the replay runs the same anchored frame. A
-    // local law's training mixtures do not travel with the model, so it cannot
-    // be replayed and says so.
+    // against that law's anchor, so the replay runs the same anchored frame.
+    // gam#2929: a local law's per-row mixtures are a function of the row's own
+    // conditioning covariates and the saved centres, so the replay rebuilds
+    // them from the covariates rather than reading persisted values — the same
+    // rule, and the same composer, prediction replays a prediction row with.
     let latent_law = match input.latent_measure {
         None | Some(crate::bms::LatentMeasureKind::StandardNormal) => None,
         Some(kind @ crate::bms::LatentMeasureKind::GlobalEmpirical { .. }) => {
             SurvivalLatentLaw::from_kind(kind, n)?.map(Arc::new)
         }
-        Some(crate::bms::LatentMeasureKind::LocalEmpirical { .. }) => {
-            return Err(
-                "saved survival marginal-slope ALO cannot replay a local-empirical latent \
-                 law: its per-row training mixtures are not persisted"
-                    .to_string(),
-            );
+        Some(kind @ crate::bms::LatentMeasureKind::LocalEmpirical { .. }) => {
+            let conditioning = input.local_law_conditioning.ok_or_else(|| {
+                "saved survival marginal-slope ALO of a local-empirical latent law needs that \
+                 law's conditioning covariates: each row's mixture is rebuilt from them, as \
+                 prediction rebuilds a prediction row's"
+                    .to_string()
+            })?;
+            if conditioning.nrows() != n {
+                return Err(format!(
+                    "saved survival marginal-slope ALO local latent-law conditioning has {} rows; \
+                     the replay has {n}",
+                    conditioning.nrows(),
+                ));
+            }
+            let rebuilt = kind.with_rebuilt_training_mixtures(conditioning.view())?;
+            SurvivalLatentLaw::from_kind(&rebuilt, n)?.map(Arc::new)
         }
     };
     let family = SurvivalMarginalSlopeFamily {
@@ -569,6 +592,7 @@ mod tests {
                 influence_design: None,
                 gaussian_frailty_sd: None,
                 latent_measure: None,
+                local_law_conditioning: None,
             })
             .expect("rigid saved survival row replays");
         let row = &replay.rows[1];

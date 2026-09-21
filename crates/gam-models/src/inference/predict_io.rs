@@ -20,7 +20,6 @@ use gam_runtime::resource::prediction_chunk_rows;
 use gam_solve::estimate::{EstimationError, UnifiedFitResult};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use std::sync::Arc;
 
 pub struct PredictResult {
     pub eta: Array1<f64>,
@@ -717,16 +716,7 @@ impl BernoulliMarginalSlopePredictor {
             LatentMeasureKind::GlobalEmpirical { grid } => {
                 Ok(LatentMeasureKind::GlobalEmpirical { grid: grid.clone() })
             }
-            LatentMeasureKind::LocalEmpirical {
-                feature_cols,
-                input_scales,
-                centers,
-                grids,
-                top_k,
-                bandwidth,
-                mixture,
-                ..
-            } => {
+            LatentMeasureKind::LocalEmpirical { centers, .. } => {
                 let conditioning = self.local_conditioning_view(input).ok_or_else(|| {
                     EstimationError::InvalidInput(
                         "saved BMS ALO with a local empirical latent measure requires the persisted conditioning matrix"
@@ -741,26 +731,13 @@ impl BernoulliMarginalSlopePredictor {
                         conditioning.ncols(),
                     )));
                 }
-                let mixtures = conditioning
-                    .rows()
-                    .into_iter()
-                    .map(|row| {
-                        let point = row.iter().copied().collect::<Vec<_>>();
-                        Self::local_empirical_mixture_for_point(
-                            &point, centers, *top_k, *bandwidth, *mixture,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(LatentMeasureKind::LocalEmpirical {
-                    feature_cols: feature_cols.clone(),
-                    input_scales: input_scales.clone(),
-                    centers: centers.clone(),
-                    grids: grids.clone(),
-                    top_k: *top_k,
-                    bandwidth: *bandwidth,
-                    mixture: *mixture,
-                    train_row_mixtures: Arc::new(mixtures),
-                })
+                // One rule rebuilds a saved local law's training mixtures
+                // (gam#2929): this route and the survival marginal-slope ALO
+                // replay call it, so neither can compose a row's weights
+                // differently from the fit that minted them.
+                self.latent_measure
+                    .with_rebuilt_training_mixtures(conditioning)
+                    .map_err(EstimationError::InvalidInput)
             }
         }
     }

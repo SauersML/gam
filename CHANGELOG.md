@@ -70,6 +70,23 @@
   into `dl_bits` and `e_process_bits`, each `Option<f64>`, a move fills at most one, and
   the JSON payload publishes both. `MoveEvidence::none()` now records neither currency as
   measured instead of a zero state-objective change.
+- **A saved survival marginal-slope model on a local-empirical latent law replays its ALO
+  rows instead of refusing them** (gam#2929, item 2).
+  `LatentMeasureKind::LocalEmpirical::train_row_mixtures` is `#[serde(skip)]`, so a saved
+  local law carries its centres, context grids, bandwidth and mixture rule but not the
+  training rows' mixtures. The survival marginal-slope ALO replay read that as "the law
+  cannot travel" and refused by name, although the mixtures are not data: a row's weights
+  are a function of the row's own conditioning covariates and the saved centres, and
+  prediction has always rebuilt a prediction row's from them. The Bernoulli marginal-slope
+  ALO already rebuilt the training rows' the same way, with its own copy of the loop. Both
+  now call one rule, `LatentMeasureKind::with_rebuilt_training_mixtures`, which composes
+  each row's weights with the `local_empirical_mixture_for_point` the fit itself used, so a
+  replayed row reads the law it was fitted under. The survival ALO carrier gained the
+  conditioning block the CLI already builds for prediction; a local law offered without it
+  is refused rather than replayed against the pooled law.
+  **Behavior change:** `gam predict --alo` on a survival marginal-slope model whose latent
+  measure is local-empirical now produces diagnostics; it previously failed with "its
+  per-row training mixtures are not persisted".
 
 - **The scheduled p-value calibration run can fail** (gam#3722).
   `.github/workflows/pvalue-calibration.yml` gave the calibration harness a runner, but

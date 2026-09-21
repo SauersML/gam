@@ -554,6 +554,13 @@ fn build_saved_marginal_slope_survival_alo_input(
             slope_exit_design.ncols(),
         ));
     }
+    // gam#2929: a saved local-empirical latent law carries its centres, grids,
+    // bandwidth and mixture rule, not its training rows' mixtures, so the ALO
+    // replay rebuilds each row's mixture from the same scaled conditioning
+    // columns prediction reads. `None` for every other law.
+    let local_law_conditioning =
+        gam_predict::input::build_marginal_slope_local_auxiliary_matrix(model, data, col_map)
+            .map_err(|error| error.to_string())?;
     let input = gam_predict::SavedMarginalSlopeSurvivalAloInput::new(
         event,
         latent_z,
@@ -569,6 +576,7 @@ fn build_saved_marginal_slope_survival_alo_input(
         slope_exit_design,
         slope_follow_up,
         slope_offset,
+        local_law_conditioning,
     )?;
     Ok(gam_predict::SavedModelAloInput::survival(
         gam_predict::SavedSurvivalAloInput::MarginalSlope(input),
