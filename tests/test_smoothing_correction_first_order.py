@@ -87,6 +87,13 @@ def test_six_smooth_glm_publishes_the_first_order_correction(family, tmp_path) -
 N_REP = 40
 N_TEST = 60
 GRID = np.linspace(0.02, 0.98, 25)
+NOMINAL = 0.95
+# Across-the-function coverage of Bayesian GAM intervals is nominal on average
+# over replicate data sets (Nychka 1988; Marra & Wood 2012), so the gate is on
+# the replicate mean against its own Monte-Carlo SE. At exactly nominal
+# coverage a |z| > 4 gate fails with probability 2(1 - Phi(4)) = 6.3e-5 per
+# assertion.
+Z_GATE = 4.0
 CELLS = {
     # family: (n, intercept, a1, a3, sigma)
     "gaussian": (200, 0.0, 1.0, 0.30, 1.0),
@@ -111,13 +118,33 @@ def _draw(family, mu, sigma, rng):
     return rng.poisson(mu).astype(float)
 
 
+def _replicate_mean_and_mcse(per_rep):
+    hits = np.asarray(per_rep, dtype=float)
+    return float(hits.mean()), float(hits.std(ddof=1) / np.sqrt(hits.size))
+
+
+def _assert_nominal_coverage(label, per_rep):
+    """Two-sided: over-coverage is a calibration failure too.
+
+    The smoothing correction ``J V_rho J^T`` is a Gram, so it can only add
+    variance. Its one way to be wrong is to add too much, which gives bands
+    that over-cover. A lower bar alone cannot see that.
+    """
+    cover, mcse = _replicate_mean_and_mcse(per_rep)
+    assert abs(cover - NOMINAL) <= Z_GATE * mcse, (
+        f"{label}: coverage {cover:.4f} is outside {NOMINAL} +/- {Z_GATE}*MCSE "
+        f"(MCSE {mcse:.4f} over {len(per_rep)} replicates)"
+    )
+
+
 @pytest.mark.parametrize("family", ["gaussian", "poisson", "binomial"])
 def test_corrected_intervals_cover_the_mean_and_partial_dependence(family) -> None:
     n, b0, a1, a3, sigma = CELLS[family]
     Xt = np.random.default_rng(12345).uniform(0.02, 0.98, (N_TEST, 3))
     mu_t = _inv_link(family, b0 + a1 * np.sin(TWO_PI * Xt[:, 0]) + a3 * np.cos(TWO_PI * Xt[:, 2]))
     test = {"x1": Xt[:, 0], "x2": Xt[:, 1], "x3": Xt[:, 2]}
-    mean_hits, pd_hits = [], []
+    mean_hits = []
+    pd_hits = {"x1": [], "x2": [], "x3": []}
     for rep in range(N_REP):
         rng = np.random.default_rng(1000 + rep)
         X = rng.uniform(0.0, 1.0, (n, 3))
@@ -139,11 +166,19 @@ def test_corrected_intervals_cover_the_mean_and_partial_dependence(family) -> No
             pd = model.partial_dependence(f"s({v})", grid=GRID)
             est = np.asarray(pd["predicted"], dtype=float)
             se = np.asarray(pd["standard_error"], dtype=float)
-            pd_hits.append(np.mean(np.abs(truth - est) <= Z95 * se))
-    mean_cover, pd_cover = float(np.mean(mean_hits)), float(np.mean(pd_hits))
-    # Across-the-function coverage of Bayesian GAM intervals is nominal on
-    # average (Nychka 1988; Marra & Wood 2012). With 40 replicates the
-    # replicate-level spread of a 95% average is ~0.01-0.02, so 0.90 fails
-    # only on a real loss of coverage.
-    assert mean_cover >= 0.90, (family, mean_cover)
-    assert pd_cover >= 0.90, (family, pd_cover)
+            pd_hits[v].append(np.mean(np.abs(truth - est) <= Z95 * se))
+    _assert_nominal_coverage(f"{family} mean", mean_hits)
+    # The two terms that carry signal are gated separately, so a shortfall in
+    # one cannot be averaged away against an excess in the other.
+    _assert_nominal_coverage(f"{family} s(x1)", pd_hits["x1"])
+    _assert_nominal_coverage(f"{family} s(x3)", pd_hits["x3"])
+    # s(x2) has truth identically zero, which lies in the double penalty's
+    # infinite-lambda limit. REML shrinks it there, where the band contains
+    # zero at every grid point by construction, so its coverage is 1 whenever
+    # the selection is right. Only a band that excludes the zero truth is a
+    # failure for this term.
+    null_cover, null_mcse = _replicate_mean_and_mcse(pd_hits["x2"])
+    assert null_cover >= NOMINAL - Z_GATE * null_mcse, (
+        f"{family} s(x2): band covers the zero truth at {null_cover:.4f} "
+        f"(MCSE {null_mcse:.4f})"
+    )

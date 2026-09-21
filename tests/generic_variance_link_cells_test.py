@@ -11,8 +11,9 @@ rejection inside the solver. These tests pin:
   maximum-likelihood fit, checked against an independent Fisher-scoring
   reference written here in numpy from the textbook ``V(mu)`` and ``mu(eta)``;
 * identity-Poisson, log-Gaussian, inverse-Gamma and log-binomial GAMs each
-  recover a smooth truth drawn from that cell, and their pointwise credible
-  bands cover the truth;
+  recover a smooth truth drawn from that cell, and over replicate data sets
+  their pointwise credible bands cover the truth at the nominal rate, neither
+  under nor over;
 * a likelihood whose maximum sits on the feasibility boundary is a typed
   error, not a clamped fit;
 * binomial + identity stays illegal, with the message that says what to write
@@ -154,30 +155,49 @@ _RECOVERY_CELLS = [
 ]
 
 
+_N_REP = 40
+_NOMINAL = 0.95
+# At exactly nominal coverage a |z| > 4 gate on the replicate mean fails with
+# probability 2(1 - Phi(4)) = 6.3e-5 per cell.
+_Z_GATE = 4.0
+
+
 @pytest.mark.parametrize(("family", "link", "truth", "phi", "n"), _RECOVERY_CELLS)
 def test_generic_cell_gam_recovers_truth_and_bands_cover_it(family, link, truth, phi, n) -> None:
-    rng = np.random.default_rng(101)
-    x = rng.uniform(0.0, 1.0, n)
-    y = _draw(rng, family, truth(x), phi)
-
-    model = gamfit.fit({"x": x, "y": y}, "y ~ s(x)", family=family, link=link)
-
     grid = np.linspace(0.02, 0.98, 97)
     mu_grid = truth(grid)
-    pred = model.predict({"x": grid}, interval=0.95)
-    fitted = np.asarray(pred["mean_plugin"], dtype=float).reshape(-1)
-    lower = np.asarray(pred["posterior_mean_lower"], dtype=float).reshape(-1)
-    upper = np.asarray(pred["posterior_mean_upper"], dtype=float).reshape(-1)
+    per_rep = []
+    for rep in range(_N_REP):
+        rng = np.random.default_rng(101 + rep)
+        x = rng.uniform(0.0, 1.0, n)
+        y = _draw(rng, family, truth(x), phi)
 
-    # The fit explains essentially all of the truth's variation.
-    explained = 1.0 - np.mean((fitted - mu_grid) ** 2) / np.var(mu_grid)
-    assert explained > 0.95, f"{family}/{link}: explained share {explained:.4f}"
+        model = gamfit.fit({"x": x, "y": y}, "y ~ s(x)", family=family, link=link)
 
-    # Bayesian credible bands have across-the-function coverage near nominal
-    # (Nychka 1988; Marra & Wood 2012); a band built on the wrong curvature
-    # or the wrong dispersion falls far short of it.
-    covered = np.mean((lower <= mu_grid) & (mu_grid <= upper))
-    assert covered >= 0.85, f"{family}/{link}: band covers {covered:.3f} of the truth"
+        pred = model.predict({"x": grid}, interval=0.95)
+        fitted = np.asarray(pred["mean_plugin"], dtype=float).reshape(-1)
+        lower = np.asarray(pred["posterior_mean_lower"], dtype=float).reshape(-1)
+        upper = np.asarray(pred["posterior_mean_upper"], dtype=float).reshape(-1)
+
+        # The fit explains essentially all of the truth's variation.
+        explained = 1.0 - np.mean((fitted - mu_grid) ** 2) / np.var(mu_grid)
+        assert explained > 0.95, f"{family}/{link} rep {rep}: explained share {explained:.4f}"
+
+        per_rep.append(np.mean((lower <= mu_grid) & (mu_grid <= upper)))
+
+    # Bayesian credible bands have across-the-function coverage that is
+    # nominal on average over replicate data sets (Nychka 1988; Marra & Wood
+    # 2012). The gate is two-sided on that replicate mean against its own
+    # Monte-Carlo SE. A band built on the wrong curvature or the wrong
+    # dispersion misses in either direction, and a band that is too wide
+    # over-covers, which a lower bar alone cannot see.
+    hits = np.asarray(per_rep, dtype=float)
+    cover = float(hits.mean())
+    mcse = float(hits.std(ddof=1) / np.sqrt(hits.size))
+    assert abs(cover - _NOMINAL) <= _Z_GATE * mcse, (
+        f"{family}/{link}: band coverage {cover:.4f} is outside {_NOMINAL} +/- "
+        f"{_Z_GATE}*MCSE (MCSE {mcse:.4f} over {hits.size} replicates)"
+    )
 
 
 def test_identity_poisson_optimum_on_the_feasibility_boundary_is_a_typed_error() -> None:
