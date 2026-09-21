@@ -52,7 +52,9 @@ use super::curl::{
     CurlVerdict, coalesce_antipodal, cooccurrence_pairs_sparse, curl_verdict,
     ring_permutation_evidence, orthonormal_pair_coords,
 };
-use super::pair_phase::ebh_reject;
+use gam_terms::inference::structure_evidence::{
+    e_benjamini_hochberg_in_family, e_bh_log_threshold,
+};
 
 /// One atom's per-row ambient image, supplied lazily.
 ///
@@ -278,6 +280,17 @@ pub fn census_shattered_circles(
             "curl census: sigma must be finite and > 0, got {sigma}"
         ));
     }
+    // The FDR level fixes the replicate budget `B + 1 = m/α` and every e-BH
+    // threshold `m/(α·k)`. Outside `(0, 1)` neither exists: `α = 0` asks for an
+    // unbounded budget, NaN collapses it to the floor, and `α ≥ 1` is no FDR
+    // control at all. Refuse up front instead of printing a census that looks
+    // like an absence of structure.
+    if !(cfg.fdr_alpha.is_finite() && cfg.fdr_alpha > 0.0 && cfg.fdr_alpha < 1.0) {
+        return Err(format!(
+            "curl census: fdr_alpha must be finite and lie in (0, 1), got {}",
+            cfg.fdr_alpha
+        ));
+    }
     if frames.len() < 2 {
         return Ok(CurlCensus {
             sigma,
@@ -323,19 +336,24 @@ pub fn census_shattered_circles(
         ids.iter().enumerate().map(|(i, a)| (*a, i)).collect();
     let signed_active: Vec<Vec<bool>> = signed.iter().map(|s| s.active.clone()).collect();
     let candidate_pairs = cooccurrence_pairs_sparse(&signed_active, cfg.min_cooccurrence);
-    // The derived budget: B + 1 = m/α, the smallest at which every e-BH rank is
-    // reachable and the largest that buys anything. See `null_replicates`.
+    // An explicit budget of one draw cannot form a permutation null at all.
+    if cfg.null_replicates == 1 {
+        return Err(
+            "curl census: null_replicates must be 0 (derived) or at least 2, got 1".to_string(),
+        );
+    }
+    // The derived budget: B + 1 is the smallest integer clearing the ledger's
+    // rank-1 threshold m/α, at which every e-BH rank is reachable and the largest
+    // that buys anything. See `null_replicates` and `derived_replicate_budget`.
     let replicates = if cfg.null_replicates > 0 {
         cfg.null_replicates
     } else {
-        ((candidate_pairs.len() as f64 / cfg.fdr_alpha).ceil() as usize)
-            .saturating_sub(1)
-            .max(2)
+        derived_replicate_budget(candidate_pairs.len(), cfg.fdr_alpha)
     };
 
     let out: Vec<CensusPair> = candidate_pairs
         .par_iter()
-        .filter_map(|&(si, sj, _count)| {
+        .filter_map(|&(si, sj, _count)| -> Option<Result<CensusPair, String>> {
             let di = &signed[si];
             let dj = &signed[sj];
             let mut co_fire: Vec<usize> = (0..n_rows)
@@ -406,8 +424,13 @@ pub fn census_shattered_circles(
                 let seed = (di.members[0] as u64)
                     .wrapping_mul(0x9E37_79B9_7F4A_7C15)
                     ^ (dj.members[0] as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-                ring_permutation_evidence(alpha.view(), beta.view(), replicates, seed | 1)
-                    .unwrap_or((1.0, 0.0, f64::NAN, f64::NAN, f64::NAN))
+                // A plane the screens accepted is a well-formed test input, so a
+                // failure here is a contract breach, not a refusal: surface it
+                // rather than recording it as the `e = 0` of a rejected plane.
+                match ring_permutation_evidence(alpha.view(), beta.view(), replicates, seed | 1) {
+                    Ok(evidence) => evidence,
+                    Err(err) => return Some(Err(format!("curl census: {err}"))),
+                }
             } else {
                 (1.0, 0.0, f64::NAN, f64::NAN, f64::NAN)
             };
@@ -423,7 +446,7 @@ pub fn census_shattered_circles(
             } else {
                 None
             };
-            Some(CensusPair {
+            Some(Ok(CensusPair {
                 members_a: di.members.clone(),
                 members_b: dj.members.clone(),
                 n_co_fire: n_eff as usize,
@@ -435,9 +458,9 @@ pub fn census_shattered_circles(
                 null_rho_sd,
                 fdr_discovery: false,
                 accepted_geometry,
-            })
+            }))
         })
-        .collect();
+        .collect::<Result<Vec<CensusPair>, String>>()?;
 
     // One e-BH ledger over the whole screened family. e-BH is valid under
     // ARBITRARY dependence between the pairs' e-values, which is the property this
@@ -448,7 +471,7 @@ pub fn census_shattered_circles(
     // hypothesis the search looked at, and carries `e = 0` into the ledger.
     let mut out = out;
     let e_values: Vec<f64> = out.iter().map(|p| p.e_value).collect();
-    let ledger = ebh_ledger(&e_values, candidate_pairs.len(), cfg.fdr_alpha);
+    let ledger = ebh_ledger(&e_values, candidate_pairs.len(), cfg.fdr_alpha)?;
     for &i in &ledger.rejected {
         out[i].fdr_discovery = true;
     }
@@ -485,24 +508,47 @@ struct CensusLedger {
     replicates_required: f64,
 }
 
+/// The derived permutation budget `B` for a family of `family` screened planes
+/// at FDR level `alpha` (see [`CurlCensusConfig::null_replicates`]).
+///
+/// A plane that beats every surrogate scores `e = B + 1`, and rank 1 of the
+/// ledger needs `e ≥ m/α`. So `B + 1` is the smallest integer that clears the
+/// rank-1 threshold, at least 3 so a null of `B ≥ 2` draws exists. The
+/// threshold is the one the ledger applies,
+/// [`e_bh_log_threshold`]`(m, α, 1) = ln m − ln α`. The linear quotient `m/α`
+/// is not used as the bar, because it and the log threshold round
+/// independently: at `m = 10, α = 0.05`, `⌈m/α⌉ = 200` while
+/// `ln 200 < ln 10 − ln 0.05` by one ulp, so a budget of `B = 199` can never
+/// reject, not even a lone perfect plane. The quotient is only the starting
+/// point. It is within rounding of `exp(ln m − ln α)`, and consecutive
+/// integers differ by `≈ 1/(B + 1)` in log, far above that rounding, so the
+/// step below runs at most once in practice. It is written as a loop so that
+/// no bound on the rounding is assumed.
+fn derived_replicate_budget(family: usize, alpha: f64) -> usize {
+    let rank_one = e_bh_log_threshold(family, alpha, 1);
+    let mut max_e = (family as f64 / alpha).ceil().max(3.0);
+    while max_e.ln() < rank_one {
+        max_e += 1.0;
+    }
+    max_e as usize - 1
+}
+
 /// Run e-BH at level `alpha` over a family of `family` hypotheses of which the
 /// first `adjudicated.len()` carry the given e-values and the rest carry `e = 0`
-/// (candidates the census generated but could not adjudicate). Padding with the
-/// valid e-value `0` is what keeps `m` the size of the search: dropping those
-/// candidates instead would shrink every threshold `m/(α·k)` to the survivors
-/// and let the ledger reject at a level the search never paid for.
-fn ebh_ledger(adjudicated: &[f64], family: usize, alpha: f64) -> CensusLedger {
-    assert!(
-        adjudicated.len() <= family,
-        "curl census: {} adjudicated e-values from a family of {family}",
-        adjudicated.len()
-    );
-    let mut e_values = adjudicated.to_vec();
-    e_values.resize(family, 0.0);
-    // A padded `e = 0` can never clear the positive threshold `m/(α·k)`, so every
-    // rejected index points into `adjudicated`.
-    let rejected = ebh_reject(&e_values, alpha);
-    let m = e_values.len() as f64;
+/// (candidates the census generated but could not adjudicate). Counting those
+/// candidates in `m` is what keeps the family the size of the search: dropping
+/// them would shrink every threshold `m/(α·k)` to the survivors and let the
+/// ledger reject at a level the search never paid for.
+///
+/// The rule itself is the crate-wide
+/// [`e_benjamini_hochberg_in_family`], which carries the unadjudicated members
+/// as exact zero e-values through `family_size` without materializing them and
+/// refuses a NaN e-value or an `alpha` outside `(0, 1)` rather than ranking it.
+fn ebh_ledger(adjudicated: &[f64], family: usize, alpha: f64) -> Result<CensusLedger, String> {
+    let log_e: Vec<f64> = adjudicated.iter().map(|&e| e.ln()).collect();
+    let rejected = e_benjamini_hochberg_in_family(&log_e, family, alpha)
+        .map_err(|err| format!("curl census e-BH ledger: {err}"))?;
+    let m = family as f64;
     let ebh_threshold = if rejected.is_empty() {
         f64::INFINITY
     } else {
@@ -514,12 +560,12 @@ fn ebh_ledger(adjudicated: &[f64], family: usize, alpha: f64) -> CensusLedger {
     } else {
         m / (alpha * n_max_e as f64) - 1.0
     };
-    CensusLedger {
+    Ok(CensusLedger {
         rejected,
         ebh_threshold,
         n_max_e,
         replicates_required,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -673,11 +719,11 @@ mod tests {
     /// make.
     #[test]
     fn unadjudicated_candidates_keep_their_place_in_the_ebh_family() {
-        let alone = ebh_ledger(&[20.0], 1, 0.05);
+        let alone = ebh_ledger(&[20.0], 1, 0.05).unwrap();
         assert_eq!(alone.rejected, vec![0]);
         assert_eq!(alone.ebh_threshold, 20.0);
 
-        let with_refused = ebh_ledger(&[20.0], 2, 0.05);
+        let with_refused = ebh_ledger(&[20.0], 2, 0.05).unwrap();
         assert!(
             with_refused.rejected.is_empty(),
             "a family of two needs e >= 40 at rank 1; got rejections {:?}",
@@ -686,6 +732,89 @@ mod tests {
         assert_eq!(with_refused.ebh_threshold, f64::INFINITY);
         assert_eq!(with_refused.n_max_e, 1);
         assert_eq!(with_refused.replicates_required, 2.0 / 0.05 - 1.0);
+    }
+
+    /// The derived budget's perfect plane must clear rank 1 of the ledger it
+    /// feeds, for every family size. The linear `⌈m/α⌉ − 1` fell one ulp short
+    /// of the log-space threshold at, among others, `m = 10, α = 0.05`
+    /// (`e = 200` against `ln 10 − ln 0.05 > ln 200`), so a lone planted circle
+    /// with a perfect permutation record could never be a discovery. The budget
+    /// is also minimal: one draw fewer cannot reach rank 1.
+    #[test]
+    fn derived_budget_lets_a_lone_perfect_plane_clear_rank_one() {
+        for alpha in [0.05, 0.1, 0.01, 0.2, 0.025] {
+            for family in 1..=3000 {
+                let replicates = derived_replicate_budget(family, alpha);
+                assert!(replicates >= 2);
+                let max_e = replicates as f64 + 1.0;
+                let mut e_values = vec![0.0; family];
+                e_values[family - 1] = max_e;
+                assert_eq!(
+                    ebh_ledger(&e_values, family, alpha).unwrap().rejected,
+                    vec![family - 1],
+                    "m = {family}, alpha = {alpha}: B = {replicates}"
+                );
+                if replicates > 2 {
+                    e_values[family - 1] = max_e - 1.0;
+                    assert!(
+                        ebh_ledger(&e_values, family, alpha)
+                            .unwrap()
+                            .rejected
+                            .is_empty(),
+                        "m = {family}, alpha = {alpha}: B = {replicates} is not minimal"
+                    );
+                }
+            }
+        }
+        assert_eq!(derived_replicate_budget(10, 0.05), 200);
+    }
+
+    /// One dominant e-value in a family of nulls is the only discovery; a flat
+    /// family of nulls makes none.
+    #[test]
+    fn ebh_ledger_rejects_only_the_dominant_e_value() {
+        let mut es = vec![1.0_f64; 20];
+        es[7] = 500.0;
+        assert_eq!(ebh_ledger(&es, 20, 0.05).unwrap().rejected, vec![7]);
+        assert!(
+            ebh_ledger(&[1.0; 20], 20, 0.05)
+                .unwrap()
+                .rejected
+                .is_empty()
+        );
+    }
+
+    /// A NaN e-value, an FDR level outside `(0, 1)`, or a family smaller than
+    /// its adjudicated members is a refusal, never a silent empty ledger.
+    #[test]
+    fn ebh_ledger_refuses_what_it_cannot_rank() {
+        assert!(ebh_ledger(&[f64::NAN, 30.0], 2, 0.05).is_err());
+        assert!(ebh_ledger(&[30.0], 1, 0.0).is_err());
+        assert!(ebh_ledger(&[30.0], 1, 1.0).is_err());
+        assert!(ebh_ledger(&[30.0, 30.0], 1, 0.05).is_err());
+    }
+
+    /// The census refuses an FDR level that fixes no replicate budget instead
+    /// of printing an empty census (`α = 0` would ask for `usize::MAX` draws).
+    #[test]
+    fn census_refuses_an_fdr_level_outside_the_unit_interval() {
+        let (dirs, coefs) = shattered_circle_frames(200, 8, 3.0, 0.05);
+        let frames = frames_from(&dirs, &coefs);
+        for alpha in [0.0, -0.1, 1.0, f64::NAN] {
+            let bad = CurlCensusConfig {
+                fdr_alpha: alpha,
+                ..cfg()
+            };
+            assert!(
+                census_shattered_circles(&frames, 200, 8, 0.05, &bad).is_err(),
+                "fdr_alpha = {alpha} must be refused"
+            );
+        }
+        let one_draw = CurlCensusConfig {
+            null_replicates: 1,
+            ..cfg()
+        };
+        assert!(census_shattered_circles(&frames, 200, 8, 0.05, &one_draw).is_err());
     }
 
     /// Without coalescing, the SAME shattered dictionary yields no accepted plane:

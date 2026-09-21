@@ -212,7 +212,6 @@ mod minimal_seed;
 mod oos_entry;
 mod oos_logit_seed;
 mod outer_objective;
-mod pair_phase;
 mod pca_seed;
 mod penalties;
 mod persistence;

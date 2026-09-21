@@ -636,17 +636,27 @@ pub fn e_benjamini_hochberg_in_family(
     }
     let mut order: Vec<usize> = (0..m).collect();
     order.sort_by(|&a, &b| log_e_values[b].total_cmp(&log_e_values[a]));
-    let m_f = family_size as f64;
     let mut k_star = 0usize;
     for (rank0, &idx) in order.iter().enumerate() {
-        let k = (rank0 + 1) as f64;
-        // e_(k) ≥ m / (α k)  ⟺  log e_(k) ≥ log m − log α − log k
-        if log_e_values[idx] >= m_f.ln() - alpha.ln() - k.ln() {
+        if log_e_values[idx] >= e_bh_log_threshold(family_size, alpha, rank0 + 1) {
             k_star = rank0 + 1;
         }
     }
     order.truncate(k_star);
     Ok(order)
+}
+
+/// The e-BH rank-`k` rejection threshold in log space, exactly as
+/// [`e_benjamini_hochberg_in_family`] evaluates it:
+/// `e_(k) ≥ m/(α·k)  ⟺  log e_(k) ≥ log m − log α − log k`.
+///
+/// This is the one owner of that arithmetic. A caller that sizes its evidence to
+/// reach a rank (a permutation budget whose maximal e-value must clear rank 1)
+/// has to measure against this rounded value, not against the linear quotient
+/// `m/(α·k)`: the two round independently, and an e-value that equals the
+/// quotient can fall one ulp short of the log threshold.
+pub fn e_bh_log_threshold(family_size: usize, alpha: f64, rank: usize) -> f64 {
+    (family_size as f64).ln() - alpha.ln() - (rank as f64).ln()
 }
 
 /// Per-claim e-BH verdict: the descending-`log_e` rank the rule used, the
@@ -681,11 +691,9 @@ pub fn e_bh_claim_verdicts(
     for (rank0, &idx) in order.iter().enumerate() {
         rank_of[idx] = rank0 + 1;
     }
-    let m_f = m as f64;
     Ok((0..m)
         .map(|i| {
-            // e_(k) ≥ m / (α k)  ⟺  log e_(k) ≥ log m − log α − log k
-            let threshold = m_f.ln() - alpha.ln() - (rank_of[i] as f64).ln();
+            let threshold = e_bh_log_threshold(m, alpha, rank_of[i]);
             EBhClaimVerdict {
                 rank: rank_of[i],
                 confirmed: confirmed.contains(&i),

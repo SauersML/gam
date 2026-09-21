@@ -12,9 +12,9 @@
 //!
 //! which is `O(n²)` with two transcendental calls in the inner body. That is a
 //! correct transform and a catastrophic cost: the surrogate is drawn ONCE PER
-//! MONTE-CARLO REPLICATE, and the phase-coupling screen
-//! ([`crate::manifold::pair_phase`]) draws `B` replicates per atom pair, so the
-//! quadratic term is multiplied by `B · pairs`. Measured consequence at
+//! MONTE-CARLO REPLICATE, and a phase-randomized null
+//! ([`crate::null_battery`]) draws `B` replicates per screened candidate, so the
+//! quadratic term is multiplied by `B · candidates`. Measured consequence at
 //! `n = 2000`, `B = 600`, 3 pairs: a single screen spends hours inside the
 //! transform. This is not an oversized fixture — the *statistic* is cheap and the
 //! sample sizes are ordinary — it is a quadratic algorithm standing where an
