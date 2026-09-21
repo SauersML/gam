@@ -354,6 +354,16 @@ pub(crate) fn compute_outer_hessian(
         ext_h_drifts.push(h_i);
     }
 
+    // Every direction the ρ-ρ, ρ-ext and ext-ext pair loops below will ask
+    // about, handed to the provider once before any of them runs (#4528). A
+    // provider whose `D²H[v_k, v_l]` has single-direction sub-blocks then
+    // builds each of them once per direction instead of once per pair; the
+    // values every pair reads are unchanged.
+    if effective_deriv.has_corrections() {
+        let pair_modes = v_ks.iter().chain(ext_v.iter()).collect::<Vec<_>>();
+        effective_deriv.prepare_pair_directions(&pair_modes)?;
+    }
+
     let fourth_trace_matrix =
         if incl_logdet_h && solution.penalty_subspace_trace.is_none() && adjoint_z_c.is_some() {
             match (glm_ingredients.as_ref(), leverage.as_ref()) {

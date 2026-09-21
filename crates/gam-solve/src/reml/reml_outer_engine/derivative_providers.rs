@@ -144,6 +144,34 @@ pub trait HessianDerivativeProvider: Send + Sync {
         false
     }
 
+    /// Hand the provider every first-order mode response the ρ-ρ pair loop will
+    /// ask about, once, before that loop starts (#4528).
+    ///
+    /// The pair hooks take opaque `(v_k, v_l, u_kl)` triples, so a provider
+    /// whose `D²H[v_k, v_l]` has sub-blocks depending on ONE of the two
+    /// directions rebuilds each of them once per pair: `K(K+1)/2` builds of `K`
+    /// distinct values. Given the direction list up front it builds them `K`
+    /// times and reads the same blocks in every pair. No pair value moves —
+    /// each block is a pure function of `(provider, direction)`, formed by the
+    /// same operations from the same inputs either way.
+    ///
+    /// Calling this is an optimization, never a precondition: a provider that
+    /// finds no prepared entry for a pair's directions builds them as before,
+    /// and a second call keeps the list the first one prepared.
+    fn prepare_pair_directions(&self, mode_responses: &[&Array1<f64>]) -> Result<(), String> {
+        // A provider that shares nothing between pairs checks only the contract
+        // every pair hook reads its responses under: they are vectors of one
+        // coefficient space.
+        let mut lengths = mode_responses.iter().map(|response| response.len());
+        let Some(first) = lengths.next() else {
+            return Ok(());
+        };
+        if lengths.any(|len| len != first) {
+            return Err("outer mode responses must share one coefficient dimension".to_string());
+        }
+        Ok(())
+    }
+
     /// The second-order corrections' logdet traces, contracted in the family's
     /// own row space (gam#2922).
     ///
@@ -461,9 +489,84 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
 pub(crate) struct FirthAwareGlmDerivatives {
     pub(crate) base: SinglePredictorGlmDerivatives,
     pub(crate) firth_op: std::sync::Arc<super::super::FirthDenseOperator>,
+    /// This assembly's direction list, filled once by
+    /// [`HessianDerivativeProvider::prepare_pair_directions`] and empty until
+    /// then (#4528).
+    pair_directions: std::sync::OnceLock<FirthPairDirections>,
+}
+
+/// One outer-Hessian assembly's mode responses and the parts of `D²H_φ` that
+/// depend on a single one of them.
+///
+/// `responses` is the caller's `v_1..v_K` in the caller's order, `dirs[i]` is
+/// `B_i = −v_i` as a direction, and `blocks` holds `P B_i` and `P_i B` for each
+/// `i` — four of the eleven O(n·r²·p) applies a pair pays, each of which has
+/// only `K` distinct values across the `K(K+1)/2` pairs (#1575, #4528).
+struct FirthPairDirections {
+    responses: Vec<Array1<f64>>,
+    dirs: Vec<super::super::FirthDirection>,
+    blocks: super::super::firth::FirthSecondDirEyeCache,
+}
+
+impl FirthAwareGlmDerivatives {
+    /// The Firth-aware provider over `base`, with no direction list prepared.
+    pub(crate) fn new(
+        base: SinglePredictorGlmDerivatives,
+        firth_op: std::sync::Arc<super::super::FirthDenseOperator>,
+    ) -> Self {
+        Self {
+            base,
+            firth_op,
+            pair_directions: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// `B_k = −v_k` as a direction: the mode response enters `H_φ` through
+    /// `δη_k = X·(−v_k)`. One owner for every site that builds it, so a
+    /// prepared direction and a freshly built one are the same bits.
+    fn direction_for(&self, v_k: &Array1<f64>) -> super::super::FirthDirection {
+        let deta_k: Array1<f64> =
+            gam_linalg::faer_ndarray::fast_av(&self.firth_op.x_dense, v_k).mapv(|v| -v);
+        self.firth_op.direction_from_deta(deta_k)
+    }
+
+    /// The prepared direction for `v`, if the caller handed `v` over. Matching
+    /// is on the response's own values: the direction is a pure function of
+    /// `(firth_op, v)`, so equal responses carry equal directions and blocks.
+    fn prepared_direction(&self, v: &Array1<f64>) -> Option<&super::super::FirthDirection> {
+        let prepared = self.pair_directions.get()?;
+        let index = prepared
+            .responses
+            .iter()
+            .position(|response| response == v)?;
+        Some(&prepared.dirs[index])
+    }
 }
 
 impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
+    fn prepare_pair_directions(&self, mode_responses: &[&Array1<f64>]) -> Result<(), String> {
+        if self.pair_directions.get().is_some() {
+            return Ok(());
+        }
+        let responses: Vec<Array1<f64>> = mode_responses
+            .iter()
+            .map(|response| (*response).clone())
+            .collect();
+        let dirs: Vec<super::super::FirthDirection> = responses
+            .iter()
+            .map(|response| self.direction_for(response))
+            .collect();
+        // The same per-direction build the TK exact path has used since #1575,
+        // here for the generic provider's pair loop.
+        let blocks = self.firth_op.tk_second_direction_eye_cache(&dirs);
+        self.pair_directions.get_or_init(|| FirthPairDirections {
+            responses,
+            dirs,
+            blocks,
+        });
+        Ok(())
+    }
+
     fn hessian_derivative_correction(
         &self,
         v_k: &Array1<f64>,
@@ -471,11 +574,13 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
         // Base GLM correction: −Xᵀ diag(c ⊙ X vₖ) X
         let base_corr = self.base.hessian_derivative_correction(v_k)?;
 
-        // Firth correction: −D(Hφ)[B_k] where B_k = −v_k, δη_k = X·(−v_k).
-        let deta_k: Array1<f64> =
-            gam_linalg::faer_ndarray::fast_av(&self.firth_op.x_dense, v_k).mapv(|v| -v);
-        let dir_k = self.firth_op.direction_from_deta(deta_k);
-        let firth_corr = self.firth_op.hphi_direction(&dir_k);
+        // Firth correction: −D(Hφ)[B_k] where B_k = −v_k, δη_k = X·(−v_k). The
+        // direction comes from the prepared list when the caller handed this
+        // response over, and is built here otherwise (#4528).
+        let firth_corr = match self.prepared_direction(v_k) {
+            Some(dir_k) => self.firth_op.hphi_direction(dir_k),
+            None => self.firth_op.hphi_direction(&self.direction_for(v_k)),
+        };
 
         match base_corr {
             Some(mut bc) => {
@@ -502,15 +607,37 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
         let dir_kl = self.firth_op.direction_from_deta(deta_kl);
         let firth_first = self.firth_op.hphi_direction(&dir_kl);
 
-        // Firth D²(Hφ)[B_k, B_l]: second directional derivative.
-        let deta_k: Array1<f64> =
-            gam_linalg::faer_ndarray::fast_av(&self.firth_op.x_dense, v_k).mapv(|v| -v);
-        let dir_k = self.firth_op.direction_from_deta(deta_k);
-        let deta_l: Array1<f64> =
-            gam_linalg::faer_ndarray::fast_av(&self.firth_op.x_dense, v_l).mapv(|v| -v);
-        let dir_l = self.firth_op.direction_from_deta(deta_l);
+        // Firth D²(Hφ)[B_k, B_l]: second directional derivative. Four of its
+        // nine reduced Hadamard-Gram applies (P B_k, P B_l, P_k B, P_l B)
+        // depend on ONE of the two directions, so they are read from the
+        // prepared list wherever the caller handed both responses over: K
+        // builds across the whole pair loop instead of 4·K(K+1)/2. The pair
+        // value is assembled by the same
+        // `hphisecond_direction_from_single_index_blocks` either way, so it is
+        // bit-identical to the per-pair build (#4528, #1575).
         let p = v_k.len();
-        let firth_second = self.firth_op.hphisecond_direction(&dir_k, &dir_l);
+        let prepared_second = self.pair_directions.get().and_then(|prepared| {
+            let k_index = prepared
+                .responses
+                .iter()
+                .position(|response| response == v_k)?;
+            let l_index = prepared
+                .responses
+                .iter()
+                .position(|response| response == v_l)?;
+            Some(self.firth_op.hphisecond_direction_apply_eye_cached(
+                &prepared.blocks,
+                &prepared.dirs,
+                k_index,
+                l_index,
+            ))
+        });
+        let firth_second = match prepared_second {
+            Some(second) => second,
+            None => self
+                .firth_op
+                .hphisecond_direction(&self.direction_for(v_k), &self.direction_for(v_l)),
+        };
 
         let mut result = match base_corr {
             Some(bc) => bc,
@@ -533,10 +660,10 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
     ) -> Result<Option<DriftDerivResult>, String> {
         let base = self.base.hessian_derivative_correction_result(v_k)?;
 
-        let deta_k: Array1<f64> =
-            gam_linalg::faer_ndarray::fast_av(&self.firth_op.x_dense, v_k).mapv(|v| -v);
-        let dir_k = self.firth_op.direction_from_deta(deta_k);
-        let neg_firth_corr = -self.firth_op.hphi_direction(&dir_k);
+        let neg_firth_corr = match self.prepared_direction(v_k) {
+            Some(dir_k) => -self.firth_op.hphi_direction(dir_k),
+            None => -self.firth_op.hphi_direction(&self.direction_for(v_k)),
+        };
 
         match base {
             Some(DriftDerivResult::Operator(operator)) => Ok(Some(DriftDerivResult::Operator(

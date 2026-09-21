@@ -42,6 +42,20 @@
   A new test pins the returned value against exact one-dimensional quadrature.
   **Behavior change:** gate evidence is lower by about `K·m·log 2`, so the
   `K` vs `K+1` split-LR resists births it used to accept.
+- **The outer ρ-Hessian builds each Firth single-direction block once per direction, not once per pair** (#4528).
+  `FirthAwareGlmDerivatives::hessian_second_derivative_correction` rebuilt `dir_k`,
+  `dir_l` and the four single-index sub-blocks of `D²H_φ[u, v]` (`P B_u`, `P B_v`,
+  `P_u B`, `P_v B`) inside every one of the `K(K+1)/2` ρ-pairs, although each has only
+  `K` distinct values; the batched hook could not help, because it hands the provider
+  cloned vectors rather than the direction list. `HessianDerivativeProvider` gains
+  `prepare_pair_directions`, which the two full-space Hessian callers invoke once with
+  the mode responses before their pair loops. The Firth provider builds the directions
+  and their blocks there, through the same `tk_second_direction_eye_cache` the TK exact
+  path has used since #1575, and every pair reads them. Numbers do not move: each pair
+  is still assembled by `hphisecond_direction_from_single_index_blocks` from blocks
+  formed by the same operations on the same inputs, and a pair whose directions were
+  not prepared builds them as before.
+
 - **Warm-start lookup cache rows belong to one store root and see sibling writes** (#3882, #3885).
   The process-global lookup cache was keyed by fingerprint alone, so a second
   `WarmStartStore` on a different root returned, touched and could TTL-expire the

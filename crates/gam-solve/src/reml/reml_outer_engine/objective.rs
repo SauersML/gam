@@ -2205,6 +2205,13 @@ fn cone_normalizer_outer_hessian(
     let total = mode_responses.len();
     let y = normalizer.solved_gradient();
     let mode_rhs_correction = effective_deriv.mode_response_rhs_correction();
+    // Every direction the pair loop below asks about, handed over once before it
+    // runs, so a provider with single-direction sub-blocks of `D²H` builds each
+    // of them once per direction instead of once per pair (#4528). The pair
+    // values are unchanged.
+    if effective_deriv.has_corrections() {
+        effective_deriv.prepare_pair_directions(mode_responses)?;
+    }
     // The family's fixed-β pair objects, fetched across the pool as the dense Hessian fetches its
     // own; the solution memoizes them, so the log-determinant's Hessian reads these same objects.
     let pair_indices: Vec<(usize, usize, usize, usize)> = (0..total)

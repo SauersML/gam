@@ -698,10 +698,9 @@ impl<'a> RemlState<'a> {
                 };
                 if firth_active_for_derivs {
                     if let Some(firth_op) = firth_op.clone() {
-                        Box::new(super::reml_outer_engine::FirthAwareGlmDerivatives {
-                            base,
-                            firth_op,
-                        })
+                        Box::new(super::reml_outer_engine::FirthAwareGlmDerivatives::new(
+                            base, firth_op,
+                        ))
                     } else {
                         Box::new(base)
                     }
@@ -842,7 +841,7 @@ impl<'a> RemlState<'a> {
                     // -D(H_phi)[B_k]. The sparse backend differs only in how
                     // B_k = H^{-1} rhs is solved.
                     if let Some(firth_op) = firth_op.clone() {
-                        Box::new(FirthAwareGlmDerivatives { base, firth_op })
+                        Box::new(FirthAwareGlmDerivatives::new(base, firth_op))
                     } else {
                         Box::new(base)
                     }
