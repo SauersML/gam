@@ -27,6 +27,7 @@ mod negbin_theta_joint_certificate_3349;
 mod null_rail_outer_certify;
 mod production_row_program_policy;
 mod standard_reml_outer_search_2817;
+mod survival_summary_block_offsets_3568;
 mod two_level_label_response_and_row_floor;
 mod warm_start_from;
 mod weibull_survival_summary_3297;
