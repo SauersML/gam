@@ -8464,32 +8464,44 @@ fn alternative_shard_log_lik(
     let (sse, count) = residual_sse(&fitted, &shard.target, &shard.rows)?;
     let reconstruction = gaussian_log_lik(sse, count, sigma2)?;
 
-    // Occam-priced gate-block evidence (#1016/#1218). The split-LR difference
-    // this gate forms is between the K+1 candidate (alternative) and the K null.
-    // The gate/assignment-logit block is the weakest-Gaussian piece of the SAE
-    // evidence, and a plain Laplace quadratic misprices it near a birth. The
-    // deterministic Pólya–Gamma gate-block marginal supplies the correct
-    // normalizer. Its `−½·d_g·log(2π)` term scales with the gate dimension `d_g`
-    // (one coordinate per atom). The candidate carries one more gate coordinate
-    // than the null, so that normalizer does NOT cancel in the K-vs-(K+1)
-    // difference: it is exactly the per-coordinate `log(2π)` Occam term #1218
-    // corrects the sign of. The null side adds its own per-shard gate block (see
-    // the null closure in [`run_structure_search_rounds`]).
+    // Occam-priced gate-block evidence (#1016/#1218/#3518). The split-LR
+    // difference this gate forms is between the K+1 candidate (alternative) and
+    // the K null. The gate/assignment-logit block is the weakest-Gaussian piece
+    // of the SAE evidence, and a plain Laplace quadratic misprices it near a
+    // birth. The deterministic Pólya–Gamma gate-block marginal supplies the
+    // block's own log-probability, so the K-dependent part of this term is the
+    // extra atom's gate marginal itself and nothing else. The `2π` of the
+    // Gaussian integral is not an Occam charge: it is cancelled by the gate
+    // prior's own normalizer inside `pg_gate_evidence` (#3518). The null side
+    // adds its own per-shard gate block (see the null closure in
+    // [`run_structure_search_rounds`]).
     Ok(reconstruction + gate_block_log_evidence(term, shard)?)
 }
 
 /// The deterministic Pólya–Gamma gate-block marginal log-evidence of the
-/// candidate's per-atom logistic gates on a shard's held-out rows (#1016/#1218).
+/// candidate's per-atom logistic gates on a shard's held-out rows
+/// (#1016/#1218/#3518).
 ///
 /// Each atom carries one free per-atom gate logit, so the gate block is a stack
 /// of `K` one-dimensional logistic gates: design `X_g = 1` (the per-atom gate
-/// coordinate), tilt `ψ̂ =` the atom's per-row logit, binomial response `y =`
-/// the binarized activation (`b = 1`), under a unit ridge gate prior. The
-/// returned value is the log-evidence `−neg_log_evidence` from
-/// `gam_inference::pg_gate_evidence::pg_gate_evidence`, summed over atoms,
-/// so the K-dependent `−½·d_g·log(2π)` normalizer enters the gate's split-LR.
+/// coordinate), binomial response `y =` the binarized activation (`b = 1`),
+/// under a unit ridge gate prior `S_g = I₁`. The returned value is the
+/// log-evidence `−neg_log_evidence` from
+/// `gam_inference::pg_gate_evidence::pg_gate_evidence`, summed over atoms.
 ///
-/// An undefined or non-PD gate block is a fit failure. It cannot be omitted
+/// The sum is read absolutely — it is added to the shard's reconstruction
+/// log-likelihood and fed to the K vs K+1 split-LR — so every constant of the
+/// marginal has to be in it. `pg_gate_evidence` returns the marginal itself:
+/// the `2^{−Σb}` PSW prefactor and the gate prior's normalizer included. Before
+/// #3518 both were dropped, which handed every atom a spurious `m·log 2 +
+/// ½·log(2π)` of evidence on a shard of `m` rows and biased the search toward
+/// births.
+///
+/// No per-row tilt is passed. The block's model is a single shared gate
+/// coordinate `ψ_i = γ`, so the atom's per-row logit is not that block's
+/// conditional mode and is not a valid expansion point for the PG law (#3518).
+///
+/// An undefined or improper gate block is a fit failure. It cannot be omitted
 /// without changing the model-selection scalar, so the error is propagated.
 fn gate_block_log_evidence(term: &SaeManifoldTerm, shard: &RowBlockShard) -> Result<f64, String> {
     use gam_solve::inference::pg_gate_evidence::{GateBlock, pg_gate_evidence};
@@ -8514,14 +8526,14 @@ fn gate_block_log_evidence(term: &SaeManifoldTerm, shard: &RowBlockShard) -> Res
     }
 
     // Unit gate design (one gate coordinate per atom) and a unit ridge gate
-    // prior; the PG block is solved per atom and summed, so `d_g = K` overall.
+    // prior `N(0, 1)`; the PG block is solved per atom and summed, so `d_g = K`
+    // overall.
     let design = Array2::<f64>::ones((m, 1));
     let b = Array1::<f64>::ones(m);
-    let penalty = Array2::<f64>::eye(1);
+    let prior = Array2::<f64>::eye(1);
 
     let mut total = 0.0_f64;
     for atom in 0..k {
-        let mut psi = Array1::<f64>::zeros(m);
         let mut y = Array1::<f64>::zeros(m);
         for (i, &row) in rows.iter().enumerate() {
             let logit = logits[[row, atom]];
@@ -8530,7 +8542,6 @@ fn gate_block_log_evidence(term: &SaeManifoldTerm, shard: &RowBlockShard) -> Res
                     "gate-block evidence encountered non-finite logit at row {row}, atom {atom}"
                 ));
             }
-            psi[i] = logit;
             // Binarized activation: the gate is ON when its logit is positive.
             y[i] = if logit > 0.0 { 1.0 } else { 0.0 };
         }
@@ -8539,8 +8550,7 @@ fn gate_block_log_evidence(term: &SaeManifoldTerm, shard: &RowBlockShard) -> Res
             y: y.view(),
             b: b.view(),
             offset: None,
-            psi_hat: Some(psi.view()),
-            penalty: Some(penalty.view()),
+            prior_precision: prior.view(),
             hess_rest: None,
             h_rest: None,
         };

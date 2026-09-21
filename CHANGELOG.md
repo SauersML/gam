@@ -23,6 +23,25 @@
   effective support before the race, so likelihood, penalty and floor count the
   same rows and the verdict is invariant to the gate unit. Hard 0/1 support has
   `mass == ess`, so its unweighted verdicts are unchanged.
+- **The PG gate block returns its marginal, not a value "up to a constant"** (#3518).
+  `pg_gate_evidence` dropped the PSW prefactor `2^{−Σb}` and the gate prior's
+  normalizer, and expanded the `ω` integral under the tilted law `PG(b, ψ̂)`
+  without its Radon–Nikodym factor. Its only production consumer, the SAE
+  structure search's `gate_block_log_evidence`, reads the value absolutely and
+  sums it over the `K` atoms, so every atom collected a spurious
+  `m·log 2 + ½·log(2π)` of evidence on a shard of `m` rows: a birth bonus that
+  grew with `K` and with the shard, and that made the returned *log*-evidence
+  positive, which no binomial likelihood can be. The module now carries
+  `Σ b_i log 2`, the offset constants and the prior normalizer; the Gaussian
+  integral's `−½·d_g·log(2π)` is cancelled by the prior's `+½·d_g·log(2π)`, so
+  it is not a `K`-dependent Occam charge and the consumer no longer claims it
+  is. `GateBlock::penalty` becomes `prior_precision` and is required: it is the
+  gate prior `N(0, S_g⁻¹)`, and an improper `S_g` has no marginal and is
+  refused. `GateBlock::psi_hat` is deleted, because the per-row gate logit is
+  not the conditional mode of a block whose model is one shared coordinate.
+  A new test pins the returned value against exact one-dimensional quadrature.
+  **Behavior change:** gate evidence is lower by about `K·m·log 2`, so the
+  `K` vs `K+1` split-LR resists births it used to accept.
 - **Warm-start lookup cache rows belong to one store root and see sibling writes** (#3882, #3885).
   The process-global lookup cache was keyed by fingerprint alone, so a second
   `WarmStartStore` on a different root returned, touched and could TTL-expire the

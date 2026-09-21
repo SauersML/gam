@@ -2426,20 +2426,23 @@ fn birth_topology_race_d2_is_undecided_on_an_interpolated_target() {
     );
 }
 
-/// #1218 PRODUCTION-GATE wiring proof: the corrected PG gate-block
+/// #1218/#3518 PRODUCTION-GATE wiring proof: the corrected PG gate-block
 /// normalizer is consumed by the live per-shard likelihood the K-vs-(K+1)
 /// birth gate forms its split-LR from — not just by the isolated unit test.
 ///
 /// `alternative_shard_log_lik` is the exact `alternative_log_lik` closure
 /// `run_atom_birth_gate` accumulates, and the null closure adds the same
 /// gate block for the null state (see [`run_structure_search_rounds`]). So it
-/// is the production gate's evaluation statistic. We score the SAME
-/// shard under a K-atom null and a (K+1)-atom candidate and isolate the
-/// gate-block contribution: growing the dictionary by one atom adds exactly
-/// one gate coordinate, so the `−½·d_g·log(2π)` normalizer (the term #1218
-/// fixed the sign of) does NOT cancel in the gate difference. With the
-/// corrected (subtracted) sign it is an Occam PENALTY that resists the
-/// extra atom; the buggy (added) sign would flip it into a spurious REWARD.
+/// is the production gate's evaluation statistic. We score the SAME shard
+/// under a K-atom null and a (K+1)-atom candidate.
+///
+/// The statistic is read absolutely, so the gate block's own scale is the
+/// thing to pin: it is a sum of `K` logistic-block log-marginals, each of them
+/// the log of a probability, so the sum is at most zero whatever the atoms do.
+/// Before #3518 the module dropped the `2^{−Σb}` PSW prefactor and mistook the
+/// Gaussian integral's `2π` for a per-coordinate Occam charge, and this shard
+/// scored `+K·(m·log 2 + ½·log 2π) ≈ +46` nats of gate evidence instead — a
+/// birth bonus that grew with `K` and with the shard.
 #[test]
 fn production_gate_consumes_corrected_pg_normalizer() {
     let n = 32usize;
@@ -2465,44 +2468,34 @@ fn production_gate_consumes_corrected_pg_normalizer() {
     // reachable here.
     let null_gate = gate_block_log_evidence(&null_term, &shard).unwrap();
     let cand_gate = gate_block_log_evidence(&cand_term, &shard).unwrap();
+    println!(
+        "[#3518] shard gate log-evidence over {n} rows: null (K=2) {null_gate:.6}, candidate \
+         (K=3) {cand_gate:.6}; the constants #3518 restored are {:.6} per atom",
+        n as f64 * std::f64::consts::LN_2 + 0.5 * (2.0 * std::f64::consts::PI).ln()
+    );
     assert!(
         null_gate.is_finite() && cand_gate.is_finite(),
         "gate-block evidence must be finite on a well-posed gate block"
     );
 
-    // The Occam normalizer per added gate coordinate. The candidate carries
-    // K+1 gate coordinates, the null K, so the gate-difference includes one
-    // extra `−½·log(2π)` normalizer that must NOT cancel.
-    let log_2pi = (2.0 * std::f64::consts::PI).ln();
-    let gate_delta = cand_gate - null_gate;
-
-    // Corrected sign ⇒ the per-coordinate normalizer SUBTRACTS, so the
-    // extra atom's gate-block log-evidence is pushed DOWN by ≈ ½·log(2π)
-    // relative to a no-normalizer baseline. The decisive, sign-sensitive
-    // assertion: the extra-coordinate normalizer is the *negative*
-    // ½·log(2π) Occam term, never the positive (buggy) one. Compare against
-    // the per-atom evidence WITHOUT the normalizer to isolate it.
-    let per_atom_no_norm = |term: &SaeManifoldTerm| -> f64 {
-        // Re-derive the gate evidence with the normalizer ADDED back (the
-        // pre-fix sign) to recover the unnormalized quadratic/logdet part.
-        // `gate_block_log_evidence` already SUBTRACTS ½·d_g·log(2π); adding
-        // it back yields the normalizer-free score, and the difference
-        // between candidate and null of THAT isolates everything except the
-        // one extra normalizer.
-        let dg = term.k_atoms() as f64; // one gate coordinate per atom
-        gate_block_log_evidence(term, &shard).unwrap() + 0.5 * dg * log_2pi
-    };
-    let no_norm_delta = per_atom_no_norm(&cand_term) - per_atom_no_norm(&null_term);
-    let normalizer_in_delta = gate_delta - no_norm_delta;
-
-    // The normalizer contribution to the K→K+1 gate difference must be
-    // exactly `−½·log(2π)` (one extra gate coordinate, corrected sign).
+    // Each atom contributes the log-marginal of its own one-coordinate
+    // logistic gate: `log ∫ Π σ(γ)^{y_i}(1−σ(γ))^{1−y_i} N(γ; 0, 1) dγ`, a
+    // log-probability. The sum over atoms is therefore at most zero, and the
+    // expansion's truncation on a 32-row block is five orders below the
+    // values themselves, so the bar is zero with no allowance.
+    for (label, value) in [("null", null_gate), ("candidate", cand_gate)] {
+        assert!(
+            value <= 0.0,
+            "the {label} shard's gate evidence is a sum of log-probabilities, so it cannot be \
+             positive: {value}"
+        );
+    }
+    // Non-vacuity: the gate block is live on this shard, not an all-zero term
+    // that would satisfy the bar by carrying no evidence at all. Every atom's
+    // block has `m = 32` rows under a unit prior, so each is well below −1.
     assert!(
-        (normalizer_in_delta + 0.5 * log_2pi).abs() < 1e-9,
-        "the gate-block normalizer in the K→K+1 difference must be the \
-         corrected −½·log(2π) Occam penalty, got {normalizer_in_delta} \
-         (buggy +½·log(2π) = {})",
-        0.5 * log_2pi
+        cand_gate < -1.0 && null_gate < -1.0,
+        "the gate blocks carry no evidence on this shard: null {null_gate}, candidate {cand_gate}"
     );
 
     // And the full production statistic carries it: the gate-block evidence
