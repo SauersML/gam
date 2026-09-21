@@ -11,6 +11,7 @@ use gam_linalg::roundoff::SymmetricAssembly;
 use gam_math::sparse_grid::CompensatedSum;
 use gam_problem::OrderedRhoBounds;
 use gam_problem::dispersion_cov::se_from_covariance;
+use gam_problem::{NegbinRootDisplacementGap, NegbinThetaRootDisplacement};
 use gam_terms::inference::smooth_score_test::WorkingResidual;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -460,41 +461,54 @@ fn negbin_theta_root_rho_gain(
     gain.is_finite().then_some(gain)
 }
 
-/// The resolution the joint certificate can demand of the theta residual.
+/// The score's own accumulation band carried into the log-theta Newton
+/// displacement, `θ·band / c`: the resolution below which
+/// [`negbin_theta_stationarity_residual`] cannot see.
 ///
-/// The score's own rounding band carried into the log-theta Newton
-/// displacement (`θ·band / c`, what [`negbin_theta_stationarity_residual`]
-/// cannot see below), plus `root_displacement`: how far the theta root can
-/// still sit from where the mode puts it, given the bands the rho and beta
-/// certificates leave that mode in (see [`negbin_theta_root_sensitivity`] and
-/// [`negbin_theta_root_rho_gain`]). Theta is re-solved at the mode the rho
-/// search hands it, so demanding more than those certificates pin the mode to
-/// would make an accurate joint point uncertifiable (#3349). A displacement
-/// that could not be derived is passed as zero and grants nothing.
-fn negbin_theta_joint_bound(
-    theta: f64,
-    profile: &pirls::NegbinThetaScore,
-    root_displacement: f64,
-) -> f64 {
+/// `None` when the log-theta curvature `c = θ²·info − θ·score` is not finite
+/// and positive, or the score band is not finite and non-negative. There is
+/// then no displacement for the band to carry into, and no resolution to judge
+/// the residual at — which is a refusal, not a zero (#4560).
+fn negbin_theta_score_rounding_band(theta: f64, profile: &pirls::NegbinThetaScore) -> Option<f64> {
     let pirls::NegbinThetaScore { score, info, band } = *profile;
     let curvature = theta * theta * info - theta * score;
-    let rounding = if theta.is_finite()
+    (theta.is_finite()
         && theta > 0.0
         && band.is_finite()
         && band >= 0.0
         && curvature.is_finite()
-        && curvature > 0.0
-    {
-        theta * band / curvature
-    } else {
-        0.0
-    };
-    let displacement = if root_displacement.is_finite() && root_displacement > 0.0 {
-        root_displacement
-    } else {
-        0.0
-    };
-    rounding + displacement
+        && curvature > 0.0)
+        .then(|| theta * band / curvature)
+}
+
+/// The resolution the joint certificate can demand of the theta residual, or
+/// the component of it that could not be derived.
+///
+/// It is [`negbin_theta_score_rounding_band`] plus `root_displacement`: how far
+/// the theta root can still sit from where the mode puts it, given the bands
+/// the rho and beta certificates leave that mode in (see
+/// [`negbin_theta_root_sensitivity`] and [`negbin_theta_root_rho_gain`]). Theta
+/// is re-solved at the mode the rho search hands it, so demanding more than
+/// those certificates pin the mode to would make an accurate joint point
+/// uncertifiable (#3349).
+///
+/// Neither half is priced at zero when it cannot be derived (#4560). A zero
+/// there is not a conservative default: it shrinks the resolution the
+/// certificate demands, so the round refuses a point it has no evidence
+/// against, and every caller downstream sees a bound that looks measured. The
+/// missing component is returned by name instead, and the refusal carries it.
+fn negbin_theta_joint_bound(
+    theta: f64,
+    profile: &pirls::NegbinThetaScore,
+    root_displacement: Result<f64, NegbinRootDisplacementGap>,
+) -> Result<f64, NegbinRootDisplacementGap> {
+    let rounding = negbin_theta_score_rounding_band(theta, profile)
+        .ok_or(NegbinRootDisplacementGap::ScoreRoundingBand)?;
+    let displacement = root_displacement?;
+    if !(displacement.is_finite() && displacement >= 0.0) {
+        return Err(NegbinRootDisplacementGap::NonFiniteDisplacement);
+    }
+    Ok(rounding + displacement)
 }
 
 /// Whether the point a fit is about to ship IS the point the outer certificate
@@ -552,7 +566,11 @@ struct NegbinJointCheckpoint {
     rho_residual: f64,
     rho_bound: f64,
     theta_residual: f64,
-    theta_bound: f64,
+    /// The score's own rounding band, or the reason it has none.
+    theta_score_rounding_band: Result<f64, NegbinRootDisplacementGap>,
+    /// The root displacement beside it, or the component that was missing
+    /// ([`negbin_theta_joint_bound`], #4560).
+    theta_root_displacement: Result<f64, NegbinRootDisplacementGap>,
 }
 
 /// The square matrices the first-order smoothing correction's assembly holds
@@ -2314,64 +2332,69 @@ where
             // score's own rounding band (#3349), not a literal outer tolerance.
             let log_theta_curvature =
                 theta * theta * theta_profile.info - theta * theta_profile.score;
-            let root_sensitivity =
-                pirls::negbin_theta_score_eta_gradient(y_o.view(), &final_eta, w_o.view(), theta)
-                    .ok()
-                    .and_then(|score_eta_gradient| {
-                        negbin_theta_root_sensitivity(
-                            &reml_state,
-                            &pirls_res,
-                            &final_rho,
-                            &score_eta_gradient,
-                            theta,
-                            log_theta_curvature,
-                        )
-                    });
-            let theta_root_displacement = root_sensitivity.as_ref().map_or(0.0, |sensitivity| {
-                // The inner certificate accepts `‖r‖ < tol · natural scale`.
-                let mode_band = pirls_res.final_kkt_tolerance.map_or(0.0, |tolerance| {
-                    tolerance * pirls_res.gradient_natural_scale
-                });
-                let mode_displacement = sensitivity.mode_gain * mode_band;
-                let rho_gain = if final_rho.is_empty() {
-                    Some(0.0)
-                } else {
-                    match joint_eval.hessian.materialize_dense() {
-                        Ok(Some(hessian)) => {
-                            let railed = outer_result
-                                .criterion_certificate
-                                .as_ref()
-                                .map(|certificate| certificate.lambdas_railed.clone())
-                                .unwrap_or_default();
-                            let invariance = reml_state.criterion_invariant_directions(&final_rho);
-                            let judged = crate::penalty_invariance::judged_subspace_basis(
-                                final_rho.len(),
-                                &railed,
-                                invariance.as_ref(),
-                            );
-                            negbin_theta_root_rho_gain(
-                                &hessian,
-                                judged.as_ref(),
-                                &sensitivity.rho_gradient,
-                            )
-                        }
-                        Ok(None) => None,
-                        Err(error) => {
-                            log::debug!(
-                                "[OUTER] negative-binomial joint certificate: rho Hessian \
-                                 unavailable for the theta root gain ({error:?})"
-                            );
-                            None
-                        }
-                    }
+            // Each piece the displacement is assembled from either exists or
+            // names itself; none of them is worth zero (#4560).
+            let theta_root_displacement = (|| -> Result<f64, NegbinRootDisplacementGap> {
+                let score_eta_gradient = match pirls::negbin_theta_score_eta_gradient(
+                    y_o.view(),
+                    &final_eta,
+                    w_o.view(),
+                    theta,
+                ) {
+                    Ok(gradient) => gradient,
+                    Err(_) => return Err(NegbinRootDisplacementGap::ScoreEtaGradient),
                 };
-                let rho_displacement = rho_gain.map_or(0.0, |gain| gain * rho_bound);
-                if mode_displacement.is_finite() && rho_displacement.is_finite() {
-                    mode_displacement + rho_displacement
-                } else {
+                let sensitivity = negbin_theta_root_sensitivity(
+                    &reml_state,
+                    &pirls_res,
+                    &final_rho,
+                    &score_eta_gradient,
+                    theta,
+                    log_theta_curvature,
+                )
+                .ok_or(NegbinRootDisplacementGap::RootSensitivity)?;
+                // The inner certificate accepts `‖r‖ < tol · natural scale`.
+                let tolerance = pirls_res
+                    .final_kkt_tolerance
+                    .ok_or(NegbinRootDisplacementGap::InnerKktTolerance)?;
+                let mode_displacement =
+                    sensitivity.mode_gain * tolerance * pirls_res.gradient_natural_scale;
+                let rho_displacement = if final_rho.is_empty() {
+                    // No rho coordinate can move the root.
                     0.0
+                } else {
+                    let hessian = match joint_eval.hessian.materialize_dense() {
+                        Ok(Some(hessian)) => hessian,
+                        Ok(None) | Err(_) => {
+                            return Err(NegbinRootDisplacementGap::RhoCurvature);
+                        }
+                    };
+                    let railed = outer_result
+                        .criterion_certificate
+                        .as_ref()
+                        .map(|certificate| certificate.lambdas_railed.clone())
+                        .unwrap_or_default();
+                    let invariance = reml_state.criterion_invariant_directions(&final_rho);
+                    let judged = crate::penalty_invariance::judged_subspace_basis(
+                        final_rho.len(),
+                        &railed,
+                        invariance.as_ref(),
+                    );
+                    let gain = negbin_theta_root_rho_gain(
+                        &hessian,
+                        judged.as_ref(),
+                        &sensitivity.rho_gradient,
+                    )
+                    .ok_or(NegbinRootDisplacementGap::RhoGain)?;
+                    gain * rho_bound
+                };
+                let displacement = mode_displacement + rho_displacement;
+                if displacement.is_finite() && displacement >= 0.0 {
+                    Ok(displacement)
+                } else {
+                    Err(NegbinRootDisplacementGap::NonFiniteDisplacement)
                 }
-            });
+            })();
             let theta_bound =
                 negbin_theta_joint_bound(theta, &theta_profile, theta_root_displacement);
             let rho_certificate_ok = final_rho.is_empty()
@@ -2386,12 +2409,16 @@ where
             // independently. The β coordinate must be strictly converged; a
             // near-stationary stalled checkpoint is not a completed joint fit.
             let pirls_certificate_ok = pirls_res.status.is_converged();
-            let theta_certificate_ok = theta_residual.is_finite() && theta_residual <= theta_bound;
+            // A round whose resolution has an underived component cannot judge
+            // its theta residual at all, so it neither certifies nor competes
+            // for the best checkpoint on a ratio it cannot form (#4560).
+            let theta_certificate_ok = theta_residual.is_finite()
+                && theta_bound.is_ok_and(|bound| theta_residual <= bound);
 
-            let theta_ratio = if theta_residual == 0.0 {
-                0.0
-            } else {
-                theta_residual / theta_bound
+            let theta_ratio = match theta_bound {
+                Ok(_) if theta_residual == 0.0 => 0.0,
+                Ok(bound) => theta_residual / bound,
+                Err(_) => f64::INFINITY,
             };
             let merit = (rho_residual / rho_bound)
                 .max(theta_ratio)
@@ -2407,7 +2434,9 @@ where
                 rho_residual,
                 rho_bound,
                 theta_residual,
-                theta_bound,
+                theta_score_rounding_band: negbin_theta_score_rounding_band(theta, &theta_profile)
+                    .ok_or(NegbinRootDisplacementGap::ScoreRoundingBand),
+                theta_root_displacement,
             };
             if negbin_best_checkpoint
                 .as_ref()
@@ -2432,7 +2461,8 @@ where
                     rho_residual,
                     rho_bound,
                     theta_residual,
-                    theta_bound,
+                    // `theta_certificate_ok` holds, so the bound was derived.
+                    theta_bound.unwrap_or(f64::NAN),
                 );
                 // #1082: the certified joint Laplace optimum decides the #784
                 // correction's admission, as for the rho-only search below.
@@ -2461,7 +2491,21 @@ where
                     rho_projected_grad_norm: best.rho_residual,
                     rho_stationarity_bound: best.rho_bound,
                     theta_score_residual: best.theta_residual,
-                    theta_stationarity_bound: best.theta_bound,
+                    // The rounding band's own gap is reported through the
+                    // displacement, which carries whichever component was
+                    // missing first (#4560).
+                    theta_score_rounding_band: best.theta_score_rounding_band.unwrap_or(f64::NAN),
+                    theta_root_displacement: match (
+                        best.theta_score_rounding_band,
+                        best.theta_root_displacement,
+                    ) {
+                        (Err(gap), _) | (Ok(_), Err(gap)) => {
+                            NegbinThetaRootDisplacement::Missing(gap)
+                        }
+                        (Ok(_), Ok(displacement)) => {
+                            NegbinThetaRootDisplacement::Derived(displacement)
+                        }
+                    },
                     rho_checkpoint: best.rho.to_vec(),
                 });
             }
@@ -2473,13 +2517,16 @@ where
                 pirls::estimate_negbin_theta_from_eta(y_o.view(), &final_eta, w_o.view())?;
             log::debug!(
                 "[OUTER] negative-binomial joint round {} not yet certified: \
-                 rho residual {:.3e}/{:.3e}, theta residual {:.3e}/{:.3e}; \
+                 rho residual {:.3e}/{:.3e}, theta residual {:.3e} against {}; \
                  updating theta {:.6e} -> {:.6e} and resuming from rho checkpoint",
                 negbin_alternation_round + 1,
                 rho_residual,
                 rho_bound,
                 theta_residual,
-                theta_bound,
+                match theta_bound {
+                    Ok(bound) => format!("{bound:.3e}"),
+                    Err(gap) => format!("no derived resolution, because {gap}"),
+                },
                 theta,
                 theta_next,
             );
@@ -4864,5 +4911,98 @@ mod outer_information_count_3192_tests {
             outer_information_count(Scale::ProfiledGaussian, rescaled.view()),
             outer_information_count(Scale::ProfiledGaussian, trials.view()),
         );
+    }
+}
+
+#[cfg(test)]
+mod negbin_theta_joint_bound_4560_tests {
+    use super::{
+        NegbinRootDisplacementGap, negbin_theta_joint_bound, negbin_theta_score_rounding_band,
+        pirls::NegbinThetaScore,
+    };
+
+    const THETA: f64 = 2.0;
+    /// `theta = 2`, `score = 0`, `info = 1` give the log-theta curvature
+    /// `theta^2*info - theta*score = 4`, so the rounding band is
+    /// `theta*band/c = 2*0.5/4`. Every value here is a dyadic rational, so the
+    /// arithmetic is exact in binary and the assertions are equalities.
+    const ROUNDING: f64 = 0.25;
+
+    fn profile() -> NegbinThetaScore {
+        NegbinThetaScore {
+            score: 0.0,
+            info: 1.0,
+            band: 0.5,
+        }
+    }
+
+    /// #4560 positive control: with both halves in hand the resolution is
+    /// exactly their sum. Without this, "the bound is an error" could mean the
+    /// bound is never formed at all.
+    #[test]
+    fn a_derived_displacement_is_added_to_the_score_rounding_band() {
+        assert_eq!(
+            negbin_theta_score_rounding_band(THETA, &profile()),
+            Some(ROUNDING)
+        );
+        assert_eq!(
+            negbin_theta_joint_bound(THETA, &profile(), Ok(0.75)),
+            Ok(ROUNDING + 0.75)
+        );
+        // A displacement of exactly zero is derived, not missing: an empty rho
+        // block and a mode band of zero both produce it legitimately.
+        assert_eq!(
+            negbin_theta_joint_bound(THETA, &profile(), Ok(0.0)),
+            Ok(ROUNDING)
+        );
+    }
+
+    /// #4560: each call withholds exactly one component, and the bound carries
+    /// that component out by name. Pricing it at zero instead would leave the
+    /// bound at `ROUNDING`, which a residual between `ROUNDING` and
+    /// `ROUNDING + displacement` would then fail — refusing a point the
+    /// certificate has no evidence against, and saying nothing about why.
+    #[test]
+    fn a_withheld_component_is_named_rather_than_priced_at_zero() {
+        for gap in [
+            NegbinRootDisplacementGap::ScoreEtaGradient,
+            NegbinRootDisplacementGap::RootSensitivity,
+            NegbinRootDisplacementGap::InnerKktTolerance,
+            NegbinRootDisplacementGap::RhoCurvature,
+            NegbinRootDisplacementGap::RhoGain,
+        ] {
+            assert_eq!(
+                negbin_theta_joint_bound(THETA, &profile(), Err(gap)),
+                Err(gap),
+                "the missing component must reach the caller by name"
+            );
+        }
+        // The other half, withheld on its own: the displacement is in hand, but
+        // a zero log-theta curvature leaves the score's band carrying into no
+        // Newton displacement, so there is no resolution at all.
+        let flat = NegbinThetaScore {
+            score: 0.0,
+            info: 0.0,
+            band: 0.5,
+        };
+        assert_eq!(negbin_theta_score_rounding_band(THETA, &flat), None);
+        assert_eq!(
+            negbin_theta_joint_bound(THETA, &flat, Ok(0.75)),
+            Err(NegbinRootDisplacementGap::ScoreRoundingBand)
+        );
+    }
+
+    /// #4560: a displacement that is not a finite, non-negative number is its
+    /// own refusal. Folding it to zero was the defect, because that silently
+    /// tightened the resolution instead of reporting the failed assembly.
+    #[test]
+    fn a_non_finite_or_negative_displacement_refuses_instead_of_folding_to_zero() {
+        for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN, -1.0] {
+            assert_eq!(
+                negbin_theta_joint_bound(THETA, &profile(), Ok(value)),
+                Err(NegbinRootDisplacementGap::NonFiniteDisplacement),
+                "a displacement of {value} must refuse"
+            );
+        }
     }
 }

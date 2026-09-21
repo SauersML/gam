@@ -1,5 +1,22 @@
 ## Unreleased
 
+- **The negative-binomial joint certificate names the component of its theta bound it
+  could not derive, instead of pricing it at zero** (#4560). The `(theta, rho, beta)`
+  certificate judges the theta-score Newton residual against the score's own rounding band
+  plus the displacement the rho and beta certificates still leave the theta root in. Every
+  piece of that displacement that could not be formed silently became `0.0`: a missing
+  eta-gradient, a mode that does not move by the assumed law, an unrecorded inner KKT
+  tolerance, an unavailable rho curvature, an indefinite judged curvature, and a non-finite
+  sum all collapsed to the same value, and so did a log-theta curvature that is not finite
+  and positive. A zero there is not conservative. It shrinks the resolution the certificate
+  demands, so a round refuses a point it has no evidence against, and the refusal
+  `NegativeBinomialAlternationDidNotConverge` could not tell a stalled alternation from an
+  allowance that was never formed. The displacement is now derived or named:
+  `negbin_theta_joint_bound` returns the missing `NegbinRootDisplacementGap`, a round whose
+  resolution has an underived component neither certifies nor competes for the best
+  checkpoint, and the refusal reports the rounding band and the displacement separately, the
+  latter as a value or as the component that is absent.
+
 - **A pure-Duchon closed-form penalty refuses a centre set with no separation, where the cause
   is visible** (gam#2469). Outside the regimes `closed_form_penalty::self_pair_bundle` covers,
   the self-pair integral does not converge and the diagonal is read at the smallest lag the

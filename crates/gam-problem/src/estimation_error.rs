@@ -4,6 +4,84 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BasisError, CustomFamilyError, FailureCategory, MonotoneRootError};
 
+/// The component of the negative-binomial theta root displacement a joint
+/// round could not derive (#4560).
+///
+/// The joint `(θ, ρ, β)` certificate judges the theta residual against the
+/// score's own rounding band plus the displacement the rho and beta
+/// certificates still leave the theta root in. That displacement is assembled
+/// from pieces, and a piece that cannot be formed is NOT worth zero: pricing it
+/// at zero makes the bound tighter than the certificates justify, so the round
+/// refuses a point it has no evidence against, and the refusal says nothing
+/// about why. Each variant names one such piece, and the refusal carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NegbinRootDisplacementGap {
+    /// `∂score/∂η` could not be formed at the accepted mode, so the root's
+    /// sensitivity to a move of that mode has no chain to travel.
+    ScoreEtaGradient,
+    /// The mode does not move by the law the implicit-function theorem assumes
+    /// here (a Firth-adjusted or inequality-constrained mode), or its penalized
+    /// Hessian did not factor as positive definite without a perturbation.
+    RootSensitivity,
+    /// The inner solve recorded no KKT tolerance, so the band it left the mode
+    /// in is unknown.
+    InnerKktTolerance,
+    /// The rho-block curvature could not be materialized densely, so the judged
+    /// subspace it is compressed onto cannot be formed.
+    RhoCurvature,
+    /// The judged rho curvature is not positive definite, so the displacement a
+    /// rho move of certificate size induces has no finite bound.
+    RhoGain,
+    /// The log-theta curvature is not finite and positive, so the score's own
+    /// accumulation band carries into no Newton displacement.
+    ScoreRoundingBand,
+    /// The pieces were each derived but their sum is not a finite, non-negative
+    /// displacement.
+    NonFiniteDisplacement,
+}
+
+impl std::fmt::Display for NegbinRootDisplacementGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ScoreEtaGradient => {
+                "the score's eta-gradient could not be formed at the accepted mode"
+            }
+            Self::RootSensitivity => {
+                "the mode does not move by the law this root sensitivity assumes, or its \
+                 penalized Hessian did not factor as positive definite"
+            }
+            Self::InnerKktTolerance => "the inner solve recorded no KKT tolerance",
+            Self::RhoCurvature => "the rho-block curvature could not be materialized densely",
+            Self::RhoGain => "the judged rho curvature is not positive definite",
+            Self::ScoreRoundingBand => "the log-theta curvature is not finite and positive",
+            Self::NonFiniteDisplacement => {
+                "the assembled displacement is not a finite, non-negative number"
+            }
+        })
+    }
+}
+
+/// The theta root displacement a joint round measured, or the component that
+/// stopped it being measured ([`NegbinRootDisplacementGap`]).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum NegbinThetaRootDisplacement {
+    /// How far the theta root may sit from where the mode puts it, given the
+    /// bands the rho and beta certificates leave that mode in.
+    Derived(f64),
+    /// No displacement was derived, because this component was missing. The
+    /// round cannot judge its theta residual at all.
+    Missing(NegbinRootDisplacementGap),
+}
+
+impl std::fmt::Display for NegbinThetaRootDisplacement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Derived(value) => write!(f, "{value:.3e}"),
+            Self::Missing(gap) => write!(f, "none, because {gap}"),
+        }
+    }
+}
+
 /// Which rung of the stationarity ladder produced the bound a refusal was
 /// measured against (#2458).
 ///
@@ -509,7 +587,8 @@ pub enum EstimationError {
         "Negative-binomial (theta, rho) optimization did not certify a joint optimum within \
          {rounds} round(s): projected rho-gradient {rho_projected_grad_norm:.3e} against \
          {rho_stationarity_bound:.3e}, theta-score Newton residual {theta_score_residual:.3e} \
-         against {theta_stationarity_bound:.3e}. A fit is only minted when both analytic \
+         against the score's own rounding band {theta_score_rounding_band:.3e} plus a root \
+         displacement of {theta_root_displacement}. A fit is only minted when both analytic \
          partials are stationary at one identical point; resume from theta={theta_checkpoint:.6e} \
          and rho={rho_checkpoint:?}."
     )]
@@ -524,8 +603,15 @@ pub enum EstimationError {
         rho_stationarity_bound: f64,
         /// Curvature-normalized log-theta score residual at that checkpoint.
         theta_score_residual: f64,
-        /// Bound the theta residual had to clear.
-        theta_stationarity_bound: f64,
+        /// Half of the resolution the certificate may demand: the score's own
+        /// accumulation band carried into the log-theta Newton displacement.
+        theta_score_rounding_band: f64,
+        /// The other half: how far the theta root may still sit from where the
+        /// mode puts it, or the component of that displacement the round could
+        /// not derive. A missing component is named rather than priced at zero,
+        /// which would demand a resolution the certificates do not justify
+        /// (#4560).
+        theta_root_displacement: NegbinThetaRootDisplacement,
         /// Best measured log-smoothing checkpoint for warm-started resume.
         rho_checkpoint: Vec<f64>,
     },

@@ -130,6 +130,8 @@ pub use estimation_error::{
     FixedLambdaSolverStage,
     FixedLambdaStallReason,
     FixedLambdaStationarityEvidence,
+    NegbinRootDisplacementGap,
+    NegbinThetaRootDisplacement,
     StationarityRung,
     StationarityStandard,
 };
