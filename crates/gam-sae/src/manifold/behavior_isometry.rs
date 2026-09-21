@@ -278,17 +278,26 @@ fn behavior_curve_speeds(
     Ok(speeds)
 }
 
-/// Construct the behavior-pinned arc-length representative on a dense audit
-/// grid, then interpolate the fitted rows into that coordinate.  The grid size
-/// is the same public arc-length integration resolution used by the activation
-/// chart canonicalizer, so the two quotient reads have one numerical contract.
+/// Construct the behavior-pinned arc-length representative on the activation
+/// chart canonicalizer's arc-length grid, then read the fitted rows into that
+/// coordinate. The two quotient reads share one numerical contract
+/// ([`crate::chart_canonicalization::ARC_LENGTH_GRID_CELLS`]): the behavior
+/// speed is sampled at every cell's node, midpoint and next node, the cumulative
+/// arc length is the composite-Simpson sum (per-cell error `O(Δu⁵)`), a row
+/// between nodes reads the exact integral of its cell's quadratic speed
+/// interpolant ([`crate::chart_canonicalization::partial_cell_arc`]), and an
+/// interval chart takes the same resolvable domain
+/// ([`crate::chart_canonicalization::arc_length_grid_resolves`]).
 fn behavior_pinned_chart(
     evaluator: &dyn SaeBasisEvaluator,
     behavior_decoder: ArrayView2<'_, f64>,
     row_coords: ArrayView1<'_, f64>,
     topology: &crate::chart_canonicalization::CanonicalChartTopology,
 ) -> Result<Option<BehaviorPinnedChart>, String> {
-    use crate::chart_canonicalization::{ARC_LENGTH_GRID_CELLS, CanonicalChartTopology};
+    use crate::chart_canonicalization::{
+        ARC_LENGTH_GRID_CELLS, CanonicalChartTopology, arc_length_grid_resolves,
+        partial_cell_arc,
+    };
 
     if row_coords.is_empty() {
         return Ok(None);
@@ -303,22 +312,26 @@ fn behavior_pinned_chart(
         CanonicalChartTopology::Interval => {
             let lo = row_coords.iter().copied().fold(f64::INFINITY, f64::min);
             let hi = row_coords.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            if !(lo.is_finite() && hi.is_finite() && hi > lo) {
+            if !(lo.is_finite() && hi.is_finite() && arc_length_grid_resolves(lo, hi)) {
                 return Ok(None);
             }
             (lo, hi, false)
         }
     };
+    // Simpson grid: node `j` at sample `2j`, the midpoint of cell `j` at `2j + 1`.
     let cells = ARC_LENGTH_GRID_CELLS;
     let step = (hi - lo) / cells as f64;
-    let mut grid = Array2::<f64>::zeros((cells + 1, 1));
-    for i in 0..=cells {
-        grid[[i, 0]] = lo + step * i as f64;
+    let mut grid = Array2::<f64>::zeros((2 * cells + 1, 1));
+    for j in 0..=cells {
+        grid[[2 * j, 0]] = lo + j as f64 * step;
+        if j < cells {
+            grid[[2 * j + 1, 0]] = lo + (j as f64 + 0.5) * step;
+        }
     }
     let (phi, jet) = evaluator.evaluate(grid.view())?;
     let behavior_points = phi.dot(&behavior_decoder);
     let speeds = behavior_curve_speeds(&jet, behavior_decoder, behavior_points.view())?;
-    if speeds.len() != cells + 1
+    if speeds.len() != 2 * cells + 1
         || speeds
             .iter()
             .any(|speed| !speed.is_finite() || *speed < 0.0)
@@ -326,8 +339,9 @@ fn behavior_pinned_chart(
         return Ok(None);
     }
     let mut cumulative = Array1::<f64>::zeros(cells + 1);
-    for i in 1..=cells {
-        cumulative[i] = cumulative[i - 1] + 0.5 * step * (speeds[i - 1] + speeds[i]);
+    for j in 0..cells {
+        let (f0, fm, f1) = (speeds[2 * j], speeds[2 * j + 1], speeds[2 * j + 2]);
+        cumulative[j + 1] = cumulative[j] + step * (f0 + 4.0 * fm + f1) / 6.0;
     }
     let behavior_length = cumulative[cells];
     if !(behavior_length.is_finite() && behavior_length > 0.0) {
@@ -335,17 +349,19 @@ fn behavior_pinned_chart(
     }
 
     // Origin: closest decoded behavior tangent point to the embedding's
-    // Frechet basepoint (the zero vector in tangent coordinates).
-    let mut anchor_grid = 0usize;
+    // Frechet basepoint (the zero vector in tangent coordinates), searched on
+    // the grid nodes, where the cumulative arc length is tabulated.
+    let mut anchor_node = 0usize;
     let mut anchor_norm_sq = f64::INFINITY;
-    for i in 0..=cells {
-        let norm_sq = behavior_points.row(i).dot(&behavior_points.row(i));
+    for j in 0..=cells {
+        let point = behavior_points.row(2 * j);
+        let norm_sq = point.dot(&point);
         if norm_sq < anchor_norm_sq {
             anchor_norm_sq = norm_sq;
-            anchor_grid = i;
+            anchor_node = j;
         }
     }
-    let anchor_arc = cumulative[anchor_grid];
+    let anchor_arc = cumulative[anchor_node];
 
     // Orientation: lexicographic sign of the physical behavior tangent at the
     // pinned origin.  If the exact anchor is stationary, use the nearest grid
@@ -355,10 +371,11 @@ fn behavior_pinned_chart(
     // accumulation, the same resolution rule `behavior_curve_speeds` applies.
     let mut orientation = 0_i8;
     for radius in 0..=cells {
-        for idx in [
-            anchor_grid.saturating_sub(radius),
-            (anchor_grid + radius).min(cells),
+        for node in [
+            anchor_node.saturating_sub(radius),
+            (anchor_node + radius).min(cells),
         ] {
+            let idx = 2 * node;
             if speeds[idx] == 0.0 {
                 continue;
             }
@@ -389,16 +406,25 @@ fn behavior_pinned_chart(
         return Ok(None);
     }
 
+    // Arc length from `lo` to a row: the tabulated nodes plus the exact integral
+    // of the row's cell-local quadratic speed interpolant, the read
+    // `unit_speed_reparameterization` applies to the activation chart.
     let interpolate_arc = |coord: f64| -> f64 {
-        let coord = if circular {
-            (coord - lo).rem_euclid(hi - lo) + lo
+        let local = if circular {
+            (coord - lo).rem_euclid(hi - lo)
         } else {
-            coord.clamp(lo, hi)
+            (coord - lo).clamp(0.0, hi - lo)
         };
-        let pos = ((coord - lo) / step).clamp(0.0, cells as f64);
-        let left = (pos.floor() as usize).min(cells - 1);
-        let frac = pos - left as f64;
-        cumulative[left] + frac * (cumulative[left + 1] - cumulative[left])
+        let cell = ((local / step).floor() as usize).min(cells - 1);
+        let x = local - cell as f64 * step;
+        cumulative[cell]
+            + partial_cell_arc(
+                speeds[2 * cell],
+                speeds[2 * cell + 1],
+                speeds[2 * cell + 2],
+                step,
+                x,
+            )
     };
     let coordinate_period = behavior_length * std::f64::consts::FRAC_1_SQRT_2;
     let mut canonical = Array1::<f64>::zeros(row_coords.len());
@@ -646,6 +672,126 @@ mod tests {
             cert.defect_cv
         );
         assert!(cert.defect_cv > 0.2);
+    }
+
+    /// Composite-Simpson behavior arc length over `[a, b]` with `cells` cells of
+    /// its own (a grid not aligned with the production chart grid).
+    fn reference_behavior_arc(
+        evaluator: &dyn SaeBasisEvaluator,
+        decoder: ArrayView2<'_, f64>,
+        a: f64,
+        b: f64,
+        cells: usize,
+    ) -> f64 {
+        if b <= a {
+            return 0.0;
+        }
+        let h = (b - a) / cells as f64;
+        let mut grid = Array2::<f64>::zeros((2 * cells + 1, 1));
+        for j in 0..=cells {
+            grid[[2 * j, 0]] = a + j as f64 * h;
+            if j < cells {
+                grid[[2 * j + 1, 0]] = a + (j as f64 + 0.5) * h;
+            }
+        }
+        let (phi, jet) = evaluator.evaluate(grid.view()).expect("evaluate");
+        let points = phi.dot(&decoder);
+        let speeds = behavior_curve_speeds(&jet, decoder, points.view()).expect("speeds");
+        (0..cells)
+            .map(|j| h * (speeds[2 * j] + 4.0 * speeds[2 * j + 1] + speeds[2 * j + 2]) / 6.0)
+            .sum()
+    }
+
+    /// #4317: the pinned behavior chart integrates behavior arc length under the
+    /// activation canonicalizer's Simpson contract. A smooth two-harmonic
+    /// behavior arc on the interval chart `[0.1, 0.4]` has Simpson per-cell error
+    /// `h⁵ max|s⁗|/2880` with `h = 0.3/2048`, so the chart length and every
+    /// pairwise pinned distance `|u_i − u_j| = |s(t_i) − s(t_j)|/√2` agree with an
+    /// independent 8192-cell Simpson reference to rounding (1e-11 of the length).
+    /// Positive control: the trapezoid-plus-linear-interpolation read on the
+    /// same 2048 nodes misses both by more than 1e-9 of the length.
+    #[test]
+    fn behavior_pinned_chart_arc_length_matches_the_simpson_contract() {
+        use crate::basis::PeriodicHarmonicEvaluator;
+        use crate::chart_canonicalization::{ARC_LENGTH_GRID_CELLS, CanonicalChartTopology};
+
+        let evaluator = PeriodicHarmonicEvaluator::new(5).expect("evaluator");
+        // Rows of the decoder are the basis columns [1, s1, c1, s2, c2].
+        let decoder = ndarray::array![[0.05, 0.0], [0.0, 0.3], [0.3, 0.0], [0.1, 0.0], [0.0, 0.08]];
+        let rows = Array1::from(vec![0.1, 0.123_456_7, 0.2, 0.271_828, 0.314_159, 0.377_7, 0.4]);
+        let (lo, hi) = (0.1, 0.4);
+
+        let chart = behavior_pinned_chart(
+            &evaluator,
+            decoder.view(),
+            rows.view(),
+            &CanonicalChartTopology::Interval,
+        )
+        .expect("chart")
+        .expect("a smooth non-stationary behavior arc has a pinned chart");
+        assert_eq!(chart.period, None);
+
+        let reference_cells = 8192;
+        let reference_length =
+            reference_behavior_arc(&evaluator, decoder.view(), lo, hi, reference_cells);
+        let reference_arc: Vec<f64> = rows
+            .iter()
+            .map(|&t| reference_behavior_arc(&evaluator, decoder.view(), lo, t, reference_cells))
+            .collect();
+        let tolerance = 1e-11 * reference_length;
+        let length_error = (chart.behavior_length - reference_length).abs();
+        assert!(
+            length_error <= tolerance,
+            "behavior_length {} vs reference {reference_length}: error {length_error:e}",
+            chart.behavior_length
+        );
+        let mut worst_distance_error = 0.0_f64;
+        for i in 0..rows.len() {
+            for j in 0..i {
+                let got = (chart.coords[i] - chart.coords[j]).abs();
+                let want = (reference_arc[i] - reference_arc[j]).abs() * std::f64::consts::FRAC_1_SQRT_2;
+                worst_distance_error = worst_distance_error.max((got - want).abs());
+            }
+        }
+        assert!(
+            worst_distance_error <= tolerance,
+            "pinned pairwise distances miss the reference by {worst_distance_error:e} \
+             (tolerance {tolerance:e})"
+        );
+
+        // Positive control: the node-only trapezoid read the chart used before.
+        let cells = ARC_LENGTH_GRID_CELLS;
+        let step = (hi - lo) / cells as f64;
+        let mut nodes = Array2::<f64>::zeros((cells + 1, 1));
+        for i in 0..=cells {
+            nodes[[i, 0]] = lo + step * i as f64;
+        }
+        let (phi, jet) = evaluator.evaluate(nodes.view()).expect("evaluate");
+        let points = phi.dot(&decoder);
+        let speeds = behavior_curve_speeds(&jet, decoder.view(), points.view()).expect("speeds");
+        let mut trapezoid = vec![0.0_f64; cells + 1];
+        for i in 1..=cells {
+            trapezoid[i] = trapezoid[i - 1] + 0.5 * step * (speeds[i - 1] + speeds[i]);
+        }
+        let trapezoid_arc = |t: f64| {
+            let pos = ((t - lo) / step).clamp(0.0, cells as f64);
+            let left = (pos.floor() as usize).min(cells - 1);
+            let frac = pos - left as f64;
+            trapezoid[left] + frac * (trapezoid[left + 1] - trapezoid[left])
+        };
+        assert!(
+            (trapezoid[cells] - reference_length).abs() > 1e-9 * reference_length,
+            "positive control: the trapezoid length should miss the reference"
+        );
+        let trapezoid_worst_row = rows
+            .iter()
+            .zip(&reference_arc)
+            .map(|(&t, &want)| (trapezoid_arc(t) - want).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            trapezoid_worst_row > 1e-9 * reference_length,
+            "positive control: the trapezoid row read should miss the reference, got {trapezoid_worst_row:e}"
+        );
     }
 
     /// An inert behavior block (all behavior speeds zero) is reported as not

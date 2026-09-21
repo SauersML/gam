@@ -185,7 +185,7 @@ pub(crate) const ARC_LENGTH_GRID_CELLS: usize = 2048;
 /// `hi − lo > 4·ARC_LENGTH_GRID_CELLS·γ_4·(|lo| + |hi|)`. Rows at one point give
 /// `hi = lo` and fail it exactly. The unit-speed defect and the arc-length reading
 /// take the same domain, so all three refuse the same charts.
-fn arc_length_grid_resolves(lo: f64, hi: f64) -> bool {
+pub(crate) fn arc_length_grid_resolves(lo: f64, hi: f64) -> bool {
     let band = 4.0
         * ARC_LENGTH_GRID_CELLS as f64
         * gam_linalg::roundoff::accumulation_growth(4)
@@ -295,7 +295,7 @@ pub(crate) fn curve_speeds(
 /// Exact integral of the cell-local quadratic speed interpolant (through the
 /// node, midpoint, and next-node speeds) over `[0, x]`, `x ∈ [0, h]`. At
 /// `x = h` this is exactly the Simpson cell weight `h(f0 + 4fm + f1)/6`.
-fn partial_cell_arc(f0: f64, fm: f64, f1: f64, h: f64, x: f64) -> f64 {
+pub(crate) fn partial_cell_arc(f0: f64, fm: f64, f1: f64, h: f64, x: f64) -> f64 {
     if h <= 0.0 {
         return 0.0;
     }
