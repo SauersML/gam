@@ -49,13 +49,14 @@ guaranteed_referr=0
 gamerr=0
 metricoff=0
 
-panicmsg=$(awk '/panicked at/{{loc=$0; getline; print loc " :: " $0; exit}}' "$log")
+{}
 refmarker=$(grep -aE 'there is no package called|could not find function|Error in library\(|package or namespace load failed|unable to load shared object|cannot open shared object|No module named|ModuleNotFoundError|IndentationError|reference .* body failed' "$log" | head -1)
 
 {}
 
 echo "$outcome,$cause"
 "#,
+        panic_message_assignment(&yaml),
         classifier_code
     );
 
@@ -236,4 +237,105 @@ fn test_publish_action_names_failed_steps_verbatim() {
         "step 8: Run quality suite (resilient + streaming; full per-test capture) | \
          step 9: Aggregate quality pairs (#1561 gate + #2395 paired power)"
     );
+}
+
+/// The run step's `panicmsg=$(awk ... "$log")` assignment, lifted out of the
+/// workflow so no test can hold a second copy of it.
+///
+/// The assignment spans the awk program's lines, so it is read as a block: it
+/// opens at `panicmsg=$(awk` and closes on the line that ends the command
+/// substitution with the log path. Each line is trimmed, which awk does not
+/// care about and which keeps the extracted script free of the workflow's YAML
+/// indentation.
+fn panic_message_assignment(yaml: &str) -> String {
+    let mut lines: Vec<&str> = Vec::new();
+    for line in yaml.lines() {
+        let trimmed = line.trim();
+        if lines.is_empty() && !trimmed.starts_with("panicmsg=$(awk") {
+            continue;
+        }
+        lines.push(trimmed);
+        if trimmed.ends_with("\"$log\")") {
+            break;
+        }
+    }
+    assert!(
+        lines.last().is_some_and(|last| last.ends_with("\"$log\")")),
+        "the run step builds `panicmsg` with `panicmsg=$(awk ... \"$log\")`"
+    );
+    lines.join("\n")
+}
+
+/// The `panicmsg` capture keeps every line of the panic message.
+///
+/// `assert_eq!` writes the two compared values on the lines AFTER the line that
+/// says the assertion failed, and those values are the only
+/// record of what the code under test produced. A capture that took the
+/// location line plus one more dropped them, which is how run 35596444985
+/// reported that a multinomial class "must carry one independent λ per (smooth
+/// term, penalty)" without reporting how many it carried.
+#[test]
+fn test_reference_quality_panic_message_keeps_every_line() {
+    let yaml = std::fs::read_to_string(".github/workflows/reference-quality.yml").unwrap();
+    let assignment = panic_message_assignment(&yaml);
+    let dir = std::env::temp_dir().join(format!("quality_panicmsg_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("panicmsg.sh");
+    std::fs::write(
+        &script,
+        format!("log=$1\n{assignment}\nprintf '%s' \"$panicmsg\"\n"),
+    )
+    .unwrap();
+    let log = dir.join("case.log");
+    let capture = |log_content: &str| -> String {
+        std::fs::write(&log, log_content).unwrap();
+        let output = Command::new("bash")
+            .arg(&script)
+            .arg(&log)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "panic capture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    // An `assert_eq!` failure: both compared values are carried, and the capture
+    // stops at the end of the message rather than swallowing libtest's sections.
+    let compared = capture(
+        "running 1 test\n\
+         thread 'families::case' panicked at tests/quality/families/case.rs:422:9:\n\
+         assertion `left == right` failed: class 0 must carry one lambda per penalty\n\
+         \x20 left: 2\n\
+         \x20right: 4\n\
+         note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
+         test families::case ... FAILED\n",
+    );
+    assert!(
+        compared.contains("left: 2") && compared.contains("right: 4"),
+        "the compared values were dropped: {compared}"
+    );
+    assert!(
+        !compared.contains("RUST_BACKTRACE") && !compared.contains("FAILED"),
+        "the capture ran past the end of the message: {compared}"
+    );
+
+    // A one-line message still reads `<location> :: <message>`, the shape every
+    // classifier regex above is written against.
+    assert_eq!(
+        capture(
+            "thread 'misc::case' panicked at tests/quality/misc/case.rs:130:6:\n\
+             gam additive fit: Fit(Estimation(did not certify a stationary optimum))\n\
+             note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
+        ),
+        "thread 'misc::case' panicked at tests/quality/misc/case.rs:130:6: :: \
+         gam additive fit: Fit(Estimation(did not certify a stationary optimum))"
+    );
+
+    // A log with no panic at all yields nothing, so the classifier's
+    // `${panicmsg:-nonzero exit $rc}` fallback still fires.
+    assert_eq!(capture("running 1 test\ntest result: FAILED\n"), "");
+    std::fs::remove_dir_all(&dir).unwrap();
 }

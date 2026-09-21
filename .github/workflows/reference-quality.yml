@@ -366,8 +366,45 @@ jobs:
             # (crates/gam-test-support/src/reference.rs); it already covers both
             # interpreters' import-failure dialects, including `cannot import name`.
             refmarker=$(grep -aE 'REFERENCE_ENV_MISSING|there is no package called|could not find function|Error in library\(|package or namespace load failed|unable to load shared object|cannot open shared object|No module named|ModuleNotFoundError|IndentationError|reference .* body failed' "$log" | head -1)
-            # First panic: "<thread> panicked at <file:line>:" then the message.
-            panicmsg=$(awk '/panicked at/{loc=$0; getline; print loc " :: " $0; exit}' "$log")
+            # First panic: "<thread> panicked at <file:line>:" then the WHOLE
+            # message, not its first line.
+            #
+            # A Rust panic message is as many lines as the panicking code
+            # formatted. `assert_eq!` writes three — `assertion `left == right`
+            # failed: <msg>`, then `  left: <l>`, then ` right: <r>` — and the
+            # two values are the only record of what the fit actually reported.
+            # Taking one line dropped them: run 35596444985's row for
+            # families::quality_vs_vgam_multinomial_softmax::gam_multinomial_softmax_recovers_true_simplex
+            # carries "class 0 must carry one independent λ per (smooth term,
+            # penalty) (2 double-penalty terms ⇒ 4)" and NOT the count the
+            # driver reported, which is the single fact needed to decide whether
+            # the driver or the test is wrong.
+            #
+            # The message ends where the next section begins. libtest and the
+            # panic runtime start those sections at column 0 with a known set of
+            # openers, and every continuation line of a panic message is either
+            # indented or plain prose, so the block is closed by the first line
+            # that is empty or opens one of them.
+            panicmsg=$(awk '
+              /panicked at/ && !seen {
+                seen = 1
+                out = $0
+                while ((getline line) > 0) {
+                  if (line == "" ||
+                      line ~ /^note:/ ||
+                      line ~ /^stack backtrace:/ ||
+                      line ~ /^thread .* panicked at/ ||
+                      line ~ /^test / ||
+                      line ~ /^(-{4}|={4})/ ||
+                      line ~ /^failures:/ ||
+                      line ~ /^error(\[[A-Za-z0-9]+\])?:/) {
+                    break
+                  }
+                  out = out (first++ ? " " : " :: ") line
+                }
+                print out
+                exit
+              }' "$log")
             # gam-side fit errors (the fit crashed/refused/failed to converge).
             # `LayoutError`/`identifiability audit` are gam's OWN model-layout /
             # identifiability verdicts — they must classify as GAM_ERROR even
@@ -487,7 +524,22 @@ jobs:
             # quoting, so normalize quotes too instead of producing an "Illegal
             # quoting" error that makes the tracked table unsearchable.
             metric_clean=$(printf '%s' "$metric" | tr '\t|"' "  '" | tr -s ' ')
-            reason_clean=$(printf '%s' "$reason" | tr '\t\n|"' "   '" | tr -s ' ' | cut -c1-400)
+            # No length cut. The 400-character one that used to be here had
+            # nothing left to protect and was losing verdicts. The consumer,
+            # bench/aggregate_quality_gate_1561.py, measures the longest field in
+            # the file and raises `csv.field_size_limit` to it, so no cell length
+            # can break the read; the job-summary table below applies its own
+            # 200-character cut, so the rendered table is capped independently;
+            # and the per-test log artifact was always the complete copy. What
+            # the cut did do was truncate every long refusal before its verdict:
+            # `RemlDidNotConverge` states its bound and rung early but names WHY
+            # it stopped — budget exhaustion, line-search collapse, cost stall,
+            # or a failed post-solve certificate — and how many outer iterations
+            # it ran, after character 400, and those two fields are the whole
+            # difference between "the optimizer stopped short" and "the optimizer
+            # could not descend". The message's own end is the bound; the awk
+            # above stops at it.
+            reason_clean=$(printf '%s' "$reason" | tr '\t\n|"' "   '" | tr -s ' ')
             printf '%d\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\n' \
               "$i" "$outcome" "$cause" "$t" "$rc" "$dur" "$sub_passed" "$sub_failed" "$metric_clean" "$reason_clean" >> "$RES"
             printf '{"idx":%d,"outcome":"%s","cause":"%s","test":"%s","rc":%d,"dur_s":%d,"sub_passed":%s,"sub_failed":%s}\n' \
