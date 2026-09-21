@@ -201,3 +201,45 @@ fn multinomial_outer_reml_selects_per_term_lambda_and_recovers_truth() {
         model_hi.lambdas
     );
 }
+
+/// TEMPORARY #4004 diagnostic (removed before merge): print the selected λ,
+/// EDF, outer iteration count and truth RMSE from several seeds and outer
+/// budgets, so the attribution of the 0.0688 RMSE rests on measured numbers.
+#[test]
+fn zz_diag_4004_multinomial_lambda_path() {
+    let (ds, truth) = synth();
+    let cfg = FitConfig::default();
+    for &(init, max_iter, tol) in &[
+        (1.0_f64, 40_usize, 1e-8_f64),
+        (1.0, 400, 1e-8),
+        (1e-3, 400, 1e-8),
+        (50.0, 400, 1e-8),
+        (1e3, 400, 1e-8),
+    ] {
+        let fit = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+            init_lambda: init,
+            max_iter,
+            tol,
+            ..MultinomialFitRequest::new(&ds, "y ~ s(x1, k=6) + s(x2, k=6) + x3", &cfg)
+        });
+        match fit {
+            Ok(model) => {
+                let rmse = rmse_vs_truth(&model, &ds, &truth);
+                eprintln!(
+                    "DIAG4004 init={init:e} max_iter={max_iter} tol={tol:e} rmse={rmse:.6} \
+                     iterations={} lambdas={:?} per_block={:?} edf_class={:?} edf_pen={:?} \
+                     deviance={:.6} pnll={:.6} p={}",
+                    model.iterations,
+                    model.lambdas,
+                    model.lambdas_per_block,
+                    model.edf_per_class,
+                    model.edf_per_penalty,
+                    model.deviance,
+                    model.penalized_neg_log_likelihood,
+                    model.p_per_class,
+                );
+            }
+            Err(e) => eprintln!("DIAG4004 init={init:e} max_iter={max_iter} tol={tol:e} ERR {e}"),
+        }
+    }
+}
