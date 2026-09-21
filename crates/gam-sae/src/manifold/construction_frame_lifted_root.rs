@@ -481,7 +481,7 @@ impl SaeManifoldTerm {
 }
 
 #[cfg(test)]
-mod test_support {
+mod frame_lifted_test_support {
     use super::*;
 
     impl SaeManifoldTerm {

@@ -2387,7 +2387,7 @@ mod tests {
         // above the 0.05 lower tail mass, so the band starts at zero and holds the
         // whole atom: its content is `F(hi) = p_hi`, a surplus of `p_lo` over the
         // level.
-        let (mu, phi, power) = (0.3, 1.0, 1.5);
+        let (mu, phi, power) = (0.3_f64, 1.0_f64, 1.5_f64);
         let (p_lo, p_hi) = (0.05, 0.95);
         let total_var = phi * mu.powf(power);
         let (lo, hi) =
@@ -2399,7 +2399,7 @@ mod tests {
         assert!(content > p_hi - p_lo, "content {content}");
         // A mean whose atom is below the lower tail mass: both edges on the
         // continuous part, content `F(hi) − F(lo)`.
-        let mu = 6.0;
+        let mu = 6.0_f64;
         let total_var = phi * mu.powf(power);
         let (lo, hi) =
             tweedie_moment_matched_interval(mu, phi, power, total_var, p_lo, p_hi).unwrap();
