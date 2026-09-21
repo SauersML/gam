@@ -712,12 +712,13 @@ pub trait PredictionTransform {
         eta_se: &Array1<f64>,
         z_lower: &Array1<f64>,
         z_upper: &Array1<f64>,
-        _covariance: PassCovariance<'_>,
+        covariance: PassCovariance<'_>,
     ) -> Result<Option<(Array1<f64>, Array1<f64>)>, EstimationError> {
         // Default: no skew-aware band. The generic symmetric construction is
-        // used instead. Validate the per-row inputs the driver hands every
-        // transform so an overriding impl and this default agree on shape:
-        // one entry per row of the prediction design.
+        // used instead. Validate the inputs the driver hands every transform so
+        // an overriding impl and this default agree on shape: one entry per row
+        // of the prediction design, whose columns are the covariance's coefficients.
+        assert_eq!(input.design.ncols(), covariance.fit.beta.len());
         assert_eq!(eta.len(), input.design.nrows());
         assert_eq!(eta.len(), eta_se.len());
         assert_eq!(eta.len(), z_lower.len());

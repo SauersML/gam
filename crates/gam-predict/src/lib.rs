@@ -4418,9 +4418,6 @@ mod tests {
             let options = PredictUncertaintyOptions {
                 covariance_mode: mode,
                 includeobservation_interval: true,
-                edgeworth_one_sided: false,
-                boundary_correction: false,
-                ood_inflation: false,
                 ..PredictUncertaintyOptions::default()
             };
             let out = predictor
@@ -4448,6 +4445,7 @@ mod tests {
                 covariance_mode: mode,
                 include_observation_interval: true,
                 extrapolation_variance: None,
+                observation_prior_weights: None,
             };
             let out = predictor
                 .predict_posterior_mean(&input, &fit, &options)
