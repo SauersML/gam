@@ -53,13 +53,194 @@ concurrency:
   group: reference-quality-${{ github.ref }}
   cancel-in-progress: false
 
+# gam#1561 SHARDING. One job used to run all 437 cases serially. With the
+# repo's own per-case bound (`.config/nextest.toml`: 600 s by default, up to
+# 2400 s for the declared exemptions) a single job's WORST case is the sum of
+# every case's bound -- 269,400 s, or 74.8 hours -- against a 6-hour platform
+# job cap. The `timeout-minutes: 320` step bound added earlier stops that run
+# from destroying its own evidence, but the cases after the bound still never
+# execute: the tail is silently never measured, which is why "no case failing
+# or unrecorded" has never been satisfiable from one job.
+#
+# The suite now runs as a matrix. The shard count is DERIVED, not chosen: the
+# `plan` job packs the cases into the fewest bins whose summed per-case bounds
+# each fit the run step's own `timeout-minutes`, so every shard finishes inside
+# its cap even if every one of its cases runs to its bound. At today's bounds
+# that is 15 shards of 27-30 cases, each holding at most 18,000 s of bound
+# against a 19,200 s cap. The count is a function of the bounds and falls as
+# `.config/nextest.toml` tightens them; nothing here is a hand-picked number.
+#
+# Cases are balanced by BOUND, not by the duration the last run recorded, and
+# the difference matters. The last complete run (35534960362) measured 2,414 s
+# across all 437 cases -- a mean of 5.5 s against a 600 s bound -- so a plan
+# balanced on recorded durations would put every case in one shard and rebuild
+# exactly the failure being fixed. A past duration is not an upper bound on a
+# future one: the run this issue opens with spent over five hours inside case
+# 86/433, a case that had always been fast. Only the bound bounds the future.
+# The plan reports the recorded-duration load per shard as well, so the gap
+# between the guarantee and the expectation stays visible.
+#
+# The build happens ONCE and ships its binaries to the shards: the run loop
+# executes the pre-built libtest binaries directly and never invokes cargo, so a
+# shard needs the reference tool stack and the artifact, not a toolchain or a
+# target cache.
+#
+# The shards do not gate. A shard that exits non-zero would skip the merge job
+# through `needs`, which is the evidence-destroying behaviour this is fixing, so
+# every shard records outcomes and exits 0; the `merge` job owns the gate, the
+# aggregate and the single published record.
+
 jobs:
-  reference-quality:
-    permissions:
-      contents: write
-      actions: read
-    name: Reference quality vs mature tools
+  plan:
+    name: Plan quality shards
     runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      total: ${{ steps.plan.outputs.total }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Derive the shard assignment from the case list and the per-case bounds
+        id: plan
+        shell: bash
+        run: |
+          set -uo pipefail
+          # The plan reads three files and nothing else: the tracked case list,
+          # the tracked results of the last complete run (for the reported
+          # expected load only), and `.config/nextest.toml` for the bounds. The
+          # shard budget is read out of THIS workflow's own run step, so the
+          # budget the plan packs against and the cap the step enforces are one
+          # number and cannot drift.
+          if ! python3 - <<'PLAN' > /tmp/shard-plan.tsv
+          import csv, json, math, os, re, sys, tomllib
+
+          WORKFLOW = ".github/workflows/reference-quality.yml"
+          CASES = "bench/gha_results/reference-quality/quality_cases.txt"
+          RESULTS = "bench/gha_results/reference-quality/quality_results.tsv"
+
+
+          def bound_seconds(timeout, where):
+              if not (isinstance(timeout, dict) and "period" in timeout and "terminate-after" in timeout):
+                  raise SystemExit(f"{where}: slow-timeout {timeout!r} has no terminate-after, so nextest never kills there")
+              period = re.fullmatch(r"(\d+)s", timeout["period"])
+              if period is None:
+                  raise SystemExit(f"{where}: period {timeout['period']!r} is not a whole number of seconds")
+              return int(period.group(1)) * int(timeout["terminate-after"])
+
+
+          with open(".config/nextest.toml", "rb") as handle:
+              profiles = tomllib.load(handle)["profile"]
+          default_bound = bound_seconds(profiles["default"]["slow-timeout"], "profile.default")
+          overrides = []
+          for index, override in enumerate(profiles["default"].get("overrides", [])):
+              if "slow-timeout" not in override:
+                  continue
+              where = f"profile.default.overrides[{index}]"
+              pattern = re.fullmatch(r"test\(/(.*)/\)", override["filter"])
+              if pattern is None:
+                  raise SystemExit(f"{where}: filter {override['filter']!r} is not a test(/regex/) filter")
+              overrides.append((re.compile(pattern.group(1)), bound_seconds(override["slow-timeout"], where)))
+
+
+          def bound(case):
+              return next((seconds for regex, seconds in overrides if regex.search(case)), default_bound)
+
+
+          # The budget IS the run step's cap. Read it from the workflow rather
+          # than restating it, so one edit moves both.
+          text = open(WORKFLOW).read()
+          marked = re.findall(
+              r"^[ \t]*#[ \t]*SHARD BUDGET:[^\n]*\n(?:[ \t]*#[^\n]*\n)*[ \t]*timeout-minutes:[ \t]*(\d+)[ \t]*$",
+              text,
+              re.M,
+          )
+          if len(marked) != 1:
+              raise SystemExit(
+                  f"{WORKFLOW}: the run step's cap must be the one `timeout-minutes:` under a "
+                  f"`# SHARD BUDGET:` comment; found {marked}"
+              )
+          budget = int(marked[0]) * 60
+
+          cases = [line.strip() for line in open(CASES) if line.strip()]
+          if not cases:
+              raise SystemExit(f"{CASES} lists no cases; the plan has nothing to shard")
+          costs = {case: bound(case) for case in cases}
+          if max(costs.values()) > budget:
+              worst = max(costs, key=costs.get)
+              raise SystemExit(
+                  f"{worst} has a {costs[worst]}s bound, past the {budget}s shard budget; "
+                  "no packing can hold it, so tighten the bound or raise the cap"
+              )
+
+          # Longest-processing-time-first into `shards` bins, starting at the
+          # information-theoretic floor and growing until every bin fits. LPT is
+          # deterministic given the list, and ties break on the case name, so the
+          # same tree always yields the same plan.
+          total = sum(costs.values())
+          shards = max(1, math.ceil(total / budget))
+          while True:
+              loads = [0] * shards
+              assignment = {}
+              for case in sorted(cases, key=lambda name: (-costs[name], name)):
+                  index = min(range(shards), key=lambda k: (loads[k], k))
+                  loads[index] += costs[case]
+                  assignment[case] = index + 1
+              if max(loads) <= budget:
+                  break
+              shards += 1
+
+          recorded = {}
+          if os.path.exists(RESULTS):
+              csv.field_size_limit(1 << 24)
+              with open(RESULTS) as handle:
+                  for row in csv.DictReader(handle, delimiter="\t"):
+                      try:
+                          recorded[row["test"]] = int(row["dur_s"])
+                      except (KeyError, TypeError, ValueError):
+                          continue
+          expected = [0] * shards
+          counts = [0] * shards
+          for case, shard in assignment.items():
+              expected[shard - 1] += recorded.get(case, costs[case])
+              counts[shard - 1] += 1
+
+          for case in cases:
+              print(f"{assignment[case]}\t{case}")
+
+          summary = [
+              f"shards={shards} budget={budget}s cases={len(cases)} bound_total={total}s",
+              "| shard | cases | bound load | recorded load |",
+              "|---|---|---|---|",
+          ]
+          for index in range(shards):
+              summary.append(f"| {index + 1} | {counts[index]} | {loads[index]}s | {expected[index]}s |")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as handle:
+              handle.write("## Quality shard plan\n\n" + "\n".join(summary) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as handle:
+              handle.write(f"total={shards}\n")
+              handle.write("shards=" + json.dumps(list(range(1, shards + 1))) + "\n")
+          print(f"planned {shards} shards over {len(cases)} cases", file=sys.stderr)
+          PLAN
+          then
+            echo "::error::could not derive the shard plan; refusing to run the suite unsharded"
+            exit 1
+          fi
+          sort -k1,1n -k2,2 /tmp/shard-plan.tsv -o /tmp/shard-plan.tsv
+          wc -l /tmp/shard-plan.tsv
+
+      - name: Upload the shard plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-shard-plan
+          path: /tmp/shard-plan.tsv
+
+  build:
+    name: Build quality binaries once
+    runs-on: ubuntu-latest
+    # The build is the long pole and runs once for every shard. Keep a backstop
+    # under the platform's 6-hour job ceiling.
+    timeout-minutes: 330
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -95,13 +276,6 @@ jobs:
           cache-all-crates: true
           shared-key: reference-quality
 
-      # Provision the full mature-tool reference stack (system libs + R + CRAN/
-      # Bioconductor/INLA packages + Python + the scientific reference libs).
-      # Shared with the Rust CI test shards (test.yml) via one composite action
-      # so the two provisioning paths can never drift.
-      - name: Install reference tool stack (R + Python mature comparators)
-        uses: ./.github/actions/install-reference-tools
-
       - name: Build quality tests
         shell: bash
         run: |
@@ -136,12 +310,103 @@ jobs:
           cargo build --keep-going --profile release-dev -p gam-cli --bin gam \
             || echo "gam CLI build reported errors; CLI-shelling quality tests will report TEST_ERROR"
 
+      - name: Archive the quality binaries for the shards
+        shell: bash
+        run: |
+          set -uo pipefail
+          # The run loop executes these binaries directly and never calls cargo,
+          # so the shards need exactly this archive: both grouped libtest
+          # binaries and the CLI some cases spawn. `--keep-going` above may have
+          # produced none of them; the archive is still created, and each shard
+          # reports BUILDFAIL for every case it was assigned, which is what a
+          # missing binary has always meant here.
+          mkdir -p /tmp/quality-bin/deps
+          find target/release-dev/deps -maxdepth 1 -type f -perm -u+x \
+            \( -name 'quality-*' -o -name 'quality_1082-*' \) ! -name '*.*' \
+            -exec cp -p {} /tmp/quality-bin/deps/ \; 2>/dev/null || true
+          cp -p target/release-dev/gam /tmp/quality-bin/gam 2>/dev/null || true
+          ls -l /tmp/quality-bin /tmp/quality-bin/deps || true
+
+      - name: Upload the quality binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-binaries
+          path: /tmp/quality-bin
+          if-no-files-found: warn
+
+  quality:
+    name: Reference quality vs mature tools (shard ${{ matrix.shard }}/${{ needs.plan.outputs.total }})
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    strategy:
+      # Never cancel the siblings: each shard holds measurements no other shard
+      # can reproduce, and losing them to a neighbour's failure is the reason
+      # this suite has never recorded a complete run.
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    env:
+      SHARD_INDEX: ${{ matrix.shard }}
+      SHARD_TOTAL: ${{ needs.plan.outputs.total }}
+      PLAN: /tmp/shard-plan/shard-plan.tsv
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # #1458: full history so build.rs author gate resolves real last editor, not HEAD
+
+      - name: Free runner disk space
+        run: |
+          set -uo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-}" || true
+          df -h /
+
+      # Provision the full mature-tool reference stack (system libs + R + CRAN/
+      # Bioconductor/INLA packages + Python + the scientific reference libs).
+      # Shared with the Rust CI test shards (test.yml) via one composite action
+      # so the two provisioning paths can never drift.
+      - name: Install reference tool stack (R + Python mature comparators)
+        uses: ./.github/actions/install-reference-tools
+
+      - name: Download the quality binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: quality-binaries
+          # Restored where the run loop already looks (`target/release-dev/deps`
+          # for the libtest binaries, `target/release-dev/gam` for the CLI some
+          # cases spawn), so the loop below is unchanged by the sharding.
+          path: target/release-dev
+
+      - name: Download the shard plan
+        uses: actions/download-artifact@v4
+        with:
+          name: quality-shard-plan
+          path: /tmp/shard-plan
+
+      - name: Make the quality binaries executable
+        shell: bash
+        run: |
+          set -uo pipefail
+          # upload-artifact does not preserve the executable bit.
+          chmod +x target/release-dev/deps/* target/release-dev/gam 2>/dev/null || true
+          ls -l target/release-dev target/release-dev/deps || true
+
       - name: Run quality suite (resilient + streaming; full per-test capture)
         # gam#1561: the platform's 6-hour JOB cap kills every later step, so a run that
         # outlived it published nothing and its measured cases were discarded (85 of
         # them on one run). A STEP bound under that cap stops only this loop; the
         # always() aggregate, upload and publish steps then record what was measured,
         # with completeness=INCOMPLETE set by the loop's own bookkeeping.
+        #
+        # SHARD BUDGET: the `plan` job reads the number below and packs each
+        # shard's summed per-case bounds to fit inside it, so the cap the step
+        # enforces and the budget the plan packs against are one number.
         timeout-minutes: 320
         shell: bash
         run: |
@@ -204,6 +469,39 @@ jobs:
           if [ "$measured" -eq 1 ]; then
             printf '%s\n' "${tests[@]}" > "$OUT/quality_cases.txt"
           fi
+          # SHARD FILTER. `plan` assigned every case of the tracked list to a
+          # shard; this job runs only the ones assigned to it. The full
+          # enumeration was written above, before this filter, because the merge
+          # job's completeness denominator is the suite, not the shard.
+          #
+          # A case the live binaries enumerate that the plan never saw (a test
+          # added since the tracked list was written) is spread by its position
+          # among the sorted unplanned names, so it lands on exactly one shard
+          # and is never dropped for being new. A planned case the binaries no
+          # longer enumerate simply does not run; the merge job reports it as a
+          # case the plan expected and the suite did not produce.
+          declare -A plan_shard
+          while IFS=$'\t' read -r planned_shard planned_case; do
+            plan_shard["$planned_case"]="$planned_shard"
+          done < "$PLAN"
+          mine=(); unplanned=()
+          for t in "${tests[@]}"; do
+            if [ -n "${plan_shard[$t]:-}" ]; then
+              if [ "${plan_shard[$t]}" = "$SHARD_INDEX" ]; then mine+=("$t"); fi
+            else
+              unplanned+=("$t")
+            fi
+          done
+          if [ "${#unplanned[@]}" -gt 0 ]; then
+            spread=0
+            while IFS= read -r t; do
+              if [ $(( spread % SHARD_TOTAL + 1 )) -eq "$SHARD_INDEX" ]; then mine+=("$t"); fi
+              spread=$((spread+1))
+            done < <(printf '%s\n' "${unplanned[@]}" | LC_ALL=C sort)
+            echo "shard $SHARD_INDEX: ${#unplanned[@]} case(s) are not in the plan; spread across the $SHARD_TOTAL shards by sorted position"
+          fi
+          tests=(${mine[@]+"${mine[@]}"})
+          echo "shard $SHARD_INDEX/$SHARD_TOTAL runs ${#tests[@]} of the enumerated cases"
           # PER-CASE BOUND. SPEC permits deadlines in tests, and libtest has none per
           # test, so one non-terminating case used to consume the whole job: run
           # 34646487573 spent over 5 hours inside case 86/433
@@ -621,6 +919,173 @@ jobs:
             echo "| **total** | **$N** | |"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "pass=$pass metric_off=$metricoff gam_error=$gamerr ref_error=$referr test_error=$testerr build_fail=$bf timeout=$timeouterr (of $N)"
+          # Hand this shard's counts to the merge job, which owns the gate. A
+          # shard cannot decide the suite's red/green: it has seen a slice.
+          printf 'pass\t%d\nmetric_off\t%d\ngam_error\t%d\nref_error\t%d\ntest_error\t%d\nbuild_fail\t%d\ntimeout\t%d\nguaranteed_ref_error\t%d\nassigned\t%d\n' \
+            "$pass" "$metricoff" "$gamerr" "$referr" "$testerr" "$bf" "$timeouterr" "$guaranteed_referr" "$N" \
+            > "$OUT/tallies.tsv"
+          # The shard always exits 0. A non-zero exit here would mark the job
+          # failed, and a failed matrix job skips the merge job through `needs`
+          # -- destroying the evidence of every other shard, which is the exact
+          # failure this sharding exists to end. The merge job reads the rows.
+          exit 0
+
+      - name: Upload this shard's results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-results-shard-${{ matrix.shard }}
+          path: /tmp/quality-report
+          if-no-files-found: ignore
+  merge:
+    name: Merge shards, aggregate and publish
+    permissions:
+      contents: write
+      actions: read
+    needs: [plan, quality]
+    # `always()`: a shard that was cancelled or hit its cap still uploaded the
+    # rows it measured, and those are usually the interesting ones. Merging only
+    # on success would discard them for the same reason the unsharded job used
+    # to discard its tail.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download every shard's results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: quality-results-shard-*
+          path: /tmp/quality-shards
+
+      - name: Merge the shards into one suite record
+        shell: bash
+        run: |
+          # Reporting, not gating: `-e` off, as in the run step.
+          set +e -u -o pipefail
+          merge_root=/tmp/quality-report
+          shards_root=/tmp/quality-shards
+          rm -rf "$merge_root"; mkdir -p "$merge_root/logs"
+          merged_tsv="$merge_root/quality_results.tsv"
+          merged_jsonl="$merge_root/quality_results.jsonl"
+          # The suite's enumeration is the UNION of what the shards enumerated.
+          # Every shard lists the whole binary before filtering to its own slice,
+          # so the union is the suite; taking one shard's list would be the same
+          # prefix-for-the-whole mistake the completeness marker exists to stop.
+          cat "$shards_root"/*/quality_cases.txt 2>/dev/null | LC_ALL=C sort -u > "$merge_root/quality_cases.txt"
+          enumerated=$(wc -l < "$merge_root/quality_cases.txt")
+          # One shard reporting `measured false` means a binary did not
+          # enumerate there, so the union is not a measurement of the suite.
+          measured=true
+          for marker in "$shards_root"/*/completeness.tsv; do
+            [ -f "$marker" ] || continue
+            if [ "$(awk -F'\t' '$1=="measured"{print $2}' "$marker")" != "true" ]; then measured=false; fi
+          done
+          [ -n "$(ls -A "$shards_root" 2>/dev/null)" ] || measured=false
+          # Rows, renumbered into one `idx` sequence and deduplicated by test
+          # name in shard order. A case two shards both ran would otherwise be
+          # counted twice, which would make `rows_written` exceed `enumerated`
+          # and read as a bigger suite.
+          printf 'idx\toutcome\tcause\ttest\trc\tdur_s\tsub_passed\tsub_failed\tmetric\treason\n' > "$merged_tsv"
+          : > "$merged_jsonl"
+          shard_tsvs=$(ls -d "$shards_root"/*/quality_results.tsv 2>/dev/null | LC_ALL=C sort)
+          # One awk pass over the shards in name order: drop each shard's header
+          # row, drop a case a previous shard already reported, and renumber the
+          # surviving rows into one `idx` sequence. The duplicate names go to a
+          # file so the count below is read, not parsed out of the log.
+          : > "$merge_root/duplicate_cases.txt"
+          if [ -n "$shard_tsvs" ]; then
+            # shellcheck disable=SC2086
+            awk -F'\t' -v OFS='\t' -v dup="$merge_root/duplicate_cases.txt" '
+              FNR == 1 { next }
+              seen[$4]++ { print $4 > dup; next }
+              { $1 = ++idx; print }
+            ' $shard_tsvs >> "$merged_tsv"
+          fi
+          duplicates=$(wc -l < "$merge_root/duplicate_cases.txt")
+          if [ "$duplicates" -gt 0 ]; then
+            while IFS= read -r case_name; do
+              echo "::warning::case $case_name was run by more than one shard; kept the first shard's row"
+            done < "$merge_root/duplicate_cases.txt"
+          fi
+          for shard_dir in "$shards_root"/*/; do
+            [ -d "$shard_dir" ] || continue
+            [ -f "$shard_dir/quality_results.jsonl" ] && cat "$shard_dir/quality_results.jsonl" >> "$merged_jsonl"
+            cp -p "$shard_dir"logs/*.log "$merge_root/logs/" 2>/dev/null || true
+          done
+          rows_written=$(( $(wc -l < "$merged_tsv") - 1 ))
+          # Sum the shards' own tallies rather than recounting the merged TSV:
+          # the tallies also carry `guaranteed_ref_error`, which is decided per
+          # case from its source file inside the run loop and cannot be
+          # recovered from an outcome column.
+          for name in pass metric_off gam_error ref_error test_error build_fail timeout guaranteed_ref_error assigned; do
+            printf '%s\t%d\n' "$name" \
+              "$(awk -F'\t' -v k="$name" '$1==k{s+=$2} END{print s+0}' "$shards_root"/*/tallies.tsv 2>/dev/null)"
+          done > "$merge_root/tallies.tsv"
+          if [ "$measured" != "true" ]; then
+            completeness=NOT_MEASURED
+          elif [ "$rows_written" -eq "$enumerated" ]; then
+            completeness=COMPLETE
+          else
+            completeness=PARTIAL
+          fi
+          printf 'completeness\t%s\nmeasured\t%s\nenumerated\t%d\nrows_written\t%d\nshards\t%d\nduplicate_rows\t%d\n' \
+            "$completeness" "$measured" "$enumerated" "$rows_written" \
+            "$(ls -d "$shards_root"/*/ 2>/dev/null | wc -l)" "$duplicates" > "$merge_root/completeness.tsv"
+          echo "MERGED completeness=$completeness enumerated=$enumerated rows_written=$rows_written duplicates=$duplicates"
+          cat "$merge_root/completeness.tsv"
+          cat "$merge_root/tallies.tsv"
+          # The cases the plan expected that no shard produced a row for. A
+          # planned case the binaries no longer enumerate is a deleted test; one
+          # that is still enumerated and has no row is a shard that did not
+          # reach it, which is what PARTIAL means.
+          if [ "$rows_written" -ne "$enumerated" ]; then
+            echo "----- enumerated but unrecorded -----"
+            comm -23 "$merge_root/quality_cases.txt" <(tail -n +2 "$merged_tsv" | cut -f4 | LC_ALL=C sort)
+            echo "-------------------------------------"
+          fi
+          if [ "$measured" = "true" ]; then
+            echo "QUALITY_MEASURED=true" >> "$GITHUB_ENV"
+          else
+            echo "QUALITY_MEASURED=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Gate the suite on the merged outcomes
+        shell: bash
+        run: |
+          set +e -u -o pipefail
+          OUT=/tmp/quality-report
+          RES="$OUT/quality_results.tsv"
+          tally() { awk -F'\t' -v k="$1" '$1==k{print $2}' "$OUT/tallies.tsv"; }
+          pass=$(tally pass); metricoff=$(tally metric_off); gamerr=$(tally gam_error)
+          referr=$(tally ref_error); testerr=$(tally test_error); bf=$(tally build_fail)
+          timeouterr=$(tally timeout); guaranteed_referr=$(tally guaranteed_ref_error)
+          N=$(awk -F'\t' '$1=="enumerated"{print $2}' "$OUT/completeness.tsv")
+          completeness=$(awk -F'\t' '$1=="completeness"{print $2}' "$OUT/completeness.tsv")
+          {
+            echo ""
+            echo "### Totals (merged over the shards)"
+            echo ""
+            echo "| outcome | count | meaning |"
+            echo "|---|---|---|"
+            echo "| PASS | $pass | met the quality bar |"
+            echo "| METRIC_OFF | $metricoff | gam ran; a quality metric missed its bound |"
+            echo "| GAM_ERROR | $gamerr | gam fit crashed / refused / failed to converge |"
+            echo "| REF_ERROR | $referr | reference tool failed or missing |"
+            echo "| TEST_ERROR | $testerr | test/harness setup defect |"
+            echo "| BUILDFAIL | $bf | did not compile |"
+            echo "| TIMEOUT | $timeouterr | stopped at its per-test bound (\`.config/nextest.toml\`) |"
+            echo "| **enumerated** | **$N** | completeness: $completeness |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "pass=$pass metric_off=$metricoff gam_error=$gamerr ref_error=$referr test_error=$testerr build_fail=$bf timeout=$timeouterr (of $N)"
+          # An INCOMPLETE suite is itself a gating failure. The acceptance of
+          # #1561 is "no case failing OR UNRECORDED", and a run that measured a
+          # prefix cannot report green on the strength of the prefix.
+          if [ "$completeness" != "COMPLETE" ]; then
+            echo "::error::Reference Quality Suite INCOMPLETE ($completeness): $(awk -F'\t' '$1=="rows_written"{print $2}' "$OUT/completeness.tsv") of $N enumerated cases produced a row. The unrecorded cases are listed in the merge step."
+            { echo ""; echo "### Gate: FAILED (incomplete)"; echo ""; echo "completeness=$completeness"; } >> "$GITHUB_STEP_SUMMARY"
+          fi
           # GATE the pipeline. The suite is the ONLY end-to-end measurement of gam
           # quality vs the mature standard tools; if it cannot go red, every quality
           # regression lands on main silently (the #1087 meta-bug). We ran ALL N
@@ -699,6 +1164,7 @@ jobs:
           fi
           echo "Gate: PASSED — every test met its quality bar; guaranteed-comparator reference coverage 100% (mgcv/gamlss/survival REF_ERROR=0); optional-reference REF_ERROR=${referr}/${N} within the 25% floor."
           { echo ""; echo "### Gate: PASSED"; } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$completeness" != "COMPLETE" ]; then exit 1; fi
 
       # #1561 aggregate + #2395 power view. The gate above decides red/green from
       # per-test outcomes; this reads the machine-readable [QUALITY_PAIR] lines
@@ -751,7 +1217,6 @@ jobs:
           # stdout/stderr log. "Everything that happened", not just the headlines.
           path: /tmp/quality-report
           if-no-files-found: ignore
-
 
       # Track this run's uncompressed numbers in-tree (bench/gha_results/reference-quality).
       # `!cancelled()` rather than `always()` so a FAILED or timed-out run still

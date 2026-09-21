@@ -1,5 +1,20 @@
 ## Unreleased
 
+- **The reference-quality suite runs as a sharded matrix, and its shard count is derived
+  from the per-case bounds** (#1561). One job ran all 437 cases serially. With the repo's own
+  per-case bound (`.config/nextest.toml`: 600 s by default, up to 2400 s for the declared
+  exemptions) that job's worst case is the sum of every bound, 269,400 s or 74.8 hours,
+  against a 6-hour platform cap, so the cases after the cap were never executed and "no case
+  failing or unrecorded" was unreachable from one job. A `plan` job now packs the cases into
+  the fewest bins whose summed bounds each fit the run step's own `timeout-minutes`, a `build`
+  job compiles the binaries once, the shards execute them and each uploads its rows, and one
+  `merge` job folds the shards into the single published record, owns the gate, and refuses a
+  run whose merged rows do not cover the enumerated union. At today's bounds the rule yields
+  15 shards of 27-30 cases, each holding at most 18,000 s of bound against a 19,200 s cap; the
+  count is a function of the bounds and falls as they tighten.
+  **Behavior change:** an incomplete suite is now a gating failure in its own right, where a
+  truncated run used to publish its prefix and report on the strength of it.
+
 - **The free Gaussian-mixture rung is priced by its Laplace evidence, not by EM and BIC** (gam#4562).
   The discrete-mixture rung fitted a full-covariance mixture by EM under a
   `covariance_floor` of `1e-6` and scored the order by `BIC/2 = −loglik + (P/2) ln n`.

@@ -354,3 +354,356 @@ fn test_reference_quality_panic_message_keeps_every_line() {
     assert_eq!(capture("running 1 test\ntest result: FAILED\n"), "");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Everything the merge job does to fold the shards into ONE suite record,
+/// lifted out of the workflow so no test can hold a second copy of it — the
+/// same contract as [`panic_message_assignment`] for the run step's
+/// `panicmsg`.
+///
+/// The block is bounded by its own code, not by a marker planted for this
+/// test: it opens at `merge_root=`, which names the merged directory, and
+/// closes at the `printf` that writes `completeness.tsv`, which is its last
+/// statement. What follows in that step — the unrecorded-case listing and the
+/// `$GITHUB_ENV` hand-off — is GitHub plumbing rather than the merge, and a
+/// script that carried it could not run outside a job. Each line is trimmed, as
+/// for the run step, so the extracted script is free of the YAML indentation.
+fn merge_script(yaml: &str) -> String {
+    let mut lines: Vec<&str> = Vec::new();
+    for line in yaml.lines() {
+        let trimmed = line.trim();
+        if lines.is_empty() && !trimmed.starts_with("merge_root=") {
+            continue;
+        }
+        lines.push(trimmed);
+        if trimmed.ends_with("> \"$merge_root/completeness.tsv\"") {
+            break;
+        }
+    }
+    assert!(
+        lines
+            .first()
+            .is_some_and(|first| first.starts_with("merge_root="))
+            && lines
+                .last()
+                .is_some_and(|last| last.ends_with("> \"$merge_root/completeness.tsv\"")),
+        "the merge job folds the shards with a block from `merge_root=` to the \
+         `printf` that writes completeness.tsv"
+    );
+    lines.join("\n")
+}
+
+/// The merge folds every shard's rows into one record, once each, renumbered
+/// into a single `idx` sequence, and its completeness marker is denominated in
+/// the UNION of what the shards enumerated.
+///
+/// This is the property the sharding is for. Before it, one job ran all 437
+/// cases and a run that outlived its cap published a prefix; a prefix of a
+/// measurement looks exactly like a smaller suite, which is how a 60-of-456
+/// fragment became the tracked artifact. Merging is now the only place the
+/// suite's row count is decided, so it is the only place that can make that
+/// mistake again.
+#[test]
+fn test_reference_quality_merge_folds_every_shard_row_exactly_once() {
+    let yaml = std::fs::read_to_string(".github/workflows/reference-quality.yml").unwrap();
+    let dir = std::env::temp_dir().join(format!("quality_merge_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Point the block at this fixture instead of the job's absolute paths. The
+    // replacement is asserted, so renaming either directory in the workflow
+    // fails here rather than silently testing nothing.
+    let merged = dir.join("merged");
+    let shards = dir.join("shards");
+    let script_body = merge_script(&yaml)
+        .replace(
+            "merge_root=/tmp/quality-report",
+            &format!("merge_root={}", merged.display()),
+        )
+        .replace(
+            "shards_root=/tmp/quality-shards",
+            &format!("shards_root={}", shards.display()),
+        );
+    assert!(
+        script_body.contains(&format!("merge_root={}", merged.display()))
+            && script_body.contains(&format!("shards_root={}", shards.display())),
+        "the merge block names /tmp/quality-report and /tmp/quality-shards; it now reads:\n{script_body}"
+    );
+    let script = dir.join("merge.sh");
+    std::fs::write(&script, format!("set +e -u -o pipefail\n{script_body}\n")).unwrap();
+
+    let header = "idx\toutcome\tcause\ttest\trc\tdur_s\tsub_passed\tsub_failed\tmetric\treason\n";
+    // Every shard enumerates the whole binary and runs its own slice, so the
+    // case lists agree and the row sets are disjoint.
+    let cases = "a::t1\na::t2\nb::t3\nb::t4\n";
+    let write_shard = |name: &str, rows: &str, measured: &str| {
+        let shard = shards.join(name);
+        std::fs::create_dir_all(shard.join("logs")).unwrap();
+        std::fs::write(shard.join("quality_cases.txt"), cases).unwrap();
+        std::fs::write(shard.join("quality_results.tsv"), format!("{header}{rows}")).unwrap();
+        std::fs::write(shard.join("quality_results.jsonl"), "").unwrap();
+        std::fs::write(
+            shard.join("completeness.tsv"),
+            format!("measured\t{measured}\n"),
+        )
+        .unwrap();
+        std::fs::write(shard.join("tallies.tsv"), "pass\t1\nassigned\t2\n").unwrap();
+    };
+    let shard_one = "1\tPASS\tok\ta::t1\t0\t3\t1\t0\trmse=0.1\t\n\
+                     2\tPASS\tok\ta::t2\t0\t4\t1\t0\t\t\n";
+    let shard_two = "1\tGAM_ERROR\tgam_fit_failed\tb::t3\t101\t9\t0\t1\t\tboom\n\
+                     2\tPASS\tok\tb::t4\t0\t2\t1\t0\t\t\n";
+
+    let run = || -> (Vec<String>, String) {
+        let _ = std::fs::remove_dir_all(&merged);
+        let output = Command::new("bash").arg(&script).output().unwrap();
+        assert!(
+            output.status.success(),
+            "the merge block failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: Vec<String> = std::fs::read_to_string(merged.join("quality_results.tsv"))
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(str::to_string)
+            .collect();
+        let marker = std::fs::read_to_string(merged.join("completeness.tsv")).unwrap();
+        (rows, marker)
+    };
+    let field = |marker: &str, key: &str| -> String {
+        marker
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}\t")))
+            .unwrap_or_else(|| panic!("completeness.tsv has no `{key}` row: {marker}"))
+            .to_string()
+    };
+
+    // Both shards complete: every row survives, once, renumbered 1..4 in shard
+    // name order, and the marker is COMPLETE against the enumerated union.
+    write_shard("quality-results-shard-1", shard_one, "true");
+    write_shard("quality-results-shard-2", shard_two, "true");
+    let (rows, marker) = run();
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|row| row.split('\t').nth(3).unwrap())
+        .collect();
+    assert_eq!(names, ["a::t1", "a::t2", "b::t3", "b::t4"]);
+    let indices: Vec<&str> = rows
+        .iter()
+        .map(|row| row.split('\t').next().unwrap())
+        .collect();
+    assert_eq!(
+        indices,
+        ["1", "2", "3", "4"],
+        "idx is renumbered across shards"
+    );
+    assert!(
+        rows[2].contains("GAM_ERROR") && rows[2].ends_with("boom"),
+        "the outcome columns are carried verbatim: {}",
+        rows[2]
+    );
+    assert_eq!(field(&marker, "completeness"), "COMPLETE");
+    assert_eq!(field(&marker, "enumerated"), "4");
+    assert_eq!(field(&marker, "rows_written"), "4");
+    assert_eq!(field(&marker, "duplicate_rows"), "0");
+
+    // A shard that reached only part of its slice makes the SUITE partial. This
+    // is the case the old single job could not express: it published the prefix
+    // and called it the suite.
+    write_shard(
+        "quality-results-shard-2",
+        "1\tGAM_ERROR\tgam_fit_failed\tb::t3\t101\t9\t0\t1\t\tboom\n",
+        "true",
+    );
+    let (rows, marker) = run();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(field(&marker, "completeness"), "PARTIAL");
+    assert_eq!(field(&marker, "enumerated"), "4");
+    assert_eq!(field(&marker, "rows_written"), "3");
+
+    // A shard whose binary did not enumerate makes the union no measurement of
+    // the suite, whatever the other shards wrote (#2744).
+    write_shard("quality-results-shard-2", shard_two, "false");
+    let (_, marker) = run();
+    assert_eq!(field(&marker, "completeness"), "NOT_MEASURED");
+    assert_eq!(field(&marker, "measured"), "false");
+
+    // A case two shards both ran is kept once, from the first shard in name
+    // order, and counted. Without the dedup `rows_written` would exceed
+    // `enumerated` and the suite would read as larger than it is.
+    write_shard(
+        "quality-results-shard-2",
+        &format!("{shard_two}3\tPASS\tok\ta::t1\t0\t5\t1\t0\t\t\n"),
+        "true",
+    );
+    let (rows, marker) = run();
+    let names: Vec<&str> = rows
+        .iter()
+        .map(|row| row.split('\t').nth(3).unwrap())
+        .collect();
+    assert_eq!(names, ["a::t1", "a::t2", "b::t3", "b::t4"]);
+    assert_eq!(
+        rows[0].split('\t').nth(5).unwrap(),
+        "3",
+        "the first shard's row is the one kept"
+    );
+    assert_eq!(field(&marker, "duplicate_rows"), "1");
+    assert_eq!(field(&marker, "completeness"), "COMPLETE");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The shard plan is derived from the case list and the per-case bounds, and
+/// every shard fits the run step's own cap.
+///
+/// The count is not a number in the workflow: it is whatever packing the bounds
+/// force. This pins the two properties that make it a guarantee rather than a
+/// hope — each shard's summed bounds fit the budget, and every enumerated case
+/// is assigned to exactly one shard — and it pins the budget to the step cap,
+/// so raising `timeout-minutes` without re-deriving the plan cannot pass.
+#[test]
+fn test_reference_quality_shard_plan_fits_every_shard_in_the_step_cap() {
+    let yaml = std::fs::read_to_string(".github/workflows/reference-quality.yml").unwrap();
+    let dir = std::env::temp_dir().join(format!("quality_plan_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // The plan is a python heredoc in the `plan` job; run the same body.
+    let body: String = {
+        let mut lines: Vec<&str> = Vec::new();
+        let mut inside = false;
+        for line in yaml.lines() {
+            if !inside {
+                if line.trim().starts_with("if ! python3 - <<'PLAN'") {
+                    inside = true;
+                }
+                continue;
+            }
+            if line.trim() == "PLAN" {
+                break;
+            }
+            lines.push(line.strip_prefix("          ").unwrap_or(line));
+        }
+        assert!(
+            lines.iter().any(|line| line.contains("SHARD BUDGET")),
+            "the plan reads the shard budget out of the workflow"
+        );
+        lines.join("\n")
+    };
+    let script = dir.join("plan.py");
+    std::fs::write(&script, body).unwrap();
+    let summary = dir.join("summary.md");
+    let outputs = dir.join("outputs.txt");
+    std::fs::write(&summary, "").unwrap();
+    std::fs::write(&outputs, "").unwrap();
+    let output = Command::new("python3")
+        .arg(&script)
+        .env("GITHUB_STEP_SUMMARY", &summary)
+        .env("GITHUB_OUTPUT", &outputs)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the shard plan did not derive: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan = String::from_utf8(output.stdout).unwrap();
+    let cases: Vec<String> =
+        std::fs::read_to_string("bench/gha_results/reference-quality/quality_cases.txt")
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_string)
+            .collect();
+    let mut assigned: Vec<(usize, String)> = plan
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let (shard, case) = line.split_once('\t').expect("`<shard>\\t<case>` rows");
+            (
+                shard.parse::<usize>().expect("a shard number"),
+                case.to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        assigned.len(),
+        cases.len(),
+        "every enumerated case is assigned once"
+    );
+    let mut names: Vec<&String> = assigned.iter().map(|(_, case)| case).collect();
+    names.sort();
+    let mut expected: Vec<&String> = cases.iter().collect();
+    expected.sort();
+    assert_eq!(names, expected, "the plan covers exactly the case list");
+
+    // The shard count the plan announced, and the budget it packed against.
+    let outputs = std::fs::read_to_string(&outputs).unwrap();
+    let total: usize = outputs
+        .lines()
+        .find_map(|line| line.strip_prefix("total="))
+        .expect("the plan outputs `total=`")
+        .parse()
+        .unwrap();
+    assert!(total >= 1);
+    let summary = std::fs::read_to_string(&summary).unwrap();
+    let budget: usize = summary
+        .split("budget=")
+        .nth(1)
+        .and_then(|rest| rest.split('s').next())
+        .expect("the plan reports the budget it packed against")
+        .parse()
+        .unwrap();
+    // The budget is the run step's cap, not a second number.
+    // The cap is the `timeout-minutes:` under the `# SHARD BUDGET:` COMMENT —
+    // matched as a comment line, so the plan script's own mention of the marker
+    // in its regex and its error message cannot stand in for it.
+    let cap_minutes: usize = yaml
+        .lines()
+        .skip_while(|line| !line.trim_start().starts_with("# SHARD BUDGET:"))
+        .find_map(|line| line.trim().strip_prefix("timeout-minutes:"))
+        .expect("the run step carries the `# SHARD BUDGET:` cap")
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        budget,
+        cap_minutes * 60,
+        "the plan packs against the step's own cap"
+    );
+
+    // Every shard's summed bounds fit the budget. The loads are in the summary
+    // table the plan writes, one row per shard.
+    let mut shards_seen = 0usize;
+    for line in summary.lines() {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        // `| shard | cases | bound load | recorded load |`
+        if cells.len() != 6 || cells[1].parse::<usize>().is_err() {
+            continue;
+        }
+        shards_seen += 1;
+        let load: usize = cells[3]
+            .trim_end_matches('s')
+            .parse()
+            .expect("a bound load in seconds");
+        assert!(
+            load <= budget,
+            "shard {} holds {load}s of bound against a {budget}s cap",
+            cells[1]
+        );
+    }
+    assert_eq!(shards_seen, total, "the summary reports every shard's load");
+    assert_eq!(
+        assigned.iter().map(|(shard, _)| *shard).max().unwrap(),
+        total,
+        "the assignment uses every shard the plan announced"
+    );
+    assigned.sort();
+    assert!(
+        assigned.windows(2).all(|pair| pair[0].1 != pair[1].1),
+        "no case is assigned to two shards"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
