@@ -104,8 +104,11 @@ impl DispersionLocationScalePredictor {
     /// joint integral.
     ///
     /// Integrated with the same projected bivariate quadrature the posterior
-    /// means use, over the exact per-row 2×2 covariance of `(η_μ, η_d)`; with
-    /// no stored covariance the integral degenerates to the plug-in law.
+    /// means use, over the exact per-row 2×2 covariance of `(η_μ, η_d)`. The
+    /// covariance is required: without it the posterior of `(η_μ, η_d)` does
+    /// not exist, and reading it as zero would silently report the plug-in law
+    /// as the integrated noise (the Gaussian location-scale `log_sigma_posterior`
+    /// refuses the same model).
     fn integrated_response_variance(
         &self,
         input: &PredictInput,
@@ -122,26 +125,28 @@ impl DispersionLocationScalePredictor {
         let n = eta_mu.len();
         let response = &self.likelihood.response;
         let strategy = self.strategy();
-        let (var_mu, var_d, cov_md) = match self.covariance.as_ref() {
-            Some(covariance) => {
-                let design_noise = input.design_noise.as_ref().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "dispersion location-scale prediction requires noise design matrix"
-                            .to_string(),
-                    )
-                })?;
-                let backend = PredictionCovarianceBackend::from_dense(covariance.view());
-                project_two_block_linear_predictor_covariance(
-                    &input.design,
-                    design_noise,
-                    &backend,
-                    self.beta_mu.len(),
-                    self.beta_noise.len(),
-                    "dispersion location-scale observation noise",
-                )?
-            }
-            None => (Array1::zeros(n), Array1::zeros(n), Array1::zeros(n)),
-        };
+        let covariance = self.covariance.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "dispersion location-scale observation noise integrates the joint \
+                 (mean, log-precision) posterior, but this model carries no coefficient \
+                 covariance; refit with covariance"
+                    .to_string(),
+            )
+        })?;
+        let design_noise = input.design_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "dispersion location-scale prediction requires noise design matrix".to_string(),
+            )
+        })?;
+        let backend = PredictionCovarianceBackend::from_dense(covariance.view());
+        let (var_mu, var_d, cov_md) = project_two_block_linear_predictor_covariance(
+            &input.design,
+            design_noise,
+            &backend,
+            self.beta_mu.len(),
+            self.beta_noise.len(),
+            "dispersion location-scale observation noise",
+        )?;
         let quadctx = gam_solve::quadrature::QuadratureContext::new();
         let mut variance = Array1::<f64>::zeros(n);
         for i in 0..n {
@@ -657,6 +662,37 @@ mod tests {
         assert!(
             pred.noise_sd(&input).is_err(),
             "noise_sd must error when design_noise is absent"
+        );
+    }
+
+    /// The integrated observation noise needs the joint (η_μ, η_d) posterior: a
+    /// model without coefficient covariance is refused rather than read as a
+    /// zero-variance posterior (which would silently report the plug-in law).
+    #[test]
+    fn observation_noise_refuses_missing_covariance() {
+        let nu = 5.0_f64;
+        let mut pred = make_pred(ResponseFamily::Gamma, StandardLink::Log);
+        let input = make_input(nu.ln());
+        let err = pred
+            .observation_noise(&input)
+            .expect_err("observation noise must refuse a model with no covariance");
+        assert!(
+            err.to_string().contains("coefficient covariance"),
+            "unexpected error: {err}"
+        );
+        // A degenerate (zero) posterior is an explicit covariance and integrates
+        // to the plug-in Gamma law `μ²/ν` at μ = 1.
+        pred.covariance = Some(Array2::<f64>::zeros((2, 2)));
+        let noise = pred
+            .observation_noise(&input)
+            .expect("observation noise with covariance")
+            .expect("dispersion-LS exposes a per-row observation noise");
+        let expected = (1.0 / nu).sqrt();
+        assert!(
+            (noise[0] - expected).abs() < 1e-12,
+            "Gamma observation noise: got {:.6e}, expected {:.6e}",
+            noise[0],
+            expected
         );
     }
 }
