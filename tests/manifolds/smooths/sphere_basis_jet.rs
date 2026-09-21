@@ -1,5 +1,5 @@
 //! Finite-difference verification of the analytic spherical-spline DESIGN jets
-//! (`∂Φ/∂(lat, lon)`) for all three kernels — Sobolev, pseudo, and harmonic.
+//! (`∂Φ/∂(lat, lon)`) for the Sobolev and truncated-Sobolev kernels and the harmonic basis.
 //!
 //! For each kernel we build the forward design at `points ± h` (central
 //! difference) in latitude then longitude and compare the resulting numeric
@@ -149,16 +149,6 @@ fn sobolev_jet_matches_finite_difference_all_orders() {
         assert_jet_matches_fd(
             &wahba_spec(SphereWahbaKernel::Sobolev, m),
             &format!("sobolev m={m}"),
-        );
-    }
-}
-
-#[test]
-fn pseudo_jet_matches_finite_difference_all_orders() {
-    for m in [1usize, 2, 3] {
-        assert_jet_matches_fd(
-            &wahba_spec(SphereWahbaKernel::Pseudo, m),
-            &format!("pseudo m={m}"),
         );
     }
 }

@@ -1032,7 +1032,7 @@ mod tests {
             "s(x, bs=cyclic)",
             "te(x, z, bs=c('cyclic','ps'))",
             "sphere(lat, lon, method=sobolev)",
-            "sphere(lat, lon, method=pseudo)",
+            "sphere(lat, lon, method=harmonic)",
             "s(x, bc=periodic)",
             "linear(x, min=0, max=1)",
             "nonnegative(x)",

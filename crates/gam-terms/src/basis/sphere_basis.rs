@@ -7,16 +7,6 @@ pub fn build_spherical_spline_basis(
     if matches!(spec.method, SphereMethod::Harmonic) {
         return build_spherical_harmonic_basis(data, spec);
     }
-    if matches!(spec.wahba_kernel, SphereWahbaKernel::Pseudo) {
-        let mut harmonic_spec = spec.clone();
-        harmonic_spec.method = SphereMethod::Harmonic;
-        harmonic_spec.penalty_order = 2;
-        harmonic_spec.max_degree = Some(match spec.max_degree {
-            Some(degree) => degree,
-            None => harmonic_degree_for_wahba_basis_width(spec, data.nrows())?,
-        });
-        return build_spherical_harmonic_basis(data, &harmonic_spec);
-    }
     validate_lat_lon_matrix(data, "spherical spline", spec.radians)?;
     if !(1..=4).contains(&spec.penalty_order) {
         crate::bail_invalid_basis!(
@@ -169,44 +159,6 @@ pub fn build_spherical_spline_basis(
 
 pub(crate) const SPHERE_UNPENALIZED_LOW_DEGREE: usize = 1;
 
-/// The harmonic degree the pseudo Wahba kernel routes through: the smallest `L`
-/// with `L(L+2)` at least the requested basis width, and at least 8. Past the
-/// degree-32 cap no degree reaches the width, and the build is refused rather
-/// than handed a row-count default that silently shrinks the basis.
-pub(crate) fn harmonic_degree_for_wahba_basis_width(
-    spec: &SphericalSplineBasisSpec,
-    n_rows: usize,
-) -> Result<usize, BasisError> {
-    let target = match &spec.center_strategy {
-        CenterStrategy::Auto(inner) => match inner.as_ref() {
-            CenterStrategy::FarthestPoint { num_centers }
-            | CenterStrategy::EqualMass { num_centers }
-            | CenterStrategy::EqualMassCovarRepresentative { num_centers }
-            | CenterStrategy::KMeans { num_centers, .. } => *num_centers,
-            CenterStrategy::UniformGrid { points_per_dim } => points_per_dim.saturating_pow(2),
-            CenterStrategy::UserProvided(centers) => centers.nrows(),
-            CenterStrategy::Auto(_) => default_num_centers(n_rows, 2),
-            CenterStrategy::DuchonSpectral { knots, .. } => knots.planned_num_centers(2),
-        },
-        CenterStrategy::FarthestPoint { num_centers } => *num_centers,
-        CenterStrategy::EqualMass { num_centers } => *num_centers,
-        CenterStrategy::EqualMassCovarRepresentative { num_centers } => *num_centers,
-        CenterStrategy::KMeans { num_centers, .. } => *num_centers,
-        CenterStrategy::UniformGrid { points_per_dim } => points_per_dim.saturating_pow(2),
-        CenterStrategy::UserProvided(centers) => centers.nrows(),
-        CenterStrategy::DuchonSpectral { knots, .. } => knots.planned_num_centers(2),
-    }
-    .max(1);
-    let Some(degree) = (1..=32).find(|&l| l * (l + 2) >= target) else {
-        crate::bail_invalid_basis!(
-            "the pseudo sphere kernel routes through spherical harmonics, and {target} basis \
-             columns need a degree above the cap of 32 (1088 columns); use at most 1088 centers \
-             or the sobolev kernel"
-        );
-    };
-    Ok(degree.max(8))
-}
-
 /// Refuse a harmonic truncation degree the dense harmonic engine cannot build.
 fn validate_spherical_harmonic_degree(l_max: usize) -> Result<(), BasisError> {
     if l_max < 1 {
@@ -223,17 +175,16 @@ fn validate_spherical_harmonic_degree(l_max: usize) -> Result<(), BasisError> {
 /// Column count of the basis [`build_spherical_spline_basis`] builds from `spec`
 /// on `n_rows` rows, read without evaluating it: the one width rule, so a caller
 /// that needs a static shape (the Python `Sphere.basis_size`) asks for it
-/// instead of restating it. The harmonic engine, which the pseudo Wahba kernel
-/// routes through, spans the `L(L+2)` harmonics of degrees `1..=L`; a Wahba
-/// center basis keeps one column per center (the section `[K Z - H C | H]`
-/// splits the centers between the kernel null-space block and the low-degree
-/// harmonics). Its center count is known before selection only for
-/// caller-supplied centers and for the farthest-point selector, which returns
-/// exactly its budget (completing from a lattice when the data hold fewer
-/// distinct directions); any other strategy is refused rather than guessed. A
-/// degree or center count the builder refuses is refused here with the same
-/// error. A frozen identifiability transform returns its active column count
-/// after validating its rows against that raw basis width.
+/// instead of restating it. The harmonic engine spans the `L(L+2)` harmonics of
+/// degrees `1..=L`; a Wahba center basis keeps one column per center (the
+/// section `[K Z - H C | H]` splits the centers between the kernel null-space
+/// block and the low-degree harmonics). Its center count is known before
+/// selection only for caller-supplied centers and for the farthest-point
+/// selector, which returns exactly its budget (completing from a lattice when
+/// the data hold fewer distinct directions); any other strategy is refused
+/// rather than guessed. A degree or center count the builder refuses is refused
+/// here with the same error. A frozen identifiability transform returns its
+/// active column count after validating its rows against that raw basis width.
 pub fn spherical_spline_basis_width(
     spec: &SphericalSplineBasisSpec,
     n_rows: usize,
@@ -242,11 +193,6 @@ pub fn spherical_spline_basis_width(
         spec.max_degree.unwrap_or_else(|| {
             default_spherical_harmonic_degree(n_rows, spec.penalty_order)
         })
-    } else if matches!(spec.wahba_kernel, SphereWahbaKernel::Pseudo) {
-        match spec.max_degree {
-            Some(degree) => degree,
-            None => harmonic_degree_for_wahba_basis_width(spec, n_rows)?,
-        }
     } else {
         let centers = match realized_center_strategy(&spec.center_strategy) {
             CenterStrategy::FarthestPoint { num_centers } => *num_centers,
@@ -4454,7 +4400,6 @@ mod width_rule_tests {
         });
         for (method,kernel,degree) in [
             (SphereMethod::Wahba,SphereWahbaKernel::Sobolev,None),
-            (SphereMethod::Wahba,SphereWahbaKernel::Pseudo,None),
             (SphereMethod::Harmonic,SphereWahbaKernel::Sobolev,Some(3)),
         ] {
             let mut spec=SphericalSplineBasisSpec {
@@ -4488,9 +4433,6 @@ mod width_rule_tests {
         spec.wahba_kernel=SphereWahbaKernel::Sobolev;
         spec.max_degree=None;
         spec.center_strategy=CenterStrategy::FarthestPoint {num_centers:1};
-        assert!(spherical_spline_basis_width(&spec,40).is_err());
-        spec.wahba_kernel=SphereWahbaKernel::Pseudo;
-        spec.center_strategy=CenterStrategy::FarthestPoint {num_centers:1089};
         assert!(spherical_spline_basis_width(&spec,40).is_err());
     }
 }

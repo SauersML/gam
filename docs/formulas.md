@@ -661,7 +661,7 @@ the poles.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `method` | `sobolev` | `sobolev`, `pseudo`, or `harmonic`. |
+| `method` | `sobolev` | `sobolev` or `harmonic`. |
 | `centers` / `k` | auto | Number of Wahba radial centers. For `method=harmonic`, `k` is instead resolved to the smallest `L` with `L(L+2) >= k`. |
 | `degree` / `max_degree` | auto | Harmonic-only maximum spherical harmonic degree `L`; basis width is `L(L+2)`. |
 | `penalty_order` | `2` | Wahba penalty order. |

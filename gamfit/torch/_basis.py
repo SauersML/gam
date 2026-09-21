@@ -716,10 +716,10 @@ def sphere_basis(
     Parameters
     ----------
     points : torch.Tensor of shape ``(N, 2)`` (latitude, longitude).
-    n_centers : Wahba center count for ``kernel='sobolev' | 'pseudo'`` or
+    n_centers : Wahba center count for ``kernel='sobolev'`` or
         truncation degree ``L`` for ``kernel='harmonic'``.
     penalty_order : roughness order ``m ∈ {1, 2, 3, 4}``. Default ``2``.
-    kernel : one of ``'sobolev'``, ``'pseudo'``, ``'harmonic'``.
+    kernel : one of ``'sobolev'``, ``'harmonic'``.
     radians : default ``False`` (degrees). True for radians.
     centers : optional ``(K, 2)`` array of pre-resolved centers.
 

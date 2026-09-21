@@ -8,9 +8,8 @@
 //!
 //! evaluated entry-by-entry against the 3-term Legendre recurrence kept
 //! in registers. The host CPU parity target is the matching
-//! `SphereWahbaKernel::SobolevTruncated { lmax }` /
-//! `SphereWahbaKernel::PseudoTruncated { lmax }` variant added to
-//! `src/terms/basis.rs` (single source: same recurrence, same c_ℓ).
+//! `SphereWahbaKernel::SobolevTruncated { lmax }` variant (single source: same
+//! recurrence, same c_ℓ).
 //!
 //! The device path evaluates the raw column-major kernel matrix with `f64`
 //! Legendre recurrence math. Host code owns centering, constraints, and solver
@@ -28,33 +27,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, CudaModule, CudaSlice, CudaStream};
-
-/// Which truncated-spectral Wahba kernel to evaluate on device. Matches
-/// the CPU `SphereWahbaKernel::{SobolevTruncated, PseudoTruncated}` so
-/// parity tests are well-defined.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum SphereSpectralKernelKind {
-    /// `c_ℓ = (2ℓ+1) / (4π · [ℓ(ℓ+1)]^m)` — true `H^m(S²)` Sobolev RKHS.
-    Sobolev,
-    /// `c_ℓ = 2 / (4π · Π_{k=1..m+1}(ℓ + k))` — Wahba 1981 pseudo-spline.
-    Pseudo,
-}
-
-impl SphereSpectralKernelKind {
-    /// `c_0 = 0`, `c_ℓ = c_ℓ(m)` for `ℓ = 1..=lmax`. Returned vector has
-    /// length `lmax + 1` and is uploaded verbatim to constant/global
-    /// memory before kernel launch.
-    pub fn coefficients(self, lmax: usize, m: usize) -> Vec<f64> {
-        match self {
-            SphereSpectralKernelKind::Sobolev => {
-                crate::basis::sobolev_s2_truncated_coefficients(lmax, m)
-            }
-            SphereSpectralKernelKind::Pseudo => {
-                crate::basis::pseudo_s2_truncated_coefficients(lmax, m)
-            }
-        }
-    }
-}
 
 /// Lat/lon (degrees or radians) → unit vector `(x, y, z)` on S² ⊂ ℝ³.
 /// Returns a flat `Vec<f64>` of length `3 * n` in the row-major layout
@@ -594,24 +566,17 @@ pub(crate) fn sphere_kernel_decision(n: usize, m: usize, lmax: usize) -> Result<
     )
 }
 
-/// Map a truncated `SphereWahbaKernel` variant onto the device kernel kind +
-/// truncation degree. Only the two *truncated* spectral variants have an exact
-/// device counterpart (the closed-form `Sobolev`/`Pseudo` variants use
-/// polylogarithms / deep-`L` series the device kernel does not evaluate), so
-/// `Sobolev`/`Pseudo` return `None` and stay on the CPU closed-form path.
+/// The truncation degree of a `SphereWahbaKernel` with an exact device
+/// counterpart. Only the truncated spectral variant has one (the closed-form
+/// `Sobolev` variant uses polylogarithms / a deep-`L` series the device kernel
+/// does not evaluate), so `Sobolev` returns `None` and stays on the CPU
+/// closed-form path.
 #[must_use]
-pub(crate) fn truncated_device_kind(
-    kernel: crate::basis::SphereWahbaKernel,
-) -> Option<(SphereSpectralKernelKind, u16)> {
+pub(crate) fn truncated_device_lmax(kernel: crate::basis::SphereWahbaKernel) -> Option<u16> {
     use crate::basis::SphereWahbaKernel;
     match kernel {
-        SphereWahbaKernel::SobolevTruncated { lmax } => {
-            Some((SphereSpectralKernelKind::Sobolev, lmax))
-        }
-        SphereWahbaKernel::PseudoTruncated { lmax } => {
-            Some((SphereSpectralKernelKind::Pseudo, lmax))
-        }
-        SphereWahbaKernel::Sobolev | SphereWahbaKernel::Pseudo => None,
+        SphereWahbaKernel::SobolevTruncated { lmax } => Some(lmax),
+        SphereWahbaKernel::Sobolev => None,
     }
 }
 
@@ -643,7 +608,7 @@ pub(crate) fn try_build_truncated_kernel_matrix_gpu(
     radians: bool,
     kernel: crate::basis::SphereWahbaKernel,
 ) -> Option<Result<Array2<f64>, GpuError>> {
-    let (kind, lmax) = truncated_device_kind(kernel)?;
+    let lmax = truncated_device_lmax(kernel)?;
     let n = data.nrows();
     let m = centers.nrows();
     if n == 0 || m == 0 || lmax == 0 {
@@ -664,7 +629,6 @@ pub(crate) fn try_build_truncated_kernel_matrix_gpu(
         centers,
         penalty_order,
         radians,
-        kind,
         lmax,
     ))
 }
@@ -677,7 +641,6 @@ fn build_truncated_kernel_matrix_gpu_admitted(
     centers: ArrayView2<'_, f64>,
     penalty_order: usize,
     radians: bool,
-    kind: SphereSpectralKernelKind,
     lmax: u16,
 ) -> Result<Array2<f64>, GpuError> {
     let n = data.nrows();
@@ -689,7 +652,7 @@ fn build_truncated_kernel_matrix_gpu_admitted(
     // Single-source the coefficients: the same `c_ℓ` array the CPU truncated
     // recurrence consumes (`wahba_sphere_kernel_from_cos_kind`) is uploaded to
     // the device, so CPU and GPU evaluate an identical zonal series.
-    let coeffs = kind.coefficients(lmax as usize, penalty_order);
+    let coeffs = crate::basis::sobolev_s2_truncated_coefficients(lmax as usize, penalty_order);
     let inputs = S2KernelBuildInputs {
         n,
         m,

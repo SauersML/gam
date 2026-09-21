@@ -423,7 +423,7 @@ fn sphere_wahba_default_method_is_sobolev() {
     assert!((p_def[0] - p_sob[0]).abs() < 1e-9);
 }
 #[test]
-fn sphere_wahba_pseudo_smoke_test() {
+fn sphere_harmonic_smoke_test() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let ul = Uniform::new(-80.0_f64, 80.0).expect("latitude range -80..80 is non-empty and finite");
@@ -441,7 +441,7 @@ fn sphere_wahba_pseudo_smoke_test() {
         ]));
     }
     let d = encode_recordswith_inferred_schema(h, r).expect("each fixture record carries one field per header column");
-    let p = fit2d("y~sphere(lat,lon,k=15,method=pseudo)", d, &[(45.0, 0.0)]);
+    let p = fit2d("y~sphere(lat,lon,k=15,method=harmonic)", d, &[(45.0, 0.0)]);
     assert!(p[0].is_finite());
 }
 #[test]
@@ -638,7 +638,7 @@ fn smooth_handles_one_outlier_low() {
     assert!(p[0].is_finite());
 }
 #[test]
-fn sphere_with_method_pseudo() {
+fn sphere_with_method_harmonic() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let ul = Uniform::new(-70.0_f64, 70.0).expect("latitude range -70..70 is non-empty and finite");
@@ -656,8 +656,43 @@ fn sphere_with_method_pseudo() {
         ]));
     }
     let d = encode_recordswith_inferred_schema(h, r).expect("each fixture record carries one field per header column");
-    let p = fit2d("y~sphere(lat,lon,k=10,method=pseudo)", d, &[(0.0, 0.0)]);
+    let p = fit2d("y~sphere(lat,lon,k=10,method=harmonic)", d, &[(0.0, 0.0)]);
     assert!(p[0].is_finite());
+}
+/// `method=mgcv` / `method=sos` once named a pseudo-spline kernel the design
+/// builder silently replaced with the harmonic basis. Both spellings are now
+/// refused at fit time instead of fitting a model other than the one asked for.
+#[test]
+fn sphere_removed_method_aliases_are_refused() {
+    init_parallelism();
+    let mut rng = StdRng::seed_from_u64(7);
+    let ul = Uniform::new(-70.0_f64, 70.0).expect("latitude range -70..70 is non-empty and finite");
+    let un = Uniform::new(-179.0_f64, 179.0).expect("longitude range -179..179 is non-empty and finite");
+    let no = Normal::new(0.0, 0.05).expect("noise sigma 0.05 is finite and non-negative");
+    let h: Vec<String> = ["lat", "lon", "y"].into_iter().map(String::from).collect();
+    let mut r = Vec::with_capacity(200);
+    for _ in 0..200 {
+        let lat = ul.sample(&mut rng);
+        let lon = un.sample(&mut rng);
+        r.push(StringRecord::from(vec![
+            lat.to_string(),
+            lon.to_string(),
+            (0.3 * lat.to_radians().sin() + no.sample(&mut rng)).to_string(),
+        ]));
+    }
+    let d = encode_recordswith_inferred_schema(h, r).expect("each fixture record carries one field per header column");
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    for removed in ["mgcv", "sos", "pseudo"] {
+        let formula = format!("y~sphere(lat,lon,k=10,method={removed})");
+        let err = match fit_from_formula(&formula, &d, &cfg) {
+            Ok(_) => panic!("{formula} must be refused, not fit with a substituted kernel"),
+            Err(err) => format!("{err:?}"),
+        };
+        assert!(err.contains("has been removed"), "{formula}: {err}");
+    }
 }
 #[test]
 fn smooth_recovers_decreasing_truth() {

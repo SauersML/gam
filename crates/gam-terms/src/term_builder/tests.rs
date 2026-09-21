@@ -427,6 +427,47 @@ fn build_sphere_over_lat_lon(ds: &Dataset) -> Result<SmoothBasisSpec, String> {
     )
 }
 
+/// The sphere `method=` values `pseudo`, `mgcv`, `sos`, `wahba_pseudo` and
+/// `wahba-pseudo` once parsed to a pseudo-spline kernel
+/// that the design builder silently rerouted to the spherical-harmonic basis,
+/// so the fit never used the kernel the formula named. That kernel is gone;
+/// each removed spelling must be refused at term construction with an error
+/// naming the replacement, and the two surviving spellings must build.
+#[test]
+fn sphere_removed_pseudo_kernel_spellings_are_refused() {
+    let ds = continuous_dataset(
+        &["y", "lat", "lon"],
+        (0..24)
+            .map(|i| {
+                let t = i as f64 / 24.0;
+                let lat = -60.0 + 120.0 * t;
+                let lon = -180.0 + 360.0 * ((7 * i) % 24) as f64 / 24.0;
+                vec![lat.to_radians().sin(), lat, lon]
+            })
+            .collect(),
+    );
+    let col_map = ds.column_map();
+    let build = |formula: &str| {
+        let parsed = parse_formula(formula).expect("parse");
+        let mut notes = Vec::new();
+        build_termspec(&parsed.terms, &ds, &col_map, &mut notes)
+    };
+    for removed in ["pseudo", "mgcv", "sos", "wahba_pseudo", "wahba-pseudo"] {
+        let formula = format!("y ~ sphere(lat, lon, k=10, method='{removed}')");
+        let err = build(&formula)
+            .expect_err("a removed sphere kernel spelling must be refused")
+            .to_string();
+        assert!(
+            err.contains("has been removed") && err.contains("method=sobolev"),
+            "{formula}: {err}"
+        );
+    }
+    for kept in ["sobolev", "harmonic"] {
+        let formula = format!("y ~ sphere(lat, lon, k=10, method={kept})");
+        build(&formula).unwrap_or_else(|err| panic!("{formula}: {err}"));
+    }
+}
+
 /// A sphere/SOS smooth is intrinsically a function of BOTH angular
 /// coordinates: a constant longitude puts every point on one meridian, an
 /// unidentifiable 1-D slice of S² that must be rejected at term construction
@@ -1840,13 +1881,12 @@ fn provisioned_internal_knots_follow_the_unique_value_rule() {
     assert_eq!(provisioned_internal_knots_for_column(boundary.view()), 8);
 }
 
-#[test]
-fn spectral_duchon_reproduces_fixed_seed_uniform_landmarks() {
-    let ds = continuous_dataset(
+fn spectral_duchon_dataset(rows: usize) -> Dataset {
+    continuous_dataset(
         &["y", "x1", "x2", "x3", "x4"],
-        (0..64)
+        (0..rows)
             .map(|i| {
-                let x = i as f64 / 63.0;
+                let x = i as f64 / (rows - 1) as f64;
                 vec![
                     x.sin(),
                     x,
@@ -1856,28 +1896,86 @@ fn spectral_duchon_reproduces_fixed_seed_uniform_landmarks() {
                 ]
             })
             .collect(),
-    );
-    let parsed = parse_formula("y ~ duchon(x1, x2, x3, x4, rank=6, order=0)").expect("parse");
+    )
+}
+
+fn spectral_duchon_strategy(ds: &Dataset, formula: &str) -> CenterStrategy {
+    let parsed = parse_formula(formula).expect("parse");
     let col_map = ds.column_map();
     let mut notes = Vec::new();
-    let terms = build_termspec(
-        &parsed.terms,
-        &ds,
-        &col_map,
-        &mut notes,
-    )
-    .expect("build spectral Duchon termspec");
+    let terms = build_termspec(&parsed.terms, ds, &col_map, &mut notes)
+        .expect("build spectral Duchon termspec");
     let SmoothBasisSpec::Duchon { spec, .. } = &terms.smooth_terms[0].basis else {
         panic!("expected Duchon term");
     };
-    let CenterStrategy::DuchonSpectral { knots, basis } = &spec.center_strategy else {
+    spec.center_strategy.clone()
+}
+
+/// The spectral Duchon landmarks are the engine's own space-filling design
+/// (the one every other 4-D Duchon smooth uses), sized by the engine's n^0.4
+/// spatial landmark budget. They used to be a clone of R's Mersenne-Twister
+/// `set.seed(1); sample(...)` over `min(n_unique, 2000)` rows, frozen as
+/// user-provided coordinates.
+#[test]
+fn spectral_duchon_landmarks_are_the_engine_space_filling_design() {
+    let ds = spectral_duchon_dataset(64);
+    let strategy = spectral_duchon_strategy(&ds, "y ~ duchon(x1, x2, x3, x4, rank=6, order=0)");
+    let CenterStrategy::DuchonSpectral { knots, basis } = &strategy else {
         panic!("expected spectral center strategy");
     };
     assert_eq!(basis.rank(), 6);
-    let CenterStrategy::UserProvided(centers) = knots.as_ref() else {
-        panic!("expected frozen sampled centers");
+    let budget = default_num_centers(64, 4);
+    assert!(
+        matches!(
+            knots.as_ref(),
+            CenterStrategy::EqualMassCovarRepresentative { num_centers } if *num_centers == budget
+        ),
+        "spectral landmarks must be the {budget}-center 4-D equal-mass design, got {knots:?}"
+    );
+}
+
+/// A retained rank above the landmark budget sizes the landmark set to that
+/// rank instead of refusing: the truncation can only keep eigenvectors a
+/// landmark set of at least that size spans.
+#[test]
+fn spectral_duchon_landmarks_span_the_requested_rank() {
+    let ds = spectral_duchon_dataset(64);
+    let budget = default_num_centers(64, 4);
+    let rank = budget + 4;
+    let strategy = spectral_duchon_strategy(
+        &ds,
+        &format!("y ~ duchon(x1, x2, x3, x4, rank={rank}, order=0)"),
+    );
+    let CenterStrategy::DuchonSpectral { knots, .. } = &strategy else {
+        panic!("expected spectral center strategy");
     };
-    assert_eq!(centers.dim(), (64, 4));
+    assert_eq!(crate::basis::center_strategy_num_centers(knots), Some(rank));
+}
+
+/// Repeated coordinate rows never make the spectral landmark budget
+/// unsatisfiable (#2623): the space-filling design picks distinct rows, and the
+/// realized basis builds with the requested rank.
+#[test]
+fn spectral_duchon_builds_on_data_with_repeated_rows_2623() {
+    let rows = 120usize;
+    let mut data: Vec<Vec<f64>> = (0..rows)
+        .map(|i| {
+            let x = (i % 60) as f64 / 59.0;
+            vec![(4.0 * x).sin(), x, (2.0 * x).cos()]
+        })
+        .collect();
+    data[rows - 1] = data[0].clone();
+    let ds = continuous_dataset(&["y", "x1", "x2"], data);
+    let parsed = parse_formula("y ~ duchon(x1, x2, rank=8)").expect("parse");
+    let col_map = ds.column_map();
+    let mut notes = Vec::new();
+    let terms = build_termspec(&parsed.terms, &ds, &col_map, &mut notes)
+        .expect("build spectral Duchon termspec");
+    let design = crate::smooth::build_term_collection_design(ds.values.view(), &terms)
+        .expect("spectral Duchon basis on repeated rows");
+    let dense = design.design.to_dense();
+    assert_eq!(dense.nrows(), rows);
+    assert!(dense.iter().all(|v| v.is_finite()));
 }
 
 #[test]

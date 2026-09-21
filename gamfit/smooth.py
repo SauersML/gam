@@ -781,12 +781,12 @@ class Sphere(Smooth):
 
     Parameters
     ----------
-    n_centers : number of basis centers when using ``kernel="sobolev"`` or
-        ``"pseudo"`` (Wahba-style). For ``kernel="harmonic"`` (eigen
+    n_centers : number of basis centers when using ``kernel="sobolev"``
+        (Wahba reproducing kernel). For ``kernel="harmonic"`` (eigen
         basis) this is the truncation degree.
     penalty_order : roughness penalty order m ∈ {1, 2, 3, 4}.
         ``m=2`` is the canonical TPS-on-sphere analogue (curvature).
-    kernel : one of ``"sobolev"`` (default), ``"pseudo"``, ``"harmonic"``.
+    kernel : one of ``"sobolev"`` (default), ``"harmonic"``.
     radians : default ``False`` (degrees, Earth/data-frame convention).
     centers : optional explicit ``(K, 2)`` center array (lat, lon) in the
         same angular convention as ``radians``, for the Wahba kernels. When
@@ -824,11 +824,10 @@ class Sphere(Smooth):
         """Column count of :meth:`evaluate`, read from the Rust builder's width
         rule without evaluating the basis.
 
-        ``kernel='sobolev'`` keeps one column per center, ``'harmonic'`` spans
-        the ``L * (L + 2)`` harmonics of degrees ``1..=L`` with ``L =
-        n_centers``, and ``'pseudo'`` routes through harmonics of a degree
-        chosen to reach ``n_centers`` columns. A descriptor the builder refuses
-        (a degree past the harmonic cap, fewer than two centers) raises here.
+        ``kernel='sobolev'`` keeps one column per center and
+        ``kernel='harmonic'`` spans the ``L * (L + 2)`` harmonics of degrees
+        ``1..=L`` with ``L = n_centers``. A descriptor the builder refuses (a
+        degree past the harmonic cap, fewer than two centers) raises here.
         """
         from . import _api
 
@@ -849,7 +848,7 @@ class Sphere(Smooth):
             raise ValueError(
                 "Sphere(kernel='harmonic') is a truncated spherical-harmonic basis of "
                 "degree n_centers and has no centers; drop `centers` or use "
-                "kernel='sobolev' / 'pseudo'"
+                "kernel='sobolev'"
             )
         return harmonic
 

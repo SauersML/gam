@@ -647,7 +647,7 @@ def sphere_evaluate(spec: Any, coords: Any) -> Any:
 def sphere_evaluate_numpy(spec: Any, coords: Any) -> Any:
     """NumPy-backend Sphere evaluation.
 
-    For Wahba kernels (``sobolev``/``pseudo``) this routes through
+    For the Wahba kernel (``sobolev``) this routes through
     ``sphere_basis_with_centers`` so the basis dimension is fixed by the
     descriptor's resolved center set rather than by the evaluation row
     count. For ``harmonic`` (eigen) basis, no centers are needed.

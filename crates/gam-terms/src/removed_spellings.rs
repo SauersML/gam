@@ -44,10 +44,6 @@ pub(crate) const SPHERE_METHODS: &[RemovedSpelling] = &[
     ("wahba", "sobolev"),
     ("wahba_sobolev", "sobolev"),
     ("wahba-sobolev", "sobolev"),
-    ("mgcv", "pseudo"),
-    ("sos", "pseudo"),
-    ("wahba_pseudo", "pseudo"),
-    ("wahba-pseudo", "pseudo"),
     ("spherical_harmonic", "harmonic"),
     ("spherical-harmonic", "harmonic"),
 ];

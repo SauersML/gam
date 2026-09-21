@@ -266,7 +266,7 @@ fn bc_clamped_at_high_k_smooths_correctly() {
 }
 
 #[test]
-fn sphere_pseudo_with_small_n() {
+fn sphere_harmonic_with_small_n() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u_lat =
@@ -292,7 +292,7 @@ fn sphere_pseudo_with_small_n() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ sphere(lat, lon, k=10, method=pseudo)", &data, &cfg)
+    let result = fit_from_formula("y ~ sphere(lat, lon, k=10, method=harmonic)", &data, &cfg)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit", e));
     let FitResult::Standard(fit) = result else {
         panic!()

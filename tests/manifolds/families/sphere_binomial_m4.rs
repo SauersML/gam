@@ -1,9 +1,9 @@
-//! Binomial(logit) + sphere with the high-order Wahba pseudo-spline
-//! kernel. The pseudo m=4 case used to collapse the smooth to ~0 for
-//! Gaussian REML (Wahba m=4 kernel values are tiny — `K(p,p) ≈ 3e-4`).
-//! The REML scale-invariance fix (cycle 45/46) cleared the absolute
-//! floor on the penalty-rank tolerance, so the non-Gaussian PIRLS-inner
-//! REML loop should also be cured. Verify here.
+//! Binomial(logit) + sphere at the high penalty order m=4, for both sphere
+//! constructions: the Sobolev `H^m(S²)` reproducing kernel and the
+//! spherical-harmonic basis. High-order sphere Grams sit on a tiny numerical
+//! scale, and a scale-sensitive rank tolerance in the PIRLS-inner REML loop
+//! would collapse the smooth to ~0. Verify neither construction collapses and
+//! that the two agree under REML.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -84,16 +84,15 @@ fn fit_predict(formula: &str) -> (f64, f64, f64) {
 }
 
 #[test]
-fn binomial_logit_sphere_pseudo_m4_does_not_collapse() {
+fn binomial_logit_sphere_harmonic_m4_does_not_collapse() {
     init_parallelism();
-    // The original collapse scenario: pseudo-spline m=4 with small kernel
-    // values produced a Gram that REML's rank-tolerance falsely truncated.
-    // After the fix, the smooth should retain its signal: pred std across
-    // a 10×20 grid > 0.1 (truth has eta peak-to-peak ≈ 4).
-    let (_, std, range) = fit_predict("y ~ sphere(lat, lon, k=30, penalty_order=4, method=pseudo)");
+    // A falsely truncated penalty rank would zero the smooth. The smooth
+    // should retain its signal: pred std across a 10×20 grid > 0.1 (truth
+    // has eta peak-to-peak ≈ 4).
+    let (_, std, range) = fit_predict("y ~ sphere(lat, lon, k=30, penalty_order=4, method=harmonic)");
     assert!(
         std > 0.1,
-        "binomial pseudo m=4 collapsed: pred std={std:.3} (range={range:.3}). \
+        "binomial harmonic m=4 collapsed: pred std={std:.3} (range={range:.3}). \
          The smooth contribution is essentially zero — REML still has a \
          scale-sensitivity bug for the Bernoulli inner loop.",
     );
@@ -116,21 +115,21 @@ fn binomial_logit_sphere_sobolev_m4_does_not_collapse() {
 
 #[test]
 fn binomial_logit_sphere_both_kernels_agree_under_reml() {
-    // If REML is truly scale-invariant, both kernels should produce
+    // If REML is truly scale-invariant, both constructions should produce
     // similar logit predictions (different λ, but identical smoother).
     init_parallelism();
     let (mean_sob, std_sob, _) = fit_predict("y ~ sphere(lat, lon, k=30, penalty_order=4, method=sobolev)");
-    let (mean_pse, std_pse, _) = fit_predict("y ~ sphere(lat, lon, k=30, penalty_order=4, method=pseudo)");
+    let (mean_har, std_har, _) = fit_predict("y ~ sphere(lat, lon, k=30, penalty_order=4, method=harmonic)");
     // Means should match to a couple decimals; stds within ~30% of each
     // other (allow some divergence because Bernoulli REML adds PIRLS
     // inner-loop nonlinearity on top).
     assert!(
-        (mean_sob - mean_pse).abs() < 0.2,
-        "binomial m=4 fit means diverge: sob={mean_sob:.3} pse={mean_pse:.3}",
+        (mean_sob - mean_har).abs() < 0.2,
+        "binomial m=4 fit means diverge: sob={mean_sob:.3} har={mean_har:.3}",
     );
-    let rel = (std_sob - std_pse).abs() / std_sob.max(std_pse).max(1e-6);
+    let rel = (std_sob - std_har).abs() / std_sob.max(std_har).max(1e-6);
     assert!(
         rel < 0.5,
-        "binomial m=4 fit stds diverge: sob={std_sob:.3} pse={std_pse:.3} rel={rel:.3}",
+        "binomial m=4 fit stds diverge: sob={std_sob:.3} har={std_har:.3} rel={rel:.3}",
     );
 }

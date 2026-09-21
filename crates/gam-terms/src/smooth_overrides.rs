@@ -654,11 +654,11 @@ fn apply_sphere(
         let k = kernel.to_ascii_lowercase();
         match k.as_str() {
             "harmonic" => spec.method = SphereMethod::Harmonic,
-            "sobolev" | "pseudo" => spec.method = SphereMethod::Wahba,
+            "sobolev" => spec.method = SphereMethod::Wahba,
             other => {
                 return Err(format!(
                     "smooths[{symbol:?}].kernel must be one of \
-                     \"sobolev\" / \"pseudo\" / \"harmonic\"; got {other:?}"
+                     \"sobolev\" / \"harmonic\"; got {other:?}"
                 ));
             }
         }

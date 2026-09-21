@@ -14,8 +14,8 @@ use super::CenterStrategy;
 ///
 /// - `Wahba`: reproducing-kernel basis on a center set selected by
 ///   `center_strategy`. The kernel function itself is chosen via
-///   `wahba_kernel` (Sobolev = true Σ [l(l+1)]^{-m} P_l kernel,
-///   Pseudo = Wahba's 1981 closed-form pseudo-spline).
+///   `wahba_kernel` (the `H^m(S²)` Sobolev kernel Σ [l(l+1)]^{-m} P_l, in
+///   closed form or truncated at a finite Legendre degree).
 /// - `Harmonic`: real spherical-harmonic truncation up to `max_degree` with
 ///   the Laplace-Beltrami eigenvalue penalty `[l(l+1)]^m`. Basis
 ///   dimension is `max_degree * (max_degree + 2)`; centers are ignored.
@@ -28,34 +28,20 @@ pub enum SphereMethod {
 
 /// Which reproducing kernel to use for `SphereMethod::Wahba`.
 ///
-/// Both options yield positive-definite reproducing kernels on S² with
-/// the same family of `penalty_order m ∈ {1, 2, 3, 4}`. They define
-/// *different* RKHS, however:
+/// Both variants are the reproducing kernel of `H^m(S²)` under the
+/// Laplace–Beltrami inner product, `penalty_order m ∈ {1, 2, 3, 4}`:
 ///
-/// - **Sobolev** (default, more correct): true Wahba/Sobolev kernel
-///   `K_m(γ) = (1/4π) Σ_{l ≥ 1} (2l+1) · [l(l+1)]^{-m} · P_l(cos γ)`,
-///   the reproducing kernel of `H^m(S²)` under the Laplace–Beltrami
-///   inner product. Penalty quadratic form recovers
-///   `‖f‖²_{H^m} = Σ_l [l(l+1)]^m · |f̂_l|²`.
-///   For m=1, 2, 3 this is evaluated via the closed forms from
+/// `K_m(γ) = (1/4π) Σ_{l ≥ 1} (2l+1) · [l(l+1)]^{-m} · P_l(cos γ)`,
+///
+/// whose penalty quadratic form recovers `‖f‖²_{H^m} = Σ_l [l(l+1)]^m · |f̂_l|²`,
+/// the same Laplace–Beltrami eigenvalue penalty `SphereMethod::Harmonic`
+/// applies. They differ only in how the series is evaluated.
+///
+/// - **Sobolev** (default): for m=1, 2, 3 via the closed forms from
 ///   Beatson & zu Castell (2018) "Thinplate Splines on the Sphere"
 ///   (SIGMA 14 (2018), 083) using elementary functions plus the
-///   di/trilogarithm. For m=4 we fall back to the spectral Legendre
-///   series (96 terms ⇒ truncation error ≲ 1e-12).
-///
-/// - **Pseudo**: Wahba 1981's "pseudo-spline" kernel with Legendre
-///   weights `2 / [(l+1)(l+2)···(l+m+1)]` (decaying as `l^{-(m+1)}`,
-///   different from Sobolev's `l^{-2m}`). Faster to evaluate (one
-///   elementary polynomial in `sin(γ/2)`, `log`), and matches mgcv's
-///   `bs="sos"` exactly. At `m=4` the pseudo-spline produces
-///   numerically tiny kernel values (`K(p,p) ≈ 3e-4`) and the basis
-///   pipeline historically collapsed the smooth contribution to zero
-///   — the cure is the REML scale-invariance fix in the solver, not
-///   the kernel itself.
-///
-/// Default is **Sobolev** because it matches the canonical "Wahba
-/// spline of order m on S²" interpretation. Use `Pseudo` for exact
-/// mgcv compatibility.
+///   di/trilogarithm. For m=4 the spectral Legendre series.
+/// - **SobolevTruncated**: the series cut at a finite degree `lmax`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SphereWahbaKernel {
     /// True Sobolev `H^m(S²)` reproducing kernel via closed-form
@@ -63,8 +49,6 @@ pub enum SphereWahbaKernel {
     /// series for m=4. This is the user-facing default.
     #[default]
     Sobolev,
-    /// Wahba 1981 closed-form pseudo-spline (mgcv `bs="sos"` compatible).
-    Pseudo,
     /// Finite truncated-spectral Sobolev kernel evaluated by the same
     /// Legendre 3-term recurrence the GPU `s2_wahba_legendre_colmajor`
     /// kernel runs in registers:
@@ -82,16 +66,6 @@ pub enum SphereWahbaKernel {
         /// 5..200; GPU kernel uses LMAX as a compile-time `#define`.
         lmax: u16,
     },
-    /// Finite truncated-spectral Wahba-1981 pseudo-spline kernel:
-    ///
-    /// `K_L^{Pseudo}(γ) = Σ_{ℓ=1..L} c_ℓ · P_ℓ(cos γ)`,
-    /// `c_0 = 0`, `c_ℓ = 2 / (4π · Π_{k=1..m+1}(ℓ + k))`.
-    ///
-    /// Same role as [`Self::SobolevTruncated`] for the pseudo branch.
-    PseudoTruncated {
-        /// Largest Legendre degree retained (≥ 1).
-        lmax: u16,
-    },
 }
 
 /// Intrinsic S² (sphere) smooth configuration.
@@ -102,12 +76,9 @@ pub struct SphericalSplineBasisSpec {
     pub center_strategy: CenterStrategy,
     /// Sphere roughness penalty order m ∈ {1, 2, 3, 4}.
     ///
-    /// - **Wahba method, Sobolev kernel (default)**: the reproducing-kernel
-    ///   norm is `Σ_l [l(l+1)]^m · |f̂_l|²` — the canonical `H^m(S²)` Sobolev
+    /// - **Wahba method**: the reproducing-kernel norm is
+    ///   `Σ_l [l(l+1)]^m · |f̂_l|²` — the canonical `H^m(S²)` Sobolev
     ///   norm. `m=2` is the usual curvature (thin-plate analogue) penalty.
-    /// - **Wahba method, Pseudo kernel**: the order maps to the Wahba 1981
-    ///   pseudo-spline kernel with Legendre weights
-    ///   `2 / [(l+1)(l+2)···(l+m+1)]`. Same `m=2` is the TPS pseudo-spline.
     /// - **Harmonic method**: raises the Laplace-Beltrami eigenvalue
     ///   penalty to `[l(l+1)]^m` (same as the Sobolev kernel norm above).
     pub penalty_order: usize,
@@ -119,16 +90,15 @@ pub struct SphericalSplineBasisSpec {
     pub radians: bool,
     /// Construction method. Default Wahba (reproducing kernel); Harmonic uses
     /// real spherical harmonics with a Laplace-Beltrami eigenvalue penalty
-    /// (Wood §5.6.2, mgcv `bs="sos"`).
+    /// (Wood §5.6.2).
     #[serde(default)]
     pub method: SphereMethod,
     /// Maximum spherical-harmonic degree L when `method == Harmonic`. Basis
     /// dimension is `L * (L + 2)`. Ignored for Wahba.
     #[serde(default)]
     pub max_degree: Option<usize>,
-    /// When `method == Wahba`, which reproducing kernel to use:
-    /// Sobolev (true `H^m(S²)`, the default) or Pseudo
-    /// (Wahba 1981 / mgcv `bs="sos"`). See `SphereWahbaKernel` docs.
+    /// When `method == Wahba`, how the `H^m(S²)` reproducing kernel is
+    /// evaluated. See `SphereWahbaKernel` docs.
     ///
     /// Deserialised specs that omit this field fall back to the standard
     /// `Default` (Sobolev). Saved models that pre-date this field are not

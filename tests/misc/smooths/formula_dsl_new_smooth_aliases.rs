@@ -46,7 +46,7 @@ fn cyclic_is_the_only_periodic_smooth_function_name() {
 
 #[test]
 fn sphere_methods_parse_and_removed_method_spellings_name_the_canonical_one() {
-    for method in ["sobolev", "pseudo", "harmonic"] {
+    for method in ["sobolev", "harmonic"] {
         let f = format!("y ~ sphere(lat, lon, k=10, method={method})");
         let parsed = parse_formula(&f).unwrap_or_else(|e| panic!("`{f}` parse failed: {e}"));
         let opts = smooth_options(&parsed);
@@ -57,7 +57,6 @@ fn sphere_methods_parse_and_removed_method_spellings_name_the_canonical_one() {
     }
     for (removed, canonical) in [
         ("wahba", "sobolev"),
-        ("mgcv", "pseudo"),
         ("spherical_harmonic", "harmonic"),
     ] {
         let f = format!("y ~ sphere(lat, lon, k=10, method={removed})");

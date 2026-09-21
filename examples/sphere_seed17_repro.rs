@@ -1,4 +1,4 @@
-//! Diagnostic repro for #1246 seed-17 pseudo-spline RMSE outlier.
+//! Diagnostic repro for #1246 seed-17 sphere RMSE outlier.
 //! Mirrors tests/manifolds/sphere_uncertainty_intervals.rs but breaks the
 //! probe error down by latitude band and prints the worst probes.
 
@@ -53,12 +53,12 @@ fn main() {
     }
     let formulas = [
         (
-            "pseudo-k25-m4",
-            "y ~ sphere(lat, lon, k=25, penalty_order=4, method=pseudo)",
+            "sobolev-k25-m4",
+            "y ~ sphere(lat, lon, k=25, penalty_order=4, method=sobolev)",
         ),
         (
-            "pseudo-k25-m2",
-            "y ~ sphere(lat, lon, k=25, penalty_order=2, method=pseudo)",
+            "sobolev-k25-m2",
+            "y ~ sphere(lat, lon, k=25, penalty_order=2, method=sobolev)",
         ),
         (
             "harmonic-deg8",

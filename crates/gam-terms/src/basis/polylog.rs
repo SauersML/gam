@@ -104,6 +104,26 @@ pub(crate) fn dilog_unit(z: f64) -> f64 {
     }
 }
 
+/// `Li₂(v)` for a complementary pair `u + v = 1` in which each half was
+/// computed on its own (the sphere's `sin²(γ/2)`, `cos²(γ/2)`).
+///
+/// Only the smaller half is exact to relative precision: at coincidence `u` is
+/// exactly `0` while `v` is `1` only up to rounding, so `dilog_unit(v)` would
+/// hand back a different last bit for every center. The reflection is taken
+/// from the smaller half instead, `Li₂(v) = π²/6 − ln u · ln v − Li₂(u)`,
+/// with `ln u · ln v` at its removable limit `0` when `u = 0` (`ln v ~ −u`).
+/// When `v` is the smaller half it is evaluated directly. The switch at
+/// `u = v` is the reflection's own fixed point.
+#[inline]
+pub(crate) fn dilog_of_complement(u: f64, v: f64) -> f64 {
+    if u <= v {
+        let cross = if u <= 0.0 { 0.0 } else { u.ln() * v.ln() };
+        std::f64::consts::PI * std::f64::consts::PI / 6.0 - cross - dilog_unit(u)
+    } else {
+        dilog_unit(v)
+    }
+}
+
 /// Trilogarithm `Li₃(z) = Σ_{k≥1} z^k / k³` for real `z ∈ [0, 1]`.
 ///
 /// Direct series for `z ≤ 0.5`; for `z ∈ (0.5, 1)` the expansion in
@@ -382,6 +402,47 @@ mod tests {
         assert!(
             worst < 4.0 * f64::EPSILON,
             "dilog_unit is off by {worst:.3e} relative"
+        );
+    }
+
+    #[test]
+    fn dilog_of_complement_is_one_number_at_coincidence() {
+        // At coincidence the sphere hands over `u = 0` exactly and `v = 1` up to
+        // rounding. `dilog_unit(v)` then differs by the last bits of `v`; the
+        // complement form is `π²/6` for every such `v`.
+        let pi2_6 = std::f64::consts::PI * std::f64::consts::PI / 6.0;
+        let below = f64::from_bits(1.0_f64.to_bits() - 1);
+        let two_below = f64::from_bits(1.0_f64.to_bits() - 2);
+        let above = f64::from_bits(1.0_f64.to_bits() + 1);
+        for v in [two_below, below, 1.0, above] {
+            assert_eq!(dilog_of_complement(0.0, v), pi2_6, "v = {v:e}");
+        }
+        assert_ne!(dilog_unit(below), dilog_unit(1.0));
+    }
+
+    #[test]
+    fn dilog_of_complement_matches_high_precision_reference() {
+        // Same `mpmath.polylog(2, v)` references as above, entered as the pair
+        // `(1 − v, v)` so both branches of the complement form are exercised.
+        const REFERENCE: [(f64, f64); 8] = [
+            (0.05, 5.063_929_246_449_602_7e-2),
+            (0.25, 2.676_526_390_827_326_2e-1),
+            (0.5, 5.822_405_264_650_124_5e-1),
+            (0.75, 9.784_693_929_303_061_0e-1),
+            (0.9, 1.299_714_723_004_958_8),
+            (0.99, 1.588_625_448_076_375_3),
+            (0.999, 1.637_022_605_276_117_7),
+            (0.999_999_999, 1.644_934_045_124_961_2),
+        ];
+        let mut worst = 0.0_f64;
+        for (v, want) in REFERENCE {
+            let rel = (dilog_of_complement(1.0 - v, v) - want).abs() / want.abs();
+            worst = worst.max(rel);
+        }
+        println!("\n  dilog_of_complement worst relative error: {worst:.3e}\n");
+        assert!(
+            worst < 4.0 * f64::EPSILON,
+            "dilog_of_complement is off by {worst:.3e} relative"
         );
     }
 }

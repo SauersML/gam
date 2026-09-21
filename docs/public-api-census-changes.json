@@ -5070,5 +5070,20 @@
     },
     "reason": "#4080: warm_start::Session kept two loaders, try_load_with_source and peek_load_with_source, with identical bodies (store lookup, record the error, wrap in LoadedEntry with source LoadSource::Exact). LoadSource had the single variant Exact, so the only test of it (objective.rs classify_cache_entry_for_outer, loaded.source == LoadSource::Exact) was always true, and LoadedEntry only paired an entry with that constant. Both loaders, the enum and the wrapper are replaced by one Session::load returning Option<WarmStartEntry>. #4081: Fingerprinter::write_f64_slice_payload_slow and write_f64_slice_payload_slow_iter were two copies of the element-wise write_f64 loop; both are replaced by one write_f64_elements.",
     "evidence": "scripts/source_removal_guard.py and scripts/public_api_census.py with --base d027be231ca8fdf6f8104690ae68869486db51ab and head the change's commit list exactly these removals. Read-proof at the head: git grep -w finds 0 occurrences of LoadSource, LoadedEntry, try_load_with_source, peek_load_with_source, write_f64_slice_payload_slow and write_f64_slice_payload_slow_iter in crates/ tests/ examples/ python/. Before the change the callers were run.rs (try_load_with_source), marginal_slope fit_entry.rs (peek_load_with_source) and run_plan_warm_start_cache_tests.rs (LoadedEntry literals), all moved to Session::load / WarmStartEntry."
+  },
+  {
+    "base": "00b33efd500f54529a61bab8ba3dcc5da54a8745",
+    "removed": {
+      "crates/gam-terms/src/basis/center_selection.rs::select_r_uniform_subsample_centers": 1,
+      "crates/gam-terms/src/basis/sphere_basis.rs::harmonic_degree_for_wahba_basis_width": 1,
+      "crates/gam-terms/src/basis/sphere_gpu.rs::coefficients": 1,
+      "crates/gam-terms/src/basis/sphere_gpu.rs::truncated_device_kind": 1,
+      "crates/gam-terms/src/basis/sphere_kernels.rs::wahba_sphere_kernel_pseudo": 1,
+      "crates/gam-terms/src/basis/sphere_kernels.rs::wahba_sphere_kernel_pseudo_coincident": 1,
+      "crates/gam-terms/src/basis/sphere_kernels.rs::wahba_sphere_kernel_pseudo_derivative_dhav": 1,
+      "crates/gam-terms/src/basis/sphere_spectral.rs::pseudo_s2_truncated_coefficients": 1
+    },
+    "reason": "#3138: the Wahba pseudo-spline sphere kernel (kernel=pseudo|mgcv|sos|wahba_pseudo silently ran the harmonic construction) is deleted with its closed forms, derivative chain, GPU kind and coefficient table; spectral Duchon landmarks now come from the engine's deterministic center design, so the R-Mersenne-Twister uniform subsample (select_r_uniform_subsample_centers) is gone. Breaking change, no shim.",
+    "evidence": "No caller of any removed function remains in the tree (git grep). The removed spellings are refused with an error naming kernel=sobolev / kernel=harmonic: gam-terms lib, manifolds sphere_methods_parse_and_removed_method_spellings and quality sphere_removed_method_aliases_are_refused pass."
   }
 ]

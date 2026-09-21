@@ -15,9 +15,8 @@
 //! 2. The Gram diagonal of a zonal kernel is ONE number, because `u = 0` at
 //!    coincidence is now a theorem about bit patterns rather than a rounding
 //!    accident that depends on the coordinates of the center.
-//! 3. The `|γ|` cusp gradient of the pseudo-spline jet is recovered at every
-//!    offset, including at a center — where the `cos γ` chain returned exactly
-//!    zero for a gradient of full magnitude.
+//! 3. The jet's `u`-chain is the same derivative as the `cos γ` chain at
+//!    ordinary separations, and `∂u` is exactly zero at a center.
 
 use super::sphere_half_angle::{
     HalfAngleSeparation, SphereTrig, ambient_half_angle_separation, half_angle_partials,
@@ -170,7 +169,10 @@ fn zz_measure_2489_gram_diagonal_is_one_number_across_centers() {
     // function of where the point happens to sit, because whether
     // sin²φ + cos²φ·(cos²ψ + sin²ψ) rounds to 1.0 depends on φ and ψ. Over a
     // spread of centers the issue measured three distinct diagonal values in
-    // one Gram matrix.
+    // one Gram matrix. The Sobolev `m = 2` closed form needs `Li₂(v)`, and `v`
+    // is `1` at coincidence only up to rounding, so the kernel takes `Li₂(v)`
+    // through the exact `u` (`polylog::dilog_of_complement`); reading
+    // `dilog_unit(v)` directly gave three distinct diagonals here.
     let mut centers = Vec::<(f64, f64)>::new();
     for i in 0..24 {
         let t = i as f64;
@@ -189,14 +191,14 @@ fn zz_measure_2489_gram_diagonal_is_one_number_across_centers() {
             u: legacy_u(t, t),
             v: 1.0 - legacy_u(t, t),
         };
-        let legacy = wahba_sphere_kernel_kind(legacy_sep, 2, SphereWahbaKernel::Pseudo)
-            .expect("pseudo m=2 is finite at coincidence");
+        let legacy = wahba_sphere_kernel_kind(legacy_sep, 2, SphereWahbaKernel::Sobolev)
+            .expect("sobolev m=2 is finite at coincidence");
         let shipped = wahba_sphere_kernel_kind(
             half_angle_separation_scalar(t, t),
             2,
-            SphereWahbaKernel::Pseudo,
+            SphereWahbaKernel::Sobolev,
         )
-        .expect("pseudo m=2 is finite at coincidence");
+        .expect("sobolev m=2 is finite at coincidence");
         legacy_diag.insert(legacy.to_bits());
         shipped_diag.insert(shipped.to_bits());
     }
@@ -220,25 +222,6 @@ fn zz_measure_2489_gram_diagonal_is_one_number_across_centers() {
 // 2. The jet — the arm with the worst symptom.
 // ---------------------------------------------------------------------------
 
-/// The legacy jet chain: `dK/d(cos γ) · ∂(cos γ)/∂φ`.
-fn legacy_jet_dphi(
-    a: SphereTrig<f64>,
-    b: SphereTrig<f64>,
-    m: usize,
-    kind: SphereWahbaKernel,
-) -> f64 {
-    let dlon_cos = a.cos_lon * b.cos_lon + a.sin_lon * b.sin_lon;
-    let cos_gamma = a.sin_lat * b.sin_lat + a.cos_lat * b.cos_lat * dlon_cos;
-    let sep = HalfAngleSeparation {
-        u: (1.0 - cos_gamma.clamp(-1.0, 1.0)) * 0.5,
-        v: (1.0 + cos_gamma.clamp(-1.0, 1.0)) * 0.5,
-    };
-    // dK/d(cos γ) = −½ dK/du.
-    let dk_dcos = -0.5 * wahba_sphere_kernel_derivative_dhav_kind(sep, m, kind);
-    let dcos_dphi = a.cos_lat * b.sin_lat - a.sin_lat * b.cos_lat * dlon_cos;
-    dk_dcos * dcos_dphi * DEG
-}
-
 fn shipped_jet_dphi(
     a: SphereTrig<f64>,
     b: SphereTrig<f64>,
@@ -254,57 +237,11 @@ fn shipped_jet_dphi(
 }
 
 #[test]
-fn zz_measure_2489_pseudo_cusp_gradient_is_recovered_at_every_offset() {
-    // The pseudo m=1 kernel carries a `−2√u` term, so `dK/du → −1/(2π√u)`
-    // while `∂u/∂φ = ½ sin Δφ → ½Δφ` and `√u = sin(γ/2) → Δφ/2`. The two
-    // divergences cancel exactly:
-    //
-    //     ∂K/∂φ = dK/du · ∂u/∂φ → [−1/(2π · Δφ/2)] · [Δφ/2] = −1/2π   per radian
-    //
-    // i.e. `−(π/180)/2π = −0.0027778` per DEGREE of latitude, independent of
-    // the offset — a plateau, which is what makes the measurement legible:
-    // every row of the table should read the same number. That is the cusp
-    // gradient the `cos γ` chain had to recover as `∞ · 0`.
-    let want = -DEG / (2.0 * std::f64::consts::PI);
-    let base_lat = 12.5_f64;
-    let lon = 44.25_f64;
-    let offsets = [1e-2, 1e-4, 1e-6, 1e-8, 1e-10];
-
-    println!(
-        "\n  true one-sided cusp gradient: {want:.10e} per degree\n\n{:>10} {:>22} {:>10} {:>22} {:>10}",
-        "offset(°)", "shipped ∂K/∂φ", "err", "legacy ∂K/∂φ", "err"
-    );
-    for offset in offsets {
-        // The ROW is offset from the center, so Δφ = +offset and the gradient
-        // takes the positive-side branch.
-        let row = SphereTrig::from_radians((base_lat + offset) * DEG, lon * DEG);
-        let center = SphereTrig::from_radians(base_lat * DEG, lon * DEG);
-        let shipped = shipped_jet_dphi(row, center, 1, SphereWahbaKernel::Pseudo);
-        let legacy = legacy_jet_dphi(row, center, 1, SphereWahbaKernel::Pseudo);
-        let rel_shipped = (shipped - want).abs() / want.abs();
-        let rel_legacy = (legacy - want).abs() / want.abs();
-        println!(
-            "{offset:>10.0e} {shipped:>22.12e} {rel_shipped:>10.2e} \
-             {legacy:>22.12e} {rel_legacy:>10.2e}"
-        );
-        assert!(
-            rel_shipped < 1e-2,
-            "pseudo m=1 cusp gradient is {rel_shipped:.3e} off at {offset:.0e}° \
-             (got {shipped:.9e}, want {want:.9e}); the pre-registered bar is 1%"
-        );
-    }
-
+fn zz_measure_2489_half_angle_partials_vanish_at_a_center() {
     // AT a center. Reachable in every fit, because farthest-point selection
-    // picks centers from the data rows. Both one-sided limits exist and differ
-    // only in sign, so no single value is the derivative; the shipped code
-    // returns the symmetric subgradient 0 deliberately rather than arriving at
-    // it by cancellation.
-    let t = SphereTrig::from_radians(base_lat * DEG, lon * DEG);
-    assert_eq!(
-        shipped_jet_dphi(t, t, 1, SphereWahbaKernel::Pseudo),
-        0.0,
-        "at a center the jet must be the symmetric subgradient 0"
-    );
+    // picks centers from the data rows. `∂u` is exactly zero there, so a cusp
+    // is resolved by the caller rather than reached as `∞ · 0`.
+    let t = SphereTrig::from_radians(12.5 * DEG, 44.25 * DEG);
     let (du_dphi, du_dpsi) = half_angle_partials(t, t);
     assert_eq!(
         (du_dphi, du_dpsi),
@@ -322,9 +259,7 @@ fn zz_measure_2489_smooth_jet_matches_a_finite_difference() {
     // routes are healthy.
     let lon = -3.75_f64;
     for &(kind, m) in &[
-        (SphereWahbaKernel::Pseudo, 2usize),
-        (SphereWahbaKernel::Pseudo, 3),
-        (SphereWahbaKernel::Sobolev, 2),
+        (SphereWahbaKernel::Sobolev, 2usize),
         (SphereWahbaKernel::Sobolev, 3),
         (SphereWahbaKernel::SobolevTruncated { lmax: 64 }, 2),
     ] {

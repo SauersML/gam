@@ -940,7 +940,7 @@ pub(crate) use sphere_kernels::{
     wahba_sphere_kernel_simd_kind, wahba_sphere_kernel_sobolev_derivative_dhav,
 };
 
-pub(crate) use sphere_spectral::{pseudo_s2_truncated_coefficients, sobolev_s2_truncated_coefficients};
+pub(crate) use sphere_spectral::sobolev_s2_truncated_coefficients;
 
 /// User intent and resolved numeric state for a Matérn kernel length scale.
 ///

@@ -1,6 +1,32 @@
 use super::*;
 use std::collections::HashSet;
 
+/// Canonical dedup key for one coordinate row: each value goes through
+/// `gam_data::canonical_level_bits`, so `+0.0` / `-0.0` collapse to one key.
+fn coordinate_row_key<'a>(values: impl Iterator<Item = &'a f64>) -> Vec<u64> {
+    values
+        .map(|&value| gam_data::canonical_level_bits(value))
+        .collect()
+}
+
+/// Number of distinct coordinate rows over `cols`.
+///
+/// A basis budget sized from the raw row count can exceed the number of
+/// distinct design points on data with repeated coordinate rows, so budgets
+/// that must be realizable by distinct points are capped by this count.
+pub(crate) fn count_unique_coordinate_rows(values: ArrayView2<'_, f64>, cols: &[usize]) -> usize {
+    let mut seen = HashSet::<Vec<u64>>::with_capacity(values.nrows());
+    let mut unique = 0usize;
+    for row in 0..values.nrows() {
+        if seen.insert(coordinate_row_key(
+            cols.iter().map(|&col| &values[[row, col]]),
+        )) {
+            unique += 1;
+        }
+    }
+    unique
+}
+
 #[derive(Debug, Clone)]
 pub struct CollocationOperatorMatrices {
     pub d0: Array2<f64>,
@@ -48,177 +74,6 @@ pub(crate) fn validate_center_count(num_centers: usize) -> Result<(), BasisError
         crate::bail_invalid_basis!("center count must be positive");
     }
     Ok(())
-}
-
-/// R 4.2's Mersenne-Twister stream.
-///
-/// This deliberately implements the historical R initialization, rather than
-/// Rust's standard `Mt19937`: `set.seed()` first scrambles the seed with the
-/// 69069 LCG and stores 624 resulting words directly as the MT state.  Keeping
-/// this tiny private implementation lets the spectral Duchon landmark
-/// experiment reproduce mgcv's `set.seed(1); sample(...)` exactly without
-/// linking an R runtime into the model builder.
-struct R42MersenneTwister {
-    state: [u32; 624],
-    index: usize,
-}
-
-impl R42MersenneTwister {
-    fn seeded(seed: u32) -> Self {
-        let mut word = seed;
-        for _ in 0..50 {
-            word = word.wrapping_mul(69_069).wrapping_add(1);
-        }
-
-        // R allocates 625 seed words. Word zero is the cursor and is replaced
-        // with 624 by FixupSeeds; words 1..=624 are the MT state.
-        word = word.wrapping_mul(69_069).wrapping_add(1);
-        let mut state = [0_u32; 624];
-        for slot in &mut state {
-            word = word.wrapping_mul(69_069).wrapping_add(1);
-            *slot = word;
-        }
-        Self { state, index: 624 }
-    }
-
-    fn next_word(&mut self) -> u32 {
-        const M: usize = 397;
-        const MATRIX_A: u32 = 0x9908_b0df;
-        const UPPER_MASK: u32 = 0x8000_0000;
-        const LOWER_MASK: u32 = 0x7fff_ffff;
-
-        if self.index >= self.state.len() {
-            for k in 0..(self.state.len() - M) {
-                let y = (self.state[k] & UPPER_MASK) | (self.state[k + 1] & LOWER_MASK);
-                self.state[k] =
-                    self.state[k + M] ^ (y >> 1) ^ if y & 1 == 0 { 0 } else { MATRIX_A };
-            }
-            for k in (self.state.len() - M)..(self.state.len() - 1) {
-                let y = (self.state[k] & UPPER_MASK) | (self.state[k + 1] & LOWER_MASK);
-                self.state[k] = self.state[k + M - self.state.len()]
-                    ^ (y >> 1)
-                    ^ if y & 1 == 0 { 0 } else { MATRIX_A };
-            }
-            let last = self.state.len() - 1;
-            let y = (self.state[last] & UPPER_MASK) | (self.state[0] & LOWER_MASK);
-            self.state[last] = self.state[M - 1] ^ (y >> 1) ^ if y & 1 == 0 { 0 } else { MATRIX_A };
-            self.index = 0;
-        }
-
-        let mut y = self.state[self.index];
-        self.index += 1;
-        y ^= y >> 11;
-        y ^= (y << 7) & 0x9d2c_5680;
-        y ^= (y << 15) & 0xefc6_0000;
-        y ^= y >> 18;
-        y
-    }
-
-    /// R 3.6+'s rejection sampler for a uniform integer in `0..upper`.
-    fn uniform_index(&mut self, upper: usize) -> usize {
-        assert!(upper > 0, "uniform-index population must be positive");
-        let bits = usize::BITS as usize - (upper - 1).leading_zeros() as usize;
-        loop {
-            let mut value = 0_u128;
-            for _ in (0..bits).step_by(16) {
-                value = (value << 16) | u128::from(self.next_word() >> 16);
-            }
-            let mask = if bits == 0 { 0 } else { (1_u128 << bits) - 1 };
-            let candidate = (value & mask) as usize;
-            if candidate < upper {
-                return candidate;
-            }
-        }
-    }
-}
-
-/// Canonical dedup key for one coordinate row, shared by the knot BUDGET and
-/// by the sampler that has to satisfy it.
-///
-/// It exists so the two cannot drift: a budget derived from a different notion
-/// of "distinct row" than `select_r_uniform_subsample_centers` uses is a budget
-/// that function may be unable to fill.
-fn coordinate_row_key<'a>(values: impl Iterator<Item = &'a f64>) -> Vec<u64> {
-    values
-        .map(|&value| gam_data::canonical_level_bits(value))
-        .collect()
-}
-
-/// Number of distinct coordinate rows over `cols`, keyed exactly as
-/// [`select_r_uniform_subsample_centers`] keys them.
-///
-/// This is mgcv's `uniquecombs` count. Its Duchon constructor deduplicates
-/// FIRST and only then caps at `max.knots`, so the reference budget is
-/// `min(n_unique, max.knots)`. A budget taken from the raw row count instead
-/// can exceed what the sampler can supply on any data carrying a repeated
-/// coordinate row — which is a hard refusal, not a degraded fit (#2623:
-/// `prostate_gamair` asked for 523 centers from 522 unique rows and the whole
-/// scenario failed).
-pub(crate) fn count_unique_coordinate_rows(values: ArrayView2<'_, f64>, cols: &[usize]) -> usize {
-    let mut seen = HashSet::<Vec<u64>>::with_capacity(values.nrows());
-    let mut unique = 0usize;
-    for row in 0..values.nrows() {
-        if seen.insert(coordinate_row_key(cols.iter().map(|&col| &values[[row, col]]))) {
-            unique += 1;
-        }
-    }
-    unique
-}
-
-/// Select the same fixed-seed uniform landmark experiment used by mgcv's
-/// Duchon smoother (`max.knots=2000`, `seed=1`).
-///
-/// Rows are first deduplicated in encounter order, matching `uniquecombs`.
-/// When the unique count exceeds the budget, sampling is without replacement
-/// and byte-for-byte compatible with R 4.2's
-/// `set.seed(seed); sample(seq_len(n), k, replace=FALSE)`.  Exact experimental
-/// parity matters here: a different deterministic space-filling design changes
-/// the finite-sample kernel eigenspace, so comparing two rank-k smooths would
-/// otherwise conflate the spectral method with a different knot experiment.
-pub(crate) fn select_r_uniform_subsample_centers(
-    data: ArrayView2<'_, f64>,
-    num_centers: usize,
-    seed: u32,
-) -> Result<Array2<f64>, BasisError> {
-    validate_center_count(num_centers)?;
-    if data.ncols() == 0 {
-        crate::bail_invalid_basis!("uniform subsampling requires at least one column");
-    }
-
-    let mut seen = HashSet::<Vec<u64>>::with_capacity(data.nrows());
-    let mut unique_rows = Vec::<usize>::with_capacity(data.nrows().min(num_centers));
-    for row in 0..data.nrows() {
-        if seen.insert(coordinate_row_key(data.row(row).iter())) {
-            unique_rows.push(row);
-        }
-    }
-    if unique_rows.len() < num_centers {
-        crate::bail_invalid_basis!(
-            "uniform subsampling requested {num_centers} centers but data has only {} unique rows",
-            unique_rows.len()
-        );
-    }
-
-    let selected = if unique_rows.len() == num_centers {
-        unique_rows
-    } else {
-        let mut rng = R42MersenneTwister::seeded(seed);
-        let mut remaining = unique_rows.len();
-        let mut selected = Vec::with_capacity(num_centers);
-        for _ in 0..num_centers {
-            let choice = rng.uniform_index(remaining);
-            selected.push(unique_rows[choice]);
-            remaining -= 1;
-            unique_rows[choice] = unique_rows[remaining];
-        }
-        selected
-    };
-
-    let mut centers = Array2::<f64>::zeros((num_centers, data.ncols()));
-    for (center, row) in selected.into_iter().enumerate() {
-        centers.row_mut(center).assign(&data.row(row));
-    }
-    Ok(centers)
 }
 
 pub(crate) fn select_equal_mass_centers(
@@ -687,91 +542,6 @@ pub(crate) fn select_uniform_grid_centers(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// #2623: the spectral-Duchon knot budget was `min(n_rows, 2000)` while the
-    /// sampler that fills it deduplicates first, so a single repeated
-    /// coordinate row made the budget unsatisfiable and the fit hard-refused
-    /// (`prostate_gamair`: "requested 523 centers but data has only 522 unique
-    /// rows"). This pins the invariant the fix rests on — a budget taken from
-    /// `count_unique_coordinate_rows` is always fillable, and one row more
-    /// never is — so the two notions of "distinct row" cannot drift apart
-    /// again without failing here.
-    #[test]
-    fn unique_row_count_is_exactly_the_budget_the_sampler_can_fill_2623() {
-        // 523 rows, 522 distinct: row 0 is repeated at the end, which is the
-        // shape that killed the scenario. Duplicates are placed at both ends so
-        // an off-by-one in either direction of the scan is caught.
-        let rows = 523usize;
-        let mut data = Array2::<f64>::zeros((rows, 2));
-        for row in 0..rows - 1 {
-            data[[row, 0]] = row as f64;
-            data[[row, 1]] = (row * 2) as f64;
-        }
-        data[[rows - 1, 0]] = 0.0;
-        data[[rows - 1, 1]] = 0.0;
-
-        let cols = [0usize, 1usize];
-        let unique = count_unique_coordinate_rows(data.view(), &cols);
-        assert_eq!(
-            unique,
-            rows - 1,
-            "one repeated coordinate row must reduce the distinct count by exactly one"
-        );
-
-        // The budget the fix installs is satisfiable...
-        select_r_uniform_subsample_centers(data.view(), unique, 1)
-            .expect("a budget equal to the distinct-row count must always be fillable");
-
-        // ...and the budget the defect installed is not. This is the exact
-        // failure the benchmark hit, reproduced in milliseconds.
-        let err = select_r_uniform_subsample_centers(data.view(), rows, 1)
-            .expect_err("asking for more centers than distinct rows must still refuse");
-        assert!(
-            format!("{err}").contains("522 unique rows"),
-            "the refusal must name the distinct-row count it measured, got: {err}"
-        );
-    }
-
-    #[test]
-    fn r_uniform_subsample_matches_r_4_2_sample_without_replacement() {
-        let data = Array2::from_shape_fn((4800, 1), |(row, _)| (row + 1) as f64);
-        let centers =
-            select_r_uniform_subsample_centers(data.view(), 20, 1).expect("sample centers");
-        assert_eq!(
-            centers.column(0).to_vec(),
-            vec![
-                1017.0, 4775.0, 2177.0, 1533.0, 4567.0, 2347.0, 270.0, 4050.0, 3379.0, 4065.0,
-                597.0, 1301.0, 330.0, 1799.0, 3913.0, 1749.0, 37.0, 1129.0, 729.0, 878.0,
-            ]
-        );
-    }
-
-    #[test]
-    fn r_uniform_subsample_matches_r_when_integer_sampling_needs_multiple_words() {
-        let data = Array2::from_shape_fn((70_000, 1), |(row, _)| (row + 1) as f64);
-        let centers =
-            select_r_uniform_subsample_centers(data.view(), 20, 1).expect("sample centers");
-        assert_eq!(
-            centers.column(0).to_vec(),
-            vec![
-                24_388.0, 59_521.0, 43_307.0, 69_586.0, 11_571.0, 25_173.0, 32_618.0, 13_903.0,
-                8_229.0, 25_305.0, 22_306.0, 12_204.0, 43_809.0, 36_244.0, 45_399.0, 6_519.0,
-                19_242.0, 21_875.0, 58_472.0, 62_956.0,
-            ]
-        );
-    }
-
-    #[test]
-    fn r_uniform_subsample_deduplicates_in_encounter_order() {
-        let data = Array2::from_shape_vec(
-            (5, 2),
-            vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, -0.0, 5.0, 0.0, 5.0],
-        )
-        .expect("duplicate-row fixture");
-        let centers =
-            select_r_uniform_subsample_centers(data.view(), 3, 1).expect("unique centers");
-        assert_eq!(centers, data.select(Axis(0), &[0, 1, 3]));
-    }
 
     #[test]
     fn one_dimensional_uniform_grid_is_the_interval_minimax_mesh() {

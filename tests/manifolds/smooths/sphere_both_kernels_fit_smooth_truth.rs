@@ -1,6 +1,7 @@
-//! Both Wahba sphere kernels — the canonical Sobolev `H^m(S²)` form and
-//! the mgcv-compatible Wahba 1981 pseudo-spline — must fit a smooth
-//! low-degree truth cleanly for every supported penalty order m ∈ {1..4}.
+//! Both sphere constructions — the Sobolev `H^m(S²)` reproducing kernel and
+//! the spherical-harmonic basis carrying the same Laplace-Beltrami penalty —
+//! must fit a smooth low-degree truth cleanly for every supported penalty
+//! order m ∈ {1..4}.
 //!
 //! Test surface:
 //!     y = 0.5 + 0.6·sin(lat) + 0.3·cos(lat)·cos(lon) + noise (σ=0.05)
@@ -9,9 +10,8 @@
 //! Hard-fail target: rmse ≤ 0.10 for *every* (kernel, m) combination on a
 //! held-out 15×15 lat/lon grid. The truth peak-to-peak is ~1.4, so a
 //! good fit at noise level σ=0.05 hits rmse 0.01–0.02. The 0.10 budget
-//! tolerates the larger boundary bias the pseudo-spline picks up at
-//! high m without admitting the historical m=4 collapse (rmse = 0.43,
-//! predictions = mean).
+//! does not admit the historical m=4 collapse (rmse = 0.43, predictions =
+//! mean).
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -105,8 +105,6 @@ fn rmse_budget(m: usize) -> f64 {
 /// builder refuses it (#2475). Stating a spectral resolution is the shipped
 /// remedy, and it is the honest one — a finite m=1 diagonal is a choice of
 /// resolution, so the choice belongs in the formula rather than in a float.
-/// The pseudo-spline arm needs no such thing: its m=1 diagonal is the finite
-/// closed form `1/4π`.
 fn sobolev_formula(m: usize) -> String {
     if m == 1 {
         "y ~ sphere(lat, lon, k=30, penalty_order=1, method=sobolev, lmax=200)".to_string()
@@ -140,15 +138,15 @@ fn sphere_sobolev_kernel_fits_smooth_truth_for_all_m() {
 }
 
 #[test]
-fn sphere_pseudo_kernel_fits_smooth_truth_for_all_m() {
+fn sphere_harmonic_kernel_fits_smooth_truth_for_all_m() {
     init_parallelism();
     let mut failures = Vec::new();
     for m in [1usize, 2, 3, 4] {
-        let formula = format!("y ~ sphere(lat, lon, k=30, penalty_order={m}, method=pseudo)");
+        let formula = format!("y ~ sphere(lat, lon, k=30, penalty_order={m}, method=harmonic)");
         match rmse_against_truth(&formula) {
             Ok(r) => {
                 let budget = rmse_budget(m);
-                eprintln!("[pseudo] m={m}: rmse={r:.4} (budget {budget:.2})");
+                eprintln!("[harmonic] m={m}: rmse={r:.4} (budget {budget:.2})");
                 if r > budget {
                     failures.push(format!("m={m}: rmse={r:.4} > {budget:.2}"));
                 }
@@ -158,12 +156,17 @@ fn sphere_pseudo_kernel_fits_smooth_truth_for_all_m() {
     }
     assert!(
         failures.is_empty(),
-        "Pseudo-spline kernel failures:\n  - {}\n\nIf m=4 fails this is the historical mgcv \
-         pseudo-spline collapse — the cure is the REML scale-invariance fix in the solver.",
+        "harmonic kernel failures:\n  - {}",
         failures.join("\n  - "),
     );
 }
 
+/// `method=` accepts exactly one spelling per construction. The pseudo-spline
+/// values (`pseudo`, `mgcv`, `sos`, `wahba_pseudo`, `wahba-pseudo`) are
+/// refused with a removal error: they once parsed and then silently fit the
+/// harmonic basis instead of the kernel they named. The other removed
+/// spellings of a surviving construction, and the removed `kernel=` key, are
+/// refused with an error naming the canonical spelling.
 #[test]
 fn sphere_methods_parse_and_removed_method_spellings_name_the_canonical_one() {
     init_parallelism();
@@ -172,26 +175,42 @@ fn sphere_methods_parse_and_removed_method_spellings_name_the_canonical_one() {
         ..FitConfig::default()
     };
     let data = make_dataset(200);
-    for method in ["sobolev", "pseudo"] {
-        let formula = format!("y ~ sphere(lat, lon, k=10, penalty_order=2, method={method})");
+    let refusal = |formula: &str| match fit_from_formula(formula, &data, &cfg) {
+        Ok(_) => panic!("{formula} must be refused"),
+        Err(e) => e.to_string(),
+    };
+    for kept in ["sobolev", "harmonic"] {
+        let formula = format!("y ~ sphere(lat, lon, k=10, penalty_order=2, method={kept})");
         fit_from_formula(&formula, &data, &cfg)
-            .unwrap_or_else(|e| panic!("method=`{method}` failed: {e}"));
+            .unwrap_or_else(|e| panic!("{formula} failed: {e}"));
+    }
+    for removed in ["pseudo", "mgcv", "sos", "wahba_pseudo", "wahba-pseudo"] {
+        let formula = format!("y ~ sphere(lat, lon, k=10, penalty_order=2, method='{removed}')");
+        let err = refusal(formula.as_str());
+        assert!(
+            err.contains("has been removed") && err.contains("method=sobolev"),
+            "{formula}: {err}"
+        );
     }
     for (removed, canonical) in [
         ("wahba", "sobolev"),
         ("wahba_sobolev", "sobolev"),
-        ("wahba_pseudo", "pseudo"),
-        ("mgcv", "pseudo"),
-        ("sos", "pseudo"),
+        ("wahba-sobolev", "sobolev"),
+        ("spherical_harmonic", "harmonic"),
+        ("spherical-harmonic", "harmonic"),
     ] {
-        let formula = format!("y ~ sphere(lat, lon, k=10, penalty_order=2, method={removed})");
-        let err = match fit_from_formula(&formula, &data, &cfg) {
-            Ok(_) => panic!("method=`{removed}` must be refused"),
-            Err(e) => e.to_string(),
-        };
+        let formula = format!("y ~ sphere(lat, lon, k=10, penalty_order=2, method='{removed}')");
+        let err = refusal(formula.as_str());
         assert!(
-            err.contains(&format!("unknown sphere method `{removed}`")) && err.contains(&format!("use `{canonical}`")),
+            err.contains(&format!("unknown sphere method `{removed}`"))
+                && err.contains(&format!("use `{canonical}`")),
             "method=`{removed}` must name `{canonical}`, got: {err}"
         );
     }
+    let formula = "y ~ sphere(lat, lon, k=10, penalty_order=2, kernel=sobolev)";
+    let err = refusal(formula);
+    assert!(
+        err.contains("unknown option `kernel`") && err.contains("use `method`"),
+        "{formula}: {err}"
+    );
 }

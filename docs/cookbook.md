@@ -177,8 +177,8 @@ gamfit.fit(df, "y ~ sphere(lat, lon, radians=true)")
 # Spherical harmonics; max_degree=L gives basis dim L(L+2).
 gamfit.fit(df, "y ~ sphere(lat, lon, method=harmonic, max_degree=8, radians=true)")
 
-# Pseudo-spline kernel.
-gamfit.fit(df, "y ~ s(lat, lon, bs=sos, method=pseudo)")
+# `s(..., bs=sos)` is the same sphere smooth written as an s() term.
+gamfit.fit(df, "y ~ s(lat, lon, bs=sos)")
 ```
 
 ## Manifold-valued response (simplex / sphere)

@@ -89,7 +89,7 @@ fn cycle_51_nan_lat_rejected_at_encode() {
 #[test]
 fn cycle_52_tiny_n_does_not_crash() {
     init_parallelism();
-    for kernel in ["sobolev", "pseudo"] {
+    for kernel in ["sobolev", "harmonic"] {
         let data = make_dataset(10, 0.05, 7);
         let pred = fit_pred(
             &format!("y ~ sphere(lat, lon, k=10, method={kernel})"),
@@ -114,7 +114,7 @@ fn cycle_52_tiny_n_does_not_crash() {
 #[test]
 fn cycle_53_extreme_noise_predicts_near_flat() {
     init_parallelism();
-    for kernel in ["sobolev", "pseudo"] {
+    for kernel in ["sobolev", "harmonic"] {
         let data = make_dataset(400, 5.0, 7);
         let pred = fit_pred(
             &format!("y ~ sphere(lat, lon, k=20, method={kernel})"),
@@ -136,7 +136,7 @@ fn cycle_53_extreme_noise_predicts_near_flat() {
 #[test]
 fn cycle_54_full_sphere_predictions_bounded() {
     init_parallelism();
-    for kernel in ["sobolev", "pseudo"] {
+    for kernel in ["sobolev", "harmonic"] {
         let data = make_dataset(400, 0.05, 7);
         let pred = fit_pred(
             &format!("y ~ sphere(lat, lon, k=30, method={kernel})"),
