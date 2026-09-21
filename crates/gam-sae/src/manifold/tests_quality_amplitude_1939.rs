@@ -1,7 +1,7 @@
 //! #1939 OBJECTIVE-QUALITY acceptance bar — existence/intensity DECOUPLING in the
 //! physical dictionary. The current representation carries intensity directly in
-//! each fitted decoder. *Existence* (does this atom explain held-out structure)
-//! must be identified separately from *intensity* (how large its contribution is).
+//! each fitted decoder. *Existence* (does the data support this atom at all) must
+//! be identified separately from *intensity* (how large its contribution is).
 //!
 //! We plant that ground truth: two live circles on DISJOINT output subspaces whose
 //! amplitudes differ by ~an order of magnitude, plus a DEAD atom slot with no
@@ -9,13 +9,16 @@
 //! the planted amplitude ratio and the dead/alive partition — NOT reproduction of
 //! any reference tool's fitted parameters.
 //!
-//! Intensity lives in the decoder magnitude `‖B_k‖`; the executable objective bar
-//! below therefore identifies a dead atom by its held-out contribution while
-//! separately checking the recovered intensity ratio of the two live atoms.
+//! Intensity lives in the decoder magnitude `‖B_k‖`. Existence is a marginal
+//! (evidence) question, so it is decided where the fit decides it: the outer
+//! REML/LAML selection of each atom's decoder precision `λ_k`, whose vanishing
+//! face removes the atom (#4325 — see the test's doc for why a hand-fixed ρ cannot
+//! decide it).
 
 use super::tests::deterministic_circle_noise;
 use super::tests_cocollapse_disjoint_2027::term_from_padded_blocks_with_mode;
 use super::*;
+use ndarray::Axis;
 
 /// Two circles on disjoint output-column parities with UNEQUAL amplitudes, plus a
 /// third (dead) subspace that carries no planted signal — returned UN-whitened so
@@ -192,11 +195,46 @@ fn even_energy_fraction(atom: &SaeManifoldAtom, p: usize) -> f64 {
 /// OBJECTIVE BAR (reachable) — a K=3 fit of two unequal circles + one dead slot
 /// recovers the planted structure: the reconstruction is faithful, the two live
 /// atoms land on the two planted (disjoint-parity) subspaces with intensities in
-/// the planted ~8:1 ratio, and the dead atom is separately identified as
-/// EXISTENCE-negative — it explains ~no held-out variance — even though the WEAK
-/// live atom is also small in magnitude. That last clause is the #1939 payoff:
-/// existence and intensity are decoupled, so "small" (weak circle) is not confused
-/// with "absent" (dead slot).
+/// the planted ~8:1 ratio, and the dead slot is separately identified as
+/// EXISTENCE-negative even though the WEAK live atom is also small in magnitude.
+/// That last clause is the #1939 payoff: existence and intensity are decoupled, so
+/// "small" (weak circle) is not confused with "absent" (dead slot).
+///
+/// WHERE EXISTENCE IS DECIDED (#4325). This bar used to fit at a hand-fixed
+/// `ρ = (0, −6, 0)` and demand that the dead slot's leave-one-atom-out EV fall
+/// below `0.25·loao(weak)`. The fixed-ρ objective does not imply that. At
+/// `λ_smooth = e⁻⁶` every decoder prior `B_k ~ N(0, (λ_k S_k)⁻¹)`, `S_k = I`, is
+/// essentially flat, so a third atom placed on the weak circle's subspace buys
+/// reconstruction with its `m·p` decoder coefficients and its `n` chart
+/// coordinates, and the only term pricing it at fixed ρ is the ordered
+/// Beta–Bernoulli gate prior. The certified inner optima measured on #4325 show
+/// the gain wins: total 194.261 with three live atoms against 194.380 with the
+/// slot empty. No seed and no bound on that state can make a fixed-ρ fit
+/// existence-negative, because the objective it certifies prefers the opposite.
+///
+/// Existence is a marginal question, and the fit prices it in the outer
+/// REML/LAML criterion over the per-atom precisions `λ_k`. Given charts and
+/// gates, each decoder block is linear-Gaussian, so for one output column the
+/// criterion in `λ_k` (others held) is the Gaussian marginal likelihood with
+/// covariance `C = φI + Σ_j Φ_j Φ_jᵀ/λ_j`. For a scalar basis direction with
+/// sparsity `s = φ_kᵀ C₋ₖ⁻¹ φ_k` and quality `q = φ_kᵀ C₋ₖ⁻¹ z` (`C₋ₖ` the
+/// covariance without atom k), the criterion is
+/// `½[ln λ − ln(λ + s) + q²/(λ + s)]`, which is stationary at the finite
+/// `λ = s²/(q² − s)` when `q² > s` and increases toward `λ → ∞` otherwise. A
+/// surplus atom duplicating the weak circle after atom 1 has explained it sees
+/// only noise in `q` (`q² ≲ s`), so its evidence optimum is the vanishing face.
+/// The weak circle's own atom has `q² ≫ s` (its signal-to-noise ratio is
+/// `amp_b²/σ² = 2500`) and keeps a finite `λ`. The production entry removes
+/// an atom whose outer search reaches that face (`fit_outer_stage_to_boundary` →
+/// `vanished_disposition` → restart at `K − 1`), so the bar runs the single fit
+/// entry with its outer ρ search and asserts that exactly the two planted atoms
+/// survive, with the weak one still existence-positive and in the planted
+/// intensity ratio.
+///
+/// The fit runs on the centered target with its (zero-to-rounding) Tier-0 mean
+/// installed, so the entry does not column-standardize: standardizing would
+/// rescale each output column to unit RMS and erase the 8:1 intensity this bar
+/// measures.
 #[test]
 fn existence_and_intensity_are_separately_identified_1939() {
     let n = 144usize;
@@ -204,11 +242,23 @@ fn existence_and_intensity_are_separately_identified_1939() {
     let m = 5usize; // [1, sin2πt, cos2πt, sin4πt, cos4πt]
     let amp_a = 8.0_f64;
     let amp_b = 1.0_f64;
-    let target = two_unequal_circles_plus_dead(n, p, amp_a, amp_b, 0.02);
+    let mut target = two_unequal_circles_plus_dead(n, p, amp_a, amp_b, 0.02);
+    let raw_mean = target
+        .mean_axis(Axis(0))
+        .expect("the fixture has n > 0 rows");
+    for mut row in target.rows_mut() {
+        row -= &raw_mean;
+    }
+    let centered_mean = target
+        .mean_axis(Axis(0))
+        .expect("the fixture has n > 0 rows");
     const LOG_SMOOTHNESS: f64 = -6.0;
     let mut term = kterm_periodic(&target, 3, m, LOG_SMOOTHNESS.exp());
+    term.set_tier0_mean(centered_mean)
+        .expect("the centered target's mean has the output width and is finite");
 
-    let mut rho = SaeManifoldRho::new(
+    // The seed ρ only; the outer REML/LAML search selects every λ_k from here.
+    let initial_rho = SaeManifoldRho::new(
         0.0,
         LOG_SMOOTHNESS,
         vec![
@@ -217,34 +267,32 @@ fn existence_and_intensity_are_separately_identified_1939() {
             Array1::<f64>::zeros(1),
         ],
     );
-    let loss = term
-        .run_joint_fit_arrow_schur(target.view(), &mut rho, None, 80, 0.05, 1.0e-3, 1.0e-3)
-        .expect("the 3-atom amplitude fit evaluates within its 80 inner iterations");
-    assert!(loss.total().is_finite(), "loss must stay finite");
-    // The existence verdict below is read from this state, so it must be the inner
-    // optimum. `run_joint_fit_arrow_schur` also returns `Ok` when the iteration grant
-    // runs out, so certify the returned state against the ordinary fit's own KKT band,
-    // in the raw chart or on the identified quotient, before anything is judged.
-    let system = term
-        .assemble_arrow_schur(target.view(), &rho, None)
-        .expect("the fitted state assembles its arrow system");
-    let grad_norm_sq = SaeManifoldTerm::system_grad_norm_sq(&system);
-    let lambda_smooth = rho
-        .lambda_smooth_vec()
-        .expect("the fitted rho carries its smoothing strengths");
-    let quotient_grad_norm =
-        term.quotient_gradient_norm_from_system(&system, grad_norm_sq, &lambda_smooth);
-    let grad_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * term.inner_iterate_scale();
-    assert!(
-        SaeManifoldTerm::quasi_laplace_kkt_stationary(
-            grad_norm_sq.sqrt(),
-            quotient_grad_norm,
-            grad_tolerance
-        ),
-        "the K=3 amplitude fit must reach its inner KKT band before existence is judged: \
-         ‖g‖={:.3e}, quotient ‖g‖={quotient_grad_norm:.3e}, tolerance {grad_tolerance:.3e}",
-        grad_norm_sq.sqrt()
-    );
+    let outcome = run_sae_manifold_fit(SaeFitRequest {
+        reconstruction_optimism_folds: None,
+        base_term: term,
+        target: target.clone(),
+        registry: AnalyticPenaltyRegistry::new(),
+        initial_rho,
+        max_iter: 80,
+        learning_rate: 0.05,
+        ridge_ext_coord: 1.0e-3,
+        ridge_beta: 1.0e-3,
+        alpha: 1.0,
+        isometry_pin_active: false,
+        metric_provenance: "Euclidean",
+        promote_from_residual: false,
+        run_structure_search: false,
+        run_outer_rho_search: true,
+        structured_residual_passes: 0,
+        cancel: None,
+    })
+    .unwrap_or_else(|error| panic!("the K=3 amplitude fit must converge its outer search: {error}"));
+    let report = outcome
+        .manifold_or_error()
+        .unwrap_or_else(|error| panic!("two planted circles must keep a manifold fit: {error}"));
+    let term = report.term;
+    let rho = report.rho;
+    let k_fit = term.k_atoms();
 
     let ev = term
         .dictionary_reconstruction_ev(target.view(), &rho)
@@ -259,25 +307,28 @@ fn existence_and_intensity_are_separately_identified_1939() {
         .map(|a| even_energy_fraction(a, p))
         .collect();
     eprintln!(
-        "[#1939] EV={ev:.4}, contrib_rms={contrib:?}, loao_ev={loao:?}, even_frac={even_frac:?}"
+        "[#1939] K_fit={k_fit}, log_lambda_smooth={:?}, criterion={:.6}, EV={ev:.4}, \
+         contrib_rms={contrib:?}, loao_ev={loao:?}, even_frac={even_frac:?}",
+        rho.log_lambda_smooth, report.penalized_quasi_laplace_criterion
     );
 
     // Faithful reconstruction: two rank-2 circles dominate a 16-dim cloud, so an
-    // honest K=3 dictionary explains most of the variance.
+    // honest dictionary explains most of the variance.
     assert!(
         ev > 0.80,
         "the two-circle target must be well reconstructed (EV={ev:.4})"
     );
 
-    // Rank atoms by physical contribution. The strongest and second-strongest are
-    // the live atoms; the weakest is the dead-slot candidate.
-    let mut order: Vec<usize> = (0..3).collect();
-    order.sort_by(|&i, &j| {
-        contrib[j]
-            .partial_cmp(&contrib[i])
-            .expect("contribution RMS is finite: the fit asserted a finite loss")
-    });
-    let (strong, weak, dead) = (order[0], order[1], order[2]);
+    // (c) EXISTENCE identified SEPARATELY from intensity — the crux. The marginal
+    // criterion removes the dead slot and keeps both planted circles.
+    assert_eq!(
+        k_fit, 2,
+        "the outer criterion must remove exactly the dead slot and keep both planted circles; \
+         it kept {k_fit} atoms with log λ_smooth {:?}, contributions {contrib:?}, LOAO {loao:?}",
+        rho.log_lambda_smooth
+    );
+
+    let (strong, weak) = if contrib[0] >= contrib[1] { (0, 1) } else { (1, 0) };
 
     // (b) INTENSITY RECOVERY — the two live atoms carry the planted amplitude
     // ratio. The gate weight is common (uniform-ish ordered_beta_bernoulli gate), so the ratio of
@@ -307,31 +358,13 @@ fn existence_and_intensity_are_separately_identified_1939() {
         even_frac[weak]
     );
 
-    // (c) EXISTENCE identified SEPARATELY from intensity — the crux. Both the weak
-    // live atom and the dead atom are small in magnitude, but the weak atom EXISTS
-    // (it explains real held-out variance) while the dead atom does not. So the
-    // dead atom's leave-one-atom-out EV drop must be near zero AND far below the
-    // weak live atom's — proving "weak" was not mistaken for "absent".
+    // The WEAK atom survived the same criterion that removed the dead slot, and it
+    // carries real variance: removing it loses its circle's share of the target.
     let loao_weak = loao[weak].unwrap_or(0.0);
-    let loao_dead = loao[dead].unwrap_or(0.0);
-    eprintln!("[#1939] loao(weak live)={loao_weak:.4}, loao(dead)={loao_dead:.4}");
+    eprintln!("[#1939] loao(weak live)={loao_weak:.4}");
     assert!(
         loao_weak > 0.01,
-        "the WEAK live atom must explain real held-out variance (existence-positive); \
+        "the WEAK live atom must explain real variance (existence-positive); \
          loao_weak={loao_weak:.4}"
-    );
-    assert!(
-        loao_dead < 0.25 * loao_weak,
-        "the DEAD atom must be existence-negative — its held-out contribution \
-         ({loao_dead:.4}) must sit far below the weak live atom's ({loao_weak:.4}), so a \
-         small-but-real intensity is never confused with absence"
-    );
-    // And its physical contribution must be the smallest by a clear margin.
-    assert!(
-        contrib[dead] < 0.5 * contrib[weak],
-        "the dead atom's decoded contribution {:.4e} must be materially below the weak \
-         live atom's {:.4e}",
-        contrib[dead],
-        contrib[weak]
     );
 }
