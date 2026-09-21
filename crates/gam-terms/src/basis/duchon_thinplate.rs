@@ -520,25 +520,13 @@ fn build_duchon_basis_uncached(
     // spuriously reject valid kernels — e.g. the `s=0` thin-plate `r²·log r`
     // (`2(p+s)=d+2` in 2D), which the native Gram handles fine.
     //
-    // Validate against the spectral power the kernel actually evaluates. The
-    // scale-free native Gram (`length_scale=None`) uses the literal fractional
-    // `spec.power`. The hybrid Matérn-blended kernel (`length_scale=Some`) is
-    // built from the integer partial-fraction expansion of `(κ²+‖w‖²)^s` and
-    // reads `s` back through `power_as_usize` (a fractional `spec.power` is
-    // truncated to that integer). Validating the raw fractional power on the
-    // hybrid path desyncs the `2(p+s) > d` well-posedness gate from the realized
-    // kernel: e.g. the cubic default `s=(d-1)/2=1.5` at p=2, d=4 truncates to
-    // s=0 where `2(p+s)=4=d` is NOT finite at the origin, yet `spec.power=1.5`
-    // passes the gate — the resulting non-finite Gram crashes the constraint
-    // eigendecomposition (gh#750). Gate on the truncated integer for hybrid so
-    // that case is rejected here with a clear message while every valid hybrid
-    // config (e.g. 1D, where `2(2+0)=4>1` stays finite) still builds.
-    let validation_power = if spec.length_scale.is_some() {
-        spec.power_as_usize() as f64
-    } else {
-        spec.power
-    };
-    validate_duchon_kernel_orders(spec.length_scale, p_order, validation_power, data.ncols())?;
+    // Validate the requested power itself. The scale-free native Gram
+    // (`length_scale=None`) evaluates the literal fractional `spec.power`; the
+    // hybrid Matérn-blended kernel (`length_scale=Some`) exists only for an
+    // integer `s` (the partial-fraction split of `(κ²+‖w‖²)^s`), so the
+    // validator refuses a fractional hybrid power rather than building some
+    // other order (#3541; gh#750 was one such request).
+    validate_duchon_kernel_orders(spec.length_scale, p_order, spec.power, data.ncols())?;
     let poly_cols = polynomial_block_from_order(data, effective_nullspace_order).ncols();
     let spectral_basis = center_strategy_spectral_basis(&spec.center_strategy);
     if let Some(spectral) = spectral_basis {
@@ -653,7 +641,9 @@ fn build_duchon_basis_uncached(
         let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
         let s_order: f64 = spec.power;
         let length_scale = spec.length_scale;
-        let s_order_int = length_scale.map(|_| duchon_power_to_usize(s_order));
+        let s_order_int = length_scale
+            .map(|_| duchon_hybrid_s_order(s_order))
+            .transpose()?;
         let coeffs = length_scale
             .map(|ls| {
                 // Hybrid Matérn (length_scale = Some) uses the integer

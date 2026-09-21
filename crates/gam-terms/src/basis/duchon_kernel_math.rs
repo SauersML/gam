@@ -131,7 +131,7 @@ pub(crate) fn build_duchon_collocation_operator_matriceswithworkspace(
     // skips it entirely and is fractional-clean down to the Riesz kernel.
     let coeffs = length_scale
         .map(|scale| {
-            let s_int = duchon_power_to_usize(s_order);
+            let s_int = duchon_hybrid_s_order(s_order)?;
             duchon_inverse_length_scale(scale, "Duchon collocation operator")
                 .map(|kappa| duchon_partial_fraction_coeffs(p_order, s_int, kappa))
         })
@@ -711,7 +711,7 @@ pub(crate) fn duchon_spec_supports_axis_psi(spec: &DuchonBasisSpec, dim: usize) 
         Some(eta) if eta.len() == dim => {}
         _ => return false,
     }
-    spec.power_as_usize() as f64 == spec.power
+    spec.hybrid_s_order().is_ok()
 }
 
 /// Returns the effective Duchon null-space order, auto-degrading when the
@@ -1575,6 +1575,10 @@ pub(crate) fn validate_duchon_kernel_orders(
     //     diverges and there is nothing to evaluate.
     if !s_order.is_finite() || s_order < 0.0 {
         crate::bail_invalid_basis!("Duchon spectral power must be finite and ≥ 0; got s={s_order}");
+    }
+    // (0) The hybrid kernel exists only for integer `s` (#3541).
+    if length_scale.is_some() {
+        crate::basis::duchon_hybrid_s_order(s_order)?;
     }
     if length_scale.is_none() && 2.0 * s_order >= k_dim as f64 {
         // The `2s >= d` boundary is INDEPENDENT of the nullspace degree p (it
@@ -3161,8 +3165,8 @@ mod duchon_hybrid_psd_tests {
         // m=2 ⇒ Linear null space. The cubic default spectral power is the
         // fractional (d-1)/2 = 7.5; the production hybrid config resolves it to
         // the integer spectral order the closed-form kernel consumes, s = 7
-        // (`duchon_constrained_bending_penalty` itself takes the integer view via
-        // `duchon_power_to_usize`, and the reroute predicate needs s ≥ 1). This is
+        // (a fractional hybrid power is refused by `duchon_hybrid_s_order`, and
+        // the reroute predicate needs s ≥ 1). This is
         // the (d=16, m=2, s=7) fixture from the issue and the Python
         // `duchon_function_norm_penalty` PSD test.
         let (nullspace_order, default_power) = duchon_cubic_default(d);
@@ -3172,7 +3176,7 @@ mod duchon_hybrid_psd_tests {
             "cubic-default power for d=16 is 7.5"
         );
         let power = 7.0_f64;
-        assert_eq!(duchon_power_to_usize(power), 7);
+        assert_eq!(duchon_hybrid_s_order(power).expect("integer power"), 7);
         // The reroute must engage for this fixture (s = 7 ≥ 1, 2p = 4 < d = 16).
         assert!(duchon_hybrid_stable_integral_applies(
             duchon_p_from_nullspace_order(nullspace_order),

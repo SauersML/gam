@@ -3172,5 +3172,14 @@
     ],
     "reason": "#3438: renamed and generalized to project_coordinate_tangent_slots. The coordinate tangent projector B is assembled in now has two block kinds, CoordinateTangentBlock::{Sphere, PinnedBound}: an embedded-sphere block keeps P = I - t t^T, and an interval coordinate held at an active bound is the zero map. The sphere-only function would miss the pinned slots, so every caller moves to the generalized projector over coordinate_tangent_blocks and the old name is deleted rather than kept as a shim.",
     "evidence": "At the base, git grep finds project_sphere_tangent_slots at its declaration (construction_exact_hessian.rs:1389), two uses in the same file (the delta-C applier's input and output legs) and four in construction_fitted_response.rs (the rhs, the solution, and the G column and row). In the landing tree the name occurs 0 times; each of those seven sites calls project_coordinate_tangent_slots with the coordinate tangent blocks. cargo check --workspace --tests passes and the gam-sae manifold suite, including tests_interval_active_bound_3438, passes."
+  },
+  {
+    "base": "0ad99f35c574d1698a07f2c4a891a14a95a5090d",
+    "items": [
+      "crates/gam-terms/src/basis/types.rs:fn:power_as_usize",
+      "tests/src_modules/smooths/basis_radial_periodic_thinplate_tests.rs:fn:hybrid_duchon_fractional_default_d4_rejects_realized_nonfinite_kernel"
+    ],
+    "reason": "#3541: a hybrid Duchon power is read through the fallible duchon_hybrid_s_order, which refuses a fractional s; the truncating power_as_usize view is gone. The d=4-only gh#750 test becomes a d=1,2,4 refusal table (hybrid_duchon_fractional_power_is_refused_in_every_dimension_3541).",
+    "evidence": "git grep finds no remaining caller of power_as_usize; every former caller now calls DuchonBasisSpec::hybrid_s_order or duchon_hybrid_s_order."
   }
 ]

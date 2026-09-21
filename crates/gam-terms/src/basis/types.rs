@@ -1160,8 +1160,8 @@ pub struct DuchonBasisSpec {
     /// user gives no explicit power) is a request-layer choice resolved by the
     /// formula / CLI / pyffi front-ends via [`duchon_cubic_default`]; by the time
     /// a spec reaches the builder this value is the final intended `s`. The
-    /// hybrid Duchon–Matérn path (`length_scale = Some`) still requires an
-    /// integer `s` (read via `spec.power_as_usize()`).
+    /// hybrid Duchon–Matérn path (`length_scale = Some`) requires an integer
+    /// `s` and refuses a fractional one (`DuchonBasisSpec::hybrid_s_order`).
     pub power: f64,
     pub nullspace_order: DuchonNullspaceOrder,
     #[serde(default)]
@@ -1197,26 +1197,43 @@ pub struct DuchonBasisSpec {
 }
 
 impl DuchonBasisSpec {
-    /// Integer view of `power` for the existing integer-only downstream chain.
-    /// Non-finite or non-integer values fall back to `0` (the integer-only
-    /// validators downstream already reject this case with a clear message).
-    pub(crate) fn power_as_usize(&self) -> usize {
-        duchon_power_to_usize(self.power)
+    /// The integer Matérn order `s` of a hybrid spec (`length_scale = Some`);
+    /// see [`duchon_hybrid_s_order`].
+    pub(crate) fn hybrid_s_order(&self) -> Result<usize, BasisError> {
+        duchon_hybrid_s_order(self.power)
     }
 }
 
-/// Convert a Duchon spectral-power `f64` into the integer view used by the
-/// closed-form code paths. Non-finite, negative, or fractional values clamp to
-/// `0` so the validator downstream emits the canonical error.
+/// The integer Matérn order `s` of a hybrid Duchon–Matérn kernel
+/// (`length_scale = Some`), or a refusal when `power` is not a non-negative
+/// integer. The hybrid kernel is built from the partial-fraction split of
+/// `1/(ρ^{2p}(κ²+ρ²)^s)`, which exists only for integer `s`; a fractional
+/// request has no hybrid kernel to build, so it is refused rather than read
+/// as some other order (#3541). The scale-free kernel (`length_scale = None`)
+/// takes a fractional `power` literally and never asks for this.
+pub(crate) fn duchon_hybrid_s_order(power: f64) -> Result<usize, BasisError> {
+    if !power.is_finite() || power < 0.0 || power.fract() != 0.0 {
+        crate::bail_invalid_basis!(
+            "hybrid Duchon (length_scale set) requires a non-negative integer spectral power s: \
+             the partial-fraction split of 1/(ρ^(2p)(κ²+ρ²)^s) exists only for integer s; \
+             got power={power}. Drop length_scale for a fractional power"
+        );
+    }
+    Ok(power as usize)
+}
+
+/// The integer order handed to kernel routines that dispatch on
+/// `length_scale`. Only their hybrid branch reads it, and a hybrid power has
+/// already passed [`duchon_hybrid_s_order`] through
+/// `validate_duchon_kernel_orders`, so there it is that same integer. The
+/// scale-free branch evaluates the literal `power` and ignores this value,
+/// which is why a fractional `power` maps to `0` here instead of refusing.
 pub(crate) fn duchon_power_to_usize(power: f64) -> usize {
-    if !power.is_finite() || power < 0.0 {
-        return 0;
+    if power.is_finite() && power >= 0.0 && power.fract() == 0.0 {
+        power as usize
+    } else {
+        0
     }
-    let rounded = power.round();
-    if (rounded - power).abs() > 1e-9 {
-        return 0;
-    }
-    rounded as usize
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

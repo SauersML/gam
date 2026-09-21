@@ -2124,7 +2124,7 @@ pub(crate) fn build_duchon_operator_penalty_psi_derivatives_in_directions(
     })?;
     let effective_nullspace_order = duchon_effective_nullspace_order(centers, spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
-    let s_order = spec.power_as_usize();
+    let s_order = spec.hybrid_s_order()?;
     let dim = centers.ncols();
     let two_pps = 2.0 * (p_order as f64 + spec.power);
     let mut effective_operator_penalties = spec.operator_penalties.clone();
@@ -2819,7 +2819,7 @@ pub(crate) fn build_duchon_native_penalty_psi_derivatives_in_directions(
     })?;
     let effective_nullspace_order = duchon_effective_nullspace_order(centers, spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
-    let s_order = spec.power_as_usize();
+    let s_order = spec.hybrid_s_order()?;
     let dim = centers.ncols();
     // #1355: project the penalty ψ-derivatives in the SAME rotated radial basis
     // as the forward penalty (`Vᵀ Ω(ψ) V`), bit-consistent with the design.

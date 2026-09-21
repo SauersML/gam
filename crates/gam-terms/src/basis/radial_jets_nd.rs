@@ -1230,7 +1230,12 @@ pub fn build_duchon_basis_design_and_jets(
     } else {
         p_order
     };
-    let s_order_int = duchon_power_to_usize(power);
+    // The hybrid kernel needs an integer `s` and refuses a fractional one
+    // (#3541); the scale-free kernel evaluates the literal `power`.
+    let s_order_int = match length_scale {
+        Some(_) => duchon_hybrid_s_order(power)?,
+        None => duchon_power_to_usize(power),
+    };
     let s_order_f = power;
 
     // Polynomial-constraint null space `Z` (same construction as every design

@@ -4997,5 +4997,13 @@
     },
     "reason": "#4097: remove the unused custom-compiler cache entry and its one forwarding wrapper; all three NVRTC compile paths use one shared-options implementation, preserving typed library failures and one diagnostic label. The keyed map recovers poisoned locks rather than bypassing caching.",
     "evidence": "MSI complete GPU unit binary builds in3.28seconds and the actual keyed-map poison/reacquisition regression passes. Coherent complete production dependency metadata is checked with warnings denied. Read audit confirms the removed custom-compiler entry had one caller using the identical shared options; fused consumers select the singleton runtime context. No GPU hardware execution is claimed."
+  },
+  {
+    "base": "0ad99f35c574d1698a07f2c4a891a14a95a5090d",
+    "removed": {
+      "crates/gam-terms/src/basis/types.rs::power_as_usize": 1
+    },
+    "reason": "#3541: a hybrid Duchon power is read through the fallible duchon_hybrid_s_order, which refuses a fractional s; the truncating power_as_usize view is gone. The d=4-only gh#750 test becomes a d=1,2,4 refusal table (hybrid_duchon_fractional_power_is_refused_in_every_dimension_3541).",
+    "evidence": "git grep finds no remaining caller of power_as_usize; every former caller now calls DuchonBasisSpec::hybrid_s_order or duchon_hybrid_s_order."
   }
 ]

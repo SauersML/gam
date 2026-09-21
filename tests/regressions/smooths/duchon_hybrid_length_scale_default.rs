@@ -11,9 +11,10 @@
 //! Root cause: the request-layer cubic structural default resolves the spectral
 //! power to the fractional `s = (d-1)/2`, which is a half-integer for even `d`.
 //! The hybrid Matérn-blended kernel requires an *integer* `s`, and the basis
-//! builder's `power_as_usize` maps a non-integer to `0` (not its floor). For
-//! `d ≥ 4` that yields `2(p+s) = 2p = 4 ≤ d`, an inadmissible kernel that is
-//! non-finite at the origin.
+//! builder then mapped a non-integer to `0` (not its floor; it now refuses a
+//! fractional hybrid power outright, #3541). For `d ≥ 4` that yielded
+//! `2(p+s) = 2p = 4 ≤ d`, an inadmissible kernel that is non-finite at the
+//! origin.
 //!
 //! Fix: for the hybrid + cubic-default case the request layer resolves the
 //! smallest admissible *integer* `(nullspace, s)` via `resolve_duchon_orders`,

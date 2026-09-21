@@ -4508,38 +4508,53 @@ fn test_duchon_linear_nullspace_uses_collocation() {
 }
 
 #[test]
-fn hybrid_duchon_fractional_default_d4_rejects_realized_nonfinite_kernel() {
-    let data = array![
-        [0.0, 0.0, 0.0, 0.0],
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-        [1.0, 1.0, 0.0, 0.0],
-        [0.0, 1.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0, 1.0],
-        [1.0, 0.0, 0.0, 1.0],
-        [1.0, 1.0, 1.0, 1.0],
-    ];
-    let spec = DuchonBasisSpec {
-        radial_reparam: None,
-        center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-        length_scale: Some(1.0),
-        power: 1.5,
-        nullspace_order: DuchonNullspaceOrder::Linear,
-        identifiability: SpatialIdentifiability::None,
-        aniso_log_scales: None,
-        operator_penalties: DuchonOperatorPenaltySpec::default(),
-        periodic: None,
-        boundary: OneDimensionalBoundary::Open,
-    };
-    let err = build_duchon_basis(data.view(), &spec)
-        .expect_err("hybrid d=4 fractional power must reject before non-finite Gram");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Duchon pointwise kernel values: 2*(p+s) > dimension is required"),
-        "unexpected error: {msg}"
-    );
+fn hybrid_duchon_fractional_power_is_refused_in_every_dimension_3541() {
+    // #3541: the hybrid Duchon–Matérn kernel is the partial-fraction split of
+    // 1/(ρ^{2p}(κ²+ρ²)^s), which exists only for integer s. A fractional
+    // hybrid power used to be read as s = 0 and built silently (d = 1, d = 2),
+    // or rejected only by accident when the truncated order failed
+    // 2(p+s) > d (the gh#750 d = 4 case). Every dimension must refuse it for
+    // the real reason.
+    for &(dim, power) in &[(1usize, 0.5f64), (2, 1.5), (2, 0.5), (4, 1.5)] {
+        let n = 12usize;
+        let mut data = Array2::<f64>::zeros((n, dim));
+        for i in 0..n {
+            for a in 0..dim {
+                data[[i, a]] = ((i * (a + 3) + a) % n) as f64 / n as f64 + 0.01 * i as f64;
+            }
+        }
+        let spec = DuchonBasisSpec {
+            radial_reparam: None,
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+            length_scale: Some(1.0),
+            power,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+            periodic: None,
+            boundary: OneDimensionalBoundary::Open,
+        };
+        let err = build_duchon_basis(data.view(), &spec).expect_err(&format!(
+            "d={dim}: hybrid Duchon with fractional power={power} must be refused"
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires a non-negative integer spectral power s"),
+            "d={dim}, power={power}: unexpected error: {msg}"
+        );
+        // The same power without a length scale is the scale-free kernel,
+        // which takes a fractional power literally wherever it exists (2s < d).
+        if 2.0 * power < dim as f64 {
+            let pure = DuchonBasisSpec {
+                length_scale: None,
+                ..spec.clone()
+            };
+            build_duchon_basis(data.view(), &pure).unwrap_or_else(|e| {
+                panic!("d={dim}: scale-free Duchon with power={power} must build: {e}")
+            });
+        }
+    }
 }
 
 #[test]

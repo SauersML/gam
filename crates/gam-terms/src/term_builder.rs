@@ -3871,12 +3871,9 @@ pub(crate) fn build_smooth_basis(
                             // requires an INTEGER spectral power `s` (the partial-
                             // fraction split `1/(ρ^{2p}(κ²+ρ²)^s)` is only defined for
                             // integer `s`). The fractional cubic default `s=(d-1)/2` is
-                            // a half-integer for even `d`, and the basis builder's
-                            // `power_as_usize` maps a NON-integer to `0` (not its
-                            // floor) — so for even `d ≥ 4` the realized kernel has
-                            // `2(p+s) = 2p = 4 ≤ d`, which is non-finite at the origin
-                            // and crashes the fit (historically a non-finite
-                            // eigendecomposition; now a fit-time validation error).
+                            // a half-integer for even `d`, and the basis builder
+                            // refuses a fractional hybrid power (#3541), so the
+                            // default must name an integer here.
                             //
                             // Resolve to the same structural cubic default the
                             // scale-free path uses (affine `Linear` null space, `r³`
@@ -3889,9 +3886,6 @@ pub(crate) fn build_smooth_basis(
                             // `2(p+s) = d+3` (odd `d`) or `d+2` (even `d`), which
                             // clears both kernel existence `2(p+s) > d` and the D1
                             // collocation floor `2(p+s) > d+1` for every `d ≥ 1`.
-                            // Flooring here at the request layer avoids the
-                            // `power_as_usize` truncation-to-zero on the fractional
-                            // half-integer.
                             let (default_order, s_frac) =
                                 crate::basis::duchon_cubic_default(cols.len());
                             (
