@@ -1,5 +1,32 @@
 ## Unreleased
 
+- **The constrained cone term skipped every Firth fit on a premise about the stored gradient that
+  is not true** (gam#2765). The criterion's constrained term was declared inapplicable under Firth
+  bias reduction because `PirlsResult::penalized_gradient_transformed` was read as
+  `Sβ̂ − ∇ℓ(β̂)`, which omits the Jeffreys score the objective carries. Its own doc comment says
+  that, and on a Firth solve it is wrong: P-IRLS folds the Jeffreys linear-predictor score into the
+  working response before forming `XᵀW(η − z)`, so the stored vector is `Sβ̂ − ∇ℓ(β̂) − ∇Φ(β̂)`,
+  the gradient of the objective the solve actually minimizes; and the evaluation bundle subtracts
+  the Jeffreys curvature from the precision in the same place. Both halves of the pair the term
+  reads therefore describe one objective, and the exception is withdrawn rather than restated: a
+  Firth fit with inequality rows now prices the same criterion every other constrained fit does. A
+  reader should check the new pin on the separated fixture, which shows the stored gradient
+  clearing the inner certificate's bar while the same vector with the Jeffreys score removed does
+  not.
+- **A log barrier and the constrained cone term priced the same rows into one precision, and only
+  one of them was in the gradient** (gam#2765). The dense evaluation bundle adds a barrier Hessian
+  diagonal to `h_total` for coefficients with simple bounds, which was the face criterion's way of
+  charging the constraint's curvature. P-IRLS carries no barrier in its gradient, so where the
+  cone term prices those rows the pair it reads — the KKT gradient and the precision — described
+  two different objectives, and the multipliers, the EP sites and the truncation were all formed
+  from a curvature the mode was never found on. The barrier is not added there. Because a
+  declared constraint set routes the fit to the dense backend by name, that leaves the barrier
+  with no consumer at all; it is gated rather than deleted, because the deletion removes public
+  items and this change is the evidence that removal needs.
+- **Two objects assembled the criterion in different spaces at a constrained mode** (gam#2765).
+  The Tierney-Kadane correction read the active face's free basis directly while the criterion
+  read the cone term's, so a constrained fit could evaluate its correction on a reduced subspace
+  the criterion no longer used. Both now read one `criterion_free_basis`.
 - **The debiased-functional estimator is a library entry point, not FFI code** (gam#4550,
   gam#3542).
   `Model.debiased_functional`'s whole estimator chain lived inside

@@ -75,6 +75,10 @@ fn separated_probit_fixture() -> (Array2<f64>, Array1<f64>) {
     (x, y)
 }
 
+/// The relative inner-gradient residual this fixture's solves are accepted at. Named so the
+/// tests that grade a stored gradient are graded against the acceptance that produced it.
+const FIRTH_INNER_TOLERANCE: f64 = 1e-12;
+
 /// Run one Firth-penalized, unpenalized-in-λ P-IRLS solve on the fixture and
 /// report what the inner solve achieved.
 fn firth_inner_solve(link: StandardLink) -> PirlsResult {
@@ -92,7 +96,7 @@ fn firth_inner_solve(link: StandardLink) -> PirlsResult {
         )),
         link_kind: InverseLink::Standard(link),
         max_iterations: 100,
-        convergence_tolerance: 1e-12,
+        convergence_tolerance: FIRTH_INNER_TOLERANCE,
         firth_bias_reduction: true,
         initial_lm_lambda: None,
     };
@@ -438,4 +442,74 @@ fn composite_bounded_links_carry_an_exact_tail_complement_2273() {
              zero, so this test is not exercising the repair"
         );
     }
+}
+
+/// gam#2765: a Firth inner solve stores the FIRTH-penalized objective's gradient, so the
+/// constrained Laplace term reads the same objective the mode was found on.
+///
+/// `PirlsResult::penalized_gradient_transformed` documents itself as `Sβ̂ − ∇ℓ(β̂)`, and on a
+/// Firth fit that is not what it holds: the block above folds the Jeffreys linear-predictor score
+/// into the working response `z` before the score `XᵀW(η − z)` is formed, so the stored vector is
+/// `Sβ̂ − ∇ℓ(β̂) − ∇Φ(β̂) = ∇E(β̂)` for the objective `E = −ℓ + ½βᵀS_λβ − Φ` the solve minimizes.
+/// The constrained criterion reads that vector as its KKT gradient and the bundle's `h_total`,
+/// which subtracts `H_φ`, as the matching precision; if the gradient omitted `∇Φ` the two would
+/// describe different objectives and every multiplier read off them would be wrong by `∇Φ`.
+///
+/// On separated data `∇Φ` is the whole reason the mode is finite, so it is far from zero there,
+/// and the test is a direct comparison at the fixture's own acceptance: the stored vector clears
+/// the inner certificate's relative bar, and the vector that OMITS the Jeffreys score —
+/// `stored + ∇Φ`, which is `Sβ̂ − ∇ℓ(β̂)` — does not. The second half is the positive control: a
+/// bar both vectors cleared would prove nothing about which one is stored.
+#[test]
+fn the_firth_inner_gradient_carries_the_jeffreys_score_2765() {
+    let (x, _) = separated_probit_fixture();
+    let mut report = String::new();
+    let mut failures = Vec::new();
+    for link in [StandardLink::Logit, StandardLink::Probit, StandardLink::CLogLog] {
+        let fit = firth_inner_solve(link);
+        let design = fit.x_transformed.to_dense();
+        assert_eq!(
+            design.dim(),
+            x.dim(),
+            "{link:?}: the fixture is not reparameterized, so the transformed design is the one \
+             the Jeffreys operator is built on"
+        );
+        let phi_gradient = crate::estimate::reml::FirthDenseOperator::build_for_link(
+            &InverseLink::Standard(link),
+            &design,
+            &fit.final_eta.to_owned(),
+        )
+        .expect("the Jeffreys operator builds at the converged eta")
+        .jeffreys_beta_gradient();
+        let stored = &fit.penalized_gradient_transformed;
+        let without_score = stored + &phi_gradient;
+        let norm = |v: &Array1<f64>| v.dot(v).sqrt();
+        // The inner solve's own acceptance, on its own scale: the same relative residual the
+        // convergence certificate is decided against, at the same tolerance the fixture declares.
+        let bar = FIRTH_INNER_TOLERANCE * (1.0 + fit.gradient_natural_scale);
+        report.push_str(&format!(
+            "{link:?}: stored={:.3e} without_jeffreys_score={:.3e} phi_gradient={:.3e} \
+             bar={bar:.3e} scale={:.3e}\n",
+            norm(stored),
+            norm(&without_score),
+            norm(&phi_gradient),
+            fit.gradient_natural_scale
+        ));
+        if norm(stored) > bar {
+            failures.push(format!(
+                "{link:?}: the stored gradient {:.6e} is above the inner certificate's bar \
+                 {bar:.6e}, so it is not the gradient the solve drove to zero",
+                norm(stored)
+            ));
+        }
+        if norm(&without_score) <= bar {
+            failures.push(format!(
+                "{link:?}: dropping the Jeffreys score leaves {:.6e}, within the same bar \
+                 {bar:.6e}: this fixture cannot tell the two gradients apart",
+                norm(&without_score)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{report}\n{failures:#?}");
+    eprintln!("[2765-FIRTH-SCORE]\n{report}");
 }

@@ -2660,7 +2660,7 @@ impl<'a> RemlState<'a> {
             );
         }
 
-        let free_basis_opt = self.active_constraint_free_basis(pirls_result);
+        let free_basis_opt = self.criterion_free_basis(pirls_result);
         let use_original_basis = matches!(
             pirls_result.coordinate_frame,
             pirls::PirlsCoordinateFrame::TransformedQs
@@ -4819,21 +4819,30 @@ impl<'a> RemlState<'a> {
     /// stop depending on, and a term switched on at the moment a row activates would trade one
     /// jump for another; the rows' own declaration is the only thing that decides it.
     ///
-    /// One mode keeps the face criterion, for a reason that is a property of the criterion and
-    /// not of the fit's difficulty: with Firth bias reduction armed the inner objective is
-    /// `−ℓ + ½βᵀSλβ − Φ`, whose score `PirlsResult::penalized_gradient_transformed` does not
-    /// carry, so the vector the term would read is not that objective's `∇F` and its KKT gradient
-    /// would be wrong by `∇Φ`.
+    /// Firth bias reduction is NOT an exception, and the earlier claim that it was is retracted
+    /// here. The inner objective under Firth is `E = −ℓ + ½βᵀS_λβ − Φ`, and both halves of the
+    /// pair the term reads describe exactly that objective:
+    /// * P-IRLS folds the Jeffreys linear-predictor score into its working response before
+    ///   forming `XᵀW(η − z)`, so `PirlsResult::penalized_gradient_transformed` is
+    ///   `Sβ̂ − ∇ℓ(β̂) − ∇Φ(β̂) = ∇E(β̂)`, not `Sβ̂ − ∇ℓ(β̂)` as its own doc comment reads
+    ///   (`crates/gam-solve/src/pirls/gam_working_model.rs`, the `firth_bias_reduction` block);
+    ///   and
+    /// * the evaluation bundle subtracts the Jeffreys curvature, `h_total -= H_φ`, so the
+    ///   precision is `∇²E` too ([`Self::prepare_dense_eval_bundlewithkey`]).
+    /// The one Firth object that is NOT the Firth objective's is the inner-KKT envelope kernel,
+    /// which is why `standard_inner_kkt_residual_transformed` still declines there (gam#1821) —
+    /// and a constrained mode presents exact KKT anyway.
     ///
     /// This is the fit-level answer, decided before any inner solve, because the outer plan needs
     /// it: a criterion carrying the term is not an EFS fixed point, and at profiled dispersion it
-    /// declares no outer Hessian (see [`Self::declares_analytic_outer_hessian`]).
+    /// declares no outer Hessian (see [`Self::declares_analytic_outer_hessian`]). It agrees with
+    /// the per-evaluation answer on every reachable fit: `select_reml_geometry` routes a declared
+    /// constraint set to the dense backend by name (`constraints_present`) and nothing reroutes
+    /// back, so a constrained mode is never assembled where no term is priced.
     pub(crate) fn fit_prices_constrained_laplace(&self) -> bool {
-        !self.config.firth_bias_reduction
-            && self
-                .linear_constraints
-                .as_ref()
-                .is_some_and(|lin| lin.a.nrows() > 0)
+        self.linear_constraints
+            .as_ref()
+            .is_some_and(|lin| lin.a.nrows() > 0)
     }
 
     /// [`Self::fit_prices_constrained_laplace`] at one inner mode, which additionally carries the
@@ -4871,6 +4880,21 @@ impl<'a> RemlState<'a> {
     /// assembled in one frame and warm-started from another.
     pub(crate) fn criterion_leaves_the_original_basis(&self, pr: &PirlsResult) -> bool {
         self.prices_constrained_laplace(pr) || self.active_constraint_free_basis(pr).is_some()
+    }
+
+    /// The free basis this fit's CRITERION is reduced onto, or `None` where it is not reduced.
+    ///
+    /// One rule for one decision (gam#2765): where the constrained Laplace term prices the
+    /// criterion there is no face to reduce onto, and every object the criterion is assembled
+    /// from — the Hessian, the penalty roots, the design the Firth operator is built on, the
+    /// Tierney-Kadane correction's own evaluation basis — must read the same answer, or two of
+    /// them describe different spaces.
+    pub(crate) fn criterion_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {
+        if self.prices_constrained_laplace(pr) {
+            None
+        } else {
+            self.active_constraint_free_basis(pr)
+        }
     }
 
     pub(crate) fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {
@@ -6792,7 +6816,21 @@ impl<'a> RemlState<'a> {
         // Add log-barrier Hessian diagonal for monotonicity-constrained coefficients.
         // This augments the penalized Hessian before the spectral decomposition so
         // that logdet, trace, and solve operations all reflect the barrier curvature.
-        if let Some(ref lin) = pirls_result.linear_constraints_transformed
+        //
+        // gam#2765: not where the constrained Laplace term prices those same rows. The term
+        // reads the pair `(∇E(β̂), ∇²E(β̂))` and forms the KKT multipliers from it; P-IRLS
+        // carries no barrier in its gradient, so a barrier added to this matrix alone would make
+        // the two halves of that pair describe different objectives, and the multipliers,
+        // the sites and the truncation would all be read off a curvature the mode was never
+        // found on. The term IS the rows' treatment there, and it is the only one.
+        //
+        // That leaves the barrier with no consumer: it exists only for declared inequality rows,
+        // and a fit with those is routed here by `select_reml_geometry` and prices the term. It
+        // is gated rather than deleted because the deletion is a removal of pub items
+        // (`BarrierConfig`, `BarrierDerivativeProvider`, `OuterCapability::barrier_config`) with
+        // its own ledger entries, and this change is the evidence that removal needs.
+        if !self.fit_prices_constrained_laplace()
+            && let Some(ref lin) = pirls_result.linear_constraints_transformed
             && let Some(barrier_cfg) = Self::barrier_config_from_constraints(lin)
         {
             let beta_t = pirls_result.beta_transformed.as_ref();

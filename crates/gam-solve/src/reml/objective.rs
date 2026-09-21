@@ -966,6 +966,12 @@ impl<'a> RemlState<'a> {
     /// this criterion, and a non-finite or mis-shaped gradient is refused rather than dropped: a
     /// silently absent term is the discontinuity this removes.
     ///
+    /// Under Firth bias reduction this gradient is still the right vector: P-IRLS folds the
+    /// Jeffreys score into its working response, so the stored residual is `∇E` for
+    /// `E = −ℓ + ½βᵀS_λβ − Φ`, and the evaluation bundle subtracts `H_φ` from the precision, so
+    /// the pair the term reads describes one objective
+    /// (`the_firth_inner_gradient_carries_the_jeffreys_score_2765`).
+    ///
     /// At profiled Gaussian dispersion the integral is `∫_{Aβ ≥ b} exp(−E(β)/φ̂)`, so the term
     /// is priced on the posterior `φ̂` describes and the scale travels on the input (gam#3234).
     /// It is read through the same [`profiled_gaussian_scale`] the criterion's own
@@ -1384,11 +1390,7 @@ impl<'a> RemlState<'a> {
         // itself is built below, once the derivative context names the dispersion its posterior
         // is priced at.
         let prices_cone = self.prices_constrained_laplace(pirls_result);
-        let free_basis_opt = if prices_cone {
-            None
-        } else {
-            self.active_constraint_free_basis(pirls_result)
-        };
+        let free_basis_opt = self.criterion_free_basis(pirls_result);
         let (h_for_operator, e_for_logdet) = if let Some(z) = free_basis_opt.as_ref() {
             (
                 Cow::Owned(Self::projectwith_basis(bundle.h_total.as_ref(), z)),
