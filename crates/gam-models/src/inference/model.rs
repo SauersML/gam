@@ -1542,6 +1542,30 @@ pub fn gaussian_location_scale_saved_sigma_floor(
     }
 }
 
+/// The saved response standardization scale of a Gaussian location-scale model:
+/// the factor that maps the standardized σ floor back to raw response units
+/// (`σ_raw = response_scale · sigma_floor + exp(η_noise)`). It is written together
+/// with [`gaussian_location_scale_saved_sigma_floor`], so a payload carrying the
+/// floor without it is corrupt; it is refused rather than read as `1.0`, which
+/// would report the floor in standardized units.
+pub fn gaussian_location_scale_saved_response_scale(
+    payload: &FittedModelPayload,
+) -> Result<f64, FittedModelError> {
+    match payload.gaussian_response_scale {
+        Some(scale) if scale.is_finite() && scale > 0.0 => Ok(scale),
+        Some(scale) => Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "gaussian-location-scale gaussian_response_scale must be finite and positive, got {scale}"
+            ),
+        }),
+        None => Err(FittedModelError::MissingField {
+            reason: "gaussian-location-scale model is missing gaussian_response_scale, the \
+                     response standardization scale saved with its σ floor"
+                .to_string(),
+        }),
+    }
+}
+
 fn validate_survival_saved_block_matches_payload(
     fit: &UnifiedFitResult,
     role: BlockRole,
@@ -4276,6 +4300,7 @@ impl FittedModel {
             )?;
             if matches!(runtime.model_class, PredictModelClass::GaussianLocationScale) {
                 gaussian_location_scale_saved_sigma_floor(self.payload())?;
+                gaussian_location_scale_saved_response_scale(self.payload())?;
             }
         } else if matches!(runtime.model_class, PredictModelClass::Survival)
             && self
@@ -6240,6 +6265,37 @@ mod tests {
             smooth_terms: vec![],
             level: Default::default(),
         }
+    }
+
+    #[test]
+    fn gaussian_response_scale_is_required_and_positive() {
+        let mut payload = FittedModelPayload::new(
+            MODEL_PAYLOAD_VERSION,
+            "y ~ 1".to_string(),
+            ModelKind::LocationScale,
+            FittedFamily::LocationScale {
+                likelihood: LikelihoodSpec::gaussian_identity(),
+                base_link: None,
+            },
+            "gaussian-location-scale".to_string(),
+        );
+        payload.gaussian_response_scale = None;
+        assert!(matches!(
+            gaussian_location_scale_saved_response_scale(&payload),
+            Err(FittedModelError::MissingField { .. })
+        ));
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            payload.gaussian_response_scale = Some(bad);
+            assert!(matches!(
+                gaussian_location_scale_saved_response_scale(&payload),
+                Err(FittedModelError::SchemaMismatch { .. })
+            ));
+        }
+        payload.gaussian_response_scale = Some(2.0);
+        assert_eq!(
+            gaussian_location_scale_saved_response_scale(&payload).unwrap(),
+            2.0
+        );
     }
 
     /// Minimal transformation-normal payload that reaches (and passes, when the

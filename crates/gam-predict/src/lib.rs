@@ -986,9 +986,8 @@ where
 // Every Gaussian location-scale builder persists this scale alongside its
 // sigma floor. Missing state cannot be replayed as an implicit unit scale.
 fn gaussian_response_scale_for_prediction(model: &FittedModel) -> Result<f64, String> {
-    model.payload().gaussian_response_scale
-        .filter(|scale| scale.is_finite() && *scale > 0.0)
-        .ok_or_else(|| "Gaussian location-scale prediction requires a saved finite positive response standardization scale".to_string())
+    gam_models::inference::model::gaussian_location_scale_saved_response_scale(model.payload())
+        .map_err(|error| error.to_string())
 }
 
 pub trait FittedModelPredictExt {
