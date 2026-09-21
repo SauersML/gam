@@ -1,4 +1,4 @@
-use gam_math::probability::beta_quantile;
+use gam_math::probability::{beta_quantile, is_binomial_trial_count};
 use statrs::function::beta::beta_reg;
 
 /// Standard normal PDF φ(x).  Implementation lives in `gam-math`; re-exported
@@ -602,6 +602,144 @@ pub fn poisson_moment_matched_interval(
     } else {
         None
     }
+}
+
+/// Equal-tailed predictive interval for the observed proportion `K/m` of a new
+/// binomial row with `m` trials, whose success probability `p` has posterior
+/// mean `mu`, complement `complement = E[1 − p]` (carried separately, as in
+/// [`beta_moment_matched_interval`]) and variance `mean_variance`. Returns the
+/// pair of predictive quantiles of `K/m` at lower-tail probabilities
+/// `p_lo < p_hi`, each a multiple of `1/m`.
+///
+/// The conditional law is `K | p ~ Binomial(m, p)`. Estimation uncertainty in
+/// `p` is carried by the Beta whose mean and variance match its posterior
+/// moments, precision `a + b = μ(1−μ)/v − 1`, `a = μ(a+b)`, `b = (1−μ)(a+b)`,
+/// and the Beta mixture of binomials is exactly the beta-binomial
+/// `K ~ BetaBinomial(m, a, b)`. Its variance, divided by `m²`, is
+/// `μ(1−μ)/m + v(m−1)/m`, the conditional binomial spread plus the estimation
+/// variance each trial shares. With `v = 0` it is the exact
+/// `Binomial(m, μ)`, and with `m = 1` it is `Bernoulli(μ)` for every `v`,
+/// because a single trial sees only the mean of `p`.
+///
+/// The beta-binomial CDF has no closed form, and its log pmf through log-gamma
+/// differences cancels catastrophically once the precision `a + b` is large, the
+/// regime of a well-determined `p`. The pmf is therefore walked in log space by
+/// its exact term ratios
+/// `pmf(k+1)/pmf(k) = (m−k)/(k+1) · (a+k)/(b+m−k−1)`, whose `a + b → ∞` limit
+/// is the binomial ratio `(m−k)/(k+1) · μ/(1−μ)`: an unnormalized sweep over
+/// `0..=m` gives the normalizing mass, an ascending sweep the lower edge and a
+/// descending sweep the upper edge, each tail summed from its own end so neither
+/// is formed as a complement. The cost is `O(m)` per row.
+///
+/// Returns `None` when the inputs are not the moments of a probability (negative
+/// or non-finite, or a variance at or past the Bernoulli ceiling `μ(1−μ)`,
+/// which no Beta reaches), when `trials` is not an integer in `[1, 2⁵³]`, or when
+/// a term ratio leaves the finite positive range (a mean within underflow of a
+/// support edge while the other side carries mass).
+pub fn binomial_proportion_interval(
+    mu: f64,
+    complement: f64,
+    trials: f64,
+    mean_variance: f64,
+    p_lo: f64,
+    p_hi: f64,
+) -> Option<(f64, f64)> {
+    if !(mu.is_finite()
+        && mu >= 0.0
+        && complement.is_finite()
+        && complement >= 0.0
+        && mean_variance.is_finite()
+        && mean_variance >= 0.0
+        && is_binomial_trial_count(trials))
+    {
+        return None;
+    }
+    let max_var = mu * complement;
+    if mean_variance > 0.0 && mean_variance >= max_var {
+        return None;
+    }
+    // With no success probability the law is the point mass at zero, and with
+    // no failure probability (which admits no spread) the point mass at one.
+    if mu == 0.0 {
+        return Some((0.0, 0.0));
+    }
+    if complement == 0.0 {
+        return Some((1.0, 1.0));
+    }
+    let m = trials;
+    // Beta shapes of the posterior of `p`; `None` is the exact binomial, the
+    // `a + b → ∞` limit, which a variance too small to resolve against the
+    // Bernoulli ceiling also reaches.
+    let shapes = (mean_variance > 0.0)
+        .then(|| max_var / mean_variance - 1.0)
+        .filter(|precision| precision.is_finite())
+        .map(|precision| (mu * precision, complement * precision));
+    let log_ratio = |k: f64| -> f64 {
+        let counts = ((m - k) / (k + 1.0)).ln();
+        match shapes {
+            Some((a, b)) => counts + ((a + k) / (b + (m - k - 1.0))).ln(),
+            None => counts + (mu / complement).ln(),
+        }
+    };
+
+    // Unnormalized log weights `ℓ(0) = 0`, `ℓ(k+1) = ℓ(k) + ln ratio(k)`, and
+    // their streaming log-sum-exp.
+    let mut log_weight = 0.0_f64;
+    let mut log_max = 0.0_f64;
+    let mut scaled_mass = 1.0_f64;
+    let mut k = 0.0;
+    while k < m {
+        let step = log_ratio(k);
+        if !step.is_finite() {
+            return None;
+        }
+        log_weight += step;
+        if log_weight > log_max {
+            scaled_mass = scaled_mass * (log_max - log_weight).exp() + 1.0;
+            log_max = log_weight;
+        } else {
+            scaled_mass += (log_weight - log_max).exp();
+        }
+        k += 1.0;
+    }
+    let log_mass = log_max + scaled_mass.ln();
+    let log_weight_at_m = log_weight;
+
+    // Lower edge: the smallest `k` with `P(K ≤ k) ≥ p_lo`.
+    let lower = if p_lo <= 0.0 {
+        0.0
+    } else {
+        let mut cumulative = 0.0;
+        let mut log_weight = 0.0;
+        let mut k = 0.0;
+        loop {
+            cumulative += (log_weight - log_mass).exp();
+            if cumulative >= p_lo || k >= m {
+                break k;
+            }
+            log_weight += log_ratio(k);
+            k += 1.0;
+        }
+    };
+    // Upper edge: the smallest `k` with `P(K > k) ≤ 1 − p_hi`, reading the upper
+    // tail `P(K ≥ k)` down from `k = m`.
+    let upper = if p_hi >= 1.0 {
+        m
+    } else {
+        let tail_limit = 1.0 - p_hi;
+        let mut tail = 0.0;
+        let mut log_weight = log_weight_at_m;
+        let mut k = m;
+        loop {
+            tail += (log_weight - log_mass).exp();
+            if tail > tail_limit || k <= 0.0 {
+                break k;
+            }
+            log_weight -= log_ratio(k - 1.0);
+            k -= 1.0;
+        }
+    };
+    (upper >= lower).then_some((lower / m, upper / m))
 }
 
 /// CDF of a Tweedie compound Poisson–Gamma response (power `1 < p < 2`) with
@@ -1776,6 +1914,89 @@ mod tests {
         assert!(
             (hi - mu) > (mu - lo),
             "band not right-skewed: lo={lo}, hi={hi}, μ={mu}"
+        );
+    }
+
+    /// #4228: with no estimation variance the band is the exact
+    /// `Binomial(m, μ)/m` quantile pair. References are
+    /// `scipy.stats.binom(m, μ).ppf([0.025, 0.975])`.
+    #[test]
+    fn binomial_proportion_interval_is_the_exact_binomial_without_estimation_variance() {
+        let cases = [
+            (100.0, 0.5, 40.0, 60.0),
+            (7.0, 0.13, 0.0, 3.0),
+            (250.0, 0.02, 1.0, 10.0),
+            (100_000.0, 0.01, 939.0, 1062.0),
+        ];
+        for (m, mu, lo, hi) in cases {
+            let band = binomial_proportion_interval(mu, 1.0 - mu, m, 0.0, 0.025, 0.975);
+            assert_eq!(band, Some((lo / m, hi / m)), "m = {m}, μ = {mu}");
+        }
+    }
+
+    /// #4228: estimation variance in `p` turns the predictive into the
+    /// beta-binomial with the moment-matched Beta shapes. References are
+    /// `scipy.stats.betabinom(m, a, b).ppf([0.025, 0.975])` with
+    /// `a + b = μ(1−μ)/v − 1`.
+    #[test]
+    fn binomial_proportion_interval_is_the_moment_matched_beta_binomial() {
+        let cases = [
+            (100.0, 0.5, 0.01, 28.0, 72.0),
+            (40.0, 0.2, 0.001, 3.0, 14.0),
+            (12.0, 0.9, 0.02, 5.0, 12.0),
+            (30.0, 0.5, 0.2, 0.0, 30.0),
+            (5000.0, 0.3, 1.0e-4, 1384.0, 1618.0),
+            // A precision of ~2e11 is the binomial to within rounding, where a
+            // log-gamma difference would already have cancelled.
+            (200.0, 0.3, 1.0e-12, 48.0, 73.0),
+        ];
+        for (m, mu, v, lo, hi) in cases {
+            let band = binomial_proportion_interval(mu, 1.0 - mu, m, v, 0.025, 0.975);
+            assert_eq!(band, Some((lo / m, hi / m)), "m = {m}, μ = {mu}, v = {v}");
+        }
+    }
+
+    /// #4228: one trial sees only the mean of `p`, so the band is
+    /// `Bernoulli(μ)` whatever the estimation variance.
+    #[test]
+    fn binomial_proportion_interval_with_one_trial_is_bernoulli() {
+        for v in [0.0, 1.0e-3, 0.2] {
+            assert_eq!(
+                binomial_proportion_interval(0.5, 0.5, 1.0, v, 0.025, 0.975),
+                Some((0.0, 1.0))
+            );
+            assert_eq!(
+                binomial_proportion_interval(0.99, 0.01, 1.0, v.min(1.0e-3), 0.025, 0.975),
+                Some((1.0, 1.0))
+            );
+        }
+    }
+
+    #[test]
+    fn binomial_proportion_interval_refuses_what_is_not_a_binomial_row() {
+        for trials in [
+            0.0,
+            2.5,
+            -3.0,
+            f64::NAN,
+            f64::INFINITY,
+            2.0 * EXACT_INTEGER_LIMIT,
+        ] {
+            assert!(
+                binomial_proportion_interval(0.4, 0.6, trials, 0.0, 0.025, 0.975).is_none(),
+                "trials = {trials}"
+            );
+        }
+        // At or past the Bernoulli ceiling no Beta carries the variance.
+        assert!(binomial_proportion_interval(0.4, 0.6, 10.0, 0.24, 0.025, 0.975).is_none());
+        // Point masses at either edge.
+        assert_eq!(
+            binomial_proportion_interval(0.0, 1.0, 10.0, 0.0, 0.025, 0.975),
+            Some((0.0, 0.0))
+        );
+        assert_eq!(
+            binomial_proportion_interval(1.0, 0.0, 10.0, 0.0, 0.025, 0.975),
+            Some((1.0, 1.0))
         );
     }
 

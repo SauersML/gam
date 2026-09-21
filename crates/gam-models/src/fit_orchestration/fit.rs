@@ -425,6 +425,21 @@ fn record_null_deviance(
         .filter(|d| d.is_finite());
 }
 
+/// Record whether a binomial fit read its prior weights as trial counts: a
+/// response strictly inside `(0, 1)` is a proportion `k/m` whose weight `m` is
+/// its trial count, while a 0/1 response is Bernoulli with case weights. A new
+/// row's predictive law (`Binomial(m*, p)/m*` versus `Bernoulli(p)`) depends
+/// on which, and a saved model keeps no response to decide it from.
+fn record_binomial_trial_counts(
+    fit: &mut UnifiedFitResult,
+    request_family: &LikelihoodSpec,
+    y: ArrayView1<'_, f64>,
+) {
+    fit.artifacts.binomial_trial_counts =
+        matches!(request_family.response, ResponseFamily::Binomial)
+            && y.iter().any(|&value| value > 0.0 && value < 1.0);
+}
+
 pub(crate) fn fit_standard_model(
     request: StandardFitRequest<'_>,
 ) -> Result<StandardFitResult, FitFailure> {
@@ -488,6 +503,7 @@ pub(crate) fn fit_standard_model_on_design(
         request.weights.view(),
         request.offset.view(),
     );
+    record_binomial_trial_counts(&mut fitted.fit, &request.family, request.y.view());
     let adaptive_bases = adaptive_bases(&request.spec);
     let result = StandardFitResult {
         saved_link_state: fitted.fit.fitted_link.clone(),
@@ -617,6 +633,7 @@ pub(crate) fn fit_standard_model_on_design(
         request.weights.view(),
         request.offset.view(),
     );
+    record_binomial_trial_counts(&mut solved.fit, &request.family, request.y.view());
 
     Ok(StandardFitResult {
         saved_link_state: result.saved_link_state,

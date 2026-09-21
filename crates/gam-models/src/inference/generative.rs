@@ -179,6 +179,13 @@ pub enum NoiseModel {
     /// `nu` are the fitted values stored on the Student-t response spec.
     StudentT { sigma: f64, nu: f64 },
     Bernoulli,
+    /// Grouped binomial proportion: row `i` is `K_i / m_i` with
+    /// `K_i ~ Binomial(m_i, mean_i)`. This is the observation law of a binomial
+    /// fit that read its prior weights as trial counts, whose response is the
+    /// proportion `y = k/m` with weight `m`. `trials[i]` is the trial count
+    /// `m_i`, an integer in `[1, 2^53]`; a row with one trial is a Bernoulli
+    /// draw.
+    BinomialProportion { trials: Array1<f64> },
     /// Row-specific categorical response law.
     ///
     /// `probabilities[[i, j]]` is the fitted probability that observation `i`
@@ -231,11 +238,18 @@ impl GenerativeSpec {
 }
 
 /// Build a generative specification for built-in GAM families from eta/mean.
+///
+/// `binomial_trial_counts` says the fit read its binomial prior weights as
+/// trial counts (its responses were proportions `k/m` with weight `m`). A new
+/// row's weight is then its trial count and its replicate is the proportion
+/// `Binomial(m, p)/m`; without weights every row has one trial, a Bernoulli
+/// draw.
 pub fn generativespec_from_predict(
     prediction: PredictResult,
     likelihood: LikelihoodSpec,
     gaussian_scale: Option<f64>,
     prior_weights: Option<&Array1<f64>>,
+    binomial_trial_counts: bool,
 ) -> Result<GenerativeSpec, EstimationError> {
     let mut noise =
         NoiseModel::from_likelihood(&likelihood, prediction.mean.len(), gaussian_scale)?;
@@ -247,6 +261,13 @@ pub fn generativespec_from_predict(
     // whenever the fit carried prior weights (#2025).
     if let Some(weights) = prior_weights {
         apply_precision_prior_weights(&mut noise, weights)?;
+    }
+    if let (true, NoiseModel::Bernoulli, Some(weights)) =
+        (binomial_trial_counts, &noise, prior_weights)
+    {
+        noise = NoiseModel::BinomialProportion {
+            trials: binomial_trials_from_prior_weights(weights, prediction.mean.len())?,
+        };
     }
     Ok(GenerativeSpec {
         mean: prediction.mean,
@@ -325,6 +346,32 @@ fn scale_rows_by_prior_weights(
         *value = scaled;
     }
     Ok(())
+}
+
+/// The trial counts of a trial-count binomial fit's new rows: the prior
+/// weights, each an integer in `[1, 2^53]`. A weight that is not a trial count
+/// names no binomial observation law, so it is refused with its row.
+fn binomial_trials_from_prior_weights(
+    weights: &Array1<f64>,
+    nobs: usize,
+) -> Result<Array1<f64>, EstimationError> {
+    if weights.len() != nobs {
+        crate::bail_invalid_estim!(
+            "prior weights length {} does not match observation count {nobs}",
+            weights.len()
+        );
+    }
+    if let Some((row, &value)) = weights
+        .iter()
+        .enumerate()
+        .find(|&(_, &value)| !crate::probability::is_binomial_trial_count(value))
+    {
+        crate::bail_invalid_estim!(
+            "binomial replicate at row {row}: the fit read its weights as trial counts, so a \
+             new row's weight is its trial count, an integer in [1, 2^53]; got {value}"
+        );
+    }
+    Ok(weights.clone())
 }
 
 impl NoiseModel {
@@ -904,6 +951,23 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
             }
             Ok(y)
         }
+        NoiseModel::BinomialProportion { trials } => {
+            check_dispersion_len(trials, spec.mean.len(), "binomial trial count")?;
+            let mut y = Array1::<f64>::zeros(spec.mean.len());
+            for i in 0..y.len() {
+                let (p, m) = (spec.mean[i], trials[i]);
+                if !crate::probability::is_binomial_trial_count(m) {
+                    crate::bail_invalid_estim!("invalid binomial trial count at row {i}: {m}");
+                }
+                let dist = rand_distr::Binomial::new(m as u64, p).map_err(|e| {
+                    EstimationError::InvalidInput(format!(
+                        "invalid binomial parameters trials={m} probability={p}: {e}"
+                    ))
+                })?;
+                y[i] = rand_distr::Distribution::sample(&dist, rng) as f64 / m;
+            }
+            Ok(y)
+        }
         NoiseModel::Categorical {
             probabilities,
             labels,
@@ -1135,6 +1199,7 @@ mod tests {
             LikelihoodSpec::gaussian_identity(),
             Some(sigma_hat),
             Some(&weights),
+            false,
         )
         .expect("weighted Gaussian generative spec builds");
         let NoiseModel::Gaussian { sigma } = spec.noise else {
@@ -1164,6 +1229,7 @@ mod tests {
             LikelihoodSpec::gaussian_identity(),
             Some(sigma_hat),
             Some(&unit),
+            false,
         )
         .expect("unit-weight Gaussian generative spec builds");
         let NoiseModel::Gaussian { sigma: flat } = unweighted.noise else {
@@ -1191,8 +1257,14 @@ mod tests {
             mean: mean.clone(),
         };
         let per_row = |likelihood: LikelihoodSpec, parameter: f64, w: &Array1<f64>| {
-            match generativespec_from_predict(prediction(), likelihood, Some(parameter), Some(w))
-                .expect("weighted generative spec builds")
+            match generativespec_from_predict(
+                prediction(),
+                likelihood,
+                Some(parameter),
+                Some(w),
+                false,
+            )
+            .expect("weighted generative spec builds")
                 .noise
             {
                 NoiseModel::Gamma { shape } => shape,
@@ -1236,6 +1308,7 @@ mod tests {
             LikelihoodSpec::poisson_log(),
             None,
             Some(&weights),
+            false,
         )
         .expect("weighted Poisson generative spec builds");
         assert!(matches!(poisson.noise, NoiseModel::Poisson));
@@ -1248,6 +1321,7 @@ mod tests {
                 LikelihoodSpec::gamma_log(),
                 Some(3.0),
                 Some(&zero),
+                false,
             )
             .is_err(),
             "a zero precision weight must be rejected, not drawn with infinite variance"
@@ -1286,6 +1360,7 @@ mod tests {
             likelihood,
             parameter,
             Some(&Array1::from(vec![1.0, 2.0, 0.5])),
+            false,
         )
         .expect("Student-t generative spec builds");
         match spec.noise {
@@ -1294,6 +1369,59 @@ mod tests {
             }
             other => panic!("unexpected Student-t observation noise {other:?}"),
         }
+    }
+
+    /// #4228: a binomial fit that read its weights as trial counts replicates a
+    /// new row as the proportion `Binomial(m, p)/m` of its own trial count `m`,
+    /// not a Bernoulli 0/1. A row with one trial is a Bernoulli draw, a fit whose
+    /// weights were case weights keeps the Bernoulli law, and a weight that is not
+    /// a trial count is refused with its row.
+    #[test]
+    fn a_trial_count_binomial_replicates_the_observed_proportion_4228() {
+        let mean = Array1::from(vec![0.3, 0.3]);
+        let trials = Array1::from(vec![50.0, 1.0]);
+        let build = |weights: &Array1<f64>, trial_counts: bool| {
+            generativespec_from_predict(
+                PredictResult {
+                    eta: mean.clone(),
+                    mean: mean.clone(),
+                },
+                LikelihoodSpec::binomial_probit(),
+                None,
+                Some(weights),
+                trial_counts,
+            )
+        };
+        let spec = build(&trials, true).expect("trial counts name a binomial law");
+        let NoiseModel::BinomialProportion { trials: carried } = &spec.noise else {
+            panic!("expected the binomial-proportion law, got {:?}", spec.noise);
+        };
+        assert_eq!(carried, &trials);
+        let draws = sampleobservation_seeded_replicates(&spec, 0, 4000, 4228).unwrap();
+        let grouped = draws.column(0);
+        assert!(
+            grouped
+                .iter()
+                .all(|&y| (0.0..=1.0).contains(&y) && (y * 50.0).fract() == 0.0),
+            "every grouped draw is a count over 50 trials"
+        );
+        let n = grouped.len() as f64;
+        let sample_mean = grouped.sum() / n;
+        let sample_var = grouped.iter().map(|&y| (y - sample_mean).powi(2)).sum::<f64>() / (n - 1.0);
+        // Var(K/m) = p(1 − p)/m = 0.0042; the Bernoulli law would be 0.21.
+        assert!((sample_mean - 0.3).abs() < 0.005, "mean {sample_mean}");
+        assert!((sample_var - 0.0042).abs() < 0.0006, "variance {sample_var}");
+        assert!(
+            draws.column(1).iter().all(|&y| y == 0.0 || y == 1.0),
+            "a row with one trial is a Bernoulli draw"
+        );
+
+        let case_weighted = build(&trials, false).expect("case weights keep the Bernoulli law");
+        assert!(matches!(case_weighted.noise, NoiseModel::Bernoulli));
+
+        let refused = build(&Array1::from(vec![50.0, 2.5]), true)
+            .expect_err("a fractional trial count names no binomial law");
+        assert!(refused.to_string().contains("row 1"), "{refused}");
     }
 
     /// RoystonParmar is not exposed through the generic generative path, and
@@ -1331,6 +1459,7 @@ mod tests {
                 LikelihoodSpec::new(response, InverseLink::Standard(StandardLink::Log)),
                 Some(parameter),
                 Some(&weights),
+                false,
             )
             .unwrap();
             let draws = sampleobservation_seeded_replicates(&spec, 0, 20_000, 4163).unwrap();
@@ -1437,6 +1566,7 @@ mod tests {
                 likelihood,
                 parameter,
                 Some(&ndarray::array![1.0, 4.0]),
+                false,
             )
             .unwrap();
             assert!(

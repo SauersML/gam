@@ -703,6 +703,7 @@ mod unseen_level_prior_scale_tests {
                 improper_penalty_null_posterior: None,
                 outer_warm_start: None,
                 null_deviance: None,
+                binomial_trial_counts: false,
                 coefficient_mode_selection:
                     gam_solve::model_types::CoefficientModeSelection::NotRecorded,
                 random_effect_tests: Vec::new(),

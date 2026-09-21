@@ -166,6 +166,7 @@ fn spline_scan_generative_spec(
         model.likelihood(),
         Some(fit.sigma2.sqrt()),
         weights,
+        false,
     )
     .map(Some)
     .map_err(|error| SavedGenerativeError::InvalidState {
@@ -627,11 +628,16 @@ pub fn generative_spec_for_saved_model(
                     .map_err(|error| SavedGenerativeError::InvalidState {
                     reason: format!("fitted family noise parameter: {error}"),
                 })?;
-            generativespec_from_predict(prediction, likelihood, parameter, weights).map_err(
-                |error| SavedGenerativeError::InvalidState {
-                    reason: format!("fitted observation law: {error}"),
-                },
+            generativespec_from_predict(
+                prediction,
+                likelihood,
+                parameter,
+                weights,
+                fit.artifacts.binomial_trial_counts,
             )
+            .map_err(|error| SavedGenerativeError::InvalidState {
+                reason: format!("fitted observation law: {error}"),
+            })
         }
         PredictModelClass::BinomialLocationScale | PredictModelClass::BernoulliMarginalSlope => {
             let (_, _, prediction) = predictor_response()?;
