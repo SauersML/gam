@@ -647,25 +647,161 @@ fn classify_occupancy_weighted_impl(
         best_bic = single;
         best_law = OccupancyLaw::Continuous;
     }
-    // Walk the anchor count up from two and stop at the first order that does not
-    // improve on the order below it. The walk is bounded by the rows themselves: a
-    // mixture needs fewer anchors than points. An order whose maximum does not
-    // certify leaves the walk without the evidence it compares, so no law is read.
-    let mut previous_order_bic = f64::INFINITY;
+    // #4323 — the winning law is the BIC minimiser over EVERY admissible order
+    // (`k < rows`), not the order where the BIC first stops falling. BIC is not
+    // unimodal in `k` under a shared width: below the true anchor count one width
+    // must span merged clusters, so each added anchor costs `2 ln n` and buys
+    // little likelihood, and the BIC rises until `k` reaches the true count, where
+    // the width collapses and the BIC drops by orders of magnitude (the weekday
+    // fixture's BIC rises from k = 2 to k = 5, then falls by 347 from k = 6
+    // to k = 7).
+    //
+    // The walk ends on a certificate instead of a local rule. No mixture of any
+    // order has a log-likelihood above `loglik_bound`, so
+    // `BIC_k ≥ −2·loglik_bound + 2k·ln n`. Once that floor reaches the best
+    // BIC so far, no higher order can win: the floor rises with `k`, and
+    // `best_bic` never rises.
+    let Some(loglik_bound) =
+        order_free_mixture_loglik_bound(&pts, &w, sigma_floor, circular, effective_rows)
+    else {
+        return OccupancyLaw::Indeterminate;
+    };
     for k in 2..pairs.len() {
+        let bic_floor = -2.0 * loglik_bound + (2 * k) as f64 * ln_n;
+        if bic_floor >= best_bic {
+            break;
+        }
+        // An order whose evidence is not computable leaves the minimiser
+        // unknown. Reading the law off the orders that happened to compute would
+        // name a winner the race never established.
         let Some(bic) = mixture_bic(k) else {
             return OccupancyLaw::Indeterminate;
         };
-        if !(bic < previous_order_bic) {
-            break;
-        }
-        previous_order_bic = bic;
         if bic < best_bic {
             best_bic = bic;
             best_law = OccupancyLaw::Discrete { anchors: k };
         }
     }
     best_law
+}
+
+/// #4323 — an upper bound on the weighted log-likelihood `Σ wᵢ ln f(uᵢ)` of
+/// every density the anchor walk can score, at every order at once. Such a
+/// density is `f = Σⱼ πⱼ κ_σ(· − μⱼ)` with `Σ πⱼ = 1` and a shared width
+/// `σ ≥ σ_floor`. `κ_σ` is the Gaussian on the line. On the circle it is a
+/// partial sum of the Gaussian's periodic images, which is at most the full
+/// wrapped normal. The bound comes from three facts.
+///
+/// 1. **One width suffices.** Gaussians compose: `κ_σ = κ_{σ_floor} ∗ N(0,
+///    σ² − σ_floor²)`, on the line and, for the wrapped normal, on the circle.
+///    So every such `f` is a mixture `f_Q = ∫ κ_{σ_floor}(· − μ) dQ(μ)` for some
+///    mixing law `Q`, whatever its order or width.
+/// 2. **Jensen's inequality (Lindsay's bound).** Take any positive `gᵢ` and set
+///    `D(μ) = Σᵢ (wᵢ/M) κ_{σ_floor}(uᵢ − μ)/gᵢ`, where `M` is the total mass.
+///    Then for every `Q`:
+///    `Σ wᵢ ln f_Q(uᵢ) ≤ Σ wᵢ ln gᵢ + M ln Σ (wᵢ/M) f_Q(uᵢ)/gᵢ
+///      = Σ wᵢ ln gᵢ + M ln ∫ D dQ ≤ Σ wᵢ ln gᵢ + M ln sup D`.
+/// 3. **The supremum of `D` over cells.** For every `μ` in a cell `[a, z]`,
+///    `D(μ) ≤ Σ cᵢ κ(dist(uᵢ, [a, z]))`. On the line, `D` falls off outside
+///    the rows' hull, so cells covering the hull suffice.
+///
+/// Choices:
+/// - `gᵢ` is the kernel density of the rows at `σ_floor`. It is the value of
+///   `f_Q` when `Q` is the empirical law, so the bound is tight when the rows
+///   are the anchors (the weekday fixture: bound 187.8, seven-anchor fit
+///   186.2). Any positive `gᵢ` keeps the bound valid, so image terms beyond the
+///   reach below are simply left out of `gᵢ`.
+/// - In `sup D`, each term beyond `reach` is charged at its largest possible
+///   value, not dropped. `reach` is where one kernel term falls to one rounding
+///   of the peak term.
+/// - The cell width `σ_floor/4` sets only how early the walk's certificate
+///   fires, never which order wins. Any width gives a valid bound.
+fn order_free_mixture_loglik_bound(
+    pts: &[f64],
+    weights: &[f64],
+    sigma_floor: f64,
+    circular: bool,
+    total_mass: f64,
+) -> Option<f64> {
+    let n = pts.len();
+    if n == 0 || weights.len() != n || !(sigma_floor > 0.0) || !(total_mass > 0.0) {
+        return None;
+    }
+    let sigma = sigma_floor;
+    let peak = 1.0 / (sigma * std::f64::consts::TAU.sqrt());
+    let inv_two_var = 0.5 / (sigma * sigma);
+    let kernel = |d: f64| peak * (-(d * d) * inv_two_var).exp();
+    let reach = sigma * (-2.0 * f64::EPSILON.ln()).sqrt();
+    // On the circle, `reach ≤ 1/2` keeps every image beyond the −1, 0, +1
+    // shifts outside the window: for `u, μ ∈ [0, 1]`, `|u + m − μ| ≥ 1` when
+    // `|m| ≥ 2`.
+    let reach = if circular { reach.min(0.5) } else { reach };
+    let shifts: &[f64] = if circular { &[-1.0, 0.0, 1.0] } else { &[0.0] };
+    // `pts` is sorted inside `[0, 1)` (circle) or `[0, 1]` (line), so the shifted
+    // copies, concatenated in shift order, stay sorted.
+    let mut images: Vec<(f64, usize)> = Vec::with_capacity(shifts.len() * n);
+    for &shift in shifts {
+        for (i, &u) in pts.iter().enumerate() {
+            images.push((u + shift, i));
+        }
+    }
+    let window = |lo: f64, hi: f64| {
+        let start = images.partition_point(|&(x, _)| x < lo);
+        let end = images.partition_point(|&(x, _)| x <= hi).max(start);
+        &images[start..end]
+    };
+
+    let mut loglik_g = 0.0_f64;
+    let mut coefficient = vec![0.0_f64; n];
+    for (i, &u) in pts.iter().enumerate() {
+        let g: f64 = window(u - reach, u + reach)
+            .iter()
+            .map(|&(x, j)| weights[j] / total_mass * kernel(x - u))
+            .sum();
+        if !(g > 0.0 && g.is_finite()) {
+            return None;
+        }
+        loglik_g += weights[i] * g.ln();
+        coefficient[i] = weights[i] / total_mass / g;
+    }
+    // Every term outside a cell's window lies more than `reach` from the cell.
+    // On the line each row has one such term. On the circle a row's images
+    // outside the window lie at `reach + j` or beyond on each side (`j ≥ 0`).
+    // `κ(reach + j) ≤ κ(reach)·exp(−reach·j/σ²)`, so their sum is at most the
+    // geometric series `2κ(reach)/(1 − exp(−reach/σ²))`.
+    let far_per_row = if circular {
+        2.0 * kernel(reach) / (1.0 - (-reach / (sigma * sigma)).exp())
+    } else {
+        kernel(reach)
+    };
+    let far = far_per_row * coefficient.iter().sum::<f64>();
+
+    let (lo_mu, hi_mu) = if circular {
+        (0.0, 1.0)
+    } else {
+        (pts[0], pts[n - 1])
+    };
+    let cell = 0.25 * sigma;
+    let cells = ((hi_mu - lo_mu) / cell).ceil().max(1.0) as usize;
+    let mut sup_d = 0.0_f64;
+    for b in 0..cells {
+        let a = lo_mu + b as f64 * cell;
+        let z = (a + cell).min(hi_mu);
+        let mut d = far;
+        for &(x, j) in window(a - reach, z + reach) {
+            let gap = if x < a {
+                a - x
+            } else if x > z {
+                x - z
+            } else {
+                0.0
+            };
+            d += coefficient[j] * kernel(gap);
+        }
+        sup_d = sup_d.max(d);
+    }
+    let bound = loglik_g + total_mass * sup_d.ln();
+    bound.is_finite().then_some(bound)
 }
 
 /// #4237 — the widest shared width the circular mixture carries: at

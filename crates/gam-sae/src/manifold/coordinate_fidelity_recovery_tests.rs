@@ -1,7 +1,10 @@
 #![cfg(test)]
 //! #2818 recovery of the #2691 occupancy-collapse contract through live weighted APIs.
 
-use super::{OccupancyLaw, classify_occupancy_interval_weighted, classify_occupancy_weighted};
+use super::{
+    OccupancyLaw, certified_mixture_log_likelihood, classify_occupancy_interval_weighted,
+    classify_occupancy_weighted, order_free_mixture_loglik_bound,
+};
 use ndarray::Array1;
 
 #[test]
@@ -35,23 +38,158 @@ fn a_narrow_but_resolvable_arc_is_still_continuous_2691() {
     );
 }
 
+/// Seven weekday clusters of twelve rows each, jittered by at most `0.00275`.
+fn weekday_coordinates() -> Vec<f64> {
+    (0..84)
+        .map(|row| (row % 7) as f64 / 7.0 + 0.0005 * ((row / 7) as f64 - 5.5))
+        .collect()
+}
+
 #[test]
 fn uniform_and_discrete_occupancy_survive_the_collapse_guard_2691() {
     let uniform: Vec<f64> = (0..84).map(|row| row as f64 / 84.0).collect();
-    let weekdays: Vec<f64> = (0..84)
-        .map(|row| (row % 7) as f64 / 7.0 + 0.0005 * ((row / 7) as f64 - 5.5))
-        .collect();
     let weights = Array1::ones(84);
-    for coordinates in [&uniform, &weekdays] {
-        let law = classify_occupancy_weighted(coordinates, weights.view());
-        assert!(
-            matches!(
-                law,
-                OccupancyLaw::Uniform | OccupancyLaw::Continuous | OccupancyLaw::Discrete { .. }
-            ),
-            "separated support must survive the collapse guard, got {law:?}"
-        );
+    // #4323: the weekday support is seven anchors, not a flat law. The old walk
+    // stopped at the first order that failed to improve (k = 2) and so called
+    // it uniform.
+    assert_eq!(
+        classify_occupancy_weighted(&weekday_coordinates(), weights.view()),
+        OccupancyLaw::Discrete { anchors: 7 }
+    );
+    assert_eq!(
+        classify_occupancy_weighted(&uniform, weights.view()),
+        OccupancyLaw::Uniform
+    );
+}
+
+/// Rows folded and sorted the way the classifier prepares them, with unit
+/// weights, so the fixture's `ess` is its row count.
+fn prepared(coordinates: &[f64], circular: bool) -> Vec<f64> {
+    let mut pts: Vec<f64> = coordinates
+        .iter()
+        .map(|&x| {
+            if circular {
+                x.rem_euclid(1.0)
+            } else {
+                x.clamp(0.0, 1.0)
+            }
+        })
+        .collect();
+    pts.sort_by(f64::total_cmp);
+    pts
+}
+
+/// #4323 — the premise of the fix, restated against main's certified evaluator.
+/// #4237 replaced the plug-in fitter the PR's own BIC digits were measured on,
+/// so nothing here is pinned to a number: the curve is recomputed and the two
+/// walks are compared on it.
+///
+/// The weekday BIC is not unimodal in the anchor count. Below the true count one
+/// shared width must span merged clusters, so each added anchor costs `2 ln n`
+/// and buys little likelihood; at the true count the width collapses and the BIC
+/// drops. A walk that stops at the first order which fails to improve on the one
+/// below it therefore halts strictly before the BIC argmin. The sweep runs to
+/// twelve anchors, which brackets the fixture's seven clusters.
+#[test]
+fn the_anchor_walk_must_not_stop_at_the_first_non_improving_order_4323() {
+    let circular = true;
+    let pts = prepared(&weekday_coordinates(), circular);
+    let n = pts.len() as f64;
+    let w = vec![1.0; pts.len()];
+    let sigma_floor = 0.5 / n;
+    let ln_n = n.ln();
+    let curve: Vec<(usize, f64)> = (1..=12)
+        .map(|k| {
+            let log_likelihood =
+                certified_mixture_log_likelihood(&pts, &w, k, sigma_floor, circular, n)
+                    .unwrap_or_else(|| panic!("order {k} did not certify on the weekday fixture"));
+            (k, -2.0 * log_likelihood + (2 * k) as f64 * ln_n)
+        })
+        .collect();
+    // The curve is the evidence for both assertions below, so it is printed
+    // whether or not they hold.
+    for (k, bic) in &curve {
+        println!("weekday BIC at {k} anchors: {bic:.6}");
     }
+    let &(argmin, best) = curve
+        .iter()
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .expect("the sweep is non-empty");
+    // The rule this PR replaces, run over that same curve.
+    let mut stopped_at = curve[0].0;
+    let mut previous = curve[0].1;
+    for &(k, bic) in &curve[1..] {
+        if !(bic < previous) {
+            break;
+        }
+        previous = bic;
+        stopped_at = k;
+    }
+    assert!(
+        stopped_at < argmin,
+        "the first-non-improving walk stops at {stopped_at} anchors while the BIC argmin \
+         is {argmin}; with no gap this fixture no longer exercises #4323"
+    );
+    assert!(
+        best < curve[stopped_at - 1].1,
+        "the argmin's BIC {best} must beat the BIC {} at the order the replaced walk \
+         stopped on",
+        curve[stopped_at - 1].1
+    );
+}
+
+/// #4323 — the certificate that ends the walk is a true upper bound: no order's
+/// certified log-likelihood exceeds `order_free_mixture_loglik_bound`, which is
+/// order-free, so `BIC_k ≥ −2·bound + 2k·ln n` at every `k`. Checked against
+/// main's certified evaluator (#4237) on clustered, lattice and quasi-random
+/// rows, on the circle and the line.
+///
+/// An order whose maximum does not certify is skipped rather than asserted on:
+/// it supplies no counterexample to an upper bound. The number of orders
+/// actually compared is asserted, so the sweep cannot pass vacuously by
+/// certifying nothing.
+#[test]
+fn order_free_bound_dominates_every_anchor_order_4323() {
+    let golden = (5.0_f64.sqrt() - 1.0) / 2.0;
+    let quasi_random: Vec<f64> = (1..=120).map(|i| (i as f64 * golden).fract()).collect();
+    let lattice: Vec<f64> = (0..84).map(|row| row as f64 / 84.0).collect();
+    let weekdays = weekday_coordinates();
+    let mut compared = 0usize;
+    for (coordinates, circular) in [
+        (&weekdays, true),
+        (&weekdays, false),
+        (&lattice, true),
+        (&quasi_random, true),
+        (&quasi_random, false),
+    ] {
+        let pts = prepared(coordinates, circular);
+        let n = pts.len() as f64;
+        let w = vec![1.0; pts.len()];
+        let sigma_floor = 0.5 / n;
+        let bound = order_free_mixture_loglik_bound(&pts, &w, sigma_floor, circular, n)
+            .expect("the bound is finite on separated rows");
+        for k in 1..=10 {
+            let Some(log_likelihood) =
+                certified_mixture_log_likelihood(&pts, &w, k, sigma_floor, circular, n)
+            else {
+                continue;
+            };
+            compared += 1;
+            // The bound is an exact-arithmetic statement, so the certified
+            // maximum is allowed its own rounding against the magnitudes both
+            // sides carry.
+            let slack = 1.0e-9 * bound.abs().max(log_likelihood.abs()).max(1.0);
+            assert!(
+                log_likelihood <= bound + slack,
+                "order {k} (circular = {circular}, n = {n}) beats the order-free bound: \
+                 log-likelihood {log_likelihood} > {bound}"
+            );
+        }
+    }
+    assert!(
+        compared >= 20,
+        "only {compared} orders certified, too few to exercise the bound"
+    );
 }
 
 #[test]
