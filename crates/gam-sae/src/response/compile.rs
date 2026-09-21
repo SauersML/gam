@@ -89,7 +89,7 @@ use gam_problem::EstimationError;
 use gam_solve::gaussian_reml_multi_penalty::{GaussianRemlMultiPenaltyProblem, GaussianRemlMultiPenaltyRhoPlacement};
 use gam_terms::basis::{
     BasisBuildResult, BasisMetadata, CenterStrategy, DuchonBasisSpec, DuchonOperatorPenaltySpec,
-    OneDimensionalBoundary, PenaltySource, SpatialIdentifiability, build_duchon_basis, default_num_centers,
+    OneDimensionalBoundary, PenaltySource, SpatialIdentifiability, build_duchon_basis,
     duchon_cubic_default, refined_num_centers, starting_num_centers,
 };
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
@@ -179,10 +179,11 @@ impl CompileDesign {
         }
     }
 
-    /// The same experiment at gam-terms' next evidence-backed resolution, or `None` once the production ceiling
-    /// `default_num_centers` is reached.
-    pub fn enriched(&self, retained_dim: usize) -> Option<Self> {
-        let ceiling = default_num_centers(self.training_draws, retained_dim);
+    /// The same experiment at gam-terms' next evidence-backed resolution, or `None` once the support bound is
+    /// reached: one center fewer than the training draws, the widest basis that still leaves REML a residual degree
+    /// of freedom (the compile refuses anything wider).
+    pub fn enriched(&self) -> Option<Self> {
+        let ceiling = self.training_draws.saturating_sub(1);
         let centers = refined_num_centers(self.centers).min(ceiling);
         (centers > self.centers).then_some(Self {
             centers,
@@ -639,14 +640,14 @@ pub fn compile_retained_response(
 }
 
 /// Recompile `compiled` at the next resolution on the same frame, drawing from the stream seeded by `seed`, and measure
-/// `Â − Â_enriched`, or `None` once the design is at gam-terms' production ceiling. `block` must be the block
-/// `compiled` was compiled from.
+/// `Â − Â_enriched`, or `None` once the design is at its support bound ([`CompileDesign::enriched`]). `block` must be
+/// the block `compiled` was compiled from.
 pub fn enrichment_step(
     block: &KnownBlock,
     compiled: &CompiledResponse,
     seed: u64,
 ) -> Result<Option<EnrichmentStep>, CompileError> {
-    let Some(design) = compiled.design.enriched(compiled.retained_dim()) else {
+    let Some(design) = compiled.design.enriched() else {
         return Ok(None);
     };
     let enriched = compile_retained_response(block, compiled.frame(), design, seed)?;

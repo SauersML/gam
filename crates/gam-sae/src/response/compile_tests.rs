@@ -240,7 +240,7 @@ fn a_planted_smooth_function_of_a_planted_subspace_is_recovered() {
     // removes the draw-to-draw spread they share, which dominates the unpaired held-out estimates.
     let step = enrichment_step(&block, &compiled, 2_946_061)
         .expect("the planted block compiles at the enriched resolution")
-        .expect("the pilot resolution lies below the production ceiling");
+        .expect("the pilot resolution lies below the support bound");
     let pilot_errors = executed_errors(&compiled, &readers, &writers(), activation, &points);
     let enriched_errors = executed_errors(&step.enriched, &readers, &writers(), activation, &points);
     let paired: Vec<f64> = pilot_errors.iter().zip(&enriched_errors).map(|(pilot, enriched)| pilot - enriched).collect();
@@ -444,7 +444,7 @@ fn the_dominance_call_adds_a_missing_direction_and_enriches_an_under_resolved_fu
     // The measured enrichment step agrees with the call: the next resolution removes function error.
     let step = enrichment_step(&block, &compiled, 2_946_057)
         .expect("the sharp block compiles at the enriched resolution")
-        .expect("ten centers lie below the production ceiling");
+        .expect("ten centers lie below the support bound");
     assert_eq!(step.enriched.split().discarded_error, split.discarded_error, "enrichment never moves E(P)");
     assert!(
         step.gain > multiple * step.gain_standard_error,
