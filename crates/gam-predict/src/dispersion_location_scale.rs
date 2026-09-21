@@ -31,6 +31,20 @@ pub(crate) struct DispersionLocationScalePredictor {
 }
 
 impl DispersionLocationScalePredictor {
+    /// The covariance backend of a fit-backed pass over the `[mean | noise]`
+    /// coefficient vector.
+    fn pass_backend<'a>(
+        &'a self,
+        covariance: PassCovariance<'a>,
+    ) -> Result<(PredictionCovarianceBackend<'a>, InferenceCovarianceMode), EstimationError> {
+        let p_total = self.beta_mu.len() + self.beta_noise.len();
+        let label = match covariance.pass {
+            PredictPass::FullUncertainty => "dispersion location-scale",
+            PredictPass::PosteriorMean => "dispersion location-scale posterior mean",
+        };
+        covariance.backend(self.covariance.as_ref(), p_total, label)
+    }
+
     fn strategy(&self) -> ResolvedFamilyStrategy {
         strategy_for_family(self.likelihood.clone(), self.inverse_link.as_ref())
     }
@@ -104,14 +118,17 @@ impl DispersionLocationScalePredictor {
     /// joint integral.
     ///
     /// Integrated with the same projected bivariate quadrature the posterior
-    /// means use, over the exact per-row 2×2 covariance of `(η_μ, η_d)`. The
-    /// covariance is required: without it the posterior of `(η_μ, η_d)` does
-    /// not exist, and reading it as zero would silently report the plug-in law
-    /// as the integrated noise (the Gaussian location-scale `log_sigma_posterior`
-    /// refuses the same model).
+    /// means use, over the exact per-row 2×2 covariance of `(η_μ, η_d)` read
+    /// from `backend` — the covariance the band's `Var(μ̂)` came from, so both
+    /// terms of the law of total variance share one posterior (#4326). A pass
+    /// with no posterior to supply is refused one level up, in
+    /// `PassCovariance::backend`, so no caller can reach this integral with a
+    /// zero covariance and have the plug-in law reported as the integrated
+    /// noise.
     fn integrated_response_variance(
         &self,
         input: &PredictInput,
+        backend: &PredictionCovarianceBackend<'_>,
     ) -> Result<Array1<f64>, EstimationError> {
         let eta_mu = self.eta_mean(input);
         let eta_d = self.eta_precision(input)?;
@@ -125,24 +142,15 @@ impl DispersionLocationScalePredictor {
         let n = eta_mu.len();
         let response = &self.likelihood.response;
         let strategy = self.strategy();
-        let covariance = self.covariance.as_ref().ok_or_else(|| {
-            EstimationError::InvalidInput(
-                "dispersion location-scale observation noise integrates the joint \
-                 (mean, log-precision) posterior, but this model carries no coefficient \
-                 covariance; refit with covariance"
-                    .to_string(),
-            )
-        })?;
         let design_noise = input.design_noise.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
                 "dispersion location-scale prediction requires noise design matrix".to_string(),
             )
         })?;
-        let backend = PredictionCovarianceBackend::from_dense(covariance.view());
         let (var_mu, var_d, cov_md) = project_two_block_linear_predictor_covariance(
             &input.design,
             design_noise,
-            &backend,
+            backend,
             self.beta_mu.len(),
             self.beta_noise.len(),
             "dispersion location-scale observation noise",
@@ -251,23 +259,11 @@ impl PredictionTransform for DispersionLocationScalePredictor {
         pass: PredictPass,
         covariance_mode: InferenceCovarianceMode,
     ) -> Result<LinearState, EstimationError> {
-        let p_total = self.beta_mu.len() + self.beta_noise.len();
-        let (backend, covariance_source) = match pass {
-            PredictPass::FullUncertainty => fit.select_uncertainty_backend(
-                p_total,
-                covariance_mode,
-                "dispersion location-scale",
-            )?,
-            PredictPass::PosteriorMean => (
-                require_posterior_mean_backend(
-                    fit,
-                    self.covariance.as_ref(),
-                    p_total,
-                    "dispersion location-scale posterior mean",
-                )?,
-                InferenceCovarianceMode::Conditional,
-            ),
-        };
+        let (backend, covariance_source) = self.pass_backend(PassCovariance {
+            fit,
+            pass,
+            mode: covariance_mode,
+        })?;
         let (eta, plugin_mean, eta_se, mean_se) = self.state_from_backend(input, &backend)?;
         let mean = match pass {
             // The full-uncertainty point is the inverse link of the
@@ -318,13 +314,17 @@ impl PredictionTransform for DispersionLocationScalePredictor {
     fn observation_noise(
         &self,
         input: &PredictInput,
+        covariance: PassCovariance<'_>,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
         // The predictive band needs `E[Var(Y|·)]` under the joint (η_μ, η_d)
-        // posterior, not the plug-in law — see `integrated_response_variance`.
+        // posterior, not the plug-in law — see `integrated_response_variance` —
+        // and under the same covariance the pass's `Var(μ̂)` came from (#4326).
         // The fitted noise *surface* (plug-in) remains available through
         // `predict_noise_scale`.
+        let (backend, _) = self.pass_backend(covariance)?;
         Ok(Some(
-            self.integrated_response_variance(input)?.mapv(f64::sqrt),
+            self.integrated_response_variance(input, &backend)?
+                .mapv(f64::sqrt),
         ))
     }
 
@@ -347,6 +347,7 @@ impl PredictionTransform for DispersionLocationScalePredictor {
         eta_se: &Array1<f64>,
         z_lower: &Array1<f64>,
         z_upper: &Array1<f64>,
+        covariance: PassCovariance<'_>,
     ) -> Result<Option<(Array1<f64>, Array1<f64>)>, EstimationError> {
         let precision = self.precision(input)?;
         let response = &self.likelihood.response;
@@ -402,8 +403,10 @@ impl PredictionTransform for DispersionLocationScalePredictor {
         };
         // `E[Var(Y | μ, φ)]` integrated over the joint (η_μ, η_d) posterior (see
         // `integrated_response_variance`; the plug-in law understates the band
-        // wherever the scale predictor is uncertain, audit finding 6).
-        let expected_response_var = self.integrated_response_variance(input)?;
+        // wherever the scale predictor is uncertain, audit finding 6), under the
+        // covariance `eta_se` came from (#4326).
+        let (backend, _) = self.pass_backend(covariance)?;
+        let expected_response_var = self.integrated_response_variance(input, &backend)?;
         family_observation_band_per_row(
             response,
             &mean,
@@ -668,24 +671,23 @@ mod tests {
     /// model without coefficient covariance is refused rather than read as a
     /// zero-variance posterior (which would silently report the plug-in law).
     #[test]
-    fn observation_noise_refuses_missing_covariance() {
+    fn observation_noise_integrates_the_supplied_posterior() {
+        // A degenerate (zero) posterior is still an explicit posterior, and the
+        // integral over it is exactly the plug-in Gamma law `μ²/ν` at μ = 1.
+        // That is the positive control for the integral itself; the refusal of a
+        // pass that has NO posterior to supply now lives one level up, in
+        // `PassCovariance::backend` / `require_posterior_mean_backend`, and is
+        // asserted there
+        // (`posterior_mean_backend_mismatch_is_a_typed_error_not_a_plugin_fallback`).
         let nu = 5.0_f64;
-        let mut pred = make_pred(ResponseFamily::Gamma, StandardLink::Log);
+        let pred = make_pred(ResponseFamily::Gamma, StandardLink::Log);
         let input = make_input(nu.ln());
-        let err = pred
-            .observation_noise(&input)
-            .expect_err("observation noise must refuse a model with no covariance");
-        assert!(
-            err.to_string().contains("coefficient covariance"),
-            "unexpected error: {err}"
-        );
-        // A degenerate (zero) posterior is an explicit covariance and integrates
-        // to the plug-in Gamma law `μ²/ν` at μ = 1.
-        pred.covariance = Some(Array2::<f64>::zeros((2, 2)));
+        let degenerate = Array2::<f64>::zeros((2, 2));
+        let backend = PredictionCovarianceBackend::from_dense(degenerate.view());
         let noise = pred
-            .observation_noise(&input)
-            .expect("observation noise with covariance")
-            .expect("dispersion-LS exposes a per-row observation noise");
+            .integrated_response_variance(&input, &backend)
+            .expect("observation noise over an explicit posterior")
+            .mapv(f64::sqrt);
         let expected = (1.0 / nu).sqrt();
         assert!(
             (noise[0] - expected).abs() < 1e-12,

@@ -25,15 +25,17 @@
 //! helpers below, so interval/posterior-mean behaviour cannot drift between
 //! families.
 
+use crate::linalg::PredictionCovarianceBackend;
 use crate::{
     InferenceCovarianceMode, IntervalReference, PointCovarianceProvenance, PosteriorMeanOptions, PredictInput,
     PredictPosteriorMeanResult, PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult,
-    PredictionWithSE, family_observation_band, refuse_declined_covariance,
+    PredictionWithSE, UncertaintyCovarianceSource, family_observation_band,
+    refuse_declined_covariance, require_posterior_mean_backend,
 };
 use gam_problem::EstimationError;
 use gam_solve::model_types::UnifiedFitResult;
 use gam_spec::{EtaFeasibility, InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
-use ndarray::Array1;
+use ndarray::{Array1, Array2};
 
 /// Closed response-scale support `[lo, hi]` used to clamp a symmetric
 /// observation (predictive) band. `None` means the response is unbounded and
@@ -484,6 +486,53 @@ pub enum PredictPass {
     PosteriorMean,
 }
 
+/// The coefficient covariance a driver resolved its η / mean standard errors
+/// from: the `(fit, pass, mode)` triple it handed
+/// [`PredictionTransform::linear_state`].
+///
+/// The observation hooks receive the same triple, so a predictor whose noise
+/// term integrates a coefficient posterior (the log-σ block of Gaussian
+/// location-scale, the joint `(η_μ, η_d)` law of the dispersion families) reads
+/// the covariance its mean SE came from. Otherwise a smoothing-corrected band
+/// would add a corrected `Var(μ̂)` to a conditional `E[σ²]` (#4326).
+#[derive(Clone, Copy)]
+pub struct PassCovariance<'a> {
+    pub fit: &'a UnifiedFitResult,
+    pub pass: PredictPass,
+    pub mode: InferenceCovarianceMode,
+}
+
+impl<'a> PassCovariance<'a> {
+    /// The covariance backend for this pass, plus the covariance definition it
+    /// holds.
+    ///
+    /// Full uncertainty honours the requested `mode` through the fit's own
+    /// selection. The posterior-mean pass integrates the conditional posterior:
+    /// the fit's covariance first, then `predictor_covariance`.
+    pub(crate) fn backend(
+        self,
+        predictor_covariance: Option<&'a Array2<f64>>,
+        expected_dim: usize,
+        label: &str,
+    ) -> Result<(PredictionCovarianceBackend<'a>, InferenceCovarianceMode), EstimationError> {
+        match self.pass {
+            PredictPass::FullUncertainty => {
+                self.fit
+                    .select_uncertainty_backend(expected_dim, self.mode, label)
+            }
+            PredictPass::PosteriorMean => Ok((
+                require_posterior_mean_backend(
+                    self.fit,
+                    predictor_covariance,
+                    expected_dim,
+                    label,
+                )?,
+                InferenceCovarianceMode::Conditional,
+            )),
+        }
+    }
+}
+
 /// How a transform forms the *response-scale* confidence interval from the
 /// η-scale state. This is the per-family policy split the predictors used to
 /// inline directly into `assemble_uncertainty_result` / `mean_bounds`; a
@@ -626,9 +675,14 @@ pub trait PredictionTransform {
 
     /// Optional response-scale observation-noise σ for the requested batch.
     /// `None` (the default) for families without an observation-scale noise
-    /// term. Only consulted by the full-uncertainty driver and only when the
-    /// caller requested observation intervals.
-    fn observation_noise(&self, _: &PredictInput) -> Result<Option<Array1<f64>>, EstimationError> {
+    /// term. Only consulted when the caller requested observation intervals.
+    /// `covariance` is the covariance the pass's η / mean SEs came from; a noise
+    /// term that integrates a coefficient posterior must read that one.
+    fn observation_noise(
+        &self,
+        _: &PredictInput,
+        _covariance: PassCovariance<'_>,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
         Ok(None)
     }
 
@@ -649,7 +703,8 @@ pub trait PredictionTransform {
     /// under the pass's covariance; the band reads its predictive moments off that
     /// η law itself, so its mean, variance and complement are one law's (#3140).
     /// `z_lower` / `z_upper` are the per-row tail multipliers (the same masses the
-    /// symmetric band would target).
+    /// symmetric band would target). `covariance` is the covariance `eta_se` came
+    /// from, so any noise moment the band integrates reads the same posterior.
     fn observation_band(
         &self,
         input: &PredictInput,
@@ -657,6 +712,7 @@ pub trait PredictionTransform {
         eta_se: &Array1<f64>,
         z_lower: &Array1<f64>,
         z_upper: &Array1<f64>,
+        _covariance: PassCovariance<'_>,
     ) -> Result<Option<(Array1<f64>, Array1<f64>)>, EstimationError> {
         // Default: no skew-aware band. The generic symmetric construction is
         // used instead. Validate the per-row inputs the driver hands every
@@ -782,8 +838,15 @@ pub(crate) fn predict_full_uncertainty_generic<T: PredictionTransform>(
     let response_index = state.response_index;
     let response_map = move |argument: &Array1<f64>| transform.response(argument);
     let reference = IntervalReference::of_fit(fit)?;
+    // The observation hooks read the covariance `linear_state` built the SEs
+    // from, so `Var(μ̂)` and the noise term share one posterior (#4326).
+    let pass_covariance = PassCovariance {
+        fit,
+        pass: PredictPass::FullUncertainty,
+        mode: options.covariance_mode,
+    };
     let observation = if options.includeobservation_interval {
-        transform.observation_noise(input)?
+        transform.observation_noise(input, pass_covariance)?
     } else {
         None
     };
@@ -794,7 +857,7 @@ pub(crate) fn predict_full_uncertainty_generic<T: PredictionTransform>(
         let z = reference.central_multiplier(options.confidence_level)?;
         let z_row = Array1::from_elem(state.mean.len(), z);
         transform
-            .observation_band(input, &state.eta, &eta_se, &z_row, &z_row)?
+            .observation_band(input, &state.eta, &eta_se, &z_row, &z_row, pass_covariance)?
             .map(|(lower, upper)| (lower, upper, None))
     } else {
         None
@@ -930,8 +993,20 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
     // `Conditional` keeps the posterior pass's own SE. `SmoothingCorrected`
     // re-derives the SEs from the full-uncertainty pass and errors if the fit
     // cannot supply that exact covariance definition.
-    let (eta_se, mean_se, response_index) = match options.covariance_mode {
-        InferenceCovarianceMode::Conditional => (cond_eta_se, cond_mean_se, cond_response_index),
+    //
+    // The observation hooks receive the pass that produced these SEs, so the
+    // band's noise term integrates the same covariance as `Var(μ̂)` (#4326).
+    let (eta_se, mean_se, response_index, pass_covariance) = match options.covariance_mode {
+        InferenceCovarianceMode::Conditional => (
+            cond_eta_se,
+            cond_mean_se,
+            cond_response_index,
+            PassCovariance {
+                fit,
+                pass: PredictPass::PosteriorMean,
+                mode: InferenceCovarianceMode::Conditional,
+            },
+        ),
         InferenceCovarianceMode::SmoothingCorrected => {
             let unc = transform.linear_state(
                 input,
@@ -963,7 +1038,16 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
                         .to_string(),
                 ));
             }
-            (eta_se, mean_se, unc.response_index)
+            (
+                eta_se,
+                mean_se,
+                unc.response_index,
+                PassCovariance {
+                    fit,
+                    pass: PredictPass::FullUncertainty,
+                    mode: InferenceCovarianceMode::SmoothingCorrected,
+                },
+            )
         }
     };
     result.uncertainty_covariance_source = Some(options.covariance_mode);
@@ -998,8 +1082,12 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
             &result.eta_standard_error,
             &z_row,
             &z_row,
+            pass_covariance,
         )?;
-        match (skew_band, transform.observation_noise(input)?) {
+        match (
+            skew_band,
+            transform.observation_noise(input, pass_covariance)?,
+        ) {
             (Some((lower, upper)), _) => {
                 result.observation_lower = Some(lower);
                 result.observation_upper = Some(upper);
