@@ -1643,7 +1643,18 @@ fn sample_survival(
     .map_err(|e| format!("survival NUTS sampling failed: {e}"));
     drop(survival_hessian_reservation);
     drop(survival_design_reservation);
-    result
+    let mut result = result?;
+    // The survival NUTS target is `pi(beta | rho-hat, y)` exactly as the standard
+    // family's is, and beta carries no cone here, so the draws take the same
+    // smoothing-parameter correction (#3184). `beta0` above is this fit's own
+    // coefficient vector, so the sampler's coordinates are the frame the fit
+    // published `Vb` and `V_c` in, and the transport is read in that frame.
+    recolor_to_smoothing_corrected_covariance(
+        &mut result,
+        fit_saved.beta_covariance(),
+        fit_saved.beta_covariance_corrected(),
+    )?;
+    Ok(result)
 }
 
 #[cfg(test)]

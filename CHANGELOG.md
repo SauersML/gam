@@ -1,5 +1,17 @@
 ## Unreleased
 
+- **A survival `sample()` described a different posterior than the same fit's `predict()`**
+  (gam#3184). The survival NUTS path targets `π(β | ρ̂, y)` and returned those draws labelled
+  `covariance_source = "conditional"`, while `predict()` on the same fit priced its bands off the
+  smoothing-corrected `V_c` whenever the fit recorded one. Two answers for one posterior. `β`
+  carries no coefficient cone on this path, so it takes the standard family's rule unchanged: the
+  draws are mapped through the linear optimal-transport map between `N(·, Vb)` and `N(·, V_c)`
+  about their own mean, and the result says `smoothing-corrected`. A fit that publishes no
+  corrected covariance keeps its conditional draws and its label, because there `predict()` can
+  publish no corrected band either. The constrained samplers (`bounded()`, shape- and
+  box-constrained) still draw at `ρ̂`: their law on the cone is the object gam#3229 is open on, and
+  a displacement cannot be added to a draw without leaving the cone.
+
 - **A chart gauge normalized axes whose spread was its own rounding, and the stretches
   compounded into the smoothness Gram** (gam#2822).
   `canonicalize_atom_affine_gauge` divides each latent axis by its weighted rms, and it
