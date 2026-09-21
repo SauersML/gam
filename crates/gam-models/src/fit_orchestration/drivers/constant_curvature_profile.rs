@@ -850,14 +850,11 @@ fn constant_curvature_kappa_problem(
         // curvature was unavailable, but because this call site never asked the
         // basis bundle for the seconds it already ships.
         .with_hessian(gam_problem::DeclaredHessianForm::Dense)
-        // Gradient-only SEARCH is retained deliberately: the change this makes
-        // is the terminal certification, not the trajectory. Declaring the
-        // Hessian while preferring gradient-only routes the planner through the
-        // `(Analytic, Analytic) if prefer_gradient_only` arm to the same BFGS it
-        // used before, so kappa-hat is selected by the same solve -- but the
-        // terminal mint can now MEASURE curvature and run the derived criterion
-        // instead of the un-derived gradient band.
-        .with_prefer_gradient_only(true)
+        // #3201: the search runs ARC on that curvature. Every derivative-bearing
+        // evaluation of the profile forms `V_p″` with its gradient, so a
+        // gradient-only search would discard curvature it has already paid for,
+        // and a line search cannot resolve ‖g‖ below `2√(L·ε_f)`, where ARC on
+        // the exact second derivative can.
         .with_disable_fixed_point(true)
         .with_fallback_policy(gam_solve::rho_optimizer::FallbackPolicy::Disabled)
         .with_psi_dim(1)
