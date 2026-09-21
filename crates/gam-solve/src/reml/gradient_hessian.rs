@@ -7021,7 +7021,6 @@ impl<'a> RemlState<'a> {
                 offset: self.offset.view(),
                 y: self.y,
                 priorweights: self.weights,
-                covariate_se: None,
                 gaussian_fixed_cache: cache_handle.as_deref(),
                 glm_first_step_gram: glm_first_step_handle.as_deref(),
             };
@@ -7136,7 +7135,6 @@ impl<'a> RemlState<'a> {
                     offset: self.offset.view(),
                     y: self.y,
                     priorweights: self.weights,
-                    covariate_se: None,
                     gaussian_fixed_cache: cache_handle.as_deref(),
                     glm_first_step_gram: None,
                 };
@@ -7691,7 +7689,6 @@ mod stateless_pirls_tests {
                 offset: self.offset.view(),
                 y: self.y,
                 priorweights: self.weights,
-                covariate_se: None,
                 gaussian_fixed_cache: cache_handle.as_deref(),
                 glm_first_step_gram: glm_first_step_handle.as_deref(),
             };

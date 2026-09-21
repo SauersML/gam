@@ -412,7 +412,6 @@ pub(crate) fn start_working_weights(
             &mut weights,
             &mut z,
             None,
-            None,
         )?,
         link => update_glmvectors(
             y,
@@ -634,7 +633,6 @@ pub struct PirlsProblem<'a, X> {
     pub offset: ArrayView1<'a, f64>,
     pub y: ArrayView1<'a, f64>,
     pub priorweights: ArrayView1<'a, f64>,
-    pub covariate_se: Option<ArrayView1<'a, f64>>,
     /// When set, the inner PLS solver reuses the precomputed `XᵀWX` and
     /// `XᵀW(y − offset)` in *original* coordinates instead of streaming the
     /// O(N·p²) GEMM and the O(N·p) matvec on every outer REML iteration.
@@ -748,11 +746,9 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         offset,
         y,
         priorweights,
-        covariate_se,
         gaussian_fixed_cache,
         glm_first_step_gram,
     } = problem;
-    let quadctx = crate::quadrature::QuadratureContext::new();
     let lambdas = exact_lambdas_from_rho(rho);
     let lambdas_slice = lambdas.as_slice_memory_order().ok_or_else(|| {
         EstimationError::InvalidInput("non-contiguous lambda storage".to_string())
@@ -1437,7 +1433,6 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             && matches!(config.likelihood.spec.response, ResponseFamily::Binomial)
             && config.link_kind.has_fisher_weight_jet(),
         transform_active.clone(),
-        quadctx,
         // #1111 / #1033 mechanism (c): frozen-W first-Fisher-step XᵀWX in the
         // original (conditioned x_fit) frame, served n-free on the first inner
         // iteration. Suppressed under Firth bias reduction, which shifts the
@@ -1448,12 +1443,6 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             glm_first_step_gram.cloned()
         },
     );
-
-    // Apply integrated (GHQ) likelihood if per-observation SE is provided.
-    // This is used by the calibrator to coherently account for base prediction uncertainty.
-    if let Some(se) = covariate_se {
-        working_model = working_model.with_covariate_se(se.to_owned());
-    }
 
     let mut beta_guess_original = warm_start_beta
         .filter(|beta| beta.len() == penalty.p)

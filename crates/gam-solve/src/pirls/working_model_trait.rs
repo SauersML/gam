@@ -249,15 +249,6 @@ impl PirlsAcceptedStateCacheKey {
     }
 }
 
-/// Uncertainty inputs for integrated (GHQ) IRLS updates.
-#[derive(Clone, Copy)]
-pub(crate) struct IntegratedWorkingInput<'a> {
-    pub quadctx: &'a crate::quadrature::QuadratureContext,
-    pub se: ArrayView1<'a, f64>,
-    pub mixture_link_state: Option<&'a MixtureLinkState>,
-    pub sas_link_state: Option<&'a SasLinkState>,
-}
-
 pub(crate) struct WorkingDerivativeBuffersMut<'a> {
     pub(crate) c: &'a mut Array1<f64>,
     pub(crate) d: &'a mut Array1<f64>,
@@ -351,7 +342,6 @@ pub(crate) trait WorkingLikelihood {
         mu: &mut Array1<f64>,
         weights: &mut Array1<f64>,
         z: &mut Array1<f64>,
-        integrated: Option<IntegratedWorkingInput<'_>>,
         derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
     ) -> Result<(), EstimationError>;
 
@@ -373,7 +363,6 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
         mu: &mut Array1<f64>,
         weights: &mut Array1<f64>,
         z: &mut Array1<f64>,
-        integrated: Option<IntegratedWorkingInput<'_>>,
         derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
     ) -> Result<(), EstimationError> {
         if let Some(cell) = self.spec.generic_edm_cell() {
@@ -389,25 +378,8 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 derivatives,
             );
         }
-        match (&self.spec.response, &self.spec.link, integrated) {
-            (ResponseFamily::Binomial, _, Some(integ)) => {
-                update_glmvectors_integrated_by_family(
-                    integ.quadctx,
-                    y,
-                    eta,
-                    integ.se,
-                    &self.spec,
-                    priorweights,
-                    mu,
-                    weights,
-                    z,
-                    derivatives,
-                    integ.mixture_link_state,
-                    integ.sas_link_state,
-                )?;
-                Ok(())
-            }
-            (ResponseFamily::Binomial, link, None) => {
+        match (&self.spec.response, &self.spec.link) {
+            (ResponseFamily::Binomial, link) => {
                 if matches!(link, InverseLink::Mixture(_)) {
                     crate::bail_invalid_estim!(
                         "BinomialMixture IRLS update requires explicit mixture link state"
@@ -426,9 +398,10 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian, link, _)
-                if reciprocal_power_link(link).is_some() =>
-            {
+            (
+                ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
+                link,
+            ) if reciprocal_power_link(link).is_some() => {
                 let (standard, exponent) =
                     reciprocal_power_link(link).expect("guarded by reciprocal_power_link");
                 let family = match self.spec.response {
@@ -450,7 +423,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                     derivatives,
                 )
             }
-            (ResponseFamily::InverseGaussian, _, _) => write_inverse_gaussian_log_working_state(
+            (ResponseFamily::InverseGaussian, _) => write_inverse_gaussian_log_working_state(
                 y,
                 eta,
                 priorweights,
@@ -460,7 +433,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 z,
                 derivatives,
             ),
-            (ResponseFamily::Gaussian, _, _) => {
+            (ResponseFamily::Gaussian, _) => {
                 let resolved_scale = self
                     .resolved_scale()
                     .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
@@ -498,10 +471,10 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 }
                 Ok(())
             }
-            (ResponseFamily::Poisson, _, _) => {
+            (ResponseFamily::Poisson, _) => {
                 write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives)
             }
-            (ResponseFamily::Tweedie { p }, _, _) => {
+            (ResponseFamily::Tweedie { p }, _) => {
                 let p = *p;
                 write_tweedie_log_working_state(
                     y,
@@ -517,7 +490,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (ResponseFamily::NegativeBinomial { .. }, _, _) => {
+            (ResponseFamily::NegativeBinomial { .. }, _) => {
                 let theta = self
                     .resolved_negbin_theta()
                     .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
@@ -533,7 +506,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (ResponseFamily::Beta { .. }, _, _) => {
+            (ResponseFamily::Beta { .. }, _) => {
                 let phi = self
                     .resolved_beta_precision()
                     .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
@@ -549,7 +522,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (ResponseFamily::Gamma, _, _) => {
+            (ResponseFamily::Gamma, _) => {
                 let shape = self
                     .resolved_gamma_shape()
                     .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
@@ -564,7 +537,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                     derivatives,
                 )
             }
-            (ResponseFamily::StudentT { .. }, _, _) => {
+            (ResponseFamily::StudentT { .. }, _) => {
                 let scale = StudentTScale::from_likelihood(self)?;
                 write_student_t_working_state(
                     y,
@@ -577,7 +550,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                     derivatives,
                 )
             }
-            (ResponseFamily::RoystonParmar, _, _) => Err(EstimationError::InvalidInput(
+            (ResponseFamily::RoystonParmar, _) => Err(EstimationError::InvalidInput(
                 "RoystonParmar is survival-specific and not a GLM IRLS family".to_string(),
             )),
         }

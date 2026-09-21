@@ -5029,5 +5029,19 @@
     },
     "reason": "Renamed test (#3513): the QP-face seed argument is removed.",
     "evidence": "Same assertions under projected_stationarity_uses_the_tangent_face_without_expanding_tight_rows."
+  },
+  {
+    "base": "74c2b1d788902aa74c5a7306ae4014e37749e4e3",
+    "removed": {
+      "crates/gam-solve/src/pirls/deviance.rs::binomial_deviance_and_log_kernel_from_mean": 1,
+      "crates/gam-solve/src/pirls/gam_working_model.rs::with_covariate_se": 1,
+      "crates/gam-solve/src/pirls/glm_update.rs::integrated_inverse_link_from_family": 1,
+      "crates/gam-solve/src/pirls/glm_update.rs::update_glmvectors_integrated_by_family": 1,
+      "crates/gam-solve/src/pirls/glm_update.rs::update_glmvectors_integrated_for_link": 1,
+      "crates/gam-solve/src/pirls/tests.rs::pirls_result_stores_integrated_logit_derivative_jet": 1,
+      "crates/gam-solve/src/pirls/tests.rs::zz_measure_pirls_stored_jet_staleness_vs_tolerance": 1
+    },
+    "reason": "#3726: PirlsProblem::covariate_se switched P-IRLS onto an integrated (Gauss-Hermite) Bernoulli likelihood mu = E[g^-1(eta + eps)], eps ~ N(0, se^2), for a calibrator that no longer exists. Every production PirlsProblem passed covariate_se: None (estimate/fixed_lambda_fit.rs, estimate/optimizer.rs, reml/gradient_hessian.rs x3, reml/rail_face_limit.rs). When it was set the path was also inconsistent: the objective, weights and working response used the integrated mean while the observed-information Hessian (compute_observed_hessian_curvature_arrays_into) used the point inverse-link jet, so Newton and LAML log|H| came from a different surface than the one optimized. The field, GamWorkingModel::with_covariate_se, the IntegratedWorkingInput plumbing through WorkingLikelihood::irls_update, the integrated GLM-vector helpers, the mean-based binomial deviance and the two tests that only exercised this mode are deleted (SPEC: no dead code). The public quadrature jets used by prediction and gam-models stay.",
+    "evidence": "At the base, git grep finds covariate_se Some(..) producers only in crates/gam-solve/src/pirls/tests.rs (pirls_result_stores_integrated_logit_derivative_jet and zz_measure_pirls_stored_jet_staleness_vs_tolerance, the two deleted tests); with_covariate_se is called only from loop_driver.rs behind covariate_se.is_some(); IntegratedWorkingInput, update_glmvectors_integrated_for_link, update_glmvectors_integrated_by_family, integrated_inverse_link_from_family and binomial_deviance_and_log_kernel_from_mean are named only inside that path. In the landing tree git grep for covariate_se, IntegratedWorkingInput, with_covariate_se, integrated_inverse_link_from_family, update_glmvectors_integrated and binomial_deviance_and_log_kernel_from_mean returns 0 hits across the workspace, benches, examples, tests and Python."
   }
 ]

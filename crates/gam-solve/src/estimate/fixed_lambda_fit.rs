@@ -275,7 +275,6 @@ pub fn fit_nested_at_fitted_log_lambdas(
             offset: inputs.offset,
             y: inputs.y,
             priorweights: inputs.weights,
-            covariate_se: None,
             gaussian_fixed_cache: None,
             glm_first_step_gram: None,
         },

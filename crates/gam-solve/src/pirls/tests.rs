@@ -100,9 +100,8 @@ mod tests {
     use gam_linalg::matrix::DesignMatrix;
     use gam_math::probability::standard_normal_quantile;
     use gam_problem::{
-        Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec,
-        LinkComponent, LinkFunction, LogSmoothingParamsView, MixtureLinkSpec, ResponseFamily,
-        StandardLink,
+        GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkComponent,
+        LinkFunction, LogSmoothingParamsView, MixtureLinkSpec, ResponseFamily, StandardLink,
     };
 
     // Test-only zero-log-measure-scale wrapper over the production single-row
@@ -1289,7 +1288,6 @@ mod tests {
                 offset: offset.view(),
                 y: y.view(),
                 priorweights: weights.view(),
-                covariate_se: None,
                 gaussian_fixed_cache: None,
                 glm_first_step_gram: None,
             },
@@ -1449,231 +1447,6 @@ mod tests {
                     target
                 );
             }
-        }
-    }
-
-    #[test]
-    pub(crate) fn pirls_result_stores_integrated_logit_derivative_jet() {
-        let x = array![[1.0], [1.0], [1.0], [1.0], [1.0]];
-        let y = array![0.0, 1.0, 0.0, 1.0, 1.0];
-        let w = Array1::ones(5);
-        let offset = Array1::zeros(5);
-        let rho = Array1::<f64>::zeros(1);
-        let covariate_se = array![0.9, 0.7, 0.8, 0.6, 0.75];
-        let rs = [array![[1.0]]];
-        let canonical: Vec<gam_terms::construction::CanonicalPenalty> = rs
-            .iter()
-            .map(|r| {
-                let local = r.t().dot(r);
-                gam_terms::construction::CanonicalPenalty {
-                    root: r.clone().into_shared(),
-                    col_range: 0..r.ncols(),
-                    total_dim: r.ncols(),
-                    nullity: 0,
-                    local: local.into_shared(),
-                    prior_mean: Array1::zeros(r.ncols()),
-                    positive_eigenvalues: Vec::new(),
-                    op: None,
-                }
-            })
-            .collect();
-        let config = PirlsConfig {
-            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Logit),
-            )),
-            link_kind: InverseLink::Standard(StandardLink::Logit),
-            max_iterations: 100,
-            convergence_tolerance: 1e-8,
-            firth_bias_reduction: false,
-            initial_lm_lambda: None,
-        };
-
-        let (fit, _) = fit_model_for_fixed_rho(
-            LogSmoothingParamsView::new(rho.view())
-                .expect("test rho lies in exact strength domain"),
-            PirlsProblem {
-                x: x.view(),
-                offset: offset.view(),
-                y: y.view(),
-                priorweights: w.view(),
-                covariate_se: Some(covariate_se.view()),
-                gaussian_fixed_cache: None,
-                glm_first_step_gram: None,
-            },
-            PenaltyConfig {
-                canonical_penalties: &canonical,
-                reparam_invariant: None,
-                p: 1,
-                coefficient_lower_bounds: None,
-                linear_constraints_original: None,
-            },
-            &config,
-            Some(&Coefficients::new(array![0.0])),
-        )
-        .expect("integrated logit PIRLS fit");
-
-        assert!(
-            fit.iteration < config.max_iterations,
-            "the one-parameter integrated-logit fit must converge before its {}-iteration cap; got status {:?}",
-            config.max_iterations,
-            fit.status
-        );
-        let ctx = crate::quadrature::QuadratureContext::new();
-        for i in 0..y.len() {
-            let jet = crate::quadrature::integrated_inverse_link_jet(
-                &ctx,
-                LinkFunction::Logit,
-                fit.final_eta[i],
-                covariate_se[i],
-            )
-            .expect("logit integrated inverse-link jet should evaluate");
-            let expected = bernoulli_geometry_from_jet(
-                i,
-                fit.final_eta[i],
-                y[i],
-                w[i],
-                MixtureInverseLinkJet {
-                    mu: jet.mean,
-                    d1: jet.d1,
-                    d2: jet.d2,
-                    d3: jet.d3,
-                },
-                1.0 - jet.mean,
-            )
-            .expect("integrated Bernoulli row geometry must be representable");
-            assert_relative_eq!(
-                fit.solve_dmu_deta[i],
-                jet.d1,
-                epsilon = 1e-9,
-                max_relative = 1e-9
-            );
-            assert_relative_eq!(
-                fit.solve_d2mu_deta2[i],
-                jet.d2,
-                epsilon = 1e-9,
-                max_relative = 1e-8
-            );
-            assert_relative_eq!(
-                fit.solve_d3mu_deta3[i],
-                jet.d3,
-                epsilon = 1e-8,
-                max_relative = 1e-7
-            );
-            assert_relative_eq!(
-                fit.solve_c_array[i],
-                expected.c,
-                epsilon = 1e-9,
-                max_relative = 1e-8
-            );
-            assert_relative_eq!(
-                fit.solve_d_array[i],
-                expected.d,
-                epsilon = 1e-8,
-                max_relative = 1e-7
-            );
-        }
-    }
-
-    /// zz_measure DIAGNOSTIC: is the shipped derivative jet one Newton step
-    /// stale relative to `final_eta`?
-    ///
-    /// `pirls_result_stores_integrated_logit_derivative_jet` compares
-    /// `fit.solve_dmu_deta[i]` against a jet recomputed at `fit.final_eta[i]`
-    /// and fails at 1e-9. The suspected mechanism is ordinary P-IRLS ordering:
-    /// the geometry (`last_dmu_deta`, …) is built at η_k, β_{k+1} is solved
-    /// from it, η_{k+1} is formed, convergence is checked, and the loop exits —
-    /// so `into_final_state()` ships the geometry of η_k beside `final_eta`
-    /// = η_{k+1}. If that is the cause, the mismatch is bounded by
-    /// `|d²μ/dη²| · |η_{k+1} − η_k|`, and `|η_{k+1} − η_k|` is what the
-    /// convergence tolerance controls — so the gap must SHRINK with the
-    /// tolerance, roughly linearly.
-    ///
-    /// If instead the gap is tolerance-independent, the two channels disagree
-    /// for a reason that is not staleness, and the mechanism above is wrong.
-    ///
-    /// Numbers only; the sole assertion is finiteness (zz_measure discipline).
-    #[test]
-    pub(crate) fn zz_measure_pirls_stored_jet_staleness_vs_tolerance() {
-        let x = array![[1.0], [1.0], [1.0], [1.0], [1.0]];
-        let y = array![0.0, 1.0, 0.0, 1.0, 1.0];
-        let w = Array1::ones(5);
-        let offset = Array1::zeros(5);
-        let rho = Array1::<f64>::zeros(1);
-        let covariate_se = array![0.9, 0.7, 0.8, 0.6, 0.75];
-        let r = array![[1.0]];
-        let canonical = vec![gam_terms::construction::CanonicalPenalty {
-            root: r.clone().into_shared(),
-            col_range: 0..r.ncols(),
-            total_dim: r.ncols(),
-            nullity: 0,
-            local: r.t().dot(&r).into_shared(),
-            prior_mean: Array1::zeros(r.ncols()),
-            positive_eigenvalues: Vec::new(),
-            op: None,
-        }];
-
-        eprintln!(
-            "[zz-jet-stale] tolerance | iters | max|solve_dmu_deta - jet.d1| | max|solve_d2 - jet.d2|"
-        );
-        for tolerance in [1.0e-6, 1.0e-8, 1.0e-10, 1.0e-12, 1.0e-14] {
-            let config = PirlsConfig {
-                likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
-                    ResponseFamily::Binomial,
-                    InverseLink::Standard(StandardLink::Logit),
-                )),
-                link_kind: InverseLink::Standard(StandardLink::Logit),
-                max_iterations: 400,
-                convergence_tolerance: tolerance,
-                firth_bias_reduction: false,
-                initial_lm_lambda: None,
-            };
-            let (fit, _) = fit_model_for_fixed_rho(
-                LogSmoothingParamsView::new(rho.view())
-                    .expect("test rho lies in exact strength domain"),
-                PirlsProblem {
-                    x: x.view(),
-                    offset: offset.view(),
-                    y: y.view(),
-                    priorweights: w.view(),
-                    covariate_se: Some(covariate_se.view()),
-                    gaussian_fixed_cache: None,
-                    glm_first_step_gram: None,
-                },
-                PenaltyConfig {
-                    canonical_penalties: &canonical,
-                    reparam_invariant: None,
-                    p: 1,
-                    coefficient_lower_bounds: None,
-                    linear_constraints_original: None,
-                },
-                &config,
-                Some(&Coefficients::new(array![0.0])),
-            )
-            .expect("integrated logit PIRLS fit");
-
-            let ctx = crate::quadrature::QuadratureContext::new();
-            let mut worst_d1 = 0.0_f64;
-            let mut worst_d2 = 0.0_f64;
-            for i in 0..y.len() {
-                let jet = crate::quadrature::integrated_inverse_link_jet(
-                    &ctx,
-                    LinkFunction::Logit,
-                    fit.final_eta[i],
-                    covariate_se[i],
-                )
-                .expect("logit integrated inverse-link jet should evaluate");
-                worst_d1 = worst_d1.max((fit.solve_dmu_deta[i] - jet.d1).abs());
-                worst_d2 = worst_d2.max((fit.solve_d2mu_deta2[i] - jet.d2).abs());
-            }
-            assert!(
-                worst_d1.is_finite() && worst_d2.is_finite(),
-                "stored-jet gaps must be finite at tolerance {tolerance:e}"
-            );
-            eprintln!(
-                "[zz-jet-stale] {tolerance:8.1e} | {:5} | {worst_d1:.6e} | {worst_d2:.6e}",
-                fit.iteration
-            );
         }
     }
 
@@ -3128,7 +2901,6 @@ mod tests {
                 offset: offset.view(),
                 y: y.view(),
                 priorweights: w.view(),
-                covariate_se: None,
                 gaussian_fixed_cache: None,
                 glm_first_step_gram: None,
             },
@@ -3248,7 +3020,6 @@ mod tests {
                 offset: offset.view(),
                 y: y.view(),
                 priorweights: w.view(),
-                covariate_se: None,
                 gaussian_fixed_cache: None,
                 glm_first_step_gram: None,
             },
@@ -3381,7 +3152,6 @@ mod tests {
                 offset: offset.view(),
                 y: y.view(),
                 priorweights: w.view(),
-                covariate_se: None,
                 gaussian_fixed_cache: None,
                 glm_first_step_gram: None,
             },
@@ -4926,7 +4696,6 @@ mod root_cause_tests {
                     offset: offset.view(),
                     y: y.view(),
                     priorweights: w.view(),
-                    covariate_se: None,
                     gaussian_fixed_cache: None,
                     glm_first_step_gram: None,
                 },
@@ -5028,7 +4797,6 @@ mod root_cause_tests {
                         offset: offset.view(),
                         y: y.view(),
                         priorweights: w.view(),
-                        covariate_se: None,
                         gaussian_fixed_cache: None,
                         glm_first_step_gram: None,
                     },
@@ -5157,7 +4925,6 @@ mod root_cause_tests {
                     offset: offset.view(),
                     y: y.view(),
                     priorweights: w.view(),
-                    covariate_se: None,
                     gaussian_fixed_cache: None,
                     glm_first_step_gram: None,
                 },

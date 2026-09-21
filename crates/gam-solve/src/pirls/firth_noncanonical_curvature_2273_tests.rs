@@ -101,7 +101,6 @@ fn firth_inner_solve(link: StandardLink) -> PirlsResult {
         offset: offset.view(),
         y: y.view(),
         priorweights: weights.view(),
-        covariate_se: None,
         gaussian_fixed_cache: None,
         glm_first_step_gram: None,
     };
