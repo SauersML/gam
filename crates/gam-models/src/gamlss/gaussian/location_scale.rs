@@ -559,6 +559,33 @@ impl GaussianLocationScaleFamily {
         else {
             return Ok(None);
         };
+        Ok(Some(self.exact_newton_joint_psi_terms_from_parts(
+            block_states,
+            &dir_a,
+            xmu,
+            x_ls,
+            None,
+        )?))
+    }
+
+    /// First-order fixed-β ψ terms `V_ψ`, `g_ψ`, `H_ψ` from an already
+    /// resolved ψ direction.
+    ///
+    /// When `subsample` is `Some`, the per-row first-order weights are
+    /// Horvitz–Thompson masked by [`apply_ht_mask_first`] before any
+    /// reduction, exactly as the second-order and mixed-drift paths mask
+    /// theirs. The outer value then sums the masked log-likelihood
+    /// (`log_likelihood_only_with_options`) and factorizes the masked Hessian
+    /// (`exact_newton_joint_hessian_workspace_with_options`), so its
+    /// first-order ψ objects describe the same row measure.
+    pub(crate) fn exact_newton_joint_psi_terms_from_parts(
+        &self,
+        block_states: &[ParameterBlockState],
+        dir_a: &LocationScaleJointPsiDirection,
+        xmu: &Array2<f64>,
+        x_ls: &Array2<f64>,
+        subsample: Option<&[crate::outer_subsample::WeightedOuterRow]>,
+    ) -> Result<gam_problem::ExactNewtonJointPsiTerms, String> {
         // Gaussian 2-block location-scale family in the unified flattened
         // coefficient space beta = [betamu; beta_sigma]:
         //
@@ -590,11 +617,18 @@ impl GaussianLocationScaleFamily {
         //
         // Generic code in custom_family.rs promotes these likelihood-only
         // objects to the full fixed-beta V_a / g_a / H_a by adding S_a.
+        validate_block_count::<GamlssError>("GaussianLocationScaleFamily", 2, block_states.len())?;
         let etamu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
-        let weights_a =
+        let mut weights_a =
             gaussian_joint_psi_firstweights(&rows, &dir_a.z_primary_psi, &dir_a.z_ls_psi);
+        if let Some(sub_rows) = subsample {
+            // HT mask: V_ψ is a row sum, g_ψ reduces the score weights through
+            // `transpose_mul`/`fast_atv`, and H_ψ (operator or dense) reduces the
+            // Hessian weights through `Xᵀ diag(W) Y`; all are row-linear.
+            apply_ht_mask_first(&mut weights_a, sub_rows);
+        }
         let objective_psi = weights_a.objective_psirow.sum();
         let xmu_map = dir_a.x_primary_psi.as_linear_map_ref();
         let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
@@ -623,12 +657,12 @@ impl GaussianLocationScaleFamily {
             gaussian_joint_psihessian_fromweights(xmu, x_ls, xmu_map, x_ls_map, &weights_a)?
         };
 
-        Ok(Some(gam_problem::ExactNewtonJointPsiTerms {
+        Ok(gam_problem::ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,
             hessian_psi,
             hessian_psi_operator,
-        }))
+        })
     }
 
     pub(crate) fn exact_newton_joint_psisecond_order_terms_from_designs(
@@ -1410,6 +1444,15 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 options.outer_score_subsample.clone(),
             )?,
         )))
+    }
+
+    /// The ψ workspace serves the first-order `V_ψ`, `g_ψ`, `H_ψ` too, so a
+    /// gradient-only outer evaluation reads them on the same outer row measure
+    /// as its value instead of falling back to the full-data
+    /// `exact_newton_joint_psi_terms`. The workspace resolves each ψ
+    /// direction once and shares it with the second-order and drift terms.
+    fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
+        true
     }
 
     fn exact_newton_joint_hessian_workspace(
