@@ -45,6 +45,21 @@
   **Behavior change:** an armed Jeffreys refit that stalled just above its KKT tolerance,
   because the tolerance omitted the score's own rounding, now settles. No tolerance was
   loosened: the band charged is the one the score actually carries.
+- **Loop holonomy is gated on a radian angle gap and refuses inputs its tolerance cannot bound** (gam#3908, gam#3910).
+  Two separate defects in the same check. `loop_holonomy` silently filtered out a defect
+  slice whose length differed from the edge count, a sign other than plus or minus one, a
+  non-finite angle and a non-finite or negative defect. Filtering them made the tolerance
+  smaller, so the check certified loops it had no grounds to certify; it now returns
+  `Result<HolonomyReport, String>` and refuses each of those. Separately, the tolerance
+  passed to it was the circular variance `1 - R`, which is dimensionless and therefore
+  cannot bound an angle at all. `CircleTransportReport` gains `max_angle_gap`, the
+  sup-norm residual angle between the empirical transport and the fitted `O(2)` element,
+  and the FFI and `behavioral_curvature_map` pass that instead. The resultant length's
+  range is derived rather than clamped.
+  **Behavior change:** the Python `loop_holonomy` raises `ValueError` on malformed input
+  where it used to drop the offending entries and return a report, the circle transport
+  dict gains a `max_angle_gap` key, and holonomy verdicts move because the tolerance is
+  now an angle in radians rather than a dimensionless variance.
 - **Multinomial smooth significance is a softmax score test, and the saved model format
   moves to version 3** (#3569, #1101). `MultinomialSavedModel::smooth_significance` ran a
   per-class Wood rank-truncated Wald test. It now runs the shared variance-component score
