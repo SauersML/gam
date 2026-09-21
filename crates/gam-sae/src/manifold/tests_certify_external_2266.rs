@@ -315,6 +315,202 @@ mod tests {
     }
 
     #[test]
+    fn lc22_probe_3474() {
+        use gam_solve::rho_optimizer::OuterObjective;
+        let _ = env_logger::builder().is_test(true).try_init();
+        let (target, term, rho, _pin, _provenance) = seeded_external_fixture();
+        let rho_flat = rho.to_flat(&term.assignment).expect("flat");
+        eprintln!("[probe] seed rho = {rho_flat:?}");
+        let registry = AnalyticPenaltyRegistry::new();
+        let mut objective = SaeManifoldOuterObjective::new(
+            term, target.clone(), Some(registry), rho, 40, 1.0, 1.0e-6, 1.0e-6,
+        );
+        let pts: Vec<[f64; 2]> = std::env::var("LC22_PTS")
+            .ok()
+            .map(|s| {
+                s.split(';')
+                    .map(|p| {
+                        let v: Vec<f64> = p.split(',').map(|x| x.trim().parse().unwrap()).collect();
+                        [v[0], v[1]]
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![[rho_flat[0], rho_flat[1]], [4.0, rho_flat[1]], [8.0, -4.0], [12.0, -6.0], [16.867491342553677, -7.261040811383532]]);
+        for p in pts {
+            let r = ndarray::Array1::from(vec![p[0], p[1]]);
+            let e = objective.eval(&r);
+            match e {
+                Ok(ev) => {
+                    let h = 1e-4;
+                    let mut fd = vec![];
+                    for j in 0..2 {
+                        let mut rp = r.clone();
+                        rp[j] += h;
+                        let mut rm = r.clone();
+                        rm[j] -= h;
+                        let fp = objective.eval(&rp).map(|e| e.cost).unwrap_or(f64::NAN);
+                        let fm = objective.eval(&rm).map(|e| e.cost).unwrap_or(f64::NAN);
+                        fd.push((fp - fm) / (2.0 * h));
+                    }
+                    eprintln!(
+                        "[probe] rho={p:?} cost={:.12e} grad={:?} fd={fd:?}",
+                        ev.cost, ev.gradient
+                    );
+                }
+                Err(err) => eprintln!("[probe] rho={p:?} error {err}"),
+            }
+        }
+        if std::env::var("LC22_NORUN").is_err() {
+            let result = OuterProblem::new(rho_flat.len())
+                .with_initial_rho(rho_flat)
+                .run(&mut objective, "#2263 native replay fixture");
+            match result {
+                Ok(r) => eprintln!("[probe] run ok rho={:?} converged={}", r.rho, r.converged()),
+                Err(e) => eprintln!("[probe] run err {e}"),
+            }
+        }
+    }
+
+    struct Lc22CriterionLogger;
+    impl log::Log for Lc22CriterionLogger {
+        fn enabled(&self, _m: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            let msg = format!("{}", record.args());
+            if msg.starts_with("[SAE-CRITERION]") || msg.contains("rank") && msg.contains("MP") {
+                eprintln!("[probe3 log] {msg}");
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn lc22_probe3_3474() {
+        use gam_solve::rho_optimizer::OuterObjective;
+        let _ = log::set_boxed_logger(Box::new(Lc22CriterionLogger));
+        log::set_max_level(log::LevelFilter::Debug);
+        let fresh = || {
+            let (target, term, rho, _pin, _provenance) = seeded_external_fixture();
+            SaeManifoldOuterObjective::new(
+                term, target, Some(AnalyticPenaltyRegistry::new()), rho, 40, 1.0, 1.0e-6, 1.0e-6,
+            )
+        };
+        let pts = [
+            [-6.054325069138625, -6.054325069138625],
+            [10.0, -4.0],
+            [10.5, -4.0],
+            [11.0, -4.0],
+            [11.5, -4.0],
+            [12.0, -4.0],
+            [12.0, -6.0],
+            [16.867491342553677, -7.261040811383532],
+            [20.0, -7.261040811383532],
+            [22.185195809350546, -14.351306798629912],
+        ];
+        for p in pts {
+            let mut o = fresh();
+            eprintln!("[probe3] ---- rho={p:?}");
+            match o.eval(&ndarray::Array1::from(vec![p[0], p[1]])) {
+                Ok(ev) => eprintln!("[probe3] rho={p:?} cost={:.10e} g={:?}", ev.cost, ev.gradient.to_vec()),
+                Err(e) => eprintln!("[probe3] rho={p:?} err {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn lc22_probe4_3474() {
+        use gam_solve::rho_optimizer::OuterObjective;
+        let _ = log::set_boxed_logger(Box::new(Lc22CriterionLogger));
+        log::set_max_level(log::LevelFilter::Debug);
+        let (target, term, rho, _pin, _provenance) = seeded_external_fixture();
+        eprintln!("[probe4] seed beta_dim={}", term.beta_dim());
+        let rho_flat = rho.to_flat(&term.assignment).unwrap();
+        let mut objective = SaeManifoldOuterObjective::new(
+            term, target.clone(), Some(AnalyticPenaltyRegistry::new()), rho, 40, 1.0, 1.0e-6, 1.0e-6,
+        );
+        let result: OuterResult = OuterProblem::new(rho_flat.len())
+            .with_initial_rho(rho_flat)
+            .run(&mut objective, "probe4")
+            .expect("run");
+        eprintln!(
+            "[probe4] run converged={} rho={:?} value={:.10e} grad={:?}",
+            result.converged(),
+            result.rho.to_vec(),
+            result.final_value,
+            result.final_measurement.as_ref().map(|m| m.gradient().to_vec())
+        );
+        if let Some(c) = result.criterion_certificate.as_ref() {
+            eprintln!("[probe4] run certificate: {}", c.summary());
+        }
+        objective.certify_outer_result(&result).expect("certify");
+        let fitted = objective.into_fitted().expect("fitted");
+        let flat = fitted.rho.flat_coordinates();
+        for prepare in [false, true] {
+            let mut t = fitted.term.clone();
+            let before = t.beta_dim();
+            if prepare {
+                t.prepare_entry_stages().expect("prepare");
+            }
+            eprintln!("[probe4] audit prepare={prepare} beta_dim {before} -> {}", t.beta_dim());
+            let mut o = SaeManifoldOuterObjective::new(
+                t, target.clone(), Some(AnalyticPenaltyRegistry::new()), fitted.rho.clone(), 0, 1.0, 1.0e-6, 1.0e-6,
+            )
+            .for_installed_state_audit();
+            match o.eval(&flat) {
+                Ok(ev) => eprintln!("[probe4] audit prepare={prepare} cost={:.10e} g={:?}", ev.cost, ev.gradient.to_vec()),
+                Err(e) => eprintln!("[probe4] audit prepare={prepare} err {e}"),
+            }
+        }
+        {
+            let t = fitted.term.clone();
+            let mut o = SaeManifoldOuterObjective::new(
+                t, target.clone(), Some(AnalyticPenaltyRegistry::new()), fitted.rho.clone(), 40, 1.0, 1.0e-6, 1.0e-6,
+            );
+            match o.eval(&flat) {
+                Ok(ev) => eprintln!("[probe4] live-from-fitted cost={:.10e} g={:?}", ev.cost, ev.gradient.to_vec()),
+                Err(e) => eprintln!("[probe4] live-from-fitted err {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn lc22_probe2_3474() {
+        use gam_solve::rho_optimizer::OuterObjective;
+        let fresh = || {
+            let (target, term, rho, _pin, _provenance) = seeded_external_fixture();
+            SaeManifoldOuterObjective::new(
+                term, target, Some(AnalyticPenaltyRegistry::new()), rho, 40, 1.0, 1.0e-6, 1.0e-6,
+            )
+        };
+        let xs = [4.0, 6.0, 7.0, 7.9, 7.99, 8.0, 8.01, 8.1, 9.0, 10.0, 12.0];
+        for &x in &xs {
+            let mut o = fresh();
+            let r = ndarray::Array1::from(vec![x, -4.0]);
+            match o.eval(&r) {
+                Ok(ev) => eprintln!("[probe2 fresh] x={x} cost={:.12e} g0={:.6e} g1={:.6e}", ev.cost, ev.gradient[0], ev.gradient[1]),
+                Err(e) => eprintln!("[probe2 fresh] x={x} err {e}"),
+            }
+        }
+        let mut o = fresh();
+        for &x in &xs {
+            let r = ndarray::Array1::from(vec![x, -4.0]);
+            match o.eval(&r) {
+                Ok(ev) => eprintln!("[probe2 seq] x={x} cost={:.12e} g0={:.6e}", ev.cost, ev.gradient[0]),
+                Err(e) => eprintln!("[probe2 seq] x={x} err {e}"),
+            }
+        }
+        for &h in &[1e-2, 1e-3, 1e-4, 1e-5] {
+            let mut o = fresh();
+            let c = o.eval(&ndarray::Array1::from(vec![8.0, -4.0])).map(|e| (e.cost, e.gradient[0])).unwrap();
+            let fp = o.eval(&ndarray::Array1::from(vec![8.0 + h, -4.0])).map(|e| e.cost).unwrap();
+            let fm = o.eval(&ndarray::Array1::from(vec![8.0 - h, -4.0])).map(|e| e.cost).unwrap();
+            let c2 = o.eval(&ndarray::Array1::from(vec![8.0, -4.0])).map(|e| (e.cost, e.gradient[0])).unwrap();
+            eprintln!("[probe2 fd] h={h} c={:.12e} g0={:.6e} fd={:.6e} fwd={:.6e} bwd={:.6e} re-eval c={:.12e} g0={:.6e}", c.0, c.1, (fp - fm) / (2.0 * h), (fp - c.0) / h, (c.0 - fm) / h, c2.0, c2.1);
+        }
+    }
+
+    #[test]
     fn converged_native_replay_passes_zero_optimization_audit_and_perturbation_fails() {
         let (target, term, rho, pin, provenance) = native_converged_state();
         let mut perturbed = term.clone();
