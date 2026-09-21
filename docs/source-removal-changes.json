@@ -3594,5 +3594,15 @@
     ],
     "reason": "#3179 item 7: quantile knots have one placement rule. quantile_knot_inference_needs_uniform_fallback was a private copy, nested in build_survival_time_basis, of gam-terms' generate_full_knot_vector_quantile with a 1e-12*scale tie tolerance; survival ran it to decide whether to switch to Uniform knots. data_capped_internal_knots now sizes the knot count from gam_terms::basis::quantile_knot_support, the exact support the shared builder places knots on, so the count never exceeds that support and the shared placement cannot fail. The copy and the Uniform branch it selected are deleted.",
     "evidence": "At the base, git grep -n quantile_knot_inference_needs_uniform_fallback finds it only in crates/gam-models/src/survival/construction.rs: its nested declaration inside infer_survival_time_knots_with_degree and its one call site there. Both are deleted in this change, and no other source, test, bench, script or Python file names it. The guard reports it as public false, test_scoped false, production_occurrences 2 (the declaration and the call)."
+  },
+  {
+    "base": "f4a293a63f27849835d1fcb67c3eefcef5a495ab",
+    "items": [
+      "crates/gam-terms/src/smooth/term_specs.rs:const:MAX_NUDGE",
+      "crates/gam-terms/src/smooth/term_specs.rs:fn:apply_response_aware_anisotropy_seed",
+      "crates/gam-terms/src/smooth/term_specs.rs:fn:response_aware_axis_contrasts"
+    ],
+    "reason": "Delete the response-aware anisotropy seed nudge (#2902 row `clamp(+-MAX_NUDGE)`): a per-axis seed shift clamped to a hand-picked ln 2 box, added in #1376 to steer the kappa/anisotropy optimizer away from a symmetric start that the then-mis-centered psi gradient could not leave. The exact centered psi gradient (#1376 root fix) makes the seed a plain starting point of a gradient optimizer, so the bounded response heuristic is an unnecessary knob; SPEC: 'Hand-supplied search boxes or bounds are never allowed.' and 'In general, do not paper over solver issues.'",
+    "evidence": "git grep -n 'response_aware\\|MAX_NUDGE' at f4a293a63f finds only the two definitions and their doc in term_specs.rs, the single call in fit_orchestration/drivers/spatial_optimization.rs (removed here) and the spec_ban_ledger row (removed here). Anisotropy recovery tests aniso_matern_full_outer_loop_recovers_planted_signal_r2, aniso_matern_recovery_ablation_eta_direction_robust_across_penalty, aniso_matern_recovers_signal_axis run on this branch via focused-rust-proof."
   }
 ]
