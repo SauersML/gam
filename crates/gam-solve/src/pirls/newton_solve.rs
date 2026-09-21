@@ -649,6 +649,7 @@ pub(super) fn solve_newton_direction_dense(
         &gradient.mapv(|g| -g).insert_axis(ndarray::Axis(1)),
         &direction_out.clone().insert_axis(ndarray::Axis(1)),
         &residual.insert_axis(ndarray::Axis(1)),
+        factor.solve_backward_band(curvature_max_abs),
         "PIRLS dense Newton direction",
     )
     .map_err(|error| {
