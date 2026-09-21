@@ -140,6 +140,10 @@ pub enum RandomEffectTestUnavailable {
     /// The scale is known, but the fit publishes no finite positive dispersion
     /// to scale the score's variance by.
     KnownScaleUnavailable,
+    /// The fitted mean composes the term's predictor with a link wiggle, so it
+    /// is not linear in the term's coefficients and the linear score has no
+    /// row state to read.
+    MeanNotLinearInTerm,
 }
 
 impl RandomEffectTestUnavailable {
@@ -152,6 +156,7 @@ impl RandomEffectTestUnavailable {
             Self::NoResidualDegreesOfFreedom => "random_effect_no_residual_degrees_of_freedom",
             Self::TailUnresolved => "random_effect_tail_unresolved",
             Self::KnownScaleUnavailable => "random_effect_known_scale_unavailable",
+            Self::MeanNotLinearInTerm => "random_effect_mean_not_linear_in_term",
         }
     }
 
@@ -173,6 +178,9 @@ impl RandomEffectTestUnavailable {
             Self::TailUnresolved => "the reference tail probability could not be resolved",
             Self::KnownScaleUnavailable => {
                 "the scale is known but the fit publishes no finite positive dispersion"
+            }
+            Self::MeanNotLinearInTerm => {
+                "the mean composes this term with a link wiggle, so it is not linear in the term's coefficients"
             }
         }
     }
