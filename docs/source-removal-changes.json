@@ -3261,5 +3261,15 @@
     ],
     "reason": "gam#3320: the flex audit judges candidates on the calibrated pilot's total eta-Jacobian; the rigid-pilot eta helper is superseded",
     "evidence": "crates/gam-models/src/bms/pilot_total_jacobian.rs BmsCalibratedPilot::build replaces pilot_eta_for_link_dev_orthogonalisation at its only call site in block_specs.rs"
+  },
+  {
+    "base": "3d306728d71b4e24433564e05043d5e68056f47a",
+    "items": [
+      "crates/gam-sae/src/manifold/gauge.rs:const:C",
+      "crates/gam-sae/src/manifold/gauge.rs:const:G",
+      "crates/gam-sae/src/manifold/gauge.rs:fn:ln_gamma"
+    ],
+    "reason": "#3795: gauge.rs's private Lanczos ln_gamma (and its G/C coefficient constants) duplicated the workspace's one ln Gamma; beta_loglik_avg now calls statrs::function::gamma::ln_gamma, as atom_codes.rs in the same crate already does.",
+    "evidence": "https://github.com/SauersML/gam/issues/3795"
   }
 ]

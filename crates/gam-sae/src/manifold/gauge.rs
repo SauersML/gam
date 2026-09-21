@@ -8,6 +8,7 @@ use ndarray::ArrayView1;
 
 use gam_math::special::{digamma, trigamma};
 use opt::{BacktrackConfig, backtracking_line_search};
+use statrs::function::gamma::ln_gamma;
 
 // ===========================================================================
 // F1 — amplitude-concentration certificate (the "intensity is presence vs a
@@ -329,29 +330,6 @@ fn beta_loglik_avg(alpha: f64, beta: f64, s_ln: f64, s_ln1m: f64) -> f64 {
 // which left `7.6e−10` / `3.1e−10` relative error — enough to matter to the
 // Beta Newton above, which stops when the score sits inside its rounding band.
 
-/// `ln Γ(x)` for `x > 0` via the Lanczos approximation (g = 7). Hand-derived
-/// closed form; used only to report the Beta log-likelihood.
-fn ln_gamma(x: f64) -> f64 {
-    const G: f64 = 7.0;
-    const C: [f64; 9] = [
-        0.999_999_999_999_809_93,
-        676.520_368_121_885_1,
-        -1_259.139_216_722_402_8,
-        771.323_428_777_653_13,
-        -176.615_029_162_140_6,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_12,
-        9.984_369_578_019_572e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-    let mut a = C[0];
-    let t = x + G - 0.5;
-    for (i, &c) in C.iter().enumerate().skip(1) {
-        a += c / (x + i as f64 - 1.0);
-    }
-    0.5 * (2.0 * std::f64::consts::PI).ln() + (x - 0.5) * t.ln() - t + a.ln()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,9 +364,6 @@ mod tests {
         assert!((digamma(2.0) - (1.0 - gamma)).abs() < 1.0e-15);
         let pi2_6 = std::f64::consts::PI * std::f64::consts::PI / 6.0;
         assert!((trigamma(1.0) - pi2_6).abs() < 1.0e-15);
-        // ln Γ(5) = ln 24. The Lanczos g=7 form here is a separate primitive and
-        // measures 1.6e-14 relative at worst, so it keeps a wider bar.
-        assert!((ln_gamma(5.0) - 24.0_f64.ln()).abs() < 1.0e-13);
     }
 
     #[test]
