@@ -140,6 +140,18 @@ pub(crate) fn validate_cov_block_kind(
                     );
                 }
             }
+            if !tv.nullspace_dims.is_empty() && tv.nullspace_dims.len() != k {
+                bail_dim_sls!(
+                    "{name} time-varying nullspace_dims length mismatch: got {}, expected {k}",
+                    tv.nullspace_dims.len()
+                );
+            }
+            if let Some(idx) = tv.nullspace_dims.iter().position(|&m| m > p_tensor) {
+                bail_dim_sls!(
+                    "{name} time-varying penalty {idx} declares nullity {} above its width {p_tensor}",
+                    tv.nullspace_dims[idx]
+                );
+            }
             Ok(())
         }
     }
@@ -304,8 +316,16 @@ pub(crate) fn drop_leading_penalty_columns(
         return Ok((Vec::new(), Vec::new(), Array1::zeros(0)));
     }
 
+    // The retained coefficients are `β = Tθ` with `T = I[:, fixed_cols..]`, so
+    // each retained penalty is `TᵀST` and declares `dim(ker S ∩ range T)`, read
+    // from the declared null basis (#3023). A block-local penalty whose block
+    // lies wholly among the retained columns keeps its local matrix, and with it
+    // its declaration, exactly.
     let structural_nullspace_available = nullspace_dims.len() == penalties.len();
-    let mut structural_nullspace_exact = structural_nullspace_available;
+    let mut selection = Array2::<f64>::zeros((full_dim, active_dim));
+    for col in 0..active_dim {
+        selection[[fixed_cols + col, col]] = 1.0;
+    }
     let mut retained_penalties = Vec::new();
     let mut retained_nullspace_dims = Vec::new();
     let mut retained_log_lambdas = Vec::new();
@@ -339,9 +359,6 @@ pub(crate) fn drop_leading_penalty_columns(
                     let active_end = col_range.end;
                     let local_start = active_start - col_range.start;
                     let local_end = active_end - col_range.start;
-                    if local_start != 0 || local_end != local.nrows() {
-                        structural_nullspace_exact = false;
-                    }
                     Some(PenaltyMatrix::Blockwise {
                         local: local
                             .slice(s![local_start..local_end, local_start..local_end])
@@ -352,7 +369,6 @@ pub(crate) fn drop_leading_penalty_columns(
                 }
             }
             PenaltyMatrix::Dense(matrix) => {
-                structural_nullspace_exact = false;
                 Some(PenaltyMatrix::Dense(
                     matrix
                         .slice(s![fixed_cols..full_dim, fixed_cols..full_dim])
@@ -363,7 +379,6 @@ pub(crate) fn drop_leading_penalty_columns(
                 diagonal.slice(s![fixed_cols..full_dim]).to_owned(),
             )),
             PenaltyMatrix::KroneckerFactored { .. } => {
-                structural_nullspace_exact = false;
                 let dense = penalty.to_dense();
                 Some(PenaltyMatrix::Dense(
                     dense
@@ -372,7 +387,6 @@ pub(crate) fn drop_leading_penalty_columns(
                 ))
             }
             PenaltyMatrix::Labeled { label, inner } => {
-                structural_nullspace_exact = false;
                 let dense = inner.to_dense();
                 Some(
                     PenaltyMatrix::Dense(
@@ -384,7 +398,6 @@ pub(crate) fn drop_leading_penalty_columns(
                 )
             }
             PenaltyMatrix::Fixed { log_lambda, inner } => {
-                structural_nullspace_exact = false;
                 let dense = inner.to_dense();
                 Some(
                     PenaltyMatrix::Dense(
@@ -398,16 +411,39 @@ pub(crate) fn drop_leading_penalty_columns(
         };
 
         if let Some(reduced) = reduced {
+            if structural_nullspace_available {
+                let declared = nullspace_dims[idx];
+                let carried = match (penalty, &reduced) {
+                    (
+                        PenaltyMatrix::Blockwise { col_range, .. },
+                        PenaltyMatrix::Blockwise {
+                            col_range: reduced_range,
+                            ..
+                        },
+                    ) if col_range.len() == reduced_range.len() => declared,
+                    _ => {
+                        let full_width = gam_problem::pulled_back_declared_nullity(
+                            penalty, declared, &selection, 0.0,
+                        )
+                        .map_err(|error| {
+                            format!("{label}: penalty {idx} declared nullity pullback: {error}")
+                        })?;
+                        match &reduced {
+                            // A block-local declaration counts only the local
+                            // matrix's null space; the other axes are exactly null.
+                            PenaltyMatrix::Blockwise {
+                                col_range: reduced_range,
+                                ..
+                            } => full_width.saturating_sub(active_dim - reduced_range.len()),
+                            _ => full_width,
+                        }
+                    }
+                };
+                retained_nullspace_dims.push(carried);
+            }
             retained_penalties.push(reduced);
             retained_log_lambdas.push(initial_log_lambdas[idx]);
-            if structural_nullspace_available {
-                retained_nullspace_dims.push(nullspace_dims[idx]);
-            }
         }
-    }
-
-    if !structural_nullspace_exact {
-        retained_nullspace_dims.clear();
     }
 
     Ok((
@@ -476,7 +512,7 @@ pub(crate) fn prepare_cov_block_kind(
                 design_derivative_exit: Some(design_derivative_exit),
                 offset: tv.offset.clone(),
                 penalties: tv.penalties.clone(),
-                nullspace_dims: vec![],
+                nullspace_dims: tv.nullspace_dims.clone(),
                 initial_log_lambdas: tv.initial_log_lambdas.clone(),
                 initial_beta: tv.initial_beta.clone(),
             })
@@ -590,19 +626,47 @@ pub(crate) fn build_survival_covariate_block_from_design(
                 .ok_or_else(|| {
                     "a time-varying covariate template produced no time-margin metric".to_string()
                 })?;
+            if cov_design.nullspace_dims.len() != cov_design.penalties.len() {
+                return Err(format!(
+                    "survival location-scale time-varying covariate block has {} penalties but \
+                     {} nullspace dimensions",
+                    cov_design.penalties.len(),
+                    cov_design.nullspace_dims.len()
+                ));
+            }
+            let p_time = metric.time_gram.nrows();
             let mut penalties =
                 Vec::with_capacity(cov_design.penalties.len() + time_penalties.len());
-            for penalty in &cov_design.penalties {
+            let mut nullspace_dims = Vec::with_capacity(penalties.capacity());
+            for (penalty, &local_nullity) in
+                cov_design.penalties.iter().zip(&cov_design.nullspace_dims)
+            {
                 penalties.push(PenaltyMatrix::KroneckerFactored {
                     left: penalty.to_global(p_cov),
                     right: metric.time_gram.clone(),
                 });
+                // `local_nullity` is the block-local declaration; at the
+                // covariate width the axes outside `col_range` are exactly null
+                // too. `Ḡ_t` is the Gram of linearly independent B-splines, so it
+                // is positive definite and `null(S ⊗ Ḡ_t) = null(S) ⊗ R^{p_t}`:
+                // the declaration scales exactly by the time width (#3023).
+                let covariate_nullity = local_nullity + (p_cov - penalty.col_range.len());
+                nullspace_dims.push(covariate_nullity * p_time);
             }
             for s_time in time_penalties {
                 penalties.push(PenaltyMatrix::KroneckerFactored {
                     left: metric.covariate_gram.clone(),
                     right: s_time.clone(),
                 });
+                // `G_x ⊗ S_t` has spectrum the products of its factors' spectra,
+                // so its nullity is `p_x·p_t − rank(G_x)·rank(S_t)`, exactly as the
+                // follow-up-varying slope declares its margin penalties (#3023).
+                nullspace_dims.push(
+                    crate::survival::time_margin_metric::kronecker_nullspace_dimension(
+                        &metric.covariate_gram,
+                        s_time,
+                    )?,
+                );
             }
             Ok(CovariateBlockKind::TimeVarying(
                 TimeDependentCovariateBlockInput {
@@ -611,6 +675,7 @@ pub(crate) fn build_survival_covariate_block_from_design(
                     time_basis_exit: time_basis_exit.clone(),
                     time_basis_derivative_exit: time_basis_derivative_exit.clone(),
                     penalties,
+                    nullspace_dims,
                     initial_log_lambdas,
                     initial_beta,
                     offset: offset.clone(),

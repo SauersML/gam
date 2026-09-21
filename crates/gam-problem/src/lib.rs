@@ -43,6 +43,7 @@ pub mod monotone_root_error;
 pub mod outer_subsample;
 pub mod penalty_coordinate;
 pub mod penalty_matrix;
+pub mod penalty_null_basis;
 mod pseudo_logdet;
 pub mod psi_design_contract;
 pub mod psi_terms;
@@ -186,6 +187,9 @@ pub use penalty_coordinate::{
     PenaltyCoordinate, ProjectedBlockRoot, project_block_root_out_of_null_directions,
 };
 pub use penalty_matrix::PenaltyMatrix;
+pub use penalty_null_basis::{
+    PenaltyNullBasis, PenaltyNullBasisError, pulled_back_declared_nullity,
+};
 pub use pseudo_logdet::PseudoLogdetMode;
 pub use psi_design_contract::{
     CustomFamilyBlockPsiDerivative,
