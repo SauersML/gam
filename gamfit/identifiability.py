@@ -23,10 +23,15 @@ The runner is:
 (N, 3)
 >>> result.profile_log_likelihood  # higher = better at fixed weights; not evidence
 
-If any precondition of the theorem fails, the corresponding warning is emitted
-via :mod:`warnings.warn` as ``UserWarning`` and recorded in
-``result.report.as_warnings()``. The fit always completes — the warnings are
-informational about which guarantee no longer formally holds.
+A result is only ever returned from a certified stationary point of the
+penalized objective; an optimization that does not certify raises
+:class:`gamfit.errors.FitConvergenceError`. An auxiliary that cannot identify
+the iVAE conditional prior (Khemakhem Thm. 1's 2k-rank condition) is a
+precondition failure and raises before any optimization. The remaining
+theorem preconditions (encoder depth, decoder sparsity, latent variance) are
+properties of the certified fit: when one fails, the corresponding warning is
+emitted via :mod:`warnings.warn` as ``UserWarning`` and recorded in
+``result.report.as_warnings()``.
 """
 
 from __future__ import annotations
@@ -315,7 +320,14 @@ class IdentifiableFactorFitResult:
         Mechanism-sparsity-regularised latent block. Identified by the
         Lachapelle 2401.04890 theorem up to permutation + signed scaling
         when the decoder Jacobian on these columns is full rank and the
-        sparsity penalty is active.
+        sparsity penalty is active. Each column has unit second moment over
+        the fitted rows: that fixes the scale the theorem leaves free, which
+        the penalized objective could otherwise lower without bound by
+        growing ``T_free`` and shrinking its decoder rows.
+    free_scale : np.ndarray, shape ``(n_free,)``
+        Root second moment of each raw free encoder output over the fitted
+        rows, so ``T_free = encoder(X)[:, n_supervised:] / free_scale``.
+        Apply the same division to encode new rows.
     profile_log_likelihood : float
         Penalized Gaussian profile log-likelihood at the fitted penalty weights,
         ``-0.5 * N * log(RSS/N) - 0.5 * total_penalty``. Higher is better. No
@@ -329,7 +341,13 @@ class IdentifiableFactorFitResult:
         Final scalar weight used for the mechanism-sparsity prior.
     encoder_state : dict[str, np.ndarray]
         ``state_dict``-style snapshot of the encoder. Useful for
-        out-of-sample prediction.
+        out-of-sample prediction together with ``free_scale``.
+    stationarity : float
+        Certified ``‖∇f(θ̂)‖∞ / ‖∇f(θ₀)‖∞`` of the penalized objective ``f``
+        over all encoder and decoder parameters, at most the ``grad_tol``
+        the fit was asked for.
+    n_iter : int
+        L-BFGS iterations taken to reach the certified point.
     aux : np.ndarray
         Auxiliary covariates used at fit time. Stored on the result so
         downstream :func:`check` calls can re-verify the iVAE preconditions
@@ -342,11 +360,14 @@ class IdentifiableFactorFitResult:
 
     T_supervised: np.ndarray
     T_free: np.ndarray
+    free_scale: np.ndarray
     profile_log_likelihood: float
     decoder: np.ndarray
     aux_prior_weight: float
     mech_sparsity_weight: float
     encoder_state: dict[str, np.ndarray]
+    stationarity: float
+    n_iter: int
     aux: np.ndarray | None = None
     report: "IdentifiabilityReport | None" = None
 
@@ -481,6 +502,15 @@ def _derive_aux_scale(aux_np: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(rust_module().derive_ivae_aux_scale(aux2d))
 
 
+def _flat_grad_inf(params: list[Any]) -> float:
+    """``‖∇‖∞`` over every parameter's accumulated ``.grad``."""
+
+    return max(
+        float(p.grad.detach().abs().max().item()) if p.grad is not None else 0.0
+        for p in params
+    )
+
+
 def _one_fit(
     x_t: Any,
     aux_t: Any,
@@ -489,23 +519,43 @@ def _one_fit(
     hidden_widths: list[int],
     aux_w: float,
     mech_w: float,
-    max_iter: int,
-    learning_rate: float,
+    max_evals: int,
+    grad_tol: float,
     seed: int,
     torch_mod: Any,
-) -> tuple[Any, Any, float, float]:
-    """Run one inner-loop fit at fixed scalar weights.
+) -> tuple[Any, Any, float, float, np.ndarray, float, int]:
+    """Minimize the penalized objective at fixed weights to a certified point.
 
-    Returns ``(encoder, decoder_W, rss, total_penalty)``. The
-    encoder is the trained ``nn.Sequential``; ``decoder_W`` is a numpy array
-    of shape ``(P, n_supervised + n_free)``.
+    The objective over encoder and decoder parameters ``θ`` is
+
+    ``f(θ) = ‖X − T Wᵀ‖² + aux_w·iVAE(T_sup | aux) + mech_w·Ω(W_free)``
+
+    with ``T = [T_sup ‖ T_free]`` and ``T_free`` the raw free encoder output
+    divided by its per-column root second moment. Without that division ``f``
+    has no minimizer: ``T_free → c·T_free`` with ``W_free → W_free / c``
+    leaves the reconstruction unchanged and strictly lowers ``Ω`` for every
+    ``c > 1``. With it, ``f`` is invariant to the raw free scale, and the
+    mechanism-sparsity penalty prices decoder sparsity at a fixed latent
+    scale, which is the setting of Lachapelle 2401.04890.
+
+    ``f`` is minimized by L-BFGS with a strong-Wolfe line search. The only
+    stopping rule is the stationarity certificate
+    ``‖∇f(θ̂)‖∞ ≤ grad_tol · ‖∇f(θ₀)‖∞``, recomputed at the returned
+    parameters. ``max_evals`` bounds objective-and-gradient evaluations and
+    never ends a fit on its own: a run that exhausts it, or whose line search
+    stalls, raises :class:`gamfit.errors.FitConvergenceError` carrying the
+    reached parameters as a checkpoint.
+
+    Returns ``(encoder, decoder, rss, total_penalty, free_scale,
+    stationarity, n_iter)`` at the certified point.
     """
 
     torch = torch_mod
     nn = torch.nn
 
     n_obs, p_features = int(x_t.shape[0]), int(x_t.shape[1])
-    latent_dim = int(n_supervised) + int(n_free)
+    n_sup = int(n_supervised)
+    latent_dim = n_sup + int(n_free)
 
     gen = torch.Generator(device=x_t.device).manual_seed(int(seed))
     # Module constructors consume the process-global RNG even though every
@@ -528,14 +578,12 @@ def _one_fit(
         decoder.weight.uniform_(-bound, bound, generator=gen)
 
     params = list(encoder.parameters()) + list(decoder.parameters())
-    optim = torch.optim.Adam(params, lr=float(learning_rate))
 
     rust = rust_module()
 
-    # Pre-build mechanism-sparsity descriptor parts: singleton feature groups
-    # (one per output feature) give an element-wise smoothed-L1 over the
-    # free-latent rows of the decoder, which is the Lachapelle 2401.04890
-    # mechanism-sparsity functional.
+    # Singleton feature groups (one per output feature) give an element-wise
+    # smoothed-L1 over the free-latent rows of the decoder, which is the
+    # Lachapelle 2401.04890 mechanism-sparsity functional.
     feature_groups = [[j] for j in range(p_features)]
     mech_pen = rust.MechanismSparsityPenalty(
         feature_groups, float(mech_w), float(max(1, n_obs))
@@ -543,99 +591,123 @@ def _one_fit(
 
     aux_np = np.ascontiguousarray(aux_t.detach().cpu().numpy())
     # Conditional scale σ(u) of the Gaussian iVAE prior, derived from the
-    # auxiliary so that the natural-parameter signature [μ(u) ‖ log σ(u)]
-    # spans the full 2k dimensions of Khemakhem 2107.10098 Thm. 1 (fixing
-    # issue #576, where the hardcoded σ ≡ 1 made that signature rank-deficient
-    # and every supervised fit raise). ``aux_prior_active`` records whether
-    # the Khemakhem precondition is satisfiable for *this* auxiliary: when the
-    # auxiliary is genuinely degenerate the conditional prior is mathematically
-    # non-identifiable, so the Rust constructor raises — we then leave the
-    # prior contribution at zero and let :func:`check` report iVAE = fail,
-    # honouring the recipe contract that the fit always completes.
+    # auxiliary so that the natural-parameter signature spans the 2k
+    # dimensions of Khemakhem 2107.10098 Thm. 1 (#576). The prior is built
+    # once here, before any optimization: an auxiliary that cannot identify
+    # it (constant column, too few distinct states) raises the Rust
+    # precondition error to the caller instead of fitting a model without
+    # the prior the recipe promises.
     aux_scale = _derive_aux_scale(aux_np)
-    zero_sup = np.zeros((n_obs, n_supervised), dtype=np.float64)
-    try:
-        rust.conditional_prior_ivae(float(aux_w), zero_sup, aux_np, aux_scale)
-        aux_prior_active = True
-    except ValueError:
-        aux_prior_active = False
+    rust.conditional_prior_ivae(
+        float(aux_w), np.zeros((n_obs, n_sup), dtype=np.float64), aux_np, aux_scale
+    )
 
-    rss = 0.0
-    total_pen = 0.0
-    for _step in range(int(max_iter)):
-        optim.zero_grad(set_to_none=True)
-        t = encoder(x_t)
-        t_sup = t[:, :n_supervised]
-        x_hat = decoder(t)
+    def latents() -> tuple[Any, Any, Any]:
+        raw = encoder(x_t)
+        raw_free = raw[:, n_sup:latent_dim]
+        free_scale = torch.sqrt((raw_free * raw_free).mean(dim=0))
+        return raw[:, :n_sup], raw_free / free_scale, free_scale
+
+    def terms() -> tuple[Any, Any, Any, float, float]:
+        t_sup, t_free, _ = latents()
+        x_hat = decoder(torch.cat([t_sup, t_free], dim=1))
         recon = ((x_hat - x_t) ** 2).sum()
-
-        # Aux conditional prior (Gaussian iVAE prior on T_sup given aux).
-        if aux_prior_active:
-            t_sup_np = np.ascontiguousarray(t_sup.detach().cpu().numpy())
-            aux_val, aux_grad = rust.conditional_prior_ivae(
-                float(aux_w), t_sup_np, aux_np, aux_scale
-            )
-            aux_grad_t = torch.as_tensor(
-                np.asarray(aux_grad), dtype=t.dtype, device=t.device
-            )
-            # Inject the analytic Rust gradient into autograd via a surrogate
-            # loss whose backward equals the precomputed gradient.
-            aux_surrogate = (t_sup * aux_grad_t).sum()
-        else:
-            aux_val = 0.0
-            aux_surrogate = t_sup.sum() * 0.0
-
-        # Mechanism sparsity on the free-latent rows of the decoder
-        # (decoder.weight is shape (P, latent_dim); transpose to
-        # (latent_dim, P) and take the free rows).
-        w_full = decoder.weight.t()
-        w_free = w_full[n_supervised : n_supervised + n_free, :]
-        w_free_np = np.ascontiguousarray(
-            w_free.detach().cpu().numpy().astype(np.float64)
+        aux_val, aux_grad = rust.conditional_prior_ivae(
+            float(aux_w),
+            np.ascontiguousarray(t_sup.detach().cpu().numpy()),
+            aux_np,
+            aux_scale,
         )
-        mech_val, mech_grad = mech_pen.value_grad(w_free_np)
-        mech_grad_t = torch.as_tensor(
-            np.asarray(mech_grad), dtype=w_free.dtype, device=w_free.device
+        # decoder.weight is (P, latent_dim); the free rows of its transpose
+        # are the free latents' mechanisms.
+        w_free = decoder.weight.t()[n_sup:latent_dim, :]
+        mech_val, mech_grad = mech_pen.value_grad(
+            np.ascontiguousarray(w_free.detach().cpu().numpy().astype(np.float64))
         )
-        mech_surrogate = (w_free * mech_grad_t).sum()
+        aux_s = (
+            t_sup * torch.as_tensor(np.asarray(aux_grad), dtype=t_sup.dtype, device=t_sup.device)
+        ).sum()
+        mech_s = (
+            w_free * torch.as_tensor(np.asarray(mech_grad), dtype=w_free.dtype, device=w_free.device)
+        ).sum()
+        return recon, aux_s, mech_s, float(aux_val), float(mech_val)
 
-        # Total surrogate loss: recon has direct autograd; the two penalty
-        # surrogates have value-matched gradients (Rust-analytic) but their
-        # numeric value is replaced below for the profile log-likelihood.
-        loss = recon + aux_surrogate + mech_surrogate
+    def objective() -> Any:
+        # The Rust penalties supply analytic values and gradients. `s − s.detach()`
+        # is exactly zero in value and carries exactly the Rust gradient, so the
+        # returned scalar is the true f(θ) the line search compares.
+        recon, aux_s, mech_s, aux_val, mech_val = terms()
+        return recon + (aux_s - aux_s.detach()) + (mech_s - mech_s.detach()) + (aux_val + mech_val)
+
+    def closure() -> Any:
+        optim.zero_grad(set_to_none=False)
+        loss = objective()
         loss.backward()
-        optim.step()
+        return loss
 
-        rss = float(recon.detach().cpu().item())
-        total_pen = float(aux_val) + float(mech_val)
+    # The stationarity reference ‖∇f(θ₀)‖∞ is the gradient scale of this
+    # problem at its seeded start; the certificate is relative to it, as in
+    # gaussian_reml_optimize_latent (#954), so it is invariant to the O(N·P)
+    # scale of the objective and to additive constants.
+    optim = torch.optim.LBFGS(
+        params,
+        lr=1.0,
+        max_iter=int(max_evals),
+        max_eval=int(max_evals),
+        tolerance_grad=0.0,
+        tolerance_change=0.0,
+        line_search_fn="strong_wolfe",
+    )
+    closure()
+    grad_inf_init = _flat_grad_inf(params)
+    target = float(grad_tol) * grad_inf_init
+    optim.param_groups[0]["tolerance_grad"] = target
+    optim.step(closure)
+    n_iter = int(optim.state[params[0]].get("n_iter", 0))
 
-    # Final-pass true (RSS, penalty) used by the scalar Rust profile
-    # log-likelihood primitive. Hyperparameter selection is not inferred
-    # from these two numbers; they describe this fixed-weight converged fit
-    # only.
-    with torch.no_grad():
-        t = encoder(x_t)
-        t_sup = t[:, :n_supervised]
-        x_hat = decoder(t)
-        rss = float(((x_hat - x_t) ** 2).sum().item())
-        if aux_prior_active:
-            aux_val, _ = rust.conditional_prior_ivae(
-                float(aux_w),
-                np.ascontiguousarray(t_sup.detach().cpu().numpy()),
-                aux_np,
-                aux_scale,
-            )
-        else:
-            aux_val = 0.0
-        w_full = decoder.weight.t()
-        w_free = w_full[n_supervised : n_supervised + n_free, :]
-        mech_val, _ = mech_pen.value_grad(
-            np.ascontiguousarray(
-                w_free.detach().cpu().numpy().astype(np.float64)
-            )
+    # Certificate, recomputed at the returned parameters independently of the
+    # optimizer's own bookkeeping.
+    loss = closure()
+    grad_inf = _flat_grad_inf(params)
+    objective_value = float(loss.detach().cpu().item())
+    if not (math.isfinite(grad_inf) and math.isfinite(objective_value) and grad_inf <= target):
+        from ._exceptions import FitConvergenceError
+
+        exc = FitConvergenceError(
+            "identifiable_factor_fit did not reach a stationary point: "
+            f"‖∇f‖∞ = {grad_inf:.3e} > grad_tol·‖∇f(θ₀)‖∞ = "
+            f"{float(grad_tol):.1e}·{grad_inf_init:.3e} after {n_iter} L-BFGS "
+            f"iterations ({max_evals} objective evaluations allowed). Raise "
+            "max_evals or resume from the checkpoint attributes."
         )
-    total_pen = float(aux_val) + float(mech_val)
-    return encoder, decoder, rss, total_pen
+        exc.grad_inf = grad_inf
+        exc.grad_inf_init = grad_inf_init
+        exc.grad_tol = float(grad_tol)
+        exc.max_evals = int(max_evals)
+        exc.n_iter = n_iter
+        exc.objective_value = objective_value
+        exc.checkpoint_encoder_state = {
+            k: v.detach().cpu().numpy().astype(np.float64).copy()
+            for k, v in encoder.state_dict().items()
+        }
+        exc.checkpoint_decoder = np.ascontiguousarray(
+            decoder.weight.detach().cpu().numpy().astype(np.float64)
+        )
+        raise exc
+
+    with torch.no_grad():
+        recon, _, _, aux_val, mech_val = terms()
+        _, _, free_scale = latents()
+    stationarity = grad_inf / grad_inf_init if grad_inf_init > 0.0 else 0.0
+    return (
+        encoder,
+        decoder,
+        float(recon.item()),
+        aux_val + mech_val,
+        np.ascontiguousarray(free_scale.detach().cpu().numpy().astype(np.float64)),
+        float(stationarity),
+        n_iter,
+    )
 
 
 def identifiable_factor_fit(
@@ -647,8 +719,8 @@ def identifiable_factor_fit(
     mech_sparsity_weight: float | None = None,
     aux_prior_weight: float | None = None,
     encoder: str = "mlp[256, 256]",
-    max_iter: int = 400,
-    learning_rate: float = 1.0e-2,
+    max_evals: int = 5000,
+    grad_tol: float = 1.0e-8,
     random_state: int = 0,
     check_identifiability: bool = True,
 ) -> IdentifiableFactorFitResult:
@@ -656,11 +728,12 @@ def identifiable_factor_fit(
 
     The encoder ``E(X) -> (T_sup, T_free)`` produces a real-valued latent
     split. ``T_sup`` is supervised by ``aux`` via an iVAE-style Gaussian
-    auxiliary-conditional prior; ``T_free`` is unsupervised and constrained
-    by a mechanism-sparsity penalty on its decoder rows. Both penalty
-    weights default to the calibrated recipe weights owned by Rust. The
-    resulting single fit is scored by its Gaussian profile log-likelihood at
-    the fitted weights, which is not a marginal likelihood.
+    auxiliary-conditional prior; ``T_free`` is unsupervised, normalized to
+    unit per-column second moment, and constrained by a mechanism-sparsity
+    penalty on its decoder rows. Both penalty weights default to the
+    calibrated recipe weights owned by Rust. The resulting single fit is
+    scored by its Gaussian profile log-likelihood at the fitted weights,
+    which is not a marginal likelihood.
 
     Parameters
     ----------
@@ -681,14 +754,36 @@ def identifiable_factor_fit(
         ``"linear"`` for a single-Linear encoder, or ``"mlp[w1, w2, ...]"``
         for an MLP of widths ``w_i`` with GELU activations and a Linear
         head onto the latent dim.
-    max_iter, learning_rate, random_state : optimiser controls.
+    max_evals : int
+        Budget of objective-and-gradient evaluations for L-BFGS. It is a
+        budget only: the fit stops when the stationarity certificate holds.
+    grad_tol : float
+        Relative stationarity the fit must certify,
+        ``‖∇f(θ̂)‖∞ ≤ grad_tol · ‖∇f(θ₀)‖∞`` over every encoder and decoder
+        parameter, with the same meaning as in
+        :func:`gamfit.gaussian_reml_optimize_latent`.
+    random_state : int
+        Seed of the parameter initialization. The caller's global torch RNG
+        is left untouched.
 
     Returns
     -------
     :class:`IdentifiableFactorFitResult`
-        Fitted latents, profile log-likelihood, decoder, final weights, and a
-        list of precondition warnings (empty if the identifiability
-        theorems' preconditions all hold).
+        Fitted latents at the certified point, profile log-likelihood,
+        decoder, final weights, the achieved ``stationarity`` and ``n_iter``,
+        and the identifiability report.
+
+    Raises
+    ------
+    gamfit.errors.FitConvergenceError
+        The certificate did not hold within ``max_evals`` evaluations. The
+        exception carries ``grad_inf``, ``grad_inf_init``, ``grad_tol``,
+        ``max_evals``, ``n_iter``, ``objective_value``,
+        ``checkpoint_encoder_state`` and ``checkpoint_decoder``.
+    ValueError
+        ``aux`` cannot identify the iVAE conditional prior (Khemakhem
+        2107.10098 Thm. 1: a constant column, or fewer than ``2k + 1``
+        distinct auxiliary states). Raised before any optimization.
 
     Notes
     -----
@@ -705,6 +800,10 @@ def identifiable_factor_fit(
 
     x_np, aux_np = _validate_inputs(X, aux, int(n_supervised), int(n_free))
     hidden_widths = _parse_encoder_spec(encoder)
+    if int(max_evals) < 1:
+        raise ValueError(f"max_evals must be >= 1; got {max_evals}")
+    if not (math.isfinite(float(grad_tol)) and float(grad_tol) > 0.0):
+        raise ValueError(f"grad_tol must be finite and > 0; got {grad_tol}")
 
     try:
         import torch as torch_mod
@@ -720,13 +819,21 @@ def identifiable_factor_fit(
     x_t = torch_mod.as_tensor(x_np, dtype=torch_mod.float64)
     aux_t = torch_mod.as_tensor(aux_np, dtype=torch_mod.float64)
 
-    encoder_module, decoder_module, rss_val, pen_val = _one_fit(
+    (
+        encoder_module,
+        decoder_module,
+        rss_val,
+        pen_val,
+        free_scale,
+        stationarity,
+        n_iter,
+    ) = _one_fit(
         x_t, aux_t, int(n_supervised), int(n_free), hidden_widths,
-        aux_w, mech_w, int(max_iter), float(learning_rate),
+        aux_w, mech_w, int(max_evals), float(grad_tol),
         int(random_state), torch_mod,
     )
-    # Score this one converged fixed-weight fit. The Rust boundary is scalar on
-    # purpose: a 1x1 "grid" is not hyperparameter selection, and sampled
+    # Score this one certified fixed-weight fit. The Rust boundary is scalar
+    # on purpose: a 1x1 "grid" is not hyperparameter selection, and sampled
     # surfaces cannot certify a continuous two-log-weight optimum.
     profile_log_likelihood = float(
         rust_module().identifiable_factor_profile_log_likelihood(
@@ -736,17 +843,11 @@ def identifiable_factor_fit(
         )
     )
 
+    n_sup = int(n_supervised)
     with torch_mod.no_grad():
-        t = encoder_module(x_t)
-        t_sup_np = np.ascontiguousarray(
-            t[:, : int(n_supervised)].detach().cpu().numpy()
-        )
-        t_free_np = np.ascontiguousarray(
-            t[:, int(n_supervised) : int(n_supervised) + int(n_free)]
-            .detach()
-            .cpu()
-            .numpy()
-        )
+        t = encoder_module(x_t).detach().cpu().numpy().astype(np.float64)
+        t_sup_np = np.ascontiguousarray(t[:, :n_sup])
+        t_free_np = np.ascontiguousarray(t[:, n_sup : n_sup + int(n_free)] / free_scale)
         decoder_w = np.ascontiguousarray(
             decoder_module.weight.detach().cpu().numpy().astype(np.float64)
         )
@@ -763,11 +864,14 @@ def identifiable_factor_fit(
     result = IdentifiableFactorFitResult(
         T_supervised=t_sup_np,
         T_free=t_free_np,
+        free_scale=free_scale,
         profile_log_likelihood=float(profile_log_likelihood),
         decoder=decoder_w,
         aux_prior_weight=float(aux_w),
         mech_sparsity_weight=float(mech_w),
         encoder_state=encoder_state,
+        stationarity=float(stationarity),
+        n_iter=int(n_iter),
         aux=aux_np,
         report=None,
     )
