@@ -185,6 +185,41 @@ fn production_objective_forced_streaming_value_gradient_matches_dense() {
     term.atoms[0].basis_second_jet = Some(Arc::new(
         PeriodicHarmonicEvaluator::new(3).expect("periodic evaluator"),
     ));
+    assert_forced_streaming_value_gradient_matches_dense(term, target);
+}
+
+/// #3439 — the periodic phase circle volume on the streaming lane. A prior period of 2 on
+/// the planted circle's 1-periodic harmonic basis leaves the atom outside every exact orbit
+/// (`CompactOrbitLaplaceReason::PeriodMismatch`), so both routes price it by Laplace and the
+/// dense value carries `periodic_phase_marginal`'s `−2·log M(Sᴮ, P) − log Sᵀ + log 2π`. The
+/// streaming value used to omit that correction and its gradient, which moved the two routes'
+/// costs apart by half of it. The same parity as the period-1 pin must hold with it priced.
+#[test]
+fn production_objective_forced_streaming_matches_dense_with_circle_phase_marginal_3439() {
+    gam_runtime::test_support::install_diagnostic_logger();
+    let target = planted_circle_embedded(32, 4, 0.02);
+    let base = planted_circle_seed_term(target.view(), PlantedCircleAssignmentMode::Softmax).0;
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        base.assignment.logits.clone(),
+        vec![base.assignment.coords[0].as_matrix()],
+        vec![LatentManifold::Circle { period: 2.0 }],
+        base.assignment.mode,
+    )
+    .expect("the seed's logits and coordinates describe one circle block");
+    let mut term = SaeManifoldTerm::new(base.atoms.clone(), assignment)
+        .expect("the seed atom and the re-periodized assignment describe the same block");
+    term.atoms[0].basis_second_jet = Some(Arc::new(
+        PeriodicHarmonicEvaluator::new(3).expect("periodic evaluator"),
+    ));
+    assert_forced_streaming_value_gradient_matches_dense(term, target);
+}
+
+/// Prices `term` at its objective's baseline rho once on the dense production route and once
+/// on the forced streaming route, and asserts the two `(value, gradient)` pairs agree.
+fn assert_forced_streaming_value_gradient_matches_dense(
+    term: SaeManifoldTerm,
+    target: Array2<f64>,
+) {
     let seed_rho = SaeManifoldRho::new(0.0, 0.05_f64.ln(), vec![Array1::<f64>::zeros(1)]);
     let mut dense = SaeManifoldOuterObjective::new(
         term.clone(),
