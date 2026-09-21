@@ -374,6 +374,7 @@ fn production_circle_coords_at_seed(
         threshold: 0.0,
         top_k: None,
         random_state,
+        smoothness: 1.0,
         initial_logits: None,
         initial_coords: None,
     })

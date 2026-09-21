@@ -184,6 +184,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         threshold: 0.0,
         top_k: Some(top_k),
         random_state: seed,
+        smoothness: 1.0,
         initial_logits: None,
         initial_coords: None,
     })?;

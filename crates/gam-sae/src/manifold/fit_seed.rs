@@ -429,6 +429,7 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
             request.alpha,
             request.tau,
             request.threshold,
+            smoothness,
         )?;
     }
 

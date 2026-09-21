@@ -404,6 +404,7 @@ fn zz_2691_outer_path_chart_collapse_sweep() {
                     threshold: 0.0,
                     top_k: None,
                     random_state: 20260731,
+                    smoothness: 1.0,
                     initial_logits: None,
                     initial_coords: None,
                 })
@@ -646,6 +647,7 @@ fn zz_2691_collapsed_chart_is_refused_by_the_production_entry() {
         threshold: 0.0,
         top_k: None,
         random_state: 20260731,
+        smoothness: 1.0,
         initial_logits: None,
         initial_coords: None,
     })

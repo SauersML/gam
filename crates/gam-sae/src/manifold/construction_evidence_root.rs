@@ -956,6 +956,7 @@ mod evidence_root_gauge_projection_2822_tests {
             threshold: 0.0,
             top_k: None,
             random_state: 0,
+            smoothness: 1.0,
             initial_logits: None,
             initial_coords: None,
         })

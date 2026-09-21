@@ -70,6 +70,7 @@ fn sae_manifold_fit_minimal<'py>(
         threshold: threshold_gate_threshold,
         top_k,
         random_state,
+        smoothness,
         initial_logits: initial_logits.as_ref().map(|values| values.as_array()),
         initial_coords: initial_coords.as_ref().map(|values| values.as_array()),
     })

@@ -74,7 +74,7 @@ fn two_unequal_circles_plus_dead(
 
 /// Build a fresh K periodic term with the production PCA coordinates and joint
 /// decoder-LSQ seed at the given atom count on the UN-whitened target.
-fn kterm_periodic(target: &Array2<f64>, k: usize, m: usize) -> SaeManifoldTerm {
+fn kterm_periodic(target: &Array2<f64>, k: usize, m: usize, smoothness: f64) -> SaeManifoldTerm {
     let n = target.nrows();
     let p = target.ncols();
     let d = 1usize;
@@ -108,6 +108,8 @@ fn kterm_periodic(target: &Array2<f64>, k: usize, m: usize) -> SaeManifoldTerm {
     let decoder = sae_decoder_lsq_init(
         basis_values.view(),
         &basis_sizes,
+        penalties.view(),
+        smoothness,
         target.view(),
         logits.view(),
         "ordered_beta_bernoulli",
@@ -203,11 +205,12 @@ fn existence_and_intensity_are_separately_identified_1939() {
     let amp_a = 8.0_f64;
     let amp_b = 1.0_f64;
     let target = two_unequal_circles_plus_dead(n, p, amp_a, amp_b, 0.02);
-    let mut term = kterm_periodic(&target, 3, m);
+    const LOG_SMOOTHNESS: f64 = -6.0;
+    let mut term = kterm_periodic(&target, 3, m, LOG_SMOOTHNESS.exp());
 
     let mut rho = SaeManifoldRho::new(
         0.0,
-        -6.0,
+        LOG_SMOOTHNESS,
         vec![
             Array1::<f64>::zeros(1),
             Array1::<f64>::zeros(1),

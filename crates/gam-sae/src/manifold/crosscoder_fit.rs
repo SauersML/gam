@@ -472,6 +472,7 @@ pub fn run_auto_sae_crosscoder_fit(
         threshold: 0.0,
         top_k: None,
         random_state: request.config.random_state,
+        smoothness: request.config.smoothness,
         initial_logits: None,
         initial_coords: None,
     })?;
