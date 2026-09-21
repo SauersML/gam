@@ -203,16 +203,23 @@ def miscalibrated(table: list[Row]) -> list[tuple[Row, str, float | None]]:
     return flagged
 
 
-def failure_lines(table: list[Row]) -> list[str]:
+def failure_lines(table: list[Row], surfaces: tuple[str, ...] | None = None) -> list[str]:
     """One bullet per failed check: the count that failed it and the bound it broke.
 
     This is both the report's "Miscalibrated" section and, for a plan that
     asserts its calibration, the reason the run exits nonzero. One rule, one
     place: a row listed here is exactly a row the run fails on.
+
+    ``surfaces`` restricts WHICH rows are reported, never how they are scored:
+    ``n_checks`` and ``miscalibrated`` always read the WHOLE table, so the
+    Bonferroni split stays the run's own and a filtered gate cannot hold a row to
+    a tighter bound than the report prints beside it.
     """
     checks = n_checks(table)
     lines: list[str] = []
     for r, kind, a in miscalibrated(table):
+        if surfaces is not None and not r.surface.startswith(surfaces):
+            continue
         holes = r.reps - r.usable
         if a is None:
             lines.append(
@@ -247,14 +254,15 @@ def gate_failures(records: list[Record]) -> list[str]:
     p-value is a defect, never a skip -- and ``miscalibrated`` cannot speak for
     it because it has no size to score, so it is listed on its own.
     """
-    table = [r for r in rows(records) if r.surface.startswith("gamfit.")]
+    gam = ("gamfit.",)
+    table = rows(records)
     dead = [
         f"- `{r.cell}` {r.surface}: NO P-VALUE in any of {r.reps} reps; "
         "a missing p-value is a defect of that surface, never a skip"
         for r in table
-        if not r.usable
+        if not r.usable and r.surface.startswith(gam)
     ]
-    return dead + failure_lines(table)
+    return dead + failure_lines(table, surfaces=gam)
 
 
 def _size(r: Row, i: int) -> str:
