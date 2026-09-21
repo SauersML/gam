@@ -1220,3 +1220,51 @@ fn a_lane_refused_beside_a_live_search_retires_at_once_instead_of_waiting_2359()
     assert_eq!(respawned.granted_bytes(), working_set);
     assert_eq!(admission.release(vec![(None::<()>, respawned)]), 0);
 }
+
+/// #3466 — every lane body runs ON a worker of the pool it shares, never on a
+/// thread that submits into that pool from outside it.
+///
+/// This is the mechanism, not a timing proxy. `WorkerThread::find_work` takes
+/// its local job, then steals from other workers, and only then pops the
+/// injector — "finish what we started before we take on something new". So a
+/// lane that is an OS thread calling `par_iter` submits through
+/// `in_worker_cold`'s injector and is served only after every worker has run
+/// out of its own and its peers' work: while one lane's fold still has
+/// splittable work, the jobs the other lanes injected wait for the whole fold.
+/// Measured on the #3011 repro, four lanes reported no progress for the 1174 s
+/// of one lane's batched d2H fold, and a standalone two-submitter proof
+/// reproduced the wait at 1 ms and at 1000 ms leaves alike, so the leaf size is
+/// not the variable.
+///
+/// The residency is what decides it, and residency is observable exactly:
+/// `rayon::current_thread_index()` is `Some` on a worker and `None` off every
+/// pool. A timing assertion would be measuring the scheduler's luck — a waiting
+/// worker may still steal a peer lane's oldest job — where this measures the
+/// property that admits the starvation at all.
+#[test]
+fn every_multistart_lane_runs_on_a_pool_worker_3466() {
+    let (problem, levels) = problem_with_starts(0.0, &[4.0, -2.0]);
+    let seeds = problem.multistart_seeds(None, &levels).expect("seeds");
+    assert!(
+        seeds.len() > 1,
+        "fixture precondition: the starvation needs more than one lane, got {seeds:?}"
+    );
+    let residency = SeedRecords::new(seeds.len());
+    let outcome = problem
+        .run_certified_multistart(&levels, "lane residency", 0, 1, |index, seed_problem, _| {
+            residency.record(index, rayon::current_thread_index());
+            let (outcome, _) =
+                run_fixture_seed(&seed_problem, 1.0, 6.0, std::time::Duration::ZERO);
+            (outcome, ())
+        })
+        .expect("multistart runs");
+    assert_eq!(outcome.outcomes.len(), seeds.len(), "every seed ran");
+    for (index, worker) in residency.all().into_iter().enumerate() {
+        assert!(
+            worker.is_some(),
+            "seed {index} ran its search off every rayon pool, so the parallel work it \
+             issues is injected and served only after the workers exhaust their own and \
+             each other's: that is #3466's starvation"
+        );
+    }
+}
