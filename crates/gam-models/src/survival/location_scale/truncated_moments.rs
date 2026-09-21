@@ -58,7 +58,10 @@
 //! cannot see bias.
 
 use super::*;
-use gam_solve::constrained_posterior::ConstrainedPosteriorJointRule;
+use gam_solve::constrained_posterior::{
+    ConstrainedPosteriorCorrection, ConstrainedPosteriorGeometry, ConstrainedPosteriorJointRule,
+    constrained_posterior_correction_from_covariance,
+};
 
 /// Slack allowed when checking the stored removed variance against the
 /// constraint-normal variance reconstructed here.
@@ -100,15 +103,14 @@ pub(crate) struct TruncatedCoefficientLaw {
     tangent_dimension: usize,
 }
 
-/// Build the truncated law for a fit, or `None` when the fit carries no cone
-/// the reported covariance was truncated against.
+/// Build the truncated law for a fit, or `None` when the law whose second
+/// moment is `covariance` retains no constraint row.
 ///
-/// `covariance` must be the SAME matrix the truncation identity describes — the
-/// conditional posterior covariance `Σ_π`. A caller that selected a different
-/// reporting covariance (the smoothing-corrected one) is reporting a law the
-/// stored cone geometry does not describe, and gets `None` so it keeps the
-/// Gaussian rule it had rather than a mixture built around the wrong second
-/// moment.
+/// `covariance` must be one of the fit's own reported covariances: the
+/// conditional `Σ_π`, or the smoothing-corrected `V_c`, whose truncated law is
+/// rebuilt from the ρ-marginal ambient `Σ + C` (#3524). Any other matrix is
+/// refused. It is never given the Gaussian rule, which would integrate against
+/// coefficient vectors the fit excluded.
 pub(crate) fn build_truncated_coefficient_law(
     fit: &UnifiedFitResult,
     covariance: &Array2<f64>,
@@ -222,6 +224,26 @@ impl TruncatedLawPieces {
     }
 }
 
+/// The pieces of the truncated law whose reported second moment is
+/// `covariance`, or `None` when that law retains no constraint row, so that its
+/// ambient Gaussian IS the posterior.
+///
+/// Two of the fit's reported covariances describe a cone-truncated law. Each is
+/// recognized by identity with the fit's own matrix, never by shape:
+///
+/// * The conditional `Σ_π = Σ − GΔGᵀ`, whose truncation moments the geometry
+///   stores.
+/// * The smoothing-corrected `V_c`, the truncation of the ρ-MARGINAL ambient
+///   `Σ + C`. The feasible set constrains β and says nothing about ρ, so the
+///   β-marginal of the truncated joint posterior is exactly the truncation of
+///   `N(β_unc, Σ + C)` (#2705). The stored moments are not its moments. The
+///   lift `G_c = (Σ+C)AᵀW_c⁻¹` and the orthant moments at `W_c = A(Σ+C)Aᵀ` are
+///   functions of the covariance, so they are rebuilt here from `Σ + C` by the
+///   same construction the fit publishes `V_c` with (#3524).
+///
+/// Any other matrix is the second moment of no law this fit defines, and is
+/// refused. It is never answered with the Gaussian rule, because that would put
+/// mass on coefficient vectors the fit excluded.
 fn truncated_law_pieces(
     fit: &UnifiedFitResult,
     covariance: &Array2<f64>,
@@ -232,166 +254,255 @@ fn truncated_law_pieces(
     let Some(constrained) = geometry.constrained_posterior.as_ref() else {
         return Ok(None);
     };
-    let Some(correction) = constrained.correction()? else {
-        // Every constraint row is slack at f64 resolution: the truncation is
-        // invisible and the ambient Gaussian IS the posterior.
+    let stored = constrained.correction()?;
+    let conditional = fit.beta_covariance();
+
+    if conditional.is_some_and(|conditional| conditional == covariance) {
+        let Some(correction) = stored else {
+            // Every constraint row is slack at f64 resolution: the truncation is
+            // invisible and the ambient Gaussian IS the posterior.
+            return Ok(None);
+        };
+        let frame = ConeFrame::new(geometry, constrained, covariance.nrows())?;
+        let lift = frame.lift(correction)?;
+        frame.certify_conditional_mean(fit, covariance, Some((&lift, correction)))?;
+        let ambient = restore_removed_variance(covariance, &lift, correction);
+        return frame.pieces(constrained, correction, lift, ambient).map(Some);
+    }
+
+    if !fit
+        .beta_covariance_corrected()
+        .is_some_and(|corrected| corrected == covariance)
+    {
+        return Err(
+            "survival location-scale truncated response moments: the covariance reaching this \
+             rule is neither the fit's conditional nor its smoothing-corrected covariance, so \
+             it is the second moment of no cone-truncated law this fit defines"
+                .to_string(),
+        );
+    }
+    let conditional = conditional.ok_or_else(|| {
+        "survival location-scale truncated response moments: the fit reports a \
+         smoothing-corrected covariance but no conditional one, and the corrected truncated \
+         law is built on the conditional ambient covariance"
+            .to_string()
+    })?;
+    let smoothing = fit.smoothing_correction().ok_or_else(|| {
+        match fit.smoothing_correction_absence() {
+            Some(absence) => format!(
+                "survival location-scale truncated response moments: the fit carries no \
+                 smoothing correction to build the corrected truncated law from: {absence}"
+            ),
+            None => "survival location-scale truncated response moments: the fit carries no \
+                     smoothing correction to build the corrected truncated law from"
+                .to_string(),
+        }
+    })?;
+    let raw_dimension = covariance.nrows();
+    if conditional.dim() != (raw_dimension, raw_dimension)
+        || smoothing.dim() != (raw_dimension, raw_dimension)
+    {
+        return Err(format!(
+            "survival location-scale truncated response moments: the smoothing-corrected \
+             covariance is {raw_dimension}x{raw_dimension} but the conditional covariance is \
+             {:?} and the smoothing correction {:?}",
+            conditional.dim(),
+            smoothing.dim()
+        ));
+    }
+    let frame = ConeFrame::new(geometry, constrained, raw_dimension)?;
+    // Recover the conditional ambient `Σ` from `Σ_π` exactly as the conditional
+    // branch does, certifying the frame against the reported coefficients first.
+    // The corrected law's own mean is not the reported vector, so this
+    // certification is the one the corrected law inherits.
+    let conditional_ambient = match stored {
+        Some(correction) => {
+            let lift = frame.lift(correction)?;
+            frame.certify_conditional_mean(fit, conditional, Some((&lift, correction)))?;
+            restore_removed_variance(conditional, &lift, correction)
+        }
+        None => {
+            frame.certify_conditional_mean(fit, conditional, None)?;
+            conditional.clone()
+        }
+    };
+    // `V_c = V_cond + C` is published on the same gauge lift as the conditional
+    // covariance, so the raw `C` adds to the raw ambient directly and reduces
+    // to the active frame through the same exact pseudo-inverse.
+    let ambient = &conditional_ambient + smoothing;
+    let unconstrained_center = constrained.unconstrained_center()?;
+    let marginal = constrained_posterior_correction_from_covariance(
+        &frame.reduce(&ambient),
+        unconstrained_center,
+        &constrained.constraints,
+    )?;
+    let Some(correction) = marginal else {
+        if stored.is_some() {
+            // `C = J·V_ρ·Jᵀ` is PSD, so `W_c ⪰ W`, and a row retained at the
+            // conditional law's standardized slack is retained at the corrected
+            // one. Reaching this means the correction is not what `V_c` was built
+            // from, and the Gaussian rule the caller holds is centred on the
+            // conditional truncated mean, which is not this law's mean.
+            return Err(
+                "survival location-scale truncated response moments: the conditional law \
+                 retains constraint rows but the smoothing-corrected law, whose ambient \
+                 covariance is wider, retains none; the smoothing correction is not the one \
+                 the corrected covariance was built from"
+                    .to_string(),
+            );
+        }
         return Ok(None);
     };
-    // The cone geometry describes the conditional posterior. If the caller
-    // selected another covariance, the mixture below would carry the cone of
-    // one law and the spread of another.
-    match fit.beta_covariance() {
-        Some(conditional) if conditional == covariance => {}
-        _ => return Ok(None),
-    }
+    let lift = frame.lift(&correction)?;
+    frame.pieces(constrained, &correction, lift, ambient).map(Some)
+}
 
-    let transform = &geometry.coefficient_gauge.t_full;
-    let raw_dimension = covariance.nrows();
-    if transform.nrows() != raw_dimension {
-        return Err(format!(
-            "survival location-scale truncated response moments: the coefficient gauge lifts \
-             into {} raw coordinates but the reported covariance is {raw_dimension}x{raw_dimension}",
-            transform.nrows()
-        ));
-    }
-    let active_dimension = transform.ncols();
-    let unconstrained_center = constrained.unconstrained_center()?;
-    if unconstrained_center.len() != active_dimension {
-        return Err(format!(
-            "survival location-scale truncated response moments: the ambient centre has {} \
-             coordinates but the gauge reduces to {active_dimension}",
-            unconstrained_center.len()
-        ));
-    }
-    if correction.lift.nrows() != active_dimension {
-        return Err(format!(
-            "survival location-scale truncated response moments: the correction lift has {} \
-             rows but the gauge reduces to {active_dimension}",
-            correction.lift.nrows()
-        ));
-    }
-
-    let retained = correction.rows.len();
-    let lift_matrix = transform.dot(&correction.lift);
-    let center = transform.dot(unconstrained_center) + &geometry.coefficient_gauge.affine_shift;
-
-    let mut normal_center = Array1::<f64>::zeros(retained);
-    let mut constraint_rows = Array2::<f64>::zeros((retained, active_dimension));
-    for (position, &row) in correction.rows.iter().enumerate() {
-        let a = constrained.constraints.a.row(row);
-        normal_center[position] = a.dot(unconstrained_center) - constrained.constraints.b[row];
-        constraint_rows.row_mut(position).assign(&a);
-    }
-
-    // The ambient covariance in RAW coordinates. `Σ_π = Σ − GΔGᵀ` is the
-    // identity the correction stores, and both `G` and `Δ` push forward through
-    // the gauge with the covariance, so this inverts it exactly rather than
-    // recomputing a second ambient from a precision that may not be the one the
-    // correction was built against.
-    let ambient = {
-        let scaled = lift_matrix.dot(&correction.removed_normal_variance);
-        let mut out = covariance.clone();
-        for i in 0..raw_dimension {
-            for j in 0..=i {
-                let restored = scaled.row(i).dot(&lift_matrix.row(j));
-                out[[i, j]] += restored;
-                if i != j {
-                    out[[j, i]] = out[[i, j]];
-                }
-            }
-        }
-        out
-    };
-
-    // `W = AΣAᵀ` lives in the ACTIVE frame while the covariance we hold is the
-    // raw lift of it. `Tᵀ` is surjective onto the active frame (the gauge has
-    // full column rank), so every active row `a` has an exact raw
-    // representative `c = T(TᵀT)⁻¹a` with `Tᵀc = a`, and then
-    // `aᵀΣ_active a = cᵀ(TΣ_activeTᵀ)c`. This is a change of representative,
-    // not an approximation.
-    let gram = transform.t().dot(transform);
-    let (eigenvalues, eigenvectors) = gram
-        .eigh(faer::Side::Lower)
-        .map_err(|e| format!("survival location-scale gauge Gram eigendecomposition failed: {e}"))?;
-    let max_eigenvalue = eigenvalues
-        .iter()
-        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
-    // A Gram eigenvalue inside the eigensolver's rounding band `γ_p·max|λ|` is a
-    // rank-deficient gauge direction.
-    let floor = gam_linalg::roundoff::accumulation_growth(eigenvalues.len()) * max_eigenvalue;
-    if eigenvalues.iter().any(|&value| value <= floor) {
-        return Err(format!(
-            "survival location-scale truncated response moments: the coefficient gauge is rank \
-             deficient (smallest Gram eigenvalue {:.3e} against floor {floor:.3e}), so the \
-             constraint rows have no raw representative",
-            eigenvalues
-                .iter()
-                .fold(f64::INFINITY, |acc, &value| acc.min(value))
-        ));
-    }
-    let mut gram_inverse = Array2::<f64>::zeros((active_dimension, active_dimension));
-    for (column, &eigenvalue) in eigenvalues.iter().enumerate() {
-        let vector = eigenvectors.column(column);
-        for i in 0..active_dimension {
-            for j in 0..active_dimension {
-                gram_inverse[[i, j]] += vector[i] * vector[j] / eigenvalue;
+/// `Σ = Σ_π + GΔGᵀ` in RAW coordinates, with `lift = TG`. This is the identity
+/// the correction stores, and both `G` and `Δ` push forward through the gauge
+/// with the covariance, so this inverts it exactly. It does not recompute a
+/// second ambient from a precision that may not be the one the correction was
+/// built against.
+fn restore_removed_variance(
+    truncated: &Array2<f64>,
+    lift: &Array2<f64>,
+    correction: &ConstrainedPosteriorCorrection,
+) -> Array2<f64> {
+    let raw_dimension = truncated.nrows();
+    let scaled = lift.dot(&correction.removed_normal_variance);
+    let mut out = truncated.clone();
+    for i in 0..raw_dimension {
+        for j in 0..=i {
+            let restored = scaled.row(i).dot(&lift.row(j));
+            out[[i, j]] += restored;
+            if i != j {
+                out[[j, i]] = out[[i, j]];
             }
         }
     }
-    let pulled_rows = constraint_rows.dot(&gram_inverse).dot(&transform.t());
-    let normal_covariance = pulled_rows.dot(&ambient).dot(&pulled_rows.t());
+    out
+}
 
-    // `Σ_res = Σ − GWGᵀ`. The constraint-normal block is removed exactly, so
-    // the tangent moves no constraint normal and every point of the rule below
-    // is feasible.
-    let residual_covariance = {
-        let scaled = lift_matrix.dot(&normal_covariance);
-        let mut out = ambient.clone();
-        for i in 0..raw_dimension {
-            for j in 0..=i {
-                let removed = scaled.row(i).dot(&lift_matrix.row(j));
-                out[[i, j]] -= removed;
-                if i != j {
-                    out[[j, i]] = out[[i, j]];
-                }
-            }
-        }
-        symmetrize_and_clip_covariance(&out)
-    };
+/// The map between the ACTIVE frame the cone lives in and the RAW frame the
+/// reported covariances and the response-moment rule live in.
+struct ConeFrame<'a> {
+    transform: &'a Array2<f64>,
+    /// `(TᵀT)⁻¹`, exact because the gauge has full column rank.
+    gram_inverse: Array2<f64>,
+    /// `β_unc` in raw coordinates.
+    center: Array1<f64>,
+}
 
-    // Two guards that are free to fail, and that fail loudly if the pieces
-    // above were assembled in different frames or at different scales.
-    //
-    // (1) `Δ = W − Cov[u]` with both PSD, so `0 ≤ Δ_kk ≤ W_kk`. `Δ` is READ
-    //     from the stored correction while `W` is RECONSTRUCTED here from the
-    //     reported covariance, so this compares two independently-produced
-    //     numbers: a covariance that reached us on a different scale than the
-    //     one the correction was built on breaks it immediately, where a
-    //     ratio-shaped check would cancel the scale and read clean.
-    for k in 0..retained {
-        let removed = correction.removed_normal_variance[[k, k]];
-        let total = normal_covariance[[k, k]];
-        let slack = ORTHANT_REMOVED_VARIANCE_SLACK * total.abs().max(removed.abs());
-        if !(removed >= -slack && removed <= total + slack) {
+impl<'a> ConeFrame<'a> {
+    fn new(
+        geometry: &'a FitGeometry,
+        constrained: &ConstrainedPosteriorGeometry,
+        raw_dimension: usize,
+    ) -> Result<Self, String> {
+        let transform = &geometry.coefficient_gauge.t_full;
+        if transform.nrows() != raw_dimension {
             return Err(format!(
-                "survival location-scale truncated response moments: the stored removed variance \
-                 {removed:.6e} on retained row {k} is not within [0, {total:.6e}], the \
-                 constraint-normal variance reconstructed from the reported covariance; the \
-                 covariance reaching this rule is not the one the cone correction was built \
-                 against"
+                "survival location-scale truncated response moments: the coefficient gauge lifts \
+                 into {} raw coordinates but the reported covariance is \
+                 {raw_dimension}x{raw_dimension}",
+                transform.nrows()
             ));
         }
+        let active_dimension = transform.ncols();
+        let unconstrained_center = constrained.unconstrained_center()?;
+        if unconstrained_center.len() != active_dimension {
+            return Err(format!(
+                "survival location-scale truncated response moments: the ambient centre has {} \
+                 coordinates but the gauge reduces to {active_dimension}",
+                unconstrained_center.len()
+            ));
+        }
+        let center =
+            transform.dot(unconstrained_center) + &geometry.coefficient_gauge.affine_shift;
+
+        let gram = transform.t().dot(transform);
+        let (eigenvalues, eigenvectors) = gram.eigh(faer::Side::Lower).map_err(|e| {
+            format!("survival location-scale gauge Gram eigendecomposition failed: {e}")
+        })?;
+        let max_eigenvalue = eigenvalues
+            .iter()
+            .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+        // A Gram eigenvalue inside the eigensolver's rounding band `γ_p·max|λ|`
+        // is a rank-deficient gauge direction.
+        let floor = gam_linalg::roundoff::accumulation_growth(eigenvalues.len()) * max_eigenvalue;
+        if eigenvalues.iter().any(|&value| value <= floor) {
+            return Err(format!(
+                "survival location-scale truncated response moments: the coefficient gauge is \
+                 rank deficient (smallest Gram eigenvalue {:.3e} against floor {floor:.3e}), so \
+                 the constraint rows have no raw representative",
+                eigenvalues
+                    .iter()
+                    .fold(f64::INFINITY, |acc, &value| acc.min(value))
+            ));
+        }
+        let mut gram_inverse = Array2::<f64>::zeros((active_dimension, active_dimension));
+        for (column, &eigenvalue) in eigenvalues.iter().enumerate() {
+            let vector = eigenvectors.column(column);
+            for i in 0..active_dimension {
+                for j in 0..active_dimension {
+                    gram_inverse[[i, j]] += vector[i] * vector[j] / eigenvalue;
+                }
+            }
+        }
+        Ok(Self {
+            transform,
+            gram_inverse,
+            center,
+        })
     }
-    // (2) `E_π[β] = β_unc + G·(E[u] − E_untrunc[u])` must reproduce the
-    //     coefficient vector the fit reports, in the RAW frame. This is what
-    //     certifies the gauge lift of the centre and of the correction lift
-    //     together; an absolute magnitude, not a ratio.
-    let reported = fit.beta.clone();
-    if reported.len() == raw_dimension {
-        let reconstructed = &center + &lift_matrix.dot(&correction.normal_mean_shift);
+
+    /// `TG`, the raw displacement per unit of constraint-normal displacement.
+    fn lift(&self, correction: &ConstrainedPosteriorCorrection) -> Result<Array2<f64>, String> {
+        if correction.lift.nrows() != self.transform.ncols() {
+            return Err(format!(
+                "survival location-scale truncated response moments: the correction lift has {} \
+                 rows but the gauge reduces to {}",
+                correction.lift.nrows(),
+                self.transform.ncols()
+            ));
+        }
+        Ok(self.transform.dot(&correction.lift))
+    }
+
+    /// `T⁺ M T⁺ᵀ` with `T⁺ = (TᵀT)⁻¹Tᵀ`: a raw bilinear form carried back into
+    /// the active frame. This is exact for every form saved as the gauge
+    /// congruence `T M_active Tᵀ`, which is how every covariance-like matrix
+    /// of this fit is published.
+    fn reduce(&self, raw: &Array2<f64>) -> Array2<f64> {
+        let pseudo_inverse = self.gram_inverse.dot(&self.transform.t());
+        let reduced = pseudo_inverse.dot(raw).dot(&pseudo_inverse.t());
+        // The congruence of a symmetric form is symmetric; averaging with the
+        // transpose only removes the rounding of the two products.
+        (&reduced + &reduced.t()) * 0.5
+    }
+
+    /// `E_π[β] = β_unc + TG·(E[u] − E_untrunc[u])` must reproduce the
+    /// coefficient vector the fit reports, in the RAW frame, under the
+    /// conditional law the fit reports it for. This certifies the gauge lift of
+    /// the centre and of the correction lift together. It is an absolute
+    /// magnitude, not a ratio.
+    fn certify_conditional_mean(
+        &self,
+        fit: &UnifiedFitResult,
+        conditional: &Array2<f64>,
+        truncation: Option<(&Array2<f64>, &ConstrainedPosteriorCorrection)>,
+    ) -> Result<(), String> {
+        let reported = &fit.beta;
+        let raw_dimension = self.center.len();
+        if reported.len() != raw_dimension {
+            return Ok(());
+        }
+        let reconstructed = match truncation {
+            Some((lift, correction)) => &self.center + &lift.dot(&correction.normal_mean_shift),
+            None => self.center.clone(),
+        };
         let mut worst = 0.0f64;
         for j in 0..raw_dimension {
-            let scale = covariance[[j, j]].max(0.0).sqrt().max(f64::MIN_POSITIVE);
+            let scale = conditional[[j, j]].max(0.0).sqrt().max(f64::MIN_POSITIVE);
             worst = worst.max((reported[j] - reconstructed[j]).abs() / scale);
         }
         if worst > COEFFICIENT_RECONSTRUCTION_SD_TOLERANCE {
@@ -402,16 +513,91 @@ fn truncated_law_pieces(
                  centre and the correction lift are not in the frame the reported coefficients are"
             ));
         }
+        Ok(())
     }
 
-    Ok(Some(TruncatedLawPieces {
-        center,
-        lift: lift_matrix,
-        normal_center,
-        normal_covariance,
-        residual_covariance,
-        upper_limits: correction.upper_limits(),
-    }))
+    /// The law's pieces from its truncation `correction`, the correction's raw
+    /// `lift` and the law's raw AMBIENT covariance.
+    fn pieces(
+        &self,
+        constrained: &ConstrainedPosteriorGeometry,
+        correction: &ConstrainedPosteriorCorrection,
+        lift: Array2<f64>,
+        ambient: Array2<f64>,
+    ) -> Result<TruncatedLawPieces, String> {
+        let raw_dimension = ambient.nrows();
+        let active_dimension = self.transform.ncols();
+        let unconstrained_center = constrained.unconstrained_center()?;
+        let retained = correction.rows.len();
+
+        let mut normal_center = Array1::<f64>::zeros(retained);
+        let mut constraint_rows = Array2::<f64>::zeros((retained, active_dimension));
+        for (position, &row) in correction.rows.iter().enumerate() {
+            let a = constrained.constraints.a.row(row);
+            normal_center[position] =
+                a.dot(unconstrained_center) - constrained.constraints.b[row];
+            constraint_rows.row_mut(position).assign(&a);
+        }
+
+        // `W = AΣAᵀ` lives in the ACTIVE frame while the covariance we hold is
+        // the raw lift of it. `Tᵀ` is surjective onto the active frame (the
+        // gauge has full column rank), so every active row `a` has an exact raw
+        // representative `c = T(TᵀT)⁻¹a` with `Tᵀc = a`, and then
+        // `aᵀΣ_active a = cᵀ(TΣ_activeTᵀ)c`. This is a change of representative,
+        // not an approximation.
+        let pulled_rows = constraint_rows
+            .dot(&self.gram_inverse)
+            .dot(&self.transform.t());
+        let normal_covariance = pulled_rows.dot(&ambient).dot(&pulled_rows.t());
+
+        // `Σ_res = Σ − GWGᵀ`. The constraint-normal block is removed exactly,
+        // so the tangent moves no constraint normal and every point of the rule
+        // below is feasible.
+        let residual_covariance = {
+            let scaled = lift.dot(&normal_covariance);
+            let mut out = ambient;
+            for i in 0..raw_dimension {
+                for j in 0..=i {
+                    let removed = scaled.row(i).dot(&lift.row(j));
+                    out[[i, j]] -= removed;
+                    if i != j {
+                        out[[j, i]] = out[[i, j]];
+                    }
+                }
+            }
+            symmetrize_and_clip_covariance(&out)
+        };
+
+        // `Δ = W − Cov[u]` with both PSD, so `0 ≤ Δ_kk ≤ W_kk`. `Δ` is READ from
+        // the correction while `W` is RECONSTRUCTED here from the raw ambient
+        // covariance, so this compares two independently-produced numbers. A
+        // covariance that reached us on a different scale than the one the
+        // correction was built on breaks it immediately, where a ratio-shaped
+        // check would cancel the scale and read clean.
+        for k in 0..retained {
+            let removed = correction.removed_normal_variance[[k, k]];
+            let total = normal_covariance[[k, k]];
+            let slack = ORTHANT_REMOVED_VARIANCE_SLACK * total.abs().max(removed.abs());
+            if !(removed >= -slack && removed <= total + slack) {
+                return Err(format!(
+                    "survival location-scale truncated response moments: the removed variance \
+                     {removed:.6e} on retained row {k} is not within [0, {total:.6e}], the \
+                     constraint-normal variance reconstructed from the reported covariance; the \
+                     covariance reaching this rule is not the one the cone correction was built \
+                     against"
+                ));
+            }
+        }
+
+        Ok(TruncatedLawPieces {
+            center: self.center.clone(),
+            lift,
+            normal_center,
+            normal_covariance,
+            residual_covariance,
+            upper_limits: correction.upper_limits(),
+        })
+    }
 }
 
 /// Everything one row's response moment reads that does not move with the node:
@@ -1007,9 +1193,6 @@ pub(crate) fn replicate_standard_error(estimates: &[f64]) -> f64 {
 mod tests {
     use super::*;
     use gam_problem::gauge::Gauge;
-    use gam_solve::constrained_posterior::{
-        ConstrainedPosteriorGeometry, constrained_posterior_correction_from_covariance,
-    };
     use ndarray::array;
 
     /// Knots and degree for a link-wiggle block of the requested width, taken
@@ -1391,5 +1574,204 @@ mod tests {
                 truncated_mean[0]
             );
         }
+    }
+
+    /// #3524: under the smoothing-corrected covariance a cone-truncated fit's
+    /// coefficient posterior is the truncation of the ρ-marginal
+    /// `N(β_unc, Σ + C)`. The truncated rule must be built for that law. It
+    /// used to be declined, which sent `--covariance-mode corrected` to the
+    /// Gaussian rule on a law the fit truncated.
+    ///
+    /// The pieces must be that law's own. Its lift `G_c = (Σ+C)AᵀW_c⁻¹` and its
+    /// constraint-normal spread `W_c = A(Σ+C)Aᵀ` are rebuilt at `Σ + C`, not
+    /// read from the stored conditional moments. The certificate is the law's
+    /// second moment: `Σ_res + G_c(W_c − Δ_c)G_cᵀ` must reproduce the published
+    /// `V_c` for the corrected law, exactly as it reproduces `Σ_π` for the
+    /// conditional one. A covariance that is neither reported matrix is the
+    /// second moment of no law this fit defines, and must be refused rather
+    /// than integrated as a Gaussian.
+    #[test]
+    fn smoothing_corrected_covariance_gets_its_own_truncated_law_3524() {
+        let (knots, degree) = wiggle_metadata(2);
+        let f = array![
+            [0.30, 0.00, 0.00, 0.00],
+            [0.10, 0.25, 0.00, 0.00],
+            [0.22, 0.12, 0.26, 0.00],
+            [0.18, 0.14, 0.10, 0.24],
+        ];
+        let block = f.dot(&f.t());
+        let mut ambient = Array2::<f64>::zeros((8, 8));
+        for i in 0..2 {
+            for j in 0..2 {
+                ambient[[i, j]] = block[[i, j]];
+                ambient[[i, 6 + j]] = block[[i, 2 + j]];
+                ambient[[6 + j, i]] = block[[2 + j, i]];
+                ambient[[6 + i, 6 + j]] = block[[2 + i, 2 + j]];
+            }
+        }
+        let center = array![0.40, -0.10, 0.20, 0.30, -0.50, 0.10, 0.04, -0.09];
+        let constraints = gam_problem::LinearInequalityConstraints::new(
+            array![
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+            ],
+            array![0.0, 0.0],
+        )
+        .expect("two-row link-wiggle non-negativity cone");
+        let conditional =
+            constrained_posterior_correction_from_covariance(&ambient, &center, &constraints)
+                .expect("the conditional correction is computable on this face")
+                .expect("a centre straddling both walls must retain the face");
+        let sigma_pi = conditional.apply_to_covariance(&ambient);
+        let beta_pi = conditional.posterior_mean(&center);
+
+        // `C = K Kᵀ`, PSD as the first-order `J·V_ρ·Jᵀ` is, loading on the time
+        // AND the wiggle blocks so that it moves both the lift and the
+        // constraint-normal spread.
+        let k = array![
+            [0.20, 0.00],
+            [0.05, 0.10],
+            [0.00, 0.00],
+            [0.00, 0.00],
+            [0.00, 0.00],
+            [0.00, 0.00],
+            [0.12, 0.04],
+            [0.03, 0.15],
+        ];
+        let smoothing = k.dot(&k.t());
+        let marginal_ambient = &ambient + &smoothing;
+        let marginal = constrained_posterior_correction_from_covariance(
+            &marginal_ambient,
+            &center,
+            &constraints,
+        )
+        .expect("the corrected correction is computable on this face")
+        .expect("a wider ambient keeps both rows retained");
+        let corrected = marginal.apply_to_covariance(&marginal_ambient);
+
+        let mut fit = survival_fit_from_parts(SurvivalLocationScaleFitResultParts {
+            training_sample_size: 32,
+            log_lambdas: Array1::zeros(0),
+            beta_time: beta_pi.slice(s![0..2]).to_owned(),
+            beta_threshold: beta_pi.slice(s![2..4]).to_owned(),
+            beta_log_sigma: beta_pi.slice(s![4..6]).to_owned(),
+            beta_link_wiggle: Some(beta_pi.slice(s![6..8]).to_owned()),
+            link_wiggle_knots: Some(knots),
+            link_wiggle_degree: Some(degree),
+            lambdas_time: Array1::zeros(0),
+            lambdas_threshold: Array1::zeros(0),
+            lambdas_log_sigma: Array1::zeros(0),
+            lambdas_linkwiggle: Some(Array1::zeros(0)),
+            log_likelihood: 0.0,
+            reml_score: Some(0.0),
+            stable_penalty_term: 0.0,
+            penalized_objective: Some(0.0),
+            used_device: false,
+            outer_iterations: 0,
+            outer_gradient_norm: None,
+            criterion_certificate: None,
+            outer_converged: true,
+            covariance_conditional: Some(sigma_pi.clone()),
+            covariance_corrected: Some(corrected.clone()),
+            smoothing_correction: Some((
+                smoothing.clone(),
+                gam_solve::model_types::SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
+                    active_rank: 2,
+                    rho_dimension: 2,
+                },
+            )),
+            smoothing_correction_absence: None,
+            geometry: Some(FitGeometry {
+                coefficient_gauge: Gauge::identity(&[2, 2, 2, 2]),
+                penalized_hessian: Array2::<f64>::eye(8).into(),
+                constrained_posterior: Some(ConstrainedPosteriorGeometry::with_moments(
+                    constraints.clone(),
+                    beta_pi.clone(),
+                    center.clone(),
+                    Some(conditional.clone()),
+                )),
+                working: None,
+            }),
+            penalty_block_trace: Vec::new(),
+            edf_by_block: Vec::new(),
+            edf_rank_bound: Vec::new(),
+            coefficient_mode_selection: Default::default(),
+        })
+        .expect("valid survival test fit");
+        fit.covariance_conditional = Some(sigma_pi.clone());
+        fit.covariance_corrected = Some(corrected.clone());
+
+        let max_gap = |left: &Array2<f64>, right: &Array2<f64>| {
+            left.iter()
+                .zip(right.iter())
+                .fold(0.0_f64, |acc, (a, b)| acc.max((a - b).abs()))
+        };
+        // `Σ_res + G(W − Δ)Gᵀ`, the second moment the pieces carry.
+        let second_moment = |pieces: &TruncatedLawPieces, removed: &Array2<f64>| {
+            let spread = &pieces.normal_covariance - removed;
+            &pieces.residual_covariance + &pieces.lift.dot(&spread).dot(&pieces.lift.t())
+        };
+
+        let conditional_pieces = truncated_law_pieces(&fit, &sigma_pi)
+            .expect("conditional law pieces")
+            .expect("the conditional law retains the face");
+        let corrected_pieces = truncated_law_pieces(&fit, &corrected)
+            .expect("corrected law pieces")
+            .expect(
+                "the smoothing-corrected law of a cone-truncated fit is truncated too; it must \
+                 not be declined into the Gaussian rule",
+            );
+
+        let conditional_gap = max_gap(
+            &second_moment(&conditional_pieces, &conditional.removed_normal_variance),
+            &sigma_pi,
+        );
+        let corrected_gap = max_gap(
+            &second_moment(&corrected_pieces, &marginal.removed_normal_variance),
+            &corrected,
+        );
+        assert!(
+            conditional_gap <= 1e-12 && corrected_gap <= 1e-12,
+            "each law's pieces must reproduce its own published covariance: conditional gap \
+             {conditional_gap:.3e}, corrected gap {corrected_gap:.3e}"
+        );
+
+        // The corrected law carries its own lift and constraint-normal spread,
+        // and they are not the stored conditional ones.
+        let lift_gap = max_gap(&corrected_pieces.lift, &marginal.lift);
+        assert!(
+            lift_gap <= 1e-12,
+            "the corrected lift must be G_c = (Σ+C)AᵀW_c⁻¹, off by {lift_gap:.3e}"
+        );
+        let expected_spread = constraints
+            .a
+            .dot(&marginal_ambient)
+            .dot(&constraints.a.t());
+        let spread_gap = max_gap(&corrected_pieces.normal_covariance, &expected_spread);
+        assert!(
+            spread_gap <= 1e-12,
+            "the corrected constraint-normal spread must be A(Σ+C)Aᵀ, off by {spread_gap:.3e}"
+        );
+        let moved = max_gap(&corrected_pieces.lift, &conditional_pieces.lift);
+        assert!(
+            moved > 1e-2,
+            "the fixture's C must move the lift, or the test measures nothing (moved {moved:.3e})"
+        );
+
+        assert!(
+            build_truncated_coefficient_draws(&fit, &corrected)
+                .expect("corrected draws")
+                .is_some(),
+            "the corrected covariance must reach the truncated-law survival rule"
+        );
+
+        let foreign = &corrected * 1.5;
+        let refusal = truncated_law_pieces(&fit, &foreign).err().expect(
+            "a covariance that is neither the conditional nor the corrected one must be refused",
+        );
+        assert!(
+            refusal.contains("neither the fit's conditional nor its smoothing-corrected"),
+            "unexpected refusal: {refusal}"
+        );
     }
 }
