@@ -772,15 +772,11 @@ pub(crate) struct MovingLawCandidates {
 
 fn probabilists_gauss_hermite(nodes: usize) -> Result<EmpiricalZGrid, MovingLawError> {
     let law = |reason: String| MovingLawError::Law { what: "Gauss-Hermite law", reason };
-    let rule =
-        gam_math::quadrature::gauss_hermite_rule(nodes).map_err(|error| law(error.to_string()))?;
-    let root_pi = std::f64::consts::PI.sqrt();
-    EmpiricalZGrid::new(
-        rule.nodes.iter().map(|&x| std::f64::consts::SQRT_2 * x).collect(),
-        rule.weights.iter().map(|&w| w / root_pi).collect(),
-        "moving-law certificate Gauss-Hermite law",
-    )
-    .map_err(law)
+    let (nodes, weights) = gam_math::quadrature::standard_normal_gauss_hermite_rule(nodes)
+        .map_err(|error| law(error.to_string()))?
+        .into_iter()
+        .unzip();
+    EmpiricalZGrid::new(nodes, weights, "moving-law certificate Gauss-Hermite law").map_err(law)
 }
 
 fn location_at(

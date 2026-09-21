@@ -54,15 +54,8 @@ pub(crate) fn skewed_grid() -> EmpiricalZGrid {
 /// The probabilists' Gauss–Hermite law: the finite law on which the mixture
 /// anchor is the Gaussian closed form to quadrature tolerance.
 pub(crate) fn hermite_grid(m: usize) -> EmpiricalZGrid {
-    let rule = gam_math::quadrature::gauss_hermite_rule(m)
+    let pairs = gam_math::quadrature::standard_normal_gauss_hermite_rule(m)
         .expect("the test orders are positive Gauss-Hermite orders");
-    let mut pairs: Vec<(f64, f64)> = rule
-        .nodes
-        .iter()
-        .zip(&rule.weights)
-        .map(|(&x, &w)| (std::f64::consts::SQRT_2 * x, w / std::f64::consts::PI.sqrt()))
-        .collect();
-    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
     let total: f64 = pairs.iter().map(|p| p.1).sum();
     EmpiricalZGrid::new(
         pairs.iter().map(|p| p.0).collect(),

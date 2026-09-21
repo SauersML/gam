@@ -47,7 +47,7 @@ use gam_math::gaussian_activation::{
     pair_kernel,
 };
 use gam_math::probability::normal_pdf;
-use gam_math::quadrature::{QuadratureError, gauss_hermite_rule};
+use gam_math::quadrature::{QuadratureError, standard_normal_gauss_hermite_rule};
 use gam_runtime::resource::{Governed, MemoryGovernor, MemoryReservation, MemoryReservationError};
 use ndarray::linalg::general_mat_vec_mul;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
@@ -1524,21 +1524,13 @@ pub struct GaussianRule {
 }
 
 impl GaussianRule {
-    /// Converts gam-math's physicists' rule (`x ↦ √2 x`, `w ↦ w/√π`) and certifies it against
-    /// the zeros of `He_m` and the Christoffel numbers.
+    /// Takes gam-math's standard-normal rule and certifies it against the zeros of `He_m` and
+    /// the Christoffel numbers.
     pub fn with_node_count(node_count: usize) -> Result<Self, HermiteError> {
-        let physicists = gauss_hermite_rule(node_count).map_err(HermiteError::Quadrature)?;
-        let sqrt_pi = std::f64::consts::PI.sqrt();
-        let nodes = physicists
-            .nodes
-            .iter()
-            .map(|node| std::f64::consts::SQRT_2 * node)
-            .collect::<Vec<_>>();
-        let weights = physicists
-            .weights
-            .iter()
-            .map(|weight| weight / sqrt_pi)
-            .collect::<Vec<_>>();
+        let (nodes, weights): (Vec<f64>, Vec<f64>) = standard_normal_gauss_hermite_rule(node_count)
+            .map_err(HermiteError::Quadrature)?
+            .into_iter()
+            .unzip();
         let mut functions = vec![0.0; node_count + 1];
         let mut node_residual = 0.0_f64;
         let mut weight_residual = 0.0_f64;
