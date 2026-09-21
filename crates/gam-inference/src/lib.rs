@@ -15,6 +15,7 @@ pub use gam_solve::inference::alo;
 pub mod certificate_impls;
 pub mod certificates;
 pub mod coefficient_layout;
+pub mod debiased_functional;
 pub use gam_problem::diagnostics;
 pub use gam_problem::dispersion_cov;
 pub use gam_sae::inference::checkpoint_dynamics;

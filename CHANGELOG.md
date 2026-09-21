@@ -1,5 +1,27 @@
 ## Unreleased
 
+- **The debiased-functional estimator is a library entry point, not FFI code** (gam#4550,
+  gam#3542).
+  `Model.debiased_functional`'s whole estimator chain lived inside
+  `gam-pyffi`'s `model_debiased_functional_dataset_json_impl`: the training-row
+  materialization, the design rebuild, the recovery of `H = XᵀWX + S(λ)` with its
+  weighted-Gram fallback, the prior-weighted Gaussian row scores, and the dispatch over
+  target functionals. None of that is a binding concern, and living there it could not be
+  reached by the CLI, could only be exercised through a Python build, and kept a
+  hand-derived Gaussian score beside the engine's own weight convention -- which is how
+  #3542 happened. It is now `gam::inference::debiased_functional::debiased_functional`,
+  which takes a fitted model, the materialization config, the training rows and a typed
+  target and returns a typed report. The #3542 contract moves with it and becomes a check
+  rather than a convention: a materialization whose weight or offset column is not the
+  fit's own is REFUSED, because replaying a `weights="w"` fit with unit weights makes the
+  scores and the Gram describe a different model than the saved `H` and `β` and moves the
+  reported standard error by the weight scale. `gam-pyffi` keeps exactly the two things
+  that are a binding concern: reading the request JSON, and encoding a query frame into a
+  design row under the Python frame conventions it owns, including resolving a
+  `deriv_var` column NAME against the frame. Choosing the derivative column when no name
+  is given is a property of the model, so it moved with the estimator. The pyffi handler
+  is about 300 lines shorter and every number it reports is the library's.
+
 - **One error variant was reporting four different failures, with a condition number no
   producer ever computed** (gam#4468).
   `EstimationError::ModelIsIllConditioned { condition_number }` was constructed at 38

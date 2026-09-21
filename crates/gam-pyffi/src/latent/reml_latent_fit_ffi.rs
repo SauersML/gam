@@ -3724,35 +3724,34 @@ fn debiased_functional_weights(
         .map(|weights| Some(ndarray::Array1::from(weights)))
 }
 
-fn weighted_affine_mean(
-    values: ndarray::ArrayView1<'_, f64>,
-    weights: Option<ndarray::ArrayView1<'_, f64>>,
-    label: &str,
-) -> Result<f64, String> {
-    if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
-        return Err(format!(
-            "debiased_functional: {label} affine rows must be finite and non-empty"
-        ));
-    }
-    match weights {
-        None => Ok(values.sum() / values.len() as f64),
-        Some(weights) => {
-            if weights.len() != values.len() || weights.iter().any(|value| !value.is_finite()) {
-                return Err(format!(
-                    "debiased_functional: {label} weights must be finite with length {}, got {}",
-                    values.len(),
-                    weights.len()
-                ));
-            }
-            let weight_sum = weights.sum();
-            if !(weight_sum.is_finite() && weight_sum > 0.0) {
-                return Err(format!(
-                    "debiased_functional: {label} weights must have positive finite sum"
-                ));
-            }
-            Ok(values.dot(&weights) / weight_sum)
-        }
-    }
+/// The training-frame column an `average_derivative` differentiates, when the
+/// caller named one. Resolving a column NAME against a frame is this layer's
+/// job; `None` leaves the choice to the model's own smooth terms, which
+/// `gam::inference::debiased_functional` resolves (#4550).
+fn debiased_functional_derivative_column(
+    dataset: &EncodedDataset,
+    spec_val: &serde_json::Value,
+) -> Result<Option<usize>, String> {
+    let Some(value) = spec_val.get("deriv_var") else {
+        return Ok(None);
+    };
+    let name = value.as_str().ok_or_else(|| {
+        format!(
+            "debiased_functional: average_derivative \"deriv_var\" must be a column \
+             name string, got {value}"
+        )
+    })?;
+    dataset
+        .column_map()
+        .get(name)
+        .copied()
+        .map(Some)
+        .ok_or_else(|| {
+            format!(
+                "debiased_functional: average_derivative \"deriv_var\" '{name}' \
+                 is not a column of the training data"
+            )
+        })
 }
 
 fn model_debiased_functional_dataset_json_impl(
@@ -3760,18 +3759,20 @@ fn model_debiased_functional_dataset_json_impl(
     dataset: EncodedDataset,
     target_spec_json: &str,
 ) -> Result<String, String> {
-    use gam::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
+    use gam::inference::debiased_functional::{DebiasedFunctionalTarget, debiased_functional};
 
-    let formula = model.payload().formula.clone();
-
-    // Only standard (non-survival, non-marginal-slope) models supported: they
-    // carry a dense penalized Hessian + weighted Gram + coefficient vector.
-    if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
-        return Err(format!(
-            "debiased_functional: only standard GAM models are supported; got '{}'",
-            prediction_model_class_label(&model)
-        ));
-    }
+    // #4550: everything below the request is `gam::inference::debiased_functional`.
+    // What is left here is the two things that ARE a binding concern: reading the
+    // caller's JSON, and encoding a query frame into a design row under the
+    // Python frame conventions this crate owns.
+    let spec_val: serde_json::Value = serde_json::from_str(target_spec_json)
+        .map_err(|e| format!("debiased_functional: invalid target_spec_json: {e}"))?;
+    let target_name = spec_val
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            "debiased_functional: target_spec_json must contain \"target\"".to_string()
+        })?;
 
     let spec = model
         .payload()
@@ -3781,260 +3782,29 @@ fn model_debiased_functional_dataset_json_impl(
             "debiased_functional: model is missing resolved_termspec; refit to enable".to_string()
         })?
         .clone();
-
-    // Preserve the exact training-frame column order before the dataset is moved
-    // into the encoder. `standard.data` (below) inherits this order verbatim
-    // (`StandardFitRequest::data == dataset.values`, no reordering), and the
-    // saved `TermCollectionSpec` resolves every term's feature column by its
-    // offset in THIS layout. The `point`/`contrast` query design must be built
-    // against the same full layout, not just the columns named in `x0` (#1621).
+    // The training-frame column order, before the dataset is handed on. The
+    // saved spec resolves every term's feature column by its offset in THIS
+    // layout, so a query design must be built against the same full layout and
+    // not against the columns `x0` happens to name (#1621).
     let training_headers = dataset.headers.clone();
-    // Replay the fit's own weight and offset columns. A default config
-    // materialized unit weights and a zero offset whatever the model was fit
-    // with, so `standard.weights` (the score weights and the Gram fallback's
-    // `W`) and `standard.offset` (the residual's `η`) described a different
-    // model than the saved `H` and `β` (#3542).
     let fit_config = postfit_standard_materialization_config(model)?;
-    let materialized = materialize(&formula, &dataset, &fit_config).map_err(|e| format!("{e}"))?;
-    let standard = match materialized.request {
-        FitRequest::Standard(req) => req,
-        _ => {
-            return Err(
-                "debiased_functional: formula materialized to a non-standard fit path".to_string(),
-            );
-        }
+
+    let query_row = |key: &str| -> Result<DebiasedQueryDesign, String> {
+        let row_obj = spec_val
+            .get(key)
+            .ok_or_else(|| {
+                format!("debiased_functional: target \"{target_name}\" requires \"{key}\" in spec")
+            })?
+            .as_object()
+            .ok_or_else(|| format!("debiased_functional: \"{key}\" must be an object"))?;
+        debiased_query_design_full_schema(model, &training_headers, row_obj, &spec, key)
     };
 
-    // Rebuild the design from the saved termspec + training data so we get the
-    // same coefficient-space columns the fit used.
-    let design_built = build_term_collection_design(standard.data.view(), &spec)
-        .map_err(|e| format!("debiased_functional: design rebuild failed: {e}"))?;
-    let x = design_built
-        .design
-        .try_to_dense_arc("debiased_functional design")
-        .map_err(|e| format!("debiased_functional: design densification failed: {e}"))?;
-
-    // Recover fitted beta, H, and X'WX from the saved model.
-    let saved_fit =
-        gam::families::survival::predict::fit_result_from_saved_model_for_prediction(&model)
-            .map_err(|e| format!("debiased_functional: {e}"))?;
-    // H and X'WX are read in the saved frame of beta and the rebuilt design
-    // (gam#3346).
-    let h = saved_fit
-        .saved_frame_penalized_hessian()
-        .map_err(|reason| format!("debiased_functional: penalized Hessian: {reason}"))?
-        .ok_or_else(|| {
-            "debiased_functional: model does not carry a dense penalized Hessian; \
-             refit with a smaller basis (dense fits only)"
-                .to_string()
-        })?;
-    // Gaussian/identity is the only supported family (enforced below for the
-    // score chain). Hoist that check here because the weighted-Gram fallback
-    // (#1622) is only valid for the profiled-Gaussian weight convention.
-    let family = model.likelihood();
-    let is_gaussian_identity = matches!(family.response, ResponseFamily::Gaussian)
-        && matches!(family.link, InverseLink::Standard(StandardLink::Identity));
-    // Fast path: the weighted Gram X'WX was stored by the REML posterior block.
-    // Fallback (#1622): the parametric-term fit path leaves `weighted_gram` at
-    // its `None` default, so reconstruct X'WX from the already-rebuilt dense
-    // design. For a profiled Gaussian/identity fit the stored penalized Hessian
-    // is H = XᵀWX + S(λ) with W = diag(prior weights) (scale-free; the penalty
-    // is added UNSCALED — see optimizer.rs `cov_scale` contract), so
-    // X'WX = Xᵀ diag(w) X exactly and S(λ) = H − X'WX is recovered consistently
-    // (for an unpenalized `y ~ x` this gives S(λ)=0, i.e. X'WX == H).
-    let saved_gram = saved_fit
-        .saved_frame_weighted_gram()
-        .map_err(|reason| format!("debiased_functional: weighted Gram: {reason}"))?;
-    let xwx_owned: ndarray::Array2<f64> = match saved_gram {
-        Some(g) => g.into_owned(),
-        None => {
-            if !is_gaussian_identity {
-                return Err(format!(
-                    "debiased_functional: model does not carry the weighted Gram X'WX and \
-                     it can only be reconstructed for Gaussian/identity models; this model \
-                     uses family='{}'",
-                    family.pretty_name()
-                ));
-            }
-            let xref = x.as_ref();
-            let w = standard.weights.view();
-            if w.len() != xref.nrows() {
-                return Err(format!(
-                    "debiased_functional: prior-weight length {} does not match design rows {}",
-                    w.len(),
-                    xref.nrows()
-                ));
-            }
-            // Xᵀ diag(w) X = (diag(w) X)ᵀ X.
-            let mut wx = xref.to_owned();
-            for (mut row, &wi) in wx.outer_iter_mut().zip(w.iter()) {
-                row.mapv_inplace(|v| v * wi);
-            }
-            wx.t().dot(xref)
-        }
-    };
-    let xwx = &xwx_owned;
-    let beta = saved_fit.beta_flat();
-    if beta.len() != x.ncols() {
-        return Err(format!(
-            "debiased_functional: beta length {} does not match design width {}",
-            beta.len(),
-            x.ncols()
-        ));
-    }
-
-    // Penalty gradient S_lambda × beta = (H − X'WX) × beta.
-    let s_lambda = &*h - xwx;
-    let penalty_beta = s_lambda.dot(&beta);
-
-    // Per-row score contributions of the objective `H` is the Hessian of.
-    // For a Gaussian identity model that objective is
-    // `½ Σ_i w_i (y_i − η_i)² + ½ βᵀS(λ)β` with `w` the PRIOR weights — the same
-    // `W` in `H = XᵀWX + S(λ)` above — so `s_i = w_i · x_i · (η_i − y_i)`.
-    // Dropping `w_i` pairs a weighted Hessian with unweighted scores: scaling
-    // every weight by `c` (a pure dispersion change, β̂ unmoved) scaled `H` by
-    // `c` and the influence values `ψ_i = −n sᵢᵀH⁻¹g` by `1/c`, so the reported
-    // SE moved by `1/c`, and non-uniform precision weights got the sandwich
-    // `H⁻¹ Σ x_i x_iᵀ r_i² H⁻¹` instead of `H⁻¹ Σ w_i² x_i x_iᵀ r_i² H⁻¹` (#3542).
-    // Other families need their own derivative chain; currently restricted to
-    // Gaussian/identity where the score is exact and the debiasing is cleanest.
-    let y = standard.y.view();
-    let prior_weights = standard.weights.view();
-    let n = x.nrows();
-    let p = x.ncols();
-    if !is_gaussian_identity {
-        return Err(format!(
-            "debiased_functional: currently only supported for Gaussian/identity models; \
-             this model uses family='{}'. Supply pre-computed row_scores via the low-level \
-             gamfit._rust.debiased_functional() call for other families.",
-            family.pretty_name()
-        ));
-    }
-    if prior_weights.len() != n {
-        return Err(format!(
-            "debiased_functional: prior-weight length {} does not match design rows {n}",
-            prior_weights.len()
-        ));
-    }
-    let effective_offset = design_built
-        .compose_offset(standard.offset.view(), "debiased functional training design")
-        .map_err(|error| error.to_string())?;
-    let eta = x.as_ref().dot(&beta) + &effective_offset;
-    let mut row_scores = ndarray::Array2::<f64>::zeros((n, p));
-    for i in 0..n {
-        // ∂/∂η of ½ w_i (y_i − η_i)² for Gaussian/identity.
-        let weighted_residual = prior_weights[i] * (eta[i] - y[i]);
-        let x_row = x.row(i);
-        for j in 0..p {
-            row_scores[[i, j]] = x_row[j] * weighted_residual;
-        }
-    }
-
-    // Parse target spec.
-    let spec_val: serde_json::Value = serde_json::from_str(target_spec_json)
-        .map_err(|e| format!("debiased_functional: invalid target_spec_json: {e}"))?;
-    let target = spec_val
-        .get("target")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            "debiased_functional: target_spec_json must contain \"target\"".to_string()
-        })?;
-
-    // Build the functional gradient g = dθ/dβ from the spec.
-    let (gradient, functional_affine): (ndarray::Array1<f64>, f64) = match target {
-        "point" | "linear" => {
-            // Requires an "x0" row dict → evaluate the design at x0, built under
-            // the FULL training schema so the saved spec's feature-column offsets
-            // resolve correctly regardless of where the response sits (#1621).
-            let x0_obj = spec_val
-                .get("x0")
-                .ok_or_else(|| {
-                    format!("debiased_functional: target \"{target}\" requires \"x0\" in spec")
-                })?
-                .as_object()
-                .ok_or_else(|| "debiased_functional: \"x0\" must be an object".to_string())?;
-            let query =
-                debiased_query_design_full_schema(&model, &training_headers, x0_obj, &spec, "x0")?;
-            (query.design_row, query.affine_offset)
-        }
-        "contrast" => {
-            let get_row = |key: &str| -> Result<DebiasedQueryDesign, String> {
-                let row_obj = spec_val
-                    .get(key)
-                    .ok_or_else(|| {
-                        format!(
-                            "debiased_functional: target \"contrast\" requires \"{key}\" in spec"
-                        )
-                    })?
-                    .as_object()
-                    .ok_or_else(|| format!("debiased_functional: \"{key}\" must be an object"))?;
-                debiased_query_design_full_schema(&model, &training_headers, row_obj, &spec, key)
-            };
-            let row_a = get_row("x0")?;
-            let row_b = get_row("x1")?;
-            let gradient = SmoothFunctional::Contrast {
-                design_row_a: row_a.design_row.view(),
-                design_row_b: row_b.design_row.view(),
-            }
-            .gradient()
-            .map_err(|e| format!("debiased_functional: contrast gradient: {e}"))?;
-            (gradient, row_a.affine_offset - row_b.affine_offset)
-        }
-        "average_derivative" | "average_value" => {
-            // Uses the full training design; optional per-row weights from spec.
-            let weights = debiased_functional_weights(&spec_val)?;
-            let x_ref = x.as_ref();
-            if target == "average_value" {
-                let gradient = SmoothFunctional::AverageValue {
-                    value_design: x_ref.view(),
-                    weights: weights.as_ref().map(|w| w.view()),
-                }
-                .gradient()
-                .map_err(|e| format!("debiased_functional: average_value gradient: {e}"))?;
-                let affine = weighted_affine_mean(
-                    design_built.affine_offset.view(),
-                    weights.as_ref().map(|w| w.view()),
-                    "average_value",
-                )?;
-                (gradient, affine)
-            } else {
-                // average_derivative needs rows of basis-function DERIVATIVES
-                // ∂φ_j/∂x(x_i), NOT the value design φ_j(x_i). Feeding the value
-                // design returns mean_i w_i·m(x_i) (the average value) instead of
-                // mean_i w_i·m'(x_i) (#1120). Build the EXACT analytic derivative
-                // design: each smooth term's basis FIRST DERIVATIVE pushed through
-                // the same frozen identifiability chart the value design uses, so
-                // its columns align with beta.
-                let deriv_col = resolve_average_derivative_column(&spec, &dataset, &spec_val)?;
-                let dx =
-                    build_term_collection_derivative_design(standard.data.view(), &spec, deriv_col)
-                        .map_err(|e| {
-                            format!(
-                                "debiased_functional: average_derivative design build failed: {e}"
-                            )
-                        })?;
-                if dx.design.ncols() != x.ncols() {
-                    return Err(format!(
-                        "debiased_functional: average_derivative design width {} does not \
-                         match fitted coefficient width {}",
-                        dx.design.ncols(),
-                        x.ncols()
-                    ));
-                }
-                let gradient = SmoothFunctional::AverageDerivative {
-                    derivative_design: dx.design.view(),
-                    weights: weights.as_ref().map(|w| w.view()),
-                }
-                .gradient()
-                .map_err(|e| format!("debiased_functional: average_derivative gradient: {e}"))?;
-                let affine = weighted_affine_mean(
-                    dx.affine_offset.view(),
-                    weights.as_ref().map(|w| w.view()),
-                    "average_derivative",
-                )?;
-                (gradient, affine)
-            }
-        }
+    // The query designs outlive the target, which borrows their rows.
+    let (single, pair) = match target_name {
+        "point" | "linear" => (Some(query_row("x0")?), None),
+        "contrast" => (None, Some((query_row("x0")?, query_row("x1")?))),
+        "average_value" | "average_derivative" => (None, None),
         other => {
             return Err(format!(
                 "debiased_functional: unknown target {other:?}; expected one of \
@@ -4043,84 +3813,55 @@ fn model_debiased_functional_dataset_json_impl(
         }
     };
 
-    let input = RieszInput {
-        beta: beta.view(),
-        functional_gradient: gradient.view(),
-        row_scores: row_scores.view(),
-        penalty_beta: penalty_beta.view(),
-        leverage: None,
+    let target = match target_name {
+        "point" => {
+            let query = single.as_ref().expect("point carries one query row");
+            DebiasedFunctionalTarget::Point {
+                design_row: query.design_row.view(),
+                affine_offset: query.affine_offset,
+            }
+        }
+        "linear" => {
+            let query = single.as_ref().expect("linear carries one query row");
+            DebiasedFunctionalTarget::Linear {
+                design_row: query.design_row.view(),
+                affine_offset: query.affine_offset,
+            }
+        }
+        "contrast" => {
+            let (row_a, row_b) = pair.as_ref().expect("contrast carries two query rows");
+            DebiasedFunctionalTarget::Contrast {
+                design_row_a: row_a.design_row.view(),
+                affine_offset_a: row_a.affine_offset,
+                design_row_b: row_b.design_row.view(),
+                affine_offset_b: row_b.affine_offset,
+            }
+        }
+        "average_value" => DebiasedFunctionalTarget::AverageValue {
+            weights: debiased_functional_weights(&spec_val)?,
+        },
+        // An explicit `deriv_var` is a COLUMN NAME, and resolving a name against
+        // a frame is this layer's job. Absent, the library resolves the column
+        // from the model's own smooth terms.
+        _ => DebiasedFunctionalTarget::AverageDerivative {
+            weights: debiased_functional_weights(&spec_val)?,
+            derivative_column: debiased_functional_derivative_column(&dataset, &spec_val)?,
+        },
     };
-    let report = debias_with_dense_hessian(&input, h.view())
-        .map_err(|e| format!("debiased_functional: Riesz engine error: {e}"))?;
 
-    let theta_plugin = report.theta_plugin + functional_affine;
-    let theta_debiased = report.theta_onestep + functional_affine;
-    let half_width = 1.959_963_984_540_054 * report.se;
+    let report = debiased_functional(model, &fit_config, &dataset, &target)?;
     let out = serde_json::json!({
-        "target": target,
-        "theta_plugin": theta_plugin,
-        "theta_debiased": theta_debiased,
+        "target": report.target,
+        "theta_plugin": report.theta_plugin,
+        "theta_debiased": report.theta_debiased,
         "se": report.se,
         "penalty_bias": report.penalty_bias,
-        "ci_lower": theta_debiased - half_width,
-        "ci_upper": theta_debiased + half_width,
-        "ci_level": 0.95_f64,
+        "ci_lower": report.ci_lower,
+        "ci_upper": report.ci_upper,
+        "ci_level": report.ci_level,
     });
     serde_json::to_string(&out)
         .map_err(|e| format!("debiased_functional: serialization failed: {e}"))
-}
-
-/// Resolve the covariate column index to differentiate for an
-/// `average_derivative` functional (#1120 / #1097).
-///
-/// If the target spec carries an explicit `"deriv_var"` column name, it is
-/// resolved against the materialized dataset headers. Otherwise the column is
-/// auto-selected (magic-by-default) as the single feature column shared by all
-/// smooth terms in the model; if the model has smooths over more than one
-/// covariate the caller must disambiguate via `"deriv_var"`.
-fn resolve_average_derivative_column(
-    spec: &TermCollectionSpec,
-    dataset: &EncodedDataset,
-    spec_val: &serde_json::Value,
-) -> Result<usize, String> {
-    let deriv_var = match spec_val.get("deriv_var") {
-        None => None,
-        Some(value) => Some(value.as_str().ok_or_else(|| {
-            format!(
-                "debiased_functional: average_derivative \"deriv_var\" must be a column \
-                 name string, got {value}"
-            )
-        })?),
-    };
-    if let Some(name) = deriv_var {
-        return dataset.column_map().get(name).copied().ok_or_else(|| {
-            format!(
-                "debiased_functional: average_derivative \"deriv_var\" '{name}' \
-                     is not a column of the training data"
-            )
-        });
-    }
-    let mut cols: Vec<usize> = spec
-        .smooth_terms
-        .iter()
-        .flat_map(smooth_term_feature_cols)
-        .collect();
-    cols.sort_unstable();
-    cols.dedup();
-    match cols.as_slice() {
-        [single] => Ok(*single),
-        [] => Err(
-            "debiased_functional: average_derivative requires at least one smooth term \
-             to differentiate; the model has no smooths"
-                .to_string(),
-        ),
-        _ => Err(
-            "debiased_functional: average_derivative is ambiguous because the model has \
-             smooths over more than one covariate; specify the covariate via the \
-             \"deriv_var\" key in the target spec"
-                .to_string(),
-        ),
-    }
 }
 
 /// The summary as a Python dict. The saved payload's row-major
@@ -5859,20 +5600,17 @@ mod debiased_functional_spec_tests {
                 .unwrap_err();
             assert!(error.contains("weights[1]"));
         }
-        let values = ndarray::array![2.0, 10.0];
+        // The parsed weights are the caller's values exactly; what they then
+        // weight is `gam::inference::debiased_functional`'s
+        // `weighted_affine_mean`, tested there (#4550).
         let parsed = debiased_functional_weights(&serde_json::json!({"weights": [1, 3]}))
             .unwrap()
             .unwrap();
-        assert_eq!(
-            super::weighted_affine_mean(values.view(), Some(parsed.view()), "test").unwrap(),
-            8.0
-        );
-        assert_eq!(
-            super::weighted_affine_mean(values.view(), None, "test").unwrap(),
-            6.0
-        );
+        assert_eq!(parsed.to_vec(), vec![1.0, 3.0]);
     }
 
+    /// A named `deriv_var` is resolved against the frame here; an absent one is
+    /// left to the model, which the library resolves (#4550).
     #[test]
     fn explicit_derivative_selector_is_resolved_or_refused() {
         let dataset = gam::data::encode_recordswith_inferred_schema(
@@ -5883,10 +5621,6 @@ mod debiased_functional_spec_tests {
             ],
         )
         .unwrap();
-        let spec: super::TermCollectionSpec = serde_json::from_value(serde_json::json!({
-            "linear_terms": [], "random_effect_terms": [], "smooth_terms": []
-        }))
-        .unwrap();
         for value in [
             serde_json::json!(null),
             serde_json::json!(true),
@@ -5894,8 +5628,7 @@ mod debiased_functional_spec_tests {
             serde_json::json!([]),
             serde_json::json!({}),
         ] {
-            let error = super::resolve_average_derivative_column(
-                &spec,
+            let error = super::debiased_functional_derivative_column(
                 &dataset,
                 &serde_json::json!({"deriv_var": value}),
             )
@@ -5903,27 +5636,24 @@ mod debiased_functional_spec_tests {
             assert!(error.contains("must be a column"), "{error}");
         }
         assert_eq!(
-            super::resolve_average_derivative_column(
-                &spec,
+            super::debiased_functional_derivative_column(
                 &dataset,
                 &serde_json::json!({"deriv_var": "z"})
             )
             .unwrap(),
-            1
+            Some(1)
         );
         assert!(
-            super::resolve_average_derivative_column(
-                &spec,
+            super::debiased_functional_derivative_column(
                 &dataset,
                 &serde_json::json!({"deriv_var": "missing"})
             )
             .unwrap_err()
             .contains("not a column")
         );
-        assert!(
-            super::resolve_average_derivative_column(&spec, &dataset, &serde_json::json!({}))
-                .unwrap_err()
-                .contains("requires at least one smooth")
+        assert_eq!(
+            super::debiased_functional_derivative_column(&dataset, &serde_json::json!({})).unwrap(),
+            None
         );
     }
 }
