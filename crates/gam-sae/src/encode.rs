@@ -843,30 +843,59 @@ fn apply_row_metric(u: ArrayView2<'_, f64>, v: ArrayView1<'_, f64>) -> Array1<f6
 
 /// Maximum Gauss--Newton iterations for the frozen-dictionary joint row solve.
 const JOINT_ENCODE_MAX_ITER: usize = 64;
-const JOINT_ENCODE_GRAD_TOL: f64 = 1.0e-10;
-const JOINT_ENCODE_STEP_TOL: f64 = 1.0e-12;
 
-/// Floor on the Levenberg--Marquardt damping `λ` for the joint row solve. The
-/// damping is carried and decayed *across* outer Gauss--Newton iterations
-/// (warm-started at this value on entry, then raised on rejection and lowered on
-/// acceptance), so it is a stateful trust-region parameter rather than an
-/// `escalate_ridge` schedule — it is deliberately kept hand-rolled. This is the
-/// initial `λ` seed at the smallest scale that still perturbs the Hessian.
-const JOINT_ENCODE_DAMPING_FLOOR: f64 = 1.0e-10;
+/// #4498 — the dimensionless resolution of the joint row solve's stationarity
+/// ratio `‖g‖ / gradient_natural_scale`: Wilkinson's `γ_k` for the longest
+/// accumulation that ratio passes through. A row whose gradient is zero to the
+/// arithmetic that formed it certifies; a row with a residual that arithmetic
+/// can still resolve does not.
+///
+/// The gradient is `g = J (M r) + g_prior` with `J` of shape `q×p`. Each
+/// component sums `p` products whose Jacobian factor is itself an accumulation
+/// over the dictionary's `basis_terms` columns and whose residual factor passes
+/// through `M = U Uᵀ` (a length-`p` contraction by `Uᵀ`, then a length-`rank`
+/// expansion by `U`); the tangent projection and the norm then sum at most `q`
+/// terms each. `γ_k` is monotone in `k`, so the single count
+/// `basis_terms + 2p + rank + 2q` bounds every one of those chains.
+///
+/// There is no absolute tolerance in it. The old test compared `‖g‖`, which
+/// carries units of output² per latent unit, with `1e-10·(1 + ‖x‖)`, which
+/// carries units of output, so `converged` moved with the units of the data:
+/// under `x → c·x, B → c·B` — the same fit in other units — `‖g‖` scales by
+/// `c²` while the bound scaled by at most `c`, and by nothing at all while
+/// `‖x‖ ≪ 1`. Large activations were reported unconverged below the
+/// arithmetic's own resolution, and small ones were certified at a relative
+/// stationarity residual of about `1e-4`.
+fn joint_encode_stationarity_resolution(
+    q: usize,
+    p: usize,
+    metric_rank: usize,
+    basis_terms: usize,
+) -> f64 {
+    gam_linalg::roundoff::accumulation_growth(
+        basis_terms
+            .saturating_add(p.saturating_mul(2))
+            .saturating_add(metric_rank)
+            .saturating_add(q.saturating_mul(2)),
+    )
+}
 
 /// Multiplicative growth applied to the LM damping `λ` whenever a damped step is
-/// rejected (unfactorable, non-descent, or Armijo-exhausted). Numerically equal
+/// rejected (non-descent, or Armijo-exhausted). Numerically equal
 /// to [`opt::constants::RIDGE_GROWTH`], but this loop is stateful across outer
 /// iterations and is intentionally not routed through `escalate_ridge`.
 const JOINT_ENCODE_DAMPING_GROWTH: f64 = 10.0;
 
 /// Multiplicative decay applied to the LM damping `λ` after an accepted step, so
 /// the next outer iteration starts from a looser trust region. Kept above the
-/// `f64::EPSILON · diag_scale` floor at the use site.
+/// `f64::EPSILON · curvature_scale` floor at the use site.
 const JOINT_ENCODE_DAMPING_DECAY: f64 = 3.0;
 
-/// Maximum number of damping-escalation attempts within a single outer
-/// Gauss--Newton iteration before the row is declared non-improvable.
+/// Maximum number of trust-region contractions within a single outer
+/// Gauss--Newton iteration before the row is declared non-improvable. Since
+/// #4498 the damped step is always solvable and always a descent direction, so
+/// every contraction here answers a line search that found no sufficient
+/// decrease, never an unfactorable system.
 const JOINT_ENCODE_DAMPING_MAX_ATTEMPTS: usize = 12;
 
 /// Maximum number of Armijo backtracking halvings for the inner line search on
@@ -874,17 +903,43 @@ const JOINT_ENCODE_DAMPING_MAX_ATTEMPTS: usize = 12;
 /// [`opt::backtracking_line_search`] primitive.
 const JOINT_ENCODE_ARMIJO_MAX_STEPS: usize = 24;
 
+/// The joint encode objective's jet at one row's coordinates, with the
+/// magnitudes its gradient was assembled from.
+struct JointEncodeJet {
+    value: f64,
+    gradient: Array1<f64>,
+    curvature: Array2<f64>,
+    /// #4498 — `‖J‖_F·(‖M r‖ + ‖M x‖) + ‖g_prior‖`: the norms of the operands
+    /// the gradient `g = J (M r) + g_prior` is built from, in the gradient's
+    /// own units, so `‖g‖ / gradient_natural_scale` is dimensionless and
+    /// invariant under `x → c·x, B → c·B` and under a rescaling of the latent
+    /// chart. This is the joint-encode analogue of
+    /// `gam_solve::pirls::penalized_gradient_natural_scale`.
+    ///
+    /// Two properties make it the right denominator. By Cauchy--Schwarz it
+    /// dominates `Σ_out |J[a,out]|·|(M r)[out]|`, which is what Wilkinson's
+    /// bound on the gradient's own rounding is stated in, so a gradient that is
+    /// zero to the arithmetic that formed it lands inside
+    /// [`joint_encode_stationarity_resolution`]. And the `‖M x‖` term is the
+    /// data's own magnitude, which does not collapse with the residual: a scale
+    /// built only from the cancelling pieces would shrink with `g` itself and
+    /// the ratio would read about `1` on a perfectly converged row (the #3339
+    /// lesson on the P-IRLS scale).
+    gradient_natural_scale: f64,
+}
+
 fn joint_data_value_grad_hess(
     jac: ArrayView2<'_, f64>,
     residual: ArrayView1<'_, f64>,
     metric_factor: Option<ArrayView2<'_, f64>>,
-) -> (f64, Array1<f64>, Array2<f64>) {
+) -> (f64, Array1<f64>, Array2<f64>, f64) {
     let q = jac.nrows();
     let p = jac.ncols();
     let weighted_residual = match metric_factor.as_ref() {
         Some(u) => apply_row_metric(u.view(), residual),
         None => residual.to_owned(),
     };
+    let weighted_residual_norm = weighted_residual.dot(&weighted_residual).sqrt();
     let value = 0.5 * residual.dot(&weighted_residual);
     let grad = jac.dot(&weighted_residual);
     let weighted_jac = match metric_factor.as_ref() {
@@ -899,20 +954,20 @@ fn joint_data_value_grad_hess(
         None => jac.to_owned(),
     };
     let hess = jac.dot(&weighted_jac.t());
-    (value, grad, hess)
+    (value, grad, hess, weighted_residual_norm)
 }
 
 /// Value, exact gradient, and positive-semidefinite Gauss--Newton curvature for
-/// the shared-residual multi-atom objective. The gradient is exact; the PSD
-/// curvature is used only to choose a descent step, so damping changes neither
-/// the objective nor its stationary points.
+/// the shared-residual multi-atom objective, with the gradient's natural scale.
+/// The gradient is exact; the PSD curvature is used only to choose a descent
+/// step, so damping changes neither the objective nor its stationary points.
 fn joint_encode_value_grad_hess(
     atoms: &[SaeManifoldAtom],
     coords: &[Array1<f64>],
     x: ArrayView1<'_, f64>,
     amplitudes: ArrayView1<'_, f64>,
     metric_factor: Option<ArrayView2<'_, f64>>,
-) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+) -> Result<JointEncodeJet, String> {
     let k_atoms = atoms.len();
     if coords.len() != k_atoms || amplitudes.len() != k_atoms {
         return Err(format!(
@@ -994,8 +1049,20 @@ fn joint_encode_value_grad_hess(
     }
 
     let residual = &recon - &x;
-    let (mut value, mut grad, mut hess) =
+    let (mut value, mut grad, mut hess, weighted_residual_norm) =
         joint_data_value_grad_hess(jac.view(), residual.view(), metric_factor.clone());
+
+    // #4498 — the magnitudes the gradient is assembled from, collected where
+    // the operands live. `‖J‖_F` is the Cauchy--Schwarz majorant of every
+    // gradient component's `Σ_out |J[a,out]|·|v[out]|`, and `M x` is the data's
+    // own magnitude, which stays put as the residual cancels.
+    let jacobian_frobenius = jac.iter().map(|entry| entry * entry).sum::<f64>().sqrt();
+    let weighted_target = match metric_factor.as_ref() {
+        Some(u) => apply_row_metric(u.view(), x),
+        None => x.to_owned(),
+    };
+    let weighted_target_norm = weighted_target.dot(&weighted_target).sqrt();
+    let mut prior_gradient_square = 0.0_f64;
 
     for (atom_idx, atom) in atoms.iter().enumerate() {
         let Some(alpha) = atom.ard_precisions.as_deref() else {
@@ -1014,15 +1081,45 @@ fn joint_encode_value_grad_hess(
             value += prior.value;
             grad[start + axis] += prior.grad;
             hess[[start + axis, start + axis]] += prior.psd_majorizer_hess();
+            prior_gradient_square += prior.grad * prior.grad;
         }
     }
-    Ok((value, grad, hess))
+    let gradient_natural_scale = jacobian_frobenius
+        * (weighted_residual_norm + weighted_target_norm)
+        + prior_gradient_square.sqrt();
+    Ok(JointEncodeJet {
+        value,
+        gradient: grad,
+        curvature: hess,
+        gradient_natural_scale,
+    })
 }
 
+/// The damped Newton step `−(H_sym + λ*I)⁻¹ g`, solved in the eigenbasis of the
+/// symmetrized curvature. `trust_damping` is the caller's trust-region floor on
+/// `λ*`.
+///
+/// #4498 — the smallest admissible `λ` is readable from the one spectrum this
+/// function already computes, so it is read rather than searched for:
+///
+/// ```text
+/// λ* = max(trust_damping, band − λ_min(H_sym))
+/// ```
+///
+/// with `band` = [`gam_linalg::roundoff::symmetric_spectrum_rounding_band`], the
+/// level below which the decomposition that produced the spectrum cannot tell an
+/// eigenvalue from zero. Every mode the step inverts is then at `band` or above,
+/// so the shifted system is positive definite, the step exists, and
+/// `gᵀstep = −gᵀ(H_sym + λ*I)⁻¹g < 0` is a strict descent direction whenever `g`
+/// is nonzero. Before, the caller multiplied `λ` by 10 and re-ran this whole
+/// eigendecomposition, up to twelve times, until the shifted matrix happened to
+/// come out positive definite — reading by trial and error a number the first
+/// spectrum states exactly. The shift is applied to the eigenvalues rather than
+/// the diagonal, which is the same matrix `H_sym + λ*I` and needs no refactor.
 fn joint_encode_damped_step(
     hess: ArrayView2<'_, f64>,
     grad: ArrayView1<'_, f64>,
-    damping: f64,
+    trust_damping: f64,
 ) -> Result<Option<Array1<f64>>, String> {
     let q = grad.len();
     if q == 0 {
@@ -1033,18 +1130,30 @@ fn joint_encode_damped_step(
         for j in 0..q {
             system[[i, j]] = 0.5 * (hess[[i, j]] + hess[[j, i]]);
         }
-        system[[i, i]] += damping;
     }
     let (evals, evecs) = system
         .eigh(Side::Lower)
         .map_err(|e| format!("joint encode: damped eigensolve failed: {e:?}"))?;
-    if evals.iter().any(|&v| !(v.is_finite() && v > 0.0)) {
+    if evals.iter().any(|&v| !v.is_finite()) {
         return Ok(None);
     }
+    let spectrum = evals
+        .as_slice()
+        .expect("a self-adjoint eigensolve returns a contiguous spectrum");
+    let band = gam_linalg::roundoff::symmetric_spectrum_rounding_band(spectrum);
+    let smallest = spectrum.iter().copied().fold(f64::INFINITY, f64::min);
+    let damping = trust_damping.max(band - smallest);
     let mut step = Array1::<f64>::zeros(q);
     for (col, &lambda) in evals.iter().enumerate() {
+        let shifted = lambda + damping;
+        if !(shifted > 0.0) {
+            // Reachable only when the whole spectrum is zero: `band` is then
+            // zero too, so the shift lifts nothing and there is no curvature to
+            // invert. A curvature with no resolved mode names no Newton step.
+            return Ok(None);
+        }
         let v = evecs.column(col);
-        let coefficient = -v.dot(&grad) / lambda;
+        let coefficient = -v.dot(&grad) / shifted;
         for row in 0..q {
             step[row] += coefficient * v[row];
         }
@@ -1073,20 +1182,32 @@ fn atom_latent_manifold(atom: &SaeManifoldAtom) -> gam_terms::latent::LatentMani
 /// pin, as the fit's row geometry does. Every cross-atom block is projected on both
 /// sides. The value is unchanged. On an all-Euclidean dictionary every projection is
 /// the identity, so the ambient pieces are returned as they are.
+///
+/// The natural scale is carried through unprojected. Every projection here is
+/// an orthogonal contraction, so it can only shrink the operands the ambient
+/// scale is a sum of norms of, and `JointEncodeJet::gradient_natural_scale`
+/// remains an upper bound on the magnitudes the tangent gradient is assembled
+/// from — including the projection's own rounding, which is bounded by the
+/// ambient gradient it acts on.
 fn joint_encode_riemannian_value_grad_hess(
     atoms: &[SaeManifoldAtom],
     coords: &[Array1<f64>],
     x: ArrayView1<'_, f64>,
     amplitudes: ArrayView1<'_, f64>,
     metric_factor: Option<ArrayView2<'_, f64>>,
-) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-    let (value, grad, hess) =
-        joint_encode_value_grad_hess(atoms, coords, x, amplitudes, metric_factor)?;
+) -> Result<JointEncodeJet, String> {
+    let ambient = joint_encode_value_grad_hess(atoms, coords, x, amplitudes, metric_factor)?;
     let manifolds: Vec<gam_terms::latent::LatentManifold> =
         atoms.iter().map(atom_latent_manifold).collect();
     if manifolds.iter().all(|manifold| manifold.is_euclidean()) {
-        return Ok((value, grad, hess));
+        return Ok(ambient);
     }
+    let JointEncodeJet {
+        value,
+        gradient: grad,
+        curvature: hess,
+        gradient_natural_scale,
+    } = ambient;
     let mut offsets = Vec::with_capacity(atoms.len() + 1);
     offsets.push(0usize);
     for atom in atoms {
@@ -1126,7 +1247,12 @@ fn joint_encode_riemannian_value_grad_hess(
                 .assign(&projected);
         }
     }
-    Ok((value, tangent_grad, tangent_hess))
+    Ok(JointEncodeJet {
+        value,
+        gradient: tangent_grad,
+        curvature: tangent_hess,
+        gradient_natural_scale,
+    })
 }
 
 /// Move each atom along its block of `scale · step` by its latent manifold's
@@ -1166,6 +1292,16 @@ fn joint_encode_add_step(
 /// sphere encode therefore stays a unit vector, an interval factor stays in range,
 /// and a row that is stationary along the manifold is not refused for an ambient
 /// normal component.
+///
+/// #4498 — the row's verdict is one rule: the dimensionless stationarity ratio
+/// `‖g‖ / JointEncodeJet::gradient_natural_scale` against
+/// [`joint_encode_stationarity_resolution`]. There is no separate step-length
+/// exit: the old one compared a latent-chart length with an output-space
+/// tolerance `1e-12·(1 + ‖x‖)`, a quantity whose meaning changed with the chart
+/// parametrisation, and it could only stop a row that was still moving toward
+/// stationarity. What actually stops a row short of stationarity is the line
+/// search finding no representable sufficient decrease, and that already ends
+/// the loop with the same verdict everything else is read against.
 pub(crate) fn joint_encode_refine_row(
     atoms: &[SaeManifoldAtom],
     initial_coords: &[Array1<f64>],
@@ -1196,26 +1332,39 @@ pub(crate) fn joint_encode_refine_row(
     if q == 0 {
         return Ok((coords, true));
     }
-    let target_scale = 1.0 + x.dot(&x).sqrt();
-    let mut damping = JOINT_ENCODE_DAMPING_FLOOR;
+    let stationarity_resolution = joint_encode_stationarity_resolution(
+        q,
+        x.len(),
+        metric_factor.as_ref().map_or(0, |u| u.ncols()),
+        atoms.iter().map(SaeManifoldAtom::basis_size).sum(),
+    );
+    // The trust region starts fully open: since #4498 the damped step is
+    // solvable at every curvature, so no seed damping is needed to make one
+    // exist, and `joint_encode_damped_step` raises `λ` to the spectrum's own
+    // minimum admissible shift on its own. `λ` leaves zero only when a line
+    // search reports that the model overstated the decrease.
+    let mut damping = 0.0_f64;
 
     for _ in 0..JOINT_ENCODE_MAX_ITER {
-        let (value, grad, hess) = joint_encode_riemannian_value_grad_hess(
+        let jet = joint_encode_riemannian_value_grad_hess(
             atoms,
             &coords,
             x,
             amplitudes,
             metric_factor.clone(),
         )?;
+        let JointEncodeJet {
+            value,
+            gradient: grad,
+            curvature: hess,
+            gradient_natural_scale,
+        } = jet;
         let grad_norm = grad.dot(&grad).sqrt();
-        if grad_norm <= JOINT_ENCODE_GRAD_TOL * target_scale {
+        if grad_norm <= stationarity_resolution * gradient_natural_scale {
             return Ok((coords, true));
         }
-        let diag_scale = (0..q)
-            .map(|i| hess[[i, i]].abs())
-            .fold(0.0_f64, f64::max)
-            .max(1.0);
-        damping = damping.max(f64::EPSILON * diag_scale);
+        let curvature_scale = (0..q).map(|i| hess[[i, i]].abs()).fold(0.0_f64, f64::max);
+        damping = damping.max(f64::EPSILON * curvature_scale);
 
         let mut accepted = None;
         for _ in 0..JOINT_ENCODE_DAMPING_MAX_ATTEMPTS {
@@ -1238,7 +1387,6 @@ pub(crate) fn joint_encode_refine_row(
             // well defined, so never `Ok(None)`) and threads them through the
             // payload so the accepted trial is returned without recomputation.
             let base_value = value;
-            let step_unit_norm = step.dot(&step).sqrt();
             let line_search = backtracking_line_search::<Vec<Array1<f64>>, String>(
                 BacktrackConfig {
                     initial_step: 1.0,
@@ -1247,53 +1395,41 @@ pub(crate) fn joint_encode_refine_row(
                 },
                 |line_scale| {
                     let candidate = joint_encode_add_step(atoms, &coords, step.view(), line_scale);
-                    let (candidate_value, _, _) = joint_encode_value_grad_hess(
+                    let candidate_jet = joint_encode_value_grad_hess(
                         atoms,
                         &candidate,
                         x,
                         amplitudes,
                         metric_factor.clone(),
                     )?;
-                    Ok(Some((candidate_value, candidate)))
+                    Ok(Some((candidate_jet.value, candidate)))
                 },
                 |line_scale, candidate_value| {
                     candidate_value <= base_value + ARMIJO_C1 * line_scale * directional
                 },
             )?;
             if let Some(AcceptedStep {
-                step: line_scale,
-                payload: candidate,
-                ..
+                payload: candidate, ..
             }) = line_search
             {
-                accepted = Some((candidate, line_scale * step_unit_norm));
+                accepted = Some(candidate);
             }
             if accepted.is_some() {
-                damping = (damping / JOINT_ENCODE_DAMPING_DECAY).max(f64::EPSILON * diag_scale);
+                damping =
+                    (damping / JOINT_ENCODE_DAMPING_DECAY).max(f64::EPSILON * curvature_scale);
                 break;
             }
             damping *= JOINT_ENCODE_DAMPING_GROWTH;
         }
-        let Some((next, step_norm)) = accepted else {
+        let Some(next) = accepted else {
             return Ok((coords, false));
         };
         coords = next;
-        if step_norm <= JOINT_ENCODE_STEP_TOL * target_scale {
-            let (_, final_grad, _) = joint_encode_riemannian_value_grad_hess(
-                atoms,
-                &coords,
-                x,
-                amplitudes,
-                metric_factor.clone(),
-            )?;
-            let converged =
-                final_grad.dot(&final_grad).sqrt() <= JOINT_ENCODE_GRAD_TOL * target_scale;
-            return Ok((coords, converged));
-        }
     }
-    let (_, final_grad, _) =
+    let final_jet =
         joint_encode_riemannian_value_grad_hess(atoms, &coords, x, amplitudes, metric_factor)?;
-    let converged = final_grad.dot(&final_grad).sqrt() <= JOINT_ENCODE_GRAD_TOL * target_scale;
+    let converged = final_jet.gradient.dot(&final_jet.gradient).sqrt()
+        <= stationarity_resolution * final_jet.gradient_natural_scale;
     Ok((coords, converged))
 }
 
@@ -3409,9 +3545,13 @@ mod encode_fix_tests {
             )
             .expect("encode objective")
         };
-        let (cover_value, cover_grad, cover_hess) = objective(&cover);
-        let (twin_value, twin_grad, twin_hess) = objective(&twin);
-        let (other_value, _, _) = objective(&other);
+        let cover_jet = objective(&cover);
+        let twin_jet = objective(&twin);
+        let (cover_value, cover_grad, cover_hess) =
+            (cover_jet.value, cover_jet.gradient, cover_jet.curvature);
+        let (twin_value, twin_grad, twin_hess) =
+            (twin_jet.value, twin_jet.gradient, twin_jet.curvature);
+        let other_value = objective(&other).value;
         let close = |label: &str, got: f64, want: f64| {
             let scale = 1.0 + got.abs().max(want.abs());
             assert!(
@@ -3440,7 +3580,8 @@ mod encode_fix_tests {
         // independent projections would instead produce (2,1.5).
         let jac = ndarray::array![[1.0_f64, 0.0], [1.0, 1.0]];
         let residual = ndarray::array![-2.0_f64, -1.0];
-        let (_value, grad, hess) = joint_data_value_grad_hess(jac.view(), residual.view(), None);
+        let (_value, grad, hess, _residual_norm) =
+            joint_data_value_grad_hess(jac.view(), residual.view(), None);
         let step = joint_encode_damped_step(hess.view(), grad.view(), 1.0e-15)
             .expect("joint system factors")
             .expect("joint system is positive definite");
@@ -4363,14 +4504,15 @@ mod joint_encode_retraction_2934_tests {
         let truth = unit([0.3, -0.5, 0.81]);
         let amplitudes = ndarray::array![0.9_f64];
         let x = decode(&atoms[0], &truth, 0.9);
-        let (_, ambient_grad, _) = joint_encode_value_grad_hess(
+        let ambient_grad = joint_encode_value_grad_hess(
             &atoms,
             std::slice::from_ref(&truth),
             x.view(),
             amplitudes.view(),
             None,
         )
-        .expect("ambient objective");
+        .expect("ambient objective")
+        .gradient;
         let ambient_norm = ambient_grad.dot(&ambient_grad).sqrt();
         assert!(
             ambient_norm > 1.0,
@@ -4425,5 +4567,112 @@ mod joint_encode_retraction_2934_tests {
             "the row must reach projected stationarity at {:?}",
             coords[0]
         );
+    }
+
+    /// A `d = 1` periodic atom whose decoder is the unit-scale one times
+    /// `scale`. Decoding it at any coordinate scales by `scale` exactly as the
+    /// decoder does, so `x = decode(atom, t)` gives the same fit written in
+    /// units `scale` times larger. It carries no ARD prior: a prior on the
+    /// latent coordinate is not rescaled with the outputs, so with one the arms
+    /// would be different problems and invariance would not be the solver's to
+    /// keep.
+    fn scaled_periodic_atom(p: usize, scale: f64) -> SaeManifoldAtom {
+        let evaluator =
+            std::sync::Arc::new(PeriodicHarmonicEvaluator::new(5).expect("periodic basis"));
+        let anchor = ndarray::array![[0.21_f64]];
+        let (phi, jet) = evaluator
+            .evaluate(anchor.view())
+            .expect("evaluate periodic basis");
+        let width = phi.ncols();
+        let decoder = Array2::from_shape_fn((width, p), |(basis, out)| {
+            scale * 0.4 * (0.61 * (5 * basis + 2 * out + 3) as f64).sin()
+        });
+        SaeManifoldAtom::new_with_provided_function_gram(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            decoder,
+            Array2::<f64>::eye(width),
+        )
+        .expect("periodic atom")
+        .with_basis_evaluator(evaluator)
+    }
+
+    /// #4498 — `x → c·x, B → c·B` is the same fit written in other units. The
+    /// residual and the Jacobian scale by `c`, the gradient `J M r` by `c²`,
+    /// and the stationary coordinate does not move at all, so neither may the
+    /// row's verdict.
+    ///
+    /// The old test compared `‖g‖`, which carries units of output² per latent
+    /// unit, with `1e-10·(1 + ‖x‖)`, which carries units of output: it scaled
+    /// by at most `c`, and by nothing at all while `‖x‖ ≪ 1`. At `c = 1e3` it
+    /// demanded a stationarity residual below the arithmetic's own resolution
+    /// and reported a stationary row unconverged; at `c = 1e-3` it accepted a
+    /// relative residual of about `1e-4`. The ratio
+    /// `‖g‖ / gradient_natural_scale` is a pure number, so the three arms agree.
+    ///
+    /// The coordinates are compared against the band the certificate itself
+    /// allows: each arm stops with `‖g‖ ≤ resolution·natural_scale`, and near a
+    /// nondegenerate minimum `g ≈ H·(t − t*)`, so each arm is within
+    /// `resolution·natural_scale/H` of the exact stationary point and the two
+    /// are within twice that of each other. That band is `c`-free, because
+    /// `natural_scale` and `H` both scale by `c²`.
+    #[test]
+    fn joint_encode_verdict_and_solution_are_invariant_to_the_output_scale_4498() {
+        let p = 4usize;
+        let truth = ndarray::array![0.37_f64];
+        let start = ndarray::array![0.33_f64];
+        let amplitudes = ndarray::array![0.8_f64];
+        let mut verdicts = Vec::new();
+        let mut solutions = Vec::new();
+        for scale in [1.0e-3_f64, 1.0, 1.0e3] {
+            let atoms = [scaled_periodic_atom(p, scale)];
+            let target = decode(&atoms[0], &truth, amplitudes[0]);
+            let (coords, converged) = joint_encode_refine_row(
+                &atoms,
+                std::slice::from_ref(&start),
+                target.view(),
+                amplitudes.view(),
+                None,
+            )
+            .expect("joint encode");
+            verdicts.push(converged);
+            solutions.push(coords[0][0]);
+        }
+        assert_eq!(
+            verdicts,
+            vec![true, true, true],
+            "one stationary row read at three output scales: solutions {solutions:?}"
+        );
+
+        let unit_atoms = [scaled_periodic_atom(p, 1.0)];
+        let unit_target = decode(&unit_atoms[0], &truth, amplitudes[0]);
+        let unit_solution = ndarray::array![solutions[1]];
+        let jet = joint_encode_value_grad_hess(
+            &unit_atoms,
+            std::slice::from_ref(&unit_solution),
+            unit_target.view(),
+            amplitudes.view(),
+            None,
+        )
+        .expect("the jet at the unit-scale solution");
+        let curvature = jet.curvature[[0, 0]];
+        let resolution = joint_encode_stationarity_resolution(1, p, 0, unit_atoms[0].basis_size());
+        let coordinate_band = 2.0 * resolution * jet.gradient_natural_scale / curvature;
+        assert!(
+            coordinate_band < (start[0] - truth[0]).abs(),
+            "premise: the agreement band {coordinate_band:e} must resolve less than the distance \
+             the solve travelled, or agreement is free"
+        );
+        for (scale, solution) in [1.0e-3_f64, 1.0e3].iter().zip([solutions[0], solutions[2]]) {
+            assert!(
+                (solution - solutions[1]).abs() <= coordinate_band,
+                "scale {scale:e} moved the solution to {solution:.17e} from {:.17e}, beyond the \
+                 certificate's own band {coordinate_band:e}",
+                solutions[1]
+            );
+        }
     }
 }

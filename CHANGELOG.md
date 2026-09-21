@@ -1,5 +1,24 @@
 ## Unreleased
 
+- **The joint encode row solve stops on quantities the problem states** (#4498).
+  `joint_encode_refine_row` declared a row converged when `‖Jᵀ M r‖ ≤ 1e-10·(1 + ‖x‖)`.
+  The gradient carries units of output² per latent unit and the bound carries units
+  of output, so `converged` moved with the units of the data: under `x → c·x,
+  B → c·B`, the same fit in other units, the gradient scales by `c²` and the bound
+  by at most `c`, and by nothing at all while `‖x‖ ≪ 1`. Large activations were
+  reported unconverged below the arithmetic's own resolution, inflating
+  `amortized_encoder_consistency().unconverged_fraction`, and small targets were
+  certified at a relative stationarity residual of about `1e-4`. The test is now the
+  dimensionless `‖g‖ / (‖J‖_F(‖M r‖ + ‖M x‖) + ‖g_prior‖)` against Wilkinson's `γ_k`
+  for the assembly that forms it, the joint-encode analogue of the P-IRLS
+  `penalized_gradient_natural_scale`. The step-length exit, which compared a
+  latent-chart length with the same output-space bound, is deleted: one rule decides
+  the row. `joint_encode_damped_step` reads the smallest admissible Levenberg
+  damping off the spectrum it already computes, `max(trust, band − λ_min)` with
+  `band` the symmetric spectrum's rounding band, so the escalate-and-refactor retry
+  for an unfactorable or non-descent system is gone and the trust region starts open.
+  **Behavior change:** a row's `converged` verdict, and so `unconverged_fraction`,
+  now reads the same at every scaling of the targets and the decoder.
 - **The block-chart evidence floor is the SSE sum's own rounding band** (#2469).
   `crossfit_evidence` floored both profiled variances at `1.0e-12 * (max SSE / n)`,
   with a second `.max(1.0e-300)` under it to keep an all-zero pair out of `0/0`.
