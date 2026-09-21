@@ -490,7 +490,9 @@ fn finite_difference_subject() -> (SubjectNodes, Vec<f64>, Vec<f64>, Vec<f64>) {
 /// The derivative pass at the default quadrature tolerance, the accuracy a
 /// fit certifies its grid to.
 fn with_derivatives() -> Evaluation {
-    Evaluation::Derivatives
+    Evaluation::Derivatives {
+        tolerance: EventHistorySpec::new(Vec::new()).quadrature_tolerance,
+    }
 }
 
 fn evaluate_at(

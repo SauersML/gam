@@ -1,5 +1,24 @@
 ## Unreleased
 
+- **The event-history smoother cut its density at an underived `1e-11` and never measured what
+  it discarded** (gam#4559, gam#3998). `marginal.rs` formed the smoothed marginal `raw · β` as a
+  value before normalising it, which forced a floor: the product overflows where the
+  future-likelihood ratio `β` is astronomically large and underflows where `raw` is
+  astronomically small, and a point cut for either reason took its mass with it unmeasured.
+  `1e-11` matched no noise the crate models — a Lagrange forward operator amplifies nodal
+  roundoff by the Lebesgue constant, and `ε·Λ_G` crosses `1e-11` between order 17 and order 21,
+  so from order 21 up the floor sat below the noise while at order 9 it discarded real mass. The
+  floor is gone, not retuned. Each point's log mass `ln w + ln raw + ln β` is summed by
+  log-sum-exp and every point is divided by that total in the log, which bounds each normalised
+  value by `1/w` before anything is exponentiated, so nothing is cut for being small or large.
+  What the log domain cannot repair is a point whose `raw` is the representation's own noise, and
+  that noise is now derived where it stands: `Λ_G · ε · k` for the `k` interpolating forward
+  kernels the density came through, the same product the fit's Gauss-Hermite order gate already
+  runs on. A point is resolved when it stands `1/tolerance` above that noise, and a marginal more
+  than `quadrature_tolerance` of whose mass sits on unresolved points is refused with a typed
+  error naming the share — the promise `EventHistoryFamily` has documented since the mechanism
+  was reverted by the merge of PR #3411. The Louis Hessian and `latent_state` move by at most the
+  mass the old floor was discarding, which is now bounded rather than assumed.
 - **A survival `sample()` described a different posterior than the same fit's `predict()`**
   (gam#3184). The survival NUTS path targets `π(β | ρ̂, y)` and returned those draws labelled
   `covariance_source = "conditional"`, while `predict()` on the same fit priced its bands off the

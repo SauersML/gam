@@ -449,6 +449,14 @@ impl EventHistoryFamily {
         &self.gh
     }
 
+    /// The relative accuracy this family's quadrature is certified to, which
+    /// the smoother reads every marginal's unresolved mass against
+    /// (`super::marginal`). A prediction that runs the smoother outside an
+    /// evaluation reads it here, so one fit has one such accuracy.
+    pub(crate) fn quadrature_tolerance(&self) -> f64 {
+        self.quadrature_tolerance
+    }
+
     /// Width of the latent block: the loadings, then the log-rates of the
     /// atoms whose rates are coefficients.
     pub(crate) fn latent_width(&self) -> usize {
@@ -630,7 +638,11 @@ impl EventHistoryFamily {
         let subjects = &self.nodes.subjects;
         let gh = &self.gh;
         let time_scale = self.time_scale;
-        let evaluation = if derivatives { Evaluation::Derivatives } else { Evaluation::Value };
+        let evaluation = if derivatives {
+            Evaluation::Derivatives { tolerance: self.quadrature_tolerance }
+        } else {
+            Evaluation::Value
+        };
         let row_direction = |dir: Option<&Array1<f64>>, d: usize, row: usize| -> f64 {
             dir.map_or(0.0, |dir| {
                 let design = &designs[d];

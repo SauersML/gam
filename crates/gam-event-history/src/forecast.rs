@@ -313,17 +313,20 @@ pub fn latent_state(
     let eta0 = node_eta0(fit, nodes.node_data.view())?;
     let subject = &nodes.subjects[0];
     let normaliser = forecast_normaliser(fit, stratum, &subject.times)?;
-    let moments = latent_state_moments(&SubjectInputs {
-        nodes: subject,
-        eta0: &eta0,
-        loadings: &loadings,
-        rates: &rates,
-        time_scale: fit.time_scale,
-        gh: fit.family.gauss_hermite(),
-        continuation_gap: 0.0,
-        designs: None,
-        log_normaliser: normaliser.as_deref(),
-    })?;
+    let moments = latent_state_moments(
+        &SubjectInputs {
+            nodes: subject,
+            eta0: &eta0,
+            loadings: &loadings,
+            rates: &rates,
+            time_scale: fit.time_scale,
+            gh: fit.family.gauss_hermite(),
+            continuation_gap: 0.0,
+            designs: None,
+            log_normaliser: normaliser.as_deref(),
+        },
+        fit.family.quadrature_tolerance(),
+    )?;
     let mut mean = Array2::<f64>::zeros((subject.len(), atoms));
     let mut covariance = Vec::with_capacity(subject.len());
     for (n, (node_mean, node_covariance)) in moments.iter().enumerate() {
