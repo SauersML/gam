@@ -257,7 +257,7 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
     // column whose M-spline derivative support sits beyond the largest training
     // exit time is ≈0 at every training row (so the old derivative-only clause
     // missed it) yet still varies in value — which is EXACTLY why `keep_cols`
-    // retained it (`construction.rs:1513-1532`, `constant_tol = 1e-12`, the same
+    // retained it (`ispline_columns_varying_on` in `construction.rs`, the same
     // geometric criterion applied here at the point of use). The derivative
     // clause is retained so a minimal warp column that carries derivative
     // structure without a materialized value spread (e.g. an anchor-centered

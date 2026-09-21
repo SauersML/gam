@@ -31,8 +31,8 @@ use gam_terms::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
     BasisMetadata, BasisOptions, Dense, ISplineBoundary, KnotSource, OneDimensionalBoundary,
     bspline_derivative_penalty_matrix, build_bspline_basis_1d, create_basis,
-    evaluate_bspline_derivative_scalar, ispline_modelling_interval, ispline_value,
-    ispline_value_and_first_derivative,
+    evaluate_bspline_derivative_scalar, ispline_columns_varying_on, ispline_modelling_interval,
+    ispline_value, ispline_value_and_first_derivative,
 };
 use gam_terms::inference::formula_dsl::{LinkWiggleFormulaSpec, parse_link_choice};
 use ndarray::{Array1, Array2, Array3, array, s};
@@ -1685,7 +1685,7 @@ pub fn build_survival_time_basis(
                 let chain = 1.0 / age_exit[i].max(SURVIVAL_TIME_FLOOR);
                 for j in 0..p_time {
                     let v = deriv_buf[j] * chain;
-                    if v.abs() > 1e-15 {
+                    if v != 0.0 {
                         deriv_triplets.push(faer::sparse::Triplet::new(i, j, v));
                     }
                 }
@@ -1868,23 +1868,38 @@ pub fn build_survival_time_basis(
                     ));
                 }
 
+                // A column is kept iff it takes more than one value on the
+                // times the basis is evaluated at. That is decided from the
+                // knots and the range of those times (#3288), not from the
+                // spread of the evaluated values against an absolute cut-off,
+                // which rounding in a saturated column can cross.
                 let keep_cols = if keep_cols.is_empty() {
-                    let constant_tol = 1e-12_f64;
-                    let mut inferred_keep_cols: Vec<usize> = Vec::new();
-                    for j in 0..p_time_full {
-                        let mut minv = f64::INFINITY;
-                        let mut maxv = f64::NEG_INFINITY;
-                        for i in 0..n {
-                            let ve = x_exit_full[[i, j]];
-                            let vs = x_entry_full[[i, j]];
-                            minv = minv.min(ve.min(vs));
-                            maxv = maxv.max(ve.max(vs));
-                        }
-                        if (maxv - minv) > constant_tol {
-                            inferred_keep_cols.push(j);
-                        }
+                    let (lo, hi) = log_entry_for_basis
+                        .iter()
+                        .chain(log_exit.iter())
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| {
+                            (lo.min(x), hi.max(x))
+                        });
+                    let varies = ispline_columns_varying_on(
+                        knotvec.view(),
+                        degree,
+                        lo,
+                        hi,
+                        ISplineBoundary::LinearTails,
+                    )
+                    .map_err(|e| format!("failed to resolve varying ispline time columns: {e}"))?;
+                    if varies.len() != p_time_full {
+                        return Err(format!(
+                            "internal error: ispline column variation covers {} columns but the \
+                             basis has {p_time_full}",
+                            varies.len()
+                        ));
                     }
-                    inferred_keep_cols
+                    varies
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(j, &kept)| kept.then_some(j))
+                        .collect()
                 } else {
                     keep_cols
                 };
@@ -1921,16 +1936,14 @@ pub fn build_survival_time_basis(
             for i in 0..n {
                 let chain = 1.0 / age_exit[i].max(SURVIVAL_TIME_FLOOR);
                 for (j_new, &j_old) in keep_cols.iter().enumerate() {
-                    let raw_v = d_exit_log_full[[i, j_old]] * chain;
-                    let v = if (-1e-12..0.0).contains(&raw_v) {
-                        0.0
-                    } else {
-                        raw_v
-                    };
+                    // `M_k ≥ 0` holds exactly — it is a Cox–de Boor value
+                    // times a positive scale (#3288) — and `chain > 0`, so a
+                    // negative entry is a broken invariant, not rounding.
+                    let v = d_exit_log_full[[i, j_old]] * chain;
                     if !v.is_finite() {
                         found_nonfinite = Some((i, j_new));
                     }
-                    if v < -1e-12 {
+                    if v < 0.0 {
                         return Err(format!(
                             "survival ispline derivative basis must stay non-negative at row {}, column {}; found {:.3e}",
                             i + 1,
@@ -1938,7 +1951,7 @@ pub fn build_survival_time_basis(
                             v
                         ));
                     }
-                    if v.abs() > 1e-15 {
+                    if v != 0.0 {
                         deriv_triplets.push(faer::sparse::Triplet::new(i, j_new, v));
                     }
                 }

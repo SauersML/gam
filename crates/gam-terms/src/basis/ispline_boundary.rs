@@ -165,6 +165,67 @@ pub fn ispline_value(
     Ok(value)
 }
 
+/// Which I-spline columns take more than one value on `[lo, hi]`, under a
+/// declared boundary convention.
+///
+/// `I_j` is continuous and non-decreasing with derivative `M_j ≥ 0`, so
+/// `I_j(hi) − I_j(lo) = ∫_lo^hi M_j`, and that is positive iff `M_j > 0` on part
+/// of `(lo, hi)`. Inside `[left, right]` the M-spline is a positive multiple of
+/// a B-spline and is positive exactly on the open support `(t_{j+1}, t_{j+k+1})`,
+/// `k = degree + 1`; under [`ISplineBoundary::LinearTails`] it is the constant
+/// `M_j(left)` below the interval and `M_j(right)` above it. Each clause is a
+/// comparison of knots with `lo`/`hi` or a sign of a Cox–de Boor value, so the
+/// answer is structural: a column that is flat on the data is not kept because
+/// rounding moved it, and a column that varies is not dropped because it moved
+/// by less than an absolute cut-off (#3288).
+///
+/// For a finite set of evaluation points `[lo, hi]` is their range; a monotone
+/// column that is constant across its extremes is constant across the set.
+pub fn ispline_columns_varying_on(
+    knots: ArrayView1<'_, f64>,
+    degree: usize,
+    lo: f64,
+    hi: f64,
+    boundary: ISplineBoundary,
+) -> Result<Vec<bool>, BasisError> {
+    if !(lo.is_finite() && hi.is_finite()) {
+        return Err(BasisError::InvalidInput(format!(
+            "I-spline column variation needs a finite range; got [{lo}, {hi}]"
+        )));
+    }
+    let interval = ispline_modelling_interval(knots, degree)?;
+    // `ispline_modelling_interval` has validated that the frame fits.
+    let order = degree + 1;
+    let columns = (knots.len() - order - 1).saturating_sub(1);
+    let mut varies = vec![false; columns];
+    let Some((left, right)) = interval else {
+        return Ok(varies);
+    };
+    if !(lo < hi) {
+        return Ok(varies);
+    }
+    let owned_knots = knots.to_owned();
+    let boundary_slopes = match boundary {
+        ISplineBoundary::Saturate => None,
+        ISplineBoundary::LinearTails => Some(create_ispline_derivative_dense(
+            Array1::from_vec(vec![left, right]).view(),
+            &owned_knots,
+            degree,
+            1,
+        )?),
+    };
+    for (column, flag) in varies.iter_mut().enumerate() {
+        let support_lo = knots[column + 1].max(left);
+        let support_hi = knots[column + order + 1].min(right);
+        let interior = lo.max(support_lo) < hi.min(support_hi);
+        let exterior = boundary_slopes.as_ref().is_some_and(|slopes| {
+            (lo < left && slopes[[0, column]] > 0.0) || (hi > right && slopes[[1, column]] > 0.0)
+        });
+        *flag = interior || exterior;
+    }
+    Ok(varies)
+}
+
 /// Continue an already-evaluated `(value, derivative)` pair affinely past the
 /// boundary knots, at the pair's own one-sided boundary derivative.
 ///
@@ -334,6 +395,62 @@ mod tests_ispline_boundary {
                 }
             }
         }
+    }
+
+    /// #3288: the structural answer is the brute-force one — a column varies on
+    /// `[lo, hi]` iff its published derivative is positive somewhere inside —
+    /// on interior windows, whole-interval, and exterior windows, under both
+    /// conventions, with no tolerance on either side.
+    #[test]
+    fn the_varying_columns_are_those_with_derivative_mass_in_the_range_3288() {
+        let knots = clamped_knots(0.0, 1.0, 4);
+        let ranges = [
+            (0.05, 0.15),
+            (0.45, 0.55),
+            (0.85, 0.95),
+            (0.21, 0.39),
+            (0.0, 1.0),
+            (-2.0, -1.0),
+            (2.0, 3.0),
+            (-2.0, 3.0),
+        ];
+        let mut saw_mixed = [false; 2];
+        let mut saw_exterior_only = false;
+        for (which, boundary) in [ISplineBoundary::Saturate, ISplineBoundary::LinearTails]
+            .into_iter()
+            .enumerate()
+        {
+            for &(lo, hi) in &ranges {
+                let varies = ispline_columns_varying_on(knots.view(), 3, lo, hi, boundary)
+                    .expect("structural column variation");
+                let grid =
+                    Array1::from_iter((1..2000).map(|i| lo + (hi - lo) * (i as f64) / 2000.0));
+                let (_, derivative) =
+                    ispline_value_and_first_derivative(grid.view(), knots.view(), 3, boundary)
+                        .expect("derivative on the range");
+                assert_eq!(varies.len(), derivative.ncols());
+                for (column, &flag) in varies.iter().enumerate() {
+                    let brute = derivative.column(column).iter().any(|&m| m > 0.0);
+                    assert_eq!(
+                        flag, brute,
+                        "{boundary:?} on [{lo}, {hi}]: column {column} structural {flag} vs \
+                         derivative mass {brute}"
+                    );
+                }
+                saw_mixed[which] |= varies.iter().any(|&v| v) && varies.iter().any(|&v| !v);
+                if boundary == ISplineBoundary::LinearTails && hi < 0.0 {
+                    saw_exterior_only |= varies.iter().any(|&v| v);
+                }
+            }
+        }
+        assert!(
+            saw_mixed[0] && saw_mixed[1],
+            "each convention must see a window that keeps some columns and drops others"
+        );
+        assert!(
+            saw_exterior_only,
+            "a linear tail must make a column vary on a window below every knot"
+        );
     }
 
     #[test]

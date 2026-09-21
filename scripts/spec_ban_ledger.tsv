@@ -33,13 +33,10 @@ magic	crates/gam-models/src/fit_orchestration/drivers/constant_curvature_kappa_j
 magic	crates/gam-models/src/fit_orchestration/drivers/constant_curvature_kappa_jet.rs	> 1.0e-8	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs	.max(1e-12)	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/fit_orchestration/fit.rs	<= 1e-10	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-models/src/survival/construction.rs	< -1e-12	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/construction.rs	< 1e-15	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/construction.rs	< 1e-15	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/construction.rs	< 1e-15	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/construction.rs	< 1e-8	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-models/src/survival/construction.rs	> 1e-15	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-models/src/survival/construction.rs	> 1e-15	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/latent/survival/mod.rs	<= 1e-15	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/marginal_slope/feasibility.rs	> 1e-24	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/marginal_slope/fit_entry.rs	<= 1e-10	https://github.com/SauersML/gam/issues/2469
