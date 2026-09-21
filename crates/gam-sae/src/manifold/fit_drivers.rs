@@ -1172,14 +1172,15 @@ impl SaeManifoldTerm {
         let transport = solve_basis_transport(new_phi.view(), old_phi.view())?;
         let old_decoder = self.atoms[atom_idx].decoder_coefficients().clone();
         let new_decoder = fast_ab(&transport, &old_decoder);
-        let (image_scale, max_abs) = image_invariance_extremes(
+        let extremes = image_invariance_extremes(
             old_phi.view(),
             old_decoder.view(),
             new_phi.view(),
             new_decoder.view(),
         )?;
-        let fit_scale = image_scale.max(1.0);
-        if max_abs > 1.0e-8 * fit_scale {
+        // Negated so a non-finite disagreement refuses the gauge instead of
+        // slipping through the comparison.
+        if !(extremes.max_abs <= extremes.band) {
             return Ok(());
         }
 
@@ -1579,7 +1580,7 @@ impl SaeManifoldTerm {
         atom_idx: usize,
         topology: &crate::chart_canonicalization::CanonicalChartTopology,
     ) -> Result<Option<PreparedUnitSpeedChart>, String> {
-        use crate::chart_canonicalization::{CHART_RECOMPOSITION_REL_TOL, unit_speed_retraction};
+        use crate::chart_canonicalization::unit_speed_retraction;
         let n = self.n_obs();
         if n == 0 {
             return Ok(None);
@@ -1626,16 +1627,13 @@ impl SaeManifoldTerm {
         // Per-row image-invariance gate: the grid gate certified the curve at
         // the audit nodes; this certifies it at the coordinates the fit
         // actually sits on. Same honest-fallback contract.
-        let (fit_scale, max_abs) = image_invariance_extremes(
+        let extremes = image_invariance_extremes(
             self.atoms[atom_idx].basis_values.view(),
             self.atoms[atom_idx].decoder_coefficients().view(),
             new_phi.view(),
             repar.new_decoder.view(),
         )?;
-        if !(fit_scale.is_finite() && max_abs.is_finite()) {
-            return Ok(None);
-        }
-        if fit_scale > 0.0 && max_abs > CHART_RECOMPOSITION_REL_TOL * fit_scale {
+        if !extremes.image_scale.is_finite() || !(extremes.max_abs <= extremes.band) {
             return Ok(None);
         }
         Ok(Some(PreparedUnitSpeedChart {
@@ -1695,22 +1693,50 @@ struct PreparedUnitSpeedChart {
     decoder_transport: Array2<f64>,
 }
 
-/// The two extremes a canonicalization's per-row image-invariance gate reads:
-/// `maxᵢⱼ max(|Φ_old B_old|ᵢⱼ, |Φ_new B_new|ᵢⱼ)` and `maxᵢⱼ |Φ_old B_old − Φ_new B_new|ᵢⱼ`,
-/// each starting from `0` and ignoring non-finite products exactly as `f64::max` does.
+/// What a canonicalization's per-row image-invariance gate reads over the two
+/// images `Φ_old B_old` and `Φ_new B_new`, and the band it judges them by.
 ///
-/// #2283 — folded one row at a time with a `p`-length scratch pair per rayon worker,
+/// #2283 — folded one row at a time with `p`-length scratch rows per rayon worker,
 /// never as the two `n × p` images. At the #2283 cell (96 000 rows, `p = 2048`) each
 /// image is 1.47 GiB, and the in-loop unit-speed retraction held two per atom per batch
-/// slot on every accepted inner iteration. Both extremes are maxima, so the folding
+/// slot on every accepted inner iteration. Every field is a maximum, so the folding
 /// order cannot change them; only the rounding of the individual products can differ
 /// from a blocked matrix product.
+struct ImageInvarianceExtremes {
+    /// `maxᵢⱼ max(|Φ_old B_old|ᵢⱼ, |Φ_new B_new|ᵢⱼ)`: the scale the images are read at.
+    image_scale: f64,
+    /// `maxᵢⱼ |Φ_old B_old − Φ_new B_new|ᵢⱼ`: the disagreement itself.
+    max_abs: f64,
+    /// The largest disagreement a canonicalization that IS an exact
+    /// reparameterization can leave. `Φ_old·B_old = Φ_new·(T·B_old)` exactly
+    /// whenever the new chart spans the old one, so what separates the two
+    /// images in binary64 is read off the operands rather than chosen:
+    ///
+    /// * each image entry is an inner product over the chart's basis columns,
+    ///   within `γ_width·Σ_b|φ·b|` of the exact one (Higham, *ASNA* 2nd ed.,
+    ///   §3.1). The fold carries the largest such `Σ_b|φ·b|` over entries,
+    ///   summed across the two images, so the two inner products are charged
+    ///   together at the widest of the two bases;
+    /// * `B_new = T·B_old` carries the transport solve. That solve keeps
+    ///   exactly the singular directions above `design_rank_cutoff`, a relative
+    ///   resolution of `max(rows, width)·ε`, and a relative perturbation of the
+    ///   transport is a relative perturbation of the image it produces, so it
+    ///   enters at `max(rows, width)·ε·image_scale`.
+    ///
+    /// A gauge change that is NOT an exact reparameterization moves the image
+    /// by a relative `O(1)`, which no rounding band covers. This is the single
+    /// rule every image-invariance gate in this file reads; it replaces a fixed
+    /// relative allowance, which is wrong in both directions as the basis width
+    /// and the row count move.
+    band: f64,
+}
+
 fn image_invariance_extremes(
     old_phi: ArrayView2<'_, f64>,
     old_decoder: ArrayView2<'_, f64>,
     new_phi: ArrayView2<'_, f64>,
     new_decoder: ArrayView2<'_, f64>,
-) -> Result<(f64, f64), String> {
+) -> Result<ImageInvarianceExtremes, String> {
     use rayon::prelude::*;
     let (rows, old_width) = old_phi.dim();
     let (new_rows, new_width) = new_phi.dim();
@@ -1737,44 +1763,69 @@ fn image_invariance_extremes(
     let new_decoder = new_decoder
         .as_slice()
         .expect("a standard-layout array is contiguous");
-    Ok((0..rows)
+    // `(image_scale, max_abs, Σ_b|φ·b| over both images)` per row; the third
+    // slot is the magnitude sum the two inner products accumulate, which bands
+    // their rounding and cannot be recovered at the gate because the images are
+    // never materialized.
+    let (image_scale, max_abs, term_magnitude) = (0..rows)
         .into_par_iter()
         .map_init(
-            || (vec![0.0_f64; p], vec![0.0_f64; p]),
-            |(old_image, new_image), row| {
+            || (vec![0.0_f64; p], vec![0.0_f64; p], vec![0.0_f64; p]),
+            |(old_image, new_image, terms), row| {
                 old_image.fill(0.0);
                 new_image.fill(0.0);
+                terms.fill(0.0);
                 for basis in 0..old_width {
                     let phi = old_phi[[row, basis]];
-                    for (slot, &coefficient) in old_image
+                    for ((slot, term), &coefficient) in old_image
                         .iter_mut()
+                        .zip(terms.iter_mut())
                         .zip(&old_decoder[basis * p..(basis + 1) * p])
                     {
                         *slot += phi * coefficient;
+                        *term += (phi * coefficient).abs();
                     }
                 }
                 for basis in 0..new_width {
                     let phi = new_phi[[row, basis]];
-                    for (slot, &coefficient) in new_image
+                    for ((slot, term), &coefficient) in new_image
                         .iter_mut()
+                        .zip(terms.iter_mut())
                         .zip(&new_decoder[basis * p..(basis + 1) * p])
                     {
                         *slot += phi * coefficient;
+                        *term += (phi * coefficient).abs();
                     }
                 }
                 let mut fit_scale = 0.0_f64;
                 let mut max_abs = 0.0_f64;
-                for (&a, &b) in old_image.iter().zip(new_image.iter()) {
+                let mut term_magnitude = 0.0_f64;
+                for ((&a, &b), &term) in old_image.iter().zip(new_image.iter()).zip(terms.iter()) {
                     fit_scale = fit_scale.max(a.abs()).max(b.abs());
                     max_abs = max_abs.max((a - b).abs());
+                    term_magnitude = term_magnitude.max(term);
                 }
-                (fit_scale, max_abs)
+                (fit_scale, max_abs, term_magnitude)
             },
         )
         .reduce(
-            || (0.0_f64, 0.0_f64),
-            |(scale_a, drift_a), (scale_b, drift_b)| (scale_a.max(scale_b), drift_a.max(drift_b)),
-        ))
+            || (0.0_f64, 0.0_f64, 0.0_f64),
+            |(scale_a, drift_a, terms_a), (scale_b, drift_b, terms_b)| {
+                (
+                    scale_a.max(scale_b),
+                    drift_a.max(drift_b),
+                    terms_a.max(terms_b),
+                )
+            },
+        );
+    let width = old_width.max(new_width);
+    let band = gam_linalg::roundoff::accumulation_band(width, term_magnitude)
+        + rows.max(width) as f64 * f64::EPSILON * image_scale;
+    Ok(ImageInvarianceExtremes {
+        image_scale,
+        max_abs,
+        band,
+    })
 }
 
 impl SaeManifoldTerm {
@@ -1867,9 +1918,7 @@ impl SaeManifoldTerm {
         atom_idx: usize,
         period: f64,
     ) -> Result<bool, String> {
-        use crate::chart_canonicalization::{
-            CHART_RECOMPOSITION_REL_TOL, torus_isometry_flow_reparameterization,
-        };
+        use crate::chart_canonicalization::torus_isometry_flow_reparameterization;
         let n = self.n_obs();
         if n == 0 {
             return Ok(false);
@@ -1907,16 +1956,13 @@ impl SaeManifoldTerm {
         // Per-row image-invariance gate: the audit grid certified the image
         // at the transport nodes; this certifies it at the coordinates the
         // fit actually sits on. Same honest-fallback contract as d = 1.
-        let (fit_scale, max_abs) = image_invariance_extremes(
+        let extremes = image_invariance_extremes(
             self.atoms[atom_idx].basis_values.view(),
             self.atoms[atom_idx].decoder_coefficients().view(),
             new_phi.view(),
             repar.new_decoder.view(),
         )?;
-        if !(fit_scale.is_finite() && max_abs.is_finite()) {
-            return Ok(false);
-        }
-        if fit_scale > 0.0 && max_abs > CHART_RECOMPOSITION_REL_TOL * fit_scale {
+        if !extremes.image_scale.is_finite() || !(extremes.max_abs <= extremes.band) {
             return Ok(false);
         }
 
@@ -1959,9 +2005,7 @@ impl SaeManifoldTerm {
         &mut self,
         atom_idx: usize,
     ) -> Result<bool, String> {
-        use crate::chart_canonicalization::{
-            CHART_RECOMPOSITION_REL_TOL, patch_isometry_flow_reparameterization,
-        };
+        use crate::chart_canonicalization::patch_isometry_flow_reparameterization;
         let n = self.n_obs();
         if n == 0 {
             return Ok(false);
@@ -1998,16 +2042,13 @@ impl SaeManifoldTerm {
         // Per-row image-invariance gate: the audit grid certified the image at
         // the transport nodes; this certifies it at the coordinates the fit
         // actually sits on. Same honest-fallback contract as the torus path.
-        let (fit_scale, max_abs) = image_invariance_extremes(
+        let extremes = image_invariance_extremes(
             self.atoms[atom_idx].basis_values.view(),
             self.atoms[atom_idx].decoder_coefficients().view(),
             new_phi.view(),
             repar.new_decoder.view(),
         )?;
-        if !(fit_scale.is_finite() && max_abs.is_finite()) {
-            return Ok(false);
-        }
-        if fit_scale > 0.0 && max_abs > CHART_RECOMPOSITION_REL_TOL * fit_scale {
+        if !extremes.image_scale.is_finite() || !(extremes.max_abs <= extremes.band) {
             return Ok(false);
         }
 
@@ -2050,9 +2091,7 @@ impl SaeManifoldTerm {
         &mut self,
         atom_idx: usize,
     ) -> Result<bool, String> {
-        use crate::chart_canonicalization::{
-            CHART_RECOMPOSITION_REL_TOL, sphere_isometry_flow_reparameterization,
-        };
+        use crate::chart_canonicalization::sphere_isometry_flow_reparameterization;
         let n = self.n_obs();
         if n == 0 {
             return Ok(false);
@@ -2089,16 +2128,13 @@ impl SaeManifoldTerm {
         // Per-row image-invariance gate: the audit grid certified the image at
         // the transport nodes; this certifies it at the coordinates the fit
         // actually sits on. Same honest-fallback contract as the torus path.
-        let (fit_scale, max_abs) = image_invariance_extremes(
+        let extremes = image_invariance_extremes(
             self.atoms[atom_idx].basis_values.view(),
             self.atoms[atom_idx].decoder_coefficients().view(),
             new_phi.view(),
             repar.new_decoder.view(),
         )?;
-        if !(fit_scale.is_finite() && max_abs.is_finite()) {
-            return Ok(false);
-        }
-        if fit_scale > 0.0 && max_abs > CHART_RECOMPOSITION_REL_TOL * fit_scale {
+        if !extremes.image_scale.is_finite() || !(extremes.max_abs <= extremes.band) {
             return Ok(false);
         }
 

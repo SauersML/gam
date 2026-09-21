@@ -114,9 +114,8 @@ pub fn sae_residual_seed_logits(
     // own scale so the head start is dimensionless. The best atom (lowest
     // residual) gets a positive logit, the worst a negative one, and a row whose
     // atoms all explain it equally well lands at exactly zero. Normalise by the
-    // row's mean residual across atoms (with a floor relative to the dataset to
-    // keep near-zero-energy rows well posed) so the spread is O(gain) regardless
-    // of output magnitude.
+    // row's mean residual across atoms so the spread is O(gain) regardless of
+    // output magnitude.
     //
     // The mean-centring is what keeps the seed safe across assignment maps.
     // Softmax is translation-invariant, so subtracting the per-row mean leaves
@@ -127,29 +126,35 @@ pub fn sae_residual_seed_logits(
     // the uniform saddle held. Centring restores `logit=0 ⇒ gate=0.5` on ties
     // and opens the gate (`logit>0`) only for atoms that beat the row mean.
     //
-    // The floor enters the DIVISOR only. The centre is always the row's true
-    // mean: centring on the floored scale instead would give a row whose mean
-    // residual sits below the floor the logits `-gain·(r − floor)/floor ≈ +gain`
-    // on every atom — an exactly-fitted (or zero) row would open every ordered
-    // Beta--Bernoulli gate at `sigmoid(gain/τ)` rather than sit at the neutral
-    // 0.5 the centring exists to preserve.
-    let mut global_mean = 0.0_f64;
+    // There is no divisor floor. A row's mean residual is resolved from zero
+    // only above the rounding of the energies that formed it: each
+    // `resid[[row, k]]` is the `p_out`-term sum of squares `Σ_c (z − fitted)²`,
+    // and a projection of that row can leave nothing below
+    // `accumulation_band(p_out, Σ_c z²)` — the band of the same accumulation at
+    // the largest magnitude it can carry, the row's own energy. A row inside
+    // that band is fitted to working precision by every atom: the centring
+    // already sends its logits to zero, and there is no scale to divide by, so
+    // it keeps the zeros `logits` was built with. That IS the neutral state the
+    // mean-centring exists to produce (`logit = 0 ⇒ gate = 0.5`), reached
+    // without inventing a denominator, and a row the old floor merely damped
+    // toward zero now lands on it exactly. A row that IS resolved is divided by
+    // its own true mean, so its spread is `O(gain)` at whatever magnitude it
+    // sits at — the floor used to flatten resolved-but-small rows to nothing.
     for row in 0..n_obs {
-        for k in 0..k_atoms {
-            global_mean += resid[[row, k]];
+        let mut row_energy = 0.0_f64;
+        for col in 0..p_out {
+            row_energy += z[[row, col]] * z[[row, col]];
         }
-    }
-    global_mean /= (n_obs * k_atoms) as f64;
-    let floor = (global_mean * 1.0e-6).max(1.0e-12);
-    for row in 0..n_obs {
         let mut row_mean = 0.0_f64;
         for k in 0..k_atoms {
             row_mean += resid[[row, k]];
         }
         row_mean /= k_atoms as f64;
-        let row_scale = row_mean.max(floor);
+        if !(row_mean > gam_linalg::roundoff::accumulation_band(p_out, row_energy)) {
+            continue;
+        }
         for k in 0..k_atoms {
-            logits[[row, k]] = -gain * (resid[[row, k]] - row_mean) / row_scale;
+            logits[[row, k]] = -gain * (resid[[row, k]] - row_mean) / row_mean;
         }
     }
     Ok(logits)

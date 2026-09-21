@@ -1595,8 +1595,19 @@ fn finalize_sae_fit_report(
         &fit_diagnostics.topology_persistence,
     ));
 
+    // An atom is active when the assignment mass it carries is resolved from
+    // zero against the mass the assignment map distributed. Each row's weights
+    // come out of one normalization (softmax, or the ordered Beta-Bernoulli
+    // gate), so they carry that normalization's rounding, and summing a column
+    // over `n_obs` rows accumulates it: the column sum of an atom that holds
+    // nothing is within `accumulation_band(n_obs, Σ|assignments|)` of zero. An
+    // atom below that band holds nothing the arithmetic separates from the
+    // other atoms' rounding, and the band moves with the row count, which a
+    // fixed number does not.
+    let assignment_mass: f64 = assignments.iter().map(|value| value.abs()).sum();
+    let active_band = gam_linalg::roundoff::accumulation_band(n_obs, assignment_mass);
     let active_mask: Vec<bool> = (0..k_atoms)
-        .map(|atom_idx| assignments.column(atom_idx).sum() > 1.0e-8)
+        .map(|atom_idx| assignments.column(atom_idx).sum() > active_band)
         .collect();
     let mut means = vec![0.0_f64; p_out];
     for row in 0..n_obs {
