@@ -1037,8 +1037,16 @@ fn representer_section_chart(
     // `spectral_tolerance` convention (#1425's single classifier) every other
     // penalty-spectrum consumer reads. No second constant, and the two
     // decisions can no longer disagree about which directions are penalized.
-    let rank_tolerance =
-        z_rbf.ncols().max(1) as f64 * super::bspline_build::SPECTRAL_RANK_RELATIVE_TOLERANCE;
+    //
+    // The bar is dimensionless — it scores `(σ_i/floor)²`, a ratio — so it is
+    // taken at a unit spectrum, which is the convention's relative width at
+    // this chart's dimension. Restating the constant's arithmetic here instead
+    // would leave this decision behind when the rank cutoff moves, which is the
+    // one thing the constant's own doc forbids (gam#4057).
+    let rank_tolerance = super::bspline_build::spectral_tolerance_for_dim(
+        z_rbf.ncols().max(1),
+        &Array1::from_elem(1, 1.0),
+    );
     let visibility = amplification_floor * rank_tolerance.sqrt();
     let retention = existence.max(visibility);
     let kept: Vec<usize> = (0..singular.len())

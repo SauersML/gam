@@ -3021,12 +3021,17 @@ mod hybrid_high_dim_psd_tests {
         // constrained Gram is PSD in exact arithmetic. Before gam#1424 the
         // partial-fraction kernel evaluation lost every significant digit here
         // and the normalized λ_min was ≈ −0.264. The stable single-integral
-        // kernel keeps λ_min at the float noise floor. Tolerance is the same
-        // scale-relative noise floor the penalty pipeline scores this block
-        // against, taken from its own constant; do NOT weaken it.
+        // kernel keeps λ_min at the float noise floor. The bar is the noise
+        // convention — "is this negative eigenvalue roundoff?" — read through
+        // its own predicate at a unit spectrum, since `lambda_min_rel` is
+        // already scale-relative. It used to restate the RANK constant's
+        // arithmetic, which is a different question with the opposite safety
+        // direction and would have dragged this refusal along with any move of
+        // the rank cutoff (gam#4057); the two constants are equal today, so the
+        // bar itself is unchanged. Do NOT weaken it.
         let d = 16;
         let n = 4 * d; // penalty dimension upper bound (kernel coeff frame).
-        let tol = (n as f64) * SPECTRAL_RANK_RELATIVE_TOLERANCE;
+        let tol = spectral_noise_tolerance(&Array1::from_elem(n, 1.0));
         let lambda_min_rel = hybrid_constrained_lambda_min(d, 7);
         assert!(
             lambda_min_rel >= -tol,
@@ -3042,7 +3047,9 @@ mod hybrid_high_dim_psd_tests {
         // d=10). Each must now be PSD to the float noise floor.
         for (d, s) in [(8usize, 3usize), (10, 4), (12, 5)] {
             let n = 4 * d;
-            let tol = (n as f64) * SPECTRAL_RANK_RELATIVE_TOLERANCE;
+            // The noise convention at a unit spectrum, as in the `d = 16` case
+            // above and for the same reason (gam#4057).
+            let tol = spectral_noise_tolerance(&Array1::from_elem(n, 1.0));
             let lambda_min_rel = hybrid_constrained_lambda_min(d, s);
             assert!(
                 lambda_min_rel >= -tol,
