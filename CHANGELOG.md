@@ -60,6 +60,25 @@
   custom-family fits now carry the smoothing and hyperparameter uncertainty, so they are
   wider than the conditional ones they used to report, and a fit that cannot mint the
   correction says which reason applies instead of returning `None`.
+- **`SymmetricMatrix::factorize` has one SPD contract on both storages** (gam#3696).
+  The method behaved differently depending on how the matrix happened to be stored.
+  Dense storage went through the `StableSolver` fallback ladder, LLT then LDLT then
+  LBLT, so it accepted indefinite matrices and even negative-definite ones; sparse
+  storage used a strict SPD Cholesky and refused exactly those matrices. Every caller
+  reads the result as an SPD factor: `effectivehessian`'s admissibility check,
+  `calculate_edf`, the survival and custom-family EDF traces, the implicit-function
+  warm-start solves and the prediction precision backend. On dense storage an indefinite
+  `H` therefore passed through with no error and those quantities were computed from a
+  factorization of something that is not a precision. The lenient method is deleted and
+  the strict `factorize_spd` becomes `factorize`, so there is one contract. Both arms now
+  run an unperturbed Cholesky in which every pivot must clear its own derived
+  `gamma_2n` roundoff band, and the sparse arm first canonicalizes any triangle
+  convention through the new `factorize_sparse_spd_certified`, so callers keep their
+  storage freedom. `StableSolver` and `factorize_symmetricwith_fallback` are unchanged.
+  **Behavior change:** a dense symmetric matrix that is not positive definite is now
+  refused by `factorize` instead of being factored. A fit that used to report an EDF or
+  an admissibility verdict computed from such a factor now fails at that point, with the
+  pivot that did not clear its band.
 - **Multinomial smooth significance is a softmax score test, and the saved model format
   moves to version 3** (#3569, #1101). `MultinomialSavedModel::smooth_significance` ran a
   per-class Wood rank-truncated Wald test. It now runs the shared variance-component score
