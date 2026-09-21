@@ -1316,18 +1316,49 @@ mod shape_uncertainty_joint_recompute_tests {
         );
     }
 
+    /// The unit-scale whitening factor of a DIAGONAL noise covariance
+    /// `Σ = diag(sd²)`: `U = diag(1/sd)`, so `U Uᵀ = Σ⁻¹`.
+    fn diagonal_whitening_factor_2933_f34(sd: &[f64]) -> ndarray::Array2<f64> {
+        ndarray::Array2::<f64>::from_shape_fn((sd.len(), sd.len()), |(i, k)| {
+            if i == k { 1.0 / sd[i] } else { 0.0 }
+        })
+    }
+
+    /// The unit-scale whitening factor of a NON-DIAGONAL noise covariance
+    /// `Σ = Q diag(sd²) Qᵀ`, with `Q` the rotation of `angle` in the first two
+    /// output axes: the symmetric `U = Q diag(1/sd) Qᵀ`, so `U Uᵀ = Σ⁻¹`
+    /// (#3440, the #2933 F34 remainder). `Σ` keeps the diagonal fixture's
+    /// spectrum and its condition number; only the correlation between output
+    /// channels is new, which is what a whitening seam that reads a metric's
+    /// diagonal alone would drop.
+    fn rotated_whitening_factor_2933_f34(sd: &[f64], angle: f64) -> ndarray::Array2<f64> {
+        let p = sd.len();
+        let (sin, cos) = angle.sin_cos();
+        let rotation = ndarray::Array2::<f64>::from_shape_fn((p, p), |(i, k)| match (i, k) {
+            (0, 0) | (1, 1) => cos,
+            (0, 1) => -sin,
+            (1, 0) => sin,
+            _ if i == k => 1.0,
+            _ => 0.0,
+        });
+        let inverse_sd = diagonal_whitening_factor_2933_f34(sd);
+        rotation.dot(&inverse_sd).dot(&rotation.t())
+    }
+
     /// Joint shape bands of the tiny fixture with every observation unit scaled
     /// by `unit`, optionally under the known whitening covariance
-    /// `Σ = unit²·diag(sd²)` (`M_n = Σ⁻¹`, installed as `U_n = Σ^{-1/2}`).
+    /// `Σ = unit²·(U₀U₀ᵀ)⁻¹` for the unit-scale factor `U₀`
+    /// (`M_n = Σ⁻¹`, installed as `U_n = U₀/unit`).
     ///
     /// Scaling the target and decoders by `unit`, `Σ` by `unit²` and
     /// `λ_smooth` by `unit⁻²` leaves the whitened inner objective unchanged, so
     /// the coordinates and gates are the same state and only the decoder moves
     /// to `unit·B`. The transformation law of a covariance is therefore
-    /// `Cov(unit·B) = unit²·Cov(B)` exactly.
+    /// `Cov(unit·B) = unit²·Cov(B)` exactly. The law does not depend on `Σ`
+    /// being diagonal, so `U₀` is a full matrix here (#3440).
     fn scaled_whitened_shape_uncertainty_2933_f34(
         unit: f64,
-        sd: Option<&[f64]>,
+        factor: Option<&ndarray::Array2<f64>>,
     ) -> crate::manifold::SaeShapeUncertainty {
         let (mut term, target, mut rho) =
             crate::manifold::tests_recovery_split_780::gamma_fd_tiny_fixture();
@@ -1345,17 +1376,22 @@ mod shape_uncertainty_joint_recompute_tests {
         }
         let target = target.mapv(|v| unit * v);
         let (n, p) = target.dim();
-        if let Some(sd) = sd {
+        if let Some(factor) = factor {
+            assert_eq!(
+                factor.dim(),
+                (p, p),
+                "the whitening factor must be square in the output dimension"
+            );
             let factors = ndarray::Array2::<f64>::from_shape_fn((n, p * p), |(_, flat)| {
                 let (i, k) = (flat / p, flat % p);
-                if i == k { 1.0 / (unit * sd[i]) } else { 0.0 }
+                factor[[i, k]] / unit
             });
             let metric = gam_problem::RowMetric::whitened_structured(
                 std::sync::Arc::new(factors),
                 p,
                 p,
             )
-            .expect("diagonal whitening factors");
+            .expect("whitening factors");
             term.set_row_metric(metric).expect("conformable whitening metric");
         }
         term.recompute_joint_shape_uncertainty(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
@@ -1413,9 +1449,10 @@ mod shape_uncertainty_joint_recompute_tests {
     /// by the raw residual variance (≈ 4× the unit-scale one) gave 16.
     #[test]
     fn isotropic_known_whitening_counts_the_noise_variance_once_2933_f34() {
+        let identity = diagonal_whitening_factor_2933_f34(&[1.0; 3]);
         let euclidean = scaled_whitened_shape_uncertainty_2933_f34(1.0, None);
-        let unit_whitened = scaled_whitened_shape_uncertainty_2933_f34(1.0, Some(&[1.0; 3]));
-        let doubled_whitened = scaled_whitened_shape_uncertainty_2933_f34(2.0, Some(&[1.0; 3]));
+        let unit_whitened = scaled_whitened_shape_uncertainty_2933_f34(1.0, Some(&identity));
+        let doubled_whitened = scaled_whitened_shape_uncertainty_2933_f34(2.0, Some(&identity));
 
         // `M = I` is the isotropic likelihood routed through the whitening seam.
         assert_shape_covariance_law_2933_f34(&euclidean, &unit_whitened, 1.0, "Σ = I vs isotropic");
@@ -1456,8 +1493,9 @@ mod shape_uncertainty_joint_recompute_tests {
     #[test]
     fn whitened_shape_covariance_obeys_the_observation_unit_law_2933_f34() {
         let sd = [1.0, 2.0, 0.5];
-        let base = scaled_whitened_shape_uncertainty_2933_f34(1.0, Some(&sd));
-        let tripled = scaled_whitened_shape_uncertainty_2933_f34(3.0, Some(&sd));
+        let factor = diagonal_whitening_factor_2933_f34(&sd);
+        let base = scaled_whitened_shape_uncertainty_2933_f34(1.0, Some(&factor));
+        let tripled = scaled_whitened_shape_uncertainty_2933_f34(3.0, Some(&factor));
         assert_shape_covariance_law_2933_f34(&base, &tripled, 3.0, "Σ = 9·diag(1, 4, 1/4) on 3z");
         let base_likelihood = base.dispersion.likelihood_dispersion;
         let base_raw = base.dispersion.raw_output_noise_variance;
@@ -1472,6 +1510,101 @@ mod shape_uncertainty_joint_recompute_tests {
                 <= 1.0e-3 * 9.0 * base_raw,
             "raw noise variance must scale by 9: {} vs 9·{base_raw}",
             tripled.dispersion.raw_output_noise_variance
+        );
+    }
+
+    /// #3440, the #2933 F34 remainder — the same observation-unit law under a
+    /// noise covariance whose output channels are CORRELATED.
+    ///
+    /// Both F34 pins above install a diagonal `Σ`, so a whitening seam that
+    /// read only a metric's diagonal would satisfy them. Here
+    /// `Σ = Q diag(1, 4, ¼) Qᵀ` with `Q` a rotation of 0.35 rad in the first two
+    /// output axes: the same spectrum and condition number, correlation
+    /// `ρ₀₁ = −0.43` between the first two channels. Rescaling every
+    /// observation unit by 3 must still scale each band sd by 3 and every
+    /// decoder covariance by 9, with the whitened dispersion unchanged and the
+    /// raw noise variance ×9 — the law is a statement about units and does not
+    /// depend on `Σ` being diagonal.
+    ///
+    /// The premise assertion is what makes the rotation load-bearing: the
+    /// rotated metric must move the shape covariance away from the unrotated
+    /// one it shares a spectrum with. If it did not, this fixture would be the
+    /// diagonal one under another name.
+    #[test]
+    fn rotated_whitening_obeys_the_observation_unit_law_2933_f34() {
+        let sd = [1.0, 2.0, 0.5];
+        let angle = 0.35_f64;
+        let rotated = rotated_whitening_factor_2933_f34(&sd, angle);
+        let diagonal = diagonal_whitening_factor_2933_f34(&sd);
+        let off_diagonal = (rotated[[0, 1]].abs()).max(rotated[[1, 0]].abs());
+        println!(
+            "[#3440 F34] rotated whitening factor off-diagonal {off_diagonal:.6e}, \
+             diagonal {:.6e}/{:.6e}/{:.6e}",
+            rotated[[0, 0]],
+            rotated[[1, 1]],
+            rotated[[2, 2]]
+        );
+        // Premise: the factor really is non-diagonal.
+        assert!(
+            off_diagonal > 0.1,
+            "the rotation must correlate two output channels; |U₀₁| = {off_diagonal:.3e}"
+        );
+
+        let base = scaled_whitened_shape_uncertainty_2933_f34(1.0, Some(&rotated));
+        let tripled = scaled_whitened_shape_uncertainty_2933_f34(3.0, Some(&rotated));
+        assert_shape_covariance_law_2933_f34(
+            &base,
+            &tripled,
+            3.0,
+            "Σ = 9·Q diag(1, 4, ¼) Qᵀ on 3z",
+        );
+
+        let base_likelihood = base.dispersion.likelihood_dispersion;
+        let base_raw = base.dispersion.raw_output_noise_variance;
+        assert!(
+            (tripled.dispersion.likelihood_dispersion - base_likelihood).abs()
+                <= 1.0e-3 * base_likelihood,
+            "whitened dispersion must be unit-free under a correlated Σ: {} vs {base_likelihood}",
+            tripled.dispersion.likelihood_dispersion
+        );
+        assert!(
+            (tripled.dispersion.raw_output_noise_variance - 9.0 * base_raw).abs()
+                <= 1.0e-3 * 9.0 * base_raw,
+            "raw noise variance must scale by 9 under a correlated Σ: {} vs 9·{base_raw}",
+            tripled.dispersion.raw_output_noise_variance
+        );
+
+        // Premise: the correlation reaches the covariance. Compared with the
+        // unrotated metric of the same spectrum, the fitted shape covariance
+        // must move by more than the 1e-3 band the law above is asserted to.
+        let unrotated = scaled_whitened_shape_uncertainty_2933_f34(1.0, Some(&diagonal));
+        let mut worst_relative = 0.0_f64;
+        for (atom, (rotated_atom, diagonal_atom)) in
+            base.atoms.iter().zip(unrotated.atoms.iter()).enumerate()
+        {
+            let a = rotated_atom
+                .decoder_covariance
+                .as_ref()
+                .expect("rotated covariance");
+            let b = diagonal_atom
+                .decoder_covariance
+                .as_ref()
+                .expect("diagonal covariance");
+            assert_eq!(a.dim(), b.dim(), "atom {atom} covariance shape");
+            let norm = b.mapv(|v| v * v).sum().sqrt();
+            let miss = (a - b).mapv(|v| v * v).sum().sqrt();
+            println!(
+                "[#3440 F34] atom {atom}: ‖Cov_rot − Cov_diag‖_F = {miss:.6e} against \
+                 ‖Cov_diag‖_F = {norm:.6e}"
+            );
+            if norm > 0.0 {
+                worst_relative = worst_relative.max(miss / norm);
+            }
+        }
+        assert!(
+            worst_relative > 1.0e-2,
+            "the rotation must move the shape covariance, or this pin is the diagonal \
+             fixture again (relative move {worst_relative:.3e})"
         );
     }
 }
