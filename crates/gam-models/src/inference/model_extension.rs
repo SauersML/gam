@@ -175,7 +175,7 @@ fn extend_model_with_random_effect_level(
             term_name,
         )?,
     };
-    for fit in [payload.fit_result.as_ref(), payload.unified.as_ref()].into_iter().flatten() {
+    if let Some(fit) = payload.fit_result.as_ref() {
         unscaled_prior_precision(fit, coefficient_variance)?;
     }
     let schema = payload

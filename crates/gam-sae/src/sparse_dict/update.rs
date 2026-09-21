@@ -3479,10 +3479,8 @@ fn recycled_component_preconditioner(
                 )
                 .enumerate()
                 .for_each(|(i, (image_row, error_row))| {
-                    let own = basis
-                        .row(i)
-                        .as_slice()
-                        .expect("Galerkin basis row is contiguous");
+                    let own_row = basis.row(i);
+                    let own = own_row.as_slice().expect("Galerkin basis row is contiguous");
                     image_row.copy_from_slice(own);
                     for q in 0..rank {
                         error_row[q] = own[q].abs();

@@ -518,17 +518,15 @@ impl BinomialLocationScaleFamily {
                 })?;
                 let (f, f1, f2, f3) = binomial_expected_q_information_third_derivatives(
                     self.weights[i],
+                    core.q0[i],
+                    &self.link_kind,
                     core.mu[i],
                     core.dmu_dq[i],
                     core.d2mu_dq2[i],
                     core.d3mu_dq3[i],
                     d4,
-                );
-                if !f3.is_finite() {
-                    return Err(format!(
-                        "binomial location-scale expected information third derivative is non-finite at row {i}"
-                    ));
-                }
+                )
+                .map_err(|error| format!("binomial location-scale row {i}: {error}"))?;
                 let q = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
                 let u = [d_eta_t_u[i], d_eta_ls_u[i]];
                 let v = [d_eta_t_v[i], d_eta_ls_v[i]];

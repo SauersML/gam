@@ -307,6 +307,11 @@ fn apply_precision_prior_weights(
         NoiseModel::InverseGaussian { phi } | NoiseModel::Tweedie { phi, .. } => {
             scale_rows_by_prior_weights(phi, weights, false, |phi, w| phi / w)
         }
+        // A prior weight on a proportion is a trial-count multiplier; the sampler's
+        // trial-count check is the one owner of integrality.
+        NoiseModel::BinomialProportion { trials } => {
+            scale_rows_by_prior_weights(trials, weights, false, |trials, w| trials * w)
+        }
         NoiseModel::Poisson
         | NoiseModel::NegativeBinomial { .. }
         | NoiseModel::Beta { .. }

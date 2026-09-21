@@ -352,15 +352,18 @@ pub(crate) fn binomial_expected_location_scale_second_coefficients(
 #[inline]
 pub(crate) fn binomial_expected_q_information_third_derivatives(
     weight: f64,
+    q: f64,
+    link_kind: &InverseLink,
     mu: f64,
     d1: f64,
     d2: f64,
     d3: f64,
     d4: f64,
-) -> (f64, f64, f64, f64) {
-    let (f, f1, f2) = binomial_expected_q_information_derivatives(weight, mu, d1, d2, d3);
+) -> Result<(f64, f64, f64, f64), String> {
+    let (f, f1, f2) =
+        binomial_expected_q_information_derivatives(weight, q, link_kind, mu, d1, d2, d3)?;
     if f == 0.0 && f1 == 0.0 && f2 == 0.0 {
-        return (0.0, 0.0, 0.0, 0.0);
+        return Ok((0.0, 0.0, 0.0, 0.0));
     }
     let var = mu * (1.0 - mu);
     let one_minus_two_mu = 1.0 - 2.0 * mu;
@@ -379,7 +382,12 @@ pub(crate) fn binomial_expected_q_information_third_derivatives(
         * (num1_second / var_squared
             - (4.0 * num1_prime * var1 + 2.0 * num1 * var2) / (var_squared * var)
             + 6.0 * num1 * var1 * var1 / (var_squared * var_squared));
-    (f, f1, f2, f3)
+    if !f3.is_finite() {
+        return Err(format!(
+            "binomial expected information third derivative is not representable at q={q}: {f3}"
+        ));
+    }
+    Ok((f, f1, f2, f3))
 }
 
 /// Row coefficients `(tt, tl, ll)` of the expected information's third directional derivative

@@ -1,6 +1,6 @@
 // The per-term variance-component test — the driver that turns a fitted
 // standard GAM into "does each `group()` block carry a between-group effect?"
-// and "does each ridged slope carry an effect?".
+// and "does each ridged linear term carry any effect?" (#3573).
 //
 // `include!`d into `drivers/mod.rs` like the other self-contained inference
 // subsystems, so it shares the driver's flat namespace and import surface.
@@ -11,8 +11,16 @@
 // over; every term gets a record, and a term the test cannot score carries the
 // typed reason instead of a p-value.
 
-/// The variance-component test of every random-effect block and every
-/// `LinearTermRidge`-penalized linear term of a fitted standard GAM.
+/// The variance-component score tests of a fitted standard GAM: one record
+/// per random-effect block and one per linear term carrying the null-recovery
+/// ridge (`TermCollectionDesign::ridged_linear_ranges`, #3573).
+pub struct VarianceComponentTestRecords {
+    pub random_effect: Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord>,
+    pub linear_term: Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord>,
+}
+
+/// The variance-component test of every random-effect block and every ridged
+/// linear term of a fitted standard GAM, scored against one shared basis.
 ///
 /// A ridged slope `β_j` with penalty `λ_j m_j β_j²` is the variance component
 /// `β_j ~ N(0, φ/(λ_j m_j))`, and "no effect" is `λ_j = ∞`, on the boundary:
@@ -26,8 +34,8 @@
 ///
 /// Never fails: a fit without the row state the score needs yields one
 /// `NoIrlsRowState` record per term, so the summary always has an answer for
-/// each tested row.
-pub fn random_effect_test_records(
+/// each such row.
+pub fn variance_component_test_records(
     design: &gam_terms::smooth::TermCollectionDesign,
     fit: &UnifiedFitResult,
 ) -> VarianceComponentTestRecords {
@@ -37,16 +45,15 @@ pub fn random_effect_test_records(
         RandomEffectTestUnavailable,
     };
 
+    let random_effect_count = design.random_effect_ranges.len();
     let ranges: Vec<(String, std::ops::Range<usize>)> = design
-        .ridged_linear_ranges()
-        .into_iter()
-        .chain(design.random_effect_ranges.iter().cloned())
+        .random_effect_ranges
+        .iter()
+        .cloned()
+        .chain(design.ridged_linear_ranges())
         .collect();
-    if ranges.is_empty() {
-        return Vec::new();
-    }
-    let records = |outcomes: Vec<RandomEffectTestOutcome>| -> Vec<RandomEffectTestRecord> {
-        ranges
+    let split = |outcomes: Vec<RandomEffectTestOutcome>| {
+        let mut records: Vec<RandomEffectTestRecord> = ranges
             .iter()
             .zip(outcomes)
             .map(|((name, range), outcome)| RandomEffectTestRecord {

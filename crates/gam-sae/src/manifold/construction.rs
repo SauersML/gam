@@ -684,7 +684,7 @@ pub(crate) fn realised_rank_charge_dof(
 }
 
 /// The rank-charge branch one atom is priced on, with the DOF it charges
-/// ([`super::wbic_audit::RankChargeStratum::production_dof`]). The criterion
+/// ([`super::rank_charge_stratum::RankChargeStratum::production_dof`]). The criterion
 /// seams read the branch as well as the DOF, because the outer search needs to
 /// know which smooth piece of the criterion a value came from (#3436).
 fn realised_rank_charge_stratum(
@@ -695,7 +695,7 @@ fn realised_rank_charge_stratum(
     r_floor: f64,
     lam_smooth: f64,
     smooth_penalty: Option<&Array2<f64>>,
-) -> Result<super::wbic_audit::RankChargeStratum, String> {
+) -> Result<super::rank_charge_stratum::RankChargeStratum, String> {
     // One stratum producer for the value, its analytic derivative and the audit,
     // so all three classify the same branch of the same state (#2933 F32).
     let stratum = super::rank_charge_stratum::rank_charge_stratum(

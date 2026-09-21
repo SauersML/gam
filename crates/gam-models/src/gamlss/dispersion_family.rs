@@ -1416,7 +1416,7 @@ enum DispersionRowStacks {
 impl DispersionRowStacks {
     #[inline(always)]
     fn at(kind: DispersionFamilyKind, yi: f64, em: f64, ed: f64, order: usize) -> Self {
-        use gam_math::special::{polygamma_stack, stirling_gap_derivative_stack};
+        use gam_math::special::stirling_gap_derivative_stack;
         match kind {
             DispersionFamilyKind::NegativeBinomial => {
                 let mu = em.exp();
