@@ -14,7 +14,7 @@
 //!   at its certified optimum, whose fit must also ship the corrected
 //!   covariance;
 //! * a Poisson tensor fit whose block is split axis by axis (`m ≥ 2`), where
-//!   the mixed-axis Laplace term `Φ` carries second-order ρ-motion of its own;
+//!   the mixed-axis term `Ψ` carries second-order ρ-motion of its own;
 //! * an inverse-Gaussian fit on its canonical `1/μ²` link, whose one-axis block
 //!   is truncated to the feasible interval `η > 0`: its ends, and with them the
 //!   transported nodes and the interval's mass `ln Z`, move with ρ.

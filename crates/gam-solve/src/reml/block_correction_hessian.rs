@@ -1,9 +1,9 @@
 //! The exact outer ρ-Hessian of the latched #784 block-local correction.
 //!
 //! The correction enters the REML/LAML cost as `−Δ_b` with
-//! `Δ_b = Σ_k V_k + Φ`: one Gauss–Hermite piece `V_k` per block axis (or one
-//! for a single-axis block) plus, when the block is split by axis, the analytic
-//! mixed-axis term `Φ` ([`mixed_axis_laplace_term`]). Every quantity either
+//! `Δ_b = Σ_k V_k + Ψ`: one Gauss–Hermite piece `V_k` per block axis (or one
+//! for a single-axis block) plus, when the block is split by axis, the
+//! mixed-axis term `Ψ = Σ_T κ_T f_T` ([`MixedAxisRule`]). Every quantity either
 //! reads depends on ρ through three smooth objects, and this module carries
 //! each of them to second order:
 //!
@@ -11,15 +11,19 @@
 //! * the block eigenpairs `(λ_r, u_r)(ρ)` of `H = XᵀWX + S_λ`, by simple-
 //!   eigenvalue perturbation theory (the caller has already refused any
 //!   near-degenerate pair, where the eigenframe is not differentiable);
-//! * the row curvature `W(η̂)` and its η-derivatives `c, d, e, f`.
+//! * the row curvature `W(η̂)` and its η-derivatives `c, d`.
 //!
 //! A piece is `V = log Σ_q w_q e^{−F(z_q Y)} − log Σ_q w_q` over fixed
 //! standard-normal nodes `z_q` with `Y = X u/√λ`, so
 //! `−∂²V = E_p[∂²F] − Var_p(∂F)` under the node posterior `p ∝ w e^{−F}`, and
 //! `F`'s row derivatives in `(η̂, s)` are closed forms of `ψ`, `ψ'` and `ψ''`.
+//! Each `f_T` of `Ψ` is the same log-ratio on the three-point rule over the
+//! axes of `T`, at `s = Σ_r z_r Y_r`, so it reads the same row derivatives.
 //! No quantity here is differenced; the tests difference it.
 
-use super::block_quadrature_correction::{block_axis_target, mixed_axis_laplace_term};
+use super::block_quadrature_correction::{
+    MixedAxisPosterior, MixedAxisRule, block_axis_target, visit_mixed_axis_nodes,
+};
 use gam_math::probability::positive_log_sum_exp;
 use super::*;
 use gam_linalg::faer_ndarray::{fast_ab, fast_atb, fast_atv, fast_av, fast_xt_diag_y};
@@ -43,9 +47,8 @@ pub(super) enum RowCurvature {
 /// The excess `F = Σ ψ(η̂+s) − ψ(η̂) − ψ'(η̂)s − ½W s²` has the row derivatives
 /// this module uses only when `W = ψ''(η̂)`: the exported curvature is the
 /// likelihood's observed information, or a canonical link where the Fisher
-/// weights coincide with it. The split block's `Φ` additionally needs the
-/// fourth η-derivative of `W`, which is carried for the families whose
-/// curvature has a closed-form derivative chain.
+/// weights coincide with it. The split block's `Ψ` reads the same excess on
+/// nodes that move several axes at once, so it needs nothing past these.
 pub(super) fn block_correction_row_curvature(
     pirls_result: &PirlsResult,
     inverse_link: &InverseLink,
@@ -88,14 +91,6 @@ pub(super) fn block_correction_row_curvature(
             RowCurvature::Observed
         }
     };
-    if axis_split && fourth_derivative_rule(&response, inverse_link).is_none() {
-        return Err(format!(
-            "the mixed-axis term Φ of a split {block_dim}-axis block needs ∂⁴W/∂η⁴, and the \
-             observed curvature of {response:?} under {inverse_link:?} is not a combination of \
-             at most two powers or exponentials of η, the forms whose ∂⁴W/∂η⁴ follows from \
-             ∂W/∂η and ∂³W/∂η³"
-        ));
-    }
     if !axis_split && block_dim >= 2 {
         return Err(format!(
             "a {block_dim}-axis block integrated by one tensor rule has no exact curvature, so \
@@ -103,127 +98,6 @@ pub(super) fn block_correction_row_curvature(
         ));
     }
     Ok(curvature)
-}
-
-/// The shape of a row's observed curvature `W(η)` that fixes `∂⁴W/∂η⁴`.
-///
-/// Up to a constant, `W = a·g(η) + b·h(η)` with row coefficients `a, b`
-/// (prior weight, dispersion, `y`) that do not depend on `η`. The pair
-/// `c = ∂W/∂η`, `e = ∂³W/∂η³` then fixes `(a, b)`, and so `f = ∂⁴W/∂η⁴`; a
-/// constant term drops out of all three.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum CurvatureShape {
-    /// Binomial-logit: `W = w μ'(η)`, differentiated by the inverse-link jet.
-    LogitJet,
-    /// `W` constant in `η`.
-    Constant,
-    /// `g = η^p`, `h = η^q`: `f = α c/η³ + β e/η`.
-    Powers(f64, Option<f64>),
-    /// `g = e^{rη}`, `h = e^{sη}`: `f = α c + β e`.
-    Rates(f64, Option<f64>),
-}
-
-/// `ψ(η)` below is each family's negative log-likelihood up to `w/φ`, and
-/// `W = ψ''`: e.g. inverse-Gaussian `1/μ²` has `ψ = yη/2 − √η`, so
-/// `W ∝ η^{−3/2}`, and Gaussian-inverse has `ψ = (y − 1/η)²/2`, so
-/// `W = 3η^{−4} − 2yη^{−3}`.
-fn fourth_derivative_rule(
-    response: &ResponseFamily,
-    inverse_link: &InverseLink,
-) -> Option<CurvatureShape> {
-    use CurvatureShape::{Constant, LogitJet, Powers, Rates};
-    let InverseLink::Standard(link) = inverse_link else {
-        return None;
-    };
-    Some(match (response, link) {
-        (ResponseFamily::Binomial, StandardLink::Logit) => LogitJet,
-        // ψ = μ − y ln μ.
-        (ResponseFamily::Poisson, StandardLink::Log) => Rates(1.0, None),
-        (ResponseFamily::Poisson, StandardLink::Identity | StandardLink::Sqrt) => {
-            Powers(-2.0, None)
-        }
-        (ResponseFamily::Poisson, StandardLink::Inverse) => Powers(-3.0, Some(-2.0)),
-        // ψ = y/μ + ln μ.
-        (ResponseFamily::Gamma, StandardLink::Log) => Rates(-1.0, None),
-        (ResponseFamily::Gamma, StandardLink::Inverse) => Powers(-2.0, None),
-        (ResponseFamily::Gamma, StandardLink::Identity) => Powers(-3.0, Some(-2.0)),
-        (ResponseFamily::Gamma, StandardLink::Sqrt) => Powers(-4.0, Some(-2.0)),
-        (ResponseFamily::Gamma, StandardLink::InverseSquared) => Powers(-1.5, Some(-2.0)),
-        // ψ = y/(2μ²) − 1/μ.
-        (ResponseFamily::InverseGaussian, StandardLink::InverseSquared) => Powers(-1.5, None),
-        (ResponseFamily::InverseGaussian, StandardLink::Inverse) => Constant,
-        (ResponseFamily::InverseGaussian, StandardLink::Log) => Rates(-2.0, Some(-1.0)),
-        (ResponseFamily::InverseGaussian, StandardLink::Identity) => Powers(-4.0, Some(-3.0)),
-        (ResponseFamily::InverseGaussian, StandardLink::Sqrt) => Powers(-6.0, Some(-4.0)),
-        // ψ = (y − μ)²/2.
-        (ResponseFamily::Gaussian, StandardLink::Inverse) => Powers(-4.0, Some(-3.0)),
-        (ResponseFamily::Gaussian, StandardLink::InverseSquared) => Powers(-2.5, Some(-3.0)),
-        (ResponseFamily::Gaussian, StandardLink::Log) => Rates(2.0, Some(1.0)),
-        (ResponseFamily::Gaussian, StandardLink::Sqrt) => Powers(2.0, None),
-        _ => return None,
-    })
-}
-
-/// `(α, β)` with `g⁗ = α g′ + β g‴` on each basis function, from its
-/// `(g‴/g′, g⁗/g′)` in reduced units: `((p−1)(p−2), (p−1)(p−2)(p−3))` on
-/// `η^p` (whose powers of `η` the `c/η³`, `e/η` scaling absorbs), and
-/// `(r², r³)` on `e^{rη}`. One basis function takes `α = 0`; two solve the
-/// pair `α + β t_k = q_k`.
-fn fourth_derivative_coefficients(first: (f64, f64), second: Option<(f64, f64)>) -> (f64, f64) {
-    let (t1, q1) = first;
-    match second {
-        None if t1 == 0.0 => (0.0, 0.0),
-        None => (0.0, q1 / t1),
-        Some((t2, q2)) => {
-            let beta = (q1 - q2) / (t1 - t2);
-            (q1 - beta * t1, beta)
-        }
-    }
-}
-
-/// `∂⁴W/∂η⁴` per row for a split block's `Φ`, from `c = ∂W/∂η` and
-/// `e = ∂³W/∂η³` through the curvature's shape.
-pub(super) fn curvature_fourth_derivative(
-    pirls_result: &PirlsResult,
-    inverse_link: &InverseLink,
-    prior_weights: &Array1<f64>,
-    c: &Array1<f64>,
-    e: &Array1<f64>,
-) -> Result<Array1<f64>, EstimationError> {
-    let response = reml_spec(&pirls_result.likelihood).response;
-    let Some(shape) = fourth_derivative_rule(&response, inverse_link) else {
-        crate::bail_invalid_estim!(
-            "#784 mixed-axis ρ-Hessian: the curvature of {response:?} under {inverse_link:?} \
-             has no ∂⁴W/∂η⁴ from its η-derivatives"
-        );
-    };
-    Ok(fourth_from_shape(shape, pirls_result.final_eta.view(), prior_weights, c, e))
-}
-
-fn fourth_from_shape(
-    shape: CurvatureShape,
-    eta: ArrayView1<'_, f64>,
-    prior_weights: &Array1<f64>,
-    c: &Array1<f64>,
-    e: &Array1<f64>,
-) -> Array1<f64> {
-    let power = |p: f64| ((p - 1.0) * (p - 2.0), (p - 1.0) * (p - 2.0) * (p - 3.0));
-    let rate = |r: f64| (r * r, r * r * r);
-    let n = eta.len();
-    match shape {
-        CurvatureShape::LogitJet => Array1::from_shape_fn(n, |i| {
-            prior_weights[i] * crate::mixture_link::logit_inverse_link_jet5(eta[i]).d5
-        }),
-        CurvatureShape::Constant => Array1::zeros(n),
-        CurvatureShape::Powers(p, q) => {
-            let (alpha, beta) = fourth_derivative_coefficients(power(p), q.map(power));
-            Array1::from_shape_fn(n, |i| alpha * c[i] / eta[i].powi(3) + beta * e[i] / eta[i])
-        }
-        CurvatureShape::Rates(r, s) => {
-            let (alpha, beta) = fourth_derivative_coefficients(rate(r), s.map(rate));
-            Array1::from_shape_fn(n, |i| alpha * c[i] + beta * e[i])
-        }
-    }
 }
 
 /// `ψ''(η)` per row at a displaced linear predictor.
@@ -301,8 +175,6 @@ pub(super) struct BlockCorrectionHessianInputs<'x> {
     /// `c = ∂W/∂η` and `d = ∂²W/∂η²` per row.
     pub(super) c: &'x Array1<f64>,
     pub(super) d: &'x Array1<f64>,
-    /// `e = ∂³W/∂η³` and `f = ∂⁴W/∂η⁴`, for a split block's `Φ`.
-    pub(super) e_f: Option<(&'x Array1<f64>, &'x Array1<f64>)>,
 }
 
 /// The cost-side second-order content of `−Δ_b`.
@@ -314,7 +186,7 @@ pub(super) struct BlockCorrectionCostHessian {
     pub(super) implied_gradient: Array1<f64>,
     /// Each piece's `V_k` from the nodes this module integrated.
     pub(super) piece_values: Vec<f64>,
-    /// `Φ`, for a split block.
+    /// `Ψ` from the nodes this module integrated, for a split block.
     pub(super) mixed_value: Option<f64>,
 }
 
@@ -614,6 +486,58 @@ struct NodeRows {
     f_ee: Array1<f64>,
 }
 
+impl NodeRows {
+    fn new(
+        target: &Gam784BlockTarget<'_>,
+        curvature: RowCurvature,
+        geometry: &Geometry<'_, '_>,
+        s: &Array1<f64>,
+        neg_score: &Array1<f64>,
+        base_neg_score: &Array1<f64>,
+    ) -> Result<Self, EstimationError> {
+        let psi2 = displaced_row_curvature(target, curvature, &(&target.eta_hat + s))?;
+        let w_mode = &target.weights_obs;
+        let f_s = neg_score - base_neg_score - &(w_mode * s);
+        let f_ss = &psi2 - w_mode;
+        let s2 = s * s;
+        let f_e = &f_s - &(geometry.c * &s2 * 0.5);
+        let f_es = &f_ss - &(geometry.c * s);
+        let f_ee = &f_es - &(geometry.d * &s2 * 0.5);
+        Ok(Self {
+            f_s,
+            f_ss,
+            f_e,
+            f_es,
+            f_ee,
+        })
+    }
+
+    /// `∂F/∂ρ_j = f_e·E_j + f_s·ṡ_j` for a node moving at `ṡ_j`.
+    fn gradient(&self, mode: &ModeMotion, s_dot: &[Array1<f64>]) -> Array1<f64> {
+        Array1::from_shape_fn(s_dot.len(), |j| {
+            self.f_e.dot(&mode.eta_dot[j]) + self.f_s.dot(&s_dot[j])
+        })
+    }
+
+    /// `∂²F/∂ρ_j∂ρ_l` for pair `k = (j, l)`, less the node's own acceleration
+    /// term `f_s·s̈_jl`.
+    fn second_at_fixed_acceleration(
+        &self,
+        mode: &ModeMotion,
+        s_dot: &[Array1<f64>],
+        k: usize,
+        j: usize,
+        l: usize,
+    ) -> f64 {
+        let (e_j, e_l) = (&mode.eta_dot[j], &mode.eta_dot[l]);
+        (&self.f_ee * e_j).dot(e_l)
+            + (&self.f_es * e_j).dot(&s_dot[l])
+            + (&self.f_es * e_l).dot(&s_dot[j])
+            + (&self.f_ss * &s_dot[j]).dot(&s_dot[l])
+            + self.f_e.dot(&mode.eta_ddot[k])
+    }
+}
+
 /// The node posterior's weighted row sums that `E_p[∂²F]` contracts against
 /// the motion.
 ///
@@ -853,7 +777,6 @@ fn piece_second_order(
     let ngs_base = piece_target
         .base_neg_score()
         .map_err(EstimationError::InvalidInput)?;
-    let w_mode = &piece_target.weights_obs;
     let log_node_weights: Vec<f64> = nodes.iter().map(|&(_, _, ln_w)| ln_w).collect();
     let log_norm = positive_log_sum_exp(&log_node_weights);
     let feasible: Vec<(f64, [f64; 2], f64, Array1<f64>)> = batched
@@ -876,32 +799,18 @@ fn piece_second_order(
     for (tau, sensitivity, lw, ngs) in feasible {
         let prob = (lw - log_mass).exp();
         let s = &axis.y * tau;
-        let psi2 = displaced_row_curvature(piece_target, curvature, &(&piece_target.eta_hat + &s))?;
-        // Row derivatives of F_i = ψ(η̂+s) − ψ(η̂) − ψ'(η̂)s − ½W s², W = ψ''(η̂).
-        let f_s = &ngs - &ngs_base - &(w_mode * &s);
-        let f_ss = &psi2 - w_mode;
-        let s2 = &s * &s;
-        let f_e = &f_s - &(geometry.c * &s2 * 0.5);
-        let f_es = &f_ss - &(geometry.c * &s);
-        let f_ee = &f_es - &(geometry.d * &s2 * 0.5);
+        let row = NodeRows::new(piece_target, curvature, geometry, &s, &ngs, &ngs_base)?;
         // The node `s = Y τ` moves with the axis and, on a truncated axis, with
         // the ends: ṡ_j = Ẏ_j τ + Y τ̇_j with τ̇_j = Σ_a σ_a ė_a,j.
         let sigma: Vec<f64> = ends.iter().map(|end| sensitivity[end.side]).collect();
         let tau_dot: Vec<f64> = (0..n_rho)
             .map(|j| ends.iter().zip(&sigma).map(|(end, s_a)| s_a * end.dot[j]).sum())
             .collect();
-        let f_s_y = f_s.dot(&axis.y);
+        let f_s_y = row.f_s.dot(&axis.y);
         let node_gradient = Array1::from_shape_fn(n_rho, |j| {
-            f_e.dot(&mode.eta_dot[j]) + tau * f_s.dot(&axis.y_dot[j]) + tau_dot[j] * f_s_y
+            row.f_e.dot(&mode.eta_dot[j]) + tau * row.f_s.dot(&axis.y_dot[j]) + tau_dot[j] * f_s_y
         });
-        let rows = NodeRows {
-            f_s,
-            f_ss,
-            f_e,
-            f_es,
-            f_ee,
-        };
-        moments.add(prob, tau, &sigma, &rows, f_s_y);
+        moments.add(prob, tau, &sigma, &row, f_s_y);
         node_gradients.push((prob, node_gradient));
     }
     let expected_second = moments.expected_second(axis, mode, &ends, pairs);
@@ -1003,34 +912,10 @@ pub(super) fn block_correction_cost_hessian(
     }
 
     let mixed_value = if inputs.axis_split {
-        let Some((e, f)) = inputs.e_f else {
-            crate::bail_invalid_estim!("#784 ρ-Hessian: a split block needs the e and f carriers");
-        };
-        let n = target.x_transformed.nrows();
-        let a = Array2::from_shape_fn((n, m), |(i, r)| axes[r].y[i]);
-        let a_dot: Vec<Array2<f64>> = (0..n_rho)
-            .map(|j| Array2::from_shape_fn((n, m), |(i, r)| axes[r].y_dot[j][i]))
-            .collect();
-        let a_ddot: Vec<Array2<f64>> = (0..geometry.pairs.len())
-            .map(|k| Array2::from_shape_fn((n, m), |(i, r)| axes[r].y_ddot[k][i]))
-            .collect();
-        let derivatives = mixed_axis_laplace_rho_derivatives(
-            a.view(),
-            inputs.c,
-            inputs.d,
-            e,
-            f,
-            MixedAxisMotion {
-                a_dot: &a_dot,
-                a_ddot: &a_ddot,
-                eta_dot: &mode.eta_dot,
-                eta_ddot: &mode.eta_ddot,
-                pairs: &geometry.pairs,
-            },
-        );
-        hessian -= &derivatives.hessian;
-        implied_gradient -= &derivatives.gradient;
-        Some(mixed_axis_laplace_term(a.view(), inputs.c, inputs.d, e).value)
+        let mixed = mixed_axis_second_order(target, inputs.curvature, &axes, &mode, &geometry)?;
+        hessian += &mixed.hessian;
+        implied_gradient += &mixed.gradient;
+        Some(mixed.value)
     } else {
         None
     };
@@ -1042,481 +927,217 @@ pub(super) fn block_correction_cost_hessian(
     })
 }
 
-/// `∂Φ/∂ρ` and `∂²Φ/∂ρ∂ρᵀ` of the mixed-axis term.
-pub(super) struct MixedAxisRhoDerivatives {
-    pub(super) gradient: Array1<f64>,
-    pub(super) hessian: Array2<f64>,
-}
-
-/// The ρ-motion of the whitened rows and the mode: `Ȧ_j`, `Ä_jl`, `η̇_j`,
-/// `η̈_jl`, the second-order quantities indexed by `pairs`.
-#[derive(Clone, Copy)]
-pub(super) struct MixedAxisMotion<'a> {
-    pub(super) a_dot: &'a [Array2<f64>],
-    pub(super) a_ddot: &'a [Array2<f64>],
-    pub(super) eta_dot: &'a [Array1<f64>],
-    pub(super) eta_ddot: &'a [Array1<f64>],
-    pub(super) pairs: &'a [(usize, usize)],
-}
-
-/// The ρ-derivatives of `Φ(A, c(η), d(η))` along the whitened rows' motion
-/// `Ȧ_j`, `Ä_jl` and the mode's `E_j = η̇_j`, `η̈_jl`.
+/// `Ψ` of a split block with its cost-side ρ-gradient and ρ-Hessian.
 ///
-/// With `Q_i = |a_i|⁴ − Σ_r a_ir⁴`, `u = Σ c_i |a_i|² a_i` and
-/// `T = Σ c_i a_i^{⊗3}`,
-///
-///   Φ = ⅛|u|² + (1/12)⟨T, T⟩ − (5/24) Σ_r T_rrr² − ⅛ Σ_i d_i Q_i,
-///
-/// so each derivative is the product rule on `u`, `T` and `Q` with
-/// `ċ = d E`, `ḋ = e E`, `c̈ = e E_j E_l + d η̈`, `d̈ = f E_j E_l + e η̈`.
-/// The cost is `O(n·m³·n_ρ + n·m²·n_ρ²)`.
-pub(super) fn mixed_axis_laplace_rho_derivatives(
-    a: ndarray::ArrayView2<'_, f64>,
-    c: &Array1<f64>,
-    d: &Array1<f64>,
-    e: &Array1<f64>,
-    f: &Array1<f64>,
-    motion: MixedAxisMotion<'_>,
-) -> MixedAxisRhoDerivatives {
-    let MixedAxisMotion {
-        a_dot,
-        a_ddot,
-        eta_dot,
-        eta_ddot,
-        pairs,
-    } = motion;
-    let (n, m) = a.dim();
-    let n_rho = a_dot.len();
-    let at = |p: usize, q: usize, r: usize| (p * m + q) * m + r;
-    let m3 = m * m * m;
-
-    let mut u = Array1::<f64>::zeros(m);
-    let mut tensor = vec![0.0_f64; m3];
-    let mut u_dot = vec![Array1::<f64>::zeros(m); n_rho];
-    let mut t_dot = vec![vec![0.0_f64; m3]; n_rho];
-    let mut q_dot = vec![0.0_f64; n_rho];
-    let sq: Vec<f64> = (0..n).map(|i| a.row(i).dot(&a.row(i))).collect();
-    let quartic_q: Vec<f64> = (0..n)
-        .map(|i| sq[i] * sq[i] - a.row(i).iter().map(|v| v.powi(4)).sum::<f64>())
-        .collect();
-    // ∂_j Q_i = 4|a|²(a·Ȧ) − 4 Σ a³Ȧ.
-    let q_first = |i: usize, ad: ArrayView1<'_, f64>| {
-        let ai = a.row(i);
-        4.0 * sq[i] * ai.dot(&ad)
-            - 4.0 * ai.iter().zip(ad.iter()).map(|(x, y)| x * x * x * y).sum::<f64>()
-    };
-    for i in 0..n {
-        let ai = a.row(i);
-        u.scaled_add(c[i] * sq[i], &ai);
-        for p in 0..m {
-            for q in 0..m {
-                let cpq = c[i] * ai[p] * ai[q];
-                for r in 0..m {
-                    tensor[at(p, q, r)] += cpq * ai[r];
-                }
+/// Every node `z` of the rule sits at `s = Σ_r z_r Y_r` with `z` fixed, so it
+/// moves at `ṡ_j = Σ_r z_r Ẏ_{r,j}` and `s̈_jl = Σ_r z_r Ÿ_{r,jl}`. The block
+/// target is evaluated once, with its displaced scores, and each feasible
+/// node's `∂ΔF` and `∂²ΔF` are kept for [`mixed_axis_cost_second_order`].
+fn mixed_axis_second_order(
+    target: &Gam784BlockTarget<'_>,
+    curvature: RowCurvature,
+    axes: &[AxisMotion],
+    mode: &ModeMotion,
+    geometry: &Geometry<'_, '_>,
+) -> Result<PieceSecondOrder, EstimationError> {
+    let m = axes.len();
+    let n = target.eta_hat.len();
+    let n_rho = target.lambdas.len();
+    let pairs = &geometry.pairs;
+    let rule = MixedAxisRule::new(m);
+    let q = rule.node_count();
+    let ngs_base = target
+        .base_neg_score()
+        .map_err(EstimationError::InvalidInput)?;
+    let mut excesses = vec![f64::NAN; q];
+    let mut node_gradients = Array2::<f64>::zeros((q, n_rho));
+    let mut node_seconds = Array2::<f64>::zeros((q, pairs.len()));
+    // One node's displacement, its motions and its row derivatives are live at
+    // a time.
+    let fixed_bytes = n
+        .saturating_mul(8 + n_rho)
+        .saturating_mul(std::mem::size_of::<f64>());
+    visit_mixed_axis_nodes(target, &rule, true, fixed_bytes, |start, z, results| {
+        for (k, (excess, score)) in results.into_iter().enumerate() {
+            let node = start + k;
+            excesses[node] = excess;
+            if !excess.is_finite() {
+                continue;
             }
-        }
-        for j in 0..n_rho {
-            let ad = a_dot[j].row(i);
-            let c_dot = d[i] * eta_dot[j][i];
-            let d_dot = e[i] * eta_dot[j][i];
-            let a_ad = ai.dot(&ad);
-            // ∂(|a|² a) = 2(a·Ȧ)a + |a|²Ȧ.
-            u_dot[j].scaled_add(c_dot * sq[i], &ai);
-            u_dot[j].scaled_add(2.0 * c[i] * a_ad, &ai);
-            u_dot[j].scaled_add(c[i] * sq[i], &ad);
-            let tj = &mut t_dot[j];
-            for p in 0..m {
-                for q in 0..m {
-                    for r in 0..m {
-                        tj[at(p, q, r)] += c_dot * ai[p] * ai[q] * ai[r]
-                            + c[i]
-                                * (ad[p] * ai[q] * ai[r]
-                                    + ai[p] * ad[q] * ai[r]
-                                    + ai[p] * ai[q] * ad[r]);
-                    }
-                }
-            }
-            q_dot[j] += d_dot * quartic_q[i] + d[i] * q_first(i, ad);
-        }
-    }
-    let t_diag: Vec<f64> = (0..m).map(|r| tensor[at(r, r, r)]).collect();
-    let gradient = Array1::from_shape_fn(n_rho, |j| {
-        0.25 * u.dot(&u_dot[j])
-            + tensor
+            let Some(score) = score else {
+                crate::bail_invalid_estim!(
+                    "#784 ρ-Hessian: mixed-axis node {node} is feasible and has no displaced score"
+                );
+            };
+            // Most nodes move one to three axes; the others contribute nothing.
+            let moved: Vec<(f64, &AxisMotion)> = axes
                 .iter()
-                .zip(t_dot[j].iter())
-                .map(|(x, y)| x * y)
-                .sum::<f64>()
-                / 6.0
-            - (5.0 / 12.0) * (0..m).map(|r| t_diag[r] * t_dot[j][at(r, r, r)]).sum::<f64>()
-            - 0.125 * q_dot[j]
-    });
+                .enumerate()
+                .filter_map(|(r, axis)| (z[(r, k)] != 0.0).then_some((z[(r, k)], axis)))
+                .collect();
+            let mut s = Array1::<f64>::zeros(n);
+            for &(z_r, axis) in &moved {
+                s.scaled_add(z_r, &axis.y);
+            }
+            let s_dot: Vec<Array1<f64>> = (0..n_rho)
+                .map(|j| {
+                    let mut v = Array1::<f64>::zeros(n);
+                    for &(z_r, axis) in &moved {
+                        v.scaled_add(z_r, &axis.y_dot[j]);
+                    }
+                    v
+                })
+                .collect();
+            let row = NodeRows::new(target, curvature, geometry, &s, &score, &ngs_base)?;
+            node_gradients
+                .row_mut(node)
+                .assign(&row.gradient(mode, &s_dot));
+            for (p, &(j, l)) in pairs.iter().enumerate() {
+                let f_s_s_ddot: f64 = moved
+                    .iter()
+                    .map(|&(z_r, axis)| z_r * row.f_s.dot(&axis.y_ddot[p]))
+                    .sum();
+                node_seconds[(node, p)] =
+                    row.second_at_fixed_acceleration(mode, &s_dot, p, j, l) + f_s_s_ddot;
+            }
+        }
+        Ok(())
+    })?;
+    let posterior = rule.posterior(&excesses)?;
+    let (gradient, hessian) =
+        mixed_axis_cost_second_order(&posterior, &node_gradients, &node_seconds, pairs);
+    Ok(PieceSecondOrder {
+        value: posterior.value,
+        gradient,
+        hessian,
+    })
+}
 
-    let n_pairs = pairs.len();
-    let mut u_ddot = vec![Array1::<f64>::zeros(m); n_pairs];
-    let mut tt = vec![0.0_f64; n_pairs];
-    let mut t_ddot_diag = vec![vec![0.0_f64; m]; n_pairs];
-    let mut q_ddot = vec![0.0_f64; n_pairs];
-    let mut taa = vec![0.0_f64; m];
-    let mut ta = vec![0.0_f64; m * m];
-    for i in 0..n {
-        let ai = a.row(i);
-        // T(a, ·, ·), T(a, a, ·) and T(a, a, a) at this row.
-        for p in 0..m {
-            for q in 0..m {
-                ta[p * m + q] = (0..m).map(|r| tensor[at(p, q, r)] * ai[r]).sum();
-            }
-        }
-        for q in 0..m {
-            taa[q] = (0..m).map(|p| ta[p * m + q] * ai[p]).sum();
-        }
-        let taaa: f64 = (0..m).map(|q| taa[q] * ai[q]).sum();
-        for (k, &(j, l)) in pairs.iter().enumerate() {
-            let (aj, al, add) = (a_dot[j].row(i), a_dot[l].row(i), a_ddot[k].row(i));
-            let (ej, el, ejl) = (eta_dot[j][i], eta_dot[l][i], eta_ddot[k][i]);
-            let (cj, cl) = (d[i] * ej, d[i] * el);
-            let c2 = e[i] * ej * el + d[i] * ejl;
-            let (dj, dl) = (e[i] * ej, e[i] * el);
-            let d2 = f[i] * ej * el + e[i] * ejl;
-            let a_aj = ai.dot(&aj);
-            let a_al = ai.dot(&al);
-            let aj_al = aj.dot(&al);
-            let a_add = ai.dot(&add);
-            let sqi = sq[i];
-            let ci = c[i];
-            let uk = &mut u_ddot[k];
-            for r in 0..m {
-                let d_l = 2.0 * a_al * ai[r] + sqi * al[r];
-                let d_j = 2.0 * a_aj * ai[r] + sqi * aj[r];
-                let d_jl = 2.0 * (aj_al + a_add) * ai[r]
-                    + 2.0 * a_aj * al[r]
-                    + 2.0 * a_al * aj[r]
-                    + sqi * add[r];
-                uk[r] += c2 * sqi * ai[r] + cj * d_l + cl * d_j + ci * d_jl;
-            }
-            let al_taa: f64 = (0..m).map(|r| al[r] * taa[r]).sum();
-            let aj_taa: f64 = (0..m).map(|r| aj[r] * taa[r]).sum();
-            let add_taa: f64 = (0..m).map(|r| add[r] * taa[r]).sum();
-            let mut aj_ta_al = 0.0;
-            for p in 0..m {
-                for q in 0..m {
-                    aj_ta_al += aj[p] * ta[p * m + q] * al[q];
-                }
-            }
-            tt[k] += c2 * taaa
-                + 3.0 * cj * al_taa
-                + 3.0 * cl * aj_taa
-                + ci * (3.0 * add_taa + 6.0 * aj_ta_al);
-            for r in 0..m {
-                let a2 = ai[r] * ai[r];
-                t_ddot_diag[k][r] += c2 * a2 * ai[r]
-                    + 3.0 * cj * a2 * al[r]
-                    + 3.0 * cl * a2 * aj[r]
-                    + ci * (3.0 * a2 * add[r] + 6.0 * ai[r] * aj[r] * al[r]);
-            }
-            let q2: f64 = 8.0 * a_aj * a_al + 4.0 * sqi * (aj_al + a_add)
-                - (0..m)
-                    .map(|r| {
-                        12.0 * ai[r] * ai[r] * aj[r] * al[r] + 4.0 * ai[r].powi(3) * add[r]
-                    })
-                    .sum::<f64>();
-            q_ddot[k] += d2 * quartic_q[i]
-                + dj * q_first(i, al)
-                + dl * q_first(i, aj)
-                + d[i] * q2;
-        }
-    }
+/// `∂(−Ψ)/∂ρ` and `∂²(−Ψ)/∂ρ∂ρᵀ` from each node's `g = ∂ΔF/∂ρ` (row `z` of
+/// `node_gradients`) and `h_jl = ∂²ΔF/∂ρ_j∂ρ_l` (row `z` of `node_seconds`,
+/// one column per pair).
+///
+/// With `f_T = log Σ w_T e^{−ΔF} − log Σ w_T` and `p_T` its node posterior,
+/// `∂f_T = −E_{p_T}[g]` and `∂²f_T = Var_{p_T}(g) − E_{p_T}[h]`, so
+///
+///   ∂(−Ψ)  = Σ_T κ_T E_{p_T}[g],
+///   ∂²(−Ψ) = Σ_T κ_T (E_{p_T}[h] − Var_{p_T}(g)).
+///
+/// Only a piece's feasible nodes are read.
+fn mixed_axis_cost_second_order(
+    posterior: &MixedAxisPosterior,
+    node_gradients: &Array2<f64>,
+    node_seconds: &Array2<f64>,
+    pairs: &[(usize, usize)],
+) -> (Array1<f64>, Array2<f64>) {
+    let n_rho = node_gradients.ncols();
+    let mut gradient = Array1::<f64>::zeros(n_rho);
     let mut hessian = Array2::<f64>::zeros((n_rho, n_rho));
-    for (k, &(j, l)) in pairs.iter().enumerate() {
-        let tjtl: f64 = t_dot[j]
-            .iter()
-            .zip(t_dot[l].iter())
-            .map(|(x, y)| x * y)
-            .sum();
-        let diag: f64 = (0..m)
-            .map(|r| {
-                t_dot[j][at(r, r, r)] * t_dot[l][at(r, r, r)] + t_diag[r] * t_ddot_diag[k][r]
-            })
-            .sum();
-        let h = 0.25 * (u_dot[j].dot(&u_dot[l]) + u.dot(&u_ddot[k])) + (tjtl + tt[k]) / 6.0
-            - (5.0 / 12.0) * diag
-            - 0.125 * q_ddot[k];
-        hessian[(j, l)] = h;
-        hessian[(l, j)] = h;
+    for piece in &posterior.pieces {
+        let mut mean = Array1::<f64>::zeros(n_rho);
+        for &(node, prob) in &piece.nodes {
+            mean.scaled_add(prob, &node_gradients.row(node));
+        }
+        let mut second = vec![0.0_f64; pairs.len()];
+        for &(node, prob) in &piece.nodes {
+            let centred = &node_gradients.row(node) - &mean;
+            for (k, &(j, l)) in pairs.iter().enumerate() {
+                second[k] += prob * (node_seconds[(node, k)] - centred[j] * centred[l]);
+            }
+        }
+        gradient.scaled_add(piece.coefficient, &mean);
+        for (k, &(j, l)) in pairs.iter().enumerate() {
+            let h = piece.coefficient * second[k];
+            hessian[(j, l)] += h;
+            if j != l {
+                hessian[(l, j)] += h;
+            }
+        }
     }
-    MixedAxisRhoDerivatives { gradient, hessian }
+    (gradient, hessian)
 }
 
 #[cfg(test)]
-mod block_correction_hessian_tests {
+mod mixed_axis_second_order_tests {
     use super::*;
 
-    struct Fixture {
-        a: Array2<f64>,
-        c: Array1<f64>,
-        d: Array1<f64>,
-        e: Array1<f64>,
-        f: Array1<f64>,
-        a_dot: Vec<Array2<f64>>,
-        a_ddot: Vec<Array2<f64>>,
-        eta_dot: Vec<Array1<f64>>,
-        eta_ddot: Vec<Array1<f64>>,
-        pairs: Vec<(usize, usize)>,
-    }
-
-    fn fixture() -> Fixture {
-        let (n, m, n_rho) = (7usize, 3usize, 2usize);
-        let a = Array2::from_shape_fn((n, m), |(i, r)| {
-            ((i * 7 + r * 3) as f64 * 0.61).sin() * 0.4 + 0.05 * r as f64
-        });
-        let c = Array1::from_shape_fn(n, |i| (i as f64 * 1.3).cos() * 0.7);
-        let d = Array1::from_shape_fn(n, |i| 0.3 + (i as f64 * 0.9).sin() * 0.2);
-        let e = Array1::from_shape_fn(n, |i| (i as f64 * 2.1).cos() * 0.5);
-        let f = Array1::from_shape_fn(n, |i| (i as f64 * 0.7).sin() * 0.4 - 0.1);
-        let a_dot = (0..n_rho)
-            .map(|j| {
-                Array2::from_shape_fn((n, m), |(i, r)| {
-                    ((i * 5 + r * 11 + j * 3) as f64 * 0.37).cos() * 0.3
-                })
-            })
-            .collect();
-        let pairs = rho_pairs(n_rho);
-        let a_ddot = pairs
-            .iter()
-            .map(|&(j, l)| {
-                Array2::from_shape_fn((n, m), |(i, r)| {
-                    ((i * 3 + r * 2 + j * 7 + l * 13) as f64 * 0.53).sin() * 0.2
-                })
-            })
-            .collect();
-        let eta_dot = (0..n_rho)
-            .map(|j| Array1::from_shape_fn(n, |i| ((i + 2 * j) as f64 * 0.83).sin() * 0.6))
-            .collect();
-        let eta_ddot = pairs
-            .iter()
-            .map(|&(j, l)| {
-                Array1::from_shape_fn(n, |i| ((i * 2 + j + 3 * l) as f64 * 0.47).cos() * 0.4)
-            })
-            .collect();
-        Fixture {
-            a,
-            c,
-            d,
-            e,
-            f,
-            a_dot,
-            a_ddot,
-            eta_dot,
-            eta_ddot,
-            pairs,
+    /// `ΔF(z; θ) = θ₀ P(z) + θ₁² Q(z) + θ₀θ₁ R(z)`, infeasible where the first
+    /// two axes both sit at `+√3`.
+    fn excess(z: ndarray::ArrayView1<'_, f64>, theta: [f64; 2]) -> f64 {
+        if z[0] > 1.0 && z[1] > 1.0 {
+            return f64::INFINITY;
         }
+        let (p, q, r) = polynomials(z);
+        theta[0] * p + theta[1] * theta[1] * q + theta[0] * theta[1] * r
     }
 
-    fn pair_index(pairs: &[(usize, usize)], j: usize, l: usize) -> usize {
-        let key = (j.min(l), j.max(l));
-        pairs.iter().position(|&p| p == key).expect("pair")
+    fn polynomials(z: ndarray::ArrayView1<'_, f64>) -> (f64, f64, f64) {
+        let p = z[0].powi(3) + 0.5 * z[1] * z[2] * z[2] - 0.3 * z[3] * z[0];
+        let q = 0.2 * z[0] * z[0] * z[1] * z[1] - 0.1 * z[2].powi(4) + 0.15 * z[1] * z[3].powi(2);
+        let r = 0.4 * z[0] * z[1] * z[2] + 0.25 * z[3].powi(3);
+        (p, q, r)
     }
 
-    /// Φ along the second-order path `A(t) = a + Σ t_j Ȧ_j + ½ Σ t_j t_l Ä_jl`
-    /// with `c` and `d` Taylor-carried along `δ(t) = Σ t_j E_j + ½ Σ t_j t_l η̈_jl`,
-    /// whose first two t-derivatives at 0 are the motion the analytic form reads.
-    fn phi_along(fx: &Fixture, t: &[f64]) -> f64 {
-        let mut a = fx.a.clone();
-        let mut delta = Array1::<f64>::zeros(fx.c.len());
-        for j in 0..t.len() {
-            a.scaled_add(t[j], &fx.a_dot[j]);
-            delta.scaled_add(t[j], &fx.eta_dot[j]);
-            for l in 0..t.len() {
-                let k = pair_index(&fx.pairs, j, l);
-                a.scaled_add(0.5 * t[j] * t[l], &fx.a_ddot[k]);
-                delta.scaled_add(0.5 * t[j] * t[l], &fx.eta_ddot[k]);
+    fn cost(rule: &MixedAxisRule, theta: [f64; 2]) -> f64 {
+        let excesses: Vec<f64> = rule.nodes.columns().into_iter().map(|z| excess(z, theta)).collect();
+        -rule.posterior(&excesses).expect("posterior").value
+    }
+
+    fn assembled(rule: &MixedAxisRule, theta: [f64; 2]) -> (Array1<f64>, Array2<f64>) {
+        let pairs = rho_pairs(2);
+        let q = rule.node_count();
+        let mut excesses = vec![0.0; q];
+        // An infeasible node's rows are NaN: the assembly must never read them.
+        let mut gradients = Array2::<f64>::from_elem((q, 2), f64::NAN);
+        let mut seconds = Array2::<f64>::from_elem((q, pairs.len()), f64::NAN);
+        for (node, z) in rule.nodes.columns().into_iter().enumerate() {
+            excesses[node] = excess(z, theta);
+            if !excesses[node].is_finite() {
+                continue;
+            }
+            let (p, q_z, r) = polynomials(z);
+            gradients[(node, 0)] = p + theta[1] * r;
+            gradients[(node, 1)] = 2.0 * theta[1] * q_z + theta[0] * r;
+            for (k, &(j, l)) in pairs.iter().enumerate() {
+                seconds[(node, k)] = match (j, l) {
+                    (0, 0) => 0.0,
+                    (0, 1) => r,
+                    _ => 2.0 * q_z,
+                };
             }
         }
-        let delta2 = &delta * &delta;
-        let c = &fx.c + &(&fx.d * &delta) + &(&fx.e * &delta2 * 0.5);
-        let d = &fx.d + &(&fx.e * &delta) + &(&fx.f * &delta2 * 0.5);
-        mixed_axis_laplace_term(a.view(), &c, &d, &fx.e).value
+        let posterior = rule.posterior(&excesses).expect("posterior");
+        mixed_axis_cost_second_order(&posterior, &gradients, &seconds, &pairs)
     }
 
     #[test]
-    fn mixed_axis_rho_derivatives_match_central_differences() {
-        let fx = fixture();
-        let derivatives = mixed_axis_laplace_rho_derivatives(
-            fx.a.view(),
-            &fx.c,
-            &fx.d,
-            &fx.e,
-            &fx.f,
-            MixedAxisMotion {
-                a_dot: &fx.a_dot,
-                a_ddot: &fx.a_ddot,
-                eta_dot: &fx.eta_dot,
-                eta_ddot: &fx.eta_ddot,
-                pairs: &fx.pairs,
-            },
-        );
-        let n_rho = fx.a_dot.len();
-        let h = 1e-6;
-        let term = mixed_axis_laplace_term(fx.a.view(), &fx.c, &fx.d, &fx.e);
-        for j in 0..n_rho {
-            let mut plus = vec![0.0; n_rho];
-            let mut minus = vec![0.0; n_rho];
-            plus[j] = h;
-            minus[j] = -h;
-            let fd = (phi_along(&fx, &plus) - phi_along(&fx, &minus)) / (2.0 * h);
+    fn assembly_matches_central_differences_of_the_cost() {
+        let rule = MixedAxisRule::new(4);
+        let theta = [0.3, -0.4];
+        let (gradient, hessian) = assembled(&rule, theta);
+        let h = 1e-5;
+        for j in 0..2 {
+            let mut plus = theta;
+            plus[j] += h;
+            let mut minus = theta;
+            minus[j] -= h;
+            let fd = (cost(&rule, plus) - cost(&rule, minus)) / (2.0 * h);
             assert!(
-                (fd - derivatives.gradient[j]).abs() <= 1e-7 * fd.abs().max(1.0),
-                "∂Φ/∂ρ_{j}: analytic {} against FD {fd}",
-                derivatives.gradient[j]
+                (fd - gradient[j]).abs() <= 1e-8 * fd.abs().max(1.0),
+                "∂(−Ψ)/∂θ_{j}: assembled {} against FD {fd}",
+                gradient[j]
             );
-            // The same slope through the term's own a- and η-gradients.
-            let chained = (&term.a_gradient * &fx.a_dot[j]).sum()
-                + term.eta_gradient.dot(&fx.eta_dot[j]);
-            assert!(
-                (chained - derivatives.gradient[j]).abs() <= 1e-12 * chained.abs().max(1.0),
-                "∂Φ/∂ρ_{j}: {} against the chained term gradient {chained}",
-                derivatives.gradient[j]
-            );
-        }
-        let h = 1e-4;
-        let center = phi_along(&fx, &vec![0.0; n_rho]);
-        for j in 0..n_rho {
-            for l in j..n_rho {
-                let at = |sj: f64, sl: f64| {
-                    let mut t = vec![0.0; n_rho];
-                    t[j] += sj;
-                    t[l] += sl;
-                    phi_along(&fx, &t)
-                };
-                let fd = if j == l {
-                    (at(h, 0.0) - 2.0 * center + at(-h, 0.0)) / (h * h)
-                } else {
-                    (at(h, h) - at(h, -h) - at(-h, h) + at(-h, -h)) / (4.0 * h * h)
-                };
-                let analytic = derivatives.hessian[(j, l)];
+            let fd_row = (&assembled(&rule, plus).0 - &assembled(&rule, minus).0) / (2.0 * h);
+            for l in 0..2 {
                 assert!(
-                    (fd - analytic).abs() <= 1e-6 * fd.abs().max(1.0),
-                    "∂²Φ/∂ρ_{j}∂ρ_{l}: analytic {analytic} against FD {fd}"
+                    (fd_row[l] - hessian[(j, l)]).abs() <= 1e-8 * fd_row[l].abs().max(1.0),
+                    "∂²(−Ψ)/∂θ_{j}∂θ_{l}: assembled {} against FD {}",
+                    hessian[(j, l)],
+                    fd_row[l]
                 );
-                assert_eq!(derivatives.hessian[(l, j)], analytic);
             }
         }
-    }
-
-    #[test]
-    fn a_single_axis_has_no_mixed_motion() {
-        let fx = fixture();
-        let column = |x: &Array2<f64>| x.column(0).to_owned().insert_axis(ndarray::Axis(1));
-        let a_dot: Vec<Array2<f64>> = fx.a_dot.iter().map(column).collect();
-        let a_ddot: Vec<Array2<f64>> = fx.a_ddot.iter().map(column).collect();
-        let derivatives = mixed_axis_laplace_rho_derivatives(
-            column(&fx.a).view(),
-            &fx.c,
-            &fx.d,
-            &fx.e,
-            &fx.f,
-            MixedAxisMotion {
-                a_dot: &a_dot,
-                a_ddot: &a_ddot,
-                eta_dot: &fx.eta_dot,
-                eta_ddot: &fx.eta_ddot,
-                pairs: &fx.pairs,
-            },
-        );
-        assert!(derivatives.gradient.iter().all(|g| g.abs() <= 1e-14));
-        assert!(derivatives.hessian.iter().all(|h| h.abs() <= 1e-14));
-    }
-
-    /// Every listed curvature shape reproduces the family's own observed
-    /// curvature: `f` from `(c, e)` matches the second difference of
-    /// `∂²W/∂η²` as `compute_observed_hessian_curvature_arrays` evaluates it.
-    #[test]
-    fn curvature_shapes_give_the_observed_fourth_derivative() {
-        let families = [
-            ResponseFamily::Poisson,
-            ResponseFamily::Gamma,
-            ResponseFamily::InverseGaussian,
-            ResponseFamily::Gaussian,
-        ];
-        let links = [
-            StandardLink::Identity,
-            StandardLink::Log,
-            StandardLink::Sqrt,
-            StandardLink::Inverse,
-            StandardLink::InverseSquared,
-        ];
-        let prior = Array1::from_elem(1, 1.7);
-        let h = 2e-3;
-        let mut checked = 0;
-        for response in &families {
-            for &link in &links {
-                let inverse_link = InverseLink::Standard(link);
-                let Some(shape) = fourth_derivative_rule(response, &inverse_link) else {
-                    continue;
-                };
-                let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
-                    response.clone(),
-                    inverse_link.clone(),
-                ));
-                if !crate::pirls::supports_observed_hessian_curvature_for_likelihood(
-                    &likelihood,
-                    &inverse_link,
-                ) {
-                    // Poisson-log reads `W = w e^η` directly (`RowCurvature::PoissonLog`).
-                    assert!(
-                        matches!((response, link), (ResponseFamily::Poisson, StandardLink::Log)),
-                        "{response:?}/{link:?} has a curvature shape but no observed curvature",
-                    );
-                    let e = Array1::from_elem(1, 1.7 * 0.8_f64.exp());
-                    let f = fourth_from_shape(shape, Array1::from_elem(1, 0.8).view(), &prior, &e, &e);
-                    assert!((f[0] - e[0]).abs() <= 1e-15 * e[0]);
-                    checked += 1;
-                    continue;
-                }
-                // A count for Poisson, a positive real otherwise.
-                let y = if matches!(response, ResponseFamily::Poisson) { 2.0 } else { 1.3 };
-                let curvature_at = |eta: f64| {
-                    crate::pirls::compute_observed_hessian_curvature_arrays(
-                        &likelihood,
-                        &inverse_link,
-                        &Array1::from_elem(1, eta),
-                        Array1::from_elem(1, y).view(),
-                        prior.view(),
-                    )
-                    .expect("observed curvature")
-                };
-                // Richardson-extrapolated central differences of `∂²W/∂η²`:
-                // O(h⁴) truncation with a step whose rounding stays far below it.
-                let differences = |eta0: f64, step: f64| {
-                    let (_, _, d0) = curvature_at(eta0);
-                    let (_, _, d_plus) = curvature_at(eta0 + step);
-                    let (_, _, d_minus) = curvature_at(eta0 - step);
-                    (
-                        (d_plus[0] - d_minus[0]) / (2.0 * step),
-                        (d_plus[0] - 2.0 * d0[0] + d_minus[0]) / (step * step),
-                    )
-                };
-                for eta0 in [0.45, 0.8, 1.6] {
-                    let (w0, c, _) = curvature_at(eta0);
-                    let (e_h, f_h) = differences(eta0, h);
-                    let (e_half, f_half) = differences(eta0, 0.5 * h);
-                    let e = Array1::from_elem(1, (4.0 * e_half - e_h) / 3.0);
-                    let f_fd = (4.0 * f_half - f_h) / 3.0;
-                    let f = fourth_from_shape(shape, Array1::from_elem(1, eta0).view(), &prior, &c, &e)[0];
-                    // The evaluated `∂²W/∂η²` carries rounding on the scale of
-                    // `W/η²`, which the second difference divides by `(h/2)²`.
-                    let rounding =
-                        4096.0 * f64::EPSILON * (w0[0] / (eta0 * eta0)).abs() / (0.25 * h * h);
-                    assert!(
-                        (f - f_fd).abs() <= 1e-7 * f_fd.abs().max(1.0) + rounding,
-                        "{response:?}/{link:?} at η={eta0}: shape f={f}, differenced f={f_fd}",
-                    );
-                }
-                checked += 1;
-            }
-        }
-        assert_eq!(checked, 18, "every tabulated non-logit shape is checked");
+        assert!(hessian.iter().all(|v| v.is_finite()) && hessian[(0, 1)] != 0.0);
     }
 
     /// The node-moment contraction of `E_p[∂²F]` equals the per-node, per-pair

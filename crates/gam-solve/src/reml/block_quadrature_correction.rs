@@ -4,8 +4,8 @@
 //! 10,000-line gate refuses to carry (#780). It is one self-contained unit:
 //! the per-bundle cached wrapper, the compute path that runs the skewness
 //! diagnostic, selects the curvature-heavy block, integrates the non-Gaussian
-//! remainder over it — axis by axis plus the analytic mixed-axis term
-//! ([`mixed_axis_laplace_term`]) when the block has more than one axis — and
+//! remainder over it — axis by axis plus the mixed-axis part
+//! ([`MixedAxisRule`]) when the block has more than one axis — and
 //! assembles the four exact gradient channels the splice's objective-gradient
 //! contract requires.
 //!
@@ -708,20 +708,22 @@ impl<'a> RemlState<'a> {
         // The whitened coordinates z_r = √λ_r t_r are independent under the
         // Laplace Gaussian, and the ANOVA split of the block marginal is
         //
-        //   Δ_b = Σ_r Δ_r + Φ + O(n_eff⁻²),
+        //   Δ_b = Σ_r Δ_r + Ψ + O(n_eff⁻²),
         //
         // where Δ_r is the exact one-dimensional correction along axis r (the
         // same target restricted to one column of V_b, integrated by its own
-        // certified 1-D rule) and Φ is the analytic mixed-axis part of the
-        // second-order Laplace expansion ([`mixed_axis_laplace_term`]). Every
-        // single-axis term is in Δ_r at every order; what Φ leaves out are the
-        // mixed-axis terms past O(n_eff⁻¹). The O(n_eff⁻³ᐟ²) ones are odd
-        // Gaussian moments and vanish, so the truncation is O(n_eff⁻²) — the same
-        // order as the remainder the quadrature is asked to resolve. The cost is
-        // Σ_r o_r nodes plus O(n·m³) for Φ.
+        // certified 1-D rule) and Ψ is the mixed-axis part: the two- and
+        // three-axis interactions of the anchored ANOVA of the block marginal,
+        // each integrated exactly on the closed-form three-point Gauss–Hermite
+        // rule ([`MixedAxisRule`]). No term through O(n_eff⁻¹) couples more than
+        // three axes, the O(n_eff⁻³ᐟ²) ones are odd and vanish, so the truncation
+        // is O(n_eff⁻²) — the order the quadrature is asked to resolve. Ψ is a
+        // combination of log-integrals of e^{−ΔF}, bounded along a soft axis as
+        // the Δ_r are. The cost is Σ_r o_r nodes plus
+        // 1 + 2m + 4·C(m,2) + 8·C(m,3) for Ψ.
         //
-        // Φ reads the likelihood's third and fourth η-derivatives of the
-        // curvature, so the split requires the exported curvature to be the
+        // Ψ's rule is exact on the interactions only when the excess starts at
+        // cubic order, so the split requires the exported curvature to be the
         // likelihood's own: observed information, or a canonical link where it
         // coincides with the Fisher weights. It also takes the linear term of the
         // excess to cancel, which is the mode condition Sβ̂ = ∇ℓ(β̂). A block of
@@ -883,7 +885,7 @@ impl<'a> RemlState<'a> {
                     },
                 });
             };
-            let channels = block_target_channel_moments(piece_target, &moments, c_weights)?;
+            let channels = block_target_channel_moments(piece_target, &moments, c_weights, 1.0)?;
             pieces.push(BlockPieceQuadrature {
                 resolution_target: quadrature.value.abs().min(next_order_remainder),
                 quadrature,
@@ -893,28 +895,14 @@ impl<'a> RemlState<'a> {
         }
 
         let x = x_dense.as_ref();
-        // Φ and its derivatives in the whitened block coordinates
-        // a_i = Λ^{-1/2} V_bᵀ x_i.
-        let curvature_derivatives = if axis_split || (want_hessian && hessian_support.is_ok()) {
-            Some(self.hessian_cde_arrays(pirls_result)?)
+        let mixed = if axis_split {
+            Some(mixed_axis_term(&target, c_weights)?)
         } else {
             None
         };
-        let mixed = match (axis_split, curvature_derivatives.as_ref()) {
-            (true, Some((c_obs, d_obs, e_obs))) => {
-                let mut whitened = target.block_design.product.clone();
-                for r in 0..m {
-                    let scale = target.block_lambdas[r].sqrt().recip();
-                    whitened.column_mut(r).mapv_inplace(|v| v * scale);
-                }
-                let term = mixed_axis_laplace_term(whitened.view(), c_obs, d_obs, e_obs);
-                Some((term, whitened))
-            }
-            _ => None,
-        };
 
         let delta_b = pieces.iter().map(|piece| piece.quadrature.value).sum::<f64>()
-            + mixed.as_ref().map_or(0.0, |(term, _)| term.value);
+            + mixed.as_ref().map_or(0.0, |term| term.value);
         let axis_quadrature_errors: Vec<f64> = pieces
             .iter()
             .flat_map(|piece| piece.quadrature.axis_quadrature_errors.iter().copied())
@@ -924,7 +912,8 @@ impl<'a> RemlState<'a> {
             .iter()
             .map(|piece| piece.quadrature.quadrature_error)
             .sum();
-        let node_count: usize = pieces.iter().map(|piece| piece.quadrature.node_count).sum();
+        let node_count: usize = pieces.iter().map(|piece| piece.quadrature.node_count).sum::<usize>()
+            + mixed.as_ref().map_or(0, |term| term.node_count);
         let abs_value = delta_b.abs();
         let relative_error = if abs_value > 0.0 {
             quadrature_error / abs_value
@@ -1021,12 +1010,12 @@ impl<'a> RemlState<'a> {
         log::debug!(
             "[#784] deterministic block-local Gauss-Hermite correction ENGAGED: \
              m={m}, axis split={axis_split}, max|γ|={:.3}, τ={:.3}, Δ_b={:.4e} \
-             (mixed-axis Φ={:.4e}), axis orders={:?}, nodes={node_count} \
+             (mixed-axis Ψ={:.4e}), axis orders={:?}, nodes={node_count} \
              [paired-rule error={:.4e}, error/|Δ_b|={:.3e}, 1/n_eff={:.3e}]",
             verdict.max_abs_skewness,
             verdict.threshold,
             delta_b,
-            mixed.as_ref().map_or(0.0, |(term, _)| term.value),
+            mixed.as_ref().map_or(0.0, |term| term.value),
             axis_orders,
             quadrature_error,
             relative_error,
@@ -1066,14 +1055,10 @@ impl<'a> RemlState<'a> {
         //
         // Split by axis, each piece supplies its own column of R and entry of
         // M (piece r depends on the block only through (λ_r, u_r)) and its own
-        // g_d and explicit gradient, which add. Φ depends on (λ_r, u_r) and β̂
-        // through a_ir = u_rᵀx_i/√λ_r and (c, d)(η̂), so with G = ∂Φ/∂A its
-        // cost-side channels are
-        //
-        //   R[:,r] −= Xᵀ G[:,r] / √λ_r,   M_r += ½ G[:,r]·A[:,r],
-        //   g_d    −= Xᵀ ∂Φ/∂η,
-        //
-        // and it has no explicit ρ-dependence.
+        // g_d and explicit gradient, which add. Ψ integrates the whole block's
+        // excess at t_r = z_r/√λ_r, so its channels are the tensor rule's under
+        // the signed node measure ω (∂(−Ψ) = Σ_z ω ∂ΔF), over every axis; they
+        // add to the pieces'. It has no explicit ρ-dependence either.
         //
         // Eigenvalue near-degeneracies `λ_r ≈ σ_q` are genuine
         // non-differentiability points of the eigenframe; the splice is
@@ -1100,15 +1085,10 @@ impl<'a> RemlState<'a> {
                 *total += value;
             }
         }
-        if let Some((term, whitened)) = mixed.as_ref() {
-            g_d.scaled_add(-1.0, &x.t().dot(&term.eta_gradient));
-            let xt_g = x.t().dot(&term.a_gradient); // p × m
-            for r in 0..m {
-                r_mat
-                    .column_mut(r)
-                    .scaled_add(-target.block_lambdas[r].sqrt().recip(), &xt_g.column(r));
-                m_vec[r] += 0.5 * term.a_gradient.column(r).dot(&whitened.column(r));
-            }
+        if let Some(term) = mixed.as_ref() {
+            g_d += &term.channels.g_d;
+            r_mat += &term.channels.r_mat;
+            m_vec += &term.channels.m_vec;
         }
 
         // Eigenframe assembly. `block_vecs` are the `block_cols` columns of
@@ -1202,21 +1182,8 @@ impl<'a> RemlState<'a> {
         // declares none (`BlockQuadratureLatch::hessian_refusal`), and its
         // smoothing-corrected covariance refuses with that reason. An
         // evaluation that does not ask for the Hessian does not pay for it.
-        let cost_hessian = match (&hessian_support, curvature_derivatives.as_ref()) {
-            (Ok(curvature), Some((c_obs, d_obs, e_obs))) if want_hessian => {
-                let fourth = if axis_split {
-                    Some(
-                        super::block_correction_hessian::curvature_fourth_derivative(
-                            pirls_result,
-                            &target.inverse_link,
-                            &target.prior_weights,
-                            c_obs,
-                            e_obs,
-                        )?,
-                    )
-                } else {
-                    None
-                };
+        let cost_hessian = match &hessian_support {
+            Ok(curvature) if want_hessian => {
                 let piece_rules: Vec<super::block_correction_hessian::PieceRule<'_>> = pieces
                     .iter()
                     .map(|piece| match &piece.composite_nodes {
@@ -1237,13 +1204,12 @@ impl<'a> RemlState<'a> {
                         evals: &evals,
                         evecs: &evecs,
                         block_cols: &block_cols,
-                        c: c_obs,
-                        d: d_obs,
-                        e_f: fourth.as_ref().map(|f| (e_obs, f)),
+                        c: c_weights,
+                        d: &pirls_result.solve_d_array.to_owned(),
                     },
                 )?;
                 log::trace!(
-                    "[#784] ρ-Hessian pieces V={:?} (quadrature {:?}), Φ={:?}",
+                    "[#784] ρ-Hessian pieces V={:?} (quadrature {:?}), Ψ={:?}",
                     second_order.piece_values,
                     pieces
                         .iter()
@@ -1461,12 +1427,15 @@ struct BlockTargetChannels {
     m_vec: Array1<f64>,
 }
 
-/// Contract a block target's normalized quadrature moments into the channel
-/// moments the exact (b)–(d) assembly consumes.
+/// Contract a block target's quadrature moments into the channel moments the
+/// exact (b)–(d) assembly consumes. The moments are linear in the node measure,
+/// whose total `mass` is one for a normalized posterior; only the base score,
+/// a constant of the nodes, reads it.
 fn block_target_channel_moments(
     target: &Gam784BlockTarget<'_>,
     moments: &gam_problem::laplace_sampler_contract::BlockQuadratureMoments,
     c_weights: &Array1<f64>,
+    mass: f64,
 ) -> Result<BlockTargetChannels, EstimationError> {
     let x = target.x_transformed;
     let n_rows = x.nrows();
@@ -1494,7 +1463,7 @@ fn block_target_channel_moments(
     // `H δ̄`, and `v_j·H δ̄ = λ_j (S_j β̂)·δ̄` is exactly the explicit channel
     // that form carried, so the total is unchanged there.
     let s_mean = xv.dot(&moments.e_t); // n
-    let mut g_d = x.t().dot(&(&moments.e_neg_score - &ngs_base));
+    let mut g_d = x.t().dot(&(&moments.e_neg_score - &(&ngs_base * mass)));
     g_d.scaled_add(-1.0, &x.t().dot(&(&target.weights_obs * &s_mean)));
     g_d.scaled_add(-0.5, &x.t().dot(&(c_weights * &sigma2)));
 
@@ -1552,136 +1521,474 @@ pub(super) fn block_axis_target<'t>(target: &Gam784BlockTarget<'t>, r: usize) ->
     }
 }
 
-/// The mixed-axis second-order Laplace term `Φ` and its derivatives.
-pub(super) struct MixedAxisLaplaceTerm {
-    pub(super) value: f64,
-    /// `∂Φ/∂a_i`, row `i` (n × m).
-    pub(super) a_gradient: Array2<f64>,
-    /// `∂Φ/∂η_i` at fixed `a_i`, through `(c_i, d_i)(η_i)` (n).
-    pub(super) eta_gradient: Array1<f64>,
+/// How many block axes one term of the mixed-axis part couples.
+///
+/// With `z ~ N(0, I_m)` the whitened block coordinates and `ΔF = ΔF₃ + ΔF₄ + …`
+/// the excess by its order in `z` (the mode condition cancels the linear term
+/// and `W = ψ''(η̂)` the quadratic one), the cumulant expansion of the block
+/// marginal is
+///
+///   log E[e^{−ΔF}] = −E[ΔF₄] + ½ E[ΔF₃²] + O(n_eff⁻²),
+///
+/// the `O(n_eff⁻³ᐟ²)` terms being odd Gaussian moments. `E[ΔF₄]` reads the
+/// monomials `z_p² z_q²` and `E[ΔF₃²]` the products of two cubic monomials,
+/// whose even part is at most `z_p² z_q² z_r²`: no term through `O(n_eff⁻¹)`
+/// couples more than three axes. The anchored ANOVA of the marginal over the
+/// axis subsets, truncated past three-axis interactions, is therefore exact to
+/// the same `O(n_eff⁻²)` the certified single-axis rules resolve.
+const MIXED_AXIS_COUPLING: usize = 3;
+
+/// The three-point Gauss–Hermite rule for the standard normal, in closed form:
+/// the nodes are the zeros of `He₃(z) = z³ − 3z`, `{0, ±√3}`, and the weights
+/// `3!/(3² He₂(z_k)²)` with `He₂ = z² − 1`, `{2/3, 1/6, 1/6}`. It integrates
+/// every polynomial of degree at most five exactly, which covers each axis's
+/// degree (at most four) in the mixed monomials of [`MIXED_AXIS_COUPLING`]. The
+/// middle node is the anchor `z = 0` exactly, so a piece's nodes restricted to
+/// fewer axes are the smaller pieces' nodes.
+fn three_point_rule() -> [(f64, f64); 3] {
+    let root = 3.0_f64.sqrt();
+    [(0.0, 2.0 / 3.0), (-root, 1.0 / 6.0), (root, 1.0 / 6.0)]
 }
 
-/// The part of the second-order Laplace expansion of a block marginal that no
-/// single axis carries.
-///
-/// With whitened rows `a_i = Λ^{-1/2} V_bᵀ x_i`, `z ~ N(0, I_m)` and
-/// `s_i = a_i·z`, the excess over the Laplace Gaussian is
-/// `ΔF = Σ_i (c_i/6) s_i³ + (d_i/24) s_i⁴ + …` once the mode condition cancels
-/// its linear term (`c = ∂W/∂η`, `d = ∂²W/∂η²`), and
-///
-///   log E[e^{−ΔF}] = −E[ΔF₄] + ½ E[ΔF₃²] + O(n⁻²)
-///                  = −⅛ Σ d_i |a_i|⁴ + ⅛ |u|² + (1/12) ‖T‖² + O(n⁻²),
-///
-/// from `E[s_i⁴] = 3|a_i|⁴` and `E[s_i³ s_j³] = 9 σ_i² σ_j² κ_ij + 6 κ_ij³`,
-/// where `u = Σ c_i |a_i|² a_i` and `T = Σ c_i a_i^{⊗3}`. The same expansion of
-/// one axis is `−⅛ Σ d_i a_ir⁴ + (5/24) T_rrr²`, so the mixed-axis part is
-///
-///   Φ = −⅛ Σ d_i (|a_i|⁴ − Σ_r a_ir⁴) + ⅛ |u|² + (1/12) ‖T‖² − (5/24) Σ_r T_rrr².
-///
-/// With `c`'s own η-derivative `d` and `d`'s `e = ∂³W/∂η³`,
-///
-///   ∂Φ/∂a_i = −½ d_i (|a_i|² a_i − a_i^{∘3}) + ¼ c_i (2 (a_i·u) a_i + |a_i|² u)
-///             + ½ c_i T(a_i, a_i, ·) − (5/4) c_i T_diag ∘ a_i^{∘2},
-///   ∂Φ/∂η_i = −⅛ e_i (|a_i|⁴ − Σ_r a_ir⁴) + ¼ d_i |a_i|² (a_i·u)
-///             + (1/6) d_i T(a_i, a_i, a_i) − (5/12) d_i Σ_r T_rrr a_ir³.
-///
-/// The cost is O(n·m³).
-pub(super) fn mixed_axis_laplace_term(
-    a: ndarray::ArrayView2<'_, f64>,
-    c: &Array1<f64>,
-    d: &Array1<f64>,
-    e: &Array1<f64>,
-) -> MixedAxisLaplaceTerm {
-    let (n, m) = a.dim();
-    let sq: Array1<f64> = a.map_axis(ndarray::Axis(1), |row| row.dot(&row));
-    let quart: Array1<f64> =
-        a.map_axis(ndarray::Axis(1), |row| row.iter().map(|v| v.powi(4)).sum());
+fn binomial_coefficient(n: usize, k: usize) -> i64 {
+    if k > n {
+        return 0;
+    }
+    let k = k.min(n - k);
+    let mut value: i64 = 1;
+    for j in 0..k {
+        value = value * (n - j) as i64 / (j + 1) as i64;
+    }
+    value
+}
 
-    // u and the symmetric tensor T, accumulated on its sorted index triples
-    // p ≤ q ≤ r and then filled out.
-    let mut u = Array1::<f64>::zeros(m);
-    let mut tensor = vec![0.0_f64; m * m * m];
-    let at = |p: usize, q: usize, r: usize| (p * m + q) * m + r;
-    for i in 0..n {
-        let ci = c[i];
-        if ci == 0.0 {
-            continue;
-        }
-        let ai = a.row(i);
-        u.scaled_add(ci * sq[i], &ai);
-        for p in 0..m {
-            let cp = ci * ai[p];
-            for q in p..m {
-                let cpq = cp * ai[q];
-                for r in q..m {
-                    tensor[at(p, q, r)] += cpq * ai[r];
-                }
-            }
-        }
+/// The coefficient `κ_T` of an axis subset of size `size` in the mixed-axis
+/// part `Ψ = Σ_T κ_T f_T` of an `m`-axis block.
+///
+/// Möbius inversion over the subsets writes the block marginal `f_{[m]}` as
+/// `Σ_U g_U` with `g_U = Σ_{V⊆U} (−1)^{|U∖V|} f_V`. Keeping `|U| ≤ K` and
+/// collecting each `f_V` gives `f_{[m]} ≈ Σ_{|V|≤K} c_{|V|} f_V` with
+/// `c_k = Σ_{j=0}^{K−k} (−1)^j C(m−k, j)`. The single-axis pieces are the
+/// certified `Δ_r`, so the three-point rule carries `κ = c_k − [k = 1]`, and
+/// `Σ_{T⊇U} κ_T = [|U| ≥ 2]` for every `1 ≤ |U| ≤ K`: every single-axis part
+/// of the three-point pieces cancels, its rule error with it, and every mixed
+/// part is counted once.
+fn mixed_axis_piece_coefficient(m: usize, size: usize) -> i64 {
+    let coupling = MIXED_AXIS_COUPLING.min(m);
+    let mut c = 0_i64;
+    for j in 0..=coupling - size {
+        let term = binomial_coefficient(m - size, j);
+        c += if j % 2 == 0 { term } else { -term };
     }
-    for p in 0..m {
-        for q in p..m {
-            for r in q..m {
-                let value = tensor[at(p, q, r)];
-                for (x, y, z) in [(p, r, q), (q, p, r), (q, r, p), (r, p, q), (r, q, p)] {
-                    tensor[at(x, y, z)] = value;
-                }
-            }
-        }
-    }
-    let t_diag: Vec<f64> = (0..m).map(|r| tensor[at(r, r, r)]).collect();
+    c - i64::from(size == 1)
+}
 
-    let mut value = 0.125 * u.dot(&u) + tensor.iter().map(|t| t * t).sum::<f64>() / 12.0
-        - (5.0 / 24.0) * t_diag.iter().map(|t| t * t).sum::<f64>();
-    let mut a_gradient = Array2::<f64>::zeros((n, m));
-    let mut eta_gradient = Array1::<f64>::zeros(n);
-    // T(a_i, a_i, ·), reused across rows.
-    let mut taa = vec![0.0_f64; m];
-    for i in 0..n {
-        let ai = a.row(i);
-        let (ci, di, ei) = (c[i], d[i], e[i]);
-        let off_axis_quartic = sq[i] * sq[i] - quart[i];
-        value -= 0.125 * di * off_axis_quartic;
-        for (r, slot) in taa.iter_mut().enumerate() {
-            let mut total = 0.0;
-            for p in 0..m {
-                let mut inner = 0.0;
-                for q in 0..m {
-                    inner += tensor[at(p, q, r)] * ai[q];
+/// Call `visit` with every size-`size` subset of `0..m`, in lexicographic order.
+fn for_each_axis_subset(m: usize, size: usize, mut visit: impl FnMut(&[usize])) {
+    let mut subset: Vec<usize> = (0..size).collect();
+    'next: loop {
+        visit(&subset);
+        let mut i = size;
+        while i > 0 {
+            i -= 1;
+            if subset[i] != i + m - size {
+                subset[i] += 1;
+                for j in i + 1..size {
+                    subset[j] = subset[j - 1] + 1;
                 }
-                total += ai[p] * inner;
+                continue 'next;
             }
-            *slot = total;
         }
-        let au = ai.dot(&u);
-        let taaa: f64 = taa.iter().zip(ai.iter()).map(|(t, v)| t * v).sum();
-        let diag_cubic: f64 = t_diag
-            .iter()
-            .zip(ai.iter())
-            .map(|(t, v)| t * v * v * v)
-            .sum();
-        let mut row = a_gradient.row_mut(i);
-        for r in 0..m {
-            let air = ai[r];
-            row[r] = -0.5 * di * (sq[i] * air - air * air * air)
-                + 0.25 * ci * (2.0 * au * air + sq[i] * u[r])
-                + 0.5 * ci * taa[r]
-                - 1.25 * ci * t_diag[r] * air * air;
+        break;
+    }
+}
+
+/// The deterministic rule for the mixed-axis part of a split block.
+///
+/// Each axis subset `T` with `1 ≤ |T| ≤ min(K, m)` and `κ_T ≠ 0` is a piece:
+/// the three-point tensor rule over the axes in `T`, anchored at `z = 0` on
+/// the others,
+///
+///   f_T = log Σ_z w_T(z) e^{−ΔF(z)} − log Σ_z w_T(z),
+///
+/// and `Ψ = Σ_T κ_T f_T`. The pieces share their nodes, so the rule holds each
+/// distinct node once: `1 + 2m + 4·C(m,2) + 8·C(m,3)` of them.
+pub(super) struct MixedAxisRule {
+    /// Standard-normal node coordinates `z`, one node per column (`m × q`).
+    pub(super) nodes: Array2<f64>,
+    pub(super) pieces: Vec<MixedAxisPiece>,
+}
+
+pub(super) struct MixedAxisPiece {
+    pub(super) coefficient: f64,
+    /// `|T|`.
+    pub(super) axes: usize,
+    /// `(node, ln w_T(z))` for each of the piece's `3^|T|` nodes.
+    pub(super) nodes: Vec<(usize, f64)>,
+}
+
+/// `Ψ` at one evaluation, with the measure its derivatives are taken against.
+pub(super) struct MixedAxisPosterior {
+    pub(super) value: f64,
+    /// `ω(z) = Σ_T κ_T p_T(z)` per node, `p_T ∝ w_T e^{−ΔF}` a piece's
+    /// normalized node posterior (zero on an infeasible node), so
+    /// `∂(−Ψ)/∂θ = Σ_z ω(z) ∂ΔF(z)/∂θ`.
+    pub(super) node_weights: Array1<f64>,
+    /// `Σ_z ω(z) = Σ_T κ_T`.
+    pub(super) mass: f64,
+    pub(super) pieces: Vec<MixedAxisPiecePosterior>,
+}
+
+pub(super) struct MixedAxisPiecePosterior {
+    pub(super) coefficient: f64,
+    pub(super) axes: usize,
+    /// `f_T`.
+    pub(super) log_ratio: f64,
+    /// `(node, p_T(z))` over the piece's feasible nodes.
+    pub(super) nodes: Vec<(usize, f64)>,
+}
+
+impl MixedAxisRule {
+    pub(super) fn new(m: usize) -> Self {
+        let rule = three_point_rule();
+        let mut keys: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut coordinates: Vec<Vec<u8>> = Vec::new();
+        let anchor = vec![0_u8; m];
+        keys.insert(anchor.clone(), 0);
+        coordinates.push(anchor);
+        let mut pieces = Vec::new();
+        for size in 1..=MIXED_AXIS_COUPLING.min(m) {
+            let coefficient = mixed_axis_piece_coefficient(m, size);
+            if coefficient == 0 {
+                continue;
+            }
+            let pattern_count = 3_usize.pow(size as u32);
+            for_each_axis_subset(m, size, |subset| {
+                let mut nodes = Vec::with_capacity(pattern_count);
+                for pattern in 0..pattern_count {
+                    let mut key = vec![0_u8; m];
+                    let mut log_weight = 0.0;
+                    let mut digits = pattern;
+                    for &axis in subset {
+                        let point = digits % 3;
+                        digits /= 3;
+                        key[axis] = point as u8;
+                        log_weight += rule[point].1.ln();
+                    }
+                    let next = coordinates.len();
+                    let node = *keys.entry(key.clone()).or_insert(next);
+                    if node == next {
+                        coordinates.push(key);
+                    }
+                    nodes.push((node, log_weight));
+                }
+                pieces.push(MixedAxisPiece {
+                    coefficient: coefficient as f64,
+                    axes: size,
+                    nodes,
+                });
+            });
         }
-        eta_gradient[i] = -0.125 * ei * off_axis_quartic + 0.25 * di * sq[i] * au
-            + di * taaa / 6.0
-            - (5.0 / 12.0) * di * diag_cubic;
+        let nodes = Array2::from_shape_fn((m, coordinates.len()), |(r, node)| {
+            rule[usize::from(coordinates[node][r])].0
+        });
+        Self { nodes, pieces }
     }
-    MixedAxisLaplaceTerm {
-        value,
-        a_gradient,
-        eta_gradient,
+
+    pub(super) fn node_count(&self) -> usize {
+        self.nodes.ncols()
     }
+
+    /// `Ψ` and its node measure from the excess `ΔF` at every node. An
+    /// infeasible node (`ΔF = +∞`) is dropped from each piece it is in, as the
+    /// tensor rule drops it; the anchor is the mode and always feasible.
+    pub(super) fn posterior(&self, excesses: &[f64]) -> Result<MixedAxisPosterior, EstimationError> {
+        let q = self.node_count();
+        if excesses.len() != q {
+            crate::bail_invalid_estim!(
+                "#784 mixed-axis rule: {} excesses for {q} nodes",
+                excesses.len()
+            );
+        }
+        if !excesses[0].is_finite() {
+            crate::bail_invalid_estim!(
+                "#784 mixed-axis rule: the excess at the mode is {}",
+                excesses[0]
+            );
+        }
+        if let Some(node) = excesses.iter().position(|&e| e.is_nan() || e == f64::NEG_INFINITY) {
+            crate::bail_invalid_estim!(
+                "#784 mixed-axis rule: node {node} has excess {}",
+                excesses[node]
+            );
+        }
+        let mut value = 0.0;
+        let mut mass = 0.0;
+        let mut node_weights = Array1::<f64>::zeros(q);
+        let mut pieces = Vec::with_capacity(self.pieces.len());
+        for piece in &self.pieces {
+            let log_norm = log_sum_exp(piece.nodes.iter().map(|&(_, lw)| lw));
+            let feasible: Vec<(usize, f64)> = piece
+                .nodes
+                .iter()
+                .filter(|&&(node, _)| excesses[node].is_finite())
+                .map(|&(node, lw)| (node, lw - excesses[node]))
+                .collect();
+            let log_mass = log_sum_exp(feasible.iter().map(|&(_, lw)| lw));
+            let log_ratio = log_mass - log_norm;
+            let nodes: Vec<(usize, f64)> = feasible
+                .into_iter()
+                .map(|(node, lw)| (node, (lw - log_mass).exp()))
+                .collect();
+            for &(node, prob) in &nodes {
+                node_weights[node] += piece.coefficient * prob;
+            }
+            value += piece.coefficient * log_ratio;
+            mass += piece.coefficient;
+            pieces.push(MixedAxisPiecePosterior {
+                coefficient: piece.coefficient,
+                axes: piece.axes,
+                log_ratio,
+                nodes,
+            });
+        }
+        Ok(MixedAxisPosterior {
+            value,
+            node_weights,
+            mass,
+            pieces,
+        })
+    }
+}
+
+fn log_sum_exp(values: impl Iterator<Item = f64> + Clone) -> f64 {
+    let max = values.clone().fold(f64::NEG_INFINITY, f64::max);
+    if !max.is_finite() {
+        return max;
+    }
+    max + values.map(|v| (v - max).exp()).sum::<f64>().ln()
+}
+
+/// Evaluate the block target at every node of `rule`, in chunks whose working
+/// memory is reserved on the governor first, and hand each chunk to `visit` as
+/// `(first node, its z columns, its (excess, displaced score) results)`.
+/// `fixed_bytes` is what the caller holds live across the whole sweep.
+pub(super) fn visit_mixed_axis_nodes<T: BlockExcessTarget + ?Sized>(
+    target: &T,
+    rule: &MixedAxisRule,
+    with_scores: bool,
+    fixed_bytes: usize,
+    mut visit: impl FnMut(
+        usize,
+        ndarray::ArrayView2<'_, f64>,
+        Vec<(f64, Option<Array1<f64>>)>,
+    ) -> Result<(), EstimationError>,
+) -> Result<(), EstimationError> {
+    let refusal = |reason: &str| {
+        EstimationError::InvalidInput(format!(
+            "#784 mixed-axis rule: working memory refused: {reason}"
+        ))
+    };
+    let m = rule.nodes.nrows();
+    let q = rule.node_count();
+    let inv_sqrt: Vec<f64> = target
+        .block_curvatures()
+        .iter()
+        .map(|lambda| lambda.sqrt().recip())
+        .collect();
+    if inv_sqrt.len() != m {
+        crate::bail_invalid_estim!(
+            "#784 mixed-axis rule: {m}-axis rule on a {}-axis target",
+            inv_sqrt.len()
+        );
+    }
+    let node_bytes = target
+        .node_working_bytes()
+        .and_then(|bytes| bytes.checked_add(m.checked_mul(std::mem::size_of::<f64>())?))
+        .ok_or_else(|| refusal("a node's working bytes overflow usize"))?;
+    let governor = gam_runtime::resource::MemoryGovernor::global();
+    let mut start = 0;
+    let mut chunk = q;
+    while start < q {
+        chunk = chunk.min(q - start);
+        let _reservation = loop {
+            let admitted = governor.remaining_bytes().saturating_sub(fixed_bytes) / node_bytes;
+            chunk = chunk.min(admitted).max(1);
+            let requested = node_bytes
+                .checked_mul(chunk)
+                .and_then(|bytes| bytes.checked_add(fixed_bytes))
+                .ok_or_else(|| refusal("the chunk's working bytes overflow usize"))?;
+            match governor.try_reserve(requested, "#784 mixed-axis rule chunk") {
+                Ok(reservation) => break reservation,
+                Err(error) if chunk == 1 => return Err(refusal(&error.to_string())),
+                // Another reservation landed between reading the remainder and
+                // reserving; the next width is re-read and strictly narrower.
+                Err(_) => chunk -= 1,
+            }
+        };
+        let z = rule.nodes.slice(ndarray::s![.., start..start + chunk]);
+        let draws = Array2::from_shape_fn((m, chunk), |(r, k)| z[(r, k)] * inv_sqrt[r]);
+        let results = if with_scores {
+            target.excess_with_displaced_neg_score_batch(&draws)
+        } else {
+            target
+                .excess_batch(&draws)
+                .into_iter()
+                .map(|excess| (excess, None))
+                .collect()
+        };
+        if results.len() != chunk {
+            crate::bail_invalid_estim!(
+                "#784 mixed-axis rule: the excess batch returned {} nodes for {chunk}",
+                results.len()
+            );
+        }
+        visit(start, z, results)?;
+        start += chunk;
+    }
+    Ok(())
+}
+
+/// Evaluate the rule's excesses and its node measure.
+pub(super) fn mixed_axis_posterior<T: BlockExcessTarget + ?Sized>(
+    target: &T,
+    rule: &MixedAxisRule,
+) -> Result<(Vec<f64>, MixedAxisPosterior), EstimationError> {
+    let mut excesses = vec![f64::NAN; rule.node_count()];
+    visit_mixed_axis_nodes(target, rule, false, 0, |start, _z, results| {
+        for (k, (excess, _)) in results.into_iter().enumerate() {
+            excesses[start + k] = excess;
+        }
+        Ok(())
+    })?;
+    let posterior = rule.posterior(&excesses)?;
+    Ok((excesses, posterior))
+}
+
+/// `Ψ` with its node count and cost-side gradient channels.
+struct MixedAxisTerm {
+    value: f64,
+    node_count: usize,
+    channels: BlockTargetChannels,
+}
+
+/// The mixed-axis part `Ψ` of a split block's marginal
+/// ([`MixedAxisRule`]), with the `ω`-weighted moments contracted into the same
+/// gradient channels as the pieces'.
+///
+/// Every `f_T` is bounded along a soft axis, as the certified `Δ_r` are: the
+/// anchor gives `f_T ≥ |T| ln(2/3)`, and for a convex row surface at an exact
+/// mode `ΔF(z) ≥ −½|z|²`, so `f_T ≤ max_z ½|z|² = 3|T|/2`. The draws are those of
+/// the whole block, `t_r = z_r/√λ_r`, so the channels are the tensor rule's
+/// under the signed measure `ω`, whose total is `Σ_T κ_T` rather than one.
+fn mixed_axis_term(
+    target: &Gam784BlockTarget<'_>,
+    c_weights: &Array1<f64>,
+) -> Result<MixedAxisTerm, EstimationError> {
+    let m = target.block_dim();
+    let n = target.eta_hat.len();
+    let rule = MixedAxisRule::new(m);
+    let (excesses, posterior) = mixed_axis_posterior(target, &rule)?;
+    let inv_sqrt: Vec<f64> = target
+        .block_lambdas
+        .iter()
+        .map(|lambda| lambda.sqrt().recip())
+        .collect();
+    let mut e_t = Array1::<f64>::zeros(m);
+    let mut e_tt = Array2::<f64>::zeros((m, m));
+    let mut e_neg_score = Array1::<f64>::zeros(n);
+    let mut e_t_neg_score = Array2::<f64>::zeros((n, m));
+    let fixed_bytes = n
+        .saturating_mul(m + 1)
+        .saturating_mul(std::mem::size_of::<f64>());
+    visit_mixed_axis_nodes(target, &rule, true, fixed_bytes, |start, z, results| {
+        for (k, (_, score)) in results.into_iter().enumerate() {
+            let node = start + k;
+            if !excesses[node].is_finite() {
+                continue;
+            }
+            let Some(score) = score else {
+                crate::bail_invalid_estim!(
+                    "#784 mixed-axis rule: node {node} is feasible and has no displaced score"
+                );
+            };
+            let weight = posterior.node_weights[node];
+            let t = Array1::from_shape_fn(m, |r| z[(r, k)] * inv_sqrt[r]);
+            e_t.scaled_add(weight, &t);
+            for a in 0..m {
+                for b in 0..m {
+                    e_tt[(a, b)] += weight * t[a] * t[b];
+                }
+            }
+            e_neg_score.scaled_add(weight, &score);
+            for r in 0..m {
+                e_t_neg_score
+                    .column_mut(r)
+                    .scaled_add(weight * t[r], &score);
+            }
+        }
+        Ok(())
+    })?;
+    let moments = gam_problem::laplace_sampler_contract::BlockQuadratureMoments {
+        e_t,
+        e_tt,
+        e_neg_score,
+        e_t_neg_score,
+    };
+    let channels = block_target_channel_moments(target, &moments, c_weights, posterior.mass)?;
+    Ok(MixedAxisTerm {
+        value: posterior.value,
+        node_count: rule.node_count(),
+        channels,
+    })
 }
 
 #[cfg(test)]
-mod mixed_axis_laplace_term_tests {
+mod mixed_axis_rule_tests {
     use super::*;
+
+    fn excesses(rule: &MixedAxisRule, excess: impl Fn(ndarray::ArrayView1<'_, f64>) -> f64) -> Vec<f64> {
+        rule.nodes.columns().into_iter().map(excess).collect()
+    }
+
+    #[test]
+    fn coefficients_count_every_mixed_part_once_and_no_single_axis_part() {
+        for m in 1..=8usize {
+            let coupling = MIXED_AXIS_COUPLING.min(m);
+            // Σ_{T⊇U} κ_T over the subsets of size ≤ K depends only on |U|.
+            for u in 1..=coupling {
+                let total: i64 = (u..=coupling)
+                    .map(|size| {
+                        binomial_coefficient(m - u, size - u) * mixed_axis_piece_coefficient(m, size)
+                    })
+                    .sum();
+                assert_eq!(total, i64::from(u >= 2), "m={m}, |U|={u}");
+            }
+            if m < 2 {
+                continue;
+            }
+            let rule = MixedAxisRule::new(m);
+            let expected = (0..=coupling)
+                .map(|k| binomial_coefficient(m, k) as usize * 2_usize.pow(k as u32))
+                .sum::<usize>();
+            assert_eq!(rule.node_count(), expected, "m={m}");
+        }
+    }
+
+    #[test]
+    fn a_separable_excess_has_no_mixed_part() {
+        for m in 2..=5usize {
+            let rule = MixedAxisRule::new(m);
+            let values = excesses(&rule, |z| {
+                z.iter()
+                    .enumerate()
+                    .map(|(r, &v)| 0.3 * (r as f64 + 1.0) * v.powi(3) + 0.1 * v.powi(4))
+                    .sum()
+            });
+            let psi = rule.posterior(&values).unwrap().value;
+            assert!(psi.abs() <= 1e-12, "m={m}: Ψ={psi}");
+        }
+    }
 
     /// The second-order Laplace expansion of `log E[e^{−ΔF}]` over the whitened
     /// rows `a`, summed pair by pair from the Gaussian moments
@@ -1702,77 +2009,161 @@ mod mixed_axis_laplace_term_tests {
         -quartic + 0.5 * cubic_square
     }
 
-    fn fixture() -> (Array2<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
+    #[test]
+    fn psi_is_the_mixed_part_of_the_laplace_expansion_to_its_order() {
         let (n, m) = (7usize, 3usize);
         let a = Array2::from_shape_fn((n, m), |(i, r)| {
             ((i * 7 + r * 3) as f64 * 0.61).sin() * 0.4 + 0.05 * r as f64
         });
         let c = Array1::from_shape_fn(n, |i| (i as f64 * 1.3).cos() * 0.7);
         let d = Array1::from_shape_fn(n, |i| 0.3 + (i as f64 * 0.9).sin() * 0.2);
-        let e = Array1::from_shape_fn(n, |i| (i as f64 * 2.1).cos() * 0.5);
-        (a, c, d, e)
-    }
-
-    #[test]
-    fn value_is_the_full_expansion_less_every_single_axis_expansion() {
-        let (a, c, d, e) = fixture();
-        let per_axis: f64 = (0..a.ncols())
+        let single: f64 = (0..m)
             .map(|r| {
                 let column = a.column(r).to_owned().insert_axis(ndarray::Axis(1));
                 pairwise_second_order(&column, &c, &d)
             })
             .sum();
-        let expected = pairwise_second_order(&a, &c, &d) - per_axis;
-        let term = mixed_axis_laplace_term(a.view(), &c, &d, &e);
+        let mixed = pairwise_second_order(&a, &c, &d) - single;
+        assert!(mixed.abs() > 1e-3, "fixture has no mixed part: {mixed}");
+        let rule = MixedAxisRule::new(m);
+        // ΔF = ε ΔF₃ + ε² ΔF₄: the mixed part is ε²·mixed, the odd ε³ terms vanish,
+        // and what is left is O(ε⁴).
+        let error = |eps: f64| {
+            let values = excesses(&rule, |z| {
+                let s = a.dot(&z);
+                (0..n)
+                    .map(|i| eps * c[i] * s[i].powi(3) / 6.0 + eps * eps * d[i] * s[i].powi(4) / 24.0)
+                    .sum()
+            });
+            rule.posterior(&values).unwrap().value - eps * eps * mixed
+        };
+        let (coarse, fine) = (error(0.2), error(0.1));
         assert!(
-            (term.value - expected).abs() <= 1e-12 * expected.abs().max(1.0),
-            "Φ={} against the pairwise expansion {expected}",
-            term.value
+            coarse.abs() > 12.0 * fine.abs(),
+            "Ψ less the expansion's mixed part does not fall at fourth order: {coarse:.3e} at \
+             ε=0.2, {fine:.3e} at ε=0.1"
         );
-        // A single axis has no mixed part.
-        let column = a.column(0).to_owned().insert_axis(ndarray::Axis(1));
-        let single = mixed_axis_laplace_term(column.view(), &c, &d, &e);
-        assert!(single.value.abs() <= 1e-14, "one axis gave Φ={}", single.value);
+    }
+
+    /// Saturated softplus rows, whose curvature `W_i = ψ''(η̂_i)` vanishes as
+    /// `|η̂|` grows, carrying both block axes against a vanishing penalty: the
+    /// whitened rows grow like `W^{-1/2}` and the second-order expansion's mixed
+    /// part like `1/W`. `Ψ` stays inside the bounds of its pieces.
+    #[test]
+    fn psi_stays_bounded_where_the_second_order_expansion_diverges() {
+        let softplus = |x: f64| if x > 0.0 { x + (-x).exp().ln_1p() } else { x.exp().ln_1p() };
+        let sig = |e: f64| 1.0 / (1.0 + (-e).exp());
+        let x = [[1.0, 0.3], [0.2, 1.0], [0.8, -0.6], [-0.4, 0.9]];
+        let rule = MixedAxisRule::new(2);
+        let mut expansions = Vec::new();
+        for saturation in [2.0_f64, 6.0, 10.0, 14.0] {
+            let eta = [-saturation, saturation, -saturation, saturation];
+            let w: Vec<f64> = eta.iter().map(|&e| sig(e) * (1.0 - sig(e))).collect();
+            let c = Array1::from_shape_fn(4, |i| w[i] * (1.0 - 2.0 * sig(eta[i])));
+            let d = Array1::from_shape_fn(4, |i| w[i] * (1.0 - 6.0 * w[i]));
+            // Whiten by the Cholesky factor of H = XᵀWX + μI, μ → 0.
+            let mut h = [[1e-12, 0.0], [0.0, 1e-12]];
+            for i in 0..4 {
+                for p in 0..2 {
+                    for q in 0..2 {
+                        h[p][q] += w[i] * x[i][p] * x[i][q];
+                    }
+                }
+            }
+            let l00 = h[0][0].sqrt();
+            let l10 = h[1][0] / l00;
+            let l11 = (h[1][1] - l10 * l10).sqrt();
+            let a = Array2::from_shape_fn((4, 2), |(i, r)| {
+                let a0 = x[i][0] / l00;
+                if r == 0 { a0 } else { (x[i][1] - l10 * a0) / l11 }
+            });
+            let values = excesses(&rule, |z| {
+                let s = a.dot(&z);
+                (0..4)
+                    .map(|i| {
+                        let e = eta[i];
+                        softplus(e + s[i]) - softplus(e) - sig(e) * s[i] - 0.5 * w[i] * s[i] * s[i]
+                    })
+                    .sum()
+            });
+            let posterior = rule.posterior(&values).unwrap();
+            let mut bound = 0.0;
+            for piece in &posterior.pieces {
+                let size = piece.axes as f64;
+                assert!(
+                    piece.log_ratio >= size * (2.0_f64 / 3.0).ln() - 1e-12
+                        && piece.log_ratio <= 1.5 * size + 1e-12,
+                    "f_T={} outside its bounds for |T|={size} at saturation {saturation}",
+                    piece.log_ratio
+                );
+                bound += piece.coefficient.abs() * 1.5 * size;
+            }
+            assert!(posterior.value.abs() <= bound, "Ψ={} past {bound}", posterior.value);
+            let single: f64 = (0..2)
+                .map(|r| {
+                    let column = a.column(r).to_owned().insert_axis(ndarray::Axis(1));
+                    pairwise_second_order(&column, &c, &d)
+                })
+                .sum();
+            expansions.push((pairwise_second_order(&a, &c, &d) - single).abs());
+        }
+        assert!(
+            expansions[3] > 100.0 * expansions[0].max(1e-3),
+            "the fixture does not reach the divergent regime: {expansions:?}"
+        );
     }
 
     #[test]
-    fn gradients_match_central_differences() {
-        let (a, c, d, e) = fixture();
-        let term = mixed_axis_laplace_term(a.view(), &c, &d, &e);
+    fn node_measure_is_the_derivative_of_psi() {
+        let m = 3usize;
+        let rule = MixedAxisRule::new(m);
+        // ΔF(z; θ) = θ₀ z₀z₁z₂ + θ₁ z₀²z₁² + θ₀θ₁ z₁³ + ¼(z·z)²θ₁², with node
+        // derivative ∂ΔF/∂θ.
+        let excess = |z: ndarray::ArrayView1<'_, f64>, theta: [f64; 2]| {
+            let q = z.dot(&z);
+            theta[0] * z[0] * z[1] * z[2]
+                + theta[1] * z[0] * z[0] * z[1] * z[1]
+                + theta[0] * theta[1] * z[1].powi(3)
+                + 0.25 * q * q * theta[1] * theta[1]
+        };
+        let theta = [0.21, 0.13];
+        let posterior = rule
+            .posterior(&excesses(&rule, |z| excess(z, theta)))
+            .unwrap();
         let h = 1e-6;
-        for i in 0..a.nrows() {
-            for r in 0..a.ncols() {
-                let mut plus = a.clone();
-                plus[(i, r)] += h;
-                let mut minus = a.clone();
-                minus[(i, r)] -= h;
-                let fd = (mixed_axis_laplace_term(plus.view(), &c, &d, &e).value
-                    - mixed_axis_laplace_term(minus.view(), &c, &d, &e).value)
-                    / (2.0 * h);
-                assert!(
-                    (fd - term.a_gradient[(i, r)]).abs() <= 1e-7,
-                    "∂Φ/∂a[{i},{r}]: analytic {} against FD {fd}",
-                    term.a_gradient[(i, r)]
-                );
+        for j in 0..2 {
+            let mut analytic = 0.0;
+            for (node, z) in rule.nodes.columns().into_iter().enumerate() {
+                let (mut plus, mut minus) = (theta, theta);
+                plus[j] += h;
+                minus[j] -= h;
+                let derivative = (excess(z, plus) - excess(z, minus)) / (2.0 * h);
+                analytic += posterior.node_weights[node] * derivative;
             }
-            // η_i moves c_i and d_i at rates d_i and e_i.
-            let mut c_plus = c.clone();
-            let mut d_plus = d.clone();
-            c_plus[i] += h * d[i];
-            d_plus[i] += h * e[i];
-            let mut c_minus = c.clone();
-            let mut d_minus = d.clone();
-            c_minus[i] -= h * d[i];
-            d_minus[i] -= h * e[i];
-            let fd = (mixed_axis_laplace_term(a.view(), &c_plus, &d_plus, &e).value
-                - mixed_axis_laplace_term(a.view(), &c_minus, &d_minus, &e).value)
-                / (2.0 * h);
-            assert!(
-                (fd - term.eta_gradient[i]).abs() <= 1e-7,
-                "∂Φ/∂η[{i}]: analytic {} against FD {fd}",
-                term.eta_gradient[i]
-            );
+            let (mut plus, mut minus) = (theta, theta);
+            plus[j] += h;
+            minus[j] -= h;
+            let at = |t: [f64; 2]| rule.posterior(&excesses(&rule, |z| excess(z, t))).unwrap().value;
+            let fd = -(at(plus) - at(minus)) / (2.0 * h);
+            assert!((fd - analytic).abs() <= 1e-7, "∂(−Ψ)/∂θ_{j}: {analytic} against {fd}");
         }
+        let total: f64 = posterior.node_weights.sum();
+        assert!((total - posterior.mass).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn infeasible_nodes_leave_their_pieces() {
+        let rule = MixedAxisRule::new(2);
+        let mut values = excesses(&rule, |z| 0.1 * z[0] * z[0] * z[1]);
+        let dropped = (0..rule.node_count())
+            .find(|&node| rule.nodes[(0, node)] > 0.0 && rule.nodes[(1, node)] > 0.0)
+            .unwrap();
+        values[dropped] = f64::INFINITY;
+        let posterior = rule.posterior(&values).unwrap();
+        assert!(posterior.value.is_finite());
+        assert_eq!(posterior.node_weights[dropped], 0.0);
+        values[0] = f64::INFINITY;
+        assert!(rule.posterior(&values).is_err(), "an infeasible mode must refuse");
     }
 }
 
