@@ -5819,31 +5819,51 @@ pub(crate) enum BlockCorrectionDecision {
     AdmittedAtOptimum,
 }
 
-/// The #784 block quadrature latched beside the admission (#2623): the
-/// Gauss–Hermite order of each block axis, and whether the block marginal is
-/// integrated axis by axis with the analytic mixed-axis term, or as one tensor
-/// rule over the whole block. Beside them sit the paired-rule errors measured
-/// at that admission: the certificate every later evaluation at those orders
-/// carries, since the paired error no longer switches anything once the
-/// orders are latched (#2748). `hessian_refusal` is the mathematical reason
-/// `Δ_b` has no closed-form ρ-Hessian on this fit, or `None` when the
-/// correction carries its exact ρ-Hessian into the criterion.
+/// The #784 block quadrature latched beside the admission (#2623): whether the
+/// block marginal is integrated axis by axis with the analytic mixed-axis term or as
+/// one tensor rule over the whole block, and each piece's rule. Every later
+/// evaluation integrates on these rules, so the criterion is one fixed rule's value
+/// at every ρ and its gradient is that rule's derivative (#2748).
+/// `hessian_refusal` is the mathematical reason `Δ_b` has no closed-form ρ-Hessian
+/// on this fit, or `None` when the correction carries its exact ρ-Hessian into the
+/// criterion.
 ///
 /// The block itself is latched as its SPECTRAL POSITIONS: the ranks, in the
 /// ascending eigenvalue order of the penalized Hessian, of the directions the
 /// admission integrated (a rank, so it does not depend on which order the
 /// criterion's eigensolver returns its pairs in). Each later ρ takes the eigenvectors at those
-/// positions, so axis `r`'s order stays attached to the direction it was
+/// positions, so axis `r`'s rule stays attached to the direction it was
 /// certified on, and the block moves with ρ as continuously as the
 /// eigenvectors at those positions do (continuously away from an eigenvalue
 /// coincidence with a neighbouring position, steeply near an avoided one).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BlockQuadratureLatch {
     pub(crate) block_positions: Vec<usize>,
-    pub(crate) axis_orders: Vec<usize>,
-    pub(crate) axis_quadrature_errors: Vec<f64>,
+    pub(crate) pieces: Vec<LatchedPieceRule>,
     pub(crate) axis_split: bool,
     pub(crate) hessian_refusal: Option<String>,
+}
+
+/// One latched piece of a #784 block. The variant is the rule, so a consumer that
+/// rebuilds a piece's nodes (a second-order pass, an audit) must name which rule it
+/// rebuilds rather than read a node count as a Gauss–Hermite order.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum LatchedPieceRule {
+    /// A tensor Gauss–Hermite rule of these per-axis orders, with the paired-rule
+    /// errors measured at admission: the certificate every later evaluation at those
+    /// orders carries, since the paired error switches nothing once they are latched.
+    /// A one-axis piece whose target is truncated (a positive-domain link) is
+    /// integrated here, by the truncated-normal transport of its Gauss–Hermite rule.
+    GaussHermite {
+        axis_orders: Vec<usize>,
+        certified_axis_errors: Vec<f64>,
+    },
+    /// One axis, integrated by the composite Gauss–Kronrod rule on the partition the
+    /// admission adapted, in the logistic image of the standardized axis `z = √λ·t`
+    /// oriented so its standardized skewness is positive.
+    Composite {
+        breakpoints: Vec<gam_problem::laplace_sampler_contract::AxisBreakpoint>,
+    },
 }
 
 pub(crate) struct RemlState<'a> {

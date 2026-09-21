@@ -445,7 +445,7 @@ fn row_bernoulli_logit(
         (mu, input.y - mu)
     };
     let dmu_deta = tail / (denom * denom);
-    if !(dmu_deta.is_finite() && dmu_deta > 0.0) {
+    if !(dmu_deta.is_finite() && dmu_deta >= 0.0) {
         return Err(EstimationError::pirls_row_geometry_unrepresentable(
             row,
             "canonical-logit inverse-link jet",
@@ -459,6 +459,29 @@ fn row_bernoulli_logit(
             input.eta,
             RowOutput {
                 mu,
+                ..RowOutput::default()
+            },
+        );
+    }
+    if dmu_deta == 0.0 {
+        // Saturated row (`|eta|` past ~745.13, where `mu'` rounds to zero): a
+        // consistent row's residual rounds to zero with it and its geometry is
+        // the analytic zero-weight limit; an inconsistent one has no representable
+        // weight for its unit-order score. Twin of `bernoulli_logit_geometry_from_jet`.
+        if residual != 0.0 {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                row,
+                "saturated canonical-logit row inconsistent with response",
+                input.eta,
+                residual,
+            ));
+        }
+        return certify_output(
+            row,
+            input.eta,
+            RowOutput {
+                mu,
+                deviance: bernoulli_logit_deviance(input.y, input.eta, w_prior),
                 ..RowOutput::default()
             },
         );
@@ -679,4 +702,35 @@ fn standard_normal_cdf(x: f64) -> f64 {
 fn standard_normal_pdf(x: f64) -> f64 {
     const COEFF: f64 = 0.398_942_280_401_432_7; // 1 / sqrt(2π)
     COEFF * (-0.5 * x * x).exp()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saturated_canonical_logit_row_matches_host_zero_weight_limit() {
+        let fit = |eta: f64, y: f64| {
+            row_bernoulli_logit(
+                0,
+                RowInput {
+                    eta,
+                    y,
+                    prior_weight: 1.0,
+                },
+                CurvatureMode::Fisher,
+            )
+        };
+        for (eta, y) in [(-746.0, 0.0), (746.0, 1.0)] {
+            let out = fit(eta, y).expect("consistent saturated row is representable");
+            assert_eq!(out.mu, y);
+            assert_eq!(out.grad_eta, 0.0);
+            assert_eq!(out.w_fisher, 0.0);
+            assert_eq!(out.w_hessian, 0.0);
+            assert_eq!(out.w_solver, 0.0);
+            assert!(out.deviance.is_finite() && out.deviance >= 0.0);
+        }
+        assert!(fit(-746.0, 1.0).is_err());
+        assert!(fit(746.0, 0.0).is_err());
+    }
 }

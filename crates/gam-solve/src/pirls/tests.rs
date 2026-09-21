@@ -840,6 +840,56 @@ mod tests {
     }
 
     #[test]
+    fn canonical_logit_saturated_consistent_rows_take_the_zero_weight_limit() {
+        // Past |eta| ~ 745.13 the logit mean derivative rounds to zero. A row whose
+        // response sits on the saturated boundary (adult income, gam#3195: row with
+        // eta = -745.17, y = 0) has a residual that rounds to zero with it, so its
+        // working geometry is the prior-weight-zero limit, not a refusal.
+        let eta = array![-745.5, -746.0, 745.5, 900.0];
+        let y = array![0.0, 0.0, 1.0, 1.0];
+        let prior = Array1::ones(4);
+        let mut mu = Array1::zeros(4);
+        let mut weights = Array1::zeros(4);
+        let mut z = Array1::zeros(4);
+        update_glmvectors(
+            y.view(),
+            &eta,
+            &InverseLink::Standard(StandardLink::Logit),
+            prior.view(),
+            &mut mu,
+            &mut weights,
+            &mut z,
+            None,
+        )
+        .expect("consistent saturated canonical-logit rows are representable");
+        for i in 0..4 {
+            assert_eq!(crate::mixture_link::logit_inverse_link_jet5(eta[i]).d1, 0.0);
+            assert_eq!(weights[i], 0.0);
+            assert_eq!(z[i], eta[i]);
+            assert_eq!(mu[i], y[i]);
+        }
+
+        // The same saturation with the response on the far boundary keeps a
+        // unit-order score and no representable weight: still refused.
+        for (eta_value, y_value) in [(-746.0, 1.0), (746.0, 0.0)] {
+            let mut mu = Array1::zeros(1);
+            let mut weights = Array1::zeros(1);
+            let mut z = Array1::zeros(1);
+            let refused = update_glmvectors(
+                array![y_value].view(),
+                &array![eta_value],
+                &InverseLink::Standard(StandardLink::Logit),
+                array![1.0].view(),
+                &mut mu,
+                &mut weights,
+                &mut z,
+                None,
+            );
+            assert!(refused.is_err(), "eta={eta_value}, y={y_value} must be refused");
+        }
+    }
+
+    #[test]
     fn canonical_logit_weight_derivative_matches_finite_difference_at_tail() {
         let eta0 = 40.0;
         let h = 1e-4;

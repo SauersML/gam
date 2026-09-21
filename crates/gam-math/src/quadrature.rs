@@ -43,6 +43,11 @@ pub enum QuadratureError {
     EmptyGaussHermiteRule,
     /// Golub-Welsch produced weights that cannot represent the Hermite mass.
     InvalidGaussHermiteMass { mass: f64 },
+    /// A Gauss-Kronrod pair must extend a Gauss rule of at least one node.
+    EmptyGaussKronrodRule,
+    /// Laurie's recurrence produced a Jacobi matrix whose Kronrod extension is
+    /// not a real positive rule interleaving the Gauss nodes on `(-1, 1)`.
+    InvalidGaussKronrodRule { gauss_nodes: usize, node: usize },
 }
 
 impl fmt::Display for QuadratureError {
@@ -93,6 +98,14 @@ impl fmt::Display for QuadratureError {
             Self::InvalidGaussHermiteMass { mass } => write!(
                 formatter,
                 "Gauss-Hermite Golub-Welsch weights have invalid mass {mass}"
+            ),
+            Self::EmptyGaussKronrodRule => {
+                formatter.write_str("a Gauss-Kronrod pair needs a Gauss rule of at least one node")
+            }
+            Self::InvalidGaussKronrodRule { gauss_nodes, node } => write!(
+                formatter,
+                "the {}-node Kronrod extension of the {gauss_nodes}-node Gauss-Legendre rule is not a real positive interleaving rule at node {node}",
+                2 * gauss_nodes + 1
             ),
         }
     }
@@ -436,6 +449,143 @@ pub fn max_representable_standard_normal_gauss_hermite_order() -> usize {
     })
 }
 
+/// A Gauss-Legendre rule and its Kronrod extension on `[-1, 1]` sharing nodes (#784).
+///
+/// `nodes` holds the `2n+1` Kronrod nodes ascending. `kronrod_weights` integrates
+/// polynomials through degree `3n+1` exactly; `gauss_weights` is aligned with `nodes`, zero
+/// at the `n+1` Kronrod-only nodes and the `n`-node Gauss-Legendre weight at the rest, so
+/// both estimates come from one set of integrand values and their difference measures
+/// the Gauss estimate's error.
+#[derive(Clone, Debug)]
+pub struct GaussKronrodRule {
+    pub nodes: Vec<f64>,
+    pub kronrod_weights: Vec<f64>,
+    pub gauss_weights: Vec<f64>,
+}
+
+/// The `(2n+1)`-node Gauss-Kronrod-Legendre rule extending the `n`-node Gauss rule.
+///
+/// Laurie's algorithm (Math. Comp. 66, 1997, in the form of Gautschi's `r_kronrod`)
+/// turns the Legendre recurrence into the Jacobi matrix of the Kronrod rule; Golub-Welsch
+/// then reads its nodes and weights from [`symmetric_tridiagonal_eigen_first_components`],
+/// the same `O(n²)` path as the Gauss-Hermite rules here. The Gauss weights come from
+/// [`crate::special::gauss_legendre`]; the Gauss nodes are the Kronrod nodes at the odd
+/// sorted positions, which the construction checks.
+pub fn gauss_kronrod_legendre_rule(
+    gauss_nodes: usize,
+) -> Result<GaussKronrodRule, QuadratureError> {
+    let n = gauss_nodes;
+    if n == 0 {
+        return Err(QuadratureError::EmptyGaussKronrodRule);
+    }
+    let size = 2 * n + 1;
+    // Legendre recurrence on [-1, 1]: alpha_k = 0, beta_0 = mass 2, beta_k = k²/(4k² − 1).
+    // Laurie needs the first floor(3n/2)+1 alphas and ceil(3n/2)+1 betas.
+    let mut alpha = vec![0.0_f64; size];
+    let mut beta = vec![0.0_f64; size];
+    for (k, value) in beta.iter_mut().enumerate().take((3 * n).div_ceil(2) + 1) {
+        *value = if k == 0 {
+            2.0
+        } else {
+            let k = k as f64;
+            k * k / (4.0 * k * k - 1.0)
+        };
+    }
+    let mut s = vec![0.0_f64; n / 2 + 2];
+    let mut t = vec![0.0_f64; n / 2 + 2];
+    t[1] = beta[n + 1];
+    let mut terms = Vec::with_capacity(n);
+    for m in 0..n.saturating_sub(1) {
+        terms.clear();
+        for k in (0..=(m + 1) / 2).rev() {
+            let l = m - k;
+            terms.push((
+                k,
+                (alpha[k + n + 1] - alpha[l]) * t[k + 1] + beta[k + n + 1] * s[k]
+                    - beta[l] * s[k + 1],
+            ));
+        }
+        let mut running = 0.0;
+        for &(k, term) in &terms {
+            running += term;
+            s[k + 1] = running;
+        }
+        std::mem::swap(&mut s, &mut t);
+    }
+    for j in (0..=n / 2).rev() {
+        s[j + 1] = s[j];
+    }
+    for m in (n - 1)..(2 * n).saturating_sub(2) {
+        terms.clear();
+        for k in (m + 1 - n)..=((m - 1) / 2) {
+            let l = m - k;
+            let j = n - 1 - l;
+            terms.push((
+                j,
+                -(alpha[k + n + 1] - alpha[l]) * t[j + 1] - beta[k + n + 1] * s[j + 1]
+                    + beta[l] * s[j + 2],
+            ));
+        }
+        let mut running = 0.0;
+        for &(j, term) in &terms {
+            running += term;
+            s[j + 1] = running;
+        }
+        let last = terms.last().map(|&(j, _)| j).expect("non-empty Laurie sweep");
+        if m % 2 == 0 {
+            let k = m / 2;
+            alpha[k + n + 1] = alpha[k] + (s[last + 1] - beta[k + n + 1] * s[last + 2]) / t[last + 2];
+        } else {
+            let k = (m + 1) / 2;
+            beta[k + n + 1] = s[last + 1] / s[last + 2];
+        }
+        std::mem::swap(&mut s, &mut t);
+    }
+    alpha[2 * n] = alpha[n - 1] - beta[2 * n] * s[1] / t[1];
+    let invalid = |node: usize| QuadratureError::InvalidGaussKronrodRule { gauss_nodes: n, node };
+    let mut off_diagonal = Vec::with_capacity(size - 1);
+    for (index, &value) in beta[1..].iter().enumerate() {
+        if !(value > 0.0) {
+            return Err(invalid(index + 1));
+        }
+        off_diagonal.push(value.sqrt());
+    }
+    let (nodes, first_components) =
+        symmetric_tridiagonal_eigen_first_components(&alpha, &off_diagonal)?;
+    let mut pairs = nodes
+        .into_iter()
+        .zip(first_components)
+        .map(|(node, first)| (node, beta[0] * first * first))
+        .collect::<Vec<_>>();
+    pairs.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let (gauss_abscissae, gauss_legendre_weights) = crate::special::gauss_legendre(n);
+    let mut gauss_weights = vec![0.0; size];
+    for (index, (&abscissa, &weight)) in gauss_abscissae
+        .iter()
+        .zip(gauss_legendre_weights.iter())
+        .enumerate()
+    {
+        let shared = 2 * index + 1;
+        // Both constructions resolve a shared node to a few ulps of the unit interval.
+        if (pairs[shared].0 - abscissa).abs() > (size as f64) * f64::EPSILON {
+            return Err(invalid(shared));
+        }
+        gauss_weights[shared] = weight;
+    }
+    for (index, &(node, weight)) in pairs.iter().enumerate() {
+        let inside = node > -1.0 && node < 1.0;
+        let ascending = index == 0 || node > pairs[index - 1].0;
+        if !(inside && ascending && weight > 0.0) {
+            return Err(invalid(index));
+        }
+    }
+    Ok(GaussKronrodRule {
+        nodes: pairs.iter().map(|&(node, _)| node).collect(),
+        kronrod_weights: pairs.into_iter().map(|(_, weight)| weight).collect(),
+        gauss_weights,
+    })
+}
+
 /// The standard normal restricted to `(lower, upper)`, `lower < 0 < upper`, and the
 /// map that transports a standard-normal rule onto it.
 ///
@@ -665,6 +815,90 @@ mod tests {
         let fd_upper = (moved_upper.log_mass() - moved_upper_back.log_mass()) / (2.0 * h);
         assert!((g_lower - fd_lower).abs() <= 1e-8);
         assert!((g_upper - fd_upper).abs() <= 1e-8);
+    }
+
+    #[test]
+    fn seven_point_gauss_kronrod_pair_matches_the_quadpack_rule_784() {
+        // QUADPACK's qk15 abscissae and weights (the non-negative half; the rule is symmetric).
+        let nodes = [
+            0.991_455_371_120_812_639,
+            0.949_107_912_342_758_525,
+            0.864_864_423_359_769_073,
+            0.741_531_185_599_394_440,
+            0.586_087_235_467_691_130,
+            0.405_845_151_377_397_167,
+            0.207_784_955_007_898_468,
+            0.0,
+        ];
+        let kronrod = [
+            0.022_935_322_010_529_225,
+            0.063_092_092_629_978_553,
+            0.104_790_010_322_250_184,
+            0.140_653_259_715_525_919,
+            0.169_004_726_639_267_903,
+            0.190_350_578_064_785_410,
+            0.204_432_940_075_298_892,
+            0.209_482_141_084_727_828,
+        ];
+        let gauss = [
+            0.0,
+            0.129_484_966_168_869_693,
+            0.0,
+            0.279_705_391_489_276_668,
+            0.0,
+            0.381_830_050_505_118_945,
+            0.0,
+            0.417_959_183_673_469_388,
+        ];
+        let rule = gauss_kronrod_legendre_rule(7).expect("G7K15");
+        assert_eq!(rule.nodes.len(), 15);
+        for (offset, index) in (7..15).rev().enumerate() {
+            assert!((rule.nodes[index] - nodes[offset]).abs() <= 1e-14, "node {index}");
+            assert!((rule.nodes[14 - index] + nodes[offset]).abs() <= 1e-14, "node {}", 14 - index);
+            assert!((rule.kronrod_weights[index] - kronrod[offset]).abs() <= 1e-14);
+            assert!((rule.gauss_weights[index] - gauss[offset]).abs() <= 1e-14);
+            assert_eq!(rule.gauss_weights[index], rule.gauss_weights[14 - index]);
+        }
+    }
+
+    #[test]
+    fn gauss_kronrod_pairs_integrate_their_exact_degrees_784() {
+        // The Kronrod rule is exact through degree 3n+1, the embedded Gauss rule through 2n-1,
+        // and at degree 2n the Gauss rule misses by exactly the squared norm of the monic
+        // Legendre polynomial, 2·prod_k k²/(2k−1)² / (2n+1): the error the pair measures.
+        for n in 1..=30 {
+            let rule = gauss_kronrod_legendre_rule(n).expect("Gauss-Kronrod pair");
+            let moment = |degree: usize| {
+                if degree % 2 == 1 { 0.0 } else { 2.0 / (degree as f64 + 1.0) }
+            };
+            let integrate = |weights: &[f64], degree: usize| {
+                rule.nodes
+                    .iter()
+                    .zip(weights)
+                    .map(|(&x, &w)| w * x.powi(degree as i32))
+                    .sum::<f64>()
+            };
+            for degree in 0..=3 * n + 1 {
+                let k = integrate(&rule.kronrod_weights, degree);
+                assert!((k - moment(degree)).abs() <= 1e-13, "K{} degree {degree}: {k}", 2 * n + 1);
+            }
+            for degree in 0..2 * n {
+                let g = integrate(&rule.gauss_weights, degree);
+                assert!((g - moment(degree)).abs() <= 1e-13, "G{n} degree {degree}: {g}");
+            }
+            let monic_norm = 2.0
+                * (1..=n)
+                    .map(|k| (k * k) as f64 / ((2 * k - 1) * (2 * k - 1)) as f64)
+                    .product::<f64>()
+                / (2 * n + 1) as f64;
+            let g = integrate(&rule.gauss_weights, 2 * n);
+            let miss = moment(2 * n) - g;
+            assert!((miss - monic_norm).abs() <= 1e-13, "G{n} misses degree {} by {miss}, expected {monic_norm}", 2 * n);
+        }
+        assert!(matches!(
+            gauss_kronrod_legendre_rule(0),
+            Err(QuadratureError::EmptyGaussKronrodRule)
+        ));
     }
 
     #[test]

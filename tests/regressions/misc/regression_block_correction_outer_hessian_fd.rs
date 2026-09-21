@@ -57,6 +57,9 @@ struct EngagedBlock {
     /// Per piece, whether it was integrated on a feasible interval with a
     /// finite end.
     truncated_pieces: Vec<bool>,
+    /// Per piece, whether its latched rule is the composite Gauss–Kronrod
+    /// partition.
+    composite_pieces: Vec<bool>,
 }
 
 fn engaged_block(label: &str, rho: &Array1<f64>) -> EngagedBlock {
@@ -72,6 +75,7 @@ fn engaged_block(label: &str, rho: &Array1<f64>) -> EngagedBlock {
         block_cols: record.block_cols,
         axis_orders: record.axis_orders,
         truncated_pieces: record.truncated_pieces,
+        composite_pieces: record.composite_pieces,
     }
 }
 
@@ -320,6 +324,13 @@ fn sparse_binomial_single_coefficient_block_hessian_matches_differences() {
     };
     for rho in [-5.0, -3.0] {
         let rho = array![rho];
+        let (_, block) = criterion.hessian("sparse binomial", &rho);
+        assert!(
+            block.composite_pieces.iter().any(|&composite| composite),
+            "the untruncated one-axis block must integrate on its latched composite \
+             Gauss–Kronrod partition, or the composite rule's Hessian is not what this \
+             test exercised: {block:?}"
+        );
         criterion.assert_gradient_matches_cost_differences("sparse binomial", &rho);
         criterion.assert_hessian_matches_gradient_differences("sparse binomial", &rho);
     }

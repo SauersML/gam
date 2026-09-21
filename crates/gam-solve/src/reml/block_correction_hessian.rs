@@ -22,6 +22,8 @@
 use super::block_quadrature_correction::{block_axis_target, mixed_axis_laplace_term};
 use gam_math::probability::positive_log_sum_exp;
 use super::*;
+use gam_linalg::faer_ndarray::{fast_ab, fast_atb, fast_atv, fast_av, fast_xt_diag_y};
+use ndarray::ShapeBuilder;
 
 /// How a row's likelihood curvature `ψ''(η)` is evaluated off the mode, where
 /// the second derivative of the excess `F` reads it.
@@ -272,12 +274,26 @@ fn rho_pairs(n_rho: usize) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// The one-axis rule a piece was integrated by, whose nodes its second-order pass
+/// differentiates.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum PieceRule<'r> {
+    /// The standard-normal Gauss–Hermite rule of this order, transported onto the
+    /// feasible interval of a truncated axis.
+    GaussHermite { order: usize },
+    /// The composite Gauss–Kronrod rule on the latched partition: fixed nodes in
+    /// the oriented standardized axis, never truncated.
+    Composite {
+        nodes: &'r [gam_problem::laplace_sampler_contract::CompositeNode],
+    },
+}
+
 /// Everything the Hessian reads besides the block target.
 pub(super) struct BlockCorrectionHessianInputs<'x> {
     pub(super) curvature: RowCurvature,
     pub(super) axis_split: bool,
-    /// The Gauss–Hermite order of each block axis (one entry for `m = 1`).
-    pub(super) axis_orders: &'x [usize],
+    /// The rule each piece was integrated by (one piece for `m = 1`).
+    pub(super) piece_rules: &'x [PieceRule<'x>],
     /// The eigensystem of `H` the block was drawn from.
     pub(super) evals: &'x Array1<f64>,
     pub(super) evecs: &'x Array2<f64>,
@@ -317,6 +333,17 @@ struct AxisMotion {
     y_ddot: Vec<Array1<f64>>,
 }
 
+impl AxisMotion {
+    /// The same motion along `−u`.
+    fn reflected(self) -> Self {
+        Self {
+            y: -self.y,
+            y_dot: self.y_dot.into_iter().map(|y| -y).collect(),
+            y_ddot: self.y_ddot.into_iter().map(|y| -y).collect(),
+        }
+    }
+}
+
 struct Geometry<'g, 't> {
     target: &'g Gam784BlockTarget<'t>,
     evals: &'g Array1<f64>,
@@ -336,35 +363,61 @@ impl Geometry<'_, '_> {
         penalty_local_matvec(&self.target.penalties[j], v) * self.target.lambdas[j]
     }
 
-    /// `H⁻¹ v` through the block's eigensystem.
-    fn solve(&self, v: &Array1<f64>) -> Array1<f64> {
-        self.evecs.dot(&(self.evecs.t().dot(v) / self.evals))
+    /// `Q diag(gains) Qᵀ M` through the block's eigensystem `Q`, every column of
+    /// `M` in one pair of products: `H⁻¹ M` with `gains = 1/σ`, the eigenpair
+    /// resolvent with `gains = 1/(λ − σ_q)`.
+    fn spectral_columns(&self, gains: &Array1<f64>, m: &Array2<f64>) -> Array2<f64> {
+        let mut coordinates = fast_atb(self.evecs, m);
+        for (mut row, &gain) in coordinates.rows_mut().into_iter().zip(gains) {
+            row *= gain;
+        }
+        fast_ab(self.evecs, &coordinates)
+    }
+
+    /// The per-row carriers of every ρ-pair as the columns of one `n × pairs`
+    /// matrix, so each design contraction `Xᵀ(·)` is one product rather than
+    /// one strided matrix–vector pass over `X` per pair.
+    fn pair_rows(&self, n: usize, row: impl Fn(usize, usize, usize) -> Array1<f64>) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((n, self.pairs.len()).f());
+        for (k, &(j, l)) in self.pairs.iter().enumerate() {
+            out.column_mut(k).assign(&row(k, j, l));
+        }
+        out
     }
 
     fn mode_motion(&self) -> ModeMotion {
         let x = self.x();
+        let n = x.nrows();
         let n_rho = self.target.lambdas.len();
         let score: Vec<Array1<f64>> = (0..n_rho)
             .map(|j| &self.target.penalty_scores[j] * self.target.lambdas[j])
             .collect();
+        let inverse = self.evals.mapv(f64::recip);
         // H β̇_j = −λ_j S_j β̂.
-        let beta_dot: Vec<Array1<f64>> = score.iter().map(|a| -self.solve(a)).collect();
-        let eta_dot: Vec<Array1<f64>> = beta_dot.iter().map(|b| x.dot(b)).collect();
-        let mut eta_ddot = Vec::with_capacity(self.pairs.len());
-        let mut w_ddot = Vec::with_capacity(self.pairs.len());
-        for &(j, l) in &self.pairs {
-            // Differentiating H β̇_j = −λ_j S_j β̂ along ρ_l, with
-            // Ḣ_l = λ_l S_l + Xᵀ diag(c ⊙ E_l) X.
-            let mut rhs = self.penalty_mv(l, beta_dot[j].view());
-            rhs += &self.penalty_mv(j, beta_dot[l].view());
-            rhs += &x.t().dot(&(self.c * &eta_dot[l] * &eta_dot[j]));
+        let beta_dot = -self.spectral_columns(&inverse, &columns_matrix(self.evecs.nrows(), &score));
+        let eta_dot = matrix_columns(&fast_ab(x, &beta_dot));
+        let beta_dot = matrix_columns(&beta_dot);
+        // Differentiating H β̇_j = −λ_j S_j β̂ along ρ_l, with
+        // Ḣ_l = λ_l S_l + Xᵀ diag(c ⊙ E_l) X.
+        let mut rhs = fast_atb(
+            x,
+            &self.pair_rows(n, |_, j, l| self.c * &eta_dot[l] * &eta_dot[j]),
+        );
+        for (k, &(j, l)) in self.pairs.iter().enumerate() {
+            let mut column = rhs.column_mut(k);
+            column += &self.penalty_mv(l, beta_dot[j].view());
+            column += &self.penalty_mv(j, beta_dot[l].view());
             if j == l {
-                rhs += &score[j];
+                column += &score[j];
             }
-            let eta_jl = -x.dot(&self.solve(&rhs));
-            w_ddot.push(self.c * &eta_jl + &(self.d * &eta_dot[j] * &eta_dot[l]));
-            eta_ddot.push(eta_jl);
         }
+        let eta_ddot = matrix_columns(&-fast_ab(x, &self.spectral_columns(&inverse, &rhs)));
+        let w_ddot = self
+            .pairs
+            .iter()
+            .zip(&eta_ddot)
+            .map(|(&(j, l), eta_jl)| self.c * eta_jl + &(self.d * &eta_dot[j] * &eta_dot[l]))
+            .collect();
         ModeMotion {
             eta_dot,
             eta_ddot,
@@ -375,6 +428,7 @@ impl Geometry<'_, '_> {
     /// The motion of the eigenpair in column `col` of the eigensystem.
     fn axis_motion(&self, col: usize, mode: &ModeMotion) -> AxisMotion {
         let x = self.x();
+        let n = x.nrows();
         let n_rho = self.target.lambdas.len();
         let lambda = self.evals[col];
         let u = self.evecs.column(col);
@@ -386,16 +440,25 @@ impl Geometry<'_, '_> {
                 (lambda - self.evals[q]).recip()
             }
         });
-        let resolvent = |v: &Array1<f64>| self.evecs.dot(&(self.evecs.t().dot(v) * &gains));
-        let xu = x.dot(&u);
+        let xu = fast_av(x, &u);
         let s_u: Vec<Array1<f64>> = (0..n_rho).map(|j| self.penalty_mv(j, u)).collect();
         // b_j = Ḣ_j u.
-        let b: Vec<Array1<f64>> = (0..n_rho)
-            .map(|j| &s_u[j] + &x.t().dot(&(self.c * &mode.eta_dot[j] * &xu)))
-            .collect();
+        let mut b = fast_atb(
+            x,
+            &columns_matrix(
+                n,
+                &(0..n_rho)
+                    .map(|j| self.c * &mode.eta_dot[j] * &xu)
+                    .collect::<Vec<_>>(),
+            ),
+        );
+        for (mut b_j, s_u_j) in b.columns_mut().into_iter().zip(&s_u) {
+            b_j += s_u_j;
+        }
+        let u_dot = self.spectral_columns(&gains, &b);
+        let xu_dot = matrix_columns(&fast_ab(x, &u_dot));
+        let (b, u_dot) = (matrix_columns(&b), matrix_columns(&u_dot));
         let lambda_dot: Vec<f64> = b.iter().map(|b_j| u.dot(b_j)).collect();
-        let u_dot: Vec<Array1<f64>> = b.iter().map(|b_j| resolvent(b_j)).collect();
-        let xu_dot: Vec<Array1<f64>> = u_dot.iter().map(|v| x.dot(v)).collect();
 
         let inv_sqrt = lambda.sqrt().recip();
         let inv_32 = inv_sqrt / lambda;
@@ -404,44 +467,66 @@ impl Geometry<'_, '_> {
         let y_dot: Vec<Array1<f64>> = (0..n_rho)
             .map(|j| &xu_dot[j] * inv_sqrt - &(&xu * (0.5 * inv_32 * lambda_dot[j])))
             .collect();
-        let mut y_ddot = Vec::with_capacity(self.pairs.len());
+        // Ḧu + Ḣ_j u̇_l + Ḣ_l u̇_j − λ̇_l u̇_j − λ̇_j u̇_l, every pair at once.
+        let mut v1 = fast_atb(
+            x,
+            &self.pair_rows(n, |k, j, l| {
+                &mode.w_ddot[k] * &xu
+                    + &(self.c * &mode.eta_dot[l] * &xu_dot[j])
+                    + &(self.c * &mode.eta_dot[j] * &xu_dot[l])
+            }),
+        );
+        let mut lambda_ddot = Vec::with_capacity(self.pairs.len());
         for (k, &(j, l)) in self.pairs.iter().enumerate() {
-            let w_jl = &mode.w_ddot[k];
             // λ̈ = uᵀḦu + 2 u̇_jᵀ Ḣ_l u.
-            let mut lambda_ddot = (w_jl * &xu * &xu).sum() + 2.0 * u_dot[j].dot(&b[l]);
-            // Ḧu + Ḣ_j u̇_l + Ḣ_l u̇_j − λ̇_l u̇_j − λ̇_j u̇_l.
-            let mut v1 = self.penalty_mv(l, u_dot[j].view());
-            v1 += &self.penalty_mv(j, u_dot[l].view());
-            let row_part = w_jl * &xu
-                + &(self.c * &mode.eta_dot[l] * &xu_dot[j])
-                + &(self.c * &mode.eta_dot[j] * &xu_dot[l]);
-            v1 += &x.t().dot(&row_part);
+            let mut lambda_jl = (&mode.w_ddot[k] * &xu * &xu).sum() + 2.0 * u_dot[j].dot(&b[l]);
+            let mut v1_jl = v1.column_mut(k);
+            v1_jl += &self.penalty_mv(l, u_dot[j].view());
+            v1_jl += &self.penalty_mv(j, u_dot[l].view());
             if j == l {
-                lambda_ddot += u.dot(&s_u[j]);
-                v1 += &s_u[j];
+                lambda_jl += u.dot(&s_u[j]);
+                v1_jl += &s_u[j];
             }
-            v1.scaled_add(-lambda_dot[l], &u_dot[j]);
-            v1.scaled_add(-lambda_dot[j], &u_dot[l]);
-            // ü = R v1 − u (u̇_j·u̇_l); the second term keeps |u| = 1.
-            let mut u_ddot = resolvent(&v1);
-            u_ddot.scaled_add(-u_dot[j].dot(&u_dot[l]), &u);
-            let mut y_jl = x.dot(&u_ddot) * inv_sqrt;
-            y_jl.scaled_add(
-                -0.5 * inv_32 * lambda_dot[l],
-                &xu_dot[j],
-            );
-            y_jl.scaled_add(
-                -0.5 * inv_32 * lambda_dot[j],
-                &xu_dot[l],
-            );
-            y_jl.scaled_add(
-                0.75 * inv_52 * lambda_dot[j] * lambda_dot[l] - 0.5 * inv_32 * lambda_ddot,
-                &xu,
-            );
-            y_ddot.push(y_jl);
+            v1_jl.scaled_add(-lambda_dot[l], &u_dot[j]);
+            v1_jl.scaled_add(-lambda_dot[j], &u_dot[l]);
+            lambda_ddot.push(lambda_jl);
         }
+        // ü = R v1 − u (u̇_j·u̇_l); the second term keeps |u| = 1.
+        let mut u_ddot = self.spectral_columns(&gains, &v1);
+        for (k, &(j, l)) in self.pairs.iter().enumerate() {
+            u_ddot.column_mut(k).scaled_add(-u_dot[j].dot(&u_dot[l]), &u);
+        }
+        let xu_ddot = fast_ab(x, &u_ddot);
+        let y_ddot = self
+            .pairs
+            .iter()
+            .enumerate()
+            .map(|(k, &(j, l))| {
+                let mut y_jl = &xu_ddot.column(k) * inv_sqrt;
+                y_jl.scaled_add(-0.5 * inv_32 * lambda_dot[l], &xu_dot[j]);
+                y_jl.scaled_add(-0.5 * inv_32 * lambda_dot[j], &xu_dot[l]);
+                y_jl.scaled_add(
+                    0.75 * inv_52 * lambda_dot[j] * lambda_dot[l] - 0.5 * inv_32 * lambda_ddot[k],
+                    &xu,
+                );
+                y_jl
+            })
+            .collect();
         AxisMotion { y, y_dot, y_ddot }
     }
+}
+
+/// Vectors of length `n` as the columns of a matrix.
+fn columns_matrix(n: usize, columns: &[Array1<f64>]) -> Array2<f64> {
+    let mut out = Array2::<f64>::zeros((n, columns.len()).f());
+    for (mut target, column) in out.columns_mut().into_iter().zip(columns) {
+        target.assign(column);
+    }
+    out
+}
+
+fn matrix_columns(m: &Array2<f64>) -> Vec<Array1<f64>> {
+    m.columns().into_iter().map(|column| column.to_owned()).collect()
 }
 
 /// One Gauss–Hermite piece's value and its cost-side ρ-gradient and Hessian.
@@ -518,10 +603,144 @@ impl AxisEnd {
     }
 }
 
+/// One node's row derivatives of the excess `F` at `s = Y τ`: `∂F/∂s`,
+/// `∂²F/∂s²`, and the mode-motion derivatives `∂F/∂η̂`, `∂²F/∂η̂∂s`,
+/// `∂²F/∂η̂²`.
+struct NodeRows {
+    f_s: Array1<f64>,
+    f_ss: Array1<f64>,
+    f_e: Array1<f64>,
+    f_es: Array1<f64>,
+    f_ee: Array1<f64>,
+}
+
+/// The node posterior's weighted row sums that `E_p[∂²F]` contracts against
+/// the motion.
+///
+/// With `ṡ_j = Ẏ_j τ + Y τ̇_j`, `τ̇_j = Σ_a σ_a ė_a,j` and
+/// `τ̈_jl = Σ_a σ_a (ë_a,jl − e_a ė_a,j ė_a,l) + τ Σ_ab σ_a σ_b ė_a,j ė_b,l`,
+/// a node's second derivative
+///
+/// ```text
+///   E_jᵀ F_ee E_l + E_jᵀ F_es ṡ_l + E_lᵀ F_es ṡ_j + ṡ_jᵀ F_ss ṡ_l
+///     + F_e·η̈_jl + f_s·(Ÿ_jl τ + Ẏ_j τ̇_l + Ẏ_l τ̇_j + Y τ̈_jl)
+/// ```
+///
+/// is bilinear in its rows and polynomial in `(τ, σ)`, so its posterior mean
+/// is the motion's quadratic forms under the rows' `p`-, `pτ`-, `pτ²`-,
+/// `pσ_a`-, `pτσ_a`- and `pσ_aσ_b`-weighted sums: one pass over the rows per
+/// node plus one per pair, instead of one per node and pair.
+struct NodeMoments {
+    ends: usize,
+    /// `Σ p F_ee`.
+    ee: Array1<f64>,
+    /// `Σ p τ F_es` and, per end, `Σ p σ_a F_es`.
+    es_tau: Array1<f64>,
+    es_end: Vec<Array1<f64>>,
+    /// `Σ p τ² F_ss`, per end `Σ p τ σ_a F_ss`, per end pair `Σ p σ_a σ_b F_ss`.
+    ss_tau: Array1<f64>,
+    ss_tau_end: Vec<Array1<f64>>,
+    ss_end: Vec<Array1<f64>>,
+    /// `Σ p F_e`.
+    e: Array1<f64>,
+    /// `Σ p τ f_s` and, per end, `Σ p σ_a f_s`.
+    s_tau: Array1<f64>,
+    s_end: Vec<Array1<f64>>,
+    /// Per end `Σ p σ_a (f_s·Y)`, per end pair `Σ p τ σ_a σ_b (f_s·Y)`.
+    sy_end: Vec<f64>,
+    sy_tau_end: Vec<f64>,
+}
+
+impl NodeMoments {
+    fn new(n: usize, ends: usize) -> Self {
+        let rows = |count: usize| vec![Array1::<f64>::zeros(n); count];
+        Self {
+            ends,
+            ee: Array1::zeros(n),
+            es_tau: Array1::zeros(n),
+            es_end: rows(ends),
+            ss_tau: Array1::zeros(n),
+            ss_tau_end: rows(ends),
+            ss_end: rows(ends * ends),
+            e: Array1::zeros(n),
+            s_tau: Array1::zeros(n),
+            s_end: rows(ends),
+            sy_end: vec![0.0; ends],
+            sy_tau_end: vec![0.0; ends * ends],
+        }
+    }
+
+    /// Adds a node of posterior mass `prob` at `τ` with end sensitivities
+    /// `sigma` (one per end, in the ends' order).
+    fn add(&mut self, prob: f64, tau: f64, sigma: &[f64], rows: &NodeRows, f_s_y: f64) {
+        self.ee.scaled_add(prob, &rows.f_ee);
+        self.es_tau.scaled_add(prob * tau, &rows.f_es);
+        self.ss_tau.scaled_add(prob * tau * tau, &rows.f_ss);
+        self.e.scaled_add(prob, &rows.f_e);
+        self.s_tau.scaled_add(prob * tau, &rows.f_s);
+        for (a, &s_a) in sigma.iter().enumerate() {
+            self.es_end[a].scaled_add(prob * s_a, &rows.f_es);
+            self.ss_tau_end[a].scaled_add(prob * tau * s_a, &rows.f_ss);
+            self.s_end[a].scaled_add(prob * s_a, &rows.f_s);
+            self.sy_end[a] += prob * s_a * f_s_y;
+            for (b, &s_b) in sigma.iter().enumerate() {
+                let ab = a * self.ends + b;
+                self.ss_end[ab].scaled_add(prob * s_a * s_b, &rows.f_ss);
+                self.sy_tau_end[ab] += prob * tau * s_a * s_b * f_s_y;
+            }
+        }
+    }
+
+    /// `E_p[∂²F/∂ρ_j∂ρ_l]` for every pair.
+    fn expected_second(
+        &self,
+        axis: &AxisMotion,
+        mode: &ModeMotion,
+        ends: &[AxisEnd],
+        pairs: &[(usize, usize)],
+    ) -> Array1<f64> {
+        let n = self.ee.len();
+        let eta_dot = columns_matrix(n, &mode.eta_dot);
+        let y_dot = columns_matrix(n, &axis.y_dot);
+        let ee = fast_xt_diag_y(&eta_dot, &self.ee, &eta_dot);
+        let es = fast_xt_diag_y(&eta_dot, &self.es_tau, &y_dot);
+        let ss = fast_xt_diag_y(&y_dot, &self.ss_tau, &y_dot);
+        let along_y = |m: &Array1<f64>| m * &axis.y;
+        // Per end, over j: E_jᵀ M_a Y, Ẏ_jᵀ M_a Y and Ẏ_j·M_a.
+        let es_end: Vec<Array1<f64>> =
+            self.es_end.iter().map(|m| fast_atv(&eta_dot, &along_y(m))).collect();
+        let ss_tau_end: Vec<Array1<f64>> =
+            self.ss_tau_end.iter().map(|m| fast_atv(&y_dot, &along_y(m))).collect();
+        let s_end: Vec<Array1<f64>> = self.s_end.iter().map(|m| fast_atv(&y_dot, m)).collect();
+        let ss_end: Vec<f64> = self.ss_end.iter().map(|m| along_y(m).dot(&axis.y)).collect();
+        Array1::from_shape_fn(pairs.len(), |k| {
+            let (j, l) = pairs[k];
+            let mut value = ee[(j, l)]
+                + es[(j, l)]
+                + es[(l, j)]
+                + ss[(j, l)]
+                + self.e.dot(&mode.eta_ddot[k])
+                + self.s_tau.dot(&axis.y_ddot[k]);
+            for (a, end_a) in ends.iter().enumerate() {
+                let (a_j, a_l) = (end_a.dot[j], end_a.dot[l]);
+                value += a_l * (es_end[a][j] + ss_tau_end[a][j] + s_end[a][j])
+                    + a_j * (es_end[a][l] + ss_tau_end[a][l] + s_end[a][l])
+                    + (end_a.ddot[k] - end_a.value * a_j * a_l) * self.sy_end[a];
+                for (b, end_b) in ends.iter().enumerate() {
+                    let ab = a * self.ends + b;
+                    value += a_j * end_b.dot[l] * (ss_end[ab] + self.sy_tau_end[ab]);
+                }
+            }
+            value
+        })
+    }
+}
+
 /// A piece is integrated on the corrector's own rule: the standard-normal
 /// Gauss–Hermite nodes `u_q`, transported onto the block's feasible interval
 /// when the likelihood ends inside the Laplace Gaussian
-/// ([`gam_math::quadrature::TruncatedNormalTransport`]), with
+/// ([`gam_math::quadrature::TruncatedNormalTransport`]), or the composite rule's
+/// latched nodes `z_q` with their masses `w_q = w_K ψ` (never truncated), with
 ///
 /// ```text
 ///   V = ln Σ_q w_q e^{−F(Y τ_q)} − ln Σ_q w_q + ln Z,   τ_q = τ(u_q; ends).
@@ -536,7 +755,7 @@ impl AxisEnd {
 fn piece_second_order(
     piece_target: &Gam784BlockTarget<'_>,
     curvature: RowCurvature,
-    order: usize,
+    piece_rule: PieceRule<'_>,
     axis: &AxisMotion,
     mode: &ModeMotion,
     geometry: &Geometry<'_, '_>,
@@ -545,16 +764,32 @@ fn piece_second_order(
     let pairs = &geometry.pairs;
     let lambda = piece_target.block_lambdas[0];
     let sqrt_lambda = lambda.sqrt();
-    let rule = gam_math::quadrature::standard_normal_gauss_hermite_rule(order).map_err(|error| {
-        EstimationError::InvalidInput(format!(
-            "#784 ρ-Hessian: Gauss–Hermite rule of order {order}: {error}"
-        ))
-    })?;
+    // Each node's position on the standardized axis and its log mass.
+    let rule: Vec<(f64, f64)> = match piece_rule {
+        PieceRule::GaussHermite { order } => {
+            gam_math::quadrature::standard_normal_gauss_hermite_rule(order)
+                .map_err(|error| {
+                    EstimationError::InvalidInput(format!(
+                        "#784 ρ-Hessian: Gauss–Hermite rule of order {order}: {error}"
+                    ))
+                })?
+                .into_iter()
+                .map(|(u, w)| (u, w.ln()))
+                .collect()
+        }
+        PieceRule::Composite { nodes } => nodes.iter().map(|node| (node.z, node.ln_weight)).collect(),
+    };
 
     let truncation = piece_target.axis_truncation();
     let cuts = truncation
         .as_deref()
         .map_or([None, None], |truncation| [truncation.lower(), truncation.upper()]);
+    if matches!(piece_rule, PieceRule::Composite { .. }) && cuts.iter().any(Option::is_some) {
+        crate::bail_invalid_estim!(
+            "#784 ρ-Hessian: a composite piece is integrated on the whole axis, but its target \
+             is truncated"
+        );
+    }
     let transport = if cuts.iter().any(Option::is_some) {
         let end = |cut: Option<gam_problem::laplace_sampler_contract::BlockAxisCut>, open: f64| {
             cut.map_or(open, |cut| sqrt_lambda * cut.t)
@@ -591,7 +826,7 @@ fn piece_second_order(
 
     // Each node's image `τ` and its end sensitivities `(∂τ/∂lower, ∂τ/∂upper)`.
     let mut nodes: Vec<(f64, [f64; 2], f64)> = Vec::with_capacity(rule.len());
-    for &(u, w) in &rule {
+    for &(u, ln_w) in &rule {
         let node = match &transport {
             Some(transport) => {
                 let tau = transport.transport(u).map_err(|error| {
@@ -600,9 +835,9 @@ fn piece_second_order(
                     ))
                 })?;
                 let (lower, upper) = transport.endpoint_sensitivities(u, tau);
-                (tau, [lower, upper], w)
+                (tau, [lower, upper], ln_w)
             }
-            None => (u, [0.0, 0.0], w),
+            None => (u, [0.0, 0.0], ln_w),
         };
         nodes.push(node);
     }
@@ -619,24 +854,24 @@ fn piece_second_order(
         .base_neg_score()
         .map_err(EstimationError::InvalidInput)?;
     let w_mode = &piece_target.weights_obs;
-    let log_node_weights: Vec<f64> = nodes.iter().map(|&(_, _, w)| w.ln()).collect();
+    let log_node_weights: Vec<f64> = nodes.iter().map(|&(_, _, ln_w)| ln_w).collect();
     let log_norm = positive_log_sum_exp(&log_node_weights);
     let feasible: Vec<(f64, [f64; 2], f64, Array1<f64>)> = batched
         .into_iter()
         .zip(nodes.iter())
-        .filter_map(|((excess, ngs), &(tau, sensitivity, w))| match ngs {
-            Some(ngs) if excess.is_finite() => Some((tau, sensitivity, w.ln() - excess, ngs)),
+        .filter_map(|((excess, ngs), &(tau, sensitivity, ln_w))| match ngs {
+            Some(ngs) if excess.is_finite() => Some((tau, sensitivity, ln_w - excess, ngs)),
             _ => None,
         })
         .collect();
     if feasible.is_empty() {
-        crate::bail_invalid_estim!("#784 ρ-Hessian: every Gauss–Hermite node was infeasible");
+        crate::bail_invalid_estim!("#784 ρ-Hessian: every node of the piece's rule was infeasible");
     }
     let log_feasible_weights: Vec<f64> = feasible.iter().map(|(_, _, lw, _)| *lw).collect();
     let log_mass = positive_log_sum_exp(&log_feasible_weights);
     let value = log_mass - log_norm + log_mass_of_interval;
 
-    let mut expected_second = Array1::<f64>::zeros(pairs.len());
+    let mut moments = NodeMoments::new(piece_target.eta_hat.len(), ends.len());
     let mut node_gradients: Vec<(f64, Array1<f64>)> = Vec::with_capacity(feasible.len());
     for (tau, sensitivity, lw, ngs) in feasible {
         let prob = (lw - log_mass).exp();
@@ -650,43 +885,26 @@ fn piece_second_order(
         let f_es = &f_ss - &(geometry.c * &s);
         let f_ee = &f_es - &(geometry.d * &s2 * 0.5);
         // The node `s = Y τ` moves with the axis and, on a truncated axis, with
-        // the ends: ṡ_j = Ẏ_j τ + Y τ̇_j.
+        // the ends: ṡ_j = Ẏ_j τ + Y τ̇_j with τ̇_j = Σ_a σ_a ė_a,j.
+        let sigma: Vec<f64> = ends.iter().map(|end| sensitivity[end.side]).collect();
         let tau_dot: Vec<f64> = (0..n_rho)
-            .map(|j| ends.iter().map(|end| sensitivity[end.side] * end.dot[j]).sum())
-            .collect();
-        let s_dot: Vec<Array1<f64>> = (0..n_rho)
-            .map(|j| &axis.y_dot[j] * tau + &(&axis.y * tau_dot[j]))
+            .map(|j| ends.iter().zip(&sigma).map(|(end, s_a)| s_a * end.dot[j]).sum())
             .collect();
         let f_s_y = f_s.dot(&axis.y);
-        let f_s_y_dot: Vec<f64> = axis.y_dot.iter().map(|y_j| f_s.dot(y_j)).collect();
-        let node_gradient =
-            Array1::from_shape_fn(n_rho, |j| f_e.dot(&mode.eta_dot[j]) + f_s.dot(&s_dot[j]));
-        for (k, &(j, l)) in pairs.iter().enumerate() {
-            let (e_j, e_l) = (&mode.eta_dot[j], &mode.eta_dot[l]);
-            // τ̈_jl = Σ_ab τ_ab ė_a,j ė_b,l + Σ_a τ_a ë_a,jl.
-            let mut tau_ddot = 0.0;
-            for a in &ends {
-                let tau_a = sensitivity[a.side];
-                tau_ddot += tau_a * a.ddot[k] - a.value * tau_a * a.dot[j] * a.dot[l];
-                for b in &ends {
-                    tau_ddot += tau * tau_a * sensitivity[b.side] * a.dot[j] * b.dot[l];
-                }
-            }
-            // f_s·s̈_jl with s̈_jl = Ÿ_jl τ + Ẏ_j τ̇_l + Ẏ_l τ̇_j + Y τ̈_jl.
-            let f_s_s_ddot = tau * f_s.dot(&axis.y_ddot[k])
-                + tau_dot[l] * f_s_y_dot[j]
-                + tau_dot[j] * f_s_y_dot[l]
-                + tau_ddot * f_s_y;
-            expected_second[k] += prob
-                * ((&f_ee * e_j).dot(e_l)
-                    + (&f_es * e_j).dot(&s_dot[l])
-                    + (&f_es * e_l).dot(&s_dot[j])
-                    + (&f_ss * &s_dot[j]).dot(&s_dot[l])
-                    + f_e.dot(&mode.eta_ddot[k])
-                    + f_s_s_ddot);
-        }
+        let node_gradient = Array1::from_shape_fn(n_rho, |j| {
+            f_e.dot(&mode.eta_dot[j]) + tau * f_s.dot(&axis.y_dot[j]) + tau_dot[j] * f_s_y
+        });
+        let rows = NodeRows {
+            f_s,
+            f_ss,
+            f_e,
+            f_es,
+            f_ee,
+        };
+        moments.add(prob, tau, &sigma, &rows, f_s_y);
         node_gradients.push((prob, node_gradient));
     }
+    let expected_second = moments.expected_second(axis, mode, &ends, pairs);
     let mut node_gradient_mean = Array1::<f64>::zeros(n_rho);
     for (prob, g) in &node_gradients {
         node_gradient_mean.scaled_add(*prob, g);
@@ -737,13 +955,30 @@ pub(super) fn block_correction_cost_hessian(
         pairs: rho_pairs(n_rho),
     };
     let mode = geometry.mode_motion();
+    // Each axis in the target's orientation (`γ_r > 0`): the pieces' nodes and cuts
+    // are on `target.block_vecs`, which is `±` the eigensystem's column. The sign is
+    // locally constant in ρ, so the motion flips with the axis.
     let axes: Vec<AxisMotion> = inputs
         .block_cols
         .iter()
-        .map(|&col| geometry.axis_motion(col, &mode))
+        .enumerate()
+        .map(|(r, &col)| {
+            let motion = geometry.axis_motion(col, &mode);
+            if target.block_vecs.column(r).dot(&inputs.evecs.column(col)) < 0.0 {
+                motion.reflected()
+            } else {
+                motion
+            }
+        })
         .collect();
 
     let piece_count = if inputs.axis_split { m } else { 1 };
+    if inputs.piece_rules.len() != piece_count {
+        crate::bail_invalid_estim!(
+            "#784 ρ-Hessian: {} piece rules for {piece_count} pieces",
+            inputs.piece_rules.len()
+        );
+    }
     if !inputs.axis_split && m != 1 {
         crate::bail_invalid_estim!(
             "#784 ρ-Hessian: a {m}-axis block under one tensor rule has no closed-form Hessian"
@@ -757,7 +992,7 @@ pub(super) fn block_correction_cost_hessian(
         let piece = piece_second_order(
             &axis_target,
             inputs.curvature,
-            inputs.axis_orders[k],
+            inputs.piece_rules[k],
             &axes[k],
             &mode,
             &geometry,
@@ -1282,5 +1517,94 @@ mod block_correction_hessian_tests {
             }
         }
         assert_eq!(checked, 18, "every tabulated non-logit shape is checked");
+    }
+
+    /// The node-moment contraction of `E_p[∂²F]` equals the per-node, per-pair
+    /// sum it replaces, on a whole line and on an axis truncated at both ends.
+    #[test]
+    fn node_moments_match_the_per_node_expected_second() {
+        let (n, n_rho) = (9usize, 3usize);
+        let pairs = rho_pairs(n_rho);
+        let row = |seed: f64| Array1::from_shape_fn(n, |i| ((i as f64 + 1.0) * seed).sin());
+        let mode = ModeMotion {
+            eta_dot: (0..n_rho).map(|j| row(0.71 + 0.13 * j as f64)).collect(),
+            eta_ddot: (0..pairs.len()).map(|k| row(0.37 + 0.29 * k as f64)).collect(),
+            w_ddot: (0..pairs.len()).map(|k| row(0.53 + 0.17 * k as f64)).collect(),
+        };
+        let axis = AxisMotion {
+            y: row(1.19),
+            y_dot: (0..n_rho).map(|j| row(0.43 + 0.31 * j as f64)).collect(),
+            y_ddot: (0..pairs.len()).map(|k| row(0.61 + 0.23 * k as f64)).collect(),
+        };
+        let end = |side: usize, value: f64| AxisEnd {
+            value,
+            log_mass_gradient: 0.0,
+            side,
+            dot: (0..n_rho).map(|j| ((j + 3 * side) as f64 * 0.9 + 0.2).cos()).collect(),
+            ddot: (0..pairs.len()).map(|k| ((k + 5 * side) as f64 * 0.7 + 0.4).sin()).collect(),
+        };
+        let nodes: Vec<(f64, f64, [f64; 2], NodeRows)> = (0..5)
+            .map(|q| {
+                let seed = 0.3 + 0.11 * q as f64;
+                let rows = NodeRows {
+                    f_s: row(seed + 0.01),
+                    f_ss: row(seed + 0.02),
+                    f_e: row(seed + 0.03),
+                    f_es: row(seed + 0.04),
+                    f_ee: row(seed + 0.05),
+                };
+                let prob = 0.1 + 0.05 * q as f64;
+                let tau = (q as f64 * 1.7).sin() * 1.5;
+                (prob, tau, [0.4 + 0.1 * q as f64, -0.3 + 0.2 * q as f64], rows)
+            })
+            .collect();
+        for ends in [vec![], vec![end(0, -1.3), end(1, 0.9)]] {
+            let mut moments = NodeMoments::new(n, ends.len());
+            let mut reference = Array1::<f64>::zeros(pairs.len());
+            for (prob, tau, sensitivity, rows) in &nodes {
+                let sigma: Vec<f64> = ends.iter().map(|end| sensitivity[end.side]).collect();
+                let tau_dot: Vec<f64> = (0..n_rho)
+                    .map(|j| ends.iter().zip(&sigma).map(|(end, s_a)| s_a * end.dot[j]).sum())
+                    .collect();
+                let s_dot: Vec<Array1<f64>> = (0..n_rho)
+                    .map(|j| &axis.y_dot[j] * *tau + &(&axis.y * tau_dot[j]))
+                    .collect();
+                let f_s_y = rows.f_s.dot(&axis.y);
+                for (k, &(j, l)) in pairs.iter().enumerate() {
+                    let (e_j, e_l) = (&mode.eta_dot[j], &mode.eta_dot[l]);
+                    let mut tau_ddot = 0.0;
+                    for (a, s_a) in ends.iter().zip(&sigma) {
+                        tau_ddot += s_a * a.ddot[k] - a.value * s_a * a.dot[j] * a.dot[l];
+                        for (b, s_b) in ends.iter().zip(&sigma) {
+                            tau_ddot += tau * s_a * s_b * a.dot[j] * b.dot[l];
+                        }
+                    }
+                    let f_s_s_ddot = tau * rows.f_s.dot(&axis.y_ddot[k])
+                        + tau_dot[l] * rows.f_s.dot(&axis.y_dot[j])
+                        + tau_dot[j] * rows.f_s.dot(&axis.y_dot[l])
+                        + tau_ddot * f_s_y;
+                    reference[k] += prob
+                        * ((&rows.f_ee * e_j).dot(e_l)
+                            + (&rows.f_es * e_j).dot(&s_dot[l])
+                            + (&rows.f_es * e_l).dot(&s_dot[j])
+                            + (&rows.f_ss * &s_dot[j]).dot(&s_dot[l])
+                            + rows.f_e.dot(&mode.eta_ddot[k])
+                            + f_s_s_ddot);
+                }
+                moments.add(*prob, *tau, &sigma, rows, f_s_y);
+            }
+            let contracted = moments.expected_second(&axis, &mode, &ends, &pairs);
+            let scale = reference.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+            for k in 0..pairs.len() {
+                assert!(
+                    (contracted[k] - reference[k]).abs() <= 1e-12 * scale,
+                    "{} ends, pair {:?}: contracted {} vs per-node {}",
+                    ends.len(),
+                    pairs[k],
+                    contracted[k],
+                    reference[k],
+                );
+            }
+        }
     }
 }

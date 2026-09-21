@@ -147,6 +147,21 @@ pub enum BlockQuadratureRefusal {
         running_minimum: f64,
         max_representable_order: usize,
     },
+    /// The adaptive composite rule of a one-axis piece had to bisect a cell whose
+    /// midpoint rounds onto one of its endpoints, so no finer partition exists at
+    /// working precision (#784). `lower_z` and `upper_z` are the cell's ends in the
+    /// standard-normal coordinate, `cell_error` its Gauss–Kronrod error share.
+    IndivisibleCompositeCell {
+        lower_z: f64,
+        upper_z: f64,
+        cell_error: f64,
+    },
+    /// The adaptive composite rule of a one-axis piece is unresolved, but every cell's
+    /// Gauss–Kronrod error share sits inside that share's own rounding band, the
+    /// spread the arithmetic forming it (the node masses and the target's excess) can
+    /// leave. The estimate is then noise, and bisecting would chase it without end
+    /// (#784). `rounding_floor` is the sum of the cells' bands.
+    CompositeRoundingFloor { cells: usize, rounding_floor: f64 },
     /// Any other failure of the integration itself (non-positive curvature,
     /// infeasible nodes, non-finite output, a malformed order list).
     Integration(String),
@@ -186,6 +201,25 @@ impl std::fmt::Display for BlockQuadratureRefusal {
                  reached order {order} (of {max_representable_order}), and its smallest paired \
                  difference at any order was {running_minimum:.4e}"
             ),
+            Self::IndivisibleCompositeCell {
+                lower_z,
+                upper_z,
+                cell_error,
+            } => write!(
+                f,
+                "the composite Gauss–Kronrod cell z ∈ [{lower_z:.6e}, {upper_z:.6e}] carries \
+                 error {cell_error:.4e} and its midpoint rounds onto an endpoint, so it cannot \
+                 be bisected"
+            ),
+            Self::CompositeRoundingFloor {
+                cells,
+                rounding_floor,
+            } => write!(
+                f,
+                "every cell of the {cells}-cell composite Gauss–Kronrod partition carries an \
+                 error share inside its rounding band (the bands sum to {rounding_floor:.4e}), \
+                 so the remaining error is not measurable at working precision"
+            ),
             Self::Integration(reason) => f.write_str(reason),
         }
     }
@@ -216,6 +250,42 @@ impl std::fmt::Display for BlockQuadratureOrderRefusal {
             self.axis, self.axis_orders, self.paired_error, self.resolution_target, self.cause
         )
     }
+}
+
+/// One interior breakpoint of a one-axis composite partition (#784), in the
+/// logistic coordinate `v ∈ (0, 1)` of the standard-normal axis `z = ln v − ln(1 − v)`.
+/// Both `v` and `1 − v` are carried, each to full relative precision, so a cell deep
+/// in either tail keeps its width: `1 − v` formed from a `v` near one would round it
+/// away.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AxisBreakpoint {
+    pub v: f64,
+    pub one_minus_v: f64,
+}
+
+/// A one-axis composite Gauss–Kronrod correction and the partition it adapted.
+#[derive(Clone, Debug)]
+pub struct CompositeAxisMarginal {
+    /// `axis_orders` is `[node_count]`, so a block's node count stays the sum of
+    /// its pieces' orders; `axis_quadrature_errors` is the Gauss–Kronrod error of
+    /// the final partition.
+    pub marginal: BlockQuadratureMarginal,
+    /// The partition's interior breakpoints, increasing.
+    pub breakpoints: Vec<AxisBreakpoint>,
+    /// The rule's nodes, cell by cell, so a second-order pass differentiates the
+    /// very rule whose value and gradient this is.
+    pub nodes: Vec<CompositeNode>,
+}
+
+/// One node of a composite axis rule (#784): its position `z = √λ·t` on the
+/// oriented standardized axis and `ln(w_K ψ)`, its Kronrod weight times the
+/// standard-normal mass `h·φ(z)·dz/dv` it carries on its cell. The value is
+/// `ln Σ w_K ψ e^{−ΔF(z/√λ)} − ln Σ w_K ψ`. A latched partition fixes every `z`
+/// and weight, so they do not move with ρ.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompositeNode {
+    pub z: f64,
+    pub ln_weight: f64,
 }
 
 // ───────────────────────── pure threshold math (moved down) ──────────────────
@@ -551,8 +621,8 @@ pub trait BlockExcessTarget {
     fn base_neg_score(&self) -> Result<Array1<f64>, String>;
 
     /// The most bytes one node holds live while
-    /// [`Self::excess_with_displaced_neg_score_batch`] or [`Self::excess_batch`]
-    /// evaluates it inside a batch: everything the implementor allocates per node
+    /// [`Self::excess_with_displaced_neg_score_batch`], [`Self::excess_batch`] or
+    /// [`Self::excess_band_and_displaced_neg_score_batch`] evaluates it inside a batch: everything the implementor allocates per node
     /// (displacements, the returned score and its entry, row transients). A batch of
     /// `B` nodes holds at most `B` times this, and the corrector reserves exactly that
     /// on the memory governor before it evaluates a chunk, so an implementor that
@@ -608,6 +678,37 @@ pub trait BlockExcessTarget {
         out
     }
 
+    /// Batched [`Self::excess_with_displaced_neg_score`] with each node's
+    /// [`Self::excess_rounding_band`] beside it, one draw per column as in
+    /// [`Self::excess_with_displaced_neg_score_batch`]: what an adaptive rule
+    /// needs to decide a node's cell and to integrate its moments, from one
+    /// evaluation of the node. A node whose excess is non-finite carries no score
+    /// and a zero band (it is decided exactly). The default composes the two
+    /// calls; implementors override to form the band from the same row sweep.
+    fn excess_band_and_displaced_neg_score_batch(
+        &self,
+        draws: &Array2<f64>,
+    ) -> Vec<BlockNodeEvaluation> {
+        let mut t = Array1::<f64>::zeros(draws.nrows());
+        self.excess_with_displaced_neg_score_batch(draws)
+            .into_iter()
+            .zip(draws.columns())
+            .map(|((excess, displaced_neg_score), column)| {
+                let rounding_band = if excess.is_finite() && displaced_neg_score.is_some() {
+                    t.assign(&column);
+                    self.excess_rounding_band(&t)
+                } else {
+                    0.0
+                };
+                BlockNodeEvaluation {
+                    excess,
+                    rounding_band,
+                    displaced_neg_score,
+                }
+            })
+            .collect()
+    }
+
     /// The feasible interval of a one-axis block, when the likelihood is defined
     /// only on part of the axis. `None` (the default) means every `t` is in the
     /// likelihood's domain, or that the target does not describe its domain.
@@ -620,6 +721,18 @@ pub trait BlockExcessTarget {
     fn axis_truncation(&self) -> Option<Box<dyn BlockAxisTruncation + '_>> {
         None
     }
+}
+
+/// One node of [`BlockExcessTarget::excess_band_and_displaced_neg_score_batch`].
+#[derive(Clone, Debug)]
+pub struct BlockNodeEvaluation {
+    /// `ΔF(t)`; non-finite for an infeasible node.
+    pub excess: f64,
+    /// [`BlockExcessTarget::excess_rounding_band`] at `t`; zero for an infeasible node.
+    pub rounding_band: f64,
+    /// [`BlockExcessTarget::displaced_neg_score`] at `t`; `None` exactly when the node
+    /// is infeasible.
+    pub displaced_neg_score: Option<Array1<f64>>,
 }
 
 /// One end of a one-axis block's feasible interval (see
@@ -707,6 +820,48 @@ pub trait LaplaceMarginalCorrector: Send + Sync {
     ) -> Result<BlockQuadratureMarginal, BlockQuadratureRefusal> {
         self.block_quadrature_marginal_correction(target, axis_orders)
     }
+
+    /// Integrate a ONE-axis block `Δ = ln E_z[e^{−ΔF(z/√λ)}]` by an adaptive composite
+    /// Gauss–Kronrod rule over the logistic image `v ∈ (0, 1)` of the standard-normal
+    /// axis (#784).
+    ///
+    /// A Gauss–Hermite rule of order `o` is exact through degree `2o − 1`, so it
+    /// resolves an integrand that is a polynomial times the Gaussian, and nothing
+    /// else at any order. Along a quasi-separated direction the likelihood is flat on
+    /// one side of the mode and `e^{−ΔF}` has a wall: on the binomial `adult` fit the
+    /// axis stayed at a paired difference of `1.6e-3` through order 388, the largest
+    /// representable order, against a `1.5e-9` target. A composite rule places its
+    /// nodes where the error is, so the wall costs a few bisections.
+    ///
+    /// The partition starts as the whole axis and the cell with the largest error
+    /// share is bisected until the axis error resolves `min(|Δ|, next_order_remainder)`.
+    /// This is the admission's rule: the partition it returns is latched, and every
+    /// later evaluation integrates on it through
+    /// [`Self::composite_axis_marginal_correction_on_partition`], so the criterion is
+    /// one fixed rule's value, a smooth function of ρ, and its gradient channels are
+    /// that rule's derivative (#784).
+    ///
+    /// The error is the Gauss–Kronrod difference of each cell's embedded Gauss rule,
+    /// taken on the self-normalised value, so a Gaussian axis (`ΔF ≡ 0`) reports
+    /// `Δ = 0` with error exactly `0`. The refusal carries `axis 0` and
+    /// `axis_orders = [node count]`.
+    fn composite_axis_marginal_correction(
+        &self,
+        target: &dyn BlockExcessTarget,
+        next_order_remainder: f64,
+    ) -> Result<CompositeAxisMarginal, BlockQuadratureOrderRefusal>;
+
+    /// The composite rule of [`Self::composite_axis_marginal_correction`] on the fixed
+    /// interior `breakpoints` a latched admission carries: no cell is bisected, and
+    /// the Gauss–Kronrod error of those cells is measured and reported, not acted on.
+    /// The breakpoints are in the logistic image of the standardized axis
+    /// `z = √λ·t`, so the rule moves with the axis's curvature and mode exactly as a
+    /// latched Gauss–Hermite order does. The returned `breakpoints` are the input.
+    fn composite_axis_marginal_correction_on_partition(
+        &self,
+        target: &dyn BlockExcessTarget,
+        breakpoints: &[AxisBreakpoint],
+    ) -> Result<CompositeAxisMarginal, BlockQuadratureOrderRefusal>;
 
     /// Publish one step of [`select_block_quadrature_orders`]: the rule it evaluated,
     /// the unresolved axis it raises next, and the node count projected at the

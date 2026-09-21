@@ -352,9 +352,11 @@ pub struct QuadratureMarginalAudit {
     pub quadrature_error: f64,
     /// Nodes evaluated, summed over those pieces.
     pub node_count: usize,
-    /// Per-axis Gauss–Hermite orders, as latched at admission.
+    /// Per-axis node counts of the latched rules: a Gauss–Hermite axis's order, or
+    /// a composite Gauss–Kronrod axis's total node count.
     pub axis_orders: Vec<usize>,
-    /// Per-axis paired differences with that axis one order lower.
+    /// Per-axis quadrature errors: a Gauss–Hermite axis's paired difference with
+    /// the rule one order lower, or a composite axis's Gauss–Kronrod error.
     pub axis_quadrature_errors: Vec<f64>,
     /// The activation evidence: `max|γ_r|` over curvature directions and the
     /// threshold `τ(n_eff)` it had to exceed.
@@ -372,6 +374,10 @@ pub struct QuadratureMarginalAudit {
     /// (`BlockExcessTarget::axis_truncation`), so its ends, transported nodes
     /// and mass `ln Z` move with ρ.
     pub truncated_pieces: Vec<bool>,
+    /// Per separately integrated piece, whether its latched rule is the composite
+    /// Gauss–Kronrod partition (`LatchedPieceRule::Composite`) rather than a
+    /// Gauss–Hermite rule.
+    pub composite_pieces: Vec<bool>,
     /// Channel (a), `∂Δ_b/∂ρ_j` — the corrector's explicit penalty-score channel,
     /// raw.
     pub explicit_a: Vec<f64>,

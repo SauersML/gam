@@ -1,4 +1,5 @@
 use super::*;
+use gam_problem::laplace_sampler_contract::BlockNodeEvaluation;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 pub(crate) const TK_BLOCK_SIZE: usize = 128;
@@ -23,6 +24,17 @@ pub(crate) const KKT_TOL_DUAL: f64 = 1e-7;
 pub(crate) const KKT_TOL_COMP: f64 = 1e-7;
 
 pub(crate) const KKT_TOL_STAT: f64 = 5e-6;
+
+/// Roundings a row oracle ([`crate::pirls::deviance_eta_row_on_measure`])
+/// commits forming one half-deviance row on its direct route, counted per
+/// branch: binomial logit at `y ∈ {0, 1}` through the `bd0` series is the
+/// deepest (the logistic pair 4–5, the series about 12, the two-term sum, the
+/// prior weight). A rounding in the logistic pair moves the row through
+/// `∂bd0/∂μ = (μ − y)/μ`, so it lands within the count times
+/// `|row| + |ψ'_i|` (the η-score `w(μ − y)`), not `|row|` alone, which the
+/// interior-`y` rows need. Gaussian (3), cauchit (about 10) and Student-t
+/// (about 11) are shallower.
+pub(crate) const ROW_ORACLE_FORMATION_ROUNDINGS: usize = 23;
 
 pub(crate) fn transformed_penalty_matvec(
     penalty: &gam_terms::construction::CanonicalPenalty,
@@ -1143,11 +1155,12 @@ pub(crate) struct Gam784BlockTarget<'t> {
     pub(crate) x_transformed: &'t Array2<f64>,
     /// Block eigenvectors `V_b` (columns), shape `p × m`.
     pub(crate) block_vecs: Array2<f64>,
-    /// `A = X_t·V_b`, shape `n × m`, formed once per target. A node `t` moves
-    /// the rows by `s = X_t V_b t = A t`, so every node reads this product
-    /// (`n·m` per node) instead of re-forming `X_t·(V_b t)` (`n·p` per node),
-    /// and so do the moment channels and the axis truncation.
-    pub(crate) row_block_design: Array2<f64>,
+    /// `X_t·V_b` (n × m) and `|X_t|·|V_b|`, formed once per target from the two
+    /// fields above. A node `t` moves the rows by `s = X_t V_b t`, so every node
+    /// reads the product (`n·m` per node) instead of re-forming `X_t·(V_b t)`
+    /// (`n·p` per node), and so do the moment channels and the axis truncation;
+    /// the magnitude is the design term of the excess's rounding band.
+    pub(crate) block_design: Gam784BlockDesign,
     /// Block curvatures `λ_r` (the `H_total` eigenvalues), length `m`.
     pub(crate) block_lambdas: Array1<f64>,
     /// Mode linear predictor η̂ = X_t β̂.
@@ -1193,11 +1206,51 @@ pub(crate) struct Gam784BlockTarget<'t> {
     pub(crate) base_absolute_half_deviance: f64,
 }
 
+/// The block's design, `X_t·V_b` (n × m), and its magnitude `|X_t|·|V_b|`.
+///
+/// Every node of a block quadrature moves the rows by `s = X_t·V_b·t`, so the
+/// `n × m` product is formed once and each node costs `O(n·m)` rather than the
+/// `O(n·p)` of `X_t·(V_b t)`. The computed `s` rounds within
+/// `(γ_p + γ_m(1 + γ_p))·(|X_t|·|V_b|·|t|)_i ≤ γ_{p+m}·(|X_t|·|V_b|·|t|)_i` (Higham,
+/// *ASNA* 2nd ed., §3.5, for the two products in turn), the same bound the other
+/// association carries, so the excess's rounding band reads the magnitude here.
+#[derive(Clone)]
+pub(crate) struct Gam784BlockDesign {
+    pub(crate) product: Array2<f64>,
+    pub(crate) absolute: Array2<f64>,
+}
+
+impl Gam784BlockDesign {
+    pub(crate) fn new(x_transformed: &Array2<f64>, block_vecs: &Array2<f64>) -> Self {
+        Self {
+            product: gam_linalg::faer_ndarray::fast_ab(x_transformed, block_vecs),
+            absolute: gam_linalg::faer_ndarray::fast_ab(
+                &x_transformed.mapv(f64::abs),
+                &block_vecs.mapv(f64::abs),
+            ),
+        }
+    }
+
+    /// The design of the block's axis `r` alone.
+    pub(crate) fn column(&self, r: usize) -> Self {
+        let column = |matrix: &Array2<f64>| {
+            matrix
+                .column(r)
+                .to_owned()
+                .insert_axis(ndarray::Axis(1))
+        };
+        Self {
+            product: column(&self.product),
+            absolute: column(&self.absolute),
+        }
+    }
+}
+
 impl Gam784BlockTarget<'_> {
     /// The per-row displacement `s = X_t V_b t = A t` of a whitened block
     /// displacement `t`.
     pub(crate) fn displacement(&self, t: &Array1<f64>) -> Array1<f64> {
-        let mut s = Array1::<f64>::zeros(self.row_block_design.nrows());
+        let mut s = Array1::<f64>::zeros(self.block_design.product.nrows());
         self.displacement_into(
             t.view(),
             s.as_slice_mut()
@@ -1210,17 +1263,18 @@ impl Gam784BlockTarget<'_> {
     /// axes per row. Every path (one node, the node batch, the rounding band)
     /// forms `s` here, so the same `t` gives the bit-identical `s` on each.
     fn displacement_into(&self, t: ndarray::ArrayView1<'_, f64>, s: &mut [f64]) {
+        let design = &self.block_design.product;
         assert_eq!(
             t.len(),
-            self.row_block_design.ncols(),
+            design.ncols(),
             "#784 block displacement length must match the block dimension"
         );
         assert_eq!(
             s.len(),
-            self.row_block_design.nrows(),
+            design.nrows(),
             "#784 row displacement length must match the row count"
         );
-        for (row, out) in self.row_block_design.rows().into_iter().zip(s.iter_mut()) {
+        for (row, out) in design.rows().into_iter().zip(s.iter_mut()) {
             let mut sum = 0.0_f64;
             for (&a, &t_r) in row.iter().zip(t.iter()) {
                 sum += a * t_r;
@@ -1321,14 +1375,15 @@ impl Gam784BlockTarget<'_> {
         self.remainder_at(scaled_half_deviance, s)
     }
 
-    /// [`BlockExcessTarget::excess_with_displaced_neg_score_batch`] and
-    /// [`BlockExcessTarget::excess_batch`], which differ only in whether each
-    /// node's displaced score is kept.
+    /// [`BlockExcessTarget::excess_band_and_displaced_neg_score_batch`] and the two
+    /// batches it extends, which differ only in whether each node's displaced score
+    /// is kept and its rounding band formed.
     fn node_batch(
         &self,
         draws: &Array2<f64>,
         keep_score: bool,
-    ) -> Vec<(f64, Option<Array1<f64>>)> {
+        with_band: bool,
+    ) -> Vec<BlockNodeEvaluation> {
         let m = self.block_lambdas.len();
         let n = self.eta_hat.len();
         let n_draws = draws.ncols();
@@ -1356,35 +1411,107 @@ impl Gam784BlockTarget<'_> {
         // Order is preserved: this is an indexed map into a `Vec`, so node `s`
         // still lands at position `s` and the result is bit-identical to the
         // serial loop. Each worker holds one half-deviance scratch and one
-        // row-displacement scratch of `n` rows.
+        // row-displacement scratch of `n` rows, and a score scratch when a band
+        // is formed from a score it does not keep.
+        let infeasible = |excess: f64| BlockNodeEvaluation {
+            excess,
+            rounding_band: 0.0,
+            displaced_neg_score: None,
+        };
         (0..n_draws)
             .into_par_iter()
             .map_init(
-                || (vec![0.0_f64; n], vec![0.0_f64; n]),
-                |scratch, sidx| {
-                    let (half, rows) = scratch;
+                || {
+                    let scratch = if with_band && !keep_score { n } else { 0 };
+                    (vec![0.0_f64; n], vec![0.0_f64; n], vec![0.0_f64; scratch])
+                },
+                |(half, rows, score_scratch), sidx| {
                     self.displacement_into(draws.column(sidx), rows);
-                    let mut score = keep_score.then(|| Array1::<f64>::zeros(n));
-                    let excess = match self.node_excess(
-                        ndarray::ArrayView1::from(rows.as_slice()),
-                        half,
-                        score.as_mut().map(|score| {
+                    let s = ndarray::ArrayView1::from(rows.as_slice());
+                    let mut kept = keep_score.then(|| Array1::<f64>::zeros(n));
+                    let score = match kept.as_mut() {
+                        Some(score) => Some(
                             score
                                 .as_slice_mut()
-                                .expect("a freshly allocated score is contiguous")
-                        }),
-                    ) {
-                        Ok(excess) => excess,
-                        Err(_) => return (f64::INFINITY, None),
+                                .expect("a freshly allocated score is contiguous"),
+                        ),
+                        None if with_band => Some(score_scratch.as_mut_slice()),
+                        None => None,
                     };
-                    if excess.is_finite() {
-                        (excess, score)
+                    let excess = match self.node_excess(s, half, score) {
+                        Ok(excess) if excess.is_finite() => excess,
+                        Ok(excess) => return infeasible(excess),
+                        Err(_) => return infeasible(f64::INFINITY),
+                    };
+                    let rounding_band = if with_band {
+                        let score = match kept.as_ref() {
+                            Some(score) => score
+                                .as_slice()
+                                .expect("a freshly allocated score is contiguous"),
+                            None => score_scratch.as_slice(),
+                        };
+                        self.rounding_band_on_rows(draws.column(sidx), s, half, score)
                     } else {
-                        (excess, None)
+                        0.0
+                    };
+                    BlockNodeEvaluation {
+                        excess,
+                        rounding_band,
+                        displaced_neg_score: kept,
                     }
                 },
             )
             .collect()
+    }
+
+    /// [`BlockExcessTarget::excess_rounding_band`] at `t` from the node's row sweep:
+    /// its displacement `s`, displaced scaled half-deviance rows `half` and displaced
+    /// η-scores `score`. One pass over the rows; see that method for the terms.
+    fn rounding_band_on_rows(
+        &self,
+        t: ndarray::ArrayView1<'_, f64>,
+        s: ndarray::ArrayView1<'_, f64>,
+        half: &[f64],
+        score: &[f64],
+    ) -> f64 {
+        use gam_linalg::roundoff::{accumulation_growth, compensated_band, UNIT_ROUNDOFF};
+        let absolute_t: Vec<f64> = t.iter().map(|value| value.abs()).collect();
+        let design_growth = accumulation_growth(self.block_vecs.nrows() + t.len());
+        let sensitivity_growth = accumulation_growth(ROW_ORACLE_FORMATION_ROUNDINGS + 3);
+        let (mut displaced_absolute, mut absolute_row_score) = (0.0_f64, 0.0_f64);
+        let (mut argument_absolute, mut linear_absolute) = (0.0_f64, 0.0_f64);
+        let (mut curvature_absolute, mut design_band) = (0.0_f64, 0.0_f64);
+        for (i, design_row) in self.block_design.absolute.rows().into_iter().enumerate() {
+            let (value, row_score, base_score) = (s[i], score[i], self.base_neg_score_at_mode[i]);
+            let weight = self.weights_obs[i];
+            displaced_absolute += half[i].abs();
+            absolute_row_score += row_score.abs() + base_score.abs();
+            argument_absolute += row_score.abs() * (self.eta_hat[i] + value).abs();
+            linear_absolute += (base_score * value).abs();
+            curvature_absolute += weight.abs() * value * value;
+            let entry_band = design_growth
+                * design_row
+                    .iter()
+                    .zip(&absolute_t)
+                    .map(|(entry, t)| entry * t)
+                    .sum::<f64>();
+            let curvature_move = weight * value;
+            let sensitivity = (row_score - base_score - curvature_move).abs()
+                + sensitivity_growth
+                    * (row_score.abs() + base_score.abs() + curvature_move.abs());
+            design_band += sensitivity * entry_band;
+        }
+        let absolute_half_deviance = displaced_absolute + self.base_absolute_half_deviance;
+        let deviance_band = compensated_band(2, absolute_half_deviance)
+            + accumulation_growth(ROW_ORACLE_FORMATION_ROUNDINGS)
+                * (absolute_half_deviance + absolute_row_score);
+        let argument_band = argument_absolute * UNIT_ROUNDOFF;
+        let linear_band = compensated_band(1, linear_absolute);
+        let curvature_band = compensated_band(2, curvature_absolute);
+        let combination_band = accumulation_growth(3)
+            * (absolute_half_deviance + linear_absolute + 0.5 * curvature_absolute);
+        deviance_band + argument_band + linear_band + 0.5 * curvature_band + combination_band
+            + design_band
     }
 
     /// `ΔF` from the displaced scaled half-deviance at `η̂ + s`: the row
@@ -1396,7 +1523,35 @@ impl Gam784BlockTarget<'_> {
     ) -> Result<f64, EstimationError> {
         let curv = self.observed_quadratic(s)?;
         let value_diff = displaced_scaled_half_deviance - self.base_scaled_half_deviance;
-        Ok(value_diff - self.base_neg_score_at_mode.dot(&s) - 0.5 * curv)
+        Ok(value_diff - self.linear_taylor_term(s) - 0.5 * curv)
+    }
+
+    /// `ψ'(η̂)·s`, one deterministic Neumaier pass.
+    ///
+    /// Near the mode the products are `O(1)` per row while the excess they cancel
+    /// against is small, so a plain inner product's `γ_n·Σ|ψ'_i s_i|` rounding
+    /// grows with the row count and, at tens of thousands of rows, sits above the
+    /// resolution the #784 correction is asked for. The compensated pass rounds
+    /// within `compensated_band(1, Σ|ψ'_i s_i|)` at any `n`.
+    fn linear_taylor_term(&self, s: ndarray::ArrayView1<'_, f64>) -> f64 {
+        assert_eq!(
+            s.len(),
+            self.base_neg_score_at_mode.len(),
+            "#784 displacement score length must match the mode score"
+        );
+        let mut sum = 0.0_f64;
+        let mut compensation = 0.0_f64;
+        for (&score, &value) in self.base_neg_score_at_mode.iter().zip(s.iter()) {
+            let term = score * value;
+            let next = sum + term;
+            compensation += if sum.abs() >= term.abs() {
+                (sum - next) + term
+            } else {
+                (term - next) + sum
+            };
+            sum = next;
+        }
+        sum + compensation
     }
 
     /// `sum_i W_i s_i^2`, one deterministic Neumaier pass that preserves signed
@@ -1527,76 +1682,52 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
     }
 
     /// The rounding band of [`Self::excess`] at `t`, from what its sums accumulate:
-    /// - the displaced and base scaled half-deviances, compensated sums over `n`
-    ///   rows. Each row oracle rounds in fewer than `n` operations, so each sum
-    ///   carries at most `accumulation_band(n, Σ|row|)`.
-    /// - the linear Taylor term `ψ'(η̂)·s`, an inner product over `n` terms.
-    /// - the observed quadratic `Σ_i W_i s_i²`, a compensated sum over `n` terms.
-    /// - the design product `s = A t` with `A = fl(X_t V_b)`. Each `a_ir` is a
-    ///   `p`-term inner product, within `γ_p·Σ_j |x_ij||v_jr|`, and `s_i` sums `m`
-    ///   products `a_ir t_r`, within `γ_m·Σ_r |a_ir||t_r|`; together
-    ///   `|ŝ_i − s_i| ≤ (γ_p + γ_m(1 + γ_p))·(|X_t||V_b||t|)_i ≤ γ_{p+m}·(|X_t||V_b||t|)_i`
-    ///   (Higham, Lemma 3.3). That moves the displaced surface by at most
-    ///   `|ψ'(η̂_i + s_i)|` times it, the linear term by `|ψ'(η̂_i)|` times it and
-    ///   the quadratic by `|W_i|·|s_i|` times it.
+    /// - the displaced and base scaled half-deviances. Each is a compensated
+    ///   sum ([`crate::pirls::stable_finite_signed_sum`]: one division per
+    ///   term, a Neumaier pass, one rescaling product), within
+    ///   `compensated_band(2, Σ|row|)` at any row count, plus the rounding each
+    ///   row oracle commits forming its row: within
+    ///   `γ_{ROW_ORACLE_FORMATION_ROUNDINGS}·(|row| + |ψ'_i|)` (see that count).
+    /// - the displaced rows' argument `η̂_i + s_i`, one rounding, which moves
+    ///   row `i` by at most `u·|η_i|·|ψ'(η_i)|`.
+    /// - the linear Taylor term `ψ'(η̂)·s` and the observed quadratic
+    ///   `Σ_i W_i s_i²`, compensated sums of terms formed in one and two
+    ///   roundings.
+    /// - the three subtractions that combine those four sums.
+    /// - the design product `s = (X_t V_b) t`, whose entries round within
+    ///   `γ_{p+m}·(|X_t|·|V_b|·|t|)_i` (Higham, *ASNA* 2nd ed., §3.5, for the two
+    ///   products in turn). The same computed `s` enters the displaced surface,
+    ///   the linear term and the quadratic, so a move `ε_i` in `s_i` moves the
+    ///   excess by `∂ΔF/∂s_i = ψ'(η̂_i + s_i) − ψ'(η̂_i) − W_i s_i` times it, to
+    ///   first order in `ε_i`. The three pieces cancel to `O(s_i²)` near the mode;
+    ///   the computed sensitivity carries the row oracle's rounding of
+    ///   `ψ'(η̂_i + s_i)` and the three operations that combine the pieces.
+    ///   Bounding the three moves apart, at `|ψ'(η̂_i + s_i)| + |ψ'(η̂_i)| +
+    ///   |W_i s_i|` against `γ_{p(m+1)}·Σ_j |x_ij|·‖δ‖∞`, made this term 99.7% of
+    ///   the composite rule's rounding floor on the log-capital-gain axis of the
+    ///   adult census fit (p = 96): a floor of 2.5e-7 against a paired error of
+    ///   5.4e-9 and a target of 1.5e-9, so the rule refused.
     ///
     /// A row surface that does not evaluate returns `+∞`, which no bar passes.
     fn excess_rounding_band(&self, t: &Array1<f64>) -> f64 {
         let s = self.displacement(t);
-        let eta_disp = &self.eta_hat + &s;
-        let Ok(rows) = crate::pirls::deviance_eta_rows_with_log_measure_scale(
+        let n = s.len();
+        let (mut half, mut score) = (vec![0.0_f64; n], vec![0.0_f64; n]);
+        if crate::pirls::deviance_eta_rows_on_measures_into(
             self.y.view(),
-            &eta_disp,
+            self.eta_hat.view(),
+            s.view(),
             &self.likelihood,
             &self.inverse_link,
-            self.prior_weights.view(),
-            -self.phi.ln(),
-        ) else {
-            return f64::INFINITY;
-        };
-        let n = rows.len();
-        let displaced_absolute: f64 = rows.iter().map(|row| row.half_deviance.abs()).sum();
-        let deviance_band = gam_linalg::roundoff::accumulation_band(n, displaced_absolute)
-            + gam_linalg::roundoff::accumulation_band(n, self.base_absolute_half_deviance);
-        let p = self.block_vecs.nrows();
-        let linear_absolute: f64 = self
-            .base_neg_score_at_mode
-            .iter()
-            .zip(s.iter())
-            .map(|(score, value)| (score * value).abs())
-            .sum();
-        let linear_band = gam_linalg::roundoff::accumulation_band(n, linear_absolute);
-        let curvature_absolute: f64 = self
-            .weights_obs
-            .iter()
-            .zip(s.iter())
-            .map(|(weight, value)| weight.abs() * value * value)
-            .sum();
-        let curvature_band = gam_linalg::roundoff::accumulation_band(n, curvature_absolute);
-        // `|V_b||t|`, the coefficient-side magnitude each design row contracts.
-        let coefficient_magnitude = self.block_vecs.mapv(f64::abs).dot(&t.mapv(f64::abs));
-        let design_growth =
-            gam_linalg::roundoff::accumulation_growth(p + self.block_lambdas.len());
-        let mut design_band = 0.0_f64;
-        for ((((design_row, row), base_score), weight), value) in self
-            .x_transformed
-            .rows()
-            .into_iter()
-            .zip(rows.iter())
-            .zip(self.base_neg_score_at_mode.iter())
-            .zip(self.weights_obs.iter())
-            .zip(s.iter())
+            &self.row_measures,
+            &mut half,
+            Some(&mut score),
+        )
+        .is_err()
         {
-            let row_magnitude: f64 = design_row
-                .iter()
-                .zip(coefficient_magnitude.iter())
-                .map(|(entry, magnitude)| entry.abs() * magnitude)
-                .sum();
-            let entry_band = design_growth * row_magnitude;
-            design_band += (row.eta_score.abs() + base_score.abs() + weight.abs() * value.abs())
-                * entry_band;
+            return f64::INFINITY;
         }
-        deviance_band + linear_band + 0.5 * curvature_band + design_band
+        self.rounding_band_on_rows(t.view(), s.view(), &half, &score)
     }
 
     /// Zero: with `δ` held fixed in coefficient space, ρ reaches `ΔF` only
@@ -1621,18 +1752,18 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
         Ok(self.base_neg_score_at_mode.clone())
     }
 
-    /// One node of [`Self::excess_with_displaced_neg_score_batch`] (and of
-    /// [`Self::excess_batch`], which runs it) holds its result entry, displaced score
-    /// (n) and excess-only result, plus a row-displacement scratch and a half-deviance
-    /// scratch of `n` rows each. The scratches are one per worker, not per node, but a
-    /// node is charged whole ones so the bound holds for any split of the batch. The
-    /// product `A = X_t·V_b` the nodes read is the target's, formed once, not a node's.
+    /// One node of [`Self::excess_band_and_displaced_neg_score_batch`] (and of the
+    /// two batches it extends) holds its result entry and displaced score (n), plus a
+    /// row-displacement, a half-deviance and a score scratch of `n` rows each. The
+    /// scratches are one per worker, not per node, but a node is charged whole ones so
+    /// the bound holds for any split of the batch. The product `A = X_t·V_b` the nodes
+    /// read is the target's, formed once, not a node's.
     fn node_working_bytes(&self) -> Option<usize> {
         let n = self.eta_hat.len();
-        n.checked_mul(3)?
+        n.checked_mul(4)?
             .checked_add(1)?
             .checked_mul(std::mem::size_of::<f64>())?
-            .checked_add(std::mem::size_of::<(f64, Option<Array1<f64>>)>())
+            .checked_add(std::mem::size_of::<BlockNodeEvaluation>())
     }
 
     /// Fused excess + displaced score sharing one row displacement `s = A t`
@@ -1666,15 +1797,28 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
         &self,
         draws: &Array2<f64>,
     ) -> Vec<(f64, Option<Array1<f64>>)> {
-        self.node_batch(draws, true)
+        self.node_batch(draws, true, false)
+            .into_iter()
+            .map(|node| (node.excess, node.displaced_neg_score))
+            .collect()
     }
 
     fn excess_batch(&self, nodes: &Array2<f64>) -> Vec<f64> {
         // The same BLAS-3 displacement path, with no score kept per node.
-        self.node_batch(nodes, false)
+        self.node_batch(nodes, false, false)
             .into_iter()
-            .map(|(excess, _)| excess)
+            .map(|node| node.excess)
             .collect()
+    }
+
+    /// The band from the same row sweep as the excess and score: the displaced rows'
+    /// half-deviances and scores are what [`Self::excess_rounding_band`] reads, so a
+    /// node is swept once.
+    fn excess_band_and_displaced_neg_score_batch(
+        &self,
+        draws: &Array2<f64>,
+    ) -> Vec<BlockNodeEvaluation> {
+        self.node_batch(draws, true, true)
     }
 
     /// A one-axis block of a reciprocal-power link: the row surface is defined
@@ -1694,7 +1838,7 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
         }
         // The same `A` column the nodes displace the rows by, so each cut is
         // where the evaluated surface `η̂ + A t` itself leaves the domain.
-        let xv = self.row_block_design.column(0).to_owned();
+        let xv = self.block_design.product.column(0).to_owned();
         let mut lower: Option<BlockAxisCut> = None;
         let mut upper: Option<BlockAxisCut> = None;
         let mut curvature = 0.0_f64;
@@ -1800,7 +1944,7 @@ mod exact_deviance_state_cache_tests {
         Gam784BlockTarget {
             x_transformed: x,
             block_lambdas: Array1::ones(block_vecs.ncols()),
-            row_block_design: gam_linalg::faer_ndarray::fast_ab(x, &block_vecs),
+            block_design: Gam784BlockDesign::new(x, &block_vecs),
             block_vecs,
             weights_obs,
             weights_obs_log_abs,
@@ -1913,6 +2057,137 @@ mod exact_deviance_state_cache_tests {
         }
         // At the mode the excess is exactly the base's cancellation.
         approx::assert_abs_diff_eq!(batch[0].0, 0.0, epsilon = 1.0e-12);
+
+        // One sweep of the rows gives each node the excess and score above and the
+        // band the one-node path derives from its own sweep.
+        let fused = target.excess_band_and_displaced_neg_score_batch(&nodes);
+        assert_eq!(fused.len(), nodes.ncols());
+        for (col, (node, (excess, score))) in fused.iter().zip(batch.iter()).enumerate() {
+            let t = nodes.column(col).to_owned();
+            assert_eq!(node.excess, *excess);
+            assert_eq!(node.displaced_neg_score.as_ref(), score.as_ref());
+            let band = target.excess_rounding_band(&t);
+            assert!(band.is_finite() && band > 0.0, "band {band:e} at t = {t}");
+            // The batch forms `s` by one product over every node, the single path by
+            // one dot product; the two round differently in the last bits.
+            approx::assert_relative_eq!(node.rounding_band, band, max_relative = 1.0e-10);
+        }
+    }
+
+    /// Binomial-logit rows about a fixed `η̂`, each row repeated `copies` times.
+    fn replicated_logit_rows(copies: usize) -> (Array2<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
+        let rows = 64;
+        let n = rows * copies;
+        let x = Array2::from_shape_fn((n, 3), |(i, j)| {
+            let u = ((i % rows) as f64 + 0.5) / rows as f64;
+            match j {
+                0 => 1.0,
+                1 => 2.0 * u - 1.0,
+                _ => (3.0 * u).sin(),
+            }
+        });
+        let eta_hat = x.dot(&array![-0.3, 1.2, 0.7]);
+        let y = Array1::from_iter((0..n).map(|i| f64::from(u8::from(((i % rows) * 7) % 5 < 2))));
+        let weights_obs = eta_hat.mapv(|eta: f64| {
+            let mu = 1.0 / (1.0 + (-eta).exp());
+            mu * (1.0 - mu)
+        });
+        (x, eta_hat, weights_obs, y)
+    }
+
+    /// Repeating every row `r` times multiplies each sum `ΔF` accumulates by
+    /// `r`, so the exact excess is `r` times the single copy's, and a band
+    /// derived from those sums grows by `r`. The half-deviance, linear and
+    /// quadratic sums are compensated, whose rounding carries no factor of the
+    /// row count; banding them with `γ_n` made the band grow by `r²`, and on
+    /// the adult fit (`n ≈ 39 000`) put a 2.99e-7 floor under a composite axis
+    /// that had to resolve to 1.47e-9, refusing it as `CompositeRoundingFloor`.
+    #[test]
+    fn excess_rounding_band_does_not_scale_with_the_row_count_784() {
+        let copies = 512;
+        let (x_one, eta_one, weights_one, y_one) = replicated_logit_rows(1);
+        let (x_many, eta_many, weights_many, y_many) = replicated_logit_rows(copies);
+        let logit = || {
+            GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            ))
+        };
+        let block_vecs = array![[0.6, 0.0], [0.8, 0.0], [0.0, 1.0]];
+        let one = target(&x_one, block_vecs.clone(), eta_one, weights_one, y_one, logit());
+        let many = target(&x_many, block_vecs, eta_many, weights_many, y_many, logit());
+        let n_many = x_many.nrows();
+        let r = copies as f64;
+        for t in [array![0.4, -0.7], array![-1.1, 0.3], array![2.0, 1.5]] {
+            let band_one = one.excess_rounding_band(&t);
+            let band_many = many.excess_rounding_band(&t);
+            assert!(band_one.is_finite() && band_one > 0.0, "band {band_one:e} at t = {t}");
+            assert!(
+                band_many
+                    <= r * band_one * (1.0 + gam_linalg::roundoff::accumulation_growth(n_many)),
+                "{copies} copies of the rows moved the band from {band_one:.3e} to \
+                 {band_many:.3e}, {:.1} times the {copies}-fold its sums grew by (t = {t})",
+                band_many / band_one / r
+            );
+            let excess_one = one.excess(&t);
+            let excess_many = many.excess(&t);
+            assert!(
+                (excess_many - r * excess_one).abs() <= band_many + r * band_one,
+                "ΔF {excess_many:.17e} of the repeated rows against {copies} × {excess_one:.17e} \
+                 lies outside the two bands {band_many:.3e} + {copies} × {band_one:.3e}"
+            );
+        }
+    }
+
+    /// Design columns the block direction leaves at zero add exact zeros to
+    /// `s = X_t (V_b t)`, so they move neither `ΔF` nor its rounding beyond the
+    /// longer products' growth `γ_{p+m}`. Banding the product by
+    /// `Σ_j |x_ij|·‖δ‖∞` charged every column at the largest coefficient move; on
+    /// the adult fit (p = 96, one axis) that design term was 99.7% of a 2.5e-7
+    /// floor under an axis that had to resolve to 1.5e-9.
+    #[test]
+    fn excess_rounding_band_ignores_design_columns_the_block_does_not_move_784() {
+        let (x_narrow, eta_hat, weights_obs, y) = replicated_logit_rows(1);
+        let extra = 5;
+        let (n, p_narrow) = x_narrow.dim();
+        let x_wide = Array2::from_shape_fn((n, p_narrow + extra), |(i, j)| {
+            if j < p_narrow {
+                x_narrow[(i, j)]
+            } else {
+                1.0e4 * ((i * (j + 1)) as f64).sin()
+            }
+        });
+        let narrow_vecs = array![[0.6, 0.0], [0.8, 0.0], [0.0, 1.0]];
+        let wide_vecs = Array2::from_shape_fn((p_narrow + extra, 2), |(j, r)| {
+            if j < p_narrow { narrow_vecs[(j, r)] } else { 0.0 }
+        });
+        let logit = || {
+            GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            ))
+        };
+        let narrow = target(
+            &x_narrow,
+            narrow_vecs,
+            eta_hat.clone(),
+            weights_obs.clone(),
+            y.clone(),
+            logit(),
+        );
+        let wide = target(&x_wide, wide_vecs, eta_hat, weights_obs, y, logit());
+        let growth = (p_narrow + extra + 2) as f64 / (p_narrow + 2) as f64;
+        for t in [array![0.4, -0.7], array![-1.1, 0.3], array![2.0, 1.5]] {
+            let band_narrow = narrow.excess_rounding_band(&t);
+            let band_wide = wide.excess_rounding_band(&t);
+            assert!(band_narrow.is_finite() && band_narrow > 0.0, "band {band_narrow:e} at t = {t}");
+            assert!(
+                band_wide <= growth * band_narrow,
+                "{extra} unmoved columns of magnitude 1e4 moved the band from {band_narrow:.3e} to \
+                 {band_wide:.3e}, {:.1} times the {growth:.2} of the longer products (t = {t})",
+                band_wide / band_narrow
+            );
+        }
     }
 
     /// `ΔF` is the definition `F(β̂+δ) − F(β̂) − ½ δᵀ H δ` at an exact mode, and
@@ -1989,7 +2264,7 @@ mod exact_deviance_state_cache_tests {
         let target = Gam784BlockTarget {
             x_transformed: &x,
             block_vecs: Array2::eye(2),
-            row_block_design: x.clone(),
+            block_design: Gam784BlockDesign::new(&x, &Array2::eye(2)),
             block_lambdas: array![1.0, 1.0],
             eta_hat: eta_hat.clone(),
             weights_obs,
