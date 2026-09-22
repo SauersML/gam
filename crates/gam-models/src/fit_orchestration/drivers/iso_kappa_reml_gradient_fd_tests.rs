@@ -197,6 +197,12 @@ struct IsoKappaFdReport {
     worst_psi_rel: f64,
     violations: Vec<String>,
     unresolved: Vec<String>,
+    /// How many components the oracle resolved AND judged. `pass` already
+    /// folds `judged > 0` in, but folded it cannot be read back: a gate that
+    /// prints `violations` on a false `pass` prints an empty list when the
+    /// truth is that nothing was measured. Named here so a gate can assert
+    /// non-vacuity in its own sentence.
+    judged: usize,
     /// Each probe's analytic outer gradient, by probe name, for gates that
     /// read the gradient itself rather than its agreement (#2450).
     analytic_by_probe: Vec<(String, Array1<f64>)>,
@@ -211,7 +217,8 @@ fn iso_kappa_fd_variant_driver(
     extra_rho_probes: &[f64],
 ) -> IsoKappaFdReport {
     let fixture = build_iso_kappa_fixture(label, n, family, well_conditioned);
-    let report = iso_kappa_fd_variant_driver_on(&fixture, label, skip_psi, extra_rho_probes);
+    let report =
+        iso_kappa_fd_variant_driver_on(&fixture, label, skip_psi, extra_rho_probes, &[]);
     // Every component the oracle declined to judge is printed by name, so a
     // green verdict can be read together with what it did NOT measure.
     for row in &report.unresolved {
@@ -544,6 +551,7 @@ fn iso_kappa_fd_variant_driver_on(
     label: &str,
     skip_psi: bool,
     extra_rho_probes: &[f64],
+    only_probes: &[&str],
 ) -> IsoKappaFdReport {
     let IsoKappaFixture {
         data,
@@ -705,9 +713,27 @@ fn iso_kappa_fd_variant_driver_on(
         ("alt", &theta_alt),
         ("long", &theta_long),
     ];
-    let all_probes: Vec<(&str, &Array1<f64>)> = base_probes
+    let every_probe: Vec<(&str, &Array1<f64>)> = base_probes
         .into_iter()
         .chain(rail_probes.iter().map(|(n, t)| (n.as_str(), t)))
+        .collect();
+    // An empty `only_probes` means the whole grid, which is what every caller
+    // but the origin-probe gate passes. A named subset exists for ONE reason:
+    // when a later probe REFUSES, this driver panics before rendering any
+    // verdict, and the probes that already evaluated are never judged by
+    // anything. Restricting the grid lets those be asserted while the refusal
+    // is still open. It is not a way to drop a probe that disagrees: a name
+    // matching no probe is a hard error here, so a subset cannot quietly
+    // become empty, and no existing gate's grid is narrowed by its presence.
+    for name in only_probes {
+        assert!(
+            every_probe.iter().any(|(probe, _)| probe == name),
+            "{label}: requested probe {name:?} is not in this grid"
+        );
+    }
+    let all_probes: Vec<(&str, &Array1<f64>)> = every_probe
+        .into_iter()
+        .filter(|(probe, _)| only_probes.is_empty() || only_probes.contains(probe))
         .collect();
     for (probe, theta) in all_probes {
         let (cost_an, grad_an) = analytic_at(theta, &mut cache, &mut evaluator);
@@ -821,6 +847,7 @@ fn iso_kappa_fd_variant_driver_on(
         worst_psi_rel,
         violations,
         unresolved,
+        judged,
         analytic_by_probe,
     }
 }
@@ -968,6 +995,78 @@ fn iso_kappa_matern_gaussian_identity_fd() {
 /// already matched FD, so the desync that stalled the κ-optimizer at its
 /// iteration cap (analytic ≠ FD on `psi_kappa`, #1122) lives in the cross-axis
 /// tension / mixed-curvature stiffness operator blocks that only carry
+/// #1561 / #2959: judge the Matérn iso-κ outer gradient at the ORIGIN probe,
+/// which no gate in this file can reach today.
+///
+/// `iso_kappa_matern_gaussian_identity_fd` builds this exact fixture and walks
+/// the five-probe grid, but dies inside `evaluate_joint_reml_outer_eval_at_theta`
+/// on a later probe, before the driver renders any verdict. The FIRST probe was
+/// measured all along and read by nobody: on the 2026-09-21 gam-models run the
+/// #2450 rail gate, which walks the same grid on the same fixture, printed at
+/// `zero`
+///
+///     rho j=0 an=+5.3729e-1 fd=+1.4523e0 rel=6.300e-1
+///     rho j=1 an=+8.2965e-1 fd=+1.5110e0 rel=4.509e-1
+///     rho j=2 an=+2.3546e-1 fd=+8.2897e-1 rel=7.160e-1
+///     rho j=3 an=+6.6535e-2 fd=+7.3088e-1 rel=9.090e-1
+///
+/// and then panicked on a later probe, so those four rows reached a log and no
+/// assertion. Two blockers in series: the refusal is not the gradient defect,
+/// and fixing the refusal alone would leave this unmeasured. Each `fd` is a
+/// Ridders extrapolant whose ladder is flat to nine digits from `h=1e-2` down
+/// to `h=5e-6`, so the oracle is not what is in question here.
+///
+/// This gate judges the origin probe ALONE. It does not narrow the five-probe
+/// gate, which is unchanged and still required; it is the part of that gate
+/// which can render a verdict while the later probes refuse, so the gradient
+/// defect is pinned by a test whose only failure mode is the disagreement.
+///
+/// What the four rows say: the analytic gradient is BELOW the oracle on every
+/// coordinate, by 45% to 91%. That one-sidedness is the shape of an omitted
+/// positive term in `∂log|S̃|₊/∂ρ_k = λ_k tr(S̃⁺S̃_k)`. A pseudo-inverse built
+/// at too low a rank drops modes from the trace and can only UNDERSTATE it; it
+/// cannot overstate it. This fixture's printed topology is
+/// `rho_dim=4 psi_dim=1 penalty_sources=[1..8, 1..8, 1..8, 1..8]` — four
+/// penalty blocks over ONE column span (the Matérn operator-penalty family;
+/// the `_dp` double penalty is off for this label) — so the weighted sum's
+/// rank is not the sum of the block ranks, and the frozen structural rank is
+/// what decides it. That is the same quantity `6e89ef39e9` re-read from the
+/// energy factor instead of from its squared Gram, one symptom further along:
+/// a rank that refuses when it is unrealizable at a trial ψ, and silently
+/// mis-differentiates when it is realizable but too low.
+#[test]
+fn matern_iso_kappa_outer_gradient_matches_fd_at_the_origin_probe_1561() {
+    // Exactly the arguments `iso_kappa_matern_gaussian_identity_fd` and the
+    // #2450 rail gate both pass — `("matern_gaussian", 80, gaussian_identity,
+    // well_conditioned=false)`. The quoted rows above are this fixture's, and
+    // they stay comparable only while the invocation is identical.
+    let fixture = build_iso_kappa_fixture(
+        "matern_gaussian",
+        80,
+        LikelihoodSpec::gaussian_identity(),
+        false,
+    );
+    let IsoKappaFdReport {
+        pass,
+        violations,
+        unresolved,
+        judged,
+        ..
+    } = iso_kappa_fd_variant_driver_on(&fixture, "matern_gaussian_origin", false, &[], &["zero"]);
+    // `pass` folds `judged > 0` in, so a false `pass` with an empty violation
+    // list would read as a disagreement when it is really a dead measurement.
+    assert!(
+        judged > 0,
+        "nothing was judged, so this gate measured nothing; unresolved: {}",
+        unresolved.join("; ")
+    );
+    assert!(
+        pass,
+        "Matérn iso-κ outer gradient disagrees with FD at θ=0 (judged={judged}):\n  {}",
+        violations.join("\n  ")
+    );
+}
+
 /// off-diagonal structure when d ≥ 2.
 #[test]
 fn iso_kappa_matern_2d_gaussian_identity_fd() {

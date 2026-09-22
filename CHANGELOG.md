@@ -15728,3 +15728,16 @@ publish paths.
   the successful fit they asserted while the torch path built its own penalty. That
   penalty was the divergence gam#4492 removed, so the old assertions were measuring a
   model `gamfit.fit` does not fit (#4492, #1561).
+### Added
+
+- `matern_iso_kappa_outer_gradient_matches_fd_at_the_origin_probe_1561`: judges the
+  Matérn iso-κ analytic outer gradient against the Ridders FD oracle at θ = 0, the one
+  probe of the iso-κ FD grid that evaluates on this fixture while later probes refuse.
+  The four ρ coordinates were measured at 45%–91% below the oracle on the 2026-09-21
+  gam-models run and printed by a gate that then panicked on a later probe, so the
+  numbers reached a log and no assertion (#1561, #2959, #2454).
+- `IsoKappaFdReport::judged`, so a gate can assert non-vacuity in its own sentence
+  instead of reading it back out of a folded `pass`.
+- `iso_kappa_fd_variant_driver_on(.., only_probes)`: an empty slice is the full grid, so
+  no existing gate is narrowed, and a name matching no probe is a hard error, so a
+  restricted grid cannot silently become empty.
