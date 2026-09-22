@@ -41,7 +41,7 @@ pub(crate) struct FrameLiftedCertificate {
     /// `λ² = Σ_{μᵢ > τᵢ} cᵢ²/μᵢ`, `c = Wᵀg_ξ`.
     pub(crate) lambda_sq: f64,
     /// `½λ²/(|f| + 1)`.
-    pub(crate) relative: f64,
+    pub(crate) relative: SaeDecrementAgainstResolution,
     /// No unexplained resolved negative direction, and the decrement certifies.
     pub(crate) certified: bool,
 }
@@ -172,7 +172,7 @@ impl SaeManifoldTerm {
     /// The pencil `(A_ξ, Φ_ξ)` classified as the fixed-frame refined root is
     /// ([`Self::exact_root_classification`]): resolved negative directions go to the
     /// concave-clamp basin, and otherwise the exact decrement decides through
-    /// [`Self::inner_relative_decrement`] and [`Self::inner_decrement_certifies`],
+    /// [`SaeDecrementAgainstResolution::measure`] and [`Self::inner_decrement_certifies`],
     /// the same two the fixed-frame root reads.
     fn frame_lifted_verdict(
         &self,
@@ -231,7 +231,11 @@ impl SaeManifoldTerm {
         // so a non-finite objective is NaN here and refuses. Written out, an
         // infinite objective would divide by an infinite scale, giving a ratio
         // of 0, and 0 certifies every decrement.
-        let relative = Self::inner_relative_decrement(lambda_sq, objective.value);
+        let relative = SaeDecrementAgainstResolution::measure(
+            lambda_sq,
+            objective.value,
+            Self::inner_information_count(target),
+        );
         let certified = (resolved_negative.is_none() || clamp_explained)
             && Self::inner_decrement_certifies(relative);
         Ok(FrameLiftedVerdict {
@@ -305,7 +309,7 @@ impl SaeManifoldTerm {
         let certificate = &verdict.certificate;
         log::debug!(
             "[SAE-FRAME-LIFT] lifted root: min μ {:.6e}, resolved negative {:?}, clamp \
-             explained {}, λ² {:.6e}, ½λ²/scale {:.6e}, certified {}",
+             explained {}, λ² {:.6e}, ½λ² over resolution {:.6e}, certified {}",
             certificate.min_curvature,
             certificate.resolved_negative,
             certificate.clamp_explained,
@@ -340,8 +344,8 @@ impl SaeManifoldTerm {
             return Ok(FrameLiftedRoot::Saddle);
         }
         Err(format!(
-            "frame-lifted root: ½λ²/scale = {:.6e} (λ² = {:.6e}) exceeds the decrement \
-             tolerance in the lifted chart, and no lifted step lowers the objective \
+            "frame-lifted root: ½λ² is {:.6e} times the criterion's own resolution \
+             (λ² = {:.6e}) in the lifted chart, and no lifted step lowers the objective \
              {:.10e} by more than its material floor",
             certificate.relative, certificate.lambda_sq, verdict.objective.value,
         ))

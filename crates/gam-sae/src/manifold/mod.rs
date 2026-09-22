@@ -624,6 +624,10 @@ pub fn rank_charge_dof(
 }
 
 pub use construction::{SaeCriterionError, VanishedAtoms};
+// #3355 — `SaeInstalledInnerKktAudit::newton_decrement_relative` is public and
+// carries this, so the type it is measured into is public with it. Nothing else
+// can build one: `measure` is the only constructor that takes a number.
+pub use construction::SaeDecrementAgainstResolution;
 // #2515 — the bundle-routed outer gradient's evidence geometry, named by variant.
 // #2267 — the dense evaluation's spectral block, which its derivative reads.
 pub(crate) use construction::{

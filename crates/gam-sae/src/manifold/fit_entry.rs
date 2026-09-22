@@ -331,12 +331,18 @@ pub struct SaeInstalledInnerKktAudit {
     pub quotient_gradient_norm: f64,
     pub stationarity_bound: f64,
     pub parameter_space: SaeParameterSpaceKktAudit,
-    /// `½λ²/(|f| + 1)` at the installed state, the affine-invariant certificate the
-    /// native inner solve accepts on (#2263). It is read off the deflated evidence
-    /// factor, and then off the exact information wherever that classifies the state
-    /// (#2933 F08). `Err` carries the reason the factorization failed, or why the exact
-    /// information refused the state.
-    pub newton_decrement_relative: Result<f64, String>,
+    /// `½λ²` against the criterion's own resolution at the installed state, the
+    /// affine-invariant certificate the native inner solve accepts on (#2263). It is
+    /// read off the deflated evidence factor, and then off the exact information
+    /// wherever that classifies the state (#2933 F08). `Err` carries the reason the
+    /// factorization failed, or why the exact information refused the state.
+    ///
+    /// The type changed with #3355: this used to be the bare ratio `½λ²/(|f| + 1)`,
+    /// whose denominator flipped the verdict on an additive constant in the objective.
+    /// It is now a [`SaeDecrementAgainstResolution`], which only its own constructor
+    /// can build, so the value crossing this boundary cannot be re-formed by hand at
+    /// the far end.
+    pub newton_decrement_relative: Result<SaeDecrementAgainstResolution, String>,
 }
 
 impl SaeInstalledInnerKktAudit {

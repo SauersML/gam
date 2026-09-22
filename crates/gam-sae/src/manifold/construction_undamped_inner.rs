@@ -426,7 +426,8 @@ impl SaeManifoldTerm {
         // certificate floors at ~ε (quadratic in g), 8 orders under the 1e-8
         // band, so a plateau above the band is a solver stall — reported
         // honestly at best-seen, never accepted past the band.
-        let mut best_seen: Option<(f64, f64, SaeManifoldMutableState)> = None;
+        let mut best_seen: Option<(SaeDecrementAgainstResolution, f64, SaeManifoldMutableState)> =
+            None;
         let refine_started = std::time::Instant::now();
         // #2267 — name this phase to the process monitor. gam-sae registered no
         // monitor scope, so every heartbeat of an SAE fit read `instrumented_threads=0
@@ -912,8 +913,11 @@ impl SaeManifoldTerm {
                                  limit-boundary certificate objective: {err}"
                             )
                         })?;
-                    let predicted_relative_decrease =
-                        Self::inner_relative_decrement(decrement_sq, limit_objective);
+                    let predicted_relative_decrease = SaeDecrementAgainstResolution::measure(
+                        decrement_sq,
+                        limit_objective,
+                        Self::inner_information_count(target),
+                    );
                     if Self::inner_decrement_certifies(predicted_relative_decrease) {
                         log::debug!(
                             "[SAE-ACCEPT] limit-boundary decrement certificate: ‖g‖={grad_norm:.6e} \
@@ -1175,8 +1179,11 @@ impl SaeManifoldTerm {
                             final_dt.view(),
                             final_db.view(),
                         );
-                        let excursion_cert =
-                            Self::inner_relative_decrement(newton_decrement_sq, final_objective);
+                        let excursion_cert = SaeDecrementAgainstResolution::measure(
+                            newton_decrement_sq,
+                            final_objective,
+                            Self::inner_information_count(target),
+                        );
                         // #2228 — the acceptance verdict keys on the BEST-SEEN
                         // certificate, not the excursion the polish left. The
                         // band is UNCHANGED; a best-seen plateau ABOVE it is a
@@ -1563,7 +1570,11 @@ impl SaeManifoldTerm {
                         stationary_dt.view(),
                         stationary_db.view(),
                     );
-                    let predicted_relative_decrease = 0.5 * newton_decrement_sq / objective_scale;
+                    let predicted_relative_decrease = SaeDecrementAgainstResolution::measure(
+                        newton_decrement_sq,
+                        objective_scale,
+                        Self::inner_information_count(target),
+                    );
                     log::trace!(
                         "SAE inner stall certificate: ‖g‖={stationary_grad_norm:.6e} \
                          ‖Π⊥null g‖={stationary_quotient_grad_norm:.6e} tol={grad_tolerance:.6e} \

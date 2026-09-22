@@ -5,6 +5,219 @@
 // it keeps the SAME module scope and private-field access. Keeps the tracked
 // construction.rs under the 10k limit.
 
+// The measure lives in its own module so its field is private even to the
+// `construction` module that uses it. `construction_quasi_laplace.rs` is
+// `include!`d into `construction.rs`, so a type declared at this file's top
+// level would have its tuple field in scope at exactly the three hand-formed
+// sites this type exists to stop. Inside a module, it is not.
+mod decrement_against_resolution {
+    /// `½λ²` measured against the resolution of the criterion it would decrease
+    /// (#3355). At or below one, the decrease the quadratic model promises is one
+    /// the criterion cannot report, and the iterate certifies.
+    ///
+    /// # Why this is a type and not an `f64`
+    ///
+    /// The predicate it feeds, [`SaeManifoldTerm::inner_decrement_certifies`], is
+    /// read at eight sites across this module, and its argument used to be formed
+    /// four different ways: one helper and three hand-written
+    /// `0.5 * decrement_sq / scale` expressions. Moving the bar with the argument
+    /// still an `f64` would have left those three compiling, graded against a
+    /// threshold eight orders looser, silently certifying any decrement. A type
+    /// whose only constructor is [`Self::measure`] makes each of them a compile
+    /// error instead.
+    ///
+    /// This is the shape `StationarityBound` uses in the outer engine, for the same
+    /// reason its doc gives: there is no constructor for "a number with no
+    /// standard", after an earlier escape hatch was taken by 22 of 30 refusal paths.
+    ///
+    /// # The denominator, and why the old one was not a certificate
+    ///
+    /// The measure used to be `½λ²/(|F| + 1)` against a `√εmach`-scale constant.
+    /// `rel·(1 + |V|)` is the floor #2954 retired from the outer engine, whose
+    /// `statistical_resolution` gives the reason: a decrease below
+    /// `τ_stat = 1/(2·n_eff)` "does not move with the units of `y` or with an
+    /// additive constant in `V`, which the `rel·(1 + |V|)` floor it replaces did".
+    /// Measured on #3355's `two_basin_outer_fit_engages_exact_envelope`: the fit
+    /// refused at `½λ²/scale = 1.025848e-8` against `1.0e-8`, over by 2.6%, and
+    /// **adding 5.263 to the objective turns that refusal into a pass**. An additive
+    /// constant moves neither the iterate, the step, nor the decrement, so a verdict
+    /// it flips is not a verdict about the fit.
+    ///
+    /// # The guarantee, as a control
+    ///
+    /// A number cannot become a measure. The field is private to this module, so
+    /// even the `construction` module that reads it — and that held all three
+    /// hand-formed ratios — cannot wrap one:
+    ///
+    /// ```compile_fail
+    /// use gam_sae::manifold::SaeDecrementAgainstResolution;
+    /// // `0.5 * decrement_sq / scale` is how the three retired sites formed their
+    /// // ratio. It is not a measure and cannot be made into one.
+    /// let hand_formed = SaeDecrementAgainstResolution(0.5 * 4.177716e-6 / 203.62);
+    /// ```
+    ///
+    /// ```
+    /// use gam_sae::manifold::SaeDecrementAgainstResolution;
+    /// let measured =
+    ///     SaeDecrementAgainstResolution::measure(4.177716e-6, 2.0262264951e2, Some(6_400));
+    /// assert!(measured.value().is_finite());
+    /// ```
+    #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+    pub struct SaeDecrementAgainstResolution(f64);
+
+    impl SaeDecrementAgainstResolution {
+        /// The only constructor: `½λ²` over the criterion's own resolution.
+        ///
+        /// `information_count` is the criterion's Fisher-information count `n_eff`,
+        /// from [`SaeManifoldTerm::inner_information_count`]. Every production
+        /// reader has one, because every ratio-forming site already holds the
+        /// `target` it is derived from. `None` is for a reader that has no count: it
+        /// decides at the arithmetic's own resolution, `ε·(|F| + 1)`.
+        ///
+        /// That fallback is proportional to `|F|` and so was the retired floor, and
+        /// the difference is the whole point. `ε·|F|` is the spacing of the
+        /// representable numbers near `F`, so a criterion carrying a larger additive
+        /// constant genuinely IS resolved more coarsely. A chosen relative tolerance
+        /// of `1e-8` is not a resolution of anything, and inherited the sensitivity
+        /// without the justification.
+        ///
+        /// A non-finite `F` has no resolution to measure a decrease against, so the
+        /// measure is NaN and the certificate refuses. Returning `0` there would
+        /// certify every decrement.
+        pub fn measure(
+            decrement_sq: f64,
+            objective: f64,
+            information_count: Option<usize>,
+        ) -> Self {
+            if !objective.is_finite() {
+                return Self(f64::NAN);
+            }
+            let resolution = match information_count {
+                Some(n_eff) if n_eff > 0 => 0.5 / n_eff as f64,
+                _ => f64::EPSILON * (objective.abs() + 1.0),
+            };
+            Self(0.5 * decrement_sq / resolution)
+        }
+
+        /// The measure of a state whose objective scale could not be formed, so no
+        /// decrease was measured against anything.
+        ///
+        /// This is the ONE named value that is not a measurement, and it exists
+        /// because the best-seen tracker needs an initial element that loses every
+        /// comparison. It cannot certify: `inner_decrement_certifies` requires a
+        /// finite value. It is deliberately not a general escape hatch — there is
+        /// still no way to wrap an arbitrary `f64`.
+        pub fn refusing() -> Self {
+            Self(f64::INFINITY)
+        }
+
+        /// The measured ratio, for reporting. Certification goes through
+        /// [`SaeManifoldTerm::inner_decrement_certifies`], never through this.
+        pub fn value(self) -> f64 {
+            self.0
+        }
+    }
+
+    impl std::fmt::LowerExp for SaeDecrementAgainstResolution {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::LowerExp::fmt(&self.0, f)
+        }
+    }
+}
+
+pub use decrement_against_resolution::SaeDecrementAgainstResolution;
+
+#[cfg(test)]
+mod decrement_against_resolution_3355_tests {
+    use super::{SaeDecrementAgainstResolution, SaeManifoldTerm};
+
+    /// The defect this type was introduced for, as a control (#3355).
+    ///
+    /// `two_basin_outer_fit_engages_exact_envelope` refused at
+    /// `½λ²/scale = 1.025848e-8` against `1.0e-8`, over by 2.6%, on an objective of
+    /// `2.0262264951e2`. Under the retired denominator `|F| + 1`, certifying needed
+    /// the scale to reach `208.8858`, so adding `5.263` to the objective flipped the
+    /// refusal to a pass. Nothing about the iterate, the step or the decrement moves
+    /// when a constant is added to the criterion, so a verdict that moves is not a
+    /// verdict about the fit.
+    #[test]
+    fn an_additive_constant_in_the_objective_cannot_move_the_verdict_3355() {
+        const DECREMENT_SQ: f64 = 4.177716e-6;
+        const OBJECTIVE: f64 = 2.0262264951e2;
+        // The shift measured to flip the retired floor, and three that bracket it.
+        for shift in [0.0, 5.263, 50.0, 1.0e4] {
+            for n_eff in [64usize, 6_400, 640_000] {
+                let here =
+                    SaeDecrementAgainstResolution::measure(DECREMENT_SQ, OBJECTIVE, Some(n_eff));
+                let shifted = SaeDecrementAgainstResolution::measure(
+                    DECREMENT_SQ,
+                    OBJECTIVE + shift,
+                    Some(n_eff),
+                );
+                assert_eq!(
+                    here.value(),
+                    shifted.value(),
+                    "n_eff={n_eff}: adding {shift} to the objective moved the measure from \
+                     {:.6e} to {:.6e}; the denominator is reading the criterion's value again",
+                    here.value(),
+                    shifted.value(),
+                );
+                assert_eq!(
+                    SaeManifoldTerm::inner_decrement_certifies(here),
+                    SaeManifoldTerm::inner_decrement_certifies(shifted),
+                    "n_eff={n_eff}: adding {shift} to the objective moved the VERDICT"
+                );
+            }
+        }
+    }
+
+    /// The measure is `½λ²` in units of the resolution, so it certifies exactly when
+    /// the promised decrease is one the criterion cannot report.
+    #[test]
+    fn the_measure_is_the_decrement_in_units_of_the_resolution_3355() {
+        const N_EFF: usize = 6_400;
+        let tau_stat = 0.5 / N_EFF as f64;
+        let at = SaeDecrementAgainstResolution::measure(2.0 * tau_stat, 1.0, Some(N_EFF));
+        assert_eq!(at.value(), 1.0, "½λ² = τ_stat must measure as exactly one");
+        assert!(SaeManifoldTerm::inner_decrement_certifies(at));
+        let above = SaeDecrementAgainstResolution::measure(4.0 * tau_stat, 1.0, Some(N_EFF));
+        assert_eq!(above.value(), 2.0);
+        assert!(!SaeManifoldTerm::inner_decrement_certifies(above));
+    }
+
+    /// The NaN guard the retired helper carried, preserved: a non-finite objective
+    /// has no resolution to measure against, and `0` would certify every decrement.
+    #[test]
+    fn a_non_finite_objective_refuses_3355() {
+        for objective in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            for decrement_sq in [0.0, 1.0e-12, 1.0, 1.0e12] {
+                let measured =
+                    SaeDecrementAgainstResolution::measure(decrement_sq, objective, Some(64));
+                assert!(
+                    measured.value().is_nan(),
+                    "objective {objective} must measure NaN"
+                );
+                assert!(
+                    !SaeManifoldTerm::inner_decrement_certifies(measured),
+                    "objective {objective}, λ² {decrement_sq}: a non-finite objective certified"
+                );
+            }
+        }
+    }
+
+    /// The one named non-measurement loses every comparison and certifies nothing.
+    #[test]
+    fn the_refusing_measure_cannot_certify_3355() {
+        let refusing = SaeDecrementAgainstResolution::refusing();
+        assert!(!SaeManifoldTerm::inner_decrement_certifies(refusing));
+        let measured = SaeDecrementAgainstResolution::measure(1.0e-12, 1.0, Some(64));
+        assert!(
+            measured < refusing,
+            "a measurement must beat the refusing element"
+        );
+    }
+}
+
 /// One coherent matrix-free outer sample. The value, factor cache, reduced
 /// operator, and lossless rational derivative are all emitted by the same
 /// frozen surrogate evaluation, so no consumer can accidentally differentiate
@@ -795,7 +1008,7 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         registry: Option<&AnalyticPenaltyRegistry>,
         penalized_gram_scale: &[f64],
-        best_seen: &mut Option<(f64, f64, SaeManifoldMutableState)>,
+        best_seen: &mut Option<(SaeDecrementAgainstResolution, f64, SaeManifoldMutableState)>,
         max_rounds: usize,
     ) -> Result<GaugeOrbitDescent, String> {
         let outcome =
@@ -1259,6 +1472,9 @@ impl SaeManifoldTerm {
     }
 
     /// The affine-invariant inner acceptance certificate (#2226/#2228/#2253).
+    /// Reads [`SaeDecrementAgainstResolution`], which only
+    /// [`SaeDecrementAgainstResolution::measure`] can build, so a hand-formed
+    /// ratio cannot reach this predicate (#3355).
     /// `relative_decrease` is `½λ²/scale`, with `λ² = −gᵀΔ` the Newton decrement
     /// on the deflated exact factor and `scale` the objective scale. At or below
     /// the stall detector's no-meaningful-change band, no step lowers the
@@ -1267,22 +1483,23 @@ impl SaeManifoldTerm {
     /// and final-gate acceptances and the installed-state audit all read this
     /// one predicate, so a state the native inner solve accepts is a state the
     /// zero-step audit accepts (#2263).
-    pub(crate) fn inner_decrement_certifies(relative_decrease: f64) -> bool {
-        relative_decrease.is_finite()
-            && relative_decrease <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
+    pub(crate) fn inner_decrement_certifies(measured: SaeDecrementAgainstResolution) -> bool {
+        let value = measured.value();
+        value.is_finite() && value <= 1.0
     }
 
-    /// The `½λ²/scale` ratio [`Self::inner_decrement_certifies`] reads, with the
-    /// objective scale `|F| + 1` of the penalized objective `F` at the iterate.
-    /// A non-finite `F` has no scale to measure a decrease against, so the ratio
-    /// is NaN and the certificate refuses. Dividing by an infinite scale instead
-    /// would drive the ratio to 0 and certify any finite decrement.
-    pub(crate) fn inner_relative_decrement(decrement_sq: f64, objective: f64) -> f64 {
-        if objective.is_finite() {
-            0.5 * decrement_sq / (objective.abs() + 1.0)
-        } else {
-            f64::NAN
-        }
+    /// The criterion's Fisher-information count `n_eff` for a target block.
+    ///
+    /// Not the row count. The penalized objective sums over the target's SCALAR
+    /// entries — `seed_reconstruction_dispersion` divides its RSS by
+    /// `nrows * ncols` — so the count the resolution is charged at is
+    /// `nrows * ncols`, and `n_obs()` would overstate the resolution by a factor
+    /// of `ncols`.
+    pub(crate) fn inner_information_count(target: ArrayView2<'_, f64>) -> Option<usize> {
+        target
+            .nrows()
+            .checked_mul(target.ncols())
+            .filter(|n| *n > 0)
     }
 
     /// `λ² = −gᵀΔ` of an inner acceptance factor's step, as the decrement
@@ -1331,14 +1548,13 @@ impl SaeManifoldTerm {
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
         registry: Option<&AnalyticPenaltyRegistry>,
-    ) -> Result<f64, String> {
+    ) -> Result<SaeDecrementAgainstResolution, String> {
         let options = self.evidence_factor_options();
         let lambda_smooth = rho.lambda_smooth_vec().map_err(|err| err.to_string())?;
-        let scale = self
+        let objective = self
             .penalized_objective_total(target, rho, registry, 1.0)
-            .map_err(|err| err.to_string())?
-            .abs()
-            + 1.0;
+            .map_err(|err| err.to_string())?;
+        let information_count = Self::inner_information_count(target);
         let mut sys = self
             .assemble_arrow_schur(target, rho, registry)
             .map_err(|err| err.to_string())?;
@@ -1355,7 +1571,8 @@ impl SaeManifoldTerm {
                 "installed-state Newton decrement is not a certificate: λ²={decrement_sq:e}"
             ));
         }
-        let majorizer_relative = 0.5 * decrement_sq / scale;
+        let majorizer_relative =
+            SaeDecrementAgainstResolution::measure(decrement_sq, objective, information_count);
         if !Self::inner_decrement_certifies(majorizer_relative) {
             return Ok(majorizer_relative);
         }
@@ -1502,7 +1719,7 @@ impl SaeManifoldTerm {
         // merit is monotone; it remains the CALLER's accumulator across rounds
         // and across the other movers, and is left keyed on the caller's own
         // acceptance currency.
-        best_seen: &mut Option<(f64, f64, SaeManifoldMutableState)>,
+        best_seen: &mut Option<(SaeDecrementAgainstResolution, f64, SaeManifoldMutableState)>,
     ) -> Result<bool, String> {
         let mut made_progress = false;
         // Warm-carried Levenberg--Marquardt damping. `0` is the undamped exact
@@ -1580,11 +1797,15 @@ impl SaeManifoldTerm {
                 factor.delta_beta.view(),
             );
             let cert = if objective_scale.is_finite() && objective_scale > 0.0 {
-                0.5 * decrement_sq / objective_scale
+                SaeDecrementAgainstResolution::measure(
+                    decrement_sq,
+                    objective_scale,
+                    Self::inner_information_count(target),
+                )
             } else {
-                f64::INFINITY
+                SaeDecrementAgainstResolution::refusing()
             };
-            if cert.is_finite() && best_seen.as_ref().is_none_or(|(c, _, _)| cert < *c) {
+            if cert.value().is_finite() && best_seen.as_ref().is_none_or(|(c, _, _)| cert < *c) {
                 *best_seen = Some((cert, grad_norm, self.snapshot_mutable_state()));
             }
             // #2472 — one line per Newton step, so a criterion evaluation that

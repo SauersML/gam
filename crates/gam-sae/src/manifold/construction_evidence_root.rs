@@ -770,7 +770,11 @@ impl SaeManifoldTerm {
             .map(|index| coefficients[index] * coefficients[index] / block.eigenvalues[index])
             .sum::<f64>();
         let objective = self.penalized_objective_total(target, rho, registry, 1.0)?;
-        let relative = Self::inner_relative_decrement(lambda_sq, objective);
+        let relative = SaeDecrementAgainstResolution::measure(
+            lambda_sq,
+            objective,
+            Self::inner_information_count(target),
+        );
         Ok(if Self::inner_decrement_certifies(relative) {
             RefinedRootVerdict::Certified {
                 lambda_sq,
@@ -790,8 +794,12 @@ impl SaeManifoldTerm {
 #[derive(Clone, Debug, PartialEq)]
 enum RefinedRootVerdict {
     /// Every resolved direction is positive, and the exact
-    /// decrement is within the decrement tolerance (`relative = ½λ²/scale`).
-    Certified { lambda_sq: f64, relative: f64 },
+    /// decrement is within the decrement tolerance (`relative` is `½λ²` over the
+    /// criterion's own resolution; #3355).
+    Certified {
+        lambda_sq: f64,
+        relative: SaeDecrementAgainstResolution,
+    },
     /// Resolved negative directions the concave clamp explains (#2333): the refinement's gate
     /// stands.
     ClampBasin { negative: usize },
@@ -808,7 +816,10 @@ enum RefinedRootRefusal {
     /// A resolved negative direction the concave clamp does not explain: a saddle.
     NotPositiveDefinite(ResolvedNegativeCurvature),
     /// The exact decrement over the resolved directions exceeds the decrement tolerance.
-    DecrementAboveTolerance { lambda_sq: f64, relative: f64 },
+    DecrementAboveTolerance {
+        lambda_sq: f64,
+        relative: SaeDecrementAgainstResolution,
+    },
     /// The dense exact information, its pencil or its classification could not be formed.
     DenseGeometry(String),
 }
@@ -842,7 +853,7 @@ impl std::fmt::Display for RefinedRootVerdict {
                 relative,
             } => write!(
                 formatter,
-                "exact decrement λ²={lambda_sq:.6e}, ½λ²/scale {relative:.6e}"
+                "exact decrement λ²={lambda_sq:.6e}, ½λ² over resolution {relative:.6e}"
             ),
             Self::ClampBasin { negative } => write!(
                 formatter,
@@ -864,7 +875,7 @@ impl std::fmt::Display for RefinedRootVerdict {
                 relative,
             }) => write!(
                 formatter,
-                "exact decrement λ²={lambda_sq:.6e}, ½λ²/scale {relative:.6e}, exceeds the \
+                "exact decrement λ²={lambda_sq:.6e}, ½λ² over resolution {relative:.6e}, exceeds the \
                  decrement tolerance"
             ),
             Self::Refused(RefinedRootRefusal::DenseGeometry(err)) => {
