@@ -1964,9 +1964,10 @@ mod dominant_holder_tests {
         // request succeeds. A leak here would refuse every later caller in the name of a
         // reservation that is gone.
         drop(neighbour);
-        governor
+        let admitted = governor
             .try_reserve(200, "a tiny read that fits an empty ledger")
             .expect("the released bytes are available again");
+        assert_eq!(admitted.bytes(), 200, "the admitted reservation holds exactly what it asked for");
     }
 
     /// The holder named is the largest live one, the one whose release would most change
