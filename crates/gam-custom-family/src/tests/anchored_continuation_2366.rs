@@ -14,7 +14,7 @@
 use super::*;
 use crate::fit::{
     AnchoredContinuationRefusal, ContinuationRefinement, anchored_continuation_seed,
-    continuation_refinement_decision,
+    coefficient_objective_homotopy_seed, continuation_refinement_decision,
 };
 use crate::penalty_labels::penalty_label_layout_with_joint;
 use crate::test_support::outerobjectivegradienthessian_labeled;
@@ -42,14 +42,50 @@ use crate::test_support::outerobjectivegradienthessian_labeled;
 struct TiltedDoubleWellFamily {
     tilt: f64,
     outer_curvature_calls: Option<Arc<AtomicUsize>>,
+    /// `Some(t)` on a homotopy member at progress `t`, `None` on the production
+    /// family — which evaluates its expressions term for term as it always has, so
+    /// every other fixture in this file reads bit-identical arithmetic (gam#2661).
+    homotopy_progress: Option<f64>,
+    /// Counts every homotopy member this family is asked to construct, and every
+    /// ZERO member separately, so a test can count the zero-member solves one ladder
+    /// pays. `None` offers no homotopy at all, which is what every other fixture here
+    /// wants: the seed tries the objective homotopy BEFORE the anchored continuation.
+    homotopy_builds: Option<Arc<AtomicUsize>>,
+    homotopy_zero_builds: Option<Arc<AtomicUsize>>,
 }
+
+/// The convexifier a homotopy member blends the double well into, so the zero
+/// member's coefficient mode is unique as the homotopy contract requires: at
+/// `progress = 0` the objective is `c·β + κ·β²` with `κ > 0`, whose observed
+/// information `2κ` is positive definite on its own.
+const HOMOTOPY_CONVEXIFIER: f64 = 2.0;
 
 impl TiltedDoubleWellFamily {
     fn new(tilt: f64) -> Self {
         Self {
             tilt,
             outer_curvature_calls: None,
+            homotopy_progress: None,
+            homotopy_builds: None,
+            homotopy_zero_builds: None,
         }
+    }
+
+    /// The same family, offering the Jeffreys-style objective homotopy and counting
+    /// what it is asked to build.
+    fn with_homotopy(tilt: f64, builds: &Arc<AtomicUsize>, zero_builds: &Arc<AtomicUsize>) -> Self {
+        Self {
+            homotopy_builds: Some(Arc::clone(builds)),
+            homotopy_zero_builds: Some(Arc::clone(zero_builds)),
+            ..Self::new(tilt)
+        }
+    }
+
+    /// `(quartic weight, convexifier weight)` at a homotopy member, `None` on the
+    /// production family.
+    fn homotopy_weights(&self) -> Option<(f64, f64)> {
+        self.homotopy_progress
+            .map(|progress| (progress, (1.0 - progress) * HOMOTOPY_CONVEXIFIER))
     }
 
     fn beta(block_states: &[ParameterBlockState]) -> Result<f64, String> {
@@ -67,6 +103,21 @@ impl CustomFamily for TiltedDoubleWellFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         let beta = Self::beta(block_states)?;
         let well = beta * beta - 1.0;
+        if let Some((quartic, convex)) = self.homotopy_weights() {
+            return Ok(FamilyEvaluation {
+                log_likelihood: -(quartic * well * well + self.tilt * beta + convex * beta * beta),
+                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                    gradient: array![
+                        -(quartic * (4.0 * beta * beta * beta - 4.0 * beta)
+                            + self.tilt
+                            + 2.0 * convex * beta)
+                    ],
+                    hessian: SymmetricMatrix::Dense(array![[
+                        quartic * (12.0 * beta * beta - 4.0) + 2.0 * convex
+                    ]]),
+                }],
+            });
+        }
         Ok(FamilyEvaluation {
             log_likelihood: -(well * well + self.tilt * beta),
             blockworking_sets: vec![BlockWorkingSet::ExactNewton {
@@ -75,6 +126,27 @@ impl CustomFamily for TiltedDoubleWellFamily {
                 hessian: SymmetricMatrix::Dense(array![[12.0 * beta * beta - 4.0]]),
             }],
         })
+    }
+
+    fn coefficient_mode_homotopy_member(&self, progress: f64) -> Result<Option<Self>, String> {
+        if !progress.is_finite() || !(0.0..=1.0).contains(&progress) {
+            return Err(format!(
+                "tilted double-well homotopy progress must lie in [0, 1], got {progress}"
+            ));
+        }
+        let Some(builds) = self.homotopy_builds.as_ref() else {
+            return Ok(None);
+        };
+        builds.fetch_add(1, Ordering::Relaxed);
+        if progress == 0.0
+            && let Some(zero_builds) = self.homotopy_zero_builds.as_ref()
+        {
+            zero_builds.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Some(Self {
+            homotopy_progress: Some(progress),
+            ..self.clone()
+        }))
     }
 
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
@@ -86,6 +158,11 @@ impl CustomFamily for TiltedDoubleWellFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
         let beta = Self::beta(block_states)?;
+        if let Some((quartic, convex)) = self.homotopy_weights() {
+            return Ok(Some(array![[
+                quartic * (12.0 * beta * beta - 4.0) + 2.0 * convex
+            ]]));
+        }
         Ok(Some(array![[12.0 * beta * beta - 4.0]]))
     }
 
@@ -96,6 +173,9 @@ impl CustomFamily for TiltedDoubleWellFamily {
     ) -> Result<Option<Array2<f64>>, String> {
         let beta = Self::beta(block_states)?;
         let step = direction.first().copied().unwrap_or(0.0);
+        if let Some((quartic, _)) = self.homotopy_weights() {
+            return Ok(Some(array![[quartic * 24.0 * beta * step]]));
+        }
         Ok(Some(array![[24.0 * beta * step]]))
     }
 
@@ -108,8 +188,14 @@ impl CustomFamily for TiltedDoubleWellFamily {
         };
         calls.fetch_add(1, Ordering::Relaxed);
         let beta = Self::beta(block_states)?;
+        let hessian = match self.homotopy_weights() {
+            Some((quartic, convex)) => {
+                array![[quartic * (12.0 * beta * beta - 4.0) + 2.0 * convex]]
+            }
+            None => array![[12.0 * beta * beta - 4.0]],
+        };
         Ok(Some(ExactNewtonOuterCurvature {
-            hessian: array![[12.0 * beta * beta - 4.0]],
+            hessian,
             rho_curvature_scale: 1.0,
             hessian_logdet_correction: 0.0,
         }))
@@ -441,8 +527,8 @@ fn double_well_options() -> BlockwiseFitOptions {
 fn continuation_corrector_builds_only_the_coefficient_product_2714() {
     let outer_curvature_calls = Arc::new(AtomicUsize::new(0));
     let family = TiltedDoubleWellFamily {
-        tilt: TILT,
         outer_curvature_calls: Some(Arc::clone(&outer_curvature_calls)),
+        ..TiltedDoubleWellFamily::new(TILT)
     };
     let specs = vec![double_well_spec(-2.0)];
     let options = double_well_options();
@@ -839,6 +925,66 @@ fn the_kept_anchor_mode_answers_only_its_own_anchor_2928() {
             .at(&array![-0.0])
             .is_none(),
         "a zero of the other sign is a different anchor"
+    );
+}
+
+/// gam#2661/#2928: the objective-homotopy ladder solves its ZERO member ONCE, not once
+/// per refinement.
+///
+/// `2c68304d2c` established this for the sibling anchored ladder: every sweep's step 0
+/// corrects the same problem from the same cold start, so each refinement repeated one
+/// deterministic computation. The homotopy ladder's step 0 has the identical property —
+/// the member at progress `0.0`, at the same `ρ`, with no predecessor to carry, since
+/// step 0 is where the carry begins — and did not have the fix.
+///
+/// Counting member CONSTRUCTIONS counts zero-member solves exactly: a sweep builds the
+/// member immediately before correcting it, and a sweep that reads the kept mode builds
+/// nothing. One construction belongs to the seed's own availability gate, so the ladder's
+/// zero-member solves are `zero − 1`.
+#[test]
+fn the_homotopy_ladder_solves_its_zero_member_once_2661() {
+    let builds = Arc::new(AtomicUsize::new(0));
+    let zero_builds = Arc::new(AtomicUsize::new(0));
+    let family = TiltedDoubleWellFamily::with_homotopy(TILT, &builds, &zero_builds);
+    let specs = vec![double_well_spec(-2.0)];
+    let options = double_well_options();
+    let penalty_counts: Vec<usize> = specs.iter().map(|spec| spec.penalties.len()).collect();
+    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
+        .expect("single-penalty label layout");
+
+    let seed = coefficient_objective_homotopy_seed(
+        &family,
+        &specs,
+        &options,
+        &layout,
+        &gam_problem::RhoPrior::Flat,
+        &array![-2.0],
+    );
+    let verdict = match &seed {
+        Ok(Some(certified)) => format!("certified at {} steps", certified.certificate.steps),
+        Ok(None) => "no homotopy offered".to_string(),
+        Err(refusal) => format!("declined: {refusal}"),
+    };
+    let total = builds.load(Ordering::Relaxed);
+    let zero = zero_builds.load(Ordering::Relaxed);
+
+    // CONTROL, and it does not read the ladder's verdict — the count below must
+    // discriminate whether the ladder certifies or spends its budget. A sweep at `s`
+    // steps builds members at progress `1/s … (s−1)/s`, since the target waypoint uses
+    // the family itself, plus the zero member on whichever sweep solves it. So sweeps at
+    // 1, 2 and 4 steps build `1 (gate) + 1 (zero) + 0 + 1 + 3 = 6`, while two sweeps
+    // build 3. More than four constructions therefore proves at least three sweeps ran,
+    // and an unfixed ladder would have solved the zero member once in each of them.
+    assert!(
+        total > 4,
+        "the ladder must run more than two sweeps or this test cannot discriminate \
+         (member constructions: {total}, {verdict})"
+    );
+    assert_eq!(
+        zero, 2,
+        "the zero member must be built twice — once by the seed's availability gate and \
+         once by the ladder's single solve — but was built {zero} times across {total} \
+         member constructions ({verdict})"
     );
 }
 

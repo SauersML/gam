@@ -1957,6 +1957,7 @@ pub(crate) fn coefficient_objective_homotopy_seed<
         layout,
         rho_prior,
         rho,
+        zero_member: std::cell::OnceCell::new(),
     };
     certify_refined_continuation(&path, options, true).map(Some)
 }
@@ -1968,6 +1969,143 @@ struct CoefficientObjectiveHomotopyPath<'a, F> {
     layout: &'a PenaltyLabelLayout,
     rho_prior: &'a gam_problem::RhoPrior,
     rho: &'a Array1<f64>,
+    /// The zero member's corrected mode, once a sweep has solved it.
+    zero_member: std::cell::OnceCell<HomotopyZeroMemberWaypoint>,
+}
+
+/// The corrected mode at the homotopy's zero member, kept for the ladder's later
+/// sweeps (gam#2661), with the values its trail line reports.
+///
+/// This is the sibling of [`AnchorWaypointMode`], for the sibling ladder, and it
+/// exists for the identical reason. Every sweep's step 0 corrects the SAME family
+/// member — [`CustomFamily::coefficient_mode_homotopy_member`] at progress `0.0` —
+/// at the SAME `ρ`, from the SAME cold start, because step 0 carries no predecessor.
+/// Those are all the inputs the solve reads, and every one of them is a shared borrow
+/// of the path or a constant, so each refinement repeated one deterministic
+/// computation. A ladder that spends its whole budget repeats it five times.
+///
+/// Uniqueness is not what makes this safe, although the contract supplies it
+/// (`coefficient_mode_homotopy_member`'s zero member "must have a uniquely selected
+/// coefficient mode"). Determinism on identical inputs is: the kept mode is the one
+/// a re-solve would return, bit for bit. Every LATER waypoint is still corrected
+/// afresh in each refinement, so the refinements stay independent wherever a branch
+/// can be chosen — which is what the ladder's agreement test is about.
+///
+/// The mode is keyed by `ρ`'s bits through [`AnchorWaypointMode`], so a path at a `ρ`
+/// that does not match them solves rather than reads.
+struct HomotopyZeroMemberWaypoint {
+    mode: AnchorWaypointMode,
+    log_likelihood: f64,
+    penalty_value: f64,
+    cycles: usize,
+    converged: bool,
+}
+
+impl<F: CustomFamily + Clone + Send + Sync + 'static> CoefficientObjectiveHomotopyPath<'_, F> {
+    /// The zero member's corrected mode at `ρ`: solved by the first sweep, read by the
+    /// rest, with the trail line reported either way so the per-waypoint trail reads the
+    /// same on every sweep.
+    fn zero_member_waypoint(
+        &self,
+        steps: usize,
+    ) -> Result<ConstrainedWarmStart, AnchoredContinuationRefusal> {
+        let kept = self.zero_member.get().and_then(|kept| {
+            kept.mode.at(self.rho).map(|mode| HomotopyZeroMemberTrail {
+                warm_start: mode.clone(),
+                log_likelihood: kept.log_likelihood,
+                penalty_value: kept.penalty_value,
+                cycles: kept.cycles,
+                converged: kept.converged,
+            })
+        });
+        let solved = match kept {
+            Some(kept) => kept,
+            None => {
+                let member = self
+                    .family
+                    .coefficient_mode_homotopy_member(0.0)
+                    .map_err(|reason| {
+                        AnchoredContinuationRefusal::HomotopyMemberConstructionFailed {
+                            steps,
+                            waypoint_index: 0,
+                            progress: 0.0,
+                            reason,
+                        }
+                    })?
+                    .ok_or(AnchoredContinuationRefusal::HomotopyMemberUnavailable {
+                        steps,
+                        waypoint_index: 0,
+                        progress: 0.0,
+                    })?;
+                let (inner, warm_start) = correct_labeled_coefficient_mode(
+                    &member,
+                    self.specs,
+                    self.options,
+                    self.layout,
+                    self.rho,
+                    None,
+                )
+                .map_err(|error| {
+                    AnchoredContinuationRefusal::WaypointEvaluationFailed {
+                        steps,
+                        waypoint_index: 0,
+                        reason: error.to_string(),
+                    }
+                })?;
+                let solved = HomotopyZeroMemberTrail {
+                    warm_start,
+                    log_likelihood: inner.log_likelihood,
+                    penalty_value: inner.penalty_value,
+                    cycles: inner.cycles,
+                    converged: inner.converged,
+                };
+                // The solve above is what this sweep returns, whether or not it is the
+                // one that gets published: a cell already holding a mode keeps it, and
+                // this path's `ρ` is one immutable borrow for the path's whole life, so
+                // a filled cell that did not answer above cannot arise here.
+                if self
+                    .zero_member
+                    .set(HomotopyZeroMemberWaypoint {
+                        mode: AnchorWaypointMode::new(self.rho, solved.warm_start.clone()),
+                        log_likelihood: solved.log_likelihood,
+                        penalty_value: solved.penalty_value,
+                        cycles: solved.cycles,
+                        converged: solved.converged,
+                    })
+                    .is_err()
+                {
+                    log::trace!(
+                        "[2661] the homotopy ladder's zero member was already published for \
+                         another rho; this sweep uses the mode it solved"
+                    );
+                }
+                solved
+            }
+        };
+        log::debug!(
+            "[OUTER] coefficient-objective homotopy: steps={steps} waypoint=0 \
+             progress=0.000000 inner_merit={:.9e} |eta|inf={:.6e} \
+             inner(loglik={} penalty={} cycles={} converged={}) \
+             (zero member, solved once per ladder)",
+            -solved.log_likelihood + solved.penalty_value,
+            waypoint_eta_sup_norm(self.specs, &solved.warm_start),
+            solved.log_likelihood,
+            solved.penalty_value,
+            solved.cycles,
+            solved.converged,
+        );
+        Ok(solved.warm_start)
+    }
+}
+
+/// One zero-member waypoint's mode and the values its trail line reports, as the sweep
+/// returns them whether it solved them or read them.
+struct HomotopyZeroMemberTrail {
+    warm_start: ConstrainedWarmStart,
+    log_likelihood: f64,
+    penalty_value: f64,
+    cycles: usize,
+    converged: bool,
 }
 
 impl<F: CustomFamily + Clone + Send + Sync + 'static> RefinedContinuationPath
@@ -1977,6 +2115,14 @@ impl<F: CustomFamily + Clone + Send + Sync + 'static> RefinedContinuationPath
         let mut carried: Option<ConstrainedWarmStart> = None;
         for step in 0..=steps {
             let progress = step as f64 / steps as f64;
+            // Step 0 corrects the zero member at `ρ` from a cold start, the same
+            // computation in every sweep, so it runs once per ladder
+            // ([`HomotopyZeroMemberWaypoint`]). It is always interior: the ladder starts
+            // at `steps = 1` and doubles, so `0 < steps` on every sweep.
+            if step == 0 && step < steps {
+                carried = Some(self.zero_member_waypoint(steps)?);
+                continue;
+            }
             let member = if step == steps {
                 self.family.clone()
             } else {
