@@ -71,7 +71,7 @@ pub(super) fn polish_the_mint(
     context: &str,
     result: &mut OuterResult,
     inputs: MintPolish<'_>,
-) -> Result<OuterCriterionCertificate, EstimationError> {
+) -> Result<Option<OuterCriterionCertificate>, EstimationError> {
     let MintPolish {
         allow_certify_reseed,
         fidelity,
@@ -156,7 +156,8 @@ pub(super) fn polish_the_mint(
                     taken,
                     cost,
                     evidence,
-                );
+                )
+                .map(Some);
             }
             Err(reason) => {
                 backtrack_unresolved = true;
@@ -288,7 +289,8 @@ pub(super) fn polish_the_mint(
                     taken,
                     cost,
                     evidence,
-                );
+                )
+                .map(Some);
             }
             Err(reason) => {
                 backtrack_unresolved = true;
@@ -316,6 +318,42 @@ pub(super) fn polish_the_mint(
         refusal_source = StationarityBoundSource::NewtonBacktrackUnresolved;
     }
     result.final_hessian = analytic_hessian.clone();
+    if matches!(
+        refusal_source,
+        StationarityBoundSource::NewtonBacktrackUnresolved
+    ) {
+        // #3228 — the decrement promised a decrease the criterion does not deliver
+        // along the Newton direction, so it is not evidence about this iterate and
+        // must not refuse it. The caller's first-order ladder decides instead.
+        //
+        // #3012 typed this refusal by the backtrack, on the reading that the
+        // decrement is the trustworthy party and the criterion failed to deliver.
+        // The measured line says otherwise. On the #3228 face fixture the polish
+        // produced a contracting Newton sequence — ΔV per step 9.513e-7, 2.378e-7,
+        // 1.486e-8, 3.716e-9, falling 4.0x, 16.0x, 4.0x and stopping at 1.85x
+        // `band_f` — on a positive-definite reduced Hessian with zero rails, while
+        // the model promised `½λ̂² = 4.988e-1` and the full step RAISED the
+        // criterion by 7.307e-1. A model whose step goes uphill by more than it
+        // promised to go down is falsified at the point it is judging, and a
+        // certificate minted from it is evidence about the model, not the iterate.
+        //
+        // Falling through cannot certify anything the gradient contradicts: a
+        // genuinely non-stationary point refuses on `|Pg|` against the coordinate
+        // band, which is the standard it should have been held to once the
+        // decrement went mute. What changes is only that the fit stops being
+        // refused by a number the criterion has already contradicted.
+        log::debug!(
+            "[CERTIFICATE] {context}: the Newton decrement is not evidence here \
+             (λ̂²={:.3e} > tolerance={:.3e}, band_f={:.3e}, {} step(s) on this face, \
+             ΔV {:?}): {stopped}. Deferring to the first-order ladder (#3228).",
+            evidence.lambda_sq,
+            evidence.tolerance,
+            evidence.band_f,
+            record.decreases.len() - face_start,
+            record.decreases,
+        );
+        return Ok(None);
+    }
     Err(outer_nonconvergence_error(
         context,
         &format!(

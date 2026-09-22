@@ -4501,8 +4501,16 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     }
 
     // #2954: a resolvable decrement at the mint is polished, railed at a limit
-    // model, or refused by name (`newton_polish::polish_the_mint`); it never
-    // reaches the first-order ladder below.
+    // model, or refused by name (`newton_polish::polish_the_mint`).
+    //
+    // #3228 — with ONE exception, which is why this returns an `Option`. When the
+    // polish backtracks along its Newton step and finds nothing that lowers the
+    // criterion by more than `band_f`, the decrement has promised a decrease the
+    // criterion does not deliver along that direction, so it is not evidence about
+    // this iterate. The polish returns `None` there and the point falls through to
+    // the first-order ladder below, which certifies it on `|Pg|` against the
+    // coordinate band or refuses it on the same, rather than on a number the
+    // criterion has contradicted.
     if matches!(fidelity, CertificationFidelity::Mint)
         && let Some((decision, _)) = decrement_decided.as_ref()
         && let Some(evidence) = resolvable_decrease_evidence(&decision.verdict)
@@ -4522,7 +4530,11 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             stationarity_bound,
             bound_source,
         };
-        return super::newton_polish::polish_the_mint(obj, config, context, result, inputs);
+        if let Some(certificate) =
+            super::newton_polish::polish_the_mint(obj, config, context, result, inputs)?
+        {
+            return Ok(certificate);
+        }
     }
 
     // #2568 -- the caller's requirement caps the ladder's TOP, after every
