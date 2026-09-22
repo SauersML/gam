@@ -1,9 +1,13 @@
 """Shared fixtures for the pyGAM-oracle translation suite (runs against the installed gamfit wheel).
 
-Datasets are pyGAM's own CSVs (copied to ./data) loaded via pygam.datasets so the
-inputs are byte-identical to what pyGAM's tests use.
+Datasets are pyGAM's own CSVs, vendored in ./data from pyGAM v0.12.0 (the version the
+bench venv pins; see data/README.md) and loaded via pygam.datasets, so the inputs are
+byte-identical to what pyGAM's tests use. The pygam wheel ships the loaders without the
+CSVs, which is why they are vendored.
+
+The helpers the tests call live in ``pg_helpers``: under pyproject's
+``--import-mode=importlib`` this file is never importable as ``conftest``.
 """
-import inspect
 import os
 import warnings
 
@@ -20,32 +24,6 @@ _L.PATH = os.path.join(HERE, "data")
 from pygam import datasets as _ds  # noqa: E402
 
 import gamfit  # noqa: E402
-
-
-def pdep(model, term, data, grid=None, n_points=100):
-    """partial_dependence across wheel (term, data, grid) and HEAD (term, grid) signatures,
-    as the wheel's dict: HEAD returns a gamfit.PartialEffect, read here by the same keys."""
-    params = inspect.signature(model.partial_dependence).parameters
-    if "data" in params:
-        return model.partial_dependence(term, data, grid=grid, n_points=n_points)
-    effect = model.partial_dependence(term, grid=grid, n_points=n_points)
-    if isinstance(effect, dict):
-        return effect
-    return {
-        "grid": effect.x if len(effect.axes) == 1 else effect.grid,
-        "axes": list(effect.axes),
-        "predicted": effect.fit,
-        "standard_error": effect.se,
-        "covariance_source": effect.covariance_source,
-    }
-
-
-def eta_of(model, data):
-    return np.asarray(model.predict(data, interval=0.95)["linear_predictor_plugin"], float)
-
-
-def intercept(model, data):
-    return float(model.design_matrix(data).coefficients[0])
 
 
 @pytest.fixture(scope="session")

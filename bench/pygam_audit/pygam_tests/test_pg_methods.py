@@ -7,7 +7,7 @@ import pytest
 from scipy import stats
 
 import gamfit
-from conftest import eta_of
+from bench.pygam_audit.pygam_tests.pg_helpers import eta_of
 
 
 def _summary_row(m, name_part):

@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 import gamfit
-from conftest import pdep
+from bench.pygam_audit.pygam_tests.pg_helpers import pdep
 
 
 def _width(m, pred):

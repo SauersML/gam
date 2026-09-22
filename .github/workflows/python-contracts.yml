@@ -399,8 +399,33 @@ jobs:
         # The exit code is taken from PIPESTATUS, not from the pipeline. A
         # pipeline reports `tee`'s status, and `tee` always succeeds — piping
         # this step without that would turn every red suite green.
+        #
+        # MEMORY SAMPLER. Run 35778241406 lost its runner 34 min into this step
+        # ("The runner has received a shutdown signal", exit 143) after eight
+        # xdist workers died as "node down: Not properly terminated"; run
+        # 35751774710 ended the same way. Nothing recorded memory, so memory
+        # exhaustion was a guess. A background loop now prints, every 15 s,
+        # `free -m` and the RSS of the ten largest python processes. It prints to
+        # the STEP LOG and not only to a file: when the runner itself is lost no
+        # later step runs, even under `always()`, and the log lines already
+        # streamed out are the only record that survives. The same lines go to
+        # py1512_memory.log for the upload below when the runner lives. The
+        # kernel's OOM-kill lines, which name a worker the kernel killed, are
+        # appended after pytest returns.
         run: |
           set -uo pipefail
+          memlog="$RUNNER_TEMP/py1512_memory.log"
+          (
+            while :; do
+              stamp=$(date -u +%H:%M:%SZ)
+              {
+                free -m | awk -v t="$stamp" 'NR==2 {printf "[mem %s] used=%sMiB free=%sMiB available=%sMiB", t, $3, $4, $7} NR==3 {printf " swap_used=%sMiB\n", $3}'
+                ps -eo pid=,rss=,etimes=,args= --sort=-rss | awk -v t="$stamp" '/python/ && n < 10 {n++; printf "[mem %s]   pid=%s rss=%dMiB age=%ss %s\n", t, $1, $2 / 1024, $3, substr($0, index($0, $4), 100)}'
+              } | tee -a "$memlog" >&2
+              sleep 15
+            done
+          ) &
+          sampler=$!
           python -m pytest "$GITHUB_WORKSPACE/tests/" \
             -m "not slow and not static_typing" \
             -p no:cacheprovider \
@@ -411,6 +436,10 @@ jobs:
             --junitxml="$RUNNER_TEMP/py1512_junit.xml" \
             -q --tb=line 2>&1 | tee "$RUNNER_TEMP/py1512_output.log"
           status=${PIPESTATUS[0]}
+          # The loop's `sleep` is its child: kill it too, or it holds the step's output open.
+          pkill -P "$sampler"; kill "$sampler"
+          echo "[mem] kernel OOM kills during the suite:" | tee -a "$memlog"
+          sudo dmesg -T | grep -iE "out of memory|oom-kill|killed process" | tee -a "$memlog"
           echo "pytest exit status: $status"
           exit "$status"
 
@@ -455,6 +484,7 @@ jobs:
           path: |
             ${{ runner.temp }}/py1512_junit.xml
             ${{ runner.temp }}/py1512_summary.txt
+            ${{ runner.temp }}/py1512_memory.log
           if-no-files-found: warn
 
 
@@ -470,6 +500,7 @@ jobs:
           files: |
             ${{ runner.temp }}/py1512_junit.xml
             ${{ runner.temp }}/py1512_summary.txt
+            ${{ runner.temp }}/py1512_memory.log
 
   # mypy --strict over gamfit and a user of it (audit PKG-05). It needs no
   # compiled extension, since mypy reads the generated gamfit/_rust.pyi, so it

@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 import gamfit
-from conftest import eta_of, intercept, pdep
+from bench.pygam_audit.pygam_tests.pg_helpers import eta_of, intercept, pdep
 
 
 def test_univariate_pdep_plus_intercept_equals_prediction(mcycle, mcycle_model):

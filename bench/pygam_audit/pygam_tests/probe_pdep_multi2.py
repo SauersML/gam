@@ -9,7 +9,7 @@ import numpy as np
 warnings.simplefilter("ignore")
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from conftest import eta_of, intercept, pdep  # noqa: E402
+from pg_helpers import eta_of, intercept, pdep  # noqa: E402
 import pygam.datasets.load_datasets as _L  # noqa: E402
 
 _L.PATH = os.path.join(HERE, "data")
