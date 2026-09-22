@@ -1,5 +1,23 @@
 ## Unreleased
 
+- **The measure-jet representer section's `ln ℓ` jet carries its chart's scale motion** (#2902,
+  #2959). `representer_section_log_length_jets` differentiates `Z = N·V·S`, the section the
+  `CenterSumToZero` build realizes, but carried only the nullspace motion `N′` and the graph
+  motion `V′`. The third factor is the conditioning chart's column scaling
+  `S = diag(sign/σ_k)`, whose `σ_k` are singular values of `E = K_cc·Z` — a spectrum that
+  collapses with the range, from `2.29e0` to `3.48e-6` across the sweep its own doc tabulates.
+  Holding `S` fixed differentiates a chart nobody realizes. The criterion is invariant to
+  applying one chart to `X` and `S` together, but this jet is added to the DESIGN jet as
+  `∂(K·Z)`, where a column rescaling is visible in `log|XᵀWX + λS|` at `2·Σ_k ∂s_k/s_k`. Measured
+  on the #2959 run, the omission put `V′` at `−1314.42` against a central difference of `+9.47`
+  at `ln ℓ = −2.6275`: 140× and sign-inverted, an additive `−1.32e3` carrying the factor two of a
+  log-determinant. The jet now forms `T′ = V′S + VS′` and `T″ = V″S + 2V′S′ + VS″`, taking `σ′`
+  and `σ″` from the diagonal of the `F = EᵀE` jets it already builds, and REFUSES on a damped
+  column whose scale rides on an amplification floor it is not given the derivative of. A new
+  finite-difference gate covers the `CenterSumToZero` arm, which the file's existing ℓ gate
+  structurally cannot reach: that one builds from a `FrozenTransform` spec, which is the arm
+  that holds `Z` fixed.
+
 - **The measure-jet range screen's jet is judged against a band the differences measure, not
   a relative tolerance** (#2902). `range_screen_jet_matches_central_differences_2902` accepted
   `V′` and `V″` within `1e-3·(1 + |value|)` of a single central difference. That bar is

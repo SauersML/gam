@@ -1217,32 +1217,36 @@ fn representer_section_log_length_jets(
     let chart = representer_section_chart(k_cc, &section)?;
     let kept = &chart.kept;
     let dropped: Vec<usize> = (0..width).filter(|index| !kept.contains(index)).collect();
+    // `F = EᵀE` and its `u = ln ℓ` jets in `E`'s singular basis. These are needed
+    // whether or not any direction was dropped: the graph chart reads their
+    // OFF-diagonal kept/dropped block, and the column scales below read their
+    // DIAGONAL, which moves at every range.
+    let evaluation = k_cc.dot(&section);
+    let evaluation_first = dk_cc.dot(&section) + k_cc.dot(&null_first);
+    let evaluation_second =
+        d2k_cc.dot(&section) + dk_cc.dot(&null_first) * 2.0 + k_cc.dot(&null_second);
+    let symmetric_product = |left: &Array2<f64>, right: &Array2<f64>| -> Array2<f64> {
+        let half = left.t().dot(right);
+        &half + &half.t()
+    };
+    let basis = &chart.right;
+    let gram_first = basis
+        .t()
+        .dot(&symmetric_product(&evaluation_first, &evaluation))
+        .dot(basis);
+    let gram_second = basis
+        .t()
+        .dot(
+            &(symmetric_product(&evaluation_second, &evaluation)
+                + evaluation_first.t().dot(&evaluation_first) * 2.0),
+        )
+        .dot(basis);
     let (rotation_first, rotation_second) = if dropped.is_empty() {
         (
             Array2::<f64>::zeros((width, kept.len())),
             Array2::<f64>::zeros((width, kept.len())),
         )
     } else {
-        let evaluation = k_cc.dot(&section);
-        let evaluation_first = dk_cc.dot(&section) + k_cc.dot(&null_first);
-        let evaluation_second =
-            d2k_cc.dot(&section) + dk_cc.dot(&null_first) * 2.0 + k_cc.dot(&null_second);
-        let symmetric_product = |left: &Array2<f64>, right: &Array2<f64>| -> Array2<f64> {
-            let half = left.t().dot(right);
-            &half + &half.t()
-        };
-        let basis = &chart.right;
-        let gram_first = basis
-            .t()
-            .dot(&symmetric_product(&evaluation_first, &evaluation))
-            .dot(basis);
-        let gram_second = basis
-            .t()
-            .dot(
-                &(symmetric_product(&evaluation_second, &evaluation)
-                    + evaluation_first.t().dot(&evaluation_first) * 2.0),
-            )
-            .dot(basis);
         let mut gaps = Array2::<f64>::zeros((dropped.len(), kept.len()));
         let mut graph_first = Array2::<f64>::zeros((dropped.len(), kept.len()));
         for (row, &lower) in dropped.iter().enumerate() {
@@ -1284,8 +1288,71 @@ fn representer_section_log_length_jets(
         .transform
         .clone()
         .unwrap_or_else(|| Array2::<f64>::eye(width));
-    let rotation_first = scale_columns(rotation_first);
-    let rotation_second = scale_columns(rotation_second);
+    // The chart the builder realizes is `T = V_K·S`, `S = diag(sign/σ_k)` from
+    // `representer_section_chart`. `S` MOVES: `σ_k` is a singular value of
+    // `E = K_cc·Z`, and that spectrum collapses as `ℓ` grows — the chart's own doc
+    // tabulates `σ_max(E)` falling from 2.29e0 to 3.48e-6 over the range sweep. So
+    // `T′ = V_K′·S + V_K·S′` and `T″ = V_K″·S + 2V_K′·S′ + V_K·S″`, and an
+    // implementation carrying only the `V_K` motion differentiates a chart nobody
+    // realizes.
+    //
+    // The consumer is what makes the omission wrong rather than free. The section
+    // jet is added to the DESIGN jet as `∂(K·Z)`, and a column rescaling of `Z` is
+    // a column rescaling of `X` — visible in `log|XᵀWX + λS|` at `2·Σ_k ∂s_k/s_k`
+    // even though the profiled criterion is invariant to applying one chart to
+    // `X` and `S` TOGETHER. Measured on the #2959 run at 7573811d1a, dropping it
+    // put `V′` at −1314.42 against a central difference of +9.47 at
+    // `ln ℓ = −2.6275`: 140× and sign-inverted, an additive −1.32e3 with the
+    // factor two of a log-determinant on it (#2902 rows 5 and 37, #2959).
+    //
+    // `s_k = sign_k/σ_k` gives `s′_k/s_k = −σ′_k/σ_k` and
+    // `s″_k/s_k = 2(σ′_k/σ_k)² − σ″_k/σ_k`, and the σ jets come from the diagonal
+    // of `F = EᵀE` already formed above: `F′_kk = 2σ_kσ′_k` and
+    // `F″_kk = 2σ′_k² + 2σ_kσ″_k`.
+    let mut scale_log_first = Array1::<f64>::zeros(kept.len());
+    let mut scale_log_second = Array1::<f64>::zeros(kept.len());
+    for (column, &index) in kept.iter().enumerate() {
+        let sigma = chart.singular[index];
+        // `representer_section_chart` CLAMPS `1/σ_k` at `1/(anchor·√ε)` for a
+        // damped direction, and that floor rides on `‖K_cc‖₂`, whose own `ln ℓ`
+        // derivative this function is not given. Refusing is the honest answer:
+        // the alternative is to report a scale as frozen when it is not, which is
+        // the defect this term exists to repair.
+        // `|s_k| = 1/max(σ_k, floor)`, so `|s_k|·σ_k` is exactly 1 on an
+        // UNDAMPED column and strictly below it on a damped one. The first form
+        // of this guard read `<= 1 + 8ε`, which every column satisfies and which
+        // would therefore have let the damped case through silently — the same
+        // shape of defect as the term it is guarding.
+        let unclamped = sigma.is_finite()
+            && sigma > 0.0
+            && (scales[column].abs() * sigma - 1.0).abs() <= 8.0 * f64::EPSILON;
+        if !unclamped {
+            crate::bail_invalid_basis!(
+                "measure-jet representer section column {column} is damped (σ = {sigma:e},                  scale = {:e}), so its chart scale moves with the amplification floor and this                  jet cannot report it",
+                scales[column]
+            );
+        }
+        let sigma_first = gram_first[(index, index)] / (2.0 * sigma);
+        let sigma_second =
+            (gram_second[(index, index)] - 2.0 * sigma_first * sigma_first) / (2.0 * sigma);
+        let relative_first = sigma_first / sigma;
+        scale_log_first[column] = -relative_first;
+        scale_log_second[column] = 2.0 * relative_first * relative_first - sigma_second / sigma;
+    }
+    let kept_basis = basis.select(Axis(1), kept);
+    let weight_columns = |block: &Array2<f64>, weights: &Array1<f64>| -> Array2<f64> {
+        block * &weights.view().insert_axis(Axis(0))
+    };
+    // `T′ = V_K′·S + V_K·S′`, `T″ = V_K″·S + 2V_K′·S′ + V_K·S″`, with `S′` and `S″`
+    // written as `S` times the relative motions above so `scale_columns` applies
+    // the one chart `S` exactly once on every term.
+    let rotation_second = scale_columns(
+        rotation_second
+            + weight_columns(&rotation_first, &scale_log_first) * 2.0
+            + weight_columns(&kept_basis, &scale_log_second),
+    );
+    let rotation_first =
+        scale_columns(rotation_first + weight_columns(&kept_basis, &scale_log_first));
     let first = null_first.dot(&transform) + section.dot(&rotation_first);
     let second = null_second.dot(&transform)
         + null_first.dot(&rotation_first) * 2.0
@@ -4173,6 +4240,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The `CenterSumToZero` arm's `ln ℓ` design jet against central differences
+    /// of the rebuilt design (#2902 rows 5 and 37, #2959).
+    ///
+    /// # Why this exists beside `psi_producer_matches_fd_length_scale`
+    ///
+    /// That test is the file's only finite-difference gate on the ℓ derivative,
+    /// and it CANNOT reach this code. It builds from `frozen_spec_fixture`, whose
+    /// spec carries `MeasureJetIdentifiability::FrozenTransform`, while
+    /// `representer_section_log_length_jets` is gated on
+    /// `MeasureJetIdentifiability::CenterSumToZero`. A frozen transform replays
+    /// one coefficient chart and holds `Z` fixed; the default arm realizes `Z` at
+    /// every range and has to carry its motion. The two arms are complementary,
+    /// so a 302-line derivative path landed on the default arm — inside an archive
+    /// of a dirty tree, `bf3398e863` — and the suite stayed green while the
+    /// realized `V′` sat at −1314.42 against a central difference of +9.47.
+    ///
+    /// # The bar
+    ///
+    /// Two steps, `h` and `2h`. A central difference carries `g′ + C·h² + O(h⁴)`,
+    /// so the gap between the two differences IS `3C·h²` and the truncation of the
+    /// `h` difference is a third of a quantity this test MEASURES rather than
+    /// names. The bar is that whole gap — three times the truncation, the factor
+    /// being the `(2h)²/h²` scaling of the differencing error itself — plus the
+    /// rounding the differencing amplifies by `1/(2h)`. This is the same rule the
+    /// landed range-screen pin uses (`a606cd1754`), so both read one bar.
+    #[test]
+    fn center_sum_to_zero_design_jet_matches_central_differences_2902() {
+        let n = 96usize;
+        let data = Array2::<f64>::from_shape_fn((n, 1), |(i, _)| {
+            let t = i as f64 / (n as f64 - 1.0);
+            t + 0.04 * (7.0 * t).sin()
+        });
+        let spec = MeasureJetBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 24 },
+            learn_length_scale: true,
+            ..MeasureJetBasisSpec::default()
+        };
+        assert!(
+            matches!(
+                spec.identifiability,
+                MeasureJetIdentifiability::CenterSumToZero
+            ),
+            "this test exists to cover the CenterSumToZero arm; the default moved"
+        );
+
+        let derivs = build_measure_jet_basis_psi_derivatives(data.view(), &spec)
+            .expect("psi derivatives on the CenterSumToZero arm");
+        assert_eq!(
+            derivs.design_first.len(),
+            1,
+            "learn_length_scale enrolls exactly the ln ℓ coordinate"
+        );
+
+        let ell0 = spec.length_scale;
+        let build_at = |ell: f64| {
+            let trial = MeasureJetBasisSpec {
+                length_scale: ell,
+                ..spec.clone()
+            };
+            build_measure_jet_basis(data.view(), &trial)
+                .expect("trial build")
+                .design
+                .to_dense()
+        };
+        let h: f64 = 1e-4;
+        let near = (build_at(ell0 * h.exp()) - build_at(ell0 * (-h).exp())) / (2.0 * h);
+        let far =
+            (build_at(ell0 * (2.0 * h).exp()) - build_at(ell0 * (-2.0 * h).exp())) / (4.0 * h);
+        let plus = build_at(ell0 * h.exp());
+        let minus = build_at(ell0 * (-h).exp());
+
+        let analytic = &derivs.design_first[0];
+        assert_eq!(
+            analytic.dim(),
+            near.dim(),
+            "the analytic jet and the rebuilt difference must be the same block"
+        );
+        let rows = data.nrows();
+        let columns = analytic.ncols();
+        let mut worst = 0.0_f64;
+        let mut worst_report = String::new();
+        for ((index, value), difference) in analytic.indexed_iter().zip(near.iter()) {
+            let truncation = (far[index] - difference).abs();
+            let rounding = gam_linalg::roundoff::accumulation_growth(rows + columns)
+                * (plus[index].abs() + minus[index].abs())
+                / (2.0 * h);
+            let band = truncation + rounding;
+            let miss = (value - difference).abs();
+            if miss > band && miss - band > worst {
+                worst = miss - band;
+                worst_report = format!(
+                    "entry {index:?}: analytic {value:.9e} vs central difference                      {difference:.9e} (at 2h: {:.9e}), band {band:.3e}",
+                    far[index]
+                );
+            }
+        }
+        assert!(
+            worst_report.is_empty(),
+            "the CenterSumToZero design jet left the band its own differences measure by \
+             {worst:.3e}. Worst entry — {worst_report}"
+        );
     }
 
     /// Quadrature nodes must be the mass-weighted cell barycenters
