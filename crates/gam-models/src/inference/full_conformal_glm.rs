@@ -2363,6 +2363,89 @@ mod tests {
             );
         }
     }
+
+    /// gam#4103: the honest count walk's `s_top` stop assumed the test score
+    /// could not come back below `s_top` at a larger level. At a FIXED strength
+    /// that follows from `du_*/dz > 0`; re-selection gives every level its own
+    /// strength, so the stop needed the score at the WORST strength the
+    /// selection can return. Taking that minimum at an endpoint would need
+    /// `u_*` monotone in `ρ`, and it is not:
+    ///
+    /// ```text
+    ///   β̇ = −H⁻¹S_ρβ̂,   du_*/dρ = −μ_*·(x_*ᵀβ̇) = μ_*·x_*ᵀH⁻¹S_ρβ̂.
+    /// ```
+    ///
+    /// `H⁻¹` is positive definite and `μ_* > 0`, but `x_*` and `S_ρβ̂` are
+    /// unrelated vectors, so that bilinear form has no determined sign. This
+    /// reads the sign off fitted scores rather than off the algebra, which is
+    /// why the stop is gone rather than moved to an endpoint.
+    ///
+    /// A red here means the ladder found one sign only. That does not restore
+    /// monotonicity — the derivative still has no sign — it means this fixture
+    /// is too narrow to exhibit it, and the fixture is what should widen.
+    #[test]
+    fn the_test_score_is_not_monotone_in_the_smoothing_strength_4103() {
+        let mut rng = StdRng::seed_from_u64(4103);
+        let d = data(ConformalGlmFamily::PoissonLog, 40, &mut rng);
+        let sub = GlmFullConformalSubstrate::new(
+            ConformalGlmFamily::PoissonLog,
+            d.x.clone(),
+            d.y.clone(),
+            d.offset.clone(),
+            penalty(),
+            Some(1),
+            Array1::zeros(3),
+        )
+        .expect("a single-penalty Poisson substrate");
+        let reselection = sub
+            .reselection
+            .as_ref()
+            .expect("penalty_count = 1 carries the re-selection substrate");
+
+        let level = 2.0_f64;
+        let ladder = [-4.0_f64, -2.0, 0.0, 2.0, 4.0];
+        let mut rising = Vec::new();
+        let mut falling = Vec::new();
+        for &x in &[-0.9_f64, -0.3, 0.3, 0.9] {
+            let x_star = row(x);
+            let test = TestRow {
+                x: &x_star,
+                offset: 0.0,
+            };
+            let mut scores = Vec::with_capacity(ladder.len());
+            for &rho in &ladder {
+                let refit = sub
+                    .at_strength(reselection, rho, Array1::zeros(3))
+                    .expect("the substrate re-penalizes at a finite strength");
+                let node = refit
+                    .solve(&test, Augmentation::Response(level), &refit.warm_start)
+                    .expect("the augmented fit converges at this strength");
+                scores.push(node.score_star);
+            }
+            eprintln!("x*={x:+.1} u_*(rho) over {ladder:?}: {scores:?}");
+            for pair in scores.windows(2) {
+                let step = pair[1] - pair[0];
+                // A step inside the solves' own agreement is no evidence of a
+                // direction, so only steps clearing it are counted. Both ends
+                // are certified fits of the same data at strengths a factor e²
+                // apart, so the floor is the score scale times the convergence
+                // tolerance the inner solve is held to.
+                let floor = GLM_CONVERGENCE_RTOL * (1.0 + pair[0].abs().max(pair[1].abs()));
+                if step > floor {
+                    rising.push(x);
+                } else if step < -floor {
+                    falling.push(x);
+                }
+            }
+        }
+        assert!(
+            !rising.is_empty() && !falling.is_empty(),
+            "the test score moved in one direction only over the strength ladder \
+             (rising at {rising:?}, falling at {falling:?}); a stop evaluated at one \
+             end of the selection domain would then be sound and this fixture cannot \
+             show otherwise"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3145,88 +3228,5 @@ mod reselection_tests {
             );
             z += 1.0;
         }
-    }
-
-    /// gam#4103: the honest count walk's `s_top` stop assumed the test score
-    /// could not come back below `s_top` at a larger level. At a FIXED strength
-    /// that follows from `du_*/dz > 0`; re-selection gives every level its own
-    /// strength, so the stop needed the score at the WORST strength the
-    /// selection can return. Taking that minimum at an endpoint would need
-    /// `u_*` monotone in `ρ`, and it is not:
-    ///
-    /// ```text
-    ///   β̇ = −H⁻¹S_ρβ̂,   du_*/dρ = −μ_*·(x_*ᵀβ̇) = μ_*·x_*ᵀH⁻¹S_ρβ̂.
-    /// ```
-    ///
-    /// `H⁻¹` is positive definite and `μ_* > 0`, but `x_*` and `S_ρβ̂` are
-    /// unrelated vectors, so that bilinear form has no determined sign. This
-    /// reads the sign off fitted scores rather than off the algebra, which is
-    /// why the stop is gone rather than moved to an endpoint.
-    ///
-    /// A red here means the ladder found one sign only. That does not restore
-    /// monotonicity — the derivative still has no sign — it means this fixture
-    /// is too narrow to exhibit it, and the fixture is what should widen.
-    #[test]
-    fn the_test_score_is_not_monotone_in_the_smoothing_strength_4103() {
-        let mut rng = StdRng::seed_from_u64(4103);
-        let d = data(ConformalGlmFamily::PoissonLog, 40, &mut rng);
-        let sub = GlmFullConformalSubstrate::new(
-            ConformalGlmFamily::PoissonLog,
-            d.x.clone(),
-            d.y.clone(),
-            d.offset.clone(),
-            penalty(),
-            Some(1),
-            Array1::zeros(3),
-        )
-        .expect("a single-penalty Poisson substrate");
-        let reselection = sub
-            .reselection
-            .as_ref()
-            .expect("penalty_count = 1 carries the re-selection substrate");
-
-        let level = 2.0_f64;
-        let ladder = [-4.0_f64, -2.0, 0.0, 2.0, 4.0];
-        let mut rising = Vec::new();
-        let mut falling = Vec::new();
-        for &x in &[-0.9_f64, -0.3, 0.3, 0.9] {
-            let x_star = row(x);
-            let test = TestRow {
-                x: &x_star,
-                offset: 0.0,
-            };
-            let mut scores = Vec::with_capacity(ladder.len());
-            for &rho in &ladder {
-                let refit = sub
-                    .at_strength(reselection, rho, Array1::zeros(3))
-                    .expect("the substrate re-penalizes at a finite strength");
-                let node = refit
-                    .solve(&test, Augmentation::Response(level), &refit.warm_start)
-                    .expect("the augmented fit converges at this strength");
-                scores.push(node.score_star);
-            }
-            eprintln!("x*={x:+.1} u_*(rho) over {ladder:?}: {scores:?}");
-            for pair in scores.windows(2) {
-                let step = pair[1] - pair[0];
-                // A step inside the solves' own agreement is no evidence of a
-                // direction, so only steps clearing it are counted. Both ends
-                // are certified fits of the same data at strengths a factor e²
-                // apart, so the floor is the score scale times the convergence
-                // tolerance the inner solve is held to.
-                let floor = GLM_CONVERGENCE_RTOL * (1.0 + pair[0].abs().max(pair[1].abs()));
-                if step > floor {
-                    rising.push(x);
-                } else if step < -floor {
-                    falling.push(x);
-                }
-            }
-        }
-        assert!(
-            !rising.is_empty() && !falling.is_empty(),
-            "the test score moved in one direction only over the strength ladder \
-             (rising at {rising:?}, falling at {falling:?}); a stop evaluated at one \
-             end of the selection domain would then be sound and this fixture cannot \
-             show otherwise"
-        );
     }
 }
