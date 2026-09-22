@@ -2187,13 +2187,24 @@ impl ConstructiveQuadratic {
     /// refused as [`BasisError::IndefinitePenalty`].
     ///
     /// [`Self::try_from_dense_psd`] instead keeps only eigenvalues above
-    /// `dim·1e-10·max|ev|`, and refuses below minus that cutoff. That is a
-    /// topology decision relative to the spectrum. On a penalty rebuilt while a
-    /// length scale moves it changed between two nearby trials, so the block lost
-    /// a rank-one piece and the REML criterion jumped. Its refusal cutoff also
-    /// followed the spectrum down: a near-underflow tension Gram whose largest
-    /// eigenvalue was ≈1.8e-12 made a −5.585e-16 residual fatal (MSI job 608882,
-    /// periodic Matérn bug-hunt fixture, ψ = 5.577).
+    /// `spectral_tolerance`, and refuses below minus it. The two differ in WHERE
+    /// they cut, not in kind: this constructor keeps every positive eigenvalue
+    /// and bands only the negatives, while the bridge bands both.
+    ///
+    /// THAT CUTOFF USED TO BE `dim·1e-10·max|ev|` AND IS NOT ANY MORE. It became
+    /// the eigensolver's own band `dim·ε·max|λ|` at `0f72c1e70e` (#2901), five
+    /// decades tighter. This paragraph described the old constant in the present
+    /// tense for nine days, and gam#1561 landed a repair aimed at it on the
+    /// strength of this sentence, quoting it rather than reading the predicate;
+    /// that commit had to be reverted (`264ea264d8`). What follows is the
+    /// HISTORY of the old constant, kept because it is why the rule changed:
+    ///
+    /// A cutoff relative to the spectrum is a topology decision. On a penalty
+    /// rebuilt while a length scale moves it changed between two nearby trials,
+    /// so the block lost a rank-one piece and the REML criterion jumped. Its
+    /// refusal cutoff also followed the spectrum down: a near-underflow tension
+    /// Gram whose largest eigenvalue was ≈1.8e-12 made a −5.585e-16 residual
+    /// fatal (MSI job 608882, periodic Matérn bug-hunt fixture, ψ = 5.577).
     pub fn unit_frobenius_from_gram_within_rounding_band(
         gram: &Array2<f64>,
         assembly_magnitude: f64,

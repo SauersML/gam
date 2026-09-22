@@ -2774,11 +2774,23 @@ fn exact_bounded_edf(
                 // Trace only involves the block slice of latent_cov.
                 let cov_block = latent_cov.slice(ndarray::s![col_range.clone(), col_range.clone()]);
                 // The rank oracle is deliberately left on `estimate_penalty_nullity`
-                // above: this root is used for the ACCUMULATION only. The two
+                // above: this root is used for the ACCUMULATION only, and adopting
+                // the root's rank here would move published per-block EDF, which
+                // is a separate, measured increment (#2469).
+                //
+                // THE STATED REASON NO LONGER HOLDS AND THE DECISION IS NOW
+                // UNJUSTIFIED RATHER THAN WRONG (#1561). This said "the two
                 // disagree — `penalty_matrix_root` cuts at `n·ε·λmax` and
-                // `spectral_tolerance` at `n·1e-10·λmax`, a factor of 4.5e5 — so
-                // adopting the root's rank here would silently move published
-                // per-block EDF, which is a separate, measured increment (#2469).
+                // `spectral_tolerance` at `n·1e-10·λmax`, a factor of 4.5e5".
+                // `0f72c1e70e` (#2901) moved `spectral_tolerance` to the
+                // eigensolver's own band, which is `n·ε·λmax`: the factor of
+                // 4.5e5 is gone and the two cut at the same place. Whether they
+                // now AGREE on this block's rank is a measurement, not a
+                // reading — equal cutoffs on two different matrices (a root's
+                // singular values against a Gram's eigenvalues) need not give
+                // equal counts, which is the `√ε`-versus-`ε` gap. Left as it
+                // stands, with the reason corrected, because changing it moves
+                // published EDF and that needs the increment #2469 describes.
                 let penalty_root =
                     gam_solve::estimate::reml::reml_outer_engine::penalty_matrix_root(local)
                         .map_err(EstimationError::InvalidInput)?;
