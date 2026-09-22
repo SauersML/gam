@@ -247,58 +247,80 @@ def _resolve_bspline_knots_for_fit(
     )
 
 
-def _marginal_bspline_design_penalty(
-    marginal: BSpline, x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build one marginal's ``(design, penalty)`` for a tensor-product smooth.
+def _engine_realized_block(
+    smooth: Smooth, points: torch.Tensor, term: str,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """The design block and per-λ penalties the Rust term builder realizes.
 
-    Mirrors the scalar :class:`BSpline` branch exactly: the design carries the
-    autograd VJP back to ``x`` through :func:`bspline_basis`, and the penalty
-    shares the SAME resolved knot vector, effective degree, and (cyclic vs
-    open) topology as the design so the derivative roughness regularizes the
-    function the design actually spans (auto-knot derivation may downgrade the
-    degree for small n — #340).
+    ``term`` is the formula term over the axis names the engine entry assigns
+    to ``points``' columns (``x0``, ``x1``, ...), e.g. ``te(x0, x1)``. The
+    smooth's own descriptor -- the same payload ``gamfit.fit(..., smooths={...})``
+    sends -- carries every tunable, so this returns exactly what ``gamfit.fit``
+    would realize for the same spec (gam#4492).
 
-    ``x`` is the 1D marginal coordinate ``(N,)``. Returns ``(B_x, S_x)`` where
-    ``B_x`` is ``(N, k)`` (differentiable) and ``S_x`` is ``(k, k)``.
+    The DESIGN comes back too, and is used rather than a torch-built one. A
+    smooth's penalty is only meaningful in the chart its design is expressed
+    in, and that chart is not a right-multiplication this side could apply: the
+    collection composes the joint-null rotation ``Q``, the term's own
+    identifiability transform, any unabsorbed global orthogonality, and the
+    span-preserving parametric residualization ``X·T − C·R``, which is affine in
+    the parametric block rather than a factor of ``X``. Rebuilding that
+    composition here would be a second implementation of the thing this entry
+    exists to stop duplicating. The consequence is explicit: for a term routed
+    through this helper the fit carries no autograd path back to ``points``,
+    because the design is not a torch expression of them.
     """
-    marg_knots = marginal.knots
-    if marg_knots is None or isinstance(marg_knots, int):
-        from .._api import _resolve_knots
-        resolved = _resolve_knots(
-            marg_knots,
-            x.detach().cpu().to(torch.float64).numpy(),
-            label="knots", degree=int(marginal.degree),
-            periodic=bool(marginal.periodic),
+    import json
+
+    from .._api import _jsonable_array
+    from .._binding import rust_module
+
+    points_np = (
+        points.detach().cpu().to(torch.float64).contiguous().numpy()
+    )
+    descriptor = _jsonable_array(dict(smooth.to_rust_descriptor()))
+    design_np, penalties_np = rust_module().smooth_term_realized_penalties(
+        points_np, term, json.dumps(descriptor),
+    )
+    design = torch.as_tensor(
+        design_np, dtype=torch.float64, device=points.device,
+    ).contiguous()
+    penalties = [
+        torch.as_tensor(
+            penalty, dtype=torch.float64, device=points.device,
+        ).contiguous()
+        for penalty in penalties_np
+    ]
+    width = design.shape[1]
+    for index, penalty in enumerate(penalties):
+        if penalty.shape != (width, width):
+            raise RuntimeError(
+                f"engine penalty {index} for {term} is {tuple(penalty.shape)}, "
+                f"not ({width}, {width}) as its realized design block"
+            )
+    return design, penalties
+
+
+def _refuse_multi_lambda(term: str, kind: str, count: int) -> None:
+    """Refuse a term whose realized penalty count the backend cannot carry.
+
+    ``gaussian_reml_fit_blocks_exact`` prices ``P = blockdiag(λ_k S_k)``: one
+    smoothing parameter per COEFFICIENT BLOCK. A term the builder realizes with
+    several penalties -- one per tensor margin, one per active Matérn operator
+    dial -- puts several of them on ONE block, which that criterion has no
+    coordinate for. Summing them under a single λ is the divergence gam#4492
+    is about, so the fit refuses instead (gam#4492 step 2: the block API takes a
+    penalty LIST per block).
+    """
+    if count > 1:
+        raise NotImplementedError(
+            f"{kind} realizes {count} penalties for {term} -- one smoothing "
+            f"parameter each, as gamfit.fit carries them -- and the torch "
+            f"Gaussian REML backend prices one λ per coefficient block. "
+            f"Fitting them under a single λ would be a different model than "
+            f"gamfit.fit's (gam#4492). Use gamfit.fit for this term until the "
+            f"block backend takes a penalty list per block."
         )
-        knots_np = resolved.locations
-        eff_degree = int(resolved.order)
-        knots = torch.as_tensor(knots_np, dtype=torch.float64, device=x.device)
-    else:
-        knots = _to_tensor(marg_knots, x).reshape(-1)
-        knots_np = knots.detach().cpu().to(torch.float64).numpy()
-        eff_degree = int(marginal.degree)
-    design = bspline_basis(
-        x, knots, degree=eff_degree, periodic=bool(marginal.periodic),
-    )
-    penalty_np = _bspline_penalty_np(
-        knots_np, eff_degree, int(marginal.penalty_order), bool(marginal.periodic),
-    )
-    penalty = torch.as_tensor(penalty_np, dtype=torch.float64, device=x.device)
-    return design.to(torch.float64), penalty
-
-
-def _kron_eye(left: int, mat: torch.Tensor, right: int) -> torch.Tensor:
-    """Form ``I_left ⊗ mat ⊗ I_right`` for the Kronecker-sum tensor penalty.
-
-    ``left`` / ``right`` are the products of the basis sizes of the marginals
-    before / after the axis ``mat`` penalizes. The result lives in the same
-    column space as the row-major Khatri-Rao tensor design (earliest marginal
-    varies slowest), so it composes term-by-term into ``S = Σ_a I ⊗ S_a ⊗ I``.
-    """
-    eye_l = torch.eye(left, dtype=mat.dtype, device=mat.device)
-    eye_r = torch.eye(right, dtype=mat.dtype, device=mat.device)
-    return torch.kron(torch.kron(eye_l, mat), eye_r)
 
 
 def _build_design_penalty(
@@ -314,6 +336,13 @@ def _build_design_penalty(
     primitive functions per smooth kind.
 
     Returns (design (N, M), penalty (M, M)) as float64 torch tensors.
+
+    Two kinds take BOTH halves from the term builder instead
+    (:func:`_engine_realized_block`, gam#4492): ``TensorBSpline`` and
+    ``Matern``, whose penalties this side used to build itself and build
+    differently from the fit. Their design carries no autograd path back to
+    ``points``, because the chart their penalty is expressed in is not a factor
+    of the raw basis; every other kind is unchanged and still differentiable.
     """
     from .._api import duchon_function_norm_penalty
 
@@ -475,117 +504,46 @@ def _build_design_penalty(
                 f"TensorBSpline has {len(marginals)} marginals but points have "
                 f"d={points.shape[1]}"
             )
-        # Per-marginal 1D B-spline design + exact derivative Gram (shared knots).
-        marg_designs: list[torch.Tensor] = []
-        marg_penalties: list[torch.Tensor] = []
-        for j, marg in enumerate(marginals):
-            b_j, s_j = _marginal_bspline_design_penalty(marg, points[:, j])
-            marg_designs.append(b_j)
-            marg_penalties.append(s_j)
-        sizes = [b.shape[1] for b in marg_designs]
-        # Design: row-wise Khatri-Rao (tensor) product of the marginal bases,
-        # earliest marginal varying slowest — the autograd VJP flows back to
-        # `points` through each `bspline_basis` factor exactly as the scalar
-        # BSpline path does, since the Hadamard-outer product is plain torch
-        # algebra over the differentiable marginal designs.
-        design = marg_designs[0]
-        for b_j in marg_designs[1:]:
-            n = design.shape[0]
-            design = (design.unsqueeze(2) * b_j.unsqueeze(1)).reshape(n, -1)
-        # Penalty: single-λ Kronecker-sum  S = Σ_a I ⊗ S_a ⊗ I, an mgcv
-        # te()-style isotropic tensor penalty.
-        #
-        # THIS IS NOT THE PENALTY RUST BUILDS FOR THE SAME SPEC (gam#4492). The
-        # comment here used to claim it matched the `MarginalKroneckerSum`
-        # branch of `gam_terms::smooth::term_specs::build_tensor_bspline_basis`;
-        # it does not, in three ways, and the claim is removed rather than left
-        # standing while the divergence is open:
-        #
-        #   * Rust emits ONE CANDIDATE PER MARGIN, each with its own λ. This
-        #     sums them under a single λ, so anisotropic smoothing cannot be
-        #     expressed at all and `λ̂` is not comparable with `gamfit.fit`'s.
-        #   * Rust measures the other margins by their FUNCTION Grams,
-        #     `S_dim = G_0/m_0 ⊗ … ⊗ S̃_dim ⊗ … ⊗ G_{d-1}/m_{d-1}` with
-        #     `m_j = 1ᵀG_j1`. `I ⊗ S_a ⊗ I` measures them by their
-        #     COEFFICIENTS, which agrees with the integral only where those
-        #     bases are Gram-orthonormal (#1561, SPEC rule 5: penalties are on
-        #     the function, never on the coefficients).
-        #   * Rust puts the marginal roughness through
-        #     `normalize_penalty_in_constrained_space` first, so each λ carries
-        #     no basis-size or length unit (#2315). The raw `S_a` here makes the
-        #     relative weight of the margins depend on their knot counts and
-        #     domain lengths.
-        #
-        # The fix is not a better penalty here: it is to ask the Rust term
-        # builder for the realized candidates and delete this branch. That needs
-        # an FFI entry returning the realized chart and candidate list, and a
-        # torch REML backend that takes several penalty blocks per smooth (one λ
-        # each), in that order -- deleting this first would leave the torch path
-        # unable to fit a TensorBSpline at all.
-        total = 1
-        for k in sizes:
-            total *= k
-        penalty = torch.zeros(
-            total, total, dtype=torch.float64, device=points.device
-        )
-        for a, s_a in enumerate(marg_penalties):
-            left = 1
-            for k in sizes[:a]:
-                left *= k
-            right = 1
-            for k in sizes[a + 1:]:
-                right *= k
-            penalty = penalty + _kron_eye(left, s_a, right)
-        return design.to(torch.float64), penalty
+        # The term builder realizes this term, design and penalties together
+        # (gam#4492). What stood here summed `I ⊗ S_a ⊗ I` over the margins
+        # under ONE λ, and diverged from `gamfit.fit` in three ways at once:
+        # the builder emits one candidate per margin with its own λ; it
+        # measures the other margins by their FUNCTION Grams
+        # `S_dim = G_0/m_0 ⊗ … ⊗ S̃_dim ⊗ … ⊗ G_{d-1}/m_{d-1}` with
+        # `m_j = 1ᵀG_j1`, where `I ⊗ S_a ⊗ I` measures them by their
+        # COEFFICIENTS (SPEC: penalties are on the function, never on the
+        # coefficients; #1561); and it normalizes the marginal roughness first,
+        # so no λ carries a basis-size or length unit (#2315).
+        axes = ", ".join(f"x{axis}" for axis in range(len(marginals)))
+        term = f"te({axes})"
+        design, penalties = _engine_realized_block(smooth, points, term)
+        _refuse_multi_lambda(term, "TensorBSpline", len(penalties))
+        return design, penalties[0]
 
     if entry == "matern" and isinstance(smooth, Matern):
-        from .._api import matern_basis as _matern_basis
         if smooth.centers is None:
             raise ValueError("Matern requires centers on the torch path")
-        from .._basis_eval import matern_evaluate, _matern_nu_string
         centers_t = _coerce_2d(_to_tensor(smooth.centers, points), "Matern.centers")
         if centers_t.shape[1] != points.shape[1]:
             raise ValueError(
                 f"Matern: points d={points.shape[1]} but centers "
                 f"d={centers_t.shape[1]}"
             )
-        # Design: Matérn kernel evaluated points-vs-centers, autograd VJP back to
-        # `points` via the analytic Rust input-location jet (matern_evaluate).
-        design = matern_evaluate(smooth, points)
-        # Penalty: the Matérn covariance Gram K_cc among centers — the RKHS
-        # norm of `f = Σ αᵢ k(·, cᵢ)`, which is `αᵀ K_cc α` by the kernel-Gram
-        # identity. centers/length_scale/ν are structural, so this carries no
-        # autograd path.
-        #
-        # RUST NEVER FITS A MATÉRN TERM THIS WAY (gam#4492), and the divergence
-        # is recorded here rather than left implicit. Rust's default path uses
-        # the ν-gated collocation operator candidates (D0/D1/D2 dials gated by
-        # `DuchonOperatorPenaltySpec::matern_for_smoothness`, #707), and its
-        # double-penalty path uses the chart-restricted `Zᵀ K Z` factor built
-        # from K's own spectrum against its roundoff envelope, plus the centre
-        # function Gram candidate. Both go through the kernel identifiability
-        # chart `Z` and carry more than one λ. This branch has no chart, has one
-        # λ, and checks `K_cc` against no roundoff envelope before it becomes a
-        # penalty -- it only symmetrizes it. So
-        # `gamfit.torch.fit(x, y, Matern(...))` fits a different model, with a
-        # different number of smoothing parameters, than `gamfit.fit` does for
-        # the same term. The fix is the same one the TensorBSpline branch above
-        # describes: the realized Rust candidates through a new FFI entry, then
-        # this branch deleted.
-        centers_np = centers_t.detach().cpu().to(torch.float64).numpy()
-        gram_np = _matern_basis(
-            centers_np,
-            centers_np,
-            length_scale=float(smooth.length_scale),
-            nu=_matern_nu_string(float(smooth.nu)),
-            aniso_log_scales=smooth.aniso_log_scales,
-        )
-        penalty = torch.as_tensor(
-            gram_np, dtype=torch.float64, device=points.device
-        )
-        # Symmetrize against round-off so REML sees an exactly symmetric penalty.
-        penalty = 0.5 * (penalty + penalty.transpose(0, 1))
-        return design.to(torch.float64), penalty
+        # The term builder realizes this term (gam#4492). What stood here took
+        # the raw symmetrised covariance Gram `K_cc` among the centres, on the
+        # raw kernel columns, under one λ. The builder never fits a Matérn term
+        # that way: its default path uses the ν-gated collocation operator
+        # candidates (D0/D1/D2 dials gated by
+        # `DuchonOperatorPenaltySpec::matern_for_smoothness`, #707) and its
+        # double-penalty path the chart-restricted `Zᵀ K Z` factor read against
+        # K's own roundoff envelope beside the centre function Gram, both
+        # through the kernel identifiability chart and both with more than one
+        # λ. Nothing checked `K_cc` against a roundoff envelope here either.
+        axes = ", ".join(f"x{axis}" for axis in range(points.shape[1]))
+        term = f"matern({axes})"
+        design, penalties = _engine_realized_block(smooth, points, term)
+        _refuse_multi_lambda(term, "Matern", len(penalties))
+        return design, penalties[0]
 
     if entry == "categorical" and isinstance(smooth, Categorical):
         # Sum-to-zero coded categorical contrast: an i.i.d. Gaussian random

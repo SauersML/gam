@@ -80,6 +80,36 @@
   from the responses, so re-selecting the strength alone would move that asymmetry rather than
   remove it, and those families keep the frozen-penalty refusal.
 
+- **The torch path built its own penalty for two smooth kinds, so `gamfit.torch.fit` and
+  `gamfit.fit` fitted different models under the same spec** (gam#4492). `_build_design_penalty`
+  summed `I ⊗ S_a ⊗ I` over a `TensorBSpline`'s margins under ONE λ, and took the raw symmetrised
+  covariance Gram `K_cc` among a `Matern`'s centres on the raw kernel columns. The term builder
+  `gamfit.fit` runs does neither: the `MarginalKroneckerSum` branch emits ONE CANDIDATE PER MARGIN,
+  each with its own λ, each measuring the other margins by their FUNCTION Grams
+  `S_dim = G_0/m_0 ⊗ … ⊗ S̃_dim ⊗ … ⊗ G_{d-1}/m_{d-1}` with `m_j = 1ᵀG_j1` and normalized first so no
+  λ carries a basis-size or length unit; and a Matérn term is penalized by the ν-gated collocation
+  operator candidates, or by the chart-restricted `Zᵀ K Z` factor read against K's own roundoff
+  envelope, both through the kernel identifiability chart and both with more than one λ.
+  `I ⊗ S_a ⊗ I` also prices the other margins' COEFFICIENTS, which SPEC forbids: a penalty is on the
+  function. The two Python penalties are deleted, not improved — two implementations of one term's
+  penalty is the defect. A new engine entry `smooth_term_realized_penalties(points, term,
+  descriptor_json)` returns what `gamfit.fit` would realize for the same spec, by running the fit's
+  own lowering (`parse_formula` → `build_termspec` → `apply_smooth_overrides` →
+  `build_term_collection_design`) and handing back the realized design block with one square penalty
+  per smoothing parameter. It returns the DESIGN, not a chart to apply to a torch-built one, because
+  that chart is not a factor of the raw basis: the collection composes the joint-null rotation, the
+  term's identifiability transform, any unabsorbed global orthogonality, and the span-preserving
+  parametric residualization `X·T − C·R`, which is affine in the parametric block. So a
+  `TensorBSpline` or `Matern` fit on the torch path no longer carries an autograd path back to its
+  points; every other kind is unchanged and still differentiable. Where the builder realizes more
+  than one penalty for the term — one per margin, one per active operator dial — the torch fit now
+  REFUSES by name instead of summing them under one λ, because `gaussian_reml_fit_blocks_exact`
+  prices `P = blockdiag(λ_k S_k)`, one λ per coefficient block, and that sum is the divergence
+  itself. Letting the block backend take a penalty list per block is the remaining half of gam#4492
+  and is what turns the refusal back into a fit; the parity test
+  `tests/torch/test_torch_penalty_parity_with_rust_4492.py` is written as its strict xfail, so it
+  reports the per-margin λ̂ / EDF / fitted-value parity the day that lands and cannot report a
+  parity that does not exist before it.
 - **A memory-budget refusal names the reservation that refused it** (#4565). The governor's
   ledger is process-wide, so `MemoryReservationError::BudgetExceeded` reported how many bytes
   were reserved without saying whose they were. A caller refused because a neighbour holds the

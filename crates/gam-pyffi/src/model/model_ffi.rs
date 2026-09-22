@@ -548,6 +548,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "equivariant_gauge_companion_loss",
             "dense_orthonormal_range_basis",
             "dense_symmetric_eigen",
+            "smooth_term_realized_penalties",
         ],
     )?;
     info.set_item(
