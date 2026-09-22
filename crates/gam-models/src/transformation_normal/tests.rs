@@ -1058,6 +1058,108 @@ pub(crate) fn max_feasible_step_size_delegates_to_the_factored_cone() {
     );
 }
 
+/// gam#4567: the CTN warm start's shape seed has to lie inside the family's monotonicity cone at
+/// EVERY covariate row, and where the design's first column cannot carry it, the design's own
+/// constant field does.
+///
+/// Every shape row gets the same covariate vector `a`, so `α_k(x) = ψ(x)ᵀa` and the factored cone
+/// asks `ψ(x_i)ᵀa ≥ 0` at every row. The rule this extends fixed `a = e_0` and checked only the
+/// weighted mean of the induced `h'`, which stays positive whenever the positive rows outweigh the
+/// negative ones.
+///
+/// The first arm is the no-drift pin: on a design whose first column is the intercept — the
+/// standard `[intercept | linear | random | smooth]` layout — the seed is still exactly
+/// `alpha_const · e_0`, coefficient for coefficient. The second arm is the extension, on a design
+/// whose first column changes sign and whose constant lives in another column, which is what a
+/// `ModelLevel::NoIntercept` collection hands this function. Its control is that `e_0` is outside
+/// the cone there: an arm where both directions were feasible would assert nothing.
+#[test]
+pub(crate) fn the_warm_start_shape_seed_stays_inside_the_cone_off_the_first_column_4567() {
+    let response = array![2.0, 3.0, 4.0, 5.0];
+    let weights = Array1::from_elem(response.len(), 1.0);
+    let offset = Array1::<f64>::zeros(response.len());
+    let seed_for = |covariate: &Array2<f64>| -> (Array1<f64>, usize) {
+        let (val_basis, deriv_basis, knots, transform, p_resp) = toy_response_basis(&response);
+        let design = DesignMatrix::Dense(DenseDesignMatrix::from(covariate.clone()));
+        let family = TransformationNormalFamily::from_prebuilt_response_basis(
+            &response,
+            val_basis,
+            deriv_basis,
+            vec![],
+            knots,
+            toy_scop_ctn_config().response_degree,
+            transform,
+            &weights,
+            &offset,
+            design,
+            vec![],
+            &toy_scop_ctn_config(),
+        )
+        .expect("a CTN family on this covariate design");
+        let row = family
+            .row_quantities(&family.initial_beta)
+            .expect("the seed is monotone on every row, so the family's own gate accepts it");
+        let min_h_prime = row.h_prime.iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(
+            min_h_prime > 0.0,
+            "h' at the seed is positive on every row: min = {min_h_prime:e}"
+        );
+        (family.initial_beta.clone(), p_resp)
+    };
+
+    // Arm 1: column 0 is the intercept. The seed must be the one this function always produced.
+    let with_intercept = array![[1.0, -1.0], [1.0, -0.5], [1.0, 0.5], [1.0, 1.0]];
+    let (beta, p_resp) = seed_for(&with_intercept);
+    let p_cov = with_intercept.ncols();
+    let alpha_const = beta[p_cov];
+    assert!(
+        alpha_const > 0.0,
+        "the intercept-design seed carries a positive shape scale: {alpha_const:e}"
+    );
+    for k in 1..p_resp {
+        assert_eq!(
+            beta[k * p_cov],
+            alpha_const,
+            "shape row {k} keeps the one shape scale on the intercept column"
+        );
+        for c in 1..p_cov {
+            assert_eq!(
+                beta[k * p_cov + c],
+                0.0,
+                "shape row {k} column {c} stays exactly zero, as `a = e_0` gave"
+            );
+        }
+    }
+
+    // Arm 2: column 0 changes sign; the constant lives in column 1.
+    let without_intercept = array![[-1.0, 1.0], [-0.5, 1.0], [0.5, 1.0], [1.0, 1.0]];
+    let leading_min = without_intercept
+        .column(0)
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        leading_min < 0.0,
+        "the control: `a = e_0` is outside the cone on this design, min = {leading_min:e}"
+    );
+    let (beta, p_resp) = seed_for(&without_intercept);
+    let p_cov = without_intercept.ncols();
+    let mut worst = f64::INFINITY;
+    for k in 1..p_resp {
+        let field = without_intercept.dot(&beta.slice(s![k * p_cov..(k + 1) * p_cov]));
+        worst = worst.min(field.iter().copied().fold(f64::INFINITY, f64::min));
+    }
+    assert!(
+        worst >= 0.0,
+        "the seed's shape rows are inside the cone on every covariate row: worst alpha = {worst:e}"
+    );
+    assert!(
+        beta[p_cov + 1] > 0.0,
+        "the seed moved its shape mass onto the design's constant column: {:e}",
+        beta[p_cov + 1]
+    );
+}
+
 #[test]
 pub(crate) fn warm_start_absorbs_offset_into_affine_seed() {
     // The direct-alpha warm start is built directly in coefficient space: choose a

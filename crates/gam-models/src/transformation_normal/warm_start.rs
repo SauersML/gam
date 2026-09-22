@@ -8,9 +8,11 @@ use super::*;
 /// derivative and approximately centered transformed response.
 ///
 /// Direct-alpha SCOP is affine in the shape rows:
-/// `h'=Σ M_k(y)α_k(x)`. The warm start initializes those rows to a
-/// positive constant derivative scale and then solves only the location row
-/// `b(x)` against the remaining affine target.
+/// `h'=Σ M_k(y)α_k(x)`. The warm start gives every shape row the same
+/// covariate vector, scaled to match the weighted average derivative target,
+/// and then solves only the location row `b(x)` against the remaining affine
+/// target. That vector has to put `α_k` inside the monotonicity cone at every
+/// covariate row, not on average (gam#4567).
 pub(crate) fn compute_warm_start(
     response: &Array1<f64>,
     weights: &Array1<f64>,
@@ -60,9 +62,11 @@ pub(crate) fn compute_warm_start(
         target_hp[i] = inv_tau;
     }
 
-    // Seed the direct monotone shape rows with a constant positive alpha that
-    // matches the weighted average derivative target, then solve only the
-    // unconstrained location row in coefficient space.
+    // Seed the direct monotone shape rows with one covariate vector, scaled so the start's
+    // weighted average derivative matches the target's, then solve only the unconstrained
+    // location row in coefficient space.
+    let zero_offset = Array1::<f64>::zeros(n);
+    let log_lambdas = Array1::<f64>::zeros(covariate_penalties.len());
     let weight_sum = weights.iter().copied().sum::<f64>();
     if !(weight_sum.is_finite() && weight_sum > 0.0) {
         return Err(TransformationNormalError::DesignDegenerate {
@@ -85,9 +89,79 @@ pub(crate) fn compute_warm_start(
         .into());
     }
 
+    // THE SHAPE SEED'S DIRECTION MUST BE INSIDE THE CONE AT EVERY ROW, not on average (gam#4567).
+    //
+    // Every shape row gets the same covariate vector `a`, so `α_k(x) = ψ(x)ᵀa` for every k and
+    // `h'(y, x) = (Σ_{k≥1} M_k(y))·ψ(x)ᵀa`. The response derivative basis is non-negative, so
+    // this start is monotone at row `i` exactly when `ψ(x_i)ᵀa ≥ 0`, and the family's factored
+    // monotonicity cone (`block_linear_constraints`: `α_k(x_i) = ψ_iᵀA[k,:] ≥ 0`) asks that of
+    // EVERY row. The only check here was on the weighted MEAN of `unit_shape_hp` below, which
+    // stays positive whenever the positive rows outweigh the negative ones: a per-row
+    // requirement verified by an average is not verified.
+    //
+    // `a = e_0` is such a vector exactly when the design's first column is positive on every
+    // row. In the standard term-collection layout `[intercept | linear | random | smooth]` it is
+    // the intercept, so that holds and this function keeps producing the seed it always
+    // produced, coefficient for coefficient. It does NOT hold for a `ModelLevel::NoIntercept`
+    // collection, where column 0 is the first centered smooth column and changes sign across the
+    // rows by construction; there the seed was outside the cone at every negative row and the
+    // family's own gate refused the fit.
+    //
+    // When column 0 is not usable, `a` is the design's own least-squares representation of the
+    // constant field 1, through the same penalized projection this function already uses for the
+    // location row. Whether THAT is inside the cone is a property of the design, checked per row
+    // below and refused by name when it is not.
+    let mut shape_direction = Array1::<f64>::zeros(p_cov);
+    shape_direction[0] = 1.0;
+    let leading_column = covariate_design.matrixvectormultiply(&shape_direction);
+    let leading_column_is_positive = leading_column
+        .iter()
+        .all(|value| value.is_finite() && *value > 0.0);
+    if !leading_column_is_positive {
+        let ones = Array1::<f64>::ones(n);
+        shape_direction = solve_penalizedweighted_projection(
+            covariate_design,
+            &zero_offset,
+            &ones,
+            weights,
+            covariate_penalties,
+            &log_lambdas,
+            WARMSTART_PROJECTION_RIDGE_FLOOR,
+        )?;
+    }
+    // The constraint is the cone's own field `ψᵀa`, not `h'`, whose fixed floor ε hides a
+    // negative field wherever the response derivative basis happens to vanish, and not an
+    // average of either.
+    let shape_field = covariate_design.matrixvectormultiply(&shape_direction);
+    let mut min_shape_field = f64::INFINITY;
+    let mut min_shape_row = 0usize;
+    for (row, value) in shape_field.iter().copied().enumerate() {
+        if !value.is_finite() {
+            return Err(TransformationNormalError::NonFinite {
+                reason: format!("SCOP warm start shape field at row {row} is {value}"),
+            }
+            .into());
+        }
+        if value < min_shape_field {
+            min_shape_field = value;
+            min_shape_row = row;
+        }
+    }
+    if !(min_shape_field >= 0.0) {
+        return Err(TransformationNormalError::DesignDegenerate {
+            reason: format!(
+                "SCOP warm start: no shape seed shared by the response rows lies inside the \
+                 monotonicity cone on this covariate design; the design's closest constant field \
+                 is {min_shape_field:.6e} at row {min_shape_row} (gam#4567)"
+            ),
+        }
+        .into());
+    }
     let mut beta = Array1::<f64>::zeros(p_total);
     for k in 1..p_resp {
-        beta[k * p_cov] = 1.0;
+        for c in 0..p_cov {
+            beta[k * p_cov + c] = shape_direction[c];
+        }
     }
     let unit_shape_hp = x_deriv_kron.forward_mul(&beta);
     let mean_unit_shape_hp = weights
@@ -96,6 +170,8 @@ pub(crate) fn compute_warm_start(
         .map(|(&w, &hp)| w * hp)
         .sum::<f64>()
         / weight_sum;
+    // The mean is the SCALE's denominator, not a feasibility claim: it matches the start's
+    // average derivative to the target's. The per-row verdict above is what makes it monotone.
     if !(mean_unit_shape_hp.is_finite() && mean_unit_shape_hp > 0.0) {
         return Err(TransformationNormalError::NonFinite {
             reason: format!(
@@ -111,15 +187,17 @@ pub(crate) fn compute_warm_start(
         }
         .into());
     }
+    // Scaling a non-negative field by a positive constant keeps every row non-negative, so the
+    // start stays inside the cone at the matched derivative scale.
     beta.fill(0.0);
     for k in 1..p_resp {
-        beta[k * p_cov] = alpha_const;
+        for c in 0..p_cov {
+            beta[k * p_cov + c] = alpha_const * shape_direction[c];
+        }
     }
 
     let shape_h = x_val_kron.forward_mul(&beta);
     let location_target = &target_h - &shape_h;
-    let zero_offset = Array1::<f64>::zeros(n);
-    let log_lambdas = Array1::<f64>::zeros(covariate_penalties.len());
     let location_beta = solve_penalizedweighted_projection(
         covariate_design,
         &zero_offset,

@@ -15519,3 +15519,22 @@ publish paths.
   including Duchon/Matern basis coverage, sparse-native REML paths, probit
   location-scale warm starts, model-consistency fixes, and the first Rust CI
   workflow.
+- **A CTN warm start that asserted a per-row cone constraint and checked a weighted mean**
+  (gam#4567, found while reading the transformation-normal inner solve). The direct-alpha SCOP
+  start gives every shape row the same covariate vector `a`, so `α_k(x) = ψ(x)ᵀa` and the family's
+  own factored monotonicity cone (`block_linear_constraints`) asks `ψ(x_i)ᵀa ≥ 0` at `i = 1..n`
+  and `k = 1..p_resp-1`. `compute_warm_start` fixed `a = e_0` and verified only the weighted MEAN
+  of the induced `h'`, which stays positive whenever the positive rows outweigh the negative ones:
+  a per-row requirement checked by an average is not checked. `a = e_0` is admissible exactly when
+  the design's first column is positive on every row. In the standard term-collection layout
+  `[intercept | linear | random | smooth]` it is the intercept, so that held and the start was
+  correct; it does not hold for a `ModelLevel::NoIntercept` collection, which a CTN formula that
+  drops the intercept (`… - 1` with no constant-spanning term) produces, and there column 0 is the
+  first sum-to-zero-centred smooth column and changes sign across the rows by construction. Every
+  shape row was then outside the cone at every negative row, and the fit died at its own gate with
+  no statement of why. The seed now keeps `e_0` whenever the design's first column is strictly
+  positive — bit-identical to the old seed, coefficient for coefficient, on every design with an
+  intercept — falls back to the design's own penalized least-squares representation of the
+  constant field otherwise, and checks the cone's own field `ψᵀa` per row rather than `h'`, whose
+  fixed floor `ε` hides a negative field wherever the response derivative basis vanishes. A design
+  that admits no such direction is refused by name, with the minimum and the row that attains it.
