@@ -4013,10 +4013,23 @@ mod tests {
     /// A read whose products round into the subnormal range (#4005). Each of eight products
     /// `3e-161 · 7e-162 ≈ 42.504 · 2^-1074` rounds to a multiple of `2^-1074` and loses about
     /// `0.496 · 2^-1074`, which no relative band sees: the read's error is near
-    /// `3.96 · 2^-1074`. The exact error is measured by scaling both operands by `2^600` into
-    /// the normal range, where a fused multiply-add gives each product's rounding error exactly
-    /// and every power-of-two scaling is exact. Positive control: the relative band alone,
-    /// `γ_d |W| |x̂| / (1 − γ_(d+3))`, lies below that error.
+    /// `3.96 · 2^-1074`. Every quantity here is measured in units of `2^-1074`, so each
+    /// comparison is between plain normal numbers.
+    ///
+    /// The units matter and are not cosmetic (#2822). Written as `3.5 · SUBNORMAL_SPACING`
+    /// the bar is not the bar: the subnormal grid holds only integer multiples of `2^-1074`,
+    /// so that product rounds to `4 · 2^-1074` and demands a whole spacing more than it says,
+    /// which the measured `3.964` does not clear. Scaling the comparison into the normal range
+    /// by `scale · scale` compounds it, because `2^600 · 2^600` overflows: the bar saturates
+    /// at `f64::MAX`, and a diagnostic dividing by it reports an error of zero for an error of
+    /// four spacings. The operands are still scaled by `2^600` to read each product's rounding
+    /// exactly through a fused multiply-add, but the scaling is undone before anything is
+    /// compared, and `scale · (scale · SUBNORMAL_SPACING)` is associated so no factor leaves
+    /// the normal range.
+    ///
+    /// Positive control: the relative band alone, `γ_d |W| |x̂| / (1 − γ_(d+3))`, misses the
+    /// error entirely — at this magnitude it underflows to exactly zero, so the whole band is
+    /// the read's underflow reach.
     #[test]
     fn a_read_band_encloses_products_that_round_into_the_subnormal_range() {
         const PRODUCTS: usize = 8;
@@ -4028,26 +4041,34 @@ mod tests {
         let (weight_scaled, row_scaled) = (weight_entry * scale, row_entry * scale);
         let product = weight_scaled * row_scaled;
         let residual = weight_scaled.mul_add(row_scaled, -product);
-        // The exact read times 2^1200 is `8 (product + residual)`. The computed read times
-        // 2^1200 is within a factor two of `8 product`, so their difference is exact.
-        let exact_scaled = PRODUCTS as f64;
-        let error = ((read[[0, 0]] * scale * scale - exact_scaled * product) - exact_scaled * residual).abs();
+        // One spacing at the scaled magnitude, `2^600 · 2^600 · 2^-1074 = 2^126`. Associated
+        // so the inner factor is `2^-474`: no intermediate leaves the normal range.
+        let scaled_spacing = scale * (scale * SUBNORMAL_SPACING);
+        // Every division below is by a power of two and so is exact. The computed read is an
+        // integer multiple of the spacing (subnormal sums are exact), and the exact read is
+        // `8 (product + residual)` at the scaled magnitude.
+        let computed_spacings = read[[0, 0]] / SUBNORMAL_SPACING;
+        let terms = PRODUCTS as f64;
+        let exact_spacings = terms * product / scaled_spacing + terms * residual / scaled_spacing;
+        let error_spacings = (computed_spacings - exact_spacings).abs();
         assert!(
-            error > 3.5 * SUBNORMAL_SPACING * scale * scale,
-            "the fixture must lose most of four subnormal spacings to underflow, lost {:e}",
-            error / (scale * scale)
+            error_spacings > 3.5,
+            "the fixture must lose most of four subnormal spacings to underflow, \
+             lost {error_spacings:.4} (computed {computed_spacings}, exact {exact_spacings:.6})"
         );
+        let band_spacings = band[[0, 0]] / SUBNORMAL_SPACING;
         assert!(
-            error <= band[[0, 0]] * scale * scale,
-            "the read band {:e} must enclose the underflow error {:e}",
-            band[[0, 0]],
-            error / (scale * scale)
+            error_spacings <= band_spacings,
+            "the read band of {band_spacings:.4} spacings must enclose the underflow error of \
+             {error_spacings:.4} spacings"
         );
         let magnitude = abs_map(weight.view(), rows.view())[[0, 0]];
         let relative = accumulation_growth(PRODUCTS) * magnitude / (1.0 - accumulation_growth(PRODUCTS + 3));
         assert!(
-            relative * scale * scale < error,
-            "positive control: the relative band {relative:e} alone must miss the underflow error"
+            relative / SUBNORMAL_SPACING < error_spacings,
+            "positive control: the relative band of {:.4} spacings alone must miss the \
+             underflow error of {error_spacings:.4} spacings",
+            relative / SUBNORMAL_SPACING
         );
     }
 
