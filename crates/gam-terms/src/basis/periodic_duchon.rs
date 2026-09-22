@@ -1898,11 +1898,19 @@ fn reject_nonpsd_then_clamp_noise(matrix: &Array2<f64>) -> Result<Array2<f64>, B
         .fold(0.0_f64, |acc, v| acc.max(v.abs()));
     let min_ev = evals.iter().copied().fold(f64::INFINITY, f64::min);
     // Noise-floor tolerance in eigenvalue units, so uniform scaling of the
-    // penalty does not change the PSD decision. Read from the canonical
-    // penalty-spectrum cutoff itself: this block is scored for rank downstream
-    // against that same cutoff, so a PSD verdict taken against a private copy
-    // of its formula could disagree with the rank it is later assigned.
-    let tol = spectral_tolerance(&evals);
+    // penalty does not change the PSD decision. Read from the canonical NOISE
+    // cutoff, which is the question this site asks: is `λ_min < 0` roundoff, or
+    // real negative curvature worth refusing on? It used to read the RANK
+    // cutoff, on the argument that a PSD verdict taken against a private copy of
+    // the rank formula could disagree with the rank later assigned. That
+    // argument does not survive gam#4057: the rank cutoff is now the
+    // eigensolver's own band `p·ε·max|λ|`, four decades tighter, and gam#1619
+    // measured this kernel's assembly roundoff at about `1e-11` relative — so
+    // moving with the rank cutoff would turn ordinary assembly noise into an
+    // `IndefinitePenalty` refusal on PSD penalties. The two never had to agree:
+    // a direction inside the rank band and outside the noise band is not a
+    // disagreement, it is two questions with different answers.
+    let tol = spectral_noise_tolerance(&evals);
     if min_ev < -tol {
         // Typed like the Matérn kernel penalty's refusal. The incremental κ realizer
         // retreats from `IndefinitePenalty` at a trial ψ and aborts the fit on any other

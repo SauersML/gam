@@ -486,9 +486,14 @@ fn analytic_hessian_matches_fd_under_rank_deficient_penalty() {
 // Test 4: a weak-tail penalty sharing its range with a second penalty, at a large λ
 // -----------------------------------------------------------------------
 
-/// The eigenvalues of the weak-tail penalty, largest first. Ten decades wide, so
-/// the two smallest sit under the canonical penalty rank cut
-/// `dim · SPECTRAL_RANK_RELATIVE_TOLERANCE · max|ev|` = `10 · 1e-10 · 1` = 1e-9.
+/// The eigenvalues of the weak-tail penalty, largest first. Ten decades wide,
+/// which is the q1561-qa2 shape; every one of them is RESOLVED against the
+/// canonical penalty rank cut `dim · ε · max|ev|` = `10 · 2.2e-16 · 1` = 2.2e-15
+/// (gam#4057). Under the cut this fixture was written against,
+/// `10 · 1e-10 · 1` = 1e-9, the two smallest (5e-10, 5e-11) were discarded as
+/// unpenalized null while still carrying `λ_tail · 5e-10 ≈ 0.15` and
+/// `λ_tail · 5e-11 ≈ 1.5e-2` of penalty curvature against a likelihood curvature
+/// of about 0.8 — the defect the cut move removes at the root.
 const WEAK_TAIL_SPECTRUM: [f64; 10] = [1.0, 5e-5, 1e-6, 8e-8, 2e-8, 5e-9, 3e-9, 2e-9, 5e-10, 5e-11];
 
 /// n=60 Gaussian-identity problem: an intercept and one 10-column block penalized
@@ -497,19 +502,30 @@ const WEAK_TAIL_SPECTRUM: [f64; 10] = [1.0, 5e-5, 1e-6, 8e-8, 2e-8, 5e-9, 3e-9, 
 /// `s_tail = Q diag(WEAK_TAIL_SPECTRUM) Qᵀ` in a rotated orthonormal basis `Q`, and
 /// `s_mix` is a rank-2 penalty mixing the tail's weakest eigenvectors with its
 /// strongest, so the two components are not orthogonal. The columns are scaled
-/// so the likelihood curvature is about 0.8 per direction. At `λ_tail = e^19.5` the
-/// directions the rank cut calls null still carry penalty curvature
-/// `λ·5e-10 ≈ 0.15` and `λ·5e-11 ≈ 0.015`, which is not negligible against 0.8.
+/// so the likelihood curvature is about 0.8 per direction. At `λ_tail = e^19.5`
+/// the two weakest directions carry penalty curvature `λ·5e-10 ≈ 0.15` and
+/// `λ·5e-11 ≈ 0.015`, which is not negligible against 0.8 — so the criterion's
+/// ρ-gradient has to describe them whether or not a rank rule keeps them.
 ///
 /// This is the shape of q1561-qa2's defect A: a survival transformation fit
 /// (Weibull by-factor) where the analytic ρ-gradient read −1.53e-2 on exactly one
 /// weak-tail block sharing its range with another block, while a central difference
 /// stable across four decades of h read +0.317.
 ///
-/// This test holds the standard lane to one penalty for the value and the gradient
-/// where the rank cut drops directions. The survival lane's inner solve runs on the
-/// raw blocks rather than on the canonical roots, so this lane passing does not cover
-/// that one.
+/// This test holds the standard lane to one penalty for the value and the
+/// gradient across ten decades of penalty spectrum at a large `λ`. The survival
+/// lane's inner solve runs on the raw blocks rather than on the canonical roots,
+/// so this lane passing does not cover that one.
+///
+/// It no longer covers "the rank cut drops a direction that still carries
+/// material curvature", and no fixture can: after gam#4057 a dropped direction
+/// is by construction one whose eigenvalue is inside the decomposition's own
+/// `dim·ε·max|ev|` band, so an assembled `Q diag(·) Qᵀ` cannot place one there
+/// and have it mean anything — the returned eigenvalue would be its own
+/// roundoff, of either sign. Genuine sub-band modes still exist (an `m`-th
+/// order difference penalty's smallest is `(π/p)^{2m}`, `8.8e-16` at `m = 4,
+/// p = 400`), and recovering them is the declared-null-basis work of gam#3023,
+/// not a threshold this test can exercise.
 fn build_gaussian_weak_tail_shared_range(
     seed: u64,
 ) -> (Array2<f64>, Array1<f64>, Array1<f64>, Vec<BlockwisePenalty>) {
@@ -583,15 +599,36 @@ fn build_gaussian_weak_tail_shared_range(
 
 #[test]
 fn weak_tail_penalty_sharing_a_range_gradient_matches_finite_difference() {
-    // Non-vacuity: exactly two of the tail's eigenvalues must sit under the rank cut,
-    // or this fixture does not exercise the directions it exists for.
-    let cut = WEAK_TAIL_SPECTRUM.len() as f64
-        * 1e-10
-        * WEAK_TAIL_SPECTRUM.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    // Non-vacuity, in the two halves the fixture exists for.
+    //
+    // (a) The rank cut is the eigensolver's own band, so every tail direction is
+    //     resolved and none is discarded as unpenalized null (gam#4057). Written
+    //     as the same product `spectral_tolerance_for_dim` forms, so this guard
+    //     moves if the cut ever moves again.
+    let max_abs = WEAK_TAIL_SPECTRUM.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let cut = WEAK_TAIL_SPECTRUM.len() as f64 * f64::EPSILON * max_abs;
     let under_cut = WEAK_TAIL_SPECTRUM.iter().filter(|&&v| v <= cut).count();
     assert_eq!(
-        under_cut, 2,
-        "fixture must put exactly two tail eigenvalues under the rank cut {cut:.3e}"
+        under_cut, 0,
+        "every tail eigenvalue must be resolved against the rank cut {cut:.3e}; the weakest is {:.3e}",
+        WEAK_TAIL_SPECTRUM.iter().fold(f64::INFINITY, |acc: f64, &v| acc.min(v)),
+    );
+    // (b) The weakest direction still carries penalty curvature the ρ-gradient
+    //     must describe: `λ_tail · λ_min` has to clear the relative bar this test
+    //     compares the gradient at, times the per-direction likelihood curvature
+    //     the columns are scaled to. Otherwise the fixture would pass on a
+    //     gradient that ignored the tail entirely.
+    let lambda_tail = 19.5_f64.exp();
+    let weakest_penalty_curvature =
+        lambda_tail * WEAK_TAIL_SPECTRUM.iter().fold(f64::INFINITY, |acc: f64, &v| acc.min(v));
+    let likelihood_curvature = 0.8_f64;
+    let gradient_relative_bar = 1e-3_f64;
+    assert!(
+        weakest_penalty_curvature > gradient_relative_bar * likelihood_curvature,
+        "the weakest tail direction carries penalty curvature {weakest_penalty_curvature:.3e} at \
+         lambda_tail = e^19.5, which does not clear the {gradient_relative_bar:.0e} relative bar \
+         against a likelihood curvature of {likelihood_curvature}: the gradient could ignore the \
+         tail and still pass"
     );
 
     let (x, y, w, s_list) = build_gaussian_weak_tail_shared_range(29);

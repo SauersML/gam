@@ -234,6 +234,37 @@
   licence. A correction that reaches its order search with no certified value band declines
   instead of choosing a target, returning the exact Laplace criterion; the production
   route always defers its admission to a certified optimum, so it always carries one.
+- **The component canonicalizer cut a penalty's rank four decades above the eigensolver's own
+  band, so genuine low-curvature modes became an unpenalized null space no lambda could
+  shrink** (gam#4057, gam#2469). `spectral_tolerance_for_dim` scored the rank at
+  `dim * SPECTRAL_RANK_RELATIVE_TOLERANCE * max|lambda|` with the constant at `1e-10`, while
+  the frozen rho+psi ranks, the balanced structural rank and `response_geometry` all counted
+  with `gam_linalg::roundoff`'s resolved-eigenvalue band `dim * eps * max|lambda|`. One
+  question, two answers, and the loose one is not a property of any decomposition: by Weyl a
+  backward-stable symmetric eigensolver resolves an eigenvalue exactly down to
+  `p * eps * ||H||_2`, so everything above that is a measurement the rank rule has no licence
+  to discard. The smallest nonzero relative eigenvalue of an `m`-th order difference penalty
+  is about `(pi/p)^{2m}`, so a cut that grows with `p` at `1e-10` drops genuine modes once `p`
+  is moderate: the old constant's own doc recorded a 4th-difference penalty at `m = 300`
+  losing 20 degrees of freedom, and the dropped directions inflate EDF because REML cannot
+  shrink a direction it has been told carries no penalty. `spectral_tolerance_for_dim` is now
+  `symmetric_spectrum_rounding_band_at_dim(dim, spectrum)` -- the same predicate, at the same
+  band, with the dimension explicit because a floor that must survive a later congruence is
+  scored at the EMBEDDED dimension -- and `SPECTRAL_RANK_RELATIVE_TOLERANCE` is deleted.
+  Every ladder defined relative to the cut moves with it, as its doc required:
+  `duchon_range_floor_curvature` lifts the lowest Duchon curvatures to
+  `RANGE_FLOOR_ABOVE_SPECTRAL_RANK_CUTOFF` times the cut, and now lifts four decades less
+  because four decades fewer directions were being misread as null in the first place.
+  The Duchon PSD refusal in `periodic_duchon.rs` does NOT move: it asks whether
+  `lambda_min < 0` is roundoff, which is `spectral_noise_tolerance`'s question with the
+  opposite safety direction, and gam#1619 measured that kernel's assembly roundoff at about
+  `1e-11` relative -- moving it with the rank cut would have turned ordinary assembly noise
+  into an `IndefinitePenalty` refusal on PSD penalties. Readers should check that
+  `weak_tail_penalty_sharing_a_range_gradient_matches_finite_difference` now asserts that NO
+  tail eigenvalue is discarded and that the weakest still carries curvature the rho-gradient
+  must describe; the sub-band nullities that no spectral threshold can recover
+  (`8.8e-16` at `m = 4, p = 400`, under `p * eps = 8.8e-14`) are gam#3023's declared
+  null basis, not a threshold.
 
 - **A memory-budget refusal names the reservation that refused it** (#4565). The governor's
   ledger is process-wide, so `MemoryReservationError::BudgetExceeded` reported how many bytes

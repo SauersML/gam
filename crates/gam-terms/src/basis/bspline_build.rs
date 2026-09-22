@@ -1722,17 +1722,6 @@ pub(crate) fn project_penalty_to_psd_cone(
     Ok(clamped)
 }
 
-/// The relative width of the canonical penalty-spectrum rank cutoff, in
-/// eigenvalue units per penalty dimension.
-///
-/// This is the one place the convention's magnitude is written. Every other
-/// site that needs it — including the ladders defined *relative* to it, such as
-/// `duchon_range_floor_curvature`'s range floor — must reach it through
-/// [`spectral_tolerance`] or [`spectral_tolerance_for_dim`] rather than
-/// restating the number, so a change here moves every dependent decision
-/// together.
-pub(crate) const SPECTRAL_RANK_RELATIVE_TOLERANCE: f64 = 1e-10;
-
 /// The relative width of the penalty-spectrum cutoff below which a NEGATIVE
 /// eigenvalue is read as roundoff rather than as genuine negative curvature.
 ///
@@ -1749,7 +1738,20 @@ pub(crate) const SPECTRAL_RANK_RELATIVE_TOLERANCE: f64 = 1e-10;
 /// movable without arming every PSD refusal in the crate (#2469).
 pub(crate) const SPECTRAL_NOISE_RELATIVE_TOLERANCE: f64 = 1e-10;
 
-/// The canonical penalty-spectrum rank cutoff at a caller-stated dimension.
+/// The canonical penalty-spectrum rank cutoff at a caller-stated dimension:
+/// the eigensolver's own backward-error band `dim·ε·max|λ|`.
+///
+/// This is the SAME predicate the frozen ρ+ψ ranks, the balanced structural
+/// rank and `response_geometry` already count with — `gam_linalg::roundoff`'s
+/// resolved-eigenvalue band at an exactly-formed operator — so "how many
+/// directions does this penalty penalize?" now has one answer on every path
+/// (gam#4057, gam#2469). It used to be `dim·1e-10·max|λ|`, four to five decades
+/// looser, and that width is not a property of any decomposition: by Weyl a
+/// backward-stable symmetric eigensolver resolves an eigenvalue exactly down to
+/// `p·ε·‖H‖₂`, and everything above that is a measurement the rank rule has no
+/// licence to discard. The measured cost of discarding it was recorded on the
+/// old constant itself: a 4th-difference penalty at `m = 300` lost 20 degrees of
+/// freedom to an unpenalized null space no `λ` could shrink.
 ///
 /// The dimension is an explicit argument because the consumers do not all score
 /// the spectrum they hold: a block's rank is decided at its own dimension,
@@ -1757,14 +1759,26 @@ pub(crate) const SPECTRAL_NOISE_RELATIVE_TOLERANCE: f64 = 1e-10;
 /// scored at the EMBEDDED dimension of the assembled block. Making the caller
 /// state which one it means is what keeps the two from silently reaching for
 /// whichever count is in scope.
+///
+/// The band is in eigenvalue units, so uniform penalty scaling does not change
+/// a rank decision for the same spectrum shape. It is NOT the cutoff below
+/// which a negative eigenvalue is read as roundoff — that is
+/// [`spectral_noise_tolerance`], a different question with the opposite safety
+/// direction, and it does not move with this one.
+///
+/// Below this band a genuine eigenvalue is indistinguishable from the
+/// decomposition's own error, so no spectral threshold can recover it: an
+/// `m`-th order difference or Duchon penalty whose smallest genuine relative
+/// eigenvalue is `(π/p)^{2m}` reaches `8.8e-16` at `m = 4, p = 400`, under
+/// `p·ε = 8.8e-14`. Those nullities must be DECLARED by the basis that knows
+/// its polynomial null space (gam#3023), not read off a spectrum.
 pub(crate) fn spectral_tolerance_for_dim(dim: usize, evals: &Array1<f64>) -> f64 {
-    let max_abs_ev = evals
-        .iter()
-        .copied()
-        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
-    // Keep the cutoff in eigenvalue units so uniform penalty scaling does not
-    // change PSD/rank decisions for the same spectrum shape.
-    (dim.max(1) as f64) * SPECTRAL_RANK_RELATIVE_TOLERANCE * max_abs_ev
+    gam_linalg::roundoff::symmetric_spectrum_rounding_band_at_dim(
+        dim,
+        evals
+            .as_slice()
+            .expect("a penalty spectrum is an owned contiguous Array1 from a symmetric eigensolve"),
+    )
 }
 
 /// The canonical penalty-spectrum rank cutoff for a spectrum scored at its own
@@ -2054,7 +2068,10 @@ pub(crate) fn analyze_penalty_block_with_op(
             negative_dim: 0,
             // An empty block has no spectrum to scale against; carry the
             // conventions themselves rather than a literal standing in for them.
-            rank_tol: SPECTRAL_RANK_RELATIVE_TOLERANCE,
+            // The rank convention is the eigensolver's own relative band, `ε`
+            // per dimension (gam#4057); the noise convention is its own
+            // constant and is unrelated to it.
+            rank_tol: f64::EPSILON,
             noise_tol: SPECTRAL_NOISE_RELATIVE_TOLERANCE,
             iszero: true,
             op,

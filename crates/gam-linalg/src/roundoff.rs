@@ -199,10 +199,24 @@ pub fn symmetric_assembly_band(
 /// below this band is not resolved from zero by the decomposition that produced
 /// it, and a sign inside it is not a measurement.
 pub fn symmetric_spectrum_rounding_band(eigenvalues: &[f64]) -> f64 {
+    symmetric_spectrum_rounding_band_at_dim(eigenvalues.len(), eigenvalues)
+}
+
+/// [`symmetric_spectrum_rounding_band`] at a caller-stated dimension.
+///
+/// A symmetric eigendecomposition returns one eigenvalue per dimension, so
+/// `eigenvalues.len()` IS the matrix order and that is the band
+/// [`symmetric_spectrum_rounding_band`] takes. A caller scoring a spectrum
+/// against the dimension it will be EMBEDDED in — a block whose floor has to
+/// survive a later congruence into a larger assembled penalty — states that
+/// dimension instead, because the `p` in `p·ε·‖H‖₂` is the order of the matrix
+/// whose decomposition the eigenvalue must be resolved by, not of the one it
+/// was read from.
+pub fn symmetric_spectrum_rounding_band_at_dim(dim: usize, eigenvalues: &[f64]) -> f64 {
     let spectral_radius = eigenvalues
         .iter()
         .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    eigenvalues.len() as f64 * f64::EPSILON * spectral_radius
+    dim.max(1) as f64 * f64::EPSILON * spectral_radius
 }
 
 /// The rank of a symmetric Gram, read off its eigenvalues: those above
