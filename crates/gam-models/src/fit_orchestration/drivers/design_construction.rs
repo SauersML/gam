@@ -5088,8 +5088,7 @@ mod refit_seed_2902_tests {
         BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
         OneDimensionalBoundary,
     };
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     /// #2902 row 9: a refit seeded from a converged fit starts the outer search at
     /// that fit's own `ρ*`, bit for bit and strictly inside the declared domain.
@@ -5155,13 +5154,13 @@ mod refit_seed_2902_tests {
         .expect("the Poisson s(x) fixture fits");
         let rho_star = converged.fit.log_lambdas.clone();
 
-        let seen: Rc<RefCell<Option<OuterSeedLayout>>> = Rc::new(RefCell::new(None));
-        let sink = Rc::clone(&seen);
+        let seen: Arc<Mutex<Option<OuterSeedLayout>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&seen);
         observe_next_outer_seed(
             0,
             Box::new(
                 move |probe: &mut dyn OuterSeedProbe| -> Result<(), EstimationError> {
-                    *sink.borrow_mut() = Some(probe.layout().clone());
+                    *sink.lock().expect("the observer sink lock is not poisoned") = Some(probe.layout().clone());
                     Ok(())
                 },
             ),
@@ -5182,7 +5181,7 @@ mod refit_seed_2902_tests {
             refit.err()
         );
         let layout = seen
-            .borrow_mut()
+            .lock().expect("the observer sink lock is not poisoned")
             .take()
             .expect("the refit's outer search entered a seed");
         let bits = |values: &Array1<f64>| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();

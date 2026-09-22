@@ -48,6 +48,7 @@
 //! thread tree of its own; [`confine_matrixmultiply_to_the_pool`] keeps that
 //! tree empty, so no gam computation starts a thread outside the pool.
 
+use std::any::Any;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
@@ -202,6 +203,104 @@ impl Drop for RootMark {
     }
 }
 
+/// Moves a carried thread-local's content in and out of the current thread's
+/// slot: stores the argument and returns what the slot held.
+pub type CarriedLocalSwap = fn(Option<Box<dyn Any + Send>>) -> Option<Box<dyn Any + Send>>;
+
+/// One thread-local that follows a computation across [`install`]'s hop.
+struct CarriedLocal {
+    swap: CarriedLocalSwap,
+    next: AtomicPtr<CarriedLocal>,
+}
+
+/// Every carried thread-local, as an append-only list. Lock-free for the same
+/// reason [`POOL`] is: a lock a parent thread held at a `fork()` stays held in
+/// the child. Entries are leaked, never freed.
+static CARRIED_LOCALS: AtomicPtr<CarriedLocal> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Make one thread-local follow every computation [`install`] moves onto the
+/// pool.
+///
+/// # Why
+///
+/// A thread-local a caller sets on its own thread is invisible to the worker
+/// [`install`] runs the computation on. The outer-evidence channels are
+/// exactly that: a test arms a probe on its own thread, calls a fit entry
+/// point, and reads what the fit published. Since the entry points began
+/// hopping onto the pool, a probe armed that way was never lent and an
+/// audit was never written, and nothing reported it (gam#4566). A registered
+/// channel is taken from the caller before the hop, swapped into the worker
+/// for the computation's duration, and handed back afterwards. What the
+/// computation left in it is returned to the caller, and the worker keeps
+/// what it held.
+///
+/// The worker's previous content is restored rather than cleared because a
+/// worker waiting inside one root computation can steal another's, so the two
+/// nest on its stack.
+///
+/// This is a registration hook rather than a fixed list only because the
+/// channels belong to crates above this one; the registry holds exactly what
+/// they register. Today that is two channels, both in
+/// `gam_solve::estimate::outer_eval_capture`: the outer-seed observer and the
+/// ρ-block audit.
+///
+/// Register each channel once per process. `swap` must store its argument in
+/// the channel and return what the channel held.
+pub fn carry_across_install(swap: CarriedLocalSwap) {
+    let entry = Box::into_raw(Box::new(CarriedLocal {
+        swap,
+        next: AtomicPtr::new(std::ptr::null_mut()),
+    }));
+    loop {
+        let head = CARRIED_LOCALS.load(Ordering::Acquire);
+        // SAFETY: `entry` came from `Box::into_raw` above and is not published
+        // until the exchange below succeeds.
+        unsafe { (*entry).next.store(head, Ordering::Relaxed) };
+        if CARRIED_LOCALS
+            .compare_exchange(head, entry, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+/// The registered channels, newest first.
+fn carried_locals() -> impl Iterator<Item = &'static CarriedLocal> {
+    let mut cursor = CARRIED_LOCALS.load(Ordering::Acquire);
+    std::iter::from_fn(move || {
+        // SAFETY: every published entry came from `Box::into_raw` and is never
+        // freed, so it is valid for the rest of the process.
+        let entry = unsafe { cursor.as_ref() }?;
+        cursor = entry.next.load(Ordering::Acquire);
+        Some(entry)
+    })
+}
+
+/// A carried channel's content, paired with its channel.
+type CarriedContent = Vec<(&'static CarriedLocal, Option<Box<dyn Any + Send>>)>;
+
+/// Swap each channel's content into this thread and return what it held.
+fn swap_carried(content: CarriedContent) -> CarriedContent {
+    content
+        .into_iter()
+        .map(|(local, value)| (local, (local.swap)(value)))
+        .collect()
+}
+
+/// Puts a worker's own channel content back if the computation unwinds.
+struct WorkerCarried {
+    previous: Option<CarriedContent>,
+}
+
+impl Drop for WorkerCarried {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            swap_carried(previous);
+        }
+    }
+}
+
 /// Run `op` on the process pool, as a root computation.
 ///
 /// From a thread outside every rayon pool, `op` runs on a worker of the
@@ -209,16 +308,43 @@ impl Drop for RootMark {
 /// resumed on the caller). From a thread that is already a rayon worker, `op`
 /// runs inline: the computation is already on a pool, and its parallel
 /// operations stay there.
+///
+/// # Invariant: a registered thread-local reads the same on either side of the hop
+///
+/// For every channel registered with [`carry_across_install`]:
+/// - `op` sees exactly what the caller's thread held when `install` was called;
+/// - the caller sees exactly what `op` left when `install` returns;
+/// - the worker holds afterwards exactly what it held before, including when
+///   `op` unwinds, so nothing one computation armed can reach the next
+///   computation that worker runs.
+///
+/// Every other thread-local is the worker's own, as for any rayon job. The
+/// inline path needs nothing: caller and computation share a thread.
 pub fn install<R: Send>(op: impl FnOnce() -> R + Send) -> R {
     if rayon::current_thread_index().is_some() {
         return op();
     }
-    pool().install(|| {
+    // Every channel travels, an empty one included: a worker waiting inside one
+    // root computation can steal this one, and must not lend it the other's.
+    let outgoing: CarriedContent = carried_locals()
+        .map(|local| (local, (local.swap)(None)))
+        .collect();
+    let (out, returning) = pool().install(|| {
+        let mut worker = WorkerCarried {
+            previous: Some(swap_carried(outgoing)),
+        };
         let root = RootMark::set(true);
         let out = op();
         drop(root);
-        out
-    })
+        let previous = worker
+            .previous
+            .take()
+            .expect("the worker's own channel content is held until the computation returns");
+        let returning = swap_carried(previous);
+        (out, returning)
+    });
+    swap_carried(returning);
+    out
 }
 
 /// Whether the current thread runs computation that no enclosing parallel
@@ -321,6 +447,54 @@ mod tests {
             .expect("one-thread pool");
         let (outer, inner) = foreign.install(|| (at_top_level(), install(at_top_level)));
         assert!(!outer && !inner, "a worker of another pool stays nested");
+    }
+
+    thread_local! {
+        static CARRIED_PROBE: std::cell::RefCell<Option<u64>> = const { std::cell::RefCell::new(None) };
+        static UNCARRIED_PROBE: std::cell::RefCell<Option<u64>> = const { std::cell::RefCell::new(None) };
+    }
+
+    fn swap_carried_probe(value: Option<Box<dyn Any + Send>>) -> Option<Box<dyn Any + Send>> {
+        let incoming = value.map(|value| {
+            *value
+                .downcast::<u64>()
+                .expect("the probe carrier only ever carries its own u64")
+        });
+        CARRIED_PROBE
+            .with(|slot| slot.replace(incoming))
+            .map(|held| Box::new(held) as Box<dyn Any + Send>)
+    }
+
+    /// gam#4566: a channel set on the caller's thread reaches the worker the
+    /// computation runs on, and what the computation writes comes back. The
+    /// uncarried twin is the control: it shows the hop is real, so the carried
+    /// one is not passing because the computation stayed on the caller.
+    #[test]
+    fn a_carried_thread_local_crosses_install_both_ways_4566() {
+        carry_across_install(swap_carried_probe);
+        CARRIED_PROBE.with(|slot| *slot.borrow_mut() = Some(7));
+        UNCARRIED_PROBE.with(|slot| *slot.borrow_mut() = Some(7));
+        let (carried_seen, uncarried_seen) = install(|| {
+            let seen = (
+                CARRIED_PROBE.with(|slot| *slot.borrow()),
+                UNCARRIED_PROBE.with(|slot| *slot.borrow()),
+            );
+            CARRIED_PROBE.with(|slot| *slot.borrow_mut() = Some(11));
+            seen
+        });
+        assert_eq!(uncarried_seen, None, "the computation must run off the caller's thread");
+        assert_eq!(carried_seen, Some(7), "the carried channel reaches the worker");
+        assert_eq!(
+            CARRIED_PROBE.with(|slot| *slot.borrow()),
+            Some(11),
+            "what the computation wrote comes back to the caller"
+        );
+        let worker_after = install(|| CARRIED_PROBE.with(|slot| *slot.borrow()));
+        assert_eq!(
+            worker_after,
+            Some(11),
+            "the next computation is handed the caller's current content, not a worker leftover"
+        );
     }
 
     #[test]

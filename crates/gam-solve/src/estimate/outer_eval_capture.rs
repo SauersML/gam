@@ -103,8 +103,13 @@ pub trait OuterSeedProbe {
 ///
 /// The runner logs an error it returns and proceeds with the seed cascade
 /// unchanged: an observer must not decide the fit it observes.
+///
+/// `Send` because the fit it observes runs on a pool worker, not on the thread
+/// that registered it (gam#4566): the fit entry points run through
+/// `gam_runtime::parallel::install`, and the observer travels with the
+/// computation ([`observe_next_outer_seed`]).
 pub type OuterSeedObserver =
-    Box<dyn FnOnce(&mut dyn OuterSeedProbe) -> Result<(), EstimationError>>;
+    Box<dyn FnOnce(&mut dyn OuterSeedProbe) -> Result<(), EstimationError> + Send>;
 
 /// What the evaluator published during one probe evaluation.
 #[derive(Default)]
@@ -137,8 +142,53 @@ thread_local! {
 
 /// Lend `observer` a probe at the next outer seed on this thread that has at
 /// least `min_psi_dim` ψ axes. Replaces an observer that has not run yet.
+///
+/// "This thread" includes the pool worker a fit entry point hands the fit to:
+/// the slot is carried across `gam_runtime::parallel::install` both ways, so an
+/// observer the fit did not consume is still registered when the entry point
+/// returns (gam#4566).
 pub fn observe_next_outer_seed(min_psi_dim: usize, observer: OuterSeedObserver) {
+    carry_capture_channels_across_install();
     SEED_OBSERVER.with(|slot| *slot.borrow_mut() = Some((min_psi_dim, observer)));
+}
+
+/// Whether this process has registered the test-armed capture channels with
+/// `gam_runtime::parallel::carry_across_install`. A plain flag rather than a
+/// `Once`, for the pool module's reason: a `Once` caught mid-call by a
+/// `fork()` blocks the child forever.
+static CAPTURE_CHANNELS_CARRIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Register the channels a test arms on its own thread and reads after the fit
+/// returns: the seed observer and the ρ-block audit.
+///
+/// The fit entry points run the fit on a pool worker
+/// (`gam_runtime::parallel::install`, `244cc54227`), where a thread-local the
+/// caller set is empty. Before this was registered, an armed observer was never
+/// lent and an armed audit was never written, and the only symptom was a test
+/// reading "the outer runner lent no seed probe" after a fit that had
+/// certified (gam#4566). The per-evaluation captures (seed-probe capture,
+/// certificate evidence) are opened and read inside one evaluation on one
+/// thread, so they are not carried.
+fn carry_capture_channels_across_install() {
+    if CAPTURE_CHANNELS_CARRIED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    gam_runtime::parallel::carry_across_install(swap_seed_observer);
+    gam_runtime::parallel::carry_across_install(swap_rho_outer_audit);
+}
+
+fn swap_seed_observer(
+    value: Option<Box<dyn std::any::Any + Send>>,
+) -> Option<Box<dyn std::any::Any + Send>> {
+    let incoming = value.map(|value| {
+        *value
+            .downcast::<(usize, OuterSeedObserver)>()
+            .expect("the seed-observer carrier only ever carries its own slot")
+    });
+    SEED_OBSERVER
+        .with(|slot| slot.replace(incoming))
+        .map(|held| Box::new(held) as Box<dyn std::any::Any + Send>)
 }
 
 /// Take this thread's observer when a seed with `psi_dim` ψ axes satisfies it.
@@ -432,7 +482,21 @@ thread_local! {
 /// the caller reads the audit for the LAST evaluation it triggered — which is
 /// the contract a probe wants when it evaluates at one θ at a time.
 pub fn enable_rho_outer_audit() {
+    carry_capture_channels_across_install();
     RHO_AUDIT.with(|audit| *audit.borrow_mut() = Some(RhoOuterAudit::default()));
+}
+
+fn swap_rho_outer_audit(
+    value: Option<Box<dyn std::any::Any + Send>>,
+) -> Option<Box<dyn std::any::Any + Send>> {
+    let incoming = value.map(|value| {
+        *value
+            .downcast::<RhoOuterAudit>()
+            .expect("the rho-audit carrier only ever carries its own window")
+    });
+    RHO_AUDIT
+        .with(|audit| audit.replace(incoming))
+        .map(|held| Box::new(held) as Box<dyn std::any::Any + Send>)
 }
 
 /// Disarm the ρ-block audit and take the last evaluation's window.

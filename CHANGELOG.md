@@ -1,5 +1,13 @@
 ## Unreleased
 
+- **Outer-evidence probes a test arms on its own thread reach the fit again** (#4566). The fit
+  entry points run on a pool worker, where a caller's thread-local is empty, so every armed seed
+  observer and ρ-block audit went unread and the tests reported "the outer runner lent no seed
+  probe". `gam_runtime::parallel::install` now carries registered channels onto the worker and
+  back, restoring the worker's own content afterwards, including on unwind.
+- **The start past the saddle is spent from the mode the rule publishes, and from no other**
+  (#3173). A probe seeded off a losing mode, usually the walk's incumbent, made the published
+  criterion depend on which basin the walk carried, so it was not a function of θ.
 - **Full conformal locates a score breakpoint its rounded root lands two or more ulps from, by exact
   signs on the f64 lattice, instead of refusing** (#3338). The factor's exact sign is monotone on the
   lattice, so the search walks outward in doubling strides and bisects the last one; every step is an

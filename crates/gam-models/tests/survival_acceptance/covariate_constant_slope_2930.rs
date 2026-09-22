@@ -17,8 +17,7 @@ use gam_solve::estimate::outer_eval_capture::{
 use gam_custom_family::{CompletionCurvatureAblation, set_completion_curvature_ablation};
 use gam_solve::model_types::{CurvatureAdmissibility, CurvatureEvidence};
 use ndarray::{Array1, Array2};
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use gam_linalg::utils::splitmix64;
@@ -563,8 +562,8 @@ fn covariate_constant_slope_derivatives_differentiate_the_value_criterion_2930()
     let data = minimal_dataset(rows, 0x2930_0000_0001);
     let config = constant_slope_config();
     type Grades = (Vec<CoordinateGrade>, Vec<HessianColumnGrade>, Vec<AblatedHessian>, usize, usize);
-    let captured: Rc<RefCell<Option<Result<Grades, String>>>> = Rc::new(RefCell::new(None));
-    let sink = Rc::clone(&captured);
+    let captured: Arc<Mutex<Option<Result<Grades, String>>>> = Arc::new(Mutex::new(None));
+    let sink = Arc::clone(&captured);
     observe_next_outer_seed(
         1,
         Box::new(
@@ -587,14 +586,14 @@ fn covariate_constant_slope_derivatives_differentiate_the_value_criterion_2930()
                     }
                     Ok((grades, columns, ablated, layout.rho_dim, layout.psi_dim))
                 })();
-                *sink.borrow_mut() = Some(outcome);
+                *sink.lock().expect("the observer sink lock is not poisoned") = Some(outcome);
                 Ok(())
             },
         ),
     );
     let refit = fit_from_formula("Surv(time, event) ~ x", &data, &config);
     let (grades, columns, ablated, rho_dim, psi_dim) = captured
-        .borrow_mut()
+        .lock().expect("the observer sink lock is not poisoned")
         .take()
         .unwrap_or_else(|| panic!("the outer runner lent no ψ-bearing seed probe: {:?}", refit.as_ref().err()))
         .unwrap_or_else(|reason| panic!("the seed probe refused: {reason}"));

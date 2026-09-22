@@ -2170,3 +2170,74 @@ fn an_exact_joint_evaluation_completes_its_starts_with_the_fits_fixed_start_3173
         "the fit's fixed start is taken once"
     );
 }
+
+/// The tilted double well's cubic share `5t₃²/(24σ³)` at the mode `beta`, in closed form:
+/// `σ = f''(β) = 12β² − 4 + e^ρ` and `t₃ = f'''(β) = 24β`. At or above one the barrier to the
+/// neighbouring basin is below the correction the Laplace series makes for it.
+fn double_well_cubic_share_3173(rho: f64, beta: f64) -> f64 {
+    let sigma = 12.0 * beta * beta - 4.0 + rho.exp();
+    let third = 24.0 * beta;
+    5.0 * third * third / (24.0 * sigma * sigma * sigma)
+}
+
+/// #3173 positive control for the start past the saddle: where the mode the rule publishes among
+/// the starts is the one whose barrier is below its own correction, the probe is spent from it and
+/// crosses into the lower basin.
+///
+/// The incumbent and the fit's blocks both sit in the shallow well, so both starts certify the
+/// shallow mode and it is the one the rule would publish. At ρ = 0.5 its closed-form share is
+/// above one, and its saddle crossing `β̂ + 2s*·v`, `s* = −2σ/t₃`, lands past the barrier, so the
+/// probe certifies the deep mode as a third candidate and the rule publishes it. The census test
+/// above is the negative arm on the same θ and the same incumbent: there the fixed start publishes
+/// the deep mode, whose share is below one, so no probe is spent off the losing shallow incumbent.
+#[test]
+fn the_start_past_the_saddle_is_spent_from_the_published_mode_3173() {
+    let family = TiltedDoubleWellFamily::new(TILT);
+    let options = double_well_options();
+    let rho = 0.5;
+    let points = double_well_stationary_points_2973(rho);
+    assert_eq!(points.len(), 3, "both wells are minima at rho=0.5");
+    let (deep, shallow) = (points[0], points[2]);
+    assert!(
+        double_well_cubic_share_3173(rho, shallow) >= 1.0,
+        "the shallow mode's barrier is below its own correction at rho=0.5"
+    );
+    assert!(
+        double_well_cubic_share_3173(rho, deep) < 1.0,
+        "the deep mode's barrier is not, so the census arm spends no probe off it"
+    );
+    let shallow_seeded = [double_well_spec(2.0)];
+    let selection = evaluate_custom_family_joint_hyper_best_mode_shared(
+        &family,
+        &shallow_seeded,
+        &options,
+        &array![rho],
+        Arc::new(test_design_hyper_layout(vec![Vec::new()])),
+        &[Some(shallow_well_incumbent_3173())],
+        EvalMode::ValueOnly,
+    )
+    .expect("an evaluation at rho=0.5 certifies a mode");
+    assert_eq!(
+        selection.screened_objectives.len(),
+        3,
+        "the two starts, and the probe past the published shallow mode's saddle"
+    );
+    assert_eq!(
+        selection.selected_candidate, 2,
+        "the probe's mode is the lowest certified one, so it is published"
+    );
+    let published = selection
+        .result
+        .warm_start
+        .block_beta_view(0)
+        .expect("one coefficient")[0];
+    assert!(
+        is_deep_mode_2973(rho, published),
+        "the probe crossed into the deep well; got {published}"
+    );
+    assert!(
+        double_well_penalized_objective_3173(rho, deep)
+            < double_well_penalized_objective_3173(rho, shallow),
+        "the closed form orders the deep minimum below the shallow one"
+    );
+}

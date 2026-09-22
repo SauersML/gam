@@ -37,8 +37,7 @@ use gam_solve::estimate::outer_eval_capture::{
     OuterSeedOrder, OuterSeedProbe, observe_next_outer_seed,
 };
 use ndarray::Array1;
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 /// The seed's analytic mode response against its finite difference, per ψ axis.
 struct SeedModeResponseAudit {
@@ -286,14 +285,14 @@ fn survival_marginal_slope_follow_up_mode_response_matches_fd_2765() {
         ..Default::default()
     };
 
-    let captured: Rc<RefCell<Option<Result<SeedModeResponseAudit, String>>>> =
-        Rc::new(RefCell::new(None));
-    let sink = Rc::clone(&captured);
+    let captured: Arc<Mutex<Option<Result<SeedModeResponseAudit, String>>>> =
+        Arc::new(Mutex::new(None));
+    let sink = Arc::clone(&captured);
     observe_next_outer_seed(
         2,
         Box::new(
             move |probe: &mut dyn OuterSeedProbe| -> Result<(), gam_solve::estimate::EstimationError> {
-                *sink.borrow_mut() = Some(audit_mode_response(probe));
+                *sink.lock().expect("the observer sink lock is not poisoned") = Some(audit_mode_response(probe));
                 Ok(())
             },
         ),
@@ -303,7 +302,7 @@ fn survival_marginal_slope_follow_up_mode_response_matches_fd_2765() {
     let fit_result =
         gam_models::fit_orchestration::fit_from_formula("Surv(time, event) ~ 1", &data, &config);
     let audit = captured
-        .borrow_mut()
+        .lock().expect("the observer sink lock is not poisoned")
         .take()
         .unwrap_or_else(|| {
             panic!(

@@ -4050,8 +4050,7 @@ fn gaussian_location_scale_wiggle_face_criterion_gradient_matches_central_differ
     use gam_solve::estimate::outer_eval_capture::{
         OuterSeedOrder, OuterSeedProbe, observe_next_outer_seed,
     };
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     let n = 72usize;
     let mut records: Vec<csv::StringRecord> = Vec::with_capacity(n);
@@ -4121,8 +4120,8 @@ fn gaussian_location_scale_wiggle_face_criterion_gradient_matches_central_differ
     let optimum = solved.fit.fit.log_lambdas.clone();
 
     type Grade = (&'static str, usize, f64, f64, f64, bool);
-    let captured: Rc<RefCell<Option<Result<Vec<Grade>, String>>>> = Rc::new(RefCell::new(None));
-    let sink = Rc::clone(&captured);
+    let captured: Arc<Mutex<Option<Result<Vec<Grade>, String>>>> = Arc::new(Mutex::new(None));
+    let sink = Arc::clone(&captured);
     observe_next_outer_seed(
         0,
         Box::new(
@@ -4202,14 +4201,14 @@ fn gaussian_location_scale_wiggle_face_criterion_gradient_matches_central_differ
                     }
                     Ok(grades)
                 })();
-                *sink.borrow_mut() = Some(outcome);
+                *sink.lock().expect("the observer sink lock is not poisoned") = Some(outcome);
                 Ok(())
             },
         ),
     );
     let refit_with_probe = refit(spec);
     let grades = captured
-        .borrow_mut()
+        .lock().expect("the observer sink lock is not poisoned")
         .take()
         .unwrap_or_else(|| {
             panic!(
@@ -5012,8 +5011,7 @@ fn wiggle_face_criterion_value_scale_3228() {
     use gam_solve::estimate::outer_eval_capture::{
         OuterSeedOrder, OuterSeedProbe, observe_next_outer_seed,
     };
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     let n = 72usize;
     let mut records: Vec<csv::StringRecord> = Vec::with_capacity(n);
@@ -5052,8 +5050,8 @@ fn wiggle_face_criterion_value_scale_3228() {
     let pilot = fit_gaussian_location_scale_terms(req_data, spec.clone(), &options, &kappa_options)
         .expect("face fixture pilot");
 
-    let report: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-    let sink = Rc::clone(&report);
+    let report: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&report);
     observe_next_outer_seed(
         0,
         Box::new(
@@ -5078,13 +5076,13 @@ fn wiggle_face_criterion_value_scale_3228() {
                 ));
                 let Some(gradient) = base.gradient.as_ref() else {
                     lines.push("[3228-scale] the objective published no gradient".to_string());
-                    sink.borrow_mut().extend(lines);
+                    sink.lock().expect("the observer sink lock is not poisoned").extend(lines);
                     return Ok(());
                 };
                 let grad_norm = gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
                 lines.push(format!("[3228-scale] ‖g‖={grad_norm:.6e}"));
                 if !(grad_norm > 0.0 && grad_norm.is_finite()) {
-                    sink.borrow_mut().extend(lines);
+                    sink.lock().expect("the observer sink lock is not poisoned").extend(lines);
                     return Ok(());
                 }
                 // Down the gradient, clamped into the seed's own box, over the
@@ -5122,7 +5120,7 @@ fn wiggle_face_criterion_value_scale_3228() {
                         }
                     }
                 }
-                sink.borrow_mut().extend(lines);
+                sink.lock().expect("the observer sink lock is not poisoned").extend(lines);
                 Ok(())
             },
         ),
@@ -5155,7 +5153,7 @@ fn wiggle_face_criterion_value_scale_3228() {
             Err(error) => format!("refused: {error}"),
         }
     );
-    let lines = report.borrow();
+    let lines = report.lock().expect("the observer sink lock is not poisoned");
     assert!(
         !lines.is_empty(),
         "the outer runner lent no seed probe, so nothing was measured"

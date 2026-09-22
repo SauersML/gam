@@ -4378,7 +4378,17 @@ fn mode_profile_exhausted_error(
     }
 }
 
-/// The start past the saddle a screened mode's own fold record names (gam#3173).
+/// The start past the saddle the PUBLISHED mode's own fold record names (gam#3173).
+///
+/// It is read off the mode the rule would publish among the evaluation's starts, and off no other.
+/// A fold reaches the criterion only through the mode it publishes, so that is the one mode whose
+/// fold needs a way out. A losing mode is the incumbent's more often than not, and which basin the
+/// incumbent sits in is the walk's choice: a probe seeded off it hands the selection a mode that
+/// only walks carrying that incumbent ever see, so two walks whose starts published the same mode
+/// at one θ would publish different values there — the criterion gam#3173 reports as not a
+/// function of θ. It also spends a solve where nothing folds: on the double well at ρ = 0.5 the
+/// shallow incumbent's share is 1.46 and the published deep mode's 0.42, so the probe re-solved
+/// the deep mode the fit's fixed start had already certified.
 ///
 /// A mode whose Laplace series' leading correction along its softest direction is not below the
 /// term it corrects sits within `5/36` of a log-likelihood unit of the saddle bounding its basin
@@ -4395,17 +4405,14 @@ fn mode_profile_exhausted_error(
 /// constraints are this basin's.
 fn fold_crossing_seed(
     rho_current: &Array1<f64>,
-    screened: &[Option<OuterObjectiveEvalResult>],
+    published: &OuterObjectiveEvalResult,
 ) -> Option<ConstrainedWarmStart> {
-    let (result, displacement) = screened.iter().flatten().find_map(|result| {
-        let fold = result.inner_mode_fold.as_ref()?;
-        if !fold.barrier_is_below_its_own_correction() {
-            return None;
-        }
-        fold.saddle_crossing_displacement()
-            .map(|displacement| (result, displacement))
-    })?;
-    let width: usize = result
+    let fold = published.inner_mode_fold.as_ref()?;
+    if !fold.barrier_is_below_its_own_correction() {
+        return None;
+    }
+    let displacement = fold.saddle_crossing_displacement()?;
+    let width: usize = published
         .inner
         .block_states
         .iter()
@@ -4415,8 +4422,8 @@ fn fold_crossing_seed(
         return None;
     }
     let mut offset = 0usize;
-    let mut block_beta = Vec::with_capacity(result.inner.block_states.len());
-    for state in &result.inner.block_states {
+    let mut block_beta = Vec::with_capacity(published.inner.block_states.len());
+    for state in &published.inner.block_states {
         let end = offset + state.beta.len();
         let mut beta = state.beta.clone();
         beta += &displacement.slice(s![offset..end]);
@@ -4587,15 +4594,20 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
         screened_results[candidate_idx] = Some(candidate);
     }
 
-    // gam#3173: one start past the saddle, spent only where a screened mode's own fold record says
-    // the barrier to the next basin is below the correction the Laplace series makes for it
-    // ([`fold_crossing_seed`]). It is an extra candidate and nothing else: the rule below still
-    // publishes the lowest penalized `f`, so the probe can only lower the criterion, and a probe
-    // that certifies no mode discovers nothing and is simply not among the candidates. It needs
-    // the penalty roots to be priced against the others, so it is spent only where they were
-    // built — an evaluation whose caller already handed more than one start.
+    // gam#3173: one start past the saddle, spent only where the fold record of the mode the rule
+    // would publish says the barrier to the next basin is below the correction the Laplace series
+    // makes for it ([`fold_crossing_seed`]). A losing mode's fold never reaches the criterion, and
+    // a probe seeded off one — usually the walk's incumbent — would make the published value
+    // depend on which basin the walk carried. It is an extra candidate and nothing else: the rule
+    // below still publishes the lowest penalized `f`, so the probe can only lower the criterion,
+    // and a probe that certifies no mode discovers nothing and is simply not among the
+    // candidates. It needs the penalty roots to be priced against the others, so it is spent only
+    // where they were built — an evaluation whose caller already handed more than one start.
     if let Some(roots) = roots.as_ref()
-        && let Some(seed) = fold_crossing_seed(rho_current, &screened_results)
+        && let Some(published) = lowest_penalized_index(&penalized_objectives)
+        && let Some(seed) = screened_results[published]
+            .as_ref()
+            .and_then(|result| fold_crossing_seed(rho_current, result))
     {
         let (probe_options, _) =
             derivative_quality_options_and_warm_start(options, None, has_psi_derivatives);

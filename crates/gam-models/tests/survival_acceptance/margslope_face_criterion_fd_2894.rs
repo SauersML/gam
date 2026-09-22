@@ -38,8 +38,7 @@ use gam_solve::estimate::outer_eval_capture::{
     OuterSeedEvaluation, OuterSeedOrder, OuterSeedProbe, observe_next_outer_seed,
 };
 use ndarray::Array1;
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 const N: usize = 160;
 const CENTERS: usize = 6;
@@ -418,8 +417,8 @@ fn survival_marginal_slope_face_criterion_derivatives_match_central_differences_
     };
 
     type Grades = (Vec<CoordinateGrade>, Vec<HessianColumnGrade>);
-    let captured: Rc<RefCell<Option<Result<Grades, String>>>> = Rc::new(RefCell::new(None));
-    let sink = Rc::clone(&captured);
+    let captured: Arc<Mutex<Option<Result<Grades, String>>>> = Arc::new(Mutex::new(None));
+    let sink = Arc::clone(&captured);
     observe_next_outer_seed(
         0,
         Box::new(
@@ -465,14 +464,14 @@ fn survival_marginal_slope_face_criterion_derivatives_match_central_differences_
                     let hessian_grades = grade_hessian(probe, &returned)?;
                     Ok((grades, hessian_grades))
                 })();
-                *sink.borrow_mut() = Some(outcome);
+                *sink.lock().expect("the observer sink lock is not poisoned") = Some(outcome);
                 Ok(())
             },
         ),
     );
     let refit = fit_from_formula(&formula, &data, &config);
     let (grades, hessian_grades) = captured
-        .borrow_mut()
+        .lock().expect("the observer sink lock is not poisoned")
         .take()
         .unwrap_or_else(|| panic!("the outer runner lent no seed probe: {:?}", refit.err()))
         .unwrap_or_else(|reason| panic!("the seed probe refused: {reason}"));
