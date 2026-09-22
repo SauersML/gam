@@ -3942,7 +3942,10 @@ fn a_posterior_that_spreads_nowhere_averages_to_the_conditional_forecast_2964() 
         stratum: 0,
     };
     // The state rebuilt at the fitted coefficients is the fitted state.
-    let rebuilt = super::posterior::ParameterState::at(&fit, &fit.fitted_coefficients())
+    let model = fit
+        .prediction_model(&cohort)
+        .expect("the fit lends a prediction model");
+    let rebuilt = super::posterior::ParameterState::at(&model, &fit.fitted_coefficients())
         .expect("the state at the fitted coefficients");
     let fitted = super::posterior::ParameterState::fitted(&fit);
     assert_eq!(rebuilt.log_rates, fitted.log_rates);
@@ -6442,7 +6445,7 @@ fn every_reference_grid_time_inside_a_window_is_a_level_zero_breakpoint() {
         events: Vec::new(),
         segments: vec![CovariateSegment { start: 1.0, row: 0 }, CovariateSegment { start: 2.5, row: 0 }],
     };
-    let breakpoints = super::forecast::window_breakpoints(&fit, &window);
+    let breakpoints = super::forecast::window_breakpoints(fit.centring.as_ref(), &window);
     emit(&format!("[2963 breakpoints] {breakpoints:?}"));
     assert_eq!(breakpoints, vec![1.0, 1.9, 2.5, 3.1, 3.5]);
 }

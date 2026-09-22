@@ -3940,5 +3940,15 @@
     ],
     "reason": "#4556 P2: the function now returns the log-determinant of the outer Hessian beside the whitening factor, because the quadrature's normalizer needs both and one Cholesky determines both; a name that says only `whitening_factor` would describe half of what it computes. It is renamed to `outer_hessian_geometry`, returning `OuterHessianGeometry { whitening_factor, log_determinant }`. Nothing is dropped: both call sites and both fixtures read the factor from that struct, and the quadrature core additionally reads the determinant it previously threw away by never forming it.",
     "evidence": "At the base c21ae3add1, git grep -n whitening_factor_from_outer_hessian finds 5 lines, all in crates/gam-inference/src/rho_posterior.rs: the declaration, the quadrature core's call, the sequential proposal's call, and two calls in its own #[cfg(test)] mod tests. No other crate, test, bench, example or Python file names it. It is a private module function (no pub), so the public-function census records no loss and carries no entry; the same commit adds the private fn outer_hessian_geometry and the private struct OuterHessianGeometry, which the census does not gate."
+  },
+  {
+    "base": "ee6083b2b4884f97846caaf19b8dffea0ae40944",
+    "items": [
+      "crates/gam-event-history/src/family.rs:fn:offsets_of_blocks",
+      "crates/gam-event-history/src/family.rs:fn:reference_at_coefficients",
+      "crates/gam-event-history/src/objective.rs:fn:computed_joint"
+    ],
+    "reason": "Three crate-private methods left behind when three event-history landings (7a674cde0b #2966, a87114a4cd #2965, d1b60b8e4f #2986) merged into one tree. `reference_at_coefficients` and `offsets_of_blocks` on `EventHistoryFamily` were the pre-#2966 accessors the posterior read; #2966 moved both onto `PredictionModel` (predictor.rs), which is what `posterior.rs` now reads, and the #2965 copy of family.rs re-introduced the family versions with no caller. `computed_joint` was the forward-mode dispatcher #2965 replaced with `adjoint_joint`; its forward reference route, `coordinate_hessian`, keeps its name and its test caller.",
+    "evidence": "At ee6083b2b4, `git grep -n 'reference_at_coefficients\\|offsets_of_blocks\\|computed_joint' crates/` finds each name only at its definition in family.rs / objective.rs and, for reference_at_coefficients, the PredictionModel method of the same name in predictor.rs that posterior.rs:158 calls. The MSI workspace gate at integ-0920-ch failed with `-D dead-code` on exactly these three."
   }
 ]

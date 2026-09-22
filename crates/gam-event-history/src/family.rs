@@ -478,34 +478,6 @@ impl EventHistoryFamily {
         self.computed_reference(states)
     }
 
-    /// The reference evolution at a coefficient vector, or `None` where the
-    /// family has no reference population and the baselines are centred on
-    /// the stationary prior.
-    ///
-    /// A prediction averaged over the parameter posterior evaluates this once
-    /// per state: the reference population's own evolution moves with the
-    /// coefficients, so carrying the fitted snapshot across states would pair
-    /// a perturbed baseline with the risk sets of a different model
-    /// (`super::posterior`).
-    pub(crate) fn reference_at_coefficients(
-        &self,
-        beta: &[f64],
-    ) -> Result<Option<RiskSetCentring>, EventHistoryError> {
-        if self.reference.is_none() {
-            return Ok(None);
-        }
-        let width = self.total_width();
-        if beta.len() != width {
-            return Err(EventHistoryError::InvalidInput {
-                reason: format!(
-                    "the reference evolution needs {width} coefficients in the family's layout, got {}",
-                    beta.len()
-                ),
-            });
-        }
-        self.reference_at(beta).map(Some)
-    }
-
     /// Start of an evaluation: a refusal an earlier evaluation left is gone.
     fn clear_reference_refusal(&self) {
         if let Ok(mut refusal) = self.reference_refusal.lock() {
@@ -556,12 +528,6 @@ impl EventHistoryFamily {
     /// one.
     pub(crate) fn reference_population(&self) -> Option<&Arc<ReferenceTables>> {
         self.reference.as_ref()
-    }
-
-    /// Where each block starts in a flat coefficient vector, with the total
-    /// width last.
-    pub(crate) fn offsets_of_blocks(&self) -> Vec<usize> {
-        self.block_offsets()
     }
 
     /// The band of dimensionless rates the cohort's breakpoints resolve, `(ν_min, ν_max)`.
