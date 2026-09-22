@@ -2359,6 +2359,36 @@ impl SmoothLrSelectionReplay {
             }
             _ => None,
         };
+        // #4563 — THE SWEEP COUNT IS THE NUMBER THE STOP HAS TO BE DENOMINATED
+        // AGAINST, AND NOTHING REPORTED IT.
+        //
+        // `select_draw` is coordinate descent whose acceptance bar is the two
+        // points' forward-error bands, so it descends each draw to the last
+        // representable bit of the criterion. The only termination argument
+        // available from that bar is `(criterion range) / (rounding band)`, of
+        // order `1/eps`, while the draws it feeds enter the answer ONLY through
+        // the indicator `W_sel >= x_sel` in `tail_shift_at`, over
+        // `SMOOTH_LR_MULTISCALE_DRAWS` draws whose own paired standard error the
+        // same function measures. A bar of `eps` feeding an answer resolved to
+        // `1/sqrt(N)` is a bar denominated in the wrong quantity.
+        //
+        // A tighter bound EXISTS but is conditional: coordinate descent with
+        // certified per-axis minima on a box contracts linearly where the
+        // criterion is strongly convex there, giving
+        // `sweeps = O(scales * kappa * log(range / band))` — problem-sized, and
+        // small for the two-scale `te(x, z)` case. Whether the criterion has that
+        // curvature on this box is exactly what is unknown, and the sweep count's
+        // growth with `n` is what answers it. So the count is reported before any
+        // stop is changed: a coarser bar would otherwise be a tolerance chosen to
+        // fit a wall time rather than derived from the answer's resolution.
+        //
+        // Reported once per replayed term, not per draw: 2048 per-draw lines
+        // would bury the number they carry. The maximum is beside the mean
+        // because a mean over 2048 draws hides a tail, and the tail is what an
+        // unbounded descent would show first.
+        let mut selection_sweeps_total = 0usize;
+        let mut selection_sweeps_max = 0usize;
+        let mut selection_calls = 0usize;
         // `(W(t*), W(1))` for one whitened draw and, on a profiled replay, its
         // `(m, R)`. The observation goes through this same function.
         let mut score = |draw: &[f64],
@@ -2381,7 +2411,16 @@ impl SmoothLrSelectionReplay {
                 }
                 coordinates[column] = projection;
             }
-            Self::select_draw(geometry, log_scale_windows, &coordinates, residual, &mut selected)?;
+            let sweeps = Self::select_draw(
+                geometry,
+                log_scale_windows,
+                &coordinates,
+                residual,
+                &mut selected,
+            )?;
+            selection_sweeps_total += sweeps;
+            selection_sweeps_max = selection_sweeps_max.max(sweeps);
+            selection_calls += 1;
             if !factor.refactor(geometry, &selected) {
                 return Err(SmoothLrSelectionDecline::SelectionUnresolved);
             }
@@ -2406,6 +2445,16 @@ impl SmoothLrSelectionReplay {
                 })
             }
         };
+        log::debug!(
+            "[#4563 multiscale selection] draws={draws} scales={scales} movable={movable} \
+             selections={selection_calls} sweeps total={selection_sweeps_total} \
+             max={selection_sweeps_max} mean={:.3}",
+            if selection_calls == 0 {
+                0.0
+            } else {
+                selection_sweeps_total as f64 / selection_calls as f64
+            },
+        );
         Ok(Self {
             generalized: ascending(fitted.eigenvalues),
             selection_sample,
@@ -2430,20 +2479,28 @@ impl SmoothLrSelectionReplay {
     ///
     /// `residual` is the draw's profiled `(m, R)` when the family profiles its
     /// scale ([`AxisSlice::criterion`]).
+    ///
+    /// Returns the number of sweeps taken, INCLUDING the final one that moved
+    /// nothing and so decided the stop. That count is the quantity #4563 needs
+    /// and had no producer: the termination argument this descent carries bounds
+    /// it only by `(criterion range) / (rounding band)`, so whether it is in fact
+    /// problem-sized is a measurement, and the caller reports it.
     fn select_draw(
         geometry: &SelectionGeometry,
         log_scale_windows: &[(f64, f64)],
         coordinates: &[f64],
         residual: Option<(f64, f64)>,
         selected: &mut [f64],
-    ) -> Result<(), SmoothLrSelectionDecline> {
+    ) -> Result<usize, SmoothLrSelectionDecline> {
         if selected.len() != log_scale_windows.len() {
             return Err(SmoothLrSelectionDecline::NoPenaltyComponents);
         }
         for (slot, &(low, high)) in selected.iter_mut().zip(log_scale_windows) {
             *slot = if high > low { 0.0_f64.clamp(low, high) } else { 0.0 };
         }
+        let mut sweeps = 0usize;
         loop {
+            sweeps += 1;
             let mut moved = false;
             for (axis, &(low, high)) in log_scale_windows.iter().enumerate() {
                 if !(high > low) {
@@ -2468,7 +2525,7 @@ impl SmoothLrSelectionReplay {
                 }
             }
             if !moved {
-                return Ok(());
+                return Ok(sweeps);
             }
         }
     }
@@ -6196,7 +6253,7 @@ mod selection_replay_tests {
                 stream.fill_normals(&mut draw);
                 let norm_squared: f64 = draw.iter().map(|value| value * value).sum();
                 let coordinates = range_coordinates(geometry, &draw);
-                SmoothLrSelectionReplay::select_draw(
+                let sweeps = SmoothLrSelectionReplay::select_draw(
                     geometry,
                     &windows,
                     &coordinates,
@@ -6204,6 +6261,15 @@ mod selection_replay_tests {
                     &mut selected,
                 )
                 .expect("a certified multi-scale selection");
+                // #4563 — the reported sweep count counts the deciding sweep too,
+                // so a completed selection is never zero sweeps. This is the only
+                // assertion on the number the caller logs; without it the
+                // instrument could report a constant and nothing would notice.
+                assert!(
+                    sweeps >= 1,
+                    "{label} draw {index}: a completed selection takes at least the sweep that \
+                     decided it; got {sweeps}"
+                );
                 let mut value_at = |point: &[f64]| {
                     assert!(
                         factor.refactor(geometry, point),
