@@ -836,7 +836,149 @@ fn survival_baseline_theta_domain(
             seed.len()
         ));
     }
-    Ok((seed - &radius, seed + &radius))
+    let mut lower = seed - &radius;
+    let upper = seed + &radius;
+    if target == SurvivalBaselineTarget::Weibull {
+        // #2969: the chart's log-normal limit is `l → −∞` at fixed slope, and
+        // the interval above ends where the published scale leaves the normal
+        // f64 range, not where the criterion stops resolving `l`. Raising the
+        // face to the representability crossing is what lets the search REACH
+        // it — inside the old interval every trial past the crossing published
+        // an unrepresentable scale and was refused, so the coordinate could
+        // never rail and the limit could never be certified.
+        if let Some(floor) = weibull_chart_shape_floor(upper[0], lower[1])? {
+            // The seed is a chart member, so it publishes a normal scale and
+            // sits at or above the crossing; keeping the face at or below the
+            // seed leaves the search its own starting point.
+            lower[1] = floor.min(seed[1]);
+        }
+    }
+    Ok((lower, upper))
+}
+
+/// The Weibull baseline chart's coordinates `θ = (b, l)` (#2969).
+///
+/// The chart realizes the probit index `q(t) = −Φ⁻¹(exp(−H))`, `H = (t/λ)^k`.
+/// Where `H` is large — the region a baseline nearer log-normal than Weibull
+/// drives the search into — `q ≈ √(2H) = C·t^{k/2}` with `C = √2·λ^{−k/2}`, so
+/// `q ≈ C·(1 + (k/2)·ln t)` and the chart tends to a baseline LINEAR in `ln t`
+/// as `k → 0` and `λ → 0` with the log-`t` slope `C·k/2` held fixed. In
+/// `(ln λ, ln k)` that limit is a curve through the interior of θ: the criterion
+/// falls along it, no interior optimum exists, and the outer search exhausts its
+/// iterations without a certificate, which is this issue.
+///
+/// The chart is therefore read in the limit's own invariant and the log shape:
+///
+/// ```text
+///   b = ln(C·k/2) = ln k − ½ln 2 − (k/2)·ln λ,     l = ln k.
+/// ```
+///
+/// `b` is the log of the limiting log-`t` slope — the quantity the limit holds
+/// fixed, taken from the expansion above, not chosen — so the limit becomes
+/// `l → −∞` at FIXED `b`: one coordinate axis, not a curve. Its floor is where
+/// the published scale leaves the normal f64 range
+/// ([`weibull_chart_shape_floor`]), so the box-face treatment every outer
+/// coordinate already gets (`certificate_railed_coordinates`: the projected
+/// gradient of a coordinate pinned against its own bound is zero, and the
+/// second-order condition is taken on the feasible tangent subspace) mints the
+/// limit with no new certification rule.
+///
+/// The inverse is [`weibull_chart_scale_shape`], and the chart's whole algebra
+/// is `ln H = k·ln t + 2u`, `u = b − l + ½ln 2`, in which `λ` never appears.
+fn weibull_chart_theta(scale: f64, shape: f64) -> [f64; 2] {
+    let l = shape.ln();
+    [
+        l - 0.5 * std::f64::consts::LN_2 - 0.5 * shape * scale.ln(),
+        l,
+    ]
+}
+
+/// The published `(λ, k)` of the chart coordinates `(b, l)`: the inverse of
+/// [`weibull_chart_theta`], `k = e^l` and `ln λ = −2u·e^{−l}`.
+///
+/// A pair whose published scale is not a NORMAL f64 is refused rather than
+/// rounded to zero: the saved model carries `λ` itself, so a chart member the
+/// payload cannot hold is not a member. [`weibull_chart_shape_floor`] puts the
+/// search box's face exactly there, so the search reaches the face instead of
+/// meeting this refusal inside the box.
+fn weibull_chart_scale_shape(b: f64, l: f64) -> Result<(f64, f64), String> {
+    let shape = l.exp();
+    let log_scale = weibull_chart_log_scale(b, l);
+    let scale = log_scale.exp();
+    if !(shape.is_finite() && shape > 0.0)
+        || !log_scale.is_finite()
+        || !(scale.is_finite() && scale >= f64::MIN_POSITIVE)
+    {
+        return Err(format!(
+            "weibull baseline chart coordinates (slope {b}, log shape {l}) publish scale \
+             exp({log_scale}) and shape {shape}, which leave the normal f64 range; a chart member \
+             is a pair whose published scale the saved model can hold"
+        ));
+    }
+    Ok((scale, shape))
+}
+
+/// `ln λ = −2·(b − l + ½ln 2)·e^{−l}` — the chart's published log scale.
+#[inline]
+fn weibull_chart_log_scale(b: f64, l: f64) -> f64 {
+    -2.0 * (b - l + 0.5 * std::f64::consts::LN_2) * (-l).exp()
+}
+
+/// The Weibull chart's log-shape floor: the smallest `l` at which EVERY slope
+/// coordinate the box admits still publishes a normal f64 scale (#2969).
+///
+/// `ln λ(l) = −2u·e^{−l}` with `u = b − l + ½ln 2` falls without bound as
+/// `l → −∞` once `u > 0`, and reaches the smallest normal f64 at
+/// `2u·e^{−l} = L`, `L = −ln(f64::MIN_POSITIVE)`. Taking `b` at the box's upper
+/// slope edge makes the whole rectangle publishable, since `ln λ` decreases in
+/// `b`. The crossing is the fixed point of `l ↦ ln(2u) − ln L`, whose
+/// derivative is `−1/u`, and `u ≥ L·e^{l}/2 > 1` at every point below the
+/// crossing, so the iteration contracts; it stops when the update no longer
+/// moves the value. `None` when the requested floor already publishes a normal
+/// scale, i.e. the representability face is outside the box and does not bind.
+fn weibull_chart_shape_floor(b_upper: f64, l_floor: f64) -> Result<Option<f64>, String> {
+    let ln_min_positive = f64::MIN_POSITIVE.ln();
+    if weibull_chart_log_scale(b_upper, l_floor) >= ln_min_positive {
+        return Ok(None);
+    }
+    let ln_l = (-ln_min_positive).ln();
+    let half_ln_2 = 0.5 * std::f64::consts::LN_2;
+    let mut l = l_floor;
+    // The contraction reaches f64 in far fewer steps than this; the bound is
+    // structural (it cannot spin), and the loop leaves as soon as the update
+    // stops moving the value.
+    for _ in 0..64 {
+        let room = b_upper - l + half_ln_2;
+        if !(room.is_finite() && room > 0.0) {
+            return Err(format!(
+                "weibull baseline chart shape floor: the box's upper slope {b_upper} leaves no \
+                 room above log shape {l} to place the representability face"
+            ));
+        }
+        let next = (2.0 * room).ln() - ln_l;
+        if next == l {
+            break;
+        }
+        l = next;
+    }
+    // The fixed point is the crossing itself, so the converged value can sit a
+    // rounding step on the unpublishable side of it. One ulp of `l` moves
+    // `ln λ` by `2e^{−l}(1 + u)·ulp(l)`, orders above that residual, so stepping
+    // up until the face publishes a normal scale settles immediately; the bound
+    // is structural.
+    for _ in 0..64 {
+        if !l.is_finite() || weibull_chart_log_scale(b_upper, l) >= ln_min_positive {
+            break;
+        }
+        l = l.next_up();
+    }
+    if !l.is_finite() || weibull_chart_log_scale(b_upper, l) < ln_min_positive {
+        return Err(format!(
+            "weibull baseline chart shape floor {l} does not publish a normal scale at the box's \
+             upper slope {b_upper}"
+        ));
+    }
+    Ok(Some(l))
 }
 
 pub fn survival_baseline_theta_from_config(
@@ -844,14 +986,15 @@ pub fn survival_baseline_theta_from_config(
 ) -> Result<Option<Array1<f64>>, String> {
     let theta = match cfg.target {
         SurvivalBaselineTarget::Linear => None,
-        SurvivalBaselineTarget::Weibull => Some(array![
-            cfg.scale
-                .ok_or_else(|| "missing weibull baseline scale".to_string())?
-                .ln(),
-            cfg.shape
-                .ok_or_else(|| "missing weibull baseline shape".to_string())?
-                .ln(),
-        ]),
+        SurvivalBaselineTarget::Weibull => {
+            let chart = weibull_chart_theta(
+                cfg.scale
+                    .ok_or_else(|| "missing weibull baseline scale".to_string())?,
+                cfg.shape
+                    .ok_or_else(|| "missing weibull baseline shape".to_string())?,
+            );
+            Some(array![chart[0], chart[1]])
+        }
         SurvivalBaselineTarget::Gompertz => Some(array![
             cfg.rate
                 .ok_or_else(|| "missing gompertz baseline rate".to_string())?
@@ -907,10 +1050,12 @@ pub fn survival_baseline_config_from_theta(
                 }
                 .into());
             }
+            // #2969: θ is the chart's `(b, l)`, not `(ln λ, ln k)`.
+            let (scale, shape) = weibull_chart_scale_shape(theta[0], theta[1])?;
             SurvivalBaselineConfig {
                 target,
-                scale: Some(theta[0].exp()),
-                shape: Some(theta[1].exp()),
+                scale: Some(scale),
+                shape: Some(shape),
                 rate: None,
                 makeham: None,
             }
@@ -2544,8 +2689,9 @@ pub fn center_survival_time_designs_at_anchor(
 /// [`survival_baseline_theta_from_config`] / [`survival_baseline_config_from_theta`]
 /// use:
 ///
-/// - **Weibull**: θ = (log_scale, log_shape).  `eta = shape·(log t − log scale)`,
-///   `o_D = shape/t`.
+/// - **Weibull**: θ = (b, l), the chart coordinates of [`weibull_chart_theta`]
+///   (#2969).  `eta = ln H = k·ln t + 2u` with `k = e^l` and
+///   `u = b − l + ½ln 2`, `o_D = k/t`.
 /// - **Gompertz**: θ = (log_rate, shape).  `eta = log H_G(t)` with
 ///   `H_G(t) = (rate/shape)·(exp(shape·t) − 1)`, `o_D = h_G(t)/H_G(t) =
 ///   shape·E/(E−1)` where `E = exp(shape·t)`.
@@ -2574,25 +2720,15 @@ pub fn baseline_offset_theta_partials(
     };
 
     match params {
-        ValidatedBaselineTarget::Weibull { scale, shape } => {
-            // eta = shape·(log t − log scale)
-            //     = shape·log t − shape·log scale
-            // o_D = shape / t
-            //
-            // θ = (log_scale, log_shape):
-            //   ∂eta/∂log_scale  = −shape          ∂o_D/∂log_scale = 0
-            //   ∂eta/∂log_shape  = shape·(log t − log scale) = eta
-            //   ∂o_D/∂log_shape  = shape / t = o_D
-            let eta = shape * (age.ln() - scale.ln());
+        ValidatedBaselineTarget::Weibull { shape, .. } => {
+            // eta = ln H = k·ln t + 2u and o_D = k/t in the chart coordinates
+            // `θ = (b, l)` ([`weibull_chart_theta`], #2969), with `k = e^l`,
+            // `u = b − l + ½ln 2` and `κ = k·ln t`:
+            //   ∂eta/∂b = 2            ∂o_D/∂b = 0
+            //   ∂eta/∂l = κ − 2        ∂o_D/∂l = k/t = o_D
             let o_d = shape / age;
-            let d_eta_d_log_scale = -shape;
-            let d_od_d_log_scale = 0.0;
-            let d_eta_d_log_shape = eta;
-            let d_od_d_log_shape = o_d;
-            Ok(Some(vec![
-                (d_eta_d_log_scale, d_od_d_log_scale),
-                (d_eta_d_log_shape, d_od_d_log_shape),
-            ]))
+            let kappa = shape * age.ln();
+            Ok(Some(vec![(2.0, 0.0), (kappa - 2.0, o_d)]))
         }
         ValidatedBaselineTarget::Gompertz { shape, .. } => {
             // θ = (log_rate, shape):
@@ -3078,6 +3214,18 @@ fn validated_baseline_params(
     }
 }
 
+/// `(H(t), h(t))` of a Weibull baseline, read through logs.
+///
+/// `H = exp(k·(ln t − ln λ))` rather than `(t/λ)^k`. The chart's far members
+/// (#2969) publish a `λ` at the bottom of the normal f64 range, where `t/λ`
+/// overflows to infinity while `H` is still O(1); the log form is exact there
+/// and agrees with the ratio form to rounding wherever both are finite.
+#[inline]
+fn weibull_hazard_components(age: f64, scale: f64, shape: f64) -> (f64, f64) {
+    let cumulative_hazard = (shape * (age.ln() - scale.ln())).exp();
+    (cumulative_hazard, shape * cumulative_hazard / age)
+}
+
 fn survival_hazard_theta_partials(
     age: f64,
     cfg: &SurvivalBaselineConfig,
@@ -3088,13 +3236,23 @@ fn survival_hazard_theta_partials(
 
     match params {
         ValidatedBaselineTarget::Weibull { scale, shape } => {
-            let log_time_ratio = age.ln() - scale.ln();
-            let cumulative_hazard = (age / scale).powf(shape);
-            let instant_hazard = shape * cumulative_hazard / age;
-            let eta = shape * log_time_ratio;
+            // The chart coordinates are `(b, l)` ([`weibull_chart_theta`]), in
+            // which `ln H = k·ln t + 2u` with `k = e^l` and `u = b − l + ½ln 2`,
+            // and `h = k·H/t`. Writing `κ = k·ln t`:
+            //
+            //   ∂ln H/∂b = 2,       ∂ln H/∂l = κ − 2,
+            //   ∂ln h/∂b = 2,       ∂ln h/∂l = κ − 1.
+            //
+            // No `λ` appears: the chart's far members have `ln λ` far below the
+            // f64 exponent range while `H` stays O(1) (#2969).
+            let (cumulative_hazard, instant_hazard) = weibull_hazard_components(age, scale, shape);
+            let kappa = shape * age.ln();
             Ok(Some(vec![
-                (-shape * cumulative_hazard, -shape * instant_hazard),
-                (eta * cumulative_hazard, (1.0 + eta) * instant_hazard),
+                (2.0 * cumulative_hazard, 2.0 * instant_hazard),
+                (
+                    (kappa - 2.0) * cumulative_hazard,
+                    (kappa - 1.0) * instant_hazard,
+                ),
             ]))
         }
         ValidatedBaselineTarget::Gompertz { rate, shape } => {
@@ -3133,9 +3291,7 @@ fn survival_cumulative_and_instant_hazard(
 
     match params {
         ValidatedBaselineTarget::Weibull { scale, shape } => {
-            let cumulative_hazard = (age / scale).powf(shape);
-            let instant_hazard = shape * cumulative_hazard / age;
-            Ok(Some((cumulative_hazard, instant_hazard)))
+            Ok(Some(weibull_hazard_components(age, scale, shape)))
         }
         ValidatedBaselineTarget::Gompertz { rate, shape } => {
             let (cumulative_hazard, instant_hazard) = gompertz_hazard_components(age, rate, shape);
@@ -3448,28 +3604,30 @@ fn survival_hazard_theta_first_second(
     match cfg.target {
         SurvivalBaselineTarget::Linear => return Ok(None),
         SurvivalBaselineTarget::Weibull => {
-            let scale = cfg
-                .scale
-                .ok_or_else(|| "weibull missing scale".to_string())?;
             let shape = cfg
                 .shape
                 .ok_or_else(|| "weibull missing shape".to_string())?;
-            let log_time_ratio = age.ln() - scale.ln();
             let cumulative_hazard = hazard.0;
             let instant_hazard = hazard.1;
-            let eta = shape * log_time_ratio;
-            second[0][0] = (
-                shape * shape * cumulative_hazard,
-                shape * shape * instant_hazard,
-            );
+            // In the chart coordinates `θ = (b, l)` ([`weibull_chart_theta`],
+            // #2969), `ln H = κ + 2u` and `ln h = ln H + l − ln t` with
+            // `κ = k·ln t`, `u = b − l + ½ln 2` and `∂κ/∂l = κ`, so
+            //   H_b = 2H,        H_l = (κ − 2)H,
+            //   H_bb = 4H,       H_bl = 2(κ − 2)H,   H_ll = [(κ − 2)² + κ]H,
+            //   h_b = 2h,        h_l = (κ − 1)h,
+            //   h_bb = 4h,       h_bl = 2(κ − 1)h,   h_ll = [(κ − 1)² + κ]h.
+            let kappa = shape * age.ln();
+            let cum_l = kappa - 2.0;
+            let inst_l = kappa - 1.0;
+            second[0][0] = (4.0 * cumulative_hazard, 4.0 * instant_hazard);
             second[0][1] = (
-                -shape * cumulative_hazard * (1.0 + eta),
-                -shape * instant_hazard * (2.0 + eta),
+                2.0 * cum_l * cumulative_hazard,
+                2.0 * inst_l * instant_hazard,
             );
             second[1][0] = second[0][1];
             second[1][1] = (
-                eta * cumulative_hazard * (1.0 + eta),
-                (eta + (1.0 + eta) * (1.0 + eta)) * instant_hazard,
+                (cum_l * cum_l + kappa) * cumulative_hazard,
+                (inst_l * inst_l + kappa) * instant_hazard,
             );
         }
         SurvivalBaselineTarget::Gompertz => {
@@ -6300,19 +6458,50 @@ mod tests {
             let seed = chart.initial_theta();
             let (lower, upper) = chart.theta_bounds();
             assert_eq!(seed.len(), radii.len(), "chart coordinate count");
+            let weibull_shape_axis = config.target == SurvivalBaselineTarget::Weibull;
             for axis in 0..seed.len() {
-                assert_eq!(
-                    lower[axis],
-                    seed[axis] - radii[axis],
-                    "lower edge of chart axis {axis} of {}",
-                    seed.len()
-                );
                 assert_eq!(
                     upper[axis],
                     seed[axis] + radii[axis],
                     "upper edge of chart axis {axis} of {}",
                     seed.len()
                 );
+                if weibull_shape_axis && axis == 1 {
+                    // #2969: the Weibull chart's log-shape runs DOWN to the
+                    // log-normal limit, and the interval ends where the
+                    // published scale leaves the normal f64 range, not at the
+                    // gradient resolution. The face is checked against that
+                    // definition, not against a literal: one step further down
+                    // must publish a scale below the smallest normal f64, and
+                    // the face itself must publish one at or above it, both at
+                    // the box's upper slope.
+                    assert!(
+                        lower[axis] > seed[axis] - radii[axis],
+                        "the representability face must bind before the resolution radius on \
+                         this seed: face {}, resolution edge {}",
+                        lower[axis],
+                        seed[axis] - radii[axis]
+                    );
+                    let face_scale = super::weibull_chart_log_scale(upper[0], lower[axis]);
+                    assert!(
+                        face_scale >= f64::MIN_POSITIVE.ln(),
+                        "the face publishes ln λ = {face_scale}, below the smallest normal f64"
+                    );
+                    let below =
+                        super::weibull_chart_log_scale(upper[0], lower[axis] - f64::EPSILON.sqrt());
+                    assert!(
+                        below < f64::MIN_POSITIVE.ln(),
+                        "the face is not the crossing: one √ε step below it still publishes \
+                         ln λ = {below}"
+                    );
+                } else {
+                    assert_eq!(
+                        lower[axis],
+                        seed[axis] - radii[axis],
+                        "lower edge of chart axis {axis} of {}",
+                        seed.len()
+                    );
+                }
             }
         }
     }
@@ -7283,8 +7472,198 @@ mod tests {
                     &format!("weibull ∂o_D/∂θ[{k}] (scale={scale}, shape={shape}, age={age})"),
                 );
             }
-            // Weibull o_D = shape/t is independent of scale; verify exactly.
+            // Weibull o_D = k/t reads the chart's log-shape alone, never its
+            // slope coordinate (#2969); verify exactly.
             assert_eq!(analytic[0].1, 0.0);
+        }
+    }
+
+    /// gam#2969: the Weibull chart is read in the limit's own invariant.
+    ///
+    /// The chart's `q(t) = −Φ⁻¹(exp(−H))` tends to a baseline LINEAR in `ln t`
+    /// as `k → 0` and `λ → 0` with `C·k/2` held fixed, `C = √2·λ^{−k/2}`. In
+    /// `(ln λ, ln k)` that is a curve through the interior, which no
+    /// coordinate-rail certificate can mint. In the chart coordinates
+    /// `b = ln(C·k/2)`, `l = ln k` it is the single axis `l → −∞` at fixed `b`,
+    /// and this test holds the chart to exactly that: the map round-trips, the
+    /// log-`t` slope converges to `e^b` monotonically as `l` falls, and the
+    /// member whose published scale leaves the normal f64 range is refused —
+    /// which is where [`survival_baseline_theta_domain`] puts the box face, so
+    /// the search rails there instead of meeting the refusal inside its box.
+    #[test]
+    fn the_weibull_chart_straightens_the_log_normal_limit_onto_its_shape_axis_2969() {
+        for (scale, shape) in [(0.5_f64, 1.2_f64), (2.0, 0.8), (0.1, 3.0), (50.0, 1.0)] {
+            let theta = super::weibull_chart_theta(scale, shape);
+            let (round_scale, round_shape) =
+                super::weibull_chart_scale_shape(theta[0], theta[1]).expect("a chart member");
+            assert_close(
+                round_shape,
+                shape,
+                1e-14,
+                &format!("chart round trip of shape {shape}"),
+            );
+            assert_close(
+                round_scale.ln(),
+                scale.ln(),
+                1e-12,
+                &format!("chart round trip of ln scale {scale}"),
+            );
+        }
+
+        // The planted log-`t` slope of gam#2930's minimal fixture.
+        let slope = 0.95_f64;
+        let b = slope.ln();
+        let times = [2.0_f64, 8.0_f64];
+        let mut previous_error = f64::INFINITY;
+        for l in [0.0_f64, -1.0, -2.0, -3.0, -4.0] {
+            let (scale, shape) =
+                super::weibull_chart_scale_shape(b, l).expect("a representable chart member");
+            let cfg = SurvivalBaselineConfig {
+                target: SurvivalBaselineTarget::Weibull,
+                scale: Some(scale),
+                shape: Some(shape),
+                rate: None,
+                makeham: None,
+            };
+            let q: Vec<f64> = times
+                .iter()
+                .map(|&t| {
+                    evaluate_survival_marginal_slope_baseline(t, &cfg)
+                        .expect("the chart evaluates")
+                        .0
+                })
+                .collect();
+            let measured = (q[1] - q[0]) / (times[1].ln() - times[0].ln());
+            let error = (measured - slope).abs();
+            assert!(
+                error < previous_error,
+                "the log-t slope must approach e^b = {slope} as the shape axis falls: at \
+                 l = {l} it is {measured} (error {error}), no closer than the previous \
+                 {previous_error}"
+            );
+            previous_error = error;
+        }
+        assert!(
+            previous_error < 0.05 * slope,
+            "four e-folds down the shape axis the chart is still {previous_error} from the \
+             linear-in-log-t baseline it tends to"
+        );
+
+        // One e-fold further the published scale leaves the normal f64 range:
+        // the member is refused rather than rounded to a zero scale the saved
+        // model cannot hold.
+        let error = super::weibull_chart_scale_shape(b, -5.0)
+            .expect_err("a member whose published scale underflows is not a member");
+        assert!(
+            error.contains("normal f64 range"),
+            "the refusal must name what left the range: {error}"
+        );
+    }
+
+    /// gam#2969: the chart's hazard derivatives in `(b, l)` against central
+    /// differences of the chart's own evaluation, first AND second order, at a
+    /// member on the limit path where `λ` is far below the ratio form's range.
+    #[test]
+    fn the_weibull_chart_hazard_partials_match_central_differences_2969() {
+        let b = (0.95_f64).ln();
+        for l in [0.3_f64, -1.0, -3.5] {
+            let (scale, shape) =
+                super::weibull_chart_scale_shape(b, l).expect("a representable chart member");
+            let cfg = SurvivalBaselineConfig {
+                target: SurvivalBaselineTarget::Weibull,
+                scale: Some(scale),
+                shape: Some(shape),
+                rate: None,
+                makeham: None,
+            };
+            for age in [1.5_f64, 7.0, 40.0] {
+                let (_, first, second) = super::survival_hazard_theta_first_second(age, &cfg)
+                    .expect("hazard partials")
+                    .expect("a nonlinear baseline");
+                let step = f64::EPSILON.powf(0.25) * (1.0 + b.abs().max(l.abs()));
+                let at = |theta: &[f64; 2]| -> (f64, f64) {
+                    let (scale, shape) = super::weibull_chart_scale_shape(theta[0], theta[1])
+                        .expect("a representable probe");
+                    let cfg = SurvivalBaselineConfig {
+                        target: SurvivalBaselineTarget::Weibull,
+                        scale: Some(scale),
+                        shape: Some(shape),
+                        rate: None,
+                        makeham: None,
+                    };
+                    super::survival_cumulative_and_instant_hazard(age, &cfg)
+                        .expect("hazard")
+                        .expect("a nonlinear baseline")
+                };
+                let base = [b, l];
+                for axis in 0..2 {
+                    let mut plus = base;
+                    let mut minus = base;
+                    plus[axis] += step;
+                    minus[axis] -= step;
+                    let (cum_p, inst_p) = at(&plus);
+                    let (cum_m, inst_m) = at(&minus);
+                    let label = format!("(b={b}, l={l}, age={age}) axis {axis}");
+                    assert_close(
+                        first[axis].0,
+                        (cum_p - cum_m) / (2.0 * step),
+                        1e-5,
+                        &format!("∂H/∂θ {label}"),
+                    );
+                    assert_close(
+                        first[axis].1,
+                        (inst_p - inst_m) / (2.0 * step),
+                        1e-5,
+                        &format!("∂h/∂θ {label}"),
+                    );
+                    // The second partials are differenced from the FIRST ones,
+                    // which are what the outer Hessian reads.
+                    let first_plus = {
+                        let (scale, shape) = super::weibull_chart_scale_shape(plus[0], plus[1])
+                            .expect("a representable probe");
+                        let cfg = SurvivalBaselineConfig {
+                            target: SurvivalBaselineTarget::Weibull,
+                            scale: Some(scale),
+                            shape: Some(shape),
+                            rate: None,
+                            makeham: None,
+                        };
+                        super::survival_hazard_theta_first_second(age, &cfg)
+                            .expect("hazard partials")
+                            .expect("a nonlinear baseline")
+                            .1
+                    };
+                    let first_minus = {
+                        let (scale, shape) = super::weibull_chart_scale_shape(minus[0], minus[1])
+                            .expect("a representable probe");
+                        let cfg = SurvivalBaselineConfig {
+                            target: SurvivalBaselineTarget::Weibull,
+                            scale: Some(scale),
+                            shape: Some(shape),
+                            rate: None,
+                            makeham: None,
+                        };
+                        super::survival_hazard_theta_first_second(age, &cfg)
+                            .expect("hazard partials")
+                            .expect("a nonlinear baseline")
+                            .1
+                    };
+                    for other in 0..2 {
+                        assert_close(
+                            second[axis][other].0,
+                            (first_plus[other].0 - first_minus[other].0) / (2.0 * step),
+                            1e-5,
+                            &format!("∂²H/∂θ[{other}]∂θ[{axis}] (b={b}, l={l}, age={age})"),
+                        );
+                        assert_close(
+                            second[axis][other].1,
+                            (first_plus[other].1 - first_minus[other].1) / (2.0 * step),
+                            1e-5,
+                            &format!("∂²h/∂θ[{other}]∂θ[{axis}] (b={b}, l={l}, age={age})"),
+                        );
+                    }
+                }
+            }
         }
     }
 

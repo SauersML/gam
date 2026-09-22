@@ -18,6 +18,30 @@
   already made to the location-scale producer). The Royston–Parmar branch already published the
   transformed-η band; the survival marginal-slope and location-scale branches still publish the
   symmetric one and are named in the issue.
+- **The Weibull marginal-slope baseline chart is read in its log-normal limit's own
+  invariant, so that limit is a box face instead of an interior curve** (gam#2969).
+  The chart realizes `q(t) = −Φ⁻¹(exp(−(t/λ)^k))`. Where the cumulative hazard is large,
+  `q ≈ C·(1 + (k/2)·ln t)` with `C = √2·λ^{−k/2}`, so as `k → 0` and `λ → 0` with the log-`t`
+  slope `C·k/2` held fixed the chart tends to a baseline LINEAR in `ln t` — the log-normal
+  AFT case real follow-up reaches. In `θ = (ln λ, ln k)` that limit is a curve through the
+  interior of θ: the criterion keeps falling along it, there is no interior optimum, and the
+  outer search ended uncertified at its iteration budget with `|Pg| = 55.65` against a bound
+  of `8.010e-2`, an indefinite Hessian and nothing railed. The chart's coordinates are now
+  `b = ln(C·k/2) = ln k − ½ln 2 − (k/2)·ln λ` and `l = ln k`, the limit's own invariant and
+  the log shape, in which the limit is the single axis `l → −∞` at fixed `b`. Its floor is
+  where the published scale leaves the normal f64 range, which is where the θ domain now puts
+  the Weibull log-shape's lower edge, so the box-face treatment every outer coordinate
+  already gets — a railed coordinate's projected gradient is zero and its row and column are
+  deleted from the second-order condition — certifies the limit with no new rule. The whole
+  chart algebra is `ln H = k·ln t + 2u`, `u = b − l + ½ln 2`, in which `λ` never appears, and
+  `(t/λ)^k` is replaced by `exp(k·(ln t − ln λ))` because the far members' `t/λ` overflows
+  while `H` is O(1).
+  **Behavior change:** every survival fit that searches a parametric Weibull baseline
+  (marginal-slope, location-scale, latent) searches these coordinates and this box. The model
+  set is unchanged — the same `(λ, k)` pairs are reachable — but the path and the box edges
+  are not, and the saved model is untouched: the payload carries `scale` and `shape`, which
+  the chart still publishes.
+
 
 - **The fold record named the mode's softest direction but never carried it, so a mode one solve
   away from a lower basin had nowhere to go** (gam#3173, gam#2765). The Laplace normalizer is the
