@@ -2629,6 +2629,14 @@ pub(crate) fn fit_binomial_mean_wiggle(
     // interpretable (the pass after an accelerated step).
     let mut last_measured_multiplier = f64::NAN;
     let mut mixer = FrozenIndexMixer::new(options.outer_max_iter)?;
+    // The outer bound may be unbounded (gam#4566 stops the custom-family search on progress
+    // certificates), so this loop carries its own: the mixer discards its history on a pass
+    // whose residual did not fall below the previous pass's, and the pass after a discard takes
+    // the scalar relaxed step whose relaxation is derived from the measured multiplier. Two
+    // consecutive discards say that relaxed step did not contract either, which is the
+    // non-contraction the refusal below already explains; the loop stops there instead of
+    // running the budget out (gam#4570).
+    let mut consecutive_non_contractions = 0usize;
     let mut dominant_multiplier = f64::NAN;
     // The operating point the de-aliasing metric is evaluated at: the composite
     // index `q = X·β + B⊥·β_w` of the previous pass. The pilot carries no warp,
@@ -2775,6 +2783,18 @@ pub(crate) fn fit_binomial_mean_wiggle(
             .chain(step.iter().copied())
             .collect();
         let (advance, advance_kind, history_reset) = mixer.advance(&residual, relaxation)?;
+        if history_reset {
+            consecutive_non_contractions += 1;
+        } else {
+            consecutive_non_contractions = 0;
+        }
+        if consecutive_non_contractions >= 2 {
+            log::debug!(
+                "[WIGGLE-OUTER] #2748 pass {_outer}: the scalar relaxed step after a discarded \
+                 history did not contract the residual either; stopping (gam#4570)"
+            );
+            break;
+        }
         log::debug!(
             "[WIGGLE-OUTER] #2748 pass {_outer}: advance={advance_kind} |residual|={:.6e} \
              history_reset={history_reset}",

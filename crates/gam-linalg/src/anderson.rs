@@ -89,12 +89,15 @@ impl AndersonAccelerator {
                 "Anderson acceleration requires a positive history depth".to_string(),
             ));
         }
+        // The depth is a CAP on the history, not a size to reserve: a caller that wants full
+        // memory passes the pass budget, which may be unbounded (gam#4570), and a history
+        // only ever holds as many columns as passes were taken.
         Ok(Self {
             depth,
             dimension: None,
             previous_residual: None,
-            image_differences: VecDeque::with_capacity(depth),
-            residual_differences: VecDeque::with_capacity(depth),
+            image_differences: VecDeque::new(),
+            residual_differences: VecDeque::new(),
         })
     }
 

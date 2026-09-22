@@ -1,5 +1,13 @@
 ## Unreleased
 
+- **Every binomial `flexible(...)` link fit panicked with `capacity overflow`** (gam#4570). The mean-wiggle
+  loop's Anderson mixer took `options.outer_max_iter` as its history depth and the accelerator preallocated that
+  depth, so once gam#4566 made the custom-family outer budget unbounded the preallocation overflowed before the
+  first pass. The accelerator now allocates its history lazily and treats the depth as a cap (full memory when
+  the cap is the budget), and the wiggle loop carries its own stop: two consecutive passes whose residual did not
+  fall below the previous pass's — the discarded-history pass and then the scalar relaxed step — end the loop
+  with the existing non-contraction refusal instead of running an unbounded budget.
+
 - **A penalty's structural rank was read off its SQUARED Gram, which resolves half the digits its
   energy factor does, so a rank frozen at one κ could not be realized at another and every trial
   refused** (gam#2959, gam#1561, gam#3236). `λᵢ(S) = σᵢ(A)²` for an accumulated `S = AᵀA`, so
