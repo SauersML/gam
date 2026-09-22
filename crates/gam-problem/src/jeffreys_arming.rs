@@ -215,11 +215,38 @@ impl CustomFamilyError {
     /// proves nothing about the unarmed objective's stationary points.
     ///
     /// A whole-search refusal is read through the typed refusal of its last
-    /// objective evaluation (see [`CustomFamilyError::OuterSmoothingFailed`]).
-    /// Its `search_inner_refusal` is never read here: the search stepped away
-    /// from that refusal, so it proves nothing about the objective where the
-    /// search ended (#2943). The match over joint-Newton terminal reasons is
-    /// exhaustive, so a new reason must be graded when it is added.
+    /// objective evaluation (see [`CustomFamilyError::OuterSmoothingFailed`]),
+    /// and falls back to its `search_inner_refusal` when that one proves nothing.
+    /// The match over joint-Newton terminal reasons is exhaustive, so a new
+    /// reason must be graded when it is added.
+    ///
+    /// # Why the fallback, and what #2943 still decides
+    ///
+    /// #2943 established that `last_refusal` wins, because the search stepped
+    /// away from `search_inner_refusal` and it proves nothing about the
+    /// objective where the search ended. That precedence is unchanged: a last
+    /// refusal carrying evidence still arms, and the earlier one is never
+    /// consulted over it.
+    ///
+    /// What changed is the case where `last_refusal` carries NO evidence. There
+    /// is no "objective where the search ended" for the earlier refusal to be
+    /// wrong about: `OuterSmoothingFailed` is raised only when the search
+    /// certified nothing anywhere, so the fit is about to refuse while holding a
+    /// proof that some `rho` it visited has an inner objective with no finite
+    /// minimizer. Arming is a decision about the FAMILY — whether its likelihood
+    /// has a separation or under-identification regime the Firth prior bounds —
+    /// and a ray at one visited `rho` is evidence about that likelihood. Moving
+    /// to another `rho` afterwards does not un-separate the data.
+    ///
+    /// This cannot arm a fit that succeeds: a search that certifies returns
+    /// `Ok`, and the certified path reads only its own posterior evidence.
+    ///
+    /// The same two fields are read in the OPPOSITE order one level up, by
+    /// `FitFailure::terminal_inner_refusal`, which prefers `search_inner_refusal`
+    /// and falls back to `last_refusal`. That is what renders the inner refusal a
+    /// reader is SHOWN. Before this fallback the displayed refusal and the armed
+    /// refusal could be different objects, so a fit could print a descending ray
+    /// and its closing strength while arming saw nothing at all (#4566).
     #[must_use]
     pub fn jeffreys_arming_evidence(&self) -> Option<JeffreysArmingEvidence> {
         let Self::InnerSolveNotConverged {
@@ -234,9 +261,18 @@ impl CustomFamilyError {
         } = self
         else {
             return match self {
-                Self::OuterSmoothingFailed { last_refusal, .. } => last_refusal
+                Self::OuterSmoothingFailed {
+                    last_refusal,
+                    search_inner_refusal,
+                    ..
+                } => last_refusal
                     .as_deref()
-                    .and_then(Self::jeffreys_arming_evidence),
+                    .and_then(Self::jeffreys_arming_evidence)
+                    .or_else(|| {
+                        search_inner_refusal
+                            .as_deref()
+                            .and_then(Self::jeffreys_arming_evidence)
+                    }),
                 _ => None,
             };
         };
@@ -376,13 +412,18 @@ mod tests {
     }
 
     #[test]
-    fn only_the_last_evaluation_refusal_arms_a_whole_search_refusal_2943() {
+    fn the_last_evaluation_refusal_wins_and_the_search_record_is_the_fallback_2943_4566() {
         // A whole-search refusal carries two refusals (gam#2943). `last_refusal`
-        // is the typed refusal of the search's last objective evaluation, and
-        // arming reads it. `search_inner_refusal` is the search's most recent
-        // uncertified inner solve, kept across the finite trials after it so the
-        // fit boundary can name it. The search stepped away from that refusal, so
-        // it proves nothing about the objective where the search ended.
+        // is the typed refusal of the search's last objective evaluation and
+        // WINS: the search stepped away from `search_inner_refusal`, so it proves
+        // nothing about the objective where the search ended, and it is never
+        // consulted over one that does.
+        //
+        // It is consulted when `last_refusal` proves nothing (gam#4566). A
+        // whole-search refusal is raised only when the search certified nowhere,
+        // so there is no ended-at objective for the earlier refusal to be wrong
+        // about, and refusing while holding a proof that a visited rho has an
+        // unbounded inner objective discards the only evidence the fit has.
         let stalled = joint_newton_refusal(
             JointNewtonTerminalReason::StalledOnDescendingRay {
                 residual: 1.0e-1,
@@ -438,13 +479,22 @@ mod tests {
         );
         assert_eq!(
             search(None, Some(stalled.clone())).jeffreys_arming_evidence(),
-            None,
-            "a ray refusal the search stepped away from must not arm it"
+            evidence,
+            "a search whose last evaluation refused with nothing typed must still arm on the \
+             ray it holds: it is refusing, so there is no ended-at objective the ray is wrong \
+             about, and the ray is the only evidence about the likelihood it has"
         );
         assert_eq!(
             search(Some(budget_only), Some(stalled.clone())).jeffreys_arming_evidence(),
-            None,
-            "a search that ends on a refusal without evidence must not arm on an earlier ray"
+            evidence,
+            "a cycle-budget ending proves nothing about the objective's stationary points, so \
+             it does not displace the ray; a refusal that proves nothing must not outrank one \
+             that proves something"
+        );
+        assert_eq!(
+            search(Some(stalled.clone()), None).jeffreys_arming_evidence(),
+            evidence,
+            "the fallback must not disturb the case it falls back FROM"
         );
         assert_eq!(
             CustomFamilyError::fit_ended_without_certified_inner_mode(stalled)
