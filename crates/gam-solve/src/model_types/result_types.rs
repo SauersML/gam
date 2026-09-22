@@ -3955,24 +3955,24 @@ mod training_response_fingerprint_tests {
     fn the_fingerprint_is_the_response_and_its_weights_by_value_4556() {
         let response = array![0.5, -1.25, 3.0, 0.0];
         let weights = array![1.0, 1.0, 2.5, 1.0];
-        let identity = training_response_fingerprint(response.view(), weights.view());
+        let identity = training_response_fingerprint(&[response.view(), weights.view()]);
         assert_eq!(
             identity,
-            training_response_fingerprint(response.view(), weights.view()),
+            training_response_fingerprint(&[response.view(), weights.view()]),
             "the same rows read twice are one experiment"
         );
 
         let moved_response = array![0.5, -1.25, 3.0, 1e-300];
         assert_ne!(
             identity,
-            training_response_fingerprint(moved_response.view(), weights.view()),
+            training_response_fingerprint(&[moved_response.view(), weights.view()]),
             "one observation moved, by any representable amount, is different data"
         );
 
         let moved_weights = array![1.0, 1.0, 2.5, 1.0 + f64::EPSILON];
         assert_ne!(
             identity,
-            training_response_fingerprint(response.view(), moved_weights.view()),
+            training_response_fingerprint(&[response.view(), moved_weights.view()]),
             "a weighted likelihood on one response under two weightings is two experiments"
         );
 
@@ -3980,20 +3980,87 @@ mod training_response_fingerprint_tests {
         let shorter_weights = array![1.0, 1.0, 2.5];
         assert_ne!(
             identity,
-            training_response_fingerprint(shorter.view(), shorter_weights.view()),
+            training_response_fingerprint(&[shorter.view(), shorter_weights.view()]),
             "the shape is absorbed before the values, so lengths cannot collide"
         );
 
-        // The function is total: a pair whose lengths disagree is not a fit's
-        // response and weights, and it gets its own identity rather than a
-        // panic or a dropped column.
+        // The function is total: a set whose lengths disagree is not a fit's
+        // columns, and it gets its own identity rather than a panic or a
+        // dropped column.
         assert_ne!(
-            training_response_fingerprint(response.view(), shorter_weights.view()),
-            training_response_fingerprint(shorter.view(), shorter_weights.view()),
+            training_response_fingerprint(&[response.view(), shorter_weights.view()]),
+            training_response_fingerprint(&[shorter.view(), shorter_weights.view()]),
         );
         assert_ne!(
-            training_response_fingerprint(response.view(), shorter_weights.view()),
+            training_response_fingerprint(&[response.view(), shorter_weights.view()]),
             identity,
+        );
+    }
+
+    /// Refs #4556. A survival transformation fit's likelihood reads four
+    /// columns, and each of them makes two datasets two experiments — including
+    /// the event code, which a `(response, weights)` rule cannot see at all:
+    /// two datasets with identical entry times, exit times and weights that
+    /// differ only in which rows were events are not one experiment, and before
+    /// this the survival route published no identity rather than a partial one.
+    ///
+    /// The column COUNT is absorbed before any value, so the four-column
+    /// identity of a survival fit can never equal the two-column identity of a
+    /// standard fit over the same numbers.
+    #[test]
+    fn a_survival_fits_identity_reads_all_four_of_its_columns_4556() {
+        let entry = array![0.0, 0.0, 1.5, 2.0];
+        let exit = array![3.0, 4.5, 6.0, 7.25];
+        let event = array![1.0, 0.0, 1.0, 0.0];
+        let weights = array![1.0, 1.0, 1.0, 2.0];
+        let columns = [entry.view(), exit.view(), event.view(), weights.view()];
+        let identity = training_response_fingerprint(&columns);
+        assert_eq!(
+            identity,
+            training_response_fingerprint(&columns),
+            "the same rows read twice are one experiment"
+        );
+
+        for (index, moved) in [
+            array![1e-300, 0.0, 1.5, 2.0],
+            array![3.0, 4.5, 6.0, 7.25 + f64::EPSILON * 8.0],
+            array![0.0, 1.0, 1.0, 0.0],
+            array![1.0, 1.0, 1.0, 2.0 + f64::EPSILON * 2.0],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut moved_columns = columns;
+            moved_columns[index] = moved.view();
+            assert_ne!(
+                identity,
+                training_response_fingerprint(&moved_columns),
+                "column {index} is part of the experiment and must move the identity"
+            );
+        }
+
+        // The event column is the one a `(response, weights)` rule cannot see:
+        // pricing the exit time as the response and the weights as the weights
+        // leaves two datasets that differ only in their events indistinguishable.
+        let flipped_event = array![0.0, 1.0, 1.0, 0.0];
+        assert_eq!(
+            training_response_fingerprint(&[exit.view(), weights.view()]),
+            training_response_fingerprint(&[exit.view(), weights.view()]),
+        );
+        assert_ne!(
+            training_response_fingerprint(&columns),
+            training_response_fingerprint(&[
+                entry.view(),
+                exit.view(),
+                flipped_event.view(),
+                weights.view(),
+            ]),
+        );
+
+        // Different column sets are different experiments by construction.
+        assert_ne!(
+            identity,
+            training_response_fingerprint(&[exit.view(), weights.view()])
         );
     }
 }
@@ -5116,8 +5183,8 @@ fn standard_errors_of_published_covariance(covariance: &Array2<f64>) -> Array1<f
     }
 }
 
-/// The identity of the data a fit was trained on: the response and the prior
-/// weights, by value (#4556 P3).
+/// The identity of the data a fit was trained on: the columns that define its
+/// experiment, by value (#4556 P3).
 ///
 /// A model comparison is an evidence ratio only between two fits of ONE
 /// experiment. Equal row counts, equal families and equal intercept-only
@@ -5126,36 +5193,46 @@ fn standard_errors_of_published_covariance(covariance: &Array2<f64>) -> Array1<f
 /// to the hash's collision probability — two fits whose fingerprints agree read
 /// the same response values in the same order under the same weights.
 ///
-/// Both columns are absorbed, because a weighted likelihood on one response
-/// under two weightings is two experiments: `−2ℓ` is weighted, so the two are
-/// not comparable and must not pass as one. The hash is
-/// [`gam_linalg::matrix::array2_bits_fingerprint`], the one value identity this
-/// repository builds every fingerprint from, and it absorbs the SHAPE before
-/// the values, so a response of `n` rows can never collide with one of `m`.
+/// EVERY column the fit's likelihood reads is absorbed, because each of them
+/// can make two fits two experiments. A standard fit passes its response and
+/// its prior weights — a weighted likelihood on one response under two
+/// weightings is two experiments, since `−2ℓ` is weighted. A survival
+/// transformation fit passes the entry time, the exit time, the event code and
+/// the weights, because its likelihood reads all four and two datasets that
+/// differ only in which rows were events are not one experiment. One rule for
+/// one quantity: the column SET is the argument, so a new response shape adds a
+/// call site and not a second identity to keep in step with this one.
+///
+/// The hash is [`gam_linalg::matrix::array2_bits_fingerprint`], the one value
+/// identity this repository builds every fingerprint from. It absorbs the
+/// column count and the row count before any value, so identities over
+/// different column sets can never collide: a survival fit and a Gaussian fit
+/// over the same numbers are different experiments and get different
+/// identities.
+///
+/// This is not the warm-start key that `fit_survival_transformation_model`
+/// hashes over the same four columns. That key answers "is this the same
+/// PROBLEM", so it also absorbs the design, the offsets, the penalty blocks and
+/// `ρ`; two models of one dataset share this identity and must not share that
+/// key.
 ///
 /// It is a value identity, not a provenance token: two runs over the same file
 /// agree, a re-read of the same rows agrees, and a change to one observation
-/// does not.
-pub fn training_response_fingerprint(
-    response: ndarray::ArrayView1<'_, f64>,
-    weights: ndarray::ArrayView1<'_, f64>,
-) -> u64 {
-    // One matrix over both columns, so the identity is of the PAIR, with the
-    // two lengths absorbed as its first row. A fit's response and weights have
-    // one length, and a view that does not is not that response's weighting;
-    // absorbing both lengths makes such a pair its own identity rather than a
-    // panic on a total function or a column silently dropped, and it is what
-    // keeps a shorter column padded with zeros from colliding with a genuine
-    // zero weight.
-    let rows = response.len().max(weights.len());
-    let mut stacked = Array2::<f64>::zeros((rows + 1, 2));
-    stacked[[0, 0]] = response.len() as f64;
-    stacked[[0, 1]] = weights.len() as f64;
-    for (row, value) in response.iter().enumerate() {
-        stacked[[row + 1, 0]] = *value;
-    }
-    for (row, weight) in weights.iter().enumerate() {
-        stacked[[row + 1, 1]] = *weight;
+/// does not. An empty column set identifies nothing and no caller passes one.
+pub fn training_response_fingerprint(columns: &[ndarray::ArrayView1<'_, f64>]) -> u64 {
+    // One matrix over every column, with each column's own length absorbed as
+    // the matrix's first row. A fit's columns have one length, and a view that
+    // does not is not one of them; absorbing every length makes such a set its
+    // own identity rather than a panic on a total function or a column silently
+    // dropped, and it is what keeps a shorter column padded with zeros from
+    // colliding with a genuine zero value.
+    let rows = columns.iter().map(|column| column.len()).max().unwrap_or(0);
+    let mut stacked = Array2::<f64>::zeros((rows + 1, columns.len().max(1)));
+    for (index, column) in columns.iter().enumerate() {
+        stacked[[0, index]] = column.len() as f64;
+        for (row, value) in column.iter().enumerate() {
+            stacked[[row + 1, index]] = *value;
+        }
     }
     gam_linalg::matrix::array2_bits_fingerprint(&stacked)
 }

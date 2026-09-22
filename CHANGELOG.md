@@ -625,8 +625,9 @@
   intercept-only deviance: every one of them necessary, none of them sufficient, so two
   different datasets of one size could be ranked against each other as though their AIC gap
   were an evidence ratio. A fit now carries the value identity of the rows it was trained on —
-  `training_response_fingerprint(response, weights)`, the repository's one value hash over
-  both columns, which absorbs the shape before the values — from the entry that read those
+  `training_response_fingerprint(columns)`, the repository's one value hash over every
+  column the fit's likelihood reads, which absorbs the column and row counts before the
+  values — from the entry that read those
   rows, through `UnifiedFitResult`, the saved payload and the summary, to
   `ComparisonCandidate::response_fingerprint`. Two candidates whose fingerprints disagree are
   refused first, before the necessary conditions, which cannot add to a settled answer.
@@ -634,6 +635,21 @@
   field existed, or a route whose response is not a `(response, weights)` pair — the O(n)
   spline scan and the survival transformation fit, each of which says so where it declines —
   is held to the necessary conditions, and the refusal text names which standard it applied.
+
+- **A survival transformation fit publishes the identity of its own four columns**
+  (Refs gam#4556). The training identity landed over `(response, weights)`, so the survival
+  transformation route — whose likelihood reads an entry time, an exit time, an event code
+  and a weight per row — published none and fell back to the necessary conditions, where
+  two datasets differing only in WHICH rows were events pass as one experiment. The
+  identity now takes the column set as its argument: one rule, one quantity, and a new
+  response shape adds a call site rather than a second identity to keep in step. The
+  survival route takes it from its spec's own columns where that fit reads its rows, and
+  carries it the way the row count already travelled. The covariate offset is deliberately
+  not among them: it is a declared model term, and two models of one experiment may declare
+  different ones, so including it would refuse exactly the comparison this identity exists
+  to allow. Because the hash absorbs the column count before any value, a survival fit's
+  four-column identity can never equal a standard fit's two-column identity over the same
+  numbers.
 
 ## gamfit 0.1.270 (2026-09-22)
 

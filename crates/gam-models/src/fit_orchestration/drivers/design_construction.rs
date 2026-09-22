@@ -3627,7 +3627,7 @@ fn fit_bounded_term_collection_with_design(
                 }],
                 training_sample_size: y.len(),
                 training_response_fingerprint: Some(
-                    gam_solve::model_types::training_response_fingerprint(y, weights),
+                    gam_solve::model_types::training_response_fingerprint(&[y, weights]),
                 ),
                 log_lambdas,
                 lambdas,

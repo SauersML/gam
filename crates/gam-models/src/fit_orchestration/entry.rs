@@ -1357,10 +1357,10 @@ fn deterministic_gaussian_standard_fit(
             }],
             training_sample_size: request.y.len(),
             training_response_fingerprint: Some(
-                gam_solve::model_types::training_response_fingerprint(
+                gam_solve::model_types::training_response_fingerprint(&[
                     request.y.view(),
                     request.weights.view(),
-                ),
+                ]),
             ),
             log_lambdas,
             lambdas,

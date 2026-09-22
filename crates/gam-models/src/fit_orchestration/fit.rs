@@ -2523,6 +2523,11 @@ fn survival_unified_fit_result(
     summary: &gam_solve::pirls::WorkingModelPirlsResult,
     state: &gam_solve::pirls::WorkingState,
     training_sample_size: usize,
+    // Value identity of the rows this fit read — its entry times, exit times,
+    // event codes and weights (Refs #4556). It travels beside the row count
+    // because it answers the question the row count only gestures at: whether
+    // two fits are of one experiment.
+    training_response_fingerprint: u64,
     penalty_blocks: &[PenaltyBlock],
     // OUTER convergence evidence from the smoothing selection (#2301 defect D):
     // the real outer-iteration count (0 when no smoothing coordinate was
@@ -2847,10 +2852,7 @@ fn survival_unified_fit_result(
             lambdas: lambdas.clone(),
         }],
         training_sample_size,
-        // The survival transformation response is entry/exit/event columns, not the
-        // `(response, weights)` pair `training_response_fingerprint` identifies, so this
-        // fit establishes no provenance under that rule rather than a partial one (#4556).
-        training_response_fingerprint: None,
+        training_response_fingerprint: Some(training_response_fingerprint),
         log_lambdas,
         lambdas,
         likelihood_family: Some(LikelihoodSpec::royston_parmar()),
@@ -4077,12 +4079,25 @@ pub(crate) fn fit_survival_transformation_model(
         } else {
             baseline_cfg
         };
+    // The columns this fit's likelihood reads as DATA: when each row was entered
+    // and left, whether it was an event, and what it weighs. The covariate
+    // offset is not among them — it is a declared model term, and two models of
+    // one experiment may declare different ones, so including it would refuse
+    // exactly the comparison this identity exists to allow (Refs #4556).
+    let event_codes = spec.event_target.mapv(f64::from);
+    let survival_identity = gam_solve::model_types::training_response_fingerprint(&[
+        spec.age_entry.view(),
+        spec.age_exit.view(),
+        event_codes.view(),
+        spec.weights.view(),
+    ]);
     let fit = survival_unified_fit_result(
         beta,
         lambdas,
         &summary,
         &state,
         spec.age_exit.len(),
+        survival_identity,
         &penalty_blocks,
         survival_outer_iterations,
         survival_outer_certificate,
