@@ -677,27 +677,6 @@ impl EventHistoryFamily {
         Ok(self.adjoint_hessian(states, &beta)?)
     }
 
-    #[cfg(test)]
-    pub(super) fn computed_joint<S: Directional>(
-        &self, states: &[ParameterBlockState], u: Option<&Array1<f64>>,
-        v: Option<&Array1<f64>>, derivatives: bool,
-    ) -> Result<(S, Vec<S>, Vec<S>), String> {
-        let values: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
-        let total = values.len();
-        for direction in [u, v].into_iter().flatten() {
-            if direction.len() != total || direction.iter().any(|x| !x.is_finite()) {
-                return Err("invalid event-history derivative direction".to_string());
-            }
-        }
-        let beta: Vec<S> = values.iter().enumerate().map(|(q, value)|
-            S::seeded(*value, u.map_or(0.0, |x| x[q]), v.map_or(0.0, |x| x[q]))).collect();
-        if !derivatives {
-            return Ok((self.path_value(states, &beta)?, Vec::new(), Vec::new()));
-        }
-        let coordinates: Vec<usize> = (0..total).collect();
-        Ok(self.coordinate_hessian(states, &beta, &coordinates)?)
-    }
-
     /// Whether the coefficient derivatives come from the computed path: a
     /// reference law differentiated through its evolution, or a static atom
     /// beside a dynamic one. The Louis sweep of `subject_marginal` covers
@@ -797,6 +776,31 @@ mod tests {
     use super::*;
     use crate::cohort::{CovariateSegment, Event, SubjectHistory};
     use ndarray::array;
+
+    /// The computed path's value, gradient and dense Hessian by FORWARD mode,
+    /// at `b(b + 1)/2` cohort sweeps: the reference the adjoint route
+    /// (`adjoint_joint`) is scored against here, and read nowhere else.
+    impl EventHistoryFamily {
+        pub(super) fn computed_joint<S: Directional>(
+            &self, states: &[ParameterBlockState], u: Option<&Array1<f64>>,
+            v: Option<&Array1<f64>>, derivatives: bool,
+        ) -> Result<(S, Vec<S>, Vec<S>), String> {
+            let values: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
+            let total = values.len();
+            for direction in [u, v].into_iter().flatten() {
+                if direction.len() != total || direction.iter().any(|x| !x.is_finite()) {
+                    return Err("invalid event-history derivative direction".to_string());
+                }
+            }
+            let beta: Vec<S> = values.iter().enumerate().map(|(q, value)|
+                S::seeded(*value, u.map_or(0.0, |x| x[q]), v.map_or(0.0, |x| x[q]))).collect();
+            if !derivatives {
+                return Ok((self.path_value(states, &beta)?, Vec::new(), Vec::new()));
+            }
+            let coordinates: Vec<usize> = (0..total).collect();
+            Ok(self.coordinate_hessian(states, &beta, &coordinates)?)
+        }
+    }
 
     fn single_event() -> (EventHistoryFamily, Vec<ParameterBlockState>) {
         single_event_on(144, 15, 1e-8, [-1.2, 0.9])
