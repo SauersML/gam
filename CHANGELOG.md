@@ -643,6 +643,14 @@
   construction — both children re-derive their tube from their own bounds and their union is
   the parent — so only `HonestConformalCost::z_cells` moves.
 
+## gamfit 0.1.272 (2026-09-22)
+
+- On musl (Alpine), a host with no CUDA driver fits on the CPU again: the
+  loader's `Error loading shared library <soname>: No such file or directory`
+  is read as an absent candidate, not a load fault (gam#4569). 0.1.271
+  shipped the manylinux x86_64 wheels and the sdist only, because its
+  musllinux wheels refused every fit.
+
 ## gamfit 0.1.271 (2026-09-22)
 - **A profiled evidence ratio stops calling itself a Bayes factor, and a model comparison tests
   the response it can see** (gam#4556 P3). `compare_reuse_reml` fits each hypothesis' own `λ̂`
