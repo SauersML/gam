@@ -1,5 +1,24 @@
 ## Unreleased
 
+- **A damped representer column gets the anchor's scale motion instead of a refusal** (#2902
+  row 5). The column-scale term landed in `7adbe5963a` refused whenever a kept chart column was
+  DAMPED, on the argument that its scale rides on an amplification floor whose derivative the
+  section jet is not given. The refusal was wrong about the state, not about the floor: from
+  `representer_section_chart`, `visibility = amplification_floor·√rank_tolerance` and
+  `retention = max(existence, visibility)`, so `retention < amplification_floor` and every
+  singular value in `(retention, floor]` is KEPT AND DAMPED — and past the node diameter the
+  chart's own doc says the whole representer block damps toward the affine head. So the refusal
+  fired on the chart's designed regime and made the `CenterSumToZero` `ln ℓ` jet unavailable at
+  exactly the long ranges the range screen exists to reach. The suite at `4057627f4b`, which
+  contains `7adbe5963a`, measured it. A damped column has `s_k = sign_k/floor`, so its motion is
+  the anchor's and is shared by every damped column: `s′/s = −a′/a`, `s″/s = 2(a′/a)² − a″/a`.
+  The anchor is `max(σ_max(K_cc), σ_max(E))`, and `E = K_cc·Z` with orthonormal `Z` makes the
+  kernel arm the binding one, so the new `kernel_anchor_log_length_jets` takes the leading
+  eigenvalue of the symmetric kernel Gram and its two jets by standard perturbation of a simple
+  eigenvalue. Three cases still refuse, and all three are points at which the quantity has no
+  derivative: a non-positive anchor, a leading eigenvalue repeated to within its own rounding
+  band, and a tie between the two arms of the max.
+
 - **A survival band could refuse a prediction because the axis it resolved was not one the
   response is monotone along** (gam#3560). `central_response_interval` requires weak monotonicity
   on the coordinate it resolves exactly — that is what makes the sub-level set a half line — and

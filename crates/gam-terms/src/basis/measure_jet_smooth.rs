@@ -1309,29 +1309,51 @@ fn representer_section_log_length_jets(
     // `s″_k/s_k = 2(σ′_k/σ_k)² − σ″_k/σ_k`, and the σ jets come from the diagonal
     // of `F = EᵀE` already formed above: `F′_kk = 2σ_kσ′_k` and
     // `F″_kk = 2σ′_k² + 2σ_kσ″_k`.
+    //
+    // A DAMPED column is not an error, it is the chart's designed state. Its bars
+    // are `amplification_floor = anchor·√ε`, `visibility = floor·√rank_tolerance`
+    // and `retention = max(existence, visibility)`, so `visibility < floor` and
+    // every `σ_k` in `(retention, floor]` is KEPT and DAMPED — and past the node
+    // diameter the chart's own doc says the WHOLE block damps toward the affine
+    // head. The first version of this term REFUSED there, which made the
+    // `CenterSumToZero` ℓ-jet unavailable at exactly the long ranges the range
+    // screen exists to reach; the suite at 4057627f4b measured that refusal.
+    //
+    // A damped column has `s_k = sign_k/floor`, so its motion is the ANCHOR'S and
+    // is shared by every damped column, with nothing of its own:
+    // `s′/s = −a′/a` and `s″/s = 2(a′/a)² − a″/a`.
     let mut scale_log_first = Array1::<f64>::zeros(kept.len());
     let mut scale_log_second = Array1::<f64>::zeros(kept.len());
-    for (column, &index) in kept.iter().enumerate() {
+    // `|s_k| = 1/max(σ_k, floor)`, so `|s_k|·σ_k` is exactly 1 on an UNDAMPED
+    // column and strictly below it on a damped one.
+    let is_damped = |column: usize, index: usize| -> bool {
         let sigma = chart.singular[index];
-        // `representer_section_chart` CLAMPS `1/σ_k` at `1/(anchor·√ε)` for a
-        // damped direction, and that floor rides on `‖K_cc‖₂`, whose own `ln ℓ`
-        // derivative this function is not given. Refusing is the honest answer:
-        // the alternative is to report a scale as frozen when it is not, which is
-        // the defect this term exists to repair.
-        // `|s_k| = 1/max(σ_k, floor)`, so `|s_k|·σ_k` is exactly 1 on an
-        // UNDAMPED column and strictly below it on a damped one. The first form
-        // of this guard read `<= 1 + 8ε`, which every column satisfies and which
-        // would therefore have let the damped case through silently — the same
-        // shape of defect as the term it is guarding.
-        let unclamped = sigma.is_finite()
+        !(sigma.is_finite()
             && sigma > 0.0
-            && (scales[column].abs() * sigma - 1.0).abs() <= 8.0 * f64::EPSILON;
-        if !unclamped {
-            crate::bail_invalid_basis!(
-                "measure-jet representer section column {column} is damped (σ = {sigma:e},                  scale = {:e}), so its chart scale moves with the amplification floor and this                  jet cannot report it",
-                scales[column]
-            );
+            && (scales[column].abs() * sigma - 1.0).abs() <= 8.0 * f64::EPSILON)
+    };
+    let anchor_log_jets = if kept
+        .iter()
+        .enumerate()
+        .any(|(column, &index)| is_damped(column, index))
+    {
+        Some(kernel_anchor_log_length_jets(
+            k_cc,
+            dk_cc,
+            d2k_cc,
+            &chart.singular,
+        )?)
+    } else {
+        None
+    };
+    for (column, &index) in kept.iter().enumerate() {
+        if is_damped(column, index) {
+            let (relative_first, relative_second) = anchor_log_jets.unwrap_or((0.0, 0.0));
+            scale_log_first[column] = -relative_first;
+            scale_log_second[column] = 2.0 * relative_first * relative_first - relative_second;
+            continue;
         }
+        let sigma = chart.singular[index];
         let sigma_first = gram_first[(index, index)] / (2.0 * sigma);
         let sigma_second =
             (gram_second[(index, index)] - 2.0 * sigma_first * sigma_first) / (2.0 * sigma);
@@ -1358,6 +1380,108 @@ fn representer_section_log_length_jets(
         + null_first.dot(&rotation_first) * 2.0
         + section.dot(&rotation_second);
     Ok((first, second))
+}
+
+/// `(a′/a, a″/a)` for the conditioning anchor `a` in `u = ln ℓ`, the one quantity
+/// every DAMPED chart column's scale rides on.
+///
+/// `representer_section_chart` damps a direction to `1/(a·√ε)`, so such a column
+/// carries no motion of its own and this is the whole of its scale jet.
+///
+/// # Which arm of the max
+///
+/// The chart takes `a = max(σ_max(K_cc), σ_max(E))`. With `E = K_cc·Z` and `Z`
+/// orthonormal, `σ_max(E) ≤ ‖K_cc‖₂·‖Z‖₂ = σ_max(K_cc)`, so the max is the
+/// kernel's own leading singular value unless the two are equal — which needs `Z`
+/// to retain the kernel's leading direction, and `Z` is built orthogonal to the
+/// affine head that direction lies in. A tie is REFUSED rather than
+/// differentiated, because `max` has no derivative there.
+///
+/// # The jets
+///
+/// `K_cc` is a symmetric kernel Gram, so its leading singular value is its
+/// leading eigenvalue in magnitude, and for a SIMPLE one:
+///
+/// ```text
+/// λ′ = vᵀK′v
+/// λ″ = vᵀK″v + 2·Σ_{j≠max} (vᵀK′v_j)² / (λ − λ_j)
+/// ```
+///
+/// A repeated leading eigenvalue leaves `v` undefined up to rotation and the sum
+/// undefined outright, so it is refused too. Those two refusals and a
+/// non-positive anchor are the only ones here: they are the points at which the
+/// quantity HAS no derivative, unlike the damped state itself, which is the
+/// chart's ordinary regime (#2902 row 5).
+fn kernel_anchor_log_length_jets(
+    k_cc: &Array2<f64>,
+    dk_cc: &Array2<f64>,
+    d2k_cc: &Array2<f64>,
+    evaluation_singular: &Array1<f64>,
+) -> Result<(f64, f64), BasisError> {
+    let (eigenvalues, eigenvectors) = k_cc.eigh(Side::Lower).map_err(BasisError::LinalgError)?;
+    let dimension = eigenvalues.len();
+    if dimension == 0 {
+        crate::bail_invalid_basis!(
+            "measure-jet representer conditioning anchor has no kernel spectrum to differentiate"
+        );
+    }
+    let leading = (0..dimension).fold(0usize, |best, index| {
+        if eigenvalues[index].abs() > eigenvalues[best].abs() {
+            index
+        } else {
+            best
+        }
+    });
+    let anchor = eigenvalues[leading].abs();
+    if !(anchor.is_finite() && anchor > 0.0) {
+        crate::bail_invalid_basis!(
+            "measure-jet representer conditioning anchor is {anchor:e}, so the damped chart \
+             scale it sets has no derivative"
+        );
+    }
+    // The separation a simple leading eigenvalue needs, against the band an
+    // `m`-term accumulation of the Gram's own entries carries.
+    let band = gam_linalg::roundoff::accumulation_growth(dimension) * anchor;
+    let mut closest = f64::INFINITY;
+    for index in 0..dimension {
+        if index != leading {
+            closest = closest.min((eigenvalues[leading] - eigenvalues[index]).abs());
+        }
+    }
+    if dimension > 1 && !(closest > band) {
+        crate::bail_invalid_basis!(
+            "measure-jet representer conditioning anchor's leading kernel eigenvalue is repeated \
+             to within its own rounding band (gap {closest:e} against {band:e}), so it has no \
+             derivative"
+        );
+    }
+    let evaluation_leading = evaluation_singular.iter().copied().fold(0.0_f64, f64::max);
+    if (anchor - evaluation_leading).abs() <= band {
+        crate::bail_invalid_basis!(
+            "measure-jet representer conditioning anchor ties its two arms (kernel {anchor:e} \
+             against evaluation {evaluation_leading:e}), so the max it is taken from has no \
+             derivative there"
+        );
+    }
+    let vector = eigenvectors.column(leading);
+    let first_image = dk_cc.dot(&vector);
+    let first = vector.dot(&first_image);
+    let mut coupling = 0.0_f64;
+    for index in 0..dimension {
+        if index != leading {
+            let cross = eigenvectors.column(index).dot(&first_image);
+            coupling += cross * cross / (eigenvalues[leading] - eigenvalues[index]);
+        }
+    }
+    let second = vector.dot(&d2k_cc.dot(&vector)) + 2.0 * coupling;
+    // The chart reads `|λ|`, so a negative leading eigenvalue carries its sign
+    // into both jets.
+    let sign = if eigenvalues[leading] < 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    Ok((sign * first / anchor, sign * second / anchor))
 }
 
 /// Axis-aligned bounding-box diagonal of a point set — the deterministic
