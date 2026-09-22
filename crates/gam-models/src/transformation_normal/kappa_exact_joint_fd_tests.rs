@@ -23,6 +23,7 @@
 
 use super::*;
 use gam_linalg_test_support::fd_checker::{FdVerdict, RiddersConfig, ridders_derivative};
+use gam_linalg_test_support::numeric_derivative::{StencilErrorPowers, ridders_from_stencil};
 use gam_test_support::FdDerivativeJudgement;
 use gam_terms::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
@@ -612,6 +613,12 @@ fn ctn_monotonicity_cone_psi_rate_matches_central_differences_3171() {
             "psi {psi_index}: the cone rate is finite"
         );
 
+        // A relative tolerance on `uᵀAv` is a bar on the CONTRACTION, not on `A`. Whether the
+        // contraction is a fair proxy for the entry scale of `A` or a cancelling one decides
+        // how tight `rel_tol` actually is, and that is `|uᵀAv| / ‖A‖_F` — printed beside the
+        // verdict, unconditionally, so a red can be read without re-running.
+        let rate_norm = rate.iter().map(|value| value * value).sum::<f64>().sqrt();
+
         for pair in 0..2 {
             let left = contraction(q, pair);
             let right = contraction(p, pair + 1);
@@ -630,8 +637,12 @@ fn ctn_monotonicity_cone_psi_rate_matches_central_differences_3171() {
             let verdict = measured.judge(analytic, rel_tol, abs_floor);
             eprintln!(
                 "[cone-psi-rate 3171] psi={psi_index} pair={pair} an={analytic:+.6e} \
-                 fd={fd:+.6e} rel={rel:.3e} unc={:.3e} step={:.1e} order={} {verdict:?}",
-                measured.uncertainty, measured.step, measured.order,
+                 fd={fd:+.6e} rel={rel:.3e} unc={:.3e} step={:.1e} order={} \
+                 |rate|_F={rate_norm:.6e} an_over_norm={:.3e} {verdict:?}",
+                measured.uncertainty,
+                measured.step,
+                measured.order,
+                analytic.abs() / rate_norm.max(f64::MIN_POSITIVE),
             );
             if verdict == FdVerdict::Disagree {
                 violations.push(format!(
@@ -647,5 +658,154 @@ fn ctn_monotonicity_cone_psi_rate_matches_central_differences_3171() {
         "the CTN monotonicity cone's psi rate disagrees with a central difference of its own \
          rows\n  {}",
         violations.join("\n  ")
+    );
+}
+
+/// gam#3171 — the attribution gate behind
+/// `ctn_monotonicity_cone_psi_rate_matches_central_differences_3171`.
+///
+/// A Khatri-Rao cone's dense rows are LINEAR in its factor: `ConstraintSet::gather_rows`
+/// delegates to `KhatriRaoConeConstraints::gather_rows`, which writes `Ψ_i` into the block of
+/// coupled row `k` RAW — no unit-normalization, no row drop, no reorder (the canonicalization
+/// that would normalize lives in `LinearInequalityConstraints::canonicalized`, which
+/// `to_dense` does not call). The value cone and the rate cone are built with the same
+/// `coupled_rows` and the same `p_left`, so row for row and column for column the cone gate
+/// grades exactly one identity:
+///
+///     `cov_first_axis_row_chunk`  ==  `d/dψ` of the rows `covariate_dense_arc` materializes,
+///
+/// contracted against two fixed vector pairs. Nothing on the cone side can move it. This gate
+/// grades the same two objects ENTRY BY ENTRY, so a red cone gate has an attribution.
+///
+/// `duchon_hybrid_psi_components_match_fd_linear_power2_3d` is the positive control: it holds
+/// these same two objects, at this same Duchon configuration (Linear, power 2, 3-D, n = 240),
+/// to this same bar, and differs in exactly ONE thing — it realizes ψ through the iso-κ
+/// cache's `ensure_theta`, while this one realizes it through `geometry_at`, the build →
+/// freeze → build that `fit_transformation_normal`'s `ensure_exact_geometry` performs on
+/// every rebuild. A red here beside a green there indicts the CTN realizer, which the
+/// criterion's own ψ gradient shares; a green here leaves the cone gate's contraction, whose
+/// `|uᵀAv| / ‖A‖_F` that gate now prints.
+///
+/// The ψ axis is one-dimensional on this fixture, so an axis-indexing defect is excluded by
+/// construction and only the chart is left.
+#[test]
+fn ctn_covariate_psi_jet_matches_the_realized_design_3171() {
+    let fixture = build_fixture(DuchonNullspaceOrder::Linear, 2.0, 3, 240, 10);
+    let theta_dim = fixture.rho_dim + 1;
+    let mut theta = Array1::<f64>::zeros(theta_dim);
+    theta[fixture.rho_dim] = 0.15;
+
+    // The rows the cone is built on at ψ — literally the factor `block_linear_constraints`
+    // hands `KhatriRaoConeConstraints::new`.
+    let rows_at = |theta: &Array1<f64>| -> Array2<f64> {
+        fixture
+            .geometry_at(theta)
+            .family
+            .covariate_dense_arc()
+            .expect("CTN covariate rows")
+            .as_ref()
+            .clone()
+    };
+
+    // The rate the family publishes for those rows, reached through the same accessor
+    // `block_linear_constraint_psi_derivative` reaches it through.
+    let geometry = fixture.geometry_at(&theta);
+    assert_eq!(
+        geometry.hyper_layout.len(),
+        1,
+        "the isotropic fixture carries one ψ axis"
+    );
+    let (axis_block, _, deriv) = geometry
+        .hyper_layout
+        .design_derivative(0)
+        .expect("the CTN ψ axis moves a block's covariate design");
+    assert_eq!(axis_block, 0, "the CTN covariate design is block 0's");
+    let op = deriv
+        .implicit_operator
+        .as_ref()
+        .and_then(|op| op.as_any().downcast_ref::<TensorKroneckerPsiOperator>())
+        .expect("CTN tensor psi derivatives stay operator-backed");
+    let n_rows = geometry.family.response_val_basis.nrows();
+    let analytic = op
+        .cov_first_axis_row_chunk(deriv.implicit_axis, 0..n_rows)
+        .expect("CTN covariate first-axis rows");
+    let value = rows_at(&theta);
+    assert_eq!(
+        analytic.dim(),
+        value.dim(),
+        "the rate differentiates the rows it is the rate of"
+    );
+
+    // One Ridders ladder over the realized rows: each rung realizes the geometry twice, and
+    // every entry is Neville-extrapolated along it together with the ladder's own error
+    // estimate. No inner solve runs here — the rows are a function of the chart alone — so the
+    // ladder costs `2 · rungs` design realizations, not `2 · rungs` criterion evaluations.
+    let config = RiddersConfig::default();
+    let mut ladder: Vec<Array2<f64>> = Vec::with_capacity(config.rungs);
+    let mut step = config.initial_step;
+    for _ in 0..config.rungs {
+        let mut forward = theta.clone();
+        forward[fixture.rho_dim] += step;
+        let mut backward = theta.clone();
+        backward[fixture.rho_dim] -= step;
+        ladder.push((rows_at(&forward) - rows_at(&backward)) / (2.0 * step));
+        step /= config.shrink;
+    }
+    let mut measured = Array2::<f64>::zeros(value.raw_dim());
+    let mut uncertainty = Array2::<f64>::zeros(value.raw_dim());
+    for i in 0..measured.nrows() {
+        for j in 0..measured.ncols() {
+            let mut rung = 0usize;
+            let entry = ridders_from_stencil(
+                |_| {
+                    let rung_value = ladder[rung][(i, j)];
+                    rung += 1;
+                    rung_value
+                },
+                config,
+                StencilErrorPowers::Even,
+            );
+            measured[(i, j)] = entry.value;
+            uncertainty[(i, j)] = entry.uncertainty;
+        }
+    }
+
+    let frobenius = |matrix: &Array2<f64>| matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let scale = frobenius(&measured).max(f64::MIN_POSITIVE);
+    let rel_gap = frobenius(&(&analytic - &measured)) / scale;
+    let rel_uncertainty = frobenius(&uncertainty) / scale;
+    let norm_ratio = frobenius(&analytic) / scale;
+    // Worst single entry too: a Frobenius gap is dominated by whatever carries the norm, and
+    // a defect confined to the ψ-independent null-space columns would hide inside it.
+    let (worst_entry, worst_gap) = analytic.indexed_iter().zip(measured.iter()).fold(
+        ((0usize, 0usize), 0.0_f64),
+        |(worst_at, worst), ((index, an), fd)| {
+            let gap = (an - fd).abs();
+            if gap > worst { (index, gap) } else { (worst_at, worst) }
+        },
+    );
+    eprintln!(
+        "[ctn-psi-jet 3171] rows={} cols={} |an|_F={:.6e} |fd|_F={:.6e} rel_gap={rel_gap:.3e} \
+         rel_unc={rel_uncertainty:.3e} norm_ratio={norm_ratio:.3e} worst_entry={worst_entry:?} \
+         worst_gap={worst_gap:.3e}",
+        value.nrows(),
+        value.ncols(),
+        frobenius(&analytic),
+        frobenius(&measured),
+    );
+
+    // The bar is not chosen here. It is the one `assert_duchon_psi_components_at_axis` already
+    // holds these two objects to at this Duchon configuration, so the two gates differ in the
+    // realizer alone and a red here names it. The ladder's own error counts against the gap
+    // (`|an − true| ≤ |an − fd| + |fd − true|`), so a pass means the published jet is within
+    // the bar of the TRUE derivative of the realized rows.
+    let control_bar = 1.0e-4_f64;
+    assert!(
+        rel_gap + rel_uncertainty < control_bar,
+        "the CTN realizer's covariate rows move by {rel_gap:.3e} ± {rel_uncertainty:.3e} more \
+         than the jet the monotonicity cone's psi rate publishes (norm ratio {norm_ratio:.3e}, \
+         worst entry {worst_entry:?} off by {worst_gap:.3e}); \
+         duchon_hybrid_psi_components_match_fd_linear_power2_3d holds the same two objects at \
+         the same configuration to {control_bar:.1e} through the iso-κ realizer"
     );
 }
