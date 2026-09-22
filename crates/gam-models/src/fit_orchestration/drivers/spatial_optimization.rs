@@ -4280,14 +4280,17 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     "{reason}. The rebuild is WIDER than the collection's slot, so it did not \
                      lose a chart direction — it did not apply a narrowing the collection \
                      applied. That narrowing is ψ-invariant, so no trial point can satisfy this \
-                     and the search must not retreat from it. Exactly one of the three carriers \
-                     failed to replay: the data-metric radial chart `V` (compare \
-                     frozen_radial_chart with realized_radial_chart), the identifiability \
-                     transform (a frozen_identifiability of `orthogonal_to_parametric` names a \
-                     policy the COLLECTION executes, and the term-local builder DOWNGRADES it to \
-                     `None` and returns a raw uncentered design, so nothing narrows it here at \
-                     any ψ), or the joint-null absorption `Q` (compare frozen_joint_null with \
-                     realized_joint_null) (gam#2959)"
+                     and the search must not retreat from it. MEASURED CAUSE (gam#2959): the \
+                     collection replays this term's `frozen_parametric_residualization` — the \
+                     #2747 chart `T` with its row-space correction `R` — and a term-local \
+                     rebuild applies neither, so the excess is the chart's column deficit. \
+                     Applying `T` here alone would fix the width and SHIP A WRONG DESIGN: the \
+                     collection's realized block is `X·T − C·R`, and #2747 measured the \
+                     uncorrected form at ‖XᵀC‖/(‖X‖‖C‖) = 1.6e-1…4.9e-1 against the 1e-8 bar \
+                     this same step asserts. The placement has to go through the collection \
+                     gauge. Cross-check the other two carriers before concluding: the radial \
+                     chart (frozen_radial_chart against realized_radial_chart) and the \
+                     joint-null absorption (frozen_joint_null against realized_joint_null)"
                 )));
             }
             return Err(EstimationError::TrialPointRefused {
