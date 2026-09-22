@@ -42,7 +42,6 @@ class LinearDictionaryFit:
     convergence: dict[str, float | int]
     assignment: str
     top_k: int
-    code_ridge: float
     training_data: np.ndarray
     # Origin of the fitted model, exactly as the Rust fit returns it: the
     # training column means for the AFFINE centered K=1 lane (``mean +
@@ -74,8 +73,9 @@ class LinearDictionaryFit:
     def transform(self, X: Any, top_k: int | None = None) -> np.ndarray:
         """Encode held-out rows ``X`` (``M x P``) against the fitted dictionary.
 
-        Routes the fitted model's assignment rule (top-``top_k`` ridge least
-        squares, or the top-``top_k`` softmax at the fitted ``temperature``)
+        Routes the fitted model's assignment rule (the top-``top_k``
+        minimum-norm least squares, or the top-``top_k`` softmax at the fitted
+        ``temperature``)
         against the fitted origin ``mean`` through the Rust core
         (``linear_dictionary_transform``), which also owns the input contract
         (finite ``X``, ``top_k`` in ``[1, K]``). Returns the ``M x K`` codes.
@@ -88,7 +88,6 @@ class LinearDictionaryFit:
             np.ascontiguousarray(self.atoms, dtype=np.float64),
             int(self.top_k if top_k is None else top_k),
             mean=self.mean,
-            code_ridge=float(self.code_ridge),
             assignment=str(self.assignment),
             temperature=float(self.temperature),
         )
@@ -103,7 +102,6 @@ def linear_dictionary_fit(
     top_k: int = 1,
     assignment: str = "top_k",
     temperature: float = 0.25,
-    code_ridge: float = 1.0e-8,
     tolerance: float = 1.0e-7,
     center_rank_one: bool = False,
 ) -> LinearDictionaryFit:
@@ -115,7 +113,6 @@ def linear_dictionary_fit(
         top_k=int(top_k),
         assignment=str(assignment),
         temperature=float(temperature),
-        code_ridge=float(code_ridge),
         tolerance=float(tolerance),
         center_rank_one=bool(center_rank_one),
     )
@@ -137,7 +134,6 @@ def linear_dictionary_fit(
         },
         assignment=str(data["assignment"]),
         top_k=int(data["top_k"]),
-        code_ridge=float(code_ridge),
         training_data=x,
         mean=None if mean is None else np.ascontiguousarray(mean, dtype=np.float64),
         temperature=float(temperature),

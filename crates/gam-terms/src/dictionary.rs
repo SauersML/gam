@@ -1,12 +1,11 @@
 use faer::Side;
-use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
+use gam_linalg::faer_ndarray::FaerEigh;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use std::fmt;
 
 const DEFAULT_MAX_ITER: usize = 30;
 const DEFAULT_TOP_K: usize = 1;
 const DEFAULT_TEMPERATURE: f64 = 0.25;
-const DEFAULT_CODE_RIDGE: f64 = 1.0e-8;
 const DEFAULT_TOLERANCE: f64 = 1.0e-7;
 const INACTIVE_LAMBDA: f64 = 1.0e30;
 
@@ -127,7 +126,6 @@ pub struct LinearDictionaryConfig {
     pub top_k: usize,
     pub assignment: LinearDictionaryAssignment,
     pub temperature: f64,
-    pub code_ridge: f64,
     pub tolerance: f64,
     /// K=1 lane only. When `false` (default) the rank-one lane takes the leading
     /// eigenvector of the UNCENTERED second-moment matrix `XᵀX` (byte-identical to
@@ -159,7 +157,6 @@ impl Default for LinearDictionaryConfig {
             top_k: DEFAULT_TOP_K,
             assignment: LinearDictionaryAssignment::TopK,
             temperature: DEFAULT_TEMPERATURE,
-            code_ridge: DEFAULT_CODE_RIDGE,
             tolerance: DEFAULT_TOLERANCE,
             center_rank_one: false,
         }
@@ -262,7 +259,6 @@ fn plain_atom_step(
             lambdas,
             reml_scores,
             atom_idx,
-            config.code_ridge,
         )?;
     }
 
@@ -415,8 +411,7 @@ fn fit_multi_atom_dictionary(
             // The per-atom update recorded scores at intermediate Gauss-Seidel
             // states. Recompute every active score from the exact canonical state
             // that passed the fixed-point certificate.
-            let final_score =
-                penalized_reconstruction_loss(x, fitted.view(), config.code_ridge, atoms.view());
+            let final_score = reconstruction_loss(x, fitted.view());
             for atom_idx in 0..config.n_atoms {
                 if atoms.row(atom_idx).dot(&atoms.row(atom_idx)) > 0.0 {
                     reml_scores[atom_idx] = final_score;
@@ -549,14 +544,7 @@ fn reroute_against_atoms(
     top_k: usize,
     config: &LinearDictionaryConfig,
 ) -> Result<Array2<f64>, String> {
-    route_against_atoms(
-        x,
-        atoms,
-        top_k,
-        config.assignment,
-        config.temperature,
-        config.code_ridge,
-    )
+    route_against_atoms(x, atoms, top_k, config.assignment, config.temperature)
 }
 
 /// Dispatch one global routing of `x` against `atoms` on the assignment rule.
@@ -569,13 +557,10 @@ fn route_against_atoms(
     top_k: usize,
     assignment: LinearDictionaryAssignment,
     temperature: f64,
-    code_ridge: f64,
 ) -> Result<Array2<f64>, String> {
     match assignment {
-        LinearDictionaryAssignment::TopK => top_k_assignments(x, atoms, top_k, code_ridge),
-        LinearDictionaryAssignment::Softmax => {
-            softmax_assignments(x, atoms, top_k, temperature, code_ridge)
-        }
+        LinearDictionaryAssignment::TopK => top_k_assignments(x, atoms, top_k),
+        LinearDictionaryAssignment::Softmax => softmax_assignments(x, atoms, top_k, temperature),
     }
 }
 
@@ -615,12 +600,6 @@ fn validate_inputs(
             config.temperature
         )));
     }
-    if !(config.code_ridge.is_finite() && config.code_ridge > 0.0) {
-        return Err(LinearDictionaryError::invalid_input(format!(
-            "linear_dictionary_fit code_ridge must be finite and positive; got {}",
-            config.code_ridge
-        )));
-    }
     if !(config.tolerance.is_finite() && config.tolerance >= 0.0) {
         return Err(LinearDictionaryError::invalid_input(format!(
             "linear_dictionary_fit tolerance must be finite and non-negative; got {}",
@@ -628,6 +607,84 @@ fn validate_inputs(
         )));
     }
     Ok(())
+}
+
+/// The rank-one lane's ridge `λ`, selected in closed form by REML.
+///
+/// The lane's model is `x_i = c_i·a + e_i` with `a` unit-norm, `c_i ~ N(0, τ²)`
+/// and `e_i ~ N(0, σ²I_p)`. Its posterior mean code is
+/// `E[c_i | x_i] = (x_i·a)·τ²/(τ² + σ²) = (x_i·a)/(1 + λ)` with `λ = σ²/τ²`, which
+/// is exactly the shrinkage the lane applies. So `λ` is a smoothing parameter and
+/// SPEC requires REML to choose it; it used to be `code_ridge`, a hand-set `1e-8`
+/// that the fit then REPORTED as its own `lambdas` (#2899 row P32).
+///
+/// No search is needed. In the eigenbasis of the second-moment matrix the
+/// likelihood separates: along `a` the projections `z_i = x_i·a` are
+/// `N(0, τ² + σ²)`, and the `p − 1` orthogonal directions are `N(0, σ²)`. With
+/// `s` the leading eigenvalue (`Σ_i z_i²`) and `r` the rest of the trace
+/// (`Σ_i ‖x_i‖² − s`), the REML estimates are
+///
+/// ```text
+/// σ̂² = r / (rows · (p − 1))
+/// τ̂² = s / rows − σ̂²
+/// λ̂  = σ̂² / τ̂²
+/// ```
+///
+/// `rows` is the residual degrees of freedom along the component: `n` for the
+/// uncentered lane and `n − 1` for the centered one, which spends one on the mean.
+///
+/// # What refuses
+///
+/// `τ̂² ≤ 0` says the leading direction carries no variance above the noise floor
+/// the other `p − 1` directions measure — the data is isotropic and there is no
+/// rank-one component to fit, so no shrinkage makes one appear. `p < 2` leaves no
+/// orthogonal complement to estimate `σ²` from at all. Both are refusals rather
+/// than a fallback, because a fit object must come from a model the data
+/// identifies.
+fn rank_one_reml_lambda(
+    eigenvalues: ArrayView1<'_, f64>,
+    rows: usize,
+    columns: usize,
+) -> Result<f64, String> {
+    if columns < 2 {
+        return Err(format!(
+            "rank-one lane cannot select its ridge by REML on {columns} column(s): the noise \
+             variance is read off the directions orthogonal to the component, and there are none"
+        ));
+    }
+    if rows == 0 || eigenvalues.is_empty() {
+        return Err(
+            "rank-one lane cannot select its ridge by REML with no residual rows".to_string(),
+        );
+    }
+    let rows = rows as f64;
+    let leading = eigenvalues
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let total: f64 = eigenvalues
+        .iter()
+        .copied()
+        .map(|value| value.max(0.0))
+        .sum();
+    let residual = (total - leading).max(0.0);
+    let noise = residual / (rows * (columns as f64 - 1.0));
+    let signal = leading / rows - noise;
+    if !(signal.is_finite() && signal > 0.0) {
+        return Err(format!(
+            "rank-one lane's leading direction carries no variance above the noise floor its \
+             orthogonal complement measures (component {:.6e} against noise {noise:.6e} per \
+             row), so the data identifies no rank-one component",
+            leading / rows
+        ));
+    }
+    let lambda = noise / signal;
+    if !lambda.is_finite() || lambda < 0.0 {
+        return Err(format!(
+            "rank-one lane's REML ridge is {lambda:e}, which is not a usable shrinkage"
+        ));
+    }
+    Ok(lambda)
 }
 
 /// K=1 closed-form lane.
@@ -659,20 +716,24 @@ fn fit_rank_one_pca_lane(
     let last = evals.len() - 1;
     let mut atom = evecs.column(last).to_owned();
     orient_vector(&mut atom);
+    // The shrinkage this lane applies IS a ridge, so REML picks it. Uncentered,
+    // so the component's residual degrees of freedom are all `n` rows.
+    let lambda = rank_one_reml_lambda(evals.view(), x.nrows(), x.ncols())?;
+    let shrink = 1.0 / (1.0 + lambda);
     let mut assignments = Array2::<f64>::zeros((x.nrows(), 1));
     for row in 0..x.nrows() {
-        assignments[[row, 0]] = x.row(row).dot(&atom) / (1.0 + config.code_ridge);
+        assignments[[row, 0]] = x.row(row).dot(&atom) * shrink;
     }
     let mut atoms = atom.insert_axis(Axis(0)).to_owned();
     normalize_atom_and_assignments(&mut atoms, &mut assignments, 0);
     let fitted = assignments.dot(&atoms);
-    let score = penalized_reconstruction_loss(x, fitted.view(), config.code_ridge, atoms.view());
+    let score = reconstruction_loss(x, fitted.view());
     Ok(LinearDictionaryFit {
         atoms,
         assignments,
         fitted: fitted.clone(),
         mean: None,
-        lambdas: Array1::from_elem(1, config.code_ridge),
+        lambdas: Array1::from_elem(1, lambda),
         reml_scores: Array1::from_elem(1, score),
         explained_variance: explained_variance(x, fitted.view()),
         iterations: 1.min(config.max_iter),
@@ -705,16 +766,17 @@ fn fit_rank_one_centered_lane(
         codes,
         fitted,
         explained_variance: ev,
-    } = centered_rank_one_components(x, config.code_ridge)?;
+        lambda,
+    } = centered_rank_one_components(x)?;
     let atoms = atom.insert_axis(Axis(0)).to_owned();
     let assignments = codes.insert_axis(Axis(1)).to_owned();
-    let score = penalized_reconstruction_loss(x, fitted.view(), config.code_ridge, atoms.view());
+    let score = reconstruction_loss(x, fitted.view());
     Ok(LinearDictionaryFit {
         atoms,
         assignments,
         fitted,
         mean: Some(mean),
-        lambdas: Array1::from_elem(1, config.code_ridge),
+        lambdas: Array1::from_elem(1, lambda),
         reml_scores: Array1::from_elem(1, score),
         explained_variance: ev,
         iterations: 1.min(config.max_iter),
@@ -742,19 +804,13 @@ struct CenteredRankOne {
     fitted: Array2<f64>,
     /// EV of `fitted` against the crate's centered denominator.
     explained_variance: f64,
+    /// The ridge REML selected for this component, reported as the fit's `lambdas`.
+    lambda: f64,
 }
 
-fn centered_rank_one_components(
-    x: ArrayView2<'_, f64>,
-    code_ridge: f64,
-) -> Result<CenteredRankOne, String> {
+fn centered_rank_one_components(x: ArrayView2<'_, f64>) -> Result<CenteredRankOne, String> {
     if x.nrows() == 0 || x.ncols() == 0 {
         return Err("centered_rank_one_components requires a non-empty 2-D matrix".to_string());
-    }
-    if !(code_ridge.is_finite() && code_ridge > 0.0) {
-        return Err(format!(
-            "centered_rank_one_components code_ridge must be finite and positive; got {code_ridge}"
-        ));
     }
     let means = x.mean_axis(Axis(0)).expect("non-empty input has means");
     let centered = &x.to_owned() - &means;
@@ -765,7 +821,10 @@ fn centered_rank_one_components(
     let last = evals.len() - 1;
     let mut atom = evecs.column(last).to_owned();
     orient_vector(&mut atom);
-    let shrink = 1.0 / (1.0 + code_ridge);
+    // Centering spends one row on the mean, so the component's residual degrees
+    // of freedom are `n − 1`.
+    let lambda = rank_one_reml_lambda(evals.view(), x.nrows().saturating_sub(1), x.ncols())?;
+    let shrink = 1.0 / (1.0 + lambda);
     let mut codes = Array1::<f64>::zeros(x.nrows());
     let mut fitted = Array2::<f64>::zeros(x.dim());
     for row in 0..x.nrows() {
@@ -782,6 +841,7 @@ fn centered_rank_one_components(
         codes,
         fitted,
         explained_variance: ev,
+        lambda,
     })
 }
 
@@ -811,6 +871,54 @@ fn initialize_atoms(x: ArrayView2<'_, f64>, n_atoms: usize) -> Array2<f64> {
     atoms
 }
 
+/// One atom's ridge `λ_k`, selected in closed form by REML from the residual the
+/// atom is fitted against.
+///
+/// The per-atom update solves `a = Σ_i c_i r_i / (Σ_i c_i² + λ)`, which is the
+/// posterior mean of `a` under `r_i = c_i·a + e_i`, `a ~ N(0, τ²I_p)`,
+/// `e_i ~ N(0, σ²I_p)`, with `λ = σ²/τ²`. So `λ_k` is a smoothing parameter and
+/// REML chooses it; it used to be `code_ridge`, hand-set and then REPORTED as
+/// this atom's entry in `lambdas` (#2899 row P32).
+///
+/// With `S = Σ_i c_i²`, `b = Σ_i c_i r_i` and `R = Σ_i ‖r_i‖²`, projecting the
+/// residual onto the code direction splits the likelihood:
+///
+/// ```text
+/// σ̂² = (R − ‖b‖²/S) / ((rows − 1)·p)
+/// τ̂² = (‖b‖²/S − p·σ̂²) / (p·S)
+/// λ̂  = σ̂² / τ̂²
+/// ```
+///
+/// A non-positive `τ̂²` says this atom's code explains no more of the residual
+/// than the noise the other `rows − 1` directions measure, so the data does not
+/// identify a direction for it. That is the SAME condition the empty-cluster
+/// branch above handles, and it is reported the same way: the atom goes inactive
+/// with [`INACTIVE_LAMBDA`] rather than being fitted at a ridge chosen to make it
+/// look identified.
+fn atom_reml_lambda(
+    code_norm2: f64,
+    cross: ArrayView1<'_, f64>,
+    residual_energy: f64,
+    rows: usize,
+    columns: usize,
+) -> Option<f64> {
+    if rows < 2 || columns == 0 || !(code_norm2 > 0.0) {
+        return None;
+    }
+    let explained = cross.dot(&cross) / code_norm2;
+    let columns_f = columns as f64;
+    let noise = (residual_energy - explained).max(0.0) / ((rows as f64 - 1.0) * columns_f);
+    let signal = (explained - columns_f * noise) / (columns_f * code_norm2);
+    if !(signal.is_finite() && signal > 0.0) || !noise.is_finite() {
+        return None;
+    }
+    let lambda = noise / signal;
+    if !lambda.is_finite() || lambda < 0.0 {
+        return None;
+    }
+    Some(lambda)
+}
+
 fn fit_one_atom_penalized_ls(
     x: ArrayView2<'_, f64>,
     atoms: &mut Array2<f64>,
@@ -819,7 +927,6 @@ fn fit_one_atom_penalized_ls(
     lambdas: &mut Array1<f64>,
     reml_scores: &mut Array1<f64>,
     atom_idx: usize,
-    atom_ridge: f64,
 ) -> Result<bool, String> {
     let code = assignments.column(atom_idx).to_owned();
     let code_norm2 = code.dot(&code);
@@ -870,9 +977,11 @@ fn fit_one_atom_penalized_ls(
             atoms[[atom_idx, col]] = x[[worst_row, col]] - fitted[[worst_row, col]];
         }
         normalize_row(atoms.slice_mut(s![atom_idx, ..]));
-        lambdas[atom_idx] = atom_ridge;
-        reml_scores[atom_idx] =
-            penalized_reconstruction_loss(x, fitted.view(), atom_ridge, atoms.view());
+        // A freshly re-seeded atom has no code yet, so nothing identifies a ridge
+        // for it. It carries the inactive marker until the next sweep gives it
+        // one, rather than a ridge chosen before there is anything to shrink.
+        lambdas[atom_idx] = INACTIVE_LAMBDA;
+        reml_scores[atom_idx] = reconstruction_loss(x, fitted.view());
         return Ok(true);
     }
 
@@ -883,11 +992,34 @@ fn fit_one_atom_penalized_ls(
         .insert_axis(Axis(1))
         .dot(&old_atom.view().insert_axis(Axis(0)));
 
-    let denominator = code_norm2 + atom_ridge;
+    let cross = {
+        let mut values = Array1::<f64>::zeros(x.ncols());
+        for col in 0..x.ncols() {
+            values[col] = code.dot(&residual.column(col));
+        }
+        values
+    };
+    let residual_energy = residual.iter().map(|value| value * value).sum::<f64>();
+    let Some(lambda) = atom_reml_lambda(
+        code_norm2,
+        cross.view(),
+        residual_energy,
+        x.nrows(),
+        x.ncols(),
+    ) else {
+        // The code explains no more of the residual than its noise floor: this
+        // atom has no identified direction, which is the same verdict the
+        // empty-cluster branch reaches, reported the same way.
+        atoms.row_mut(atom_idx).fill(0.0);
+        lambdas[atom_idx] = INACTIVE_LAMBDA;
+        reml_scores[atom_idx] = 0.0;
+        return Ok(false);
+    };
+    let denominator = code_norm2 + lambda;
     for col in 0..x.ncols() {
-        atoms[[atom_idx, col]] = code.dot(&residual.column(col)) / denominator;
+        atoms[[atom_idx, col]] = cross[col] / denominator;
     }
-    lambdas[atom_idx] = atom_ridge;
+    lambdas[atom_idx] = lambda;
     normalize_atom_and_assignments(atoms, assignments, atom_idx);
     let updated_code = assignments.column(atom_idx).to_owned();
     fitted.assign(&x);
@@ -896,8 +1028,7 @@ fn fit_one_atom_penalized_ls(
         .view()
         .insert_axis(Axis(1))
         .dot(&atoms.row(atom_idx).insert_axis(Axis(0)));
-    reml_scores[atom_idx] =
-        penalized_reconstruction_loss(x, fitted.view(), atom_ridge, atoms.view());
+    reml_scores[atom_idx] = reconstruction_loss(x, fitted.view());
     Ok(false)
 }
 
@@ -905,13 +1036,12 @@ fn top_k_assignments(
     x: ArrayView2<'_, f64>,
     atoms: ArrayView2<'_, f64>,
     top_k: usize,
-    code_ridge: f64,
 ) -> Result<Array2<f64>, String> {
     let cross = x.dot(&atoms.t());
     let mut assignments = Array2::<f64>::zeros((x.nrows(), atoms.nrows()));
     for row in 0..x.nrows() {
         let active = top_indices_by_abs(cross.row(row), top_k);
-        let coeffs = solve_active_coefficients(atoms, cross.row(row), &active, code_ridge)?;
+        let coeffs = solve_active_coefficients(atoms, cross.row(row), &active)?;
         for pos in 0..active.len() {
             assignments[[row, active[pos]]] = coeffs[pos];
         }
@@ -922,16 +1052,15 @@ fn top_k_assignments(
 /// Encode held-out rows `x` (`M x P`) against a frozen dictionary `atoms`
 /// (`K x P`) using the same routing the fit uses against its final atoms:
 /// the fitted model's `assignment` rule (top-`top_k` ridge least squares, or
-/// the top-`top_k` softmax at `temperature`) with its `code_ridge`. Returns the
+/// the top-`top_k` softmax at `temperature`). Returns the
 /// `(M, K)` sparse code matrix.
 ///
 /// `mean` is the fitted model's origin, [`LinearDictionaryFit::mean`]: for an
 /// affine fit (the centered K=1 lane) the rows are encoded as `x − mean`, exactly
 /// the centered rows the fit coded, and for a linear fit (`None`) `x` is encoded
 /// as is. The input contract is checked here, not by a caller: `x`, `atoms` and
-/// `mean` must be finite, `top_k` must lie in `[1, K]` and `code_ridge` must be
-/// finite and positive (the fit's own contract), and an out-of-range `top_k` is
-/// an error rather than a clamp.
+/// `mean` must be finite and `top_k` must lie in `[1, K]`, and an out-of-range
+/// `top_k` is an error rather than a clamp.
 ///
 /// This is the out-of-sample `transform`/encode step for a fitted linear
 /// dictionary; the math lives in the Rust core so the Python facade stays a
@@ -943,7 +1072,6 @@ pub fn linear_dictionary_transform(
     top_k: usize,
     assignment: LinearDictionaryAssignment,
     temperature: f64,
-    code_ridge: f64,
 ) -> Result<Array2<f64>, String> {
     let k = atoms.nrows();
     if k == 0 {
@@ -970,11 +1098,6 @@ pub fn linear_dictionary_transform(
             "linear_dictionary_transform: top_k must be in [1, K={k}]; got {top_k}"
         ));
     }
-    if !(code_ridge.is_finite() && code_ridge > 0.0) {
-        return Err(format!(
-            "linear_dictionary_transform: code_ridge must be finite and positive; got {code_ridge}"
-        ));
-    }
     if assignment == LinearDictionaryAssignment::Softmax
         && !(temperature.is_finite() && temperature > 0.0)
     {
@@ -983,7 +1106,7 @@ pub fn linear_dictionary_transform(
         ));
     }
     match mean {
-        None => route_against_atoms(x, atoms, top_k, assignment, temperature, code_ridge),
+        None => route_against_atoms(x, atoms, top_k, assignment, temperature),
         Some(mean) => {
             if mean.len() != atoms.ncols() {
                 return Err(format!(
@@ -996,14 +1119,7 @@ pub fn linear_dictionary_transform(
                 return Err("linear_dictionary_transform: mean must be finite".to_string());
             }
             let centered = &x - &mean;
-            route_against_atoms(
-                centered.view(),
-                atoms,
-                top_k,
-                assignment,
-                temperature,
-                code_ridge,
-            )
+            route_against_atoms(centered.view(), atoms, top_k, assignment, temperature)
         }
     }
 }
@@ -1013,7 +1129,6 @@ fn softmax_assignments(
     atoms: ArrayView2<'_, f64>,
     top_k: usize,
     temperature: f64,
-    code_ridge: f64,
 ) -> Result<Array2<f64>, String> {
     let cross = x.dot(&atoms.t());
     // A zero atom states no direction: it has no similarity to any row and is
@@ -1046,35 +1161,73 @@ fn softmax_assignments(
             return Err("linear_dictionary_fit softmax assignment underflowed".to_string());
         }
         for &atom_idx in &active {
-            let projection = cross[[row, atom_idx]] / (atom_norm2[atom_idx] + code_ridge);
+            // `active` already excludes `atom_norm2 == 0`, and a live atom is
+            // unit-norm, so this divisor is 1 up to its own rounding. The ridge
+            // that used to be added here was an undeclared relative shrinkage on
+            // every softmax code, guarding a case the filter above removes.
+            let projection = cross[[row, atom_idx]] / atom_norm2[atom_idx];
             assignments[[row, atom_idx]] = assignments[[row, atom_idx]] * projection / denom;
         }
     }
     Ok(assignments)
 }
 
+/// The active-set code on the subspace the stored dictionary RESOLVES.
+///
+/// `G_ij = a_i·a_j` over the `m` active atoms. The rows are unit-norm, so every
+/// entry is a sum of `p` products with `Σ_c |a_ic a_jc| ≤ ‖a_i‖‖a_j‖ = 1` and
+/// rounds by at most Wilkinson's `γ_p`. An `m × m` perturbation whose entries are
+/// bounded by `γ_p` moves an eigenvalue by at most its Frobenius norm, `m·γ_p`, so
+/// an eigendirection of `G` at or below that band is a combination of active atoms
+/// the stored dictionary separates only at rounding — a near-duplicate pair. Its
+/// coordinate `vᵀ(Dᵀx)` is a rounding-level quantity, so nothing identifies it, and
+/// a solve that keeps it swings the split of the code between those atoms on
+/// rounding-level dictionary changes while the reconstruction stays put.
+///
+/// Resolved directions contribute their exact coordinate `vᵀb/λ` and unresolved
+/// ones contribute nothing, which is the minimum-norm code on the resolved
+/// subspace — the Moore-Penrose joint least-squares code. No off-diagonal Gram
+/// term is discarded.
+///
+/// # Why there is no ridge
+///
+/// This used to add `code_ridge` to the diagonal so the Cholesky would survive a
+/// near-collinear active set. That is the job the band above does, and does with
+/// a derivation: a ridge cannot tell an unresolved direction from a small
+/// resolved one, so it biases EVERY resolved coordinate by `λ/(λ + ρ)` in order to
+/// stabilise the ones it cannot identify. The sibling sparse lane already reads
+/// the same rule, `gam_sae::sparse_dict::codes::ResolvedActiveGram`, whose doc
+/// names the same zero-ridge limit (#2899 row P32).
 fn solve_active_coefficients(
     atoms: ArrayView2<'_, f64>,
     cross_row: ArrayView1<'_, f64>,
     active: &[usize],
-    code_ridge: f64,
 ) -> Result<Array1<f64>, String> {
     let m = active.len();
+    let p = atoms.ncols();
     let mut system = Array2::<f64>::zeros((m, m));
-    let mut rhs = Array2::<f64>::zeros((m, 1));
+    let mut rhs = Array1::<f64>::zeros(m);
     for i in 0..m {
-        rhs[[i, 0]] = cross_row[active[i]];
+        rhs[i] = cross_row[active[i]];
         for j in 0..m {
             system[[i, j]] = atoms.row(active[i]).dot(&atoms.row(active[j]));
         }
-        system[[i, i]] += code_ridge;
     }
-    let factor = system
-        .cholesky(Side::Lower)
-        .map_err(|err| format!("linear_dictionary_fit sparse-code solve failed: {err}"))?;
-    let mut solution = rhs;
-    factor.solve_mat_in_place(&mut solution);
-    Ok(solution.column(0).to_owned())
+    let (eigenvalues, eigenvectors) = system
+        .eigh(Side::Lower)
+        .map_err(|err| format!("linear_dictionary_fit active-set spectrum failed: {err}"))?;
+    let resolution = m as f64 * gam_linalg::roundoff::accumulation_growth(p);
+    let mut solution = Array1::<f64>::zeros(m);
+    for index in 0..m {
+        let eigenvalue = eigenvalues[index];
+        if !(eigenvalue > resolution) {
+            continue;
+        }
+        let direction = eigenvectors.column(index);
+        let projection = direction.dot(&rhs) / eigenvalue;
+        solution.scaled_add(projection, &direction);
+    }
+    Ok(solution)
 }
 
 fn top_indices_by_abs(row: ArrayView1<'_, f64>, top_k: usize) -> Vec<usize> {
@@ -1219,12 +1372,13 @@ fn explained_variance(x: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -> f6
     }
 }
 
-fn penalized_reconstruction_loss(
-    x: ArrayView2<'_, f64>,
-    fitted: ArrayView2<'_, f64>,
-    ridge: f64,
-    atoms: ArrayView2<'_, f64>,
-) -> f64 {
+/// `‖X − fitted‖²`, recorded once after the fixed-point certificate passes.
+///
+/// This used to add `ridge·‖atoms‖²`. The atoms are unit-norm, so that term was
+/// `ridge·K`: a constant offset on a number nothing compares, since the
+/// convergence test reads `ev_residual` and `routing_residual` and this value
+/// only reaches `reml_scores` (#2899 row P32).
+fn reconstruction_loss(x: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -> f64 {
     let mut loss = 0.0;
     for row in 0..x.nrows() {
         for col in 0..x.ncols() {
@@ -1232,7 +1386,7 @@ fn penalized_reconstruction_loss(
             loss += residual * residual;
         }
     }
-    loss + ridge * atoms.iter().map(|value| value * value).sum::<f64>()
+    loss
 }
 
 #[cfg(test)]
@@ -1262,7 +1416,6 @@ mod tests {
             top_k: 2,
             assignment: LinearDictionaryAssignment::TopK,
             temperature: DEFAULT_TEMPERATURE,
-            code_ridge: DEFAULT_CODE_RIDGE,
             tolerance: 1.0e-9,
             center_rank_one: false,
         };
@@ -1328,7 +1481,6 @@ mod tests {
             top_k: 2,
             assignment: LinearDictionaryAssignment::TopK,
             temperature: DEFAULT_TEMPERATURE,
-            code_ridge: DEFAULT_CODE_RIDGE,
             tolerance: 1.0e-9,
             center_rank_one: false,
         };
@@ -1377,7 +1529,6 @@ mod tests {
             top_k: 1,
             assignment: LinearDictionaryAssignment::TopK,
             temperature: DEFAULT_TEMPERATURE,
-            code_ridge: DEFAULT_CODE_RIDGE,
             tolerance: DEFAULT_TOLERANCE,
             center_rank_one: false,
         };
@@ -1385,14 +1536,81 @@ mod tests {
         let fit = fit_linear_dictionary(x.view(), &config).expect("rank-one fit");
         let covariance = x.t().dot(&x);
         let (evals, _) = covariance.eigh(Side::Lower).expect("PCA eigensolve");
-        let shrink = 1.0 / (1.0 + DEFAULT_CODE_RIDGE);
+
+        // The ridge is no longer a constant to read off, so the oracle is built
+        // from the closed form the lane selects (#2899 row P32) and the fit's own
+        // reported value is checked against it. `rows` is `n` here because this
+        // lane is uncentered.
+        let last = evals.len() - 1;
+        let noise = (evals.sum() - evals[last]) / (80.0 * (3.0 - 1.0));
+        let signal = evals[last] / 80.0 - noise;
+        assert!(
+            signal > 0.0,
+            "the fixture must carry a rank-one component above its noise floor"
+        );
+        let oracle_lambda = noise / signal;
+        assert_abs_diff_eq!(fit.lambdas[0], oracle_lambda, epsilon = 1.0e-12);
+
+        let shrink = 1.0 / (1.0 + oracle_lambda);
         let oracle_ev = 1.0
-            - ((1.0 - shrink) * (1.0 - shrink) * evals[evals.len() - 1]
-                + evals.slice(s![..evals.len() - 1]).sum())
+            - ((1.0 - shrink) * (1.0 - shrink) * evals[last] + evals.slice(s![..last]).sum())
                 / evals.sum();
 
         assert!(fit.explained_variance > 0.99);
         assert_abs_diff_eq!(fit.explained_variance, oracle_ev, epsilon = 2.0e-4);
+    }
+
+    /// The active-set code on a near-duplicate pair is the MINIMUM-NORM one
+    /// (#2899 row P32).
+    ///
+    /// Two atoms separated by `δ` far below the Gram's resolution band are one
+    /// direction as far as the stored dictionary can tell, so the split of the
+    /// code between them is not identified. A ridge would pick one — whichever
+    /// the arithmetic happened to favour — and the split would then move with
+    /// rounding-level changes to the dictionary. The resolved solve drops the
+    /// unidentified difference direction and keeps only the sum, which is the
+    /// Moore-Penrose answer, and it shows up as the two atoms carrying EQUAL
+    /// codes.
+    ///
+    /// The control is the second assertion: a genuinely separated pair, with the
+    /// same geometry but `δ` well ABOVE the band, must NOT be equalized. Without
+    /// it this test would pass on a solve that always splits evenly.
+    #[test]
+    fn near_duplicate_atoms_take_the_minimum_norm_code_2899() {
+        let p = 16usize;
+        let mut build = |delta: f64| -> Array1<f64> {
+            let mut atoms = Array2::<f64>::zeros((2, p));
+            for col in 0..p {
+                atoms[[0, col]] = if col == 0 { 1.0 } else { 0.0 };
+                atoms[[1, col]] = if col == 0 {
+                    1.0
+                } else if col == 1 {
+                    delta
+                } else {
+                    0.0
+                };
+            }
+            normalize_row(atoms.slice_mut(s![0, ..]));
+            normalize_row(atoms.slice_mut(s![1, ..]));
+            let mut row = Array1::<f64>::zeros(p);
+            row[0] = 3.0;
+            row[1] = 0.5;
+            let cross = atoms.dot(&row);
+            solve_active_coefficients(atoms.view(), cross.view(), &[0, 1]).expect("active-set code")
+        };
+
+        // Below the band: `m·γ_p` with `m = 2`, so the difference direction is
+        // unresolved and the code may not prefer either atom.
+        let unresolved = build(1.0e-12);
+        assert_abs_diff_eq!(unresolved[0], unresolved[1], epsilon = 1.0e-9);
+
+        // Above it: the pair is a real pair and the codes must differ, or the
+        // assertion above would be measuring a solve that equalizes everything.
+        let resolved = build(1.0e-2);
+        assert!(
+            (resolved[0] - resolved[1]).abs() > 1.0e-3,
+            "a resolved pair must not be equalized: {resolved:?}"
+        );
     }
 
     #[test]
@@ -1429,7 +1647,6 @@ mod tests {
             top_k: 1,
             assignment: LinearDictionaryAssignment::TopK,
             temperature: DEFAULT_TEMPERATURE,
-            code_ridge: DEFAULT_CODE_RIDGE,
             tolerance: 1.0e-9,
             center_rank_one: false,
         };
@@ -1474,7 +1691,6 @@ mod tests {
             top_k: 2,
             assignment: LinearDictionaryAssignment::TopK,
             temperature: DEFAULT_TEMPERATURE,
-            code_ridge: DEFAULT_CODE_RIDGE,
             tolerance: 1.0e-9,
             center_rank_one: false,
         };
@@ -1561,7 +1777,6 @@ mod tests {
             top_k: 2,
             assignment: LinearDictionaryAssignment::TopK,
             temperature: DEFAULT_TEMPERATURE,
-            code_ridge: DEFAULT_CODE_RIDGE,
             tolerance: DEFAULT_TOLERANCE,
             center_rank_one: false,
         };
@@ -1621,7 +1836,6 @@ mod tests {
             top_k: 1,
             assignment: LinearDictionaryAssignment::TopK,
             temperature: DEFAULT_TEMPERATURE,
-            code_ridge: DEFAULT_CODE_RIDGE,
             tolerance: DEFAULT_TOLERANCE,
             center_rank_one: false,
         };
@@ -1704,7 +1918,6 @@ mod tests {
             top_k: 1,
             assignment: LinearDictionaryAssignment::TopK,
             temperature: DEFAULT_TEMPERATURE,
-            code_ridge: DEFAULT_CODE_RIDGE,
             tolerance: 1.0e-9,
             center_rank_one: false,
         };
@@ -1754,7 +1967,6 @@ mod tests {
                     &mut lambdas,
                     &mut reml_scores,
                     atom_idx,
-                    config.code_ridge,
                 )
                 .expect("atom update");
             }
@@ -1851,7 +2063,6 @@ mod tests {
             top_k: 2,
             assignment: LinearDictionaryAssignment::TopK,
             temperature: DEFAULT_TEMPERATURE,
-            code_ridge: DEFAULT_CODE_RIDGE,
             tolerance: 1.0e-9,
             center_rank_one: false,
         };
@@ -1894,7 +2105,6 @@ mod tests {
                 top_k,
                 assignment,
                 temperature,
-                config.code_ridge,
             )
             .expect("transform");
             for (a, b) in transformed.iter().zip(fitted_route.iter()) {
@@ -1908,7 +2118,6 @@ mod tests {
             top_k,
             LinearDictionaryAssignment::TopK,
             temperature,
-            DEFAULT_CODE_RIDGE,
         )
         .expect("top-k transform");
         let softmax_codes = linear_dictionary_transform(
@@ -1918,7 +2127,6 @@ mod tests {
             top_k,
             LinearDictionaryAssignment::Softmax,
             temperature,
-            DEFAULT_CODE_RIDGE,
         )
         .expect("softmax transform");
         let max_gap = top_k_codes
@@ -1938,7 +2146,6 @@ mod tests {
                 top_k,
                 LinearDictionaryAssignment::Softmax,
                 0.0,
-                DEFAULT_CODE_RIDGE,
             )
             .is_err()
         );
@@ -1992,7 +2199,6 @@ mod tests {
             fit.top_k,
             fit.assignment,
             config.temperature,
-            config.code_ridge,
         )
         .expect("transform");
         for (a, b) in transformed.iter().zip(fit.assignments.iter()) {
@@ -2005,7 +2211,6 @@ mod tests {
             fit.top_k,
             fit.assignment,
             config.temperature,
-            config.code_ridge,
         )
         .expect("linear transform");
         let origin_gap = linear_codes
@@ -2032,7 +2237,6 @@ mod tests {
                 k,
                 fit.assignment,
                 config.temperature,
-                config.code_ridge,
             )
         };
         assert!(encode(&x, mean, 0).is_err());

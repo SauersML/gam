@@ -5267,7 +5267,6 @@ fn thin_svd_scores<'py>(
     top_k = 1,
     assignment = "top_k",
     temperature = 0.25,
-    code_ridge = 1.0e-8,
     tolerance = 1.0e-7,
     center_rank_one = false
 ))]
@@ -5279,7 +5278,6 @@ fn linear_dictionary_fit<'py>(
     top_k: usize,
     assignment: &str,
     temperature: f64,
-    code_ridge: f64,
     tolerance: f64,
     center_rank_one: bool,
 ) -> PyResult<Py<PyDict>> {
@@ -5291,7 +5289,6 @@ fn linear_dictionary_fit<'py>(
         top_k,
         assignment: assignment_kind,
         temperature,
-        code_ridge,
         tolerance,
         center_rank_one,
     };
@@ -5364,7 +5361,6 @@ fn linear_dictionary_error_to_pyerr(py: Python<'_>, error: LinearDictionaryError
     atoms,
     top_k,
     mean = None,
-    code_ridge = 1.0e-8,
     assignment = "top_k",
     temperature = 0.25
 ))]
@@ -5374,7 +5370,6 @@ fn linear_dictionary_transform_ffi<'py>(
     atoms: PyReadonlyArray2<'py, f64>,
     top_k: usize,
     mean: Option<PyReadonlyArray1<'py, f64>>,
-    code_ridge: f64,
     assignment: &str,
     temperature: f64,
 ) -> PyResult<Py<PyArray2<f64>>> {
@@ -5390,7 +5385,6 @@ fn linear_dictionary_transform_ffi<'py>(
             top_k,
             assignment_kind,
             temperature,
-            code_ridge,
         )
     })?;
     Ok(codes.into_pyarray(py).unbind())

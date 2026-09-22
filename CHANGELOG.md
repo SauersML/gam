@@ -9,6 +9,23 @@
   admitted modes below the band that resolves them from zero, weighted `1/λ` in the
   pseudo-inverse. Reverted, with the stale comments corrected rather than restored
   (#1561, #3236, #2901).
+- **The linear dictionary's ridge is selected by REML, and where it was never a ridge it is
+  gone** (#2899 row P32). One field, `code_ridge`, was doing five different jobs under one
+  hand-set `1e-8`. Two of them were inert: the softmax divisor already filtered zero-norm atoms
+  and its live atoms are unit-norm, so the ridge was an undeclared relative shrinkage on every
+  softmax code, and the reported loss added `ridge·‖atoms‖²`, a constant on unit-norm atoms that
+  nothing compares. One was a numerical stabiliser on the active-set Gram, now replaced by the
+  resolution the arithmetic sets: entries round by Wilkinson's `γ_p`, an `m × m` perturbation
+  moves an eigenvalue by at most `m·γ_p`, and directions below that band are dropped rather than
+  ridged, giving the minimum-norm Moore-Penrose code the sibling sparse lane already computes.
+  The remaining two were SMOOTHING PARAMETERS that the fit reported as its own `lambdas` — the
+  rank-one lane's code shrinkage and the per-atom dictionary update — and both now come from
+  closed-form REML on the same second-moment spectra the lanes already compute, with a typed
+  refusal where the leading direction carries no variance above the noise floor its orthogonal
+  complement measures. `code_ridge` is deleted from `LinearDictionaryConfig`, from
+  `linear_dictionary_transform`, from both pyffi entry points and from the Python signature and
+  stubs. The sparse lane's `code_ridge` is untouched: there it is explicitly an initial value
+  that the fit selects from and records in `selected_rho`.
 
 - **A damped representer column gets the anchor's scale motion instead of a refusal** (#2902
   row 5). The column-scale term landed in `7adbe5963a` refused whenever a kept chart column was
