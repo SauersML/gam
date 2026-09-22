@@ -1327,14 +1327,33 @@ pub(crate) fn subject_marginal<S: JetField>(
         // C_{m+1}(z') = E[C_m(z) | z', y_{≤m}], plus the gap score's own
         // expectation E[t_g | z', y_{≤m}] in its log-rate slot, both under the
         // forward kernel's normalised inner weights at every target point: the
-        // carried functions through their Lagrange interpolant on node m's
-        // filtered grid, the gap polynomial exactly at the inner points. Every
-        // weight is positive and sums to one, so each propagated value is a
-        // bounded average of bounded functions wherever the predicted density
-        // is. The kernel is built from node m's filtered grid and log density
-        // to whichever grid of node m+1 is the target: the filtered grid, which
-        // carries the vector on, and the smoothed grid, where node m+1's
-        // expectations are taken.
+        // carried functions through their Lagrange interpolant on the SOURCE
+        // grid, the gap polynomial exactly at the inner points. Every weight is
+        // positive and sums to one, so each propagated value is a bounded
+        // average of bounded functions wherever the predicted density is.
+        //
+        // #3013 slice 2 — which grid the carrier is read on is the same question
+        // slice 1 answered for the marginal, and it has the same answer. The
+        // conditional `p(z_m | z_{m+1}, y_{≤m}) ∝ α_m(z)·f(z'|z)` is what both
+        // routes integrate; only the quadrature points differ. On a slow atom's
+        // early nodes the filtered grid is as wide as the prior, and
+        // `C_m(z) ≈ e^{a z}` read there is an envelope times a degree-`G−1`
+        // polynomial whose truncation is `(a·hull)^G / G!` — which is why the
+        // Louis Hessian stopped converging geometrically in `G` while the
+        // marginal, moved onto its own grid by slice 1, did not. For a `z'` in
+        // node m+1's smoothed region the mass of `α_m(z)·f(z'|z)` sits where
+        // node m's SMOOTHED grid is, so that is where the carrier is read.
+        //
+        // The density the kernel is built from is the filtered one either way:
+        // `ln α_m = ln p̂_m + f_m`, with the smooth half read at the source
+        // grid's points (`Smoothed::predicted`) and `f_m` the explicit node
+        // factor, which is a function and not grid values, so it travels
+        // unchanged. Nothing about the conditional changes — only where it is
+        // sampled.
+        //
+        // `carried` still moves on the filtered chain: the last node has no
+        // smoothed grid of its own, and its expectations contract against that
+        // carrier.
         //
         // A gap of zero length leaves the state where it is: `z' = z`, the
         // carried functions pass through unchanged, and the gap's score is
@@ -1344,18 +1363,21 @@ pub(crate) fn subject_marginal<S: JetField>(
         // inner rule collapses onto `z = z'/φ` at `q = 0`, carries the
         // functions to it.
         let zero_gap = transitions.iter().all(|t| t.innovation.value() == 0.0);
-        let source = &filtered[m];
-        let source_size = source.grid.size();
-        let propagate = |target: &Grid<S>| -> Vec<S> {
+        let propagate = |source_grid: &Grid<S>,
+                         source_density: &SplitDensity<S>,
+                         source_values: &[S],
+                         target: &Grid<S>|
+         -> Vec<S> {
+            let source_size = source_grid.size();
             let kernel =
-                ForwardKernel::new(inputs.gh, &source.grid, &source.density, target, transitions);
+                ForwardKernel::new(inputs.gh, source_grid, source_density, target, transitions);
             let target_size = target.size();
             let mut propagated = vec![zero.clone(); p_total * target_size];
             for j in 0..target_size {
                 let row = kernel.row(j);
                 let transfer = kernel.transfer(j, &row.weights);
                 for q in 0..p_total {
-                    let carried_q = &carried[q * source_size..(q + 1) * source_size];
+                    let carried_q = &source_values[q * source_size..(q + 1) * source_size];
                     propagated[q * target_size + j] = transfer
                         .iter()
                         .zip(carried_q.iter())
@@ -1383,9 +1405,43 @@ pub(crate) fn subject_marginal<S: JetField>(
             }
             propagated
         };
-        carried_smoothed = smoothed_chain.grids[m + 1].as_ref().map(|target| propagate(target));
+        let filtered_source = &filtered[m];
+        // Node m's smoothed grid with the FILTERED density read on it: the
+        // smooth half at this grid's points, the node factor unchanged.
+        let smoothed_source = smoothed_chain.grids[m]
+            .as_ref()
+            .zip(smoothed_chain.predicted[m].as_ref())
+            .map(|(grid, smooth)| {
+                (
+                    grid,
+                    SplitDensity {
+                        smooth: smooth.clone(),
+                        factor: filtered_source.density.factor.clone(),
+                    },
+                )
+            });
+        // The carrier moves from the smoothed grid only where the node has one
+        // AND the carrier is already on it; at the first node without one it
+        // falls back to the filtered chain, which is where it has been all along.
+        let next_smoothed = smoothed_chain.grids[m + 1].as_ref().map(|target| {
+            match (smoothed_source.as_ref(), carried_smoothed.as_deref()) {
+                (Some((grid, density)), Some(values)) => propagate(grid, density, values, target),
+                _ => propagate(
+                    &filtered_source.grid,
+                    &filtered_source.density,
+                    &carried,
+                    target,
+                ),
+            }
+        });
+        carried_smoothed = next_smoothed;
         if !zero_gap {
-            carried = propagate(&next.grid);
+            carried = propagate(
+                &filtered_source.grid,
+                &filtered_source.density,
+                &carried,
+                &next.grid,
+            );
         }
     }
 
@@ -1550,6 +1606,15 @@ struct Smoothed<S> {
     /// lives on the node's filtered grid: the last node, whose smoothed
     /// marginal is its filtered one, and every node of a static chain.
     grids: Vec<Option<Grid<S>>>,
+    /// `ln p̂_n` on the node's own smoothed grid: the SMOOTH half of the
+    /// filtered log density `ln α_n = ln p̂_n + f_n`, and the only half that is
+    /// bound to a grid. `f_n` is a [`LogFactor`], the explicit node function the
+    /// kernel evaluates wherever it needs it, so the filtered density on the
+    /// smoothed grid is `SplitDensity { smooth: predicted[n], factor:
+    /// filtered[n].density.factor }` — the same density the filtered grid
+    /// carries, read at the smoothed grid's points. `None` exactly where
+    /// `grids[n]` is.
+    predicted: Vec<Option<Vec<S>>>,
     marginals: Vec<Vec<S>>,
     innovation_moments: Vec<HashMap<Vec<u8>, Vec<S>>>,
 }
@@ -1684,7 +1749,7 @@ fn backward_smoother<S: JetField>(
     let last = &filtered[n_nodes - 1];
     if crate::static_state::is_static(inputs.rates) {
         if derivatives { return Err(numerical("static frailties have no innovation scores")); }
-        return Ok(Smoothed { grids: vec![None; n_nodes],
+        return Ok(Smoothed { grids: vec![None; n_nodes], predicted: vec![None; n_nodes],
             marginals: vec![last.alpha.clone(); n_nodes], innovation_moments: Vec::new() });
     }
     let marks = inputs.nodes.counts.ncols();
@@ -1752,6 +1817,7 @@ fn backward_smoother<S: JetField>(
         }
     }
     let mut grids: Vec<Option<Grid<S>>> = vec![None; n_nodes];
+    let mut predicted: Vec<Option<Vec<S>>> = vec![None; n_nodes];
     let mut marginals: Vec<Vec<S>> = vec![Vec::new(); n_nodes];
     let mut log_beta: Vec<Vec<S>> = vec![Vec::new(); n_nodes];
     log_beta[n_nodes - 1] = vec![zero.clone(); last.grid.size()];
@@ -1807,6 +1873,9 @@ fn backward_smoother<S: JetField>(
             .zip(likelihood.ell.iter())
             .map(|(p, e)| p.add(&add_real(e, -likelihood.shift)))
             .collect();
+        // `log_predicted` is kept whole below: it is the smooth half of this
+        // node's filtered density, and the Louis carried vector is propagated
+        // from this grid rather than the filtered one (#3013 slice 2).
         // ---- `log β_n` on it ----------------------------------------------
         // The node's log-likelihood is an explicit formula, so it is
         // evaluated exactly at every inner point; only the smoother residual
@@ -1892,9 +1961,11 @@ fn backward_smoother<S: JetField>(
         log_beta[n] = log_beta_n;
         innovation_moments[n] = moments;
         grids[n] = Some(grid);
+        predicted[n] = Some(log_predicted);
     }
     Ok(Smoothed {
         grids,
+        predicted,
         marginals,
         innovation_moments,
     })
