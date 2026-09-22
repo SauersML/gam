@@ -500,7 +500,11 @@ impl<F: CustomFamily> ContractedTraceHessianBatch<F> {
                     &self.states,
                     &self.specs,
                 )?;
-            let _ = self.snapshot.set(prepared);
+            if self.snapshot.set(prepared).is_err() {
+                log::trace!(
+                    "[2979] a concurrent contraction prepared this snapshot's towers first; the first one stands"
+                );
+            }
         }
         match self.snapshot.get() {
             Some(Some(prepared)) => prepared.contract(weight),
