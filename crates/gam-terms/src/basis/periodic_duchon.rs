@@ -2417,6 +2417,28 @@ mod axis_relevance_factor_rank_2735_tests {
         // reflection so the Gram is not diagonal. One mode sits at σ²/σ²_max =
         // 1e-9: far above the Gram's rounding band (n·ε ≈ 2.7e-15) and below
         // the bridge's cutoff n·1e-10 = 1.2e-9.
+        //
+        // THAT SECOND CLAUSE IS STALE AND THIS FIXTURE'S SHAPE CANNOT BE
+        // RETUNED (#1561). `0f72c1e70e` (#2901) replaced the `n·1e-10` cutoff
+        // with the rounding band itself, so the bridge now keeps the 1e-9 mode
+        // and the negative control below is false: left 9, right 8.
+        //
+        // Its sibling `axis_relevance_rank_is_continuous_across_the_seed0_
+        // length_scales_2735` was retunable because its Gram is 500-order while
+        // its accumulation is only 12 rows deep, leaving a 42× window between
+        // `dim·ε·λ_max` and `γ_rows`. Here the Gram is 12-order (band
+        // `12·ε = 2.66e-15`) and `fast_ata` accumulates over `rows_per_axis =
+        // 20` rows (noise `20·ε = 4.44e-15`). The noise EXCEEDS the band, so
+        // there is no ratio that the bridge reliably drops while its computed
+        // sign is still a measurement — a mode placed there could make
+        // `try_from_dense_psd` refuse the Gram as indefinite instead of
+        // truncating it, and the control would fail for a third reason.
+        //
+        // Giving this test a window means giving it the sibling's shape: more
+        // columns than rows, modes set through `U Σ Vᵀ`. That makes it a near
+        // duplicate of the sibling, so the two should be merged rather than
+        // this one rewritten. Left failing deliberately, with the reason
+        // stated, rather than retuned into a fixture I cannot run.
         let n = 12usize;
         let rows_per_axis = 20usize;
         let sigma_sq: [f64; 12] = [1.0, 0.5, 0.1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-9, 0.0, 0.0, 0.0];
@@ -2490,8 +2512,32 @@ mod axis_relevance_factor_rank_2735_tests {
         let rows_per_axis = 12usize;
         let columns = 500usize;
         let steady_ratios: [f64; 7] = [1.0, 0.25, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6];
+        // The three ratios straddle the cutoff ACTUALLY IN FORCE, derived here
+        // rather than taken from the incident (#1561).
+        //
+        // The incident's own ratios were 5.057e-8, 5.013e-8 and 4.958e-8,
+        // chosen to straddle `500·1e-10 = 5.000e-8`. `0f72c1e70e` (#2901)
+        // removed that constant: `try_from_dense_psd` now cuts at the
+        // spectrum's rounding band `dim·ε·λ_max`, and with a 500-column Gram
+        // that is `500·2.22e-16 = 1.11e-13`. All three incident ratios sit six
+        // decades ABOVE it, so the bridge kept 8, 8, 8 and the negative control
+        // below — which exists to prove the fixture can tell the routes apart —
+        // became false. The defect the incident recorded was fixed by #2901,
+        // not by anything in #2735; the CLAIM this test makes is still live.
+        //
+        // Two bands bound the usable window, and they are 42 apart here:
+        //   * the bridge drops a mode below `1.11e-13` (the 500-order Gram's
+        //     rounding band), and
+        //   * `fast_ata` accumulates over `rows_per_axis = 12` rows, so a
+        //     computed eigenvalue is trustworthy only above `γ₁₂ ≈ 12·ε ≈
+        //     2.66e-15`. Below that its sign is noise and the bridge could
+        //     REFUSE the Gram as indefinite rather than truncate it.
+        // 5.0e-13 and 2.0e-13 sit above the band and are kept; 5.0e-14 sits
+        // under it and 19× over the noise floor, so it is dropped with its sign
+        // still measured. The factor resolves all three: `σ = √r` is 2.24e-7 at
+        // the smallest, against a factor band of `max(12,500)·ε = 1.11e-13`.
         let crossing: [(f64, f64); 3] =
-            [(1.0004, 5.057e-8), (0.9970, 5.013e-8), (0.9929, 4.958e-8)];
+            [(1.0004, 5.0e-13), (0.9970, 2.0e-13), (0.9929, 5.0e-14)];
         // Householder reflections, so neither the factor nor its Gram is
         // diagonal: U acts on the rows and V on the columns.
         let householder = |n: usize, slope: f64| {

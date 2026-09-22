@@ -4100,13 +4100,23 @@ mod function_space_null_shrinkage_tests {
     /// design while the frozen replay kept it.
     #[test]
     fn constructive_null_space_uses_the_canonical_penalty_spectrum_cutoff_2433() {
-        // λ = (1, 1e-12). Canonically that second direction is UNPENALIZED
-        // (`spectral_tolerance` = 2·1e-10·1 = 2e-10, two decades above it), but
-        // in singular-value units it is 1e-6 — eight decades above RRQR's
+        // λ = (1, 1e-20). Canonically that second direction is UNPENALIZED,
+        // but in singular-value units it is 1e-10 — four decades above RRQR's
         // machine-precision cutoff (100·ε·2 ≈ 4.4e-14), which is what the
-        // constructive path used to ask.
+        // constructive path used to ask. THAT GAP is what this test is about,
+        // and it is the √ε-versus-ε gap: a Gram resolves a direction only above
+        // its own band, its factor resolves the square root of the same number.
+        //
+        // The numbers moved with `0f72c1e70e` (#2901) and not with this test's
+        // subject. `spectral_tolerance` was `dim·1e-10·λ_max` = 2e-10 when this
+        // fixture was written, so λ = 1e-12 was two decades under it. It is now
+        // the spectrum's rounding band `dim·ε·λ_max` = 2·2.22e-16 = 4.44e-16,
+        // and 1e-12 is three decades OVER that — the direction became resolved
+        // and `nullity` went 1 → 0. λ = 1e-20 is four decades under the band
+        // again, with σ = 1e-10 still far above the RRQR cutoff, so the fixture
+        // asks the same question of the arithmetic actually in force (#1561).
         let quadratic = ConstructiveQuadratic::from_energy_factor(
-            array![[1.0, 0.0], [0.0, 1.0e-6]],
+            array![[1.0, 0.0], [0.0, 1.0e-10]],
             "#2433 canonical-cutoff fixture",
         )
         .expect("finite factor");
@@ -4144,11 +4154,23 @@ mod function_space_null_shrinkage_tests {
     /// penalty. With a machine-precision cutoff those two answered differently.
     #[test]
     fn constructive_null_space_is_independent_of_where_the_chart_is_applied_2433() {
-        // A raw penalty whose second direction is 30× ABOVE the raw chart's
-        // tolerance (3·1e-10) and, after an orthonormal restriction that keeps
-        // only a 1e-2 component of it, 200× BELOW the constrained chart's
-        // (2·1e-10).
-        let component = 1.0e-2_f64;
+        // A raw penalty whose second direction is far ABOVE the raw chart's
+        // tolerance and, after an orthonormal restriction that keeps only a
+        // small component of it, far BELOW the constrained chart's.
+        //
+        // Retuned for the tolerance actually in force (#1561). `0f72c1e70e`
+        // (#2901) replaced `dim·1e-10·λ_max` with the rounding band
+        // `dim·ε·λ_max`, so the raw chart's cutoff went 3e-10 → 6.66e-16 and
+        // the constrained chart's 2e-10 → 4.44e-16. The old `component = 1e-2`
+        // put the restricted eigenvalue at `1e-8·(1e-2)² = 1e-12`, which WAS
+        // 200× under 2e-10 and is now 2250× OVER 4.44e-16, so the restricted
+        // penalty stopped having a null direction at all.
+        //
+        // `component = 1e-5` puts it at `1e-8·(1e-5)² = 1e-18`, three decades
+        // under the constrained band, while the raw direction stays at 1e-8,
+        // seven decades over the raw band. Same two-sided question, current
+        // arithmetic.
+        let component = 1.0e-5_f64;
         let z = array![
             [1.0, 0.0],
             [0.0, (1.0 - component * component).sqrt()],
