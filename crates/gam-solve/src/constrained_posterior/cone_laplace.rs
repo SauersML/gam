@@ -37,6 +37,21 @@
 //!   one row on either side of `σ = 0`.
 //! - **The fold.** A continued tilted variance that is not positive is the constrained mode's fold:
 //!   the boundary has lost the Laplace regime. It is refused by name ([`ConeLaplaceRefusal::Fold`]).
+//!   It cannot be one at SWEEP 0. With `B_i = Λ − τ̃_ia_ia_iᵀ`, Sherman-Morrison gives
+//!   `τ_c = 1/Σ_ii − τ̃_i = 1/(a_iᵀB_i⁻¹a_i)` exactly, and at sweep 0 every site is `μ²` or zero, so
+//!   `B_i ⪰ M`: a positive definite `M` forces `τ_c > 0`, the ordinary branch, and a positive
+//!   variance. A fold reported there says `B_i` is not positive definite, or that the difference
+//!   `1/Σ_ii − τ̃_i` lost its digits — never that the mode folded. Those two are ONE question in
+//!   two forms: with `Λ` positive definite (which the Cholesky establishes before any site is
+//!   read) `B_i ≻ 0` exactly when `τ̃_i·Σ_ii < 1`, and `τ_c` carries the sign of `1 − τ̃_i·Σ_ii`
+//!   because `Σ_ii > 0`. The product is that question asked without the cancellation; the
+//!   difference loses every digit as the product approaches 1. So the reading is whether the
+//!   product clears 1 by more than `κ(Λ)·ε`, not whether it exceeds 1. The refusal carries both
+//!   operands, their product and `M`'s curvature along the row's normal, the last being ONE-SIDED
+//!   evidence: negative settles `B_i ⊁ 0`, while non-negative settles nothing, since `B_i` needs
+//!   `M` positive in every direction coupling to `a_i` through `B_i⁻¹` and not only along `a_i`
+//!   (gam#4571). From sweep 1 the sites may go negative, `B_i ⪰ M` fails, and the verdict is a
+//!   verdict again.
 //!
 //! # Where EP starts
 //!
@@ -118,7 +133,48 @@ pub enum ConeLaplaceRefusal {
     /// that does not pull toward the boundary.
     NotIntegrable { row: usize, cavity_precision: f64, cavity_shift: f64, sweep: usize },
     /// The continued tilted variance of a site is not positive: the constrained mode's fold.
-    Fold { row: usize, variance: f64, sweep: usize },
+    ///
+    /// It carries the cavity that produced it. The verdict is a SIGN test on a cumulant that
+    /// vanishes at the continuation's own boundary `τ_c = −μ²/2`, so a mode sitting near that
+    /// boundary returns a small negative number, and the number alone cannot say whether it is
+    /// past the fold or unresolved from zero. The cavity says which: `τ_c > 0` means the variance
+    /// is a genuine variance and a non-positive one is a degeneracy, while `τ_c ≤ 0` means it is
+    /// the principal-value continuation's formal second cumulant, read at `τ_c` against the
+    /// boundary `−ν_c²/2` (gam#4571).
+    Fold {
+        row: usize,
+        variance: f64,
+        cavity_precision: f64,
+        cavity_shift: f64,
+        /// `τ̃_i` and `Σ_ii`, the two operands the cavity precision is the difference of.
+        site_precision: f64,
+        posterior_variance: f64,
+        /// `M`'s curvature along this row's normal, `a_iᵀMa_i/a_iᵀa_i`, filled by
+        /// [`ConeLaplace::evaluate`], which is the innermost frame holding both the precision and
+        /// the caller's rows. It is evidence the verdict needs, not a diagnostic beside it, and it
+        /// is ONE-SIDED: a negative value settles that `B_i = Λ − τ̃_ia_ia_iᵀ` is not positive
+        /// definite, since `B_i ⪰ M` at sweep 0. A non-negative one settles nothing — `B_i` needs
+        /// `M` positive in every direction that couples to `a_i` through `B_i⁻¹`, not only along
+        /// `a_i` — and what separates the remaining readings is whether `τ̃_i·Σ_ii` clears 1 by
+        /// more than `κ(Λ)·ε`.
+        ///
+        /// `None` IS A STATEMENT, not a missing value: it says this refusal was raised on the
+        /// DERIVATIVE path ([`ConeLaplace::first_order`] and [`ConeLaplace::second_order`] reach
+        /// [`Self::Fold`] through the per-site jacobian without passing through `evaluate`), where
+        /// the sites are at their converged fixed point, `τ̃` may be negative, `B_i ⪰ M` fails and
+        /// `M`'s curvature along the normal discriminates nothing. Read the cavity precision
+        /// there. The term holds `Λ`, not `M`, so filling it anyway would mean a second `p × p`
+        /// residency to report a number that does not answer the question (gam#4571).
+        normal_curvature: Option<f64>,
+        /// `(max L_ii / min L_ii)²` of `Λ`'s Cholesky, a LOWER bound on `κ₂(Λ)` and so on the band
+        /// the product `τ̃_i·Σ_ii` is read against. One-sided in the direction that matters: a
+        /// product within `condition_floor·ε` of 1 means the cavity's sign is the subtraction's
+        /// FOR CERTAIN, which is the reading that makes this refusal a defect. A product outside
+        /// it is NOT thereby genuine, because a lower bound cannot establish the converse
+        /// (gam#4571).
+        condition_floor: f64,
+        sweep: usize,
+    },
     /// EP's damped update stopped moving the sites before they settled to their rounding.
     NotContracting { sweeps: usize, fraction: f64, step: f64 },
     /// A system EP's derivatives solve is singular.
@@ -145,11 +201,37 @@ impl std::fmt::Display for ConeLaplaceRefusal {
                 "constrained Laplace term: row {row}'s cavity has precision {cavity_precision:e} and \
                  shift {cavity_shift:e} at sweep {sweep}, so its half-line has no decay (gam#2765)"
             ),
-            Self::Fold { row, variance, sweep } => write!(
+            Self::Fold {
+                row,
+                variance,
+                cavity_precision,
+                cavity_shift,
+                site_precision,
+                posterior_variance,
+                normal_curvature,
+                condition_floor,
+                sweep,
+            } => write!(
                 f,
                 "constrained Laplace term: row {row}'s continued tilted variance is {variance:e} at \
-                 sweep {sweep}; the constrained mode is at a fold, outside the boundary Laplace \
-                 regime (gam#2765, gam#3173)"
+                 sweep {sweep}, from a cavity with precision {cavity_precision:e} and shift \
+                 {cavity_shift:e} against the continuation's boundary {:e}; that precision is \
+                 1/Sigma_ii - tau_i with tau_i={site_precision:e}, Sigma_ii={posterior_variance:e} \
+                 and tau_i*Sigma_ii={:.17e}, which sits {:.3e} from 1 against a band of at least \
+                 {:.3e}; M's curvature along this row's normal is {}; the constrained mode is at a \
+                 fold, outside the boundary Laplace regime (gam#2765, gam#3173, gam#4571)",
+                -0.5 * cavity_shift * cavity_shift,
+                site_precision * posterior_variance,
+                (1.0 - site_precision * posterior_variance).abs(),
+                condition_floor * f64::EPSILON,
+                normal_curvature.map_or_else(
+                    || {
+                        "not the discriminator here: this is the derivative path, where the sites \
+                         are at their fixed point and the cavity precision is what to read"
+                            .to_string()
+                    },
+                    |curvature| format!("{curvature:.9e}")
+                )
             ),
             Self::NotContracting { sweeps, fraction, step } => write!(
                 f,
@@ -243,12 +325,55 @@ struct SiteUpdate {
     jacobian: [f64; 4],
 }
 
-fn site_update(row: usize, tau_c: f64, nu_c: f64, sweep: usize) -> Result<SiteUpdate, ConeLaplaceRefusal> {
+/// The tilted log mass of a cavity that pulls toward the boundary, and nothing else.
+///
+/// `share_and_magnitude` reads this and no other cumulant, so it must not inherit the
+/// moment-matching condition [`site_update`] applies: the share is a VALUE, and `κ₂` enters only
+/// through `τ̃ = 1/κ₂ − τ_c`, which the share never forms. Reading the mass through `site_update`
+/// refused an evaluation on a quantity it does not use, and did it at sweep 0 — at the starting
+/// sites, before EP has moved anything — where the module's own premise is that the start "only
+/// selects where EP begins" and its fixed point does not depend on it (gam#4571).
+fn tilted_log_mass(
+    row: usize,
+    tau_c: f64,
+    nu_c: f64,
+    sweep: usize,
+) -> Result<f64, ConeLaplaceRefusal> {
+    // The mass needs no cumulant beyond itself, so it takes no site operands either.
+    let [log_mass, ..] =
+        half_line_gaussian_log_jet(-nu_c, tau_c).ok_or(ConeLaplaceRefusal::NotIntegrable {
+            row,
+            cavity_precision: tau_c,
+            cavity_shift: nu_c,
+            sweep,
+        })?;
+    Ok(log_mass)
+}
+
+fn site_update(
+    row: usize,
+    tau_c: f64,
+    nu_c: f64,
+    site_precision: f64,
+    posterior_variance: f64,
+    condition_floor: f64,
+    sweep: usize,
+) -> Result<SiteUpdate, ConeLaplaceRefusal> {
     let [log_mass, k1, k2, k3, k4] = half_line_gaussian_log_jet(-nu_c, tau_c).ok_or(
         ConeLaplaceRefusal::NotIntegrable { row, cavity_precision: tau_c, cavity_shift: nu_c, sweep },
     )?;
     if !(k2 > 0.0) {
-        return Err(ConeLaplaceRefusal::Fold { row, variance: k2, sweep });
+        return Err(ConeLaplaceRefusal::Fold {
+            row,
+            variance: k2,
+            cavity_precision: tau_c,
+            cavity_shift: nu_c,
+            site_precision,
+            posterior_variance,
+            normal_curvature: None,
+            condition_floor,
+            sweep,
+        });
     }
     let dk1_dtau = -0.5 * (k3 + 2.0 * k1 * k2);
     let dk2_dtau = -0.5 * (k4 + 2.0 * k2 * k2 + 2.0 * k1 * k3);
@@ -277,6 +402,8 @@ struct GaussianPart {
     normal_solves: Array2<f64>,
     sigma: Array2<f64>,
     posterior_mean: Array1<f64>,
+    /// `(max L_ii / min L_ii)²` of `Λ`'s Cholesky: a lower bound on `κ₂(Λ)`.
+    condition_floor: f64,
 }
 
 /// `Λ = M + AᵀT̃A`, `Λ⁻¹`, `ln|Λ|` and `δ̄ = Λ⁻¹h` at a set of sites.
@@ -308,7 +435,23 @@ fn site_precision(
     let factor = precision
         .cholesky(Side::Lower)
         .map_err(|_| ConeLaplaceRefusal::NotPositiveDefinite { sweep })?;
-    let log_det = 2.0 * factor.diag().iter().map(|pivot| pivot.ln()).sum::<f64>();
+    // The Cholesky's pivots, from the walk `log_det` already makes, give a FREE lower bound on
+    // `κ₂(Λ)`: `Λ_ii = Σ_{k≤i} L_ik² ≥ L_ii²` puts `max_i L_ii² ≤ λ_max`, and the i-th pivot
+    // squared is the Schur complement `1/(Λ⁻¹)_ii` with `(Λ⁻¹)_ii ≤ 1/λ_min`, so
+    // `min_i L_ii² ≥ λ_min`. Hence `(max L_ii / min L_ii)² ≤ κ₂(Λ)`. It is what the cavity's own
+    // band is denominated in, and it costs nothing beyond the reduction below (gam#4571).
+    let (mut log_det, mut widest, mut narrowest) = (0.0_f64, 0.0_f64, f64::INFINITY);
+    for pivot in factor.diag().iter() {
+        log_det += 2.0 * pivot.ln();
+        widest = widest.max(*pivot);
+        narrowest = narrowest.min(*pivot);
+    }
+    let condition_floor = if narrowest > 0.0 {
+        let ratio = widest / narrowest;
+        ratio * ratio
+    } else {
+        f64::INFINITY
+    };
     let inverse = symmetrized(&factor.solve_mat(&Array2::<f64>::eye(p)));
     let shift = Array1::from_shape_fn(q, |i| nu[i] - tau[i] * slack[i]);
     let h = rows.t().dot(&shift) - gradient;
@@ -316,7 +459,7 @@ fn site_precision(
     if !(log_det.is_finite() && mean_offset.iter().all(|value| value.is_finite())) {
         return Err(ConeLaplaceRefusal::NonFinite { what: "posterior of the sites" });
     }
-    Ok((precision, inverse, log_det, h, mean_offset))
+    Ok((precision, inverse, log_det, h, mean_offset, condition_floor))
 }
 
 fn gaussian_part(
@@ -328,7 +471,7 @@ fn gaussian_part(
     nu: &Array1<f64>,
     sweep: usize,
 ) -> Result<GaussianPart, ConeLaplaceRefusal> {
-    let (precision, inverse, log_det, h, mean_offset) =
+    let (precision, inverse, log_det, h, mean_offset, condition_floor) =
         site_precision(precision_m, gradient, rows, slack, tau, nu, sweep)?;
     let normal_solves = inverse.dot(&rows.t());
     let sigma = symmetrized(&rows.dot(&normal_solves));
@@ -336,7 +479,17 @@ fn gaussian_part(
     if !sigma.iter().all(|value| value.is_finite()) {
         return Err(ConeLaplaceRefusal::NonFinite { what: "posterior of the sites" });
     }
-    Ok(GaussianPart { precision, inverse, log_det, h, mean_offset, normal_solves, sigma, posterior_mean })
+    Ok(GaussianPart {
+        precision,
+        inverse,
+        log_det,
+        h,
+        mean_offset,
+        normal_solves,
+        sigma,
+        posterior_mean,
+        condition_floor,
+    })
 }
 
 /// `L`'s share beside `½ln|Λ|`, `−½hᵀδ̄ − Σ(ν̃d − ½τ̃d²) − Σ ln c_i`, with the summed magnitude of
@@ -374,7 +527,7 @@ fn share_and_magnitude(
             magnitude += log_cdf.abs() + gaussian.abs();
             -(log_cdf + gaussian)
         } else {
-            let tilted = site_update(i, tau_c, nu_c, sweep)?.log_mass;
+            let tilted = tilted_log_mass(i, tau_c, nu_c, sweep)?;
             let gaussian = 0.5 * (2.0 * std::f64::consts::PI / tau_p).ln() + nu_p * nu_p / (2.0 * tau_p);
             magnitude += tilted.abs() + gaussian.abs();
             -(tilted - gaussian)
@@ -485,6 +638,9 @@ pub struct ConeLaplace {
     normal_solves: Array2<f64>,
     sigma: Array2<f64>,
     posterior_mean: Array1<f64>,
+    /// A lower bound on `κ₂(Λ)` at the returned sites, for the cavity band the derivative path's
+    /// refusals are read against.
+    condition_floor: f64,
     sweeps: usize,
     fraction: f64,
     site_motion_system: std::sync::OnceLock<Result<SiteMotionSystem, ConeLaplaceRefusal>>,
@@ -622,7 +778,7 @@ impl ConeLaplace {
         }
         let all_rows = stack_rows(units, &(0..total).collect::<Vec<_>>(), p);
         let all_slack = Array1::from(slacks.clone());
-        let (_, start_inverse, _, _, start_offset) = site_precision(
+        let (_, start_inverse, _, _, start_offset, _) = site_precision(
             precision,
             gradient,
             &all_rows,
@@ -643,7 +799,50 @@ impl ConeLaplace {
         let mut tau: Vec<f64> = chosen.iter().map(|&i| start_tau[i]).collect();
         let mut nu: Vec<f64> = chosen.iter().map(|&i| start_nu[i]).collect();
         loop {
-            let term = Self::converge(&mode, &chosen, &tau, &nu)?;
+            // A fold verdict is about `M`'s curvature along ONE row's normal, and this is the
+            // innermost frame holding both the precision and the caller's rows (`converge` is
+            // handed the mode, not the rows). One matvec on the refusal path, nothing otherwise.
+            //
+            // Why this and not `M`'s smallest eigenvalue: at sweep 0 every site is `μ²` or zero,
+            // so with `B_i = Λ − τ̃_ia_ia_iᵀ` the cavity precision is `1/Σ_ii − τ̃_i =
+            // 1/(a_iᵀB_i⁻¹a_i)` exactly, and `B_i ⪰ M`. A NEGATIVE quotient therefore settles that
+            // `B_i` is not positive definite, at one matvec, where a whole-matrix eigenvalue costs
+            // a decomposition and still answers a different question — `M` can be indefinite and
+            // positive along `a_i`. The evidence is one-sided on purpose: a non-negative quotient
+            // does not give `B_i ≻ 0`, which needs `M` positive in every direction coupling to
+            // `a_i` through `B_i⁻¹`. `M`'s inertia would close it in both directions and belongs
+            // where the matrix is assembled and already factored, not here (gam#4571).
+            let term = Self::converge(&mode, &chosen, &tau, &nu).map_err(|refusal| {
+                let ConeLaplaceRefusal::Fold {
+                    row,
+                    variance,
+                    cavity_precision,
+                    cavity_shift,
+                    site_precision,
+                    posterior_variance,
+                    condition_floor,
+                    sweep,
+                    ..
+                } = refusal
+                else {
+                    return refusal;
+                };
+                let normal_curvature = chosen.get(row).map(|&unit| {
+                    let normal = all_rows.row(unit);
+                    normal.dot(&precision.dot(&normal)) / normal.dot(&normal)
+                });
+                ConeLaplaceRefusal::Fold {
+                    row,
+                    variance,
+                    cavity_precision,
+                    cavity_shift,
+                    site_precision,
+                    posterior_variance,
+                    normal_curvature,
+                    condition_floor,
+                    sweep,
+                }
+            })?;
             let mut added = false;
             for i in 0..total {
                 if !chosen.contains(&i) && standardized(&term.inverse, &term.mean_offset, i) < horizon {
@@ -700,7 +899,8 @@ impl ConeLaplace {
                 let s_jj = sigma[[j, j]];
                 let tau_c = 1.0 / s_jj - tau[j];
                 let nu_c = mean[j] / s_jj - nu[j];
-                let update = site_update(j, tau_c, nu_c, sweeps)?;
+                let update =
+                    site_update(j, tau_c, nu_c, tau[j], s_jj, part.condition_floor, sweeps)?;
                 let tau_rounding = growth * (tau_c.abs() + (tau_c + update.tau).abs());
                 let nu_rounding = growth * (nu_c.abs() + (nu_c + update.nu).abs());
                 step = step
@@ -758,6 +958,7 @@ impl ConeLaplace {
                     normal_solves: part.normal_solves,
                     sigma: part.sigma,
                     posterior_mean: part.posterior_mean,
+                    condition_floor: part.condition_floor,
                     sweeps,
                     fraction,
                     site_motion_system: std::sync::OnceLock::new(),
@@ -1026,7 +1227,16 @@ impl ConeLaplace {
                     let s_jj = sigma[[j, j]];
                     let tau_c = 1.0 / s_jj - self.tau[j];
                     let nu_c = mean[j] / s_jj - self.nu[j];
-                    let jacobian = site_update(j, tau_c, nu_c, self.sweeps)?.jacobian;
+                    let jacobian = site_update(
+                        j,
+                        tau_c,
+                        nu_c,
+                        self.tau[j],
+                        s_jj,
+                        self.condition_floor,
+                        self.sweeps,
+                    )?
+                    .jacobian;
                     let [dt_dtc, dt_dnc, dn_dtc, dn_dnc] = jacobian;
                     jacobians.push(jacobian);
                     let s2 = s_jj * s_jj;
@@ -1407,12 +1617,68 @@ mod tests {
 
     /// Past the continuation's own boundary the tilted variance changes sign: at `σ = −μ²/2` one
     /// active row's constrained mode is at a fold, refused by name.
+    ///
+    /// This fixture sits EXACTLY ON that boundary, where the variance is zero, so what it
+    /// establishes is that the code refuses AT the sign change. It does not establish that the
+    /// refusal discriminates a mode just inside it from one just past it, and a production mode
+    /// near the boundary returns a small negative number the verdict cannot separate from zero
+    /// (gam#4571). The cavity the refusal now carries is what a reader needs to tell those apart,
+    /// so it is asserted here rather than left to a `..`.
     #[test]
     fn a_fold_of_the_constrained_mode_is_refused_by_name_2765() {
         let mu = 2.0;
         let m = array![[-0.5 * mu * mu, 0.0], [0.0, 1.0]];
         let refusal = ConeLaplace::evaluate(&array![[1.0, 0.0]], &array![0.0], &array![0.0, 0.0], &array![mu, 0.0], &m)
             .expect_err("a fold is outside the boundary Laplace regime");
-        assert!(matches!(refusal, ConeLaplaceRefusal::Fold { .. }), "refused as {refusal}");
+        let ConeLaplaceRefusal::Fold {
+            variance,
+            cavity_precision,
+            cavity_shift,
+            ..
+        } = refusal
+        else {
+            panic!("refused as {refusal}");
+        };
+        assert!(
+            !(variance > 0.0),
+            "the fold verdict is the variance's sign: {variance:e}"
+        );
+        // The cavity at the starting sites is the leave-one-out precision, which for one row is
+        // `M11` itself. Carrying it is what says whether a refusal is past the boundary
+        // `-nu_c^2/2` or sitting on it.
+        assert!(
+            (cavity_precision - m[[0, 0]]).abs() <= 1e-12 * m[[0, 0]].abs(),
+            "the refusal must report the cavity that produced it: {cavity_precision:e} against \
+             M11 {:e}",
+            m[[0, 0]]
+        );
+        assert!(
+            cavity_shift.is_finite(),
+            "the cavity shift is reported, not dropped: {cavity_shift:e}"
+        );
+    }
+
+    /// The negative control the fold refusal needs: the same one-row geometry on the indefinite
+    /// side of `M11 = 0`, where the other derivative pins in this module already evaluate, must
+    /// PRICE rather than refuse. A refusal that fires on every indefinite `M` would be
+    /// indistinguishable from the one above, and the whole point of the continuation is that an
+    /// indefinite `M` is inside the regime until the boundary (gam#4571).
+    #[test]
+    fn an_indefinite_precision_inside_the_continuation_prices_rather_than_folding_4571() {
+        let mu = 2.0;
+        let m = array![[-0.02, 0.0], [0.0, 1.0]];
+        let priced = ConeLaplace::evaluate(
+            &array![[1.0, 0.0]],
+            &array![0.0],
+            &array![0.0, 0.0],
+            &array![mu, 0.0],
+            &m,
+        )
+        .expect("an indefinite precision inside the continuation is inside the regime");
+        assert!(
+            priced.value().is_finite(),
+            "the term prices a finite value there: {:e}",
+            priced.value()
+        );
     }
 }
