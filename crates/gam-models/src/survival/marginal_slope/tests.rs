@@ -7558,6 +7558,145 @@ fn rigid_survival_second_all_axes_each_matches_single_direction_979() {
     }
 }
 
+/// gam#2979: a criterion priced on the complete Jeffreys curvature contracts the trace
+/// Hessian many times at ONE coefficient snapshot — once per outer coordinate in its gradient
+/// and once per coordinate pair in its Hessian — and the rigid path rebuilds every row's
+/// order-4 primary tower for each of them. The snapshot handle builds them once.
+///
+/// Two things have to hold, and the second is what makes the first safe. Every weight the
+/// handle serves must be BIT-IDENTICAL to the per-weight entry point's matrix, since the
+/// criterion reads both routes' output as one object. And the handle must be bound to the
+/// snapshot it was prepared at: two handles prepared at different β must disagree on the same
+/// weight, which is exactly what a tower carried across a coefficient change would silently
+/// fail to do.
+#[test]
+fn rigid_survival_contracted_trace_hessian_snapshot_matches_per_weight_2979() {
+    use crate::custom_family::ContractedTraceHessianAtSnapshot;
+
+    let n = 120usize;
+    let z: Vec<f64> = (0..n).map(|r| ((r as f64) * 0.29).sin() * 0.9).collect();
+    let weights: Vec<f64> = (0..n).map(|r| 0.6 + 0.4 * ((r % 5) as f64) / 5.0).collect();
+    let event: Vec<f64> = (0..n).map(|r| ((r % 3 == 0) as u8) as f64).collect();
+
+    let p_m = 2usize;
+    let p_g = 2usize;
+    let marginal_design = Array2::from_shape_fn((n, p_m), |(r, j)| {
+        0.2 + 0.05 * (r as f64).cos() + 0.11 * (j as f64) - 0.013 * (r as f64) / (n as f64)
+    });
+    let slope_design = Array2::from_shape_fn((n, p_g), |(r, j)| {
+        0.1 + 0.07 * (r as f64).sin() - 0.09 * (j as f64) + 0.004 * (r as f64) / (n as f64)
+    });
+
+    let mut family = oracle_rigid_family(n, &z, &weights, &event, None);
+    family.marginal_design = DesignMatrix::from(marginal_design.clone());
+    family
+        .slope_layout
+        .replace_coefficient_design(DesignMatrix::from(slope_design.clone()));
+
+    let total = 1 + p_m + p_g;
+    let specs = vec![
+        dummy_blockspec(1),
+        dummy_blockspec(p_m),
+        dummy_blockspec(p_g),
+    ];
+    // beta_flat = [time(1), marginal(2), slope(2)].
+    let states_at = |beta_flat: &Array1<f64>| -> Vec<ParameterBlockState> {
+        let beta_time = beta_flat.slice(ndarray::s![0..1]).to_owned();
+        let beta_marginal = beta_flat.slice(ndarray::s![1..1 + p_m]).to_owned();
+        let beta_slope = beta_flat.slice(ndarray::s![1 + p_m..total]).to_owned();
+        let marginal_eta = marginal_design.dot(&beta_marginal);
+        let slope_eta = slope_design.dot(&beta_slope);
+        vec![
+            ParameterBlockState {
+                beta: beta_time,
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: beta_marginal,
+                eta: marginal_eta,
+            },
+            ParameterBlockState {
+                beta: beta_slope,
+                eta: slope_eta,
+            },
+        ]
+    };
+
+    // Three distinct symmetric weights, as a completion drift's `W₀` and `W₁` are: the handle
+    // must be asked more than once, or the build-once claim is untested.
+    let trace_weights: Vec<Array2<f64>> = (0..3usize)
+        .map(|k| {
+            let raw = Array2::from_shape_fn((total, total), |(i, j)| {
+                ((i * 7 + j * 11 + 2 + 5 * k) % 13) as f64 * 0.1 - 0.6
+            });
+            (&raw + &raw.t()).mapv(|value| value * 0.5)
+        })
+        .collect();
+
+    let beta0 = array![0.6, 0.18, -0.12, -0.2, 0.13];
+    let beta1 = array![0.55, 0.21, -0.07, -0.17, 0.09];
+
+    for (snapshot, beta) in [&beta0, &beta1].into_iter().enumerate() {
+        let states = states_at(beta);
+        let prepared = family
+            .joint_jeffreys_information_contracted_trace_hessian_at_snapshot(&states, &specs)
+            .expect("snapshot handle call")
+            .expect("the rigid path must hand out a snapshot handle");
+        for (index, weight) in trace_weights.iter().enumerate() {
+            let per_weight = family
+                .joint_jeffreys_information_contracted_trace_hessian_with_specs(
+                    &states, &specs, weight,
+                )
+                .expect("per-weight contracted trace Hessian call")
+                .expect("the rigid path must supply the contracted trace Hessian");
+            let batched = prepared
+                .contract(weight)
+                .expect("snapshot contraction call")
+                .expect("the rigid path's handle must supply the contracted trace Hessian");
+            assert_eq!(batched.dim(), (total, total));
+            assert!(
+                per_weight.iter().any(|value| value.abs() > 1.0e-3),
+                "snapshot {snapshot} weight {index}: the fixture must exercise a nonzero \
+                 contraction"
+            );
+            for (position, (left, right)) in batched.iter().zip(per_weight.iter()).enumerate() {
+                assert_eq!(
+                    left.to_bits(),
+                    right.to_bits(),
+                    "snapshot {snapshot} weight {index} entry {position}: the snapshot handle \
+                     gave {left:e}, the per-weight entry point {right:e}"
+                );
+            }
+        }
+    }
+
+    // The positive control for the claim above: the two snapshots' contractions of ONE weight
+    // must differ, so a handle that answered for a β it was not built at would be caught here.
+    let prepared_0 = family
+        .joint_jeffreys_information_contracted_trace_hessian_at_snapshot(&states_at(&beta0), &specs)
+        .expect("snapshot handle call")
+        .expect("the rigid path must hand out a snapshot handle");
+    let prepared_1 = family
+        .joint_jeffreys_information_contracted_trace_hessian_at_snapshot(&states_at(&beta1), &specs)
+        .expect("snapshot handle call")
+        .expect("the rigid path must hand out a snapshot handle");
+    let at_0 = prepared_0
+        .contract(&trace_weights[0])
+        .expect("snapshot contraction call")
+        .expect("served");
+    let at_1 = prepared_1
+        .contract(&trace_weights[0])
+        .expect("snapshot contraction call")
+        .expect("served");
+    assert!(
+        at_0.iter()
+            .zip(at_1.iter())
+            .any(|(left, right)| left.to_bits() != right.to_bits()),
+        "the fixture's two coefficient snapshots must give different contractions, or the \
+         snapshot-binding control is inert"
+    );
+}
+
 /// gam#2894: the contracted trace Hessian's first and second directional derivatives,
 /// which the outer gradient and Hessian of a criterion priced on the complete Jeffreys
 /// curvature read, checked against central differences of the exact contracted trace

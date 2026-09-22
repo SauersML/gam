@@ -590,8 +590,10 @@ impl<const K: usize, const LIN: u32> gam_math::nested_dual::JetField for SparseT
 
 /// Read access to the third tensor of whichever order-≤3 tower a frame
 /// declares, so the all-axes paths are generic over the tower's static
-/// sparsity: the Gaussian frames elide the affine location blocks
-/// ([`RIGID_LINEAR_MASK`]), the anchored frame is dense (gam#2923).
+/// sparsity: the Gaussian frames elide the three affine location blocks
+/// ([`RIGID_LINEAR_MASK`]), and the anchored frame — nonlinear in both location
+/// channels through `α(q, b)` — elides `q̇₁`'s alone
+/// ([`ANCHORED_LINEAR_MASK`], gam#2928). It is not dense.
 pub(crate) trait SparseThird<const K: usize> {
     fn t3(&self) -> &[[[f64; K]; K]; K];
 }
@@ -2203,7 +2205,47 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
                 weight.dim()
             ));
         }
-        let towers = self.build_row_towers(&crate::row_kernel::RowSet::All)?;
+        let towers = self.all_row_primary_towers()?;
+        self.contracted_trace_hessian_from_towers(weight, &towers)
+    }
+
+    /// Every row's order-4 primary tower at this kernel's coefficient snapshot: one
+    /// [`Self::build_row_towers`] over [`crate::row_kernel::RowSet::All`], the form
+    /// [`Self::contracted_trace_hessian_from_towers`] reads.
+    pub(crate) fn all_row_primary_towers(&self) -> Result<Vec<G::Tower4>, String> {
+        self.build_row_towers(&crate::row_kernel::RowSet::All)
+    }
+
+    /// [`Self::contracted_trace_hessian`] against towers already built at THIS kernel's
+    /// coefficient snapshot (gam#2979).
+    ///
+    /// `∇²_β tr(W · H(β))` is linear in `W`, and the towers are the row program's fourth
+    /// derivative at `β` alone — the weight is projected into the row's primary space and
+    /// contracted against them afterwards. So a batch of trace weights taken at one snapshot
+    /// shares ONE build, exactly as a batch of directions does in
+    /// [`Self::second_directional_derivative_all_axes_each`]. The row pass, the per-row
+    /// projection and the deterministic `ARROW_ROW_CHUNK` fold order below are the entry
+    /// point's own, so each weight's matrix is bit-for-bit what
+    /// [`Self::contracted_trace_hessian`] returns for it.
+    pub(crate) fn contracted_trace_hessian_from_towers(
+        &self,
+        weight: &Array2<f64>,
+        towers: &[G::Tower4],
+    ) -> Result<Array2<f64>, String> {
+        let p = self.n_coefficients();
+        if weight.dim() != (p, p) {
+            return Err(format!(
+                "SurvivalMarginalSlopeRowKernel::contracted_trace_hessian_from_towers: weight shape {:?} != ({p}, {p})",
+                weight.dim()
+            ));
+        }
+        let n = gam_math::jet_tower::RowProgram::n_rows(self);
+        if towers.len() != n {
+            return Err(format!(
+                "SurvivalMarginalSlopeRowKernel::contracted_trace_hessian_from_towers: {} towers for {n} rows",
+                towers.len()
+            ));
+        }
         self.chunked_pullback_reduce(p, |row, acc| -> Result<(), String> {
             let w_row = self.primary_trace_weight(row, weight)?;
             let t4 = towers[row].t4();

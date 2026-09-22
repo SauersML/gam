@@ -6,6 +6,49 @@
 use super::*;
 use gam_problem::ConstraintSet;
 
+/// [`SurvivalMarginalSlopeFamily`]'s contracted trace Hessian prepared at ONE coefficient
+/// snapshot (gam#2979): the rigid row kernel that contracts it, and that kernel's order-4 row
+/// towers.
+///
+/// The towers are the row program's fourth derivative at the snapshot's `β`; the trace weight is
+/// projected into each row's primary space and contracted against them afterwards. They are
+/// therefore what a batch of weights at one snapshot shares, and the kernel owns the snapshot,
+/// so this handle cannot be asked about any other `β`.
+///
+/// The build happens on the FIRST contraction, not at preparation: a completion drift that is
+/// prepared and never asked for a weight pays nothing, which is what the per-weight entry point
+/// costs today. Two threads that race the first contraction may both build; the build is a pure
+/// function of the owned snapshot, so the loser's towers are bit-identical to the winner's and
+/// are dropped.
+struct SurvivalSnapshotTraceHessian<const P: usize, G: SlopeRowGeometry<P>> {
+    kernel: SurvivalMarginalSlopeRowKernel<P, G>,
+    towers: std::sync::OnceLock<Vec<G::Tower4>>,
+}
+
+impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalSnapshotTraceHessian<P, G> {
+    /// This snapshot's row towers, built once.
+    fn towers(&self) -> Result<&[G::Tower4], String> {
+        if let Some(towers) = self.towers.get() {
+            return Ok(towers.as_slice());
+        }
+        let built = self.kernel.all_row_primary_towers()?;
+        let _ = self.towers.set(built);
+        self.towers.get().map(Vec::as_slice).ok_or_else(|| {
+            "survival marginal-slope snapshot trace Hessian lost its row towers".to_string()
+        })
+    }
+}
+
+impl<const P: usize, G: SlopeRowGeometry<P>> crate::custom_family::ContractedTraceHessianAtSnapshot
+    for SurvivalSnapshotTraceHessian<P, G>
+{
+    fn contract(&self, weight: &Array2<f64>) -> Result<Option<Array2<f64>>, String> {
+        self.kernel
+            .contracted_trace_hessian_from_towers(weight, self.towers()?)
+            .map(Some)
+    }
+}
+
 impl crate::custom_family::JeffreysThirdInformationDerivative for SurvivalMarginalSlopeFamily {
     fn third_directional_all_axes(
         &self,
@@ -938,6 +981,47 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     /// `gam-custom-family/src/jeffreys.rs`).
     fn joint_jeffreys_information_contracted_trace_hessian_available(&self) -> bool {
         true
+    }
+
+    /// gam#2979: the rigid path's contracted trace Hessian builds every row's order-4 primary
+    /// tower, and the tower reads the coefficient snapshot ALONE. The completion drifts ask for
+    /// the contraction once per outer coordinate and once per coordinate pair at one snapshot
+    /// (gam#2894), so handing out a snapshot handle turns those `k + k(k+1)/2` builds into one.
+    ///
+    /// The gate is
+    /// [`Self::joint_jeffreys_information_contracted_trace_hessian_with_specs`]'s own, in its
+    /// order, so a configuration that refuses the contraction per weight also has no handle and
+    /// the caller falls back to that same refusal. On the rigid path the handle's `contract`
+    /// returns exactly what the per-weight entry point returns for the same weight.
+    fn joint_jeffreys_information_contracted_trace_hessian_at_snapshot(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Arc<dyn crate::custom_family::ContractedTraceHessianAtSnapshot>>, String>
+    {
+        if !self.outer_default_trustworthy_for_joint_hessian(specs)
+            && !self.joint_hessian_is_structurally_coupled(block_states)?
+        {
+            return Ok(None);
+        }
+        if self.per_z_slope_active()
+            || self.effective_flex_active(block_states)?
+            || self.flex_timewiggle_active()
+        {
+            return Ok(None);
+        }
+        in_slope_frame!(self, P, Frame, {
+            let kernel = SurvivalMarginalSlopeRowKernel::<P, Frame>::new(
+                self.clone(),
+                block_states.to_vec(),
+            );
+            let prepared: Arc<dyn crate::custom_family::ContractedTraceHessianAtSnapshot> =
+                Arc::new(SurvivalSnapshotTraceHessian::<P, Frame> {
+                    kernel,
+                    towers: std::sync::OnceLock::new(),
+                });
+            Ok(Some(prepared))
+        })
     }
 
     fn exact_newton_joint_psi_terms(

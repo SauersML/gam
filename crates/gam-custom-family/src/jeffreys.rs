@@ -453,6 +453,68 @@ pub(crate) fn custom_family_joint_jeffreys_term_with_exact_completion<
     Ok(Some((phi, gradient, hphi, completion)))
 }
 
+/// One coefficient snapshot's contracted trace Hessian, taken through the family's snapshot
+/// handle where it has one and through the per-weight entry point where it does not (gam#2979).
+///
+/// The completion drifts read `⟨W, D²I_J[e_a, e_b]⟩` once per outer coordinate in the gradient
+/// and once per coordinate PAIR in the Hessian, at one `β` (gam#2894), and the ψ calculus reads
+/// it once per ψ axis, ψ pair and mixed β-ψ direction of the same snapshot. Every one of those
+/// weights is a different matrix, so nothing about the WEIGHT can be shared; what a row-kernel
+/// family shares is the per-row derivative tensor the weight is contracted against, which is a
+/// function of `β` alone. [`CustomFamily::joint_jeffreys_information_contracted_trace_hessian_at_snapshot`]
+/// hands out a handle that owns that snapshot and builds the tensor at most once.
+///
+/// The handle is resolved on the FIRST contraction, so a drift that is built and never asked for
+/// a weight costs what it costs today, and a family that refuses the contraction refuses it in
+/// the same place and with the same error as the per-weight entry point.
+pub(crate) struct ContractedTraceHessianBatch<F> {
+    family: Arc<F>,
+    states: Arc<Vec<ParameterBlockState>>,
+    specs: Arc<Vec<ParameterBlockSpec>>,
+    snapshot: std::sync::OnceLock<Option<Arc<dyn ContractedTraceHessianAtSnapshot>>>,
+}
+
+impl<F: CustomFamily> ContractedTraceHessianBatch<F> {
+    /// The batch of trace weights taken at `states`. Nothing is asked of the family here.
+    pub(crate) fn new(
+        family: Arc<F>,
+        states: Arc<Vec<ParameterBlockState>>,
+        specs: Arc<Vec<ParameterBlockSpec>>,
+    ) -> Self {
+        Self {
+            family,
+            states,
+            specs,
+            snapshot: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// `∇²_β tr(W · I_J(β))` at this snapshot, exactly as
+    /// [`CustomFamily::joint_jeffreys_information_contracted_trace_hessian_with_specs`] returns
+    /// it for the same weight, `None` included.
+    pub(crate) fn contract(&self, weight: &Array2<f64>) -> Result<Option<Array2<f64>>, String> {
+        if self.snapshot.get().is_none() {
+            let prepared = self
+                .family
+                .joint_jeffreys_information_contracted_trace_hessian_at_snapshot(
+                    &self.states,
+                    &self.specs,
+                )?;
+            let _ = self.snapshot.set(prepared);
+        }
+        match self.snapshot.get() {
+            Some(Some(prepared)) => prepared.contract(weight),
+            _ => self
+                .family
+                .joint_jeffreys_information_contracted_trace_hessian_with_specs(
+                    &self.states,
+                    &self.specs,
+                    weight,
+                ),
+        }
+    }
+}
+
 /// The exact second-order Jeffreys completion `−½·G·⟨Z_J K Z_Jᵀ, H''⟩` plus the
 /// gate/floor motion, at one information snapshot.
 ///
@@ -759,6 +821,18 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
     let strength = family.joint_jeffreys_term_strength();
     let states_owned = Arc::new(states.to_vec());
     let specs_owned = Arc::new(specs.to_vec());
+    // gam#2979: every contraction of the trace Hessian reachable from this drift object is
+    // taken at THIS snapshot — the `k` deltas of a batched outer gradient, the single delta of
+    // each `hessian_derivative_correction`, and the `k(k+1)/2` pairs of the outer Hessian. The
+    // handle belongs to the snapshot for the same reason `prepare_base` does, so a family whose
+    // contraction builds a per-row object out of `β` alone builds it once for all of them
+    // instead of once per weight. Resolved on the first contraction, so an object that is built
+    // and never asked for a weight pays nothing.
+    let contracted_batch = Arc::new(ContractedTraceHessianBatch::new(
+        Arc::clone(&family_owned),
+        Arc::clone(&states_owned),
+        Arc::clone(&specs_owned),
+    ));
     let family_second = Arc::clone(&family_owned);
     let states_second = Arc::clone(&states_owned);
     let specs_second = Arc::clone(&specs_owned);
@@ -827,6 +901,7 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
                 Arc::clone(&family_owned),
                 Arc::clone(&states_owned),
                 Arc::clone(&specs_owned),
+                Arc::clone(&contracted_batch),
             )
         });
     let completion_beta = {
@@ -1094,7 +1169,7 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
         Option<CompletionDriftFn>,
         Option<CompletionSecondDriftFn>,
     ) = match completion_derivatives {
-        Some((prepare, family, states, specs)) => {
+        Some((prepare, family, states, specs, contracted_batch)) => {
             let missing = |derivative: &str| {
                 CustomFamilyError::trial_point(format!(
                     "a criterion priced on the complete Jeffreys curvature requires exact \
@@ -1102,11 +1177,12 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
                 ))
             };
             let completion_first: CompletionDriftFn = {
-                let (prepare, family, states, specs) = (
+                let (prepare, family, states, specs, contracted_batch) = (
                     Arc::clone(&prepare),
                     Arc::clone(&family),
                     Arc::clone(&states),
                     Arc::clone(&specs),
+                    Arc::clone(&contracted_batch),
                 );
                 Arc::new(move |deltas: &[Array1<f64>]| {
                     let base = prepare()?;
@@ -1149,15 +1225,11 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
                                 .ok_or_else(|| missing("first information derivatives"))?;
                             let contracted =
                                 |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
-                                    family
-                                        .joint_jeffreys_information_contracted_trace_hessian_with_specs(
-                                            &states, &specs, weight,
-                                        )?
-                                        .ok_or_else(|| {
-                                            "priced Jeffreys completion requires the contracted \
-                                             trace Hessian"
-                                                .to_string()
-                                        })
+                                    contracted_batch.contract(weight)?.ok_or_else(|| {
+                                        "priced Jeffreys completion requires the contracted \
+                                         trace Hessian"
+                                            .to_string()
+                                    })
                                 };
                             let along = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
                                 family
@@ -1257,15 +1329,11 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
                                 .ok_or_else(|| missing("second information derivatives"))?;
                             let contracted =
                                 |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
-                                    family
-                                        .joint_jeffreys_information_contracted_trace_hessian_with_specs(
-                                            &states, &specs, weight,
-                                        )?
-                                        .ok_or_else(|| {
-                                            "priced Jeffreys completion requires the contracted \
-                                             trace Hessian"
-                                                .to_string()
-                                        })
+                                    contracted_batch.contract(weight)?.ok_or_else(|| {
+                                        "priced Jeffreys completion requires the contracted \
+                                         trace Hessian"
+                                            .to_string()
+                                    })
                                 };
                             let along = |weight: &Array2<f64>,
                                          direction: &Array1<f64>|

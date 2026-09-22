@@ -344,6 +344,32 @@ pub trait JeffreysCompletionOuterDerivatives {
     ) -> Result<Option<Array2<f64>>, String>;
 }
 
+/// A family's contracted trace Hessian
+/// ([`CustomFamily::joint_jeffreys_information_contracted_trace_hessian_with_specs`]) prepared at
+/// ONE coefficient snapshot, so a batch of trace weights taken at that snapshot shares whatever
+/// the contraction builds out of `β` alone (gam#2979).
+///
+/// `⟨W, D²I_J[e_a, e_b]⟩` is linear in `W`, and for a row-kernel family the per-row derivative
+/// tensor it contracts is a function of the coefficient snapshot alone: the weight is contracted
+/// against that tensor after it is built. A criterion priced on the complete Jeffreys curvature
+/// asks for the contraction once per outer coordinate in its gradient and once per coordinate
+/// PAIR in its Hessian, every one of them at the same `β` (gam#2894), and the per-weight entry
+/// point rebuilds the tensor for each.
+///
+/// A handle OWNS the snapshot it was prepared at, so it cannot answer for a `β` it was not built
+/// at. That is the difference between this and a memo: a memo is only as good as its key, and
+/// gam#2515 records what a fingerprint over an allocation is worth as an identity. Here the
+/// caller cannot even express the question that would return the wrong derivative.
+///
+/// [`Self::contract`] returns exactly what the per-weight entry point returns for the same weight
+/// at the same snapshot, `None` included.
+pub trait ContractedTraceHessianAtSnapshot: Send + Sync {
+    /// `∇²_β tr(W · I_J(β))` at the prepared snapshot, for a symmetric weight `W` that need not
+    /// be PSD. `None` declares the contraction unavailable there, exactly as the per-weight entry
+    /// point does.
+    fn contract(&self, weight: &Array2<f64>) -> Result<Option<Array2<f64>>, String>;
+}
+
 /// A family whose outer searches run as independent members of a parallel
 /// multistart (gnomon#2359): each seed searches on its own member, and the
 /// multistart starts a search only once the memory governor has granted its
@@ -2110,6 +2136,29 @@ pub trait CustomFamily {
     /// fallback. Default `false` preserves the historical width cap exactly.
     fn joint_jeffreys_information_contracted_trace_hessian_available(&self) -> bool {
         false
+    }
+
+    /// [`Self::joint_jeffreys_information_contracted_trace_hessian_with_specs`] prepared for a
+    /// BATCH of trace weights at one coefficient snapshot: see
+    /// [`ContractedTraceHessianAtSnapshot`] (gam#2979).
+    ///
+    /// The default returns `None`, which declares that this family has nothing to share between
+    /// the weights of a snapshot, and every caller stays on the per-weight entry point. A family
+    /// whose contraction builds a per-row object out of `block_states` alone returns a handle
+    /// that builds it at most once and contracts every weight of the batch against it.
+    ///
+    /// A `None` here says nothing about AVAILABILITY. It means only that there is no batched
+    /// form, so the caller takes the per-weight entry point and whatever that returns — a matrix
+    /// or a refusal — is unchanged. A family that hands out a handle must make it agree with the
+    /// per-weight entry point weight by weight, since a criterion reads the two routes' output
+    /// as one object.
+    fn joint_jeffreys_information_contracted_trace_hessian_at_snapshot(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Arc<dyn ContractedTraceHessianAtSnapshot>>, String> {
+        let _ = (block_states, specs);
+        Ok(None)
     }
 
     /// Whether [`Self::joint_jeffreys_information_with_specs`] is the SAME

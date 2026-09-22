@@ -221,6 +221,16 @@ fn prepare_explicit_jeffreys_curvature_drifts<F: CustomFamily + Clone + Send + S
     let family = Arc::new(family.clone());
     let states = Arc::new(states.to_vec());
     let specs = Arc::new(specs.to_vec());
+    // gam#2979: the completion drifts below contract the trace Hessian once per ψ axis, once
+    // per ψ PAIR and once per mixed β-ψ direction, all at THIS snapshot. A family whose
+    // contraction builds a per-row object out of `β` alone builds it once for every one of
+    // them; the handle is resolved on the first contraction, so a drift set that is never
+    // asked for a weight costs what the per-weight entry point costs today.
+    let contracted_batch = Arc::new(crate::jeffreys::ContractedTraceHessianBatch::new(
+        family.clone(),
+        states.clone(),
+        specs.clone(),
+    ));
     let strength = family.joint_jeffreys_term_strength();
     let psi_pair = {
         let (base, first, first_axes, family, states, specs, layout, workspace) = (
@@ -333,13 +343,11 @@ fn prepare_explicit_jeffreys_curvature_drifts<F: CustomFamily + Clone + Send + S
     // one pass, the completion's first-drift algebra forms it directly from `∂_ψ H_info`; elsewhere
     // every column is the exact action above along one coefficient axis.
     let completion_psi_partial: CompletionPsiPartial = {
-        let (base, first, first_axes, family, states, specs, workspace, completion_psi) = (
+        let (base, first, first_axes, contracted_batch, workspace, completion_psi) = (
             base.clone(),
             first.clone(),
             first_axes.clone(),
-            family.clone(),
-            states.clone(),
-            specs.clone(),
+            contracted_batch.clone(),
             workspace.clone(),
             Arc::clone(&completion_psi),
         );
@@ -365,11 +373,9 @@ fn prepare_explicit_jeffreys_curvature_drifts<F: CustomFamily + Clone + Send + S
                         None
                     };
                     let contracted = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
-                        family
-                            .joint_jeffreys_information_contracted_trace_hessian_with_specs(&states, &specs, weight)?
-                            .ok_or_else(|| {
-                                "priced Jeffreys completion requires the contracted trace Hessian".to_string()
-                            })
+                        contracted_batch.contract(weight)?.ok_or_else(|| {
+                            "priced Jeffreys completion requires the contracted trace Hessian".to_string()
+                        })
                     };
                     let along = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
                         ws.contracted_trace_hessian_psi(psi, weight)?.ok_or_else(|| {
@@ -412,13 +418,11 @@ fn prepare_explicit_jeffreys_curvature_drifts<F: CustomFamily + Clone + Send + S
     ) = match workspace.as_ref().filter(|_| every_axis_served) {
         Some(ws) => {
             let pair: CompletionPsiPair = {
-                let (base, first, first_axes, family, states, specs, ws) = (
+                let (base, first, first_axes, contracted_batch, ws) = (
                     base.clone(),
                     first.clone(),
                     first_axes.clone(),
-                    family.clone(),
-                    states.clone(),
-                    specs.clone(),
+                    contracted_batch.clone(),
                     Arc::clone(ws),
                 );
                 Arc::new(move |psi_i, psi_j| {
@@ -465,11 +469,9 @@ fn prepare_explicit_jeffreys_curvature_drifts<F: CustomFamily + Clone + Send + S
                         (None, None, None)
                     };
                     let contracted = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
-                        family
-                            .joint_jeffreys_information_contracted_trace_hessian_with_specs(&states, &specs, weight)?
-                            .ok_or_else(|| {
-                                "priced Jeffreys completion requires the contracted trace Hessian".to_string()
-                            })
+                        contracted_batch.contract(weight)?.ok_or_else(|| {
+                            "priced Jeffreys completion requires the contracted trace Hessian".to_string()
+                        })
                     };
                     let along_i = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
                         ws.contracted_trace_hessian_psi(psi_i, weight)?.ok_or_else(|| {
@@ -503,13 +505,14 @@ fn prepare_explicit_jeffreys_curvature_drifts<F: CustomFamily + Clone + Send + S
                 })
             };
             let beta: CompletionBetaPsi = {
-                let (base, first, first_axes, family, states, specs, ws) = (
+                let (base, first, first_axes, family, states, specs, contracted_batch, ws) = (
                     base.clone(),
                     first.clone(),
                     first_axes.clone(),
                     family.clone(),
                     states.clone(),
                     specs.clone(),
+                    contracted_batch.clone(),
                     Arc::clone(ws),
                 );
                 Arc::new(move |psi, direction: &Array1<f64>| {
@@ -551,11 +554,9 @@ fn prepare_explicit_jeffreys_curvature_drifts<F: CustomFamily + Clone + Send + S
                         (None, None, None)
                     };
                     let contracted = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
-                        family
-                            .joint_jeffreys_information_contracted_trace_hessian_with_specs(&states, &specs, weight)?
-                            .ok_or_else(|| {
-                                "priced Jeffreys completion requires the contracted trace Hessian".to_string()
-                            })
+                        contracted_batch.contract(weight)?.ok_or_else(|| {
+                            "priced Jeffreys completion requires the contracted trace Hessian".to_string()
+                        })
                     };
                     let along_psi = |weight: &Array2<f64>| -> Result<Array2<f64>, String> {
                         ws.contracted_trace_hessian_psi(psi, weight)?.ok_or_else(|| {
