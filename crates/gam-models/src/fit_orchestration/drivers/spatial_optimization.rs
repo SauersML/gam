@@ -2852,6 +2852,67 @@ fn spatial_realized_radial_chart_shape(metadata: &BasisMetadata) -> Option<(usiz
     }
 }
 
+/// Which identifiability a spatial replay spec carries, for diagnostics.
+///
+/// THREE CARRIERS DECIDE A SPATIAL TERM'S WIDTH, AND A WIDTH REFUSAL HAS TO SAY
+/// WHICH ONE MOVED (gam#2959). A term-local rebuild reproduces the collection's
+/// column count only if every ψ-invariant narrowing the collection applied
+/// travels on the replay spec: the data-metric radial chart `V`
+/// ([`spatial_frozen_radial_chart_shape`]), the identifiability transform read
+/// here, and the joint-null absorption rotation `Q`
+/// ([`spatial_joint_null_rotation_shape`]). Each is persisted by a DIFFERENT
+/// line of `freeze_term_collection_from_design`, each fails independently, and
+/// each has its own repair.
+///
+/// `orthogonal_to_parametric` is the one value that is not self-contained: it
+/// names a policy whose execution belongs to the collection's global
+/// parametric-orthogonality pass, which a term-local rebuild does not run
+/// (`smooth_requires_parametric_orthogonality`). A replay spec still carrying it
+/// therefore rebuilds UNCENTERED and one column wide, at every ψ including the
+/// seed — which is not a property of the trial and cannot be retreated from.
+fn spatial_frozen_identifiability_kind(termspec: &SmoothTermSpec) -> String {
+    use gam_terms::basis::SpatialIdentifiability as Spatial;
+    let spatial = |id: &Spatial| match id {
+        Spatial::None => "none".to_string(),
+        Spatial::OrthogonalToParametric => "orthogonal_to_parametric".to_string(),
+        Spatial::FrozenTransform { transform } => {
+            let (rows, cols) = transform.dim();
+            format!("frozen_transform({rows}x{cols})")
+        }
+    };
+    match &termspec.basis {
+        SmoothBasisSpec::Duchon { spec, .. } => spatial(&spec.identifiability),
+        SmoothBasisSpec::ThinPlate { spec, .. } => spatial(&spec.identifiability),
+        SmoothBasisSpec::Matern { spec, .. } => match &spec.identifiability {
+            MaternIdentifiability::FrozenTransform { transform } => {
+                let (rows, cols) = transform.dim();
+                format!("frozen_transform({rows}x{cols})")
+            }
+            other => format!("{other:?}"),
+        },
+        _ => "n/a".to_string(),
+    }
+}
+
+/// A joint-null absorption `Q` as `(rows, cols, joint_nullity)`, for diagnostics.
+///
+/// `Q` is the third ψ-invariant narrowing (see
+/// [`spatial_frozen_identifiability_kind`]). The rotation itself is SQUARE
+/// `p × p` with the joint-null directions ordered last, so the width it costs is
+/// `joint_nullity`, not a shrunk column count — which is why the nullity travels
+/// beside the shape here. A rebuild that DERIVES its own `Q` instead of
+/// replaying the frozen one can resolve a different `joint_nullity` at the trial
+/// ψ, and one direction's difference is exactly the observed
+/// `rebuilt_cols = cached_cols + 1`.
+fn spatial_joint_null_rotation_shape(
+    rotation: Option<&gam_terms::basis::JointNullRotation>,
+) -> Option<(usize, usize, usize)> {
+    rotation.map(|rot| {
+        let (rows, cols) = rot.rotation.dim();
+        (rows, cols, rot.joint_nullity)
+    })
+}
+
 fn rebuild_smooth_auxiliary_state(
     smooth: &mut SmoothDesign,
     dropped_penaltyinfo_by_term: &[Vec<DroppedPenaltyBlockInfo>],
@@ -3990,11 +4051,25 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
 
         // What this trial was rebuilt FROM, so a shape refusal downstream names
         // the trial rather than only its arithmetic (gam#2760).
+        // All THREE ψ-invariant narrowings, not just the radial chart (gam#2959).
+        // A width refusal that reports only the two totals cannot say which
+        // carrier failed to replay, and they have three different repairs; the
+        // #2760 note below already makes this argument one level down, for the
+        // two halves of the gauge. Measured cost of not having them: every
+        // Duchon ψ/κ finite-difference fixture refuses at its first trial with
+        // `rebuilt_cols = cached_cols + 1`, and the message names a lost chart
+        // direction — the opposite of a rebuild that is one column WIDER — so
+        // the run says the mismatch happened and nothing about why.
         let trial_report = format!(
             "psi={psi:?}, length_scale={next_length_scale:?}, geometry_cached={geometry_cached}, \
-             frozen_radial_chart={:?}, realized_radial_chart={:?}, local_cols={}",
+             frozen_radial_chart={:?}, realized_radial_chart={:?}, \
+             frozen_identifiability={}, frozen_joint_null={:?}, realized_joint_null={:?}, \
+             local_cols={}",
             spatial_frozen_radial_chart_shape(&build_spec),
             spatial_realized_radial_chart_shape(&local.metadata),
+            spatial_frozen_identifiability_kind(&build_spec),
+            spatial_joint_null_rotation_shape(build_spec.joint_null_rotation.as_ref()),
+            spatial_joint_null_rotation_shape(local.joint_null_rotation.as_ref()),
             local.design.ncols(),
         );
         // The n×k realization is the trial's dominant cost and had no timer of
@@ -4168,6 +4243,51 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 return Err(EstimationError::InvalidInput(format!(
                     "{reason}. A fixed collection coefficient chart cannot change width; the \
                      replay is not the collection-gauged model (gam#2760)"
+                )));
+            }
+            // NARROWER and WIDER are not the same finding (gam#2959). The old
+            // text said "loses a numerical chart direction" for both, and every
+            // observed instance was the other one: the Duchon ψ/κ
+            // finite-difference fixtures all refuse with
+            // `rebuilt_cols = cached_cols + 1`, at a ψ a hair off the seed, so
+            // the rebuild GAINED the column the collection does not carry. A
+            // rebuild that is wider has not lost a direction; it has failed to
+            // apply a narrowing the collection applied, and the three carriers
+            // that narrowing can travel on are now in `trial_report` above.
+            if design_local.ncols() > coeff_range.len() {
+                // A WIDER rebuild IS NOT A TRIAL-POINT PROPERTY (gam#2959), and
+                // that is why this arm is an error rather than a refusal.
+                //
+                // `TrialPointRefused` tells the outer κ/ψ search that the model
+                // does not exist AT THIS ψ, so it retreats and tries another.
+                // That is right for a basis that loses a direction at one ψ. It
+                // is wrong here: every ψ-invariant narrowing the collection
+                // applied is, by definition, not a function of ψ, so a rebuild
+                // that fails to apply one fails to apply it everywhere. Measured
+                // on the run this was found in: the mismatch reproduces at the
+                // SEED itself — `psi=[-0.0], length_scale=Some(1.0),
+                // geometry_cached=true` gives the same `local_cols=8` against a
+                // 7-column slot as `psi=[-0.004]` does — so there is no ψ to
+                // retreat to. Refusing it per trial made a search burn every
+                // trial and report a ψ boundary that does not exist, which is
+                // what roughly twenty Duchon fixtures observed: all of them die
+                // at their FIRST trial.
+                //
+                // The narrower case keeps its refusal below: a realized basis
+                // CAN resolve one fewer direction at a particular ψ, and
+                // retreating from that ψ is the correct response.
+                return Err(EstimationError::InvalidInput(format!(
+                    "{reason}. The rebuild is WIDER than the collection's slot, so it did not \
+                     lose a chart direction — it did not apply a narrowing the collection \
+                     applied. That narrowing is ψ-invariant, so no trial point can satisfy this \
+                     and the search must not retreat from it. Exactly one of the three carriers \
+                     failed to replay: the data-metric radial chart `V` (compare \
+                     frozen_radial_chart with realized_radial_chart), the identifiability \
+                     transform (a frozen_identifiability of `orthogonal_to_parametric` names a \
+                     policy the COLLECTION executes, and the term-local builder DOWNGRADES it to \
+                     `None` and returns a raw uncentered design, so nothing narrows it here at \
+                     any ψ), or the joint-null absorption `Q` (compare frozen_joint_null with \
+                     realized_joint_null) (gam#2959)"
                 )));
             }
             return Err(EstimationError::TrialPointRefused {
