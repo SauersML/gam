@@ -110,7 +110,8 @@ fn a_pullback_mirrored_in_place_is_what_the_strict_symmetry_gate_accepts_1561() 
     // The two values the survival census recorded on the production refusal:
     // one ulp apart, which is what two independent accumulations of one real
     // number differ by.
-    let mut h = array![[1.0, -0.024554355106785223], [-0.024554355106785226, 2.0]];
+    let mut h: ndarray::Array2<f64> =
+        array![[1.0, -0.024554355106785223], [-0.024554355106785226, 2.0]];
     assert_ne!(
         h[[0, 1]].to_bits(),
         h[[1, 0]].to_bits(),
