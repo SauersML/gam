@@ -82,11 +82,9 @@ pub(crate) use gam::geometry::sinkhorn_barycenter::{
 
 pub(crate) use gam::report::render_html;
 
-pub(crate) use gam::terms::smooth::{TermCollectionSpec, smooth_term_feature_cols};
+pub(crate) use gam::terms::smooth::TermCollectionSpec;
 // #1521: relocated DOWN into gam_terms::smooth (was families::...::drivers).
-pub(crate) use gam::terms::smooth::{
-    build_term_collection_derivative_design, build_term_collection_design,
-};
+pub(crate) use gam::terms::smooth::build_term_collection_design;
 
 pub(crate) use gam::families::fit_orchestration::descriptors::build_analytic_penalty_registry_from_descriptors as build_analytic_penalty_registry_from_json;
 

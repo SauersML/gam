@@ -20,7 +20,6 @@
 
 use crate::ffi::ffi_errors::detach_py_result;
 use gam::data::{ColumnKindTag, DataSchema, EncodedDataset, SchemaColumn};
-use gam::linalg::matrix::DenseDesignOperator;
 use gam::terms::inference::formula_dsl::parse_formula;
 use gam::terms::smooth::build_term_collection_design;
 use gam::terms::smooth_overrides::apply_smooth_overrides;
