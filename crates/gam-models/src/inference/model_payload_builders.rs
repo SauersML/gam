@@ -3036,7 +3036,7 @@ mod joint_latent_law_save_tests {
         let doubled = joint_latent_law_calibration_save_refusal(
             Some(&conditional),
             &calibrated,
-            &law(vec![None, Some(conditional)]),
+            &law(vec![None, Some(conditional.clone())]),
         )
         .expect("a second copy of a map must refuse the save");
         assert!(
