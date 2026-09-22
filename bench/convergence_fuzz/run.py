@@ -41,9 +41,8 @@ from pathlib import Path
 from typing import Any
 
 import psutil
-from pygam_compare.run import THREAD_ENV, git_sha, run_isolated
 
-from convergence_fuzz import dgp, triage
+from . import dgp, triage
 
 HERE = Path(__file__).resolve().parent
 BENCH_DIR = HERE.parent
@@ -100,6 +99,23 @@ def _quick() -> list[Rep]:
 PLANS = {"full": _full, "quick": _quick}
 
 
+def _harness() -> Any:
+    """The gamfit-vs-pyGAM harness's ``run`` module, which the driver runs reps through.
+
+    It is imported here and not at module level because this module is imported two
+    ways: as ``convergence_fuzz.run`` with ``bench/`` on the path (the documented
+    ``cd bench && python -m convergence_fuzz.run``, and the subprocess
+    ``test_quick.py`` launches), where the harness is the top-level
+    ``pygam_compare``; and as ``bench.convergence_fuzz.run`` when pytest collects
+    ``bench/`` as a package, where only the plan tables are read and no rep runs.
+    A module-level ``from pygam_compare.run import ...`` made the second import fail
+    at collection, and with it every test in the file.
+    """
+    import pygam_compare.run
+
+    return pygam_compare.run
+
+
 def run_one(rep: Rep, cwd: str, timeout_s: float, memcap_mb: float) -> dict[str, Any]:
     cmd = [
         sys.executable,
@@ -109,7 +125,7 @@ def run_one(rep: Rep, cwd: str, timeout_s: float, memcap_mb: float) -> dict[str,
         rep.family,
         str(rep.n),
     ]
-    rec = run_isolated(
+    rec = _harness().run_isolated(
         cmd, cwd, timeout_s, memcap_mb, env_extra={"PYTHONPATH": str(BENCH_DIR)}
     )
     rec.update(case=rep.case, family=rep.family, n=rep.n)
@@ -127,6 +143,7 @@ def run_plan(
     progress: bool = True,
 ) -> list[dict[str, Any]]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    harness = _harness()
     meta: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "plan": plan_name,
@@ -135,13 +152,13 @@ def run_plan(
         "timeout_s": timeout_s,
         "memcap_mb": memcap_mb,
         "safety_net": "timeout_s and memcap_mb are a harness safety net, not a solver budget",
-        "thread_env": THREAD_ENV,
+        "thread_env": harness.THREAD_ENV,
         "root_seed": dgp.ROOT_SEED,
         "host": platform.node(),
         "platform": platform.platform(),
         "python": platform.python_version(),
         "nproc": os.cpu_count(),
-        "git_sha": git_sha(),
+        "git_sha": harness.git_sha(),
         "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     records: list[dict[str, Any]] = []
