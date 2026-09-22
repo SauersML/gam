@@ -3671,9 +3671,25 @@ impl SaeManifoldTerm {
         // and `1/gbar² ∝ ‖B‖⁻⁴` exactly cancels the raw `‖B‖⁴`. Fold it into `mu`
         // so every `mu * acc` write below carries it. `gbar` is read from the
         // penalty (the single source of truth shared with the gradient).
-        let mu_raw =
+        // #4531 — READ THE STRENGTH COORDINATE ONLY WHERE THE PENALTY DECLARES ONE.
+        //
+        // `IsometryPenalty::rho_count` is `usize::from(learnable_weight)`, so a
+        // fixed-strength isometry owns NO outer coordinate and every caller hands it
+        // an empty rho block (`Array1::<f64>::zeros(0)` at the call sites in this
+        // file). `rho_index` then names a slot that does not exist. The penalty
+        // itself gates this exact read on the same flag in both `strength` and
+        // `validate_rho`; this consumer did not, so a fixed-strength isometry
+        // panicked here with "index 0 is out of bounds for array of shape [0]"
+        // rather than using the weight it declares. `484c0311a9` is what made the
+        // strength an outer coordinate only where the penalty prices its own prior
+        // mass, and this is the same reader-side repair `12a865c3d6` applied to the
+        // softmax-entropy penalty's Hessian and majorizer.
+        let mu_raw = if corrected.learnable_weight {
             resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index])
-                .expect("analytic-penalty rho must be validated before SAE assembly");
+                .expect("analytic-penalty rho must be validated before SAE assembly")
+        } else {
+            corrected.scalar_weight
+        };
         // SAFETY: `corrected` comes from `corrected_isometry_penalty`, whose
         // evaluation precondition refuses an undefined gauge normalizer.
         let gbar = corrected
@@ -3932,9 +3948,25 @@ impl SaeManifoldTerm {
         // the β tier. Fold the same `1/gbar²` frozen-normalizer factor in here
         // so the decoder curvature matches its scale-free gradient. PSD-
         // preserving (positive scalar on a PSD Gram block).
-        let mu_raw =
+        // #4531 — READ THE STRENGTH COORDINATE ONLY WHERE THE PENALTY DECLARES ONE.
+        //
+        // `IsometryPenalty::rho_count` is `usize::from(learnable_weight)`, so a
+        // fixed-strength isometry owns NO outer coordinate and every caller hands it
+        // an empty rho block (`Array1::<f64>::zeros(0)` at the call sites in this
+        // file). `rho_index` then names a slot that does not exist. The penalty
+        // itself gates this exact read on the same flag in both `strength` and
+        // `validate_rho`; this consumer did not, so a fixed-strength isometry
+        // panicked here with "index 0 is out of bounds for array of shape [0]"
+        // rather than using the weight it declares. `484c0311a9` is what made the
+        // strength an outer coordinate only where the penalty prices its own prior
+        // mass, and this is the same reader-side repair `12a865c3d6` applied to the
+        // softmax-entropy penalty's Hessian and majorizer.
+        let mu_raw = if corrected.learnable_weight {
             resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index])
-                .expect("analytic-penalty rho must be validated before SAE assembly");
+                .expect("analytic-penalty rho must be validated before SAE assembly")
+        } else {
+            corrected.scalar_weight
+        };
         // SAFETY: `corrected` comes from `corrected_isometry_penalty`, whose
         // evaluation precondition refuses an undefined gauge normalizer.
         let gbar = corrected
