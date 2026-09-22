@@ -1795,8 +1795,15 @@ pub(crate) fn spectral_tolerance(evals: &Array1<f64>) -> f64 {
 
 /// The canonical cutoff for deciding whether a negative eigenvalue is roundoff.
 ///
-/// Same shape and same value as [`spectral_tolerance`] today; separate because
-/// it answers a different question and will not move with it.
+/// Same shape as [`spectral_tolerance`], and a DIFFERENT VALUE since
+/// `0f72c1e70e` (#2901): the rank cutoff moved to the eigensolver's own band
+/// `dim·ε·max|λ|` and this one kept `SPECTRAL_NOISE_RELATIVE_TOLERANCE = 1e-10`,
+/// so the two now differ by about five decades. They were equal when this note
+/// was written, and the note said they would not move together; they did not,
+/// and it is the note that went stale. `analyze_penalty_block` states the live
+/// split correctly: "the rank convention is the eigensolver's own relative
+/// band, `ε` per dimension; the noise convention is its own constant and is
+/// unrelated to it" (#1561).
 pub(crate) fn spectral_noise_tolerance(evals: &Array1<f64>) -> f64 {
     let max_abs_ev = evals
         .iter()

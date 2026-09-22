@@ -2059,10 +2059,17 @@ pub(crate) fn duchon_native_penalty_candidates_with_curvature(
     // Range-floor the ill-conditioned curvature spectrum so its numerical null
     // space is exactly the polynomial null space (#1815): without this, the
     // Duchon Gram's low-curvature tail sits below `analyze_penalty_block`'s
-    // `nrows·1e-10·λmax` cutoff and those retained kernel modes are classed
+    // rank cutoff and those retained kernel modes are classed
     // UNPENALIZED, so no `λ` collapses them and the smooth cannot reach the null
     // on an irrelevant covariate. `n_pre` is the embedded penalty dimension the
     // assembled block is later scored against.
+    //
+    // That cutoff was `nrows·1e-10·λmax` when this was written and is now the
+    // eigensolver's own band `dim·ε·λmax` (`0f72c1e70e`, #2901), five decades
+    // tighter, so the tail this floor exists to lift has five decades less room
+    // to fall into. The floor is NOT removed on that reading alone: whether the
+    // #1815 modes still land under the band is a measurement nobody has taken
+    // (#1561).
     let omega = duchon_range_floor_curvature(&omega, n_pre)?;
     let mut primary_pre = Array2::<f64>::zeros((n_pre, n_pre));
     primary_pre
