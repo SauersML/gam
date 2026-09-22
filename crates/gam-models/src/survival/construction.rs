@@ -976,6 +976,45 @@ pub fn survival_baseline_config_from_theta(
 enum BaselineDerivativeContract {
     /// Cost + analytic gradient, no analytic Hessian. Routes to BFGS, which
     /// builds its own quasi-Newton curvature from successive gradients.
+    ///
+    /// # What the missing theta-Hessian is (#3201)
+    ///
+    /// This is the one row of #3201 whose Hessian is not merely deferred but
+    /// absent, so the derivation is recorded where the absence is declared.
+    /// The criterion is the PROFILE penalized NLL
+    /// `V(theta) = 0.5*deviance(beta_hat(theta); o(theta)) + 0.5*beta_hat' S beta_hat`,
+    /// and theta enters the working model only through the three additive
+    /// time-block offsets `o_E`, `o_X`, `o_D`. Because `beta_hat(theta)` is the
+    /// constrained PIRLS optimum, `dV/dtheta` is the explicit partial alone
+    /// (the envelope theorem; the active-set bounds `beta_j >= 0` carry no
+    /// theta-dependence), which is what `baseline_chain_rule_gradient`
+    /// contracts.
+    ///
+    /// The SECOND derivative of a profiled criterion is NOT the explicit
+    /// partial: `beta_hat` moves with theta, so
+    ///
+    /// ```text
+    ///   d2V/dtheta_j dtheta_k = V_tt[j,k] - V_tb[j,:] (H_bb)^-1 V_bt[:,k],
+    /// ```
+    ///
+    /// with `H_bb` the penalized working Hessian at `beta_hat` restricted to
+    /// the FREE block of the active set (the bounds are theta-free, so a
+    /// coordinate on its bound contributes no `dbeta/dtheta`), `V_tb` the
+    /// cross block `d2V/dtheta dbeta`, and `V_tt` the explicit partial
+    /// Hessian. Each of the three is a contraction of the offset channels the
+    /// gradient already uses: `V_tt` needs the deviance's second derivatives
+    /// in the offsets and each offset's own theta-Hessian, and `V_tb` needs
+    /// the offset-by-coefficient cross derivatives. `OuterEval` already
+    /// carries a `hessian` field and
+    /// [`run_baseline_theta_optimizer_with_eval`] already validates its shape,
+    /// so the plumbing exists; only the producer does not.
+    ///
+    /// Its acceptance is a central finite difference of the analytic theta
+    /// gradient, graded entry by entry against each Hessian row, at an
+    /// interior point and at the seed -- not a norm, which hides a single
+    /// wrong entry. Until that exists, this contract declares
+    /// `DeclaredHessianForm::Unavailable`, which is the honest declaration:
+    /// an absent Hessian, not a reserved one.
     GradientOnly,
 }
 
@@ -1045,9 +1084,14 @@ where
     // records, in the `dim` baseline parameters themselves.
     let problem = contract
         .configure(
-            OuterProblem::new(dim)
-                .with_prefer_gradient_only(true)
-                .with_problem_size(age_exit.len(), dim),
+            // No `with_prefer_gradient_only` (#3201). The contract this problem
+            // is configured by declares `DeclaredHessianForm::Unavailable`, and
+            // the flag is read only where the declared Hessian is analytic --
+            // by `plan`, and by `fallback_attempts` when it escalates a
+            // gradient-only primary to exact curvature. It therefore decided
+            // nothing on this path. The baseline row's open item is the
+            // profiled theta-Hessian itself, recorded on the contract.
+            OuterProblem::new(dim).with_problem_size(age_exit.len(), dim),
         )
         .with_bounds(lower, upper)
         .with_initial_rho(seed.clone());

@@ -1680,7 +1680,15 @@ fn run_support_outer_search(
         let problem = OuterProblem::new(objective.n_params())
             .with_gradient(Derivative::Analytic)
             .with_hessian(DeclaredHessianForm::Unavailable)
-            .with_prefer_gradient_only(true)
+            // No `with_prefer_gradient_only` (#3201). It DECIDED NOTHING here:
+            // `plan` only reads it when the declared Hessian is analytic, and
+            // `fallback_attempts`' escalation to exact curvature requires the
+            // same, so with `Unavailable` this problem routed to a gradient
+            // solver either way. Keeping the call made the support outer look
+            // like a site that reserves curvature it has, when in fact it has
+            // none to reserve: the stochastic-probe objective publishes no
+            // rho-Hessian. What this row still needs is that Hessian, not a
+            // flag.
             .with_disable_fixed_point(true)
             .with_problem_size(n_cells, beta_dim)
             .with_bounds(rho_lower.clone(), rho_upper.clone())
