@@ -234,12 +234,20 @@ mod tests {
     /// along each eigen-direction of `V_ρ`, which is what `tr(V'' V_ρ)` decomposes into and
     /// which shares no line with the assembly.
     ///
-    /// The step is derived, not chosen. A symmetric second difference of a smooth `f` carries
-    /// truncation `h²|f⁗|/12` and roundoff `4ε|f|/h²`; those are equal at
+    /// The step is derived, not chosen: a symmetric second difference of a smooth `f` carries
+    /// truncation `h²|f⁗|/12` and roundoff `4ε|f|/h²`, which are equal at
     /// `h = (48 ε |f| / |f⁗|)^{1/4}`, and with `|f⁗|` and `|f|` of the same order on this
-    /// fixture that is `h = (48 ε)^{1/4}`. At that step the total error is `≈ 2√(ε/3)·|f|`, so
-    /// the band is that times a counted factor of four for the five roundings the two sides
-    /// accumulate around it.
+    /// fixture that is `h = (48 ε)^{1/4}`.
+    ///
+    /// The BAND is the difference's own two error terms, and both are read here rather than
+    /// assumed. Writing `D(h)` for the second difference at step `h`, `D(h) = f'' + c·h² +
+    /// O(h⁴)`, so `(D(2h) − D(h))/3` IS `c·h²`, the truncation at `h`, measured. The roundoff
+    /// is counted: three evaluations enter each difference (`f(+h)`, `f(−h)` and twice
+    /// `f(0)`), each to within half an ulp of `|f|`, and the sum is divided by `h²`, so it is
+    /// `4ε·max|f|/h²` per direction. Denominating the band in `|f''|` instead — the size of
+    /// the answer — is what made this assertion fail at a correct value: the roundoff is
+    /// carried by `|f|`, which on this fixture is about four hundred times larger, so a band
+    /// proportional to the answer is thirty times too tight.
     #[test]
     fn two_coordinates_match_a_second_difference_of_the_inverse() {
         let base = array![[3.0_f64, 0.4], [0.4, 2.0]];
@@ -280,33 +288,51 @@ mod tests {
             symmetric.eigh(faer::Side::Lower).expect("V_rho eigh")
         };
         let step = (48.0 * f64::EPSILON).powf(0.25);
-        let mut reference = Array2::<f64>::zeros((2, 2));
-        for (column, &eigenvalue) in eigenvalues.iter().enumerate() {
-            if !(eigenvalue > 0.0) {
-                continue;
+        // `½ Σ_m D_m(h)` at `h` and at `2h`, and the largest magnitude the differenced
+        // function reaches over every point either one evaluated.
+        let difference_at = |h: f64| -> (Array2<f64>, f64) {
+            let mut total = Array2::<f64>::zeros((2, 2));
+            let mut scale_of_f = v.iter().fold(0.0_f64, |worst, value| worst.max(value.abs()));
+            for (column, &eigenvalue) in eigenvalues.iter().enumerate() {
+                if !(eigenvalue > 0.0) {
+                    continue;
+                }
+                let scale = eigenvalue.sqrt();
+                let direction = [
+                    scale * eigenvectors[[0, column]],
+                    scale * eigenvectors[[1, column]],
+                ];
+                let forward = inverse([h * direction[0], h * direction[1]]);
+                let backward = inverse([-h * direction[0], -h * direction[1]]);
+                for value in forward.iter().chain(backward.iter()) {
+                    scale_of_f = scale_of_f.max(value.abs());
+                }
+                let second = (&forward + &backward - &v.mapv(|value| 2.0 * value))
+                    .mapv(|value| value / (h * h));
+                total.scaled_add(0.5, &second);
             }
-            let scale = eigenvalue.sqrt();
-            let direction = [
-                scale * eigenvectors[[0, column]],
-                scale * eigenvectors[[1, column]],
-            ];
-            let forward = inverse([step * direction[0], step * direction[1]]);
-            let backward = inverse([-step * direction[0], -step * direction[1]]);
-            let second = (&forward + &backward - &v.mapv(|value| 2.0 * value))
-                .mapv(|value| value / (step * step));
-            reference.scaled_add(0.5, &second);
-        }
+            (total, scale_of_f)
+        };
+        let (reference, scale_of_f) = difference_at(step);
+        let (coarse, _) = difference_at(2.0 * step);
 
-        let magnitude = reference
+        // Four roundings of `|f|` per direction, divided by `h²`, over the two directions the
+        // sum runs; each direction's `½` is already in the difference above.
+        let directions = eigenvalues.iter().filter(|&&value| value > 0.0).count() as f64;
+        let roundoff = directions * 0.5 * 4.0 * f64::EPSILON * scale_of_f / (step * step);
+        for (index, ((assembled, expected), coarse_value)) in term
             .iter()
-            .chain(term.iter())
-            .fold(0.0_f64, |worst, value| worst.max(value.abs()));
-        let band = 4.0 * 2.0 * (f64::EPSILON / 3.0).sqrt() * magnitude;
-        for (index, (assembled, expected)) in term.iter().zip(reference.iter()).enumerate() {
+            .zip(reference.iter())
+            .zip(coarse.iter())
+            .enumerate()
+        {
+            let truncation = (expected - coarse_value).abs() / 3.0;
+            let band = truncation + roundoff;
             assert!(
                 (assembled - expected).abs() <= band,
                 "entry {index}: assembled {assembled:e} against second difference {expected:e}, \
-                 off by more than {band:e}"
+                 off by more than its measured truncation {truncation:e} plus its counted \
+                 roundoff {roundoff:e}"
             );
         }
     }
