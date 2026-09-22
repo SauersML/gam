@@ -98,9 +98,11 @@ fn search_evaluations(n: usize, order: usize) -> (u64, f64, f64) {
         },
     );
     let elapsed = started.elapsed().as_secs_f64();
-    outcome.unwrap_or_else(|error| {
-        panic!("n={n} order={order}: the certified search refused: {error}")
-    });
+    assert!(
+        outcome.is_ok(),
+        "n={n} order={order}: the certified search refused: {}",
+        outcome.as_ref().err().map(ToString::to_string).unwrap_or_default()
+    );
     (evaluations.get(), hi - lo, elapsed)
 }
 
