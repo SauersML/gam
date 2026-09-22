@@ -1881,6 +1881,9 @@ pub(crate) fn try_tangent_projected_evaluate(
                 gradient_motion,
                 laplace: term.laplace.clone(),
                 profiled: term.profiled.clone(),
+                // The constraint rows' own psi motion belongs to the cone, not to the
+                // response geometry re-resolved here, so it rides unchanged (gam#3171).
+                constraint_motion: term.constraint_motion.clone(),
             })
         }),
     };

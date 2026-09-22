@@ -63,6 +63,41 @@ impl TransformationNormalFamily {
         )?;
         Ok(Some(ConstraintSet::KhatriRaoCone(cone)))
     }
+
+    /// The cone's ψ rates constrain the coefficients of exactly `block_index`, so the state the
+    /// active-set solve carries and the spec it was built from must agree on that block's width
+    /// before a rate is published against it — the same check `block_linear_constraints` makes
+    /// for the value (gam#3171).
+    fn check_cone_block_width(
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        block_index: usize,
+        what: &str,
+    ) -> Result<(), String> {
+        if block_states.len() != specs.len() {
+            return Err(format!(
+                "CTN {what}: {} parameter block state(s) against {} spec(s)",
+                block_states.len(),
+                specs.len(),
+            ));
+        }
+        let (Some(state), Some(spec)) = (block_states.get(block_index), specs.get(block_index))
+        else {
+            return Err(format!(
+                "CTN {what}: block index {block_index} out of range for {} parameter block(s)",
+                specs.len(),
+            ));
+        };
+        if state.beta.len() != spec.design.ncols() {
+            return Err(format!(
+                "CTN {what}: block '{}' state width {} != spec design width {}",
+                spec.name,
+                state.beta.len(),
+                spec.design.ncols(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl CustomFamily for TransformationNormalFamily {
@@ -337,12 +372,13 @@ impl CustomFamily for TransformationNormalFamily {
     /// so the dense and matrix-free routes feed one rate exactly as they already feed one `G_x`.
     fn block_linear_constraint_psi_derivative(
         &self,
-        _block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
         hyper_layout: &CustomFamilyHyperLayout,
         block_index: usize,
         psi_index: usize,
     ) -> Result<Option<ConstraintSet>, String> {
+        Self::check_cone_block_width(block_states, specs, block_index, "monotonicity cone psi rate")?;
         let Some((op, axis, rows)) =
             self.covariate_cone_axis(hyper_layout, block_index, psi_index)?
         else {
@@ -359,13 +395,19 @@ impl CustomFamily for TransformationNormalFamily {
     /// for a pair the operator carries no second derivative for (gam#3171).
     fn block_linear_constraint_psi_second_derivative(
         &self,
-        _block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
         hyper_layout: &CustomFamilyHyperLayout,
         block_index: usize,
         psi_index_i: usize,
         psi_index_j: usize,
     ) -> Result<Option<ConstraintSet>, String> {
+        Self::check_cone_block_width(
+            block_states,
+            specs,
+            block_index,
+            "monotonicity cone psi pair rate",
+        )?;
         let Some((op, axis_i, rows)) =
             self.covariate_cone_axis(hyper_layout, block_index, psi_index_i)?
         else {
