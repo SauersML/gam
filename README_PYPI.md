@@ -50,8 +50,7 @@ print(bands[["posterior_mean", "posterior_mean_lower", "posterior_mean_upper",
   `mcycle` its 95% observation interval covers 97% of the data
   ([tour](https://gamfit.readthedocs.io/en/latest/tour/#heteroscedastic-noise-mcycle)).
 
-The [migration guide](https://gamfit.readthedocs.io/en/latest/migrating-from-pygam/) maps pyGAM calls to
-gamfit. Docs: <https://gamfit.readthedocs.io/>.
+Docs: <https://gamfit.readthedocs.io/>.
 
 ## Scope
 
