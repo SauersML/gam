@@ -13,11 +13,30 @@ fn rotation(angle: f64) -> Array2<f64> {
     array![[c, -s], [s, c]]
 }
 
+/// `Q diag(lambda) Qᵀ`, assembled BITWISE symmetric.
+///
+/// `aft_absolute_newton_direction` hands its argument to
+/// `strict_symmetric_eigh` under `SymmetricAssembly::Mirrored`, whose band is
+/// exactly zero because a mirrored assembly writes one rounded value into both
+/// triangles. Two chained GEMMs do not: entry `(j, k)` of `(Q·D)·Qᵀ` and entry
+/// `(k, j)` accumulate the same products in a different association, and IEEE
+/// multiplication is commutative but not associative, so the two triangles are
+/// free to differ in the last bit. They do here, and the eigendecomposition
+/// refused this fixture rather than the code under test.
+///
+/// `(M + Mᵀ)/2` fixes it without changing the matrix: addition commutes, so the
+/// two triangles are the same rounded sum, and halving is exact in binary. The
+/// spectrum the assertions below read is unchanged to within one ulp.
+fn symmetric_spectral(q: &Array2<f64>, lambda: &Array1<f64>) -> Array2<f64> {
+    let m = q.dot(&Array2::from_diag(lambda)).dot(&q.t());
+    (&m + &m.t()) * 0.5
+}
+
 #[test]
 fn absolute_newton_direction_flips_negative_curvature_3090() {
     let q = rotation(0.3);
     let lambda = [3.0, -0.5];
-    let h = q.dot(&Array2::from_diag(&Array1::from(lambda.to_vec()))).dot(&q.t());
+    let h = symmetric_spectral(&q, &Array1::from(lambda.to_vec()));
     let g = array![0.7, -1.1];
 
     let step = aft_absolute_newton_direction(&h, &g, 0).expect("regular indefinite H");
@@ -56,7 +75,7 @@ fn absolute_newton_direction_is_newton_on_positive_definite_hessian_3090() {
 #[test]
 fn absolute_newton_direction_refuses_gradient_along_flat_curvature_3090() {
     let q = rotation(0.3);
-    let h = q.dot(&Array2::from_diag(&array![2.0, 0.0])).dot(&q.t());
+    let h = symmetric_spectral(&q, &array![2.0, 0.0]);
     // Gradient in the range of H: the flat direction carries no slope, so the
     // step is the pseudo-inverse one.
     let g_range = q.column(0).to_owned() * 1.5;
