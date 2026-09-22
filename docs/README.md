@@ -25,8 +25,6 @@ Starting out
 - [A tour on real data](tour.md) — six complete analyses of public
   datasets: factors, noise models, counts, string labels, shape
   constraints, surfaces.
-- [Migrating from pyGAM](migrating-from-pygam.md) — what changes, a
-  call-by-call mapping, and the gotchas.
 - [Data input formats](data-input.md) — pandas, polars, pyarrow, numpy,
   dict of columns, list of records.
 - [CLI reference](cli.md) — `gam fit`, `predict`, `diagnose`, `sample`,

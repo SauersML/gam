@@ -129,7 +129,6 @@ nav:
   - Getting started:
     - Install and first model: getting-started.md
     - A tour on real data: tour.md
-    - Migrating from pyGAM: migrating-from-pygam.md
     - Data input formats: data-input.md
     - CLI reference: cli.md
   - Building a model:

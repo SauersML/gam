@@ -106,9 +106,9 @@ def test_pages_for_pygam_users_are_reachable():
     nav = set(_nav_pages())
     missing_files = sorted(page for page in nav if not (DOCS_DIR / page).is_file())
     assert not missing_files, f"nav names pages that do not exist: {missing_files}"
-    for page in ("migrating-from-pygam.md", "tour.md", "benchmarks.md"):
+    for page in ("tour.md", "benchmarks.md"):
         assert page in nav, f"{page} is not in the mkdocs nav"
-    for page in ("migrating-from-pygam.md", "tour.md", "benchmarks.md"):
+    for page in ("tour.md", "benchmarks.md"):
         assert f"({page})" in (DOCS_DIR / "README.md").read_text(encoding="utf-8"), page
     assert not [page for page in nav if _excluded(page, patterns)]
 
@@ -138,4 +138,3 @@ def test_readme_opens_with_pitch_example_and_linked_claims(path):
     assert len(claims) == 3, claims
     for claim in claims:
         assert re.search(r"\]\((?:https?://|docs/)[^)]+\)", claim), f"claim without evidence link: {claim[:60]}"
-    assert "migrating-from-pygam" in text[:long_list]

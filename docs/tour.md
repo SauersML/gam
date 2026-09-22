@@ -200,7 +200,6 @@ when both coordinates share one scale.
 
 ## Where next
 
-- [Migrating from pyGAM](migrating-from-pygam.md) maps pyGAM calls to gamfit.
 - [Predictions](predictions.md) lists every column `predict` can return.
 - [Diagnostics](diagnostics.md) covers `summary()`, `basis_check()` and plots.
 - [Benchmarks](benchmarks.md) compares accuracy and speed with pyGAM, losses included.

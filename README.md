@@ -42,8 +42,7 @@ Coming from pyGAM:
   `mcycle` its 95% observation interval covers 97% of the data
   ([tour](docs/tour.md#heteroscedastic-noise-mcycle)).
 
-The [migration guide](docs/migrating-from-pygam.md) maps pyGAM calls to
-gamfit, and the [tour](docs/tour.md) works through six real datasets.
+The [tour](docs/tour.md) works through six real datasets.
 
 Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>.
 Contributions of every kind are welcome.
@@ -558,7 +557,6 @@ instead of mixing context or handle ownership across implementations.
 ## Documentation
 
 - Full Python documentation: <https://gamfit.readthedocs.io/>.
-- Migrating from pyGAM: [docs/migrating-from-pygam.md](docs/migrating-from-pygam.md).
 - Real-data tour: [docs/tour.md](docs/tour.md).
 - Benchmarks against pyGAM: [docs/benchmarks.md](docs/benchmarks.md).
 - Cookbook: [docs/cookbook.md](docs/cookbook.md).
