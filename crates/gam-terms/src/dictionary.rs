@@ -175,6 +175,11 @@ impl Default for LinearDictionaryConfig {
 /// model is AFFINE. `mean` is the exact column-mean vector that lane baked into
 /// `fitted`, so a held-out [`linear_dictionary_transform`] / reconstruct reads
 /// the model's origin from the fit instead of re-deriving it.
+///
+/// `posterior_shrinkage` is the same kind of carried quantity for the codes: the
+/// factor the fit multiplied its routed codes by, which the transform must apply
+/// for a held-out row to be encoded by the estimator that produced
+/// `assignments`.
 #[derive(Clone, Debug)]
 pub struct LinearDictionaryFit {
     pub atoms: Array2<f64>,
@@ -183,6 +188,12 @@ pub struct LinearDictionaryFit {
     /// Origin of the affine model: `Some(column means)` exactly when the fit is
     /// the centered K=1 lane, `None` for every linear (mean-free) model.
     pub mean: Option<Array1<f64>>,
+    /// Posterior-mean shrinkage of the codes: `Some(1/(1 + λ̂))` exactly when the
+    /// fit is a K=1 rank-one lane, whose code is the posterior mean
+    /// `(x·a)/(1 + λ̂)` at its REML ridge `λ̂`, and `None` for the multi-atom lane,
+    /// whose codes are the unshrunk routing. Selected by the fit, never set by a
+    /// caller.
+    pub posterior_shrinkage: Option<f64>,
     pub lambdas: Array1<f64>,
     pub reml_scores: Array1<f64>,
     pub explained_variance: f64,
@@ -422,6 +433,7 @@ fn fit_multi_atom_dictionary(
                 assignments,
                 fitted,
                 mean: None,
+                posterior_shrinkage: None,
                 lambdas,
                 reml_scores,
                 explained_variance: last_ev,
@@ -733,6 +745,7 @@ fn fit_rank_one_pca_lane(
         assignments,
         fitted: fitted.clone(),
         mean: None,
+        posterior_shrinkage: Some(shrink),
         lambdas: Array1::from_elem(1, lambda),
         reml_scores: Array1::from_elem(1, score),
         explained_variance: explained_variance(x, fitted.view()),
@@ -767,6 +780,7 @@ fn fit_rank_one_centered_lane(
         fitted,
         explained_variance: ev,
         lambda,
+        shrink,
     } = centered_rank_one_components(x)?;
     let atoms = atom.insert_axis(Axis(0)).to_owned();
     let assignments = codes.insert_axis(Axis(1)).to_owned();
@@ -776,6 +790,7 @@ fn fit_rank_one_centered_lane(
         assignments,
         fitted,
         mean: Some(mean),
+        posterior_shrinkage: Some(shrink),
         lambdas: Array1::from_elem(1, lambda),
         reml_scores: Array1::from_elem(1, score),
         explained_variance: ev,
@@ -806,6 +821,9 @@ struct CenteredRankOne {
     explained_variance: f64,
     /// The ridge REML selected for this component, reported as the fit's `lambdas`.
     lambda: f64,
+    /// `1/(1 + lambda)`, the factor applied to `codes`, carried by the fit so the
+    /// transform applies it too.
+    shrink: f64,
 }
 
 fn centered_rank_one_components(x: ArrayView2<'_, f64>) -> Result<CenteredRankOne, String> {
@@ -842,6 +860,7 @@ fn centered_rank_one_components(x: ArrayView2<'_, f64>) -> Result<CenteredRankOn
         fitted,
         explained_variance: ev,
         lambda,
+        shrink,
     })
 }
 
@@ -874,8 +893,8 @@ fn initialize_atoms(x: ArrayView2<'_, f64>, n_atoms: usize) -> Array2<f64> {
 /// One atom's ridge `λ_k`, selected in closed form by REML from the residual the
 /// atom is fitted against.
 ///
-/// The per-atom update solves `a = Σ_i c_i r_i / (Σ_i c_i² + λ)`, which is the
-/// posterior mean of `a` under `r_i = c_i·a + e_i`, `a ~ N(0, τ²I_p)`,
+/// The per-atom ridge is the one whose posterior mean is
+/// `a = Σ_i c_i r_i / (Σ_i c_i² + λ)`, under `r_i = c_i·a + e_i`, `a ~ N(0, τ²I_p)`,
 /// `e_i ~ N(0, σ²I_p)`, with `λ = σ²/τ²`. So `λ_k` is a smoothing parameter and
 /// REML chooses it; it used to be `code_ridge`, hand-set and then REPORTED as
 /// this atom's entry in `lambdas` (#2899 row P32).
@@ -895,6 +914,20 @@ fn initialize_atoms(x: ArrayView2<'_, f64>, n_atoms: usize) -> Array2<f64> {
 /// branch above handles, and it is reported the same way: the atom goes inactive
 /// with [`INACTIVE_LAMBDA`] rather than being fitted at a ridge chosen to make it
 /// look identified.
+///
+/// # Where `λ̂_k` acts, and where it must not
+///
+/// The posterior mean `b/(S + λ̂)` has the direction of `b` for every `λ̂`, and
+/// the stored atom is that direction at unit norm. So the ridge shrinks only the
+/// atom's MAGNITUDE, which the unit-norm gauge removes. Handing that magnitude to
+/// the codes instead (the old `normalize` of `b/(S + λ̂)`) turned it into a code
+/// shrinkage `S/(S + λ̂)` on the sweep state alone: the routing that owns the
+/// certified codes, and the transform that reproduces them, are the unshrunk
+/// minimum-norm code, so `routing_residual` measured the shrinkage and not the
+/// fixed point, and no fit with a non-negligible `λ̂_k` could certify. The sweep
+/// therefore rescales the codes by the least-squares magnitude `‖b‖/S`, the same
+/// unshrunk estimator the routing is, and `λ̂_k` enters the model through its
+/// identification verdict and its report in `lambdas`.
 fn atom_reml_lambda(
     code_norm2: f64,
     cross: ArrayView1<'_, f64>,
@@ -1015,9 +1048,12 @@ fn fit_one_atom_penalized_ls(
         reml_scores[atom_idx] = 0.0;
         return Ok(false);
     };
-    let denominator = code_norm2 + lambda;
+    // The least-squares atom for this code, so the normalization moves `‖b‖/S`
+    // into the codes: the unshrunk magnitude the routing reproduces. The ridge's
+    // posterior mean has this same direction; see `atom_reml_lambda` for why its
+    // magnitude must not reach the codes.
     for col in 0..x.ncols() {
-        atoms[[atom_idx, col]] = cross[col] / denominator;
+        atoms[[atom_idx, col]] = cross[col] / code_norm2;
     }
     lambdas[atom_idx] = lambda;
     normalize_atom_and_assignments(atoms, assignments, atom_idx);
@@ -1062,6 +1098,15 @@ fn top_k_assignments(
 /// `mean` must be finite and `top_k` must lie in `[1, K]`, and an out-of-range
 /// `top_k` is an error rather than a clamp.
 ///
+/// `posterior_shrinkage` is the fitted model's
+/// [`LinearDictionaryFit::posterior_shrinkage`]. The rank-one lanes code a row by
+/// its posterior mean `(x·a)/(1 + λ̂)`, so the routed code is multiplied by that
+/// fitted factor; without it a held-out row would be encoded by the unshrunk
+/// projection, a different estimator on a different scale from the fit's own
+/// `assignments`. `None` (the multi-atom lane) leaves the routed code as is. A
+/// supplied factor is `1/(1 + λ)` for some `λ ≥ 0`, so anything outside `(0, 1]`
+/// is not one and is refused.
+///
 /// This is the out-of-sample `transform`/encode step for a fitted linear
 /// dictionary; the math lives in the Rust core so the Python facade stays a
 /// thin wrapper. `temperature` is read only by the softmax rule.
@@ -1069,6 +1114,7 @@ pub fn linear_dictionary_transform(
     x: ArrayView2<'_, f64>,
     atoms: ArrayView2<'_, f64>,
     mean: Option<ArrayView1<'_, f64>>,
+    posterior_shrinkage: Option<f64>,
     top_k: usize,
     assignment: LinearDictionaryAssignment,
     temperature: f64,
@@ -1105,8 +1151,16 @@ pub fn linear_dictionary_transform(
             "linear_dictionary_transform: softmax temperature must be finite and positive; got {temperature}"
         ));
     }
-    match mean {
-        None => route_against_atoms(x, atoms, top_k, assignment, temperature),
+    if let Some(shrink) = posterior_shrinkage
+        && !(shrink.is_finite() && shrink > 0.0 && shrink <= 1.0)
+    {
+        return Err(format!(
+            "linear_dictionary_transform: posterior shrinkage must be a fitted factor \
+             1/(1 + λ) in (0, 1]; got {shrink}"
+        ));
+    }
+    let routed = match mean {
+        None => route_against_atoms(x, atoms, top_k, assignment, temperature)?,
         Some(mean) => {
             if mean.len() != atoms.ncols() {
                 return Err(format!(
@@ -1119,9 +1173,13 @@ pub fn linear_dictionary_transform(
                 return Err("linear_dictionary_transform: mean must be finite".to_string());
             }
             let centered = &x - &mean;
-            route_against_atoms(centered.view(), atoms, top_k, assignment, temperature)
+            route_against_atoms(centered.view(), atoms, top_k, assignment, temperature)?
         }
-    }
+    };
+    Ok(match posterior_shrinkage {
+        Some(shrink) => routed * shrink,
+        None => routed,
+    })
 }
 
 fn softmax_assignments(
@@ -2011,10 +2069,10 @@ mod tests {
         }
         // Deliberately NOT a per-sweep monotone-objective gate, even though
         // this is nominally coordinate descent. Two reasons, both structural:
-        //   * `fit_one_atom_penalized_ls` descends a RIDGE-penalized loss whose
-        //     lambda it re-estimates by REML on every call, so the objective it
-        //     descends is not fixed across the sweep and the unpenalized EV
-        //     traced here is not its Lyapunov function;
+        //   * `fit_one_atom_penalized_ls` re-estimates each atom's REML ridge on
+        //     every call and retires an atom whose ridge the data does not
+        //     identify, so the set of atoms it descends over is not fixed across
+        //     the sweep and the EV traced here is not its Lyapunov function;
         //   * `reroute_against_atoms` is a greedy top-k selection, not the
         //     exact minimizer of that loss over assignments, so the reroute
         //     step can lower EV.
@@ -2102,6 +2160,7 @@ mod tests {
                 x.view(),
                 atoms.view(),
                 None,
+                None,
                 top_k,
                 assignment,
                 temperature,
@@ -2115,6 +2174,7 @@ mod tests {
             x.view(),
             atoms.view(),
             None,
+            None,
             top_k,
             LinearDictionaryAssignment::TopK,
             temperature,
@@ -2123,6 +2183,7 @@ mod tests {
         let softmax_codes = linear_dictionary_transform(
             x.view(),
             atoms.view(),
+            None,
             None,
             top_k,
             LinearDictionaryAssignment::Softmax,
@@ -2142,6 +2203,7 @@ mod tests {
             linear_dictionary_transform(
                 x.view(),
                 atoms.view(),
+                None,
                 None,
                 top_k,
                 LinearDictionaryAssignment::Softmax,
@@ -2196,6 +2258,7 @@ mod tests {
             x.view(),
             fit.atoms.view(),
             Some(mean.view()),
+            fit.posterior_shrinkage,
             fit.top_k,
             fit.assignment,
             config.temperature,
@@ -2208,6 +2271,7 @@ mod tests {
             x.view(),
             fit.atoms.view(),
             None,
+            fit.posterior_shrinkage,
             fit.top_k,
             fit.assignment,
             config.temperature,
@@ -2234,6 +2298,7 @@ mod tests {
                 rows.view(),
                 fit.atoms.view(),
                 Some(origin.view()),
+                fit.posterior_shrinkage,
                 k,
                 fit.assignment,
                 config.temperature,

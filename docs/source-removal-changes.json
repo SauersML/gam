@@ -3995,5 +3995,13 @@
     ],
     "reason": "#2627: the test asserted a property the measurement refutes (the scan's cost is n^1.5 because the certified search's evaluation count grows as 411.7 + 5.67*sqrt(n)), timed two sizes that cannot run (4.5 h and 123 h per fit) and gated a wall-clock ratio inside a shared test binary. Replaced in the same file by `spline_scan_recovers_truth_and_a_sane_edf_at_scale`, which asserts truth recovery match-or-beat against the dense path at n = 4000; the evaluation-count growth is asserted deterministically in gam-solve's `certified_search_evaluation_count_stays_inside_its_subdivision_budget_2627`.",
     "evidence": "At ce36a4f1f8 `git grep -n -w spline_scan_million_row_fit_scales_linearly_and_recovers_truth` finds only the declaration; e169b0b026 renames it in place with the new body."
+  },
+  {
+    "base": "4ef8cd5a140d31afb01a6b955bc77e1af107eb8c",
+    "items": [
+      "crates/gam-models/src/inference/full_conformal_glm.rs:fn:poisson_level_walk_closes_and_matches_each_levels_own_refit"
+    ],
+    "reason": "#4103: the test asserted that the honest Poisson level walk closes on a finite top level. 0669c3730e deleted the s_top stop that closed it, because the tail bound it read proves only the level it is evaluated at once every level re-selects its own strength, so honest_count_levels returns the whole support [0, inf) and the assertion `top.is_finite()` is false by construction. Replaced in the same file by `poisson_honest_set_is_the_whole_support_and_wider_than_its_levels_4103`, which asserts what is now true: the set is the whole support under HonestRefit, every level's own selected refit still selects and certifies, and some level on 0..=12 is a non-member of its own refit, so the whole support is strictly the conservative side of the per-level verdicts.",
+    "evidence": "At e6624050c9 `git grep -n -w poisson_level_walk_closes_and_matches_each_levels_own_refit` finds only its declaration, inside full_conformal_glm.rs's `mod reselection_tests`; no other file, bench, script or Python file names it."
   }
 ]

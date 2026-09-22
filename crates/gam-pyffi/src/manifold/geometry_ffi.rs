@@ -5304,6 +5304,8 @@ fn linear_dictionary_fit<'py>(
     out.set_item("fitted", fit.fitted.into_pyarray(py))?;
     // Origin of the affine model (the centered K=1 lane); `None` for a linear fit.
     out.set_item("mean", fit.mean.map(|mean| mean.into_pyarray(py)))?;
+    // Posterior-mean code shrinkage the rank-one lane applied; `None` otherwise.
+    out.set_item("posterior_shrinkage", fit.posterior_shrinkage)?;
     out.set_item("lambdas", fit.lambdas.into_pyarray(py))?;
     out.set_item("reml_scores", fit.reml_scores.into_pyarray(py))?;
     out.set_item("explained_variance", fit.explained_variance)?;
@@ -5354,12 +5356,16 @@ fn linear_dictionary_error_to_pyerr(py: Python<'_>, error: LinearDictionaryError
 /// Out-of-sample encode: route held-out rows `x` (`M x P`) through a fitted
 /// linear dictionary `atoms` (`K x P`) with the fitted model's assignment rule
 /// (`"top_k"` ridge solve or `"softmax"` at `temperature`) against the fitted
-/// origin `mean` (the fit's `"mean"`, `None` for a linear model), returning the
-/// `(M, K)` code matrix. The input contract is checked in Rust.
+/// origin `mean` (the fit's `"mean"`, `None` for a linear model) and the fitted
+/// `posterior_shrinkage` (the fit's `"posterior_shrinkage"`), returning the
+/// `(M, K)` code matrix. `posterior_shrinkage` has no default: it is read off the
+/// fit, and a default would encode a rank-one model's held-out rows on a
+/// different scale from its own codes. The input contract is checked in Rust.
 #[pyfunction(signature = (
     x,
     atoms,
     top_k,
+    posterior_shrinkage,
     mean = None,
     assignment = "top_k",
     temperature = 0.25
@@ -5369,6 +5375,7 @@ fn linear_dictionary_transform_ffi<'py>(
     x: PyReadonlyArray2<'py, f64>,
     atoms: PyReadonlyArray2<'py, f64>,
     top_k: usize,
+    posterior_shrinkage: Option<f64>,
     mean: Option<PyReadonlyArray1<'py, f64>>,
     assignment: &str,
     temperature: f64,
@@ -5382,6 +5389,7 @@ fn linear_dictionary_transform_ffi<'py>(
             x_values.view(),
             atoms_values.view(),
             mean_values.as_ref().map(|mean| mean.view()),
+            posterior_shrinkage,
             top_k,
             assignment_kind,
             temperature,

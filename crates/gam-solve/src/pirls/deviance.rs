@@ -1016,7 +1016,7 @@ pub fn deviance_eta_row_on_measure(
             }
         }
         ResponseFamily::Poisson => {
-            if !valid_count_response(y) {
+            if !gam_spec::is_poisson_response(y) {
                 return Err(EstimationError::pirls_row_geometry_unrepresentable(row, "Poisson response", eta, y));
             }
             let log_r = if y == 0.0 {
@@ -2457,9 +2457,7 @@ fn full_log_likelihood_row(
     }
     let exact_integer = |value: f64| value.is_finite() && value >= 0.0 && value == value.round();
     match &likelihood.spec.response {
-        ResponseFamily::Poisson
-        | ResponseFamily::NegativeBinomial { .. }
-        | ResponseFamily::Beta { .. } => {
+        ResponseFamily::NegativeBinomial { .. } | ResponseFamily::Beta { .. } => {
             if !exact_integer(weight) {
                 return Err(EstimationError::pirls_row_geometry_unrepresentable(
                     row,
@@ -2479,6 +2477,20 @@ fn full_log_likelihood_row(
                 return Err(EstimationError::pirls_row_geometry_unrepresentable(
                     row,
                     "fully-normalized binomial prior weight (finite and positive required)",
+                    eta,
+                    weight,
+                ));
+            }
+        }
+        // gam#4572: the Poisson row's weighted log-mass `w·(y·η − e^η − ln Γ(y+1))`
+        // is the same continuation at any real weight, so a prior weight is a
+        // precision weight here, as it is for the binomial above: a fractional
+        // one is the weighted quasi-likelihood, not an unrepresentable count.
+        ResponseFamily::Poisson => {
+            if !(weight.is_finite() && weight > 0.0) {
+                return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                    row,
+                    "fully-normalized Poisson prior weight (finite and positive required)",
                     eta,
                     weight,
                 ));

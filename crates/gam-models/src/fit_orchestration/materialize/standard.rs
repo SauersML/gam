@@ -47,7 +47,8 @@ pub(crate) fn materialize_standard<'a>(
     );
 
     // Per-family response-support validation (#335 Gamma requires y > 0;
-    // #337 Poisson/NegativeBinomial require non-negative integer counts;
+    // #337 NegativeBinomial requires non-negative integer counts; #4572 Poisson
+    // takes any finite non-negative response;
     // mirrors the Beta (0,1)-support check in the external-design GLM path).
     // The family itself owns the check — see
     // `ResponseFamily::validate_response_support` — so adding a new family

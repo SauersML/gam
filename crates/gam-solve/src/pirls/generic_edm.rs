@@ -121,7 +121,7 @@ pub(crate) fn certify_generic_edm_response(
 ) -> Result<(), EstimationError> {
     let (in_support, quantity) = match generic_edm_variance(cell) {
         EdmVariance::Gaussian => (y.is_finite(), "Gaussian response"),
-        EdmVariance::Poisson => (valid_count_response(y), "Poisson response"),
+        EdmVariance::Poisson => (gam_spec::is_poisson_response(y), "Poisson response"),
         EdmVariance::Gamma => (y.is_finite() && y > 0.0, "Gamma response"),
         EdmVariance::InverseGaussian => (y.is_finite() && y > 0.0, "inverse-Gaussian response"),
         EdmVariance::Bernoulli => (y.is_finite() && (0.0..=1.0).contains(&y), "binomial response"),

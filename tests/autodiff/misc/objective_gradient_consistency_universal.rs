@@ -369,11 +369,11 @@ fn binomial_single_block(seed: u64) -> GlmFixture {
 /// well defined.
 ///
 /// NOT for integer-only families: the response here is `μ·(1 ± 0.2)`, a real
-/// number. This previously read "Poisson / Gamma design", and the Poisson arm
-/// was wired to it on that description — which the Poisson density validly
-/// rejects (the count families' support contract,
-/// `gam_spec::COUNT_RESPONSE_SUPPORT_REQUIREMENT`, at `y = 1.9668…`).
-/// Integer-support families take [`count_response_single_block`].
+/// number, which negative binomial refuses (the count families' support
+/// contract, `gam_spec::COUNT_RESPONSE_SUPPORT_REQUIREMENT`). The Poisson arm
+/// keeps [`count_response_single_block`] so it grades the Poisson objective on
+/// counts; since gam#4572 Poisson would also accept this real response,
+/// through the `ln Γ(y+1)` continuation.
 fn positive_response_single_block(seed: u64, intercept: f64) -> GlmFixture {
     let n = 180usize;
     let p = 7usize;

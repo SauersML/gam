@@ -43,6 +43,12 @@ class LinearDictionaryFit:
     assignment: str
     top_k: int
     training_data: np.ndarray
+    # Posterior-mean code shrinkage the fit applied, exactly as the Rust fit
+    # returns it: ``1/(1 + λ̂)`` at the REML ridge for the K=1 rank-one lanes and
+    # ``None`` for the multi-atom lane, whose codes are unshrunk. ``transform``
+    # hands it back to Rust so held-out codes share the scale of
+    # ``assignments``. It has no default: a fit selects it, a caller never does.
+    posterior_shrinkage: float | None
     # Origin of the fitted model, exactly as the Rust fit returns it: the
     # training column means for the AFFINE centered K=1 lane (``mean +
     # code·atom``) and ``None`` for every LINEAR model. Python never re-derives
@@ -76,7 +82,8 @@ class LinearDictionaryFit:
         Routes the fitted model's assignment rule (the top-``top_k``
         minimum-norm least squares, or the top-``top_k`` softmax at the fitted
         ``temperature``)
-        against the fitted origin ``mean`` through the Rust core
+        against the fitted origin ``mean``, scaled by the fitted
+        ``posterior_shrinkage``, through the Rust core
         (``linear_dictionary_transform``), which also owns the input contract
         (finite ``X``, ``top_k`` in ``[1, K]``). Returns the ``M x K`` codes.
         """
@@ -87,6 +94,7 @@ class LinearDictionaryFit:
             x,
             np.ascontiguousarray(self.atoms, dtype=np.float64),
             int(self.top_k if top_k is None else top_k),
+            self.posterior_shrinkage,
             mean=self.mean,
             assignment=str(self.assignment),
             temperature=float(self.temperature),
@@ -118,6 +126,7 @@ def linear_dictionary_fit(
     )
     data = dict(payload)
     mean = data["mean"]
+    posterior_shrinkage = data["posterior_shrinkage"]
     return LinearDictionaryFit(
         atoms=np.ascontiguousarray(data["atoms"], dtype=np.float64),
         assignments=np.ascontiguousarray(data["assignments"], dtype=np.float64),
@@ -135,6 +144,7 @@ def linear_dictionary_fit(
         assignment=str(data["assignment"]),
         top_k=int(data["top_k"]),
         training_data=x,
+        posterior_shrinkage=None if posterior_shrinkage is None else float(posterior_shrinkage),
         mean=None if mean is None else np.ascontiguousarray(mean, dtype=np.float64),
         temperature=float(temperature),
     )

@@ -109,27 +109,25 @@ fn gamma_log_link_smooth_lowdispersion_fits_with_finite_coefficients() {
     // are well-posed — only the Gamma objective was defective.
     fit_family("gaussian", &data).expect("gaussian smooth fit on the same data must succeed");
 
-    // The Poisson arm cannot be a SUCCESS here: `y` is a continuous Gamma
-    // realization and the count families enforce EXACT integrality
-    // (`valid_count_response` in `crates/gam-solve/src/pirls/family_state.rs`),
-    // because the Poisson log-likelihood is defined at non-integer `y` through
-    // `ln_gamma` and would otherwise evaluate a different model in silence.
-    // Asserting the refusal keeps the control — the smooth, its basis and its
-    // penalty must still be built and carried to the family's domain check —
-    // and is strictly stronger than the success that the response never
-    // qualified for.
-    let poisson_refusal = fit_family("poisson", &data)
-        .expect_err("poisson must refuse a non-integer (continuous Gamma) response");
-    // The contract is gam-spec's one text, matched as the constant rather
-    // than as a copy of it. Two wordings for one contract is what made this
-    // control red: the fit-boundary support check refuses first, and the
-    // P-IRLS row scan's wording, which this used to quote, never reached the
-    // caller on this path.
+    // The count-integrality control is negative binomial, whose support is still the non-negative
+    // integers: `y` here is a continuous Gamma draw, so it must refuse, and its refusal naming
+    // the count contract is what shows the smooth basis and penalty were built and reached the
+    // family. Poisson used to be this control; since gam#4572 its support is the non-negative
+    // reals (a non-integer `y` is evaluated through the `ln Γ(y+1)` continuation, the Poisson
+    // quasi-likelihood at dispersion one), so on this response it must FIT, and it is asserted to
+    // below.
+    let count_refusal = fit_family("negative-binomial", &data)
+        .expect_err("negative binomial must refuse a non-integer (continuous Gamma) response");
     assert!(
-        poisson_refusal.contains(gam_spec::COUNT_RESPONSE_SUPPORT_REQUIREMENT),
-        "the poisson control must fail on the COUNT-INTEGRALITY contract (proving \
-         the smooth basis and penalty were built and reached the family), got: \
-         {poisson_refusal}"
+        count_refusal.contains(gam_spec::COUNT_RESPONSE_SUPPORT_REQUIREMENT),
+        "the negative-binomial control must fail on the COUNT-INTEGRALITY contract (proving \
+         the smooth basis and penalty were built and reached the family), got: {count_refusal}"
+    );
+    let poisson = fit_family("poisson", &data)
+        .expect("an explicit Poisson family fits a non-negative real response");
+    assert!(
+        poisson.iter().all(|value| value.is_finite()),
+        "the Poisson quasi-likelihood fit returned non-finite coefficients: {poisson:?}"
     );
 
     // The defect: gamma aborted at REML startup with `objective returned a

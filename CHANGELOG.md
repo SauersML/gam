@@ -1,5 +1,32 @@
 ## Unreleased
 
+- **Full conformal locates a score breakpoint its rounded root lands two or more ulps from, by exact
+  signs on the f64 lattice, instead of refusing** (#3338). The factor's exact sign is monotone on the
+  lattice, so the search walks outward in doubling strides and bisects the last one; every step is an
+  exact endpoint sign. Three of the five coverage cells refused at 4057627f4b now pass; the other two
+  get past isolation and are graded on coverage.
+- **An explicit Poisson family fits a non-negative real response and fractional prior weights**
+  (#4572). Under a log link the Poisson fit depends on `y` only through `Xᵀ W y`, so pseudo-counts
+  that share a table's sufficient statistics (iterative proportional fitting to known margins)
+  give the table's coefficients, smoothing parameters and covariance. A non-integer `y` is
+  evaluated through the `ln Γ(y+1)` continuation of the log-mass, the Poisson quasi-likelihood at
+  dispersion one, and a prior weight is a precision weight, as the binomial's already was.
+  Negative binomial keeps the integer-count contract, and response auto-inference still picks
+  Poisson only for an all-integer column, so a real response reaches Poisson only when the family
+  is named.
+- **GLM full conformal re-selects every smoothing strength of a multi-penalty Bernoulli or
+  Poisson fit on the augmented rows** (#4103). v40 payloads carry the penalty components, the
+  criterion's `ln|Σ e^{ρ_k} S_k|₊` and its gradient are formed from them (never from the summed
+  penalty), and at one strength the gradient is the scalar jet bit for bit. Those rows report
+  `honest_refit` instead of `refused:multi_penalty`; v39 payloads keep the refusal.
+- **The cone-Laplace (EP) term no longer costs O(q³) in the constraint rows it pulls in** (#4567,
+  #979). A transformation-normal fit went silent for minutes inside `ConeLaplace::evaluate` once a
+  small smoothing strength widened the posterior over a few hundred of its 24000 monotonicity
+  rows. Each EP site update now carries `Λ⁻¹` and `δ̄` by Sherman–Morrison in coefficient space
+  (O(p²) per site), the per-row horizon test is one `AΛ⁻¹` product, and the linearized fixed point
+  is factored once by LU instead of an explicit Gauss–Jordan inverse, or, past the flop crossover,
+  solved exactly through the rank-`p(p+1)/2 + p` Woodbury capacitance the cone normalizer already
+  uses.
 - `c5ba2177df` moved the two Matérn third-order penalty sites from
   `ConstructiveQuadratic::try_from_dense_psd` to
   `unit_frobenius_from_gram_within_rounding_band`, on the stated ground that the former
@@ -25,7 +52,18 @@
   complement measures. `code_ridge` is deleted from `LinearDictionaryConfig`, from
   `linear_dictionary_transform`, from both pyffi entry points and from the Python signature and
   stubs. The sparse lane's `code_ridge` is untouched: there it is explicitly an initial value
-  that the fit selects from and records in `selected_rho`.
+  that the fit selects from and records in `selected_rho`. The rank-one lane's code is the
+  posterior mean `(x·a)/(1 + λ̂)`, so the transform must apply the same factor or a held-out row
+  is encoded on a different scale from the fit's own codes: `LinearDictionaryFit` carries it as
+  `posterior_shrinkage` (`Some(1/(1 + λ̂))` for the rank-one lanes, `None` for the multi-atom
+  lane, whose codes are the unshrunk routing), `linear_dictionary_transform` and
+  `linear_dictionary_transform_ffi` take it with no default, and the Python
+  `LinearDictionaryFit.transform` passes the fitted value. The per-atom update no longer hands
+  its ridge's shrinkage to the codes: the ridge's posterior mean has the least-squares atom's
+  direction, the unit-norm gauge removes its magnitude, and moving that magnitude into the codes
+  made the sweep a shrunk estimator the canonical routing is not, so `routing_residual` measured
+  the shrinkage and the fit could not certify. The sweep rescales codes by the least-squares
+  magnitude, and `λ̂_k` acts through its identification verdict and its report in `lambdas`.
 - Four #2433 / #2735 fixtures were tuned to `spectral_tolerance = dim·1e-10·λ_max`, which
   `0f72c1e70e` (#2901) replaced with the spectrum's rounding band `dim·ε·λ_max`, five to
   seven decades tighter. Three are retuned so their modes sit in the window where the

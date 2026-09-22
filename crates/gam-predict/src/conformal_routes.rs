@@ -261,7 +261,8 @@ pub fn full_conformal_prediction_columns(
                 penalty.s_lambda().clone(),
                 penalty.penalty_count(),
                 fit.beta.clone(),
-            )?;
+            )?
+            .with_components(penalty.components().to_vec())?;
             for i in 0..n_test {
                 let x_star = x_test.row(i).to_owned();
                 let set = substrate

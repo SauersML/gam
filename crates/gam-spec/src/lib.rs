@@ -946,9 +946,8 @@ impl ResponseFamily {
             Self::Gamma | Self::InverseGaussian => {
                 Some("strictly positive response values (y > 0)")
             }
-            Self::Poisson | Self::NegativeBinomial { .. } => {
-                Some(COUNT_RESPONSE_SUPPORT_REQUIREMENT)
-            }
+            Self::Poisson => Some(POISSON_RESPONSE_SUPPORT_REQUIREMENT),
+            Self::NegativeBinomial { .. } => Some(COUNT_RESPONSE_SUPPORT_REQUIREMENT),
             Self::Tweedie { .. } => Some("non-negative response values (y ≥ 0)"),
             Self::Beta { .. } => Some(
                 "response values strictly in the open interval (0, 1) \
@@ -975,7 +974,8 @@ impl ResponseFamily {
     fn response_support_contains(&self, yi: f64) -> bool {
         match self {
             Self::Gamma | Self::InverseGaussian => yi.is_finite() && yi > 0.0,
-            Self::Poisson | Self::NegativeBinomial { .. } => is_count_value(yi),
+            Self::Poisson => is_poisson_response(yi),
+            Self::NegativeBinomial { .. } => is_count_value(yi),
             Self::Tweedie { .. } => yi.is_finite() && yi >= 0.0,
             Self::Beta { .. } => yi.is_finite() && yi > 0.0 && yi < 1.0,
             Self::Binomial => yi.is_finite() && (0.0..=1.0).contains(&yi),
@@ -2327,7 +2327,7 @@ pub const fn is_valid_tweedie_power(p: f64) -> bool {
 
 /// The count families' response-support contract, written once.
 ///
-/// `Poisson` and `NegativeBinomial` refuse a non-integer `y` at TWO layers: the
+/// `NegativeBinomial` refuses a non-integer `y` at TWO layers: the
 /// fit-boundary support check ([`ResponseFamily::validate_response_support`],
 /// which reaches the caller first) and the P-IRLS row scan
 /// (`gam_solve::pirls::certify_count_responses`, which is what runs once a fit
@@ -2337,9 +2337,38 @@ pub const fn is_valid_tweedie_power(p: f64) -> bool {
 /// same wherever it is enforced and a caller matches on the constant rather than
 /// on a copy of it.
 pub const COUNT_RESPONSE_SUPPORT_REQUIREMENT: &str =
-    "non-negative integer counts (y = 0, 1, 2, ...); for non-negative non-integer data use a \
-     Tweedie family (for example family='tweedie(p=1.5)'), and model a rate as an integer count \
-     with a log-exposure offset";
+    "non-negative integer counts (y = 0, 1, 2, ...); for non-negative non-integer data use \
+     family='poisson', whose log-mass extends to real y, or a Tweedie family (for example \
+     family='tweedie(p=1.5)')";
+
+/// The Poisson family's response-support contract (gam#4572): finite and
+/// non-negative, integer or not.
+///
+/// A non-integer `y` is evaluated through the `ln Γ(y + 1)` continuation of the
+/// log-mass, `y·η − e^η − ln Γ(y + 1)`. That is not a probability mass, and it
+/// is not meant to be one: under a log link the fit's score equations, its
+/// Laplace/REML criterion and its posterior covariance depend on `y` only
+/// through `Xᵀy` plus a term free of both `β` and `ρ`, so ANY non-negative `y*`
+/// with `Xᵀy* = Xᵀy` yields the same coefficients, smoothing parameters and
+/// covariance. That is the sufficient-statistic fit #4572 asks for (pseudo-counts
+/// from iterative proportional fitting to known margins, for example), and it is
+/// the Poisson quasi-likelihood at dispersion one, which mgcv and `glm` also fit.
+///
+/// Negative binomial keeps [`COUNT_RESPONSE_SUPPORT_REQUIREMENT`], and response
+/// auto-inference still chooses Poisson only for an all-integer column, so a
+/// non-integer response reaches this contract only when the caller names the
+/// family.
+pub const POISSON_RESPONSE_SUPPORT_REQUIREMENT: &str =
+    "finite non-negative response values (y ≥ 0); a non-integer y is evaluated through the \
+     ln Γ(y+1) continuation of the log-mass, which under a log link leaves the fit a function of \
+     Xᵀy (the Poisson quasi-likelihood at dispersion one)";
+
+/// The row-level Poisson response contract: finite and non-negative. See
+/// [`POISSON_RESPONSE_SUPPORT_REQUIREMENT`] for why integrality is not required.
+#[inline]
+pub fn is_poisson_response(y: f64) -> bool {
+    y.is_finite() && y >= 0.0
+}
 
 /// The row-level count-response contract: finite, non-negative, and an exact
 /// integer.
@@ -4238,20 +4267,34 @@ mod tests {
     #[test]
     fn count_support_rejects_non_integer_values() {
         let y = arr1(&[0.0_f64, 1.0, 2.5, 4.0]);
-        for family in [
-            ResponseFamily::Poisson,
-            ResponseFamily::NegativeBinomial {
-                theta: 1.0,
-                theta_fixed: true,
-            },
-        ] {
-            let err = family
-                .validate_response_support(y.view(), unit_weights(&y).view())
-                .expect_err("a non-integer count is outside the count support");
-            assert_eq!(err.offending, vec![(2, 2.5)]);
-            let msg = err.message_for("count");
-            assert!(msg.contains("tweedie"), "message: {msg}");
+        let err = ResponseFamily::NegativeBinomial {
+            theta: 1.0,
+            theta_fixed: true,
         }
+        .validate_response_support(y.view(), unit_weights(&y).view())
+        .expect_err("a non-integer count is outside the negative-binomial support");
+        assert_eq!(err.offending, vec![(2, 2.5)]);
+        let msg = err.message_for("count");
+        assert!(msg.contains("tweedie"), "message: {msg}");
+        assert!(msg.contains("poisson"), "message: {msg}");
+    }
+
+    /// gam#4572: Poisson's support is the finite non-negative reals; a
+    /// non-integer response is evaluated through the `ln Γ(y+1)` continuation.
+    /// A negative value is still outside it.
+    #[test]
+    fn poisson_support_is_the_non_negative_reals_4572() {
+        let y = arr1(&[0.0_f64, 1.0, 2.5, 4.0]);
+        assert!(
+            ResponseFamily::Poisson
+                .validate_response_support(y.view(), unit_weights(&y).view())
+                .is_ok()
+        );
+        let bad = arr1(&[0.0_f64, -0.5, 3.0]);
+        let err = ResponseFamily::Poisson
+            .validate_response_support(bad.view(), unit_weights(&bad).view())
+            .expect_err("a negative response is outside the Poisson support");
+        assert_eq!(err.offending, vec![(1, -0.5)]);
     }
 
     #[test]

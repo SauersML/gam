@@ -392,7 +392,7 @@ pub(crate) fn write_poisson_log_working_state(
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) -> Result<(), EstimationError> {
-    validate_count_responses(&y, &priorweights, "Poisson")?;
+    validate_poisson_responses(&y, &priorweights)?;
     log_link_working_state::write_log_link_working_state(
         &log_link_working_state::LogLinkRule {
             weight: log_link_working_state::WorkingWeight::PoissonIdentity,
@@ -784,6 +784,33 @@ pub fn certify_count_responses(
                 gam_spec::COUNT_RESPONSE_SUPPORT_REQUIREMENT
             ));
         }
+    }
+    Ok(())
+}
+
+/// The Poisson counterpart of [`certify_count_responses`]: finite and
+/// non-negative, integer or not (gam#4572, [`gam_spec::POISSON_RESPONSE_SUPPORT_REQUIREMENT`]).
+pub fn certify_poisson_responses(
+    y: &ArrayView1<'_, f64>,
+    weights: &ArrayView1<'_, f64>,
+) -> Result<(), String> {
+    for (i, (&yi, &wi)) in y.iter().zip(weights.iter()).enumerate() {
+        if wi > 0.0 && !gam_spec::is_poisson_response(yi) {
+            return Err(format!(
+                "Poisson response requires {}; positive-weight row {i} has y = {yi}",
+                gam_spec::POISSON_RESPONSE_SUPPORT_REQUIREMENT
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_poisson_responses(
+    y: &ArrayView1<'_, f64>,
+    priorweights: &ArrayView1<'_, f64>,
+) -> Result<(), EstimationError> {
+    if let Err(message) = certify_poisson_responses(y, priorweights) {
+        crate::bail_invalid_estim!("{message}");
     }
     Ok(())
 }

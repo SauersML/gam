@@ -39,12 +39,11 @@
 //!
 //! The penalty is frozen at the training fit, whose smoothing parameters saw
 //! the n training responses and not the test response. A row of a fit that
-//! selected a smoothing parameter (except the one-strength map below) or a
-//! negative-binomial θ therefore reports
+//! selected a smoothing parameter (except under the re-selecting maps below) or
+//! a negative-binomial θ therefore reports
 //! a typed refusal certificate: the numerical enclosure uses a frozen map
-//! without a guarantee for training-selected strengths. The one-strength map
-//! below re-selects its strength; see
-//! [`ConformalGlmFamily::certificate`].
+//! without a guarantee for training-selected strengths. The maps below
+//! re-select their strengths; see [`ConformalGlmFamily::certificate`].
 //!
 //! # Strength re-selection, and the level walk it forces
 //!
@@ -56,6 +55,14 @@
 //! LAML minimization. Selection failures propagate as errors, without a
 //! frozen-fit replacement. The score comparison remains a conservative
 //! numerical enclosure, now for the re-selecting fitting map.
+//!
+//! With `K ≥ 2` selected strengths the same holds over `ρ ∈ R^K` at
+//! `Σ_k e^{ρ_k} S_k`, each component at unit Frobenius norm and each coordinate
+//! bounded to its own resolvability interval (gam#4103). That map needs the
+//! components themselves, because its criterion's `log|Σ_k e^{ρ_k}S_k|₊` is not
+//! a function of their sum; a payload written before they were carried (v39 or
+//! older) keeps [`ConformalRefusal::MultiPenalty`]. Its search is
+//! gradient-based, with the `K × K` second derivative declared unavailable.
 //!
 //! Re-selection applies to the families whose likelihood carries no nuisance
 //! parameter beside the strength — Bernoulli-logit and Poisson-log. The Gamma
@@ -208,20 +215,31 @@ impl ConformalGlmFamily {
     }
 
     /// What this arm's set guarantees for a fit that selected `penalty_count`
-    /// smoothing parameters (`None` for a payload that did not record it).
+    /// smoothing parameters (`None` for a payload that did not record it), with
+    /// `component_count` the per-penalty blocks the payload carries (zero for a
+    /// v39 or older payload).
     ///
     /// With no smoothing parameter the frozen-penalty fitting map selects
     /// nothing from the responses (the Gamma dispersion does not enter an
     /// unpenalized fit, and the score is dispersion-free), so the numerical set is
-    /// a conservative enclosure. One selected strength is re-selected on the
+    /// a conservative enclosure. The selected strengths are re-selected on the
     /// augmented rows for the two families whose likelihood has no nuisance
-    /// parameter beside it — Bernoulli and Poisson. The Gamma dispersion and the
-    /// negative-binomial θ are themselves estimated from the responses, so
-    /// re-selecting the strength alone would move the asymmetry rather than
-    /// remove it; those rows keep
-    /// [`ConformalRefusal::GlmFrozenPenalty`], and more than one selected
-    /// strength keeps [`ConformalRefusal::MultiPenalty`].
-    pub fn certificate(self, penalty_count: Option<usize>) -> ConformalCertificate {
+    /// parameter beside them — Bernoulli and Poisson. The Gamma dispersion and
+    /// the negative-binomial θ are themselves estimated from the responses, so
+    /// re-selecting the strengths alone would move the asymmetry rather than
+    /// remove it; those rows keep [`ConformalRefusal::GlmFrozenPenalty`].
+    ///
+    /// One strength re-selects off the frozen sum alone, because its criterion's
+    /// `log|e^ρS|₊` is `rank(S)·ρ` plus a constant. Several need the components:
+    /// `log|Σ_k e^{ρ_k}S_k|₊` is a function of the blocks, which their sum has
+    /// lost (#2644). So more than one strength is honest only when the payload
+    /// carries one component per strength, and keeps
+    /// [`ConformalRefusal::MultiPenalty`] otherwise (gam#4103).
+    pub fn certificate(
+        self,
+        penalty_count: Option<usize>,
+        component_count: usize,
+    ) -> ConformalCertificate {
         match (self, penalty_count) {
             (_, None) => ConformalCertificate::Refused(ConformalRefusal::UnknownPenaltyStructure),
             (Self::NegativeBinomialLog { .. }, _) => {
@@ -229,6 +247,9 @@ impl ConformalGlmFamily {
             }
             (_, Some(0)) => ConformalCertificate::ConservativeFrozen,
             (Self::BernoulliLogit | Self::PoissonLog, Some(1)) => ConformalCertificate::HonestRefit,
+            (Self::BernoulliLogit | Self::PoissonLog, Some(count)) if count == component_count => {
+                ConformalCertificate::HonestRefit
+            }
             (Self::BernoulliLogit | Self::PoissonLog, Some(_)) => {
                 ConformalCertificate::Refused(ConformalRefusal::MultiPenalty)
             }
@@ -341,6 +362,9 @@ impl ConformalGlmFamily {
     /// ([`Self::certificate`] refuses them before a jet is ever asked for), so
     /// this returns a curvature only where one is used rather than carrying an
     /// unreachable arm.
+    ///
+    /// The `K`-strength criterion ([`GlmFullConformalSubstrate::laml_gradient`])
+    /// reads `w` and `w′` only.
     fn weight_jet(self, eta: f64) -> Option<(f64, f64, f64)> {
         match self {
             Self::BernoulliLogit => {
@@ -505,6 +529,49 @@ struct LamlJet {
     beta: Array1<f64>,
 }
 
+/// The `K ≥ 2` smoothing strengths the honest map re-selects per candidate
+/// level (gam#4103).
+#[derive(Clone, Debug)]
+struct MultiReselection {
+    /// Each penalty component at unit Frobenius norm, `S_k/‖S_k‖_F`; the map
+    /// fits at `Σ_k e^{ρ_k} S_k`, formed from these and never from the frozen
+    /// sum.
+    units: Vec<Array2<f64>>,
+    /// `XᵀX` of the labeled rows; the test row adds `x_* x_*ᵀ`.
+    gram: Array2<f64>,
+}
+
+impl MultiReselection {
+    /// `Σ_k λ_k S_k` over the unit components.
+    fn penalty_at(&self, lambdas: &[f64]) -> Array2<f64> {
+        let p = self.gram.nrows();
+        let mut penalty = Array2::<f64>::zeros((p, p));
+        for (unit, &lambda) in self.units.iter().zip(lambdas) {
+            penalty.scaled_add(lambda, unit);
+        }
+        penalty
+    }
+}
+
+/// One Laplace-REML evaluation of the `K`-strength honest map at `ρ ∈ R^K`:
+/// the value and its gradient. The `K × K` second derivative is not formed, and
+/// the selection declares it unavailable.
+struct LamlGradient {
+    value: f64,
+    gradient: Array1<f64>,
+    beta: Array1<f64>,
+}
+
+/// Which re-selecting map an honest level is fitted under.
+#[derive(Clone, Copy)]
+enum HonestMap<'a> {
+    /// One strength, selected by [`GlmFullConformalSubstrate::select_strength`].
+    Single(&'a Reselection),
+    /// `K ≥ 2` strengths, selected by
+    /// [`GlmFullConformalSubstrate::select_strengths`].
+    Multi(&'a MultiReselection),
+}
+
 /// Maximal runs of consecutive integers among the increasing `levels`.
 fn level_runs(levels: impl IntoIterator<Item = f64>) -> Vec<ConformalInterval> {
     let mut runs = Vec::<ConformalInterval>::new();
@@ -515,6 +582,52 @@ fn level_runs(levels: impl IntoIterator<Item = f64>) -> Vec<ConformalInterval> {
         }
     }
     runs
+}
+
+/// A symmetric penalty at unit Frobenius norm, with its rank.
+struct UnitPenalty {
+    unit: Array2<f64>,
+    /// Counted at the REML engine's positive-eigenvalue threshold.
+    rank: usize,
+}
+
+/// `S/‖S‖_F` for a symmetric `S` whose largest entry magnitude is `largest`
+/// (nonzero), refusing a normalization that erases an entry or a penalty that
+/// is not resolved positive semidefinite with a nonzero rank.
+fn unit_penalty(penalty: &Array2<f64>, largest: f64) -> Result<UnitPenalty, String> {
+    // Scale before squaring: a finite penalty of any magnitude
+    // must not become an infinite norm or a false zero penalty.
+    let scaled = penalty.mapv(|v| v / largest);
+    if penalty
+        .iter()
+        .zip(scaled.iter())
+        .any(|(&original, &value)| original != 0.0 && value == 0.0)
+    {
+        return Err("honest conformal: penalty normalization loses a nonzero entry".into());
+    }
+    let norm = scaled.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let unit = scaled.mapv(|v| v / norm);
+    if scaled
+        .iter()
+        .zip(unit.iter())
+        .any(|(&scaled, &value)| scaled != 0.0 && value == 0.0)
+    {
+        return Err("honest conformal: unit penalty normalization loses a nonzero entry".into());
+    }
+    let (evals, _) = unit
+        .eigh(Side::Lower)
+        .map_err(|e| format!("honest conformal: penalty eigendecomposition failed: {e:?}"))?;
+    let evals = evals.to_vec();
+    let threshold =
+        gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(&evals);
+    if evals.iter().any(|&v| !v.is_finite() || v < -threshold) {
+        return Err("honest conformal: penalty is not resolved positive semidefinite".into());
+    }
+    let rank = evals.iter().filter(|&&v| v > threshold).count();
+    if rank == 0 {
+        return Err("honest conformal: nonzero penalty rank is unresolved".into());
+    }
+    Ok(UnitPenalty { unit, rank })
 }
 
 /// Labeled rows, frozen penalty and warm start of a non-Gaussian full-conformal
@@ -533,8 +646,14 @@ pub struct GlmFullConformalSubstrate {
     /// A column that is identically one on the labeled rows with an all-zero
     /// penalty row and column: the unpenalised intercept the tail bounds use.
     intercept: Option<usize>,
+    /// The number of strengths the fit selected, which [`Self::with_components`]
+    /// checks the blocks it is given against.
+    penalty_count: Option<usize>,
     certificate: ConformalCertificate,
+    /// The one-strength map; `None` whenever [`Self::multi_reselection`] is set.
     reselection: Option<Reselection>,
+    /// The `K ≥ 2`-strength map; `None` whenever [`Self::reselection`] is set.
+    multi_reselection: Option<MultiReselection>,
 }
 
 impl GlmFullConformalSubstrate {
@@ -543,6 +662,10 @@ impl GlmFullConformalSubstrate {
     /// must be positive semidefinite), `penalty_count` declares how many strengths
     /// were selected from the training responses, and `warm_start` gives the fitted
     /// coefficients, the Newton starting point of every augmented solve.
+    ///
+    /// Carries no penalty components, so a fit that selected more than one
+    /// strength keeps [`ConformalRefusal::MultiPenalty`] until
+    /// [`Self::with_components`] supplies them.
     pub fn new(
         family: ConformalGlmFamily,
         x: Array2<f64>,
@@ -607,36 +730,15 @@ impl GlmFullConformalSubstrate {
         if warm_start.iter().any(|v| !v.is_finite()) {
             return Err("full conformal: warm-start coefficients must be finite".into());
         }
-        let mut certificate = family.certificate(penalty_count);
+        // No components yet: several strengths refuse here, and
+        // `with_components` re-reads the certificate once it holds the blocks.
+        let mut certificate = family.certificate(penalty_count, 0);
         let mut reselection = None;
         if certificate == ConformalCertificate::HonestRefit {
             let largest = s_lambda.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
             if largest == 0.0 {
                 certificate = ConformalCertificate::ConservativeFrozen;
             } else {
-                // Scale before squaring: a finite penalty of any magnitude
-                // must not become an infinite norm or a false zero penalty.
-                let scaled = s_lambda.mapv(|v| v / largest);
-                if s_lambda
-                    .iter()
-                    .zip(scaled.iter())
-                    .any(|(&original, &value)| original != 0.0 && value == 0.0)
-                {
-                    return Err(
-                        "honest conformal: penalty normalization loses a nonzero entry".into(),
-                    );
-                }
-                let norm = scaled.iter().map(|v| v * v).sum::<f64>().sqrt();
-                let unit = scaled.mapv(|v| v / norm);
-                if scaled
-                    .iter()
-                    .zip(unit.iter())
-                    .any(|(&scaled, &value)| scaled != 0.0 && value == 0.0)
-                {
-                    return Err(
-                        "honest conformal: unit penalty normalization loses a nonzero entry".into(),
-                    );
-                }
                 for a in 0..p {
                     for b in 0..a {
                         if s_lambda[[a, b]] != s_lambda[[b, a]] {
@@ -644,26 +746,10 @@ impl GlmFullConformalSubstrate {
                         }
                     }
                 }
-                let (evals, _) = unit.eigh(Side::Lower).map_err(|e| {
-                    format!("honest conformal: penalty eigendecomposition failed: {e:?}")
-                })?;
-                let evals = evals.to_vec();
-                let threshold =
-                    gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(
-                        &evals,
-                    );
-                if evals.iter().any(|&v| !v.is_finite() || v < -threshold) {
-                    return Err(
-                        "honest conformal: penalty is not resolved positive semidefinite".into(),
-                    );
-                }
-                let rank = evals.iter().filter(|&&v| v > threshold).count();
-                if rank == 0 {
-                    return Err("honest conformal: nonzero penalty rank is unresolved".into());
-                }
+                let normalized = unit_penalty(&s_lambda, largest)?;
                 reselection = Some(Reselection {
-                    unit,
-                    rank,
+                    unit: normalized.unit,
+                    rank: normalized.rank,
                     gram: x.t().dot(&x),
                 });
             }
@@ -677,9 +763,108 @@ impl GlmFullConformalSubstrate {
             s_lambda,
             warm_start,
             intercept,
+            penalty_count,
             certificate,
             reselection,
+            multi_reselection: None,
         })
+    }
+
+    /// Carry the penalty's components in the fit's own basis, one `p × p` block
+    /// per selected strength, aligned with the strengths the fit selected
+    /// (gam#4103). An empty list (a v39 or older payload) changes nothing.
+    ///
+    /// Several strengths are re-selected against these blocks
+    /// ([`Self::select_strengths`]), and only here does such a fit's certificate
+    /// become [`ConformalCertificate::HonestRefit`]: the map that certificate
+    /// names exists once the blocks do. One strength keeps re-selecting off
+    /// `s_lambda` ([`Self::select_strength`]), whose criterion needs nothing
+    /// more, so its block is validated and not read.
+    ///
+    /// Each block is held at unit Frobenius norm, as the one-strength map holds
+    /// its penalty, so the selection does not depend on the units a block was
+    /// stored in. The fitted `ln λ_k` are deliberately not an input: they were
+    /// selected on the training rows alone, and a search started from them
+    /// would treat the test row differently from the rows it joins. The outer
+    /// engine starts from its own start, as it does for one strength.
+    pub fn with_components(mut self, components: Vec<Array2<f64>>) -> Result<Self, String> {
+        if components.is_empty() {
+            return Ok(self);
+        }
+        let family = self.family.name();
+        if self.penalty_count != Some(components.len()) {
+            return Err(format!(
+                "{family} full conformal: {} penalty component(s) against a fit that selected \
+                 {:?} smoothing parameter(s)",
+                components.len(),
+                self.penalty_count
+            ));
+        }
+        let p = self.p();
+        for (index, block) in components.iter().enumerate() {
+            if block.nrows() != p || block.ncols() != p {
+                return Err(format!(
+                    "{family} full conformal: penalty component {index} is {}x{} on a \
+                     {p}-column design",
+                    block.nrows(),
+                    block.ncols()
+                ));
+            }
+            if block.iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "{family} full conformal: penalty component {index} is not finite"
+                ));
+            }
+        }
+        let certificate = self
+            .family
+            .certificate(self.penalty_count, components.len());
+        if certificate != ConformalCertificate::HonestRefit || components.len() == 1 {
+            return Ok(self);
+        }
+        let mut units = Vec::with_capacity(components.len());
+        for (index, block) in components.iter().enumerate() {
+            let context = |reason: String| format!("penalty component {index}: {reason}");
+            // A component is `RᵀR` for the term's penalty root, and a
+            // non-mirroring product leaves its two triangles disagreeing by at
+            // most its assembly band; past that it is not a symmetric penalty.
+            // Inside it the two triangles are averaged, the `(M + Mᵀ)/2` every
+            // symmetric reader of it would otherwise take one half of.
+            let assembly = gam_linalg::roundoff::SymmetricAssembly::penalized_gram(0, p);
+            let mut symmetric = block.clone();
+            for a in 0..p {
+                for b in 0..a {
+                    let band = gam_linalg::roundoff::symmetric_assembly_band(
+                        assembly,
+                        block[[a, a]],
+                        block[[b, b]],
+                    );
+                    if !((block[[a, b]] - block[[b, a]]).abs() <= band) {
+                        return Err(context(
+                            "honest conformal: penalty must be symmetric".into(),
+                        ));
+                    }
+                    let average = 0.5 * block[[a, b]] + 0.5 * block[[b, a]];
+                    symmetric[[a, b]] = average;
+                    symmetric[[b, a]] = average;
+                }
+            }
+            let largest = symmetric.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+            if largest == 0.0 {
+                return Err(context(
+                    "honest conformal: a selected strength scales a zero penalty".into(),
+                ));
+            }
+            // The rank is re-read by the criterion's pseudo-determinant over the
+            // sum; here it only has to be resolved, which `unit_penalty` checks.
+            units.push(unit_penalty(&symmetric, largest).map_err(context)?.unit);
+        }
+        self.certificate = certificate;
+        self.multi_reselection = Some(MultiReselection {
+            units,
+            gram: self.x.t().dot(&self.x),
+        });
+        Ok(self)
     }
 
     fn n(&self) -> usize {
@@ -749,8 +934,13 @@ impl GlmFullConformalSubstrate {
             offset: offset_star,
         };
         let tau = conformal_rank_threshold(alpha, self.n() + 1);
-        let intervals = if let Some(reselection) = &self.reselection {
-            self.honest_discrete_set(reselection, &row, tau, tie_uniform)?
+        let honest = match (&self.reselection, &self.multi_reselection) {
+            (Some(reselection), _) => Some(HonestMap::Single(reselection)),
+            (None, Some(multi)) => Some(HonestMap::Multi(multi)),
+            (None, None) => None,
+        };
+        let intervals = if let Some(map) = honest {
+            self.honest_discrete_set(map, &row, tau, tie_uniform)?
         } else if self.family.is_discrete() {
             self.discrete_set(&row, tau, tie_uniform)
         } else {
@@ -1026,16 +1216,17 @@ impl GlmFullConformalSubstrate {
     }
 
     /// The discrete set of the honest map: each candidate level `z` is fitted at
-    /// the strength `ρ̂(z)` the augmented data select, and its rank is decided by
-    /// the certified solve at `e^{ρ̂(z)} S`. Returns the reason when a selection
-    /// does not complete; there is no frozen-fit substitution.
+    /// the strength `ρ̂(z)` the augmented data select (a vector of them under
+    /// [`HonestMap::Multi`]), and its rank is decided by the certified solve at
+    /// that penalty. Returns the reason when a selection does not complete;
+    /// there is no frozen-fit substitution.
     ///
     /// Bernoulli has two levels and walks both. The count families walk
     /// `z = 0, 1, 2, …`; [`Self::honest_count_levels`] says why a level walk
     /// replaces the frozen arm's score-space bisection and what closes it.
     fn honest_discrete_set(
         &self,
-        reselection: &Reselection,
+        map: HonestMap<'_>,
         row: &TestRow<'_>,
         tau: f64,
         u_tie: f64,
@@ -1048,7 +1239,7 @@ impl GlmFullConformalSubstrate {
             let twin = self.twin_rows(row);
             let mut kept = Vec::with_capacity(2);
             for z in [0.0, 1.0] {
-                if self.honest_level(reselection, row, z, tau, u_tie, &twin)?.0 {
+                if self.honest_level(map, row, z, tau, u_tie, &twin)?.0 {
                     kept.push(z);
                 }
             }
@@ -1058,19 +1249,28 @@ impl GlmFullConformalSubstrate {
     }
 
     /// One level of the honest walk: the strength `ρ̂(z)` the augmented rows
-    /// select, the membership the certified solve at `e^{ρ̂(z)} S` decides, and
-    /// that solve's certified lower bound on the test score `|u_*|`.
+    /// select, the membership the certified solve at `e^{ρ̂(z)} S` (at
+    /// `Σ_k e^{ρ̂_k(z)} S_k` under [`HonestMap::Multi`]) decides, and that
+    /// solve's certified lower bound on the test score `|u_*|`.
     fn honest_level(
         &self,
-        reselection: &Reselection,
+        map: HonestMap<'_>,
         row: &TestRow<'_>,
         z: f64,
         tau: f64,
         u_tie: f64,
         twin: &[bool],
     ) -> Result<(bool, f64), String> {
-        let (rho, beta) = self.select_strength(reselection, row, z)?;
-        let refit = self.at_strength(reselection, rho, beta)?;
+        let refit = match map {
+            HonestMap::Single(reselection) => {
+                let (rho, beta) = self.select_strength(reselection, row, z)?;
+                self.at_strength(reselection, rho, beta)?
+            }
+            HonestMap::Multi(multi) => {
+                let (rho, beta) = self.select_strengths(multi, row, z)?;
+                self.at_strengths(multi, &rho, beta)?
+            }
+        };
         Ok(refit.count_member_scored(row, z, u_tie, twin, tau))
     }
 
@@ -1292,15 +1492,7 @@ impl GlmFullConformalSubstrate {
             ));
         }
         let beta = node.beta;
-        let mut x_aug = Array2::<f64>::zeros((n + 1, p));
-        x_aug.slice_mut(ndarray::s![..n, ..]).assign(&self.x);
-        x_aug.row_mut(n).assign(row.x);
-        let mut offset_aug = Array1::<f64>::zeros(n + 1);
-        offset_aug.slice_mut(ndarray::s![..n]).assign(&self.offset);
-        offset_aug[n] = row.offset;
-        let mut y_aug = Array1::<f64>::zeros(n + 1);
-        y_aug.slice_mut(ndarray::s![..n]).assign(&self.y);
-        y_aug[n] = z;
+        let (x_aug, offset_aug, y_aug) = self.augmented_rows(row, z);
         let eta = fast_av(&x_aug, &beta) + &offset_aug;
         let mut w = Array1::<f64>::zeros(n + 1);
         let mut w1 = Array1::<f64>::zeros(n + 1);
@@ -1355,6 +1547,270 @@ impl GlmFullConformalSubstrate {
             value,
             gradient,
             hessian,
+            beta,
+        })
+    }
+
+    /// The design, offsets and responses of the `n + 1` augmented rows: the
+    /// labeled rows, then the test row carrying the candidate `z`.
+    fn augmented_rows(&self, row: &TestRow<'_>, z: f64) -> (Array2<f64>, Array1<f64>, Array1<f64>) {
+        let n = self.n();
+        let mut x_aug = Array2::<f64>::zeros((n + 1, self.p()));
+        x_aug.slice_mut(ndarray::s![..n, ..]).assign(&self.x);
+        x_aug.row_mut(n).assign(row.x);
+        let mut offset_aug = Array1::<f64>::zeros(n + 1);
+        offset_aug.slice_mut(ndarray::s![..n]).assign(&self.offset);
+        offset_aug[n] = row.offset;
+        let mut y_aug = Array1::<f64>::zeros(n + 1);
+        y_aug.slice_mut(ndarray::s![..n]).assign(&self.y);
+        y_aug[n] = z;
+        (x_aug, offset_aug, y_aug)
+    }
+
+    /// `λ_k = e^{ρ_k}` for one strength per component of `multi`.
+    fn strengths(&self, multi: &MultiReselection, rho: &Array1<f64>) -> Result<Vec<f64>, String> {
+        let family = self.family.name();
+        if rho.len() != multi.units.len() {
+            return Err(format!(
+                "{family} honest full conformal: {} log-strength(s) for {} penalty component(s)",
+                rho.len(),
+                multi.units.len()
+            ));
+        }
+        gam_problem::checked_exp_log_strengths(rho.iter().copied())
+            .map_err(|error| format!("{family} honest conformal strength: {error}"))
+    }
+
+    /// This substrate at the penalty `Σ_k e^{ρ_k} S_k`, warm-started at `beta`.
+    fn at_strengths(
+        &self,
+        multi: &MultiReselection,
+        rho: &Array1<f64>,
+        beta: Array1<f64>,
+    ) -> Result<Self, String> {
+        let lambdas = self.strengths(multi, rho)?;
+        let mut refit = self.clone();
+        refit.s_lambda = multi.penalty_at(&lambdas);
+        refit.warm_start = beta;
+        refit.reselection = None;
+        refit.multi_reselection = None;
+        Ok(refit)
+    }
+
+    /// `ρ̂(z) ∈ R^K`: a certified local Laplace-REML solution for the augmented
+    /// rows over `Σ_k e^{ρ_k} S_k`, with the fitted coefficients at it
+    /// (gam#4103). Like [`Self::select_strength`] it is a local solution, not a
+    /// proof of global minimization, and a failure propagates as an error.
+    ///
+    /// Each coordinate is bounded to its #2812 resolvability interval against
+    /// the augmented Gram, as [`Self::select_strength`] bounds its one
+    /// coordinate. The interval is the workspace's per-coordinate reading of a
+    /// component among the others on its columns
+    /// (`resolvability_domain_from_gram_blocks`), which widens a component's
+    /// own interval by the strengths at which its companions pin or free the
+    /// directions it shares with them. That reading keeps the precision box for
+    /// a coordinate it cannot project; this map refuses such a component
+    /// instead, exactly as the one-strength map refuses an unresolved spectrum,
+    /// by requiring each component's own interval first. A lone component has
+    /// no companions, so at `K = 1` the box is the one-strength map's interval.
+    /// Like it, the box is a property of the augmented Gram and the shapes, the
+    /// same at every candidate level.
+    ///
+    /// The search is gradient-based: [`Self::laml_gradient`] forms the value
+    /// and the `K`-gradient, and the `K × K` second derivative is declared
+    /// unavailable rather than derived, so the planner takes its quasi-Newton
+    /// route inside the same bounds and under the same terminal certificate.
+    fn select_strengths(
+        &self,
+        multi: &MultiReselection,
+        row: &TestRow<'_>,
+        z: f64,
+    ) -> Result<(Array1<f64>, Array1<f64>), String> {
+        use gam_problem::{Derivative, HessianValue, OuterEval};
+        use gam_solve::estimate::EstimationError;
+        use gam_solve::estimate::rho_domain::{
+            penalty_range_gammas_from_gram, resolvability_domain_from_gram_blocks,
+            resolvability_interval,
+        };
+        use gam_solve::rho_optimizer::OuterProblem;
+
+        let p = self.p();
+        let family = self.family.name();
+        let mut gram = multi.gram.clone();
+        for a in 0..p {
+            for b in 0..p {
+                gram[[a, b]] += row.x[a] * row.x[b];
+            }
+        }
+        for (index, unit) in multi.units.iter().enumerate() {
+            let spectrum = penalty_range_gammas_from_gram(&gram, unit).ok_or_else(|| {
+                format!(
+                    "{family} honest conformal: augmented penalty spectrum of component {index} \
+                     is unresolved"
+                )
+            })?;
+            if resolvability_interval(&spectrum).is_none() {
+                return Err(format!(
+                    "{family} honest conformal: smoothing domain of component {index} is \
+                     unresolved"
+                ));
+            }
+        }
+        let (lower, upper) = resolvability_domain_from_gram_blocks(
+            &gram,
+            multi.units.iter().map(|unit| (0..p, unit)),
+            multi.units.len(),
+        );
+        let context = format!("{family} honest full conformal at z={z}");
+        let refuse = |reason: String| EstimationError::TrialPointRefused { reason };
+        let problem = OuterProblem::new(multi.units.len())
+            .with_problem_size(self.n() + 1, p)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(gam_problem::DeclaredHessianForm::Unavailable)
+            .with_bounds(lower, upper);
+        let mut objective = problem.build_objective(
+            Array1::<f64>::zeros(p),
+            |warm: &mut Array1<f64>, rho: &Array1<f64>| {
+                let jet = self
+                    .laml_gradient(multi, row, z, rho, warm)
+                    .map_err(refuse)?;
+                *warm = jet.beta;
+                Ok(jet.value)
+            },
+            |warm: &mut Array1<f64>, rho: &Array1<f64>| {
+                let jet = self
+                    .laml_gradient(multi, row, z, rho, warm)
+                    .map_err(refuse)?;
+                *warm = jet.beta;
+                Ok(OuterEval {
+                    cost: jet.value,
+                    gradient: jet.gradient,
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: None,
+                })
+            },
+            None::<fn(&mut Array1<f64>)>,
+            None::<
+                fn(&mut Array1<f64>, &Array1<f64>) -> Result<gam_problem::EfsEval, EstimationError>,
+            >,
+        );
+        let result = problem
+            .run_certified(&mut objective, &context)
+            .map_err(|e| format!("{context}: {e}"))?;
+        let rho = result.rho().clone();
+        let jet = self.laml_gradient(multi, row, z, &rho, &Array1::zeros(p))?;
+        Ok((rho, jet.beta))
+    }
+
+    /// The Laplace-REML criterion of the `n + 1` augmented rows at
+    /// `Sρ = Σ_k e^{ρ_k} S_k`, with its `ρ`-gradient in closed form (gam#4103):
+    ///
+    /// ```text
+    ///   V(ρ) = Σ_j ℓ(η_j; y_j) + ½ β̂ᵀSρβ̂ + ½ ln|H| − ½ ln|Sρ|₊,
+    ///   H    = X_aᵀ W X_a + Sρ,
+    /// ```
+    ///
+    /// `β̂` the certified augmented fit. With `S_kρ = e^{ρ_k} S_k`,
+    /// `β̇_k = −H⁻¹S_kρβ̂`, `η̇_k = X_aβ̇_k` and
+    /// `Ḣ_k = S_kρ + X_aᵀ diag(w′η̇_k) X_a`:
+    ///
+    /// ```text
+    ///   ∂V/∂ρ_k = ½ β̂ᵀS_kρβ̂ + ½ tr(H⁻¹Ḣ_k) − ½ tr(Sρ⁺ S_kρ).
+    /// ```
+    ///
+    /// The last term is the one a sum cannot supply. `ln|Sρ|₊` and its gradient
+    /// are read from the components through the workspace's one
+    /// pseudo-determinant, which prices them off the stacked scaled roots
+    /// rather than the assembled sum and holds the structural rank fixed as the
+    /// strengths spread (#2644, #1237).
+    ///
+    /// At `K = 1`, `tr(Sρ⁺ e^ρ S) = rank(S)` and `ln|e^ρ S|₊ = rank(S)·ρ +
+    /// ln|S|₊`, so the gradient is [`Self::laml_jet`]'s `V′` and the value
+    /// differs from its `V` by the constant `−½ ln|S|₊`. Every other term is
+    /// formed by the same operations on the same operands, so the two
+    /// gradients differ only by the pseudo-determinant's rounding;
+    /// `the_k_strength_gradient_at_one_strength_is_the_scalar_jet_4103` holds
+    /// that identity.
+    fn laml_gradient(
+        &self,
+        multi: &MultiReselection,
+        row: &TestRow<'_>,
+        z: f64,
+        rho: &Array1<f64>,
+        warm: &Array1<f64>,
+    ) -> Result<LamlGradient, String> {
+        let n = self.n();
+        let p = self.p();
+        let family = self.family.name();
+        let lambdas = self.strengths(multi, rho)?;
+        let s_rho = multi.penalty_at(&lambdas);
+        let mut refit = self.clone();
+        refit.s_lambda = s_rho.clone();
+        refit.reselection = None;
+        refit.multi_reselection = None;
+        let node = refit.solve(row, Augmentation::Response(z), warm)?;
+        if !node.certifies(node.error) {
+            return Err(format!(
+                "{family} honest full conformal: the augmented fit at ρ={rho} did not certify"
+            ));
+        }
+        let beta = node.beta;
+        let (x_aug, offset_aug, y_aug) = self.augmented_rows(row, z);
+        let eta = fast_av(&x_aug, &beta) + &offset_aug;
+        let mut w = Array1::<f64>::zeros(n + 1);
+        let mut w1 = Array1::<f64>::zeros(n + 1);
+        for j in 0..=n {
+            let jet = self.family.weight_jet(eta[j]).ok_or_else(|| {
+                format!("{family} honest full conformal: this family has no re-selecting map")
+            })?;
+            w[j] = jet.0;
+            w1[j] = jet.1;
+        }
+
+        let h = fast_xt_diag_x(&x_aug, &w) + &s_rho;
+        let chol = h.cholesky(Side::Lower).map_err(|e| {
+            format!("{family} honest full conformal: penalized Hessian not SPD: {e:?}")
+        })?;
+        let pseudo_logdet =
+            gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet::from_components(
+                &multi.units,
+                &lambdas,
+                0.0,
+            )
+            .map_err(|error| {
+                format!(
+                    "{family} honest full conformal: penalty pseudo-determinant at ρ={rho}: \
+                     {error}"
+                )
+            })?;
+        let logdet_gradient = pseudo_logdet.rho_derivatives(&multi.units, &lambdas).0;
+        let penalty = beta.dot(&s_rho.dot(&beta));
+        let mut value = 0.5 * penalty + chol.diag().iter().map(|d| d.ln()).sum::<f64>()
+            - 0.5 * pseudo_logdet.value();
+        for j in 0..=n {
+            value += self.family.nll(eta[j], y_aug[j]);
+        }
+
+        let mut gradient = Array1::<f64>::zeros(lambdas.len());
+        for (k, (unit, &lambda)) in multi.units.iter().zip(&lambdas).enumerate() {
+            let s_k = unit.mapv(|v| lambda * v);
+            let s_k_beta = s_k.dot(&beta);
+            let penalty_k = beta.dot(&s_k_beta);
+            let d_beta = chol.solvevec(&s_k_beta).mapv(|v| -v);
+            let d_eta = fast_av(&x_aug, &d_beta);
+            let h_dot = fast_xt_diag_x(&x_aug, &(&w1 * &d_eta)) + &s_k;
+            let m = chol.solve_mat(&h_dot);
+            let trace_m: f64 = (0..p).map(|a| m[[a, a]]).sum();
+            gradient[k] = 0.5 * penalty_k + 0.5 * trace_m - 0.5 * logdet_gradient[k];
+        }
+        if !(value.is_finite() && gradient.iter().all(|g| g.is_finite())) {
+            return Err(format!(
+                "{family} honest full conformal: criterion is not finite at ρ={rho}"
+            ));
+        }
+        Ok(LamlGradient {
+            value,
+            gradient,
             beta,
         })
     }
@@ -2182,19 +2638,21 @@ mod tests {
             ConformalGlmFamily::GammaLog,
         ] {
             assert_eq!(
-                family.certificate(Some(0)),
+                family.certificate(Some(0), 0),
                 ConformalCertificate::ConservativeFrozen
             );
             // Bernoulli and Poisson carry no nuisance parameter beside the
-            // strength, so one strength is re-selected and several are refused
-            // by name; the Gamma dispersion is itself estimated, so its rows
-            // keep the frozen-penalty refusal at every count.
+            // strengths, so one strength is re-selected, several are re-selected
+            // when the payload carries their components, and several without
+            // them (a v39 payload) are refused by name; the Gamma dispersion is
+            // itself estimated, so its rows keep the frozen-penalty refusal at
+            // every count.
             let honest = matches!(
                 family,
                 ConformalGlmFamily::BernoulliLogit | ConformalGlmFamily::PoissonLog
             );
             assert_eq!(
-                family.certificate(Some(1)),
+                family.certificate(Some(1), 0),
                 if honest {
                     ConformalCertificate::HonestRefit
                 } else {
@@ -2202,9 +2660,17 @@ mod tests {
                 }
             );
             assert_eq!(
-                family.certificate(Some(3)),
+                family.certificate(Some(3), 0),
                 if honest {
                     ConformalCertificate::Refused(ConformalRefusal::MultiPenalty)
+                } else {
+                    refused
+                }
+            );
+            assert_eq!(
+                family.certificate(Some(3), 3),
+                if honest {
+                    ConformalCertificate::HonestRefit
                 } else {
                     refused
                 }
@@ -2212,12 +2678,12 @@ mod tests {
         }
         let nb = ConformalGlmFamily::NegativeBinomialLog { theta: 2.0 };
         assert_eq!(
-            nb.certificate(Some(0)),
+            nb.certificate(Some(0), 0),
             refused,
             "θ is selected on the responses"
         );
         assert_eq!(
-            ConformalGlmFamily::PoissonLog.certificate(None),
+            ConformalGlmFamily::PoissonLog.certificate(None, 0),
             ConformalCertificate::Refused(ConformalRefusal::UnknownPenaltyStructure)
         );
         assert_eq!(refused.code(), -7);
@@ -2614,7 +3080,7 @@ mod consolidation_tests {
             }
         }
         assert_eq!(covered, 70);
-        let certificate = ConformalGlmFamily::BernoulliLogit.certificate(Some(0));
+        let certificate = ConformalGlmFamily::BernoulliLogit.certificate(Some(0), 0);
         assert_eq!(certificate.label(), "conservative_frozen");
         assert_eq!(certificate.code(), 2);
     }
@@ -3188,11 +3654,15 @@ mod reselection_tests {
         );
     }
 
-    /// The honest count set closes, and every level it reports agrees with that
-    /// level's own selected refit — the definition of the map, evaluated here
-    /// without the walk's bracket or stopping rule.
+    /// The honest count set is the whole support since gam#4103 removed the
+    /// stop it could not prove ([`GlmFullConformalSubstrate::honest_count_levels`]),
+    /// and it still carries the honest certificate. Each level's own selected
+    /// refit still selects and certifies, and some level is a non-member of it,
+    /// so the whole support is the conservative answer, strictly wider than the
+    /// levels' own verdicts. This held "the walk closes" before that change,
+    /// which is what it can no longer do.
     #[test]
-    fn poisson_level_walk_closes_and_matches_each_levels_own_refit() {
+    fn poisson_honest_set_is_the_whole_support_and_wider_than_its_levels_4103() {
         let sub = poisson_fixture(1., Array1::zeros(2));
         let selected = sub.reselection.as_ref().unwrap();
         let star = array![1., 0.35];
@@ -3204,29 +3674,348 @@ mod reselection_tests {
             .prediction_set_with_uniform(&star, offset, alpha, u_tie)
             .unwrap();
         assert_eq!(set.certificate, ConformalCertificate::HonestRefit);
-        let top = set
-            .intervals
-            .iter()
-            .fold(0.0_f64, |acc, piece| acc.max(piece.hi));
-        assert!(
-            top.is_finite(),
-            "the walk did not close: {:?}",
-            set.intervals
-        );
+        assert_eq!(set.intervals, sub.family.whole_support());
         let tau = conformal_rank_threshold(alpha, sub.n() + 1);
         let twin = sub.twin_rows(&row);
-        let mut z = 0.0_f64;
-        while z <= top + 2.0 {
-            let direct = sub
-                .honest_level(selected, &row, z, tau, u_tie, &twin)
+        let verdicts: Vec<bool> = (0..=12)
+            .map(|z| {
+                sub.honest_level(
+                    HonestMap::Single(selected),
+                    &row,
+                    z as f64,
+                    tau,
+                    u_tie,
+                    &twin,
+                )
                 .unwrap()
-                .0;
-            let walked = set.intervals.iter().any(|piece| piece.contains(z));
-            assert_eq!(
-                walked, direct,
-                "level {z}: walk={walked} own refit={direct}"
-            );
-            z += 1.0;
+                .0
+            })
+            .collect();
+        assert!(
+            verdicts.iter().any(|&member| !member),
+            "every level on 0..=12 is a member of its own refit, so this fixture cannot show \
+             the whole support is wider than the levels' verdicts: {verdicts:?}"
+        );
+    }
+
+    /// The one-strength map's penalty as a `K = 1` component list, so the
+    /// `K`-strength map can be run on exactly the problem the scalar map solves.
+    fn one_component(reselection: &Reselection) -> MultiReselection {
+        MultiReselection {
+            units: vec![reselection.unit.clone()],
+            gram: reselection.gram.clone(),
         }
+    }
+
+    /// gam#4103's self-check: at one strength the `K`-strength criterion's
+    /// gradient IS [`GlmFullConformalSubstrate::laml_jet`]'s `V′`.
+    ///
+    /// `laml_gradient` forms `½β̂ᵀS_ρβ̂ + ½tr(H⁻¹Ḣ)` by the same operations on
+    /// the same operands as `laml_jet` (at `K = 1` its `Σ_k e^{ρ_k}S_k` is
+    /// `0 + λ·S`, the same bits as `λ·S`), so the two share that partial sum
+    /// bit for bit. They differ only in the last term: `½ rank(S)` there, and
+    /// `½ λ·tr(S_ρ⁺S)` here, read off the pseudo-determinant. That trace is a
+    /// sum of `rank` unit ratios `σ̂_i/σ̂_i`, each formed from two separately
+    /// computed estimates of one resolved eigenvalue `σ_i` of `S`, and a
+    /// backward-stable symmetric eigensolver places each within its Weyl band
+    /// `p·ε·‖S‖₂` (`symmetric_spectrum_rounding_band`); scaling by `λ` scales
+    /// both the eigenvalue and the band, so the ratio's error is `λ`-free. Summing
+    /// the `rank` ratios adds `accumulation_band(rank, rank)`. The final
+    /// subtraction rounds once on each side.
+    ///
+    /// A rank miscounted by one moves the gradient by `½`, so the bar is
+    /// required to sit below that: the identity has to be able to fail.
+    #[test]
+    fn the_k_strength_gradient_at_one_strength_is_the_scalar_jet_4103() {
+        use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
+
+        let star = array![1., 0.35];
+        let row = TestRow {
+            x: &star,
+            offset: 0.1,
+        };
+        let cases = [
+            (fixture(1.0, Array1::zeros(2)), vec![0., 1.]),
+            (poisson_fixture(1.0, Array1::zeros(2)), vec![0., 2., 5.]),
+        ];
+        for (sub, levels) in &cases {
+            let selected = sub.reselection.as_ref().unwrap();
+            let multi = one_component(selected);
+            let evals = selected.unit.eigh(Side::Lower).unwrap().0.to_vec();
+            let threshold =
+                gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(&evals);
+            let spectrum_band = gam_linalg::roundoff::symmetric_spectrum_rounding_band(&evals);
+            let rank = selected.rank as f64;
+            let trace_band = evals
+                .iter()
+                .filter(|&&sigma| sigma > threshold)
+                .map(|&sigma| 2.0 * spectrum_band / sigma)
+                .sum::<f64>()
+                + gam_linalg::roundoff::accumulation_band(selected.rank, rank);
+            for &z in levels {
+                for rho in [-3., -0.5, 1., 3.] {
+                    let pseudo =
+                        PenaltyPseudologdet::from_components(&multi.units, &[f64::exp(rho)], 0.0)
+                            .unwrap();
+                    assert_eq!(
+                        pseudo.rank(),
+                        selected.rank,
+                        "{:?} rho={rho}: the pseudo-determinant counts a different rank",
+                        sub.family
+                    );
+                    let scalar = sub
+                        .laml_jet(selected, &row, z, rho, &Array1::zeros(2))
+                        .unwrap();
+                    let general = sub
+                        .laml_gradient(&multi, &row, z, &array![rho], &Array1::zeros(2))
+                        .unwrap();
+                    assert_eq!(
+                        general.beta, scalar.beta,
+                        "the two maps solved different fits"
+                    );
+                    let shared = scalar.gradient + 0.5 * rank;
+                    let rounding = 2.0
+                        * gam_linalg::roundoff::accumulation_band(
+                            1,
+                            shared.abs() + 0.5 * (rank + trace_band),
+                        );
+                    let bar = 0.5 * trace_band + rounding;
+                    assert!(
+                        bar < 0.5,
+                        "{:?}: the bar {bar:e} cannot see a rank miscounted by one",
+                        sub.family
+                    );
+                    assert!(
+                        (general.gradient[0] - scalar.gradient).abs() <= bar,
+                        "{:?} z={z} rho={rho}: K-strength gradient {} against the scalar jet's \
+                         {} (bar {bar:e})",
+                        sub.family,
+                        general.gradient[0],
+                        scalar.gradient
+                    );
+                }
+            }
+        }
+    }
+
+    /// The `K`-strength map at one strength reaches the scalar map's verdict on
+    /// every level: the same membership of both Bernoulli labels at each tie
+    /// uniform. The two searches take different routes (the scalar one carries
+    /// its analytic second derivative, this one declares none), so their
+    /// selected strengths agree to the outer certificate rather than to the bit,
+    /// and the verdicts are what must not move.
+    #[test]
+    fn the_k_strength_map_at_one_strength_keeps_the_scalar_verdicts_4103() {
+        let sub = fixture(1., Array1::zeros(2));
+        let selected = sub.reselection.as_ref().unwrap();
+        let multi = one_component(selected);
+        let star = array![1., 0.35];
+        let row = TestRow {
+            x: &star,
+            offset: 0.1,
+        };
+        let tau = conformal_rank_threshold(0.3, sub.n() + 1);
+        let twin = sub.twin_rows(&row);
+        for uniform in [0.1, 0.6, 0.9] {
+            for z in [0., 1.] {
+                let scalar = sub
+                    .honest_level(HonestMap::Single(selected), &row, z, tau, uniform, &twin)
+                    .unwrap();
+                let general = sub
+                    .honest_level(HonestMap::Multi(&multi), &row, z, tau, uniform, &twin)
+                    .unwrap();
+                assert_eq!(
+                    general.0, scalar.0,
+                    "U={uniform} z={z}: the K-strength map moved the verdict"
+                );
+            }
+        }
+    }
+
+    /// Two strengths on the same two columns: a first-difference penalty and a
+    /// ridge, so `log|λ₁S₁ + λ₂S₂|₊` does not split into one term per strength
+    /// and `tr(S_ρ⁺S_k)` is a genuine function of both strengths.
+    fn two_penalty_components() -> Vec<Array2<f64>> {
+        vec![
+            array![[0., 0., 0.], [0., 1., -1.], [0., -1., 1.]],
+            array![[0., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+        ]
+    }
+
+    /// A Bernoulli substrate on `[1, x, x²]` that selected the two strengths of
+    /// [`two_penalty_components`] and carries them (a v40 payload).
+    fn two_penalty_fixture(xs: &[f64], y: Array1<f64>) -> GlmFullConformalSubstrate {
+        let x = Array2::from_shape_fn((xs.len(), 3), |(i, j)| xs[i].powi(j as i32));
+        let components = two_penalty_components();
+        let s_lambda = &components[0] + &components[1];
+        GlmFullConformalSubstrate::new(
+            ConformalGlmFamily::BernoulliLogit,
+            x,
+            y,
+            Array1::zeros(xs.len()),
+            s_lambda,
+            Some(2),
+            Array1::zeros(3),
+        )
+        .unwrap()
+        .with_components(components)
+        .unwrap()
+    }
+
+    const TWO_PENALTY_XS: [f64; 12] = [
+        -1.4, -1.1, -0.8, -0.5, -0.2, 0.1, 0.4, 0.7, 1.0, 1.3, 1.6, 1.9,
+    ];
+
+    /// The certificate widens past one strength only with the blocks: a v39
+    /// payload (no components) keeps `Refused(MultiPenalty)` and the frozen
+    /// map, a v40 payload gets the `K`-strength map, and blocks that do not
+    /// match the selected count are an error rather than either answer.
+    #[test]
+    fn components_widen_the_certificate_only_when_they_match_the_count_4103() {
+        let y = array![0., 0., 1., 0., 0., 1., 0., 1., 0., 1., 1., 1.];
+        let honest = two_penalty_fixture(&TWO_PENALTY_XS, y.clone());
+        assert_eq!(honest.certificate, ConformalCertificate::HonestRefit);
+        assert!(honest.reselection.is_none());
+        assert_eq!(honest.multi_reselection.as_ref().unwrap().units.len(), 2);
+        let frozen = GlmFullConformalSubstrate::new(
+            ConformalGlmFamily::BernoulliLogit,
+            honest.x.clone(),
+            y.clone(),
+            Array1::zeros(12),
+            honest.s_lambda.clone(),
+            Some(2),
+            Array1::zeros(3),
+        )
+        .unwrap()
+        .with_components(Vec::new())
+        .unwrap();
+        assert_eq!(
+            frozen.certificate,
+            ConformalCertificate::Refused(ConformalRefusal::MultiPenalty)
+        );
+        assert!(frozen.reselection.is_none() && frozen.multi_reselection.is_none());
+        let short = GlmFullConformalSubstrate::new(
+            ConformalGlmFamily::BernoulliLogit,
+            honest.x.clone(),
+            y.clone(),
+            Array1::zeros(12),
+            honest.s_lambda.clone(),
+            Some(2),
+            Array1::zeros(3),
+        )
+        .unwrap()
+        .with_components(vec![two_penalty_components().remove(0)]);
+        assert!(
+            short.is_err(),
+            "one block for two strengths must not build a map"
+        );
+        // The Gamma dispersion is itself selected, so the blocks do not make
+        // its rows honest.
+        let gamma = GlmFullConformalSubstrate::new(
+            ConformalGlmFamily::GammaLog,
+            honest.x.clone(),
+            y.mapv(|v| v + 0.5),
+            Array1::zeros(12),
+            honest.s_lambda.clone(),
+            Some(2),
+            Array1::zeros(3),
+        )
+        .unwrap()
+        .with_components(two_penalty_components())
+        .unwrap();
+        assert_eq!(
+            gamma.certificate,
+            ConformalCertificate::Refused(ConformalRefusal::GlmFrozenPenalty)
+        );
+        assert!(gamma.multi_reselection.is_none());
+    }
+
+    /// The two-strength criterion's gradient against independent differences
+    /// of its value, one coordinate at a time, as the one-strength criterion is
+    /// held (`criterion_gradient_and_hessian_match_independent_differences`).
+    /// At `K = 1` the self-check above pins the gradient to the scalar jet; at
+    /// `K = 2` the pseudo-determinant's cross-strength term is new, and only
+    /// this reads it.
+    #[test]
+    fn two_penalty_criterion_gradient_matches_independent_differences_4103() {
+        let y = array![0., 0., 1., 0., 0., 1., 0., 1., 0., 1., 1., 1.];
+        let sub = two_penalty_fixture(&TWO_PENALTY_XS, y);
+        let multi = sub.multi_reselection.as_ref().unwrap();
+        let star = array![1., 0.35, 0.35 * 0.35];
+        let row = TestRow {
+            x: &star,
+            offset: 0.1,
+        };
+        // How far the differences stand clear of their own bars, per coordinate.
+        let mut resolved = [0.0_f64; 2];
+        for z in [0., 1.] {
+            for rho in [array![-2., 1.], array![0.5, -1.5], array![2., 2.]] {
+                let mid = sub
+                    .laml_gradient(multi, &row, z, &rho, &Array1::zeros(3))
+                    .unwrap();
+                // One evaluation is a certified augmented solve, so its band is
+                // the certificate's relative tolerance on the criterion's own
+                // scale, as in the one-strength pin.
+                let evaluation_error = GLM_CONVERGENCE_RTOL * mid.value.abs().max(1.);
+                for k in 0..2 {
+                    let h = GLM_CONVERGENCE_RTOL.cbrt() * (1. + f64::abs(rho[k]));
+                    let along = |r: f64| {
+                        let mut at = rho.clone();
+                        at[k] = r;
+                        sub.laml_gradient(multi, &row, z, &at, &Array1::zeros(3))
+                            .unwrap()
+                            .value
+                    };
+                    let (fd, bar) = richardson_first(along, rho[k], h, evaluation_error);
+                    resolved[k] = resolved[k].max(fd.abs() / bar);
+                    assert!(
+                        (mid.gradient[k] - fd).abs() <= bar,
+                        "z={z} rho={rho} coordinate {k}: gradient={} reference={fd} \
+                         bar={bar:e}",
+                        mid.gradient[k]
+                    );
+                }
+            }
+        }
+        for (k, &ratio) in resolved.iter().enumerate() {
+            assert!(
+                ratio > 1.0,
+                "the differences never resolve coordinate {k}'s gradient on this grid \
+                 (best |reference|/bar = {ratio:.3}), so its pin decides nothing"
+            );
+        }
+    }
+
+    /// The two-strength honest set, checked the way
+    /// `augmented_row_roles_preserve_the_selected_fitting_map` checks the
+    /// one-strength set: hold out each of six exchangeable rows in turn and
+    /// predict it from the other five. Every split augments to the same
+    /// multiset of six points, so the selected strengths and fit are the same
+    /// map up to the order the rows are summed in, and the held-out point's
+    /// smoothed p-value is `(g + U(1 + t))/6` with `g` the rows scoring above
+    /// it. At `α = 0.5` the rank threshold is `3`, so a point is kept exactly
+    /// when `g ≥ 3`: three of the six points at every `U > 0`, and `12` of the
+    /// `24` split-uniform pairs. That is `1 − α` exactly, which is the finite
+    /// coverage the map's symmetry buys and a frozen training-selected map does
+    /// not.
+    #[test]
+    fn two_penalty_honest_set_covers_at_its_rank_4103() {
+        let xs = [-1.2, -0.83, -0.19, 0.36, 0.77, 1.41];
+        let y = array![0., 0., 1., 0., 1., 1.];
+        let mut accepted = 0usize;
+        for held in 0..6 {
+            let retained: Vec<usize> = (0..6).filter(|&i| i != held).collect();
+            let train: Vec<f64> = retained.iter().map(|&i| xs[i]).collect();
+            let sub = two_penalty_fixture(&train, y.select(Axis(0), &retained));
+            let star = array![1., xs[held], xs[held] * xs[held]];
+            for uniform in [0.125, 0.375, 0.625, 0.875] {
+                let set = sub
+                    .prediction_set_with_uniform(&star, 0., 0.5, uniform)
+                    .unwrap();
+                assert_eq!(set.certificate, ConformalCertificate::HonestRefit);
+                accepted += usize::from(set.intervals.iter().any(|piece| piece.contains(y[held])));
+            }
+        }
+        assert_eq!(accepted, 12);
     }
 }

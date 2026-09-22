@@ -113,7 +113,7 @@
 //! scale and divides them by that row's norm there, a constant rescaling that leaves `L` unchanged.
 
 use faer::Side;
-use gam_linalg::faer_ndarray::FaerCholesky;
+use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky, FaerLu, array1_to_col_matmut};
 use gam_math::gaussian_reciprocal::half_line_gaussian_log_jet;
 use gam_math::probability::standard_normal_quantile;
 use gam_math::roundoff::accumulation_growth;
@@ -259,48 +259,6 @@ fn slack_horizon() -> Result<f64, ConeLaplaceRefusal> {
     standard_normal_quantile(f64::EPSILON)
         .map(|quantile| -quantile)
         .map_err(|_| ConeLaplaceRefusal::NonFinite { what: "slack horizon" })
-}
-
-/// `A⁻¹` by Gauss–Jordan elimination with partial pivoting, for the `2q × 2q` linearized fixed
-/// point.
-fn invert(mut a: Array2<f64>, what: &str) -> Result<Array2<f64>, ConeLaplaceRefusal> {
-    let n = a.nrows();
-    let mut inverse = Array2::<f64>::eye(n);
-    for col in 0..n {
-        let mut pivot_row = col;
-        for row in (col + 1)..n {
-            if a[[row, col]].abs() > a[[pivot_row, col]].abs() {
-                pivot_row = row;
-            }
-        }
-        let pivot = a[[pivot_row, col]];
-        if !(pivot != 0.0 && pivot.is_finite()) {
-            return Err(ConeLaplaceRefusal::Singular {
-                reason: format!("{what} has no pivot in column {col} of {n}"),
-            });
-        }
-        if pivot_row != col {
-            for k in 0..n {
-                a.swap([col, k], [pivot_row, k]);
-                inverse.swap([col, k], [pivot_row, k]);
-            }
-        }
-        for k in 0..n {
-            a[[col, k]] /= pivot;
-            inverse[[col, k]] /= pivot;
-        }
-        for row in 0..n {
-            let factor = a[[row, col]];
-            if row == col || factor == 0.0 {
-                continue;
-            }
-            for k in 0..n {
-                a[[row, k]] -= factor * a[[col, k]];
-                inverse[[row, k]] -= factor * inverse[[col, k]];
-            }
-        }
-    }
-    Ok(inverse)
 }
 
 fn symmetrized(matrix: &Array2<f64>) -> Array2<f64> {
@@ -606,11 +564,50 @@ pub struct ConeLaplaceFirstOrder {
 }
 
 /// What the sites' motion reads at a fixed point that does not depend on the direction of the
-/// motion: each site's update partials in its cavity and the inverse of `I − ∂F/∂s`.
+/// motion: each site's update partials in its cavity and a factored `I − ∂F/∂s`.
 #[derive(Clone, Debug)]
 struct SiteMotionSystem {
     jacobians: Vec<[f64; 4]>,
-    inverse: Array2<f64>,
+    solver: SiteMotionSolver,
+}
+
+/// Two exact factorizations of the linearized fixed point `I − ∂F/∂s = (I + D) − DCR_dV`.
+///
+/// `D` is block diagonal in the sites, `D_j` the `2 × 2` partials of site `j`'s update in its cavity,
+/// and `C_j = [[−1/Σ_jj², 0], [−ū_j/Σ_jj², 1/Σ_jj]]` maps the motion of its posterior marginal
+/// `(dΣ_jj, dū_j)` to its cavity's. The marginals move through `m = p(p+1)/2 + p` numbers: with
+/// `w_j = Λ⁻¹a_j`, `dΣ_jj = −Σ_kΣ_jk²dτ̃_k = −w_jᵀ(Aᵀdiag(dτ̃)A)w_j` and
+/// `dū_j = Σ_kΣ_jk(dν̃_k − ū_kdτ̃_k) = w_jᵀAᵀ(dν̃ − ū∘dτ̃)`, so `V ds = [upper(Aᵀdiag(dτ̃)A);
+/// Aᵀ(dν̃ − ū∘dτ̃)]` and `R_d` reads `(−w_jᵀZw_j, w_jᵀz)` back off each site. The coupling has
+/// rank at most `m`, not `p`: the variance channel is the Hadamard square `Σ∘Σ`, whose rank is
+/// that of the symmetric `p × p` matrices, so no `p × p` system carries it.
+#[derive(Clone, Debug)]
+enum SiteMotionSolver {
+    /// The partial-pivoting LU of the `2q × 2q` system.
+    Direct(FaerLu),
+    /// Woodbury through the `m` coordinates: `(I + D_j)⁻¹` per site, `P_j = (I + D_j)⁻¹D_jC_j`,
+    /// and the partial-pivoting LU of the capacitance `I_m − VP R_d`.
+    Capacitance { site_inverse: Vec<[f64; 4]>, coupling: Vec<[f64; 4]>, factor: FaerLu },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SiteMotionRoute {
+    Direct,
+    Capacitance,
+}
+
+impl SiteMotionRoute {
+    /// The route with the smaller leading flop count at `q` sites over `p` coefficients: the
+    /// direct LU costs `(2/3)(2q)³`, the capacitance `2q·m²` to form and `(2/3)m³` to factor. Both
+    /// are exact, so the choice moves cost and rounding, not the quantity. The capacitance is also
+    /// the one whose memory, `m²` against `(2q)²`, stays bounded as `q` grows to the full
+    /// constraint count.
+    fn cheaper(q: usize, p: usize) -> Self {
+        let (q, m) = (q as f64, (p * (p + 1) / 2 + p) as f64);
+        let direct = 2.0 / 3.0 * (2.0 * q).powi(3);
+        let capacitance = 2.0 * q * m * m + 2.0 / 3.0 * m.powi(3);
+        if capacitance < direct { Self::Capacitance } else { Self::Direct }
+    }
 }
 
 /// The constrained Laplace term `L = ½ln|M| + C` at one inner mode, with the state its outer
@@ -785,15 +782,18 @@ impl ConeLaplace {
             &Array1::from(start_nu.clone()),
             0,
         )?;
-        // A row's standardized posterior slack `ū_i/√(a_iᵀΛ⁻¹a_i)`.
-        let standardized = |inverse: &Array2<f64>, offset: &Array1<f64>, i: usize| {
-            let row = all_rows.row(i);
-            (row.dot(offset) + slacks[i]) / row.dot(&inverse.dot(&row)).sqrt()
+        // Every row's standardized posterior slack `ū_i/√(a_iᵀΛ⁻¹a_i)`, read through one product
+        // `AΛ⁻¹` over all the distinct rows, which number in the tens of thousands on a
+        // transformation-normal monotonicity system, rather than through a matvec per row.
+        let standardized = |inverse: &Array2<f64>, offset: &Array1<f64>| {
+            let solved = all_rows.dot(inverse);
+            let means = all_rows.dot(offset);
+            Array1::from_shape_fn(total, |i| (means[i] + slacks[i]) / solved.row(i).dot(&all_rows.row(i)).sqrt())
         };
         let mode = ModeInputs { precision, gradient, beta, distinct: &distinct, caller_rows: rows.nrows() };
-        let mut chosen: Vec<usize> = (0..total)
-            .filter(|&i| start_tau[i] > 0.0 || standardized(&start_inverse, &start_offset, i) < horizon)
-            .collect();
+        let start_standardized = standardized(&start_inverse, &start_offset);
+        let mut chosen: Vec<usize> =
+            (0..total).filter(|&i| start_tau[i] > 0.0 || start_standardized[i] < horizon).collect();
         let mut tau: Vec<f64> = chosen.iter().map(|&i| start_tau[i]).collect();
         let mut nu: Vec<f64> = chosen.iter().map(|&i| start_nu[i]).collect();
         loop {
@@ -842,8 +842,9 @@ impl ConeLaplace {
                 }
             })?;
             let mut added = false;
+            let term_standardized = standardized(&term.inverse, &term.mean_offset);
             for i in 0..total {
-                if !chosen.contains(&i) && standardized(&term.inverse, &term.mean_offset, i) < horizon {
+                if !chosen.contains(&i) && term_standardized[i] < horizon {
                     chosen.push(i);
                     added = true;
                 }
@@ -869,7 +870,9 @@ impl ConeLaplace {
         let mut nu = Array1::from(nu.to_vec());
         // Every term of `L`, and every site's cavity, is formed in at most `p² + 4q² + 8q` rounded
         // operations: the Cholesky pivots and solves accumulate `p` products per entry over `p`
-        // entries, and a sweep's rank-one updates `O(q)` per entry over `q` sites.
+        // entries, and a sweep carries one rank-one update per site, `q` in all, into each entry of
+        // `Λ⁻¹` and reads each cavity through two length-`p` products, which the `p²` already
+        // counts.
         let growth = accumulation_growth(p * p + 4 * q * q + 8 * q);
         let band_of = |magnitude: f64| growth * magnitude;
         let mut part = gaussian_part(precision_m, gradient, &rows, &slack, &tau, &nu, 0)?;
@@ -887,16 +890,23 @@ impl ConeLaplace {
             // tilted and cavity natural parameters).
             let (mut step, mut moved) = (0.0_f64, false);
             let relative = |delta: f64, rounding: f64| if delta == 0.0 { 0.0 } else { delta.abs() / rounding };
-            // The sweep carries the posterior of `u` from site to site by the rank-one update a
-            // site's move makes to `Λ`: with `c = Δτ̃/(1 + Δτ̃ Σ_jj)`, `Σ ← Σ − c Σ_{:j}Σ_{j:}` and
-            // `ū ← ū + Σ_{:j}(Δν̃ − Δτ̃ ū_j)/(1 + Δτ̃ Σ_jj)`, and forms it exactly again from `Λ` at the
-            // sweep's end.
-            let mut sigma = part.sigma.clone();
-            let mut mean = part.posterior_mean.clone();
+            // The sweep carries the posterior from site to site by the rank-one update a site's move
+            // makes to `Λ`, and forms it exactly again from `Λ` at the sweep's end. It carries it in
+            // coefficient space: with `w = Λ⁻¹a_j`, `Σ_jj = a_jᵀw`, `ū_j = a_jᵀδ̄ + d_j` and
+            // `c = Δτ̃/(1 + Δτ̃ Σ_jj)`, `Λ⁻¹ ← Λ⁻¹ − c wwᵀ` and `δ̄ ← δ̄ + w(Δν̃ − Δτ̃ ū_j)/(1 + Δτ̃ Σ_jj)`,
+            // which is `Σ ← Σ − c Σ_{:j}Σ_{j:}` and `ū ← ū + Σ_{:j}(Δν̃ − Δτ̃ ū_j)/(1 + Δτ̃ Σ_jj)` read
+            // through `Σ = AΛ⁻¹Aᵀ`. A site then costs `O(p²)` where the `q × q` carry cost `O(q²)`,
+            // and the rows inside the horizon of a transformation-normal monotonicity system
+            // number in the thousands at `p` in the low hundreds.
+            let mut inverse = part.inverse.clone();
+            let mut offset = part.mean_offset.clone();
             for j in 0..q {
-                let s_jj = sigma[[j, j]];
+                let row = rows.row(j);
+                let solved = inverse.dot(&row);
+                let s_jj = row.dot(&solved);
+                let mean_j = row.dot(&offset) + slack[j];
                 let tau_c = 1.0 / s_jj - tau[j];
-                let nu_c = mean[j] / s_jj - nu[j];
+                let nu_c = mean_j / s_jj - nu[j];
                 let update =
                     site_update(j, tau_c, nu_c, tau[j], s_jj, part.condition_floor, sweeps)?;
                 let tau_rounding = growth * (tau_c.abs() + (tau_c + update.tau).abs());
@@ -914,14 +924,13 @@ impl ConeLaplace {
                 if !(denominator > 0.0) {
                     return Err(ConeLaplaceRefusal::NotPositiveDefinite { sweep: sweeps });
                 }
-                let column = sigma.column(j).to_owned();
-                let mean_step = (d_nu - d_tau * mean[j]) / denominator;
-                mean.scaled_add(mean_step, &column);
+                let mean_step = (d_nu - d_tau * mean_j) / denominator;
+                offset.scaled_add(mean_step, &solved);
                 let shrink = d_tau / denominator;
-                for a in 0..q {
-                    let scaled = shrink * column[a];
-                    for b in 0..q {
-                        sigma[[a, b]] -= scaled * column[b];
+                for a in 0..p {
+                    let scaled = shrink * solved[a];
+                    for b in 0..p {
+                        inverse[[a, b]] -= scaled * solved[b];
                     }
                 }
             }
@@ -1206,37 +1215,93 @@ impl ConeLaplace {
             rhs[j] = dt_dtc * dtc + dt_dnc * dnc;
             rhs[q + j] = dn_dtc * dtc + dn_dnc * dnc;
         }
-        let ds = system.inverse.dot(&rhs);
-        Ok((ds.slice(s![0..q]).to_owned(), ds.slice(s![q..2 * q]).to_owned()))
+        self.solve_linearized_fixed_point(&system.solver, &mut rhs);
+        Ok((rhs.slice(s![0..q]).to_owned(), rhs.slice(s![q..2 * q]).to_owned()))
     }
 
-    /// The site partials and the inverse of the linearized fixed point's `2q × 2q` system
-    /// `I − ∂F/∂s`, formed once for these sites. Per unit site change the posterior of `u` moves by
-    /// `dΣ/dτ̃_k = −Σ_{:k}Σ_{k:}`, `dū/dτ̃_k = −Σ_{:k}ū_k` and `dū/dν̃_k = Σ_{:k}`, and site `j` reads
-    /// the cavity `(1/Σ_jj − τ̃_j, ū_j/Σ_jj − ν̃_j)`.
-    fn linearized_fixed_point(&self) -> Result<&SiteMotionSystem, ConeLaplaceRefusal> {
-        self.site_motion_system
-            .get_or_init(|| {
-                let q = self.rows.nrows();
-                let (sigma, mean) = (&self.sigma, &self.posterior_mean);
-                let mut system = Array2::<f64>::eye(2 * q);
-                let mut jacobians = Vec::with_capacity(q);
+    /// Overwrite `rhs = [τ̃ block; ν̃ block]` with `(I − ∂F/∂s)⁻¹rhs`.
+    fn solve_linearized_fixed_point(&self, solver: &SiteMotionSolver, rhs: &mut Array1<f64>) {
+        let (q, p) = self.rows.dim();
+        match solver {
+            SiteMotionSolver::Direct(factor) => factor.solve_in_place(array1_to_col_matmut(rhs)),
+            SiteMotionSolver::Capacitance { site_inverse, coupling, factor } => {
+                let quad = p * (p + 1) / 2;
+                // x₀ = (I + D)⁻¹rhs.
+                let mut x_tau = Array1::<f64>::zeros(q);
+                let mut x_nu = Array1::<f64>::zeros(q);
                 for j in 0..q {
+                    let a = site_inverse[j];
+                    x_tau[j] = a[0] * rhs[j] + a[1] * rhs[q + j];
+                    x_nu[j] = a[2] * rhs[j] + a[3] * rhs[q + j];
+                }
+                // V x₀ = [upper(Aᵀdiag(x_τ)A); Aᵀ(x_ν − ū∘x_τ)].
+                let weighted = Array2::from_shape_fn((q, p), |(j, a)| x_tau[j] * self.rows[[j, a]]);
+                let gram = self.rows.t().dot(&weighted);
+                let mut moved = Array1::<f64>::zeros(quad + p);
+                let mut index = 0;
+                for a in 0..p {
+                    for c in a..p {
+                        moved[index] = gram[[a, c]];
+                        index += 1;
+                    }
+                }
+                let linear = self.rows.t().dot(&(&x_nu - &(&self.posterior_mean * &x_tau)));
+                moved.slice_mut(s![quad..]).assign(&linear);
+                factor.solve_in_place(array1_to_col_matmut(&mut moved));
+                // ds = x₀ + P R_d z, with R_d reading (−w_jᵀZw_j, w_jᵀz) off each site.
+                let mut z_matrix = Array2::<f64>::zeros((p, p));
+                let mut index = 0;
+                for a in 0..p {
+                    for c in a..p {
+                        z_matrix[[a, c]] = moved[index];
+                        z_matrix[[c, a]] = moved[index];
+                        index += 1;
+                    }
+                }
+                let z_linear = moved.slice(s![quad..]);
+                let quadratic = z_matrix.dot(&self.normal_solves);
+                for j in 0..q {
+                    let w = self.normal_solves.column(j);
+                    let read_variance = -quadratic.column(j).dot(&w);
+                    let read_mean = w.dot(&z_linear);
+                    let [p00, p01, p10, p11] = coupling[j];
+                    rhs[j] = x_tau[j] + p00 * read_variance + p01 * read_mean;
+                    rhs[q + j] = x_nu[j] + p10 * read_variance + p11 * read_mean;
+                }
+            }
+        }
+    }
+
+    /// The site partials and the factored linearized fixed point `I − ∂F/∂s`, formed once for these
+    /// sites, by the cheaper of its two exact routes. Per unit site change the posterior of `u` moves
+    /// by `dΣ/dτ̃_k = −Σ_{:k}Σ_{k:}`, `dū/dτ̃_k = −Σ_{:k}ū_k` and `dū/dν̃_k = Σ_{:k}`, and site `j`
+    /// reads the cavity `(1/Σ_jj − τ̃_j, ū_j/Σ_jj − ν̃_j)`.
+    fn linearized_fixed_point(&self) -> Result<&SiteMotionSystem, ConeLaplaceRefusal> {
+        let (q, p) = self.rows.dim();
+        self.site_motion_system
+            .get_or_init(|| self.form_site_motion_system(SiteMotionRoute::cheaper(q, p)))
+            .as_ref()
+            .map_err(|refusal| refusal.clone())
+    }
+
+    fn form_site_motion_system(&self, route: SiteMotionRoute) -> Result<SiteMotionSystem, ConeLaplaceRefusal> {
+        let (q, p) = self.rows.dim();
+        let (sigma, mean) = (&self.sigma, &self.posterior_mean);
+        let mut jacobians = Vec::with_capacity(q);
+        for j in 0..q {
+            let s_jj = sigma[[j, j]];
+            let tau_c = 1.0 / s_jj - self.tau[j];
+            let nu_c = mean[j] / s_jj - self.nu[j];
+            jacobians.push(
+                site_update(j, tau_c, nu_c, self.tau[j], s_jj, self.condition_floor, self.sweeps)?.jacobian,
+            );
+        }
+        let solver = match route {
+            SiteMotionRoute::Direct => {
+                let mut system = Array2::<f64>::eye(2 * q);
+                for j in 0..q {
+                    let [dt_dtc, dt_dnc, dn_dtc, dn_dnc] = jacobians[j];
                     let s_jj = sigma[[j, j]];
-                    let tau_c = 1.0 / s_jj - self.tau[j];
-                    let nu_c = mean[j] / s_jj - self.nu[j];
-                    let jacobian = site_update(
-                        j,
-                        tau_c,
-                        nu_c,
-                        self.tau[j],
-                        s_jj,
-                        self.condition_floor,
-                        self.sweeps,
-                    )?
-                    .jacobian;
-                    let [dt_dtc, dt_dnc, dn_dtc, dn_dnc] = jacobian;
-                    jacobians.push(jacobian);
                     let s2 = s_jj * s_jj;
                     let cavity_rate =
                         |d_sjj: f64, d_mean: f64| -> (f64, f64) { (-d_sjj / s2, d_mean / s_jj - mean[j] * d_sjj / s2) };
@@ -1251,11 +1316,95 @@ impl ConeLaplace {
                         system[[q + j, q + k]] -= dn_dtc * dtc + dn_dnc * dnc;
                     }
                 }
-                let inverse = invert(system, "the linearized EP fixed point")?;
-                Ok(SiteMotionSystem { jacobians, inverse })
-            })
-            .as_ref()
-            .map_err(|refusal| refusal.clone())
+                // Factored once and solved per direction: an explicit inverse would cost `O(q³)`
+                // more work and `O(q²)` more memory for nothing a solve does not already give.
+                SiteMotionSolver::Direct(FaerLu::new(FaerArrayView::new(&system).as_ref()).map_err(|column| {
+                    ConeLaplaceRefusal::Singular {
+                        reason: format!(
+                            "the linearized EP fixed point has no pivot in column {column} of {}",
+                            2 * q
+                        ),
+                    }
+                })?)
+            }
+            SiteMotionRoute::Capacitance => {
+                let quad = p * (p + 1) / 2;
+                let m = quad + p;
+                let mut site_inverse = Vec::with_capacity(q);
+                let mut coupling = Vec::with_capacity(q);
+                for j in 0..q {
+                    let [d00, d01, d10, d11] = jacobians[j];
+                    let (a00, a01, a10, a11) = (1.0 + d00, d01, d10, 1.0 + d11);
+                    let det = a00 * a11 - a01 * a10;
+                    if !(det != 0.0 && det.is_finite()) {
+                        return Err(ConeLaplaceRefusal::Singular {
+                            reason: format!("the EP site map at row {j} has determinant {det:e}"),
+                        });
+                    }
+                    let inverse = [a11 / det, -a01 / det, -a10 / det, a00 / det];
+                    let s_jj = sigma[[j, j]];
+                    let s2 = s_jj * s_jj;
+                    let (c00, c01, c10, c11) = (-1.0 / s2, 0.0, -mean[j] / s2, 1.0 / s_jj);
+                    let dc = [
+                        d00 * c00 + d01 * c10,
+                        d00 * c01 + d01 * c11,
+                        d10 * c00 + d11 * c10,
+                        d10 * c01 + d11 * c11,
+                    ];
+                    coupling.push([
+                        inverse[0] * dc[0] + inverse[1] * dc[2],
+                        inverse[0] * dc[1] + inverse[1] * dc[3],
+                        inverse[2] * dc[0] + inverse[3] * dc[2],
+                        inverse[2] * dc[1] + inverse[3] * dc[3],
+                    ]);
+                    site_inverse.push(inverse);
+                }
+                // `I_m − Σ_j V_jP_jR_{d,j}`, where site j's columns of V are
+                // τ̃_j → [upper(a_ja_jᵀ); −ū_ja_j] and ν̃_j → [0; a_j], and its rows of R_d read
+                // (dΣ_jj, dū_j) as [−(2 − δ_ac)w_aw_c; 0] and [0; w_j]. It is accumulated over
+                // blocks of `p` sites, so no intermediate is larger than `m × 2p`.
+                let mut capacitance = Array2::<f64>::eye(m);
+                let block = p.max(1);
+                let mut start = 0;
+                while start < q {
+                    let end = (start + block).min(q);
+                    let n = end - start;
+                    let mut v = Array2::<f64>::zeros((m, 2 * n));
+                    let mut read = Array2::<f64>::zeros((2 * n, m));
+                    for (i, j) in (start..end).enumerate() {
+                        let row = self.rows.row(j);
+                        let w = self.normal_solves.column(j);
+                        let [p00, p01, p10, p11] = coupling[j];
+                        let mut index = 0;
+                        for a in 0..p {
+                            for c in a..p {
+                                v[[index, 2 * i]] = row[a] * row[c];
+                                let weight = if a == c { 1.0 } else { 2.0 };
+                                let spread = weight * w[a] * w[c];
+                                read[[2 * i, index]] = -p00 * spread;
+                                read[[2 * i + 1, index]] = -p10 * spread;
+                                index += 1;
+                            }
+                        }
+                        for a in 0..p {
+                            v[[quad + a, 2 * i]] = -mean[j] * row[a];
+                            v[[quad + a, 2 * i + 1]] = row[a];
+                            read[[2 * i, quad + a]] = p01 * w[a];
+                            read[[2 * i + 1, quad + a]] = p11 * w[a];
+                        }
+                    }
+                    capacitance -= &v.dot(&read);
+                    start = end;
+                }
+                let factor = FaerLu::new(FaerArrayView::new(&capacitance).as_ref()).map_err(|column| {
+                    ConeLaplaceRefusal::Singular {
+                        reason: format!("the EP site system's capacitance has no pivot in column {column} of {m}"),
+                    }
+                })?;
+                SiteMotionSolver::Capacitance { site_inverse, coupling, factor }
+            }
+        };
+        Ok(SiteMotionSystem { jacobians, solver })
     }
 }
 
@@ -1279,7 +1428,10 @@ mod tests {
         gradient: &Array1<f64>,
         m: &Array2<f64>,
     ) -> (f64, f64) {
-        let inverse = invert(m.clone(), "test precision").expect("an invertible test precision");
+        let inverse = m
+            .cholesky(Side::Lower)
+            .expect("the test precision is positive definite")
+            .solve_mat(&Array2::<f64>::eye(m.nrows()));
         let solve = |rhs: &Array1<f64>| inverse.dot(rhs);
         let normalizer = ConeNormalizer::evaluate(rows, bounds, beta, gradient, &solve)
             .unwrap_or_else(|refusal| panic!("the covariance form converges: {refusal}"));
@@ -1381,6 +1533,8 @@ mod tests {
         bounds: Array1<f64>,
         slack: Array1<f64>,
         moving: bool,
+        /// The linearized fixed point's route where a test fixes it, the cheaper one otherwise.
+        route: Option<SiteMotionRoute>,
         m: [Array2<f64>; 4],
         g: [Array1<f64>; 4],
         v: [Array1<f64>; 4],
@@ -1405,6 +1559,7 @@ mod tests {
                 bounds,
                 slack,
                 moving: false,
+                route: None,
                 m: [m0, m1, m2, m12],
                 g: [g0, array![0.2, -0.1, 0.05], array![-0.1, 0.3, 0.0], array![0.05, 0.05, -0.02]],
                 v: [beta, array![0.0, 0.0, 0.3], array![0.0, 0.0, -0.2], array![0.0, 0.0, 0.1]],
@@ -1456,15 +1611,27 @@ mod tests {
             }
         }
 
+        /// The same family with its linearized fixed point solved by `route`.
+        fn through(mut self, route: SiteMotionRoute) -> Self {
+            self.route = Some(route);
+            self
+        }
+
         fn term(&self, theta: [f64; 2]) -> ConeLaplace {
-            ConeLaplace::evaluate(
+            let term = ConeLaplace::evaluate(
                 &Self::at(&self.a, theta),
                 &self.bounds_at(theta),
                 &Self::at(&self.v, theta),
                 &Self::at(&self.g, theta),
                 &Self::at(&self.m, theta),
             )
-            .unwrap_or_else(|refusal| panic!("θ = {theta:?}: {refusal}"))
+            .unwrap_or_else(|refusal| panic!("θ = {theta:?}: {refusal}"));
+            if let Some(route) = self.route {
+                term.site_motion_system
+                    .set(term.form_site_motion_system(route))
+                    .expect("a freshly evaluated term has not formed its site motion yet");
+            }
+            term
         }
 
         /// `(Ȧ_k, ḃ_k)` at `θ`, `ḃ_k = Ȧ_kβ̂ + Aβ̂̇_k`, where the rows move.
@@ -1610,6 +1777,28 @@ mod tests {
     fn second_order_carries_the_rows_motion_3171() {
         for corner in [0.3, -0.02] {
             Family::moving(corner).check_second_order(&format!("moving rows, M11 {corner}"));
+        }
+    }
+
+    /// The capacitance route carries the same sites' motion as the direct one. This family's size
+    /// puts it on the direct route by cost, so the second-order checks above never reach the
+    /// capacitance; it is fixed here, with rows at rest and moving, on both sides of the indefinite
+    /// crossing, against the same finite differences.
+    #[test]
+    fn the_capacitance_route_carries_the_same_site_motion_2765() {
+        let retained = Family::new(0.3).term([0.0, 0.0]).retained_rows();
+        assert_eq!(
+            SiteMotionRoute::cheaper(retained, 3),
+            SiteMotionRoute::Direct,
+            "the family reaches the capacitance by cost, so fixing it here tests nothing new"
+        );
+        for corner in [0.3, -0.02] {
+            Family::new(corner)
+                .through(SiteMotionRoute::Capacitance)
+                .check_second_order(&format!("capacitance, M11 {corner}"));
+            Family::moving(corner)
+                .through(SiteMotionRoute::Capacitance)
+                .check_second_order(&format!("capacitance, moving rows, M11 {corner}"));
         }
     }
 

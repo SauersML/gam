@@ -441,9 +441,14 @@ impl ExactGaussianFullConformal {
         })
     }
 
-    /// Isolate the true linear root between adjacent representable candidates.
-    /// A rounded endpoint itself is ranked separately; it is not presumed tied.
-    fn isolated_score_root(&self, i: usize, subtract: bool, a: f64, b: f64) -> Result<f64, String> {
+    /// The rounded root `-b/a`, refined by the exact expansion residual.
+    fn corrected_score_root(
+        &self,
+        i: usize,
+        subtract: bool,
+        a: f64,
+        b: f64,
+    ) -> Result<f64, String> {
         let mut root = -b / a;
         if !root.is_finite() || (root == 0.0 && b != 0.0) {
             return Err("full conformal: score breakpoint is not representable".into());
@@ -451,7 +456,7 @@ impl ExactGaussianFullConformal {
         // Rounded coefficient subtraction can displace -b/a by several ulps.
         // Correct it with the exact expansion residual before certifying the
         // adjacent representable candidates. Every accepted root is still
-        // checked below; this bounded refinement grants no tolerance band.
+        // checked by the caller; this refinement grants no tolerance band.
         for _ in 0..4 {
             let residual = self.endpoint_factor_leading(i, root, subtract)?;
             if residual == 0.0 {
@@ -466,7 +471,22 @@ impl ExactGaussianFullConformal {
             }
             root = corrected;
         }
-        if self.endpoint_factor_sign(i, root, subtract)? == 0 {
+        Ok(root)
+    }
+
+    /// Isolate the true linear root between adjacent representable candidates.
+    /// A rounded endpoint itself is ranked separately; it is not presumed tied.
+    ///
+    /// The factor is affine in `z` with exact slope `w_i ∓ w_*`, whose sign is
+    /// the sign of the rounded `a`, so its exact sign is monotone over the
+    /// f64 lattice. When the corrected root's two neighbours do not bracket
+    /// the sign change (#3338), the change is located by walking outward on
+    /// the lattice with doubling strides and bisecting the last stride: at
+    /// most one pass per bit of the lattice key, every step an exact sign.
+    fn isolated_score_root(&self, i: usize, subtract: bool, a: f64, b: f64) -> Result<f64, String> {
+        let root = self.corrected_score_root(i, subtract, a, b)?;
+        let at_root = self.endpoint_factor_sign(i, root, subtract)?;
+        if at_root == 0 {
             return Ok(root);
         }
         let lower = root.next_down();
@@ -482,11 +502,53 @@ impl ExactGaussianFullConformal {
         if right == 0 {
             return Ok(upper);
         }
-        let slope = if a > 0.0 { 1 } else { -1 };
-        if left != -slope || right != slope {
+        let slope: i8 = if a > 0.0 { 1 } else { -1 };
+        if left == -slope && right == slope {
+            return Ok(root);
+        }
+        if left != right || left != at_root {
             return Err("full conformal: score breakpoint isolation cannot be certified".into());
         }
-        Ok(root)
+        // Past the crossing already (sign = slope): the change lies below.
+        // Keys are widened so a stride between opposite signs cannot overflow.
+        let stride_sign: i128 = if at_root == slope { -1 } else { 1 };
+        let bound = i128::from(lattice_key(f64::MAX));
+        let mut near = i128::from(lattice_key(root));
+        let mut far;
+        let mut stride: i128 = 1;
+        loop {
+            let limit = bound - stride_sign * near;
+            if limit == 0 {
+                return Err("full conformal: score breakpoint is not representable".into());
+            }
+            let candidate = near + stride_sign * stride.min(limit);
+            let sign = self.endpoint_factor_sign(i, lattice_value(candidate), subtract)?;
+            if sign == 0 {
+                return Ok(lattice_value(candidate));
+            }
+            if sign != at_root {
+                far = candidate;
+                break;
+            }
+            near = candidate;
+            stride *= 2;
+        }
+        while (far - near).abs() > 1 {
+            let middle = near + (far - near) / 2;
+            let sign = self.endpoint_factor_sign(i, lattice_value(middle), subtract)?;
+            if sign == 0 {
+                return Ok(lattice_value(middle));
+            }
+            if sign == at_root {
+                near = middle;
+            } else {
+                far = middle;
+            }
+        }
+        // Adjacent candidates on either side of the change: every candidate
+        // above the lower one carries the flipped sign, every one below it
+        // the unflipped sign, and the lower one is ranked at its own sign.
+        Ok(lattice_value(near.min(far)))
     }
 
     /// Invert the affine score comparisons for representable f64 candidates.
@@ -619,6 +681,23 @@ impl ExactGaussianFullConformal {
     }
 }
 
+/// Order-preserving integer key of a finite f64: consecutive keys are
+/// adjacent representable values, and `-0.0` shares `0.0`'s key.
+fn lattice_key(value: f64) -> i64 {
+    let magnitude = (value.to_bits() & 0x7fff_ffff_ffff_ffff) as i64;
+    if value.is_sign_negative() {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+/// Inverse of [`lattice_key`].
+fn lattice_value(key: i128) -> f64 {
+    let magnitude = f64::from_bits(key.unsigned_abs() as u64);
+    if key < 0 { -magnitude } else { magnitude }
+}
+
 /// Wilkinson growth for the Gaussian REML response's arithmetic: the factor
 /// [`honest`] charges against every magnitude sum.
 ///
@@ -708,10 +787,12 @@ pub struct ExactFullConformalPenalty {
     /// keep the verdict they already had. Never partially filled: the
     /// constructor below validates the set's structure (one strength per block,
     /// every block `p × p` and finite) and says why it does not test the sum.
-    #[serde(default)]
+    // Omitted when empty, so a payload with no components (v39 and older, or a
+    // single-penalty fit) re-serializes to its own shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     components: Vec<Array2<f64>>,
     /// The fitted `ln λ_k`, aligned 1:1 with [`Self::components`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     log_strengths: Vec<f64>,
 }
 
@@ -1685,6 +1766,79 @@ mod smoothed_tests {
                     expected,
                     "slope={slope}, z={z:.18e}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn a_corrected_root_whose_neighbours_share_a_sign_is_isolated_on_the_lattice_3338() {
+        // r_0(z) ∓ r_*(z) is 1 − z (subtract) and 1 + z (add). A slope handed
+        // in at three times its magnitude leaves the four corrections short
+        // of the crossing, on either side depending on the factor.
+        let engine = ExactGaussianFullConformal {
+            u: array![1.0, 0.0],
+            w: array![0.0, 1.0],
+            n: 1,
+            tie_uniform: 0.5,
+        };
+        for (subtract, a, crossing) in [(true, -3.0, 1.0), (false, 3.0, -1.0)] {
+            let corrected = engine.corrected_score_root(0, subtract, a, 1.0).unwrap();
+            let sign = |z: f64| engine.endpoint_factor_sign(0, z, subtract).unwrap();
+            let at = sign(corrected);
+            assert_ne!(at, 0, "premise: the corrected root is not the crossing");
+            assert_eq!(
+                (sign(corrected.next_down()), sign(corrected.next_up())),
+                (at, at),
+                "premise: the neighbours share a sign, which used to be refused"
+            );
+            assert_eq!(
+                engine.isolated_score_root(0, subtract, a, 1.0).unwrap(),
+                crossing
+            );
+        }
+
+        // A crossing between two representable candidates: 1 − 3z at 1/3.
+        let engine = ExactGaussianFullConformal {
+            u: array![1.0, 0.0],
+            w: array![0.0, 3.0],
+            n: 1,
+            tie_uniform: 0.5,
+        };
+        let sign = |z: f64| engine.endpoint_factor_sign(0, z, true).unwrap();
+        let corrected = engine.corrected_score_root(0, true, -9.0, 1.0).unwrap();
+        assert_eq!(sign(corrected.next_down()), sign(corrected.next_up()));
+        let root = engine.isolated_score_root(0, true, -9.0, 1.0).unwrap();
+        assert_eq!((sign(root), sign(root.next_up())), (1, -1));
+        assert!((lattice_key(root) - lattice_key(1.0 / 3.0)).abs() <= 1);
+
+        // Control: accurate slope, neighbours bracket, the root is kept as is.
+        let corrected = engine.corrected_score_root(0, true, -3.0, 1.0).unwrap();
+        assert_eq!(
+            (sign(corrected.next_down()), sign(corrected.next_up())),
+            (1, -1)
+        );
+        assert_eq!(
+            engine.isolated_score_root(0, true, -3.0, 1.0).unwrap(),
+            corrected
+        );
+    }
+
+    #[test]
+    fn lattice_keys_order_adjacent_values() {
+        for value in [
+            -f64::MAX,
+            -1.0,
+            -f64::MIN_POSITIVE,
+            -0.0,
+            0.0,
+            5e-324,
+            1.0 / 3.0,
+            f64::MAX,
+        ] {
+            let key = lattice_key(value);
+            assert_eq!(lattice_value(i128::from(key)), value);
+            if value < f64::MAX {
+                assert_eq!(lattice_value(i128::from(key) + 1), value.next_up());
             }
         }
     }

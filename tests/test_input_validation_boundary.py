@@ -11,8 +11,9 @@ Policies pinned here:
 * **Scale invariance (F3).** A Gaussian fit is equivariant under ``y -> c*y``:
   the fitted mean scales by ``c`` and the smoothing parameters do not move.
   There is no absolute spread floor on the response.
-* **Family support.** Poisson and negative binomial take non-negative
-  *integer* counts (non-integer data is pointed at Tweedie), binomial takes
+* **Family support.** Negative binomial takes non-negative *integer* counts
+  (non-integer data is pointed at Poisson and Tweedie); an explicit Poisson
+  family takes any non-negative real (gam#4572); binomial takes
   ``y`` in ``[0, 1]``, Gamma takes ``y > 0``. Errors are ``DataError`` naming
   the column, the family and the first offending 1-based row.
 * **Weights.** Finite, non-negative and not all zero. A zero weight excludes
@@ -111,7 +112,6 @@ def _with(values: np.ndarray, row0: int, value: float) -> np.ndarray:
 SUPPORT_CASES = [
     # (id, family, response, 1-based offending row, value text, family label)
     ("poisson-negative", "poisson", _with(_counts(), 6, -1.0), 7, "-1", "Poisson"),
-    ("poisson-non-integer", "poisson", _with(_counts(), 2, 2.5), 3, "2.5", "Poisson"),
     ("nb-non-integer", "negative-binomial", _with(_counts(), 9, 0.5), 10, "0.5", "Negative-Binomial"),
     ("binomial-above-one", "binomial", _with(_binary(), 3, 2.0), 4, "2", "Binomial"),
     ("binomial-negative", "binomial", _with(_binary(), 0, -0.25), 1, "-0.25", "Binomial"),
@@ -135,10 +135,20 @@ def test_response_outside_family_support_is_a_data_error(family, y, row, value, 
     assert f"first offending row {row} has value {value}" in message, message
 
 
-def test_non_integer_counts_point_at_tweedie() -> None:
+def test_non_integer_counts_point_negative_binomial_at_poisson_and_tweedie() -> None:
     x, _ = _base()
     with pytest.raises(gamfit.errors.DataError, match="tweedie"):
-        gamfit.fit({"x": x, "y": _counts() + 0.5}, "y ~ s(x)", family="poisson")
+        gamfit.fit({"x": x, "y": _counts() + 0.5}, "y ~ s(x)", family="negative-binomial")
+
+
+def test_explicit_poisson_fits_a_non_negative_real_response() -> None:
+    # gam#4572: the Poisson family's support is the non-negative reals; a
+    # non-integer y is the ln-Gamma continuation of the log-mass (the Poisson
+    # quasi-likelihood at dispersion one). See test_poisson_real_response_4572.py
+    # for the X'y sufficiency this buys.
+    x, _ = _base()
+    model = gamfit.fit({"x": x, "y": _counts() + 0.5}, "y ~ s(x)", family="poisson")
+    assert np.all(np.isfinite(_mean(model, GRID)))
 
 
 def test_non_integer_non_negative_data_fits_under_tweedie() -> None:

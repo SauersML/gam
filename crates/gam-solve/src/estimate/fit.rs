@@ -242,7 +242,7 @@ where
         Some(opts.firth_bias_reduction),
     )?;
     // Per-family response-support validation, owned by the family type.
-    // Gamma `y > 0`, Poisson / NegativeBinomial non-negative integer counts,
+    // Gamma `y > 0`, Poisson `y ≥ 0` (#4572), NegativeBinomial non-negative integer counts,
     // Tweedie `y ≥ 0`, Beta `y ∈ (0, 1)`, judged over positive-weight rows
     // (a zero weight excludes its row from the likelihood). Centralising the rule on `ResponseFamily` means the
     // external-design GLM path and the formula path share the same
