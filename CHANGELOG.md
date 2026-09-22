@@ -110,6 +110,26 @@
   `tests/torch/test_torch_penalty_parity_with_rust_4492.py` is written as its strict xfail, so it
   reports the per-margin λ̂ / EDF / fitted-value parity the day that lands and cannot report a
   parity that does not exist before it.
+- **A fitted event-history model could only be predicted from in the session that fitted it**
+  (gam#2966). There was no save/load prediction contract: every prediction took an
+  `EventHistoryFit`, which holds the training cohort's node expansion and its per-mark designs over
+  those nodes, and an `EventHistoryCohort`, which holds the participants' histories and covariate
+  rows. The Python class held both. A prediction reads none of it. What it reads is the frozen
+  schema, the fitted functions and the probability law, the reference law the baselines are
+  normalised against, and the posterior a posterior-predictive average integrates over — and that
+  list is now a type, `PredictionModel`, which every prediction function reads and which two owners
+  lend: a fit, and an `EventHistoryPredictor` loaded from a file. Because both lend the same view
+  there is one implementation, so save → reload → forecast reproduces the in-memory forecast bit
+  for bit as a consequence rather than as a second code path kept in step by hand. The artifact is
+  the shared saved-model envelope of kind `event-history` at version 1, so another kind or another
+  version is refused there, typed, and never migrated. It does not carry the reference population's
+  designs, because they are derived: the fit builds them by crossing the profiles with the grid
+  times under the frozen specification, so a reload rebuilds them from what the document does hold,
+  and the rebuilt widths are checked against the saved block widths, which refuses a document whose
+  schema and law came from different models. `_EventHistoryPredictor` in `gamfit._rust` loads one
+  and serves `forecast_history` and `population_forecast` holding no cohort at all;
+  `_EventHistoryModel.save()` writes one.
+
 - **A memory-budget refusal names the reservation that refused it** (#4565). The governor's
   ledger is process-wide, so `MemoryReservationError::BudgetExceeded` reported how many bytes
   were reserved without saying whose they were. A caller refused because a neighbour holds the

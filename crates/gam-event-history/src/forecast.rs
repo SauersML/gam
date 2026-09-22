@@ -116,6 +116,7 @@ use super::cohort::{
     SubjectNodes, cell_rule, expand_nodes, mesh_cells,
 };
 use super::family::EventHistoryFit;
+use super::predictor::{EventHistoryPredictor, PredictionModel};
 use super::marginal::{
     ForwardPass, SubjectInputs, expected_intensities, forward_filter, latent_state_moments, spells,
 };
@@ -250,21 +251,20 @@ fn forecast_normaliser(state: &ParameterState, marks: usize, stratum: usize, tim
 }
 
 fn single_subject_nodes(
-    fit: &EventHistoryFit,
-    cohort: &EventHistoryCohort,
+    model: &PredictionModel<'_>,
     table: ArrayView2<'_, f64>,
     history: &SubjectHistory,
 ) -> Result<CohortNodes, EventHistoryError> {
     let mut one = EventHistoryCohort {
-        mark_names: cohort.mark_names.clone(),
-        mark_kinds: cohort.mark_kinds.clone(),
-        covariate_names: cohort.covariate_names.clone(),
-        covariate_levels: cohort.covariate_levels.clone(),
+        mark_names: model.mark_names.to_vec(),
+        mark_kinds: model.mark_kinds.to_vec(),
+        covariate_names: model.covariate_names.to_vec(),
+        covariate_levels: model.covariate_levels.to_vec(),
         covariates: table.to_owned(),
         subjects: vec![history.clone()],
     };
     one.validate()?;
-    expand_nodes(&one, fit.quadrature_order, fit.mesh_refinement)
+    expand_nodes(&one, model.quadrature_order, model.mesh_refinement)
 }
 
 /// Population node log-intensities `η⁰` (design × coefficients + offset)
@@ -276,15 +276,15 @@ fn single_subject_nodes(
 /// (`super::posterior`). The frozen term specifications and the design they
 /// build are the fit's, because the model's basis is not a parameter.
 fn node_eta0(
-    fit: &EventHistoryFit,
+    model: &PredictionModel<'_>,
     state: &ParameterState,
     rows: ArrayView2<'_, f64>,
 ) -> Result<Vec<f64>, EventHistoryError> {
-    let marks = fit.marks();
+    let marks = model.marks;
     let total = rows.nrows();
     let mut eta0 = vec![0.0; total * marks];
     for d in 0..marks {
-        let design = build_term_collection_design(rows, &fit.frozen_specs[d]).map_err(|error| {
+        let design = build_term_collection_design(rows, &model.frozen_specs[d]).map_err(|error| {
             EventHistoryError::Fit {
                 reason: format!("prediction design for mark {d}: {error}"),
             }
@@ -293,7 +293,7 @@ fn node_eta0(
         if design.design.ncols() != beta.len() {
             return Err(EventHistoryError::Fit {
                 reason: format!(
-                    "prediction design for mark {d} has {} columns, the fit has {} coefficients",
+                    "prediction design for mark {d} has {} columns, the model has {} coefficients",
                     design.design.ncols(),
                     beta.len()
                 ),
@@ -319,14 +319,19 @@ fn node_eta0(
 /// The fitted baseline surfaces, evaluated directly on covariate rows with
 /// time in the last column. This is distinct from averaging individual
 /// forecasts under an entry-conditioned population.
-pub fn baseline_log_rates(fit: &EventHistoryFit, rows: ArrayView2<'_, f64>) -> Result<Array2<f64>, EventHistoryError> {
-    if rows.ncols() != fit.nodes.time_column + 1 || rows.iter().any(|x| !x.is_finite()) {
+pub fn baseline_log_rates(
+    fit: &EventHistoryFit,
+    cohort: &EventHistoryCohort,
+    rows: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, EventHistoryError> {
+    let model = fit.prediction_model(cohort)?;
+    if rows.ncols() != model.time_column + 1 || rows.iter().any(|x| !x.is_finite()) {
         return Err(EventHistoryError::InvalidInput {
             reason: "baseline rows need finite covariates followed by time".to_string(),
         });
     }
-    let values = node_eta0(fit, &ParameterState::fitted(fit), rows)?;
-    Array2::from_shape_vec((rows.nrows(), fit.marks()), values)
+    let values = node_eta0(&model, &model.fitted, rows)?;
+    Array2::from_shape_vec((rows.nrows(), model.marks), values)
         .map_err(|error| EventHistoryError::InvalidInput { reason: error.to_string() })
 }
 
@@ -356,26 +361,27 @@ pub fn latent_state(
     history: &SubjectHistory,
     stratum: usize,
 ) -> Result<SmoothedLatentState, EventHistoryError> {
-    let atoms = fit.rank();
-    let state = ParameterState::fitted(fit);
+    let model = fit.prediction_model(cohort)?;
+    let atoms = model.atoms;
+    let state = &model.fitted;
     let rates = state.rates();
-    let nodes = single_subject_nodes(fit, cohort, cohort.covariates.view(), history)?;
-    let eta0 = node_eta0(fit, &state, nodes.node_data.view())?;
+    let nodes = single_subject_nodes(&model, cohort.covariates.view(), history)?;
+    let eta0 = node_eta0(&model, state, nodes.node_data.view())?;
     let subject = &nodes.subjects[0];
-    let normaliser = forecast_normaliser(&state, fit.marks(), stratum, &subject.times)?;
+    let normaliser = forecast_normaliser(state, model.marks, stratum, &subject.times)?;
     let moments = latent_state_moments(
         &SubjectInputs {
             nodes: subject,
             eta0: &eta0,
             loadings: &state.loadings,
             rates: &rates,
-            time_scale: fit.time_scale,
-            gh: fit.family.gauss_hermite(),
+            time_scale: model.time_scale,
+            gh: model.gh,
             continuation_gap: 0.0,
             designs: None,
             log_normaliser: normaliser.as_deref(),
         },
-        fit.family.quadrature_tolerance(),
+        model.quadrature_tolerance,
     )?;
     let mut mean = Array2::<f64>::zeros((subject.len(), atoms));
     let mut covariance = Vec::with_capacity(subject.len());
@@ -421,8 +427,7 @@ struct Opening<'a> {
 /// rule `gh`. Each rule a window integrates under filters the history anew,
 /// placing its own grids, so the state it continues from is its own.
 fn observed_state(
-    fit: &EventHistoryFit,
-    cohort: &EventHistoryCohort,
+    model: &PredictionModel<'_>,
     opening: &Opening<'_>,
     stratum: usize,
     state: &ParameterState,
@@ -431,17 +436,17 @@ fn observed_state(
     gh: &GaussHermite,
 ) -> Result<LatentState, EventHistoryError> {
     let history = &opening.history;
-    let observed = single_subject_nodes(fit, cohort, opening.table, history)?;
-    chain_fits(gh.order, fit.rank(), observed.subjects[0].len())?;
-    let eta0 = node_eta0(fit, state, observed.node_data.view())?;
-    let normaliser = forecast_normaliser(state, fit.marks(), stratum, &observed.subjects[0].times)?;
+    let observed = single_subject_nodes(model, opening.table, history)?;
+    chain_fits(gh.order, model.atoms, observed.subjects[0].len())?;
+    let eta0 = node_eta0(model, state, observed.node_data.view())?;
+    let normaliser = forecast_normaliser(state, model.marks, stratum, &observed.subjects[0].times)?;
     let mut pass = forward_filter(
         &SubjectInputs {
             nodes: &observed.subjects[0],
             eta0: &eta0,
             loadings,
             rates,
-            time_scale: fit.time_scale,
+            time_scale: model.time_scale,
             gh,
             continuation_gap: 0.0,
             designs: None,
@@ -497,11 +502,11 @@ fn validate_horizons(horizons: &[f64], start: f64) -> Result<(), EventHistoryErr
 }
 
 fn validate_future(
-    cohort: &EventHistoryCohort,
+    model: &PredictionModel<'_>,
     future: &[FutureSegment],
     last_horizon: f64,
 ) -> Result<(), EventHistoryError> {
-    let n_cov = cohort.covariates.ncols();
+    let n_cov = model.covariate_names.len();
     for (i, segment) in future.iter().enumerate() {
         if !segment.start.is_finite() || segment.covariates.len() != n_cov {
             return Err(EventHistoryError::InvalidInput {
@@ -533,14 +538,14 @@ fn validate_future(
                     ),
                 });
             }
-            let levels = &cohort.covariate_levels[j];
+            let levels = &model.covariate_levels[j];
             if !levels.is_empty()
                 && (value.fract() != 0.0 || *value < 0.0 || *value >= levels.len() as f64)
             {
                 return Err(EventHistoryError::InvalidInput {
                     reason: format!(
                         "future segment {i} has code {value} for categorical covariate {:?} with {} levels",
-                        cohort.covariate_names[j],
+                        model.covariate_names[j],
                         levels.len()
                     ),
                 });
@@ -554,8 +559,7 @@ fn validate_future(
 /// history whose filtered state it continues from (`None` for the stationary
 /// prior), and which marks the subject is still at risk for.
 struct Window<'a> {
-    fit: &'a EventHistoryFit,
-    cohort: &'a EventHistoryCohort,
+    model: &'a PredictionModel<'a>,
     /// The global parameter state every probability in this window is
     /// conditioned on. A conditional prediction passes the fitted state; a
     /// posterior-predictive average passes one rule point's
@@ -598,7 +602,7 @@ fn chain_fits(order: usize, atoms: usize, chain_nodes: usize) -> Result<(), Even
 /// Gauss-Legendre rule per cell, and the window's killed runs. A latent window
 /// runs two, on the fit's rule and on its next rung.
 struct WindowIntegrand<'a> {
-    fit: &'a EventHistoryFit,
+    model: &'a PredictionModel<'a>,
     state: &'a ParameterState,
     stratum: usize,
     pseudo: &'a SubjectHistory,
@@ -630,9 +634,9 @@ impl WindowIntegrand<'_> {
         right: f64,
         from: &[Option<LatentState>],
     ) -> Result<Vec<CellSums<Option<LatentState>>>, EventHistoryError> {
-        let fit = self.fit;
-        let marks = fit.marks();
-        let atoms = fit.rank();
+        let model = self.model;
+        let marks = model.marks;
+        let atoms = model.atoms;
         let q = self.gl_nodes.len();
         let outer: Vec<(f64, f64)> = cell_rule(left, right, self.gl_nodes, self.gl_weights).collect();
         let inner: Vec<Vec<(f64, f64)>> = outer
@@ -651,7 +655,7 @@ impl WindowIntegrand<'_> {
             }
             rows[[i, n_cov]] = t;
         }
-        let eta0 = node_eta0(fit, self.state, rows.view())?;
+        let eta0 = node_eta0(model, self.state, rows.view())?;
         let outer_times: Vec<f64> = times[..q].to_vec();
         let outer_weights: Vec<f64> = outer.iter().map(|&(_, w)| w).collect();
         let mut sums = Vec::with_capacity(self.runs.len());
@@ -666,7 +670,7 @@ impl WindowIntegrand<'_> {
                         eta0: eta,
                         loadings: self.loadings,
                         rates: self.rates,
-                        time_scale: fit.time_scale,
+                        time_scale: model.time_scale,
                         gh,
                         continuation_gap: state.map_or(0.0, |s| times[0] - s.time),
                         designs: None,
@@ -761,11 +765,14 @@ impl KilledProcess for WindowIntegrand<'_> {
 /// algebraically in its width, so the gap between the cell and its halves no
 /// longer bounds the halves' error. With every grid time a breakpoint, each
 /// cell's integrand is smooth. None of them depends on the horizons.
-pub(crate) fn window_breakpoints(fit: &EventHistoryFit, pseudo: &SubjectHistory) -> Vec<f64> {
+pub(crate) fn window_breakpoints(
+    centring: Option<&crate::family::RiskSetCentring>,
+    pseudo: &SubjectHistory,
+) -> Vec<f64> {
     let (start, end) = (pseudo.entry, pseudo.exit);
     let mut breakpoints = vec![start];
     breakpoints.extend(mesh_cells(pseudo, false, 0).iter().map(|&(_, right)| right));
-    if let Some(snapshot) = fit.centring.as_ref() {
+    if let Some(snapshot) = centring {
         breakpoints.extend(snapshot.grid.times.iter().copied().filter(|&t| t > start && t < end));
     }
     breakpoints.sort_by(f64::total_cmp);
@@ -794,8 +801,7 @@ pub(crate) fn window_breakpoints(fit: &EventHistoryFit, pseudo: &SubjectHistory)
 /// companion's budget alone.
 fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
     let Window {
-        fit,
-        cohort,
+        model,
         state,
         stratum,
         opening,
@@ -806,8 +812,8 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
         at_risk,
         label,
     } = window;
-    let marks = fit.marks();
-    let kinds = &cohort.mark_kinds;
+    let marks = model.marks;
+    let kinds = model.mark_kinds;
     let terminal: Vec<bool> = kinds.iter().map(|k| *k == MarkKind::Terminal).collect();
     let mut runs = vec![KilledRun {
         exposed: (0..marks).map(|d| terminal[d] && at_risk[d]).collect(),
@@ -825,11 +831,11 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
     }
     let loadings = &state.loadings;
     let rates = state.rates();
-    let (gl_nodes, gl_weights) = gam_math::special::gauss_legendre(fit.quadrature_order);
-    let gh: &GaussHermite = fit.family.gauss_hermite();
-    let rung = if fit.rank() > 0 {
+    let (gl_nodes, gl_weights) = gam_math::special::gauss_legendre(model.quadrature_order);
+    let gh: &GaussHermite = model.gh;
+    let rung = if model.atoms > 0 {
         let order = 2 * gh.order - 1;
-        chain_fits(order, fit.rank(), fit.quadrature_order + 1)?;
+        chain_fits(order, model.atoms, model.quadrature_order + 1)?;
         Some(GaussHermite::new(order)?)
     } else {
         None
@@ -842,7 +848,7 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
         segments,
     };
     let integrand = WindowIntegrand {
-        fit,
+        model,
         state,
         stratum,
         pseudo: &pseudo,
@@ -852,7 +858,7 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
         gl_nodes: &gl_nodes,
         gl_weights: &gl_weights,
         gh,
-        interpolates: fit.rank() > 0 && !crate::static_state::is_static(&rates),
+        interpolates: model.atoms > 0 && !crate::static_state::is_static(&rates),
         runs: &runs,
     };
     // Each rule's opening state is the history filtered under that rule, or
@@ -860,7 +866,7 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
     let opened = |rule: &GaussHermite| -> Result<Vec<Option<LatentState>>, EventHistoryError> {
         let opened_at = opening
             .as_ref()
-            .map(|history| observed_state(fit, cohort, history, stratum, state, loadings, &rates, rule))
+            .map(|history| observed_state(model, history, stratum, state, loadings, &rates, rule))
             .transpose()?;
         Ok(vec![opened_at; runs.len()])
     };
@@ -872,7 +878,7 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
         }),
         None => None,
     };
-    let breakpoints = window_breakpoints(fit, &pseudo);
+    let breakpoints = window_breakpoints(state.centring.as_ref(), &pseudo);
     let reached = integrate_window(&integrand, opened(gh)?, companion, &breakpoints, horizons)?;
     let n_h = horizons.len();
     let mut survival = vec![0.0; n_h];
@@ -953,10 +959,10 @@ pub fn forecast(
     cohort: &EventHistoryCohort,
     request: &ForecastRequest<'_>,
 ) -> Result<Forecast, EventHistoryError> {
+    let model = fit.prediction_model(cohort)?;
     forecast_on_table(
-        fit,
-        cohort,
-        &ParameterState::fitted(fit),
+        &model,
+        &model.fitted,
         cohort.covariates.view(),
         request.history,
         request.stratum,
@@ -978,19 +984,37 @@ pub fn forecast_history(
     cohort: &EventHistoryCohort,
     request: &HistoryForecastRequest<'_>,
 ) -> Result<Forecast, EventHistoryError> {
-    if request.covariates.ncols() != cohort.covariates.ncols() {
+    history_forecast(&fit.prediction_model(cohort)?, request)
+}
+
+/// [`forecast_history`] from a saved predictor: the same window, the same
+/// filter and the same numbers, out of an artifact that holds no training
+/// records (gam#2966). This is the serving entry point, because a history
+/// brings its own covariate rows.
+pub fn predictor_forecast_history(
+    predictor: &EventHistoryPredictor,
+    request: &HistoryForecastRequest<'_>,
+) -> Result<Forecast, EventHistoryError> {
+    history_forecast(&predictor.model(), request)
+}
+
+/// A history forecast at whatever model lends it.
+fn history_forecast(
+    model: &PredictionModel<'_>,
+    request: &HistoryForecastRequest<'_>,
+) -> Result<Forecast, EventHistoryError> {
+    if request.covariates.ncols() != model.covariate_names.len() {
         return Err(EventHistoryError::InvalidInput {
             reason: format!(
-                "the history's covariate rows have {} columns, the fit's cohort {}",
+                "the history's covariate rows have {} columns, the model's schema {}",
                 request.covariates.ncols(),
-                cohort.covariates.ncols()
+                model.covariate_names.len()
             ),
         });
     }
     forecast_on_table(
-        fit,
-        cohort,
-        &ParameterState::fitted(fit),
+        model,
+        &model.fitted,
         request.covariates,
         request.history,
         request.stratum,
@@ -1000,8 +1024,7 @@ pub fn forecast_history(
 }
 
 fn forecast_on_table(
-    fit: &EventHistoryFit,
-    cohort: &EventHistoryCohort,
+    model: &PredictionModel<'_>,
     state: &ParameterState,
     table: ArrayView2<'_, f64>,
     history: &SubjectHistory,
@@ -1009,18 +1032,13 @@ fn forecast_on_table(
     horizons: &[f64],
     future: &[FutureSegment],
 ) -> Result<Forecast, EventHistoryError> {
-    let marks = fit.marks();
-    let kinds = &cohort.mark_kinds;
-    if kinds.len() != marks || fit.mark_kinds != *kinds {
-        return Err(EventHistoryError::InvalidInput {
-            reason: "the forecast cohort's mark kinds differ from the fit's".to_string(),
-        });
-    }
+    let marks = model.marks;
+    let kinds = model.mark_kinds;
     state.risk_set_normaliser_at(marks, stratum, history.entry)?;
     validate_horizons(horizons, history.exit)?;
     state.risk_set_normaliser_at(marks, stratum, horizons[horizons.len() - 1])?;
     let last_horizon = horizons[horizons.len() - 1];
-    validate_future(cohort, future, last_horizon)?;
+    validate_future(model, future, last_horizon)?;
     // A subject whose follow-up ended with a terminal event has no future:
     // its survival is zero and nothing more can happen.
     if history.terminal_event(kinds).is_some() {
@@ -1050,8 +1068,7 @@ fn forecast_on_table(
         })
         .collect();
     run_window(Window {
-        fit,
-        cohort,
+        model,
         state,
         stratum,
         opening: Some(opening),
@@ -1071,22 +1088,28 @@ pub fn population_forecast(
     cohort: &EventHistoryCohort,
     request: &PopulationForecastRequest<'_>,
 ) -> Result<Forecast, EventHistoryError> {
-    population_on_state(fit, cohort, &ParameterState::fitted(fit), request)
+    let model = fit.prediction_model(cohort)?;
+    population_on_state(&model, &model.fitted, request)
+}
+
+/// [`population_forecast`] from a saved predictor (gam#2966). A population
+/// window reads the covariate path the request carries and the reference
+/// population the artifact carries, and never a training row.
+pub fn predictor_population_forecast(
+    predictor: &EventHistoryPredictor,
+    request: &PopulationForecastRequest<'_>,
+) -> Result<Forecast, EventHistoryError> {
+    let model = predictor.model();
+    population_on_state(&model, &model.fitted, request)
 }
 
 /// [`population_forecast`] at one global parameter state.
 fn population_on_state(
-    fit: &EventHistoryFit,
-    cohort: &EventHistoryCohort,
+    model: &PredictionModel<'_>,
     state: &ParameterState,
     request: &PopulationForecastRequest<'_>,
 ) -> Result<Forecast, EventHistoryError> {
-    let marks = fit.marks();
-    if cohort.mark_kinds.len() != marks || fit.mark_kinds != cohort.mark_kinds {
-        return Err(EventHistoryError::InvalidInput {
-            reason: "the forecast cohort's mark kinds differ from the fit's".to_string(),
-        });
-    }
+    let marks = model.marks;
     if !request.start.is_finite() {
         return Err(EventHistoryError::InvalidInput {
             reason: "the window's start must be finite".to_string(),
@@ -1096,9 +1119,14 @@ fn population_on_state(
     validate_horizons(request.horizons, request.start)?;
     state.risk_set_normaliser_at(marks, request.stratum, request.horizons[request.horizons.len() - 1])?;
     let last_horizon = request.horizons[request.horizons.len() - 1];
-    validate_future(cohort, request.future, last_horizon)?;
+    validate_future(model, request.future, last_horizon)?;
+    // A population window's covariate path is the request's own segments, and
+    // `future_table` addresses them from the end of the base table, so the
+    // base is the empty table of the schema's width: a population forecast
+    // reads no training row, and a saved predictor has none to read.
+    let base = Array2::<f64>::zeros((0, model.covariate_names.len()));
     let (table, segments) = future_table(
-        cohort.covariates.view(),
+        base.view(),
         request.future,
         request.start,
         None,
@@ -1116,13 +1144,12 @@ fn population_on_state(
                 events: Vec::new(),
                 segments: vec![CovariateSegment { start: origin, row: request.stratum }],
             };
-            let compensated: Vec<bool> = fit.mark_kinds.iter().map(|kind| *kind != MarkKind::Recurrent).collect();
+            let compensated: Vec<bool> = model.mark_kinds.iter().map(|kind| *kind != MarkKind::Recurrent).collect();
             Some(Opening { table: snapshot.profiles.view(), history, compensated })
         } else { None }
     } else { None };
     run_window(Window {
-        fit,
-        cohort,
+        model,
         state,
         stratum: request.stratum,
         opening,
@@ -1150,11 +1177,11 @@ pub fn posterior_predictive_forecast(
     cohort: &EventHistoryCohort,
     request: &ForecastRequest<'_>,
 ) -> Result<PosteriorPredictiveForecast, EventHistoryError> {
-    posterior_predictive(fit, request.horizons, |coefficients| {
+    let model = fit.prediction_model(cohort)?;
+    posterior_predictive(&model, request.horizons, |coefficients| {
         forecast_on_table(
-            fit,
-            cohort,
-            &ParameterState::at(fit, coefficients)?,
+            &model,
+            &ParameterState::at(&model, coefficients)?,
             cohort.covariates.view(),
             request.history,
             request.stratum,
@@ -1171,20 +1198,38 @@ pub fn posterior_predictive_forecast_history(
     cohort: &EventHistoryCohort,
     request: &HistoryForecastRequest<'_>,
 ) -> Result<PosteriorPredictiveForecast, EventHistoryError> {
-    if request.covariates.ncols() != cohort.covariates.ncols() {
+    averaged_history_forecast(&fit.prediction_model(cohort)?, request)
+}
+
+/// [`predictor_forecast_history`] averaged over the model's posterior of the
+/// global parameters (gam#2964, gam#2966). Every state of the rule rebuilds
+/// its reference evolution from the artifact's own reference population, so a
+/// served posterior-predictive forecast reads no training record either.
+pub fn predictor_posterior_predictive_forecast_history(
+    predictor: &EventHistoryPredictor,
+    request: &HistoryForecastRequest<'_>,
+) -> Result<PosteriorPredictiveForecast, EventHistoryError> {
+    averaged_history_forecast(&predictor.model(), request)
+}
+
+/// An averaged history forecast at whatever model lends it.
+fn averaged_history_forecast(
+    model: &PredictionModel<'_>,
+    request: &HistoryForecastRequest<'_>,
+) -> Result<PosteriorPredictiveForecast, EventHistoryError> {
+    if request.covariates.ncols() != model.covariate_names.len() {
         return Err(EventHistoryError::InvalidInput {
             reason: format!(
-                "the history's covariate rows have {} columns, the fit's cohort {}",
+                "the history's covariate rows have {} columns, the model's schema {}",
                 request.covariates.ncols(),
-                cohort.covariates.ncols()
+                model.covariate_names.len()
             ),
         });
     }
-    posterior_predictive(fit, request.horizons, |coefficients| {
+    posterior_predictive(model, request.horizons, |coefficients| {
         forecast_on_table(
-            fit,
-            cohort,
-            &ParameterState::at(fit, coefficients)?,
+            model,
+            &ParameterState::at(model, coefficients)?,
             request.covariates,
             request.history,
             request.stratum,
@@ -1201,8 +1246,9 @@ pub fn posterior_predictive_population_forecast(
     cohort: &EventHistoryCohort,
     request: &PopulationForecastRequest<'_>,
 ) -> Result<PosteriorPredictiveForecast, EventHistoryError> {
-    posterior_predictive(fit, request.horizons, |coefficients| {
-        population_on_state(fit, cohort, &ParameterState::at(fit, coefficients)?, request)
+    let model = fit.prediction_model(cohort)?;
+    posterior_predictive(&model, request.horizons, |coefficients| {
+        population_on_state(&model, &ParameterState::at(&model, coefficients)?, request)
     })
 }
 
@@ -1221,22 +1267,23 @@ pub fn predictive_pit(
     history: &SubjectHistory,
     stratum: usize,
 ) -> Result<Vec<SpellPit>, EventHistoryError> {
-    let marks = fit.marks();
-    let kinds = &cohort.mark_kinds;
-    let state = ParameterState::fitted(fit);
+    let model = fit.prediction_model(cohort)?;
+    let marks = model.marks;
+    let kinds = model.mark_kinds;
+    let state = &model.fitted;
     let rates = state.rates();
-    let nodes = single_subject_nodes(fit, cohort, cohort.covariates.view(), history)?;
-    let eta0 = node_eta0(fit, &state, nodes.node_data.view())?;
+    let nodes = single_subject_nodes(&model, cohort.covariates.view(), history)?;
+    let eta0 = node_eta0(&model, state, nodes.node_data.view())?;
     let subject = &nodes.subjects[0];
-    let normaliser = forecast_normaliser(&state, marks, stratum, &subject.times)?;
+    let normaliser = forecast_normaliser(state, marks, stratum, &subject.times)?;
     let chronology = spells(
         &SubjectInputs {
             nodes: subject,
             eta0: &eta0,
             loadings: &state.loadings,
             rates: &rates,
-            time_scale: fit.time_scale,
-            gh: fit.family.gauss_hermite(),
+            time_scale: model.time_scale,
+            gh: model.gh,
             continuation_gap: 0.0,
             designs: None,
             log_normaliser: normaliser.as_deref(),

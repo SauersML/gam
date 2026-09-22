@@ -56,6 +56,7 @@ use super::cohort::EventHistoryError;
 use super::covariance::eigenmodes;
 use super::family::{EventHistoryFit, RiskSetCentring, risk_set_normaliser_of};
 use super::forecast::Forecast;
+use super::predictor::PredictionModel;
 use ndarray::{Array1, Array2};
 
 /// One global parameter state a prediction conditions on: the per-mark
@@ -92,37 +93,44 @@ impl ParameterState {
     /// module existed, bit for bit.
     pub(crate) fn fitted(fit: &EventHistoryFit) -> Self {
         let marks = fit.marks();
-        let atoms = fit.rank();
+        Self {
+            mark_betas: (0..marks).map(|d| fit.mark_coefficients(d).clone()).collect(),
+            loadings: Self::fitted_loadings(fit),
+            log_rates: fit.log_rates.clone(),
+            centring: fit.centring.clone(),
+        }
+    }
+
+    /// The fit's reported loadings flattened as the filter indexes them,
+    /// `d * atoms + k`. A saved predictor records them through this, so an
+    /// artifact and the fit it came from carry one vector, not two orderings
+    /// (`super::predictor`).
+    pub(crate) fn fitted_loadings(fit: &EventHistoryFit) -> Vec<f64> {
+        let (marks, atoms) = (fit.marks(), fit.rank());
         let mut loadings = Vec::with_capacity(marks * atoms);
         for d in 0..marks {
             for k in 0..atoms {
                 loadings.push(fit.loadings[[d, k]]);
             }
         }
-        Self {
-            mark_betas: (0..marks).map(|d| fit.mark_coefficients(d).clone()).collect(),
-            loadings,
-            log_rates: fit.log_rates.clone(),
-            centring: fit.centring.clone(),
-        }
+        loadings
     }
 
-    /// The state at an arbitrary coefficient vector, in the family's layout.
-    /// The latent block is read through the family's own rate chart and the
+    /// The state at an arbitrary coefficient vector, in the model's layout.
+    /// The latent block is read through the model's own rate chart and the
     /// reference evolution is rebuilt from these coefficients, never carried
-    /// over from the fit.
+    /// over from the fitted state.
     pub(crate) fn at(
-        fit: &EventHistoryFit,
+        model: &PredictionModel<'_>,
         coefficients: &[f64],
     ) -> Result<Self, EventHistoryError> {
-        let marks = fit.marks();
-        let atoms = fit.rank();
-        let offsets = fit.coefficient_block_offsets();
-        let width = fit.family.total_width();
+        let (marks, atoms) = (model.marks, model.atoms);
+        let offsets = &model.block_offsets;
+        let width = model.total_width();
         if coefficients.len() != width {
             return Err(EventHistoryError::InvalidInput {
                 reason: format!(
-                    "a parameter state needs {width} coefficients in the family's layout, got {}",
+                    "a parameter state needs {width} coefficients in the model's layout, got {}",
                     coefficients.len()
                 ),
             });
@@ -133,22 +141,21 @@ impl ParameterState {
         let latent = Array1::from(coefficients[offsets[marks]..].to_vec());
         let loadings = coefficients[offsets[marks]..offsets[marks] + marks * atoms].to_vec();
         // The two lines the fit's own latent report runs, so a state at the
-        // fitted coefficients reproduces `fit.loadings` and `fit.log_rates`.
-        let log_rates: Vec<f64> = fit
-            .family
+        // fitted coefficients reproduces the fit's loadings and log-rates.
+        let log_rates: Vec<f64> = model
             .atom_rates(&latent)
             .iter()
             .map(|nu| nu.ln())
             .collect();
         // The reference evolution is a function of the coefficients alone, so
-        // at the fit's own coefficients it IS the snapshot the fit returned.
+        // at the model's own coefficients it IS the snapshot it carries.
         // Reading it back rather than recomputing it keeps a prediction at
         // `θ̂` identical to the conditional one bit for bit, and spares the
         // rule's centre point a reference rebuild.
-        let centring = if coefficients == fit.fitted_coefficients().as_slice() {
-            fit.centring.clone()
+        let centring = if coefficients == model.fitted_coefficients.as_slice() {
+            model.fitted.centring.clone()
         } else {
-            fit.family.reference_at_coefficients(coefficients)?
+            model.reference_at_coefficients(coefficients)?
         };
         Ok(Self {
             mark_betas,
@@ -229,25 +236,26 @@ struct PosteriorDirections {
 }
 
 impl PosteriorDirections {
-    /// The directions of a fit's own posterior.
+    /// The directions of a model's own posterior.
     ///
-    /// The covariance read is the one `predict()` reads everywhere else in
-    /// this repository: the smoothing-corrected `V_c` when the fit published
-    /// one, which also propagates the uncertainty in `λ̂`, falling back to the
+    /// The covariance is the one `predict()` reads everywhere else in this
+    /// repository: the smoothing-corrected `V_c` when the fit published one,
+    /// which also propagates the uncertainty in `λ̂`, falling back to the
     /// conditional `V_b` only where the fit has no smoothing coordinate to
-    /// correct for. A fit that publishes neither states no posterior over its
-    /// coefficients, and averaging over a posterior that does not exist is a
-    /// typed refusal.
-    fn of(fit: &EventHistoryFit) -> Result<Self, EventHistoryError> {
-        let centre = fit.fitted_coefficients();
+    /// correct for. A model that publishes neither states no posterior over
+    /// its coefficients, and averaging over a posterior that does not exist is
+    /// a typed refusal — which a saved predictor inherits, because the
+    /// covariance is what its document carries as the posterior
+    /// representation.
+    fn of(model: &PredictionModel<'_>) -> Result<Self, EventHistoryError> {
+        let centre = model.fitted_coefficients.clone();
         let width = centre.len();
-        let covariance = fit
-            .fit
-            .beta_covariance_corrected()
+        let covariance = model
+            .posterior_covariance
             .filter(|c| c.nrows() == width && c.ncols() == width)
             .ok_or_else(|| EventHistoryError::Fit {
                 reason: format!(
-                    "the fit publishes no {width}×{width} posterior covariance of its coefficients, so it states no posterior for a prediction to be averaged over"
+                    "the model publishes no {width}×{width} posterior covariance of its coefficients, so it states no posterior for a prediction to be averaged over"
                 ),
             })?;
         let (values, vectors) =
@@ -349,10 +357,10 @@ impl ProductRule {
     /// This is a resource guard: it refuses the rule and never trims it to a
     /// smaller one, because a rule chosen by a budget would make the reported
     /// probability a function of the machine it ran on.
-    fn fits(&self, fit: &EventHistoryFit) -> Result<usize, EventHistoryError> {
+    fn fits(&self, model: &PredictionModel<'_>) -> Result<usize, EventHistoryError> {
         let points = self.points()?;
-        let per_state = fit.family.total_width()
-            + fit.centring.as_ref().map_or(0, |snapshot| {
+        let per_state = model.total_width()
+            + model.fitted.centring.as_ref().map_or(0, |snapshot| {
                 snapshot.log_normaliser.len()
                     + snapshot.log_risk_mass.len()
                     + snapshot.profiles.len()
@@ -515,26 +523,26 @@ impl PosteriorBar {
 /// [`ParameterState::at`] does, and it must read nothing from the fit that
 /// the coefficients determine.
 pub(crate) fn posterior_predictive<F>(
-    fit: &EventHistoryFit,
+    model: &PredictionModel<'_>,
     horizons: &[f64],
     at: F,
 ) -> Result<PosteriorPredictiveForecast, EventHistoryError>
 where
     F: Fn(&[f64]) -> Result<Forecast, EventHistoryError>,
 {
-    let marks = fit.marks();
-    let directions = PosteriorDirections::of(fit)?;
-    let order = fit.family.gauss_hermite().order;
+    let marks = model.marks;
+    let directions = PosteriorDirections::of(model)?;
+    let order = model.gh.order;
     let bar = PosteriorBar {
-        tolerance: fit.family.quadrature_tolerance(),
+        tolerance: model.quadrature_tolerance,
         directions: directions.count(),
         order,
         check_order: 2 * order - 1,
     };
     let rule = ProductRule::new(bar.order, directions.count())?;
     let check = ProductRule::new(bar.check_order, directions.count())?;
-    let states = rule.fits(fit)?;
-    let check_states = check.fits(fit)?;
+    let states = rule.fits(model)?;
+    let check_states = check.fits(model)?;
     let averaged = average_over(&directions, &rule, states, horizons, marks, &at)?;
     let checked = average_over(&directions, &check, check_states, horizons, marks, &at)?;
 

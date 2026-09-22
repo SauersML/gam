@@ -23,6 +23,7 @@ mod formula;
 pub mod joint;
 mod marginal;
 mod posterior;
+mod predictor;
 mod preserve;
 mod scalar;
 mod static_state;
@@ -42,8 +43,11 @@ pub use forecast::{
     SmoothedLatentState, SpellPit, forecast, forecast_history, latent_state, pit_uniform_distance,
     population_forecast, posterior_predictive_forecast, posterior_predictive_forecast_history,
     posterior_predictive_population_forecast, predictive_pit, baseline_log_rates,
+    predictor_forecast_history, predictor_population_forecast,
+    predictor_posterior_predictive_forecast_history,
 };
 pub use posterior::PosteriorPredictiveForecast;
+pub use predictor::EventHistoryPredictor;
 pub use preserve::{ReferenceGrid, ReferenceStrata};
 
 #[cfg(test)]

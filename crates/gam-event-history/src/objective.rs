@@ -15,50 +15,37 @@ struct BlockPair<S> {
 }
 
 impl EventHistoryFamily {
+    /// The reference population's normalisers at a coefficient state, with the
+    /// family's own typed-refusal relay around them.
+    ///
+    /// The evaluation itself is `super::reference_normalisers`, which reads the
+    /// population's tables and the coefficients and nothing of the training
+    /// cohort, so a saved predictor evaluates the same law (gam#2966). What
+    /// stays here is the relay: a `ReferenceStep` refusal is kept typed on the
+    /// family, because the custom-family engine sees it only as text.
     fn reference_values<S: JetField>(
         &self, beta: &[S], loadings: &[S], rates: &[S],
     ) -> Result<crate::preserve::Normalisers<S>, EventHistoryError> {
         let tables = self.reference.as_ref().ok_or_else(|| EventHistoryError::InvalidInput {
             reason: "this family has no reference population".to_string(),
         })?;
-        let marks = self.marks();
-        let nodes = tables.grid.len();
         let offsets = self.block_offsets();
-        let mut normalisers = Vec::new();
-        let mut risk_mass = Vec::new();
-        let mut masks = 0;
-        for s in 0..tables.strata {
-            let mut eta0 = Vec::with_capacity(nodes * marks);
-            for n in 0..nodes {
-                for d in 0..marks {
-                    let row = s * nodes + n;
-                    let mut value = beta[0].constant_like(tables.offsets[d][row]);
-                    for (j, x) in tables.designs[d].row(row).iter().enumerate() {
-                        value = value.add(&beta[offsets[d] + j].scale(*x));
-                    }
-                    eta0.push(value);
+        let shape = crate::family::ReferenceLawShape {
+            block_offsets: &offsets,
+            marks: self.marks(),
+            atoms: self.atoms,
+            time_scale: self.time_scale,
+            gh: &self.gh,
+        };
+        match crate::family::reference_normalisers(tables, &shape, beta, loadings, rates) {
+            Err(refusal @ EventHistoryError::ReferenceStep { .. }) => {
+                if let Ok(mut slot) = self.reference_refusal.lock() {
+                    *slot = Some(refusal.clone());
                 }
+                Err(refusal)
             }
-            let out = match stratum_normalisers(&tables.grid, &eta0, loadings, rates,
-                self.time_scale, &self.gh, &tables.kinds, self.atoms) {
-                Ok(out) => out,
-                // Kept typed on the family, because the engine sees this
-                // refusal only as text.
-                Err(refusal @ EventHistoryError::ReferenceStep { .. }) => {
-                    if let Ok(mut slot) = self.reference_refusal.lock() {
-                        *slot = Some(refusal.clone());
-                    }
-                    return Err(refusal);
-                }
-                Err(error) => return Err(error),
-            };
-            masks = out.masks;
-            normalisers.extend(out.log_normaliser);
-            risk_mass.extend(out.log_risk_mass);
+            other => other,
         }
-        Ok(crate::preserve::Normalisers {
-            log_normaliser: normalisers, log_risk_mass: risk_mass, masks,
-        })
     }
 
     pub(super) fn computed_reference(&self, states: &[ParameterBlockState]) -> Result<RiskSetCentring, EventHistoryError> {
@@ -84,11 +71,7 @@ impl EventHistoryFamily {
         let tables = self.reference.as_ref().ok_or_else(|| EventHistoryError::InvalidInput {
             reason: "reference centring requires reference tables".to_string(),
         })?;
-        let (_, mask_of_mark) = crate::preserve::killing_masks(&tables.kinds);
-        Ok(RiskSetCentring { grid: tables.grid.clone(), profiles: tables.profiles.clone(),
-            coefficients: beta.to_vec(),
-            log_normaliser: out.log_normaliser,
-            log_risk_mass: out.log_risk_mass, masks: out.masks, mask_of_mark })
+        Ok(crate::family::reference_law(tables, beta, out))
     }
 
     /// The reference law is evaluated with the same jet as the subject

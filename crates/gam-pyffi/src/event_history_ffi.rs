@@ -7,10 +7,11 @@ use crate::ffi::ffi_errors::{detach_py_result, py_value_error};
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::event_history::{
     CovariateCells, CovariateSegment, CovariateValue, Event, EventHistoryCohort, EventHistoryFit,
-    ForecastRequest, FutureSegment, HistoryForecastRequest, MarkKind, PopulationForecastRequest,
-    ReferenceStrata, SubjectHistory, code_covariate_value, fit_event_history_formulas, forecast,
-    forecast_history, latent_state, mark_index_of, pit_uniform_distance, population_forecast,
-    predictive_pit, resolve_mark_vocabulary,
+    EventHistoryPredictor, ForecastRequest, FutureSegment, HistoryForecastRequest, MarkKind,
+    PopulationForecastRequest, ReferenceStrata, SubjectHistory, code_covariate_value,
+    fit_event_history_formulas, forecast, forecast_history, latent_state, mark_index_of,
+    pit_uniform_distance, population_forecast, predictor_forecast_history,
+    predictor_population_forecast, predictive_pit, resolve_mark_vocabulary,
 };
 use ndarray::{Array2, Array3};
 use numpy::{PyArray1, PyArray2, PyArray3};
@@ -31,18 +32,21 @@ pub(crate) struct PyEventHistoryModel {
 /// Code one Python covariate record against the fitted schema: a continuous
 /// covariate takes a number, a categorical one the `str` of its value, and the
 /// cohort's levels decide the code.
-fn coded_record(cohort: &EventHistoryCohort, values: &[Bound<'_, PyAny>]) -> PyResult<Vec<f64>> {
-    if values.len() != cohort.covariate_names.len() {
+fn coded_record(
+    names: &[String],
+    levels_of: &[Vec<String>],
+    values: &[Bound<'_, PyAny>],
+) -> PyResult<Vec<f64>> {
+    if values.len() != names.len() {
         return Err(py_value_error(format!(
             "a covariate record has {} values for {} covariates",
             values.len(),
-            cohort.covariate_names.len()
+            names.len()
         )));
     }
-    cohort
-        .covariate_names
+    names
         .iter()
-        .zip(&cohort.covariate_levels)
+        .zip(levels_of)
         .zip(values)
         .map(|((name, levels), value)| {
             let value = if levels.is_empty() {
@@ -56,7 +60,8 @@ fn coded_record(cohort: &EventHistoryCohort, values: &[Bound<'_, PyAny>]) -> PyR
 }
 
 fn future_segments(
-    cohort: &EventHistoryCohort,
+    names: &[String],
+    levels_of: &[Vec<String>],
     future: Vec<(f64, Vec<Bound<'_, PyAny>>)>,
 ) -> PyResult<Vec<FutureSegment>> {
     future
@@ -64,7 +69,7 @@ fn future_segments(
         .map(|(start, record)| {
             Ok(FutureSegment {
                 start,
-                covariates: coded_record(cohort, &record)?,
+                covariates: coded_record(names, levels_of, &record)?,
             })
         })
         .collect()
@@ -280,14 +285,14 @@ impl PyEventHistoryModel {
     }
 
     fn baseline_rates<'py>(&self, py: Python<'py>, values: Vec<Bound<'py, PyAny>>, times: Vec<f64>, stratum: usize) -> PyResult<Bound<'py, PyArray2<f64>>> {
-        let values = coded_record(&self.cohort, &values)?;
+        let values = coded_record(&self.cohort.covariate_names, &self.cohort.covariate_levels, &values)?;
         let mut rows = Array2::zeros((times.len(), values.len() + 1));
         for (n, &time) in times.iter().enumerate() {
             self.fit.risk_set_normaliser_at(stratum, time).map_err(|e| py_value_error(e.to_string()))?;
             for (j, &value) in values.iter().enumerate() { rows[[n, j]] = value; }
             rows[[n, values.len()]] = time;
         }
-        let rates = gam::event_history::baseline_log_rates(&self.fit, rows.view())
+        let rates = gam::event_history::baseline_log_rates(&self.fit, &self.cohort, rows.view())
             .map_err(|e| py_value_error(e.to_string()))?.mapv(f64::exp);
         if rates.iter().any(|x| !x.is_finite()) {
             return Err(py_value_error("baseline rate exceeds floating-point range".to_string()));
@@ -332,7 +337,7 @@ impl PyEventHistoryModel {
             .clone();
         let fit = Arc::clone(&self.fit);
         let cohort = Arc::clone(&self.cohort);
-        let future = future_segments(&self.cohort, future)?;
+        let future = future_segments(&self.cohort.covariate_names, &self.cohort.covariate_levels, future)?;
         let result = detach_py_result(py, "event-history forecast", move || {
             forecast(
                 &fit,
@@ -361,7 +366,7 @@ impl PyEventHistoryModel {
     ) -> PyResult<Bound<'py, PyDict>> {
         let fit = Arc::clone(&self.fit);
         let cohort = Arc::clone(&self.cohort);
-        let future = future_segments(&self.cohort, future)?;
+        let future = future_segments(&self.cohort.covariate_names, &self.cohort.covariate_levels, future)?;
         let result = detach_py_result(py, "event-history population forecast", move || {
             population_forecast(
                 &fit,
@@ -479,7 +484,7 @@ impl PyEventHistoryModel {
             .collect::<PyResult<Vec<usize>>>()?;
         let mut table = Array2::<f64>::zeros((covariates.len(), self.cohort.covariate_names.len()));
         for (row, record) in covariates.iter().enumerate() {
-            for (j, code) in coded_record(&self.cohort, record)?.into_iter().enumerate() {
+            for (j, code) in coded_record(&self.cohort.covariate_names, &self.cohort.covariate_levels, record)?.into_iter().enumerate() {
                 table[[row, j]] = code;
             }
         }
@@ -507,7 +512,7 @@ impl PyEventHistoryModel {
         };
         let fit = Arc::clone(&self.fit);
         let cohort = Arc::clone(&self.cohort);
-        let future = future_segments(&self.cohort, future)?;
+        let future = future_segments(&self.cohort.covariate_names, &self.cohort.covariate_levels, future)?;
         let result = detach_py_result(py, "event-history forecast", move || {
             let history = match cutoff {
                 Some(cutoff) => history
@@ -518,6 +523,191 @@ impl PyEventHistoryModel {
             forecast_history(
                 &fit,
                 &cohort,
+                &HistoryForecastRequest {
+                    history: &history,
+                    covariates: table.view(),
+                    horizons: &horizons,
+                    future: &future,
+                    stratum,
+                },
+            )
+            .map_err(|e| e.to_string())
+        })?;
+        forecast_dict(py, result)
+    }
+
+    /// Write this model's predictor to `path`: the frozen schema, the fitted
+    /// functions, the reference law and the coefficient posterior, and none of
+    /// the training participants' records (gam#2966).
+    fn save(&self, py: Python<'_>, path: String) -> PyResult<()> {
+        let fit = Arc::clone(&self.fit);
+        let cohort = Arc::clone(&self.cohort);
+        detach_py_result(py, "event-history save", move || {
+            let predictor =
+                EventHistoryPredictor::of(&fit, &cohort).map_err(|e| e.to_string())?;
+            predictor
+                .save(std::path::Path::new(&path))
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// A saved event-history predictor, loaded from a file: the frozen schema, the
+/// probability law, the reference population and the coefficient posterior.
+///
+/// It holds no cohort. The training subjects' histories and covariate rows are
+/// not part of a predictor, so the per-subject diagnostics of
+/// `_EventHistoryModel` — `forecast` by index, `pit`, `latent_state` — have no
+/// counterpart here; a served history brings its own rows through
+/// `forecast_history` (gam#2966).
+#[pyclass(module = "gamfit._rust", name = "_EventHistoryPredictor", frozen)]
+pub(crate) struct PyEventHistoryPredictor {
+    predictor: Arc<EventHistoryPredictor>,
+}
+
+#[pymethods]
+impl PyEventHistoryPredictor {
+    /// Load a saved predictor, refusing another kind of model or another
+    /// payload version with a typed error.
+    #[staticmethod]
+    fn load(py: Python<'_>, path: String) -> PyResult<Self> {
+        let predictor = detach_py_result(py, "event-history load", move || {
+            EventHistoryPredictor::load(std::path::Path::new(&path)).map_err(|e| e.to_string())
+        })?;
+        Ok(Self {
+            predictor: Arc::new(predictor),
+        })
+    }
+
+    fn mark_names(&self) -> Vec<String> {
+        self.predictor.mark_names().to_vec()
+    }
+
+    fn mark_kinds(&self) -> Vec<String> {
+        self.predictor
+            .mark_kinds()
+            .iter()
+            .map(|kind| {
+                match kind {
+                    MarkKind::Recurrent => "recurrent",
+                    MarkKind::Once => "once",
+                    MarkKind::Terminal => "terminal",
+                }
+                .to_string()
+            })
+            .collect()
+    }
+
+    fn covariate_names(&self) -> Vec<String> {
+        self.predictor.covariate_names().to_vec()
+    }
+
+    fn covariate_levels(&self) -> Vec<Vec<String>> {
+        self.predictor.covariate_levels().to_vec()
+    }
+
+    fn rank(&self) -> usize {
+        self.predictor.rank()
+    }
+
+    #[pyo3(signature = (start, horizons, future, stratum))]
+    fn population_forecast<'py>(
+        &self,
+        py: Python<'py>,
+        start: f64,
+        horizons: Vec<f64>,
+        future: Vec<(f64, Vec<Bound<'py, PyAny>>)>,
+        stratum: usize,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let future = future_segments(
+            self.predictor.covariate_names(),
+            self.predictor.covariate_levels(),
+            future,
+        )?;
+        let predictor = Arc::clone(&self.predictor);
+        let result = detach_py_result(py, "event-history population forecast", move || {
+            predictor_population_forecast(
+                &predictor,
+                &PopulationForecastRequest {
+                    start,
+                    horizons: &horizons,
+                    future: &future,
+                    stratum,
+                },
+            )
+            .map_err(|e| e.to_string())
+        })?;
+        forecast_dict(py, result)
+    }
+
+    #[pyo3(signature = (entry, exit, event_time, event_marks, segment_start, covariates, cutoff, horizons, future, stratum))]
+    fn forecast_history<'py>(
+        &self,
+        py: Python<'py>,
+        entry: f64,
+        exit: f64,
+        event_time: Vec<f64>,
+        event_marks: Vec<String>,
+        segment_start: Vec<f64>,
+        covariates: Vec<Vec<Bound<'py, PyAny>>>,
+        cutoff: Option<f64>,
+        horizons: Vec<f64>,
+        future: Vec<(f64, Vec<Bound<'py, PyAny>>)>,
+        stratum: usize,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let names = self.predictor.covariate_names();
+        let levels_of = self.predictor.covariate_levels();
+        if event_time.len() != event_marks.len() {
+            return Err(py_value_error(
+                "event_time and event_marks must have equal length".to_string(),
+            ));
+        }
+        let event_mark = event_marks
+            .iter()
+            .map(|label| {
+                mark_index_of(self.predictor.mark_names(), label)
+                    .map_err(|e| py_value_error(e.to_string()))
+            })
+            .collect::<PyResult<Vec<usize>>>()?;
+        let mut table = Array2::<f64>::zeros((covariates.len(), names.len()));
+        for (row, record) in covariates.iter().enumerate() {
+            for (j, code) in coded_record(names, levels_of, record)?.into_iter().enumerate() {
+                table[[row, j]] = code;
+            }
+        }
+        if segment_start.len() != table.nrows() {
+            return Err(py_value_error(format!(
+                "{} segment starts for {} covariate rows",
+                segment_start.len(),
+                table.nrows()
+            )));
+        }
+        let history = SubjectHistory {
+            id: "history".to_string(),
+            entry,
+            exit,
+            events: event_time
+                .iter()
+                .zip(event_mark.iter())
+                .map(|(&time, &mark)| Event { time, mark })
+                .collect(),
+            segments: segment_start
+                .iter()
+                .enumerate()
+                .map(|(row, &start)| CovariateSegment { start, row })
+                .collect(),
+        };
+        let future = future_segments(names, levels_of, future)?;
+        let predictor = Arc::clone(&self.predictor);
+        let result = detach_py_result(py, "event-history forecast", move || {
+            let history = match cutoff {
+                Some(cutoff) => history
+                    .prefix(cutoff, predictor.mark_kinds())
+                    .map_err(|e| e.to_string())?,
+                None => history,
+            };
+            predictor_forecast_history(
+                &predictor,
                 &HistoryForecastRequest {
                     history: &history,
                     covariates: table.view(),
@@ -698,6 +888,7 @@ fn fit_event_history(
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyEventHistoryModel>()?;
+    module.add_class::<PyEventHistoryPredictor>()?;
     module.add_function(wrap_pyfunction!(fit_event_history, module)?)?;
     Ok(())
 }

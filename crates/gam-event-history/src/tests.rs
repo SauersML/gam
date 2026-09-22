@@ -17,8 +17,10 @@ use super::family::{
 use super::forecast::{
     ForecastRequest, FutureSegment, HistoryForecastRequest, PopulationForecastRequest, SpellPit,
     forecast, forecast_history, latent_state, pit_uniform_distance, population_forecast,
-    posterior_predictive_forecast, predictive_pit,
+    posterior_predictive_forecast, predictive_pit, predictor_forecast_history,
+    predictor_population_forecast,
 };
+use super::predictor::EventHistoryPredictor;
 use super::marginal::{Evaluation, SubjectInputs, subject_marginal};
 use super::preserve::{ReferenceGrid, ReferenceStrata, killing_masks, stratum_normalisers};
 use gam_model_api::families::custom_family::BlockwiseFitOptions;
@@ -4120,8 +4122,159 @@ fn a_one_direction_posterior_average_matches_its_own_gaussian_integral_2964() {
     );
 }
 
+/// A saved predictor forecasts what the fit it came from forecasts, bit for
+/// bit, out of an artifact that holds no training record (gam#2966).
+///
+/// The identity is not a coincidence to be re-checked whenever either side
+/// moves: a fit and a predictor lend the SAME `PredictionModel`, and every
+/// prediction function reads that view alone, so there is one implementation
+/// and this test pins that there is. What it can catch is the one thing the
+/// artifact does not carry verbatim — the reference population's designs,
+/// which are rebuilt from the saved profiles, grid times and frozen
+/// specifications — and the second fixture below is centred so that rebuild
+/// is on the path.
+#[test]
+fn a_saved_predictor_forecasts_what_its_fit_forecasts_2966() {
+    install_test_logger();
+    // The reference grid has to span every horizon below: the fixture's
+    // integrated terminal hazard of two lands near nine, so the grid runs to
+    // sixteen.
+    let kinked = kinked_constant_hazard_fit(&[0.0, 4.0, 8.0, 16.0], &[0.0, -0.1, -0.25, -0.4]);
+    for (label, (cohort, fit, rates)) in [("prior-centred", constant_hazard_fit()), ("risk-set centred", kinked)] {
+        let total_terminal = rates[0] + rates[1];
+        let censored = cohort
+            .subjects
+            .iter()
+            .find(|s| s.terminal_event(&cohort.mark_kinds).is_none())
+            .expect("a censored subject")
+            .clone();
+        let horizons: Vec<f64> = [0.5, 1.0, 2.0]
+            .iter()
+            .map(|h| censored.exit + h / total_terminal)
+            .collect();
+        let table = Array2::<f64>::zeros((1, cohort.covariates.ncols()));
+        let history = SubjectHistory {
+            id: censored.id.clone(),
+            entry: censored.entry,
+            exit: censored.exit,
+            events: censored.events.clone(),
+            segments: vec![CovariateSegment { start: censored.entry, row: 0 }],
+        };
+        let request = HistoryForecastRequest {
+            history: &history,
+            covariates: table.view(),
+            horizons: &horizons,
+            future: &[],
+            stratum: 0,
+        };
+        let in_memory = forecast_history(&fit, &cohort, &request).expect("history forecast");
+        let text = EventHistoryPredictor::of(&fit, &cohort)
+            .expect("a predictor of the fit")
+            .saved_text()
+            .expect("a saved document");
+        emit(&format!("[2966 {label}] saved document is {} bytes", text.len()));
+        // A serving artifact holds no training participant. The censored
+        // subject's own identifier is the one string that would name one.
+        assert!(
+            !text.contains(&censored.id),
+            "the saved document names the training subject {:?}",
+            censored.id
+        );
+        let reloaded = EventHistoryPredictor::from_saved_text(&text).expect("a reloaded predictor");
+        let served = predictor_forecast_history(&reloaded, &request).expect("served forecast");
+        for (i, &h) in horizons.iter().enumerate() {
+            assert_eq!(
+                served.survival[i].to_bits(),
+                in_memory.survival[i].to_bits(),
+                "{label}, horizon {h}: served survival {} against in-memory {}",
+                served.survival[i],
+                in_memory.survival[i]
+            );
+            assert_eq!(
+                served.survival_error[i].to_bits(),
+                in_memory.survival_error[i].to_bits()
+            );
+            for d in 0..3 {
+                assert_eq!(
+                    served.expected_counts[[i, d]].to_bits(),
+                    in_memory.expected_counts[[i, d]].to_bits(),
+                    "{label}, mark {d} at horizon {h}"
+                );
+                assert_eq!(
+                    served.expected_count_errors[[i, d]].to_bits(),
+                    in_memory.expected_count_errors[[i, d]].to_bits()
+                );
+            }
+        }
+        // The population tier too, which opens at the reference law rather
+        // than at a history.
+        let population = PopulationForecastRequest {
+            start: 0.0,
+            horizons: &horizons,
+            future: &[FutureSegment { start: 0.0, covariates: vec![0.0] }],
+            stratum: 0,
+        };
+        let here = population_forecast(&fit, &cohort, &population).expect("population forecast");
+        let there = predictor_population_forecast(&reloaded, &population).expect("served population");
+        for i in 0..horizons.len() {
+            assert_eq!(
+                there.survival[i].to_bits(),
+                here.survival[i].to_bits(),
+                "{label}, population horizon {}: served {} against in-memory {}",
+                horizons[i],
+                there.survival[i],
+                here.survival[i]
+            );
+            for d in 0..3 {
+                assert_eq!(
+                    there.expected_counts[[i, d]].to_bits(),
+                    here.expected_counts[[i, d]].to_bits()
+                );
+            }
+        }
+    }
+}
+
+/// A payload of another kind, another version, or one whose schema and law
+/// disagree is refused, typed, and never migrated (gam#2966).
+#[test]
+fn a_saved_predictor_refuses_a_payload_it_cannot_rebuild_2966() {
+    install_test_logger();
+    let (cohort, fit, _) = constant_hazard_fit();
+    let text = EventHistoryPredictor::of(&fit, &cohort)
+        .expect("a predictor of the fit")
+        .saved_text()
+        .expect("a saved document");
+    assert!(
+        EventHistoryPredictor::from_saved_text(&text).is_ok(),
+        "the document this fit wrote must load"
+    );
+    // The envelope names the kind and the version first, so both are one
+    // substring each.
+    for (what, damaged) in [
+        ("another version", text.replace("\"version\":1", "\"version\":2")),
+        ("another kind", text.replace("\"kind\":\"event-history\"", "\"kind\":\"joint\"")),
+    ] {
+        assert_ne!(damaged, text, "the fixture must actually rewrite {what}");
+        let refusal = EventHistoryPredictor::from_saved_text(&damaged)
+            .err()
+            .unwrap_or_else(|| panic!("a document of {what} must be refused"));
+        emit(&format!("[2966 refusal] {what}: {refusal}"));
+    }
+    // A law that no longer matches its schema: one coefficient too few in the
+    // first block, which the rebuilt reference design's width would catch on a
+    // centred model and the block arithmetic catches on any.
+    let widened = text.replace("\"block_widths\":[1,1,1]", "\"block_widths\":[2,1,1]");
+    assert_ne!(widened, text, "the fixture must actually widen a block");
+    let refusal = EventHistoryPredictor::from_saved_text(&widened)
+        .err()
+        .expect("a document whose blocks and coefficients disagree must be refused");
+    emit(&format!("[2966 refusal] widened block: {refusal}"));
+}
+
 #[test]
 fn forecast_probabilities_are_coherent_under_a_latent_state() {
+
     install_test_logger();
     // The loadings are large enough that the evidence buys the direction:
     // the rank is no longer a setting, so a fixture that means to exercise a

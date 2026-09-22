@@ -284,17 +284,81 @@ pub(crate) struct ReferenceTables {
     /// Covariate profiles retained independently of the training histories.
     pub(crate) profiles: Array2<f64>,
     /// The mark kinds, which decide each mark's risk set.
-    kinds: Vec<MarkKind>,
+    pub(crate) kinds: Vec<MarkKind>,
     /// Per mark, the design of the reference rows, `strata · nodes × p_d`.
-    designs: Vec<Arc<Array2<f64>>>,
+    pub(crate) designs: Vec<Arc<Array2<f64>>>,
     /// Per mark, the affine offset of those rows.
-    offsets: Vec<Array1<f64>>,
-    strata: usize,
+    pub(crate) offsets: Vec<Array1<f64>>,
+    pub(crate) strata: usize,
     /// Per cohort node: its subject's stratum, the reference node below it and
-    /// the weight of the one above.
+    /// the weight of the one above. These are the only training-shaped fields
+    /// here, they are read by [`Self::carry_rows`] alone, and a table built
+    /// for prediction ([`Self::for_prediction`]) leaves them empty — a serving
+    /// artifact has no training nodes to place, and [`Self::check_carry`]
+    /// refuses such a table at fit time for exactly that reason (gam#2966).
     node_stratum: Vec<usize>,
     node_lower: Vec<usize>,
     node_weight: Vec<f64>,
+}
+
+impl ReferenceTables {
+    /// The reference population's tables rebuilt for prediction, from the
+    /// grid, the profiles, the mark kinds and the frozen term specifications
+    /// — everything a saved predictor carries and nothing else (gam#2966).
+    ///
+    /// The designs are not saved because they are derived: [`reference_tables`]
+    /// builds them by crossing the profiles with the grid times and handing
+    /// those rows to `build_term_collection_design` under the same frozen
+    /// specification, and nothing of the training cohort enters. Running the
+    /// same function over the same rows returns the same bits, so a reloaded
+    /// predictor evaluates the reference law the fit evaluated.
+    pub(crate) fn for_prediction(
+        grid: ReferenceGrid,
+        profiles: Array2<f64>,
+        kinds: Vec<MarkKind>,
+        frozen_specs: &[TermCollectionSpec],
+    ) -> Result<Self, EventHistoryError> {
+        let strata = profiles.nrows();
+        let covariates = profiles.ncols();
+        let mut node_data = Array2::<f64>::zeros((strata * grid.len(), covariates + 1));
+        for s in 0..strata {
+            for (n, &time) in grid.times.iter().enumerate() {
+                let row = s * grid.len() + n;
+                for c in 0..covariates {
+                    node_data[[row, c]] = profiles[[s, c]];
+                }
+                node_data[[row, covariates]] = time;
+            }
+        }
+        let mut designs = Vec::with_capacity(frozen_specs.len());
+        let mut offsets = Vec::with_capacity(frozen_specs.len());
+        for (d, spec) in frozen_specs.iter().enumerate() {
+            let design = build_term_collection_design(node_data.view(), spec).map_err(|error| {
+                EventHistoryError::Fit {
+                    reason: format!("reference design for mark {d}: {error}"),
+                }
+            })?;
+            let dense = design
+                .design
+                .try_to_dense_arc("event-history reference design")
+                .map_err(|error| EventHistoryError::Fit {
+                    reason: error.to_string(),
+                })?;
+            designs.push(dense);
+            offsets.push(design.affine_offset.clone());
+        }
+        Ok(Self {
+            grid,
+            profiles,
+            kinds,
+            designs,
+            offsets,
+            strata,
+            node_stratum: Vec::new(),
+            node_lower: Vec::new(),
+            node_weight: Vec::new(),
+        })
+    }
 }
 
 impl EventHistoryFamily {
@@ -441,14 +505,30 @@ impl EventHistoryFamily {
     /// Every atom's dimensionless rate `ν` at a latent block state: the
     /// chart of the coefficient for a free rate, the held value otherwise.
     pub(crate) fn atom_rates(&self, latent_beta: &Array1<f64>) -> Vec<f64> {
-        self.free_rate_slots()
-            .iter()
-            .zip(self.held_rates.iter())
-            .map(|(slot, held)| match slot {
-                Some(slot) => rate_from_chart(self.rate_band, &latent_beta[*slot]),
-                None => held.expect("a rate without a coefficient is held"),
-            })
-            .collect()
+        atom_rates_of(
+            self.rate_band,
+            &self.held_rates,
+            self.marks() * self.atoms,
+            latent_beta,
+        )
+    }
+
+    /// Whether each atom's rate is a coefficient of the latent block, as a
+    /// saved predictor records it.
+    pub(crate) fn held_rates(&self) -> &[Option<f64>] {
+        &self.held_rates
+    }
+
+    /// The reference population this family normalises against, when it has
+    /// one.
+    pub(crate) fn reference_population(&self) -> Option<&Arc<ReferenceTables>> {
+        self.reference.as_ref()
+    }
+
+    /// Where each block starts in a flat coefficient vector, with the total
+    /// width last.
+    pub(crate) fn offsets_of_blocks(&self) -> Vec<usize> {
+        self.block_offsets()
     }
 
     /// The band of dimensionless rates the cohort's breakpoints resolve, `(ν_min, ν_max)`.
@@ -1056,6 +1136,122 @@ fn rate_band(nodes: &CohortNodes, time_scale: f64) -> Result<(f64, f64), EventHi
         })
 }
 
+/// Every atom's dimensionless rate `ν` at a latent block, from the chart's
+/// band, the held values and the width the loadings occupy — everything a
+/// saved predictor carries, and nothing of the training cohort (gam#2966).
+///
+/// The loadings come first in the latent block, then the free rates in atom
+/// order, so the coefficient of the `i`-th free rate sits at
+/// `loading_width + i`. A held rate has no coefficient and is its own value.
+pub(crate) fn atom_rates_of(
+    band: (f64, f64),
+    held: &[Option<f64>],
+    loading_width: usize,
+    latent_beta: &Array1<f64>,
+) -> Vec<f64> {
+    let mut next = loading_width;
+    held.iter()
+        .map(|held| match held {
+            Some(value) => *value,
+            None => {
+                let slot = next;
+                next += 1;
+                rate_from_chart(band, &latent_beta[slot])
+            }
+        })
+        .collect()
+}
+
+/// The reference-law snapshot a population's normalisers at `beta` make: the
+/// population's own grid and profiles beside the evolution those coefficients
+/// gave it.
+///
+/// One assembly, two callers. `EventHistoryFamily::reference_at` produces the
+/// normalisers through the family, which relays a `ReferenceStep` refusal back
+/// typed for the custom-family engine; a prediction produces them through
+/// `reference_normalisers` and has no engine to relay through
+/// (`super::predictor`). Only the production differs, so only the production
+/// is written twice.
+pub(crate) fn reference_law(
+    tables: &ReferenceTables,
+    beta: &[f64],
+    values: crate::preserve::Normalisers<f64>,
+) -> RiskSetCentring {
+    let (_, mask_of_mark) = crate::preserve::killing_masks(&tables.kinds);
+    RiskSetCentring {
+        grid: tables.grid.clone(),
+        profiles: tables.profiles.clone(),
+        coefficients: beta.to_vec(),
+        log_normaliser: values.log_normaliser,
+        log_risk_mass: values.log_risk_mass,
+        masks: values.masks,
+        mask_of_mark,
+    }
+}
+
+/// What evaluating a reference population's normalisers needs beside its
+/// tables and a coefficient state: the block layout the coefficients are laid
+/// out in, the latent dimensions, the time scale and the quadrature rule.
+pub(crate) struct ReferenceLawShape<'a> {
+    pub block_offsets: &'a [usize],
+    pub marks: usize,
+    pub atoms: usize,
+    pub time_scale: f64,
+    pub gh: &'a GaussHermite,
+}
+
+/// The reference population's log normalisers and log risk masses at one
+/// coefficient state, per stratum and grid node.
+///
+/// This reads the population's tables and the coefficients and nothing else,
+/// which is what lets a saved predictor evaluate the same law the fit
+/// evaluated: [`EventHistoryFamily::reference_values`] is this function plus
+/// the family's typed-refusal relay (gam#2966).
+pub(crate) fn reference_normalisers<S: JetField>(
+    tables: &ReferenceTables,
+    shape: &ReferenceLawShape<'_>,
+    beta: &[S],
+    loadings: &[S],
+    rates: &[S],
+) -> Result<crate::preserve::Normalisers<S>, EventHistoryError> {
+    let marks = shape.marks;
+    let nodes = tables.grid.len();
+    let mut normalisers = Vec::new();
+    let mut risk_mass = Vec::new();
+    let mut masks = 0;
+    for st in 0..tables.strata {
+        let mut eta0 = Vec::with_capacity(nodes * marks);
+        for n in 0..nodes {
+            for d in 0..marks {
+                let row = st * nodes + n;
+                let mut value = beta[0].constant_like(tables.offsets[d][row]);
+                for (j, x) in tables.designs[d].row(row).iter().enumerate() {
+                    value = value.add(&beta[shape.block_offsets[d] + j].scale(*x));
+                }
+                eta0.push(value);
+            }
+        }
+        let out = stratum_normalisers(
+            &tables.grid,
+            &eta0,
+            loadings,
+            rates,
+            shape.time_scale,
+            shape.gh,
+            &tables.kinds,
+            shape.atoms,
+        )?;
+        masks = out.masks;
+        normalisers.extend(out.log_normaliser);
+        risk_mass.extend(out.log_risk_mass);
+    }
+    Ok(crate::preserve::Normalisers {
+        log_normaliser: normalisers,
+        log_risk_mass: risk_mass,
+        masks,
+    })
+}
+
 /// The chart of the rate band: `ν(u) = ν_min + (ν_max − ν_min) · u² / (1 + u²)`.
 pub(crate) fn rate_from_chart<S: JetField>(band: (f64, f64), u: &S) -> S {
     let (lower, upper) = band;
@@ -1468,6 +1664,47 @@ impl EventHistoryFit {
     /// total width last.
     pub(crate) fn coefficient_block_offsets(&self) -> Vec<usize> {
         self.family.block_offsets()
+    }
+
+    /// Everything a prediction reads, borrowed from this fit and the cohort
+    /// whose vocabulary a served history is encoded against.
+    ///
+    /// The cohort lends its encoder — the mark vocabulary and kinds, the
+    /// covariate names and their level codes — and nothing else; no subject's
+    /// history and no training row reaches the returned view. That is what
+    /// lets the same prediction code run over an [`EventHistoryPredictor`]
+    /// loaded from a file, which has no cohort at all (gam#2966).
+    pub(crate) fn prediction_model<'a>(
+        &'a self,
+        cohort: &'a EventHistoryCohort,
+    ) -> Result<crate::predictor::PredictionModel<'a>, EventHistoryError> {
+        if cohort.mark_kinds != self.mark_kinds {
+            return Err(EventHistoryError::InvalidInput {
+                reason: "the forecast cohort's mark kinds differ from the fit's".to_string(),
+            });
+        }
+        Ok(crate::predictor::PredictionModel {
+            marks: self.marks(),
+            atoms: self.rank(),
+            time_column: self.nodes.time_column,
+            mark_names: &cohort.mark_names,
+            mark_kinds: &self.mark_kinds,
+            covariate_names: &cohort.covariate_names,
+            covariate_levels: &cohort.covariate_levels,
+            frozen_specs: &self.frozen_specs,
+            quadrature_order: self.quadrature_order,
+            mesh_refinement: self.mesh_refinement,
+            time_scale: self.time_scale,
+            gh: self.family.gauss_hermite(),
+            quadrature_tolerance: self.family.quadrature_tolerance(),
+            block_offsets: self.coefficient_block_offsets(),
+            rate_band: self.family.rate_band(),
+            held_rates: self.family.held_rates(),
+            reference: self.family.reference_population().map(|tables| &**tables),
+            fitted_coefficients: self.fitted_coefficients(),
+            fitted: crate::posterior::ParameterState::fitted(self),
+            posterior_covariance: self.fit.beta_covariance_corrected(),
+        })
     }
 
     /// The rank of the latent covariance the fit carries: the rank the
