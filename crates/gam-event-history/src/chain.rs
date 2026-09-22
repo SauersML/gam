@@ -968,13 +968,68 @@ pub(crate) fn interpolate_at_inner_points<S: JetField>(
 }
 
 /// `ln Σ exp(terms)`, stabilised by the largest value.
+///
+/// A sum of no mass is `-inf`, and it is returned as one. Stabilising by the
+/// largest value divides through by `exp(shift)`, which is the identity only
+/// while `shift` is finite: when every term is `-inf` the shift is `-inf` too,
+/// `t - shift` is `inf - inf`, and the stabilised sum is NaN. That NaN then
+/// travels — a filter's log normaliser, a predicted log density, a smoothed
+/// marginal's mass — and every consumer downstream reports it instead of the
+/// condition that produced it, which is a node whose whole grid holds no mass.
+/// Returning the value the sum has removes the NaN and leaves that condition
+/// to be reported by whoever cares that it is not finite.
 pub(crate) fn log_sum_exp<S: JetField>(terms: &[S]) -> S {
     let shift = terms
         .iter()
         .map(|t| t.value())
         .fold(f64::NEG_INFINITY, f64::max);
+    if !shift.is_finite() {
+        // Every term is `-inf` (no mass), or one is `+inf` or NaN and the sum
+        // is that. Either way the stabilised form cannot be formed and the
+        // answer is the shift itself.
+        return terms[0].constant_like(shift);
+    }
     let sum = terms
         .iter()
         .fold(terms[0].constant_like(0.0), |acc, t| acc.add(&exp(&add_real(t, -shift))));
     add_real(&ln(&sum), shift)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gam_math::roundoff::accumulation_growth;
+
+    /// A sum of no mass is `-inf`, and a sum of some mass is unchanged by the
+    /// empty case being handled.
+    ///
+    /// The stabilised form divides through by `exp(max)`, which is the
+    /// identity only while the max is finite. With every term `-inf` the max
+    /// is `-inf`, `t - max` is `inf - inf`, and the old form returned NaN for
+    /// a quantity whose value is `-inf`. Five event-history tests reported
+    /// that NaN through a filter's log normaliser rather than the condition
+    /// that produced it.
+    #[test]
+    fn a_log_sum_exp_of_no_mass_is_minus_infinity_not_a_nan() {
+        let empty = log_sum_exp(&[f64::NEG_INFINITY; 4]);
+        assert!(
+            empty == f64::NEG_INFINITY,
+            "a sum of four terms of no mass reads {empty}, and the sum of four zeros is zero"
+        );
+        // One term carrying mass is the whole sum, however many do not.
+        let one = log_sum_exp(&[f64::NEG_INFINITY, -3.25, f64::NEG_INFINITY]);
+        assert!(
+            (one - -3.25).abs() <= f64::EPSILON * 3.25,
+            "a sum whose only mass is exp(-3.25) reads {one}"
+        );
+        // The ordinary case is untouched: `ln(e^a + e^b)` to the rounding of
+        // the three operations the stabilised form performs on it.
+        let (a, b) = (-1.5_f64, -0.25_f64);
+        let both = log_sum_exp(&[a, b]);
+        let exact = (a.exp() + b.exp()).ln();
+        assert!(
+            (both - exact).abs() <= accumulation_growth(3) * exact.abs(),
+            "ln(e^{a} + e^{b}) reads {both}, against {exact}"
+        );
+    }
 }
