@@ -643,6 +643,7 @@
   construction — both children re-derive their tube from their own bounds and their union is
   the parent — so only `HonestConformalCost::z_cells` moves.
 
+## gamfit 0.1.271 (2026-09-22)
 - **A profiled evidence ratio stops calling itself a Bayes factor, and a model comparison tests
   the response it can see** (gam#4556 P3). `compare_reuse_reml` fits each hypothesis' own `λ̂`
   and published the difference of the two maxima as `ReuseComparison::log_bayes_factor`, with
@@ -694,8 +695,9 @@
 
 ## gamfit 0.1.270 (2026-09-22)
 
-0.1.269 was tagged on 2026-09-21 and never reached PyPI: its release run
-failed on the free-threaded cp314t wheel and the sdist, fixed since.
+0.1.269 and 0.1.270 were tagged and never reached PyPI: their release runs
+failed on the free-threaded cp314t wheel, the sdist, and the musllinux
+smoke check, each fixed since.
 
 ## gamfit 0.1.269 (2026-09-21)
 
