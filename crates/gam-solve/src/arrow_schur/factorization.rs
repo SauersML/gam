@@ -655,7 +655,40 @@ pub(crate) fn factor_spectral_deflated_criterion_row_with_geometry(
         0.0_f64,
         |acc, &v| if v.is_finite() { acc.max(v.abs()) } else { acc },
     );
-    if !(max_abs.is_finite() && max_abs > 0.0) {
+    // #4077/#3438 — A FULLY PINNED ROW IS THE UNIT-STIFFNESS CASE, NOT A DECLINE.
+    //
+    // `max_abs` is the scale the deflation floor below is denominated in, and
+    // requiring it to be strictly POSITIVE also excluded the one block whose
+    // answer this function's own convention already fixes. At an active interval
+    // bound the Riemannian conversion zeroes the pinned slot's gradient, row and
+    // column; when every slot of the row is pinned — a latent dimension of 1 at
+    // its bound being the smallest such row — the WHOLE block is exactly zero.
+    // The genuine Cholesky then refuses on its first pivot (`non-PD pivot 0 at
+    // index 0`), which is precisely what routes the block here, and this routine
+    // is the one that may not decline: see the PD GUARANTEE below, whose whole
+    // point is that declining surfaces the hard per-row refusal.
+    //
+    // An all-zero block is `d` exactly-null directions, and the rule below
+    // already prices each one on its own: a non-positive eigenvalue is deflated
+    // to unit stiffness and contributes `log 1 = 0`. Applied to every direction
+    // it makes the conditioned block the identity — the CONSTANT unit direction
+    // `e_u` that #4077 specifies for a pinned slot. A constant has no derivative,
+    // and that is what the consumers already read: with every raw eigenvalue
+    // equal, `row_deflation_frechet_coefficients` finds no resolved gap, takes
+    // its degenerate branch, and reads `0` off the `UnitDeflated` tag, so the
+    // row reaches no trace of `log|A|`, exactly as #4077 requires.
+    //
+    // `max_abs == 0` also means no eigenvalue is positive, so the floor-clamped
+    // branch below cannot be reached with a zero `floor`.
+    //
+    // A NON-FINITE eigenvalue at zero scale still declines: with no scale to
+    // separate a null direction from a broken one there is nothing to apply the
+    // convention to. Above zero scale such a direction is already deflated by
+    // the existing branch, so that case is untouched.
+    if !max_abs.is_finite() {
+        return Ok(None);
+    }
+    if max_abs == 0.0 && !evals.iter().all(|value| value.is_finite()) {
         return Ok(None);
     }
     if let Some(geometry) = exact_a

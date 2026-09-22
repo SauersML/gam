@@ -1083,6 +1083,107 @@ pub(crate) fn evidence_row_recovers_intrinsic_dimension_flat_block_without_gauge
     );
 }
 
+/// #4077/#3438 — a row whose every slot is pinned at an active bound has its
+/// whole `H_tt` zeroed by the Riemannian conversion, so the block's spectral
+/// scale is exactly zero. The genuine Cholesky refuses it on its first pivot,
+/// which routes it here, and the unit-stiffness convention already prices every
+/// null direction at `+1`: applied to all of them the conditioned block is the
+/// identity and the row contributes `log 1 = 0`. Declining instead surfaced the
+/// hard per-row non-PD refusal that this routine's PD guarantee exists to
+/// prevent, which is what made the interval fixture unpriceable.
+///
+/// The second block is the control: with any non-zero curvature present, only
+/// the null direction is deflated, so the zero-scale branch is reached on the
+/// fully pinned row alone and the ordinary spectrum is untouched.
+#[test]
+pub(crate) fn evidence_row_at_zero_spectral_scale_deflates_every_direction_4077() {
+    for d in [1usize, 3usize] {
+        let k = 1usize;
+        let mut block = ArrowRowBlock::new(d, k);
+        block.htt = Array2::<f64>::zeros((d, d));
+        block.htbeta = Array2::<f64>::zeros((d, k));
+        block.gt = Array1::<f64>::zeros(d);
+
+        // The state that routes a block to this routine at all.
+        assert!(
+            cholesky_lower(&block.htt).is_err(),
+            "d={d}: a fully pinned row must refuse the genuine Cholesky"
+        );
+
+        let result = factor_spectral_deflated_criterion_row_with_geometry(&block, d, false, None)
+            .expect("an all-null block carries no resolved sign to refuse on")
+            .expect("a fully pinned row must factor at unit stiffness, not decline");
+
+        assert_eq!(
+            result.gauge_deflated_directions, d,
+            "d={d}: every direction of an all-null block is deflated"
+        );
+        let spectrum = result
+            .deflation_spectrum
+            .as_ref()
+            .expect("a deflated row publishes the spectrum its gradient correction reads");
+        assert!(
+            spectrum
+                .conditioning
+                .iter()
+                .all(|branch| *branch == RowSpectralConditioning::UnitDeflated),
+            "d={d}: every direction takes the unit-stiffness branch, got {:?}",
+            spectrum.conditioning
+        );
+
+        // `conditioned[i,j] = Σ_m v_im·v_jm` sums `d` products whose absolute sum
+        // is at most 1 (Cauchy–Schwarz on two unit rows of an orthonormal basis),
+        // so its accumulation error is at most `d·ε`; the eigensolver returns its
+        // basis orthonormal to within a backward error of the same order, and the
+        // Cholesky of a matrix within `δ` of the identity reproduces it within
+        // `δ`. Both terms are written out rather than folded into one constant.
+        let accumulation = (d as f64) * f64::EPSILON;
+        let orthogonality = (d as f64) * f64::EPSILON;
+        let band = accumulation + orthogonality;
+        let recon = result.factor.dot(&result.factor.t());
+        for i in 0..d {
+            for j in 0..d {
+                let expected = if i == j { 1.0_f64 } else { 0.0_f64 };
+                assert!(
+                    (recon[[i, j]] - expected).abs() <= band,
+                    "d={d}: the conditioned block must be the identity at [{i},{j}]: \
+                     got {}, band {band:e}",
+                    recon[[i, j]]
+                );
+            }
+        }
+
+        // The quantity the convention actually promises: this row prices at zero.
+        let log_det: f64 = 2.0 * (0..d).map(|i| result.factor[[i, i]].ln()).sum::<f64>();
+        let log_det_band = 2.0 * (d as f64) * band;
+        assert!(
+            log_det.abs() <= log_det_band,
+            "d={d}: a fully pinned row contributes log 1 = 0 to the evidence \
+             log-det: got {log_det:e}, band {log_det_band:e}"
+        );
+    }
+
+    // Control: one null direction beside a resolved positive one. The spectral
+    // scale is now 1, so the zero-scale branch is not taken and only the null
+    // direction is deflated — the behaviour every other row keeps.
+    let d = 2usize;
+    let mut mixed = ArrowRowBlock::new(d, 1);
+    mixed.htt = array![[0.0_f64, 0.0], [0.0, 1.0]];
+    mixed.htbeta = Array2::<f64>::zeros((d, 1));
+    mixed.gt = Array1::<f64>::zeros(d);
+    assert!(
+        cholesky_lower(&mixed.htt).is_err(),
+        "the control block must also reach this routine through a refused Cholesky"
+    );
+    let control = factor_spectral_deflated_criterion_row_with_geometry(&mixed, d, false, None)
+        .expect("a block with a resolved positive direction carries no saddle")
+        .expect("a partially null block still factors");
+    assert_eq!(
+        control.gauge_deflated_directions, 1,
+        "only the null direction is deflated when the row has a resolved curvature"
+    );
+}
+
 /// #1117 flicker guard: a per-row evidence block carrying ONE genuinely
 /// indefinite direction (so spectral deflation runs) plus a small POSITIVE
 /// eigenvalue parked right at the relative cutoff `floor = REL_FLOOR·max|λ|`
