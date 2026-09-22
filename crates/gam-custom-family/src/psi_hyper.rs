@@ -3307,6 +3307,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                     psi_scores: None,
                     criterion_rank: value_only.criterion_rank,
                     incumbent_mode_excess: None,
+                    inner_mode_fold: value_only.inner_mode_fold,
                     inner: inner.clone(),
                 });
             }
@@ -3814,6 +3815,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         psi_scores: None,
                         criterion_rank: value_only.criterion_rank,
                         incumbent_mode_excess: None,
+                        inner_mode_fold: value_only.inner_mode_fold,
                         inner: inner.clone(),
                     });
                 }
@@ -4369,6 +4371,60 @@ fn mode_profile_exhausted_error(
     }
 }
 
+/// The start past the saddle a screened mode's own fold record names (gam#3173).
+///
+/// A mode whose Laplace series' leading correction along its softest direction is not below the
+/// term it corrects sits within `5/36` of a log-likelihood unit of the saddle bounding its basin
+/// ([`InnerModeFold::barrier_is_below_its_own_correction`]), and the cubic model places that saddle
+/// at `s* = −2σ/t₃`. This is `β̂ + 2s*·v`: past it, so an inner solve started there descends into
+/// the neighbouring basin where one exists and returns to `β̂` where it does not. At a saddle-node
+/// fold the vanishing minimum and the saddle coincide, and the mountain-pass inequality then puts
+/// the rival basin strictly below — which is why the probe is worth exactly one solve there and
+/// none anywhere else.
+///
+/// The displacement is in the stacked coefficient frame the mode-response operator acts on, so it
+/// is split across the blocks by their own widths, and a displacement of any other length names no
+/// start. The probe carries NO active set: it is aimed at another basin, and this mode's active
+/// constraints are this basin's.
+fn fold_crossing_seed(
+    rho_current: &Array1<f64>,
+    screened: &[Option<OuterObjectiveEvalResult>],
+) -> Option<ConstrainedWarmStart> {
+    let (result, displacement) = screened.iter().flatten().find_map(|result| {
+        let fold = result.inner_mode_fold.as_ref()?;
+        if !fold.barrier_is_below_its_own_correction() {
+            return None;
+        }
+        fold.saddle_crossing_displacement()
+            .map(|displacement| (result, displacement))
+    })?;
+    let width: usize = result
+        .inner
+        .block_states
+        .iter()
+        .map(|state| state.beta.len())
+        .sum();
+    if displacement.len() != width || displacement.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let mut offset = 0usize;
+    let mut block_beta = Vec::with_capacity(result.inner.block_states.len());
+    for state in &result.inner.block_states {
+        let end = offset + state.beta.len();
+        let mut beta = state.beta.clone();
+        beta += &displacement.slice(s![offset..end]);
+        offset = end;
+        block_beta.push(beta);
+    }
+    let blocks = block_beta.len();
+    Some(ConstrainedWarmStart {
+        rho: rho_current.clone(),
+        block_beta,
+        active_sets: vec![None; blocks],
+        cached_inner: None,
+    })
+}
+
 /// The starts one exact-joint evaluation solves its candidate modes from (gam#3173).
 ///
 /// The caller is the driver's coefficient-mode branch (gam-models'
@@ -4524,6 +4580,60 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
         screened_results[candidate_idx] = Some(candidate);
     }
 
+    // gam#3173: one start past the saddle, spent only where a screened mode's own fold record says
+    // the barrier to the next basin is below the correction the Laplace series makes for it
+    // ([`fold_crossing_seed`]). It is an extra candidate and nothing else: the rule below still
+    // publishes the lowest penalized `f`, so the probe can only lower the criterion, and a probe
+    // that certifies no mode discovers nothing and is simply not among the candidates. It needs
+    // the penalty roots to be priced against the others, so it is spent only where they were
+    // built — an evaluation whose caller already handed more than one start.
+    if let Some(roots) = roots.as_ref()
+        && let Some(seed) = fold_crossing_seed(rho_current, &screened_results)
+    {
+        let (probe_options, _) =
+            derivative_quality_options_and_warm_start(options, None, has_psi_derivatives);
+        match evaluate_custom_family_hyper_internal_shared(
+            family,
+            specs,
+            &probe_options,
+            &penalty_counts,
+            rho_current,
+            Arc::clone(&hyper_layout),
+            Some(&seed),
+            gam_problem::RhoPrior::Flat,
+            EvalMode::ValueOnly,
+            None,
+        ) {
+            Ok(probe) if probe.inner_converged && probe.objective.is_finite() => {
+                match penalized_objective_at_mode(family, specs, roots, &probe.inner) {
+                    Ok(penalized) => {
+                        log::debug!(
+                            "[mode selection #3173] the start past the saddle certified a mode, \
+                             f={:.9e}",
+                            penalized.value
+                        );
+                        screened_objectives.push(Some(probe.objective));
+                        penalized_objectives.push(Some(penalized));
+                        rejected_candidates.push(None);
+                        rejection_is_rho_local.push(true);
+                        screened_results.push(Some(probe));
+                    }
+                    Err(error) => log::debug!(
+                        "[mode selection #3173] the start past the saddle reached a mode this \
+                         theta cannot price: {error}"
+                    ),
+                }
+            }
+            Ok(_) => log::debug!(
+                "[mode selection #3173] the start past the saddle certified no mode; the basin it \
+                 was aimed at is not there"
+            ),
+            Err(error) => log::debug!(
+                "[mode selection #3173] the start past the saddle was refused: {error}"
+            ),
+        }
+    }
+
     let selected = if roots.is_some() {
         lowest_penalized_index(&penalized_objectives)
     } else {
@@ -4551,7 +4661,7 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
             "[mode selection #3173] exact-joint rho=[{}]: {certified} of {} start(s) certified \
              a mode; published start {selected_candidate}, f={:.9e}; runner-up gap {}",
             join_rho(rho_current),
-            candidates.len(),
+            screened_objectives.len(),
             published.value,
             runner_up_gap.map_or_else(|| "none".to_string(), |gap| format!("{gap:.3e}")),
         );
@@ -4774,6 +4884,7 @@ mod mode_selection_value_tests {
             psi_scores: None,
             criterion_rank: None,
             incumbent_mode_excess: None,
+            inner_mode_fold: None,
             inner: BlockwiseInnerResult {
                 solved_inner_tol: 1e-6,
                 block_states: Vec::new(),

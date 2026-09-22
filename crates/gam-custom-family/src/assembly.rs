@@ -529,6 +529,7 @@ pub(crate) fn unified_joint_cost_gradient(
 
     let hessian = result.hessian;
     let ext_mode_response_cols = result.ext_mode_response_cols;
+    let inner_mode_fold = result.inner_mode_fold;
 
     Ok((
         cost,
@@ -536,6 +537,7 @@ pub(crate) fn unified_joint_cost_gradient(
         hessian,
         criterion_components,
         ext_mode_response_cols,
+        inner_mode_fold,
     ))
 }
 
@@ -1396,8 +1398,14 @@ pub(crate) fn joint_outer_evaluate(
         }
         scores
     });
-    let (objective, grad, outer_hessian, criterion_components, ext_mode_response_cols) =
-        unified_joint_cost_gradient(
+    let (
+        objective,
+        grad,
+        outer_hessian,
+        criterion_components,
+        ext_mode_response_cols,
+        inner_mode_fold,
+    ) = unified_joint_cost_gradient(
             inner,
             specs,
             per_block,
@@ -1515,6 +1523,7 @@ pub(crate) fn joint_outer_evaluate(
         // Only a mode SELECTION names this, and the selection happens above this assembly
         // (gam#3173): one coefficient mode priced here is its own publication.
         incumbent_mode_excess: None,
+        inner_mode_fold,
         inner: inner.clone(),
     })
 }

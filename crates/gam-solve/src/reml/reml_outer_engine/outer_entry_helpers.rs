@@ -41,6 +41,16 @@ pub struct RemlLamlResult {
     /// Extended-coordinate mode responses, one `K · g_j` vector per column,
     /// when extended derivative coordinates required them.
     pub ext_mode_response_cols: Option<Array2<f64>>,
+    /// The inner mode's fold record along its softest direction ([`InnerModeFold`], gam#2765,
+    /// gam#3173), on the path that VALIDATED.
+    ///
+    /// A refused evaluation carries the same record through [`RemlLamlError::InnerModeFold`],
+    /// which is the only place it used to go. That left the record unreadable exactly where it is
+    /// load-bearing: a mode whose Laplace series' leading correction is not below the term it
+    /// corrects is admitted, and it is admitted BECAUSE its curvature is still resolved — but it
+    /// sits close enough to the saddle bounding its basin that another basin is within one solve.
+    /// `None` when the mode response names no span to grade.
+    pub inner_mode_fold: Option<InnerModeFold>,
 }
 
 impl RemlLamlResult {
@@ -102,6 +112,10 @@ pub struct InnerModeFold {
     pub sigma: f64,
     /// The span spectrum's rounding band, un-scaled.
     pub rounding_band: f64,
+    /// The unit softest eigenvector `v` of that span, in the coefficient frame the operator acts
+    /// on. It is the direction every other field is measured ALONG, and the direction a start past
+    /// the saddle is displaced in ([`InnerModeFold::saddle_crossing_displacement`]).
+    pub softest_direction: Array1<f64>,
     /// `t₃ = vᵀ D_β M[v] v` along the softest eigenvector, un-scaled; `None` when the rounding band
     /// refused before it was priced, or when the grading priced no record (the unified evaluator's
     /// verdict reads `σ` alone, #979).
@@ -139,6 +153,46 @@ impl InnerModeFold {
     /// term it corrects.
     pub fn is_valid(&self) -> bool {
         self.sigma > self.rounding_band
+    }
+
+    /// Whether the Laplace series' leading correction along `v` is NOT below the term it corrects:
+    /// the cubic share `5t₃²/(24σ³)` at or above one (gam#3173).
+    ///
+    /// The share equals `5/(36·ΔF)` for the barrier `ΔF = (2/3)σ³/t₃²` the cubic model puts
+    /// between this minimum and the saddle beyond it, so the condition reads "the barrier is below
+    /// `5/36` in log-likelihood units". It has no constant of its own: a correction at or above
+    /// the term it corrects is not a correction, and that is the whole of it.
+    ///
+    /// This is a DISCOVERY condition and never a refusal. Refusing on the same share was measured
+    /// wrong (gate job 1219877: a mode at `σ = 2`, `t₃ = 8.5` refused; 122 of 387 graded
+    /// evaluations refused on the #2894 repro, 80 of them at `σ ≥ 0.1`; six custom-family pins
+    /// red), and that measurement stands — a well-conditioned mode with a large third derivative
+    /// is not at a fold. What the share does say is where looking for another basin is worth one
+    /// solve. `false` where `t₃` was not priced.
+    pub fn barrier_is_below_its_own_correction(&self) -> bool {
+        self.cubic_correction.is_some_and(|share| share >= 1.0)
+    }
+
+    /// The displacement from this mode that lands past the saddle bounding its basin along `v`,
+    /// `2s*·v` with `s* = −2σ/t₃` (gam#3173).
+    ///
+    /// The cubic model along `v` is `f(β̂ + s·v) ≈ f̂ + ½σs² + t₃s³/6`, whose other stationary
+    /// point is the saddle at `s* = −2σ/t₃`. Twice that overshoots it, so an inner solve started
+    /// there descends into the neighbouring basin where one exists and returns to this mode where
+    /// it does not: at a saddle-node fold the vanishing minimum and the saddle coincide, and the
+    /// mountain-pass inequality then puts the rival basin below this one. `σ` and `t₃` are both
+    /// un-scaled by the operator's curvature scale, so their ratio is scale-free and the
+    /// displacement is in coefficient units.
+    ///
+    /// `None` when `t₃` was not priced, or is zero or not finite: a vanishing cubic term puts the
+    /// saddle at infinity, which names no crossing.
+    pub fn saddle_crossing_displacement(&self) -> Option<Array1<f64>> {
+        let third = self.third_derivative?;
+        if !third.is_finite() || third == 0.0 || !self.sigma.is_finite() {
+            return None;
+        }
+        let step = -4.0 * self.sigma / third;
+        step.is_finite().then(|| &self.softest_direction * step)
     }
 }
 

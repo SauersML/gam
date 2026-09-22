@@ -1,5 +1,28 @@
 ## Unreleased
 
+- **The fold record named the mode's softest direction but never carried it, so a mode one solve
+  away from a lower basin had nowhere to go** (gam#3173, gam#2765). The Laplace normalizer is the
+  Gaussian integral of the quadratic model about the inner mode, and along the softest eigenpair
+  `(σ, v)` the objective is `f(β̂ + s·v) ≈ f̂ + ½σs² + t₃s³/6`. The record graded `σ` against its
+  rounding band and stopped there: `t₃` was priced only when the caller asked, the one production
+  call site asked for `None`, and the eigenvector `v` — which the grading holds in its hand — was
+  discarded. So every fold record in a real fit carried two numbers and no direction, and the
+  record only ever travelled on the REFUSAL channel, which is the one path where nothing can act
+  on it. The grading now carries `v` on every record, priced or refused; the unified evaluator
+  supplies `t₃`, one directional drift of the log-determinant operator along `v`, skipped entirely
+  on refused trials because the band refuses before any derivative is spent; and the record is
+  published on the success path, where a mode NEAR a fold is admitted precisely because its
+  curvature still resolves. The consumer is the start the record names. The cubic model's other
+  stationary point is the saddle bounding this basin, at `s* = −2σ/t₃`, and the share the record
+  already computed, `5t₃²/(24σ³)`, is `5/(36·ΔF)` for the barrier `ΔF = (2/3)σ³/t₃²` to the next
+  one. Where that share is at or above one — the leading correction is not below the term it
+  corrects, so the barrier is below `5/36` of a log-likelihood unit — an exact-joint evaluation
+  now solves one more mode from `β̂ + 2s*·v`, past the saddle, and the gam#3173 published-mode rule
+  publishes the lower penalized `f`. At a saddle-node fold the vanishing minimum and the saddle
+  coincide, so the mountain-pass inequality puts the rival basin strictly below the folding one:
+  the probe either finds it or returns, and a probe that certifies no mode is simply not among the
+  candidates. It is a discovery condition and never a refusal — refusing on the same share was
+  measured wrong (gate job 1219877) and that measurement stands.
 - **A memory-budget refusal names the reservation that refused it** (#4565). The governor's
   ledger is process-wide, so `MemoryReservationError::BudgetExceeded` reported how many bytes
   were reserved without saying whose they were. A caller refused because a neighbour holds the

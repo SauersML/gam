@@ -1848,6 +1848,11 @@ pub(crate) struct OuterObjectiveEvalResult {
     /// criterion, so it carries no pseudo-log-determinant and two evaluations on two kept
     /// ranks can be compared through it.
     pub(crate) incumbent_mode_excess: Option<f64>,
+    /// The inner mode's fold record along its softest direction at this evaluation (gam#2765,
+    /// gam#3173). It names the saddle bounding this mode's basin, so a caller that must leave the
+    /// basin has the start to leave it from. `None` when the mode response named no span to grade,
+    /// or when the evaluation did not route through the unified evaluator.
+    pub(crate) inner_mode_fold: Option<InnerModeFold>,
     /// The exact coefficient mode used to assemble this objective payload.
     ///
     /// Keeping the owned result here lets an atomic multi-start evaluation

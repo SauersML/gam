@@ -49,6 +49,7 @@ pub(crate) use gam_solve::estimate::reml::reml_outer_engine::{
     ExactJeffreysTerm,
     HessianDerivativeProvider,
     HessianFactorization,
+    InnerModeFold,
     OuterHessianDerivativeKernel,
     PenaltySubspaceTrace,
     active_constraint_face_geometry,

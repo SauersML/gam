@@ -169,6 +169,8 @@ pub use sparse_cholesky_backends::*;
 #[cfg(test)]
 mod cholesky_logdet_1561_tests;
 #[cfg(test)]
+mod fold_crossing_3173_tests;
+#[cfg(test)]
 mod logdet_lane_agreement_2457_tests;
 #[cfg(test)]
 mod psi_logdet_chain_tests;

@@ -483,21 +483,33 @@ pub(crate) fn reml_laml_evaluate(
     // at a fold, however well it is solved. One verdict at one point refuses the value and every
     // derivative alike, through the error channel, before anything is built on the mode.
     //
-    // The verdict reads the softest curvature against its rounding band alone, so an evaluation
-    // prices no `t₃`: that is one directional drift of the log-determinant operator, a full row
-    // pass, for a record no consumer of the evaluation reads (#979: +20.5 s on the n=2000 BMS flex
-    // smoke fit, job 1267301).
+    // The verdict still reads the softest curvature against its rounding band alone. What the
+    // evaluation now also prices is `t₃`, one directional drift of the log-determinant operator
+    // along the softest eigenvector: it places the saddle bounding this mode's basin at
+    // `s* = −2σ/t₃`, and gam#3173's start past that saddle is the consumer #979 recorded as
+    // missing when it declined to pay for the pass (+20.5 s on the n=2000 BMS flex smoke fit, job
+    // 1267301). It is one row pass against an inner solve, it is skipped on every refused trial
+    // (the band refuses before any derivative is spent), and the record it completes is published
+    // on the success path below.
+    let mut inner_mode_fold: Option<InnerModeFold> = None;
     if let Some(span) = mode_kernel.inverted_span() {
-        let fold = grade_inner_mode_fold(&span, solution.rho_curvature_scale, None).map_err(
-            |reason| RemlError::ContractViolation {
-                reason: format!("inner-mode fold verdict (gam#2765): {reason}"),
-            },
-        )?;
+        let third_along = |direction: &Array1<f64>| {
+            inner_mode_third_derivative(solution.deriv_provider.as_ref(), direction)
+        };
+        let fold = grade_inner_mode_fold(
+            &span,
+            solution.rho_curvature_scale,
+            Some(&third_along),
+        )
+        .map_err(|reason| RemlError::ContractViolation {
+            reason: format!("inner-mode fold verdict (gam#2765): {reason}"),
+        })?;
         log::debug!("[inner-mode fold] {fold}");
         if !fold.is_valid() {
             log::debug!("[inner-mode fold] refusing this trial point: {fold}");
             return Err(RemlLamlError::InnerModeFold(fold));
         }
+        inner_mode_fold = Some(fold);
     }
     // #2954: the factor `log|H_β|` is read from, for the certificate's band on
     // the criterion's value. Where a kernel replaces the operator's determinant,
@@ -714,6 +726,7 @@ pub(crate) fn reml_laml_evaluate(
             hessian: gam_problem::HessianValue::Unavailable,
             rho_mode_response_cols: None,
             ext_mode_response_cols: None,
+            inner_mode_fold,
         });
     }
 
@@ -2024,6 +2037,7 @@ pub(crate) fn reml_laml_evaluate(
                 hessian,
                 rho_mode_response_cols,
                 ext_mode_response_cols,
+                inner_mode_fold,
             });
         }
         let hessian_kernel = effective_deriv.outer_hessian_derivative_kernel();
@@ -2257,6 +2271,7 @@ pub(crate) fn reml_laml_evaluate(
         hessian,
         rho_mode_response_cols,
         ext_mode_response_cols,
+        inner_mode_fold,
     })
 }
 

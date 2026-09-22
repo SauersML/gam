@@ -971,9 +971,12 @@ pub fn inner_mode_third_derivative(
 /// before any derivative is priced.
 ///
 /// The verdict reads `σ` against the band alone. `t₃` and its cubic share are priced only when
-/// `third_along` is given; without it a resolved curvature is admitted with no record of them. The
-/// unified evaluator passes `None`: `t₃` is one directional drift of the log-determinant operator,
-/// a full row pass on every evaluation, and no consumer of an evaluation reads it (#979).
+/// `third_along` is given, and only above the band: below it the trial is refused before any
+/// derivative is spent. The unified evaluator supplies it since gam#3173, because an evaluation's
+/// record now has a consumer — the start past the saddle that
+/// [`InnerModeFold::saddle_crossing_displacement`] names — and `t₃` is what places that saddle.
+/// The softest eigenVECTOR is carried on every record, priced or not: the grading holds it
+/// already, and it is what the record is measured along.
 pub(crate) fn grade_inner_mode_fold(
     span: &InvertedSpan,
     curvature_scale: f64,
@@ -989,12 +992,14 @@ pub(crate) fn grade_inner_mode_fold(
     let sigma = span.eigenvalues[softest] / curvature_scale;
     let rounding_band =
         gam_linalg::roundoff::symmetric_spectrum_rounding_band(&span.eigenvalues) / curvature_scale;
+    let softest_direction = span.basis.column(softest).to_owned();
     let third_along = match third_along {
         Some(third_along) if sigma > rounding_band => third_along,
         _ => {
             return Ok(InnerModeFold {
                 sigma,
                 rounding_band,
+                softest_direction,
                 third_derivative: None,
                 cubic_correction: None,
                 quartic_correction: QuarticShare::NotPriced,
@@ -1002,11 +1007,12 @@ pub(crate) fn grade_inner_mode_fold(
             });
         }
     };
-    let (third, completion) = third_along(&span.basis.column(softest).to_owned())?;
+    let (third, completion) = third_along(&softest_direction)?;
     let third = third / curvature_scale;
     Ok(InnerModeFold {
         sigma,
         rounding_band,
+        softest_direction,
         third_derivative: Some(third),
         cubic_correction: Some(5.0 * third * third / (24.0 * sigma.powi(3))),
         quartic_correction: QuarticShare::NotPriced,
