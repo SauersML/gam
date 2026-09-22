@@ -35,6 +35,12 @@ pub struct ConeNormalizerInput {
     pub gradient: Array1<f64>,
     /// How that gradient moves with the outer coordinates.
     pub gradient_motion: ConeGradientMotion,
+    /// How the CONSTRAINT SYSTEM moves with the ψ coordinates, for a family whose rows are a
+    /// function of one (gam#3171). `None` where the rows are fixed along every coordinate,
+    /// which is every family whose cone is a statement about coefficients alone and the whole
+    /// standard route, where `A` and `b` are the fit's own
+    /// `PirlsResult::linear_constraints_transformed`.
+    pub constraint_motion: Option<Arc<dyn ConeRowMotionSource>>,
     /// `Some(φ̂)` where the criterion profiles a Gaussian scale out, `None` at fixed dispersion.
     ///
     /// The Laplace integral the term normalizes is `∫_{Aβ ≥ b} exp(−E(β)/φ̂) dβ`, so the
@@ -43,6 +49,37 @@ pub struct ConeNormalizerInput {
     /// [`profiled_gaussian_scale`](super::profiled_gaussian_scale), the one rule for `φ̂`, so
     /// the term and the criterion cannot price two posteriors for one mode (gam#2765).
     pub profiled_scale: Option<f64>,
+}
+
+/// The constraint system's motion along the ψ coordinates (gam#3171).
+///
+/// A family whose inequality rows are built on a design serves `Ȧ` and `ḃ` here; the
+/// transformation-normal monotonicity cone is the case the issue names, whose rows
+/// `α_k(x_i) = ψ_iᵀA[k,:] ≥ 0` are the covariate design rows and therefore move with the Duchon
+/// length scale.
+///
+/// The index is the ψ coordinate's own, `0..ext_dim` — the engine's coordinate `c` minus its
+/// `ρ` count `k`, which is the same index the hyper layout addresses its design axes by. The
+/// rates are over the rows exactly as [`ConeNormalizerInput::rows`] carries them, at that row
+/// scale: `P(u ≥ 0)` is invariant to a positive rescaling of any row, so the term's internal
+/// unit-scaling contributes nothing and a producer hands over `d(rows)/dψ` unnormalized.
+///
+/// Both methods answer on demand rather than by materializing `ext_dim` (and `ext_dim²`) dense
+/// row blocks: a cone with `n·(p_resp − 1)` rows is already the largest object the term reads,
+/// and the pair grid would square it.
+pub trait ConeRowMotionSource: std::fmt::Debug + Send + Sync {
+    /// `(Ȧ_e, ḃ_e)` along ψ coordinate `e`, or `None` where it does not move the system.
+    fn first(
+        &self,
+        psi_index: usize,
+    ) -> Result<Option<crate::constrained_posterior::ConeRowMotion>, String>;
+
+    /// `(Ä_ef, b̈_ef)` along the ψ pair, or `None` where the pair does not move it.
+    fn second(
+        &self,
+        psi_index_e: usize,
+        psi_index_f: usize,
+    ) -> Result<Option<crate::constrained_posterior::ConeRowMotion>, String>;
 }
 
 /// How the KKT gradient `g = ∇F(β̂(θ), θ)` moves along an outer coordinate (gam#2765).
@@ -77,6 +114,8 @@ pub struct ConeNormalizerTerm {
     /// The state a profiled scale's own motion moves, `None` at fixed dispersion where `φ̂` is
     /// not a function of the outer coordinates.
     pub profiled: Option<ProfiledConeScale>,
+    /// The constraint system's ψ motion, carried verbatim from the input (gam#3171).
+    pub constraint_motion: Option<Arc<dyn ConeRowMotionSource>>,
 }
 
 /// What a profiled Gaussian scale contributes to the constrained Laplace term's derivatives
@@ -173,6 +212,7 @@ impl ConeNormalizerTerm {
                 laplace,
                 gradient_motion: input.gradient_motion.clone(),
                 profiled,
+                constraint_motion: input.constraint_motion.clone(),
             },
             lambda,
         ))

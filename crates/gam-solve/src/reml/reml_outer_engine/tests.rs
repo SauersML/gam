@@ -9355,6 +9355,7 @@ impl ConeFaceSwitchFixture {
                 bounds: self.bounds.clone(),
                 gradient,
                 gradient_motion: ConeGradientMotion::Stationary,
+                constraint_motion: None,
                 profiled_scale,
             };
             let precision = self.precision(rho);

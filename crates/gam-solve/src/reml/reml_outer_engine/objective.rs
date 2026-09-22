@@ -1803,15 +1803,25 @@ pub(crate) fn reml_laml_evaluate(
                 // trace `½tr(Λ̃⁻¹Ṁ_k)` does not see.
                 grad[coordinate] += 0.5 * ell * profiled.trace_deficit;
             }
+            // gam#3171: a family whose inequality rows are built on a design moves them with
+            // that design's ψ coordinates. A ρ coordinate scales penalties and never the design,
+            // so `coordinate < k` moves no row on any route; the ψ coordinate's own index is
+            // `coordinate - k`, which is the index the hyper layout addresses its design axes by.
+            let constraint_rate = match (coordinate.checked_sub(k), term.constraint_motion.as_ref())
+            {
+                (Some(psi_index), Some(source)) => source.first(psi_index).map_err(|reason| {
+                    RemlLamlError::ConeNormalizer(
+                        crate::constrained_posterior::ConeLaplaceRefusal::RowMotion { reason },
+                    )
+                })?,
+                _ => None,
+            };
             let motion = crate::constrained_posterior::ConeLaplaceMotion {
                 mode_response,
                 gradient_rate,
                 precision_rate_on_mean,
                 precision_rate_on_normals,
-                // The rows of `Aβ ≥ b` are the family's declared constraints, read once at the
-                // mode and fixed along every outer coordinate on both routes that price the
-                // term. A family whose rows move with a coordinate is gam#3171.
-                constraint_rate: None,
+                constraint_rate,
             };
             let first = laplace
                 .first_order(&motion)
@@ -2493,13 +2503,27 @@ fn cone_laplace_outer_hessian(
             }
             ConeGradientMotion::Pinned => -&state.rhs / scale,
         };
+        // gam#3171, second order. `A` is a function of the ψ coordinates alone, so a pair that
+        // holds a ρ coordinate has `Ä = 0` and only a ψψ pair moves the system.
+        let constraint_rate = match (
+            i.checked_sub(k),
+            j.checked_sub(k),
+            term.constraint_motion.as_ref(),
+        ) {
+            (Some(psi_i), Some(psi_j), Some(source)) => {
+                source.second(psi_i, psi_j).map_err(|reason| {
+                    RemlLamlError::ConeNormalizer(
+                        crate::constrained_posterior::ConeLaplaceRefusal::RowMotion { reason },
+                    )
+                })?
+            }
+            _ => None,
+        };
         let pair_motion = crate::constrained_posterior::ConeLaplacePairMotion {
             mode_response: state.second_response.clone(),
             gradient_rate,
             precision_rate_on_mean,
-            // The rows are fixed along every outer coordinate on both routes that price the term
-            // (gam#3171), so no pair moves them either.
-            constraint_rate: None,
+            constraint_rate,
         };
         let value = term
             .laplace

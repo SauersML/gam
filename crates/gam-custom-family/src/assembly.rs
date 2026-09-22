@@ -2297,10 +2297,133 @@ pub(crate) fn refuse_efs_where_the_cone_normalizer_is_priced<F: CustomFamily + ?
 /// [`joint_penalty_stationarity_score`]) from the likelihood score plus `∇Φ`. Without `∇Φ` the
 /// normalizer reads `−∇Φ` as a KKT gradient at an unconstrained mode, where the evaluator takes
 /// the gradient to be stationary, so the criterion's gradient does not differentiate its value.
+/// The constraint system's ψ motion for a family that publishes it (gam#3171), assembled into
+/// the same joint row space the value's rows were concatenated into.
+///
+/// It answers on demand: the engine asks once per ψ coordinate for the gradient and once per ψ
+/// PAIR for the Hessian, and a cone with `n·(p_resp − 1)` rows is already the largest object the
+/// term reads, so materializing the whole grid would square it.
+struct CustomFamilyConeRowMotion<F> {
+    family: F,
+    specs: Vec<ParameterBlockSpec>,
+    states: Vec<ParameterBlockState>,
+    hyper_layout: CustomFamilyHyperLayout,
+    /// The blocks that carry a cone, in the order the value's rows were laid down.
+    coned_blocks: Vec<usize>,
+    /// Each coned block's row count and its coefficient columns, so a rate whose shape disagrees
+    /// with the value it differentiates is refused rather than placed.
+    block_rows: Vec<usize>,
+    ranges: Vec<(usize, usize)>,
+    nrows: usize,
+    total: usize,
+}
+
+impl<F> std::fmt::Debug for CustomFamilyConeRowMotion<F> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CustomFamilyConeRowMotion")
+            .field("coned_blocks", &self.coned_blocks)
+            .field("nrows", &self.nrows)
+            .field("total", &self.total)
+            .finish()
+    }
+}
+
+impl<F: CustomFamily + Clone + Send + Sync + 'static> CustomFamilyConeRowMotion<F> {
+    /// Place one rate per coned block into the joint row space, in the value's own row order.
+    /// `None` when no block moves: that is every family whose cone is a statement about
+    /// coefficients alone, and it is the default the trait hooks return.
+    fn assemble(
+        &self,
+        per_block: impl Fn(usize) -> Result<Option<gam_problem::ConstraintSet>, String>,
+    ) -> Result<Option<gam_solve::constrained_posterior::ConeRowMotion>, String> {
+        let mut rates: Vec<Option<gam_problem::LinearInequalityConstraints>> =
+            Vec::with_capacity(self.coned_blocks.len());
+        for &block in &self.coned_blocks {
+            rates.push(match per_block(block)? {
+                Some(set) => Some(set.to_dense()?),
+                None => None,
+            });
+        }
+        if rates.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        let mut rows = Array2::<f64>::zeros((self.nrows, self.total));
+        let mut bounds = Array1::<f64>::zeros(self.nrows);
+        let mut out_row = 0usize;
+        for (position, &block) in self.coned_blocks.iter().enumerate() {
+            let count = self.block_rows[position];
+            let Some(dense) = rates[position].as_ref() else {
+                out_row += count;
+                continue;
+            };
+            let (start, end) = self.ranges[block];
+            if dense.a.nrows() != count || dense.a.ncols() != end - start {
+                return Err(format!(
+                    "block {block}'s constraint rate is {}x{} but its constraint system is \
+                     {count}x{}; a rate must differentiate the rows it is the rate of",
+                    dense.a.nrows(),
+                    dense.a.ncols(),
+                    end - start,
+                ));
+            }
+            for row in 0..count {
+                rows.row_mut(out_row + row)
+                    .slice_mut(s![start..end])
+                    .assign(&dense.a.row(row));
+                bounds[out_row + row] = dense.b[row];
+            }
+            out_row += count;
+        }
+        Ok(Some(gam_solve::constrained_posterior::ConeRowMotion {
+            rows,
+            bounds,
+        }))
+    }
+}
+
+impl<F: CustomFamily + Clone + Send + Sync + 'static>
+    gam_solve::estimate::reml::reml_outer_engine::ConeRowMotionSource
+    for CustomFamilyConeRowMotion<F>
+{
+    fn first(
+        &self,
+        psi_index: usize,
+    ) -> Result<Option<gam_solve::constrained_posterior::ConeRowMotion>, String> {
+        self.assemble(|block| {
+            self.family.block_linear_constraint_psi_derivative(
+                &self.states,
+                &self.specs,
+                &self.hyper_layout,
+                block,
+                psi_index,
+            )
+        })
+    }
+
+    fn second(
+        &self,
+        psi_index_e: usize,
+        psi_index_f: usize,
+    ) -> Result<Option<gam_solve::constrained_posterior::ConeRowMotion>, String> {
+        self.assemble(|block| {
+            self.family.block_linear_constraint_psi_second_derivative(
+                &self.states,
+                &self.specs,
+                &self.hyper_layout,
+                block,
+                psi_index_e,
+                psi_index_f,
+            )
+        })
+    }
+}
+
 pub(crate) fn custom_family_cone_normalizer_input<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
+    hyper_layout: &CustomFamilyHyperLayout,
     inner: &BlockwiseInnerResult,
 ) -> Result<Option<Arc<gam_solve::estimate::reml::reml_outer_engine::ConeNormalizerInput>>, CustomFamilyError>
 {
@@ -2313,6 +2436,8 @@ pub(crate) fn custom_family_cone_normalizer_input<F: CustomFamily + Clone + Send
     let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
     let mut rows: Vec<Array1<f64>> = Vec::new();
     let mut bounds: Vec<f64> = Vec::new();
+    let mut coned_blocks: Vec<usize> = Vec::new();
+    let mut block_rows: Vec<usize> = Vec::new();
     for (block, set) in sets.iter().enumerate() {
         let Some(set) = set else { continue };
         let dense = set.to_dense().map_err(|reason| CustomFamilyError::Optimization {
@@ -2320,6 +2445,8 @@ pub(crate) fn custom_family_cone_normalizer_input<F: CustomFamily + Clone + Send
             reason,
         })?;
         let (start, end) = ranges[block];
+        coned_blocks.push(block);
+        block_rows.push(dense.a.nrows());
         for row in 0..dense.a.nrows() {
             let mut joint = Array1::<f64>::zeros(total);
             joint.slice_mut(s![start..end]).assign(&dense.a.row(row));
@@ -2372,6 +2499,22 @@ pub(crate) fn custom_family_cone_normalizer_input<F: CustomFamily + Clone + Send
             bounds: Array1::from(bounds),
             gradient,
             gradient_motion: gam_solve::estimate::reml::reml_outer_engine::ConeGradientMotion::Stationary,
+            // gam#3171: the rows of a cone built on a DESIGN move with that design's ψ
+            // coordinates. The source answers per coordinate and per pair; a family whose rows
+            // are a statement about coefficients alone answers `None` from the trait defaults,
+            // which is the fixed-row case this criterion priced before.
+            constraint_motion: Some(Arc::new(CustomFamilyConeRowMotion {
+                family: family.clone(),
+                specs: specs.to_vec(),
+                states: states.to_vec(),
+                hyper_layout: hyper_layout.clone(),
+                coned_blocks,
+                block_rows,
+                ranges: ranges.clone(),
+                nrows: q,
+                total,
+            })
+                as Arc<dyn gam_solve::estimate::reml::reml_outer_engine::ConeRowMotionSource>),
             // Every custom family evaluates at fixed dispersion, so the posterior the term
             // truncates is the objective's own and no scale divides it (gam#3234).
             profiled_scale: None,

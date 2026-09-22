@@ -3053,7 +3053,13 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     };
     certify_inner_mode(family, specs, options, &mut inner, rho_dim, psi_dim)?;
     // gam#2765: the constrained Laplace normalizer's inputs at this mode.
-    inner.cone_normalizer = custom_family_cone_normalizer_input(family, specs, options, &inner)?;
+    inner.cone_normalizer = custom_family_cone_normalizer_input(
+        family,
+        specs,
+        options,
+        hyper_layout.as_ref(),
+        &inner,
+    )?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
     // ── Try to obtain a joint Hessian and route through the unified evaluator ──

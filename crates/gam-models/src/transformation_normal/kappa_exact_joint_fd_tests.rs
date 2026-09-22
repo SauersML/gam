@@ -517,3 +517,135 @@ fn ctn_exact_joint_gradient_matches_fd_duchon_linear_power9_16d() {
         violations.join("\n  ")
     );
 }
+
+/// gam#3171: the monotonicity cone's rows are the covariate design rows, so they move with the
+/// Duchon length scale, and the constrained Laplace term's outer derivatives contract that
+/// motion. The rate the family publishes is graded against a Ridders central difference of the
+/// rows themselves, which needs no fit and no criterion evaluation: the rows are a function of
+/// the chart alone.
+///
+/// The whole matrix is graded through fixed contractions `uᵀA v` rather than entry by entry. A
+/// cone on this fixture is `n·(p_resp − 1)` by `p_resp·p_cov` and a per-entry ladder would run
+/// one Ridders sweep per entry; a contraction against dense deterministic vectors misses only a
+/// rate whose whole error lies in the orthogonal complement of `u ⊗ v`, and two independent
+/// pairs are differenced so that a single unlucky pair cannot be the verdict.
+#[test]
+fn ctn_monotonicity_cone_psi_rate_matches_central_differences_3171() {
+    let fixture = build_fixture(DuchonNullspaceOrder::Linear, 2.0, 3, 240, 10);
+    let theta_dim = fixture.rho_dim + 1;
+    let mut theta = Array1::<f64>::zeros(theta_dim);
+    theta[fixture.rho_dim] = 0.15;
+
+    // The cone's rows at ψ, in the joint coefficient space of block 0, with the states the value
+    // hook validates its width against. The rows are β-free (the cone is `Ψ_i·A[k,:] ≥ 0` with
+    // `b ≡ 0`), so a zero state carries the same rows any mode does.
+    let cone_rows = |theta: &Array1<f64>| -> Array2<f64> {
+        let geometry = fixture.geometry_at(theta);
+        let spec = &geometry.blocks[0];
+        let states = vec![ParameterBlockState {
+            beta: Array1::<f64>::zeros(spec.design.ncols()),
+            eta: Array1::<f64>::zeros(spec.design.nrows()),
+        }];
+        geometry
+            .family
+            .block_linear_constraints(&states, 0, spec)
+            .expect("CTN monotonicity cone")
+            .expect("the fixture's response basis carries a monotone block")
+            .to_dense()
+            .expect("cone rows")
+            .a
+    };
+
+    let base_rows = cone_rows(&theta);
+    let (q, p) = base_rows.dim();
+    assert!(q > 0 && p > 0, "the fixture's cone is non-empty");
+
+    // Deterministic dense contractions: an alternating-sign ramp and a coprime-stride ramp, both
+    // normalized, so neither is orthogonal to a coordinate direction of the other.
+    let contraction = |len: usize, pair: usize| -> Array1<f64> {
+        let mut v = Array1::<f64>::zeros(len);
+        for (index, slot) in v.iter_mut().enumerate() {
+            let phase = (index * (2 * pair + 1) + pair) % 7;
+            *slot = ((phase as f64) - 3.0) * if index % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let norm = v.dot(&v).sqrt();
+        assert!(norm > 0.0, "contraction {pair} is non-degenerate");
+        v / norm
+    };
+
+    let geometry = fixture.geometry_at(&theta);
+    let spec = &geometry.blocks[0];
+    let states = vec![ParameterBlockState {
+        beta: Array1::<f64>::zeros(spec.design.ncols()),
+        eta: Array1::<f64>::zeros(spec.design.nrows()),
+    }];
+    let psi_dim = geometry.hyper_layout.len();
+    assert_eq!(psi_dim, 1, "the isotropic fixture carries one ψ axis");
+
+    let ridders = RiddersConfig::default();
+    let rel_tol = 5e-3_f64;
+    let abs_floor = 1e-6_f64;
+    let mut violations: Vec<String> = Vec::new();
+
+    for psi_index in 0..psi_dim {
+        let rate = geometry
+            .family
+            .block_linear_constraint_psi_derivative(
+                &states,
+                &geometry.blocks,
+                geometry.hyper_layout.as_ref(),
+                0,
+                psi_index,
+            )
+            .expect("CTN monotonicity cone psi rate")
+            .expect("a CTN psi axis moves the covariate design the cone is built on")
+            .to_dense()
+            .expect("cone rate rows")
+            .a;
+        assert_eq!(
+            rate.dim(),
+            (q, p),
+            "the rate differentiates the rows it is the rate of"
+        );
+        assert!(
+            rate.iter().all(|value| value.is_finite()),
+            "psi {psi_index}: the cone rate is finite"
+        );
+
+        for pair in 0..2 {
+            let left = contraction(q, pair);
+            let right = contraction(p, pair + 1);
+            let analytic = left.dot(&rate.dot(&right));
+            let measured = ridders_derivative(
+                |step| {
+                    let mut probe = theta.clone();
+                    probe[fixture.rho_dim + psi_index] += step;
+                    left.dot(&cone_rows(&probe).dot(&right))
+                },
+                ridders,
+            );
+            let fd = measured.value;
+            let denom = fd.abs().max(analytic.abs()).max(abs_floor);
+            let rel = (analytic - fd).abs() / denom;
+            let verdict = measured.judge(analytic, rel_tol, abs_floor);
+            eprintln!(
+                "[cone-psi-rate 3171] psi={psi_index} pair={pair} an={analytic:+.6e} \
+                 fd={fd:+.6e} rel={rel:.3e} unc={:.3e} step={:.1e} order={} {verdict:?}",
+                measured.uncertainty, measured.step, measured.order,
+            );
+            if verdict == FdVerdict::Disagree {
+                violations.push(format!(
+                    "psi={psi_index} pair={pair}: analytic={analytic:+.6e} fd={fd:+.6e} \
+                     rel={rel:.3e}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "the CTN monotonicity cone's psi rate disagrees with a central difference of its own \
+         rows\n  {}",
+        violations.join("\n  ")
+    );
+}

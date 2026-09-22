@@ -5,6 +5,66 @@ use gam_problem::{ConstraintSet, KhatriRaoConeConstraints};
 // CustomFamily implementation
 // ---------------------------------------------------------------------------
 
+impl TransformationNormalFamily {
+    /// The ψ-derivative operator and covariate axis behind global ψ index `psi_index`, with the
+    /// covariate row range the monotonicity cone is built over, or `None` when that axis does not
+    /// move this block's covariate design (gam#3171).
+    ///
+    /// The cone lives on block 0, so an axis owned by any other block moves no row of it. An axis
+    /// that IS this block's and carries no operator is refused rather than reported as motionless:
+    /// the CTN ψ route requires operator-backed derivatives, and silently returning `None` here
+    /// would restore exactly the missing term this hook exists to supply.
+    fn covariate_cone_axis(
+        &self,
+        hyper_layout: &CustomFamilyHyperLayout,
+        block_index: usize,
+        psi_index: usize,
+    ) -> Result<Option<(&TensorKroneckerPsiOperator, usize, std::ops::Range<usize>)>, String> {
+        if block_index != 0 {
+            return Ok(None);
+        }
+        if self.response_val_basis.ncols() <= 1 {
+            return Ok(None);
+        }
+        let Some((axis_block, _, deriv)) = hyper_layout.design_derivative(psi_index) else {
+            return Ok(None);
+        };
+        if axis_block != 0 {
+            return Ok(None);
+        }
+        let op = deriv
+            .implicit_operator
+            .as_ref()
+            .and_then(|op| op.as_any().downcast_ref::<TensorKroneckerPsiOperator>())
+            .ok_or_else(|| {
+                "TransformationNormalFamily requires tensor psi derivatives to remain \
+                 operator-backed to publish its monotonicity cone's psi rate (gam#3171)"
+                    .to_string()
+            })?;
+        Ok(Some((
+            op,
+            deriv.implicit_axis,
+            0..self.response_val_basis.nrows(),
+        )))
+    }
+
+    /// The cone carrier over a covariate factor RATE: the same coupled response rows and the same
+    /// `p_left` as the value, so `to_dense()` of the two agree row for row and column for column,
+    /// and `ḃ = 0` because the value's cone is homogeneous (gam#3171).
+    fn covariate_cone_from_factor(
+        &self,
+        factor: Array2<f64>,
+    ) -> Result<Option<ConstraintSet>, String> {
+        let p_resp = self.response_val_basis.ncols();
+        let cone = KhatriRaoConeConstraints::new(
+            std::sync::Arc::new(factor),
+            (1..p_resp).collect(),
+            p_resp,
+        )?;
+        Ok(Some(ConstraintSet::KhatriRaoCone(cone)))
+    }
+}
+
 impl CustomFamily for TransformationNormalFamily {
     /// The direct-α chart makes `h'` affine in β, so the change-of-variables
     /// Jacobian `−log h'` is a canonical self-concordant barrier (the `−½h²`
@@ -264,6 +324,64 @@ impl CustomFamily for TransformationNormalFamily {
             ));
         }
         Ok(Some(ConstraintSet::KhatriRaoCone(cone)))
+    }
+
+    /// The monotonicity cone is `α_k(x_i) = ψ_iᵀA[k,:] ≥ 0` over the covariate design rows, so
+    /// its rows ARE `Ψ` and its rate along a ψ axis is the same Khatri-Rao cone on
+    /// `∂Ψ/∂ψ_e` — the same coupled rows, the same `p_left`, and `ḃ = 0` because the cone is
+    /// homogeneous (gam#3171).
+    ///
+    /// `∂Ψ/∂ψ_e` is the block the ψ-jets already form,
+    /// `TensorKroneckerPsiOperator::cov_first_axis_row_chunk`, through the guarded accessor that
+    /// materializes from the implicit operator when the dense `x_psi` is the Duchon placeholder,
+    /// so the dense and matrix-free routes feed one rate exactly as they already feed one `G_x`.
+    fn block_linear_constraint_psi_derivative(
+        &self,
+        _block_states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+        hyper_layout: &CustomFamilyHyperLayout,
+        block_index: usize,
+        psi_index: usize,
+    ) -> Result<Option<ConstraintSet>, String> {
+        let Some((op, axis, rows)) =
+            self.covariate_cone_axis(hyper_layout, block_index, psi_index)?
+        else {
+            return Ok(None);
+        };
+        let factor = op.cov_first_axis_row_chunk(axis, rows).map_err(|error| {
+            format!("CTN monotonicity cone psi rate: covariate first-axis rows failed: {error}")
+        })?;
+        self.covariate_cone_from_factor(factor)
+    }
+
+    /// The same cone on `∂²Ψ/∂ψ_e∂ψ_f`, which
+    /// `TensorKroneckerPsiOperator::cov_second_axis_row_chunk` forms and which is the zero block
+    /// for a pair the operator carries no second derivative for (gam#3171).
+    fn block_linear_constraint_psi_second_derivative(
+        &self,
+        _block_states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+        hyper_layout: &CustomFamilyHyperLayout,
+        block_index: usize,
+        psi_index_i: usize,
+        psi_index_j: usize,
+    ) -> Result<Option<ConstraintSet>, String> {
+        let Some((op, axis_i, rows)) =
+            self.covariate_cone_axis(hyper_layout, block_index, psi_index_i)?
+        else {
+            return Ok(None);
+        };
+        let Some((_, axis_j, _)) =
+            self.covariate_cone_axis(hyper_layout, block_index, psi_index_j)?
+        else {
+            return Ok(None);
+        };
+        let factor = op
+            .cov_second_axis_row_chunk(axis_i, axis_j, rows)
+            .map_err(|error| {
+                format!("CTN monotonicity cone psi pair rate: covariate second-axis rows failed: {error}")
+            })?;
+        self.covariate_cone_from_factor(factor)
     }
 
     fn exact_newton_hessian_directional_derivative(

@@ -927,6 +927,90 @@ pub trait CustomFamily {
         Ok(None)
     }
 
+    /// How [`Self::block_linear_constraints`]'s system moves along one design-ψ axis (gam#3171).
+    ///
+    /// A cone that is a statement about COEFFICIENTS alone — a monotone warp's `β_w ≥ 0` — does
+    /// not move with any outer coordinate, and the default `Ok(None)` says exactly that. A cone
+    /// built on a DESIGN does: the transformation-normal monotonicity rows are
+    /// `α_k(x_i) = ψ_iᵀA[k,:] ≥ 0` over the covariate design rows, so they move with that design's
+    /// length scale, and a criterion that holds them fixed reports a ψ-gradient short by
+    /// `−γᵀṁ₀ − tr(ΓẆ)`.
+    ///
+    /// Return the rate IN THE SAME CARRIER the value hook returned, so the caller materializes
+    /// the two the same way and a factored cone's rate stays factored: the rate of a Khatri-Rao
+    /// cone is the same cone on the derivative factor `∂Ψ/∂ψ_e`, with the same coupled rows and
+    /// the same `p_left`. `to_dense()` of the rate is then exactly `(Ȧ, ḃ)` at the value's own
+    /// row scale, which is the scale the consumer asks for — `P(u ≥ 0)` is invariant to a
+    /// positive rescaling of any row, so the term's internal unit-scaling contributes nothing.
+    /// A carrier's row-norm bookkeeping is not a rate and is never read from one.
+    ///
+    /// `psi_index` is the layout's GLOBAL axis index, the same one
+    /// [`Self::exact_newton_joint_psi_terms`] takes.
+    fn block_linear_constraint_psi_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &CustomFamilyHyperLayout,
+        block_index: usize,
+        psi_index: usize,
+    ) -> Result<Option<ConstraintSet>, String> {
+        assert_valid_blockspecs(specs, "block linear constraint psi derivative");
+        assert_states_match_specs(block_states, specs, "block linear constraint psi derivative");
+        assert_hyper_layout_matches_specs(
+            hyper_layout,
+            specs,
+            "block linear constraint psi derivative",
+        );
+        assert_psi_index_in_layout(
+            hyper_layout,
+            psi_index,
+            "block linear constraint psi derivative",
+        );
+        assert!(block_index < specs.len());
+        Ok(None)
+    }
+
+    /// The second derivative of the same system along a ψ PAIR (gam#3171), in the same carrier.
+    ///
+    /// The constrained Laplace term's outer HESSIAN contracts `Ä_ef` exactly as its gradient
+    /// contracts `Ȧ_e`, so a family that publishes the first and not the second gets a Hessian
+    /// that is wrong in a way a moving search does not announce. The default `Ok(None)` is
+    /// correct for every family whose rows are affine in ψ as well as for one whose rows do not
+    /// move at all; a family whose rows have curvature in ψ must say so here.
+    fn block_linear_constraint_psi_second_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &CustomFamilyHyperLayout,
+        block_index: usize,
+        psi_index_i: usize,
+        psi_index_j: usize,
+    ) -> Result<Option<ConstraintSet>, String> {
+        assert_valid_blockspecs(specs, "block linear constraint psi second derivative");
+        assert_states_match_specs(
+            block_states,
+            specs,
+            "block linear constraint psi second derivative",
+        );
+        assert_hyper_layout_matches_specs(
+            hyper_layout,
+            specs,
+            "block linear constraint psi second derivative",
+        );
+        assert_psi_index_in_layout(
+            hyper_layout,
+            psi_index_i,
+            "block linear constraint psi second derivative",
+        );
+        assert_psi_index_in_layout(
+            hyper_layout,
+            psi_index_j,
+            "block linear constraint psi second derivative",
+        );
+        assert!(block_index < specs.len());
+        Ok(None)
+    }
+
     /// Is block `block_index`'s COEFFICIENT COORDINATE model content, or is only
     /// its column space? (#2748)
     ///

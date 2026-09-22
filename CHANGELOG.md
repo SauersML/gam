@@ -42,6 +42,26 @@
   are not, and the saved model is untouched: the payload carries `scale` and `shape`, which
   the chart still publishes.
 
+- **The constrained Laplace normalizer's outer derivatives now carry the constraint rows'
+  own motion** (gam#3171, gam#2765).
+  `ConeLaplace` has carried the row-motion half of its derivatives since the term landed —
+  `ConeRowMotion`, the `constraint_rate` field of its two motion structs, the `tr(T̃ȦR)` term
+  of `first_order` and the four row-motion blocks of `second_order` — and both producers
+  published `constraint_rate: None`, so a family whose rows move with an outer coordinate got
+  a derivative that omitted `Ȧ` and `ḃ`. The transformation-normal monotonicity cone is that
+  family: its rows are `α_k(x_i) = ψ_iᵀA[k,:] ≥ 0` over the COVARIATE DESIGN rows, which move
+  with the Duchon length scale, and its ψ-gradient was 6–18% off against a finite-difference
+  oracle resolved to 1e-9 while every ρ direction of the same ladder agreed. `CustomFamily`
+  gains `block_linear_constraint_psi_derivative` and its pair sibling, which publish the rate
+  IN THE SAME CARRIER the value hook returns — a Khatri-Rao cone's rate is the same cone on
+  the derivative factor, so a factored cone's rate stays factored and `to_dense()` of the two
+  agree row for row. The transformation-normal implementation reads `∂Ψ/∂ψ` and
+  `∂²Ψ/∂ψ∂ψ` from the same `TensorKroneckerPsiOperator` row-chunk accessors the ψ-jets
+  already use, so the dense and matrix-free routes feed one rate. `ConeNormalizerInput` carries
+  the motion as a source that answers per coordinate and per pair rather than as a
+  materialized grid, because the cone is already the largest object the term reads and the
+  pair grid would square it. The standard route is unchanged: there `A` and `b` are the fit's
+  own `linear_constraints_transformed`, fixed for the fit, so `None` is exact.
 
 - **The fold record named the mode's softest direction but never carried it, so a mode one solve
   away from a lower basin had nowhere to go** (gam#3173, gam#2765). The Laplace normalizer is the

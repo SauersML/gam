@@ -123,6 +123,9 @@ pub enum ConeLaplaceRefusal {
     NotContracting { sweeps: usize, fraction: f64, step: f64 },
     /// A system EP's derivatives solve is singular.
     Singular { reason: String },
+    /// The producer of the constraint system's ψ motion could not serve it (gam#3171). It is a
+    /// refusal of the DERIVATIVE, not of the value: the term itself priced.
+    RowMotion { reason: String },
 }
 
 impl std::fmt::Display for ConeLaplaceRefusal {
@@ -155,6 +158,10 @@ impl std::fmt::Display for ConeLaplaceRefusal {
                  times its rounding (gam#2765)"
             ),
             Self::Singular { reason } => write!(f, "constrained Laplace term: {reason} (gam#2765)"),
+            Self::RowMotion { reason } => write!(
+                f,
+                "constrained Laplace term: the constraint rows' psi motion is unavailable:                  {reason} (gam#3171)"
+            ),
         }
     }
 }

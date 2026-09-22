@@ -1032,6 +1032,10 @@ impl<'a> RemlState<'a> {
                 // the tangent-projected mode response and the matching `ġ = M_true β̂̇ + ∂_θ∇F`
                 // from the same `Z`. Publishing a motion here would be a second reading of it.
                 gradient_motion: super::reml_outer_engine::ConeGradientMotion::Stationary,
+                // On the standard route `A` and `b` are the fit's own
+                // `PirlsResult::linear_constraints_transformed`, fixed for the fit, so no outer
+                // coordinate moves them (gam#3171).
+                constraint_motion: None,
                 profiled_scale,
             },
         )))
