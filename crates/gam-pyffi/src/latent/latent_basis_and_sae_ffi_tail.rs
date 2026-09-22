@@ -1360,7 +1360,8 @@ fn sae_manifold_certify_external<'py>(
             )?;
             inner.set_item("stationarity_bound", report.inner.stationarity_bound)?;
             match &report.inner.newton_decrement_relative {
-                Ok(relative) => inner.set_item("newton_decrement_relative", *relative)?,
+                // ½λ² in units of the criterion's resolution (#3355); the bar is one.
+                Ok(relative) => inner.set_item("newton_decrement_relative", relative.value())?,
                 Err(reason) => inner.set_item("newton_decrement_unresolved", reason.as_str())?,
             }
             let parameter_space = PyDict::new(py);

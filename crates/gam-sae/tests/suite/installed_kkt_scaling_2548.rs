@@ -1,7 +1,7 @@
 use approx::assert_abs_diff_eq;
 use gam_sae::manifold::{
-    SaeInnerKktScaleBlock, SaeInnerKktScaleError, SaeInstalledInnerKktAudit,
-    SaeManifoldTerm, SaeParameterSpaceKktAudit,
+    SaeDecrementAgainstResolution, SaeInnerKktScaleBlock, SaeInnerKktScaleError,
+    SaeInstalledInnerKktAudit, SaeManifoldTerm, SaeParameterSpaceKktAudit,
 };
 use gam_solve::arrow_schur::ArrowSchurSystem;
 
@@ -127,10 +127,23 @@ fn audit_does_not_certify_on_a_diagonal_scaled_residual_2933_f08() {
 /// Newton decrement, so the zero-step audit must accept that currency too.
 /// The numbers are the natively certified replay measured by guarded pool job
 /// 541721 at 5e8436c44: ‖g‖ 55.6 along smoothing directions with curvature
-/// ~5e12, against a KKT band of 5.3e-5, while ½λ²/(|f| + 1) = 1.34e-11. The
-/// test's perturbed decoder measured ½λ²/(|f| + 1) = 1.0.
+/// ~5e12, against a KKT band of 5.3e-5, while the decrement was 1.34e-11 of
+/// its scale. The perturbed decoder measured a decrement equal to its scale.
+///
+/// Since #3355 the audit's field is a [`SaeDecrementAgainstResolution`], ½λ² in
+/// units of the criterion's own resolution `0.5/n_eff`, with the bar at one
+/// unit, so the fixture states each decrement in those units through the only
+/// constructor: `measure(value / n_eff, F, Some(n_eff))` measures exactly
+/// `value`. The retired `|f| + 1` scale put the perturbed decoder at `1.0`
+/// against a `1e-8` tolerance; in resolution units a decrement at the bar
+/// CERTIFIES, so the descending state is placed at two units, the same point
+/// the newtype's own `above` control uses.
 #[test]
 fn audit_accepts_the_native_newton_decrement_certificate() {
+    const N_EFF: usize = 6_400;
+    let in_resolution_units = |value: f64| {
+        SaeDecrementAgainstResolution::measure(value / N_EFF as f64, 0.0, Some(N_EFF))
+    };
     let stiff_optimum = SaeInstalledInnerKktAudit {
         raw_gradient_norm: 55.6,
         quotient_gradient_norm: 55.6,
@@ -139,12 +152,12 @@ fn audit_accepts_the_native_newton_decrement_certificate() {
             scaled_gradient_max: 2.4e6,
             stationarity_bound: 2.0e-5,
         },
-        newton_decrement_relative: Ok(1.34e-11),
+        newton_decrement_relative: Ok(in_resolution_units(1.34e-11)),
     };
     assert!(stiff_optimum.certifies());
 
     let descending = SaeInstalledInnerKktAudit {
-        newton_decrement_relative: Ok(1.0),
+        newton_decrement_relative: Ok(in_resolution_units(2.0)),
         ..stiff_optimum.clone()
     };
     assert!(!descending.certifies());
