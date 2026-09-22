@@ -1578,7 +1578,7 @@ mod tests {
     #[test]
     fn near_duplicate_atoms_take_the_minimum_norm_code_2899() {
         let p = 16usize;
-        let mut build = |delta: f64| -> Array1<f64> {
+        let build = |delta: f64| -> Array1<f64> {
             let mut atoms = Array2::<f64>::zeros((2, p));
             for col in 0..p {
                 atoms[[0, col]] = if col == 0 { 1.0 } else { 0.0 };
