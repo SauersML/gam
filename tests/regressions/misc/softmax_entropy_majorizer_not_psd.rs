@@ -24,12 +24,15 @@
 //! which is strictly negative for `K > 1`. So `psd_majorizer_diag` returns a
 //! negative entry, violating `B ⪰ 0`.
 //!
-//! This must FAIL now (majorizer == exact negative diagonal) and PASS once the
-//! penalty supplies a genuine PSD majorizer. Related: the sibling ScadMcp
-//! majorizer bug filed in this run, and the (closed) smooth-threshold majorizer #796.
+//! This had to FAIL when it was filed (majorizer == exact negative diagonal) and to PASS once the
+//! penalty supplied a genuine PSD majorizer. It does supply one now: `psd_majorizer_diag` is
+//! overridden with the Gershgorin / diagonal-dominance majorizer of the dense per-row block
+//! (`psd_majorizer_abs_row_sums`), a diagonal with `D ⪰ H` and `D ⪰ 0`. So this file is the pin on
+//! that repair, not an open bug. Related: the sibling ScadMcp majorizer bug filed in the same run,
+//! and the (closed) smooth-threshold majorizer #796.
 
 use gam::terms::analytic_penalties::{AnalyticPenalty, SoftmaxAssignmentSparsityPenalty};
-use ndarray::array;
+use ndarray::{Array1, array};
 
 #[test]
 fn softmax_entropy_psd_majorizer_is_actually_psd() {
@@ -40,7 +43,11 @@ fn softmax_entropy_psd_majorizer_is_actually_psd() {
     // Two rows, both near-uniform (all-equal logits) so each softmax weight is
     // 1/K and the exact entropy-Hessian diagonal is strictly negative.
     let target = array![0.0_f64, 0.0, 0.0, 0.0, 0.1, 0.1, 0.1, 0.1];
-    let rho = array![0.0_f64]; // weight * exp(0) = 1
+    // The entropy strength is the penalty's own `weight`, never an outer coordinate (#4291): on
+    // this chart — the full `(N, K)` logit matrix — the energy is bounded and shift-invariant, so
+    // `∫exp(−λ·ΣH) dℓ` diverges for every `λ` and there is no prior mass to price. `new` leaves
+    // `weight = 1`, which is the strength the retired `rho = [0]` used to name.
+    let rho = Array1::<f64>::zeros(0);
 
     let maj = pen
         .psd_majorizer_diag(target.view(), rho.view())
