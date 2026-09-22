@@ -107,10 +107,12 @@ fn library_load_error_detail(error: &libloading::Error) -> String {
 
 /// True only when a failed loader attempt proves that the requested candidate
 /// itself is absent. A named object that exists but is corrupt, ABI-incompatible,
-/// or missing a transitive dependency is a load fault. For bare sonames, glibc's
-/// missing-object diagnostic begins with the requested soname; a missing
-/// transitive dependency begins with that dependency instead and is therefore
-/// deliberately not classified as absence.
+/// or missing a transitive dependency is a load fault. For bare sonames, the
+/// missing-object diagnostic names the requested soname first: glibc as
+/// `<soname>: cannot open shared object file: No such file or directory`, musl
+/// as `Error loading shared library <soname>: No such file or directory`. A
+/// missing transitive dependency names that dependency instead and is
+/// therefore deliberately not classified as absence.
 fn load_failure_is_candidate_absence(
     candidate: &str,
     candidate_present: bool,
@@ -119,7 +121,10 @@ fn load_failure_is_candidate_absence(
     if Path::new(candidate).components().count() > 1 {
         return !candidate_present;
     }
-    let missing_object = message.starts_with(candidate)
+    let named_object = message
+        .strip_prefix("Error loading shared library ")
+        .unwrap_or(message);
+    let missing_object = named_object.starts_with(candidate)
         && (message.contains("No such file or directory")
             || message.contains("cannot open shared object file")
             || message.contains("image not found"));
@@ -378,6 +383,21 @@ mod loader_classification_tests {
             "libcuda.so.1",
             false,
             "libcuda.so.1: cannot open shared object file: No such file or directory",
+        ));
+    }
+
+    /// musl's loader names the missing object after a fixed prefix (gam#4569).
+    #[test]
+    fn missing_bare_soname_is_absence_on_musl() {
+        assert!(load_failure_is_candidate_absence(
+            "libcuda.so",
+            false,
+            "Error loading shared library libcuda.so: No such file or directory",
+        ));
+        assert!(!load_failure_is_candidate_absence(
+            "libcuda.so",
+            false,
+            "Error loading shared library libnvidia-ptxjitcompiler.so.1: No such file or directory",
         ));
     }
 
