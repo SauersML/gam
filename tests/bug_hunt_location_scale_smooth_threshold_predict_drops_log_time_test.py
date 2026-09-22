@@ -11,7 +11,7 @@ whenever any smoothing parameter existed, and saved replay then dropped
 ``-log t``: the time warp it evaluated had been removed, so the predicted curve
 was flat.
 
-Observed on gamfit 0.1.269 (n = 8000, 475 events, AoU-shaped cohort):
+Observed on gamfit 0.1.270 (n = 8000, 475 events, AoU-shaped cohort):
 
     Surv(followup, event) ~ sex + z                  F(1), F(3) = 0.031, 0.079
     Surv(followup, event) ~ sex + z + s(lookback)    F(1), F(3) = 0.031, 0.031

@@ -495,7 +495,11 @@
   construction — both children re-derive their tube from their own bounds and their union is
   the parent — so only `HonestConformalCost::z_cells` moves.
 
-## gamfit 0.1.269 (2026-09-21)
+## gamfit 0.1.270 (2026-09-22)
+
+0.1.269 was tagged on 2026-09-21 and never reached PyPI: its release run
+failed on the free-threaded cp314t wheel and the sdist, fixed since.
+
 
 - A Bernoulli marginal-slope prediction table carries `mean_score_derivative`
   (`d mean / dz`) and `probit_score_derivative` (`d probit(mean) / dz`), the
