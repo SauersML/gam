@@ -3698,10 +3698,51 @@ fn fit_expectile_laws(
             current[i] = projected;
         }
         if !moved {
-            return Err(generalized_failure(format!(
-                "the projected Newton step on {} free rows is null at the box boundary",
-                free.len()
-            )));
+            // The linearization is unusable here, and the complementarity
+            // problem still has a solution, so the step comes from the argument
+            // that proves it does.
+            //
+            // A free row sits at a box endpoint whose sign DISAGREES with its
+            // residual — that is what put it in the free set — and the Newton
+            // step `−rᵢ / (∂rᵢ/∂aᵢ)` points OUT of the box, so its projection is
+            // the point it started from. That says the tangent at the endpoint
+            // does not reach the root, not that no root exists: `rᵢ(aᵢ)` is
+            // continuous on `[lo, hi]` and takes opposite signs at `current[i]`
+            // and at `target_asymmetry[i]` (the endpoint the residual's sign now
+            // names), so by the intermediate value theorem the root the
+            // set-valued fixed point is defined by lies BETWEEN them.
+            //
+            // Bisecting that bracket needs no state of its own. Moving `aᵢ` to
+            // its midpoint and re-fitting recomputes `target_asymmetry[i]` from
+            // the new sign, and the next bracket `[current[i],
+            // target_asymmetry[i]]` is exactly the half the root is in: if the
+            // sign at the midpoint still names the far endpoint the root is
+            // beyond the midpoint, and if it flipped the root is behind it. The
+            // bracket therefore halves every iteration and `aᵢ` converges to the
+            // root, with acceptance unchanged — the KKT certificate at the top of
+            // the loop, whose defect on a fractional row is
+            // `(aᵢ − targetᵢ)·baseᵢ·rᵢ → 0` as `rᵢ → 0`.
+            //
+            // A free row whose endpoint AGREES with its residual sign is
+            // complementary already and is not bisected; its bracket is empty. If
+            // no free row disagrees, every one of them is interior with a matching
+            // target, which is the state the KKT gate above accepts, so a null
+            // step there is a genuine stall and still refuses.
+            let mut bisected = false;
+            for &i in &free {
+                if current[i] != target_asymmetry[i] {
+                    current[i] = 0.5 * (current[i] + target_asymmetry[i]);
+                    bisected = true;
+                }
+            }
+            if !bisected {
+                return Err(generalized_failure(format!(
+                    "the projected Newton step on {} free rows is null at the box boundary \
+                     and none of them brackets a sign change, so there is no \
+                     interval the complementarity root can lie in",
+                    free.len()
+                )));
+            }
         }
         weights = Arc::new(Array1::from_shape_fn(n, |i| base_weights[i] * current[i]));
     }

@@ -1,5 +1,24 @@
 ## Unreleased
 
+- **The expectile generalized fixed point refused a state whose root it could still bracket**
+  (gam#1561, gam#3504). When the LAWS sign map cycles, the Clarke fixed point of the subgradient
+  weight map hands the disagreeing rows to a projected Newton solve. A free row sits at a box
+  endpoint whose sign DISAGREES with its residual — that is what puts it in the free set — and
+  when the Newton step `−rᵢ/(∂rᵢ/∂aᵢ)` points OUT of the box its projection is the point it
+  started from, so `moved` stayed false and the fit raised. That says the tangent at the endpoint
+  does not reach the root, not that no root exists. `rᵢ(aᵢ)` is continuous on the asymmetry box
+  and takes opposite signs at `current[i]` and at the endpoint the residual's sign now names, so
+  the intermediate value theorem — the same argument the routine already cites for the fixed
+  point's existence — puts the root BETWEEN them. The null step now bisects that bracket, which
+  needs no state of its own: moving `aᵢ` to the midpoint and re-fitting recomputes the target
+  endpoint from the new sign, and the next bracket is exactly the half the root is in, so it
+  halves every iteration. Acceptance is untouched — the same KKT certificate, whose defect on a
+  fractional row is `(aᵢ − targetᵢ)·baseᵢ·rᵢ → 0` as `rᵢ → 0` — so a fit is still only ever
+  returned when it is certified. A free row whose endpoint agrees with its residual sign is
+  complementary already and is not bisected, and when no free row disagrees the step is a genuine
+  stall and still refuses, now saying that no interval can contain the root. Measured on the
+  heteroscedastic expectile band fixture: `tau=0.05` cycled at iteration 10 with cycle length 2
+  and one free row, at a KKT residual of 1.103e-6 against a scaled tolerance of 1.000e-10.
 - **The spline-scan scaling probe asserts the budget it can derive, not the flatness its own
   measurement refuted** (#2627). `certified_search_evaluation_count_does_not_grow_with_n_2627`
   argued that because the certified search's SUBDIVISION BUDGET is nearly flat in `n`, its
