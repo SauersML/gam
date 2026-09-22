@@ -1904,6 +1904,7 @@ mod certified_outer_result_tests;
 #[path = "multistart.rs"]
 mod multistart;
 pub use multistart::MultistartOutcome;
+pub use multistart::probe_face_for_a_lower_basin;
 
 /// Typed refusal from [`audit_stationary_point`]. The rejected point and every
 /// analytic certificate field measured before refusal remain available to the

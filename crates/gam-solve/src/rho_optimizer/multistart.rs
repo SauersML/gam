@@ -1211,8 +1211,95 @@ fn keep_best(values: impl IntoIterator<Item = Option<f64>>) -> Option<usize> {
 /// Whether a run certified at `value` displaces the incumbent certified at
 /// `incumbent`: only when it is lower by more than the rounding envelope of the
 /// two values (`outer_value_agreement_bound`), so a tie keeps the lower seed index.
+/// [`probe_face_for_a_lower_basin`] reads the same rule (#1561).
 fn displaces(incumbent: f64, value: f64) -> bool {
     incumbent - value > outer_value_agreement_bound(incumbent, value)
+}
+
+/// Whether an outer search ended at a certified optimum: converged, with a terminal
+/// certificate that certifies.
+fn certified_optimum(result: &OuterResult) -> bool {
+    result.converged()
+        && result
+            .criterion_certificate
+            .as_ref()
+            .is_some_and(|certificate| certificate.certifies())
+}
+
+/// Probe one face of a certified search's box for a lower basin, and search it when
+/// the probe proves one (#1561, #1464).
+///
+/// A certified optimum is a local minimum of its criterion, and a single search
+/// certifies whichever basin its start drains into. `criterion_at` reads the
+/// criterion — one inner solve — at the certified optimum and at `face`. A face value
+/// strictly below the optimum's is a point of the same criterion lower than a local
+/// minimum, so a lower basin exists by construction; `search_from` then runs a second
+/// certified search from the face, and keep-best ([`displaces`]) publishes the lower
+/// of the two certified optima. A face at or above the optimum proves nothing and
+/// changes nothing, and a face the inner solve refuses, or a second search that does
+/// not certify, leaves the first optimum published with the reason recorded.
+///
+/// `first` must itself be certified; an uncertified search has no optimum to compare,
+/// and is returned unprobed.
+pub fn probe_face_for_a_lower_basin<S>(
+    state: &mut S,
+    first: OuterResult,
+    face: Array1<f64>,
+    criterion_at: impl Fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
+    search_from: impl Fn(&mut S, Array1<f64>) -> Result<OuterResult, EstimationError>,
+) -> Result<(OuterResult, Option<crate::model_types::FaceProbe>), EstimationError> {
+    use crate::model_types::{FaceProbe, FaceSearch, FaceValue};
+    if !certified_optimum(&first) {
+        return Ok((first, None));
+    }
+    let certified_criterion = criterion_at(state, &first.rho)?;
+    let face_value = criterion_at(state, &face);
+    let face_record = match &face_value {
+        Ok(criterion) => FaceValue::Evaluated { criterion: *criterion },
+        Err(error) => FaceValue::Refused { reason: error.to_string() },
+    };
+    let (published, second_search) = match face_value {
+        Ok(criterion) if criterion < certified_criterion => match search_from(state, face.clone()) {
+            Ok(second) if certified_optimum(&second) => {
+                let published = displaces(first.final_value, second.final_value);
+                let record = FaceSearch::Certified {
+                    criterion: second.final_value,
+                    rho: second.rho.to_vec(),
+                    published,
+                };
+                (if published { second } else { first }, record)
+            }
+            Ok(second) => (
+                first,
+                FaceSearch::NotCertified {
+                    reason: format!(
+                        "the search from the face ended without a certificate after {} \
+                         iteration(s)",
+                        second.iterations
+                    ),
+                },
+            ),
+            Err(error) => (first, FaceSearch::NotCertified { reason: error.to_string() }),
+        },
+        _ => (first, FaceSearch::NotRun),
+    };
+    log::debug!(
+        "[OUTER] face probe: face {:?} criterion {:?} against the certified {:.9e}; second \
+         search {:?}",
+        face.as_slice().unwrap_or(&[]),
+        face_record,
+        certified_criterion,
+        second_search,
+    );
+    Ok((
+        published,
+        Some(FaceProbe {
+            face_rho: face.to_vec(),
+            face: face_record,
+            certified_criterion,
+            second_search,
+        }),
+    ))
 }
 
 #[cfg(test)]

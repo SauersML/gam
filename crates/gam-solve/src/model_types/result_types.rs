@@ -2608,6 +2608,48 @@ impl CovarianceDeclined {
     }
 }
 
+/// A check for a basin lower than the one a certified outer search reached
+/// (#1561, #1464), run by [`crate::rho_optimizer::probe_face_for_a_lower_basin`].
+///
+/// A certified optimum is a local minimum of its criterion. The criterion is
+/// read once, one inner solve, at a face of the search box: the standard REML
+/// path's least-penalized face, or the face opposite a railed curvature κ̂. A
+/// face value strictly below the certified optimum's is a point of the same
+/// criterion lower than a local minimum, so a lower basin exists, and a second
+/// certified search then runs from the face. The two certified optima are
+/// compared by the multistart's keep-best rule, and the lower is published.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FaceProbe {
+    /// The face the criterion was read at.
+    pub face_rho: Vec<f64>,
+    /// The criterion at the face, or why its inner solve refused it.
+    pub face: FaceValue,
+    /// The criterion at the first search's certified optimum.
+    pub certified_criterion: f64,
+    /// What the second search did.
+    pub second_search: FaceSearch,
+}
+
+/// The criterion at the probed face.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum FaceValue {
+    Evaluated { criterion: f64 },
+    /// The inner solve at the face refused; nothing is compared.
+    Refused { reason: String },
+}
+
+/// The search a lower face triggers.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum FaceSearch {
+    /// The face was not below the certified optimum, or was not evaluated.
+    NotRun,
+    /// The search from the face certified at `criterion`, at `rho`;
+    /// `published` when it displaced the first search's optimum.
+    Certified { criterion: f64, rho: Vec<f64>, published: bool },
+    /// The search from the face did not certify; the first optimum stands.
+    NotCertified { reason: String },
+}
+
 /// Post-fit artifacts needed by downstream diagnostics/inference without
 /// re-running PIRLS.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -2645,6 +2687,12 @@ pub struct FitArtifacts {
     /// gradient-free or an audit probe could not evaluate.
     #[serde(default)]
     pub criterion_certificate: Option<OuterCriterionCertificate>,
+    /// What the standard REML path's lower-face probe found after its first
+    /// certified search (#1561): the criterion at the least-penalized face of the
+    /// ρ domain, and whether a second search ran from there and which optimum was
+    /// published. `None` on every other route, and on a model that predates it.
+    #[serde(default)]
+    pub lower_face_probe: Option<FaceProbe>,
     /// What the Tier-0 marginal-smoothing (`ρ`-uncertainty) PSIS adequacy seam
     /// concluded (#938, #2627): the Pareto-`k̂` grade that says whether the
     /// plug-in + first-order `V_ρ` correction is adequate, or the typed reason it
@@ -2986,6 +3034,7 @@ impl std::fmt::Debug for FitArtifacts {
                 &self.survival_link_wiggle_degree,
             )
             .field("criterion_certificate", &self.criterion_certificate)
+            .field("lower_face_probe", &self.lower_face_probe)
             .field("rho_posterior", &self.rho_posterior)
             .field("rho_posterior_escalation", &self.rho_posterior_escalation)
             .field(

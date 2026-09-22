@@ -834,6 +834,8 @@ pub fn survival_fit_from_parts(
             survival_link_wiggle_knots: link_wiggle_knots,
             survival_link_wiggle_degree: link_wiggle_degree,
             criterion_certificate,
+            // Not the standard REML path, which alone probes the lower face.
+            lower_face_probe: None,
             // The survival location-scale fit never passes the REML evaluator's
             // post-fit adequacy seam.
             rho_posterior: gam_problem::rho_posterior::RhoPosteriorOutcome::NotComputed(

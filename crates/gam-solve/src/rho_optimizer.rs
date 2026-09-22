@@ -93,7 +93,10 @@ pub use run::OuterProblem;
 // above is `pub(crate)`) so the lifted gam-models fit-orchestration driver can
 // name `gam_solve::rho_optimizer::OuterResult` (#1521).
 pub use outer_measurement::OuterFirstOrderMeasurement;
-pub use run::{CertifiedOuterResult, MultistartOutcome, OuterResult, OuterResultOrigin};
+pub use run::{
+    CertifiedOuterResult, MultistartOutcome, OuterResult, OuterResultOrigin,
+    probe_face_for_a_lower_basin,
+};
 // Re-export the converged-via certificate vocabulary (#2235/#2241) so callers
 // that thread the termination verdict into their own payloads (gam-sae's
 // SaeOuterTermination) can name the variants.

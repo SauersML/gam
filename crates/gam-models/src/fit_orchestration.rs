@@ -178,6 +178,9 @@ mod smooth_lr_nested_null_tests;
 mod gaussian_reml_stall_edf_collapse_1788_tests;
 
 #[cfg(test)]
+mod gaussian_reml_lower_face_basin_1561_tests;
+
+#[cfg(test)]
 mod gaussian_reml_near_linear_offset_plateau_2299_tests;
 
 #[cfg(test)]

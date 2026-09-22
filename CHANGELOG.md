@@ -1,5 +1,13 @@
 ## Unreleased
 
+- **A standard REML fit checks the least-penalized face for a lower basin and searches it when
+  there is one** (#1561). A certified optimum is only a local minimum. On a basis that represents
+  a high-frequency signal only through its most-penalized directions, the derived start drained
+  to the λ → ∞ plateau and the fit predicted a constant (`gam_duchon_1d_matches_mgcv_ds`, truth
+  RMSE 0.706 against the signal's 0.707). After the first certified search the criterion is read
+  once at the least-penalized face; if it is below the certified optimum a second certified
+  search runs from there, and the lower of the two certified optima is published. The record is
+  `FitArtifacts::lower_face_probe`.
 - **The Duchon range floor's ψ-jet clamps exactly the modes the value clamps** (#2959, #2735). The
   jet carried its own `dim·1e-8·λ_max` floor after #2901 moved the value's floor to
   `100·dim·ε·λ_max`, so it clamped modes the value left alone and replaced their `λ'` with the

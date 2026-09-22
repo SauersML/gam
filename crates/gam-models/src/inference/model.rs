@@ -6556,6 +6556,7 @@ mod tests {
                 survival_link_wiggle_knots: None,
                 survival_link_wiggle_degree: None,
                 criterion_certificate: None,
+                lower_face_probe: None,
                 rho_posterior: Default::default(),
                 rho_posterior_escalation: None,
                 rho_covariance: None,

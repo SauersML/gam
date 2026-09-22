@@ -142,10 +142,14 @@ fn with_enclosing_attempt_ledger(
 /// into the model domain's envelope so no start sits on a face the search does
 /// not have (SPEC rule 20, #2902 row 9).
 ///
-/// There is exactly one start. A start that does not certify is continued by
-/// the certify-resume loop from its own checkpoint, and a certified saddle is
+/// One search has exactly one start. A start that does not certify is continued
+/// by the certify-resume loop from its own checkpoint, and a certified saddle is
 /// left along its negative-curvature direction; neither re-enters the search
-/// from an unrelated lattice point.
+/// from an unrelated lattice point. A second search runs only where a caller
+/// holds a proof that a lower basin exists: a custom family's declared
+/// multistart levels (gnomon#2359), and the standard REML path's least-penalized
+/// face when the criterion there is below the first search's certified optimum
+/// (#1561). A start's value is never used to rank or discard a start.
 pub(crate) fn outer_start_point(
     config: &OuterConfig,
     n_params: usize,

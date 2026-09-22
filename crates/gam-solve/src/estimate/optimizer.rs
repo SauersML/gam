@@ -9,6 +9,7 @@ use crate::estimate::prefit::{
 use gam_linalg::matrix::FactorizedSystem;
 use gam_linalg::roundoff::SymmetricAssembly;
 use gam_math::sparse_grid::CompensatedSum;
+use crate::model_types::FaceProbe;
 use gam_problem::OrderedRhoBounds;
 use gam_problem::dispersion_cov::se_from_covariance;
 use gam_problem::{NegbinRootDisplacementGap, NegbinThetaRootDisplacement};
@@ -1627,6 +1628,9 @@ where
     // later run of the standard arm is the corrected search continued from that
     // optimum, alone (#1082).
     let mut corrected_continuation = false;
+    // What the lower-face probe of the derived start's search found (#1561), for
+    // the fit's provenance; `None` where no search entered from the derived start.
+    let mut lower_face_probe: Option<FaceProbe> = None;
     // The Laplace optimum's exact analytic outer Hessian, bound to that
     // optimum: the corrected continuation's BFGS starts from its inverse.
     let mut continuation_curvature: Option<Array2<f64>> = None;
@@ -1753,8 +1757,10 @@ where
             let weight_log_geom_mean: f64 = reml_state.rho_weight_anchor();
             // The outer search enters from ONE deterministic, data-derived start
             // and the certified second-order search owns everything after it.
-            // No candidate is scored, ranked or restarted: a start-point cost is
-            // not a basin certificate, and a lattice of starts is a grid search.
+            // No candidate start is scored or ranked: a start-point cost is not a
+            // basin certificate, and a lattice of starts is a grid search. The one
+            // second search is the lower-face one below, which runs only on a
+            // proof that a lower basin exists (#1561).
             //
             // A caller-supplied full-length ρ (a warm start, a cached optimum, or
             // the Negative-Binomial alternation's previous ρ̂) is that start as
@@ -1806,19 +1812,31 @@ where
                 start_bounds.lower(),
                 start_bounds.upper(),
             );
-            let problem = problem.with_initial_rho(outer_start);
+            // Whether this is the fit's own first search, not a Negative-Binomial
+            // alternation round or the #784-corrected continuation, each of which
+            // starts from an earlier round's certified optimum: only the first search
+            // is probed for a lower basin below.
+            let first_round = negbin_rho_seed.is_none();
+            let first_problem = problem.clone().with_initial_rho(outer_start);
             // Attach the outer-loop cache session. The session shares its
             // realized-fit-context key with the inner beta record (different
             // payload namespace), so a SIGKILL mid-outer-iter leaves both the
             // last accepted β (inner record) and the best rho seen so far
-            // (outer iterate) on disk for the next run.
-            let problem = match reml_state.outer_cache_session() {
-                Some(session) => problem.with_cache_session(session),
-                None => problem,
+            // (outer iterate) on disk for the next run. It belongs to this one
+            // search; a lower-face search below runs without it.
+            let first_problem = match reml_state.outer_cache_session() {
+                Some(session) => first_problem.with_cache_session(session),
+                None => first_problem,
             };
 
-            let obj = problem.build_objective_with_eval_order(
-                &mut reml_state,
+            // One certified search of the standard REML criterion from `search`'s
+            // start, on this fit's REML state.
+            let run_search = |state: &mut crate::estimate::reml::RemlState<'_>,
+                              search: &OuterProblem|
+             -> Result<crate::rho_optimizer::OuterResult, EstimationError> {
+
+            let obj = search.build_objective_with_eval_order(
+                state,
                 |state: &mut &mut crate::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
                     state.compute_cost(rho)
                 },
@@ -1889,8 +1907,33 @@ where
             // bitwise-matching outer seed that owns the cached vector.
             let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
 
-            let strategy_result = problem.run(&mut obj, "standard REML")?;
+            let result = search.run(&mut obj, "standard REML");
             drop(obj);
+            result
+            };
+            let first = run_search(&mut reml_state, &first_problem)?;
+            // #1561: a certified optimum is a local one, and the criterion can have
+            // another basin the derived start never reaches — the REML criterion of
+            // a basis that can represent a high-frequency signal only through its
+            // most-penalized directions rises from the least-penalized face to a
+            // ridge and falls again to a λ → ∞ plateau, and `initial.sp` starts on
+            // the plateau's side. So the least-penalized face is probed, one inner
+            // solve, and searched only when it is below the certified optimum
+            // (`rho_optimizer::probe_face_for_a_lower_basin`, the rule every
+            // face probe shares).
+            let strategy_result = if first_round && k > 0 {
+                let (published, probe) = crate::rho_optimizer::probe_face_for_a_lower_basin(
+                    &mut reml_state,
+                    first,
+                    rho_model_domain.0.clone(),
+                    |state, rho| state.compute_cost(rho),
+                    |state, start| run_search(state, &problem.clone().with_initial_rho(start)),
+                )?;
+                lower_face_probe = probe;
+                published
+            } else {
+                first
+            };
             let accepted_rho = strategy_result.rho.clone();
             (
                 accepted_rho,
@@ -4553,6 +4596,7 @@ where
         artifacts: FitArtifacts {
             pirls: Some(pirls_res),
             criterion_certificate: outer_result.criterion_certificate.clone(),
+            lower_face_probe,
             rho_posterior,
             rho_posterior_escalation,
             rho_covariance,
