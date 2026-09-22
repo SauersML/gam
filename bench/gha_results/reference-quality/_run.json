@@ -3,12 +3,12 @@
   "publish_job_status": "failure",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
   "publish_job_failed_steps": "step 5: Gate the suite on the merged outcomes",
-  "run_id": "35672147775",
-  "run_number": "614",
+  "run_id": "35718467357",
+  "run_number": "617",
   "run_attempt": "1",
-  "event": "workflow_dispatch",
+  "event": "schedule",
   "ref": "refs/heads/main",
-  "sha": "3561ea002605f97c9ddaebe108e806723820bd6a",
-  "completed_utc": "2026-09-22T01:21:34Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/35672147775"
+  "sha": "e5f9da6ba1641c489e283b5df6c183d64156ff0f",
+  "completed_utc": "2026-09-22T11:57:44Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/35718467357"
 }
