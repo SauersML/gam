@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
 from scipy.sparse import issparse
@@ -15,7 +15,12 @@ from sklearn.utils.validation import (
 )
 
 from ._binding import rust_module
-from ._exceptions import NotFittedError
+if TYPE_CHECKING:
+    # The stub declares the class; `_exceptions` binds it from the loaded
+    # extension module, which mypy reads as a variable and so not as a base.
+    from ._rust import NotFittedError
+else:
+    from ._exceptions import NotFittedError
 from ._api import fit as fit_model
 from ._api import is_multinomial_family
 from ._model import Model, MultinomialModel

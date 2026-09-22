@@ -161,7 +161,8 @@ class PartialEffect:
         if name not in _SERIES:
             raise ValueError(f"surface: unknown series {name!r}; choose one of {list(_SERIES)}")
         shape = tuple(len(values) for values in self.axis_values)
-        return getattr(self, name).reshape(shape)
+        series: np.ndarray = getattr(self, name)
+        return series.reshape(shape)
 
 
 _SERIES = ("fit", "se", "lower", "upper", "simultaneous_lower", "simultaneous_upper")

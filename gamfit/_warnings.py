@@ -19,6 +19,7 @@ import os
 import sys
 import warnings
 from typing import Iterable
+from types import FrameType
 
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
 
@@ -42,7 +43,7 @@ def _stacklevel_outside_package() -> int:
     package makes the warning point at the user's line whatever gamfit entry
     point (``fit``, ``fit_array``, an estimator wrapper) sits in between.
     """
-    frame = sys._getframe(1)
+    frame: FrameType | None = sys._getframe(1)
     level = 1
     while frame is not None and os.path.abspath(frame.f_code.co_filename).startswith(
         _PACKAGE_DIR

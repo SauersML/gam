@@ -26,7 +26,6 @@ def model(
     model: "Model",
     data: Any,
     *,
-    x: str | None = None,
     y: str | None = None,
     interval: float | None = 0.95,
     kind: str = "prediction",
@@ -35,11 +34,15 @@ def model(
     """Plot a fitted model on ``data`` and return the matplotlib axes.
 
     ``kind`` is one of ``"prediction"``, ``"residuals"`` or
-    ``"observed_vs_predicted"``.
+    ``"observed_vs_predicted"``. A prediction plot is drawn against the data's
+    one feature column, as :meth:`gamfit.Model.plot` does; a model with several
+    features is drawn term by term with ``model.plot_terms()``. There is no
+    ``x=``: the helper stopped taking one when the prediction plot was tied to
+    the sole feature, and passing it raised ``TypeError`` on every call.
     """
     from ._diagnose_plot import plot as _plot
 
-    return _plot(model, data, x=x, y=y, interval=interval, kind=kind, ax=ax)
+    return _plot(model, data, y=y, interval=interval, kind=kind, ax=ax)
 
 
 def trace(

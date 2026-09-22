@@ -260,6 +260,11 @@ def _point_payload_spec(
         return probs, table_columns
 
     if point_shape == "expectile_curves":
+        if point_columns is None:
+            raise ValueError(
+                "an expectile_curves prediction must name its point_columns; the Rust payload "
+                "carried none"
+            )
         curves = rust_module().column_stack_f64([columns[name] for name in point_columns])
         return curves, columns
 

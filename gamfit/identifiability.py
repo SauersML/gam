@@ -41,12 +41,40 @@ import math
 import re
 import warnings
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from ._api import conditional_prior_ivae, derive_ivae_aux_scale, mechanism_sparsity_jacobian
 from ._binding import rust_module
+
+if TYPE_CHECKING:
+    from ._rust import FitConvergenceError
+else:
+    from ._exceptions import FitConvergenceError
+
+
+class IdentifiableFactorFitConvergenceError(FitConvergenceError):
+    """:class:`gamfit.errors.FitConvergenceError` from ``identifiable_factor_fit``,
+    carrying the certificate that failed and a checkpoint to resume from.
+
+    A subclass rather than attributes set on the base instance, so the fields
+    are declared: ``grad_inf`` is the returned parameters' ``‖∇f‖∞``,
+    ``grad_inf_init`` the starting one, ``grad_tol`` the relative tolerance the
+    certificate compared them against, ``max_evals`` and ``n_iter`` the budget
+    and the L-BFGS iterations spent, ``objective_value`` the loss there, and the
+    two ``checkpoint_*`` fields the encoder state dict and decoder weights.
+    Callers catching ``FitConvergenceError`` still catch it.
+    """
+
+    grad_inf: float
+    grad_inf_init: float
+    grad_tol: float
+    max_evals: int
+    n_iter: int
+    objective_value: float
+    checkpoint_encoder_state: dict[str, np.ndarray]
+    checkpoint_decoder: np.ndarray
 
 __all__ = [
     "IdentifiabilityReport",
@@ -671,9 +699,7 @@ def _one_fit(
     grad_inf = _flat_grad_inf(params)
     objective_value = float(loss.detach().cpu().item())
     if not (math.isfinite(grad_inf) and math.isfinite(objective_value) and grad_inf <= target):
-        from ._exceptions import FitConvergenceError
-
-        exc = FitConvergenceError(
+        exc = IdentifiableFactorFitConvergenceError(
             "identifiable_factor_fit did not reach a stationary point: "
             f"‖∇f‖∞ = {grad_inf:.3e} > grad_tol·‖∇f(θ₀)‖∞ = "
             f"{float(grad_tol):.1e}·{grad_inf_init:.3e} after {n_iter} L-BFGS "
