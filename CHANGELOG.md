@@ -51,6 +51,35 @@
   to the dense backend. This also retracts a claim made when the log barrier was gated off: the
   barrier's remaining consumer was not the sparse-exact backend, which no constrained fit reaches,
   but exactly these box-bounded fits. With them on the term it has none.
+- **The honest full-conformal map re-selects the smoothing strength for Poisson too, by walking
+  the levels instead of the score coordinate** (#4103). The GLM full-conformal sets under-covered at
+  small n because the penalty was frozen at the training fit, a map that is not symmetric in the
+  n + 1 augmented points once a strength was selected from the n training responses; the 1000-rep
+  benchmark measured 0.8912 for Poisson at n = 30 against a 0.9009 single-ridge control, and those
+  rows were labelled `conformal_certificate = -7` (`refused:glm_frozen_penalty`). Bernoulli already
+  re-selected `ρ̂(z)` per level. The count families could not take the same route because
+  `count_set` bisects the test-SCORE coordinate with `Augmentation::Tilt(s)`: it is a single frozen
+  penalty that makes `z ↦ u_*` monotone, which is what gives a score interval a count image and
+  lets one solve decide a whole run of counts. Re-selecting per level gives every level its own
+  penalty and its own score map, so neither the bracket nor the monotonicity survives. The honest
+  count set is now walked level by level, one certified outer selection and one certified solve
+  each, and the family-specific half of the criterion is one function: `weight_jet` returns the
+  IRLS curvature and its two η-derivatives, `(σ(η)σ(−η), w(1−2μ), w(1−6w))` for Bernoulli-logit and
+  `(μ, μ, μ)` for Poisson-log, where `μ = e^η` is its own derivative. The walk closes on a bound
+  that does not mention the penalty: at any augmented fit whose intercept column is unpenalised the
+  intercept KKT row reads `Σ_i u_i + u_* = 0` and `u_i = y_i − μ_i < y_i`, so the existing
+  `count_score_tail` bound holds at every strength and a level whose own fit puts `|u_*|` past it
+  is a non-member whatever strength that fit selected. What re-selection removes is the guarantee
+  that no LARGER level returns, so the walk never truncates on it: it is bounded by the first level
+  the frozen substrate's own score carries to that tail, and a walk still open there returns the
+  whole support, the conservative answer this module already gives where no tail is provable.
+  **Behavior change:** a Poisson-log fit that selected exactly one smoothing strength now reports
+  `ConformalCertificate::HonestRefit` instead of the `-7` refusal, and more than one strength
+  reports `refused:multi_penalty` rather than `refused:glm_frozen_penalty`, so the two reasons are
+  no longer conflated. The Gamma dispersion and the negative-binomial θ are themselves estimated
+  from the responses, so re-selecting the strength alone would move that asymmetry rather than
+  remove it, and those families keep the frozen-penalty refusal.
+
 - **A memory-budget refusal names the reservation that refused it** (#4565). The governor's
   ledger is process-wide, so `MemoryReservationError::BudgetExceeded` reported how many bytes
   were reserved without saying whose they were. A caller refused because a neighbour holds the
