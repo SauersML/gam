@@ -15721,3 +15721,10 @@ publish paths.
 - The #4492 parity test names `bs='ps'` in both arms. Its Rust arm fitted `y ~ te(x1, x2)`
   with a `TensorBSpline` override, which is a cr tensor, so the test compared two
   different models.
+### Changed
+
+- The three `tests/torch/test_smooth_api.py` smooth-API tests for `Matern` and
+  `TensorBSpline` assert the `NotImplementedError` the torch fit now raises, instead of
+  the successful fit they asserted while the torch path built its own penalty. That
+  penalty was the divergence gam#4492 removed, so the old assertions were measuring a
+  model `gamfit.fit` does not fit (#4492, #1561).

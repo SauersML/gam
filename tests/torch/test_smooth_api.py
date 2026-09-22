@@ -178,39 +178,74 @@ def test_fit_two_periodic_splines_uses_identified_chart_and_lifts_coefficients()
         )
 
 
-def test_matern_fit_single_1d():
-    """Matern tensor backend is wired (#1105): kernel design vs centers, RKHS
-    covariance-Gram penalty. The fit must produce finite coefficients and a
-    fitted vector matching the response shape."""
+def test_matern_fit_refuses_until_the_block_backend_takes_a_penalty_list():
+    """`gt.fit` refuses a Matern term, and that refusal is the #4492 contract.
+
+    This used to assert a successful fit with one coefficient per centre and
+    an R^2 floor. It passed because the torch path built its OWN penalty --
+    the raw symmetrised covariance Gram `K_cc` on the raw kernel columns under
+    a single lambda -- which is not the penalty `gamfit.fit` prices for the
+    same spec. 047b45f06d routed the realization through the term builder, so
+    the Matern term now arrives with the nu-gated collocation operator
+    candidates, several of them, one smoothing parameter each.
+
+    `gaussian_reml_fit_blocks_exact` prices `P = blockdiag(lambda_k S_k)`, one
+    lambda per COEFFICIENT BLOCK. Several penalties on one block have no
+    coordinate in that criterion, and summing them under a single lambda is
+    exactly the divergence #4492 exists to remove, so the fit refuses (step 2
+    of the issue is the block API taking a penalty list per block).
+
+    The old assertions cannot be restored as they were: the realized design is
+    the builder's, through the kernel identifiability chart, so its width is
+    not the centre count either.
+
+    WHEN THIS REFUSAL STOPS, this test fails, and that failure is the
+    instruction to replace this body with the fit and the parity assertions in
+    `tests/torch/test_torch_penalty_parity_with_rust_4492.py`, which already
+    carry the bar the parity is stated in.
+    """
     t, y = _inputs(n=20)
     centers = _centers(6)
-    res = gt.fit(t, y, gt.Matern(centers=centers, nu=1.5, length_scale=1.0))
-
-    # One coefficient per center, single output column.
-    assert res.coefficients.shape == (6, 1)
-    assert res.fitted.shape == (20, 1)
-    assert torch.isfinite(res.coefficients).all()
-    assert torch.isfinite(res.fitted).all()
-    # The kernel ridge must actually track the smooth target, not collapse.
-    y2d = y.unsqueeze(1)
-    ss_res = ((res.fitted - y2d) ** 2).sum()
-    ss_tot = ((y2d - y2d.mean()) ** 2).sum()
-    assert float(ss_res / ss_tot) < 0.5
+    with pytest.raises(NotImplementedError) as refusal:
+        gt.fit(t, y, gt.Matern(centers=centers, nu=1.5, length_scale=1.0))
+    assert "penalt" in str(refusal.value).lower(), (
+        "Matern refused, but not for the several-penalties reason this test "
+        f"is about: {refusal.value}"
+    )
 
 
-def test_matern_fit_autograd_flows_to_points():
-    """The Matern design carries the input-location VJP back to ``points``
-    (the scalar-kernel autograd path), so a scalar of the fitted values has a
-    finite, non-zero gradient w.r.t. the input coordinates."""
+def test_matern_fit_no_longer_carries_autograd_back_to_points():
+    """The input-location VJP through a Matern design is WITHDRAWN (#4492).
+
+    This used to assert a finite non-zero gradient of the fitted values with
+    respect to `points`. That held only while the torch path built the design
+    itself as a torch expression of the inputs. 047b45f06d takes the design
+    from the term builder, because a penalty is meaningful only in the chart
+    its design is expressed in, and that chart -- the joint-null rotation, the
+    term's identifiability transform, any unabsorbed global orthogonality, and
+    the affine parametric residualization -- is not a right-multiplication the
+    torch side could apply without reimplementing the thing the entry exists
+    to stop duplicating.
+
+    So there is no autograd path back to `points` for an engine-routed term,
+    by construction and not by accident. Today the fit refuses before the
+    question arises, and the refusal is what is asserted.
+
+    WHEN THE REFUSAL STOPS, this test fails. The replacement is NOT the old
+    assertion: it is that `torch.autograd.grad(res.fitted.sum(), t)` raises,
+    or returns a gradient that is None, because `points` is not in the graph.
+    Restoring the old assertion would mean restoring a torch-built design, and
+    with it the divergence.
+    """
     t, _y = _inputs(n=20)
     t = t.clone().requires_grad_(True)
     y = torch.sin(3.0 * t.detach())
-    res = gt.fit(t, y, gt.Matern(centers=_centers(6), nu=1.5, length_scale=1.0))
-    loss = res.fitted.sum()
-    (grad,) = torch.autograd.grad(loss, t)
-    assert grad.shape == t.shape
-    assert torch.isfinite(grad).all()
-    assert float(grad.abs().sum()) > 0.0
+    with pytest.raises(NotImplementedError) as refusal:
+        gt.fit(t, y, gt.Matern(centers=_centers(6), nu=1.5, length_scale=1.0))
+    assert "penalt" in str(refusal.value).lower(), (
+        "Matern refused, but not for the several-penalties reason this test "
+        f"is about: {refusal.value}"
+    )
 
 
 def _tensor_bspline_inputs(n=200, seed=1):
@@ -225,10 +260,35 @@ def _tensor_bspline_inputs(n=200, seed=1):
     return points, y
 
 
-def test_tensorbspline_fit_te_2d():
-    """TensorBSpline (te) tensor backend is wired (#1105): Khatri-Rao design
-    over both marginal B-spline bases, Kronecker-sum tensor penalty. The fit
-    must recover the interaction target on a 2D (x, z) input."""
+def test_tensorbspline_fit_te_2d_refuses_one_lambda_per_margin():
+    """`gt.fit` refuses a te term, one realized penalty per margin (#4492).
+
+    This used to assert a successful fit whose coefficient count is the
+    product of the two marginal column counts. It passed because the torch
+    path built its own tensor penalty, summing `I (x) S_a (x) I` over the
+    margins under ONE lambda. The term builder emits one candidate per margin,
+    each measured by its neighbours' FUNCTION Grams rather than by their
+    coefficients, and each normalized first -- a different model, with a
+    different number of smoothing parameters.
+
+    Two margins therefore realize two penalties on one coefficient block, and
+    the block criterion prices one lambda per block, so the fit refuses.
+
+    The old coefficient-count assertion could not be restored either: the
+    realized design is the builder's identifiable block, not the raw
+    Khatri-Rao product.
+
+    DEPENDS ON `fix/4492-2`. Without it the term this fit lowers is a bare
+    `te(x0, x1)`, whose margins are natural cubic regression splines, and the
+    explicit knot VECTOR below is refused first, with "an explicit knot vector
+    cannot replace the value knots of a natural cubic regression spline" --
+    a different refusal, raised as a different exception type. If this test
+    fails with that message, 4492-2 has not landed and this file is not what
+    is wrong.
+
+    WHEN THE REFUSAL STOPS, replace this body with the fit and the parity
+    assertions in `test_torch_penalty_parity_with_rust_4492.py`.
+    """
     points, y = _tensor_bspline_inputs()
     # An explicit knot tensor is the FULL knot vector, so a cubic basis needs
     # its boundary knots repeated to cover the data on [0, 1]. The bare grid
@@ -241,39 +301,21 @@ def test_tensorbspline_fit_te_2d():
             torch.ones(3, dtype=torch.float64),
         ]
     )
-    res = gt.fit(
-        points,
-        y,
-        gt.TensorBSpline(
-            marginals=[
-                gt.BSpline(knots=knots, degree=3),
-                gt.BSpline(knots=knots, degree=3),
-            ],
-        ),
+    with pytest.raises(NotImplementedError) as refusal:
+        gt.fit(
+            points,
+            y,
+            gt.TensorBSpline(
+                marginals=[
+                    gt.BSpline(knots=knots, degree=3),
+                    gt.BSpline(knots=knots, degree=3),
+                ],
+            ),
+        )
+    assert "penalt" in str(refusal.value).lower(), (
+        "te refused, but not for the several-penalties reason this test is "
+        f"about: {refusal.value}"
     )
-
-    # Coefficient space is the tensor product of the two marginal bases: its
-    # size is the product of each marginal B-spline's column count. Derive the
-    # marginal column count from the basis itself (avoids hardcoding the
-    # open-knot convention) and assert the Kronecker dimension.
-    from gamfit.torch._basis import bspline_basis as _bspline_basis
-
-    marg_cols = _bspline_basis(
-        points[:, 0], knots, degree=3, periodic=False,
-    ).shape[1]
-    assert marg_cols > 1
-    assert res.coefficients.dim() == 2
-    assert res.coefficients.shape[1] == 1
-    assert res.coefficients.shape[0] == marg_cols * marg_cols
-    assert res.fitted.shape == (points.shape[0], 1)
-    assert torch.isfinite(res.coefficients).all()
-    assert torch.isfinite(res.lambdas).all()
-    # The interaction surface must actually be tracked (additive s(x)+s(z)
-    # cannot represent sin(x)cos(z); the te must beat the variance floor).
-    y2d = y.unsqueeze(1)
-    ss_res = ((res.fitted - y2d) ** 2).sum()
-    ss_tot = ((y2d - y2d.mean()) ** 2).sum()
-    assert float(ss_res / ss_tot) < 0.6
 
 
 def test_tensorbspline_dim_mismatch_rejected():
