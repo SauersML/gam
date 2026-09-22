@@ -361,69 +361,112 @@ fn scan_routed_fit_recovers_truth_at_least_as_well_as_dense_path() {
     );
 }
 
-/// #1030 benchmark + no-regression certificate at biobank scale: the scan
-/// fits a single 1-D Gaussian smooth at n = 1e6 in O(n) wall-clock and
-/// recovers the known truth — the regime where the dense design/Gram/REML
-/// route is impractical (O(n·k²) per λ-trial). Timing is logged, not gated
-/// (shared-runner wall-clock is noisy); the HARD assertions are (a) the cost
-/// scales sub-quadratically from 1e5 → 1e6 (proves O(n), not O(n²)), (b)
-/// truth recovery within the injected noise, and (c) a sane EDF. The headline
-/// scan-vs-dense ratio is recorded on the issue from the large-scale run.
+/// #1030, #2627: the scan recovers the truth at the largest size this lane can
+/// run, and reports a sane EDF there.
+///
+/// # What this test used to assert, and why it no longer does
+///
+/// It fitted `n = 1e5` and `n = 1e6` and gated `t_big <= 30 * t_small` as a
+/// sub-quadratic check, under the name `..._scales_linearly_...`. Three things
+/// were wrong with that and #2627 measured all of them.
+///
+/// **The fit is not linear.** Its cost is `evaluations x O(n)`, and the left
+/// factor is not flat: the certified log-lambda search spends
+/// `411.7 + 5.67*sqrt(n)` criterion evaluations, measured across two disjoint
+/// size ranges agreeing on the coefficient to 5%. Per evaluation the cost is
+/// cleanly linear, exponent `0.994`. The fit is therefore `n^1.5`. The
+/// attribution names the mechanism: the growth is the dominated-cell census of
+/// the subdivision search, not its enclosure.
+///
+/// **The bar admitted the defect.** On that law the ratio from `1e5` to `1e6` is
+/// `27.6` against a bar of `30`, so the test passed with 8% to spare while the
+/// cost was superlinear, and its comment attributed the slack to a logarithmic
+/// search overhead that is really the square-root census.
+///
+/// **The sizes could not run.** One fit at `n = 1e5` is about 4.5 hours and at
+/// `n = 1e6` about 123 hours, from a law that reproduces the three measured
+/// wall-clocks to within 2%.
+///
+/// The deterministic content — how the evaluation count grows — is now asserted
+/// directly against the search's own subdivision budget in
+/// `certified_search_evaluation_count_stays_inside_its_subdivision_budget_2627`
+/// (`gam-solve`, about 285 s). A deterministic assertion on the mechanism beats
+/// a wall-clock ratio in a shared binary, which measures the machine as much as
+/// the code. Nothing here times anything.
+///
+/// # What it asserts now
+///
+/// Truth recovery and the EDF, at `n = 4_000`: the largest size that stays well
+/// inside the per-test cap, at about 230 s measured. The recovery bar is
+/// match-or-beat against the dense reduced-rank path on the same formula, the
+/// shape `scan_routed_fit_recovers_truth_at_least_as_well_as_dense_path` already
+/// uses, which needs no absolute constant. The retired `mse < 1e-3` was chosen
+/// for `n = 1e6` and does not transfer: the variance floor `sigma^2*edf/n`, with
+/// the fixture's injected `sigma^2 = 0.0075` and an EDF near 50, is `9.4e-5` at
+/// `n = 4_000` against `3.8e-7` at `n = 1e6`, so an absolute bar would have to
+/// move with `n` while a match-or-beat does not.
+///
+/// This is not biobank scale, and it does not claim to be. That the scan cannot
+/// be exercised at biobank scale in any lane until the evaluation count is fixed
+/// is the finding, recorded on #2627, not something for a bar to paper over.
 #[test]
-fn spline_scan_million_row_fit_scales_linearly_and_recovers_truth() {
+fn spline_scan_recovers_truth_and_a_sane_edf_at_scale() {
     init_parallelism();
+    const N: usize = 4_000;
     let cfg = gaussian_config();
+    let (x, y) = training_xy(N);
+    let data = encode_xy(&x, &y);
 
-    let time_fit = |n: usize| -> (f64, gam::solver::spline_scan::SplineScanFit) {
-        let (x, y) = training_xy(n);
-        let data = encode_xy(&x, &y);
-        let start = std::time::Instant::now();
-        let fit = fit_spline_scan_from_formula(SCAN_FORMULA, &data, &cfg)
-            .expect("scan-routed fit")
-            .expect("detection must fire for a single 1-D single-penalty Gaussian smooth");
-        (start.elapsed().as_secs_f64(), fit)
-    };
+    let scan = fit_spline_scan_from_formula(SCAN_FORMULA, &data, &cfg)
+        .expect("scan-routed fit")
+        .expect("detection must fire for a single 1-D single-penalty Gaussian smooth");
 
-    let (t_small, _) = time_fit(100_000);
-    let (t_big, fit) = time_fit(1_000_000);
-    eprintln!(
-        "[spline-scan bench] n=1e5: {t_small:.4}s | n=1e6: {t_big:.4}s | ratio={:.2} (linear ≈ 10)",
-        t_big / t_small.max(1e-9)
-    );
+    // The dense reduced-rank estimator on the identical formula, as the
+    // match-or-beat baseline. It bypasses the auto-route so the comparison is
+    // between two estimators of the same model, not the scan against itself.
+    let dense = dense_reference_fit(SCAN_FORMULA, &data, &cfg);
 
-    // Sub-quadratic scaling: a 10× n increase costs far less than 100× (the
-    // O(n²) dense-Gram blowup). Generous bound absorbs runner noise and the
-    // O(log) golden-section λ-search overhead while still excluding O(n²).
-    assert!(
-        t_big <= 30.0 * t_small.max(1e-6),
-        "scan cost grew super-linearly from n=1e5 ({t_small:.4}s) to n=1e6 ({t_big:.4}s)"
-    );
-
-    // Truth recovery at n=1e6 against the self-constructed truth (#904 style):
-    // the injected noise has half-range 0.15 (variance ≈ 0.0075), and with 1e6
-    // observations the smooth is resolved far tighter than the per-point noise.
     let grid: Vec<f64> = (0..200).map(|i| 0.02 + 0.96 * i as f64 / 199.0).collect();
-    let mut sse = 0.0;
-    for &t in &grid {
-        let (mean, var) = fit.predict(t).expect("scan predict at scale");
+    let mut dense_design = Array2::<f64>::zeros((grid.len(), 2));
+    for (i, &t) in grid.iter().enumerate() {
+        dense_design[[i, 0]] = t;
+    }
+    let design = build_term_collection_design(dense_design.view(), &dense.resolvedspec)
+        .expect("dense predict design rebuild");
+    let dense_pred = design.design.apply(&dense.fit.beta).to_vec();
+
+    let mut scan_sse = 0.0;
+    let mut dense_sse = 0.0;
+    for (i, &t) in grid.iter().enumerate() {
+        let truth = truth_fn(t);
+        let (mean, var) = scan.predict(t).expect("scan predict at scale");
         assert!(
             mean.is_finite() && var.is_finite() && var > 0.0,
             "scan prediction must be finite with positive variance at x={t}"
         );
-        sse += (mean - truth_fn(t)) * (mean - truth_fn(t));
+        scan_sse += (mean - truth) * (mean - truth);
+        dense_sse += (dense_pred[i] - truth) * (dense_pred[i] - truth);
     }
-    let mse = sse / grid.len() as f64;
-    assert!(
-        mse < 1e-3,
-        "scan fails truth recovery at n=1e6: MSE={mse} (truth is noise-free)"
+    let scan_mse = scan_sse / grid.len() as f64;
+    let dense_mse = dense_sse / grid.len() as f64;
+    let edf = scan.edf();
+    eprintln!(
+        "[spline-scan scale] n={N} scan MSE={scan_mse:.6e} dense MSE={dense_mse:.6e} edf={edf:.3}"
     );
 
-    // EDF must exceed the unpenalized null-space dimension (2) and stay well
-    // below n — a real smooth was fit, not the linear trend or an interpolant.
-    let edf = fit.edf();
+    // Match-or-beat the dense reduced-rank path on the same formula, at a size
+    // where both estimators are solvable.
     assert!(
-        edf > 2.0 && edf < 1_000.0,
-        "scan EDF {edf} outside the sane band (2, 1000) for a smooth biobank-scale fit"
+        scan_mse <= 1.10 * dense_mse + 1e-12,
+        "scan-routed fit worse than dense path at n={N}: scan MSE={scan_mse}, dense MSE={dense_mse}"
+    );
+
+    // A real smooth was fit: above the unpenalized null-space dimension and far
+    // below the row count, so neither the linear trend nor an interpolant.
+    assert!(
+        edf > 2.0 && edf < N as f64 / 4.0,
+        "scan EDF {edf} outside the sane band (2, {}) at n={N}",
+        N as f64 / 4.0
     );
 }
 
