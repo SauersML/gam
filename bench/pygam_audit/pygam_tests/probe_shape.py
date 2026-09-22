@@ -9,7 +9,8 @@ import pandas as pd
 
 A = "/tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/audit/pygam_tests"
 import pygam.datasets.load_datasets as _L
-_L.PATH = A + "/data"
+from pg_helpers import dataset_dir
+_L.PATH = dataset_dir()
 from pygam import datasets as _ds
 X, y = _ds.hepatitis(return_X_y=True)
 d = {"x": X[:, 0].astype(float), "y": np.asarray(y, float)}

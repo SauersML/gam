@@ -12,7 +12,8 @@ sys.path.insert(0, HERE)
 from pg_helpers import eta_of, intercept, pdep  # noqa: E402
 import pygam.datasets.load_datasets as _L  # noqa: E402
 
-_L.PATH = os.path.join(HERE, "data")
+from pg_helpers import dataset_dir  # noqa: E402
+_L.PATH = dataset_dir()
 from pygam import datasets as _ds  # noqa: E402
 import gamfit  # noqa: E402
 

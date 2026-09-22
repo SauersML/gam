@@ -4,7 +4,8 @@ import numpy as np
 warnings.simplefilter("ignore")
 HERE = os.path.dirname(os.path.abspath(__file__))
 import pygam.datasets.load_datasets as _L
-_L.PATH = os.path.join(HERE, "data")
+from pg_helpers import dataset_dir  # noqa: E402
+_L.PATH = dataset_dir()
 from pygam import datasets as _ds
 import gamfit
 X, y = _ds.default(return_X_y=True)

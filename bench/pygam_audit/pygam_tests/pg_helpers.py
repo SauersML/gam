@@ -6,9 +6,41 @@ works only when the test directory is on ``sys.path``. Under pyproject's
 ``bench.pygam_audit.pygam_tests.pg_helpers``, the package path the Python Contracts
 bench step provides, and the probe scripts beside them import ``pg_helpers`` directly.
 """
+import atexit
+import functools
+import gzip
 import inspect
+import os
+import shutil
+import tempfile
 
 import numpy as np
+
+_DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+
+@functools.cache
+def dataset_dir() -> str:
+    """The directory pyGAM's loaders read, with every vendored dataset as a plain CSV.
+
+    ``data/`` holds each CSV as pyGAM v0.12.0 ships it, except ``default.csv``, which is
+    stored as ``default.csv.gz``: its 10000 rows and header are one line over the
+    repository's limit on tracked files (#780). pyGAM's loaders read ``PATH/<name>.csv``
+    as plain text, so this builds the directory once per process: plain CSVs are linked
+    and each ``.csv.gz`` is decompressed beside them, byte for byte.
+    """
+    target = tempfile.mkdtemp(prefix="pygam_data_")
+    atexit.register(shutil.rmtree, target, True)
+    for name in os.listdir(_DATA):
+        source = os.path.join(_DATA, name)
+        if name.endswith(".csv"):
+            os.symlink(source, os.path.join(target, name))
+        elif name.endswith(".csv.gz"):
+            with gzip.open(source, "rb") as packed, open(
+                os.path.join(target, name[: -len(".gz")]), "wb"
+            ) as plain:
+                shutil.copyfileobj(packed, plain)
+    return target
 
 
 def pdep(model, term, data, grid=None, n_points=100):

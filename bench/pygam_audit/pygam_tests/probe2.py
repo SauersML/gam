@@ -1,6 +1,6 @@
 import numpy as np, time, gamfit, warnings
 warnings.simplefilter("ignore")
-import pygam.datasets.load_datasets as L; L.PATH='data'
+import pygam.datasets.load_datasets as L; from pg_helpers import dataset_dir; L.PATH=dataset_dir()
 from pygam.datasets import mcycle
 X,y=mcycle(return_X_y=True)
 d={"x":X[:,0].astype(float),"y":np.asarray(y,float)}
