@@ -49,12 +49,47 @@ pub(super) enum EmpiricalBmsFourthJetSchedule {
 const EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET: usize = 4096;
 const EMPIRICAL_BMS_BATCH_LANE_CAP: usize = 8;
 
+/// #3290 — CHUNKING IS ONLY WORTH ITS EXTRA BASE PASSES WHERE IT CAN MEET THE
+/// BOUND IT IS CHUNKING FOR.
+///
+/// A chunk's resident working set is `chunk_len · r³` floats, and a chunk's
+/// batch evaluates the frozen row program ONCE for the whole chunk: the shared
+/// base channel (the order-two jet over all `r` axes, carried through every
+/// calibration node and through the implicit intercept solve) is computed once
+/// per chunk, and each lane adds only its own nilpotent channel. So splitting
+/// `d` requested directions into `c = ceil(d / lanes)` chunks costs `c` full
+/// base passes instead of one, and buys a resident set `lanes · r³` instead of
+/// `d · r³`.
+///
+/// That trade is worth making only while the smaller resident set is BELOW the
+/// budget. Once ONE lane already exceeds it — `r³ > BUDGET`, i.e. every
+/// `r >= 16`, which is every flex width the BMS product actually reaches — no
+/// chunk length meets the bound, so chunking cannot deliver what it is paid
+/// for and the extra base passes are pure loss. In that regime the lane count
+/// is not the budget's to choose; the declared ceiling
+/// [`EMPIRICAL_BMS_BATCH_LANE_CAP`] is what bounds the arena, exactly as it
+/// does at the small widths where the quotient saturates it.
+///
+/// The returned value is an UPPER BOUND on a chunk, never a floor: each call
+/// site sizes its workspace with `workspace.reset(chunk.len())` and
+/// `chunk.len() = min(lanes, remaining)`, so raising `lanes` never allocates
+/// more than the caller actually asked for and never adds a pass. At the two
+/// structural request sizes on this route — the third contraction's two axis
+/// directions `e_q`, `e_g`, and the fourth's four ordered axis pairs
+/// (`row_primary_hessian::flex_axis_{third,fourth}_tensors_for_row`) — the old
+/// rule returned 1 for every `r >= 16` and so evaluated the row program twice
+/// and four times per row per outer evaluation, where once serves both.
+///
+/// This changes no value: lanes are independent inside a batch and the base
+/// channel is recomputed identically per chunk, so a contraction is
+/// bit-identical under any chunking.
 #[inline]
 pub(super) fn empirical_bms_runtime_batch_lanes(r: usize) -> usize {
     let tape_work_per_lane = r.saturating_mul(r).saturating_mul(r).max(1);
-    (EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET / tape_work_per_lane)
-        .max(1)
-        .min(EMPIRICAL_BMS_BATCH_LANE_CAP)
+    if tape_work_per_lane > EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET {
+        return EMPIRICAL_BMS_BATCH_LANE_CAP;
+    }
+    (EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET / tape_work_per_lane).min(EMPIRICAL_BMS_BATCH_LANE_CAP)
 }
 
 pub(super) fn empirical_bms_third_jet_schedule(r: usize) -> EmpiricalBmsThirdJetSchedule {
@@ -4591,6 +4626,55 @@ mod empirical_flex_jet_oracle_tests {
                 empirical_bms_fourth_jet_schedule(r),
                 EmpiricalBmsFourthJetSchedule::DynamicBatch { lanes },
                 "fourth-order r={r} must use the bounded runtime schedule",
+            );
+        }
+    }
+
+    /// #3290 — the lane bound must not force a second base pass at a width
+    /// where no chunk length meets the budget it is chunking for.
+    ///
+    /// The flex route's own request sizes are structural, not configurable:
+    /// `flex_axis_third_tensors_for_row` asks for the two axis directions
+    /// `e_q`, `e_g`, and `flex_axis_fourth_tensors_for_row` for the four
+    /// ordered axis pairs built from the same two. A lane bound of 1 splits
+    /// those into two and four chunks, and each chunk recomputes the shared
+    /// base channel — the order-two jet over all `r` axes carried through the
+    /// calibration grid and the implicit intercept solve.
+    ///
+    /// Both halves are asserted. Below the budget the quotient still governs,
+    /// so a width that can meet the bound still does; at and above `r = 16`,
+    /// where one lane already costs `r³ >= BUDGET` floats, the declared cap
+    /// governs and one chunk serves the whole request.
+    #[test]
+    fn runtime_batch_lanes_never_chunk_the_flex_axis_request_3290() {
+        const THIRD_DIRECTIONS: usize = 2;
+        const FOURTH_DIRECTION_PAIRS: usize = 4;
+        for r in 1..=8 {
+            let tape_work = r * r * r;
+            assert!(
+                tape_work <= EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET,
+                "premise: r={r} is a width whose single lane fits the budget"
+            );
+            assert_eq!(
+                empirical_bms_runtime_batch_lanes(r),
+                (EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET / tape_work)
+                    .min(EMPIRICAL_BMS_BATCH_LANE_CAP),
+                "below the budget the quotient still chooses the lane count at r={r}"
+            );
+        }
+        for r in [16, 18, 20, 22, 32, 128] {
+            assert!(
+                r * r * r > EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET,
+                "premise: one lane at r={r} already exceeds the tape-work budget"
+            );
+            let lanes = empirical_bms_runtime_batch_lanes(r);
+            assert_eq!(
+                lanes, EMPIRICAL_BMS_BATCH_LANE_CAP,
+                "the declared cap governs where the budget cannot be met, at r={r}"
+            );
+            assert!(
+                lanes >= THIRD_DIRECTIONS && lanes >= FOURTH_DIRECTION_PAIRS,
+                "one chunk must serve the flex axis request at r={r}; got {lanes}"
             );
         }
     }
