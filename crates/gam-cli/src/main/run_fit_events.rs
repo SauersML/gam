@@ -376,9 +376,23 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
             .map_err(|err| format!("failed to compute comparable REML score: {err}"))?),
     );
     summary.insert("raw_reml_score".to_string(), json!(fit.fit.reml_score()));
+    // The cost decomposition of the certified fit (#2986): a wall time alone
+    // cannot say whether a cohort spent it on more outer iterations or on
+    // costlier ones, and the cost of one iteration is set by how many nodes
+    // each evaluation walks and how far the longest subject's chain reaches.
     summary.insert(
         "outer_iterations".to_string(),
         json!(fit.fit.outer_iterations),
+    );
+    summary.insert("inner_cycles".to_string(), json!(fit.fit.inner_cycles));
+    summary.insert(
+        "outer_gradient_norm".to_string(),
+        json!(fit.fit.outer_gradient_norm),
+    );
+    summary.insert("total_nodes".to_string(), json!(fit.nodes.total_nodes));
+    summary.insert(
+        "max_subject_nodes".to_string(),
+        json!(fit.nodes.max_subject_nodes()),
     );
     summary.insert("time_scale".to_string(), json!(fit.time_scale));
     summary.insert("loadings".to_string(), json!(rows(&fit.loadings)));
