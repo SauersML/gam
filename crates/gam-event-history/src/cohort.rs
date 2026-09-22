@@ -677,7 +677,7 @@ pub struct CohortNodes {
 
 impl CohortNodes {
     /// The largest node count of any subject.
-    pub(crate) fn max_subject_nodes(&self) -> usize {
+    pub fn max_subject_nodes(&self) -> usize {
         self.subjects.iter().map(|s| s.len()).max().unwrap_or(0)
     }
 }
