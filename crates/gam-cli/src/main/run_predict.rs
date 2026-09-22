@@ -2030,6 +2030,58 @@ pub(crate) struct PreparedSavedLatentWindowPrediction {
     q_exit: Array1<f64>,
 }
 
+/// One latent-window row's posterior standard deviation and central interval,
+/// both read from the law its posterior mean is the mean of (gam#3560).
+///
+/// `row_mean` is that published mean. The deviation is the square root of the
+/// CENTRED second moment, a sum of non-negative terms: `E[S²] − E[S]²` resolves
+/// the variance of a nearly-certain window only to the rounding of
+/// `E[S²] ≈ E[S]²`, and reported that rounding — or the zero a clip made of it —
+/// as the row's standard error (gam#4086 made the same repair to the
+/// location-scale producer).
+///
+/// The interval is the law's own central one. `mean ± z·sd` clamped to `[0, 1]`
+/// is not an interval of that law at all: on a window whose survival is near
+/// either rail it carries every miss in one tail and covers an endpoint the law
+/// never reaches, so it is conservative in the high-survival regime and
+/// anti-conservative in the low one. Its ends are values the response attains,
+/// so nothing is clamped. A law with no spread along the axis it resolves is a
+/// point mass in the response, and its interval is that point.
+fn latent_window_row_band(
+    quadctx: &gam::quadrature::QuadratureContext,
+    row_mu: [f64; 3],
+    row_cov: [[f64; 3]; 3],
+    row_mean: f64,
+    level: f64,
+    response: impl Fn([f64; 3]) -> Result<f64, String>,
+) -> Result<(f64, f64, f64), String> {
+    let variance = gam::quadrature::normal_expectation_nd_adaptive_result::<3, _, _, String>(
+        quadctx,
+        row_mu,
+        row_cov,
+        15,
+        |x| {
+            response(x).map(|value| {
+                let deviation = value - row_mean;
+                deviation * deviation
+            })
+        },
+    )?;
+    let resolved_axis =
+        gam::quadrature::most_responsive_axis::<3, _, String>(row_mu, row_cov, &response)?;
+    let (lower, upper) = gam::quadrature::central_response_interval::<3, _, String>(
+        quadctx,
+        row_mu,
+        row_cov,
+        resolved_axis,
+        15,
+        level,
+        &response,
+    )?
+    .unwrap_or((row_mean, row_mean));
+    Ok((variance.max(0.0).sqrt(), lower, upper))
+}
+
 pub(crate) fn latent_window_plugin_survival(
     quadctx: &gam::quadrature::QuadratureContext,
     q_entry: f64,
@@ -2230,10 +2282,9 @@ pub(crate) fn run_predict_saved_latent_window_impl(
     };
 
     let mean: Array1<f64>;
-    let mut mean_sd = None;
-    let mut mean_lo = None;
-    let mut mean_hi = None;
-    {
+    // Every band field is produced together or not at all, so they are bound
+    // from this block rather than pre-set to `None` and overwritten.
+    let (mean_sd, mean_lo, mean_hi) = {
         let local_cov = local_covariances.as_ref().ok_or_else(|| {
             "internal error: latent window posterior mean requires local covariance".to_string()
         })?;
@@ -2243,73 +2294,83 @@ pub(crate) fn run_predict_saved_latent_window_impl(
         } else {
             None
         };
+        let mut response_lower = if args.uncertainty {
+            Some(Array1::<f64>::zeros(n))
+        } else {
+            None
+        };
+        let mut response_upper = if args.uncertainty {
+            Some(Array1::<f64>::zeros(n))
+        } else {
+            None
+        };
+        if args.uncertainty {
+            validate_level(args.level)?;
+        }
         for i in 0..n {
-            let (m1, m2) = gam::quadrature::normal_expectation_nd_adaptive_result::<3, _, _, String>(
-                &quadctx,
-                [state.eta[i], state.q_entry[i], state.q_exit[i]],
+            let row_mu = [state.eta[i], state.q_entry[i], state.q_exit[i]];
+            let row_cov = [
                 [
-                    [
-                        local_cov[0][0][i].max(0.0),
-                        local_cov[0][1][i],
-                        local_cov[0][2][i],
-                    ],
-                    [
-                        local_cov[1][0][i],
-                        local_cov[1][1][i].max(0.0),
-                        local_cov[1][2][i],
-                    ],
-                    [
-                        local_cov[2][0][i],
-                        local_cov[2][1][i],
-                        local_cov[2][2][i].max(0.0),
-                    ],
+                    local_cov[0][0][i].max(0.0),
+                    local_cov[0][1][i],
+                    local_cov[0][2][i],
                 ],
-                15,
-                |x| {
-                    // The Gaussian approximation of the coefficient posterior
-                    // is not confined to the cone the monotone time block lives
-                    // in, so a displaced node can carry `Λ(exit) < Λ(entry)` —
-                    // a baseline no fitted coefficient can produce and a row
-                    // the kernel refuses (`mass_exit >= mass_entry`). A node
-                    // outside the cone is projected onto its boundary: the
-                    // window carries no event mass there. With the plug-in
-                    // point this never arose; the posterior mean integrates the
-                    // approximation's tails and has to say what they mean.
-                    let q_entry = x[1];
-                    let q_exit = x[2].max(q_entry);
-                    latent_window_plugin_survival(
-                        &quadctx,
-                        q_entry,
-                        q_exit,
-                        prepared.unloaded_mass_entry[i],
-                        prepared.unloaded_mass_exit[i],
-                        x[0],
-                        state.sigma,
-                    )
-                    .map(|jet| {
-                        let mean = kind.response_from_survival(jet.survival);
-                        (mean, mean * mean)
-                    })
-                },
+                [
+                    local_cov[1][0][i],
+                    local_cov[1][1][i].max(0.0),
+                    local_cov[1][2][i],
+                ],
+                [
+                    local_cov[2][0][i],
+                    local_cov[2][1][i],
+                    local_cov[2][2][i].max(0.0),
+                ],
+            ];
+            // The Gaussian approximation of the coefficient posterior is not
+            // confined to the cone the monotone time block lives in, so a
+            // displaced node can carry `Λ(exit) < Λ(entry)` — a baseline no
+            // fitted coefficient can produce and a row the kernel refuses
+            // (`mass_exit >= mass_entry`). A node outside the cone is projected
+            // onto its boundary: the window carries no event mass there. With
+            // the plug-in point this never arose; the posterior mean integrates
+            // the approximation's tails and has to say what they mean.
+            let response = |x: [f64; 3]| -> Result<f64, String> {
+                let q_entry = x[1];
+                let q_exit = x[2].max(q_entry);
+                latent_window_plugin_survival(
+                    &quadctx,
+                    q_entry,
+                    q_exit,
+                    prepared.unloaded_mass_entry[i],
+                    prepared.unloaded_mass_exit[i],
+                    x[0],
+                    state.sigma,
+                )
+                .map(|jet| kind.response_from_survival(jet.survival))
+            };
+            let first = gam::quadrature::normal_expectation_nd_adaptive_result::<3, _, _, String>(
+                &quadctx, row_mu, row_cov, 15, &response,
             )?;
-            posterior_mean[i] = m1.clamp(0.0, 1.0);
-            if let Some(sd) = response_sd.as_mut() {
-                sd[i] = (m2 - m1 * m1).max(0.0).sqrt();
+            let row_mean = first.clamp(0.0, 1.0);
+            posterior_mean[i] = row_mean;
+            if args.uncertainty {
+                let (deviation, lower, upper) = latent_window_row_band(
+                    &quadctx, row_mu, row_cov, row_mean, args.level, &response,
+                )?;
+                if let Some(sd) = response_sd.as_mut() {
+                    sd[i] = deviation;
+                }
+                if let Some(lo) = response_lower.as_mut() {
+                    lo[i] = lower;
+                }
+                if let Some(hi) = response_upper.as_mut() {
+                    hi[i] = upper;
+                }
             }
         }
         mean = posterior_mean;
-        if args.uncertainty {
-            validate_level(args.level)?;
-            let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
-            let response_sd = response_sd
-                .ok_or_else(|| "internal error: latent window response SD missing".to_string())?;
-            let (lo, hi) =
-                response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
-            mean_sd = Some(response_sd);
-            mean_lo = Some(lo);
-            mean_hi = Some(hi);
-        }
-    }
+        (response_sd, response_lower, response_upper)
+    };
 
     kind.write_predictions(
         &args.out,

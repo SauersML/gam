@@ -1,5 +1,24 @@
 ## Unreleased
 
+- **A survival prediction band was `mean ± z·sd` clamped to `[0, 1]`, which is not an interval of
+  the law the same prediction reports the mean of** (gam#3560). `S` is strongly skewed near either
+  rail, so a symmetric band puts all of its miss mass in one tail and covers an endpoint the law
+  never reaches: measured against the exact transformed-η band it over-covers at 0.957 and 0.973
+  where survival is high and under-covers at 0.939 and 0.943 where it is low, against a nominal
+  0.950. Conservative is a defect here just as anti-conservative is. `gam predict` now publishes
+  the law's own central interval: `central_response_interval` permutes one coordinate last,
+  factors the covariance, and integrates `F(s) = E_V[P(h_V(T) ≤ s)]` on the same Gauss–Hermite
+  rule the posterior mean already runs, one dimension lower, with the last coordinate's
+  contribution an exact `Φ` rather than a node. Both ends are values the response attains, so
+  nothing is clamped, and a response that turns over on the resolved axis is refused by name
+  instead of being integrated as a half line it is not. The latent-window branch takes it, and
+  its standard error now comes from the centred second moment: `E[S²] − E[S]²` resolved the
+  variance of a nearly-certain window only to the rounding of `E[S²] ≈ E[S]²` and reported that
+  rounding, or the zero a clip made of it, as the row's standard error (the repair gam#4086 had
+  already made to the location-scale producer). The Royston–Parmar branch already published the
+  transformed-η band; the survival marginal-slope and location-scale branches still publish the
+  symmetric one and are named in the issue.
+
 - **The fold record named the mode's softest direction but never carried it, so a mode one solve
   away from a lower basin had nowhere to go** (gam#3173, gam#2765). The Laplace normalizer is the
   Gaussian integral of the quadratic model about the inner mode, and along the softest eigenpair

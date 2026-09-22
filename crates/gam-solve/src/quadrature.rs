@@ -6421,3 +6421,608 @@ mod log_survival_panel_2714_tests {
         }
     }
 }
+
+/// Points on the resolved axis of [`central_response_interval`], over
+/// `±`[`RESOLVED_AXIS_HALFWIDTH`] standard deviations.
+///
+/// The crossing `t*` with `h(t*) = s` is located by inverse-quadratic
+/// interpolation of the tabulated `h`, whose error is `Δt³·|t‴|/6` in the
+/// inverse's own third derivative. With the half-width below, `Δt = 16/128 =
+/// 0.125` and that error is `3.3e-4` times the inverse's curvature scale, which
+/// enters the reported level through `φ(t) ≤ 0.399` as at most `1.3e-4` of
+/// probability: two orders below the `0.01`-scale coverage differences this
+/// band exists to remove (gam#3560's own table reports 0.939 and 0.973 against
+/// a nominal 0.950). The outer Gauss–Hermite rule below, which is the rule the
+/// caller's own posterior mean already runs, is the larger error of the two.
+const RESOLVED_AXIS_POINTS: usize = 129;
+
+/// Half-width of [`central_response_interval`]'s resolved axis, in standard
+/// deviations of its conditional law. The standard normal puts `1.2e-15` of its
+/// mass outside `±8`, below the `f64` resolution of any level in `(0, 1)`, so
+/// the tails the grid does not reach cannot move a reported level.
+const RESOLVED_AXIS_HALFWIDTH: f64 = 8.0;
+
+/// The coordinate of a Gaussian law along which a response moves most, in the
+/// law's own units (gam#3560): `argmax_i |g(mu + h_i e_i) − g(mu − h_i e_i)|`
+/// with `h_i` a half standard deviation of coordinate `i`.
+///
+/// This is a choice of WHICH axis [`central_response_interval`] resolves
+/// exactly, and it cannot bias that interval: the factorization
+/// `F(s) = E_V[P(h_V(T) ≤ s)]` is an identity for every ordering of the
+/// coordinates, so the pick moves only which of the two error terms dominates —
+/// the outer Gauss–Hermite rule's, or the resolved axis's grid. Picking the
+/// coordinate the response actually moves along puts the exact treatment where
+/// the law's spread reaches the response, and leaves the quadrature the
+/// directions it integrates well.
+///
+/// The step is a half standard deviation rather than a derivative's: the
+/// comparison is over the bulk of the law, where the response's motion decides
+/// the band, not at a point where its local slope might.
+///
+/// A coordinate with no spread is never picked. When no coordinate has any, the
+/// law is a point mass and the first coordinate is returned; the interval then
+/// reports `Ok(None)` for it.
+pub fn most_responsive_axis<const D: usize, F, E>(
+    mu: [f64; D],
+    cov: [[f64; D]; D],
+    g: F,
+) -> Result<usize, E>
+where
+    F: Fn([f64; D]) -> Result<f64, E>,
+    E: From<String>,
+{
+    let mut best = 0usize;
+    let mut best_motion = f64::NEG_INFINITY;
+    for axis in 0..D {
+        let sd = cov[axis][axis].max(0.0).sqrt();
+        if !(sd.is_finite() && sd > 0.0) {
+            continue;
+        }
+        let step = 0.5 * sd;
+        let mut low = mu;
+        let mut high = mu;
+        low[axis] -= step;
+        high[axis] += step;
+        let motion = (g(high)? - g(low)?).abs();
+        if !motion.is_finite() {
+            return Err(E::from(format!(
+                "most responsive axis: the response is not finite a half standard deviation \
+                 either side of the mean along coordinate {axis}"
+            )));
+        }
+        if motion > best_motion {
+            best_motion = motion;
+            best = axis;
+        }
+    }
+    Ok(best)
+}
+
+/// One outer node's tabulation of the response along the resolved axis.
+struct ResolvedAxisTable {
+    /// The node's Gauss–Hermite weight, already normalized.
+    weight: f64,
+    /// The response at [`RESOLVED_AXIS_POINTS`] standardized offsets.
+    values: Vec<f64>,
+    /// Whether the tabulation rises with the axis. A tabulation that neither
+    /// rises nor falls beyond its own rounding is recorded as rising; both of
+    /// its verdicts are then taken at the ends, never from a crossing.
+    increasing: bool,
+}
+
+/// Whether two tabulated values differ by more than the rounding of the pair.
+/// Two values formed by the same accumulation agree to
+/// [`gam_linalg::roundoff::accumulation_band`] of their absolute sum, so a step
+/// inside that band is not evidence of a direction (gam#3560).
+#[inline]
+fn resolved_axis_step_is_resolved(before: f64, after: f64) -> bool {
+    let band = gam_linalg::roundoff::accumulation_band(2, before.abs() + after.abs());
+    (after - before).abs() > band
+}
+
+/// The central posterior interval of a response that is a deterministic
+/// function of a small Gaussian vector (gam#3560).
+///
+/// A predictor that publishes `E[g(X)]` for `X ~ N(mu, Sigma)` by a
+/// Gauss–Hermite rule publishes the mean of ONE law, the pushforward of that
+/// rule's own node measure. A band written `mean ± z·sd` is not an interval of
+/// that law: on a bounded, skewed response it carries all of its miss mass in
+/// one tail and covers an endpoint the law never reaches, so it is conservative
+/// in one regime and anti-conservative in the other. This returns the law's own
+/// central interval, the pair `(s_lo, s_hi)` with `F(s_lo) = (1 − level)/2` and
+/// `F(s_hi) = (1 + level)/2` for `F(s) = P(g(X) ≤ s)`. Both ends are values the
+/// response attains, so nothing is clamped.
+///
+/// # The law it inverts
+///
+/// Permute `resolved_axis` last and factor `Sigma = L Lᵀ` with `L` lower
+/// triangular. Writing `X = mu + L Z` for a standard normal `Z`, the last
+/// coordinate is the only one whose conditional law given the others is read
+/// straight off the factor:
+///
+/// ```text
+///   X_{D-1} | Z_0..Z_{D-2}  ~  N( mu_{D-1} + Σ_{c<D-1} L[D-1][c]·Z_c , L[D-1][D-1]² ).
+/// ```
+///
+/// So with `V = (Z_0..Z_{D-2})` and `T` the standardized last coordinate,
+///
+/// ```text
+///   F(s) = E_V[ P( h_V(T) ≤ s ) ],     h_V(t) = g(x(V, t)),
+/// ```
+///
+/// the outer expectation runs on the same Gauss–Hermite rule the caller's mean
+/// uses, one dimension lower, and the inner probability is EXACT in `T`: for a
+/// monotone `h_V` the sub-level set is a half line and its mass is one `Phi`.
+/// The only approximations are that outer rule — already the error the
+/// published mean carries — and the resolved axis's grid
+/// ([`RESOLVED_AXIS_POINTS`]). `F` is therefore smooth and non-decreasing in
+/// `s`, and inverting it is a bisection. At `D = 1` there is no outer rule and
+/// the interval is exact: it is the image of the credible interval of the one
+/// Gaussian coordinate, which is what a monotone link publishes directly.
+///
+/// Reading a quantile off the raw `D`-dimensional node measure instead would
+/// not do: a 15-point Gauss–Hermite rule puts `5.6e-3` of its mass at or below
+/// its fourth node and `6.1e-2` at or below its fifth, so the `2.5%` level
+/// falls between two atoms `0.9` standard deviations apart and any interval
+/// read from them is far too wide.
+///
+/// # What it refuses
+///
+/// `h_V` must be weakly monotone on the resolved axis: that is what makes the
+/// sub-level set a half line, and it is a statement about the model, not a
+/// numerical convenience. A tabulation that turns over beyond its own rounding
+/// is reported by name rather than silently integrated as if it had not.
+/// `Ok(None)` is the one non-error absence: the resolved coordinate carries no
+/// spread of its own (a singular covariance, or a factor whose last pivot is an
+/// exact zero), so the law has no axis to resolve and the caller publishes its
+/// point estimate.
+pub fn central_response_interval<const D: usize, F, E>(
+    ctx: &QuadratureContext,
+    mu: [f64; D],
+    cov: [[f64; D]; D],
+    resolved_axis: usize,
+    max_n: usize,
+    level: f64,
+    g: F,
+) -> Result<Option<(f64, f64)>, E>
+where
+    F: Fn([f64; D]) -> Result<f64, E>,
+    E: From<String>,
+{
+    if D == 0 || resolved_axis >= D {
+        return Err(E::from(format!(
+            "central response interval: resolved axis {resolved_axis} is outside a {D}-coordinate law"
+        )));
+    }
+    if !(level > 0.0 && level < 1.0) {
+        return Err(E::from(format!(
+            "central response interval: level {level} is not a probability strictly inside (0, 1)"
+        )));
+    }
+    let mut order = [0usize; D];
+    let mut written = 0usize;
+    for axis in 0..D {
+        if axis != resolved_axis {
+            order[written] = axis;
+            written += 1;
+        }
+    }
+    order[D - 1] = resolved_axis;
+    let mut mu_p = [0.0_f64; D];
+    let mut cov_p = [[0.0_f64; D]; D];
+    for i in 0..D {
+        mu_p[i] = mu[order[i]];
+        for j in 0..D {
+            cov_p[i][j] = cov[order[i]][order[j]];
+        }
+    }
+    for i in 0..D {
+        cov_p[i][i] = cov_p[i][i].max(0.0);
+    }
+    let Some(l) = cholesky_static::<D>(&cov_p) else {
+        return Ok(None);
+    };
+    let axis_sd = l[D - 1][D - 1];
+    if !(axis_sd.is_finite() && axis_sd > 0.0) {
+        return Ok(None);
+    }
+    // The outer rule is the caller's own: the same adaptive point count, taken
+    // on the widest coordinate it still integrates rather than resolves.
+    let outer = D - 1;
+    let mut outer_max_var = 0.0_f64;
+    for (i, row) in cov_p.iter().enumerate().take(outer) {
+        outer_max_var = outer_max_var.max(row[i]);
+    }
+    let n = adaptive_point_countwith_cap(outer_max_var.sqrt(), max_n);
+    let axis_step = 2.0 * RESOLVED_AXIS_HALFWIDTH / ((RESOLVED_AXIS_POINTS - 1) as f64);
+    let axis_t: Vec<f64> = (0..RESOLVED_AXIS_POINTS)
+        .map(|j| -RESOLVED_AXIS_HALFWIDTH + axis_step * (j as f64))
+        .collect();
+
+    let norm = 1.0 / std::f64::consts::PI.powf(0.5 * outer as f64);
+    let build = |nodes: &[f64], weights: &[f64]| -> Result<Vec<ResolvedAxisTable>, E> {
+        let mut built: Vec<ResolvedAxisTable> = Vec::new();
+        let mut idx = vec![0usize; outer];
+        loop {
+            let mut z = vec![0.0_f64; outer];
+            let mut weight = norm;
+            for (d, slot) in z.iter_mut().enumerate() {
+                *slot = SQRT_2 * nodes[idx[d]];
+                weight *= weights[idx[d]];
+            }
+            // The outer coordinates, and the conditional mean of the resolved
+            // one, are the same triangular map `x = mu + L z` the mean's rule
+            // walks; only the last row is left as a law instead of a point.
+            let mut x_p = mu_p;
+            for row in 0..outer {
+                let mut dot = 0.0_f64;
+                for (col, value) in z.iter().enumerate().take(row + 1) {
+                    dot += l[row][col] * *value;
+                }
+                x_p[row] += dot;
+            }
+            let mut axis_mean = mu_p[D - 1];
+            for (col, value) in z.iter().enumerate() {
+                axis_mean += l[D - 1][col] * *value;
+            }
+            let mut base = [0.0_f64; D];
+            for (i, &axis) in order.iter().enumerate().take(outer) {
+                base[axis] = x_p[i];
+            }
+            let mut values = Vec::with_capacity(RESOLVED_AXIS_POINTS);
+            for &t in &axis_t {
+                let mut x = base;
+                x[resolved_axis] = axis_mean + axis_sd * t;
+                let value = g(x)?;
+                if !value.is_finite() {
+                    return Err(E::from(format!(
+                        "central response interval: the response is {value} at a node of its own \
+                         posterior law, {t} standard deviations along the resolved axis"
+                    )));
+                }
+                values.push(value);
+            }
+            let mut rises = false;
+            let mut falls = false;
+            for pair in values.windows(2) {
+                if !resolved_axis_step_is_resolved(pair[0], pair[1]) {
+                    continue;
+                }
+                if pair[1] > pair[0] {
+                    rises = true;
+                } else {
+                    falls = true;
+                }
+            }
+            if rises && falls {
+                return Err(E::from(
+                    "central response interval: the response turns over along the resolved axis \
+                     of its posterior law, so its sub-level set is not a half line and this rule \
+                     does not describe it"
+                        .to_string(),
+                ));
+            }
+            built.push(ResolvedAxisTable {
+                weight,
+                values,
+                increasing: !falls,
+            });
+            if outer == 0 {
+                break;
+            }
+            let mut carry = true;
+            for d in (0..outer).rev() {
+                idx[d] += 1;
+                if idx[d] < n {
+                    carry = false;
+                    break;
+                }
+                idx[d] = 0;
+            }
+            if carry {
+                break;
+            }
+        }
+        Ok(built)
+    };
+    let tables = if outer == 0 {
+        build(&[], &[])?
+    } else {
+        with_gh_nodesweights(ctx, n, |nodes, weights| build(nodes, weights))?
+    };
+
+    // `P(h_V(T) <= s)` for one table, exact in `T` up to where the crossing is
+    // located. Outside the tabulated span `h_V` is taken at its end value,
+    // which is the sub-level verdict the grid's own tail carries.
+    let table_mass = |table: &ResolvedAxisTable, s: f64| -> f64 {
+        let last = RESOLVED_AXIS_POINTS - 1;
+        let first_below = table.values[0] <= s;
+        let last_below = table.values[last] <= s;
+        if first_below == last_below {
+            return if first_below { 1.0 } else { 0.0 };
+        }
+        // The one cell the level crosses, on a table monotone by construction.
+        let mut lo = 0usize;
+        let mut hi = last;
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if (table.values[mid] <= s) == table.increasing {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let crossing = inverse_interpolated_crossing(&axis_t, &table.values, lo, hi, s);
+        let mass = gam_math::probability::normal_cdf(crossing);
+        if table.increasing { mass } else { 1.0 - mass }
+    };
+    let cdf = |s: f64| -> f64 {
+        tables
+            .iter()
+            .map(|table| table.weight * table_mass(table, s))
+            .sum()
+    };
+    // `F` is non-decreasing, `F(min) = 0` and `F(max) = 1` over the tabulated
+    // span, so each level is bracketed by construction and bisection cannot
+    // leave the span.
+    let mut span_low = f64::INFINITY;
+    let mut span_high = f64::NEG_INFINITY;
+    for table in &tables {
+        for &value in &table.values {
+            span_low = span_low.min(value);
+            span_high = span_high.max(value);
+        }
+    }
+    if !(span_low.is_finite() && span_high.is_finite()) {
+        return Err(E::from(
+            "central response interval: the response spans no finite range over its own posterior \
+             law"
+            .to_string(),
+        ));
+    }
+    if span_low == span_high {
+        return Ok(Some((span_low, span_high)));
+    }
+    let invert = |target: f64| -> f64 {
+        let (mut lo, mut hi) = (span_low, span_high);
+        // The loop stops when the bracket reaches the `f64` spacing of its own
+        // ends, not at a count; the bound is what a bisection of a finite
+        // bracket can need.
+        for _ in 0..128 {
+            let mid = 0.5 * (lo + hi);
+            if !(mid > lo && mid < hi) {
+                break;
+            }
+            if cdf(mid) < target {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    };
+    let tail = 0.5 * (1.0 - level);
+    Ok(Some((invert(tail), invert(1.0 - tail))))
+}
+
+/// The `t` where a monotone table crosses `s`, between neighbours `lo` and `hi`.
+///
+/// Quadratic through the crossing cell and the neighbour on the side that has
+/// one, solved for `t(s)` rather than `s(t)` so the answer needs no root of its
+/// own: interpolating the INVERSE is exact when the inverse is quadratic, and
+/// its error is `Δt³·|t‴|/6` where a linear crossing would carry `Δt²·|t″|/2`.
+/// A cell whose ends share a value cannot be interpolated and takes its left
+/// end; a quadratic that leaves the cell is reporting its own extrapolation,
+/// which a monotone inverse cannot do, and the linear crossing is taken there.
+fn inverse_interpolated_crossing(
+    axis_t: &[f64],
+    values: &[f64],
+    lo: usize,
+    hi: usize,
+    s: f64,
+) -> f64 {
+    let (y0, y1) = (values[lo], values[hi]);
+    let (t0, t1) = (axis_t[lo], axis_t[hi]);
+    if y1 == y0 {
+        return t0;
+    }
+    let linear = t0 + (t1 - t0) * (s - y0) / (y1 - y0);
+    let third = if hi + 1 < values.len() {
+        Some(hi + 1)
+    } else {
+        lo.checked_sub(1)
+    };
+    let Some(third) = third else {
+        return linear;
+    };
+    let (y2, t2) = (values[third], axis_t[third]);
+    if y2 == y0 || y2 == y1 {
+        return linear;
+    }
+    let quadratic = t0 * ((s - y1) * (s - y2)) / ((y0 - y1) * (y0 - y2))
+        + t1 * ((s - y0) * (s - y2)) / ((y1 - y0) * (y1 - y2))
+        + t2 * ((s - y0) * (s - y1)) / ((y2 - y0) * (y2 - y1));
+    let (cell_low, cell_high) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
+    if quadratic.is_finite() && quadratic >= cell_low && quadratic <= cell_high {
+        quadratic
+    } else {
+        linear
+    }
+}
+
+/// The central response interval against laws whose quantiles are closed form
+/// (gam#3560).
+#[cfg(test)]
+mod response_interval_tests {
+    use super::*;
+    use gam_math::probability::{normal_cdf, standard_normal_quantile};
+
+    const LEVEL: f64 = 0.95;
+
+    /// One Gaussian coordinate and a monotone response: the interval is the
+    /// image of the coordinate's own credible interval, in closed form, and the
+    /// rule runs no outer quadrature at all — so the only error left is the
+    /// crossing's, which the axis grid bounds at `1.3e-4` of probability. The
+    /// bar here is on the VALUE, and `Phi` is 1-Lipschitz, so `2e-4` is that
+    /// bound carried through the link.
+    #[test]
+    fn one_coordinate_monotone_response_is_the_image_of_its_own_interval_3560() {
+        let ctx = QuadratureContext::new();
+        let z = standard_normal_quantile(0.5 + 0.5 * LEVEL).expect("normal quantile");
+        for (mu, sd) in [(0.0_f64, 1.0_f64), (-2.3, 0.7), (1.4, 2.5)] {
+            let (lo, hi) = central_response_interval::<1, _, String>(
+                &ctx,
+                [mu],
+                [[sd * sd]],
+                0,
+                31,
+                LEVEL,
+                |x| Ok(normal_cdf(x[0])),
+            )
+            .expect("a Gaussian coordinate with spread has an interval")
+            .expect("a positive variance resolves its axis");
+            let (want_lo, want_hi) = (normal_cdf(mu - z * sd), normal_cdf(mu + z * sd));
+            assert!(
+                (lo - want_lo).abs() <= 2e-4 && (hi - want_hi).abs() <= 2e-4,
+                "mu={mu} sd={sd}: got ({lo}, {hi}), the image of the coordinate's interval is \
+                 ({want_lo}, {want_hi})"
+            );
+        }
+    }
+
+    /// The same for a DECREASING response, the Royston-Parmar survival
+    /// `S = exp(-exp(eta))`: the image swaps ends, and a rule that ignored the
+    /// direction would return the interval reversed.
+    #[test]
+    fn a_decreasing_response_takes_the_reversed_image_3560() {
+        let ctx = QuadratureContext::new();
+        let z = standard_normal_quantile(0.5 + 0.5 * LEVEL).expect("normal quantile");
+        let (mu, sd) = (-0.8_f64, 0.9_f64);
+        let (lo, hi) =
+            central_response_interval::<1, _, String>(&ctx, [mu], [[sd * sd]], 0, 31, LEVEL, |x| {
+                Ok((-x[0].exp()).exp())
+            })
+            .expect("a Gaussian coordinate with spread has an interval")
+            .expect("a positive variance resolves its axis");
+        let want_lo = (-(mu + z * sd).exp()).exp();
+        let want_hi = (-(mu - z * sd).exp()).exp();
+        assert!(lo < hi, "an interval runs low to high, got ({lo}, {hi})");
+        assert!(
+            (lo - want_lo).abs() <= 2e-4 && (hi - want_hi).abs() <= 2e-4,
+            "got ({lo}, {hi}), the reversed image is ({want_lo}, {want_hi})"
+        );
+    }
+
+    /// Two correlated coordinates whose response is uniform in closed form:
+    /// with `X ~ N(0, I)` and `g(x) = Phi((x_0 + x_1)/sqrt(2))`, the drive is
+    /// standard normal and `g(X)` is exactly `Uniform(0, 1)`, whose central
+    /// 95% interval is `(0.025, 0.975)`. This is the multi-coordinate case the
+    /// issue's three open branches are, and it exercises the outer rule: the
+    /// answer is NOT read off the resolved axis alone.
+    #[test]
+    fn two_coordinates_with_a_uniform_response_return_its_exact_quantiles_3560() {
+        let ctx = QuadratureContext::new();
+        for resolved in 0..2usize {
+            let (lo, hi) = central_response_interval::<2, _, String>(
+                &ctx,
+                [0.0, 0.0],
+                [[1.0, 0.0], [0.0, 1.0]],
+                resolved,
+                31,
+                LEVEL,
+                |x| Ok(normal_cdf((x[0] + x[1]) / std::f64::consts::SQRT_2)),
+            )
+            .expect("a full-rank law has an interval")
+            .expect("a positive variance resolves its axis");
+            assert!(
+                (lo - 0.025).abs() <= 1e-5 && (hi - 0.975).abs() <= 1e-5,
+                "resolved axis {resolved}: got ({lo}, {hi}), the exact uniform quantiles are \
+                 (0.025, 0.975)"
+            );
+        }
+    }
+
+    /// The band is a central interval of the law, not the symmetric band: on a
+    /// response whose law is skewed against a rail, `mean + z*sd` leaves the
+    /// range and `mean - z*sd` cuts far more than the tail it names. This is the
+    /// defect gam#3560 reports, so it is pinned as a difference and not only as
+    /// an agreement.
+    #[test]
+    fn a_skewed_response_is_not_its_symmetric_band_3560() {
+        let ctx = QuadratureContext::new();
+        let (mu, sd) = (-4.0_f64, 1.0_f64);
+        let response = |x: [f64; 1]| -> Result<f64, String> { Ok((-x[0].exp()).exp()) };
+        let (lo, hi) = central_response_interval::<1, _, String>(
+            &ctx,
+            [mu],
+            [[sd * sd]],
+            0,
+            31,
+            LEVEL,
+            response,
+        )
+        .expect("a Gaussian coordinate with spread has an interval")
+        .expect("a positive variance resolves its axis");
+        let (mean, second) = normal_expectation_1d_adaptive_pair(&ctx, mu, sd, |eta| {
+            let value = (-eta.exp()).exp();
+            (value, value * value)
+        });
+        let symmetric_sd = (second - mean * mean).max(0.0).sqrt();
+        let z = standard_normal_quantile(0.5 + 0.5 * LEVEL).expect("normal quantile");
+        assert!(
+            mean + z * symmetric_sd > 1.0,
+            "precondition: the symmetric band must leave the response's range here, got upper \
+             {}",
+            mean + z * symmetric_sd
+        );
+        assert!(
+            hi < 1.0 && lo > 0.0,
+            "the central interval stays inside the response's range, got ({lo}, {hi})"
+        );
+        assert!(
+            (hi - lo) < (2.0 * z * symmetric_sd),
+            "the central interval of a skewed law is narrower than the symmetric band that \
+             covers an unreachable end: got width {} against {}",
+            hi - lo,
+            2.0 * z * symmetric_sd
+        );
+    }
+
+    /// A response that turns over on the resolved axis has no half-line
+    /// sub-level set, and the rule says so instead of integrating a set it did
+    /// not find.
+    #[test]
+    fn a_response_that_turns_over_on_the_resolved_axis_is_refused_3560() {
+        let ctx = QuadratureContext::new();
+        let error =
+            central_response_interval::<1, _, String>(&ctx, [0.0], [[1.0]], 0, 31, LEVEL, |x| {
+                Ok(x[0] * x[0])
+            })
+            .expect_err("a response that turns over must be refused");
+        assert!(
+            error.contains("turns over"),
+            "the refusal must name the mechanism, got {error}"
+        );
+    }
+
+    /// A resolved axis with no spread of its own leaves nothing to resolve, and
+    /// that is an absence the caller handles, not an error.
+    #[test]
+    fn a_resolved_axis_without_spread_returns_no_interval_3560() {
+        let ctx = QuadratureContext::new();
+        let interval = central_response_interval::<2, _, String>(
+            &ctx,
+            [0.0, 0.0],
+            [[1.0, 0.0], [0.0, 0.0]],
+            1,
+            31,
+            LEVEL,
+            |x| Ok(normal_cdf(x[0] + x[1])),
+        )
+        .expect("a degenerate axis is an absence, not a failure");
+        assert!(
+            interval.is_none(),
+            "a resolved axis with zero variance has no interval to report, got {interval:?}"
+        );
+    }
+}
