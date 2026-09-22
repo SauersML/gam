@@ -154,7 +154,12 @@ fn search_evaluations(n: usize, order: usize) -> SearchCost {
     // bans `panic!(` and `unreachable!(`, so the result is read through the
     // `Option` the assertion has already decided. The `map_or` defaults are on a
     // branch the assertion cannot leave open.
-    let searched = outcome.as_ref().ok();
+    // The assertion above has already decided `outcome` is `Ok`; the match reads it as an
+    // `Option` without a `.ok()` that would read as a discarded error.
+    let searched = match outcome.as_ref() {
+        Ok(result) => Some(result),
+        Err(_) => None,
+    };
     let flat = |pick: fn(&gam_math::score_opt::ResolutionFlatRegion) -> f64| -> f64 {
         searched.map_or(0.0, |result| {
             result
