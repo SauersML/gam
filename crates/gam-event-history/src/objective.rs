@@ -990,6 +990,9 @@ mod tests {
     #[test]
     fn reverse_sweep_cost_ratio_instrument_2965() {
         const W: usize = TANGENT_WIDTH;
+        // The block width each arm reaches, so the two regimes below are both
+        // shown to have been visited rather than assumed.
+        let mut blocks = Vec::new();
         for columns in [4usize, 16, 32] {
             let (family, states) = wide_reference_family(columns);
             assert!(
@@ -998,6 +1001,7 @@ mod tests {
             );
             let p = family.total_width();
             let b = p.div_ceil(W);
+            blocks.push(b);
             let gradient_passes = b;
             let hessian_passes = b * (b + 1) / 2;
             let values: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
@@ -1051,19 +1055,35 @@ mod tests {
             );
             assert_eq!(gradient.len(), p, "columns {columns}: gradient width");
             assert_eq!(hessian.len(), p * p, "columns {columns}: Hessian width");
-            assert!(
+            // `b(b+1)/2` exceeds `b` exactly above `b = 1`. At `b = 1` one
+            // tangent block spans the whole coefficient vector, so the dense
+            // Hessian IS the single block sweep the gradient already is and
+            // the two pass counts coincide — a true property of the model,
+            // not a miscount, and a width at which the ratio this instrument
+            // measures has nothing to improve. Asserting the equality's own
+            // boundary pins where the strictness comes from.
+            assert_eq!(
                 hessian_passes > gradient_passes,
-                "columns {columns}: the dense Hessian must make more passes than the gradient \
-                 ({hessian_passes} against {gradient_passes}); if it does not, the pass model \
-                 this cost ratio is derived from is wrong"
+                b > 1,
+                "columns {columns}: the dense Hessian makes {hessian_passes} passes against the \
+                 gradient's {gradient_passes} at b = {b}, and b(b+1)/2 exceeds b exactly above \
+                 b = 1"
             );
             assert!(
                 hessian_wall > gradient_wall,
                 "columns {columns}: the dense Hessian makes {hessian_passes} passes of the same \
-                 kind the gradient makes {gradient_passes} of, so it cannot be the faster of \
-                 the two ({hessian_wall:.4} s against {gradient_wall:.4} s)"
+                 kind the gradient makes {gradient_passes} of, and each carries a second-order \
+                 jet where the gradient's carries a first-order one, so it cannot be the faster \
+                 of the two ({hessian_wall:.4} s against {gradient_wall:.4} s)"
             );
         }
+        // Neither arm of the assertion above is vacuous: the widths reach both
+        // regimes, so one of them exercised the equality and another the
+        // strict inequality.
+        assert!(
+            blocks.iter().any(|&b| b == 1) && blocks.iter().any(|&b| b > 1),
+            "the widths must straddle b = 1 for the pass model to be pinned on both sides: {blocks:?}"
+        );
     }
 
     /// Four subjects on one once-only mark, a reference law on 24 equal steps,
