@@ -68,9 +68,22 @@ on:
 # The daily schedule above stays as the floor for a quiet main. A commissioned
 # build is keyed by the exact commit it promises and is never cancelled either;
 # an ordinary empty-input dispatch keeps newest-wins on its own ref.
+#
+# The SCHEDULED build is the floor, so it gets a group of its own and is never
+# cancelled. Under the previous expression a schedule fell through to the
+# ref-keyed group with `cancel-in-progress` true, because its event name is not
+# `push` and its `build_sha` input is empty: an ordinary empty-input dispatch on
+# main landed in the same `runtime-refs/heads/main` group and could kill the
+# nightly, and so could the next schedule. A floor that another lane can cancel
+# is not a floor. Only an empty-input dispatch keeps newest-wins now, on its own
+# ref, which is the one lane the comment above describes as wanting it.
 concurrency:
-  group: runtime-${{ github.event_name == 'push' && 'main' || github.event.inputs.build_sha || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'push' && github.event.inputs.build_sha == '' }}
+  group: >-
+    runtime-${{ github.event_name == 'push' && 'main'
+      || github.event_name == 'schedule' && 'scheduled-main'
+      || github.event.inputs.build_sha
+      || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build_sha == '' }}
 
 permissions:
   contents: write

@@ -63,16 +63,28 @@ jobs:
           runtime_run_id=""
           runtime_sha=""
           runtime_artifact=""
+          runtime_created=""
+          # wheel-nightly.yml builds on `cron: '19 4 * * *'`, one period a day,
+          # so a healthy producer leaves at most 24 h between runtimes. A bound
+          # at one period would refuse every time a single build runs long or one
+          # cycle is missed, which is noise rather than a defect; a bound at two
+          # admits exactly one missed cycle and refuses two consecutive ones,
+          # which is the smallest gap that cannot happen while the producer is
+          # working. Nothing here is chosen: change the producer's cron and this
+          # is twice its period.
+          runtime_max_age_hours=48
           while read -r candidate_run; do
             if [[ -z "$candidate_run" ]]; then
               continue
             fi
-            candidate_artifact=$(gh api \
+            candidate_row=$(gh api \
               "repos/${GITHUB_REPOSITORY}/actions/runs/${candidate_run}/artifacts?per_page=100" \
-              --jq '[.artifacts[] | select((.name | test("^gamfit-runtime-[0-9a-f]{40}$")) and (.expired == false)) | .name] | if length == 1 then .[0] else "" end')
-            if [[ -z "$candidate_artifact" ]]; then
+              --jq '[.artifacts[] | select((.name | test("^gamfit-runtime-[0-9a-f]{40}$")) and (.expired == false)) | "\(.name)\t\(.created_at)"] | if length == 1 then .[0] else "" end')
+            if [[ -z "$candidate_row" ]]; then
               continue
             fi
+            candidate_artifact="${candidate_row%%$'\t'*}"
+            candidate_created="${candidate_row#*$'\t'}"
             candidate_sha="${candidate_artifact#gamfit-runtime-}"
             merge_base=$(gh api \
               "repos/${GITHUB_REPOSITORY}/compare/${candidate_sha}...${GITHUB_SHA}" \
@@ -83,6 +95,7 @@ jobs:
             runtime_run_id="$candidate_run"
             runtime_sha="$candidate_sha"
             runtime_artifact="$candidate_artifact"
+            runtime_created="$candidate_created"
             break
           done < <(gh run list --repo "$GITHUB_REPOSITORY" \
             --workflow wheel-nightly.yml \
@@ -95,14 +108,37 @@ jobs:
             echo "::error::No unexpired warm runtime artifact exists on the ancestry of ${GITHUB_SHA}; refusing a source-build fallback."
             exit 1
           fi
+          # Ancestry alone does not make a runtime current: every runtime ever
+          # built on this history is an ancestor of today's tip, so the check
+          # above passes on a binary of any age. Run 35689260220 benchmarked a
+          # nine-day-old one and reported the scheduled SHA, which reads as a
+          # measurement of a tree the binary does not contain (gam#4568, #4567).
+          # Age is therefore a second, independent condition on the SAME
+          # artifact the run would use, applied after the choice rather than
+          # inside the loop, so the message names the runtime that was actually
+          # selected.
+          runtime_age_hours=$(( ( $(date -u +%s) - $(date -u -d "$runtime_created" +%s) ) / 3600 ))
+          if (( runtime_age_hours > runtime_max_age_hours )); then
+            echo "::error::The newest warm runtime on the ancestry of ${GITHUB_SHA} is ${runtime_sha}, built ${runtime_age_hours}h ago, past the ${runtime_max_age_hours}h bound (twice wheel-nightly.yml's daily period). Benchmarking it would measure neither sha. Fix the producer: check \`gh workflow list --all | grep 'Rolling wheel'\` for disabled_manually, then \`gh workflow enable wheel-nightly.yml\`, or commission one with \`gh workflow run wheel-nightly.yml -f build_sha=${GITHUB_SHA}\`."
+            {
+              echo "runtime \`${runtime_sha}\` is ${runtime_age_hours}h old, past the ${runtime_max_age_hours}h bound; scheduled \`${GITHUB_SHA}\` was NOT benchmarked"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           printf 'run_id=%s\n' "$runtime_run_id" >> "$GITHUB_OUTPUT"
           printf 'sha=%s\n' "$runtime_sha" >> "$GITHUB_OUTPUT"
           printf 'artifact=%s\n' "$runtime_artifact" >> "$GITHUB_OUTPUT"
+          # First line of the run summary, because resolve-runtime gates every
+          # other job and so writes first: a reader who sees only that line must
+          # already know which binary produced the numbers below it.
           {
+            echo "runtime \`${runtime_sha}\` benchmarked as scheduled \`${GITHUB_SHA}\` (runtime age ${runtime_age_hours}h, bound ${runtime_max_age_hours}h)"
+            echo
             echo "### Large-scale runtime"
             echo
             echo "- scheduled workflow SHA: \`${GITHUB_SHA}\`"
             echo "- immutable runtime SHA: \`${runtime_sha}\`"
+            echo "- runtime built: \`${runtime_created}\` (${runtime_age_hours}h ago)"
             echo "- producer run: \`${runtime_run_id}\`"
             echo "- artifact: \`${runtime_artifact}\`"
           } >> "$GITHUB_STEP_SUMMARY"
