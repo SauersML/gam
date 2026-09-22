@@ -6627,14 +6627,85 @@ mod tests {
             "floor-age probit q' in log age",
         );
 
+        let theta_step = 1e-7_f64;
         let analytic = marginal_slope_baseline_offset_theta_partials(age, &cfg)
             .expect("partials")
             .expect("nonlinear");
-        let fd = fd_marginal_slope_baseline_offset(age, &cfg, &[1e-7, 1e-7]);
+        let fd = fd_marginal_slope_baseline_offset(age, &cfg, &[theta_step, theta_step]);
         assert_eq!(analytic.len(), fd.len());
+        // A central difference reports a derivative only as well as it can
+        // resolve one, and at the entry floor that is the binding bound rather
+        // than a rounding remark: `q′` is about 2.0e8 there and its difference
+        // across the step is about 1.1, a cancellation of 1.8e8, while the
+        // analytic `∂q′/∂θ = A(∂h/∂θ + h(qA − 1)∂H/∂θ)` carries a 72-fold
+        // cancellation of its own in `1 + (qA − 1)H`.
+        //
+        // The unit is one ulp in ONE probe: `ulp(2.031e8) = 2.98e-8` over the
+        // divisor `2h = 2e-7` is 0.149 of the reported derivative. What the
+        // bound has to say is how many probes may be wrong at once, and the
+        // answer for a bound is both: each carries at most `δ` of its own
+        // magnitude, so the difference carries at most their sum and the
+        // quotient at most `|v|·δ/h`, twice the one-probe unit. That is the
+        // triangle inequality and it holds however the two roundings happen to
+        // correlate; `√2` times the unit would instead assume they are
+        // independent, which is not something a test can assert.
+        //
+        // Written from the run that refused this grade: at suite 4057627f4b,
+        // census base 7e641c78b9, the panic read `floor-age weibull-probit q'
+        // theta[0]: analytic=5.655602e6 fd=5.655589e6 (tol=1.0e-6)` — a miss of
+        // 13.0 against a relative bar of 5.656, which is 43.6 ulps of `q′` at
+        // the triangle reading and 61.7 at the independent one. Those numbers
+        // are the fixture's own and can be recomputed from it, so this comment
+        // cannot drift from the code beneath it without the recomputation
+        // saying so.
+        //
+        // `δ` is not a guess either. Everything here is downstream of
+        // `q = Φ⁻¹(F)` at `F ≈ 5.2e-17`, and `standard_normal_quantile`'s own
+        // reference test holds it to `4e-15·|q|` relative; `A = S/φ(q)`
+        // inherits `|q|` times that, since `d(ln A)/dq = q`. So a fixed `1e-6`
+        // on `∂q′/∂θ` asks the tail quantile for about two ulps where it
+        // declares nineteen, and no correct derivative can meet it. The fixed
+        // bar still binds wherever the difference does resolve, which is why the
+        // two are taken together.
+        let quantile_relative = 4e-15_f64;
+        let fd_resolution = |magnitude: f64, relative: f64| magnitude.abs() * relative / theta_step;
+        let q_band = fd_resolution(q, quantile_relative);
+        let q_derivative_band = fd_resolution(q_derivative, quantile_relative * q.abs());
         for (k, ((aq, aqt), (fq, fqt))) in analytic.iter().zip(fd.iter()).enumerate() {
-            assert_close(*aq, *fq, 1e-6, &format!("floor-age weibull-probit q theta[{k}]"));
-            assert_close(*aqt, *fqt, 1e-6, &format!("floor-age weibull-probit q' theta[{k}]"));
+            assert_resolved(
+                *aq,
+                *fq,
+                1e-6,
+                q_band,
+                &format!("floor-age weibull-probit q theta[{k}]"),
+            );
+            assert_resolved(
+                *aqt,
+                *fqt,
+                1e-6,
+                q_derivative_band,
+                &format!("floor-age weibull-probit q' theta[{k}]"),
+            );
+        }
+        // The band is the comparison's resolution, not a licence: a derivative
+        // wrong by a thousandth still exceeds it on both channels, so nothing
+        // that could be a defect hides inside it.
+        let bound_of = |expected: f64, band: f64| (1e-6 * expected.abs().max(1.0)).max(band);
+        for (k, ((aq, aqt), (fq, fqt))) in analytic.iter().zip(fd.iter()).enumerate() {
+            let defect_q = (aq * 1e-3).abs();
+            let bound_q = bound_of(*fq, q_band);
+            assert!(
+                defect_q > bound_q,
+                "the q theta[{k}] bound {bound_q:.3e} admits a derivative wrong by a thousandth \
+                 ({defect_q:.3e})"
+            );
+            let defect_qt = (aqt * 1e-3).abs();
+            let bound_qt = bound_of(*fqt, q_derivative_band);
+            assert!(
+                defect_qt > bound_qt,
+                "the q' theta[{k}] bound {bound_qt:.3e} admits a derivative wrong by a thousandth \
+                 ({defect_qt:.3e})"
+            );
         }
 
         let age_entry = array![SURVIVAL_TIME_FLOOR, SURVIVAL_TIME_FLOOR];
@@ -7121,6 +7192,21 @@ mod tests {
                 ((eta_p - eta_m) / (2.0 * h), (od_p - od_m) / (2.0 * h))
             })
             .collect()
+    }
+
+    /// `assert_close` with a floor: the larger of the relative bar and the
+    /// resolution of the comparison itself, for a finite difference whose own
+    /// cancellation puts it below that bar. The bound that applied is printed,
+    /// so a reader sees which one the grade was taken against.
+    fn assert_resolved(actual: f64, expected: f64, tol: f64, band: f64, what: &str) {
+        let relative = tol * expected.abs().max(1.0);
+        let bound = relative.max(band);
+        let error = (actual - expected).abs();
+        assert!(
+            error <= bound,
+            "{what}: analytic={actual:.6e} fd={expected:.6e} error={error:.3e} \
+             bound={bound:.3e} (relative {relative:.3e}, difference resolution {band:.3e})"
+        );
     }
 
     fn assert_close(actual: f64, expected: f64, tol: f64, what: &str) {
