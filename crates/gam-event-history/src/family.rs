@@ -260,39 +260,6 @@ impl ReferenceTables {
     /// [`Self::carry_to_nodes`] for the node rows `rows` alone, on tables
     /// [`Self::check_carry`] accepted: a subject reads its own rows where it
     /// is evaluated instead of every subject's being formed up front.
-    /// The transpose of [`Self::carry_rows`] over the whole node set: given an
-    /// adjoint of the values `carry_rows` produced, the adjoint of the
-    /// normaliser they were carried from.
-    ///
-    /// `carry_rows` is the linear map `m_row,d = (1 − w) m_lower,d + w
-    /// m_upper,d`, so its transpose scatters each row's adjoint back onto the
-    /// two reference nodes that bracket it with the same two weights. This is
-    /// what lets the adjoint gradient of gam#2965 price the reference law
-    /// without ever making a reference point a coefficient: the whole cohort's
-    /// dependence on `m` arrives here as one vector.
-    pub(crate) fn scatter_rows<S: JetField>(
-        &self,
-        node_adjoint: &[S],
-        marks: usize,
-        total_nodes: usize,
-        zero: &S,
-    ) -> Vec<S> {
-        let nodes = self.grid.len();
-        let mut out = vec![zero.clone(); self.strata * nodes * marks];
-        for row in 0..total_nodes {
-            let base = self.node_stratum[row] * nodes;
-            let lower = (base + self.node_lower[row]) * marks;
-            let upper = (base + self.node_lower[row] + 1) * marks;
-            let weight = self.node_weight[row];
-            for d in 0..marks {
-                let bar = &node_adjoint[row * marks + d];
-                out[lower + d] = out[lower + d].add(&bar.scale(1.0 - weight));
-                out[upper + d] = out[upper + d].add(&bar.scale(weight));
-            }
-        }
-        out
-    }
-
     pub(crate) fn carry_rows<S: JetField>(&self, held: &[S], marks: usize, rows: std::ops::Range<usize>) -> Vec<S> {
         let nodes = self.grid.len();
         let mut out = Vec::with_capacity(rows.len() * marks);
@@ -672,7 +639,7 @@ impl EventHistoryFamily {
     ) -> Result<(S, Vec<S>, Vec<S>), String> {
         self.validate_states(states)?;
         if self.differentiates_the_computed_path() {
-            return self.adjoint_joint(states, u, v, derivatives);
+            return self.computed_joint(states, u, v, derivatives);
         }
         let marks = self.marks();
         let atoms = self.atoms;
@@ -892,19 +859,6 @@ impl EventHistoryFamily {
     /// on a gradient that is not the derivative of the value it tests.
     fn exact_gradient(&self, states: &[ParameterBlockState]) -> Result<Vec<f64>, String> {
         self.clear_reference_refusal();
-        // On the computed path the gradient is one cohort sweep, not
-        // `⌈p / TANGENT_WIDTH⌉` of them (#2965 step B). The family has ONE
-        // gradient, so the route that returns it is the route its Hessian is
-        // differentiated from; `exact_gradient_chunks` stays the forward-mode
-        // reference for every other family and for the tests that score the
-        // adjoint against it.
-        if self.differentiates_the_computed_path() {
-            let values: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
-            let (_, gradient) = self
-                .adjoint_value_and_gradient(states, &values)
-                .map_err(|error| error.to_string())?;
-            return Ok(gradient);
-        }
         let total = self.total_width();
         let mut gradient = vec![0.0; total];
         self.exact_gradient_chunks::<{ super::scalar::TANGENT_WIDTH }>(states, &mut gradient)?;
