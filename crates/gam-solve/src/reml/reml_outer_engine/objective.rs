@@ -1192,6 +1192,35 @@ pub(crate) fn reml_laml_evaluate(
                         // `trace − first[idx]` and cancellation-free at the rail.
                         let det_is_integer_rank = !penalty_supports_overlap(&penalty_supports, idx);
                         if det_is_integer_rank {
+                            // The structural predicate CHOSE this identity; it did not CHECK
+                            // it. The fused value below forms its `−rank` det term from this
+                            // coordinate alone and never reads `det1[k]`, so a coordinate whose
+                            // cost-side `det1[k]` is not this rank has its det term silently
+                            // replaced, and the gradient this evaluation publishes stops being
+                            // the derivative of the cost the same evaluation reported. The
+                            // weighted chart below refuses its own fused value on exactly this
+                            // question; this branch asserted its identity instead of asking,
+                            // and the sentinel fixture whose whole arming mechanism is an
+                            // inflated `penalty_logdet.first` is what noticed
+                            // (`build_sentinel_tripwire_solution`, four envelope-tripwire
+                            // regressions).
+                            //
+                            // Both numbers are the same integer reached two ways: one from the
+                            // cost's eigendecomposition of `S_λ`, one from the coordinate's
+                            // stored rank. A real disagreement is therefore at least one whole
+                            // unit of rank, and the only gap to allow is the `p`-term
+                            // accumulation the trace is summed over — the same band form the
+                            // weighted chart's gate uses, without its whitening term, since no
+                            // second pseudo-inverse is formed on this branch. Written so a
+                            // non-finite difference refuses the fused value rather than
+                            // accepting it, as that gate is.
+                            let integer_band = gam_linalg::roundoff::accumulation_band(
+                                p,
+                                rank as f64 + det1_k.abs(),
+                            );
+                            if !((det1_k - rank as f64).abs() <= integer_band) {
+                                return None;
+                            }
                             let is_square_full_rank = end - start == rank;
                             let fused = if is_square_full_rank {
                                 ds.fused_logdet_gradient_minus_rank_full_block(
