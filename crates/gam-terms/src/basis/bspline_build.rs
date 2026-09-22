@@ -1649,6 +1649,14 @@ pub fn estimate_penalty_nullity(penalty: &Array2<f64>) -> Result<usize, BasisErr
 pub(crate) struct PsdSpectralSummary {
     pub(crate) min_eigenvalue: f64,
     pub(crate) max_abs_eigenvalue: f64,
+    /// The bound [`validate_psd_penalty`] refused a negative eigenvalue beyond:
+    /// the NOISE cutoff [`spectral_noise_tolerance`], not the rank cutoff
+    /// `effective_rank` was counted at. The two were one number until
+    /// `0f72c1e70e` (#2901) moved the rank cutoff to `dim·ε·max|λ|`, and this
+    /// field kept reporting the rank cutoff while the check applied the noise
+    /// cutoff, 4.5e5 times wider. A caller asserting `min_eigenvalue ≥
+    /// −tolerance` on a summary the check had just accepted could then fail on
+    /// roundoff the check deliberately admits.
     pub(crate) tolerance: f64,
     pub(crate) effective_rank: usize,
 }
@@ -2018,15 +2026,16 @@ pub(crate) fn validate_psd_penalty(
         return Ok(PsdSpectralSummary {
             min_eigenvalue: 0.0,
             max_abs_eigenvalue: 0.0,
-            tolerance: 1e-10,
+            // An empty block has no spectrum to scale against; carry the noise
+            // convention itself, as `analyze_penalty_block_with_op` does.
+            tolerance: SPECTRAL_NOISE_RELATIVE_TOLERANCE,
             effective_rank: 0,
         });
     }
 
     let (_, evals, _) = spectral_summary(penalty)?;
-    let tolerance = spectral_tolerance(&evals);
-    let classes =
-        SpectralClassification::new(&evals, tolerance, spectral_noise_tolerance(&evals));
+    let tolerance = spectral_noise_tolerance(&evals);
+    let classes = SpectralClassification::new(&evals, spectral_tolerance(&evals), tolerance);
     let min_eigenvalue = evals.iter().copied().fold(f64::INFINITY, f64::min);
     let max_abs_eigenvalue = evals
         .iter()
@@ -4651,5 +4660,42 @@ mod psd_cone_projection_tests {
             }
             other => panic!("expected IndefinitePenalty, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod psd_summary_tolerance_tests {
+    use super::*;
+    use ndarray::array;
+
+    /// A summary the PSD check accepted must satisfy its own reported bound.
+    ///
+    /// `−1e-13` relative to `λ_max = 1` is inside the noise cutoff the check
+    /// refuses beyond (`2·1e-10`) and outside the rank cutoff (`2·ε`). Before the
+    /// fix the summary reported the rank cutoff, so `min ≥ −tolerance` failed on
+    /// a penalty `validate_psd_penalty` had just accepted, which is what the
+    /// thin-plate builder asserts after calling it: the positive control is this
+    /// assertion on the old field.
+    #[test]
+    fn an_accepted_penalty_satisfies_the_bound_its_summary_reports() {
+        let penalty = array![[1.0, 0.0], [0.0, -1.0e-13]];
+        let evals = array![-1.0e-13, 1.0];
+        assert!(
+            -1.0e-13 < -spectral_tolerance(&evals) && -1.0e-13 > -spectral_noise_tolerance(&evals),
+            "the fixture's negative eigenvalue must sit between the two cutoffs"
+        );
+        let summary = validate_psd_penalty(
+            &penalty,
+            "noise-band penalty",
+            "roundoff inside the noise band is not indefiniteness",
+        )
+        .expect("a negative eigenvalue inside the noise cutoff is accepted");
+        assert!(
+            summary.min_eigenvalue >= -summary.tolerance,
+            "accepted summary violates its own bound: min_eigenvalue={:e}, tolerance={:e}",
+            summary.min_eigenvalue,
+            summary.tolerance
+        );
+        assert_eq!(summary.effective_rank, 1, "the rank is still counted at the rank cutoff");
     }
 }

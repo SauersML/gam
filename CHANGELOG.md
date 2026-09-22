@@ -1,5 +1,10 @@
 ## Unreleased
 
+- **The Duchon range floor's ψ-jet clamps exactly the modes the value clamps** (#2959, #2735). The
+  jet carried its own `dim·1e-8·λ_max` floor after #2901 moved the value's floor to
+  `100·dim·ε·λ_max`, so it clamped modes the value left alone and replaced their `λ'` with the
+  floor's. Both now read `duchon_range_floor`. The PSD summary also reports the noise cutoff its
+  check applies, not the rank cutoff, so an accepted penalty satisfies its own reported bound.
 - **Outer-evidence probes a test arms on its own thread reach the fit again** (#4566). The fit
   entry points run on a pool worker, where a caller's thread-local is empty, so every armed seed
   observer and ρ-block audit went unread and the tests reported "the outer runner lent no seed

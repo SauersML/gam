@@ -1171,12 +1171,7 @@ pub(crate) fn duchon_range_floor_curvature(
     if !lam_max.is_finite() || lam_max <= 0.0 {
         return Ok(sym);
     }
-    // Read the cutoff from the same helper `analyze_penalty_block` scores this
-    // block with, at the EMBEDDED dimension, and lift by the stated margin.
-    // Writing the product out as a literal is what let the doc comment above
-    // drift to "one decade" while the code kept two.
-    let floor = RANGE_FLOOR_ABOVE_SPECTRAL_RANK_CUTOFF
-        * spectral_tolerance_for_dim(embedded_penalty_dim.max(n), &evals);
+    let floor = duchon_range_floor(embedded_penalty_dim.max(n), &evals);
     let mut floored = false;
     for v in evals.iter_mut() {
         if v.is_finite() && *v < floor {
@@ -1204,11 +1199,31 @@ pub(crate) fn duchon_range_floor_curvature(
     Ok(symmetrize_penalty(&out))
 }
 
+/// The eigenvalue [`duchon_range_floor_curvature`] lifts a spectrum's low
+/// modes to: [`RANGE_FLOOR_ABOVE_SPECTRAL_RANK_CUTOFF`] times the rank cutoff
+/// `analyze_penalty_block` scores the block with, at the embedded dimension.
+///
+/// The value and its ψ-jet ([`duchon_range_floor_curvature_psi_jet`]) both read
+/// the floor here. The jet used to carry its own copy, `dim·1e-8·λ_max`, which
+/// was this floor while the cutoff was `dim·1e-10·λ_max`. `0f72c1e70e` (#2901)
+/// moved the cutoff to the eigensolver's band `dim·ε·λ_max` and the forward floor
+/// with it, and the jet kept `1e-8`: 4.5e5 times the floor the value applies. The
+/// jet then clamped every mode between the two, replacing its own `λ'` with the
+/// floor's, in a block whose value did not clamp it (gam#2735).
+///
+/// The cutoff is linear in `max|λ|`, so the floor is `c·max|λ|` with `c`
+/// constant in ψ, which is what the jet differentiates.
+pub(crate) fn duchon_range_floor(embedded_penalty_dim: usize, evals: &Array1<f64>) -> f64 {
+    RANGE_FLOOR_ABOVE_SPECTRAL_RANK_CUTOFF
+        * spectral_tolerance_for_dim(embedded_penalty_dim, evals)
+}
+
 /// First and second log-κ (ψ) derivatives of the range-floored curvature Gram.
 ///
 /// The forward `duchon_native_penalty_candidates` ships the `Primary` block as
 /// `range_floor(Ω(ψ))`, where `range_floor` clamps every eigenvalue below
-/// `floor(ψ) = max(embedded_dim, n)·1e-8·λ_max(Ω(ψ))` up to that floor (#1815).
+/// `floor(ψ) = c·λ_max(Ω(ψ))` up to that floor (#1815), `c` read from
+/// [`duchon_range_floor`] so the value and this jet clamp the same modes.
 /// The clamp is a spectral function `Ω ↦ U max(Λ, φ) Uᵀ` whose threshold `φ`
 /// itself moves with ψ (through `λ_max`), so its ψ-derivative is NOT the plain
 /// `Ω'`: the near-null curvature modes — precisely the high-frequency modes with
@@ -1257,8 +1272,9 @@ pub(crate) fn duchon_range_floor_curvature_psi_jet(
     if !lam_max.is_finite() || lam_max <= 0.0 {
         return Ok(passthrough());
     }
-    let c = (embedded_penalty_dim.max(n) as f64) * 1e-8;
-    let floor = c * lam_max;
+    // The forward floor, and its ratio to `λ_max`: `φ(ψ) = c·λ_max(ψ)`.
+    let floor = duchon_range_floor(embedded_penalty_dim.max(n), &evals);
+    let c = floor / lam_max;
     // No mode below the floor ⇒ the clamp is locally the identity, so the plain
     // derivatives pass through unchanged (matches `range_floor`'s early return).
     if !evals.iter().any(|&v| v.is_finite() && v < floor) {
@@ -4269,14 +4285,40 @@ mod range_floor_psi_jet_tests {
         m
     }
 
+    /// The embedded dimension the floor is scored at, larger than the block so
+    /// the floor is the embedded one.
+    const EMBEDDED_DIM: usize = 8;
+
+    /// Rotate `m` into the base eigenbasis, zero its block on the two clamped
+    /// modes, and rotate back. A perturbation with no component inside the
+    /// clamped subspace moves those eigenvalues only at second order, so they
+    /// stay under the floor across the difference stencil.
+    fn without_clamped_block(m: &Array2<f64>, u: &Array2<f64>) -> Array2<f64> {
+        let mut eig = u.t().dot(m).dot(u);
+        for i in 3..5 {
+            for j in 3..5 {
+                eig[[i, j]] = 0.0;
+            }
+        }
+        u.dot(&eig).dot(&u.t())
+    }
+
     // Controlled model: Ω(ψ) = Ω0 + ψ·B + ½ψ²·C with a WELL-SEPARATED base
-    // spectrum whose two smallest modes sit ~100× below the range floor and a
-    // deliberately SMALL non-commuting perturbation, so (a) the clamped set is
-    // stable across ±eps (the clamp is only C⁰ where a mode crosses the floor,
+    // spectrum whose two smallest modes sit 100× and 1000× below the range floor
+    // and a deliberately SMALL non-commuting perturbation, so (a) the clamped set
+    // is stable across ±eps (the clamp is only C⁰ where a mode crosses the floor,
     // which would corrupt a finite difference) while (b) B does not commute with
     // Ω0, rotating the eigenvectors so the off-diagonal Daleckii–Krein terms are
     // genuinely exercised. Ω0 = U diag(d) Uᵀ with U the eigenvectors of a fixed
     // symmetric seed and d spanning the floor boundary.
+    //
+    // The two low modes are placed relative to THE floor, `duchon_range_floor`,
+    // rather than at literals: they were `5e-10` and `5e-11`, under the
+    // `dim·1e-8` floor the jet carried and above the `100·dim·ε` floor the
+    // value applies since #2901, so the jet clamped them and the value did not
+    // (gam#2735). B and C have no component inside the clamped pair, which is
+    // what (a) needs once the floor is `100·dim·ε` rather than `dim·1e-8`: a
+    // first-order motion of `eps·1e-3` would otherwise carry them across it.
     fn omega_at(psi: f64) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
         let n = 5usize;
         let seed = sym_from(
@@ -4286,9 +4328,10 @@ mod range_floor_psi_jet_tests {
             n,
         );
         let (_evals, u) = FaerEigh::eigh(&seed, Side::Lower).expect("seed eigh");
-        // Target spectrum: three modes well above the floor (8e-8·λmax = 8e-8),
-        // two modes ~100× below it and mutually separated by 10×.
-        let d = [1.0_f64, 0.08, 0.006, 5.0e-10, 5.0e-11];
+        // Target spectrum: three modes well above the floor, two 100× and 1000×
+        // below it. `λ_max = 1`, so the floor is read at that spectrum.
+        let floor = duchon_range_floor(EMBEDDED_DIM, &ndarray::array![1.0_f64, 0.08, 0.006]);
+        let d = [1.0_f64, 0.08, 0.006, floor / 100.0, floor / 1000.0];
         let mut base = Array2::<f64>::zeros((n, n));
         for i in 0..n {
             for j in 0..n {
@@ -4316,6 +4359,8 @@ mod range_floor_psi_jet_tests {
             n,
         )
         .mapv(|v| v * scale);
+        let b = without_clamped_block(&b, &u);
+        let c = without_clamped_block(&c, &u);
         let omega = &base + &b.mapv(|v| v * psi) + &c.mapv(|v| v * 0.5 * psi * psi);
         let omega_psi = &b + &c.mapv(|v| v * psi);
         (omega, omega_psi, c)
@@ -4323,7 +4368,7 @@ mod range_floor_psi_jet_tests {
 
     #[test]
     fn range_floor_psi_jet_matches_central_differences() {
-        let dim = 8usize; // embedded_penalty_dim > n so the floor is active
+        let dim = EMBEDDED_DIM; // embedded_penalty_dim > n so the floor is active
         let (o0, b0, c0) = omega_at(0.0);
         let jet =
             duchon_range_floor_curvature_psi_jet(&o0, &b0, &c0, dim).expect("range-floor psi jet");
@@ -4403,6 +4448,44 @@ mod range_floor_psi_jet_tests {
             second_err / second_scale < 1e-3,
             "range-floor second derivative mismatch: rel={:.3e} (err={second_err:.3e})",
             second_err / second_scale
+        );
+    }
+
+    /// gam#2735: the jet clamps exactly the modes the value clamps.
+    ///
+    /// A mode at `1e-10·λ_max` sits above the value's floor (`100·dim·ε·λ_max`
+    /// since #2901) and below the `dim·1e-8·λ_max` the jet used to carry. The
+    /// value leaves it alone, so the clamp is locally the identity and the jet
+    /// must pass `Ω'` through untouched. The old jet clamped it and replaced its
+    /// `λ'` with the floor's: that is the positive control, and it is what this
+    /// assertion fails on.
+    #[test]
+    fn range_floor_jet_passes_through_a_mode_the_value_does_not_clamp_2735() {
+        let omega = ndarray::array![[1.0, 0.0], [0.0, 1.0e-10]];
+        let omega_psi = ndarray::array![[0.3, 0.2], [0.2, 0.7]];
+        let omega_psi_psi = ndarray::array![[0.1, -0.05], [-0.05, 0.4]];
+        let floored = duchon_range_floor_curvature(&omega, EMBEDDED_DIM).expect("range floor");
+        assert_eq!(
+            floored,
+            symmetrize_penalty(&omega),
+            "the fixture's low mode must sit above the value's floor"
+        );
+        let jet = duchon_range_floor_curvature_psi_jet(
+            &omega,
+            &omega_psi,
+            &omega_psi_psi,
+            EMBEDDED_DIM,
+        )
+        .expect("range-floor psi jet");
+        assert_eq!(
+            jet.first,
+            symmetrize_penalty(&omega_psi),
+            "the jet clamped a mode the value does not clamp: its first derivative is not Ω'"
+        );
+        assert_eq!(
+            jet.second,
+            symmetrize_penalty(&omega_psi_psi),
+            "the jet clamped a mode the value does not clamp: its second derivative is not Ω''"
         );
     }
 
