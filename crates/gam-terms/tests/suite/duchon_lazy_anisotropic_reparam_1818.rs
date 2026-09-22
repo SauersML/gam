@@ -10,7 +10,7 @@ use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam_runtime::resource::ResourcePolicy;
 use gam_terms::basis::{
     BasisMetadata, BasisWorkspace, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
-    DuchonOperatorPenaltySpec, build_duchon_basiswithworkspace,
+    DuchonOperatorPenaltySpec, SpatialIdentifiability, build_duchon_basiswithworkspace,
 };
 use ndarray::{Array1, Array2, Axis, s};
 
@@ -32,7 +32,21 @@ fn lazy_anisotropic_duchon_uses_data_metric_radial_chart() {
         length_scale: None,
         power: 0.5,
         nullspace_order: DuchonNullspaceOrder::Linear,
-        identifiability: Default::default(),
+        // `SpatialIdentifiability::None`, NOT the default, and the certificate
+        // below is why. The default is `OrthogonalToParametric`, and for a
+        // direct `build_duchon_basiswithworkspace` call that is not inert:
+        // `spatial_identifiability_transform_from_design_matrix` returns
+        // `Some(Z)` for it and the builder then wraps the design in `Z`. The
+        // realized columns would be `K·Z_k·V·Z`, so the Gram measured below
+        // would be `ZᵀVᵀG_cVZ`, which is not `I` and is not supposed to be —
+        // the assertion would be reporting the centering, not the chart.
+        // (The term-collection path never hits this: its Duchon arm downgrades
+        // `OrthogonalToParametric` to `None` and leaves the centering to the
+        // collection. A direct caller like this fixture does hit it.)
+        // Identifiability is orthogonal to what this test covers — whether the
+        // LAZY anisotropic branch computes and applies `V` at all — so removing
+        // it removes a confound rather than any coverage.
+        identifiability: SpatialIdentifiability::None,
         aniso_log_scales: Some(vec![0.7, -0.7]),
         operator_penalties: DuchonOperatorPenaltySpec::all_disabled(),
         boundary: Default::default(),
@@ -65,9 +79,16 @@ fn lazy_anisotropic_duchon_uses_data_metric_radial_chart() {
     );
 
     // `V` is defined by Vᵀ G_c V = I.  The first `V.ncols()` columns of the
-    // operator are exactly K·Z·V, so their training-data Gram is the
-    // coordinate-free executable certificate that the lazy branch applied the
-    // generalized-eigen chart rather than merely persisting metadata.
+    // operator are exactly K·Z·V — which holds because the spec above declares
+    // `SpatialIdentifiability::None`, so no further transform is wrapped around
+    // the design — and their training-data Gram is therefore the coordinate-free
+    // executable certificate that the lazy branch applied the generalized-eigen
+    // chart rather than merely persisting metadata.
+    //
+    // THE BAR IS NOT MOVED. It stays at 1e-8. What changed is that the columns
+    // being measured are now the ones the sentence above claims they are. If
+    // this still fails, the residual is the lazy branch's and the number can be
+    // trusted as such (gam#2959).
     //
     // Compute that Gram through operator products. Calling `to_dense()` here
     // would contradict the fixture's one-byte materialization ceiling and test
