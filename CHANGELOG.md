@@ -26,6 +26,16 @@
   `linear_dictionary_transform`, from both pyffi entry points and from the Python signature and
   stubs. The sparse lane's `code_ridge` is untouched: there it is explicitly an initial value
   that the fit selects from and records in `selected_rho`.
+- Four #2433 / #2735 fixtures were tuned to `spectral_tolerance = dim·1e-10·λ_max`, which
+  `0f72c1e70e` (#2901) replaced with the spectrum's rounding band `dim·ε·λ_max`, five to
+  seven decades tighter. Three are retuned so their modes sit in the window where the
+  factor and Gram routes actually differ, which is the `√ε`-versus-`ε` gap those tests are
+  about. Two of them are negative controls, so reading their rank from the reader under
+  test would have made them vacuous (#1561, #2433, #2735, #2901).
+- `axis_relevance_block_keeps_every_mode_its_factor_resolves_2735` is left failing with the
+  reason recorded: at its shape the Gram's rounding band is smaller than its own
+  accumulation noise, so no mode can be placed where the bridge reliably truncates it. It
+  needs its sibling's shape, and the two should be merged.
 
 - **A damped representer column gets the anchor's scale motion instead of a refusal** (#2902
   row 5). The column-scale term landed in `7adbe5963a` refused whenever a kept chart column was
