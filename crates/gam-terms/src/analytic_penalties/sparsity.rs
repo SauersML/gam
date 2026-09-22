@@ -514,7 +514,11 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
-        assert_eq!(rho.len(), 1, "softmax entropy expects one rho parameter");
+        assert_eq!(
+            rho.len(),
+            self.rho_count(),
+            "softmax entropy takes one rho coordinate exactly when its strength is learnable"
+        );
         assert!(
             rho.iter().all(|value| value.is_finite()),
             "softmax entropy rho must be finite"
@@ -611,7 +615,11 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
-        assert_eq!(rho.len(), 1, "softmax entropy expects one rho parameter");
+        assert_eq!(
+            rho.len(),
+            self.rho_count(),
+            "softmax entropy takes one rho coordinate exactly when its strength is learnable"
+        );
         assert_eq!(
             target.len() % self.k_atoms,
             0,
