@@ -3498,7 +3498,18 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         // The per-term penalties live contiguously in the collection penalty
         // list at the term's `coeff_range` (single-spatial-term collection).
         let p_total = self.design.design.ncols();
-        let (locals, nullspace_dims): (Vec<Array2<f64>>, Vec<usize>) = match &term.metadata {
+        // The trial-ψ ENERGY FACTOR travels beside the trial-ψ Gram (gam#2959).
+        // A block's rank is a property of its factor: a direction whose factor
+        // singular value is `σ` appears in `S = AᵀA` as `σ²`, so the Gram
+        // resolves it only above `√(p·ε)` relative where the factor resolves it
+        // above `max(m,n)·ε`. Reading the rank off the Gram therefore loses half
+        // the digits, which is what makes a Matérn collocation rank move with κ
+        // and refuse a frozen rank one step from the build ψ.
+        let (locals, nullspace_dims, energy_factors): (
+            Vec<Array2<f64>>,
+            Vec<usize>,
+            Vec<Option<Array2<f64>>>,
+        ) = match &term.metadata {
             BasisMetadata::Duchon {
                 centers,
                 identifiability_transform,
@@ -3525,7 +3536,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                         .to_standardized_units(gam_terms::OriginalUnits::new(length))
                         .standardized_value()
                 });
-                gam_terms::basis::duchon_penalties_at_length_scale(
+                let (locals, nullspace_dims) = gam_terms::basis::duchon_penalties_at_length_scale(
                     centers.view(),
                     identifiability_transform.as_ref(),
                     operator_collocation_points.as_ref().map(|p| p.view()),
@@ -3537,7 +3548,19 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     effective_ls,
                     &mut self.basisworkspace,
                 )
-                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+                // THIS ENTRY POINT returns dense Grams, so there is no factor to
+                // carry HERE and the rank reader falls back to the Gram for these
+                // blocks. Not a statement about Duchon penalties in general:
+                // `filter_penalty_candidates` is basis-agnostic and records a
+                // factor for every candidate that reaches it, so a Duchon block
+                // built through the candidate path does carry one. It is this
+                // re-key's shortcut past that path that loses it. If a Duchon
+                // re-key row ever refuses on a frozen rank, the change is to have
+                // `duchon_penalties_at_length_scale` return the factors it
+                // already forms.
+                let factors = vec![None; locals.len()];
+                (locals, nullspace_dims, factors)
             }
             BasisMetadata::Matern {
                 centers,
@@ -3592,7 +3615,15 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     .iter()
                     .map(|penalty| penalty.nullity)
                     .collect();
-                (locals, nullspace_dims)
+                // The factor the triplet builder formed AT THIS ψ, from the same
+                // `ActivePenalty` the Gram came from — never the frozen
+                // template's, which describes the build ψ.
+                let factors = filtered
+                    .active
+                    .iter()
+                    .map(|penalty| penalty.info.energy_factor.clone())
+                    .collect();
+                (locals, nullspace_dims, factors)
             }
             BasisMetadata::ThinPlate {
                 centers,
@@ -3607,15 +3638,20 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     SmoothBasisSpec::ThinPlate { spec, .. } => spec.double_penalty,
                     _ => false,
                 };
-                gam_terms::basis::thin_plate_penalties_at_length_scale(
-                    centers.view(),
-                    identifiability_transform.as_ref(),
-                    radial_reparam.as_ref(),
-                    ls,
-                    double_penalty,
-                    &mut self.basisworkspace,
-                )
-                .map_err(|e| e.to_string())?
+                let (locals, nullspace_dims) =
+                    gam_terms::basis::thin_plate_penalties_at_length_scale(
+                        centers.view(),
+                        identifiability_transform.as_ref(),
+                        radial_reparam.as_ref(),
+                        ls,
+                        double_penalty,
+                        &mut self.basisworkspace,
+                    )
+                    .map_err(|e| e.to_string())?;
+                // Dense Grams from this entry point, as for Duchon above, and
+                // with the same caveat: the candidate path would carry a factor.
+                let factors = vec![None; locals.len()];
+                (locals, nullspace_dims, factors)
             }
             other => {
                 return Err(format!(
@@ -3637,15 +3673,105 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 templates.len()
             ));
         }
+        // WHICH BLOCK A FROZEN-RANK REFUSAL NAMES, read off its own numbers
+        // (gam#2959). A Matérn term ships the operator triplet {mass, tension,
+        // stiffness} and, for ν ≥ 5/2, a fourth third-order block. They fail for
+        // different reasons and the frozen rank says which one is talking:
+        //
+        //   rank == block width          a TRIPLET block, full rank with one
+        //                                marginal direction collapsing at the
+        //                                trial. Under `CenterSumToZero` the
+        //                                width is `k − 1` for `k` centres, so
+        //                                this reads as `rank == k − 1`. These
+        //                                blocks have an exact energy factor, so
+        //                                the factor carried below resolves the
+        //                                mode the Gram cannot: `σ` against the
+        //                                factor's band where the Gram offers
+        //                                `σ²` against its own.
+        //   rank == width − (d+1)(d+2)/2 the THIRD-ORDER block, whose null space
+        //                                is the degree-≤2 polynomials (six
+        //                                directions in d = 2). Its only
+        //                                representation is a Gram — there is no
+        //                                `d3` on `CollocationOperatorMatrices` —
+        //                                so its "factor" is the eigen-root of an
+        //                                already-truncated reconstruction and
+        //                                nothing below helps it.
+        //
+        // Measured: seven refusals across #2959 and #1561 — this path's row at
+        // rank 23 on 24 centres, and six reference-quality rows at 29/30, 24/25,
+        // 24/25, 19/20 and 19/20 — are all `rank == k − 1`, i.e. all triplet
+        // blocks. The discriminator settled all six in one query after a
+        // mechanism-first reading had attributed them to the third-order block.
+        // Keep it here rather than in an issue thread: it is read off the
+        // refusal, needs no rerun, and the mechanism-first mistake is the easy
+        // one to repeat.
+        //
+        // THE FACTOR MUST DESCRIBE THE GRAM IT SHIPS WITH (gam#2959). `AᵀA` is
+        // the Gram by construction at the point the factor was formed
+        // (`ConstructiveQuadratic::from_energy_factor` computes the matrix AS
+        // `fast_ata(&factor)`), so this cannot fail for a factor that travelled
+        // with its own block — which is exactly why it is worth asserting here,
+        // where the two have just been carried through a re-key that could pair
+        // them wrongly. A BAND and not an equality: what reaches
+        // `ActivePenalty.matrix` is the symmetrized form, and symmetrizing a
+        // matrix already symmetric to roundoff still moves its last bits.
+        for (idx, (local, factor)) in locals.iter().zip(energy_factors.iter()).enumerate() {
+            let Some(factor) = factor.as_ref() else {
+                continue;
+            };
+            if factor.ncols() != local.ncols() {
+                return Err(format!(
+                    "n-free penalty re-key block {idx}: energy factor has {} columns but its \
+                     Gram has {} — the factor does not describe this block",
+                    factor.ncols(),
+                    local.ncols()
+                ));
+            }
+            let reconstructed = gam_linalg::faer_ndarray::fast_ata(factor);
+            let defect = reconstructed
+                .iter()
+                .zip(local.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            let scale = local.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+            let band = local.ncols() as f64 * f64::EPSILON * scale;
+            if defect > band {
+                return Err(format!(
+                    "n-free penalty re-key block {idx}: AᵀA differs from the Gram it ships with \
+                     by {defect:e}, past the symmetrization band dim·ε·max|S| = {band:e}; the \
+                     factor and the Gram are from different ψ"
+                ));
+            }
+        }
+        // `col_range` is the one genuinely ψ-invariant field and keeps coming
+        // from the template. The structure hint does NOT: it now carries the
+        // TRIAL ψ's energy factor, because a hint copied from the template would
+        // hand the rank reader a build-ψ factor beside a trial-ψ Gram and it
+        // would read a rank for a penalty nobody is pricing — a plausible wrong
+        // answer instead of a refusal, which is strictly worse than the refusal
+        // this exists to remove.
+        //
+        // `op` is left on the template deliberately and is NOT part of this
+        // change. It is the same class of staleness — the type documents it as
+        // "bit-equivalent to `local`", and the template's is equivalent to the
+        // template's `local`, not to this one — but it is inert here, because
+        // this path ships dense Grams and nothing on it consults the op instead
+        // of the matrix. Moving it needs its own measurement of what reads it,
+        // and pairing that with this change would make one gate answer two
+        // questions.
         let specs: Vec<gam_solve::estimate::PenaltySpec> = templates
             .iter()
             .zip(locals.into_iter())
-            .map(|(tmpl, local)| gam_solve::estimate::PenaltySpec::Block {
-                local,
-                col_range: tmpl.col_range.clone(),
-                structure_hint: tmpl.structure_hint.clone(),
-                op: tmpl.op.clone(),
-            })
+            .zip(energy_factors.into_iter())
+            .map(
+                |((tmpl, local), factor)| gam_solve::estimate::PenaltySpec::Block {
+                    local,
+                    col_range: tmpl.col_range.clone(),
+                    structure_hint: factor
+                        .map(gam_terms::smooth::PenaltyStructureHint::EnergyFactor),
+                    op: tmpl.op.clone(),
+                },
+            )
             .collect();
         let canonical = gam_terms::construction::canonicalize_penalty_specs_at_frozen_ranks(
             &specs,
