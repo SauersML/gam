@@ -2311,7 +2311,14 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
                 Ok(a)
             },
         )
-        .map(|fold| fold.matrix)
+        .map(|mut fold| {
+            // The fold's `(a, b)` channel loop gives each triangle its own
+            // accumulation, so the total is symmetric only up to rounding; the
+            // consumer that eigendecomposes it declares `Mirrored`, whose band is
+            // exactly zero (gam#1561).
+            mirror_pullback_in_place(&mut fold.matrix);
+            fold.matrix
+        })
     }
 
     fn directional_derivative_dense(
@@ -2335,7 +2342,14 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
                 Ok(a)
             },
         )
-        .map(|fold| fold.matrix)
+        .map(|mut fold| {
+            // The fold's `(a, b)` channel loop gives each triangle its own
+            // accumulation, so the total is symmetric only up to rounding; the
+            // consumer that eigendecomposes it declares `Mirrored`, whose band is
+            // exactly zero (gam#1561).
+            mirror_pullback_in_place(&mut fold.matrix);
+            fold.matrix
+        })
     }
 
     fn second_directional_derivative_dense(
@@ -2362,7 +2376,14 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
                 Ok(a)
             },
         )
-        .map(|fold| fold.matrix)
+        .map(|mut fold| {
+            // The fold's `(a, b)` channel loop gives each triangle its own
+            // accumulation, so the total is symmetric only up to rounding; the
+            // consumer that eigendecomposes it declares `Mirrored`, whose band is
+            // exactly zero (gam#1561).
+            mirror_pullback_in_place(&mut fold.matrix);
+            fold.matrix
+        })
     }
 }
 
@@ -2437,6 +2458,39 @@ fn axis_direction_from_channel_cache(
         }
     }
     dir
+}
+
+/// Make a pullback's two triangles ONE rounded value per off-diagonal pair, as
+/// [`gam_linalg::roundoff::SymmetricAssembly::Mirrored`] requires of the matrix
+/// that declares it (gam#1561, gam#3090).
+///
+/// `add_pullback_hessian` accumulates entry `(i, j)` and entry `(j, i)` in
+/// SEPARATE passes of its `(a, b)` channel loop. `JᵀHJ` is symmetric in exact
+/// arithmetic, but the two passes take the same multiset of products in
+/// different orders and associate them differently — `(h_ab·J_a[i])·J_b[j]`
+/// against `(h_ba·J_b[j])·J_a[i]` — and IEEE multiplication and addition are
+/// commutative without being associative. Wherever two channels share a
+/// coefficient block, which this lowering does by construction (three channels
+/// per block, plus the wiggle), the two triangles then differ in their last
+/// bits. That is the mechanism gam#1561 removed from the packed `DenseFull`
+/// assembly by contributing `product + product.t()` as one quantity; this route
+/// does not go through that assembly and carried it still.
+///
+/// `(M + Mᵀ)/2` is one of the constructions `Mirrored` names, and this writes
+/// the one computed average into both entries, so the result is bitwise
+/// symmetric whatever order the fold combined its chunks in. It is also no less
+/// accurate than either triangle alone: the two are independent roundings of one
+/// real number, and their average is at least as close to it as the worse of
+/// them. The diagonal is untouched — it has no pair to reconcile.
+pub(crate) fn mirror_pullback_in_place(matrix: &mut Array2<f64>) {
+    let p = matrix.nrows();
+    for i in 0..p {
+        for j in (i + 1)..p {
+            let averaged = (matrix[[i, j]] + matrix[[j, i]]) * 0.5;
+            matrix[[i, j]] = averaged;
+            matrix[[j, i]] = averaged;
+        }
+    }
 }
 
 /// Accumulate `Σ_{x,y} (w·t[x][y]) · (row_x ⊗ row_y)` into the dense `p×p`

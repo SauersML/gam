@@ -2238,7 +2238,14 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
         firth: false,
         family: FamilyArg::Auto,
         negative_binomial_theta: None,
-        survival_likelihood: Some("transformation".to_string()),
+        // The noise formula IS the log-sigma predictor, so under the DEFAULT
+        // likelihood it selects the location-scale model, which is the routing
+        // this test is named for and whose Scale block it asserts below. Naming
+        // `transformation` explicitly asks for a likelihood that has no
+        // log-sigma predictor, and the materializer refuses that pair by name
+        // rather than dropping the noise formula or swapping the likelihood
+        // under the caller. The request, not the refusal, was stale.
+        survival_likelihood: None,
         baseline_target: "linear".to_string(),
         baseline_scale: None,
         baseline_shape: None,
