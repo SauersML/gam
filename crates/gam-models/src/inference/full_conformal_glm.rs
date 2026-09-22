@@ -2608,6 +2608,69 @@ mod reselection_tests {
         .unwrap()
     }
 
+    /// A Richardson central FIRST difference of `f` at `x`, with its own
+    /// measured error bar.
+    ///
+    /// `central(h) = (f(x+h) − f(x−h))/2h` carries truncation `h²·f‴/6`, so the
+    /// combination `(4·central(h) − central(2h))/3` cancels that term. The bar
+    /// is four times the combination's disagreement with the one an octave
+    /// coarser — the truncation the two step sizes still disagree about,
+    /// MEASURED rather than bounded through a derivative nobody has — plus the
+    /// counted roundoff of the quotient: each central difference divides the
+    /// error of two evaluations by `2h` and so carries `evaluation_error/h`, and
+    /// the reference weights `central(h)` by 4/3 and `central(2h)` by 1/3, for
+    /// `1.5·evaluation_error/h`.
+    ///
+    /// This is the shape `gam-custom-family`'s `richardson_derivative_at_zero`
+    /// uses (gam#2765), with that site's `1e-9·|reference|` floor replaced by the
+    /// roundoff term it stands in for.
+    ///
+    /// `evaluation_error` is the caller's bound on the ABSOLUTE error of one
+    /// evaluation of `f`, and it is the caller's to supply rather than inferred
+    /// from `|f|` here: for a closed form it is the unit roundoff carried by the
+    /// value's own magnitude, but for a quantity read off a certified solve it
+    /// is denominated in what that solve certifies — the criterion's natural
+    /// scale, not the magnitude of whichever component is being differenced.
+    /// Inferring it from `|f|` would under-count exactly where the differenced
+    /// component is small and its error is not.
+    fn richardson_first(
+        f: impl Fn(f64) -> f64,
+        x: f64,
+        h: f64,
+        evaluation_error: f64,
+    ) -> (f64, f64) {
+        let central = |width: f64| (f(x + width) - f(x - width)) / (2.0 * width);
+        let fine = central(h);
+        let middle = central(2.0 * h);
+        let wide = central(4.0 * h);
+        let reference = (4.0 * fine - middle) / 3.0;
+        let coarse = (4.0 * middle - wide) / 3.0;
+        let roundoff = 1.5 * evaluation_error / h;
+        (reference, 4.0 * (reference - coarse).abs() + roundoff)
+    }
+
+    /// The same construction for the central SECOND difference
+    /// `(f(x+h) − 2f(x) + f(x−h))/h²`, whose leading truncation `h²·f⁗/12` is
+    /// also `O(h²)` and so cancels under the same weights. Its roundoff is
+    /// `4·evaluation_error/h²` — three evaluations, the middle one doubled,
+    /// over `h²` — and the reference carries `(4·4 + 1)/3 = 17/3` of it.
+    fn richardson_second(
+        f: impl Fn(f64) -> f64,
+        x: f64,
+        h: f64,
+        evaluation_error: f64,
+    ) -> (f64, f64) {
+        let centre = f(x);
+        let central = |width: f64| (f(x + width) - 2.0 * centre + f(x - width)) / (width * width);
+        let fine = central(h);
+        let middle = central(2.0 * h);
+        let wide = central(4.0 * h);
+        let reference = (4.0 * fine - middle) / 3.0;
+        let coarse = (4.0 * middle - wide) / 3.0;
+        let roundoff = (17.0 / 3.0) * evaluation_error / (h * h);
+        (reference, 4.0 * (reference - coarse).abs() + roundoff)
+    }
+
     /// `weight_jet` is the only family-specific content of the honest
     /// criterion, checked against the negative log-likelihood it claims to
     /// differentiate rather than against the criterion that consumes it: `w` is
@@ -2620,37 +2683,66 @@ mod reselection_tests {
             ConformalGlmFamily::PoissonLog,
         ] {
             let y = 1.0;
+            // How far each quantity's own differences resolve it, over the grid.
+            let mut resolved = [0.0_f64; 3];
             for &eta in &[-1.7, -0.6, 0.0, 0.4, 1.3] {
-                // Central differences at step `h` carry truncation plus
-                // cancellation: `h²·|f‴|/6 + ε·|f|/h` for the first difference,
-                // `h²·|f⁗|/12 + 4ε·|f|/h²` for the second. Every η-derivative of
-                // the Poisson curvature IS `μ`, and the logistic's are bounded by
-                // its own curvature, so `scale` bounds each `|f|` here. The factor
-                // two is the next term of each series, which has the same shape one
-                // order down in `h`.
-                let h = 1e-3;
+                // The step is where each scheme's roundoff meets its truncation.
+                // A central first difference carries `band·|f|/h` against
+                // `h²·|f‴|/6`, which balances at `band^(1/3)`; a central second
+                // difference carries `4·band·|f|/h²` against `h²·|f⁗|/12`, which
+                // balances at `band^(1/4)`. Both are lifted by the point's own
+                // magnitude so the step is a relative one. `nll` and `weight_jet`
+                // are closed forms, so one evaluation's band is the unit roundoff.
+                let reach = 1.0 + eta.abs();
+                let h_first = f64::EPSILON.cbrt() * reach;
+                let h_second = f64::EPSILON.powf(0.25) * reach;
                 let (w, w1, w2) = family.weight_jet(eta).unwrap();
-                let scale = w.abs().max(1.0);
-                let first_band = 2.0 * scale * (h * h / 6.0 + f64::EPSILON / h);
-                let second_band = 2.0 * scale * (h * h / 12.0 + 4.0 * f64::EPSILON / (h * h));
-                let curvature = |e: f64| family.weight_jet(e).unwrap().0;
-                let slope = |e: f64| family.weight_jet(e).unwrap().1;
-                let fd_w = (family.nll(eta + h, y) - 2.0 * family.nll(eta, y)
-                    + family.nll(eta - h, y))
-                    / (h * h);
-                let fd_w1 = (curvature(eta + h) - curvature(eta - h)) / (2.0 * h);
-                let fd_w2 = (slope(eta + h) - slope(eta - h)) / (2.0 * h);
-                assert!(
-                    (w - fd_w).abs() < second_band,
-                    "{family:?} eta={eta}: w={w} second difference={fd_w} band={second_band:e}"
+                // One evaluation's ABSOLUTE error: the unit roundoff carried by
+                // the magnitude each closed form reaches over the stencil. `w`
+                // bounds `|w′|` and `|w″|` for both links, and `reach` covers the
+                // stencil's own spread about the point.
+                let nll_error = f64::EPSILON * (family.nll(eta, y).abs() + reach);
+                let weight_error = f64::EPSILON * (w.abs() + reach);
+                let (fd_w, band_w) =
+                    richardson_second(|e| family.nll(e, y), eta, h_second, nll_error);
+                let (fd_w1, band_w1) = richardson_first(
+                    |e| family.weight_jet(e).unwrap().0,
+                    eta,
+                    h_first,
+                    weight_error,
+                );
+                let (fd_w2, band_w2) = richardson_first(
+                    |e| family.weight_jet(e).unwrap().1,
+                    eta,
+                    h_first,
+                    weight_error,
                 );
                 assert!(
-                    (w1 - fd_w1).abs() < first_band,
-                    "{family:?} eta={eta}: w1={w1} difference={fd_w1} band={first_band:e}"
+                    (w - fd_w).abs() <= band_w,
+                    "{family:?} eta={eta}: w={w} second difference={fd_w} band={band_w:e}"
                 );
                 assert!(
-                    (w2 - fd_w2).abs() < first_band,
-                    "{family:?} eta={eta}: w2={w2} difference={fd_w2} band={first_band:e}"
+                    (w1 - fd_w1).abs() <= band_w1,
+                    "{family:?} eta={eta}: w1={w1} difference={fd_w1} band={band_w1:e}"
+                );
+                assert!(
+                    (w2 - fd_w2).abs() <= band_w2,
+                    "{family:?} eta={eta}: w2={w2} difference={fd_w2} band={band_w2:e}"
+                );
+                resolved[0] = resolved[0].max(fd_w.abs() / band_w);
+                resolved[1] = resolved[1].max(fd_w1.abs() / band_w1);
+                resolved[2] = resolved[2].max(fd_w2.abs() / band_w2);
+            }
+            // The pins above compare two numbers; this says the comparison
+            // decides something, by requiring each quantity to stand clear of its
+            // own bar somewhere on the grid. It is a grid statement rather than a
+            // per-point one because `w′ = w(1 − 2μ)` is structurally zero at
+            // η = 0 for the logistic, where no difference can resolve it.
+            for (quantity, &ratio) in ["w", "w′", "w″"].iter().zip(resolved.iter()) {
+                assert!(
+                    ratio > 1.0,
+                    "{family:?}: the differences never resolve {quantity} on this grid \
+                     (best |reference|/bar = {ratio:.3}), so its pin decides nothing"
                 );
             }
         }
@@ -2674,29 +2766,56 @@ mod reselection_tests {
             x: &star,
             offset: 0.1,
         };
+        // How far the differences stand clear of their own bars, over the grid.
+        let mut resolved = [0.0_f64; 2];
         for z in [0., 1.] {
             for rho in [-3., -0.5, 1., 3.] {
-                let h = 1e-4;
-                let evaluate = |r| {
+                // One evaluation of this criterion is a certified augmented
+                // solve, so its band is not the unit roundoff: what the solve
+                // certifies is `GLM_CONVERGENCE_RTOL` on the penalized gradient
+                // relative to its natural scale, and that is the band the
+                // difference quotient's roundoff is counted at. The step is where
+                // that roundoff meets a central first difference's `h²`
+                // truncation, its cube root — which at the module's `1e-12` is the
+                // `1e-4` this pin used before the step was derived.
+                let h = GLM_CONVERGENCE_RTOL.cbrt() * (1. + rho.abs());
+                let evaluate = |r: f64| {
                     sub.laml_jet(selected, &row, z, r, &Array1::zeros(2))
                         .unwrap()
                 };
-                let left = evaluate(rho - h);
                 let mid = evaluate(rho);
-                let right = evaluate(rho + h);
-                let fd_gradient = (right.value - left.value) / (2. * h);
-                let fd_hessian = (right.gradient - left.gradient) / (2. * h);
+                // Both components are read off the same certified solve, so both
+                // carry the same absolute error: the certificate's relative
+                // tolerance on the criterion's own scale.
+                let evaluation_error = GLM_CONVERGENCE_RTOL * mid.value.abs().max(1.);
+                let (fd_gradient, gradient_bar) =
+                    richardson_first(|r| evaluate(r).value, rho, h, evaluation_error);
+                let (fd_hessian, hessian_bar) =
+                    richardson_first(|r| evaluate(r).gradient, rho, h, evaluation_error);
+                resolved[0] = resolved[0].max(fd_gradient.abs() / gradient_bar);
+                resolved[1] = resolved[1].max(fd_hessian.abs() / hessian_bar);
                 assert!(
-                    (mid.gradient - fd_gradient).abs() < 2e-6 * (1. + fd_gradient.abs()),
-                    "rho={rho} z={z}: gradient={} fd={fd_gradient}",
+                    (mid.gradient - fd_gradient).abs() <= gradient_bar,
+                    "rho={rho} z={z}: gradient={} reference={fd_gradient} bar={gradient_bar:e}",
                     mid.gradient
                 );
                 assert!(
-                    (mid.hessian - fd_hessian).abs() < 2e-6 * (1. + fd_hessian.abs()),
-                    "rho={rho} z={z}: hessian={} fd={fd_hessian}",
+                    (mid.hessian - fd_hessian).abs() <= hessian_bar,
+                    "rho={rho} z={z}: hessian={} reference={fd_hessian} bar={hessian_bar:e}",
                     mid.hessian
                 );
             }
+        }
+        // The pins above compare two numbers; this says the comparison decides
+        // something. It is a grid statement rather than a per-point one because
+        // the criterion is stationary somewhere on this ρ range, and no
+        // difference resolves a derivative that is genuinely zero.
+        for (quantity, &ratio) in ["gradient", "hessian"].iter().zip(resolved.iter()) {
+            assert!(
+                ratio > 1.0,
+                "the differences never resolve the criterion's {quantity} on this grid \
+                 (best |reference|/bar = {ratio:.3}), so its pin decides nothing"
+            );
         }
     }
 
@@ -2919,29 +3038,56 @@ mod reselection_tests {
             x: &star,
             offset: 0.1,
         };
+        // How far the differences stand clear of their own bars, over the grid.
+        let mut resolved = [0.0_f64; 2];
         for z in [0., 2., 5.] {
             for rho in [-3., -0.5, 1., 3.] {
-                let h = 1e-4;
-                let evaluate = |r| {
+                // One evaluation of this criterion is a certified augmented
+                // solve, so its band is not the unit roundoff: what the solve
+                // certifies is `GLM_CONVERGENCE_RTOL` on the penalized gradient
+                // relative to its natural scale, and that is the band the
+                // difference quotient's roundoff is counted at. The step is where
+                // that roundoff meets a central first difference's `h²`
+                // truncation, its cube root — which at the module's `1e-12` is the
+                // `1e-4` this pin used before the step was derived.
+                let h = GLM_CONVERGENCE_RTOL.cbrt() * (1. + rho.abs());
+                let evaluate = |r: f64| {
                     sub.laml_jet(selected, &row, z, r, &Array1::zeros(2))
                         .unwrap()
                 };
-                let left = evaluate(rho - h);
                 let mid = evaluate(rho);
-                let right = evaluate(rho + h);
-                let fd_gradient = (right.value - left.value) / (2. * h);
-                let fd_hessian = (right.gradient - left.gradient) / (2. * h);
+                // Both components are read off the same certified solve, so both
+                // carry the same absolute error: the certificate's relative
+                // tolerance on the criterion's own scale.
+                let evaluation_error = GLM_CONVERGENCE_RTOL * mid.value.abs().max(1.);
+                let (fd_gradient, gradient_bar) =
+                    richardson_first(|r| evaluate(r).value, rho, h, evaluation_error);
+                let (fd_hessian, hessian_bar) =
+                    richardson_first(|r| evaluate(r).gradient, rho, h, evaluation_error);
+                resolved[0] = resolved[0].max(fd_gradient.abs() / gradient_bar);
+                resolved[1] = resolved[1].max(fd_hessian.abs() / hessian_bar);
                 assert!(
-                    (mid.gradient - fd_gradient).abs() < 2e-6 * (1. + fd_gradient.abs()),
-                    "rho={rho} z={z}: gradient={} fd={fd_gradient}",
+                    (mid.gradient - fd_gradient).abs() <= gradient_bar,
+                    "rho={rho} z={z}: gradient={} reference={fd_gradient} bar={gradient_bar:e}",
                     mid.gradient
                 );
                 assert!(
-                    (mid.hessian - fd_hessian).abs() < 2e-6 * (1. + fd_hessian.abs()),
-                    "rho={rho} z={z}: hessian={} fd={fd_hessian}",
+                    (mid.hessian - fd_hessian).abs() <= hessian_bar,
+                    "rho={rho} z={z}: hessian={} reference={fd_hessian} bar={hessian_bar:e}",
                     mid.hessian
                 );
             }
+        }
+        // The pins above compare two numbers; this says the comparison decides
+        // something. It is a grid statement rather than a per-point one because
+        // the criterion is stationary somewhere on this ρ range, and no
+        // difference resolves a derivative that is genuinely zero.
+        for (quantity, &ratio) in ["gradient", "hessian"].iter().zip(resolved.iter()) {
+            assert!(
+                ratio > 1.0,
+                "the differences never resolve the criterion's {quantity} on this grid \
+                 (best |reference|/bar = {ratio:.3}), so its pin decides nothing"
+            );
         }
     }
 
