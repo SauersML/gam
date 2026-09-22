@@ -156,7 +156,7 @@ fn sae_fisher_metric_construction_stays_in_gam_sae_2236() {
 /// first wrong turn available, and the second is the feature flag above.
 #[test]
 fn manifold_sae_structured_metric_without_behavior_shard_is_loadable() {
-    crate::test_support::attach(|_py| {
+    crate::test_support::attach(|_| {
         let mut payload = crate::manifold::manifold_sae_payload::ManifoldSaePayload::from_json(
             include_str!("../../../../tests/fixtures/manifold_sae/golden_full.json"),
         )
