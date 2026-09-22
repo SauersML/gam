@@ -3214,15 +3214,40 @@ fn validated_baseline_params(
     }
 }
 
-/// `(H(t), h(t))` of a Weibull baseline, read through logs.
+/// `(H(t), h(t))` of a Weibull baseline, in the form the member admits.
 ///
-/// `H = exp(k·(ln t − ln λ))` rather than `(t/λ)^k`. The chart's far members
-/// (#2969) publish a `λ` at the bottom of the normal f64 range, where `t/λ`
-/// overflows to infinity while `H` is still O(1); the log form is exact there
-/// and agrees with the ratio form to rounding wherever both are finite.
+/// `H = (t/λ)^k` wherever the ratio `t/λ` is a NORMAL f64, and
+/// `H = exp(k·(ln t − ln λ))` where it is not.
+///
+/// The two are the same quantity and not the same rounding. The ratio form
+/// rounds once in the ratio and once in the power; the log form rounds `ln t`,
+/// `ln λ`, their difference and the product, and `exp` then multiplies the
+/// exponent's ABSOLUTE error into `H` as a relative one — so its error grows
+/// with `|k·ln(t/λ)|`, which is about 37 at the gam#2930 entry floor and puts
+/// `H` about 13 times further from the exact value than the ratio form does.
+/// That matters because the chart's consumers are graded against bands derived
+/// from the value's own rounding: the entry-floor θ partials of `q′` sit on a
+/// 15-to-26-fold cancellation (`∂q′/∂θ = A(∂h/∂θ + h(qA − 1)∂H/∂θ)`, whose two
+/// terms nearly annihilate there), which multiplies any error in `H` by the
+/// same factor before it reaches a finite-difference bar.
+///
+/// So the ratio form is the rule wherever it can be formed, and it is formed on
+/// exactly the members the chart could evaluate before gam#2969 — every fit
+/// that ran then reads the same bits now. The log form exists for the members
+/// that reparameterization reaches and the old chart could not: the limit's far
+/// end publishes a `λ` at the bottom of the normal f64 range, where `t/λ`
+/// overflows to infinity while `H` is O(1), and a small `t` against a large `λ`
+/// where the ratio underflows to zero while `H` is not zero. A subnormal ratio
+/// takes the log form too: its own relative error is already unbounded, so it
+/// is not the accurate form there either.
 #[inline]
 fn weibull_hazard_components(age: f64, scale: f64, shape: f64) -> (f64, f64) {
-    let cumulative_hazard = (shape * (age.ln() - scale.ln())).exp();
+    let ratio = age / scale;
+    let cumulative_hazard = if ratio.is_finite() && ratio >= f64::MIN_POSITIVE {
+        ratio.powf(shape)
+    } else {
+        (shape * (age.ln() - scale.ln())).exp()
+    };
     (cumulative_hazard, shape * cumulative_hazard / age)
 }
 
@@ -7665,6 +7690,86 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// gam#2969: the chart's cumulative hazard is the RATIO form on every member
+    /// the chart could evaluate before the reparameterization — bit for bit, so
+    /// no fit that ran then reads a different number now — and the log form only
+    /// where the ratio cannot be formed at all.
+    ///
+    /// The log form is not a free substitute: `exp` turns the absolute error of
+    /// `k·(ln t − ln λ)` into a relative error of `H`, so at the entry floor,
+    /// where that exponent is about −37, it lands `H` roughly thirteen times
+    /// further out than the ratio form. The entry-floor θ partials of `q′` are
+    /// graded on a finite-difference bar across a 15-to-26-fold cancellation,
+    /// which multiplies exactly that error, and that is what this pin protects.
+    #[test]
+    fn the_weibull_hazard_takes_the_ratio_form_wherever_the_ratio_is_normal_2969() {
+        for (scale, shape, age) in [
+            (1.2093_f64.exp(), 0.5365_f64.exp(), SURVIVAL_TIME_FLOOR),
+            (1.2093_f64.exp(), 0.5365_f64.exp(), 3.0),
+            (0.5, 1.2, 25.0),
+            (2.0, 0.8, 60.0),
+            (0.1, 3.0, 10.0),
+        ] {
+            let ratio = age / scale;
+            assert!(
+                ratio.is_finite() && ratio >= f64::MIN_POSITIVE,
+                "this witness has stopped being one: t/λ = {ratio:e} is no longer a normal f64"
+            );
+            let ratio_form = ratio.powf(shape);
+            let (cumulative, instant) = super::weibull_hazard_components(age, scale, shape);
+            assert_eq!(
+                cumulative.to_bits(),
+                ratio_form.to_bits(),
+                "H at (λ={scale}, k={shape}, t={age}) must be the ratio form bit for bit"
+            );
+            assert_eq!(
+                instant.to_bits(),
+                (shape * ratio_form / age).to_bits(),
+                "h at (λ={scale}, k={shape}, t={age}) must follow the same H"
+            );
+        }
+
+        // The far end of the chart's limit axis: the published scale is at the
+        // bottom of the normal f64 range, so the ratio overflows while `H` is
+        // O(1) in the exponent. Only the log form reaches this member, which is
+        // why it is in the chart at all (gam#2969).
+        let far_scale = f64::MIN_POSITIVE;
+        let far_shape = (-2.9_f64).exp();
+        let far_age = 10.0_f64;
+        assert!(
+            !(far_age / far_scale).is_finite(),
+            "this witness has stopped being one: t/λ no longer overflows at the limit's far end"
+        );
+        let (cumulative, instant) = super::weibull_hazard_components(far_age, far_scale, far_shape);
+        assert_eq!(
+            cumulative.to_bits(),
+            (far_shape * (far_age.ln() - far_scale.ln()))
+                .exp()
+                .to_bits(),
+            "the unrepresentable ratio takes the log form"
+        );
+        assert!(
+            cumulative.is_finite() && cumulative > 0.0 && instant.is_finite() && instant > 0.0,
+            "the far member's hazard is finite and positive: H={cumulative:e}, h={instant:e}"
+        );
+
+        // The other end: a small age against a large scale, where the ratio
+        // underflows to zero and the ratio form would report a cumulative hazard
+        // of exactly zero — which the point evaluator refuses — although `H` is
+        // positive.
+        let (tiny_age, huge_scale, shape) = (1e-300_f64, 1e300_f64, 0.5_f64);
+        assert_eq!(
+            tiny_age / huge_scale,
+            0.0,
+            "this witness has stopped being one: t/λ no longer underflows"
+        );
+        let (cumulative, _) = super::weibull_hazard_components(tiny_age, huge_scale, shape);
+        assert!(
+            cumulative.is_finite() && cumulative > 0.0,
+            "the underflowing ratio takes the log form: H={cumulative:e}"
+        );
     }
 
     #[test]
