@@ -1256,6 +1256,7 @@ mod tests {
         UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
             blocks,
             training_sample_size: 16,
+            training_response_fingerprint: None,
             log_lambdas: lambdas.clone(),
             lambdas,
             likelihood_family: Some(LikelihoodSpec::new(
@@ -1394,6 +1395,7 @@ mod tests {
                 lambdas: Array1::zeros(0),
             }],
             training_sample_size: 16,
+            training_response_fingerprint: None,
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
             likelihood_family: Some(LikelihoodSpec::new(

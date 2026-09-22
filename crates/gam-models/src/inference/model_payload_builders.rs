@@ -612,6 +612,7 @@ fn truncate_marginal_slope_influence_absorber(
     // narrowed reassembly, which revalidates the preserved artifacts.
     let pirls_status = fit_result.convergence_evidence().inner_status();
     let training_sample_size = fit_result.training_sample_size();
+    let training_response_fingerprint = fit_result.training_response_fingerprint();
     // Read through the accessors before destructuring: the criterion pair is
     // private so that no consumer can substitute a number for an absent one,
     // and a narrowing reassembly must carry the absence forward unchanged.
@@ -677,6 +678,7 @@ fn truncate_marginal_slope_influence_absorber(
     UnifiedFitResult::try_from_parts(gam_solve::estimate::UnifiedFitResultParts {
         blocks,
         training_sample_size,
+        training_response_fingerprint,
         log_lambdas,
         lambdas,
         likelihood_family,
@@ -3506,6 +3508,7 @@ mod survival_payload_decline_tests {
                 lambdas: Array1::zeros(0),
             }],
             training_sample_size: 16,
+            training_response_fingerprint: None,
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
             likelihood_family: Some(LikelihoodSpec::royston_parmar()),

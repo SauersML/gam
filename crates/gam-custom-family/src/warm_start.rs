@@ -1168,6 +1168,7 @@ pub fn blockwise_fit_from_parts(
     gam_solve::model_types::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
         blocks,
         training_sample_size: n,
+        training_response_fingerprint: None,
         log_lambdas: log_lambdas.clone(),
         lambdas: lambdas.clone(),
         likelihood_family: None,

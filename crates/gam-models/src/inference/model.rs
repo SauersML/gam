@@ -6511,6 +6511,7 @@ mod tests {
         UnifiedFitResult::try_from_parts(gam_solve::estimate::UnifiedFitResultParts {
             blocks,
             training_sample_size: 16,
+            training_response_fingerprint: None,
             log_lambdas: lambdas.mapv(f64::ln),
             lambdas,
             likelihood_family: Some(LikelihoodSpec::binomial_probit()),

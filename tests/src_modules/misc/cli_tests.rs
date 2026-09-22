@@ -198,6 +198,7 @@ pub(crate) fn core_saved_fit_result(
                 lambdas: lambdas.clone(),
             }],
             training_sample_size: summary.training_sample_size,
+            training_response_fingerprint: None,
             log_lambdas,
             lambdas,
             likelihood_family: summary.likelihood_family,
@@ -414,6 +415,7 @@ mod tests {
                 lambdas: Array1::from_vec(vec![1.0]),
             }],
             training_sample_size: 32,
+            training_response_fingerprint: None,
             log_lambdas: Array1::zeros(1),
             lambdas: Array1::from_vec(vec![1.0]),
             likelihood_family: None,
@@ -525,6 +527,7 @@ mod tests {
                 lambdas: Array1::from_vec(vec![1.0]),
             }],
             training_sample_size: 32,
+            training_response_fingerprint: None,
             log_lambdas: Array1::zeros(1),
             lambdas: Array1::from_vec(vec![1.0]),
             likelihood_family: None,
@@ -2769,6 +2772,7 @@ fn nonlinear_saved_model_with_hessian_only_remains_persistable_and_predictable()
             lambdas: Array1::zeros(0),
         }],
         training_sample_size: 12,
+        training_response_fingerprint: None,
         log_lambdas: Array1::zeros(0),
         lambdas: Array1::zeros(0),
         likelihood_family: Some(LikelihoodSpec::new(
@@ -2923,6 +2927,7 @@ fn hessian_only_saved_model_reports_the_truncated_covariance_on_an_active_face()
             lambdas: Array1::zeros(0),
         }],
         training_sample_size: 12,
+        training_response_fingerprint: None,
         log_lambdas: Array1::zeros(0),
         lambdas: Array1::zeros(0),
         likelihood_family: Some(LikelihoodSpec::new(
@@ -3762,6 +3767,7 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
             lambdas: lambdas.clone(),
         }],
         training_sample_size: 3,
+        training_response_fingerprint: None,
         log_lambdas: lambdas.mapv(f64::ln),
         lambdas,
         likelihood_family: Some(LikelihoodSpec::new(

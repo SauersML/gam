@@ -2847,6 +2847,10 @@ fn survival_unified_fit_result(
             lambdas: lambdas.clone(),
         }],
         training_sample_size,
+        // The survival transformation response is entry/exit/event columns, not the
+        // `(response, weights)` pair `training_response_fingerprint` identifies, so this
+        // fit establishes no provenance under that rule rather than a partial one (#4556).
+        training_response_fingerprint: None,
         log_lambdas,
         lambdas,
         likelihood_family: Some(LikelihoodSpec::royston_parmar()),

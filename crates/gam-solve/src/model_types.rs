@@ -163,6 +163,7 @@ pub use result_types::{
     SmoothingCorrectionMethod, UnifiedFitResult, UnifiedFitResultParts, WorkingGeometry,
     ensure_finite_scalar, is_zero_dispersion_boundary,
     saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
+    training_response_fingerprint,
     validate_all_finite, validate_dense_hessian_export,
     validate_explicit_dense_hessian_for_whitening,
 };

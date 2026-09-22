@@ -583,6 +583,21 @@
   establishes — necessary conditions, not provenance — and what a response fingerprint would
   add, so the claim matches the test.
 
+- **A model comparison establishes one experiment instead of failing to contradict it**
+  (gam#4556 P3). `compare_models` tested the family label, the row count and the
+  intercept-only deviance: every one of them necessary, none of them sufficient, so two
+  different datasets of one size could be ranked against each other as though their AIC gap
+  were an evidence ratio. A fit now carries the value identity of the rows it was trained on —
+  `training_response_fingerprint(response, weights)`, the repository's one value hash over
+  both columns, which absorbs the shape before the values — from the entry that read those
+  rows, through `UnifiedFitResult`, the saved payload and the summary, to
+  `ComparisonCandidate::response_fingerprint`. Two candidates whose fingerprints disagree are
+  refused first, before the necessary conditions, which cannot add to a settled answer.
+  `None` is an absence of established provenance and never a claim: a model saved before the
+  field existed, or a route whose response is not a `(response, weights)` pair — the O(n)
+  spline scan and the survival transformation fit, each of which says so where it declines —
+  is held to the necessary conditions, and the refusal text names which standard it applied.
+
 ## gamfit 0.1.270 (2026-09-22)
 
 0.1.269 was tagged on 2026-09-21 and never reached PyPI: its release run

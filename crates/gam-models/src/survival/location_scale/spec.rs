@@ -800,6 +800,7 @@ pub fn survival_fit_from_parts(
     crate::model_types::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
         blocks,
         training_sample_size,
+        training_response_fingerprint: None,
         log_lambdas,
         lambdas: Array1::from_vec(all_lambdas),
         likelihood_family: None,

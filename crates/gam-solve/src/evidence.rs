@@ -2369,23 +2369,24 @@ pub const COMPARISON_CRITERION: &str = "aic_corrected";
 /// Every field is required: a model that cannot publish its corrected AIC is
 /// refused before it becomes a candidate, with the summary's own reason.
 ///
-/// # What the comparability checks establish, and what they do not (#4556 P3)
+/// # What the comparability checks establish (#4556 P3)
 ///
 /// An AIC gap is an evidence ratio only between two fits of one experiment: the
 /// same response, the same weights, the same base measure. [`check_comparable`]
-/// tests every NECESSARY condition the published summaries carry — the family
-/// label, the training row count, and the intercept-only deviance, which is a
-/// function of the response, the weights and the family and of nothing the model
-/// chooses — and refuses on any mismatch. Passing them is not proof of one
-/// experiment: two different datasets of the same size, same family and (far
-/// less likely) the same null deviance would pass, and a fit that publishes no
-/// null deviance is tested on `n` and the family alone.
+/// establishes that from [`ComparisonCandidate::response_fingerprint`], the
+/// value identity of the response and the prior weights, taken where the fit
+/// read those rows and carried on the fit result, the saved payload and the
+/// summary. Two candidates whose fingerprints disagree are refused: they read
+/// different data.
 ///
-/// What would establish it is a fingerprint of the training response carried on
-/// the fit itself. That is a persisted-format change: the response reaches the
-/// summary only through `UnifiedFitResult`'s training record, so a fingerprint
-/// has to be taken where `training_sample_size` is taken and travel the same
-/// way. This type states what it tests instead of claiming what it does not.
+/// A candidate that carries no fingerprint — a model saved before the fit
+/// recorded one, or a route whose response is not a `(response, weights)` pair
+/// — establishes no provenance, and the pair is then held to the NECESSARY
+/// conditions the published summaries do carry: the family label, the training
+/// row count, and the intercept-only deviance, which is a function of the
+/// response, the weights and the family and of nothing the model chooses. Those
+/// refuse a mismatch and do not establish a match, and the refusal text says
+/// which of the two standards it applied.
 #[derive(Clone, Debug)]
 pub struct ComparisonCandidate {
     pub name: String,
@@ -2395,6 +2396,18 @@ pub struct ComparisonCandidate {
     /// Training observations. Candidates fit on different `n` are refused:
     /// `−2ℓ` grows with `n`, so their AIC gap is not an evidence ratio.
     pub n_obs: usize,
+    /// Value identity of the rows this fit was trained on — the response and
+    /// the prior weights, by value
+    /// ([`crate::model_types::training_response_fingerprint`], #4556 P3).
+    ///
+    /// This is the field that ESTABLISHES one experiment rather than failing to
+    /// contradict it: two candidates whose fingerprints disagree read different
+    /// data, whatever their row counts, families and null deviances say, and are
+    /// refused. `None` is an absence of established provenance — a model saved
+    /// before the fit recorded one, or a route whose response is not a
+    /// `(response, weights)` pair — and the pair is then tested on the
+    /// necessary conditions below, which is what the refusal says.
+    pub response_fingerprint: Option<u64>,
     /// Deviance of the intercept-only model on the training data, when the fit
     /// publishes one.
     ///
@@ -2483,6 +2496,20 @@ fn check_comparable(candidates: &[&ComparisonCandidate]) -> Result<(), String> {
         return Err("compare_models requires at least one fit".to_string());
     };
     for cand in candidates {
+        // Provenance first: it is the only check that ESTABLISHES one
+        // experiment, so a disagreement here is decided before the necessary
+        // conditions, which cannot add to it (#4556 P3).
+        if let (Some(first_print), Some(cand_print)) =
+            (first.response_fingerprint, cand.response_fingerprint)
+            && first_print != cand_print
+        {
+            return Err(format!(
+                "compare_models: cannot compare fits trained on different data \
+                 (response fingerprints {first_print:#018x} vs {cand_print:#018x}); an AIC gap \
+                 is an evidence ratio only between two fits of one experiment. Compare models \
+                 fit to the same response, with the same weights, on the same rows."
+            ));
+        }
         if cand.family != first.family {
             return Err(format!(
                 "compare_models: cannot compare fits of different response families \
@@ -3228,6 +3255,7 @@ mod tests {
             family: "gaussian".to_string(),
             n_obs: 100,
             // One experiment: every candidate reads the same response.
+            response_fingerprint: Some(0x5eed_0000_0000_0001),
             null_deviance: Some(412.5),
             aic_corrected: 2.0 * edf,
             aic_conditional: 2.0 * edf,
@@ -4355,6 +4383,7 @@ mod tests {
             family: "Gaussian Identity".to_string(),
             n_obs: 200,
             // One experiment: every candidate reads the same response.
+            response_fingerprint: Some(0x5eed_0000_0000_0002),
             null_deviance: Some(318.25),
             aic_corrected,
             aic_conditional,
@@ -4362,6 +4391,38 @@ mod tests {
             edf_conditional: 5.0,
             reml_score: Some(reml),
         }
+    }
+
+    /// #4556 P3. The fingerprint is what ESTABLISHES one experiment, so it
+    /// refuses a pair the necessary conditions cannot: same family, same `n`,
+    /// same intercept-only deviance, different data. A candidate carrying none
+    /// establishes nothing and is held to those conditions instead, which is
+    /// the only case where they still decide.
+    #[test]
+    fn compare_models_refuses_candidates_whose_response_fingerprints_disagree_4556() {
+        let first = cand("first", 180.5, 100.0, 101.0);
+        let mut second = cand("second", 177.4, 99.0, 103.0);
+        // Everything a summary can publish about the data agrees.
+        second.null_deviance = first.null_deviance;
+        assert_eq!(first.n_obs, second.n_obs);
+        assert_eq!(first.family, second.family);
+        compare_models(vec![first.clone(), second.clone()])
+            .expect("one experiment compares under matching fingerprints");
+
+        let mut other_data = second.clone();
+        other_data.response_fingerprint = Some(0x5eed_0000_0000_00ff);
+        let refusal = compare_models(vec![first.clone(), other_data.clone()])
+            .expect_err("two experiments must not be ranked against each other");
+        assert!(
+            refusal.contains("trained on different data"),
+            "the refusal must name what it established: {refusal}"
+        );
+
+        // No fingerprint, no provenance: the pair falls back to the necessary
+        // conditions, which this pair passes.
+        other_data.response_fingerprint = None;
+        compare_models(vec![first, other_data])
+            .expect("a candidate with no fingerprint is held to the necessary conditions");
     }
 
     /// #4556 P3. Two fits of one family with the same `n` can still be two
@@ -4376,6 +4437,10 @@ mod tests {
     fn compare_models_refuses_candidates_whose_null_deviance_disagrees_4556() {
         let mut first = cand("first", 180.5, 100.0, 101.0);
         let mut second = cand("second", 177.4, 99.0, 103.0);
+        // The necessary-condition path: neither fit established its provenance,
+        // which is the only case where the null deviance still decides.
+        first.response_fingerprint = None;
+        second.response_fingerprint = None;
         // Positive control: the pair compares while the two agree.
         compare_models(vec![first.clone(), second.clone()]).expect("one experiment compares");
 

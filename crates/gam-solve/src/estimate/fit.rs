@@ -318,6 +318,9 @@ where
             lambdas: result_lambdas.clone(),
         }],
         training_sample_size: y.len(),
+        training_response_fingerprint: Some(crate::model_types::training_response_fingerprint(
+            y, weights,
+        )),
         log_lambdas,
         lambdas: result_lambdas,
         likelihood_family: Some(result.likelihood_family),

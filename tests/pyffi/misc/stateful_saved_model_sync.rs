@@ -201,6 +201,7 @@ fn minimal_fit_result(fitted_link: FittedLinkState) -> UnifiedFitResult {
             lambdas: Array1::zeros(0),
         }],
         training_sample_size: 8,
+        training_response_fingerprint: None,
         log_lambdas: Array1::zeros(0),
         lambdas: Array1::zeros(0),
         likelihood_family: Some(LikelihoodSpec::new(
@@ -256,6 +257,7 @@ fn minimal_survival_fit_result() -> UnifiedFitResult {
             },
         ],
         training_sample_size: 8,
+        training_response_fingerprint: None,
         log_lambdas: Array1::zeros(0),
         lambdas: Array1::zeros(0),
         likelihood_family: Some(LikelihoodSpec::new(

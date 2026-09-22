@@ -403,6 +403,7 @@ mod tests {
             deviance_explained_unavailable: None,
             scale: Some(0.2525),
             log_likelihood: Some(-70.125),
+            response_fingerprint: None,
             n_obs: Some(100),
             reml_score: Some(81.75),
             raw_reml_score: Some(80.5),

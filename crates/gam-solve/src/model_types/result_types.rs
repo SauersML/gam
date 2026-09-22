@@ -133,6 +133,7 @@ mod per_term_edf_tests {
                 lambdas: Array1::from_vec(vec![1.0, 1.0]),
             }],
             training_sample_size: 64,
+            training_response_fingerprint: None,
             log_lambdas: Array1::zeros(2),
             lambdas: Array1::from_vec(vec![1.0, 1.0]),
             likelihood_family: Some(LikelihoodSpec::gaussian_identity()),
@@ -245,6 +246,7 @@ mod per_term_edf_tests {
                 lambdas: Array1::from_vec(vec![1.0]),
             }],
             training_sample_size: 64,
+            training_response_fingerprint: None,
             log_lambdas: Array1::zeros(1),
             lambdas: Array1::from_vec(vec![1.0]),
             likelihood_family: Some(LikelihoodSpec::gaussian_identity()),
@@ -321,6 +323,7 @@ mod per_term_edf_tests {
                 lambdas: lambdas.clone(),
             }],
             training_sample_size: 256,
+            training_response_fingerprint: None,
             log_lambdas: Array1::zeros(n_levels),
             lambdas,
             likelihood_family: Some(LikelihoodSpec::gaussian_identity()),
@@ -526,6 +529,7 @@ mod per_term_edf_tests {
                 lambdas: lambdas.clone(),
             }],
             training_sample_size: 256,
+            training_response_fingerprint: None,
             log_lambdas: Array1::zeros(n_blocks),
             lambdas,
             likelihood_family: Some(LikelihoodSpec::gaussian_identity()),
@@ -3699,6 +3703,15 @@ pub struct UnifiedFitResultParts {
     /// count, not positive-weight count and not row count multiplied by the
     /// number of response coordinates.
     pub training_sample_size: usize,
+    /// [`fn@training_response_fingerprint`] of the rows this fit was trained on,
+    /// when the construction site holds them (#4556 P3).
+    ///
+    /// `None` is "this construction has no training response to identify" — a
+    /// fit rebuilt from a payload that predates the field, a fixture, a
+    /// prediction-side reconstruction — and never "the data did not matter".
+    /// A comparison reads it as an absence of established provenance and falls
+    /// back to the necessary conditions it can test.
+    pub training_response_fingerprint: Option<u64>,
     pub log_lambdas: Array1<f64>,
     pub lambdas: Array1<f64>,
     pub likelihood_family: Option<LikelihoodSpec>,
@@ -3929,6 +3942,63 @@ fn has_no_smoothing_coordinate(log_lambdas: &Array1<f64>, artifacts: &FitArtifac
 }
 
 #[cfg(test)]
+mod training_response_fingerprint_tests {
+    use super::training_response_fingerprint;
+    use ndarray::array;
+
+    /// #4556 P3. The identity is of the VALUES: the same rows read twice agree,
+    /// and a change to one observation, to one weight, or to the row count moves
+    /// it. The last one is what makes a fingerprint stronger than the row count
+    /// it travels beside — two responses of different lengths cannot collide,
+    /// because the hash absorbs the shape before the values.
+    #[test]
+    fn the_fingerprint_is_the_response_and_its_weights_by_value_4556() {
+        let response = array![0.5, -1.25, 3.0, 0.0];
+        let weights = array![1.0, 1.0, 2.5, 1.0];
+        let identity = training_response_fingerprint(response.view(), weights.view());
+        assert_eq!(
+            identity,
+            training_response_fingerprint(response.view(), weights.view()),
+            "the same rows read twice are one experiment"
+        );
+
+        let moved_response = array![0.5, -1.25, 3.0, 1e-300];
+        assert_ne!(
+            identity,
+            training_response_fingerprint(moved_response.view(), weights.view()),
+            "one observation moved, by any representable amount, is different data"
+        );
+
+        let moved_weights = array![1.0, 1.0, 2.5, 1.0 + f64::EPSILON];
+        assert_ne!(
+            identity,
+            training_response_fingerprint(response.view(), moved_weights.view()),
+            "a weighted likelihood on one response under two weightings is two experiments"
+        );
+
+        let shorter = array![0.5, -1.25, 3.0];
+        let shorter_weights = array![1.0, 1.0, 2.5];
+        assert_ne!(
+            identity,
+            training_response_fingerprint(shorter.view(), shorter_weights.view()),
+            "the shape is absorbed before the values, so lengths cannot collide"
+        );
+
+        // The function is total: a pair whose lengths disagree is not a fit's
+        // response and weights, and it gets its own identity rather than a
+        // panic or a dropped column.
+        assert_ne!(
+            training_response_fingerprint(response.view(), shorter_weights.view()),
+            training_response_fingerprint(shorter.view(), shorter_weights.view()),
+        );
+        assert_ne!(
+            training_response_fingerprint(response.view(), shorter_weights.view()),
+            identity,
+        );
+    }
+}
+
+#[cfg(test)]
 mod assembly_inner_status_gate_tests {
     use super::*;
     use crate::pirls::PirlsStatus;
@@ -3951,6 +4021,7 @@ mod assembly_inner_status_gate_tests {
                 lambdas: Array1::from_vec(vec![1.0]),
             }],
             training_sample_size: 64,
+            training_response_fingerprint: None,
             log_lambdas: Array1::zeros(1),
             lambdas: Array1::from_vec(vec![1.0]),
             likelihood_family: Some(LikelihoodSpec::gaussian_identity()),
@@ -4673,6 +4744,43 @@ mod assembly_inner_status_gate_tests {
         );
     }
 
+    /// #4556 P3. The identity has to survive the fit result's own wire, or a
+    /// saved model is compared on nothing: `compare_models` reads it from the
+    /// summary, the summary reads it from the fit result, and the payload
+    /// persists that fit result. A wire written before the field existed decodes
+    /// as no provenance rather than failing or acquiring one.
+    #[test]
+    fn the_training_response_fingerprint_survives_the_fit_results_wire_4556() {
+        let identity = 0x0123_4567_89ab_cdef_u64;
+        let mut parts = parts_with_inner_status(PirlsStatus::Converged);
+        parts.geometry = None;
+        parts.training_response_fingerprint = Some(identity);
+        let fit = UnifiedFitResult::try_from_parts(parts).expect("a fit carries its provenance");
+        assert_eq!(fit.training_response_fingerprint(), Some(identity));
+
+        let encoded = serde_json::to_value(&fit).expect("serialize fit");
+        let decoded: UnifiedFitResult =
+            serde_json::from_value(encoded).expect("a fit round-trips its own wire");
+        assert_eq!(
+            decoded.training_response_fingerprint(),
+            Some(identity),
+            "the identity of the training rows must survive save and load"
+        );
+
+        let mut older = serde_json::to_value(&fit).expect("serialize fit");
+        older
+            .as_object_mut()
+            .expect("fit serializes as an object")
+            .remove("training_response_fingerprint");
+        let older: UnifiedFitResult =
+            serde_json::from_value(older).expect("a model saved before the field still loads");
+        assert_eq!(
+            older.training_response_fingerprint(),
+            None,
+            "a wire that carries no identity establishes none"
+        );
+    }
+
     /// A fit solved on a reduced second block (`X_fit = X_saved·T`, `T` 2×1)
     /// with its active geometry and covariance, plus the saved-frame lift
     /// `J = blockdiag(I₂, T)`.
@@ -5008,6 +5116,50 @@ fn standard_errors_of_published_covariance(covariance: &Array2<f64>) -> Array1<f
     }
 }
 
+/// The identity of the data a fit was trained on: the response and the prior
+/// weights, by value (#4556 P3).
+///
+/// A model comparison is an evidence ratio only between two fits of ONE
+/// experiment. Equal row counts, equal families and equal intercept-only
+/// deviances are NECESSARY for that and none of them establishes it: two
+/// different datasets can agree on all three. This is what establishes it, up
+/// to the hash's collision probability — two fits whose fingerprints agree read
+/// the same response values in the same order under the same weights.
+///
+/// Both columns are absorbed, because a weighted likelihood on one response
+/// under two weightings is two experiments: `−2ℓ` is weighted, so the two are
+/// not comparable and must not pass as one. The hash is
+/// [`gam_linalg::matrix::array2_bits_fingerprint`], the one value identity this
+/// repository builds every fingerprint from, and it absorbs the SHAPE before
+/// the values, so a response of `n` rows can never collide with one of `m`.
+///
+/// It is a value identity, not a provenance token: two runs over the same file
+/// agree, a re-read of the same rows agrees, and a change to one observation
+/// does not.
+pub fn training_response_fingerprint(
+    response: ndarray::ArrayView1<'_, f64>,
+    weights: ndarray::ArrayView1<'_, f64>,
+) -> u64 {
+    // One matrix over both columns, so the identity is of the PAIR, with the
+    // two lengths absorbed as its first row. A fit's response and weights have
+    // one length, and a view that does not is not that response's weighting;
+    // absorbing both lengths makes such a pair its own identity rather than a
+    // panic on a total function or a column silently dropped, and it is what
+    // keeps a shorter column padded with zeros from colliding with a genuine
+    // zero weight.
+    let rows = response.len().max(weights.len());
+    let mut stacked = Array2::<f64>::zeros((rows + 1, 2));
+    stacked[[0, 0]] = response.len() as f64;
+    stacked[[0, 1]] = weights.len() as f64;
+    for (row, value) in response.iter().enumerate() {
+        stacked[[row + 1, 0]] = *value;
+    }
+    for (row, weight) in weights.iter().enumerate() {
+        stacked[[row + 1, 1]] = *weight;
+    }
+    gam_linalg::matrix::array2_bits_fingerprint(&stacked)
+}
+
 /// Unified fit result for all model types (standard GAM, GAMLSS, survival).
 ///
 /// Standard models have a single block; GAMLSS and survival models have
@@ -5024,6 +5176,15 @@ pub struct UnifiedFitResult {
     /// optional IRLS evidence, a synthetic prediction grid, nonzero weights,
     /// or the number of response coordinates.
     training_sample_size: std::num::NonZeroUsize,
+    /// Value identity of the training response and weights
+    /// ([`fn@training_response_fingerprint`], #4556 P3), when the fit was built
+    /// where those rows were in hand.
+    ///
+    /// `#[serde(default)]`, so a model saved before this field existed loads as
+    /// "no established provenance" rather than failing, which is exactly what
+    /// it is.
+    #[serde(default)]
+    training_response_fingerprint: Option<u64>,
     /// Log-smoothing parameters (all blocks concatenated in block order).
     pub log_lambdas: Array1<f64>,
     /// Smoothing parameters (exp of log_lambdas).
@@ -5536,6 +5697,13 @@ impl UnifiedFitResult {
         self.training_sample_size.get()
     }
 
+    /// Value identity of the rows this fit was trained on, when it has one
+    /// ([`fn@training_response_fingerprint`], #4556 P3). `None` is an absence of
+    /// established provenance, not a claim about the data.
+    pub fn training_response_fingerprint(&self) -> Option<u64> {
+        self.training_response_fingerprint
+    }
+
     /// The fit's REML/LAML criterion, or `None` when no finite criterion exists
     /// at this fit.
     ///
@@ -5688,6 +5856,7 @@ impl UnifiedFitResult {
         let UnifiedFitResultParts {
             blocks,
             training_sample_size,
+            training_response_fingerprint,
             log_lambdas,
             lambdas,
             likelihood_family,
@@ -6084,6 +6253,7 @@ impl UnifiedFitResult {
         Ok(Self {
             blocks,
             training_sample_size,
+            training_response_fingerprint,
             log_lambdas,
             lambdas,
             likelihood_family,
@@ -6133,6 +6303,7 @@ impl UnifiedFitResult {
         let reconstructed = Self::try_from_parts(UnifiedFitResultParts {
             blocks: self.blocks.clone(),
             training_sample_size: self.training_sample_size.get(),
+            training_response_fingerprint: self.training_response_fingerprint,
             log_lambdas: self.log_lambdas.clone(),
             lambdas: self.lambdas.clone(),
             likelihood_family: self.likelihood_family.clone(),

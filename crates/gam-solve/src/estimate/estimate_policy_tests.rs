@@ -1157,6 +1157,7 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
         // `working row count 3 must match training_sample_size 16` before
         // reaching the invariant each was written to measure.
         training_sample_size: 3,
+        training_response_fingerprint: None,
         log_lambdas,
         lambdas,
         likelihood_family: Some(LikelihoodSpec::new(

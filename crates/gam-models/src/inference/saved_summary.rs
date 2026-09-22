@@ -797,6 +797,9 @@ fn scan_summary_payload(
         scale: Some(scan.sigma2),
         log_likelihood: Some(scan.log_likelihood),
         n_obs: Some(scan.training_sample_size),
+        // The O(n) scan route carries its row count but not the identity of the
+        // rows, so it establishes no provenance rather than a partial one.
+        response_fingerprint: None,
         // The scan does not compute the penalized-Hessian null-space logdet the TK
         // normalizer needs, so it has no comparable criterion: the raw cost is
         // published as `raw_reml_score` only. `evidence()` ranks on conditional
@@ -1106,6 +1109,7 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, Estima
         // number lets `compare_models` rank an exact fit on `−2·0 + 2·edf`.
         log_likelihood,
         n_obs: Some(fit.training_sample_size()),
+        response_fingerprint: fit.training_response_fingerprint(),
         reml_score,
         raw_reml_score,
         reml_score_unavailable: match (raw_reml_score, reml_score) {
@@ -1238,6 +1242,7 @@ fn comparison_candidate(
         name,
         family: summary.family_name,
         n_obs,
+        response_fingerprint: summary.response_fingerprint,
         null_deviance: summary.null_deviance,
         aic_corrected,
         aic_conditional,
@@ -1466,6 +1471,19 @@ pub struct SummaryPayload {
     /// reserved for non-model summary kinds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n_obs: Option<usize>,
+    /// Value identity of the rows the fit was trained on — the response and the
+    /// prior weights, by value
+    /// (`gam_solve::model_types::training_response_fingerprint`, #4556 P3).
+    ///
+    /// `compare_models` refuses two candidates whose fingerprints disagree: an
+    /// AIC gap is an evidence ratio only between two fits of ONE experiment, and
+    /// equal `n_obs` is necessary for that and does not establish it. `None`
+    /// means this summary's fit established none — a model saved before the
+    /// field existed, a route whose response is not a `(response, weights)`
+    /// pair, or a summary kind with no fit — and a comparison then falls back to
+    /// the necessary conditions it can test, which it says in its refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_fingerprint: Option<u64>,
     /// Cross-model comparable criterion: `raw_reml_score` plus the rank-aware
     /// Tierney-Kadane normalizer over the penalty null space.
     ///
