@@ -691,51 +691,141 @@ mod range_screen_tests {
         })
     }
 
+    /// The fixture's center count, named once so the rounding floor below can
+    /// state the criterion's log-determinant length without re-deriving it from
+    /// the spec by a match the ban list does not allow a fallback arm for.
+    const SCREEN_CENTERS: usize = 40;
+
     fn spec() -> gam_terms::basis::MeasureJetBasisSpec {
         gam_terms::basis::MeasureJetBasisSpec {
-            center_strategy: gam_terms::basis::CenterStrategy::FarthestPoint { num_centers: 40 },
+            center_strategy: gam_terms::basis::CenterStrategy::FarthestPoint {
+                num_centers: SCREEN_CENTERS,
+            },
             ..gam_terms::basis::MeasureJetBasisSpec::default()
         }
+    }
+
+    /// The band a central difference of `g` at step `h` may miss `g′` by, read
+    /// off the differences themselves rather than chosen (#2902, SPEC rule 23).
+    ///
+    /// A central difference carries two errors and no others:
+    ///
+    /// * TRUNCATION. `D(h) = g′ + C·h² + O(h⁴)` with `C = g‴/6`. The same
+    ///   difference at `2h` gives `D(2h) = g′ + 4C·h² + O(h⁴)`, so the observed
+    ///   gap `D(2h) − D(h)` IS `3C·h²` and the truncation of `D(h)` is exactly a
+    ///   third of it. `C` is never named: it is measured here, on this fixture,
+    ///   at this range.
+    /// * ROUNDING. The two values differ in their leading digits by `O(h)`, so
+    ///   whatever band they carry is amplified by `1/(2h)`. Their band is
+    ///   Wilkinson's `γ_k` for the criterion's longest accumulation — the
+    ///   `n`-term deviance sum plus the `p`-term log-determinant of the evaluator
+    ///   this screen calls — against the values' own scale.
+    ///
+    /// The returned band is the WHOLE gap plus the rounding floor, not the third
+    /// of it that truncation actually costs. That factor of three is not a safety
+    /// margin someone picked either: it is the `(2h)²/h²` scaling of the
+    /// differencing error itself, so a miss outside this band is not explained by
+    /// an `h²` truncation at any of the three steps, nor by the arithmetic.
+    fn central_difference_band(
+        near: f64,
+        far: f64,
+        values: [f64; 2],
+        step: f64,
+        rows: usize,
+        columns: usize,
+    ) -> f64 {
+        let truncation = (far - near).abs();
+        let scale = values[0].abs() + values[1].abs();
+        let rounding = gam_linalg::roundoff::accumulation_growth(rows + columns) * scale
+            / (2.0 * step.abs());
+        truncation + rounding
     }
 
     /// #2902: the screen's exact `ln ℓ` jet against central differences of its own
     /// value and gradient, at ranges a few node spacings above the window floor
     /// where the identified rank does not change under the step. The certified
     /// multi-start screen then returns a range inside the window.
+    ///
+    /// Both comparisons are made at two steps, `h` and `2h`, because a single
+    /// step cannot say how much of a miss is the difference's own truncation. The
+    /// bar is then [`central_difference_band`] at each point rather than a
+    /// relative tolerance: a fixed `1e-3·(1 + |V′|)` accepted the frozen-`Z` jet's
+    /// `1.5e-3` relative error at one range while refusing nothing at the other,
+    /// so it measured the criterion's scale and not the jet.
     #[test]
     fn range_screen_jet_matches_central_differences_2902() {
         let data = chart();
         let y = response(&data);
         let spec = spec();
+        let rows = data.nrows();
+        let columns = SCREEN_CENTERS;
         let (lower, upper) =
             gam_terms::basis::measure_jet_ln_range_window(data.view(), &spec).expect("window");
         let jet = |ln_ell: f64| {
             measure_jet_range_screen_jet(data.view(), y.view(), None, &spec, ln_ell)
                 .expect("the screen jet at a representable range")
         };
+        // A PROBE step, not an acceptance bar. Nothing is accepted against it:
+        // the band below is computed FROM the probe, so a step too large shows up
+        // as a large measured truncation and a step too small as a large
+        // amplified rounding floor. Either way the bar widens rather than a
+        // defect hiding. `1e-4` in `ln ℓ` keeps `[at − 2h, at + 2h]` inside one
+        // identified rank on this fixture, which is what the derivative exists on
+        // at all.
         let step = 1e-4;
         for offset in [0.4_f64, 1.0] {
             let at = lower + offset;
             let (_, first, second) = jet(at);
             let (up_value, up_first, _) = jet(at + step);
             let (down_value, down_first, _) = jet(at - step);
+            let (far_up_value, far_up_first, _) = jet(at + 2.0 * step);
+            let (far_down_value, far_down_first, _) = jet(at - 2.0 * step);
             let first_difference = (up_value - down_value) / (2.0 * step);
+            let first_difference_far = (far_up_value - far_down_value) / (4.0 * step);
             let second_difference = (up_first - down_first) / (2.0 * step);
-            assert!(
-                (first - first_difference).abs() <= 1e-3 * (1.0 + first.abs()),
-                "ln ℓ = {at}: V′ {first} vs central difference {first_difference}"
+            let second_difference_far = (far_up_first - far_down_first) / (4.0 * step);
+            let first_band = central_difference_band(
+                first_difference,
+                first_difference_far,
+                [up_value, down_value],
+                step,
+                rows,
+                columns,
+            );
+            let second_band = central_difference_band(
+                second_difference,
+                second_difference_far,
+                [up_first, down_first],
+                step,
+                rows,
+                columns,
             );
             assert!(
-                (second - second_difference).abs() <= 1e-3 * (1.0 + second.abs()),
-                "ln ℓ = {at}: V″ {second} vs central difference {second_difference}"
+                (first - first_difference).abs() <= first_band,
+                "ln ℓ = {at}: V′ {first} vs central difference {first_difference} \
+                 (at 2h: {first_difference_far}), band {first_band:e}"
+            );
+            assert!(
+                (second - second_difference).abs() <= second_band,
+                "ln ℓ = {at}: V″ {second} vs central difference {second_difference} \
+                 (at 2h: {second_difference_far}), band {second_band:e}"
             );
         }
         let screened = screen_measure_jet_range(data.view(), y.view(), None, &spec)
             .expect("at least one certified range search");
         let ln_screened = screened.ln();
+        // The screen answers in ℓ and the window is stated in `ln ℓ`, so the only
+        // slack a containment check is owed is that round trip: `exp` then `ln`,
+        // each correctly rounded, against the bound's own formation. Eight
+        // roundings is a generous count of that path, and lands about five
+        // decades under the `1e-9` this replaces, which stood for no arithmetic
+        // at all.
+        let round_trip =
+            gam_linalg::roundoff::accumulation_growth(8) * (1.0 + ln_screened.abs().max(1.0));
         assert!(
-            ln_screened >= lower - 1e-9 && ln_screened <= upper + 1e-9,
-            "the screened range ln ℓ = {ln_screened} left the window [{lower}, {upper}]"
+            ln_screened >= lower - round_trip && ln_screened <= upper + round_trip,
+            "the screened range ln ℓ = {ln_screened} left the window [{lower}, {upper}] \
+             by more than the {round_trip:e} the ℓ round trip costs"
         );
     }
 }

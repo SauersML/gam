@@ -1,5 +1,16 @@
 ## Unreleased
 
+- **The measure-jet range screen's jet is judged against a band the differences measure, not
+  a relative tolerance** (#2902). `range_screen_jet_matches_central_differences_2902` accepted
+  `V′` and `V″` within `1e-3·(1 + |value|)` of a single central difference. That bar is
+  denominated in the criterion's own scale, not in anything the comparison costs, so it
+  measured how large `V′` happens to be: it passed the frozen-`Z` jet whose error was `1.5e-3`
+  relative and would have passed a larger error at a larger range. Each derivative is now
+  differenced at two steps, `h` and `2h`. The observed gap between them IS the `3C·h²`
+  truncation of the `h` difference, so the truncation is measured on this fixture at this
+  range rather than named, and the bar is that whole gap plus Wilkinson's `γ_{n+p}` on the
+  differenced values amplified by `1/(2h)`. The window-containment check trades its `1e-9`
+  for the `exp`/`ln` round trip it is actually owed. No production code moves.
 - **A collection design rebuilt from a frozen residualization chart exports a gauge** (gam#2959).
   `apply_global_smooth_identifiability` sets `plan = Absent` whenever a term's narrowing is
   REPLAYED from a frozen `ParametricResidualizationChart`, and an `Absent` plan derives no
