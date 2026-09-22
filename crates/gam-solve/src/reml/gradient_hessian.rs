@@ -4819,6 +4819,14 @@ impl<'a> RemlState<'a> {
     /// stop depending on, and a term switched on at the moment a row activates would trade one
     /// jump for another; the rows' own declaration is the only thing that decides it.
     ///
+    /// Coefficient lower bounds are such rows. P-IRLS merges them into the one transformed system
+    /// the criterion reads (`build_transformed_lower_bound_constraints` then
+    /// `merge_linear_constraints`, `crates/gam-solve/src/pirls/loop_driver.rs`), so a box-bounded
+    /// fit has an active face, a face determinant and the same O(1) fall at every face change as
+    /// a shape-constrained one. Reading only `linear_constraints` here left those fits on the
+    /// determinant this term replaces; the predicate reads both declarations, which is the same
+    /// pair `select_reml_geometry` reads when it routes a constrained fit to the dense backend.
+    ///
     /// Firth bias reduction is NOT an exception, and the earlier claim that it was is retracted
     /// here. The inner objective under Firth is `E = −ℓ + ½βᵀS_λβ − Φ`, and both halves of the
     /// pair the term reads describe exactly that objective:
@@ -4840,9 +4848,17 @@ impl<'a> RemlState<'a> {
     /// constraint set to the dense backend by name (`constraints_present`) and nothing reroutes
     /// back, so a constrained mode is never assembled where no term is priced.
     pub(crate) fn fit_prices_constrained_laplace(&self) -> bool {
-        self.linear_constraints
+        let declares_rows = self
+            .linear_constraints
             .as_ref()
-            .is_some_and(|lin| lin.a.nrows() > 0)
+            .is_some_and(|lin| lin.a.nrows() > 0);
+        // A bound is a row only where it is finite, which is the same test the transformed
+        // system is built under.
+        let declares_bounds = self
+            .coefficient_lower_bounds
+            .as_ref()
+            .is_some_and(|bounds| bounds.iter().any(|bound| bound.is_finite()));
+        declares_rows || declares_bounds
     }
 
     /// [`Self::fit_prices_constrained_laplace`] at one inner mode, which additionally carries the

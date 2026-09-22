@@ -7080,7 +7080,16 @@ pub(crate) fn fresh_exact_mode_curvature_certificate_detects_returned_strict_sad
         },
     ];
     let start_certificate = exact_joint_mode_curvature_certificate(
-        &family, &at_start, &specs, &options, &ranges, &s_lambdas, None, 2, None,
+        &family,
+        &at_start,
+        &specs,
+        &options,
+        &ranges,
+        &s_lambdas,
+        None,
+        2,
+        None,
+        &[],
     )
     .expect("positive-curvature start should be certifiable");
     assert!(start_certificate.workspace.is_some());
@@ -7106,11 +7115,158 @@ pub(crate) fn fresh_exact_mode_curvature_certificate_detects_returned_strict_sad
         None,
         2,
         None,
+        &[],
     )
     .expect("returned strict saddle should produce an honest certificate");
     assert!(returned_certificate.workspace.is_some());
     assert!(returned_certificate.has_resolvable_negative_curvature());
     assert_eq!(returned_certificate.minimum_whitened_eigenvalue, -1.0);
+}
+
+/// gam#2695 item 4: a tight row that carries a ZERO KKT multiplier bounds the mode to a
+/// half-space, so nulling it hides a saddle the mode can descend into.
+///
+/// The fixture is the planted returned saddle above: at `β = (target, 0)` the joint Hessian is
+/// `diag(1, −1)` and the gradient is exactly zero, so the point is first-order stationary with a
+/// strict descent direction along `y`. Add the row `y ≥ 0`. It is tight there, and because the
+/// gradient is zero it carries no multiplier: it touches the mode without blocking it, and the
+/// critical cone is the half-space `{d : d_y ≥ 0}`, which contains the descent direction.
+///
+/// Both calls below hand the certificate the SAME tight row, so the only thing that differs is
+/// which rule chooses the face:
+/// * forcing the row onto the face reproduces the rule this replaces — null every tight row — and
+///   certifies, because the reduced tangent is the `x` axis alone. That is the positive control:
+///   the old rule really does certify this saddle, so the new one is not asserting a property
+///   every rule has;
+/// * leaving the choice to the multipliers keeps the row out of the face, and the certificate
+///   reports the exact planted curvature `−1`.
+#[test]
+pub(crate) fn a_zero_multiplier_tight_row_does_not_hide_a_returned_saddle_2695() {
+    let family = OneStepReturnedSaddleFamily::new(0.125);
+    let specs = one_step_returned_saddle_specs();
+    let options = BlockwiseFitOptions::default();
+    let ranges = block_param_ranges(&specs);
+    let s_lambdas = vec![Array2::zeros((1, 1)), Array2::zeros((1, 1))];
+    let at_returned_beta = vec![
+        ParameterBlockState {
+            beta: array![family.target],
+            eta: array![family.target],
+        },
+        ParameterBlockState {
+            beta: array![0.0],
+            eta: array![0.0],
+        },
+    ];
+    // `y ≥ 0` over the joint coefficients `[x, y]`, tight at the returned point.
+    let tight_face = ActiveLinearConstraintBlock {
+        a: array![[0.0, 1.0]],
+    };
+    let on_every_tight_row = exact_joint_mode_curvature_certificate(
+        &family,
+        &at_returned_beta,
+        &specs,
+        &options,
+        &ranges,
+        &s_lambdas,
+        None,
+        2,
+        Some(&tight_face),
+        &[0],
+    )
+    .expect("the tight-face certificate is formed");
+    assert!(
+        !on_every_tight_row.has_resolvable_negative_curvature(),
+        "the rule this replaces certifies the planted saddle: lambda_min={:.6e}, floor={:.6e}",
+        on_every_tight_row.minimum_whitened_eigenvalue,
+        on_every_tight_row.numerical_floor,
+    );
+    let on_the_positive_multiplier_face = exact_joint_mode_curvature_certificate(
+        &family,
+        &at_returned_beta,
+        &specs,
+        &options,
+        &ranges,
+        &s_lambdas,
+        None,
+        2,
+        Some(&tight_face),
+        &[],
+    )
+    .expect("the positive-multiplier certificate is formed");
+    assert_eq!(
+        on_the_positive_multiplier_face.certified_face_positions,
+        Some(Vec::new()),
+        "a zero-multiplier row is not on the certified face",
+    );
+    assert!(
+        on_the_positive_multiplier_face.has_resolvable_negative_curvature(),
+        "the saddle the half-space admits is reported: lambda_min={:.6e}, floor={:.6e}",
+        on_the_positive_multiplier_face.minimum_whitened_eigenvalue,
+        on_the_positive_multiplier_face.numerical_floor,
+    );
+    assert_eq!(
+        on_the_positive_multiplier_face.minimum_whitened_eigenvalue, -1.0,
+        "the planted curvature is reported exactly, not a projection of it",
+    );
+}
+
+/// gam#2695 item 4, the other side: a tight row that DOES carry a positive multiplier stays on
+/// the certified face, so curvature normal to it is not counted against the mode.
+///
+/// The row here is `x ≥ target + 0.05`, evaluated at `x = target + 0.05` so that it is tight AND
+/// carries the gradient. The fixture's score is `∂ℓ/∂x = −(x − target)`, so the objective's own
+/// gradient is `∇E = (x − target, 0) = (0.05, 0)`: it points along the row's normal with a
+/// positive coefficient, and that coefficient IS the KKT multiplier. The row is therefore kept and
+/// the `x` direction nulled. The remaining tangent is `y`, whose curvature there is
+/// `shape = −1 + 2·0.05²/target² = −0.68` at `target = 0.125`, so the certificate must still report a
+/// saddle — read from the tangent, not from the nulled normal. The point of the pair is that the
+/// face is chosen by the multiplier, not by the verdict it produces.
+#[test]
+pub(crate) fn a_positive_multiplier_tight_row_stays_on_the_certified_face_2695() {
+    let family = OneStepReturnedSaddleFamily::new(0.125);
+    let specs = one_step_returned_saddle_specs();
+    let options = BlockwiseFitOptions::default();
+    let ranges = block_param_ranges(&specs);
+    let s_lambdas = vec![Array2::zeros((1, 1)), Array2::zeros((1, 1))];
+    let displaced_x = family.target + 0.05;
+    let off_the_target = vec![
+        ParameterBlockState {
+            beta: array![displaced_x],
+            eta: array![displaced_x],
+        },
+        ParameterBlockState {
+            beta: array![0.0],
+            eta: array![0.0],
+        },
+    ];
+    // `x ≥ target + 0.05`, tight at this point, and carrying the whole gradient.
+    let tight_face = ActiveLinearConstraintBlock {
+        a: array![[1.0, 0.0]],
+    };
+    let certificate = exact_joint_mode_curvature_certificate(
+        &family,
+        &off_the_target,
+        &specs,
+        &options,
+        &ranges,
+        &s_lambdas,
+        None,
+        2,
+        Some(&tight_face),
+        &[],
+    )
+    .expect("the positive-multiplier certificate is formed");
+    assert_eq!(
+        certificate.certified_face_positions,
+        Some(vec![0]),
+        "a row carrying the gradient is on the certified face",
+    );
+    assert!(
+        certificate.has_resolvable_negative_curvature(),
+        "the remaining tangent's own curvature is reported: lambda_min={:.6e}, floor={:.6e}",
+        certificate.minimum_whitened_eigenvalue,
+        certificate.numerical_floor,
+    );
 }
 
 #[test]
@@ -7178,6 +7334,7 @@ pub(crate) fn joint_newton_recovers_from_returned_strict_saddle_with_remaining_c
         None,
         2,
         None,
+        &[],
     )
     .expect("recovered local minimum should have certifiable exact curvature");
     assert!(!certificate.has_resolvable_negative_curvature());

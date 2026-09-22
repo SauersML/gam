@@ -23,6 +23,34 @@
   the probe either finds it or returns, and a probe that certifies no mode is simply not among the
   candidates. It is a discovery condition and never a refusal — refusing on the same share was
   measured wrong (gate job 1219877) and that measurement stands.
+- **A constrained mode certified on a face that hid the saddle it could descend into** (gam#2695).
+  The second-order certificate nulled every NUMERICALLY TIGHT constraint row before testing the
+  curvature. At a KKT point the directions the mode may move along are the critical cone
+  `C = {d : aᵢᵀd = 0 where μᵢ > 0, aᵢᵀd ≥ 0 where μᵢ = 0}`, and `null(A_tight)` is a strict SUBSET
+  of it as soon as one tight row carries a zero multiplier: such a row touches the mode without
+  blocking it, and nulling it deletes exactly the descent direction the mode has. The measured
+  witness is the #2695 branch B, which certified with whitened tangent `λ_min = 4.28e-8` while its
+  full space carried `−2.08e-3`, became the warm cache, and latched BFGS at a criterion 3.6 below
+  the mode every nearby probe returned, so no Armijo step existed. The face is now the tight rows
+  that carry a POSITIVE multiplier, read through the same Lawson-Hanson projection the reduced-face
+  solver already reads its support through. That tests `null(A_pos)`, a SUPERSET of `C`, so passing
+  it is sufficient; and it is also necessary wherever at most one tight row has a zero multiplier,
+  because a quadratic form is even and its sign on a half-space through the origin is its sign on
+  the whole subspace. With two or more such rows the saddle-escape supplies the remaining faces:
+  a negative direction pinned on both signs moves its blocking row onto the face and the curvature
+  question is asked again there. The widening this narrows is kept whole — a row the QP omitted but
+  which genuinely blocks carries part of the gradient, so the projection gives it a positive
+  multiplier and it stays nulled, and the phantom indefiniteness the widening exists to remove does
+  not return.
+- **A box-bounded fit kept the face determinant the constrained cone term replaces** (gam#2765,
+  gam#2695). The predicate that decides whether a fit prices the constrained Laplace term read only
+  the declared linear constraints. P-IRLS merges coefficient lower bounds into the SAME transformed
+  inequality system the criterion reads, so a box-bounded fit has an active face and the same O(1)
+  fall at every face change, and it was left on the determinant. The predicate reads both
+  declarations, which is the pair the geometry router already reads when it sends a constrained fit
+  to the dense backend. This also retracts a claim made when the log barrier was gated off: the
+  barrier's remaining consumer was not the sparse-exact backend, which no constrained fit reaches,
+  but exactly these box-bounded fits. With them on the term it has none.
 - **A memory-budget refusal names the reservation that refused it** (#4565). The governor's
   ledger is process-wide, so `MemoryReservationError::BudgetExceeded` reported how many bytes
   were reserved without saying whose they were. A caller refused because a neighbour holds the

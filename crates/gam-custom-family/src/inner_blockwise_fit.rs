@@ -105,6 +105,13 @@ pub(crate) struct ExactJointModeCurvatureCertificate {
     /// stationarity system it was formed from (#2977). The settlement raises it
     /// to the objective's measured resolution.
     pub(crate) decrement_bands: DecrementResolution,
+    /// Which of the supplied tight rows this certificate actually nulled, as POSITIONS into the
+    /// rows it was given (gam#2695). The face is the tight rows carrying a positive KKT
+    /// multiplier, plus any the caller forced on; a tight row with a zero multiplier bounds the
+    /// mode to a half-space and is left in the tangent, so the saddle-escape must truncate its
+    /// chord against that row rather than treat it as already satisfied. `None` on an
+    /// unconstrained certificate.
+    pub(crate) certified_face_positions: Option<Vec<usize>>,
 }
 
 impl ExactJointModeCurvatureCertificate {
@@ -2504,6 +2511,7 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
     joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
     total_p: usize,
     active_constraints: Option<&ActiveLinearConstraintBlock>,
+    forced_face_positions: &[usize],
 ) -> Result<ExactJointModeCurvatureCertificate, CustomFamilyError> {
     let workspace =
         family.exact_newton_joint_hessian_workspace_with_options(states, specs, options)?;
@@ -2629,8 +2637,75 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
     // Retain the active-face tangent `Z` so a resolved negative-curvature mode
     // (certified in the reduced tangent space) can be mapped back into the full
     // joint coefficient layout as a saddle-escape direction.
-    let (certificate_matrix, certificate_metric, tangent) = match active_constraints {
-        Some(active) => match active_constraint_tangent_geometry(&active.a)? {
+    //
+    // gam#2695 item 4: the face is the tight rows that carry a POSITIVE KKT multiplier, not every
+    // tight row. At a KKT point the critical cone is
+    //
+    //     C = { d : aᵢᵀd = 0 for μᵢ > 0,  aᵢᵀd ≥ 0 for μᵢ = 0 },
+    //
+    // and second-order sufficiency asks for positive curvature on `C`. Nulling EVERY tight row
+    // tests `null(A_tight)`, a strict SUBSET of `C` as soon as one tight row carries a zero
+    // multiplier, so a saddle whose descent direction merely leaves that row's half-space passes:
+    // the measured #2695 branch B certified with whitened tangent λ_min 4.28e-8 while its full
+    // space carried −2.08e-3, became the warm cache, and latched BFGS at a cost 3.6 below the
+    // mode every nearby probe returned. Nulling only the positive-multiplier rows tests
+    // `null(A_pos)`, a SUPERSET of `C`, so passing it is sufficient for the condition on `C`.
+    //
+    // It is also NECESSARY wherever at most one tight row carries a zero multiplier: a quadratic
+    // form is even, so its sign on a half-space through the origin is its sign on the whole
+    // subspace, and `C ∪ (−C)` is then `null(A_pos)` exactly. With two or more such rows the
+    // escape supplies the missing faces of `C` — a negative direction pinned on BOTH signs moves
+    // its blocking row onto the face through `forced_face_positions` and the curvature question is
+    // asked again there.
+    //
+    // The widening this narrows is kept whole. A row the QP left out of its recorded active set
+    // but which genuinely blocks carries part of `∇E`, so the projection gives it a positive
+    // multiplier and it stays nulled; the phantom indefiniteness the widening exists to remove
+    // does not return. What is dropped is exactly the rows the projection certifies as carrying
+    // none of the gradient.
+    let certified_face_positions = match (active_constraints, stationarity_rhs.as_ref()) {
+        (None, _) => None,
+        // Without a joint gradient there are no multipliers to read, so the face is the tight one
+        // and the certificate publishes no decrements either: it is the same weaker evidence on
+        // both channels rather than a face chosen by a different rule.
+        (Some(active), None) => Some((0..active.a.nrows()).collect::<Vec<usize>>()),
+        (Some(active), Some((rhs, _))) => {
+            // `rhs` is the stationarity system `∇ℓ − Sβ + ∇Φ`, which is `−∇E` for the objective
+            // `E = −ℓ + ½βᵀSλβ − Φ` the mode minimizes.
+            let objective_gradient = rhs.mapv(|value| -value);
+            let mut face =
+                crate::blockwise_solve::positive_multiplier_face(&active.a, &objective_gradient)
+                    .ok_or_else(|| {
+                        CustomFamilyError::trial_point(
+                            "fresh exact joint-mode curvature certificate: the tight face's KKT \
+                             multipliers could not be projected, so which rows block this mode \
+                             is unknown (gam#2695)"
+                                .to_string(),
+                        )
+                    })?;
+            face.extend(
+                forced_face_positions
+                    .iter()
+                    .copied()
+                    .filter(|&position| position < active.a.nrows()),
+            );
+            face.sort_unstable();
+            face.dedup();
+            Some(face)
+        }
+    };
+    let certified_rows = match (active_constraints, certified_face_positions.as_ref()) {
+        (Some(active), Some(face)) if !face.is_empty() => {
+            let mut rows = Array2::<f64>::zeros((face.len(), active.a.ncols()));
+            for (out, &row) in face.iter().enumerate() {
+                rows.row_mut(out).assign(&active.a.row(row));
+            }
+            Some(rows)
+        }
+        _ => None,
+    };
+    let (certificate_matrix, certificate_metric, tangent) = match certified_rows.as_ref() {
+        Some(rows) => match active_constraint_tangent_geometry(rows)? {
             ActiveConstraintTangentGeometry::FullyPinned => {
                 return Ok(ExactJointModeCurvatureCertificate {
                     workspace,
@@ -2644,6 +2719,7 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
                         identified: 0.0,
                         weakly_identified: 0.0,
                     },
+                    certified_face_positions,
                 });
             }
             ActiveConstraintTangentGeometry::Tangent(z) => {
@@ -2759,6 +2835,7 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
             f64::NAN
         },
         decrement_bands,
+        certified_face_positions,
     })
 }
 
@@ -2912,6 +2989,8 @@ fn resolve_constrained_converged_mode<F: CustomFamily + Clone + Send + Sync + 's
         total_p,
         block_constraints,
         tight_active_sets,
+        // No escape has run yet, so no row is forced onto the certified face (gam#2695).
+        &[],
         saddle_escapes_used,
         previous_escape_lambda_min,
         objective_tol,
@@ -2939,6 +3018,7 @@ fn resolve_constrained_converged_mode_on_face<F: CustomFamily + Clone + Send + S
     total_p: usize,
     block_constraints: &[Option<ConstraintSet>],
     tight_active_sets: Vec<Option<Vec<usize>>>,
+    forced_rows: &[usize],
     saddle_escapes_used: usize,
     previous_escape_lambda_min: Option<f64>,
     objective_tol: f64,
@@ -2950,6 +3030,24 @@ fn resolve_constrained_converged_mode_on_face<F: CustomFamily + Clone + Send + S
 ) -> Result<ConstrainedModeResolution, CustomFamilyError> {
     let mode_active_block =
         assemble_active_constraint_block(block_constraints, &tight_active_sets, ranges, total_p);
+    // The joint row id of each row of the assembled face, in the assembly's own order, so the
+    // certificate can answer in positions and this caller can name the rows it kept (gam#2695).
+    let tight_joint_rows =
+        flatten_joint_active_set(&tight_active_sets, block_constraints).unwrap_or_default();
+    if let Some(block) = mode_active_block.as_ref()
+        && block.a.nrows() != tight_joint_rows.len()
+    {
+        return Err(CustomFamilyError::trial_point(format!(
+            "constrained mode certification: the assembled tight face has {} rows against {} \
+             joint row ids, so a certified row cannot be named (gam#2695)",
+            block.a.nrows(),
+            tight_joint_rows.len(),
+        )));
+    }
+    let forced_positions: Vec<usize> = forced_rows
+        .iter()
+        .filter_map(|row| tight_joint_rows.iter().position(|id| id == row))
+        .collect();
     let certificate = exact_joint_mode_curvature_certificate(
         family,
         states,
@@ -2960,7 +3058,20 @@ fn resolve_constrained_converged_mode_on_face<F: CustomFamily + Clone + Send + S
         joint_bundle,
         total_p,
         mode_active_block.as_ref(),
+        &forced_positions,
     )?;
+    // The face the certificate NULLED, in joint row ids. Every consumer below reads this rather
+    // than the tight set: a tight row with a zero multiplier is not on the certified face, so the
+    // escape must truncate its chord against that row instead of treating it as satisfied.
+    let certified_joint_rows: Vec<usize> = certificate
+        .certified_face_positions
+        .as_ref()
+        .map(|face| {
+            face.iter()
+                .filter_map(|&position| tight_joint_rows.get(position).copied())
+                .collect()
+        })
+        .unwrap_or_default();
     if certificate.jeffreys_completion_assembled {
         *jeffreys_completion_calls += 1;
     }
@@ -3096,8 +3207,7 @@ fn resolve_constrained_converged_mode_on_face<F: CustomFamily + Clone + Send + S
     // scaled-slack terms the active-set solvers use (row norm cancels in the
     // ratio). Both signs of `δ` give the same second-order decrease, so choose
     // the sign that admits the longer feasible step.
-    let joint_active =
-        flatten_joint_active_set(&tight_active_sets, block_constraints).unwrap_or_default();
+    let joint_active = certified_joint_rows;
     let mut feasible_positive = f64::INFINITY;
     let mut feasible_negative = f64::INFINITY;
     // WHICH row truncates the chord, per sign. A chord shorter than
@@ -3210,12 +3320,20 @@ fn resolve_constrained_converged_mode_on_face<F: CustomFamily + Clone + Send + S
              moving blocking row {row} onto the certified face (exchange {})",
             face_exchanges + 1,
         );
-        let mut widened = joint_active;
+        // The candidate face grows by the blocking row, and the row is FORCED onto the certified
+        // face as well: it blocks this direction, so its multiplier being zero at this point is
+        // not a reason to leave it in the tangent a second time. Without that the narrowing would
+        // drop it again on re-entry and the exchange would be a no-op (gam#2695).
+        let mut widened = tight_joint_rows;
         widened.push(row);
         widened.sort_unstable();
         widened.dedup();
         let widened_face =
             crate::blockwise_solve::scatter_joint_active_set(&widened, block_constraints);
+        let mut widened_forced = forced_rows.to_vec();
+        widened_forced.push(row);
+        widened_forced.sort_unstable();
+        widened_forced.dedup();
         return resolve_constrained_converged_mode_on_face(
             family,
             states,
@@ -3227,6 +3345,7 @@ fn resolve_constrained_converged_mode_on_face<F: CustomFamily + Clone + Send + S
             total_p,
             block_constraints,
             widened_face,
+            &widened_forced,
             saddle_escapes_used,
             previous_escape_lambda_min,
             objective_tol,
@@ -4003,6 +4122,9 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                     joint_bundle,
                     total_joint_p,
                     mode_active_block.as_ref(),
+                    // This site certifies a cached mode rather than resolving a saddle, so no
+                    // escape has forced a row onto the face (gam#2695).
+                    &[],
                 ) {
                     Ok(certificate) => {
                         cached_mode_acceptable = !certificate.has_resolvable_negative_curvature();
@@ -5079,6 +5201,9 @@ fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + Sync + 'stat
             joint_bundle,
             local_total_p,
             active_constraints.as_deref(),
+            // The blockwise exit certifies once and refuses; it runs no escape, so it forces no
+            // row onto the face (gam#2695).
+            &[],
         )?;
         let has_negative_curvature = certificate.has_resolvable_negative_curvature();
         let minimum_whitened_eigenvalue = certificate.minimum_whitened_eigenvalue;

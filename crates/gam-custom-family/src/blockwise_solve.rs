@@ -1066,6 +1066,51 @@ pub(crate) fn widen_active_sets_to_tight_face(
     Ok(tight_active_sets)
 }
 
+/// The rows of a tight face that carry a POSITIVE KKT multiplier at this mode (gam#2695).
+///
+/// At a KKT point of `min E` on `Aβ ≥ b` the objective's gradient is a nonnegative combination
+/// of the ACTIVE rows' normals, `∇E = Σ μᵢaᵢ` with `μ ≥ 0`. A tight row with `μᵢ = 0` carries
+/// none of that gradient: it touches the mode without blocking it, and it constrains the mode to a
+/// HALF-SPACE rather than to its own hyperplane. Which rows carry a positive multiplier is
+/// therefore a property of the point, and it is read here through the one routine the reduced-face
+/// solver already reads it through — the operator-native Lawson–Hanson projection onto the cone
+/// the rows generate, which returns only the positive multipliers.
+///
+/// `rows` are the tight face's rows over the joint coefficients, at any row scale; `gradient` is
+/// `∇E(β̂)` in the same layout. `None` when the projection cannot be certified, which is a refusal
+/// rather than an empty face: an unprojected residual names no support at all.
+pub(crate) fn positive_multiplier_face(
+    rows: &Array2<f64>,
+    gradient: &Array1<f64>,
+) -> Option<Vec<usize>> {
+    let (m, p) = (rows.nrows(), rows.ncols());
+    if m == 0 || p != gradient.len() || rows.iter().chain(gradient.iter()).any(|v| !v.is_finite()) {
+        return None;
+    }
+    let norms: Vec<f64> = (0..m)
+        .map(|row| rows.row(row).dot(&rows.row(row)).sqrt())
+        .collect();
+    let (multipliers, _) = gam_solve::active_set::nonnegative_cone_projection_by_rows(
+        &norms,
+        gradient,
+        |candidate| Some(rows.dot(candidate)),
+        |ids| {
+            let mut gathered = Array2::<f64>::zeros((ids.len(), p));
+            for (out, &id) in ids.iter().enumerate() {
+                if id >= m {
+                    return None;
+                }
+                gathered.row_mut(out).assign(&rows.row(id));
+            }
+            Some(gathered)
+        },
+    )?;
+    let mut face: Vec<usize> = multipliers.into_iter().map(|(row, _)| row).collect();
+    face.sort_unstable();
+    face.dedup();
+    Some(face)
+}
+
 pub(crate) fn assemble_active_constraint_block(
     block_constraints: &[Option<ConstraintSet>],
     block_active_sets: &[Option<Vec<usize>>],
