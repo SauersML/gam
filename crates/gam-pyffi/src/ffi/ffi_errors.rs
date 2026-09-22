@@ -1503,43 +1503,106 @@ mod saved_model_error_dispatch_tests {
     /// gam#3008: a payload load refuses raises the class of its category, a
     /// `DataError`, naming its variant and category in the message and as
     /// attributes, not an untyped refusal that cannot be told from any other.
+    ///
+    /// Two refusals, because they are different facts about the bytes and gam#3350
+    /// separated them. A document that is not the `{kind, version, model}` envelope is a
+    /// SCHEMA mismatch and names the remedy; a document that IS one but cannot be read is
+    /// CORRUPT and says so. The corrupt half is asserted here for the first time: the
+    /// fixture this test used to carry, `{"not": "a saved model"}`, is well-formed JSON
+    /// that merely is not an envelope, so it never exercised corruption at all.
     #[test]
     fn a_refused_saved_model_raises_its_category_with_its_variant_3008() {
+        use gam::inference::model::{MODEL_PAYLOAD_VERSION, SAVED_MODEL_KIND};
+
         crate::test_support::attach(|py| {
-            let refused = crate::load_model_impl(b"{\"not\": \"a saved model\"}")
-                .err()
-                .expect("bytes that are not a saved model must be refused");
-            let err = saved_model_error_to_pyerr(py, refused);
-            assert!(err.is_instance_of::<DataError>(py));
-            assert!(err.is_instance_of::<GamfitError>(py));
+            let refuse = |bytes: &[u8]| {
+                let refused = crate::load_model_impl(bytes)
+                    .err()
+                    .expect("these bytes are not a model this build can read");
+                saved_model_error_to_pyerr(py, refused)
+            };
+            let attribute = |err: &PyErr, name: &str| -> String {
+                err.value(py)
+                    .getattr(name)
+                    .and_then(|value| value.extract::<String>())
+                    .expect("every saved-model refusal carries this attribute")
+            };
+            let message = |err: &PyErr| err.value(py).str().expect("message").to_string();
+
+            // Bytes that are not a saved-model envelope. They name no kind, which is also
+            // what a PRE-ENVELOPE saved model looks like to this reader, so gam#3350 refuses
+            // both the same way and names the remedy that serves the model case. The class
+            // and the category are unchanged by that: still `DataError`, still `data`.
+            let not_an_envelope = refuse(b"{\"not\": \"a saved model\"}");
+            assert!(not_an_envelope.is_instance_of::<DataError>(py));
+            assert!(not_an_envelope.is_instance_of::<GamfitError>(py));
             assert!(
-                !err.is_instance_of::<FormulaError>(py),
+                !not_an_envelope.is_instance_of::<FormulaError>(py),
                 "a payload refusal is not a request error"
             );
-            let value = err.value(py);
-            let variant: String =
-                value.getattr("variant").and_then(|v| v.extract()).expect("variant");
-            let category: String =
-                value.getattr("category").and_then(|v| v.extract()).expect("category");
-            assert_eq!(variant, "FittedModelError::PayloadCorrupt");
-            assert_eq!(category, "data");
-            let message = value.str().expect("message").to_string();
+            assert_eq!(
+                attribute(&not_an_envelope, "variant"),
+                "FittedModelError::SchemaMismatch"
+            );
+            assert_eq!(attribute(&not_an_envelope, "category"), "data");
+            let text = message(&not_an_envelope);
             assert!(
-                message.contains("failed to parse model json")
-                    && message.contains("variant: FittedModelError::PayloadCorrupt")
-                    && message.contains("category: data"),
-                "the message must carry the refusal, its variant and its category: {message}"
+                text.contains("this reader expects")
+                    && text.contains("refit the model with this build")
+                    && text.contains("variant: FittedModelError::SchemaMismatch")
+                    && text.contains("category: data"),
+                "the message must carry the refusal, its variant and its category: {text}"
             );
 
+            // A CORRUPT payload must still say corrupt to a user. These three reach
+            // `SavedModelError::Malformed` by the decoder's three different routes: bytes
+            // that are not JSON at all, an envelope this reader accepts whose model is
+            // missing, and one whose model is not a model. The envelope is built from the
+            // reader's own kind and version so this test does not pin a version literal that
+            // every payload change would have to edit.
+            let envelope = |model: &str| {
+                format!(
+                    "{{\"kind\":\"{SAVED_MODEL_KIND}\",\"version\":{MODEL_PAYLOAD_VERSION}{model}}}"
+                )
+            };
+            for (label, bytes) in [
+                ("bytes that are not JSON", b"{".to_vec()),
+                ("an envelope with no model", envelope("").into_bytes()),
+                (
+                    "an envelope whose model is not a model",
+                    envelope(",\"model\":42").into_bytes(),
+                ),
+            ] {
+                let corrupt = refuse(&bytes);
+                assert!(
+                    corrupt.is_instance_of::<DataError>(py),
+                    "{label} must raise the data category"
+                );
+                assert_eq!(
+                    attribute(&corrupt, "variant"),
+                    "FittedModelError::PayloadCorrupt",
+                    "{label} must still say corrupt"
+                );
+                assert_eq!(attribute(&corrupt, "category"), "data", "{label}");
+                let text = message(&corrupt);
+                assert!(
+                    text.contains("the saved model is not a model document")
+                        && text.contains("variant: FittedModelError::PayloadCorrupt"),
+                    "{label}: {text}"
+                );
+            }
+
+            // A refusal raised directly, not decoded, keeps its own variant.
             let mismatch = saved_model_error_to_pyerr(
                 py,
                 gam::inference::model::FittedModelError::SchemaMismatch {
                     reason: "fixture: saved covariance has the wrong shape".to_string(),
                 },
             );
-            let variant: String =
-                mismatch.value(py).getattr("variant").and_then(|v| v.extract()).expect("variant");
-            assert_eq!(variant, "FittedModelError::SchemaMismatch");
+            assert_eq!(
+                attribute(&mismatch, "variant"),
+                "FittedModelError::SchemaMismatch"
+            );
         });
     }
 }
