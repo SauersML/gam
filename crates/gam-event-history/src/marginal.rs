@@ -2643,26 +2643,61 @@ mod tests {
             smoothed.0, smoothed.1, last.0, last.1
         );
         assert!(smoothed.0 > 1.5, "the fixture's smoothed marginal must sit off the prior");
-        for order in [9, 17, 33] {
+        // Two quantities, measured at every order: node 0's SMOOTHED marginal,
+        // which the backward pass makes, and the last node's, which is its
+        // filtered one and so is the forward filter's.
+        let orders = [9usize, 17, 33];
+        let mut measured: Vec<((f64, f64), (f64, f64))> = Vec::with_capacity(orders.len());
+        for &order in &orders {
             let gh = GaussHermite::new(order).unwrap();
             let inputs = SubjectInputs {
                 nodes: &nodes, eta0: &eta0, loadings: &loadings, rates: &rates, time_scale: 1.0,
                 gh: &gh, continuation_gap: 0.0, designs: None, log_normaliser: None,
             };
             let moments = latent_state_moments(&inputs, default_quadrature_tolerance()).unwrap();
-            let node_0 = (moments[0].0[0], moments[0].1[0].sqrt());
-            let final_node = (moments[n_nodes - 1].0[0], moments[n_nodes - 1].1[0].sqrt());
-            let filter_error = (final_node.0 - last.0).abs().max((final_node.1 - last.1).abs());
-            let bar = filter_error.max(reference_error);
+            measured.push((
+                (moments[0].0[0], moments[0].1[0].sqrt()),
+                (moments[n_nodes - 1].0[0], moments[n_nodes - 1].1[0].sqrt()),
+            ));
+        }
+        // Each claim is read against ITS OWN convergence in the Gauss-Hermite
+        // order: the largest move either moment makes between consecutive
+        // orders, floored by the dense reference's own error, since nothing
+        // here resolves below that.
+        let step = |pick: &dyn Fn(&((f64, f64), (f64, f64))) -> (f64, f64)| -> f64 {
+            measured
+                .windows(2)
+                .map(|pair| {
+                    let (coarse, fine) = (pick(&pair[0]), pick(&pair[1]));
+                    (coarse.0 - fine.0).abs().max((coarse.1 - fine.1).abs())
+                })
+                .fold(0.0_f64, f64::max)
+        };
+        let smoother_bar = step(&|m| m.0).max(reference_error);
+        let filter_bar = step(&|m| m.1).max(reference_error);
+        eprintln!(
+            "bars: smoother {smoother_bar:.3e}, forward filter {filter_bar:.3e}, dense reference {reference_error:.3e}"
+        );
+        for (&order, &(node_0, final_node)) in orders.iter().zip(&measured) {
             let (mean_error, sd_error) = (node_0.0 - smoothed.0, node_0.1 - smoothed.1);
+            let (last_mean, last_sd) = (final_node.0 - last.0, final_node.1 - last.1);
             eprintln!(
-                "order {order}: node 0 mean error {mean_error:+.3e}, sd error {sd_error:+.3e}; bar {bar:.3e} (filter error {filter_error:.3e})"
+                "order {order}: node 0 error ({mean_error:+.3e}, {sd_error:+.3e}) against {smoother_bar:.3e}; \
+                 last node error ({last_mean:+.3e}, {last_sd:+.3e}) against {filter_bar:.3e}"
             );
             assert!(
-                mean_error.abs() <= bar && sd_error.abs() <= bar,
+                mean_error.abs() <= smoother_bar && sd_error.abs() <= smoother_bar,
                 "order {order}: node 0's smoothed marginal N({:.6}, {:.6}²) misses the dense N({:.6}, {:.6}²) by \
-                 ({mean_error:+.3e}, {sd_error:+.3e}), past the forward filter's own error {bar:.3e}",
+                 ({mean_error:+.3e}, {sd_error:+.3e}), past the {smoother_bar:.3e} the BACKWARD pass moves by \
+                 between these orders",
                 node_0.0, node_0.1, smoothed.0, smoothed.1
+            );
+            assert!(
+                last_mean.abs() <= filter_bar && last_sd.abs() <= filter_bar,
+                "order {order}: the last node's filtered marginal N({:.6}, {:.6}²) misses the dense \
+                 N({:.6}, {:.6}²) by ({last_mean:+.3e}, {last_sd:+.3e}), past the {filter_bar:.3e} the \
+                 FORWARD filter moves by between these orders",
+                final_node.0, final_node.1, last.0, last.1
             );
         }
     }
