@@ -2256,6 +2256,7 @@ pub(crate) fn run_outer_with_plan(
                             last_solution,
                             max_attempts,
                             failure_reason,
+                            last_armijo_miss,
                         }) => log::debug!(
                             // Same rationale as the MaxIterationsReached
                             // arm: surface `in N iters` so the runner can
@@ -2265,13 +2266,19 @@ pub(crate) fn run_outer_with_plan(
                             // immediately) is a different signal from
                             // failure at iter 50 (the optimizer made
                             // substantial progress before stalling).
-                            "[OUTER summary] BFGS line-search failed in {} iters elapsed={:.3}s final_value={:.6e} reason={:?} max_attempts={} |g|={:.3e}",
+                            // `last_armijo_miss` says whether the last rejected trial's
+                            // predicted decrease was inside the evaluations' band (the
+                            // test could not see it) or resolvable and not realized
+                            // (opt#17).
+                            "[OUTER summary] BFGS line-search failed in {} iters elapsed={:.3}s final_value={:.6e} reason={:?} max_attempts={} |g|={:.3e} last_armijo_miss={:?} band_limited={:?}",
                             last_solution.iterations,
                             bfgs_elapsed,
                             last_solution.final_value,
                             failure_reason,
                             max_attempts,
                             last_solution.final_gradient_norm.unwrap_or(f64::NAN),
+                            last_armijo_miss,
+                            last_armijo_miss.map(|miss| miss.within_band()),
                         ),
                         Err(e) => log::debug!(
                             "[OUTER summary] BFGS failed elapsed={:.3}s err={:?}",
@@ -2295,6 +2302,7 @@ pub(crate) fn run_outer_with_plan(
                             last_solution,
                             max_attempts,
                             failure_reason,
+                            ..
                         }) => {
                             if last_solution.final_value.is_finite()
                                 && last_solution.final_point.iter().all(|v| v.is_finite())
