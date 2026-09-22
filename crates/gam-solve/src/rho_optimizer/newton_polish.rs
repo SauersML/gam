@@ -222,7 +222,8 @@ pub(super) fn polish_the_mint(
                             allow_certify_reseed,
                             fidelity,
                             Some(PolishWalk { record, judged }),
-                        );
+                        )
+                        .map(Some);
                     }
                     Ok((rail_cost, _)) => {
                         stopped = format!(
@@ -766,6 +767,7 @@ pub(super) fn polish_rail_plan(
 /// point published. The certificate recursion of that one walk owns it and drops
 /// it on return, so no other walk, concurrent or later, can read it, whatever
 /// point either visits.
+#[derive(Clone)]
 pub(super) struct PolishWalk {
     pub(super) record: NewtonPolishRecord,
     judged: JudgedEvidence,
@@ -773,6 +775,7 @@ pub(super) struct PolishWalk {
 
 /// The certificate evidence a polish trial's evaluation published, with the
 /// point it was published at.
+#[derive(Clone)]
 struct JudgedEvidence {
     point: Array1<u64>,
     evidence: crate::estimate::outer_eval_capture::CertificateEvidence,

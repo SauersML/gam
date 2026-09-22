@@ -4518,7 +4518,8 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         let inputs = super::newton_polish::MintPolish {
             allow_certify_reseed,
             fidelity,
-            polish,
+            // The walk is read again below when the polish declines to certify (gam#3228).
+            polish: polish.clone(),
             decision,
             evidence,
             cost: evaluation.cost,
