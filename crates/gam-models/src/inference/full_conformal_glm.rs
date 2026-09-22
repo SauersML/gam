@@ -2693,7 +2693,7 @@ mod reselection_tests {
                 // balances at `band^(1/4)`. Both are lifted by the point's own
                 // magnitude so the step is a relative one. `nll` and `weight_jet`
                 // are closed forms, so one evaluation's band is the unit roundoff.
-                let reach = 1.0 + eta.abs();
+                let reach = 1.0 + f64::abs(eta);
                 let h_first = f64::EPSILON.cbrt() * reach;
                 let h_second = f64::EPSILON.powf(0.25) * reach;
                 let (w, w1, w2) = family.weight_jet(eta).unwrap();
@@ -2778,7 +2778,7 @@ mod reselection_tests {
                 // that roundoff meets a central first difference's `h²`
                 // truncation, its cube root — which at the module's `1e-12` is the
                 // `1e-4` this pin used before the step was derived.
-                let h = GLM_CONVERGENCE_RTOL.cbrt() * (1. + rho.abs());
+                let h = GLM_CONVERGENCE_RTOL.cbrt() * (1. + f64::abs(rho));
                 let evaluate = |r: f64| {
                     sub.laml_jet(selected, &row, z, r, &Array1::zeros(2))
                         .unwrap()
@@ -3050,7 +3050,7 @@ mod reselection_tests {
                 // that roundoff meets a central first difference's `h²`
                 // truncation, its cube root — which at the module's `1e-12` is the
                 // `1e-4` this pin used before the step was derived.
-                let h = GLM_CONVERGENCE_RTOL.cbrt() * (1. + rho.abs());
+                let h = GLM_CONVERGENCE_RTOL.cbrt() * (1. + f64::abs(rho));
                 let evaluate = |r: f64| {
                     sub.laml_jet(selected, &row, z, r, &Array1::zeros(2))
                         .unwrap()
