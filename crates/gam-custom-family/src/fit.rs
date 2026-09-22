@@ -1037,7 +1037,7 @@ fn stacked_block_design_gram(specs: &[ParameterBlockSpec]) -> Option<Array2<f64>
 /// above the measured failure. The count reached is recorded in the certificate
 /// so that a future fixture which defeats it changes one number with its
 /// evidence attached rather than a rule with none.
-const REQUIRED_CONSECUTIVE_AGREEMENTS: usize = 2;
+pub(crate) const REQUIRED_CONSECUTIVE_AGREEMENTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct AnchoredContinuationCertificate {
@@ -1489,21 +1489,46 @@ fn criterion_agreement(coarser: f64, finer: f64) -> f64 {
 /// [`certify_refined_continuation`]).
 ///
 /// The bound is derived, not chosen: **the seed may not cost more correctors
-/// than the outer search it seeds is budgeted for.** A ladder through `D`
-/// refinements runs `1 + 2 + 4 + … + 2^D = 2^{D+1} − 1` correctors, and the outer
-/// search is allowed `outer_max_iter` iterations each of which pays at least one,
-/// so `2^{D+1} ≤ outer_max_iter`, i.e. `D = ⌊log₂(outer_max_iter)⌋ − 1`.
+/// than the fit is willing to spend seeding itself.** A ladder through `D`
+/// refinements runs `1 + 2 + 4 + … + 2^D = 2^{D+1} − 1` correctors, so
+/// `2^{D+1} ≤ CONTINUATION_SEED_CORRECTOR_BUDGET`, i.e.
+/// `D = ⌊log₂(CONTINUATION_SEED_CORRECTOR_BUDGET)⌋ − 1`.
 ///
-/// Floored at `REQUIRED_CONSECUTIVE_AGREEMENTS + 1`, which is the fewest
-/// refinements that can produce a verdict at all: a budget below it refuses
-/// every path regardless of what the path does, which is a disablement rather
-/// than a budget.
-pub(crate) fn continuation_refinement_budget(outer_max_iter: usize) -> usize {
-    let from_outer_budget = usize::BITS
-        .saturating_sub(outer_max_iter.leading_zeros())
+/// # Why the budget is declared here and not read off the outer search
+///
+/// This used to read `outer_max_iter`, on the argument that the outer search is
+/// allowed that many iterations each paying at least one corrector. That was
+/// sound only while the outer search was bounded by a count. It no longer is:
+/// #2817 replaced the count with progress certificates on every route, and
+/// `DEFAULT_CUSTOM_FAMILY_OUTER_MAX_ITER` is now the engine's unbounded value.
+/// Read through the old expression that yields `D = 62` — a ladder of `2^63`
+/// correctors, which is the operationally unbounded loop #2661 closed, reopened
+/// by a change to an unrelated stop.
+///
+/// The two bounds answer different questions and are now stated separately: the
+/// outer search terminates on measured progress, and the seed ladder terminates
+/// on a resource it declares. A resource cap is the right shape for this one
+/// because the endpoint sequence is MODE-VALUED — refining does not shrink an
+/// error, it changes which mode the path arrives at (see
+/// [`certify_refined_continuation`]) — so there is no error law from which a
+/// depth could be derived, and #2612 measured that no convergence ratio reads
+/// this ladder.
+pub(crate) fn continuation_refinement_budget() -> usize {
+    let from_corrector_budget = usize::BITS
+        .saturating_sub(CONTINUATION_SEED_CORRECTOR_BUDGET.leading_zeros())
         .saturating_sub(2) as usize;
-    from_outer_budget.max(REQUIRED_CONSECUTIVE_AGREEMENTS + 1)
+    from_corrector_budget.max(REQUIRED_CONSECUTIVE_AGREEMENTS + 1)
 }
+
+/// The corrector solves the #2661 continuation seed may spend, as a resource.
+///
+/// `32` is what the retired coupling to `outer_max_iter` allowed at the shipped
+/// default: `outer_max_iter = 60` gave `D = ⌊log₂60⌋ − 1 = 4`, a ladder of
+/// `2^5 − 1 = 31` correctors. Declaring `32` holds the ladder's depth at that
+/// same `D = 4`, so removing the outer count moves the outer search and nothing
+/// else. Any change to the seed's depth is then a change to this number, argued
+/// on the seed's own cost, rather than a side effect of the outer stop.
+pub(crate) const CONTINUATION_SEED_CORRECTOR_BUDGET: usize = 32;
 
 /// Refine the continuation's discretization until its endpoint settles on one
 /// mode, and certify that it did.
@@ -1572,7 +1597,7 @@ pub(crate) fn certify_refined_continuation<P: RefinedContinuationPath>(
     // The outer search's own criterion resolution: two criterion values closer
     // than this are values the search that consumes them cannot separate.
     let criterion_resolution = continuation_criterion_resolution(path.observation_count());
-    let max_refinements = continuation_refinement_budget(options.outer_max_iter);
+    let max_refinements = continuation_refinement_budget();
     let mut coarser: Option<SweptEndpoint> = None;
     let mut previous_discrepancy: Option<f64> = None;
     let mut consecutive_agreements = 0usize;

@@ -3923,5 +3923,14 @@
     ],
     "reason": "#4562: the free full-covariance Gaussian-mixture rung is priced by its Laplace marginal likelihood instead of by EM plus BIC, so the EM map, its resume checkpoint, its typed error, its contraction-rate projection and the covariance-floor constraint all lose their consumer. GaussianMixtureFit::bic, ::certificate and ::iterations go with them, but those three names are NOT listed here: RingGaussianMixtureFit still declares bic, certificate and iterations in the same file, and the ring rung keeps its EM and its Schwarz price. The covariance floor is deleted rather than replaced: the Wishart(d+1, S^-1) prior keeps every component precision finite even for a component holding one row or none, so the mode is interior for every k and no floor is needed.",
     "evidence": "The free rung's entry point fit_gaussian_mixture now calls gaussian_mixture_laplace::fit_mixture_laplace and reads only kmeans_max_iter from GaussianMixtureConfig; the remaining EM fields serve fit_ring_gaussian_mixture, whose ring_mixture_e_step, bic() and certificate() are untouched. No file outside crates/gam-solve names GaussianMixtureCheckpoint or GaussianMixtureError, and the gam-solve mod.rs re-export of the checkpoint is removed in the same commit."
+  },
+  {
+    "base": "eeb8b136b1ea45f29a3f8fd2c10affd910750f84",
+    "items": [
+      "crates/gam-custom-family/src/tests/anchored_continuation_2366.rs:fn:scripted_options",
+      "crates/gam-custom-family/src/tests/anchored_continuation_2366.rs:fn:the_refinement_budget_is_the_outer_searchs_corrector_budget_2661"
+    ],
+    "reason": "#4566: the custom-family outer search stops on its progress certificates, not BlockwiseFitOptions::default().outer_max_iter = 60, and the #2661 seed ladder's depth is derived from a declared corrector budget (CONTINUATION_SEED_CORRECTOR_BUDGET) instead of floor(log2(outer_max_iter)) - 1. scripted_options existed only to vary outer_max_iter for that ladder, which no longer reads it; its three callers call double_well_options() directly. The budget test is rewritten as the_refinement_budget_is_the_seed_ladders_corrector_budget_2661, bracketing the depth from the declared budget from both sides instead of tabulating four outer counts. Test-scoped items; no production item is removed.",
+    "evidence": "Read off the landing diff: git grep for either name at the landing parent returns only the test file; the rewritten test in the same file pins the derivation."
   }
 ]

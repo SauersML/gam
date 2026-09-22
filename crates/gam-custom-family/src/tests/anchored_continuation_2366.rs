@@ -206,13 +206,6 @@ impl crate::fit::RefinedContinuationPath for ScriptedContinuationPath {
 /// the resolution the fixtures below are written against: `1e-6`.
 const SCRIPTED_OBSERVATIONS: usize = 500_000;
 
-fn scripted_options(outer_max_iter: usize) -> BlockwiseFitOptions {
-    BlockwiseFitOptions {
-        outer_max_iter,
-        ..double_well_options()
-    }
-}
-
 /// #2661's guarantee, asserted as the property it actually is: **the refinement
 /// loop terminates in bounded work**, whatever the sequence does.
 ///
@@ -229,8 +222,8 @@ fn arbitrarily_slow_progress_still_terminates_in_bounded_work_2661() {
     // strictly improving, never agreeing to `τ_stat = 1e-6`.
     let script: Vec<f64> = (0..40).map(|k| 1.0 + 0.999_f64.powi(k)).collect();
     let path = ScriptedContinuationPath::new(script);
-    let options = scripted_options(100);
-    let budget = crate::fit::continuation_refinement_budget(options.outer_max_iter);
+    let options = double_well_options();
+    let budget = crate::fit::continuation_refinement_budget();
     let refusal = match crate::fit::certify_refined_continuation(&path, &options, false) {
         Ok(certified) => panic!(
             "a creeping criterion must terminate with a typed refusal, not a certificate at \
@@ -259,26 +252,36 @@ fn arbitrarily_slow_progress_still_terminates_in_bounded_work_2661() {
     );
 }
 
-/// The bound is derived from the outer search's own budget, so it moves with it.
+/// The bound is the seed ladder's own declared corrector budget, and the outer
+/// search's stop cannot move it (#4566).
 #[test]
-fn the_refinement_budget_is_the_outer_searchs_corrector_budget_2661() {
-    for (outer_max_iter, expected) in [(64usize, 5usize), (100, 5), (128, 6), (1000, 8)] {
-        assert_eq!(
-            crate::fit::continuation_refinement_budget(outer_max_iter),
-            expected,
-            "a ladder through D refinements runs 2^(D+1)-1 correctors, which must fit in \
-             outer_max_iter={outer_max_iter}"
-        );
-        assert!(
-            (1usize << (expected + 1)) <= outer_max_iter,
-            "the derivation must hold at outer_max_iter={outer_max_iter}"
-        );
-    }
-    // Below the point where a verdict is reachable at all, the budget is floored
-    // at the fewest refinements that can produce one rather than disabling the
-    // ladder outright.
-    assert_eq!(crate::fit::continuation_refinement_budget(1), 3);
-    assert_eq!(crate::fit::continuation_refinement_budget(8), 3);
+fn the_refinement_budget_is_the_seed_ladders_corrector_budget_2661() {
+    let budget = crate::fit::continuation_refinement_budget();
+    let correctors = (1usize << (budget + 1)) - 1;
+    assert!(
+        correctors <= crate::fit::CONTINUATION_SEED_CORRECTOR_BUDGET,
+        "a ladder through D={budget} refinements runs {correctors} correctors, which must fit \
+         in the declared seed budget {}",
+        crate::fit::CONTINUATION_SEED_CORRECTOR_BUDGET
+    );
+    assert!(
+        ((1usize << (budget + 2)) - 1) > crate::fit::CONTINUATION_SEED_CORRECTOR_BUDGET,
+        "D={budget} must be the LARGEST depth the declared seed budget affords, otherwise the \
+         ladder is refusing paths the budget can pay for"
+    );
+    assert!(
+        budget >= crate::fit::REQUIRED_CONSECUTIVE_AGREEMENTS + 1,
+        "a budget below the fewest refinements that can produce a verdict is a disablement, \
+         not a budget: D={budget}"
+    );
+
+    // The decoupling itself is the signature: the budget reads no outer count,
+    // so no outer stop -- bounded or unbounded -- can move the ladder's depth.
+    // Read through the retired expression `floor(log2(outer_max_iter)) - 1`, the
+    // shipped unbounded outer search would give D = 62, a ladder of 2^63
+    // correctors, which is the operationally unbounded loop #2661 closed. The
+    // two brackets above are the whole verdict: D is the largest depth the
+    // declared corrector budget pays for, whatever that budget is set to.
 }
 
 /// The #2612 shape, from the direction the penguins fixture cannot be run in
@@ -296,7 +299,7 @@ fn a_plateau_a_later_refinement_leaves_is_neither_certified_nor_refused_2612() {
     // steps 8, 16, 32: another mode   (disagreement at 8, then agreements)
     let script = vec![10.607, 11.387, 11.387, 10.594, 10.594, 10.594];
     let path = ScriptedContinuationPath::new(script);
-    let options = scripted_options(100);
+    let options = double_well_options();
     let certified = crate::fit::certify_refined_continuation(&path, &options, false).expect(
         "a ladder that changes branch and then settles must certify, not refuse: the coarse \
          pair's agreement was never a discretization error, so it cannot be a contraction \
@@ -334,7 +337,7 @@ fn a_plateau_a_later_refinement_leaves_is_neither_certified_nor_refused_2612() {
 #[test]
 fn a_single_agreement_does_not_certify_2612() {
     let path = ScriptedContinuationPath::new(vec![10.607, 11.387, 11.387, 10.594, 10.594, 10.594]);
-    let options = scripted_options(100);
+    let options = double_well_options();
     let certified = crate::fit::certify_refined_continuation(&path, &options, false)
         .expect("this script settles");
     assert!(

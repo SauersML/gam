@@ -568,6 +568,45 @@ pub struct BlockwiseFitOptions {
 /// Default maximum coefficient cycles for a custom-family fit.
 pub const DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES: usize = 1200;
 
+/// The outer smoothing search's iteration count for a custom-family fit: none.
+///
+/// This is the value the shared outer engine declares for itself
+/// (`gam_solve::rho_optimizer::run::UNBOUNDED_OUTER_ITERATIONS`), and it is here
+/// because the custom-family path was the last caller overriding it with a
+/// count.
+///
+/// # Why a count is not the stop
+///
+/// #2817 replaced the outer search's count-based stop with a progress
+/// certificate on every route, because a count decides that a search which has
+/// not converged is refused — which is a statement about the budget, not about
+/// the problem. Each route now ends a stalled search on its own certificate:
+///
+/// * the dense ARC and matrix-free trust-region bridges, and the host BFGS
+///   stuck-stall escapes, license another filled cost-stall window only after
+///   resolved descent or a smaller incumbent residual
+///   (`CostStallGuard::license_continuation`);
+/// * the fixed-point and per-atom walks carry `FixedPointProgress`, which stops
+///   at an evaluation buying neither a resolved improvement nor a contraction of
+///   its step (#3176);
+/// * the device BFGS walk carries opt's native cost stall.
+///
+/// **Termination argument.** Every one of those certificates is a test on
+/// measured progress at the current iterate, not on an iteration index, and each
+/// fires after a bounded number of consecutive non-progressing evaluations. A
+/// search that stops improving therefore stops, and a search still improving is
+/// not cut off mid-descent; a stationary point stops on the certificate ladder's
+/// own rungs, whose bounds are the criterion's statistical resolution
+/// `tau_stat = 1/(2*n_eff)` and the formation bands measured at the point.
+///
+/// The `60` this replaces was undderived. It was below what the engine's
+/// certificates need on real fits: raising it alone carried
+/// `binomial_location_scale_engine_matches_reference_flow` (#3265) from refused
+/// to passing, and carried the Gaussian wiggle-face criterion (#3228) past its
+/// iteration-budget refusal to a Newton-decrement verdict, which is the first
+/// verdict about the fit rather than about the budget.
+pub const DEFAULT_CUSTOM_FAMILY_OUTER_MAX_ITER: usize = usize::MAX;
+
 impl Default for BlockwiseFitOptions {
     fn default() -> Self {
         Self {
@@ -582,7 +621,11 @@ impl Default for BlockwiseFitOptions {
             // Gaussian, logistic, and small-n fits.
             inner_max_cycles: DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES,
             inner_tol: 1e-6,
-            outer_max_iter: 60,
+            // No count: the outer search stops on the engine's progress
+            // certificates and the stationarity ladder, never on an iteration
+            // index. See `DEFAULT_CUSTOM_FAMILY_OUTER_MAX_ITER` for the
+            // termination argument.
+            outer_max_iter: DEFAULT_CUSTOM_FAMILY_OUTER_MAX_ITER,
             outer_tol: 1e-5,
             rho_lower_bound: None,
             // Conditioning is solver state, not a coefficient prior. Start at
