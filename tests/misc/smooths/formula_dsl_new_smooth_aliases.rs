@@ -2,6 +2,17 @@
 
 use gam::inference::formula_dsl::{ParsedTerm, parse_formula};
 
+// A smooth function name records the basis it dispatches to under `bs`, which
+// is what `fix_function_basis` writes and what every consumer reads. There is
+// no `type` option: the parser's own unit test in
+// `crates/gam-terms/src/inference/formula_dsl.rs` asserts
+// `!options.contains_key("type")` for `cyclic(x)` beside `tps`, `mjs`, `curv`,
+// `matern` and `duchon`, so the two tests here that read `type` were asserting
+// against the parser's stated convention and could not pass. `cyclic()` parses
+// correctly and always did; only the key being read was wrong (gam#4103 suite
+// triage). `difference_smooth_options_parse_by_and_sz` below already reads
+// `bs`, which is the convention the whole file now uses.
+
 fn smooth_options(
     parsed: &gam::inference::formula_dsl::ParsedFormula,
 ) -> &std::collections::BTreeMap<String, String> {
@@ -19,8 +30,8 @@ fn sphere_alias_names_all_parse_to_sphere_type() {
         let f = format!("y ~ {name}(lat, lon, k=10)");
         let parsed = parse_formula(&f).unwrap_or_else(|e| panic!("`{f}` parse failed: {e}"));
         let opts = smooth_options(&parsed);
-        let ty = opts.get("type").map(String::as_str).unwrap_or("");
-        assert_eq!(ty, "sphere", "alias `{name}` parsed to type=`{ty}`");
+        let bs = opts.get("bs").map(String::as_str).unwrap_or("");
+        assert_eq!(bs, "sphere", "alias `{name}` parsed to bs=`{bs}`");
     }
 }
 
@@ -29,8 +40,8 @@ fn cyclic_is_the_only_periodic_smooth_function_name() {
     let f = "y ~ cyclic(t, k=10, period_start=0, period_end=6.283185307179586)";
     let parsed = parse_formula(f).unwrap_or_else(|e| panic!("`{f}` parse failed: {e}"));
     let opts = smooth_options(&parsed);
-    let ty = opts.get("type").map(String::as_str).unwrap_or("");
-    assert_eq!(ty, "cyclic", "`cyclic()` parsed to type=`{ty}`");
+    let bs = opts.get("bs").map(String::as_str).unwrap_or("");
+    assert_eq!(bs, "cyclic", "`cyclic()` parsed to bs=`{bs}`");
     for removed in ["periodic", "cc", "cp"] {
         let f = format!("y ~ {removed}(t, k=10, period_start=0, period_end=6.283185307179586)");
         let err = match parse_formula(&f) {
