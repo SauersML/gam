@@ -6425,15 +6425,17 @@ mod log_survival_panel_2714_tests {
 /// Points on the resolved axis of [`central_response_interval`], over
 /// `±`[`RESOLVED_AXIS_HALFWIDTH`] standard deviations.
 ///
-/// The crossing `t*` with `h(t*) = s` is located by inverse-quadratic
-/// interpolation of the tabulated `h`, whose error is `Δt³·|t‴|/6` in the
-/// inverse's own third derivative. With the half-width below, `Δt = 16/128 =
-/// 0.125` and that error is `3.3e-4` times the inverse's curvature scale, which
-/// enters the reported level through `φ(t) ≤ 0.399` as at most `1.3e-4` of
-/// probability: two orders below the `0.01`-scale coverage differences this
-/// band exists to remove (gam#3560's own table reports 0.939 and 0.973 against
-/// a nominal 0.950). The outer Gauss–Hermite rule below, which is the rule the
-/// caller's own posterior mean already runs, is the larger error of the two.
+/// The grid BRACKETS the crossing `h(t) = s`; it does not locate it. Locating it
+/// by interpolating the grid leaves the reported level the cell's own curvature
+/// error, `(Δt³/6)·|h‴/h′|` carried through `φ(t)`, and that is not small: on the
+/// exactly-uniform two-coordinate law of
+/// `two_coordinates_with_a_uniform_response_return_its_exact_quantiles_3560` it
+/// misses the 2.5% level by `1.4e-5` and the 97.5% level by `1.8e-5`. The
+/// crossing is therefore SOLVED on the response itself
+/// ([`solve_resolved_axis_crossing`]), so this count sets only how sharp the
+/// bracket and the first estimate are, and the reported level carries the outer
+/// Gauss–Hermite rule's error alone. On that same law, with the crossing solved,
+/// the level is exact to `5e-17`.
 const RESOLVED_AXIS_POINTS: usize = 129;
 
 /// Half-width of [`central_response_interval`]'s resolved axis, in standard
@@ -6450,7 +6452,7 @@ const RESOLVED_AXIS_HALFWIDTH: f64 = 8.0;
 /// exactly, and it cannot bias that interval: the factorization
 /// `F(s) = E_V[P(h_V(T) ≤ s)]` is an identity for every ordering of the
 /// coordinates, so the pick moves only which of the two error terms dominates —
-/// the outer Gauss–Hermite rule's, or the resolved axis's grid. Picking the
+/// the outer Gauss–Hermite rule's, or the resolved axis's. Picking the
 /// coordinate the response actually moves along puts the exact treatment where
 /// the law's spread reaches the response, and leaves the quadrature the
 /// directions it integrates well.
@@ -6499,9 +6501,14 @@ where
 }
 
 /// One outer node's tabulation of the response along the resolved axis.
-struct ResolvedAxisTable {
+struct ResolvedAxisTable<const D: usize> {
     /// The node's Gauss–Hermite weight, already normalized.
     weight: f64,
+    /// The coordinates the outer rule fixed at this node; the resolved one is
+    /// overwritten before each evaluation.
+    base: [f64; D],
+    /// The conditional mean of the resolved coordinate at this node.
+    axis_mean: f64,
     /// The response at [`RESOLVED_AXIS_POINTS`] standardized offsets.
     values: Vec<f64>,
     /// Whether the tabulation rises with the axis. A tabulation that neither
@@ -6553,18 +6560,27 @@ fn resolved_axis_step_is_resolved(before: f64, after: f64) -> bool {
 /// the outer expectation runs on the same Gauss–Hermite rule the caller's mean
 /// uses, one dimension lower, and the inner probability is EXACT in `T`: for a
 /// monotone `h_V` the sub-level set is a half line and its mass is one `Phi`.
-/// The only approximations are that outer rule — already the error the
-/// published mean carries — and the resolved axis's grid
-/// ([`RESOLVED_AXIS_POINTS`]). `F` is therefore smooth and non-decreasing in
-/// `s`, and inverting it is a bisection. At `D = 1` there is no outer rule and
-/// the interval is exact: it is the image of the credible interval of the one
-/// Gaussian coordinate, which is what a monotone link publishes directly.
+/// At `D = 1` there is no outer rule at all and the interval is exact — it is
+/// the image `g(mu + sd·Φ⁻¹(p))` of the one coordinate's credible interval,
+/// which is what a monotone link publishes directly.
 ///
 /// Reading a quantile off the raw `D`-dimensional node measure instead would
 /// not do: a 15-point Gauss–Hermite rule puts `5.6e-3` of its mass at or below
 /// its fourth node and `6.1e-2` at or below its fifth, so the `2.5%` level
 /// falls between two atoms `0.9` standard deviations apart and any interval
 /// read from them is far too wide.
+///
+/// # How it is inverted
+///
+/// Each node's response is tabulated once on the resolved axis. That grid is a
+/// BRACKET, not an answer: an estimate read off it by interpolation carries the
+/// cell's curvature into the reported level (`1.4e-5` and `1.8e-5` on the
+/// uniform two-coordinate law of the tests). So the grid supplies a first
+/// estimate through [`inverse_interpolated_crossing`], and the level is then
+/// driven onto `F` itself by the secant method, with every node's crossing
+/// SOLVED on the response ([`solve_resolved_axis_crossing`]). What is left is
+/// the outer rule's own truncation: on that same law the levels come back exact
+/// to `5e-17`.
 ///
 /// # What it refuses
 ///
@@ -6638,10 +6654,15 @@ where
     let axis_t: Vec<f64> = (0..RESOLVED_AXIS_POINTS)
         .map(|j| -RESOLVED_AXIS_HALFWIDTH + axis_step * (j as f64))
         .collect();
+    let at_offset = |table: &ResolvedAxisTable<D>, t: f64| -> [f64; D] {
+        let mut x = table.base;
+        x[resolved_axis] = table.axis_mean + axis_sd * t;
+        x
+    };
 
     let norm = 1.0 / std::f64::consts::PI.powf(0.5 * outer as f64);
-    let build = |nodes: &[f64], weights: &[f64]| -> Result<Vec<ResolvedAxisTable>, E> {
-        let mut built: Vec<ResolvedAxisTable> = Vec::new();
+    let build = |nodes: &[f64], weights: &[f64]| -> Result<Vec<ResolvedAxisTable<D>>, E> {
+        let mut built: Vec<ResolvedAxisTable<D>> = Vec::new();
         let mut idx = vec![0usize; outer];
         loop {
             let mut z = vec![0.0_f64; outer];
@@ -6669,22 +6690,26 @@ where
             for (i, &axis) in order.iter().enumerate().take(outer) {
                 base[axis] = x_p[i];
             }
-            let mut values = Vec::with_capacity(RESOLVED_AXIS_POINTS);
+            let mut table = ResolvedAxisTable {
+                weight,
+                base,
+                axis_mean,
+                values: Vec::with_capacity(RESOLVED_AXIS_POINTS),
+                increasing: true,
+            };
             for &t in &axis_t {
-                let mut x = base;
-                x[resolved_axis] = axis_mean + axis_sd * t;
-                let value = g(x)?;
+                let value = g(at_offset(&table, t))?;
                 if !value.is_finite() {
                     return Err(E::from(format!(
                         "central response interval: the response is {value} at a node of its own \
                          posterior law, {t} standard deviations along the resolved axis"
                     )));
                 }
-                values.push(value);
+                table.values.push(value);
             }
             let mut rises = false;
             let mut falls = false;
-            for pair in values.windows(2) {
+            for pair in table.values.windows(2) {
                 if !resolved_axis_step_is_resolved(pair[0], pair[1]) {
                     continue;
                 }
@@ -6702,11 +6727,8 @@ where
                         .to_string(),
                 ));
             }
-            built.push(ResolvedAxisTable {
-                weight,
-                values,
-                increasing: !falls,
-            });
+            table.increasing = !falls;
+            built.push(table);
             if outer == 0 {
                 break;
             }
@@ -6731,19 +6753,15 @@ where
         with_gh_nodesweights(ctx, n, |nodes, weights| build(nodes, weights))?
     };
 
-    // `P(h_V(T) <= s)` for one table, exact in `T` up to where the crossing is
-    // located. Outside the tabulated span `h_V` is taken at its end value,
-    // which is the sub-level verdict the grid's own tail carries.
-    let table_mass = |table: &ResolvedAxisTable, s: f64| -> f64 {
+    // The cell of one table that the level crosses, on a table monotone by
+    // construction. `None` when every offset is on one side of the level, which
+    // is the whole verdict: the mass is 0 or 1 and nothing has to be solved.
+    let crossing_cell = |table: &ResolvedAxisTable<D>, s: f64| -> Option<(usize, usize)> {
         let last = RESOLVED_AXIS_POINTS - 1;
-        let first_below = table.values[0] <= s;
-        let last_below = table.values[last] <= s;
-        if first_below == last_below {
-            return if first_below { 1.0 } else { 0.0 };
+        if (table.values[0] <= s) == (table.values[last] <= s) {
+            return None;
         }
-        // The one cell the level crosses, on a table monotone by construction.
-        let mut lo = 0usize;
-        let mut hi = last;
+        let (mut lo, mut hi) = (0usize, last);
         while hi - lo > 1 {
             let mid = lo + (hi - lo) / 2;
             if (table.values[mid] <= s) == table.increasing {
@@ -6752,19 +6770,37 @@ where
                 hi = mid;
             }
         }
-        let crossing = inverse_interpolated_crossing(&axis_t, &table.values, lo, hi, s);
+        Some((lo, hi))
+    };
+    let mass_from_crossing = |table: &ResolvedAxisTable<D>, crossing: f64| -> f64 {
         let mass = gam_math::probability::normal_cdf(crossing);
         if table.increasing { mass } else { 1.0 - mass }
     };
-    let cdf = |s: f64| -> f64 {
+    let saturated_mass = |table: &ResolvedAxisTable<D>, s: f64| -> f64 {
+        if table.values[0] <= s { 1.0 } else { 0.0 }
+    };
+
+    // The first estimate, read off the grid. No evaluation of the response
+    // happens here, so the bisection below is free; what it produces is only a
+    // starting point for the secant on the exact `F`.
+    let estimated_cdf = |s: f64| -> f64 {
         tables
             .iter()
-            .map(|table| table.weight * table_mass(table, s))
+            .map(|table| {
+                table.weight
+                    * match crossing_cell(table, s) {
+                        None => saturated_mass(table, s),
+                        Some((lo, hi)) => mass_from_crossing(
+                            table,
+                            inverse_interpolated_crossing(&axis_t, &table.values, lo, hi, s),
+                        ),
+                    }
+            })
             .sum()
     };
     // `F` is non-decreasing, `F(min) = 0` and `F(max) = 1` over the tabulated
-    // span, so each level is bracketed by construction and bisection cannot
-    // leave the span.
+    // span, so each level is bracketed by construction and no search can leave
+    // the span.
     let mut span_low = f64::INFINITY;
     let mut span_high = f64::NEG_INFINITY;
     for table in &tables {
@@ -6783,7 +6819,7 @@ where
     if span_low == span_high {
         return Ok(Some((span_low, span_high)));
     }
-    let invert = |target: f64| -> f64 {
+    let estimate = |target: f64| -> f64 {
         let (mut lo, mut hi) = (span_low, span_high);
         // The loop stops when the bracket reaches the `f64` spacing of its own
         // ends, not at a count; the bound is what a bisection of a finite
@@ -6793,7 +6829,7 @@ where
             if !(mid > lo && mid < hi) {
                 break;
             }
-            if cdf(mid) < target {
+            if estimated_cdf(mid) < target {
                 lo = mid;
             } else {
                 hi = mid;
@@ -6801,16 +6837,153 @@ where
         }
         0.5 * (lo + hi)
     };
+    // `F` itself, with every crossing solved on the response, and the slope the
+    // grid's own cells report at those crossings. The slope seeds the secant
+    // below; it never enters the answer, so the cell's secant is enough for it.
+    let exact_cdf_and_slope = |s: f64| -> Result<(f64, f64), E> {
+        let mut value = 0.0_f64;
+        let mut slope = 0.0_f64;
+        for table in &tables {
+            let Some((lo, hi)) = crossing_cell(table, s) else {
+                value += table.weight * saturated_mass(table, s);
+                continue;
+            };
+            let crossing = solve_resolved_axis_crossing(&axis_t, table, lo, hi, s, |t| {
+                g(at_offset(table, t))
+            })?;
+            value += table.weight * mass_from_crossing(table, crossing);
+            let cell = (table.values[hi] - table.values[lo]) / (axis_t[hi] - axis_t[lo]);
+            if cell != 0.0 {
+                slope += table.weight * gam_math::probability::normal_pdf(crossing) / cell.abs();
+            }
+        }
+        Ok((value, slope))
+    };
+    let solve = |target: f64| -> Result<f64, E> {
+        let mut previous = estimate(target);
+        let (value, slope) = exact_cdf_and_slope(previous)?;
+        let mut previous_residual = value - target;
+        if previous_residual == 0.0 || !(slope.is_finite() && slope > 0.0) {
+            return Ok(previous);
+        }
+        let mut current = (previous - previous_residual / slope).clamp(span_low, span_high);
+        // Secant on the exact `F`. Its order is 1.618 on a simple root, so from
+        // the grid's own estimate the residual is below the `f64` resolution of
+        // the level within a few steps; the loop exits when the iterate stops
+        // moving, and the count is a bound rather than a tuning.
+        for _ in 0..8 {
+            if current == previous {
+                break;
+            }
+            let (value, _) = exact_cdf_and_slope(current)?;
+            let residual = value - target;
+            if residual == 0.0 {
+                break;
+            }
+            let denominator = residual - previous_residual;
+            if denominator == 0.0 {
+                break;
+            }
+            let next = current - residual * (current - previous) / denominator;
+            previous = current;
+            previous_residual = residual;
+            if !next.is_finite() {
+                break;
+            }
+            let next = next.clamp(span_low, span_high);
+            if next == current {
+                break;
+            }
+            current = next;
+        }
+        Ok(current)
+    };
     let tail = 0.5 * (1.0 - level);
-    Ok(Some((invert(tail), invert(1.0 - tail))))
+    Ok(Some((solve(tail)?, solve(1.0 - tail)?)))
 }
 
-/// The `t` where a monotone table crosses `s`, between neighbours `lo` and `hi`.
+/// The `t` in the bracketing cell `[lo, hi]` where a monotone response crosses
+/// `s`, solved on the response itself rather than read off the grid (gam#3560).
+///
+/// False position, with Illinois' halving of a retained end's value so both ends
+/// keep moving: on the smooth monotone response of one cell it reaches the `f64`
+/// resolution of the bracket in a handful of evaluations, and the halving is
+/// what bounds the bracket for one that is not. The loop exits when the next
+/// point is no longer strictly inside the bracket, which is the bracket reaching
+/// adjacent floats; the count is a bound (64 halvings take any `f64` bracket
+/// there) and never the binding constraint.
+///
+/// A cell whose ends carry the same value has no crossing to solve and reports
+/// its left end.
+fn solve_resolved_axis_crossing<const D: usize, G, E>(
+    axis_t: &[f64],
+    table: &ResolvedAxisTable<D>,
+    lo: usize,
+    hi: usize,
+    s: f64,
+    response: G,
+) -> Result<f64, E>
+where
+    G: Fn(f64) -> Result<f64, E>,
+    E: From<String>,
+{
+    let (mut t_low, mut t_high) = (axis_t[lo], axis_t[hi]);
+    let (mut y_low, mut y_high) = (table.values[lo], table.values[hi]);
+    if y_low == y_high {
+        return Ok(t_low);
+    }
+    let (mut retained_low, mut retained_high) = (0u32, 0u32);
+    let mut crossing = t_low + (t_high - t_low) * (s - y_low) / (y_high - y_low);
+    for _ in 0..64 {
+        let scaled_low = (y_low - s) * if retained_low >= 2 { 0.5 } else { 1.0 };
+        let scaled_high = (y_high - s) * if retained_high >= 2 { 0.5 } else { 1.0 };
+        if scaled_low == scaled_high {
+            break;
+        }
+        let mut next = (t_low * scaled_high - t_high * scaled_low) / (scaled_high - scaled_low);
+        if !(next > t_low && next < t_high) {
+            next = 0.5 * (t_low + t_high);
+        }
+        if !(next > t_low && next < t_high) {
+            break;
+        }
+        let value = response(next)?;
+        if !value.is_finite() {
+            return Err(E::from(format!(
+                "central response interval: the response is {value} at {next} standard deviations \
+                 along the resolved axis, inside a cell its own tabulation bracketed"
+            )));
+        }
+        crossing = next;
+        if (value <= s) == table.increasing {
+            t_low = next;
+            y_low = value;
+            retained_low = 0;
+            retained_high += 1;
+        } else {
+            t_high = next;
+            y_high = value;
+            retained_high = 0;
+            retained_low += 1;
+        }
+        if value == s {
+            break;
+        }
+    }
+    Ok(crossing)
+}
+
+/// The `t` where a monotone table crosses `s`, between neighbours `lo` and `hi`,
+/// read off the table alone.
 ///
 /// Quadratic through the crossing cell and the neighbour on the side that has
 /// one, solved for `t(s)` rather than `s(t)` so the answer needs no root of its
 /// own: interpolating the INVERSE is exact when the inverse is quadratic, and
 /// its error is `Δt³·|t‴|/6` where a linear crossing would carry `Δt²·|t″|/2`.
+/// That error is what keeps this out of the reported level — it supplies the
+/// first estimate that [`solve_resolved_axis_crossing`] then drives onto the
+/// response.
+///
 /// A cell whose ends share a value cannot be interpolated and takes its left
 /// end; a quadratic that leaves the cell is reporting its own extrapolation,
 /// which a monotone inverse cannot do, and the linear crossing is taken there.
@@ -6859,12 +7032,30 @@ mod response_interval_tests {
 
     const LEVEL: f64 = 0.95;
 
+    /// The bar where the crossing is the only thing that could be wrong: one
+    /// coordinate (no outer rule at all), or two independent ones whose outer
+    /// rule is exact for this integrand. With the crossing read off the resolved
+    /// axis by interpolation, the uniform two-coordinate law below misses its
+    /// levels by `1.4e-5` and `1.8e-5`; with it SOLVED on the response, the same
+    /// levels come back to `2e-17` and `1e-16`. `1e-10` is that with six orders
+    /// of margin for a node set formed differently, and five orders tighter than
+    /// the interpolated crossing could ever reach.
+    const EXACT_LEVEL_TOLERANCE: f64 = 1e-10;
+
+    /// The bar for a CORRELATED pair, where the outer rule and not the crossing
+    /// is the limit. The resolved axis keeps `1 − r²` of its coordinate's
+    /// variance while the drive keeps `1 + r`, so the outer rule has to resolve a
+    /// sigmoid `sqrt((1 + r)/(1 − r))` times steeper than its own spread. At
+    /// 31 points the residual is `5.4e-11` at `r = −0.6` and `2.2e-11` at
+    /// `r = 0.4`; `1e-9` is those with twenty times margin. At `r = 0.8` the same
+    /// rule leaves `6.6e-6`, which is the outer rule's own and is pinned as such
+    /// by [`the_level_error_left_is_the_outer_rules_and_falls_with_it_3560`].
+    const CORRELATED_LEVEL_TOLERANCE: f64 = 1e-9;
+
     /// One Gaussian coordinate and a monotone response: the interval is the
-    /// image of the coordinate's own credible interval, in closed form, and the
-    /// rule runs no outer quadrature at all — so the only error left is the
-    /// crossing's, which the axis grid bounds at `1.3e-4` of probability. The
-    /// bar here is on the VALUE, and `Phi` is 1-Lipschitz, so `2e-4` is that
-    /// bound carried through the link.
+    /// image of the coordinate's own credible interval, in closed form. There is
+    /// no outer rule at `D = 1`, so this is exact — `F(s) = Phi(h^-1(s))`, and
+    /// `F(s) = p` is `s = g(mu + sd*Phi^-1(p))`.
     #[test]
     fn one_coordinate_monotone_response_is_the_image_of_its_own_interval_3560() {
         let ctx = QuadratureContext::new();
@@ -6883,7 +7074,8 @@ mod response_interval_tests {
             .expect("a positive variance resolves its axis");
             let (want_lo, want_hi) = (normal_cdf(mu - z * sd), normal_cdf(mu + z * sd));
             assert!(
-                (lo - want_lo).abs() <= 2e-4 && (hi - want_hi).abs() <= 2e-4,
+                (lo - want_lo).abs() <= EXACT_LEVEL_TOLERANCE
+                    && (hi - want_hi).abs() <= EXACT_LEVEL_TOLERANCE,
                 "mu={mu} sd={sd}: got ({lo}, {hi}), the image of the coordinate's interval is \
                  ({want_lo}, {want_hi})"
             );
@@ -6908,7 +7100,8 @@ mod response_interval_tests {
         let want_hi = (-(mu - z * sd).exp()).exp();
         assert!(lo < hi, "an interval runs low to high, got ({lo}, {hi})");
         assert!(
-            (lo - want_lo).abs() <= 2e-4 && (hi - want_hi).abs() <= 2e-4,
+            (lo - want_lo).abs() <= EXACT_LEVEL_TOLERANCE
+                && (hi - want_hi).abs() <= EXACT_LEVEL_TOLERANCE,
             "got ({lo}, {hi}), the reversed image is ({want_lo}, {want_hi})"
         );
     }
@@ -6917,8 +7110,10 @@ mod response_interval_tests {
     /// with `X ~ N(0, I)` and `g(x) = Phi((x_0 + x_1)/sqrt(2))`, the drive is
     /// standard normal and `g(X)` is exactly `Uniform(0, 1)`, whose central
     /// 95% interval is `(0.025, 0.975)`. This is the multi-coordinate case the
-    /// issue's three open branches are, and it exercises the outer rule: the
-    /// answer is NOT read off the resolved axis alone.
+    /// issue's three open branches are, it exercises the outer rule (the answer
+    /// is NOT read off the resolved axis alone), and it is the regression pin on
+    /// the solved crossing: reading that crossing off the grid instead misses
+    /// these levels by `1.4e-5` and `1.8e-5`.
     #[test]
     fn two_coordinates_with_a_uniform_response_return_its_exact_quantiles_3560() {
         let ctx = QuadratureContext::new();
@@ -6935,11 +7130,83 @@ mod response_interval_tests {
             .expect("a full-rank law has an interval")
             .expect("a positive variance resolves its axis");
             assert!(
-                (lo - 0.025).abs() <= 1e-5 && (hi - 0.975).abs() <= 1e-5,
+                (lo - 0.025).abs() <= EXACT_LEVEL_TOLERANCE
+                    && (hi - 0.975).abs() <= EXACT_LEVEL_TOLERANCE,
                 "resolved axis {resolved}: got ({lo}, {hi}), the exact uniform quantiles are \
                  (0.025, 0.975)"
             );
         }
+    }
+
+    /// The same uniform law with its coordinates CORRELATED, so the resolved
+    /// axis's conditional mean moves with the outer node and the triangular
+    /// factor's off-diagonal is load-bearing. With `Cov = [[1, r], [r, 1]]` the
+    /// drive `(x_0 + x_1)/sqrt(2)` has variance `1 + r`, so `g(X) = Phi(drive)`
+    /// has the law of `Phi(sqrt(1 + r) Z)` and its central level `p` is
+    /// `Phi(sqrt(1 + r) Phi^-1(p))`.
+    #[test]
+    fn correlated_coordinates_carry_the_resolved_axis_conditional_mean_3560() {
+        let ctx = QuadratureContext::new();
+        let z = standard_normal_quantile(0.5 + 0.5 * LEVEL).expect("normal quantile");
+        for correlation in [-0.6_f64, 0.4] {
+            let scale = (1.0 + correlation).sqrt();
+            let (lo, hi) = central_response_interval::<2, _, String>(
+                &ctx,
+                [0.0, 0.0],
+                [[1.0, correlation], [correlation, 1.0]],
+                1,
+                31,
+                LEVEL,
+                |x| Ok(normal_cdf((x[0] + x[1]) / std::f64::consts::SQRT_2)),
+            )
+            .expect("a full-rank law has an interval")
+            .expect("a positive variance resolves its axis");
+            let (want_lo, want_hi) = (normal_cdf(-z * scale), normal_cdf(z * scale));
+            assert!(
+                (lo - want_lo).abs() <= CORRELATED_LEVEL_TOLERANCE
+                    && (hi - want_hi).abs() <= CORRELATED_LEVEL_TOLERANCE,
+                "correlation {correlation}: got ({lo}, {hi}), the exact levels are \
+                 ({want_lo}, {want_hi})"
+            );
+        }
+    }
+
+    /// What is left once the crossing is solved is the OUTER rule's truncation,
+    /// and this pins that it is that and not a floor of the construction's own.
+    /// At `r = 0.8` the resolved axis keeps `0.36` of its coordinate's variance
+    /// while the drive keeps `1.8`, so the outer rule must resolve a sigmoid
+    /// three times steeper than its own spread. Refining that rule from 15 points
+    /// to 31 must then move the level toward the closed form, and move it by more
+    /// than an order; a crossing read off the fixed resolved-axis grid would
+    /// leave an error the outer rule cannot reach, whatever its count.
+    #[test]
+    fn the_level_error_left_is_the_outer_rules_and_falls_with_it_3560() {
+        let ctx = QuadratureContext::new();
+        let z = standard_normal_quantile(0.5 + 0.5 * LEVEL).expect("normal quantile");
+        let correlation = 0.8_f64;
+        let want = normal_cdf(-z * (1.0 + correlation).sqrt());
+        let mut errors = Vec::new();
+        for points in [15usize, 31] {
+            let (lo, _) = central_response_interval::<2, _, String>(
+                &ctx,
+                [0.0, 0.0],
+                [[1.0, correlation], [correlation, 1.0]],
+                1,
+                points,
+                LEVEL,
+                |x| Ok(normal_cdf((x[0] + x[1]) / std::f64::consts::SQRT_2)),
+            )
+            .expect("a full-rank law has an interval")
+            .expect("a positive variance resolves its axis");
+            errors.push((lo - want).abs());
+        }
+        assert!(
+            errors[1] * 10.0 < errors[0],
+            "refining the outer rule from 15 points to 31 must reduce the level's error by more \
+             than an order: got {:.3e} then {:.3e}",
+            errors[0],
+            errors[1]
+        );
     }
 
     /// The band is a central interval of the law, not the symmetric band: on a
