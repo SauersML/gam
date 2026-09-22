@@ -94,6 +94,47 @@ fn absolute_newton_direction_refuses_gradient_along_flat_curvature_3090() {
     );
 }
 
+/// The gate this file's fixtures stand in front of, asserted from BOTH sides.
+///
+/// `symmetric_spectral` above keeps the fixtures inside the contract
+/// `aft_absolute_newton_direction` declares; production matrices reach it from
+/// the row-kernel pullback, whose `(a, b)` channel loop accumulates entry
+/// `(i, j)` and entry `(j, i)` separately and so leaves them free to differ in
+/// the last bit. `mirror_pullback_in_place` is what that route now applies. This
+/// shows the refusal is real on the asymmetric matrix and gone on the mirrored
+/// one, so the mirror is what the gate ACCEPTS rather than something it
+/// tolerates, and neither half of that claim rests on the other.
+#[test]
+fn a_pullback_mirrored_in_place_is_what_the_strict_symmetry_gate_accepts_1561() {
+    use crate::survival::location_scale::row_kernel::mirror_pullback_in_place;
+    // The two values the survival census recorded on the production refusal:
+    // one ulp apart, which is what two independent accumulations of one real
+    // number differ by.
+    let mut h = array![[1.0, -0.024554355106785223], [-0.024554355106785226, 2.0]];
+    assert_ne!(
+        h[[0, 1]].to_bits(),
+        h[[1, 0]].to_bits(),
+        "precondition: the fixture must carry the asymmetry the route produced, \
+         or the refusal below proves nothing"
+    );
+    let g = array![0.3, -0.4];
+    let refusal = aft_absolute_newton_direction(&h, &g, 0)
+        .err()
+        .expect("a one-ulp asymmetry must be refused under a band of exactly zero");
+    assert!(
+        refusal.to_string().contains("not symmetric"),
+        "the refusal must name the mechanism, got {refusal}"
+    );
+    mirror_pullback_in_place(&mut h);
+    assert_eq!(
+        h[[0, 1]].to_bits(),
+        h[[1, 0]].to_bits(),
+        "a mirrored pullback writes ONE computed value into both triangles"
+    );
+    aft_absolute_newton_direction(&h, &g, 0)
+        .expect("the mirrored pullback satisfies the band its consumer declares");
+}
+
 /// End to end: start the location intercept three standard deviations off the
 /// mean. For the lognormal AFT in `(μ, log σ)` the NLL Hessian has determinant
 /// `∝ S/n − (ȳ − μ)²`, so this start has an indefinite `H`; the fit must still

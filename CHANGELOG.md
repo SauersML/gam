@@ -36,6 +36,20 @@
   reason recorded: at its shape the Gram's rounding band is smaller than its own
   accumulation noise, so no mode can be placed where the bridge reliably truncates it. It
   needs its sibling's shape, and the two should be merged.
+- **A survival location-scale fit with a link wiggle refused its own Hessian** (gam#1561,
+  gam#3090). `aft_absolute_newton_direction` declares `SymmetricAssembly::Mirrored`, whose band is
+  exactly zero because a mirrored assembly writes one rounded value into both triangles, so any
+  disagreement is a construction defect rather than rounding. That declaration was true of only one
+  of the two matrices reaching it. `exact_newton_joint_hessian` routes a fit WITH a link wiggle to
+  `survival_ls_wiggle_joint_hessian_dense`, which never enters the packed assembly gam#1561
+  repaired: it folds `add_pullback_hessian`, whose `(a, b)` channel loop accumulates entry `(i, j)`
+  and entry `(j, i)` in separate passes. The same multiset of products in a different order and a
+  different association is not the same `f64`, and the lowering puts three channels on every
+  coefficient block, so the two triangles differed by one ulp and the eigendecomposition refused the
+  fit. The route now mirrors its pullback, `(M + Mᵀ)/2` written as one computed value into both
+  entries, which is one of the constructions `Mirrored` names and is no less accurate than either
+  triangle alone. The band is unchanged: widening it would have turned a construction defect into a
+  tolerance.
 
 - **A damped representer column gets the anchor's scale motion instead of a refusal** (#2902
   row 5). The column-scale term landed in `7adbe5963a` refused whenever a kept chart column was
