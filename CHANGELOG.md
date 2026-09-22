@@ -82,6 +82,24 @@
   and its second derivative is a cumulant object, and a design (ψ) axis, whose `M̈` is the
   family's own second design derivative and is published by no family.
 
+- **A survival location-scale joint Hessian's two triangles accumulated the same summands in a
+  different order, so the eigendecomposition refused the matrix it was handed** (gam#1561,
+  gam#4350). The packed coefficient lowering added a within-block cross-channel group's `product`
+  and then its transpose into the SAME slice. With one such group per block that is symmetric,
+  because IEEE addition is commutative; with two it is not, because addition is not ASSOCIATIVE:
+  entry `(i, j)` accumulated `P1ᵢⱼ, P1ⱼᵢ, P2ᵢⱼ, P2ⱼᵢ` while entry `(j, i)` accumulated
+  `P1ⱼᵢ, P1ᵢⱼ, P2ⱼᵢ, P2ᵢⱼ`, and `(s + a) + b ≠ (s + b) + a`. `aft_absolute_newton_direction`
+  enters `strict_symmetric_eigh` with `SymmetricAssembly::Mirrored` declared, whose band is
+  exactly zero because a mirrored matrix holds ONE rounded value per pair, so a one-ulp
+  disagreement is a refusal rather than a tolerance question. On the lognormal-AFT interaction fit
+  it refused at `H[2,1] = 5.272420286106774` against `H[1,2] = 5.272420286106773`, a defect of
+  8.882e-16. The band is not widened and the declaration is not changed: the assembly is made to
+  be what it declares. A cross-channel group now contributes `product + product.t()` as ONE
+  quantity, so `Mᵢⱼ` and `Mⱼᵢ` are the same rounded sum by commutativity and the two triangles
+  accumulate one identical sequence whatever the group order. A cross-BLOCK group already wrote
+  one value per pair and is untouched; the `BlockDiagonal` target carried the same defect and
+  takes the same rule. Every total is unchanged, so no fitted value moves except where the matrix
+  previously could not be decomposed at all.
 - **The fold record named the mode's softest direction but never carried it, so a mode one solve
   away from a lower basin had nowhere to go** (gam#3173, gam#2765). The Laplace normalizer is the
   Gaussian integral of the quadratic model about the inner mode, and along the softest eigenpair

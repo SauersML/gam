@@ -4078,17 +4078,48 @@ impl SurvivalLocationScaleFamily {
                     let right_block = group.right_channel / 3;
                     let (left_start, left_end) = (offsets[left_block], offsets[left_block + 1]);
                     let (right_start, right_end) = (offsets[right_block], offsets[right_block + 1]);
-                    dense
-                        .slice_mut(s![left_start..left_end, right_start..right_end])
-                        .scaled_add(1.0, &product);
+                    // ONE rounded value per off-diagonal pair, so each block is
+                    // bitwise symmetric and `SymmetricAssembly::Mirrored` — the
+                    // declaration `aft_absolute_newton_direction` enters
+                    // `strict_symmetric_eigh` with — is true of the result.
+                    //
+                    // Adding `product` and then `product.t()` into the SAME slice
+                    // did not do that once two cross-channel groups shared a
+                    // block. Entry `(i, j)` accumulated `P1ᵢⱼ, P1ⱼᵢ, P2ᵢⱼ, P2ⱼᵢ`
+                    // and entry `(j, i)` accumulated `P1ⱼᵢ, P1ᵢⱼ, P2ⱼᵢ, P2ᵢⱼ`:
+                    // the same multiset in a different ORDER. IEEE addition is
+                    // commutative, so the first pair still agreed bitwise, but it
+                    // is not associative, so `(s + a) + b ≠ (s + b) + a` from the
+                    // second group on. On the lognormal-AFT interaction fit that
+                    // left `H[2,1] = 5.272420286106774` against
+                    // `H[1,2] = 5.272420286106773`, a defect of 8.882e-16 against
+                    // a Mirrored band of exactly zero, and the eigendecomposition
+                    // refused the matrix (gam#1561).
+                    //
+                    // A cross-BLOCK group already wrote one value per pair: it
+                    // adds `product` to `(L, R)` and `product.t()` to `(R, L)`, so
+                    // both triangles take the same summands in the same order.
+                    // Only the within-block cross-channel group interleaved two
+                    // orders into one slice, and it now adds `product +
+                    // product.t()` as ONE quantity: `Mᵢⱼ` and `Mⱼᵢ` are the same
+                    // rounded sum by commutativity, and the two triangles then
+                    // accumulate one identical sequence. The total is unchanged.
                     if left_block != right_block {
+                        dense
+                            .slice_mut(s![left_start..left_end, right_start..right_end])
+                            .scaled_add(1.0, &product);
                         dense
                             .slice_mut(s![right_start..right_end, left_start..left_end])
                             .scaled_add(1.0, &product.t());
                     } else if group.left_channel != group.right_channel {
+                        let mirrored = &product + &product.t();
                         dense
                             .slice_mut(s![left_start..left_end, right_start..right_end])
-                            .scaled_add(1.0, &product.t());
+                            .scaled_add(1.0, &mirrored);
+                    } else {
+                        dense
+                            .slice_mut(s![left_start..left_end, right_start..right_end])
+                            .scaled_add(1.0, &product);
                     }
                 }
                 Ok(SlsCoefficientHessian::DenseFull(dense))
@@ -4104,9 +4135,16 @@ impl SurvivalLocationScaleFamily {
                     .collect::<Vec<_>>();
                 for (group, product) in products {
                     let block = group.left_channel / 3;
-                    blocks[block].scaled_add(1.0, &product);
+                    // Same rule as the `DenseFull` arm above: a cross-channel
+                    // group contributes `product + product.t()` as ONE quantity,
+                    // so the block's two triangles accumulate one identical
+                    // sequence and the block is bitwise symmetric whatever the
+                    // group order. The total is unchanged.
                     if group.left_channel != group.right_channel {
-                        blocks[block].scaled_add(1.0, &product.t());
+                        let mirrored = &product + &product.t();
+                        blocks[block].scaled_add(1.0, &mirrored);
+                    } else {
+                        blocks[block].scaled_add(1.0, &product);
                     }
                 }
                 Ok(SlsCoefficientHessian::BlockDiagonal(blocks))
