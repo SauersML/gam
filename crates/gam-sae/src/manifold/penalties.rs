@@ -3684,7 +3684,7 @@ impl SaeManifoldTerm {
         // strength an outer coordinate only where the penalty prices its own prior
         // mass, and this is the same reader-side repair `12a865c3d6` applied to the
         // softmax-entropy penalty's Hessian and majorizer.
-        let mu_raw = if corrected.learnable_weight {
+        let mu_raw = if corrected.learns_weight() {
             resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index])
                 .expect("analytic-penalty rho must be validated before SAE assembly")
         } else {
@@ -3961,7 +3961,7 @@ impl SaeManifoldTerm {
         // strength an outer coordinate only where the penalty prices its own prior
         // mass, and this is the same reader-side repair `12a865c3d6` applied to the
         // softmax-entropy penalty's Hessian and majorizer.
-        let mu_raw = if corrected.learnable_weight {
+        let mu_raw = if corrected.learns_weight() {
             resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index])
                 .expect("analytic-penalty rho must be validated before SAE assembly")
         } else {

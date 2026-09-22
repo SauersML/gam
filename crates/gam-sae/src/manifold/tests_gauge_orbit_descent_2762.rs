@@ -574,7 +574,17 @@ fn terminal_gauge_descent_keeps_the_live_excursion_2228() {
     // past its best-certificate state.
     term.restore_mutable_state(&planted_state)
         .expect("the planted excursion restores");
-    let mut best_seen = Some((0.0, slope, seed_state));
+    // The seed's certificate is a zero decrement, measured through the only
+    // constructor the best-seen tracker accepts (#3355).
+    let mut best_seen = Some((
+        SaeDecrementAgainstResolution::measure(
+            0.0,
+            seed_objective,
+            SaeManifoldTerm::inner_information_count(z.view()),
+        ),
+        slope,
+        seed_state,
+    ));
     let outcome = term
         .descend_gauge_orbit_consuming_best_seen(
             z.view(),

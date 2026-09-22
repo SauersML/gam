@@ -333,6 +333,13 @@ impl IsometryPenalty {
     /// metric space, not in the latent coordinates it is integrated over
     /// (#4291).
     #[must_use = "invalid learnable-weight requests must be handled"]
+    /// Whether the strength is an outer coordinate (`rho_count() == 1`) or the fixed
+    /// `scalar_weight`. A consumer that reads `rho[rho_index]` must ask this first: a
+    /// fixed-strength isometry is handed an empty rho block (#4531).
+    pub fn learns_weight(&self) -> bool {
+        self.learnable_weight
+    }
+
     pub fn with_learnable_weight(self) -> Result<Self, String> {
         Err(format!(
             "isometry cannot own a learnable strength: ∂P/∂ρ_iso = P ≥ 0 at every target,              and the prior mass that would make the optimum interior is an integral over              the pullback metric JᵀWJ rather than over the latent coordinates this value              is a function of. Selecting μ_iso against the unnormalized energy sends it to              the lower face, removing the gauge fix the penalty exists for while the fit              still certifies (p_out = {}, scalar_weight = {})",
