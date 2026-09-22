@@ -692,6 +692,27 @@ pub struct ExactFullConformalPenalty {
     /// the REML re-selecting map is computable ([`honest_full_conformal`]).
     #[serde(default)]
     penalty_count: Option<usize>,
+    /// The penalty's COMPONENTS in the fit's own basis, one `S_k` per selected
+    /// smoothing parameter, with [`Self::log_strengths`] their fitted `ln λ_k`
+    /// (v40, gam#4103).
+    ///
+    /// `s_lambda` above is `Σ_k λ_k S_k`, and a sum is not enough to re-select
+    /// against. The honest map's criterion carries `log|Σ_k e^{ρ_k}S_k|₊`, which
+    /// is a function of the components and their scales and not of their sum --
+    /// "an assembled sum has already lost it" (#2644). At ONE penalty the term
+    /// is `rank(S)·ρ` plus a constant that cancels in every comparison, which is
+    /// exactly why the single-penalty arm re-selects off `s_lambda` alone and
+    /// why nothing above one could.
+    ///
+    /// Empty for a v39 or older payload, which carries no components; those rows
+    /// keep the verdict they already had. Never partially filled: the
+    /// constructor below validates the set's structure (one strength per block,
+    /// every block `p × p` and finite) and says why it does not test the sum.
+    #[serde(default)]
+    components: Vec<Array2<f64>>,
+    /// The fitted `ln λ_k`, aligned 1:1 with [`Self::components`].
+    #[serde(default)]
+    log_strengths: Vec<f64>,
 }
 
 impl ExactFullConformalPenalty {
@@ -710,6 +731,8 @@ impl ExactFullConformalPenalty {
         Ok(Self {
             s_lambda: m - gram,
             penalty_count: Some(penalty_count),
+            components: Vec::new(),
+            log_strengths: Vec::new(),
         })
     }
 
@@ -723,6 +746,8 @@ impl ExactFullConformalPenalty {
         Ok(Self {
             s_lambda,
             penalty_count: Some(penalty_count),
+            components: Vec::new(),
+            log_strengths: Vec::new(),
         })
     }
 
@@ -740,6 +765,75 @@ impl ExactFullConformalPenalty {
     /// written before the count was persisted.
     pub fn penalty_count(&self) -> Option<usize> {
         self.penalty_count
+    }
+
+    /// Carry the penalty's components and their fitted `ln λ_k` (v40, #4103).
+    ///
+    /// Validated for STRUCTURE only: one strength per component, every block
+    /// square at this penalty's own `p`, and every entry finite. It deliberately
+    /// does not test that `Σ_k e^{ρ_k}S_k` reproduces `s_lambda`, and the reason
+    /// is that the two are not formed the same way and the consumer does not need
+    /// them to agree.
+    ///
+    /// `s_lambda` is recovered by CANCELLATION, `M₀ − XᵀX`, so its error is
+    /// denominated in `‖M₀‖` — a scale this constructor does not hold. A band
+    /// derived from the components' own accumulation would be far tighter than
+    /// that and would fire on correct sets; a band loose enough to cover the
+    /// cancellation would certify nothing. Neither is worth having, so neither
+    /// is written.
+    ///
+    /// Nothing is lost by declining the test. The honest map forms
+    /// `Σ_k e^{ρ_k}S_k` from these components at every trial strength and never
+    /// reads `s_lambda`, which stays what it always was: the FROZEN penalty the
+    /// frozen-map arm is defined against. The two quantities answer different
+    /// questions and are not required to be the same matrix to the last ulp.
+    pub fn with_components(
+        mut self,
+        components: Vec<Array2<f64>>,
+        log_strengths: Vec<f64>,
+    ) -> Result<Self, String> {
+        if components.len() != log_strengths.len() {
+            return Err(format!(
+                "exact full conformal penalty: {} penalty component(s) against {} log-strength(s)",
+                components.len(),
+                log_strengths.len()
+            ));
+        }
+        let p = self.p();
+        for (index, block) in components.iter().enumerate() {
+            if block.nrows() != p || block.ncols() != p {
+                return Err(format!(
+                    "exact full conformal penalty: component {index} is {}x{} on a {p}-column \
+                     penalty",
+                    block.nrows(),
+                    block.ncols()
+                ));
+            }
+            if block.iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "exact full conformal penalty: component {index} is not finite"
+                ));
+            }
+        }
+        if log_strengths.iter().any(|value| !value.is_finite()) {
+            return Err(
+                "exact full conformal penalty: a fitted log-strength is not finite".to_string(),
+            );
+        }
+        self.components = components;
+        self.log_strengths = log_strengths;
+        Ok(self)
+    }
+
+    /// The penalty's components in the fit's own basis, empty for a v39 or
+    /// older payload.
+    pub fn components(&self) -> &[Array2<f64>] {
+        &self.components
+    }
+
+    /// The fitted `ln λ_k`, aligned 1:1 with [`Self::components`].
+    pub fn log_strengths(&self) -> &[f64] {
+        &self.log_strengths
     }
 
     /// Join the frozen penalty to labeled rows `(X, y)` for the per-test-row

@@ -1043,8 +1043,9 @@ impl GlmFullConformalSubstrate {
         if tau < u_tie {
             return Ok(self.family.whole_support());
         }
-        let twin = self.twin_rows(row);
         if self.family == ConformalGlmFamily::BernoulliLogit {
+            // Only the level walk reads the twins, and only Bernoulli walks.
+            let twin = self.twin_rows(row);
             let mut kept = Vec::with_capacity(2);
             for z in [0.0, 1.0] {
                 if self.honest_level(reselection, row, z, tau, u_tie, &twin)?.0 {
@@ -1053,7 +1054,7 @@ impl GlmFullConformalSubstrate {
             }
             return Ok(level_runs(kept));
         }
-        self.honest_count_levels(reselection, row, tau, u_tie, &twin)
+        Ok(self.honest_count_levels())
     }
 
     /// One level of the honest walk: the strength `ρ̂(z)` the augmented rows
@@ -1073,86 +1074,77 @@ impl GlmFullConformalSubstrate {
         Ok(refit.count_member_scored(row, z, u_tie, twin, tau))
     }
 
-    /// The honest count set: one substrate per level.
+    /// The honest count set is the whole support, because the walk that used to
+    /// narrow it could not prove where to stop (gam#4103).
     ///
-    /// # Why the frozen arm's walk cannot carry re-selection
+    /// # What was here
     ///
-    /// [`Self::count_set`] bisects the test-SCORE coordinate with
-    /// `Augmentation::Tilt(s)` and maps score intervals back to count runs. That
-    /// construction is a property of ONE substrate: a single frozen penalty is
-    /// what makes `z ↦ u_*` monotone, which is what gives a score interval a
-    /// count image and lets one solve decide a whole run. Re-selecting `ρ̂(z)`
-    /// gives every level its own penalty and its own score map, so neither the
-    /// bracket nor the monotonicity survives. The honest set is walked level by
-    /// level instead, one certified outer selection and one certified solve each.
+    /// A level walk `z = 0, 1, 2, …`, each level fitted at the strength `ρ̂(z)`
+    /// the augmented rows select, closing at the first non-member whose own
+    /// certified score reached `s_top` — the tail past which the intercept KKT
+    /// row `Σ_i u_i + u_* = 0` with `u_i = y_i − μ_i < y_i` leaves too few
+    /// training rows above the test score for any rank to admit it.
     ///
-    /// # What closes the walk
+    /// That tail bound holds at every strength, and it does prove the level it
+    /// is evaluated at is a non-member. It proves nothing about LARGER levels.
+    /// At a FIXED penalty `du_*/dz > 0` carries it up the walk, which is what
+    /// the frozen arm uses; re-selection gives every level its own penalty, and
+    /// this function's previous doc said so two paragraphs before the stop that
+    /// assumed otherwise. A conformal set narrowed on an unproven step is not
+    /// conservative, so it is gone rather than documented.
     ///
-    /// At an augmented fit whose intercept column is unpenalised the intercept
-    /// KKT row reads `Σ_i u_i + u_* = 0`, and for the count families
-    /// `u_i = y_i − μ_i < y_i` because `μ_i > 0`. Neither statement mentions the
-    /// penalty, so [`Self::count_score_tail`]'s bound — the number of training
-    /// rows whose score reaches `s` is at most `1 + Σy/s`, which falls below the
-    /// rank the set needs once `s ≥ s_top` — holds at EVERY strength. A level
-    /// whose own certified fit puts `|u_*|` at or past `s_top` is therefore a
-    /// non-member whatever strength that fit selected, and the walk stops there.
+    /// # What the stop would have to be
     ///
-    /// # What the walk does not prove, and what it does instead of guessing
+    /// ```text
+    ///   stop at z₀  when  min over ρ ∈ [lower, upper] of u_*(z₀, ρ)  ≥  s_top.
+    /// ```
     ///
-    /// The frozen arm also knows that no LARGER level returns, because
-    /// `du_*/dz > 0` at a fixed penalty. That is exactly what re-selection
-    /// removes: levels above the stop choose their own `ρ̂`, and this walk proves
-    /// nothing about them. So it never truncates. It is bounded by `z_cap`, the
-    /// first level the FROZEN substrate's own score carries to `s_top` — one
-    /// tilt solve, since `z(s)` is increasing there — and a walk that reaches
-    /// `z_cap` with the set still open returns the whole support `[0, ∞)`, the
-    /// same conservative answer this module already gives where no tail is
-    /// provable. A too-wide enclosure keeps coverage at or above `1 − α`; a
-    /// truncated one would not, which is the defect being repaired.
-    fn honest_count_levels(
-        &self,
-        reselection: &Reselection,
-        row: &TestRow<'_>,
-        tau: f64,
-        u_tie: f64,
-        twin: &[bool],
-    ) -> Result<Vec<ConformalInterval>, String> {
-        let whole = || self.family.whole_support();
-        let k_max = (tau - u_tie).floor() as usize;
-        let Some(s_top) = self.count_score_tail(row, k_max) else {
-            return Ok(whole());
-        };
-        let Ok(cap_node) = self.solve(row, Augmentation::Tilt(s_top), &self.warm_start) else {
-            return Ok(whole());
-        };
-        if !cap_node.certifies(cap_node.error) {
-            return Ok(whole());
-        }
-        let slack = cap_node.lever_star * cap_node.error;
-        let (_, z_cap) = self.family.response_enclosure(
-            cap_node.eta_star - slack,
-            cap_node.eta_star + slack,
-            s_top,
-            s_top,
-        );
-        if !(z_cap.is_finite() && z_cap >= 0.0) {
-            return Ok(whole());
-        }
-        let z_cap = z_cap.ceil();
-        let mut kept = Vec::new();
-        let mut z = 0.0_f64;
-        loop {
-            let (member, score) = self.honest_level(reselection, row, z, tau, u_tie, twin)?;
-            if member {
-                kept.push(z);
-            } else if score >= s_top {
-                return Ok(level_runs(kept));
-            }
-            if z >= z_cap {
-                return Ok(whole());
-            }
-            z += 1.0;
-        }
+    /// [`Self::select_strength`] bounds `ρ` to the #2812 resolvability interval
+    /// of the augmented Gram, and that interval is a property of the Gram and
+    /// the penalty shape, so it is the SAME interval at every candidate level —
+    /// one quantifier over one fixed bounded set. At each fixed `ρ`, `z ↦ u_*`
+    /// is increasing, so `u_*(z', ρ) ≥ u_*(z₀, ρ)` pointwise for `z' ≥ z₀`, and
+    /// pointwise domination carries to the minima. That is what makes one
+    /// level's test decide every larger one.
+    ///
+    /// The minimum cannot be read at an endpoint. `u_*` is not monotone in `ρ`:
+    ///
+    /// ```text
+    ///   β̇ = −H⁻¹S_ρβ̂,    du_*/dρ = −μ_*·(x_*ᵀβ̇) = μ_*·x_*ᵀH⁻¹S_ρβ̂,
+    /// ```
+    ///
+    /// and `x_*` and `S_ρβ̂` are unrelated vectors, so that form has no
+    /// determined sign whatever `H⁻¹`'s definiteness.
+    /// `the_test_score_is_not_monotone_in_the_smoothing_strength_4103` measures
+    /// both signs on fitted scores rather than asserting the algebra.
+    ///
+    /// # What the follow-up needs
+    ///
+    /// A certified minimum over that interval. The derivative above is already
+    /// boundable from quantities this module forms: Cauchy-Schwarz in the `H⁻¹`
+    /// inner product, with `H = X_aᵀWX_a + S_ρ ⪰ S_ρ` giving
+    /// `S_ρ^{1/2}H⁻¹S_ρ^{1/2} ⪯ I`, yields
+    ///
+    /// ```text
+    ///   |du_*/dρ| ≤ μ_*·sqrt(l_*·β̂ᵀS_ρβ̂),
+    /// ```
+    ///
+    /// where `l_*` is [`Node::lever_star`] and `β̂ᵀS_ρβ̂` is [`Self::laml_jet`]'s
+    /// own penalty quadratic. What is missing is a bound on that product over
+    /// the WHOLE interval rather than at sampled strengths: `β̂ᵀS_ρβ̂` tends to
+    /// zero as `ρ` grows but is not shown monotone, so its supremum is not in
+    /// hand, and a constant read off the samples would be the same assumption
+    /// the stop already made.
+    ///
+    /// # Until then
+    ///
+    /// Bernoulli is unaffected: its support is `{0, 1}` and
+    /// [`Self::honest_discrete_set`] walks both levels, which needs no stop.
+    /// The count families return `[0, ∞)`, the same conservative answer this
+    /// module already gives wherever no tail is provable. Too wide keeps
+    /// coverage at or above `1 − α`; the truncation did not.
+    fn honest_count_levels(&self) -> Vec<ConformalInterval> {
+        self.family.whole_support()
     }
 
     /// This substrate at the penalty `e^ρ S`, warm-started at `beta`.
@@ -3153,5 +3145,88 @@ mod reselection_tests {
             );
             z += 1.0;
         }
+    }
+
+    /// gam#4103: the honest count walk's `s_top` stop assumed the test score
+    /// could not come back below `s_top` at a larger level. At a FIXED strength
+    /// that follows from `du_*/dz > 0`; re-selection gives every level its own
+    /// strength, so the stop needed the score at the WORST strength the
+    /// selection can return. Taking that minimum at an endpoint would need
+    /// `u_*` monotone in `ρ`, and it is not:
+    ///
+    /// ```text
+    ///   β̇ = −H⁻¹S_ρβ̂,   du_*/dρ = −μ_*·(x_*ᵀβ̇) = μ_*·x_*ᵀH⁻¹S_ρβ̂.
+    /// ```
+    ///
+    /// `H⁻¹` is positive definite and `μ_* > 0`, but `x_*` and `S_ρβ̂` are
+    /// unrelated vectors, so that bilinear form has no determined sign. This
+    /// reads the sign off fitted scores rather than off the algebra, which is
+    /// why the stop is gone rather than moved to an endpoint.
+    ///
+    /// A red here means the ladder found one sign only. That does not restore
+    /// monotonicity — the derivative still has no sign — it means this fixture
+    /// is too narrow to exhibit it, and the fixture is what should widen.
+    #[test]
+    fn the_test_score_is_not_monotone_in_the_smoothing_strength_4103() {
+        let mut rng = StdRng::seed_from_u64(4103);
+        let d = data(ConformalGlmFamily::PoissonLog, 40, &mut rng);
+        let sub = GlmFullConformalSubstrate::new(
+            ConformalGlmFamily::PoissonLog,
+            d.x.clone(),
+            d.y.clone(),
+            d.offset.clone(),
+            penalty(),
+            Some(1),
+            Array1::zeros(3),
+        )
+        .expect("a single-penalty Poisson substrate");
+        let reselection = sub
+            .reselection
+            .as_ref()
+            .expect("penalty_count = 1 carries the re-selection substrate");
+
+        let level = 2.0_f64;
+        let ladder = [-4.0_f64, -2.0, 0.0, 2.0, 4.0];
+        let mut rising = Vec::new();
+        let mut falling = Vec::new();
+        for &x in &[-0.9_f64, -0.3, 0.3, 0.9] {
+            let x_star = row(x);
+            let test = TestRow {
+                x: &x_star,
+                offset: 0.0,
+            };
+            let mut scores = Vec::with_capacity(ladder.len());
+            for &rho in &ladder {
+                let refit = sub
+                    .at_strength(reselection, rho, Array1::zeros(3))
+                    .expect("the substrate re-penalizes at a finite strength");
+                let node = refit
+                    .solve(&test, Augmentation::Response(level), &refit.warm_start)
+                    .expect("the augmented fit converges at this strength");
+                scores.push(node.score_star);
+            }
+            eprintln!("x*={x:+.1} u_*(rho) over {ladder:?}: {scores:?}");
+            for pair in scores.windows(2) {
+                let step = pair[1] - pair[0];
+                // A step inside the solves' own agreement is no evidence of a
+                // direction, so only steps clearing it are counted. Both ends
+                // are certified fits of the same data at strengths a factor e²
+                // apart, so the floor is the score scale times the convergence
+                // tolerance the inner solve is held to.
+                let floor = GLM_CONVERGENCE_RTOL * (1.0 + pair[0].abs().max(pair[1].abs()));
+                if step > floor {
+                    rising.push(x);
+                } else if step < -floor {
+                    falling.push(x);
+                }
+            }
+        }
+        assert!(
+            !rising.is_empty() && !falling.is_empty(),
+            "the test score moved in one direction only over the strength ladder \
+             (rising at {rising:?}, falling at {falling:?}); a stop evaluated at one \
+             end of the selection domain would then be sound and this fixture cannot \
+             show otherwise"
+        );
     }
 }
