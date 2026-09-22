@@ -2157,7 +2157,10 @@ pub trait CustomFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ContractedTraceHessianAtSnapshot>>, String> {
-        let _ = (block_states, specs);
+        // No batched form by default; the arguments still have to describe one snapshot, since
+        // the per-weight entry point the caller falls back to will read them as one.
+        assert_valid_blockspecs(specs, "contracted trace Hessian at snapshot");
+        assert_states_match_specs(block_states, specs, "contracted trace Hessian at snapshot");
         Ok(None)
     }
 

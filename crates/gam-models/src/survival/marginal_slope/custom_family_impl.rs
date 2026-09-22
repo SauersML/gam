@@ -32,7 +32,11 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalSnapshotTraceHessian<P, G> 
             return Ok(towers.as_slice());
         }
         let built = self.kernel.all_row_primary_towers()?;
-        let _ = self.towers.set(built);
+        if self.towers.set(built).is_err() {
+            log::trace!(
+                "[2979] a concurrent contraction built this snapshot's row towers first; the first set stands"
+            );
+        }
         self.towers.get().map(Vec::as_slice).ok_or_else(|| {
             "survival marginal-slope snapshot trace Hessian lost its row towers".to_string()
         })
