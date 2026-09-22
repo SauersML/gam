@@ -491,17 +491,32 @@ fn compare_routes_at_state(
         )
         .expect("mutant gradient components");
 
-    let arrow_log_det = arrow_geometry.log_det();
+    // The two routes are compared at the CRITERION's log-determinant, which is the only
+    // quantity they both produce. `ArrowOrbitGeometry::log_det` is deliberately not that: it
+    // is the operator's `log|A|` with the orbits integrated, and `construction_quasi_laplace`
+    // stamps it on the cache as such — the θ-adjoint consumers differentiate a determinant,
+    // and the periodic phases' circle volume is not one — then adds that volume on top, off
+    // this same cache. The dense route adds it INSIDE
+    // `exact_observed_information_log_dets_with_saddle_directions`, so `dense_log_det` already
+    // carries it. Comparing the lane's value against the dense one without it compares two
+    // different quantities, and agrees only where the phase volume happens to be zero: the
+    // single-atom circle fixture, but not two compact top-k orbits (#4531).
+    let phase_correction = state
+        .periodic_phase_marginal(&cache)
+        .expect("the periodic phase marginal")
+        .map_or(0.0, |(correction, _)| correction);
+    let arrow_log_det = arrow_geometry.log_det() + phase_correction;
     let value_bar = 1.0e-9 * (1.0 + dense_log_det.abs());
     eprintln!(
         "[#2234 1a {label}] log det dense={dense_log_det:.15e} arrow={arrow_log_det:.15e} \
-         (|Δ| {:.3e}, bar {value_bar:.3e}; orbit correction {:.6e})",
+         (|Δ| {:.3e}, bar {value_bar:.3e}; orbit correction {:.6e}, phase volume {phase_correction:.6e})",
         (arrow_log_det - dense_log_det).abs(),
         arrow_geometry.log_det_correction
     );
     assert!(
         (arrow_log_det - dense_log_det).abs() <= value_bar,
-        "{label}: the arrow orbit lane's log-determinant misses the dense route's"
+        "{label}: the arrow orbit lane's criterion log-determinant (lane value + phase volume) \
+         misses the dense route's"
     );
     assert!(
         arrow_geometry.log_det_correction.abs() > 10.0 * value_bar,
