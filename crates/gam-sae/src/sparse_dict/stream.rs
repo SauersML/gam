@@ -121,6 +121,10 @@ pub struct SparseDictStreamState {
     last_ev: f64,
     last_ev_residual: f64,
     last_decoder_residual: f64,
+    /// The DERIVED fixed-point tolerance the convergence rule actually compared the two
+    /// residuals against, retained because `config.tolerance` is not that number and a
+    /// refusal quoting the config value would name a bar the gate never applied (#2902).
+    last_fixed_point_tol: f64,
     epochs_run: usize,
     last_revived: usize,
     converged: bool,
@@ -174,6 +178,7 @@ impl SparseDictStreamState {
             last_ev: f64::NEG_INFINITY,
             last_ev_residual: f64::INFINITY,
             last_decoder_residual: f64::INFINITY,
+            last_fixed_point_tol: f64::INFINITY,
             epochs_run: 0,
             last_revived: 0,
             converged: false,
@@ -369,8 +374,7 @@ impl SparseDictStreamState {
             self.decoder.nrows(),
             self.p,
         );
-        let numerically_sound = decoder_solve_stats.cg_nonconverged_columns == 0
-            && decoder_solve_stats.cg_relative_residual <= decoder_solve_stats.cg_residual_stop;
+        let numerically_sound = Self::decoder_solve_is_sound(&decoder_solve_stats);
         let evidence_settled = self.eq.firings.iter().all(|&firings| firings == 0);
         let improve = ev - self.prev_ev;
         let converged = self.epochs_run > 0
@@ -384,6 +388,7 @@ impl SparseDictStreamState {
         self.last_ev = ev;
         self.last_ev_residual = improve.abs();
         self.last_decoder_residual = decoder_residual;
+        self.last_fixed_point_tol = fixed_point_tol;
         self.last_revived = revived;
         self.converged = converged;
         self.epochs_run += 1;
@@ -460,19 +465,59 @@ impl SparseDictStreamState {
     /// if the streaming loop has not met the convergence rule, this is a typed
     /// error and the state itself remains the resumable checkpoint — stream more
     /// epochs and finalize again.
+    /// Whether the last decoder solve met its own CG stopping contract: the
+    /// `numerically_sound` conjunct of the fixed-point rule in `end_epoch`. It lives
+    /// here so the epoch that DECIDES convergence and the refusal that EXPLAINS it
+    /// read one expression and cannot drift apart (#2902).
+    fn decoder_solve_is_sound(stats: &DecoderSolveStats) -> bool {
+        stats.cg_nonconverged_columns == 0 && stats.cg_relative_residual <= stats.cg_residual_stop
+    }
+
     pub fn finalize(&self) -> Result<SparseDictArtifact, String> {
         if !self.converged {
+            // #2902 — A SIX-CONJUNCT GATE MUST NAME THE CONJUNCT THAT FAILED.
+            //
+            // The rule in `end_epoch` is `epochs_run > 0 && revived == 0 &&
+            // numerically_sound && evidence_settled && |Δev| <= tol && decoder_residual
+            // <= tol`. This refusal used to report four of those six, and they are the
+            // four that are SATISFIED whenever the other two are why it refused: the
+            // observed message read "EV residual 0.000e0, decoder residual 0.000e0 vs
+            // tolerance 1.000e-9, 0 atom(s) revived", which is a passing gate as far as
+            // it goes, so a reader concludes the rule is broken. The two conjuncts that
+            // could actually be false went unmentioned. Report all of them.
+            //
+            // It also quoted `config.tolerance`, which is NOT the bar the rule applies:
+            // the comparison is against the derived `fixed_point_tolerance(...)` the
+            // epoch computed from the row count and the decoder shape. Quote the bar the
+            // gate used, and keep the configured value beside it so the derivation stays
+            // visible.
+            let solve_sound = Self::decoder_solve_is_sound(&self.last_decoder_solve_stats);
+            let unsettled = self
+                .eq
+                .firings
+                .iter()
+                .filter(|&&firings| firings != 0)
+                .count();
             return Err(format!(
                 "SparseDictStream.finalize: streaming fit has not converged after {} epoch(s) \
-                 (last EV {:.6e}, EV residual {:.3e}, decoder residual {:.3e} vs tolerance \
-                 {:.3e}, {} atom(s) revived in the last epoch); the stream state is a resumable \
-                 checkpoint, not a model — run more epochs until end_epoch reports convergence",
+                 (last EV {:.6e}, EV residual {:.3e}, decoder residual {:.3e}, both against the \
+                 derived fixed-point tolerance {:.3e} from configured {:.3e}; {} atom(s) revived \
+                 in the last epoch; decoder solve sound={} with {} non-converged column(s) and CG \
+                 relative residual {:.3e} against stop {:.3e}; {} atom(s) still hold evidence a \
+                 later refresh would install); the stream state is a resumable checkpoint, not a \
+                 model — run more epochs until end_epoch reports convergence",
                 self.epochs_run,
                 self.last_ev,
                 self.last_ev_residual,
                 self.last_decoder_residual,
+                self.last_fixed_point_tol,
                 self.config.tolerance,
                 self.last_revived,
+                solve_sound,
+                self.last_decoder_solve_stats.cg_nonconverged_columns,
+                self.last_decoder_solve_stats.cg_relative_residual,
+                self.last_decoder_solve_stats.cg_residual_stop,
+                unsettled,
             ));
         }
         Ok(SparseDictArtifact {
