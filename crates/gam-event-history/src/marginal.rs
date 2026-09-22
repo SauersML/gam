@@ -108,6 +108,21 @@ pub(crate) struct SubjectOutput<S> {
 pub(crate) enum Evaluation {
     /// The marginal log-likelihood alone.
     Value,
+    /// The log-likelihood with its Fisher gradient alone.
+    ///
+    /// The gradient is `E[∂L_c | y]`, a FIRST moment of the complete-data
+    /// score under the smoothed marginal. Every object the Louis Hessian adds
+    /// to it is a second moment — `E[g gᵀ | y]`, the expected curvature, and
+    /// the carried conditional score that propagates the first of those
+    /// between nodes — and each of the three is `p_total²` or
+    /// `p_total × grid` wide where the gradient is `p_total`. On the
+    /// adjoint route of gam#2965 a subject is swept in its NODE
+    /// log-intensities, so `p_total` is `nodes × marks` and the square is
+    /// what made the whole-coordinate Louis sweep unaffordable: 1553 nodes
+    /// and three marks is a 4662-wide vector and a 174 MB Hessian. This arm
+    /// forms neither, and the chain rule to the coefficients is taken
+    /// outside (`super::objective::EventHistoryFamily::adjoint_gradient`).
+    Gradient { tolerance: f64 },
     /// The log-likelihood with its Fisher gradient and Louis Hessian. Both
     /// read the backward smoother, whose every marginal is certified against
     /// `tolerance`, the relative accuracy the fit's quadrature is certified
@@ -831,7 +846,7 @@ pub(crate) fn subject_marginal<S: JetField>(
     let exposure_rows: Vec<Vec<f64>> = (0..n_nodes).map(|n| nodes.exposure_row(n)).collect();
 
     // ---- forward filter ------------------------------------------------
-    let derivatives = matches!(evaluation, Evaluation::Derivatives { .. });
+    let derivatives = !matches!(evaluation, Evaluation::Value);
     let filtered = filter_nodes(inputs, derivatives, &counts_rows, &exposure_rows)?;
     let node_loglik: Vec<S> = filtered
         .iter()
@@ -849,8 +864,12 @@ pub(crate) fn subject_marginal<S: JetField>(
                 hessian: Vec::new(),
             });
         }
-        Evaluation::Derivatives { tolerance } => tolerance,
+        Evaluation::Gradient { tolerance } | Evaluation::Derivatives { tolerance } => tolerance,
     };
+    // Whether the second moments are formed at all. The gradient needs the
+    // smoothed marginals and each node's own score; every remaining object
+    // below exists to build `E[g gᵀ | y]` or the expected curvature.
+    let want_hessian = matches!(evaluation, Evaluation::Derivatives { .. });
 
     // ---- layout ------------------------------------------------------------
     // With designs, the coefficients are the per-mark blocks in mark order.
@@ -933,8 +952,9 @@ pub(crate) fn subject_marginal<S: JetField>(
     // equation the held normaliser defines is unbiased.
     let prior_centred = inputs.log_normaliser.is_none();
     let mut mean = vec![zero.clone(); p_total];
-    let mut second = vec![zero.clone(); p_total * p_total];
-    let mut curvature = vec![zero.clone(); p_total * p_total];
+    let square = if want_hessian { p_total * p_total } else { 0 };
+    let mut second = vec![zero.clone(); square];
+    let mut curvature = vec![zero.clone(); square];
     // Louis' identity is `E[∂²L_c | y] + Var[∂L_c | y]`. Without atoms there
     // is no latent state to be uncertain about: the complete-data likelihood
     // *is* the observed one, its score has no posterior spread, and the
@@ -944,15 +964,22 @@ pub(crate) fn subject_marginal<S: JetField>(
     // arithmetic whose answer is known, and it is the part that grows with
     // the square of the mark count. The expected curvature and the mean are
     // still needed, and still formed.
+    //
+    // `latent_variance` is that question — is there a latent state at all —
+    // and `carried_variance` is it together with whether the second moments
+    // are wanted, because the carried conditional score exists only to build
+    // them. The gap below still runs under `latent_variance` alone: the rate
+    // score lives there, and it is a first moment.
     let latent_variance = atoms > 0;
-    let mut carried: Vec<S> = if latent_variance {
+    let carried_variance = latent_variance && want_hessian;
+    let mut carried: Vec<S> = if carried_variance {
         vec![zero.clone(); p_total * filtered[0].grid.size()]
     } else {
         Vec::new()
     };
     let mut carried_smoothed: Option<Vec<S>> = smoothed_chain.grids[0]
         .as_ref()
-        .filter(|_| latent_variance)
+        .filter(|_| carried_variance)
         .map(|grid| vec![zero.clone(); p_total * grid.size()]);
     // `ζ_{dk}(i) = ∂η_d/∂a_{dk}` per mark and atom at every point of a grid.
     let centred_on = |grid: &Grid<S>| -> Vec<Vec<Vec<S>>> {
@@ -1051,9 +1078,10 @@ pub(crate) fn subject_marginal<S: JetField>(
         for d in 0..marks {
             let ws = &ws_all[d];
             // B[q] = Σ_i W s_d C[q];  A_k[q] = Σ_i W s_d ζ_{dk} C[q]
-            let mut b = vec![zero.clone(); if latent_variance { p_total } else { 0 }];
-            let mut a_k = vec![vec![zero.clone(); p_total]; atoms];
-            if latent_variance {
+            let mut b = vec![zero.clone(); if carried_variance { p_total } else { 0 }];
+            let mut a_k =
+                vec![vec![zero.clone(); p_total]; if carried_variance { atoms } else { 0 }];
+            if carried_variance {
                 // `W s_d C[q]` is formed once per grid point and reused for the
                 // atom contractions, which is the same arithmetic in the same
                 // order with the product taken once instead of once per atom.
@@ -1075,7 +1103,7 @@ pub(crate) fn subject_marginal<S: JetField>(
                 }
             }
             // E[C v_dᵀ] and its transpose.
-            if latent_variance {
+            if carried_variance {
                 for q in 0..p_total {
                     for &(col, x) in &rows[d] {
                         let value = b[q].scale(x);
@@ -1101,7 +1129,12 @@ pub(crate) fn subject_marginal<S: JetField>(
                 }
                 mean[layout.a(d, k)] = mean[layout.a(d, k)].add(&acc);
             }
-            // Expected curvature of the node term.
+            // Expected curvature of the node term. It is a second moment
+            // and enters `curvature` alone, so the gradient arm forms none of
+            // it.
+            if !want_hessian {
+                continue;
+            }
             let mut ec = zero.clone();
             let mut ecz = vec![zero.clone(); atoms];
             let mut eczz = vec![zero.clone(); atoms * atoms];
@@ -1150,7 +1183,7 @@ pub(crate) fn subject_marginal<S: JetField>(
             }
         }
         // ---- pass 2: the same-node block, every ordered pair of marks -------
-        for d in 0..if latent_variance { marks } else { 0 } {
+        for d in 0..if carried_variance { marks } else { 0 } {
             let ws = &ws_all[d];
             for d2 in 0..marks {
                 let mut m00 = zero.clone();
@@ -1197,7 +1230,7 @@ pub(crate) fn subject_marginal<S: JetField>(
             }
         }
         // ---- pass 3: the node's functions join the carried vectors ---------
-        if latent_variance {
+        if carried_variance {
             match carried_smoothed.as_mut() {
                 Some(on_smoothed) => {
                     absorb(on_smoothed, &rows, node, &centred, size);
@@ -1256,18 +1289,25 @@ pub(crate) fn subject_marginal<S: JetField>(
         for k in 0..atoms {
             let (t, dt) = &polys[k];
             let tk = start_function(k, t, 2);
-            let dtk = start_function(k, dt, 2);
-            let ttk = start_function(k, &t.mul(t), 4);
             let rho = layout.rho(k);
             let mut e_t = zero.clone();
+            for i in 0..size {
+                e_t = e_t.add(&w[i].mul(&tk[i]));
+            }
+            // The gap's own rate score is a FIRST moment, so it is the one
+            // thing in this section the gradient arm needs.
+            mean[rho] = mean[rho].add(&e_t);
+            if !want_hessian {
+                continue;
+            }
+            let dtk = start_function(k, dt, 2);
+            let ttk = start_function(k, &t.mul(t), 4);
             let mut e_dt = zero.clone();
             let mut e_tt = zero.clone();
             for i in 0..size {
-                e_t = e_t.add(&w[i].mul(&tk[i]));
                 e_dt = e_dt.add(&w[i].mul(&dtk[i]));
                 e_tt = e_tt.add(&w[i].mul(&ttk[i]));
             }
-            mean[rho] = mean[rho].add(&e_t);
             curvature[rho * p_total + rho] = curvature[rho * p_total + rho].add(&e_dt);
             second[rho * p_total + rho] = second[rho * p_total + rho].add(&e_tt);
             // E[C_m t_k]: the gap score against everything carried so far
@@ -1283,7 +1323,7 @@ pub(crate) fn subject_marginal<S: JetField>(
             }
         }
         // Cross-atom same-gap products E[t_k t_j].
-        for k in 0..atoms {
+        for k in 0..if want_hessian { atoms } else { 0 } {
             for j in (k + 1)..atoms {
                 let (tk, _) = &polys[k];
                 let (tj, _) = &polys[j];
@@ -1324,6 +1364,13 @@ pub(crate) fn subject_marginal<S: JetField>(
             }
         }
         // ---- propagate the carried vector to node m+1's grids ------------------
+        // The carried vector exists only to build `E[g gᵀ | y]`, so the
+        // gradient arm neither holds one nor moves one across a gap. That is
+        // the whole of what step B saves inside a subject: one `p_total × G^K`
+        // vector and one forward kernel per gap (gam#2965).
+        if !carried_variance {
+            continue;
+        }
         // C_{m+1}(z') = E[C_m(z) | z', y_{≤m}], plus the gap score's own
         // expectation E[t_g | z', y_{≤m}] in its log-rate slot, both under the
         // forward kernel's normalised inner weights at every target point: the
@@ -1446,8 +1493,8 @@ pub(crate) fn subject_marginal<S: JetField>(
     }
 
     // ---- assemble ----------------------------------------------------------
-    let mut hessian = vec![zero.clone(); p_total * p_total];
-    for q in 0..p_total {
+    let mut hessian = vec![zero.clone(); square];
+    for q in 0..if want_hessian { p_total } else { 0 } {
         for r in q..p_total {
             let (value, mirror) = if latent_variance {
                 (
@@ -1485,7 +1532,7 @@ pub(crate) fn subject_marginal<S: JetField>(
     for k in 0..converted {
         let rho_k = layout.rho(k);
         let inv_k = &inverse_rates[k];
-        for j in 0..converted {
+        for j in 0..if want_hessian { converted } else { 0 } {
             let rho_j = layout.rho(j);
             let inv_j = &inverse_rates[j];
             let raw = hessian[rho_k * p_total + rho_j].clone();
@@ -1496,7 +1543,7 @@ pub(crate) fn subject_marginal<S: JetField>(
             };
             hessian[rho_k * p_total + rho_j] = converted;
         }
-        for q in 0..layout.rho0 {
+        for q in 0..if want_hessian { layout.rho0 } else { 0 } {
             let value = hessian[rho_k * p_total + q].mul(inv_k);
             hessian[rho_k * p_total + q] = value.clone();
             hessian[q * p_total + rho_k] = value;

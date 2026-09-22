@@ -74,6 +74,29 @@ impl EventHistoryFamily {
         Ok(crate::family::reference_law(tables, beta, out))
     }
 
+    /// The loadings slice and the atom rates a coefficient vector carries.
+    ///
+    /// One reader, so the adjoint route's reference evolution cannot drift
+    /// from the forward path's: a free rate reads its coefficient through the
+    /// band chart, a held one is a constant of the vector's own jet.
+    fn latent_parameters<'a, S: JetField>(&self, beta: &'a [S]) -> (&'a [S], Vec<S>) {
+        let marks = self.marks();
+        let latent_offset = self.block_offsets()[marks];
+        let loadings = &beta[latent_offset..latent_offset + marks * self.atoms];
+        let rates = self
+            .free_rate_slots()
+            .iter()
+            .enumerate()
+            .map(|(k, slot)| match slot {
+                Some(slot) => rate_from_chart(self.rate_band, &beta[latent_offset + slot]),
+                None => beta[0].constant_like(
+                    self.held_rates[k].expect("a non-free atom rate has a held value"),
+                ),
+            })
+            .collect();
+        (loadings, rates)
+    }
+
     /// The reference law is evaluated with the same jet as the subject
     /// likelihood, before interpolation. Grid adaptation is differentiated too.
     pub(super) fn path_value<S: JetField + Send + Sync>(
@@ -82,14 +105,7 @@ impl EventHistoryFamily {
         let marks = self.marks();
         let offsets = self.block_offsets();
         let latent_offset = offsets[marks];
-        let loadings = &beta[latent_offset..latent_offset + marks * self.atoms];
-        let rates: Vec<S> = self.free_rate_slots().iter().enumerate().map(|(k, slot)| {
-            match slot {
-                Some(slot) => rate_from_chart(self.rate_band, &beta[latent_offset + slot]),
-                None => beta[0].constant_like(self.held_rates[k]
-                    .expect("a non-free atom rate has a held value")),
-            }
-        }).collect();
+        let (loadings, rates) = self.latent_parameters(beta);
         let normalisers = if let (Some(tables), true) = (self.reference.as_ref(), self.atoms > 0) {
             let values = self.reference_values(beta, loadings, &rates)?;
             tables.check_carry(values.log_normaliser.len(), marks, self.nodes.total_nodes)?;
@@ -123,6 +139,315 @@ impl EventHistoryFamily {
             subject_marginal(&inputs, Evaluation::Value).map(|result| result.loglik)
         }).collect();
         Ok(pairwise_sum(&results?, &beta[0].constant_like(0.0)))
+    }
+
+
+    /// The reference log-normaliser and its Jacobian in the coefficients:
+    /// `(m, ∂m/∂β)` with `∂m/∂β[q][i] = ∂m_i/∂β_q`, or `None` for a family
+    /// with no reference law.
+    ///
+    /// Forward mode is the right mode here and nowhere else on this path. The
+    /// reference evolution walks the REFERENCE grid, whose length the
+    /// certificate sets and the cohort does not, so its cost is independent of
+    /// `n`: `⌈p / TANGENT_WIDTH⌉` evolutions give every column at once, and
+    /// they overlap because each is its own serial chain. Reversing it instead
+    /// would mean checkpointing every population grid, every killing mask and
+    /// the midpoint fixed point, to save work that does not grow with the
+    /// cohort (#2965).
+    fn reference_jacobian<S: JetField + Send + Sync>(
+        &self,
+        beta: &[S],
+    ) -> Result<Option<(Vec<S>, Vec<Vec<S>>)>, EventHistoryError> {
+        const W: usize = TANGENT_WIDTH;
+        let marks = self.marks();
+        if self.reference.is_none() || self.atoms == 0 {
+            return Ok(None);
+        }
+        let total = beta.len();
+        let starts: Vec<usize> = (0..total).step_by(W).collect();
+        let sweeps: Vec<Result<Vec<Rows<S, W>>, EventHistoryError>> = starts
+            .par_iter()
+            .map(|&start| {
+                let seeded: Vec<Rows<S, W>> = beta
+                    .iter()
+                    .enumerate()
+                    .map(|(q, value)| {
+                        Rows::seed(
+                            value.clone(),
+                            std::array::from_fn(|k| f64::from(q == start + k)),
+                        )
+                    })
+                    .collect();
+                let (loadings, rates) = self.latent_parameters(&seeded);
+                Ok(self
+                    .reference_values(&seeded, loadings, &rates)?
+                    .log_normaliser)
+            })
+            .collect();
+        let mut held: Option<Vec<S>> = None;
+        let mut jacobian: Vec<Vec<S>> = Vec::new();
+        for (&start, sweep) in starts.iter().zip(sweeps) {
+            let sweep = sweep?;
+            if held.is_none() {
+                held = Some(sweep.iter().map(|value| value.base.clone()).collect());
+                jacobian = vec![vec![beta[0].constant_like(0.0); sweep.len()]; total];
+            }
+            for (i, value) in sweep.iter().enumerate() {
+                for k in 0..W.min(total - start) {
+                    jacobian[start + k][i] = value.rows[k].clone();
+                }
+            }
+        }
+        let held = held.ok_or_else(|| EventHistoryError::InvalidInput {
+            reason: "a reference law needs at least one coefficient to be differentiated in"
+                .to_string(),
+        })?;
+        self.reference
+            .as_ref()
+            .expect("the reference was present above")
+            .check_carry(held.len(), marks, self.nodes.total_nodes)?;
+        Ok(Some((held, jacobian)))
+    }
+
+    /// The computed path's value and gradient in ONE cohort sweep — step B of
+    /// gam#2965.
+    ///
+    /// # Why a reverse sweep exists at all here
+    ///
+    /// [`Self::path_value`] carries the coefficients' tangents THROUGH the
+    /// whole cohort, so a gradient costs `⌈p / TANGENT_WIDTH⌉` cohort sweeps
+    /// and a dense Hessian `b(b + 1)/2` of them at `b = ⌈p / TANGENT_WIDTH⌉`.
+    /// The issue's ceiling is one sweep per column. This route reaches it by
+    /// differentiating the path where it is CHEAP to and contracting where it
+    /// is not:
+    ///
+    /// ```text
+    ///   ℓ(β) = Σ_i ℓ_i(η⁰_i(β), a(β), ν(β), m(β))
+    ///   ∇ℓ  = Σ_i X_iᵀ ℓ_{i,η} + Σ_i ℓ_{i,a} + Σ_i ℓ_{i,ν} ∂ν/∂β
+    ///                          + (∂m/∂β)ᵀ Σ_i ℓ_{i,m}
+    /// ```
+    ///
+    /// Every factor on the right is already available:
+    ///
+    /// * `ℓ_{i,η}`, `ℓ_{i,a}` and `ℓ_{i,ν}` are what
+    ///   [`subject_marginal`] returns under [`Evaluation::Gradient`] with NO
+    ///   designs, where its own layout is the node log-intensities themselves;
+    /// * `∂m/∂β` is [`Self::reference_jacobian`], `n`-independent;
+    /// * and `ℓ_{i,m} = −ℓ_{i,η}` EXACTLY, because a held normaliser enters
+    ///   every intensity only through `η⁰ − m`
+    ///   (`marginal::centred_baseline`). The reference adjoint is therefore
+    ///   the node adjoint scattered back through the transpose of the linear
+    ///   interpolation that carried `m` onto the cohort's rows, and it costs
+    ///   nothing to form.
+    ///
+    /// # Why the whole-coordinate Louis sweep was refused and this is not it
+    ///
+    /// Sending reference-centred families to the Louis sweep with the
+    /// reference points ADDED to the coordinate vector was measured at
+    /// 2.15 GB and killed at 900 s where the block sweep took 612 s, because
+    /// the per-subject Hessian then grows as `(p + points·marks)²`. Here the
+    /// reference points are never coordinates: the subject returns a VECTOR of
+    /// node adjoints, one scatter forms `Σ_i ℓ_{i,m}` for the whole cohort,
+    /// and the only square object in the route is `∂m/∂β`, which is
+    /// `(strata · reference nodes · marks) × p` and does not see the cohort.
+    ///
+    /// The value channel is the same computed value [`Self::path_value`]
+    /// returns; the gradient is the exact derivative of the marginal the
+    /// forward filter computes, by Fisher's identity on that same quadrature.
+    pub(super) fn adjoint_value_and_gradient<S: JetField + Send + Sync>(
+        &self, states: &[ParameterBlockState], beta: &[S],
+    ) -> Result<(S, Vec<S>), EventHistoryError> {
+        let marks = self.marks();
+        let atoms = self.atoms;
+        let offsets = self.block_offsets();
+        let latent_offset = offsets[marks];
+        let total = beta.len();
+        let zero = beta[0].constant_like(0.0);
+        let (loadings, rates) = self.latent_parameters(beta);
+        let reference = self.reference_jacobian(beta)?;
+        let carried: Option<(&ReferenceTables, &Vec<S>)> = match reference.as_ref() {
+            Some((held, _)) => Some((self.reference_tables()?, held)),
+            None => None,
+        };
+        let tolerance = self.quadrature_tolerance;
+        // One sweep over the cohort. Each subject is differentiated in its own
+        // node log-intensities, so its local vector is `nodes · marks` wide and
+        // never `p`.
+        let swept: Result<Vec<(usize, S, Vec<S>)>, EventHistoryError> = self
+            .nodes
+            .subjects
+            .par_iter()
+            .map(|subject| {
+                let first = subject.first_row;
+                let held = carried.map(|(tables, held)| {
+                    tables.carry_rows(held, marks, first..first + subject.len())
+                });
+                let mut eta0 = Vec::with_capacity(subject.len() * marks);
+                for row in first..first + subject.len() {
+                    for d in 0..marks {
+                        let mut eta = zero.clone();
+                        for (j, x) in self.designs[d].row(row).iter().enumerate() {
+                            if *x != 0.0 {
+                                eta = eta.add(&beta[offsets[d] + j].scale(*x));
+                            }
+                        }
+                        eta0.push(eta.with_value(states[d].eta[row]));
+                    }
+                }
+                let inputs = SubjectInputs {
+                    nodes: subject, eta0: &eta0, loadings, rates: &rates,
+                    time_scale: self.time_scale, gh: &self.gh, continuation_gap: 0.0,
+                    designs: None,
+                    log_normaliser: held.as_deref(),
+                };
+                let out = subject_marginal(&inputs, Evaluation::Gradient { tolerance })?;
+                Ok((first, out.loglik, out.gradient))
+            })
+            .collect();
+        let swept = swept?;
+        // ---- the adjoints, summed over the cohort -----------------------------
+        let mut node_bar = vec![zero.clone(); self.nodes.total_nodes * marks];
+        let mut loading_bar = vec![zero.clone(); marks * atoms];
+        let mut rate_bar = vec![zero.clone(); atoms];
+        let logliks: Vec<S> = swept.iter().map(|(_, loglik, _)| loglik.clone()).collect();
+        for (first, _, gradient) in &swept {
+            let nodes = gradient.len() - marks * atoms - atoms;
+            // Subjects own disjoint node rows, so this places rather than adds.
+            node_bar[first * marks..first * marks + nodes].clone_from_slice(&gradient[..nodes]);
+            for (k, bar) in loading_bar.iter_mut().enumerate() {
+                *bar = bar.add(&gradient[nodes + k]);
+            }
+            for (k, bar) in rate_bar.iter_mut().enumerate() {
+                *bar = bar.add(&gradient[nodes + marks * atoms + k]);
+            }
+        }
+        // ---- the chain rule ---------------------------------------------------
+        let mut gradient = vec![zero.clone(); total];
+        for d in 0..marks {
+            let design = &self.designs[d];
+            for row in 0..self.nodes.total_nodes {
+                let bar = &node_bar[row * marks + d];
+                for (j, x) in design.row(row).iter().enumerate() {
+                    if *x != 0.0 {
+                        let slot = offsets[d] + j;
+                        gradient[slot] = gradient[slot].add(&bar.scale(*x));
+                    }
+                }
+            }
+        }
+        for (k, bar) in loading_bar.iter().enumerate() {
+            let slot = latent_offset + k;
+            gradient[slot] = gradient[slot].add(bar);
+        }
+        // A free rate reads exactly one coefficient through the band chart, so
+        // its Jacobian is that chart's own derivative there, carried in `S`.
+        for (k, slot) in self.free_rate_slots().iter().enumerate() {
+            if let Some(slot) = slot {
+                let coefficient = latent_offset + slot;
+                let seeded = Rows::<S, 1>::seed(beta[coefficient].clone(), [1.0]);
+                let chart = rate_from_chart(self.rate_band, &seeded);
+                gradient[coefficient] = gradient[coefficient].add(&rate_bar[k].mul(&chart.rows[0]));
+            }
+        }
+        // ---- the reference law ------------------------------------------------
+        if let Some((tables, _)) = carried {
+            let jacobian = &reference
+                .as_ref()
+                .expect("the reference Jacobian is present with its tables")
+                .1;
+            let held_bar = tables.scatter_rows(&node_bar, marks, self.nodes.total_nodes, &zero);
+            for (q, column) in jacobian.iter().enumerate() {
+                let mut acc = zero.clone();
+                for (bar, entry) in held_bar.iter().zip(column) {
+                    acc = acc.add(&bar.mul(entry));
+                }
+                // `∂ℓ/∂m = −∂ℓ/∂η⁰`: the normaliser is subtracted from the
+                // baseline, so the scattered node adjoint enters negated.
+                gradient[q] = gradient[q].sub(&acc);
+            }
+        }
+        Ok((pairwise_sum(&logliks, &zero), gradient))
+    }
+
+    /// The reference tables of a family that has them.
+    fn reference_tables(&self) -> Result<&ReferenceTables, EventHistoryError> {
+        self.reference
+            .as_deref()
+            .ok_or_else(|| EventHistoryError::InvalidInput {
+                reason: "this family has no reference population".to_string(),
+            })
+    }
+
+    /// The value, the gradient and the dense Hessian of the computed path from
+    /// `⌈p / TANGENT_WIDTH⌉` adjoint sweeps — the ceiling gam#2965 sets.
+    ///
+    /// Forward over reverse: each sweep seeds one block of coefficients as
+    /// tangents of [`Self::adjoint_value_and_gradient`], whose gradient then
+    /// carries `∂g_q/∂β_r` in tangent channel `r`. One sweep per column block
+    /// gives the whole Hessian, where the pair replay cost `b(b + 1)/2` and
+    /// the block sweep still costs that many. `H v` is the same route at
+    /// `W = 1`, one sweep for a product.
+    ///
+    /// The result is symmetrised as [`Self::coordinate_hessian`] symmetrises
+    /// its own: the two triangles are the same second derivative computed
+    /// through different channels, and their average is the entry both name.
+    ///
+    /// The reference law is the one thing this pays `b²` for rather than `b`:
+    /// each of the `b` outer sweeps asks [`Self::reference_jacobian`] for
+    /// every column of `∂m/∂β`, which is `b` evolutions of its own. That is
+    /// the right trade and not an oversight — a reference evolution walks the
+    /// REFERENCE grid, so `b²` of them do not grow with the cohort, while the
+    /// `b(b + 1)/2 − b` cohort sweeps they replace grow with every subject,
+    /// every node and `G^K`.
+    pub(super) fn adjoint_hessian<S: JetField + Send + Sync>(
+        &self, states: &[ParameterBlockState], beta: &[S],
+    ) -> Result<(S, Vec<S>, Vec<S>), EventHistoryError> {
+        const W: usize = TANGENT_WIDTH;
+        let total = beta.len();
+        let zero = beta[0].constant_like(0.0);
+        if total == 0 {
+            return Ok((self.path_value(states, beta)?, Vec::new(), Vec::new()));
+        }
+        let starts: Vec<usize> = (0..total).step_by(W).collect();
+        let sweeps: Vec<Result<(Rows<S, W>, Vec<Rows<S, W>>), EventHistoryError>> = starts
+            .par_iter()
+            .map(|&start| {
+                let seeded: Vec<Rows<S, W>> = beta
+                    .iter()
+                    .enumerate()
+                    .map(|(q, value)| {
+                        Rows::seed(
+                            value.clone(),
+                            std::array::from_fn(|k| f64::from(q == start + k)),
+                        )
+                    })
+                    .collect();
+                self.adjoint_value_and_gradient(states, &seeded)
+            })
+            .collect();
+        let mut value = zero.clone();
+        let mut gradient = vec![zero.clone(); total];
+        let mut hessian = vec![zero.clone(); total * total];
+        for (&start, sweep) in starts.iter().zip(sweeps) {
+            let (swept_value, swept_gradient) = sweep?;
+            value = swept_value.base;
+            for (q, entry) in swept_gradient.iter().enumerate() {
+                gradient[q] = entry.base.clone();
+                for k in 0..W.min(total - start) {
+                    hessian[q * total + start + k] = entry.rows[k].clone();
+                }
+            }
+        }
+        for q in 0..total {
+            for r in (q + 1)..total {
+                let symmetric = hessian[q * total + r]
+                    .add(&hessian[r * total + q])
+                    .scale(0.5);
+                hessian[q * total + r] = symmetric.clone();
+                hessian[r * total + q] = symmetric;
+            }
+        }
+        Ok((value, gradient, hessian))
     }
 
     /// The value, the gradient along `coordinates` and the row-major Hessian
@@ -323,6 +648,34 @@ impl EventHistoryFamily {
             traces[i] -= term?;
         }
         Ok(traces)
+    }
+
+    /// The computed path's value, gradient and dense Hessian by the ADJOINT
+    /// route — what the fit evaluates (#2965 step B).
+    ///
+    /// [`Self::computed_joint`] is the same three objects by forward mode, at
+    /// `b(b + 1)/2` cohort sweeps for `b = ⌈p / TANGENT_WIDTH⌉`; this is `b`
+    /// of them. It keeps its name and its callers in the tests, where it is
+    /// the reference this route is scored against, exactly as it already is
+    /// for the all-static families `evaluate_generic` sends to the Louis
+    /// sweep.
+    pub(super) fn adjoint_joint<S: Directional>(
+        &self, states: &[ParameterBlockState], u: Option<&Array1<f64>>,
+        v: Option<&Array1<f64>>, derivatives: bool,
+    ) -> Result<(S, Vec<S>, Vec<S>), String> {
+        let values: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
+        let total = values.len();
+        for direction in [u, v].into_iter().flatten() {
+            if direction.len() != total || direction.iter().any(|x| !x.is_finite()) {
+                return Err("invalid event-history derivative direction".to_string());
+            }
+        }
+        let beta: Vec<S> = values.iter().enumerate().map(|(q, value)|
+            S::seeded(*value, u.map_or(0.0, |x| x[q]), v.map_or(0.0, |x| x[q]))).collect();
+        if !derivatives {
+            return Ok((self.path_value(states, &beta)?, Vec::new(), Vec::new()));
+        }
+        Ok(self.adjoint_hessian(states, &beta)?)
     }
 
     pub(super) fn computed_joint<S: Directional>(
@@ -841,6 +1194,20 @@ mod tests {
     fn louis_matches_the_block_sweep_2965(
         label: &str, fixture: impl Fn(usize) -> (EventHistoryFamily, Vec<ParameterBlockState>),
     ) {
+        route_matches_the_block_sweep_2965(label, false, fixture);
+    }
+
+    /// [`louis_matches_the_block_sweep_2965`] for whichever route
+    /// `evaluate_generic` takes: the Louis sweep where the family is off the
+    /// computed path, the adjoint sweep where it is on it (#2965 step B).
+    /// `computed_path` states which, and is asserted, so a fixture that stops
+    /// taking the route the caller names fails rather than silently scoring
+    /// the other one.
+    fn route_matches_the_block_sweep_2965(
+        label: &str,
+        computed_path: bool,
+        fixture: impl Fn(usize) -> (EventHistoryFamily, Vec<ParameterBlockState>),
+    ) {
         use crate::test_support::Bound;
         struct Refinement {
             first: f64,
@@ -863,7 +1230,11 @@ mod tests {
         let mut computed = Vec::new();
         for order in orders {
             let (family, states) = fixture(order);
-            assert!(!family.differentiates_the_computed_path(), "{label}: the fixture takes the Louis sweep");
+            assert_eq!(
+                family.differentiates_the_computed_path(),
+                computed_path,
+                "{label}: the fixture does not take the route this test scores"
+            );
             let (_, _, sweep) = family.evaluate_generic::<Bound>(&states, None, None, true).unwrap();
             let (_, _, block) = family.computed_joint::<Bound>(&states, None, None, true).unwrap();
             louis.push(sweep);
@@ -938,10 +1309,58 @@ mod tests {
         louis_matches_the_block_sweep_2965("all static", fixture);
     }
 
+    /// A reference-centred family's ADJOINT Hessian is its block sweep's,
+    /// within the quadrature refinement both routes are converging under
+    /// (#2965 step B).
+    ///
+    /// The two are the same object by two formulas. The block sweep carries
+    /// the coefficients' tangents through the whole computed path, so it
+    /// differentiates the quadrature itself, grid placement included. The
+    /// adjoint contracts the subject's own score — Fisher's identity on that
+    /// same quadrature — against the design, the loading slots, the rate
+    /// chart and the reference law's Jacobian. They differ by the part of the
+    /// derivative that is the RULE moving rather than the integrand, which is
+    /// a quadrature error and shrinks with the Gauss-Hermite order; so the bar
+    /// is not a chosen number but the refinement the two routes measure on
+    /// themselves, over orders 9, 17 and 33, exactly as the all-static
+    /// comparison does. An entry is compared only where its own refinement
+    /// step is resolved above its rounding and shrinking, and only where it is
+    /// material against that bar.
+    ///
+    /// This is the fixture the whole-coordinate Louis route was refused on:
+    /// sending it there with the reference points as coordinates was measured
+    /// at 2.15 GB against the block sweep's 210 MB. The adjoint never makes a
+    /// reference point a coordinate, and this test is what says it did not
+    /// need to.
+    #[test]
+    fn the_adjoint_route_matches_the_block_sweep_on_a_reference_law_2965() {
+        let fixture = |order| wide_reference_family_at(4, order);
+        let (family, _) = fixture(9);
+        assert!(
+            family.differentiates_the_computed_path(),
+            "a reference-centred family must take the computed path"
+        );
+        eprintln!(
+            "reference adjoint: {} coefficients, {} nodes",
+            family.total_width(),
+            family.nodes.total_nodes
+        );
+        route_matches_the_block_sweep_2965("reference adjoint", true, fixture);
+    }
+
     /// Four subjects on one once-only mark, a reference law on 24 equal steps,
     /// `columns` cosine time columns in the mark block, and a near-static held
     /// atom: a reference-centred fixture of any width.
     fn wide_reference_family(columns: usize) -> (EventHistoryFamily, Vec<ParameterBlockState>) {
+        wide_reference_family_at(columns, 9)
+    }
+
+    /// [`wide_reference_family`] at a stated Gauss-Hermite order, so a
+    /// refinement comparison can build the same fixture on three rungs.
+    fn wide_reference_family_at(
+        columns: usize,
+        order: usize,
+    ) -> (EventHistoryFamily, Vec<ParameterBlockState>) {
         let subjects: Vec<SubjectHistory> = (0..4).map(|i| {
             let exit = 6.0 - 0.75 * i as f64;
             SubjectHistory {
@@ -993,7 +1412,7 @@ mod tests {
             ParameterBlockState { beta, eta },
             ParameterBlockState { beta: array![0.9], eta: Array1::zeros(nodes.total_nodes) },
         ];
-        let family = EventHistoryFamily::new(nodes.clone(), vec![Arc::new(design)], 1, 9, 1.0, vec![Some(1e-8)],
+        let family = EventHistoryFamily::new(nodes.clone(), vec![Arc::new(design)], 1, order, 1.0, vec![Some(1e-8)],
             EventHistorySpec::new(Vec::new()).quadrature_tolerance)
             .unwrap().with_reference(Some(Arc::new(tables)));
         (family, states)

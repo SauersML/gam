@@ -260,6 +260,39 @@ impl ReferenceTables {
     /// [`Self::carry_to_nodes`] for the node rows `rows` alone, on tables
     /// [`Self::check_carry`] accepted: a subject reads its own rows where it
     /// is evaluated instead of every subject's being formed up front.
+    /// The transpose of [`Self::carry_rows`] over the whole node set: given an
+    /// adjoint of the values `carry_rows` produced, the adjoint of the
+    /// normaliser they were carried from.
+    ///
+    /// `carry_rows` is the linear map `m_row,d = (1 − w) m_lower,d + w
+    /// m_upper,d`, so its transpose scatters each row's adjoint back onto the
+    /// two reference nodes that bracket it with the same two weights. This is
+    /// what lets the adjoint gradient of gam#2965 price the reference law
+    /// without ever making a reference point a coefficient: the whole cohort's
+    /// dependence on `m` arrives here as one vector.
+    pub(crate) fn scatter_rows<S: JetField>(
+        &self,
+        node_adjoint: &[S],
+        marks: usize,
+        total_nodes: usize,
+        zero: &S,
+    ) -> Vec<S> {
+        let nodes = self.grid.len();
+        let mut out = vec![zero.clone(); self.strata * nodes * marks];
+        for row in 0..total_nodes {
+            let base = self.node_stratum[row] * nodes;
+            let lower = (base + self.node_lower[row]) * marks;
+            let upper = (base + self.node_lower[row] + 1) * marks;
+            let weight = self.node_weight[row];
+            for d in 0..marks {
+                let bar = &node_adjoint[row * marks + d];
+                out[lower + d] = out[lower + d].add(&bar.scale(1.0 - weight));
+                out[upper + d] = out[upper + d].add(&bar.scale(weight));
+            }
+        }
+        out
+    }
+
     pub(crate) fn carry_rows<S: JetField>(&self, held: &[S], marks: usize, rows: std::ops::Range<usize>) -> Vec<S> {
         let nodes = self.grid.len();
         let mut out = Vec::with_capacity(rows.len() * marks);
@@ -673,7 +706,7 @@ impl EventHistoryFamily {
     ) -> Result<(S, Vec<S>, Vec<S>), String> {
         self.validate_states(states)?;
         if self.differentiates_the_computed_path() {
-            return self.computed_joint(states, u, v, derivatives);
+            return self.adjoint_joint(states, u, v, derivatives);
         }
         let marks = self.marks();
         let atoms = self.atoms;
@@ -893,6 +926,19 @@ impl EventHistoryFamily {
     /// on a gradient that is not the derivative of the value it tests.
     fn exact_gradient(&self, states: &[ParameterBlockState]) -> Result<Vec<f64>, String> {
         self.clear_reference_refusal();
+        // On the computed path the gradient is one cohort sweep, not
+        // `⌈p / TANGENT_WIDTH⌉` of them (#2965 step B). The family has ONE
+        // gradient, so the route that returns it is the route its Hessian is
+        // differentiated from; `exact_gradient_chunks` stays the forward-mode
+        // reference for every other family and for the tests that score the
+        // adjoint against it.
+        if self.differentiates_the_computed_path() {
+            let values: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
+            let (_, gradient) = self
+                .adjoint_value_and_gradient(states, &values)
+                .map_err(|error| error.to_string())?;
+            return Ok(gradient);
+        }
         let total = self.total_width();
         let mut gradient = vec![0.0; total];
         self.exact_gradient_chunks::<{ super::scalar::TANGENT_WIDTH }>(states, &mut gradient)?;
@@ -3846,6 +3892,12 @@ fn fit_event_history_on_grid(
             rate_held: fit.rate_held.clone(),
             atom: Some(atom.clone()),
         };
+        // A candidate fit is a whole solve of the next rank's model, and the
+        // path runs one per step whether or not the evidence accepts it, so a
+        // cohort that judges more candidates pays for them even at the same
+        // final rank. Its cost is reported on the same decomposition the
+        // certified rungs use (#2986).
+        let candidate_started = std::time::Instant::now();
         let grown = fit_at_rank(
             cohort,
             &rank_spec,
@@ -3858,6 +3910,15 @@ fn fit_event_history_on_grid(
         );
         match grown {
             Ok(candidate) => {
+                log::debug!(
+                    "{}",
+                    rung_cost(
+                        "rank candidate",
+                        rank + 1,
+                        &candidate,
+                        candidate_started.elapsed()
+                    )
+                );
                 let criterion = |fit: &EventHistoryFit| -> Result<f64, EventHistoryError> {
                     fit.fit.reml_score().filter(|value| value.is_finite())
                         .ok_or_else(|| EventHistoryError::Fit {
@@ -3958,13 +4019,63 @@ fn certified_rank(
 ) -> Result<EventHistoryFit, EventHistoryError> {
     let started = std::time::Instant::now();
     let fit = fit_at_rank(cohort, spec, atoms, start, None, admitted, from_refinement, reference_refinement)?;
-    log::debug!(
-        "[event-history] rank {atoms}: certified at Gauss-Hermite order {}, mesh refinement {} ({:.2} s)",
+    log::debug!("{}", rung_cost("rank", atoms, &fit, started.elapsed()));
+    Ok(fit)
+}
+
+/// One ladder rung's cost, decomposed (#2986).
+///
+/// Two cohorts of the same size can differ in wall time three ways, and this
+/// line carries all three: a rung's own wall splits into how many outer
+/// iterations it took and what each cost, both below, and how many rungs were
+/// run at all is the number of these lines a fit emits — the refinement ladder
+/// logs one per certified rank and the rank path one per candidate it judges,
+/// accepted or not.
+///
+/// A rung's wall is `outer iterations × the cost of one outer iteration`, and
+/// the cost of one outer iteration is set by the mesh the family evaluates on
+/// and by the latent grid's `G^K`. Reporting the wall alone cannot separate
+/// them, so this reports both factors beside it: how many outer iterations the
+/// search took and what they cost in inner cycles, and the size of what each
+/// evaluation walks — the node count, the longest subject's node count (which
+/// sets the Gauss-Hermite certificate's reach), the certified order and the
+/// certified mesh refinement. The derived seconds per outer iteration is what
+/// "costlier evaluations" means, and it is written out rather than left to the
+/// reader because which of the two factors moved IS the question.
+///
+/// Neither convergence flag is among them, and that is deliberate: a
+/// `UnifiedFitResult` is minted only from a converged optimization, and only
+/// `PirlsStatus::Converged` may mint one, so on every rung that returns a fit
+/// the outer flag is `true` and the inner status is `Converged`. Logging them
+/// would spend a field on a constant. The outer stationarity norm the
+/// certificate holds does vary, and it is what says whether a long search was
+/// a hard surface or a slow one.
+fn rung_cost(
+    what: &str,
+    rank: usize,
+    fit: &EventHistoryFit,
+    elapsed: std::time::Duration,
+) -> String {
+    let wall = elapsed.as_secs_f64();
+    let outer = fit.fit.outer_iterations;
+    let per_outer = if outer == 0 {
+        f64::NAN
+    } else {
+        wall / outer as f64
+    };
+    format!(
+        "[event-history] {what} {rank}: certified at Gauss-Hermite order {}, mesh refinement {} \
+         ({wall:.2} s over {outer} outer iterations = {per_outer:.3} s each, {} inner cycles, \
+         |g| {}, {} nodes, longest subject {} nodes)",
         fit.quadrature.gauss_hermite_order,
         fit.quadrature.mesh_refinement,
-        started.elapsed().as_secs_f64()
-    );
-    Ok(fit)
+        fit.fit.inner_cycles,
+        fit.fit
+            .outer_gradient_norm
+            .map_or_else(|| "none".to_string(), |norm| format!("{norm:.3e}")),
+        fit.nodes.total_nodes,
+        fit.nodes.max_subject_nodes(),
+    )
 }
 
 /// The ladder a rank decision the incumbent's setting cannot resolve climbs.
