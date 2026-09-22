@@ -169,6 +169,45 @@ Terminal counts are cumulative incidences, once-only counts are first-event
 probabilities before termination, and recurrent counts are expected numbers of
 events before termination.
 
+### Which parameters a forecast conditions on
+
+`forecast`, `forecast_history`, `population_forecast`, `latent_state` and
+`predictive_pit` integrate the subject's LATENT state and evaluate the global
+parameters -- the baseline coefficients, the loadings and the atom rates -- at
+their fitted values. Each is therefore `P(. | data, theta-hat)`, and the error
+fields beside it bound that window's quadratures at `theta-hat`, not the
+distance to the posterior-predictive probability.
+
+`posterior_predictive_forecast` and its siblings return
+`E_theta[P(. | data, theta)]` instead. The average is a Gauss-Hermite product
+rule over the coefficients' posterior, on the directions its covariance
+resolves; every state of the rule rebuilds its own reference evolution and
+refilters the history at its own coefficients, so no averaged baseline and no
+averaged loading covariance enters a probability. The rule's own error is the
+gap to the same average on the next Gauss-Hermite rung, returned beside every
+probability and refused above the fit's quadrature tolerance. A rule whose
+states do not fit the machine's materialisation budget is refused with its
+direction and point counts named, rather than run on a cheaper rule.
+
+The two differ because the probabilities are nonlinear in the parameters:
+averaging the parameters and then evaluating is not evaluating and then
+averaging. The gap is largest for sparse outcomes and weakly identified
+effects.
+
+### Saving a predictor
+
+A fit's predictor saves and reloads through the shared model envelope, kind
+`event-history`. It carries the frozen schema, the fitted functions and the
+probability law, the reference law, and the coefficient posterior the average
+above integrates over -- and none of the training participants' records. Save,
+reload and forecast reproduce the in-memory forecast bit for bit on the same
+build; another kind of payload, or another version, is refused with a typed
+error and never migrated.
+
+A reloaded predictor serves `forecast_history` and `population_forecast`,
+which bring their own covariate rows. It cannot serve `forecast` by training
+subject index: that names a row of a cohort a predictor does not hold.
+
 ## Python example
 
 ```python
