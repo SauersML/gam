@@ -88,8 +88,9 @@ pub use crate::model_types::{
     validate_dense_hessian_export, validate_explicit_dense_hessian_for_whitening,
 };
 pub use edf_accounting::{
-    EdfBundle, EdfRankBound, EdfRankCertificate, collapsed_to_penalty_null_space,
-    numerical_rank_bound, penalized_edf_bundle_within_bands, sparse_numerical_rank_bound,
+    EdfBundle, EdfRankBound, EdfRankCertificate, TermEdfBelowDeclaredNull,
+    collapsed_to_penalty_null_space, numerical_rank_bound, penalized_edf_bundle_within_bands,
+    sparse_numerical_rank_bound, term_edf_below_declared_null,
 };
 pub use evaluation::{evaluate_externalcost, evaluate_externalgradient, evaluate_externalhessian};
 pub use external_options::{ExternalOptimOptions, ExternalOptimResult};

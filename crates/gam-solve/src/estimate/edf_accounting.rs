@@ -556,6 +556,100 @@ fn assert_blocks_aligned(traces: usize, ranks: usize) {
     );
 }
 
+/// A term's fitted EDF found below the structural null dimension its own
+/// builder declares, with both numbers named (gam#1561).
+///
+/// Carried as a value rather than raised, because the accounting that detects
+/// it is not the layer that decides what a fit does about it; every field is
+/// what a caller needs to say which term, by how much, and against what.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TermEdfBelowDeclaredNull {
+    /// The term's published EDF, `tr(F)` restricted to its coefficient block.
+    pub edf_term: f64,
+    /// `dim(∩_k null(S_k))` from the term's own declarations
+    /// (`SmoothTerm::declared_unpenalized_dim`).
+    pub declared_null_dim: usize,
+    /// The term's coefficient count, `|coeff_range|`.
+    pub coefficient_count: usize,
+}
+
+impl std::fmt::Display for TermEdfBelowDeclaredNull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "term effective df {:.6} is below the {} direction(s) its own penalties declare \
+             unpenalized, over {} coefficients: smoothing removed df from a subspace no \
+             penalty acts on",
+            self.edf_term, self.declared_null_dim, self.coefficient_count
+        )
+    }
+}
+
+/// Whether a term's published EDF fell below the null dimension its penalties
+/// declare, which is a theorem it cannot do.
+///
+/// # The bound
+///
+/// A term's EDF is the influence matrix's trace over its coefficient block,
+/// which [`crate::model_types::UnifiedFitResult::per_term_edf`] states as
+///
+/// ```text
+/// edf_term = p_local − Σ_{k ∈ term} λ_k·tr(H⁻¹ S_k)
+///          = p_local − tr(H⁻¹ S_term(λ)),   S_term(λ) = Σ_k λ_k S_k.
+/// ```
+///
+/// Let `m = dim(∩_k null(S_k))`. Every `S_k` is PSD, so
+/// `null(Σ_k λ_k S_k) = ∩_k null(S_k)` for positive `λ`, giving
+/// `rank(S_term(λ)) = p_local − m` at every `λ` the optimizer can reach. Under
+/// the same condition each block already publishes a certificate for — `H ⪰ λ_k
+/// S̃_k`, [`EdfRankBound::Certified`] — the trace of `H⁻¹ S_term(λ)` is at most
+/// that rank, so
+///
+/// ```text
+/// edf_term ≥ p_local − (p_local − m) = m.
+/// ```
+///
+/// The bound is a subspace dimension and is attained in the limit `λ → ∞`, so
+/// no tolerance belongs on either side: there is no slack term to absorb, and a
+/// band would only hide the first fraction of a direction lost. This is the
+/// per-term form of the `[mp, p]` floor `assemble_bundle` already applies to
+/// `edf_total`, and it is derived the same way.
+///
+/// # What `m` must be
+///
+/// `m` has to be the term's DECLARED joint null dimension
+/// (`SmoothTerm::declared_unpenalized_dim`), not the measured one
+/// (`wald_unpenalized_dim`). The measurement reads the stored matrices, and a
+/// builder that conditions its seminorm — the Duchon affine ridge at `√ε` — has
+/// put a resolvable eigenvalue on a direction it declared null, so the
+/// measurement returns a floor of zero for exactly the terms this bound exists
+/// to protect. Passing the measured dimension here is not wrong, only vacuous.
+///
+/// # When it does not apply
+///
+/// `every_block_certified` is false when any of the term's blocks published
+/// `Uncertified` or `NotAssessed`: without `H ⪰ λ_k S̃_k` nothing certifies
+/// `H ≻ 0` either, the trace is published unclamped and may be negative, and a
+/// violation would be a statement about the missing certificate rather than
+/// about the fit. Nothing is reported there, exactly as `assemble_bundle`
+/// applies no `[mp, p]` clamp to a total containing such a block. A non-finite
+/// EDF is likewise not reported: the arithmetic already failed upstream.
+pub fn term_edf_below_declared_null(
+    edf_term: f64,
+    declared_null_dim: usize,
+    coefficient_count: usize,
+    every_block_certified: bool,
+) -> Option<TermEdfBelowDeclaredNull> {
+    if !every_block_certified || !edf_term.is_finite() {
+        return None;
+    }
+    (edf_term < declared_null_dim as f64).then_some(TermEdfBelowDeclaredNull {
+        edf_term,
+        declared_null_dim,
+        coefficient_count,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,5 +1059,72 @@ mod tests {
             );
         }
         assert!(!collapsed_to_penalty_null_space(1.294, 576, f64::NAN));
+    }
+
+    /// The bound is attained in the limit `λ → ∞`, so equality is not a
+    /// violation and no band is needed to say so.
+    #[test]
+    fn a_term_resting_exactly_on_its_declared_null_dimension_is_not_a_violation() {
+        assert_eq!(term_edf_below_declared_null(2.0, 2, 20, true), None);
+    }
+
+    /// Positive control. `duchon_capacity` fits `duchon(x0, k = 20)` at
+    /// `order = Linear`, so its seminorm annihilates the polynomials of degree
+    /// `≤ m − 1 = 1` in one variable — the frame `{1, x}`, dimension 2 — and the
+    /// builder declares exactly that frame while putting a `√ε`-relative ridge
+    /// on the slope column. The reference-quality row reports `edf = 1.518` over
+    /// that term's 20 coefficients, which is below the declaration by 0.482 of a
+    /// direction. Read against the MEASURED null dimension the same row is
+    /// silent, because the ridge makes the measurement 0: that is the fourth
+    /// assertion here, and it is why the declaration is the quantity this
+    /// acceptance takes.
+    #[test]
+    fn the_duchon_capacity_row_is_named_with_both_numbers() {
+        let below = term_edf_below_declared_null(1.518, 2, 20, true)
+            .expect("1.518 effective df is below a declared affine null of 2");
+        assert_eq!(below.edf_term, 1.518);
+        assert_eq!(below.declared_null_dim, 2);
+        assert_eq!(below.coefficient_count, 20);
+        let named = below.to_string();
+        assert!(
+            named.contains("1.518"),
+            "message omits the fitted df: {named}"
+        );
+        assert!(
+            named.contains(" 2 direction(s)"),
+            "message omits the declared dimension: {named}"
+        );
+        assert_eq!(term_edf_below_declared_null(1.518, 0, 20, true), None);
+    }
+
+    /// Without `H ⪰ λ_k S̃_k` nothing certifies `H ≻ 0` either, so the trace the
+    /// EDF is formed from is published unclamped and can even be negative
+    /// (#2635). A violation read off it would be a statement about the missing
+    /// certificate, not about the fit, so none is reported — the same discipline
+    /// `assemble_bundle` applies to the `[mp, p]` clamp of the total.
+    #[test]
+    fn an_uncertified_term_reports_nothing_however_far_below() {
+        assert_eq!(term_edf_below_declared_null(-3.0, 4, 20, false), None);
+    }
+
+    #[test]
+    fn a_non_finite_effective_df_is_not_reported_as_a_violation() {
+        for edf in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                term_edf_below_declared_null(edf, 2, 20, true),
+                None,
+                "{edf} is arithmetic that already failed upstream"
+            );
+        }
+    }
+
+    /// An unpenalized term carries every one of its coefficients as a full
+    /// degree of freedom, which is the bound at `m = p_local`: the acceptance
+    /// holds with no room, and a term at `p_local` is not a violation while one
+    /// a thousandth below it is.
+    #[test]
+    fn an_unpenalized_term_sits_on_the_bound_at_its_full_width() {
+        assert_eq!(term_edf_below_declared_null(20.0, 20, 20, true), None);
+        assert!(term_edf_below_declared_null(19.999, 20, 20, true).is_some());
     }
 }

@@ -2184,7 +2184,13 @@ fn periodic_bspline_margin_wraps_exactly_at_period() {
     for row in dense.rows() {
         assert!((row.sum() - 1.0).abs() < 1e-12);
     }
-    assert_eq!(built.active_penalties[0].nullity, 1);
+    // gam#1561: the harmonic roughness at `penalty_order = 2` carries a DECLARED
+    // structural null frame -- `cyclic_harmonic_null_frame` returns the constant
+    // and the two frequency-one translates, three orthonormal columns -- and
+    // `filter_penalty_candidates` now records that declaration rather than the
+    // one direction the spectrum resolves through the factor's conditioning. The
+    // old `1` was the measurement on a matrix the builder declared otherwise.
+    assert_eq!(built.active_penalties[0].nullity, 3);
 }
 
 #[test]

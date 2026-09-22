@@ -1329,10 +1329,95 @@ pub fn report_penalty_pair_redundancy(canonical: &[CanonicalPenalty]) -> Vec<(us
 ///
 /// This is O(block_dim^3) instead of O(p^3) for block-local penalties.
 /// Returns `None` if the penalty has rank zero (should be dropped).
+///
+/// The caller has no declaration to offer, so the block's nullity is MEASURED
+/// from its own spectrum. A caller holding the design's declared null dimension
+/// calls [`canonicalize_penalty_spec_declared`] instead, which is the same
+/// computation with the declaration consulted; this entry is that one at
+/// `NO_DECLARED_NULLITY`.
 pub fn canonicalize_penalty_spec(
     spec: &crate::PenaltySpec,
     p: usize,
     idx: usize,
+    context: &str,
+) -> Result<Option<CanonicalPenalty>, EstimationError> {
+    canonicalize_penalty_spec_declared(spec, p, idx, NO_DECLARED_NULLITY, context)
+}
+
+/// The declared null dimension a caller passes when it has none to declare.
+///
+/// The design's per-penalty `nullspace_dims` is a `usize` with no absent state,
+/// and `0` is what every producer writes for a block whose null space it has
+/// not declared. Reading `0` as "no declaration" costs nothing either way: a
+/// block that genuinely annihilates nothing removes nothing under the rule
+/// below, which is what a measurement would give it too. Naming the convention
+/// is what keeps it from being read as a decision.
+pub const NO_DECLARED_NULLITY: usize = 0;
+
+/// [`canonicalize_penalty_spec`] with the design's declared null dimension for
+/// this block consulted.
+///
+/// # Why a declaration exists at all
+///
+/// A basis builder knows its seminorm's null space as a THEOREM -- Duchon's
+/// polynomial block, a tensor's joint polynomial null space -- while the
+/// shipped matrix deliberately carries a conditioning term on top of it. The
+/// Duchon builder places a ridge on its affine slope columns at
+/// `DUCHON_AFFINE_NATIVE_RIDGE_REL = 1.4901161193847656e-8`, bit-exactly `√ε`,
+/// and says why in its own doc: the coefficient is relative "so the affine
+/// trend stays in the EFFECTIVE NULL SPACE while the slopes remain structurally
+/// (non-zero) penalized". A rank test on the shipped matrix reads that
+/// direction as penalized -- `√ε` is seven orders above the eigensolver's own
+/// band -- so the measurement contradicts the declaration, and the criterion
+/// then prices a direction the builder declared null.
+///
+/// What that costs is not a rank gap: both halves of the LAML pair range over
+/// the same subspace, so `PenaltyFrameAudit`'s rank identity holds throughout.
+/// It is a ramp. `log|S|₊` charges the direction from the first unit of ρ while
+/// `½log|H|` cannot answer until `λ·s_min` overtakes the data curvature, which
+/// for a `√ε`-relative eigenvalue is `ln(1/√ε) = 26·ln 2 ≈ 18` units of ρ
+/// later. Over that range the criterion carries a `−½` per unit ρ slope with no
+/// interior optimum, and λ climbs; that is how a term ends below its own
+/// structural null dimension (gam#1561).
+///
+/// `spectral_tolerance_for_dim`'s own doc reaches the same conclusion from the
+/// other side: nullities the decomposition's error swallows "must be DECLARED
+/// by the basis that knows its polynomial null space (gam#3023), not read off a
+/// spectrum".
+///
+/// # The rule
+///
+/// `rank = resolved.min(block_dim − declared)`. This is not a new rule: it is
+/// the one [`gam_problem::structural_penalty_root`] already applies on the
+/// custom-family route, where `nullspace_dims` has been consulted since #2954,
+/// and whose doc derives the direction -- a declaration can only REMOVE
+/// directions from the root, never restore one the spectrum did not resolve.
+/// This entry brings the standard route to the same rule; the two had differed
+/// only in that the standard route never looked.
+///
+/// Where the block resolves MORE null space than the design declares, the
+/// spectrum wins and nothing is refused, for the reason that route's doc gives:
+/// a block can lose rank beyond its structural declaration because of the data
+/// (a collinear covariate, an unobserved factor level), and telling that apart
+/// from a formation error needs the construction's own error band, which no
+/// producer carries yet (gam#3023). A declaration ABOVE the block's own
+/// dimension is refused with both numbers named, because no spectrum can carry
+/// it; that is `PenaltyRootError::NullityExceedsDimension` on the other route.
+///
+/// The cut is taken from the range directions only. An indefinite block's
+/// negative-curvature directions are already excluded from the root and are not
+/// null, so `block_dim − declared` would miscount them.
+///
+/// # What this does not decide
+///
+/// It does not decide that a FITTED term respected its declaration. That
+/// acceptance is `gam_solve::estimate::term_edf_below_declared_null`, read
+/// against `SmoothTerm::declared_unpenalized_dim`, where the EDF is published.
+pub fn canonicalize_penalty_spec_declared(
+    spec: &crate::PenaltySpec,
+    p: usize,
+    idx: usize,
+    declared_nullity: usize,
     context: &str,
 ) -> Result<Option<CanonicalPenalty>, EstimationError> {
     use crate::PenaltySpec;
@@ -1442,12 +1527,45 @@ pub fn canonicalize_penalty_spec(
         tolerance,
         analysis.noise_tol,
     );
-    let rank_k = classes.rank();
+    let measured_rank = classes.rank();
     assert_eq!(
-        rank_k, analysis.rank,
-        "penalty-root rank disagreement: SpectralClassification rank={rank_k} vs analyze_penalty_block rank={} (#1425 canonical-classifier invariant)",
+        measured_rank, analysis.rank,
+        "penalty-root rank disagreement: SpectralClassification rank={measured_rank} vs analyze_penalty_block rank={} (#1425 canonical-classifier invariant)",
         analysis.rank
     );
+
+    // The design's declaration decides this block's nullity where it has one;
+    // the spectrum decides only where it does not. See this function's doc for
+    // why a builder's declaration outranks a rank test on a matrix that
+    // deliberately carries a conditioning term.
+    let measured_nullity = classes.nullity();
+    if declared_nullity > block_dim {
+        crate::bail_invalid_estim!(
+            "{context}: penalty block idx={idx} of dimension {block_dim} is declared to \
+             annihilate {declared_nullity} direction(s); a declared null space cannot exceed \
+             the block it is declared on (the block resolves {measured_nullity})"
+        );
+    }
+    // Ordered largest first, so the declaration is carried by cutting the tail.
+    let mut range_idx: Vec<usize> = classes.range_idx.to_vec();
+    range_idx.sort_by(|&a, &b| analysis.eigenvalues[b].total_cmp(&analysis.eigenvalues[a]));
+    // The cut is taken from the RANGE, never from the negative-curvature
+    // directions: those are already excluded from the root and are not null, so
+    // `block_dim - declared` would be the wrong count on an indefinite block
+    // (the high-d Duchon kernels reach this path). Removing nothing leaves
+    // `nullity` bit-identical to `classes.nullity()`, which is what every
+    // undeclared block still gets.
+    let removed = declared_nullity.saturating_sub(measured_nullity);
+    range_idx.truncate(measured_rank.saturating_sub(removed));
+    let nullity = measured_nullity + (measured_rank - range_idx.len());
+    let rank_k = range_idx.len();
+    if rank_k == 0 {
+        log::trace!(
+            "Dropped penalty block idx={idx} reason=DeclaredFullyNull \
+             declared={declared_nullity} measured_rank={measured_rank}"
+        );
+        return Ok(None);
+    }
 
     // Build the penalty root R from ONLY the range directions (positive
     // curvature): R has one row per range eigenpair, scaled by sqrt(ev), so
@@ -1458,7 +1576,7 @@ pub fn canonicalize_penalty_spec(
     // high d require to preserve the q_pen / q_null invariant downstream.
     let mut root = Array2::zeros((rank_k, block_dim));
     let mut positive_eigenvalues = Vec::with_capacity(rank_k);
-    for (row_idx, &i) in classes.range_idx.iter().enumerate() {
+    for (row_idx, &i) in range_idx.iter().enumerate() {
         let eigenval = analysis.eigenvalues[i];
         let eigenvec = analysis.eigenvectors.column(i);
         root.row_mut(row_idx).assign(&(&eigenvec * eigenval.sqrt()));
@@ -1474,9 +1592,8 @@ pub fn canonicalize_penalty_spec(
         log::trace!(
             "{context}: penalty block idx={idx} carries {} negative-curvature \
              eigendirection(s) below -tol={tolerance:e}; dropped from the canonical \
-             root and NOT counted as null space (rank={rank_k}, nullity={})",
-            classes.negative_dim(),
-            classes.nullity()
+             root and NOT counted as null space (rank={rank_k}, nullity={nullity})",
+            classes.negative_dim()
         );
     }
 
@@ -1488,7 +1605,7 @@ pub fn canonicalize_penalty_spec(
         root: root.into_shared(),
         col_range,
         total_dim: p,
-        nullity: classes.nullity(),
+        nullity,
         local: local.into_shared(),
         positive_eigenvalues,
         op,
@@ -1497,6 +1614,15 @@ pub fn canonicalize_penalty_spec(
 
 /// Canonicalize a batch of penalty specs, dropping zero-rank penalties.
 /// Returns (active_penalties, active_nullspace_dims).
+///
+/// `nullspace_dims` is the design's declaration, one entry per spec, and this
+/// is the seam where it meets the block it describes. It used to travel past
+/// the canonicalization untouched -- carried into `active_nullspace` for later
+/// consumers while each block's own nullity was measured from its spectrum --
+/// so a builder that declared a direction null and then placed a `√ε`
+/// conditioning ridge on it got the ridge's verdict rather than its own
+/// (gam#1561). Each block now reads its declaration through
+/// [`canonicalize_penalty_spec_declared`], which is where the two meet.
 pub fn canonicalize_penalty_specs(
     specs: &[crate::PenaltySpec],
     nullspace_dims: &[usize],
@@ -1514,7 +1640,9 @@ pub fn canonicalize_penalty_specs(
     let mut active = Vec::with_capacity(specs.len());
     let mut active_nullspace = Vec::with_capacity(specs.len());
     for (idx, spec) in specs.iter().enumerate() {
-        if let Some(canonical) = canonicalize_penalty_spec(spec, p, idx, context)? {
+        if let Some(canonical) =
+            canonicalize_penalty_spec_declared(spec, p, idx, nullspace_dims[idx], context)?
+        {
             active_nullspace.push(nullspace_dims[idx]);
             active.push(canonical);
         }
@@ -4586,5 +4714,145 @@ mod tests {
             redundant.is_empty(),
             "different col_ranges must not be flagged"
         );
+    }
+
+    /// The conditioning-ridge shape the Duchon builder ships, reduced to
+    /// arithmetic: a block whose third direction carries `√ε` relative to its
+    /// largest eigenvalue, which is what
+    /// `DUCHON_AFFINE_NATIVE_RIDGE_REL = 1.4901161193847656e-8` puts on the
+    /// affine slope columns so they "stay in the effective null space while the
+    /// slopes remain structurally (non-zero) penalized".
+    fn conditioned_affine_block() -> crate::PenaltySpec {
+        crate::PenaltySpec::Block {
+            local: ndarray::array![
+                [1.0, 0.0, 0.0],
+                [0.0, 0.5, 0.0],
+                [0.0, 0.0, f64::EPSILON.sqrt()],
+            ],
+            col_range: 0..3,
+            structure_hint: None,
+            op: None,
+        }
+    }
+
+    /// Negative control for the pair below, and the reason the declaration is
+    /// needed at all: `√ε` is seven orders above the spectrum's own rounding
+    /// band (`3·ε` at this scale), so the measurement resolves the conditioned
+    /// direction as penalized and reports a nullity of zero. If this ever stops
+    /// holding, the declared case below is passing for a different reason and
+    /// this test says so first.
+    #[test]
+    fn the_conditioning_ridge_is_resolved_as_penalized_when_nothing_is_declared_1561() {
+        let (active, _) = super::canonicalize_penalty_specs(
+            &[conditioned_affine_block()],
+            &[0],
+            3,
+            "undeclared conditioning ridge",
+        )
+        .expect("a positive-definite block canonicalizes");
+        assert_eq!(active.len(), 1);
+        assert_eq!(
+            active[0].nullity, 0,
+            "the measurement resolves a √ε direction as penalized"
+        );
+        assert_eq!(active[0].root.nrows(), 3, "all three directions are rooted");
+    }
+
+    /// gam#1561: the declaration decides the block's nullity where the design
+    /// has one. The same block, with the design declaring one null direction,
+    /// roots two directions and reports a nullity of one — the conditioned
+    /// direction leaves both the root and `log|S|₊`, which is the charge that
+    /// ramps the criterion by `−½` per unit of ρ over the `ln(1/√ε) ≈ 18` units
+    /// it takes `½log|H|` to answer.
+    #[test]
+    fn a_declared_null_direction_leaves_the_root_even_where_the_spectrum_resolves_it_1561() {
+        let (active, active_nullspace) = super::canonicalize_penalty_specs(
+            &[conditioned_affine_block()],
+            &[1],
+            3,
+            "declared conditioning ridge",
+        )
+        .expect("a block with one declared null direction canonicalizes");
+        assert_eq!(active.len(), 1);
+        assert_eq!(
+            active[0].nullity, 1,
+            "the declaration is the block's nullity"
+        );
+        assert_eq!(
+            active[0].root.nrows(),
+            2,
+            "the declared direction is not rooted"
+        );
+        assert_eq!(active_nullspace, vec![1]);
+        for eigenvalue in &active[0].positive_eigenvalues {
+            assert!(
+                *eigenvalue > f64::EPSILON.sqrt(),
+                "the kept directions are the two largest, not the conditioned one: \
+                 {eigenvalue:e}"
+            );
+        }
+    }
+
+    /// A declaration only ever removes directions. A block the spectrum finds
+    /// rank-deficient beyond its declaration keeps the spectrum's answer: the
+    /// extra deficiency is about the data (a collinear covariate, an unobserved
+    /// level), and telling that apart from a formation error needs a band no
+    /// producer carries. This is the direction `gam_problem::structural_penalty_root`
+    /// already resolves the same way on the custom-family route.
+    #[test]
+    fn a_declaration_below_the_measured_nullity_does_not_restore_a_direction_1561() {
+        let spec = crate::PenaltySpec::Block {
+            local: ndarray::array![[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            col_range: 0..3,
+            structure_hint: None,
+            op: None,
+        };
+        let (active, _) =
+            super::canonicalize_penalty_specs(&[spec], &[1], 3, "under-declared block")
+                .expect("a rank-one block canonicalizes");
+        assert_eq!(
+            active[0].nullity, 2,
+            "the spectrum keeps its two null directions"
+        );
+        assert_eq!(active[0].root.nrows(), 1);
+    }
+
+    /// Positive control for the refusal: a declaration the block cannot carry
+    /// at any spectrum. Four null directions on a three-column block is a
+    /// disagreement about dimension, not about arithmetic, so it is refused
+    /// with both numbers named and no tolerance consulted.
+    #[test]
+    fn a_declaration_wider_than_its_own_block_is_refused_naming_both_1561() {
+        let outcome = super::canonicalize_penalty_specs(
+            &[conditioned_affine_block()],
+            &[4],
+            3,
+            "over-declared block",
+        );
+        let Err(super::EstimationError::InvalidInput(reason)) = &outcome else {
+            panic!(
+                "a declaration above the block dimension must be refused, got {:?}",
+                outcome.as_ref().map(|(active, _)| active.len())
+            );
+        };
+        assert!(
+            reason.contains("dimension 3") && reason.contains("4 direction(s)"),
+            "the refusal must name both the block and the declaration: {reason}"
+        );
+    }
+
+    /// A block declared wholly null contributes nothing and is dropped, the
+    /// same outcome a numerically zero block already gets.
+    #[test]
+    fn a_block_declared_wholly_null_is_dropped_1561() {
+        let (active, active_nullspace) = super::canonicalize_penalty_specs(
+            &[conditioned_affine_block()],
+            &[3],
+            3,
+            "fully declared block",
+        )
+        .expect("a wholly declared block is a drop, not a refusal");
+        assert!(active.is_empty());
+        assert!(active_nullspace.is_empty());
     }
 }

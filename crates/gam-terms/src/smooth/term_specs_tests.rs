@@ -1656,3 +1656,125 @@ mod operator_chart_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod declared_joint_unpenalized_dim_tests {
+    use super::{
+        ActivePenalty, ActivePenaltyInfo, PenaltySource, declared_joint_unpenalized_dim,
+        joint_unpenalized_dim,
+    };
+    use ndarray::{Array2, array};
+
+    fn active_penalty(matrix: Array2<f64>, frame: Option<Array2<f64>>) -> ActivePenalty {
+        ActivePenalty {
+            matrix,
+            nullity: 0,
+            null_eigenvectors: None,
+            op: None,
+            info: ActivePenaltyInfo {
+                source: PenaltySource::Primary,
+                original_index: 0,
+                effective_rank: 0,
+                normalization_scale: 1.0,
+                kronecker_factors: None,
+                structural_null_frame: frame,
+                energy_factor: None,
+            },
+        }
+    }
+
+    /// The conditioning-ridge shape the Duchon builder ships, reduced to
+    /// arithmetic: a block whose third direction carries `√ε` relative to its
+    /// largest eigenvalue, which is what
+    /// `DUCHON_AFFINE_NATIVE_RIDGE_REL = 1.4901161193847656e-8` puts on the
+    /// affine slope columns so they stay in the effective null space while
+    /// remaining structurally non-zero.
+    fn conditioned_affine_penalty() -> Array2<f64> {
+        array![
+            [1.0, 0.0, 0.0],
+            [0.0, 0.5, 0.0],
+            [0.0, 0.0, f64::EPSILON.sqrt()],
+        ]
+    }
+
+    /// The declared frame for that block: the one direction the builder placed
+    /// the ridge on, as an orthonormal 3×1 basis.
+    fn affine_frame() -> Array2<f64> {
+        array![[0.0], [0.0], [1.0]]
+    }
+
+    /// Negative control, and the reason the declaration is needed: `√ε` is
+    /// seven orders above the spectrum's own rounding band, so the measurement
+    /// resolves the conditioned direction as penalized and reports a joint null
+    /// dimension of zero. Both readings agree here because there is nothing
+    /// declared to disagree with.
+    #[test]
+    fn an_undeclared_conditioning_ridge_reads_as_penalized_by_both_1561() {
+        let penalties = [active_penalty(conditioned_affine_penalty(), None)];
+        assert_eq!(joint_unpenalized_dim(3, &penalties), 0);
+        assert_eq!(declared_joint_unpenalized_dim(3, &penalties), 0);
+    }
+
+    /// gam#1561: with the frame declared, the same block reports the direction
+    /// as unpenalized. This is the number a term's EDF is then held above.
+    #[test]
+    fn a_declared_frame_is_read_where_the_spectrum_resolves_the_direction_1561() {
+        let penalties = [active_penalty(
+            conditioned_affine_penalty(),
+            Some(affine_frame()),
+        )];
+        assert_eq!(joint_unpenalized_dim(3, &penalties), 0);
+        assert_eq!(declared_joint_unpenalized_dim(3, &penalties), 1);
+    }
+
+    /// A frame with a different row count describes another block's
+    /// coordinates. Rotating it into this chart would be inventing a transform
+    /// nobody carried, so that penalty falls through to its measurement.
+    #[test]
+    fn a_frame_from_another_chart_is_not_used_1561() {
+        let penalties = [active_penalty(
+            conditioned_affine_penalty(),
+            Some(array![[0.0], [1.0]]),
+        )];
+        assert_eq!(declared_joint_unpenalized_dim(3, &penalties), 0);
+    }
+
+    /// With nothing declared the projector route answers exactly what the
+    /// penalty-sum route answers, on both shapes `joint_unpenalized_dim`'s own
+    /// tests pin: one penalty leaving two coordinates alone, and the #1360
+    /// complementary pair whose per-penalty null spaces are disjoint.
+    #[test]
+    fn the_projector_route_agrees_with_the_penalty_sum_where_nothing_is_declared() {
+        let single = [active_penalty(
+            array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 5.0]],
+            None,
+        )];
+        assert_eq!(declared_joint_unpenalized_dim(3, &single), 2);
+        assert_eq!(
+            declared_joint_unpenalized_dim(3, &single),
+            joint_unpenalized_dim(3, &single)
+        );
+
+        let complementary = [
+            active_penalty(
+                array![[0.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 4.0]],
+                None,
+            ),
+            active_penalty(
+                array![[4.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                None,
+            ),
+        ];
+        assert_eq!(declared_joint_unpenalized_dim(3, &complementary), 0);
+        assert_eq!(
+            declared_joint_unpenalized_dim(3, &complementary),
+            joint_unpenalized_dim(3, &complementary)
+        );
+    }
+
+    #[test]
+    fn a_term_with_no_penalty_is_wholly_unpenalized() {
+        assert_eq!(declared_joint_unpenalized_dim(4, &[]), 4);
+        assert_eq!(declared_joint_unpenalized_dim(0, &[]), 0);
+    }
+}

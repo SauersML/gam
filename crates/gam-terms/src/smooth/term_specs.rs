@@ -990,6 +990,57 @@ impl SmoothTerm {
     pub fn wald_unpenalized_dim(&self) -> usize {
         joint_unpenalized_dim(self.coeff_range.len(), &self.active_penalties)
     }
+
+    /// The same joint null dimension read from each penalty's DECLARED null
+    /// frame where its builder carried one, and from its spectrum only where
+    /// none exists (gam#1561).
+    ///
+    /// [`Self::wald_unpenalized_dim`] reads `null(Σ_k S_k)` off the stored
+    /// matrices. That is the right question to ask of a matrix and the wrong
+    /// one to ask of a seminorm whose builder deliberately conditioned it. The
+    /// Duchon builder places a ridge on its affine columns at
+    /// `DUCHON_AFFINE_NATIVE_RIDGE_REL = √ε` so that, in its own words, the
+    /// affine trend "stays in the effective null space while the slopes remain
+    /// structurally (non-zero) penalized". `√ε` is six orders above the
+    /// spectrum cutoff those directions are then read at, so the measurement
+    /// returns `0` for a term whose builder declared an affine null space, and
+    /// every consumer of the measurement — the Wald reference d.f., the EDF
+    /// floor — loses the floor it was supposed to get.
+    ///
+    /// # What is computed
+    ///
+    /// For each active penalty take an orthonormal basis `N_k` of its null
+    /// space: the declared [`ActivePenaltyInfo::structural_null_frame`] where
+    /// the builder carried one, the measured null eigenvectors otherwise. Each
+    /// `I − N_k N_kᵀ` is then the orthogonal projector onto that penalty's
+    /// range, and
+    ///
+    /// ```text
+    /// dim(∩_k null(S_k)) = p_local − rank(Σ_k (I − N_k N_kᵀ)).
+    /// ```
+    ///
+    /// because a vector is killed by every projector exactly when it lies in
+    /// every null space, and a sum of PSD matrices annihilates `v` only when
+    /// each term does. This is the identity `wald_unpenalized_dim` already uses,
+    /// with each `S_k` replaced by the projector onto the complement of its null
+    /// space.
+    ///
+    /// Replacing the penalties by projectors is what removes the scale
+    /// pathology rather than papering over it: `Σ_k S_k` has the builder's own
+    /// `√ε` sitting in its spectrum, so any cutoff must decide whether `√ε·‖S‖`
+    /// is a penalized direction, while a sum of orthogonal projectors has
+    /// eigenvalues in `[0, K]` that are exactly `0` on the intersection and at
+    /// least `1` off it. The rank is still read at
+    /// [`crate::basis::spectral_tolerance`], the crate's one penalty-spectrum
+    /// cutoff, so no new tolerance enters; it is simply asked of a spectrum
+    /// where the answer does not depend on it.
+    ///
+    /// With no declaration anywhere this returns exactly
+    /// `wald_unpenalized_dim`, up to the rank of one well-separated spectrum
+    /// agreeing with the rank of another.
+    pub fn declared_unpenalized_dim(&self) -> usize {
+        declared_joint_unpenalized_dim(self.coeff_range.len(), &self.active_penalties)
+    }
 }
 
 /// Numeric core of [`SmoothTerm::wald_unpenalized_dim`]: the dimension of the
@@ -1043,6 +1094,93 @@ pub(crate) fn joint_unpenalized_dim(p_local: usize, active_penalties: &[ActivePe
     // The joint null space is read at the crate's one penalty-spectrum rank
     // cutoff, so this dimension agrees with the ranks the term's penalties
     // carry everywhere else.
+    let tol = crate::basis::spectral_tolerance(&evals);
+    let rank = evals.iter().filter(|&&v| v > tol).count();
+    p_local.saturating_sub(rank)
+}
+
+/// Numeric core of [`SmoothTerm::declared_unpenalized_dim`]: the same
+/// intersection, read through each penalty's null-space PROJECTOR rather than
+/// through the penalty itself.
+///
+/// Each penalty contributes `I − N_k N_kᵀ` where `N_k` is an orthonormal basis
+/// of its null space, taken in this order:
+///
+/// 1. the declared `structural_null_frame`, which
+///    `ConstructiveQuadratic::with_structural_null_frame` has already checked is
+///    orthonormal against a band it derives from the frame itself, so `N N ᵀ` is
+///    the orthogonal projector with no further work;
+/// 2. the null eigenvectors the filter recorded, when the frame is absent or
+///    sits in a different chart than this term's;
+/// 3. the penalty's own spectrum, eigendecomposed here, when neither is
+///    recorded. A penalty reaching branch 3 contributes exactly what it
+///    contributes to [`joint_unpenalized_dim`], so a term with no declarations
+///    at all gets the measured answer.
+///
+/// The frame is used only when it spans this term's chart
+/// (`nrows() == p_local`). A frame in another chart describes another block's
+/// coordinates, and rotating it here would be inventing a transform nobody
+/// carried; that penalty falls through to its measurement instead.
+pub(crate) fn declared_joint_unpenalized_dim(
+    p_local: usize,
+    active_penalties: &[ActivePenalty],
+) -> usize {
+    use gam_linalg::faer_ndarray::FaerEigh;
+    if p_local == 0 {
+        return 0;
+    }
+    if active_penalties.is_empty() {
+        // No penalty ⇒ a wholly unpenalized (fixed-effect) block.
+        return p_local;
+    }
+    let mut range_total = Array2::<f64>::zeros((p_local, p_local));
+    for penalty in active_penalties {
+        let in_chart = |basis: &&Array2<f64>| basis.nrows() == p_local && basis.ncols() <= p_local;
+        let recorded = penalty
+            .info
+            .structural_null_frame
+            .as_ref()
+            .filter(in_chart)
+            .or_else(|| penalty.null_eigenvectors.as_ref().filter(in_chart));
+        let null_basis = match recorded {
+            Some(basis) => basis.clone(),
+            None => {
+                let s = &penalty.matrix;
+                assert_eq!(
+                    s.dim(),
+                    (p_local, p_local),
+                    "active penalty {:?} is {}×{} on a {p_local}-coefficient term",
+                    penalty.info.source,
+                    s.nrows(),
+                    s.ncols(),
+                );
+                let symmetric = {
+                    let transpose = s.t().to_owned();
+                    (s + &transpose) * 0.5
+                };
+                let (evals, evecs) = symmetric
+                    .eigh(faer::Side::Lower)
+                    .expect("symmetric eigendecomposition of a certified PSD penalty");
+                let tol = crate::basis::spectral_tolerance(&evals);
+                let columns: Vec<usize> = (0..p_local).filter(|&i| evals[i] <= tol).collect();
+                let mut basis = Array2::<f64>::zeros((p_local, columns.len()));
+                for (slot, &column) in columns.iter().enumerate() {
+                    basis.column_mut(slot).assign(&evecs.column(column));
+                }
+                basis
+            }
+        };
+        // `I − N Nᵀ`: the orthogonal projector onto this penalty's range. Its
+        // eigenvalues are exactly 0 on the penalty's null space and exactly 1
+        // off it, so the sum below separates the intersection from everything
+        // else by a full unit rather than by the penalty's own scale.
+        let mut projector = Array2::<f64>::eye(p_local);
+        projector -= &null_basis.dot(&null_basis.t());
+        range_total += &projector;
+    }
+    let (evals, _) = range_total
+        .eigh(faer::Side::Lower)
+        .expect("symmetric eigendecomposition of a sum of orthogonal projectors");
     let tol = crate::basis::spectral_tolerance(&evals);
     let rank = evals.iter().filter(|&&v| v > tol).count();
     p_local.saturating_sub(rank)

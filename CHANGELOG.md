@@ -112,6 +112,34 @@
   the cap is the budget), and the wiggle loop carries its own stop: two consecutive passes whose residual did not
   fall below the previous pass's — the discarded-history pass and then the scalar relaxed step — end the loop
   with the existing non-contraction refusal instead of running an unbounded budget.
+- **A basis builder's declared null space was dropped at the canonicalization, so a seminorm that
+  ships a conditioning ridge had the ridge's verdict taken for its own** (gam#1561, gam#3023). The
+  Duchon builder places a ridge on its affine slope columns at
+  `DUCHON_AFFINE_NATIVE_RIDGE_REL = 1.4901161193847656e-8`, bit-exactly `√ε`, so that the affine
+  trend "stays in the EFFECTIVE NULL SPACE while the slopes remain structurally (non-zero)
+  penalized". `√ε` is seven orders above the eigensolver's own band, so
+  `canonicalize_penalty_spec` resolved that direction as penalized while the design's
+  `nullspace_dims` travelled past it untouched into `active_nullspace`. The cost is not a rank
+  gap -- `PenaltyFrameAudit`'s `e_rows == penalty_logdet_rank` identity holds throughout -- but a
+  ramp: `log|S|₊` charges the direction from the first unit of ρ while `½log|H|` cannot answer
+  until `λ·s_min` overtakes the data curvature, `ln(1/√ε) = 26·ln 2 ≈ 18` units of ρ later, over
+  which the criterion carries a `−½` per unit slope with no interior optimum and λ climbs. That is
+  how `duchon_capacity` reports 1.518 effective df out of `k = 20` and `tensor_edf_collapse` 1.991
+  against mgcv's 6.441. `canonicalize_penalty_spec_declared` now applies
+  `rank = resolved.min(block_dim − declared)`, which is not a new rule but the one
+  `gam_problem::structural_penalty_root` has applied on the custom-family route since #2954, in
+  the same direction and for the reason its doc derives: a declaration only ever REMOVES
+  directions. A block that resolves MORE null space than it declares keeps the spectrum's answer,
+  because losing rank beyond a structural declaration is something the DATA can do (a collinear
+  covariate, an unobserved factor level) and telling that apart from a formation error needs a
+  band no producer carries yet; a declaration above the block's own dimension is refused with both
+  numbers named. `SmoothTerm::declared_unpenalized_dim` reads the same intersection through each
+  penalty's declared frame where one exists, as a sum of orthogonal projectors whose spectrum is
+  `0` on the intersection and at least `1` off it rather than one carrying the builder's `√ε`, and
+  `gam_solve::estimate::term_edf_below_declared_null` is the acceptance those two feed: a term's
+  EDF is `p_local − tr(H⁻¹ S_term(λ))` and `rank(S_term(λ)) = p_local − m`, so under the `H ⪰ λ_k
+  S̃_k` certificate each block already publishes, `edf_term ≥ m` with no tolerance on either side.
+  It is the per-term form of the `[mp, p]` floor the bundle already applies to `edf_total`.
 
 - **A penalty's structural rank was read off its SQUARED Gram, which resolves half the digits its
   energy factor does, so a rank frozen at one κ could not be realized at another and every trial

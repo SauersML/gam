@@ -2245,25 +2245,76 @@ pub fn filter_penalty_candidates(
                 normalization_scale,
             });
         } else {
-            let null_basis = nullspace_basis_from_block(&analysis);
+            // A builder that carried a structural null frame has DECLARED its
+            // seminorm's null space as a theorem, and that declaration outranks
+            // a rank test on a matrix the same builder deliberately conditioned
+            // (gam#1561). The Duchon builder places a `√ε`-relative ridge on
+            // its affine slope columns so the affine trend "stays in the
+            // EFFECTIVE NULL SPACE while the slopes remain structurally
+            // (non-zero) penalized"; `√ε` is seven orders above the band
+            // `analysis.nullity` was counted at, so without this the record
+            // leaves here saying the direction is penalized and every
+            // consumer of `nullity` -- `nullspace_dims`, and through it
+            // `canonicalize_penalty_spec_declared` and `log|S|₊` -- believes
+            // it. `spectral_tolerance_for_dim`'s own doc reaches the same
+            // conclusion from the other side: a nullity the decomposition's
+            // error swallows "must be DECLARED by the basis that knows its
+            // polynomial null space (gam#3023), not read off a spectrum".
+            //
+            // A declaration only ever REMOVES directions, the direction
+            // `gam_problem::structural_penalty_root` already resolves the same
+            // way on the custom-family route: a block that resolves MORE null
+            // space than it declares keeps the spectrum's answer, because
+            // losing rank beyond a structural declaration is something the
+            // DATA can do and telling that apart from a formation error needs
+            // a band no producer carries yet.
+            let declared_null_dim = structural_null_frame
+                .as_ref()
+                .filter(|frame| frame.nrows() == analysis.sym_penalty.nrows())
+                .map_or(analysis.nullity, |frame| frame.ncols());
+            let removed = declared_null_dim.saturating_sub(analysis.nullity);
+            if removed >= analysis.rank {
+                crate::bail_invalid_basis!(
+                    "penalty block source={source:?} original_index={original_index} declares \
+                     {declared_null_dim} null direction(s) on a {}-column block whose spectrum \
+                     resolves {} penalized and {} null; honouring the declaration would leave \
+                     nothing penalized, so the frame and the operator disagree about which \
+                     object this is",
+                    analysis.sym_penalty.nrows(),
+                    analysis.rank,
+                    analysis.nullity
+                );
+            }
+            let rank = analysis.rank - removed;
+            let nullity = analysis.nullity + removed;
+            // The declared frame IS the null basis when the declaration is what
+            // was honoured: it is orthonormal by `with_structural_null_frame`'s
+            // own check and spans exactly the `nullity` directions now counted.
+            let null_basis = if removed == 0 {
+                nullspace_basis_from_block(&analysis)
+            } else {
+                structural_null_frame.clone()
+            };
             log::trace!(
-                "Retained penalty block source={:?} original_index={} rank={} nullity={} has_op={} has_null_basis={}",
+                "Retained penalty block source={:?} original_index={} rank={} \
+                 nullity={} declared={} has_op={} has_null_basis={}",
                 source,
                 original_index,
-                analysis.rank,
-                analysis.nullity,
+                rank,
+                nullity,
+                declared_null_dim,
                 analysis.op.is_some(),
                 null_basis.is_some(),
             );
             active.push(ActivePenalty {
                 matrix: analysis.sym_penalty,
-                nullity: analysis.nullity,
+                nullity,
                 null_eigenvectors: null_basis,
                 op: analysis.op,
                 info: ActivePenaltyInfo {
                     source,
                     original_index,
-                    effective_rank: analysis.rank,
+                    effective_rank: rank,
                     normalization_scale,
                     kronecker_factors,
                     structural_null_frame,
