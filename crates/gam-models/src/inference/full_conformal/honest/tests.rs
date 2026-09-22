@@ -611,3 +611,68 @@ fn full_conformal_coverage_heteroscedastic_n50() {
 fn full_conformal_coverage_heteroscedastic_n200() {
     coverage_cell(Scenario::Heteroscedastic, 2, 200, 2);
 }
+
+/// #3338. A comparison whose enclosure is strictly positive at one end of the
+/// cell and strictly negative at the other has its crossing inside the cell,
+/// and `certified_sign_change` returns that crossing.
+///
+/// The fixture is dyadic end to end — the line `s − ¼` over `[−1, 1]`, whose
+/// endpoint values `−1¼` and `¾` and interpolation `−1 + 2·0.625` are all exact
+/// in binary — so the returned root is the crossing bit for bit and the
+/// assertion needs no band.
+#[test]
+fn a_certified_sign_change_is_returned_at_the_crossing_3338() {
+    let line = Affine::exact(-0.25, 1.0);
+    let (s1, s2) = (-1.0_f64, 1.0_f64);
+    let root = certified_sign_change(&line, 0.1, 0.0, s1, s2)
+        .expect("an enclosure that is negative at one end and positive at the other crosses");
+    assert_eq!(root.to_bits(), 0.25_f64.to_bits());
+    assert!(
+        root > s1 && root < s2,
+        "a returned split must be strictly interior, or it partitions nothing: {root}"
+    );
+    assert_eq!(line.value(root).to_bits(), 0.0_f64.to_bits());
+}
+
+/// #3338. Where the enclosure's own certified width reaches across an endpoint,
+/// this cell has not established that the comparison changes sign in it, and the
+/// rule declines rather than guessing a crossing. A same-signed enclosure
+/// declines for the same reason.
+#[test]
+fn an_uncertified_crossing_returns_no_split_3338() {
+    let line = Affine::exact(-0.25, 1.0);
+    // `value(1) = 0.75` and the certified half-width is `0.8`: the enclosure
+    // still contains zero at that end, so nothing is established.
+    assert!(certified_sign_change(&line, 0.8, 0.0, -1.0, 1.0).is_none());
+    // The evaluation's own rounding enters the same width, so a growth large
+    // enough to cover the endpoint declines too.
+    assert!(certified_sign_change(&line, 0.0, 0.7, -1.0, 1.0).is_none());
+    // No crossing at all: both ends are strictly positive.
+    let rising = Affine::exact(2.0, 1.0);
+    assert!(certified_sign_change(&rising, 0.1, 0.0, -1.0, 1.0).is_none());
+}
+
+/// #3338. What the certified split buys, as arithmetic rather than as a
+/// hypothesis. A midpoint descent reaches a crossing only by halving down to
+/// the crossing's own resolution, which takes `log2(width / ulp(root))` cells —
+/// the mantissa's 52 bits plus the cell's width in octaves — and each level
+/// pays for the sibling next to the breakpoint as well. That is the
+/// "about 40 halvings per breakpoint" the issue reads off the 1,000-2,100
+/// cells a row examines. The certified split reaches the same point once.
+#[test]
+fn the_midpoint_descent_spends_one_cell_per_mantissa_bit_3338() {
+    let line = Affine::exact(-0.25, 1.0);
+    let (s1, s2) = (-1.0_f64, 1.0_f64);
+    let root = certified_sign_change(&line, 0.1, 0.0, s1, s2).expect("a certified crossing");
+    let ulp = root.next_up() - root;
+    let halvings = ((s2 - s1) / ulp).log2();
+    assert_eq!(
+        halvings,
+        (f64::MANTISSA_DIGITS - 1) as f64 + ((s2 - s1) / root.abs()).log2(),
+        "the depth of a midpoint descent is the mantissa plus the cell's width in octaves"
+    );
+    assert!(
+        halvings > (f64::MANTISSA_DIGITS - 1) as f64,
+        "reaching this crossing by halving costs more than a mantissa of cells, got {halvings}"
+    );
+}

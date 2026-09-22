@@ -219,6 +219,20 @@
   added to the criterion moves it by exactly minus that constant while no normalized weight
   moves at all, and three nodes per axis publish the same number as five — #4556's own rule
   that no sweep's width may move a score, in the new quantity's terms.
+- **An undecided full-conformal cell is split at the comparison's certified sign change**
+  (gam#3338). The honest row's `z` branch-and-bound always bisected an undecided cell at its
+  midpoint, so a breakpoint was reached only by halving down to its own resolution —
+  `log2(width / ulp(root))` cells, the mantissa's 52 bits plus the cell's width in octaves,
+  with a sibling paid for at every level. That is the 1,000-2,100 cells per row the issue
+  measured at 35-121 ms, on every production prediction row certified `honest_refit`. The
+  rank comparison's sign is the sign of `m·p` with `m` and `p` affine in the chart
+  variable, so it changes sign exactly where one of them crosses zero, and
+  `certified_sign_change` returns that crossing when the cell's own enclosure establishes it:
+  the whole interval `value(s) ± (radius + rounding)` strictly negative at one end of the
+  cell and strictly positive at the other. The split takes the certified crossing nearest the
+  midpoint, and the midpoint where no comparison certifies one. The set is unchanged by
+  construction — both children re-derive their tube from their own bounds and their union is
+  the parent — so only `HonestConformalCost::z_cells` moves.
 
 ## gamfit 0.1.269 (2026-09-21)
 

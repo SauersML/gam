@@ -946,6 +946,11 @@ struct BoxVerdict {
     /// range but leaves the width part, so no `z`-split alone can close the
     /// comparison; halving the box shrinks the width part.
     width_dominated: bool,
+    /// Where one of this box's open comparisons certainly changes sign inside
+    /// the cell, nearest the cell's midpoint ([`certified_sign_change`],
+    /// gam#3338). `None` when no open comparison certifies a crossing, which is
+    /// what a cell that is undecided through its `δ`-width alone looks like.
+    split: Option<f64>,
 }
 
 impl BoxVerdict {
@@ -1003,6 +1008,52 @@ fn disagreement(boxes: &[BoxVerdict]) -> bool {
     member && non_member
 }
 
+/// Where an affine comparison certainly changes sign inside `[s1, s2]`, or
+/// `None` when this cell's own enclosure does not establish that it does
+/// (gam#3338).
+///
+/// `value` is the enclosure's CENTRE — `m = e_i − e_*` or `p = e_i + e_*`,
+/// affine in the chart variable — and `radius` the certified half-width the
+/// box's `δ` leaves around it, to which evaluating the centre adds its own
+/// rounding `γ·Σ|coefficients|`. The enclosure over the cell is therefore
+/// `value(s) ± width`, and it establishes a sign change exactly when that whole
+/// interval is strictly positive at one end of the cell and strictly negative at
+/// the other: no `δ` the box admits and no rounding of this evaluation can move
+/// the crossing outside `(s1, s2)`.
+///
+/// Where it does, the crossing of the centre line is the point the descent is
+/// bisecting TOWARD. Returning it is a statement about the work and not about
+/// the answer: the caller splits the cell there instead of at its midpoint, and
+/// every child re-derives its own tube over its own bounds, so the union of the
+/// children is the cell whatever point is chosen. Midpoint bisection reaches the
+/// same crossing in `log2(width / ε)` halvings — about forty at this chart's
+/// scale — and each halving pays for the sibling cell as well.
+///
+/// The root is formed by interpolating between the endpoint values rather than
+/// as `−c₀/c₁`, so a certified bracket returns a point in `[s1, s2]` by
+/// construction; the caller still refuses a point that is not strictly interior
+/// in `f64`, which is the same floor its midpoint arm has.
+fn certified_sign_change(
+    value: &Affine,
+    radius: f64,
+    growth: f64,
+    s1: f64,
+    s2: f64,
+) -> Option<f64> {
+    let width = radius + growth * value.magnitude();
+    let (v1, v2) = (value.value(s1), value.value(s2));
+    let crosses = (v1 + width < 0.0 && v2 - width > 0.0) || (v1 - width > 0.0 && v2 + width < 0.0);
+    if !crosses {
+        return None;
+    }
+    let denominator = v1 - v2;
+    if !(denominator.is_finite() && denominator != 0.0) {
+        return None;
+    }
+    let root = s1 + (s2 - s1) * (v1 / denominator);
+    root.is_finite().then_some(root)
+}
+
 /// How one comparison `|e_i| ≥ |e_*|` resolves over a cell and one ρ-box.
 #[derive(Clone, Copy)]
 enum Comparison {
@@ -1058,6 +1109,8 @@ fn box_verdicts(
         let mut uncertain = [0usize; 3];
         let mut resolvable = 0usize;
         let mut width_dominated = false;
+        let cell_mid = 0.5 * (s1 + s2);
+        let mut split: Option<f64> = None;
         for i in 0..n {
             let mut row = data.rows[i];
             let (mut width_m, mut width_p) = (0.0, 0.0);
@@ -1097,6 +1150,25 @@ fn box_verdicts(
             if !blurred && matches!(compare(lo - remainder, hi + remainder, 0.0), Comparison::Uncertain) {
                 resolvable += 1;
                 width_dominated |= width_part > hi - lo;
+                // `m·p` is open over this cell, so the comparison's sign changes
+                // inside it. Where one of the two factors certifies WHERE, that
+                // point is what the descent is heading for (gam#3338). The one
+                // nearest the cell's midpoint is kept: it divides the cell's
+                // remaining crossings most evenly between the two children,
+                // which is the only thing the choice decides.
+                for (factor, radius) in [(&m, rad_m), (&p, rad_p)] {
+                    let Some(root) = certified_sign_change(factor, radius, growth, s1, s2) else {
+                        continue;
+                    };
+                    if !(root > s1 && root < s2) {
+                        continue;
+                    }
+                    let nearer = split
+                        .is_none_or(|best: f64| (root - cell_mid).abs() < (best - cell_mid).abs());
+                    if nearer {
+                        split = Some(root);
+                    }
+                }
             }
         }
         let decide = |slot: usize| {
@@ -1115,6 +1187,7 @@ fn box_verdicts(
             centre: decide(2),
             resolution_limited: exact.is_none() && resolvable == 0,
             width_dominated,
+            split,
         });
     }
     out
@@ -1386,15 +1459,42 @@ fn branch_and_bound(
             Verdict::Undecided { .. } if !(mid > cell.s1 && mid < cell.s2) => true,
             Verdict::Undecided { .. } => {
                 // The cell straddles a breakpoint, or its candidates disagree:
-                // bisect it, and bisect the disagreeing boxes so the tube
-                // follows the halves.
+                // split it, and bisect the disagreeing boxes so the tube follows
+                // the parts.
+                //
+                // WHERE to split is decided by the cell's own certified widths
+                // (gam#3338). An open comparison whose enclosure is strictly
+                // positive at one end of the cell and strictly negative at the
+                // other has its crossing inside, at a point the centre line
+                // gives in closed form, and that crossing is exactly what
+                // repeated halving is converging to — `log2(width / ε)` cells
+                // deep, with a sibling paid for at every level. Splitting there
+                // puts the breakpoint on a child's boundary, so both children
+                // are decided rather than halved again. Where no comparison
+                // certifies a crossing — the cell is open through the boxes'
+                // `δ`-width, not through a breakpoint — the midpoint is the
+                // split, which is the guaranteed-progress arm and the only one
+                // that ran before. Both arms partition the same cell and every
+                // child re-derives its own tube from its own bounds, so this
+                // decides the work and not the answer.
+                let split = verdicts
+                    .iter()
+                    .filter_map(|v| v.split)
+                    .filter(|&root| root > cell.s1 && root < cell.s2)
+                    .fold(mid, |best, root| {
+                        if (root - mid).abs() < (best - mid).abs() {
+                            root
+                        } else {
+                            best
+                        }
+                    });
                 let disagree = disagreement(&verdicts);
                 let flagged: Vec<bool> = verdicts
                     .iter()
                     .zip(&box_ties)
                     .map(|(v, &tie)| disagree && !tie && v.exact.is_some())
                     .collect();
-                for (a, b) in [(cell.s1, mid), (mid, cell.s2)] {
+                for (a, b) in [(cell.s1, split), (split, cell.s2)] {
                     let mut seeds = cell.seeds.clone();
                     let tube = split_and_prune(basis, data, a, b, &tube, &flagged, &mut seeds);
                     stack.push(Cell {
