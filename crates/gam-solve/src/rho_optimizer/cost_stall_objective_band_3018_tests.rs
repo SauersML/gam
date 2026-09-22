@@ -112,6 +112,7 @@ fn resolution_3018(value: f64, inner_residual: Option<f64>) -> f64 {
 
 fn evidence_3018(inner_residual: f64) -> CertificateEvidence {
     CertificateEvidence {
+        quadrature: None,
         inner_residual: Some(InnerResidualCharge {
             energy: inner_residual,
             source: InnerResidualSource::InnerGradient,
@@ -176,6 +177,7 @@ fn objective_band_is_formed_from_the_evaluations_own_evidence_3018() {
         inner_residual_energy: Some(1.0e-9),
     };
     let with_criterion = CertificateEvidence {
+        quadrature: None,
         criterion: Some(criterion),
         ..evidence_3018(1.0e-9)
     };
@@ -185,6 +187,7 @@ fn objective_band_is_formed_from_the_evaluations_own_evidence_3018() {
         "a log|H| channel whose factor derives no forward error is charged nothing"
     );
     let with_factor = CertificateEvidence {
+        quadrature: None,
         inner_factor: Some(InnerFactorCondition {
             logdet_forward_error: 4.0e-12,
         }),

@@ -1146,6 +1146,7 @@ fn config_2269() -> OuterConfig {
 /// The score's rounding band `ε` (Theorem 9) at a sub-resolution residual.
 fn score_rounding_band_2269() -> f64 {
     let evidence = crate::estimate::outer_eval_capture::CertificateEvidence {
+        quadrature: None,
         parts: vec![score_parts_2269(0.0)],
         ..Default::default()
     };

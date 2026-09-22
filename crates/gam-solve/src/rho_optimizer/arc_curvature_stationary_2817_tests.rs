@@ -677,6 +677,7 @@ fn published_evidence_2954(
 ) -> crate::estimate::outer_eval_capture::CertificateEvidence {
     use crate::estimate::outer_eval_capture as capture;
     capture::CertificateEvidence {
+        quadrature: None,
         parts: vec![capture::RhoGradientParts {
             index: 0,
             lambda: 0.5f64.exp(),
@@ -1984,6 +1985,7 @@ fn the_online_stop_decides_on_both_arms_of_the_one_resolution_3286() {
     let config = claim_band_config_2817(CLAIM_BAND_2817);
     let stop = |inner_residual: f64, gradient: f64| {
         let evidence = capture::CertificateEvidence {
+            quadrature: None,
             inner_residual: Some(capture::InnerResidualCharge {
                 energy: inner_residual,
                 source: capture::InnerResidualSource::InnerGradient,

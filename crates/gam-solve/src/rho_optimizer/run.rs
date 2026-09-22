@@ -4444,7 +4444,8 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         log::debug!(
             "[CERTIFICATE] {context}: Newton-decrement verdict {verdict:?} (tolerance \
              {:.3e} = max(τ_stat {:.3e} − band_f, band_f), arithmetic-limited {}; band_f = \
-             channels {:.3e} + factor {:.3e} + inner residual {:.3e}); face {:?}, released \
+             channels {:.3e} + factor {:.3e} + inner residual {:.3e} + quadrature {:.3e}); \
+             face {:?}, released \
              {:?}; bound {bound:.3e} (rung {}) replaces {stationarity_bound:.3e} (rung {}) at \
              |Pg|={projected_grad_norm:.3e} (#2954)",
             decision.tolerance.value(),
@@ -4453,6 +4454,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             decision.objective_band.channels,
             decision.objective_band.factor,
             decision.objective_band.inner_residual,
+            decision.objective_band.quadrature,
             decision.face,
             decision.released,
             source.label(),

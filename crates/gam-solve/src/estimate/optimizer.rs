@@ -2469,7 +2469,17 @@ where
                 if mixture_dim == 0
                     && sas_dim == 0
                     && reml_state.block_correction_admission_deferred()
-                    && reml_state.decide_block_correction_admission(&final_rho)?
+                    && reml_state.decide_block_correction_admission(
+                        &final_rho,
+                        // The certificate's own value resolution at the point the
+                        // admission is decided: the correction's Gauss–Hermite
+                        // order target (#3004).
+                        outer_result
+                            .criterion_certificate
+                            .as_ref()
+                            .and_then(|certificate| certificate.criterion_error)
+                            .map(|error| error.value_band),
+                    )?
                 {
                     // The corrected search continues from that optimum, its one
                     // start (#1082).
@@ -2552,7 +2562,16 @@ where
                 .as_ref()
                 .is_some_and(|certificate| certificate.certifies())
             && reml_state.block_correction_admission_deferred()
-            && reml_state.decide_block_correction_admission(&final_rho)?
+            && reml_state.decide_block_correction_admission(
+                &final_rho,
+                // As above: the order target is the band the certificate at this
+                // point judges the criterion against (#3004).
+                outer_result
+                    .criterion_certificate
+                    .as_ref()
+                    .and_then(|certificate| certificate.criterion_error)
+                    .map(|error| error.value_band),
+            )?
         {
             // The corrected search continues from that optimum, its one start
             // (#1082).

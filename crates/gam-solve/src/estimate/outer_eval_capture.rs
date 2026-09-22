@@ -559,6 +559,29 @@ pub struct CertificateEvidence {
     /// The error `V` carries because its inner mode stops at a residual rather
     /// than at the exact mode. `None` when the evaluation could form no residual.
     pub inner_residual: Option<InnerResidualCharge>,
+    /// The error `V` carries from the #784 block-local Gauss--Hermite
+    /// correction spliced into it. `None` when no correction is spliced, which
+    /// is an exact zero and not a missing term (#3004).
+    pub quadrature: Option<QuadratureCharge>,
+}
+
+/// The #784 block-local quadrature's error in an evaluation's value (#3004).
+///
+/// `Δ_b` is integrated by a latched Gauss--Hermite rule per axis, and `error`
+/// is the bound that rule's own paired difference with the next lower rule
+/// certified at admission, summed over the separately integrated pieces because
+/// their errors add in `Δ_b`. The criterion carries `−Δ_b`, so this is `V`'s
+/// error in `V`'s own units and adds to `band_f` like any other term.
+///
+/// It is published on EVERY evaluation whose splice engages, not only on audited
+/// ones: the certificate's band must exist wherever the correction does. Once
+/// the order target is the certificate's own value resolution (#3004 L3), this
+/// term is the same size as the rest of `band_f`, and a certificate that ignores
+/// an error of its own size is not a certificate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuadratureCharge {
+    /// The latched rules' certified paired-rule error on `Δ_b`.
+    pub error: f64,
 }
 
 /// The inner-mode error an evaluation's value carries (#2954): `E_r = ½·rᵀH_β⁻¹r`
@@ -634,6 +657,22 @@ pub(crate) fn record_certificate_inner_factor(factor: InnerFactorCondition) {
     CERTIFICATE_EVIDENCE.with(|slot| {
         if let Some(state) = slot.borrow_mut().as_mut() {
             state.inner_factor = Some(factor);
+        }
+    });
+}
+
+/// Publish the #784 block-local quadrature's error to an armed capture (no-op
+/// when disarmed) (#3004).
+///
+/// Called from the one seam every spliced evaluation passes through, fresh or
+/// cached, so an engaged correction cannot reach the certificate with its error
+/// missing. That is a structural guarantee and not a default: a route that
+/// splices nothing publishes nothing, and `outer_objective_band` charges zero,
+/// which is the exact error of an absent correction.
+pub(crate) fn record_certificate_quadrature(charge: QuadratureCharge) {
+    CERTIFICATE_EVIDENCE.with(|slot| {
+        if let Some(state) = slot.borrow_mut().as_mut() {
+            state.quadrature = Some(charge);
         }
     });
 }

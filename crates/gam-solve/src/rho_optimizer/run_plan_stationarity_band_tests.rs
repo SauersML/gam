@@ -466,6 +466,7 @@ fn evidence_2954(
     coordinates: &[(usize, f64, f64, f64)],
 ) -> crate::estimate::outer_eval_capture::CertificateEvidence {
     crate::estimate::outer_eval_capture::CertificateEvidence {
+        quadrature: None,
         parts: coordinates
             .iter()
             .enumerate()

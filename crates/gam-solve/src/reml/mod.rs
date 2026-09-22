@@ -1301,7 +1301,7 @@ mod tests {
         let before = solves();
         assert!(
             !state
-                .decide_block_correction_admission(&rho)
+                .decide_block_correction_admission(&rho, None)
                 .expect("decision"),
             "the correction never applies to a Gaussian-identity fit"
         );
@@ -5258,6 +5258,13 @@ pub(crate) struct BlockLocalCorrectionCache {
     /// where the splice ran. `None` when the splice declined or when the audit
     /// was disarmed (the production case, which allocates nothing).
     pub(crate) audit: Option<crate::estimate::outer_eval_capture::QuadratureMarginalAudit>,
+    /// The certified paired-rule error of the quadrature `terms` was integrated
+    /// with, in `V`'s own units, so a later assemble at this ρ that reads the
+    /// cache publishes the same `band_f` term the computing one did (#3004).
+    /// `0.0` when the splice declined. Unlike `audit` this is carried whether or
+    /// not the ρ-block audit is armed: the certificate's band must exist wherever
+    /// the correction does.
+    pub(crate) quadrature_error: f64,
 }
 
 /// The penalty components the criterion APPLIES, `S̃_k = Π S_k Π`, for an inner
@@ -6075,6 +6082,19 @@ pub(crate) struct RemlState<'a> {
     /// the value, gradient and moments, are one measure at every ρ. Whether the
     /// block is integrated axis by axis is latched with them, for the same reason.
     pub(crate) block_correction_axis_orders: std::sync::Mutex<Option<BlockQuadratureLatch>>,
+    /// The certificate's own value resolution `band_f` at the ρ where the
+    /// correction's admission is decided (#3004): the error the evaluated `V`
+    /// already carries there, from its channels, its inner factor and its inner
+    /// mode's residual.
+    ///
+    /// It is the ORDER TARGET. The quadrature exists to remove a term of the
+    /// criterion, and the criterion is read only through a certificate that
+    /// cannot distinguish two values closer than `band_f`, so a rule resolving
+    /// `Δ_b` below `band_f` buys no decision anywhere. `None` until the
+    /// admission supplies it, and a correction that reaches its order search
+    /// without one DECLINES: its own error would then be charged into `band_f`
+    /// against a target nothing derived.
+    pub(crate) block_correction_value_band: std::sync::Mutex<Option<f64>>,
     /// Adaptive IFT step-cap controller, the hypergradient budget controller,
     /// and the two mode-response caches.
     ///

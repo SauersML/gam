@@ -211,6 +211,29 @@
   schema and law came from different models. `_EventHistoryPredictor` in `gamfit._rust` loads one
   and serves `forecast_history` and `population_forecast` holding no cohort at all;
   `_EventHistoryModel.save()` writes one.
+- **The #784 block-local correction was resolved five decades below anything that reads the
+  criterion, and the certificate did not charge its error** (gam#3004). The Gauss-Hermite
+  order search raised each axis until its paired-rule difference cleared
+  `min(|Delta_b|, 1/n_eff^2)`, the next-order remainder of the Laplace expansion the
+  correction removes the `O(1/n_eff)` term of. That is a statistical accuracy target, and
+  nothing reads the criterion statistically: every consumer -- the decrement verdict, the
+  two-value comparison the cost-stall guard makes, the stationarity bound -- reads it through
+  a certificate that cannot distinguish two values closer than `band_f`. On the measured
+  n = 10 000 binomial probit fit the search drove the paired error to `7.2e-10` against a
+  `band_f` of `1.429e-3`, and paid for it in nodes: the correction is about 95% of every
+  outer evaluation once it engages, 137 s of a 187 s fit. The order target is now the
+  certificate's own value resolution at the rho where the admission is decided, passed in
+  from the certified optimum's `CriterionErrorBound::value_band`, so the rule resolves what
+  the fit can act on and no finer. Because that target is only sound if the certificate
+  charges the quadrature's own error first, `ObjectiveBand` gains a fourth term and
+  `band_f = channels + factor + inner residual + quadrature`: the latched rules' certified
+  paired error is published on every spliced evaluation -- fresh or served from the
+  per-bundle cache, through the one seam both pass -- and is zero exactly where no
+  correction is spliced. A looser rule therefore widens the band it is judged against and
+  the decrement tolerance tightens with it, which is what keeps the new target from being a
+  licence. A correction that reaches its order search with no certified value band declines
+  instead of choosing a target, returning the exact Laplace criterion; the production
+  route always defers its admission to a certified optimum, so it always carries one.
 
 - **A memory-budget refusal names the reservation that refused it** (#4565). The governor's
   ledger is process-wide, so `MemoryReservationError::BudgetExceeded` reported how many bytes

@@ -115,15 +115,26 @@ impl<'a> RemlState<'a> {
         n_ext: usize,
         want_hessian: bool,
     ) -> Result<TkCorrectionTerms, EstimationError> {
+        // This is the ONE seam every spliced evaluation passes through, fresh or
+        // cached, so it is where the quadrature's certified error is published to
+        // the certificate (#3004). Publishing at the computing site instead would
+        // leave the second and third assembles at one ρ — which share the bundle
+        // and hit the cache — with no quadrature term in their `band_f`, exactly
+        // the way the audit record went missing before #2623.
+        let publish = |quadrature_error: f64| {
+            crate::estimate::outer_eval_capture::record_certificate_quadrature(
+                crate::estimate::outer_eval_capture::QuadratureCharge {
+                    error: quadrature_error,
+                },
+            );
+        };
         // A deferred search prices the Laplace criterion, which is not this
         // bundle's correction once the admission is decided, so it is not cached.
         if self.block_correction_admission_deferred() {
-            return self.block_local_quadrature_correction_compute(
-                rho,
-                bundle,
-                n_ext,
-                want_hessian,
-            );
+            let (terms, quadrature_error) = self
+                .block_local_quadrature_correction_compute(rho, bundle, n_ext, want_hessian)?;
+            publish(quadrature_error);
+            return Ok(terms);
         }
         if let Some(entry) = bundle.block_local_correction.get(n_ext, want_hessian) {
             // Re-publish the audit record the computing call wrote: the window
@@ -133,10 +144,12 @@ impl<'a> RemlState<'a> {
             if let Some(record) = entry.audit {
                 crate::estimate::outer_eval_capture::record_quadrature_marginal(record);
             }
+            publish(entry.quadrature_error);
             return Ok((*entry.terms).clone());
         }
-        let terms =
+        let (terms, quadrature_error) =
             self.block_local_quadrature_correction_compute(rho, bundle, n_ext, want_hessian)?;
+        publish(quadrature_error);
         bundle
             .block_local_correction
             .store(super::BlockLocalCorrectionCache {
@@ -144,6 +157,7 @@ impl<'a> RemlState<'a> {
                 terms: std::sync::Arc::new(terms.clone()),
                 carries_hessian: want_hessian,
                 audit: crate::estimate::outer_eval_capture::last_quadrature_marginal_record(),
+                quadrature_error,
             });
         Ok(terms)
     }
@@ -192,6 +206,15 @@ impl<'a> RemlState<'a> {
     /// verdict and, when it engages, the order search that latches the block,
     /// exactly as a first admission does (#2748).
     ///
+    /// `certified_value_band` is the certificate's own value resolution at
+    /// `rho` — `band_f`, the error the evaluated `V` already carries there
+    /// ([`CriterionErrorBound::value_band`](crate::model_types::CriterionErrorBound)).
+    /// It is the ORDER TARGET the block's Gauss–Hermite rules are selected
+    /// against (#3004): resolving `Δ_b` finer than the value the certificate can
+    /// distinguish buys no decision, and the correction's own error is charged
+    /// into that same `band_f`. `None` where the search certified no value bound,
+    /// and the correction then declines rather than choosing a target itself.
+    ///
     /// Returns whether the correction was admitted. If it was, `rho` was
     /// certified under a criterion that is no longer the model's, and the caller
     /// continues the corrected search from it. A correction refused at `rho` is
@@ -200,6 +223,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn decide_block_correction_admission(
         &self,
         rho: &Array1<f64>,
+        certified_value_band: Option<f64>,
     ) -> Result<bool, EstimationError> {
         // A family the correction never applies to has its decision without an
         // evaluation: the verdict below would only reach the same decline, after
@@ -210,6 +234,11 @@ impl<'a> RemlState<'a> {
             *self.block_correction_decision_guard() = BlockCorrectionDecision::DeclinedAtOptimum;
             return Ok(false);
         }
+        *self
+            .block_correction_value_band
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            certified_value_band.filter(|band| band.is_finite() && *band > 0.0);
         *self.block_correction_decision_guard() = BlockCorrectionDecision::DecidingAtOptimum;
         // Every cached evaluation priced the Laplace criterion, and the decision
         // is taken at the terminal inner mode, not a capped screening one.
@@ -263,13 +292,20 @@ impl<'a> RemlState<'a> {
         None
     }
 
+    /// The correction's terms together with the CERTIFIED ERROR of the
+    /// quadrature that produced them, in `V`'s own units (#3004).
+    ///
+    /// The error travels with the value because the certificate charges it in
+    /// `band_f` beside the channel, factor and inner-residual terms. A declined
+    /// splice returns `0.0`, which is the exact error of a correction that was
+    /// not taken, not a missing measurement.
     fn block_local_quadrature_correction_compute(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
         n_ext: usize,
         want_hessian: bool,
-    ) -> Result<TkCorrectionTerms, EstimationError> {
+    ) -> Result<(TkCorrectionTerms, f64), EstimationError> {
         // #1521 trait-inversion: the #784 importance-sampling correction and its
         // eigen-diagnostic live UP in the gam-inference `hmc_io` tier; gam-solve
         // calls them through the neutral `gam_problem` sampler contract instead
@@ -291,16 +327,16 @@ impl<'a> RemlState<'a> {
             *self.block_correction_decision_guard(),
             BlockCorrectionDecision::DeferredToOptimum | BlockCorrectionDecision::DeclinedAtOptimum
         ) {
-            return Ok(zero());
+            return Ok((zero(), 0.0));
         }
 
         if let Some(reason) = self.block_correction_family_decline() {
             log::trace!("[#784] block-local fallback declined: {reason}");
-            return Ok(zero());
+            return Ok((zero(), 0.0));
         }
         // The mode and trace channels need one λ per canonical penalty.
         if rho.len() != n_rho || n_rho == 0 {
-            return Ok(zero());
+            return Ok((zero(), 0.0));
         }
 
         let pirls_result = bundle.pirls_result.as_ref();
@@ -312,7 +348,7 @@ impl<'a> RemlState<'a> {
         let x_design = &pirls_result.x_transformed;
         let p = h_total.nrows();
         if p == 0 || c_weights.len() != x_design.nrows() {
-            return Ok(zero());
+            return Ok((zero(), 0.0));
         }
 
         // The correction integrates over a dense copy of the design, which the
@@ -359,7 +395,7 @@ impl<'a> RemlState<'a> {
                  channels are not implemented; splicing a ψ-truncated gradient would \
                  desync objective and gradient (#901)"
             );
-            return Ok(zero());
+            return Ok((zero(), 0.0));
         }
 
         // Resolve the injected gam-inference corrector. When the inference tier
@@ -367,7 +403,7 @@ impl<'a> RemlState<'a> {
         // the same safe no-op as every other decline branch here.
         let Some(corrector) = gam_problem::laplace_sampler_contract::laplace_marginal_corrector()
         else {
-            return Ok(zero());
+            return Ok((zero(), 0.0));
         };
 
         // The eigensystem every step below reads: the block's directions `v_r`,
@@ -451,7 +487,7 @@ impl<'a> RemlState<'a> {
             .directional_cubic_diagnostic(&evals, &evecs, x_design, c_weights)
             .map_err(EstimationError::InvalidInput)?;
         if !max_abs.is_finite() || max_abs == 0.0 {
-            return Ok(zero());
+            return Ok((zero(), 0.0));
         }
 
         // Step 2: auto-derived, block-local activation. `n_eff` is the number of
@@ -479,7 +515,7 @@ impl<'a> RemlState<'a> {
                     verdict.threshold,
                 );
             }
-            return Ok(zero());
+            return Ok((zero(), 0.0));
         }
 
         // Build the block subspace V_b. At admission the block is the flagged
@@ -570,7 +606,7 @@ impl<'a> RemlState<'a> {
         };
         order_block_axes_by_curvature(&mut block_cols, &evals);
         if block_cols.is_empty() {
-            return Ok(zero());
+            return Ok((zero(), 0.0));
         }
         let m = block_cols.len();
         let (block_vecs, block_lambdas) =
@@ -677,24 +713,60 @@ impl<'a> RemlState<'a> {
             base_absolute_half_deviance,
         };
 
-        // The correction exists to remove the O(1/n_eff) Laplace term, so its
-        // quadrature error must sit below the next-order remainder 1/n_eff²
-        // (#2623). Each axis's Gauss–Hermite order is selected ONCE, at
-        // admission, as the smallest order whose paired difference with the next
-        // lower rule resolves min(|Δ|, 1/n_eff²), and latched beside the block
-        // dimension. Under a latched admission the orders are the model's, so
-        // every ρ integrates against the same nodes and the value, gradient and
-        // moments share one measure. The paired lower rules then switch nothing
-        // (#2748), so a latched evaluation integrates the fine rule alone and
-        // carries the admission's paired errors as its certificate: on a
-        // three-axis block the lower rules are five times the fine rule's nodes.
-        // A one-axis piece latches its composite partition the same way (below).
+        // THE ORDER TARGET IS THE CERTIFICATE'S OWN VALUE RESOLUTION (#3004).
+        //
+        // Each axis's Gauss–Hermite order is selected ONCE, at admission, as the
+        // smallest order whose paired difference with the next lower rule
+        // resolves `min(|Δ|, target)`, and latched beside the block dimension.
+        // Under a latched admission the orders are the model's, so every ρ
+        // integrates against the same nodes and the value, gradient and moments
+        // share one measure. The paired lower rules then switch nothing (#2748),
+        // so a latched evaluation integrates the fine rule alone and carries the
+        // admission's paired errors as its certificate: on a three-axis block the
+        // lower rules are five times the fine rule's nodes. A one-axis piece
+        // latches its composite partition the same way (below).
+        //
+        // The target used to be `1/n_eff²`, the next-order remainder of the
+        // Laplace expansion the correction removes the `O(1/n_eff)` term of. That
+        // is a STATISTICAL accuracy target, and nothing reads the criterion
+        // statistically: every consumer reads it through a certificate that
+        // cannot distinguish two values closer than `band_f`. On the measured
+        // n = 10k binomial fit the two were five decades apart — the search drove
+        // the paired error to 7.2e-10 against a `band_f` of 1.429e-3 — and paid
+        // for it in nodes, which is 95% of every outer evaluation once the
+        // correction engages. Resolving below `band_f` cannot change a verdict,
+        // a comparison of two values, or a stall decision, because each of those
+        // is decided against `band_f` itself.
+        //
+        // The certificate now CHARGES this rule's error in that same `band_f`
+        // (`ObjectiveBand::quadrature`), so the target is not a licence to be
+        // sloppy: a looser rule widens the band it is judged against, and the
+        // decrement verdict tightens with it. That is the ordering this change
+        // depends on — the charge exists before the target moves.
+        //
+        // No band, no correction. A correction admitted where the search
+        // certified no value bound has no derived target at all, and picking one
+        // would be choosing a number. Declining returns the exact Laplace
+        // criterion, which is what the fit had before #784 and is always valid.
+        // The Laplace term the correction removes, reported beside the target so
+        // a reader can see how far apart the statistical and the arithmetic
+        // scales are on this fit.
         let laplace_floor = if n_eff > 0.0 {
             1.0 / n_eff
         } else {
             f64::INFINITY
         };
-        let next_order_remainder = laplace_floor * laplace_floor;
+        let Some(resolution_band) = *self
+            .block_correction_value_band
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        else {
+            log::trace!(
+                "[#784] block-local correction declined: the admission carried no certified \
+                 value band, so its Gauss–Hermite order target is underived (#3004)"
+            );
+            return Ok((zero(), 0.0));
+        };
 
         // ── Axis by axis, or one tensor rule ─────────────────────────────
         //
@@ -841,7 +913,7 @@ impl<'a> RemlState<'a> {
                 ),
                 None if composite_axis => {
                     let adapted = corrector
-                        .composite_axis_marginal_correction(piece_target, next_order_remainder)
+                        .composite_axis_marginal_correction(piece_target, resolution_band)
                         .map_err(order_search_refused)?;
                     (
                         adapted.marginal,
@@ -856,7 +928,7 @@ impl<'a> RemlState<'a> {
                         gam_problem::laplace_sampler_contract::select_block_quadrature_orders(
                             corrector,
                             piece_target,
-                            next_order_remainder,
+                            resolution_band,
                         )
                         .map_err(order_search_refused)?;
                     let rule = LatchedPieceRule::GaussHermite {
@@ -887,7 +959,7 @@ impl<'a> RemlState<'a> {
             };
             let channels = block_target_channel_moments(piece_target, &moments, c_weights, 1.0)?;
             pieces.push(BlockPieceQuadrature {
-                resolution_target: quadrature.value.abs().min(next_order_remainder),
+                resolution_target: quadrature.value.abs().min(resolution_band),
                 quadrature,
                 channels,
                 composite_nodes,
@@ -958,7 +1030,7 @@ impl<'a> RemlState<'a> {
             log::debug!(
                 "[#784] block-local correction spliced UNRESOLVED (admission already latched, \
                  #2748): the latched rule's measured error {:.4e} does not resolve \
-                 min(|Δ|, 1/n_eff²)={:.4e} (|Δ_b|={abs_value:.4e}, m={m}, axis split={axis_split}, \
+                 min(|Δ|, band_f)={:.4e} (|Δ_b|={abs_value:.4e}, m={m}, axis split={axis_split}, \
                  max|γ|={:.3}, τ={:.3}, axis orders={:?}, nodes={node_count}, 1/n_eff={:.3e})",
                 piece.quadrature.quadrature_error,
                 piece.resolution_target,
@@ -1311,11 +1383,14 @@ impl<'a> RemlState<'a> {
                 second_order.implied_gradient,
             );
         }
-        Ok(TkCorrectionTerms {
-            value: -delta_b,
-            gradient: Some(gradient),
-            hessian: cost_hessian.map(|second_order| second_order.hessian),
-        })
+        Ok((
+            TkCorrectionTerms {
+                value: -delta_b,
+                gradient: Some(gradient),
+                hessian: cost_hessian.map(|second_order| second_order.hessian),
+            },
+            quadrature_error,
+        ))
     }
 }
 
@@ -1408,7 +1483,8 @@ fn order_block_axes_by_curvature(block_cols: &mut [usize], evals: &Array1<f64>) 
 /// rule, or one axis of it under the split, with its gradient channels.
 struct BlockPieceQuadrature {
     quadrature: gam_problem::laplace_sampler_contract::BlockQuadratureMarginal,
-    /// `min(|Δ_piece|, 1/n_eff²)`, the error the piece's rule must resolve.
+    /// `min(|Δ_piece|, band_f)`, the error the piece's rule must resolve: its own
+    /// value or the certificate's value resolution, whichever is smaller (#3004).
     resolution_target: f64,
     channels: BlockTargetChannels,
     /// A composite piece's nodes, which its second-order pass differentiates;

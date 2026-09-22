@@ -65,6 +65,7 @@ fn one_coordinate_evidence_2688(
     let logdet_s = -0.5 * rank as f64;
     let logdet_h = total - fixed_beta - logdet_s;
     crate::estimate::outer_eval_capture::CertificateEvidence {
+        quadrature: None,
         parts: vec![crate::estimate::outer_eval_capture::RhoGradientParts {
             index: 0,
             lambda: 1.0,

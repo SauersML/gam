@@ -21,7 +21,7 @@ use ndarray::{Array1, Array2};
 ///   implicit-function correction. Charging the assembled `|g_k|` instead can
 ///   only understate `band_λ²` when the channels cancel, and so only certify more;
 /// * the Hessian's band is `γ_m·‖H‖_F` at the same count;
-/// * `band_f = B_channels + B_factor + |E_r|`, the error the evaluated `V` itself
+/// * `band_f = B_channels + B_factor + |E_r| + B_quadrature`, the error the evaluated `V` itself
 ///   carries. A decrease below it is one the evaluator cannot resolve, so
 ///   demanding it would refuse points the criterion cannot tell apart:
 ///   * the channel term `B_channels = γ_m·(|fixed_beta| + |logdet_h| +
@@ -43,6 +43,13 @@ use ndarray::{Array1, Array2};
 ///     with, so the floor that regularization applies bounds each term. Where
 ///     the channel is nonzero and the factor derives no bound, no verdict is
 ///     taken;
+///   * the quadrature term is the #784 block-local Gauss--Hermite correction's
+///     own certified error in `Δ_b`, which `V` carries as `−Δ_b`
+///     ([`QuadratureCharge`]). It used to be left out, which was harmless only
+///     while the order search resolved `Δ_b` to `1/n_eff²` — five decades under
+///     `band_f`. Once the order target is `band_f` itself (#3004) the two are the
+///     same size, and a certificate that ignores an error of its own size is not
+///     a certificate. Zero exactly where no correction is spliced;
 ///   * the inner-mode term `E_r = ½·rᵀH_β⁻¹r` is the error `V` carries because
 ///     its inner mode stops at a residual `r` rather than at the exact mode, in
 ///     `V`'s units ([`InnerResidualCharge`]): the iterative inner Newton's own
@@ -64,6 +71,7 @@ use ndarray::{Array1, Array2};
 /// moved with the units of `y` and with any additive constant in `V`.
 ///
 /// [`CertificateCriterion`]: crate::estimate::outer_eval_capture::CertificateCriterion
+/// [`QuadratureCharge`]: crate::estimate::outer_eval_capture::QuadratureCharge
 /// [`InnerFactorCondition`]: crate::estimate::outer_eval_capture::InnerFactorCondition
 /// [`InnerResidualCharge`]: crate::estimate::outer_eval_capture::InnerResidualCharge
 pub(crate) fn outer_decrement_bands(
@@ -185,6 +193,16 @@ pub(crate) fn outer_objective_band(
             .filter(|band| band.is_finite())
             .unwrap_or(0.0),
         inner_residual,
+        // An evaluation with no #784 splice publishes no charge, and the exact
+        // error of a correction that was not taken is zero. An evaluation whose
+        // splice engaged always publishes one, from the single seam every
+        // spliced evaluation passes through, so "absent" never means "unmeasured"
+        // here (#3004).
+        quadrature: evidence
+            .quadrature
+            .map(|charge| charge.error.abs())
+            .filter(|error| error.is_finite())
+            .unwrap_or(0.0),
     })
 }
 
@@ -301,11 +319,14 @@ pub(crate) struct ObjectiveBand {
     pub(crate) factor: f64,
     /// `|½·rᵀH_β⁻¹r|`, the error the inner mode's residual leaves in `V`.
     pub(crate) inner_residual: f64,
+    /// The #784 block-local quadrature's certified error in `Δ_b`, which `V`
+    /// carries as `−Δ_b`. Exactly zero where no correction is spliced (#3004).
+    pub(crate) quadrature: f64,
 }
 
 impl ObjectiveBand {
     pub(crate) fn total(self) -> f64 {
-        self.channels + self.factor + self.inner_residual
+        self.channels + self.factor + self.inner_residual + self.quadrature
     }
 }
 

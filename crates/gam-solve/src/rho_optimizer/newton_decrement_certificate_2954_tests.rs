@@ -311,6 +311,7 @@ fn a_cancelling_gradient_is_charged_on_its_channels_not_its_sum_2954() {
         &[],
         cost,
         &crate::estimate::outer_eval_capture::CertificateEvidence {
+            quadrature: None,
             parts: parts.to_vec(),
             criterion: None,
             inner_factor: None,
@@ -873,6 +874,7 @@ fn the_objective_band_charges_the_channels_and_the_inner_factor_2954() {
     let verdict = |lambda_sq: f64, channels: Option<(f64, f64)>, factor: Factor| {
         let gradient = array![lambda_sq.sqrt()];
         let evidence = crate::estimate::outer_eval_capture::CertificateEvidence {
+            quadrature: None,
             parts: vec![crate::estimate::outer_eval_capture::RhoGradientParts {
                 index: 0,
                 lambda: 1.0,
@@ -1458,6 +1460,7 @@ fn an_inner_mode_without_a_residual_takes_no_decrement_verdict_2954() {
         ..OuterConfig::default()
     };
     let evidence = |inner_residual| crate::estimate::outer_eval_capture::CertificateEvidence {
+        quadrature: None,
         parts: vec![crate::estimate::outer_eval_capture::RhoGradientParts {
             index: 0,
             lambda: 1.0,
@@ -1801,6 +1804,7 @@ fn the_decrement_verdict_is_invariant_to_an_additive_cost_shift_c3() {
                 &[],
                 cost,
                 &crate::estimate::outer_eval_capture::CertificateEvidence {
+                    quadrature: None,
                     parts: vec![crate::estimate::outer_eval_capture::RhoGradientParts {
                         index: 0,
                         lambda: 1.0,
