@@ -515,7 +515,34 @@ def _build_design_penalty(
         # coefficients; #1561); and it normalizes the marginal roughness first,
         # so no λ carries a basis-size or length unit (#2315).
         axes = ", ".join(f"x{axis}" for axis in range(len(marginals)))
-        term = f"te({axes})"
+        # The term must NAME the marginal basis family, because a descriptor
+        # cannot change it (gam#4492).
+        #
+        # `te(...)` with no `bs=` is mgcv's default tensor and its margins are
+        # natural cubic regression splines: `term_builder.rs`'s
+        # `margin_wants_cr` treats an unset `bs` exactly like `cr`. This
+        # smooth's margins are B-splines. `apply_bspline_1d` on the Rust side
+        # reads `degree`, `penalty_order`, `double_penalty`, `knots`, `n_knots`
+        # and `periodic` from a marginal descriptor and never reads `kind`, so
+        # it can tune a margin but cannot turn a cr margin into a B-spline one.
+        # Sending a `TensorBSpline` descriptor at a bare `te(...)` therefore
+        # asked the engine to realize one basis while describing another.
+        #
+        # It refused rather than doing that silently only because a tunable
+        # collided: `BSpline`'s defaults are `degree=3` and `penalty_order=2`,
+        # which ARE `CR_MARGIN_DEGREE` and `CR_MARGIN_PENALTY_ORDER`, so both
+        # pass a cr margin's guards untouched. `BSpline(knots=8)` is what
+        # raised "knots=8 cannot resize a natural cubic regression spline";
+        # a plain `BSpline()` would have returned cr-margin penalties for a
+        # B-spline descriptor with nothing said.
+        #
+        # Periodicity stays on ONE mechanism rather than two: a periodic
+        # marginal travels as the descriptor's `periodic: true`, which
+        # `apply_bspline_1d` promotes to a cyclic spec documented as
+        # bit-identical to the formula's `cyclic()` build. So the family named
+        # here is `ps` for every marginal, and `bs=c('cyclic', ...)` is not
+        # also used.
+        term = f"te({axes}, bs='ps')"
         design, penalties = _engine_realized_block(smooth, points, term)
         _refuse_multi_lambda(term, "TensorBSpline", len(penalties))
         return design, penalties[0]

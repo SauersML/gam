@@ -15703,3 +15703,21 @@ publish paths.
   and its replacement on the same Grams across a length-scale ladder and fails if the
   removed cutoff does NOT move, so a constant rank cannot be read as a repair when it is
   really a fixture that never reached the defect.
+### Fixed
+
+- `gamfit.torch.fit` asked the engine to realize a tensor smooth as `te(x0, x1)`, whose
+  margins are natural cubic regression splines, while sending a `TensorBSpline`
+  descriptor naming B-spline margins. A descriptor tunes a margin and cannot change its
+  basis family, so the entry realized a cr tensor for a B-spline smooth. The term now
+  names the family (#4492).
+- `apply_bspline_1d` ignored a marginal descriptor's `kind`, so a family disagreement was
+  reported only when a tunable happened to collide. `BSpline`'s default `degree=3` and
+  `penalty_order=2` are exactly `CR_MARGIN_DEGREE` and `CR_MARGIN_PENALTY_ORDER`, so the
+  default descriptor could not collide and the disagreement was silent. It is now refused
+  by name.
+
+### Changed
+
+- The #4492 parity test names `bs='ps'` in both arms. Its Rust arm fitted `y ~ te(x1, x2)`
+  with a `TensorBSpline` override, which is a cr tensor, so the test compared two
+  different models.

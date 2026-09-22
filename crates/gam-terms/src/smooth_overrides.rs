@@ -799,6 +799,36 @@ fn apply_bspline_1d(
         spec.knotspec,
         BSplineKnotSpec::NaturalCubicRegression { .. }
     );
+    // A descriptor names its basis family in `kind`, and nothing read it here
+    // until #4492. The top level dispatches on it (`apply_one_override`); a
+    // TENSOR MARGINAL is handed straight to this function, so a descriptor
+    // naming one family could be applied to a margin of another and the
+    // disagreement went unstated.
+    //
+    // It was caught only when a tunable happened to collide. `BSpline`'s
+    // defaults are `degree=3` and `penalty_order=2`, which ARE
+    // `CR_MARGIN_DEGREE` and `CR_MARGIN_PENALTY_ORDER`, so a plain `BSpline()`
+    // against a `te(...)` default cr margin passes every guard below and
+    // returns a cr basis for a B-spline descriptor. Only a knot count, an
+    // explicit vector, or a non-cr degree or penalty order raised anything —
+    // all of them incidental to the real disagreement, which is the family.
+    //
+    // Narrow on purpose, and complete for what this bridge can produce: a te
+    // margin is cr (unset/`cr`/`tps`), cyclic, or B-spline, and a Python
+    // marginal descriptor is always a `BSpline`, whose kind is `"bspline"`.
+    // A cyclic margin IS of the B-spline family and is not refused here; its
+    // periodicity travels as the descriptor's own `periodic` key below.
+    if let Some(kind) = descriptor.get("kind").and_then(|value| value.as_str())
+        && is_cr
+        && matches!(kind, "bspline" | "ps" | "p_spline" | "bs")
+    {
+        return Err(format!(
+            "smooths[{symbol:?}]: this margin is a natural cubic regression spline \
+             (bs=\"cr\"/\"cs\") and the descriptor names a {kind:?} margin; a descriptor \
+             tunes a margin, it cannot change the basis family. Ask for the family in \
+             the formula, as te(..., bs='ps')"
+        ));
+    }
     if let Some(d) = descriptor_u64(descriptor, "degree", symbol)? {
         if is_cr && d as usize != crate::term_builder::CR_MARGIN_DEGREE {
             return Err(format!(
@@ -1672,6 +1702,66 @@ mod tests {
             "x",
         )
         .expect("double_penalty: false must be accepted by Duchon");
+    }
+
+
+    /// #4492: a marginal descriptor naming a basis FAMILY the margin is not is
+    /// refused by name, not incidentally through a tunable.
+    ///
+    /// `te(x, z)` with no `bs=` builds cr margins. `TensorBSpline(marginals=
+    /// [BSpline(...), ...])` describes B-spline margins and always emits
+    /// `"kind": "bspline"`. Before this guard the two met in
+    /// `apply_bspline_1d`, which read every tunable and never the kind, so the
+    /// engine realized a cr tensor for a B-spline descriptor. Nothing said so
+    /// unless a tunable collided -- and `BSpline`'s DEFAULTS cannot collide,
+    /// because `degree=3` and `penalty_order=2` are exactly the cr's own
+    /// values. `BSpline(knots=8)` collided; `BSpline()` did not.
+    ///
+    /// Note the sibling test above blesses `{"degree": 3, "penalty_order": 2}`
+    /// on a cr margin as accepted. It still does: that descriptor carries no
+    /// `kind`, which is the one field that distinguishes "restating the cr's
+    /// own numbers" from "asking for another basis". The real Python bridge
+    /// always sends one.
+    #[test]
+    fn a_marginal_descriptor_naming_another_basis_family_is_refused_4492() {
+        let cr_spec = || {
+            let mut spec = open_bspline_spec();
+            spec.knotspec = BSplineKnotSpec::NaturalCubicRegression {
+                knots: Array1::from(vec![0.0, 0.25, 0.5, 0.75, 1.0]),
+            };
+            spec
+        };
+
+        // The silent case: every tunable agrees with the cr, so nothing else
+        // in this function objects. Only the family disagrees.
+        let err = apply_bspline_1d(
+            &mut cr_spec(),
+            &obj(json!({"kind": "bspline", "degree": 3, "penalty_order": 2})),
+            "x,z",
+        )
+        .expect_err("a bspline descriptor on a cr margin must be refused by family");
+        assert!(err.contains("cannot change the basis family"), "got: {err}");
+        assert!(err.contains("natural cubic regression"), "got: {err}");
+
+        // A B-spline margin takes the same descriptor without complaint, so
+        // the guard is about the PAIR and not about the key being present.
+        let mut ps = open_bspline_spec();
+        apply_bspline_1d(
+            &mut ps,
+            &obj(json!({"kind": "bspline", "degree": 3, "penalty_order": 2})),
+            "x,z",
+        )
+        .expect("a bspline descriptor on a B-spline margin must be accepted");
+
+        // And a cr margin still takes a descriptor that does not claim a
+        // family, which is what the pre-#4492 tests send.
+        let mut cr = cr_spec();
+        apply_bspline_1d(&mut cr, &obj(json!({"degree": 3, "penalty_order": 2})), "x,z")
+            .expect("a kindless descriptor restating the cr must still be accepted");
+        assert!(matches!(
+            cr.knotspec,
+            BSplineKnotSpec::NaturalCubicRegression { .. }
+        ));
     }
 
     /// A `BSpline` override on a natural cubic regression smooth (`bs=cr`)

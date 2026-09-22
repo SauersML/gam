@@ -56,6 +56,15 @@ from gamfit._api import _jsonable_array
 from gamfit._binding import rust_module
 from gamfit.smooth import BSpline, Matern, TensorBSpline
 
+# Both arms name `bs='ps'`, and that is part of the claim rather than a detail.
+# A bare `te(x1, x2)` is mgcv's default tensor, whose margins are natural cubic
+# regression splines -- `margin_wants_cr` in `term_builder.rs` treats an unset
+# `bs` as `cr`. `TensorBSpline(marginals=[BSpline(...), ...])` is a B-spline
+# tensor. Comparing one against the other is comparing two models, which is the
+# very failure gam#4492 exists to stop, so the two arms had to be made the same
+# basis before any parity assertion between them means anything. A descriptor
+# cannot do it: the marginal bridge tunes a margin and does not set its family.
+
 # One fixture for both arms: the two fits must see the same rows, so the data
 # are built once and handed to each as its own frontend takes them.
 N_ROWS = 160
@@ -101,10 +110,10 @@ def test_engine_realizes_the_penalties_the_fit_carries() -> None:
     tensor_points = np.column_stack([frame["x1"], frame["x2"]])
     tensor_smooth = _tensor_smooth()
     tensor_design, tensor_penalties = _realized(
-        tensor_points, "te(x0, x1)", tensor_smooth
+        tensor_points, "te(x0, x1, bs='ps')", tensor_smooth
     )
     tensor_fit = gamfit.fit(
-        frame, "y ~ te(x1, x2)", smooths={("x1", "x2"): tensor_smooth}
+        frame, "y ~ te(x1, x2, bs='ps')", smooths={("x1", "x2"): tensor_smooth}
     )
     assert len(tensor_penalties) == len(tensor_fit.smoothing_parameters()), (
         "the entry must realize one penalty per smoothing parameter the fit "
@@ -169,7 +178,7 @@ def test_the_entry_refuses_a_descriptor_that_is_not_the_terms(
         ]
     )
     with pytest.raises(Exception) as caught:
-        _realized(points, "te(x0, x1)", wrong)
+        _realized(points, "te(x0, x1, bs='ps')", wrong)
     assert "marginals" in str(caught.value), str(caught.value)
 
 
@@ -213,7 +222,7 @@ def test_torch_fit_refuses_to_price_several_penalties_under_one_lambda() -> None
     # DIVERGENCE rather than a shared limitation. Naming it here keeps that half
     # of the claim measured instead of assumed.
     rust_tensor_fit = gamfit.fit(
-        frame, "y ~ te(x1, x2)", smooths={("x1", "x2"): tensor_smooth}
+        frame, "y ~ te(x1, x2, bs='ps')", smooths={("x1", "x2"): tensor_smooth}
     )
     rust_matern_fit = gamfit.fit(
         frame, "y ~ matern(x1)", smooths={"x1": matern_smooth}
