@@ -443,6 +443,7 @@ pub(crate) fn unified_joint_cost_gradient(
         gam_problem::HessianValue,
         [f64; 4],
         Option<Array2<f64>>,
+        Option<gam_solve::estimate::reml::reml_outer_engine::InnerModeFold>,
     ),
     CustomFamilyError,
 > {
