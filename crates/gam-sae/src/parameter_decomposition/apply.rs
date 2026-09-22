@@ -240,9 +240,18 @@ impl EditFootprint {
         })
     }
 
-    /// Charge the footprint to the process memory governor before allocating.
-    pub fn reserve(&self, context: &str) -> Result<EditReservation, ApplyError> {
-        let governor = MemoryGovernor::global();
+    /// Charge the footprint to `governor` before allocating.
+    ///
+    /// The governor is an argument rather than `MemoryGovernor::global()` read from here
+    /// (#4565): the global ledger is shared by every caller in the process, so a kernel
+    /// that reaches for it cannot be exercised against a budget of its own, and a test of
+    /// its admission is at the mercy of whatever else the binary is holding. Production
+    /// passes the global governor; a test passes `MemoryGovernor::with_budget_bytes`.
+    pub fn reserve(
+        &self,
+        governor: &MemoryGovernor,
+        context: &str,
+    ) -> Result<EditReservation, ApplyError> {
         let result = governor.try_reserve(self.result_bytes, context)?;
         let scratch = governor.try_reserve(self.scratch_bytes, context)?;
         Ok(EditReservation { result, scratch })
@@ -275,10 +284,20 @@ pub fn native_linear(
     native: ArrayView2<'_, f64>,
     input: ArrayView2<'_, f64>,
 ) -> Result<Governed<Array2<f64>>, ApplyError> {
+    native_linear_with_governor(MemoryGovernor::global(), native, input)
+}
+
+/// [`native_linear`] charging `governor` instead of the process-wide ledger (#4565), so a
+/// caller can exercise this kernel's admission against a budget of its own.
+pub fn native_linear_with_governor(
+    governor: &MemoryGovernor,
+    native: ArrayView2<'_, f64>,
+    input: ArrayView2<'_, f64>,
+) -> Result<Governed<Array2<f64>>, ApplyError> {
     expect_dim("input rows", (input.nrows(), native.ncols()), input.dim())?;
     let footprint =
         EditFootprint::anchored_linear(input.nrows(), native.ncols(), native.nrows(), 0, 0)?;
-    let reservation = footprint.reserve("native linear apply")?;
+    let reservation = footprint.reserve(governor, "native linear apply")?;
     let output = execute_anchored(native, 1.0, None, input, footprint.tile_rows);
     Ok(reservation.result.bind(output))
 }
@@ -310,7 +329,7 @@ pub fn apply_anchored_linear(
         terms,
         active.len(),
     )?;
-    let reservation = footprint.reserve("anchored linear apply")?;
+    let reservation = footprint.reserve(MemoryGovernor::global(), "anchored linear apply")?;
     let output = if active.is_empty() {
         execute_anchored(native, anchor, None, input, footprint.tile_rows)
     } else if active.len() == terms {
@@ -345,7 +364,7 @@ pub fn edit_frobenius_contractions(
 ) -> Result<Governed<Array1<f64>>, ApplyError> {
     expect_pullback_rows(edit, cotangent, input)?;
     let footprint = EditFootprint::frobenius_contractions(input.nrows(), edit.term_count())?;
-    let reservation = footprint.reserve("edit frobenius contractions")?;
+    let reservation = footprint.reserve(MemoryGovernor::global(), "edit frobenius contractions")?;
     let sums = contractions_tiled(edit, cotangent, input, footprint.tile_rows);
     Ok(reservation.result.bind(sums))
 }
@@ -374,7 +393,7 @@ pub fn edit_factor_cotangents(
         edit.output_dim(),
         edit.term_count(),
     )?;
-    let reservation = footprint.reserve("edit factor cotangents")?;
+    let reservation = footprint.reserve(MemoryGovernor::global(), "edit factor cotangents")?;
     let cotangents = cotangents_tiled(edit, cotangent, input, footprint.tile_rows);
     Ok(reservation.result.bind(cotangents))
 }
@@ -828,8 +847,13 @@ mod tests {
 
     #[test]
     fn an_unfittable_request_is_refused_before_allocation() {
+        // #4565 — charged to this test's own governor, not the process-wide one: against
+        // the shared ledger the positive control below fails whenever something else in
+        // the binary happens to hold the budget, which is a verdict about the neighbour
+        // and not about the footprint.
+        let governor = MemoryGovernor::with_budget_bytes(1 << 40);
         let small = EditFootprint::anchored_linear(64, 48, 40, 6, 3).expect("small footprint");
-        let admitted = small.reserve("apply admission test");
+        let admitted = small.reserve(&governor, "apply admission test");
         assert!(
             admitted.is_ok(),
             "a {small:?} footprint must be admitted (positive control)"
@@ -839,7 +863,7 @@ mod tests {
             .expect("the footprint itself fits usize");
         assert!(
             matches!(
-                huge.reserve("apply admission test"),
+                huge.reserve(&governor, "apply admission test"),
                 Err(ApplyError::Memory(MemoryReservationError::BudgetExceeded { .. }))
             ),
             "a {huge:?} footprint was not refused by the memory governor"

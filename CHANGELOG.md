@@ -1,5 +1,18 @@
 ## Unreleased
 
+- **A memory-budget refusal names the reservation that refused it** (#4565). The governor's
+  ledger is process-wide, so `MemoryReservationError::BudgetExceeded` reported how many bytes
+  were reserved without saying whose they were. A caller refused because a neighbour holds the
+  budget was indistinguishable from a caller whose own request is too large: both printed the
+  refused caller's own context and the same total. In a concurrent test binary that is routine,
+  one long-running reservation refuses every other test and each reports itself, so a collateral
+  refusal reads as the refused kernel's own overrun. The ledger now records each live
+  reservation's context and bytes, keyed by an id its `MemoryReservation` removes on drop, and a
+  refusal carries the largest live holder as a `DominantHolder`, which displays either that
+  holder and its bytes or a statement that nothing else was live. `EditFootprint::reserve` and
+  the new `native_linear_with_governor` also take the governor they charge instead of reaching
+  for the global one, so a kernel's admission can be exercised against a budget of its own.
+
 - **The reference-quality suite runs as a sharded matrix, and its shard count is derived
   from the per-case bounds** (#1561). One job ran all 437 cases serially. With the repo's own
   per-case bound (`.config/nextest.toml`: 600 s by default, up to 2400 s for the declared

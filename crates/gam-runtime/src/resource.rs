@@ -331,6 +331,46 @@ fn stationary_headroom_of_capacity(availability: &MemoryAvailability) -> usize {
     usize::try_from(scaled).unwrap_or(usize::MAX)
 }
 
+/// Who held the ledger's reserved bytes when a [`MemoryReservationError::BudgetExceeded`]
+/// was measured (#4565).
+///
+/// The ledger is process-wide, so a refusal reports bytes that any live reservation may
+/// own. Without naming one, a caller refused because a neighbour is holding the budget
+/// reads exactly like a caller whose own request is too large, and in a concurrent test
+/// binary the two are routinely confused: one long-running reservation refuses every other
+/// test, each of which then reports its own context. Naming the largest live holder
+/// separates the two cases at the point of refusal, where the evidence exists.
+///
+/// The largest holder is the one to name because it is the one whose release would most
+/// change the verdict; the rest are visible through `reserved_bytes` minus its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DominantHolder {
+    /// No reservation was live, so the request alone does not fit the budget. This is the
+    /// caller's own overrun and nothing else's.
+    Unheld,
+    /// The largest live reservation at the moment of the refusal.
+    Held {
+        /// The context string that reservation was taken under.
+        context: Box<str>,
+        /// Its bytes, of the `reserved_bytes` the refusal reports.
+        bytes: usize,
+    },
+}
+
+impl std::fmt::Display for DominantHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unheld => f.write_str(
+                "nothing else holds the ledger, so this request alone exceeds the budget",
+            ),
+            Self::Held { context, bytes } => write!(
+                f,
+                "the largest live reservation is '{context}' holding {bytes} bytes"
+            ),
+        }
+    }
+}
+
 /// Typed refusal from [`MemoryGovernor::try_reserve`].
 ///
 /// Carries the full ledger evidence so callers can route to a chunked or
@@ -341,13 +381,15 @@ fn stationary_headroom_of_capacity(availability: &MemoryAvailability) -> usize {
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum MemoryReservationError {
     #[error(
-        "{context}: cannot reserve {requested_bytes} bytes; {reserved_bytes} of {budget_bytes} bytes already reserved process-wide; detected availability: {availability}"
+        "{context}: cannot reserve {requested_bytes} bytes; {reserved_bytes} of {budget_bytes} bytes already reserved process-wide ({dominant_holder}); detected availability: {availability}"
     )]
     BudgetExceeded {
         context: Box<str>,
         requested_bytes: usize,
         reserved_bytes: usize,
         budget_bytes: usize,
+        /// Who held the reserved bytes when this refusal was measured (#4565).
+        dominant_holder: DominantHolder,
         availability: MemoryAvailability,
     },
 
@@ -368,6 +410,57 @@ struct GovernorLedger {
     materialization_cap_bytes: usize,
     availability: MemoryAvailability,
     reserved_bytes: std::sync::atomic::AtomicUsize,
+    /// Every live reservation's context and bytes, keyed by the id its
+    /// [`MemoryReservation`] carries and removes on drop, so this map IS the live set
+    /// `reserved_bytes` sums (#4565). A refusal reads the largest entry to name the holder
+    /// it is refused by. It is written once per successful reservation and once per drop,
+    /// the same frequency as the ledger's own compare-and-swap, and only for allocations
+    /// large enough to be governed at all.
+    holders: std::sync::Mutex<std::collections::BTreeMap<u64, (Box<str>, usize)>>,
+    /// Source of the holder keys. Monotone, so an id is never reused and a drop cannot
+    /// remove a later reservation's entry.
+    next_holder: std::sync::atomic::AtomicU64,
+}
+
+impl GovernorLedger {
+    /// The largest live reservation, for a refusal to name ([`DominantHolder`]).
+    ///
+    /// A poisoned registry is read through its guard rather than refused: the map is a
+    /// plain `BTreeMap` with no invariant a panicking holder could have broken halfway,
+    /// and a refusal that could not name its holder is worth less than one that can.
+    fn dominant_holder(&self) -> DominantHolder {
+        let guard = self
+            .holders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.values().max_by_key(|(_, bytes)| *bytes).map_or(
+            DominantHolder::Unheld,
+            |(context, bytes)| DominantHolder::Held {
+                context: context.clone(),
+                bytes: *bytes,
+            },
+        )
+    }
+
+    /// Record a reservation that just took `bytes` under `context`, returning its id.
+    fn register(&self, context: &str, bytes: usize) -> u64 {
+        let id = self
+            .next_holder
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.holders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, (context.into(), bytes));
+        id
+    }
+
+    /// Drop the entry a released reservation owned.
+    fn deregister(&self, id: u64) {
+        self.holders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+    }
 }
 
 /// Process-wide byte-accounting governor for large allocations.
@@ -417,6 +510,8 @@ impl MemoryGovernor {
                 materialization_cap_bytes: budget_bytes,
                 availability: resample_memory_availability(),
                 reserved_bytes: std::sync::atomic::AtomicUsize::new(0),
+                holders: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+                next_holder: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -430,6 +525,8 @@ impl MemoryGovernor {
                 materialization_cap_bytes,
                 availability,
                 reserved_bytes: std::sync::atomic::AtomicUsize::new(0),
+                holders: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+                next_holder: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -497,6 +594,9 @@ impl MemoryGovernor {
                         requested_bytes: bytes,
                         reserved_bytes: current,
                         budget_bytes: self.ledger.budget_bytes,
+                        // Read after the refusal is decided, from the same live set
+                        // `current` sums: whoever holds the budget is named here (#4565).
+                        dominant_holder: self.ledger.dominant_holder(),
                         availability: self.ledger.availability.clone(),
                     });
                 }
@@ -509,6 +609,7 @@ impl MemoryGovernor {
             ) {
                 Ok(_) => {
                     return Ok(MemoryReservation {
+                        holder: self.ledger.register(context, bytes),
                         ledger: Arc::clone(&self.ledger),
                         bytes,
                     });
@@ -567,6 +668,9 @@ pub const fn dense_f64_bytes(nrows: usize, ncols: usize) -> Option<usize> {
 pub struct MemoryReservation {
     ledger: Arc<GovernorLedger>,
     bytes: usize,
+    /// This reservation's entry in the ledger's live-holder registry, removed on drop so
+    /// the registry is exactly the set of live reservations (#4565).
+    holder: u64,
 }
 
 impl MemoryReservation {
@@ -632,6 +736,9 @@ impl Drop for MemoryReservation {
         self.ledger
             .reserved_bytes
             .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+        // Released in the same order a refusal reads them, so a holder named by a
+        // concurrent refusal was live when that refusal was measured (#4565).
+        self.ledger.deregister(self.holder);
     }
 }
 
@@ -1810,5 +1917,106 @@ mod governed_scratch_pool_2989_tests {
         });
         assert_eq!(pool.idle_len(), 3);
         assert_eq!(governor.reserved_bytes(), pool.retained_bytes());
+    }
+}
+
+/// gam#4565: the ledger is process-wide, so a refusal must say whose bytes refused it.
+#[cfg(test)]
+mod dominant_holder_tests {
+    use super::{DominantHolder, MemoryGovernor, MemoryReservationError};
+
+    /// The holder a refusal names, or the refusal's own text when it named none.
+    fn refuse(governor: &MemoryGovernor, bytes: usize, context: &str) -> DominantHolder {
+        match governor.try_reserve(bytes, context) {
+            Err(MemoryReservationError::BudgetExceeded {
+                dominant_holder, ..
+            }) => dominant_holder,
+            other => panic!("{context}: expected a budget refusal, got {other:?}"),
+        }
+    }
+
+    /// A caller refused because a neighbour holds the budget names the neighbour, and a
+    /// caller whose own request does not fit names nobody. Those are the two cases the
+    /// refusal could not previously distinguish: both reported the refused caller's own
+    /// context and the same total, so a collateral refusal in a concurrent binary read as
+    /// the refused kernel's own overrun.
+    #[test]
+    fn a_refusal_names_the_holder_that_caused_it_and_not_the_caller() {
+        let governor = MemoryGovernor::with_budget_bytes(1_000);
+        // Nothing is live: this is the caller's own overrun.
+        assert_eq!(
+            refuse(&governor, 1_001, "a request larger than the whole budget"),
+            DominantHolder::Unheld
+        );
+        let neighbour = governor
+            .try_reserve(900, "the neighbour's long-running reservation")
+            .expect("the neighbour fits");
+        // The same tiny request that fits an empty ledger is now refused, and the refusal
+        // names the reservation that refused it rather than the caller.
+        assert_eq!(
+            refuse(&governor, 200, "a tiny read that fits an empty ledger"),
+            DominantHolder::Held {
+                context: "the neighbour's long-running reservation".into(),
+                bytes: 900,
+            }
+        );
+        // The registry is the live set, not a log: once the neighbour releases, the same
+        // request succeeds. A leak here would refuse every later caller in the name of a
+        // reservation that is gone.
+        drop(neighbour);
+        governor
+            .try_reserve(200, "a tiny read that fits an empty ledger")
+            .expect("the released bytes are available again");
+    }
+
+    /// The holder named is the largest live one, the one whose release would most change
+    /// the verdict, not merely the first or the most recent.
+    #[test]
+    fn the_named_holder_is_the_largest_live_reservation() {
+        let governor = MemoryGovernor::with_budget_bytes(1_000);
+        let small = governor.try_reserve(100, "the small holder").expect("fits");
+        let large = governor.try_reserve(700, "the large holder").expect("fits");
+        assert_eq!(
+            refuse(&governor, 500, "the refused caller"),
+            DominantHolder::Held {
+                context: "the large holder".into(),
+                bytes: 700,
+            }
+        );
+        // Releasing the largest hands the name to the next one down, so the field tracks
+        // the live set rather than recording whoever was biggest at some past moment.
+        drop(large);
+        assert_eq!(
+            refuse(&governor, 950, "the refused caller"),
+            DominantHolder::Held {
+                context: "the small holder".into(),
+                bytes: 100,
+            }
+        );
+        drop(small);
+    }
+
+    /// The refusal's message carries the holder, so a panic through `expect` reads as the
+    /// collateral it is. This is the whole point of the field: the text is what a killed
+    /// test binary leaves behind.
+    #[test]
+    fn the_refusal_message_names_the_holder() {
+        let governor = MemoryGovernor::with_budget_bytes(1_000);
+        let held = governor
+            .try_reserve(900, "sae manifold outer probe")
+            .expect("fits");
+        let message = match governor.try_reserve(200, "native linear apply") {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("the tiny request must be refused while 900 of 1000 are held"),
+        };
+        assert!(
+            message.contains("native linear apply") && message.contains("sae manifold outer probe"),
+            "the refusal must name both the refused caller and its holder: {message}"
+        );
+        assert!(
+            message.contains("holding 900 bytes"),
+            "the refusal must say how much the holder holds: {message}"
+        );
+        drop(held);
     }
 }
