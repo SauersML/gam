@@ -1508,8 +1508,20 @@ mod isometry_decoder_jet_facade_tests {
         h: Option<Array2<f64>>,
         k: Option<Array3<f64>>,
     ) -> Result<Array1<f64>, String> {
-        let rho = array![0.0_f64];
-        analytic_penalty_hvp_impl(LATENTS, ISOMETRY, t.view(), v.view(), Some(rho.view()), j, h, k)
+        // #4531 — TAKE THE RHO ARITY FROM THE REGISTRY INSTEAD OF RESTATING IT.
+        //
+        // `ISOMETRY` declares `weight: 1.0` and no learnable strength, and since
+        // `484c0311a9` an analytic penalty owns a strength coordinate only where it
+        // prices its own prior mass, so this registry's `total_rho_count()` is 0.
+        // The hand-built length-1 rho therefore made `analytic_penalty_hvp_impl`
+        // refuse at its arity check with "rho length 1 does not match analytic
+        // penalty rho_count 0", every one of this test's four facade calls returned
+        // `Err`, and the assertions read that as a wrong Hessian rather than as a
+        // rejected call. `None` makes the impl build `zeros(total_rho_count())`
+        // itself, so the fixture cannot go stale the next time a declared arity
+        // moves. The numerics are unchanged: a fixed `weight = 1.0` and a learnable
+        // `weight · exp(0)` are the same strength.
+        analytic_penalty_hvp_impl(LATENTS, ISOMETRY, t.view(), v.view(), None, j, h, k)
     }
 
     /// Premises, free to fail: the closed-form second difference resolves a nonzero
