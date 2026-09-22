@@ -938,6 +938,134 @@ mod tests {
         louis_matches_the_block_sweep_2965("all static", fixture);
     }
 
+
+    /// The cost model that decides whether a checkpointed reverse sweep is
+    /// worth writing for the computed path, measured rather than believed
+    /// (#2965).
+    ///
+    /// # What is being decided
+    ///
+    /// The forward route costs `b(b + 1)/2` cohort passes for a dense Hessian
+    /// and `b` for a gradient, at `b = ⌈p / TANGENT_WIDTH⌉`. A reverse sweep
+    /// costs one cohort pass per gradient and `b` per dense Hessian
+    /// (forward over reverse), but each of its passes is more expensive than a
+    /// value pass by the tape factor `c_r`: it replays the forward filter,
+    /// stores every node's grid, filtered density and kernel weights, and then
+    /// walks them backwards. #3013's S0 quotes `c_r` at about 8 to 11 for this
+    /// path.
+    ///
+    /// So the reverse sweep wins the dense Hessian exactly when
+    ///
+    /// ```text
+    ///   b · c_r · T_value  <  b(b + 1)/2 · T_second,
+    ///   i.e.  c_r  <  (b + 1)/2 · (T_second / T_value),
+    /// ```
+    ///
+    /// with `T_value` the wall of one value-only cohort pass and `T_second`
+    /// the wall of one pass at the second-order jet width the block sweep
+    /// runs. BOTH factors on the right grow with the problem: `(b + 1)/2` with
+    /// the coefficient count, and `T_second / T_value` with the jet width the
+    /// engine actually pays for. The earlier reading of "`c_r` about 8-11
+    /// against the about 3 needed" took the right-hand side at ONE width —
+    /// the `p = 17` fixture, where `b = 3` and `(b + 1)/2 = 2` — and read a
+    /// crossover as a verdict. The admissible `c_r` is not a constant, and
+    /// this instrument reports it as the function of `p` that it is.
+    ///
+    /// # What this measures and what it asserts
+    ///
+    /// Per fixture width: the coefficient count `p`, the block count `b`, the
+    /// pass counts the two routes make, the wall of one value pass, of the
+    /// gradient and of the dense Hessian, the per-pass walls those imply, and
+    /// the admissible `c_r` the inequality above gives. It also reports the
+    /// tape a reverse sweep would have to hold, which is the other half of the
+    /// decision and is countable without writing one: per subject,
+    /// `nodes · (G^K + K·G² )` doubles for the grids, filtered densities and
+    /// per-axis kernel bases.
+    ///
+    /// The walls are diagnostics and nothing is asserted about them except the
+    /// one relation the pass model makes structurally true — the dense Hessian
+    /// makes strictly more passes of the same kind than the gradient, so it
+    /// must take longer. A timing bar beyond that would be a number no
+    /// derivation supports. The counts ARE asserted, because they are exact.
+    #[test]
+    fn reverse_sweep_cost_ratio_instrument_2965() {
+        const W: usize = TANGENT_WIDTH;
+        for columns in [4usize, 16, 32] {
+            let (family, states) = wide_reference_family(columns);
+            assert!(
+                family.differentiates_the_computed_path(),
+                "the instrument must measure the route this issue is about"
+            );
+            let p = family.total_width();
+            let b = p.div_ceil(W);
+            let gradient_passes = b;
+            let hessian_passes = b * (b + 1) / 2;
+            let values: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
+
+            let started = std::time::Instant::now();
+            let value = family
+                .path_value::<f64>(&states, &values)
+                .expect("the cost model needs a value pass this fixture can take");
+            let value_wall = started.elapsed().as_secs_f64();
+
+            let started = std::time::Instant::now();
+            let gradient = family
+                .exact_gradient(&states)
+                .expect("the cost model needs the forward gradient this fixture can take");
+            let gradient_wall = started.elapsed().as_secs_f64();
+
+            let started = std::time::Instant::now();
+            let (_, _, hessian) = family
+                .computed_joint::<f64>(&states, None, None, true)
+                .expect("the cost model needs the forward dense Hessian this fixture can take");
+            let hessian_wall = started.elapsed().as_secs_f64();
+
+            let per_second_pass = hessian_wall / hessian_passes as f64;
+            let admissible = 0.5 * (b + 1) as f64 * per_second_pass / value_wall;
+            // The tape a reverse sweep must hold, per subject: each node keeps
+            // its grid's `G^K` weights and filtered density, and the kernel's
+            // `K·G²` per-axis bases, so the checkpoint is what the forward
+            // route discards at every step.
+            let order = family.gauss_hermite_order();
+            let atoms = family.atoms();
+            let grid_points = order.pow(atoms as u32);
+            let nodes_per_subject = family.nodes.max_subject_nodes();
+            let tape = nodes_per_subject * (2 * grid_points + atoms * order * order);
+
+            eprintln!(
+                "#2965 cost model: columns {columns} p {p} b {b} | passes: value 1, gradient \
+                 {gradient_passes}, hessian {hessian_passes} | wall: value {value_wall:.4} s, \
+                 gradient {gradient_wall:.4} s, hessian {hessian_wall:.4} s | per pass: \
+                 gradient {:.4} s, hessian {per_second_pass:.4} s | second-order jet factor \
+                 {:.2} | admissible c_r {admissible:.2} | tape {tape} doubles per subject \
+                 ({} nodes, G^K {grid_points})",
+                gradient_wall / gradient_passes as f64,
+                per_second_pass / value_wall,
+                nodes_per_subject,
+            );
+            assert!(
+                value.is_finite()
+                    && gradient.iter().all(|g| g.is_finite())
+                    && hessian.iter().all(|h| h.is_finite()),
+                "columns {columns}: the instrument must measure a finite evaluation"
+            );
+            assert_eq!(gradient.len(), p, "columns {columns}: gradient width");
+            assert_eq!(hessian.len(), p * p, "columns {columns}: Hessian width");
+            assert!(
+                hessian_passes > gradient_passes,
+                "columns {columns}: the dense Hessian must make more passes than the gradient \
+                 ({hessian_passes} against {gradient_passes}); if it does not, the pass model \
+                 this cost ratio is derived from is wrong"
+            );
+            assert!(
+                hessian_wall > gradient_wall,
+                "columns {columns}: the dense Hessian makes {hessian_passes} passes of the same \
+                 kind the gradient makes {gradient_passes} of, so it cannot be the faster of \
+                 the two ({hessian_wall:.4} s against {gradient_wall:.4} s)"
+            );
+        }
+    }
+
     /// Four subjects on one once-only mark, a reference law on 24 equal steps,
     /// `columns` cosine time columns in the mark block, and a near-static held
     /// atom: a reference-centred fixture of any width.
