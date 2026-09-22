@@ -1448,6 +1448,17 @@ fn derive_smooth_collection_span_frame(
             )
             .map(|residualization| residualization.coefficient_transform)
         }
+        // A replayed gauge already CARRIES the `T0` this function exists to
+        // derive, so reaching here means a caller asked for a frame it was
+        // handed (gam#2959). Deriving one would re-decide, on these rows, a
+        // construction the fit already chose — the exact re-decision the arm is
+        // frozen to prevent.
+        SmoothCollectionGaugeArm::Replayed => {
+            crate::bail_invalid_basis!(
+                "collection gauge arm `Replayed` carries its own fixed coefficient chart; \
+                 deriving a span frame for it would re-decide the construction the fit froze"
+            )
+        }
     };
     match derived {
         Ok(transform) => Ok(transform),
@@ -2371,6 +2382,18 @@ fn apply_global_smooth_identifiability(
             .expect("a derived collection coefficient chart implies a present gauge")
         });
         let mut residualization: Option<crate::basis::ParametricResidualization> = None;
+        // A REPLAYED term exports a gauge too (gam#2959). `plan` is `Absent`
+        // whenever a frozen chart is in play, so the block above derives none,
+        // and before this a replayed collection design carried no gauge at all.
+        // The incremental ψ/κ realizer rebuilds one term LOCALLY per trial and
+        // can only place that rebuild through a gauge: without one it spliced a
+        // raw term-local design, one chart-width too wide, into a slot sized for
+        // the placed design, and refused every trial — at the seed too, because
+        // the chart is ψ-invariant. Everything a gauge needs is already in hand
+        // here: `C` is rebuilt below for the correction, `T0` and the owner list
+        // are on the chart, and the local chart and `Q` are on the term.
+        let mut replay_gauge: Option<SmoothCollectionGauge> = None;
+        let replay_local_columns = design_local.ncols();
         let (design_constrained, z_opt) = if let Some(gauge) = collection_gauge.as_ref() {
             // This term takes a gauge, so it is realized through the one entry
             // point that knows how — the same one the outer search's incremental
@@ -2431,6 +2454,27 @@ fn apply_global_smooth_identifiability(
                         parametric_block.as_ref(),
                         &replay_owner_blocks,
                     )?;
+                    // The gauge for a ψ-search over THIS design. `C` is the
+                    // block just rebuilt, `T0` is the chart's own transform, and
+                    // the arm is `Replayed` because which construction derived
+                    // `T0` is not recorded and is not needed: placement forms
+                    // `X·T0 − C·R` and recomputes `R` either way. NOT the
+                    // chart's frozen `R`, which is training-row data for a
+                    // PREDICTION replay — reusing it across ψ is the
+                    // `X(ψ̂)·Z − C·R(ψ₀)` defect #2747 measured at
+                    // ‖XᵀC‖/(‖X‖‖C‖) = 4.15e-1 against a 1e-8 bar.
+                    replay_gauge = Some(SmoothCollectionGauge {
+                        arm: SmoothCollectionGaugeArm::Replayed,
+                        constraint_block: block.clone(),
+                        owner_terms: chart.owner_terms.clone(),
+                        has_parametric_block: chart.has_parametric_block,
+                        local_identifiability_transform: basis_local_identifiability_transform(
+                            &term.metadata,
+                        ),
+                        joint_null_rotation: term.joint_null_rotation.clone(),
+                        coefficient_transform: chart.coefficient_transform.clone(),
+                        local_columns: replay_local_columns,
+                    });
                     if block.ncols() != chart.correction.nrows() {
                         gam_problem::bail_dim_basis!(
                             "frozen parametric residualization mismatch for term '{}': rebuilt constraint block has {} columns but the persisted fit-time correction has {} rows",
@@ -2513,7 +2557,10 @@ fn apply_global_smooth_identifiability(
                 correction: plan.row_space_correction.clone(),
             })
             .or_else(|| replay_correction.cloned());
-        local_collection_gauge[idx] = collection_gauge;
+        // A derived gauge when the collection decided one, the replayed gauge
+        // when it replayed a chart; never both, because `plan` is `Absent`
+        // exactly when a chart is in play.
+        local_collection_gauge[idx] = collection_gauge.or(replay_gauge);
         local_dims[idx] = design_constrained.ncols();
         local_designs[idx] = Some(design_constrained);
         local_active_penalties[idx] = active_penalties;

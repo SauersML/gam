@@ -719,12 +719,20 @@ pub fn freeze_term_collection_from_design(
         .iter_mut()
         .zip(design.smooth.terms.iter())
     {
-        // A term with a collection chart but no gauge was REPLAYED from a spec
-        // this freeze already wrote. A replay decides nothing; the fit already
-        // did, and the spec it was rebuilt from is that decision. Refreezing
-        // from its metadata would fold the chart's `T` into the basis a second
-        // time.
-        if fitted.collection_gauge.is_none() && fitted.parametric_residualization.is_some() {
+        // A term REPLAYED from a spec this freeze already wrote decides
+        // nothing; the fit already did, and the spec it was rebuilt from is that
+        // decision. Refreezing from its metadata would fold the chart's `T` into
+        // the basis a second time.
+        //
+        // READ FROM THE SPEC, NOT FROM THE ABSENCE OF A GAUGE (gam#2959). "No
+        // gauge and a residualization" was a faithful proxy for "replayed" only
+        // while a replayed term exported no gauge; it now exports one, so the
+        // proxy would have silently stopped firing and every replayed term would
+        // have been refrozen. The spec's own `frozen_parametric_residualization`
+        // is the direct statement — it is what put the collection on the replay
+        // path in the first place — and this loop has not written to it yet, so
+        // it still holds the INPUT spec's value here.
+        if term.frozen_parametric_residualization.is_some() {
             continue;
         }
         // Factor-smooth kinds cannot absorb the collection chart into their

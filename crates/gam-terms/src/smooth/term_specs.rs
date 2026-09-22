@@ -762,6 +762,25 @@ pub enum SmoothCollectionGaugeArm {
     Delete,
     /// `X·T − C·R`, span-preserving — always licensed.
     Residualize,
+    /// `T0` was REPLAYED from a frozen [`ParametricResidualizationChart`], so
+    /// which of the two constructions above originally derived it is not
+    /// recorded anywhere (gam#2959).
+    ///
+    /// The chart is serialized and the arm is not, so a gauge rebuilt from a
+    /// chart cannot state the original arm, and its SHAPE does not state it
+    /// either: a `Delete` transform is always narrower than its input, but a
+    /// `Residualize` one is `positive_spectral_frame_from_gram`, which drops the
+    /// residual Gram's null directions and so can be narrower too. The two are
+    /// therefore not distinguishable from `T` alone.
+    ///
+    /// Nothing is lost by saying so, because the arm has exactly one functional
+    /// consumer — `derive_smooth_collection_coefficient_transform`, which
+    /// DERIVES `T0` at the cold build — and a replayed gauge already carries the
+    /// `T0` that derivation produced. `realize_smooth_collection_gauge` never
+    /// reads the arm: it forms `X·T0 − C·R` and recomputes `R` from the moved
+    /// design whichever construction chose `T0`. Asking the derivation for a
+    /// frame under this arm is therefore a contradiction, and it refuses.
+    Replayed,
 }
 
 /// The COLLECTION's gauge for one smooth term: the realized constraint block it

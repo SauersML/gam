@@ -1,5 +1,32 @@
 ## Unreleased
 
+- **A collection design rebuilt from a frozen residualization chart exports a gauge** (gam#2959).
+  `apply_global_smooth_identifiability` sets `plan = Absent` whenever a term's narrowing is
+  REPLAYED from a frozen `ParametricResidualizationChart`, and an `Absent` plan derives no
+  `SmoothCollectionGauge`, so a replayed collection design carried none. Three consumers read the
+  gauge, and all three silently changed behaviour for such a term. The incremental ψ/κ realizer
+  rebuilds one smooth TERM-LOCALLY per trial and can only place that rebuild through a gauge;
+  without one it spliced the raw term-local design — one chart-width too wide, because the chart
+  is what narrows it — into a slot sized for the placed design, and refused every trial with
+  `incremental realizer width mismatch`, at the seed as well, since the chart does not move with
+  ψ. The two design-jet builders skipped their left projection `P_C = I − C(CᵀC)⁻Cᵀ`, which
+  `spatial_hyper_dirs.rs` records as the difference between a design derivative that matches
+  central differences at 5.6e-7 and one that misses by rel 6.67. A replayed term now exports a
+  gauge built from the chart it replayed: `C` is the constraint block already rebuilt for the
+  correction, `T0` is the chart's own coefficient transform, and the owner list and parametric
+  flag come from the chart. Placement recomputes the row-space correction `R(ψ)` from the moved
+  design and never reuses the chart's frozen `R`, which is training-row data for a prediction
+  replay — reusing it across ψ is the `X(ψ̂)·Z − C·R(ψ₀)` defect gam#2747 measured at
+  ‖XᵀC‖/(‖X‖‖C‖) = 4.15e-1 against the 1e-8 bar the same step asserts. `SmoothCollectionGaugeArm`
+  gains `Replayed`, because which construction originally derived `T0` is not recorded and is not
+  recoverable from `T`'s shape (a `Delete` transform is narrower than its input, but a
+  `Residualize` one is a positive spectral frame and can be narrower too); nothing is lost,
+  because the arm's only functional consumer derives `T0`, and a replayed gauge already carries
+  it. Asking that derivation for a frame under `Replayed` is a contradiction and refuses.
+  `freeze_term_collection_from_design` identified a replayed term by the ABSENCE of a gauge; it
+  now reads the spec's own `frozen_parametric_residualization`, so the freeze behaves exactly as
+  before.
+
 - **The expectile generalized fixed point refused a state whose root it could still bracket**
   (gam#1561, gam#3504). When the LAWS sign map cycles, the Clarke fixed point of the subgradient
   weight map hands the disagreeing rows to a projected Newton solve. A free row sits at a box
