@@ -248,6 +248,17 @@ pub(crate) enum SmoothingCorrectionUnavailable {
     OuterHessian {
         error: String,
     },
+    /// The criterion DECLARES it has no outer rho-Hessian, so there is no
+    /// second-order refinement of the covariance to compute and none is
+    /// missing.
+    ///
+    /// This is not a failure and is the one variant a caller must not refuse
+    /// on: the fit is converged and its point estimate and uncorrected
+    /// covariance are exactly what mgcv publishes with `unconditional = FALSE`
+    /// and what scam publishes for the same shape-constrained models. A term
+    /// priced on a profiled posterior is the case that raises it (gam#3234,
+    /// gam#1561).
+    OuterHessianDeclaredAbsent,
     OuterHessianInverse { error: String },
     PenaltyDimension {
         rho: usize,
@@ -256,6 +267,36 @@ pub(crate) enum SmoothingCorrectionUnavailable {
     },
     PenaltyStructure { error: String },
     NonFiniteCorrection,
+}
+
+/// Whether an unavailable smoothing correction REFUSES the fit.
+///
+/// Exactly one reason does not, and it is the only one that is not a failure:
+/// [`SmoothingCorrectionUnavailable::OuterHessianDeclaredAbsent`], the
+/// criterion declaring it has no outer rho-Hessian. That is a property of the
+/// model -- there is no second-order refinement of the covariance to compute,
+/// so none is missing -- and the fit publishes its point estimate and its
+/// uncorrected covariance, which is what mgcv gives with
+/// `unconditional = FALSE` and what scam gives for the same shape-constrained
+/// models (gam#3234, gam#1561).
+///
+/// Every other reason is a failure to produce a matrix that DOES exist,
+/// including every Firth case: each Firth link carries its analytic outer
+/// rho-Hessian (#3203), so an unavailable correction there is a real defect and
+/// the fit refuses. Railed coordinates are not a reason either: the correction
+/// excludes them exactly as the certificate did.
+///
+/// The rule lives here, named once, rather than as a pattern in the consumer,
+/// so a new variant has to be classified deliberately and
+/// `unavailable_correction_refusal_covers_every_failure_1561` fails if it is
+/// not.
+pub(crate) fn unavailable_correction_refuses_fit(
+    reason: &SmoothingCorrectionUnavailable,
+) -> bool {
+    !matches!(
+        reason,
+        SmoothingCorrectionUnavailable::OuterHessianDeclaredAbsent
+    )
 }
 
 /// Certified inverse of the rho-space LAML Hessian. A pseudoinverse is admitted
@@ -1877,8 +1918,31 @@ pub(crate) fn compute_smoothing_correction(
     // evaluation policy here. Unified may still perform local numerical
     // salvage inside the exact branch, but the branch choice itself no longer
     // lives inline at the call site.
-    let mut hessian_rho = match reml_state.compute_lamlhessian_consistent(final_rho) {
-        Ok(h) => h,
+    let mut hessian_rho = match reml_state
+        .compute_lamlhessian_consistent_or_declared_absent(final_rho)
+    {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            // The criterion declares it has no outer rho-Hessian. Nothing
+            // failed and nothing is missing: this correction is a second-order
+            // refinement of the covariance, and a model whose criterion has no
+            // second derivative in rho has no such refinement to carry. The
+            // uncorrected covariance stands, and the caller is told which of
+            // the two happened so it does not read a model property as a
+            // defect (gam#3234, gam#1561).
+            log::debug!(
+                "the outer criterion declares no rho-Hessian; publishing the uncorrected \
+                 covariance with no smoothing correction."
+            );
+            return SmoothingCorrectionComputation {
+                factor: None,
+                rho_covariance: None,
+                active_rank: None,
+                status: SmoothingCorrectionStatus::Unavailable(
+                    SmoothingCorrectionUnavailable::OuterHessianDeclaredAbsent,
+                ),
+            };
+        }
         Err(err) => {
             log::debug!(
                 "LAML Hessian unavailable ({}); skipping smoothing correction.",

@@ -3951,14 +3951,22 @@ where
             );
             match smoothing_outcome {
                 super::reml::eval::SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
-                    // Every Firth link carries its analytic outer ρ-Hessian
-                    // (#3203), so an unavailable correction is a real defect.
-                    // Railed coordinates are not a reason: the correction
-                    // excludes them exactly as the certificate did, so a
-                    // refusal on a railed fit is a real defect like any other.
-                    return Err(EstimationError::InvalidInput(format!(
-                        "exact smoothing-corrected covariance unavailable: {reason:?}"
-                    )));
+                    if crate::estimate::smoothing_correction::unavailable_correction_refuses_fit(
+                        &reason,
+                    ) {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "exact smoothing-corrected covariance unavailable: {reason:?}"
+                        )));
+                    }
+                    // The one reason that is not a failure: the criterion
+                    // DECLARES it has no outer ρ-Hessian, so there is no
+                    // second-order refinement of the covariance to compute and
+                    // none is missing (gam#3234, gam#1561). The fit is
+                    // converged; its point estimate and uncorrected covariance
+                    // are published, and the method stays the `None` it was
+                    // initialized to, so the fit says it carries no correction
+                    // rather than naming one it does not.
+                    smoothing_correction_method = None;
                 }
                 outcome => {
                     rho_covariance = outcome.rho_covariance().cloned();

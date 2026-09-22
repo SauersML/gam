@@ -11,6 +11,32 @@
   range rather than named, and the bar is that whole gap plus Wilkinson's `γ_{n+p}` on the
   differenced values amplified by `1/(2h)`. The window-containment check trades its `1e-9`
   for the `exp`/`ln` round trip it is actually owed. No production code moves.
+- **A criterion that DECLARES it has no outer ρ-Hessian was read as an assembly failure, and the
+  fit refused** (gam#1561, gam#3234, gam#3203). A term priced on a PROFILED posterior -- every
+  shape-constrained smooth at estimated scale -- declares no outer Hessian on purpose: its second
+  derivative carries the scale's own second-order channel, which is assembled a function away, so
+  publishing the fixed-scale matrix in its place would hand the search something that is not the
+  second derivative of the value it certifies against. `reml/eval.rs` then flattened that
+  declaration and an envelope suppression and a "not requested" into one
+  `HessianValue::Unavailable` and one string, `smoothing_correction.rs` wrapped the string as
+  `OuterHessian { error }`, and `optimizer.rs` refused the whole fit on any unavailable
+  correction -- justified in place by "Every Firth link carries its analytic outer ρ-Hessian
+  (#3203), so an unavailable correction is a real defect", which is a statement about a matrix
+  that EXISTS and was not produced. So gam could not complete a convex or monotone smooth at all,
+  and the message blamed the Hessian assembly for a matrix the criterion says does not exist. The
+  declaration is now typed and carried from its one owner: `RemlLamlResult` gains
+  `hessian_absence: Option<OuterHessianAbsence>`, set beside `hessian` at the same `if` that
+  decides it so the two cannot drift, distinguishing `ProfiledCriterionDeclares` from
+  `EnvelopeSuppressed` and `NotRequested`. `compute_lamlhessian_consistent_or_declared_absent`
+  returns `Ok(None)` for the declaration and `Err` for a failure, with the old entry points kept
+  as wrappers that turn the declaration into a refusal NAMING it, so every other caller is
+  unchanged. `unavailable_correction_refuses_fit` is the one place that decides which reasons
+  refuse: only the declaration publishes, and the fit carries its point estimate and its
+  uncorrected covariance, which is what mgcv gives with `unconditional = FALSE` and what scam
+  gives for the same models. Nothing pinned the Firth premise before, so nothing would have
+  caught the opposite mistake either; it is pinned now by
+  `smoothing_correction_refusal_1561_tests`, whose exhaustive match stops compiling if a new
+  reason is added without deciding which side it falls on.
 - **A collection design rebuilt from a frozen residualization chart exports a gauge** (gam#2959).
   `apply_global_smooth_identifiability` sets `plan = Absent` whenever a term's narrowing is
   REPLAYED from a frozen `ParametricResidualizationChart`, and an `Absent` plan derives no

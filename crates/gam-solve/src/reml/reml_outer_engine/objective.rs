@@ -724,6 +724,7 @@ pub(crate) fn reml_laml_evaluate(
             inner_polish_step,
             gradient: None,
             hessian: gam_problem::HessianValue::Unavailable,
+            hessian_absence: Some(OuterHessianAbsence::NotRequested),
             rho_mode_response_cols: None,
             ext_mode_response_cols: None,
             inner_mode_fold,
@@ -1976,7 +1977,7 @@ pub(crate) fn reml_laml_evaluate(
         }
         _ => None,
     };
-    let hessian = if mode == EvalMode::ValueGradientHessian
+    let (hessian, hessian_absence) = if mode == EvalMode::ValueGradientHessian
         && !envelope_suppresses_outputs
         && !profiled_cone_declines_hessian
     {
@@ -2045,6 +2046,7 @@ pub(crate) fn reml_laml_evaluate(
                 inner_polish_step,
                 gradient: Some(grad),
                 hessian,
+                hessian_absence: None,
                 rho_mode_response_cols,
                 ext_mode_response_cols,
                 inner_mode_fold,
@@ -2210,9 +2212,27 @@ pub(crate) fn reml_laml_evaluate(
              n={n_obs} p={p_dim} k={k_outer} elapsed={:.3}s",
             assembly_start.elapsed().as_secs_f64(),
         );
-        result
+        (result, None)
+    } else if profiled_cone_declines_hessian {
+        // The criterion DECLARES it has none. Checked before the envelope
+        // because it is a property of this model rather than of this trial: a
+        // suppression is a thing that happened at one point, a declaration
+        // holds at every point of the fit, and a consumer deciding whether its
+        // own output exists needs the durable one.
+        (
+            gam_problem::HessianValue::Unavailable,
+            Some(OuterHessianAbsence::ProfiledCriterionDeclares),
+        )
+    } else if envelope_suppresses_outputs {
+        (
+            gam_problem::HessianValue::Unavailable,
+            Some(OuterHessianAbsence::EnvelopeSuppressed),
+        )
     } else {
-        gam_problem::HessianValue::Unavailable
+        (
+            gam_problem::HessianValue::Unavailable,
+            Some(OuterHessianAbsence::NotRequested),
+        )
     };
 
     // Envelope-gradient sanity tripwire — last line of defense.
@@ -2279,6 +2299,7 @@ pub(crate) fn reml_laml_evaluate(
         inner_polish_step,
         gradient: gradient_out,
         hessian,
+        hessian_absence,
         rho_mode_response_cols,
         ext_mode_response_cols,
         inner_mode_fold,

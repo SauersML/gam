@@ -51,7 +51,56 @@ pub struct RemlLamlResult {
     /// sits close enough to the saddle bounding its basin that another basin is within one solve.
     /// `None` when the mode response names no span to grade.
     pub inner_mode_fold: Option<InnerModeFold>,
+    /// WHY this evaluation carries no outer Hessian.
+    ///
+    /// `Some` exactly when `hessian` is `HessianValue::Unavailable`, and set
+    /// beside it so the two cannot drift. `HessianValue` is `opt`'s enum and
+    /// has no room for a reason, but the reasons are not interchangeable: one
+    /// of them is a DECLARATION by the criterion that the matrix does not
+    /// exist for this model, and a consumer that reads it as a failure refuses
+    /// a fit that is fine (gam#3234, gam#1561).
+    pub hessian_absence: Option<OuterHessianAbsence>,
 }
+
+/// Why a [`RemlLamlResult`] carries no outer Hessian.
+///
+/// The three are different findings and only the criterion can tell them
+/// apart, so it says which one it is rather than leaving every consumer to
+/// read `HessianValue::Unavailable` as the same thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OuterHessianAbsence {
+    /// The evaluation mode did not ask for one. Nothing is wrong and nothing
+    /// was attempted.
+    NotRequested,
+    /// THE CRITERION DECLARES IT HAS NONE, and this is a property of the model.
+    ///
+    /// The second derivative of a term priced on a PROFILED posterior carries
+    /// the scale's own second-order channel, which is assembled a function
+    /// away, so publishing the fixed-scale Hessian in its place would hand a
+    /// caller a matrix that is not the second derivative of the value the fit
+    /// certifies against. The criterion declares no Hessian instead and the
+    /// outer plan reads that declaration before the search starts (gam#3234).
+    ///
+    /// A consumer whose own output is DEFINED without the Hessian -- the
+    /// smoothing correction, whose absence leaves the uncorrected covariance --
+    /// records that it was declined and carries on. A consumer that needs the
+    /// matrix refuses, naming this.
+    ProfiledCriterionDeclares,
+    /// The envelope-gradient tripwire suppressed this evaluation's outputs, so
+    /// no Hessian was assembled for a point whose gradient is already invalid
+    /// as a descent direction. A numerical event at this trial, not a property
+    /// of the model.
+    EnvelopeSuppressed,
+}
+
+impl OuterHessianAbsence {
+    /// Whether the absence is the criterion's own declaration rather than a
+    /// failure or a suppression at this trial.
+    pub fn is_declared_by_criterion(self) -> bool {
+        matches!(self, Self::ProfiledCriterionDeclares)
+    }
+}
+
 
 impl RemlLamlResult {
     /// The outer gradient an evaluation in `mode` hands its caller.

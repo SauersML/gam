@@ -53,6 +53,20 @@ impl SmoothingCorrectionOutcome {
     }
 }
 
+/// The refusal a caller that NEEDS a dense outer rho-Hessian gets when the
+/// criterion declares it has none.
+///
+/// One text, named once, so the two wrappers that turn the declaration into an
+/// error cannot describe it differently.
+fn declared_no_outer_hessian() -> EstimationError {
+    EstimationError::InvalidInput(
+        "this fit's outer criterion declares no rho-Hessian -- a term priced on a profiled \
+         posterior carries the scale's own second-order channel (gam#3234) -- so there is no \
+         matrix to return here"
+            .to_string(),
+    )
+}
+
 /// Process-wide count of numerical failures inside
 /// [`RemlState::compute_smoothing_correction_outcome`]: the exact first-order
 /// geometry could not be formed on a fit that has smoothing parameters.
@@ -178,34 +192,76 @@ impl<'a> RemlState<'a> {
         Ok((value, rank, det1, det2))
     }
 
-    pub(super) fn compute_lamlhessian_exact_from_bundle(
+    /// The outer rho-Hessian at `rho`, or `Ok(None)` when THIS CRITERION
+    /// DECLARES it has none.
+    ///
+    /// `Ok(None)` is a property of the model and `Err` is a failure, and this
+    /// is where the two stop being the same thing. The criterion states which
+    /// it is on `RemlLamlResult::hessian_absence`; before it did, both arrived
+    /// as `HessianValue::Unavailable` and were flattened into one string, so a
+    /// consumer could only read a declaration as a failure -- which is how a
+    /// shape-constrained fit at profiled dispersion, whose criterion correctly
+    /// declares no Hessian (gam#3234), was refused outright (gam#1561).
+    ///
+    /// An envelope suppression still errors: it is a numerical event at THIS
+    /// trial, and a caller asking for the Hessian at a point whose gradient is
+    /// already invalid should hear about it.
+    pub(super) fn compute_lamlhessian_or_declared_absent_from_bundle(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
-    ) -> Result<Array2<f64>, EstimationError> {
+    ) -> Result<Option<Array2<f64>>, EstimationError> {
         let mode = super::reml_outer_engine::EvalMode::ValueGradientHessian;
         let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             self.evaluate_unified_sparse(rho, bundle, mode)?
         } else {
             self.evaluate_unified(rho, bundle, mode)?
         };
-        result
+        if result
+            .hessian_absence
+            .is_some_and(super::reml_outer_engine::OuterHessianAbsence::is_declared_by_criterion)
+        {
+            return Ok(None);
+        }
+        let dense = result
             .hessian
             .materialize_dense()
             .map_err(|error| EstimationError::RemlOptimizationFailed(error.to_string()))?
             .ok_or_else(|| {
-                EstimationError::RemlOptimizationFailed(
-                    "Unified Hessian returned no analytic representation for VGH mode".into(),
-                )
-            })
+                EstimationError::RemlOptimizationFailed(format!(
+                    "the unified evaluation returned no outer rho-Hessian in VGH mode, and the \
+                     criterion did not declare that it has none: {:?}",
+                    result.hessian_absence
+                ))
+            })?;
+        Ok(Some(dense))
     }
 
-    pub(crate) fn compute_lamlhessian_consistent(
+    pub(super) fn compute_lamlhessian_exact_from_bundle(
         &self,
         rho: &Array1<f64>,
+        bundle: &EvalShared,
     ) -> Result<Array2<f64>, EstimationError> {
+        self.compute_lamlhessian_or_declared_absent_from_bundle(rho, bundle)?
+            .ok_or_else(declared_no_outer_hessian)
+    }
+
+    /// The outer rho-Hessian at `rho`, or `Ok(None)` when THIS CRITERION
+    /// DECLARES it has none
+    /// ([`Self::compute_lamlhessian_or_declared_absent_from_bundle`]).
+    ///
+    /// A caller that needs a dense matrix, and has nothing to say about a
+    /// model that has none, calls [`Self::compute_lamlhessian_consistent`],
+    /// which turns the declaration into a refusal that names it. A caller
+    /// whose own output is DEFINED without the Hessian -- the smoothing
+    /// correction, whose absence leaves the uncorrected covariance -- reads
+    /// the `Option` and reports which of the two happened.
+    pub(crate) fn compute_lamlhessian_consistent_or_declared_absent(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
-        let hessian = self.compute_lamlhessian_exact_from_bundle(rho, &bundle);
+        let hessian = self.compute_lamlhessian_or_declared_absent_from_bundle(rho, &bundle);
         // Read after the evaluation: a first evaluation is what latches the
         // #784 block, and with it whether `Δ_b` has a closed-form ρ-Hessian.
         if let Some(reason) = self.block_correction_hessian_refusal() {
@@ -215,6 +271,14 @@ impl<'a> RemlState<'a> {
             );
         }
         hessian
+    }
+
+    pub(crate) fn compute_lamlhessian_consistent(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        self.compute_lamlhessian_consistent_or_declared_absent(rho)?
+            .ok_or_else(declared_no_outer_hessian)
     }
 
     /// Tier-0 of the marginal-smoothing inference stack (#938): the PSIS

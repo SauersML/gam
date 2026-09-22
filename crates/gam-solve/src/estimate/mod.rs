@@ -157,6 +157,8 @@ mod ridge_continuity_tests;
 #[cfg(test)]
 mod score_test_working_residual_3832_tests;
 #[cfg(test)]
+mod smoothing_correction_refusal_1561_tests;
+#[cfg(test)]
 mod student_t_laml_tests;
 #[cfg(test)]
 mod wide_design_reml_derivatives_tests;
