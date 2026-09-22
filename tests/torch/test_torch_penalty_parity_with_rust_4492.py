@@ -21,15 +21,22 @@ Two things are asserted here, and they are different claims:
   passes now: the entry returns, for each of the two terms, as many penalties as
   `gamfit.fit` carries smoothing parameters for that term, each square on the
   realized design block.
-* `test_torch_fit_matches_rust_fit_on_te_and_matern` is the parity the issue
-  asks for -- per-margin λ̂, EDF and fitted values -- and is a STRICT xfail on
-  `NotImplementedError` until the block backend takes a penalty list per block
-  (gam#4492 step 2). `gaussian_reml_fit_blocks_exact` prices
-  `P = blockdiag(λ_k S_k)`, one λ per coefficient block, and both terms realize
-  several penalties on ONE block. The torch fit refuses rather than summing them
-  under a single λ, because that sum IS the divergence. Strict xfail means the
-  day step 2 lands this test reports the parity instead of the refusal, and any
-  failure that is not that refusal fails the suite today.
+* `test_torch_fit_refuses_to_price_several_penalties_under_one_lambda` asserts
+  what the torch path does TODAY: it refuses. `gaussian_reml_fit_blocks_exact`
+  prices `P = blockdiag(λ_k S_k)`, one λ per coefficient block, and both terms
+  realize several penalties on ONE block. Summing them under a single λ IS the
+  divergence this issue is about, so refusing is the correct behaviour until the
+  block backend takes a penalty list per block (gam#4492 step 2).
+
+This test used to carry a strict expected-failure marker on the parity
+assertion, raising on `NotImplementedError`. SPEC rule 16 forbids the
+expected-failure pattern outright -- "a failing test should always indicate
+problematic behavior" -- with no exception for a strict marker, and gam#2901
+lists rule 16 as clean, so the marker was a live violation of an audit that
+reports itself closed on that rule. The refusal is asserted directly instead,
+which costs nothing the marker bought: the day step 2 lands, the refusal stops
+and `pytest.raises` fails, the same signal the strict marker gave, and any OTHER
+failure fails today rather than being absorbed as expected.
 """
 
 from __future__ import annotations
@@ -166,18 +173,16 @@ def test_the_entry_refuses_a_descriptor_that_is_not_the_terms(
     assert "marginals" in str(caught.value), str(caught.value)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=NotImplementedError,
-    reason=(
-        "gam#4492 step 2: gaussian_reml_fit_blocks_exact prices one lambda per "
-        "coefficient block, and both terms realize several penalties on one "
-        "block. The torch fit refuses rather than summing them under a single "
-        "lambda. This becomes the parity assertion when the block API takes a "
-        "penalty list per block."
-    ),
-)
-def test_torch_fit_matches_rust_fit_on_te_and_matern() -> None:
+def test_torch_fit_refuses_to_price_several_penalties_under_one_lambda() -> None:
+    """Both terms realize several penalties on one coefficient block, and the
+    block backend prices one lambda per block, so the torch fit REFUSES.
+
+    Asserted, not marked expected-to-fail. When gam#4492 step 2 lands and the
+    block API takes a penalty list per block, both refusals stop and the
+    `pytest.raises` blocks below fail. That failure is the instruction to replace
+    this body with the two fits and `_assert_fit_parity`, which is written below
+    and already carries the bar the parity is stated in.
+    """
     frame, _ = _surface_frame()
     response = torch.as_tensor(frame["y"], dtype=torch.float64).reshape(-1, 1)
 
@@ -185,22 +190,41 @@ def test_torch_fit_matches_rust_fit_on_te_and_matern() -> None:
     tensor_points = torch.as_tensor(
         np.column_stack([frame["x1"], frame["x2"]]), dtype=torch.float64
     )
-    torch_tensor_fit = gt.fit(tensor_points, response, tensor_smooth)
-    rust_tensor_fit = gamfit.fit(
-        frame, "y ~ te(x1, x2)", smooths={("x1", "x2"): tensor_smooth}
+    with pytest.raises(NotImplementedError) as tensor_refusal:
+        gt.fit(tensor_points, response, tensor_smooth)
+    assert "penalt" in str(tensor_refusal.value).lower(), (
+        "te(x1, x2): the torch fit refused, but not for the several-penalties "
+        f"reason this test is about: {tensor_refusal.value}"
     )
-    _assert_fit_parity("te(x1, x2)", torch_tensor_fit, rust_tensor_fit, frame)
 
     centers = _matern_centers()
     matern_smooth = _matern_smooth(centers)
     matern_points = torch.as_tensor(
         frame["x1"].reshape(-1, 1), dtype=torch.float64
     )
-    torch_matern_fit = gt.fit(matern_points, response, matern_smooth)
+    with pytest.raises(NotImplementedError) as matern_refusal:
+        gt.fit(matern_points, response, matern_smooth)
+    assert "penalt" in str(matern_refusal.value).lower(), (
+        "matern(x1): the torch fit refused, but not for the several-penalties "
+        f"reason this test is about: {matern_refusal.value}"
+    )
+
+    # The Rust arm fits both today, which is what makes the torch refusal a
+    # DIVERGENCE rather than a shared limitation. Naming it here keeps that half
+    # of the claim measured instead of assumed.
+    rust_tensor_fit = gamfit.fit(
+        frame, "y ~ te(x1, x2)", smooths={("x1", "x2"): tensor_smooth}
+    )
     rust_matern_fit = gamfit.fit(
         frame, "y ~ matern(x1)", smooths={"x1": matern_smooth}
     )
-    _assert_fit_parity("matern(x1)", torch_matern_fit, rust_matern_fit, frame)
+    assert len(rust_tensor_fit.smoothing_parameters()) > 1, (
+        "te(x1, x2): the Rust fit carries "
+        f"{len(rust_tensor_fit.smoothing_parameters())} smoothing parameters; "
+        "with one, the torch backend would have nothing to refuse and this "
+        "test would be asserting a refusal that is not #4492's"
+    )
+    assert len(rust_matern_fit.smoothing_parameters()) >= 1
 
 
 def _assert_fit_parity(

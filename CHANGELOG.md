@@ -100,6 +100,16 @@
   one value per pair and is untouched; the `BlockDiagonal` target carried the same defect and
   takes the same rule. Every total is unchanged, so no fitted value moves except where the matrix
   previously could not be decomposed at all.
+- **The torch penalty-parity test asserts the refusal instead of marking it expected**
+  (#2901, #4492). `test_torch_penalty_parity_with_rust_4492.py` carried a strict
+  expected-failure marker raising on `NotImplementedError`, which is the pattern SPEC rule 16
+  forbids outright. The marker also sat under an audit that lists rule 16 as clean, so it was
+  invisible to the audit that owns it. The torch fit's refusal is now asserted directly, for
+  both the tensor and Matérn arms, with the Rust arm's smoothing-parameter count checked
+  beside it so the refusal is pinned as a divergence rather than a shared limitation. The day
+  the block backend takes a penalty list per block, the refusal stops and the assertions fail,
+  which is the same signal the strict marker gave.
+
 - **The fold record named the mode's softest direction but never carried it, so a mode one solve
   away from a lower basin had nowhere to go** (gam#3173, gam#2765). The Laplace normalizer is the
   Gaussian integral of the quadratic model about the inner mode, and along the softest eigenpair
@@ -500,6 +510,7 @@
 0.1.269 was tagged on 2026-09-21 and never reached PyPI: its release run
 failed on the free-threaded cp314t wheel and the sdist, fixed since.
 
+## gamfit 0.1.269 (2026-09-21)
 
 - A Bernoulli marginal-slope prediction table carries `mean_score_derivative`
   (`d mean / dz`) and `probit_score_derivative` (`d probit(mean) / dz`), the
