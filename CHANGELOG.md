@@ -62,6 +62,25 @@
   materialized grid, because the cone is already the largest object the term reads and the
   pair grid would square it. The standard route is unchanged: there `A` and `b` are the fit's
   own `linear_constraints_transformed`, fixed for the fit, so `None` is exact.
+- **The smoothing-corrected covariance carries the curvature half of the theta-mixture
+  variance, where the identity it rests on holds** (gam#3229).
+  A smoothing-corrected covariance reports `Var(β | y) = E_θ[V(θ)] + Var_θ(m(θ))`, which to
+  first order in `V_θ` is `V(θ̂) + J_m V_θ J_mᵀ + ½ Σ_jk V_θ[j,k] ∂²V/∂θ_j∂θ_k`. Only the
+  middle term was ever assembled, and the third is the SAME ORDER, not a remainder: on the
+  issue's Gauss-Hermite witness they are `2.77e-5` and `−1.99e-5` at `V_θ = 0.005`, and their
+  sum `7.8e-6` is the exact mixture's `7.84e-6` while the carried term alone is off by a
+  factor of three and a half. `gam_solve::estimate::smoothing_curvature` derives the missing
+  term in closed form wherever the reported conditional covariance is the penalized
+  precision's inverse: the penalties carry no ρ, so `Ṁ_k = λ_k S̃_k` and `M̈_jk = δ_jk λ_k S̃_k`
+  exactly, and `½ tr(V''V_ρ)` is `V[Σ_m E_m V E_m]V − ½ V[Σ_k V_ρ[k,k] D_k]V` with
+  `E_m = Σ_j L[j,m] D_j` over any factorization `V_ρ = L Lᵀ` — `k` products, the same order as
+  the first-order term's own chain, rather than the `k²` a double sum would cost. The term is
+  symmetric and INDEFINITE, which is why it is added as a matrix and not folded into the
+  correction's PSD factor. Two regimes are named rather than priced with the ambient
+  identity, because either would be a third convention on top of the two this issue reports:
+  a constrained mode, where the reported `V` is the truncated-Gaussian covariance on the cone
+  and its second derivative is a cumulant object, and a design (ψ) axis, whose `M̈` is the
+  family's own second design derivative and is published by no family.
 
 - **The fold record named the mode's softest direction but never carried it, so a mode one solve
   away from a lower basin had nowhere to go** (gam#3173, gam#2765). The Laplace normalizer is the

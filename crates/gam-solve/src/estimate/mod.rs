@@ -75,6 +75,7 @@ mod prefit;
 pub mod rho_domain;
 mod smooth_term_summary;
 pub(crate) mod smoothing_correction;
+pub mod smoothing_curvature;
 mod summary;
 
 pub use crate::model_types::result_types::dispersion_from_likelihood;
@@ -124,6 +125,7 @@ pub use smoothing_correction::{
     EigenClassification, InvertedRhoHessian, invert_identified_rho_hessian,
     invert_identified_rho_hessian_off_railed,
 };
+pub use smoothing_curvature::{CovarianceCurvatureAbsence, laplace_covariance_curvature_term};
 pub use summary::{
     ContinuousSmoothnessOrder, ContinuousSmoothnessOrderStatus,
     ParametricPValueUnavailable, ParametricTermSummary, ParametricTest,

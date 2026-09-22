@@ -2728,6 +2728,10 @@ fn survival_unified_fit_result(
                     outer_hessian,
                     outer_gradient.as_ref().unwrap_or(&no_gradient),
                     &excluded,
+                    // gam#3229: this mint assembles `U` from `lambdas[coordinate] * S_beta`
+                    // per block range and never forms the drift MATRICES `D_k = lambda_k S_k`
+                    // the curvature half contracts, so it carries the first-order term only.
+                    &[],
                 )
                 .map_err(|reason| {
                     format!("survival transformation smoothing correction: {reason}")

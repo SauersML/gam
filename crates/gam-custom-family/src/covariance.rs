@@ -2211,8 +2211,15 @@ pub(crate) fn joint_smoothing_correction(
         &layout.joint_to_outer,
         rho_outer.len(),
     )?;
-    first_order_smoothing_correction(v_cond, &u_mat, outer_hessian, outer_gradient, excluded_outer)
-        .map_err(CustomFamilyError::trial_point)
+    first_order_smoothing_correction(
+        v_cond,
+        &u_mat,
+        outer_hessian,
+        outer_gradient,
+        excluded_outer,
+        &[],
+    )
+    .map_err(CustomFamilyError::trial_point)
 }
 
 /// The smoothing columns of the score matrix `U`, `U[:, o] = ∂(S_λ β̂)/∂ρ_o =
@@ -2336,6 +2343,9 @@ pub(crate) fn owned_mode_smoothing_correction(
     outer_hessian: &Array2<f64>,
     outer_gradient: &Array1<f64>,
     excluded_outer: &[usize],
+    // Whether the mode is interior, i.e. no inequality row is active, so the reported
+    // conditional covariance is the penalized precision's inverse (gam#3229).
+    mode_is_interior: bool,
 ) -> Result<
     Result<(Array2<f64>, usize), gam_solve::model_types::SmoothingCorrectionAbsence>,
     CustomFamilyError,
@@ -2369,8 +2379,88 @@ pub(crate) fn owned_mode_smoothing_correction(
     u_mat
         .slice_mut(ndarray::s![.., k_rho..])
         .assign(psi_scores);
-    first_order_smoothing_correction(v_cond, &u_mat, outer_hessian, outer_gradient, excluded_outer)
-        .map_err(CustomFamilyError::trial_point)
+    // gam#3229: the curvature half `½ tr(V'' V_ρ)` is carried exactly where the reported
+    // conditional covariance IS the penalized precision's inverse, which is an interior mode
+    // over ρ coordinates alone. At a constrained mode the reported `V` is the truncated
+    // covariance on the cone, whose second θ-derivative is a cumulant object; a ψ axis's `M̈`
+    // is the family's own second design derivative and is published nowhere. Both are named
+    // in the log and left uncarried rather than priced with the ambient identity, which
+    // would be a third convention on top of the two this issue already reports.
+    let drifts = if !mode_is_interior {
+        log::debug!(
+            "[smoothing-correction] curvature=absent reason=truncated-conditional-covariance \
+             (gam#3229)"
+        );
+        Vec::new()
+    } else if psi_dim > 0 {
+        log::debug!(
+            "[smoothing-correction] curvature=absent reason=design-axes psi_dimension={psi_dim} \
+             (gam#3229)"
+        );
+        Vec::new()
+    } else {
+        penalty_precision_drifts(specs, rho, v_cond.nrows())?
+    };
+    first_order_smoothing_correction(
+        v_cond,
+        &u_mat,
+        outer_hessian,
+        outer_gradient,
+        excluded_outer,
+        &drifts,
+    )
+    .map_err(CustomFamilyError::trial_point)
+}
+
+/// The ρ-drifts of the penalized precision, `D_k = λ_k S̃_k`, in the joint coefficient frame
+/// the conditional covariance lives in (gam#3229).
+///
+/// These are exact rather than modelled: the penalties carry no ρ, so `Ṁ_k = λ_k S̃_k` and
+/// `M̈_jk = δ_jk λ_k S̃_k`. The slot order is the one `penalty_score_columns` lays the ρ
+/// columns of `U` down in — block-major, then the block's own penalty order — so drift `o`
+/// and column `o` of `U` name the same coordinate, which is the invariant
+/// `first_order_smoothing_correction` indexes them by.
+fn penalty_precision_drifts(
+    specs: &[ParameterBlockSpec],
+    rho: &Array1<f64>,
+    p_total: usize,
+) -> Result<Vec<Array2<f64>>, CustomFamilyError> {
+    let mut drifts = Vec::with_capacity(rho.len());
+    let mut start = 0usize;
+    let mut slot = 0usize;
+    for spec in specs {
+        let width = spec.design.ncols();
+        for penalty in &spec.penalties {
+            if slot >= rho.len() {
+                return Err(CustomFamilyError::trial_point(format!(
+                    "covariance curvature drift: penalty slot {slot} past {} rho coordinate(s)",
+                    rho.len()
+                )));
+            }
+            let lambda = gam_problem::checked_exp_log_strength(rho[slot]).map_err(|error| {
+                CustomFamilyError::trial_point(format!(
+                    "covariance curvature drift: penalty slot {slot}: {error}"
+                ))
+            })?;
+            let block = penalty.to_dense();
+            if block.dim() != (width, width) {
+                return Err(CustomFamilyError::trial_point(format!(
+                    "covariance curvature drift: penalty slot {slot} is {:?} for a {width}-column \
+                     block",
+                    block.dim()
+                )));
+            }
+            let mut drift = Array2::<f64>::zeros((p_total, p_total));
+            drift
+                .slice_mut(ndarray::s![start..start + width, start..start + width])
+                .assign(&block);
+            drift *= lambda;
+            drifts.push(drift);
+            slot += 1;
+        }
+        start += width;
+    }
+    Ok(drifts)
 }
 
 /// First-order ρ-uncertainty inflation `C = A·V_ρ·Aᵀ` of a conditional
@@ -2398,6 +2488,7 @@ pub fn first_order_smoothing_correction(
     outer_hessian: &Array2<f64>,
     outer_gradient: &Array1<f64>,
     excluded_outer: &[usize],
+    precision_drifts: &[Array2<f64>],
 ) -> Result<Result<(Array2<f64>, usize), gam_solve::model_types::SmoothingCorrectionAbsence>, String>
 {
     let (p_total, k_outer) = u_mat.dim();
@@ -2490,6 +2581,33 @@ pub fn first_order_smoothing_correction(
     }
     let a_mat = v_cond.dot(&u_inc);
     let mut correction = a_mat.dot(&inverted.inverse).dot(&a_mat.t());
+
+    // gam#3229: `J V_ρ Jᵀ` is one of TWO terms of the θ-mixture variance at first order in
+    // `V_ρ`. The other, `½ tr(V'' V_ρ)`, is the same order, not a remainder: on the issue's
+    // one-dimensional witness they are `2.77e-5` and `−1.99e-5` at `V_ρ = 0.005`, and their
+    // sum is the exact mixture's `7.84e-6` while the first alone is off by three and a half.
+    // A caller that supplies the precision's ρ-drifts `D_k = λ_k S̃_k` carries it; an empty
+    // slice is a caller whose reported `V` is not the penalized precision's inverse, where
+    // the identity does not hold and the term must be named rather than priced (see
+    // `gam_solve::estimate::smoothing_curvature`).
+    if !precision_drifts.is_empty() {
+        if precision_drifts.len() != k_outer {
+            return Err(format!(
+                "smoothing correction: {} precision drift(s) for {k_outer} outer coordinate(s)",
+                precision_drifts.len()
+            ));
+        }
+        let included_drifts: Vec<Array2<f64>> = included
+            .iter()
+            .map(|&o| precision_drifts[o].clone())
+            .collect();
+        let curvature = gam_solve::estimate::laplace_covariance_curvature_term(
+            v_cond.view(),
+            &included_drifts,
+            inverted.inverse.view(),
+        )?;
+        correction += &curvature;
+    }
     symmetrize_dense_in_place(&mut correction);
     Ok(Ok((correction, inverted.active_rank)))
 }
@@ -2516,7 +2634,7 @@ mod required_covariance_tests {
         let gradient = array![0.0_f64, 1.0e-6];
         let saturated = array![[2.0_f64, 0.0], [0.0, -1.0e-7]];
         let (correction, active_rank) =
-            first_order_smoothing_correction(&v_cond, &u, &saturated, &gradient, &[])
+            first_order_smoothing_correction(&v_cond, &u, &saturated, &gradient, &[], &[])
                 .expect("well-formed inputs")
                 .expect("a direction under the gradient floor is dropped, not refused");
         assert_eq!(active_rank, 1);
@@ -2525,7 +2643,8 @@ mod required_covariance_tests {
         assert!(correction[[0, 1]].abs() <= 1e-12, "{correction:?}");
 
         let contradicted = array![[2.0_f64, 0.0], [0.0, -1.0e-3]];
-        let absence = first_order_smoothing_correction(&v_cond, &u, &contradicted, &gradient, &[])
+        let absence =
+            first_order_smoothing_correction(&v_cond, &u, &contradicted, &gradient, &[], &[])
             .expect("well-formed inputs");
         assert!(
             matches!(
@@ -2578,6 +2697,7 @@ mod required_covariance_tests {
             &outer_hessian,
             &no_gradient,
             &[],
+            true,
         )
         .expect("well-formed inputs")
         .expect("a positive-definite outer Hessian mints the correction");
@@ -2596,6 +2716,7 @@ mod required_covariance_tests {
             &outer_hessian,
             &no_gradient,
             &[1],
+            true,
         )
         .expect("well-formed inputs")
         .expect("excluding the psi rail leaves the rho correction");
@@ -2615,9 +2736,100 @@ mod required_covariance_tests {
                 &outer_hessian,
                 &no_gradient,
                 &[],
+                true,
             )
             .is_err(),
             "psi scores in another coefficient frame are refused"
+        );
+    }
+
+    /// gam#3229. At an interior mode over rho coordinates alone the mint carries
+    /// `1/2 tr(V'' V_rho)` beside `A V_rho A'`, and the difference between that correction
+    /// and the same mode declared constrained is EXACTLY the published curvature term. This
+    /// pins the wiring -- the interior gate, the drift order, and the identified-subspace
+    /// restriction -- against the derivation, whose own oracle lives beside it in
+    /// `gam_solve::estimate::smoothing_curvature`.
+    #[test]
+    fn an_interior_rho_only_mode_carries_the_covariance_curvature_3229() {
+        let specs = vec![ParameterBlockSpec {
+            name: "interior-rho-only".to_string(),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 2)),
+            )),
+            offset: Array1::zeros(1),
+            penalties: vec![PenaltyMatrix::Dense(array![[2.0_f64, 0.0], [0.0, 1.0]])],
+            nullspace_dims: vec![0],
+            initial_log_lambdas: array![0.0],
+            initial_beta: None,
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        }];
+        let states = vec![ParameterBlockState {
+            beta: array![1.0_f64, -1.0],
+            eta: array![0.0],
+        }];
+        let v_cond = array![[2.0_f64, 0.5], [0.5, 1.0]];
+        let rho = array![3.0_f64.ln()];
+        let no_psi = Array2::<f64>::zeros((2, 0));
+        let outer_hessian = array![[4.0_f64]];
+        let no_gradient = Array1::<f64>::zeros(0);
+
+        let (interior, interior_rank) = owned_mode_smoothing_correction(
+            &v_cond,
+            &specs,
+            &rho,
+            &states,
+            &no_psi,
+            &outer_hessian,
+            &no_gradient,
+            &[],
+            true,
+        )
+        .expect("well-formed inputs")
+        .expect("a positive-definite outer Hessian mints the correction");
+        let (constrained, constrained_rank) = owned_mode_smoothing_correction(
+            &v_cond,
+            &specs,
+            &rho,
+            &states,
+            &no_psi,
+            &outer_hessian,
+            &no_gradient,
+            &[],
+            false,
+        )
+        .expect("well-formed inputs")
+        .expect("a constrained mode still mints the first-order correction");
+        assert_eq!(interior_rank, constrained_rank);
+
+        let lambda = 3.0_f64;
+        let drift = specs[0].penalties[0].to_dense().mapv(|value| value * lambda);
+        let expected = gam_solve::estimate::laplace_covariance_curvature_term(
+            v_cond.view(),
+            std::slice::from_ref(&drift),
+            array![[0.25_f64]].view(),
+        )
+        .expect("the published curvature term");
+        let difference = &interior - &constrained;
+        let magnitude = expected
+            .iter()
+            .chain(difference.iter())
+            .fold(0.0_f64, |worst, value| worst.max(value.abs()));
+        // Both sides are the same three products of the same operands; the only difference
+        // is the addition and the symmetrization the mint applies, so the band is those two
+        // roundings at half an ulp of the result's own magnitude.
+        let band = 4.0 * f64::EPSILON * magnitude;
+        for (index, (carried, want)) in difference.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (carried - want).abs() <= band,
+                "entry {index}: the mint carried {carried:e} against the published {want:e}"
+            );
+        }
+        assert!(
+            magnitude > 0.0,
+            "the fixture's curvature term is non-zero, so the comparison is not vacuous"
         );
     }
 

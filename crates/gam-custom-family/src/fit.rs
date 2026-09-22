@@ -4437,6 +4437,7 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
                         outer_hessian,
                         outer.final_gradient().unwrap_or(&no_gradient),
                         &excluded,
+                        inner.active_constraints.is_none(),
                     )? {
                         Ok((correction, active_rank)) => (
                             Some((
