@@ -1,5 +1,24 @@
 use std::process::Command;
 
+/// Remove a fixture directory if it is there.
+///
+/// `remove_dir_all` on a path that does not exist is `NotFound`, and these three call sites are
+/// PRE-cleans: each names its directory after the running process and creates it on the next line,
+/// so on any runner that has not already got one the removal cannot succeed. They were written as
+/// `let _ = std::fs::remove_dir_all(&dir);`, which the build scanner's ban on discarded results
+/// then turned into an `expect` (2787813481) — and that changed a best-effort clean into a
+/// requirement that a directory which is not there be removable, so every run panicked before the
+/// test began. Discarding the result is still wrong: a directory that IS there and cannot be
+/// removed is this test's failure, because the next line would write into whatever is left.
+fn clear_if_present(dir: &std::path::Path) {
+    std::fs::remove_dir_all(dir)
+        .or_else(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(error),
+        })
+        .expect("a fixture directory that is present is removed before the test writes into it");
+}
+
 #[test]
 fn test_reference_quality_classifier() {
     let yaml = std::fs::read_to_string(".github/workflows/reference-quality.yml").unwrap();
@@ -421,7 +440,10 @@ fn merge_script(yaml: &str) -> String {
 fn test_reference_quality_merge_folds_every_shard_row_exactly_once() {
     let yaml = std::fs::read_to_string(".github/workflows/reference-quality.yml").unwrap();
     let dir = std::env::temp_dir().join(format!("quality_merge_{}", std::process::id()));
-    std::fs::remove_dir_all(&dir).expect("the fixture directory is removed after the test");
+    // A pre-clean, not a post-clean: the directory is named after this process and does not
+    // exist on a fresh runner, so requiring its removal to SUCCEED fails every run with
+    // `NotFound`. An error that is not `NotFound` is still this test's, and is raised.
+    clear_if_present(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
     // Point the block at this fixture instead of the job's absolute paths. The
@@ -469,7 +491,7 @@ fn test_reference_quality_merge_folds_every_shard_row_exactly_once() {
                      2\tPASS\tok\tb::t4\t0\t2\t1\t0\t\t\n";
 
     let run = || -> (Vec<String>, String) {
-        std::fs::remove_dir_all(&merged).expect("the merged fixture directory is removed after the test");
+        clear_if_present(&merged);
         let output = Command::new("bash").arg(&script).output().unwrap();
         assert!(
             output.status.success(),
@@ -580,7 +602,10 @@ fn test_reference_quality_merge_folds_every_shard_row_exactly_once() {
 fn test_reference_quality_shard_plan_fits_every_shard_in_the_step_cap() {
     let yaml = std::fs::read_to_string(".github/workflows/reference-quality.yml").unwrap();
     let dir = std::env::temp_dir().join(format!("quality_plan_{}", std::process::id()));
-    std::fs::remove_dir_all(&dir).expect("the fixture directory is removed after the test");
+    // A pre-clean, not a post-clean: the directory is named after this process and does not
+    // exist on a fresh runner, so requiring its removal to SUCCEED fails every run with
+    // `NotFound`. An error that is not `NotFound` is still this test's, and is raised.
+    clear_if_present(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
     // The plan is a python heredoc in the `plan` job; run the same body.
