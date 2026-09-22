@@ -677,6 +677,7 @@ impl EventHistoryFamily {
         Ok(self.adjoint_hessian(states, &beta)?)
     }
 
+    #[cfg(test)]
     pub(super) fn computed_joint<S: Directional>(
         &self, states: &[ParameterBlockState], u: Option<&Array1<f64>>,
         v: Option<&Array1<f64>>, derivatives: bool,
