@@ -2578,7 +2578,6 @@ mod reselection_tests {
         .unwrap()
     }
 
-    #[test]
     /// The Poisson analogue of [`fixture`]: the same design and one selected
     /// strength on the non-intercept column, with counts on a rising trend.
     fn poisson_fixture(scale: f64, warm: Array1<f64>) -> GlmFullConformalSubstrate {
