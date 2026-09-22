@@ -2218,6 +2218,7 @@ pub fn filter_penalty_candidates(
             op,
         } = candidate;
         let structural_null_frame = matrix.structural_null_frame().cloned();
+        let energy_factor = matrix.factor().clone();
         let analysis = analyze_penalty_block_with_op(&matrix, op)?;
         let dropped_reason = if analysis.rank == 0 {
             Some(if analysis.iszero {
@@ -2266,6 +2267,20 @@ pub fn filter_penalty_candidates(
                     normalization_scale,
                     kronecker_factors,
                     structural_null_frame,
+                    // The candidate's own factor, carried rather than
+                    // re-derived. `ConstructiveQuadratic` documents it as the
+                    // authoritative representation and says rank logic must use
+                    // it; this is the point where the record stops being a
+                    // candidate and the factor would otherwise be dropped.
+                    //
+                    // `try_from_dense_psd` reconstructs a factor from the dense
+                    // Gram's spectrum, so for a bridged factory the factor is a
+                    // function of the matrix and carries nothing the matrix does
+                    // not. It is carried anyway: `AᵀA` is the matrix either way,
+                    // and a reader gains nothing by having to know which
+                    // constructor a factory used. `matrix` here is the SYMMETRIZED
+                    // Gram, so the two agree to that symmetrization's rounding.
+                    energy_factor: Some(energy_factor),
                 },
             });
         }

@@ -1839,6 +1839,31 @@ pub struct ActivePenaltyInfo {
     /// from the basis factory, which is the single source.
     #[serde(skip)]
     pub structural_null_frame: Option<Array2<f64>>,
+    /// The candidate's energy factor `A` with `AᵀA = matrix`, when its factory
+    /// built the quadratic from one (`ConstructiveQuadratic::from_energy_factor`).
+    ///
+    /// It is carried because the RANK of an accumulated penalty cannot be read
+    /// back off its matrix. A direction whose factor singular value is `σ`
+    /// appears in `S = AᵀA` as `σ²`, so resolving it against the Gram's band
+    /// `p·ε·‖S‖₂` needs `σ/σ_max > √(p·ε) ≈ 1e-7`, while resolving it against
+    /// the factor's own band needs `σ/σ_max > max(m,n)·ε ≈ 1e-14`. Squaring
+    /// throws away half the digits the factor has, which is why a Matérn
+    /// collocation Gram "loses genuine modes to its band" (gam#3236) and why a
+    /// rank frozen at one κ cannot be realized at another (gam#2959, gam#1561).
+    ///
+    /// `None` for a factory whose matrix is authoritative and not accumulated (a
+    /// closed-form analytic penalty, a ridge, a Kronecker product): reading its
+    /// Gram IS reading the object, and no factor is missing.
+    ///
+    /// Runtime-only, like `kronecker_factors` and `structural_null_frame`: a
+    /// frozen replay rebuilds it from the basis factory, the single source.
+    /// It travels with `matrix` through every congruence -- a rotation `Q`
+    /// sends `matrix ← QᵀSQ` and `A ← AQ`, since `(AQ)ᵀ(AQ) = QᵀAᵀAQ` -- so
+    /// `AᵀA` equals `matrix` wherever the record goes, to the rounding of the
+    /// symmetrization `matrix` carries and the congruence's own arithmetic. It
+    /// is not a bitwise identity and no consumer may test it as one.
+    #[serde(skip)]
+    pub energy_factor: Option<Array2<f64>>,
 }
 
 /// Diagnostic for one penalty candidate excluded from the optimizer layout.

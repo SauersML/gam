@@ -353,6 +353,9 @@ fn build_term_collection_design_inner_with_policy_and_plan(
                 normalization_scale: 1.0,
                 kronecker_factors: None,
                 structural_null_frame: None,
+                // A unit ridge is its own authoritative matrix, not an
+                // accumulated Gram, so there is no factor missing here.
+                energy_factor: None,
             },
         });
     }
@@ -372,6 +375,9 @@ fn build_term_collection_design_inner_with_policy_and_plan(
                 normalization_scale: 1.0,
                 kronecker_factors: None,
                 structural_null_frame: None,
+                // A unit ridge is its own authoritative matrix, not an
+                // accumulated Gram, so there is no factor missing here.
+                energy_factor: None,
             },
         });
     }

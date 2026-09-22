@@ -2712,6 +2712,18 @@ fn wrap_local_build_as_realization(
                     .structural_null_frame
                     .as_ref()
                     .map(|frame| gam_linalg::faer_ndarray::fast_atb(q, frame));
+                // And the energy factor, by the same congruence: coordinates
+                // transform as `v = Q v′`, so a factor whose rows act on the old
+                // coordinates acts as `A·Q` on the new ones, and
+                // `(AQ)ᵀ(AQ) = QᵀAᵀAQ = QᵀSQ` is the rotated matrix above. It is
+                // what the frozen rank is read from, so a factor left in
+                // pre-rotation coordinates would hand the reader a rank for a
+                // block nobody prices (gam#2959, gam#1561).
+                penalty.info.energy_factor = penalty
+                    .info
+                    .energy_factor
+                    .as_ref()
+                    .map(|factor| gam_linalg::faer_ndarray::fast_ab(factor, q));
                 penalty.op = None;
                 penalty.info.kronecker_factors = None;
             }

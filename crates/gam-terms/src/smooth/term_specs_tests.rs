@@ -28,6 +28,9 @@ mod joint_unpenalized_dim_tests {
                 normalization_scale: 1.0,
                 kronecker_factors: None,
                 structural_null_frame: None,
+                // This fixture builds a penalty from a matrix, so it has no
+                // factor to carry and the readers take their Gram path.
+                energy_factor: None,
             },
         }
     }

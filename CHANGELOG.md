@@ -1,5 +1,28 @@
 ## Unreleased
 
+- **A penalty's structural rank was read off its SQUARED Gram, which resolves half the digits its
+  energy factor does, so a rank frozen at one κ could not be realized at another and every trial
+  refused** (gam#2959, gam#1561, gam#3236). `λᵢ(S) = σᵢ(A)²` for an accumulated `S = AᵀA`, so
+  separating a mode from zero on the Gram needs `σᵢ/σ₁ > √(p·ε) ≈ 1e-7` where separating it on the
+  factor needs `σᵢ/σ₁ > max(m,n)·ε ≈ 1e-14`. A Matérn collocation penalty's tail sits in that gap,
+  so the count moved with the length scale, and six reference-quality cases refused with their
+  R-th eigenvalue three orders of magnitude BELOW the band it was judged against (ranks 19/24/29,
+  eigenvalues -9.4e-18 to +2.9e-18, bands near 4e-15). `53a084c6c1` removed the `dim·1e-10·max|ev|`
+  cut that made the rank a chosen RELATIVE threshold, which was necessary and not sufficient: the
+  measurement that found these six was taken at a sha that already contained it. The factor is now
+  CARRIED rather than re-derived: `ActivePenaltyInfo` keeps the candidate's own factor beside the
+  `kronecker_factors` and `structural_null_frame` it already carries,
+  `PenaltyStructureHint::EnergyFactor` moves it through `BlockwisePenalty` and `PenaltySpec::Block`
+  on slots already threaded end to end, and the two sites that rotate a penalty after filtering
+  transport it with the matrix -- `A ← AQ` beside `S ← QᵀSQ`, since `(AQ)ᵀ(AQ) = QᵀAᵀAQ`, exactly
+  as they already transport the declared null frame. `penalty_structural_ranks_at_rounding_band`
+  and `canonicalize_penalty_spec_at_frozen_rank` then take the rank from
+  `factor_rank_partition` and build the root as `σᵢ·vᵢᵀ`, which also removes a `√` of a possibly
+  negative eigenvalue from the root's construction. A block with no factor keeps the Gram path,
+  which is correct for it: its matrix is authoritative, not accumulated. `EnergyFactor` is
+  deliberately not counted by `penalty_spec_has_structure_hint`, which asks whether a block has a
+  CLOSED-FORM root; routing an accumulated penalty there would refuse whenever the realized root's
+  rank differed from the frozen one, which is the thing carrying the factor exists to prevent.
 - **The measure-jet representer section's `ln ℓ` jet carries its chart's scale motion** (#2902,
   #2959). `representer_section_log_length_jets` differentiates `Z = N·V·S`, the section the
   `CenterSumToZero` build realizes, but carried only the nullspace motion `N′` and the graph

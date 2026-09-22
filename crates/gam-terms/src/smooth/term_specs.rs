@@ -2218,6 +2218,20 @@ where
 pub enum PenaltyStructureHint {
     Ridge(f64),
     Kronecker(Vec<Array2<f64>>),
+    /// The energy factor `A` of an ACCUMULATED penalty, with `AᵀA = local`.
+    ///
+    /// Unlike the other two this is not a closed-form root the consumer can
+    /// use instead of decomposing: it is the object the penalty's RANK is a
+    /// property of. A direction whose factor singular value is `σ` appears in
+    /// `S = AᵀA` as `σ²`, so the Gram resolves it only above `√(p·ε)` relative
+    /// where the factor resolves it above `max(m,n)·ε` -- half the digits. A
+    /// rank read off the Gram therefore moves with κ on a Matérn collocation
+    /// penalty and cannot be frozen (gam#3236, gam#2959, gam#1561).
+    ///
+    /// `penalty_spec_has_structure_hint` deliberately does NOT count this one:
+    /// that predicate asks "does this block have a closed-form root", and the
+    /// answer here is no. The frozen-rank path checks for the factor itself.
+    EnergyFactor(Array2<f64>),
 }
 
 /// A penalty matrix stored at its natural block size together with the
@@ -2268,6 +2282,17 @@ impl BlockwisePenalty {
             structure_hint: None,
             op: None,
         }
+    }
+
+    /// Attach the energy factor `A` of this accumulated penalty, `AᵀA = local`.
+    ///
+    /// `None` leaves the hint alone, so a block whose factory has no factor
+    /// keeps whatever closed-form hint it already carries.
+    pub(crate) fn with_energy_factor(mut self, factor: Option<Array2<f64>>) -> Self {
+        if let Some(factor) = factor {
+            self.structure_hint = Some(PenaltyStructureHint::EnergyFactor(factor));
+        }
+        self
     }
 
     /// Attach an op-form penalty handle bit-equivalent to `local`.
@@ -9545,6 +9570,18 @@ pub(crate) fn build_smooth_design_from_planned_terms(
                         .null_eigenvectors
                         .as_ref()
                         .map(|basis| gam_linalg::faer_ndarray::fast_atb(q, basis));
+                    // The energy factor is a congruence away exactly as the
+                    // matrix is: coordinates transform as `v = Q v′`, so a factor
+                    // whose rows act on the old coordinates acts as `A·Q` on the
+                    // new ones, and `(AQ)ᵀ(AQ) = QᵀAᵀAQ = QᵀSQ` is the rotated
+                    // matrix above. Left behind, it would describe a different
+                    // chart's penalty and the rank read from it would be a rank
+                    // for a block nobody prices.
+                    penalty.info.energy_factor = penalty
+                        .info
+                        .energy_factor
+                        .as_ref()
+                        .map(|factor| gam_linalg::faer_ndarray::fast_ab(factor, q));
                     // `Q` is orthogonal, so `null(Qᵀ S Q) = Qᵀ null(S)` and the
                     // image of an orthonormal frame is orthonormal — a declared
                     // structural null frame transports EXACTLY here (unlike the
@@ -9572,7 +9609,8 @@ pub(crate) fn build_smooth_design_from_planned_terms(
             let global_index = penalties_global.len();
             penalties_global.push(
                 BlockwisePenalty::new(col_start..col_end, active_penalty.matrix.clone())
-                    .with_op(active_penalty.op.clone()),
+                    .with_op(active_penalty.op.clone())
+                    .with_energy_factor(active_penalty.info.energy_factor.clone()),
             );
             nullspace_dims_global.push(active_penalty.nullity);
             penaltyinfo_global.push(PenaltyBlockInfo {

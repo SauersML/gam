@@ -1548,6 +1548,18 @@ pub fn penalty_structural_ranks_at_rounding_band(
             continue;
         }
         crate::validate_penalty_spec_shape(idx, spec, p, context)?;
+        // An accumulated block's rank is a property of its FACTOR. Counting it
+        // on the Gram instead costs half the digits -- `λᵢ = σᵢ²`, so the Gram
+        // resolves only above `√(p·ε)` relative where the factor resolves above
+        // `max(m,n)·ε` -- and on a Matérn collocation penalty that difference is
+        // the whole defect: the count moves with κ, so the rank frozen here
+        // cannot be realized at another κ and every trial refuses (gam#2959,
+        // gam#1561). A block with no factor keeps the Gram path, which is right
+        // for it: its matrix is authoritative, not accumulated.
+        if let Some(factor) = penalty_spec_energy_factor(spec) {
+            ranks.push(penalty_spec_factor_partition(factor, idx, context)?.rank);
+            continue;
+        }
         let analysis = analyze_penalty_block(&penalty_spec_local_matrix(spec)).map_err(|err| {
             EstimationError::InvalidInput(format!(
                 "{context}: structural rank analysis failed at penalty {idx}: {err}"
@@ -1627,14 +1639,57 @@ pub fn canonicalize_penalty_specs_at_frozen_ranks(
     Ok((active, active_nullspace))
 }
 
+/// Whether this block has a CLOSED-FORM root the canonicalization can use
+/// instead of decomposing anything.
+///
+/// `EnergyFactor` deliberately does not count. It is not a closed-form root --
+/// it is the operand the block's rank is a property of, and the frozen-rank
+/// path reads it through [`penalty_spec_energy_factor`] after this predicate has
+/// said no. Counting it here would route an accumulated penalty into the hinted
+/// branch, which refuses whenever the realized root's rank differs from the
+/// frozen one, and the whole point of carrying the factor is that its rank does
+/// NOT differ.
 fn penalty_spec_has_structure_hint(spec: &crate::PenaltySpec) -> bool {
     matches!(
         spec,
         crate::PenaltySpec::Block {
-            structure_hint: Some(_),
+            structure_hint: Some(
+                crate::smooth::PenaltyStructureHint::Ridge(_)
+                    | crate::smooth::PenaltyStructureHint::Kronecker(_)
+            ),
             ..
         }
     )
+}
+
+/// The energy factor `A` this block carries, with `AᵀA = local`.
+///
+/// Present exactly when the factory built the quadratic from one, which is what
+/// makes the block's rank readable at `ε` instead of `√ε` relative: `λᵢ(S) =
+/// σᵢ(A)²`, so the Gram cannot separate from zero a mode the factor separates
+/// comfortably (gam#3236).
+fn penalty_spec_energy_factor(spec: &crate::PenaltySpec) -> Option<&Array2<f64>> {
+    match spec {
+        crate::PenaltySpec::Block {
+            structure_hint: Some(crate::smooth::PenaltyStructureHint::EnergyFactor(factor)),
+            ..
+        } => Some(factor),
+        _ => None,
+    }
+}
+
+/// The rank partition of a block's energy factor, with this context's name on
+/// any failure.
+fn penalty_spec_factor_partition(
+    factor: &Array2<f64>,
+    idx: usize,
+    context: &str,
+) -> Result<gam_linalg::roundoff::FactorRankPartition, EstimationError> {
+    gam_linalg::roundoff::factor_rank_partition(factor).map_err(|err| {
+        EstimationError::InvalidInput(format!(
+            "{context}: energy-factor rank partition failed at penalty {idx}: {err}"
+        ))
+    })
 }
 
 fn penalty_spec_local_matrix(spec: &crate::PenaltySpec) -> Array2<f64> {
@@ -1664,6 +1719,57 @@ fn canonicalize_penalty_spec_at_frozen_rank(
         crate::bail_invalid_estim!(
             "{context}: penalty {idx} frozen at rank {frozen_rank} exceeds its block dimension {block_dim}"
         );
+    }
+    // An accumulated block is rooted from its FACTOR, at the factor's own
+    // band, because that is the operand its rank is a property of. The Gram
+    // route below reads `λᵢ = σᵢ²` at `p·ε·‖S‖₂`, which is `√(p·ε)` relative
+    // in `σ` -- half the digits -- so a mode the factor resolves comfortably
+    // comes back there as roundoff of either sign. That is what refused these
+    // trials: the frozen rank counted modes the trial's Gram could no longer
+    // separate from zero, at a κ a step away (gam#3236, gam#2959, gam#1561).
+    //
+    // The root is `σᵢ·vᵢᵀ` for the leading `frozen_rank` modes, so `RᵀR` is `S`
+    // on the resolved range, and `σᵢ²` are the positive eigenvalues. Nothing
+    // here takes `√` of an eigenvalue, so a negative one cannot become a NaN
+    // row: the sign question does not arise on the factor side.
+    if let Some(factor) = penalty_spec_energy_factor(spec) {
+        let partition = penalty_spec_factor_partition(factor, idx, context)?;
+        if partition.rank < frozen_rank {
+            let band = gam_linalg::roundoff::factor_singular_band(
+                factor.nrows(),
+                factor.ncols(),
+                partition.singular_values.first().copied().unwrap_or(0.0),
+            );
+            let smallest_kept = partition
+                .singular_values
+                .get(frozen_rank - 1)
+                .copied()
+                .unwrap_or(0.0);
+            return Err(EstimationError::TrialPointRefused {
+                reason: format!(
+                    "{context}: penalty block idx={idx} was frozen at structural rank \
+                     {frozen_rank}, but at this trial its energy factor resolves only \
+                     {} singular value(s): the {frozen_rank}-th is {smallest_kept:e}, at \
+                     or below the factor's own backward-error band {band:e}",
+                    partition.rank
+                ),
+            });
+        }
+        let root = partition.root_rows(frozen_rank);
+        let local = root.t().dot(&root);
+        let positive_eigenvalues = partition.singular_values[..frozen_rank]
+            .iter()
+            .map(|sigma| sigma * sigma)
+            .collect();
+        return Ok(Some(CanonicalPenalty {
+            root: root.into_shared(),
+            col_range,
+            total_dim: p,
+            nullity: block_dim - frozen_rank,
+            local: local.into_shared(),
+            positive_eigenvalues,
+            op,
+        }));
     }
     let analysis = analyze_penalty_block(&penalty_spec_local_matrix(spec)).map_err(|err| {
         EstimationError::InvalidInput(format!(
@@ -3366,6 +3472,152 @@ fn block_original_frame(
 
 #[cfg(test)]
 mod tests {
+    /// gam#2959 / gam#1561: a penalty's rank is a property of its ENERGY FACTOR,
+    /// and reading it off the squared Gram instead loses half the digits.
+    ///
+    /// `λᵢ(S) = σᵢ(A)²`, so resolving a mode against the Gram's band
+    /// `p·ε·‖S‖₂` needs `σᵢ/σ₁ > √(p·ε)` while resolving it against the
+    /// factor's own band needs `σᵢ/σ₁ > max(m,n)·ε` -- seven orders apart in
+    /// f64. On a Matérn collocation penalty the tail sits in that gap, so a rank
+    /// counted on the Gram MOVES with κ and a rank frozen at one κ cannot be
+    /// realized at another: six reference-quality cases refused with their
+    /// R-th eigenvalue three orders BELOW the band it was judged against.
+    ///
+    /// The shape is gam#3236's own probe: 119 centers, ν = 5/2.
+    #[test]
+    fn a_matern_collocation_gram_resolves_fewer_modes_than_its_factor_2959() {
+        use ndarray::Array2;
+
+        let centers = Array2::from_shape_fn((119, 1), |(i, _)| i as f64 / 118.0);
+        let ops = crate::basis::build_matern_collocation_operator_matrices(
+            centers.view(),
+            None,
+            0.35,
+            crate::basis::MaternNu::FiveHalves,
+            true,
+            None,
+            None,
+        )
+        .expect("the 119-centre nu=5/2 collocation operators build");
+
+        // The mass operator `D0` is the factor; `S = D0ᵀD0` is what the Gram
+        // route reads. Both counts are taken with the engine's own predicates,
+        // neither is a literal.
+        let factor = &ops.d0;
+        let gram = gam_linalg::faer_ndarray::fast_ata(factor);
+        let partition = gam_linalg::roundoff::factor_rank_partition(factor)
+            .expect("the factor decomposes");
+        let analysis =
+            crate::basis::analyze_penalty_block(&gram).expect("the Gram decomposes");
+        let gram_rank = gam_linalg::roundoff::resolved_eigenvalue_count(
+            &analysis.eigenvalues.to_vec(),
+            0.0,
+        );
+
+        assert!(
+            partition.rank > gram_rank,
+            "squaring must lose modes on this operator, or the fixture is not the \
+             regime the defect lives in: factor resolves {}, Gram resolves {}",
+            partition.rank,
+            gram_rank
+        );
+        // And the modes it loses are genuinely there, not roundoff: the smallest
+        // one the factor keeps stands above the factor's own band.
+        let band = gam_linalg::roundoff::factor_singular_band(
+            factor.nrows(),
+            factor.ncols(),
+            partition.singular_values[0],
+        );
+        assert!(
+            partition.singular_values[partition.rank - 1] > band,
+            "the factor's last kept singular value must clear its own band"
+        );
+    }
+
+    /// The readers take the factor's answer, and the root they build from it has
+    /// no `√` of a negative in it.
+    ///
+    /// The control is the SAME block with no factor carried: it must give the
+    /// Gram's smaller rank. That is what shows the factor changed the answer
+    /// rather than the fixture being easy.
+    #[test]
+    fn the_frozen_rank_reader_takes_the_factors_rank_and_roots_from_it_2959() {
+        use ndarray::Array2;
+
+        // A factor whose singular values span the gap: `1` down to `1e-9`
+        // relative. Squared they run to `1e-18`, under a Gram band of about
+        // `8·ε = 1.8e-15`, so the Gram cannot see the last few.
+        let dim = 8usize;
+        let factor = Array2::from_shape_fn((dim, dim), |(i, j)| {
+            if i == j { 10.0_f64.powi(-(i as i32) - 1) } else { 0.0 }
+        });
+        let local = gam_linalg::faer_ndarray::fast_ata(&factor);
+
+        let with_factor = crate::PenaltySpec::Block {
+            local: local.clone(),
+            col_range: 0..dim,
+            structure_hint: Some(crate::smooth::PenaltyStructureHint::EnergyFactor(
+                factor.clone(),
+            )),
+            op: None,
+        };
+        let without_factor = crate::PenaltySpec::Block {
+            local: local.clone(),
+            col_range: 0..dim,
+            structure_hint: None,
+            op: None,
+        };
+
+        let factor_ranks = super::penalty_structural_ranks_at_rounding_band(
+            std::slice::from_ref(&with_factor),
+            dim,
+            "factor rank gate",
+        )
+        .expect("the factor-carrying spec ranks");
+        let gram_ranks = super::penalty_structural_ranks_at_rounding_band(
+            std::slice::from_ref(&without_factor),
+            dim,
+            "gram rank gate",
+        )
+        .expect("the bare spec ranks");
+        assert!(
+            factor_ranks[0] > gram_ranks[0],
+            "the factor must resolve more modes than the squared Gram: {} vs {}",
+            factor_ranks[0],
+            gram_ranks[0]
+        );
+
+        // The carrier's invariant, pinned: the factor this block carries is the
+        // factor OF this block, to the rounding the Gram's assembly left.
+        let rebuilt = gam_linalg::faer_ndarray::fast_ata(&factor);
+        let scale = local.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        let band = dim as f64 * f64::EPSILON * scale;
+        let defect = (&rebuilt - &local)
+            .iter()
+            .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(
+            defect <= band,
+            "the carried factor must satisfy A'A = local: defect {defect:e} exceeds {band:e}"
+        );
+
+        // Rooting at the factor's rank succeeds and reproduces the block on the
+        // resolved range. The Gram route cannot do this: its `frozen_rank`-th
+        // eigenvalue is roundoff of either sign and `sqrt` of it is a NaN row.
+        let (canonical, _) = super::canonicalize_penalty_specs_at_frozen_ranks(
+            std::slice::from_ref(&with_factor),
+            &[0],
+            &factor_ranks,
+            dim,
+            "factor root gate",
+        )
+        .expect("the factor-rooted canonicalization does not refuse");
+        let root = &canonical[0].root;
+        assert_eq!(root.nrows(), factor_ranks[0]);
+        assert!(
+            root.iter().all(|value| value.is_finite()),
+            "a factor-built root carries no NaN row"
+        );
+    }
     /// #2469: the freeze and the trial read one band. A kept eigenvalue inside
     /// the penalty block's own rounding band is an unresolved rank, refused
     /// whatever its sign.
