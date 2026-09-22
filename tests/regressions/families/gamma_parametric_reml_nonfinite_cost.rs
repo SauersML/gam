@@ -101,8 +101,13 @@ fn gamma_log_link_ordinary_data_fits_with_finite_coefficients() {
     // success the response is not eligible for.
     let poisson_refusal = fit_family("poisson", &data)
         .expect_err("poisson must refuse a non-integer (continuous Gamma) response");
+    // The contract is gam-spec's one text, matched as the constant rather
+    // than as a copy of it. Two wordings for one contract is what made this
+    // control red: the fit-boundary support check refuses first, and the
+    // P-IRLS row scan's wording, which this used to quote, never reached the
+    // caller on this path.
     assert!(
-        poisson_refusal.contains("must be a finite non-negative integer"),
+        poisson_refusal.contains(gam_spec::COUNT_RESPONSE_SUPPORT_REQUIREMENT),
         "the poisson control must fail on the COUNT-INTEGRALITY contract (proving \
          the design and encoding reached the family), got: {poisson_refusal}"
     );

@@ -775,8 +775,13 @@ pub fn certify_count_responses(
 ) -> Result<(), String> {
     for (i, (&yi, &wi)) in y.iter().zip(weights.iter()).enumerate() {
         if wi > 0.0 && !valid_count_response(yi) {
+            // The contract text is gam-spec's, not a second copy: the
+            // fit-boundary support check refuses the same responses first, and
+            // two wordings for one contract left the earlier one shadowing this
+            // one for every caller matching on text.
             return Err(format!(
-                "{family} response must be a finite non-negative integer at positive-weight row {i}; got {yi}"
+                "{family} response requires {}; positive-weight row {i} has y = {yi}",
+                gam_spec::COUNT_RESPONSE_SUPPORT_REQUIREMENT
             ));
         }
     }

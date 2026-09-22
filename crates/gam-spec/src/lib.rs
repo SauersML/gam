@@ -946,12 +946,9 @@ impl ResponseFamily {
             Self::Gamma | Self::InverseGaussian => {
                 Some("strictly positive response values (y > 0)")
             }
-            Self::Poisson | Self::NegativeBinomial { .. } => Some(
-                "non-negative integer counts (y = 0, 1, 2, ...); for non-negative \
-                 non-integer data use a Tweedie family (for example \
-                 family='tweedie(p=1.5)'), and model a rate as an integer count \
-                 with a log-exposure offset",
-            ),
+            Self::Poisson | Self::NegativeBinomial { .. } => {
+                Some(COUNT_RESPONSE_SUPPORT_REQUIREMENT)
+            }
             Self::Tweedie { .. } => Some("non-negative response values (y ≥ 0)"),
             Self::Beta { .. } => Some(
                 "response values strictly in the open interval (0, 1) \
@@ -2327,6 +2324,22 @@ impl LikelihoodSpec {
 pub const fn is_valid_tweedie_power(p: f64) -> bool {
     p.is_finite() && p > 1.0 && p < 2.0
 }
+
+/// The count families' response-support contract, written once.
+///
+/// `Poisson` and `NegativeBinomial` refuse a non-integer `y` at TWO layers: the
+/// fit-boundary support check ([`ResponseFamily::validate_response_support`],
+/// which reaches the caller first) and the P-IRLS row scan
+/// (`gam_solve::pirls::certify_count_responses`, which is what runs once a fit
+/// is under way). Each used to carry its own wording, so the earlier one
+/// shadowed the later and a caller matching on the later's text saw a refusal it
+/// could not recognise. Both now name this one string, so the contract reads the
+/// same wherever it is enforced and a caller matches on the constant rather than
+/// on a copy of it.
+pub const COUNT_RESPONSE_SUPPORT_REQUIREMENT: &str =
+    "non-negative integer counts (y = 0, 1, 2, ...); for non-negative non-integer data use a \
+     Tweedie family (for example family='tweedie(p=1.5)'), and model a rate as an integer count \
+     with a log-exposure offset";
 
 /// The row-level count-response contract: finite, non-negative, and an exact
 /// integer.
