@@ -4304,9 +4304,15 @@ fn build_joint_marginal_slope_predict_context(
     if model.latent_z_rank_int_calibration.is_some()
         || model.latent_z_conditional_calibration.is_some()
     {
+        // gam#2949: a `K ≥ 2` model's conditional maps travel inside the joint
+        // law, one per coordinate, and are applied below. A scalar map in the
+        // payload beside them would map one coordinate twice, and a rank-INT
+        // map has no per-coordinate form at all, so both are refused here as
+        // well as at save.
         return Err(SurvivalPredictError::UnsupportedConfiguration {
-            reason: "saved survival marginal-slope joint latent law was fitted on uncalibrated \
-                     scores; this model also carries a per-score calibration"
+            reason: "saved survival marginal-slope joint latent law carries its scores' \
+                     conditional maps per coordinate; this model also carries a scalar \
+                     latent-z calibration, which would map a coordinate twice"
                 .to_string(),
         });
     }
@@ -4324,14 +4330,47 @@ fn build_joint_marginal_slope_predict_context(
         .filter(|specs| specs.len() == k)
         .ok_or_else(|| format!("saved K={k} survival marginal-slope model must carry {k} slope surfaces"))?;
     let n = data.nrows();
+    // gam#2949: a coordinate whose conditional law moves was read by the row
+    // program as `ζ = (z − m(a))/√v(a)`, so a new score is read on that same
+    // axis before the law's unit map. The span `a(C)` is the marginal design,
+    // rebuilt here from the resolved marginal spec — which is exactly the
+    // reproducibility the save refusal requires, so a model that reaches this
+    // point has one. The composition order is the fit's: raw score, conditional
+    // map, then the unit map the law's nodes live on (gam#4331).
+    let conditioning = if law.calibrates_any_score() {
+        Some(
+            cov_design
+                .try_to_dense_arc("saved survival marginal-slope joint-law conditioning span")
+                .map_err(|reason| SurvivalPredictError::InvalidInput { reason })?,
+        )
+    } else {
+        None
+    };
     let mut scores = Array2::<f64>::zeros((n, k));
     for (column, name) in z_columns.iter().enumerate() {
         let index = *col_map
             .get(name)
             .ok_or_else(|| format!("missing score column '{name}'"))?;
+        let raw = data.column(index).to_owned();
+        let fitted_axis = match (law.score_calibration(column), conditioning.as_ref()) {
+            (None, _) => raw,
+            (Some(calibration), Some(span)) => {
+                crate::inference::predict_io::FittedLatentScoreMap::conditional_only(calibration)
+                    .calibrate(raw.view(), Some(span.view()))
+                    .map_err(|reason| SurvivalPredictError::InvalidInput { reason })?
+            }
+            (Some(_), None) => {
+                return Err(SurvivalPredictError::InvalidInput {
+                    reason: format!(
+                        "saved survival marginal-slope joint latent law calibrates score column \
+                         {column} but built no conditioning span to read it on"
+                    ),
+                });
+            }
+        };
         scores
             .column_mut(column)
-            .assign(&data.column(index).mapv(|z| law.standardized_score(column, z)));
+            .assign(&fitted_axis.mapv(|z| law.standardized_score(column, z)));
     }
 
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;

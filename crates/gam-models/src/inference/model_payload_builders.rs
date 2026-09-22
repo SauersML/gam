@@ -2266,10 +2266,12 @@ fn payload_for_survival_marginal_slope(
                          per-score slope surface specs to rebuild its surfaces"
                     )
                 })?;
-            if let Some(reason) =
-                joint_latent_law_calibration_save_refusal(persisted_conditional.as_ref())
-            {
-                return Err(reason.to_string());
+            if let Some(reason) = joint_latent_law_calibration_save_refusal(
+                persisted_conditional.as_ref(),
+                &ms_result.latent_z_calibrations,
+                law,
+            ) {
+                return Err(reason);
             }
             if law.conditional.is_some() && !ms_result.latent_conditioning_reproducible {
                 return Err(
@@ -2370,14 +2372,53 @@ fn payload_for_survival_marginal_slope(
 /// (gam#2929). The saved joint-law contract replays the anchor on the raw score
 /// columns, so a model whose scores were calibrated before the fit would predict
 /// on scores other than the ones it was fitted on.
+/// The one place a `K ≥ 2` model's score maps can be lost, checked where it
+/// would happen (gam#2929, gam#2949).
+///
+/// The fit reads each coordinate on the axis its own latent-law gate chose, so
+/// a coordinate the gate calibrated reaches the row program as
+/// `ζ = (z − m(a))/√v(a)`. Prediction must read a new score on that same axis,
+/// and the object it reads every coordinate against is the joint latent law —
+/// so the law carries one map per coordinate and the single-surface payload
+/// field stays empty. Two ways that can go wrong, both refused here rather than
+/// written:
+///
+/// * the fit calibrated a coordinate and the law does not carry the maps, which
+///   would give prediction an uncalibrated axis for it;
+/// * the payload ALSO carries a scalar map beside the law's, which would map a
+///   coordinate twice.
 fn joint_latent_law_calibration_save_refusal(
     conditional: Option<&crate::bms::LatentZConditionalCalibration>,
-) -> Option<&'static str> {
-    conditional.is_some().then_some(
-        "survival marginal-slope K ≥ 2 model calibrated its scores before the fit, and the joint \
-         latent law's saved contract replays the anchor on the raw score columns: saving is \
-         refused rather than writing a model whose prediction evaluates different scores",
-    )
+    fitted: &[crate::bms::LatentMeasureCalibration],
+    law: &crate::survival::marginal_slope::SurvivalJointLatentLaw,
+) -> Option<String> {
+    let calibrated: Vec<usize> = fitted
+        .iter()
+        .enumerate()
+        .filter(|(_, calibration)| {
+            !matches!(calibration, crate::bms::LatentMeasureCalibration::None)
+        })
+        .map(|(column, _)| column)
+        .collect();
+    if conditional.is_some() {
+        return Some(
+            "survival marginal-slope K ≥ 2 model carries a scalar latent-z conditional \
+             calibration beside its joint latent law's per-coordinate maps: prediction reads \
+             every coordinate against the law, so a second copy of one coordinate's map would \
+             apply it twice. Saving is refused rather than writing a model whose prediction \
+             evaluates different scores"
+                .to_string(),
+        );
+    }
+    if !calibrated.is_empty() && law.score_calibrations.is_empty() {
+        return Some(format!(
+            "survival marginal-slope K ≥ 2 fit calibrated latent-score column(s) {calibrated:?} \
+             before the row program read them, and its joint latent law carries no per-coordinate \
+             map: prediction would read those columns on an uncalibrated axis. Saving is refused \
+             rather than writing a model whose prediction evaluates different scores"
+        ));
+    }
+    None
 }
 
 fn payload_for_survival_transformation(
@@ -2932,16 +2973,13 @@ fn payload_for_latent_window(
 mod joint_latent_law_save_tests {
     use super::*;
 
-    /// A joint-law model refuses to save by name when its score column carries a
-    /// persisted conditional location-scale calibration, and saves when it does
-    /// not. Fits no longer persist a rank-INT calibration (gam#2926).
+    /// The two ways a `K ≥ 2` model could lose or double a score's map, refused
+    /// by name, and the two states that save (gam#2929, gam#2949).
     #[test]
-    fn joint_law_model_with_a_calibrated_score_refuses_to_save_2929() {
-        assert!(
-            joint_latent_law_calibration_save_refusal(None).is_none(),
-            "an uncalibrated joint-law model must save"
-        );
-        let conditional = crate::bms::LatentZConditionalCalibration {
+    fn joint_law_model_refuses_to_save_a_map_it_would_lose_or_double_2949() {
+        use crate::bms::{LatentMeasureCalibration, LatentZConditionalCalibration};
+
+        let conditional = LatentZConditionalCalibration {
             mean_coeffs: vec![0.1, 0.4],
             log_var_coeffs: Vec::new(),
             basis_ncols: 1,
@@ -2950,12 +2988,60 @@ mod joint_latent_law_save_tests {
             post_sd: 1.0,
             theta1_cov: ndarray::Array2::zeros((0, 0)),
         };
-        let reason = joint_latent_law_calibration_save_refusal(Some(&conditional))
-            .expect("a conditional location-scale calibration must refuse the joint-law save");
+        let law = |maps: Vec<Option<LatentZConditionalCalibration>>| {
+            crate::survival::marginal_slope::SurvivalJointLatentLaw {
+                score_dim: 2,
+                residual_nodes: vec![vec![-1.0, 0.0], vec![0.0, 1.0], vec![1.0, -1.0]],
+                weights: vec![0.25, 0.5, 0.25],
+                score_mean: vec![0.0, 0.0],
+                pooled_factor: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+                conditional: None,
+                score_location: vec![0.0, 0.0],
+                score_scale: vec![1.0, 1.0],
+                score_calibrations: maps,
+            }
+        };
+        let uncalibrated = vec![LatentMeasureCalibration::None; 2];
+        let calibrated = vec![
+            LatentMeasureCalibration::None,
+            LatentMeasureCalibration::ConditionalLocationScale(conditional.clone()),
+        ];
+
+        // Nothing calibrated, nothing carried: the model saves.
         assert!(
-            reason.contains("model calibrated its scores before the fit")
-                && reason.contains("saving is refused"),
-            "unexpected refusal {reason}"
+            joint_latent_law_calibration_save_refusal(None, &uncalibrated, &law(Vec::new()))
+                .is_none(),
+            "an uncalibrated joint-law model must save"
+        );
+        // Calibrated and carried by the law: the model saves, and this is the
+        // state gam#2949 adds.
+        assert!(
+            joint_latent_law_calibration_save_refusal(
+                None,
+                &calibrated,
+                &law(vec![None, Some(conditional.clone())])
+            )
+            .is_none(),
+            "a joint-law model whose law carries the calibrated column's map must save"
+        );
+        // Calibrated and NOT carried: prediction would read that column on an
+        // uncalibrated axis.
+        let lost = joint_latent_law_calibration_save_refusal(None, &calibrated, &law(Vec::new()))
+            .expect("a map the law does not carry must refuse the save");
+        assert!(
+            lost.contains("column(s) [1]") && lost.contains("uncalibrated axis"),
+            "unexpected refusal {lost}"
+        );
+        // Carried by the law AND by the payload: prediction would map twice.
+        let doubled = joint_latent_law_calibration_save_refusal(
+            Some(&conditional),
+            &calibrated,
+            &law(vec![None, Some(conditional)]),
+        )
+        .expect("a second copy of a map must refuse the save");
+        assert!(
+            doubled.contains("apply it twice") && doubled.contains("refused"),
+            "unexpected refusal {doubled}"
         );
     }
 }

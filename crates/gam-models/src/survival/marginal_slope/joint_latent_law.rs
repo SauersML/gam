@@ -93,6 +93,22 @@ pub struct SurvivalJointLatentLaw {
     pub score_location: Vec<f64>,
     /// See [`Self::score_location`]; every entry is finite and positive.
     pub score_scale: Vec<f64>,
+    /// Each coordinate's conditional location-scale map, where the latent-law
+    /// gate calibrated that score before the fit consumed it (gam#2949).
+    ///
+    /// The fit reads score `j` as `ζ_j = (z_j − m_j(a))/√v_j(a)` when this is
+    /// `Some`, so the law's nodes, mean and factors are the law of `ζ`, not of
+    /// `z`. Prediction must apply the SAME map to a new score before reading it
+    /// against this law, which is why the map travels inside the law rather
+    /// than beside it: the payload's scalar `latent_z_conditional_calibration`
+    /// carries one surface, and a `K ≥ 2` fit has one per coordinate.
+    ///
+    /// Empty (the serde default, and what every law written before this field
+    /// carries) means no coordinate was calibrated — the state the saved
+    /// contract used to refuse to write at all. Otherwise it holds exactly `K`
+    /// entries, `None` for an uncalibrated coordinate.
+    #[serde(default)]
+    pub score_calibrations: Vec<Option<crate::bms::LatentZConditionalCalibration>>,
 }
 
 impl SurvivalJointLatentLaw {
@@ -188,7 +204,35 @@ impl SurvivalJointLatentLaw {
                 self.score_scale.len()
             ));
         }
+        // gam#2949: the per-coordinate conditional maps are either absent
+        // altogether (no coordinate was calibrated) or one per coordinate. A
+        // shorter list would silently leave a calibrated score unmapped at
+        // prediction, which is the failure the save refusals exist to prevent.
+        if !self.score_calibrations.is_empty() && self.score_calibrations.len() != k {
+            return Err(format!(
+                "{context}: joint latent law carries {} conditional score maps for K={k} scores; \
+                 it carries one per coordinate or none at all",
+                self.score_calibrations.len()
+            ));
+        }
         Ok(())
+    }
+
+    /// Coordinate `j`'s conditional location-scale map, if the fit calibrated
+    /// that score (gam#2949).
+    #[inline]
+    pub fn score_calibration(
+        &self,
+        j: usize,
+    ) -> Option<&crate::bms::LatentZConditionalCalibration> {
+        self.score_calibrations.get(j).and_then(Option::as_ref)
+    }
+
+    /// Whether any coordinate carries a conditional map, i.e. whether reading a
+    /// new score against this law needs the conditioning span rebuilt.
+    #[inline]
+    pub fn calibrates_any_score(&self) -> bool {
+        self.score_calibrations.iter().any(Option::is_some)
     }
 
     /// Score `j` recorded as `raw` on the law's standardised axis
@@ -761,6 +805,7 @@ pub(crate) fn build_joint_latent_law(
     covariance: &ScoreCovarianceField,
     conditioning: Option<ArrayView2<'_, f64>>,
     score_units: &[LatentZNormalization],
+    score_calibrations: &[crate::bms::LatentMeasureCalibration],
     node_count: usize,
 ) -> Result<(SurvivalJointLatentLaw, JointLatentLawRuntime), String> {
     let (n, k) = scores.dim();
@@ -773,6 +818,13 @@ pub(crate) fn build_joint_latent_law(
         return Err(format!(
             "survival marginal-slope joint latent law carries {} score unit maps for K={k} scores",
             score_units.len()
+        ));
+    }
+    if score_calibrations.len() != k {
+        return Err(format!(
+            "survival marginal-slope joint latent law carries {} conditional score maps for K={k} \
+             scores",
+            score_calibrations.len()
         ));
     }
     if weights.len() != n {
@@ -832,6 +884,27 @@ pub(crate) fn build_joint_latent_law(
         conditional: model.cloned(),
         score_location: score_units.iter().map(|units| units.mean).collect(),
         score_scale: score_units.iter().map(|units| units.sd).collect(),
+        // gam#2949: `scores` are what the row program reads, so a coordinate the
+        // gate calibrated reached this builder as `ζ` and the law below is the
+        // law of `ζ`. The map travels with the law so prediction reads a new
+        // score on the same axis. An all-`None` list is stored as the empty
+        // list, which is what a law over uncalibrated scores has always been.
+        score_calibrations: {
+            let maps: Vec<Option<crate::bms::LatentZConditionalCalibration>> = score_calibrations
+                .iter()
+                .map(|calibration| match calibration {
+                    crate::bms::LatentMeasureCalibration::None => None,
+                    crate::bms::LatentMeasureCalibration::ConditionalLocationScale(cal) => {
+                        Some(cal.clone())
+                    }
+                })
+                .collect();
+            if maps.iter().all(Option::is_none) {
+                Vec::new()
+            } else {
+                maps
+            }
+        },
     };
     persisted.validate("survival marginal-slope joint latent law")?;
     let log_weights = node_weights.iter().map(|weight| weight.ln()).collect();
@@ -2867,6 +2940,7 @@ mod joint_latent_law_tests {
             conditional: None,
             score_location: vec![0.0; 2],
             score_scale: vec![1.0; 2],
+            score_calibrations: Vec::new(),
         }
     }
 
@@ -3174,6 +3248,7 @@ mod joint_latent_law_tests {
             &field,
             Some(design.view()),
             &[LatentZNormalization { mean: 0.0, sd: 1.0 }; 2],
+            &vec![crate::bms::LatentMeasureCalibration::None; 2],
             DEFAULT_JOINT_LATENT_NODES,
         )
         .expect("joint law");
@@ -3301,6 +3376,7 @@ mod joint_latent_law_tests {
                 &field,
                 None,
                 &identity,
+                &vec![crate::bms::LatentMeasureCalibration::None; k],
                 3 * n / 4,
             )
             .expect("joint law");

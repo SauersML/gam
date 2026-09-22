@@ -46,6 +46,31 @@
   exact to `2e-17` and `1e-16`. The residual is the outer rule's and moves with it, which the
   tests pin both ways: exact where that rule is adequate, and falling by more than an order from
   15 outer points to 31 on a correlated pair whose resolved axis keeps only a third of the drive.
+- **A K >= 2 survival marginal-slope fit keeps the law its own conditional evidence chose,
+  and the saved model carries the map that law was read on** (gam#2949).
+  With several scores the anchor reads the drive `rᵀz`, whose law is the joint latent law,
+  so the one-score moving-law certificate could not score the arms and the fit threw the
+  whole decision away: every column was forced back to the closed form and the primary
+  recorded `gaussian-uncertified`, naming the moving score. That was more than the
+  certificate's absence required. The joint law transports one pooled residual law by
+  `μ + L(a)·ε`, and a location-scale arm's map is divided out of the score BEFORE the law is
+  built, so what the law compresses is the standardised residual: every arm but the LOCAL one
+  — the gate's finding that a column's SHAPE moves on the span — is carried exactly. The fit
+  now keeps the fitted arm for those columns and labels it through `uncertified`, the field
+  that exists for an anchor the certificate does not evaluate; a local column still sends
+  every column back to the closed form.
+  Carrying the arm means carrying its map: `SurvivalJointLatentLaw` gains one
+  `Option<LatentZConditionalCalibration>` per coordinate (`#[serde(default)]`, so every law
+  written before this reads back as "no coordinate was calibrated"), prediction applies each
+  coordinate's map before the law's unit map, and the single-surface payload field stays
+  empty so no coordinate is mapped twice. The two save refusals move with it: a calibrated
+  coordinate whose map the law does NOT carry is still refused at the point of loss, and so
+  is a scalar map beside the law's.
+  **Behavior change:** a K >= 2 fit whose score's conditional law moves in mean or variance
+  now anchors on that law instead of the closed form, and saves. Its label is
+  `estimated-moving-law` with `uncertified` set, not `gaussian-uncertified`. A score whose
+  law moves in SHAPE is unchanged.
+
 
 - **Every binomial `flexible(...)` link fit panicked with `capacity overflow`** (gam#4570). The mean-wiggle
   loop's Anderson mixer took `options.outer_max_iter` as its history depth and the accelerator preallocated that

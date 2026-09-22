@@ -287,6 +287,9 @@ impl SurvivalMarginalSlopeFitResult {
         split_persisted_latent_calibrations(
             &self.latent_z_calibrations,
             self.latent_conditioning_reproducible,
+            self.joint_latent_law
+                .as_ref()
+                .is_some_and(|law| !law.score_calibrations.is_empty()),
         )
     }
 
@@ -328,16 +331,33 @@ impl SurvivalMarginalSlopeFitResult {
 pub(crate) fn split_persisted_latent_calibrations(
     calibrations: &[crate::bms::LatentMeasureCalibration],
     conditioning_reproducible: bool,
+    joint_law_carries_maps: bool,
 ) -> Result<Option<crate::bms::LatentZConditionalCalibration>, String> {
     {
         use crate::bms::LatentMeasureCalibration;
+        let any_calibrated = calibrations
+            .iter()
+            .any(|calibration| !matches!(calibration, LatentMeasureCalibration::None));
+        // gam#2949: a `K ≥ 2` fit's maps travel inside the joint latent law, one
+        // per coordinate, because prediction reads every coordinate against that
+        // law. The single-surface payload field is then EMPTY — one owner for
+        // the map a score is read on, so no coordinate can be mapped twice.
+        // The reproducibility refusal still binds: the span `a(C)` is rebuilt
+        // from the resolved marginal spec whichever object holds the map.
+        if joint_law_carries_maps {
+            if any_calibrated && !conditioning_reproducible {
+                return Err(CONDITIONING_NOT_REPRODUCIBLE.to_string());
+            }
+            return Ok(None);
+        }
         for (column, calibration) in calibrations.iter().enumerate().skip(1) {
             if !matches!(calibration, LatentMeasureCalibration::None) {
                 return Err(format!(
                     "survival marginal-slope latent-score column {column} carries a conditional \
-                     location-scale calibration, but the saved-model contract holds exactly one \
-                     score surface: persisting this fit would give prediction an uncalibrated axis \
-                     for that column and a different model from the one that was fitted. Fit the \
+                     location-scale calibration, and this fit's joint latent law does not carry \
+                     that column's map: the single-surface payload holds exactly one score \
+                     surface, so persisting it would give prediction an uncalibrated axis for \
+                     that column and a different model from the one that was fitted. Fit the \
                      multi-surface model without latent_measure=\"conditional-location-scale\" if \
                      it must be saved"
                 ));
@@ -347,22 +367,27 @@ pub(crate) fn split_persisted_latent_calibrations(
             None | Some(LatentMeasureCalibration::None) => None,
             Some(LatentMeasureCalibration::ConditionalLocationScale(cal)) => {
                 if !conditioning_reproducible {
-                    return Err(
-                        "survival marginal-slope conditional latent calibration was fit against \
-                         the marginal design frozen before the spatial length-scale search, and \
-                         that search then moved the design: prediction rebuilds a(C) from the \
-                         RESOLVED marginal spec, so a saved model would apply a different latent \
-                         map than the one its coefficients were fitted under. Pin the marginal \
-                         formula's spatial length_scale=, or supply an already \
-                         conditionally-standardised score, if this model must be saved"
-                            .to_string(),
-                    );
+                    return Err(CONDITIONING_NOT_REPRODUCIBLE.to_string());
                 }
                 Some(cal.clone())
             }
         })
     }
 }
+
+/// Why a conditional latent calibration cannot be persisted when the spatial
+/// length-scale search moved the design it was fitted against (gam#2926).
+///
+/// One refusal for one reason: the scalar payload field and the joint latent
+/// law's per-coordinate maps (gam#2949) are both read by rebuilding `a(C)` from
+/// the RESOLVED marginal spec, so both are refused here on the same evidence.
+pub(crate) const CONDITIONING_NOT_REPRODUCIBLE: &str =
+    "survival marginal-slope conditional latent calibration was fit against the marginal design \
+     frozen before the spatial length-scale search, and that search then moved the design: \
+     prediction rebuilds a(C) from the RESOLVED marginal spec, so a saved model would apply a \
+     different latent map than the one its coefficients were fitted under. Pin the marginal \
+     formula's spatial length_scale=, or supply an already conditionally-standardised score, if \
+     this model must be saved";
 
 /// Why a learned Gaussian-shift frailty is refused where the likelihood does not
 /// identify it (gam#2938); see

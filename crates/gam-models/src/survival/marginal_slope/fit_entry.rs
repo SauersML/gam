@@ -788,6 +788,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     .as_ref()
                     .map(|design| design.view()),
                 &score_maps,
+                &latent_calibration.per_score,
                 DEFAULT_JOINT_LATENT_NODES,
             )
             .map_err(FitFailure::unclassified)?;
@@ -2768,6 +2769,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     .as_ref()
                     .map(|design| design.view()),
                 &score_maps,
+                &latent_calibration.per_score,
                 DEFAULT_JOINT_LATENT_NODES,
             )
             .map_err(FitFailure::unclassified)?;

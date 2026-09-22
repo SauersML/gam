@@ -38,7 +38,7 @@ use super::*;
 
 use crate::bms::{
     EmpiricalLatentMeasureSupport, LatentLawConsumed, LatentMeasureCalibration, LatentMeasureKind,
-    LatentMeasureSpec, LatentZConditionalCalibration, build_latent_measure_decision,
+    LatentMeasureSpec, LatentZConditionalCalibration, MovingLawArm, build_latent_measure_decision,
     estimated_latent_law,
 };
 use crate::inference::predict_io::FittedLatentScoreMap;
@@ -342,12 +342,45 @@ pub(crate) fn resolve_latent_score_calibration_from_parts(
             support,
             "survival-marginal-slope",
         )?;
-        // The moving-law certificate covers one score. With several, a moving
-        // column is routed below on the score as given (gam#2949).
+        // The moving-law certificate covers ONE score: with several, the anchor
+        // reads the drive `rᵀz`, whose law is the joint law, and the arms are
+        // not scored on a scalar axis here (gam#2949). The arm the gate FITTED
+        // is still the law this column's own conditional evidence chose, and
+        // the joint law transports it exactly unless it is a LOCAL law:
+        //
+        //   * a location-scale arm's calibration is applied to the score below,
+        //     BEFORE any downstream consumer — the joint law included — sees
+        //     it, so the moving mean and variance are divided out and what the
+        //     joint law compresses is the standardised residual, whose law does
+        //     not move. The map travels with the law
+        //     (`SurvivalJointLatentLaw::score_calibrations`) so prediction reads
+        //     a new score on the same axis;
+        //   * a pooled or location-scale-empirical arm is a finite law of that
+        //     same residual, which the joint law's own compression carries.
+        //
+        // Only the LOCAL arm — the gate's finding that the column's SHAPE moves
+        // on the span — has nothing that `μ + L(a)·ε` can follow, and that
+        // column alone still sends every column back to the closed form. The
+        // certificate itself is not taken at `K ≥ 2`, and the label says so
+        // through `uncertified`, the field that exists for an anchor the
+        // certificate does not evaluate.
         if k >= 2 && decision.moving_law.take().is_some() {
-            decision.kind = LatentMeasureKind::StandardNormal;
-            decision.calibration = LatentMeasureCalibration::None;
-            decision.empirical_build = None;
+            if matches!(decision.kind, LatentMeasureKind::LocalEmpirical { .. }) {
+                decision.kind = LatentMeasureKind::StandardNormal;
+                decision.calibration = LatentMeasureCalibration::None;
+                decision.empirical_build = None;
+            } else if let LatentLawConsumed::EstimatedMovingLaw {
+                arm, uncertified, ..
+            } = &mut decision.consumed
+            {
+                *uncertified = Some(format!(
+                    "the cross-fitted moving-law certificate scores the arms of ONE score's own \
+                     axis; with K={k} scores the anchor reads the drive rᵀz on the joint latent \
+                     law, so the {} arm this column's conditional evidence chose is fitted and \
+                     carried without being scored against the other arms (gam#2949)",
+                    arm.label(),
+                ));
+            }
         } else if decision.moving_law.is_some() {
             moving_law = decision.moving_law.take();
         }
@@ -414,11 +447,15 @@ pub(crate) fn resolve_latent_score_calibration_from_parts(
 ///
 /// With several scores the anchor reads the law of the drive `rᵀz`, and any
 /// column that is not the standard normal sends the fit to the joint latent law
-/// (gam#2929), which transports one pooled residual law by `μ + L(a)·ε`. That
-/// follows a moving covariance but not a moving mean or shape, so a column whose
-/// law moves has nothing to anchor on yet: every column keeps the closed form,
-/// labelled `gaussian-uncertified` and naming the moving score (gam#2949). No
-/// default fit reaches the joint law's refusal of a local law.
+/// (gam#2929), which transports one pooled residual law by `μ + L(a)·ε`.
+///
+/// That transport follows a moving MEAN and covariance — a location-scale arm's
+/// map is divided out of the score before the law is built, and travels with the
+/// law so prediction reads a new score on the same axis (gam#2949) — but not a
+/// moving SHAPE. So a column whose fitted arm is the LOCAL one has nothing to
+/// anchor on yet: every column keeps the closed form, labelled
+/// `gaussian-uncertified` and naming that score. No default fit reaches the
+/// joint law's refusal of a local law.
 ///
 /// Otherwise, when some column departs, the fit anchors on the joint law for all
 /// columns. A column the adequacy screen passed is then not anchored on its
@@ -466,18 +503,28 @@ fn route_multi_score_latent_laws(
         }
     };
     let k = measures.len();
-    if let Some(moving) = consumed
-        .iter()
-        .position(|decision| matches!(decision, LatentLawConsumed::EstimatedMovingLaw { .. }))
-    {
+    // gam#2949: only a column whose fitted arm is LOCAL is beyond the joint
+    // law's transport. A location-scale arm is divided out of the score before
+    // the joint law sees it, and a pooled or residual finite law is a law of
+    // that same residual, so those columns are carried on the joint law and are
+    // no longer a reason to put every column back on the closed form.
+    if let Some(moving) = consumed.iter().position(|decision| {
+        matches!(
+            decision,
+            LatentLawConsumed::EstimatedMovingLaw {
+                arm: MovingLawArm::Local,
+                ..
+            }
+        )
+    }) {
         let moving_summary = evidence_of(&consumed[moving])
             .map(|evidence| evidence.summary())
             .unwrap_or_default();
         let missing = format!(
-            "the conditional law of score column {moving} moves on the marginal-index span \
-             ({moving_summary}), and with K={k} scores the joint latent law transports one pooled \
-             residual law, which follows a moving covariance but not a moving mean or shape \
-             (gam#2949)"
+            "the conditional law of score column {moving} moves in SHAPE on the marginal-index \
+             span ({moving_summary}), and with K={k} scores the joint latent law transports one \
+             pooled residual law by μ + L(a)·ε, which follows a moving mean and covariance but \
+             not a moving shape (gam#2949)"
         );
         log::debug!(
             "[survival-marginal-slope latent-z] every score column keeps the closed form, \
@@ -1182,14 +1229,14 @@ mod persistence_tests {
 
     #[test]
     fn an_unfired_gate_persists_nothing() {
-        let cond = split_persisted_latent_calibrations(&[LatentMeasureCalibration::None], true)
+        let cond = split_persisted_latent_calibrations(&[LatentMeasureCalibration::None], true, false)
             .expect("no calibration is always persistable");
         assert!(cond.is_none());
     }
 
     #[test]
     fn a_conditional_calibration_persists_into_its_field() {
-        let cond = split_persisted_latent_calibrations(&[conditional()], true)
+        let cond = split_persisted_latent_calibrations(&[conditional()], true, false)
             .expect("conditional persists");
         assert!(cond.is_some());
     }
@@ -1199,7 +1246,7 @@ mod persistence_tests {
     /// than its coefficients were fitted under, and nothing downstream could tell.
     #[test]
     fn an_unreproducible_conditioning_span_refuses_to_persist() {
-        let error = split_persisted_latent_calibrations(&[conditional()], false)
+        let error = split_persisted_latent_calibrations(&[conditional()], false, false)
             .expect_err("an unreproducible span must refuse");
         assert!(
             error.contains("RESOLVED marginal spec"),
@@ -1207,7 +1254,7 @@ mod persistence_tests {
         );
         // A fit that calibrated nothing conditions on nothing, so the same state
         // must NOT refuse it.
-        split_persisted_latent_calibrations(&[LatentMeasureCalibration::None], false)
+        split_persisted_latent_calibrations(&[LatentMeasureCalibration::None], false, false)
             .expect("an uncalibrated score is unaffected by the span");
     }
 
@@ -1219,6 +1266,7 @@ mod persistence_tests {
         let error = split_persisted_latent_calibrations(
             &[LatentMeasureCalibration::None, conditional()],
             true,
+            false,
         )
         .expect_err("a calibrated second score must refuse");
         assert!(
@@ -1229,7 +1277,38 @@ mod persistence_tests {
         split_persisted_latent_calibrations(
             &[conditional(), LatentMeasureCalibration::None],
             true,
+            false,
         )
         .expect("only the persisted surface was calibrated");
+    }
+
+    /// gam#2949: when the joint latent law carries one map per coordinate, the
+    /// single-surface payload field is EMPTY — one owner for the map a score is
+    /// read on — and a calibrated second score is no longer a refusal. The
+    /// reproducibility refusal still binds, because the span is rebuilt from the
+    /// resolved marginal spec whichever object holds the map.
+    #[test]
+    fn a_joint_law_that_carries_the_maps_persists_none_of_them_in_the_scalar_field_2949() {
+        let carried = split_persisted_latent_calibrations(
+            &[LatentMeasureCalibration::None, conditional()],
+            true,
+            true,
+        )
+        .expect("a calibrated second score persists once the law carries its map");
+        assert!(
+            carried.is_none(),
+            "the scalar field must stay empty so no coordinate is mapped twice"
+        );
+        let first_only = split_persisted_latent_calibrations(&[conditional()], true, true)
+            .expect("the primary score's map travels with the law too");
+        assert!(first_only.is_none());
+        let error =
+            split_persisted_latent_calibrations(&[conditional()], false, true).expect_err(
+                "an unreproducible span refuses whichever object carries the map",
+            );
+        assert!(
+            error.contains("RESOLVED marginal spec"),
+            "the refusal must name what prediction would rebuild instead; got {error}"
+        );
     }
 }
