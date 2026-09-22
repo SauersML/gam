@@ -5386,6 +5386,10 @@ impl SplineScanFit {
 }
 
 #[cfg(test)]
+#[path = "spline_scan_evaluation_scaling_tests.rs"]
+mod spline_scan_evaluation_scaling_tests;
+
+#[cfg(test)]
 mod tests {
     /// Seed a covariance zonotope without throwing away exact symmetry.
     ///
