@@ -114,6 +114,21 @@ echo "$outcome,$cause"
     assert_eq!(out, "GAM_ERROR");
     assert_eq!(cause, "gam_fit_failed");
 
+    // Test 2c: a custom-family refusal is gam failing to fit, however it is
+    // wrapped. Run 3561ea0026 reported three of these as METRIC_OFF because the
+    // list keyed on the wrappers rather than on the variant's own rendering.
+    let (out, cause) = run_case(
+        "",
+        101,
+        "thread 'main' panicked at tests/quality/families/foo.rs:203:6:\n\
+         gam multinomial fit: Custom-family fit failed: custom-family optimization error in \
+         fit_custom_family outer smoothing: outer smoothing optimization failed certified-fit \
+         validation after exhausting strategy fallbacks",
+        "test2c",
+    );
+    assert_eq!(out, "GAM_ERROR");
+    assert_eq!(cause, "gam_fit_failed");
+
     // Test 3: METRIC_OFF
     let (out, cause) = run_case("", 1, "Failed to fit", "test3");
     assert_eq!(out, "METRIC_OFF");

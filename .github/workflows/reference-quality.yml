@@ -762,7 +762,23 @@ jobs:
             # sites share the literal phrase `REML optimum is value-resolved`,
             # which is gam's own prose and cannot be produced by a test
             # describing its reference tool, so that phrase is the key.
-            gamfit_re='IntegrationFailed|InvalidConfig|IdentifiabilityFailure|LayoutError|identifiability audit|Invalid input|could not broadcast|Newton step|transformation fit failed|workflow survival baseline failed|RemlOptimizationFailed|REML smoothing optimization|Optimization \{ context:|OrderFailures \{|NonConvergence \{|REML optimum is value-resolved|Fit\((Raised|Estimation|Context|Annotated|CustomFamily|SurvivalMarginalSlope|Workflow)'
+            # A seventh missing variant, and the one that shows the rule this
+            # list needs. `EstimationError::CustomFamilyFit` renders as
+            # `Custom-family fit failed: {0}`
+            # (crates/gam-problem/src/estimation_error.rs:500) -- gam refusing to
+            # produce a fit. On run 3561ea0026 four rows carried that text and the
+            # list matched only ONE of them, and by accident: the Dirichlet row
+            # also wrapped an `Optimization { context:` and landed in GAM_ERROR,
+            # while `quality_vs_synthetic_multinomial_deviance_identity`,
+            # `quality_vs_vgam_multinomial_smooth_by_factor` and
+            # `quality_vs_vgam_multinomial_softmax::..._on_real_data` -- whose
+            # inner text is `outer smoothing optimization failed certified-fit
+            # validation` -- were all reported as METRIC_OFF, i.e. as gam fitting
+            # and missing a quality bound. One error variant classified two ways
+            # depending on what wrapped it. The variant's own rendering is the key,
+            # as it is for the six above it: a test describing its reference tool
+            # cannot produce gam's own prose.
+            gamfit_re='IntegrationFailed|InvalidConfig|IdentifiabilityFailure|LayoutError|identifiability audit|Invalid input|could not broadcast|Newton step|transformation fit failed|workflow survival baseline failed|RemlOptimizationFailed|REML smoothing optimization|Custom-family fit failed|Optimization \{ context:|OrderFailures \{|NonConvergence \{|REML optimum is value-resolved|Fit\((Raised|Estimation|Context|Annotated|CustomFamily|SurvivalMarginalSlope|Workflow)'
             if [ "$outcome" = TEST_ERROR ]; then
               testerr=$((testerr+1))
             elif [ "$outcome" = BUILDFAIL ]; then
