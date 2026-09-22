@@ -395,23 +395,35 @@ fn gam_multinomial_softmax_recovers_true_simplex() {
     );
 
     // ---- #561: independent smoothing parameters per (smooth term, class) ----
-    // The formula `y ~ s(x1) + s(x2) + x3` has TWO penalized smooth terms
-    // (`s(x1)`, `s(x2)`; `x3` is an unpenalized linear term), and each smooth
-    // term carries TWO penalties under the double-penalty construction
-    // (wiggliness + polynomial-null-space shrinkage, mgcv `select=TRUE`
-    // semantics), so each of the K-1=2 active classes carries
-    // n_smooth_terms · 2 = 4 independent λ and the total count is (K-1)·4 = 8.
-    // The native multinomial driver must select all of them SEPARATELY within
-    // each active class — the truth's cubic-in-x1 and sigmoid-in-x2 have very
-    // different roughness, so a single fused λ per class would have to
-    // over-smooth one term while under-smoothing the other, biasing the surface
-    // (the original RMSE=0.13 failure). A fused single-λ-per-class driver
-    // would report only K-1 = 2. We assert the per-term structure survived
-    // into the saved model, AND that the λ within a class actually resolved to
-    // DISTINCT values (the whole point — fusion would force them equal).
+    // The driver must select one λ per (penalty component, active class), not
+    // one fused λ per class — the truth's cubic-in-x1 and sigmoid-in-x2 have
+    // very different roughness, so a single fused λ would over-smooth one term
+    // while under-smoothing the other and bias the surface (the original
+    // RMSE=0.13 failure). What the per-class count IS follows from the formula,
+    // by enumerating the terms that own a penalty block rather than only the
+    // smooth ones:
+    //
+    //   s(x1, k=6)  double-penalty smooth  wiggliness + null-space shrinkage  2
+    //   s(x2, k=6)  double-penalty smooth  wiggliness + null-space shrinkage  2
+    //   x3          default linear slope   its own ridge                      1
+    //                                                        per active class  5
+    //
+    // The linear slope is the term this count used to omit. `x3` is not
+    // unpenalized: a default slope owns a penalty block
+    // (`LinearTermSpec::owns_penalty_block`, gam#4300 — "the design emits one
+    // block per double_penalty term and per bounded-shrinkage coefficient"),
+    // so writing the expectation as a product over the SMOOTH terms alone
+    // silently asserted that the formula's third term contributes nothing. It
+    // reported 4 where the design carries 5.
+    //
+    // A fused single-λ-per-class driver would report 1, which is what this
+    // guard exists to catch and what every count below still separates from.
     // `lambdas_per_block` segments the flat λ vector by class.
     const PENALTIES_PER_SMOOTH_TERM: usize = 2; // wiggliness + null-space shrinkage
     const N_SMOOTH_TERMS: usize = 2; // s(x1), s(x2)
+    const PENALIZED_LINEAR_TERMS: usize = 1; // x3, a default (ridged) slope
+    const COMPONENTS_PER_CLASS: usize =
+        N_SMOOTH_TERMS * PENALTIES_PER_SMOOTH_TERM + PENALIZED_LINEAR_TERMS;
     assert_eq!(
         model.lambdas_per_block.len(),
         K - 1,
@@ -421,18 +433,39 @@ fn gam_multinomial_softmax_recovers_true_simplex() {
     for (a, &n_lam) in model.lambdas_per_block.iter().enumerate() {
         assert_eq!(
             n_lam,
+            COMPONENTS_PER_CLASS,
+            "class {a} must carry one independent λ per penalty component \
+             ({N_SMOOTH_TERMS} double-penalty smooths ⇒ \
+             {} components, plus {PENALIZED_LINEAR_TERMS} ridged linear slope \
+             ⇒ {COMPONENTS_PER_CLASS}); a fused single-λ-per-class driver would \
+             report 1. Labels: {:?}",
             N_SMOOTH_TERMS * PENALTIES_PER_SMOOTH_TERM,
-            "class {a} must carry one independent λ per (smooth term, penalty) \
-             (2 double-penalty terms ⇒ 4); a fused single-λ-per-class driver \
-             would report 1"
+            model.lambda_labels
+        );
+    }
+    // Which components they are, so a change to any term's penalty topology
+    // fails by naming the term that moved instead of printing a bare count.
+    for (var, expected) in [
+        ("x1", PENALTIES_PER_SMOOTH_TERM),
+        ("x2", PENALTIES_PER_SMOOTH_TERM),
+    ] {
+        let named = model
+            .lambda_labels
+            .iter()
+            .filter(|label| label.contains(var))
+            .count();
+        assert_eq!(
+            named, expected,
+            "{var} must own {expected} penalty components, got {named} in {:?}",
+            model.lambda_labels
         );
     }
     assert_eq!(
         model.lambdas.len(),
-        (K - 1) * N_SMOOTH_TERMS * PENALTIES_PER_SMOOTH_TERM,
-        "per-term smoothing must yield (K-1)·n_smooth_terms·2 = {} λ total, not \
-         a single fused λ per class; got {:?}",
-        (K - 1) * N_SMOOTH_TERMS * PENALTIES_PER_SMOOTH_TERM,
+        (K - 1) * COMPONENTS_PER_CLASS,
+        "per-term smoothing must yield (K-1)·{COMPONENTS_PER_CLASS} = {} λ total, \
+         not a single fused λ per class; got {:?}",
+        (K - 1) * COMPONENTS_PER_CLASS,
         model.lambdas
     );
     // The two smooth terms within at least one class must resolve to materially
