@@ -7571,7 +7571,6 @@ fn rigid_survival_second_all_axes_each_matches_single_direction_979() {
 /// fail to do.
 #[test]
 fn rigid_survival_contracted_trace_hessian_snapshot_matches_per_weight_2979() {
-    use crate::custom_family::ContractedTraceHessianAtSnapshot;
 
     let n = 120usize;
     let z: Vec<f64> = (0..n).map(|r| ((r as f64) * 0.29).sin() * 0.9).collect();
