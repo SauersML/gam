@@ -3426,14 +3426,24 @@ pub(crate) fn operator_penalty_candidates_from_collocation(
         )?);
     }
     if let Some(gram) = third_order_gram {
-        let (s3, c3) = normalize_penalty(&symmetrize(gram));
-        out.push(PenaltyCandidate {
-            matrix: ConstructiveQuadratic::try_from_dense_psd(
-                s3,
+        // The sibling of the third-order block in
+        // `matern_operator_penalty_triplet_at_length_scale`, repaired the same
+        // way and for the same reason (#1561, #3236). There is no `d3` to build
+        // an energy factor from, so the rank must come off the Gram's ROUNDING
+        // band rather than off a cutoff relative to the spectrum, which κ walks
+        // across. That site carries the full argument and says why
+        // `assembly_magnitude` is zero here.
+        let sym = symmetrize(gram);
+        let (matrix, normalization_scale) =
+            ConstructiveQuadratic::unit_frobenius_from_gram_within_rounding_band(
+                &sym,
+                0.0,
                 "collocation operator third-order penalty",
-            )?,
+            )?;
+        out.push(PenaltyCandidate {
+            matrix,
             source: PenaltySource::OperatorThirdOrder,
-            normalization_scale: c3,
+            normalization_scale,
             kronecker_factors: None,
             op: None,
         });
@@ -4402,6 +4412,133 @@ mod third_order_operator_tests {
                 }
             }
         }
+    }
+
+    /// A 6x6 grid. Large enough that a smooth kernel's Gram spectrum spans far
+    /// more than the ten orders that separate the two cutoffs compared below;
+    /// `centers_2d`'s five points give a 5x5 Gram that cannot.
+    fn centers_grid_36() -> Array2<f64> {
+        let side = 6usize;
+        let mut centers = Array2::<f64>::zeros((side * side, 2));
+        for i in 0..side {
+            for j in 0..side {
+                centers[[i * side + j, 0]] = i as f64 / (side as f64 - 1.0);
+                centers[[i * side + j, 1]] = j as f64 / (side as f64 - 1.0);
+            }
+        }
+        centers
+    }
+
+    /// #1561 / #3236: the third-order block's rank must stop moving with κ.
+    ///
+    /// `try_from_dense_psd` keeps the eigen-directions above `dim·1e-10·max|ev|`
+    /// and rebuilds the matrix from them, so the kept COUNT is decided by where
+    /// the spectrum sits relative to its own largest eigenvalue. Move κ and the
+    /// spectrum slides through that cutoff: #3236 measured a mass block at rank
+    /// 118 at ψ = 1.4398 and 117 at ψ − 1e-3. Downstream,
+    /// `canonicalize_penalty_specs_at_frozen_ranks` refuses the trial, or, when
+    /// it does not, `log|S̃|₊` and its ρ-derivative are computed at two different
+    /// ranks on two neighbouring trials and the outer search cost-stalls against
+    /// a descent direction that is correct for neither.
+    ///
+    /// #3236 moved mass, tension and stiffness onto their energy factors. The
+    /// third-order block could not follow: the collocation builder emits its
+    /// energy as a closed-form Gram and there is no `d3` to factor. It is now
+    /// built at the Gram's ROUNDING band instead, which is an absolute scale and
+    /// does not move with the spectrum.
+    ///
+    /// The first assertion is a POSITIVE CONTROL and is the reason this gate is
+    /// worth running. A rank that does not move is the expected reading of BOTH
+    /// "the repair works" and "this fixture never reached the defect", and those
+    /// are not the same result. So the rule being removed is run verbatim beside
+    /// the rule replacing it, on the same Grams, and the test fails if the old
+    /// one does NOT move.
+    #[test]
+    fn third_order_block_rank_stops_moving_with_kappa_1561() {
+        let centers = centers_grid_36();
+        let nu = MaternNu::FiveHalves;
+        let ladder: Vec<f64> = (0..25).map(|k| 0.40 * (1.0 + 0.02 * k as f64)).collect();
+
+        let mut old_cutoff: Vec<usize> = Vec::new();
+        let mut rounding_band: Vec<usize> = Vec::new();
+        let mut production: Vec<Option<usize>> = Vec::new();
+
+        for &length_scale in &ladder {
+            let ops = build_matern_collocation_operator_matrices(
+                centers.view(),
+                None,
+                length_scale,
+                nu,
+                false,
+                None,
+                None,
+            )
+            .expect("Matérn collocation operators");
+            let gram = ops
+                .third_order_gram
+                .expect("ν ≥ 5/2 admits the third-order operator");
+            let sym = symmetrize(&gram);
+
+            // The rule this change removes, run verbatim on the same Gram.
+            let (normalized, _) = normalize_penalty(&sym);
+            let cut = ConstructiveQuadratic::try_from_dense_psd(normalized, "old cutoff probe")
+                .expect("the old cutoff accepts this Gram");
+            old_cutoff.push(cut.factor().nrows());
+
+            // The rule replacing it.
+            let (banded, _) = ConstructiveQuadratic::unit_frobenius_from_gram_within_rounding_band(
+                &sym,
+                0.0,
+                "rounding-band probe",
+            )
+            .expect("the rounding band accepts this Gram");
+            rounding_band.push(banded.factor().nrows());
+
+            // What the shipped builder actually hands a fit. `None` records the
+            // block being dropped entirely, which is a rank change too: a Matérn
+            // trial whose odd-order Grams underflow drops ThirdOrder outright.
+            let filtered = crate::smooth::matern_operator_penalty_triplet_at_length_scale(
+                centers.view(),
+                None,
+                None,
+                nu,
+                false,
+                None,
+                length_scale,
+            )
+            .expect("Matérn operator triplet");
+            production.push(
+                filtered
+                    .active
+                    .iter()
+                    .find(|penalty| {
+                        matches!(penalty.info.source, PenaltySource::OperatorThirdOrder)
+                    })
+                    .map(|penalty| penalty.info.effective_rank),
+            );
+        }
+
+        eprintln!("[third-order ladder] old_cutoff={old_cutoff:?}");
+        eprintln!("[third-order ladder] rounding_band={rounding_band:?}");
+        eprintln!("[third-order ladder] production={production:?}");
+
+        assert!(
+            old_cutoff.iter().any(|rank| *rank != old_cutoff[0]),
+            "POSITIVE CONTROL FAILED: the cutoff this change removes does not move over \
+             this ladder, so the ladder never reaches the defect and the assertions below \
+             would pass without measuring anything. Widen the ladder or the grid; do not \
+             delete this assertion. old_cutoff={old_cutoff:?}"
+        );
+        assert!(
+            production.iter().all(|rank| *rank == production[0]),
+            "the shipped third-order block's rank still moves with κ: {production:?} \
+             (old cutoff on the same Grams: {old_cutoff:?})"
+        );
+        assert!(
+            rounding_band.iter().all(|rank| *rank == rounding_band[0]),
+            "the rounding band's own kept count moves over this ladder, so the band is \
+             not the absolute scale it is documented to be: {rounding_band:?}"
+        );
     }
 
     /// The closed-form Gram equals `D₃ᵀD₃` of the materialized third-derivative

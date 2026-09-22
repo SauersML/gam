@@ -15639,26 +15639,19 @@ publish paths.
 
 ### Fixed
 
-- Fixed cancellation in non-Gaussian REML gradients at high smoothing
-  parameters.
+- The Matérn third-order operator penalty's rank no longer moves with κ. Both builders
+  constructed that block with `ConstructiveQuadratic::try_from_dense_psd`, whose
+  `dim·1e-10·max|ev|` cutoff is relative to the spectrum, so the kept count changed
+  between neighbouring trial length scales — the mechanism #3236 repaired for the mass,
+  tension and stiffness blocks and could not repair for this one, which has no operator
+  matrix to build an energy factor from. Both now use
+  `unit_frobenius_from_gram_within_rounding_band`, whose band `dim·ε·(max|S| + assembly)`
+  is an absolute scale (#1561, #3236, #2959).
+- A comment claiming #3236 had removed the cut from
+  `operator_penalty_candidates_from_collocation` is corrected: that builder kept it for
+  the third-order block, as did its sibling.
 
-## v0.1.1 — gam 0.1.1 / gamfit - (2026-02-25)
-
-### Changed
-
-- Strengthened oracle tests and aligned survival penalty derivatives.
-
-## v0.1.0 — gam 0.1.0 / gamfit - (2026-02-25)
-
-### Changed
-
-- Initial crates.io release of the Rust GAM engine, including formula/design
-  construction, REML/PIRLS fitting paths, survival and non-Gaussian families,
-  uncertainty output, and engine test coverage.
-
-## v0.0.0 — gam 0.0.0 / gamfit - (2026-02-24)
-
-### Changed
+### Added
 
 - Initial placeholder crates.io publication after the early GAM stack import,
   including Duchon/Matern basis coverage, sparse-native REML paths, probit
@@ -15706,3 +15699,7 @@ publish paths.
   announcing. Both lines now report the criterion agreement against the criterion resolution and
   the number of consecutive agreements that certified, with the discrepancy and the tolerance
   printed as the carried numbers they are.
+- `third_order_block_rank_stops_moving_with_kappa_1561`, which runs the removed cutoff
+  and its replacement on the same Grams across a length-scale ladder and fails if the
+  removed cutoff does NOT move, so a constant rank cannot be read as a repair when it is
+  really a fixture that never reached the defect.

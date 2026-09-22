@@ -5448,9 +5448,13 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
         // crossing (a mass block at rank 118 at ψ = 1.4398 and 117 at ψ − 1e-3),
         // `canonicalize_penalty_specs_at_frozen_ranks` refuses that trial, and
         // the outer search cost-stalls against a correct descent gradient. #3236
-        // removed the cut from `operator_penalty_candidates_from_collocation`
-        // and this builder kept it, so for a `matern()` term the cut was still
-        // the one in effect: `build_single_local_smooth_term_for` replaces a
+        // moved the MASS, TENSION and STIFFNESS candidates of both builders onto
+        // their energy factors and could move neither builder's THIRD-ORDER
+        // block, which has no operator matrix to move to; #1561 put that block
+        // on the Gram's rounding band instead (below, and at the sibling site
+        // `operator_penalty_candidates_from_collocation`, which kept the cut for
+        // the same block and for the same reason). For a `matern()` term this
+        // builder is the one in effect: `build_single_local_smooth_term_for` replaces a
         // `SmoothBasisSpec::Matern` term's active penalties with this triplet,
         // so the other builder's output never reaches the fit. The refusals name
         // the cut's fingerprint — a kept eigenvalue of ±1e-17 beside a rounding
@@ -5465,13 +5469,44 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
         )?);
     }
     if let Some(gram) = ops.third_order_gram.as_ref() {
+        // THE FOURTH BLOCK, off the `dim·1e-10·max|ev|` cut (#1561, #3236).
+        //
+        // The three blocks above are built from their exact energy factors, so
+        // each rank is a property of an operator. This one has no operator to
+        // build from: the collocation builder emits the third-order energy as a
+        // Gram summed in closed form and `CollocationOperatorMatrices` carries
+        // no `d3`. So it stayed on `try_from_dense_psd`, whose cutoff is
+        // relative to the spectrum, which is precisely what makes a block's rank
+        // a function of κ — the mechanism the comment above describes, still
+        // live for every ν ≥ 5/2 (`MaternNu::admits_third_order_operator`) after
+        // #3236 repaired the other three.
+        //
+        // `unit_frobenius_from_gram_within_rounding_band` is the constructor
+        // written for this and, until now, called only from its own tests. It
+        // keeps EVERY positive eigenvalue and clamps a negative one only inside
+        // `dim·ε·(max|S| + assembly)`, so the kept count no longer crosses a
+        // cutoff as κ moves. It returns the unit-Frobenius quadratic together
+        // with `c = ‖S₊‖_F`, which is exactly the pair this candidate wants, so
+        // `normalize_penalty_in_constrained_space` is not needed here any more.
+        // Its `c` is taken over the positive eigenvalues where the old one took
+        // a Frobenius norm over all of them; inside the rounding band those are
+        // the same number.
+        //
+        // `assembly_magnitude = 0` because this Gram's summands are not
+        // available at this site. That makes the band `dim·ε·max|S|`, a LOWER
+        // bound on the honest band, so any refusal it raises is at least as
+        // strict as the true one — never weaker. If a third-order Gram does
+        // refuse at a residual just past it, the repair is to thread the summand
+        // magnitude out of the kernel builder, not to widen the band here.
         let sym = (gram + &gram.t()) * 0.5;
-        let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym)?;
-        candidates.push(PenaltyCandidate {
-            matrix: ConstructiveQuadratic::try_from_dense_psd(
-                matrix,
+        let (matrix, normalization_scale) =
+            ConstructiveQuadratic::unit_frobenius_from_gram_within_rounding_band(
+                &sym,
+                0.0,
                 "Matérn third-order operator penalty",
-            )?,
+            )?;
+        candidates.push(PenaltyCandidate {
+            matrix,
             source: PenaltySource::OperatorThirdOrder,
             normalization_scale,
             kronecker_factors: None,
