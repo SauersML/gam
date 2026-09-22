@@ -2,3 +2,5 @@ completeness	COMPLETE
 measured	true
 enumerated	437
 rows_written	437
+shards	15
+duplicate_rows	0
