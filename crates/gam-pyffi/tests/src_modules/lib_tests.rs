@@ -132,34 +132,58 @@ fn sae_fisher_metric_construction_stays_in_gam_sae_2236() {
     );
 }
 
+/// The refusal this test reads is a `PyErr`, and formatting one is interpreter work:
+/// `manifold_sae_resident_fisher_metric` refuses through `py_value_error`, so
+/// `error.to_string()` below needs a live interpreter to render the exception.
+///
+/// This crate does NOT take pyo3's `auto-initialize` for that. The feature would start
+/// one implicitly, but it refuses to build a wheel against an interpreter that embeds
+/// statically — the manylinux free-threaded cp314t — which is why `test_support` exists
+/// and says so at `lib.rs`. A test that needs the interpreter attaches to it explicitly;
+/// it does not acquire the feature flag on that test's behalf.
+///
+/// Without the attach this failed at `4057627f4b` inside pyo3 itself, at
+/// `pyo3-0.29.0/src/interpreter_lifecycle.rs:134`, not at any assertion in this file:
+///
+/// ```text
+/// assertion `left != right` failed: The Python interpreter is not initialized and the
+/// `auto-initialize` feature is not enabled. | Consider calling `Python::initialize()`
+/// before attempting to use Python APIs. | left: 0 | right: 0
+/// ```
+///
+/// That `left != right` is pyo3's own lifecycle check on the initialization count, which
+/// every Python API entry passes through — reading it as this test's `assert!` is the
+/// first wrong turn available, and the second is the feature flag above.
 #[test]
 fn manifold_sae_structured_metric_without_behavior_shard_is_loadable() {
-    let mut payload = crate::manifold::manifold_sae_payload::ManifoldSaePayload::from_json(
-        include_str!("../../../../tests/fixtures/manifold_sae/golden_full.json"),
-    )
-    .expect("golden ManifoldSAE payload");
-    payload.fisher_factors = None;
-    payload.fisher_provenance = None;
-    payload.fisher_mass_residual = None;
-    payload.fisher_factor_kind = None;
-    payload.metric_provenance = "WhitenedStructured".to_string();
+    crate::test_support::attach(|_py| {
+        let mut payload = crate::manifold::manifold_sae_payload::ManifoldSaePayload::from_json(
+            include_str!("../../../../tests/fixtures/manifold_sae/golden_full.json"),
+        )
+        .expect("golden ManifoldSAE payload");
+        payload.fisher_factors = None;
+        payload.fisher_provenance = None;
+        payload.fisher_mass_residual = None;
+        payload.fisher_factor_kind = None;
+        payload.metric_provenance = "WhitenedStructured".to_string();
 
-    assert!(
-        manifold_sae_resident_fisher_metric(&payload)
-            .expect("structured fit without a behavioral shard is valid")
-            .is_none(),
-        "WhitenedStructured fit provenance must not fabricate a resident behavioral metric"
-    );
+        assert!(
+            manifold_sae_resident_fisher_metric(&payload)
+                .expect("structured fit without a behavioral shard is valid")
+                .is_none(),
+            "WhitenedStructured fit provenance must not fabricate a resident behavioral metric"
+        );
 
-    payload.metric_provenance = "OutputFisher".to_string();
-    let error = manifold_sae_resident_fisher_metric(&payload)
-        .err()
-        .expect("behavioral provenance without retained factors must be rejected");
-    assert!(
-        error
-            .to_string()
-            .contains("requires retained fisher_factors")
-    );
+        payload.metric_provenance = "OutputFisher".to_string();
+        let error = manifold_sae_resident_fisher_metric(&payload)
+            .err()
+            .expect("behavioral provenance without retained factors must be rejected");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("requires retained fisher_factors"),
+            "the refusal must name what it wants retained: {rendered}"
+        );
+    });
 }
 
 #[test]
