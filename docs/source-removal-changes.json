@@ -3945,10 +3945,9 @@
     "base": "ee6083b2b4884f97846caaf19b8dffea0ae40944",
     "items": [
       "crates/gam-event-history/src/family.rs:fn:offsets_of_blocks",
-      "crates/gam-event-history/src/family.rs:fn:reference_at_coefficients",
-      "crates/gam-event-history/src/objective.rs:fn:computed_joint"
+      "crates/gam-event-history/src/family.rs:fn:reference_at_coefficients"
     ],
-    "reason": "Three crate-private methods left behind when three event-history landings (7a674cde0b #2966, a87114a4cd #2965, d1b60b8e4f #2986) merged into one tree. `reference_at_coefficients` and `offsets_of_blocks` on `EventHistoryFamily` were the pre-#2966 accessors the posterior read; #2966 moved both onto `PredictionModel` (predictor.rs), which is what `posterior.rs` now reads, and the #2965 copy of family.rs re-introduced the family versions with no caller. `computed_joint` was the forward-mode dispatcher #2965 replaced with `adjoint_joint`; its forward reference route, `coordinate_hessian`, keeps its name and its test caller.",
-    "evidence": "At ee6083b2b4, `git grep -n 'reference_at_coefficients\\|offsets_of_blocks\\|computed_joint' crates/` finds each name only at its definition in family.rs / objective.rs and, for reference_at_coefficients, the PredictionModel method of the same name in predictor.rs that posterior.rs:158 calls. The MSI workspace gate at integ-0920-ch failed with `-D dead-code` on exactly these three."
+    "reason": "Two crate-private accessors left behind when three event-history landings (7a674cde0b #2966, a87114a4cd #2965, d1b60b8e4f #2986) merged into one tree. `reference_at_coefficients` and `offsets_of_blocks` on `EventHistoryFamily` were the pre-#2966 accessors the posterior read; #2966 moved both onto `PredictionModel` (predictor.rs), which is what `posterior.rs` now reads, and the #2965 copy of family.rs re-introduced the family versions with no caller. (`computed_joint`, deleted in 5f0a2380b2 by the same reading, IS called by the objective's own tests as the forward-mode reference and was restored in the next commit; it is not a removal.)",
+    "evidence": "At ee6083b2b4, `git grep -n 'reference_at_coefficients\\|offsets_of_blocks' crates/` finds each name only at its definition in family.rs and, for reference_at_coefficients, the PredictionModel method of the same name in predictor.rs that posterior.rs:158 calls. The MSI workspace gate at integ-0920-ch failed with `-D dead-code` on both."
   }
 ]

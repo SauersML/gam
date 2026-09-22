@@ -14,12 +14,12 @@ impl TransformationNormalFamily {
     /// that IS this block's and carries no operator is refused rather than reported as motionless:
     /// the CTN ψ route requires operator-backed derivatives, and silently returning `None` here
     /// would restore exactly the missing term this hook exists to supply.
-    fn covariate_cone_axis(
+    fn covariate_cone_axis<'a>(
         &self,
-        hyper_layout: &CustomFamilyHyperLayout,
+        hyper_layout: &'a CustomFamilyHyperLayout,
         block_index: usize,
         psi_index: usize,
-    ) -> Result<Option<(&TensorKroneckerPsiOperator, usize, std::ops::Range<usize>)>, String> {
+    ) -> Result<Option<(&'a TensorKroneckerPsiOperator, usize, std::ops::Range<usize>)>, String> {
         if block_index != 0 {
             return Ok(None);
         }

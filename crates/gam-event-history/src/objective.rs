@@ -103,6 +103,7 @@ impl EventHistoryFamily {
         &self, states: &[ParameterBlockState], beta: &[S],
     ) -> Result<S, EventHistoryError> {
         let marks = self.marks();
+        let offsets = self.block_offsets();
         let (loadings, rates) = self.latent_parameters(beta);
         let normalisers = if let (Some(tables), true) = (self.reference.as_ref(), self.atoms > 0) {
             let values = self.reference_values(beta, loadings, &rates)?;
@@ -138,6 +139,7 @@ impl EventHistoryFamily {
         }).collect();
         Ok(pairwise_sum(&results?, &beta[0].constant_like(0.0)))
     }
+
 
     /// The reference log-normaliser and its Jacobian in the coefficients:
     /// `(m, ∂m/∂β)` with `∂m/∂β[q][i] = ∂m_i/∂β_q`, or `None` for a family
@@ -650,11 +652,12 @@ impl EventHistoryFamily {
     /// The computed path's value, gradient and dense Hessian by the ADJOINT
     /// route — what the fit evaluates (#2965 step B).
     ///
-    /// [`Self::coordinate_hessian`] is the same Hessian by forward mode, at
+    /// [`Self::computed_joint`] is the same three objects by forward mode, at
     /// `b(b + 1)/2` cohort sweeps for `b = ⌈p / TANGENT_WIDTH⌉`; this is `b`
-    /// of them. The forward route stays as the reference the tests score this
-    /// one against, exactly as it already is for the all-static families
-    /// `evaluate_generic` sends to the Louis sweep.
+    /// of them. It keeps its name and its callers in the tests, where it is
+    /// the reference this route is scored against, exactly as it already is
+    /// for the all-static families `evaluate_generic` sends to the Louis
+    /// sweep.
     pub(super) fn adjoint_joint<S: Directional>(
         &self, states: &[ParameterBlockState], u: Option<&Array1<f64>>,
         v: Option<&Array1<f64>>, derivatives: bool,
@@ -672,6 +675,26 @@ impl EventHistoryFamily {
             return Ok((self.path_value(states, &beta)?, Vec::new(), Vec::new()));
         }
         Ok(self.adjoint_hessian(states, &beta)?)
+    }
+
+    pub(super) fn computed_joint<S: Directional>(
+        &self, states: &[ParameterBlockState], u: Option<&Array1<f64>>,
+        v: Option<&Array1<f64>>, derivatives: bool,
+    ) -> Result<(S, Vec<S>, Vec<S>), String> {
+        let values: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
+        let total = values.len();
+        for direction in [u, v].into_iter().flatten() {
+            if direction.len() != total || direction.iter().any(|x| !x.is_finite()) {
+                return Err("invalid event-history derivative direction".to_string());
+            }
+        }
+        let beta: Vec<S> = values.iter().enumerate().map(|(q, value)|
+            S::seeded(*value, u.map_or(0.0, |x| x[q]), v.map_or(0.0, |x| x[q]))).collect();
+        if !derivatives {
+            return Ok((self.path_value(states, &beta)?, Vec::new(), Vec::new()));
+        }
+        let coordinates: Vec<usize> = (0..total).collect();
+        Ok(self.coordinate_hessian(states, &beta, &coordinates)?)
     }
 
     /// Whether the coefficient derivatives come from the computed path: a
