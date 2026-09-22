@@ -159,6 +159,67 @@ pub(crate) fn weighted_crossprod_dense_stable(
     Ok(out)
 }
 
+/// `Xᵀ·diag(w)·X` for the SAME design on both sides, computed so the result is
+/// BITWISE symmetric (gam#1561).
+///
+/// [`weighted_crossprod_dense_with_parallelism`] is a general `Lᵀ·diag(w)·R`.
+/// Handed the same matrix twice it is still a general GEMM: entry `(i, j)` and
+/// entry `(j, i)` are separate accumulations, and a blocked kernel is free to
+/// sum them in different orders. IEEE addition is not associative, so the two
+/// triangles come back differing in the last bits.
+///
+/// That is not a tolerance question here. `aft_absolute_newton_direction`
+/// declares [`SymmetricAssembly::Mirrored`], whose band is EXACTLY ZERO because
+/// a mirrored matrix has no legitimate disagreement at all, and
+/// `strict_symmetric_eigh` then refuses the Hessian. At `4057627f4b` that
+/// refusal was live in eight tests across four crates, every one at index
+/// `(1, 0)` and every one by a single ulp: defects of 3.469e-18, 1.110e-16,
+/// 2.220e-16 and 4.441e-16 against a band of 0.
+///
+/// `fast_xt_diag_x_with_parallelism` is one of the two routines the
+/// `Mirrored` documentation names as producing a bitwise-symmetric result, and
+/// it earns that: it accumulates the LOWER TRIANGLE ONLY
+/// (`CrossprodStructure::SymmetricLower`) and mirrors it once into the upper.
+/// One rounded value per off-diagonal pair, which is what the declaration
+/// asserts.
+///
+/// The finiteness and weight validation is the same as the general routine's,
+/// so a caller swapping to this one loses no check.
+pub(crate) fn weighted_selfcrossprod_dense_mirrored(
+    x: &Array2<f64>,
+    weights: &Array1<f64>,
+    par: faer::Par,
+) -> Result<Array2<f64>, String> {
+    if x.nrows() != weights.len() {
+        return Err(SurvivalLocationScaleError::DimensionMismatch {
+            reason: format!(
+                "weighted_selfcrossprod_dense row mismatch: x is {}x{}, weights has {}",
+                x.nrows(),
+                x.ncols(),
+                weights.len()
+            ),
+        }
+        .into());
+    }
+    if x.iter().any(|value| !value.is_finite()) {
+        return Err(SurvivalLocationScaleError::InvalidConfiguration {
+            reason: "weighted_selfcrossprod_dense inputs contain non-finite design values"
+                .to_string(),
+        }
+        .into());
+    }
+    require_finite_row_weights(weights, "weighted_selfcrossprod_dense")?;
+    let out = gam_linalg::faer_ndarray::fast_xt_diag_x_with_parallelism(x, weights, par);
+    if out.iter().any(|value| !value.is_finite()) {
+        return Err(SurvivalLocationScaleError::InvalidConfiguration {
+            reason: "weighted_selfcrossprod_dense accumulation produced non-finite values"
+                .to_string(),
+        }
+        .into());
+    }
+    Ok(out)
+}
+
 pub(crate) fn weighted_crossprod_dense_with_parallelism(
     left: &Array2<f64>,
     weights: &Array1<f64>,
@@ -337,4 +398,79 @@ pub(crate) fn embed_tail_columns(
     let mut out = Array2::<f64>::zeros((local.nrows(), total_cols));
     out.slice_mut(s![.., tail_range]).assign(local);
     Ok(out)
+}
+
+#[cfg(test)]
+mod mirrored_selfcrossprod_tests {
+    use super::*;
+    use ndarray::{Array1, Array2};
+
+    /// #1561: a same-channel survival-LS Hessian group must come back BITWISE
+    /// symmetric, and the general crossprod does not promise that.
+    ///
+    /// `aft_absolute_newton_direction` hands the assembled Hessian to
+    /// `strict_symmetric_eigh` declaring `SymmetricAssembly::Mirrored`, whose
+    /// band is EXACTLY ZERO: the declaration says every off-diagonal pair was
+    /// rounded once and written to both triangles, so any disagreement at all
+    /// is a construction defect rather than rounding. One ulp refuses the fit.
+    ///
+    /// The necessity of this routine is evidenced by the eight tests that
+    /// carried that refusal at `4057627f4b`, across `gam-cli`, `gam-models`
+    /// and `gam::regressions`, every one at index `(1, 0)` and every one a
+    /// single ulp: 3.469e-18, 1.110e-16, 2.220e-16, 4.441e-16 against a band
+    /// of 0. It is NOT re-derived here with a synthetic fixture, because
+    /// whether a general GEMM reassociates on any given shape depends on its
+    /// blocking and would make this gate's meaning depend on a tile size. The
+    /// eight real failures are the better evidence, and this test pins the
+    /// CONTRACT instead: bitwise symmetry, and the same value as before.
+    #[test]
+    fn the_self_crossprod_is_bitwise_symmetric_and_keeps_the_general_value() {
+        let n = 4096usize;
+        let p = 7usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        for row in 0..n {
+            for col in 0..p {
+                // Deterministic and deliberately not dyadic: entries whose
+                // products need the whole mantissa are what make a
+                // reassociated sum differ in its last bit.
+                let t = (row as f64 + 1.0) * (col as f64 + 1.7);
+                x[[row, col]] = (t * 0.739_085_133_215_160_7).sin() * (1.0 + 0.5 * col as f64);
+            }
+        }
+        let weights = Array1::from_shape_fn(n, |row| 0.25 + ((row % 13) as f64) / 17.0);
+
+        let mirrored = weighted_selfcrossprod_dense_mirrored(&x, &weights, faer::Par::Seq)
+            .expect("mirrored self-crossprod");
+        for i in 0..p {
+            for j in 0..p {
+                assert_eq!(
+                    mirrored[[i, j]].to_bits(),
+                    mirrored[[j, i]].to_bits(),
+                    "({i}, {j}) is not bitwise symmetric: {:e} versus {:e}",
+                    mirrored[[i, j]],
+                    mirrored[[j, i]]
+                );
+            }
+        }
+
+        // The routine must not move the VALUE. The bar is the band a
+        // reassociated sum of these summands may legitimately leave, read off
+        // this fixture's own summands, not a chosen closeness.
+        let general = weighted_crossprod_dense_with_parallelism(&x, &weights, &x, faer::Par::Seq)
+            .expect("general crossprod");
+        for i in 0..p {
+            for j in 0..p {
+                let absolute_sum: f64 = (0..n)
+                    .map(|row| (x[[row, i]] * weights[row] * x[[row, j]]).abs())
+                    .sum();
+                let band = gam_linalg::roundoff::accumulation_band(n, absolute_sum);
+                let gap = (mirrored[[i, j]] - general[[i, j]]).abs();
+                assert!(
+                    gap <= band,
+                    "({i}, {j}) moved by {gap:e}, past this entry's own accumulation band \
+                     {band:e}; the mirrored routine changed the value, not just its symmetry"
+                );
+            }
+        }
+    }
 }

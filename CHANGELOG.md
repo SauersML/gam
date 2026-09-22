@@ -15788,3 +15788,17 @@ publish paths.
 - `iso_kappa_fd_variant_driver_on(.., only_probes)`: an empty slice is the full grid, so
   no existing gate is narrowed, and a name matching no probe is a hard error, so a
   restricted grid cannot silently become empty.
+### Fixed
+
+- A survival location-scale Hessian group whose two channels are the same design was
+  formed with the general `Lᵀ·diag(w)·R` crossprod, so the two triangles of `Xᵀ·diag(w)·X`
+  were separate accumulations a blocked kernel could reassociate. The assembled Hessian is
+  declared `SymmetricAssembly::Mirrored`, whose band is exactly zero, so a single ulp of
+  disagreement made `strict_symmetric_eigh` refuse the fit — live in eight tests across
+  `gam-cli`, `gam-models` and `gam::regressions` at `4057627f4b`, every one at index
+  `(1, 0)`. The same-channel product now goes through `fast_xt_diag_x_with_parallelism`,
+  which accumulates one triangle and mirrors it (#1561, #3090).
+- The comment justifying `Mirrored` over `PsdAccumulation` said the latter "refuses a
+  negative diagonal". `symmetric_assembly_band` takes the absolute value of both diagonals;
+  the real reason is that its band is derived by Cauchy-Schwarz over PSD pieces and this
+  Hessian is deliberately indefinite.

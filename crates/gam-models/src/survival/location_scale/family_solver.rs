@@ -46,11 +46,24 @@ pub(crate) fn aft_absolute_newton_direction(
     use gam_linalg::roundoff::{accumulation_band, accumulation_growth};
 
     let p = g.len();
-    // The row kernel's `symmetric!` writes each off-diagonal pair from ONE
-    // rounded channel value into both triangles, so `h` is bitwise symmetric.
-    // It is also deliberately allowed to be indefinite — this routine exists
-    // to take an absolute-value Newton step at a saddle — so a PSD-accumulation
-    // declaration, which refuses a negative diagonal, would be wrong here.
+    // `h` is bitwise symmetric: every off-diagonal pair is written from ONE
+    // rounded value. Two things had to be true for that, and only the first
+    // was, until gam#1561: the row kernel's `symmetric!` mirrors each channel
+    // value, AND each coefficient-block product must itself be mirrored. A
+    // same-channel group is `Xᵀ·diag(w)·X`, and computing it with the general
+    // `Lᵀ·diag(w)·R` left `(i, j)` and `(j, i)` as separate accumulations that
+    // a blocked kernel could reassociate; it now goes through
+    // `weighted_selfcrossprod_dense_mirrored`, which accumulates one triangle
+    // and mirrors it.
+    //
+    // `PsdAccumulation` is still the wrong declaration, but NOT for the reason
+    // written here before: `symmetric_assembly_band` takes `.abs()` of both
+    // diagonals, so a negative diagonal is fine by it. The reason is the
+    // band's DERIVATION — Cauchy–Schwarz over PSD pieces, `|T_ij| ≤
+    // √(T_ii·T_jj)`. This matrix is deliberately allowed to be indefinite,
+    // because this routine exists to take an absolute-value Newton step at a
+    // saddle, so its pieces are not PSD and that bound does not cover them.
+    // Mirrored is the honest declaration, and the fix is to make it true.
     let (eigenvalues, eigenvectors) = strict_symmetric_eigh(
         h,
         gam_linalg::roundoff::SymmetricAssembly::Mirrored,

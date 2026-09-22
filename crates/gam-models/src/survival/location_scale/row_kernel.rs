@@ -4065,8 +4065,29 @@ impl SurvivalLocationScaleFamily {
                 let right = closing[group.right_channel]
                     .expect("active survival-LS pair has a right design");
                 let weights = slots.row(slot).to_owned();
-                weighted_crossprod_dense_with_parallelism(left, &weights, right, faer::Par::Seq)
+                // A same-channel group is `Xᵀ·diag(w)·X` with ONE design on
+                // both sides, and it must come back bitwise symmetric, because
+                // `aft_absolute_newton_direction` declares
+                // `SymmetricAssembly::Mirrored` and that band is exactly zero.
+                // The general crossprod does not deliver that: handed the same
+                // matrix twice it is still a general GEMM, and `(i, j)` and
+                // `(j, i)` are separate accumulations a blocked kernel may sum
+                // in different orders. b258f0090d removed the group-ORDER
+                // asymmetry and this is the remaining source, one ulp of it, at
+                // index (1, 0) in all eight tests that carried the refusal at
+                // `4057627f4b` (gam#1561).
+                if group.left_channel == group.right_channel {
+                    weighted_selfcrossprod_dense_mirrored(left, &weights, faer::Par::Seq)
+                        .map(|product| (group, product))
+                } else {
+                    weighted_crossprod_dense_with_parallelism(
+                        left,
+                        &weights,
+                        right,
+                        faer::Par::Seq,
+                    )
                     .map(|product| (group, product))
+                }
             })
             .collect::<Result<Vec<_>, String>>()?;
 
