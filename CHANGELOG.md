@@ -1,5 +1,19 @@
 ## Unreleased
 
+- **The spline-scan scaling probe asserts the budget it can derive, not the flatness its own
+  measurement refuted** (#2627). `certified_search_evaluation_count_does_not_grow_with_n_2627`
+  argued that because the certified search's SUBDIVISION BUDGET is nearly flat in `n`, its
+  evaluation COUNT must be too. The probe's first run showed the count never comes near the
+  budget, so the budget never binds and bounds nothing, and the count grows as `sqrt(n)`: 591,
+  772 and 1129 evaluations at `n = 1_000`, `4_000` and `16_000`, increments in a ratio of 1.972
+  against the 2.0 that `sqrt(n)` predicts. The old 2x allowance admitted that 1.91x growth by
+  where the sizes happened to fall, so the test passed while measuring the thing its name
+  forbids. It now asserts what `maximize_score_1d` actually contracts — the count stays inside
+  `8*depth^2`, past which the search refuses rather than returning a slow fit — plus the leaf
+  bound the dominated-region audit implies, and prints which of the three terminal proofs
+  retired each cell so the growth can be attributed. Per evaluation the cost is clean `O(n)`
+  (exponent 0.994 over a 16x range), so the fit's total is about `n^1.5`, which is #2627's cost
+  located rather than assumed away.
 - **A survival prediction band was `mean ± z·sd` clamped to `[0, 1]`, which is not an interval of
   the law the same prediction reports the mean of** (gam#3560). `S` is strongly skewed near either
   rail, so a symmetric band puts all of its miss mass in one tail and covers an endpoint the law
