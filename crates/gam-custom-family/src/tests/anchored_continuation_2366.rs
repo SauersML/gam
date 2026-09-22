@@ -216,13 +216,37 @@ struct ScriptedContinuationPath {
     /// last entry repeats for any deeper refinement.
     criterion_by_refinement: Vec<f64>,
     sweeps: std::cell::RefCell<Vec<usize>>,
+    /// The depth this witness declares, or `None` to be priced by the production
+    /// corrector budget (gam#2612).
+    refinement_budget: Option<usize>,
 }
 
 impl ScriptedContinuationPath {
+    /// A scripted path priced by the production corrector budget, for the fixtures that
+    /// assert what that budget buys.
     fn new(criterion_by_refinement: Vec<f64>) -> Self {
         Self {
             criterion_by_refinement,
             sweeps: std::cell::RefCell::new(Vec::new()),
+            refinement_budget: None,
+        }
+    }
+
+    /// A scripted path refined through its WHOLE script: one rung per entry, so
+    /// `len - 1` refinements (gam#2612).
+    ///
+    /// A script is a witness, not a fit. It runs no correctors — [`Self::sweep`] returns a
+    /// canned criterion value — so the corrector budget does not price it, and a script
+    /// written to show a shape needs exactly the rungs that shape takes. `ecfd2c33ee`
+    /// obtained this by passing `outer_max_iter = 100` to the then-parameterized budget,
+    /// which is `floor(log2 100) - 1 = 5`, the depth its six-rung trail needs; the depth is
+    /// now taken from the script itself so it cannot drift from it.
+    fn walking_its_whole_script(criterion_by_refinement: Vec<f64>) -> Self {
+        let refinement_budget = Some(criterion_by_refinement.len().saturating_sub(1));
+        Self {
+            criterion_by_refinement,
+            sweeps: std::cell::RefCell::new(Vec::new()),
+            refinement_budget,
         }
     }
 
@@ -280,6 +304,11 @@ impl crate::fit::RefinedContinuationPath for ScriptedContinuationPath {
 
     fn label(&self) -> &'static str {
         "scripted"
+    }
+
+    fn refinement_budget(&self) -> usize {
+        self.refinement_budget
+            .unwrap_or_else(crate::fit::continuation_refinement_budget)
     }
 
     fn observation_count(&self) -> usize {
@@ -384,7 +413,7 @@ fn a_plateau_a_later_refinement_leaves_is_neither_certified_nor_refused_2612() {
     // steps 1, 2, 4 : one mode        (an agreement at 2->4)
     // steps 8, 16, 32: another mode   (disagreement at 8, then agreements)
     let script = vec![10.607, 11.387, 11.387, 10.594, 10.594, 10.594];
-    let path = ScriptedContinuationPath::new(script);
+    let path = ScriptedContinuationPath::walking_its_whole_script(script);
     let options = double_well_options();
     let certified = crate::fit::certify_refined_continuation(&path, &options, false).expect(
         "a ladder that changes branch and then settles must certify, not refuse: the coarse \
@@ -422,7 +451,9 @@ fn a_plateau_a_later_refinement_leaves_is_neither_certified_nor_refused_2612() {
 /// measured counterexample rather than with a comment.
 #[test]
 fn a_single_agreement_does_not_certify_2612() {
-    let path = ScriptedContinuationPath::new(vec![10.607, 11.387, 11.387, 10.594, 10.594, 10.594]);
+    let path = ScriptedContinuationPath::walking_its_whole_script(vec![
+        10.607, 11.387, 11.387, 10.594, 10.594, 10.594,
+    ]);
     let options = double_well_options();
     let certified = crate::fit::certify_refined_continuation(&path, &options, false)
         .expect("this script settles");

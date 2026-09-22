@@ -1437,6 +1437,22 @@ pub(crate) trait RefinedContinuationPath {
     /// count the outer search declares as its problem size
     /// ([`criterion_observation_count`]).
     fn observation_count(&self) -> usize;
+
+    /// How many dyadic refinements THIS path may be spent on.
+    ///
+    /// The default is [`continuation_refinement_budget`], the corrector budget every real
+    /// path is priced by, and every production path takes it. It is a property of the path
+    /// rather than a constant read at the loop because what it bounds is the path's own
+    /// correctors: a path that runs none is not priced by a corrector budget, and a
+    /// scripted witness runs none (gam#2612).
+    ///
+    /// `ecfd2c33ee` gave the #2612 witness its depth by passing `outer_max_iter` to the
+    /// then-parameterized budget; `c21ae3add1` made the budget parameterless and the
+    /// witness lost the only knob it had. This is that knob, in the place the quantity
+    /// belongs, and it leaves [`CONTINUATION_SEED_CORRECTOR_BUDGET`] alone.
+    fn refinement_budget(&self) -> usize {
+        continuation_refinement_budget()
+    }
 }
 
 /// The number of observations the custom-family criterion sums over: the row
@@ -1479,7 +1495,11 @@ fn criterion_agreement(coarser: f64, finer: f64) -> f64 {
     (coarser - finer).abs()
 }
 
-/// How many dyadic refinements the ladder may spend.
+/// How many dyadic refinements the ladder may spend: the default every real path takes,
+/// through [`RefinedContinuationPath::refinement_budget`].
+///
+/// A path that runs no correctors is not priced by a corrector budget and declares its own
+/// depth there instead; every production path runs them and takes this one (gam#2612).
 ///
 /// #2661 established the requirement this answers: accepting arbitrarily slow
 /// progress makes the loop operationally unbounded, and each refinement DOUBLES
@@ -1597,7 +1617,7 @@ pub(crate) fn certify_refined_continuation<P: RefinedContinuationPath>(
     // The outer search's own criterion resolution: two criterion values closer
     // than this are values the search that consumes them cannot separate.
     let criterion_resolution = continuation_criterion_resolution(path.observation_count());
-    let max_refinements = continuation_refinement_budget();
+    let max_refinements = path.refinement_budget();
     let mut coarser: Option<SweptEndpoint> = None;
     let mut previous_discrepancy: Option<f64> = None;
     let mut consecutive_agreements = 0usize;
