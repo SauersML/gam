@@ -4973,3 +4973,194 @@ fn gaussian_location_scale_no_intercept_noise_formula_fits_the_raw_model() {
         );
     }
 }
+
+/// #3228 — at what scale does the wiggle-face criterion stop being a smooth
+/// function of ρ, and is that scale above the rounding band it is judged against?
+///
+/// # Why this probe exists
+///
+/// The face fit refuses with a Newton decrement of `9.975e-1` against a
+/// tolerance of `6.944e-3`, after a polish whose four accepted steps bought
+/// `9.513e-7, 2.378e-7, 1.486e-8, 3.716e-9` and moved the iterate by `1.2e-6` of
+/// one Newton step. Two readings fit. Either the outer Hessian underestimates
+/// the local curvature, so the step is a million times too long and `λ̂²` is
+/// correspondingly too large; or the criterion's own value error exceeds
+/// `band_f = 2.009e-9`, in which case those four "decreases" are not descent at
+/// all. `band_f` is a rounding band and does not bound the error a profiled
+/// criterion inherits from its inner solve.
+///
+/// # Why it is not the warm-versus-cold comparison
+///
+/// `OuterSeedProbe::evaluate` states that "every call resets the objective
+/// first, so two calls at one θ are the same evaluation". A warm arm cannot be
+/// taken through this API: both arms would be cold and the difference would be
+/// zero by construction, which is a control pointed at itself. The first
+/// evaluation pair below is kept precisely as that null control — it must print
+/// exactly zero, and a nonzero value would mean the criterion is not even
+/// reproducible at one θ, which would settle the question immediately and
+/// differently.
+///
+/// What is measurable is the scale at which the criterion departs from its own
+/// gradient. Along `-g/‖g‖` the first-order prediction is `-‖g‖·t`. Where the
+/// measured change tracks that, the criterion is smooth and its value error is
+/// below the step's effect; where it does not, the value error dominates and the
+/// ratio says by how much.
+///
+/// Asserts only that what it prints is finite. It is an instrument, not a gate.
+#[test]
+fn wiggle_face_criterion_value_scale_3228() {
+    use gam_solve::estimate::outer_eval_capture::{
+        OuterSeedOrder, OuterSeedProbe, observe_next_outer_seed,
+    };
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let n = 72usize;
+    let mut records: Vec<csv::StringRecord> = Vec::with_capacity(n);
+    for i in 0..n {
+        let x = -2.0 + 4.0 * (i as f64) / ((n - 1) as f64);
+        let y = 0.7 * x + 0.5 * x.max(0.0).powi(2) + 0.05 * (7.3 * x).sin();
+        records.push(csv::StringRecord::from(vec![
+            format!("{y:.17e}"),
+            format!("{x:.17e}"),
+        ]));
+    }
+    let data = gam_data::encode_recordswith_inferred_schema(
+        vec!["y".to_string(), "x".to_string()],
+        records,
+    )
+    .expect("encode the face fixture");
+    let config = FitConfig {
+        family: Some("gaussian".to_string()),
+        noise_formula: Some("1".to_string()),
+        ..FitConfig::default()
+    };
+    let materialized =
+        materialize("y ~ x", &data, &config).expect("gaussian location-scale materialization");
+    let FitRequest::GaussianLocationScale(request) = materialized.request else {
+        panic!("expected a Gaussian location-scale request");
+    };
+    let GaussianLocationScaleFitRequest {
+        data: req_data,
+        mut spec,
+        options,
+        kappa_options,
+        ..
+    } = request;
+    standardize_gaussian_spec_like_engine(&mut spec);
+    let wiggle_cfg = small_wiggle_cfg();
+    let pilot = fit_gaussian_location_scale_terms(req_data, spec.clone(), &options, &kappa_options)
+        .expect("face fixture pilot");
+
+    let report: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let sink = Rc::clone(&report);
+    observe_next_outer_seed(
+        0,
+        Box::new(
+            move |probe: &mut dyn OuterSeedProbe| -> Result<(), gam_solve::estimate::EstimationError> {
+                let layout = probe.layout().clone();
+                let theta = layout.seed.clone();
+                let base = probe.evaluate(&theta, OuterSeedOrder::ValueAndGradient)?;
+                let again = probe.evaluate(&theta, OuterSeedOrder::Value)?;
+                let mut lines = Vec::new();
+                lines.push(format!(
+                    "[3228-scale] seed θ={:?} rho_dim={} psi_dim={}",
+                    theta.to_vec(),
+                    layout.rho_dim,
+                    layout.psi_dim
+                ));
+                lines.push(format!(
+                    "[3228-scale] null control: cost {:.17e} then {:.17e}, difference {:.6e} \
+                     (the API resets every call, so this must be exactly zero)",
+                    base.cost,
+                    again.cost,
+                    again.cost - base.cost
+                ));
+                let Some(gradient) = base.gradient.as_ref() else {
+                    lines.push("[3228-scale] the objective published no gradient".to_string());
+                    sink.borrow_mut().extend(lines);
+                    return Ok(());
+                };
+                let grad_norm = gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
+                lines.push(format!("[3228-scale] ‖g‖={grad_norm:.6e}"));
+                if !(grad_norm > 0.0 && grad_norm.is_finite()) {
+                    sink.borrow_mut().extend(lines);
+                    return Ok(());
+                }
+                // Down the gradient, clamped into the seed's own box, over the
+                // decades that bracket the polish's accepted steps and the
+                // objective's rounding band.
+                for exponent in -10i32..=-1 {
+                    let t = 10f64.powi(exponent);
+                    let mut point = theta.clone();
+                    for k in 0..point.len() {
+                        let moved = theta[k] - t * gradient[k] / grad_norm;
+                        point[k] = moved.max(layout.lower[k]).min(layout.upper[k]);
+                    }
+                    let moved_norm = (0..point.len())
+                        .map(|k| (point[k] - theta[k]) * (point[k] - theta[k]))
+                        .sum::<f64>()
+                        .sqrt();
+                    match probe.evaluate(&point, OuterSeedOrder::Value) {
+                        Ok(at) => {
+                            let measured = at.cost - base.cost;
+                            let predicted = -grad_norm * moved_norm;
+                            lines.push(format!(
+                                "[3228-scale] t={t:.1e} |Δθ|={moved_norm:.6e} cost={:.17e} \
+                                 measured Δ={measured:+.6e} first-order Δ={predicted:+.6e} \
+                                 ratio={:.6e}",
+                                at.cost,
+                                if predicted != 0.0 {
+                                    measured / predicted
+                                } else {
+                                    f64::NAN
+                                }
+                            ));
+                        }
+                        Err(error) => {
+                            lines.push(format!("[3228-scale] t={t:.1e} refused: {error}"));
+                        }
+                    }
+                }
+                sink.borrow_mut().extend(lines);
+                Ok(())
+            },
+        ),
+    );
+
+    // The fit is expected to refuse; the probe has already run by then and its
+    // report is what this test exists to print.
+    let outcome = fit_gaussian_location_scale_terms_with_selected_wiggle(
+        req_data,
+        spec.clone(),
+        &pilot,
+        select_gaussian_location_scale_link_wiggle_basis_from_pilot(
+            &pilot,
+            &WiggleBlockConfig {
+                degree: wiggle_cfg.degree,
+                num_internal_knots: wiggle_cfg.num_internal_knots,
+                penalty_order: 2,
+                double_penalty: wiggle_cfg.double_penalty,
+            },
+            &wiggle_cfg.penalty_orders,
+        )
+        .expect("face fixture wiggle basis selection"),
+        &options,
+        &kappa_options,
+    );
+    eprintln!(
+        "[3228-scale] the face refit {}",
+        match &outcome {
+            Ok(_) => "certified".to_string(),
+            Err(error) => format!("refused: {error}"),
+        }
+    );
+    let lines = report.borrow();
+    assert!(
+        !lines.is_empty(),
+        "the outer runner lent no seed probe, so nothing was measured"
+    );
+    for line in lines.iter() {
+        eprintln!("{line}");
+    }
+}
