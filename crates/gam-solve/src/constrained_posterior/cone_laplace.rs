@@ -319,8 +319,6 @@ fn symmetrized(matrix: &Array2<f64>) -> Array2<f64> {
 struct SiteUpdate {
     tau: f64,
     nu: f64,
-    /// `ln` of the tilted mass `∫₀^∞ e^{ν_c u − τ_c u²/2} du`.
-    log_mass: f64,
     /// `[∂τ̃/∂τ_c, ∂τ̃/∂ν_c, ∂ν̃/∂τ_c, ∂ν̃/∂ν_c]`.
     jacobian: [f64; 4],
 }
@@ -359,7 +357,8 @@ fn site_update(
     condition_floor: f64,
     sweep: usize,
 ) -> Result<SiteUpdate, ConeLaplaceRefusal> {
-    let [log_mass, k1, k2, k3, k4] = half_line_gaussian_log_jet(-nu_c, tau_c).ok_or(
+    // The tilted mass is read by `tilted_log_mass` on the share path; this update reads the cumulants only.
+    let [_, k1, k2, k3, k4] = half_line_gaussian_log_jet(-nu_c, tau_c).ok_or(
         ConeLaplaceRefusal::NotIntegrable { row, cavity_precision: tau_c, cavity_shift: nu_c, sweep },
     )?;
     if !(k2 > 0.0) {
@@ -381,7 +380,6 @@ fn site_update(
     Ok(SiteUpdate {
         tau: 1.0 / k2 - tau_c,
         nu: k1 / k2 - nu_c,
-        log_mass,
         jacobian: [
             -dk2_dtau / k2_squared - 1.0,
             -k3 / k2_squared,
