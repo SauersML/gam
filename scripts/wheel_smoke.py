@@ -244,13 +244,18 @@ def stray_wheel_files(paths: list[str], dist_info: str, extension_suffixes: list
     """Files the installed wheel carries that are not part of the package.
 
     The package is its Python sources, the PEP 561 marker and one compiled
-    ``_rust`` extension; everything else must live in the dist-info directory.
-    Test data, Rust sources, notebooks or build leftovers land here.
+    ``_rust`` extension; a repaired wheel also carries the shared libraries
+    auditwheel vendored beside it, under ``gamfit.libs/`` (the musllinux
+    wheels ship libgcc_s there, which Alpine does not guarantee); everything
+    else must live in the dist-info directory. Test data, Rust sources,
+    notebooks or build leftovers land here.
     """
     stray: list[str] = []
     for path in paths:
         parts = pathlib.PurePosixPath(path).parts
         if parts[0] == dist_info:
+            continue
+        if parts[0] == "gamfit.libs" and len(parts) == 2 and ".so" in parts[1].split("-")[-1]:
             continue
         if parts[0] != "gamfit":
             stray.append(path)

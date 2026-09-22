@@ -148,6 +148,12 @@ class WheelContentTests(unittest.TestCase):
         ]
         self.assertEqual(wheel_smoke.stray_wheel_files(paths, DIST_INFO, EXT), [])
 
+    def test_auditwheel_vendored_libraries_are_part_of_a_repaired_wheel(self):
+        vendored = ["gamfit.libs/libgcc_s-f685abf1.so.1", "gamfit.libs/libgomp-a34b3233.so.1.0.0"]
+        self.assertEqual(wheel_smoke.stray_wheel_files(vendored, DIST_INFO, EXT), [])
+        not_libraries = ["gamfit.libs/NOTES.txt", "gamfit.libs/nested/libz.so.1"]
+        self.assertEqual(wheel_smoke.stray_wheel_files(not_libraries, DIST_INFO, EXT), not_libraries)
+
     def test_stray_files_are_reported(self):
         stray = [
             "tests/test_fit.py",
