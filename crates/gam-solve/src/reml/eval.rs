@@ -237,15 +237,6 @@ impl<'a> RemlState<'a> {
         Ok(Some(dense))
     }
 
-    pub(super) fn compute_lamlhessian_exact_from_bundle(
-        &self,
-        rho: &Array1<f64>,
-        bundle: &EvalShared,
-    ) -> Result<Array2<f64>, EstimationError> {
-        self.compute_lamlhessian_or_declared_absent_from_bundle(rho, bundle)?
-            .ok_or_else(declared_no_outer_hessian)
-    }
-
     /// The outer rho-Hessian at `rho`, or `Ok(None)` when THIS CRITERION
     /// DECLARES it has none
     /// ([`Self::compute_lamlhessian_or_declared_absent_from_bundle`]).

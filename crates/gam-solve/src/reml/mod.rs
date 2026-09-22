@@ -1689,8 +1689,9 @@ mod tests {
         );
         let bundle = state.obtain_eval_bundle(&rho).expect("exact firth bundle");
         let h_dense = state
-            .compute_lamlhessian_exact_from_bundle(&rho, &bundle)
-            .expect("Firth exact Hessian should include analytic TK second derivatives");
+            .compute_lamlhessian_or_declared_absent_from_bundle(&rho, &bundle)
+            .expect("Firth exact Hessian should include analytic TK second derivatives")
+            .expect("a Firth fit's criterion declares no absent outer Hessian");
         assert_eq!(h_dense.raw_dim(), ndarray::Ix2(2, 2));
         assert!(
             h_dense.iter().all(|value| value.is_finite()),

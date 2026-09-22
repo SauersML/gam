@@ -3967,5 +3967,13 @@
     ],
     "reason": "Two crate-private accessors left behind when three event-history landings (7a674cde0b #2966, a87114a4cd #2965, d1b60b8e4f #2986) merged into one tree. `reference_at_coefficients` and `offsets_of_blocks` on `EventHistoryFamily` were the pre-#2966 accessors the posterior read; #2966 moved both onto `PredictionModel` (predictor.rs), which is what `posterior.rs` now reads, and the #2965 copy of family.rs re-introduced the family versions with no caller. (`computed_joint`, deleted in 5f0a2380b2 by the same reading, IS called by the objective's own tests as the forward-mode reference and was restored in the next commit; it is not a removal.)",
     "evidence": "At ee6083b2b4, `git grep -n 'reference_at_coefficients\\|offsets_of_blocks' crates/` finds each name only at its definition in family.rs and, for reference_at_coefficients, the PredictionModel method of the same name in predictor.rs that posterior.rs:158 calls. The MSI workspace gate at integ-0920-ch failed with `-D dead-code` on both."
+  },
+  {
+    "base": "978ab62edc383b0e9f46ea7bcda1e30d453fae5a",
+    "items": [
+      "crates/gam-solve/src/reml/eval.rs:fn:compute_lamlhessian_exact_from_bundle"
+    ],
+    "reason": "9f8c5151ee split the dense outer-Hessian read into `compute_lamlhessian_or_declared_absent_from_bundle` (Option) and kept `compute_lamlhessian_exact_from_bundle` as a wrapper turning the declared absence into a refusal; its only caller was a test in reml/mod.rs, so the lib build refused it as dead code (gate integ-0920-cz). The test now reads the Option form and asserts the Firth criterion declares no absence; `compute_lamlhessian_consistent` remains the production wrapper.",
+    "evidence": "At 978ab62edc, `git grep -n -w compute_lamlhessian_exact_from_bundle -- crates` finds its definition (eval.rs:240) and one caller inside `mod tests` of reml/mod.rs (line 1692); no production caller."
   }
 ]
