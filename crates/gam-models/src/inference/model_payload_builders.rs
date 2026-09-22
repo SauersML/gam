@@ -383,10 +383,58 @@ fn glm_conformal_penalty(
         &penalized,
         scale,
     )?;
+    // v40 (#4103): carry the COMPONENTS beside the sum. `s_lambda` above is
+    // `Σ_k λ_k S_k` recovered by cancellation from the normal matrix, and the
+    // honest map cannot re-select against a sum -- its criterion carries
+    // `log|Σ_k e^{ρ_k}S_k|₊`, which a sum has already lost (#2644).
+    //
+    // The blocks carried are the DESIGN's own penalties, unscaled, paired with
+    // the `λ_k` the criterion selected. The Gamma dispersion `scale` above
+    // belongs to the P-IRLS weights the Gram was formed with, not to the
+    // criterion's penalties, so applying it here would pair a scaled block with
+    // an unscaled strength. The pair carried is the one the fit actually
+    // optimised.
+    let p = design.design.ncols();
+    let mut components = Vec::with_capacity(design.penalties.len());
+    for (index, penalty) in design.penalties.iter().enumerate() {
+        let range = penalty.col_range.clone();
+        if range.end > p || penalty.local.nrows() != range.len() {
+            return Err(format!(
+                "full conformal penalty: component {index} is {}x{} on columns {range:?} of a \
+                 {p}-column design",
+                penalty.local.nrows(),
+                penalty.local.ncols()
+            ));
+        }
+        let mut block = Array2::<f64>::zeros((p, p));
+        block
+            .slice_mut(ndarray::s![range.clone(), range])
+            .assign(&penalty.local);
+        components.push(block);
+    }
+    if fit.lambdas.len() != components.len() {
+        return Err(format!(
+            "full conformal penalty: {} fitted smoothing parameter(s) against {} penalty \
+             component(s)",
+            fit.lambdas.len(),
+            components.len()
+        ));
+    }
+    let mut log_strengths = Vec::with_capacity(components.len());
+    for (index, &lambda) in fit.lambdas.iter().enumerate() {
+        if !(lambda.is_finite() && lambda > 0.0) {
+            return Err(format!(
+                "full conformal penalty: fitted smoothing parameter {index} is {lambda}, which \
+                 has no log-strength"
+            ));
+        }
+        log_strengths.push(lambda.ln());
+    }
     crate::inference::full_conformal::ExactFullConformalPenalty::from_s_lambda(
         s_lambda,
         fit.lambdas.len(),
-    )
+    )?
+    .with_components(components, log_strengths)
 }
 
 /// The comparable REML/LAML criterion of a standard fit: its raw criterion

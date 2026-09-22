@@ -84,7 +84,18 @@ pub const SAVED_MODEL_KIND: &str = "gam";
 // four keys and is a different wire shape at the same field names, so it must not be read
 // as this one; link-wiggle metadata without a `fit_result` or without the block is now a
 // refusal rather than a fallback to the copy.
-pub const MODEL_PAYLOAD_VERSION: u32 = 39;
+// v40 carries the conformal penalty's COMPONENTS beside their sum (#4103):
+// `ExactFullConformalPenalty` gains `components`, the per-penalty blocks in the fit's
+// own basis, and `log_strengths`, their fitted `ln λ_k`. The honest full-conformal map
+// re-selects the smoothing strength from the augmented rows, and the criterion it
+// re-selects against carries `log|Σ_k e^{ρ_k}S_k|₊`, which is not a function of
+// `Σ_k λ_k S_k` -- an assembled sum has already lost it (#2644). At ONE penalty the term
+// is `rank(S)·ρ` plus a constant that drops out of every comparison, which is why the
+// single-penalty arm worked off the sum alone and why it stopped at two. A v39 document
+// carries `s_lambda` and `penalty_count` with no components, so its multi-penalty rows
+// read as `Refused(MultiPenalty)` exactly as they did; it is a different wire shape at
+// the same field names and must not be read as this one.
+pub const MODEL_PAYLOAD_VERSION: u32 = 40;
 
 /// Coefficient parameterization of a saved transformation-normal (CTN) fit.
 ///
