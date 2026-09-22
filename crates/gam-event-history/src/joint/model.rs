@@ -375,6 +375,22 @@ mod tests {
             .collect()
     }
 
+    /// One JSON field as the shared envelope WRITES it, `"name":value`, taken
+    /// from the writer rather than assumed.
+    ///
+    /// `gam_model_api::saved_model` writes a document with
+    /// `serde_json::to_string`, which is compact. The mutants below are text
+    /// edits of that document, so each one has to be spelled the way the
+    /// writer spells it; spelling them with a space after the colon made every
+    /// `replace` a no-op and the document's own assertions false. Rendering a
+    /// one-field object and stripping its braces gives the writer's spelling
+    /// whatever the writer later becomes.
+    fn saved_field(name: &str, value: serde_json::Value) -> String {
+        let rendered = serde_json::to_string(&serde_json::json!({ name: value }))
+            .expect("a one-field object renders");
+        rendered[1..rendered.len() - 1].to_string()
+    }
+
     #[test]
     fn save_reload_forecast_is_bit_identical_and_other_versions_are_refused() {
         let model = competing_model();
@@ -392,10 +408,14 @@ mod tests {
         let text = model.saved_text().unwrap();
         assert_eq!(reloaded.saved_text().unwrap(), text);
         assert!(!text.contains("\"a\"") && !text.contains("\"b\""));
-        let version = format!("\"version\": {JOINT_EVENT_MODEL_VERSION}");
-        assert!(text.contains(&version) && text.contains("\"kind\": \"joint\""));
+        let version = saved_field("version", serde_json::json!(JOINT_EVENT_MODEL_VERSION));
+        let kind = saved_field("kind", serde_json::json!("joint"));
+        assert!(text.contains(&version), "{version} in {text}");
+        assert!(text.contains(&kind), "{kind}");
         assert!(matches!(
-            JointEventModel::from_saved_text(&text.replace(&version, "\"version\": 0")),
+            JointEventModel::from_saved_text(
+                &text.replace(&version, &saved_field("version", serde_json::json!(0)))
+            ),
             Err(SavedModelError::Version { found: Some(0), expected: JOINT_EVENT_MODEL_VERSION, .. })
         ));
         assert!(matches!(
@@ -404,7 +424,10 @@ mod tests {
         ));
         // The previous payload version, which held no encoding schema, is refused: it
         // cannot rebuild the encoder a forecast needs, so the refusal names the remedy.
-        let previous = format!("\"version\": {}", JOINT_EVENT_MODEL_VERSION - 1);
+        let previous = saved_field(
+            "version",
+            serde_json::json!(JOINT_EVENT_MODEL_VERSION - 1),
+        );
         let refused = JointEventModel::from_saved_text(&text.replace(&version, &previous));
         assert!(matches!(
             &refused,
@@ -414,19 +437,25 @@ mod tests {
         let reason = refused.err().map(|error| error.to_string()).unwrap_or_default();
         assert!(reason.contains("refit the model"), "{reason}");
         assert!(matches!(
-            JointEventModel::from_saved_text(&text.replace("\"kind\": \"joint\"", "\"kind\": \"event_history\"")),
+            JointEventModel::from_saved_text(
+                &text.replace(&kind, &saved_field("kind", serde_json::json!("event_history")))
+            ),
             Err(SavedModelError::Kind { .. })
         ));
-        assert!(text.contains("\"shape\": 1.0"));
+        let shape = saved_field("shape", serde_json::json!(1.0));
+        assert!(text.contains(&shape), "{shape}");
         assert!(matches!(
-            JointEventModel::from_saved_text(&text.replacen("\"shape\": 1.0", "\"shape\": 0.5", 1)),
+            JointEventModel::from_saved_text(
+                &text.replacen(&shape, &saved_field("shape", serde_json::json!(0.5)), 1)
+            ),
             Err(SavedModelError::Inconsistent { .. })
         ));
         // A rank-zero law refuses any specification beyond its marks' rank-zero one.
-        assert!(text.contains("\"population_columns\": 1"));
+        let columns = saved_field("population_columns", serde_json::json!(1));
+        assert!(text.contains(&columns), "{columns}");
         assert!(matches!(
             JointEventModel::from_saved_text(
-                &text.replacen("\"population_columns\": 1", "\"population_columns\": 2", 1)
+                &text.replacen(&columns, &saved_field("population_columns", serde_json::json!(2)), 1)
             ),
             Err(SavedModelError::Inconsistent { .. })
         ));
@@ -435,20 +464,35 @@ mod tests {
         // and measurement channels. Each original field is present first, so no
         // mutant passes by changing nothing.
         for (original, tampered) in [
-            ("\"cvd_death\"", "\"diagnosis\""),
-            ("\"quadrature_order\": 1", "\"quadrature_order\": 5"),
-            ("\"state_width\": null", "\"state_width\": 1.0"),
-            ("\"covariate_names\": []", "\"covariate_names\": [\"bmi\"]"),
-            ("\"score_names\": []", "\"score_names\": [\"prs\"]"),
+            ("\"cvd_death\"".to_string(), "\"diagnosis\"".to_string()),
             (
-                "\"channels\": []",
-                "\"channels\": [{\"name\": \"hba1c\", \"family\": \"StudentT\"}]",
+                saved_field("quadrature_order", serde_json::json!(1)),
+                saved_field("quadrature_order", serde_json::json!(5)),
+            ),
+            (
+                saved_field("state_width", serde_json::Value::Null),
+                saved_field("state_width", serde_json::json!(1.0)),
+            ),
+            (
+                saved_field("covariate_names", serde_json::json!([])),
+                saved_field("covariate_names", serde_json::json!(["bmi"])),
+            ),
+            (
+                saved_field("score_names", serde_json::json!([])),
+                saved_field("score_names", serde_json::json!(["prs"])),
+            ),
+            (
+                saved_field("channels", serde_json::json!([])),
+                saved_field(
+                    "channels",
+                    serde_json::json!([{"name": "hba1c", "family": "StudentT"}]),
+                ),
             ),
         ] {
-            assert!(text.contains(original), "{original}");
+            assert!(text.contains(&original), "{original}");
             assert!(
                 matches!(
-                    JointEventModel::from_saved_text(&text.replacen(original, tampered, 1)),
+                    JointEventModel::from_saved_text(&text.replacen(&original, &tampered, 1)),
                     Err(SavedModelError::Inconsistent { .. })
                 ),
                 "{tampered}"
