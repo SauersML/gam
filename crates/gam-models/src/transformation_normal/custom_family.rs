@@ -125,13 +125,9 @@ impl CustomFamily for TransformationNormalFamily {
         )?;
         let evaluate_start = std::time::Instant::now();
         let beta = &block_states[0].beta;
-        let row_q_start = std::time::Instant::now();
+        // The row pass times itself on recompute (gam#4567, `row_quantities`); a timer here would
+        // count a cache hit as a pass and would miss the nine other entries that ask for one.
         let row_quantities = self.row_quantities(beta)?;
-        log::debug!(
-            "[STAGE] CTN row_quantities (h, h', 1/h', powers) n={} elapsed={:.3}s",
-            row_quantities.h.len(),
-            row_q_start.elapsed().as_secs_f64(),
-        );
         let h = row_quantities.h.as_ref();
         let n = h.len();
 

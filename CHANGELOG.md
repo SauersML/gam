@@ -15683,3 +15683,26 @@ publish paths.
   constant field otherwise, and checks the cone's own field `ψᵀa` per row rather than `h'`, whose
   fixed floor `ε` hides a negative field wherever the response derivative basis vanishes. A design
   that admits no such direction is refused by name, with the minimum and the row that attains it.
+- **Inner-solve timers that never printed at the size they were meant to measure** (gam#4567).
+  The joint Newton cycle timed four constrained-QP phases and printed each only when that one
+  occurrence exceeded a second. A per-cycle cost accumulates across cycles into the whole wall, so
+  a phase costing 0.9 s at each of 133 cycles is 119 s of silence, and the large-scale CTN fit at
+  `p=144` reported 0.8 s of outer Hessian calls and 10.6 s of outer evaluations against a 300 s
+  cap with nothing accounting for the rest. The four phases now print unconditionally under the
+  `[STAGE]` tag the run already greps, with the constraint row count beside the metric projection.
+  The transformation-normal row pass is timed from inside `row_quantities`, at the one place that
+  recomputes it, instead of at one of the ten trait entries that ask for it: the cache it fronts is
+  a single slot keyed on the coefficient vector, so a line-search trial and the iterate it came
+  from evict each other and a timer at one entry counted neither the evictions nor the other nine
+  entries.
+
+- **A continuation certificate announced itself with an inequality its rule never tested, and which
+  can be false** (gam#4567). Both `[OUTER]` certification lines printed
+  `endpoint discrepancy <= inner tolerance` as the certificate's claim, while
+  `continuation_refinement_decision` certifies on the criterion agreement over
+  `REQUIRED_CONSECUTIVE_AGREEMENTS` refinements and never tests the state discrepancy against the
+  inner tolerance at all. The gam#2612 fixture certifies at a discrepancy of `5.4e-5` against an
+  `inner_tol` of `1e-5`, so the line asserted `5.4e-5 <= 1e-5` about the certificate it was
+  announcing. Both lines now report the criterion agreement against the criterion resolution and
+  the number of consecutive agreements that certified, with the discrepancy and the tolerance
+  printed as the carried numbers they are.

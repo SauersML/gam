@@ -3016,10 +3016,21 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // The rule that selected the mode is recorded on the fit (#2661), so a
     // declined continuation is visible to a caller, not only in this log.
     let mode_seed = if let Some(certified) = objective_homotopy_seed {
+        // Report the quantity that CERTIFIED, which `continuation_refinement_decision` says is
+        // the criterion agreement over `REQUIRED_CONSECUTIVE_AGREEMENTS` refinements, never the
+        // state discrepancy. Printing `discrepancy <= inner tolerance` claimed a relation the rule
+        // does not test and that a real certificate can violate: the #2612 fixture certifies at a
+        // discrepancy of 5.4e-5 against an `inner_tol` of 1e-5, so the line asserted a false
+        // inequality about the very certificate it was announcing (gam#4567). The discrepancy and
+        // the tolerance are still printed, as the carried numbers they are.
         log::debug!(
-            "[OUTER] coefficient-objective continuation certified at {} steps: endpoint \
-             discrepancy {:.3e} <= inner tolerance {:.3e}; observed contraction factor {:?}",
+            "[OUTER] coefficient-objective continuation certified at {} steps on {} consecutive \
+             agreement(s): criterion agreement {:.3e} <= criterion resolution {:.3e}; carried \
+             endpoint discrepancy {:.3e}, inner tolerance {:.3e}, observed contraction factor {:?}",
             certified.certificate.steps,
+            certified.certificate.consecutive_agreements,
+            certified.certificate.criterion_agreement,
+            certified.certificate.criterion_resolution,
             certified.certificate.endpoint_discrepancy,
             certified.certificate.inner_tolerance,
             certified.certificate.observed_contraction_factor,
@@ -3041,11 +3052,16 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             &rho0,
         ) {
             Ok(certified) => {
+                // The certifying quantity, as above (gam#4567).
                 log::debug!(
-                    "[OUTER] #2661 anchored continuation certified at {} steps: endpoint \
-                     discrepancy {:.3e} <= inner tolerance {:.3e}; observed contraction \
-                     factor {:?}",
+                    "[OUTER] #2661 anchored continuation certified at {} steps on {} consecutive \
+                     agreement(s): criterion agreement {:.3e} <= criterion resolution {:.3e}; \
+                     carried endpoint discrepancy {:.3e}, inner tolerance {:.3e}, observed \
+                     contraction factor {:?}",
                     certified.certificate.steps,
+                    certified.certificate.consecutive_agreements,
+                    certified.certificate.criterion_agreement,
+                    certified.certificate.criterion_resolution,
                     certified.certificate.endpoint_discrepancy,
                     certified.certificate.inner_tolerance,
                     certified.certificate.observed_contraction_factor,

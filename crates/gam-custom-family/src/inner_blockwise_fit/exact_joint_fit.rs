@@ -2265,12 +2265,14 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
             drop(spectrum_scope);
             let spectrum_elapsed = spectrum_started.elapsed();
-            if spectrum_elapsed >= std::time::Duration::from_secs(1) {
-                log::debug!(
-                    "[gam#979 constrained-QP phase] cycle={cycle} phase=ambient-spectrum elapsed_s={:.3}",
-                    spectrum_elapsed.as_secs_f64(),
-                );
-            }
+            // gam#4567: unconditional. A one-second-per-occurrence bar on a per-cycle cost prints
+            // nothing while that cost accumulates across cycles into the whole wall: at 133 cycles
+            // a phase costing 0.9s each is 119s of silence. The threshold made the timer a
+            // reporter of single slow cycles, which is not the question the wall asks.
+            log::debug!(
+                "[STAGE] joint-newton cycle={cycle} phase=ambient-spectrum p={total_p} elapsed_s={:.6}",
+                spectrum_elapsed.as_secs_f64(),
+            );
             // A coordinate bound and a general linear inequality define the
             // same active-face geometry. Both QP routes store constraint-row
             // indices, so both must use the exact tangent Hessian before any
@@ -2292,13 +2294,11 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 );
                 drop(reduced_face_scope);
                 let reduced_face_elapsed = reduced_face_started.elapsed();
-                if reduced_face_elapsed >= std::time::Duration::from_secs(1) {
-                    log::debug!(
-                        "[gam#979 constrained-QP phase] cycle={cycle} phase=reduced-face elapsed_s={:.3} warm_rows={}",
-                        reduced_face_elapsed.as_secs_f64(),
-                        active_rows.len(),
-                    );
-                }
+                log::debug!(
+                    "[STAGE] joint-newton cycle={cycle} phase=reduced-face p={total_p} elapsed_s={:.6} warm_rows={}",
+                    reduced_face_elapsed.as_secs_f64(),
+                    active_rows.len(),
+                );
                 result?
             } else {
                 None
@@ -2322,12 +2322,10 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 )?;
                 drop(convexification_scope);
                 let convexification_elapsed = convexification_started.elapsed();
-                if convexification_elapsed >= std::time::Duration::from_secs(1) {
-                    log::debug!(
-                        "[gam#979 constrained-QP phase] cycle={cycle} phase=convexification elapsed_s={:.3}",
-                        convexification_elapsed.as_secs_f64(),
-                    );
-                }
+                log::debug!(
+                    "[STAGE] joint-newton cycle={cycle} phase=convexification p={total_p} elapsed_s={:.6}",
+                    convexification_elapsed.as_secs_f64(),
+                );
                 if cycle <= 2 {
                     let min_eval_raw = constrained_geometry.raw_min_eigenvalue;
                     let min_eval_refl = constrained_geometry.stabilized_min_eigenvalue;
@@ -2370,12 +2368,11 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             };
             drop(metric_projection_scope);
             let metric_projection_elapsed = metric_projection_started.elapsed();
-            if metric_projection_elapsed >= std::time::Duration::from_secs(1) {
-                log::debug!(
-                    "[gam#979 constrained-QP phase] cycle={cycle} phase=metric-projection elapsed_s={:.3}",
-                    metric_projection_elapsed.as_secs_f64(),
-                );
-            }
+            log::debug!(
+                "[STAGE] joint-newton cycle={cycle} phase=metric-projection p={total_p} rows={} elapsed_s={:.6}",
+                constraints.nrows(),
+                metric_projection_elapsed.as_secs_f64(),
+            );
             match solve_result {
                 Ok((beta_new, active_set)) => {
                     // Durable constrained-QP liveness: per-cycle active-face

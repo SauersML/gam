@@ -922,6 +922,12 @@ impl TransformationNormalFamily {
             }
         }
 
+        // gam#4567: the row pass is timed HERE, at the one place that recomputes it, rather than
+        // at one of the ten trait entries that ask for it. The cache above is a single slot keyed
+        // on β, so a line-search trial and the iterate it came from evict each other and the
+        // entries that follow recompute; a timer at one entry counts neither the evictions nor the
+        // other nine. One line per recompute is the count and the wall the 300-row fixture needs.
+        let recompute_start = std::time::Instant::now();
         let p_resp = self.response_val_basis.ncols();
         let p_cov = self.covariate_design.ncols();
         let beta_mat = beta
@@ -1046,6 +1052,14 @@ impl TransformationNormalFamily {
             log_likelihood: derived.log_likelihood,
         };
 
+        log::debug!(
+            "[STAGE] CTN row pass recompute n={} p_resp={} p_cov={} p_total={} elapsed_s={:.6}",
+            row_quantities.h.len(),
+            p_resp,
+            p_cov,
+            p_resp * p_cov,
+            recompute_start.elapsed().as_secs_f64(),
+        );
         let mut cache = self
             .row_quantity_cache
             .lock()
