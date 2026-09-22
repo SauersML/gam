@@ -1,5 +1,15 @@
 ## Unreleased
 
+- `c5ba2177df` moved the two Matérn third-order penalty sites from
+  `ConstructiveQuadratic::try_from_dense_psd` to
+  `unit_frobenius_from_gram_within_rounding_band`, on the stated ground that the former
+  cuts at `dim·1e-10·max|ev|` and so makes the block's rank a function of κ. That constant
+  was removed by `0f72c1e70e` (#2901): the bridge cuts at the spectrum's rounding band
+  `dim·ε·‖H‖₂`. The replacement keeps every strictly positive eigenvalue, so the change
+  admitted modes below the band that resolves them from zero, weighted `1/λ` in the
+  pseudo-inverse. Reverted, with the stale comments corrected rather than restored
+  (#1561, #3236, #2901).
+
 - **A damped representer column gets the anchor's scale motion instead of a refusal** (#2902
   row 5). The column-scale term landed in `7adbe5963a` refused whenever a kept chart column was
   DAMPED, on the argument that its scale rides on an amplification floor whose derivative the

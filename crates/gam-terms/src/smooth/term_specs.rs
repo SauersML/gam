@@ -5586,12 +5586,14 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
         // crossing (a mass block at rank 118 at ψ = 1.4398 and 117 at ψ − 1e-3),
         // `canonicalize_penalty_specs_at_frozen_ranks` refuses that trial, and
         // the outer search cost-stalls against a correct descent gradient. #3236
-        // moved the MASS, TENSION and STIFFNESS candidates of both builders onto
-        // their energy factors and could move neither builder's THIRD-ORDER
-        // block, which has no operator matrix to move to; #1561 put that block
-        // on the Gram's rounding band instead (below, and at the sibling site
-        // `operator_penalty_candidates_from_collocation`, which kept the cut for
-        // the same block and for the same reason). For a `matern()` term this
+        // moved the MASS, TENSION and STIFFNESS candidates onto their energy
+        // factors. THE PARAGRAPH ABOVE IS HISTORY, NOT CURRENT BEHAVIOUR: the
+        // `dim·1e-10·max|ev|` cut it describes was removed by `0f72c1e70e`
+        // (#2901), and `try_from_dense_psd` now cuts at the spectrum's rounding
+        // band `dim·ε·‖H‖₂`. A rank read at that band can still move with κ,
+        // since the band is relative to `‖H‖₂`, but five orders of magnitude
+        // less readily, and #3236's 118↔117 measurement was taken under the old
+        // constant. For a `matern()` term this
         // builder is the one in effect: `build_single_local_smooth_term_for` replaces a
         // `SmoothBasisSpec::Matern` term's active penalties with this triplet,
         // so the other builder's output never reaches the fit. The refusals name
@@ -5607,44 +5609,25 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
         )?);
     }
     if let Some(gram) = ops.third_order_gram.as_ref() {
-        // THE FOURTH BLOCK, off the `dim·1e-10·max|ev|` cut (#1561, #3236).
-        //
-        // The three blocks above are built from their exact energy factors, so
-        // each rank is a property of an operator. This one has no operator to
-        // build from: the collocation builder emits the third-order energy as a
-        // Gram summed in closed form and `CollocationOperatorMatrices` carries
-        // no `d3`. So it stayed on `try_from_dense_psd`, whose cutoff is
-        // relative to the spectrum, which is precisely what makes a block's rank
-        // a function of κ — the mechanism the comment above describes, still
-        // live for every ν ≥ 5/2 (`MaternNu::admits_third_order_operator`) after
-        // #3236 repaired the other three.
-        //
-        // `unit_frobenius_from_gram_within_rounding_band` is the constructor
-        // written for this and, until now, called only from its own tests. It
-        // keeps EVERY positive eigenvalue and clamps a negative one only inside
-        // `dim·ε·(max|S| + assembly)`, so the kept count no longer crosses a
-        // cutoff as κ moves. It returns the unit-Frobenius quadratic together
-        // with `c = ‖S₊‖_F`, which is exactly the pair this candidate wants, so
-        // `normalize_penalty_in_constrained_space` is not needed here any more.
-        // Its `c` is taken over the positive eigenvalues where the old one took
-        // a Frobenius norm over all of them; inside the rounding band those are
-        // the same number.
-        //
-        // `assembly_magnitude = 0` because this Gram's summands are not
-        // available at this site. That makes the band `dim·ε·max|S|`, a LOWER
-        // bound on the honest band, so any refusal it raises is at least as
-        // strict as the true one — never weaker. If a third-order Gram does
-        // refuse at a residual just past it, the repair is to thread the summand
-        // magnitude out of the kernel builder, not to widen the band here.
+        // The third-order block is the one Matérn penalty with no operator
+        // matrix to build an energy factor from: the collocation builder emits
+        // its energy as a closed-form Gram and `CollocationOperatorMatrices`
+        // carries `d0`, `d1`, `d2` and `third_order_gram`, with no `d3`. So it
+        // goes through the dense bridge, whose cutoff is the SPECTRUM'S
+        // ROUNDING BAND `dim·ε·‖H‖₂` (`spectral_tolerance`), not a fixed
+        // relative cut. #1561 briefly replaced this with
+        // `unit_frobenius_from_gram_within_rounding_band` on the belief that
+        // the bridge still cut at `dim·1e-10·max|ev|`; that constant was
+        // removed by `0f72c1e70e` (#2901) and the replacement admitted every
+        // positive eigenvalue, including modes BELOW the band the
+        // decomposition can resolve them from zero by. Reverted.
         let sym = (gram + &gram.t()) * 0.5;
-        let (matrix, normalization_scale) =
-            ConstructiveQuadratic::unit_frobenius_from_gram_within_rounding_band(
-                &sym,
-                0.0,
-                "Matérn third-order operator penalty",
-            )?;
+        let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym)?;
         candidates.push(PenaltyCandidate {
-            matrix,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                matrix,
+                "Matérn third-order operator penalty",
+            )?,
             source: PenaltySource::OperatorThirdOrder,
             normalization_scale,
             kronecker_factors: None,
