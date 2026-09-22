@@ -3975,5 +3975,31 @@
     ],
     "reason": "9f8c5151ee split the dense outer-Hessian read into `compute_lamlhessian_or_declared_absent_from_bundle` (Option) and kept `compute_lamlhessian_exact_from_bundle` as a wrapper turning the declared absence into a refusal; its only caller was a test in reml/mod.rs, so the lib build refused it as dead code (gate integ-0920-cz). The test now reads the Option form and asserts the Firth criterion declares no absence; `compute_lamlhessian_consistent` remains the production wrapper.",
     "evidence": "At 978ab62edc, `git grep -n -w compute_lamlhessian_exact_from_bundle -- crates` finds its definition (eval.rs:240) and one caller inside `mod tests` of reml/mod.rs (line 1692); no production caller."
+  },
+  {
+    "base": "d7e8bee3cf1d4e653b79af1a62aaefc6aed49e63",
+    "items": [
+      "crates/gam-sae/src/manifold/tests_outer_quasi_laplace_probe_budget_2080.rs:fn:inner_relative_decrement_refuses_a_non_finite_objective"
+    ],
+    "reason": "4fa520cd36 (#3355) deleted `SaeManifoldTerm::inner_relative_decrement` and put the ratio behind `SaeDecrementAgainstResolution::measure`; this test called the deleted helper and asserted the retired `|F| + 1` scale. The newtype module's `a_non_finite_objective_refuses_3355` and `the_refusing_measure_cannot_certify_3355` cover the same NaN guard through the only constructor, so the test is removed rather than rewritten into a duplicate (gate integ-0920-du).",
+    "evidence": "At d7e8bee3cf, `git grep -n -w inner_relative_decrement -- crates` finds only this test's five calls; `git grep -n a_non_finite_objective_refuses_3355` finds the replacement in construction_quasi_laplace.rs."
+  },
+  {
+    "base": "a46e5c31abae721649ceddc33f7b61ba265f9d84",
+    "items": [
+      "crates/gam-terms/src/basis/matern_kernel.rs:fn:centers_grid_36",
+      "crates/gam-terms/src/basis/matern_kernel.rs:fn:third_order_block_rank_stops_moving_with_kappa_1561"
+    ],
+    "reason": "Revert of c5ba2177df. The gate's positive control asserted that `try_from_dense_psd`'s cutoff moves across a psi ladder, which was true only under the `dim*1e-10*max|ev|` constant that 0f72c1e70e (#2901) had already replaced by the spectrum's rounding band; with the premise false the control cannot pass and the gate measured nothing. Its fixture `centers_grid_36` had no other caller.",
+    "evidence": "`git show c5ba2177df --stat` adds both items; at a46e5c31ab `git grep -n -w centers_grid_36 -- crates` finds only the fixture and its one use inside the removed test."
+  },
+  {
+    "base": "f3c3c06097d3f25c54dcea65b384995cf6825eb0",
+    "items": [
+      "crates/gam-terms/src/dictionary.rs:const:DEFAULT_CODE_RIDGE",
+      "crates/gam-terms/src/dictionary.rs:fn:penalized_reconstruction_loss"
+    ],
+    "reason": "#2899 row P32: `code_ridge` carried a hand-set 1e-8 into five jobs; the two that were smoothing parameters are now selected by closed-form REML, the active-set solve resolves at the Gram's rounding band, and the softmax divisor and the reported loss drop the term. `penalized_reconstruction_loss` becomes `reconstruction_loss` (the `ridge*K` offset it added was a constant nothing compared) and the default constant has no reader.",
+    "evidence": "At f3c3c06097 `git grep -n -w DEFAULT_CODE_RIDGE -- crates` finds the constant and its uses in dictionary.rs only; `git grep -n -w penalized_reconstruction_loss -- crates` finds its definition and callers in dictionary.rs only, all replaced in 298c398d05."
   }
 ]
