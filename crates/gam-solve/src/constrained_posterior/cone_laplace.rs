@@ -415,7 +415,7 @@ fn site_precision(
     tau: &Array1<f64>,
     nu: &Array1<f64>,
     sweep: usize,
-) -> Result<(Array2<f64>, Array2<f64>, f64, Array1<f64>, Array1<f64>), ConeLaplaceRefusal> {
+) -> Result<(Array2<f64>, Array2<f64>, f64, Array1<f64>, Array1<f64>, f64), ConeLaplaceRefusal> {
     let p = precision_m.nrows();
     let q = rows.nrows();
     let mut precision = precision_m.clone();
