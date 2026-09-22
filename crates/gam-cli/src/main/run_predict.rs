@@ -2045,8 +2045,19 @@ pub(crate) struct PreparedSavedLatentWindowPrediction {
 /// either rail it carries every miss in one tail and covers an endpoint the law
 /// never reaches, so it is conservative in the high-survival regime and
 /// anti-conservative in the low one. Its ends are values the response attains,
-/// so nothing is clamped. A law with no spread along the axis it resolves is a
-/// point mass in the response, and its interval is that point.
+/// so nothing is clamped. A law with no spread along any coordinate is a point
+/// mass in the response, and its interval is that point.
+///
+/// The axis the interval resolves exactly is chosen among those the window
+/// survival is MONOTONE along, not by responsiveness alone. This row's response
+/// projects a node outside the monotone time block's cone onto its boundary
+/// (`q_exit = x[2].max(q_entry)` above), and that projection makes the entry
+/// coordinate move the exit offset too wherever it is active, so the window
+/// survival can turn over in `q_entry` while staying monotone in the latent mean
+/// and the exit offset. Resolving a coordinate it turns over along would refuse
+/// the whole prediction; the factorization is an identity for every ordering, so
+/// taking a coordinate that is monotone is choosing a valid decomposition rather
+/// than falling back from an invalid one.
 fn latent_window_row_band(
     quadctx: &gam::quadrature::QuadratureContext,
     row_mu: [f64; 3],
@@ -2067,18 +2078,11 @@ fn latent_window_row_band(
             })
         },
     )?;
-    let resolved_axis =
-        gam::quadrature::most_responsive_axis::<3, _, String>(row_mu, row_cov, &response)?;
-    let (lower, upper) = gam::quadrature::central_response_interval::<3, _, String>(
-        quadctx,
-        row_mu,
-        row_cov,
-        resolved_axis,
-        15,
-        level,
-        &response,
-    )?
-    .unwrap_or((row_mean, row_mean));
+    let (lower, upper) =
+        gam::quadrature::central_response_interval_on_a_monotone_axis::<3, _, String>(
+            quadctx, row_mu, row_cov, 15, level, &response,
+        )?
+        .unwrap_or((row_mean, row_mean));
     Ok((variance.max(0.0).sqrt(), lower, upper))
 }
 

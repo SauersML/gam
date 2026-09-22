@@ -1,5 +1,19 @@
 ## Unreleased
 
+- **A survival band could refuse a prediction because the axis it resolved was not one the
+  response is monotone along** (gam#3560). `central_response_interval` requires weak monotonicity
+  on the coordinate it resolves exactly — that is what makes the sub-level set a half line — and
+  the axis was chosen by how far the response moves along it, which is a different question. The
+  latent-window row projects a node outside the monotone time block's cone onto its boundary, and
+  that projection makes the entry offset move the exit offset wherever it is active, so the window
+  survival can turn over in the entry coordinate while staying monotone in the latent mean and the
+  exit offset. The band now takes the most responsive coordinate the response is monotone ALONG:
+  `F(s) = E_V[P(h_V(T) ≤ s)]` is an identity for every ordering of the coordinates, so every
+  admissible axis gives the same interval and choosing one that meets the precondition is
+  selecting a valid decomposition rather than falling back from an invalid one. A response that
+  turns over along every coordinate carrying spread is still refused, and the refusal now names
+  that they were all tried.
+
 - **A constrained-Laplace VALUE refused on a moment-matching condition it never uses, at the sites
   EP had not yet moved** (gam#4571). `share_and_magnitude` reads one number from a site, the tilted
   log mass, and obtained it by calling `site_update`, which computes the full cumulant jet and
