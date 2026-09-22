@@ -180,6 +180,23 @@
   provisional convergence label on a still-descending iterate and left the revocation paths
   to take it back (#2299), which now withdraw a named claim.
 
+- **The `ρ`-posterior quadrature publishes the mass it integrates instead of dividing it out**
+  (gam#4556 P2). `quadrature_nodes_core` already formed every factor of
+  `log ∫ exp(−V(ρ)) dρ` — the node exponents `a_m = log w_m − V(ρ_m) + V(ρ̂) + ½‖z_m‖²`, their
+  logsumexp as `max + ln(total)`, and the Cholesky of the outer Hessian the proposal is
+  whitened by — and then kept only the normalized weights, which is exactly that quantity
+  divided away. `RhoPosteriorMixture::log_normalizer` reports it:
+  `−V(ρ̂) + (K/2)·log 2π − ½ log|H_ρ| + logsumexp_m a_m`, where the `log 2π` is the density the
+  Gauss-Hermite rule integrates against and the `log|H_ρ|` is the Jacobian of `ρ = ρ̂ + L z`,
+  now returned by the same factorization that returns `L` rather than a second one.
+  The nodes alone answer conditional questions; this is the number they also determine that
+  compares one MODEL with another, with `ρ` integrated out instead of profiled. Three
+  fixtures pin it on the Gaussian criterion, where the rule is exact and the integral is
+  closed form: it equals `(K/2)·log 2π − ½ log|H|` to the arithmetic's own band, a constant
+  added to the criterion moves it by exactly minus that constant while no normalized weight
+  moves at all, and three nodes per axis publish the same number as five — #4556's own rule
+  that no sweep's width may move a score, in the new quantity's terms.
+
 ## gamfit 0.1.269 (2026-09-21)
 
 - A Bernoulli marginal-slope prediction table carries `mean_score_derivative`

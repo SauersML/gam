@@ -323,6 +323,28 @@ pub struct RhoPosteriorMixture {
     /// Kish ESS of the node weights `(Σw)²/Σw²` — how non-Gaussian the exact
     /// posterior is relative to the Laplace proposal (max = node count).
     pub effective_sample_size: f64,
+    /// `log ∫ exp(−V(ρ)) dρ` over the rule's support: the log of the criterion
+    /// mass the nodes integrate, before normalizing divides it out (#4556).
+    ///
+    /// The nodes alone answer only conditional questions — the mixture's mean,
+    /// its covariance, a posterior over `β` averaged across it. This is the one
+    /// number they also determine that compares one MODEL with another: with
+    /// `V` the LAML/REML criterion, `exp(−V(ρ))` is the marginal likelihood at
+    /// `ρ` and this is its integral against the flat `ρ`-measure the criterion's
+    /// own scale implies, so a difference of two of them over the same data is a
+    /// log Bayes factor with `ρ` integrated out rather than profiled. The
+    /// criterion's additive constant is carried by the DATA, so it is common to
+    /// candidates scored on the same data by the same criterion and cancels in
+    /// that difference — and, exactly as #4556 rules for every other comparison,
+    /// a divisor applied before comparing must be common to the candidates too.
+    ///
+    /// It is the Gauss-Hermite product rule's value, not the exact integral: the
+    /// rule is exact for integrands the Gaussian proposal makes polynomial of
+    /// degree `≤ 2·nodes_per_axis − 1`, and `effective_sample_size` is what says
+    /// how far this posterior sits from that proposal. A mixture whose ESS has
+    /// collapsed toward one node has put its mass where the rule resolves it
+    /// worst, and this number inherits that.
+    pub log_normalizer: f64,
 }
 
 /// Tier-2 deliverable (#938): `π(ρ|y)` draws from NUTS with the exact profiled

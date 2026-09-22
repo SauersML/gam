@@ -3932,5 +3932,13 @@
     ],
     "reason": "#4566: the custom-family outer search stops on its progress certificates, not BlockwiseFitOptions::default().outer_max_iter = 60, and the #2661 seed ladder's depth is derived from a declared corrector budget (CONTINUATION_SEED_CORRECTOR_BUDGET) instead of floor(log2(outer_max_iter)) - 1. scripted_options existed only to vary outer_max_iter for that ladder, which no longer reads it; its three callers call double_well_options() directly. The budget test is rewritten as the_refinement_budget_is_the_seed_ladders_corrector_budget_2661, bracketing the depth from the declared budget from both sides instead of tabulating four outer counts. Test-scoped items; no production item is removed.",
     "evidence": "Read off the landing diff: git grep for either name at the landing parent returns only the test file; the rewritten test in the same file pins the derivation."
+  },
+  {
+    "base": "c21ae3add14836cad2f50a976900e99afd1ab4ba",
+    "items": [
+      "crates/gam-inference/src/rho_posterior.rs:fn:whitening_factor_from_outer_hessian"
+    ],
+    "reason": "#4556 P2: the function now returns the log-determinant of the outer Hessian beside the whitening factor, because the quadrature's normalizer needs both and one Cholesky determines both; a name that says only `whitening_factor` would describe half of what it computes. It is renamed to `outer_hessian_geometry`, returning `OuterHessianGeometry { whitening_factor, log_determinant }`. Nothing is dropped: both call sites and both fixtures read the factor from that struct, and the quadrature core additionally reads the determinant it previously threw away by never forming it.",
+    "evidence": "At the base c21ae3add1, git grep -n whitening_factor_from_outer_hessian finds 5 lines, all in crates/gam-inference/src/rho_posterior.rs: the declaration, the quadrature core's call, the sequential proposal's call, and two calls in its own #[cfg(test)] mod tests. No other crate, test, bench, example or Python file names it. It is a private module function (no pub), so the public-function census records no loss and carries no entry; the same commit adds the private fn outer_hessian_geometry and the private struct OuterHessianGeometry, which the census does not gate."
   }
 ]

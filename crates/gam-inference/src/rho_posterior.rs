@@ -138,9 +138,23 @@ impl DetNormal {
 /// not positive definite has no Gaussian proposal, so it is refused with the
 /// factorization's reason rather than ridged into one whose covariance is not
 /// `H_ρ⁻¹`.
-fn whitening_factor_from_outer_hessian(
+/// The Laplace geometry of an outer Hessian: the factor the proposal draws
+/// through and the log-determinant the quadrature's normalizer carries, from ONE
+/// Cholesky (#4556 P2). Read separately they could describe different matrices;
+/// `|det L| = |H_ρ|^{-½}` is the Jacobian of the very map `L` performs, so the
+/// two are one fact about `H_ρ`.
+struct OuterHessianGeometry {
+    /// `L = R⁻ᵀ` with `R Rᵀ = H_ρ`: `ρ = ρ̂ + L z` has covariance `H_ρ⁻¹`.
+    whitening_factor: Array2<f64>,
+    /// `log|H_ρ| = 2·Σ_i log R_ii`, exact for a triangular factor: the
+    /// determinant of a product is the product of the determinants, and a
+    /// triangular matrix's is its diagonal's product.
+    log_determinant: f64,
+}
+
+fn outer_hessian_geometry(
     outer_hessian: &Array2<f64>,
-) -> Result<Array2<f64>, RhoPosteriorRefusal> {
+) -> Result<OuterHessianGeometry, RhoPosteriorRefusal> {
     let r = outer_hessian
         .cholesky(Side::Lower)
         .map_err(|error| RhoPosteriorRefusal::HessianNotPositiveDefinite {
@@ -179,7 +193,13 @@ fn whitening_factor_from_outer_hessian(
             l_inv[[i, j]] = r_inv[[j, i]];
         }
     }
-    Ok(l_inv)
+    // Every pivot was checked positive and finite by the forward substitution
+    // above, so this sum is over logarithms of positive numbers.
+    let log_determinant = 2.0 * (0..n).map(|i| r[[i, i]].ln()).sum::<f64>();
+    Ok(OuterHessianGeometry {
+        whitening_factor: l_inv,
+        log_determinant,
+    })
 }
 
 /// Enumerate the product rule over `rules`, one rule per axis, appending every
@@ -199,6 +219,14 @@ pub(crate) fn enumerate_gh_product(
         z[axis] = node;
         enumerate_gh_product(rules, axis + 1, z, log_w + weight.ln(), out);
     }
+}
+
+/// What the Tier-1 core measures: the normalized nodes, how far their weights
+/// are from the proposal's, and the log of the criterion mass they integrate.
+struct QuadratureCore {
+    nodes: Vec<NormalizedQuadratureNode>,
+    effective_sample_size: f64,
+    log_normalizer: f64,
 }
 
 /// One normalized node from the quadrature core: `(ρ, cost, normalized weight,
@@ -222,7 +250,7 @@ fn quadrature_nodes_core<E>(
     nodes_per_axis: usize,
     cost_hat: f64,
     mut eval_node: E,
-) -> Result<(Vec<NormalizedQuadratureNode>, f64), EstimationError>
+) -> Result<QuadratureCore, EstimationError>
 where
     E: FnMut(&Array1<f64>) -> Result<f64, String>,
 {
@@ -240,9 +268,10 @@ where
             ))
         },
     )?;
-    let l_inv = whitening_factor_from_outer_hessian(outer_hessian).map_err(|reason| {
+    let geometry = outer_hessian_geometry(outer_hessian).map_err(|reason| {
         EstimationError::RemlOptimizationFailed(format!("rho_posterior_quadrature: {reason}"))
     })?;
+    let l_inv = &geometry.whitening_factor;
     if !cost_hat.is_finite() {
         return Err(EstimationError::RemlOptimizationFailed(
             "rho_posterior_quadrature: non-finite criterion at rho_hat".to_string(),
@@ -296,6 +325,25 @@ where
         ));
     }
 
+    // The log of the mass the nodes integrate, which normalizing then throws
+    // away (#4556 P2). Every factor is already here:
+    //
+    //   ∫ exp(−V(ρ)) dρ
+    //     = |det L| ∫ exp(−V(ρ̂ + Lz)) dz                       (ρ = ρ̂ + Lz)
+    //     = |H_ρ|^{-½} (2π)^{K/2} ∫ exp(−V(ρ̂+Lz) + ½‖z‖²) φ_K(z) dz
+    //     ≈ |H_ρ|^{-½} (2π)^{K/2} exp(−V(ρ̂)) · Σ_m exp(a_m),
+    //
+    // with `φ_K` the standard normal density the rule integrates against — its
+    // weights sum to one — and `a_m = log w_m − V(ρ_m) + V(ρ̂) + ½‖z_m‖²` the
+    // `log_weight` above, which carries the `V(ρ̂)` shift exactly so the sum is
+    // finite. `logsumexp_m a_m` is `max_log_weight + ln(total)`, the two numbers
+    // the normalization already formed.
+    let log_sum_exp_weights = max_log_weight + total.ln();
+    let log_normalizer = -cost_hat
+        + 0.5 * (k as f64) * std::f64::consts::TAU.ln()
+        - 0.5 * geometry.log_determinant
+        + log_sum_exp_weights;
+
     let mut nodes = Vec::with_capacity(raw_nodes.len());
     let mut sum_sq = 0.0;
     for ((rho, cost, log_weight), scaled_weight) in raw_nodes.into_iter().zip(scaled) {
@@ -309,7 +357,11 @@ where
         });
     }
     let ess = if sum_sq > 0.0 { 1.0 / sum_sq } else { 0.0 };
-    Ok((nodes, ess))
+    Ok(QuadratureCore {
+        nodes,
+        effective_sample_size: ess,
+        log_normalizer,
+    })
 }
 
 /// Posterior moments of a normalized discrete mixture over `ρ`.
@@ -368,9 +420,11 @@ where
             "rho_posterior_quadrature: criterion is unavailable at rho_hat itself: {detail}"
         ))
     })?;
-    let (core_nodes, effective_sample_size) =
-        quadrature_nodes_core(rho_hat, outer_hessian, nodes_per_axis, cost_hat, criterion)?;
-    let nodes: Vec<RhoMixtureNode> = core_nodes
+    let core = quadrature_nodes_core(rho_hat, outer_hessian, nodes_per_axis, cost_hat, criterion)?;
+    let effective_sample_size = core.effective_sample_size;
+    let log_normalizer = core.log_normalizer;
+    let nodes: Vec<RhoMixtureNode> = core
+        .nodes
         .into_iter()
         .map(|node| RhoMixtureNode {
             rho: node.rho,
@@ -385,6 +439,7 @@ where
         mean,
         covariance,
         effective_sample_size,
+        log_normalizer,
     })
 }
 
@@ -614,7 +669,7 @@ impl DomainLaplaceProposal {
         let l_inv = if free.is_empty() {
             free_hessian
         } else {
-            whitening_factor_from_outer_hessian(&free_hessian)?
+            outer_hessian_geometry(&free_hessian)?.whitening_factor
         };
         Ok(Self {
             rho_hat: rho_hat.clone(),
@@ -1200,7 +1255,8 @@ mod tests {
     fn whitening_factor_is_exact_at_any_curvature_scale() {
         let tiny = 2.0_f64.powi(-60);
         let h = array![[tiny, 0.0], [0.0, 4.0 * tiny]];
-        let l_inv = whitening_factor_from_outer_hessian(&h).expect("positive definite");
+        let geometry = outer_hessian_geometry(&h).expect("positive definite");
+        let l_inv = geometry.whitening_factor;
         assert_eq!(l_inv[[0, 0]], 2.0_f64.powi(30));
         assert_eq!(l_inv[[1, 1]], 2.0_f64.powi(29));
         assert_eq!(l_inv[[0, 1]], 0.0);
@@ -1214,7 +1270,7 @@ mod tests {
     fn singular_outer_hessian_is_refused() {
         let rho_hat = array![0.0, 0.0];
         let h = array![[1.0, 1.0], [1.0, 1.0]];
-        assert!(whitening_factor_from_outer_hessian(&h).is_err());
+        assert!(outer_hessian_geometry(&h).is_err());
         let refusal = rho_posterior_adequacy(&rho_hat, &h, &unbounded(), &[], |_| Ok(0.0))
             .expect_err("a singular outer Hessian must be refused");
         assert!(
