@@ -708,6 +708,56 @@ impl SaeManifoldTerm {
                                 ProbeRefusalKind::non_pd_per_row_marker()
                             ));
                         }
+                        // #2080 — THE FULL DRIVE REFUSES WHEN REFINEMENT STOPS
+                        // PAYING, NOT WHEN THE BUDGET RUNS OUT.
+                        //
+                        // The lane above is the only one that fast-fails on the
+                        // first non-PD probe, and #2228 requires that no outer
+                        // ranking lane consume it
+                        // (`value_lane_prices_at_shared_fixed_point_2228`). Every
+                        // production lane therefore arrives here, where the refusal
+                        // used to wait for `total_inner_iter >= refine_limit`
+                        // below — 16× `inner_max_iter` at the accepted base budget.
+                        // An infeasible-ρ probe paid that budget in full on every
+                        // gradient coordinate, which is the wide-p wall #2080 was
+                        // opened for: the loop is bounded, but nothing bounds how
+                        // many probes spend all of it.
+                        //
+                        // The full drive exists because this block may be a
+                        // TRANSIENT indefinite state the refinement crosses, so a
+                        // blanket fast-fail would refuse probes that would have
+                        // converged. Crossing it is OBSERVABLE: the KKT residual
+                        // keeps falling round over round. The transient case is
+                        // therefore exactly `refine_round_made_progress`, the same
+                        // per-round verdict `refine_iteration_limit` spends its
+                        // budget on one line below. A round that did not reduce the
+                        // residual AND still leaves the block non-PD has shown the
+                        // state to be terminal, and further rounds buy nothing.
+                        //
+                        // This bounds an infeasible probe at the rounds it can pay
+                        // for instead of at the budget, while a descending probe
+                        // keeps the whole drive — so #2080 and #2228 are both
+                        // served, and the coarse lane above is untouched.
+                        //
+                        // The first visit has no previous round to judge, so it
+                        // always earns one refinement round before this can fire.
+                        if let Some(previous_grad_norm) = previous_refine_grad_norm
+                            && !Self::refine_round_made_progress(
+                                Some(previous_grad_norm),
+                                grad_norm,
+                            )
+                        {
+                            return Err(format!(
+                                "SaeManifoldTerm::penalized_quasi_laplace_criterion: undamped evidence \
+                             factorization hit a {} before KKT \
+                             stationarity (‖g‖={grad_norm:.6e}, tol {grad_tolerance:.6e}) \
+                             and the preceding refinement round did not reduce the KKT \
+                             residual from {previous_grad_norm:.6e}, so the block is \
+                             terminally rather than transiently indefinite after \
+                             {total_inner_iter} inner iterations; {err}",
+                                ProbeRefusalKind::non_pd_per_row_marker()
+                            ));
+                        }
                         let refine_limit = Self::refine_iteration_limit(
                             total_inner_iter,
                             base_refine_iter,
