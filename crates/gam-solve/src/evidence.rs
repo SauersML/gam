@@ -2368,6 +2368,24 @@ pub const COMPARISON_CRITERION: &str = "aic_corrected";
 ///
 /// Every field is required: a model that cannot publish its corrected AIC is
 /// refused before it becomes a candidate, with the summary's own reason.
+///
+/// # What the comparability checks establish, and what they do not (#4556 P3)
+///
+/// An AIC gap is an evidence ratio only between two fits of one experiment: the
+/// same response, the same weights, the same base measure. [`check_comparable`]
+/// tests every NECESSARY condition the published summaries carry — the family
+/// label, the training row count, and the intercept-only deviance, which is a
+/// function of the response, the weights and the family and of nothing the model
+/// chooses — and refuses on any mismatch. Passing them is not proof of one
+/// experiment: two different datasets of the same size, same family and (far
+/// less likely) the same null deviance would pass, and a fit that publishes no
+/// null deviance is tested on `n` and the family alone.
+///
+/// What would establish it is a fingerprint of the training response carried on
+/// the fit itself. That is a persisted-format change: the response reaches the
+/// summary only through `UnifiedFitResult`'s training record, so a fingerprint
+/// has to be taken where `training_sample_size` is taken and travel the same
+/// way. This type states what it tests instead of claiming what it does not.
 #[derive(Clone, Debug)]
 pub struct ComparisonCandidate {
     pub name: String,
@@ -2377,6 +2395,17 @@ pub struct ComparisonCandidate {
     /// Training observations. Candidates fit on different `n` are refused:
     /// `−2ℓ` grows with `n`, so their AIC gap is not an evidence ratio.
     pub n_obs: usize,
+    /// Deviance of the intercept-only model on the training data, when the fit
+    /// publishes one.
+    ///
+    /// It is a function of the response, the prior weights and the family, and
+    /// of nothing the candidate model chooses — no design, no smoothing, no
+    /// basis. Two fits of one family on one response therefore compute it from
+    /// the same inputs by the same code and agree; two that disagree were not
+    /// fit to the same response, whatever their `n`. `None` for a fit with no
+    /// single intercept, with an offset, or saved before the value was
+    /// recorded, and that case is tested on `n` and the family alone.
+    pub null_deviance: Option<f64>,
     /// Wood–Pya–Säfken smoothing-corrected AIC `−2ℓ + 2·(τ + p_scale)`, the
     /// ranking criterion.
     pub aic_corrected: f64,
@@ -2467,9 +2496,29 @@ fn check_comparable(candidates: &[&ComparisonCandidate]) -> Result<(), String> {
                 "compare_models: cannot compare fits made on a different number of \
                  observations (n={} vs n={}); AIC scales with the sample size, so their \
                  difference is not an evidence ratio. Compare models fit to the same \
-                 response on the same data.",
+                 response, with the same weights, on the same rows.",
                 first.n_obs, cand.n_obs
             ));
+        }
+        // The intercept-only deviance is a function of the response, the weights
+        // and the family alone, so two fits of one experiment compute it from
+        // the same inputs by the same code. It is a sum of `n` non-negative
+        // per-row contributions, so its own forward error is
+        // `γ_n·null_deviance`; a difference wider than the two values' bands
+        // together is not rounding, it is different data (#4556 P3).
+        if let (Some(first_null), Some(cand_null)) = (first.null_deviance, cand.null_deviance) {
+            let band = gam_linalg::roundoff::accumulation_growth(first.n_obs)
+                * (first_null.abs() + cand_null.abs());
+            if !((first_null - cand_null).abs() <= band) {
+                return Err(format!(
+                    "compare_models: cannot compare fits whose intercept-only deviances differ \
+                     ({first_null} vs {cand_null}, beyond the {band} their own summation can \
+                     explain); that deviance reads the response, the weights and the family and \
+                     nothing the model chooses, so these fits were not made on the same data. \
+                     Compare models fit to the same response, with the same weights, on the \
+                     same rows."
+                ));
+            }
         }
         for (label, value) in [
             ("aic_corrected", cand.aic_corrected),
@@ -3178,6 +3227,8 @@ mod tests {
             name: name.to_string(),
             family: "gaussian".to_string(),
             n_obs: 100,
+            // One experiment: every candidate reads the same response.
+            null_deviance: Some(412.5),
             aic_corrected: 2.0 * edf,
             aic_conditional: 2.0 * edf,
             edf_corrected: edf,
@@ -4303,12 +4354,48 @@ mod tests {
             name: name.to_string(),
             family: "Gaussian Identity".to_string(),
             n_obs: 200,
+            // One experiment: every candidate reads the same response.
+            null_deviance: Some(318.25),
             aic_corrected,
             aic_conditional,
             edf_corrected: 6.0,
             edf_conditional: 5.0,
             reml_score: Some(reml),
         }
+    }
+
+    /// #4556 P3. Two fits of one family with the same `n` can still be two
+    /// experiments. The intercept-only deviance reads the response, the weights
+    /// and the family and nothing the model chooses, so a difference in it is a
+    /// difference in the data and the comparison refuses rather than reporting
+    /// an evidence ratio between datasets. A difference inside the band that
+    /// deviance's own summation can explain is not one, and must still compare;
+    /// a candidate that publishes none is tested on `n` and the family alone,
+    /// which is what this check can establish and all it claims.
+    #[test]
+    fn compare_models_refuses_candidates_whose_null_deviance_disagrees_4556() {
+        let mut first = cand("first", 180.5, 100.0, 101.0);
+        let mut second = cand("second", 177.4, 99.0, 103.0);
+        // Positive control: the pair compares while the two agree.
+        compare_models(vec![first.clone(), second.clone()]).expect("one experiment compares");
+
+        let null = first.null_deviance.expect("the fixture publishes one");
+        let band = gam_linalg::roundoff::accumulation_growth(first.n_obs) * 2.0 * null;
+        second.null_deviance = Some(null + 0.5 * band);
+        compare_models(vec![first.clone(), second.clone()])
+            .expect("a rounding-level difference is what one experiment can produce");
+
+        second.null_deviance = Some(null * 1.05);
+        let refusal = compare_models(vec![first.clone(), second.clone()])
+            .expect_err("two experiments must not be ranked against each other");
+        assert!(
+            refusal.contains("intercept-only deviances differ"),
+            "the refusal must name what it observed: {refusal}"
+        );
+
+        first.null_deviance = None;
+        compare_models(vec![first, second])
+            .expect("a fit publishing no null deviance is tested on n and the family alone");
     }
 
     #[test]

@@ -505,6 +505,24 @@
   construction — both children re-derive their tube from their own bounds and their union is
   the parent — so only `HonestConformalCost::z_cells` moves.
 
+- **A profiled evidence ratio stops calling itself a Bayes factor, and a model comparison tests
+  the response it can see** (gam#4556 P3). `compare_reuse_reml` fits each hypothesis' own `λ̂`
+  and published the difference of the two maxima as `ReuseComparison::log_bayes_factor`, with
+  `log_posterior_odds` and `posterior_share_probability` transformed from it. No integral over
+  `λ` is taken there, so none of those names was true. The REML arm now returns its own
+  `ProfiledReuseComparison` — `profiled_log_evidence_*`, `log_profiled_evidence_ratio`,
+  `log_profiled_odds`, `share_score` — and `ReuseComparison` is the exact arm's type, where
+  both hypotheses integrate against one declared proper prior and the Bayes-factor names are
+  true. One `share_odds` transform serves both arms, so the two cannot apply the prior
+  differently; what differs is what goes into it.
+  `compare_models` established "the same data" by equal `n_obs` and equal family, while its
+  refusal text claimed the same response on the same data. Two datasets of one size passed. It
+  now also refuses two candidates whose intercept-only deviances differ by more than the
+  `γ_n` their own summation can explain: that deviance reads the response, the weights and the
+  family and nothing the model chooses. `ComparisonCandidate` documents what the set of checks
+  establishes — necessary conditions, not provenance — and what a response fingerprint would
+  add, so the claim matches the test.
+
 ## gamfit 0.1.270 (2026-09-22)
 
 0.1.269 was tagged on 2026-09-21 and never reached PyPI: its release run

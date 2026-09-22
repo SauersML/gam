@@ -1238,6 +1238,7 @@ fn comparison_candidate(
         name,
         family: summary.family_name,
         n_obs,
+        null_deviance: summary.null_deviance,
         aic_corrected,
         aic_conditional,
         edf_corrected,

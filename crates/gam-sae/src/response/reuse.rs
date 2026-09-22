@@ -81,7 +81,15 @@ impl SharedAlignment {
     }
 }
 
-/// A comparison of reuse against specialization.
+/// A comparison of reuse against specialization by EXACT evidence
+/// ([`compare_reuse`]).
+///
+/// Both hypotheses integrate their coefficients against ONE declared proper
+/// prior, so each number here is a marginal likelihood and their difference is a
+/// Bayes factor. The REML arm, which maximizes over its smoothing strengths
+/// instead of integrating over them, has its own type
+/// ([`ProfiledReuseComparison`]): the same arithmetic on profiled values does
+/// not make them evidences (#4556 P3).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReuseComparison {
     /// `log p(y | shared)`: the prior-mass mixture over the declared alignments.
@@ -98,12 +106,47 @@ pub struct ReuseComparison {
     pub posterior_share_probability: f64,
 }
 
+/// A comparison of reuse against specialization by PROFILED restricted
+/// likelihood ([`compare_reuse_reml`]), where the prior scale is not declared.
+///
+/// Every number here is taken at each hypothesis' own `λ̂`. No integral over `λ`
+/// was performed, so none of them is a marginal likelihood, their difference is
+/// not a Bayes factor, and the logistic of the prior-adjusted difference is not
+/// a posterior probability — the type says so in the names rather than leaving
+/// the reader to find it in a doc (#4556 P3). The two arms carry the same prior
+/// transform ([`share_odds`]); what differs is what goes into it.
+///
+/// What would make the REML arm's ratio a Bayes factor is the integral the
+/// profile skips: `log ∫ exp(−V(ρ)) dρ` over each hypothesis' own smoothing
+/// coordinates, which is the quantity `RhoPosteriorMixture::log_normalizer`
+/// publishes for the Tier-1 route (#4556 P2). It cannot be called from this
+/// crate — `gam-inference`, which owns that route, depends on `gam-sae` — so
+/// making this arm evidential means moving the integral down, not calling up.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProfiledReuseComparison {
+    /// `log p(y | shared, λ̂_shared)`: the prior-mass mixture over the declared alignments, each at its own `λ̂`.
+    pub profiled_log_evidence_shared: f64,
+    /// `log p(y | shared, alignment k, λ̂_k)`, in declaration order, before weighting by the alignment's prior mass.
+    pub alignment_profiled_log_evidence: Vec<f64>,
+    /// `log p(y | specialized, λ̂_specialized)`.
+    pub profiled_log_evidence_specialized: f64,
+    /// Their difference, in nats. Positive favours reuse. Each side is maximized over its own smoothing
+    /// strengths, so this is a profiled (empirical-Bayes) evidence ratio and NOT a Bayes factor: the `λ`-integral
+    /// both sides would need is not taken, and the two sides' maxima are not comparable normalizing constants.
+    pub log_profiled_evidence_ratio: f64,
+    /// `log_profiled_evidence_ratio + ln(π/(1 − π))` for the declared structural prior probability `π` of sharing.
+    pub log_profiled_odds: f64,
+    /// `logistic(log_profiled_odds)`: a share SCORE in `(0, 1)` monotone in the profiled ratio. It is not
+    /// `P(shared | y)`, because the ratio it is built from is not a Bayes factor.
+    pub share_score: f64,
+}
+
 /// The REML arm's comparison with its fitted smoothing strengths, where they sit, and its resolution.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemlReuseComparison {
-    /// The comparison. Each log evidence is `log p(y | λ̂, σ̂²)`: the negative minimized REML cost of the whitened
-    /// problem less `½Σ ln r_i` for the declared noise shape.
-    pub comparison: ReuseComparison,
+    /// The comparison. Each profiled log evidence is `log p(y | λ̂, σ̂²)`: the negative minimized REML cost of the
+    /// whitened problem less `½Σ ln r_i` for the declared noise shape.
+    pub comparison: ProfiledReuseComparison,
     /// `λ̂` of the shared hypothesis under each declared alignment, one strength per penalty.
     pub alignment_lambdas: Vec<Array1<f64>>,
     /// Per shared fit, per penalty: where `ρ̂ = ln λ̂` sits in the REML owner's derived domain.
@@ -112,12 +155,15 @@ pub struct RemlReuseComparison {
     pub specialized_lambdas: Array1<f64>,
     /// Per penalty: where the specialized fit's `ρ̂` sits.
     pub specialized_rho_placement: Vec<GaussianRemlMultiPenaltyRhoPlacement>,
-    /// Bound on how far `comparison.log_bayes_factor` can sit from the exact profiled value: each fit's forward-error
-    /// bound (widened for the noise whitening) plus its optimality gap `½g_Fᵀ H_FF⁻¹ g_F` over the interior coordinates
-    /// `F` of `ρ̂`. The mixture over alignments is 1-Lipschitz in each alignment's evidence, so the shared side
-    /// contributes its largest bound. `None` when a fit's placement is unaudited or its interior Hessian block is not
-    /// positive definite: the verdict then has no established resolution.
-    pub log_bayes_factor_resolution: Option<f64>,
+    /// Bound on how far `comparison.log_profiled_evidence_ratio` can sit from the exact profiled value: each fit's
+    /// forward-error bound (widened for the noise whitening) plus its optimality gap `½g_Fᵀ H_FF⁻¹ g_F` over the
+    /// interior coordinates `F` of `ρ̂`. The mixture over alignments is 1-Lipschitz in each alignment's evidence, so
+    /// the shared side contributes its largest bound. `None` when a fit's placement is unaudited or its interior
+    /// Hessian block is not positive definite: the verdict then has no established resolution.
+    ///
+    /// It bounds the distance to the exact PROFILED ratio and nothing else. The distance from that ratio to a Bayes
+    /// factor is the `λ`-integral this arm does not take, which no rounding bound can measure.
+    pub log_profiled_ratio_resolution: Option<f64>,
 }
 
 /// Why a reuse comparison could not be computed.
@@ -268,24 +314,56 @@ fn shared_design(
     ))
 }
 
+/// The declared structural prior odds `ln(π/(1 − π))` added to a log ratio, and the logistic of the sum.
+///
+/// One transform, written once, so the two arms cannot apply it differently. What differs is what goes IN: a Bayes
+/// factor out of [`compare_reuse`], a profiled evidence ratio out of [`compare_reuse_reml`]. That is why the exact
+/// arm's outputs are named posterior odds and posterior probability and the REML arm's are not (#4556 P3).
+fn share_odds(log_ratio: f64, prior_share_probability: f64) -> (f64, f64) {
+    let log_odds = log_ratio + prior_share_probability.ln() - (-prior_share_probability).ln_1p();
+    (log_odds, logistic(log_odds))
+}
+
 fn assemble(
     log_evidence_shared: f64,
     alignment_log_evidence: Vec<f64>,
     log_evidence_specialized: f64,
     prior_share_probability: f64,
 ) -> ReuseComparison {
-    // Both arms pass normalized log evidences (exact under a declared prior, at each hypothesis' REML λ in
-    // `compare_reuse_reml`), so their difference is the log Bayes factor itself, not a raw `criterion_gap`.
+    // Both sides are exact marginal likelihoods under one declared proper prior, so their difference is the log
+    // Bayes factor itself, not a raw `criterion_gap`.
     let log_bayes_factor = log_evidence_shared - log_evidence_specialized;
-    let log_posterior_odds =
-        log_bayes_factor + prior_share_probability.ln() - (-prior_share_probability).ln_1p();
+    let (log_posterior_odds, posterior_share_probability) =
+        share_odds(log_bayes_factor, prior_share_probability);
     ReuseComparison {
         log_evidence_shared,
         alignment_log_evidence,
         log_evidence_specialized,
         log_bayes_factor,
         log_posterior_odds,
-        posterior_share_probability: logistic(log_posterior_odds),
+        posterior_share_probability,
+    }
+}
+
+fn assemble_profiled(
+    profiled_log_evidence_shared: f64,
+    alignment_profiled_log_evidence: Vec<f64>,
+    profiled_log_evidence_specialized: f64,
+    prior_share_probability: f64,
+) -> ProfiledReuseComparison {
+    // Both sides are maximized over their own smoothing strengths, so this difference is a profiled evidence ratio.
+    // The arithmetic is the exact arm's; the currency is not.
+    let log_profiled_evidence_ratio =
+        profiled_log_evidence_shared - profiled_log_evidence_specialized;
+    let (log_profiled_odds, share_score) =
+        share_odds(log_profiled_evidence_ratio, prior_share_probability);
+    ProfiledReuseComparison {
+        profiled_log_evidence_shared,
+        alignment_profiled_log_evidence,
+        profiled_log_evidence_specialized,
+        log_profiled_evidence_ratio,
+        log_profiled_odds,
+        share_score,
     }
 }
 
@@ -640,7 +718,7 @@ fn reml_fit(
 /// coefficients `γ_c` under a flat prior in BOTH hypotheses. The shared fit then uses `[diag(Φ_1N̂, …, Φ_mN̂) |
 /// Φ_1A_1U; …; Φ_mA_mU]` with penalties `diag(0, UᵀS_kU)`; the specialized fit uses `[diag(Φ_cN̂) | diag(Φ_cU)]` with
 /// `diag(0, UᵀS_kU, …, UᵀS_kU)` and the same `λ_k` for every context. Both integrate the same `m·k` flat coordinates,
-/// so the flat prior's arbitrary constant cancels from the Bayes factor. A penalty that does not annihilate the
+/// so the flat prior's arbitrary constant cancels from the ratio. A penalty that does not annihilate the
 /// declared null space is refused with [`ReuseError::NullSpaceNotAnnihilated`], and an undeclared null direction by the
 /// REML owner's structural rank check.
 pub fn compare_reuse_reml(
@@ -727,7 +805,7 @@ pub fn compare_reuse_reml(
     )?;
 
     Ok(RemlReuseComparison {
-        comparison: assemble(
+        comparison: assemble_profiled(
             log_evidence_shared,
             alignment_log_evidence,
             specialized.log_evidence,
@@ -737,7 +815,7 @@ pub fn compare_reuse_reml(
         alignment_rho_placement,
         specialized_lambdas: specialized.lambdas,
         specialized_rho_placement: specialized.placement,
-        log_bayes_factor_resolution: shared_resolution
+        log_profiled_ratio_resolution: shared_resolution
             .zip(specialized.resolution)
             .map(|(shared, specialized)| shared + specialized),
     })
@@ -1240,18 +1318,18 @@ mod tests {
             )
             .expect("REML comparison");
             let resolution = reml
-                .log_bayes_factor_resolution
+                .log_profiled_ratio_resolution
                 .expect("every fit is audited with positive interior curvature");
-            let log_bayes_factor = reml.comparison.log_bayes_factor;
+            let log_profiled_ratio = reml.comparison.log_profiled_evidence_ratio;
             if favours_sharing {
                 assert!(
-                    log_bayes_factor > resolution,
-                    "{label}: REML log Bayes factor {log_bayes_factor:e} must favour sharing beyond {resolution:e}"
+                    log_profiled_ratio > resolution,
+                    "{label}: REML profiled evidence ratio {log_profiled_ratio:e} must favour sharing beyond {resolution:e}"
                 );
             } else {
                 assert!(
-                    log_bayes_factor < -resolution,
-                    "{label}: REML log Bayes factor {log_bayes_factor:e} must favour specialization beyond {resolution:e}"
+                    log_profiled_ratio < -resolution,
+                    "{label}: REML profiled evidence ratio {log_profiled_ratio:e} must favour specialization beyond {resolution:e}"
                 );
             }
             assert!(reml.specialized_lambdas[0] > 0.0 && reml.alignment_lambdas[0][0] > 0.0);
@@ -1304,12 +1382,12 @@ mod tests {
             compare_reuse_reml(&contexts, &penalties, intercept.view(), &alignments, 0.5)
                 .expect("REML comparison with a declared intercept");
         let resolution = offset_shape
-            .log_bayes_factor_resolution
+            .log_profiled_ratio_resolution
             .expect("every fit is audited with positive interior curvature");
         assert!(
-            offset_shape.comparison.log_bayes_factor > resolution,
-            "one shape at two offsets: REML log Bayes factor {:e} must favour sharing beyond {resolution:e}",
-            offset_shape.comparison.log_bayes_factor
+            offset_shape.comparison.log_profiled_evidence_ratio > resolution,
+            "one shape at two offsets: REML profiled evidence ratio {:e} must favour sharing beyond {resolution:e}",
+            offset_shape.comparison.log_profiled_evidence_ratio
         );
         assert_eq!(offset_shape.specialized_lambdas.len(), 2);
         assert_eq!(offset_shape.alignment_rho_placement[0].len(), 2);
@@ -1325,13 +1403,13 @@ mod tests {
         )
         .expect("REML comparison with a full-rank penalty");
         let control_resolution = shared_intercept
-            .log_bayes_factor_resolution
+            .log_profiled_ratio_resolution
             .expect("every fit is audited with positive interior curvature");
         assert!(
-            shared_intercept.comparison.log_bayes_factor < -control_resolution,
-            "a shared intercept across a 5-unit offset: REML log Bayes factor {:e} must favour specialization \
+            shared_intercept.comparison.log_profiled_evidence_ratio < -control_resolution,
+            "a shared intercept across a 5-unit offset: REML profiled evidence ratio {:e} must favour specialization \
              beyond {control_resolution:e}",
-            shared_intercept.comparison.log_bayes_factor
+            shared_intercept.comparison.log_profiled_evidence_ratio
         );
 
         // Control: opposite shapes still favour specialization with the intercepts free.
@@ -1341,12 +1419,12 @@ mod tests {
             compare_reuse_reml(&contexts, &penalties, intercept.view(), &alignments, 0.5)
                 .expect("REML comparison with a declared intercept");
         let opposite_resolution = opposite
-            .log_bayes_factor_resolution
+            .log_profiled_ratio_resolution
             .expect("every fit is audited with positive interior curvature");
         assert!(
-            opposite.comparison.log_bayes_factor < -opposite_resolution,
-            "opposite shapes: REML log Bayes factor {:e} must favour specialization beyond {opposite_resolution:e}",
-            opposite.comparison.log_bayes_factor
+            opposite.comparison.log_profiled_evidence_ratio < -opposite_resolution,
+            "opposite shapes: REML profiled evidence ratio {:e} must favour specialization beyond {opposite_resolution:e}",
+            opposite.comparison.log_profiled_evidence_ratio
         );
     }
 
@@ -1381,10 +1459,10 @@ mod tests {
         .expect("REML comparison in transformed coordinates");
 
         let band = original
-            .log_bayes_factor_resolution
+            .log_profiled_ratio_resolution
             .expect("every fit is audited with positive interior curvature")
             + transformed
-                .log_bayes_factor_resolution
+                .log_profiled_ratio_resolution
                 .expect("every fit is audited with positive interior curvature");
         let predicted_shift = 2.0 * 4.0_f64.ln();
         assert!(
@@ -1394,13 +1472,13 @@ mod tests {
         for (label, before, after) in [
             (
                 "shared",
-                original.comparison.log_evidence_shared,
-                transformed.comparison.log_evidence_shared,
+                original.comparison.profiled_log_evidence_shared,
+                transformed.comparison.profiled_log_evidence_shared,
             ),
             (
                 "specialized",
-                original.comparison.log_evidence_specialized,
-                transformed.comparison.log_evidence_specialized,
+                original.comparison.profiled_log_evidence_specialized,
+                transformed.comparison.profiled_log_evidence_specialized,
             ),
         ] {
             assert!(
@@ -1410,11 +1488,13 @@ mod tests {
             );
         }
         assert!(
-            (transformed.comparison.log_bayes_factor - original.comparison.log_bayes_factor).abs()
+            (transformed.comparison.log_profiled_evidence_ratio
+                - original.comparison.log_profiled_evidence_ratio)
+                .abs()
                 <= band,
-            "log Bayes factor {:e} vs {:e} must agree within {band:e}",
-            transformed.comparison.log_bayes_factor,
-            original.comparison.log_bayes_factor
+            "profiled evidence ratio {:e} vs {:e} must agree within {band:e}",
+            transformed.comparison.log_profiled_evidence_ratio,
+            original.comparison.log_profiled_evidence_ratio
         );
     }
 
