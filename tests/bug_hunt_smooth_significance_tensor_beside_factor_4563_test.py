@@ -28,8 +28,11 @@ be found in the first and not manufactured in the second.
 the measurement there read 5.1 s to fit and 21.7 s to replay at 500 rows, and
 the number of scales -- which is what selects this route -- does not depend on
 ``n``. To read the sweep count the stop must eventually be denominated against,
-run this file under ``GAMFIT_LOG=debug`` and grep for
-``[#4563 multiscale selection]``.
+lower the ``gamfit`` logger to DEBUG, since no environment variable does it
+(``pytest -o log_cli=true --log-cli-level=DEBUG`` on this file, then grep for
+``[#4563 multiscale selection]``), or run
+``experiments/smooth_significance_te_beside_factor_4563.py``, which prints the
+record per ``n``.
 """
 
 from __future__ import annotations
