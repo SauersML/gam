@@ -1266,8 +1266,9 @@ mod evidence_root_gauge_projection_2822_tests {
             RefinedRootVerdict::Refused(RefinedRootRefusal::DecrementAboveTolerance {
                 relative, ..
             }) => assert!(
-                relative > SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL,
-                "the refusal must carry a decrement above the tolerance, got ½λ²/scale {relative:.3e}"
+                !SaeManifoldTerm::inner_decrement_certifies(relative),
+                "the refusal must carry a decrement its own resolution refuses, got ½λ² in \
+                 units of the resolution {relative:.3e}"
             ),
             other => panic!(
                 "a state displaced along its stiffest direction must refuse on its exact \

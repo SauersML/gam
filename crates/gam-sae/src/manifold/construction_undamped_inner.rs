@@ -357,7 +357,9 @@ impl SaeManifoldTerm {
         // evaluation may earn (the geometric-progress gate below is the real
         // bound; the cap only guards against a certificate oscillating around
         // the progress threshold).
-        let mut last_limit_certificate: Option<f64> = None;
+        // The previous window's measure, kept as the measure itself: the contraction
+        // test below compares two measures taken at one resolution (#3355).
+        let mut last_limit_certificate: Option<SaeDecrementAgainstResolution> = None;
         let mut certificate_escalations = 0usize;
         // #2080 -- the polish-paid window granted at the budget-exhaustion branch
         // below is gated on `terminal_newton_polish_armed`, a FLAG that any
@@ -994,7 +996,8 @@ impl SaeManifoldTerm {
                         }
                     }
                     let certificate_improving = last_limit_certificate.is_none_or(|previous| {
-                        predicted_relative_decrease <= CERTIFICATE_ESCALATION_PROGRESS * previous
+                        predicted_relative_decrease.value()
+                            <= CERTIFICATE_ESCALATION_PROGRESS * previous.value()
                     });
                     if certificate_improving
                         && certificate_escalations < CERTIFICATE_ESCALATION_ANTI_RUNAWAY_CAP

@@ -43,6 +43,7 @@ use crate::migration_ledger::{BirthSeed, MoveEvidence, MoveStage, SaeMigrationLe
 use crate::structure_harvest;
 use crate::tiered::Tier0Mean;
 
+use super::SaeDecrementAgainstResolution;
 use super::{
     AmortizedEncoderConsistency, ChartDegeneracyReport,
     ChartNondegeneracyCertificate, CoordinateFidelityCertificate, CrossFitConfig,
