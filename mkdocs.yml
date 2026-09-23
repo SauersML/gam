@@ -8,7 +8,7 @@ edit_uri: edit/main/docs/
 
 docs_dir: docs
 
-# Engineering ledgers (issue progress notes, test censuses, removal evidence)
+# Engineering notes (issue progress notes, test censuses, removal policy)
 # live beside the user docs in the repository but are not part of the
 # published site.
 exclude_docs: |
@@ -16,7 +16,6 @@ exclude_docs: |
   test-census-*
   test-integrity.md
   public-api-*
-  source-removal-changes.json
 
 extra_css:
   - stylesheets/extra.css
