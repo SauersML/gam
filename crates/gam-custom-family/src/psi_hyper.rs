@@ -4378,67 +4378,6 @@ fn mode_profile_exhausted_error(
     }
 }
 
-/// The start past the saddle the PUBLISHED mode's own fold record names (gam#3173).
-///
-/// It is read off the mode the rule would publish among the evaluation's starts, and off no other.
-/// A fold reaches the criterion only through the mode it publishes, so that is the one mode whose
-/// fold needs a way out. A losing mode is the incumbent's more often than not, and which basin the
-/// incumbent sits in is the walk's choice: a probe seeded off it hands the selection a mode that
-/// only walks carrying that incumbent ever see, so two walks whose starts published the same mode
-/// at one θ would publish different values there — the criterion gam#3173 reports as not a
-/// function of θ. It also spends a solve where nothing folds: on the double well at ρ = 0.5 the
-/// shallow incumbent's share is 1.46 and the published deep mode's 0.42, so the probe re-solved
-/// the deep mode the fit's fixed start had already certified.
-///
-/// A mode whose Laplace series' leading correction along its softest direction is not below the
-/// term it corrects sits within `5/36` of a log-likelihood unit of the saddle bounding its basin
-/// ([`InnerModeFold::barrier_is_below_its_own_correction`]), and the cubic model places that saddle
-/// at `s* = −2σ/t₃`. This is `β̂ + 2s*·v`: past it, so an inner solve started there descends into
-/// the neighbouring basin where one exists and returns to `β̂` where it does not. At a saddle-node
-/// fold the vanishing minimum and the saddle coincide, and the mountain-pass inequality then puts
-/// the rival basin strictly below — which is why the probe is worth exactly one solve there and
-/// none anywhere else.
-///
-/// The displacement is in the stacked coefficient frame the mode-response operator acts on, so it
-/// is split across the blocks by their own widths, and a displacement of any other length names no
-/// start. The probe carries NO active set: it is aimed at another basin, and this mode's active
-/// constraints are this basin's.
-fn fold_crossing_seed(
-    rho_current: &Array1<f64>,
-    published: &OuterObjectiveEvalResult,
-) -> Option<ConstrainedWarmStart> {
-    let fold = published.inner_mode_fold.as_ref()?;
-    if !fold.barrier_is_below_its_own_correction() {
-        return None;
-    }
-    let displacement = fold.saddle_crossing_displacement()?;
-    let width: usize = published
-        .inner
-        .block_states
-        .iter()
-        .map(|state| state.beta.len())
-        .sum();
-    if displacement.len() != width || displacement.iter().any(|value| !value.is_finite()) {
-        return None;
-    }
-    let mut offset = 0usize;
-    let mut block_beta = Vec::with_capacity(published.inner.block_states.len());
-    for state in &published.inner.block_states {
-        let end = offset + state.beta.len();
-        let mut beta = state.beta.clone();
-        beta += &displacement.slice(s![offset..end]);
-        offset = end;
-        block_beta.push(beta);
-    }
-    let blocks = block_beta.len();
-    Some(ConstrainedWarmStart {
-        rho: rho_current.clone(),
-        block_beta,
-        active_sets: vec![None; blocks],
-        cached_inner: None,
-    })
-}
-
 /// The starts one exact-joint evaluation solves its candidate modes from (gam#3173).
 ///
 /// The caller is the driver's coefficient-mode branch (gam-models'

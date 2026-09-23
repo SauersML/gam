@@ -1,5 +1,21 @@
 ## Unreleased
 
+- **A custom-family outer evaluation outside the branch continuation published a mode at its fold
+  with no way out of its basin** (gam#3173). The cf-inner route (`evaluate_on_branch`) follows the
+  walk's branch to its fold and hands over there only where the single-block continuation covers
+  the family's solve. For every other family — two coupled blocks, a Hessian-vector workspace, a
+  joint penalty or a Jeffreys term — nothing followed the published mode toward its fold, so a
+  mode whose barrier was vanishing stayed published, and its `½log σ` fell without bound, unless
+  a fixed start happened to land in the rival basin. The exact-joint evaluator already spent one
+  start past the published mode's saddle where that mode's own fold record says its barrier is
+  below its Laplace correction. That rule (`fold_crossing_seed`, now in `mode_selection.rs`) is
+  now spent on the cf-inner route too, wherever the continuation does not cover the solve: the
+  crossing's mode replaces the published one only when its penalized `f` is resolvably below it,
+  the criterion is re-priced there, and the published mode's excess over it is handed to the
+  #2939 stratum rule as `incumbent_mode_excess`. The probe costs one inner solve on an evaluation
+  whose published mode's share is at or above one, and a second pricing only where the crossing
+  wins; covered single-block families are unchanged.
+
 - **Exact block Gaussian REML (`gaussian_reml_fit_blocks_forward`) returns a numerically
   stationary smoothing optimum, so its analytic backward is exact.** The forward certified its
   outer search at the criterion's statistical resolution `1/(2n)`. That left `|∂V/∂ρ|` near `1e-3`

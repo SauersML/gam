@@ -2241,3 +2241,175 @@ fn the_start_past_the_saddle_is_spent_from_the_published_mode_3173() {
         "the closed form orders the deep minimum below the shallow one"
     );
 }
+
+/// The tilted double well beside a second, quadratic block that does not couple to it:
+/// `f(β, γ; ρ) = (β² − 1)² + cβ + ½(γ − 1)² + ½e^{ρ₀}β² + ½e^{ρ₁}γ²`.
+///
+/// Its modes in `β` are the double well's at `ρ₀`, and `γ̂ = 1/(1 + e^{ρ₁})` whichever well `β`
+/// sits in. Two blocks put the family's solve outside the single-block continuation
+/// ([`single_block_newton_region_probe_applies`]), so no branch is followed to its fold on the
+/// cf-inner route and the published mode's own fold record is the only way out of its basin.
+#[derive(Clone)]
+struct DecoupledTwoBlockDoubleWellFamily;
+
+impl DecoupledTwoBlockDoubleWellFamily {
+    fn coefficients(block_states: &[ParameterBlockState]) -> Result<(f64, f64), String> {
+        let first = |index: usize| {
+            block_states
+                .get(index)
+                .and_then(|state| state.beta.first().copied())
+                .ok_or_else(|| format!("missing coefficient of block {index}"))
+        };
+        Ok((first(0)?, first(1)?))
+    }
+}
+
+impl CustomFamily for DecoupledTwoBlockDoubleWellFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let (beta, gamma) = Self::coefficients(block_states)?;
+        let well = beta * beta - 1.0;
+        Ok(FamilyEvaluation {
+            log_likelihood: -(well * well + TILT * beta + 0.5 * (gamma - 1.0) * (gamma - 1.0)),
+            blockworking_sets: vec![
+                BlockWorkingSet::ExactNewton {
+                    gradient: array![-(4.0 * beta * beta * beta - 4.0 * beta + TILT)],
+                    hessian: SymmetricMatrix::Dense(array![[12.0 * beta * beta - 4.0]]),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: array![-(gamma - 1.0)],
+                    hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                },
+            ],
+        })
+    }
+
+    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+        true
+    }
+
+    /// The two blocks share no term, so the joint Hessian is the block diagonal: the outer
+    /// evaluator's joint path may assemble it, where a coupled two-block family would be refused.
+    fn likelihood_blocks_uncoupled(&self) -> bool {
+        true
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        let (beta, _) = Self::coefficients(block_states)?;
+        Ok(Some(array![[12.0 * beta * beta - 4.0, 0.0], [0.0, 1.0]]))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        direction: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let (beta, _) = Self::coefficients(block_states)?;
+        let step = direction.first().copied().unwrap_or(0.0);
+        Ok(Some(array![[24.0 * beta * step, 0.0], [0.0, 0.0]]))
+    }
+}
+
+/// The quadratic block's spec: seeded at zero, one ridge penalty.
+fn decoupled_quadratic_spec() -> ParameterBlockSpec {
+    ParameterBlockSpec {
+        name: "quadratic".to_string(),
+        ..double_well_spec(0.0)
+    }
+}
+
+/// #3173 on the cf-inner route: where no continuation follows the family's solve to its fold,
+/// the published mode's own fold record spends one start past its saddle, and the crossing is
+/// published where its `f` is lower.
+///
+/// Both arms solve from the caller's seed in the shallow well and nothing else, so without the
+/// probe the shallow mode is published at every ρ where it exists. At ρ₀ = 0.5 its closed-form
+/// cubic share is above one: the probe is spent, crosses into the deep well, and the deep mode is
+/// published, with the shallow mode's excess over it handed to the stratum rule. At ρ₀ = 0 the
+/// share is below one: no probe is spent and the shallow mode is published although the deep one
+/// is lower, so it is the share, not the existence of a lower basin, that spends the solve. The
+/// quadratic block's ρ₁ = 2 keeps its curvature `1 + e²` above the shallow mode's at both points,
+/// so the softest direction the fold record grades is the double well's. The single-block double
+/// well is the covered arm: there the continuation owns the fold, and
+/// `the_published_mode_is_the_lowest_penalized_mode_among_the_starts_3173` publishes the shallow
+/// mode from the same seed at ρ = 0.5.
+#[test]
+fn an_uncontinued_published_mode_is_probed_past_its_saddle_3173() {
+    let family = DecoupledTwoBlockDoubleWellFamily;
+    let specs = [double_well_spec(2.0), decoupled_quadratic_spec()];
+    let options = double_well_options();
+    assert!(
+        !single_block_newton_region_probe_applies(&family, &specs, &options),
+        "two blocks lie outside the continuation, which is the regime this test is about"
+    );
+    let penalty_counts: Vec<usize> = specs.iter().map(|spec| spec.penalties.len()).collect();
+    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
+        .expect("two-penalty label layout");
+    let quadratic_rho: f64 = 2.0;
+    let evaluate = |well_rho: f64| {
+        evaluate_on_branch(
+            &family,
+            &specs,
+            &options,
+            &layout,
+            &array![well_rho, quadratic_rho],
+            ModeStarts {
+                incumbent: None,
+                fixed: &[],
+            },
+            &gam_problem::RhoPrior::Flat,
+            EvalMode::ValueAndGradient,
+        )
+        .expect("an evaluation from the shallow seed certifies a mode")
+    };
+    for well_rho in [0.0, 0.5] {
+        let points = double_well_stationary_points_2973(well_rho);
+        assert_eq!(points.len(), 3, "both wells are minima at rho0={well_rho}");
+        let shallow = points[2];
+        let sigma = 12.0 * shallow * shallow - 4.0 + well_rho.exp();
+        assert!(
+            sigma < 1.0 + quadratic_rho.exp(),
+            "the shallow mode's curvature is the softest at rho0={well_rho}"
+        );
+        assert!(
+            double_well_penalized_objective_3173(well_rho, points[0])
+                < double_well_penalized_objective_3173(well_rho, shallow),
+            "the closed form orders the deep minimum below the shallow one at rho0={well_rho}"
+        );
+    }
+
+    assert!(
+        double_well_cubic_share_3173(0.5, double_well_stationary_points_2973(0.5)[2]) >= 1.0,
+        "the shallow mode's barrier is below its own correction at rho0=0.5"
+    );
+    let crossed = evaluate(0.5);
+    let crossed_beta = crossed.warm_start.block_beta[0][0];
+    assert!(
+        is_deep_mode_2973(0.5, crossed_beta),
+        "the start past the shallow mode's saddle reaches the deep well, which is published; got \
+         {crossed_beta}"
+    );
+    assert!(
+        crossed.incumbent_mode_excess.is_some_and(|excess| excess > 0.0),
+        "the shallow mode the seed reached sat above the published one: {:?}",
+        crossed.incumbent_mode_excess
+    );
+
+    assert!(
+        double_well_cubic_share_3173(0.0, double_well_stationary_points_2973(0.0)[2]) < 1.0,
+        "the shallow mode's barrier is not below its own correction at rho0=0"
+    );
+    let kept = evaluate(0.0);
+    let kept_beta = kept.warm_start.block_beta[0][0];
+    assert!(
+        is_shallow_mode_2973(0.0, kept_beta),
+        "below the share's threshold no probe is spent and the seed's shallow mode is published; \
+         got {kept_beta}"
+    );
+    assert_eq!(
+        kept.incumbent_mode_excess, None,
+        "a mode published without a selection names no excess"
+    );
+}

@@ -4064,5 +4064,13 @@
     ],
     "reason": "deb6da876e: exact block Gaussian REML now minimises its exact profiled jet with certified_newton_minimum (GaussianRemlBlocksProfile::jet); the two private OuterProblem adapters that fed the generic outer runner have no caller left.",
     "evidence": "git grep for both names at deb6da876e finds no occurrence outside the removed definitions; cargo check --workspace --all-targets green (gateB lane)."
+  },
+  {
+    "base": "dcdb56f3217a51a437e1840ac52bc048c4fc19fd",
+    "items": [
+      "crates/gam-custom-family/src/psi_hyper.rs:fn:fold_crossing_seed"
+    ],
+    "reason": "gam#3173: fold_crossing_seed is moved, not deleted. It now lives in crates/gam-custom-family/src/mode_selection.rs as pub(crate), because both the exact-joint evaluator in psi_hyper.rs and evaluate_on_branch in branch_continuation.rs spend it.",
+    "evidence": "The body is unchanged. psi_hyper.rs's call sites resolve to mode_selection::fold_crossing_seed. cargo check --workspace --all-targets is rc=0 on MSI at 09d870cc78 with the patch, and the full gam-custom-family --lib suite has the same 6 reds as origin/main."
   }
 ]

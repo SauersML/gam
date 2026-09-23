@@ -592,6 +592,12 @@ fn certified_mode<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// selection. The evaluation refuses only when no start certified a mode, and then with the
 /// incumbent's refusal. Any other error is a failure of the evaluation, not of a start, and is
 /// returned as it is.
+///
+/// Where the continuation does not cover the family's solve, nothing follows the published mode to
+/// its fold, so the published mode's own fold record is read after it is priced: where its barrier
+/// is below its own Laplace correction, one more start past its saddle is solved
+/// ([`fold_crossing_seed`]), and its mode replaces the published one only when its `f` is
+/// resolvably below it, which re-prices the criterion there.
 pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -664,24 +670,30 @@ pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static
         },
         None => direct(starts.incumbent).map_err(dropped_or_failed),
     };
+    // The penalty roots at this θ, the same the solves evaluated `½βᵀS_λβ` on (#2954). Built
+    // only where two modes are compared.
+    let penalty_roots = || -> Result<BlockPenaltyRoots, CustomFamilyError> {
+        let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
+        let per_block = split_log_lambdas(&physical_rho, &layout.penalty_counts)?;
+        BlockPenaltyRoots::new(
+            specs,
+            &per_block,
+            labeled_options.joint_penalties.as_deref(),
+        )
+    };
     // How far the incumbent's own mode sat above the published one, where the published one is
     // another start's (gam#3173). It is the evidence the stratum rule needs to tell a trial that
     // merely wandered to another kept rank from one that is on the branch this run is not.
     let mut incumbent_mode_excess: Option<f64> = None;
+    // The incumbent's own penalized objective, where a selection priced it.
+    let mut incumbent_penalized: Option<PenalizedObjective> = None;
     let published = if rivals.is_empty() {
         match incumbent {
             Ok(inner) => inner,
             Err(Ok(refusal) | Err(refusal)) => return Err(refusal),
         }
     } else {
-        // The penalty roots at this θ, the same the solves evaluated `½βᵀS_λβ` on (#2954).
-        let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
-        let per_block = split_log_lambdas(&physical_rho, &layout.penalty_counts)?;
-        let roots = BlockPenaltyRoots::new(
-            specs,
-            &per_block,
-            labeled_options.joint_penalties.as_deref(),
-        )?;
+        let roots = penalty_roots()?;
         let candidate = |start: ModeStart, inner: BlockwiseInnerResult| {
             penalized_objective_at_mode(family, specs, &roots, &inner).map(|penalized_objective| {
                 ModeCandidate {
@@ -692,7 +704,6 @@ pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static
             })
         };
         let mut candidates = Vec::new();
-        let mut incumbent_penalized: Option<PenalizedObjective> = None;
         let incumbent_refusal = match incumbent {
             Ok(inner) => {
                 let incumbent_candidate = candidate(ModeStart::Incumbent, inner)?;
@@ -756,6 +767,61 @@ pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static
     let mut result = outerobjective_from_coefficient_mode_labeled(
         family, specs, options, layout, rho, rho_prior, published, eval_mode,
     )?;
+    // gam#3173: one start past the saddle of the published mode, where its own fold record says
+    // the barrier to the next basin is below the correction the Laplace series makes for it
+    // ([`fold_crossing_seed`]). Where the continuation covers the family's solve, the walk's
+    // branch is followed to its fold and hands over there (`FoldReached` above), and that is this
+    // route's one handover. Everywhere else nothing follows the published mode toward its fold,
+    // so without the probe a mode whose barrier is vanishing is published until `½log σ` falls
+    // without bound, unless a fixed start happens to land in the rival basin. The probe is one
+    // more candidate and nothing else: its mode is published only when its `f` is resolvably
+    // below the published one's, and a probe that certifies no mode discovers nothing.
+    if !continuation_covers(family, specs, options, layout)
+        && let Some(seed) = fold_crossing_seed(rho, &result)
+    {
+        match direct(Some(&seed)) {
+            Ok(crossed) => {
+                let roots = penalty_roots()?;
+                let published_f =
+                    penalized_objective_at_mode(family, specs, &roots, &result.inner)?;
+                let crossed_f = penalized_objective_at_mode(family, specs, &roots, &crossed)?;
+                if crossed_f.resolvably_below(&published_f) {
+                    log::debug!(
+                        "[mode selection #3173] rho=[{}]: the start past the published mode's \
+                         saddle certified f={:.9e}, below its f={:.9e}; published the crossing",
+                        join_rho(rho),
+                        crossed_f.value,
+                        published_f.value,
+                    );
+                    // With no rival the published mode was the incumbent's own.
+                    let incumbent_f = if rivals.is_empty() {
+                        Some(published_f)
+                    } else {
+                        incumbent_penalized
+                    };
+                    incumbent_mode_excess =
+                        incumbent_f.map(|incumbent| incumbent.value - crossed_f.value);
+                    result = outerobjective_from_coefficient_mode_labeled(
+                        family, specs, options, layout, rho, rho_prior, crossed, eval_mode,
+                    )?;
+                } else {
+                    log::debug!(
+                        "[mode selection #3173] rho=[{}]: the start past the published mode's \
+                         saddle found no lower mode (f={:.9e} against {:.9e})",
+                        join_rho(rho),
+                        crossed_f.value,
+                        published_f.value,
+                    );
+                }
+            }
+            Err(refusal) if refusal.is_trial_point_infeasible() => log::debug!(
+                "[mode selection #3173] rho=[{}]: the start past the published mode's saddle \
+                 certified no mode: {refusal}",
+                join_rho(rho)
+            ),
+            Err(error) => return Err(error),
+        }
+    }
     result.incumbent_mode_excess = incumbent_mode_excess;
     Ok(result)
 }
