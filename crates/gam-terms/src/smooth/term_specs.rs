@@ -745,6 +745,21 @@ pub struct ParametricResidualizationChart {
     pub coefficient_transform: Array2<f64>,
     /// `R`, `q × k`, stated against the RAW constraint columns.
     pub correction: Array2<f64>,
+    /// Whether `correction` has stopped being the value of the fixed projection
+    /// on this term's design: set when an outer search moves the term's own
+    /// basis parameters (its length scale or anisotropy) on a frozen spec.
+    ///
+    /// `R` is a function of the realized design, so it moves with those
+    /// parameters while `C` and `T` do not (the gauge's own contract,
+    /// `X_g(ψ) = P_C·X_local(ψ)·T0`). A frozen `R` replayed at a moved ψ forms
+    /// `X(ψ)·T0 − C·R(ψ₀)`, which is not orthogonal to `C` and is not the design
+    /// the outer search's incremental realizer or its ψ-derivatives describe
+    /// (#2747, #3171). A stale correction is re-derived on the rows being built,
+    /// which are the training rows whenever a search moved ψ; prediction never
+    /// moves ψ and keeps the fit's `R` bit for bit. Never serialized: a saved
+    /// chart is always current.
+    #[serde(skip)]
+    pub correction_is_stale: bool,
 }
 
 /// Which construction `apply_global_smooth_identifiability` chose to make one
@@ -3548,9 +3563,15 @@ pub fn set_spatial_length_scale(
     term_idx: usize,
     length_scale: f64,
 ) -> Result<(), EstimationError> {
+    let moved = get_spatial_length_scale(spec, term_idx) != Some(length_scale);
     let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
         crate::bail_invalid_estim!("spatial length-scale term index {term_idx} out of range");
     };
+    // The term's design moves with its length scale, and its frozen row-space
+    // correction with it (see `ParametricResidualizationChart::correction_is_stale`).
+    if moved && let Some(chart) = term.frozen_parametric_residualization.as_mut() {
+        chart.correction_is_stale = true;
+    }
     match &mut term.basis {
         SmoothBasisSpec::ThinPlate { spec, .. } => {
             spec.length_scale = length_scale;
@@ -4251,6 +4272,18 @@ pub fn set_spatial_aniso_log_scales(
     let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
         crate::bail_invalid_estim!("spatial aniso_log_scales term index {term_idx} out of range");
     };
+    let current = match &term.basis {
+        SmoothBasisSpec::Matern { spec, .. } => spec.aniso_log_scales.as_ref(),
+        SmoothBasisSpec::Duchon { spec, .. } => spec.aniso_log_scales.as_ref(),
+        _ => None,
+    };
+    // The term's design moves with its anisotropy, and its frozen row-space
+    // correction with it (see `ParametricResidualizationChart::correction_is_stale`).
+    if current != Some(&eta)
+        && let Some(chart) = term.frozen_parametric_residualization.as_mut()
+    {
+        chart.correction_is_stale = true;
+    }
     match &mut term.basis {
         SmoothBasisSpec::Matern { spec, .. } => {
             spec.aniso_log_scales = Some(eta);

@@ -16,6 +16,15 @@
   where the kernel's own is `+1.0e−5`, so it was refused or shipped wrong. The tail bound now
   carries across structurally vanishing orders, and the reduced kernel matches the direct
   partial-fraction value, less its annihilated head, at every radius.
+- **An outer search that moves a frozen smooth's length scale re-derives its parametric
+  residualization instead of replaying the fit's** (gam#2433, gam#3171). A frozen spec replays the
+  row-space correction `R` that made the smooth orthogonal to the intercept and linear terms, but
+  `R` is a function of the design and moves with the length scale. A full rebuild at a moved scale
+  shipped `X(ψ)·T − C·R(ψ₀)`, which is not orthogonal to `C`. The transformation-normal κ search
+  then read its monotonicity cone from that design while its ψ-rate described the
+  re-orthogonalized one. Moving the length scale or anisotropy now marks `R` stale, the rebuild
+  re-derives it on the training rows, and a later freeze keeps the re-derived one. Prediction
+  replays the fit's `R` bit for bit.
 
 - **A constrained fit's smoothing-corrected posterior is the θ-mixture of its cone-truncated
   laws, and the fit and the predictor read that one object** (gam#3229). Before this, a

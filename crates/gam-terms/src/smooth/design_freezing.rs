@@ -732,7 +732,15 @@ pub fn freeze_term_collection_from_design(
         // is the direct statement — it is what put the collection on the replay
         // path in the first place — and this loop has not written to it yet, so
         // it still holds the INPUT spec's value here.
-        if term.frozen_parametric_residualization.is_some() {
+        if let Some(chart) = term.frozen_parametric_residualization.as_ref() {
+            // A replay whose term an outer search moved re-derived its row-space
+            // correction on the rows it was built from; the freeze keeps the
+            // correction the design applied, not the one the spec carried
+            // before the move, or a saved model would replay an `R` of a design
+            // it no longer has (#3171).
+            if chart.correction_is_stale {
+                term.frozen_parametric_residualization = fitted.parametric_residualization.clone();
+            }
             continue;
         }
         // Factor-smooth kinds cannot absorb the collection chart into their

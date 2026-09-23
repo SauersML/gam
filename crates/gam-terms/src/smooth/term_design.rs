@@ -1764,6 +1764,7 @@ pub fn place_term_in_collection_gauge(
         has_parametric_block: gauge.has_parametric_block,
         coefficient_transform: realized.coefficient_transform.clone(),
         correction: realized.residualization.row_space_correction.clone(),
+        correction_is_stale: false,
     });
     Ok(CollectionGaugedTerm {
         design: realized.design,
@@ -2408,6 +2409,9 @@ fn apply_global_smooth_identifiability(
         // here: `C` is rebuilt below for the correction, `T0` and the owner list
         // are on the chart, and the local chart and `Q` are on the term.
         let mut replay_gauge: Option<SmoothCollectionGauge> = None;
+        // The correction a stale replay re-derived on these rows, re-exported
+        // on the chart below.
+        let mut rederived_correction: Option<Array2<f64>> = None;
         let replay_local_columns = design_local.ncols();
         let (design_constrained, z_opt) = if let Some(gauge) = collection_gauge.as_ref() {
             // This term takes a gauge, so it is realized through the one entry
@@ -2490,18 +2494,35 @@ fn apply_global_smooth_identifiability(
                         coefficient_transform: chart.coefficient_transform.clone(),
                         local_columns: replay_local_columns,
                     });
-                    if block.ncols() != chart.correction.nrows() {
+                    // A chart whose term an outer search moved carries an `R`
+                    // of the design it no longer has; the correction is the
+                    // value of the fixed projection on THIS design, re-derived
+                    // on these rows exactly as the gauge placement forms it
+                    // (`realize_smooth_collection_gauge`). Otherwise it is the
+                    // fit's, replayed bit for bit (#3001).
+                    let correction = if chart.correction_is_stale {
+                        let projector =
+                            crate::basis::FixedRowSpaceProjector::from_constraint_block(
+                                block.view(),
+                            )?;
+                        let fresh = projector.row_space_correction(&design_transformed, &term.name)?;
+                        rederived_correction = Some(fresh.clone());
+                        fresh
+                    } else {
+                        chart.correction.clone()
+                    };
+                    if block.ncols() != correction.nrows() {
                         gam_problem::bail_dim_basis!(
                             "frozen parametric residualization mismatch for term '{}': rebuilt constraint block has {} columns but the persisted fit-time correction has {} rows",
                             term.name,
                             block.ncols(),
-                            chart.correction.nrows()
+                            correction.nrows()
                         );
                     }
                     subtract_row_space_correction(
                         design_transformed,
                         block.view(),
-                        chart.correction.view(),
+                        correction.view(),
                         &term.name,
                     )?
                 }
@@ -2570,8 +2591,20 @@ fn apply_global_smooth_identifiability(
                 has_parametric_block: parametric_block.is_some(),
                 coefficient_transform: plan.coefficient_transform.clone(),
                 correction: plan.row_space_correction.clone(),
+                correction_is_stale: false,
             })
-            .or_else(|| replay_correction.cloned());
+            .or_else(|| {
+                // A replay re-exports its chart, with the correction it
+                // actually applied: the frozen one, or the one re-derived from
+                // these rows when a search had moved the term (#3171).
+                replay_correction.map(|chart| ParametricResidualizationChart {
+                    correction: rederived_correction
+                        .clone()
+                        .unwrap_or_else(|| chart.correction.clone()),
+                    correction_is_stale: false,
+                    ..chart.clone()
+                })
+            });
         // A derived gauge when the collection decided one, the replayed gauge
         // when it replayed a chart; never both, because `plan` is `Absent`
         // exactly when a chart is in play.
