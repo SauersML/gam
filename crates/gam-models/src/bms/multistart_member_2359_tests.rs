@@ -56,7 +56,6 @@ pub(super) fn rigid_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlo
         policy: policy.clone(),
         cell_moment_lru: new_cell_moment_lru_cache(&policy),
         cell_moment_cache_stats: new_cell_moment_cache_stats(),
-        jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
         intercept_warm_starts: Some(
             new_intercept_warm_start_cache_on_law(&LatentMeasureKind::StandardNormal, n)
                 .expect("an intercept cache on the standard-normal law"),
@@ -194,7 +193,6 @@ fn flex_fixture() -> (BernoulliMarginalSlopeFamily, Array2<f64>, Array2<f64>, us
         policy: policy.clone(),
         cell_moment_lru: new_cell_moment_lru_cache(&policy),
         cell_moment_cache_stats: new_cell_moment_cache_stats(),
-        jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
         intercept_warm_starts: Some(
             new_intercept_warm_start_cache_on_law(&LatentMeasureKind::StandardNormal, n)
                 .expect("an intercept cache on the standard-normal law"),

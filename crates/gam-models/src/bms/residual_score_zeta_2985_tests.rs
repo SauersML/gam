@@ -143,7 +143,6 @@ impl Fixture {
             policy: policy.clone(),
             cell_moment_lru: new_cell_moment_lru_cache(&policy),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),

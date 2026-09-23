@@ -121,7 +121,6 @@ fn default_test_family() -> BernoulliMarginalSlopeFamily {
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cell_moment_lru: Arc::new(exact_kernel::CellMomentLruCache::new(1024)),
         cell_moment_cache_stats: Arc::new(exact_kernel::CellMomentCacheStats::default()),
-        jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
         intercept_warm_starts: None,
         auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         auto_subsample_last_rho: Arc::new(std::sync::Mutex::new(None)),

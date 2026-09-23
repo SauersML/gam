@@ -30,11 +30,6 @@ pub(super) struct BernoulliMarginalSlopeFamily {
     /// eviction never changes numerical results.
     pub(super) cell_moment_lru: Arc<exact_kernel::CellMomentLruCache>,
     pub(super) cell_moment_cache_stats: Arc<exact_kernel::CellMomentCacheStats>,
-    /// Fit-lifetime pools of runtime-sized jet workspaces for the empirical
-    /// FLEX third and fourth contractions and the third trace. Idle
-    /// workspaces are charged to the governor and freed with the fit's
-    /// families (gam#2989).
-    pub(super) jet_scratch: Arc<super::hessian_paths::JetScratch>,
     /// Per-row warm-start cache for the scalar intercept root-finder
     /// (`solve_row_intercept_base`). The intercept `a` is solved per row at
     /// every inner PIRLS iteration; without a warm start, each call burns

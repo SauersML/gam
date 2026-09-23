@@ -50,6 +50,13 @@ use gam_math::probability::{
     normal_cdf, normal_cdf_and_pdf, normal_logcdf, normal_pdf,
     signed_probit_logcdf_and_mills_ratio,
 };
+use gam_math::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
+use gam_math::special::logaddexp;
+use crate::cubic_cell_kernel::{
+    DenestedCubicCell, NON_AFFINE_VALUE_TERM_OPERATIONS, TERMINAL_GL_ORDER,
+    visit_cell_log_quadrature,
+};
+use crate::marginal_slope_shared::eval_coeff4_at;
 use smallvec::SmallVec;
 
 /// `|log-residual|` at which the anchoring equation counts as solved. The
@@ -814,17 +821,32 @@ impl CalibrationTailSum {
     /// derivatives.
     #[inline]
     pub(crate) fn push(&mut self, weight: f64, eta: f64, eta_a: f64, eta_aa: f64) {
-        let tail_arg = if self.survival_side { -eta } else { eta };
-        let curvature = eta_aa - eta * eta_a * eta_a;
         if !self.log_space {
+            let tail_arg = if self.survival_side { -eta } else { eta };
+            let curvature = eta_aa - eta * eta_a * eta_a;
             let pdf = normal_pdf(eta);
             self.tail += weight * normal_cdf(tail_arg);
             self.density += weight * pdf * eta_a;
             self.density_slope += weight * pdf * curvature;
             return;
         }
+        self.push_log_weight(weight.ln(), eta, eta_a, eta_aa);
+    }
+
+    /// [`Self::push`] with the node's weight given as its logarithm, for a
+    /// law whose weights are themselves below `f64::MIN_POSITIVE` (the
+    /// log-space cells of [`sum_denested_cells_in_log_space`], gam#4504). A
+    /// linear sum takes `exp(log_weight)`.
+    #[inline]
+    fn push_log_weight(&mut self, log_weight: f64, eta: f64, eta_a: f64, eta_aa: f64) {
+        if !self.log_space {
+            self.push(log_weight.exp(), eta, eta_a, eta_aa);
+            return;
+        }
+        let tail_arg = if self.survival_side { -eta } else { eta };
+        let curvature = eta_aa - eta * eta_a * eta_a;
         let (log_cdf, mills) = signed_probit_logcdf_and_mills_ratio(tail_arg);
-        let term = weight.ln() + log_cdf;
+        let term = log_weight + log_cdf;
         if term == f64::NEG_INFINITY {
             // A zero weight or a tail that is exactly zero contributes nothing.
             return;
@@ -888,6 +910,82 @@ pub(crate) fn sum_calibration_tail<E>(
     let mut log_space = CalibrationTailSum::new(survival_side, true);
     visit(&mut log_space)?;
     Ok(log_space.finish(summands))
+}
+
+/// Whether a de-nested cells calibration tail summed in linear probability
+/// still holds its value (gam#4504): the sum and its bound are finite, and the
+/// sum is large enough that the underflow of its node terms sits below its
+/// own rounding. A node term below `f64::MIN_POSITIVE` is flushed to zero or
+/// held as a subnormal, which moves the sum by less than `f64::MIN_POSITIVE`,
+/// so `summands` terms move it by at most `summands·MIN_POSITIVE`; the sum
+/// keeps its relative accuracy while that is at most `u·T`. Past it — for a
+/// standard-normal row, from about `|q| ≈ 36` — the cells are summed in log
+/// units by [`sum_denested_cells_in_log_space`]. An infinite bound (an affine
+/// cell's bivariate-normal orthant difference with no digits left) takes the
+/// log route too.
+pub(crate) fn linear_cell_tail_is_representable(
+    tail: f64,
+    tail_rounding: f64,
+    summands: usize,
+) -> bool {
+    tail.is_finite()
+        && tail_rounding.is_finite()
+        && UNIT_ROUNDOFF * tail >= summands as f64 * f64::MIN_POSITIVE
+}
+
+/// A de-nested cells calibration tail summed in log units (gam#4504), the
+/// standard-normal latent law's counterpart of the log pass of
+/// [`sum_calibration_tail`], taken where [`linear_cell_tail_is_representable`]
+/// fails.
+///
+/// Each cell is the finite law of its log-space quadrature
+/// ([`visit_cell_log_quadrature`]): nodes `z_j` with log weights `log ω_j`,
+/// index `η(z_j)` and intercept derivatives `η_a(z_j)`, `η_aa(z_j)` from the
+/// cell's coefficient partials, all pushed into one streaming log-sum-exp
+/// across the cells. `log T`, `P′/T` and `P″/T` therefore come out as ratios,
+/// and nothing underflows with the tail. Each window is chosen on the tail's
+/// own integrand: the cell negated on the survival side.
+///
+/// Its bound relative to `T` is the per-term Wilkinson factor the linear
+/// value of a curved cell charges, plus every cell's dropped-mass bound over
+/// `T`. Each node term's exponent is formed at the magnitude of `log T`,
+/// whose rounding the residual already charges ([`anchor_residual_rounding`]).
+///
+/// `cells` yields `(cell, ∂c/∂a, ∂²c/∂a²)`. `density_slope` says whether `P″`
+/// is read, as on the linear route it replaces.
+pub(crate) fn sum_denested_cells_in_log_space(
+    survival_side: bool,
+    density_slope: bool,
+    cells: impl IntoIterator<Item = (DenestedCubicCell, [f64; 4], [f64; 4])>,
+) -> Result<CalibrationTail, String> {
+    let mut sum = CalibrationTailSum::new(survival_side, true);
+    let mut log_dropped = f64::NEG_INFINITY;
+    let mut summands = 0usize;
+    for (cell, dc_da, d2c_da2) in cells {
+        let tail_cell = if survival_side { cell.negated() } else { cell };
+        let dropped = visit_cell_log_quadrature(tail_cell, |z, log_weight| {
+            sum.push_log_weight(
+                log_weight,
+                cell.eta(z),
+                eval_coeff4_at(&dc_da, z),
+                eval_coeff4_at(&d2c_da2, z),
+            );
+        })?;
+        summands += TERMINAL_GL_ORDER;
+        log_dropped = logaddexp(log_dropped, dropped);
+    }
+    let tail = sum.finish(summands);
+    Ok(CalibrationTail {
+        density_slope_ratio: if density_slope {
+            tail.density_slope_ratio
+        } else {
+            None
+        },
+        tail_rounding_ratio: accumulation_growth(
+            TERMINAL_GL_ORDER + NON_AFFINE_VALUE_TERM_OPERATIONS,
+        ) + (log_dropped - tail.log_tail).exp(),
+        ..tail
+    })
 }
 
 /// The unit a probit calibration constraint `Σ_k w_k Φ(η_k) − Φ(q)` is
@@ -1692,6 +1790,138 @@ mod anchor_tests {
     use gam_math::jet_scalar::{JetScalar, Order2};
     use gam_math::jet_tower::Tower4;
     use gam_math::probability::{normal_cdf, normal_pdf};
+
+    // ── The standard-normal cells route in log units (gam#4504) ──
+
+    /// The affine cells `(α, β)` of the line cut at `splits`, whose values sum
+    /// to `Φ(α/√(1 + β²))` exactly, each with `∂c/∂a = (1, 0, 0, 0)` and
+    /// `∂²c/∂a² = 0`.
+    fn affine_line_cells(
+        alpha: f64,
+        beta: f64,
+        splits: &[f64],
+    ) -> Vec<(DenestedCubicCell, [f64; 4], [f64; 4])> {
+        let edges: Vec<f64> = std::iter::once(f64::NEG_INFINITY)
+            .chain(splits.iter().copied())
+            .chain(std::iter::once(f64::INFINITY))
+            .collect();
+        edges
+            .windows(2)
+            .map(|edge| {
+                let cell = DenestedCubicCell {
+                    left: edge[0],
+                    right: edge[1],
+                    c0: alpha,
+                    c1: beta,
+                    c2: 0.0,
+                    c3: 0.0,
+                };
+                (cell, [1.0, 0.0, 0.0, 0.0], [0.0; 4])
+            })
+            .collect()
+    }
+
+    /// gam#4504: past `|q| ≈ 37.5` every cell of a standard-normal row is below
+    /// `f64::MIN_POSITIVE`, so the linear cell sum is zero and its log tail
+    /// `−∞`. The log-space cells hold the tail there. On affine cells cut
+    /// anywhere along the line the exact tail is `Φ(h)`, `h = α/√(1 + β²)`, with
+    /// `P′/T = λ(h)/s` and `P″/T = ∓h·λ(h)/s²` (`λ = φ/Φ`, `s = √(1 + β²)`),
+    /// so at `h = −40` and `h = −60`, on both sides and three partitions, the log
+    /// route must match those to its own charged bound plus the residual's
+    /// rounding at that `log T`.
+    ///
+    /// Control: the same cells through the linear evaluator
+    /// ([`crate::cubic_cell_kernel::evaluate_cell_moments`]) fail
+    /// [`linear_cell_tail_is_representable`], and their log tail misses
+    /// `log Φ(h)` by more than that band. At `h = −20`, where the linear sum
+    /// holds, the linear sum passes the predicate, and both routes match the
+    /// exact tail to their bands.
+    #[test]
+    fn log_space_cells_hold_the_exact_tail_where_the_linear_sum_underflows_4504() {
+        use crate::cubic_cell_kernel::evaluate_cell_moments;
+        let partitions: [&[f64]; 3] = [&[], &[-2.0, 0.5, 3.0], &[-45.0, -1.0, 0.0, 2.5, 30.0, 41.0]];
+        for (h, linear_holds) in [(-20.0_f64, true), (-40.0, false), (-60.0, false)] {
+            let (log_reference, mills) = signed_probit_logcdf_and_mills_ratio(h);
+            for beta in [0.35_f64, 3.0, -2.0] {
+                let s = beta.hypot(1.0);
+                for splits in partitions {
+                    for survival_side in [false, true] {
+                        // The complement side reads `Φ(α/s)` at `α = h·s`; the
+                        // survival side reads `Φ(−α/s)` at `α = −h·s`.
+                        let sign = if survival_side { -1.0 } else { 1.0 };
+                        let cells = affine_line_cells(sign * h * s, sign * beta, splits);
+                        let label = format!(
+                            "h={h} beta={beta} cells={} survival={survival_side}",
+                            cells.len()
+                        );
+                        let tail = sum_denested_cells_in_log_space(survival_side, true, cells.clone())
+                            .expect("log-space cells");
+                        let band = tail.tail_rounding_ratio
+                            + anchor_residual_rounding(log_reference, tail.summands);
+                        assert!(
+                            (tail.log_tail - log_reference).abs() <= band,
+                            "{label}: log T {:+.17e} against log Φ(h) {log_reference:+.17e} (band {band:e})",
+                            tail.log_tail
+                        );
+                        let density_reference = mills / s;
+                        assert!(
+                            (tail.density_ratio - density_reference).abs() <= band * density_reference,
+                            "{label}: P'/T {:+.17e} against λ(h)/s {density_reference:+.17e}",
+                            tail.density_ratio
+                        );
+                        let slope_reference = -sign * h * mills / (s * s);
+                        let slope = tail.density_slope_ratio.expect("P''/T is read");
+                        assert!(
+                            (slope - slope_reference).abs() <= band * slope_reference.abs(),
+                            "{label}: P''/T {slope:+.17e} against ∓h·λ(h)/s² {slope_reference:+.17e}"
+                        );
+
+                        let linear = cells.iter().try_fold(
+                            (0.0, 0.0),
+                            |(value, rounding), (cell, _, _)| {
+                                evaluate_cell_moments(
+                                    if survival_side { cell.negated() } else { *cell },
+                                    4,
+                                )
+                                .map(|state| (value + state.value, rounding + state.value_rounding))
+                            },
+                        );
+                        match (linear_holds, linear) {
+                            (true, Ok((linear, linear_rounding))) => {
+                                let linear_log = linear.ln();
+                                let linear_band = linear_rounding / linear
+                                    + anchor_residual_rounding(log_reference, tail.summands);
+                                assert!(
+                                    linear_cell_tail_is_representable(
+                                        linear,
+                                        linear_rounding,
+                                        tail.summands
+                                    ) && (linear_log - log_reference).abs() <= linear_band,
+                                    "{label}: the linear sum holds here: log T {linear_log:+.17e} \
+                                     against {log_reference:+.17e} (band {linear_band:e})"
+                                );
+                            }
+                            (true, Err(error)) => panic!("{label}: linear cell: {error}"),
+                            (false, Ok((linear, linear_rounding))) => {
+                                let linear_log = linear.ln();
+                                assert!(
+                                    !linear_cell_tail_is_representable(
+                                        linear,
+                                        linear_rounding,
+                                        tail.summands
+                                    ) && !((linear_log - log_reference).abs() <= band),
+                                    "{label}: control: the linear sum {linear:e} (log \
+                                     {linear_log:e}) should have lost log Φ(h) = {log_reference:e}"
+                                );
+                            }
+                            // A linear cell that refuses has lost the value as well.
+                            (false, Err(_)) => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // ── The smaller-tail log residual: its own rounding and underflow (gam#3216, PR #3374) ──
 

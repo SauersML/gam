@@ -1,6 +1,7 @@
 use super::cell_moment_assembly::{
     assemble_bms_block_local_s_psi, fill_link_basis_cell_coeff_jet, fill_score_basis_cell_coeff_jet,
 };
+use super::calibration_cells::CalibrationCell;
 use super::exact_eval_cache::*;
 use super::family::*;
 use super::residual_repair_kernel::{
@@ -3222,14 +3223,10 @@ impl BernoulliMarginalSlopeFamily {
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
         let beta_h = beta_h_owned.as_ref();
         let beta_w = beta_w_owned.as_ref();
-        if let Some(grid) = self.training_row_grid(row)? {
-            return self.empirical_flex_row_third_contracted_many(
-                row, primary, q, b, beta_h, beta_w, row_ctx, row_dirs, &grid,
-            );
-        }
-
         let a = row_ctx.intercept;
-        let marginal = self.marginal_link_map(q)?;
+        // Both latent laws sum the same cell contractions (gam#3290).
+        let route = self.row_calibration_route(row, q, a, b, beta_h, beta_w)?;
+        let marginal = route.marginal;
         let h_range = primary.h.as_ref();
         let w_range = primary.w.as_ref();
         let score_runtime = self.score_warp.as_ref();
@@ -3255,9 +3252,12 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_auv = Array2::<f64>::zeros((r, r));
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) =
-            self.row_cell_moments_for_third_degree15(cache, row)?
+        let standard_normal_cells: &[CachedDenestedCellMoments] = if route
+            .empirical_cells
+            .is_some()
         {
+            &[]
+        } else if let Some(cached) = self.row_cell_moments_for_third_degree15(cache, row)? {
             cached
         } else {
             let partitions = self.denested_partition_cells(a, b, beta_h, beta_w)?;
@@ -3273,9 +3273,16 @@ impl BernoulliMarginalSlopeFamily {
                 .collect::<Result<Vec<_>, String>>()?;
             &owned_cells
         };
+        let cells: Vec<CalibrationCell<'_>> = match route.empirical_cells.as_deref() {
+            Some(empirical) => empirical.iter().map(CalibrationCell::Nodes).collect(),
+            None => standard_normal_cells
+                .iter()
+                .map(CalibrationCell::Moments)
+                .collect(),
+        };
 
         Self::accumulate_primary_third_cell_moments(
-            cells,
+            &cells,
             a,
             b,
             scale,
@@ -3301,23 +3308,26 @@ impl BernoulliMarginalSlopeFamily {
             &mut f_aau,
             &mut f_auv,
         )?;
-        self.add_standard_normal_flex_third_calibration_crossings(
-            primary,
-            a,
-            b,
-            cells,
-            row_dirs,
-            &mut f_aa,
-            &mut f_au,
-            &mut f_uv,
-            &mut f_a_dir,
-            &mut f_aa_dir,
-            &mut f_au_dir,
-            &mut f_uv_dir,
-            &mut f_aaa,
-            &mut f_aau,
-            &mut f_auv,
-        )?;
+        // A point-mass law has no moving boundary (see the fourth contraction).
+        if route.empirical_cells.is_none() {
+            self.add_standard_normal_flex_third_calibration_crossings(
+                primary,
+                a,
+                b,
+                standard_normal_cells,
+                row_dirs,
+                &mut f_aa,
+                &mut f_au,
+                &mut f_uv,
+                &mut f_a_dir,
+                &mut f_aa_dir,
+                &mut f_au_dir,
+                &mut f_uv_dir,
+                &mut f_aaa,
+                &mut f_aau,
+                &mut f_auv,
+            )?;
+        }
 
         f_u[0] = -marginal.mu1;
         f_uv[[0, 0]] = -marginal.mu2;

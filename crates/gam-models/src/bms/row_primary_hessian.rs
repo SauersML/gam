@@ -1,8 +1,8 @@
 use super::cell_moment_assembly::{
-    BernoulliInterceptSolveStats, EmpiricalBmsFourthJetSchedule, empirical_bms_fourth_jet_schedule,
-    fill_link_basis_cell_coeff_gradient, fill_link_basis_cell_coeff_jet,
-    fill_score_basis_cell_coeff_jet,
+    BernoulliInterceptSolveStats, fill_link_basis_cell_coeff_gradient,
+    fill_link_basis_cell_coeff_jet, fill_score_basis_cell_coeff_jet,
 };
+use super::calibration_cells::{CalibrationCell, sorted_active_primaries};
 use super::exact_eval_cache::*;
 use super::family::*;
 use super::flex_row_program::{
@@ -3722,47 +3722,24 @@ impl BernoulliMarginalSlopeFamily {
                     let mut e_g = Array1::<f64>::zeros(r);
                     e_g[cache.primary.slope] = 1.0;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let [t3_q, t3_g] = if let Some(grid) =
-                        self.training_row_grid(row)?
-                    {
-                        let point = self.primary_point_from_block_states(
+                    // Both latent laws contract the row's calibration cells
+                    // (gam#3290).
+                    let [t3_q, t3_g] = [
+                        self.row_primary_third_contracted_with_moments(
                             row,
                             block_states,
-                            &cache.primary,
-                        )?;
-                        let (q, b, beta_h_owned, beta_w_owned) =
-                            self.primary_point_components(&point, &cache.primary);
-                        self.empirical_flex_row_third_contracted_many(
-                            row,
-                            &cache.primary,
-                            q,
-                            b,
-                            beta_h_owned.as_ref(),
-                            beta_w_owned.as_ref(),
+                            cache,
                             row_ctx,
-                            &[e_q, e_g],
-                            &grid,
-                        )?
-                        .try_into()
-                        .expect("two empirical BMS axis directions produce two contractions")
-                    } else {
-                        [
-                            self.row_primary_third_contracted_with_moments(
-                                row,
-                                block_states,
-                                cache,
-                                row_ctx,
-                                &e_q,
-                            )?,
-                            self.row_primary_third_contracted_with_moments(
-                                row,
-                                block_states,
-                                cache,
-                                row_ctx,
-                                &e_g,
-                            )?,
-                        ]
-                    };
+                            &e_q,
+                        )?,
+                        self.row_primary_third_contracted_with_moments(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &e_g,
+                        )?,
+                    ];
                     Ok(FlexAxisThirdRowTensors {
                         third: [t3_q, t3_g],
                     })
@@ -3798,65 +3775,42 @@ impl BernoulliMarginalSlopeFamily {
                     let mut e_g = Array1::<f64>::zeros(r);
                     e_g[cache.primary.slope] = 1.0;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let [t4_qq, t4_gg, t4_qg_ordered, t4_qg_swapped] = if let Some(grid) =
-                        self.training_row_grid(row)?
-                    {
-                        let point = self.primary_point_from_block_states(
+                    // Both latent laws contract the row's calibration cells
+                    // (gam#3290).
+                    let [t4_qq, t4_gg, t4_qg_ordered, t4_qg_swapped] = [
+                        self.row_primary_fourth_contracted_ordered(
                             row,
                             block_states,
-                            &cache.primary,
-                        )?;
-                        let (q, b, beta_h_owned, beta_w_owned) =
-                            self.primary_point_components(&point, &cache.primary);
-                        self.empirical_flex_row_fourth_contracted_many_ordered(
-                            row,
-                            &cache.primary,
-                            q,
-                            b,
-                            beta_h_owned.as_ref(),
-                            beta_w_owned.as_ref(),
+                            cache,
                             row_ctx,
-                            &[(&e_q, &e_q), (&e_g, &e_g), (&e_q, &e_g), (&e_g, &e_q)],
-                            &grid,
-                        )?
-                        .try_into()
-                        .expect("four empirical BMS axis pairs produce four contractions")
-                    } else {
-                        [
-                            self.row_primary_fourth_contracted_ordered(
-                                row,
-                                block_states,
-                                cache,
-                                row_ctx,
-                                &e_q,
-                                &e_q,
-                            )?,
-                            self.row_primary_fourth_contracted_ordered(
-                                row,
-                                block_states,
-                                cache,
-                                row_ctx,
-                                &e_g,
-                                &e_g,
-                            )?,
-                            self.row_primary_fourth_contracted_ordered(
-                                row,
-                                block_states,
-                                cache,
-                                row_ctx,
-                                &e_q,
-                                &e_g,
-                            )?,
-                            self.row_primary_fourth_contracted_ordered(
-                                row,
-                                block_states,
-                                cache,
-                                row_ctx,
-                                &e_g,
-                                &e_q,
-                            )?,
-                        ]
-                    };
+                            &e_q,
+                            &e_q,
+                        )?,
+                        self.row_primary_fourth_contracted_ordered(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &e_g,
+                            &e_g,
+                        )?,
+                        self.row_primary_fourth_contracted_ordered(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &e_q,
+                            &e_g,
+                        )?,
+                        self.row_primary_fourth_contracted_ordered(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &e_g,
+                            &e_q,
+                        )?,
+                    ];
                     let mut t4_qg = t4_qg_ordered;
                     t4_qg.zip_mut_with(&t4_qg_swapped, |a, &b| *a = 0.5 * (*a + b));
                     Ok(FlexAxisFourthRowTensors {
@@ -3948,14 +3902,11 @@ impl BernoulliMarginalSlopeFamily {
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
         let beta_h = beta_h_owned.as_ref();
         let beta_w = beta_w_owned.as_ref();
-        if let Some(grid) = self.training_row_grid(row)? {
-            return self.empirical_flex_row_third_contracted(
-                row, primary, q, b, beta_h, beta_w, row_ctx, dir, &grid,
-            );
-        }
         let a = row_ctx.intercept;
         let r = primary.total;
-        let marginal = self.marginal_link_map(q)?;
+        // Both latent laws sum the same cell contractions (gam#3290).
+        let route = self.row_calibration_route(row, q, a, b, beta_h, beta_w)?;
+        let marginal = route.marginal;
         let h_range = primary.h.as_ref();
         let w_range = primary.w.as_ref();
         let score_runtime = self.score_warp.as_ref();
@@ -3981,9 +3932,12 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_auv = Array2::<f64>::zeros((r, r));
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) =
-            self.row_cell_moments_for_third_degree15(cache, row)?
+        let standard_normal_cells: &[CachedDenestedCellMoments] = if route
+            .empirical_cells
+            .is_some()
         {
+            &[]
+        } else if let Some(cached) = self.row_cell_moments_for_third_degree15(cache, row)? {
             cached
         } else {
             let partitions = self.denested_partition_cells(a, b, beta_h, beta_w)?;
@@ -3999,8 +3953,15 @@ impl BernoulliMarginalSlopeFamily {
                 .collect::<Result<Vec<_>, String>>()?;
             &owned_cells
         };
+        let cells: Vec<CalibrationCell<'_>> = match route.empirical_cells.as_deref() {
+            Some(empirical) => empirical.iter().map(CalibrationCell::Nodes).collect(),
+            None => standard_normal_cells
+                .iter()
+                .map(CalibrationCell::Moments)
+                .collect(),
+        };
         Self::accumulate_primary_third_cell_moments(
-            cells,
+            &cells,
             a,
             b,
             scale,
@@ -4026,23 +3987,26 @@ impl BernoulliMarginalSlopeFamily {
             &mut f_aau,
             &mut f_auv,
         )?;
-        self.add_standard_normal_flex_third_calibration_crossings(
-            primary,
-            a,
-            b,
-            cells,
-            std::slice::from_ref(dir),
-            &mut f_aa,
-            &mut f_au,
-            &mut f_uv,
-            &mut f_a_dirs,
-            &mut f_aa_dirs,
-            &mut f_au_dirs,
-            &mut f_uv_dirs,
-            &mut f_aaa,
-            &mut f_aau,
-            &mut f_auv,
-        )?;
+        // A point-mass law has no moving boundary (see the fourth contraction).
+        if route.empirical_cells.is_none() {
+            self.add_standard_normal_flex_third_calibration_crossings(
+                primary,
+                a,
+                b,
+                standard_normal_cells,
+                std::slice::from_ref(dir),
+                &mut f_aa,
+                &mut f_au,
+                &mut f_uv,
+                &mut f_a_dirs,
+                &mut f_aa_dirs,
+                &mut f_au_dirs,
+                &mut f_uv_dirs,
+                &mut f_aaa,
+                &mut f_aau,
+                &mut f_auv,
+            )?;
+        }
         let f_a_dir = f_a_dirs[0];
         let f_aa_dir = f_aa_dirs[0];
         let f_au_dir = Array1::from_vec(f_au_dirs);
@@ -4533,16 +4497,13 @@ impl BernoulliMarginalSlopeFamily {
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
         let beta_h = beta_h_owned.as_ref();
         let beta_w = beta_w_owned.as_ref();
-        if let Some(grid) = self.training_row_grid(row)? {
-            return self.empirical_flex_row_third_trace_gradient(
-                row, primary, q, b, beta_h, beta_w, row_ctx, gram, &grid,
-            );
-        }
-
         use super::exact_kernel as exact;
 
         let a = row_ctx.intercept;
-        let marginal = self.marginal_link_map(q)?;
+        // Both latent laws sum the same cell contractions and their adjoints
+        // (gam#3290).
+        let route = self.row_calibration_route(row, q, a, b, beta_h, beta_w)?;
+        let marginal = route.marginal;
         let h_range = primary.h.as_ref();
         let w_range = primary.w.as_ref();
         let score_runtime = self.score_warp.as_ref();
@@ -4563,9 +4524,12 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_auv = Array2::<f64>::zeros((r, r));
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) =
-            self.row_cell_moments_for_third_degree15(cache, row)?
+        let standard_normal_cells: &[CachedDenestedCellMoments] = if route
+            .empirical_cells
+            .is_some()
         {
+            &[]
+        } else if let Some(cached) = self.row_cell_moments_for_third_degree15(cache, row)? {
             cached
         } else {
             let partitions = self.denested_partition_cells(a, b, beta_h, beta_w)?;
@@ -4581,13 +4545,19 @@ impl BernoulliMarginalSlopeFamily {
                 .collect::<Result<Vec<_>, String>>()?;
             &owned_cells
         };
+        let cells: Vec<CalibrationCell<'_>> = match route.empirical_cells.as_deref() {
+            Some(empirical) => empirical.iter().map(CalibrationCell::Nodes).collect(),
+            None => standard_normal_cells
+                .iter()
+                .map(CalibrationCell::Moments)
+                .collect(),
+        };
 
-        for entry in cells {
-            let partition_cell = entry.partition_cell;
+        for &entry in &cells {
+            let partition_cell = entry.partition_cell();
             let cell = partition_cell.cell;
             let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
-            let state = &entry.state;
 
             let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
                 partition_cell.score_span,
@@ -4687,35 +4657,32 @@ impl BernoulliMarginalSlopeFamily {
                 &zero_family,
             );
 
-            f_a += exact::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
-            f_aa += exact::cell_second_derivative_from_moments(
+            f_a += entry.first(&dc_da)?;
+            f_aa += entry.second(
                 cell,
                 &dc_da,
                 &dc_da,
                 &dc_daa,
-                &state.moments,
             )?;
             for u in 1..r {
                 f_u[u] +=
-                    exact::cell_first_derivative_from_moments(&coeff_jet.first[u], &state.moments)?;
-                f_au[u] += exact::cell_second_derivative_from_moments(
+                    entry.first(&coeff_jet.first[u])?;
+                f_au[u] += entry.second(
                     cell,
                     &dc_da,
                     &coeff_jet.first[u],
                     &coeff_jet.a_first[u],
-                    &state.moments,
                 )?;
             }
             for u in 1..r {
                 for v in u..r {
                     let second_coeff =
                         coeff_jet.pair_from_b_family(coeff_jet.b_first, u, v, COEFF_SUPPORT_BHW);
-                    let val = exact::cell_second_derivative_from_moments(
+                    let val = entry.second(
                         cell,
                         &coeff_jet.first[u],
                         &coeff_jet.first[v],
                         &second_coeff,
-                        &state.moments,
                     )?;
                     f_uv[[u, v]] += val;
                     if u != v {
@@ -4724,7 +4691,7 @@ impl BernoulliMarginalSlopeFamily {
                 }
             }
             // Intercept a-chain moments (#2347): ∂ₐ of the second-order moments.
-            f_aaa += exact::cell_third_derivative_from_moments(
+            f_aaa += entry.third(
                 cell,
                 &dc_da,
                 &dc_da,
@@ -4733,10 +4700,9 @@ impl BernoulliMarginalSlopeFamily {
                 &dc_daa,
                 &dc_daa,
                 &dc_daaa,
-                &state.moments,
             )?;
             for u in 1..r {
-                f_aau[u] += exact::cell_third_derivative_from_moments(
+                f_aau[u] += entry.third(
                     cell,
                     &dc_da,
                     &dc_da,
@@ -4745,7 +4711,6 @@ impl BernoulliMarginalSlopeFamily {
                     &coeff_jet.a_first[u],
                     &coeff_jet.a_first[u],
                     &coeff_jet.aa_first[u],
-                    &state.moments,
                 )?;
             }
             for u in 1..r {
@@ -4754,7 +4719,7 @@ impl BernoulliMarginalSlopeFamily {
                         coeff_jet.pair_from_b_family(coeff_jet.b_first, u, v, COEFF_SUPPORT_BHW);
                     let third_alr =
                         coeff_jet.pair_from_b_family(coeff_jet.ab_first, u, v, COEFF_SUPPORT_BW);
-                    let val = exact::cell_third_derivative_from_moments(
+                    let val = entry.third(
                         cell,
                         &dc_da,
                         &coeff_jet.first[u],
@@ -4763,7 +4728,6 @@ impl BernoulliMarginalSlopeFamily {
                         &coeff_jet.a_first[v],
                         &second_lr,
                         &third_alr,
-                        &state.moments,
                     )?;
                     f_auv[[u, v]] += val;
                     if u != v {
@@ -4773,15 +4737,27 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
 
-        let crossings = self.standard_normal_flex_third_calibration_crossings(primary, a, b, cells)?;
-        crossings.add_base(
-            &mut f_aa,
-            &mut f_au,
-            &mut f_uv,
-            &mut f_aaa,
-            &mut f_aau,
-            &mut f_auv,
-        );
+        // A point-mass law has no moving boundary (see the fourth contraction).
+        let crossings = if route.empirical_cells.is_none() {
+            Some(self.standard_normal_flex_third_calibration_crossings(
+                primary,
+                a,
+                b,
+                standard_normal_cells,
+            )?)
+        } else {
+            None
+        };
+        if let Some(crossings) = crossings.as_ref() {
+            crossings.add_base(
+                &mut f_aa,
+                &mut f_au,
+                &mut f_uv,
+                &mut f_aaa,
+                &mut f_aau,
+                &mut f_auv,
+            );
+        }
 
         f_u[0] = -marginal.mu1;
         f_uv[[0, 0]] = -marginal.mu2;
@@ -5084,12 +5060,11 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
 
-        for entry in cells {
-            let partition_cell = entry.partition_cell;
+        for &entry in &cells {
+            let partition_cell = entry.partition_cell();
             let cell = partition_cell.cell;
             let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
-            let state = &entry.state;
 
             let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
                 partition_cell.score_span,
@@ -5195,10 +5170,9 @@ impl BernoulliMarginalSlopeFamily {
             let mut coeff_au_dir_adj = vec![[0.0; 4]; r];
 
             if adj_f_a_dir != 0.0 {
-                Self::add_cell_second_direction_adjoint(
+                entry.second_direction_adjoint(
                     cell,
                     &dc_da,
-                    &state.moments,
                     adj_f_a_dir,
                     &mut coeff_dir_adj,
                     &mut coeff_a_dir_adj,
@@ -5207,12 +5181,11 @@ impl BernoulliMarginalSlopeFamily {
             if adj_f_aa_dir != 0.0 {
                 let mut a_rt_adj = [0.0; 4];
                 let mut a_st_adj = [0.0; 4];
-                Self::add_cell_third_direction_adjoint(
+                entry.third_direction_adjoint(
                     cell,
                     &dc_da,
                     &dc_da,
                     &dc_daa,
-                    &state.moments,
                     adj_f_aa_dir,
                     &mut coeff_dir_adj,
                     &mut a_rt_adj,
@@ -5227,12 +5200,11 @@ impl BernoulliMarginalSlopeFamily {
                 if adj == 0.0 {
                     continue;
                 }
-                Self::add_cell_third_direction_adjoint(
+                entry.third_direction_adjoint(
                     cell,
                     &dc_da,
                     &coeff_jet.first[u],
                     &coeff_jet.a_first[u],
-                    &state.moments,
                     adj,
                     &mut coeff_dir_adj,
                     &mut coeff_a_dir_adj,
@@ -5251,12 +5223,11 @@ impl BernoulliMarginalSlopeFamily {
                     let mut u_dir_adj = [0.0; 4];
                     let mut v_dir_adj = [0.0; 4];
                     let mut third_coeff_adj = [0.0; 4];
-                    Self::add_cell_third_direction_adjoint(
+                    entry.third_direction_adjoint(
                         cell,
                         &coeff_jet.first[u],
                         &coeff_jet.first[v],
                         &second_coeff,
-                        &state.moments,
                         adj,
                         &mut coeff_dir_adj,
                         &mut u_dir_adj,
@@ -5312,13 +5283,15 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
 
-        crossings.add_direction_adjoint(
-            adj_f_a_dir,
-            adj_f_aa_dir,
-            &adj_f_au_dir,
-            &adj_f_uv_dir,
-            &mut direction_adjoint,
-        );
+        if let Some(crossings) = crossings.as_ref() {
+            crossings.add_direction_adjoint(
+                adj_f_a_dir,
+                adj_f_aa_dir,
+                &adj_f_au_dir,
+                &adj_f_uv_dir,
+                &mut direction_adjoint,
+            );
+        }
         Ok(Array1::from_vec(direction_adjoint))
     }
 
@@ -5331,8 +5304,8 @@ impl BernoulliMarginalSlopeFamily {
     /// [`Self::row_primary_third_trace_many_with_moments`]. All consumers
     /// interpret the same declarative Order2/Order3 node stream; only the
     /// diagnostic labels threaded into the deviation-basis compiler differ.
-    pub(crate) fn accumulate_primary_third_cell_moments(
-        cells: &[CachedDenestedCellMoments],
+    pub(super) fn accumulate_primary_third_cell_moments(
+        cells: &[CalibrationCell<'_>],
         a: f64,
         b: f64,
         scale: f64,
@@ -5360,12 +5333,11 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<(), String> {
         use super::exact_kernel as exact;
 
-        for entry in cells {
-            let partition_cell = entry.partition_cell;
+        for &entry in cells {
+            let partition_cell = entry.partition_cell();
             let cell = partition_cell.cell;
             let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
-            let state = &entry.state;
 
             let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
                 partition_cell.score_span,
@@ -5399,6 +5371,9 @@ impl BernoulliMarginalSlopeFamily {
             let mut coeff_abu = vec![[0.0; 4]; r];
             let mut coeff_bbu = vec![[0.0; 4]; r];
 
+            // The slope, then every column whose span covers the cell
+            // (`sorted_active_primaries`).
+            let mut active = vec![1usize];
             coeff_u[1] = dc_db;
             coeff_au[1] = dc_dab;
             coeff_bu[1] = dc_dbb;
@@ -5413,6 +5388,7 @@ impl BernoulliMarginalSlopeFamily {
                     z_mid,
                     score_label,
                     |_, idx, basis_span| {
+                        active.push(idx);
                         fill_score_basis_cell_coeff_jet(
                             idx,
                             basis_span,
@@ -5433,6 +5409,7 @@ impl BernoulliMarginalSlopeFamily {
                     u_mid,
                     link_label,
                     |_, idx, basis_span| {
+                        active.push(idx);
                         fill_link_basis_cell_coeff_jet(
                             idx,
                             basis_span,
@@ -5451,6 +5428,8 @@ impl BernoulliMarginalSlopeFamily {
                 )?;
             }
 
+            sorted_active_primaries(&mut active);
+
             let coeff_jet = SparsePrimaryCoeffJetView::new(
                 1,
                 h_range,
@@ -5467,37 +5446,34 @@ impl BernoulliMarginalSlopeFamily {
                 zero_family,
             );
 
-            BmsFlexRowProgram::try_for_each_calibration_order2_contiguous(
-                1..r,
+            BmsFlexRowProgram::try_for_each_calibration_order2(
+                &active,
                 true,
                 |node| -> Result<(), String> {
                     match node {
                         BmsFlexCalibrationOrder2Node::InterceptFirst => {
                             *f_a +=
-                                exact::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
+                                entry.first(&dc_da)?;
                         }
                         BmsFlexCalibrationOrder2Node::InterceptSecond => {
-                            *f_aa += exact::cell_second_derivative_from_moments(
+                            *f_aa += entry.second(
                                 cell,
                                 &dc_da,
                                 &dc_da,
                                 &dc_daa,
-                                &state.moments,
                             )?;
                         }
                         BmsFlexCalibrationOrder2Node::PrimaryFirst { primary } => {
-                            f_u[primary] += exact::cell_first_derivative_from_moments(
+                            f_u[primary] += entry.first(
                                 &coeff_jet.first[primary],
-                                &state.moments,
                             )?;
                         }
                         BmsFlexCalibrationOrder2Node::InterceptPrimarySecond { primary } => {
-                            f_au[primary] += exact::cell_second_derivative_from_moments(
+                            f_au[primary] += entry.second(
                                 cell,
                                 &dc_da,
                                 &coeff_jet.first[primary],
                                 &coeff_jet.a_first[primary],
-                                &state.moments,
                             )?;
                         }
                         BmsFlexCalibrationOrder2Node::PrimaryPairSecond { left, right } => {
@@ -5507,12 +5483,11 @@ impl BernoulliMarginalSlopeFamily {
                                 right,
                                 COEFF_SUPPORT_BHW,
                             );
-                            let value = exact::cell_second_derivative_from_moments(
+                            let value = entry.second(
                                 cell,
                                 &coeff_jet.first[left],
                                 &coeff_jet.first[right],
                                 &second_coeff,
-                                &state.moments,
                             )?;
                             f_uv[[left, right]] += value;
                             if left != right {
@@ -5539,7 +5514,7 @@ impl BernoulliMarginalSlopeFamily {
             // enters `M` only through `a`, so its rows/entries stay zero — the
             // `1..r` loops below leave them untouched, matching the manual
             // `-mu*` q-corrections applied by the callers.
-            *f_aaa += exact::cell_third_derivative_from_moments(
+            *f_aaa += entry.third(
                 cell,
                 &dc_da,
                 &dc_da,
@@ -5548,10 +5523,9 @@ impl BernoulliMarginalSlopeFamily {
                 &dc_daa,
                 &dc_daa,
                 &dc_daaa,
-                &state.moments,
             )?;
-            for primary in 1..r {
-                f_aau[primary] += exact::cell_third_derivative_from_moments(
+            for &primary in &active {
+                f_aau[primary] += entry.third(
                     cell,
                     &dc_da,
                     &dc_da,
@@ -5560,11 +5534,10 @@ impl BernoulliMarginalSlopeFamily {
                     &coeff_jet.a_first[primary],
                     &coeff_jet.a_first[primary],
                     &coeff_jet.aa_first[primary],
-                    &state.moments,
                 )?;
             }
-            for left in 1..r {
-                for right in left..r {
+            for (position, &left) in active.iter().enumerate() {
+                for &right in &active[position..] {
                     let second_lr = coeff_jet.pair_from_b_family(
                         coeff_jet.b_first,
                         left,
@@ -5577,7 +5550,7 @@ impl BernoulliMarginalSlopeFamily {
                         right,
                         COEFF_SUPPORT_BW,
                     );
-                    let value = exact::cell_third_derivative_from_moments(
+                    let value = entry.third(
                         cell,
                         &dc_da,
                         &coeff_jet.first[left],
@@ -5586,7 +5559,6 @@ impl BernoulliMarginalSlopeFamily {
                         &coeff_jet.a_first[right],
                         &second_lr,
                         &third_alr,
-                        &state.moments,
                     )?;
                     f_auv[[left, right]] += value;
                     if left != right {
@@ -5600,8 +5572,8 @@ impl BernoulliMarginalSlopeFamily {
             let mut coeff_aa_dir = [0.0; 4];
             let mut coeff_u_dir = vec![[0.0; 4]; r];
             let mut coeff_au_dir = vec![[0.0; 4]; r];
-            BmsFlexRowProgram::try_for_each_calibration_order3_contiguous(
-                1..r,
+            BmsFlexRowProgram::try_for_each_calibration_order3(
+                &active,
                 row_dirs.len(),
                 |node| -> Result<(), String> {
                     match node {
@@ -5622,7 +5594,7 @@ impl BernoulliMarginalSlopeFamily {
                                 dir,
                                 COEFF_SUPPORT_BW,
                             );
-                            for primary in 1..r {
+                            for &primary in &active {
                                 coeff_u_dir[primary] = coeff_jet.param_directional_from_b_family(
                                     coeff_jet.b_first,
                                     primary,
@@ -5638,16 +5610,15 @@ impl BernoulliMarginalSlopeFamily {
                             }
                         }
                         BmsFlexCalibrationOrder3Node::InterceptDirectionalSecond { direction } => {
-                            f_a_dir[direction] += exact::cell_second_derivative_from_moments(
+                            f_a_dir[direction] += entry.second(
                                 cell,
                                 &dc_da,
                                 &coeff_dir,
                                 &coeff_a_dir,
-                                &state.moments,
                             )?;
                         }
                         BmsFlexCalibrationOrder3Node::InterceptDirectionalThird { direction } => {
-                            f_aa_dir[direction] += exact::cell_third_derivative_from_moments(
+                            f_aa_dir[direction] += entry.third(
                                 cell,
                                 &dc_da,
                                 &dc_da,
@@ -5656,7 +5627,6 @@ impl BernoulliMarginalSlopeFamily {
                                 &coeff_a_dir,
                                 &coeff_a_dir,
                                 &coeff_aa_dir,
-                                &state.moments,
                             )?;
                         }
                         BmsFlexCalibrationOrder3Node::InterceptPrimaryDirectionalThird {
@@ -5664,7 +5634,7 @@ impl BernoulliMarginalSlopeFamily {
                             primary,
                         } => {
                             f_au_dir[direction * r + primary] +=
-                                exact::cell_third_derivative_from_moments(
+                                entry.third(
                                     cell,
                                     &dc_da,
                                     &coeff_jet.first[primary],
@@ -5673,7 +5643,6 @@ impl BernoulliMarginalSlopeFamily {
                                     &coeff_a_dir,
                                     &coeff_u_dir[primary],
                                     &coeff_au_dir[primary],
-                                    &state.moments,
                                 )?;
                         }
                         BmsFlexCalibrationOrder3Node::PrimaryPairDirectionalThird {
@@ -5695,7 +5664,7 @@ impl BernoulliMarginalSlopeFamily {
                                 dir,
                                 COEFF_SUPPORT_BW,
                             );
-                            let value = exact::cell_third_derivative_from_moments(
+                            let value = entry.third(
                                 cell,
                                 &coeff_jet.first[left],
                                 &coeff_jet.first[right],
@@ -5704,7 +5673,6 @@ impl BernoulliMarginalSlopeFamily {
                                 &coeff_u_dir[left],
                                 &coeff_u_dir[right],
                                 &third_coeff,
-                                &state.moments,
                             )?;
                             let base = direction * r * r;
                             f_uv_dir[base + left * r + right] += value;
@@ -5831,14 +5799,13 @@ impl BernoulliMarginalSlopeFamily {
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
         let beta_h = beta_h_owned.as_ref();
         let beta_w = beta_w_owned.as_ref();
-        if let Some(grid) = self.training_row_grid(row)? {
-            return self.empirical_flex_row_fourth_contracted(
-                row, primary, q, b, beta_h, beta_w, row_ctx, dir_u, dir_v, &grid,
-            );
-        }
         let a = row_ctx.intercept;
         let r = primary.total;
-        let marginal = self.marginal_link_map(q)?;
+        // Both latent laws sum the same cell contractions (gam#3290); an
+        // empirical row reads its grid's node moments, in its calibration
+        // unit, where the standard-normal row reads the kernel's integrals.
+        let route = self.row_calibration_route(row, q, a, b, beta_h, beta_w)?;
+        let marginal = route.marginal;
         let h_range = primary.h.as_ref();
         let w_range = primary.w.as_ref();
         let score_runtime = self.score_warp.as_ref();
@@ -5880,7 +5847,12 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_auv_dir = vec![0.0; directions.len() * r * r];
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = self
+        let standard_normal_cells: &[CachedDenestedCellMoments] = if route
+            .empirical_cells
+            .is_some()
+        {
+            &[]
+        } else if let Some(cached) = self
             .existing_bundle_for_degree(cache, 21)?
             .and_then(|bundle| bundle.row(row, 21))
         {
@@ -5900,12 +5872,18 @@ impl BernoulliMarginalSlopeFamily {
                 .collect::<Result<Vec<_>, String>>()?;
             &owned_cells
         };
-        for entry in cells {
-            let partition_cell = entry.partition_cell;
+        let cells: Vec<CalibrationCell<'_>> = match route.empirical_cells.as_deref() {
+            Some(empirical) => empirical.iter().map(CalibrationCell::Nodes).collect(),
+            None => standard_normal_cells
+                .iter()
+                .map(CalibrationCell::Moments)
+                .collect(),
+        };
+        for &entry in &cells {
+            let partition_cell = entry.partition_cell();
             let cell = partition_cell.cell;
             let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
-            let state = &entry.state;
 
             let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
                 partition_cell.score_span,
@@ -5945,6 +5923,9 @@ impl BernoulliMarginalSlopeFamily {
             let mut coeff_abbu = vec![[0.0; 4]; r];
             let mut coeff_bbbu = vec![[0.0; 4]; r];
 
+            // The slope, then every column whose span covers the cell
+            // (`sorted_active_primaries`).
+            let mut active = vec![1usize];
             coeff_u[1] = dc_db;
             coeff_au[1] = dc_dab;
             coeff_bu[1] = dc_dbb;
@@ -5959,6 +5940,7 @@ impl BernoulliMarginalSlopeFamily {
                     z_mid,
                     "score-warp fourth-direction",
                     |_, idx, basis_span| {
+                        active.push(idx);
                         fill_score_basis_cell_coeff_jet(
                             idx,
                             basis_span,
@@ -5979,6 +5961,7 @@ impl BernoulliMarginalSlopeFamily {
                     u_mid,
                     "link-wiggle fourth-direction",
                     |_, idx, basis_span| {
+                        active.push(idx);
                         fill_link_basis_cell_coeff_jet(
                             idx,
                             basis_span,
@@ -6003,6 +5986,8 @@ impl BernoulliMarginalSlopeFamily {
                 )?;
             }
 
+            sorted_active_primaries(&mut active);
+
             let coeff_jet = SparsePrimaryCoeffJetView::new(
                 1,
                 h_range,
@@ -6019,37 +6004,34 @@ impl BernoulliMarginalSlopeFamily {
                 &coeff_bbbu,
             );
 
-            BmsFlexRowProgram::try_for_each_calibration_order2_contiguous(
-                1..r,
+            BmsFlexRowProgram::try_for_each_calibration_order2(
+                &active,
                 true,
                 |node| -> Result<(), String> {
                     match node {
                         BmsFlexCalibrationOrder2Node::InterceptFirst => {
                             f_a +=
-                                exact::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
+                                entry.first(&dc_da)?;
                         }
                         BmsFlexCalibrationOrder2Node::InterceptSecond => {
-                            f_aa += exact::cell_second_derivative_from_moments(
+                            f_aa += entry.second(
                                 cell,
                                 &dc_da,
                                 &dc_da,
                                 &dc_daa,
-                                &state.moments,
                             )?;
                         }
                         BmsFlexCalibrationOrder2Node::PrimaryFirst { primary } => {
-                            f_u[primary] += exact::cell_first_derivative_from_moments(
+                            f_u[primary] += entry.first(
                                 &coeff_jet.first[primary],
-                                &state.moments,
                             )?;
                         }
                         BmsFlexCalibrationOrder2Node::InterceptPrimarySecond { primary } => {
-                            f_au[primary] += exact::cell_second_derivative_from_moments(
+                            f_au[primary] += entry.second(
                                 cell,
                                 &dc_da,
                                 &coeff_jet.first[primary],
                                 &coeff_jet.a_first[primary],
-                                &state.moments,
                             )?;
                         }
                         BmsFlexCalibrationOrder2Node::PrimaryPairSecond { left, right } => {
@@ -6059,12 +6041,11 @@ impl BernoulliMarginalSlopeFamily {
                                 right,
                                 COEFF_SUPPORT_BHW,
                             );
-                            let value = exact::cell_second_derivative_from_moments(
+                            let value = entry.second(
                                 cell,
                                 &coeff_jet.first[left],
                                 &coeff_jet.first[right],
                                 &second_coeff,
-                                &state.moments,
                             )?;
                             f_uv[[left, right]] += value;
                             if left != right {
@@ -6081,7 +6062,7 @@ impl BernoulliMarginalSlopeFamily {
             // promote the directional/mixed moments to TOTAL derivatives through
             // the moving intercept root. Same cell moments, with the intercept
             // coefficient jet (dc_da / dc_daa / dc_daaa) in the extra slots.
-            f_aaa += exact::cell_third_derivative_from_moments(
+            f_aaa += entry.third(
                 cell,
                 &dc_da,
                 &dc_da,
@@ -6090,9 +6071,8 @@ impl BernoulliMarginalSlopeFamily {
                 &dc_daa,
                 &dc_daa,
                 &dc_daaa,
-                &state.moments,
             )?;
-            f_aaaa += exact::cell_fourth_derivative_from_moments(
+            f_aaaa += entry.fourth(
                 cell,
                 &dc_da,
                 &dc_da,
@@ -6109,10 +6089,9 @@ impl BernoulliMarginalSlopeFamily {
                 &dc_daaa,
                 &dc_daaa,
                 &dc_daaaa,
-                &state.moments,
             )?;
-            for primary in 1..r {
-                f_aau[primary] += exact::cell_third_derivative_from_moments(
+            for &primary in &active {
+                f_aau[primary] += entry.third(
                     cell,
                     &dc_da,
                     &dc_da,
@@ -6121,9 +6100,8 @@ impl BernoulliMarginalSlopeFamily {
                     &coeff_jet.a_first[primary],
                     &coeff_jet.a_first[primary],
                     &coeff_jet.aa_first[primary],
-                    &state.moments,
                 )?;
-                f_aaau[primary] += exact::cell_fourth_derivative_from_moments(
+                f_aaau[primary] += entry.fourth(
                     cell,
                     &dc_da,
                     &dc_da,
@@ -6140,11 +6118,10 @@ impl BernoulliMarginalSlopeFamily {
                     &coeff_jet.aa_first[primary],
                     &coeff_jet.aa_first[primary],
                     &coeff_jet.aaa_first[primary],
-                    &state.moments,
                 )?;
             }
-            for left in 1..r {
-                for right in left..r {
+            for (position, &left) in active.iter().enumerate() {
+                for &right in &active[position..] {
                     let second_lr = coeff_jet.pair_from_b_family(
                         coeff_jet.b_first,
                         left,
@@ -6163,7 +6140,7 @@ impl BernoulliMarginalSlopeFamily {
                         right,
                         COEFF_SUPPORT_W,
                     );
-                    let auv = exact::cell_third_derivative_from_moments(
+                    let auv = entry.third(
                         cell,
                         &dc_da,
                         &coeff_jet.first[left],
@@ -6172,9 +6149,8 @@ impl BernoulliMarginalSlopeFamily {
                         &coeff_jet.a_first[right],
                         &second_lr,
                         &third_alr,
-                        &state.moments,
                     )?;
-                    let aauv = exact::cell_fourth_derivative_from_moments(
+                    let aauv = entry.fourth(
                         cell,
                         &dc_da,
                         &dc_da,
@@ -6191,7 +6167,6 @@ impl BernoulliMarginalSlopeFamily {
                         &third_alr,
                         &third_alr,
                         &fourth_aalr,
-                        &state.moments,
                     )?;
                     f_auv[[left, right]] += auv;
                     f_aauv[[left, right]] += aauv;
@@ -6207,8 +6182,8 @@ impl BernoulliMarginalSlopeFamily {
             let mut coeff_aa_dirs = [[0.0; 4]; 2];
             let mut coeff_u_dirs = vec![[0.0; 4]; 2 * r];
             let mut coeff_au_dirs = vec![[0.0; 4]; 2 * r];
-            BmsFlexRowProgram::try_for_each_calibration_order3_contiguous(
-                1..r,
+            BmsFlexRowProgram::try_for_each_calibration_order3(
+                &active,
                 directions.len(),
                 |node| -> Result<(), String> {
                     match node {
@@ -6230,7 +6205,7 @@ impl BernoulliMarginalSlopeFamily {
                                 COEFF_SUPPORT_BW,
                             );
                             let base = direction * r;
-                            for primary in 1..r {
+                            for &primary in &active {
                                 coeff_u_dirs[base + primary] = coeff_jet
                                     .param_directional_from_b_family(
                                         coeff_jet.b_first,
@@ -6248,16 +6223,15 @@ impl BernoulliMarginalSlopeFamily {
                             }
                         }
                         BmsFlexCalibrationOrder3Node::InterceptDirectionalSecond { direction } => {
-                            f_a_dir[direction] += exact::cell_second_derivative_from_moments(
+                            f_a_dir[direction] += entry.second(
                                 cell,
                                 &dc_da,
                                 &coeff_dirs[direction],
                                 &coeff_a_dirs[direction],
-                                &state.moments,
                             )?;
                         }
                         BmsFlexCalibrationOrder3Node::InterceptDirectionalThird { direction } => {
-                            f_aa_dir[direction] += exact::cell_third_derivative_from_moments(
+                            f_aa_dir[direction] += entry.third(
                                 cell,
                                 &dc_da,
                                 &dc_da,
@@ -6266,7 +6240,6 @@ impl BernoulliMarginalSlopeFamily {
                                 &coeff_a_dirs[direction],
                                 &coeff_a_dirs[direction],
                                 &coeff_aa_dirs[direction],
-                                &state.moments,
                             )?;
                         }
                         BmsFlexCalibrationOrder3Node::InterceptPrimaryDirectionalThird {
@@ -6274,7 +6247,7 @@ impl BernoulliMarginalSlopeFamily {
                             primary,
                         } => {
                             let base = direction * r;
-                            f_au_dir[base + primary] += exact::cell_third_derivative_from_moments(
+                            f_au_dir[base + primary] += entry.third(
                                 cell,
                                 &dc_da,
                                 &coeff_jet.first[primary],
@@ -6283,7 +6256,6 @@ impl BernoulliMarginalSlopeFamily {
                                 &coeff_a_dirs[direction],
                                 &coeff_u_dirs[base + primary],
                                 &coeff_au_dirs[base + primary],
-                                &state.moments,
                             )?;
                         }
                         BmsFlexCalibrationOrder3Node::PrimaryPairDirectionalThird {
@@ -6305,7 +6277,7 @@ impl BernoulliMarginalSlopeFamily {
                                 COEFF_SUPPORT_BW,
                             );
                             let vector_base = direction * r;
-                            let value = exact::cell_third_derivative_from_moments(
+                            let value = entry.third(
                                 cell,
                                 &coeff_jet.first[left],
                                 &coeff_jet.first[right],
@@ -6314,7 +6286,6 @@ impl BernoulliMarginalSlopeFamily {
                                 &coeff_u_dirs[vector_base + left],
                                 &coeff_u_dirs[vector_base + right],
                                 &third_coeff,
-                                &state.moments,
                             )?;
                             let matrix_base = direction * r * r;
                             f_uv_dir[matrix_base + left * r + right] += value;
@@ -6338,8 +6309,8 @@ impl BernoulliMarginalSlopeFamily {
                 let dir = directions[direction];
                 let vector_base = direction * r;
                 let matrix_base = direction * r * r;
-                for left in 1..r {
-                    for right in left..r {
+                for (position, &left) in active.iter().enumerate() {
+                    for &right in &active[position..] {
                         let second_lr = coeff_jet.pair_from_b_family(
                             coeff_jet.b_first,
                             left,
@@ -6366,7 +6337,7 @@ impl BernoulliMarginalSlopeFamily {
                             dir,
                             COEFF_SUPPORT_W,
                         );
-                        let value = exact::cell_fourth_derivative_from_moments(
+                        let value = entry.fourth(
                             cell,
                             &dc_da,
                             &coeff_jet.first[left],
@@ -6383,7 +6354,6 @@ impl BernoulliMarginalSlopeFamily {
                             &coeff_au_dirs[vector_base + right],
                             &third_lrd,
                             &fourth_alrd,
-                            &state.moments,
                         )?;
                         f_auv_dir[matrix_base + left * r + right] += value;
                         if left != right {
@@ -6398,8 +6368,8 @@ impl BernoulliMarginalSlopeFamily {
             let mut coeff_aa_dir_mixed = [0.0; 4];
             let mut coeff_u_mixed = vec![[0.0; 4]; r];
             let mut coeff_au_mixed = vec![[0.0; 4]; r];
-            BmsFlexRowProgram::try_for_each_calibration_order4_contiguous(
-                1..r,
+            BmsFlexRowProgram::try_for_each_calibration_order4(
+                &active,
                 direction_pairs.len(),
                 |node| -> Result<(), String> {
                     match node {
@@ -6425,7 +6395,7 @@ impl BernoulliMarginalSlopeFamily {
                                 right_dir,
                                 COEFF_SUPPORT_W,
                             );
-                            for primary in 1..r {
+                            for &primary in &active {
                                 coeff_u_mixed[primary] = coeff_jet.param_mixed_from_bb_family(
                                     coeff_jet.bb_first,
                                     primary,
@@ -6444,7 +6414,7 @@ impl BernoulliMarginalSlopeFamily {
                         }
                         BmsFlexCalibrationOrder4Node::InterceptMixedThird { pair } => {
                             let (left_direction, right_direction) = direction_pairs[pair];
-                            f_a_mixed[pair] += exact::cell_third_derivative_from_moments(
+                            f_a_mixed[pair] += entry.third(
                                 cell,
                                 &dc_da,
                                 &coeff_dirs[left_direction],
@@ -6453,12 +6423,11 @@ impl BernoulliMarginalSlopeFamily {
                                 &coeff_a_dirs[right_direction],
                                 &coeff_dir_mixed,
                                 &coeff_a_dir_mixed,
-                                &state.moments,
                             )?;
                         }
                         BmsFlexCalibrationOrder4Node::InterceptMixedFourth { pair } => {
                             let (left_direction, right_direction) = direction_pairs[pair];
-                            f_aa_mixed[pair] += exact::cell_fourth_derivative_from_moments(
+                            f_aa_mixed[pair] += entry.fourth(
                                 cell,
                                 &dc_da,
                                 &dc_da,
@@ -6475,7 +6444,6 @@ impl BernoulliMarginalSlopeFamily {
                                 &coeff_a_dir_mixed,
                                 &coeff_a_dir_mixed,
                                 &coeff_aa_dir_mixed,
-                                &state.moments,
                             )?;
                         }
                         BmsFlexCalibrationOrder4Node::InterceptPrimaryMixedFourth {
@@ -6486,7 +6454,7 @@ impl BernoulliMarginalSlopeFamily {
                             let left_base = left_direction * r;
                             let right_base = right_direction * r;
                             f_au_mixed[pair * r + primary] +=
-                                exact::cell_fourth_derivative_from_moments(
+                                entry.fourth(
                                     cell,
                                     &dc_da,
                                     &coeff_jet.first[primary],
@@ -6503,7 +6471,6 @@ impl BernoulliMarginalSlopeFamily {
                                     &coeff_a_dir_mixed,
                                     &coeff_u_mixed[primary],
                                     &coeff_au_mixed[primary],
-                                    &state.moments,
                                 )?;
                         }
                         BmsFlexCalibrationOrder4Node::PrimaryPairMixedFourth {
@@ -6544,7 +6511,7 @@ impl BernoulliMarginalSlopeFamily {
                             );
                             let left_base = left_direction * r;
                             let right_base = right_direction * r;
-                            let value = exact::cell_fourth_derivative_from_moments(
+                            let value = entry.fourth(
                                 cell,
                                 &coeff_jet.first[left],
                                 &coeff_jet.first[right],
@@ -6561,7 +6528,6 @@ impl BernoulliMarginalSlopeFamily {
                                 &coeff_u_mixed[left],
                                 &coeff_u_mixed[right],
                                 &fourth_mixed,
-                                &state.moments,
                             )?;
                             let matrix_base = pair * r * r;
                             f_uv_mixed[matrix_base + left * r + right] += value;
@@ -6581,10 +6547,14 @@ impl BernoulliMarginalSlopeFamily {
         // C² at an interior knot but only C⁰ at a support edge, where its tails
         // turn constant, so an edge crossing adds terms from order two up and an
         // interior knot from order four up.
-        {
+        // A point-mass law has no moving boundary: its nodes stay put, and
+        // each lies in the one cell whose spans it evaluates.
+        if route.empirical_cells.is_none() {
             use super::standard_normal_flex_fifth::ExplicitSlot::{Coordinate, Intercept, U, V};
-            let partition: Vec<exact::DenestedPartitionCell> =
-                cells.iter().map(|entry| entry.partition_cell).collect();
+            let partition: Vec<exact::DenestedPartitionCell> = standard_normal_cells
+                .iter()
+                .map(|entry| entry.partition_cell)
+                .collect();
             let crossings = self
                 .standard_normal_flex_calibration_crossings(primary, a, b, &partition, directions)?;
             let direction_slots = [U, V];
@@ -7300,29 +7270,19 @@ impl BernoulliMarginalSlopeFamily {
                 .iter()
                 .map(|&(a, b)| (&axes[a], &axes[b]))
                 .collect::<Vec<_>>();
-            let axis_fourths = match self.training_row_grid(row)? {
-                Some(grid) => self.empirical_fourth_ordered_lanes(
-                    row,
-                    block_states,
-                    cache,
-                    row_ctx,
-                    &grid,
-                    &ordered_axes,
-                )?,
-                None => ordered_axes
-                    .iter()
-                    .map(|&(direction_u, direction_v)| {
-                        self.row_primary_fourth_contracted_ordered(
-                            row,
-                            block_states,
-                            cache,
-                            row_ctx,
-                            direction_u,
-                            direction_v,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, String>>()?,
-            };
+            let axis_fourths = ordered_axes
+                .iter()
+                .map(|&(direction_u, direction_v)| {
+                    self.row_primary_fourth_contracted_ordered(
+                        row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        direction_u,
+                        direction_v,
+                    )
+                })
+                .collect::<Result<Vec<_>, String>>()?;
             return Ok(direction_pairs
                 .iter()
                 .map(|(direction_u, direction_v)| {
@@ -7341,149 +7301,21 @@ impl BernoulliMarginalSlopeFamily {
                 })
                 .collect());
         }
-        let Some(grid) = self.training_row_grid(row)? else {
-            return direction_pairs
-                .iter()
-                .map(|(direction_u, direction_v)| {
-                    self.row_primary_fourth_contracted(
-                        row,
-                        block_states,
-                        cache,
-                        row_ctx,
-                        direction_u,
-                        direction_v,
-                    )
-                })
-                .collect();
-        };
-        if !flex_active {
-            return direction_pairs
-                .iter()
-                .map(|(direction_u, direction_v)| {
-                    self.row_primary_fourth_contracted(
-                        row,
-                        block_states,
-                        cache,
-                        row_ctx,
-                        direction_u,
-                        direction_v,
-                    )
-                })
-                .collect();
-        }
-
-        let fourth_schedule = empirical_bms_fourth_jet_schedule(expected);
-        if fourth_schedule == EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth {
-            return direction_pairs
-                .iter()
-                .map(|(direction_u, direction_v)| {
-                    self.row_primary_fourth_contracted(
-                        row,
-                        block_states,
-                        cache,
-                        row_ctx,
-                        direction_u,
-                        direction_v,
-                    )
-                })
-                .collect();
-        }
-
-        let mut ordered_pairs = Vec::with_capacity(2 * direction_pairs.len());
-        for &(direction_u, direction_v) in direction_pairs {
-            ordered_pairs.push((direction_u, direction_v));
-            ordered_pairs.push((direction_v, direction_u));
-        }
-        let ordered = self.empirical_fourth_ordered_lanes(
-            row,
-            block_states,
-            cache,
-            row_ctx,
-            &grid,
-            &ordered_pairs,
-        )?;
-        let mut contractions = Vec::with_capacity(direction_pairs.len());
-        let mut orientations = ordered.into_iter();
-        while let Some(mut ordered) = orientations.next() {
-            let swapped = orientations
-                .next()
-                .expect("each empirical BMS pair has two ordered orientations");
-            ordered.zip_mut_with(&swapped, |ordered, &swapped| {
-                *ordered = 0.5 * (*ordered + swapped);
-            });
-            contractions.push(ordered);
-        }
-        Ok(contractions)
-    }
-
-    /// The ordered fourth contractions `T4[u, v, ·, ·]` of one empirical FLEX
-    /// row, one per ordered pair and not symmetrized. The row plan is compiled
-    /// once and the lanes run in two-seed batches of
-    /// `2·PAIRS_PER_EMPIRICAL_BATCH`, so a caller that asks for both
-    /// orientations of each pair gets each pair's two in one batch.
-    fn empirical_fourth_ordered_lanes(
-        &self,
-        row: usize,
-        block_states: &[ParameterBlockState],
-        cache: &BernoulliMarginalSlopeExactEvalCache,
-        row_ctx: &BernoulliMarginalSlopeRowExactContext,
-        grid: &crate::bms::EmpiricalZGrid,
-        ordered_pairs: &[(&Array1<f64>, &Array1<f64>)],
-    ) -> Result<Vec<Array2<f64>>, String> {
-        const PAIRS_PER_EMPIRICAL_BATCH: usize = 4;
-
-        let primary = &cache.primary;
-        let batch_lanes = match empirical_bms_fourth_jet_schedule(primary.total) {
-            EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth => {
-                return ordered_pairs
-                    .iter()
-                    .map(|&(direction_u, direction_v)| {
-                        self.row_primary_fourth_contracted_ordered(
-                            row,
-                            block_states,
-                            cache,
-                            row_ctx,
-                            direction_u,
-                            direction_v,
-                        )
-                    })
-                    .collect();
-            }
-            EmpiricalBmsFourthJetSchedule::FixedWidthFromPlan => None,
-            EmpiricalBmsFourthJetSchedule::DynamicBatch { lanes } => Some(lanes),
-        };
-        let point = self.primary_point_from_block_states(row, block_states, primary)?;
-        let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
-        let plan = self.compile_empirical_bms_row_program(
-            row,
-            primary,
-            q,
-            b,
-            beta_h_owned.as_ref(),
-            beta_w_owned.as_ref(),
-            row_ctx.intercept,
-            grid,
-        )?;
-        let primary_point =
-            Self::intercept_primary_point(q, b, beta_h_owned.as_ref(), beta_w_owned.as_ref());
-        let mut lanes_out = Vec::with_capacity(ordered_pairs.len());
-        for chunk in ordered_pairs.chunks(2 * PAIRS_PER_EMPIRICAL_BATCH) {
-            let ordered = match batch_lanes {
-                None => {
-                    Self::empirical_fixed_fourth_many_from_plan::<4>(&plan, &primary_point, chunk)
-                }
-                Some(lanes) => Self::empirical_dynamic_fourth_batch_from_plan(
-                    &plan,
-                    &primary_point,
-                    chunk,
-                    primary,
-                    lanes,
-                    &self.jet_scratch.batch,
-                ),
-            }?;
-            lanes_out.extend(ordered);
-        }
-        Ok(lanes_out)
+        // Both latent laws contract the row's calibration cells, one pair at
+        // a time (gam#3290).
+        direction_pairs
+            .iter()
+            .map(|(direction_u, direction_v)| {
+                self.row_primary_fourth_contracted(
+                    row,
+                    block_states,
+                    cache,
+                    row_ctx,
+                    direction_u,
+                    direction_v,
+                )
+            })
+            .collect()
     }
 
     pub(super) fn row_primary_fourth_contracted(

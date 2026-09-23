@@ -1,7 +1,7 @@
 use gam_math::bivariate_normal::{BoundedProbability, bivariate_normal_interval_probability};
-use gam_math::probability::normal_cdf;
-use gam_math::roundoff::accumulation_growth;
-use gam_math::special::{CertifiedGaussLegendreRule, gauss_legendre_certified};
+use gam_math::probability::{normal_cdf, normal_logcdf, signed_probit_logcdf_and_mills_ratio};
+use gam_math::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
+use gam_math::special::{CertifiedGaussLegendreRule, gauss_legendre_certified, logaddexp};
 use gam_runtime::resource::{ByteLruCache, ResidentBytes};
 use smallvec::{SmallVec, smallvec};
 use std::hash::{Hash, Hasher};
@@ -2951,6 +2951,200 @@ fn evaluate_non_affine_cell_derivative_state(
 ) -> Result<CellDerivativeMomentState, String> {
     let (moments, _) = evaluate_non_affine_cell_simd::<false>(cell, max_degree);
     Ok(CellDerivativeMomentState { branch, moments })
+}
+
+/// A cell's value `∫φ(z)Φ(η(z)) dz` as a quadrature held in log units
+/// (gam#4504). Visits `(z_j, log ω_j)` for the nodes of the terminal
+/// Gauss–Legendre rule on a window `[l, r]` of the cell, with
+/// `log ω_j = log(w_j·(r − l)/2) − ½log τ − z_j²/2`, so the value is
+/// `Σ_j ω_j·Φ(η(z_j))` and each derivative channel is the same node sum
+/// against `φ(η)` (a moment contraction `Σ_k ∂c_k·M_k/τ` is that same sum,
+/// taken on this rule). No weight, value or moment is formed in linear
+/// probability, so a cell below `f64::MIN_POSITIVE` keeps its logarithm and
+/// its ratios; the caller sums the nodes by log-sum-exp.
+///
+/// `cell` is the cell whose value is wanted, negated on the survival side,
+/// because the window follows its integrand. Returns the log of a bound on
+/// the mass outside the window (`−∞` when the window is the whole cell),
+/// which the caller charges to the tail's rounding.
+///
+/// * An affine cell, finite or semi-infinite, is windowed by
+///   `affine_log_window`: its log integrand is concave, and the window is
+///   the super-level set that drops at most one unit roundoff of the cell's
+///   value. This form sums positive node terms, so it has no orthant
+///   difference to lose where the value underflows.
+/// * A curved cell is finite. Its window is the cell clipped to the radius the
+///   linear value clips to, [`gaussian_moment_underflow_radius`]`(0)`. Beyond
+///   that radius `φ(z)Φ(η) ≤ φ(z)`, so the dropped mass is at most `2Φ(−R)`.
+pub fn visit_cell_log_quadrature(
+    cell: DenestedCubicCell,
+    mut visit: impl FnMut(f64, f64),
+) -> Result<f64, String> {
+    validate_cell_inputs(cell)?;
+    let (left, right, log_dropped) = if cell.c2 == 0.0 && cell.c3 == 0.0 {
+        affine_log_window(cell)?
+    } else {
+        if !(cell.left.is_finite() && cell.right.is_finite()) {
+            return Err(CubicCellKernelError::invalid_cell_shape(format!(
+                "semi-infinite cell [{}, {}] must be affine (c2=c3=0), got c2={:.3e}, c3={:.3e}",
+                cell.left, cell.right, cell.c2, cell.c3
+            ))
+            .into());
+        }
+        let radius = gaussian_moment_underflow_radius(0);
+        let (left, right) = (cell.left.max(-radius), cell.right.min(radius));
+        let log_dropped = if left > cell.left || right < cell.right {
+            std::f64::consts::LN_2 + normal_logcdf(-radius)
+        } else {
+            f64::NEG_INFINITY
+        };
+        (left, right, log_dropped)
+    };
+    if !(left < right) {
+        return Ok(log_dropped);
+    }
+    let center = 0.5 * (left + right);
+    let half_width = 0.5 * (right - left);
+    let log_scale = half_width.ln() - 0.5 * std::f64::consts::TAU.ln();
+    let terminal = terminal_gl_rule();
+    for (&node, &weight) in terminal.nodes.iter().zip(terminal.weights.iter()) {
+        let z = center + half_width * node;
+        visit(z, weight.ln() + log_scale - 0.5 * z * z);
+    }
+    Ok(log_dropped)
+}
+
+/// The quadrature window `(l, r, log dropped)` of an affine cell in log units
+/// (gam#4504).
+///
+/// The cell's integrand is `e^{g(z)}/√τ` with
+/// `g(z) = −z²/2 + log Φ(c0 + c1·z)`. `log Φ` is concave with second
+/// derivative in `(−1, 0)`, so `−κ < g″ < −1` with `κ = 1 + c1²`, and `g′` is
+/// strictly decreasing. Let `ẑ` be the maximizer of `g` on the cell
+/// ([`affine_log_peak`]).
+///
+/// * Lower bound. Stepping `t ≤ δ` into the cell from `ẑ`,
+///   `g ≥ g(ẑ) − |g′(ẑ)|·t − κt²/2`. With `δ = min(w, 1/(|g′(ẑ)| + √κ))` and
+///   `w` the cell's width on the wider side of `ẑ`, that is at least
+///   `g(ẑ) − 3/2`, so the value is at least `δ·e^{g(ẑ) − 3/2}/√τ`.
+/// * Upper bound on what the window drops. Past an edge `e` where `g(e) ≤ ℓ`,
+///   `g′` points back toward `ẑ` and `g″ < −1`, so `g ≤ g(e) − t²/2`. The mass
+///   beyond `e` is then at most `e^{g(e)}/2`, and both sides together are at
+///   most `e^ℓ`.
+///
+/// With the level `ℓ = g(ẑ) − L` and
+/// `L = −log u − log δ + 3/2 + ½log τ`, the dropped mass is at most `u` times
+/// the value. The returned bound is the computed `e^{g(e)}/2` at each clipped
+/// edge, not this worst case.
+fn affine_log_window(cell: DenestedCubicCell) -> Result<(f64, f64, f64), String> {
+    let log_integrand = |z: f64| {
+        let (log_cdf, mills) = signed_probit_logcdf_and_mills_ratio(cell.c0 + cell.c1 * z);
+        (log_cdf - 0.5 * z * z, cell.c1 * mills - z)
+    };
+    let peak = affine_log_peak(cell, |z| log_integrand(z).1);
+    let (log_peak, slope) = log_integrand(peak);
+    if !(log_peak.is_finite() && slope.is_finite()) {
+        return Err(CubicCellKernelError::invalid_cell_shape(format!(
+            "affine cell [{}, {}] with c0={:.6e}, c1={:.6e} has no finite log integrand at its \
+             maximizer z={peak:e}: log value {log_peak:e}, slope {slope:e}",
+            cell.left, cell.right, cell.c0, cell.c1
+        ))
+        .into());
+    }
+    let curvature = 1.0 + cell.c1 * cell.c1;
+    let inward_width = (peak - cell.left).max(cell.right - peak);
+    let step = inward_width.min(1.0 / (slope.abs() + curvature.sqrt()));
+    let depth = -UNIT_ROUNDOFF.ln() - step.ln() + 1.5 + 0.5 * std::f64::consts::TAU.ln();
+    let level = log_peak - depth;
+    let log_value = |z: f64| log_integrand(z).0;
+    let (left, left_dropped) = affine_log_window_edge(cell.left, peak, -1.0, level, log_value);
+    let (right, right_dropped) = affine_log_window_edge(cell.right, peak, 1.0, level, log_value);
+    Ok((left, right, logaddexp(left_dropped, right_dropped)))
+}
+
+/// The maximizer of the concave `g` on the cell from its strictly decreasing
+/// slope `g′`: the cell edge where `g′` keeps one sign on the whole cell, else
+/// the root of `g′` bracketed by doubling steps from the finite probe nearest
+/// zero and bisected to adjacent floats. The doubling ends because
+/// `g″ < −1` makes `|g′|` fall by at least the step.
+fn affine_log_peak(cell: DenestedCubicCell, slope: impl Fn(f64) -> f64) -> f64 {
+    let probe = 0.0_f64.clamp(cell.left, cell.right);
+    let at_probe = slope(probe);
+    if at_probe == 0.0 {
+        return probe;
+    }
+    let direction = if at_probe > 0.0 { 1.0 } else { -1.0 };
+    let edge = if at_probe > 0.0 { cell.right } else { cell.left };
+    let mut inner = probe;
+    let mut step = 1.0;
+    let mut outer = loop {
+        let candidate = probe + direction * step;
+        if edge.is_finite() && (candidate - edge) * direction >= 0.0 {
+            if slope(edge) * direction >= 0.0 {
+                return edge;
+            }
+            break edge;
+        }
+        if !(slope(candidate) * direction > 0.0) {
+            break candidate;
+        }
+        inner = candidate;
+        step *= 2.0;
+    };
+    loop {
+        let mid = inner + 0.5 * (outer - inner);
+        if mid == inner || mid == outer {
+            return inner;
+        }
+        if slope(mid) * direction > 0.0 {
+            inner = mid;
+        } else {
+            outer = mid;
+        }
+    }
+}
+
+/// One edge of [`affine_log_window`] on the side `direction` of `peak`: the
+/// cell's own edge where `g` is still at or above `level` there, dropping
+/// nothing; otherwise the crossing of `level`, bracketed by doubling steps
+/// (which end because `g ≤ g(ẑ) − t²/2` outward) and bisected to adjacent
+/// floats, returned as the outer float of the pair, with the log of the mass
+/// it drops, `g(e) − log 2`.
+fn affine_log_window_edge(
+    cell_edge: f64,
+    peak: f64,
+    direction: f64,
+    level: f64,
+    log_value: impl Fn(f64) -> f64,
+) -> (f64, f64) {
+    if cell_edge.is_finite() && log_value(cell_edge) >= level {
+        return (cell_edge, f64::NEG_INFINITY);
+    }
+    let mut inner = peak;
+    let mut step = 1.0;
+    let mut outer = loop {
+        let candidate = peak + direction * step;
+        if cell_edge.is_finite() && (candidate - cell_edge) * direction >= 0.0 {
+            break cell_edge;
+        }
+        if !(log_value(candidate) >= level) {
+            break candidate;
+        }
+        inner = candidate;
+        step *= 2.0;
+    };
+    loop {
+        let mid = inner + 0.5 * (outer - inner);
+        if mid == inner || mid == outer {
+            break;
+        }
+        if log_value(mid) >= level {
+            inner = mid;
+        } else {
+            outer = mid;
+        }
+    }
+    (outer, log_value(outer) - std::f64::consts::LN_2)
 }
 
 /// De-nested cubic cell evaluator.

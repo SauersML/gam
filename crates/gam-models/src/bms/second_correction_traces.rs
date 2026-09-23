@@ -17,19 +17,14 @@
 //! `√λ_k·v_k` of `G_i`'s eigenpairs. Forming the drifts instead takes two fourth
 //! contractions and one third per row and pair.
 //!
-//! An empirical flex row with fewer directions than primaries skips `N_i`: its
-//! jets take the directions themselves as free axes, so each factor column's
-//! contraction is `T4_i[f_c, f_c, d_a, d_b]` directly, carried at `m²` rather
-//! than `r²` order-two coefficients.
+//! Both latent laws form `N_i` from the row's calibration cells (gam#3290):
+//! each fourth contraction costs the cells' active columns and one `r²`
+//! finalizer, not a pass of the row program's dense jets.
 
-use super::EmpiricalZGrid;
-use super::cell_moment_assembly::empirical_bms_runtime_batch_lanes;
 use super::exact_eval_cache::*;
 use super::family::*;
 use super::gradient_paths::*;
-use super::hessian_paths::{BernoulliMarginalSlopeRowExactContext, PrimarySlices};
 use crate::custom_family::BlockwiseFitOptions;
-use gam_math::jet_scalar::DynamicTwoSeedBatch;
 use gam_problem::ParameterBlockState;
 use ndarray::{Array1, Array2};
 
@@ -109,11 +104,6 @@ impl BernoulliMarginalSlopeFamily {
             .collect();
         let weighted_rows = cache.outer_weighted_rows_cached(options, n);
         let m = directions.ncols();
-        // An empirical flex row contracts its fourth derivative straight onto the
-        // directions whenever they are fewer than the primaries, so each seed's jet
-        // carries `m²` instead of `r²` order-two coefficients.
-        let project_onto_directions =
-            self.effective_flex_active(block_states)? && m < primary.total;
         let started = std::time::Instant::now();
         // `N_i` is linear in the row's gram `G_i`, so its seeds may be the
         // columns of any root of `G_i`. Past `r` factor columns they are the
@@ -166,49 +156,30 @@ impl BernoulliMarginalSlopeFamily {
                                 )
                             })
                             .collect::<Result<Vec<_>, String>>()?;
-                        let grid = if project_onto_directions {
-                            self.training_row_grid(row)?
-                        } else {
-                            None
-                        };
-                        let fourth = match grid {
-                            Some(grid) => self.empirical_flex_row_fourth_factor_contraction_along(
+                        let mut contracted = Array2::<f64>::zeros((r, r));
+                        for column in 0..seed_rank {
+                            for (axis, value) in seed.iter_mut().enumerate() {
+                                *value = seeds[axis * seed_rank + column];
+                            }
+                            if seed.iter().all(|value| *value == 0.0) {
+                                continue;
+                            }
+                            contracted += &self.row_primary_fourth_contracted_ordered(
                                 row,
                                 block_states,
-                                primary,
+                                cache,
                                 row_ctx,
-                                &grid,
-                                seeds,
-                                seed_rank,
-                                &row_directions,
-                            )?,
-                            None => {
-                                let mut contracted = Array2::<f64>::zeros((r, r));
-                                for column in 0..seed_rank {
-                                    for (axis, value) in seed.iter_mut().enumerate() {
-                                        *value = seeds[axis * seed_rank + column];
-                                    }
-                                    if seed.iter().all(|value| *value == 0.0) {
-                                        continue;
-                                    }
-                                    contracted += &self.row_primary_fourth_contracted_ordered(
-                                        row,
-                                        block_states,
-                                        cache,
-                                        row_ctx,
-                                        &seed,
-                                        &seed,
-                                    )?;
-                                }
-                                let applied: Vec<Array1<f64>> = row_directions
-                                    .iter()
-                                    .map(|direction| contracted.dot(direction))
-                                    .collect();
-                                Array2::from_shape_fn((m, m), |(a, b)| {
-                                    row_directions[a].dot(&applied[b])
-                                })
-                            }
-                        };
+                                &seed,
+                                &seed,
+                            )?;
+                        }
+                        let applied: Vec<Array1<f64>> = row_directions
+                            .iter()
+                            .map(|direction| contracted.dot(direction))
+                            .collect();
+                        let fourth = Array2::from_shape_fn((m, m), |(a, b)| {
+                            row_directions[a].dot(&applied[b])
+                        });
                         for ((value, &(a, b)), mode) in acc.iter_mut().zip(pairs).zip(&mode_columns)
                         {
                             let row_mode =
@@ -263,84 +234,6 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
         Ok(())
-    }
-
-    /// `Σ_c T4_i[f_c, f_c, d_a, d_b]` over one empirical flex row's projected
-    /// factor columns (`projection`, row-major `r × rank`), as the `m × m` matrix
-    /// over its projected directions `d_a`.
-    ///
-    /// The row plan is compiled once, and the jet's free axes are the directions
-    /// themselves (`DynamicTwoSeedBatch::seed_direction_pairs_along`): the lanes
-    /// are the factor columns, each the repeated seed `(f_c, f_c)`, and each lane's
-    /// contracted fourth is already the `m × m` projection.
-    fn empirical_flex_row_fourth_factor_contraction_along(
-        &self,
-        row: usize,
-        block_states: &[ParameterBlockState],
-        primary: &PrimarySlices,
-        row_ctx: &BernoulliMarginalSlopeRowExactContext,
-        grid: &EmpiricalZGrid,
-        projection: &[f64],
-        rank: usize,
-        row_directions: &[Array1<f64>],
-    ) -> Result<Array2<f64>, String> {
-        let r = primary.total;
-        let m = row_directions.len();
-        if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
-            return Err(
-                "non-finite empirical flexible row context in projected fourth contraction".into(),
-            );
-        }
-        let point = self.primary_point_from_block_states(row, block_states, primary)?;
-        let (q, b, beta_h, beta_w) = self.primary_point_components(&point, primary);
-        let plan = self.compile_empirical_bms_row_program(
-            row,
-            primary,
-            q,
-            b,
-            beta_h.as_ref(),
-            beta_w.as_ref(),
-            row_ctx.intercept,
-            grid,
-        )?;
-        let primary_point = Self::intercept_primary_point(q, b, beta_h.as_ref(), beta_w.as_ref());
-        let seeds: Vec<usize> = (0..rank)
-            .filter(|&column| (0..r).any(|axis| projection[axis * rank + column] != 0.0))
-            .collect();
-        let gradients: Vec<Vec<f64>> = (0..r)
-            .map(|axis| {
-                row_directions
-                    .iter()
-                    .map(|direction| direction[axis])
-                    .collect()
-            })
-            .collect();
-        let lanes = empirical_bms_runtime_batch_lanes(m);
-        let mut total = Array2::<f64>::zeros((m, m));
-        self.jet_scratch.batch.with(|workspace| -> Result<(), String> {
-            for chunk in seeds.chunks(lanes) {
-                workspace.reset(chunk.len());
-                let vars = workspace.alloc_slice_fill_with(r, |axis| {
-                    DynamicTwoSeedBatch::seed_direction_pairs_along(
-                        primary_point[axis],
-                        &gradients[axis],
-                        &workspace,
-                        |lane| {
-                            let seed = projection[axis * rank + chunk[lane]];
-                            (seed, seed)
-                        },
-                    )
-                });
-                let jet = plan.evaluate(vars, 4, &workspace)?;
-                for lane in 0..chunk.len() {
-                    for (value, contribution) in total.iter_mut().zip(jet.contracted_fourth(lane)) {
-                        *value += *contribution;
-                    }
-                }
-            }
-            Ok(())
-        })?;
-        Ok(total)
     }
 }
 

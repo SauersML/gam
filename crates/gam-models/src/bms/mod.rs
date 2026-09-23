@@ -4535,6 +4535,7 @@ mod stacked_first_stage_sandwich_2484_tests {
 mod anchor_law_2926_tests;
 pub(crate) mod axis_direction_search;
 pub(crate) mod cell_moment_assembly;
+mod calibration_cells;
 #[cfg(test)]
 mod closed_form_certificate_2926_tests;
 #[cfg(test)]
@@ -4582,6 +4583,8 @@ mod flex_verify_932_tests;
 mod flex_measure_932_tests;
 #[cfg(test)]
 mod third_trace_2998_tests;
+#[cfg(test)]
+mod factored_link_block_3290_tests;
 // gam#2768 unit gates on the shared latent-measure decision and the conditional
 // location-scale calibration it escalates to. Bare `#[cfg(test)] mod` with the
 // allowed `*_tests` name so the build.rs ban-scanner exempts it.

@@ -402,20 +402,6 @@ impl BmsFlexRowProgram {
         )
     }
 
-    pub(super) fn try_for_each_calibration_order2_contiguous<E>(
-        active_primaries: std::ops::Range<usize>,
-        need_hessian: bool,
-        visit: impl FnMut(BmsFlexCalibrationOrder2Node) -> Result<(), E>,
-    ) -> Result<(), E> {
-        let start = active_primaries.start;
-        Self::try_for_each_calibration_order2_indexed(
-            active_primaries.len(),
-            |position| start + position,
-            need_hessian,
-            visit,
-        )
-    }
-
     fn try_for_each_calibration_order2_indexed<E>(
         active_count: usize,
         active_at: impl Fn(usize) -> usize,
@@ -475,16 +461,15 @@ impl BmsFlexRowProgram {
     }
 
     /// Interpret the canonical directional derivative of the Order2 schedule
-    /// for a contiguous range of active primary coordinates.
-    pub(super) fn try_for_each_calibration_order3_contiguous<E>(
-        active_primaries: std::ops::Range<usize>,
+    /// for one cell's sparse active primary coordinates (gam#3290).
+    pub(super) fn try_for_each_calibration_order3<E>(
+        active_primaries: &[usize],
         direction_count: usize,
         visit: impl FnMut(BmsFlexCalibrationOrder3Node) -> Result<(), E>,
     ) -> Result<(), E> {
-        let start = active_primaries.start;
         Self::try_for_each_calibration_order3_indexed(
             active_primaries.len(),
-            |position| start + position,
+            |position| active_primaries[position],
             direction_count,
             visit,
         )
@@ -525,17 +510,16 @@ impl BmsFlexRowProgram {
     }
 
     /// Interpret the canonical mixed directional derivative of the Order2
-    /// schedule for a contiguous primary range and
-    /// `direction_pair_count` backend-owned direction pairs.
-    pub(super) fn try_for_each_calibration_order4_contiguous<E>(
-        active_primaries: std::ops::Range<usize>,
+    /// schedule for one cell's sparse active primary coordinates and
+    /// `direction_pair_count` backend-owned direction pairs (gam#3290).
+    pub(super) fn try_for_each_calibration_order4<E>(
+        active_primaries: &[usize],
         direction_pair_count: usize,
         visit: impl FnMut(BmsFlexCalibrationOrder4Node) -> Result<(), E>,
     ) -> Result<(), E> {
-        let start = active_primaries.start;
         Self::try_for_each_calibration_order4_indexed(
             active_primaries.len(),
-            |position| start + position,
+            |position| active_primaries[position],
             direction_pair_count,
             visit,
         )

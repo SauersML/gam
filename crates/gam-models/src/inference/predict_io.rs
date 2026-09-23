@@ -5,8 +5,9 @@ use crate::bms::{
 };
 use crate::inference::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
 use crate::latent_anchor::{
-    CalibrationTail, CalibrationUnit, smaller_tail_log_target, solve_log_tail_root,
-    sum_calibration_tail,
+    CalibrationTail, CalibrationUnit, linear_cell_tail_is_representable,
+    smaller_tail_log_target, solve_log_tail_root, sum_calibration_tail,
+    sum_denested_cells_in_log_space,
 };
 use crate::marginal_slope_shared::{
     ObservedDenestedCellPartials, eval_coeff4_at,
@@ -1277,7 +1278,8 @@ impl BernoulliMarginalSlopePredictor {
     /// (gam#3216, gam#3333): on the survival side each cell is evaluated with
     /// its index negated, whose value is `∫φ(z)Φ(−η(z)) dz`, and whose moments
     /// are the cell's own, so they contract with the cell's `∂c/∂a` into `P′`
-    /// and `P″`.
+    /// and `P″`. Where the linear sum no longer holds its value, the same
+    /// cells are summed in log units, as the fit sums them (gam#4504).
     fn evaluate_denested_calibration_tail(
         &self,
         a: f64,
@@ -1302,6 +1304,7 @@ impl BernoulliMarginalSlopePredictor {
         let mut tail_rounding = 0.0;
         let mut density = 0.0;
         let mut density_slope = 0.0;
+        let mut log_space_cells = Vec::with_capacity(cells.len());
         for partition_cell in cells {
             let cell = partition_cell.cell;
             let (dc_da_raw, _) = crate::cubic_cell_kernel::denested_cell_coefficient_partials(
@@ -1350,14 +1353,19 @@ impl BernoulliMarginalSlopePredictor {
                 &state.moments,
             )
             .map_err(EstimationError::InvalidInput)?;
+            log_space_cells.push((cell, dc_da, d2c_da2));
         }
-        Ok(CalibrationTail::from_linear(
-            tail,
-            density,
-            Some(density_slope),
-            summands,
-            tail_rounding,
-        ))
+        if linear_cell_tail_is_representable(tail, tail_rounding, summands) {
+            return Ok(CalibrationTail::from_linear(
+                tail,
+                density,
+                Some(density_slope),
+                summands,
+                tail_rounding,
+            ));
+        }
+        sum_denested_cells_in_log_space(survival_side, true, log_space_cells)
+            .map_err(EstimationError::InvalidInput)
     }
 
     fn observed_denested_cell_partials_at_z(

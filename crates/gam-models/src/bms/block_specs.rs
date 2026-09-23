@@ -3412,7 +3412,6 @@ fn fit_bernoulli_marginal_slope_terms_under(
         .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
     let cell_moment_lru = new_cell_moment_lru_cache(policy);
     let cell_moment_cache_stats = new_cell_moment_cache_stats();
-    let jet_scratch = super::hessian_paths::new_jet_scratch();
     let make_family = |marginal_design: &TermCollectionDesign,
                        slope_design: &TermCollectionDesign,
                        sigma: Option<f64>|
@@ -3461,7 +3460,6 @@ fn fit_bernoulli_marginal_slope_terms_under(
             policy: policy.clone(),
             cell_moment_lru: Arc::clone(&cell_moment_lru),
             cell_moment_cache_stats: Arc::clone(&cell_moment_cache_stats),
-            jet_scratch: Arc::clone(&jet_scratch),
             intercept_warm_starts: Some(Arc::clone(&intercept_warm_starts)),
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),

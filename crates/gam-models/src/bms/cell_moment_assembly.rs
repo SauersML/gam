@@ -17,99 +17,9 @@ use super::*;
 use crate::fnv1a::Fnv1a;
 use crate::latent_anchor::{
     AnchorGridOwned, AnchorTaylor, CalibrationTail, CalibrationUnit, anchor_derivatives_in_slot,
-    anchor_taylor_in_slot, smaller_tail_log_target, solve_anchor, solve_log_tail_root,
-    sum_calibration_tail,
+    anchor_taylor_in_slot, linear_cell_tail_is_representable, smaller_tail_log_target,
+    solve_anchor, solve_log_tail_root, sum_calibration_tail, sum_denested_cells_in_log_space,
 };
-use gam_math::jet_scalar::{
-    DynamicOneSeedBatch, DynamicTwoSeedBatch, FixedRuntimeJet, OneSeed, TwoSeed,
-};
-use gam_math::jet_trace::DynamicTraceJet;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum EmpiricalBmsThirdJetSchedule {
-    FixedWidthFromPlan,
-    DynamicBatch { lanes: usize },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum EmpiricalBmsFourthJetSchedule {
-    FixedWidthFromPlan,
-    RepeatedFixedWidth,
-    DynamicBatch { lanes: usize },
-}
-
-/// Bound the live directional jet work for widths without a fixed
-/// specialization.
-///
-/// Each lane carries `r²` order-two coefficients, while the basis-dependent
-/// row program contributes `O(r)` live tape nodes. Bounding `lanes·r³` tracks
-/// the leading working set that caused the measured cache cliff and geometric
-/// arena growth, while every chunk still evaluates the same frozen
-/// [`BmsFlexRowProgram`].
-const EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET: usize = 4096;
-const EMPIRICAL_BMS_BATCH_LANE_CAP: usize = 8;
-
-/// #3290 — CHUNKING IS ONLY WORTH ITS EXTRA BASE PASSES WHERE IT CAN MEET THE
-/// BOUND IT IS CHUNKING FOR.
-///
-/// A chunk's resident working set is `chunk_len · r³` floats, and a chunk's
-/// batch evaluates the frozen row program ONCE for the whole chunk: the shared
-/// base channel (the order-two jet over all `r` axes, carried through every
-/// calibration node and through the implicit intercept solve) is computed once
-/// per chunk, and each lane adds only its own nilpotent channel. So splitting
-/// `d` requested directions into `c = ceil(d / lanes)` chunks costs `c` full
-/// base passes instead of one, and buys a resident set `lanes · r³` instead of
-/// `d · r³`.
-///
-/// That trade is worth making only while the smaller resident set is BELOW the
-/// budget. Once ONE lane already exceeds it — `r³ > BUDGET`, i.e. every
-/// `r >= 16`, which is every flex width the BMS product actually reaches — no
-/// chunk length meets the bound, so chunking cannot deliver what it is paid
-/// for and the extra base passes are pure loss. In that regime the lane count
-/// is not the budget's to choose; the declared ceiling
-/// [`EMPIRICAL_BMS_BATCH_LANE_CAP`] is what bounds the arena, exactly as it
-/// does at the small widths where the quotient saturates it.
-///
-/// The returned value is an UPPER BOUND on a chunk, never a floor: each call
-/// site sizes its workspace with `workspace.reset(chunk.len())` and
-/// `chunk.len() = min(lanes, remaining)`, so raising `lanes` never allocates
-/// more than the caller actually asked for and never adds a pass. At the two
-/// structural request sizes on this route — the third contraction's two axis
-/// directions `e_q`, `e_g`, and the fourth's four ordered axis pairs
-/// (`row_primary_hessian::flex_axis_{third,fourth}_tensors_for_row`) — the old
-/// rule returned 1 for every `r >= 16` and so evaluated the row program twice
-/// and four times per row per outer evaluation, where once serves both.
-///
-/// This changes no value: lanes are independent inside a batch and the base
-/// channel is recomputed identically per chunk, so a contraction is
-/// bit-identical under any chunking.
-#[inline]
-pub(super) fn empirical_bms_runtime_batch_lanes(r: usize) -> usize {
-    let tape_work_per_lane = r.saturating_mul(r).saturating_mul(r).max(1);
-    if tape_work_per_lane > EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET {
-        return EMPIRICAL_BMS_BATCH_LANE_CAP;
-    }
-    (EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET / tape_work_per_lane).min(EMPIRICAL_BMS_BATCH_LANE_CAP)
-}
-
-pub(super) fn empirical_bms_third_jet_schedule(r: usize) -> EmpiricalBmsThirdJetSchedule {
-    match r {
-        4 | 8 | 12 | 18 => EmpiricalBmsThirdJetSchedule::FixedWidthFromPlan,
-        runtime_width => EmpiricalBmsThirdJetSchedule::DynamicBatch {
-            lanes: empirical_bms_runtime_batch_lanes(runtime_width),
-        },
-    }
-}
-
-pub(super) fn empirical_bms_fourth_jet_schedule(r: usize) -> EmpiricalBmsFourthJetSchedule {
-    match r {
-        4 => EmpiricalBmsFourthJetSchedule::FixedWidthFromPlan,
-        8 | 12 | 18 => EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth,
-        runtime_width => EmpiricalBmsFourthJetSchedule::DynamicBatch {
-            lanes: empirical_bms_runtime_batch_lanes(runtime_width),
-        },
-    }
-}
 
 /// Bounded same-β reuse store for the BMS per-row cell-moment exact-cache.
 ///
@@ -1039,623 +949,6 @@ impl BernoulliMarginalSlopeFamily {
             scaled_intercept / scale,
             grid,
         )
-    }
-
-    #[inline]
-    fn empirical_fixed_third_contracted_arrays<const K: usize>(
-        plan: &BmsFlexRowProgram,
-        point: &[f64; K],
-        direction: &[f64; K],
-    ) -> Result<Array2<f64>, String> {
-        let vars: [FixedRuntimeJet<OneSeed<K>, K>; K] = std::array::from_fn(|axis| {
-            FixedRuntimeJet::from_inner(OneSeed::seed_direction(point[axis], axis, direction[axis]))
-        });
-        let contracted = plan
-            .evaluate(&vars, 3, &())?
-            .into_inner()
-            .contracted_third();
-        Ok(Array2::from_shape_fn((K, K), |(a, b)| contracted[a][b]))
-    }
-
-    #[inline]
-    fn empirical_fixed_third_contracted<const K: usize>(
-        plan: &BmsFlexRowProgram,
-        point: &[f64],
-        direction: &Array1<f64>,
-    ) -> Result<Array2<f64>, String> {
-        let point: &[f64; K] = point.try_into().map_err(|_| {
-            format!(
-                "fixed empirical BMS point length {} != specialization width {K}",
-                point.len()
-            )
-        })?;
-        let direction: &[f64; K] = direction
-            .as_slice()
-            .and_then(|values| values.try_into().ok())
-            .ok_or_else(|| {
-                format!(
-                    "fixed empirical BMS third direction length {} != specialization width {K}",
-                    direction.len()
-                )
-            })?;
-        Self::empirical_fixed_third_contracted_arrays(plan, point, direction)
-    }
-
-    #[inline]
-    fn empirical_fixed_fourth_contracted_arrays<const K: usize>(
-        plan: &BmsFlexRowProgram,
-        point: &[f64; K],
-        direction_u: &[f64; K],
-        direction_v: &[f64; K],
-    ) -> Result<Array2<f64>, String> {
-        let vars: [FixedRuntimeJet<TwoSeed<K>, K>; K] = std::array::from_fn(|axis| {
-            FixedRuntimeJet::from_inner(TwoSeed::seed(
-                point[axis],
-                axis,
-                direction_u[axis],
-                direction_v[axis],
-            ))
-        });
-        let contracted = plan
-            .evaluate(&vars, 4, &())?
-            .into_inner()
-            .contracted_fourth();
-        Ok(Array2::from_shape_fn((K, K), |(a, b)| contracted[a][b]))
-    }
-
-    #[inline]
-    fn empirical_fixed_fourth_contracted<const K: usize>(
-        plan: &BmsFlexRowProgram,
-        point: &[f64],
-        direction_u: &Array1<f64>,
-        direction_v: &Array1<f64>,
-    ) -> Result<Array2<f64>, String> {
-        let point: &[f64; K] = point.try_into().map_err(|_| {
-            format!(
-                "fixed empirical BMS point length {} != specialization width {K}",
-                point.len()
-            )
-        })?;
-        let direction_u: &[f64; K] = direction_u
-            .as_slice()
-            .and_then(|values| values.try_into().ok())
-            .ok_or_else(|| {
-                format!(
-                    "fixed empirical BMS fourth first-direction length {} != specialization width {K}",
-                    direction_u.len()
-                )
-            })?;
-        let direction_v: &[f64; K] = direction_v
-            .as_slice()
-            .and_then(|values| values.try_into().ok())
-            .ok_or_else(|| {
-                format!(
-                    "fixed empirical BMS fourth second-direction length {} != specialization width {K}",
-                    direction_v.len()
-                )
-            })?;
-        Self::empirical_fixed_fourth_contracted_arrays(plan, point, direction_u, direction_v)
-    }
-
-    fn empirical_fixed_third_many_from_plan<const K: usize>(
-        plan: &BmsFlexRowProgram,
-        point: &[f64],
-        directions: &[Array1<f64>],
-    ) -> Result<Vec<Array2<f64>>, String> {
-        let point: &[f64; K] = point.try_into().map_err(|_| {
-            format!(
-                "fixed empirical BMS point length {} != specialization width {K}",
-                point.len()
-            )
-        })?;
-        directions
-            .iter()
-            .map(|direction| {
-                let direction: &[f64; K] = direction
-                    .as_slice()
-                    .and_then(|values| values.try_into().ok())
-                    .ok_or_else(|| {
-                        format!(
-                            "fixed empirical BMS third direction length {} != specialization width {K}",
-                            direction.len()
-                        )
-                    })?;
-                Self::empirical_fixed_third_contracted_arrays(plan, point, direction)
-            })
-            .collect()
-    }
-
-    fn empirical_fixed_third_many_dispatch(
-        plan: &BmsFlexRowProgram,
-        point: &[f64],
-        directions: &[Array1<f64>],
-        r: usize,
-    ) -> Result<Vec<Array2<f64>>, String> {
-        match r {
-            4 => Self::empirical_fixed_third_many_from_plan::<4>(plan, point, directions),
-            8 => Self::empirical_fixed_third_many_from_plan::<8>(plan, point, directions),
-            12 => Self::empirical_fixed_third_many_from_plan::<12>(plan, point, directions),
-            18 => Self::empirical_fixed_third_many_from_plan::<18>(plan, point, directions),
-            _ => Err(format!(
-                "unsupported fixed empirical BMS third-many specialization width {r}"
-            )),
-        }
-    }
-
-    pub(super) fn empirical_fixed_fourth_many_from_plan<const K: usize>(
-        plan: &BmsFlexRowProgram,
-        point: &[f64],
-        direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
-    ) -> Result<Vec<Array2<f64>>, String> {
-        let point: &[f64; K] = point.try_into().map_err(|_| {
-            format!(
-                "fixed empirical BMS point length {} != specialization width {K}",
-                point.len()
-            )
-        })?;
-        direction_pairs
-            .iter()
-            .map(|(direction_u, direction_v)| {
-                let direction_u: &[f64; K] = direction_u
-                    .as_slice()
-                    .and_then(|values| values.try_into().ok())
-                    .ok_or_else(|| {
-                        format!(
-                            "fixed empirical BMS fourth first-direction length {} != specialization width {K}",
-                            direction_u.len()
-                        )
-                    })?;
-                let direction_v: &[f64; K] = direction_v
-                    .as_slice()
-                    .and_then(|values| values.try_into().ok())
-                    .ok_or_else(|| {
-                        format!(
-                            "fixed empirical BMS fourth second-direction length {} != specialization width {K}",
-                            direction_v.len()
-                        )
-                    })?;
-                Self::empirical_fixed_fourth_contracted_arrays(
-                    plan,
-                    point,
-                    direction_u,
-                    direction_v,
-                )
-            })
-            .collect()
-    }
-
-    pub(super) fn empirical_flex_row_third_contracted(
-        &self,
-        row: usize,
-        primary: &PrimarySlices,
-        q: f64,
-        b: f64,
-        beta_h: Option<&Array1<f64>>,
-        beta_w: Option<&Array1<f64>>,
-        row_ctx: &BernoulliMarginalSlopeRowExactContext,
-        dir: &Array1<f64>,
-        grid: &EmpiricalZGrid,
-    ) -> Result<Array2<f64>, String> {
-        let r = primary.total;
-        if dir.len() != r {
-            return Err(format!(
-                "bernoulli empirical flex third contraction direction length {} != primary dimension {r}",
-                dir.len()
-            ));
-        }
-        if dir.iter().all(|value| *value == 0.0) {
-            return Ok(Array2::<f64>::zeros((r, r)));
-        }
-        if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
-            return Err("non-finite empirical flexible row context in third contraction".into());
-        }
-        if matches!(r, 4 | 8 | 12 | 18) {
-            let plan = self.compile_empirical_bms_row_program(
-                row,
-                primary,
-                q,
-                b,
-                beta_h,
-                beta_w,
-                row_ctx.intercept,
-                grid,
-            )?;
-            let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-            return match r {
-                4 => Self::empirical_fixed_third_contracted::<4>(&plan, &point, dir),
-                8 => Self::empirical_fixed_third_contracted::<8>(&plan, &point, dir),
-                12 => Self::empirical_fixed_third_contracted::<12>(&plan, &point, dir),
-                18 => Self::empirical_fixed_third_contracted::<18>(&plan, &point, dir),
-                _ => Err(format!(
-                    "unsupported fixed empirical BMS third specialization width {r}"
-                )),
-            };
-        }
-        let mut contracted = self.empirical_flex_row_third_contracted_many(
-            row,
-            primary,
-            q,
-            b,
-            beta_h,
-            beta_w,
-            row_ctx,
-            std::slice::from_ref(dir),
-            grid,
-        )?;
-        Ok(contracted
-            .pop()
-            .expect("one empirical BMS direction produces one contraction"))
-    }
-
-    /// Evaluate every requested third contraction from one canonical row plan.
-    /// Common widths reuse the plan across fixed-width lanes; other runtime
-    /// widths reuse it across bounded arena chunks.
-    pub(super) fn empirical_flex_row_third_contracted_many(
-        &self,
-        row: usize,
-        primary: &PrimarySlices,
-        q: f64,
-        b: f64,
-        beta_h: Option<&Array1<f64>>,
-        beta_w: Option<&Array1<f64>>,
-        row_ctx: &BernoulliMarginalSlopeRowExactContext,
-        row_dirs: &[Array1<f64>],
-        grid: &EmpiricalZGrid,
-    ) -> Result<Vec<Array2<f64>>, String> {
-        let r = primary.total;
-        if row_dirs.is_empty() {
-            return Ok(Vec::new());
-        }
-        if let Some((lane, direction)) = row_dirs
-            .iter()
-            .enumerate()
-            .find(|(_, direction)| direction.len() != r)
-        {
-            return Err(format!(
-                "bernoulli empirical flex third contraction direction {lane} length {} != primary dimension {r}",
-                direction.len()
-            ));
-        }
-        if row_dirs
-            .iter()
-            .all(|direction| direction.iter().all(|value| *value == 0.0))
-        {
-            return Ok(row_dirs
-                .iter()
-                .map(|_| Array2::<f64>::zeros((r, r)))
-                .collect());
-        }
-        if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
-            return Err("non-finite empirical flexible row context in third contraction".into());
-        }
-        let plan = self.compile_empirical_bms_row_program(
-            row,
-            primary,
-            q,
-            b,
-            beta_h,
-            beta_w,
-            row_ctx.intercept,
-            grid,
-        )?;
-        let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        match empirical_bms_third_jet_schedule(r) {
-            EmpiricalBmsThirdJetSchedule::FixedWidthFromPlan => {
-                Self::empirical_fixed_third_many_dispatch(&plan, &point, row_dirs, r)
-            }
-            EmpiricalBmsThirdJetSchedule::DynamicBatch { lanes } => self
-                .jet_scratch
-                .batch
-                .with(|workspace| {
-                    let mut contracted = Vec::with_capacity(row_dirs.len());
-                    for directions in row_dirs.chunks(lanes) {
-                        workspace.reset(directions.len());
-                        let vars = workspace.alloc_slice_fill_with(r, |axis| {
-                            DynamicOneSeedBatch::seed_directions(
-                                point[axis],
-                                axis,
-                                r,
-                                &workspace,
-                                |lane| directions[lane][axis],
-                            )
-                        });
-                        let jet = plan.evaluate(vars, 3, &workspace)?;
-                        for lane in 0..directions.len() {
-                            contracted.push(
-                                Array2::from_shape_vec((r, r), jet.contracted_third(lane).to_vec())
-                                    .map_err(|error| {
-                                        format!("empirical BMS third-contraction shape: {error}")
-                                    })?,
-                            );
-                        }
-                    }
-                    Ok(contracted)
-                }),
-        }
-    }
-
-    /// `g_c = Σ_ab gram[ab] · D³f[a,b,c]` from one row plan.
-    ///
-    /// D³f is symmetric in `(a, b)`, so only `S = (gram + gramᵀ)/2` enters,
-    /// and with `S = Σ_k λ_k v_k v_kᵀ`, `g = Σ_k λ_k D³f[v_k, v_k, ·]`. One
-    /// [`DynamicTraceJet`] pass carries every `D³f[v_k, v_k, ·]` at `O(r)`
-    /// floats per lane, where seeding one contraction lane per output axis
-    /// carries an `r × r` Hessian in each (gam#2998). No rank-three tensor is
-    /// materialized and no width has its own schedule.
-    pub(super) fn empirical_flex_row_third_trace_gradient(
-        &self,
-        row: usize,
-        primary: &PrimarySlices,
-        q: f64,
-        b: f64,
-        beta_h: Option<&Array1<f64>>,
-        beta_w: Option<&Array1<f64>>,
-        row_ctx: &BernoulliMarginalSlopeRowExactContext,
-        gram: &[f64],
-        grid: &EmpiricalZGrid,
-    ) -> Result<Array1<f64>, String> {
-        let r = primary.total;
-        if gram.len() != r * r {
-            return Err(format!(
-                "bernoulli empirical flex third trace gram length {} != {}",
-                gram.len(),
-                r * r
-            ));
-        }
-        if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
-            return Err("non-finite empirical flexible row context in third trace gradient".into());
-        }
-        let symmetric = Array2::from_shape_fn((r, r), |(a, b)| 0.5 * (gram[a * r + b] + gram[b * r + a]));
-        let (scales, directions) =
-            gam_linalg::faer_ndarray::FaerEigh::eigh(&symmetric, faer::Side::Lower).map_err(
-                |error| {
-                    format!(
-                        "bernoulli empirical flex third trace: gram eigendecomposition failed: {error}"
-                    )
-                },
-            )?;
-        let lanes: Vec<usize> = (0..r).filter(|&k| scales[k] != 0.0).collect();
-        let mut gradient = Array1::<f64>::zeros(r);
-        if lanes.is_empty() {
-            return Ok(gradient);
-        }
-        let plan = self.compile_empirical_bms_row_program(
-            row,
-            primary,
-            q,
-            b,
-            beta_h,
-            beta_w,
-            row_ctx.intercept,
-            grid,
-        )?;
-        let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        self.jet_scratch.trace.with(|workspace| {
-            workspace.reset(lanes.len());
-            let vars = workspace.alloc_slice_fill_with(r, |axis| {
-                DynamicTraceJet::seed_directions(point[axis], axis, r, &workspace, |lane| {
-                    directions[[axis, lanes[lane]]]
-                })
-            });
-            let jet = plan.evaluate(vars, 3, &workspace)?;
-            for (lane, &k) in lanes.iter().enumerate() {
-                let scale = scales[k];
-                for (out, &third) in gradient.iter_mut().zip(jet.second_directional_gradient(lane)) {
-                    *out += scale * third;
-                }
-            }
-            Ok(gradient)
-        })
-    }
-
-    pub(super) fn empirical_flex_row_fourth_contracted(
-        &self,
-        row: usize,
-        primary: &PrimarySlices,
-        q: f64,
-        b: f64,
-        beta_h: Option<&Array1<f64>>,
-        beta_w: Option<&Array1<f64>>,
-        row_ctx: &BernoulliMarginalSlopeRowExactContext,
-        dir_u: &Array1<f64>,
-        dir_v: &Array1<f64>,
-        grid: &EmpiricalZGrid,
-    ) -> Result<Array2<f64>, String> {
-        let r = primary.total;
-        if dir_u.len() != r || dir_v.len() != r {
-            return Err(format!(
-                "bernoulli empirical flex fourth contraction direction lengths ({},{}) != primary dimension {r}",
-                dir_u.len(),
-                dir_v.len()
-            ));
-        }
-        if dir_u.iter().all(|value| *value == 0.0) || dir_v.iter().all(|value| *value == 0.0) {
-            return Ok(Array2::<f64>::zeros((r, r)));
-        }
-        if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
-            return Err("non-finite empirical flexible row context in fourth contraction".into());
-        }
-        if matches!(r, 4 | 8 | 12 | 18) {
-            let plan = self.compile_empirical_bms_row_program(
-                row,
-                primary,
-                q,
-                b,
-                beta_h,
-                beta_w,
-                row_ctx.intercept,
-                grid,
-            )?;
-            let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-            return match r {
-                4 => Self::empirical_fixed_fourth_contracted::<4>(&plan, &point, dir_u, dir_v),
-                8 => Self::empirical_fixed_fourth_contracted::<8>(&plan, &point, dir_u, dir_v),
-                12 => Self::empirical_fixed_fourth_contracted::<12>(&plan, &point, dir_u, dir_v),
-                18 => Self::empirical_fixed_fourth_contracted::<18>(&plan, &point, dir_u, dir_v),
-                _ => Err(format!(
-                    "unsupported fixed empirical BMS fourth specialization width {r}"
-                )),
-            };
-        }
-        let pairs = [(dir_u, dir_v)];
-        let mut contracted = self.empirical_flex_row_fourth_contracted_many_ordered(
-            row, primary, q, b, beta_h, beta_w, row_ctx, &pairs, grid,
-        )?;
-        Ok(contracted
-            .pop()
-            .expect("one empirical BMS direction pair produces one contraction"))
-    }
-
-    /// Evaluate ordered fourth contractions from one canonical row plan.
-    pub(super) fn empirical_flex_row_fourth_contracted_many_ordered(
-        &self,
-        row: usize,
-        primary: &PrimarySlices,
-        q: f64,
-        b: f64,
-        beta_h: Option<&Array1<f64>>,
-        beta_w: Option<&Array1<f64>>,
-        row_ctx: &BernoulliMarginalSlopeRowExactContext,
-        direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
-        grid: &EmpiricalZGrid,
-    ) -> Result<Vec<Array2<f64>>, String> {
-        let r = primary.total;
-        if direction_pairs.is_empty() {
-            return Ok(Vec::new());
-        }
-        if let Some((lane, (direction_u, direction_v))) =
-            direction_pairs
-                .iter()
-                .enumerate()
-                .find(|(_, (direction_u, direction_v))| {
-                    direction_u.len() != r || direction_v.len() != r
-                })
-        {
-            return Err(format!(
-                "bernoulli empirical flex fourth contraction pair {lane} lengths ({},{}) != primary dimension {r}",
-                direction_u.len(),
-                direction_v.len()
-            ));
-        }
-        let is_zero = |direction: &Array1<f64>| direction.iter().all(|value| *value == 0.0);
-        if direction_pairs
-            .iter()
-            .all(|(direction_u, direction_v)| is_zero(direction_u) || is_zero(direction_v))
-        {
-            return Ok(direction_pairs
-                .iter()
-                .map(|_| Array2::<f64>::zeros((r, r)))
-                .collect());
-        }
-        if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
-            return Err("non-finite empirical flexible row context in fourth contraction".into());
-        }
-        let schedule = empirical_bms_fourth_jet_schedule(r);
-        if schedule == EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth {
-            return direction_pairs
-                .iter()
-                .map(|(direction_u, direction_v)| {
-                    self.empirical_flex_row_fourth_contracted(
-                        row,
-                        primary,
-                        q,
-                        b,
-                        beta_h,
-                        beta_w,
-                        row_ctx,
-                        direction_u,
-                        direction_v,
-                        grid,
-                    )
-                })
-                .collect();
-        }
-        let plan = self.compile_empirical_bms_row_program(
-            row,
-            primary,
-            q,
-            b,
-            beta_h,
-            beta_w,
-            row_ctx.intercept,
-            grid,
-        )?;
-        let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        match schedule {
-            EmpiricalBmsFourthJetSchedule::FixedWidthFromPlan => {
-                Self::empirical_fixed_fourth_many_from_plan::<4>(&plan, &point, direction_pairs)
-            }
-            EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth => direction_pairs
-                .iter()
-                .map(|(direction_u, direction_v)| {
-                    self.empirical_flex_row_fourth_contracted(
-                        row,
-                        primary,
-                        q,
-                        b,
-                        beta_h,
-                        beta_w,
-                        row_ctx,
-                        direction_u,
-                        direction_v,
-                        grid,
-                    )
-                })
-                .collect(),
-            EmpiricalBmsFourthJetSchedule::DynamicBatch { lanes } => {
-                Self::empirical_dynamic_fourth_batch_from_plan(
-                    &plan,
-                    &point,
-                    direction_pairs,
-                    primary,
-                    lanes,
-                    &self.jet_scratch.batch,
-                )
-            }
-        }
-    }
-
-    /// Execute ordered two-seed contractions in bounded runtime-sized chunks
-    /// from one already-frozen row plan.
-    pub(super) fn empirical_dynamic_fourth_batch_from_plan(
-        plan: &BmsFlexRowProgram,
-        point: &[f64],
-        direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
-        primary: &PrimarySlices,
-        lanes: usize,
-        scratch: &super::hessian_paths::JetScratchPool,
-    ) -> Result<Vec<Array2<f64>>, String> {
-        let r = primary.total;
-        let is_zero = |direction: &Array1<f64>| direction.iter().all(|value| *value == 0.0);
-        scratch.with(|workspace| {
-            let mut contracted = Vec::with_capacity(direction_pairs.len());
-            for pairs in direction_pairs.chunks(lanes) {
-                workspace.reset(pairs.len());
-                let vars = workspace.alloc_slice_fill_with(r, |axis| {
-                    DynamicTwoSeedBatch::seed_direction_pairs(
-                        point[axis],
-                        axis,
-                        r,
-                        &workspace,
-                        |lane| (pairs[lane].0[axis], pairs[lane].1[axis]),
-                    )
-                });
-                let jet = plan.evaluate(vars, 4, &workspace)?;
-                for (lane, (direction_u, direction_v)) in pairs.iter().enumerate() {
-                    if is_zero(direction_u) || is_zero(direction_v) {
-                        contracted.push(Array2::<f64>::zeros((r, r)));
-                    } else {
-                        contracted.push(
-                            Array2::from_shape_vec((r, r), jet.contracted_fourth(lane).to_vec())
-                                .map_err(|error| {
-                                    format!("empirical BMS fourth-contraction shape: {error}")
-                                })?,
-                        );
-                    }
-                }
-            }
-            Ok(contracted)
-        })
     }
 
     pub(super) fn rigid_row_kernel_eval(
@@ -3012,6 +2305,11 @@ impl BernoulliMarginalSlopeFamily {
     /// FLEX repro and made each value-bearing cell slower, so the solve takes
     /// Newton's step at degree-4 moments. Each cell's value is a sum of at most
     /// the terminal Gauss–Legendre rule's terms.
+    ///
+    /// Where the linear sum no longer holds its value
+    /// ([`linear_cell_tail_is_representable`]: past `|q| ≈ 37` every cell is
+    /// below `f64::MIN_POSITIVE`), the same cells are summed in log units by
+    /// [`sum_denested_cells_in_log_space`] (gam#4504).
     pub(super) fn evaluate_denested_calibration_tail(
         &self,
         a: f64,
@@ -3047,13 +2345,44 @@ impl BernoulliMarginalSlopeFamily {
             let dc_da = scale_coeff4(dc_da_raw, scale);
             density += exact_kernel::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
         }
-        Ok(CalibrationTail::from_linear(
-            tail,
-            density,
-            None,
-            summands,
-            tail_rounding,
-        ))
+        if linear_cell_tail_is_representable(tail, tail_rounding, summands) {
+            return Ok(CalibrationTail::from_linear(
+                tail,
+                density,
+                None,
+                summands,
+                tail_rounding,
+            ));
+        }
+        self.evaluate_denested_calibration_tail_in_log_space(a, slope, beta_h, beta_w, survival_side)
+    }
+
+    /// The log-space form of [`Self::evaluate_denested_calibration_tail`]
+    /// (gam#4504): the same cells and the same `∂c/∂a`, summed by
+    /// [`sum_denested_cells_in_log_space`] without `P″`.
+    pub(super) fn evaluate_denested_calibration_tail_in_log_space(
+        &self,
+        a: f64,
+        slope: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        survival_side: bool,
+    ) -> Result<CalibrationTail, String> {
+        let scale = self.probit_frailty_scale();
+        let cells = self.denested_partition_cells(a, slope, beta_h, beta_w)?;
+        sum_denested_cells_in_log_space(
+            survival_side,
+            false,
+            cells.into_iter().map(|partition_cell| {
+                let (dc_da_raw, _) = exact_kernel::denested_cell_coefficient_partials(
+                    partition_cell.score_span,
+                    partition_cell.link_span,
+                    a,
+                    slope,
+                );
+                (partition_cell.cell, scale_coeff4(dc_da_raw, scale), [0.0; 4])
+            }),
+        )
     }
 
     /// The row calibration `P(a) = Σ_k w_k Φ(η(a, u_k))` under the finite law
@@ -3803,7 +3132,6 @@ mod empirical_rigid_jet_oracle_tests {
             policy: policy.clone(),
             cell_moment_lru: new_cell_moment_lru_cache(&policy),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
@@ -4594,91 +3922,6 @@ mod empirical_flex_jet_oracle_tests {
         out
     }
 
-    #[test]
-    fn empirical_bms_schedule_maps_channels_to_measured_kernels_932() {
-        for r in [4, 8, 12, 18] {
-            assert_eq!(
-                empirical_bms_third_jet_schedule(r),
-                EmpiricalBmsThirdJetSchedule::FixedWidthFromPlan,
-                "third-order r={r} must reuse one fixed-width plan",
-            );
-        }
-        assert_eq!(
-            empirical_bms_fourth_jet_schedule(4),
-            EmpiricalBmsFourthJetSchedule::FixedWidthFromPlan,
-            "fourth-many r=4 must reuse one fixed-width plan",
-        );
-        for r in [8, 12, 18] {
-            assert_eq!(
-                empirical_bms_fourth_jet_schedule(r),
-                EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth,
-                "fourth-many r={r} must use repeated canonical fixed evaluation",
-            );
-        }
-        for r in [1, 2, 3, 5, 7, 9, 16, 19, 32, 128] {
-            let lanes = empirical_bms_runtime_batch_lanes(r);
-            assert_eq!(
-                empirical_bms_third_jet_schedule(r),
-                EmpiricalBmsThirdJetSchedule::DynamicBatch { lanes },
-                "third-order r={r} must use the bounded runtime schedule",
-            );
-            assert_eq!(
-                empirical_bms_fourth_jet_schedule(r),
-                EmpiricalBmsFourthJetSchedule::DynamicBatch { lanes },
-                "fourth-order r={r} must use the bounded runtime schedule",
-            );
-        }
-    }
-
-    /// #3290 — the lane bound must not force a second base pass at a width
-    /// where no chunk length meets the budget it is chunking for.
-    ///
-    /// The flex route's own request sizes are structural, not configurable:
-    /// `flex_axis_third_tensors_for_row` asks for the two axis directions
-    /// `e_q`, `e_g`, and `flex_axis_fourth_tensors_for_row` for the four
-    /// ordered axis pairs built from the same two. A lane bound of 1 splits
-    /// those into two and four chunks, and each chunk recomputes the shared
-    /// base channel — the order-two jet over all `r` axes carried through the
-    /// calibration grid and the implicit intercept solve.
-    ///
-    /// Both halves are asserted. Below the budget the quotient still governs,
-    /// so a width that can meet the bound still does; at and above `r = 16`,
-    /// where one lane already costs `r³ >= BUDGET` floats, the declared cap
-    /// governs and one chunk serves the whole request.
-    #[test]
-    fn runtime_batch_lanes_never_chunk_the_flex_axis_request_3290() {
-        const THIRD_DIRECTIONS: usize = 2;
-        const FOURTH_DIRECTION_PAIRS: usize = 4;
-        for r in 1..=8 {
-            let tape_work = r * r * r;
-            assert!(
-                tape_work <= EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET,
-                "premise: r={r} is a width whose single lane fits the budget"
-            );
-            assert_eq!(
-                empirical_bms_runtime_batch_lanes(r),
-                (EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET / tape_work)
-                    .min(EMPIRICAL_BMS_BATCH_LANE_CAP),
-                "below the budget the quotient still chooses the lane count at r={r}"
-            );
-        }
-        for r in [16, 18, 20, 22, 32, 128] {
-            assert!(
-                r * r * r > EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET,
-                "premise: one lane at r={r} already exceeds the tape-work budget"
-            );
-            let lanes = empirical_bms_runtime_batch_lanes(r);
-            assert_eq!(
-                lanes, EMPIRICAL_BMS_BATCH_LANE_CAP,
-                "the declared cap governs where the budget cannot be met, at r={r}"
-            );
-            assert!(
-                lanes >= THIRD_DIRECTIONS && lanes >= FOURTH_DIRECTION_PAIRS,
-                "one chunk must serve the flex axis request at r={r}; got {lanes}"
-            );
-        }
-    }
-
     /// Test handle bundling a family with one active deviation block and the
     /// primary layout / fixed coefficients the kernel reads.
     struct FlexFixture {
@@ -4772,7 +4015,6 @@ mod empirical_flex_jet_oracle_tests {
             policy: policy.clone(),
             cell_moment_lru: new_cell_moment_lru_cache(&policy),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
-            jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
@@ -5804,6 +5046,164 @@ mod empirical_flex_jet_oracle_tests {
                         .evaluate_empirical_grid_calibration_tail(a, 0.35, beta_h, beta_w, &fx.grid, side)
                         .expect("grid calibration tail");
                     assert_eq!(grid.tail_rounding_ratio, 0.0);
+                }
+            }
+        }
+    }
+
+    /// gam#4504: a standard-normal flex row past `|q| ≈ 37.5`. With its
+    /// deviation coefficients at zero the row is `η = a + b·z` on every cell of
+    /// its partition, so its tail is `Φ(h)` exactly, `h = ∓a/√(1 + b²)`, with
+    /// `P′/T = λ(h)/√(1 + b²)`. At `h = −40` and `h = −60` the linear cells sum
+    /// to below `f64::MIN_POSITIVE` (the control: they fail
+    /// [`linear_cell_tail_is_representable`]). The tail evaluator must then
+    /// return `log Φ(h)` and the exact ratio to its charged bound plus the
+    /// residual's rounding, on both sides and both deviation kinds, and leave
+    /// `P″` unread, as its linear route does.
+    ///
+    /// With the fixture's curved deviations, where no closed form exists, the
+    /// log route must match the linear route where both hold (`h = −8`) to the
+    /// sum of their bands. At `h = −40` the log route must still return a
+    /// finite residual that the solve can read.
+    #[test]
+    fn denested_tail_is_exact_in_log_units_past_the_linear_floor_4504() {
+        use crate::latent_anchor::{anchor_residual_rounding, linear_cell_tail_is_representable};
+        use gam_math::probability::signed_probit_logcdf_and_mills_ratio;
+
+        for is_score_warp in [true, false] {
+            let fx = make_fixture(is_score_warp);
+            assert_eq!(fx.family.probit_frailty_scale(), 1.0);
+            let dev_range = if is_score_warp {
+                fx.primary.h.clone().unwrap()
+            } else {
+                fx.primary.w.clone().unwrap()
+            };
+            let curved: Array1<f64> =
+                Array1::from_iter(dev_range.clone().enumerate().map(|(k, _)| fx.beta_dev[k]));
+            let flat = Array1::<f64>::zeros(dev_range.len());
+            let coefficients = |beta: &Array1<f64>| {
+                if is_score_warp {
+                    (Some(beta.clone()), None)
+                } else {
+                    (None, Some(beta.clone()))
+                }
+            };
+            let (flat_h, flat_w) = coefficients(&flat);
+            let (curved_h, curved_w) = coefficients(&curved);
+            for b in [0.35_f64, 3.0] {
+                let s = b.hypot(1.0);
+                for survival_side in [false, true] {
+                    // The complement side reads `Φ(a/s)`, the survival side `Φ(−a/s)`.
+                    let intercept = |h: f64| if survival_side { -h * s } else { h * s };
+                    for h in [-40.0_f64, -60.0] {
+                        let label =
+                            format!("kind={is_score_warp} b={b} survival={survival_side} h={h}");
+                        let a = intercept(h);
+                        let (log_reference, mills) = signed_probit_logcdf_and_mills_ratio(h);
+                        let cells = fx
+                            .family
+                            .denested_partition_cells(a, b, flat_h.as_ref(), flat_w.as_ref())
+                            .expect("partition cells");
+                        let summands = cells.len() * crate::cubic_cell_kernel::TERMINAL_GL_ORDER;
+                        let mut linear = 0.0;
+                        let mut linear_rounding = 0.0;
+                        for partition_cell in &cells {
+                            let cell = partition_cell.cell;
+                            assert!(cell.c2 == 0.0 && cell.c3 == 0.0, "{label}: flat row is affine");
+                            if let Ok(state) = crate::cubic_cell_kernel::evaluate_cell_moments(
+                                if survival_side { cell.negated() } else { cell },
+                                4,
+                            ) {
+                                linear += state.value;
+                                linear_rounding += state.value_rounding;
+                            } else {
+                                linear_rounding = f64::INFINITY;
+                            }
+                        }
+                        assert!(
+                            !linear_cell_tail_is_representable(linear, linear_rounding, summands),
+                            "{label}: control: the linear cells {linear:e} should have lost \
+                             log Φ(h) = {log_reference:e}"
+                        );
+
+                        let tail = fx
+                            .family
+                            .evaluate_denested_calibration_tail(
+                                a,
+                                b,
+                                flat_h.as_ref(),
+                                flat_w.as_ref(),
+                                survival_side,
+                            )
+                            .expect("denested calibration tail");
+                        let band = tail.tail_rounding_ratio
+                            + anchor_residual_rounding(log_reference, tail.summands);
+                        assert!(
+                            (tail.log_tail - log_reference).abs() <= band,
+                            "{label}: log T {:+.17e} against log Φ(h) {log_reference:+.17e} \
+                             (band {band:e})",
+                            tail.log_tail
+                        );
+                        let density_reference = mills / s;
+                        assert!(
+                            (tail.density_ratio - density_reference).abs() <= band * density_reference,
+                            "{label}: P'/T {:+.17e} against λ(h)/s {density_reference:+.17e}",
+                            tail.density_ratio
+                        );
+                        assert!(tail.density_slope_ratio.is_none(), "{label}: P'' is not read");
+
+                        let deep = fx
+                            .family
+                            .evaluate_denested_calibration_tail(
+                                a,
+                                b,
+                                curved_h.as_ref(),
+                                curved_w.as_ref(),
+                                survival_side,
+                            )
+                            .expect("curved deep calibration tail");
+                        let residual = deep
+                            .log_residual(survival_side, log_reference)
+                            .expect("curved deep residual");
+                        assert!(
+                            residual.value.is_finite()
+                                && residual.first.is_finite()
+                                && residual.rounding < 1.0,
+                            "{label}: curved row: residual {residual:?}"
+                        );
+                    }
+
+                    let a = intercept(-8.0);
+                    let linear = fx
+                        .family
+                        .evaluate_denested_calibration_tail(
+                            a,
+                            b,
+                            curved_h.as_ref(),
+                            curved_w.as_ref(),
+                            survival_side,
+                        )
+                        .expect("curved linear tail");
+                    let log_space = fx
+                        .family
+                        .evaluate_denested_calibration_tail_in_log_space(
+                            a,
+                            b,
+                            curved_h.as_ref(),
+                            curved_w.as_ref(),
+                            survival_side,
+                        )
+                        .expect("curved log-space tail");
+                    let band = linear.tail_rounding_ratio
+                        + log_space.tail_rounding_ratio
+                        + anchor_residual_rounding(linear.log_tail, linear.summands);
+                    assert!(
+                        (linear.log_tail - log_space.log_tail).abs() <= band,
+                        "kind={is_score_warp} b={b} survival={survival_side}: curved row at h=-8: \
+                         linear log T {:+.17e} against log-space {:+.17e} (band {band:e})",
+                        linear.log_tail,
+                        log_space.log_tail
+                    );
                 }
             }
         }

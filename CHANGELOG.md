@@ -1,5 +1,39 @@
 ## Unreleased
 
+- **An empirical-law flex row's higher derivatives cost dense jets over every primary, with a width
+  table** (gam#3290). Its third and fourth contractions, its third-trace gradient and the projected
+  fourth of the second-order logdet corrections ran the whole row program as runtime-width jets,
+  one axis per primary. Each calibration node combined every score and link column's seed jet, so
+  a contraction cost about `G·(p_h + p_w)·r²` floats for `G` grid nodes. Only widths 4, 8, 12 and
+  18 had compiled fixed-width paths. These consumers now sum the row's calibration cells, the
+  lowering the standard-normal law already used. An empirical cell holds the grid nodes it
+  contains as moments about their own midpoint, in the row's unit `N = Φ(−|q|)`. The kernel's
+  contractions then read these moments once the cell's cubic and its coefficient polynomials are
+  re-expanded about that midpoint, and the trace gradient's coefficient adjoints are pulled back
+  through the same shift. On either law a cell visits only the slope and the score and link
+  columns whose spans cover it, so a link column reaches the row through its span's column table
+  and the cell's scalar moments. Per-row cost is about `G·22` moment terms, plus the cells' active
+  pairs, plus one `r²` finalizer per contraction. A point-mass law has no moving cell edges, so
+  empirical rows take no knot-crossing terms. The width table, the fixed-width jet paths and the
+  fit-owned jet scratch pools are gone. The dense row program remains only as the tests' oracle:
+  the contractions and the trace gradient match it at link widths from `internal_knots = 2` to the
+  eight-knot default, to Wilkinson's factor over the summed moments. The GPU row kernel's layout is
+  unchanged: it computes only the order-two row Hessian, only under the standard-normal law, and
+  none of these consumers reach it.
+- **A standard-normal flex row past `|q| ≈ 36` summed its cells to zero** (gam#4504). The cells
+  route summed each cell's `∫φ(z)Φ(∓η(z)) dz` in linear probability. Once every cell fell below
+  `f64::MIN_POSITIVE` the tail was 0, `log T = −∞`, and the intercept bracket never closed on a
+  root that is representable in log units. The fit and the prediction mirror now switch where the
+  linear sum stops holding its value: when its node terms' underflow (`summands·MIN_POSITIVE`) is
+  no longer below `u·T`, or when a cell's bound is infinite. Past that point they sum the same cells
+  in log units. Each cell is visited as a log-weighted Gauss–Legendre law and pushed through the
+  same streaming log-sum-exp as a finite law, so `log T`, `P′/T` and `P″/T` come out as ratios.
+  An affine cell is integrated on the super-level window of its concave log integrand, which
+  drops at most `u` of its value, instead of as a bivariate-normal orthant difference. The
+  dropped mass is charged to the tail's bound. At `h = −40` and `h = −60` the tail matches
+  `log Φ(h)`, `λ(h)/s` and `∓h·λ(h)/s²` to that bound, while the linear sum there has lost them.
+  The GPU cubic-cell substrate computes only the row Hessian's derivative moments and never a
+  calibration tail, so it has no route to mirror.
 - **A standard REML fit checks the least-penalized face for a lower basin and searches it when
   there is one** (#1561). A certified optimum is only a local minimum. On a basis that represents
   a high-frequency signal only through its most-penalized directions, the derived start drained
