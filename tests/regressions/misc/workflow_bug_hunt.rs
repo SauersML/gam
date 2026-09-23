@@ -292,7 +292,7 @@ fn resolve_family_rejects_genuinely_illegal_family_link_pairs() {
     )
     .expect_err("beta + log is illegal and must be rejected");
     assert!(
-        err.contains("not supported for family 'beta'"),
+        err.contains("not supported for family `beta`"),
         "beta + log rejection should name the family and link, got: {err}"
     );
 
@@ -310,7 +310,7 @@ fn resolve_family_rejects_genuinely_illegal_family_link_pairs() {
     )
     .expect_err("gaussian + logit is illegal and must be rejected");
     assert!(
-        err.contains("not supported for family 'gaussian'"),
+        err.contains("not supported for family `gaussian`"),
         "gaussian + logit rejection should name the family and link, got: {err}"
     );
 

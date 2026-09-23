@@ -1023,12 +1023,18 @@ mod tests {
             "a sum whose only mass is exp(-3.25) reads {one}"
         );
         // The ordinary case is untouched: `ln(e^a + e^b)` to the rounding of
-        // the three operations the stabilised form performs on it.
+        // both routes to it. A logarithm turns its argument's RELATIVE rounding
+        // into ABSOLUTE error (`d ln s = ds/s`), so each route is off by the
+        // relative rounding of the sum it forms (an `exp`, an add and the `exp`
+        // of the other term, or the shift the stabilised form makes) plus the
+        // log's own `ε|ln s|`. The bar is both routes' share, in absolute units:
+        // here `s ≈ 1.0019` and `ln s ≈ 0.0019`, so a bar relative to `ln s`
+        // alone asks for 500 times the digits the sum carries.
         let (a, b) = (-1.5_f64, -0.25_f64);
         let both = log_sum_exp(&[a, b]);
         let exact = (a.exp() + b.exp()).ln();
         assert!(
-            (both - exact).abs() <= accumulation_growth(3) * exact.abs(),
+            (both - exact).abs() <= 2.0 * accumulation_growth(4) * (1.0 + exact.abs()),
             "ln(e^{a} + e^{b}) reads {both}, against {exact}"
         );
     }

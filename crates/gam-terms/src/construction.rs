@@ -3673,11 +3673,14 @@ mod tests {
         use ndarray::Array2;
 
         // A factor whose singular values span the gap: `1` down to `1e-9`
-        // relative. Squared they run to `1e-18`, under a Gram band of about
-        // `8·ε = 1.8e-15`, so the Gram cannot see the last few.
+        // relative, evenly in the log. Squared they run to `1e-18`, under a Gram
+        // band of about `8·ε = 1.8e-15`, so the Gram cannot see the last two
+        // (`σ² < 1.8e-15` below `σ = 4.2e-8`), while the factor's own band,
+        // about `8·ε` of its largest singular value, keeps all eight.
         let dim = 8usize;
+        let decades = 9.0 / (dim - 1) as f64;
         let factor = Array2::from_shape_fn((dim, dim), |(i, j)| {
-            if i == j { 10.0_f64.powi(-(i as i32) - 1) } else { 0.0 }
+            if i == j { 10.0_f64.powf(-(i as f64) * decades) } else { 0.0 }
         });
         let local = gam_linalg::faer_ndarray::fast_ata(&factor);
 

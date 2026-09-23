@@ -61,12 +61,6 @@ const EXEMPTIONS: &[(&str, &str, &str)] = &[
          no consumer with the row-chunk target",
     ),
     (
-        "crates/gam-models/src/fit_orchestration/drivers/design_construction.rs",
-        "const STREAMING_BYTES_THRESHOLD",
-        "a dense-vs-streamed ROUTE threshold on the total n*p*8 work, not a chunk \
-         size; unifying it would tie a routing decision to a tile budget",
-    ),
-    (
         "crates/gam-sae/src/corpus/shard_reader.rs",
         "const DEFAULT_PREFETCH_WINDOW_BYTES",
         "an I/O read-ahead window on a shard reader, sized by storage latency \

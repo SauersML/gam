@@ -3478,9 +3478,10 @@ fn test_build_duchon_basisfreezes_default_spatial_identifiability() {
 
 #[test]
 fn test_duchon_basis_spec_rejects_removed_double_penalty_field() {
+    // Every other field is valid, so `double_penalty` is the only thing serde
+    // can refuse (`length_scale` is left out: a pure Duchon has none).
     let payload = r#"{
             "center_strategy": { "FarthestPoint": { "num_centers": 4 } },
-            "length_scale": 1.0,
             "power": 2,
             "nullspace_order": "Linear",
             "double_penalty": true
@@ -3488,7 +3489,7 @@ fn test_duchon_basis_spec_rejects_removed_double_penalty_field() {
 
     let err = serde_json::from_str::<DuchonBasisSpec>(payload)
         .expect_err("removed Duchon double_penalty field should be rejected");
-    assert!(err.to_string().contains("unknown field `double_penalty`"));
+    assert!(err.to_string().contains("unknown field `double_penalty`"), "{err}");
 }
 
 #[test]
