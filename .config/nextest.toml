@@ -86,10 +86,16 @@ slow-timeout = { period = "300s", terminate-after = 2 }
 # exactly the bulk-kill-hides-the-culprit failure #1393 reports. `slow` streams
 # the SLOW/TIMEOUT/TERMINATING lines as each test crosses the period, so they
 # are in the log even on a bulk-kill; the post-run summary step in test.yml
-# hoists them into the job output. `slow` adds only fail+retry+slow statuses
-# (NOT pass), so passing-test output stays suppressed and the disk-exhaustion
-# guard (success-output = "never") is unaffected.
-status-level = "slow"
+# hoists them into the job output.
+#
+# #2627: the live level is `pass`, one line per finished test. A shard whose
+# RUNNER dies (exit 143, 35778050322 shards 1/6/10) prints nothing for a test
+# killed before the 300s slow period, so at `slow` the log could not name the
+# test that exhausted the runner. With a PASS/FAIL line per finished test, the
+# shard's tests that have none are exactly the ones running at the kill. It
+# adds one status line per test, not its output: `success-output = "never"`
+# still suppresses passing-test output, so the disk-exhaustion guard holds.
+status-level = "pass"
 final-status-level = "slow"
 
 # Do not stop the run on the first failure: CI must collect every failing test
