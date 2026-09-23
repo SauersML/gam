@@ -571,11 +571,14 @@ pub enum EstimationError {
     },
 
     #[error(
-        "Block-orthogonal Gaussian REML has no certified smoothing optimum: {reason}. \
+        "{context} has no certified smoothing optimum: {reason}. \
          A fit is only minted from a converged optimization; resume from the \
          checkpoint by passing `init_rhos` = {rho_checkpoint:?}."
     )]
-    BlockOrthogonalRemlDidNotConverge {
+    BlockRemlDidNotConverge {
+        /// Which block Gaussian REML route refused: block-orthogonal or exact
+        /// joint.
+        context: &'static str,
         /// Why the certified Newton trust region on the scale-profiled
         /// objective returned no stationary point.
         reason: String,
@@ -1358,7 +1361,7 @@ impl EstimationError {
             | Self::PenaltySpectrumNonFinite { .. }
             | Self::PenaltySpectrumIndefinite { .. }
             | Self::ParameterConstraintViolation { .. }
-            | Self::BlockOrthogonalRemlDidNotConverge { .. }
+            | Self::BlockRemlDidNotConverge { .. }
             | Self::NegativeBinomialAlternationDidNotConverge { .. }
             | Self::BetaPrecisionRefinementDidNotConverge { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
@@ -1544,7 +1547,7 @@ impl EstimationError {
             }
             Self::PirlsDidNotConverge { .. }
             | Self::FixedLambdaNewtonDidNotConverge { .. }
-            | Self::BlockOrthogonalRemlDidNotConverge { .. }
+            | Self::BlockRemlDidNotConverge { .. }
             | Self::NegativeBinomialAlternationDidNotConverge { .. }
             | Self::BetaPrecisionRefinementDidNotConverge { .. }
             | Self::IdentifiedRankNotLocallyConstant { .. }
@@ -1638,8 +1641,8 @@ impl EstimationError {
             Self::FixedLambdaNewtonDidNotConverge { .. } => {
                 "EstimationError::FixedLambdaNewtonDidNotConverge"
             }
-            Self::BlockOrthogonalRemlDidNotConverge { .. } => {
-                "EstimationError::BlockOrthogonalRemlDidNotConverge"
+            Self::BlockRemlDidNotConverge { .. } => {
+                "EstimationError::BlockRemlDidNotConverge"
             }
             Self::NegativeBinomialAlternationDidNotConverge { .. } => {
                 "EstimationError::NegativeBinomialAlternationDidNotConverge"

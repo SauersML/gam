@@ -1,6 +1,5 @@
 use crate::estimate::EstimationError;
 use crate::exact_jet_objective::certified_newton_minimum;
-use crate::rho_optimizer::{FallbackPolicy, OuterProblem};
 use faer::Side;
 use gam_linalg::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerEigh, FaerSvd, fast_ab, fast_atb, fast_xt_diag_x,
@@ -8,7 +7,7 @@ use gam_linalg::faer_ndarray::{
 };
 use gam_linalg::matrix::array2_bits_fingerprint;
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
-use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval, StationarityStandard};
+use gam_problem::StationarityStandard;
 use gam_terms::construction::CanonicalPenalty;
 use gam_terms::smooth::BlockwisePenalty;
 use ndarray::{
@@ -370,6 +369,9 @@ struct GaussianRemlBlocksProfileEval {
     coefficients: Array1<f64>,
     fitted: Array1<f64>,
     edf: Array1<f64>,
+    /// The rounding bands the Newton-decrement certificate decides this
+    /// evaluation against (see [`GaussianRemlBlocksProfile::evaluate`]).
+    bands: DecrementBands,
 }
 
 impl GaussianRemlBlocksProfile {
@@ -425,7 +427,12 @@ impl GaussianRemlBlocksProfile {
             });
         }
 
-        let scaled_coefficients = factor.solvevec(&(&self.xtwy * &scales));
+        let scaled_rhs = &self.xtwy * &scales;
+        let scaled_coefficients = factor.solvevec(&scaled_rhs);
+        // `q(s)` is quadratic in the scaled coefficients with Hessian `2N`, so the
+        // solve's residual `ρ = N·ŝ − c` leaves `q(ŝ) = q* + ρᵀN⁻¹ρ` exactly.
+        let normal_residual = normal.dot(&scaled_coefficients) - &scaled_rhs;
+        let residual_excess = normal_residual.dot(&inverse.dot(&normal_residual));
         let coefficients = self.penalty_basis.dot(&(&scaled_coefficients * &scales));
         let fitted = self.design.dot(&coefficients);
         let residual = &self.y - &fitted;
@@ -489,6 +496,16 @@ impl GaussianRemlBlocksProfile {
             ));
         }
 
+        // The value reads `q` only through `½·ν·ln q`, so the excess the residual
+        // leaves in it is `−½·ν·ln(1 − ρᵀN⁻¹ρ/q)`: exact, and infinite where the
+        // residual bounds nothing.
+        let relative_excess = residual_excess / q;
+        let inner_residual_energy = if relative_excess < 1.0 {
+            -0.5 * self.nu * (-relative_excess).ln_1p()
+        } else {
+            f64::INFINITY
+        };
+
         let tau = self.nu / q;
         let tau_q = -self.nu / (q * q);
         let cost = 0.5
@@ -503,6 +520,7 @@ impl GaussianRemlBlocksProfile {
         }
 
         let mut hessian = Array2::<f64>::zeros((f_blocks, f_blocks));
+        let mut hessian_magnitude = Array2::<f64>::zeros((f_blocks, f_blocks));
         for k in 0..f_blocks {
             for j in 0..f_blocks {
                 let trace_pair = gam_linalg::utils::trace_of_product(
@@ -510,20 +528,79 @@ impl GaussianRemlBlocksProfile {
                     rp_matrices[j].view(),
                 );
                 let beta_pk_r_pj_beta = p_betas[k].dot(&inverse.dot(&p_betas[j]));
+                let diagonal_trace = if k == j { t_values[k] } else { 0.0 };
+                let diagonal_energy = if k == j { b_values[k] } else { 0.0 };
                 hessian[[k, j]] = 0.5
-                    * ((if k == j { t_values[k] } else { 0.0 }) - trace_pair
+                    * (diagonal_trace - trace_pair
                         + tau_q * b_values[k] * b_values[j]
-                        + tau
-                            * ((if k == j { b_values[k] } else { 0.0 }) - 2.0 * beta_pk_r_pj_beta));
+                        + tau * (diagonal_energy - 2.0 * beta_pk_r_pj_beta));
+                hessian_magnitude[[k, j]] = 0.5
+                    * (diagonal_trace
+                        + trace_pair.abs()
+                        + tau_q.abs() * b_values[k] * b_values[j]
+                        + tau * (diagonal_energy + 2.0 * beta_pk_r_pj_beta.abs()));
             }
         }
         gam_linalg::matrix::symmetrize_in_place(&mut hessian);
+
+        // The bands the Newton-decrement certificate decides against, each the
+        // growth factor of this evaluation's longest accumulation (`n` rows into
+        // `XᵀWX` and `q`, `p²` products into a solve or a trace, the same count
+        // the outer engine charges a REML evaluation) times the magnitudes of
+        // the terms its quantity is summed from. The value also carries the
+        // exact excess the normal-equation residual leaves in `q`. Its bar is
+        // its own rounding band: the decrement left to the minimum is certified
+        // once one evaluation of `V` cannot resolve it. The paired backward
+        // (`gaussian_reml_fit_blocks_backward_analytic`) is the envelope-theorem
+        // derivative, exact only where `∂V/∂ρ = 0`; a point certified at the
+        // criterion's statistical resolution `1/(2n)` instead left `|∂V/∂ρ|`
+        // near `1e-3` and every VJP off by `(∂V/∂ρ)·dρ̂/d(input)`.
+        let growth = accumulation_growth(self.y.len() + p * p);
+        let logdet_normal_magnitude = 2.0
+            * (factor.diag().iter().map(|value| value.ln().abs()).sum::<f64>()
+                + scales.iter().map(|value| value.ln().abs()).sum::<f64>());
+        let logdet_penalty_magnitude = self
+            .domain
+            .canonical_penalties
+            .iter()
+            .zip(rhos.iter())
+            .map(|(penalty, rho)| {
+                penalty
+                    .positive_eigenvalues
+                    .iter()
+                    .map(|eigenvalue| eigenvalue.ln().abs())
+                    .sum::<f64>()
+                    + penalty.rank() as f64 * rho.abs()
+            })
+            .sum::<f64>();
+        let objective_band = growth
+            * (0.5
+                * (self.nu * (1.0 + (2.0 * std::f64::consts::PI * q / self.nu).ln().abs())
+                    + logdet_normal_magnitude
+                    + logdet_penalty_magnitude)
+                + self.observation_measure.value.abs())
+            + inner_residual_energy;
+        let gradient_band = Array1::from_iter((0..f_blocks).map(|block| {
+            growth
+                * 0.5
+                * (t_values[block]
+                    + self.domain.canonical_penalties[block].rank() as f64
+                    + tau * b_values[block])
+        }));
+        let hessian_band = growth * hessian_magnitude.iter().map(|value| value * value).sum::<f64>().sqrt();
+        let bands = DecrementBands {
+            objective: objective_band,
+            tolerance: objective_band,
+            gradient: gradient_band,
+            hessian: hessian_band,
+        };
         if !cost.is_finite()
             || coefficients.iter().any(|value| !value.is_finite())
             || fitted.iter().any(|value| !value.is_finite())
             || edf.iter().any(|value| !value.is_finite())
             || gradient.iter().any(|value| !value.is_finite())
             || hessian.iter().any(|value| !value.is_finite())
+            || !(objective_band.is_finite() && hessian_band.is_finite())
         {
             return Err(EstimationError::TrialPointRefused {
                 reason: "block Gaussian REML profile evaluation produced a non-finite value"
@@ -539,28 +616,22 @@ impl GaussianRemlBlocksProfile {
             coefficients,
             fitted,
             edf,
+            bands,
         })
     }
-}
 
-fn gaussian_reml_blocks_profile_cost(
-    state: &mut GaussianRemlBlocksProfile,
-    rhos: &Array1<f64>,
-) -> Result<f64, EstimationError> {
-    Ok(state.evaluate(rhos.view())?.cost)
-}
-
-fn gaussian_reml_blocks_profile_outer_eval(
-    state: &mut GaussianRemlBlocksProfile,
-    rhos: &Array1<f64>,
-) -> Result<OuterEval, EstimationError> {
-    let evaluated = state.evaluate(rhos.view())?;
-    Ok(OuterEval {
-        cost: evaluated.cost,
-        gradient: evaluated.gradient,
-        hessian: HessianValue::Dense(evaluated.hessian),
-        inner_beta_hint: Some(evaluated.coefficients),
-    })
+    /// The evaluation at `rhos` as the exact jet the certified Newton trust
+    /// region minimises.
+    fn jet(&self, rhos: &Array1<f64>) -> Result<SecondOrderSample, ObjectiveEvalError> {
+        self.evaluate(rhos.view())
+            .map(|evaluated| SecondOrderSample {
+                value: evaluated.cost,
+                gradient: evaluated.gradient,
+                hessian: Some(evaluated.hessian),
+                decrement_bands: Some(evaluated.bands),
+            })
+            .map_err(|error| ObjectiveEvalError::recoverable(error.to_string()))
+    }
 }
 
 /// Exact profiled Gaussian REML for a joint additive design with one
@@ -661,7 +732,6 @@ pub fn gaussian_reml_fit_blocks_exact(
     let weight = gaussian_reml_weights(n, weights)?;
     let mut design = Array2::<f64>::zeros((n, p_total));
     let mut blockwise_penalties = Vec::with_capacity(f_blocks);
-    let mut canonical_keys = Vec::with_capacity(f_blocks);
     for block in 0..f_blocks {
         design
             .slice_mut(s![.., offsets[block]..offsets[block + 1]])
@@ -670,15 +740,6 @@ pub fn gaussian_reml_fit_blocks_exact(
             offsets[block]..offsets[block + 1],
             penalties[block].clone(),
         ));
-        let mut key = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(
-            &(
-                array2_bits_fingerprint(&designs[block]),
-                array2_bits_fingerprint(&penalties[block]),
-            ),
-            &mut key,
-        );
-        canonical_keys.push(std::hash::Hasher::finish(&key));
     }
     let domain = GaussianRemlBlocksDomain::from_blockwise_penalties(p_total, &blockwise_penalties)?;
     let unit_lambdas = Array1::<f64>::ones(f_blocks);
@@ -781,34 +842,27 @@ pub fn gaussian_reml_fit_blocks_exact(
             rho_upper.get(k).copied().unwrap_or(f64::INFINITY),
         )
     }));
-    let problem = OuterProblem::new(f_blocks)
-        .with_gradient(Derivative::Analytic)
-        .with_hessian(DeclaredHessianForm::Dense)
-        .with_prefer_gradient_only(false)
-        .with_disable_fixed_point(true)
-        .with_tolerance(1.0e-10)
-        .with_bounds(rho_lower.clone(), rho_upper.clone())
-        .with_rho_canonical_keys(Some(canonical_keys))
-        .with_fallback_policy(FallbackPolicy::Disabled)
-        .with_problem_size(n, p_total)
-        .with_initial_rho(start_rho);
-    let mut objective = problem.build_objective(
-        profile,
-        gaussian_reml_blocks_profile_cost,
-        gaussian_reml_blocks_profile_outer_eval,
-        None::<fn(&mut GaussianRemlBlocksProfile)>,
-        None::<
-            fn(
-                &mut GaussianRemlBlocksProfile,
-                &Array1<f64>,
-            ) -> Result<gam_problem::EfsEval, EstimationError>,
-        >,
-    );
-    let optimum = problem.run(&mut objective, "exact block Gaussian REML")?;
-    let final_eval = objective.state.evaluate(optimum.rho.view())?;
-    objective.state.domain.certify_joint_coefficient_map(
-        objective.state.design.view(),
-        objective.state.weights.view(),
+    // The minimiser is `opt`'s Newton trust region on the exact profiled jet,
+    // projected onto each strength's resolvability domain, certified by the
+    // Newton decrement against the jet's own rounding bands exactly as the
+    // block-orthogonal route is. No iteration budget and no step clamp; anything
+    // short of a certified stationary point is a typed error carrying the last
+    // iterate, resumable through `init_rhos`. A projection writes the bound
+    // itself, so a strength is on its face exactly when it equals it.
+    let bounds = opt::Bounds::new(rho_lower, rho_upper, 0.0)
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+    let solution = certified_newton_minimum(start_rho.clone(), Some(bounds), None, |rhos| {
+        profile.jet(rhos)
+    })
+    .map_err(|error| EstimationError::BlockRemlDidNotConverge {
+        context: "exact block Gaussian REML",
+        rho_checkpoint: error.last_point().unwrap_or(&start_rho).to_vec(),
+        reason: error.to_string(),
+    })?;
+    let final_eval = profile.evaluate(solution.final_point.view())?;
+    profile.domain.certify_joint_coefficient_map(
+        profile.design.view(),
+        profile.weights.view(),
         final_eval.lambdas.view(),
     )?;
 
@@ -816,7 +870,7 @@ pub fn gaussian_reml_fit_blocks_exact(
         coefficients: final_eval.coefficients.insert_axis(Axis(1)),
         fitted: final_eval.fitted.insert_axis(Axis(1)),
         lambdas: final_eval.lambdas,
-        log_lambdas: optimum.rho,
+        log_lambdas: solution.final_point,
         reml_score: final_eval.cost,
         edf: final_eval.edf,
     })
@@ -2162,7 +2216,8 @@ pub fn gaussian_reml_blocks_orthogonal_shared_scale(
             .map(|jet| jet.sample)
             .map_err(|error| ObjectiveEvalError::recoverable(error.to_string()))
     })
-    .map_err(|error| EstimationError::BlockOrthogonalRemlDidNotConverge {
+    .map_err(|error| EstimationError::BlockRemlDidNotConverge {
+        context: "block-orthogonal Gaussian REML",
         rho_checkpoint: error.last_point().unwrap_or(&seed).to_vec(),
         reason: error.to_string(),
     })?;
@@ -6345,15 +6400,13 @@ mod tests {
     /// positive definiteness around rho=30 even when X is full rank and S is
     /// PSD. A start on that wall must stay numerically feasible and converge.
     ///
-    /// The two starts do not describe the same fit, and are not required to:
-    /// the criterion has an interior minimum and, at λ → ∞ in both blocks, a
-    /// flat top whose slope and curvature decay like `e^{-ρ}` below what the
-    /// criterion resolves. The search from the ordinary start finds the
-    /// interior minimum; the search from the wall certifies the flat top it
-    /// starts on, which is the penalty-null-space fit. Nothing a
-    /// derivative-based search reads at ρ = 30 points at a basin about 40
-    /// e-folds away, and the seed lattice that used to find it was a grid
-    /// search.
+    /// The criterion has an interior minimum and, at λ → ∞ in both blocks, a
+    /// flat top, the penalty-null-space fit, whose slope and curvature decay
+    /// like `e^{-ρ}`. Certified at the criterion's statistical resolution, the
+    /// search from the wall stopped on that top. Against the profile's own
+    /// rounding bands the top is not a certified stationary point, so the
+    /// Newton trust region descends from it and both starts reach the one
+    /// interior minimum.
     #[test]
     fn block_reml_large_strength_start_is_coordinate_stable_2830() {
         let mut first = Array2::<f64>::zeros((12, 2));
@@ -6385,48 +6438,70 @@ mod tests {
         )
         .expect("large-strength block-REML start must remain numerically feasible");
 
+        // The profile both fits minimise, evaluated directly: at the flat top
+        // `ρ = (30, 30)` and at each certified optimum, with the rounding band
+        // each value carries.
+        let n = y.len();
+        let mut design = Array2::<f64>::zeros((n, 4));
+        design.slice_mut(s![.., 0..2]).assign(&designs[0]);
+        design.slice_mut(s![.., 2..4]).assign(&designs[1]);
+        let weights = Array1::<f64>::ones(n);
+        let domain = GaussianRemlBlocksDomain::from_blockwise_penalties(
+            4,
+            &[
+                BlockwisePenalty::new(0..2, penalties[0].clone()),
+                BlockwisePenalty::new(2..4, penalties[1].clone()),
+            ],
+        )
+        .expect("block penalty domain");
+        let (penalty_basis, penalty_spectrum) =
+            domain.penalty_eigenbasis().expect("penalty eigenbasis");
+        let rotated = design.dot(&penalty_basis);
+        let profile = GaussianRemlBlocksProfile {
+            domain,
+            design: design.clone(),
+            weights: weights.clone(),
+            y: y.clone(),
+            xtwx: rotated.t().dot(&rotated),
+            xtwy: rotated.t().dot(&y),
+            // Each rank-one penalty leaves one null direction.
+            nu: (n - 2) as f64,
+            observation_measure: gaussian_reml_observation_measure(weights.view(), 1),
+            penalty_basis,
+            penalty_spectrum,
+        };
+        let top = profile.evaluate(array![30.0, 30.0].view()).expect("flat top");
+        let at_ordinary = profile
+            .evaluate(ordinary.log_lambdas.view())
+            .expect("ordinary optimum");
+        let at_boundary = profile
+            .evaluate(boundary.log_lambdas.view())
+            .expect("boundary optimum");
+
+        // Both starts certify the one interior minimum: their criteria agree
+        // within the sum of their bands, the resolution at which two evaluated
+        // values can differ at all (#3018), and it lies resolvably below the
+        // flat top the large start begins on.
         assert!(
-            ordinary.reml_score < boundary.reml_score,
-            "the ordinary start must reach the interior minimum below the flat top: \
-             ordinary rho {:?} criterion {:e}, boundary rho {:?} criterion {:e}",
+            (ordinary.reml_score - boundary.reml_score).abs()
+                <= at_ordinary.bands.objective + at_boundary.bands.objective,
+            "both starts must certify the same minimum: ordinary rho {:?} criterion {:e}, \
+             boundary rho {:?} criterion {:e}",
             ordinary.log_lambdas,
             ordinary.reml_score,
             boundary.log_lambdas,
             boundary.reml_score,
         );
-
-        // The λ → ∞ limit: least squares on each block's penalty null space,
-        // the column X_k·(1, 1).
-        let null_columns: Vec<Array1<f64>> = designs
-            .iter()
-            .map(|design| design.column(0).to_owned() + design.column(1))
-            .collect();
-        let gram = |a: &Array1<f64>, b: &Array1<f64>| a.dot(b);
-        let (a, b) = (&null_columns[0], &null_columns[1]);
-        let (aa, ab, bb) = (gram(a, a), gram(a, b), gram(b, b));
-        let (ay, by) = (a.dot(&y), b.dot(&y));
-        let determinant = aa * bb - ab * ab;
-        let coef_a = (bb * ay - ab * by) / determinant;
-        let coef_b = (aa * by - ab * ay) / determinant;
-        let limit = a * coef_a + &(b * coef_b);
-
-        // The fit leaves the limit at the rate the penalty releases the range
-        // space, `e^{-ρ}` in the least-penalized block.
-        let min_log_lambda = boundary.log_lambdas.iter().copied().fold(f64::INFINITY, f64::min);
-        let scale = y.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-        let tolerance = scale * (-min_log_lambda).exp();
-        let limit_difference = boundary
-            .fitted
-            .iter()
-            .zip(limit.iter())
-            .map(|(fitted, limit)| (fitted - limit).abs())
-            .fold(0.0_f64, f64::max);
         assert!(
-            limit_difference <= tolerance,
-            "the boundary start must certify the penalty-null-space fit: max difference \
-             {limit_difference:e} against {tolerance:e} at rho {:?}",
-            boundary.log_lambdas,
+            top.cost - ordinary.reml_score > top.bands.objective + at_ordinary.bands.objective,
+            "the interior minimum must lie resolvably below the flat top: top {:e}, \
+             minimum {:e}",
+            top.cost,
+            ordinary.reml_score,
         );
+
+        // That the top itself evaluates to the penalty-null-space fit is
+        // `block_profile_large_penalties_preserve_the_data_nullspace_fit`'s pin.
     }
 
     /// #2496: this one-mode problem has an analytic interior optimum at λ=1.

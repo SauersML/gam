@@ -3,7 +3,7 @@ use super::*;
 // payload assembly moved to `gam::inference::model_payload_builders` (#2470),
 // so only these tests still reach them.
 use gam::inference::model::{FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind};
-use ndarray::{array, s};
+use ndarray::array;
 
 #[test]
 fn pyffi_sources_use_canonical_gam_module_paths() {
@@ -823,99 +823,27 @@ fn blocks_reml_sign_inputs() -> (Vec<Array2<f64>>, Vec<Array2<f64>>, Array1<f64>
     (vec![x1, x2], vec![s1, s2], y, weights)
 }
 
+/// The forward `gaussian_reml_fit_blocks_backward_analytic` pairs with, the one
+/// the Python `gaussian_reml_fit_blocks_forward` calls: exact block REML.
+/// Returns `(log_lambdas, reml_score)`. The backward's score channel is the
+/// envelope-theorem derivative, exact only where `∂V/∂ρ = 0`, so the profile it
+/// is compared against must be this certified optimum and not a route that
+/// stops at the criterion's statistical resolution.
 fn gaussian_reml_fit_blocks_forward_native(
     designs: &[Array2<f64>],
     penalties: &[Array2<f64>],
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
     init_rhos: &[f64],
-) -> Result<
-    (
-        Array1<f64>,
-        Array1<f64>,
-        Array1<f64>,
-        Array1<f64>,
-        f64,
-        Array1<f64>,
-    ),
-    EstimationError,
-> {
-    let n_rows = designs[0].nrows();
-    let mut col_offsets = vec![0usize];
-    for design in designs {
-        col_offsets.push(col_offsets.last().copied().unwrap() + design.ncols());
-    }
-    let p_total = *col_offsets.last().unwrap();
-    let mut joint_x = Array2::<f64>::zeros((n_rows, p_total));
-    for (block, design) in designs.iter().enumerate() {
-        joint_x
-            .slice_mut(s![.., col_offsets[block]..col_offsets[block + 1]])
-            .assign(design);
-    }
-    let s_list = penalties
-        .iter()
-        .enumerate()
-        .map(|(block, penalty)| {
-            gam::terms::smooth::BlockwisePenalty::new(
-                col_offsets[block]..col_offsets[block + 1],
-                penalty.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let opts = gam::solver::estimate::FitOptions {
-        resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
-        latent_cloglog: None,
-        mixture_link: None,
-        optimize_mixture: false,
-        sas_link: None,
-        optimize_sas: false,
-        compute_inference: true,
-        skip_rho_posterior_inference: false,
-        max_iter: 200,
-        tol: 1.0e-9,
-        nullspace_dims: vec![0; s_list.len()],
-        linear_constraints: None,
-        firth_bias_reduction: false,
-        rho_prior: Default::default(),
-        persistent_warm_start_store: None,
-    };
-    let offset = Array1::<f64>::zeros(n_rows);
-    let fit = gam::solver::estimate::fit_gamwith_heuristic_log_lambdas(
-        joint_x.clone(),
+) -> Result<(Array1<f64>, f64), EstimationError> {
+    let fit = gam::solver::gaussian_reml::gaussian_reml_fit_blocks_exact(
+        designs,
+        penalties,
         y,
-        weights,
-        offset.view(),
-        &s_list,
+        Some(weights),
         Some(init_rhos),
-        LikelihoodSpec::new(
-            ResponseFamily::Gaussian,
-            InverseLink::Standard(StandardLink::Identity),
-        ),
-        &opts,
     )?;
-    let beta = fit.beta.clone();
-    let fitted = joint_x.dot(&beta);
-    let lambdas = fit.lambdas.clone();
-    let log_lambdas = lambdas.mapv(|lambda| lambda.max(1.0e-300).ln());
-    let edf_vec = fit
-        .inference
-        .as_ref()
-        .map(|inference| inference.edf_by_block.clone())
-        .unwrap_or_else(|| vec![0.0; lambdas.len()]);
-    let edf = if edf_vec.len() == lambdas.len() {
-        Array1::from_vec(edf_vec)
-    } else {
-        Array1::zeros(lambdas.len())
-    };
-    Ok((
-        beta,
-        fitted,
-        lambdas,
-        log_lambdas,
-        fit.reml_score()
-            .expect("the blockwise reference fit reports its criterion"),
-        edf,
-    ))
+    Ok((fit.log_lambdas, fit.reml_score))
 }
 
 fn blocks_profile_reml_score(
@@ -925,7 +853,7 @@ fn blocks_profile_reml_score(
     weights: ArrayView1<'_, f64>,
     init_rhos: &[f64],
 ) -> f64 {
-    let (_, _, _, _, reml_score, _) =
+    let (_, reml_score) =
         gaussian_reml_fit_blocks_forward_native(designs, penalties, y, weights, init_rhos)
             .expect("multi-block Gaussian REML profile score");
     reml_score
@@ -935,7 +863,7 @@ fn blocks_profile_reml_score(
 fn blocks_negative_reml_score_backward_sign_matches_profile_perturbations() {
     let (designs, penalties, y, weights) = blocks_reml_sign_inputs();
     let init_rhos = vec![0.2, -0.4];
-    let (_, _, _, log_lambdas, _, _) = gaussian_reml_fit_blocks_forward_native(
+    let (log_lambdas, _) = gaussian_reml_fit_blocks_forward_native(
         &designs,
         &penalties,
         y.view(),

@@ -1,5 +1,15 @@
 ## Unreleased
 
+- **Exact block Gaussian REML (`gaussian_reml_fit_blocks_forward`) returns a numerically
+  stationary smoothing optimum, so its analytic backward is exact.** The forward certified its
+  outer search at the criterion's statistical resolution `1/(2n)`. That left `|∂V/∂ρ|` near `1e-3`
+  (log-λ about 0.02 from the optimum). The paired backward is the envelope-theorem derivative,
+  exact only where `∂V/∂ρ = 0`, so every VJP was off by about `1e-4` relative. The forward now
+  minimises the exact profiled jet with a certified Newton trust region on each strength's
+  resolvability domain. The certificate is the Newton decrement against the jet's own rounding
+  bands, as on the block-orthogonal route. A non-converged fit raises the renamed
+  `EstimationError::BlockRemlDidNotConverge`, which names its route and carries a resumable
+  `init_rhos` checkpoint.
 - **Model summaries report the variance-component score test (statistic and p-value) for ridged
   linear terms again** (#3573). Two #3573 changes merged on top of each other: one files the ridged
   records in `FitArtifacts::linear_term_tests`, the other's summary reader looked them up in
