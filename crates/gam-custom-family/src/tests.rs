@@ -1625,6 +1625,15 @@ pub(crate) fn outerobjective_andgradient<F: CustomFamily + Clone + Send + Sync +
     Ok((objective, gradient, warm_start))
 }
 
+/// One Gaussian block with every response at `1`: `ℓ(η) = −½Σ(1 − η)²`, whose IRLS working set is
+/// response `1` at weight `1` on every row.
+///
+/// The log-likelihood is the one its working set is the quadratic model of. It was once the
+/// constant `0` beside that working set, so the IRLS step toward `η = 1` raised the penalized
+/// objective by `½λβ²` with nothing to gain: an inner solve that scores its steps against the
+/// objective accepts none of them, and `failed_terminal_probe_clears_stale_owned_mode` was refused
+/// with `InnerSolveNotConverged { max_accepted_step: 0.0, max_proposed_step: 0.5, .. }` before it
+/// reached the transaction boundary it tests.
 #[derive(Clone)]
 pub(crate) struct OneBlockIdentityFamily;
 
@@ -5513,9 +5522,11 @@ pub(crate) fn custom_family_outer_derivatives_keeps_second_order_for_large_inner
 
 impl CustomFamily for OneBlockIdentityFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        let n = block_states[0].eta.len();
+        let eta = &block_states[0].eta;
+        let n = eta.len();
+        let residual = eta.mapv(|value| 1.0 - value);
         Ok(FamilyEvaluation {
-            log_likelihood: 0.0,
+            log_likelihood: -0.5 * residual.dot(&residual),
             blockworking_sets: vec![BlockWorkingSet::Diagonal {
                 working_response: Array1::ones(n),
                 working_weights: Array1::ones(n),
