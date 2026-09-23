@@ -2416,135 +2416,41 @@ mod axis_relevance_factor_rank_2735_tests {
     use super::*;
     use ndarray::Array2;
 
-    /// The shipped relevance block keeps every mode its collocation factor
-    /// resolves, including one below the dense bridge's relative cutoff.
-    #[test]
-    fn axis_relevance_block_keeps_every_mode_its_factor_resolves_2735() {
-        // Axis 1 of a 2-axis D1 is `[diag(σ) Vᵀ; 0]`, with V a Householder
-        // reflection so the Gram is not diagonal. One mode sits at σ²/σ²_max =
-        // 1e-9: far above the Gram's rounding band (n·ε ≈ 2.7e-15) and below
-        // the bridge's cutoff n·1e-10 = 1.2e-9.
-        //
-        // THAT SECOND CLAUSE IS STALE AND THIS FIXTURE'S SHAPE CANNOT BE
-        // RETUNED (#1561). `0f72c1e70e` (#2901) replaced the `n·1e-10` cutoff
-        // with the rounding band itself, so the bridge now keeps the 1e-9 mode
-        // and the negative control below is false: left 9, right 8.
-        //
-        // Its sibling `axis_relevance_rank_is_continuous_across_the_seed0_
-        // length_scales_2735` was retunable because its Gram is 500-order while
-        // its accumulation is only 12 rows deep, leaving a 42× window between
-        // `dim·ε·λ_max` and `γ_rows`. Here the Gram is 12-order (band
-        // `12·ε = 2.66e-15`) and `fast_ata` accumulates over `rows_per_axis =
-        // 20` rows (noise `20·ε = 4.44e-15`). The noise EXCEEDS the band, so
-        // there is no ratio that the bridge reliably drops while its computed
-        // sign is still a measurement — a mode placed there could make
-        // `try_from_dense_psd` refuse the Gram as indefinite instead of
-        // truncating it, and the control would fail for a third reason.
-        //
-        // Giving this test a window means giving it the sibling's shape: more
-        // columns than rows, modes set through `U Σ Vᵀ`. That makes it a near
-        // duplicate of the sibling, so the two should be merged rather than
-        // this one rewritten. Left failing deliberately, with the reason
-        // stated, rather than retuned into a fixture I cannot run.
-        let n = 12usize;
-        let rows_per_axis = 20usize;
-        let sigma_sq: [f64; 12] = [1.0, 0.5, 0.1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-9, 0.0, 0.0, 0.0];
-        let v: Vec<f64> = (0..n).map(|i| 1.0 + 0.37 * i as f64).collect();
-        let v_norm_sq: f64 = v.iter().map(|x| x * x).sum();
-        let mut factor = Array2::<f64>::zeros((rows_per_axis, n));
-        for (row, &s2) in sigma_sq.iter().enumerate() {
-            let sigma = s2.sqrt();
-            for col in 0..n {
-                let identity = if row == col { 1.0 } else { 0.0 };
-                let reflection = identity - 2.0 * v[row] * v[col] / v_norm_sq;
-                factor[[row, col]] = sigma * reflection;
-            }
-        }
-        let mut d1 = Array2::<f64>::zeros((2 * rows_per_axis, n));
-        for row in 0..rows_per_axis {
-            d1[[2 * row, row % n]] = 1.0;
-            d1.row_mut(2 * row + 1).assign(&factor.row(row));
-        }
-
-        let factor_rank = gam_linalg::roundoff::factor_rank_partition(&factor)
-            .expect("factor SVD")
-            .rank;
-        assert_eq!(factor_rank, 9, "the fixture's factor must resolve its 1e-9 mode");
-        // Negative control: the dense bridge drops that mode.
-        let bridged = ConstructiveQuadratic::try_from_dense_psd(
-            symmetrize(&fast_ata(&factor)),
-            "dense bridge control",
-        )
-        .expect("dense bridge");
-        assert_eq!(
-            bridged.factor().nrows(),
-            8,
-            "the dense bridge must truncate the 1e-9 mode, or this fixture cannot tell the routes apart"
-        );
-
-        let candidate = duchon_axis_relevance_candidate(&d1, 2, 1).expect("relevance candidate");
-        assert_eq!(candidate.source, PenaltySource::OperatorRelevance { axis: 1 });
-        let shipped = analyze_penalty_block(candidate.matrix.dense())
-            .expect("shipped block spectrum")
-            .eigenvalues
-            .to_vec();
-        assert_eq!(
-            gam_linalg::roundoff::resolved_eigenvalue_count(&shipped, 0.0),
-            factor_rank,
-            "the shipped relevance block must keep every mode its factor resolves"
-        );
-        let gram_frobenius = stable_euclidean_norm(fast_ata(&factor).iter().copied());
-        assert!(
-            (candidate.normalization_scale - gram_frobenius).abs() <= 1e-12 * gram_frobenius,
-            "the block is normalized by its own Gram's Frobenius norm: {} vs {gram_frobenius}",
-            candidate.normalization_scale
-        );
-    }
-
     /// The rank flip #2735's seed 0 hit (MSI 1244869), rebuilt on a factor whose
     /// spectrum is set instead of searched for. On the stress term's 500-column
     /// relevance Gram of axis 1, `λ₄₈₃/λ_max` was 5.057e-8, 5.013e-8 and
-    /// 4.958e-8 at ℓ = 1.0004, 0.9970 and 0.9929 (builds 1, 6 and 7), across
-    /// the dense bridge's cutoff `500·1e-10 = 5.000e-8`. The bridge kept 484,
-    /// 484 and then 483 modes, and every trial on the short side was refused at
-    /// the frozen rank.
+    /// 4.958e-8 at ℓ = 1.0004, 0.9970 and 0.9929 (builds 1, 6 and 7). The dense
+    /// bridge then cut at `500·1e-10·λ_max = 5.000e-8`, so it kept 484, 484 and
+    /// then 483 modes, and every trial on the short side was refused at the
+    /// frozen rank.
     ///
     /// Here `D = U·Σ·Vᵀ` has 500 columns and eight modes, and the eighth mode's
-    /// `σ²/σ²_max` takes the three measured ratios. The factor resolves all
-    /// eight modes at every ℓ, so the shipped rank must be eight at all three.
-    /// The dense bridge must keep 8, 8, 7, or the fixture cannot tell the
-    /// routes apart.
+    /// `σ²/σ²_max` takes the three measured ratios. The shipped block is emitted
+    /// from its collocation factor, and its rank is classified at the spectrum's
+    /// own rounding band `dim·ε·λ_max = 1.1e-13` (`0f72c1e70e`, #2901). All
+    /// three ratios sit five decades above that band, so the shipped rank must
+    /// be eight at every ℓ, equal to the factor's.
+    ///
+    /// The control is the rule that failed. A spectrum count at the incident's
+    /// relative cutoff `500·1e-10` must split the three builds 8, 8, 7, or this
+    /// fixture could not have caught the flip.
+    ///
+    /// An earlier sibling placed a mode between the factor's band and the dense
+    /// band to separate the factor route from the dense bridge. After #2901 both
+    /// cut at the dense rounding band, and every consumer of the shipped block
+    /// (`nullspace_dims`, `log|S|₊`) reads that dense spectrum. A mode below the
+    /// band is not resolved by any of them, so no route exists that could keep
+    /// it, and that fixture measured nothing. Its normalization check is kept
+    /// here.
     #[test]
     fn axis_relevance_rank_is_continuous_across_the_seed0_length_scales_2735() {
         let rows_per_axis = 12usize;
         let columns = 500usize;
         let steady_ratios: [f64; 7] = [1.0, 0.25, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6];
-        // The three ratios straddle the cutoff ACTUALLY IN FORCE, derived here
-        // rather than taken from the incident (#1561).
-        //
-        // The incident's own ratios were 5.057e-8, 5.013e-8 and 4.958e-8,
-        // chosen to straddle `500·1e-10 = 5.000e-8`. `0f72c1e70e` (#2901)
-        // removed that constant: `try_from_dense_psd` now cuts at the
-        // spectrum's rounding band `dim·ε·λ_max`, and with a 500-column Gram
-        // that is `500·2.22e-16 = 1.11e-13`. All three incident ratios sit six
-        // decades ABOVE it, so the bridge kept 8, 8, 8 and the negative control
-        // below — which exists to prove the fixture can tell the routes apart —
-        // became false. The defect the incident recorded was fixed by #2901,
-        // not by anything in #2735; the CLAIM this test makes is still live.
-        //
-        // Two bands bound the usable window, and they are 42 apart here:
-        //   * the bridge drops a mode below `1.11e-13` (the 500-order Gram's
-        //     rounding band), and
-        //   * `fast_ata` accumulates over `rows_per_axis = 12` rows, so a
-        //     computed eigenvalue is trustworthy only above `γ₁₂ ≈ 12·ε ≈
-        //     2.66e-15`. Below that its sign is noise and the bridge could
-        //     REFUSE the Gram as indefinite rather than truncate it.
-        // 5.0e-13 and 2.0e-13 sit above the band and are kept; 5.0e-14 sits
-        // under it and 19× over the noise floor, so it is dropped with its sign
-        // still measured. The factor resolves all three: `σ = √r` is 2.24e-7 at
-        // the smallest, against a factor band of `max(12,500)·ε = 1.11e-13`.
         let crossing: [(f64, f64); 3] =
-            [(1.0004, 5.0e-13), (0.9970, 2.0e-13), (0.9929, 5.0e-14)];
+            [(1.0004, 5.057e-8), (0.9970, 5.013e-8), (0.9929, 4.958e-8)];
+        // The incident's cutoff, relative to λ_max: `dim · 1e-10`.
+        let incident_cutoff = columns as f64 * 1e-10;
         // Householder reflections, so neither the factor nor its Gram is
         // diagonal: U acts on the rows and V on the columns.
         let householder = |n: usize, slope: f64| {
@@ -2559,7 +2465,7 @@ mod axis_relevance_factor_rank_2735_tests {
         let v = householder(columns, 0.011);
 
         let mut shipped_ranks = Vec::new();
-        let mut bridged_ranks = Vec::new();
+        let mut incident_ranks = Vec::new();
         for (length_scale, ratio) in crossing {
             let mut sigma_sq = steady_ratios.to_vec();
             sigma_sq.push(ratio);
@@ -2589,6 +2495,7 @@ mod axis_relevance_factor_rank_2735_tests {
             );
             let candidate =
                 duchon_axis_relevance_candidate(&d1, 2, 1).expect("relevance candidate");
+            assert_eq!(candidate.source, PenaltySource::OperatorRelevance { axis: 1 });
             let shipped = analyze_penalty_block(candidate.matrix.dense())
                 .expect("shipped block spectrum")
                 .eigenvalues
@@ -2599,19 +2506,32 @@ mod axis_relevance_factor_rank_2735_tests {
                 "ℓ = {length_scale}, axis 1: the shipped relevance block resolves \
                  {shipped_rank} modes but its collocation factor resolves {factor_rank}"
             );
-            let bridged = ConstructiveQuadratic::try_from_dense_psd(
-                symmetrize(&fast_ata(&factor)),
-                "dense bridge control",
-            )
-            .expect("dense bridge");
+            let gram_frobenius = stable_euclidean_norm(fast_ata(&factor).iter().copied());
+            assert!(
+                (candidate.normalization_scale - gram_frobenius).abs()
+                    <= gam_linalg::roundoff::accumulation_band(columns * columns, gram_frobenius),
+                "ℓ = {length_scale}: the block is normalized by its own Gram's Frobenius norm: \
+                 {} vs {gram_frobenius}",
+                candidate.normalization_scale
+            );
+            let gram_spectrum = analyze_penalty_block(&symmetrize(&fast_ata(&factor)))
+                .expect("Gram spectrum")
+                .eigenvalues
+                .to_vec();
+            let top = gram_spectrum.iter().copied().fold(0.0_f64, f64::max);
+            incident_ranks.push(
+                gram_spectrum
+                    .iter()
+                    .filter(|&&value| value > incident_cutoff * top)
+                    .count(),
+            );
             shipped_ranks.push(shipped_rank);
-            bridged_ranks.push(bridged.factor().nrows());
         }
         assert_eq!(
-            bridged_ranks,
+            incident_ranks,
             vec![8, 8, 7],
-            "negative control: the dense bridge must keep the crossing mode at ℓ = 1.0004 and \
-             0.9970 and drop it at 0.9929, or this fixture cannot tell the routes apart"
+            "control: the incident's `dim·1e-10` cutoff must split the three builds, or this \
+             fixture could not have caught the flip"
         );
         assert!(
             shipped_ranks.windows(2).all(|pair| pair[0] == pair[1]),
