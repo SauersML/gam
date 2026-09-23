@@ -1,9 +1,7 @@
 """Certify the population executed by partitioned nextest shard logs.
 
 WHAT THIS ANSWERS, AND WHAT IT DOES NOT
-`scripts/test_census.py` answers "were tests deleted from source". This answers
-a different question with a different blind spot: "did the shards actually RUN
-what was there". A test can be present in every source tree, archived into
+This answers "did the shards actually RUN what was there". A test can be present in every source tree, archived into
 `nx.tar.zst`, assigned to a partition, and then never execute because that
 shard's runner was OOM-killed or its log was truncated -- and every source-side
 gate in this repository is byte-identical between that run and a complete one.

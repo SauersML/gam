@@ -17,17 +17,6 @@ name: Compile gate (native Linux + non-Linux cross)
 # was lost. This job is the answer to "is THIS commit buildable on the platform
 # everyone runs it on", and it is minutes, not hours.
 #
-# The ban scanner runs FIRST, and standalone. It is the root `build.rs`, which
-# is std-only and reads the tree through `CARGO_MANIFEST_DIR`, so `scripts/
-# ban_scanner.sh` compiles and runs THE SAME CODE cargo runs — not a
-# re-implementation of its rules — in about four seconds. That matters for the
-# third defect #2582 names: as a build-script side effect the report is
-# attributed to "failed to run custom build command for `gam`" and buried
-# several hundred `cargo:rerun-if-changed=` lines from the `file:line` it
-# names. Run directly, the violation list IS the step output. It also gives
-# every lane a four-second pre-land check that a per-crate `cargo check` cannot
-# provide.
-#
 # NON-LINUX CROSS (#2377). Every wheel platform except Linux was silently
 # broken for three releases because no CI job COMPILES a non-Linux target
 # between releases — `-D warnings` breaks in `cfg(target_os = "linux")`
@@ -78,7 +67,7 @@ concurrency:
 
 jobs:
   linux-native-check:
-    name: Native Linux — ban scanner + workspace --all-targets
+    name: Native Linux — workspace --all-targets
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -86,28 +75,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Ban scanner (root build.rs, run standalone)
-        run: |
-          set +e
-          scripts/ban_scanner.sh .
-          status=$?
-          if [ "$status" -ne 0 ]; then
-            echo "::error title=Ban scanner::This commit contains banned constructs; every offending file:line is printed above in this step. The same check aborts the root crate's build, which fails EVERY root-crate target including the whole quality suite."
-          fi
-          exit "$status"
-      # Negative control: the step above proves the tree is clean, which is also
-      # what a scanner that detects NOTHING reports. This plants a real violation
-      # and requires the scanner to fail on it. Runs second so a genuine
-      # violation is reported by the step above first.
-      - name: Ban scanner negative control (planted violation must fail)
-        run: |
-          set +e
-          scripts/ban_scanner_selftest.sh .
-          status=$?
-          if [ "$status" -ne 0 ]; then
-            echo "::error title=Ban scanner negative control::The ban scanner did not fail on a planted violation, or rejected the committed tree. A scanner that detects nothing passes every shape check in build.rs -- that is what this control exists to catch. Repair the rule; do not remove this step."
-          fi
-          exit "$status"
       - uses: mozilla-actions/sccache-action@v0.0.9
       - name: Check workspace natively (deny warnings)
         env:

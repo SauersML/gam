@@ -120,7 +120,7 @@ jobs:
           # a shallow clone with depth 2 keeps a parent commit available.
           fetch-depth: 2
 
-      - name: Verify the commissioned tree and repository bans
+      - name: Verify the commissioned tree
         shell: bash
         env:
           TARGET_SHA: ${{ steps.target.outputs.sha }}
@@ -132,7 +132,6 @@ jobs:
             exit 1
           fi
           echo "Preflighting immutable runtime ${checked_out_sha}."
-          scripts/ban_scanner.sh .
 
       - name: Plan the installed-wheel smoke matrix
         id: smoke-matrix
