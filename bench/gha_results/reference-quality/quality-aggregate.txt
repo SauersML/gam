@@ -6,13 +6,13 @@ factors         1      1      0      1    0.0173      1.0000    1.0000
 families       51     51     34     17   -0.0055      0.0038    0.0226
 manifolds      11     11      8      2   -0.0033      0.0527    0.1582
 misc           28     28     16     12   -0.0003      0.1421    0.2132
-smooths        40     40     21     19   -0.0030      0.1324    0.2132
-survival       12     12      7      5   -0.0092      0.2349    0.2818
+smooths        40     40     22     18   -0.0051      0.1032    0.2064
+survival       13     13      7      5   -0.0058      0.2349    0.2818
 ------------------------------------------------------------------------
-OVERALL       143    143     86     56   -0.0033      0.0006 
+OVERALL       144    144     87     55   -0.0034      0.0005 
 
-CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0006, median log(gam/ref)=-0.0033, wins 86 / losses 56)
-Experimental units: 143 cases from 184 metric pairs.
+CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0005, median log(gam/ref)=-0.0034, wins 87 / losses 55)
+Experimental units: 144 cases from 185 metric pairs.
 INCOMPLETE: absent manifest, mismatched execution, or failed cases; closure blocked.
 
 --- execution vs emission (silent-attrition guard) ---
@@ -24,9 +24,9 @@ manifolds          11       0        11
 misc              247      10        28
 regressions         3       0         0
 smooths            49      10        40
-survival           27       3        12
+survival           27       2        13
 
-SILENT ATTRITION: 16 test(s) failed BEFORE emitting a pair (excluded from the significance set):
+SILENT ATTRITION: 15 test(s) failed BEFORE emitting a pair (excluded from the significance set):
   GAM_ERROR/gam_fit_failed families::quality_vs_vgam_multinomial_softmax::gam_multinomial_softmax_recovers_true_simplex_on_real_data
   GAM_ERROR/gam_fit_failed families::quality_vs_synthetic_multinomial_deviance_identity::multinomial_recovers_decision_boundary_on_held_out_split
   GAM_ERROR/gam_fit_failed families::quality_vs_vgam_multinomial_smooth_by_factor::gam_multinomial_smooth_by_factor_recovers_truth
@@ -41,11 +41,10 @@ SILENT ATTRITION: 16 test(s) failed BEFORE emitting a pair (excluded from the si
   METRIC_OFF/quality_metric smooths::quality_vs_rstpm2_pstpm2_smooth_covariate::gam_smooth_covariate_recovers_flat_noise_effect_and_valid_survival_on_bone
   METRIC_OFF/quality_metric smooths::quality_vs_mgcv_quakes_spatial_smooth::gam_spatial_smooth_predicts_quakes_better_than_baseline_on_real_data
   GAM_ERROR/gam_fit_failed smooths::quality_vs_mgcv_matern_smooth::gam_matern_smooth_recovers_truth
-  TIMEOUT/per_test_bound survival::quality_vs_survival_coxph_frailty_hazard_multiplier::gam_hazard_multiplier_frailty_matches_coxph_frailty_on_real_data
   TIMEOUT/per_test_bound survival::quality_vs_survival_coxph_frailty_hazard_multiplier::gam_hazard_multiplier_frailty_matches_coxph_frailty
 
 --- #2395 paired-panel power ---
-33 of 184 pairs carry a paired fold panel: 2 resolved BETTER, 4 resolved WORSE, 27 unresolved.
+33 of 185 pairs carry a paired fold panel: 2 resolved BETTER, 4 resolved WORSE, 27 unresolved.
 Pairing gain (unpaired SEM / paired SEM) over these panels: min 1.00x, median 4.18x, max 345.92x. Values above 1 are the common fold-draw swing that comparing two separately-averaged arms would have paid for.
 
 pair                                                         K   effect%    sem%  |e|/sem     d_z   wins  verdict
