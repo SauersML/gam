@@ -5228,5 +5228,14 @@
     },
     "reason": "#4559/#3998: smoothed_marginal normalises in the log domain, so the crate-private weighted_sum that renormalised the value-domain product has no caller. The old body formed exp(log raw + log beta) as a value, summed it against the grid weights with weighted_sum, and divided; that ordering is what forced the underived 1e-11 density floor, because the product overflows where beta is large and underflows where raw is small. The replacement sums each point's log mass ln w + ln raw + ln beta with log_sum_exp and divides in the log, so no weighted sum of values is formed anywhere in the function. No other site in gam-event-history forms a plain weighted sum over a grid: posterior_moments and latent_state_moments each weight a triple product (weight times density times a coordinate), which weighted_sum's two-slice fold does not express. See docs/source-removal-changes.json at the same base for the const and private fn removed with it.",
     "evidence": "Replacement: the log-domain normalisation inside smoothed_marginal in crates/gam-event-history/src/marginal.rs, in this commit. At the base 07220f9411, git grep -n -w weighted_sum finds its declaration (marginal.rs:330) and exactly one call (marginal.rs:1586, inside smoothed_marginal); every other occurrence in the tree is an unrelated local binding or struct field of the same name in gam-model-kernels, gam-solve, gam-sae and tests/, in files that do not depend on gam-event-history. It is pub(crate), never re-exported: crates/gam-event-history/src/lib.rs lists no marginal item in its pub use, and no file under crates, gamfit, tests or examples names gam_event_history::marginal."
+  },
+  {
+    "base": "5f736876ee686d5a23d53d4558863655637b0ec2",
+    "removed": {
+      "crates/gam-models/src/inference/full_conformal.rs::new": 1,
+      "crates/gam-models/src/inference/full_conformal/honest.rs::honest_full_conformal": 1
+    },
+    "reason": "#3338, acb2a08e4c: every production conformal inversion takes its tie uniform from conformal_tie_uniform(row_index). ExactGaussianFullConformal::new and honest_full_conformal drew an unseeded rand::rng() uniform and had no caller; callers use new_with_uniform and honest_full_conformal_with_uniform.",
+    "evidence": "git grep at the base finds no caller outside the coverage replicate, which now uses honest_full_conformal_with_uniform; gam-models 13/13 targeted tests and the gam-pyffi --all-targets check are green (acn112)."
   }
 ]
