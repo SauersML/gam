@@ -875,6 +875,38 @@ pub(crate) fn duchon_order_for_operator_margin(
     effective
 }
 
+/// `n!` as `f64`, from the exact integer product: within one rounding of `n!`
+/// for `n ≤ 34` (the product is exact in `u128` and converted once), and one
+/// more rounding per factor past 34.
+///
+/// The Duchon partial-fraction Taylor coefficients take `Γ` only at positive
+/// integers, and their `ln r` parts cancel across blocks to a real zero, so the
+/// cancellation band has to count every rounding that forms a summand. The
+/// Lanczos approximation [`gamma_lanczos`] carries a truncation error of a few
+/// ulps that no rounding count describes; this does not.
+pub(crate) fn factorial_f64(n: usize) -> f64 {
+    let mut exact: u128 = 1;
+    let mut k = 2usize;
+    while k <= n {
+        match exact.checked_mul(k as u128) {
+            Some(product) => exact = product,
+            None => break,
+        }
+        k += 1;
+    }
+    let mut value = exact as f64;
+    while k <= n {
+        value *= k as f64;
+        k += 1;
+    }
+    value
+}
+
+/// Roundings [`factorial_f64`] makes forming `n!`.
+pub(crate) const fn factorial_roundings(n: usize) -> usize {
+    if n <= 34 { 1 } else { 1 + (n - 34) }
+}
+
 #[inline(always)]
 pub(crate) fn gamma_lanczos(x: f64) -> f64 {
     // Numerical Recipes / Lanczos approximation with reflection formula.
@@ -2101,7 +2133,8 @@ pub(crate) fn duchon_hybrid_kernel_collision_value(
     let mut log_part = CompensatedSum::default();
     // The magnitude sum of exactly the terms `log_part` accumulates: the
     // quantity that bands its forward error below.
-    let mut log_abs_scale = CompensatedSum::default();
+    // The band of the `ln r` residue, summand by summand.
+    let mut log_cancel_band = 0.0_f64;
     for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
         if a_m == 0.0 {
             continue;
@@ -2109,7 +2142,12 @@ pub(crate) fn duchon_hybrid_kernel_collision_value(
         let (block_pure, block_log) = duchon_polyharmonic_block_taylor_r2j(m, k_dim, 0);
         pure.add(a_m * block_pure);
         log_part.add(a_m * block_log);
-        log_abs_scale.add((a_m * block_log).abs());
+        if block_log != 0.0 {
+            log_cancel_band += gam_linalg::roundoff::compensated_band(
+                polyharmonic_log_summand_roundings(m, k_dim),
+                (a_m * block_log).abs(),
+            );
+        }
     }
     for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
         if b_n == 0.0 {
@@ -2118,19 +2156,23 @@ pub(crate) fn duchon_hybrid_kernel_collision_value(
         let (block_pure, block_log) = duchon_matern_block_taylor_r2j(kappa, n, k_dim, 0);
         pure.add(b_n * block_pure);
         log_part.add(b_n * block_log);
-        log_abs_scale.add((b_n * block_log).abs());
+        if block_log != 0.0 {
+            log_cancel_band += gam_linalg::roundoff::compensated_band(
+                matern_log_summand_roundings(n, k_dim, 0),
+                (b_n * block_log).abs(),
+            );
+        }
     }
     let value = pure.value();
     let log_value = log_part.value();
     // The partial-fraction identity cancels the `ln r` coefficients in exact
-    // arithmetic, so `log_part` sums to a real zero and holds nothing but its
-    // own summation error. `CompensatedSum` is a Kahan-Babuska-Neumaier sum,
-    // whose forward error is `(2 + k)·u·Σ|terms|` with NO dependence on the term
-    // count (Higham, *ASNA* 2nd ed., §4.3); each summand here costs one product
-    // to form, so `k = 1`. The band is denominated in the log terms' own
-    // magnitudes: the pure part is a different quantity and is free to be zero
-    // where the log terms are not.
-    let log_cancel_band = gam_linalg::roundoff::compensated_band(1, log_abs_scale.value());
+    // arithmetic, so `log_part` sums to a real zero and holds nothing but the
+    // roundings of its summands and of their sum. `CompensatedSum` is a
+    // Kahan-Babuska-Neumaier sum, whose forward error is `(2 + k)·u·Σ|terms|`
+    // with NO dependence on the term count (Higham, *ASNA* 2nd ed., §4.3), where
+    // `k` counts the roundings that formed each summand, per block above. The
+    // band is denominated in the log terms' own magnitudes: the pure part is a
+    // different quantity and is free to be zero where the log terms are not.
     if log_value.abs() > log_cancel_band {
         crate::bail_invalid_basis!(
             "Duchon hybrid diagonal log terms did not cancel: log={log_value:.6e}, band={log_cancel_band:.6e}, value={value:.6e}; p={p_order}, s={s_order}, d={k_dim}"
@@ -2402,6 +2444,8 @@ pub(crate) fn duchon_hybrid_kernel_nullspace_reduced(
         let mut power = r.powi(start as i32);
         let mut k = start;
         let mut certified: Option<f64> = None;
+        // The bound the previous order carries forward (see below).
+        let mut carried_bound = 0.0_f64;
         while k <= s_order + DUCHON_TAYLOR_ORDER_CEILING {
             let term = duchon_hybrid_taylor_rk(kappa, k_dim, coeffs, k);
             let even = k.is_multiple_of(2);
@@ -2425,16 +2469,33 @@ pub(crate) fn duchon_hybrid_kernel_nullspace_reduced(
             // follows it, so a structurally vanishing order cannot certify a
             // tail it says nothing about.
             series_scale += kept_scale * power;
-            let order_bound = (term.pure_scale + term.log_scale * ln_r.abs()) * power;
-            if !(series_scale.is_finite() && order_bound.is_finite()) {
-                break;
-            }
             // Every block's order-`k` coefficient carries `(−κ)^{k−q₀}/(k−q₀)!`
             // for a block-fixed `q₀ ≤ s`, so past `k = s` the per-order ratio is
             // at most `z / (k − s)`, and past `k = 2p` — beyond every
             // polyharmonic block, which contributes to a single order — that
             // ratio is the whole of it. Where the ratio is below one half the
-            // untaken tail is a geometric series on this order's own scale.
+            // untaken tail is a geometric series on this order's own bound.
+            //
+            // An order's own scale bounds the tail only if the order carries the
+            // series: in even `d` every odd order is structurally zero, so its
+            // own scale is zero while the next even order is not. That zero
+            // certified the tail at `k = 2p + 1`, one term in, and the reduced
+            // kernel dropped every order past `2p`: at `d = 2, p = 2, s = 1` the
+            // omitted `r⁶` term made the constrained Gram indefinite
+            // (`λ_min = −2.2e−3` against an exact `+1.0e−5`, gam#3020). The same
+            // ratio argument carries the previous order's bound across a
+            // vanishing order, `|C_k| r^k ≤ bound_{k−1} · z/(k − s)`, so the
+            // bound an order reports is the larger of its own scale and that.
+            let own_bound = (term.pure_scale + term.log_scale * ln_r.abs()) * power;
+            let order_bound = if (k as f64) > s_order as f64 {
+                own_bound.max(carried_bound * z / (k as f64 - s_order as f64))
+            } else {
+                own_bound
+            };
+            carried_bound = order_bound;
+            if !(series_scale.is_finite() && order_bound.is_finite()) {
+                break;
+            }
             if k > analytic_start && (k as f64) > s_order as f64 + 2.0 * z {
                 let ratio = z / (k as f64 - s_order as f64);
                 let tail = order_bound * ratio / (1.0 - ratio);
@@ -3180,6 +3241,112 @@ mod duchon_hybrid_psd_tests {
     use super::*;
     use faer::Side;
     use gam_linalg::faer_ndarray::FaerEigh;
+
+    /// gam#3020: in even `d` the null-space-reduced kernel is the value minus
+    /// its analytic head at every radius, and the constrained Gram built from
+    /// it is positive semidefinite, as the hybrid spectrum makes it.
+    ///
+    /// At `d = 2, p = 2, s = 1` every odd Taylor order is structurally zero.
+    /// The series form certified its tail on the first of them and dropped
+    /// every order past `r⁴`, so the reduced kernel missed `φ − c₀ − c₂r²` by
+    /// up to `6e−4` at `ℓ = 0.7` and the constrained Gram had `λ_min = −2.2e−3`
+    /// where the exact kernel's is `+1.0e−5`: the bending penalty was refused
+    /// as indefinite. Here both forms are compared to the value the direct
+    /// partial-fraction sum gives (which matches the closed form
+    /// `r² ln r/(8πκ²) + (ln r + K₀(κr))/(2πκ⁴)` to `3e−16`). The bar is the
+    /// accumulation band of every summand the two evaluations add: the
+    /// partial-fraction blocks, the head's two terms, and the reduced kernel's
+    /// own sum over the same quantities.
+    #[test]
+    fn even_d_reduced_kernel_is_the_value_minus_its_head_3020() {
+        let (p, s, d) = (2usize, 1usize, 2usize);
+        for length_scale in [0.7_f64, 1.0] {
+            let kappa = 1.0 / length_scale;
+            let coeffs = duchon_partial_fraction_coeffs(p, s, kappa);
+            let c0 = duchon_hybrid_taylor_rk(kappa, d, &coeffs, 0);
+            let c2 = duchon_hybrid_taylor_rk(kappa, d, &coeffs, 2);
+            for step in 1..=56 {
+                let r = 0.05 * step as f64;
+                let blocks: Vec<f64> = coeffs
+                    .a
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .filter(|(_, a)| **a != 0.0)
+                    .map(|(m, a)| a * polyharmonic_kernel(r, m as f64, d))
+                    .chain(
+                        coeffs
+                            .b
+                            .iter()
+                            .enumerate()
+                            .skip(1)
+                            .filter(|(_, b)| **b != 0.0)
+                            .map(|(n, b)| b * duchon_matern_block(r, kappa, n, d).expect("block")),
+                    )
+                    .collect();
+                let value = duchon_matern_kernel_general_from_distance(
+                    r,
+                    Some(length_scale),
+                    p,
+                    s,
+                    d,
+                    Some(&coeffs),
+                )
+                .expect("value");
+                let head = c0.pure + c2.pure * r * r;
+                let reduced =
+                    duchon_hybrid_kernel_nullspace_reduced(r, length_scale, p, s, d, &coeffs)
+                        .expect("reduced");
+                let magnitude = blocks.iter().map(|v| v.abs()).sum::<f64>()
+                    + c0.pure_scale
+                    + c2.pure_scale * r * r;
+                let terms = 2 * (blocks.len() + 2);
+                let bar = gam_linalg::roundoff::accumulation_band(terms, magnitude);
+                assert!(
+                    (reduced - (value - head)).abs() <= bar,
+                    "ℓ={length_scale} r={r}: reduced {reduced:.15e} against value − head {:.15e} \
+                     (gap {:.3e}, bar {bar:.3e})",
+                    value - head,
+                    (reduced - (value - head)).abs()
+                );
+            }
+
+            // The constrained Gram on a 30-point cloud, from the reduced form.
+            let n = 30usize;
+            let mut centers = Array2::<f64>::zeros((n, 2));
+            for i in 0..n {
+                centers[[i, 0]] = 2.0 * ((i as f64 * 0.754_877_666_246_692_7).fract()) - 1.0;
+                centers[[i, 1]] = 2.0 * ((i as f64 * 0.569_840_290_998_053_3).fract()) - 1.0;
+            }
+            let mut workspace = crate::basis::BasisWorkspace::default();
+            let z = crate::basis::kernel_constraint_nullspace(
+                centers.view(),
+                DuchonNullspaceOrder::Linear,
+                &mut workspace.cache,
+            )
+            .expect("nullspace");
+            let (kernel, _) = crate::basis::duchon_center_kernel_matrix(
+                centers.view(),
+                Some(length_scale),
+                1.0,
+                DuchonNullspaceOrder::Linear,
+                None,
+                crate::basis::DuchonCenterKernelForm::NullspaceReduced,
+            )
+            .expect("reduced center kernel");
+            let omega = z.t().dot(&kernel).dot(&z);
+            let omega = (&omega + &omega.t()) * 0.5;
+            let (evals, _) = FaerEigh::eigh(&omega, Side::Lower).expect("eigh");
+            let evals = evals.to_vec();
+            let band = gam_linalg::roundoff::resolved_eigenvalue_band(&evals, 0.0);
+            let lowest = evals.iter().copied().fold(f64::INFINITY, f64::min);
+            assert!(
+                lowest >= -band,
+                "ℓ={length_scale}: the reduced constrained Gram has eigenvalue {lowest:.6e} below \
+                 its band {band:.3e}"
+            );
+        }
+    }
 
     fn assert_pow_parity(label: &str, got: f64, reference: f64) {
         if got.to_bits() == reference.to_bits() || (got.is_nan() && reference.is_nan()) {

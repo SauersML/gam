@@ -776,7 +776,9 @@ fn duchon_matern_block_normalization(kappa: f64, n_order: usize, k_dim: usize) -
     let n = n_order as f64;
     let k_half = 0.5 * k_dim as f64;
     kappa.powf(k_half - n)
-        / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n))
+        / ((2.0 * std::f64::consts::PI).powf(k_half)
+            * 2.0_f64.powf(n - 1.0)
+            * factorial_f64(n_order - 1))
 }
 
 /// The `r^k` Taylor coefficient (pure and `ln r` parts) of one Matérn
@@ -846,7 +848,9 @@ pub(crate) fn duchon_matern_block_taylor_r2j_triplet(
     let k_half = 0.5 * k_dim as f64;
     let nu = n - k_half;
     let c_const = 1.0
-        / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
+        / ((2.0 * std::f64::consts::PI).powf(k_half)
+            * 2.0_f64.powf(n - 1.0)
+            * factorial_f64(n_order - 1));
     let c_exp = k_half - n;
 
     let mut pure = (0.0, 0.0, 0.0);
@@ -864,8 +868,8 @@ pub(crate) fn duchon_matern_block_taylor_r2j_triplet(
             if j < nu_usize {
                 let sign = if j.is_multiple_of(2) { 1.0 } else { -1.0 };
                 let power = 2 * j as i32 - nu_usize as i32;
-                let coeff = 0.5 * sign * gamma_lanczos((nu_usize - j) as f64)
-                    / gamma_lanczos((j + 1) as f64)
+                let coeff = 0.5 * sign * factorial_f64(nu_usize - j - 1)
+                    / factorial_f64(j)
                     * 2.0_f64.powi(-power);
                 let exponent = c_exp + power as f64;
                 let value = c_const * coeff * kappa.powf(exponent);
@@ -874,8 +878,7 @@ pub(crate) fn duchon_matern_block_taylor_r2j_triplet(
 
             if j >= nu_usize {
                 let k = j - nu_usize;
-                let inv_fac = 1.0
-                    / (gamma_lanczos((k + 1) as f64) * gamma_lanczos((nu_usize + k + 1) as f64));
+                let inv_fac = 1.0 / (factorial_f64(k) * factorial_f64(nu_usize + k));
                 let power = (2 * k + nu_usize) as i32;
                 let exponent = c_exp + power as f64;
                 let kp_base = c_const * kappa.powf(exponent) * 2.0_f64.powi(-power);
@@ -893,8 +896,7 @@ pub(crate) fn duchon_matern_block_taylor_r2j_triplet(
             }
         } else {
             let k = j;
-            let inv_fac =
-                1.0 / (gamma_lanczos((k + 1) as f64) * gamma_lanczos((mu + k + 1) as f64));
+            let inv_fac = 1.0 / (factorial_f64(k) * factorial_f64(mu + k));
             let power = (mu + 2 * k) as i32;
             let exponent = c_exp + power as f64;
             let kp_base = c_const * kappa.powf(exponent) * 2.0_f64.powi(-power);
@@ -982,7 +984,7 @@ pub(crate) fn duchon_matern_block_taylor_r2j_integer_nu(
         if j < nu {
             // (1/2) · (−1)^j · (ν−j−1)!/j! · (κ/2)^{2j−ν}
             let sign = if j.is_multiple_of(2) { 1.0 } else { -1.0 };
-            let coeff = sign * gamma_lanczos((nu - j) as f64) / gamma_lanczos((j + 1) as f64)
+            let coeff = sign * factorial_f64(nu - j - 1) / factorial_f64(j)
                 * kappa_half.powi(2 * j as i32 - nu as i32)
                 * 0.5;
             pure += coeff;
@@ -991,8 +993,7 @@ pub(crate) fn duchon_matern_block_taylor_r2j_integer_nu(
         // Source 2: regular+log sum at k = j − ν.
         if j >= nu {
             let k = j - nu;
-            let inv_fac =
-                1.0 / (gamma_lanczos((k + 1) as f64) * gamma_lanczos((nu + k + 1) as f64));
+            let inv_fac = 1.0 / (factorial_f64(k) * factorial_f64(nu + k));
             let kp = kappa_half.powi(2 * k as i32 + nu as i32);
             let sign_mu = if mu.is_multiple_of(2) { 1.0 } else { -1.0 }; // (−1)^μ
 
@@ -1014,7 +1015,7 @@ pub(crate) fn duchon_matern_block_taylor_r2j_integer_nu(
         // Singular sum gives powers r^{2ν}, ..., r^{−2} (all negative).
         // Regular+log sum gives r^0, r^2, r^4, ... at k = j.
         let k = j;
-        let inv_fac = 1.0 / (gamma_lanczos((k + 1) as f64) * gamma_lanczos((mu + k + 1) as f64));
+        let inv_fac = 1.0 / (factorial_f64(k) * factorial_f64(mu + k));
         let kp = kappa_half.powi(mu as i32 + 2 * k as i32);
         let sign_mu = if mu.is_multiple_of(2) { 1.0 } else { -1.0 };
 
@@ -1138,8 +1139,8 @@ pub(crate) fn duchon_polyharmonic_block_taylor_rk(m: usize, k_dim: usize, k: usi
         let c = polyharmonic_log_sign(m, k_dim)
             / (2.0_f64.powi((2 * m - 1) as i32)
                 * std::f64::consts::PI.powf(k_half)
-                * gamma_lanczos(m as f64)
-                * gamma_lanczos((m - k_dim / 2 + 1) as f64));
+                * factorial_f64(m - 1)
+                * factorial_f64(m - k_dim / 2));
         (0.0, c)
     } else {
         // Non-log case: Φ_m = c · r^α.
@@ -1149,6 +1150,76 @@ pub(crate) fn duchon_polyharmonic_block_taylor_rk(m: usize, k_dim: usize, k: usi
                 * gamma_lanczos(m as f64));
         (c, 0.0)
     }
+}
+
+/// Roundings that form one polyharmonic block's `ln r` summand `a_m · c_m` of
+/// the `r^{2j}` Taylor coefficient.
+///
+/// The `ln r` parts cancel across the blocks to a real zero for every `κ` (the
+/// partial-fraction identity), so a constant every summand shares, `π` or `κ`
+/// as represented, cancels with them; only the operations that form each
+/// summand are left in the residue:
+/// - `a_m = ±κ^e·C`: one `powf` and one product (the binomial is exact);
+/// - `c_m = ±1/(2^{2m−1}·π^{d/2}·(m−1)!·(m−d/2)!)`: the power of two is exact,
+///   one `powf`, the two factorials, three products and one quotient;
+/// - `a_m·c_m`: one product.
+pub(crate) fn polyharmonic_log_summand_roundings(m: usize, k_dim: usize) -> usize {
+    2 + 1 + factorial_roundings(m - 1) + factorial_roundings(m - k_dim / 2) + 3 + 1 + 1
+}
+
+/// Roundings that form one integer-`ν` Matérn block's `ln r` summand
+/// `b_n · c · ℓ` of the `r^{2j}` Taylor coefficient (see
+/// [`polyharmonic_log_summand_roundings`] for why shared constants do not count):
+/// - `b_n = ±κ^e·C`: one `powf` and one product;
+/// - `c = κ^{d/2−n}/((2π)^{d/2}·2^{n−1}·(n−1)!)`: two `powf` (doubling `π` is
+///   exact), one for the power of two, the factorial, two products and one
+///   quotient;
+/// - `ℓ = ∓(κ/2)^e/(k!(|ν|+k)!)`: `powi` by repeated squaring, at most two
+///   products per bit of `e`; the two factorials, a product and a reciprocal;
+///   one product;
+/// - `c·ℓ` and `b_n·(c·ℓ)`: two products.
+pub(crate) fn matern_log_summand_roundings(n_order: usize, k_dim: usize, j: usize) -> usize {
+    let nu = n_order as i64 - (k_dim as i64) / 2;
+    let mu = nu.unsigned_abs() as usize;
+    let (k, exponent) = if nu >= 0 {
+        let k = j.saturating_sub(mu);
+        (k, 2 * k + mu)
+    } else {
+        (j, mu + 2 * j)
+    };
+    let powi = 2 * (usize::BITS - exponent.leading_zeros()) as usize;
+    2 + (3 + factorial_roundings(n_order - 1) + 3)
+        + powi
+        + (factorial_roundings(k) + factorial_roundings(mu + k) + 2)
+        + 1
+        + 2
+}
+
+/// Roundings that form one integer-`ν` Matérn block's `ln r` summands of the
+/// ψ-triplet collision coefficient ([`duchon_matern_block_taylor_r2j_triplet`]),
+/// up to and including their combination into the three sums:
+/// - `b_n`: one `powf` and one product;
+/// - `c = 1/((2π)^{d/2}·2^{n−1}·(n−1)!)`: two `powf`, the factorial, two
+///   products and one quotient;
+/// - `c·κ^e·2^{−e'}`: one `powf` and one product (the power of two is exact);
+/// - `1/(k!(|ν|+k)!)`: the two factorials, a product and a reciprocal;
+/// - the log base `∓(…)·(…)`: one product, and the triplet's `e²·v`: two;
+/// - the combination `β²·b_n·ℓ₀ + 2β·b_n·ℓ₁ + b_n·ℓ₂`: three products and two
+///   additions.
+pub(crate) fn matern_log_triplet_summand_roundings(
+    n_order: usize,
+    k_dim: usize,
+    j: usize,
+) -> usize {
+    let nu = n_order as i64 - (k_dim as i64) / 2;
+    let mu = nu.unsigned_abs() as usize;
+    let k = if nu >= 0 { j.saturating_sub(mu) } else { j };
+    2 + (3 + factorial_roundings(n_order - 1) + 2)
+        + 2
+        + (factorial_roundings(k) + factorial_roundings(mu + k) + 2)
+        + 1
+        + 2
+        + 5
 }
 
 /// Compute the even-order radial derivative φ^{(2j)}(0) from analytic Taylor
@@ -1194,6 +1265,9 @@ pub(crate) fn duchon_phi_even_derivative_collision(
     let mut total_pure = CompensatedSum::default();
     let mut total_log = CompensatedSum::default();
     let mut total_log_abs_scale = CompensatedSum::default();
+    // The band of the `ln r` residue, summand by summand: each summand's own
+    // formation roundings plus the compensated sum's `2u`.
+    let mut log_cancel_band = 0.0_f64;
 
     // Polyharmonic blocks.
     for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
@@ -1204,6 +1278,12 @@ pub(crate) fn duchon_phi_even_derivative_collision(
         total_pure.add(a_m * pure);
         total_log.add(a_m * log);
         total_log_abs_scale.add((a_m * log).abs());
+        if log != 0.0 {
+            log_cancel_band += gam_linalg::roundoff::compensated_band(
+                polyharmonic_log_summand_roundings(m, k_dim),
+                (a_m * log).abs(),
+            );
+        }
     }
 
     // Matérn blocks.
@@ -1215,20 +1295,28 @@ pub(crate) fn duchon_phi_even_derivative_collision(
         total_pure.add(b_n * pure);
         total_log.add(b_n * log);
         total_log_abs_scale.add((b_n * log).abs());
+        if log != 0.0 {
+            log_cancel_band += gam_linalg::roundoff::compensated_band(
+                matern_log_summand_roundings(n, k_dim, j),
+                (b_n * log).abs(),
+            );
+        }
     }
     let total_pure = total_pure.value();
     let total_log = total_log.value();
     let total_log_abs_scale = total_log_abs_scale.value();
 
     // The `ln r` coefficients cancel exactly (the PFD identity, whenever
-    // 2(p+s) > d+2j), so `total_log` sums to a real zero and carries only its own
-    // summation error. `CompensatedSum` is Kahan-Babuska-Neumaier, whose forward
-    // error is `(2 + k)·u·Σ|terms|` independently of the term count (Higham,
-    // *ASNA* 2nd ed., §4.3), with one product per summand here;
-    // `total_log_abs_scale` is exactly that `Σ|terms|`. A residue above the band
-    // is a failure of the identity rather than rounding, and the band is read off
-    // the log terms rather than off the pure part, a different quantity.
-    let log_cancel_band = gam_linalg::roundoff::compensated_band(1, total_log_abs_scale);
+    // 2(p+s) > d+2j), so `total_log` sums to a real zero and carries only the
+    // roundings of its summands and of their sum. `CompensatedSum` is
+    // Kahan-Babuska-Neumaier, whose forward error is `(2 + k)·u·Σ|terms|`
+    // independently of the term count (Higham, *ASNA* 2nd ed., §4.3), where `k`
+    // is the roundings that formed a summand: counted per block above, not one
+    // product (the Γ, power and quotient roundings of each block's coefficient
+    // do not cancel; gam#2735 measured a 1.6-ulp residue against a one-product
+    // band). A residue above the band is a failure of the identity rather than
+    // rounding, and the band is read off the log terms rather than off the pure
+    // part, a different quantity.
     if total_log.abs() > log_cancel_band {
         crate::bail_invalid_basis!(
             "Duchon Taylor a_{} log-coefficient did not cancel: log={total_log:.6e}, pure={total_pure:.6e}; \
@@ -1275,6 +1363,9 @@ pub(crate) fn duchon_phi_even_derivative_collision_psi_triplet(
     let mut log_psi = CompensatedSum::default();
     let mut log_psi_psi = CompensatedSum::default();
     let mut log_abs_scale = CompensatedSum::default();
+    // The band of the three `ln r` residues, product by product: each product's
+    // formation roundings plus the compensated sum's `2u`.
+    let mut log_cancel_band = 0.0_f64;
 
     for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
         if a_m == 0.0 {
@@ -1291,6 +1382,15 @@ pub(crate) fn duchon_phi_even_derivative_collision_psi_triplet(
         log_abs_scale.add((a_m * log).abs());
         log_abs_scale.add((alpha_m * a_m * log).abs());
         log_abs_scale.add((alpha_m * alpha_m * a_m * log).abs());
+        if log != 0.0 {
+            // `α²·a_m·ℓ` is the longest: two products past the summand.
+            log_cancel_band += gam_linalg::roundoff::compensated_band(
+                polyharmonic_log_summand_roundings(m, k_dim) + 2,
+                (a_m * log).abs()
+                    + (alpha_m * a_m * log).abs()
+                    + (alpha_m * alpha_m * a_m * log).abs(),
+            );
+        }
     }
 
     for (n, &b_n) in coeffs.b.iter().enumerate().skip(1) {
@@ -1315,6 +1415,17 @@ pub(crate) fn duchon_phi_even_derivative_collision_psi_triplet(
         log_abs_scale.add((beta_n * beta_n * b_n * log.0).abs());
         log_abs_scale.add((2.0 * beta_n * b_n * log.1).abs());
         log_abs_scale.add((b_n * log.2).abs());
+        if log != (0.0, 0.0, 0.0) {
+            log_cancel_band += gam_linalg::roundoff::compensated_band(
+                matern_log_triplet_summand_roundings(n, k_dim, j),
+                (b_n * log.0).abs()
+                    + (beta_n * b_n * log.0).abs()
+                    + (b_n * log.1).abs()
+                    + (beta_n * beta_n * b_n * log.0).abs()
+                    + (2.0 * beta_n * b_n * log.1).abs()
+                    + (b_n * log.2).abs(),
+            );
+        }
     }
 
     let value = value.value();
@@ -1326,12 +1437,12 @@ pub(crate) fn duchon_phi_even_derivative_collision_psi_triplet(
     let log_abs_scale = log_abs_scale.value();
     // All three `ln r` coefficient sums cancel exactly, so each carries only its
     // Kahan-Babuska-Neumaier forward error `(2 + k)·u·Σ|terms|` (Higham, *ASNA*
-    // 2nd ed., §4.3). The longest summand is
-    // `β²·b_n·log.0 + 2·β·b_n·log.1 + b_n·log.2`: three products and two
-    // additions, so `k = 5`. `log_abs_scale` is the magnitude sum of every one of
-    // those products, which majorizes each of the three sums' own `Σ|terms|`, so
-    // one band covers all three.
-    let log_cancel_band = gam_linalg::roundoff::compensated_band(5, log_abs_scale);
+    // 2nd ed., §4.3), with `k` the roundings that formed each summand: counted
+    // per block above, through the block's own Γ, power and quotient roundings
+    // and the triplet's combination (the combination alone, `k = 5`, missed the
+    // coefficients' formation). The band is taken over every product the three
+    // sums accumulate, which majorizes each sum's own, so one band covers all
+    // three.
     if log_value.abs().max(log_psi.abs()).max(log_psi_psi.abs()) > log_cancel_band {
         crate::bail_invalid_basis!(
             "Duchon Taylor a_{} log-coefficient derivative did not cancel: \

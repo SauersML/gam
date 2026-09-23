@@ -8,6 +8,14 @@
   solved in logarithms from centred node exponents, on the side of the equation the root solver
   reads (the complement `log Φ(x)` for `q < 0`, where `log Φ(39)` is `0` in binary64). All q-partials
   at `q = 39` match a 90-digit reference to `3e−13`.
+- **Even-dimension Duchon penalties are positive semidefinite again** (gam#3020). The
+  null-space-reduced kernel the bending penalty is built from (#4558) stopped summing its
+  Taylor series after the first order past the polynomial head. In even `d` every odd order is
+  structurally zero, and the tail bound read that zero as a converged tail. A 2-D
+  `duchon(x1, x2)` penalty then had a negative eigenvalue (`−2.2e−3` against `λ_max = 4.1e−2`)
+  where the kernel's own is `+1.0e−5`, so it was refused or shipped wrong. The tail bound now
+  carries across structurally vanishing orders, and the reduced kernel matches the direct
+  partial-fraction value, less its annihilated head, at every radius.
 
 - **A constrained fit's smoothing-corrected posterior is the θ-mixture of its cone-truncated
   laws, and the fit and the predictor read that one object** (gam#3229). Before this, a
