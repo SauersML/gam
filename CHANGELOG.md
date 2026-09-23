@@ -1,5 +1,14 @@
 ## Unreleased
 
+- **The anchored intercept's Taylor table keeps its digits deep in either tail** (gam#3639). The
+  survival marginal-slope anchor solves `Σ_k w_k Φ(−(α + b u_k)) = Φ(−q)`. Its derivative table
+  differentiated that equation directly, where every partial is a Hermite moment that grows like
+  `η^{n−1}`. At `q = 39` the order-five coefficient cancelled terms of size `2e4` down to `5e−10`,
+  and the row NLL's fifth derivative came out `1.6e−5` against an exact `1.22e−7`. The table is now
+  solved in logarithms from centred node exponents, on the side of the equation the root solver
+  reads (the complement `log Φ(x)` for `q < 0`, where `log Φ(39)` is `0` in binary64). All q-partials
+  at `q = 39` match a 90-digit reference to `3e−13`.
+
 - **A constrained fit's smoothing-corrected posterior is the θ-mixture of its cone-truncated
   laws, and the fit and the predictor read that one object** (gam#3229). Before this, a
   custom-family fit published `V_cond + C` against the truncated covariance, while the predictor

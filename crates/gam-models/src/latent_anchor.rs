@@ -1421,16 +1421,13 @@ pub(crate) struct AnchorDerivatives {
 ///
 /// Every implicit derivative of the anchor is a ratio of density sums — to
 /// each other and to `φ(q)` — so it reads the weights only through `ω` and the
-/// scale only through [`AnchorDensity::log_density_ratio`]. Deep in either tail
+/// scale only through the density ratio `φ(q)/Σ w φ(η)`. Deep in either tail
 /// every `φ(η_k)` underflows while those ratios are finite. Each exponent is
 /// formed against the heaviest node `*` as `log w_k − log w_* − ½(η_k − η_*)(η_k
 /// + η_*)`, whose difference `η_k − η_* = b·(u_k − u_*)` carries no cancellation,
 /// so a weight keeps its digits where `½η²` alone would round them away.
 pub(crate) struct AnchorDensity {
     weights: SmallVec<[f64; 128]>,
-    heaviest_log_weight: f64,
-    heaviest_eta: f64,
-    log_relative_sum: f64,
 }
 
 impl AnchorDensity {
@@ -1472,12 +1469,7 @@ impl AnchorDensity {
         for weight in weights.iter_mut() {
             *weight /= sum;
         }
-        Ok(Self {
-            weights,
-            heaviest_log_weight,
-            heaviest_eta,
-            log_relative_sum: sum.ln(),
-        })
+        Ok(Self { weights })
     }
 
     /// `ω_k`, in the law's node order.
@@ -1486,15 +1478,6 @@ impl AnchorDensity {
         &self.weights
     }
 
-    /// `log φ(q) − log Σ_k w_k φ(η_k)`, its quadratic terms combined as the
-    /// product `(q − η_*)(q + η_*)`: at a tail root `q` and `η_*` agree to many
-    /// digits, and their squares would not.
-    #[inline]
-    pub(crate) fn log_density_ratio(&self, q: f64) -> f64 {
-        -self.heaviest_log_weight
-            - self.log_relative_sum
-            - 0.5 * (q - self.heaviest_eta) * (q + self.heaviest_eta)
-    }
 }
 
 /// The order of the anchor's Taylor table. The order-≤4 carriers read `α`
@@ -1528,37 +1511,45 @@ fn power_slice(r: usize, degree: usize) -> usize {
     (degree - 1) * (degree - 2) / 2 + (r - 2)
 }
 
-/// `[·, F′, F″, F‴, F⁗, F⁽⁵⁾, F⁽⁶⁾](x)` through slot `SLOTS − 1`, with
-/// `F(x) = Φ(−x)`, `F^{(n)} = (−1)^n He_{n−1}(x) φ(x)`, with `φ(x)` replaced by
-/// the caller's `density` — a normalized node weight or the ratio
-/// `φ(q)/Σ w φ(η)` (gam#2941). The value slot is never read and holds zero.
+/// `[G, G′, …, G⁽⁶⁾](x)` for `G(x) = log F(x) = log Φ(−x)`: `G^{(n)}(x) =
+/// (−1)^n·(log Φ)^{(n)}(−x)`, from the tail-exact log-CDF derivatives (the left
+/// tail's continued fraction, the right tail's log-magnitude recurrence), so a
+/// node or target deep in either tail keeps every digit (gam#3639).
 #[inline]
-fn survival_cdf_derivative_stack<const SLOTS: usize>(x: f64, density: f64) -> [f64; SLOTS] {
-    const { assert!(SLOTS <= ANCHOR_SIXTH_SLOTS) };
-    let x2 = x * x;
-    let hermite = [
-        0.0,
-        -1.0,
-        x,
-        1.0 - x2,
-        x2 * x - 3.0 * x,
-        -(x2 * x2 - 6.0 * x2 + 3.0),
-        (x2 * x2 - 10.0 * x2 + 15.0) * x,
-    ];
-    std::array::from_fn(|n| hermite[n] * density)
+fn log_survival_derivatives(x: f64) -> [f64; ANCHOR_SIXTH_SLOTS] {
+    let log_cdf = gam_math::probability::normal_logcdf_derivatives_through_sixth(-x);
+    std::array::from_fn(|n| if n % 2 == 0 { log_cdf[n] } else { -log_cdf[n] })
+}
+
+/// The log-mass derivatives of the side the anchoring equation is solved on,
+/// the side [`solve_anchor`] reads: `log Φ(−x)` for `q ≥ 0`, and for `q < 0`
+/// the complement `log Φ(x)`. The weights sum to one, so `Σ_k w_k Φ(−η_k) =
+/// Φ(−q)` and `Σ_k w_k Φ(η_k) = Φ(q)` are the same equation. Only the smaller
+/// side has digits in a tail: at `q = −39`, `log Φ(39) = −1e-333` is `0` in
+/// binary64 and every partial of the survival side underflows with it
+/// (gam#3639).
+#[inline]
+fn anchor_side_log_derivatives(x: f64, complement: bool) -> [f64; ANCHOR_SIXTH_SLOTS] {
+    if complement {
+        gam_math::probability::normal_logcdf_derivatives_through_sixth(x)
+    } else {
+        log_survival_derivatives(x)
+    }
 }
 
 /// The anchor's Taylor table at a solved root (gam#2928): `c[i][j] =
 /// ∂_q^i ∂_b^j α / (i!·j!)` through total order five.
 ///
-/// Implicit differentiation of `H(α, b) = Σ_k w_k F(α + b u_k) = F(q)`,
-/// `F(x) = Φ(−x)`, degree by degree. Every partial of `H` is a moment of the
-/// law, `H_{rs} = ∂_α^r ∂_b^s H = Σ_k w_k u_k^s F^{(r+s)}(η_k)`, so one pass
-/// over the nodes gives the equation's whole Taylor polynomial. With `A_d` the
-/// degree-`d` part of `δα`, the degree-`d` part of the expanded equation is
+/// Implicit differentiation of `Ψ(α, b) = log Σ_k w_k F(α + b u_k) = log F(q)`,
+/// `F(x) = Φ(−x)`, degree by degree: the logarithm of the anchoring equation,
+/// whose partials stay `O(1)` in either tail where `F`'s own grow like `η^{n−1}`
+/// (gam#3639; [`anchor_taylor_coefficients`] derives `Ψ`'s Taylor polynomial from
+/// the nodes' centred exponents). With `A_d` the degree-`d` part of `δα` and
+/// `T_n` the Taylor coefficients of `log F` at `q`, the degree-`d` part of the
+/// expanded equation is
 ///
 /// ```text
-///     H_{10}·A_d = F^{(d)}(q)·δq^d / d! − Σ_{(r,s) ∉ {(0,0),(1,0)}} H_{rs}·[δα^r]_{d−s}·δb^s / (r!·s!),
+///     Ψ_{10}·A_d = T_d·δq^d − Σ_{(r,s) ∉ {(0,0),(1,0)}} Ψ_{rs}·[δα^r]_{d−s}·δb^s / (r!·s!),
 /// ```
 ///
 /// whose right side reads only `A_1, …, A_{d−1}`: `[δα^r]_e` for `r ≥ 2` is
@@ -1586,29 +1577,146 @@ fn anchor_taylor_coefficients<const SLOTS: usize, const SLICES: usize>(
     grid: AnchorGrid<'_>,
 ) -> Result<[[f64; SLOTS]; SLOTS], String> {
     const { assert!(SLICES == (SLOTS - 1) * (SLOTS - 2) / 2) };
-    // moments[n][s] = Σ_k w_k u_k^s F^{(n)}(η_k), 1 ≤ n < SLOTS, s ≤ n, divided
-    // through by `Σ_k w_k φ(η_k)` like `G` of the implicit derivatives: the
-    // table is homogeneous of degree zero in `H`, and the normalized form
-    // stays finite where every node's density underflows (gam#2941).
-    let density = AnchorDensity::at(alpha, observed_slope, grid)?;
-    let mut moments = [[0.0_f64; SLOTS]; SLOTS];
-    for (&u, &omega) in grid.nodes.iter().zip(density.weights().iter()) {
-        let stack = survival_cdf_derivative_stack::<SLOTS>(alpha + observed_slope * u, omega);
-        let mut power = 1.0;
-        for s in 0..SLOTS {
-            for n in s.max(1)..SLOTS {
-                moments[n][s] += stack[n] * power;
-            }
-            power *= u;
-        }
+    // The equation is solved in logarithms, `Ψ(α, b) = log Σ_k w_k F(α + b u_k) =
+    // log F(q)`, and each node's exponent is centred on its mean under the
+    // law's own tail probabilities before it is exponentiated (gam#3639).
+    //
+    // Why: in `F` itself every partial is a Hermite moment, `F^{(n)}(η) =
+    // (−1)^n He_{n−1}(η)·φ(η)`, which grows like `η^{n−1}` while `α`'s own
+    // derivatives are tiny in a tail (`α ≈ q` plus a smooth correction). At
+    // `q = 39` the degree-five equation cancels terms of size `He_4(39)/5! ≈
+    // 2e4` down to `∂⁵α/5! ≈ 5e-10`, thirteen orders of magnitude, so the
+    // order-five coefficient was mostly rounding: the row NLL's fifth derivative
+    // came out `1.6e-5` against an exact `1.22e-7` (90-digit reference), an
+    // error larger than every term of its Faà di Bruno sum. `log F` has
+    // derivatives that grow at most linearly (`(log F)′ = −λ ≈ −η`, the rest
+    // bounded), and centring removes that common slope, so every coefficient
+    // the solve reads is `O(1)`.
+    //
+    // With `G = log F` and `ε_k = δα + u_k·δb`, `Ψ(α + δα, b + δb) − Ψ(α, b) =
+    // log E_p[exp(Y_k)]`, `Y_k = Σ_n G^{(n)}(η_k)·ε_k^n / n!`, under the weights
+    // `p_k ∝ w_k F(η_k)`. Writing `Ȳ = E_p[Y]` and `Z = Y − Ȳ`, it is `Ȳ +
+    // log(1 + E_p[exp(Z) − 1])`, whose `exp` and `log` series act on
+    // polynomials without a large common term. `moments[r+s][s]` then holds
+    // `∂_α^r ∂_b^s Ψ` and `target[n]` holds `G^{(n)}(q)`, the inputs the
+    // degree-by-degree solve below reads for any equation `Ψ(α, b) = T(q)`.
+    let degree_limit = SLOTS - 1;
+    let mut stacks: SmallVec<[[f64; ANCHOR_SIXTH_SLOTS]; 128]> =
+        SmallVec::with_capacity(grid.len());
+    let mut log_mass: SmallVec<[f64; 128]> = SmallVec::with_capacity(grid.len());
+    let mut heaviest = f64::NEG_INFINITY;
+    let complement = q < 0.0;
+    for (k, &u) in grid.nodes.iter().enumerate() {
+        let eta = alpha + observed_slope * u;
+        let stack = anchor_side_log_derivatives(eta, complement);
+        let mass = grid.log_weights[k] + stack[0];
+        heaviest = heaviest.max(mass);
+        stacks.push(stack);
+        log_mass.push(mass);
     }
-    let h_alpha = moments[1][0];
-    if !(h_alpha.is_finite() && h_alpha < 0.0) {
+    if !heaviest.is_finite() {
         return Err(format!(
-            "survival marginal-slope anchor has no finite gradient: H_α={h_alpha:e} at α={alpha}, q={q}, b={observed_slope}"
+            "survival marginal-slope anchor has no node of finite tail mass at α={alpha}, b={observed_slope}"
         ));
     }
-    let target = survival_cdf_derivative_stack::<SLOTS>(q, density.log_density_ratio(q).exp());
+    let mut probabilities: SmallVec<[f64; 128]> =
+        log_mass.iter().map(|mass| (mass - heaviest).exp()).collect();
+    let total: f64 = probabilities.iter().sum();
+    for probability in probabilities.iter_mut() {
+        *probability /= total;
+    }
+    // `Y_k`'s coefficient of `δα^i δb^j` is `G^{(i+j)}(η_k)·u_k^j / (i!·j!)`.
+    let exponent = |stack: &[f64; ANCHOR_SIXTH_SLOTS], u: f64| -> [[f64; SLOTS]; SLOTS] {
+        let mut poly = [[0.0_f64; SLOTS]; SLOTS];
+        let mut u_power = 1.0;
+        for j in 0..SLOTS {
+            for i in 0..SLOTS - j {
+                if i + j >= 1 {
+                    poly[i][j] = stack[i + j] * u_power / (FACTORIAL[i] * FACTORIAL[j]);
+                }
+            }
+            u_power *= u;
+        }
+        poly
+    };
+    let multiply = |left: &[[f64; SLOTS]; SLOTS], right: &[[f64; SLOTS]; SLOTS]| {
+        let mut product = [[0.0_f64; SLOTS]; SLOTS];
+        for i1 in 0..SLOTS {
+            for j1 in 0..SLOTS - i1 {
+                if left[i1][j1] == 0.0 {
+                    continue;
+                }
+                for i2 in 0..SLOTS - i1 - j1 {
+                    for j2 in 0..SLOTS - i1 - j1 - i2 {
+                        product[i1 + i2][j1 + j2] += left[i1][j1] * right[i2][j2];
+                    }
+                }
+            }
+        }
+        product
+    };
+    let mut mean = [[0.0_f64; SLOTS]; SLOTS];
+    for ((stack, &u), &probability) in stacks.iter().zip(grid.nodes).zip(&probabilities) {
+        let poly = exponent(stack, u);
+        for i in 0..SLOTS {
+            for j in 0..SLOTS - i {
+                mean[i][j] += probability * poly[i][j];
+            }
+        }
+    }
+    // `E_p[exp(Z) − 1] = Σ_{m ≥ 2} E_p[Z^m] / m!`: `E_p[Z] = 0`.
+    let mut excess = [[0.0_f64; SLOTS]; SLOTS];
+    for ((stack, &u), &probability) in stacks.iter().zip(grid.nodes).zip(&probabilities) {
+        let mut centred = exponent(stack, u);
+        for i in 0..SLOTS {
+            for j in 0..SLOTS - i {
+                centred[i][j] -= mean[i][j];
+            }
+        }
+        let mut power = centred;
+        for order in 2..=degree_limit {
+            power = multiply(&power, &centred);
+            let weight = probability / FACTORIAL[order];
+            for i in 0..SLOTS {
+                for j in 0..SLOTS - i {
+                    excess[i][j] += weight * power[i][j];
+                }
+            }
+        }
+    }
+    // `log(1 + W) = Σ_{m ≥ 1} (−1)^{m+1} W^m / m`; `W` starts at degree two, so
+    // `m ≤ degree_limit / 2` reaches every degree the table holds.
+    let mut log_poly = mean;
+    let mut power = excess;
+    for order in 1..=degree_limit / 2 {
+        if order > 1 {
+            power = multiply(&power, &excess);
+        }
+        let sign = if order % 2 == 1 { 1.0 } else { -1.0 };
+        for i in 0..SLOTS {
+            for j in 0..SLOTS - i {
+                log_poly[i][j] += sign * power[i][j] / order as f64;
+            }
+        }
+    }
+    let mut moments = [[0.0_f64; SLOTS]; SLOTS];
+    for r in 0..SLOTS {
+        for s in 0..SLOTS - r {
+            if r + s >= 1 {
+                moments[r + s][s] = log_poly[r][s] * FACTORIAL[r] * FACTORIAL[s];
+            }
+        }
+    }
+    // The survival side decreases in `α`, the complement side increases.
+    let h_alpha = moments[1][0];
+    let expected_sign = if complement { 1.0 } else { -1.0 };
+    if !(h_alpha.is_finite() && h_alpha * expected_sign > 0.0) {
+        return Err(format!(
+            "survival marginal-slope anchor has no finite gradient: Ψ_α={h_alpha:e} at α={alpha}, q={q}, b={observed_slope}"
+        ));
+    }
+    let target_stack = anchor_side_log_derivatives(q, complement);
+    let target: [f64; SLOTS] = std::array::from_fn(|n| if n == 0 { 0.0 } else { target_stack[n] });
     // parts[d][i]: the coefficient of δq^i·δb^(d−i) in δα. powers holds the
     // degree-e part of δα^r for 2 ≤ r ≤ e only — the slices the solve reads —
     // at `power_slice(r, e)`, so an order-five table zeroes 480 bytes of
@@ -2044,7 +2152,34 @@ mod anchor_tests {
                     power *= u;
                 }
             }
-            let rho = density.log_density_ratio(q).exp();
+            // `ρ = φ(q) / Σ_k w_k φ(η_k)`, formed about the heaviest node `*` with the
+            // quadratic terms as the product `(q − η_*)(q + η_*)`: at a tail root `q`
+            // and `η_*` agree to many digits and their squares would not.
+            let (heaviest_log_weight, heaviest_eta) = grid
+                .nodes
+                .iter()
+                .zip(grid.log_weights)
+                .map(|(&u, &log_weight)| (log_weight, alpha + observed_slope * u))
+                .max_by(|left, right| {
+                    (left.0 - 0.5 * left.1 * left.1).total_cmp(&(right.0 - 0.5 * right.1 * right.1))
+                })
+                .expect("the grid has a node");
+            let log_relative_sum = grid
+                .nodes
+                .iter()
+                .zip(grid.log_weights)
+                .map(|(&u, &log_weight)| {
+                    let eta = alpha + observed_slope * u;
+                    ((log_weight - heaviest_log_weight)
+                        - 0.5 * (eta - heaviest_eta) * (eta + heaviest_eta))
+                        .exp()
+                })
+                .sum::<f64>()
+                .ln();
+            let rho = (-heaviest_log_weight
+                - log_relative_sum
+                - 0.5 * (q - heaviest_eta) * (q + heaviest_eta))
+                .exp();
             // Partial derivatives of G by order. In `q` alone: `−F^{(n)}(q) =
             // −(−1)^n He_{n−1}(q) φ(q)`; in `(α, b)` the law's moments above, by
             // total order and by the number of `b`'s. Order zero is never read.

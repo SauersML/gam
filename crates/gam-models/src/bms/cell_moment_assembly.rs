@@ -3559,6 +3559,57 @@ mod empirical_rigid_jet_oracle_tests {
         }
     }
 
+    /// gam#3639: the anchor table's `q`-partials at a tail index, against the
+    /// anchored intercept `α(q, b)` of `Σ_k π_k Φ(α + b·x_k) = Φ(q)` solved and
+    /// differentiated in 90-digit arithmetic (mpmath, survival form) on this
+    /// grid at `q = 39`, `b = 0.3`. The row NLL's fifth derivative there is
+    /// `1.22e-7`; composing it from these partials by Faà di Bruno reproduces
+    /// that, its largest term being `5ℓ″a′a⁽⁴⁾ ≈ −2.2e-6`.
+    #[test]
+    fn anchor_table_q_partials_at_a_tail_index_3639() {
+        const EXACT: [f64; 6] = [
+            39.425_636_238_329_493,
+            1.001_393_060_023_777_2,
+            -7.120_863_541_675_143_5e-5,
+            5.421_029_021_371_700_9e-6,
+            -5.423_019_952_174_688_2e-7,
+            6.621_891_940_926_901_5e-8,
+        ];
+        let grid = test_grid();
+        let family = empirical_family(vec![0.0], vec![0.5], vec![0.8], None, grid.clone());
+        let map = bernoulli_marginal_link_map(
+            &InverseLink::Standard(gam_problem::StandardLink::Probit),
+            39.0,
+        )
+        .unwrap();
+        let (_, taylor) = family
+            .empirical_rigid_intercept_jet::<gam_math::jet_tower::Tower4<2>>(
+                0,
+                map,
+                0.3,
+                &grid.nodes,
+                &grid.weights,
+            )
+            .unwrap();
+        // Deep in the tail `(log F)″ = −(λ² − qλ)` with `λ ≈ q + 1/q`: two terms
+        // of size `q²` cancel to `O(1)`, so every order at or above two carries a
+        // relative rounding of `ε·q²` from that one subtraction (four rounded
+        // operations: `λ²`, `qλ`, their difference and the solve's quotient by
+        // `Ψ_α`). The old Hermite-moment table missed order five by a factor of a
+        // hundred.
+        let q = 39.0_f64;
+        for (k, &exact) in EXACT.iter().enumerate() {
+            let table = taylor.partial(k, 0);
+            let bar = 4.0 * f64::EPSILON * (1.0 + q * q) * exact.abs();
+            assert!(
+                (table - exact).abs() <= bar,
+                "d^{k}alpha/dq^{k}: table {table:.17e} against the 90-digit {exact:.17e} \
+                 (relative {:.3e}, bar {bar:.3e})",
+                (table - exact).abs() / exact.abs()
+            );
+        }
+    }
+
     /// gam#3639: past |q| ≈ 37.5 every node density `φ(a + s·g·x_k)` of the
     /// rigid calibration underflows to zero, so a fifth order assembled from
     /// linear densities divides a zero remainder by a zero Jacobian and
