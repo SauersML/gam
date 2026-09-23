@@ -18,12 +18,11 @@
 # handed to rustc, which died on `½`, `·`, `⁺`, `ᵀ`, `δ`, `ρ`. They are fenced
 # as ```text now, and the workspace is green. The bar here is ZERO: any failing
 # doctest fails this gate, and there is no ledger of tolerated crates.
-# `scripts/doctest_census.sh` is the per-crate triage instrument (it produced
-# the numbers above and gates nothing); this is the gate.
+# This is the gate.
 #
 # WHY IT IS ONE WORKSPACE PASS AND NOT 24 PER-CRATE PASSES
-# The census shells `cargo test --doc -p <crate>` once per crate and takes
-# ~1h39m, which is a triage cost, not a push-gate cost. One `--workspace`
+# A per-crate `cargo test --doc -p <crate>` sweep took ~1h39m, which is a
+# triage cost, not a push-gate cost. One `--workspace`
 # invocation builds the dependency graph once.
 #
 # THE COVERAGE CONTROL, AND WHY A GREEN HERE CANNOT BE A NON-RUN
