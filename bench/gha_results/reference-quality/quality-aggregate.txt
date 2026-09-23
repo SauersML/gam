@@ -3,32 +3,31 @@ complete case manifest: /tmp/quality-report/quality_cases.txt (437 cases)
 === #1561 whole-suite quality meta-gate ===
 category        n scored GAMwin REFwin   medlogR  p(1-sided)      p_BH
 factors         1      1      0      1    0.0173      1.0000    1.0000
-families       50     50     34     16   -0.0076      0.0025    0.0152
+families       51     51     33     18   -0.0055      0.0052    0.0311
 manifolds      11     11      8      2   -0.0033      0.0527    0.1582
 misc           28     28     16     12   -0.0003      0.1421    0.2132
-smooths        40     40     22     18   -0.0051      0.1032    0.2064
+smooths        40     40     21     19   -0.0030      0.1324    0.2132
 survival       12     12      7      5   -0.0092      0.2349    0.2818
 ------------------------------------------------------------------------
-OVERALL       142    142     87     54   -0.0040      0.0004 
+OVERALL       143    143     85     57   -0.0033      0.0008 
 
-CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0004, median log(gam/ref)=-0.0040, wins 87 / losses 54)
-Experimental units: 142 cases from 182 metric pairs.
+CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0008, median log(gam/ref)=-0.0033, wins 85 / losses 57)
+Experimental units: 143 cases from 184 metric pairs.
 INCOMPLETE: absent manifest, mismatched execution, or failed cases; closure blocked.
 
 --- execution vs emission (silent-attrition guard) ---
 category     executed  failed  emitting
 calibration         8       0         0
 factors             2       0         1
-families           90      10        50
+families           90      10        51
 manifolds          11       0        11
 misc              247      10        28
 regressions         3       0         0
 smooths            49      10        40
 survival           27       3        12
 
-SILENT ATTRITION: 17 test(s) failed BEFORE emitting a pair (excluded from the significance set):
+SILENT ATTRITION: 16 test(s) failed BEFORE emitting a pair (excluded from the significance set):
   GAM_ERROR/gam_fit_failed families::quality_vs_vgam_multinomial_softmax::gam_multinomial_softmax_recovers_true_simplex_on_real_data
-  GAM_ERROR/gam_fit_failed families::quality_vs_gamlss_gaussian_multi_smooth::gam_gaussian_multi_smooth_matches_gamlss
   GAM_ERROR/gam_fit_failed families::quality_vs_synthetic_multinomial_deviance_identity::multinomial_recovers_decision_boundary_on_held_out_split
   GAM_ERROR/gam_fit_failed families::quality_vs_vgam_multinomial_smooth_by_factor::gam_multinomial_smooth_by_factor_recovers_truth
   METRIC_OFF/quality_metric misc::fit_quality_stress::hifreq_tensor_k4
@@ -46,8 +45,8 @@ SILENT ATTRITION: 17 test(s) failed BEFORE emitting a pair (excluded from the si
   TIMEOUT/per_test_bound survival::quality_vs_survival_coxph_frailty_hazard_multiplier::gam_hazard_multiplier_frailty_matches_coxph_frailty
 
 --- #2395 paired-panel power ---
-31 of 182 pairs carry a paired fold panel: 2 resolved BETTER, 4 resolved WORSE, 25 unresolved.
-Pairing gain (unpaired SEM / paired SEM) over these panels: min 1.00x, median 4.88x, max 345.92x. Values above 1 are the common fold-draw swing that comparing two separately-averaged arms would have paid for.
+33 of 184 pairs carry a paired fold panel: 2 resolved BETTER, 4 resolved WORSE, 27 unresolved.
+Pairing gain (unpaired SEM / paired SEM) over these panels: min 1.00x, median 4.18x, max 345.92x. Values above 1 are the common fold-draw swing that comparing two separately-averaged arms would have paid for.
 
 pair                                                         K   effect%    sem%  |e|/sem     d_z   wins  verdict
 families/quality_vs_gamlss_gaussian_location_scale::gaguri   4   -25.695   5.303     5.75   -2.87   4/4   unresolved_tie
@@ -73,7 +72,9 @@ families/quality_vs_gamlss_gaussian_location_scale_cyclic:  25    -4.552   3.184
 smooths/quality_vs_mgcv_quakes_spatial_smooth               10    +0.094   0.066     1.43   +0.45   3/10  unresolved_tie
 smooths/quality_vs_mgcv_duchon_regimes::two_component_k30   10    +8.828   6.115     1.43   +0.45   5/10  unresolved_tie
 smooths/quality_vs_mgcv_matern_varying_nu                   25    +4.052   2.957     1.36   +0.27  10/25  unresolved_tie
+families/quality_vs_gamlss_gaussian_multi_smooth::mu        23    -4.422   3.558     1.29   -0.27  17/23  unresolved_tie
 families/quality_vs_gamlss_gaussian_location_scale::gaguri   4    -8.424   7.534     1.21   -0.61   3/4   unresolved_tie
+families/quality_vs_gamlss_gaussian_multi_smooth::log_sigm  23   -13.014  13.729     1.08   -0.23  20/23  unresolved_tie
 smooths/quality_vs_mgcv_matern_varying_nu                   25    -0.931   0.880     1.07   -0.21  16/25  unresolved_tie
 families/quality_vs_gamlss_custom_family_location_scale_ga   4    +5.682   7.010     0.82   +0.41   3/4   unresolved_tie
 families/quality_vs_gamlss_gaussian_location_scale_cyclic:  25    +2.213   3.381     0.66   +0.13  11/25  unresolved_tie
@@ -88,7 +89,7 @@ REAL FINDINGS: 4 pair(s) where gam is worse by more than the paired fold spread 
   families/quality_vs_mgcv_gaussian_smooth::ps_basis [test_rmse] vs mgcv: +3.173% over 10 folds (5.2 SEM, gam won 0/10)
   smooths/quality_vs_mgcv_matern_varying_nu [rmse_vs_truth_nu2.5] vs mgcv: +8.330% over 25 folds (4.1 SEM, gam won 6/25)
 
-DILUTION: 25 paired pair(s) remain unresolved — their sign is not established even after fold averaging. They still enter the rank test above with full weight. Raising K on these is the lever that converts them into evidence:
+DILUTION: 27 paired pair(s) remain unresolved — their sign is not established even after fold averaging. They still enter the rank test above with full weight. Raising K on these is the lever that converts them into evidence:
   families/quality_vs_gamlss_custom_family_location_scale_gaussian::gagurine::constant_sigma: +1.730% +- 26.012% (0.07 SEM over 4 folds)
   smooths/quality_vs_mgcv_pspline_smooth: +0.044% +- 0.143% (0.31 SEM over 10 folds)
   misc/quality_vs_mgcv_thin_plate_1d::i_mod_4_split: +0.017% +- 0.037% (0.47 SEM over 10 folds)
@@ -96,7 +97,9 @@ DILUTION: 25 paired pair(s) remain unresolved — their sign is not established 
   families/quality_vs_gamlss_gaussian_location_scale_cyclic::fundamental::mu: +2.213% +- 3.381% (0.66 SEM over 25 folds)
   families/quality_vs_gamlss_custom_family_location_scale_gaussian::gagurine::mgcv: +5.682% +- 7.010% (0.82 SEM over 4 folds)
   smooths/quality_vs_mgcv_matern_varying_nu: -0.931% +- 0.880% (1.07 SEM over 25 folds)
+  families/quality_vs_gamlss_gaussian_multi_smooth::log_sigma: -13.014% +- 13.729% (1.08 SEM over 23 folds)
   families/quality_vs_gamlss_gaussian_location_scale::gagurine::gamlss: -8.424% +- 7.534% (1.21 SEM over 4 folds)
+  families/quality_vs_gamlss_gaussian_multi_smooth::mu: -4.422% +- 3.558% (1.29 SEM over 23 folds)
   smooths/quality_vs_mgcv_matern_varying_nu: +4.052% +- 2.957% (1.36 SEM over 25 folds)
   smooths/quality_vs_mgcv_duchon_regimes::two_component_k30: +8.828% +- 6.115% (1.43 SEM over 10 folds)
   smooths/quality_vs_mgcv_quakes_spatial_smooth: +0.094% +- 0.066% (1.43 SEM over 10 folds)
