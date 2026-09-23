@@ -2882,14 +2882,14 @@ pub struct FitArtifacts {
     /// [`CoefficientModeSelection::NotRecorded`], which claims nothing.
     #[serde(default)]
     pub coefficient_mode_selection: CoefficientModeSelection,
-    /// The variance-component score test of every random-effect term and every
-    /// `LinearTermRidge`-penalized linear term, computed once on the training
-    /// fit's own IRLS row state (`gam_terms::inference::random_effect_test`).
-    /// The summary's random-effect rows and ridged parametric rows read their
-    /// p-value (or its typed absence) from here, so the CLI, Rust and
-    /// persisted-model surfaces report the same number. Empty on a model with
-    /// no such term and on a payload written before the test existed; a
-    /// summary treats a term missing from it as not recorded.
+    /// The variance-component score test of every random-effect term, computed
+    /// once on the training fit's own IRLS row state
+    /// (`gam_terms::inference::random_effect_test`). The summary's
+    /// random-effect rows read their p-value (or its typed absence) from here,
+    /// so the CLI, Rust and persisted-model surfaces report the same number.
+    /// Empty on a model with no such term and on a payload written before the
+    /// test existed; a summary treats a term missing from it as not recorded.
+    /// Ridged linear terms are recorded in `linear_term_tests`, never here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub random_effect_tests:
         Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord>,

@@ -16,7 +16,7 @@
 //! sets, gam#3573). "No effect" for a ridged slope is its variance component on
 //! the boundary, and the row reports the variance-component score test the fit
 //! recorded for it (`gam_terms::inference::random_effect_test`) — the same test
-//! and record the random-effect rows read.
+//! the random-effect rows read, filed in `FitArtifacts::linear_term_tests`.
 
 use crate::estimate::smooth_term_summary::SummaryBlockOffset;
 use crate::estimate::summary::{
@@ -139,7 +139,7 @@ pub fn parametric_term_summary_rows(
             let global = (offset.coefficients + range.start)..(offset.coefficients + range.end);
             let outcome = fit
                 .artifacts
-                .random_effect_tests
+                .linear_term_tests
                 .iter()
                 .find(|record| record.term == *name && record.coefficient_range == global)
                 .map(|record| &record.outcome);

@@ -220,7 +220,7 @@ fn gaussian_ridged_linear_score_test_is_the_unpenalized_partial_f_test() {
             let record = fitted
                 .fit
                 .artifacts
-                .random_effect_tests
+                .linear_term_tests
                 .iter()
                 .find(|record| record.term == LINEAR_TERM)
                 .expect("recorded score test");

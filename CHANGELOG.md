@@ -1,5 +1,9 @@
 ## Unreleased
 
+- **Model summaries report the variance-component score test (statistic and p-value) for ridged
+  linear terms again** (#3573). Two #3573 changes merged on top of each other: one files the ridged
+  records in `FitArtifacts::linear_term_tests`, the other's summary reader looked them up in
+  `random_effect_tests`, so every ridged parametric row said `linear_term_test_not_recorded`.
 - **Batched Gaussian REML fits no longer refuse a segment whose design is numerically rank
   deficient.** `gaussian_reml_fit_batched` and the position-batched forward prebuilt each segment's
   eigen cache from its Gram `XᵀWX`. That cache judged the design's rank by whether a Cholesky of the

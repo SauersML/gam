@@ -84,16 +84,6 @@
 //! one-way ANOVA `F` on a balanced design. `D'` is the unpenalized residual and
 //! not the fit's `φ̂` because `φ̂` is computed from a residual the penalty shrank,
 //! whose law under `H₀` depends on the smoothing parameters REML chose.
-//!
-//! # Ridged slopes
-//!
-//! A linear term under the REML-selected `LinearTermRidge` is the same
-//! question with a one-column `X_R`: its penalty makes the slope a variance
-//! component, and "no effect" is that component on the boundary. With one
-//! column `V = μ` is a scalar, `T/(φμ)` is `χ²₁`, and with an estimated scale
-//! the ratio is `F(1, ν)`: for a Gaussian model exactly the classical partial
-//! `t²` of the UNPENALIZED slope, read without the shrunk `β̂` the Wald ratio
-//! would need.
 
 
 use std::ops::Range;
