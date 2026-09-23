@@ -3964,6 +3964,14 @@ fn assemble_candidate_formula(
     .map_err(PyValueError::new_err)
 }
 
+/// Whether `formula` holds the `s(..., type=AUTO)` term that
+/// [`assemble_candidate_formula`] substitutes into, read by the assembler's own
+/// scan.
+#[pyfunction]
+fn has_auto_smooth_term(formula: &str) -> PyResult<bool> {
+    gam::solver::topology_formula::has_auto_smooth_term(formula).map_err(PyValueError::new_err)
+}
+
 const PREFERRED_PREDICTION_COLUMNS: &[&str] = &[
     // Estimand-explicit schema (#2785): the plug-in pair, the posterior
     // estimand, then its uncertainty columns, in the order the docs list them.

@@ -86,7 +86,8 @@ pub fn assemble_candidate_formula(
     candidate: &CandidateTopology,
     strict_dimension: bool,
 ) -> Result<Option<String>, String> {
-    let auto_span = find_auto_smooth_call(base_formula)?;
+    let auto_span = find_auto_smooth_call(base_formula)?
+        .ok_or_else(|| "select_topology requires one s(..., type=AUTO) smooth term".to_string())?;
     let term_text = &base_formula[auto_span.start..auto_span.end];
     let (vars, user_options, option_keys) = auto_call_parts(term_text)?;
     let topo_term = topology_term(candidate, &option_keys)?;
@@ -135,7 +136,15 @@ struct AutoSpan {
     end: usize,
 }
 
-fn find_auto_smooth_call(formula: &str) -> Result<AutoSpan, String> {
+/// Whether `formula` holds an `s(..., type=AUTO)` smooth term, read by the same
+/// scan [`assemble_candidate_formula`] substitutes into, so the caller's branch
+/// on AUTO presence and the assembler can never disagree about one formula.
+/// Unbalanced parentheses in a smooth call are an error.
+pub fn has_auto_smooth_term(formula: &str) -> Result<bool, String> {
+    find_auto_smooth_call(formula).map(|span| span.is_some())
+}
+
+fn find_auto_smooth_call(formula: &str) -> Result<Option<AutoSpan>, String> {
     let bytes = formula.as_bytes();
     let mut idx = 0usize;
     while idx < bytes.len() {
@@ -146,14 +155,14 @@ fn find_auto_smooth_call(formula: &str) -> Result<AutoSpan, String> {
         let close_paren = matching_paren(formula, open_paren)?;
         let term = &formula[call_start..=close_paren];
         if contains_type_auto(term) {
-            return Ok(AutoSpan {
+            return Ok(Some(AutoSpan {
                 start: call_start,
                 end: close_paren + 1,
-            });
+            }));
         }
         idx = close_paren + 1;
     }
-    Err("select_topology requires one s(..., type=AUTO) smooth term".to_string())
+    Ok(None)
 }
 
 /// Find the next `s(` or `smooth(` call at or after `from`. Returns the byte
@@ -725,5 +734,41 @@ mod tests {
         };
         let err = assemble_candidate_formula("y ~ s(t, k=8)", &candidate, true).unwrap_err();
         assert!(err.contains("type=AUTO"));
+    }
+
+    /// The AUTO presence test and the assembler read one scan. Each formula
+    /// here is one the deleted Python regex `\btype\s*=\s*(['"]?)AUTO\1`
+    /// called AUTO-bearing although the assembler finds no `s(...)` AUTO term
+    /// in it (a `te(...)` call, a line break the scan does not skip, an AUTO
+    /// outside any smooth call), so gamfit branched one way and Rust the other.
+    #[test]
+    fn auto_presence_agrees_with_the_assembler_2899() {
+        let candidate = CandidateTopology::PeriodicSplineCurve {
+            n_knots: 20,
+            degree: 3,
+            penalty_order: 2,
+            double_penalty: None,
+        };
+        for (formula, present) in [
+            ("y ~ s(t, type=AUTO)", true),
+            ("y ~ s(t, type = 'auto')", true),
+            ("y ~ x + smooth(t, k=8, type=\"AUTO\")", true),
+            ("y ~ s(t, k=8)", false),
+            ("y ~ te(t, u, type=AUTO)", false),
+            ("y ~ s(t, type=\nAUTO)", false),
+            ("y ~ s(t) + f(type=AUTO)", false),
+        ] {
+            assert_eq!(
+                has_auto_smooth_term(formula).unwrap(),
+                present,
+                "AUTO presence of {formula:?}"
+            );
+            assert_eq!(
+                assemble_candidate_formula(formula, &candidate, true).is_ok(),
+                present,
+                "assembly of {formula:?}"
+            );
+        }
+        assert!(has_auto_smooth_term("y ~ s(t, type=AUTO").is_err());
     }
 }

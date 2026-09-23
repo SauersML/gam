@@ -4546,6 +4546,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(tierney_kadane_normalized_score, module)?)?;
     module.add_function(wrap_pyfunction!(torch_smooth_dispatch_key, module)?)?;
     module.add_function(wrap_pyfunction!(assemble_candidate_formula, module)?)?;
+    module.add_function(wrap_pyfunction!(has_auto_smooth_term, module)?)?;
     module.add_function(wrap_pyfunction!(
         select_topology_candidate_lifecycle,
         module

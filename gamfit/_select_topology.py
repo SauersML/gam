@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeAlias, cast
@@ -32,12 +31,6 @@ from .smooth import (
 )
 
 
-# Sentinel placeholder for the `auto` tuple passed through `_formula_for_candidate`.
-# The Rust assembler scans for `type=AUTO` itself, so the Python side only needs
-# to know whether such a term exists; the tuple's interior is unused.
-_AUTO_PRESENT: tuple[int, int, str] = (-1, -1, "")
-_AUTO_RE = re.compile(r"\btype\s*=\s*(['\"]?)AUTO\1(?=\s*(?:,|\)))", re.IGNORECASE)
-
 
 @dataclass(frozen=True, slots=True)
 class _Candidate:
@@ -52,6 +45,8 @@ class _TopologyRustModule(Protocol):
         candidate_json: str,
         strict_dimension: bool,
     ) -> str | None: ...
+
+    def has_auto_smooth_term(self, formula: str) -> bool: ...
 
     def select_topology_candidate_lifecycle(self, request_json: str) -> str: ...
 
@@ -231,7 +226,6 @@ def select_topology(
     score_scale_kind = _normalize_score_scale(score_scale)
     formula, feature_dim, n_obs = _formula_from_response(data, response)
     normalized = _normalize_candidates(candidates, feature_dim=feature_dim)
-    _find_auto_smooth_call(formula)
 
     # Table ingestion is topology-independent. Normalize once, then run one
     # complete converged fit for every genuinely discrete candidate. There is
@@ -601,20 +595,6 @@ def _formula_from_response(data: Any, response: str) -> tuple[str, int, int]:
     return f"{text} ~ s({', '.join(features)}, type=AUTO)", len(features), n_obs
 
 
-def _find_auto_smooth_call(formula: str) -> tuple[int, int, str]:
-    """Return a sentinel triple when `formula` contains a `type=AUTO` smooth.
-
-    The Rust formula assembler does its own AUTO scan, paren matching, and
-    argument splitting; this Python wrapper only needs to signal presence vs.
-    absence. The returned tuple's interior is intentionally a sentinel — the
-    sole consumer (`_formula_for_candidate`) ignores it and routes through
-    the Rust pyfunction.
-    """
-    if _AUTO_RE.search(formula):
-        return _AUTO_PRESENT
-    raise ValueError("select_topology requires one s(..., type=AUTO) smooth term")
-
-
 def _formula_for_candidate(
     formula: str,
     candidate: _Candidate,
@@ -964,7 +944,7 @@ class TopologyAutoSelector:
         """
         latent_name, latent = _single_latent(latents, self.latent)
         n_obs = _n_obs(data, latent_name, latent)
-        auto = _maybe_auto_smooth(formula)
+        auto = _topology_rust().has_auto_smooth_term(formula)
         normalized = _normalize_selector_candidates(self.candidates, latent.d)
 
         # Normalize topology-independent data once. Each requested topology is
@@ -1081,19 +1061,12 @@ def _n_obs(data: Any, latent_name: str, latent: LatentCoord) -> int:
     return n_obs
 
 
-def _maybe_auto_smooth(formula: str) -> tuple[int, int, str] | None:
-    try:
-        return _find_auto_smooth_call(formula)
-    except ValueError:
-        return None
-
-
 def _candidate_formula(
     formula: str,
-    auto: tuple[int, int, str] | None,
+    auto: bool,
     candidate: _Candidate,
 ) -> str:
-    if auto is None:
+    if not auto:
         return formula
     candidate_formula = _formula_for_candidate(
         formula,
