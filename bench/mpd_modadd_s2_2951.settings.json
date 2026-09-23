@@ -1,14 +1,18 @@
 {
-  "stage": "plane_edits",
-  "models": [
-    {"label": "trained", "file": "addition_s0.pt", "step": null, "shuffle_mlp_seed": null},
-    {"label": "c1_init", "file": "addition_s0.pt", "step": 0, "shuffle_mlp_seed": null},
-    {"label": "c4_step2000", "file": "addition_s0.pt", "step": 2000, "shuffle_mlp_seed": null},
-    {"label": "c3_shuffled_mlp", "file": "addition_s0.pt", "step": null, "shuffle_mlp_seed": 0},
-    {"label": "c2_random_labels", "file": "random_s0.pt", "step": null, "shuffle_mlp_seed": null}
+  "stage": "s2_native",
+  "runs": [
+    {"label": "addition", "file": "addition_s0.pt", "checkpoints": [20000, 0, 2000]},
+    {"label": "addition", "file": "addition_s0.pt", "checkpoints": [20000], "shuffle_seed": 0},
+    {"label": "random", "file": "random_s0.pt", "checkpoints": [20000]}
   ],
+  "trained": "addition.20000",
+  "sites": ["pos0", "pos1", "global"],
   "fit_shift": 1,
-  "fraction_bits": 24,
-  "null_edit_models": ["trained"],
-  "random_basis_seed": 0
+  "held_out_shifts": [2, 3, 5, 8, 13, 21, 34, 55, 56, 57, 89, 112],
+  "tolerances": [0.001, 0.01, 0.1, 1.0],
+  "disagreements": [0.0001, 0.001, 0.01, 0.1],
+  "kl_quantiles": [0.5, 0.9, 0.99, 0.999],
+  "fraction_bits": 16,
+  "null_seed": 0,
+  "support": {"sites": ["pos0", "global"], "tolerances": [0.01, 0.1]}
 }
