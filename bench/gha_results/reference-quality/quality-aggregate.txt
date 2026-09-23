@@ -3,15 +3,15 @@ complete case manifest: /tmp/quality-report/quality_cases.txt (437 cases)
 === #1561 whole-suite quality meta-gate ===
 category        n scored GAMwin REFwin   medlogR  p(1-sided)      p_BH
 factors         1      1      0      1    0.0173      1.0000    1.0000
-families       50     50     33     17   -0.0076      0.0036    0.0215
+families       50     50     34     16   -0.0101      0.0023    0.0138
 manifolds      11     11      8      2   -0.0033      0.0527    0.1582
-misc           28     28     16     12   -0.0003      0.1421    0.2132
-smooths        39     39     21     18   -0.0044      0.1206    0.2132
+misc           27     27     16     11   -0.0005      0.1145    0.1987
+smooths        40     40     21     19   -0.0030      0.1324    0.1987
 survival       12     12      7      5   -0.0092      0.2349    0.2818
 ------------------------------------------------------------------------
-OVERALL       141    141     85     55   -0.0036      0.0005 
+OVERALL       141    141     86     54   -0.0044      0.0004 
 
-CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0005, median log(gam/ref)=-0.0036, wins 85 / losses 55)
+CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0004, median log(gam/ref)=-0.0044, wins 86 / losses 54)
 Experimental units: 141 cases from 181 metric pairs.
 INCOMPLETE: absent manifest, mismatched execution, or failed cases; closure blocked.
 
@@ -21,27 +21,26 @@ calibration         8       0         0
 factors             2       0         1
 families           90      10        50
 manifolds          11       0        11
-misc              247      11        28
+misc              247      10        27
 regressions         3       0         0
-smooths            49      12        39
+smooths            49      10        40
 survival           27       3        12
 
-SILENT ATTRITION: 19 test(s) failed BEFORE emitting a pair (excluded from the significance set):
+SILENT ATTRITION: 18 test(s) failed BEFORE emitting a pair (excluded from the significance set):
   GAM_ERROR/gam_fit_failed families::quality_vs_vgam_multinomial_softmax::gam_multinomial_softmax_recovers_true_simplex_on_real_data
   GAM_ERROR/gam_fit_failed families::quality_vs_gamlss_gaussian_multi_smooth::gam_gaussian_multi_smooth_matches_gamlss
   GAM_ERROR/gam_fit_failed families::quality_vs_synthetic_multinomial_deviance_identity::multinomial_recovers_decision_boundary_on_held_out_split
   GAM_ERROR/gam_fit_failed families::quality_vs_vgam_multinomial_smooth_by_factor::gam_multinomial_smooth_by_factor_recovers_truth
   METRIC_OFF/quality_metric misc::fit_quality_stress::hifreq_tensor_k4
   GAM_ERROR/gam_fit_failed misc::quality_expectile_band_coverage_heteroscedastic::expectile_bands_cover_true_expectile_under_heteroscedastic_noise
-  TIMEOUT/per_test_bound misc::quality_vs_scipy_pit_transformation_normal::transformation_normal_held_out_pit_is_uniform
   GAM_ERROR/gam_fit_failed misc::mega_batch_k::matern_recovers_polynomial
   GAM_ERROR/gam_fit_failed misc::quality_vs_simplex_dirichlet_regression::gam_dirichlet_regression_recovers_truth_on_real_data
+  METRIC_OFF/quality_metric misc::quality_vs_inla_rw2_spde_penalized_baseline::gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla_on_real_data
   GAM_ERROR/gam_fit_failed misc::quality_vs_statsmodels_gam_additive::gam_additive_matches_statsmodels_gam
   TIMEOUT/per_test_bound misc::quality_vs_lifelines_interval_censored_truth_recovery::gam_recovers_interval_censored_latent_truth_match_or_beat_lifelines
   GAM_ERROR/gam_fit_failed misc::quality_vs_r_gpgp_likelihood::gam_gp_smooth_recovers_truth_and_predicts
   GAM_ERROR/gam_fit_failed smooths::quality_vs_sklearn_gp_matern_regression::gam_matern_gp_recovers_truth_and_beats_sklearn
   METRIC_OFF/quality_metric smooths::quality_vs_rstpm2_pstpm2_smooth_covariate::gam_smooth_covariate_recovers_flat_noise_effect_and_valid_survival_on_bone
-  GAM_ERROR/gam_fit_failed smooths::quality_vs_scam_monotone_increasing_smooth::gam_monotone_increasing_smooth_recovers_truth_and_matches_scam
   METRIC_OFF/quality_metric smooths::quality_vs_mgcv_quakes_spatial_smooth::gam_spatial_smooth_predicts_quakes_better_than_baseline_on_real_data
   GAM_ERROR/gam_fit_failed smooths::quality_vs_mgcv_matern_smooth::gam_matern_smooth_recovers_truth
   TIMEOUT/per_test_bound survival::quality_vs_survival_coxph_frailty_hazard_multiplier::gam_hazard_multiplier_frailty_matches_coxph_frailty_on_real_data
@@ -119,7 +118,7 @@ DILUTION: 25 paired pair(s) remain unresolved — their sign is not established 
 
 Top tests GAM loses (largest log(gam/ref) > 0):
   +4.5360  survival/quality_vs_gamlss_gaussian_survival_ls::loc [rmse_to_truth] gam=29.565 vs gamlss=0.31682
-  +1.8032  smooths/quality_vs_mgcv_factor_smooth_fs [truth_rmse] gam=0.33135 vs mgcv=0.054596
+  +1.8027  smooths/quality_vs_mgcv_factor_smooth_fs [truth_rmse] gam=0.33135 vs mgcv=0.054623
   +1.6032  families/quality_vs_gamlss_gaussian_location_scale::mu [mu_rmse_to_truth] gam=0.075034 vs gamlss=0.015101
   +1.3747  smooths/quality_vs_mgcv_duchon_default_rank::2d_n400 [truth_rmse] gam=0.092236 vs mgcv=0.023328
   +1.1847  survival/quality_vs_gamlss_gaussian_survival_ls::log_sigma [rmse_to_truth] gam=1.2232 vs gamlss=0.37409
