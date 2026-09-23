@@ -629,73 +629,253 @@ fn reserve_dense_covariance_bundle(p: usize) -> Option<gam_runtime::resource::Me
     }
 }
 
-/// Truncate the ρ-MARGINAL posterior covariance to the fit's feasible set,
-/// in place (#2705 group A).
-///
-/// `covariance` arrives as `Vp = Vb + J·V_ρ·Jᵀ` built from the UNTRUNCATED
-/// conditional `Vb`, and leaves as the covariance of `N(β_unc, Vp)` restricted
-/// to `{β : Aβ ≥ b}`. The truncation is rebuilt AT `Vp` — its own lift
-/// `G_p = Vp·Aᵀ·W_p⁻¹` and its own orthant moments at `W_p = A·Vp·Aᵀ` — because
-/// a lift derived from a different covariance is not a projector for this one,
-/// and subtracting it is not a truncation of anything.
-///
-/// A geometry whose moments were DECLINED never truncated the conditional
-/// covariance either, so there is nothing here to keep consistent with and the
-/// marginal is published untruncated, exactly as the conditional one is.
-///
-/// A MOMENT failure declines rather than propagating. The corrected covariance
-/// is a refinement of an already-published conditional one, and #2601 is on
-/// record for what happens when a failure to refine the uncertainty is allowed
-/// to destroy a converged point estimate; the honest degradation is the typed
-/// absence every consumer of `beta_covariance_corrected` already handles. A
-/// STRUCTURAL failure — a geometry whose constraint width disagrees with the
-/// covariance it is supposed to constrain — is still fatal, because that is a
-/// wiring defect and no absence describes it.
-pub(crate) fn apply_marginal_constraint_truncation(
-    geometry: &crate::constrained_posterior::ConstrainedPosteriorGeometry,
-    covariance: &mut Array2<f64>,
-) -> Result<Result<(), String>, EstimationError> {
-    if geometry.decline().is_some() {
-        return Ok(Ok(()));
+/// One node precision of a factorized fit's smoothing mixture (gam#3229): the
+/// dense `M̂ + Σ_k expm1(δ_k) R_kᵀR_k` in the original basis, factored once and
+/// served through certified solves, with no inverse formed.
+struct FactoredNodePrecision {
+    matrix: gam_linalg::matrix::SymmetricMatrix,
+    factor: Box<dyn FactorizedSystem>,
+}
+
+impl FactoredNodePrecision {
+    fn factor(
+        precision: &Array2<f64>,
+        drift_roots: &[Array2<f64>],
+        weights: &[f64],
+    ) -> Result<Self, String> {
+        let mut node = precision.clone();
+        for (root, &weight) in drift_roots.iter().zip(weights) {
+            node.scaled_add(weight, &root.t().dot(root));
+        }
+        gam_linalg::matrix::symmetrize_in_place(&mut node);
+        Self::from_matrix(node)
     }
-    let p = covariance.nrows();
-    if geometry.constraints.a.ncols() != p {
+
+    /// Factor a node precision already formed, and mirrored, by
+    /// [`crate::constrained_posterior::SmoothingMixture::node_precision`].
+    fn from_matrix(node: Array2<f64>) -> Result<Self, String> {
+        let matrix = gam_linalg::matrix::SymmetricMatrix::Dense(node);
+        let factor = matrix.factorize(SymmetricAssembly::Mirrored)?;
+        Ok(Self { matrix, factor })
+    }
+}
+
+/// A dense route's mixture beside the covariance it publishes; a dense build
+/// that formed none is a wiring defect, reported as the reason.
+fn dense_mixture_with_covariance(
+    mixture: crate::constrained_posterior::SmoothingMixture,
+) -> Result<(crate::constrained_posterior::SmoothingMixture, Array2<f64>), String> {
+    match mixture.covariance().cloned() {
+        Some(published) => Ok((mixture, published)),
+        None => Err("a dense smoothing mixture formed no covariance".to_string()),
+    }
+}
+
+/// The published standard errors of a factorized fit's smoothing mixture
+/// (gam#3229): per node, the published diagonal of its truncated law through
+/// the same chunked solve and the same `factorized_standard_errors` judgement
+/// the conditional standard errors take, with `H_t⁻¹ = Qsᵀ·M_i⁻¹·Qs` served by
+/// the node's own factor; then `diag Σ_i w_i [V_i + (m_i − m̄)(m_i − m̄)ᵀ]` in the
+/// published coordinates, whose spread term reads `M·(m_i − m̄)`. The cost is
+/// one factorization and one chunked diagonal pass per node.
+fn factorized_mixture_standard_errors(
+    mixture: &crate::constrained_posterior::SmoothingMixture,
+    geometry: &crate::constrained_posterior::ConstrainedPosteriorGeometry,
+    penalized_hessian: &Array2<f64>,
+    conditioning: &crate::estimate::penalty::ParametricColumnConditioning,
+    qs: &Array2<f64>,
+    chunk_cols: usize,
+) -> Result<Result<Array1<f64>, String>, EstimationError> {
+    use crate::constrained_posterior::NodeSolve;
+
+    let factor_node = |index: usize| {
+        mixture
+            .node_precision(penalized_hessian.view(), index)
+            .and_then(FactoredNodePrecision::from_matrix)
+    };
+    let nodes = match mixture.node_truncations(
+        penalized_hessian.view(),
+        &geometry.constraints,
+        factor_node,
+    ) {
+        Ok(nodes) => nodes,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let weight = 1.0 / nodes.len() as f64;
+    let p = penalized_hessian.nrows();
+    let mut mean = Array1::<f64>::zeros(p);
+    for (_, truncation) in &nodes {
+        mean.scaled_add(weight, &truncation.mean);
+    }
+    let mut variance = Array1::<f64>::zeros(qs.nrows());
+    for (index, (node, truncation)) in nodes.iter().enumerate() {
+        let inverse_diagonal = crate::estimate::penalty::factorized_published_inverse_diagonal(
+            conditioning,
+            qs,
+            chunk_cols,
+            |rhs, rows| {
+                node.solve(&qs.dot(rhs))
+                    .map(|solved| qs.t().dot(&solved))
+                    .map_err(|reason| {
+                        EstimationError::RemlOptimizationFailed(format!(
+                            "smoothing mixture node {index} standard errors at rows {}..{}: \
+                             {reason}",
+                            rows.start, rows.end
+                        ))
+                    })
+            },
+        )?;
+        let node_standard_errors = crate::estimate::penalty::factorized_standard_errors(
+            conditioning,
+            &inverse_diagonal,
+            mixture.covariance_scale(),
+            None,
+            truncation.correction.as_ref(),
+            false,
+        )?;
+        let spread = conditioning
+            .left_multiply_by_m(&(&truncation.mean - &mean).insert_axis(ndarray::Axis(1)));
+        for row in 0..variance.len() {
+            variance[row] += weight
+                * (node_standard_errors[row] * node_standard_errors[row]
+                    + spread[[row, 0]] * spread[[row, 0]]);
+        }
+    }
+    Ok(Ok(variance.mapv(f64::sqrt)))
+}
+
+impl crate::constrained_posterior::NodeSolve for FactoredNodePrecision {
+    fn solve(&self, rhs: &Array2<f64>) -> Result<Array2<f64>, String> {
+        let solution = self.factor.solvemulti(rhs)?;
+        certify_factorized_inference_solve(
+            &self.matrix,
+            rhs,
+            &solution,
+            "smoothing mixture node solve",
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(solution)
+    }
+}
+
+impl crate::constrained_posterior::NodePrecision for FactoredNodePrecision {
+    fn dense_inverse(&self) -> Option<Result<Array2<f64>, String>> {
+        None
+    }
+}
+
+/// The penalty drifts of a standard fit as roots in the original basis the
+/// constrained posterior lives in (gam#3229): `R_k = √λ_k·[root_k]·Qsᵀ`, with
+/// `[root_k]` the canonical penalty's root embedded at its columns of the
+/// transformed frame, so `R_kᵀR_k = λ_k·Qs·S̃_k·Qsᵀ` over the penalties `H_t`
+/// carries, in the order `lambdas` and `V_ρ` name them.
+fn standard_route_drift_roots(
+    pirls_res: &crate::pirls::PirlsResult,
+    lambdas: &Array1<f64>,
+) -> Result<Vec<Array2<f64>>, EstimationError> {
+    let applied_penalties = pirls_res
+        .reparam_result
+        .applied_penalties()
+        .map_err(|error| {
+            EstimationError::LayoutError(format!(
+                "projecting the smoothing mixture's penalty drifts onto the reparameterization's \
+                 penalized subspace failed: {error}"
+            ))
+        })?;
+    if applied_penalties.len() != lambdas.len() {
         return Err(EstimationError::RemlOptimizationFailed(format!(
-            "constrained posterior geometry has {} constraint columns against a {p}x{p} \
-             corrected covariance",
-            geometry.constraints.a.ncols(),
+            "smoothing mixture: {} penalties for {} strengths",
+            applied_penalties.len(),
+            lambdas.len()
+        )));
+    }
+    let qs = &pirls_res.reparam_result.qs;
+    let p_t = qs.ncols();
+    applied_penalties
+        .iter()
+        .zip(lambdas.iter())
+        .map(|(penalty, &lambda)| {
+            let range = &penalty.col_range;
+            let root = &penalty.root;
+            if root.ncols() != range.len() {
+                return Err(EstimationError::LayoutError(format!(
+                    "smoothing mixture: a penalty root has {} columns on a {}-column block",
+                    root.ncols(),
+                    range.len()
+                )));
+            }
+            let mut embedded = Array2::<f64>::zeros((root.nrows(), p_t));
+            embedded
+                .slice_mut(ndarray::s![.., range.clone()])
+                .assign(root);
+            Ok(embedded.dot(&qs.t()) * lambda.sqrt())
+        })
+        .collect()
+}
+
+/// The smoothing-corrected θ-mixture of a standard constrained fit (gam#3229),
+/// in the frame its constrained posterior geometry lives in: the original
+/// internal basis, where `penalized_hessian` is `Qs·H_t·Qsᵀ`. A dense fit
+/// factors and inverts each node ([`crate::constrained_posterior::DenseNodePrecision`])
+/// and carries the mixture's covariance; a factorized one factors each node and
+/// reads it through solves ([`FactoredNodePrecision`]), carrying none.
+///
+/// A MOMENT or node failure is `Ok(Err(reason))`, which the caller publishes as
+/// the typed absence: the corrected covariance refines an already-published
+/// conditional one, and #2601 is on record for letting a failure to refine the
+/// uncertainty destroy a converged point estimate. A STRUCTURAL mismatch
+/// between the penalties, the strengths and `V_ρ` is fatal, because that is a
+/// wiring defect and no absence describes it.
+fn standard_route_smoothing_mixture(
+    geometry: &crate::constrained_posterior::ConstrainedPosteriorGeometry,
+    penalized_hessian: &Array2<f64>,
+    covariance_scale: f64,
+    pirls_res: &crate::pirls::PirlsResult,
+    lambdas: &Array1<f64>,
+    rho_covariance: Option<&Array2<f64>>,
+    dense: bool,
+) -> Result<Result<crate::constrained_posterior::SmoothingMixture, String>, EstimationError> {
+    let Some(rho_covariance) = rho_covariance else {
+        return Ok(Err(
+            "the smoothing correction published no rho covariance to place the mixture's \
+             nodes with"
+                .to_string(),
+        ));
+    };
+    if rho_covariance.dim() != (lambdas.len(), lambdas.len()) {
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "smoothing mixture: {} strengths against a {:?} rho covariance",
+            lambdas.len(),
+            rho_covariance.dim()
         )));
     }
     let center = match geometry.unconstrained_center() {
-        Ok(center) if center.len() == p => center,
-        Ok(center) => {
-            return Err(EstimationError::RemlOptimizationFailed(format!(
-                "constrained posterior geometry carries a length-{} centre against a {p}x{p} \
-                 corrected covariance",
-                center.len(),
-            )));
-        }
+        Ok(center) => center,
         Err(reason) => return Ok(Err(reason)),
     };
-    let marginal_correction =
-        match crate::constrained_posterior::constrained_posterior_correction_from_covariance(
-            covariance,
-            center,
-            &geometry.constraints,
-        ) {
-            Ok(correction) => correction,
-            Err(reason) => return Ok(Err(reason)),
-        };
-    if let Some(correction) = marginal_correction {
-        // Same positive-semidefinite assembly the conditional covariance uses:
-        // the marginal is read for standard errors too, and a pinned coordinate
-        // cancels there for exactly the same reason.
-        match correction.truncated_covariance_psd(covariance, &geometry.constraints) {
-            Ok(truncated) => *covariance = truncated,
-            Err(reason) => return Ok(Err(reason)),
-        }
-    }
-    Ok(Ok(()))
+    let roots = standard_route_drift_roots(pirls_res, lambdas)?;
+    let precision_center = penalized_hessian.dot(center);
+    let inputs = crate::constrained_posterior::SmoothingMixtureInputs {
+        center: center.view(),
+        precision_center: precision_center.view(),
+        covariance_scale,
+        drift_roots: &roots,
+        rho_covariance: rho_covariance.view(),
+        constraints: &geometry.constraints,
+    };
+    Ok(if dense {
+        crate::constrained_posterior::SmoothingMixture::build(inputs, |weights| {
+            crate::constrained_posterior::DenseNodePrecision::factor(
+                penalized_hessian.view(),
+                &roots,
+                weights,
+            )
+        })
+    } else {
+        crate::constrained_posterior::SmoothingMixture::build(inputs, |weights| {
+            FactoredNodePrecision::factor(penalized_hessian, &roots, weights)
+        })
+    })
 }
 
 /// Reserve the first-order smoothing correction's workspace on a fit whose
@@ -716,61 +896,6 @@ fn reserve_smoothing_correction_workspace(
             "factorized-branch first-order smoothing correction workspace",
         )
         .map_err(|error| error.to_string())
-}
-
-/// The truncation of the ρ-marginal `Vp = Vb + B·Bᵀ` to the fit's feasible set
-/// on the factorized branch (#3283), where neither covariance is formed.
-///
-/// It is [`apply_marginal_constraint_truncation`]'s construction: `Vp`'s own
-/// lift and orthant moments at `W_p = A·Vp·Aᵀ`, built from the only block the
-/// decomposition reads, `Vp·Aᵀ = Vb·Aᵀ + B·(Bᵀ·Aᵀ)`, with
-/// `conditional_times_constraints = Vb·Aᵀ` solved through the Hessian factor.
-/// `Ok(Ok(None))` means no retained face moves the answer; a MOMENT failure is
-/// `Ok(Err(reason))`, which the caller publishes as the typed absence, and a
-/// STRUCTURAL mismatch is fatal, both exactly as on the dense branch. A declined
-/// geometry never truncated the conditional law, and the caller does not call
-/// this for one.
-fn factorized_marginal_constraint_truncation(
-    geometry: &crate::constrained_posterior::ConstrainedPosteriorGeometry,
-    conditional_times_constraints: &Array2<f64>,
-    factor: &Array2<f64>,
-) -> Result<
-    Result<Option<crate::constrained_posterior::ConstrainedPosteriorCorrection>, String>,
-    EstimationError,
-> {
-    let constraints = &geometry.constraints;
-    let p = factor.nrows();
-    if constraints.a.ncols() != p
-        || conditional_times_constraints.dim() != (p, constraints.a.nrows())
-    {
-        return Err(EstimationError::RemlOptimizationFailed(format!(
-            "constrained posterior geometry has {}x{} constraints against a {p}-row smoothing \
-             correction factor and a {:?} conditional normal block",
-            constraints.a.nrows(),
-            constraints.a.ncols(),
-            conditional_times_constraints.dim(),
-        )));
-    }
-    let center = match geometry.unconstrained_center() {
-        Ok(center) if center.len() == p => center,
-        Ok(center) => {
-            return Err(EstimationError::RemlOptimizationFailed(format!(
-                "constrained posterior geometry carries a length-{} centre against a {p}-row \
-                 smoothing correction factor",
-                center.len(),
-            )));
-        }
-        Err(reason) => return Ok(Err(reason)),
-    };
-    let marginal_times_constraints =
-        conditional_times_constraints + &factor.dot(&factor.t().dot(&constraints.a.t()));
-    Ok(
-        crate::constrained_posterior::constrained_posterior_correction(
-            marginal_times_constraints.view(),
-            center,
-            constraints,
-        ),
-    )
 }
 
 /// Reserve the square matrices that remain live even when inference stays
@@ -3234,7 +3359,7 @@ where
     // This work is independent of `compute_inference`: requesting standard
     // errors cannot change the fitted coefficient vector. It needs q+1 solves,
     // not a dense p×p inverse.
-    let constrained_posterior = match pirls_res.linear_constraints_transformed.as_ref() {
+    let mut constrained_posterior = match pirls_res.linear_constraints_transformed.as_ref() {
         Some(constraints) => {
             let factor = edf_factor.as_ref().ok_or_else(|| {
                 EstimationError::RemlOptimizationFailed(
@@ -4168,36 +4293,62 @@ where
             // lift, as the dense branch does, from `Vp·Aᵀ = Vb·Aᵀ + B·(Bᵀ·Aᵀ)`:
             // `m` solves against the factor instead of a `p × p` product.
             if let Some(factor) = smoothing_correction_factor.take() {
-                let truncation = match constrained_posterior
-                    .as_ref()
+                // gam#3229: a constrained fit's corrected law is the θ-mixture of its
+                // truncated node laws; a factorized fit factors each node precision
+                // and publishes the mixture's standard errors from solves, with no
+                // `p × p` covariance formed. `B` stays the first-order factor the
+                // corrected-EDF reads; it is not read as an ambient inflation.
+                let standard_errors = match constrained_posterior
+                    .as_mut()
                     .filter(|geometry| geometry.decline().is_none())
                 {
                     Some(geometry) => {
-                        let constraints_transpose = geometry.constraints.a.t().to_owned();
-                        let solved = factor_t.certified_solve(
-                            &pirls_res.stabilizedhessian_transformed,
-                            &qs.t().dot(&constraints_transpose),
-                            "smoothing-corrected constrained posterior normal geometry",
-                        )?;
-                        let conditional_times_constraints = qs.dot(&solved) * cov_scale;
-                        factorized_marginal_constraint_truncation(
+                        let mixture = standard_route_smoothing_mixture(
                             geometry,
-                            &conditional_times_constraints,
-                            &factor,
-                        )?
-                    }
-                    None => Ok(None),
-                };
-                match truncation {
-                    Ok(marginal_correction) => {
-                        let standard_errors = crate::estimate::penalty::factorized_standard_errors(
-                            &conditioning,
-                            &inverse_diagonal,
+                            &penalized_hessian,
                             cov_scale,
-                            Some(&factor),
-                            marginal_correction.as_ref(),
+                            &pirls_res,
+                            &lambdas,
+                            rho_covariance.as_ref(),
                             false,
                         )?;
+                        let published = match mixture {
+                            Ok(mixture) => factorized_mixture_standard_errors(
+                                &mixture,
+                                geometry,
+                                &penalized_hessian,
+                                &conditioning,
+                                qs,
+                                se_chunk_cols,
+                            )?
+                            .map(|standard_errors| (mixture, standard_errors)),
+                            Err(reason) => Err(reason),
+                        };
+                        match published {
+                            Ok((mixture, standard_errors)) => {
+                                geometry.set_smoothing_mixture(mixture).map_err(|reason| {
+                                    EstimationError::RemlOptimizationFailed(format!(
+                                        "the constrained smoothing mixture does not fit its own \
+                                         geometry: {reason}"
+                                    ))
+                                })?;
+                                Ok(standard_errors)
+                            }
+                            Err(reason) => Err(reason),
+                        }
+                    }
+                    None => crate::estimate::penalty::factorized_standard_errors(
+                        &conditioning,
+                        &inverse_diagonal,
+                        cov_scale,
+                        Some(&factor),
+                        None,
+                        false,
+                    )
+                    .map(Ok)?,
+                };
+                match standard_errors {
+                    Ok(standard_errors) => {
                         smoothing_correction_factorized =
                             Some(crate::model_types::FactorizedSmoothingCorrection {
                                 factor,
@@ -4206,8 +4357,8 @@ where
                     }
                     Err(reason) => {
                         log::debug!(
-                            "[CONSTRAINED-Vp] the factorized smoothing-corrected law could not be \
-                             truncated to the feasible set ({reason}); publishing the typed absence"
+                            "[CONSTRAINED-Vp] the factorized smoothing-corrected mixture could \
+                             not be formed ({reason}); publishing the typed absence"
                         );
                         smoothing_correction_absence = Some(
                             crate::model_types::SmoothingCorrectionAbsence::ConstrainedTruncationRefused {
@@ -4245,78 +4396,88 @@ where
         // predict() interval for large-magnitude responses (#582). cov_scale is
         // applied once, where it belongs: in Vb = scaled_covariance(H⁻¹, cov_scale).
         //
-        // #2705 group A — WHICH `Vb` the sum starts from, when the fit carries
-        // inequality constraints.
+        // #2705 group A and gam#3229 — what the corrected covariance of a fit
+        // carrying inequality constraints IS.
         //
         // `beta_covariance` is the ρ̂-CONDITIONAL posterior covariance and, for a
         // constrained fit, it has already been truncated to the feasible set:
         // `Σ_π = Σ − GΔGᵀ`. Adding `J·V_ρ·Jᵀ` to THAT produced a matrix that is
-        // the truncation of neither covariance:
+        // the truncation of neither covariance (`Vp − GΔGᵀ`, `G` and `Δ` from
+        // `Σ`), which published a materially negative variance on
+        // `y ~ s(x, shape=convex)`.
         //
-        //     (Σ − GΔGᵀ) + (Vp − Σ)  =  Vp − GΔGᵀ,
+        // Nor is it the truncation of the ρ-marginal ambient `Σ + J·V_ρ·Jᵀ`,
+        // which is what this site published next. `V_ρ` is the inverse curvature
+        // of the criterion THIS constrained fit selected ρ on, so it describes
+        // ρ's posterior under the constrained model, and β given ρ is the
+        // cone-truncated law at ρ. The β-marginal is therefore the θ-mixture of
+        // truncated laws, `E_θ[V(θ)] + Var_θ(m(θ))`, whose first-order term
+        // carries `½ tr(V″ V_ρ)` beside `J_m V_ρ J_mᵀ`; truncating `Σ + J V_ρ Jᵀ`
+        // carries neither, and on gam#3229's one-row witness it is three times
+        // further from the mixture than the mixture's own first-order term.
         //
-        // with `G` and `Δ` derived from `Σ`, not from `Vp`. Along a coordinate
-        // the constraint pins, `(GΔGᵀ)_ii` cancels `Σ_ii` to eleven digits, so
-        // whatever `(Vp − Σ)_ii` happens to be becomes the WHOLE reported
-        // variance — and `Vp − Σ` need not be resolvable against that
-        // cancellation (any increment is PSD only as a SUM with `Vb` once the
-        // truncation has removed most of `Σ_ii`). On
-        // `y ~ s(x, shape=convex)` that left `Σ_ii = 2.30e-2` truncated to
-        // `6.23e-13` with a `−3.03e-9` smoothing increment on top, i.e. a
-        // materially negative published variance, and `se_from_covariance`
-        // refused the fit.
-        //
-        // The correct composition follows from the estimand. The feasible set
-        // constrains β and says nothing about ρ, so the indicator `1_C(β)`
-        // factors straight out of the ρ-integral:
-        //
-        //     ∫ π(β,ρ|y)·1_C(β) dρ  =  1_C(β)·∫ π(β,ρ|y) dρ,
-        //
-        // i.e. the β-marginal of the TRUNCATED joint posterior is exactly the
-        // truncation of the β-marginal of the untruncated one. So the truncation
-        // belongs on `Vp`, applied last, with its own `G_p = Vp·Aᵀ·W_p⁻¹` and its
-        // own orthant moments at `W_p = A·Vp·Aᵀ` — not inherited from `Σ`.
-        //
-        // Two properties come with it, both of which the old order lacked: the
-        // published matrix is a genuine truncated-Gaussian covariance, so it sits
-        // between `P·Vp·Pᵀ ⪰ 0` and `Vp` instead of below both; and the
-        // constraint's effect on the reported interval is measured at the width
-        // the interval actually has, rather than at the conditional width.
+        // So a constrained fit publishes the mixture itself, built by the one
+        // function every constrained route shares
+        // (`crate::constrained_posterior::SmoothingMixture`), and attaches it to
+        // its geometry, where a predictor reads the same object as its law. Each
+        // node covariance is truncated in the sum-of-Grams form, so the pinned
+        // coordinate's cancellation of #2705 cannot reappear in it. A declined
+        // geometry truncated nothing and publishes `Vb + J·V_ρ·Jᵀ` untruncated,
+        // exactly as its conditional covariance is.
         //
         // The ρ̂-CONDITIONAL `beta_covariance` keeps its own truncation at `Σ` —
         // that one is right, because that estimand really is conditional on ρ̂.
         beta_covariance_corrected = match (&beta_covariance, &smoothing_correction) {
             (Some(base_cov), Some(corr)) if base_cov.as_array().dim() == corr.dim() => {
-                let mut corrected = untruncated_conditional_covariance
-                    .as_ref()
-                    .unwrap_or_else(|| base_cov.as_array())
-                    .clone();
-                corrected += corr;
-                let truncation = match constrained_posterior.as_ref() {
+                match constrained_posterior
+                    .as_mut()
+                    .filter(|geometry| geometry.decline().is_none())
+                {
                     Some(geometry) => {
-                        apply_marginal_constraint_truncation(geometry, &mut corrected)?
+                        let mixture = standard_route_smoothing_mixture(
+                            geometry,
+                            &penalized_hessian,
+                            cov_scale,
+                            &pirls_res,
+                            &lambdas,
+                            rho_covariance.as_ref(),
+                            true,
+                        )?;
+                        let mixture = mixture.and_then(dense_mixture_with_covariance);
+                        match mixture {
+                            Ok((mixture, published)) => {
+                                geometry.set_smoothing_mixture(mixture).map_err(|reason| {
+                                    EstimationError::RemlOptimizationFailed(format!(
+                                        "the constrained smoothing mixture does not fit its own \
+                                         geometry: {reason}"
+                                    ))
+                                })?;
+                                Some(published)
+                            }
+                            Err(reason) => {
+                                log::debug!(
+                                    "[CONSTRAINED-Vp] the smoothing-corrected mixture could not \
+                                     be formed ({reason}); publishing the typed absence rather \
+                                     than a law under another convention. The rho-hat-conditional \
+                                     covariance is unaffected."
+                                );
+                                smoothing_correction_absence = Some(
+                                    crate::model_types::SmoothingCorrectionAbsence::ConstrainedTruncationRefused {
+                                        detail: reason,
+                                    },
+                                );
+                                None
+                            }
+                        }
                     }
-                    None => Ok(()),
-                };
-                match truncation {
-                    Ok(()) => {
+                    None => {
+                        let mut corrected = untruncated_conditional_covariance
+                            .as_ref()
+                            .unwrap_or_else(|| base_cov.as_array())
+                            .clone();
+                        corrected += corr;
                         gam_linalg::matrix::symmetrize_in_place(&mut corrected);
                         Some(corrected)
-                    }
-                    Err(reason) => {
-                        log::debug!(
-                            "[CONSTRAINED-Vp] the smoothing-corrected covariance could not be \
-                             truncated to the feasible set ({reason}); publishing the typed \
-                             absence rather than an untruncated marginal, which would over-state \
-                             every constrained interval. The rho-hat-conditional covariance is \
-                             unaffected."
-                        );
-                        smoothing_correction_absence = Some(
-                            crate::model_types::SmoothingCorrectionAbsence::ConstrainedTruncationRefused {
-                                detail: reason.to_string(),
-                            },
-                        );
-                        None
                     }
                 }
             }

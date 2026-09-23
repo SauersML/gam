@@ -1,5 +1,23 @@
 ## Unreleased
 
+- **A constrained fit's smoothing-corrected posterior is the θ-mixture of its cone-truncated
+  laws, and the fit and the predictor read that one object** (gam#3229). Before this, a
+  custom-family fit published `V_cond + C` against the truncated covariance, while the predictor
+  read the same `C` as an inflation of the ambient Gaussian and truncated `Σ + C`. That gave two
+  posteriors for one fit, and neither carried the `½ tr(V″ V_θ)` term, which is the same order
+  as `J V_θ Jᵀ`. On the one-row witness the terms are `2.77e-5` and `−1.99e-5`, and their sum is
+  the exact mixture's `7.84e-6`. The mixture is the symmetric `2r`-node rule over `Var(θ̂)`
+  (exact for every cubic in `δ`). Each node is the quadratic model's truncated Gaussian at
+  `M̂ + Σ_k expm1(δ_k) D_k`. The fit publishes the mixture's covariance, or on a factorized route
+  its standard errors through one factored node precision per node. The predictor's
+  smoothing-corrected interval is the equal-tailed interval of the same mixture law. Lanes that
+  cannot form it report why: `ConstrainedMixtureOverDesignAxes` and
+  `ConstrainedMixtureWithoutAmbientMoments`. The payload version is now v41; a v40 document of a
+  constrained fit carries a `C` under one of the two old readings. Separately, a projection's
+  residual variance is now floored at the rounding band of its two quadratic forms, not at
+  `p·ε·max`. That floor had sent an exact half-normal node, whose lift rounded to `1 − ulp`,
+  through the orthant cubature.
+
 - **`curv()` recovers the sign of κ on data from its own kernel family, reports its range on the
   distance-kernel face when the profile reaches it, and certifies a κ̂ resting on a derived chart
   wall by local box-KKT** (#1464). The range solve reported an interior minimum at ℓ = 2.3e6 on

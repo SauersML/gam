@@ -95,7 +95,20 @@ pub const SAVED_MODEL_KIND: &str = "gam";
 // carries `s_lambda` and `penalty_count` with no components, so its multi-penalty rows
 // read as `Refused(MultiPenalty)` exactly as they did; it is a different wire shape at
 // the same field names and must not be read as this one.
-pub const MODEL_PAYLOAD_VERSION: u32 = 40;
+// v41 carries a constrained fit's smoothing-corrected posterior as the θ-mixture of its
+// cone-truncated laws (#3229): `ConstrainedPosteriorGeometry` gains `smoothing_mixture`, the
+// symmetric `2r`-node rule over `Var(θ̂)` stored as the ambient centre, the scale, the penalty
+// drifts as roots `R_k` (`D_k = R_kᵀR_k`) and the node offsets, beside the mixture's mean and,
+// on a dense route, its covariance. Each node's precision is rebuilt from the fit's penalized
+// Hessian. The fit publishes the mixture's covariance (or, factorized, its standard errors)
+// as its smoothing-corrected covariance and a predictor reads the same mixture as its
+// smoothing-corrected law, so the two are one object. Before it, a custom-family fit
+// published `V_cond + C` against the truncated covariance while the predictor read the same
+// `C` as an inflation of the AMBIENT Gaussian and truncated `Σ + C`: two posteriors for one
+// fit, and neither carried `½ tr(V″ V_θ)`. A v40 document of a constrained fit carries a `C`
+// under one of those readings and no mixture, so it is a different wire shape at the same
+// field names and must not be read as this one.
+pub const MODEL_PAYLOAD_VERSION: u32 = 41;
 
 /// Coefficient parameterization of a saved transformation-normal (CTN) fit.
 ///

@@ -174,11 +174,12 @@ pub(crate) use branch_continuation::*;
 pub(crate) use covariance::*;
 // Covariance helpers that are part of the public flat-namespace API: one consumed
 // by the relocated families (`crate::projected_linear_constraint_stationarity_vector`),
-// and the first-order smoothing correction the single-cause survival fit mints
-// through (#2912). Surface them publicly (the `pub(crate) use covariance::*` glob
+// the first-order smoothing correction the single-cause survival fit mints
+// through (#2912), and the constrained smoothing mixture it attaches (#3229). Surface them publicly (the `pub(crate) use covariance::*` glob
 // above keeps them crate-internal).
 pub use covariance::{
-    first_order_smoothing_correction, projected_linear_constraint_stationarity_vector,
+    attach_smoothing_mixture, first_order_smoothing_correction,
+    projected_linear_constraint_stationarity_vector,
 };
 pub use fit::*;
 pub(crate) use inner_blockwise_fit::*;

@@ -66,8 +66,7 @@ use gam_models::inference::model::{
 use gam_problem::{BlockRole, EstimationError};
 use gam_runtime::resource::prediction_chunk_rows;
 use gam_solve::constrained_posterior::{
-    ConstrainedPosteriorGeometry, ConstrainedProjectionLaw, constrained_posterior_correction,
-    constrained_posterior_correction_from_covariance,
+    ConstrainedMixtureProjectionLaw, ConstrainedPosteriorGeometry, ConstrainedProjectionLaw,
 };
 use gam_solve::mixture_link::{
     InverseLinkJet, beta_logistic_inverse_link_jetwith_param_partials,
@@ -168,11 +167,13 @@ fn validate_posterior_mean_backend(
                 .map_err(EstimationError::InvalidInput)
         }
         PredictionCovarianceBackend::Factorized { .. }
+        | PredictionCovarianceBackend::Mixture { .. }
             if backend.parameter_dim() == expected_dim =>
         {
             Ok(())
         }
-        PredictionCovarianceBackend::Factorized { .. } => {
+        PredictionCovarianceBackend::Factorized { .. }
+        | PredictionCovarianceBackend::Mixture { .. } => {
             Err(EstimationError::InvalidInput(format!(
                 "{label} covariance/backend dimension mismatch: expected parameter dimension \
                  {expected_dim}, got {}",
@@ -426,10 +427,12 @@ fn selected_uncertainty_backend<'a>(
 
 /// The smoothing-corrected law `Vp = Vb + B·Bᵀ` of a fit whose inference
 /// stayed factorized (#3283), applied through the saved penalized Hessian's
-/// factor with the correction's factor `B` beside it. A constrained fit's law
-/// is the truncation at `Vp`'s own lift, `Vp·Aᵀ = Vb·Aᵀ + B·(Bᵀ·Aᵀ)`: the
-/// construction the fit published its corrected standard errors from. `None`
-/// when the fit carries no factorized correction.
+/// factor with the correction's factor `B` beside it. `None` when the fit
+/// carries no factorized correction. A constrained fit's corrected law is the
+/// θ-mixture of its truncated node laws (gam#3229), which this serves through
+/// one factored node precision per node ([`smoothing_mixture_backend`]); `B`
+/// is never read as an ambient inflation to truncate, the second convention
+/// gam#3229 removed.
 pub fn smoothing_corrected_factorized_backend<'a>(
     fit: &'a UnifiedFitResult,
     expected_dim: usize,
@@ -446,35 +449,38 @@ pub fn smoothing_corrected_factorized_backend<'a>(
                  penalized Hessian to apply it with"
             ))
         })?;
+    if let Some(posterior) = fit
+        .geometry
+        .as_ref()
+        .and_then(|geometry| geometry.constrained_posterior.as_ref())
+        .filter(|posterior| posterior.decline().is_none())
+    {
+        let mixture = posterior.smoothing_mixture().ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "{label}: a constrained fit's smoothing-corrected law is the theta-mixture of its \
+                 truncated node laws (gam#3229), and this fit carries none"
+            ))
+        })?;
+        return smoothing_mixture_backend(mixture, hessian, posterior, gauge_lift)
+            .map(Some)
+            .map_err(|reason| {
+                EstimationError::InvalidInput(format!(
+                    "{label}: the constrained smoothing-corrected mixture could not be served: \
+                     {reason}"
+                ))
+            });
+    }
     let gauge = fit.geometry.as_ref().map(|geometry| &geometry.coefficient_gauge);
     let active_factor = match gauge {
         Some(gauge) => reduced_factor(gauge, &factorized.factor)?,
         None => factorized.factor.clone(),
     };
-    let posterior = fit
-        .geometry
-        .as_ref()
-        .and_then(|geometry| geometry.constrained_posterior.as_ref())
-        .filter(|posterior| posterior.decline().is_none());
     let scale = fit.coefficient_covariance_scale()?;
     let backend = PredictionCovarianceBackend::from_factorized_hessian_scaled(
         SymmetricMatrix::Dense(hessian.clone()),
         scale,
     )
-    .and_then(|backend| {
-        backend.with_smoothing_correction(active_factor, |ambient| match posterior {
-            Some(posterior) => {
-                let marginal_times_constraints =
-                    ambient.apply_ambient_active(&posterior.constraints.a.t().to_owned())?;
-                constrained_posterior_correction(
-                    marginal_times_constraints.view(),
-                    posterior.unconstrained_center()?,
-                    &posterior.constraints,
-                )
-            }
-            None => Ok(None),
-        })
-    })
+    .and_then(|backend| backend.with_smoothing_correction(active_factor))
     .and_then(|backend| match gauge_lift {
         Some(lift) => backend.with_gauge_lift(lift),
         None => Ok(backend),
@@ -487,11 +493,67 @@ pub fn smoothing_corrected_factorized_backend<'a>(
     Ok(Some(backend))
 }
 
+/// A constrained fit's smoothing-corrected mixture (gam#3229) as a prediction
+/// backend that never forms a `p × p` covariance: each node precision
+/// `M̂ + Σ_k expm1(δ_k) R_kᵀR_k` is factored once and its truncation read
+/// through solves, the construction a factorized fit published its standard
+/// errors from, and the mixture applies `Σ_i w_i V_i·rhs + S·(Sᵀ·rhs)` with
+/// `S[:, i] = √w_i·(m_i − m̄)`. The cost is one factorization per node and one
+/// solve per node per application.
+fn smoothing_mixture_backend<'a>(
+    mixture: &gam_solve::constrained_posterior::SmoothingMixture,
+    hessian: &Array2<f64>,
+    posterior: &ConstrainedPosteriorGeometry,
+    gauge_lift: Option<ArrayView2<'a, f64>>,
+) -> Result<PredictionCovarianceBackend<'a>, String> {
+    struct NodeFactor(Box<dyn gam_linalg::matrix::FactorizedSystem>);
+    impl gam_solve::constrained_posterior::NodeSolve for NodeFactor {
+        fn solve(&self, rhs: &Array2<f64>) -> Result<Array2<f64>, String> {
+            gam_linalg::matrix::FactorizedSystem::solvemulti(&*self.0, rhs)
+        }
+    }
+    let dim = hessian.nrows();
+    let nodes = mixture.node_truncations(hessian.view(), &posterior.constraints, |index| {
+        let precision = mixture.node_precision(hessian.view(), index)?;
+        SymmetricMatrix::Dense(precision)
+            .factorize(gam_linalg::roundoff::SymmetricAssembly::penalized_gram(
+                0, dim,
+            ))
+            .map(NodeFactor)
+    })?;
+    let weight = 1.0 / nodes.len() as f64;
+    let mut mean = Array1::<f64>::zeros(dim);
+    for (_, truncation) in &nodes {
+        mean.scaled_add(weight, &truncation.mean);
+    }
+    let mut spread = Array2::<f64>::zeros((dim, nodes.len()));
+    for (column, (_, truncation)) in nodes.iter().enumerate() {
+        spread
+            .column_mut(column)
+            .assign(&((&truncation.mean - &mean) * weight.sqrt()));
+    }
+    let components = nodes
+        .into_iter()
+        .map(|(NodeFactor(factor), truncation)| {
+            PredictionCovarianceBackend::from_factor(
+                factor,
+                dim,
+                mixture.covariance_scale(),
+                truncation.correction,
+            )
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let backend = PredictionCovarianceBackend::mixture(components, spread)?;
+    match gauge_lift {
+        Some(lift) => backend.with_gauge_lift(lift),
+        None => Ok(backend),
+    }
+}
+
 /// Carry a square-root factor saved in the raw frame (`B_raw = T·B`, so that
 /// `B_raw·B_rawᵀ = T·(B·Bᵀ)·Tᵀ` is the gauge congruence every saved
 /// covariance-like matrix receives) back into the active frame:
-/// `B = T⁺·B_raw`, `T⁺ = (TᵀT)⁻¹Tᵀ`, exact because `T` has full column rank
-/// ([`reduced_bilinear_form`] for the factor).
+/// `B = T⁺·B_raw`, `T⁺ = (TᵀT)⁻¹Tᵀ`, exact because `T` has full column rank.
 fn reduced_factor(
     gauge: &gam_problem::gauge::Gauge,
     raw: &Array2<f64>,
@@ -1822,18 +1884,18 @@ fn constrained_ambient_covariance(
 }
 
 /// The inequality-truncated posterior law of a constrained fit under one
-/// covariance definition: the untruncated ambient covariance in the active
-/// coefficient frame, and the truncation moments that belong to it.
+/// covariance definition, as the equally weighted components it is a mixture
+/// of: each an untruncated ambient covariance in the active coefficient frame
+/// and the truncation moments that belong to it.
 ///
-/// The persisted [`ConstrainedPosteriorGeometry`] carries the moments of the
-/// CONDITIONAL law (its lift and mean shift are functions of `Vb`), so the
-/// smoothing-corrected law is not "the same moments with a wider matrix": it
-/// is re-derived from `Vp = Vb + J·Var(ρ̂)·Jᵀ` by the same construction the fit
-/// uses to publish its truncated `Vp` for `summary()` (#2784). The feasible
-/// set constrains β and says nothing about ρ, so the β-marginal of the
-/// truncated joint posterior is exactly the truncation of the β-marginal —
-/// the corrected ambient covariance defines a truncated law as well as the
-/// conditional one does.
+/// The conditional law is one component, the persisted geometry itself. The
+/// smoothing-corrected law is the θ-mixture the fit published (gam#3229): one
+/// component per node, read off the SAME
+/// [`gam_solve::constrained_posterior::SmoothingMixture`] whose covariance
+/// the fit reports as its smoothing-corrected covariance, so the interval and
+/// the standard error describe one posterior. The node laws are the
+/// truncations of their own ambient Gaussians at their own widths, by the
+/// construction the fit built them with.
 struct ConstrainedLaw<'a> {
     ambient: Array2<f64>,
     geometry: std::borrow::Cow<'a, ConstrainedPosteriorGeometry>,
@@ -1843,110 +1905,43 @@ fn constrained_law<'a>(
     fit: &UnifiedFitResult,
     geometry: &'a FitGeometry,
     mode: InferenceCovarianceMode,
-) -> Result<ConstrainedLaw<'a>, EstimationError> {
+) -> Result<Vec<ConstrainedLaw<'a>>, EstimationError> {
     let posterior = geometry.constrained_posterior.as_ref().ok_or_else(|| {
         EstimationError::InvalidInput(
             "constrained law requested without a persisted constrained posterior".to_string(),
         )
     })?;
-    let conditional = constrained_ambient_covariance(fit, geometry)?;
     match mode {
-        InferenceCovarianceMode::Conditional => Ok(ConstrainedLaw {
-            ambient: conditional,
+        InferenceCovarianceMode::Conditional => Ok(vec![ConstrainedLaw {
+            ambient: constrained_ambient_covariance(fit, geometry)?,
             geometry: std::borrow::Cow::Borrowed(posterior),
-        }),
+        }]),
         InferenceCovarianceMode::SmoothingCorrected => {
-            // The factorized branch keeps the correction as its factor `B`,
-            // `C = B·Bᵀ` (#3283); this law is dense in the active frame anyway.
-            let correction = match (fit.smoothing_correction(), fit.smoothing_correction_factorized()) {
-                (Some(correction), _) => reduced_bilinear_form(&geometry.coefficient_gauge, correction)?,
-                (None, Some(factorized)) => {
-                    let factor = reduced_factor(&geometry.coefficient_gauge, &factorized.factor)?;
-                    factor.dot(&factor.t())
-                }
-                (None, None) => {
-                    return Err(EstimationError::InvalidInput(
-                        match fit.smoothing_correction_absence() {
-                            Some(absence) => format!(
-                                "fit result does not contain smoothing-corrected covariance: \
-                                 {absence}"
-                            ),
-                            None => "fit result does not contain smoothing-corrected covariance"
-                                .to_string(),
-                        },
-                    ));
-                }
-            };
-            if correction.dim() != conditional.dim() {
-                return Err(EstimationError::InvalidInput(format!(
-                    "smoothing correction is {:?} against a {:?} constrained ambient covariance",
-                    correction.dim(),
-                    conditional.dim()
-                )));
-            }
-            let ambient = &conditional + &correction;
-            let center = posterior
-                .unconstrained_center()
+            let mixture = posterior.smoothing_mixture().ok_or_else(|| {
+                EstimationError::InvalidInput(match fit.smoothing_correction_absence() {
+                    Some(absence) => format!(
+                        "fit result does not contain a smoothing-corrected constrained law: \
+                         {absence}"
+                    ),
+                    None => "fit result does not contain a smoothing-corrected constrained law"
+                        .to_string(),
+                })
+            })?;
+            let active_dimension = geometry.coefficient_gauge.reduced_total();
+            mixture
+                .validate_for_dimension(active_dimension)
                 .map_err(EstimationError::InvalidInput)?;
-            let moments = constrained_posterior_correction_from_covariance(
-                &ambient,
-                center,
-                &posterior.constraints,
-            )
-            .map_err(EstimationError::InvalidInput)?;
-            Ok(ConstrainedLaw {
-                ambient,
-                geometry: std::borrow::Cow::Owned(ConstrainedPosteriorGeometry::with_moments(
-                    posterior.constraints.clone(),
-                    posterior.mode.clone(),
-                    center.clone(),
-                    moments,
-                )),
-            })
+            Ok(mixture
+                .node_laws(geometry.penalized_hessian.as_array().view(), posterior)
+                .map_err(EstimationError::InvalidInput)?
+                .into_iter()
+                .map(|(ambient, node)| ConstrainedLaw {
+                    ambient,
+                    geometry: std::borrow::Cow::Owned(node),
+                })
+                .collect())
         }
     }
-}
-
-/// Carry a coefficient-space bilinear form saved in the raw frame (`C_raw =
-/// T·C·Tᵀ`, the gauge congruence every saved covariance-like matrix
-/// receives) back into the active frame: `C = T⁺·C_raw·T⁺ᵀ` with `T⁺ =
-/// (TᵀT)⁻¹Tᵀ`, exact because `T` has full column rank. An identity gauge is
-/// the common case and costs nothing.
-fn reduced_bilinear_form(
-    gauge: &gam_problem::gauge::Gauge,
-    raw: &Array2<f64>,
-) -> Result<Array2<f64>, EstimationError> {
-    let (raw_total, reduced_total) = (gauge.raw_total(), gauge.reduced_total());
-    if raw.dim() != (raw_total, raw_total) {
-        return Err(EstimationError::InvalidInput(format!(
-            "raw-frame bilinear form is {:?} but the coefficient gauge lifts {raw_total} rows",
-            raw.dim()
-        )));
-    }
-    if gauge.is_identity() {
-        return Ok(raw.clone());
-    }
-    let t = &gauge.t_full;
-    let gram = t.t().dot(t);
-    let factor = gram.cholesky(Side::Lower).map_err(|error| {
-        EstimationError::InvalidInput(format!(
-            "coefficient gauge Gram matrix is not positive definite: {error:?}"
-        ))
-    })?;
-    // X = (TᵀT)⁻¹ · (Tᵀ C_raw T), column by column, then C = X · (TᵀT)⁻¹ = (M⁻¹ Xᵀ)ᵀ.
-    let projected = t.t().dot(raw).dot(t);
-    let mut half = Array2::<f64>::zeros((reduced_total, reduced_total));
-    for column in 0..reduced_total {
-        half.column_mut(column)
-            .assign(&factor.solvevec(&projected.column(column).to_owned()));
-    }
-    let mut reduced = Array2::<f64>::zeros((reduced_total, reduced_total));
-    for row in 0..reduced_total {
-        reduced
-            .row_mut(row)
-            .assign(&factor.solvevec(&half.row(row).to_owned()));
-    }
-    Ok(0.5 * (&reduced + &reduced.t()))
 }
 
 fn constrained_linear_predictor_intervals(
@@ -1981,13 +1976,19 @@ fn constrained_linear_predictor_intervals(
             design.nrows()
         )));
     }
-    let law = constrained_law(fit, geometry, covariance_mode)?;
-    // The projection law — including its certified orthant cubature — is a
-    // property of the fit, not of the row, so it is prepared once and every row
-    // reads it. Peak cubature storage is one node set, independent of the
-    // prediction batch, chunk size and worker count.
-    let projection_law = ConstrainedProjectionLaw::new(&law.ambient, &law.geometry)
+    let laws = constrained_law(fit, geometry, covariance_mode)?;
+    // The projection law — including each component's certified orthant
+    // cubature — is a property of the fit, not of the row, so it is prepared
+    // once and every row reads it. Peak cubature storage is one node set per
+    // component, independent of the prediction batch, chunk size and worker
+    // count.
+    let components = laws
+        .iter()
+        .map(|law| ConstrainedProjectionLaw::new(&law.ambient, &law.geometry))
+        .collect::<Result<Vec<_>, String>>()
         .map_err(EstimationError::InvalidInput)?;
+    let projection_law =
+        ConstrainedMixtureProjectionLaw::new(components).map_err(EstimationError::InvalidInput)?;
     let n_rows = design.nrows();
     let mut lower = Array1::<f64>::zeros(n_rows);
     let mut upper = Array1::<f64>::zeros(n_rows);
@@ -2920,9 +2921,9 @@ where
     let constrained_fit = source.constrained_fit_result();
     if constrained_fit.is_some() {
         // The truncated law is formed under the REQUESTED covariance definition
-        // by `constrained_law` (#2784): conditional from the persisted moments,
-        // smoothing-corrected by re-deriving them from `Vp`, exactly as the
-        // fit publishes its own truncated `Vp` for `summary()`.
+        // by `constrained_law`: conditional from the persisted moments,
+        // smoothing-corrected as the θ-mixture the fit publishes, the object
+        // whose covariance `summary()` reports (gam#3229).
         if options.extrapolation_variance.is_some() {
             return Err(EstimationError::InvalidInput(
                 "inequality-truncated credible intervals cannot combine the persisted posterior \
@@ -3382,7 +3383,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_solve::constrained_posterior::constrained_projection_equal_tailed_interval;
     use gam_math::probability::{normal_pdf, standard_normal_quantile};
     use gam_models::bms::LatentMeasureKind;
     use gam_models::inference::model::SavedLatentZNormalization;
@@ -3586,10 +3586,14 @@ mod tests {
         fit
     }
 
-    fn smoothing_corrected_half_normal_fit(ambient_variance: f64) -> UnifiedFitResult {
-        assert!(ambient_variance > 1.0);
+    /// The half-normal fit with its smoothing-corrected θ-mixture (gam#3229):
+    /// the precision `M̂ = 1` splits into data curvature `½` and a penalty drift
+    /// `D = ½`, the centre is on the wall, and `V_ρ = rho_variance`. Every node
+    /// is then a half-normal `|N(0, 1/(½ + ½e^δ))|`, and the fit publishes the
+    /// mixture's covariance as its smoothing-corrected covariance, exactly as a
+    /// constrained route does.
+    fn smoothing_corrected_half_normal_fit(rho_variance: f64) -> UnifiedFitResult {
         let mut fit = half_normal_constrained_fit();
-        let smoothing_correction = array![[ambient_variance - 1.0]];
         let constraints = fit
             .geometry
             .as_ref()
@@ -3597,23 +3601,45 @@ mod tests {
             .expect("constrained geometry")
             .constraints
             .clone();
-        let ambient = array![[ambient_variance]];
-        let marginal_correction =
-            gam_solve::constrained_posterior::constrained_posterior_correction_from_covariance(
-                &ambient,
-                &array![0.0],
-                &constraints,
-            )
-            .expect("smoothing-corrected truncation")
-            .expect("active smoothing-corrected half-space");
-        let published = marginal_correction
-            .truncated_covariance_psd(&ambient, &constraints)
-            .expect("published smoothing-corrected covariance");
-
+        let precision = array![[1.0]];
+        let roots =
+            [gam_solve::constrained_posterior::drift_root(&array![[0.5]])
+                .expect("a positive drift")];
+        let mixture = gam_solve::constrained_posterior::SmoothingMixture::build(
+            gam_solve::constrained_posterior::SmoothingMixtureInputs {
+                center: array![0.0].view(),
+                precision_center: array![0.0].view(),
+                covariance_scale: 1.0,
+                drift_roots: &roots,
+                rho_covariance: array![[rho_variance]].view(),
+                constraints: &constraints,
+            },
+            |weights| {
+                gam_solve::constrained_posterior::DenseNodePrecision::factor(
+                    precision.view(),
+                    &roots,
+                    weights,
+                )
+            },
+        )
+        .expect("the half-normal mixture builds");
+        let published = mixture
+            .covariance()
+            .expect("a dense route forms the covariance")
+            .clone();
+        // The first-order ambient correction the route also carries; the law is
+        // the mixture, and this matrix is never read as one.
+        let smoothing_correction = array![[0.0]];
+        fit.geometry
+            .as_mut()
+            .and_then(|geometry| geometry.constrained_posterior.as_mut())
+            .expect("constrained geometry")
+            .set_smoothing_mixture(mixture)
+            .expect("the mixture fits its geometry");
         fit.log_lambdas = array![0.0];
         fit.lambdas = array![1.0];
         fit.blocks[0].lambdas = array![1.0];
-        fit.covariance_corrected = Some(published.clone());
+        fit.covariance_corrected = Some(published);
         fit.inference = Some(FitInference {
             edf_by_block: vec![0.0],
             penalty_block_trace: vec![0.0],
@@ -3648,153 +3674,135 @@ mod tests {
         fit
     }
 
+    /// `P(β ≤ x)` under the half-normal fit's smoothing-corrected mixture with
+    /// `V_ρ = rho_variance`, evaluated from the fixture's closed form rather
+    /// than from the mixture: the two nodes sit at `δ = ±√V_ρ`, where the
+    /// precision is `½ + ½e^δ`, and each node law is `|N(0, 1/(½ + ½e^δ))|`,
+    /// whose CDF is `2Φ(x/σ) − 1`.
+    fn half_normal_mixture_cdf(rho_variance: f64, x: f64) -> (f64, f64) {
+        [rho_variance.sqrt(), -rho_variance.sqrt()]
+            .into_iter()
+            .fold((0.0, 0.0), |acc, delta| {
+                let sd = (0.5 + 0.5 * delta.exp()).recip().sqrt();
+                let (cdf, density) = gam_math::probability::normal_cdf_and_pdf(x / sd);
+                (
+                    acc.0 + 0.5 * (2.0 * cdf - 1.0),
+                    acc.1 + 0.5 * 2.0 * density / sd,
+                )
+            })
+    }
+
     #[test]
     fn constrained_conditional_law_keeps_its_persisted_geometry() {
         let fit = half_normal_constrained_fit();
         let geometry = fit.geometry.as_ref().expect("fit geometry");
-        let law = constrained_law(&fit, geometry, InferenceCovarianceMode::Conditional)
+        let laws = constrained_law(&fit, geometry, InferenceCovarianceMode::Conditional)
             .expect("conditional constrained law");
-        assert_eq!(law.ambient, array![[1.0]]);
-        assert!(matches!(law.geometry, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(laws.len(), 1);
+        assert_eq!(laws[0].ambient, array![[1.0]]);
+        assert!(matches!(laws[0].geometry, std::borrow::Cow::Borrowed(_)));
     }
 
+    /// gam#3229: the smoothing-corrected law is the mixture the fit published,
+    /// one component per node, each the node's own ambient Gaussian truncated at
+    /// its own width: `N(0, 1/(½ + ½e^δ))` at `δ = ±√V_ρ` on the half-normal
+    /// fixture, to the roundings of a one-by-one factor and its solve.
     #[test]
-    fn constrained_smoothing_law_rebuilds_the_truncation_at_its_own_width() {
-        let fit = smoothing_corrected_half_normal_fit(4.0);
+    fn constrained_smoothing_law_is_the_published_mixture_3229() {
+        let rho_variance = 0.5_f64;
+        let fit = smoothing_corrected_half_normal_fit(rho_variance);
         let geometry = fit.geometry.as_ref().expect("fit geometry");
-        let law = constrained_law(
-            &fit,
-            geometry,
-            InferenceCovarianceMode::SmoothingCorrected,
-        )
-        .expect("smoothing-corrected constrained law");
-        assert_eq!(law.ambient, array![[4.0]]);
-        assert!(matches!(law.geometry, std::borrow::Cow::Owned(_)));
-
-        let (lower, upper) = constrained_projection_equal_tailed_interval(
-            &law.ambient,
-            &law.geometry,
-            &array![1.0],
-            0.95,
-        )
-        .expect("smoothing-corrected half-normal quantiles");
-        let expected_lower = 2.0 * standard_normal_quantile(0.5125).expect("lower quantile");
-        let expected_upper = 2.0 * standard_normal_quantile(0.9875).expect("upper quantile");
-        assert!((lower - expected_lower).abs() < 1e-12);
-        assert!((upper - expected_upper).abs() < 1e-12);
+        let laws = constrained_law(&fit, geometry, InferenceCovarianceMode::SmoothingCorrected)
+            .expect("smoothing-corrected constrained law");
+        assert_eq!(laws.len(), 2, "one resolved theta direction, two nodes");
+        for (law, delta) in laws.iter().zip([rho_variance.sqrt(), -rho_variance.sqrt()]) {
+            let expected = (0.5 + 0.5 * delta.exp()).recip();
+            let band = gam_linalg::roundoff::accumulation_band(8, expected);
+            assert!(
+                (law.ambient[[0, 0]] - expected).abs() <= band,
+                "delta={delta}: ambient {} against {expected}",
+                law.ambient[[0, 0]]
+            );
+            assert!(matches!(law.geometry, std::borrow::Cow::Owned(_)));
+        }
     }
 
-    /// #3283: the twin of [`smoothing_corrected_half_normal_fit`] whose
-    /// inference stayed factorized. It publishes no covariance: its standard
-    /// errors, the corrected ones beside them, and the correction as its
-    /// square-root factor `B`, `B·Bᵀ = C`.
-    fn factorized_smoothing_corrected_half_normal_fit(
-        ambient_variance: f64,
-        factor: f64,
-    ) -> UnifiedFitResult {
-        let mut fit = smoothing_corrected_half_normal_fit(ambient_variance);
-        let conditional = fit.beta_standard_errors().expect("conditional standard errors");
-        let corrected = fit
-            .beta_standard_errors_corrected()
-            .expect("smoothing-corrected standard errors");
-        fit.covariance_conditional = None;
-        fit.covariance_corrected = None;
-        let inference = fit.inference.as_mut().expect("fit inference");
+    /// gam#3283 and gam#3229: a fit whose inference stayed factorized applies
+    /// `Vp = Vb + B·Bᵀ` when it is unconstrained, and its constrained twin
+    /// applies the θ-mixture it carries, through one factored node precision
+    /// per node, with no `p × p` covariance formed. The constrained backend's
+    /// variance is the mixture's published diagonal, the two differing only in
+    /// how one node's truncated variance is assembled (a sum of Grams against a
+    /// subtraction), eight roundings on its ambient scale.
+    #[test]
+    fn a_factorized_fit_applies_the_corrected_law_it_carries_3229() {
+        let rho_variance = 0.5_f64;
+        let dense = smoothing_corrected_half_normal_fit(rho_variance);
+        let published = dense
+            .beta_covariance_corrected()
+            .expect("the dense mixture covariance")[[0, 0]];
+        let mut factorized = dense.clone();
+        let conditional = factorized
+            .beta_standard_errors()
+            .expect("conditional standard errors");
+        factorized.covariance_conditional = None;
+        factorized.covariance_corrected = None;
+        let inference = factorized.inference.as_mut().expect("fit inference");
         inference.smoothing_correction = None;
         inference.smoothing_correction_first_order = None;
         inference.smoothing_correction_method_first_order = None;
         inference.factorized_standard_errors = Some(conditional);
+        // `B = 3/4`: the first-order factor the route carries beside the
+        // mixture, which the constrained law never reads.
         inference.smoothing_correction_factorized =
             Some(gam_solve::model_types::FactorizedSmoothingCorrection {
-                factor: array![[factor]],
-                standard_errors: corrected,
+                factor: array![[0.75]],
+                standard_errors: array![published.sqrt()],
             });
-        fit
-    }
-
-    /// #3283: a fit whose inference stayed factorized applies the
-    /// smoothing-corrected law it published, `Vp = Vb + B·Bᵀ` truncated at its
-    /// own lift, not a refusal and not the conditional law.
-    ///
-    /// `B = 3/4`, `C = B·Bᵀ = 9/16`, `Vb = H⁻¹ = 1` and `W = Vp = 25/16` are
-    /// exact in binary, and so are `√W = 5/4` and the lift `G = W/(√W·√W) = 1`.
-    /// Both routes hand the same ambient `Vp·Aᵀ = W` to the same moment
-    /// computation and read the same `Δ`, and differ only in how the truncated
-    /// variance is assembled. The factorized backend forms `W − G·Δ·G`, one
-    /// rounded subtraction `C = fl(W − Δ)`. The published dense matrix
-    /// (`truncated_covariance_psd`) forms `(P·√W)² + (G·√C)²` with
-    /// `P = 1 − G = 0` exactly, from the same `C`, so it adds one correctly
-    /// rounded square root and one correctly rounded square,
-    /// `C·(1 + 2δ₁ + δ₂)` with `|δ| ≤ ε/2`: at most `1.5·ε` relative, inside the
-    /// `2·ε` bar below.
-    #[test]
-    fn a_factorized_fit_applies_the_smoothing_corrected_law_it_published_3283() {
-        let dense = smoothing_corrected_half_normal_fit(1.5625);
-        let factorized = factorized_smoothing_corrected_half_normal_fit(1.5625, 0.75);
-        assert_eq!(
-            factorized.published_covariance_mode(),
-            InferenceCovarianceMode::SmoothingCorrected,
-            "the factorized fit publishes the corrected definition it carries"
-        );
         let eye = Array2::<f64>::eye(1);
-        let (dense_backend, _) = selected_uncertainty_backend(
-            &dense,
-            1,
-            InferenceCovarianceMode::SmoothingCorrected,
-            "3283 dense",
-        )
-        .expect("the dense fit's corrected backend");
-        let (factorized_backend, source) = selected_uncertainty_backend(
+        let (backend, source) = selected_uncertainty_backend(
             &factorized,
             1,
             InferenceCovarianceMode::SmoothingCorrected,
-            "3283 factorized",
+            "3229 factorized constrained",
         )
-        .expect("the factorized fit's corrected backend");
+        .expect("the factorized fit serves its mixture");
         assert_eq!(source, InferenceCovarianceMode::SmoothingCorrected);
-        let published = dense_backend.apply_columns(&eye).expect("dense Vp")[[0, 0]];
-        let applied = factorized_backend
-            .apply_columns(&eye)
-            .expect("factorized Vp")[[0, 0]];
+        let applied = backend.apply_columns(&eye).expect("the mixture's Vp")[[0, 0]];
+        let scale = (0.5 + 0.5 * (-rho_variance.sqrt()).exp()).recip();
+        let band = gam_linalg::roundoff::accumulation_band(8, scale);
         assert!(
-            (applied - published).abs() <= 2.0 * f64::EPSILON * published,
-            "the factorized law's truncated Vp is {applied:.17e}; the published dense Vp is \
-             {published:.17e}"
+            (applied - published).abs() <= band,
+            "the factorized mixture applies {applied:.17e}; the dense mixture published \
+             {published:.17e} (band {band:e})"
         );
-        let corrected = factorized
-            .beta_standard_errors_corrected()
-            .expect("corrected standard errors")[0];
-        assert_eq!(corrected, published.sqrt(), "the fit's corrected standard error");
 
-        // The dense constrained law rebuilds its ambient `Vb + B·Bᵀ` from the
-        // factor exactly.
-        let geometry = factorized.geometry.as_ref().expect("fit geometry");
-        let law = constrained_law(
-            &factorized,
-            geometry,
-            InferenceCovarianceMode::SmoothingCorrected,
-        )
-        .expect("the factorized fit's smoothing-corrected constrained law");
-        assert_eq!(law.ambient, array![[1.5625]]);
-
-        // Without constraints the backend is `Vb + B·Bᵀ`, exact here.
+        // Without constraints the backend is `Vb + B·Bᵀ = 1 + 9/16`, exact.
         let mut unconstrained = factorized.clone();
         if let Some(geometry) = unconstrained.geometry.as_mut() {
             geometry.constrained_posterior = None;
         }
-        let (backend, _) = selected_uncertainty_backend(
+        let (backend, source) = selected_uncertainty_backend(
             &unconstrained,
             1,
             InferenceCovarianceMode::SmoothingCorrected,
             "3283 unconstrained",
         )
         .expect("the unconstrained factorized corrected backend");
+        assert_eq!(source, InferenceCovarianceMode::SmoothingCorrected);
         assert_eq!(backend.apply_columns(&eye).expect("Vp")[[0, 0]], 1.5625);
     }
 
+    /// gam#3229, restated from the pin that fixed the ambient reading: the
+    /// published constrained prediction reads the covariance definition the fit
+    /// publishes, and under it the standard error is the root of the published
+    /// mixture covariance and the interval is the mixture law's equal-tailed
+    /// interval. The endpoints are checked against the mixture's CDF evaluated
+    /// directly from the nodes' half-normals, to the `√ε·spread` resolution the
+    /// quantile is settled at.
     #[test]
     fn constrained_default_uses_the_covariance_definition_the_fit_publishes() {
-        let fit = smoothing_corrected_half_normal_fit(4.0);
+        let fit = smoothing_corrected_half_normal_fit(0.5);
         let published = fit.published_covariance_mode();
         assert_eq!(published, InferenceCovarianceMode::SmoothingCorrected);
         let options = PredictUncertaintyOptions {
@@ -3812,17 +3820,55 @@ mod tests {
             &options,
         )
         .expect("published constrained prediction interval");
-        let expected_lower = 2.0 * standard_normal_quantile(0.5125).expect("lower quantile");
-        let expected_upper = 2.0 * standard_normal_quantile(0.9875).expect("upper quantile");
-        let expected_standard_error =
-            2.0 * (1.0 - 2.0 / std::f64::consts::PI).sqrt();
         assert_eq!(
             result.covariance_source,
             InferenceCovarianceMode::SmoothingCorrected
         );
-        assert!((result.eta_lower[0] - expected_lower).abs() < 1e-12);
-        assert!((result.eta_upper[0] - expected_upper).abs() < 1e-12);
-        assert!((result.eta_standard_error[0] - expected_standard_error).abs() < 1e-12);
+        let variance = fit
+            .beta_covariance_corrected()
+            .expect("the published mixture covariance")[[0, 0]];
+        assert_eq!(result.eta_standard_error[0], variance.sqrt());
+        let spread = variance.sqrt();
+        // Each node's ambient variance and unconstrained centre, the two facts the
+        // half-normal model below assumes (`1/(½ + ½e^δ)` and the wall).
+        let geometry = fit.geometry.as_ref().expect("fit geometry");
+        let nodes: Vec<String> =
+            constrained_law(&fit, geometry, InferenceCovarianceMode::SmoothingCorrected)
+                .expect("smoothing-corrected constrained law")
+                .iter()
+                .map(|law| {
+                    let center = law
+                        .geometry
+                        .unconstrained_center()
+                        .map_or(f64::NAN, |center| center[0]);
+                    format!(
+                        "(ambient {}, centre {center}, posterior mean {:?}, correction {:?})",
+                        law.ambient[[0, 0]],
+                        law.geometry.posterior_mean(),
+                        law.geometry.correction()
+                    )
+                })
+                .collect();
+        for (endpoint, probability) in [(result.eta_lower[0], 0.025), (result.eta_upper[0], 0.975)]
+        {
+            let (cdf, density) = half_normal_mixture_cdf(0.5, endpoint);
+            // The quantile is settled to `√ε·spread` in value, `density·√ε·spread`
+            // in probability, beside the few roundings of each node's CDF.
+            let bar = density * f64::EPSILON.sqrt() * spread
+                + gam_linalg::roundoff::accumulation_band(8, 1.0);
+            assert!(
+                (cdf - probability).abs() <= bar,
+                "endpoint {endpoint}: mixture CDF {cdf} against {probability} (bar {bar:e}); \
+                 nodes (ambient variance, centre) {nodes:?}"
+            );
+        }
+        // The conditional law is one half-normal; the mixture's interval is not
+        // its interval, which is what makes this pin decide the definition.
+        let conditional_upper = standard_normal_quantile(0.9875).expect("upper quantile");
+        assert!(
+            (result.eta_upper[0] - conditional_upper).abs() > spread * f64::EPSILON.sqrt(),
+            "the corrected interval reads the conditional law"
+        );
     }
 
     #[test]
@@ -5189,7 +5235,7 @@ mod tests {
         use gam_solve::constrained_posterior::{
             ConePosteriorMomentDecline, ConePropernessEvidence, ConstrainedPosteriorGeometry,
         };
-        let mut fit = smoothing_corrected_half_normal_fit(4.0);
+        let mut fit = smoothing_corrected_half_normal_fit(0.5);
         let (control, source) = selected_uncertainty_backend(
             &fit,
             1,

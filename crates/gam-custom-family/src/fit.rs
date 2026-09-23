@@ -4029,6 +4029,42 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         }
         (None, _) => (None, None),
     };
+    // gam#3229: a constrained posterior publishes the θ-mixture of its truncated node laws as
+    // its smoothing-corrected posterior, over the same `V_ρ` the first-order `C` above was
+    // minted from; `C` stays the channel the corrected-EDF reads.
+    let (smoothing_corrected, smoothing_correction_absence) =
+        match (smoothing_corrected, certified_outer.final_hessian()) {
+            (Some(corrected), Some(outer_hessian)) => {
+                let certificate = certified_outer.criterion_certificate();
+                let mut excluded: Vec<usize> = certificate.lambdas_railed.clone();
+                for rail in certificate.stationarity.rails() {
+                    if !excluded.contains(&rail.index) {
+                        excluded.push(rail.index);
+                    }
+                }
+                let no_gradient = Array1::<f64>::zeros(0);
+                let drifts = crate::covariance::outer_precision_drifts(
+                    specs,
+                    &rho_star,
+                    &label_layout.physical_to_outer,
+                    &label_layout.joint_specs,
+                    &label_layout.joint_to_outer,
+                    geometry.penalized_hessian.as_array().nrows(),
+                )?;
+                match crate::covariance::attach_constrained_smoothing_mixture(
+                    &mut geometry,
+                    &drifts,
+                    outer_hessian,
+                    certified_outer.final_gradient().unwrap_or(&no_gradient),
+                    &excluded,
+                    0,
+                )? {
+                    None => (Some(corrected), None),
+                    Some(absence) => (None, Some(absence)),
+                }
+            }
+            (corrected, _) => (corrected, smoothing_correction_absence),
+        };
     install_reported_posterior_mean(
         family,
         specs,
@@ -4637,6 +4673,46 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
             }
         }
         _ => (None, None),
+    };
+    // gam#3229: a constrained posterior publishes the θ-mixture of its truncated node laws as
+    // its smoothing-corrected posterior, over the same `V_ρ` the first-order `C` above was
+    // minted from; `C` stays the channel the corrected-EDF reads.
+    let (smoothing_corrected, smoothing_correction_absence) = match (
+        smoothing_corrected,
+        certified_outer.and_then(|outer| outer.final_hessian()),
+    ) {
+        (Some(corrected), Some(outer_hessian)) => {
+            let outer = certified_outer.ok_or_else(|| CustomFamilyError::Optimization {
+                context: "fit_custom_family_fixed_log_lambdas_from_owned_mode smoothing mixture",
+                reason: "a certified outer Hessian was read without its certified outer optimum"
+                    .to_string(),
+            })?;
+            let certificate = outer.criterion_certificate();
+            let mut excluded: Vec<usize> = certificate.lambdas_railed.clone();
+            for rail in certificate.stationarity.rails() {
+                if !excluded.contains(&rail.index) {
+                    excluded.push(rail.index);
+                }
+            }
+            let no_gradient = Array1::<f64>::zeros(0);
+            let drifts = crate::covariance::penalty_precision_drifts(
+                specs,
+                &rho,
+                geometry.penalized_hessian.as_array().nrows(),
+            )?;
+            match crate::covariance::attach_constrained_smoothing_mixture(
+                &mut geometry,
+                &drifts,
+                outer_hessian,
+                outer.final_gradient().unwrap_or(&no_gradient),
+                &excluded,
+                hyper_values.len(),
+            )? {
+                None => (Some(corrected), None),
+                Some(absence) => (None, Some(absence)),
+            }
+        }
+        (corrected, _) => (corrected, smoothing_correction_absence),
     };
     install_reported_posterior_mean(
         family,

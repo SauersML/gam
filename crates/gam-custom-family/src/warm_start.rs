@@ -655,7 +655,12 @@ fn require_converged_outer_for_assembly(outer_converged: bool) -> Result<(), Cus
     })
 }
 
-/// Assemble the first-order corrected covariance `V_c = V_cond + C` (#2346).
+/// Assemble the corrected covariance: `V_c = V_cond + C` (#2346), or, for a
+/// constrained fit whose geometry carries its smoothing-corrected θ-mixture,
+/// that mixture's covariance (gam#3229). At a constrained mode `V_cond + C` is
+/// not the covariance of any law this fit defines — the predictor reads the
+/// mixture — so the mixture's own covariance is what is published, and `C`
+/// stays the first-order channel the corrected-EDF reads.
 ///
 /// Its diagonal goes through `gam_problem::se_from_covariance`, the gate the
 /// published standard errors are derived under (gam#2955), rather than a local
@@ -666,12 +671,13 @@ fn require_converged_outer_for_assembly(outer_converged: bool) -> Result<(), Cus
 /// is legitimate only inside the dimension-scaled backward-error bound, which is
 /// exactly the judgement `se_from_covariance` owns. Refusing here names the
 /// custom-family lane in the error, before the fit is minted.
-fn corrected_covariance(
+pub(crate) fn corrected_covariance(
     smoothing_corrected: Option<&(
         Array2<f64>,
         gam_solve::model_types::SmoothingCorrectionMethod,
     )>,
     covariance_conditional: Option<&Array2<f64>>,
+    mixture_covariance: Option<Array2<f64>>,
 ) -> Result<
     (
         Option<Array2<f64>>,
@@ -687,7 +693,20 @@ fn corrected_covariance(
     if correction.dim() != v_cond.dim() {
         return Ok((None, None, None));
     }
-    let corrected = v_cond + correction;
+    let corrected = match mixture_covariance {
+        Some(mixture) if mixture.dim() == v_cond.dim() => mixture,
+        Some(mixture) => {
+            return Err(CustomFamilyError::NumericalFailure {
+                reason: format!(
+                    "the constrained smoothing mixture is {:?} against a {:?} conditional \
+                     covariance",
+                    mixture.dim(),
+                    v_cond.dim()
+                ),
+            });
+        }
+        None => v_cond + correction,
+    };
     gam_problem::se_from_covariance(&corrected).map_err(|reason| {
         CustomFamilyError::NumericalFailure {
             reason: format!(
@@ -717,6 +736,7 @@ mod corrected_covariance_tests {
         let (_, _, corrected) = corrected_covariance(
             Some(&(correction, first_order_method())),
             Some(&v_cond),
+            None,
         )
         .expect("a positive-definite corrected covariance must be accepted");
         let corrected = corrected.expect("corrected covariance is published");
@@ -740,6 +760,7 @@ mod corrected_covariance_tests {
         let error = corrected_covariance(
             Some(&(correction, first_order_method())),
             Some(&v_cond),
+            None,
         )
         .expect_err("a materially negative corrected diagonal must be refused");
         assert!(matches!(
@@ -756,6 +777,7 @@ mod corrected_covariance_tests {
         let (correction_out, method, corrected) = corrected_covariance(
             Some(&(correction, first_order_method())),
             Some(&v_cond),
+            None,
         )
         .expect("a mismatched correction is a typed absence, not a failure");
         assert!(correction_out.is_none());
@@ -1135,6 +1157,22 @@ pub fn blockwise_fit_from_parts(
         corrected_covariance(
             smoothing_corrected.as_ref(),
             covariance_conditional.as_ref(),
+            // The mixture lives in the geometry's active frame, and the covariances
+            // this lane publishes are lifted to the raw frame by its gauge.
+            geom.constrained_posterior
+                .as_ref()
+                .and_then(|posterior| posterior.smoothing_mixture())
+                .map(|mixture| {
+                    mixture
+                        .covariance()
+                        .map(|covariance| geom.coefficient_gauge.lift_covariance(covariance))
+                        .ok_or_else(|| CustomFamilyError::NumericalFailure {
+                            reason: "the constrained smoothing mixture of a dense lane carries \
+                                     no dense covariance"
+                                .to_string(),
+                        })
+                })
+                .transpose()?,
         )?;
     // The published standard errors derive from the top-level covariance, the
     // one store (gam#2955), so `display_coefficient_uncertainty()` (#2296) sees

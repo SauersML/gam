@@ -161,6 +161,11 @@ pub use cone_normalizer::{
     ConeCoordinateMotion, ConeDriftWeight, ConeFirstOrder, ConeNormalizer, ConeNormalizerRefusal,
     ConePairMotion, OrthantLogMass,
 };
+mod smoothing_mixture;
+pub use smoothing_mixture::{
+    ConstrainedMixtureProjectionLaw, DenseNodePrecision, NodePrecision, NodeSolve,
+    NodeTruncation, SmoothingMixture, SmoothingMixtureInputs, drift_root,
+};
 mod cone_laplace;
 pub use cone_laplace::{
     ConeLaplace, ConeLaplaceFirstOrder, ConeLaplaceMotion, ConeLaplacePairMotion, ConeLaplaceRefusal,
@@ -740,9 +745,42 @@ pub struct ConstrainedPosteriorGeometry {
     /// `None` when no mean was published and on geometry saved before it existed.
     #[serde(default)]
     pub mode_log_likelihood: Option<f64>,
+    /// The smoothing-corrected posterior of this constrained fit: the θ-mixture
+    /// of its node laws (gam#3229, payload v41). The fit's smoothing-corrected
+    /// covariance is this mixture's covariance and a predictor's
+    /// smoothing-corrected law is this mixture, so the two are one object.
+    /// `None` when the fit selected no smoothing coordinate, when its moments
+    /// are not the ambient truncation this mixture is built on, or when the
+    /// correction is absent for a typed reason.
+    #[serde(default)]
+    smoothing_mixture: Option<SmoothingMixture>,
 }
 
 impl ConstrainedPosteriorGeometry {
+    /// The smoothing-corrected θ-mixture this fit publishes, if any (gam#3229).
+    pub fn smoothing_mixture(&self) -> Option<&SmoothingMixture> {
+        self.smoothing_mixture.as_ref()
+    }
+
+    /// Attach the smoothing-corrected θ-mixture. Only a law with ambient moments
+    /// has one: a declined or boundary-mode posterior is not a truncation of an
+    /// ambient Gaussian, so it cannot carry a mixture of such truncations.
+    pub fn set_smoothing_mixture(&mut self, mixture: SmoothingMixture) -> Result<(), String> {
+        if !matches!(
+            self.moment_status,
+            ConstrainedPosteriorMomentStatus::Available
+        ) {
+            return Err(
+                "a smoothing mixture is a mixture of ambient truncations, and this constrained \
+                 posterior has no ambient moments"
+                    .to_string(),
+            );
+        }
+        mixture.validate_for_dimension(self.mode.len())?;
+        self.smoothing_mixture = Some(mixture);
+        Ok(())
+    }
+
     pub fn with_moments(
         constraints: LinearInequalityConstraints,
         mode: Array1<f64>,
@@ -756,6 +794,7 @@ impl ConstrainedPosteriorGeometry {
             correction,
             moment_status: ConstrainedPosteriorMomentStatus::Available,
             mode_log_likelihood: None,
+            smoothing_mixture: None,
         }
     }
 
@@ -771,6 +810,7 @@ impl ConstrainedPosteriorGeometry {
             correction: None,
             moment_status: ConstrainedPosteriorMomentStatus::Declined(decline),
             mode_log_likelihood: None,
+            smoothing_mixture: None,
         }
     }
 
@@ -793,6 +833,7 @@ impl ConstrainedPosteriorGeometry {
                 approximation,
             },
             mode_log_likelihood: None,
+            smoothing_mixture: None,
         }
     }
 
@@ -1008,6 +1049,18 @@ impl ConstrainedPosteriorGeometry {
                 ));
             }
         }
+        if let Some(mixture) = self.smoothing_mixture.as_ref() {
+            if !matches!(
+                self.moment_status,
+                ConstrainedPosteriorMomentStatus::Available
+            ) {
+                return Err(
+                    "a constrained posterior without ambient moments carries a smoothing mixture"
+                        .to_string(),
+                );
+            }
+            mixture.validate_for_dimension(dimension)?;
+        }
         Ok(())
     }
 }
@@ -1184,15 +1237,41 @@ impl<'a> ConstrainedProjectionLaw<'a> {
         let normal_component_variance =
             projection_lift.dot(&truncation.normal_covariance.dot(&projection_lift));
         let residual_variance = ambient_variance - normal_component_variance;
-        let residual_floor =
-            (p.max(q).max(1) as f64) * f64::EPSILON * ambient_variance.max(normal_component_variance);
+        // Both variances are rounded quadratic forms of one quantity. `cᵀ(Σc)` is two
+        // `p`-term inner products, within `γ_{2p}·|c|ᵀ|Σ||c|`; `lᵀ(Wl)` is two `q`-term
+        // ones on a lift `l = Gᵀc` that is itself a `p`-term inner product per entry,
+        // whose rounding enters the square twice, within `γ_{2q + 2p}·|l|ᵀ|W||l|`. A
+        // contrast carried entirely by the retained normals differs by no more than
+        // that, and the gam#3229 fixture measured such a lift at `1 − ulp` with a
+        // residual `1.5e-16` against the former `p·ε·max = 1.47e-16` floor, which
+        // sent an exact half-normal node through the orthant cubature.
+        let abs_ambient = {
+            let abs_contrast = contrast.mapv(f64::abs);
+            abs_contrast.dot(&self.ambient_covariance.mapv(f64::abs).dot(&abs_contrast))
+        };
+        let abs_normal = {
+            let abs_lift = projection_lift.mapv(f64::abs);
+            abs_lift.dot(&truncation.normal_covariance.mapv(f64::abs).dot(&abs_lift))
+        };
+        let residual_floor = gam_linalg::roundoff::accumulation_growth(2 * p) * abs_ambient
+            + gam_linalg::roundoff::accumulation_growth(2 * q + 2 * p) * abs_normal;
         if residual_variance < -residual_floor || !residual_variance.is_finite() {
             return Err(format!(
                 "constrained projection decomposition produced residual variance \
                  {residual_variance:.6e} from ambient {ambient_variance:.6e}"
             ));
         }
-        let residual_variance = residual_variance.max(0.0);
+        // The residual is a difference of two roundings of one variance, known
+        // only to `residual_floor` on EITHER side of zero. A contrast carried
+        // entirely by the retained normals can land a few ulps above zero (a
+        // one-row lift `σ²/√σ²/√σ²` rounds to `1 − ulp` at some `σ²`), and a
+        // positive roundoff residual would send its exact closed-form law
+        // through the certified orthant nodes instead (#3229).
+        let residual_variance = if residual_variance <= residual_floor {
+            0.0
+        } else {
+            residual_variance
+        };
         let posterior_mean = ambient_mean + projection_lift.dot(&correction.normal_mean_shift);
         Ok(ProjectionDecomposition {
             ambient_mean,
@@ -4458,6 +4537,7 @@ mod tests {
             correction: Some(correction),
             moment_status: ConstrainedPosteriorMomentStatus::Available,
             mode_log_likelihood: None,
+            smoothing_mixture: None,
         };
         let (lower, upper) = constrained_projection_equal_tailed_interval(
             &covariance,
@@ -4514,6 +4594,7 @@ mod tests {
                 correction: Some(correction),
                 moment_status: ConstrainedPosteriorMomentStatus::Available,
                 mode_log_likelihood: None,
+                smoothing_mixture: None,
             };
             let (lower, upper) = constrained_projection_equal_tailed_interval(
                 &covariance,
@@ -4598,6 +4679,7 @@ mod tests {
             correction: Some(correction),
             moment_status: ConstrainedPosteriorMomentStatus::Available,
             mode_log_likelihood: None,
+            smoothing_mixture: None,
         };
         let contrasts = array![
             [1.0, 0.0, 0.0],
@@ -6006,6 +6088,7 @@ mod tests {
             correction: Some(correction),
             moment_status: ConstrainedPosteriorMomentStatus::Available,
             mode_log_likelihood: None,
+            smoothing_mixture: None,
         };
         let (low, high) = constrained_projection_equal_tailed_interval(
             &covariance,

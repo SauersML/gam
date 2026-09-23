@@ -11,11 +11,10 @@
 //! the ρ-marginal one. Along a coordinate the constraint pins, `(GΔGᵀ)_ii`
 //! cancels `Σ_ii` to the last digit, so the residue `(Vp − Σ)_ii` — a
 //! second-order, legitimately sign-indefinite increment — becomes the entire
-//! published variance and can be negative. The feasible set constrains β and
-//! not ρ, so `1_C(β)` factors out of the ρ-integral and the β-marginal of the
-//! truncated joint posterior IS the truncation of the β-marginal of the
-//! untruncated one: the truncation belongs on `Vp`, with its own lift and its
-//! own orthant moments.
+//! published variance and can be negative. The repair first truncated `Vp` at
+//! its own lift; gam#3229 then replaced that with the θ-mixture of truncated
+//! node laws (`crate::constrained_posterior::SmoothingMixture`), each node
+//! truncated at its own width in the sum-of-Grams form pinned below.
 //!
 //! **(2) The subtraction itself has no digits left on a pinned coordinate.**
 //! `Σ − GΔGᵀ` is a cancellation whose residue carries a sign. `Δ` is a cubature
@@ -226,13 +225,15 @@ fn marginal_covariance_truncated_at_itself_is_a_valid_covariance_2705() {
 }
 
 /// A geometry whose moments were DECLINED never truncated the conditional
-/// covariance, so the marginal one must be published untruncated too — the two
-/// estimands stay consistent about whether the constraint was representable.
+/// covariance, and it cannot carry the smoothing-corrected θ-mixture either
+/// (gam#3229): the mixture is a mixture of ambient truncations, and a declined
+/// posterior has no ambient law to truncate. The optimizer then publishes the
+/// marginal untruncated, as the conditional covariance is.
 #[test]
-fn declined_moments_leave_the_marginal_covariance_untouched_2705() {
-    let conditional = conditional_covariance();
-    let geometry = ConstrainedPosteriorGeometry::with_decline(
-        pinning_constraints(),
+fn a_declined_geometry_carries_no_smoothing_mixture_3229() {
+    let constraints = pinning_constraints();
+    let mut geometry = ConstrainedPosteriorGeometry::with_decline(
+        constraints.clone(),
         array![0.0_f64, 0.5],
         ConePosteriorMomentDecline {
             ambient_precision_failure: "probe: the ambient route declined".to_string(),
@@ -243,14 +244,31 @@ fn declined_moments_leave_the_marginal_covariance_untouched_2705() {
             boundary_approximation_refusal: None,
         },
     );
-
-    let marginal = &conditional + &smoothing_increment();
-    let mut published = marginal.clone();
-    super::optimizer::apply_marginal_constraint_truncation(&geometry, &mut published)
-        .expect("a declined geometry is not a structural error at this boundary")
-        .expect("a declined geometry is not a moment failure either");
-    assert_eq!(
-        published, marginal,
-        "a declined constrained posterior must leave the marginal covariance bit-identical"
-    );
+    let precision = array![[25.0_f64, 0.0], [0.0, 11.0]];
+    let center = array![0.1_f64, 0.5];
+    let precision_center = precision.dot(&center);
+    let roots = [array![[1.0_f64, 0.0]]];
+    let mixture = crate::constrained_posterior::SmoothingMixture::build(
+        crate::constrained_posterior::SmoothingMixtureInputs {
+            center: center.view(),
+            precision_center: precision_center.view(),
+            covariance_scale: 1.0,
+            drift_roots: &roots,
+            rho_covariance: array![[0.2_f64]].view(),
+            constraints: &constraints,
+        },
+        |weights| {
+            crate::constrained_posterior::DenseNodePrecision::factor(
+                precision.view(),
+                &roots,
+                weights,
+            )
+        },
+    )
+    .expect("a two-coefficient mixture builds");
+    let refusal = geometry
+        .set_smoothing_mixture(mixture)
+        .expect_err("a declined geometry has no ambient law to mix");
+    assert!(refusal.contains("no ambient moments"), "{refusal}");
+    assert!(geometry.smoothing_mixture().is_none());
 }

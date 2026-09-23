@@ -36,11 +36,71 @@ pub enum PredictionCovarianceBackend<'a> {
         /// covariance.
         gauge_lift: Option<ArrayView2<'a, f64>>,
     },
+    /// The smoothing-corrected law of a constrained fit whose inference stayed
+    /// factorized (gam#3229): the equally weighted mixture of its node laws,
+    /// each a factorized truncated backend, with the nodes' mean spread,
+    /// `V = Σ_i w_i V_i + S·Sᵀ`, `S[:, i] = √w_i·(m_i − m̄)`. A linear operator
+    /// like the other two, so every consumer of `apply_columns` reads it
+    /// unchanged; the cost is one solve per node per application.
+    Mixture {
+        components: Vec<PredictionCovarianceBackend<'a>>,
+        spread: Array2<f64>,
+    },
 }
 
 impl<'a> PredictionCovarianceBackend<'a> {
     pub fn from_dense(covariance: ArrayView2<'a, f64>) -> Self {
         Self::Dense(covariance)
+    }
+
+    /// A factorized backend from a precision the caller already factored:
+    /// `φ·M⁻¹` with the truncation `constrained_correction` removed (gam#3229,
+    /// one node of a smoothing mixture).
+    pub fn from_factor(
+        factor: Box<dyn FactorizedSystem>,
+        dim: usize,
+        phi: f64,
+        constrained_correction: Option<ConstrainedPosteriorCorrection>,
+    ) -> Result<Self, String> {
+        if !(phi.is_finite() && phi >= 0.0) {
+            return Err(format!(
+                "prediction precision backend requires a finite non-negative coefficient-covariance \
+                 scale, got {phi}"
+            ));
+        }
+        Ok(Self::Factorized {
+            factor,
+            dim,
+            phi_scale: phi,
+            constrained_correction: constrained_correction.map(Cow::Owned),
+            smoothing_factor: None,
+            gauge_lift: None,
+        })
+    }
+
+    /// The equally weighted mixture of `components` with the nodes' mean
+    /// spread `spread` (see [`Self::Mixture`]).
+    pub fn mixture(components: Vec<Self>, spread: Array2<f64>) -> Result<Self, String> {
+        if components.is_empty() || spread.ncols() != components.len() {
+            return Err(format!(
+                "a prediction covariance mixture needs one spread column per component, got {} \
+                 component(s) and {} column(s)",
+                components.len(),
+                spread.ncols()
+            ));
+        }
+        if let Some(index) = components
+            .iter()
+            .position(|component| component.nrows() != spread.nrows())
+        {
+            return Err(format!(
+                "prediction covariance mixture component {index} has {} rows against a {}-row \
+                 spread",
+                components[index].nrows(),
+                spread.nrows()
+            ));
+        }
+        Ok(Self::Mixture { components, spread })
     }
 
     /// Factorize the penalized Hessian and multiply the resulting `H^{-1} rhs`
@@ -108,15 +168,11 @@ impl<'a> PredictionCovarianceBackend<'a> {
     /// Carry a conditional factorized backend (built with no truncation) to
     /// the smoothing-corrected law `Vp = Vb + B·Bᵀ` of a fit whose inference
     /// stayed factorized (#3283). `smoothing_factor` is `B` on the backend's
-    /// active coordinates. `truncation` builds a constrained fit's lift at
-    /// `Vp` from `Vp·Aᵀ`, which this closure receives through
-    /// [`Self::apply_ambient_active`]: the corrected law is the truncation at
-    /// `Vp`'s own lift, as the fit publishes it, never `Vb`'s lift plus `B·Bᵀ`.
-    pub fn with_smoothing_correction(
-        self,
-        smoothing_factor: Array2<f64>,
-        truncation: impl FnOnce(&Self) -> Result<Option<ConstrainedPosteriorCorrection>, String>,
-    ) -> Result<Self, String> {
+    /// active coordinates. Only an unconstrained law takes it: a constrained
+    /// fit's corrected law is the θ-mixture of dense truncated node laws
+    /// (gam#3229), which no factorized backend represents, and its caller
+    /// refuses before reaching here.
+    pub fn with_smoothing_correction(self, smoothing_factor: Array2<f64>) -> Result<Self, String> {
         let Self::Factorized {
             factor,
             dim,
@@ -146,23 +202,14 @@ impl<'a> PredictionCovarianceBackend<'a> {
                 smoothing_factor.nrows()
             ));
         }
-        let mut corrected = Self::Factorized {
+        Ok(Self::Factorized {
             factor,
             dim,
             phi_scale,
             constrained_correction: None,
             smoothing_factor: Some(smoothing_factor),
             gauge_lift: None,
-        };
-        let marginal_correction = truncation(&corrected)?;
-        if let Self::Factorized {
-            constrained_correction,
-            ..
-        } = &mut corrected
-        {
-            *constrained_correction = marginal_correction.map(Cow::Owned);
-        }
-        Ok(corrected)
+        })
     }
 
     /// The untruncated ambient covariance this backend's law is built from,
@@ -198,6 +245,10 @@ impl<'a> PredictionCovarianceBackend<'a> {
                 }
                 Ok(solved)
             }
+            Self::Mixture { components, .. } => Err(format!(
+                "a mixture of {} truncated laws has no single ambient law",
+                components.len()
+            )),
         }
     }
 
@@ -235,6 +286,24 @@ impl<'a> PredictionCovarianceBackend<'a> {
                     gauge_lift: Some(lift),
                 })
             }
+            Self::Mixture { components, spread } => {
+                if lift.ncols() != spread.nrows() {
+                    return Err(format!(
+                        "the coefficient gauge lifts {} active coordinates but the mixture is \
+                         over {}",
+                        lift.ncols(),
+                        spread.nrows()
+                    ));
+                }
+                let components = components
+                    .into_iter()
+                    .map(|component| component.with_gauge_lift(lift))
+                    .collect::<Result<Vec<_>, String>>()?;
+                Ok(Self::Mixture {
+                    components,
+                    spread: lift.dot(&spread),
+                })
+            }
         }
     }
 
@@ -244,13 +313,14 @@ impl<'a> PredictionCovarianceBackend<'a> {
             Self::Factorized {
                 dim, gauge_lift, ..
             } => gauge_lift.as_ref().map_or(*dim, |lift| lift.nrows()),
+            Self::Mixture { spread, .. } => spread.nrows(),
         }
     }
 
     pub fn nrows(&self) -> usize {
         match self {
             Self::Dense(covariance) => covariance.nrows(),
-            Self::Factorized { .. } => self.parameter_dim(),
+            Self::Factorized { .. } | Self::Mixture { .. } => self.parameter_dim(),
         }
     }
 
@@ -294,6 +364,14 @@ impl<'a> PredictionCovarianceBackend<'a> {
                     Some(lift) => lift.dot(&solved),
                     None => solved,
                 })
+            }
+            Self::Mixture { components, spread } => {
+                let weight = 1.0 / components.len() as f64;
+                let mut applied = spread.dot(&spread.t().dot(rhs));
+                for component in components {
+                    applied.scaled_add(weight, &component.apply_columns(rhs)?);
+                }
+                Ok(applied)
             }
         }
     }

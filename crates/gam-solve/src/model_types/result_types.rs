@@ -3184,6 +3184,13 @@ pub enum SmoothingCorrectionAbsence {
     /// that owns the coefficient mode assembled no ψ scores `∂_ψ∇_β F`, so the mode response
     /// `∂β̂/∂ψ` that carries their uncertainty into the coefficients is unknown (#2677).
     FamilyHyperScoresUnrecorded { psi_dimension: usize },
+    /// A constrained fit's outer coordinates include `psi_dimension` design (ψ) axes. The
+    /// θ-mixture moves each node's precision by the penalties' exact `λ` dependence, and a ψ
+    /// axis's is the family's own second design derivative, which no family publishes (#3229).
+    ConstrainedMixtureOverDesignAxes { psi_dimension: usize },
+    /// A constrained fit whose posterior is not a truncation of an ambient Gaussian (a certified
+    /// boundary-mode law) has no node laws for the θ-mixture to be built from (#3229).
+    ConstrainedMixtureWithoutAmbientMoments,
 }
 
 /// Why a custom-family outer search declares no analytic ρ-Hessian.
@@ -3243,6 +3250,16 @@ impl std::fmt::Display for SmoothingCorrectionAbsence {
                 "the evaluation that owns the coefficient mode recorded no scores for its \
                  {psi_dimension} family hyperparameter(s), so their mode response is unknown"
             ),
+            Self::ConstrainedMixtureOverDesignAxes { psi_dimension } => write!(
+                f,
+                "the constrained smoothing-corrected mixture moves the precision along its \
+                 smoothing axes only, and this fit has {psi_dimension} design axis/axes"
+            ),
+            Self::ConstrainedMixtureWithoutAmbientMoments => write!(
+                f,
+                "the constrained posterior is a boundary-mode law, not a truncation of an \
+                 ambient Gaussian, so it has no node laws to mix"
+            ),
         }
     }
 }
@@ -3253,8 +3270,10 @@ impl std::fmt::Display for SmoothingCorrectionAbsence {
 /// publishes standard errors without a covariance (#2960). The correction `C = J·V_ρ·Jᵀ` is then
 /// kept as the square-root factor it is assembled from, `C = B·Bᵀ` with `B` of shape `p × r`
 /// (`r` the identified rank of `V_ρ`), so no `p × p` matrix is formed. A consumer applies
-/// `Vp·x = Vb·x + B·(Bᵀ·x)` through the Hessian factor; a constrained fit's corrected law is the
-/// truncation at `Vp`'s own lift, `Vp·Aᵀ = Vb·Aᵀ + B·(Bᵀ·Aᵀ)`, as the dense branch builds it.
+/// `Vp·x = Vb·x + B·(Bᵀ·x)` through the Hessian factor. A constrained fit's corrected law is
+/// instead the θ-mixture of its truncated node laws its geometry carries (#3229): there
+/// `standard_errors` are the mixture's, published through one factored node precision per node,
+/// and `B` is only the first-order factor the corrected-EDF reads, never an ambient inflation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FactorizedSmoothingCorrection {
     /// `B` in the frame of the published coefficients, `C = B·Bᵀ`.

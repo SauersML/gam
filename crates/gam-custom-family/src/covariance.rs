@@ -2420,47 +2420,217 @@ pub(crate) fn owned_mode_smoothing_correction(
 /// columns of `U` down in — block-major, then the block's own penalty order — so drift `o`
 /// and column `o` of `U` name the same coordinate, which is the invariant
 /// `first_order_smoothing_correction` indexes them by.
-fn penalty_precision_drifts(
+pub(crate) fn penalty_precision_drifts(
     specs: &[ParameterBlockSpec],
     rho: &Array1<f64>,
     p_total: usize,
 ) -> Result<Vec<Array2<f64>>, CustomFamilyError> {
-    let mut drifts = Vec::with_capacity(rho.len());
+    let slots: Vec<Option<usize>> = (0..rho.len()).map(Some).collect();
+    outer_precision_drifts(specs, rho, &slots, &[], &[], p_total)
+}
+
+/// The precision's drift along every outer coordinate `o`,
+/// `D_o = Σ_{slots tied to o} λ_slot S_slot`, in the stacked coefficient frame
+/// (gam#3229): the ρ-block of `Ṁ`, laid out as [`penalty_score_columns`] lays
+/// out `U`, with per-block penalties on their block slice and joint penalties
+/// on the full stacked space. Fixed (untied) slots carry no coordinate and no
+/// drift. An owned-mode fit ties physical slot `i` to outer `i`.
+pub(crate) fn outer_precision_drifts(
+    specs: &[ParameterBlockSpec],
+    rho_outer: &Array1<f64>,
+    physical_to_outer: &[Option<usize>],
+    joint_specs: &[gam_problem::JointPenaltySpec],
+    joint_to_outer: &[usize],
+    p_total: usize,
+) -> Result<Vec<Array2<f64>>, CustomFamilyError> {
+    let strength = |outer: usize, context: &str| -> Result<f64, CustomFamilyError> {
+        let value = rho_outer.get(outer).copied().ok_or_else(|| {
+            CustomFamilyError::trial_point(format!(
+                "covariance curvature drift: {context} is tied to outer coordinate {outer} past \
+                 {} coordinate(s)",
+                rho_outer.len()
+            ))
+        })?;
+        gam_problem::checked_exp_log_strength(value).map_err(|error| {
+            CustomFamilyError::trial_point(format!(
+                "covariance curvature drift: {context}: {error}"
+            ))
+        })
+    };
+    let mut drifts = vec![Array2::<f64>::zeros((p_total, p_total)); rho_outer.len()];
     let mut start = 0usize;
     let mut slot = 0usize;
     for spec in specs {
         let width = spec.design.ncols();
         for penalty in &spec.penalties {
-            if slot >= rho.len() {
-                return Err(CustomFamilyError::trial_point(format!(
-                    "covariance curvature drift: penalty slot {slot} past {} rho coordinate(s)",
-                    rho.len()
-                )));
-            }
-            let lambda = gam_problem::checked_exp_log_strength(rho[slot]).map_err(|error| {
-                CustomFamilyError::trial_point(format!(
-                    "covariance curvature drift: penalty slot {slot}: {error}"
-                ))
-            })?;
+            let outer = physical_to_outer.get(slot).copied().flatten();
+            let context = format!("penalty slot {slot}");
+            slot += 1;
+            let Some(outer) = outer else {
+                continue;
+            };
+            let lambda = strength(outer, &context)?;
             let block = penalty.to_dense();
             if block.dim() != (width, width) {
                 return Err(CustomFamilyError::trial_point(format!(
-                    "covariance curvature drift: penalty slot {slot} is {:?} for a {width}-column \
-                     block",
+                    "covariance curvature drift: {context} is {:?} for a {width}-column block",
                     block.dim()
                 )));
             }
-            let mut drift = Array2::<f64>::zeros((p_total, p_total));
-            drift
+            drifts[outer]
                 .slice_mut(ndarray::s![start..start + width, start..start + width])
-                .assign(&block);
-            drift *= lambda;
-            drifts.push(drift);
-            slot += 1;
+                .scaled_add(lambda, &block);
         }
         start += width;
     }
+    if start != p_total {
+        return Err(CustomFamilyError::trial_point(format!(
+            "covariance curvature drift: the blocks span {start} coefficient(s) of {p_total}"
+        )));
+    }
+    for (joint_index, spec) in joint_specs.iter().enumerate() {
+        let outer = joint_to_outer.get(joint_index).copied().ok_or_else(|| {
+            CustomFamilyError::trial_point(format!(
+                "covariance curvature drift: joint penalty {joint_index} has no outer coordinate"
+            ))
+        })?;
+        let lambda = strength(outer, &format!("joint penalty {joint_index}"))?;
+        if spec.matrix.dim() != (p_total, p_total) {
+            return Err(CustomFamilyError::trial_point(format!(
+                "covariance curvature drift: joint penalty {joint_index} is {:?} in a \
+                 {p_total}-coefficient frame",
+                spec.matrix.dim()
+            )));
+        }
+        drifts[outer].scaled_add(lambda, &spec.matrix);
+    }
     Ok(drifts)
+}
+
+/// Attach a constrained fit's smoothing-corrected θ-mixture to its geometry
+/// (gam#3229), or name why it has none: [`attach_smoothing_mixture`] on the
+/// geometry's constrained posterior, with the geometry's own penalized Hessian
+/// as the precision. A geometry with no constrained posterior has nothing to
+/// attach it to and is left alone.
+pub(crate) fn attach_constrained_smoothing_mixture(
+    geometry: &mut FitGeometry,
+    drifts: &[Array2<f64>],
+    outer_hessian: &Array2<f64>,
+    outer_gradient: &Array1<f64>,
+    excluded_outer: &[usize],
+    psi_dimension: usize,
+) -> Result<Option<gam_solve::model_types::SmoothingCorrectionAbsence>, CustomFamilyError> {
+    let precision = geometry.penalized_hessian.as_array().clone();
+    let Some(posterior) = geometry.constrained_posterior.as_mut() else {
+        return Ok(None);
+    };
+    attach_smoothing_mixture(
+        posterior,
+        &precision,
+        drifts,
+        outer_hessian,
+        outer_gradient,
+        excluded_outer,
+        psi_dimension,
+    )
+    .map_err(CustomFamilyError::trial_point)
+}
+
+/// Attach the smoothing-corrected θ-mixture to a constrained posterior
+/// (gam#3229), or name why it has none: the one mint every route that mints
+/// its first-order correction through [`first_order_smoothing_correction`]
+/// reads its constrained law from.
+///
+/// A posterior whose moments are the truncation of an ambient Gaussian
+/// publishes the mixture of those truncations over `V_ρ`'s nodes as its
+/// smoothing-corrected posterior: its covariance is the corrected covariance
+/// and a predictor reads its law. `precision` is the dense penalized Hessian
+/// the ambient covariance inverts, unscaled with unit dispersion; `drifts[o]`
+/// is the precision's drift along outer coordinate `o`, carried as its root;
+/// and `V_ρ` is the same identified-subspace inverse the first-order
+/// correction reads. Returns `Ok(None)` when the mixture is attached or the
+/// posterior was declined (a declined posterior publishes no covariance at
+/// all), and the typed absence otherwise: a boundary-mode law is not an ambient
+/// truncation, a design axis has no drift, and a refused `V_ρ` or a node whose
+/// moments fail leaves no mixture to publish. A malformed input is an error.
+pub fn attach_smoothing_mixture(
+    posterior: &mut gam_solve::constrained_posterior::ConstrainedPosteriorGeometry,
+    precision: &Array2<f64>,
+    drifts: &[Array2<f64>],
+    outer_hessian: &Array2<f64>,
+    outer_gradient: &Array1<f64>,
+    excluded_outer: &[usize],
+    psi_dimension: usize,
+) -> Result<Option<gam_solve::model_types::SmoothingCorrectionAbsence>, String> {
+    use gam_solve::constrained_posterior::{
+        ConstrainedPosteriorMomentStatus, DenseNodePrecision, SmoothingMixture,
+        SmoothingMixtureInputs, drift_root,
+    };
+    use gam_solve::model_types::SmoothingCorrectionAbsence;
+
+    match &posterior.moment_status {
+        ConstrainedPosteriorMomentStatus::Declined(_) => return Ok(None),
+        ConstrainedPosteriorMomentStatus::BoundaryApproximation { .. } => {
+            return Ok(Some(
+                SmoothingCorrectionAbsence::ConstrainedMixtureWithoutAmbientMoments,
+            ));
+        }
+        ConstrainedPosteriorMomentStatus::Available => {}
+    }
+    if psi_dimension > 0 {
+        return Ok(Some(
+            SmoothingCorrectionAbsence::ConstrainedMixtureOverDesignAxes { psi_dimension },
+        ));
+    }
+    let k_outer = outer_hessian.nrows();
+    if drifts.len() != k_outer {
+        return Err(format!(
+            "constrained smoothing mixture: {} precision drift(s) for {k_outer} outer \
+             coordinate(s)",
+            drifts.len()
+        ));
+    }
+    let identified = match identified_rho_covariance(outer_hessian, outer_gradient, excluded_outer)?
+    {
+        Ok(identified) => identified,
+        Err(absence) => return Ok(Some(absence)),
+    };
+    let rho_covariance = identified.embedded(k_outer);
+    let roots = drifts
+        .iter()
+        .map(drift_root)
+        .collect::<Result<Vec<_>, String>>()?;
+    let center = posterior.unconstrained_center()?.clone();
+    let precision_center = precision.dot(&center);
+    let built = SmoothingMixture::build(
+        SmoothingMixtureInputs {
+            center: center.view(),
+            precision_center: precision_center.view(),
+            // The routes that mint through here publish their penalized Hessian
+            // unscaled with unit dispersion; the ambient covariance is its
+            // inverse.
+            covariance_scale: 1.0,
+            drift_roots: &roots,
+            rho_covariance: rho_covariance.view(),
+            constraints: &posterior.constraints,
+        },
+        |weights| DenseNodePrecision::factor(precision.view(), &roots, weights),
+    );
+    match built {
+        Ok(mixture) => {
+            posterior.set_smoothing_mixture(mixture)?;
+            Ok(None)
+        }
+        Err(detail) => {
+            log::debug!(
+                "[smoothing-correction] the constrained smoothing mixture could not be formed \
+                 ({detail}); publishing the typed absence (gam#3229)"
+            );
+            Ok(Some(
+                SmoothingCorrectionAbsence::ConstrainedTruncationRefused { detail },
+            ))
+        }
+    }
 }
 
 /// First-order ρ-uncertainty inflation `C = A·V_ρ·Aᵀ` of a conditional
@@ -2510,11 +2680,12 @@ pub fn first_order_smoothing_correction(
             outer_hessian.dim()
         ));
     }
-    // Interior V_ρ: strict SPD inverse of the non-excluded outer sub-block.
-    let included: Vec<usize> = (0..k_outer)
-        .filter(|o| !excluded_outer.contains(o))
-        .collect();
-    if included.is_empty() {
+    let identified = match identified_rho_covariance(outer_hessian, outer_gradient, excluded_outer)?
+    {
+        Ok(identified) => identified,
+        Err(absence) => return Ok(Err(absence)),
+    };
+    let Some(inverted) = identified.inverted.as_ref() else {
         // Every outer coordinate is railed: no free rho direction survives, so
         // Var(rho) is the zero-dimensional zero matrix and the inflation
         // C = A Var(rho) A^T is EXACTLY the p x p zero matrix at identified
@@ -2525,54 +2696,9 @@ pub fn first_order_smoothing_correction(
         // indistinguishable from the genuinely-undefined non-PD-interior case
         // below and left the fit reporting no corrected covariance at all.
         return Ok(Ok((Array2::<f64>::zeros((p_total, p_total)), 0)));
-    }
+    };
+    let included = &identified.included;
     let ki = included.len();
-    let mut h_sub = Array2::<f64>::zeros((ki, ki));
-    for (i, &oi) in included.iter().enumerate() {
-        for (j, &oj) in included.iter().enumerate() {
-            h_sub[[i, j]] = outer_hessian[[oi, oj]];
-        }
-    }
-    let g_sub = if outer_gradient.is_empty() {
-        Array1::<f64>::zeros(0)
-    } else {
-        included
-            .iter()
-            .map(|&o| outer_gradient[o])
-            .collect::<Array1<f64>>()
-    };
-    // The ρ-Hessian's triangles are separate accumulations of the same mixed
-    // partial (Clairaut), so their skew part is assembly error, not rounding:
-    // symmetrize it and forward that measured defect as a `‖δH‖₂` component,
-    // exactly as the standard lane does (#2748), since the inverter takes an
-    // exactly mirrored ρ-Hessian.
-    let symmetrization_defect = gam_linalg::matrix::symmetrization_defect_2norm(&h_sub);
-    gam_linalg::matrix::symmetrize_in_place(&mut h_sub);
-    let measured_hessian_error = [gam_linalg::curvature_resolution::MeasuredHessianError::new(
-        "outer rho-Hessian symmetrization defect |(H - H')/2|_2",
-        symmetrization_defect,
-    )];
-    let inverted = match gam_solve::estimate::invert_identified_rho_hessian(
-        &h_sub,
-        0,
-        &g_sub,
-        None,
-        &measured_hessian_error,
-    ) {
-        Ok(inverted) => inverted,
-        Err(refusal) => {
-            log::debug!(
-                "[smoothing-correction] branch=unavailable reason=interior-rho-hessian-refused \
-                     rho_dimension={k_outer} railed={}: {refusal}",
-                k_outer - ki,
-            );
-            return Ok(Err(
-                gam_solve::model_types::SmoothingCorrectionAbsence::InteriorRhoHessianRefused {
-                    refusal,
-                },
-            ));
-        }
-    };
 
     // C = (V·U_inc) · V_ρ · (V·U_inc)ᵀ — symmetric PSD by construction.
     let mut u_inc = Array2::<f64>::zeros((p_total, ki));
@@ -2610,6 +2736,121 @@ pub fn first_order_smoothing_correction(
     }
     symmetrize_dense_in_place(&mut correction);
     Ok(Ok((correction, inverted.active_rank)))
+}
+
+/// `V_ρ` on the identified subspace of the non-excluded outer coordinates: the
+/// inversion [`first_order_smoothing_correction`] and the constrained θ-mixture
+/// (gam#3229) both place their θ uncertainty with, so the two read one `V_ρ`.
+///
+/// Outer coordinates in `excluded_outer` (box rails and typed AsymptoteRail
+/// coordinates) have no finite ρ-variance and are left out; with every
+/// coordinate excluded `included` is empty and nothing is inverted. A curvature
+/// the certificate could not have passed is the typed absence
+/// `SmoothingCorrectionAbsence::InteriorRhoHessianRefused`.
+pub(crate) struct IdentifiedRhoCovariance {
+    /// The outer coordinates `V_ρ` is defined over, in outer order.
+    pub(crate) included: Vec<usize>,
+    /// The identified-subspace inverse over `included`; `None` exactly when
+    /// `included` is empty, where there is nothing to invert.
+    pub(crate) inverted: Option<gam_solve::estimate::InvertedRhoHessian>,
+}
+
+impl IdentifiedRhoCovariance {
+    /// `V_ρ` over all `k_outer` coordinates, zero on the excluded ones.
+    pub(crate) fn embedded(&self, k_outer: usize) -> Array2<f64> {
+        let mut embedded = Array2::<f64>::zeros((k_outer, k_outer));
+        if let Some(inverted) = self.inverted.as_ref() {
+            for (row, &outer_row) in self.included.iter().enumerate() {
+                for (column, &outer_column) in self.included.iter().enumerate() {
+                    embedded[[outer_row, outer_column]] = inverted.inverse[[row, column]];
+                }
+            }
+        }
+        embedded
+    }
+}
+
+pub(crate) fn identified_rho_covariance(
+    outer_hessian: &Array2<f64>,
+    outer_gradient: &Array1<f64>,
+    excluded_outer: &[usize],
+) -> Result<
+    Result<IdentifiedRhoCovariance, gam_solve::model_types::SmoothingCorrectionAbsence>,
+    String,
+> {
+    let k_outer = outer_hessian.nrows();
+    if outer_hessian.ncols() != k_outer {
+        return Err(format!(
+            "smoothing correction: outer Hessian shape {:?} is not square",
+            outer_hessian.dim()
+        ));
+    }
+    if !outer_gradient.is_empty() && outer_gradient.len() != k_outer {
+        return Err(format!(
+            "smoothing correction: outer gradient has {} coordinate(s) for {k_outer}",
+            outer_gradient.len()
+        ));
+    }
+    // Interior V_ρ: strict SPD inverse of the non-excluded outer sub-block.
+    let included: Vec<usize> = (0..k_outer)
+        .filter(|o| !excluded_outer.contains(o))
+        .collect();
+    let ki = included.len();
+    if ki == 0 {
+        return Ok(Ok(IdentifiedRhoCovariance {
+            included,
+            inverted: None,
+        }));
+    }
+    let mut h_sub = Array2::<f64>::zeros((ki, ki));
+    for (i, &oi) in included.iter().enumerate() {
+        for (j, &oj) in included.iter().enumerate() {
+            h_sub[[i, j]] = outer_hessian[[oi, oj]];
+        }
+    }
+    let g_sub = if outer_gradient.is_empty() {
+        Array1::<f64>::zeros(0)
+    } else {
+        included
+            .iter()
+            .map(|&o| outer_gradient[o])
+            .collect::<Array1<f64>>()
+    };
+    // The ρ-Hessian's triangles are separate accumulations of the same mixed
+    // partial (Clairaut), so their skew part is assembly error, not rounding:
+    // symmetrize it and forward that measured defect as a `‖δH‖₂` component,
+    // exactly as the standard lane does (#2748), since the inverter takes an
+    // exactly mirrored ρ-Hessian.
+    let symmetrization_defect = gam_linalg::matrix::symmetrization_defect_2norm(&h_sub);
+    gam_linalg::matrix::symmetrize_in_place(&mut h_sub);
+    let measured_hessian_error = [gam_linalg::curvature_resolution::MeasuredHessianError::new(
+        "outer rho-Hessian symmetrization defect |(H - H')/2|_2",
+        symmetrization_defect,
+    )];
+    match gam_solve::estimate::invert_identified_rho_hessian(
+        &h_sub,
+        0,
+        &g_sub,
+        None,
+        &measured_hessian_error,
+    ) {
+        Ok(inverted) => Ok(Ok(IdentifiedRhoCovariance {
+            included,
+            inverted: Some(inverted),
+        })),
+        Err(refusal) => {
+            log::debug!(
+                "[smoothing-correction] branch=unavailable reason=interior-rho-hessian-refused \
+                     rho_dimension={k_outer} railed={}: {refusal}",
+                k_outer - ki,
+            );
+            Ok(Err(
+                gam_solve::model_types::SmoothingCorrectionAbsence::InteriorRhoHessianRefused {
+                    refusal,
+                },
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3784,6 +4025,154 @@ mod required_covariance_tests {
         assert!(
             error.to_string().contains("evaluated at a different coefficient vector"),
             "the refusal must name the operating-point mismatch, got: {error}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod constrained_smoothing_mixture_3229_tests {
+    //! The custom-family wiring of gam#3229's one convention: a constrained
+    //! posterior with ambient moments carries the θ-mixture over the SAME `V_ρ`
+    //! the first-order correction reads, and the lanes that cannot form one say
+    //! why instead of publishing a law under another convention.
+    use super::*;
+    use gam_solve::constrained_posterior::{
+        ConePosteriorMomentDecline, ConePropernessEvidence, ConstrainedPosteriorGeometry,
+        DenseNodePrecision, SmoothingMixture, SmoothingMixtureInputs,
+        constrained_posterior_correction_from_covariance,
+    };
+    use gam_solve::model_types::SmoothingCorrectionAbsence;
+    use ndarray::array;
+
+    /// One coefficient on `β ≥ 0` with precision `M̂ = 2`, a penalty drift
+    /// `D = 1` and the ambient centre `−½`, on the wall's wrong side.
+    fn bound_geometry() -> FitGeometry {
+        let constraints = gam_problem::LinearInequalityConstraints::new(array![[1.0]], array![0.0])
+            .expect("one nonnegativity row");
+        let center = array![-0.5];
+        let correction =
+            constrained_posterior_correction_from_covariance(&array![[0.5]], &center, &constraints)
+                .expect("the mode's correction");
+        FitGeometry {
+            coefficient_gauge: gam_problem::gauge::Gauge::identity(&[1]),
+            penalized_hessian: array![[2.0]].into(),
+            constrained_posterior: Some(ConstrainedPosteriorGeometry::with_moments(
+                constraints,
+                array![0.0],
+                center,
+                correction,
+            )),
+            working: None,
+        }
+    }
+
+    #[test]
+    fn a_constrained_geometry_carries_the_mixture_over_the_corrections_rho_covariance() {
+        let mut geometry = bound_geometry();
+        // `V_ρ = 1/2`, the exact inverse of the certified outer Hessian `2`.
+        let absence = attach_constrained_smoothing_mixture(
+            &mut geometry,
+            &[array![[1.0]]],
+            &array![[2.0]],
+            &Array1::zeros(0),
+            &[],
+            0,
+        )
+        .expect("the attachment is well formed");
+        assert!(absence.is_none(), "{absence:?}");
+        let posterior = geometry.constrained_posterior.as_ref().expect("geometry");
+        let attached = posterior.smoothing_mixture().expect("the attached mixture");
+        let roots = [array![[1.0]]];
+        let precision = array![[2.0]];
+        let precision_center = precision.dot(&array![-0.5]);
+        let expected = SmoothingMixture::build(
+            SmoothingMixtureInputs {
+                center: array![-0.5].view(),
+                precision_center: precision_center.view(),
+                covariance_scale: 1.0,
+                drift_roots: &roots,
+                rho_covariance: array![[0.5]].view(),
+                constraints: &posterior.constraints,
+            },
+            |weights| DenseNodePrecision::factor(precision.view(), &roots, weights),
+        )
+        .expect("the reference mixture");
+        assert_eq!(attached.covariance(), expected.covariance());
+        assert_eq!(attached.node_count(), 2);
+        // The lane publishes that covariance, not `V_cond + C`.
+        let first_order = (
+            array![[0.125]],
+            gam_solve::model_types::SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
+                active_rank: 1,
+                rho_dimension: 1,
+            },
+        );
+        let (correction, method, published) = crate::warm_start::corrected_covariance(
+            Some(&first_order),
+            Some(&array![[0.25]]),
+            attached.covariance().cloned(),
+        )
+        .expect("a published corrected pair");
+        assert_eq!(correction, Some(array![[0.125]]));
+        assert!(method.is_some());
+        assert_eq!(published.as_ref(), expected.covariance());
+    }
+
+    #[test]
+    fn lanes_without_a_mixture_name_their_absence() {
+        let mut design_axes = bound_geometry();
+        assert_eq!(
+            attach_constrained_smoothing_mixture(
+                &mut design_axes,
+                &[array![[1.0]]],
+                &array![[2.0, 0.0], [0.0, 3.0]],
+                &Array1::zeros(0),
+                &[],
+                1,
+            )
+            .expect("well formed"),
+            Some(SmoothingCorrectionAbsence::ConstrainedMixtureOverDesignAxes { psi_dimension: 1 })
+        );
+        let mut declined = bound_geometry();
+        let constraints = declined
+            .constrained_posterior
+            .as_ref()
+            .expect("geometry")
+            .constraints
+            .clone();
+        declined.constrained_posterior = Some(ConstrainedPosteriorGeometry::with_decline(
+            constraints,
+            array![0.0],
+            ConePosteriorMomentDecline {
+                ambient_precision_failure: "probe".to_string(),
+                properness: ConePropernessEvidence::CertificationFailed {
+                    reason: "probe".to_string(),
+                },
+                active_rows: Vec::new(),
+                boundary_approximation_refusal: None,
+            },
+        ));
+        // A declined posterior publishes no covariance at all, so there is no
+        // corrected law for an absence to describe.
+        assert_eq!(
+            attach_constrained_smoothing_mixture(
+                &mut declined,
+                &[array![[1.0]]],
+                &array![[2.0]],
+                &Array1::zeros(0),
+                &[],
+                0,
+            )
+            .expect("well formed"),
+            None
+        );
+        assert!(
+            declined
+                .constrained_posterior
+                .as_ref()
+                .expect("geometry")
+                .smoothing_mixture()
+                .is_none()
         );
     }
 }
