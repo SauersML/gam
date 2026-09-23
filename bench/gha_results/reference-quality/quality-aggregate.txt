@@ -3,15 +3,15 @@ complete case manifest: /tmp/quality-report/quality_cases.txt (437 cases)
 === #1561 whole-suite quality meta-gate ===
 category        n scored GAMwin REFwin   medlogR  p(1-sided)      p_BH
 factors         1      1      0      1    0.0173      1.0000    1.0000
-families       51     51     33     18   -0.0055      0.0052    0.0311
+families       51     51     34     17   -0.0055      0.0038    0.0226
 manifolds      11     11      8      2   -0.0033      0.0527    0.1582
 misc           28     28     16     12   -0.0003      0.1421    0.2132
 smooths        40     40     21     19   -0.0030      0.1324    0.2132
 survival       12     12      7      5   -0.0092      0.2349    0.2818
 ------------------------------------------------------------------------
-OVERALL       143    143     85     57   -0.0033      0.0008 
+OVERALL       143    143     86     56   -0.0033      0.0006 
 
-CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0008, median log(gam/ref)=-0.0033, wins 85 / losses 57)
+CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0006, median log(gam/ref)=-0.0033, wins 86 / losses 56)
 Experimental units: 143 cases from 184 metric pairs.
 INCOMPLETE: absent manifest, mismatched execution, or failed cases; closure blocked.
 
