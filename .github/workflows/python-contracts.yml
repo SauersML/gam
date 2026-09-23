@@ -42,6 +42,8 @@ on:
       # drift check and the static-typing lane must see every change to them.
       - "crates/gam-pyffi/**"
       - "scripts/gen_rust_stub.py"
+      # The script-units job's scripts and their tests.
+      - "scripts/**"
       - "pyproject.toml"
       - ".github/workflows/python-contracts.yml"
 
@@ -507,6 +509,25 @@ jobs:
   # runs in minutes beside the wheel build rather than after it. What it does
   # need is every framework gamfit integrates with, which is why these tests
   # carry the `static_typing` marker and the full-suite steps deselect it.
+  script-units:
+    # The release, version, wheel-smoke and quality-gate scripts carry their own
+    # stdlib unit tests under scripts/tests. The test-census workflow used to run
+    # them and was deleted; without this job they ran in no CI job (#1512).
+    name: Script unit tests (scripts/tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Unit-test every scripts/tests module
+        run: python -m unittest discover -s scripts/tests -v
+
   static-typing:
     name: Static typing (mypy --strict)
     runs-on: ubuntu-latest
