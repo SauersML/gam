@@ -5006,9 +5006,27 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // `CurvatureEvidence` was introduced to prevent.
     let strict_curvature_refused =
         config.require_measured_psd && certificate.hessian_psd() == Some(false);
+    // The gradient-residue floor clears a measured negative direction on the
+    // premise that it is `λV_λ = g` rounding residue, indistinguishable from
+    // zero. Where the raw interior eigenvalue lies below the resolution the
+    // verdict was decided at, that premise is a claim about the criterion, not
+    // a measurement: a genuine `e^{-ρ}` tail also has `H_kk = −g_k` exactly. On
+    // the shared-tangent fixture of #2627 the floor cleared `H₁₁ = −g₁ =
+    // −7.27e-6` against a decided resolution of 1.3e-7, and the fit minted a
+    // point the criterion still descends from. So it is adjudicated like any
+    // refused curvature: a confirmed descent falsifies the floor, and a
+    // contradicted or unresolvable one withdraws the verdict as before.
+    let floor_cleared_resolvable_negative = matches!(
+        certificate.curvature,
+        CurvatureEvidence::Measured { psd: false }
+    ) && certificate.curvature_floor.is_some_and(|clearance| {
+        clearance.cleared && clearance.interior_min_eigenvalue < -clearance.decided_at_resolution
+    });
     result.saddle_escape_reseed = None;
     if certificate.is_stationary()
-        && (!certificate.curvature_not_refused() || strict_curvature_refused)
+        && (!certificate.curvature_not_refused()
+            || strict_curvature_refused
+            || floor_cleared_resolvable_negative)
         && let Some(hessian) = result.final_hessian.clone()
         && let Some(gradient) = result.final_gradient().cloned()
     {
@@ -5035,6 +5053,13 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             context,
         ) {
             SaddleAdjudication::Descended(point) => {
+                // A descent the criterion resolves falsifies the floor's premise
+                // that this direction is indistinguishable from zero, so the
+                // floor is withdrawn and the measured negative curvature refuses.
+                if floor_cleared_resolvable_negative {
+                    certificate.curvature_floor = None;
+                    result.criterion_certificate = Some(certificate.clone());
+                }
                 // The reseed — and only the reseed — is one-shot. On the retry
                 // pass the descent is still a real finding: the criterion agrees
                 // with the matrix, so the refusal that follows is the refusal a

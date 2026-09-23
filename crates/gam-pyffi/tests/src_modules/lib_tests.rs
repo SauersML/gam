@@ -309,8 +309,8 @@ fn shared_tangent_formula_dataset() -> (EncodedDataset, Array2<f64>) {
 
 /// Regression for issue #381 adversarial review (flaw #2), carried into the
 /// shared-smoothing model (issue #967): the residual-variance denominator must
-/// count the FULL effective df — unpenalized columns (intercept + the
-/// parametric `x`, `z`) included — matching the canonical Gaussian scale. With
+/// count the FULL effective df — unpenalized columns (the intercept) included
+/// — matching the canonical Gaussian scale. With
 /// one pooled isotropic σ² over the `D·n` stacked rows, that denominator is
 /// `D·n - edf_total`, `edf_total = (K·D - penalized_rank) + penalized_edf`. The
 /// pre-fix denominator used only the penalized `edf_by_block`, overstating
@@ -338,11 +338,14 @@ fn shared_tangent_sigma2_pools_and_counts_unpenalized_columns() {
     assert!(fit.lambdas.iter().all(|v| v.is_finite()));
     assert!(fit.edf.iter().all(|v| v.is_finite() && *v >= 0.0));
 
-    // `~ x + z + s(w)` has exactly three unpenalized columns PER OUTPUT (the
-    // intercept plus the parametric `x`, `z`); the smooth `s(w)` is fully
-    // penalized. So the pooled effective df is
-    //   edf_total = 3·D (unpenalized) + Σ_block edf  (shared across all D).
-    const UNPENALIZED_PER_OUTPUT: f64 = 3.0;
+    // `~ x + z + s(w)` has exactly ONE unpenalized column PER OUTPUT, the
+    // intercept. Under the default double penalty each parametric slope owns
+    // its own `LinearTermRidge` block (so `x` and `z` are penalized, each with
+    // its own λ), and `s(w)` carries its primary block plus a
+    // `DoublePenaltyNullspace` block over its polynomial null space. So the
+    // pooled effective df is
+    //   edf_total = 1·D (unpenalized) + Σ_block edf  (shared across all D).
+    const UNPENALIZED_PER_OUTPUT: f64 = 1.0;
     let penalized_edf: f64 = fit.edf.iter().sum();
     let edf_total = UNPENALIZED_PER_OUTPUT * d as f64 + penalized_edf;
     let mut ss = 0.0;

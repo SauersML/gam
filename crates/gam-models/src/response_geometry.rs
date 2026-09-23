@@ -474,15 +474,18 @@ pub fn fit_shared_tangent_reml(
             .with_gradient(Derivative::Analytic)
             .with_hessian(DeclaredHessianForm::Dense)
             .with_bounds(rho_lower, rho_upper)
-            .with_disable_fixed_point(true)
-            // The closed-form QR/root evaluation resolves the per-output
-            // smoothing score to the floating-point floor. The generic outer
-            // band also serves inexact inner solves and can stop equivalent
-            // response frames at distinguishable coefficient maps. State this
-            // exact engine's accuracy requirement before search/certification.
-            .with_required_projected_gradient_norm(Some(
-                f64::EPSILON.sqrt() * prepared.n_outputs as f64,
-            ));
+            // No caller `|Pg|` requirement (#3245). This route used to impose
+            // `√ε·D`, a constant no property of the criterion produces. The
+            // search accepts a step only on a decrease its value band resolves,
+            // so it stops where the Newton decrement `½gᵀH⁻¹g` falls under
+            // that band (3.2e-12 on a score of −892). Near unit curvature that
+            // is `|Pg| ≈ 3e-6`. Meeting `√ε·D = 3e-8` would need a decrement
+            // near 1e-16, far below anything one evaluation resolves, so the
+            // cap refused every such fit. The engine's own band certifies the
+            // point at the criterion's resolution, and the output-rotation
+            // equivariance the requirement was meant to protect holds there
+            // (`shared_tangent_fit_is_output_rotation_equivariant`).
+            .with_disable_fixed_point(true);
         if let Some(initial) = initial_log_lambdas.as_ref() {
             problem = problem.with_initial_rho(Array1::from_iter(
                 prepared
@@ -646,8 +649,8 @@ impl OuterObjective for SharedTangentObjective<'_> {
     // `1/(2n)` instead of their own error. This closed form is exact to
     // rounding. Measured against `1/(2n)`, every step ARC took near a strict
     // saddle read as "no resolved progress", and the cost-stall guard ended the
-    // search with `|g| ≈ 2e-3` against the caller's `√ε·D` stationarity
-    // requirement.
+    // search with `|g| ≈ 2e-3` against the `√ε·D` stationarity requirement
+    // this route then imposed (see `fit_shared_tangent_reml`).
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
         self.prepared.evaluate(rho).map(|evaluation| {
             record_certificate_inner_residual(evaluation.inner_residual);

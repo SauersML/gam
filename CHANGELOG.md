@@ -1,5 +1,13 @@
 ## Unreleased
 
+- **Shared-tangent (response-geometry) Gaussian REML no longer refuses fits it has converged, and an
+  outer certificate no longer clears a resolvable negative curvature on its gradient floor** (#2627).
+  The route capped its outer certificate at a hand-set `|Pg| ≤ √ε·D`; its search accepts a step only
+  on a decrease its value band resolves, so it stopped near `|Pg| ≈ 3e-6` and meeting the cap needed
+  a Newton decrement near 1e-16. The cap is gone and the engine's own band certifies these fits.
+  Separately, where the gradient-residue floor cleared a measured negative direction whose raw
+  eigenvalue lies below the resolution the verdict was decided at, that direction now goes to saddle
+  adjudication like any refused curvature: a confirmed descent withdraws the floor and refuses.
 - **The survival marginal-slope, survival location-scale and competing-risks bands are central
   intervals of the posterior law of the response, not `mean ± z·sd` clamped to the range**
   (gam#3560). This follows `a3b841be88`, which fixed the latent-window band the same way.
