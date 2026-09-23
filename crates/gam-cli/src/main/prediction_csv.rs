@@ -209,9 +209,18 @@ pub(crate) fn prepend_id_column_to_prediction_csv(
     Ok(())
 }
 
+/// The shortest decimal that parses back to exactly `value` (#4575). A fixed
+/// number of decimal places is an absolute rounding: it prints any value
+/// below half its last place as 0 and drops the relative digits of every
+/// small one, so a probability, a tail bound or a posterior draw would not
+/// survive the round trip through the file.
+pub(crate) fn csv_float(value: f64) -> String {
+    ryu::Buffer::new().format(value).to_string()
+}
+
 /// Unified CSV prediction writer.  Each column is a `(name, data)` pair;
 /// the function writes a header row from the names and one data row per
-/// element, formatting every value to 12 decimal places.
+/// element, each value as its shortest round-trip decimal ([`csv_float`]).
 ///
 /// All columns must have the same length.  An empty column list is an error.
 pub(crate) fn write_prediction_csv_unified(
@@ -269,7 +278,7 @@ pub(crate) fn write_prediction_csv_unified(
     for i in 0..n {
         let row: Vec<String> = columns
             .iter()
-            .map(|(_, data)| format!("{:.12}", data[i]))
+            .map(|(_, data)| csv_float(data[i]))
             .collect();
         wtr.write_record(&row)
             .map_err(|e| CliError::FileWriteFailed {

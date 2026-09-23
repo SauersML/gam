@@ -5623,8 +5623,8 @@ fn prediction_csv_can_prepend_id_column() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "read prediction csv", e));
     let mut lines = text.lines();
     assert_eq!(lines.next(), Some("person_id,eta,mean"));
-    assert_eq!(lines.next(), Some("p1,0.500000000000,0.620000000000"));
-    assert_eq!(lines.next(), Some("p2,-0.250000000000,0.440000000000"));
+    assert_eq!(lines.next(), Some("p1,0.5,0.62"));
+    assert_eq!(lines.next(), Some("p2,-0.25,0.44"));
 
     remove_temp_file(&path);
 }
@@ -5788,7 +5788,7 @@ fn location_scale_prediction_csv_names_posterior_uncertainty_explicitly() {
     assert_eq!(
         lines.next(),
         Some(
-            "1.000000000000,1.000000000000,1.000000000000,0.400000000000,0.250000000000,0.300000000000,0.200000000000,1.800000000000"
+            "1.0,1.0,1.0,0.4,0.25,0.3,0.2,1.8"
         )
     );
 
@@ -6630,15 +6630,14 @@ fn cli_survival_marginal_slope_predict_publishes_library_posterior_mean_3316() {
         .survival_upper
         .as_ref()
         .expect("a band was requested");
-    // The CSV writes every value with `{:.12}` fixed decimals, so a published
-    // cell differs from the library value by at most half a unit in the 12th
-    // decimal plus the parse's own rounding (one ulp of the value).
+    // The CSV writes every value as its shortest round-trip decimal, so a
+    // published cell parses back to the library value exactly.
     let assert_published = |column: &str, row: usize, expected: f64| {
         let published = csv_value_at(&pred_path, row, column);
-        let bound = 0.5e-12 + f64::EPSILON * expected.abs().max(1.0);
-        assert!(
-            (published - expected).abs() <= bound,
-            "row {row} `{column}`: CSV published {published}, library {expected}"
+        assert_eq!(
+            published.to_bits(),
+            expected.to_bits(),
+            "row {row} `{column}`: CSV published {published:e}, library {expected:e}"
         );
     };
     let mut max_gap_to_delta = 0.0f64;

@@ -281,12 +281,12 @@ fn write_multinomial_prediction_csv(
         .map_err(|e| format!("failed to write csv header: {e}"))?;
     for i in 0..probs.nrows() {
         let mut row: Vec<String> = (0..probs.ncols())
-            .map(|j| format!("{:.12}", probs[[i, j]]))
+            .map(|j| csv_float(probs[[i, j]]))
             .collect();
         if let Some(se) = prob_se {
             match &se[i] {
                 Ok(values) => {
-                    row.extend(values.iter().map(|value| format!("{value:.12}")));
+                    row.extend(values.iter().map(|&value| csv_float(value)));
                     row.push(String::new());
                 }
                 Err(decline) => {
@@ -332,11 +332,11 @@ mod tests {
         assert_eq!(lines[0], "prob_a,prob_b,prob_se_a,prob_se_b,prob_se_decline");
         assert_eq!(
             lines[1],
-            "0.300000000000,0.700000000000,0.100000000000,0.100000000000,"
+            "0.3,0.7,0.1,0.1,"
         );
         let declined: Vec<&str> = lines[2].split(',').collect();
         assert_eq!(declined.len(), 5, "{}", lines[2]);
-        assert_eq!(&declined[..4], &["0.500000000000", "0.500000000000", "", ""]);
+        assert_eq!(&declined[..4], &["0.5", "0.5", "", ""]);
         assert!(
             declined[4].contains("negative probability variance"),
             "{}",
@@ -344,7 +344,7 @@ mod tests {
         );
         assert_eq!(
             lines[3],
-            "0.900000000000,0.100000000000,0.020000000000,0.020000000000,"
+            "0.9,0.1,0.02,0.02,"
         );
     }
 }

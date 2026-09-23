@@ -126,7 +126,7 @@ pub(crate) fn run_sample(args: SampleArgs) -> CliResult<()> {
             .map_err(|e| format!("failed to write csv header: {e}"))?;
         for i in 0..nuts.samples.nrows() {
             let row: Vec<String> = (0..n_coeffs)
-                .map(|j| format!("{:.12}", nuts.samples[[i, j]]))
+                .map(|j| csv_float(nuts.samples[[i, j]]))
                 .collect();
             wtr.write_record(&row)
                 .map_err(|e| format!("failed to write csv row {i}: {e}"))?;

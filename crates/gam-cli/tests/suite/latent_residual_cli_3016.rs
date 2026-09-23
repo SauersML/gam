@@ -9,9 +9,6 @@ use std::process::{Command, Output};
 
 /// `Corr(z, x)`: the conditional-mean slope the calibration removes.
 const M_SHIFT: f64 = 0.6;
-/// The CSV writer's fixed twelve decimals round each value by at most half a
-/// unit in the twelfth place.
-const CSV_ROUNDING: f64 = 0.5e-12;
 
 fn request_document(latent_measure: &str) -> String {
     format!(
@@ -146,15 +143,15 @@ fn latent_residual_cli_matches_the_saved_model_3016() {
         .expect("in-process residual")
         .expect("a conditional-law fit returns a residual");
     assert_eq!(cli.len(), in_process.len(), "one residual per held-out row");
-    let worst = cli
-        .iter()
-        .zip(in_process.iter())
-        .map(|(written, computed)| (written - computed).abs())
-        .fold(0.0_f64, f64::max);
-    assert!(
-        worst <= CSV_ROUNDING * (1.0 + 1.0e-6),
-        "the CLI residual differs from the saved model's by {worst:e}, more than the csv rounding"
-    );
+    // The CSV carries each residual's shortest round-trip decimal, so the
+    // written residual is the saved model's to the bit.
+    for (row, (written, computed)) in cli.iter().zip(in_process.iter()).enumerate() {
+        assert_eq!(
+            written.to_bits(),
+            computed.to_bits(),
+            "row {row}: the CLI residual {written:e} is not the saved model's {computed:e}"
+        );
+    }
 
     let global = fit(dir, &train, "global-empirical");
     let refused = gam(

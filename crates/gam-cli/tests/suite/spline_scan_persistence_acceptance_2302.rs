@@ -140,14 +140,17 @@ fn fresh_processes_replay_saved_scan_for_predict_and_report() {
     for ((row, &x), row_index) in rows.iter().zip(&query).zip(0..) {
         let (mean, variance) = scan.predict(x).expect("direct saved-scan prediction");
         let se = variance.max(0.0).sqrt();
+        // The CSV carries each value's shortest round-trip decimal, so the
+        // fresh process must print exactly the persisted scan's numbers.
+        let exact = |value: f64| ryu::Buffer::new().format(value).to_string();
         let expected = [
-            format!("{mean:.12}"),
-            format!("{mean:.12}"),
-            format!("{mean:.12}"),
-            format!("{se:.12}"),
-            format!("{se:.12}"),
-            format!("{:.12}", mean - z * se),
-            format!("{:.12}", mean + z * se),
+            exact(mean),
+            exact(mean),
+            exact(mean),
+            exact(se),
+            exact(se),
+            exact(mean - z * se),
+            exact(mean + z * se),
         ];
         assert_eq!(
             row.iter().collect::<Vec<_>>(),

@@ -111,8 +111,6 @@ fn cli_royston_parmar_survival_band_is_the_transformed_eta_interval_3560() {
     let z = standard_normal_quantile(0.5 + 0.5 * level)
         .unwrap_or_else(|e| panic!("normal quantile: {e:?}"));
     let survival = |eta: f64| (-eta.exp()).exp();
-    // Every column is printed with 12 fixed decimals, and |dS/deta| <= 1/e.
-    let print_tol = 1e-11;
     let mut rows = 0;
     for line in lines.filter(|l| !l.trim().is_empty()) {
         let v: Vec<f64> = line
@@ -131,16 +129,14 @@ fn cli_royston_parmar_survival_band_is_the_transformed_eta_interval_3560() {
             response_sd > 0.0,
             "a fitted row must carry a positive survival-scale SD, got {response_sd}"
         );
-        // The printed bounds are fixed 12-decimal renderings, so a lower survival
-        // bound below 5e-13 prints as 0 though the band is inside (0, 1): the
-        // printed columns can only be ordered within [0, 1]. Strict interiority is
-        // asserted below on the exact transformed bounds they render.
+        // Every column is printed as its shortest round-trip decimal, so the
+        // parsed values are the computed ones.
         assert!(
-            0.0 <= lo && lo < hi && hi <= 1.0,
-            "row {rows}: the printed band [{lo}, {hi}] must be ordered within [0, 1]"
+            0.0 < lo && lo < hi && hi < 1.0,
+            "row {rows}: the band [{lo:e}, {hi:e}] must lie strictly inside (0, 1)"
         );
         assert!(
-            lo - print_tol <= plugin && plugin <= hi + print_tol,
+            lo <= plugin && plugin <= hi,
             "row {rows}: the band [{lo}, {hi}] must contain the plug-in survival {plugin}"
         );
         if !constrained {
@@ -150,9 +146,10 @@ fn cli_royston_parmar_survival_band_is_the_transformed_eta_interval_3560() {
                 "row {rows}: the band [{want_lo:e}, {want_hi:e}] must lie strictly inside (0, 1)"
             );
             for (got, want, side) in [(lo, want_lo, "lower"), (hi, want_hi, "upper")] {
-                assert!(
-                    (got - want).abs() <= print_tol,
-                    "row {rows}: {side} band {got} is not the transformed eta bound {want}"
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "row {rows}: {side} band {got:e} is not the transformed eta bound {want:e}"
                 );
             }
         }
