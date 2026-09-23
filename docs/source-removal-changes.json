@@ -4072,5 +4072,20 @@
     ],
     "reason": "gam#3173: fold_crossing_seed is moved, not deleted. It now lives in crates/gam-custom-family/src/mode_selection.rs as pub(crate), because both the exact-joint evaluator in psi_hyper.rs and evaluate_on_branch in branch_continuation.rs spend it.",
     "evidence": "The body is unchanged. psi_hyper.rs's call sites resolve to mode_selection::fold_crossing_seed. cargo check --workspace --all-targets is rc=0 on MSI at 09d870cc78 with the patch, and the full gam-custom-family --lib suite has the same 6 reds as origin/main."
+  },
+  {
+    "base": "75010213451cb8ff8dbdad2450ba00f102e3ec1f",
+    "items": [
+      "crates/gam-models/src/bms/calibration_cells.rs:const:BINOMIAL",
+      "crates/gam-models/src/bms/calibration_cells.rs:const:EMPIRICAL_CELL_MOMENT_DEGREE",
+      "crates/gam-models/src/bms/calibration_cells.rs:fn:add_shift_adjoint",
+      "crates/gam-models/src/bms/calibration_cells.rs:fn:shift_adjoint_is_the_transpose_of_the_shift_3290",
+      "crates/gam-models/src/bms/calibration_cells.rs:fn:shift_cubic",
+      "crates/gam-models/src/bms/calibration_cells.rs:fn:shifted",
+      "crates/gam-models/src/bms/calibration_cells.rs:fn:shifted_cell",
+      "crates/gam-models/src/bms/calibration_cells.rs:fn:shifted_cubic_is_the_same_polynomial_about_the_new_origin_3290"
+    ],
+    "reason": "gam#3290: empirical calibration cells evaluate their contractions as node sums over the cell's nodes instead of centred moments through degree 21, so the shift/moment machinery (shift_cubic, add_shift_adjoint, the moment-degree constant and the centred-cell helpers) and their tests have no caller.",
+    "evidence": "node_sums_are_the_kernel_contractions_over_the_node_moments_3290 pins the node sums to the kernel's moment contractions term by term; empirical_cell_contractions_match_the_dense_row_program_3290 and cell_third_trace_matches_per_axis_dense_contraction_2998 pass (gateD lane, cargo check --workspace --all-targets green)."
   }
 ]

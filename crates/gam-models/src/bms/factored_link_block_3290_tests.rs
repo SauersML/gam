@@ -8,7 +8,6 @@
 //! Ban-scanner-safe: a bare `#[cfg(test)] mod factored_link_block_3290_tests;`
 //! in `bms/mod.rs` with the allowed `*_tests` name.
 
-use super::calibration_cells::EMPIRICAL_CELL_MOMENT_DEGREE;
 use super::family::*;
 use super::flex_row_program::BmsFlexRowProgram;
 use super::hessian_paths::*;
@@ -19,6 +18,16 @@ use gam_math::roundoff::accumulation_growth;
 use gam_problem::{InverseLink, ParameterBlockState, StandardLink};
 use ndarray::{Array1, Array2};
 use std::sync::{Arc, Mutex};
+
+/// Rounded operations in one node term of the widest contraction, the fourth
+/// (`EmpiricalCalibrationCell::fourth`): fifteen cubic coefficient
+/// polynomials and the cell's cubic `η` evaluated by Horner's rule (six each),
+/// the two Hermite weights `η² − 1` and `3η − η³` (five), the fourteen products
+/// and sums of the Faà di Bruno combination (seven `3+1`/`2+2` products and
+/// their sum, six `2+1+1` triple products and their sum, the quadruple
+/// product), and the weighted accumulation (two). A contraction over `G` nodes
+/// is then a sum of `G` such terms.
+pub(super) const EMPIRICAL_NODE_TERM_OPERATIONS: usize = 16 * 6 + 5 + (7 * 2 + 6 * 3 + 4) + 2;
 
 /// The dense oracle for a third contraction: the canonical row program in the
 /// runtime-width one-seed jets, `lanes` directions per pass.
@@ -178,7 +187,7 @@ struct RowContractions {
     elapsed: [[std::time::Duration; 2]; 2],
 }
 
-fn row_contractions(link_internal_knots: usize) -> RowContractions {
+fn row_contractions(link_internal_knots: usize, repetitions: usize) -> RowContractions {
     let row = 0usize;
     let (family, states) = empirical_flex_fixture(link_internal_knots);
     let cache = family
@@ -200,82 +209,93 @@ fn row_contractions(link_internal_knots: usize) -> RowContractions {
     let dir_v = Array1::from_shape_fn(r, |i| -0.4 + 0.3 * (((i + 1) % 4) as f64) - 0.1 * ((i % 2) as f64));
     assert!(dir_u[h_range.start] != 0.0 && dir_v[w_range.start] != 0.0);
 
-    let started = std::time::Instant::now();
-    let third = family
-        .row_primary_third_contracted_with_moments(row, &states, &cache, row_ctx, &dir_u)
-        .expect("production third contraction");
-    let third_time = started.elapsed();
-    let started = std::time::Instant::now();
-    let fourth = family
-        .row_primary_fourth_contracted_ordered(row, &states, &cache, row_ctx, &dir_u, &dir_v)
-        .expect("production fourth contraction");
-    let fourth_time = started.elapsed();
-
+    let third_call = || {
+        family
+            .row_primary_third_contracted_with_moments(row, &states, &cache, row_ctx, &dir_u)
+            .expect("production third contraction")
+    };
+    let fourth_call = || {
+        family
+            .row_primary_fourth_contracted_ordered(row, &states, &cache, row_ctx, &dir_u, &dir_v)
+            .expect("production fourth contraction")
+    };
     let point = family
         .primary_point_from_block_states(row, &states, &primary)
         .expect("primary point");
     let (q, b, beta_h, beta_w) = family.primary_point_components(&point, &primary);
-    let started = std::time::Instant::now();
-    let plan = family
-        .compile_empirical_bms_row_program(
-            row,
-            &primary,
-            q,
-            b,
-            beta_h.as_ref(),
-            beta_w.as_ref(),
-            row_ctx.intercept,
-            &grid,
-        )
-        .expect("canonical empirical-flex row plan");
-    let plan_time = started.elapsed();
     let primary_point = BernoulliMarginalSlopeFamily::intercept_primary_point(
         q,
         b,
         beta_h.as_ref(),
         beta_w.as_ref(),
     );
-    let started = std::time::Instant::now();
-    let dense_third = dense_third_contracted(
-        &plan,
-        &primary_point,
-        std::slice::from_ref(&dir_u),
-        r,
-        1,
-    )
-    .expect("dense third contraction")
-    .remove(0);
-    let dense_third_time = plan_time + started.elapsed();
-    let started = std::time::Instant::now();
-    let dense_fourth = dense_fourth_contracted(
-        &plan,
-        &primary_point,
-        &[(&dir_u, &dir_v)],
-        r,
-        1,
-    )
-    .expect("dense fourth contraction")
-    .remove(0);
-    let dense_fourth_time = plan_time + started.elapsed();
+    // The dense route compiles the row program on every contraction, as its
+    // production callers did, so its time includes the compile.
+    let plan = || {
+        family
+            .compile_empirical_bms_row_program(
+                row,
+                &primary,
+                q,
+                b,
+                beta_h.as_ref(),
+                beta_w.as_ref(),
+                row_ctx.intercept,
+                &grid,
+            )
+            .expect("canonical empirical-flex row plan")
+    };
+    let dense_third_call = || {
+        dense_third_contracted(&plan(), &primary_point, std::slice::from_ref(&dir_u), r, 1)
+            .expect("dense third contraction")
+            .remove(0)
+    };
+    let dense_fourth_call = || {
+        dense_fourth_contracted(&plan(), &primary_point, &[(&dir_u, &dir_v)], r, 1)
+            .expect("dense fourth contraction")
+            .remove(0)
+    };
+    let third = third_call();
+    let fourth = fourth_call();
+    let dense_third = dense_third_call();
+    let dense_fourth = dense_fourth_call();
+    // After those warm calls, the median of `repetitions` calls per route.
+    let median = |call: &dyn Fn() -> Array2<f64>| -> std::time::Duration {
+        let mut times: Vec<std::time::Duration> = (0..repetitions)
+            .map(|repetition| {
+                let started = std::time::Instant::now();
+                let value = call();
+                let elapsed = started.elapsed();
+                assert!(value.iter().all(|entry| entry.is_finite()), "repetition {repetition}");
+                elapsed
+            })
+            .collect();
+        times.sort_unstable();
+        times[times.len() / 2]
+    };
+    let elapsed = [
+        [median(&third_call), median(&dense_third_call)],
+        [median(&fourth_call), median(&dense_fourth_call)],
+    ];
     RowContractions {
         r,
         link_width: w_range.len(),
         third: [third, dense_third],
         fourth: [fourth, dense_fourth],
-        elapsed: [[third_time, dense_third_time], [fourth_time, dense_fourth_time]],
+        elapsed,
     }
 }
 
-/// Both routes sum the same grid's contributions: the cell route through
-/// centred moments through degree [`EMPIRICAL_CELL_MOMENT_DEGREE`] on each
-/// node, the dense route node by node, then one `r`-wide implicit and observed
-/// finalizer each. The band is Wilkinson's factor over that accumulation,
-/// `G·(D + 1) + r²` rounded operations, on the largest entry.
+/// Both routes sum the same grid's contributions node by node, the cell route
+/// with at most [`EMPIRICAL_NODE_TERM_OPERATIONS`] rounded operations per node
+/// term, then one `r`-wide implicit and observed finalizer each. The band is
+/// Wilkinson's factor over that accumulation, `G·K + r²` rounded operations,
+/// on the largest entry.
 fn assert_matches_dense(label: &str, production: &Array2<f64>, dense: &Array2<f64>, grid_nodes: usize) {
     let r = dense.nrows();
     let scale = dense.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
     assert!(scale > 0.0, "{label}: the dense contraction is identically zero");
-    let band = accumulation_growth(grid_nodes * (EMPIRICAL_CELL_MOMENT_DEGREE + 1) + r * r) * scale;
+    let band = accumulation_growth(grid_nodes * EMPIRICAL_NODE_TERM_OPERATIONS + r * r) * scale;
     let mut worst = 0.0_f64;
     for ((index, &got), &want) in production.indexed_iter().zip(dense.iter()) {
         assert!(
@@ -291,7 +311,7 @@ fn assert_matches_dense(label: &str, production: &Array2<f64>, dense: &Array2<f6
 fn empirical_cell_contractions_match_the_dense_row_program_3290() {
     let grid_nodes = grid().nodes.len();
     for link_internal_knots in [2usize, 4] {
-        let result = row_contractions(link_internal_knots);
+        let result = row_contractions(link_internal_knots, 1);
         let label = format!("r={} link width={}", result.r, result.link_width);
         assert_matches_dense(
             &format!("{label} third"),
@@ -309,14 +329,16 @@ fn empirical_cell_contractions_match_the_dense_row_program_3290() {
 }
 
 /// The per-contraction cost record for gam#3290: the cell route and the dense
-/// row program at the issue's link widths (`internal_knots = 2` and the
-/// eight-knot default), one row, one call each. Diagnostic only: wall time on
+/// row program from the issue's link width (`internal_knots = 2`) past the
+/// eight-knot default, one row, the median of nine warm calls per route, the
+/// dense one including the row-program compile its callers paid per
+/// contraction. Diagnostic only: wall time on
 /// a shared runner is not asserted here; the acceptance measurement is the
 /// #3011 fit's per-evaluation wall on its own hardware.
 #[test]
 fn zz_measure_3290_cell_and_dense_contraction_cost() {
-    for link_internal_knots in [2usize, 4, 8] {
-        let result = row_contractions(link_internal_knots);
+    for link_internal_knots in [2usize, 4, 8, 16] {
+        let result = row_contractions(link_internal_knots, 9);
         let [[third, dense_third], [fourth, dense_fourth]] = result.elapsed;
         eprintln!(
             "gam#3290 cost r={} link width={}: third cells {third:?} dense {dense_third:?}; \

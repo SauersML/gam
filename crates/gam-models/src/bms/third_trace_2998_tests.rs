@@ -7,9 +7,10 @@
 //! Ban-scanner-safe: a bare `#[cfg(test)] mod third_trace_2998_tests;` in
 //! `bms/mod.rs` with the allowed `*_tests` name.
 
-use super::calibration_cells::EMPIRICAL_CELL_MOMENT_DEGREE;
 use super::family::*;
-use super::factored_link_block_3290_tests::{dense_third_contracted, empirical_flex_fixture, grid};
+use super::factored_link_block_3290_tests::{
+    EMPIRICAL_NODE_TERM_OPERATIONS, dense_third_contracted, empirical_flex_fixture, grid,
+};
 use gam_math::roundoff::accumulation_growth;
 use ndarray::Array1;
 
@@ -72,12 +73,12 @@ fn check_link_knots(link_internal_knots: usize) {
         .map(|m| m.iter().zip(&gram).map(|(third, weight)| third * weight).sum())
         .collect();
 
-    // Both sides sum the grid through degree-D cell moments (or node by node)
-    // and then `r²` gram-weighted entries per output axis.
+    // Both sides sum the grid node by node, at most K rounded operations per
+    // node term, and then `r²` gram-weighted entries per output axis.
     let scale = expected.iter().fold(0.0f64, |acc, v| acc.max(v.abs()));
     assert!(scale > 0.0, "r={r}: third trace is identically zero");
     let nodes = grid().nodes.len();
-    let band = accumulation_growth(nodes * (EMPIRICAL_CELL_MOMENT_DEGREE + 1) + 2 * r * r) * scale;
+    let band = accumulation_growth(nodes * EMPIRICAL_NODE_TERM_OPERATIONS + 2 * r * r) * scale;
     for (c, (&got, &want)) in traced.iter().zip(&expected).enumerate() {
         assert!(
             (got - want).abs() <= band,

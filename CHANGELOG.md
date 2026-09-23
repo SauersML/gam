@@ -1,5 +1,11 @@
 ## Unreleased
 
+- **Marginal-slope fits under an empirical latent law evaluate their third- and fourth-order
+  calibration contractions as node sums over each partition cell, now faster than the dense row
+  program at every link width** (#3290). The fourth contraction was slower than dense at r ≥ 13
+  (moment contractions through degree 21 per cell, and `f64::mul_add` lowering to a software fma
+  call on the baseline x86-64 target, 37% of the profile). Median of nine warm calls, cells vs
+  dense: r = 11 1.32 vs 5.56 ms, r = 17 3.19 vs 6.56 ms, r = 25 7.12 vs 14.87 ms.
 - **A custom-family outer evaluation outside the branch continuation published a mode at its fold
   with no way out of its basin** (gam#3173). The cf-inner route (`evaluate_on_branch`) follows the
   walk's branch to its fold and hands over there only where the single-block continuation covers
