@@ -723,6 +723,55 @@ fn zero_slack_multipliers(zero_rows: &Array2<f64>, gradient: &Array1<f64>) -> Re
     Ok(vectors.dot(&scaled))
 }
 
+/// How EP damps its site updates from one sweep to the next, and what its floor exit compares
+/// (gam#3257). [`RecoveringDamping`] is the rule EP runs; the seam exists so a test can run a
+/// superseded rule through the same sweep.
+trait EpDampingRule {
+    /// The share of its full update every site takes on the next sweep, after a sweep whose full
+    /// update moved the sites `step` rounding units against `previous_step` on the sweep before.
+    fn next_fraction(&self, fraction: f64, step: f64, previous_step: f64) -> f64;
+
+    /// Whether a sweep that changed `L` by `change`, against its rounding band `band`, at the share
+    /// `fraction`, has reached the floor the value's own rounding sets.
+    fn value_at_floor(&self, change: f64, band: f64, fraction: f64) -> bool;
+}
+
+/// Halve the share after a sweep whose full update did not shrink and double it back, up to the
+/// whole update, after one that did; hold only the change beyond `L`'s own rounding band against
+/// the damped share of it.
+///
+/// Neither rule moves a fixed point: a damped sweep takes `(1 − f)·s + f·u(s)` at each site, which
+/// equals `s` exactly when `u(s) = s`, for every `f` in `(0, 1]`. The damping sets only the rate,
+/// about `f` of a full sweep's contraction per sweep, so a share that is never restored keeps EP
+/// crawling long after the transient that cut it has passed. Near its fixed point `step` is
+/// measured in rounding units and fluctuates, and under a halve-only rule each non-decrease was
+/// another permanent halving (to `2⁻³⁷` on the #3257 fit).
+///
+/// The band is `L`'s own rounding, and it enters a sweep's change whatever the damping is: `value`
+/// and `previous` are each formed to within it, so their difference carries up to `band` of
+/// arithmetic even when no site moved. The damping scales only the systematic part, the move a
+/// sweep's sites make toward the fixed point, which is `fraction` of the full update's. So the full
+/// update would move `L` by no more than its band exactly when the change beyond the arithmetic is
+/// within `fraction · band`. A floor on the whole change against `fraction · band` asks the
+/// arithmetic itself to shrink with the damping, which it does not: once `fraction` is small that
+/// exit can never fire, and EP crawls to `step ≤ 1` at `fraction` of a sweep's contraction per
+/// sweep (26 million sweeps per pricing on the #3257 fit).
+struct RecoveringDamping;
+
+impl EpDampingRule for RecoveringDamping {
+    fn next_fraction(&self, fraction: f64, step: f64, previous_step: f64) -> f64 {
+        if step < previous_step {
+            (2.0 * fraction).min(1.0)
+        } else {
+            0.5 * fraction
+        }
+    }
+
+    fn value_at_floor(&self, change: f64, band: f64, fraction: f64) -> bool {
+        change - band <= fraction * band
+    }
+}
+
 impl ConeLaplace {
     /// Evaluate `L` at a mode. `rows · β ≥ bounds` is the constraint system over the joint
     /// coefficients (any row scale), `gradient` is `∇F(β̂)`, and `precision` is the precision `M`
@@ -733,6 +782,18 @@ impl ConeLaplace {
         beta: &Array1<f64>,
         gradient: &Array1<f64>,
         precision: &Array2<f64>,
+    ) -> Result<Self, ConeLaplaceRefusal> {
+        Self::evaluate_with_damping(rows, bounds, beta, gradient, precision, &RecoveringDamping)
+    }
+
+    /// [`Self::evaluate`] under a named EP damping rule.
+    fn evaluate_with_damping(
+        rows: &Array2<f64>,
+        bounds: &Array1<f64>,
+        beta: &Array1<f64>,
+        gradient: &Array1<f64>,
+        precision: &Array2<f64>,
+        damping: &dyn EpDampingRule,
     ) -> Result<Self, ConeLaplaceRefusal> {
         let p = beta.len();
         if rows.ncols() != p || bounds.len() != rows.nrows() || gradient.len() != p || precision.dim() != (p, p)
@@ -810,7 +871,7 @@ impl ConeLaplace {
             // does not give `B_i ≻ 0`, which needs `M` positive in every direction coupling to
             // `a_i` through `B_i⁻¹`. `M`'s inertia would close it in both directions and belongs
             // where the matrix is assembled and already factored, not here (gam#4571).
-            let term = Self::converge(&mode, &chosen, &tau, &nu).map_err(|refusal| {
+            let term = Self::converge(&mode, &chosen, &tau, &nu, damping).map_err(|refusal| {
                 let ConeLaplaceRefusal::Fold {
                     row,
                     variance,
@@ -860,7 +921,13 @@ impl ConeLaplace {
     }
 
     /// EP on the rows `chosen` of the mode's distinct rows from the sites `(tau, nu)`.
-    fn converge(mode: &ModeInputs<'_>, chosen: &[usize], tau: &[f64], nu: &[f64]) -> Result<Self, ConeLaplaceRefusal> {
+    fn converge(
+        mode: &ModeInputs<'_>,
+        chosen: &[usize],
+        tau: &[f64],
+        nu: &[f64],
+        damping: &dyn EpDampingRule,
+    ) -> Result<Self, ConeLaplaceRefusal> {
         let ModeInputs { precision: precision_m, gradient, beta, distinct, caller_rows } = *mode;
         let p = gradient.len();
         let q = chosen.len();
@@ -943,10 +1010,11 @@ impl ConeLaplace {
             let band = band_of(share_magnitude + 0.5 * part.log_det.abs());
             let change = (value - previous).abs();
             // Settled: no site moves beyond its rounding. Or at the floor the sites' own rounding
-            // sets: `L` no longer moves beyond its band (a damped sweep moves it by about `fraction`
-            // of the full update) and a full sweep no longer shrinks the sites' move, so no further
-            // sweep can bring them closer to the fixed point.
-            let at_floor = change <= fraction * band && !(step < previous_step);
+            // sets: a full sweep no longer shrinks the sites' move, and `L` moved by no more than
+            // the damped share of its band beyond that band ([`RecoveringDamping`] states why the
+            // band is taken out of the change first).
+            let at_floor =
+                damping.value_at_floor(change, band, fraction) && !(step < previous_step);
             if step <= 1.0 || at_floor {
                 return Ok(Self {
                     value,
@@ -975,11 +1043,9 @@ impl ConeLaplace {
                 return Err(ConeLaplaceRefusal::NotContracting { sweeps, fraction, step });
             }
             // The change need not fall monotonically: on strongly correlated rows it can grow for
-            // one sweep and then contract geometrically. A sweep whose full update did not shrink
-            // halves the share of it every later site takes, which leaves the fixed points unchanged.
-            if !(step < previous_step) {
-                fraction *= 0.5;
-            }
+            // one sweep and then contract geometrically, so the share each later site takes of its
+            // full update follows the sweeps ([`RecoveringDamping`]); no share moves a fixed point.
+            fraction = damping.next_fraction(fraction, step, previous_step);
             previous_step = step;
             previous = value;
         }
@@ -1456,6 +1522,172 @@ mod tests {
         let fine = (half_plus - half_minus) / h;
         let noise = (plus_noise + minus_noise) / (2.0 * h) + (half_plus_noise + half_minus_noise) / h;
         ((4.0 * fine - coarse) / 3.0, (fine - coarse).abs() + 4.0 * noise)
+    }
+
+    /// The EP damping rule [`RecoveringDamping`] replaced, exactly: the share only ever halves,
+    /// and the floor exit holds a sweep's whole change against `fraction · band`.
+    struct HalveOnlyDamping;
+
+    impl EpDampingRule for HalveOnlyDamping {
+        fn next_fraction(&self, fraction: f64, step: f64, previous_step: f64) -> f64 {
+            if step < previous_step {
+                fraction
+            } else {
+                0.5 * fraction
+            }
+        }
+
+        fn value_at_floor(&self, change: f64, band: f64, fraction: f64) -> bool {
+            change <= fraction * band
+        }
+    }
+
+    /// gam#3257: EP's damping recovers once the sweeps contract again.
+    ///
+    /// The instance is the incident itself, not a constructed one: the first cone-Laplace pricing
+    /// whose EP reached 100 000 sweeps in the binomial `flexible(probit)` fit of the issue's
+    /// (3014, 2000) sample, captured at `7e3646325d` under the superseded rule, where it took
+    /// 156 746 sweeps at a share of `2⁻¹⁴`. Eleven rows `β_w ≥ 0` on a 13-coefficient mode, one at
+    /// the wall, and a warp block penalized at `λ ≈ 1.4·10⁷`, so the sites couple through `Λ⁻¹`
+    /// almost perfectly. A grid of 128 AR(1) instances built to imitate it never collapsed the
+    /// share past one halving.
+    ///
+    /// Both arms are comparisons on that one instance, so neither carries a constant. The
+    /// recovering rule restores the whole update after the transient that cut it, so it ends at a
+    /// larger share than the halve-only rule's collapsed one and takes strictly fewer sweeps. Were
+    /// production still running the halve-only rule, the two runs would be the same run and both
+    /// strict comparisons would fail: that is the positive control. No rate-based sweep bound is
+    /// asserted: undamped EP does not converge on this instance (over a million sweeps with its
+    /// step near 10⁶ rounding units), so the EP map's own rate is not measurable here.
+    ///
+    /// Nor is agreement of the two runs' `L` to their reported bands asserted: they differ by a few
+    /// 1e-6 against bands near 7e-12. Each site is the difference of a tilted and a cavity precision
+    /// near `λ`, so the sites, and `L` through them, are known only to that difference's rounding,
+    /// which the reported band does not carry. That band accounting is its own defect.
+    #[test]
+    fn ep_damping_recovers_and_its_floor_exit_fires_at_the_rounding_band_3257() {
+        let precision = ndarray::array![
+            [
+                674.5813074433105, -310.1827473636024, -3.6108125975714453, -7.142175676922976,
+                -5.860997277998256, 4.1397006851389, 14.782970050149356, 12.805000800702553,
+                0.13673370277701596, -9.397823998628024, -8.064379431233155, -3.481723644485358,
+                -0.7650023523350322,
+            ],
+            [
+                -310.18274736360246, 791.6987068009604, 13.824030835146214, 31.048402673992257,
+                40.10004109000729, 32.06778123159466, 11.364742939872032, -9.393042405813638,
+                -28.066050935001865, -36.19378789618029, -26.193858412443817, -12.035389777067873,
+                -2.9075334634508736,
+            ],
+            [
+                -3.6108125975714436, 13.824030835146214, 83782371.82609095, -62836716.113520764,
+                13963702.831609407, 1.754713720629778, -3.2885123052758214, -5.5394263901767005,
+                -4.941797812946503, -2.7957016339132252, -0.9915324177574697, -0.31115466311935125,
+                -0.06458682961198949,
+            ],
+            [
+                -7.142175676922973, 31.048402673992264, -62836716.11352077, 52363950.97374576,
+                -17454615.333592217, 3490930.9291131618, -7.298588344416003, -13.968184855104019,
+                -12.755559176212397, -7.173045832356873, -2.4633383979341876, -0.7461839069153365,
+                -0.15180513930031253,
+            ],
+            [
+                -5.860997277998253, 40.10004109000729, 13963702.831609407, -17454615.333592217,
+                13963747.182602776, -9309122.118370317, 2327275.606128796, -21.103690529577843,
+                -20.63173386307935, -11.664758169554965, -3.8492367079084326, -1.104937864474891,
+                -0.21716439810570917,
+            ],
+            [
+                4.139700685138897, 32.06778123159466, 1.754713720407446, 3490930.9291131618,
+                -9309122.118370319, 13963745.51859758, -9309133.21316085, 2327264.9554497497,
+                -23.420760684784057, -14.154969769520234, -4.551591663416387, -1.2164152072759824,
+                -0.2254809206319379,
+            ],
+            [
+                14.782970050149354, 11.364742939872032, -3.2885123053012952, -7.298588344408338,
+                2327275.606128796, -9309133.21316085, 13963740.996271253, -9309133.78167376,
+                2327271.0728080436, -10.431400349600231, -3.6202976645465927, -0.9211115581324422,
+                -0.15790351142964087,
+            ],
+            [
+                12.805000800702553, -9.39304240581364, -5.539426390246151, -13.968184855063173,
+                -21.103690529535417, 2327264.9554497497, -9309133.78167376, 13963744.475156993,
+                -9309126.13212818, 2327283.6517242333, -0.7550532531779872, -0.2144233808679621,
+                -0.024501863766303315,
+            ],
+            [
+                0.1367337027770171, -28.06605093500187, -4.941797812963871, -12.75555917635677,
+                -20.631733862477216, -23.42076068514051, 2327271.0728080436, -9309126.132128181,
+                13963747.516128812, -9309124.918883655, 2327286.097183382, 0.7765196641133881,
+                0.15224613519172311,
+            ],
+            [
+                -9.397823998628024, -36.1937878961803, -2.7957016341413143, -7.173045832583775,
+                -11.664758169296102, -14.154969769010657, -10.431400350104541, 2327283.651724234,
+                -9309124.918883657, 13963734.362895725, -9309134.823170416, 3490925.406889451,
+                0.26391249138644257,
+            ],
+            [
+                -8.064379431233151, -26.193858412443817, -0.991532416345837, -2.463338398063727,
+                -3.849236708164254, -4.551591664645125, -3.620297663786411, -0.7550532535939708,
+                2327286.0971833817, -9309134.823170416, 13963720.94983781, -17454634.183277622,
+                13963695.941960784,
+            ],
+            [
+                -3.481723644485361, -12.035389777067873, -0.3111546680337974, -0.746183910163516,
+                -1.1049378642771197, -1.2164152072524392, -0.9211115580574509,
+                -0.21442338095084007, 0.7765196637583346, 3490925.406889451, -17454634.183277622,
+                52363930.98284782, -62836725.79169249,
+            ],
+            [
+                -0.7650023523350333, -2.9075334634508727, -0.06458682639988948,
+                -0.15180513753496297, -0.21716439972851267, -0.22548092007488843,
+                -0.15790351149551646, -0.024501863691042087, 0.1522461350594899,
+                0.2639124917167722, 13963695.941960784, -62836725.79169249, 83782364.75258636,
+            ],
+        ];
+        let beta = ndarray::array![
+            0.31873625063538497, 1.061361357803822, 0.0, 0.033198289254217604, 0.14939249795902548,
+            0.24898777342402817, 0.34858290357646415, 0.44817780785432004, 0.5477721846845723,
+            0.6473658666062775, 0.746958961991805, 0.5643676357176183, 0.29878252891695467,
+        ];
+        let gradient = ndarray::array![
+            -1.5417778165272011e-09, -4.056847080491366e-09, 0.0008503931962016709,
+            -9.993317284795467e-11, 6.538760644048125e-10, -1.784550285321984e-11,
+            4.628781802296089e-10, 6.323260248741747e-10, -2.5134505587942613e-09,
+            -8.797795825188359e-11, 1.9496240177829804e-09, 7.658542688915304e-10,
+            1.2902381940627095e-10,
+        ];
+        let rows = Array2::from_shape_fn((11, 13), |(i, j)| if j == i + 2 { 1.0 } else { 0.0 });
+        let bounds = Array1::<f64>::zeros(11);
+        let run = |rule: &dyn EpDampingRule, label: &str| {
+            ConeLaplace::evaluate_with_damping(&rows, &bounds, &beta, &gradient, &precision, rule)
+                .unwrap_or_else(|refusal| panic!("{label} EP converges: {refusal}"))
+        };
+        let recovering = run(&RecoveringDamping, "recovering");
+        let halve_only = run(&HalveOnlyDamping, "halve-only");
+        eprintln!(
+            "[3257-EP] recovering: sweeps {} fraction {:e} L {:.15e}; halve-only: sweeps {} \
+             fraction {:e} L {:.15e}",
+            recovering.sweeps(),
+            recovering.ep_step_fraction(),
+            recovering.value(),
+            halve_only.sweeps(),
+            halve_only.ep_step_fraction(),
+            halve_only.value(),
+        );
+        assert!(
+            recovering.ep_step_fraction() > halve_only.ep_step_fraction(),
+            "the recovering rule ended at share {:e}, not above the halve-only rule's collapsed {:e}",
+            recovering.ep_step_fraction(),
+            halve_only.ep_step_fraction()
+        );
+        assert!(
+            recovering.sweeps() < halve_only.sweeps(),
+            "the recovering rule took {} sweeps, not fewer than the halve-only rule's {}",
+            recovering.sweeps(),
+            halve_only.sweeps()
+        );
     }
 
     /// Where `M` is positive definite the term is the covariance form's `½ln|M| + C`: the same EP

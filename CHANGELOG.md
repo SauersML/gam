@@ -1,5 +1,14 @@
 ## Unreleased
 
+- **The cone-Laplace (EP) damping recovers after a transient, so a strongly coupled constrained
+  fit no longer crawls for hours** (#3257). EP halved the share of each site's full update after
+  every sweep that failed to shrink it and never restored it; near the fixed point that step
+  fluctuates in rounding units, so each non-decrease was another permanent halving. On the
+  captured pricing from the issue's binomial `flexible(probit)` fit (11 rows on 13 coefficients,
+  a warp penalty near 1.4·10⁷) that took 156 746 sweeps at a share of 2⁻¹⁴. The share now
+  doubles back, up to the whole update, after a sweep whose full update shrank: the same pricing
+  converges in 61 sweeps. The floor exit also discounts `L`'s own rounding band before comparing
+  the change with the damped share, so it can fire at a small share.
 - **Marginal-slope fits under an empirical latent law evaluate their third- and fourth-order
   calibration contractions as node sums over each partition cell, now faster than the dense row
   program at every link width** (#3290). The fourth contraction was slower than dense at r ≥ 13
