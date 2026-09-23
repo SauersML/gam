@@ -4055,5 +4055,14 @@
     ],
     "reason": "gam#3290: an empirical-law flex row's third and fourth contractions, its third-trace gradient and the projected fourth of the second-order logdet corrections now sum the row's calibration cells (bms/calibration_cells.rs), the lowering the standard-normal law already used, with each cell visiting only its active columns. The dense row-program jets these items carried for those consumers (the {4, 8, 12, 18} fixed-width table and its schedules, the fixed- and dynamic-width third/fourth contractions, the dense trace gradient, the projected dense fourth, the lane budget and the fit-owned jet scratch pools that only they used, and the contiguous-range calibration schedules the active-column loops replaced) have no production caller left. The tests removed exercised only those paths (fixed-vs-dynamic parity and timing, scratch-pool charging, the lane budget) or are replaced: factored_third_trace_matches_per_axis_contraction_2998 by cell_third_trace_matches_per_axis_dense_contraction_2998, and the dense oracles now live in factored_link_block_3290_tests.",
     "evidence": "At c365abf90f024c8cee3e0c05f3178a6062908689 (batch8 applied onto 2d525961f8), `git grep -n -w <name>` over the whole tree finds none of the 44 names in any .rs, .py, .toml, workflow or script file; the only hit is release_measure_bms_empirical_third_fourth_fixed_vs_dynamic_932 in docs/issue-932-reopening-audit.md:118, a historical record. Every production caller moved to the cell route in the same patch: flex_axis_{third,fourth}_tensors_for_row, row_primary_third_contracted_with_moments, row_primary_third_contracted_many_with_moments, row_primary_third_trace_gradient_with_moments, row_primary_fourth_contracted_ordered/_many and batched_second_correction_logdet_traces. Oracle coverage: factored_link_block_3290_tests (cells vs dense third and fourth at two link widths), cell_third_trace_matches_per_axis_dense_contraction_2998 (trace gradient vs dense per-axis), and the 2922 second-correction trace tests (projected fourth)."
+  },
+  {
+    "base": "97fe005ce83fe8667d121c10615a6d1eafe48233",
+    "items": [
+      "crates/gam-solve/src/gaussian_reml.rs:fn:gaussian_reml_blocks_profile_cost",
+      "crates/gam-solve/src/gaussian_reml.rs:fn:gaussian_reml_blocks_profile_outer_eval"
+    ],
+    "reason": "deb6da876e: exact block Gaussian REML now minimises its exact profiled jet with certified_newton_minimum (GaussianRemlBlocksProfile::jet); the two private OuterProblem adapters that fed the generic outer runner have no caller left.",
+    "evidence": "git grep for both names at deb6da876e finds no occurrence outside the removed definitions; cargo check --workspace --all-targets green (gateB lane)."
   }
 ]
