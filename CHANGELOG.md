@@ -1,5 +1,17 @@
 ## Unreleased
 
+- **`curv()` recovers the sign of κ on data from its own kernel family, reports its range on the
+  distance-kernel face when the profile reaches it, and certifies a κ̂ resting on a derived chart
+  wall by local box-KKT** (#1464). The range solve reported an interior minimum at ℓ = 2.3e6 on
+  the ray toward the distance-kernel face (`V_η/V_ηη = −1`); one value evaluation at the face now
+  decides it and reports `DistanceKernelLimit`. Curvature inference refused a κ̂ railed at the
+  Möbius antipodal fold because the whole-box quadratic model predicted a descent across a
+  resolvable rise; a rail whose score points out of the box and whose inward rise is resolvable is
+  now a local minimum. The likelihood-ratio walk no longer refuses on a probe outside the
+  likelihood set whose model falls beyond it (a multimodal profile). The contract's data are now
+  draws from the model's own kernel family at κ* = ±2. The old saturating radial generator is kept
+  as a documented case, since within the family the spherical distance kernel explains it better
+  than any hyperbolic fit.
 - **Shared-tangent (response-geometry) Gaussian REML no longer refuses fits it has converged, and an
   outer certificate no longer clears a resolvable negative curvature on its gradient floor** (#2627).
   The route capped its outer certificate at a hand-set `|Pg| ≤ √ε·D`; its search accepts a step only

@@ -676,6 +676,27 @@ impl<'a> ConstantCurvatureProfile<'a> {
         } else {
             RangeSolveOutcome::Uncertified
         };
+        // A certified η̂ whose slope still points at a face is not the minimum over
+        // the derived range when that face is no higher: the profile is then the
+        // face's value, reached (#1464). On the κ*=−2 fixture the solve stopped at
+        // ln ℓ = 14.6 with V_η/V_ηη = −1 — the exponential approach to the
+        // distance-kernel face at ln ℓ = 18.3 — and reported an interior minimum at
+        // ℓ = 2.3e6, whose value was the face's to 1.8e-4. One value evaluation at
+        // the face decides it, with nothing to tune.
+        if outcome == RangeSolveOutcome::InteriorMinimum {
+            let toward = if jet.gradient[1] < 0.0 {
+                Some((hi, RangeSolveOutcome::DistanceKernelLimit))
+            } else if jet.gradient[1] > 0.0 {
+                Some((lo, RangeSolveOutcome::EvaluabilityWall))
+            } else {
+                None
+            };
+            if let Some((face, face_outcome)) = toward
+                && self.evaluate_value(kappa, face)? <= jet.value
+            {
+                return Ok((face, self.evaluate_psi(kappa, face)?, face_outcome));
+            }
+        }
         Ok((eta, jet, outcome))
     }
 
@@ -1054,6 +1075,273 @@ mod profile_model_contract_tests {
             let FitRequest::Standard(request)=materialize(formula,&data,&config).unwrap().request else {panic!("standard request")};
             let verdict=validate_constant_curvature_profile_inputs(&request.spec,0,request.weights.view(),request.offset.view(),&request.family);
             if accepted {verdict.unwrap();} else {assert!(verdict.unwrap_err().to_string().contains("exactly `y ~ curv(...)`"),"{formula}");}
+        }
+    }
+}
+
+/// κ recovery on draws from the model's own family (#1464).
+///
+/// `curv()` estimates the κ of the kernel family it fits, `exp(−d_κ/ℓ)` closed by
+/// its derived faces (the Gram-resolvability wall and the distance-kernel face
+/// `−d_κ`, #2747). A contract can only ask it to recover κ from data that family
+/// generates, so the fixtures here are combinations of the family's own kernel at
+/// κ* = ±2, ℓ* = 1, at the term's realized centres, over the #1464 disc (radius
+/// 0.68, 600 points, noise 0.02). The old generator `2e^{−d_hyp} − 1` is kept as a documented case: it is
+/// not a draw from the family, and within the family the spherical distance kernel
+/// explains it better than any hyperbolic fit, which is the #2747 behaviour working
+/// as designed and is pinned as such.
+#[cfg(test)]
+mod kappa_recovery_1464_tests {
+    use super::*;
+    use crate::fit_orchestration::request::StandardFitRequest;
+    use crate::fit_orchestration::{FitConfig, FitRequest, materialize};
+    use gam_geometry::manifolds::ConstantCurvature;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use rand_distr::{Distribution, Normal, Uniform};
+
+    const RADIUS: f64 = 0.68;
+    const ROWS: usize = 600;
+    const NOISE: f64 = 0.02;
+
+    /// Uniform points on the disc of radius [`RADIUS`], each with its noise draw.
+    fn disc_sample() -> Vec<([f64; 2], f64)> {
+        let mut rng = StdRng::seed_from_u64(1);
+        let unit = Uniform::new(-1.0_f64, 1.0).expect("uniform");
+        let noise = Normal::new(0.0, NOISE).expect("normal");
+        let mut sample = Vec::with_capacity(ROWS);
+        while sample.len() < ROWS {
+            let (a, b) = (unit.sample(&mut rng), unit.sample(&mut rng));
+            if a * a + b * b > 1.0 {
+                continue;
+            }
+            sample.push(([a * RADIUS, b * RADIUS], noise.sample(&mut rng)));
+        }
+        sample
+    }
+
+    fn encode(rows: impl Iterator<Item = ([f64; 2], f64)>) -> gam_data::EncodedDataset {
+        let rows = rows
+            .map(|([u, v], y)| csv::StringRecord::from(vec![y.to_string(), u.to_string(), v.to_string()]))
+            .collect();
+        let headers = ["y", "x1", "x2"].into_iter().map(String::from).collect();
+        gam_data::encode_recordswith_inferred_schema(headers, rows).expect("encode")
+    }
+
+    /// The disc sample with response `response(x) + noise`.
+    fn disc_dataset(response: impl Fn([f64; 2]) -> f64) -> gam_data::EncodedDataset {
+        encode(disc_sample().into_iter().map(|(x, noise)| (x, response(x) + noise)))
+    }
+
+    /// A draw from the family `curv(x1, x2, centers=10)` fits: the kernel
+    /// `exp(−d_κ*(x, c_j)/ℓ*)`, ℓ* = 1, at the term's own realized centres `c_j`,
+    /// with coefficients that sum to zero as the term's `CenterSumToZero`
+    /// constraint requires, and the geodesic distance the basis evaluates.
+    ///
+    /// Both halves are what makes it in-family. A combination at centres the
+    /// basis does not hold, or with coefficients off the constraint, is not in the
+    /// span at any κ, and its best approximation need not be at κ*: with five
+    /// hand-placed centres and coefficients summing to 1.5, κ* = −2 was published
+    /// at κ̂ = +2.02, and with the sum made zero at κ̂ = +2.13.
+    fn kernel_draw(kappa_star: f64) -> gam_data::EncodedDataset {
+        const WEIGHTS: [f64; 10] = [2.0, -1.5, 1.2, -1.0, 0.8, -0.6, 0.5, -0.4, 0.3, -1.3];
+        let sample = disc_sample();
+        // The centres depend on the covariates alone, so any response realizes them.
+        let covariates = encode(sample.iter().copied());
+        let request = request(&covariates);
+        let (feature_cols, spec) = match &request.spec.smooth_terms[0].basis {
+            SmoothBasisSpec::ConstantCurvature { feature_cols, spec, .. } => (feature_cols, spec),
+            _ => panic!("curv term"),
+        };
+        let x_term = select_columns(request.data.view(), feature_cols).expect("columns");
+        let realized = gam_terms::basis::constant_curvature_realized_centers(x_term.view(), spec)
+            .expect("realized centres");
+        assert_eq!(realized.nrows(), WEIGHTS.len(), "centers=10 realizes ten centres");
+        // The coefficients are assigned in lexicographic centre order, so the draw
+        // does not depend on the order the selector lists its centres in.
+        let mut centres: Vec<[f64; 2]> = realized.outer_iter().map(|c| [c[0], c[1]]).collect();
+        centres.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+        let manifold = ConstantCurvature::new(2, kappa_star);
+        encode(sample.into_iter().map(|(x, noise)| {
+            let point = ndarray::array![x[0], x[1]];
+            let signal: f64 = centres
+                .iter()
+                .zip(WEIGHTS)
+                .map(|(centre, weight)| {
+                    let d = manifold
+                        .distance(point.view(), ndarray::array![centre[0], centre[1]].view())
+                        .expect("every point and centre is inside the chart");
+                    weight * (-d).exp()
+                })
+                .sum();
+            (x, signal + noise)
+        }))
+    }
+
+    /// The pre-#1464-ruling generator: a radial response `2e^{−d} − 1` in the
+    /// geodesic distance from the origin at κ*. Not a draw from the family.
+    fn saturating_radial(kappa_star: f64) -> gam_data::EncodedDataset {
+        let root = kappa_star.abs().sqrt();
+        disc_dataset(|[u, v]| {
+            let r = u.hypot(v);
+            let d = if kappa_star < 0.0 {
+                2.0 * (root * r).min(1.0 - 1e-9).atanh() / root
+            } else if kappa_star > 0.0 {
+                2.0 * (root * r).atan() / root
+            } else {
+                2.0 * r
+            };
+            2.0 * (-d).exp() - 1.0
+        })
+    }
+
+    fn request(data: &gam_data::EncodedDataset) -> StandardFitRequest<'_> {
+        let config = FitConfig {
+            family: Some("gaussian".into()),
+            ..FitConfig::default()
+        };
+        let FitRequest::Standard(request) =
+            materialize("y ~ curv(x1, x2, centers=10)", data, &config).expect("materialize").request
+        else {
+            panic!("standard request");
+        };
+        request
+    }
+
+    fn published(request: &StandardFitRequest<'_>, label: &str) -> ConstantCurvatureOptimum {
+        let optimum = constant_curvature_kappa_profile_optimum(
+            request.data.view(),
+            request.y.view(),
+            &request.spec,
+            0,
+            &request.options,
+        )
+        .expect("the κ profile certifies an optimum");
+        eprintln!(
+            "[1464-KAPPA] {label}: kappa_hat={:+.6} range={:.6e}",
+            optimum.kappa, optimum.length_scale
+        );
+        optimum
+    }
+
+    /// The curvature report the Python contract reads (`FittedModel.curvature`):
+    /// [`curvature_inference_forspec`] on the spec the fit publishes, κ̂ and ℓ̂
+    /// written back as `spatial_kappa_incumbent` writes them. It must certify
+    /// κ̂, rail or not, and report it unchanged.
+    fn curvature_report(
+        request: &StandardFitRequest<'_>,
+        optimum: &ConstantCurvatureOptimum,
+        label: &str,
+    ) -> CurvatureInference {
+        let mut spec = request.spec.clone();
+        let Some(SmoothBasisSpec::ConstantCurvature { spec: cc, .. }) =
+            spec.smooth_terms.get_mut(0).map(|term| &mut term.basis)
+        else {
+            panic!("curv term");
+        };
+        cc.kappa = optimum.kappa;
+        cc.length_scale = optimum.length_scale;
+        let report = curvature_inference_forspec(
+            request.data.view(),
+            request.y.view(),
+            request.weights.view(),
+            request.offset.view(),
+            &spec,
+            0,
+            request.family.clone(),
+            0.95,
+        )
+        .expect("curvature inference certifies the published κ̂");
+        eprintln!(
+            "[1464-KAPPA] {label}: report kappa_hat={:+.6} ci=({:+.4},{:+.4}) support={} range={:.6e}",
+            report.kappa_hat,
+            report.ci.ci_lo,
+            report.ci.ci_hi,
+            report.ci.kappa_hat_support.label(),
+            report.length_scale_hat
+        );
+        assert_eq!(report.kappa_hat, optimum.kappa, "{label}: the report restates κ̂");
+        report
+    }
+
+    #[test]
+    fn a_hyperbolic_kernel_draw_is_recovered_hyperbolic_1464() {
+        let data = kernel_draw(-2.0);
+        let request = request(&data);
+        let label = "kernel draw, kappa*=-2";
+        let optimum = published(&request, label);
+        assert!(optimum.kappa < 0.0, "κ* = −2 must be recovered hyperbolic, got κ̂ = {}", optimum.kappa);
+        curvature_report(&request, &optimum, label);
+    }
+
+    #[test]
+    fn a_spherical_kernel_draw_is_recovered_spherical_1464() {
+        let data = kernel_draw(2.0);
+        let request = request(&data);
+        let label = "kernel draw, kappa*=+2";
+        let optimum = published(&request, label);
+        assert!(optimum.kappa > 0.0, "κ* = +2 must be recovered spherical, got κ̂ = {}", optimum.kappa);
+        curvature_report(&request, &optimum, label);
+    }
+
+    /// The saturating radial profile generated at κ* = −2 is explained better by
+    /// the spherical distance kernel than by every certified hyperbolic fit: the
+    /// published κ̂ is spherical and its profiled criterion is below the best
+    /// criterion a κ search confined to the hyperbolic half of the chart certifies
+    /// from either of that half's ends.
+    #[test]
+    fn a_saturating_radial_profile_is_explained_best_by_the_spherical_distance_kernel_1464() {
+        let data = saturating_radial(-2.0);
+        let request = request(&data);
+        let optimum = published(&request, "saturating radial, kappa*=-2");
+        let (kappa_min, kappa_max) = constant_curvature_kappa_bounds(request.data.view(), &request.spec, 0);
+        let (feature_cols, base_spec) = match &request.spec.smooth_terms[0].basis {
+            SmoothBasisSpec::ConstantCurvature { feature_cols, spec, .. } => (feature_cols.clone(), spec.clone()),
+            _ => panic!("curv term"),
+        };
+        let x_term = select_columns(request.data.view(), &feature_cols).expect("columns");
+        let profile_from = |start: f64| {
+            let mut spec = base_spec.clone();
+            spec.kappa = start;
+            ConstantCurvatureProfile::new(x_term.view(), request.y.view(), spec).expect("profile")
+        };
+        let published_value = profile_from(optimum.kappa).evaluate(optimum.kappa).expect("profile at κ̂").0;
+        let hyperbolic: Vec<(f64, f64)> = [kappa_min, 0.0]
+            .into_iter()
+            .map(|start| {
+                let hyperbolic = solve_constant_curvature_kappa_profile(
+                    ROWS,
+                    profile_from(start),
+                    &request.options,
+                    kappa_min,
+                    0.0,
+                    0,
+                )
+                .expect("a κ search on the hyperbolic half certifies");
+                let value = profile_from(hyperbolic.kappa).evaluate(hyperbolic.kappa).expect("profile").0;
+                (hyperbolic.kappa, value)
+            })
+            .collect();
+        eprintln!(
+            "[1464-KAPPA] saturating radial: published kappa_hat={:+.6} V={published_value:.6} chart=[{kappa_min:+.6},{kappa_max:+.6}] hyperbolic certified (kappa, V)={hyperbolic:?}",
+            optimum.kappa
+        );
+        assert!(optimum.kappa > 0.0, "the published κ̂ is the spherical distance kernel's, got {}", optimum.kappa);
+        // It rests on the fold wall, and the curvature report certifies it there by
+        // local box-KKT rather than refusing it on the whole-box model. Its range
+        // is the distance-kernel face, reached and reported as such rather than
+        // as an interior minimum short of it.
+        let report = curvature_report(&request, &optimum, "saturating radial, kappa*=-2");
+        assert_eq!(
+            report.length_scale_support,
+            gam_geometry::curvature_estimand::RangeEstimateSupport::DistanceKernelLimit,
+            "the range at the published κ̂ is the distance-kernel face"
+        );
+        for (kappa, value) in hyperbolic {
+            assert!(
+                published_value < value,
+                "the published V = {published_value} must beat the certified hyperbolic fit at κ = {kappa}, V = {value}"
+            );
         }
     }
 }

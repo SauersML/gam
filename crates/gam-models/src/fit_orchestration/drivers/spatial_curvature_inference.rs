@@ -116,27 +116,35 @@ where
             break;
         }
         let (value, score, curvature) = profile(probe)?;
-        // The search assumes the profile rises outward through the likelihood
-        // set. A downward outward slope at a probe is refused only when the
-        // exact jet predicts a decrease larger than the resolution over the
-        // part of the bracket that is still outward of the probe.
-        let outward_score = direction * score;
-        let outward_decrease =
-            profile_model_decrease(outward_score, curvature, 0.0, (outside_x - probe).abs());
-        if outward_decrease > resolution {
-            return Err(format!(
-                "curvature profile changed direction before its likelihood crossing at \
-                 kappa={probe}: outward score {outward_score:.6e} and curvature \
-                 {curvature:.6e} predict a decrease of {outward_decrease:.6e}, above the \
-                 criterion resolution {resolution:.6e}"
-            ));
-        }
         let residual = value - value_hat - half_threshold;
         if residual >= 0.0 {
+            // Outside the likelihood set at any slope: the first crossing is in
+            // (inside_x, probe], and what the profile does past the probe has
+            // no bearing on it (gam#3509). On a multimodal profile it falls
+            // toward another basin there, which the jet's model over the rest
+            // of the bracket reads as a decrease (#1464).
             outside_x = probe;
             outside_residual = residual;
             outside_score = score;
         } else {
+            // The search assumes the profile rises outward through the
+            // likelihood set. A downward outward slope at a point inside it is
+            // refused when the exact jet predicts a decrease larger than the
+            // resolution over the part of the bracket still outward of the
+            // point: that is an interior maximum past which the walk could
+            // report a later crossing, a different component.
+            let outward_score = direction * score;
+            let outward_decrease =
+                profile_model_decrease(outward_score, curvature, 0.0, (outside_x - probe).abs());
+            if outward_decrease > resolution {
+                return Err(format!(
+                    "curvature profile changed direction inside its likelihood-ratio set at \
+                     kappa={probe}: outward score {outward_score:.6e} and curvature \
+                     {curvature:.6e} predict a decrease of {outward_decrease:.6e}, above the \
+                     criterion resolution {resolution:.6e} (V(kappa)={value:.9e}, \
+                     V(kappa) - V(kappa_hat) - half_threshold = {residual:.6e})"
+                ));
+            }
             inside_x = probe;
             inside_residual = residual;
         }
@@ -244,12 +252,34 @@ where
     // a rail the infeasible side has zero length, so a score pointing out of
     // the box is stationary by construction — the rail relaxation is the
     // feasible set, not a separate rule.
-    let predicted_decrease = profile_model_decrease(
-        score_hat,
-        curvature_hat,
-        kappa_min - kappa_hat,
-        kappa_max - kappa_hat,
-    );
+    //
+    // Except that the quadratic model, extrapolated across the whole box, is not
+    // a statement about κ̂ (#1464). At a rail on a derived wall with the score
+    // pointing out, every feasible move RAISES the profile to first order, and on
+    // a concave profile the model first rises to `s²/(2|c|)` at `t = −s/c` before
+    // it can fall. When that rise is itself resolvable, κ̂ is a box-KKT local
+    // minimum that the model's far-side descent cannot reach without crossing it:
+    // the far side is another basin, not a failure of this point's stationarity,
+    // and whether it is LOWER is a question of value that the likelihood-ratio
+    // walk below answers at the opposite bound (it refuses κ̂ if the bound is
+    // below it). Measured: a five-centre κ*=+2 draw railed at the fold with
+    // s = −12.8, c = −7.38 — a rise of 11.1 against a resolution of 8.3e-4 — and
+    // the whole-box model's decrease of 13.7 refused it. A rise at or below the resolution is not
+    // separated from a maximum along κ (#3453), so that case keeps the whole-box
+    // model.
+    let score_points_out = (at_upper && score_hat < 0.0) || (at_lower && score_hat > 0.0);
+    let resolvable_rise = curvature_hat >= 0.0
+        || score_hat * score_hat / (2.0 * curvature_hat.abs()) > resolution;
+    let predicted_decrease = if score_points_out && resolvable_rise {
+        0.0
+    } else {
+        profile_model_decrease(
+            score_hat,
+            curvature_hat,
+            kappa_min - kappa_hat,
+            kappa_max - kappa_hat,
+        )
+    };
     if predicted_decrease > resolution {
         // Name what was refused AGAINST, not just that something was refused.
         // A κ̂ that failed this check is either a genuine interior non-optimum or
@@ -547,6 +577,100 @@ mod curvature_profile_score_tests {
         );
     }
 
+    /// gam#1464: at a rail on a derived wall, stationarity is local box-KKT. A
+    /// concave profile railed at the upper wall with the score pointing out of the
+    /// box and a resolvable inward rise is accepted, although the whole-box
+    /// quadratic model predicts a descent at the far wall. The same shape with the
+    /// score pointing INTO the box, and the same shape with a rise below the
+    /// resolution, are still refused.
+    #[test]
+    fn a_rail_is_judged_by_local_box_kkt_not_the_whole_box_model_1464() {
+        // `V = s·t − 2t² + t⁴` in the displacement `t = κ − 1` from the upper
+        // wall. At the wall its jet is the concave quadratic `m(t) = s·t − 2t²`
+        // (the quartic has no value, slope or curvature there). At s = −3 the
+        // score points out of the box and `m` rises to 9/8 at t = −3/4 and falls
+        // to −2 at the lower wall t = −2, so the whole-box model predicts a
+        // descent. The profile itself does not descend: `V > 0` on all of
+        // `[−2, 0)`, so the rail is its minimum over the box, as it is on a
+        // profile the κ search has already compared across faces.
+        let concave_at = |score: f64| {
+            move |kappa: f64| -> Result<(f64, f64, f64), String> {
+                let t = kappa - 1.0;
+                Ok((
+                    score * t - 2.0 * t * t + t.powi(4),
+                    score - 4.0 * t + 4.0 * t.powi(3),
+                    -4.0 + 12.0 * t * t,
+                ))
+            }
+        };
+        assert!(
+            super::profile_model_decrease(-3.0, -4.0, -2.0, 0.0) > TEST_RESOLUTION,
+            "the fixture must be one the whole-box model refuses"
+        );
+        let mut railed = concave_at(-3.0);
+        let ci = curvature_profile_ci_from_analytic_score(
+            &mut railed,
+            1.0,
+            -1.0,
+            1.0,
+            0.95,
+            TEST_RESOLUTION,
+            f64::INFINITY,
+        )
+        .expect("a rail with the score pointing out and a resolvable rise is a box-KKT minimum");
+        assert_eq!(
+            ci.kappa_hat_support,
+            gam_geometry::curvature_estimand::KappaEstimateSupport::RailedAtUpperBound
+        );
+
+        let mut inward = concave_at(3.0);
+        let error = curvature_profile_ci_from_analytic_score(
+            &mut inward,
+            1.0,
+            -1.0,
+            1.0,
+            0.95,
+            TEST_RESOLUTION,
+            f64::INFINITY,
+        )
+        .expect_err("a rail whose score points into the box is not stationary");
+        assert!(error.contains("non-stationary"), "{error}");
+
+        // Out of the box, but the rise `s²/(2|c|)` is half the resolution: not
+        // separated from a maximum along κ, so the whole-box model decides.
+        let unresolved_score = -(TEST_RESOLUTION * 4.0).sqrt();
+        assert!(unresolved_score * unresolved_score / 8.0 < TEST_RESOLUTION);
+        let mut unresolved = concave_at(unresolved_score);
+        let error = curvature_profile_ci_from_analytic_score(
+            &mut unresolved,
+            1.0,
+            -1.0,
+            1.0,
+            0.95,
+            TEST_RESOLUTION,
+            f64::INFINITY,
+        )
+        .expect_err("an unresolvable rise leaves the whole-box model in charge");
+        assert!(error.contains("non-stationary"), "{error}");
+
+        // Off the rail the interior test decides: at the same profile's interior
+        // point κ = 1/4 (t = −3/4) the score is −27/16 and the curvature 11/4,
+        // a Newton decrease of about 0.52, far above the resolution, so it is
+        // refused although no wall is involved.
+        let mut interior = concave_at(-3.0);
+        let error = curvature_profile_ci_from_analytic_score(
+            &mut interior,
+            0.25,
+            -1.0,
+            1.0,
+            0.95,
+            TEST_RESOLUTION,
+            f64::INFINITY,
+        )
+        .expect_err("an interior maximum along κ is not an optimum");
+        assert!(error.contains("non-stationary"), "{error}");
+    }
+
     /// gam#3453: this layer used to re-test κ̂ against its own bar
     /// `|V_p'| ≤ max(rt, √ε)·(1 + |V_p|)`, which is in raw gradient units and
     /// scales with the ADDITIVE level of the criterion — so it refused κ̂ values
@@ -688,6 +812,54 @@ mod curvature_profile_score_tests {
             (ci.ci_lo + first_crossing).abs() <= endpoint_bound,
             "{ci:?}"
         );
+        assert!(!ci.lo_at_bound && !ci.hi_at_bound);
+    }
+
+    /// gam#3509 / #1464: a bracketing probe OUTSIDE the likelihood set closes the
+    /// bracket whatever the profile does beyond it. `V = aκ² − bκ⁴` on
+    /// `[−1.2, 1.2]` with `a = 6`, `b = 3` rises through the level at `κ ≈ 0.633`
+    /// and turns over at `κ = 1`, so the probe the walk takes at `κ = 0.9` is
+    /// outside the set, on a concave stretch whose quadratic model predicts a
+    /// fall over the rest of the bracket. That fall is past the crossing and is
+    /// not a reason to refuse; the #3245 resolution rewrite had moved the
+    /// direction-change refusal ahead of the inside/outside test and refused it.
+    #[test]
+    fn a_probe_outside_the_level_closes_the_bracket_whatever_follows_it_1464() {
+        let (a, b) = (6.0_f64, 3.0_f64);
+        let level = 0.95;
+        let z = gam_geometry::curvature_estimand::wald_half_width(1.0, level)
+            .expect("valid normal quantile");
+        let half_threshold = 0.5 * z * z;
+        let value = |kappa: f64| a * kappa * kappa - b * kappa.powi(4);
+        // The fixture must be the awkward case: the chart bound is above the
+        // level, and at the probe κ = 0.9 the profile is outside the set with an
+        // outward model that falls by more than the resolution before the bound.
+        assert!(value(1.2) > half_threshold && value(0.9) > half_threshold);
+        let score = 2.0 * a * 0.9 - 4.0 * b * 0.9_f64.powi(3);
+        let curvature = 2.0 * a - 12.0 * b * 0.81;
+        assert!(super::profile_model_decrease(score, curvature, 0.0, 0.3) > TEST_RESOLUTION);
+        let mut profile = |kappa: f64| -> Result<(f64, f64, f64), String> {
+            Ok((
+                value(kappa),
+                2.0 * a * kappa - 4.0 * b * kappa.powi(3),
+                2.0 * a - 12.0 * b * kappa * kappa,
+            ))
+        };
+        let ci = curvature_profile_ci_from_analytic_score(
+            &mut profile,
+            0.0,
+            -1.2,
+            1.2,
+            level,
+            TEST_RESOLUTION,
+            f64::INFINITY,
+        )
+        .expect("an outside probe closes the bracket");
+        let first_crossing = ((a - (a * a - 4.0 * b * half_threshold).sqrt()) / (2.0 * b)).sqrt();
+        let slope = 2.0 * a * first_crossing - 4.0 * b * first_crossing.powi(3);
+        let endpoint_bound = TEST_RESOLUTION / slope;
+        assert!((ci.ci_hi - first_crossing).abs() <= endpoint_bound, "{ci:?}");
+        assert!((ci.ci_lo + first_crossing).abs() <= endpoint_bound, "{ci:?}");
         assert!(!ci.lo_at_bound && !ci.hi_at_bound);
     }
 
