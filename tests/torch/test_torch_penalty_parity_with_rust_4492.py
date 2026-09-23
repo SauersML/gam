@@ -10,33 +10,27 @@ kernel identifiability chart. So `gamfit.torch.fit(x, y, TensorBSpline(...))`
 fitted a different model, with a different number of smoothing parameters, than
 `gamfit.fit` did for the same term -- which SPEC forbids outright.
 
-The penalties now come from the engine entry `smooth_term_realized_penalties`,
-which runs the fit's own lowering (`parse_formula` → `build_termspec` →
-`apply_smooth_overrides` → `build_term_collection_design`) and returns what
-`gamfit.fit` would realize.
+Both kinds are now fitted by the engine whole: `gamfit.torch.fit` hands a
+single `TensorBSpline` or `Matern` term to the fit `gamfit.fit` runs for the
+same spec (`_fit_engine_term`), so the term's basis, identifiability chart,
+penalties and REML criterion have one definition. Taking only the builder's
+penalties (`smooth_term_realized_penalties`) could not close the divergence:
+the torch block backends price one λ per coefficient block, both terms realize
+several penalties on one block, and the realized block is centred against a
+model intercept a torch block does not carry.
 
-Two things are asserted here, and they are different claims:
+Two claims are asserted here:
 
-* `test_engine_realizes_the_penalties_the_fit_carries` is step 1's own claim and
-  passes now: the entry returns, for each of the two terms, as many penalties as
-  `gamfit.fit` carries smoothing parameters for that term, each square on the
-  realized design block.
-* `test_torch_fit_refuses_to_price_several_penalties_under_one_lambda` asserts
-  what the torch path does TODAY: it refuses. `gaussian_reml_fit_blocks_exact`
-  prices `P = blockdiag(λ_k S_k)`, one λ per coefficient block, and both terms
-  realize several penalties on ONE block. Summing them under a single λ IS the
-  divergence this issue is about, so refusing is the correct behaviour until the
-  block backend takes a penalty list per block (gam#4492 step 2).
-
-This test used to carry a strict expected-failure marker on the parity
-assertion, raising on `NotImplementedError`. SPEC rule 16 forbids the
-expected-failure pattern outright -- "a failing test should always indicate
-problematic behavior" -- with no exception for a strict marker, and gam#2901
-lists rule 16 as clean, so the marker was a live violation of an audit that
-reports itself closed on that rule. The refusal is asserted directly instead,
-which costs nothing the marker bought: the day step 2 lands, the refusal stops
-and `pytest.raises` fails, the same signal the strict marker gave, and any OTHER
-failure fails today rather than being absorbed as expected.
+* `test_engine_realizes_the_penalties_the_fit_carries`: the realization entry
+  returns, for each term, as many penalties as `gamfit.fit` carries smoothing
+  parameters, each square on the realized design block.
+* `test_torch_fit_is_the_engine_fit`: the torch fit and `gamfit.fit` agree on
+  the per-margin λ̂, the EDF, the REML score and the fitted values, EXACTLY.
+  They are one computation on the same rows, so any difference at all -- not
+  just one beyond a rounding band -- is two definitions of the term again. The
+  positive control is the torch path this replaced: its tensor fit carried ONE
+  λ against the engine's two, and fails the λ-count assertion before any value
+  is compared.
 """
 
 from __future__ import annotations
@@ -182,128 +176,91 @@ def test_the_entry_refuses_a_descriptor_that_is_not_the_terms(
     assert "marginals" in str(caught.value), str(caught.value)
 
 
-def test_torch_fit_refuses_to_price_several_penalties_under_one_lambda() -> None:
-    """Both terms realize several penalties on one coefficient block, and the
-    block backend prices one lambda per block, so the torch fit REFUSES.
+def test_torch_fit_is_the_engine_fit() -> None:
+    """`gamfit.torch.fit` on a te and a Matérn term IS `gamfit.fit` on them.
 
-    Asserted, not marked expected-to-fail. When gam#4492 step 2 lands and the
-    block API takes a penalty list per block, both refusals stop and the
-    `pytest.raises` blocks below fail. That failure is the instruction to replace
-    this body with the two fits and `_assert_fit_parity`, which is written below
-    and already carries the bar the parity is stated in.
+    The torch arm names its axes `x0, x1`; the engine arm is written here with
+    the frame's own names, independently of the torch path's lowering, so a
+    torch-side term string that drifted from the spec would show as a
+    disagreement rather than as the same call twice.
     """
     frame, _ = _surface_frame()
-    response = torch.as_tensor(frame["y"], dtype=torch.float64).reshape(-1, 1)
+    response = torch.as_tensor(frame["y"], dtype=torch.float64)
 
     tensor_smooth = _tensor_smooth()
     tensor_points = torch.as_tensor(
         np.column_stack([frame["x1"], frame["x2"]]), dtype=torch.float64
     )
-    with pytest.raises(NotImplementedError) as tensor_refusal:
-        gt.fit(tensor_points, response, tensor_smooth)
-    assert "penalt" in str(tensor_refusal.value).lower(), (
-        "te(x1, x2): the torch fit refused, but not for the several-penalties "
-        f"reason this test is about: {tensor_refusal.value}"
-    )
-
-    centers = _matern_centers()
-    matern_smooth = _matern_smooth(centers)
-    matern_points = torch.as_tensor(
-        frame["x1"].reshape(-1, 1), dtype=torch.float64
-    )
-    with pytest.raises(NotImplementedError) as matern_refusal:
-        gt.fit(matern_points, response, matern_smooth)
-    assert "penalt" in str(matern_refusal.value).lower(), (
-        "matern(x1): the torch fit refused, but not for the several-penalties "
-        f"reason this test is about: {matern_refusal.value}"
-    )
-
-    # The Rust arm fits both today, which is what makes the torch refusal a
-    # DIVERGENCE rather than a shared limitation. Naming it here keeps that half
-    # of the claim measured instead of assumed.
+    torch_tensor_fit = gt.fit(tensor_points, response, tensor_smooth)
     rust_tensor_fit = gamfit.fit(
         frame, "y ~ te(x1, x2, bs='ps')", smooths={("x1", "x2"): tensor_smooth}
     )
+    assert len(rust_tensor_fit.smoothing_parameters()) >= 2, (
+        "te(x1, x2): the engine carries "
+        f"{len(rust_tensor_fit.smoothing_parameters())} smoothing parameters, "
+        "fewer than one per margin; the per-margin claim below would be vacuous"
+    )
+    _assert_fit_identity("te(x1, x2)", torch_tensor_fit, rust_tensor_fit, frame)
+
+    centers = _matern_centers()
+    matern_smooth = _matern_smooth(centers)
+    matern_points = torch.as_tensor(frame["x1"], dtype=torch.float64)
+    torch_matern_fit = gt.fit(matern_points, response, matern_smooth)
     rust_matern_fit = gamfit.fit(
         frame, "y ~ matern(x1)", smooths={"x1": matern_smooth}
     )
-    assert len(rust_tensor_fit.smoothing_parameters()) > 1, (
-        "te(x1, x2): the Rust fit carries "
-        f"{len(rust_tensor_fit.smoothing_parameters())} smoothing parameters; "
-        "with one, the torch backend would have nothing to refuse and this "
-        "test would be asserting a refusal that is not #4492's"
-    )
-    assert len(rust_matern_fit.smoothing_parameters()) >= 1
+    _assert_fit_identity("matern(x1)", torch_matern_fit, rust_matern_fit, frame)
 
 
-def _assert_fit_parity(
+def test_torch_fit_refuses_what_the_engine_fit_does_not_carry() -> None:
+    """Autograd, a multi-column response and a λ warm start are refused by
+    name, not dropped: the engine fit has no backward, fits one response, and
+    takes no warm start."""
+    frame, _ = _surface_frame()
+    points = torch.as_tensor(frame["x1"], dtype=torch.float64)
+    response = torch.as_tensor(frame["y"], dtype=torch.float64)
+    smooth = _matern_smooth(_matern_centers())
+
+    with pytest.raises(NotImplementedError, match="backward"):
+        gt.fit(points.clone().requires_grad_(True), response, smooth)
+    with pytest.raises(NotImplementedError, match="response column"):
+        gt.fit(points, torch.stack([response, response], dim=1), smooth)
+    with pytest.raises(NotImplementedError, match="warm start"):
+        gt.fit(points, response, smooth, init_lambdas=torch.tensor(1.0))
+
+
+def _assert_fit_identity(
     label: str, torch_fit: Any, rust_fit: Any, frame: dict[str, np.ndarray]
 ) -> None:
-    """Per-margin λ̂, EDF and fitted values, on the identical rows.
-
-    ONE derived bar, `√ε`, applied in the coordinate each quantity is smooth in.
-
-    The two arms minimize the SAME profiled REML criterion over the same
-    matrices, so they differ only in the order their floating-point operations
-    run, and a criterion whose VALUE is resolved to `ε` relative locates its
-    ARGMIN only to `√ε`: at a minimum `V(ρ) − V(ρ̂) ≈ ½ V''(ρ̂)(ρ − ρ̂)²`, so a
-    value perturbation of `ε|V|` moves `ρ̂` by `√(2ε|V|/V'')`. `ρ = log λ` is the
-    coordinate the outer search works in and the one the criterion is curved in,
-    so the smoothing parameters are compared there. EDF and the fitted vector are
-    differentiable functions of `ρ` with O(1) sensitivity in the interior, so
-    they inherit the same bar against their own scale.
-
-    A failure AT this bar, with the two criterion values agreeing, is a
-    statement about `V''` at the optimum rather than a disagreement about the
-    model; a failure well beyond it is two different criteria, which is what
-    gam#4492 was.
-    """
-    root_eps = float(np.sqrt(np.finfo(np.float64).eps))
-
-    torch_lambdas = np.sort(
-        np.asarray(torch_fit.lambdas.detach().cpu(), dtype=float).reshape(-1)
-    )
-    rust_lambdas = np.sort(
-        np.asarray(list(rust_fit.smoothing_parameters().values()), dtype=float)
+    """Per-margin λ̂, EDF, REML score and fitted values, bit for bit."""
+    torch_lambdas = np.asarray(torch_fit.lambdas, dtype=float).reshape(-1)
+    rust_parameters = rust_fit.smoothing_parameters()
+    rust_lambdas = np.asarray(
+        [rust_parameters[index] for index in sorted(rust_parameters)], dtype=float
     )
     assert torch_lambdas.shape == rust_lambdas.shape, (
         f"{label}: the two fits carry different numbers of smoothing "
-        f"parameters: torch={torch_lambdas.shape[0]}, "
-        f"rust={rust_lambdas.shape[0]}"
+        f"parameters: torch={torch_lambdas.shape[0]}, rust={rust_lambdas.shape[0]}"
     )
-    assert float(torch_lambdas.min()) > 0.0 and float(rust_lambdas.min()) > 0.0, (
-        f"{label}: a fitted smoothing parameter is not positive: "
-        f"torch={torch_lambdas.tolist()}, rust={rust_lambdas.tolist()}"
-    )
-    log_gap = float(np.abs(np.log(torch_lambdas) - np.log(rust_lambdas)).max())
-    assert log_gap <= root_eps, (
-        f"{label}: per-margin lambda-hat differs by {log_gap:.3e} in log lambda, "
-        f"beyond the sqrt(eps)={root_eps:.3e} an argmin of a criterion resolved "
-        f"to eps is located to"
+    assert np.array_equal(torch_lambdas, rust_lambdas), (
+        f"{label}: lambda-hat differs: torch={torch_lambdas.tolist()}, "
+        f"rust={rust_lambdas.tolist()}"
     )
 
-    torch_edf = float(
-        np.asarray(torch_fit.edf.detach().cpu(), dtype=float).sum()
-    )
+    summary = rust_fit.summary()
     rust_edf = float(sum(rust_fit.smooth_edf.values()))
-    assert abs(torch_edf - rust_edf) <= root_eps * max(1.0, abs(rust_edf)), (
+    torch_edf = float(torch_fit.edf)
+    assert torch_edf == rust_edf, (
         f"{label}: smooth EDF differs: torch={torch_edf}, rust={rust_edf}"
     )
+    assert float(torch_fit.reml_score) == float(summary.reml_score), (
+        f"{label}: REML score differs: torch={float(torch_fit.reml_score)}, "
+        f"rust={summary.reml_score}"
+    )
 
-    torch_fitted = np.asarray(
-        torch_fit.fitted.detach().cpu(), dtype=float
-    ).reshape(-1)
+    torch_fitted = np.asarray(torch_fit.fitted, dtype=float).reshape(-1)
     rust_fitted = np.asarray(rust_fit.predict(frame), dtype=float).reshape(-1)
-    # The Rust collection carries an intercept the torch block does not, so the
-    # two fitted vectors agree up to that one constant. Comparing the centred
-    # vectors states the shared claim -- the same surface -- without asserting a
-    # column one side does not have. The bar is the same sqrt(eps), against the
-    # surface's own scale.
-    torch_centred = torch_fitted - torch_fitted.mean()
-    rust_centred = rust_fitted - rust_fitted.mean()
-    surface_scale = float(np.abs(rust_centred).max())
-    gap = float(np.abs(torch_centred - rust_centred).max())
-    assert gap <= root_eps * max(1.0, surface_scale), (
-        f"{label}: fitted surfaces differ by {gap:.3e}, beyond sqrt(eps) times "
-        f"the surface scale {surface_scale:.3e}"
+    assert np.array_equal(torch_fitted, rust_fitted), (
+        f"{label}: fitted values differ by up to "
+        f"{float(np.abs(torch_fitted - rust_fitted).max()):.3e}"
     )

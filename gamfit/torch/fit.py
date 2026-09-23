@@ -82,6 +82,11 @@ class FitResult:
     * ``lambdas`` — scalar (single) or ``Tensor`` shape ``(F,)`` (additive)
     * ``reml_score`` — scalar
     * ``smooths`` — echo of the input specs (for downstream indexing)
+    * ``model`` — the engine's :class:`gamfit.Model` when the engine fitted the
+      term whole (a single ``TensorBSpline`` or ``Matern``, gam#4492), else
+      ``None``. ``coefficients`` are then the engine's, intercept first,
+      ``lambdas`` has one entry per realized penalty, and ``model.predict``
+      evaluates the fit at new points.
     """
 
     coefficients: torch.Tensor | list[torch.Tensor]
@@ -90,6 +95,7 @@ class FitResult:
     reml_score: torch.Tensor
     edf: torch.Tensor
     smooths: list[Smooth]
+    model: Any | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -247,80 +253,173 @@ def _resolve_bspline_knots_for_fit(
     )
 
 
-def _engine_realized_block(
-    smooth: Smooth, points: torch.Tensor, term: str,
-) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """The design block and per-λ penalties the Rust term builder realizes.
+def _engine_term(smooth: Smooth, points: torch.Tensor) -> str:
+    """The formula term, over the axis names ``x0 … x{d-1}``, that the engine
+    fits for a :class:`TensorBSpline` or :class:`Matern` spec (gam#4492).
 
-    ``term`` is the formula term over the axis names the engine entry assigns
-    to ``points``' columns (``x0``, ``x1``, ...), e.g. ``te(x0, x1)``. The
-    smooth's own descriptor -- the same payload ``gamfit.fit(..., smooths={...})``
-    sends -- carries every tunable, so this returns exactly what ``gamfit.fit``
-    would realize for the same spec (gam#4492).
-
-    The DESIGN comes back too, and is used rather than a torch-built one. A
-    smooth's penalty is only meaningful in the chart its design is expressed
-    in, and that chart is not a right-multiplication this side could apply: the
-    collection composes the joint-null rotation ``Q``, the term's own
-    identifiability transform, any unabsorbed global orthogonality, and the
-    span-preserving parametric residualization ``X·T − C·R``, which is affine in
-    the parametric block rather than a factor of ``X``. Rebuilding that
-    composition here would be a second implementation of the thing this entry
-    exists to stop duplicating. The consequence is explicit: for a term routed
-    through this helper the fit carries no autograd path back to ``points``,
-    because the design is not a torch expression of them.
+    Both kinds are fitted by the engine whole -- basis, identifiability chart,
+    penalties and REML -- because each realizes SEVERAL penalties on one
+    coefficient block, one smoothing parameter each, through a chart this side
+    cannot rebuild; see :func:`_fit_engine_term`. This validates the spec
+    against ``points`` and names the term; the smooth's own descriptor carries
+    every tunable to the engine.
     """
-    import json
-
-    from .._api import _jsonable_array
-    from .._binding import rust_module
-
-    points_np = (
-        points.detach().cpu().to(torch.float64).contiguous().numpy()
-    )
-    descriptor = _jsonable_array(dict(smooth.to_rust_descriptor()))
-    design_np, penalties_np = rust_module().smooth_term_realized_penalties(
-        points_np, term, json.dumps(descriptor),
-    )
-    design = torch.as_tensor(
-        design_np, dtype=torch.float64, device=points.device,
-    ).contiguous()
-    penalties = [
-        torch.as_tensor(
-            penalty, dtype=torch.float64, device=points.device,
-        ).contiguous()
-        for penalty in penalties_np
-    ]
-    width = design.shape[1]
-    for index, penalty in enumerate(penalties):
-        if penalty.shape != (width, width):
-            raise RuntimeError(
-                f"engine penalty {index} for {term} is {tuple(penalty.shape)}, "
-                f"not ({width}, {width}) as its realized design block"
+    if isinstance(smooth, TensorBSpline):
+        marginals = list(smooth.marginals)
+        if not marginals:
+            raise ValueError("TensorBSpline: no marginals")
+        if points.shape[1] != len(marginals):
+            raise ValueError(
+                f"TensorBSpline has {len(marginals)} marginals but points have "
+                f"d={points.shape[1]}"
             )
-    return design, penalties
+        axes = ", ".join(f"x{axis}" for axis in range(len(marginals)))
+        # The term must NAME the marginal basis family, because a descriptor
+        # tunes a margin and cannot change its family (gam#4492): a bare
+        # `te(...)` is mgcv's default tensor, whose margins are natural cubic
+        # regression splines (`margin_wants_cr` treats an unset `bs` as `cr`),
+        # while this smooth's margins are B-splines. A periodic marginal travels
+        # as the descriptor's `periodic: true`, which `apply_bspline_1d`
+        # promotes to the formula's `cyclic()` build, so `ps` is named for
+        # every margin and periodicity stays on that one mechanism.
+        return f"te({axes}, bs='ps')"
+    if isinstance(smooth, Matern):
+        if smooth.centers is None:
+            raise ValueError("Matern requires centers on the torch path")
+        centers_t = _coerce_2d(_to_tensor(smooth.centers, points), "Matern.centers")
+        if centers_t.shape[1] != points.shape[1]:
+            raise ValueError(
+                f"Matern: points d={points.shape[1]} but centers "
+                f"d={centers_t.shape[1]}"
+            )
+        axes = ", ".join(f"x{axis}" for axis in range(points.shape[1]))
+        return f"matern({axes})"
+    raise TypeError(
+        f"{type(smooth).__name__} is not fitted by the engine on the torch path"
+    )
 
 
-def _refuse_multi_lambda(term: str, kind: str, count: int) -> None:
-    """Refuse a term whose realized penalty count the backend cannot carry.
+def _fit_engine_term(
+    smooth: TensorBSpline | Matern,
+    points: torch.Tensor,
+    response: torch.Tensor,
+    *,
+    weights: torch.Tensor | None,
+    init_lambdas: torch.Tensor | None,
+) -> FitResult:
+    """Fit one :class:`TensorBSpline` or :class:`Matern` term with the engine's
+    own fit -- the fit ``gamfit.fit`` runs for the same spec (gam#4492).
 
-    ``gaussian_reml_fit_blocks_exact`` prices ``P = blockdiag(λ_k S_k)``: one
-    smoothing parameter per COEFFICIENT BLOCK. A term the builder realizes with
-    several penalties -- one per tensor margin, one per active Matérn operator
-    dial -- puts several of them on ONE block, which that criterion has no
-    coordinate for. Summing them under a single λ is the divergence gam#4492
-    is about, so the fit refuses instead (gam#4492 step 2: the block API takes a
-    penalty LIST per block).
+    Neither kind has a torch-side definition any more. The torch path used to
+    build its own penalty for both and fit it with its own block REML: the
+    tensor summed `I ⊗ S_a ⊗ I` under ONE λ where the term builder emits one
+    candidate per margin, measured by its neighbours' function Grams and
+    normalized first; the Matérn took the raw symmetrised `K_cc` on the raw
+    kernel columns where the builder emits ν-gated collocation operator
+    candidates through the kernel identifiability chart. Taking only the
+    builder's PENALTIES would not close that: the torch block backends price one
+    λ per coefficient block, both terms realize several penalties on one block,
+    and the realized block is centred against the model intercept, which a torch
+    block does not carry. So the whole fit is the engine's -- one definition of
+    the term, its chart, its penalties and its REML criterion -- and this
+    function only moves the tensors in and the results out.
+
+    The model is ``y ~ 1 + term``: the intercept plus the centred term spans
+    exactly the raw tensor or kernel basis's function space, with the same
+    unpenalized constant. ``coefficients`` are the engine's, in its column order
+    (intercept first), and ``model`` is the fitted :class:`gamfit.Model`, the one
+    object that evaluates the term at new points in the chart it was fitted in.
+
+    What the engine fit does not carry is refused rather than dropped:
+    autograd (the design is not a torch expression of ``points``, and the engine
+    exposes no backward for its fit), a multi-column response (the torch
+    contract shares λ across columns; the engine fits one response), ``by``
+    gating, and a λ warm start.
     """
-    if count > 1:
+    import numpy as np
+
+    from .._api import fit as engine_fit
+
+    kind = type(smooth).__name__
+    points = _coerce_2d(points, "points")
+    term = _engine_term(smooth, points)
+    if response.shape[1] != 1:
         raise NotImplementedError(
-            f"{kind} realizes {count} penalties for {term} -- one smoothing "
-            f"parameter each, as gamfit.fit carries them -- and the torch "
-            f"Gaussian REML backend prices one λ per coefficient block. "
-            f"Fitting them under a single λ would be a different model than "
-            f"gamfit.fit's (gam#4492). Use gamfit.fit for this term until the "
-            f"block backend takes a penalty list per block."
+            f"{kind} on the torch path is fitted by the engine, which fits one "
+            f"response column; got {response.shape[1]}. Fit each column with "
+            f"gamfit.fit, or a single column here (gam#4492)."
         )
+    if smooth.by is not None:
+        raise NotImplementedError(
+            f"{kind} with by= on the torch path: the engine fits this term, and "
+            f"the torch `by` contract (fitted = by * design @ beta, no intercept) "
+            f"is not the engine's `by=` term. Use gamfit.fit with a by column "
+            f"(gam#4492)."
+        )
+    if init_lambdas is not None:
+        raise NotImplementedError(
+            f"{kind} on the torch path is fitted by the engine, which takes no "
+            f"smoothing-parameter warm start (gam#4492)."
+        )
+    tracked = [points, response] + ([] if weights is None else [weights])
+    if torch.is_grad_enabled() and any(t.requires_grad for t in tracked):
+        raise NotImplementedError(
+            f"{kind} on the torch path is fitted by the engine, which exposes no "
+            f"backward: its design is the term builder's identifiable block, not "
+            f"a torch expression of `points`, so no gradient can reach points, "
+            f"response or weights. Detach the inputs or wrap the call in "
+            f"torch.no_grad() (gam#4492)."
+        )
+
+    points_np = points.detach().cpu().to(torch.float64).numpy()
+    axes = [f"x{axis}" for axis in range(points_np.shape[1])]
+    frame: dict[str, Any] = {name: points_np[:, axis] for axis, name in enumerate(axes)}
+    frame["y"] = response.detach().cpu().to(torch.float64).numpy()[:, 0]
+    weights_column = None
+    if weights is not None:
+        weights_column = "__gamfit_torch_weights"
+        frame[weights_column] = (
+            weights.detach().cpu().to(torch.float64).reshape(-1).numpy()
+        )
+    key: Any = axes[0] if len(axes) == 1 else tuple(axes)
+    model = engine_fit(
+        frame, f"y ~ {term}", smooths={key: smooth}, weights=weights_column,
+    )
+
+    summary = model.summary()
+    if summary.reml_score is None:
+        raise RuntimeError(
+            f"the engine fit of {term} reports no REML score: "
+            f"{summary.reml_score_unavailable}"
+        )
+    smooth_rows = list(summary.smooth_terms)
+    if len(smooth_rows) != 1:
+        raise RuntimeError(
+            f"the engine fit of {term} reports {len(smooth_rows)} smooth terms, "
+            f"not the one it was given"
+        )
+    smoothing = model.smoothing_parameters()
+    lambdas = [smoothing[index] for index in sorted(smoothing)]
+    coefficients = np.asarray(
+        [record["estimate"] for record in summary.coefficients], dtype=np.float64
+    ).reshape(-1, 1)
+    fitted = np.asarray(model.predict(frame), dtype=np.float64).reshape(-1, 1)
+
+    def as_tensor(value: Any) -> torch.Tensor:
+        return torch.as_tensor(
+            np.asarray(value, dtype=np.float64), dtype=torch.float64,
+            device=points.device,
+        )
+
+    return FitResult(
+        coefficients=as_tensor(coefficients),
+        fitted=as_tensor(fitted),
+        lambdas=as_tensor(lambdas),
+        reml_score=as_tensor(summary.reml_score),
+        edf=as_tensor(float(smooth_rows[0]["edf"])),
+        smooths=[smooth],
+        model=model,
+    )
 
 
 def _build_design_penalty(
@@ -337,12 +436,8 @@ def _build_design_penalty(
 
     Returns (design (N, M), penalty (M, M)) as float64 torch tensors.
 
-    Two kinds take BOTH halves from the term builder instead
-    (:func:`_engine_realized_block`, gam#4492): ``TensorBSpline`` and
-    ``Matern``, whose penalties this side used to build itself and build
-    differently from the fit. Their design carries no autograd path back to
-    ``points``, because the chart their penalty is expressed in is not a factor
-    of the raw basis; every other kind is unchanged and still differentiable.
+    ``TensorBSpline`` and ``Matern`` have no pair here: the engine fits them
+    whole (:func:`_fit_engine_term`, gam#4492), so this refuses them.
     """
     from .._api import duchon_function_norm_penalty
 
@@ -495,82 +590,18 @@ def _build_design_penalty(
         penalty = design.transpose(0, 1) @ design / float(design.shape[0])
         return design, penalty
 
-    if entry == "tensor_bspline" and isinstance(smooth, TensorBSpline):
-        marginals = list(smooth.marginals)
-        if not marginals:
-            raise ValueError("TensorBSpline: no marginals")
-        if points.shape[1] != len(marginals):
-            raise ValueError(
-                f"TensorBSpline has {len(marginals)} marginals but points have "
-                f"d={points.shape[1]}"
-            )
-        # The term builder realizes this term, design and penalties together
-        # (gam#4492). What stood here summed `I ⊗ S_a ⊗ I` over the margins
-        # under ONE λ, and diverged from `gamfit.fit` in three ways at once:
-        # the builder emits one candidate per margin with its own λ; it
-        # measures the other margins by their FUNCTION Grams
-        # `S_dim = G_0/m_0 ⊗ … ⊗ S̃_dim ⊗ … ⊗ G_{d-1}/m_{d-1}` with
-        # `m_j = 1ᵀG_j1`, where `I ⊗ S_a ⊗ I` measures them by their
-        # COEFFICIENTS (SPEC: penalties are on the function, never on the
-        # coefficients; #1561); and it normalizes the marginal roughness first,
-        # so no λ carries a basis-size or length unit (#2315).
-        axes = ", ".join(f"x{axis}" for axis in range(len(marginals)))
-        # The term must NAME the marginal basis family, because a descriptor
-        # cannot change it (gam#4492).
-        #
-        # `te(...)` with no `bs=` is mgcv's default tensor and its margins are
-        # natural cubic regression splines: `term_builder.rs`'s
-        # `margin_wants_cr` treats an unset `bs` exactly like `cr`. This
-        # smooth's margins are B-splines. `apply_bspline_1d` on the Rust side
-        # reads `degree`, `penalty_order`, `double_penalty`, `knots`, `n_knots`
-        # and `periodic` from a marginal descriptor and never reads `kind`, so
-        # it can tune a margin but cannot turn a cr margin into a B-spline one.
-        # Sending a `TensorBSpline` descriptor at a bare `te(...)` therefore
-        # asked the engine to realize one basis while describing another.
-        #
-        # It refused rather than doing that silently only because a tunable
-        # collided: `BSpline`'s defaults are `degree=3` and `penalty_order=2`,
-        # which ARE `CR_MARGIN_DEGREE` and `CR_MARGIN_PENALTY_ORDER`, so both
-        # pass a cr margin's guards untouched. `BSpline(knots=8)` is what
-        # raised "knots=8 cannot resize a natural cubic regression spline";
-        # a plain `BSpline()` would have returned cr-margin penalties for a
-        # B-spline descriptor with nothing said.
-        #
-        # Periodicity stays on ONE mechanism rather than two: a periodic
-        # marginal travels as the descriptor's `periodic: true`, which
-        # `apply_bspline_1d` promotes to a cyclic spec documented as
-        # bit-identical to the formula's `cyclic()` build. So the family named
-        # here is `ps` for every marginal, and `bs=c('cyclic', ...)` is not
-        # also used.
-        term = f"te({axes}, bs='ps')"
-        design, penalties = _engine_realized_block(smooth, points, term)
-        _refuse_multi_lambda(term, "TensorBSpline", len(penalties))
-        return design, penalties[0]
-
-    if entry == "matern" and isinstance(smooth, Matern):
-        if smooth.centers is None:
-            raise ValueError("Matern requires centers on the torch path")
-        centers_t = _coerce_2d(_to_tensor(smooth.centers, points), "Matern.centers")
-        if centers_t.shape[1] != points.shape[1]:
-            raise ValueError(
-                f"Matern: points d={points.shape[1]} but centers "
-                f"d={centers_t.shape[1]}"
-            )
-        # The term builder realizes this term (gam#4492). What stood here took
-        # the raw symmetrised covariance Gram `K_cc` among the centres, on the
-        # raw kernel columns, under one λ. The builder never fits a Matérn term
-        # that way: its default path uses the ν-gated collocation operator
-        # candidates (D0/D1/D2 dials gated by
-        # `DuchonOperatorPenaltySpec::matern_for_smoothness`, #707) and its
-        # double-penalty path the chart-restricted `Zᵀ K Z` factor read against
-        # K's own roundoff envelope beside the centre function Gram, both
-        # through the kernel identifiability chart and both with more than one
-        # λ. Nothing checked `K_cc` against a roundoff envelope here either.
-        axes = ", ".join(f"x{axis}" for axis in range(points.shape[1]))
-        term = f"matern({axes})"
-        design, penalties = _engine_realized_block(smooth, points, term)
-        _refuse_multi_lambda(term, "Matern", len(penalties))
-        return design, penalties[0]
+    if (entry == "tensor_bspline" and isinstance(smooth, TensorBSpline)) or (
+        entry == "matern" and isinstance(smooth, Matern)
+    ):
+        term = _engine_term(smooth, points)
+        raise NotImplementedError(
+            f"{type(smooth).__name__} has no torch-side (design, penalty): the "
+            f"engine fits {term} whole, with one smoothing parameter per realized "
+            f"penalty and its identifiability chart against the model intercept, "
+            f"none of which a torch coefficient block carries (gam#4492). Fit it "
+            f"as the single smooth of gamfit.torch.fit, which hands it to the "
+            f"engine, or together with other terms through gamfit.fit."
+        )
 
     if entry == "categorical" and isinstance(smooth, Categorical):
         # Sum-to-zero coded categorical contrast: an i.i.d. Gaussian random
@@ -703,7 +734,7 @@ def _fit_single_constrained(
     weights: torch.Tensor | None,
     shape_kind: str,
     init_lambdas: torch.Tensor | None,
-) -> "FitResult":
+) -> FitResult:
     points_2d = _coerce_2d(points, "points")
     if not isinstance(smooth, BSpline):
         raise NotImplementedError(
@@ -968,6 +999,11 @@ def fit(
             raise TypeError(
                 "a single smooth takes one points torch.Tensor, "
                 f"got {type(points).__name__}"
+            )
+        if isinstance(smooths, (TensorBSpline, Matern)):
+            return _fit_engine_term(
+                smooths, points, response_f64,
+                weights=weights_f64, init_lambdas=init_lambdas,
             )
         design, penalty = _build_design_penalty(smooths, points)
         by_t = _smooth_by_tensor(smooths, design)
