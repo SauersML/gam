@@ -158,6 +158,8 @@ fn dense_fisher_gaussian_fit_to_pydict<'py>(
     out.set_item("reml_hess_lambda", f64::NAN)?;
     out.set_item("reml_grad_rho", f64::NAN)?;
     out.set_item("reml_hess_rho", f64::NAN)?;
+    out.set_item("reml_score_roundoff", None::<f64>)?;
+    out.set_item("reml_hess_rho_roundoff", None::<f64>)?;
     out.set_item("edf", (k * n_outputs) as f64)?;
     out.set_item("coefficients", coefficients.into_pyarray(py))?;
     out.set_item("fitted", fitted.into_pyarray(py))?;
@@ -412,6 +414,8 @@ fn latent_multi_output_fit_to_pydict<'py>(
     out.set_item("reml_hess_lambda", f64::NAN)?;
     out.set_item("reml_grad_rho", f64::NAN)?;
     out.set_item("reml_hess_rho", f64::NAN)?;
+    out.set_item("reml_score_roundoff", None::<f64>)?;
+    out.set_item("reml_hess_rho_roundoff", None::<f64>)?;
     out.set_item("edf", (p * active_outputs) as f64)?;
     out.set_item("coefficients", coefficients.into_pyarray(py))?;
     out.set_item("fitted", fitted.into_pyarray(py))?;

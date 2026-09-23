@@ -5855,6 +5855,14 @@ fn set_batched_gaussian_reml_dict_items<'py>(
     )?;
     out.set_item("reml_grad_rho", result.reml_grad_rhos.into_pyarray(py))?;
     out.set_item("reml_hess_rho", result.reml_hess_rhos.into_pyarray(py))?;
+    out.set_item(
+        "reml_score_roundoff",
+        result.reml_score_roundoffs.into_pyarray(py),
+    )?;
+    out.set_item(
+        "reml_hess_rho_roundoff",
+        result.reml_hess_rho_roundoffs.into_pyarray(py),
+    )?;
     out.set_item("edf", result.edf.into_pyarray(py))?;
     out.set_item("coefficients", result.coefficients.into_pyarray(py))?;
     out.set_item("fitted", result.fitted.into_pyarray(py))?;

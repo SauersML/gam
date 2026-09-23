@@ -1,5 +1,18 @@
 ## Unreleased
 
+- **Batched Gaussian REML fits no longer refuse a segment whose design is numerically rank
+  deficient.** `gaussian_reml_fit_batched` and the position-batched forward prebuilt each segment's
+  eigen cache from its Gram `XᵀWX`. That cache judged the design's rank by whether a Cholesky of the
+  squared operator succeeded. The fit reads the rank from the Householder factor of `W½X` at that
+  factorization's backward band. On a segment whose smallest singular value falls inside that band,
+  the Cholesky still factored, the cache claimed full rank, and the fit refused it as another
+  design's ("eigen cache design rank mismatch: cache has 6, design has 5"). Each segment now builds
+  its cache from its own design inside the fit, so one design has one rank decision.
+- **A backward from `forward_state` now matches the refit it stands for.** The Gaussian REML forward
+  state (single and batched) dropped `reml_score_roundoff` and `reml_hess_rho_roundoff`. The
+  backward opens the implicit `λ̂` channel only when the ρ-curvature clears its own bound, so a
+  state-fed backward silently lost that channel and returned different gradients from a refit. Both
+  bounds are now state keys: `None` / NaN where the evaluator accumulated none.
 - **An empirical-law flex row's higher derivatives cost dense jets over every primary, with a width
   table** (gam#3290). Its third and fourth contractions, its third-trace gradient and the projected
   fourth of the second-order logdet corrections ran the whole row program as runtime-width jets,

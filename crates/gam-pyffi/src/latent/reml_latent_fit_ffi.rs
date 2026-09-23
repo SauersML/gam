@@ -690,6 +690,8 @@ fn set_ok_glm_latent_items<'py>(
     out.set_item("reml_hess_lambda", f64::NAN)?;
     out.set_item("reml_grad_rho", f64::NAN)?;
     out.set_item("reml_hess_rho", f64::NAN)?;
+    out.set_item("reml_score_roundoff", None::<f64>)?;
+    out.set_item("reml_hess_rho_roundoff", None::<f64>)?;
     out.set_item("edf", pirls.edf)?;
     out.set_item("coefficients", coefficients.into_pyarray(py))?;
     out.set_item("fitted", fitted.into_pyarray(py))?;
@@ -1174,6 +1176,8 @@ fn set_ok_gaussian_reml_items<'py>(
     out.set_item("reml_hess_lambda", fit.reml_hess_lambda)?;
     out.set_item("reml_grad_rho", fit.reml_grad_rho)?;
     out.set_item("reml_hess_rho", fit.reml_hess_rho)?;
+    out.set_item("reml_score_roundoff", fit.reml_score_roundoff)?;
+    out.set_item("reml_hess_rho_roundoff", fit.reml_hess_rho_roundoff)?;
     out.set_item("edf", fit.edf)?;
     out.set_item("coefficients", fit.coefficients.into_pyarray(py))?;
     out.set_item("fitted", fit.fitted.into_pyarray(py))?;
@@ -1288,11 +1292,16 @@ fn gaussian_reml_fit_state_from_pydict(
         reml_score: get(state, "reml_score")?
             .extract::<f64>()
             .map_err(|err| err.to_string())?,
-        // #2729: the serialized forward state does not carry the evaluator's
-        // accumulated score roundoff, so this reconstruction says so rather
-        // than fabricating a bound it never measured.
-        reml_score_roundoff: None,
-        reml_hess_rho_roundoff: None,
+        // #2729: the forward state carries the evaluator's accumulated bounds,
+        // `None` where it accumulated none. The backward gates the implicit λ̂
+        // channel on the curvature bound, so dropping it here would make the
+        // state's backward differ from the refit's.
+        reml_score_roundoff: get(state, "reml_score_roundoff")?
+            .extract::<Option<f64>>()
+            .map_err(|err| err.to_string())?,
+        reml_hess_rho_roundoff: get(state, "reml_hess_rho_roundoff")?
+            .extract::<Option<f64>>()
+            .map_err(|err| err.to_string())?,
         reml_grad_lambda: get(state, "reml_grad_lambda")?
             .extract::<f64>()
             .map_err(|err| err.to_string())?,
@@ -1366,6 +1375,14 @@ fn batched_gaussian_reml_fits_from_pydict(
         .extract::<PyReadonlyArray1<'_, f64>>()
         .map_err(|err| err.to_string())?;
     let reml_hess_rhos = reml_hess_rhos.as_array();
+    let reml_score_roundoffs = get(state, "reml_score_roundoff")?
+        .extract::<PyReadonlyArray1<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let reml_score_roundoffs = reml_score_roundoffs.as_array();
+    let reml_hess_rho_roundoffs = get(state, "reml_hess_rho_roundoff")?
+        .extract::<PyReadonlyArray1<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let reml_hess_rho_roundoffs = reml_hess_rho_roundoffs.as_array();
     let edf = get(state, "edf")?
         .extract::<PyReadonlyArray1<'_, f64>>()
         .map_err(|err| err.to_string())?;
@@ -1476,9 +1493,10 @@ fn batched_gaussian_reml_fits_from_pydict(
             coefficients: coefficients.slice(s![b, .., ..]).to_owned(),
             fitted: fitted.slice(s![start..end, ..]).to_owned(),
             reml_score: reml_scores[b],
-            // #2729: not carried across the FFI boundary; see above.
-            reml_score_roundoff: None,
-            reml_hess_rho_roundoff: None,
+            // #2729: NaN is the batched encoding of "no bound accumulated".
+            reml_score_roundoff: Some(reml_score_roundoffs[b]).filter(|value| !value.is_nan()),
+            reml_hess_rho_roundoff: Some(reml_hess_rho_roundoffs[b])
+                .filter(|value| !value.is_nan()),
             reml_grad_lambda: reml_grad_lambdas[b],
             reml_hess_lambda: reml_hess_lambdas[b],
             reml_grad_rho: reml_grad_rhos[b],
@@ -1501,6 +1519,13 @@ struct BatchedGaussianRemlResult {
     reml_hess_lambdas: Array1<f64>,
     reml_grad_rhos: Array1<f64>,
     reml_hess_rhos: Array1<f64>,
+    /// Each fit's `reml_score_roundoff`, NaN where the evaluator accumulated
+    /// no bound. The backward reads the curvature bound to decide whether the
+    /// implicit λ̂ channel is resolved, so a state that dropped it would take a
+    /// different backward than the refit it stands for.
+    reml_score_roundoffs: Array1<f64>,
+    /// Each fit's `reml_hess_rho_roundoff`, NaN where none was accumulated.
+    reml_hess_rho_roundoffs: Array1<f64>,
     edf: Array1<f64>,
     coefficients: Array3<f64>,
     fitted: Array2<f64>,
@@ -1687,54 +1712,15 @@ fn gaussian_reml_fit_batched_impl(
     let p = x.ncols();
     let d = y.ncols();
 
-    // Phase A: compute X'WX per fit in parallel (CPU or per-fit GPU dispatch
-    // via `fast_xt_diag_x`). Per-fit X'WX cost is `O(n_b · p²)`; this phase
-    // produces K p×p matrices that feed the batched Cholesky in Phase B.
-    let xtwx_phase: Vec<Option<Array2<f64>>> = (0..batch)
-        .into_par_iter()
-        .map(|b| {
-            let start = row_offsets[b];
-            let end = row_offsets[b + 1];
-            if start == end {
-                return None;
-            }
-            let x_slice = x.slice(s![start..end, ..]);
-            let owned_weight: Array1<f64> = match weights.as_ref() {
-                Some(w) => w.slice(s![start..end]).to_owned(),
-                None => Array1::ones(end - start),
-            };
-            Some(gam::linalg::faer_ndarray::fast_xt_diag_x(
-                &x_slice,
-                &owned_weight,
-            ))
-        })
-        .collect();
-
-    // Phase B: assemble live X'WX matrices and run the batched cache build.
-    // The Cholesky step inside collapses to a single `cusolverDnDpotrfBatched`
-    // call when policy + uniform shape allow; otherwise falls back to
-    // per-fit Cholesky inside the helper. The remaining whitened-penalty
-    // eigh stays per-fit (cuSOLVER has no batched symmetric eigensolver).
-    let mut live_indices: Vec<usize> = Vec::with_capacity(batch);
-    let mut live_xtwx: Vec<Array2<f64>> = Vec::with_capacity(batch);
-    for (b, slot) in xtwx_phase.into_iter().enumerate() {
-        if let Some(xtwx) = slot {
-            live_indices.push(b);
-            live_xtwx.push(xtwx);
-        }
-    }
-    let batched_caches = build_gaussian_reml_eigen_cache_batched(live_xtwx, penalty, None);
-    let mut prebuilt_caches: Vec<Option<gam::solver::gaussian_reml::GaussianRemlEigenCache>> =
-        (0..batch).map(|_| None).collect();
-    for (i, cache_result) in batched_caches.into_iter().enumerate() {
-        if let Ok(cache) = cache_result {
-            prebuilt_caches[live_indices[i]] = Some(cache);
-        }
-    }
-
-    // Phase C: per-fit completion. Each fit either uses the prebuilt cache
-    // (skipping its chol + eigh in `prepare_gaussian_reml`) or falls through
-    // to a fresh build when the batched cache build dropped that element.
+    // Each fit builds its eigen cache from its own weighted design inside
+    // `prepare_gaussian_reml`, where the design's rank is read off the
+    // Householder factor of `W½X` at that factorization's backward band. A
+    // cache prebuilt from the Gram `XᵀWX` alone decides the same rank by
+    // whether a Cholesky of the squared operator happens to succeed: on a
+    // design whose smallest singular value is inside the QR band, the Cholesky
+    // still factors (its pivot is roundoff of `σ_min²`), the prebuilt cache
+    // claims full rank, and the fit refuses the cache as another design's.
+    // One design has one rank decision, so there is no Gram prebuild.
     let fit_results: Vec<
         Result<
             (
@@ -1752,14 +1738,13 @@ fn gaussian_reml_fit_batched_impl(
                 return Ok((b, None));
             }
             let weight_slice = weights.as_ref().map(|w| w.slice(s![start..end]));
-            let cache_ref = prebuilt_caches[b].as_ref();
             match gaussian_reml_multi_closed_form_with_cache(
                 x.slice(s![start..end, ..]),
                 y.slice(s![start..end, ..]),
                 penalty,
                 weight_slice,
                 init_lambda,
-                cache_ref,
+                None,
             ) {
                 Ok(result) => Ok((b, Some(result))),
                 Err(
@@ -1778,6 +1763,9 @@ fn gaussian_reml_fit_batched_impl(
     let mut reml_hess_lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
     let mut reml_grad_rhos = Array1::<f64>::from_elem(batch, f64::NAN);
     let mut reml_hess_rhos = Array1::<f64>::from_elem(batch, f64::NAN);
+    // NaN marks a fit whose evaluator accumulated no bound (#2729).
+    let mut reml_score_roundoffs = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_hess_rho_roundoffs = Array1::<f64>::from_elem(batch, f64::NAN);
     let mut edf = Array1::<f64>::zeros(batch);
     let mut coefficients = Array3::<f64>::zeros((batch, p, d));
     let mut fitted = Array2::<f64>::zeros((x.nrows(), d));
@@ -1811,6 +1799,8 @@ fn gaussian_reml_fit_batched_impl(
             reml_hess_lambdas[b] = fit.reml_hess_lambda;
             reml_grad_rhos[b] = fit.reml_grad_rho;
             reml_hess_rhos[b] = fit.reml_hess_rho;
+            reml_score_roundoffs[b] = fit.reml_score_roundoff.unwrap_or(f64::NAN);
+            reml_hess_rho_roundoffs[b] = fit.reml_hess_rho_roundoff.unwrap_or(f64::NAN);
             edf[b] = fit.edf;
             coefficients
                 .slice_mut(s![b, .., ..])
@@ -1851,6 +1841,8 @@ fn gaussian_reml_fit_batched_impl(
         reml_hess_lambdas,
         reml_grad_rhos,
         reml_hess_rhos,
+        reml_score_roundoffs,
+        reml_hess_rho_roundoffs,
         edf,
         coefficients,
         fitted,
@@ -2459,9 +2451,8 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
 
     // Fold the `by` gate into the prior weights ONCE for the whole batch, then
     // slice the gated array per segment. Zero-`by` rows get weight 0, so they
-    // drop out of both the segment `XᵀWX` (cache build) and the segment fit
-    // consistently — the cache fingerprint check requires the same weights in
-    // both — and out of `ywy` / the effective-DoF `ν` in the solver (#2031).
+    // drop out of the segment fit's weighted design and out of `ywy` / the
+    // effective-DoF `ν` in the solver (#2031).
     let gated_weights = gate_weights_for_forward(weights, by, t.len())?;
     let weights = gated_weights.as_ref().map(|w| w.view());
 
@@ -2479,55 +2470,8 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
     // impossible for the position-batched API to materialize the concatenated
     // n_total x p design, which is exactly the shape that becomes
     // operator-backed for large Duchon batches.
-    let xtwx_phase: Vec<Result<Option<Array2<f64>>, String>> = (0..batch)
-        .into_par_iter()
-        .map(|b| {
-            let start = row_offsets[b];
-            let end = row_offsets[b + 1];
-            if start == end {
-                return Ok(None);
-            }
-            let x = position_fit_design_for_slice(
-                t.slice(s![start..end]),
-                knots_or_centers,
-                basis_kind,
-                basis_order,
-                periodic,
-                period,
-                by.as_ref().map(|values| values.slice(s![start..end])),
-                by_start_col,
-                p,
-                b,
-                radial_reparam.as_ref(),
-            )?;
-            let owned_weight: Array1<f64> = match weights.as_ref() {
-                Some(w) => w.slice(s![start..end]).to_owned(),
-                None => Array1::ones(end - start),
-            };
-            Ok(Some(gam::linalg::faer_ndarray::fast_xt_diag_x(
-                &x.view(),
-                &owned_weight,
-            )))
-        })
-        .collect();
-
-    let mut live_indices: Vec<usize> = Vec::with_capacity(batch);
-    let mut live_xtwx: Vec<Array2<f64>> = Vec::with_capacity(batch);
-    for (b, slot) in xtwx_phase.into_iter().enumerate() {
-        if let Some(xtwx) = slot? {
-            live_indices.push(b);
-            live_xtwx.push(xtwx);
-        }
-    }
-    let batched_caches = build_gaussian_reml_eigen_cache_batched(live_xtwx, penalty, None);
-    let mut prebuilt_caches: Vec<Option<gam::solver::gaussian_reml::GaussianRemlEigenCache>> =
-        (0..batch).map(|_| None).collect();
-    for (i, cache_result) in batched_caches.into_iter().enumerate() {
-        if let Ok(cache) = cache_result {
-            prebuilt_caches[live_indices[i]] = Some(cache);
-        }
-    }
-
+    // Each segment's eigen cache is built from its own design inside the fit,
+    // at the design's one rank decision (see `gaussian_reml_fit_batched_impl`).
     let fit_results: Vec<
         Result<
             (
@@ -2558,14 +2502,13 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
                 radial_reparam.as_ref(),
             )?;
             let weight_slice = weights.as_ref().map(|w| w.slice(s![start..end]));
-            let cache_ref = prebuilt_caches[b].as_ref();
             match gaussian_reml_multi_closed_form_with_cache(
                 x.view(),
                 y.slice(s![start..end, ..]),
                 penalty,
                 weight_slice,
                 init_lambda,
-                cache_ref,
+                None,
             ) {
                 Ok(result) => Ok((b, Some(result))),
                 Err(
@@ -2586,6 +2529,9 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
     let mut reml_hess_lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
     let mut reml_grad_rhos = Array1::<f64>::from_elem(batch, f64::NAN);
     let mut reml_hess_rhos = Array1::<f64>::from_elem(batch, f64::NAN);
+    // NaN marks a fit whose evaluator accumulated no bound (#2729).
+    let mut reml_score_roundoffs = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_hess_rho_roundoffs = Array1::<f64>::from_elem(batch, f64::NAN);
     let mut edf = Array1::<f64>::zeros(batch);
     let mut coefficients = Array3::<f64>::zeros((batch, p, d));
     let mut fitted = Array2::<f64>::zeros((t.len(), d));
@@ -2619,6 +2565,8 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
             reml_hess_lambdas[b] = fit.reml_hess_lambda;
             reml_grad_rhos[b] = fit.reml_grad_rho;
             reml_hess_rhos[b] = fit.reml_hess_rho;
+            reml_score_roundoffs[b] = fit.reml_score_roundoff.unwrap_or(f64::NAN);
+            reml_hess_rho_roundoffs[b] = fit.reml_hess_rho_roundoff.unwrap_or(f64::NAN);
             edf[b] = fit.edf;
             coefficients
                 .slice_mut(s![b, .., ..])
@@ -2659,6 +2607,8 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
         reml_hess_lambdas,
         reml_grad_rhos,
         reml_hess_rhos,
+        reml_score_roundoffs,
+        reml_hess_rho_roundoffs,
         edf,
         coefficients,
         fitted,

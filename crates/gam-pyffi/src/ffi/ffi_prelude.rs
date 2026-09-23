@@ -24,7 +24,7 @@ pub(crate) use gam::families::inverse_link::{apply_inverse_link_spec_vec, apply_
 pub(crate) use gam::families::survival::predict::fit_result_from_saved_model_for_prediction;
 
 pub(crate) use gam::solver::gaussian_reml::{
-    GaussianRemlMultiBackwardProblem, build_gaussian_reml_eigen_cache_batched,
+    GaussianRemlMultiBackwardProblem,
     gaussian_reml_blocks_orthogonal_shared_scale, gaussian_reml_free_b_score,
     gaussian_reml_multi_closed_form_backward, gaussian_reml_multi_closed_form_backward_batch,
     gaussian_reml_multi_closed_form_backward_from_fit, gaussian_reml_multi_closed_form_with_cache,
