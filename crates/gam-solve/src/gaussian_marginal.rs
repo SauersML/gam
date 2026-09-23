@@ -128,7 +128,7 @@ pub struct GaussianMarginalModel {
 
 impl GaussianMarginalModel {
     /// Validate `y = Φβ + ε` with `ε ~ N(0, diag(noise_variance))` and `β ~ N(0, prior_precision⁻¹)`, refusing an
-    /// improper prior. The declared `prior_precision` must be exactly symmetric ([`DECLARED_PRIOR_ASSEMBLY`]).
+    /// improper prior. The declared `prior_precision` must be exactly symmetric (`DECLARED_PRIOR_ASSEMBLY`).
     pub fn new(
         basis: ArrayView2<'_, f64>,
         response: ArrayView1<'_, f64>,

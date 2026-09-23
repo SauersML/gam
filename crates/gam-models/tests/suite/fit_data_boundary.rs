@@ -152,7 +152,14 @@ fn response_outside_family_support_is_a_data_error_naming_family_and_row() {
     let x = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
     let cases: [(&str, Vec<f64>, &[&str]); 7] = [
         ("poisson", vec![1.0, 0.0, 2.0, -1.0, 3.0, 1.0], &["Poisson", "row 4 has value -1"]),
-        ("poisson", vec![1.0, 0.0, 2.5, 1.0, 3.0, 1.0], &["Poisson", "row 3 has value 2.5", "tweedie"]),
+        // Poisson takes a non-integer y as its quasi-likelihood (gam#4572); the
+        // count contract, and its pointer to the families that take real y, is
+        // negative binomial's.
+        (
+            "negative-binomial",
+            vec![1.0, 0.0, 2.5, 1.0, 3.0, 1.0],
+            &["Negative-Binomial", "row 3 has value 2.5", "tweedie"],
+        ),
         (
             "negative-binomial",
             vec![1.0, 0.5, 2.0, 1.0, 3.0, 1.0],

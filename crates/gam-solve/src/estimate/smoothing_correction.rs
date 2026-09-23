@@ -669,7 +669,7 @@ fn structural_pseudo_inverse_band(
 /// the certificate's railed set and excludes it through that same call, which
 /// is what the fitted-model correction does.
 ///
-/// The ρ-Hessian must be exactly symmetric ([`RHO_HESSIAN_ASSEMBLY`]): its two
+/// The ρ-Hessian must be exactly symmetric (`RHO_HESSIAN_ASSEMBLY`): its two
 /// triangles are separate accumulations of the same mixed partial, so their
 /// difference is assembly error rather than rounding, and the caller
 /// symmetrizes and forwards that measured defect through

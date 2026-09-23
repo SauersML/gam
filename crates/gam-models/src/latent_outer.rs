@@ -41,8 +41,8 @@ impl LatentOuterProblem {
     /// REML score (inner Gaussian REML plus aux/dim identifiability priors) and,
     /// when `want_grad`, the outer latent gradient `∂(reml_score)/∂t`.
     ///
-    /// The value reproduces [`gaussian_reml_fit_latent`]'s `reml_score` and the
-    /// gradient reproduces [`gaussian_reml_fit_latent_backward`]'s `grad_t` at
+    /// The value reproduces `gaussian_reml_fit_latent`'s `reml_score` and the
+    /// gradient reproduces `gaussian_reml_fit_latent_backward`'s `grad_t` at
     /// `grad_reml_score = 1`, so the optimizer descends exactly the quantity the
     /// forward primitive reports. A non-finite or unsolvable configuration maps
     /// to `+∞` with no gradient, which the trust region rejects rather than

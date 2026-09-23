@@ -501,7 +501,7 @@ fn partition_memo() -> &'static Mutex<Vec<(usize, u64, SoftmaxEntropyLogPartitio
 /// passes from near-uniform routing to near-vertex routing, and a single global rule cannot resolve
 /// that bend. The declared result error is [`SOFTMAX_ENTROPY_PARTITION_RELATIVE_TOLERANCE`]. This is
 /// refinement of a numerical integral of one fixed function, not a search over parameters
-/// (SPEC 18). Exhausting [`PARTITION_MAX_PIECES`], a piece that cannot be halved, or a group
+/// (SPEC 18). Exhausting `PARTITION_MAX_PIECES`, a piece that cannot be halved, or a group
 /// integral that does not converge, is a refusal.
 ///
 /// Limits: `Z_K(0) = 1/(K − 1)!` with slope `∂_λ ln Z_K(0) = 1 − H_K` (`H_K` the harmonic number),

@@ -114,7 +114,7 @@ pub struct ReuseComparison {
 /// not a Bayes factor, and the logistic of the prior-adjusted difference is not
 /// a posterior probability — the type says so in the names rather than leaving
 /// the reader to find it in a doc (#4556 P3). The two arms carry the same prior
-/// transform ([`share_odds`]); what differs is what goes into it.
+/// transform (`share_odds`); what differs is what goes into it.
 ///
 /// What would make the REML arm's ratio a Bayes factor is the integral the
 /// profile skips: `log ∫ exp(−V(ρ)) dρ` over each hypothesis' own smoothing

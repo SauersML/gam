@@ -3281,10 +3281,24 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
             self.decrement_verdict_config.is_some() || self.cost_stall.is_some(),
             || self.obj.eval_with_order(x, OuterEvalOrder::ValueGradientHessian),
         );
+        // The reason is the whole content of a refused trial: without it a trust
+        // region that raises its regularization on silent refusals leaves a trail
+        // of eval starts with no end and names no domain (#3430), as the operator
+        // bridge already records.
+        let log_refusal = |err: &ObjectiveEvalError| {
+            log::debug!(
+                "[STAGE] outer eval end order=ValueGradientHessian elapsed={:.3}s outcome={} theta={} reason={}",
+                stage_start.elapsed().as_secs_f64(),
+                if err.is_recoverable() { "recoverable" } else { "fatal" },
+                format_outer_theta(x),
+                err,
+            );
+        };
         let eval = match evaluated {
             Ok(eval) => eval,
             Err(err) => {
                 let err = into_line_search_value_probe_error("outer eval failed", err);
+                log_refusal(&err);
                 if err.is_recoverable() && self.cost_stall.is_some() {
                     self.accepted_trials.stage_refusal(x.clone());
                 }
@@ -3294,7 +3308,8 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         if !eval.cost.is_finite() && self.cost_stall.is_some() {
             self.accepted_trials.stage_refusal(x.clone());
         }
-        let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
+        let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)
+            .inspect_err(|err| log_refusal(err))?;
         self.eval_count += 1;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
         self.last_value_grad_rho = Some(x.clone());

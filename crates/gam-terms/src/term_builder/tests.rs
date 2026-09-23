@@ -809,7 +809,24 @@ fn matern_length_scale_provenance_drives_prebuild_kappa_locking() {
         "resolved Auto Matérn κ must remain optimizer-owned"
     );
 
-    for explicit in ["0.75", "0.0"] {
+    // An explicit zero is not a range: it is refused at the formula, where it would
+    // otherwise be indistinguishable from the auto marker (#3764).
+    let mut options = BTreeMap::new();
+    options.insert("bs".to_string(), "matern".to_string());
+    options.insert("length_scale".to_string(), "0.0".to_string());
+    let mut refusal_notes = Vec::new();
+    let refused = build_smooth_basis(
+        SmoothKind::S,
+        &["x1".to_string(), "x2".to_string()],
+        &[1, 2],
+        &options,
+        &ds,
+        &mut refusal_notes,
+    )
+    .expect_err("an explicit zero Matérn length_scale is refused");
+    assert!(refused.contains("positive finite"), "{refused}");
+
+    for explicit in ["0.75"] {
         let fixed = collection(build(Some(explicit)));
         assert!(matches!(
             &fixed.smooth_terms[0].basis,
@@ -1126,8 +1143,9 @@ fn default_te_margin_dims(ds: &Dataset, formula: &str) -> Vec<usize> {
 
 /// The default `te` is a 2-D smooth and takes the same total basis dimension
 /// as any other 2-covariate default smooth on these rows, not a fixed per-margin
-/// table: at n = 3200 a `te(x, z)` of two continuous covariates resolves more
-/// than a fixed `7 x 7` could (the bump2d audit case).
+/// table (the bump2d audit case). That dimension is the engine's pilot width; the
+/// fit grows it where the adequacy test asks (#3078), so no count beyond the
+/// shared default is this builder's to pin.
 #[test]
 fn default_te_takes_the_engine_default_basis_dimension_for_its_rows() {
     let n = 3200;
@@ -1147,7 +1165,6 @@ fn default_te_takes_the_engine_default_basis_dimension_for_its_rows() {
         tensor_margin_sizes(&[n, n], default_num_centers(n, 2)),
         "default te margins must split the engine's 2-D default budget"
     );
-    assert!(dims.iter().product::<usize>() > 49, "{dims:?}");
 }
 
 /// A low-cardinality margin is capped at its distinct values and hands the
@@ -4984,10 +5001,13 @@ fn canonical_penalty_partition_agrees_with_declared_nullity_across_families_2469
             let block_dim = penalty.local.nrows();
             let analysis =
                 crate::basis::analyze_penalty_block(&penalty.local).expect("penalty spectrum");
-            let canonical = crate::construction::canonicalize_penalty_spec(
+            // The fit roots each block through its declaration
+            // (`canonicalize_penalty_specs`), so that is the root graded here.
+            let canonical = crate::construction::canonicalize_penalty_spec_declared(
                 &crate::PenaltySpec::from_blockwise_ref(penalty),
                 p,
                 idx,
+                declared_nullity,
                 formula,
             )
             .expect("canonical penalty");
@@ -5019,7 +5039,11 @@ fn canonical_penalty_partition_agrees_with_declared_nullity_across_families_2469
                 block_dim as f64 * f64::EPSILON,
                 analysis.rank_tol / lambda_max,
             );
-            if canonical_rank + declared_nullity != block_dim || canonical_rank != analysis.rank {
+            // One partition: the root's rank and the declared nullity split the block. A
+            // declaration only removes directions, so the root never keeps more than the
+            // spectrum resolves; it keeps fewer where a builder declares null directions its
+            // conditioning left resolvable (the cyclic harmonic `{sin, cos}`, gam#1561).
+            if canonical_rank + declared_nullity != block_dim || canonical_rank > analysis.rank {
                 disagreements.push(format!(
                     "{formula} block {idx}: dim={block_dim} declared_nullity={declared_nullity} \
                      analysis_rank={} canonical_rank={canonical_rank}",

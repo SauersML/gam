@@ -4289,15 +4289,46 @@ fn a_trial_the_collection_gauge_cannot_place_refuses_instead_of_failing_2959() {
         cache.ensure_theta(theta).map(|()| cache.design().design.ncols())
     };
     assert!(cache_at(&theta).is_ok(), "the seed ψ places in the gauge");
+    // Whether this far trial is placeable moves with the realizer's conditioning
+    // (it was refused at a 9.919e-1 residual, and places since the block's nullity
+    // is read from its declared frame); what may not move is that it never FAILS
+    // the fit: it is placed, or refused as a trial naming the placement.
     let mut beyond = theta.clone();
     beyond[rho_dim] = -18.26917481547663;
     match cache_at(&beyond) {
+        Ok(_) => {}
         Err(EstimationError::TrialPointRefused { reason }) => assert!(
             reason.contains("smooth orthogonality residual too large"),
             "the refusal names the placement it could not make: {reason}"
         ),
-        other => panic!("a trial the gauge cannot place must refuse the trial, got {other:?}"),
+        Err(other) => panic!("a trial the gauge cannot place must refuse the trial, got {other:?}"),
     }
+    // The mapping itself, on both arms: an unplaceable block is a refused trial,
+    // any other placement failure a defect.
+    let unplaceable = collection_gauge_placement_error(
+        "duchon",
+        "psi=-18.269",
+        gam_terms::basis::BasisError::CollectionGaugeNotOrthogonal {
+            term: "duchon".to_string(),
+            residual: 9.919e-1,
+            tolerance: 1e-8,
+        },
+    );
+    match unplaceable {
+        EstimationError::TrialPointRefused { reason } => assert!(
+            reason.contains("smooth orthogonality residual too large"),
+            "{reason}"
+        ),
+        other => panic!("an unplaceable block must refuse the trial, got {other:?}"),
+    }
+    assert!(matches!(
+        collection_gauge_placement_error(
+            "duchon",
+            "psi=-18.269",
+            gam_terms::basis::BasisError::InvalidInput("a defect".to_string()),
+        ),
+        EstimationError::InvalidInput(_)
+    ));
 }
 
 #[test]

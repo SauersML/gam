@@ -733,8 +733,11 @@ pub trait PredictionTransform {
         // Default: no skew-aware band. The generic symmetric construction is
         // used instead. Validate the inputs the driver hands every transform so
         // an overriding impl and this default agree on shape: one entry per row
-        // of the prediction design, whose columns are the covariance's coefficients.
-        assert_eq!(input.design.ncols(), covariance.fit.beta.len());
+        // of the prediction design, whose columns are coefficients of the fit the
+        // covariance belongs to. They need not be ALL of them: a location-scale
+        // model's `design` is its location block while `fit.beta` carries every
+        // block (#4326).
+        assert!(input.design.ncols() <= covariance.fit.beta.len());
         assert_eq!(eta.len(), input.design.nrows());
         assert_eq!(eta.len(), eta_se.len());
         assert_eq!(eta.len(), z_lower.len());

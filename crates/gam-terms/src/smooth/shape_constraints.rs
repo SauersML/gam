@@ -1023,7 +1023,7 @@ pub(super) fn shape_order_and_sign(shape: ShapeConstraint) -> Option<(usize, f64
 }
 
 /// Coordinate lower bounds of the shape chart built by
-/// [`bspline_shape_cone_chart`]. The chart's leading coordinates are the free
+/// `bspline_shape_cone_chart`. The chart's leading coordinates are the free
 /// affine ones — level then (for curvature) slope — and every later coordinate
 /// is a cone coordinate `δ_j ≥ 0`. A centred chart has no level coordinate, so
 /// one fewer leading coordinate is free.

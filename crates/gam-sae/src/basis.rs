@@ -1413,7 +1413,7 @@ impl SaeBasisSecondJet for AmbientSphereHarmonicEvaluator {
     }
 
     /// A column's mixed partial with `s` of its axes in `(x, y)` and `r` in `z` is
-    /// `N·Q^{(r)}(z)·∂^s A_m(x, y)` ([`Self::partial`]). On the ball, `|z| ≤ ρ_z` and
+    /// `N·Q^{(r)}(z)·∂^s A_m(x, y)` (`Self::partial`). On the ball, `|z| ≤ ρ_z` and
     /// `|x + iy| ≤ ρ_w`, so `|Q^{(r)}(z)| ≤ Σ_j |q^{(r)}_j| ρ_z^j` and
     /// `|∂^s A_m| ≤ |m|^{↓s} ρ_w^{|m|−s}` (from `∂^p_x ∂^q_y w^a = i^q a^{↓(p+q)} w^{a−p−q}`).
     /// Of the ordered axis tuples of length `k`, `C(k, r)·2^s` have that split.
@@ -1886,7 +1886,7 @@ impl SaeBasisSecondJet for TorusHarmonicEvaluator {
     }
 
     /// Exact at every point: each column is a product of `d` Fourier factors of
-    /// frequency `2π` ([`tensor_column_sups`]), in the layout above (last axis fastest).
+    /// frequency `2π` (`tensor_column_sups`), in the layout above (last axis fastest).
     fn jet_ball_bound(
         &self,
         center: ArrayView1<'_, f64>,
@@ -3002,7 +3002,7 @@ impl SaeBasisSecondJet for EuclideanPatchEvaluator {
 
     /// A monomial `t^α` is the product of one monomial factor per axis, and on the
     /// ball each coordinate obeys `|t_a| ≤ |c_a| + radius`
-    /// ([`monomial_axis_function_sups`], [`tensor_column_sups`]).
+    /// (`monomial_axis_function_sups`, `tensor_column_sups`).
     fn jet_ball_bound(
         &self,
         center: ArrayView1<'_, f64>,

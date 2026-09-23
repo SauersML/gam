@@ -1910,7 +1910,7 @@ impl SaeManifoldOuterObjective {
     /// On the streaming lane the searched criterion is the frozen rational surrogate
     /// of `½log|A|`, and the certificate judges that surrogate's gradient. Before
     /// stamping, the certified point is re-scored on a plan of twice the search's
-    /// probes ([`Self::validate_surrogate_certificate`]); a disagreement is returned as
+    /// probes (`Self::validate_surrogate_certificate`); a disagreement is returned as
     /// [`SaeOuterCertificationError::SurrogateDisagrees`] with the doubled plan
     /// installed, for [`Self::run_to_certificate`] to resume from.
     pub fn certify_outer_result(
@@ -2322,7 +2322,7 @@ impl SaeManifoldOuterObjective {
     ///
     /// Re-converges the penalized quasi-Laplace criterion at the settled ρ,
     /// re-forms the exact observed information `A` at that inner optimum
-    /// ([`SaeManifoldTerm::exact_observed_information_shape_covariance`]), and
+    /// (`SaeManifoldTerm::exact_observed_information_shape_covariance`), and
     /// reads the per-atom covariance and bands off its selected inverse, scaling
     /// by the Gaussian reconstruction dispersion `φ̂` (#2933 F33: not the
     /// majorizer's Schur inverse). The term is already at the optimum after the

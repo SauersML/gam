@@ -156,26 +156,45 @@ fn measure_jet_range_screen_jet(
             response[row] *= root;
         }
     }
-    let transform = whiten_to_identifiable_subspace(&design).ok_or_else(|| {
+    let chart_jet = identifiable_subspace_chart_jet(&design, &first, &second).ok_or_else(|| {
         EstimationError::InvalidInput(
             "measure-jet range screen: the representer design identifies no direction".to_string(),
         )
     })?;
-    let chart = |block: &Array2<f64>| fast_ab(block, &transform);
-    // The congruence is symmetric in exact arithmetic; make it so in floating
-    // point as well, because the evaluator's spectral classification refuses a
-    // matrix that is not exactly self-adjoint.
-    let congruence = |block: &Array2<f64>| -> Array2<f64> {
-        let half = fast_ab(block, &transform);
-        let full = fast_atb(&transform, &half);
-        (&full + &full.t()) * 0.5
+    let IdentifiableChartJet {
+        value: transform,
+        first: transform_first,
+        second: transform_second,
+    } = &chart_jet;
+    // `X(ℓ)T(ℓ)` and its first two ℓ-derivatives.
+    let design_first_chart = fast_ab(&first, transform) + fast_ab(&design, transform_first);
+    let design_second_chart = fast_ab(&second, transform)
+        + fast_ab(&first, transform_first) * 2.0
+        + fast_ab(&design, transform_second);
+    let design_chart = fast_ab(&design, transform);
+    // `Aᵀ B C` symmetrized: every penalty congruence below is self-adjoint in
+    // exact arithmetic, and the evaluator's spectral classification refuses a
+    // matrix that is not exactly so in floating point.
+    let sandwich = |left: &Array2<f64>, block: &Array2<f64>, right: &Array2<f64>| -> Array2<f64> {
+        fast_atb(left, &fast_ab(block, right))
     };
-    let design = chart(&design);
-    let first = chart(&first);
-    let second = chart(&second);
-    let penalty = congruence(&border_penalty(&basis.active_penalties[0].matrix));
-    let penalty_first = congruence(&border_penalty(penalty_first));
-    let penalty_second = congruence(&border_penalty(penalty_second));
+    let symmetric = |full: Array2<f64>| -> Array2<f64> { (&full + &full.t()) * 0.5 };
+    let s0 = border_penalty(&basis.active_penalties[0].matrix);
+    let s1 = border_penalty(penalty_first);
+    let s2 = border_penalty(penalty_second);
+    // `T(ℓ)ᵀ S(ℓ) T(ℓ)` and its first two ℓ-derivatives; each mixed pair `AᵀBC + CᵀBA`
+    // is formed as twice the symmetric part of one product.
+    let penalty = symmetric(sandwich(transform, &s0, transform));
+    let penalty_first = symmetric(
+        sandwich(transform, &s1, transform) + sandwich(transform_first, &s0, transform) * 2.0,
+    );
+    let penalty_second = symmetric(
+        sandwich(transform, &s2, transform)
+            + sandwich(transform_first, &s1, transform) * 4.0
+            + sandwich(transform_first, &s0, transform_first) * 2.0
+            + sandwich(transform_second, &s0, transform) * 2.0,
+    );
+    let (design, first, second) = (design_chart, design_first_chart, design_second_chart);
     let kept = transform.ncols();
     let zero_design = Array2::<f64>::zeros((n, kept));
     let zero_penalty = Array2::<f64>::zeros((kept, kept));
@@ -194,7 +213,8 @@ fn measure_jet_range_screen_jet(
 }
 
 /// The chart `T` (`p × k`) that restricts a design to the subspace it actually
-/// identifies, with the Gram the identity there: `(XT)ᵀ(XT) = I`.
+/// identifies, with the Gram the identity there: `(XT)ᵀ(XT) = I`, and its first
+/// two derivatives along the design's `ln ℓ` jet.
 ///
 /// ## Why this is needed at all
 ///
@@ -208,29 +228,56 @@ fn measure_jet_range_screen_jet(
 /// exists to reach would report the seed basin as the optimum for the second
 /// time, which is the defect rather than a measurement of it.
 ///
-/// ## Why it is free
-///
-/// For an INVERTIBLE `T`, `X → XT`, `S → TᵀST` leaves the profiled criterion
-/// exactly unchanged: `log|Tᵀ(XᵀWX + λS)T|` and `log|λTᵀST|₊` both pick up
-/// `2 ln|det T|` and the deviance is invariant, so the `2 ln|det T|` cancels in
-/// the difference. Whitening is therefore a free change of chart, not a change
-/// of model — and it makes the Gram exactly `I`, so the congruence above is the
-/// identity and the evaluator sees the penalty as it was assembled. The same
-/// `T` carries the ℓ-jets, `∂X → ∂X·T` and `∂S → Tᵀ∂S T`: on a stretch of ranges
-/// where the identified rank does not change the criterion does not depend on
-/// which chart of the identified subspace it is read in.
-///
-/// The map is only non-invertible where it drops directions, and dropping is
-/// the honest reading there: the collection's own realization drops columns at
-/// the same ranges. The cut is at `√ε` of the leading Gram eigenvalue — the
-/// half-mantissa bar, i.e. the point past which a direction cannot survive
+/// The kept directions are the Gram eigendirections above `√ε` of the leading
+/// eigenvalue — the half-mantissa bar, past which a direction cannot survive
 /// being squared into a Gram and inverted back out with any significant digits.
-fn whiten_to_identifiable_subspace(design: &Array2<f64>) -> Option<Array2<f64>> {
+/// Dropping is the honest reading there: the collection's own realization drops
+/// columns at the same ranges.
+///
+/// ## Why the chart must move with ℓ (gam#2959)
+///
+/// For an invertible `A`, `T → TA` leaves the profiled criterion exactly
+/// unchanged: `log|Aᵀ Tᵀ(XᵀWX + λS)T A|` and `log|λAᵀTᵀSTA|₊` both pick up
+/// `2 ln|det A|`, which cancels in their difference, and the deviance is
+/// invariant. So the criterion depends on `T` only through its SPAN, the kept
+/// eigenspace of the Gram `G(ℓ) = XᵀX` — and that span rotates with `ℓ`
+/// wherever a direction is dropped. A jet pushed through a frozen `T` differentiates
+/// a criterion on a frozen subspace, which is not the criterion the screen
+/// evaluates at a neighbouring range (#2959 measured V′ 9.620 against a central
+/// difference of 9.635).
+///
+/// The chart used is `T(ℓ) = P(ℓ)·T₀`, with `P` the spectral projector onto the kept
+/// eigenspace and `T₀` the whitened kept eigenvectors at this `ℓ`. It equals `T₀`
+/// here and spans the kept eigenspace at every nearby `ℓ` on the same rank, so by
+/// the invariance above its jet is the criterion's exact jet. The projector's
+/// derivatives follow from `P² = P` and `GP = PG` differentiated twice; in the
+/// eigenbasis of `G`, with `i` kept and `j` dropped,
+///
+/// ```text
+/// Ṗᵢⱼ = Ġᵢⱼ / (λᵢ − λⱼ),     P̈ᵢⱼ = (G̈ + 2(ṖĠ − ĠṖ))ᵢⱼ / (λᵢ − λⱼ),
+/// P̈_KK = −2 (Ṗ²)_KK,        Ṗ_KK = Ṗ_DD = 0,
+/// ```
+///
+/// where `Ġ = ẊᵀX + XᵀẊ` and `G̈ = ẌᵀX + 2ẊᵀẊ + XᵀẌ`. Every denominator spans the
+/// `√ε` cut, `λᵢ > cut ≥ λⱼ`; where it closes, a direction is crossing the cut and
+/// the criterion itself steps there.
+struct IdentifiableChartJet {
+    value: Array2<f64>,
+    first: Array2<f64>,
+    second: Array2<f64>,
+}
+
+fn identifiable_subspace_chart_jet(
+    design: &Array2<f64>,
+    design_first: &Array2<f64>,
+    design_second: &Array2<f64>,
+) -> Option<IdentifiableChartJet> {
+    use gam_linalg::faer_ndarray::{fast_ab, fast_ata, fast_atb};
     let p = design.ncols();
     if p == 0 {
         return None;
     }
-    let gram = gam_linalg::faer_ndarray::fast_ata(design);
+    let gram = fast_ata(design);
     let (values, vectors) = gam_linalg::faer_ndarray::strict_symmetric_eigh(
         &gram,
         // `fast_ata` accumulates one triangle and mirrors it.
@@ -247,14 +294,59 @@ fn whiten_to_identifiable_subspace(design: &Array2<f64>) -> Option<Array2<f64>> 
     if kept.is_empty() {
         return None;
     }
-    let mut transform = Array2::<f64>::zeros((p, kept.len()));
-    for (column, &index) in kept.iter().enumerate() {
-        let inverse_root = values[index].sqrt().recip();
-        for row in 0..p {
-            transform[(row, column)] = vectors[(row, index)] * inverse_root;
+    let is_kept: Vec<bool> = (0..p).map(|i| values[i] > cut).collect();
+    // The Gram's ℓ-jet in its own eigenbasis.
+    let rotated = fast_ab(design, &vectors);
+    let rotated_first = fast_ab(design_first, &vectors);
+    let rotated_second = fast_ab(design_second, &vectors);
+    let cross = fast_atb(&rotated_first, &rotated);
+    let gram_first = &cross + &cross.t();
+    let cross_second = fast_atb(&rotated_second, &rotated);
+    let gram_second =
+        &cross_second + &cross_second.t() + fast_atb(&rotated_first, &rotated_first) * 2.0;
+    // `Ṗ`: nonzero only on the kept × dropped blocks.
+    let mut projector_first = Array2::<f64>::zeros((p, p));
+    for i in 0..p {
+        for j in 0..p {
+            if is_kept[i] && !is_kept[j] {
+                let entry = gram_first[(i, j)] / (values[i] - values[j]);
+                projector_first[(i, j)] = entry;
+                projector_first[(j, i)] = entry;
+            }
         }
     }
-    Some(transform)
+    // `P̈` on the kept columns: the kept × kept block and the dropped × kept block.
+    let commutator = fast_ab(&projector_first, &gram_first) - fast_ab(&gram_first, &projector_first);
+    let projector_square = fast_ab(&projector_first, &projector_first);
+    let mut projector_second_kept = Array2::<f64>::zeros((p, kept.len()));
+    for (column, &k) in kept.iter().enumerate() {
+        for row in 0..p {
+            projector_second_kept[(row, column)] = if is_kept[row] {
+                -2.0 * projector_square[(row, k)]
+            } else {
+                // `P̈` is symmetric, so its dropped × kept entry is the kept × dropped one.
+                (gram_second[(k, row)] + 2.0 * commutator[(k, row)]) / (values[k] - values[row])
+            };
+        }
+    }
+    // `T₀`, `Ṗ T₀` and `P̈ T₀` in the eigenbasis: column `c` reads the projector
+    // derivatives' kept column `kept[c]`, scaled by `λ^{-1/2}`.
+    let mut value = Array2::<f64>::zeros((p, kept.len()));
+    let mut first = Array2::<f64>::zeros((p, kept.len()));
+    let mut second = Array2::<f64>::zeros((p, kept.len()));
+    for (column, &k) in kept.iter().enumerate() {
+        let inverse_root = values[k].sqrt().recip();
+        value[(k, column)] = inverse_root;
+        for row in 0..p {
+            first[(row, column)] = projector_first[(row, k)] * inverse_root;
+            second[(row, column)] = projector_second_kept[(row, column)] * inverse_root;
+        }
+    }
+    Some(IdentifiableChartJet {
+        value: fast_ab(&vectors, &value),
+        first: fast_ab(&vectors, &first),
+        second: fast_ab(&vectors, &second),
+    })
 }
 
 /// The screened range for ONE measure-jet term, in standardized units, or

@@ -761,11 +761,11 @@ pub fn chi_square_quantile(p: f64, degrees_of_freedom: f64) -> f64 {
 ///   used to hand back a partial sum as a converged value — and returns NaN if
 ///   that test can never be met, which the band code already reads as "no band".
 ///   Below the split with `a < 1`, `Q` is summed directly
-///   ([`small_shape_upper_gamma_below_split`]) rather than formed as `1 − P`.
+///   (`small_shape_upper_gamma_below_split`) rather than formed as `1 − P`.
 ///
 /// All three share the prefactor `x^a e^{−x} / Γ(a)` in the form
 /// `e^{−a·h} √(a/2π) / Γ*(a)`, `h = λ − 1 − ln λ`, `λ = x / a`
-/// ([`incomplete_gamma_prefactor`]): the textbook `exp(a·ln x − x − ln Γ(a))`
+/// (`incomplete_gamma_prefactor`): the textbook `exp(a·ln x − x − ln Γ(a))`
 /// is a difference of terms of size `a·ln a` and loses that many ulp of it.
 pub fn regularized_incomplete_gamma_pair(a: f64, x: f64) -> (f64, f64) {
     // Callers (`inverse_regularized_lower_gamma`) validate `a > 0` upstream.
@@ -1239,7 +1239,7 @@ fn temme_incomplete_gamma_pair(a: f64, x: f64) -> Option<(f64, f64)> {
 /// [`regularized_incomplete_gamma_pair`] (NOT `statrs::gamma_lr`, which clamps the
 /// residual to `−p` for tiny `x`; see that fn's note); the density
 /// `f(x) = x^{a−1} e^{−x} / Γ(a)` is the same pair's prefactor
-/// ([`incomplete_gamma_prefactor`]) over `x`, finite and free of the `a·ln a`
+/// (`incomplete_gamma_prefactor`) over `x`, finite and free of the `a·ln a`
 /// cancellation for every `a`. A positivity step-halving guard keeps the
 /// iterate inside the support.
 pub fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {

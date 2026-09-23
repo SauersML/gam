@@ -721,7 +721,7 @@ impl MultinomialFixedLambdaObjective {
 
 /// A penalty-free coefficient direction along which the multinomial likelihood
 /// never decreases and strictly increases on some rows (#4173). See
-/// [`certify_multinomial_separation`].
+/// `certify_multinomial_separation`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MultinomialSeparationWitness {
     /// Dimension `q` of the null space of `A(λ) ⊗ S`, where the search ran.
@@ -1075,7 +1075,7 @@ pub(crate) fn certify_multinomial_separation(
 ///
 /// See the module docs for the optimization problem and conventions. Before it
 /// iterates, the driver decides from the data whether the penalized likelihood
-/// has a finite maximizer ([`certify_multinomial_separation`]). If it does, the
+/// has a finite maximizer (`certify_multinomial_separation`). If it does, the
 /// driver fits the penalized likelihood. If the data are (quasi-)separated in
 /// the null space of the penalty, it fits the Firth-penalized objective
 /// instead. Either objective is fitted to convergence, and the fit records

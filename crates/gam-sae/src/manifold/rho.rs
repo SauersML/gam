@@ -293,7 +293,7 @@ impl SaeManifoldRho {
     ///
     /// The layout reads the assignment, not only its mode: a per-fit concentration
     /// override pins a learnable mode, and that fit has no sparse coordinate
-    /// ([`SaeAssignment::effective_alpha_is_learnable`], #2933 F45).
+    /// (`SaeAssignment::effective_alpha_is_learnable`, #2933 F45).
     #[must_use]
     pub fn for_assignment(mut self, assignment: &SaeAssignment) -> Self {
         self.assignment_strength_layout = AssignmentStrengthLayout::of(assignment);

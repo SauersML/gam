@@ -1139,7 +1139,7 @@ pub enum SurvivalPosteriorIntegration {
     /// re-solved at every node. The event density `φ(η)·η′` also reads the
     /// tangents `(q′(t), b′(t))`: given the primaries they are Gaussian and
     /// `η′ = η_q·q′ + η_b·b′` is linear in them, so they enter through their
-    /// conditional mean alone ([`exact_anchor_node_moments`]), and the published
+    /// conditional mean alone (`exact_anchor_node_moments`), and the published
     /// density is exactly `−dE_θ[S]/dt`.
     ///
     /// Survival and density are integrated separately under this one rule and
@@ -1315,9 +1315,9 @@ fn survival_posterior_moments(
 /// - The truncated-law rule's posterior is a mixture over its nodes of laws
 ///   each node leaves exactly Gaussian in the coefficients, so the band is the
 ///   certified central interval of that mixture: a Royston-Parmar cell's
-///   `log H` is linear in the coefficients ([`replayed_truncated_surface_band`]),
+///   `log H` is linear in the coefficients (`replayed_truncated_surface_band`),
 ///   and a location-scale cell's index is resolved in one coordinate per node
-///   ([`location_scale_truncated_surface_band`]).
+///   (`location_scale_truncated_surface_band`).
 ///
 /// `req.with_uncertainty` must be set and `level` must lie strictly inside
 /// `(0, 1)`.
@@ -2005,7 +2005,7 @@ fn predict_competing_risks_with_posterior(
 
     for_each_survival_posterior_node(&posterior_mean, &active_covariance, &cone_coords, |node, weight| {
         let draw_model = saved_model_with_survival_coefficients(req.model, node)?;
-        let draw = predict_competing_risks_survival(
+        let draw = predict_competing_risks_coefficient_law(
             SurvivalPredictRequest {
                 model: &draw_model,
                 data: req.data,
@@ -2017,7 +2017,6 @@ fn predict_competing_risks_with_posterior(
                 with_uncertainty: false,
                 estimand: SurvivalPredictEstimand::Plugin,
             },
-            SurvivalPredictionCovarianceMode::Conditional,
         )?;
         if draw.cif.len() != cause_count
             || draw.survival.len() != cause_count
@@ -3632,6 +3631,28 @@ pub fn predict_competing_risks_survival(
     if req.estimand == SurvivalPredictEstimand::PosteriorMean || req.with_uncertainty {
         return predict_competing_risks_with_posterior(req, covariance_mode, None);
     }
+    let result = predict_competing_risks_coefficient_law(req)?;
+    for (cause, hazard) in result.hazard.iter().enumerate() {
+        if let Some(((row, time), hazard)) =
+            hazard.indexed_iter().find(|(_, hazard)| **hazard < 0.0)
+        {
+            return Err(decreasing_survival_refusal(format!(
+                "endpoint {cause} hazard dH/dt={hazard:.6e} < 0 at row {row}, time column {time}"
+            )));
+        }
+    }
+    Ok(result)
+}
+
+/// The competing-risks law at the coefficients `req.model` carries, for a
+/// posterior rule that sums it over coefficient nodes: the plug-in pass of
+/// [`predict_competing_risks_survival`] without the refusal of a negative
+/// cause-specific hazard. Where a node's cumulative hazard falls, its hazard is
+/// the negative `dH/dt` it is, so the rule's sums stay the derivatives of its
+/// sums (gam#3575); the publisher refuses the curve it publishes.
+fn predict_competing_risks_coefficient_law(
+    req: SurvivalPredictRequest<'_>,
+) -> Result<CompetingRisksPredictResult, SurvivalPredictError> {
     let SurvivalPredictRequest {
         model,
         data,
@@ -5107,11 +5128,11 @@ fn evaluate_rp_row_with_beta(
         wiggle_derivative_component = derivative_design.dot(&beta_w)[0];
         eta_derivative += wiggle_derivative_component;
     }
-    // Cold-path diagnostic (fires only when the assembled log-cumulative-hazard
-    // derivative is about to be refused): decompose `eta_t` into its additive
-    // components and report the time-coefficient / derivative-basis extrema so a
-    // refused prediction is traceable to the specific negative term instead of
-    // only surfacing the aggregate. Never fires on the accepted path.
+    // Cold-path diagnostic (fires only where the assembled log-cumulative-hazard
+    // derivative is negative or non-finite, which a published surface refuses):
+    // decompose `eta_t` into its additive components and report the
+    // time-coefficient / derivative-basis extrema so the cell is traceable to the
+    // specific negative term instead of only surfacing the aggregate.
     if !(eta_derivative.is_finite() && eta_derivative >= 0.0) {
         let time_beta = beta.slice(s![..p_time]);
         let beta_min = time_beta.iter().copied().fold(f64::INFINITY, f64::min);
@@ -5199,9 +5220,15 @@ fn royston_parmar_survival_hazard_components(
     eta_derivative: f64,
 ) -> Result<(f64, f64), SurvivalPredictError> {
     // `eta = log Λ(t)` and `eta_derivative = d(log Λ)/dt`, so the instantaneous
-    // hazard is `h(t) = Λ(t) · eta_derivative = dΛ/dt`. Reject only the true bug
-    // signals: a non-finite `eta`, and a derivative that is NaN or genuinely
-    // negative.
+    // hazard is `h(t) = Λ(t) · eta_derivative = dΛ/dt`, its sign included. Where
+    // `eta_derivative < 0` the law's cumulative hazard falls and its survival
+    // rises, and `h` is the negative `dΛ/dt` it is (gam#3575): a coefficient
+    // node of a posterior rule can sit there, and the integrator's `Σ S·h` is
+    // `−d/dt` of its `Σ S` only if that node's `h` is not refused or clamped.
+    // The surfaces that PUBLISH a hazard refuse a negative one
+    // (`refuse_decreasing_survival`), exactly as for the probit law
+    // (`probit_survival_hazard_components`). Only a non-finite `eta` or
+    // derivative is refused here.
     //
     // `eta_derivative == 0` is a VALID boundary value, not a failure. The RP
     // baseline `log Λ(t)` is an I-spline (monotone non-decreasing cumulative
@@ -5212,7 +5239,7 @@ fn royston_parmar_survival_hazard_components(
     // strict `> 0.0` gate spuriously failed those predictions (#1564). The
     // probit / marginal-slope sibling (`probit_survival_hazard_components`)
     // maps a zero derivative to a zero hazard; the RP guard must match.
-    if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative >= 0.0) {
+    if !(eta.is_finite() && eta_derivative.is_finite()) {
         return Err(SurvivalPredictError::NumericalFailure {
             reason: format!(
                 "saved Royston-Parmar survival prediction produced invalid log-cumulative-hazard derivative: eta={eta}, eta_t={eta_derivative}"
@@ -5238,7 +5265,7 @@ fn royston_parmar_survival_hazard_components(
     // `>= 0.0` rejects NaN (the only true bug signal) while allowing the full
     // [0, +∞] range. The consumer materializes survival via
     // `survival = exp(-cum).clamp(0, 1)`, which collapses cleanly at saturation.
-    if !(cumulative_hazard >= 0.0 && hazard >= 0.0) {
+    if !(cumulative_hazard >= 0.0 && !hazard.is_nan()) {
         return Err(SurvivalPredictError::NumericalFailure {
             reason: format!(
                 "saved Royston-Parmar survival prediction produced invalid survival components: eta={eta}, eta_t={eta_derivative}, cumulative_hazard={cumulative_hazard}, hazard={hazard}"

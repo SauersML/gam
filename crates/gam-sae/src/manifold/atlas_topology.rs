@@ -217,7 +217,7 @@ impl fmt::Display for TopologyRefusal {
 /// # The complex
 ///
 /// The rows carry the atlas's own neighbourhood graph `G`
-/// ([`LocalAtlas::neighbourhood`]), the graph patch membership grew through. Patch `i`
+/// (`LocalAtlas::neighbourhood`), the graph patch membership grew through. Patch `i`
 /// spans the flag complex `K_i` of the subgraph `G[U_i]` its members induce, and
 /// `{K_i}` covers `K = ⋃_i K_i`. The flag complexes of induced subgraphs intersect as
 /// the flag complex of the induced subgraph on the common rows, so

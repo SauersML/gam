@@ -4236,20 +4236,22 @@ impl<'a> RemlState<'a> {
         // Use the same H = X' W X + S that PIRLS built. W is the exact signed
         // statistical curvature, and no stabilization ridge is added
         // (#2901 V22).
-        let h = &pr.stabilizedhessian_transformed;
-        // `X'WX` comes from `fast_xt_diag_x`, which mirrors; the penalty root's
-        // Gram is the only term whose two triangles can disagree.
-        let assembly = gam_linalg::roundoff::SymmetricAssembly::penalized_gram(
-            0,
-            pr.reparam_result.e_transformed.nrows(),
-        );
-        if h.factorize(assembly).is_ok() {
-            return Ok(h.to_dense());
+        //
+        // No factorization gates it here. H at a converged mode may be singular
+        // along directions neither the design nor the penalty identifies (an
+        // intercept beside unconstrained B-spline blocks, #1575), and the
+        // criterion is built for that: its operator factors H by Cholesky and
+        // otherwise scores it on its identified subspace (#2901 V22), refusing
+        // there what it cannot score. A strict SPD factor here, whose factor was
+        // thrown away, refused exactly those fits before the criterion could
+        // decide (#3696 made it strict; it had been a vacuous LBLᵀ).
+        let h = pr.stabilizedhessian_transformed.to_dense();
+        if h.iter().any(|value| !value.is_finite()) {
+            return Err(EstimationError::InnerSolveUnresolvedAtRho {
+                context: "penalized Hessian has non-finite entries",
+            });
         }
-
-        Err(EstimationError::InnerSolveUnresolvedAtRho {
-            context: "penalized Hessian dense factorization",
-        })
+        Ok(h)
     }
 
     pub(crate) fn newwith_offset<X>(

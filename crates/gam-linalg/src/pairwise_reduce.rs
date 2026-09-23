@@ -344,7 +344,7 @@ where
 /// rows of work, such as row chunks or tiles.
 ///
 /// The leaves hold at most [`BASE_CHUNK`] rows of work
-/// ([`leaf_indices_for_work`]), so a fold over a few heavy indices still fans across
+/// (`leaf_indices_for_work`), so a fold over a few heavy indices still fans across
 /// workers. Folding coarse indices through the unweighted fold keeps every fold of
 /// at most [`BASE_CHUNK`] indices in one sequential base block, whatever each index
 /// costs (#979). The association order is a pure function of `(n, rows_per_index)`,

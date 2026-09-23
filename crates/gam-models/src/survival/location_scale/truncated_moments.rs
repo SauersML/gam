@@ -2245,10 +2245,13 @@ mod tests {
             lift_gap <= 1e-12,
             "the corrected lift must be G_c = (Σ+C)AᵀW_c⁻¹, off by {lift_gap:.3e}"
         );
-        let expected_spread = constraints
-            .a
-            .dot(&marginal_ambient)
-            .dot(&constraints.a.t());
+        // The pieces carry the retained rows in the correction's own order
+        // (`marginal.rows`), which need not be the constraint system's: on this face
+        // the corrected law retains row 1 before row 0. The spread is compared in that
+        // order; read in the system's order the diagonal is the same two numbers
+        // swapped, a 3.4e-3 "miss" that is no miss (#3524).
+        let retained_rows = constraints.a.select(ndarray::Axis(0), &marginal.rows);
+        let expected_spread = retained_rows.dot(&marginal_ambient).dot(&retained_rows.t());
         let spread_gap = max_gap(&corrected_pieces.normal_covariance, &expected_spread);
         assert!(
             spread_gap <= 1e-12,

@@ -404,7 +404,7 @@ impl SaeManifoldTerm {
     /// user-facing uncertainty of the fitted manifold shapes.
     ///
     /// For atom `k` with decoder-block range `r_k` (see
-    /// [`Self::shape_covariance_border_ranges`]),
+    /// `Self::shape_covariance_border_ranges`),
     /// `Cov(β_k) = φ·[A⁺]_ββ[r_k, r_k]` is the φ-scaled posterior covariance of
     /// its decoder coefficients with the latent coordinates and the other atoms
     /// marginalized out through the exact observed information `A` (#2933 F33;
@@ -625,7 +625,7 @@ impl SaeManifoldTerm {
     /// information no longer describes the returned model. This re-converges THIS
     /// (final) term at `rho` through the penalized quasi-Laplace criterion,
     /// re-forms the exact observed information `A` at that inner optimum
-    /// ([`Self::exact_observed_information_shape_covariance`]), and reads the
+    /// (`Self::exact_observed_information_shape_covariance`), and reads the
     /// per-atom covariance and bands off its selected inverse, scaling by the
     /// reconstruction dispersion `φ̂`. The result carries the cross-atom
     /// covariance and the decoder-coordinate couplings, and its per-channel band

@@ -311,8 +311,8 @@ fn scaled_norm(errors: ArrayView1<'_, f64>) -> f64 {
 /// The squares, `d − 1` additions, the mean, `+ ε`, the square root, the reciprocal and the
 /// products with the row and the gain are `γ_(d+6)` relative while their results stay
 /// normal. A square, the mean or a product whose result is subnormal rounds by an absolute
-/// `2^-1075` instead: through `ν̂` that is the relative `ρ` of [`normalization_growth`], and on
-/// the entry it is the absolute `a_j = |w_j| 2^-1074 + 2^-1074` of [`underflow_reach`]. So
+/// `2^-1075` instead: through `ν̂` that is the relative `ρ` of `normalization_growth`, and on
+/// the entry it is the absolute `a_j = |w_j| 2^-1074 + 2^-1074` of `underflow_reach`. So
 /// `|ŷ − y| ≤ λ |y| + a` with `λ = (1 + γ_(d+6))(1 + ρ) − 1`, and `|y| ≤ (|ŷ| + a)/(1 − λ)`,
 /// so the band is `λ (|ŷ| + a)/(1 − λ) + a`. Every operation rounds to nearest and then steps
 /// one float up (down where it divides), so the band is an upper bound computed in binary64.
@@ -1226,7 +1226,7 @@ impl NativeAttentionLayer {
 
     /// The rounding band of one linear read of `rows` at their absolute positions:
     /// `|fl(A x) − A x|` for the map `A` that `read` applies, entrywise, where `fl`
-    /// is apply.rs's kernel ([`read_band`]). A component read is refused.
+    /// is apply.rs's kernel (`read_band`). A component read is refused.
     pub fn read_band(
         &self,
         projection: AttentionProjection,
@@ -1316,7 +1316,7 @@ impl ComponentAttentionLayer {
     }
 
     /// The rounding band of one linear read of `rows` at their absolute positions
-    /// ([`read_band`]).
+    /// (`read_band`).
     pub fn read_band(
         &self,
         projection: AttentionProjection,

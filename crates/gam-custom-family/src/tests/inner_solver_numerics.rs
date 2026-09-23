@@ -877,8 +877,10 @@ pub(crate) fn a_rounding_level_change_never_shrinks_the_region_2977() {
             CEILING,
             true,
         );
+        // The band is closed: at the edge `realized = ±CEILING = ±2ε_f` the ratio is
+        // exactly `1 ∓ 1/4`, which the sampled edges reach.
         assert!(
-            (update.rho - 1.0).abs() < 0.25,
+            (update.rho - 1.0).abs() <= 0.25,
             "a change {realized:.3e} within the comparison's rounding {CEILING:.3e} must read \
              rho within 1/4 of one; got {:.6e}",
             update.rho

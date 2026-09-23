@@ -861,7 +861,7 @@ where
 impl OuterProblem {
     /// The starts a multistart searches, in seed order: `leading` (a joined warm
     /// start) when given, then this problem's own derived start
-    /// ([`outer_start_point`](crate::rho_optimizer::run_plan::outer_start_point)),
+    /// (`outer_start_point`),
     /// then one start per level of `additional_levels`, every coordinate at that
     /// level. Each is projected into the search box and exact duplicates are
     /// dropped, so a level beyond a face lands on that face.
@@ -1234,7 +1234,7 @@ fn certified_optimum(result: &OuterResult) -> bool {
 /// criterion — one inner solve — at the certified optimum and at `face`. A face value
 /// strictly below the optimum's is a point of the same criterion lower than a local
 /// minimum, so a lower basin exists by construction; `search_from` then runs a second
-/// certified search from the face, and keep-best ([`displaces`]) publishes the lower
+/// certified search from the face, and keep-best (`displaces`) publishes the lower
 /// of the two certified optima. A face at or above the optimum proves nothing and
 /// changes nothing, and a face the inner solve refuses, or a second search that does
 /// not certify, leaves the first optimum published with the reason recorded.

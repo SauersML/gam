@@ -168,7 +168,7 @@ pub struct EventHistoryFamily {
 /// snapshot be a serving artifact's reference law (gam#2966): a saved
 /// predictor carries the population the baselines are normalised against, not
 /// the people the model was fitted on. The placement of each TRAINING node on
-/// the grid belongs to [`ReferenceTables`], which the fit holds and a
+/// the grid belongs to `ReferenceTables`, which the fit holds and a
 /// prediction never reads.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RiskSetCentring {
@@ -1617,7 +1617,7 @@ impl EventHistoryFit {
     /// order, then the latent block. This is the vector the posterior
     /// covariance is expressed in, so it is also the centre a
     /// posterior-predictive rule steps away from
-    /// ([`super::posterior::ParameterState`]).
+    /// (`super::posterior::ParameterState`).
     pub fn fitted_coefficients(&self) -> Vec<f64> {
         self.fit
             .block_states

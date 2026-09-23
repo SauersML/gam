@@ -4239,6 +4239,191 @@ fn gaussian_location_scale_wiggle_face_criterion_gradient_matches_central_differ
     );
 }
 
+/// gam#3228: the outer HESSIAN of the #2894 face fixture at the point its polish declined,
+/// `ρ = [1.1339, −1.5634]`, against central differences of the analytic GRADIENT.
+///
+/// There the polish's full Newton step raised the criterion by 7.307e-1 where its model promised
+/// −½λ̂² = −4.988e-1: a model falsified at unit step, so the Hessian or the gradient it is built
+/// from is wrong at that point. #2894 grades the gradient against the value; this grades each
+/// Hessian column against the gradient on a halving ladder, the bar being the ladder's own settled
+/// disagreement. A rung whose stencil changes the pinned face differences two criteria and is
+/// reported, not graded.
+#[test]
+fn gaussian_location_scale_wiggle_face_hessian_matches_its_gradient_3228() {
+    use gam_solve::estimate::outer_eval_capture::{
+        OuterSeedOrder, OuterSeedProbe, observe_next_outer_seed,
+    };
+    use std::sync::{Arc, Mutex};
+
+    let n = 72usize;
+    let mut records: Vec<csv::StringRecord> = Vec::with_capacity(n);
+    for i in 0..n {
+        let x = -2.0 + 4.0 * (i as f64) / ((n - 1) as f64);
+        let y = 0.7 * x + 0.5 * x.max(0.0).powi(2) + 0.05 * (7.3 * x).sin();
+        records.push(csv::StringRecord::from(vec![
+            format!("{y:.17e}"),
+            format!("{x:.17e}"),
+        ]));
+    }
+    let data =
+        gam_data::encode_recordswith_inferred_schema(vec!["y".to_string(), "x".to_string()], records)
+            .expect("encode the face fixture");
+    let config = FitConfig {
+        family: Some("gaussian".to_string()),
+        noise_formula: Some("1".to_string()),
+        ..FitConfig::default()
+    };
+    let materialized =
+        materialize("y ~ x", &data, &config).expect("gaussian location-scale materialization");
+    let FitRequest::GaussianLocationScale(request) = materialized.request else {
+        panic!("expected a Gaussian location-scale request");
+    };
+    let GaussianLocationScaleFitRequest {
+        data: req_data,
+        mut spec,
+        options,
+        kappa_options,
+        ..
+    } = request;
+    standardize_gaussian_spec_like_engine(&mut spec);
+    let wiggle_cfg = small_wiggle_cfg();
+    let pilot = fit_gaussian_location_scale_terms(req_data, spec.clone(), &options, &kappa_options)
+        .expect("face fixture pilot");
+    let basis = select_gaussian_location_scale_link_wiggle_basis_from_pilot(
+        &pilot,
+        &WiggleBlockConfig {
+            degree: wiggle_cfg.degree,
+            num_internal_knots: wiggle_cfg.num_internal_knots,
+            penalty_order: 2,
+            double_penalty: wiggle_cfg.double_penalty,
+        },
+        &wiggle_cfg.penalty_orders,
+    )
+    .expect("face fixture wiggle basis selection");
+    let wiggle_width = basis.block.design.ncols();
+    let bound = 1.0e-10;
+
+    // (row, column, analytic, difference, settle, on_face)
+    type Grade = (usize, usize, f64, f64, f64, bool);
+    let captured: Arc<Mutex<Option<Result<Vec<Grade>, String>>>> = Arc::new(Mutex::new(None));
+    let sink = Arc::clone(&captured);
+    observe_next_outer_seed(
+        0,
+        Box::new(
+            move |probe: &mut dyn OuterSeedProbe| -> Result<(), gam_solve::estimate::EstimationError> {
+                let outcome = (|| -> Result<Vec<Grade>, String> {
+                    let layout = probe.layout().clone();
+                    let declined = [1.1339_f64, -1.5634];
+                    if layout.seed.len() != declined.len() {
+                        return Err(format!(
+                            "the fixture's outer coordinate has {} entries, the declined point {}",
+                            layout.seed.len(),
+                            declined.len()
+                        ));
+                    }
+                    let theta = ndarray::Array1::from_shape_fn(declined.len(), |i| {
+                        declined[i].clamp(layout.lower[i], layout.upper[i])
+                    });
+                    let pinned = |beta: &ndarray::Array1<f64>| -> Vec<usize> {
+                        let start = beta.len() - wiggle_width;
+                        (0..wiggle_width).filter(|&k| beta[start + k].abs() <= bound).collect()
+                    };
+                    let at = probe
+                        .evaluate(&theta, OuterSeedOrder::ValueGradientHessian)
+                        .map_err(|error| format!("declined point: {error}"))?;
+                    let hessian = at.hessian.ok_or("no analytic outer Hessian")?;
+                    let (beta, _) = at.selected_mode.ok_or("no selected mode")?;
+                    let face = pinned(&beta);
+                    let mut grades = Vec::new();
+                    for column in 0..theta.len() {
+                        let room = (theta[column] - layout.lower[column])
+                            .min(layout.upper[column] - theta[column])
+                            .max(0.0);
+                        let mut step = (1.0e-2 * (1.0 + theta[column].abs())).min(0.5 * room);
+                        if !(step > 0.0) {
+                            continue;
+                        }
+                        let mut estimates: Vec<(ndarray::Array1<f64>, bool)> = Vec::new();
+                        for _ in 0..6 {
+                            let mut same_face = true;
+                            let mut gradients = Vec::with_capacity(2);
+                            for sign in [1.0_f64, -1.0] {
+                                let mut displaced = theta.clone();
+                                displaced[column] += sign * step;
+                                let evaluation = probe
+                                    .evaluate(&displaced, OuterSeedOrder::ValueAndGradient)
+                                    .map_err(|error| format!("column {column}: {error}"))?;
+                                let (displaced_beta, _) =
+                                    evaluation.selected_mode.ok_or("no displaced mode")?;
+                                same_face &= pinned(&displaced_beta) == face;
+                                gradients.push(evaluation.gradient.ok_or("no displaced gradient")?);
+                            }
+                            estimates.push(((&gradients[0] - &gradients[1]) / (2.0 * step), same_face));
+                            step *= 0.5;
+                        }
+                        for row in 0..theta.len() {
+                            let (index, settle) = (1..estimates.len())
+                                .map(|i| (i, (estimates[i].0[row] - estimates[i - 1].0[row]).abs()))
+                                .min_by(|left, right| left.1.total_cmp(&right.1))
+                                .expect("the ladder has six rungs");
+                            let on_face = estimates[index].1 && estimates[index - 1].1;
+                            grades.push((
+                                row,
+                                column,
+                                hessian[[row, column]],
+                                estimates[index].0[row],
+                                settle,
+                                on_face,
+                            ));
+                        }
+                    }
+                    Ok(grades)
+                })();
+                *sink.lock().expect("the observer sink lock is not poisoned") = Some(outcome);
+                Ok(())
+            },
+        ),
+    );
+    // The fit itself declines at this fixture on main (#3228); the probe runs at its seed first.
+    let fit = fit_gaussian_location_scale_terms_with_selected_wiggle(
+        req_data,
+        spec,
+        &pilot,
+        basis,
+        &options,
+        &kappa_options,
+    );
+    let grades = captured
+        .lock()
+        .expect("the observer sink lock is not poisoned")
+        .take()
+        .unwrap_or_else(|| panic!("the outer runner lent no seed probe: {:?}", fit.err()))
+        .unwrap_or_else(|reason| panic!("the seed probe refused: {reason}"));
+    let mut graded = 0usize;
+    let mut misses = Vec::new();
+    for (row, column, analytic, difference, settle, on_face) in &grades {
+        eprintln!(
+            "[3228-HESSIAN] H[{row},{column}] analytic={analytic:.9e} difference={difference:.9e} \
+             settle={settle:e} on_face={on_face}"
+        );
+        if !on_face {
+            continue;
+        }
+        graded += 1;
+        if (analytic - difference).abs() > 10.0 * settle {
+            misses.push(format!(
+                "H[{row},{column}]: analytic {analytic:e} vs {difference:e} (settle {settle:e})"
+            ));
+        }
+    }
+    assert!(graded >= 1, "no Hessian entry was graded on a stable face: {grades:?}");
+    assert!(
+        misses.is_empty(),
+        "the analytic outer Hessian is not the derivative of the analytic gradient at the \
+         declined point: {misses:?}"
+    );
+}
+
 #[test]
 fn marginal_slope_base_link_accepts_only_probit() {
     let parsed = gam_terms::inference::formula_dsl::parse_formula("y ~ x + link(type=probit)")

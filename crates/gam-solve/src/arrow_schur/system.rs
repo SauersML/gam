@@ -150,7 +150,7 @@ pub struct ArrowSchurSystem {
     /// apply depth ([`RowHtbetaDeclaration`]), installed in lock-step with
     /// [`Self::htbeta_matvec`] by [`Self::set_row_htbeta_operator`]. A dense slab
     /// supplement is bounded separately from its entries, and
-    /// [`Self::cross_block_row_norm_bounds`] refuses an installed operator that carries
+    /// `Self::cross_block_row_norm_bounds` refuses an installed operator that carries
     /// none.
     pub htbeta_declaration: Option<RowHtbetaDeclaration>,
     /// Whether `rows[*].htbeta` contains a dense contribution that must be added
@@ -587,7 +587,7 @@ impl ArrowSchurSystem {
     /// `declaration` states the operator's per-row norm bounds and apply depth, derived
     /// from its own entries and loop structure (#2627, see [`RowHtbetaDeclaration`]). A
     /// structural ridge termination reads it through
-    /// [`Self::cross_block_row_norm_bounds`], so it is installed with the operator and
+    /// `Self::cross_block_row_norm_bounds`, so it is installed with the operator and
     /// never separately.
     pub fn set_row_htbeta_operator<F, T>(
         &mut self,
@@ -868,7 +868,7 @@ impl ArrowSchurSystem {
 
     /// `out += M·x` for the majorant `M` of the shared `H_ββ` block this system
     /// solves with (#2627), through the same operator → dense dispatch as
-    /// [`Self::penalty_matvec_add`]. Returns the accumulation depth; see
+    /// `Self::penalty_matvec_add`. Returns the accumulation depth; see
     /// [`BetaPenaltyOp::accumulate_abs_majorant_matvec`].
     pub fn shared_block_abs_majorant_matvec(&self, x: &[f64], out: &mut [f64]) -> usize {
         match self.penalty_op.as_ref() {

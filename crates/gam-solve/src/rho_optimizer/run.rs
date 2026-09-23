@@ -181,7 +181,7 @@ impl OuterProblemSize {
 }
 
 /// `τ_stat = 1/(2n)` over `n_obs` observations, the criterion resolution
-/// [`OuterProblemSize::statistical_resolution`] documents, for callers outside
+/// `OuterProblemSize::statistical_resolution` documents, for callers outside
 /// this crate that judge a criterion the outer engine certified at it (the
 /// κ-profile inference endpoints, #3245). It is public so such a consumer
 /// re-examines an outer-certified point against the SAME resolution the
@@ -194,7 +194,7 @@ pub fn criterion_statistical_resolution(n_obs: usize) -> Option<f64> {
 /// `τ_stat = 1/(2·n_eff)` over an information count, the ONE place the
 /// criterion's resolution is formed. The row-count entry
 /// [`criterion_statistical_resolution`] and the declared-count entry
-/// [`OuterProblemSize::statistical_resolution`] both reduce to it, so a route
+/// `OuterProblemSize::statistical_resolution` both reduce to it, so a route
 /// that declares `Σ wᵢ` and one that declares `n` rows are resolved by the same
 /// rule. `None` for a count that is not finite and positive, which resolves
 /// nothing.
@@ -1694,7 +1694,7 @@ pub struct OuterResult {
     /// from one that filled because the surface is flat by Δ.
     pub cost_stall_probe_scale: Option<(f64, f64)>,
     /// Set when the search halted where its kept rank ends (#2939). See
-    /// [`RankBoundaryStall`]. Reported, and never a converged claim.
+    /// `RankBoundaryStall`. Reported, and never a converged claim.
     pub rank_boundary_stall: Option<RankBoundaryStall>,
     /// Refused trials the cost-stall guard saw proposed from this result's point
     /// whose step's model promised at most the point's resolution (#3400). Each

@@ -173,7 +173,7 @@ pub struct FiringCoordinate {
 /// per-firing coordinates.
 #[derive(Clone, Debug)]
 pub struct BlockCoordinateReport {
-    /// Estimated isotropic per-component noise `σ̂` ([`isotropic_noise_sigma`]).
+    /// Estimated isotropic per-component noise `σ̂` (`isotropic_noise_sigma`).
     pub sigma_hat: f64,
     /// Mean firing radius `r̄ = mean ‖z‖`.
     pub mean_radius: f64,

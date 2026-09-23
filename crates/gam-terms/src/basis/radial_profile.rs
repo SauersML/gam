@@ -21,7 +21,7 @@
 //!
 //! ## Certification, not approximation-by-fiat
 //!
-//! [`RadialProfile::build`] returns `None` (callers fall back to exact
+//! `RadialProfile::build` returns `None` (callers fall back to exact
 //! per-point evaluation) unless BOTH
 //! 1. the Chebyshev coefficient tail decays below `PROFILE_CERT_RTOL` of
 //!    each channel's scale — the geometric-decay certificate for analytic

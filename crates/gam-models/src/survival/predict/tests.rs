@@ -661,12 +661,17 @@ fn royston_parmar_hazard_is_cumulative_hazard_derivative() {
 }
 
 #[test]
-fn royston_parmar_hazard_rejects_negative_log_hazard_derivative() {
-    // A negative time-derivative of log Λ(t) means a *decreasing* cumulative
-    // hazard — not a valid survival model. Only the genuinely-negative slope
-    // is rejected; the zero boundary is valid (see the sibling test below).
-    let err = royston_parmar_survival_hazard_components(0.0, -0.5)
-        .expect_err("negative derivative should be invalid");
+fn royston_parmar_hazard_keeps_the_sign_of_a_negative_log_hazard_derivative() {
+    // A negative time-derivative of log Λ(t) is a falling cumulative hazard: the
+    // component returns the negative `dΛ/dt` it is, so a posterior rule's
+    // `Σ S·h` stays `−d/dt Σ S` (gam#3575). Publication refuses it
+    // (`refuse_decreasing_survival`); the component does not.
+    let (cum, hazard) = royston_parmar_survival_hazard_components(0.0, -0.5)
+        .expect("a finite negative derivative is a signed hazard");
+    assert_eq!(cum, 1.0);
+    assert_eq!(hazard, -0.5);
+    let err = royston_parmar_survival_hazard_components(0.0, f64::NAN)
+        .expect_err("a NaN derivative is not a hazard");
     assert!(
         err.to_string()
             .contains("invalid log-cumulative-hazard derivative")

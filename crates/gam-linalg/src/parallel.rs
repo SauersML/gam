@@ -58,9 +58,9 @@ pub fn row_reduction_chunk_rows(
 ///
 /// Each block is one task: a sequential GEMM of its rows into a private
 /// `output_cells` partial, the partials combined over a fixed pairwise tree.
-/// The block is sized so one task carries [`TARGET_WORK_PER_TASK`] of
+/// The block is sized so one task carries `TARGET_WORK_PER_TASK` of
 /// multiply-adds (`rows · output_cells`), within the same row band every other
-/// row reduction uses. The split applies only while a [`MIN_ROWS_PER_TASK`]
+/// row reduction uses. The split applies only while a `MIN_ROWS_PER_TASK`
 /// block still fits inside that budget: beyond it the output is wide enough
 /// that faer's own tiling has output tiles for every worker, and partials of
 /// that size would be the reduction traffic this module exists to avoid.

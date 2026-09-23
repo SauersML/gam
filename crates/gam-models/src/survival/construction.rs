@@ -2689,7 +2689,7 @@ pub fn center_survival_time_designs_at_anchor(
 /// [`survival_baseline_theta_from_config`] / [`survival_baseline_config_from_theta`]
 /// use:
 ///
-/// - **Weibull**: θ = (b, l), the chart coordinates of [`weibull_chart_theta`]
+/// - **Weibull**: θ = (b, l), the chart coordinates of `weibull_chart_theta`
 ///   (#2969).  `eta = ln H = k·ln t + 2u` with `k = e^l` and
 ///   `u = b − l + ½ln 2`, `o_D = k/t`.
 /// - **Gompertz**: θ = (log_rate, shape).  `eta = log H_G(t)` with

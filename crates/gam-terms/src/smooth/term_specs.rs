@@ -1031,7 +1031,7 @@ impl SmoothTerm {
     /// is a penalized direction, while a sum of orthogonal projectors has
     /// eigenvalues in `[0, K]` that are exactly `0` on the intersection and at
     /// least `1` off it. The rank is still read at
-    /// [`crate::basis::spectral_tolerance`], the crate's one penalty-spectrum
+    /// `crate::basis::spectral_tolerance`, the crate's one penalty-spectrum
     /// cutoff, so no new tolerance enters; it is simply asked of a spectrum
     /// where the answer does not depend on it.
     ///
@@ -5522,7 +5522,7 @@ fn charted_operator(operator: &Array2<f64>) -> Array2<f64> {
 /// decay like `exp(−√(2ν)·r/ℓ)` has an EXACTLY zero f64 Gram at the short length
 /// scales a κ search visits, so its block normalized to nothing, was dropped as a
 /// zero matrix, and the count moved after all. The Gram is now formed in the
-/// power-of-two chart of [`operator_chart_scale`], which is inert wherever the
+/// power-of-two chart of `operator_chart_scale`, which is inert wherever the
 /// unscaled Gram is representable, so the count is ψ-stable in f64 as well.
 pub fn matern_operator_penalty_triplet_at_length_scale(
     centers: ArrayView2<'_, f64>,

@@ -4046,27 +4046,23 @@ mod rounding_band_tests {
     /// The criterion jump the rule removes: a positive eigenvalue crossing the old
     /// relative cutoff `dim·1e-10·max|ev|` changed the dense block's rank between
     /// two nearby Grams. Under the rounding band the block moves by the size of the
-    /// perturbation, never by a dropped rank-one piece.
+    /// perturbation, never by a dropped rank-one piece. `try_from_dense_psd` reads
+    /// the eigensolver's own band `dim·ε·max|ev|` since `0f72c1e70e` (#2901), so it
+    /// keeps both eigenvalues too: neither route has a cutoff between the two Grams.
     #[test]
     fn the_block_is_continuous_across_the_old_relative_cutoff() {
         let below = mixed_gram(&[1.0, 1.9e-10]);
         let above = mixed_gram(&[1.0, 2.1e-10]);
-        assert_eq!(
-            ConstructiveQuadratic::try_from_dense_psd(below.clone(), "cutoff below")
-                .expect("below")
-                .factor()
-                .nrows(),
-            1,
-            "the relative cutoff drops the small eigenvalue below it"
-        );
-        assert_eq!(
-            ConstructiveQuadratic::try_from_dense_psd(above.clone(), "cutoff above")
-                .expect("above")
-                .factor()
-                .nrows(),
-            2,
-            "and keeps it just above"
-        );
+        for (gram, label) in [(&below, "below"), (&above, "above")] {
+            assert_eq!(
+                ConstructiveQuadratic::try_from_dense_psd(gram.clone(), label)
+                    .expect(label)
+                    .factor()
+                    .nrows(),
+                2,
+                "{label} the old cutoff, the eigensolver's band keeps the small eigenvalue"
+            );
+        }
         let (below_quadratic, _) =
             ConstructiveQuadratic::unit_frobenius_from_gram_within_rounding_band(&below, 0.0, "below")
                 .expect("below");

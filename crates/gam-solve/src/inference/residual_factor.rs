@@ -205,7 +205,7 @@ impl StructuredResidualModel {
     /// (#3337). It is not a constant of this module.
     ///
     /// The rungs are `B = 1, 2, 4, …` equal-count bins of `z`
-    /// ([`activity_bin_assignment`]). Doubling is the least nested refinement
+    /// (`activity_bin_assignment`). Doubling is the least nested refinement
     /// that reaches every bin — the smallest integer ratio above one — and it
     /// keeps every existing edge, so rung `2B` refines rung `B` and its law
     /// contains rung `B`'s. Rung 1 is the null law `c ≡ 1` exactly: one slot

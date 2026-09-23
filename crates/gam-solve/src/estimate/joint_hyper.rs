@@ -292,24 +292,32 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         let p = x.ncols();
         let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
         validate_penalty_specs(&specs, p, context)?;
-        let frozen_penalty_ranks =
+        let mut frozen_penalty_ranks =
             gam_terms::construction::penalty_structural_ranks_at_rounding_band(&specs, p, context)?;
-        for (idx, (spec, &rank)) in specs.iter().zip(frozen_penalty_ranks.iter()).enumerate() {
+        // A builder's declared nullity is a theorem about its seminorm and outranks a rank read
+        // off a spectrum it deliberately conditioned (gam#1561): the cyclic harmonic roughness
+        // declares `{sin, cos}` null although their aliased representers sit above every rank
+        // cutoff, so the spectrum resolves the whole block. The declaration only ever REMOVES
+        // directions, the rule `filter_penalty_candidates` and `canonicalize_penalty_specs`
+        // already apply; a block that resolves MORE null space than it declares keeps the
+        // spectrum's answer. Freezing the spectral rank instead priced the declared null
+        // directions' `ln λ` in `log|S|₊` of every joint ρ+ψ fit carrying such a block, while
+        // identifiability absorbed them as null: two partitions of one block (gam#2469).
+        for (idx, (spec, rank)) in specs.iter().zip(frozen_penalty_ranks.iter_mut()).enumerate() {
             let block_dim = match spec {
                 PenaltySpec::Block { local, .. } => local.nrows(),
-                PenaltySpec::Dense(matrix) => {
-                    matrix.nrows()
-                }
+                PenaltySpec::Dense(matrix) => matrix.nrows(),
             };
-            if let Some(&declared_nullity) = opts.nullspace_dims.get(idx)
-                && block_dim.saturating_sub(declared_nullity) != rank
-            {
-                log::debug!(
-                    "[FROZEN-RANK] {context}: penalty {idx} is frozen at structural rank {rank} \
-                     from its rounding band, but the design declares nullity {declared_nullity} of \
-                     {block_dim} (rank {})",
-                    block_dim.saturating_sub(declared_nullity)
-                );
+            if let Some(&declared_nullity) = opts.nullspace_dims.get(idx) {
+                let declared_rank = block_dim.saturating_sub(declared_nullity);
+                if declared_rank < *rank {
+                    log::debug!(
+                        "[FROZEN-RANK] {context}: penalty {idx} resolves rank {rank} from its \
+                         rounding band; the design declares nullity {declared_nullity} of \
+                         {block_dim}, so it is frozen at the declared rank {declared_rank}"
+                    );
+                    *rank = declared_rank;
+                }
             }
         }
         let (canonical, active_nullspace_dims) =

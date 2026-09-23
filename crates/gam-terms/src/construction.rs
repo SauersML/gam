@@ -2208,7 +2208,7 @@ fn balanced_block_eigh(
 }
 
 /// Structural rank of a set of penalty components: the number of resolved
-/// eigenvalues of each [`balanced_penalty_groups`] block
+/// eigenvalues of each `balanced_penalty_groups` block
 /// (`resolved_eigenvalue_count` at the block's [`BalancedPenalty::assembly_band`]),
 /// summed. This is the rank the reparameterization's penalized subspace has —
 /// [`precompute_reparam_invariant_from_canonical`] partitions and counts with the

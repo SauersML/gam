@@ -17,7 +17,7 @@ mod decrement_against_resolution {
     ///
     /// # Why this is a type and not an `f64`
     ///
-    /// The predicate it feeds, [`SaeManifoldTerm::inner_decrement_certifies`], is
+    /// The predicate it feeds, `SaeManifoldTerm::inner_decrement_certifies`, is
     /// read at eight sites across this module, and its argument used to be formed
     /// four different ways: one helper and three hand-written
     /// `0.5 * decrement_sq / scale` expressions. Moving the bar with the argument
@@ -69,7 +69,7 @@ mod decrement_against_resolution {
         /// The only constructor: `½λ²` over the criterion's own resolution.
         ///
         /// `information_count` is the criterion's Fisher-information count `n_eff`,
-        /// from [`SaeManifoldTerm::inner_information_count`]. Every production
+        /// from `SaeManifoldTerm::inner_information_count`. Every production
         /// reader has one, because every ratio-forming site already holds the
         /// `target` it is derived from. `None` is for a reader that has no count: it
         /// decides at the arithmetic's own resolution, `ε·(|F| + 1)`.
@@ -112,7 +112,7 @@ mod decrement_against_resolution {
         }
 
         /// The measured ratio, for reporting. Certification goes through
-        /// [`SaeManifoldTerm::inner_decrement_certifies`], never through this.
+        /// `SaeManifoldTerm::inner_decrement_certifies`, never through this.
         pub fn value(self) -> f64 {
             self.0
         }

@@ -61,7 +61,7 @@ pub fn tail_count(n: usize) -> usize {
 }
 
 /// Standard error of the REPORTED shape at tail sample `tail_n` and shape `k`:
-/// `√n(1+k)/(n+P)`, with `P` = [`SHAPE_PRIOR_PSEUDO_OBSERVATIONS`].
+/// `√n(1+k)/(n+P)`, with `P` = `SHAPE_PRIOR_PSEUDO_OBSERVATIONS`.
 ///
 /// The generalized-Pareto shape estimate has asymptotic standard error
 /// `(1+k)/√n` at tail sample `n`, and the reported shape is the convex

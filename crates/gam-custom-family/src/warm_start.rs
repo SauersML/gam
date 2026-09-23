@@ -410,20 +410,43 @@ pub(crate) fn custom_family_blockwise_edf(
         )));
     }
 
-    let h_sym = SymmetricMatrix::Dense(penalized_hessian.clone());
     // EDF and covariance are properties of the fitted Hessian, not of a
     // nearby matrix selected because it factors. Refuse invalid curvature
     // rather than silently reporting inference for a ridge-perturbed estimand.
-    // A custom family assembles its own observed information, so this takes
-    // the conservative reading: an accumulation over the block designs' rows
-    // with the penalty root on top.
-    let assembly = gam_linalg::roundoff::SymmetricAssembly::penalized_gram(
-        specs.iter().map(|s| s.design.nrows()).max().unwrap_or(0),
-        p,
-    );
-    let factor = h_sym.factorize(assembly).map_err(|error| {
-        format!("custom-family edf: exact penalized-Hessian factorization failed: {error}")
+    //
+    // A custom family assembles its own OBSERVED information, which is not an
+    // accumulation of PSD pieces: at a cone-constrained mode it is legitimately
+    // indefinite (#2635), and its trace then publishes raw and uncertified
+    // (#2901). Declaring it a penalized Gram (`PsdAccumulation`) asserted
+    // non-negative diagonal summands, so the strict factorization refused that
+    // mode by its diagonal before the trace was read; and the PSD symmetry band
+    // `2γ·√(A_ii·A_jj)` rests on the pieces being PSD, which signed pieces are
+    // not. With no per-entry magnitudes for a signed band, the matrix used is the
+    // Hessian's symmetric part, formed once here.
+    //
+    // `SymmetricMatrix::factorize` is the strict SPD gate (#3696) and refuses that
+    // indefinite mode too, so the trace solves go through the backward-stable
+    // symmetric factor: Cholesky where the Hessian is positive definite,
+    // Bunch–Kaufman otherwise. Each trace's band is measured from its own solve's
+    // residual, so it prices either factor.
+    let symmetric_part = (penalized_hessian + &penalized_hessian.t()) * 0.5;
+    let factor = gam_linalg::faer_ndarray::factorize_symmetricwith_fallback(
+        gam_linalg::faer_ndarray::FaerArrayView::new(&symmetric_part).as_ref(),
+        faer::Side::Lower,
+    )
+    .map_err(|error| {
+        format!("custom-family edf: exact penalized-Hessian factorization failed: {error:?}")
     })?;
+    let solve_columns = |rhs: &Array2<f64>| -> Result<Array2<f64>, String> {
+        let solved = factor.solve(gam_linalg::faer_ndarray::FaerArrayView::new(rhs).as_ref());
+        let solved = Array2::from_shape_fn(rhs.dim(), |(row, column)| solved[(row, column)]);
+        if solved.iter().all(|value| value.is_finite()) {
+            Ok(solved)
+        } else {
+            Err("the symmetric factor's solve is not finite: the penalized Hessian is singular"
+                .to_string())
+        }
+    };
 
     // Per-penalty traces, the rounding band of the solve behind each, each
     // penalty's rank-bound certificate and their block ranks, handed to the shared
@@ -435,7 +458,9 @@ pub(crate) fn custom_family_blockwise_edf(
     // trace unclamped. This route previously floored `edf_total` at 0, which permits
     // an effective dimension below the joint penalty null space.
     let solve = |values: &mut [f64]| -> Result<(), String> {
-        let solved = factor.solve(&ndarray::Array1::from(values.to_vec()))?;
+        let rhs = Array2::from_shape_vec((values.len(), 1), values.to_vec())
+            .map_err(|error| error.to_string())?;
+        let solved = solve_columns(&rhs)?;
         for (slot, value) in values.iter_mut().zip(solved.iter()) {
             *slot = *value;
         }
@@ -497,7 +522,7 @@ pub(crate) fn custom_family_blockwise_edf(
             // λ_k tr(H⁻¹S_k) = λ_k Σ_c r_cᵀ H⁻¹ r_c over the root columns, priced
             // against the Hessian the solve represents.
             if lambda > 0.0 {
-                let solution = factor.solvemulti(&root_columns).map_err(|e| {
+                let solution = solve_columns(&root_columns).map_err(|e| {
                     format!("custom-family edf trace solve failed for penalty {global_k}: {e}")
                 })?;
                 let (trace, band) = gam_linalg::roundoff::solved_penalty_trace(

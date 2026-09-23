@@ -3352,7 +3352,7 @@ fn beta_logistic_latent_jet(x: f64, a: f64, b: f64) -> InverseLinkJet {
 }
 
 /// Beta-logistic inverse-link jet: `μ = K(x)` and `dᵏμ/dηᵏ = sᵏ·K⁽ᵏ⁾(x)` (see
-/// [`beta_logistic_standardization`]).
+/// `beta_logistic_standardization`).
 pub fn beta_logistic_inverse_link_jet(
     eta: f64,
     log_shape_center: f64,
@@ -3603,7 +3603,7 @@ fn beta_logistic_latent_jet_with_param_partials(x: f64, a: f64, b: f64) -> SasJe
 }
 
 /// Beta-logistic inverse-link jet with its exact parameter partials, through the
-/// standardization `x = E Z + s·η` (see [`beta_logistic_standardization`]).
+/// standardization `x = E Z + s·η` (see `beta_logistic_standardization`).
 ///
 /// Notation: `K` is the latent kernel, `K_j` a partial at fixed `x`, and `x_j`, `s_j`
 /// the standardization's partials. The link's `μ = K(x)`, `d1 = s·K′`, `d2 = s²·K″`
@@ -5265,7 +5265,9 @@ mod tests {
             assert_eq!((j.d2, j.d3, j.d4, j.d5, j.d6), (0.0, 0.0, 0.0, 0.0, 0.0));
         }
         // Saturation |x| ≥ c: exact ±B plateau, every derivative exactly 0.
-        for &x in &[c, c + 1e-9, 75.0, 1e12, f64::MAX] {
+        // Sampled from the seam `c`, which moves with the derived bound `B`, not at a
+        // literal that the bound can overtake (75 was saturated while `B` was 50).
+        for &x in &[c, c + 1e-9, 1.5 * c, 1e12, f64::MAX] {
             let j = jet(x);
             assert_eq!(j.g, b, "saturation value at x={x}");
             assert_eq!(
@@ -5277,7 +5279,11 @@ mod tests {
         assert_eq!(jet(c).g, b);
 
         // Odd symmetry: g,d2,d4,d6 flip sign; d1,d3,d5 are even.
-        for &x in &[3.0, a - 2.0, 44.0, 50.0, 56.0, 100.0] {
+        // Every regime, placed from the seams `a` and `c`, which move with the derived
+        // bound `B`: literals placed for `B = 50` all fell inside the identity interior once
+        // `B` was derived larger, where every higher derivative is exactly 0.
+        let splice = |fraction: f64| a + fraction * (c - a);
+        for &x in &[3.0, a - 2.0, splice(0.2), splice(0.5), splice(0.8), 1.5 * c] {
             let p = jet(x);
             let m = jet(-x);
             assert_eq!(m.g, -p.g, "g odd at x={x}");
@@ -5304,7 +5310,15 @@ mod tests {
         // central-difference error, still orders of magnitude below the O(1)
         // shift any wrong smoothstep coefficient would produce.
         let h = 0.02;
-        for &x0 in &[45.0, 47.5, 50.0, 52.5, 55.0, -47.5, -52.5] {
+        for &x0 in &[
+            splice(0.25),
+            splice(0.375),
+            splice(0.5),
+            splice(0.625),
+            splice(0.75),
+            -splice(0.375),
+            -splice(0.625),
+        ] {
             let jp = jet(x0 + h);
             let jm = jet(x0 - h);
             let j0 = jet(x0);

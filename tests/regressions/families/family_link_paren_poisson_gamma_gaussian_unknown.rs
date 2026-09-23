@@ -141,7 +141,9 @@ fn link_changing_parenthesized_forms_still_resolve() {
 /// never silently mis-resolved to the default link.
 #[test]
 fn illegal_family_link_pairings_are_rejected() {
-    for bad in ["gaussian(logit)", "poisson(probit)", "gamma(identity)"] {
+    // `gamma(identity)` is on the power/log ladder the free-scale families admit;
+    // a probability link is not.
+    for bad in ["gaussian(logit)", "poisson(probit)", "gamma(logit)"] {
         let err = resolve(bad).expect_err(&format!("{bad} is an illegal pairing and must error"));
         assert!(
             err.contains("not supported for family"),

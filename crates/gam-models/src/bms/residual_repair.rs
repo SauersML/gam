@@ -38,7 +38,7 @@
 //! residual kernel (`residual_repair_kernel`) is a `RowKernel<5>` over
 //! `(η_m, g, t, u, v)` whatever the width, with every primary-space channel
 //! derived by the canonical jet lowering of the ONE row program
-//! [`residual_row_nll`]. The coefficient-space channels are the chain rule
+//! `residual_row_nll`. The coefficient-space channels are the chain rule
 //! through the one quadratic map `β ↦ v`, whose constant curvature `2Σ_rr` is the
 //! only term the generic pullback does not carry.
 //!
@@ -306,7 +306,7 @@ impl ResidualBlockRuntime {
     /// calibration), `a_block` the marginal-index span the gam#2768 gates
     /// condition on. Each column is checked for `E_w[r_k | span] = 0` including
     /// the level, with the robust Rao score statistic at
-    /// [`AUTO_Z_CONDITIONAL_RAO_ALPHA`]; a failing column is a typed refusal.
+    /// `AUTO_Z_CONDITIONAL_RAO_ALPHA`; a failing column is a typed refusal.
     pub fn fit(
         spec: &ResidualRepairSpec,
         z: ArrayView1<'_, f64>,

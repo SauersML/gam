@@ -2584,9 +2584,9 @@ pub(crate) fn closed_form_anisotropic_pair_block_with_origin(
 /// `length_scale = None` (pure-Duchon) penalty assembly.
 ///
 /// Self-pairs (R=0) take the exact `R → 0⁺` limit
-/// [`closed_form_penalty::pure_duchon_self_pair_value`] (integer or fractional
+/// `closed_form_penalty::pure_duchon_self_pair_value` (integer or fractional
 /// `s`): `0` whenever the UV clause `4(m+s) > d + 2q` of
-/// [`duchon_closed_form_operator_penalty_converges`] holds. Outside that regime
+/// `duchon_closed_form_operator_penalty_converges` holds. Outside that regime
 /// the self-pair diverges and no closed-form block exists, so calling this
 /// without the convergence gate is a contract violation and panics.
 pub fn closed_form_anisotropic_pair_block_pure(

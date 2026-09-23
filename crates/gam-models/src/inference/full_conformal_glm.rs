@@ -77,7 +77,7 @@
 //! level its own `ρ̂(z)` and the counts no longer share a score map, so neither
 //! the bracket nor the monotonicity survives. The walk that replaces it, and
 //! the ρ-free tail that closes it, are in
-//! [`GlmFullConformalSubstrate::honest_count_levels`]. Scaling the penalty
+//! `GlmFullConformalSubstrate::honest_count_levels`. Scaling the penalty
 //! leaves its zero rows and columns zero, so the unpenalised intercept that
 //! tail argument needs is the same column at every strength.
 //!
@@ -106,7 +106,7 @@
 //!   the map re-selects.
 //! * Poisson under the honest map: the levels `0, 1, 2, …` are walked directly,
 //!   each at its own `ρ̂(z)`, and the walk closes on the ρ-free score tail
-//!   below (see [`GlmFullConformalSubstrate::honest_count_levels`]).
+//!   below (see `GlmFullConformalSubstrate::honest_count_levels`).
 //! * Poisson (frozen) and NB: the counts are walked in the test-score coordinate, from
 //!   the score of the count `0` up to a tail score derived from the data,
 //!   beyond which no count can be in the set:
@@ -777,10 +777,10 @@ impl GlmFullConformalSubstrate {
     /// (gam#4103). An empty list (a v39 or older payload) changes nothing.
     ///
     /// Several strengths are re-selected against these blocks
-    /// ([`Self::select_strengths`]), and only here does such a fit's certificate
+    /// (`Self::select_strengths`), and only here does such a fit's certificate
     /// become [`ConformalCertificate::HonestRefit`]: the map that certificate
     /// names exists once the blocks do. One strength keeps re-selecting off
-    /// `s_lambda` ([`Self::select_strength`]), whose criterion needs nothing
+    /// `s_lambda` (`Self::select_strength`), whose criterion needs nothing
     /// more, so its block is validated and not read.
     ///
     /// Each block is held at unit Frobenius norm, as the one-strength map holds

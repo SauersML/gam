@@ -56,7 +56,7 @@
 //!   `β = e^{±ρ}·ε`, is the resolution of `ĉ` at that probe.
 //! * **Settlement, not a drift band.** Past the leading term the tail law is
 //!   `ĉ(ρ) = c + O(e^{∓ρ})`: consecutive `ĉ` differences contract
-//!   geometrically toward the rail. [`settle_tail_constant`] bounds that
+//!   geometrically toward the rail. `settle_tail_constant` bounds that
 //!   contraction ratio from the observed differences and their bands, and sums
 //!   the remaining geometric series into an extrapolation radius `R` with
 //!   `|c − ĉ_last| ≤ R`. A window whose differences grow toward the rail, or

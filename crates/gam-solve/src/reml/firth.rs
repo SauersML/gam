@@ -3183,7 +3183,7 @@ impl JeffreysHalfLogDet {
     }
 
     /// `½ log|I(η)|` on the identifiable subspace: the value
-    /// [`FirthDenseOperator::jeffreys_logdet`] reports for the same design,
+    /// `FirthDenseOperator::jeffreys_logdet` reports for the same design,
     /// link and `η`.
     pub fn at(&self, eta: &Array1<f64>) -> Result<f64, EstimationError> {
         let factor = &self.factor;

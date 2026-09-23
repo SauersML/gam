@@ -399,7 +399,7 @@ impl DenseSpectralOperator {
     /// on the survival Weibull AFT curved arm, where the LLT of the same matrix
     /// reproduces warm- and cold-started modes to `5·10⁻¹³`. The LLT's error is
     /// componentwise, `|δH| ≤ γ_(p+1)·|L||Lᵀ|` (Higham, Thm 10.3), so diagonal
-    /// grading costs it nothing ([`DenseCholeskyOperator`]'s bound).
+    /// grading costs it nothing (`DenseCholeskyOperator`'s bound).
     ///
     /// Only the value changes. Traces, solves and the logdet derivatives stay on
     /// the eigenpairs, whose cancellation-free rail forms need them; both price

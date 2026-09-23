@@ -824,8 +824,9 @@ fn negbin_dispersion_location_scale_assembles_covariance_and_is_predictable() {
             k as f64
         })
         .collect();
+    // The family's one spelling; the `negbin` alias is refused by name (SPEC R25).
     assert_orthogonal_dispersion_family_predictable(
-        "negbin",
+        "negative-binomial",
         DispersionFamilyKind::NegativeBinomial,
         &x,
         &y,

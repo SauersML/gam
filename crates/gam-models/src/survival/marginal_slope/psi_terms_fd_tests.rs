@@ -2815,3 +2815,146 @@ fn anchored_design_psi_third_information_matches_finite_difference_2945() {
         );
     }
 }
+
+/// gam#2627: the ψψ inputs the Jeffreys completion's pair drift reads, differenced along ψ
+/// ITSELF at fixed β.
+///
+/// The #2930 outer Hessian agrees with its finite-difference reference to 1e-9 only with the
+/// completion's ψψ partial `∂²C/∂ψ_i∂ψ_j|_β` left out, while that partial moves the entries by
+/// 4e-5. The partial is `completion_second_drift_matrix`, whose algebra is differenced along β
+/// (#2905), fed the ψ pair's own objects: the contracted trace Hessian `⟨W, ∂²_ψψ H²⟩` and the
+/// information Hessian `∂²_ψψ H`. The pair gates above grade those against a β-difference of
+/// another ψψ object, which a pair that is not the ψ-derivative of the first-order object passes.
+/// These grade each against the ψ_j-difference of its first-order counterpart, the family rebuilt
+/// at every displacement with β held and every η re-formed from it.
+#[test]
+fn design_psi_pair_completion_inputs_match_their_psi_differences_2627() {
+    let options = BlockwiseFitOptions::default();
+    let blocks = two_design_axis_blocks();
+    let family_along = |axis: PsiAxis, t: f64| {
+        let mut family = family_at(axis, SlopeFrame::Static, t);
+        let (x_entry, x_exit, x_derivative) = time_designs();
+        family.design_entry = DesignMatrix::from(x_entry);
+        family.design_exit = DesignMatrix::from(x_exit);
+        family.design_derivative_exit = DesignMatrix::from(x_derivative);
+        family
+    };
+    let (family, beta) = drift_family_and_states(SlopeFrame::Static);
+    let states = states_at_beta(&family, &beta);
+    let total = beta.len();
+    let weight = contraction_weight(total);
+    // ψ index 0 is the marginal design, 1 the slope design; `family_at` displaces the design of
+    // `axis_j` linearly, so every block's `X_ψ` is the same at every displacement.
+    for (psi_i, psi_j, axis_j) in [
+        (0, 0, PsiAxis::MarginalDesign),
+        (0, 1, PsiAxis::SlopeDesign),
+        (1, 0, PsiAxis::MarginalDesign),
+        (1, 1, PsiAxis::SlopeDesign),
+    ] {
+        let pair_contraction = family
+            .design_contracted_trace_hessian_psi_pair_with_options(
+                &states, &blocks, psi_i, psi_j, &weight, &options,
+            )
+            .expect("pair design contraction")
+            .expect("a design pair on the rigid frame serves the pair contraction");
+        let contraction_stencil = derived_difference_stencil(|t| {
+            let displaced = family_along(axis_j, t);
+            displaced
+                .design_contracted_trace_hessian_psi_with_options(
+                    &states_at_beta(&displaced, &beta),
+                    &blocks,
+                    psi_i,
+                    &weight,
+                    &options,
+                )
+                .expect("displaced design contraction")
+                .expect("a design ψ axis on the rigid frame serves the one-pass contraction")
+        });
+        let contraction_scale = max_abs(pair_contraction.iter());
+        let pair_terms = family
+            .psi_second_order_terms_inner_with_options(&states, &blocks, psi_i, psi_j, None, &options)
+            .expect("design pair terms")
+            .expect("a design pair on supported blocks publishes its terms");
+        let pair_hessian = dense_psi_hessian(
+            pair_terms.hessian_psi_psi_operator.as_ref(),
+            &pair_terms.hessian_psi_psi,
+            total,
+        );
+        let hessian_stencil = derived_difference_stencil(|t| {
+            let displaced = family_along(axis_j, t);
+            let terms = displaced
+                .psi_terms(&states_at_beta(&displaced, &beta), &blocks, psi_i)
+                .expect("displaced design ψ terms")
+                .expect("a design ψ axis on a supported block publishes terms");
+            dense_psi_hessian(terms.hessian_psi_operator.as_ref(), &terms.hessian_psi, total)
+        });
+        let hessian_scale = max_abs(pair_hessian.iter());
+        // The third input: the coefficient-axis derivatives `∂²_ψψ H²[e_a]` the pair reads
+        // where the gate or floor moves, against the ψ_j-difference of `∂_ψ H²[e_a]`.
+        let pair_axes = family
+            .design_psi_pair_hessian_directional_derivative_all_beta_axes_with_options(
+                &states, &blocks, psi_i, psi_j, &options,
+            )
+            .expect("design-pair third information derivative")
+            .expect("a design pair on supported blocks publishes its third information derivative");
+        let axes_stencil = derived_difference_stencil(|t| {
+            let displaced = family_along(axis_j, t);
+            displaced
+                .psi_hessian_directional_derivatives_all_beta_axes_with_options(
+                    &states_at_beta(&displaced, &beta),
+                    &blocks,
+                    psi_i,
+                    &options,
+                )
+                .expect("displaced design ψ axis derivatives")
+                .expect("a design ψ axis on a supported block publishes its axis derivatives")
+        });
+        let axes_scale = pair_axes
+            .iter()
+            .fold(0.0_f64, |acc, axis| acc.max(max_abs(axis.iter())));
+        eprintln!(
+            "[#2627] pair ({psi_i},{psi_j}): max|<W, d2_psi H2>|={contraction_scale:e} \
+             max|d2_psi H|={hessian_scale:e} max|d2_psi H2[e_a]|={axes_scale:e}"
+        );
+        for row in 0..total {
+            for column in 0..total {
+                assert_within_derived_band(
+                    &format!("pair ({psi_i},{psi_j}) <W, d2_psi H2> [{row},{column}]"),
+                    pair_contraction[[row, column]],
+                    derived_difference(
+                        std::array::from_fn(|k| contraction_stencil[k][[row, column]]),
+                        DERIVED_DIFFERENCE_STEP,
+                        N_ROWS * total * total,
+                    ),
+                    contraction_scale,
+                );
+                assert_within_derived_band(
+                    &format!("pair ({psi_i},{psi_j}) d2_psi H [{row},{column}]"),
+                    pair_hessian[[row, column]],
+                    derived_difference(
+                        std::array::from_fn(|k| hessian_stencil[k][[row, column]]),
+                        DERIVED_DIFFERENCE_STEP,
+                        N_ROWS * total,
+                    ),
+                    hessian_scale,
+                );
+            }
+        }
+        for (a, axis) in pair_axes.iter().enumerate() {
+            for row in 0..total {
+                for column in 0..total {
+                    assert_within_derived_band(
+                        &format!("pair ({psi_i},{psi_j}) d2_psi H2[e_{a}] [{row},{column}]"),
+                        axis[[row, column]],
+                        derived_difference(
+                            std::array::from_fn(|k| axes_stencil[k][a][[row, column]]),
+                            DERIVED_DIFFERENCE_STEP,
+                            N_ROWS * total,
+                        ),
+                        axes_scale,
+                    );
+                }
+            }
+        }
+    }
+}

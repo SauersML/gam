@@ -603,7 +603,7 @@ fn radial_log_power_sup(e: f64, a: f64, b: f64, r_lo: f64, r_hi: f64) -> Option<
 /// `D³ψ = (φ''' − 3β)u⊗u⊗u + β·sym(δ⊗u)` with `β = (φ'' − φ'/r)/r`, whose Frobenius
 /// norms are at most `|φ'|`, `|φ''| + √(d−1)|φ'/r|` and `|φ''' − 3β| + √(3(d+2))|β|`.
 /// Each of those is a sum of terms `r^e(a + b ln r)`, bounded on the radial interval
-/// the ball spans ([`radial_log_power_sup`]). A polynomial column `t^α` is bounded
+/// the ball spans (`radial_log_power_sup`). A polynomial column `t^α` is bounded
 /// with `|t_a| ≤ |center_a| + radius`: a partial meeting axis `a` exactly `j_a` times
 /// is at most `Π_a α_a^{↓j_a}(|center_a| + radius)^{α_a − j_a}`.
 pub fn duchon_sae_atom_jet_ball_bound(

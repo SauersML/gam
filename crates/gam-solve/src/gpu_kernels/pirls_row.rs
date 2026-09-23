@@ -210,7 +210,7 @@ impl CurvatureMode {
 /// Device refusal codes.  Zero is the only success value; a non-zero code
 /// means that the row kernel wrote no numerical outputs for that row.  The
 /// host deterministically selects the smallest failing row and replays the
-/// CPU oracle to recover the full typed [`EstimationError`] (including the
+/// CPU oracle to recover the full typed `EstimationError` (including the
 /// exact offending value).
 pub mod status_codes {
     pub const OK: u32 = 0;

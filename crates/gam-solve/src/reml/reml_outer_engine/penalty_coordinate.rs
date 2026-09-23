@@ -362,7 +362,7 @@ impl PenaltySubspaceTrace {
         Ok(kept + 2.0 * rotation)
     }
 
-    /// `U_Kᵀ · A · U_D` for a dense `A`: the kept–dropped block [`Self::pseudo_logdet_cross`] reads.
+    /// `U_Kᵀ · A · U_D` for a dense `A`: the kept–dropped block `Self::pseudo_logdet_cross` reads.
     pub fn couple_dropped(&self, a: &Array2<f64>) -> Array2<f64> {
         gam_linalg::faer_ndarray::fast_atb(&self.u_s, &gam_linalg::faer_ndarray::fast_ab(a, &self.dropped_basis))
     }

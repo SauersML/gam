@@ -296,7 +296,7 @@ pub fn build_periodic_bspline_basis_1d(
 /// The k-th derivative of I-spline j is the right-cumulative sum of the k-th
 /// derivatives of those B-splines, starting from column j+1 down to j. The
 /// first derivative is that sum in closed form, the M-spline it telescopes to
-/// ([`create_ispline_first_derivative_dense`]), so it is non-negative exactly.
+/// (`create_ispline_first_derivative_dense`), so it is non-negative exactly.
 ///
 /// This produces `num_bspline_basis - 1` columns (same as the I-spline value
 /// basis), where `num_bspline_basis = len(knot_vector) - degree - 2`.

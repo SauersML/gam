@@ -91,7 +91,7 @@ fn canonical_family_head(head: &str) -> Option<&'static str> {
 ///
 /// `Categorical` carries the source-string levels through so a two-level
 /// column can be coded as a binary outcome
-/// ([`code_two_level_label_response`]) and any other level count's
+/// (`code_two_level_label_response`) and any other level count's
 /// auto-inference refusal can echo them; `Binary` short-circuits the
 /// numeric scan inside [`ResponseFamily::infer_from_response`]; `Continuous`
 /// maps to `Numeric` and the family layer scans `y` itself to decide
@@ -736,7 +736,7 @@ pub fn scalar_family_from_name(
 /// Routing the kind through [`ResponseFamily::infer_from_response`] keeps the
 /// auto-detector from reading level indices as values: a two-level label
 /// column is a binary outcome (Binomial, coded by
-/// [`code_two_level_label_response`]), and any other label column is refused.
+/// `code_two_level_label_response`), and any other label column is refused.
 pub fn resolve_family(
     family: Option<&str>,
     negative_binomial_theta: Option<f64>,

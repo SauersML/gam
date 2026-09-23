@@ -992,7 +992,7 @@ pub fn solve_with_lm_escalation_inner(
 /// direction is descent, and Armijo decrease holds, or until the damped model
 /// promises less decrease than half the float spacing at the incumbent value,
 /// past which no rung can produce a representable one (#2627, see
-/// [`ArrowShiftCertificate::promises_unrepresentable_decrease`]).
+/// `ArrowShiftCertificate::promises_unrepresentable_decrease`).
 pub fn solve_arrow_newton_step_with_proximal_correction<F>(
     sys: &ArrowSchurSystem,
     base_ridge_t: f64,

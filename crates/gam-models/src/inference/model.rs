@@ -1582,7 +1582,8 @@ pub fn gaussian_location_scale_saved_response_scale(
         Some(scale) if scale.is_finite() && scale > 0.0 => Ok(scale),
         Some(scale) => Err(FittedModelError::SchemaMismatch {
             reason: format!(
-                "gaussian-location-scale gaussian_response_scale must be finite and positive, got {scale}"
+                "gaussian-location-scale gaussian_response_scale, the response standardization \
+                 scale saved with its σ floor, must be finite and positive, got {scale}"
             ),
         }),
         None => Err(FittedModelError::MissingField {

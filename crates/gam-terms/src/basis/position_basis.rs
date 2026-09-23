@@ -120,7 +120,7 @@ pub struct ResolvedPositionBasis {
 /// Resolve a position fit's basis request on the sample positions `t`.
 ///
 /// - The kind defaults to a B-spline. The order defaults to
-///   [`PositionBasisKind::default_order`] and must be at least 1.
+///   `PositionBasisKind::default_order` and must be at least 1.
 /// - Open B-spline: an explicit knot vector is used as given; otherwise the
 ///   internal-knot count (the request's, or the formula default on `t`) is
 ///   placed at quantiles by [`auto_knot_vector_1d_quantile`], which may lower
@@ -332,13 +332,13 @@ pub struct ResolvedBasisLocations {
 ///
 /// - Open B-spline: an explicit knot vector is used as given; otherwise the
 ///   internal-knot count (the request's, or
-///   [`provisioned_internal_knots_for_column`]) is placed at quantiles by
+///   `provisioned_internal_knots_for_column`) is placed at quantiles by
 ///   [`auto_knot_vector_1d_quantile`].
 /// - Cyclic B-spline: an explicit grid is used as given; otherwise the uniform
 ///   grid over `[min t, max t]` with one cyclic control per interval. An
 ///   integer `K` names the same dimension it does for an open basis,
 ///   `K + degree + 1` controls; the default is the formula's cyclic basis
-///   dimension [`provisioned_cyclic_basis_dim`].
+///   dimension `provisioned_cyclic_basis_dim`.
 /// - Duchon: an explicit center vector is used as given; otherwise the center
 ///   count (the request's, at least 2, or the formula's 1-D Duchon default) is
 ///   placed by equal mass.

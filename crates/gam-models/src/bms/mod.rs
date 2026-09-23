@@ -300,7 +300,7 @@ impl Default for LatentMeasureSpec {
 /// What the conditional-law structure test measured on the marginal-index span
 /// (gam#2926): robust Rao score tests of `E[z|a]`, `Var(z|a)` and the third
 /// standardised moment against the span's non-constant directions, each at
-/// level [`AUTO_Z_CONDITIONAL_RAO_ALPHA`].
+/// level `AUTO_Z_CONDITIONAL_RAO_ALPHA`.
 ///
 /// A `None` p-value means the test could not be formed — no span was supplied
 /// (a CTN influence absorber owns the conditional leakage), or the span has no
@@ -370,7 +370,7 @@ impl ConditionalLawEvidence {
 /// Anchors that share `Ĝ` share its error, and on one law of `M` atoms
 /// `Σ_ij = Σ_m w_m (p_im − p̄_i)(p_jm − p̄_j)/n_eff`, so the `λ_k` are those of the
 /// `M × M` Gram `Σ_i c_i a_i a_iᵀ`, `a_im = √(w_m/n_eff)·(p_im − p̄_i)`
-/// ([`AnchorNoiseGram`]). Their sum is the noise energy. One mode carries most of
+/// (`AnchorNoiseGram`). Their sum is the noise energy. One mode carries most of
 /// it, so the sign of `D̂ = T − 2 Σ_k λ_k` fired on about `P(χ²_1 > 2) ≈ 16%` of exact
 /// Gaussian fits. The closed form is now kept unless `T` exceeds the null law's
 /// upper [`CLOSED_FORM_CERTIFICATE_ALPHA`] quantile, read from the null tail and its
@@ -405,14 +405,14 @@ pub struct ClosedFormAnchorResidual {
     /// `(Σλ)²/Σλ²`, the null law's effective number of modes.
     #[serde(default)]
     pub null_modes: Option<f64>,
-    /// The decision, [`closed_form_kept_by_null_tail`]: the closed form was kept.
+    /// The decision, `closed_form_kept_by_null_tail`: the closed form was kept.
     pub closed_form_chosen: bool,
 }
 
 /// The closed-form certificate's design false-fire rate (gam#2926): the probability
 /// that the certificate prefers the estimated law on an exactly Gaussian score. A
 /// stated policy, not a tuning knob, at the adequacy screen's level
-/// [`AUTO_Z_NORMAL_SCREEN_ALPHA`].
+/// `AUTO_Z_NORMAL_SCREEN_ALPHA`.
 pub const CLOSED_FORM_CERTIFICATE_ALPHA: f64 = AUTO_Z_NORMAL_SCREEN_ALPHA;
 
 /// Whether the closed-form certificate keeps the closed form (gam#2926), from the
@@ -730,7 +730,7 @@ fn least_favourable_declaration_tail(weights: &[f64], statistic: f64) -> Result<
     }
 }
 
-/// The outcome of [`declared_gaussian_loss_test`] (gam#2968).
+/// The outcome of `declared_gaussian_loss_test` (gam#2968).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeclaredGaussianLossTest {
     /// Lower bound on the least-favourable p-value `P(T_LF > T)`.
@@ -741,7 +741,7 @@ pub struct DeclaredGaussianLossTest {
     pub top_weight: f64,
     /// `N = Σλ`, the bias energy at the null's boundary.
     pub noise_energy: f64,
-    /// `H₀: D ≤ 0` is rejected at [`AUTO_Z_CONDITIONAL_RAO_ALPHA`].
+    /// `H₀: D ≤ 0` is rejected at `AUTO_Z_CONDITIONAL_RAO_ALPHA`.
     pub refused: bool,
 }
 
@@ -1007,7 +1007,7 @@ pub enum LatentLawConsumed {
     /// screen, `adequacy` is the failing ledger and `residual` the declaration's
     /// estimated excess anchoring loss at the converged fit, both warned about. A
     /// failed screen alone does not refuse the declaration; a loss beyond its
-    /// sampling noise does ([`declared_gaussian_loss_test`],
+    /// sampling noise does (`declared_gaussian_loss_test`,
     /// [`LatentLawRefusal::DeclaredGaussianAnchoringLoss`], gam#2968), so a
     /// persisted declaration's loss is within it.
     DeclaredGaussian {
@@ -1150,7 +1150,7 @@ pub enum LatentLawRefusal {
     },
     /// A Gaussian law was declared on a score that fails the standard-normal
     /// adequacy screen, and at the converged declared fit the declaration's excess
-    /// anchoring loss is beyond its sampling noise ([`declared_gaussian_loss_test`],
+    /// anchoring loss is beyond its sampling noise (`declared_gaussian_loss_test`,
     /// gam#2968).
     DeclaredGaussianAnchoringLoss {
         context: String,
@@ -1288,7 +1288,7 @@ pub enum LatentMeasureKind {
 
 /// How a row's local-law mixture weights are formed from its distances to the
 /// context centres (gam#2926). Every row's weights come from one function,
-/// [`estimated_latent_law::local_empirical_mixture_for_point`], at fit and at
+/// `estimated_latent_law::local_empirical_mixture_for_point`, at fit and at
 /// prediction alike.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1310,7 +1310,7 @@ pub enum LocalLawMixture {
     /// covariates everywhere. New fits mint it with `top_k = 4`, and with the
     /// bandwidth in the scaled covariates and the floor that minimise the
     /// cross-fitted CRPS of the score
-    /// ([`local_law_resolution::select_local_law_resolution`], gam#3610).
+    /// (`local_law_resolution::select_local_law_resolution`, gam#3610).
     VanishingAtTruncation { floor: f64 },
 }
 
@@ -1487,7 +1487,7 @@ impl LatentMeasureKind {
     /// saved centres, so the saved law carries the function and the values are
     /// rebuilt wherever the fitted rows are replayed. This is the one rule that
     /// rebuilds them, and it composes each row's weights with
-    /// [`estimated_latent_law::local_empirical_mixture_for_point`] — the same
+    /// `estimated_latent_law::local_empirical_mixture_for_point` — the same
     /// composer the fit used for its training rows (gam#2926) and prediction
     /// uses for a prediction row — so the law a row was fitted under and the law
     /// it is replayed under are one object.
@@ -2129,7 +2129,7 @@ pub struct LatentZConditionalCalibration {
     /// cross-block proportional to the residual's third moment. Both vanish
     /// under a Gaussian residual, and neither vanishes on the branch this
     /// covariance serves (gam#2484). Built as `ΨᵀΨ` from
-    /// [`stacked_first_stage_row_influence`]; the two retired fields were its
+    /// `stacked_first_stage_row_influence`; the two retired fields were its
     /// diagonal blocks.
     ///
     /// Fit-time only: predict applies the map from `mean_coeffs`/`log_var_coeffs`
@@ -2283,7 +2283,7 @@ impl LatentZConditionalCalibration {
 
     /// Joint first-stage covariance `V₁` of `θ₁`, ordered to match
     /// [`Self::zeta_theta1_jacobian_row`]: the stacked sandwich `ΨᵀΨ` of
-    /// [`stacked_first_stage_row_influence`], which is NOT block-diagonal off a
+    /// `stacked_first_stage_row_influence`, which is NOT block-diagonal off a
     /// Gaussian residual (gam#2484).
     pub fn theta1_covariance(&self) -> Array2<f64> {
         self.theta1_cov.clone()
@@ -3690,7 +3690,7 @@ pub(crate) fn build_latent_measure_decision(
 /// the evidence away. That is why "how far is the calibrated residual from
 /// standard normal when the gate trips?" could not be answered from a fit --
 /// the failing clause and its margin existed only inside the conjunction and
-/// were discarded at the `&&`. The conjunction now lives in [`Self::passes`]
+/// were discarded at the `&&`. The conjunction now lives in `Self::passes`
 /// and the evidence survives it, which is what lets the conditional
 /// location-scale branch say what the data did (gam#2484).
 ///

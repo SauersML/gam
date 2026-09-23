@@ -1699,10 +1699,11 @@ fn a_decrement_that_grows_after_a_resolvable_step_keeps_polishing_3012() {
 /// A criterion whose value does not fall along the Newton step its own gradient
 /// and Hessian describe, on a route whose bounds are both limit models: the
 /// backtrack halves the step down to where the quadratic model's own decrease
-/// reaches the tolerance and finds no resolved decrease, no limit face lowers the
-/// criterion either, and the mint refuses by the typed
-/// `newton-backtrack-unresolved` rung (#3012), with the checkpoint where it was
-/// judged.
+/// reaches the tolerance and finds no resolved decrease, and no limit face lowers
+/// the criterion either. A model its criterion contradicts is not evidence about
+/// the iterate, so the decrement defers to the first-order ladder (#3228), which
+/// refuses this point on its projected gradient; nothing certifies, and the
+/// checkpoint is where it was judged (#3012).
 #[test]
 fn a_backtrack_without_a_resolved_decrease_is_a_typed_refusal_3012() {
     let theta = 5.0e-4;
@@ -1717,21 +1718,13 @@ fn a_backtrack_without_a_resolved_decrease_is_a_typed_refusal_3012() {
     let error = outcome.expect_err("a decrease the criterion never delivers must not certify");
     let message = error.to_string();
     assert!(
-        message.contains("Newton-decrement above tolerance after polish")
-            && message.contains("no step along the Newton step lowers the criterion"),
-        "{message}",
+        message.contains("did not certify a stationary optimum") && message.contains("NOT STATIONARY"),
+        "the first-order ladder refuses the point the decrement deferred on: {message}",
     );
-    match &error {
-        EstimationError::RemlDidNotConverge {
-            stationarity_standard,
-            ..
-        } => assert_eq!(
-            stationarity_standard.rung().map(|rung| rung.label),
-            Some("newton-backtrack-unresolved"),
-            "{message}",
-        ),
-        other => panic!("expected a typed outer refusal, got {other:?}"),
-    }
+    assert!(
+        matches!(&error, EstimationError::RemlDidNotConverge { .. }),
+        "expected a typed outer refusal, got {error:?}"
+    );
     assert_eq!(published[0].to_bits(), theta.to_bits());
 }
 

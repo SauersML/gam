@@ -35,7 +35,7 @@
 //!   `(t_k, τ(t_k; c_k))` are independent across samples and the classification
 //!   averages over the rows' law.
 //!
-//! The class posteriors of [`classify_circle_transport`] treat the pairs as
+//! The class posteriors of `classify_circle_transport` treat the pairs as
 //! independent draws, so the caller draws the source coordinates independently
 //! from the coordinate law it declares (for a circle, uniform on `[0, 1)`).
 //!
@@ -52,7 +52,7 @@
 //!   basis rows are orthogonal on `[0, 1)` with mean square ½, and row 0 decodes
 //!   the image's mean point.
 //! - **Rigid transition error.** The departure of the executed chart map from a
-//!   rigid O(2) map: [`classify_circle_transport`]'s defect `1 − max(R₊, R₋)`, its
+//!   rigid O(2) map: `classify_circle_transport`'s defect `1 − max(R₊, R₋)`, its
 //!   standard error, and the Shift/Reflect/Mixing posteriors.
 //! - **Non-rigid part.** The transport map `h` of the executed pairs
 //!   ([`fit_transport_map`]): its winding degree, its fold certificate, and its

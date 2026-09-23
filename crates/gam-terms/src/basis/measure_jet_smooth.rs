@@ -4398,17 +4398,36 @@ mod tests {
             let t = i as f64 / (n as f64 - 1.0);
             t + 0.04 * (7.0 * t).sin()
         });
-        let spec = MeasureJetBasisSpec {
+        let auto_spec = MeasureJetBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 24 },
             learn_length_scale: true,
             ..MeasureJetBasisSpec::default()
         };
         assert!(
             matches!(
-                spec.identifiability,
+                auto_spec.identifiability,
                 MeasureJetIdentifiability::CenterSumToZero
             ),
             "this test exists to cover the CenterSumToZero arm; the default moved"
+        );
+        // The default range is the `0.0` auto sentinel, so `0.0·e^{±h}` rebuilds the
+        // SAME auto range and its central difference is identically zero whatever the
+        // jet says. Pin the range the auto build realizes and differentiate at it; a
+        // rebuild at that explicit range must be the auto design itself, which checks
+        // the pinned value is read in the spec's own frame.
+        let auto = build_measure_jet_basis(data.view(), &auto_spec).expect("auto build");
+        let BasisMetadata::MeasureJet { length_scale, .. } = &auto.metadata else {
+            panic!("a measure-jet build publishes measure-jet metadata");
+        };
+        let spec = MeasureJetBasisSpec {
+            length_scale: length_scale.standardized_value(),
+            ..auto_spec
+        };
+        let pinned = build_measure_jet_basis(data.view(), &spec).expect("pinned build");
+        assert_eq!(
+            pinned.design.to_dense(),
+            auto.design.to_dense(),
+            "the explicit realized range must rebuild the auto design"
         );
 
         let derivs = build_measure_jet_basis_psi_derivatives(data.view(), &spec)

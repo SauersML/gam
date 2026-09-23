@@ -337,7 +337,7 @@ pub fn predict_survival_location_scalewith_uncertainty(
 /// survival is monotone along. A fit whose posterior is inequality-truncated
 /// integrates its moments over the mixture the truncated law's joint rule forms
 /// (#2679), so its band is that mixture's central interval
-/// ([`truncated_survival_response_bands`]), not the moment-matched normal's.
+/// (`truncated_survival_response_bands`), not the moment-matched normal's.
 pub fn predict_survival_location_scale_band(
     input: &SurvivalLocationScalePredictInput,
     fit: &UnifiedFitResult,

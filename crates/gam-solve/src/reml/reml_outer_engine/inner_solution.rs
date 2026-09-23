@@ -46,7 +46,7 @@ pub struct ConeNormalizerInput {
     /// The Laplace integral the term normalizes is `∫_{Aβ ≥ b} exp(−E(β)/φ̂) dβ`, so the
     /// posterior it truncates has precision `M/φ̂` and KKT gradient `g/φ̂`. At fixed dispersion
     /// `φ̂` is 1 and the two are the objective's own. Read through
-    /// [`profiled_gaussian_scale`](super::profiled_gaussian_scale), the one rule for `φ̂`, so
+    /// `profiled_gaussian_scale`, the one rule for `φ̂`, so
     /// the term and the criterion cannot price two posteriors for one mode (gam#2765).
     pub profiled_scale: Option<f64>,
 }

@@ -2822,7 +2822,7 @@ pub struct DecoderSolveStats {
     /// over column tiles, the tile's maximum per-column iteration count times
     /// its width. Every sweep applies the operator to all of a tile's columns,
     /// converged or not, so this is the work the dense-versus-CG route prices
-    /// ([`decoder_component_route_is_dense`]).
+    /// (`decoder_component_route_is_dense`).
     pub cg_column_sweeps: usize,
     /// Components solved exactly by dense Cholesky (the cost route chose dense
     /// and the factorization succeeded).

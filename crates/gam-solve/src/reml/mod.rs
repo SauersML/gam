@@ -4887,7 +4887,7 @@ pub(crate) struct FirthDesignFactor {
 /// The Jeffreys log-density `½ log|I(β)|` of a fixed design under one inverse
 /// link, as a function of `η = Xβ` alone.
 ///
-/// It holds the β-independent [`FirthDesignFactor`] and evaluates the same
+/// It holds the β-independent `FirthDesignFactor` and evaluates the same
 /// identifiable-subspace value [`FirthDenseOperator`] carries, without the
 /// Fisher inverse, hat diagonal, and weight derivatives only the gradient
 /// needs: the per-state cost is `X_rᵀ W X_r` and one factorization. A

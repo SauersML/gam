@@ -954,7 +954,7 @@ impl HessianFactorization for SparseCholeskyOperator {
         self.n_dim
     }
 
-    /// Componentwise (#2954), the sparse form of [`DenseCholeskyOperator`]'s
+    /// Componentwise (#2954), the sparse form of `DenseCholeskyOperator`'s
     /// bound. The computed factor is exact for `H + δH` with
     /// `|δH| ≤ γ_(r+1)·|L||Lᵀ|` (Higham, *Accuracy and Stability of Numerical
     /// Algorithms*, Thm 10.3, whose `n`-term inner products are here at most

@@ -2228,7 +2228,7 @@ impl BlockSparseStreamState {
     /// `partial_fit`. Every per-pass accumulator is zero there, and a staged birth or frame
     /// trial holds only its baseline and proposal, so those are all it records; a state with
     /// rows of an unfinished pass streamed is refused. The layout is fixed little-endian under
-    /// [`CHECKPOINT_SCHEMA`]. The file is written to a sibling and renamed into place, so an
+    /// `CHECKPOINT_SCHEMA`. The file is written to a sibling and renamed into place, so an
     /// interrupted write never leaves a truncated checkpoint at `path`.
     pub fn checkpoint(&self, path: &std::path::Path) -> Result<(), String> {
         if self.row_count != 0 {

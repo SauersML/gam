@@ -2372,7 +2372,7 @@ pub const COMPARISON_CRITERION: &str = "aic_corrected";
 /// # What the comparability checks establish (#4556 P3)
 ///
 /// An AIC gap is an evidence ratio only between two fits of one experiment: the
-/// same response, the same weights, the same base measure. [`check_comparable`]
+/// same response, the same weights, the same base measure. `check_comparable`
 /// establishes that from [`ComparisonCandidate::response_fingerprint`], the
 /// value identity of the response and the prior weights, taken where the fit
 /// read those rows and carried on the fit result, the saved payload and the

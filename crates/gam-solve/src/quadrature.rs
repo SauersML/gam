@@ -595,7 +595,7 @@ pub(crate) fn compute_gauss_hermite_n(n: usize) -> GaussHermiteRule {
 /// - dμ/dm = ∫ σ'(η) × N(η; m, SE²) dη = ∫ σ(η)(1-σ(η)) × N(η; m, SE²) dη
 ///
 /// Both come from one pass of the accelerated moment series in
-/// [`logit_posterior_meanwith_deriv_exact`], accurate to working precision at
+/// `logit_posterior_meanwith_deriv_exact`, accurate to working precision at
 /// every finite `(eta, se_eta)`.
 ///
 /// Returns: (μ, dμ/dm)
@@ -3818,7 +3818,7 @@ fn probit_gap_jet(mu: f64, u: f64) -> LinkGapJet {
 ///
 /// The mean is the integral used for the posterior-mean prediction itself,
 /// so the two agree; the variance is the central-moment lobe integral of
-/// [`log_concave_link_posterior_variance`].
+/// `log_concave_link_posterior_variance`.
 pub fn logit_posterior_meanvariance(eta: f64, se_eta: f64) -> Result<(f64, f64), EstimationError> {
     let (mean, _) = logit_posterior_meanwith_deriv(eta, se_eta)?;
     let var = log_concave_link_posterior_variance(se_eta, |u| logit_gap_jet(eta, u));
@@ -3829,7 +3829,7 @@ pub fn logit_posterior_meanvariance(eta: f64, se_eta: f64) -> Result<(f64, f64),
 
 /// Posterior mean and variance of `Φ(η)`, `η ~ N(eta, se_eta²)`: the exact
 /// closed-form mean and the central-moment lobe variance of
-/// [`log_concave_link_posterior_variance`].
+/// `log_concave_link_posterior_variance`.
 pub fn probit_posterior_meanvariance(eta: f64, se_eta: f64) -> (f64, f64) {
     let mean = probit_posterior_mean(eta, se_eta);
     let var = log_concave_link_posterior_variance(se_eta, |u| probit_gap_jet(eta, u));
@@ -6927,9 +6927,9 @@ where
 /// BRACKET, not an answer: an estimate read off it by interpolation carries the
 /// cell's curvature into the reported level (`1.4e-5` and `1.8e-5` on the
 /// uniform two-coordinate law of the tests). So the grid supplies a first
-/// estimate through [`inverse_interpolated_crossing`], and the level is then
+/// estimate through `inverse_interpolated_crossing`, and the level is then
 /// driven onto `F` itself by the secant method, with every node's crossing
-/// SOLVED on the response ([`solve_resolved_axis_crossing`]). What is left is
+/// SOLVED on the response (`solve_resolved_axis_crossing`). What is left is
 /// the outer rule's own truncation: on that same law the levels come back exact
 /// to `5e-17`.
 ///

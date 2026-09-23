@@ -511,10 +511,16 @@ mod tests {
         assert_eq!(schema["mark_kinds"][0], serde_json::json!("Once"));
         assert_eq!(schema["mark_names"].as_array().map(Vec::len), Some(model.mark_kinds().len()));
         assert!(schema["covariate_levels"].as_array().is_some_and(|l| l.is_empty()));
+        // The reader takes the header before the model (a model of another format is refused by
+        // its header), and a `serde_json::Value` map re-serializes its keys sorted, `model` before
+        // `version`. So the mutant is written back in the saved order, header first.
         let tamper = |edit: &dyn Fn(&mut serde_json::Value)| {
             let mut document = saved.clone();
             edit(&mut document["model"]["schema"]);
-            JointEventModel::from_saved_text(&serde_json::to_string_pretty(&document).unwrap())
+            JointEventModel::from_saved_text(&format!(
+                "{{\"kind\":{},\"version\":{},\"model\":{}}}",
+                document["kind"], document["version"], document["model"]
+            ))
         };
         let edits: [(&str, Box<dyn Fn(&mut serde_json::Value)>); 7] = [
             (

@@ -1385,7 +1385,7 @@ impl ConstrainedProjectionLaw<'_> {
     ///
     /// The quantiles of every row whose projection keeps a tangent residual are
     /// settled together against the one cached node set
-    /// ([`settle_mixture_quantiles`]).
+    /// (`settle_mixture_quantiles`).
     pub fn equal_tailed_intervals(
         &self,
         contrasts: ArrayView2<'_, f64>,
@@ -2840,6 +2840,21 @@ struct TruncatedStandardNormal {
     /// high·φ(high)) / P`, which is `ρ(ρ − low)` on the half-line with
     /// `ρ = φ/Φ̄` the normal hazard.
     mean_wall_derivative: f64,
+    /// Rounding `mean` carries from its own formation. Each density term is
+    /// `exp(ln φ(t) − ln P)`, so the exponent's absolute rounding — three
+    /// operations over `½t²`, `ln √(2π)` and `|ln P|` (`ln P` is itself read to
+    /// its magnitude's rounding) — is the term's RELATIVE error, plus the `exp`.
+    /// Far in a tail `½t²` dominates, and the mean is resolved to
+    /// `ε·t²/2` of itself, not to `ε`.
+    mean_band: f64,
+}
+
+/// Relative rounding of `exp(ln φ(t) − log_mass)`: the exponent's absolute
+/// rounding, which `exp` turns into a relative one, and the `exp`'s own.
+fn density_ratio_relative_band(t: f64, log_mass: f64) -> f64 {
+    const LOG_SQRT_2PI: f64 = 0.918_938_533_204_672_7;
+    gam_linalg::roundoff::accumulation_band(3, 0.5 * t * t + LOG_SQRT_2PI + log_mass.abs())
+        + gam_linalg::roundoff::accumulation_growth(1)
 }
 
 /// `ln φ(t)`; `−∞` at `t = ±∞`, which is the limit `φ` has there.
@@ -2868,15 +2883,16 @@ fn truncated_standard_normal(low: f64, high: f64) -> Option<TruncatedStandardNor
         let mean = (standard_normal_log_density(low) - log_mass).exp();
         // A wall at `−∞` truncates nothing: mean `0`, and no sensitivity to a
         // wall that is not there.
-        let mean_wall_derivative = if low.is_finite() {
-            mean * (mean - low)
+        let (mean_wall_derivative, mean_band) = if low.is_finite() {
+            (mean * (mean - low), mean.abs() * density_ratio_relative_band(low, log_mass))
         } else {
-            0.0
+            (0.0, 0.0)
         };
         return Some(TruncatedStandardNormal {
             log_mass,
             mean,
             mean_wall_derivative,
+            mean_band,
         });
     }
     if !(high > low) {
@@ -2898,10 +2914,15 @@ fn truncated_standard_normal(low: f64, high: f64) -> Option<TruncatedStandardNor
     let reflected_mean = density_a - density_b;
     let mean_wall_derivative =
         reflected_mean * reflected_mean - (a * density_a - b * density_b);
+    // The two density terms round independently; the difference adds one more.
+    let mean_band = density_a * density_ratio_relative_band(a, log_mass)
+        + if b.is_finite() { density_b * density_ratio_relative_band(b, log_mass) } else { 0.0 }
+        + gam_linalg::roundoff::accumulation_band(1, density_a + density_b);
     Some(TruncatedStandardNormal {
         log_mass,
         mean: if reflect { -reflected_mean } else { reflected_mean },
         mean_wall_derivative,
+        mean_band,
     })
 }
 
@@ -3235,6 +3256,7 @@ fn saddle_point_tilt(
         // Rounding each wall carries, which `ρ[i]` inherits scaled by the wall
         // derivative the same call returns.
         let mut wall_band = vec![0.0f64; q];
+        let mut mean_band = vec![0.0f64; q];
         for i in 0..q {
             let mut bound = -mean[i];
             let mut bound_magnitude = mean[i].abs();
@@ -3258,6 +3280,7 @@ fn saddle_point_tilt(
             let law = truncated_standard_normal(low, high)?;
             rho[i] = law.mean;
             wall_derivative[i] = law.mean_wall_derivative;
+            mean_band[i] = law.mean_band;
         }
         let mut f = vec![0.0f64; unknowns];
         let mut band = vec![0.0f64; unknowns];
@@ -3273,15 +3296,21 @@ fn saddle_point_tilt(
             band[i] = gam_linalg::roundoff::accumulation_band(
                 2,
                 z[i].abs() + tilt_at(i).abs() + rho[i].abs(),
-            ) + wall_derivative[i].abs() * wall_band[i];
+            ) + wall_derivative[i].abs() * wall_band[i]
+                + mean_band[i];
         }
         for k in 0..(q - 1) {
             let mut coupling = 0.0;
             let mut coupling_magnitude = mu[k].abs();
+            // Each `ρ[i]` enters scaled by `L_ik/L_ii`, so its own rounding and its
+            // wall's reach the entry at that scale.
+            let mut inherited = 0.0;
             for i in (k + 1)..q {
-                let term = rho[i] * factor[[i, k]] / diagonal[i];
+                let scale = factor[[i, k]] / diagonal[i];
+                let term = rho[i] * scale;
                 coupling += term;
                 coupling_magnitude += term.abs();
+                inherited += scale.abs() * (mean_band[i] + wall_derivative[i].abs() * wall_band[i]);
             }
             f[q + k] = mu[k] - coupling;
             // Two multiplies and one addition per coupled row, and the final
@@ -3289,7 +3318,7 @@ fn saddle_point_tilt(
             band[q + k] = gam_linalg::roundoff::accumulation_band(
                 3 * (q - k - 1) + 1,
                 coupling_magnitude,
-            );
+            ) + inherited;
         }
         if f.iter().any(|value| !value.is_finite()) {
             return None;

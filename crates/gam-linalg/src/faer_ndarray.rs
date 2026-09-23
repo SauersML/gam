@@ -3744,15 +3744,15 @@ pub struct CertifiedGeneralSpectrum {
 /// It refuses as `GeneralEigenCertificateRefused`, naming the arm, the slot, the
 /// measured value and the band, unless all of these hold:
 /// - (i) every eigenvalue's backward error is within its band. First the
-///   residual of faer's eigenvector ([`general_eigenpair_backward_errors`]) is
+///   residual of faer's eigenvector (`general_eigenpair_backward_errors`) is
 ///   compared with `η` (`general_eigen_pair_band`); it bounds the backward error
 ///   from above. Where it does not certify, faer's vector is not evidence either
 ///   way, so the exact backward error `σ_min(A − λI)` is measured instead
 ///   (`general_eigenvalue_singular_backward_error`), one singular-values-only SVD
 ///   per such eigenvalue.
-/// - (ii) `Σ re` agrees with `tr A` ([`general_spectrum_trace_measure`]), and
+/// - (ii) `Σ re` agrees with `tr A` (`general_spectrum_trace_measure`), and
 ///   Schur's inequality `Σ|λ|² ≤ ‖A‖_F²` holds
-///   ([`general_spectrum_schur_measure`]), each within its band.
+///   (`general_spectrum_schur_measure`), each within its band.
 /// - Conjugate pairs are adjacent with equal real parts and negated imaginary parts.
 ///
 /// faer's own failures stay `GeneralEigen(EvdError)` and `SvdNoConvergence`.
@@ -4281,6 +4281,13 @@ fn rrqr_nullspace_basis_inner<S: Data<Elem = f64>>(
     a: &ArrayBase<S, Ix2>,
     cutoff: RrqrRankCutoff,
 ) -> Result<(Array2<f64>, usize), FaerLinalgError> {
+    // A matrix with no nonzero entry has rank zero at any precision, and its
+    // pivoted QR runs every Householder step on a zero column, whose reflector
+    // is `0/0`: the factor it returns is not finite, so neither rank rule can
+    // read it. The whole space is the null space.
+    if a.iter().all(|&value| value == 0.0) {
+        return Ok((Array2::<f64>::eye(a.nrows()), 0));
+    }
     let faerview = FaerArrayView::new(a);
     let qr = ColumnPivotedQr::new(faerview.as_ref());
     let r = qr.thin_r();

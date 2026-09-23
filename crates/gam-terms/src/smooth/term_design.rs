@@ -1551,7 +1551,16 @@ fn penalty_balanced_collection_chart(
                 "collection chart for term '{termname}': a penalty restricted to the kept span is not finite"
             );
         }
-        if norm > 0.0 {
+        // A penalty that vanishes on the kept span restricts to the rounding of the congruence
+        // `FᵀSF` alone: with `F` orthonormal each entry is two length-`p` accumulations over
+        // `S`, so its spectrum is resolved only to `γ_{2p}·‖S‖₂`. Its top eigenvalue is then
+        // that rounding, and dividing by it lifts the rounding's negative eigenvalues to O(1),
+        // which is how `y ~ s(x) + te(x, z)` built a balanced metric with eigenvalue −3.48. Such a
+        // penalty charges nothing on the span and contributes nothing to `M`.
+        let full_norm = top_eigenvalue(&symmetrized(penalty.matrix.clone()))?;
+        let congruence_band =
+            gam_linalg::roundoff::accumulation_growth(2 * p) * full_norm.abs();
+        if norm > congruence_band {
             penalty_sum.scaled_add(1.0 / norm, &restricted);
         }
     }
@@ -1767,7 +1776,7 @@ pub fn place_term_in_collection_gauge(
 }
 
 /// The operator-penalty request of a Duchon term's spec, which
-/// [`penalties_in_collection_chart`] re-derives its penalty set from.
+/// `penalties_in_collection_chart` re-derives its penalty set from.
 pub fn duchon_operator_penalty_request(
     termspec: &SmoothTermSpec,
 ) -> Option<&crate::basis::DuchonOperatorPenaltySpec> {
@@ -1778,7 +1787,7 @@ pub fn duchon_operator_penalty_request(
 }
 
 /// The B-spline spec of a 1-D B-spline term, bare or under a `by=` wrapper,
-/// which [`penalties_in_collection_chart`] charges the null ridge from.
+/// which `penalties_in_collection_chart` charges the null ridge from.
 pub fn bspline_null_ridge_request(
     termspec: &SmoothTermSpec,
 ) -> Option<&crate::basis::BSplineBasisSpec> {
