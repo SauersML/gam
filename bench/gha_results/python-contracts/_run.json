@@ -1,14 +1,14 @@
 {
   "workflow": "Python Contracts",
-  "publish_job_status": "failure",
+  "publish_job_status": "cancelled",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
-  "publish_job_failed_steps": "step 10: Run curv() constant-curvature sign-recovery contract (#1464) | step 13: Run bench-package Python tests (#1512 orphans) | step 16: Triage full Python suite on the fresh wheel (#1512)",
-  "run_id": "35795749470",
-  "run_number": "320",
+  "publish_job_failed_steps": "",
+  "run_id": "35881691930",
+  "run_number": "322",
   "run_attempt": "1",
   "event": "workflow_dispatch",
   "ref": "refs/heads/main",
-  "sha": "2d525961f8e5a6caaa7b580615ce5b42e3ce23e9",
-  "completed_utc": "2026-09-23T02:32:51Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/35795749470"
+  "sha": "8614e33a43376530b6a48cb5bcc8d944b4551cbf",
+  "completed_utc": "2026-09-23T20:27:46Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/35881691930"
 }
