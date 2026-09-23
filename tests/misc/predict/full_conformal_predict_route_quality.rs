@@ -163,9 +163,10 @@ fn gaussian_exact_full_conformal_covers_under_misspecification_and_is_efficient(
     for i in 0..n_test {
         let x_star = test_design.row(i).to_owned();
 
-        // EXACT full-conformal envelope (the #1098 engine).
+        // EXACT full-conformal envelope (the #1098 engine), at the row's
+        // position in the request, as the prediction route calls it.
         let interval = substrate
-            .interval(&x_star, alpha)
+            .interval(&x_star, alpha, i as u64)
             .expect("exact full-conformal interval");
         if y_test[i] >= interval.lo && y_test[i] <= interval.hi {
             conf_inside += 1;

@@ -1099,7 +1099,8 @@ pub(crate) fn glm_full_conformal<'py>(
     };
 
     let set = GlmFullConformalSubstrate::new(family, x, y, offset, sl, Some(0), Array1::zeros(p))
-        .and_then(|substrate| substrate.prediction_set(&star, offset_star, alpha))
+        // One test row: request position 0.
+        .and_then(|substrate| substrate.prediction_set(&star, offset_star, alpha, 0))
         .map_err(py_value_error)?;
 
     let intervals: Vec<(f64, f64)> = set.intervals.iter().map(|i| (i.lo, i.hi)).collect();

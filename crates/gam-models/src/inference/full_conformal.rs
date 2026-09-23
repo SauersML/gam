@@ -137,14 +137,12 @@
 
 use faer::Side;
 use ndarray::{Array1, Array2};
-use rand::RngExt;
 
 use gam_linalg::faer_ndarray::{FaerCholesky, fast_av};
 
 pub mod honest;
 pub use honest::{
     ConformalCertificate, ConformalRefusal, HonestConformalCost, HonestFullConformal,
-    honest_full_conformal,
 };
 
 #[cfg(test)]
@@ -252,6 +250,34 @@ pub(crate) fn validate_tie_uniform(value: f64) -> Result<(), String> {
     }
 }
 
+/// The smoothed conformal p-value's uniform `U` for the test row at position
+/// `row_index` of a prediction request: output `row_index` of SplitMix64 seeded
+/// at zero (Steele, Lea & Flood 2014; output 0 is `0xE220A8397B1DCDAF`), mapped
+/// to `[0, 1)` by its top 53 bits.
+///
+/// Every production inversion takes its `U` here, so the same model, data and
+/// request give bit-identical sets on every run. `U` is a function of the
+/// row's position alone, never of a covariate, response or fitted value, so it
+/// is independent of the data. What that buys, stated exactly: with `R` the
+/// number of the `n + 1` augmented scores strictly above the test score and no
+/// ties, a row with fixed `U = u` is covered when `R + u > α(n + 1)`, which has
+/// probability `1 − (⌊α(n + 1) − u⌋ + 1)/(n + 1)`. That is within `1/(n + 1)`
+/// of `1 − α`, between the plain p-value's two roundings, for every `u`. Averaged
+/// over `u ~ Uniform[0, 1)` it is exactly `1 − α`, and consecutive positions
+/// give SplitMix64's equidistributed outputs, so coverage averaged over the
+/// rows of a request is `1 − α` up to that equidistribution. A caller that needs
+/// a fresh independent `U` per inversion passes one to the `_with_uniform`
+/// entry points.
+pub fn conformal_tie_uniform(row_index: u64) -> f64 {
+    let mut z = row_index
+        .wrapping_add(1)
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
+}
+
 /// The smallest strict-dominating count k with k+U > α(n+1), or n+1.
 /// Counting uncertain ties as possible strict dominators gives a conservative
 /// upper bound for the honest numerical enclosure.
@@ -289,17 +315,9 @@ impl ExactGaussianFullConformal {
     /// conformal — Tibshirani et al. 2019 — is a different estimand with
     /// likelihood-ratio weights; it can be added as its own constructor,
     /// not silently conflated with this one.)
-    pub fn new(
-        x: &Array2<f64>,
-        y: &Array1<f64>,
-        prior_weights: &Array1<f64>,
-        s_lambda: &Array2<f64>,
-        x_star: &Array1<f64>,
-    ) -> Result<Self, String> {
-        Self::new_with_uniform(x, y, prior_weights, s_lambda, x_star, rand::rng().random())
-    }
-
-    /// Construct one inversion with an externally supplied independent U.
+    ///
+    /// `tie_uniform` is the smoothed p-value's `U` for this row; a prediction
+    /// takes it from [`conformal_tie_uniform`] of the row's request position.
     pub fn new_with_uniform(
         x: &Array2<f64>,
         y: &Array1<f64>,
@@ -768,7 +786,8 @@ pub struct ExactFullConformalPenalty {
     /// Frozen penalty `Sλ = M₀ − XᵀX` at the fitted smoothing parameters (p × p).
     s_lambda: Array2<f64>,
     /// Number of smoothing parameters the fit selected, which decides whether
-    /// the REML re-selecting map is computable ([`honest_full_conformal`]).
+    /// the REML re-selecting map is computable
+    /// ([`honest::honest_full_conformal_with_uniform`]).
     #[serde(default)]
     penalty_count: Option<usize>,
     /// The penalty's COMPONENTS in the fit's own basis, one `S_k` per selected
@@ -954,7 +973,8 @@ impl ExactFullConformalPenalty {
 
 /// Runtime substrate for the Gaussian-identity full-conformal set: the labeled
 /// design `X`, response `y`, the frozen penalty `Sλ` and the fit's
-/// smoothing-parameter count. Each test row gets [`honest_full_conformal`]: the
+/// smoothing-parameter count. Each test row gets
+/// [`honest::honest_full_conformal_with_uniform`]: the
 /// set of the map that re-selects the smoothing strength by REML on the
 /// augmented rows, or the frozen-ρ set with a typed refusal. It is never
 /// persisted (see [`ExactFullConformalPenalty`]).
@@ -1040,13 +1060,16 @@ impl ExactFullConformalSubstrate {
         self.x.nrows()
     }
 
-    /// The full-conformal verdict at one test row `x_*` and miscoverage `alpha`.
+    /// The full-conformal verdict at one test row `x_*` and miscoverage `alpha`,
+    /// where `row_index` is the row's position in the prediction request and
+    /// selects its [`conformal_tie_uniform`].
     pub fn interval(
         &self,
         x_star: &Array1<f64>,
         alpha: f64,
+        row_index: u64,
     ) -> Result<ExactFullConformalInterval, String> {
-        self.interval_with_uniform(x_star, alpha, rand::rng().random())
+        self.interval_with_uniform(x_star, alpha, conformal_tie_uniform(row_index))
     }
 
     /// The same outer envelope with an explicitly supplied independent U.
@@ -1467,7 +1490,7 @@ mod tests {
         // Without the count the re-selecting map is unknown: the row is refused
         // loudly and gets the frozen set, never a silent guarantee.
         let row = substrate
-            .interval(&Array1::from_vec(vec![0.3, 0.1, 0.2]), 0.2)
+            .interval(&Array1::from_vec(vec![0.3, 0.1, 0.2]), 0.2, 0)
             .expect("legacy row");
         assert_eq!(
             row.certificate,
@@ -1721,6 +1744,50 @@ mod smoothed_tests {
             .is_err()
         );
     }
+    #[test]
+    fn the_tie_uniform_is_splitmix64_output_of_the_row_position() {
+        // SplitMix64 seeded at zero first outputs 0xE220A8397B1DCDAF.
+        let reference = (0xE220_A839_7B1D_CDAFu64 >> 11) as f64 / (1u64 << 53) as f64;
+        assert_eq!(conformal_tie_uniform(0).to_bits(), reference.to_bits());
+        assert_eq!(conformal_tie_uniform(0), 0.8833108082136426);
+        assert_eq!(conformal_tie_uniform(2), 0.026433771592597743);
+        for index in [0, 1, 2, 7, u64::MAX] {
+            let u = conformal_tie_uniform(index);
+            assert!((0.0..1.0).contains(&u), "index {index}: {u}");
+            assert_eq!(u.to_bits(), conformal_tie_uniform(index).to_bits());
+        }
+    }
+
+    #[test]
+    fn the_same_row_predicted_twice_gives_bit_identical_sets() {
+        let substrate = ExactFullConformalSubstrate {
+            x: array![
+                [1.0, -0.8],
+                [1.0, -0.3],
+                [1.0, 0.1],
+                [1.0, 0.5],
+                [1.0, 0.9],
+                [1.0, 1.4]
+            ],
+            y: array![-0.6, 0.2, -0.1, 0.7, 0.4, 1.3],
+            s_lambda: array![[0.0, 0.0], [0.0, 0.5]],
+            penalty_count: Some(0),
+        };
+        let star = array![1.0, 0.3];
+        for row_index in [0, 2, 7] {
+            let first = substrate.interval(&star, 0.3, row_index).unwrap();
+            let second = substrate.interval(&star, 0.3, row_index).unwrap();
+            let pinned = substrate
+                .interval_with_uniform(&star, 0.3, conformal_tie_uniform(row_index))
+                .unwrap();
+            for other in [&second, &pinned] {
+                assert_eq!(first.set.intervals, other.set.intervals, "row {row_index}");
+                assert_eq!(first.lo.to_bits(), other.lo.to_bits(), "row {row_index}");
+                assert_eq!(first.hi.to_bits(), other.hi.to_bits(), "row {row_index}");
+            }
+        }
+    }
+
     #[test]
     fn empty_randomized_set_has_no_point_envelope() {
         let substrate = ExactFullConformalSubstrate {

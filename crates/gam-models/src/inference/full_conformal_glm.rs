@@ -138,10 +138,13 @@
 //!
 //! # Independent randomization and numerical ties
 //!
-//! All families use an independent `U ~ Uniform[0, 1)` drawn once per
-//! inversion and shared by all candidate labels. Exact smoothed ranks have
-//! marginal coverage `1 − α` for exchangeable supplied rows and a fitting map
-//! symmetric in all augmented rows. This is not a conditional-on-features
+//! All families use one `U` per inversion, shared by all candidate labels:
+//! [`conformal_tie_uniform`] of the test row's position in the request, a
+//! fixed function of that position and of nothing in the data. Averaged over
+//! `U`, exact smoothed ranks have marginal coverage `1 − α` for exchangeable
+//! supplied rows and a fitting map symmetric in all augmented rows; at the
+//! row's fixed `U` it is within `1/(n + 1)` of that (see
+//! [`conformal_tie_uniform`]). This is not a conditional-on-features
 //! guarantee; a training-only learned basis or penalty need not be symmetric.
 //! Numerical uncertainty is retained as a conservative enclosure, so this
 //! implementation does not claim exact coverage. Gamma uses the same independent-U
@@ -152,7 +155,6 @@ use std::ops::Range;
 
 use faer::Side;
 use ndarray::{Array1, Array2, Axis};
-use rand::RngExt;
 
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_atv, fast_av, fast_xt_diag_x};
 use gam_math::special::{logistic as sigmoid, softplus};
@@ -162,7 +164,7 @@ use opt::{BacktrackConfig, backtracking_line_search};
 
 use super::full_conformal::{
     ConformalCertificate, ConformalInterval, ConformalRefusal, conformal_rank_threshold,
-    validate_tie_uniform,
+    conformal_tie_uniform, validate_tie_uniform,
 };
 
 /// Maximum damped-Newton iterations for a cold augmented GLM fit.
@@ -894,14 +896,21 @@ impl GlmFullConformalSubstrate {
     }
 
     /// The full-conformal set at level `1 − alpha` for the test row
-    /// `(x_star, offset_star)`.
+    /// `(x_star, offset_star)` at position `row_index` of the prediction
+    /// request, which selects its [`conformal_tie_uniform`].
     pub fn prediction_set(
         &self,
         x_star: &Array1<f64>,
         offset_star: f64,
         alpha: f64,
+        row_index: u64,
     ) -> Result<GlmFullConformalSet, String> {
-        self.prediction_set_with_uniform(x_star, offset_star, alpha, rand::rng().random())
+        self.prediction_set_with_uniform(
+            x_star,
+            offset_star,
+            alpha,
+            conformal_tie_uniform(row_index),
+        )
     }
 
     /// Invert with one externally supplied independent uniform variate.
@@ -2353,7 +2362,7 @@ pub fn penalty_from_normal_and_gram(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{SeedableRng, rngs::StdRng};
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
     use rand_distr::{Distribution, Gamma as GammaDist, Poisson as PoissonDist};
 
     const ALPHA: f64 = 0.1;
@@ -2994,6 +3003,41 @@ mod consolidation_tests {
                 .any(|piece| piece.lo <= 0.0 && piece.hi >= 0.0);
             assert_eq!(member, u > 0.2, "tied candidate, U={u}");
         }
+    }
+
+    #[test]
+    fn a_request_row_takes_its_positions_tie_uniform_on_every_call() {
+        // The tied Bernoulli candidate 0 of the fixture above is a member iff
+        // U > α, so its membership reads the uniform the row position selects.
+        let sub = GlmFullConformalSubstrate::new(
+            ConformalGlmFamily::BernoulliLogit,
+            Array2::zeros((4, 1)),
+            Array1::zeros(4),
+            Array1::zeros(4),
+            array![[1.0]],
+            Some(0),
+            array![0.0],
+        )
+        .unwrap();
+        let row = array![0.0];
+        let mut members = Vec::new();
+        for row_index in 0..8 {
+            let first = sub.prediction_set(&row, 0.0, 0.2, row_index).unwrap();
+            let second = sub.prediction_set(&row, 0.0, 0.2, row_index).unwrap();
+            assert_eq!(first.intervals, second.intervals, "row {row_index}");
+            let member = first
+                .intervals
+                .iter()
+                .any(|piece| piece.lo <= 0.0 && piece.hi >= 0.0);
+            assert_eq!(
+                member,
+                conformal_tie_uniform(row_index) > 0.2,
+                "row {row_index}"
+            );
+            members.push(member);
+        }
+        // Positions 0 and 2 draw 0.883 and 0.026: both verdicts occur.
+        assert!(members.contains(&true) && members.contains(&false));
     }
 
     #[test]

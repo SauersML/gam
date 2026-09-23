@@ -1,5 +1,16 @@
 ## Unreleased
 
+- **Full-conformal predictions are reproducible: each test row's tie uniform is a fixed function
+  of its position in the request** (#3338). The smoothed conformal p-value needs one uniform `U`
+  per inversion; the Gaussian substrate's `interval` and the GLM substrate's `prediction_set`
+  drew it from the operating system's generator, so the same model, data and request could return
+  different sets on every call. `conformal_tie_uniform(row_index)` (output `row_index` of
+  SplitMix64 seeded at zero, top 53 bits) now supplies it on both substrates and in `gam
+  predict`'s full-conformal route. `U` depends on nothing in the data; at a fixed `U` a row's
+  coverage is within `1/(n + 1)` of `1 − α`, and averaged over `U` it is exactly `1 − α`. The two
+  public entry points that drew an unseeded `U` and had no caller,
+  `ExactGaussianFullConformal::new` and `honest_full_conformal`, are removed; the
+  `_with_uniform` entry points remain.
 - **The cone-Laplace (EP) damping recovers after a transient, so a strongly coupled constrained
   fit no longer crawls for hours** (#3257). EP halved the share of each site's full update after
   every sweep that failed to shrink it and never restored it; near the fixed point that step

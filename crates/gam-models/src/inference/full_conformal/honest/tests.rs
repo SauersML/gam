@@ -64,6 +64,20 @@ impl Scenario {
 
     /// `n` training rows and one exchangeable test row `(x_*, y_*)`.
     fn sample(self, n: usize, seed: u64) -> (Array2<f64>, Array1<f64>, Array1<f64>, f64) {
+        let (x, y, x_star, y_star, _) = self.sample_with_tie_uniform(n, seed);
+        (x, y, x_star, y_star)
+    }
+
+    /// [`Self::sample`] plus the test row's smoothed-p-value uniform, drawn
+    /// from the same seeded stream AFTER the rows: the rows are the draw
+    /// `sample` makes, and the uniform is independent of them. Drawing it here
+    /// rather than from an unseeded generator makes a replicate, and so a
+    /// coverage cell, the same measurement on every run.
+    fn sample_with_tie_uniform(
+        self,
+        n: usize,
+        seed: u64,
+    ) -> (Array2<f64>, Array1<f64>, Array1<f64>, f64, f64) {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut x = Array2::zeros((n, P));
         let mut y = Array1::zeros(n);
@@ -73,7 +87,8 @@ impl Scenario {
             y[i] = yi;
         }
         let (t_star, y_star) = self.draw(&mut rng);
-        (x, y, cosine_row(t_star), y_star)
+        let tie_uniform = Uniform::new(0.0, 1.0).expect("uniform").sample(&mut rng);
+        (x, y, cosine_row(t_star), y_star, tie_uniform)
     }
 }
 
@@ -415,18 +430,111 @@ fn no_probe_grid_certificate_remains() {
 const REPS: usize = 2000;
 const ALPHAS: [f64; 2] = [0.1, 0.05];
 
+/// The coverage study's false-alarm budget: the probability that the whole
+/// suite reports a failure when every Monte-Carlo-graded class covers at
+/// exactly `1 − α`. Each graded tally is held to `1 − α − z·MCSE` with the
+/// Bonferroni `z = Φ⁻¹(1 − δ/m)` over the `m` graded tallies, so the budget is
+/// spent once across all of them rather than once per tally (#3338).
+const COVERAGE_FALSE_ALARM_BUDGET: f64 = 0.01;
+
+/// `m`: the Monte-Carlo-graded tallies in the whole study. Nine
+/// `(scenario, n)` cells, both `α`, and one graded class, `honest_refit`;
+/// `coverage_cell` refuses to grade any other class by Monte Carlo, so this
+/// count cannot silently fall behind the classes it covers.
+const MONTE_CARLO_TALLIES: usize = 9 * ALPHAS.len();
+
+/// How a row class's coverage is graded (#3338).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Grading {
+    /// A fixed map, symmetric in the augmented rows: graded exactly by
+    /// [`exchangeability_identity`], with no sampling noise.
+    Identity,
+    /// A re-selecting map's conservative enclosure: graded by Monte Carlo
+    /// against [`COVERAGE_FALSE_ALARM_BUDGET`].
+    MonteCarlo,
+    /// The frozen-ρ̂ set of a refused row, whose ρ̂ was selected on the
+    /// training rows alone: its certificate claims no finite-sample coverage,
+    /// so it is measured and reported, never held to `1 − α`.
+    Reported,
+}
+
+fn grading(certificate: ConformalCertificate) -> Grading {
+    match certificate {
+        ConformalCertificate::ExactFrozen => Grading::Identity,
+        ConformalCertificate::HonestRefit | ConformalCertificate::ConservativeFrozen => {
+            Grading::MonteCarlo
+        }
+        ConformalCertificate::Refused(_) => Grading::Reported,
+    }
+}
+
 /// One replicate's outcome for every row class at every `α`.
 struct Replicate {
-    /// `(certificate label, α index, covered)`.
-    rows: Vec<(&'static str, usize, bool)>,
+    /// `(certificate label, α index, covered, how the class is graded)`.
+    rows: Vec<(&'static str, usize, bool, Grading)>,
+    /// Per `α`: the exact-frozen map's `(covered folds, identity count)`.
+    identity: [(usize, usize); 2],
     honest_extra_refits: [usize; 2],
     honest_factorizations: [usize; 2],
+}
+
+/// The exchangeability identity of a fixed penalty's map at `(α, u)`.
+///
+/// Hold out each of the `n + 1` augmented rows in turn and invert on the other
+/// `n` with the same `u`. At its own held-out response every fold's augmented
+/// data is the same `n + 1` rows, and the fixed-penalty fit is symmetric in
+/// them, so every fold scores the same residuals. A fold is covered exactly
+/// when its row's strict-dominator count `r` satisfies `r + u > α(n + 1)`, and
+/// with distinct scores `r` takes each value in `0..=n` once. So the number of
+/// covered folds is `#{r ∈ 0..=n : r + u > α(n + 1)}` exactly: the finite-sample
+/// statement that `1 − α` coverage averages, checked with no sampling noise.
+/// Returns `(covered folds, that count)`.
+fn exchangeability_identity(
+    x: &Array2<f64>,
+    y: &Array1<f64>,
+    x_star: &Array1<f64>,
+    y_star: f64,
+    penalty: &Array2<f64>,
+    alpha: f64,
+    tie_uniform: f64,
+) -> Result<(usize, usize), String> {
+    let n = x.nrows();
+    let x_aug = Array2::from_shape_fn((n + 1, x.ncols()), |(i, j)| {
+        if i < n { x[[i, j]] } else { x_star[j] }
+    });
+    let y_aug = Array1::from_shape_fn(n + 1, |i| if i < n { y[i] } else { y_star });
+    let mut covered = 0;
+    for fold in 0..=n {
+        let keep: Vec<usize> = (0..=n).filter(|&i| i != fold).collect();
+        let row = honest_full_conformal_with_uniform(
+            &x_aug.select(ndarray::Axis(0), &keep),
+            &y_aug.select(ndarray::Axis(0), &keep),
+            &unit_weights(n),
+            penalty,
+            Some(0),
+            &x_aug.row(fold).to_owned(),
+            alpha,
+            tie_uniform,
+        )?;
+        if row.certificate != ConformalCertificate::ExactFrozen {
+            return Err(format!(
+                "fold {fold}: a fixed penalty was certified {}",
+                row.certificate.label()
+            ));
+        }
+        covered += usize::from(contains(&row.set, y_aug[fold]));
+    }
+    let threshold = crate::inference::full_conformal::conformal_rank_threshold(alpha, n + 1);
+    let count = (0..=n)
+        .filter(|&r| r as f64 + tie_uniform > threshold)
+        .count();
+    Ok((covered, count))
 }
 
 /// The library's own failures are carried out rather than swallowed, so the run
 /// that sees one names the replicate that produced it (#3394).
 fn replicate(scenario: Scenario, n: usize, seed: u64) -> Result<Replicate, String> {
-    let (x, y, x_star, y_star) = scenario.sample(n, seed);
+    let (x, y, x_star, y_star, tie_uniform) = scenario.sample_with_tie_uniform(n, seed);
     let weights = unit_weights(n);
     let s = curvature_penalty();
     // The trained fit: λ̂ by REML on the training rows alone, stored as `Sλ`.
@@ -436,6 +544,7 @@ fn replicate(scenario: Scenario, n: usize, seed: u64) -> Result<Replicate, Strin
     let rho_hat = brute_force_rho(&response, None);
     let s_lambda = &s * rho_hat.exp();
     let mut rows = Vec::new();
+    let mut identity = [(0, 0); 2];
     let mut honest_extra_refits = [0; 2];
     let mut honest_factorizations = [0; 2];
     for (a, &alpha) in ALPHAS.iter().enumerate() {
@@ -447,26 +556,54 @@ fn replicate(scenario: Scenario, n: usize, seed: u64) -> Result<Replicate, Strin
             (Some(2), &s_lambda),
             (None, &s_lambda),
         ] {
-            let row = honest_full_conformal(&x, &y, &weights, penalty, count, &x_star, alpha)
-                .map_err(|error| format!("α={alpha} penalty_count={count:?}: {error}"))?;
+            // One U per test row, shared by every α and penalty class, as
+            // production draws it once per row.
+            let row = honest_full_conformal_with_uniform(
+                &x,
+                &y,
+                &weights,
+                penalty,
+                count,
+                &x_star,
+                alpha,
+                tie_uniform,
+            )
+            .map_err(|error| format!("α={alpha} penalty_count={count:?}: {error}"))?;
             if count == Some(1) {
                 honest_extra_refits[a] = row.cost.extra_refits;
                 honest_factorizations[a] = row.cost.factorizations;
             }
-            rows.push((row.certificate.label(), a, contains(&row.set, y_star)));
+            let grade = grading(row.certificate);
+            if grade == Grading::Identity {
+                identity[a] =
+                    exchangeability_identity(&x, &y, &x_star, y_star, penalty, alpha, tie_uniform)
+                        .map_err(|error| format!("α={alpha} identity: {error}"))?;
+            }
+            rows.push((
+                row.certificate.label(),
+                a,
+                contains(&row.set, y_star),
+                grade,
+            ));
         }
     }
     Ok(Replicate {
         rows,
+        identity,
         honest_extra_refits,
         honest_factorizations,
     })
 }
 
-/// One `(scenario, n)` cell of the coverage study: coverage of every row class
-/// at `α ∈ {0.1, 0.05}` from the same replicates, `≥ 1 − α − 2·MCSE`, no row
-/// excluded. Also asserts the cost of this cell's honest rows: one
-/// factorization each, and a median local-refit count of at most two.
+/// One `(scenario, n)` cell of the coverage study, over the same replicates at
+/// `α ∈ {0.1, 0.05}`, each class graded as [`Grading`] says (#3338): the
+/// exact-frozen map by [`exchangeability_identity`] on every replicate, the
+/// honest map's coverage `≥ 1 − α − z·MCSE` with `z` spending
+/// [`COVERAGE_FALSE_ALARM_BUDGET`] over [`MONTE_CARLO_TALLIES`], and the
+/// refused classes printed without a bar, since asserting one would assert a
+/// guarantee the library disclaims. Also asserts the cost of this cell's
+/// honest rows: one factorization each, and a median local-refit count of at
+/// most two.
 ///
 /// `seed_index` and `size_index` are the cell's position in
 /// `Scenario::ALL × [20, 50, 200]`; they enter the seed exactly as they did
@@ -485,8 +622,25 @@ fn coverage_cell(scenario: Scenario, seed_index: usize, n: usize, size_index: us
     let mut failures = Vec::new();
     let mut refits = Vec::new();
     let mut tallies: std::collections::BTreeMap<(&str, usize), (usize, usize)> = Default::default();
-    for rep in &reps {
-        for &(label, a, covered) in &rep.rows {
+    let mut gradings = std::collections::BTreeMap::new();
+    let mut identity_checks = 0;
+    for (r, rep) in reps.iter().enumerate() {
+        for (a, &(covered, count)) in rep.identity.iter().enumerate() {
+            if covered != count {
+                failures.push(format!(
+                    "{scenario:?} n={n} α={} seed={}: exact_frozen covers {covered} of the \
+                     {} held-out folds, the exchangeability identity says {count}",
+                    ALPHAS[a],
+                    base + r as u64,
+                    n + 1
+                ));
+            }
+        }
+        for &(label, a, covered, grade) in &rep.rows {
+            gradings.insert(label, grade);
+            if grade == Grading::Identity {
+                identity_checks += 1;
+            }
             let entry = tallies.entry((label, a)).or_default();
             entry.0 += 1;
             entry.1 += usize::from(covered);
@@ -499,19 +653,37 @@ fn coverage_cell(scenario: Scenario, seed_index: usize, n: usize, size_index: us
             refits.push(rep.honest_extra_refits[a]);
         }
     }
+    // The identity must have run on every replicate at both α, or the cell
+    // graded nothing exactly.
+    assert_eq!(
+        identity_checks,
+        REPS * ALPHAS.len(),
+        "{scenario:?} n={n}: the fixed penalty's rows were not all exact_frozen"
+    );
+    let z = gam_math::probability::standard_normal_quantile(
+        1.0 - COVERAGE_FALSE_ALARM_BUDGET / MONTE_CARLO_TALLIES as f64,
+    )
+    .expect("Bonferroni quantile");
     for (&(label, a), &(rows, covered)) in &tallies {
         let alpha = ALPHAS[a];
         let coverage = covered as f64 / rows as f64;
         let mcse = (coverage * (1.0 - coverage) / rows as f64).sqrt();
+        let grade = gradings[label];
         eprintln!(
             "{scenario:?} n={n} α={alpha} {label}: coverage {coverage:.4} ± {mcse:.4} \
-             over {rows} rows"
+             over {rows} rows, graded {grade:?}"
         );
-        if coverage < 1.0 - alpha - 2.0 * mcse {
-            failures.push(format!(
-                "{scenario:?} n={n} α={alpha} {label}: {coverage:.4} < {:.4}",
-                1.0 - alpha - 2.0 * mcse
-            ));
+        if grade == Grading::MonteCarlo {
+            assert_eq!(
+                label, "honest_refit",
+                "{label} is graded by Monte Carlo but MONTE_CARLO_TALLIES does not count it"
+            );
+            if coverage < 1.0 - alpha - z * mcse {
+                failures.push(format!(
+                    "{scenario:?} n={n} α={alpha} {label}: {coverage:.4} < {:.4} (z = {z:.3})",
+                    1.0 - alpha - z * mcse
+                ));
+            }
         }
     }
     // Every K = 1 row is honest: none silently fell back. Collected over both
@@ -542,7 +714,7 @@ fn coverage_cell(scenario: Scenario, seed_index: usize, n: usize, size_index: us
     );
     assert!(
         failures.is_empty(),
-        "coverage below 1 − α − 2·MCSE: {failures:#?}"
+        "coverage failures (exchangeability identity, or below 1 − α − z·MCSE): {failures:#?}"
     );
     assert!(
         median <= 2,
@@ -566,6 +738,29 @@ fn coverage_cell(scenario: Scenario, seed_index: usize, n: usize, size_index: us
 // 94-97 % of the honest call at 1,000-2,100 cells and 35-121 ms per row, and
 // every production row with `conformal_certificate = honest_refit` pays it;
 // #3338's cell-count item is open, and the cap is not raised for it here.
+
+/// [`exchangeability_identity`] on one replicate: the covered folds equal the
+/// identity's count at both `α`, and the count moves with `α` (at `n = 20` the
+/// two `α` give counts that differ for every `u`), so the equality is the
+/// fold-by-fold rank statement and not a constant both sides happen to share.
+#[test]
+fn the_exchangeability_identity_holds_and_moves_with_alpha_3338() {
+    let (x, y, x_star, y_star, tie_uniform) =
+        Scenario::Heteroscedastic.sample_with_tie_uniform(20, 7);
+    let s = curvature_penalty();
+    let counts: Vec<usize> = ALPHAS
+        .iter()
+        .map(|&alpha| {
+            let (covered, count) =
+                exchangeability_identity(&x, &y, &x_star, y_star, &s, alpha, tie_uniform)
+                    .expect("identity");
+            assert_eq!(covered, count, "α={alpha}, U={tie_uniform}");
+            assert!(0 < count && count <= 21, "α={alpha}: count {count}");
+            count
+        })
+        .collect();
+    assert_ne!(counts[0], counts[1], "U={tie_uniform}");
+}
 
 #[test]
 fn full_conformal_coverage_misspecified_mean_n20() {

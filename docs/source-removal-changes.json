@@ -4087,5 +4087,14 @@
     ],
     "reason": "gam#3290: empirical calibration cells evaluate their contractions as node sums over the cell's nodes instead of centred moments through degree 21, so the shift/moment machinery (shift_cubic, add_shift_adjoint, the moment-degree constant and the centred-cell helpers) and their tests have no caller.",
     "evidence": "node_sums_are_the_kernel_contractions_over_the_node_moments_3290 pins the node sums to the kernel's moment contractions term by term; empirical_cell_contractions_match_the_dense_row_program_3290 and cell_third_trace_matches_per_axis_dense_contraction_2998 pass (gateD lane, cargo check --workspace --all-targets green)."
+  },
+  {
+    "base": "5f736876ee686d5a23d53d4558863655637b0ec2",
+    "items": [
+      "crates/gam-models/src/inference/full_conformal.rs:fn:new",
+      "crates/gam-models/src/inference/full_conformal/honest.rs:fn:honest_full_conformal"
+    ],
+    "reason": "gam#3338: every production conformal inversion takes its tie uniform from conformal_tie_uniform(row_index); the two public entry points that drew an unseeded rand::rng() uniform had no caller, so they are removed and callers use the _with_uniform entry points.",
+    "evidence": "git grep over crates, tests, gamfit, examples, bench, experiments, scripts and docs at the base finds no caller outside the coverage replicate, which now uses honest_full_conformal_with_uniform; gam-models 13/13 targeted tests and gam-pyffi --all-targets check green on acn112 (gateA lane)."
   }
 ]

@@ -97,7 +97,6 @@
 
 use faer::Side;
 use ndarray::{Array1, Array2};
-use rand::RngExt;
 
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use gam_math::special::softplus;
@@ -1654,29 +1653,10 @@ fn refit_at(
 ///
 /// `penalty_count` is the number of smoothing parameters the fit selected
 /// (`None` when a payload predates that field). Inputs are validated exactly
-/// as [`ExactGaussianFullConformal::new`] validates them.
-pub fn honest_full_conformal(
-    x: &Array2<f64>,
-    y: &Array1<f64>,
-    prior_weights: &Array1<f64>,
-    s_lambda: &Array2<f64>,
-    penalty_count: Option<usize>,
-    x_star: &Array1<f64>,
-    alpha: f64,
-) -> Result<HonestFullConformal, String> {
-    honest_full_conformal_with_uniform(
-        x,
-        y,
-        prior_weights,
-        s_lambda,
-        penalty_count,
-        x_star,
-        alpha,
-        rand::rng().random(),
-    )
-}
-
-/// The same numerical enclosure with an explicitly supplied independent U.
+/// as [`ExactGaussianFullConformal::new_with_uniform`] validates them.
+///
+/// `tie_uniform` is the smoothed p-value's `U` for this row; a prediction
+/// takes it from [`super::conformal_tie_uniform`] of the row's request position.
 pub fn honest_full_conformal_with_uniform(
     x: &Array2<f64>,
     y: &Array1<f64>,

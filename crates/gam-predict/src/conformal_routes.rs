@@ -235,7 +235,7 @@ pub fn full_conformal_prediction_columns(
             for i in 0..n_test {
                 let x_star = x_test.row(i).to_owned();
                 let iv = substrate
-                    .interval(&x_star, alpha)
+                    .interval(&x_star, alpha, i as u64)
                     .map_err(|e| format!("full conformal at row {i}: {e}"))?;
                 lower_vec.push(iv.lo + offset_test[i]);
                 upper_vec.push(iv.hi + offset_test[i]);
@@ -266,7 +266,7 @@ pub fn full_conformal_prediction_columns(
             for i in 0..n_test {
                 let x_star = x_test.row(i).to_owned();
                 let set = substrate
-                    .prediction_set(&x_star, offset_test[i], alpha)
+                    .prediction_set(&x_star, offset_test[i], alpha, i as u64)
                     .map_err(|e| format!("full conformal at row {i}: {e}"))?;
                 // A randomized set may be empty (no candidate conforms); its
                 // envelope is then undefined and reported as NaN with zero
